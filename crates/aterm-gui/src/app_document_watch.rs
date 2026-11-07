@@ -3,7 +3,7 @@
 
 //! The file watch over open documents (A4, `docs/DESIGN-amacs-2026-10-19.md`
 //! §7): every document opened from a file is watched
-//! ([`amacs_files::watch`]), and when its file changes on disk, whoever
+//! ([`aterm_uds::file_watch`]), and when its file changes on disk, whoever
 //! changed it (an AI CLI's edit tool, `git checkout`, a formatter), the host
 //! re-reads it through the document's own capability and reduces it
 //! ([`App::refresh_native_document`]).
@@ -38,7 +38,7 @@ pub(crate) const KEPT_STATUS: &str = "Kept your edits · Save writes them over t
 /// The documents the file watch hears, and the watch once it started.
 #[derive(Default)]
 pub(crate) struct DocumentWatch {
-    watch: Option<amacs_files::watch::FileWatch>,
+    watch: Option<aterm_uds::file_watch::FileWatch>,
     /// The platform refused the watch's event source: logged once, not retried.
     unavailable: bool,
     /// Each watched key (its document's id) with the document and file.
@@ -114,7 +114,7 @@ impl App {
         let notify = move |key: u64| {
             let _ = proxy.send_event(crate::Wake::NativeDocumentFileChanged(key));
         };
-        match amacs_files::watch::FileWatch::platform(Box::new(notify)) {
+        match aterm_uds::file_watch::FileWatch::platform(Box::new(notify)) {
             Ok(watch) => {
                 for (key, (_, path)) in &host.watched {
                     watch.watch(*key, path.clone());

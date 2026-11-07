@@ -44,6 +44,10 @@ pub(in super::super) fn binding_role(value: &aterm_json::Value, role: &str) -> i
 }
 
 pub(in super::super) struct Authorization {
+    pub metadata: bool,
+    pub resolver: bool,
+    pub program: Vec<u8>,
+    pub environment: Vec<(Vec<u8>, Vec<u8>)>,
     pub job: Binding,
     pub member: Binding,
     pub capability: Capability,
@@ -67,6 +71,10 @@ impl Authorization {
             return Err(refused("member caller differs from native peer"));
         }
         Ok(Self {
+            metadata: false,
+            resolver: false,
+            program: request.member.argv[0].clone(),
+            environment: request.member.env.clone(),
             job: request.job.clone(),
             member: request.member.binding.clone(),
             capability: request.capability.clone(),
@@ -140,6 +148,11 @@ impl Owner {
         else {
             return false;
         };
+        if request.resolver
+            && job.resolver_queries >= trust_resource_controller::resolver::RESOLVER_MAX_QUERIES
+        {
+            return false;
+        }
         live(&self.fence, &self.debt, job, request)
     }
 }
@@ -161,6 +174,47 @@ pub(super) fn live(
         || request.units > job.cpu_ceiling
         || !trusted_caller(job, request.peer)
     {
+        return false;
+    }
+    // A metadata root cannot authorize compiler/foreign work. Conversely the
+    // metadata route requires the actual original fixed-one and GNU owners;
+    // an unsupported ancestor route refuses rather than minting a shadow root.
+    if request.metadata && request.resolver {
+        return false;
+    }
+    if request.resolver {
+        use std::os::unix::ffi::OsStrExt as _;
+        if job.metadata_root
+            || !job.resolver_ready
+            || !job
+                .resolver
+                .as_ref()
+                .is_some_and(resolver_root::Preparation::prepared)
+            || !job
+                .resolver
+                .as_ref()
+                .is_some_and(|root| root.query_environment_matches(&request.environment))
+            || job.cpu_ceiling != 1
+            || job.metadata_gnu.is_none()
+            || request.peer.pid != job.child.child_mut().id()
+            || request.peer.birth != job.root_birth
+            || !crate::metadata_prelude::no_fork(request.peer.pid).unwrap_or(false)
+            || !job.metadata_sdk.as_ref().is_some_and(|sdk| {
+                sdk.resolver_compiler().as_os_str().as_bytes() == request.program
+                    && sdk.validate_loaded(request.peer.pid).is_ok()
+            })
+        {
+            return false;
+        }
+    } else if request.metadata {
+        if !job.metadata_root
+            || !job.metadata_ready
+            || job.cpu_ceiling != 1
+            || job.metadata_gnu.is_none()
+        {
+            return false;
+        }
+    } else if job.metadata_root || job.resolver.is_some() {
         return false;
     }
     let mode_matches = matches!(

@@ -12457,7 +12457,7 @@ fn a_restarted_loop_at_a_wall_its_predecessor_continued_past_waits_out_the_new_r
 
 #[test]
 fn a_person_the_server_sees_at_the_write_gets_the_question_first() {
-    use crate::supervise::policy::QuestionPriority;
+    use crate::supervise::policy::PriorityWord;
     use aterm_phase::prompt::fixtures as f;
     let (ldir, ledger) = ledger_file("person-at-write");
     let one = q(f::QUESTION_ONE);
@@ -12466,7 +12466,7 @@ fn a_person_the_server_sees_at_the_write_gets_the_question_first() {
     m.human_seq = Some(4);
     m.person_at_key = 1;
     let mut opts = answering(30);
-    opts.policy.question_priority = QuestionPriority::LongTerm;
+    opts.policy.question_priority = PriorityWord::LongTerm;
     let mut s = session(&mut m, None);
     s.set_approval_env(owner_env());
     s.set_approval_ledger(Some(ledger.clone()));
@@ -14156,6 +14156,40 @@ fn muse_controller_positive() {
     assert!(line.starts_with("ANSWERED "), "{line}");
     assert_eq!(m.presses().len(), 1, "{:#?}", m.requests);
     assert!(guarded_enter(m.presses()[0]), "{:#?}", m.requests);
+}
+
+/// A READ PROGRAM'S QUESTION IS A PERSON'S: a controller's answer to Grok Build's or Kimi Code's
+/// question card (measured), each read as a question box, is refused and types nothing, since
+/// neither program is supervised. NEGATIVE CONTROL: the same answer to Muse Code's question
+/// presses its choice.
+#[test]
+fn a_controllers_answer_leaves_a_read_programs_question_to_the_person() {
+    muse_controller_positive();
+    for (program, fixture) in [
+        ("grok", aterm_phase::grok::fixtures::QUESTION),
+        ("kimi", aterm_phase::kimi::fixtures::QUESTION_240),
+    ] {
+        let rows = q(fixture);
+        assert_eq!(
+            aterm_phase::read(Some(program), &rows, None)
+                .prompt
+                .map(|p| p.kind),
+            Some(aterm_phase::PromptKind::Question),
+            "PRECONDITION: {program}'s question box"
+        );
+        let mut m = questioned(vec![rows.clone(), rows]);
+        m.program = program;
+        m.human = vec!["150000"];
+        m.human_seq = Some(7);
+        let (line, code) = controller_answer(&mut m, "1", None);
+        assert_eq!(code, EXIT_REFUSED, "{program}: {line}");
+        assert!(line.starts_with("REFUSED @s-w "), "{program}: {line}");
+        assert!(
+            line.contains("is read, not supervised"),
+            "{program}: {line}"
+        );
+        assert!(m.presses().is_empty(), "{program}: {:#?}", m.requests);
+    }
 }
 
 #[test]

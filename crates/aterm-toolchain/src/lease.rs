@@ -805,6 +805,39 @@ pub struct ReclaimGuard {
     gate: File,
 }
 
+impl ReclaimGuard {
+    /// Check that this actual exclusive guard is the expected native subject gate.
+    /// This neither opens nor probes a lock and never acquires new authority.
+    /// # Errors
+    /// The original gate is replaced, unsafe, or belongs to another subject/prefix.
+    #[cfg(unix)]
+    pub fn check_subject(&self, prefix: &Path, subject: &Subject) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+        let directory = std::fs::symlink_metadata(dir(prefix))?;
+        let held = self.gate.metadata()?;
+        let named = std::fs::symlink_metadata(
+            dir(prefix).join(format!("{}{GATE_SUFFIX}", subject.stem())),
+        )?;
+        // SAFETY: geteuid only observes the effective process identity.
+        let uid = unsafe { libc::geteuid() };
+        if !directory.is_dir()
+            || directory.uid() != uid
+            || directory.mode() & 0o077 != 0
+            || held.dev() != named.dev()
+            || held.ino() != named.ino()
+        {
+            return Err(io::Error::other("native reclaim guard subject changed"));
+        }
+        for meta in [&held, &named] {
+            if !meta.is_file() || meta.nlink() != 1 || meta.uid() != uid || meta.mode() & 0o077 != 0
+            {
+                return Err(io::Error::other("native reclaim guard is unsafe"));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Drop for ReclaimGuard {
     fn drop(&mut self) {
         let _ = self.gate.unlock();
@@ -1136,6 +1169,8 @@ mod tests {
             "a live description must keep its rendezvous named"
         );
         drop(duplicate);
+        // A sibling test's fork holds its own copy until that child's `exec` ([`Lease::release`]).
+        assert_eq!(let_go_within(&path, LET_GO_HANG), Ok(()));
         assert_eq!(holders(root.path(), &subject), Holders::Free);
         let Reclaim::Clear(_guard) = reclaim(root.path(), &subject) else {
             panic!("the final actual close must permit SDK reclamation");
@@ -1190,6 +1225,8 @@ mod tests {
             Reclaim::Keep(Holders::Held(_))
         ));
         drop(replacement);
+        // A sibling test's fork holds its own copy until that child's `exec` ([`Lease::release`]).
+        assert_eq!(let_go_within(&path, LET_GO_HANG), Ok(()));
         assert!(matches!(reclaim(root.path(), &subject), Reclaim::Clear(_)));
     }
 
@@ -1225,7 +1262,7 @@ mod tests {
         let lease = take(&p, &trust(3), "gone", DEFAULT_WAIT).unwrap();
         let path = lease.path().to_path_buf();
         #[cfg(unix)]
-        drop(lease);
+        lease.release();
         #[cfg(not(unix))]
         {
             lease.file.unlock();
@@ -1276,7 +1313,7 @@ mod tests {
         let dead = take(&p, &trust(7), "dead", DEFAULT_WAIT).unwrap();
         let dead_path = dead.path().to_path_buf();
         #[cfg(unix)]
-        drop(dead);
+        dead.release();
         #[cfg(not(unix))]
         {
             dead.file.unlock();

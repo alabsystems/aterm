@@ -9,7 +9,7 @@
 //! ```text
 //! vte_engine_harness <payload-dir> [--corpus NAME=PATH]... [--rows N] [--cols N]
 //!                    [--samples N] [--corpus-samples N] [--only NAME,...] [--secs S]
-//!                    [--shape live|bare]
+//!                    [--shape live|bare] [--quiet-drain]
 //! ```
 //!
 //! A payload folder holds `<name>.bench` and, where the benchmark has a setup script,
@@ -41,7 +41,12 @@
 //! cores' clock in GHz, and the 1-minute load before and after. Only the cycles are judged;
 //! every time moves with load. Without the counters (another OS) the judged key is absent.
 //! `--secs` keeps sampling until that many seconds have passed (a profiler's window); `--only`
-//! runs the named scenarios alone. The last stdout line is the JSON report the lane judges.
+//! runs the named scenarios alone. Every vtebench sample begins with RIS, which erases the
+//! history, so a live sample starts over an empty store; `--quiet-drain` gives a live engine,
+//! after each sample's setup and before it is timed, the drain the app's compression worker runs
+//! once output goes quiet ([`worker_quiet_drain`]), so the sample starts over a store that holds
+//! what the setup scrolled off, as a session's burst does after earlier output. The last stdout
+//! line is the JSON report the lane judges.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -118,6 +123,25 @@ fn engine(shape: Shape, rows: u16, cols: u16) -> Terminal {
             t.set_compress_offload_active(true);
             t
         }
+    }
+}
+
+/// The lines the app's compression worker moves into the store in one hold of the terminal's
+/// lock, and the staged lines its quiet drain leaves (aterm-gui's spawn.rs, `COMPRESS_BUDGET`
+/// and `COMPRESS_LOW_WATER`).
+const WORKER_BUDGET: usize = 256;
+
+/// What the app's compression worker does once output goes quiet (aterm-gui's spawn.rs,
+/// `spawn_compress_worker`): move staged lines into the store a budget at a time until at most
+/// its low water mark stays staged or a batch moves nothing.
+fn worker_quiet_drain(term: &mut Terminal) {
+    let mut prev = usize::MAX;
+    loop {
+        let remaining = term.drain_lazy_bounded(WORKER_BUDGET);
+        if remaining <= WORKER_BUDGET || remaining >= prev {
+            break;
+        }
+        prev = remaining;
     }
 }
 
@@ -406,8 +430,14 @@ fn vte_scenarios(dir: &Path, n: usize) -> Result<Vec<Scenario>, String> {
 }
 
 /// One sample of `scenario` and the bytes it timed. A vtebench sample runs on the scenario's
-/// one engine, as vtebench's samples share their terminal; a corpus sample runs on a fresh one.
-fn sample(scenario: &mut Scenario, shape: Shape, (rows, cols): (u16, u16)) -> (Cost, usize) {
+/// one engine, as vtebench's samples share their terminal, a live one drained after its setup
+/// where `quiet_drain` says ([`worker_quiet_drain`]); a corpus sample runs on a fresh one.
+fn sample(
+    scenario: &mut Scenario,
+    shape: Shape,
+    (rows, cols): (u16, u16),
+    quiet_drain: bool,
+) -> (Cost, usize) {
     match &scenario.payload {
         Payload::Vte { setup, bench } => {
             let term = scenario
@@ -415,6 +445,9 @@ fn sample(scenario: &mut Scenario, shape: Shape, (rows, cols): (u16, u16)) -> (C
                 .get_or_insert_with(|| engine(shape, rows, cols));
             term.process(RESET);
             feed(term, setup);
+            if quiet_drain && shape == Shape::Live {
+                worker_quiet_drain(term);
+            }
             let watch = Stopwatch::start();
             feed(term, bench);
             let cost = watch.stop();
@@ -453,12 +486,14 @@ struct Args {
     only: Option<Vec<String>>,
     secs: Option<Duration>,
     shape: Shape,
+    quiet_drain: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: vte_engine_harness <payload-dir> [--corpus NAME=PATH]... [--rows N] [--cols N] \
-         [--samples N] [--corpus-samples N] [--only NAME,...] [--secs S] [--shape live|bare]"
+         [--samples N] [--corpus-samples N] [--only NAME,...] [--secs S] [--shape live|bare] \
+         [--quiet-drain]"
     );
     std::process::exit(2)
 }
@@ -478,8 +513,13 @@ fn parse_args() -> Args {
         only: None,
         secs: None,
         shape: Shape::Live,
+        quiet_drain: false,
     };
     while let Some(flag) = it.next() {
+        if flag == "--quiet-drain" {
+            a.quiet_drain = true;
+            continue;
+        }
         let value = it.next().unwrap_or_else(|| usage());
         let positive = || {
             value
@@ -651,7 +691,7 @@ fn main() {
     for scenario in &mut scenarios {
         scenario.costs.reserve(scenario.n);
         for _ in 0..WARMUP {
-            let _ = sample(scenario, args.shape, grid);
+            let _ = sample(scenario, args.shape, grid, args.quiet_drain);
         }
     }
     let rounds = scenarios.iter().map(|s| s.n).max().unwrap_or(0);
@@ -660,7 +700,7 @@ fn main() {
     while round < rounds || args.secs.is_some_and(|s| started.elapsed() < s) {
         for scenario in &mut scenarios {
             if round >= rounds || due(round, scenario.n, rounds) {
-                let cost = sample(scenario, args.shape, grid);
+                let cost = sample(scenario, args.shape, grid, args.quiet_drain);
                 scenario.costs.push(cost);
             }
         }
@@ -668,7 +708,7 @@ fn main() {
     }
     let mut json = format!(
         "{{\"rows\":{},\"cols\":{},\"slice\":{SLICE},\"min_bytes\":{MIN_BYTES},\"warmup\":{WARMUP},\
-         \"samples\":{},\"corpus_samples\":{},\"shape\":\"{}\",\"clock\":\"{}\",\
+         \"samples\":{},\"corpus_samples\":{},\"shape\":\"{}\",\"quiet_drain\":{},\"clock\":\"{}\",\
          \"counters\":{counted},\"on_pcores\":{ON_PCORES},\"user_interactive\":{interactive},\
          \"load1_before\":{load_before:.2},",
         args.rows,
@@ -676,6 +716,7 @@ fn main() {
         args.samples,
         args.corpus_samples,
         args.shape.name(),
+        args.quiet_drain,
         clock::NAME,
     );
     for scenario in &scenarios {

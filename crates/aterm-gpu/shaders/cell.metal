@@ -632,7 +632,10 @@ fragment float4 fs_glyph(GlyphVsOut in [[stage_in]],
             cov = clamp((blend_l - bg_l) / (fg_l - bg_l), 0.0, 1.0);
         }
     }
-    return float4(fg_lin, cov);
+    // Premultiplied into PREMULTIPLIED_OVER: the remapped coverage lies off the
+    // 1/255 lattice, and a blend unit that rounds its source alpha to the
+    // target's 8 bits rounds only the ground's share (see cell.glsl).
+    return float4(fg_lin * cov, cov);
 }
 
 // Colour-emoji glyphs: the atlas holds the CPU renderer's final cell-sized RGBA,
@@ -656,7 +659,9 @@ fragment float4 fs_deco_over(GlyphVsOut in [[stage_in]],
 }
 
 // ADD (the profanity sparkle): emit premultiplied (rgb*a, a) into the One/One
-// pipeline, so dst + rgb*a == the CPU add_sat(dst, premul_rgb(color, a)).
+// pipeline, the light quantized to the CPU's byte (round(c*a*255)/255 ==
+// premul_rgb's (c*a + 127)/255), so dst + rgb*a == the CPU add_sat(dst,
+// premul_rgb(color, a)) on a blend unit that holds its source short of f32 too.
 // The sparkle's coverage times its alpha, on the CPU's intermediate byte
 // lattice (see fs_deco_over), as a byte.
 static inline uint deco_add_alpha(GlyphVsOut in, texture2d<float> atlas_tex,
@@ -669,7 +674,7 @@ fragment float4 fs_deco_add(GlyphVsOut in [[stage_in]],
                             texture2d<float> atlas_tex [[texture(0)]],
                             sampler atlas_samp [[sampler(0)]]) {
     float a = float(deco_add_alpha(in, atlas_tex, atlas_samp)) / 255.0;
-    return float4(in.color.rgb * a, a);
+    return float4(rint(in.color.rgb * a * 255.0) / 255.0, a);
 }
 
 // RGBA8 sprites: the per-instance tint and opacity multiplies are each quantized
@@ -884,7 +889,7 @@ static inline float3 fetch_store(uint3 b) {
     return s2l(float3(b) / 255.0);
 }
 
-// GLOW_OVER (One, OneMinusSrcAlpha) on the Unorm view: over_premul, which is
+// PREMULTIPLIED_OVER (One, OneMinusSrcAlpha) on the Unorm view: over_premul, which is
 // add_sat at a = 0 and a store at a = 255.
 static inline float4 fetch_over_premul(float4 dst, uint4 c) {
     uint3 d = fetch_bytes(dst.rgb);

@@ -4143,7 +4143,22 @@ impl Session<'_> {
         }
     }
 
-    fn mark(&mut self, item: &'static str) {
+    /// Whether the guest is still there before `next`: a guest lost under the session (lima's
+    /// GPU instance when krunkit died, the vz arm's `Lost`) cuts it off there, NOT RUN naming
+    /// the loss and what was cut off, rather than every later item failing against no guest.
+    fn alive(&self, next: &str) -> Result<(), String> {
+        match self.up().guest.lost() {
+            None => Ok(()),
+            Some(why) => Err(format!(
+                "the guest was lost under this session; cut off before {next}, after {} \
+                 recorded line(s): {why}",
+                self.rec.lines.len()
+            )),
+        }
+    }
+
+    fn mark(&mut self, item: &'static str) -> Result<(), String> {
+        self.alive(item)?;
         if let Some(now) = self
             .ctl(&["metrics"])
             .ok()
@@ -4151,6 +4166,7 @@ impl Session<'_> {
         {
             self.marks.push((item, now));
         }
+        Ok(())
     }
 
     fn server_stack(&mut self) {
@@ -4280,7 +4296,7 @@ fn record_session(
             return Err(format!("`ready` answered {r}"));
         }
         let _ = s.ctl(&["metrics", "reset"]);
-        s.mark("settle");
+        s.mark("settle")?;
         s.settled_dims()
     })();
     let d = match started {
@@ -4296,7 +4312,7 @@ fn record_session(
         }
     };
     s.rec.behaviour("start.dims", dims_summary(&d));
-    s.mark("echo");
+    s.mark("echo")?;
     let echo = s.run_line(proof::TYPED, proof::ECHO);
     s.rec.behaviour(
         "echo",
@@ -4305,17 +4321,17 @@ fn record_session(
             Err(e) => format!("failed: {e}"),
         },
     );
-    s.mark("walk.start");
+    s.mark("walk.start")?;
     s.walk("start");
-    s.mark("resizes");
+    s.mark("resizes")?;
     if let Err(e) = s.resizes() {
         s.rec.behaviour("resize.input", format!("failed: {e}"));
     }
-    s.mark("os-resize");
+    s.mark("os-resize")?;
     s.os_resize();
-    s.mark("ledger");
+    s.mark("ledger")?;
     s.ledger();
-    s.mark("selections");
+    s.mark("selections")?;
     match (s.x_display(), screen.display.seat()) {
         (Some(x), _) => s.x11_selections(&x),
         (None, Some(_)) => {
@@ -4328,26 +4344,26 @@ fn record_session(
             "weston's headless backend advertises no wl_seat, and a Wayland selection is set with a seat's serial (the weston-x11 screen drives it: weston's x11 backend, nested in Xvfb, has a seat that XTEST on the Xvfb drives)",
         ),
     }
-    s.mark("key-repeat");
+    s.mark("key-repeat")?;
     s.key_repeat();
-    s.mark("compose");
+    s.mark("compose")?;
     s.compose();
     match (s.x_display(), screen.display.seat()) {
         (Some(x), _) => {
-            s.mark("dnd");
+            s.mark("dnd")?;
             s.dnd(&x);
         }
         (None, Some(_)) => {
-            s.mark("dnd");
+            s.mark("dnd")?;
             let w = s.wayland_display().unwrap_or_default();
             s.wl_dnd(&w);
         }
         (None, _) => {}
     }
-    s.mark("header");
+    s.mark("header")?;
     s.header();
     s.not_driven();
-    s.mark("walk.end");
+    s.mark("walk.end")?;
     s.walk("end");
     let journal = s.gui.journal(&invocation);
     s.percentiles(&journal);
@@ -4390,15 +4406,23 @@ fn record_session(
         }
         s.rec.measured(&format!("atspi.event.{}", i + 1), shown);
     }
+    s.alive("server-stack")?;
     s.server_stack();
     s.gui.stop();
-    s.xim();
-    s.x11_wire();
-    s.text_input_v3();
-    s.header_gestures();
-    s.cpu_seat();
-    s.touch();
-    s.text_input_v3_ime();
+    let tail: [(&str, fn(&mut _)); 7] = [
+        ("xim", Session::xim),
+        ("x11-wire", Session::x11_wire),
+        ("text-input-v3", Session::text_input_v3),
+        ("header-gestures", Session::header_gestures),
+        ("cpu-seat", Session::cpu_seat),
+        ("touch", Session::touch),
+        ("text-input-v3-ime", Session::text_input_v3_ime),
+    ];
+    for (item, run) in tail {
+        s.alive(item)?;
+        run(&mut s);
+    }
+    s.alive("the session's end")?;
     up.stop_units();
     Ok(s.rec)
 }
@@ -4546,6 +4570,14 @@ impl Baseline {
         );
         println!("\n=== {name} ===");
         let started = Instant::now();
+        if let Some(why) = up.guest.lost() {
+            return proof::Row {
+                name,
+                verdict: proof::Verdict::NotRun,
+                secs: 0.0,
+                detail: format!("not started: the guest was lost earlier in this run: {why}"),
+            };
+        }
         let enabled = accessibility(up, true);
         let recorded = if enabled.ok() {
             record_session(
@@ -4664,7 +4696,7 @@ impl Baseline {
 pub fn cmd_baseline(args: &[String]) -> Res {
     let ask = parse_baseline(args)?;
     crate::stop::install();
-    let _lock = linux::LaneLock::boot()?;
+    let mut lane = linux::LaneLock::boot()?;
     let repo = linux::repo();
     let results = linux::state_dir()?.join(format!(
         "baseline-{}",
@@ -4673,7 +4705,7 @@ pub fn cmd_baseline(args: &[String]) -> Res {
     std::fs::create_dir_all(&results)
         .map_err(|e| Fail::die(format!("{}: {e}", results.display())))?;
     let t0 = Instant::now();
-    let up = match linux::bring_up() {
+    let up = match linux::bring_up(&mut lane) {
         Ok(up) => up,
         Err(f) => {
             let _ = std::fs::remove_dir(&results);
@@ -4790,6 +4822,63 @@ pub fn cmd_baseline(args: &[String]) -> Res {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A guest lost under a session (krunkit's abort on the GPU instance) cuts it off at the next
+    /// item, naming the loss and the item, and a later session is not started; while the guest
+    /// answers, both go on.
+    #[test]
+    fn a_lost_guest_cuts_the_session_off_and_starts_no_other() {
+        use crate::linux_driver::fake::{Answer, Guest};
+        let guest = Guest::new().answer(
+            &["vulkaninfo"],
+            Answer::Lost("krunkit aborted: virglrenderer's double free".into()),
+        );
+        let up = linux::fake_up(&guest, false);
+        let s = Session {
+            gui: Gui {
+                up: &up,
+                bin: "/b".into(),
+                dir: "/d".into(),
+                name: "aarch64-xvfb".into(),
+                cpu: false,
+                deck: false,
+            },
+            arch: Arch::Aarch64,
+            screen: Screen::BASELINE[0],
+            bus: String::new(),
+            wl: String::new(),
+            results: PathBuf::new(),
+            rec: Recording::default(),
+            roles: Vec::new(),
+            end_terminal: None,
+            marks: Vec::new(),
+        };
+        assert_eq!(s.alive("echo"), Ok(()), "the guest answers");
+        let baseline = Baseline {
+            bus: String::new(),
+            wl: String::new(),
+            lock: String::new(),
+            committed: PathBuf::new(),
+            results: PathBuf::new(),
+            record: false,
+        };
+        let _ = s.sh(&["vulkaninfo".into()]);
+        let why = s.alive("compose").expect_err("cut off");
+        assert!(why.contains("cut off before compose"), "{why}");
+        assert!(
+            why.ends_with("krunkit aborted: virglrenderer's double free"),
+            "{why}"
+        );
+        let calls = guest.calls().len();
+        let row = baseline.session(&up, Arch::Aarch64, Screen::BASELINE[1], "/b");
+        assert_eq!(row.verdict, proof::Verdict::NotRun, "{}", row.detail);
+        assert!(
+            row.detail.contains("lost earlier in this run"),
+            "{}",
+            row.detail
+        );
+        assert_eq!(guest.calls().len(), calls, "the next session ran nothing");
+    }
 
     #[test]
     fn a_present_line_names_software_only_for_mesa_s_software_rasterizer() {

@@ -117,9 +117,15 @@ impl Cmd {
         self
     }
 
+    /// Set `k` to `v` for the child: in place of a value set before, as the child sees only the
+    /// last, so each variable is named once wherever the command is read back (a rerun line).
     #[must_use]
     pub fn env(mut self, k: impl Into<OsString>, v: impl Into<OsString>) -> Self {
-        self.envs.push((k.into(), v.into()));
+        let (k, v) = (k.into(), v.into());
+        match self.envs.iter_mut().find(|(key, _)| *key == k) {
+            Some(set) => set.1 = v,
+            None => self.envs.push((k, v)),
+        }
         self
     }
 
@@ -561,6 +567,13 @@ fn run_captured(cmd: &Cmd, env: ExecEnv<'_>, machine: Option<&mut Result<String,
     for (k, v) in &cmd.envs {
         c.env(k, v);
     }
+    // A replayed child's recorded environment holds the marker of the run that recorded it, not
+    // the claim its stage holds now: that claim covers it.
+    if cmd.exact_env
+        && let Some(marker) = crate::memory::cover()
+    {
+        c.env(aterm_capacity::COVER_ENV, &*marker);
+    }
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let marks = if cmd.waits_count {
         None
@@ -678,7 +691,7 @@ const LOOK_EVERY: Duration = Duration::from_millis(25);
 
 /// How often a child's clock reads what its tree used ([`Host::group_usage`]) while its work is
 /// short of its ceiling; at the ceiling it reads once more before it judges.
-const READ_USAGE_EVERY: Duration = Duration::from_millis(500);
+pub(crate) const READ_USAGE_EVERY: Duration = Duration::from_millis(500);
 
 /// How often a child's stage meter reads its process group in its first [`READ_USAGE_EVERY`]: a
 /// child that ends before the first full read (a 400 ms link of 3 GiB) is still read near its peak,
@@ -1046,8 +1059,9 @@ impl<'a> Clock<'a> {
         }
     }
 
-    /// Read what the tree used since the last read, book what it holds into its stage's meter
-    /// ([`crate::memory::Meter::book`]) and its own ([`Clock::own`]), and move to
+    /// Read what the tree used since the last read, book what it holds and its live rate into its
+    /// stage's meter ([`crate::memory::Meter::book_at`]) and into its own
+    /// ([`Clock::own`]), and move to
     /// [`Clock::starved`] the part of its work that the reads of its span show it spent waiting
     /// for a core and have not moved yet
     /// ([`CoreWaitSpan::book`]), unless it has made no progress for [`NO_PROGRESS_HANG`]: then the
@@ -1065,7 +1079,7 @@ impl<'a> Clock<'a> {
             return;
         };
         if let Some((meter, pgid)) = &self.meter {
-            meter.book(*pgid, &members);
+            meter.book_at(*pgid, &members, now);
         }
         if let Some(own) = self.own {
             own.book(u.pgid, &members);
@@ -2511,6 +2525,23 @@ pub fn capture_reply(cmd: &Cmd, env: ExecEnv<'_>) -> String {
 mod tests {
     use super::*;
 
+    /// A VARIABLE SET TWICE IS SET ONCE, to its last value, where it was first set: what the child
+    /// sees, named once. NEGATIVE CONTROL: two variables keep both, in the order they were set.
+    #[test]
+    fn a_variable_set_twice_is_named_once_with_its_last_value() {
+        let cmd = Cmd::new("targo")
+            .env("ATERM_SPEC_CHECKERS", "1")
+            .env("TRAIL_LAWS_FULL", "1")
+            .env("ATERM_SPEC_CHECKERS", "0");
+        assert_eq!(
+            cmd.envs,
+            [
+                ("ATERM_SPEC_CHECKERS".into(), "0".into()),
+                ("TRAIL_LAWS_FULL".into(), "1".into())
+            ]
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_native_stage_keeps_its_inherited_pipe_descriptor() {
@@ -2761,6 +2792,40 @@ mod tests {
             assert_eq!(said(&run(&ask, env)), "0000000000001-7-0");
             let pooled = crate::testrun::pool(1, &[0], 1, |_| said(&run(&ask, env)));
             assert_eq!(pooled, [Some("0000000000001-7-0".to_string())]);
+            let dispatched = crate::testrun::dispatch_each(1, |_| said(&run(&ask, env)));
+            assert_eq!(dispatched, [Some("0000000000001-7-0".to_string())]);
+        }
+        assert_eq!(said(&run(&ask, env)), aterm_capacity::NO_COVER);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A child replayed from a recorded invocation ([`Cmd::replayed`]) is handed the cover marker
+    /// of its stage's claim over the one its recorded environment holds, from a worker of the
+    /// test dispatch too. NEGATIVE CONTROL: outside a stage that holds a claim, its recorded one
+    /// reaches it.
+    #[cfg(unix)]
+    #[test]
+    fn a_replayed_child_is_handed_its_stages_cover_marker() {
+        let tmp = crate::mktemp_dir("atv-replayed-cover").expect("mktemp");
+        let env = env_in(&tmp);
+        let ask = Cmd::replayed(
+            &[
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from("printf %s \"$ATERM_CAPACITY_COVER\""),
+            ],
+            &tmp,
+            vec![(
+                OsString::from(aterm_capacity::COVER_ENV),
+                OsString::from(aterm_capacity::NO_COVER),
+            )],
+        );
+        assert_eq!(said(&run(&ask, env)), aterm_capacity::NO_COVER);
+        {
+            let _covering = crate::memory::covering(Some("0000000000001-7-0".into()));
+            assert_eq!(said(&run(&ask, env)), "0000000000001-7-0");
+            let dispatched = crate::testrun::dispatch_each(1, |_| said(&run(&ask, env)));
+            assert_eq!(dispatched, [Some("0000000000001-7-0".to_string())]);
         }
         assert_eq!(said(&run(&ask, env)), aterm_capacity::NO_COVER);
         std::fs::remove_dir_all(&tmp).ok();
@@ -3887,35 +3952,38 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Set, the test binary is [`holder_stand_in`]: `idle` naps, `polls` wakes every 20 ms to do
-    /// a little work, as a holder that itself waits in a chain looks again.
+    /// Set, the test binary is [`holder_stand_in`]: `idle` naps, `works` naps beside a child that
+    /// works (`child`, which loops until its parent is gone), as a lane's run does beside its
+    /// guest's.
     #[cfg(unix)]
     const HOLDER_STAND_IN: &str = "ATERM_VERIFY_TEST_HOLDER";
 
     /// Run as a lock's named holder by [`a_child_waiting_behind_a_stuck_holder_could_not_run`]:
     /// lives for twice the hang detector unless its test ends it first, using no CPU time and
-    /// writing nothing (`idle`), or waking to work (`polls`) for 2 ms of each wake. Linux counts a
-    /// process's CPU time in clock ticks (`/proc/<pid>/stat`, 10 ms at `USER_HZ` 100), so its wakes'
-    /// work must sum to several ticks within each [`STUCK_AFTER`] there, or the holder reads as
-    /// one that did none.
+    /// writing nothing (`idle`), or beside a child that keeps a core busy (`works`). Linux counts
+    /// a process's CPU time in clock ticks (`/proc/<pid>/stat`, 10 ms at `USER_HZ` 100), so the
+    /// child's work must sum to several ticks within each [`STUCK_AFTER`] there, which a busy core
+    /// does.
     #[cfg(unix)]
     #[test]
     fn holder_stand_in() {
         let Some(how) = std::env::var_os(HOLDER_STAND_IN) else {
             return;
         };
-        let until = Instant::now() + HANG_DETECTOR * 2;
-        if how == "idle" {
-            std::thread::sleep(HANG_DETECTOR * 2);
-        }
-        let mut n = 0u64;
-        while Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(20));
-            let wake = Instant::now();
-            while wake.elapsed() < Duration::from_millis(2) {
-                n = std::hint::black_box(n.wrapping_mul(31).wrapping_add(1));
+        if how == "child" {
+            let parent = std::os::unix::process::parent_id();
+            let until = Instant::now() + HANG_DETECTOR * 2;
+            let mut n = 0u64;
+            while std::os::unix::process::parent_id() == parent && Instant::now() < until {
+                for i in 0..1_000_000u64 {
+                    n = std::hint::black_box(n.wrapping_mul(31).wrapping_add(i));
+                }
             }
+            return;
         }
+        let child = (how == "works").then(|| HolderStandIn::start("child"));
+        std::thread::sleep(HANG_DETECTOR * 2);
+        drop(child);
     }
 
     /// A [`holder_stand_in`], killed when dropped: no test leaves one behind.
@@ -3974,11 +4042,11 @@ mod tests {
     /// detector past that grace and with no ceiling that could end it instead; the child could
     /// not run, naming the holder and how long it made no progress, at least the waiter's bound;
     /// the Linux lane's row reads NOT RUN with it; and the holder is never signalled and still
-    /// runs. Negative control: a holder that wakes to work (a waiter in a chain) is waited for
-    /// past three times the bound from the child's own wait mark, then the child has the lock and
-    /// runs to its end. Neither run has a ceiling, so a starved start of the child, which a
-    /// ceiling counts as work, decides neither, and the control's span starts once the child
-    /// waits, however late it started.
+    /// runs. Negative control: a holder whose child works is waited for past three times the
+    /// bound from the child's own wait mark, then the child has the lock and runs to its end.
+    /// Neither run has a ceiling, so a starved start of the child, which a ceiling counts as
+    /// work, decides neither, and the control's span starts once the child waits, however late
+    /// it started.
     #[cfg(unix)]
     #[test]
     fn a_child_waiting_behind_a_stuck_holder_could_not_run() {
@@ -4058,7 +4126,7 @@ mod tests {
 
         let lane = tmp.join("working");
         std::fs::create_dir(&lane).expect("a second lane");
-        let mut working = HolderStandIn::start("polls");
+        let mut working = HolderStandIn::start("works");
         let (held, waiter) = held_lane_by(&lane, working.0.id());
         let waiter = waiter.env(WAIT_PACED, "1").env(WAIT_THEN_EXIT, "1");
         let running = {

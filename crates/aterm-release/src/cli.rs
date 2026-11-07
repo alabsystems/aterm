@@ -131,7 +131,7 @@ USAGE
       digest, that serves other bytes, or that the channel no longer serves (a
       prerelease, or below the head's floor); then nothing is written.
 
-  targo --unverified ship cut [--dry-run] [--resume] [--abandon vX.Y.Z]
+  targo --unverified ship cut [--dry-run] [--resume] [--sign] [--abandon vX.Y.Z]
                  [--min-build N] [--release-credentials <profile.toml>]
                  [--linux-artifacts DIRECTORY [--linux-target aarch64|x86_64]...
                   [--linux-worker ARCH=HOST:REPO]... | --mac-only]
@@ -144,6 +144,12 @@ USAGE
         --dry-run          the gates, then the verified bundle copied into dist/,
                            signed, notarized and self-checked under its reserved
                            number; nothing claimed, committed, published or built
+        --sign             what the release runs beside `pub publish`: the bundle
+                           its release journal names copied into dist/, signed,
+                           notarized, packaged and self-checked under its reserved
+                           number, and kept for the claim, which adopts it when
+                           every digest still matches; nothing claimed or
+                           published. Combines only with --release-credentials
         --resume           re-enter the journaled cut (dist/cut-state.toml) at
                            its first incomplete step
         --abandon vX.Y.Z   withdraw an unpublished cut: its own draft deleted, or
@@ -215,7 +221,7 @@ USAGE
                  [--cut [--source]] [--export] [--wasm32] [--compat]
                            would a release of REV (default HEAD) pass? Read-only;
                            naming sections narrows it to them, none is all three:
-        --compat           the stage's stable x86_64 compile check, without a cut
+        --compat           the stable x86_64 compile check, without a cut
         --source           with --cut: only commit gates, for source sampling;
                            no bundle-verification outcome is recorded
         --cut              the cut's pre-claim gates that read only the commit
@@ -288,9 +294,18 @@ USAGE
                            whose trustd went away under it is COULD NOT RUN,
                            never a verdict on its code. A check starts
                            once the capacity ledger admits its memory
-                           claim (its library's last recorded peak and a fifth
-                           more, at least 1 GiB more; with none recorded
-                           16 GiB, or half the RAM where that is less): until
+                           claim (its library's last recorded peak under this
+                           prover and a fifth more, at least 1 GiB more; with
+                           none recorded, 16 GiB, or half the RAM where that
+                           is less; a check cut short, over budget,
+                           interrupted or failed, keeps its peak as the least
+                           it needs, which claims at least what none does
+                           until a check under this prover has finished; and
+                           while none has, at least what another prover's
+                           newest row of it claims, unless this prover's own
+                           peak is refused by itself, a claim that can never
+                           be available refusing the library up front naming
+                           that prover): until
                            then it waits, naming the shortfall and each holder
                            once a minute (`aterm pkg capacity` lists the
                            claims), and --admit now starts it at once. A
@@ -1118,6 +1133,7 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
         match flag {
             "--dry-run" => opts.dry_run = true,
             "--resume" => opts.resume = true,
+            "--sign" => opts.sign = true,
             "--linux-artifacts" | "--linux-worker" | "--mac-only" | "--linux-target" => {
                 LinuxFlags {
                     artifacts: &mut opts.linux_artifacts,
@@ -1150,6 +1166,22 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             other => return Err(format!("unknown cut flag {other:?}")),
         }
     }
+    if opts.sign
+        && (abandon.is_some()
+            || opts.dry_run
+            || opts.resume
+            || opts.linux_artifacts.is_some()
+            || !opts.linux_workers.is_empty()
+            || opts.mac_only
+            || opts.min_build.is_some())
+    {
+        return Err(
+            "--sign combines only with --release-credentials (it signs the bundle its \
+             release journal names, under that reservation, and leaves Linux and the \
+             floor to the claim)"
+                .to_string(),
+        );
+    }
     if abandon.is_some()
         && (opts.dry_run
             || opts.resume
@@ -1181,6 +1213,7 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
     }
     .check()?;
     if abandon.is_none()
+        && !opts.sign
         && !opts.resume
         && !opts.dry_run
         && !opts.mac_only
@@ -1250,6 +1283,7 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
         Cmd::Cut {
             abandon: Some(v), ..
         } => verify::run_abandon(&repo_root()?, &v),
+        Cmd::Cut { opts, .. } if opts.sign => publish::run_cut_sign(&repo_root()?, &opts),
         Cmd::Cut { opts, .. } => publish::run_cut(&repo_root()?, &opts),
         Cmd::NotaryOnly { check } => crate::provision::run_notary_only(check),
         Cmd::Provision {
@@ -1358,7 +1392,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compat_checks_only_the_stage_compile_without_exporting_or_cutting() {
+    fn compat_checks_only_the_stable_compile_without_exporting_or_cutting() {
         let args = ["check", "--compat"].map(str::to_owned);
         let Cmd::Check(opts) = parse(&args).unwrap() else {
             panic!("check verb");

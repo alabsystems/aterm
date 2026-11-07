@@ -10,6 +10,9 @@ use aterm_json::{Value, json};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::OnceLock;
 
+#[path = "codex_enrollment_cleanup.rs"]
+mod cleanup;
+
 const MAX_JOBS: usize = 32;
 const MAX_FRAME: usize = 64 * 1024;
 
@@ -114,6 +117,7 @@ fn progress(request: &enrollment::RejectedIntent, status: &enrollment::Status) -
 }
 
 struct Job {
+    cleanup_owner: Option<enrollment::RetirementControl>,
     command: Command,
     proof: crate::self_claim::Proven,
     started: std::time::Instant,
@@ -218,7 +222,11 @@ impl Drop for Reservation {
 }
 
 fn complete(job: &Arc<Job>, result: Result<Option<Value>, ()>) {
-    let mut table = jobs().lock().unwrap_or_else(|p| p.into_inner());
+    complete_in(jobs(), job, result);
+}
+
+fn complete_in(registry: &Mutex<Registry>, job: &Arc<Job>, result: Result<Option<Value>, ()>) {
+    let mut table = registry.lock().unwrap_or_else(|p| p.into_inner());
     if job.command.may_publish() {
         table.changed();
     }
@@ -289,16 +297,32 @@ fn remove_control(key: &(String, String), control: &Arc<OwnedControl>) {
     }
 }
 
-fn seal_controls(lifetime: &account_work::Lifetime) -> bool {
-    let owned = controls()
+type OwnedControlEntry = ((String, String), Arc<OwnedControl>);
+
+fn owned_controls(lifetime: &account_work::Lifetime) -> Vec<OwnedControlEntry> {
+    controls()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .iter()
         .filter(|(_, control)| control.owned_by(lifetime))
         .map(|(key, control)| (key.clone(), Arc::clone(control)))
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn settle_control_custody(lifetime: &account_work::Lifetime) -> bool {
+    let mut pending = false;
+    for (_, control) in owned_controls(lifetime) {
+        if control.has_pending_custody() {
+            let _ = control.settle_custody(&control.env);
+            pending |= control.has_pending_custody();
+        }
+    }
+    pending
+}
+
+fn seal_controls(lifetime: &account_work::Lifetime) -> bool {
     let mut sealed = true;
-    for (key, control) in owned {
+    for (key, control) in owned_controls(lifetime) {
         if !control.work_retired() {
             sealed = false;
             continue;
@@ -317,19 +341,30 @@ fn seal_controls(lifetime: &account_work::Lifetime) -> bool {
 }
 
 impl crate::App {
+    pub(crate) fn settle_enrollment_custody(lifetime: &account_work::Lifetime) -> bool {
+        settle_control_custody(lifetime)
+    }
+
     pub(crate) fn enrollment_retirement_pending(lifetime: &account_work::Lifetime) -> bool {
         controls()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .values()
             .any(|control| control.owned_by(lifetime))
+            || cleanup::pending(lifetime)
     }
 
     pub(crate) fn seal_enrollment_retirement(lifetime: &account_work::Lifetime) -> bool {
         if !Self::enrollment_retirement_pending(lifetime) {
             return true;
         }
-        seal_controls(lifetime)
+        // Both sets may hold exact historical receipts for one operation. A
+        // successful current receipt makes older terminal retirement idempotent.
+        let normal = seal_controls(lifetime);
+        let cleanup = cleanup::seal_controls(lifetime);
+        let normal = normal || seal_controls(lifetime);
+        let cleanup = cleanup || cleanup::seal_controls(lifetime);
+        normal && cleanup
     }
 }
 
@@ -436,7 +471,7 @@ fn run(
     proof: &crate::self_claim::Proven,
     lifetime: &account_work::Lifetime,
 ) -> Result<Option<Value>, ()> {
-    let env = Env::from_process().map_err(|_| ())?;
+    let env = crate::native_act::codex_account_env().map_err(|_| ())?;
     run_in(command, sid, proof, lifetime, &env, enrollment::Work::run)
 }
 
@@ -474,52 +509,74 @@ fn run_enrollment(
     if warning.is_some() {
         return Err(());
     }
+    let mut native_recovery = false;
+    let mut native_retirement = false;
     let recovery = if let Ok((retained, status)) = logins.enrollment.retained(operation, &owner) {
         if retained.revision != *revision || retained.account_id != *account {
             return Err(());
         }
         let request = logins.enrollment.admitted(operation, &owner).ok();
         match request {
-            Some(request) if logins.enrollment.recoverable(&request).map_err(|_| ())? => {
-                Some(request)
+            Some(request) => {
+                native_recovery = logins
+                    .enrollment
+                    .native_recovery_pending(&request)
+                    .map_err(|_| ())?;
+                native_retirement =
+                    native_recovery && status.phase == enrollment::Phase::CancelRequested;
+                if native_recovery || logins.enrollment.recoverable(&request).map_err(|_| ())? {
+                    Some(request)
+                } else {
+                    return Ok(Some(progress(&retained, &status)));
+                }
             }
-            _ => return Ok(Some(progress(&retained, &status))),
+            None => return Ok(Some(progress(&retained, &status))),
         }
     } else {
         None
     };
-    let config = env
-        .config
-        .as_deref()
-        .and_then(std::path::Path::parent)
-        .ok_or(())?;
-    let path = config.join(accounts::Cli::Codex.accounts().roster_file);
-    let records = store.peek_account_records(&path, env.now).map_err(|_| ())?;
-    let Some(row) = records
-        .roster
-        .rows
-        .iter()
-        .find(|row| accounts_control::account_id(&row.label) == *account)
-    else {
-        return refuse();
+    let request = if native_retirement {
+        // Cancellation owns only original custody. Current roster policy and
+        // staging-file availability cannot authorize or prevent its retirement.
+        recovery.clone().ok_or(())?
+    } else {
+        let config = env
+            .config
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .ok_or(())?;
+        let path = config.join(accounts::Cli::Codex.accounts().roster_file);
+        let records = store.peek_account_records(&path, env.now).map_err(|_| ())?;
+        let Some(row) = records
+            .roster
+            .rows
+            .iter()
+            .find(|row| accounts_control::account_id(&row.label) == *account)
+        else {
+            return refuse();
+        };
+        if row.held_by.is_some()
+            || row.expected_identity_email().is_none()
+            // Exact retained native work authenticates its original row again under
+            // native resources. Another row's publication may advance this revision.
+            || (!native_recovery
+                && accounts::pool_authority_revision(&records.raw_roster, &records.logins)
+                    .map_err(|_| ())?
+                    != *revision)
+        {
+            return refuse();
+        }
+        let request = recovery.clone().unwrap_or_else(|| enrollment::Request {
+            id: operation.clone(),
+            caller: owner,
+            label: row.label.clone(),
+            revision: revision.clone(),
+        });
+        if request.label != row.label {
+            return Err(());
+        }
+        request
     };
-    if row.held_by.is_some()
-        || row.expected_identity_email().is_none()
-        || accounts::pool_authority_revision(&records.raw_roster, &records.logins)
-            .map_err(|_| ())?
-            != *revision
-    {
-        return refuse();
-    }
-    let request = recovery.clone().unwrap_or_else(|| enrollment::Request {
-        id: operation.clone(),
-        caller: owner,
-        label: row.label.clone(),
-        revision: revision.clone(),
-    });
-    if request.label != row.label {
-        return Err(());
-    }
     let Some(scope) = lifetime.enter() else {
         return refuse();
     };
@@ -599,14 +656,64 @@ fn run_in(
     // publication deliberately fences; discovery never repairs these records.
     let _work = lifetime.enter().ok_or(())?;
     let store = env.accounts_store_for(accounts::Cli::Codex).ok_or(())?;
-    let config = env
-        .config
-        .as_deref()
-        .and_then(std::path::Path::parent)
-        .ok_or(())?;
-    let roster = config.join(accounts::Cli::Codex.accounts().roster_file);
-    store.recover_records(&roster).map_err(|_| ())?;
     let owner = caller(sid, proof);
+    // A pending account-record transaction can fence load_logins itself.
+    // Failure to observe an exact native cancellation selects the ordinary
+    // counted record-repair path; it supplies no native cleanup authority.
+    let native_metadata_dispatch = if let Ok((before, None)) = store.load_logins(env.now) {
+        if let Ok((retained, status)) = before.enrollment.retained(command.id(), &owner) {
+            let body_matches = match command {
+                Command::Enroll {
+                    revision, account, ..
+                } => retained.revision == *revision && retained.account_id == *account,
+                _ => true,
+            };
+            let cleanup_phase = status.phase == enrollment::Phase::CancelRequested
+                || (matches!(command, Command::Cancel(_))
+                    && status.phase == enrollment::Phase::Running);
+            let terminal = matches!(
+                status.phase,
+                enrollment::Phase::Cancelled | enrollment::Phase::Applied
+            );
+            if body_matches && (cleanup_phase || terminal) {
+                let request = before
+                    .enrollment
+                    .admitted(command.id(), &owner)
+                    .map_err(|_| ())?;
+                if terminal {
+                    before
+                        .enrollment
+                        .native_admitted(&request)
+                        .map_err(|_| ())?
+                } else if matches!(command, Command::Cancel(_)) {
+                    before
+                        .enrollment
+                        .native_cancellation(&request)
+                        .map_err(|_| ())?
+                } else {
+                    before
+                        .enrollment
+                        .native_recovery_pending(&request)
+                        .map_err(|_| ())?
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if !native_metadata_dispatch {
+        let config = env
+            .config
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .ok_or(())?;
+        let roster = config.join(accounts::Cli::Codex.accounts().roster_file);
+        store.recover_records(&roster).map_err(|_| ())?;
+    }
     let key = (sid.to_owned(), command.id().to_owned());
     match command {
         Command::Enroll { .. } => run_enrollment(command, sid, proof, lifetime, env, drive),
@@ -693,12 +800,22 @@ fn run_in(
                     remove_control(&key, &control);
                 }
             }
-            if matches!(command, Command::Poll(_)) && status.phase == enrollment::Phase::Running {
+            if matches!(command, Command::Poll(_))
+                && matches!(
+                    status.phase,
+                    enrollment::Phase::Running | enrollment::Phase::CancelRequested
+                )
+            {
                 let (current, warning) = store.load_logins(env.now).map_err(|_| ())?;
                 if warning.is_some() {
                     return Err(());
                 }
-                if current.enrollment.recoverable(&admitted).map_err(|_| ())? {
+                if current
+                    .enrollment
+                    .native_recovery_pending(&admitted)
+                    .map_err(|_| ())?
+                    || current.enrollment.recoverable(&admitted).map_err(|_| ())?
+                {
                     let enrollment = Command::Enroll {
                         operation: admitted.id.clone(),
                         revision: admitted.revision.clone(),
@@ -761,6 +878,11 @@ pub(crate) fn serve(
     if !read && ctx.fabric.hold().is_some() {
         return format!("ERR {namespace} denied\n");
     }
+    if !read
+        && let Some(reply) = cleanup::serve_if_eligible(ctx, master, &command, &before, lifetime)
+    {
+        return reply;
+    }
     let key = (
         ctx.self_id.as_str().to_owned(),
         command.kind(),
@@ -787,6 +909,7 @@ pub(crate) fn serve(
                 return format!("ERR {namespace} refused\n");
             };
             let job = Arc::new(Job {
+                cleanup_owner: None,
                 command: command.clone(),
                 proof: before.clone(),
                 started: std::time::Instant::now(),
@@ -834,7 +957,32 @@ pub(crate) fn serve(
     }
     reservation.dispatched();
 
-    if !before.alive() || accounts_control::claim(ctx, master).as_ref() != Some(&before) {
+    reply(
+        ctx,
+        master,
+        (namespace, read),
+        &command,
+        &before,
+        &job,
+        jobs(),
+    )
+}
+
+fn reply(
+    ctx: &Arc<crate::SessionCtx>,
+    master: i32,
+    (namespace, read): (&str, bool),
+    command: &Command,
+    before: &crate::self_claim::Proven,
+    job: &Arc<Job>,
+    registry: &Mutex<Registry>,
+) -> String {
+    let key = (
+        ctx.self_id.as_str().to_owned(),
+        command.kind(),
+        command.id().to_owned(),
+    );
+    if !before.alive() || accounts_control::claim(ctx, master).as_ref() != Some(before) {
         return format!("ERR {namespace} denied\n");
     }
     let result = job.result.lock().unwrap_or_else(|p| p.into_inner()).clone();
@@ -842,7 +990,7 @@ pub(crate) fn serve(
         if read {
             return format!("OK codex-accounts state=waiting request={}\n", command.id());
         }
-        let Some(binding) = session(ctx.self_id.as_str(), &before) else {
+        let Some(binding) = session(ctx.self_id.as_str(), before) else {
             return format!("ERR {namespace} refused\n");
         };
         return format!(
@@ -851,9 +999,9 @@ pub(crate) fn serve(
         );
     };
     {
-        let mut table = jobs().lock().unwrap_or_else(|p| p.into_inner());
+        let mut table = registry.lock().unwrap_or_else(|p| p.into_inner());
         let stale = read && (table.exhausted || table.sequence != job.intent_sequence);
-        table.remove(&key, &job);
+        table.remove(&key, job);
         if stale {
             return format!("OK codex-accounts state=waiting request={}\n", command.id());
         }
@@ -864,7 +1012,7 @@ pub(crate) fn serve(
     let Some(mut value) = value else {
         return format!("OK codex-accounts state=waiting request={}\n", command.id());
     };
-    let Some(binding) = session(ctx.self_id.as_str(), &before) else {
+    let Some(binding) = session(ctx.self_id.as_str(), before) else {
         return format!("ERR {namespace} refused\n");
     };
     let object = value.as_object_mut().expect("worker result object");
@@ -892,12 +1040,12 @@ mod tests {
     use aterm_agent::harness::{align::Captured, login_drive};
     use std::cell::Cell;
 
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn serial() -> std::sync::MutexGuard<'static, ()> {
         static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
         SERIAL.get_or_init(Mutex::default).lock().unwrap()
     }
 
-    fn fixture() -> (
+    pub(super) fn fixture() -> (
         aterm_tempfile::TempDir,
         Env,
         crate::self_claim::Proven,
@@ -941,6 +1089,141 @@ mod tests {
         Held,
         Panic,
     }
+
+    #[test]
+    fn actual_pending_response_settles_before_drain_without_a_source_registry() {
+        let _callbacks = enrollment::PendingCustodyFixture::serial_callbacks().unwrap();
+        for late in [false, true] {
+            let _serial = serial();
+            let lifetime = account_work::Lifetime::default();
+            let original = lifetime.enter().unwrap();
+            let cancellation = original.cancellation();
+            let (control, env, mut restore) = enrollment::PendingCustodyFixture::new(&original)
+                .unwrap()
+                .into_parts();
+            drop(original);
+            let owned = Arc::new(OwnedControl { control, env });
+            let key = ("pending-drain-test".to_owned(), "owned".to_owned());
+
+            let foreign_lifetime = account_work::Lifetime::default();
+            let foreign_scope = foreign_lifetime.enter().unwrap();
+            let foreign_cancel = foreign_scope.cancellation();
+            let (control, env, mut foreign_restore) =
+                enrollment::PendingCustodyFixture::new(&foreign_scope)
+                    .unwrap()
+                    .into_parts();
+            drop(foreign_scope);
+            // A wrongly selected foreign retry would now succeed and release its count.
+            foreign_restore.restore().unwrap();
+            let foreign = Arc::new(OwnedControl { control, env });
+            let foreign_key = ("pending-drain-test".to_owned(), "foreign".to_owned());
+            {
+                let mut table = controls().lock().unwrap();
+                table.insert(key.clone(), owned.clone());
+                table.insert(foreign_key.clone(), foreign.clone());
+            }
+            let pause = lifetime.pause().unwrap();
+            let persistent = App::settle_enrollment_custody(&lifetime);
+            let still_counted = pause.try_wait();
+            let refused = still_counted.is_err();
+            let held_resources = restore.resources_available();
+            if late {
+                remove_control(&key, &owned);
+            }
+            let (swept_send, swept_receive) = std::sync::mpsc::channel();
+            let (resume_send, resume_receive) = std::sync::mpsc::channel();
+            let (done_send, done_receive) = std::sync::mpsc::channel();
+            let worker_lifetime = lifetime.clone();
+            let worker = std::thread::spawn(move || {
+                let drained = match still_counted {
+                    Err(pause) => crate::app_account_work::drain_custody_for_test(
+                        pause,
+                        &worker_lifetime,
+                        Some(crate::app_account_work::CustodySweepCheckpoint {
+                            swept: swept_send,
+                            resume: resume_receive,
+                        }),
+                    ),
+                    Ok(drained) => drained,
+                };
+                let _ = done_send.send(drained);
+            });
+            let swept = swept_receive.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+            let pending_before_restore = owned.has_pending_custody();
+            let retired_before_restore = owned.work_retired();
+            let foreign_before = (
+                foreign.has_pending_custody(),
+                foreign.work_retired(),
+                foreign_cancel.cancelled(),
+            );
+            if late {
+                controls()
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), owned.clone());
+            }
+            let restored = restore.restore();
+            let resumed = resume_send.send(());
+            let completed = done_receive.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+            let automatic = completed.is_ok();
+            let automatic_resources = restore.resources_available();
+            let foreign_resources = foreign_restore.resources_available();
+            // Rescue real custody before joining even if drain orchestration regresses.
+            let settled = owned.settle_custody(&owned.env);
+            let pending_after = owned.has_pending_custody();
+            let retired_after = owned.work_retired() && cancellation.retired();
+            let sealed = automatic && App::seal_enrollment_retirement(&lifetime);
+            remove_control(&key, &owned);
+            // Teardown of this synthetic private world cannot qualify as settlement:
+            // `automatic` was captured before the fallback and must still be true.
+            drop(owned);
+            let completed = match completed {
+                Ok(drained) => Ok(drained),
+                Err(_) => done_receive.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+            };
+            let joined = worker.join();
+            let foreign_settled = foreign.settle_custody(&foreign.env);
+            let foreign_released_resources = foreign_restore.resources_available();
+            let foreign_pause = foreign_lifetime.pause().unwrap();
+            let foreign_retired = foreign_pause.try_wait();
+            let foreign_automatic = foreign_retired.is_ok();
+            let foreign_sealed = App::seal_enrollment_retirement(&foreign_lifetime);
+            remove_control(&foreign_key, &foreign);
+            drop(foreign);
+            let foreign_drained = match foreign_retired {
+                Ok(drained) => Ok(drained),
+                Err(pause) => pause.try_wait(),
+            };
+
+            joined.unwrap();
+            restored.unwrap();
+            settled.unwrap();
+            foreign_settled.unwrap();
+            assert!(
+                persistent && refused,
+                "actual failed storage retains its original count"
+            );
+            swept.expect("actual first custody sweep completed before late insertion");
+            assert!(resumed.is_ok());
+            assert!(pending_before_restore && !retired_before_restore);
+            assert_eq!(held_resources.unwrap(), [false; 4]);
+            assert_eq!(foreign_before, (true, false, false));
+            assert!(
+                automatic,
+                "the drain itself must retry owned custody before count-zero"
+            );
+            assert!(!pending_after && retired_after);
+            assert_eq!(automatic_resources.unwrap(), [true; 4]);
+            assert_eq!(foreign_resources.unwrap(), [false; 4]);
+            assert_eq!(foreign_released_resources.unwrap(), [true; 4]);
+            assert!(sealed && foreign_sealed && foreign_automatic);
+            completed.unwrap().resume().unwrap();
+            foreign_drained.unwrap().resume().unwrap();
+            assert!(lifetime.enter().is_some());
+            assert!(foreign_lifetime.enter().is_some());
+        }
+    }
+
     struct FailedProvider(
         Cell<usize>,
         ProviderEnd,
@@ -1347,6 +1630,7 @@ mod tests {
         let scope = lifetime.enter().unwrap();
         let custody = scope.cancellation();
         let job = Arc::new(Job {
+            cleanup_owner: None,
             command: Command::Enroll {
                 operation: "7".repeat(32),
                 revision: "a".repeat(64),
@@ -1411,6 +1695,7 @@ mod tests {
             let scope = lifetime.enter().unwrap();
             let custody = scope.cancellation();
             let job = Arc::new(Job {
+                cleanup_owner: None,
                 command: Command::Enroll {
                     operation: "9".repeat(32),
                     revision: "a".repeat(64),
@@ -1456,6 +1741,7 @@ mod tests {
             let scope = lifetime.enter().unwrap();
             let custody = scope.cancellation();
             let job = Arc::new(Job {
+                cleanup_owner: None,
                 command: Command::Enroll {
                     operation: "8".repeat(32),
                     revision: "a".repeat(64),
@@ -1470,6 +1756,7 @@ mod tests {
                 result: Mutex::new(None),
             });
             let replacement = Arc::new(Job {
+                cleanup_owner: None,
                 command: job.command.clone(),
                 proof: crate::self_claim::Proven {
                     start: "replacement-fixture".into(),
@@ -1534,6 +1821,7 @@ mod tests {
             let (root, env, proof, sid) = fixture();
             let key = (sid.clone(), command.kind(), command.id().to_owned());
             let job = Arc::new(Job {
+                cleanup_owner: None,
                 command,
                 proof: proof.clone(),
                 started: std::time::Instant::now(),
@@ -1571,6 +1859,7 @@ mod tests {
             let key = (sid.clone(), "enroll", command.id().to_owned());
             let make_job = || {
                 Arc::new(Job {
+                    cleanup_owner: None,
                     command: command.clone(),
                     proof: proof.clone(),
                     started: std::time::Instant::now(),
@@ -1621,6 +1910,216 @@ mod tests {
             }
             assert!(!env.state.exists());
         }
+    }
+
+    #[test]
+    fn retained_native_b_recovers_after_a_publication_without_replaying_authentication() {
+        let _serial = serial();
+        let (_root, _old_env, proof, sid) = fixture();
+        let native = enrollment::NativeRowRecoveryFixture::new(&caller(&sid, &proof));
+        native.retire_originals().unwrap();
+        let b = native.requests()[1].clone();
+        assert_eq!(
+            native.publish_first().unwrap().phase,
+            enrollment::Phase::Applied
+        );
+        let env = native.env();
+        let store = env.accounts_store_for(accounts::Cli::Codex).unwrap();
+        let roster = env.accounts_roster_for(accounts::Cli::Codex).unwrap();
+        let records = store.peek_account_records(&roster, env.now).unwrap();
+        assert_ne!(
+            accounts::pool_authority_revision(&records.raw_roster, &records.logins).unwrap(),
+            b.revision
+        );
+        assert!(
+            records
+                .logins
+                .enrollment
+                .native_recovery_pending(&b)
+                .unwrap()
+        );
+        let lifetime = account_work::Lifetime::default();
+        // Reusing the operation id cannot change its original body.
+        for (revision, account) in [
+            ("d".repeat(64), accounts_control::account_id(&b.label)),
+            (b.revision.clone(), accounts_control::account_id("alpha")),
+        ] {
+            let changed = Command::Enroll {
+                operation: b.id.clone(),
+                revision,
+                account,
+            };
+            assert!(
+                run_in(&changed, &sid, &proof, &lifetime, env, |_, _| {
+                    panic!("changed retained request cannot dispatch")
+                })
+                .is_err()
+            );
+        }
+        let dispatched = Cell::new(0);
+        let recovered = run_in(
+            &Command::Poll(b.id.clone()),
+            &sid,
+            &proof,
+            &lifetime,
+            env,
+            |work, env| {
+                dispatched.set(dispatched.get() + 1);
+                assert_eq!(env.home, native.env().home);
+                native.run_recovery(work)
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(dispatched.get(), 1);
+        assert_eq!(recovered["phase"].as_str(), Some("applied"));
+        assert_eq!(recovered["generation"].as_u64(), Some(2));
+        assert!(
+            !store
+                .load_logins(env.now)
+                .unwrap()
+                .0
+                .enrollment
+                .native_recovery_pending(&b)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn retained_native_cancellation_retires_without_parsing_the_current_roster() {
+        let _serial = serial();
+        let (_root, _old_env, proof, sid) = fixture();
+        let native = enrollment::NativeRowRecoveryFixture::new(&caller(&sid, &proof));
+        native.retire_originals().unwrap();
+        native.cancel_first_after_publication_claim().unwrap();
+        let request = native.requests()[0].clone();
+        let env = native.env();
+        let roster = env.accounts_roster_for(accounts::Cli::Codex).unwrap();
+        std::fs::write(&roster, "not [valid TOML").unwrap();
+        let store = env.accounts_store_for(accounts::Cli::Codex).unwrap();
+        let before = store.load_logins(env.now).unwrap().0;
+        assert!(before.enrollment.native_recovery_pending(&request).unwrap());
+        let lifetime = account_work::Lifetime::default();
+        let dispatched = Cell::new(0);
+        let cancelled = run_in(
+            &Command::Poll(request.id.clone()),
+            &sid,
+            &proof,
+            &lifetime,
+            env,
+            |work, _| {
+                dispatched.set(dispatched.get() + 1);
+                native.run_recovery(work)
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(dispatched.get(), 1);
+        assert_eq!(cancelled["phase"].as_str(), Some("cancelled"));
+        let after = store.load_logins(env.now).unwrap().0;
+        assert_eq!(after.labels, before.labels);
+        assert_eq!(after.generation_clock, before.generation_clock);
+        assert_eq!(std::fs::read_to_string(roster).unwrap(), "not [valid TOML");
+        assert!(!after.enrollment.native_recovery_pending(&request).unwrap());
+        for replay in [
+            Command::Poll(request.id.clone()),
+            Command::Cancel(request.id.clone()),
+            Command::Enroll {
+                operation: request.id.clone(),
+                revision: request.revision.clone(),
+                account: accounts_control::account_id(&request.label),
+            },
+        ] {
+            assert_eq!(
+                run_in(&replay, &sid, &proof, &lifetime, env, |_, _| {
+                    panic!("terminal native replay cannot dispatch work")
+                })
+                .unwrap()
+                .unwrap(),
+                cancelled
+            );
+        }
+    }
+
+    #[test]
+    fn live_native_original_can_be_cancelled_and_retired_with_a_malformed_roster() {
+        let _serial = serial();
+        let (_root, _old_env, proof, sid) = fixture();
+        let native = enrollment::NativeRowRecoveryFixture::new(&caller(&sid, &proof));
+        let request = native.requests()[0].clone();
+        let env = native.env();
+        let lifetime = account_work::Lifetime::default();
+        let (work, control) = native.first_original(lifetime.enter().unwrap());
+        let control = Arc::new(OwnedControl {
+            control,
+            env: env.clone(),
+        });
+        let key = (sid.clone(), request.id.clone());
+        controls()
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Arc::clone(&control));
+        let roster = env.accounts_roster_for(accounts::Cli::Codex).unwrap();
+        std::fs::write(&roster, "not [valid TOML").unwrap();
+        let store = env.accounts_store_for(accounts::Cli::Codex).unwrap();
+        let before = store.load_logins(env.now).unwrap().0;
+        assert!(before.enrollment.native_cancellation(&request).unwrap());
+        assert!(!before.enrollment.native_recovery_pending(&request).unwrap());
+        let cancel = Command::Cancel(request.id.clone());
+        let pending = run_in(&cancel, &sid, &proof, &lifetime, env, |_, _| {
+            panic!("cancellation cannot dispatch authentication")
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(pending["phase"].as_str(), Some("cancel_requested"));
+        assert!(!control.work_retired());
+        drop(work);
+        assert!(control.work_retired());
+        let cancelled = run_in(&cancel, &sid, &proof, &lifetime, env, |_, _| {
+            panic!("retirement cannot dispatch authentication")
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(cancelled["phase"].as_str(), Some("cancelled"));
+        assert!(!controls().lock().unwrap().contains_key(&key));
+        let after = store.load_logins(env.now).unwrap().0;
+        assert_eq!(after.labels, before.labels);
+        assert_eq!(after.generation_clock, before.generation_clock);
+        assert_eq!(std::fs::read_to_string(roster).unwrap(), "not [valid TOML");
+    }
+
+    #[test]
+    fn fresh_enrollment_cannot_use_a_revision_from_before_another_row_was_added() {
+        let _serial = serial();
+        let (_root, env, proof, sid) = fixture();
+        let baseline = discovery(&env, &sid, &proof).unwrap().unwrap();
+        let path = env.accounts_roster_for(accounts::Cli::Codex).unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+        let other = accounts::Row {
+            label: "other".into(),
+            email: Some("other@example.test".into()),
+            ..Default::default()
+        };
+        std::fs::write(
+            &path,
+            accounts::append_rows_for(accounts::Cli::Codex, &original, &[other]).unwrap(),
+        )
+        .unwrap();
+        let current = discovery(&env, &sid, &proof).unwrap().unwrap();
+        assert_ne!(baseline["revision"], current["revision"]);
+        let command = Command::Enroll {
+            operation: "b".repeat(32),
+            revision: baseline["revision"].as_str().unwrap().into(),
+            account: accounts_control::account_id("main"),
+        };
+        let lifetime = account_work::Lifetime::default();
+        let refused = run_in(&command, &sid, &proof, &lifetime, &env, |_, _| {
+            panic!("fresh stale enrollment cannot dispatch provider or recovery work")
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(refused["phase"].as_str(), Some("refused"));
+        assert_eq!(refused["generation"], Value::Null);
     }
 
     #[test]
@@ -1709,6 +2208,7 @@ mod tests {
         };
         let key = (sid.clone(), "enroll", command.id().to_owned());
         let job = Arc::new(Job {
+            cleanup_owner: None,
             command: command.clone(),
             proof: proof.clone(),
             started: std::time::Instant::now(),

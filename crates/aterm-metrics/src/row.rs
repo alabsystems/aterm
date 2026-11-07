@@ -10,6 +10,7 @@
 //! | [`PlaceRow`] | `shared/now/place/<account>` | where an account is placed here (`fill`, `borrow`, …) |
 //! | [`NeedsRow`] | `shared/now/needs` | the sessions that need a person, held sessions and managers |
 //! | [`UnreadRow`] | `shared/now/unread` | the account pools this Mac could not read |
+//! | [`ActivityRow`] | `shared/now/activity` | its agents counted by word, and the first of them by id and word |
 //! | [`WindowRecord`] | `shared/1m/…`, `shared/1h/…` | one window's summary: origin, metric, window, revision |
 //!
 //! **Words and numbers only.** No row field is for an address, password, token, cookie, URL,
@@ -44,6 +45,8 @@
 //! NeedsRow     'N' 1 | at | n | n × (sid | word | harness | ?worker_of | ?since)
 //!                    | n | n × (sid | hold | ?by | ?since) | n | n × (sid | workers)
 //! UnreadRow    'U' 1 | at | n | n × pool
+//! ActivityRow  'T' 1 | at | busy | idle | waiting | walled | unknown
+//!                    | n | n × (sid | word | ?detail)
 //! WindowRecord 'W' 1 | id len | astream SummaryId | revision | astream Summary (to the end)
 //! ```
 //!
@@ -68,6 +71,8 @@ pub const KIND_PLACE: u8 = b'P';
 pub const KIND_NEEDS: u8 = b'N';
 /// The kind byte of an [`UnreadRow`].
 pub const KIND_UNREAD: u8 = b'U';
+/// The kind byte of an [`ActivityRow`].
+pub const KIND_ACTIVITY: u8 = b'T';
 /// The kind byte of a [`WindowRecord`].
 pub const KIND_WINDOW: u8 = b'W';
 /// The one version of every row this build writes and reads.
@@ -84,6 +89,16 @@ pub const AGY_GROUPS_MAX: usize = 32;
 pub const NEEDS_MAX: usize = 128;
 /// The most pools an [`UnreadRow`] names.
 pub const UNREAD_MAX: usize = 16;
+/// The most agent sessions an [`ActivityRow`] lists by id: the Fleet glance's own bound on one
+/// Mac's sessions (`aterm-gui` `fleet_glance::SESSIONS_MAX`).
+pub const AGENTS_LISTED_MAX: usize = 32;
+/// How often a publisher writes an [`ActivityRow`] again that says what the log already holds,
+/// Unix seconds: a reader judges a row this old fresh, and one past [`ACTIVITY_FRESH_MS`] gone.
+pub const ACTIVITY_REFRESH_S: u64 = 600;
+/// How far an [`ActivityRow`]'s `at` may trail its Mac's presence row before a reader takes it as
+/// not read: two refreshes missed and a sample's period more. Both times are the origin's own
+/// clock, so no Mac's skew moves it.
+pub const ACTIVITY_FRESH_MS: u64 = 25 * 60 * 1000;
 /// The longest [`Word`], in bytes.
 pub const WORD_MAX: usize = 32;
 /// The longest [`Label`], in bytes: the harness's (`accounts.rs` `LABEL_MAX`).
@@ -1026,6 +1041,131 @@ impl UnreadRow {
 }
 
 // ---------------------------------------------------------------------------
+// Agent activity
+// ---------------------------------------------------------------------------
+
+/// One agent session by id and word ([`ActivityRow::sessions`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentEntry {
+    /// The session.
+    pub sid: Sid,
+    /// What it is doing: `busy`, `idle`, `waiting`, `walled` or `unknown`. A word a later build
+    /// adds reads as itself.
+    pub word: Word,
+    /// The word's detail: a wall's kind (`usage-weekly`, `auth`) for `walled`.
+    pub detail: Option<Word>,
+}
+
+/// What this Mac's agents are doing (the Fleet field's activity marks, `aterm-gui`
+/// `fleet_glance::AgentTally`): each word's count, and the first [`AGENTS_LISTED_MAX`] agent
+/// sessions by id and word. Counts, ids and words only; a session's program, title, task and
+/// context never leave the Mac. Its agent count is the sum of the five, so a value has one
+/// encoding.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ActivityRow {
+    /// When the windows were read, Unix seconds.
+    pub at: u64,
+    /// At work.
+    pub busy: u32,
+    /// At rest.
+    pub idle: u32,
+    /// Waiting on a person.
+    pub waiting: u32,
+    /// At a limit.
+    pub walled: u32,
+    /// Any other word.
+    pub unknown: u32,
+    /// The first agent sessions, at most [`AGENTS_LISTED_MAX`] and at most [`Self::agents`].
+    pub sessions: Vec<AgentEntry>,
+}
+
+impl ActivityRow {
+    /// Where `node` publishes it.
+    #[must_use]
+    pub const fn subject(node: Node) -> Subject {
+        Subject::Now {
+            node,
+            now: Now::Activity,
+        }
+    }
+
+    /// Its agents: the five counts' sum.
+    #[must_use]
+    pub const fn agents(&self) -> u32 {
+        self.busy
+            .saturating_add(self.idle)
+            .saturating_add(self.waiting)
+            .saturating_add(self.walled)
+            .saturating_add(self.unknown)
+    }
+
+    /// The canonical encoding: the first [`AGENTS_LISTED_MAX`] sessions, and no more than it
+    /// counts agents.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let listed = usize::try_from(self.agents())
+            .unwrap_or(usize::MAX)
+            .min(AGENTS_LISTED_MAX);
+        let mut o = Out::with_capacity(KIND_ACTIVITY, 24 + self.sessions.len().min(listed) * 40);
+        o.varint(self.at);
+        for n in [
+            self.busy,
+            self.idle,
+            self.waiting,
+            self.walled,
+            self.unknown,
+        ] {
+            o.varint(u64::from(n));
+        }
+        let k = o.count(&self.sessions, listed);
+        for e in self.sessions.iter().take(k) {
+            o.sid(e.sid);
+            o.text(e.word.as_str());
+            o.opt_text(e.detail.as_ref().map(Word::as_str));
+        }
+        o.0
+    }
+
+    /// Decode a canonical encoding.
+    ///
+    /// # Errors
+    /// [`RowError`] for anything [`ActivityRow::encode`] does not write: more sessions than
+    /// [`AGENTS_LISTED_MAX`], or than its counts sum to, among them.
+    pub fn decode(bytes: &[u8]) -> Result<ActivityRow, RowError> {
+        let mut r = In::head(bytes, KIND_ACTIVITY)?;
+        let at = r.varint()?;
+        let busy = r.u32("the busy agents")?;
+        let idle = r.u32("the idle agents")?;
+        let waiting = r.u32("the waiting agents")?;
+        let walled = r.u32("the walled agents")?;
+        let unknown = r.u32("the agents of another word")?;
+        let mut row = ActivityRow {
+            at,
+            busy,
+            idle,
+            waiting,
+            walled,
+            unknown,
+            sessions: Vec::new(),
+        };
+        let n = r.count(AGENTS_LISTED_MAX, "agent sessions")?;
+        if u64::try_from(n).unwrap_or(u64::MAX) > u64::from(row.agents()) {
+            return Err(RowError::TooMany("agent sessions for the tally"));
+        }
+        row.sessions.reserve(n);
+        for _ in 0..n {
+            row.sessions.push(AgentEntry {
+                sid: r.sid("a session id")?,
+                word: r.word("an agent word")?,
+                detail: r.opt_word("an agent word's detail")?,
+            });
+        }
+        r.finish()?;
+        Ok(row)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Window records
 // ---------------------------------------------------------------------------
 
@@ -1192,6 +1332,8 @@ pub enum Row {
     Needs(NeedsRow),
     /// The pools the Mac could not read.
     Unread(UnreadRow),
+    /// What the Mac's agents are doing.
+    Activity(ActivityRow),
     /// A window's summary.
     Window(WindowRecord),
 }
@@ -1206,6 +1348,7 @@ impl Row {
             Row::Place(r) => r.encode(),
             Row::Needs(r) => r.encode(),
             Row::Unread(r) => r.encode(),
+            Row::Activity(r) => r.encode(),
             Row::Window(r) => r.encode(),
         }
     }
@@ -1239,6 +1382,7 @@ impl Row {
             Subject::Now { now, .. } => match now {
                 Now::Needs => NeedsRow::decode(body).map(Row::Needs),
                 Now::Unread => UnreadRow::decode(body).map(Row::Unread),
+                Now::Activity => ActivityRow::decode(body).map(Row::Activity),
                 Now::Place(account) => {
                     let row = PlaceRow::decode(body)?;
                     if row.account != account {
@@ -1271,6 +1415,7 @@ impl Row {
             Row::Place(r) => Some(r.subject(node)),
             Row::Needs(_) => Some(NeedsRow::subject(node)),
             Row::Unread(_) => Some(UnreadRow::subject(node)),
+            Row::Activity(_) => Some(ActivityRow::subject(node)),
             Row::Window(r) => (r.node == node).then(|| r.subject()),
         }
     }

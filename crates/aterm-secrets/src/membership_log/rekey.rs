@@ -26,6 +26,10 @@
 //!   after the signer's prior one, and the exchange moves a few records a round; a `Wrap` missing
 //!   from a prefix reads as a recipient left out on purpose ([`Log::left_out`]), so the tender
 //!   mints from, and the gap closer closes gaps on, no such epoch while it may still be arriving.
+//!   An epoch settles once its minter signs again, or, of a seat audience, once its minter's
+//!   `Wrap`s here reach past every recipient its batch could still wrap
+//!   ([`Log::batch_could_wrap`]): the rest of the batch can wrap no one, so a batch that ends in
+//!   `Wrap`s settles when its last `Wrap` arrives, not after a grace (one-mesh §11 H2).
 //! - [`Log::batch_may_wrap`] and [`Log::in_flight`]: what the rest of such a batch may still wrap
 //!   (a recipient its audience held before it, above the last one its minter's `Wrap`s reach
 //!   here), and of that the recipients a current seat binds. A writer seals under such an epoch
@@ -37,7 +41,8 @@
 //! - [`Log::undecided`]: those Macs with no seat, which only the batch can decide. A writer seals
 //!   under its epoch; the tender waits for the batch within its settle grace, a re-key of
 //!   another audience for `[everyone]`'s batch too, and no longer, since no record marks a
-//!   batch's end.
+//!   batch's end: one that left such a Mac out, above its last `Wrap`, reads the same as one
+//!   whose `Wrap` to it is still on its way.
 //! - [`secure_twins`]: two or more newest epochs with one recipient set and no removed recipient,
 //!   which need no coalescing; a writer seals under the lowest id among them.
 
@@ -78,6 +83,12 @@ thread_local! {
     /// test sets it for its thread; a lab instance turns it on for its whole process with
     /// `unsettled-ok` in `ATERM_TEST_NEGATIVE_CONTROL` ([`unsettled_ok`]).
     pub(crate) static UNSETTLED_OK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of a batch's frontier ([`Log::batch_whole`]): while set, an epoch
+    /// settles only once its minter signs a record other than a `Wrap` after it, as before
+    /// one-mesh §11 H2, so a whole batch that ends in `Wrap`s reads as a prefix until the settle
+    /// grace. A test sets it for its thread; a lab instance turns it on for its whole process
+    /// with `frontier-blind` in `ATERM_TEST_NEGATIVE_CONTROL` ([`frontier_blind`]).
+    pub(crate) static FRONTIER_BLIND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether [`UNSETTLED_OK`] is on: set on this thread, or named for this process
@@ -85,6 +96,24 @@ thread_local! {
 #[cfg(any(test, debug_assertions))]
 pub(crate) fn unsettled_ok() -> bool {
     UNSETTLED_OK.with(std::cell::Cell::get) || aterm_types::negative_control::on("unsettled-ok")
+}
+
+/// Whether [`FRONTIER_BLIND`] is on: set on this thread, or named for this process
+/// (`frontier-blind`, [`aterm_types::negative_control::on`]).
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn frontier_blind() -> bool {
+    FRONTIER_BLIND.with(std::cell::Cell::get) || aterm_types::negative_control::on("frontier-blind")
+}
+
+/// What a log holds of the `Wrap`s of one epoch ([`Log::batch_wraps`]).
+struct BatchWraps {
+    /// Every recipient a counting `Wrap` of the epoch names, whoever signed it.
+    wrapped: BTreeSet<Recipient>,
+    /// The highest recipient its minter's `Wrap`s of it in its own batch reach here.
+    frontier: Option<Recipient>,
+    /// The index of the minter's last record of that batch this log holds: the `Wrap` at the
+    /// frontier, or the `Epoch` where it holds none.
+    last: usize,
 }
 
 /// One audience due a new epoch ([`Log::rekey_dues`]).
@@ -465,14 +494,21 @@ impl Log {
     }
 
     /// The epochs of `epochs` whose minter's batch this log may hold only a prefix of: it holds
-    /// no record by the epoch's minter but a `Wrap` with the epoch in its causal past (a later
-    /// `Epoch`, `Put` or any other record settles it). An epoch it does not hold is not named.
+    /// no record its minter signed after the batch's own records of it (a later `Epoch`, `Put`,
+    /// a `Wrap` of another epoch or of a later batch: each record follows its signer's prior one,
+    /// so any of them puts the whole batch here), and cannot tell from the `Wrap`s it holds that
+    /// the batch is whole ([`Log::batch_whole`]). An epoch it does not hold is not named.
     #[must_use]
     pub fn unsettled(&self, epochs: &[RecordId]) -> Vec<RecordId> {
         #[cfg(any(test, debug_assertions))]
         if unsettled_ok() {
             return Vec::new();
         }
+        // Under the control, as before H2: only a record other than a `Wrap` settles.
+        #[cfg(any(test, debug_assertions))]
+        let blind = frontier_blind();
+        #[cfg(not(any(test, debug_assertions)))]
+        let blind = false;
         let effective = self.effective();
         epochs
             .iter()
@@ -481,19 +517,238 @@ impl Log {
                 let Some(&at) = self.held.get(id) else {
                     return false;
                 };
-                let minter = self.order[at].actor();
-                !self
+                let epoch = &self.order[at];
+                let signed_again = self
                     .order
                     .iter()
                     .enumerate()
                     .skip(at + 1)
                     .any(|(i, record)| {
-                        record.actor() == minter
-                            && !matches!(record.body(), Body::Wrap { .. })
+                        record.actor() == epoch.actor()
                             && effective.before(at, i)
-                    })
+                            && match record.body() {
+                                Body::Wrap { epoch: of, .. } => {
+                                    !blind
+                                        && (of != id || record.authored_ms() != epoch.authored_ms())
+                                }
+                                _ => true,
+                            }
+                    });
+                !signed_again && (blind || !self.batch_whole(at))
             })
             .collect()
+    }
+
+    /// Whether this log holds every `Wrap` of the batch that minted the epoch at `at`, though no
+    /// record marks a batch's end and its minter signed nothing here since (one-mesh §11 H2):
+    /// the epoch is of a seat audience (`[everyone]`, Commons), and every recipient that batch
+    /// could wrap ([`Log::batch_could_wrap`]) is wrapped here or sorts below the highest
+    /// recipient its minter's `Wrap`s reach here (its frontier). A batch wraps in ascending
+    /// recipient order, so the rest of it can wrap only a recipient above the frontier, and
+    /// there is none it could. A seat below the frontier that no `Wrap` hands the epoch was left
+    /// out on purpose, so its gap heals at once rather than after the settle grace. A host list's
+    /// batch wraps the Macs its text names, which no record before its `Put`s carries, so it
+    /// settles only when its minter signs again.
+    fn batch_whole(&self, at: usize) -> bool {
+        let Body::Epoch { audience, .. } = self.order[at].body() else {
+            return false;
+        };
+        if matches!(audience, EpochAudience::Hosts(_)) {
+            return false;
+        }
+        let Some(batch) = self.batch_wraps(at) else {
+            return true;
+        };
+        self.batch_could_wrap(at, batch.last)
+            .iter()
+            .all(|r| batch.wrapped.contains(r) || batch.frontier.is_some_and(|last| *r < last))
+    }
+
+    /// What this log holds of the `Wrap`s of the epoch at `at` ([`BatchWraps`]); `None` where its
+    /// minter wrapped it in a later batch too (a `Wrap` of it authored at another time), so the
+    /// batch that minted it is whole here.
+    fn batch_wraps(&self, at: usize) -> Option<BatchWraps> {
+        let record = &self.order[at];
+        let (epoch, minter) = (record.id(), record.actor());
+        let effective = self.effective();
+        let mut out = BatchWraps {
+            wrapped: BTreeSet::new(),
+            frontier: None,
+            last: at,
+        };
+        // A `Wrap` follows its epoch, which it pins in its causal past.
+        for (i, other) in self.order.iter().enumerate().skip(at + 1) {
+            if !effective.counts(i) {
+                continue;
+            }
+            let Body::Wrap {
+                epoch: of,
+                recipient,
+                ..
+            } = other.body()
+            else {
+                continue;
+            };
+            if of != epoch {
+                continue;
+            }
+            out.wrapped.insert(*recipient);
+            if other.actor() == minter {
+                if other.authored_ms() != record.authored_ms() {
+                    return None;
+                }
+                if out.frontier < Some(*recipient) {
+                    out.frontier = Some(*recipient);
+                    out.last = i;
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// The recipients the batch that minted the epoch at `at` could wrap, read from the causal
+    /// past of `last`, its minter's last record of that batch this log holds (a draft follows at
+    /// most [`crate::envelope::MAX_PARENTS`] heads and the signer's next record the rest, so that
+    /// past holds what the minter knew): each seat the genesis or an `Admit` there binds, unless
+    /// a `Remove` there took its member out and this log reads that removal effective (a mint
+    /// wraps the current seats its minter knows, one-mesh M1 and M4), and each recipient some
+    /// causally newest epoch of the audience before it wraps there ([`Log::heads_before`]),
+    /// seated or not, which bounds what a 0.154.0 Mac's intersection carry and a waiting write's
+    /// union carry it from. A seat its minter could not know is no recipient of its batch: it is a
+    /// gap of the epoch, wherever it sorts. A key no seat binds and no causally newest earlier
+    /// epoch of the audience wraps (a `[machines]` key a person's edit lets in) is not named: no record here says the
+    /// batch may wrap it, so nothing reads its missing `Wrap` either way, and a re-key's carry,
+    /// which takes seats alone, leaves it out wherever the batch reads whole.
+    fn batch_could_wrap(&self, at: usize, last: usize) -> BTreeSet<Recipient> {
+        let seats = self.seat_recipients();
+        let effective = self.effective();
+        let membership = self.membership_ref();
+        let mut bound: BTreeMap<MemberId, BTreeSet<Recipient>> = BTreeMap::new();
+        if let Body::Genesis { founders, .. } = self.genesis().body() {
+            for founder in founders {
+                if let Some(actor) = founder.member() {
+                    bound.entry(actor).or_default().insert(founder.recipient);
+                }
+            }
+        }
+        let mut gone: BTreeSet<MemberId> = BTreeSet::new();
+        for (i, record) in self.order.iter().enumerate().take(last).skip(1) {
+            if !effective.before(i, last) {
+                continue;
+            }
+            match record.body() {
+                Body::Admit { entrant, .. } => {
+                    bound
+                        .entry(entrant.member())
+                        .or_default()
+                        .insert(entrant.request.binding().recipient());
+                }
+                Body::Remove { member, .. } if membership.removed().contains_key(member) => {
+                    gone.insert(*member);
+                }
+                _ => {}
+            }
+        }
+        let mut could: BTreeSet<Recipient> = bound
+            .into_iter()
+            .filter(|(member, _)| !gone.contains(member))
+            .flat_map(|(_, set)| set)
+            .collect();
+        could.extend(self.heads_before(at, last, &seats).into_iter().flatten());
+        could
+    }
+
+    /// What the minter of the epoch at `at` had seen of its audience's causally newest epochs
+    /// before it, read from the causal past of the record at `upto` (the epoch itself, or its
+    /// minter's last `Wrap` of it, whose past also holds the heads the epoch's draft left out):
+    /// for each such epoch, not `at`'s and not after it, the recipients its counting `Wrap`s there
+    /// name, less each one a `Remove` there took out (`seats`: each recipient a seat ever bound,
+    /// by member), but an Undo's share that a Mac the Undo's target removed signed, which is no
+    /// removal to a minter that holds too few of its quorum's shares. Empty for an audience's
+    /// first epoch.
+    fn heads_before(
+        &self,
+        at: usize,
+        upto: usize,
+        seats: &BTreeMap<MemberId, BTreeSet<Recipient>>,
+    ) -> Vec<BTreeSet<Recipient>> {
+        let Body::Epoch { audience, .. } = self.order[at].body() else {
+            return Vec::new();
+        };
+        let effective = self.effective();
+        // A `Remove` before the epoch its minter read as one: any that counts here but an Undo's
+        // share, which a minter holding too few of its quorum's shares reads as no removal.
+        // NEGATIVE CONTROL `removed-before-unauthorized`: every counted `Remove`, an Undo's share
+        // included. NEGATIVE CONTROL `removed-before-plain`: only one authorized with nothing
+        // void, which leaves out every `Remove` a Mac an Undo restored signs.
+        #[cfg(any(test, debug_assertions))]
+        let known = {
+            let unauthorized = aterm_types::negative_control::on("removed-before-unauthorized");
+            let plain_only = aterm_types::negative_control::on("removed-before-plain");
+            move |i: usize| {
+                if unauthorized {
+                    effective.counts(i)
+                } else if plain_only {
+                    effective.counts_plain(i)
+                } else {
+                    effective.counts_where_held(i)
+                }
+            }
+        };
+        #[cfg(not(any(test, debug_assertions)))]
+        let known = |i: usize| effective.counts_where_held(i);
+        let mut before: Vec<usize> = Vec::new();
+        let mut wraps_of: BTreeMap<RecordId, BTreeSet<Recipient>> = BTreeMap::new();
+        let mut removed_before: BTreeSet<Recipient> = BTreeSet::new();
+        for (i, other) in self.order.iter().enumerate().take(upto).skip(1) {
+            if !effective.counts(i) || !effective.before(i, upto) {
+                continue;
+            }
+            match other.body() {
+                Body::Wrap {
+                    epoch: of,
+                    recipient,
+                    ..
+                } => {
+                    wraps_of.entry(*of).or_default().insert(*recipient);
+                }
+                Body::Epoch { audience: aud, .. }
+                    if aud == audience && i != at && !effective.before(at, i) =>
+                {
+                    before.push(i);
+                }
+                Body::Remove { member, .. } if known(i) => {
+                    removed_before.extend(seats.get(member).into_iter().flatten().copied());
+                }
+                _ => {}
+            }
+        }
+        effective
+            .newest(&before, |&b| b)
+            .into_iter()
+            .map(|&b| {
+                wraps_of
+                    .get(self.order[b].id())
+                    .map(|set| set.difference(&removed_before).copied().collect())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// What the minter of the epoch at `at` could carry on by the 0.154.0 intersection carry:
+    /// each recipient every causally newest epoch of its audience before it wraps by a counting
+    /// `Wrap` in its causal past, that no `Remove` before it took out ([`Log::heads_before`]).
+    /// Empty for an audience's first epoch.
+    fn carry_on(
+        &self,
+        at: usize,
+        seats: &BTreeMap<MemberId, BTreeSet<Recipient>>,
+    ) -> BTreeSet<Recipient> {
+        let mut heads = self.heads_before(at, at, seats).into_iter();
+        let first = heads.next().unwrap_or_default();
+        heads.fold(first, |held, set| {
+            held.intersection(&set).copied().collect()
+        })
     }
     /// Each recipient a seat ever bound, by member, from the genesis and every `Admit`, the Macs
     /// now out included.
@@ -519,17 +774,17 @@ impl Log {
 
     /// What the rest of `epoch`'s batch may still wrap, where this log may hold only a prefix of
     /// it ([`Log::unsettled`]) and its minter is not the Mac whose recipient is `mine`: each
-    /// recipient that every causally newest epoch of its audience before it wraps by a `Wrap` in
-    /// its causal past (what its minter could carry on), that no held
-    /// `Wrap` hands it, that sorts above every recipient its minter's `Wrap`s of it reach here (a
-    /// batch wraps in ascending recipient order, so a recipient below one of them that it lacks
-    /// was left out on purpose), and that no `Remove` before it took out (but an Undo's share that
-    /// a Mac the Undo's target removed signed, which is no removal to a minter that holds too few
-    /// of its quorum's shares). Empty for an epoch this log does not hold or that settled, for one
-    /// the Mac holding `mine` minted (its batch is whole here), for one whose minter's later batch
-    /// wrapped it too (so its own is whole), and for an audience's first epoch. A recipient with no
-    /// seat is named too, so this bounds what sealing under `epoch` may reach; [`Log::in_flight`]
-    /// carries only the seated ones.
+    /// recipient its minter could carry on ([`Log::carry_on`]: every causally newest epoch of its
+    /// audience before it wraps it by a `Wrap` in its causal past, and no `Remove` before it took
+    /// it out, an Undo's share that a Mac the Undo's target removed signed being no removal to a
+    /// minter that holds too few of its quorum's shares), that no held `Wrap` hands it, and that
+    /// sorts above every recipient its minter's `Wrap`s of it reach here (a batch wraps in
+    /// ascending recipient order, so a recipient below one of them that it lacks was left out on
+    /// purpose). Empty for an epoch this log does not hold or that settled, for one the Mac
+    /// holding `mine` minted (its batch is whole here), for one whose minter's later batch
+    /// wrapped it too (so its own is whole), and for an audience's first epoch. A recipient with
+    /// no seat is named too, so this bounds what sealing under `epoch` may reach;
+    /// [`Log::in_flight`] carries only the seated ones.
     #[must_use]
     pub fn batch_may_wrap(&self, epoch: &RecordId, mine: &Recipient) -> BTreeSet<Recipient> {
         let none = BTreeSet::new();
@@ -541,96 +796,23 @@ impl Log {
             return none;
         };
         let record = &self.order[at];
-        let Body::Epoch { audience, .. } = record.body() else {
+        if !matches!(record.body(), Body::Epoch { .. }) {
             return none;
-        };
-        let minter = *record.actor();
+        }
         let seats = self.seat_recipients();
-        if seats.get(&minter).is_some_and(|set| set.contains(mine))
+        if seats
+            .get(record.actor())
+            .is_some_and(|set| set.contains(mine))
             || self.unsettled(&[*epoch]).is_empty()
         {
             return none;
         }
-        let effective = self.effective();
-        // A `Remove` before the epoch its minter read as one: any that counts here but an Undo's
-        // share, which a minter holding too few of its quorum's shares reads as no removal.
-        // NEGATIVE CONTROL `removed-before-unauthorized`: every counted `Remove`, an Undo's share
-        // included. NEGATIVE CONTROL `removed-before-plain`: only one authorized with nothing
-        // void, which leaves out every `Remove` a Mac an Undo restored signs.
-        #[cfg(any(test, debug_assertions))]
-        let known = {
-            let unauthorized = aterm_types::negative_control::on("removed-before-unauthorized");
-            let plain_only = aterm_types::negative_control::on("removed-before-plain");
-            move |i: usize| {
-                if unauthorized {
-                    effective.counts(i)
-                } else if plain_only {
-                    effective.counts_plain(i)
-                } else {
-                    effective.counts_where_held(i)
-                }
-            }
+        let Some(batch) = self.batch_wraps(at) else {
+            return none;
         };
-        #[cfg(not(any(test, debug_assertions)))]
-        let known = |i: usize| effective.counts_where_held(i);
-        let mut wrapped: BTreeSet<Recipient> = BTreeSet::new();
-        let mut frontier: Option<Recipient> = None;
-        let mut before: Vec<usize> = Vec::new();
-        let mut wraps_of: BTreeMap<RecordId, BTreeSet<Recipient>> = BTreeMap::new();
-        let mut removed_before: BTreeSet<Recipient> = BTreeSet::new();
-        for (i, other) in self.order.iter().enumerate().skip(1) {
-            if !effective.counts(i) {
-                continue;
-            }
-            match other.body() {
-                Body::Wrap {
-                    epoch: of,
-                    recipient,
-                    ..
-                } if of == epoch => {
-                    wrapped.insert(*recipient);
-                    if *other.actor() == minter {
-                        if other.authored_ms() != record.authored_ms() {
-                            return none;
-                        }
-                        frontier = frontier.max(Some(*recipient));
-                    }
-                }
-                // Only what its minter had seen: a `Wrap` it could carry on.
-                Body::Wrap {
-                    epoch: of,
-                    recipient,
-                    ..
-                } if effective.before(i, at) => {
-                    wraps_of.entry(*of).or_default().insert(*recipient);
-                }
-                Body::Epoch { audience: aud, .. }
-                    if aud == audience && i != at && effective.before(i, at) =>
-                {
-                    before.push(i);
-                }
-                Body::Remove { member, .. } if effective.before(i, at) && known(i) => {
-                    removed_before.extend(seats.get(member).into_iter().flatten().copied());
-                }
-                _ => {}
-            }
-        }
-        let empty = BTreeSet::new();
-        let mut held: Option<BTreeSet<Recipient>> = None;
-        for &b in effective.newest(&before, |&b| b) {
-            let set = wraps_of.get(self.order[b].id()).unwrap_or(&empty);
-            held = Some(match held {
-                None => set.clone(),
-                Some(prior) => prior.intersection(set).copied().collect(),
-            });
-        }
-        held.unwrap_or_default()
+        self.carry_on(at, &seats)
             .into_iter()
-            .filter(|r| {
-                !wrapped.contains(r)
-                    && frontier.is_none_or(|last| *r > last)
-                    && !removed_before.contains(r)
-            })
+            .filter(|r| !batch.wrapped.contains(r) && batch.frontier.is_none_or(|last| *r > last))
             .collect()
     }
 
@@ -678,9 +860,10 @@ impl Log {
     /// tender holds a re-key of the audience, and of every other audience while `[everyone]`
     /// names one (a re-key reads `[everyone]`'s leave-out for each), for its settle grace. No
     /// record marks a batch's end (one whose last audience its minter does not open whole ends
-    /// in `Wrap`s), so a whole batch that left the recipient out reads like this until its
-    /// minter signs again: a re-key past the grace, like any mint that cannot wait (a person's
-    /// removal, a writer's fresh epoch), leaves it out, as a retirement would.
+    /// in `Wrap`s), so a whole batch that left the recipient out, which sorts above the batch's
+    /// last `Wrap` ([`Log::batch_whole`]), reads like this until its minter signs again: a re-key
+    /// past the grace, like any mint that cannot wait (a person's removal, a writer's fresh
+    /// epoch), leaves it out, as a retirement would.
     #[must_use]
     pub fn undecided(&self, audience: &EpochAudience, mine: &Recipient) -> BTreeSet<Recipient> {
         // Under SEATLESS_FLY every such recipient is in flight instead.

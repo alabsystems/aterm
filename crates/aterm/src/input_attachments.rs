@@ -5,8 +5,11 @@
 
 use aterm_cli::macos_doctor::{InputServiceSet, InputSetupScope};
 use aterm_secrets::converge::{Last, RunnerRetry};
-use std::ffi::OsString;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 #[derive(Default)]
 struct Keeper {
@@ -19,6 +22,144 @@ struct Keeper {
 struct Inputs {
     keeper: Keeper,
     pending: Option<(u64, InputServiceSet)>,
+}
+
+/// Mutable task ownership outlives a failed sampling thread. Only observations are
+/// invalidated after a panic; finite input/FDA workers retain their one owner.
+#[derive(Default)]
+struct Actor {
+    inputs: Inputs,
+    console: ConsoleReturn,
+    coordinator: super::input_coordinator::Coordinator,
+    follow_up: super::withheld_preferences::Coordinator,
+    follow_up_said: Option<String>,
+    said: Option<String>,
+}
+
+#[derive(Clone)]
+struct Notifications {
+    changed: fn(),
+    console_return: Option<fn() -> Result<(), String>>,
+    pending: PendingOwner,
+    ended: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+struct Supervisor {
+    clock: Instant,
+    actor: Arc<Mutex<Actor>>,
+    stop: Arc<AtomicBool>,
+    ending: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+    retry: RunnerRetry,
+    notifications: Notifications,
+}
+
+impl Supervisor {
+    fn new(notifications: Notifications) -> Self {
+        Self {
+            clock: Instant::now(),
+            actor: Arc::default(),
+            stop: Arc::new(AtomicBool::new(false)),
+            ending: Arc::new(AtomicBool::new(false)),
+            worker: None,
+            retry: RunnerRetry::default(),
+            notifications,
+        }
+    }
+
+    /// Healthy host ticks inspect only the owned thread handle. No actor lock or
+    /// preference/HID read runs on a window's event loop.
+    fn maintain(&mut self) -> Option<Instant> {
+        let clock = self.clock;
+        let notifications = self.notifications.clone();
+        self.maintain_with(|actor, stop, ending| {
+            spawn_worker(actor, stop, ending, clock, notifications)
+        })
+    }
+
+    fn maintain_with(
+        &mut self,
+        start: impl FnOnce(
+            Arc<Mutex<Actor>>,
+            Arc<AtomicBool>,
+            Arc<AtomicBool>,
+        ) -> std::io::Result<JoinHandle<()>>,
+    ) -> Option<Instant> {
+        let now = u64::try_from(self.clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Err(why) = self.round_with(now, start) {
+            super::warn_when_logging(format!("keyboard attachment activation waits: {why}"));
+        }
+        if self.worker.is_some() {
+            // The exit wake is necessarily sent before JoinHandle becomes finished.
+            // Keep its completion handoff alive until the handle can be reaped.
+            return self.ending.load(Ordering::Acquire).then(|| {
+                Instant::now() + Duration::from_millis(aterm_secrets::converge::FIRST_RETRY_MS)
+            });
+        }
+        self.retry.remaining(now).map(|left| Instant::now() + left)
+    }
+
+    fn round_with(
+        &mut self,
+        now: u64,
+        start: impl FnOnce(
+            Arc<Mutex<Actor>>,
+            Arc<AtomicBool>,
+            Arc<AtomicBool>,
+        ) -> std::io::Result<JoinHandle<()>>,
+    ) -> std::io::Result<()> {
+        if self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+            let panicked = self
+                .worker
+                .take()
+                .expect("finished sampler")
+                .join()
+                .is_err();
+            if panicked {
+                // The joined sampler holds no actor guard now. Keep its coordinator
+                // handles, discard cached observations, and start with fresh authority.
+                let mut actor = self.actor.lock().unwrap_or_else(PoisonError::into_inner);
+                actor.inputs = Inputs::default();
+                actor.coordinator.invalidate_observation();
+                actor.console = ConsoleReturn {
+                    away: true,
+                    pending: false,
+                };
+                actor.said = None;
+                actor.follow_up_said = None;
+                self.actor.clear_poison();
+            }
+            self.retry.reaped(Last::Failed, now);
+        }
+        if self.worker.is_some()
+            || self
+                .retry
+                .remaining(now)
+                .is_some_and(|left| !left.is_zero())
+        {
+            return Ok(());
+        }
+        self.retry.started();
+        self.ending.store(false, Ordering::Release);
+        match start(
+            Arc::clone(&self.actor),
+            Arc::clone(&self.stop),
+            Arc::clone(&self.ending),
+        ) {
+            Ok(worker) => self.worker = Some(worker),
+            Err(why) => {
+                self.retry.reaped(Last::Failed, now);
+                return Err(why);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -214,21 +355,17 @@ impl Keeper {
     }
 }
 
-/// The subscriber starts the same keeper before entering its long-lived runtime. No
-/// diagnostic, malformed command or help request starts a keyboard observer.
-pub(super) fn secrets_entry(args: Vec<OsString>) -> ExitCode {
-    secrets_entry_with(args, spawn_background, aterm_secrets::cli::main_entry)
-}
-
-fn secrets_entry_with<R>(
-    args: Vec<OsString>,
-    start: impl FnOnce(),
-    run: impl FnOnce(Vec<OsString>) -> R,
-) -> R {
-    if args.len() == 1 && args[0] == "watch" {
-        start();
+/// Constructed only by the validated subscriber runtime. Its existing local-input
+/// lane maintains the keeper even when sharing holds repository observation.
+pub(super) fn subscriber_inputs(
+    paths: &aterm_secrets::client::Paths,
+) -> aterm_secrets::client::SubscriberInputs {
+    let maintenance = spawn_background();
+    let inputs = super::converge_inputs::observe(paths);
+    match maintenance {
+        Some(maintain) => inputs.with_maintenance(Box::new(move || maintain())),
+        None => inputs,
     }
-    run(args)
 }
 
 /// Start only inside the node job's owned startup, after its boot and exclusive lease.
@@ -236,19 +373,40 @@ pub(super) fn node_serve(startup: impl FnOnce()) -> ExitCode {
     node_serve_with(aterm_gui::run_node_serve_owning, spawn_background, startup)
 }
 
-fn node_serve_with<'a, R>(
-    own: impl FnOnce(Box<dyn FnOnce() + 'a>) -> R,
-    start: impl FnOnce() + 'a,
+fn node_serve_with<'a, R, S: 'a>(
+    own: impl FnOnce(Box<dyn FnOnce() -> S + 'a>) -> R,
+    start: impl FnOnce() -> S + 'a,
     runtime: impl FnOnce() + 'a,
 ) -> R {
     own(Box::new(move || {
-        start();
+        let maintenance = start();
         runtime();
+        maintenance
     }))
 }
 
-fn spawn_background() {
-    spawn_background_with(&aterm_machines::port::Live::new(), spawn_with);
+fn spawn_background() -> Option<aterm_gui::NodeMaintenance> {
+    let mut maintenance = None;
+    spawn_background_with(
+        &aterm_machines::port::Live::new(),
+        |changed, console_return, pending| {
+            maintenance = supervisor(Notifications {
+                changed,
+                console_return,
+                pending,
+                ended: None,
+            })
+            .map(|owner| {
+                let owner = Mutex::new(owner);
+                Arc::new(move || {
+                    if let Ok(mut owner) = owner.try_lock() {
+                        let _ = owner.maintain();
+                    }
+                }) as aterm_gui::NodeMaintenance
+            });
+        },
+    );
+    maintenance
 }
 
 fn spawn_background_with(
@@ -266,9 +424,9 @@ fn start_background_with(sys: &dyn aterm_machines::port::System, start: impl FnO
     }
 }
 
-pub(super) fn spawn() {
-    spawn_with(
-        || {
+pub(super) fn spawn() -> Option<aterm_gui::HostMaintenance> {
+    supervisor(Notifications {
+        changed: || {
             super::request_observation(
                 None,
                 vec![aterm_types::macos_setup::Subject::Setting(
@@ -277,93 +435,139 @@ pub(super) fn spawn() {
                 false,
             );
         },
-        Some(super::wake_setup_for_console),
-        PendingOwner::Window(super::wake_setup_facts),
-    );
+        console_return: Some(super::wake_setup_for_console),
+        pending: PendingOwner::Window(super::wake_setup_facts),
+        ended: Some(Arc::new(aterm_gui::wake_host_maintenance)),
+    })
+    .map(|mut owner| Box::new(move || owner.maintain()) as aterm_gui::HostMaintenance)
 }
 
-fn spawn_with(
-    changed: fn(),
-    console_return: Option<fn() -> Result<(), String>>,
-    pending: PendingOwner,
-) {
+fn supervisor(notifications: Notifications) -> Option<Supervisor> {
     if aterm_types::dirs::runs_under_private_state_root() || std::env::var_os("CI").is_some() {
-        return;
+        return None;
     }
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    STARTED.call_once(|| spawn_worker(changed, console_return, pending));
+    let mut owner = Supervisor::new(notifications);
+    let _ = owner.maintain();
+    Some(owner)
 }
 
 fn spawn_worker(
-    changed: fn(),
-    console_return: Option<fn() -> Result<(), String>>,
-    pending: PendingOwner,
-) {
-    let worker = move || {
-        use aterm_machines::port::System as _;
-        let _ = aterm_log::wait_for_logger(super::EARLY_LOG_WAIT);
-        let clock = std::time::Instant::now();
-        let sys = aterm_machines::port::Live::new();
-        let mut inputs = Inputs::default();
-        let mut console = ConsoleReturn::default();
-        let mut coordinator = super::input_coordinator::Coordinator::default();
-        let mut said = None;
-        loop {
-            // One current console sample and one canonical input-scope read select accepted
-            // activation or the GUI's narrowly scoped observation of still-owed Caps work.
-            let at_console = sys.euid() != 0 && !aterm_machines::console::remote(&sys);
-            if let Some(wake) = console_return {
-                let _ = console.recover(at_console, wake);
-            }
-            let now = u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let scope = aterm_cli::macos_doctor::input_setup_scope();
-            let owned = pending.coordinate(
-                &mut coordinator,
-                &scope,
-                at_console,
-                now,
-                super::input_coordinator::start,
-                super::wake_setup_facts,
-            );
-            let result = owned.and_then(|()| {
-                inputs.round(
+    actor: Arc<Mutex<Actor>>,
+    stop: Arc<AtomicBool>,
+    ending: Arc<AtomicBool>,
+    clock: Instant,
+    notifications: Notifications,
+) -> std::io::Result<JoinHandle<()>> {
+    spawn_worker_with(
+        actor,
+        stop,
+        ending,
+        clock,
+        notifications,
+        |actor, stop, clock, notifications| {
+            use aterm_machines::port::System as _;
+            let _ = aterm_log::wait_for_logger(super::EARLY_LOG_WAIT);
+            let sys = aterm_machines::port::Live::new();
+            while !stop.load(Ordering::Acquire) {
+                let mut actor = actor.lock().unwrap_or_else(PoisonError::into_inner);
+                let Actor {
+                    inputs,
+                    console,
+                    coordinator,
+                    follow_up,
+                    follow_up_said,
+                    said,
+                } = &mut *actor;
+                // One current console sample and one canonical input-scope read select accepted
+                // activation or the GUI's narrowly scoped observation of still-owed Caps work.
+                let at_console = sys.euid() != 0 && !aterm_machines::console::remote(&sys);
+                if let Some(wake) = notifications.console_return {
+                    let _ = console.recover(at_console, wake);
+                }
+                let now = u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if matches!(notifications.pending, PendingOwner::Window(_)) {
+                    match follow_up.round(now) {
+                        Ok(()) => *follow_up_said = None,
+                        Err(why) if follow_up_said.as_ref() != Some(&why) => {
+                            aterm_log::info!("deferred preferences wait for a worker: {why}");
+                            *follow_up_said = Some(why);
+                        }
+                        Err(_) => {}
+                    }
+                }
+                let scope = aterm_cli::macos_doctor::input_setup_scope();
+                let owned = notifications.pending.coordinate(
+                    coordinator,
+                    &scope,
                     at_console,
                     now,
-                    || scope,
-                    || sys.keyboard_service_ids(),
-                    |revision, ids| {
-                        aterm_cli::macos_doctor::activate_input_attachments(
-                            revision,
-                            ids,
-                            super::setup_stop_requested,
-                        )
-                    },
-                    &pending.changed(),
-                )
-            });
-            match result {
-                Ok(true) => {
-                    changed();
-                    said = None;
+                    super::input_coordinator::start,
+                    super::wake_setup_facts,
+                );
+                let result = owned.and_then(|()| {
+                    inputs.round(
+                        at_console,
+                        now,
+                        || scope,
+                        || sys.keyboard_service_ids(),
+                        |revision, ids| {
+                            aterm_cli::macos_doctor::activate_input_attachments(
+                                revision,
+                                ids,
+                                super::setup_stop_requested,
+                            )
+                        },
+                        &notifications.pending.changed(),
+                    )
+                });
+                match result {
+                    Ok(true) => {
+                        (notifications.changed)();
+                        *said = None;
+                    }
+                    Ok(false) => {}
+                    Err(why) if said.as_ref() != Some(&why) => {
+                        aterm_log::info!("keyboard attachment activation waits: {why}");
+                        *said = Some(why);
+                    }
+                    Err(_) => {}
                 }
-                Ok(false) => {}
-                Err(why) if said.as_ref() != Some(&why) => {
-                    aterm_log::info!("keyboard attachment activation waits: {why}");
-                    said = Some(why);
-                }
-                Err(_) => {}
+                drop(actor);
+                std::thread::sleep(Duration::from_secs(2));
             }
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        }
-    };
-    if let Err(why) = std::thread::Builder::new()
+        },
+    )
+}
+
+fn spawn_worker_with(
+    actor: Arc<Mutex<Actor>>,
+    stop: Arc<AtomicBool>,
+    ending: Arc<AtomicBool>,
+    clock: Instant,
+    notifications: Notifications,
+    run: impl FnOnce(Arc<Mutex<Actor>>, Arc<AtomicBool>, Instant, Notifications) + Send + 'static,
+) -> std::io::Result<JoinHandle<()>> {
+    std::thread::Builder::new()
         .name("aterm-input-attachments".into())
-        .spawn(worker)
-    {
-        super::warn_when_logging(format!(
-            "keyboard attachment activation could not start: {why}"
-        ));
-    }
+        .spawn(move || {
+            struct Ended {
+                notice: Arc<AtomicBool>,
+                wake: Option<Arc<dyn Fn() + Send + Sync>>,
+            }
+            impl Drop for Ended {
+                fn drop(&mut self) {
+                    self.notice.store(true, Ordering::Release);
+                    if let Some(wake) = &self.wake {
+                        wake();
+                    }
+                }
+            }
+            let _ended = Ended {
+                notice: ending,
+                wake: notifications.ended.clone(),
+            };
+            run(actor, stop, clock, notifications);
+        })
 }
 
 #[cfg(test)]
@@ -408,6 +612,197 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_keeper_start_does_not_abandon_the_native_pending_caps_task() {
+        use super::super::input_coordinator::fixture;
+        use aterm_cli::macos_doctor::input_setup_scope_at;
+        use aterm_secrets::converge::FIRST_RETRY_MS;
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let (setup, revision) = native_pending_caps(dir.path());
+        let (native, events) = fixture::Native::new(dir.path().to_path_buf());
+        let notifications = Notifications {
+            changed: || {},
+            console_return: None,
+            pending: PendingOwner::Background,
+            ended: None,
+        };
+        let mut owner = Supervisor::new(notifications.clone());
+        assert!(
+            owner
+                .round_with(0, |_, _, _| Err(std::io::Error::other(
+                    "injected keeper spawn refusal"
+                )))
+                .is_err()
+        );
+        owner
+            .round_with(FIRST_RETRY_MS - 1, |_, _, _| {
+                panic!("retained start backoff")
+            })
+            .unwrap();
+        let root = dir.path().to_path_buf();
+        let native_waiting = Arc::clone(&native);
+        let clock = owner.clock;
+        owner
+            .round_with(FIRST_RETRY_MS, |actor, stop, ending| {
+                spawn_worker_with(
+                    actor,
+                    stop,
+                    ending,
+                    clock,
+                    notifications.clone(),
+                    move |actor, _, observed_clock, notifications| {
+                        assert_eq!(observed_clock, clock, "one retained timebase");
+                        let mut actor = actor.lock().unwrap();
+                        notifications
+                            .pending
+                            .coordinate(
+                                &mut actor.coordinator,
+                                &input_setup_scope_at(&root),
+                                true,
+                                FIRST_RETRY_MS,
+                                |revision| native_waiting.start(revision),
+                                || native_waiting.wake(),
+                            )
+                            .unwrap();
+                        actor
+                            .inputs
+                            .round(
+                                true,
+                                FIRST_RETRY_MS,
+                                || input_setup_scope_at(&root),
+                                || Ok(vec![41]),
+                                |_, _| panic!("pending input has no setter authority"),
+                                &|| {},
+                            )
+                            .unwrap();
+                        panic!("injected sampler panic while its input worker remains owned");
+                    },
+                )
+            })
+            .unwrap();
+        fixture::waiting(&events);
+        let until = Instant::now() + Duration::from_secs(60);
+        while !owner.worker.as_ref().unwrap().is_finished() {
+            assert!(Instant::now() < until, "finite sampler did not end");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        owner
+            .round_with(FIRST_RETRY_MS, |_, _, _| panic!("reap before retry"))
+            .unwrap();
+        assert!(
+            owner.actor.lock().unwrap().inputs.pending.is_none(),
+            "discard failed observations"
+        );
+        let root = dir.path().to_path_buf();
+        let now = FIRST_RETRY_MS * 3;
+        owner
+            .round_with(now, |actor, stop, ending| {
+                spawn_worker_with(
+                    actor,
+                    stop,
+                    ending,
+                    clock,
+                    notifications,
+                    move |actor, _, observed_clock, notifications| {
+                        assert_eq!(observed_clock, clock);
+                        let mut actor = actor.lock().unwrap();
+                        notifications
+                            .pending
+                            .coordinate(
+                                &mut actor.coordinator,
+                                &input_setup_scope_at(&root),
+                                true,
+                                now,
+                                |_| panic!("the retained input worker still owns this task"),
+                                || native.wake(),
+                            )
+                            .unwrap();
+                        native.attached.store(true, Ordering::Release);
+                        native.wake();
+                        fixture::finished(&events, &mut actor.coordinator);
+                    },
+                )
+            })
+            .unwrap();
+        owner.worker.take().unwrap().join().unwrap();
+        assert_eq!(setup.input_activation_revision().unwrap(), Some(revision));
+    }
+
+    #[test]
+    fn a_window_keeps_the_exit_handoff_until_the_sampler_is_joinable() {
+        use std::sync::mpsc;
+
+        let (sampled, sampled_rx) = mpsc::channel();
+        let (finish, finish_rx) = mpsc::channel();
+        let (woke, woke_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let notifications = Notifications {
+            changed: || {},
+            console_return: None,
+            pending: PendingOwner::Window(|| {}),
+            ended: Some(Arc::new(move || {
+                woke.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(60))
+                    .unwrap();
+            })),
+        };
+        let mut owner = Supervisor::new(notifications.clone());
+        let clock = owner.clock;
+        assert!(
+            owner
+                .maintain_with(|actor, stop, ending| {
+                    spawn_worker_with(
+                        actor,
+                        stop,
+                        ending,
+                        clock,
+                        notifications,
+                        move |_, _, _, _| {
+                            sampled.send(()).unwrap();
+                            finish_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+                        },
+                    )
+                })
+                .is_none()
+        );
+        sampled_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert!(
+            owner
+                .maintain_with(|_, _, _| panic!("one live sampler"))
+                .is_none(),
+            "healthy idle windows gain no timer"
+        );
+        finish.send(()).unwrap();
+        woke_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert!(
+            !owner.worker.as_ref().unwrap().is_finished(),
+            "the actual exit callback still holds the worker"
+        );
+        assert!(
+            owner
+                .maintain_with(|_, _, _| panic!("join before replacement"))
+                .is_some(),
+            "an early exit wake must leave a deadline"
+        );
+        release.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(60);
+        while !owner.worker.as_ref().unwrap().is_finished() {
+            assert!(Instant::now() < until, "exit handoff did not finish");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            owner
+                .maintain_with(|_, _, _| panic!("retained restart backoff"))
+                .is_some()
+        );
+        assert!(owner.worker.is_none(), "the host reaped its owned handle");
+    }
+
+    #[test]
     fn headless_watch_hands_the_original_pending_caps_pass_back_to_a_coordinator_on_attach() {
         use super::super::input_coordinator::{Coordinator, fixture};
         use aterm_cli::macos_doctor::{
@@ -435,49 +830,41 @@ mod tests {
         let (native, events) = fixture::Native::new(dir.path().to_path_buf());
         let mut coordinator = Coordinator::default();
         let mut inputs = Inputs::default();
-        secrets_entry_with(
-            vec![OsString::from("watch")],
-            || {
-                spawn_background_with(&actor, |_, _, owner| {
-                    for attached in [false, true] {
-                        native.attached.store(attached, Ordering::Release);
-                        let scope = input_setup_scope_at(dir.path());
-                        owner
-                            .coordinate(
-                                &mut coordinator,
-                                &scope,
-                                true,
-                                0,
-                                |revision| native.start(revision),
-                                || native.wake(),
-                            )
-                            .unwrap();
-                        let hand_off = || native.wake();
-                        assert!(
-                            !inputs
-                                .round(
-                                    true,
-                                    0,
-                                    || scope,
-                                    || {
-                                        InitialSetupAdmissionStopTest::keyboard_system(attached)
-                                            .keyboard_service_ids()
-                                    },
-                                    |_, _| panic!(
-                                        "a pending pass has no attachment-setter authority"
-                                    ),
-                                    &hand_off,
-                                )
-                                .unwrap()
-                        );
-                        if !attached {
-                            fixture::waiting(&events);
-                        }
-                    }
-                });
-            },
-            |_| {},
-        );
+        spawn_background_with(&actor, |_, _, owner| {
+            for attached in [false, true] {
+                native.attached.store(attached, Ordering::Release);
+                let scope = input_setup_scope_at(dir.path());
+                owner
+                    .coordinate(
+                        &mut coordinator,
+                        &scope,
+                        true,
+                        0,
+                        |revision| native.start(revision),
+                        || native.wake(),
+                    )
+                    .unwrap();
+                let hand_off = || native.wake();
+                assert!(
+                    !inputs
+                        .round(
+                            true,
+                            0,
+                            || scope,
+                            || {
+                                InitialSetupAdmissionStopTest::keyboard_system(attached)
+                                    .keyboard_service_ids()
+                            },
+                            |_, _| panic!("a pending pass has no attachment-setter authority"),
+                            &hand_off,
+                        )
+                        .unwrap()
+                );
+                if !attached {
+                    fixture::waiting(&events);
+                }
+            }
+        });
         fixture::finished(&events, &mut coordinator);
         assert_eq!(
             input_setup_scope_at(dir.path()).unwrap(),
@@ -502,38 +889,32 @@ mod tests {
         let actor = InitialSetupAdmissionStopTest::keyboard_system(true);
         let started = Cell::new(false);
         let mut inputs = Inputs::default();
-        secrets_entry_with(
-            vec![OsString::from("watch")],
-            || {
-                spawn_background_with(&actor, |_, _, owner| {
-                    started.set(true);
-                    owner
-                        .coordinate(
-                            &mut super::super::input_coordinator::Coordinator::default(),
-                            &input_setup_scope_at(dir.path()),
-                            true,
-                            0,
-                            |_| panic!("Stop withholds coordinator startup"),
-                            || {},
-                        )
-                        .unwrap();
-                    let stopped_handoff = || -> () {
-                        panic!("Stop withholds the coordinator handoff");
-                    };
-                    inputs
-                        .round(
-                            true,
-                            0,
-                            || input_setup_scope_at(dir.path()),
-                            || panic!("Stop withholds the pending hardware read"),
-                            |_, _| panic!("Stop withholds activation"),
-                            &stopped_handoff,
-                        )
-                        .unwrap();
-                })
-            },
-            |_| {},
-        );
+        spawn_background_with(&actor, |_, _, owner| {
+            started.set(true);
+            owner
+                .coordinate(
+                    &mut super::super::input_coordinator::Coordinator::default(),
+                    &input_setup_scope_at(dir.path()),
+                    true,
+                    0,
+                    |_| panic!("Stop withholds coordinator startup"),
+                    || {},
+                )
+                .unwrap();
+            let stopped_handoff = || -> () {
+                panic!("Stop withholds the coordinator handoff");
+            };
+            inputs
+                .round(
+                    true,
+                    0,
+                    || input_setup_scope_at(dir.path()),
+                    || panic!("Stop withholds the pending hardware read"),
+                    |_, _| panic!("Stop withholds activation"),
+                    &stopped_handoff,
+                )
+                .unwrap();
+        });
         assert!(started.get(), "the valid local Aqua startup branch ran");
     }
 
@@ -760,50 +1141,6 @@ mod tests {
         console
             .recover(true, || panic!("a handled return is spent"))
             .unwrap();
-    }
-
-    #[test]
-    fn subscriber_start_keeps_inputs_before_watch_but_other_commands_only_dispatch() {
-        use std::cell::RefCell;
-
-        for (words, watching) in [
-            (&["watch"][..], true),
-            (&["watch", "--help"], false),
-            (&["watch", "extra"], false),
-            (&["watch", "--invalid"], false),
-            (&["help", "watch"], false),
-            (&["sync"], false),
-            (&["status"], false),
-            (&[], false),
-        ] {
-            let events = RefCell::new(Vec::new());
-            let args: Vec<_> = words.iter().map(OsString::from).collect();
-            let expected = args.clone();
-            assert_eq!(
-                secrets_entry_with(
-                    args,
-                    || events.borrow_mut().push("keeper"),
-                    |forwarded| {
-                        assert_eq!(forwarded, expected);
-                        assert_eq!(
-                            events.borrow().as_slice(),
-                            if watching { &["keeper"][..] } else { &[] }
-                        );
-                        events.borrow_mut().push("runtime");
-                        ExitCode::from(75)
-                    },
-                ),
-                ExitCode::from(75)
-            );
-            assert_eq!(
-                events.into_inner(),
-                if watching {
-                    vec!["keeper", "runtime"]
-                } else {
-                    vec!["runtime"]
-                }
-            );
-        }
     }
 
     #[test]

@@ -6,6 +6,7 @@
 
 use crate::model::{Probe, User};
 use crate::port::{Cmd, Ran, System};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -24,6 +25,105 @@ pub(crate) const NO_SIDE_RUNS: [&str; 4] = [
     "-c",
     "maintenance.auto=false",
 ];
+
+/// The keys of every hook and filter driver a config names: a `hook` or `filter` section with a
+/// subsection, the empty one (`[hook ""]`) included.
+const PROGRAM_KEYS: &str = r"^(hook|filter)\..*\.[^.]+$";
+
+/// What a repository's config names that a git command there can start by itself, beyond what
+/// [`NO_SIDE_RUNS`] and `-c core.fsmonitor=false` stop: each hook (`hook.<name>.*`) and each
+/// filter driver (`filter.<driver>.*`), whose `clean` runs whenever git hashes a worktree file an
+/// attributes file assigns it to (a `status` or `diff` of a stat-dirty file, an index rewrite of
+/// a racily clean one), in any scope the config reads, the empty name included.
+#[derive(Debug, Default)]
+pub(crate) struct Programs {
+    hooks: BTreeSet<String>,
+    filters: BTreeSet<String>,
+}
+
+impl Programs {
+    /// The listing [`Programs::named`] runs: `git`, a command already in the repository, asked
+    /// for [`PROGRAM_KEYS`] in the C locale, where git's regular expressions match bytes (under
+    /// a UTF-8 locale `.` matches no byte that is not UTF-8, so such a key would go unlisted).
+    pub(crate) fn listing(git: Cmd) -> Cmd {
+        git.env("LC_ALL", "C")
+            .args(["config", "--null", "--get-regexp", PROGRAM_KEYS])
+    }
+
+    /// Each one the repository `git` runs in names.
+    ///
+    /// # Errors
+    /// The config cannot be read, or names a hook or filter driver whose name is not UTF-8,
+    /// which no override can name: a command there could start it.
+    pub(crate) fn named(sys: &dyn System, git: Cmd) -> Result<Self, String> {
+        let ran = sys
+            .run_complete_stdout(&Self::listing(git))
+            .map_err(|why| format!("cannot run git: {why}"))?;
+        let mut named = Self::default();
+        match ran.status {
+            Some(0) => {}
+            Some(1) => return Ok(named),
+            _ => return Err("cannot read which hooks and filters its config names".into()),
+        }
+        for record in ran
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+        {
+            let key = record
+                .split(|byte| *byte == b'\n')
+                .next()
+                .unwrap_or_default();
+            let key = std::str::from_utf8(key).map_err(|_| {
+                "its config names a hook or filter whose name is not UTF-8, which aterm cannot \
+                 turn off"
+                    .to_owned()
+            })?;
+            // The section ends at the first dot and the variable starts after the last, so the
+            // name between them keeps any dot of its own, and may be empty.
+            let Some((section, rest)) = key.split_once('.') else {
+                continue;
+            };
+            let Some((name, _)) = rest.rsplit_once('.') else {
+                continue;
+            };
+            match section {
+                "hook" => named.hooks.insert(name.to_owned()),
+                "filter" => named.filters.insert(name.to_owned()),
+                _ => false,
+            };
+        }
+        Ok(named)
+    }
+
+    /// `cmd` with every one turned off for its run, carried in `GIT_CONFIG_*` so no name is
+    /// parsed as an option: `hook.<name>.enabled=false`; and for a driver an empty `process`,
+    /// which also stops its `clean` on git 2.54 and 2.56 (git takes `clean` only where no
+    /// `process` is set), an empty `clean` should a git take it beside one, and
+    /// `required=false`, without which a required driver turned off fails the command. So no
+    /// attributes file (the worktree's, `.git/info/attributes`, `core.attributesFile`) starts a
+    /// driver; a file one would have cleaned is read as it is on disk.
+    pub(crate) fn off(&self, cmd: Cmd) -> Cmd {
+        let mut off: Vec<(String, &str)> = self
+            .hooks
+            .iter()
+            .map(|name| (format!("hook.{name}.enabled"), "false"))
+            .collect();
+        for name in &self.filters {
+            off.push((format!("filter.{name}.clean"), ""));
+            off.push((format!("filter.{name}.smudge"), ""));
+            off.push((format!("filter.{name}.process"), ""));
+            off.push((format!("filter.{name}.required"), "false"));
+        }
+        let mut cmd = cmd.env("GIT_CONFIG_COUNT", off.len().to_string());
+        for (at, (key, value)) in off.into_iter().enumerate() {
+            cmd = cmd
+                .env(format!("GIT_CONFIG_KEY_{at}"), key)
+                .env(format!("GIT_CONFIG_VALUE_{at}"), value);
+        }
+        cmd
+    }
+}
 
 /// The installed git for `user` ([`crate::items::github::git_program_for_user`]: their managed
 /// build, else native Git), in `path` when given, with no prompt (`GIT_TERMINAL_PROMPT=0`,
@@ -406,19 +506,27 @@ fn local(sys: &dyn System, user: &User, path: &Path, origin: &Origin) -> Result<
         Some(1) => return Err(Stop::Kept(format!("{branch} has no commit yet"))),
         _ => return Err(Stop::from("cannot read the checkout's HEAD".to_owned())),
     };
-    let status = read_ok(
+    // Even a status can invoke configured filters or fsmonitor. The same
+    // no-program overrides used for dependency reads keep eligibility local.
+    let git = || git(sys, user, Some(path));
+    let programs = Programs::named(sys, git())?;
+    let status = run(
         sys,
-        user,
-        path,
-        &[
+        &programs.off(git()).args(NO_SIDE_RUNS).args([
+            "-c",
+            "core.fsmonitor=false",
             "status",
             "--porcelain=v1",
             "-z",
             "--untracked-files=normal",
             "--ignore-submodules=all",
-        ],
+        ]),
+        "status",
     )?;
-    if !status.is_empty() {
+    if !status.success() {
+        return Err(Stop::from("git status failed in the checkout".to_owned()));
+    }
+    if !stdout(&status).is_empty() {
         return Err(Stop::Kept(
             "it has uncommitted changes or untracked files".into(),
         ));
@@ -494,14 +602,23 @@ impl From<String> for NotFetched {
 
 /// Origin's default branch and its tip as this checkout last fetched them
 /// (`refs/remotes/origin/HEAD`, which a clone writes, and the branch it names): no network read.
-fn fetched_head(
+pub(crate) fn fetched_head(
     sys: &dyn System,
     user: &User,
     path: &Path,
 ) -> Result<(String, String), NotFetched> {
+    fetched_head_by(sys, &|| git(sys, user, Some(path)))
+}
+
+/// [`fetched_head`], each read run by the git `in_checkout` builds in the checkout (one that
+/// never fetches a missing object, for a caller that reads no remote).
+pub(crate) fn fetched_head_by(
+    sys: &dyn System,
+    in_checkout: &dyn Fn() -> Cmd,
+) -> Result<(String, String), NotFetched> {
     let symbolic = run(
         sys,
-        &git(sys, user, Some(path)).args(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]),
+        &in_checkout().args(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]),
         "symbolic-ref",
     )?;
     let default = match symbolic.status {
@@ -530,7 +647,7 @@ fn fetched_head(
     };
     let tip = run(
         sys,
-        &git(sys, user, Some(path)).args([
+        &in_checkout().args([
             "rev-parse",
             "--verify",
             "--quiet",
@@ -741,6 +858,29 @@ pub(crate) fn read_fetched(
     Ok(judge(sys, user, path, &local, &default, &tip, true)?)
 }
 
+/// Whether this same active branch explicitly tracks origin's corresponding
+/// branch. Automatic default refresh preserves missing, unreadable or different
+/// tracking; explicit profile/develop alignment keeps its existing policy.
+pub(crate) fn tracks_origin(sys: &dyn System, user: &User, path: &Path, branch: &str) -> bool {
+    let reference = format!("refs/heads/{branch}");
+    read_ok(sys, user, path, &["symbolic-ref", "--quiet", "HEAD"])
+        .is_ok_and(|value| value == reference)
+        && read_ok(
+            sys,
+            user,
+            path,
+            &["config", "--get-all", &format!("branch.{branch}.remote")],
+        )
+        .is_ok_and(|value| value == "origin")
+        && read_ok(
+            sys,
+            user,
+            path,
+            &["config", "--get-all", &format!("branch.{branch}.merge")],
+        )
+        .is_ok_and(|value| value == reference)
+}
+
 /// Bring the checkout at `path` to origin's default branch when [`read`] says it moves: `git fetch
 /// origin` (origin alone, no hook), the same judgement over what was fetched, then `git merge
 /// --ff-only` of the fetched tip (no autostash, no submodule worktree touched, no hook).
@@ -771,10 +911,12 @@ pub(crate) fn align_guarded(
         Stands::Behind { branch, .. } | Stands::Unfetched { branch, .. } => branch.clone(),
         Stands::Current { .. } | Stands::Kept(_) => return Ok(before),
     };
+    let programs = Programs::named(sys, git(sys, user, Some(path)))?;
     current().map_err(Unread::from)?;
     let fetch = run(
         sys,
-        &network(sys, user, Some(path))
+        &programs
+            .off(network(sys, user, Some(path)))
             .budget(FETCH_BUDGET)
             .args(NO_SIDE_RUNS)
             .args(["fetch", "--quiet", "--no-recurse-submodules", "origin"]),
@@ -818,10 +960,12 @@ pub(crate) fn align_guarded(
     let Stands::Behind { .. } = &stands else {
         return Ok(stands);
     };
+    let programs = Programs::named(sys, git(sys, user, Some(path)))?;
     current().map_err(Unread::from)?;
     let merge = run(
         sys,
-        &network(sys, user, Some(path))
+        &programs
+            .off(network(sys, user, Some(path)))
             .budget(FETCH_BUDGET)
             .args(NO_SIDE_RUNS)
             .args([

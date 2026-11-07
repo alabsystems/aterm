@@ -548,6 +548,7 @@ mod tests {
             known_hosts: "existing-hosts".into(),
             port: 2222,
             user: guest::RUNNER,
+            connect_within: super::super::CONNECT_WITHIN,
         };
         let options = ssh.options_for(true);
         assert!(

@@ -26,6 +26,7 @@ fn native_receipt_fixture(home: &Path, now: i64) -> RefreshJournal {
     .unwrap();
     RefreshJournal::EnrollmentResponse {
         admission: Box::new(codex_enrollment::Staging {
+            native_row: None,
             request: codex_enrollment::Request {
                 id: "a".repeat(32),
                 caller: "b".repeat(64),
@@ -63,6 +64,7 @@ fn an_existing_native_response_blocks_ordinary_exchange_without_losing_custody()
             (boundary == 1).then(|| AuthLock::try_take(&home.join(AUTH_FILE)).unwrap().unwrap());
         let (port, server) = provider(|_, _| ("200 OK", json!({})));
         let result = CodeExchange {
+            native_scope: None,
             publication: None,
             enrollment: None,
             home: &home,
@@ -173,6 +175,7 @@ pub(in crate::harness) fn native_ordinary_exchange_fixture(
     )
 }
 
+#[cfg(unix)]
 pub(in crate::harness) fn native_enrollment_owner_fixture(
     artifact: &crate::harness::codex_enrollment::Artifact,
     cut: Option<EnrollmentCut>,
@@ -246,6 +249,7 @@ fn native_exchange_capturing<C: CodeGrantCapture>(
         )
     });
     let exchange = CodeExchange {
+        native_scope: None,
         publication: destination.publication,
         enrollment: destination.enrollment,
         home,
@@ -339,6 +343,7 @@ mod stored_identity_tests;
 #[path = "codex_row_identity_tests.rs"]
 mod row_identity_tests;
 
+#[cfg(unix)]
 #[path = "codex_grant_completion_tests.rs"]
 mod grant_completion_tests;
 
@@ -849,7 +854,19 @@ fn an_approver_unwind_retires_the_actual_callback_listener_and_scope() {
     let port = approver.port.unwrap();
     drop(approver);
     assert!(outcome.is_err());
-    assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+    // Where no close-on-fork mark keeps a socket out of a child (Linux), a child another test
+    // thread forks meanwhile holds a copy of the retired listener until its `exec` closes it,
+    // and the port takes connections until then. The minute is a hang detector, never a
+    // latency budget: a listener nothing lets go fails there.
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "a refused connect to the retired callback port",
+        || {
+            TcpStream::connect(("127.0.0.1", port))
+                .is_err()
+                .then_some(())
+        },
+    );
     assert!(store.signin_now().unwrap().is_some());
     assert!(lifetime.pause().unwrap().try_wait().is_ok());
 }
@@ -1395,6 +1412,7 @@ fn login_case(case: i64) -> [(&'static str, i64); 6] {
         Duration::from_secs(60)
     };
     let exchange = || CodeExchange {
+        native_scope: None,
         publication: None,
         enrollment: None,
         home: tmp.path(),
@@ -1408,6 +1426,7 @@ fn login_case(case: i64) -> [(&'static str, i64); 6] {
     };
     let perform = || {
         CodeExchange {
+            native_scope: None,
             publication: None,
             enrollment: None,
             home: tmp.path(),
@@ -3787,6 +3806,7 @@ fn sign_in_takes_the_publication_lock_before_spending_its_code() {
         };
         assert!(
             CodeExchange {
+                native_scope: None,
                 publication: None,
                 enrollment: None,
                 home: &home,
@@ -3828,6 +3848,7 @@ fn first_sign_in_holds_its_lock_during_the_token_exchange() {
     });
     assert_eq!(
         CodeExchange {
+            native_scope: None,
             publication: None,
             enrollment: None,
             home: &home,
@@ -3852,111 +3873,6 @@ fn first_sign_in_holds_its_lock_during_the_token_exchange() {
         Some("new-refresh")
     );
     assert!(AuthLock::try_take(&home.join(AUTH_FILE)).unwrap().is_some());
-}
-
-#[cfg(unix)]
-#[test]
-fn code_exchange_rechecks_original_budget_after_the_actual_scope_mutex_wait() {
-    use crate::harness::account_work::Lifetime;
-    use crate::harness::wake_deadline::SleepSeam;
-    for slept in [false, true] {
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let home = tmp.path().join("login");
-        let now = 1_790_000_000;
-        hour_login(&home, now, Some("original-refresh"));
-        RefreshJournal::Attempted {
-            token: refresh_token_digest("original-refresh"),
-        }
-        .write(&home)
-        .unwrap();
-        let before = std::fs::read(home.join(AUTH_FILE)).unwrap();
-        let evidence = std::fs::read(beside_auth(&home, JOURNAL_SUFFIX)).unwrap();
-        let (port, server) = provider(move |_, _| {
-            let access = make_chatgpt_jwt(Some("owner@example.test"), "pro", now + 3600);
-            (
-                "200 OK",
-                json!({"id_token":access,"access_token":access,"refresh_token":"new-refresh"}),
-            )
-        });
-        let lifetime = Lifetime::default();
-        let scope = lifetime.enter().unwrap();
-        let cancellation = scope.cancellation();
-        let waiting = scope.cancellation_wait_for_test();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let worker_home = home.clone();
-        let worker = std::thread::spawn(move || {
-            let seam = SleepSeam::hold();
-            seam.sleeper().slept(Duration::from_secs(3600));
-            let deadline = WakeDeadline::after(Duration::from_secs(3600));
-            CodeExchange {
-                publication: None,
-                enrollment: None,
-                home: &worker_home,
-                endpoints: &Endpoints {
-                    issuer: format!("http://127.0.0.1:{port}"),
-                    token_url: format!("http://127.0.0.1:{port}/oauth/token"),
-                    callback_ports: vec![],
-                },
-                redirect_uri: "http://127.0.0.1/callback",
-                code: "code",
-                code_verifier: "verifier",
-                deadline,
-                work: Some(&scope),
-                now,
-            }
-            .persist_using(Some("new-owner"), |home, lock_deadline| {
-                let held = AuthLock::within(home, lock_deadline.instant())?;
-                let _ = ready_tx.send(seam.sleeper());
-                release_rx
-                    .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-                    .ok()?;
-                Some(held)
-            })
-        });
-        let ready = ready_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
-        let held = ready.as_ref().ok().map(|_| lifetime.hold_state_for_test());
-        let released = release_tx.send(());
-        // The epoch stays open. This witness names actual Scope mutex contention,
-        // after all earlier admission checks and the real AuthLock acquisition.
-        let contended = waiting.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
-        if slept
-            && contended.is_ok()
-            && let Ok(sleeper) = &ready
-        {
-            sleeper.slept(Duration::from_secs(7200));
-        }
-        drop(held);
-        let result = worker.join();
-        let seen = provider_seen(port, server);
-        ready.expect("real AuthLock acquired before the Scope contention");
-        assert!(released.is_ok());
-        contended.expect("worker attempted the actual held Scope mutex");
-        let result = result.unwrap();
-        if slept {
-            assert!(
-                seen.is_empty(),
-                "expired original work must send no token POST: {seen:?}"
-            );
-            assert_eq!(result, Err(ExchangeError::Protected));
-            assert_eq!(std::fs::read(home.join(AUTH_FILE)).unwrap(), before);
-            assert_eq!(
-                std::fs::read(beside_auth(&home, JOURNAL_SUFFIX)).unwrap(),
-                evidence
-            );
-        } else {
-            assert_eq!(result, Ok(Some("owner@example.test".into())));
-            assert_eq!(seen, ["POST /oauth/token"]);
-            assert!(!beside_auth(&home, JOURNAL_SUFFIX).exists());
-        }
-        assert!(cancellation.retired());
-        assert!(
-            lifetime.enter().is_some(),
-            "the original epoch was never closed"
-        );
-        assert!(lifetime.pause().unwrap().try_wait().is_ok());
-        assert!(AuthLock::try_take(&home.join(AUTH_FILE)).unwrap().is_some());
-    }
 }
 
 #[cfg(unix)]
@@ -3996,6 +3912,7 @@ fn code_exchange_rechecks_original_work_after_the_actual_publication_lock() {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(scope.clone().wrap(move || {
             let result = CodeExchange {
+                native_scope: None,
                 publication: None,
                 enrollment: None,
                 home: &worker_home,
@@ -4184,6 +4101,7 @@ fn sign_in_and_stale_journal_recovery_keep_evidence_until_publication_is_durable
     let fault = aterm_durable::seam::FailingDirs::with(aterm_durable::seam::EIO);
     assert!(
         CodeExchange {
+            native_scope: None,
             publication: None,
             enrollment: None,
             home: &home,
@@ -5393,6 +5311,7 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
         .expect("journal directory");
     assert_eq!(
         CodeExchange {
+            native_scope: None,
             publication: None,
             enrollment: None,
             home: &bad_journal_home,
@@ -5418,6 +5337,7 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
     std::fs::create_dir_all(bad_auth_home.join(AUTH_FILE)).expect("auth.json directory");
     assert_eq!(
         CodeExchange {
+            native_scope: None,
             publication: None,
             enrollment: None,
             home: &bad_auth_home,
@@ -5457,6 +5377,7 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
 
     assert_eq!(
         CodeExchange {
+            native_scope: None,
             publication: None,
             enrollment: None,
             home: &relogin_home,
@@ -5477,6 +5398,7 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
     );
 
     let signed_in = CodeExchange {
+        native_scope: None,
         publication: None,
         enrollment: None,
         home: &relogin_home,

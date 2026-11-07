@@ -123,7 +123,7 @@ pub mod shared;
 
 #[path = "accounts_native_publication.rs"]
 mod native_publication;
-pub(in crate::harness) use native_publication::ActualPublicationPermit;
+pub(in crate::harness) use native_publication::{ActualPublicationPermit, ActualPublicationStamp};
 
 #[path = "accounts_sync_commit.rs"]
 mod sync_commit;
@@ -1201,27 +1201,11 @@ pub fn row_text(row: &Row) -> Option<String> {
 /// # Errors
 /// A raw roster row cannot be represented canonically.
 pub fn pool_authority_revision(raw: &Roster, logins: &Logins) -> Result<String, String> {
-    let rows = raw
-        .rows
-        .iter()
-        .map(|row| {
-            row_text(row)
-                .map(|text| aterm_json::json!({"row": text, "was": row.was}))
-                .ok_or_else(|| "pool authority row cannot be represented".to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let rows = pool_authority_rows(raw)?;
     let bindings = logins
         .labels
         .iter()
-        .map(|(label, binding)| {
-            aterm_json::json!({"label": label, "dir": binding.dir,
-            "renewal_generation": binding.renewal_generation,
-            "last_success_generation": binding.last_success_generation,
-            "proved_email": binding.proved_email, "proved_dir": binding.proved_dir,
-            "proved_by": binding.proved_by.map(Proof::as_str),
-            "ended_at": binding.ended_at, "wrong_at": binding.wrong_at,
-            "was": binding.was})
-        })
+        .map(|(label, binding)| pool_authority_binding(label, binding))
         .collect::<Vec<_>>();
     let bytes = aterm_json::to_vec(
         &aterm_json::json!({"domain": "aterm-codex-pool-authority-v1",
@@ -1231,6 +1215,27 @@ pub fn pool_authority_revision(raw: &Roster, logins: &Logins) -> Result<String, 
     Ok(aterm_codec::hex::encode_lower(
         &aterm_digest::Sha256::digest(bytes),
     ))
+}
+
+// Shared canonical encodings: scoped native witnesses must retain the exact
+// same roster/binding policy fields as the original whole-pool witness.
+pub(super) fn pool_authority_rows(raw: &Roster) -> Result<Vec<aterm_json::Value>, String> {
+    raw.rows
+        .iter()
+        .map(|row| {
+            row_text(row)
+                .map(|text| aterm_json::json!({"row": text, "was": row.was}))
+                .ok_or_else(|| "pool authority row cannot be represented".to_string())
+        })
+        .collect()
+}
+pub(super) fn pool_authority_binding(label: &str, binding: &Binding) -> aterm_json::Value {
+    aterm_json::json!({"label": label, "dir": binding.dir,
+        "renewal_generation": binding.renewal_generation,
+        "last_success_generation": binding.last_success_generation,
+        "proved_email": binding.proved_email, "proved_dir": binding.proved_dir,
+        "proved_by": binding.proved_by.map(Proof::as_str),
+        "ended_at": binding.ended_at, "wrong_at": binding.wrong_at, "was": binding.was})
 }
 
 /// Formats a single account row as an inline TOML table.
@@ -2246,6 +2251,41 @@ pub(super) fn write_enrollment_checkpoint(
     )
 }
 
+/// A new fenced response keeps the original issuer-bound parent even when
+/// authenticated other-row publications advanced the global clock. Only the
+/// held current-row proof can authorize this metadata writer; legacy callers
+/// still capture and check the complete current parent.
+pub(super) fn write_native_enrollment_checkpoint(
+    current: &super::codex_native_row::CurrentNativeRow<'_>,
+    email: &str,
+    proof: Proof,
+    checked_at: i64,
+    logins: &Logins,
+) -> io::Result<()> {
+    let (admission, parent) = current
+        .checkpoint_metadata(logins)
+        .map_err(io::Error::other)?;
+    write_checkpoint_with_parent(
+        Cli::Codex,
+        None,
+        &admission.request.label,
+        email,
+        admission
+            .directory
+            .to_str()
+            .ok_or_else(|| io::Error::other("native checkpoint path invalid"))?,
+        None,
+        Some(proof),
+        None,
+        None,
+        None,
+        checked_at,
+        logins,
+        Some(&admission.request),
+        parent,
+    )
+}
+
 /// A native Google checkpoint can only be made while its verified capability is current.
 #[cfg(unix)]
 pub(super) fn write_google_renewal_checkpoint(
@@ -2304,6 +2344,44 @@ fn write_checkpoint(
     logins: &Logins,
     enrollment: Option<&super::codex_enrollment::Request>,
 ) -> io::Result<()> {
+    write_checkpoint_with_parent(
+        cli,
+        region,
+        label,
+        email,
+        staging_text,
+        subscription,
+        proved_by,
+        google_principal,
+        google_grant_digest,
+        google_binding_scope,
+        checked_at,
+        logins,
+        enrollment,
+        RenewalParent::capture(logins, label),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "existing explicit checkpoint fields plus its privately derived parent"
+)]
+fn write_checkpoint_with_parent(
+    cli: Cli,
+    region: Option<Region>,
+    label: &str,
+    email: &str,
+    staging_text: &str,
+    subscription: Option<&str>,
+    proved_by: Option<Proof>,
+    google_principal: Option<[u8; 32]>,
+    google_grant_digest: Option<[u8; 32]>,
+    google_binding_scope: Option<[u8; 32]>,
+    checked_at: i64,
+    logins: &Logins,
+    enrollment: Option<&super::codex_enrollment::Request>,
+    parent: RenewalParent,
+) -> io::Result<()> {
     let staging = Path::new(staging_text);
     std::fs::canonicalize(staging)?;
     let native_grant = enrollment
@@ -2324,7 +2402,7 @@ fn write_checkpoint(
         google_principal,
         google_grant_digest,
         google_binding_scope,
-        parent: RenewalParent::capture(logins, label),
+        parent,
     };
     if !checkpoint.valid()
         || (cli == Cli::Kimi) != region.is_some()
@@ -3056,27 +3134,27 @@ impl Logins {
         let mut o = Map::new();
         o.insert(
             "schema".to_owned(),
-            Value::from(
-                if self.enrollment.has_owner_witness() || self.enrollment.has_artifacts() {
-                    9
-                } else if self.enrollment.requires_extended() {
-                    8
-                } else if !self.enrollment.is_empty() {
-                    7
-                } else if self
-                    .labels
-                    .values()
-                    .any(|binding| binding.google_principal.is_some())
-                {
-                    6
-                } else if !self.native_rotations.is_empty() {
-                    5
-                } else if self.shared.is_empty() {
-                    LOGINS_SCHEMA
-                } else {
-                    4
-                },
-            ),
+            Value::from(if self.enrollment.has_native_rows() {
+                10
+            } else if self.enrollment.has_owner_witness() || self.enrollment.has_artifacts() {
+                9
+            } else if self.enrollment.requires_extended() {
+                8
+            } else if !self.enrollment.is_empty() {
+                7
+            } else if self
+                .labels
+                .values()
+                .any(|binding| binding.google_principal.is_some())
+            {
+                6
+            } else if !self.native_rotations.is_empty() {
+                5
+            } else if self.shared.is_empty() {
+                LOGINS_SCHEMA
+            } else {
+                4
+            }),
         );
         if !self.enrollment.is_empty() {
             o.insert("enrollment".into(), self.enrollment.encode());
@@ -3192,18 +3270,18 @@ impl Logins {
         }
         let schema = doc.get("schema").and_then(Value::as_u64);
         let legacy = match schema {
-            Some(4..=9) => false,
+            Some(4..=10) => false,
             Some(2 | LOGINS_SCHEMA) => false,
             Some(1) => true,
             Some(other) => {
                 return Err(Unread::NotOurs(format!(
-                    "schema {other}; this build reads schemas 1, 2, {LOGINS_SCHEMA}, 4, 5, 6, 7, 8 and 9"
+                    "schema {other}; this build reads schemas 1, 2, {LOGINS_SCHEMA}, 4, 5, 6, 7, 8, 9 and 10"
                 )));
             }
             None => return Err(Unread::NotOurs("names no schema".to_string())),
         };
         let shared = if schema == Some(4)
-            || (matches!(schema, Some(5..=9)) && doc.get("shared").is_some())
+            || (matches!(schema, Some(5..=10)) && doc.get("shared").is_some())
         {
             shared::State::from_json(&doc["shared"]).map_err(Unread::NotOurs)?
         } else {
@@ -3216,7 +3294,7 @@ impl Logins {
         };
         let mut native_rotations = BTreeMap::new();
         if schema == Some(5)
-            || (matches!(schema, Some(6..=9)) && doc.get("native_rotations").is_some())
+            || (matches!(schema, Some(6..=10)) && doc.get("native_rotations").is_some())
         {
             let entries = doc
                 .get("native_rotations")
@@ -3357,7 +3435,7 @@ impl Logins {
                 )));
             }
             if binding.google_principal.is_some()
-                && (!matches!(schema, Some(6..=9))
+                && (!matches!(schema, Some(6..=10))
                     || binding.proved_by != Some(Proof::Status)
                     || binding.proved_email.is_none()
                     || binding.proved_dir.is_none()
@@ -3406,10 +3484,16 @@ impl Logins {
                 sign_in_receipts.insert(label.clone(), receipt);
             }
         }
-        let enrollment = if matches!(schema, Some(7..=9)) {
+        let enrollment = if matches!(schema, Some(7..=10)) {
             let book = super::codex_enrollment::Operations::decode(&doc["enrollment"])
                 .map_err(Unread::NotOurs)?;
-            if schema != Some(9) && book.has_owner_witness() {
+            if schema != Some(10) && book.has_native_rows() {
+                return Err(Unread::NotOurs(
+                    "native row admission requires schema 10".into(),
+                ));
+            }
+
+            if !matches!(schema, Some(9 | 10)) && book.has_owner_witness() {
                 return Err(Unread::NotOurs(
                     "owner freshness witnesses require schema 9".into(),
                 ));
@@ -3419,7 +3503,7 @@ impl Logins {
                     "native enrollment custody requires schema 8".into(),
                 ));
             }
-            if schema != Some(9) && book.has_artifacts() {
+            if !matches!(schema, Some(9 | 10)) && book.has_artifacts() {
                 return Err(Unread::NotOurs(
                     "native artifact custody requires schema 9".into(),
                 ));
@@ -5635,7 +5719,7 @@ impl Account {
     /// When this row last had room on someone's word: the owner's clearing ([`pin`]), or the newest
     /// read that named a window and found none full ([`note_sample`]). Nothing rewrites a rollout,
     /// and a session stopped at a wall writes no later reading, so a full reading older than this
-    /// no longer speaks for the row ([`crate::ai::codex_limits::login_sample`]). A later read that
+    /// no longer speaks for the row ([`crate::ai::codex_limits::login_look`]). A later read that
     /// finds one full leaves this where it was: it speaks for itself, and only from then on.
     #[must_use]
     pub fn room_since(&self) -> Option<i64> {
@@ -10863,6 +10947,51 @@ impl Drop for Lock {
     }
 }
 
+/// A pure snapshot pinned to the actual account writer. No constructor from
+/// caller-supplied records; native admission must consume it while held.
+pub(in crate::harness) struct NativeRowSnapshot<'a> {
+    store: &'a Store,
+    roster: PathBuf,
+    held: &'a Lock,
+    records: AccountRecords,
+}
+/// Read-only canonical custody pinned to the actual writer. Cancellation
+/// retirement needs no roster, provider policy, credential, or stage file read.
+pub(in crate::harness) struct NativeRetirementSnapshot<'a> {
+    store: &'a Store,
+    held: &'a Lock,
+    logins: Logins,
+}
+impl NativeRetirementSnapshot<'_> {
+    pub(in crate::harness) fn current(&self) -> Result<(), String> {
+        if !self.store.native_writer_matches(self.held) {
+            return Err("native retirement writer changed".into());
+        }
+        Ok(())
+    }
+    pub(in crate::harness) fn retained_image(&self) -> &Logins {
+        &self.logins
+    }
+}
+
+impl NativeRowSnapshot<'_> {
+    pub(in crate::harness) fn current(&self) -> Result<(), String> {
+        if !self.store.native_writer_matches(self.held) {
+            return Err("native row writer changed".into());
+        }
+        Ok(())
+    }
+    pub(in crate::harness) fn roster(&self) -> &Path {
+        &self.roster
+    }
+    pub(in crate::harness) fn account_image(&self) -> &AccountRecords {
+        &self.records
+    }
+    pub(in crate::harness) fn store(&self) -> &Store {
+        self.store
+    }
+}
+
 impl Store {
     /// Opens the accounts [`Store`] rooted under `harness_state`.
     #[must_use]
@@ -11546,10 +11675,60 @@ impl Store {
         self.read_account_records_with(roster_path, now, || {})
     }
 
+    fn native_writer_matches(&self, held: &Lock) -> bool {
+        astream_sys::file_matches_path(&held.0, &self.dir.join(LOCK_FILE)).unwrap_or(false)
+    }
+
+    pub(in crate::harness) fn native_retirement_snapshot_held<'a>(
+        &'a self,
+        held: &'a Lock,
+        now: i64,
+    ) -> Result<NativeRetirementSnapshot<'a>, String> {
+        if !self.native_writer_matches(held) {
+            return Err("native retirement writer changed".into());
+        }
+        let (logins, note) = self.load_logins(now)?;
+        if note.is_some() {
+            return Err("native retirement records are uncertain".into());
+        }
+        let snapshot = NativeRetirementSnapshot {
+            store: self,
+            held,
+            logins,
+        };
+        snapshot.current()?;
+        Ok(snapshot)
+    }
+
     /// Observe cached account metadata without recovering publication or reading
     /// credentials. A pending or overlapping publication fails closed.
     /// # Errors
     /// As [`Self::read_account_records`]; no interrupted publication is repaired.
+    pub(in crate::harness) fn native_row_snapshot_held<'a>(
+        &'a self,
+        held: &'a Lock,
+        roster: &Path,
+        now: i64,
+    ) -> Result<NativeRowSnapshot<'a>, String> {
+        if !self.native_writer_matches(held) {
+            return Err("native row writer changed".into());
+        }
+        let records = self
+            .peek_account_records(roster, now)
+            .map_err(|_| "native row records unavailable")?;
+        if !records.roster_present || !records.notes.is_empty() {
+            return Err("native row records are uncertain".into());
+        }
+        let snapshot = NativeRowSnapshot {
+            store: self,
+            roster: std::fs::canonicalize(roster).map_err(|_| "native row source unavailable")?,
+            held,
+            records,
+        };
+        snapshot.current()?;
+        Ok(snapshot)
+    }
+
     pub fn peek_account_records(
         &self,
         roster_path: &Path,

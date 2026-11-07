@@ -5,11 +5,12 @@
 //! Only bounded byte parsing is used; no unaligned native struct references.
 
 #[cfg(target_os = "macos")]
-use super::{MAX_MESSAGES, MAX_REPLY, Socket, sequence};
+use super::{MAX_MESSAGES, MAX_REPLY, Socket, option, sequence, set_option};
 use super::{Route, align4, refuse, u16_at, u32_at};
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    os::fd::{AsRawFd, OwnedFd},
 };
 
 const HEADER: usize = 92;
@@ -208,7 +209,6 @@ pub(super) fn lookup(
     bound: Option<u32>,
     until: std::time::Instant,
 ) -> io::Result<Route> {
-    use std::os::fd::AsRawFd;
     let sequence = sequence()?;
     let pid = std::process::id();
     let bytes = request(peer, sequence, pid, bound)?;
@@ -245,6 +245,125 @@ pub(super) fn lookup(
         }
     }
     Err(refuse("route query reply bound exceeded"))
+}
+
+/// Whether a routing-socket message of type `kind` can change what `getifaddrs`, an interface's
+/// index or its link type says: every type but the route-table ones (`RTM_ADD` through
+/// `RTM_RESOLVE`, and `RTM_GET2`, bsd/net/route.h), which add, change or look up routes and
+/// never an interface or its addresses. A type this build does not know moves it.
+pub(super) const fn moves_interfaces(kind: u8) -> bool {
+    !matches!(kind, 0x1..=0xb | 0x14)
+}
+
+/// The receive room [`Watch::open`] asks for on its routing socket: some 400 interface or
+/// address messages between two drains, where the kernel's default (8 KiB) holds some 50.
+#[cfg(target_os = "macos")]
+const WATCH_ROOM: u32 = 64 * 1024;
+
+/// The most messages one drain ([`Watch::drain`]) reads before it counts what may be left as lost.
+const DRAIN: usize = 4096;
+
+/// The kernel's interface changes as one routing socket hears them: a generation that every
+/// interface or address message the socket delivers moves ([`moves_interfaces`]). What the socket
+/// cannot vouch for moves it too, so a lost message never leaves a reader on an attachment the
+/// kernel changed: a read that fails or is too short to name its type, a drain that reaches its
+/// bound, and a drain that finds half the socket's receive room queued, since the kernel drops a
+/// message that finds the room full and says nothing.
+pub(super) struct Watch {
+    socket: OwnedFd,
+    generation: u64,
+    /// The socket's receive room, in bytes.
+    room: usize,
+}
+
+impl Watch {
+    /// A watch over `socket`, a datagram socket whose receive room is `room` bytes.
+    pub(super) const fn over(socket: OwnedFd, room: usize) -> Self {
+        Self {
+            socket,
+            generation: 0,
+            room,
+        }
+    }
+
+    /// A routing socket of this process's own, its receive room raised to [`WATCH_ROOM`] where the
+    /// kernel allows, and read back.
+    #[cfg(target_os = "macos")]
+    fn open() -> io::Result<Self> {
+        let socket = Socket::new(libc::PF_ROUTE, 0)?;
+        let _ = set_option(&socket.0, libc::SOL_SOCKET, libc::SO_RCVBUF, WATCH_ROOM);
+        let room = option(&socket.0, libc::SOL_SOCKET, libc::SO_RCVBUF)?;
+        Ok(Self::over(socket.0, usize::try_from(room).unwrap_or(0)))
+    }
+
+    /// Read every message queued on the socket, at most `most`, and say the generation after them.
+    pub(super) fn drain(&mut self, most: usize) -> u64 {
+        // An interface or address message is a few hundred bytes; only its type is read, and a
+        // longer one is cut, never misread.
+        let mut buffer = [0_u8; 1024];
+        let mut moved = false;
+        let mut queued = 0_usize;
+        let mut read = 0;
+        loop {
+            if read == most {
+                moved = true;
+                break;
+            }
+            read += 1;
+            // SAFETY: buffer is writable for its full length on this live descriptor.
+            let received = unsafe {
+                libc::recv(
+                    self.socket.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            let Ok(received) = usize::try_from(received) else {
+                match io::Error::last_os_error().kind() {
+                    io::ErrorKind::WouldBlock => break,
+                    io::ErrorKind::Interrupted => continue,
+                    _ => {
+                        moved = true;
+                        break;
+                    }
+                }
+            };
+            queued += received;
+            moved |= received < 4 || moves_interfaces(buffer[3]);
+        }
+        if moved || queued.saturating_mul(2) >= self.room {
+            self.generation += 1;
+        }
+        self.generation
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    /// A stand-in for the process's routing socket that [`interface_generation`] drains on this
+    /// thread instead, so a test delivers the kernel's messages itself.
+    static STAND_IN: std::cell::RefCell<Option<Watch>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The kernel's interface changes as this process has heard them ([`Watch`]): a routing socket
+/// opened at the first ask and drained at each. `None` where the socket cannot be opened.
+#[cfg(target_os = "macos")]
+pub(super) fn interface_generation() -> Option<u64> {
+    static WATCH: std::sync::Mutex<Option<Watch>> = std::sync::Mutex::new(None);
+    #[cfg(test)]
+    if let Some(generation) =
+        STAND_IN.with_borrow_mut(|watch| watch.as_mut().map(|watch| watch.drain(DRAIN)))
+    {
+        return Some(generation);
+    }
+    let mut watch = WATCH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if watch.is_none() {
+        *watch = Some(Watch::open().ok()?);
+    }
+    Some(watch.as_mut()?.drain(DRAIN))
 }
 
 #[cfg(target_os = "macos")]

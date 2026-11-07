@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::ctx::Ctx;
-use crate::host::{HostError, Slug};
+use crate::host::{HostError, HostRole, Slug, gh_serves};
 
 /// The trust repo's seed ledger path at `origin/main`.
 pub const LEDGER: &str = "bootstrap/trust-stage0/seed-ledger.toml";
@@ -97,19 +97,36 @@ pub fn publish_refusals_for_receipt(ctx: &Ctx, trust_repo: &Path, receipt: &str)
     let repin = field(receipt, "repin_commit").unwrap_or_default();
     let tag = field(receipt, "repin_release_tag").unwrap_or_default();
     let commit = field(receipt, "repin_compiler_git_commit_hash").unwrap_or_default();
-    if let Err(why) = git(trust_repo, &["fetch", "-q", "origin", "main"]) {
-        return vec![format!(
-            "cannot fetch {repo}'s origin main ({why}), so nothing says main pins this seal's \
-             compiler"
-        )];
-    }
-    if repin.is_empty()
-        || git(
+    let native = !gh_serves(ctx, HostRole::Staging);
+    let main = if native {
+        match crate::git::main_of_record(
+            &*ctx.hosts.staging,
             trust_repo,
-            &["merge-base", "--is-ancestor", &repin, "FETCH_HEAD"],
-        )
-        .is_err()
-    {
+            &ctx.staging_slug("trust"),
+        ) {
+            Ok(main) => Some(main),
+            Err(why) => {
+                return vec![format!(
+                    "cannot read {repo}'s owner-bound main through its host ({why}), so nothing \
+                 says main pins this seal's compiler"
+                )];
+            }
+        }
+    } else {
+        if let Err(why) = git(trust_repo, &["fetch", "-q", "origin", "main"]) {
+            return vec![format!(
+                "cannot fetch {repo}'s origin main ({why}), so nothing says main pins this seal's \
+                 compiler"
+            )];
+        }
+        None
+    };
+    let tip = main.as_ref().map_or("FETCH_HEAD", |(_, tip)| tip.as_str());
+    let query = |args: &[&str]| match &main {
+        Some((source, _)) => source.query(args).map_err(|error| error.to_string()),
+        None => git(trust_repo, args),
+    };
+    if repin.is_empty() || query(&["merge-base", "--is-ancestor", &repin, tip]).is_err() {
         return vec![format!(
             "{repo}'s origin main does not contain this cut's re-pin commit {}. Publish its \
              archives as release {tag}, land the re-pin, then publish this pack: a pack whose \
@@ -118,9 +135,8 @@ pub fn publish_refusals_for_receipt(ctx: &Ctx, trust_repo: &Path, receipt: &str)
             if repin.is_empty() { "<none>" } else { &repin }
         )];
     }
-    let main_stage0 = git(trust_repo, &["show", "FETCH_HEAD:src/stage0"]).unwrap_or_default();
-    let repin_stage0 =
-        git(trust_repo, &["show", &format!("{repin}:src/stage0")]).unwrap_or_default();
+    let main_stage0 = query(&["show", &format!("{tip}:src/stage0")]).unwrap_or_default();
+    let repin_stage0 = query(&["show", &format!("{repin}:src/stage0")]).unwrap_or_default();
     let pinned = field(&main_stage0, "compiler_git_commit_hash").unwrap_or_default();
     let short: String = repin.chars().take(10).collect();
     if pinned != commit {
@@ -138,7 +154,7 @@ pub fn publish_refusals_for_receipt(ctx: &Ctx, trust_repo: &Path, receipt: &str)
              minted"
         ));
     }
-    let ledger = git(trust_repo, &["show", &format!("FETCH_HEAD:{LEDGER}")]).unwrap_or_default();
+    let ledger = query(&["show", &format!("{tip}:{LEDGER}")]).unwrap_or_default();
     let release = ledger.parse::<aterm_toml::Table>().ok().and_then(|t| {
         let r = t.get("release")?;
         let repo = r.get("repo")?.as_str()?.to_string();

@@ -1801,8 +1801,8 @@ pub(crate) enum FleetLine {
     NotInFleet,
     /// In a fleet.
     InFleet {
-        /// The last good read: how many Macs answered of how many asked, how many agents they run, and when it was read (unix ms).
-        read: Option<(usize, usize, usize, u64)>,
+        /// The last good read: how many Macs answered of how many asked, how many agents they run (where their rows count them), and when it was read (unix ms).
+        read: Option<(usize, usize, Option<usize>, u64)>,
         /// A read is in flight.
         reading: bool,
         /// Why the last read failed, when it did.
@@ -2739,6 +2739,7 @@ pub(crate) fn landing_receipts() -> (
             check: false,
             said: "Nothing left: the parser is committed and pushed to origin/main.".to_string(),
             at_ms: 0,
+            statement: aterm_agent::harness::land_receipt::Statement::Unread,
         },
         LandReceipt {
             head: "0c4d2e9f1a7b".to_string(),
@@ -3289,16 +3290,19 @@ pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
     expect(dead_code, reason = "the menu-bar status item is macOS's")
 )]
 fn fleet_line(
-    read: Option<&(usize, usize, usize, u64)>,
+    read: Option<&(usize, usize, Option<usize>, u64)>,
     reading: bool,
     failed: bool,
     now_unix: i64,
 ) -> String {
     let mut line = match read {
         Some((answered, asked, agents, at)) => format!(
-            "Fleet \u{2014} {answered} of {asked} Mac{} answered \u{b7} {agents} agent{} \u{b7} read {} ago",
+            "Fleet \u{2014} {answered} of {asked} Mac{} answered{} \u{b7} read {} ago",
             plural(*asked),
-            plural(*agents),
+            agents.map_or_else(String::new, |agents| format!(
+                " \u{b7} {agents} agent{}",
+                plural(agents)
+            )),
             age_words(ms_age(*at, now_unix))
         ),
         None if reading => return "Fleet \u{2014} reading\u{2026}".to_string(),
@@ -3457,14 +3461,28 @@ fn mac_row(
             )));
         }
     }
-    rows.push(StatusRow::Info(format!(
-        "{} session{} \u{b7} {} agent{}, {} working",
-        mac.sessions,
-        plural(mac.sessions),
-        mac.agents,
-        plural(mac.agents),
-        mac.working
-    )));
+    // Each count is absent, never zero, where it was not read: this Mac's copy reads no session
+    // count (`sessions: None`), and an older aterm's rows, or a copy's Mac that publishes no fresh
+    // activity row, no agents.
+    let sessions = mac
+        .sessions
+        .filter(|&n| n > 0 || mac.activity.is_some())
+        .map(|n| format!("{n} session{} \u{b7} ", plural(n)));
+    let sessions = sessions.as_deref().unwrap_or("");
+    rows.push(StatusRow::Info(match mac.activity {
+        Some(t) => format!(
+            "{sessions}{} agent{}: {} busy, {} waiting, {} walled",
+            t.agents,
+            plural(usize::from(t.agents)),
+            t.busy,
+            t.waiting,
+            t.walled
+        ),
+        None => format!("{sessions}agents not read"),
+    }));
+    if let Some(build) = &mac.build {
+        rows.push(StatusRow::Info(format!("at {build}")));
+    }
     if mac.left_out > 0 {
         rows.push(StatusRow::Info(format!(
             "{} more not sent (its reply cap)",
@@ -3516,15 +3534,33 @@ fn mac_row(
             unbound_issuer_row,
         ));
     }
-    let what = match (mac.needs.len(), mac.working) {
-        (0, 0) if mac.instances_unread > 0 => "other instances unread".to_string(),
-        (0, 0) => "quiet".to_string(),
-        (0, w) => format!("{w} working"),
-        (n, w) if mac.unproven => format!("{n} need{} \u{b7} {w} working", plural(n)),
-        (n, w) => format!(
-            "{n} need{} you \u{b7} {w} working",
-            if n == 1 { "s" } else { "" }
-        ),
+    // Where its activity was not read (an older aterm, this Mac's copy) the busy count is
+    // absent, never 0.
+    let busy = mac.activity.map(|t| t.busy);
+    // The agents' words from the tally [`quiet_mac`] reads, so a Mac listed among the active is
+    // never labelled quiet.
+    let t = mac.activity.unwrap_or_default();
+    let agents: Vec<String> = [
+        (t.busy, "busy"),
+        (t.waiting, "waiting"),
+        (t.walled, "at a limit"),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, word)| format!("{n} {word}"))
+    .collect();
+    let what = match mac.needs.len() {
+        0 if agents.is_empty() && mac.instances_unread > 0 => "other instances unread".to_string(),
+        0 if agents.is_empty() => "quiet".to_string(),
+        0 => agents.join(" \u{b7} "),
+        n => {
+            let needs = if mac.unproven {
+                format!("{n} need{}", plural(n))
+            } else {
+                format!("{n} need{} you", if n == 1 { "s" } else { "" })
+            };
+            busy.map_or(needs.clone(), |b| format!("{needs} \u{b7} {b} busy"))
+        }
     };
     let mark = if mac.unproven {
         "key not proven \u{b7} "
@@ -3539,7 +3575,7 @@ fn mac_row(
     } else {
         String::new()
     };
-    let partial = if mac.instances_unread > 0 && (!mac.needs.is_empty() || mac.working > 0) {
+    let partial = if mac.instances_unread > 0 && (!mac.needs.is_empty() || !agents.is_empty()) {
         " \u{b7} partial read"
     } else {
         ""
@@ -3551,6 +3587,18 @@ fn mac_row(
         ),
         rows,
     }
+}
+
+/// Whether a fleet Mac is quiet: no need, no agent busy, waiting or at a limit, and no other
+/// instance reported unread.
+#[cfg(any(target_os = "macos", test))]
+fn quiet_mac(mac: &crate::fleet_glance::FleetMac) -> bool {
+    let t = mac.activity.unwrap_or_default();
+    mac.needs.is_empty()
+        && t.busy == 0
+        && t.waiting == 0
+        && t.walled == 0
+        && mac.instances_unread == 0
 }
 
 /// Compose the Fleet submenu from the fleet glance's slot, ages as of `now_unix` — pure, at the submenu's own `menuNeedsUpdate:`: the degrade lines; the Macs that need you, work or were only partly read, needs first; the quiet ones with no other instances reported, the ones that did not answer, the ones whose key is not proven (an older one among them stands with the older) and the older ones each folded into one row; and Read the Fleet Now.
@@ -3579,14 +3627,16 @@ pub(crate) fn compose_fleet_menu(
                 .macs
                 .iter()
                 .enumerate()
-                .filter(|(_, m)| {
-                    m.counts() && (!m.needs.is_empty() || m.working > 0 || m.instances_unread > 0)
-                })
+                .filter(|(_, m)| m.counts() && !quiet_mac(m))
                 .collect();
+            // Needs first, then the agents that wait on a person or sit at a limit, then the
+            // busy ones.
             active.sort_by_key(|(i, m)| {
+                let t = m.activity.unwrap_or_default();
                 (
                     std::cmp::Reverse(m.needs.len()),
-                    std::cmp::Reverse(m.working),
+                    std::cmp::Reverse(t.waiting.saturating_add(t.walled)),
+                    std::cmp::Reverse(t.busy),
                     *i,
                 )
             });
@@ -3595,9 +3645,7 @@ pub(crate) fn compose_fleet_menu(
                 .macs
                 .iter()
                 .enumerate()
-                .filter(|(_, m)| {
-                    m.counts() && m.needs.is_empty() && m.working == 0 && m.instances_unread == 0
-                })
+                .filter(|(_, m)| m.counts() && quiet_mac(m))
                 .filter_map(|(i, m)| row(i, m))
                 .collect();
             if !quiet.is_empty() {
@@ -5446,7 +5494,7 @@ mod tests {
         };
         assert_eq!(
             label,
-            "studio \u{2014} key not proven \u{b7} 1 need \u{b7} 1 working"
+            "studio \u{2014} key not proven \u{b7} 1 need \u{b7} 1 busy"
         );
         let infos: Vec<&str> = rows
             .iter()
@@ -5503,7 +5551,7 @@ mod tests {
             fleet
                 .iter()
                 .any(|row| matches!(row, StatusRow::Submenu { label, .. }
-                if label == "studio \u{2014} 1 needs you \u{b7} 1 working")),
+                if label == "studio \u{2014} 1 needs you \u{b7} 1 busy")),
             "{fleet:?}"
         );
         assert!(
@@ -6912,7 +6960,9 @@ mod tests {
                     name: "mac-22".to_string(),
                     dial: "mac-22".to_string(),
                     why: "no connection in 3 s".to_string(),
+                    ..crate::fleet_glance::Unanswered::default()
                 }],
+                seats: None,
             })),
             book: crate::fleet_glance::BookFacts {
                 in_fleet: true,
@@ -6935,9 +6985,13 @@ mod tests {
             dial: label.to_string(),
             host: crate::fleet_glance::host_word(label),
             older,
-            sessions: needs + working,
-            agents: needs + working,
-            working,
+            sessions: Some(needs + working),
+            activity: (!older).then(|| crate::fleet_glance::AgentTally {
+                agents: u16::try_from(needs + working).expect("a few agents"),
+                busy: u16::try_from(working).expect("a few agents"),
+                unknown: u16::try_from(needs).expect("a few agents"),
+                ..crate::fleet_glance::AgentTally::default()
+            }),
             needs: (0..needs)
                 .map(|n| crate::fleet_glance::FleetNeed {
                     sid: format!("s-{n}"),
@@ -6953,6 +7007,52 @@ mod tests {
                 .collect(),
             ..crate::fleet_glance::FleetMac::default()
         }
+    }
+
+    /// A Mac whose agents only wait or sit at a limit is listed among the active ones, and its
+    /// label says so, from the same tally the fold reads. Negative control: an idle Mac folds
+    /// into the quiet Macs.
+    #[test]
+    fn a_waiting_or_walled_mac_is_labelled_where_it_is_listed() {
+        let with = |label: &str, waiting: u16, walled: u16| crate::fleet_glance::FleetMac {
+            activity: Some(crate::fleet_glance::AgentTally {
+                agents: 1 + waiting + walled,
+                idle: 1,
+                waiting,
+                walled,
+                ..crate::fleet_glance::AgentTally::default()
+            }),
+            ..mac(label, 0, 0, false)
+        };
+        let slot = fleet_slot(
+            vec![
+                with("mac-idle", 0, 0),
+                with("mac-walled", 0, 2),
+                with("mac-waiting", 1, 0),
+            ],
+            10_000,
+        );
+        let rows = compose_fleet_menu(&slot, 10);
+        let labels: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| match row {
+                StatusRow::Submenu { label, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            labels.contains(&"mac-walled \u{2014} 2 at a limit"),
+            "{labels:?}"
+        );
+        assert!(
+            labels.contains(&"mac-waiting \u{2014} 1 waiting"),
+            "{labels:?}"
+        );
+        assert!(labels.contains(&"1 quiet Mac"), "{labels:?}");
+        assert!(
+            !labels.iter().any(|l| l.starts_with("mac-idle")),
+            "{labels:?}"
+        );
     }
 
     #[test]
@@ -7142,7 +7242,7 @@ mod tests {
             matches!(
                 g.fleet,
                 FleetLine::InFleet {
-                    read: Some((1, 2, 2, _)),
+                    read: Some((1, 2, Some(2), _)),
                     ..
                 }
             ),
@@ -7372,8 +7472,11 @@ mod tests {
             vec![crate::fleet_glance::FleetMac {
                 name: "mac-17".to_string(),
                 dial: "mac-17".to_string(),
-                sessions: 2,
-                agents: 2,
+                sessions: Some(2),
+                activity: Some(crate::fleet_glance::AgentTally {
+                    agents: 2,
+                    ..crate::fleet_glance::AgentTally::default()
+                }),
                 needs: vec![
                     peer("report", NeedWord::Ask, 4 * 3600, true),
                     peer("box", NeedWord::Approval, 1800, false),

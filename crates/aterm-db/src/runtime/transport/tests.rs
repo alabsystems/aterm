@@ -991,7 +991,7 @@ fn completed_round_metadata_is_bounded_and_discloses_every_eviction() {
         36
     );
     assert!(transport.reports().next().is_none());
-    let error = bounded_error("λ".repeat(1000));
+    let error = super::super::report::bounded_error("λ".repeat(1000));
     assert!(error.len() <= 512);
     assert!(error.ends_with('…'));
 }
@@ -1380,7 +1380,10 @@ fn authenticated_transport_contacts_become_unconfirmed_retained_network_history(
         || (wall, at),
     );
     let mut failed = round.clone();
-    failed.control = Err("failed after authentication".into());
+    failed.control = Err(Failure::new(
+        aterm_types::network_state::RepairCause::Io,
+        "failed after authentication",
+    ));
     super::super::observe_contacts(
         &bootstrap,
         &std::cell::OnceCell::new(),
@@ -1912,4 +1915,41 @@ fn panicked_worker_releases_the_hint_slot_for_retry() {
             .next(now + Duration::from_secs(10))
             .is_some()
     );
+}
+
+/// A dial's failure names what held it: the LAN broker's absence or refusal is `lan-held` (the
+/// typed refusal survives `into_io`, while a bare `NotConnected` is only I/O), a dial that reached
+/// no peer is `unreachable`, and any other I/O failure stays `io`.
+#[test]
+fn a_dial_failure_names_a_held_lan_apart_from_an_unreachable_peer() {
+    use aterm_types::network_state::RepairCause;
+    use aterm_uds::lan::{LanError, Unavailable};
+    let cause = |error: io::Error| dial_failure(error).repair_cause();
+    for why in [
+        Unavailable::NotInstalled,
+        Unavailable::Outdated { ours: 1, theirs: 2 },
+        Unavailable::Refused("fixture".into()),
+    ] {
+        assert_eq!(
+            cause(LanError::Unavailable(why).into_io()),
+            RepairCause::LanHeld
+        );
+    }
+    for kind in [
+        io::ErrorKind::ConnectionRefused,
+        io::ErrorKind::TimedOut,
+        io::ErrorKind::HostUnreachable,
+        io::ErrorKind::NetworkUnreachable,
+        io::ErrorKind::NetworkDown,
+        io::ErrorKind::AddrNotAvailable,
+    ] {
+        assert_eq!(
+            cause(io::Error::from(kind)),
+            RepairCause::Unreachable,
+            "{kind:?}"
+        );
+    }
+    for kind in [io::ErrorKind::NotConnected, io::ErrorKind::InvalidInput] {
+        assert_eq!(cause(io::Error::from(kind)), RepairCause::Io, "{kind:?}");
+    }
 }

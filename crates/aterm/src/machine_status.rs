@@ -536,20 +536,13 @@ pub(crate) fn vault_area(vault: &Vault, setup: &Setup) -> Area {
     }
 }
 
-/// The fleet area: the read-only check of what a sync would do, and the peers known.
-pub(crate) fn fleet_area(
-    check: &Result<FleetCheck, String>,
-    peers: &Result<usize, String>,
-) -> Area {
+/// The fleet area: the read-only check of what a sync would do, and this Mac's own presence row
+/// (`own`, [`aterm_agent::fleet_view::own_line`]; one-mesh §4.16).
+pub(crate) fn fleet_area(check: &Result<FleetCheck, String>, own: &str) -> Area {
     const NAME: &str = "fleet";
-    let peers = match peers {
-        Ok(1) => "1 peer known".to_owned(),
-        Ok(n) => format!("{n} peers known"),
-        Err(_) => "peers unread".to_owned(),
-    };
     match check {
-        Err(why) => Area::unread(NAME, why, "aterm fleet peers"),
-        Ok(FleetCheck::Current) => Area::ok(NAME, format!("in the vault's fleet; {peers}")),
+        Err(why) => Area::unread(NAME, why, "aterm fleet"),
+        Ok(FleetCheck::Current) => Area::ok(NAME, format!("in the vault's fleet; {own}")),
         Ok(FleetCheck::Due(why)) => Area::working(
             NAME,
             format!("a sync is due: {why}"),
@@ -567,7 +560,7 @@ pub(crate) fn fleet_area(
                 format!("not in a fleet yet ({})", idle.report()),
                 "it joins the default fleet once this Mac is in the ALab vault",
             ),
-            _ => Area::off(NAME, format!("{}; {peers}", idle.report())),
+            _ => Area::off(NAME, format!("{}; {own}", idle.report())),
         },
     }
 }
@@ -1155,12 +1148,21 @@ fn read_areas() -> Vec<Area> {
         let paths = paths.clone();
         bounded(move || paths.map(|paths| read_vault(&paths)))
     };
-    let fleet = bounded(|| {
-        (
-            aterm_agent::check_from_cache(),
-            aterm_agent::known_peer_count(),
-        )
-    });
+    let fleet_check = bounded(aterm_agent::check_from_cache);
+    // This Mac's row of the view, read apart from the sync check: a slow node service costs the
+    // line its row, never the check.
+    let fleet_own = {
+        let paths = paths.clone().ok();
+        bounded(move || {
+            aterm_types::dirs::state_dir().map_or_else(
+                || "presence not read: $HOME is not set".to_owned(),
+                |state| {
+                    let (fleet, at_ms) = aterm_agent::fleet_view::read(&state, paths.as_ref());
+                    aterm_agent::fleet_view::own_line(&fleet, at_ms)
+                },
+            )
+        })
+    };
     let name = bounded(crate::converge::mac_names);
     let clt = bounded(read_clt);
     let toolset = bounded(read_toolset);
@@ -1198,9 +1200,17 @@ fn read_areas() -> Vec<Area> {
         Some(Err(why)) => Area::unread("vault", why, "aterm secrets status"),
         None => late("vault", "aterm secrets status"),
     });
-    areas.push(match fleet(deadline) {
-        Some((check, peers)) => fleet_area(&check, &peers),
-        None => late("fleet", "aterm fleet peers"),
+    areas.push(match fleet_check(deadline) {
+        Some(check) => fleet_area(
+            &check,
+            &fleet_own(deadline).unwrap_or_else(|| {
+                format!(
+                    "this Mac's presence row not read within {} s",
+                    READ_WITHIN.as_secs()
+                )
+            }),
+        ),
+        None => late("fleet", "aterm fleet"),
     });
     areas
         .push(name(deadline).map_or_else(|| late("name", "aterm doctor"), |name| name_area(&name)));

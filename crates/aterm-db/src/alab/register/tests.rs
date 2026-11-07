@@ -18,6 +18,7 @@ use crate::{
     table::tests::{Lab, repair_commons},
     typed::{
         cell::{self, CellKey, CellValue, Cells},
+        grid::tests::Book,
         keys,
         owned::{OwnedRead, OwnedRow},
     },
@@ -1498,7 +1499,7 @@ fn a_transient_empty_probe_does_not_spend_evidence_or_start_rest() {
 /// NEGATIVE CONTROLS: without filtering `enrolled_ms` by `!is_member_denied`, a denied roster row
 /// still returns `Some(1_700_000_000_000)`; without `found.dedup()` in `typed::check::findings`,
 /// two conflicted candidates naming the same missing target emit two identical `Dangling`
-/// findings.
+/// findings; without reading `node_id`, a member's `fleet_node` is `None`.
 #[test]
 fn denied_roster_entries_and_duplicate_dangling_candidates_are_filtered() {
     use super::super::{command::known_macs_from_roster, store::roster_identity};
@@ -1530,6 +1531,10 @@ node_id = "fedcba9876543210fedcba9876543210"
     let macs = known_macs_from_roster(&roster);
     assert_eq!(macs.len(), 1);
     assert_eq!(macs[0].label.as_ref().unwrap().canonical(), "m10");
+    assert_eq!(
+        macs[0].fleet_node.as_deref(),
+        Some("fedcba9876543210fedcba9876543210")
+    );
 
     let mut cells = Cells::new();
     let key = (
@@ -1620,4 +1625,113 @@ fn registrar_drop_joins_inflight_pass_and_plan_saturates_fact_counter() {
     }
     let refreshed = run(&me(), &probe(), &[ME], true, &empty, &facts(&[(ME, row)]));
     assert_eq!(written_row(&refreshed)["n"], json!(u64::MAX));
+}
+
+/// A duplicate its Mac's own facts row is bound to stays until that Mac moves, through the facts a
+/// real registration wrote; a row the Mac is bound to is the row that stays.
+/// NEGATIVE CONTROL: with `command::merge_plan` passing an empty `bound`, the Mac's row is merged
+/// under it, and the `plan.merges.is_empty()` assertion prints that merge.
+#[test]
+fn merge_reads_the_macs_own_facts() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    name_macs(&lab);
+    let registry = Registry::at(lab.paths[0].clone());
+    registry.open().unwrap();
+    let done = registry
+        .register(&lab_config(&lab, 0), &probe(), true, NOW)
+        .unwrap();
+    let bound = match done.outcome {
+        Outcome::Born { mac } | Outcome::Adopted { mac, .. } => mac,
+        other => panic!("{other:?}"),
+    };
+    let view = registry.view().unwrap();
+    let held_name = view.project(&MACHINE).rows[&bound]
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_owned();
+    let other = keys::machine_pk("m899");
+    let write = |pk: &str, col: &str, elem: Option<&str>, x: Value| {
+        cell::change(
+            &MACHINE,
+            CellKey { pk, col, elem },
+            &CellValue::owner(MACHINE.version, x),
+        )
+        .unwrap()
+    };
+    registry
+        .write(vec![vec![
+            write(&other, "label", None, json!("m899")),
+            write(&other, "aliases", Some(&held_name), json!(true)),
+            write(
+                &other,
+                "fleet_node",
+                None,
+                json!("00112233445566778899aabbccddeeff"),
+            ),
+            write(&other, "status", None, json!("active")),
+            write(&other, "row", None, json!("live")),
+            write(&bound, "node", None, Value::Null),
+        ]])
+        .unwrap();
+    let view = registry.view().unwrap();
+    let plan = crate::alab::command::merge_plan(&view, &BTreeMap::new()).unwrap();
+    assert!(plan.merges.is_empty(), "{:?}", plan.merges);
+    assert_eq!(plan.held[0].why, "bound-by-its-mac");
+}
+
+/// A Mac that could adopt a duplicate by name adopts the row that stays, through `pick` itself: a
+/// merge leaves it no reason to birth a third row.
+/// NEGATIVE CONTROL: with `status_moves` never moving `planned` onto a row that waits, the Mac births:
+/// `Born { .. }`, which the panic prints.
+#[test]
+fn a_mac_adopts_the_row_a_merge_kept() {
+    let keep = keys::machine_pk("m36");
+    let gone = keys::machine_pk("m7");
+    let imported = |pk: &str, col: &str, elem: Option<&str>, x: Value| {
+        cell::change(
+            &MACHINE,
+            CellKey { pk, col, elem },
+            &CellValue::imported(MACHINE.version, x, "sr-0123456789abcdef"),
+        )
+        .unwrap()
+    };
+    let mut book = Book::new();
+    book.write(
+        2,
+        &[],
+        vec![
+            imported(&keep, "label", None, json!("m36")),
+            imported(&keep, "aliases", Some("m7"), json!(true)),
+            imported(
+                &keep,
+                "fleet_node",
+                None,
+                json!("00112233445566778899aabbccddeeff"),
+            ),
+            imported(&keep, "status", None, json!("active")),
+            imported(&keep, "row", None, json!("live")),
+            imported(&gone, "label", None, json!("m7")),
+            imported(&gone, "status", None, json!("planned")),
+            imported(&gone, "row", None, json!("live")),
+        ],
+    );
+    let cells = book.cells();
+    let merged = crate::alab::merge::plan(
+        &cell::project(&MACHINE, &cells),
+        &cell::project(&crate::alab::registry::PREFERENCE, &cells),
+        &BTreeSet::new(),
+        &[("m7".to_owned(), Default::default())].into(),
+    )
+    .unwrap();
+    assert_eq!(merged.merges.len(), 1, "{:?}", merged.held);
+    for changes in &merged.rows {
+        let seen = book.all();
+        book.write(2, &seen, changes.clone());
+    }
+    let adopted = run(&me(), &probe(), &[ME], true, &book.cells(), &facts(&[]));
+    match adopted.outcome {
+        Outcome::Adopted { mac, .. } => assert_eq!(mac, keep),
+        other => panic!("{other:?}"),
+    }
 }

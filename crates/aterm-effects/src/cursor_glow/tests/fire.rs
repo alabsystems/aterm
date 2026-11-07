@@ -532,6 +532,153 @@ fn fire_forge_cursor_heats_holds_and_cools_to_ember() {
     assert!(!glow.is_active(), "the animation timer disarms");
 }
 
+/// THE EMBER KEEPS A MARGIN OVER THE PAGE (after-land L3): on the reference
+/// dark page and on Solarized Dark the resting ember reads at 4.6:1 or
+/// better, past the caret bar (4.5) by more than a renderer's rounding, and
+/// keeps its ember look: still the ramp's warm metal, its rest within two
+/// hundredths of the ramp of where the bare bar put it (`#df4900` to
+/// `#e14d01` on the reference dark). Negative control: the
+/// band solved to the bare bar ([`ForgeBand::solve_to`] at
+/// [`crate::cursor_fx::CARET_PAGE_MIN_CONTRAST`]) rests under 4.6, the 4.50
+/// the composed land's `fire-dark.rest` and `fire-dark-idle10.idle10` read
+/// on both pages.
+#[test]
+fn the_resting_ember_keeps_a_margin_over_the_page() {
+    let ratio = wcag_ratio;
+    for page in [0x0011_1318u32, 0x0000_2B36] {
+        let band = ForgeBand::solve(page, true);
+        let bare = ForgeBand::solve_to(page, true, crate::cursor_fx::CARET_PAGE_MIN_CONTRAST);
+        let (rest, was) = (fire_ramp(band.lo), fire_ramp(bare.lo));
+        assert!(
+            ratio(rest, page) >= 4.6,
+            "on {page:06x} the resting ember {rest:06x} reads {:.2}:1",
+            ratio(rest, page)
+        );
+        let (r, g, b) = ((rest >> 16) & 0xff, (rest >> 8) & 0xff, rest & 0xff);
+        assert!(
+            r > g && g >= b && band.lo - bare.lo < 0.02,
+            "on {page:06x} the ember {rest:06x} (ramp {:.4}) left its look {was:06x} (ramp {:.4})",
+            band.lo,
+            bare.lo
+        );
+        assert!(
+            ratio(was, page) < 4.6,
+            "control: on {page:06x} the bare bar's ember {was:06x} reads {:.2}:1",
+            ratio(was, page)
+        );
+    }
+}
+
+/// after-land L3, THE PAPER EMBER GLOWS RED: on paper the forge caret
+/// rested at the ramp's deep rest point, a near-black maroon (`#510a00`,
+/// 15:1 on white) heavy under the paper's pale flames (`fire-light.t0`). On
+/// white and on Solarized Light it rests a red ember: past the caret's floor
+/// and under 10.5:1, its red channel more than twice its green, and
+/// [`ForgeBand::MIN_ARC`] below its full heat. Negative control: the band
+/// resting at [`ForgeBand::COLD`] as the composed land's did reads 13.5:1
+/// or more on both.
+#[test]
+fn the_paper_ember_rests_red() {
+    let ratio = wcag_ratio;
+    for page in [0x00FF_FFFFu32, 0x00FD_F6E3] {
+        let band = ForgeBand::solve(page, false);
+        let rest = fire_ramp(band.lo);
+        let read = ratio(rest, page);
+        let (r, g) = ((rest >> 16) & 0xff, (rest >> 8) & 0xff);
+        assert!(
+            (ForgeBand::PAGE_CONTRAST..10.5).contains(&read) && r > 2 * g,
+            "on {page:06x} the resting ember {rest:06x} reads {read:.2}:1"
+        );
+        assert!(
+            (band.hi - band.lo - ForgeBand::MIN_ARC).abs() < 1e-4,
+            "on {page:06x} the ember heats from {:.3} to {:.3}",
+            band.lo,
+            band.hi
+        );
+        let cold = ForgeBand {
+            lo: ForgeBand::COLD,
+            ..band
+        };
+        assert!(
+            ratio(fire_ramp(cold.lo), page) >= 13.5,
+            "control: on {page:06x} the cold rest reads {:.2}:1",
+            ratio(fire_ramp(cold.lo), page)
+        );
+    }
+}
+
+/// after-land L3, THE PAPER FLAME BURNS DEEP: on paper Fire's tongues read
+/// as pale peach (`fire-light.t0`, the tongues over 'fox'). Typing on GitHub
+/// Light at the gallery's cell under blank rows, the flame's lit pixels in
+/// the rows above the typed row (each fallen 24 or more from white) wear a
+/// mean saturation of 0.36 or more and fall 90 or more from white on
+/// average. Negative control: in the composed land's pale stops, tip fall
+/// and side fall (`fire_paper_pale`), they read under 0.34 and under 85.
+#[test]
+fn the_paper_flame_burns_deep() {
+    let g = tall_geom();
+    let pair = (0x001F_2328u32, 0x00FF_FFFFu32);
+    let row = 5u16;
+    let read = |pale: bool| {
+        let mut c = cfg(GlowStyle::Fire, true);
+        (c.intensity, c.dark_theme) = (1.0, false);
+        (c.theme_fg, c.theme_bg) = pair;
+        let mut glow = CursorGlow {
+            fire_paper_pale: pale,
+            ..CursorGlow::default()
+        };
+        let mut out = Vec::new();
+        let mut text = vec![' '; g.cols];
+        let mut t = Instant::now();
+        let mut col = 2u16;
+        glow.observe_row(row, col, &text, t);
+        glow.tick(Some((row, col)), t, &c, g, &mut out);
+        let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+        let mut cells = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+        for line in &mut cells {
+            for cell in line.iter_mut() {
+                (cell.fg, cell.bg) = (rgb(pair.0), rgb(pair.1));
+            }
+        }
+        for _ in 0..24 {
+            t += Duration::from_millis(60);
+            text[usize::from(col)] = 'm';
+            cells[usize::from(row)][usize::from(col)].ch = 'm';
+            col += 1;
+            glow.note_synthetic_typed(t, 1);
+            glow.observe_row(row, col, &text, t);
+            glow.observe_frame_text(Some((row, col)), &cells, t);
+            glow.tick(Some((row, col)), t, &c, g, &mut out);
+        }
+        let mut glass = Glass::new(g, pair.1);
+        glass.add_quads(glow.under_quads());
+        let lit: Vec<(f32, i32)> = (0..i32::from(row) * g.ch as i32)
+            .flat_map(|y| (0..g.win_w as i32).map(move |x| (y, x)))
+            .filter_map(|(y, x)| {
+                let fall = paper_depth(&glass, y, x);
+                (fall >= 24).then(|| (crate::color_math::rgb2hsv(glass.at(y, x)).1, fall))
+            })
+            .collect();
+        let n = lit.len().max(1) as f32;
+        (
+            lit.iter().map(|l| l.0).sum::<f32>() / n,
+            lit.iter().map(|l| l.1).sum::<i32>() as f32 / n,
+            lit.len(),
+        )
+    };
+    let (sat, fall, n) = read(false);
+    let (was_sat, was_fall, _) = read(true);
+    assert!(n >= 100, "the flame lights {n} px above the row");
+    assert!(
+        sat >= 0.36 && fall >= 90.0,
+        "the flame's lit pixels read saturation {sat:.2}, fall {fall:.1}"
+    );
+    assert!(
+        was_sat < 0.34 && was_fall < 85.0,
+        "control: the pale flame's lit pixels read saturation {was_sat:.2}, fall {was_fall:.1}"
+    );
+}
+
 #[test]
 fn the_forge_caret_reads_on_its_page_at_rest_and_hot() {
     let g = geom();
@@ -1337,6 +1484,10 @@ fn fire_on_a_light_ground_is_ink_never_light() {
         // slabs (`coarse`).
         glow.light_body_unsolved = unsolved;
         glow.fire_light_root_coarse = coarse;
+        // With both off, the flame is laid in the composed land's pale
+        // stops (`fire_paper_pale`, after-land L3), the brightest the paper
+        // flame has burned and so the hardest on a light ink.
+        glow.fire_paper_pale = unsolved && coarse;
         let mut t = Instant::now();
         glow.observe_row(row, start, &text, t);
         glow.tick(Some((row, start)), t, &c, g, &mut out);
@@ -6782,8 +6933,9 @@ fn the_frame_s_night_grounds_lie_under_the_ramps_light_too() {
 
 /// The light Comet typing 20 keys on GitHub Light at `gap` ms a key
 /// (`short`: its wedge as looks8 laid it), the frame after the last key:
-/// `(reach, worst)`, the cells behind the caret whose counters its tail
-/// darkens by 24 or more, and the least contrast of the typed letters.
+/// `(reach, worst)`, the cells behind the caret whose foot its tail darkens
+/// by 24 or more (read at its spine, [`CursorGlow::COMET_LIGHT_SPINE`], and
+/// at the counters' columns), and the least contrast of the typed letters.
 fn paper_comet_tail(gap: u64, short: bool) -> (usize, f32) {
     let g = tall_geom();
     let pair = (0x001F_2328u32, 0x00FF_FFFFu32);
@@ -6809,14 +6961,14 @@ fn paper_comet_tail(gap: u64, short: bool) -> (usize, f32) {
     glass.add_quads(&out);
     glass.add_halos(glow.halos());
     let (cw, ch) = (g.cw as i32, g.ch as i32);
-    let yc = i32::from(row) * ch + ch / 2;
-    // A cell's counters (between its strokes) at the row's middle.
+    let yc = i32::from(row) * ch + (ch as f32 * (0.5 + CursorGlow::COMET_LIGHT_SPINE)) as i32;
+    // A cell's counters' columns (between its strokes) at the tail's spine.
     let dark = |back: u16| {
         let x0 = i32::from(caret - back) * cw;
         [4, 8]
             .iter()
             .map(|&dx| {
-                let p = glass.at(yc + 1, x0 + dx);
+                let p = glass.at(yc, x0 + dx);
                 [16u32, 8, 0]
                     .iter()
                     .map(|&sh| 255 - ((p >> sh) & 0xff) as i32)
@@ -6839,7 +6991,8 @@ fn paper_comet_tail(gap: u64, short: bool) -> (usize, f32) {
 /// THE PAPER COMET'S TAIL HAS PRESENCE (looks9 Q2): on paper Comet was
 /// mostly a soft blue blob, its tail's light gone two cells behind the
 /// caret (`comet-light.t0`). Typing on GitHub Light, its tail darkens the
-/// counters of five cells or more behind the caret, and every typed letter
+/// foot of five cells or more behind the caret (its spine, after-land L1),
+/// and every typed letter
 /// keeps 4.5:1. Negative control: the wedge as looks8 laid it reaches three
 /// or fewer.
 #[test]
@@ -6934,6 +7087,310 @@ fn the_paper_comet_s_tail_is_a_needle_of_ice() {
         tube_tail * 3 >= tube_head
             && (toward_ice(tube_head_hue) - toward_ice(tube_tail_hue)).abs() < 3.0,
         "control: looks9's wedge lights {tube_tail} rows of {tube_head} four cells back, hue {tube_tail_hue:.1} of {tube_head_hue:.1}"
+    );
+}
+
+/// The light Comet typing 20 keys on GitHub Light at 60 ms a key with the caret's insertion
+/// point at `head_dx` (0.5 a block, 0.08 a bar), the frame after the last key: its lights
+/// under the letters alone on the page, and the caret's column.
+fn paper_comet_lights(head_dx: f32, setup: &dyn Fn(&mut CursorGlow)) -> (Glass, u16) {
+    let g = tall_geom();
+    let pair = (0x001F_2328u32, 0x00FF_FFFFu32);
+    let (row, start, keys) = (4u16, 2u16, 20u16);
+    let mut c = cfg(GlowStyle::Comet, true);
+    (c.intensity, c.dark_theme, c.head_dx) = (1.0, false, head_dx);
+    (c.theme_fg, c.theme_bg) = pair;
+    let mut glow = CursorGlow::default();
+    setup(&mut glow);
+    let mut out = Vec::new();
+    let mut text = vec![' '; g.cols];
+    let mut t = Instant::now();
+    for k in 0..=keys {
+        if k > 0 {
+            t += Duration::from_millis(60);
+            text[usize::from(start + k - 1)] = 'm';
+            glow.note_synthetic_typed(t, 1);
+        }
+        glow.observe_row(row, start + k, &text, t);
+        glow.tick(Some((row, start + k)), t, &c, g, &mut out);
+    }
+    let mut glass = Glass::new(g, pair.1);
+    glass.add_quads(glow.under_quads());
+    (glass, start + keys)
+}
+
+/// How far the page at (`y`, `x`) is darkened: its deepest channel's fall from white.
+fn paper_depth(glass: &Glass, y: i32, x: i32) -> i32 {
+    let p = glass.at(y, x);
+    [16u32, 8, 0]
+        .iter()
+        .map(|&sh| 255 - ((p >> sh) & 0xff) as i32)
+        .max()
+        .unwrap_or(0)
+}
+
+/// after-land L1, THE PAPER COMET'S TAIL RUNS AT THE LETTERS' FOOT: on paper the comet's
+/// tail swelled about the row's middle and crossed the last word at mid-height like a
+/// strikethrough (`comet-light.t0`, x320-375 y~118), where the dark comet's tail runs in the
+/// leading under the row. Typing on GitHub Light, three to five cells behind the caret (past
+/// its nucleus and coma) the tail darkens the row's foot band (its last quarter) by 24 or more
+/// and the middle band where a letter's x-height lies (0.38-0.62 of the row) by under 8.
+/// Negative control: laid about the row's middle as the composed land laid it
+/// (`comet_light_mid_spine`), the middle band is darkened by 24 or more.
+#[test]
+fn the_paper_comet_s_tail_runs_at_the_letters_foot() {
+    let (g, row) = (tall_geom(), 4i32);
+    let (cw, ch) = (g.cw as i32, g.ch as i32);
+    // The deepest the tail darkens rows `y0..y1` (shares of the row) of the cell `back` behind
+    // the caret.
+    let band = |glass: &Glass, caret: u16, back: i32, (y0, y1): (f32, f32)| {
+        let (x0, top) = ((i32::from(caret) - back) * cw, row * ch);
+        let rows = (top + (y0 * ch as f32) as i32)..(top + (y1 * ch as f32).ceil() as i32);
+        rows.flat_map(|y| (x0..x0 + cw).map(move |x| (y, x)))
+            .map(|(y, x)| paper_depth(glass, y, x))
+            .max()
+            .unwrap_or(0)
+    };
+    let (foot, mid) = ((0.75, 1.0), (0.38, 0.62));
+    let (glass, caret) = paper_comet_lights(0.5, &|_| {});
+    for back in 3..=5 {
+        let (f, m) = (
+            band(&glass, caret, back, foot),
+            band(&glass, caret, back, mid),
+        );
+        assert!(
+            f >= 24,
+            "{back} cells back the tail darkens the foot by {f}"
+        );
+        assert!(
+            m < 8,
+            "{back} cells back the tail darkens the middle by {m}"
+        );
+    }
+    let (old, caret) = paper_comet_lights(0.5, &|glow| glow.comet_light_mid_spine = true);
+    let m = (3..=5)
+        .map(|back| band(&old, caret, back, mid))
+        .min()
+        .unwrap_or(0);
+    assert!(
+        m >= 24,
+        "control: laid about the row's middle, the tail darkens the middle by only {m}"
+    );
+}
+
+/// The light Comet typing 20 keys on GitHub Light at 60 ms a key, then `erase` Backspaces at
+/// 150 ms, the frame after the last: its lights under the letters alone on the page, and the
+/// caret's column.
+fn paper_comet_backspaced(erase: u16, setup: &dyn Fn(&mut CursorGlow)) -> (Glass, u16) {
+    let g = tall_geom();
+    let pair = (0x001F_2328u32, 0x00FF_FFFFu32);
+    let (row, start, keys) = (4u16, 2u16, 20u16);
+    let mut c = cfg(GlowStyle::Comet, true);
+    (c.intensity, c.dark_theme) = (1.0, false);
+    (c.theme_fg, c.theme_bg) = pair;
+    let mut glow = CursorGlow::default();
+    setup(&mut glow);
+    let mut out = Vec::new();
+    let mut text = vec![' '; g.cols];
+    let mut t = Instant::now();
+    let mut col = start;
+    glow.observe_row(row, col, &text, t);
+    glow.tick(Some((row, col)), t, &c, g, &mut out);
+    for _ in 0..keys {
+        t += Duration::from_millis(60);
+        text[usize::from(col)] = 'm';
+        col += 1;
+        glow.note_synthetic_typed(t, 1);
+        glow.observe_row(row, col, &text, t);
+        glow.tick(Some((row, col)), t, &c, g, &mut out);
+    }
+    for _ in 0..erase {
+        t += Duration::from_millis(150);
+        col -= 1;
+        text[usize::from(col)] = ' ';
+        glow.note_backspace(t);
+        glow.observe_row(row, col, &text, t);
+        glow.tick(Some((row, col)), t, &c, g, &mut out);
+    }
+    let mut glass = Glass::new(g, pair.1);
+    glass.add_quads(glow.under_quads());
+    (glass, col)
+}
+
+/// after-land round 2's A3, OVER ERASED CELLS THE PAPER COMET'S TAIL IS ONE TAPERED FILL: L1 lifts
+/// the tail to the letters' foot to clear them, and laid there over the cells a Backspace erased,
+/// where no letter is to clear, the one fill read as a row of droplets and a separate needle with
+/// a gap between (`comet-light-steam.bs06`, y116-122 and y126-128). Six Backspaces on GitHub Light:
+/// over the three cells right of the caret every column of the tail's spine, the row's middle, is
+/// lit by 24 or more, and its fill leaves the row's foot (its last sixth) two and three cells
+/// out under 8. L1's own law holds where there are letters
+/// ([`the_paper_comet_s_tail_runs_at_the_letters_foot`], [`a_word_gap_keeps_the_paper_comet_s_tail_at_the_foot`]).
+/// Negative control: laid at the foot over the erased cells (`comet_foot_on_blanks`), the spine's
+/// middle has a column under 8 between the droplets and the foot is lit by 24 or more.
+#[test]
+fn over_erased_cells_the_paper_comet_s_tail_is_one_fill() {
+    let (g, row) = (tall_geom(), 4i32);
+    let (cw, ch) = (g.cw as i32, g.ch as i32);
+    let read = |setup: &dyn Fn(&mut CursorGlow)| {
+        let (glass, caret) = paper_comet_backspaced(6, setup);
+        let caret = i32::from(caret);
+        let spine = row * ch + ch / 2 + ch * 4 / 100;
+        let thinnest = ((caret + 1) * cw..(caret + 4) * cw)
+            .map(|x| paper_depth(&glass, spine, x))
+            .min()
+            .unwrap_or(0);
+        let foot = ((row * ch + ch * 5 / 6)..(row + 1) * ch)
+            .flat_map(|y| ((caret + 2) * cw..(caret + 4) * cw).map(move |x| (y, x)))
+            .map(|(y, x)| paper_depth(&glass, y, x))
+            .max()
+            .unwrap_or(0);
+        (thinnest, foot)
+    };
+    let (thinnest, foot) = read(&|_| {});
+    assert!(
+        thinnest >= 24,
+        "over the erased cells the tail's spine falls to {thinnest}"
+    );
+    assert!(
+        foot < 8,
+        "over the erased cells the row's foot is lit by {foot}"
+    );
+    let (was_thinnest, was_foot) = read(&|glow| glow.comet_foot_on_blanks = true);
+    assert!(
+        was_thinnest < 8 && was_foot >= 24,
+        "control: lifted to the foot the spine falls to {was_thinnest} and the foot is lit by {was_foot}"
+    );
+}
+
+/// after-land round 2's A3 keeps L1: a blank among letters is no erased run. Typing `mm m`-spaced
+/// words on GitHub Light, the frame after a key that leaves a word gap one cell behind the caret,
+/// the tail still runs at the letters' foot: three to five cells behind the caret the middle band
+/// is lit by under 8. Negative control: laid about the row's middle
+/// (`comet_light_mid_spine`), by 24 or more.
+#[test]
+fn a_word_gap_keeps_the_paper_comet_s_tail_at_the_foot() {
+    let (g, row) = (tall_geom(), 4i32);
+    let (cw, ch) = (g.cw as i32, g.ch as i32);
+    let pair = (0x001F_2328u32, 0x00FF_FFFFu32);
+    let read = |setup: &dyn Fn(&mut CursorGlow)| {
+        let mut c = cfg(GlowStyle::Comet, true);
+        (c.intensity, c.dark_theme) = (1.0, false);
+        (c.theme_fg, c.theme_bg) = pair;
+        let mut glow = CursorGlow::default();
+        setup(&mut glow);
+        let mut out = Vec::new();
+        let mut text = vec![' '; g.cols];
+        let mut t = Instant::now();
+        let mut col = 2u16;
+        glow.observe_row(row as u16, col, &text, t);
+        glow.tick(Some((row as u16, col)), t, &c, g, &mut out);
+        for k in 0..20u16 {
+            t += Duration::from_millis(60);
+            // A word gap every fourth key, the last key's among them.
+            text[usize::from(col)] = if k % 4 == 3 { ' ' } else { 'm' };
+            col += 1;
+            glow.note_synthetic_typed(t, 1);
+            glow.observe_row(row as u16, col, &text, t);
+            glow.tick(Some((row as u16, col)), t, &c, g, &mut out);
+        }
+        let mut glass = Glass::new(g, pair.1);
+        glass.add_quads(glow.under_quads());
+        let caret = i32::from(col);
+        (3..=5)
+            .map(|back| {
+                let x0 = (caret - back) * cw;
+                ((row * ch + ch * 38 / 100)..(row * ch + ch * 62 / 100))
+                    .flat_map(|y| (x0..x0 + cw).map(move |x| (y, x)))
+                    .map(|(y, x)| paper_depth(&glass, y, x))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect::<Vec<i32>>()
+    };
+    let foot = read(&|_| {});
+    assert!(
+        foot.iter().all(|&m| m < 8),
+        "behind a word gap the tail lights the middle by {foot:?}"
+    );
+    let mid = read(&|glow| glow.comet_light_mid_spine = true);
+    assert!(
+        mid.iter().all(|&m| m >= 24),
+        "control: about the row's middle the tail lights it by {mid:?}"
+    );
+}
+
+/// after-land L2, BEHIND A BAR THE PAPER COMET'S HEAD SEATS ON THE BAR: with a bar caret on
+/// paper the comet's coma ring circled the bar like a second outline, the bar through it, and
+/// its cap ran on to the cell's far edge (`shape-bar/comet-light.t0`). Typing on GitHub Light
+/// with a bar (`head_dx` 0.08), no light (8 or more) lies in the caret's row past the bar's far edge, and
+/// the head still lights the cell behind the bar by 24 or more. Negative control: laid as on
+/// a block (`comet_bar_unseated`), light lies past the bar by 24 or more.
+#[test]
+fn behind_a_bar_the_paper_comet_s_head_seats_on_the_bar() {
+    let (g, row) = (tall_geom(), 4i32);
+    let (cw, ch) = (g.cw as i32, g.ch as i32);
+    let head_dx = 0.08f32;
+    let bar_right = |caret: u16| {
+        i32::from(caret) * cw + (2.0 * head_dx * cw as f32).round().clamp(1.0, cw as f32) as i32
+    };
+    // The deepest light past the bar's far edge in the caret's row, out to two cells past it.
+    let past = |glass: &Glass, caret: u16| {
+        let x0 = bar_right(caret);
+        (row * ch..(row + 1) * ch)
+            .flat_map(|y| (x0..x0 + 2 * cw).map(move |x| (y, x)))
+            .map(|(y, x)| paper_depth(glass, y, x))
+            .max()
+            .unwrap_or(0)
+    };
+    let (glass, caret) = paper_comet_lights(head_dx, &|_| {});
+    let ahead = past(&glass, caret);
+    assert!(ahead < 8, "light past the bar: {ahead}");
+    let behind = (row * ch..(row + 1) * ch)
+        .flat_map(|y| ((i32::from(caret) - 1) * cw..i32::from(caret) * cw).map(move |x| (y, x)))
+        .map(|(y, x)| paper_depth(&glass, y, x))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        behind >= 24,
+        "the head lights the cell behind the bar by {behind}"
+    );
+    let (block, caret) = paper_comet_lights(head_dx, &|glow| glow.comet_bar_unseated = true);
+    let unseated = past(&block, caret);
+    assert!(
+        unseated >= 24,
+        "control: laid as on a block, the light past the bar is only {unseated}"
+    );
+}
+
+/// after-land r1's judge, BEHIND A BAR THE PAPER COMET LAYS NO COMA PATCH: seated on a bar
+/// (after-land L2), the paper comet still laid its coma's fill, cut at the bar and at the row's
+/// top, a pale flat-topped patch over the letter behind the bar (`shape-bar/comet-light.t0`,
+/// x365-377 y104-112). Typing on GitHub Light with a bar (`head_dx` 0.08), the upper 45% of
+/// the cell behind the bar, over the letter's body and above the tail at its foot, is
+/// darkened by under 8 everywhere. Negative control: with the coma's fill laid behind the bar
+/// (`comet_bar_coma`), it is darkened by 16 or more.
+#[test]
+fn behind_a_bar_the_paper_comet_lays_no_coma_patch() {
+    let (g, row) = (tall_geom(), 4i32);
+    let (cw, ch) = (g.cw as i32, g.ch as i32);
+    let upper = |glass: &Glass, caret: u16| {
+        (row * ch..row * ch + ch * 45 / 100)
+            .flat_map(|y| ((i32::from(caret) - 1) * cw..i32::from(caret) * cw).map(move |x| (y, x)))
+            .map(|(y, x)| paper_depth(glass, y, x))
+            .max()
+            .unwrap_or(0)
+    };
+    let (glass, caret) = paper_comet_lights(0.08, &|_| {});
+    let patch = upper(&glass, caret);
+    assert!(
+        patch < 8,
+        "the upper cell behind the bar is darkened by {patch}"
+    );
+    let (coma, caret) = paper_comet_lights(0.08, &|glow| glow.comet_bar_coma = true);
+    let was = upper(&coma, caret);
+    assert!(
+        was >= 16,
+        "control: with the coma's fill the upper cell behind the bar is darkened by only {was}"
     );
 }
 
@@ -7837,5 +8294,239 @@ fn sparkles_rail_fades_in_gold_to_its_last_frame_on_a_tinted_page() {
     assert!(
         bare_off >= 40 && bare_frames >= 3,
         "control: at the least opacity only {bare_off} of {bare_lit} px in {bare_frames} frames read off gold"
+    );
+}
+
+/// What a dark Fire line typed at the Cursor card's pace (156 ms a key) burns at a Trail
+/// duration of `ms`: the run of its flame behind the caret, in cells, averaged over the line's
+/// last twelve key frames (the farthest cell behind the caret whose column in the air above
+/// the caret's row stands lit), and the pixels lit three rows or more above that row, where
+/// only its embers reach, summed over frames from the first key to two seconds after the last.
+fn dark_card_line(ms: u64, seam: impl Fn(&mut CursorGlow)) -> (f32, usize) {
+    const KEYS: u16 = 26;
+    let g = Geom {
+        cw: 13,
+        ch: 26,
+        rows: 14,
+        cols: 48,
+        origin_x: 0,
+        origin_y: 0,
+        win_w: 624,
+        win_h: 364,
+        head: 0,
+    };
+    let (row, start) = (11u16, 2u16);
+    let line: Vec<char> = "git add README.md && git commit".chars().collect();
+    let mut c = cfg(GlowStyle::Fire, true);
+    c.intensity = 1.0;
+    c.duration = Duration::from_millis(ms);
+    (c.theme_fg, c.theme_bg) = DARK_PAIR;
+    let mut glow = CursorGlow::default();
+    seam(&mut glow);
+    let bg = DARK_PAIR.1 as i32 & 0xff;
+    let (cw, ch) = (g.cw as i32, g.ch as i32);
+    let row_top = i32::from(row) * ch;
+    let mut text = vec![' '; g.cols];
+    let mut out = Vec::new();
+    let t0 = Instant::now();
+    let (mut runs, mut n_runs, mut ember_px) = (0.0f32, 0, 0usize);
+    let last_ms = 156 * u64::from(KEYS);
+    let mut ms_at = 0;
+    let mut k = 0u16;
+    while ms_at <= last_ms + 2_000 {
+        let t = t0 + Duration::from_millis(ms_at);
+        let keyed = k < KEYS && ms_at >= 156 * u64::from(k + 1);
+        if keyed {
+            text[usize::from(start + k)] = line[usize::from(k) % line.len()];
+            k += 1;
+            glow.note_synthetic_typed(t, 1);
+        }
+        let caret = start + k;
+        glow.observe_row(row, caret, &text, t);
+        let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+        for (col, &chr) in text.iter().enumerate() {
+            rows[usize::from(row)][col].ch = chr;
+        }
+        glow.observe_frame_text(Some((row, caret)), &rows, t);
+        glow.tick(Some((row, caret)), t, &c, g, &mut out);
+        if keyed && k > KEYS - 12 {
+            let mut flame = Glass::new(g, DARK_PAIR.1);
+            flame.add_quads(glow.under_quads());
+            flame.add_fire_patches(glow.patches());
+            let caret_x = i32::from(caret) * cw;
+            let lit = |x: i32| (row_top - ch..row_top).any(|y| flame.level(y, x) > bg + 24);
+            let far = (0..caret_x).find(|&x| lit(x)).unwrap_or(caret_x);
+            runs += (caret_x - far) as f32 / cw as f32;
+            n_runs += 1;
+        }
+        let mut air = Glass::new(g, DARK_PAIR.1);
+        air.add_quads(glow.under_quads());
+        air.add_fire_patches(glow.patches());
+        air.add_quads(&out);
+        air.add_halos(glow.halos());
+        ember_px += (0..row_top - 3 * ch)
+            .flat_map(|y| (0..g.win_w as i32).map(move |x| (y, x)))
+            .filter(|&(y, x)| air.level(y, x) > bg + 24)
+            .count();
+        ms_at += if k < KEYS { 26 } else { 50 };
+    }
+    (runs / n_runs.max(1) as f32, ember_px)
+}
+
+/// A LONG TRAIL BURNS A LONGER FLAME, NOT MORE DUST (after-land F5, the composed final judge:
+/// "Fire's Trail-duration knob on the card shows up as more drifting embers rather than a
+/// longer flame"). A dark line typed at the Cursor card's pace burns its flame about six cells
+/// behind the caret at the default 260 ms and at 60 ms; at 1200 ms the run reaches at least
+/// 1.6 times as far ([`CursorGlow::FIRE_DARK_RUN_STRETCH_MAX`]), and its embers light no more
+/// pixels three rows or more above the typed row than at 260 ms
+/// ([`CursorGlow::fire_ember_life_scale`]). Negative controls, each reverting one half: with
+/// the run unstretched (`fire_run_unstretched`) the 1200 ms run stays within a tenth of the
+/// default's; with the embers' flight scaled by the duration as the composed land did
+/// (`fire_embers_duration_scaled`), they light over a thousand pixels up there.
+#[test]
+fn a_long_trail_burns_a_longer_flame_not_more_dust() {
+    let (short, _) = dark_card_line(60, |_| {});
+    let (default, default_dust) = dark_card_line(260, |_| {});
+    let (long, long_dust) = dark_card_line(1_200, |_| {});
+    assert!(
+        default >= 4.0,
+        "fixture: the default run burns {default} cells behind the caret"
+    );
+    assert!(
+        short <= default,
+        "60 ms burns {short} cells against the default's {default}"
+    );
+    assert!(
+        long >= 1.6 * default,
+        "1200 ms burns {long} cells behind the caret against the default's {default}"
+    );
+    assert!(
+        long_dust <= default_dust,
+        "1200 ms's embers light {long_dust} px three rows up against the default's {default_dust}"
+    );
+    let (unstretched, _) = dark_card_line(1_200, |g| g.fire_run_unstretched = true);
+    assert!(
+        unstretched < 1.1 * default,
+        "control: the unstretched run burns {unstretched} cells at 1200 ms against {default}"
+    );
+    let (_, scaled_dust) = dark_card_line(1_200, |g| g.fire_embers_duration_scaled = true);
+    assert!(
+        scaled_dust > 1_000,
+        "control: embers flying 1200 ms's share light only {scaled_dust} px three rows up"
+    );
+}
+
+/// The air lit over a Tab's landing on a dark line: the Cursor card's scene, its line under
+/// the last command's printed `[main 4f2c9e1] ship it`, `git add R` typed at 156 ms a key and
+/// a Tab that completes `README.md`, an 8-cell leap past the printed line's end. Returns, over
+/// the frames from 26 to 156 ms after the Tab, the most pixels lit in the row above over the
+/// landing's blank air (the cells past the printed line, up to the caret's) and over the
+/// printed line's letters.
+fn tab_landing_air(seam: impl Fn(&mut CursorGlow)) -> (usize, usize) {
+    const TYPED: u16 = 9;
+    const LANDS: u16 = 17;
+    let g = Geom {
+        cw: 13,
+        ch: 26,
+        rows: 14,
+        cols: 48,
+        origin_x: 0,
+        origin_y: 0,
+        win_w: 624,
+        win_h: 364,
+        head: 0,
+    };
+    let (row, start) = (11u16, 9u16);
+    let line: Vec<char> = "git add README.md && git commit".chars().collect();
+    let printed: Vec<char> = "[main 4f2c9e1] ship it".chars().collect();
+    let mut c = cfg(GlowStyle::Fire, true);
+    c.intensity = 1.0;
+    (c.theme_fg, c.theme_bg) = DARK_PAIR;
+    let mut glow = CursorGlow::default();
+    seam(&mut glow);
+    let bg = DARK_PAIR.1 as i32 & 0xff;
+    let (cw, ch) = (g.cw as i32, g.ch as i32);
+    let row_top = i32::from(row) * ch;
+    let mut text = vec![' '; g.cols];
+    let mut above = vec![' '; g.cols];
+    above[..printed.len()].copy_from_slice(&printed);
+    let mut out = Vec::new();
+    let t0 = Instant::now();
+    let tab_ms = 156 * u64::from(TYPED + 1);
+    let (mut blank_air, mut over_letters) = (0usize, 0usize);
+    let mut ms_at = 0;
+    let mut k = 0u16;
+    while ms_at <= tab_ms + 156 {
+        let t = t0 + Duration::from_millis(ms_at);
+        if k < TYPED && ms_at >= 156 * u64::from(k + 1) {
+            text[usize::from(start + k)] = line[usize::from(k)];
+            k += 1;
+            glow.note_synthetic_typed(t, 1);
+        } else if k == TYPED && ms_at >= tab_ms {
+            for cell in TYPED..LANDS {
+                text[usize::from(start + cell)] = line[usize::from(cell)];
+            }
+            k = LANDS;
+            glow.note_user_gesture(t);
+        }
+        let caret = start + k;
+        glow.observe_row(row, caret, &text, t);
+        let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+        for (col, (&chr, &over)) in text.iter().zip(&above).enumerate() {
+            rows[usize::from(row)][col].ch = chr;
+            rows[usize::from(row) - 1][col].ch = over;
+        }
+        glow.observe_frame_text(Some((row, caret)), &rows, t);
+        glow.tick(Some((row, caret)), t, &c, g, &mut out);
+        if ms_at >= tab_ms + 26 {
+            let mut air = Glass::new(g, DARK_PAIR.1);
+            air.add_quads(glow.under_quads());
+            air.add_fire_patches(glow.patches());
+            air.add_quads(&out);
+            air.add_halos(glow.halos());
+            let lit = |x0: i32, x1: i32| {
+                (row_top - ch..row_top)
+                    .flat_map(|y| (x0..x1).map(move |x| (y, x)))
+                    .filter(|&(y, x)| air.level(y, x) > bg + 24)
+                    .count()
+            };
+            let printed_end = printed.len() as i32 * cw;
+            blank_air = blank_air.max(lit(printed_end, i32::from(caret + 1) * cw));
+            over_letters = over_letters.max(lit(i32::from(start + TYPED) * cw, printed_end));
+        }
+        ms_at += 26;
+    }
+    (blank_air, over_letters)
+}
+
+/// A TAB'S LANDING BURNS WHERE ITS AIR IS BLANK (after-land L3: "The Settings card at
+/// motion-0900 shows only the ember caret"). The card's frame 86 ms after its Tab showed
+/// Fire's ember alone: the Tab's 8-cell completion flies Fire's meteor, whose streak lies over
+/// the letters it completed, where the letter guard holds it to a few levels, and a meteor laid
+/// no flame. Now the leap also lays the run a shorter hop lays
+/// ([`CursorGlow::fire_meteor_lays_its_landing`]), which flames only where the air above is
+/// blank: over the landing's cells past the printed line, the row above lights at least 150
+/// pixels, and over the printed line's letters it lights no more than the meteor alone does.
+/// Negative control: the meteor alone (`fire_meteor_lands_dark`) lights under 40 pixels of
+/// that blank air.
+#[test]
+fn a_tab_s_landing_burns_where_its_air_is_blank() {
+    let (air, over) = tab_landing_air(|_| {});
+    let (dark_air, dark_over) = tab_landing_air(|g| g.fire_meteor_lands_dark = true);
+    eprintln!(
+        "over the landing's blank air {air} px (meteor alone {dark_air}); over the printed \
+         letters {over} px (meteor alone {dark_over})"
+    );
+    assert!(
+        air >= 150,
+        "the Tab's landing lights {air} px of the blank air above it"
+    );
+    assert!(
+        over <= dark_over,
+        "the landing lights {over} px over the printed line's letters, the meteor alone {dark_over}"
+    );
+    assert!(
+        dark_air < 40,
+        "control: the meteor alone lights {dark_air} px of the landing's blank air"
     );
 }

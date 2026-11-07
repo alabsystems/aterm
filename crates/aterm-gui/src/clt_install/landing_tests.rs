@@ -1841,27 +1841,6 @@ fn a_stop_leaves_the_shim_and_ends_its_word_of_an_install() {
     assert!(!installing_said(&shim), "nothing installs them");
 }
 
-/// The tools arrive by any route: the watch's next second takes the shim off new shells, though a
-/// want stands and no pass or tab said a word.
-/// NEGATIVE CONTROL: a second with them still missing leaves it.
-#[test]
-fn tools_that_arrived_by_any_route_take_the_shim_off_new_shells() {
-    let dir = aterm_tempfile::tempdir().expect("a state directory");
-    let (mut app, _) = page();
-    let shim = shim_in(&mut app, dir.path());
-    app.want_developer_tools_install(4, true);
-    app.developer_tools_watch(Some(idle()));
-    assert!(wanted(&shim));
-    TOOLS_PRESENT.with(|present| present.set(true));
-    app.developer_tools_watch(None);
-    assert_eq!(app.workstation_setup.developer_tools_want, Some(4));
-    assert!(!wanted(&shim) && !installing_said(&shim));
-    assert!(
-        shim.is_dir(),
-        "the directory stays for the shells that have it"
-    );
-}
-
 /// Tools that arrive by any route while the automatic tab waits (on Apple's own window raised
 /// from another terminal, a person's own `xcode-select --install` or `aterm init`) end the
 /// automatic opening. A watch second that read them missing just before they arrived, with no
@@ -2260,9 +2239,9 @@ fn an_install_under_way_elsewhere_says_the_tools_are_on_their_way() {
 /// word, the automatic tab's due check) read what its second read on its own thread, and probe
 /// this Mac's processes not at all on the loop; a second whose reading moves the shim's word
 /// settles it, and one that moves nothing writes nothing. A landing's check still reads live.
-/// NEGATIVE CONTROL: where no watch runs (no reading yet), the same looks probe live; once the
-/// tools arrived, the page's step still probes live, and the due check is no longer reached
-/// because nothing is wanted.
+/// NEGATIVE CONTROL: once the tools arrive, the page's step still probes live without a watch
+/// reading. The shim removes its marks without reading installers, including at later want and
+/// root-step changes; with no owned shim, the watch keeps its logical word.
 #[test]
 fn the_watchs_reading_spares_the_loop_its_process_scan() {
     let dir = aterm_tempfile::tempdir().expect("a state directory");
@@ -2313,8 +2292,30 @@ fn the_watchs_reading_spares_the_loop_its_process_scan() {
     TOOLS_PRESENT.with(|present| present.set(true));
     app.developer_tools_watch(None);
     assert_eq!(probes(), 1);
+    assert_eq!(app.workstation_setup.developer_tools_want, Some(4));
+    assert!(!wanted(&shim) && !installing_said(&shim));
+    assert!(shim.is_dir(), "the directory stays for shells that have it");
     assert_eq!(step(&mut app), Some(ToolsInstall::Installing));
     assert_eq!(probes(), 2, "no watch reading: a live probe");
+
+    app.withdraw_developer_tools_want();
+    app.developer_tools_first_look();
+    app.root_steps_owed(false);
+    assert_eq!(probes(), 2, "a settled shim needs no installer reading");
+    assert_eq!(
+        app.workstation_setup.developer_tools_shim_said.get(),
+        Some(false),
+        "no installing mark remains once the tools exist"
+    );
+
+    app.workstation_setup.developer_tools_shim = crate::clt_shim::Shim::default();
+    app.developer_tools_watch(Some(installing()));
+    assert_eq!(
+        app.workstation_setup.developer_tools_shim_said.get(),
+        Some(true),
+        "without an owned shim the watch keeps its logical word"
+    );
+    assert_eq!(probes(), 2, "the watch's own reading needs no probe");
 }
 
 /// Low Data Mode holds the download back: the tab's program says so and exits with its own code,

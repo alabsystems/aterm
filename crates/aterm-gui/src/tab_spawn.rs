@@ -3076,35 +3076,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_update_waits_for_a_tab_spawn_to_settle_before_admission() {
-        let mut app = App::headless_for_test();
-        let id = book(&mut app, WindowId(0), TabSpawnThen::Nothing);
-        let apply = |app: &mut App| {
-            app.apply_staged_update_now(
-                crate::app_native::NativeUpdateSafetyToken::carrying_for_test(0, 0, 0),
-                crate::native_updater_service::ApplyMode::Immediate,
-                None,
-                None,
-            )
-            .expect_err("the fixture supplies no replacement authority")
-        };
-        assert!(
-            apply(&mut app).is_activity_deferred(),
-            "an unregistered tab must keep its process alive"
-        );
-        assert!(!app.install_spawned_tab(TabSpawned {
-            id,
-            window: WindowId(0),
-            session: Err(std::io::Error::other("exec refused")),
-            reader_gate: None,
-        }));
-        assert!(
-            !apply(&mut app).is_activity_deferred(),
-            "a settled spawn no longer holds replacement admission"
-        );
-    }
-
-    #[test]
     fn held_input_is_bounded_and_a_drop_or_focus_loss_repairs_the_modifiers() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);

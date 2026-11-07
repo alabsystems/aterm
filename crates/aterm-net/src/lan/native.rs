@@ -57,6 +57,20 @@ pub(super) fn index(name: &str) -> io::Result<u32> {
     }
 }
 
+/// The kernel's interface generation ([`darwin::interface_generation`]): it moves whenever an
+/// interface or address may have changed. `None` where this OS gives none, so every read of the
+/// attachments asks the OS again.
+pub(super) fn interface_generation() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        darwin::interface_generation()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 pub(super) fn physical(name: &str) -> io::Result<bool> {
     #[cfg(target_os = "macos")]
     {
@@ -368,7 +382,7 @@ impl Socket {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            let millis = left.as_millis().min(i32::MAX as u128).max(1) as i32;
+            let millis = aterm_uds::deadline::poll_timeout_ms(left);
             // SAFETY: descriptor is the sole writable pollfd for the count 1.
             let result = unsafe { libc::poll(&raw mut descriptor, 1, millis) };
             if result < 0 {

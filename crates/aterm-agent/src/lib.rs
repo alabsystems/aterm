@@ -17,6 +17,9 @@
 aterm_durable::plain_durable_flushes_in_tests!();
 
 #[cfg(test)]
+mod test_config;
+
+#[cfg(test)]
 mod test_program;
 
 /// A test's POSIX absolute path literal as this host reads it absolute, as a `&'static str`
@@ -53,14 +56,18 @@ pub mod fleet_cli;
 /// Fleet admission as this Mac's membership log says it (F17).
 #[cfg(unix)]
 pub mod fleet_log;
-/// `aterm fleet init|join|peers|allow|publish|sync|census|leave`: this machine's membership in a
-/// fleet.
+/// `aterm fleet init|join|peers|allow|publish|sync|census|name|leave`: this machine's membership
+/// in a fleet; and `aterm fleet --help`.
 #[cfg(unix)]
 mod fleet_member;
 /// The vault this Mac's fleet state was taken under, which alone lets its drive grants admit
 /// (F17, ATERM-KI-1105-10).
 #[cfg(unix)]
 pub mod fleet_vault;
+/// `aterm fleet [--json]`: the lab's status line and one row per seat, from what this Mac holds
+/// (one-mesh §4.12, B9).
+#[cfg(unix)]
+pub mod fleet_view;
 #[cfg(unix)]
 mod lan_members;
 /// This machine's name: `machine-name.toml` (`docs/DESIGN-machine-names-2026-11-04.md` §3.3).
@@ -92,8 +99,8 @@ pub mod vault_join;
 #[cfg(unix)]
 pub use fleet_member::{
     FleetCheck, FleetName, FleetSync, FleetSyncError, check_from_cache, drive_fleet,
-    drive_fleet_proven, fleet_name_for, fleet_node, follow_fleet_name, known_peer_count,
-    survey_fleet, sync_from_cache, try_sync_from_cache,
+    drive_fleet_proven, fleet_name_for, fleet_node, follow_fleet_name, survey_fleet,
+    sync_from_cache, try_sync_from_cache,
 };
 /// The harness core.
 pub mod harness;
@@ -997,9 +1004,11 @@ COMMANDS
                            presses Enter, fenced on the question row.
                        A label matches whole, in any case. Each also takes `recommended`
                        (the window's own choice) and `human` (types nothing). Refused: a
-                       free-text row (Muse's `None of the above` too) and a policy word
+                       free-text row (Muse's `None of the above` too), a policy word
                        that names no option (`long-term`, `short-term`;
-                       `meta set questions <word>` sets one). `--box TOKEN` (`phase`'s
+                       `meta set questions <word>` sets one), and Grok Build's and Kimi
+                       Code's questions, which are read, not supervised, and stay a
+                       person's. `--box TOKEN` (`phase`'s
                        `box`) refuses when the dialog on screen is another box. A
                        person's input within `[harness] human_grace_s` leaves the dialog
                        to them. Prints one line:

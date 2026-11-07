@@ -982,6 +982,7 @@ mod platform {
 
     /// `posix_spawn`, with `POSIX_SPAWN_CLOEXEC_DEFAULT` unless `place.inherit_all`.
     pub(super) fn spawn(image: &Image, place: &Placement<'_>) -> io::Result<i32> {
+        super::note_spawn();
         let argv = Image::pointers(&image.argv);
         let envp = Image::pointers(&image.envp);
         let disclaim = place.disclaim.map(disclaimer).transpose()?;
@@ -1415,6 +1416,7 @@ mod platform {
 
     /// Fork, strip, place, exec, the child calling only async-signal-safe functions on memory prepared here.
     pub(super) fn spawn(image: &Image, place: &Placement<'_>) -> io::Result<i32> {
+        super::note_spawn();
         super::past_text_busy(
             super::TEXT_BUSY_FOR,
             || spawn_once(image, place),
@@ -1913,6 +1915,36 @@ thread_local! {
 #[cfg(all(any(test, debug_assertions), not(target_vendor = "apple")))]
 pub fn on_next_text_busy_pause(hook: impl FnOnce() + 'static) {
     TEXT_BUSY_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The children this thread started while [`spawns_during`] counts them; `None` while it
+    /// does not.
+    static SPAWNS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Count one child this thread starts, where [`spawns_during`] counts: each `platform::spawn`
+/// (this module's, Darwin's commands' and the pass-throughs'), each start of a command off
+/// Darwin (its fork through std), and [`crate::pspawn::spawn_cloexec_default`].
+#[inline]
+pub(crate) fn note_spawn() {
+    #[cfg(any(test, debug_assertions))]
+    SPAWNS.with(|count| count.set(count.get().map(|n| n.saturating_add(1))));
+}
+
+/// Test seam: `body`'s result, and how many children this thread started while it ran, a spawn
+/// that failed included ([`note_spawn`]). Counted on the calling thread alone, so the children
+/// other tests start in parallel never count; a count nested in another adds to it.
+#[cfg(any(test, debug_assertions))]
+pub fn spawns_during<R>(body: impl FnOnce() -> R) -> (R, usize) {
+    let outer = SPAWNS.with(|count| count.replace(Some(0)));
+    let result = body();
+    let spawned = SPAWNS.with(|count| count.replace(outer)).unwrap_or(0);
+    if let Some(outer) = outer {
+        SPAWNS.with(|count| count.set(Some(outer.saturating_add(spawned))));
+    }
+    (result, spawned)
 }
 
 #[path = "spawnfd_command.rs"]

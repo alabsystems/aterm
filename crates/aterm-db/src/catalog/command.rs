@@ -629,7 +629,7 @@ fn readiness(paths: &Paths, config: &Path, deadline: std::time::Instant) -> Resu
         let recipient = request.binding().recipient();
         let log_roster = aterm_secrets::client::local_swarm_roster_for_log(bootstrap.paths(), &log)
             .map_err(crate::table::failure)?;
-        let membership = log.membership();
+        let membership = log.membership_ref();
         let member = membership.get(&actor);
         // The one removal predicate first; the seat scan below asks more of the seats that share
         // the actor or recipient (a removed writer key, a roster denial) than its kin verdict does.

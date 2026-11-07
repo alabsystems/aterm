@@ -235,10 +235,7 @@ impl Grid {
         } else {
             (hi_abs, lo_abs)
         };
-        self.storage.selection_damage = self
-            .storage
-            .selection_damage
-            .union(crate::SelectionDamage::Band { lo_abs, hi_abs });
+        self.storage.selection_damage.union_band(lo_abs, hi_abs);
     }
 
     /// The absolute row the cursor is on.

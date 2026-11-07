@@ -8,7 +8,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "aterm's network place: one per-Mac answer to where this Mac is on the network (the ALab LAN, a remote network, offline), whether the internet answers and how that is known, and how much of the ALab LAN it reaches; its evidence file, its keeper, and the one wording every reporter prints."
+description = "aterm's network place: one per-Mac answer to where this Mac is on the network (the ALab LAN, a remote network, offline), whether the internet answers and how that is known; its evidence file, its keeper, and the one wording every reporter prints."
 
 [lints]
 workspace = true
@@ -39,3 +39,23 @@ aterm-objc = { workspace = true }
 
 [dev-dependencies]
 aterm-tempfile = { workspace = true }
+aterm-heap-count = { path = "../aterm-heap-count" }
+
+[[example]]
+name = "route_events"
+test = true
+
+# Manual allocation measurement of the public pacing path, with scripted facts.
+[[bench]]
+name = "pacing_cache_cost"
+harness = false
+
+# Manual allocation measurement of the uncached public reader over private histories.
+[[bench]]
+name = "reader_cost"
+harness = false
+
+# Manual public admission-reader work measurement with a bounded evidence ledger.
+[[bench]]
+name = "proof_reader_cost"
+harness = false

@@ -404,7 +404,8 @@ pub fn developer_tool_in(
 
 /// [`developer_tool_in`] on this Mac: the developer tools' own `<tool>`, read with a stat and a
 /// readlink (no child process, so nothing can raise Apple's install dialog). `None` where no
-/// developer directory carries it, and off macOS.
+/// developer directory carries a nonempty executable file for it, and off macOS. Compiler
+/// links are followed, as Apple's toolchains use them.
 #[must_use]
 pub fn developer_tool(tool: &str) -> Option<std::path::PathBuf> {
     if !cfg!(target_os = "macos") {
@@ -415,8 +416,26 @@ pub fn developer_tool(tool: &str) -> Option<std::path::PathBuf> {
     developer_tool_in(
         tool,
         &developer_dirs(developer_dir.as_deref(), selected.as_deref()),
-        |path| std::fs::metadata(path).is_ok_and(|meta| meta.is_file()),
+        developer_executable,
     )
+}
+
+fn developer_executable(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Whether `/usr/bin/<tool>` runs a tool once the developer tools are present: one of
@@ -450,6 +469,35 @@ pub fn without_shim(path: &std::ffi::OsStr, shim: &std::path::Path) -> std::ffi:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_developer_tools_do_not_hide_a_later_executable_and_links_still_work() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let root = aterm_tempfile::tempdir().unwrap();
+        let partial = root.path().join("partial");
+        let complete = root.path().join("complete");
+        let empty = partial.join("usr/bin/git");
+        let not_executable = partial.join(DEFAULT_TOOLCHAIN_BIN).join("git");
+        let good = complete.join("usr/bin/git");
+        for (path, bytes, mode) in [
+            (&empty, "", 0o755),
+            (&not_executable, "not executable", 0o644),
+            (&good, "executable fixture", 0o755),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let dirs = [partial, complete];
+        let find = || developer_tool_in("git", &dirs, developer_executable);
+        assert_eq!(find(), Some(good.clone()));
+        std::fs::write(&empty, "repaired executable fixture").unwrap();
+        assert_eq!(find(), Some(empty.clone()));
+        std::fs::remove_file(&empty).unwrap();
+        symlink(&good, &empty).unwrap();
+        assert_eq!(find(), Some(empty));
+    }
 
     #[test]
     fn the_brief_s_named_tools_are_in_the_set() {

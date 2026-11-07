@@ -906,6 +906,7 @@ fn every_chip_title_says_its_modes_sentence_from_mode_words() {
         check: false,
         said: "Nothing left: pushed.".into(),
         at_ms: 0,
+        statement: aterm_agent::harness::land_receipt::Statement::Unread,
     };
     let landed_title =
         |words: String| format!("autopilot: land, landed 14:05 \u{2014} {words} \u{b7} click: off");

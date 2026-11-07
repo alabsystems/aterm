@@ -338,16 +338,23 @@ impl Agent {
         let table = vec![(shell, 1, "zsh".into())];
         let args = atpkg::caller_shell::process_args(self.sf.pid).expect("agent argv");
         let files = session_files(&opts.home);
+        let script = Script::new(shell, foreground, None);
         visit_with_claim(
             opts,
             &self.sf,
             files.as_deref(),
             &table,
             &newer(),
-            &Script::new(shell, foreground, None),
+            &self.parked(&script),
             Some(&args),
             None,
         )
+    }
+
+    /// `script` over the agent's own facts: the start it registered, which it keeps until its
+    /// drop reaps it, and no work under it.
+    fn parked<'a>(&self, script: &'a Script) -> ParkedProcess<'a> {
+        ParkedProcess::new(script, self.sf.pid, Some(&self.sf.proc_start))
     }
 }
 
@@ -1400,7 +1407,7 @@ fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
             "gave-up".to_string()
         }
         Step::Terminate => {
-            let back = st.signalled(AGENT_PID, 1, TAB, "claude --resume x".to_string(), now);
+            let back = st.signalled(AGENT_PID, "", 1, TAB, "claude --resume x".to_string(), now);
             if holds == Holds::Refused {
                 st.signal_failed(back, now);
                 actions.push("Abandon");
@@ -1777,7 +1784,7 @@ fn a_stop_is_stamped_and_a_rearm_is_a_new_round() {
     assert_eq!(stopped.failed_at, 3_000);
     let mut refused = St::default();
     refused.announced(marker(1), 10, 1);
-    let back = refused.signalled(AGENT_PID, 1, TAB, "claude --resume x".to_string(), 20);
+    let back = refused.signalled(AGENT_PID, "", 1, TAB, "claude --resume x".to_string(), 20);
     refused.signal_failed(back, 30);
     assert_eq!(
         (refused.phase.clone(), refused.failed_at),

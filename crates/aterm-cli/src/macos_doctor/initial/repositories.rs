@@ -157,6 +157,7 @@ fn local_items(
                 sys,
                 ctx,
                 mode,
+                aterm_secrets::converge::RepositoryWork::Refresh,
                 inputs,
                 move || current(),
             )
@@ -212,6 +213,7 @@ fn items_current(
         sys,
         ctx,
         mode,
+        aterm_secrets::converge::RepositoryWork::Refresh,
         captured.inputs,
         move || {
             if let Some(current) = &current
@@ -221,7 +223,7 @@ fn items_current(
             }
             captured
                 .snapshot
-                .is_current(&paths)
+                .is_current_now(&paths)
                 .map_err(|error| error.to_string())
         },
     )

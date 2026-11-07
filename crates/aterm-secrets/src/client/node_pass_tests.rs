@@ -537,7 +537,12 @@ fn converge_program(root: &Path, name: &str, body: &str) -> PathBuf {
 }
 
 fn ended_runner(exe: &Path) -> aterm_uds::spawnfd::Child {
-    let mut child = crate::converge::start(exe, crate::converge::SUBSCRIBER).unwrap();
+    let mut child = crate::converge::start(
+        exe,
+        crate::converge::SUBSCRIBER,
+        crate::converge::RepositoryWork::Repair,
+    )
+    .unwrap();
     child.wait().unwrap();
     child
 }
@@ -623,7 +628,12 @@ fn node_convergence_coalesces_new_versions_while_a_runner_still_runs() {
     let start = || {
         calls.set(calls.get() + 1);
         Some(if calls.get() == 1 {
-            crate::converge::start(&running, crate::converge::SUBSCRIBER).unwrap()
+            crate::converge::start(
+                &running,
+                crate::converge::SUBSCRIBER,
+                crate::converge::RepositoryWork::Repair,
+            )
+            .unwrap()
         } else {
             ended_runner(&success)
         })

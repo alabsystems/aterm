@@ -293,6 +293,161 @@ fn remove_by_label_refuses_a_label_naming_two_macs() {
     macs.server.stop();
 }
 
+/// B12: a person's removal of the seat B2's resolver named (`remove_seat`) takes out that one
+/// Mac where the word names two: m7 lets in two Macs labelled m40, the word `m40` is refused, the
+/// seat of one is removed and the other stays in, a second removal of it is refused as removed
+/// already and signs nothing, and m7's own seat is refused.
+///
+/// NEGATIVE CONTROL: in `named_target`, drop the `Target::Seat(_) if membership.removal(..)` arm:
+/// the repeat is refused as no member, and the "removed already" assert fails.
+#[test]
+fn a_person_removes_the_seat_the_resolver_named_where_the_word_names_two_macs() {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
+    let m7 = &macs.m7;
+    let (_a, actor_a, _) = let_in(&macs, "m40-a", "m40");
+    let (_b, actor_b, _) = let_in(&macs, "m40-b", "m40");
+    assert_ne!(actor_a, actor_b, "CONTROL: two Macs");
+    let error = remove_member(m7, "m40", false).expect_err("m40 names two Macs");
+    assert!(error.to_string().contains("names 2 Macs"), "{error}");
+
+    let removal = remove_seat(m7, actor_a, false).expect("m7 removes the seat it was given");
+    assert!(removal.signed > 0, "{removal:?}");
+    assert!(removal.label.starts_with("m40"), "{}", removal.label);
+    let membership = log_of(m7).membership();
+    assert!(membership.removal(&actor_a).is_some());
+    assert!(membership.contains(&actor_b), "the other m40 stays in");
+
+    let held = load_records(m7).expect("records").inventory();
+    let error = remove_seat(m7, actor_a, false).expect_err("removed already");
+    assert_eq!(
+        error.to_string(),
+        format!("{} is removed already", removal.label)
+    );
+    let (_, own, _) = member_key(m7);
+    let error = remove_seat(m7, own, false).expect_err("m7 does not remove itself");
+    assert!(error.to_string().contains("itself"), "{error}");
+    assert_eq!(
+        load_records(m7).expect("records").inventory(),
+        held,
+        "a refused seat signs nothing"
+    );
+    macs.server.stop();
+}
+
+/// B12: a person's removal cuts tables only for a seat it removes. The recording hook sees m40's
+/// cut once, before its `Remove`, while m40 is still seated; it sees nothing for the repeat
+/// (removed already) or for m7's own seat, both refused.
+///
+/// NEGATIVE CONTROL: in `cut_tables_first`, make the first arm
+/// `Target::Actor(actor) | Target::Seat(actor) => actor`: the repeat's Share cut and m7's own
+/// cut are recorded, and the assert fails.
+#[test]
+fn a_refused_seat_signs_no_table_cutoff() {
+    on_table_cuts(record_table_cuts);
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
+    let m7 = &macs.m7;
+    let (_a, actor_a, _) = let_in(&macs, "m40", "m40");
+    let (_, own, _) = member_key(m7);
+    let calls = || -> Vec<(MemberId, CutPass, bool)> {
+        TABLE_CUT_CALLS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(dir, ..)| *dir == m7.dir)
+            .map(|(_, member, pass, seated)| (*member, *pass, *seated))
+            .collect()
+    };
+    assert!(calls().is_empty(), "CONTROL: nothing cut on m7 yet");
+    remove_seat(m7, actor_a, false).expect("m7 removes m40's seat");
+    remove_seat(m7, actor_a, false).expect_err("removed already");
+    remove_seat(m7, own, false).expect_err("m7 does not remove itself");
+    assert_eq!(
+        calls(),
+        vec![(actor_a, CutPass::BeforeRemove, true)],
+        "only the removed seat is cut, once, before its Remove"
+    );
+    macs.server.stop();
+}
+
+/// B12: a seat's removal is a person's, so it takes out the Mac, every seat of its age recipient,
+/// as the word's does: a Mac seated twice (a second device key under the same secrets identity,
+/// let in on two sides of a split, since a desk refuses a key another seat binds) leaves the log
+/// whole when a person removes one seat.
+///
+/// NEGATIVE CONTROL: in `draft_removal`, make `by_person` `matches!(target, Target::Word(_))`:
+/// the twin's seat stays in, and the "every seat of the recipient" assert fails.
+#[test]
+fn a_seats_removal_takes_every_seat_of_its_recipient() {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    let (a, actor_a, rec_a) = let_in_by(&macs, m7, "m40-a", "m40");
+    let twin = Paths::for_home(&macs.root.path().join("m40-twin"));
+    fsx::ensure_private_dir(&twin.dir).expect("twin dir");
+    let key = fsx::read_private(&a.identity_file(), 16 << 10)
+        .expect("read")
+        .expect("m40's key");
+    fsx::write_atomic(&twin.identity_file(), key.as_slice(), 0o600).expect("twin key");
+    let (_, actor_twin, rec_twin) = let_in_by(&macs, m22, "m40-twin", "m41");
+    save_records(m7, &load_records(m22).expect("m22's records").encode()).expect("the heal");
+    assert_eq!(rec_a, rec_twin, "CONTROL: one secrets identity");
+    assert_ne!(actor_a, actor_twin, "CONTROL: two seats");
+    let membership = log_of(m7).membership();
+    assert!(membership.contains(&actor_a) && membership.contains(&actor_twin));
+
+    remove_seat(m7, actor_a, false).expect("m7 removes m40's seat");
+    let membership = log_of(m7).membership();
+    assert!(
+        membership.removal(&actor_a).is_some() && membership.removal(&actor_twin).is_some(),
+        "every seat of the recipient is removed"
+    );
+    macs.server.stop();
+}
+
+/// B12: a person's removal on a Mac seated twice refuses the Mac's other seat as itself: the
+/// removal takes out every seat of the age recipient and revokes it, so m40's removal of its twin
+/// (by seat or by the twin's label) would take m40 out too. Both are refused and sign nothing.
+///
+/// NEGATIVE CONTROL: in `named_target`, make the recipient check `false && …`: the seat's
+/// removal signs, and the `expect_err` fails.
+#[test]
+fn a_person_does_not_remove_this_macs_twin_seat() {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    let (a, actor_a, rec_a) = let_in_by(&macs, m7, "m40-a", "m40");
+    let twin = Paths::for_home(&macs.root.path().join("m40-twin"));
+    fsx::ensure_private_dir(&twin.dir).expect("twin dir");
+    let key = fsx::read_private(&a.identity_file(), 16 << 10)
+        .expect("read")
+        .expect("m40's key");
+    fsx::write_atomic(&twin.identity_file(), key.as_slice(), 0o600).expect("twin key");
+    let (_, actor_twin, rec_twin) = let_in_by(&macs, m22, "m40-twin", "m41");
+    save_records(m7, &load_records(m22).expect("m22's records").encode()).expect("the heal");
+    save_records(&a, &load_records(m7).expect("m7's records").encode()).expect("m40 heals");
+    assert_eq!(rec_a, rec_twin, "CONTROL: one secrets identity");
+    let membership = log_of(&a).membership();
+    assert!(
+        membership.contains(&actor_a) && membership.contains(&actor_twin),
+        "CONTROL: m40's log seats both"
+    );
+    let twin_label = membership
+        .get(&actor_twin)
+        .expect("twin seat")
+        .label
+        .clone();
+
+    let held = load_records(&a).expect("records").inventory();
+    let error = remove_seat(&a, actor_twin, false).expect_err("m40 does not remove its twin");
+    assert!(error.to_string().contains("itself"), "{error}");
+    let error = remove_member(&a, &twin_label, false).expect_err("nor by the twin's label");
+    assert!(error.to_string().contains("itself"), "{error}");
+    assert_eq!(
+        load_records(&a).expect("records").inventory(),
+        held,
+        "a refused twin signs nothing"
+    );
+    macs.server.stop();
+}
+
 /// F16: on two sides of a split, m22 removes m40 and m7 removes m41; each mints its own next
 /// `[everyone]` and Commons epoch. After the heal the vault pass's epoch tender on one Mac (the
 /// first ranked of the two removers) mints one higher epoch of each covering both removals, the
@@ -1338,6 +1493,27 @@ fn an_envelope_admin_is_revoked_with_the_admin_key_and_a_log_removal_says_the_ke
     );
 
     let removal = remove_member(m22, "m7", false).expect("m22 removes m7 through the log");
+    assert!(
+        removal
+            .envelope_notes
+            .iter()
+            .any(|note| note.starts_with("m7 was an admin") && note.contains("signing key")),
+        "{:?}",
+        removal.envelope_notes
+    );
+    macs.server.stop();
+}
+
+/// B12: a person's removal of the seat B2's resolver named says, as the word's does, that the
+/// envelope admin it removed keeps the envelope's signing key, finding that admin by the seat's
+/// age recipient (a node id names no envelope machine).
+///
+/// NEGATIVE CONTROL: make `vault_admin_holding` return `None`: the note assert fails.
+#[test]
+fn a_seats_removal_of_an_envelope_admin_says_the_key_stays() {
+    let macs = two_macs_with(&[(Audience::Everyone, "shared", b"v1".as_slice())], true);
+    let (_, m7, _) = member_key(&macs.m7);
+    let removal = remove_seat(&macs.m22, m7, false).expect("m22 removes m7's seat");
     assert!(
         removal
             .envelope_notes

@@ -54,11 +54,40 @@ impl DamageTracker {
         }
     }
 
-    /// Mark a range of rows as damaged.
+    /// Mark a range of rows as damaged: what [`Self::mark_row`] on each row of `start..end` does,
+    /// one mark-clock tick per row, past-the-end rows included, with the bounds and bits written a
+    /// slice and a word at a time.
     #[inline]
     pub(crate) fn mark_rows(&mut self, start: u16, end: u16) {
-        for row in start..end {
-            self.mark_row(row);
+        #[cfg(test)]
+        if crate::test_counters::reference_paths() {
+            for row in start..end {
+                self.mark_row(row);
+            }
+            return;
+        }
+        self.mark_seq = self
+            .mark_seq
+            .wrapping_add(u64::from(end.saturating_sub(start)));
+        let lo = usize::from(start).min(self.row_bounds.len());
+        let hi = usize::from(end).min(self.row_bounds.len());
+        if lo >= hi {
+            return;
+        }
+        self.row_bounds[lo..hi].fill(RowDamageBounds {
+            left: 0,
+            right: u16::MAX,
+            damaged: true,
+        });
+        let mut row = lo;
+        while row < hi {
+            let bit = row % 64;
+            let take = (64 - bit).min(hi - row);
+            let mask = u64::MAX >> (64 - take) << bit;
+            if let Some(word) = self.row_bits.get_mut(row / 64) {
+                *word |= mask;
+            }
+            row += take;
         }
     }
 

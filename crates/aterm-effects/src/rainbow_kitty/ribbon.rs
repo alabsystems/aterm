@@ -2816,6 +2816,10 @@ struct GlassEnv {
     opacity: f32,
     height: f32,
     reduced: bool,
+    /// The cell lies on a row the hand has left, sunk to [`WRAP_SINK_CH`] ([`GlassWrap`]): its
+    /// exits fade its opacity at the sunk height, so the row retires as a streak along its foot,
+    /// as the dark ribbon's does, rather than shrinking to a hairline.
+    left: bool,
     reach: f32,
 }
 
@@ -2826,8 +2830,37 @@ impl GlassEnv {
             opacity: 1.0,
             height: 1.0,
             reduced,
+            left: false,
             reach,
         }
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static LEFT_ROWS_SHRINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A test's negative control: `f` run with a row the hand has left melting by height, as Prism
+/// Glass 1.12 did ([`GlassEnv::left`]). Debug and test builds only.
+#[cfg(any(test, debug_assertions))]
+pub fn with_left_rows_shrinking<R>(f: impl FnOnce() -> R) -> R {
+    LEFT_ROWS_SHRINK.with(|c| c.set(true));
+    let out = f();
+    LEFT_ROWS_SHRINK.with(|c| c.set(false));
+    out
+}
+
+/// Whether a row the hand has left retires by its glass's opacity ([`GlassEnv::left`]).
+#[inline]
+fn left_rows_fade() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        !LEFT_ROWS_SHRINK.with(std::cell::Cell::get)
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        true
     }
 }
 
@@ -2836,6 +2869,7 @@ impl Envelope for GlassEnv {
         opacity: 0.0,
         height: 0.0,
         reduced: false,
+        left: false,
         reach: 0.0,
     };
 
@@ -2846,7 +2880,7 @@ impl Envelope for GlassEnv {
 
     #[inline]
     fn fade(&mut self, f: f32) {
-        if self.reduced {
+        if self.reduced || self.left {
             self.opacity *= f;
         } else {
             self.height *= f;
@@ -8010,7 +8044,10 @@ impl Ribbon {
         #[cfg(any(test, debug_assertions))]
         count_glass_exit();
         let reach = GLASS_TAIL_UP_CH * (ctx.geom.ch as f32 * clamp01(ctx.cfg.intensity));
-        self.envelope(ctx, cell, coh, GlassEnv::new(ctx.cfg.reduced_motion, reach))
+        let mut env = GlassEnv::new(ctx.cfg.reduced_motion, reach);
+        env.left =
+            left_rows_fade() && coh.is_some_and(|c| self.sunk_on(c.id, c.row, ctx.now) > 0.0);
+        self.envelope(ctx, cell, coh, env)
     }
 
     /// Fold the cell's envelope into `e`: its attack, its melt, each exit, the printed dim, the
@@ -14285,6 +14322,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// THE LEFT ROW'S STREAK (the after-land pass's R3): once a wrapped row the hand has left has
+    /// sunk ([`a_wrapped_row_the_hand_left_sinks_to_its_low_glass_by_height`]), its exits fade
+    /// the glass's opacity at the sunk height, so the row retires as a streak along its foot, as
+    /// the dark ribbon's retiring row does: on every frame it stands, its body reaches nine
+    /// tenths of [`WRAP_SINK_CH`] or more, and its opacity falls under half of its whole before
+    /// it goes.
+    /// Negative control: [`with_left_rows_shrinking`] melts it by height, as 1.12 did, and its
+    /// body falls under half the sunk height while its opacity stays whole: the hairline.
+    #[test]
+    fn a_wrapped_row_the_hand_left_retires_as_a_streak_along_its_foot() {
+        let c = glass_cfg(cfg(false, true));
+        let t0 = Instant::now();
+        let chf = geom().ch as f32;
+        let low = WRAP_SINK_CH * chf;
+        let body = (10.0 + 3.0) * geom().cw as f32;
+        // Each frame's left-row body: its most reach (its oldest end tapers, and eats in as it
+        // retires) and its most coverage, while it lays.
+        let frames = || {
+            let (mut rib, wrap) = wrapped(&c, t0);
+            let mut out = Vec::new();
+            for ms in (400u64..6000).step_by(40) {
+                let _ = glass_frame(&mut rib, &c, at(wrap, ms), WRAPPED_CARET);
+                let laid: Vec<(f32, f32, u8)> = row_glass(&rib, 2)
+                    .into_iter()
+                    .filter(|&(x, up, cov)| x >= body && up > 0.0 && cov > 0)
+                    .collect();
+                if laid.is_empty() {
+                    break;
+                }
+                let up = laid.iter().map(|l| l.1).fold(0.0, f32::max);
+                let cov = laid.iter().map(|l| l.2).max().unwrap_or(0);
+                out.push((ms, up, cov));
+            }
+            out
+        };
+        let streak = frames();
+        assert!(
+            streak.len() > 3,
+            "fixture: the left row stands for several frames: {streak:?}"
+        );
+        let whole = streak[0].2;
+        assert!(
+            streak.iter().all(|&(_, up, _)| up >= 0.9 * low),
+            "the left row keeps its sunk height through its exit: {streak:?}"
+        );
+        assert!(
+            streak
+                .iter()
+                .any(|&(_, _, cov)| u32::from(cov) * 2 < u32::from(whole)),
+            "the left row's opacity fades out: {streak:?}"
+        );
+        let hairline = with_left_rows_shrinking(frames);
+        assert!(
+            hairline.iter().any(|&(_, up, _)| up < 0.5 * low)
+                && hairline.iter().all(|&(_, _, cov)| cov == hairline[0].2),
+            "control: melted by height, the left row shrinks at whole opacity: {hairline:?}"
+        );
     }
 
     /// THE HAND-ROW INSET (§2.4, §15.2 1.10): on a multi-row structural set the hand's row keeps

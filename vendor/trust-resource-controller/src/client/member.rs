@@ -5,6 +5,7 @@
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+#[cfg(trust_std)]
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
@@ -57,10 +58,27 @@ pub struct ProxyChild {
     attached: bool,
     started: Option<Started>,
     terminal: Option<Status>,
+    accounted: bool,
+    accounting: Option<crate::accounting::Observation>,
+    pending_terminal: Option<Status>,
+    observed_terminal: Option<Status>,
 }
 fn invalid() -> io::Error {
     io::ErrorKind::InvalidData.into()
 }
+/// Explicit descriptor actions are a compiler capability, not a request flag.
+/// STOCK EXCEPTION: a stock compiler cannot launch members through this API.
+fn require_member_inheritance() -> io::Result<()> {
+    if cfg!(trust_std) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native member launch requires explicit descriptor inheritance",
+        ))
+    }
+}
+
 fn duplicate_for_inheritance(source: BorrowedFd<'_>) -> io::Result<OwnedFd> {
     // SAFETY: duplicate a held description at a fresh slot >=5, replacing nothing.
     let raw = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 5) };
@@ -133,8 +151,31 @@ impl Client {
         io: MemberIo,
         deadline: Instant,
     ) -> Result<ProxyChild, MemberError> {
+        self.member_inner(request, io, deadline, false)
+    }
+    /// Require the negotiated original-owning-wait route. Unsupported helpers
+    /// or custodians refuse; this never retries through ordinary execution.
+    pub fn member_accounted(
+        &self,
+        request: &Request,
+        io: MemberIo,
+        deadline: Instant,
+    ) -> Result<ProxyChild, MemberError> {
+        self.member_inner(request, io, deadline, true)
+    }
+    fn member_inner(
+        &self,
+        request: &Request,
+        io: MemberIo,
+        deadline: Instant,
+        accounted: bool,
+    ) -> Result<ProxyChild, MemberError> {
+        require_member_inheritance().map_err(MemberError::BeforeRequest)?;
         let prepare = || -> io::Result<_> {
             request.validate()?;
+            if matches!(request.role, crate::Role::SealedMetadata | crate::Role::ResolverQuery) {
+                return Err(invalid());
+            }
             // Even metadata borrows the original real CPU continuation; live
             // memory context alone never grants a second implicit CPU unit.
             if request.delegations.cpu.is_none() {
@@ -154,7 +195,15 @@ impl Client {
                 }
             }
             let (offered, descriptions) = inheritance_copies(request, &io.descriptions)?;
-            let payload = offered.encode()?;
+            let payload = if accounted {
+                crate::accounting::AccountedRequest {
+                    request: offered.clone(),
+                    scope: crate::accounting::Scope::ChildAndWaitedDescendantsV1,
+                }
+                .encode()?
+            } else {
+                offered.encode()?
+            };
             self.host.validate(deadline)?;
             let (control, child_control) = UnixStream::pair()?;
             let (proof, child_proof) = UnixStream::pair()?;
@@ -168,26 +217,16 @@ impl Client {
             let mut inherited: Vec<_> = descriptions.iter().map(AsRawFd::as_raw_fd).collect();
             inherited.extend([child_control.as_raw_fd(), child_proof.as_raw_fd()]);
             let mut command = Command::new(self.host.helper_path());
-            command.args(fds.arguments()?).env_clear();
+            command
+                .args(if accounted { fds.accounted_arguments()? } else { fds.arguments()? })
+                .env_clear();
             // These transient intentional copies are not close-on-fork guarded.
             // All local v3 launches must use this paired helper; any future
             // foreign local phase needs a shared fork guard or SCM transport.
-            // Keep this helper in the caller's existing owned process group.
-            // SAFETY: child-only fcntl on held descriptors, preserving flags;
-            // no allocation or overwrite of Rust's private exec-status pipe.
-            unsafe {
-                command.pre_exec(move || {
-                    for &fd in &inherited {
-                        let flags = libc::fcntl(fd, libc::F_GETFD);
-                        if flags < 0
-                            || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
-                        {
-                            return Err(io::Error::last_os_error());
-                        }
-                    }
-                    Ok(())
-                });
-            }
+            // Keep the helper in this owned group. Explicit Trust std file
+            // actions preserve only these descriptions, without forcing a
+            // fork/pre_exec copy of a potentially large compiler address space.
+            inherit_descriptions(&mut command, &inherited)?;
             Ok((payload, command, control, proof, child_control, child_proof, descriptions))
         };
         let (payload, mut command, control, proof, child_control, child_proof, mut descriptions) =
@@ -209,12 +248,67 @@ impl Client {
             attached: false,
             started: None,
             terminal: None,
+            accounted,
+            accounting: None,
+            pending_terminal: None,
+            observed_terminal: None,
         };
-        child.host.validate_child(&child.helper, deadline).map_err(MemberError::BeforeRequest)?;
+        if let Err(error) = child.host.validate_child(&child.helper, deadline) {
+            // A helper was actually spawned. An identity/refusal failure does
+            // not establish its retirement or return the caller's paid loan.
+            return Err(MemberError::Unknown { child: Box::new(child), error });
+        }
         if let Err(error) = child.control.send(&payload, deadline) {
             return Err(MemberError::Unknown { child: Box::new(child), error });
         }
         Ok(child)
+    }
+}
+
+/// Native member launch requires explicit child-only inheritance, never a
+/// process-wide CLOEXEC change or an implicit stock-std inheritance fallback.
+/// Configure only native per-child file actions, granting no admission or
+/// descriptor ownership. The caller must retain each actual original owned
+/// description through spawn. Unsupported compilers refuse without a flag or
+/// pre_exec fallback, and parent descriptor flags remain untouched.
+pub fn inherit_descriptions(
+    command: &mut Command,
+    descriptions: &[std::os::fd::RawFd],
+) -> io::Result<()> {
+    #[cfg(trust_std)]
+    {
+        for &fd in descriptions {
+            command.inherit_fd(fd);
+        }
+        Ok(())
+    }
+    #[cfg(not(trust_std))]
+    {
+        let _ = (command, descriptions);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native resource member launch requires Trust std explicit descriptor inheritance",
+        ))
+    }
+}
+
+#[cfg(all(test, not(trust_std)))]
+mod inheritance_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_inheritance_keeps_parent_descriptions_closed_on_exec() {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let fd = socket.as_raw_fd();
+        // SAFETY: the socket owns this live descriptor throughout the test.
+        let before = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(before >= 0 && before & libc::FD_CLOEXEC != 0);
+        let mut command = Command::new("unused-helper");
+        assert_eq!(require_member_inheritance().unwrap_err().kind(), io::ErrorKind::Unsupported);
+        let error = inherit_descriptions(&mut command, &[fd]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        // SAFETY: the same socket still owns the descriptor.
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, before);
     }
 }
 impl ProxyChild {
@@ -242,6 +336,20 @@ impl ProxyChild {
     }
     pub fn started(&self) -> Option<Started> {
         self.started
+    }
+    /// Available only from the negotiated terminal for this original attempt.
+    /// Inner absent fields remain uncollected, even after a known child exit.
+    pub fn accounting(&self) -> Option<crate::accounting::Observation> {
+        if matches!(self.terminal, Some(Status::Finished { .. } | Status::Refused { .. })) {
+            self.accounting
+        } else {
+            None
+        }
+    }
+    /// Last well-framed reported terminal, retained for diagnostics if later
+    /// transport failure makes the actual result Unknown. This is no grant.
+    pub fn observed_terminal(&self) -> Option<&Status> {
+        self.observed_terminal.as_ref()
     }
     pub fn cancel(&mut self, deadline: Instant) -> io::Result<()> {
         if matches!(self.terminal, Some(Status::Finished { .. } | Status::Refused { .. })) {
@@ -288,6 +396,7 @@ impl ProxyChild {
             }
             Ok(None) => None,
             Err(_) => {
+                self.accounting = None;
                 let status = Status::Unknown {
                     reason: "native member lifecycle unavailable".into(),
                     started: self.started,
@@ -298,15 +407,47 @@ impl ProxyChild {
         }
     }
     fn poll(&mut self, deadline: Instant) -> io::Result<Option<Status>> {
+        if self.pending_terminal.is_some() {
+            let eof = self.control.at_eof()?;
+            if self.control.ready_to_receive()? && !eof {
+                return Err(invalid());
+            }
+            if !eof {
+                return Ok(None);
+            }
+            if self.proof.ready_to_receive()? && !self.proof.at_eof()? {
+                return Err(invalid());
+            }
+            return match self.helper.try_wait()? {
+                Some(status) if status.success() => Ok(self.pending_terminal.take()),
+                Some(_) => Err(invalid()),
+                None => Ok(None),
+            };
+        }
         if !self.proof_done && self.proof.ready_to_receive()? {
             self.answer(deadline)?;
         }
         if self.control.ready_to_receive()? {
-            let frame = StatusFrame::decode(
-                &self.control.receive(deadline)?,
-                self.binding.0,
-                self.binding.1,
-            )?;
+            let bytes = self.control.receive(deadline)?;
+            let (frame, accounting) = if self.accounted {
+                match crate::accounting::TerminalFrame::decode(
+                    &bytes,
+                    self.binding.0,
+                    self.binding.1,
+                ) {
+                    Ok(value) => (value.finished, Some(value.observation)),
+                    Err(_) => {
+                        let plain = StatusFrame::decode(&bytes, self.binding.0, self.binding.1)?;
+                        if matches!(plain.status, Status::Finished { .. } | Status::Refused { .. })
+                        {
+                            return Err(invalid());
+                        }
+                        (plain, None)
+                    }
+                }
+            } else {
+                (StatusFrame::decode(&bytes, self.binding.0, self.binding.1)?, None)
+            };
             match frame.status {
                 Status::Attached if !self.attached && self.started.is_none() => {
                     self.attached = true
@@ -315,9 +456,23 @@ impl ProxyChild {
                     self.started = Some(started)
                 }
                 Status::Finished { .. } if self.proof_done && self.started.is_some() => {
+                    self.accounting = accounting;
+                    self.observed_terminal = Some(frame.status.clone());
+                    if self.accounted {
+                        self.pending_terminal = Some(frame.status);
+                        return Ok(None);
+                    }
                     return Ok(Some(frame.status));
                 }
-                Status::Refused { .. } if self.started.is_none() => return Ok(Some(frame.status)),
+                Status::Refused { .. } if self.started.is_none() => {
+                    self.accounting = accounting;
+                    self.observed_terminal = Some(frame.status.clone());
+                    if self.accounted {
+                        self.pending_terminal = Some(frame.status);
+                        return Ok(None);
+                    }
+                    return Ok(Some(frame.status));
+                }
                 Status::Unknown { started, .. } => {
                     if self.started.is_some() && started != self.started {
                         return Err(invalid());

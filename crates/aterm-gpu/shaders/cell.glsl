@@ -532,7 +532,12 @@ void vs_glyph() {
 
 // TEXT glyphs, with the W2 linear-corrected coverage remap gated exactly like
 // the CPU correction_applies (interior coverage, a non-degenerate luminance
-// gap: 0.001 == aterm_render::TEXT_BLEND_EPS).
+// gap: 0.001 == aterm_render::TEXT_BLEND_EPS). The letter's light leaves
+// premultiplied (fg * cov, cov) into PREMULTIPLIED_OVER: the remapped coverage
+// lies off the 1/255 lattice, and a blend unit that rounds its source alpha to
+// the target's 8 bits (NVIDIA's GL) laid a dark page's faint edges up to 5 codes
+// off the CPU's blend_text; only the ground's share (1 - cov) rounds now, by
+// under a quarter of a code.
 #if defined(ATERM_FRAGMENT) && defined(ATERM_FS_fs_glyph)
 void fs_glyph() {
     float cov = texture(aterm_t0, v_uv).r;
@@ -546,7 +551,7 @@ void fs_glyph() {
             cov = clamp((blend_l - bg_l) / (fg_l - bg_l), 0.0, 1.0);
         }
     }
-    o_frag = vec4(fg_lin, cov);
+    o_frag = vec4(fg_lin * cov, cov);
 }
 #endif
 
@@ -568,12 +573,14 @@ void fs_deco_over() {
 }
 #endif
 
-// ADD (the profanity sparkle): premultiplied (rgb*a, a) into One/One.
+// ADD (the profanity sparkle): premultiplied (rgb*a, a) into One/One, the light
+// quantized to the CPU's byte, round(c*a*255)/255 == premul_rgb's (c*a + 127)/255:
+// a blend unit that holds its source short of f32 (NVIDIA's GL) adds that byte.
 #if defined(ATERM_FRAGMENT) && defined(ATERM_FS_fs_deco_add)
 void fs_deco_add() {
     float cov = texture(aterm_t0, v_uv).r;
     float a = roundEven(cov * v_color.a * 255.0) / 255.0;
-    o_frag = vec4(v_color.rgb * a, a);
+    o_frag = vec4(roundEven(v_color.rgb * a * 255.0) / vec3(255.0), a);
 }
 #endif
 

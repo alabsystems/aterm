@@ -12,6 +12,7 @@ mod carry;
 mod csi;
 mod empty_params;
 mod invariants;
+mod line_runs;
 mod performance;
 mod string_bulk;
 mod string_cancel;

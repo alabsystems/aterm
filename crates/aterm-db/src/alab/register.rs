@@ -205,7 +205,7 @@ fn text<'a>(row: &'a Value, column: &str) -> Option<&'a str> {
 }
 
 /// One name, with or without the `.local` a stored `hostname` reading carries.
-fn same_host(a: &str, b: &str) -> bool {
+pub(super) fn same_host(a: &str, b: &str) -> bool {
     fn bare(name: &str) -> &str {
         let name = name.trim();
         match name.len().checked_sub(".local".len()) {

@@ -4,7 +4,8 @@
 //! What tells a parked setup run that a fact it reads may have moved, with no timer
 //! ([`super::InitialSetupParkMark::watches`]): the secrets folder changing (the subscriber's
 //! `state.toml`, a join's identity or source, and materialized `~/.secrets` files), this Mac's
-//! network addresses changing (a route socket's address and interface messages), and a `git`
+//! network changing (the kernel's network-change events, [`aterm_uds::network::RouteChanges`]),
+//! and a `git`
 //! arriving (atpkg's, the Command Line Tools' or Xcode's), and the selected repository inputs
 //! or pinned helper changing. A watch only
 //! says "look again": the park reads its mark again and runs a pass only when a fact changed.
@@ -14,7 +15,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,14 +52,25 @@ pub struct ParkWatch {
     /// Set by a watch that stopped hearing its fact after it started ([`ParkWatch::whole`]).
     lost: Arc<AtomicBool>,
     files: Option<Arc<atpkg::dirwatch::Watcher>>,
-    network: Option<Arc<OwnedFd>>,
+    network: Option<NetworkWatch>,
+}
+
+/// A park's network watch: the write end of the pipe its thread waits on beside the route
+/// changes. Dropping it hangs the pipe up, which ends that wait; a kernel event socket takes no
+/// `shutdown(2)` (it answers `ENOTCONN`, and a poll on it goes on).
+struct NetworkWatch {
+    _end: std::io::PipeWriter,
+    /// The thread's route changes, gone once the thread ended.
+    #[cfg(test)]
+    routes: std::sync::Weak<aterm_uds::network::RouteChanges>,
 }
 
 impl ParkWatch {
     /// Start what `watches` names, each calling `changed` when its fact may have moved.
     ///
     /// # Errors
-    /// A watch that could not start: the park then reads its mark on its old timer.
+    /// A watch that could not start, with its cause (the kernel's errno for a network-change
+    /// socket it refused): the park then reads its mark on its old timer.
     pub fn start(watches: Watches, changed: fn()) -> io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let lost = Arc::new(AtomicBool::new(false));
@@ -141,16 +152,12 @@ impl ParkWatch {
 }
 
 impl Drop for ParkWatch {
+    /// Tell each thread to end. The network thread's pipe hangs up when `network` drops, after
+    /// this, so it finds `stop` set.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(files) = &self.files {
             let _ = files.wake();
-        }
-        if let Some(route) = &self.network {
-            // SAFETY: `route` is an open socket this watch owns for as long as the Arc lives;
-            // shutting it down ends the thread's blocked poll, and it closes when the last Arc
-            // goes.
-            unsafe { libc::shutdown(route.as_raw_fd(), libc::SHUT_RDWR) };
         }
     }
 }
@@ -573,11 +580,6 @@ fn watch_paths_scoped(
     Ok(watcher)
 }
 
-/// Darwin's routing message types for an address added or removed and an interface's state
-/// (`<net/route.h>`'s `RTM_NEWADDR`, `RTM_DELADDR`, `RTM_IFINFO`); the routes a LAN's neighbours
-/// come and go by are not watched.
-const ADDRESS_MESSAGES: [u8; 3] = [0xc, 0xd, 0xe];
-
 /// How long the network stays quiet after an address or interface message before the park is
 /// told: joining a network comes as a burst (the link, then each address), and one look after it
 /// sees where it settled.
@@ -603,39 +605,44 @@ fn network_tell_at(first: Instant, last: Instant, told: Option<Instant>) -> Inst
     told.map_or(settled, |told| settled.max(told + NETWORK_SPACING))
 }
 
-/// A route socket's thread, calling `changed` once each burst of address or interface messages
-/// settles ([`network_tell_at`]), until `stop`; a socket that fails is `lost` ([`lose`]).
+/// A thread waiting on the kernel's network-change events ([`aterm_uds::network::RouteChanges`]),
+/// calling `changed` once each burst of them settles ([`network_tell_at`]), until the park drops
+/// its [`NetworkWatch`]. Events that name no change (a router advertisement, a link-quality
+/// report) are read and passed over; a socket that fails is `lost` ([`lose`]). One the kernel
+/// refuses fails the watch with its reason ([`aterm_uds::network::RouteChanges::open`]).
 fn watch_network(
     stop: Arc<AtomicBool>,
     lost: Arc<AtomicBool>,
     changed: fn(),
-) -> io::Result<Arc<OwnedFd>> {
-    // Kept out of children from its creation (`aterm_uds::kept_out`); close-on-exec is set
-    // before the mark, as `F_SETFD` replaces every descriptor flag.
-    let route = Arc::new(aterm_uds::kept_out(|| {
-        // SAFETY: socket(2) with constant arguments; a non-negative result is a new descriptor
-        // this function owns.
-        let raw = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC) };
-        if raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `raw` is the open descriptor socket(2) just returned, owned by nothing else.
-        let route = unsafe { OwnedFd::from_raw_fd(raw) };
-        // SAFETY: F_SETFD changes only this descriptor's close-on-exec flag.
-        if unsafe { libc::fcntl(route.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(route)
-    })?);
-    let thread_route = Arc::clone(&route);
+) -> io::Result<NetworkWatch> {
+    watch_network_over(
+        aterm_uds::network::RouteChanges::open()?,
+        stop,
+        lost,
+        changed,
+    )
+}
+
+/// [`watch_network`] over `routes`, which a test makes a stand-in.
+fn watch_network_over(
+    routes: aterm_uds::network::RouteChanges,
+    stop: Arc<AtomicBool>,
+    lost: Arc<AtomicBool>,
+    changed: fn(),
+) -> io::Result<NetworkWatch> {
+    use aterm_uds::network::RouteWake;
+    use std::os::fd::AsFd as _;
+    let (ended, end) = aterm_uds::kept_out(std::io::pipe)?;
+    let routes = Arc::new(routes);
+    #[cfg(test)]
+    let watched = Arc::downgrade(&routes);
     std::thread::Builder::new()
         .name("aterm-setup-park-network".into())
         .spawn(move || {
-            let mut message = [0u8; 2048];
             let mut burst: Option<(Instant, Instant)> = None;
             while !stop.load(Ordering::Acquire) {
-                let timeout = match burst {
-                    None => -1,
+                let most = match burst {
+                    None => Duration::MAX,
                     Some((first, last)) => {
                         let now = Instant::now();
                         let mut told = NETWORK_TOLD
@@ -650,58 +657,29 @@ fn watch_network(
                             continue;
                         }
                         drop(told);
-                        libc::c_int::try_from(at.duration_since(now).as_millis())
-                            .unwrap_or(libc::c_int::MAX)
-                            .max(1)
+                        at.duration_since(now)
                     }
                 };
-                let mut ready = libc::pollfd {
-                    fd: thread_route.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                // SAFETY: one pollfd for a descriptor the Arc keeps open.
-                let polled = unsafe { libc::poll(&mut ready, 1, timeout) };
-                if polled < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                if polled < 0 {
-                    lose(&stop, &lost, changed);
-                    return;
-                }
-                if polled == 0 {
-                    continue;
-                }
-                // SAFETY: reads into `message`, a buffer of its stated length, from a descriptor
-                // the Arc keeps open.
-                let read = unsafe {
-                    libc::read(
-                        thread_route.as_raw_fd(),
-                        message.as_mut_ptr().cast(),
-                        message.len(),
-                    )
-                };
-                if read < 0
-                    && matches!(
-                        io::Error::last_os_error().kind(),
-                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                    )
-                {
-                    continue;
-                }
-                // The watch shut the socket down, or it failed: nothing more is heard.
-                if read <= 0 {
-                    lose(&stop, &lost, changed);
-                    return;
-                }
-                // `rt_msghdr`: a u16 length, a u8 version, then the u8 type.
-                if read >= 4 && ADDRESS_MESSAGES.contains(&message[3]) {
-                    let now = Instant::now();
-                    burst = Some((burst.map_or(now, |(first, _)| first), now));
+                match routes.wait_beside(most, Some(ended.as_fd())) {
+                    RouteWake::Change => {
+                        let now = Instant::now();
+                        burst = Some((burst.map_or(now, |(first, _)| first), now));
+                    }
+                    RouteWake::Timeout => {}
+                    // The park dropped its watch, which hung the pipe up.
+                    RouteWake::Also => return,
+                    RouteWake::Failed => {
+                        lose(&stop, &lost, changed);
+                        return;
+                    }
                 }
             }
         })?;
-    Ok(route)
+    Ok(NetworkWatch {
+        _end: end,
+        #[cfg(test)]
+        routes: watched,
+    })
 }
 
 #[cfg(test)]
@@ -813,9 +791,12 @@ mod tests {
         );
     }
 
+    /// A wait for something that must happen: a hang detector, never a latency budget.
+    const HANG: Duration = Duration::from_secs(60);
+
     /// Wait, as a one-minute hang detector, until `done`.
     fn until(what: &str, done: impl Fn() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + HANG;
         while !done() {
             assert!(Instant::now() < deadline, "{what}");
             std::thread::sleep(Duration::from_millis(5));
@@ -1361,39 +1342,252 @@ mod tests {
         assert_eq!(network_tell_at(at(90), at(90), Some(start)), at(92));
     }
 
-    static NETWORK_TOLD: AtomicUsize = AtomicUsize::new(0);
-
-    fn network_told() {
-        NETWORK_TOLD.fetch_add(1, Ordering::SeqCst);
+    /// A park whose network watch cannot open its socket fails to start with the kernel's
+    /// reason, which the park's log line carries (`setup: a parked run reads its facts each
+    /// minute: …`). Here no descriptor is free, in a child of this test binary, so no other test
+    /// meets the limit.
+    #[test]
+    fn a_network_watch_that_cannot_open_says_why() {
+        use std::os::fd::AsRawFd as _;
+        const CHILD: &str = "ATERM_TEST_PARK_WITH_NO_DESCRIPTOR_FREE";
+        if std::env::var_os(CHILD).is_none() {
+            let name = format!(
+                "{}::a_network_watch_that_cannot_open_says_why",
+                module_path!().split_once("::").map_or("", |(_, rest)| rest)
+            );
+            let mut child =
+                aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"));
+            child
+                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1");
+            let out = aterm_uds::deadline::output_until(&mut child, Instant::now() + HANG)
+                .expect("the child ran");
+            let said = String::from_utf8_lossy(&out.stdout);
+            let refused = format!(
+                "park refused: {}",
+                io::Error::from_raw_os_error(libc::EMFILE)
+            );
+            // The line the test harness began with its test's name.
+            assert!(
+                said.lines().any(|line| line.ends_with(&refused)),
+                "the park's refusal does not say why:\n{said}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` writes the struct this frame owns.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) },
+            0
+        );
+        // The lowest descriptor free, as the limit: no descriptor opens after.
+        let lowest = std::fs::File::open("/dev/null")
+            .expect("a descriptor free")
+            .as_raw_fd();
+        limit.rlim_cur = libc::rlim_t::try_from(lowest).expect("a descriptor's number");
+        // SAFETY: `setrlimit` reads the struct this frame owns: a soft limit under the hard one.
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) },
+            0
+        );
+        let network = Watches {
+            network: true,
+            ..Watches::default()
+        };
+        match ParkWatch::start(network, || {}) {
+            Ok(_) => println!("park started"),
+            Err(why) => println!("park refused: {why}"),
+        }
     }
 
-    /// A park's end ends its network watch's thread (its socket closes with it), and is no loss.
+    static DROP_TOLD: AtomicUsize = AtomicUsize::new(0);
+
+    fn drop_told() {
+        DROP_TOLD.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Dropping a park's network watch ends its thread by the pipe's hang-up, and is neither a
+    /// tell nor a loss. `stop` is never set here and the stand-in socket never speaks, so only
+    /// the hang-up can end the wait, as only it ends one on a kernel event socket, which takes
+    /// no `shutdown(2)`.
     #[test]
-    fn a_dropped_park_watch_ends_its_network_thread() {
+    fn a_dropped_network_watch_ends_its_thread_by_its_pipe() {
+        let (heard, kernel) = std::os::unix::net::UnixDatagram::pair().expect("a socket pair");
+        let lost = Arc::new(AtomicBool::new(false));
+        let watch = watch_network_over(
+            aterm_uds::network::RouteChanges::over(heard.into()),
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&lost),
+            drop_told,
+        )
+        .expect("a network watch");
+        let routes = watch.routes.clone();
+        drop(watch);
+        until("the network thread outlived its watch", || {
+            routes.upgrade().is_none()
+        });
+        assert!(!lost.load(Ordering::Acquire), "an end is no loss");
+        assert_eq!(DROP_TOLD.load(Ordering::SeqCst), 0, "an end tells nothing");
+        drop(kernel);
+    }
+
+    static PARK_TOLD: AtomicUsize = AtomicUsize::new(0);
+
+    fn park_told() {
+        PARK_TOLD.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A park that watches the network starts a network watch on the kernel's socket, and the
+    /// park's end (`stop`, then the pipe's hang-up) ends that watch's thread, as neither a tell
+    /// nor a loss. Which of the two ends it is where the thread was when the park dropped; that
+    /// the hang-up alone ends a wait is `a_dropped_network_watch_ends_its_thread_by_its_pipe`'s.
+    #[test]
+    fn a_park_watching_the_network_ends_its_network_thread_with_it() {
         let watch = ParkWatch::start(
             Watches {
                 network: true,
                 ..Watches::default()
             },
-            network_told,
+            park_told,
         )
-        .unwrap();
-        let route_fd = watch.network.as_ref().unwrap().as_raw_fd();
-        // SAFETY: F_GETFD reads the descriptor's flags without mutating state.
-        let flags = unsafe { libc::fcntl(route_fd, libc::F_GETFD) };
-        assert!(flags >= 0, "F_GETFD failed");
-        assert_ne!(
-            flags & libc::FD_CLOEXEC,
-            0,
-            "route socket must be close-on-exec"
-        );
-        let socket = Arc::downgrade(watch.network.as_ref().unwrap());
+        .expect("a park's watches");
+        let routes = watch
+            .network
+            .as_ref()
+            .expect("a network watch")
+            .routes
+            .clone();
         let lost = Arc::clone(&watch.lost);
         drop(watch);
         until("the network thread outlived its park", || {
-            socket.upgrade().is_none()
+            routes.upgrade().is_none()
         });
-        assert!(!lost.load(Ordering::Acquire));
-        assert_eq!(NETWORK_TOLD.load(Ordering::SeqCst), 0);
+        assert!(!lost.load(Ordering::Acquire), "an end is no loss");
+        assert_eq!(PARK_TOLD.load(Ordering::SeqCst), 0, "an end tells nothing");
+    }
+
+    /// One kernel event message as `PF_SYSTEM` delivers it: Apple's network class, its
+    /// `subclass` and event `code`.
+    fn kernel_event(subclass: u32, code: u32) -> Vec<u8> {
+        [24_u32, 1, 1, subclass, 37, code]
+            .into_iter()
+            .flat_map(u32::to_ne_bytes)
+            .collect()
+    }
+
+    /// When the park was told of each change ([`change_told`]).
+    static CHANGES_TOLD: std::sync::Mutex<Vec<Instant>> = std::sync::Mutex::new(Vec::new());
+
+    fn change_told() {
+        CHANGES_TOLD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Instant::now());
+    }
+
+    /// When the park was told of its `nth` change, once it was.
+    fn nth_change_told(nth: usize) -> Instant {
+        let told = || {
+            CHANGES_TOLD
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(nth)
+                .copied()
+        };
+        until("a change of network was never told", || told().is_some());
+        told().expect("a change told")
+    }
+
+    /// Every park's last tell of a network change ([`super::NETWORK_TOLD`]).
+    fn last_network_tell() -> std::sync::MutexGuard<'static, Option<Instant>> {
+        super::NETWORK_TOLD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A change of network (an IPv4 address added) is told the park no sooner than its burst
+    /// settles ([`NETWORK_SETTLE`]), and no sooner than [`NETWORK_SPACING`] after the last tell,
+    /// which the thread reads and records ([`super::NETWORK_TOLD`]); neither is a loss. Each is
+    /// a lower bound on when the tell came, which no load can break, and which a thread that
+    /// tells at once, or never reads or records the last tell, fails. Which events name a change
+    /// is `RouteChanges::wait_beside`'s (aterm-uds' `names_a_change` laws), and the ten-second
+    /// bound on a settle is [`network_tell_at`]'s arithmetic. The one law that tells through
+    /// [`super::NETWORK_TOLD`], so it alone sets it.
+    #[test]
+    fn a_network_change_is_told_no_sooner_than_it_settles_or_a_minute_after_the_last_tell() {
+        let (heard, kernel) = std::os::unix::net::UnixDatagram::pair().expect("a socket pair");
+        let stop = Arc::new(AtomicBool::new(false));
+        let lost = Arc::new(AtomicBool::new(false));
+        *last_network_tell() = None;
+        let watch = watch_network_over(
+            aterm_uds::network::RouteChanges::over(heard.into()),
+            Arc::clone(&stop),
+            Arc::clone(&lost),
+            change_told,
+        )
+        .expect("a network watch");
+        let sent = Instant::now();
+        kernel.send(&kernel_event(1, 1)).expect("an address added");
+        let told = nth_change_told(0);
+        assert!(
+            told >= sent + NETWORK_SETTLE,
+            "told {:?} after the change, before its burst settled",
+            told - sent
+        );
+        let recorded = *last_network_tell();
+        assert!(
+            recorded.is_some_and(|at| at >= sent + NETWORK_SETTLE && at <= told),
+            "the tell was not recorded for the next one's spacing: {recorded:?}"
+        );
+        // A last tell all but twice the settle a minute ago: the spacing says when, not the
+        // settle.
+        let last = Instant::now()
+            .checked_sub(NETWORK_SPACING - 2 * NETWORK_SETTLE)
+            .expect("a clock past its first minute");
+        *last_network_tell() = Some(last);
+        kernel
+            .send(&kernel_event(1, 1))
+            .expect("another address added");
+        let told = nth_change_told(1);
+        assert!(
+            told >= last + NETWORK_SPACING,
+            "told {:?} short of a minute after the last tell",
+            (last + NETWORK_SPACING).duration_since(told)
+        );
+        assert!(!lost.load(Ordering::Acquire), "a change is no loss");
+        stop.store(true, Ordering::Release);
+        drop(watch);
+    }
+
+    static LOSS_TOLD: AtomicUsize = AtomicUsize::new(0);
+
+    fn loss_told() {
+        LOSS_TOLD.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A route socket that fails (its peer gone) is a loss, which tells the park to look again
+    /// and take its timer back.
+    #[test]
+    fn a_failed_route_socket_is_a_loss_the_park_is_told() {
+        let (heard, peer) = std::os::unix::net::UnixStream::pair().expect("a stream pair");
+        drop(peer);
+        let stop = Arc::new(AtomicBool::new(false));
+        let lost = Arc::new(AtomicBool::new(false));
+        let watch = watch_network_over(
+            aterm_uds::network::RouteChanges::over(heard.into()),
+            Arc::clone(&stop),
+            Arc::clone(&lost),
+            loss_told,
+        )
+        .expect("a network watch");
+        until("a failed route socket was never a loss", || {
+            lost.load(Ordering::Acquire) && LOSS_TOLD.load(Ordering::SeqCst) == 1
+        });
+        stop.store(true, Ordering::Release);
+        drop(watch);
     }
 }

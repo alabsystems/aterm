@@ -57,7 +57,8 @@ mod win_paths;
 pub mod windows;
 
 pub use procs::{
-    ProcessReading, Sweep, SweepOpts, pid_version, processes, processes_keeping, processes_with,
+    CoreSplit, ProcessReading, Sweep, SweepOpts, pid_version, processes, processes_keeping,
+    processes_with,
 };
 
 pub use caps::{Cap, CapSource, Caps, Why};

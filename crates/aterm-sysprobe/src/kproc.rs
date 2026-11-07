@@ -172,9 +172,8 @@ pub(crate) use imp::reaps_unwaited_all;
 #[cfg(target_os = "macos")]
 mod imp {
     use std::ffi::{CString, c_char, c_int, c_void};
-    use std::sync::OnceLock;
-    use std::sync::{Arc, Condvar, Mutex};
-    use std::time::Duration;
+    use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
+    use std::time::{Duration, Instant};
 
     use crate::jobs::darwin::{
         KERN_PROC, KERN_PROC_PID, KINFO_COMM_AT, KINFO_FLAG_AT, KINFO_PGID_AT, KINFO_PID_AT,
@@ -409,7 +408,7 @@ mod imp {
     const TABLE_WAIT: Duration = Duration::from_secs(1);
 
     /// This process's read of the table, while one is in the kernel ([`Bounded`]).
-    static TABLE: Bounded<Vec<u8>> = Bounded::new();
+    static TABLE: Bounded = Bounded::new();
 
     /// The whole table's `kinfo_proc` records (`KERN_PROC_ALL`), a whole number of them; `None`
     /// also where the kernel did not answer within [`TABLE_WAIT`].
@@ -417,94 +416,110 @@ mod imp {
         TABLE.read(TABLE_WAIT, table_now)
     }
 
-    /// Concurrent callers share one kernel read, each waiting at most its own bound.
-    /// A read the kernel never answers holds one worker, not one for each call.
-    pub(super) struct Bounded<T> {
-        flight: Mutex<Option<Arc<Pending<T>>>>,
+    /// A read the kernel may hold for as long as something else takes, made on a thread of its
+    /// own and waited for a bounded time. While one is still in the kernel no other starts, so a
+    /// read the kernel never answers holds one thread, not one for each call.
+    pub(super) struct Bounded {
+        in_flight: Mutex<bool>,
+        finished: Condvar,
     }
 
-    pub(super) struct Pending<T> {
-        answer: Mutex<Option<Option<T>>>,
-        done: Condvar,
-    }
-
-    impl<T: Clone + Send + 'static> Bounded<T> {
+    impl Bounded {
         pub(super) const fn new() -> Self {
             Self {
-                flight: Mutex::new(None),
+                in_flight: Mutex::new(false),
+                finished: Condvar::new(),
             }
         }
 
-        /// `read`'s answer, or `None` when it gave none, exceeded this caller's bound,
-        /// panicked, or no worker could be started. Joining a read never starts another.
-        pub(super) fn read(&'static self, within: Duration, read: fn() -> Option<T>) -> Option<T> {
-            self.begin(read).wait(within)
+        /// Wait for any earlier read, then take a fresh snapshot, within one total deadline.
+        /// An unreadable or overdue answer, or a thread that cannot start, returns `None`.
+        pub(super) fn read<T: Send + 'static>(
+            &'static self,
+            within: Duration,
+            read: fn() -> Option<T>,
+        ) -> Option<T> {
+            self.read_inner(within, read, || {})
         }
 
-        pub(super) fn begin(&'static self, read: fn() -> Option<T>) -> Arc<Pending<T>> {
-            let (pending, start) = {
-                let mut flight = self
-                    .flight
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some(pending) = flight.as_ref() {
-                    (Arc::clone(pending), false)
-                } else {
-                    let pending = Arc::new(Pending {
-                        answer: Mutex::new(None),
-                        done: Condvar::new(),
-                    });
-                    *flight = Some(Arc::clone(&pending));
-                    (pending, true)
+        fn read_inner<T: Send + 'static>(
+            &'static self,
+            within: Duration,
+            read: fn() -> Option<T>,
+            mut waiting: impl FnMut(),
+        ) -> Option<T> {
+            let deadline = Instant::now().checked_add(within)?;
+            let mut busy = self
+                .in_flight
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            while *busy {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return None;
                 }
-            };
-            if start {
-                let worker = Arc::clone(&pending);
-                let spawned = std::thread::Builder::new()
-                    .name("kproc-table".into())
-                    .spawn(move || {
-                        self.finish(&worker, std::panic::catch_unwind(read).ok().flatten());
-                    });
-                if spawned.is_err() {
-                    self.finish(&pending, None);
-                }
+                waiting();
+                let (next, _) = self
+                    .finished
+                    .wait_timeout(busy, left)
+                    .unwrap_or_else(PoisonError::into_inner);
+                busy = next;
             }
-            pending
+            if Instant::now() >= deadline {
+                return None;
+            }
+            *busy = true;
+            drop(busy);
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let spawned = std::thread::Builder::new()
+                .name("kproc-table".into())
+                .spawn(move || {
+                    let answer = {
+                        let _done = Done(self);
+                        read()
+                    };
+                    let _ = tx.send(answer);
+                });
+            if spawned.is_err() {
+                drop(Done(self));
+                return None;
+            }
+            rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .ok()
+                .flatten()
         }
 
-        fn finish(&self, pending: &Pending<T>, answer: Option<T>) {
-            *pending
-                .answer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(answer);
-            *self
-                .flight
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-            pending.done.notify_all();
+        #[cfg(test)]
+        pub(super) fn read_observing_wait<T: Send + 'static>(
+            &'static self,
+            within: Duration,
+            read: fn() -> Option<T>,
+            waiting: impl FnMut(),
+        ) -> Option<T> {
+            self.read_inner(within, read, waiting)
         }
 
         /// Whether a read is in the kernel now.
         #[cfg(test)]
         pub(super) fn in_flight(&self) -> bool {
-            self.flight
+            *self
+                .in_flight
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_some()
+                .unwrap_or_else(PoisonError::into_inner)
         }
     }
 
-    impl<T: Clone> Pending<T> {
-        pub(super) fn wait(&self, within: Duration) -> Option<T> {
-            let answer = self
-                .answer
+    /// Clears its flag when the read ends, a panicking one included.
+    struct Done(&'static Bounded);
+
+    impl Drop for Done {
+        fn drop(&mut self) {
+            *self
+                .0
+                .in_flight
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let (answer, _) = self
-                .done
-                .wait_timeout_while(answer, within, |answer| answer.is_none())
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            answer.clone().flatten()
+                .unwrap_or_else(PoisonError::into_inner) = false;
+            self.0.finished.notify_all();
         }
     }
 

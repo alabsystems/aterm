@@ -3,8 +3,9 @@
 
 //! FILES, WRITTEN THE CAREFUL WAY AND READ WITHIN A BOUND.
 //!
-//! The bounded regular-file readers ([`read_regular`], [`read_regular_text`]) run on every
-//! platform. The whole-file writer runs on Unix and Windows; Unix modes apply only on Unix.
+//! The bounded regular-file readers ([`read_regular`], [`read_regular_text`]) and the bounded
+//! reader of a user-named input ([`read_bounded_stream`]) run on every platform. The whole-file
+//! writer runs on Unix and Windows; Unix modes apply only on Unix.
 //! aterm.toml's (`ConfigFile`, under the config service's write lock) is Unix-only, since its
 //! modes and `flock` have no counterpart elsewhere.
 
@@ -14,6 +15,8 @@ use std::path::Path;
 #[cfg(any(unix, windows))]
 #[path = "atomic_file_write.rs"]
 mod writer;
+#[cfg(unix)]
+pub(crate) use writer::fresh_temp_component;
 #[cfg(any(unix, windows))]
 pub use writer::*;
 
@@ -69,6 +72,45 @@ pub fn read_regular(path: &Path, max_bytes: u64) -> io::Result<(Vec<u8>, std::fs
         ));
     }
     Ok((buf, meta))
+}
+
+/// Read an input a user named, up to `max_bytes`: a regular file, or a stream (a FIFO, a pipe or
+/// terminal named by `/dev/fd/N` or `/dev/stdin`, a character device). The open follows links and
+/// blocks until a FIFO has a writer, as a reader of a named input should; the descriptor is
+/// close-on-exec. A directory, a block device or a socket is refused, and so is an input longer
+/// than `max_bytes`, which is detected by reading one byte past the bound.
+///
+/// # Errors
+/// Returns an error if `path` cannot be opened or read, names a directory, block device or
+/// socket, or yields more than `max_bytes` bytes.
+pub fn read_bounded_stream(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    // std opens with `O_CLOEXEC` on Unix and without `O_NONBLOCK`, so a FIFO waits for its writer.
+    let file = std::fs::File::open(path)?;
+    let kind = file.metadata()?.file_type();
+    #[cfg(unix)]
+    let stream = {
+        use std::os::unix::fs::FileTypeExt as _;
+        kind.is_fifo() || kind.is_char_device()
+    };
+    #[cfg(not(unix))]
+    let stream = false;
+    if !kind.is_file() && !stream {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file, FIFO or character device",
+        ));
+    }
+    let mut buf = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)?;
+    if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("input exceeds {max_bytes} bytes"),
+        ));
+    }
+    Ok(buf)
 }
 
 /// Read a regular UTF-8 file non-blockingly up to `max_bytes`.

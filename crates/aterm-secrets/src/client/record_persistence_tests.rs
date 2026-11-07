@@ -438,7 +438,7 @@ fn a_mac_stores_its_mark_before_its_records_file_holds_its_4097th_record() {
         fixture::RAISED.within(|| {
             let home = aterm_tempfile::tempdir().expect("tempdir");
             let paths = super::Paths::for_home(home.path());
-            std::fs::create_dir_all(&paths.dir).expect("the secrets dir");
+            crate::fsx::ensure_private_dir(&paths.dir).expect("the secrets dir");
             let mark = super::crossing_mark(&paths);
             let mut store = Store::for_vault(VAULT).expect("store");
             let mut records = batch.whole();
@@ -516,11 +516,11 @@ impl MacRun {
         static BASE_FILE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
         let home = aterm_tempfile::tempdir().expect("tempdir");
         let paths = super::Paths::for_home(home.path());
-        std::fs::create_dir_all(&paths.dir).expect("the secrets dir");
+        crate::fsx::ensure_private_dir(&paths.dir).expect("the secrets dir");
         let base = BASE_FILE.get_or_init(|| {
             let built = aterm_tempfile::tempdir().expect("tempdir");
             let built = super::Paths::for_home(built.path());
-            std::fs::create_dir_all(&built.dir).expect("the secrets dir");
+            crate::fsx::ensure_private_dir(&built.dir).expect("the secrets dir");
             let mut store = crate::membership_log::Store::for_vault(VAULT).expect("store");
             let _ = store
                 .ingest_records(Batch::get().base.clone())

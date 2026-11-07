@@ -121,7 +121,7 @@ fn account_named(lab: &LabView, name: &str) -> Result<String> {
 }
 
 /// The machine `name` names: its key, else the one live row its label or an alias names (a
-/// retired row under the same label holds no label, as the importer's `live_by_label` and `add
+/// retired row under the same label holds no label, as the importer's `rows_named` and `add
 /// machine` read it), else the one retired row it names, for its history.
 pub(super) fn machine_named(lab: &LabView, name: &str) -> Option<String> {
     if lab.machines.contains_key(name) {

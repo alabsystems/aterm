@@ -343,7 +343,8 @@ pub(crate) enum Action {
 }
 
 fn admit(scope: crate::control::Scope, words: &str) -> Result<Action, &'static str> {
-    const USAGE: &str = "ERR usage: sys policy [status|collect|cancel] [--json]\n";
+    const USAGE: &str =
+        "ERR usage: sys policy [status|collect|cancel] [--json] (aterm help sys cpu)\n";
     if scope != crate::control::Scope::Owner {
         return Err("ERR CPU policy authorization is owner-only\n");
     }

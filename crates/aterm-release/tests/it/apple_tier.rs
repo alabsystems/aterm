@@ -778,6 +778,37 @@ fn the_self_check_gate_passes_a_genuinely_notarized_cut() {
     );
 }
 
+/// AN ADOPTED COPY'S SIGNING CHECKS ARE ASKED AGAIN AT THE CLAIM: a ticket that no longer
+/// validates, or a manifest of another team, refuses the claim's self-check of a copy `cut
+/// --sign` signed and checked earlier. NEGATIVE CONTROL: an adoption that trusts the sign's own
+/// checks passes the unstapled copy.
+#[test]
+fn an_adopted_copy_asks_its_signing_checks_again() {
+    let log = log();
+    publish::adopted_selfcheck(
+        FAKE_TEAM,
+        FAKE_TEAM,
+        &app(),
+        &dmg(),
+        &FakeTools::healthy(&log),
+    )
+    .expect("a copy whose checks still pass is adopted");
+    assert!(
+        entries(&log).contains(&"stapled?:aterm.app".to_string()),
+        "{:?}",
+        entries(&log)
+    );
+    let tools = FakeTools {
+        unstapled: Some("aterm.app"),
+        ..FakeTools::healthy(&log)
+    };
+    publish::adopted_selfcheck(FAKE_TEAM, FAKE_TEAM, &app(), &dmg(), &tools)
+        .expect_err("a ticket that no longer validates refuses the claim");
+    let err = publish::adopted_selfcheck("OTHERTEAM1", FAKE_TEAM, &app(), &dmg(), &tools)
+        .expect_err("another team refuses the claim");
+    assert!(err.to_string().contains("OTHERTEAM1"), "{err}");
+}
+
 #[test]
 fn the_self_check_asks_nothing_of_apple_for_a_cut_that_claims_no_team() {
     let log = log();

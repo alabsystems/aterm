@@ -52,7 +52,7 @@ pub use phase::{
     Busy, Phase, Zone, busy_signal, context_left, is_placeholder, limit_notice, survey_open,
     transcript_end, worker_phase,
 };
-pub use policy::approval::QuestionPriority;
+pub use policy::approval::{PriorityWord, QuestionPriority};
 pub use policy::turn_end::{AgentResumed, Outage, WaitKind};
 pub use report::{DEFAULT_MAX_ROWS, Mark, Marker, Reason, Report, ReportOpts};
 pub use run::{

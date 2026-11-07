@@ -88,10 +88,9 @@ impl Item for Keychain {
             if super::helper(sys, &self.user).is_none() {
                 return Probe::Blocked {
                     why: format!(
-                        "{KEYCHAIN_BLOCK}, and aterm's helper runs {}, which is not there \
-                         (atpkg repair puts it back); removing the block alone would leave \
+                        "{KEYCHAIN_BLOCK}; {}; removing the block alone would leave \
                          git's own login-keychain helper in effect",
-                        Helper::launcher(&self.user).display()
+                        Helper::unavailable(sys, &self.user)
                     ),
                 };
             }
@@ -135,12 +134,8 @@ impl Item for Keychain {
             return Err("the keychain GitHub block changed before it could be replaced".into());
         }
         drop(journaled);
-        let helper = super::helper(sys, &self.user).ok_or_else(|| {
-            format!(
-                "{} left before the keychain GitHub block could be replaced",
-                Helper::launcher(&self.user).display()
-            )
-        })?;
+        let helper =
+            super::helper(sys, &self.user).ok_or_else(|| Helper::unavailable(sys, &self.user))?;
         git.replace_keychain_block(sys, &self.user, &block, &helper)?;
         self.replaced.store(true, Ordering::Relaxed);
         Ok(())

@@ -170,7 +170,9 @@ fn until(inst: &Instance, worker: &str, what: &str, mut probe: impl FnMut() -> b
 const SUPERVISED: &str = "relaunch = false\nupgrade = false\n";
 
 /// Never let the worker launcher type a vendor command unless this worker's own shell
-/// resolves it to the fixture. The marker proves that guarded shell reached its rc.
+/// resolves it to the fixture. The marker proves that guarded shell reached its rc: for bash,
+/// `.bashrc`, which integrated bash reads on macOS (after the login files) and on Linux (where
+/// it starts as no login shell, as a terminal's bash does there).
 const WORKER_RESOLUTION: &str = "if [ -n \"$ATERM_TASK_FILE\" ]; then\n\
     [ \"$(command -v claude)\" = \"$ATERM_EXPECTED_CLAUDE\" ] || exit 86\n\
     printf 'worker shell resolved fixture\\n' > \"$HOME/worker-resolved\"\n\
@@ -416,7 +418,7 @@ fn a_command_only_instance_spawns_a_worker_without_typing_into_its_command() {
         "cmd",
         "/bin/bash",
         Some(SUPERVISED),
-        Some((".bash_profile", WORKER_RESOLUTION)),
+        Some((".bashrc", WORKER_RESOLUTION)),
         &[
             "-e",
             "/bin/sh",

@@ -584,7 +584,10 @@ float4 fs_glyph(GlyphVsOut i) : SV_Target0 {
             cov = clamp((blend_l - bg_l) / (fg_l - bg_l), 0.0, 1.0);
         }
     }
-    return float4(fg_lin, cov);
+    // Premultiplied into PREMULTIPLIED_OVER: the remapped coverage lies off the
+    // 1/255 lattice, and a blend unit that rounds its source alpha to the
+    // target's 8 bits rounds only the ground's share (see cell.glsl).
+    return float4(fg_lin * cov, cov);
 }
 
 // Colour-emoji glyphs: the atlas holds the CPU renderer's final RGBA pixels.
@@ -601,11 +604,13 @@ float4 fs_deco_over(GlyphVsOut i) : SV_Target0 {
     return float4(s2l(i.color.xyz), a);
 }
 
-// ADD (the profanity sparkle): premultiplied (rgb*a, a) into One/One.
+// ADD (the profanity sparkle): premultiplied (rgb*a, a) into One/One, the light
+// quantized to the CPU's byte, round(c*a*255)/255 == premul_rgb's (c*a + 127)/255:
+// a blend unit that holds its source short of f32 adds that byte.
 float4 fs_deco_add(GlyphVsOut i) : SV_Target0 {
     float cov = atlas_tex.Sample(atlas_samp, i.uv).x;
     float a = round((cov * i.color.w) * 255.0) / 255.0;
-    return float4(i.color.xyz * a, a);
+    return float4(round((i.color.xyz * a) * 255.0) / (255.0).xxx, a);
 }
 
 // RGBA8 sprites: the tint and opacity multiplies quantized to 8 bits before

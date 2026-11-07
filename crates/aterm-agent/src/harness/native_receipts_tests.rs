@@ -13,6 +13,9 @@ mod successor;
 #[path = "native_receipts_phase_tests.rs"]
 mod phase;
 
+#[path = "native_receipts_account_tests.rs"]
+mod accounts;
+
 fn fixture() -> (aterm_tempfile::TempDir, Paths, Prepare, Binding) {
     let home = aterm_tempfile::tempdir().unwrap();
     let paths = Paths::for_home(home.path());
@@ -113,6 +116,22 @@ fn acknowledged_noexec_survives_reopen_and_exact_retry_appends_nothing() {
         std::fs::read(directory(&paths).join("noexec.astream")).unwrap(),
         before
     );
+}
+
+#[test]
+fn lost_enrollment_after_key_capture_cannot_reenroll_an_existing_only_open() {
+    let (_home, paths, prepare, binding) = fixture();
+    record_event_at(&paths, &prepare, &binding, Some(Event::Prepare)).unwrap();
+    let key = existing_key(&paths).unwrap();
+    std::fs::rename(directory(&paths), paths.dir.join("saved-journal")).unwrap();
+    std::fs::rename(
+        paths.dir.join(ENROLLMENT),
+        paths.dir.join("saved-enrollment"),
+    )
+    .unwrap();
+    assert!(open_existing(&paths, &key, LIMITS).is_err());
+    assert!(!directory(&paths).exists());
+    assert!(!paths.dir.join(ENROLLMENT).exists());
 }
 
 #[test]
@@ -370,6 +389,7 @@ fn issuer_number(state: IssuerState) -> i64 {
         IssuerState::NoExec => 3,
         IssuerState::Sealed { may_execute: false } => 4,
         IssuerState::Sealed { may_execute: true } => 5,
+        IssuerState::Fenced => 6,
     }
 }
 

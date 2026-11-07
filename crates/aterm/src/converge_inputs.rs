@@ -10,6 +10,7 @@ use aterm_machines::init_github::{
 };
 use aterm_machines::port::{Live, System};
 use aterm_secrets::client::Paths;
+use aterm_secrets::converge::RepositoryWork;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::PathBuf;
@@ -110,35 +111,45 @@ impl Inputs {
         inputs
     }
 
-    fn changed(&mut self, sys: &dyn System, allowed: bool) -> bool {
+    fn changed(&mut self, sys: &dyn System, allowed: bool) -> Option<RepositoryWork> {
         if !allowed {
             self.held = true;
-            return false;
+            return None;
         }
         let Ok((mut metadata, reusable)) =
             Metadata::read(sys, &self.paths, self.seen.as_ref(), &mut self.control)
         else {
-            return false;
+            return None;
         };
         if reusable && !self.held && self.metadata.as_ref() == Some(&metadata) {
-            return false;
+            return None;
         }
         let Ok(mark) = repository_input_mark(sys) else {
-            return false;
+            return None;
         };
-        let changed = self.held
-            || self.seen.as_ref() != Some(&mark)
+        let work = if self.held
+            || self
+                .seen
+                .as_ref()
+                .is_none_or(|before| !before.same_source(&mark))
             || self
                 .metadata
                 .as_ref()
-                .is_none_or(|prev| prev.admission != metadata.admission);
+                .is_none_or(|prev| prev.admission != metadata.admission)
+        {
+            Some(RepositoryWork::Refresh)
+        } else if self.seen.as_ref() != Some(&mark) {
+            Some(RepositoryWork::Repair)
+        } else {
+            None
+        };
         // Retain the state captured with the semantic scope. Resampling after capture could
         // cache a later repair next to an earlier mark and swallow that repair on the next tick.
         metadata.checkouts = Some(mark.captured_checkout_metadata());
         self.metadata = Some(metadata);
         self.seen = Some(mark);
         self.held = false;
-        changed
+        work
     }
 }
 
@@ -153,7 +164,7 @@ pub(super) fn observe(
             && sys.euid() != 0
             && std::path::Path::new(&identity.user.home) == paths.home
     }) {
-        return Box::new(|| false);
+        return aterm_secrets::client::SubscriberInputs::new(Box::new(|| None));
     }
     let home = paths.home.clone();
     let allowed = move || {
@@ -162,7 +173,7 @@ pub(super) fn observe(
                 .holds(aterm_types::macos_setup::Setting::Repositories)
     };
     let mut inputs = Inputs::new(&sys, paths, allowed());
-    Box::new(move || inputs.changed(&sys, allowed()))
+    aterm_secrets::client::SubscriberInputs::new(Box::new(move || inputs.changed(&sys, allowed())))
 }
 
 #[cfg(test)]
@@ -286,10 +297,13 @@ mod tests {
             "parked setup sees the same repair"
         );
         assert!(
-            inputs.changed(&sys, true),
+            inputs.changed(&sys, true) == Some(RepositoryWork::Refresh),
             "the repaired execution route is new readiness"
         );
-        assert!(!inputs.changed(&sys, true), "one wake for the same repair");
+        assert!(
+            inputs.changed(&sys, true).is_none(),
+            "one wake for the same repair"
+        );
     }
 
     #[test]
@@ -373,7 +387,10 @@ mod tests {
             .unwrap()
             .0;
         let mut inputs = Inputs::new(&sys, &paths, true);
-        assert!(!inputs.changed(&sys, true), "blocked but unchanged");
+        assert!(
+            inputs.changed(&sys, true).is_none(),
+            "blocked but unchanged"
+        );
 
         std::fs::remove_file(&parent).unwrap();
         std::fs::rename(&held, &parent).unwrap();
@@ -387,13 +404,20 @@ mod tests {
                 .0
                 .files
         );
-        assert!(inputs.changed(&sys, true), "path admission repaired");
-        assert!(!inputs.changed(&sys, true), "one wake for the repair");
+        assert_eq!(
+            inputs.changed(&sys, true),
+            Some(RepositoryWork::Refresh),
+            "path admission repaired"
+        );
+        assert!(
+            inputs.changed(&sys, true).is_none(),
+            "one wake for the repair"
+        );
         let mut policy = Live::new().stat(&parent).unwrap();
         policy.len += 1;
         sys.stat_of(parent.to_str().unwrap(), policy);
         assert!(
-            !inputs.changed(&sys, true),
+            inputs.changed(&sys, true).is_none(),
             "unrelated directory contents do not move admission"
         );
     }
@@ -457,6 +481,7 @@ mod tests {
                 name == "gh_access_token"
                     || name == "github-repositories.json"
                     || name == "init.toml"
+                    || name == "installed-command.json"
             }) {
                 counted.fetch_add(1, Ordering::SeqCst);
             }
@@ -465,7 +490,7 @@ mod tests {
         let mut inputs = Inputs::new(&sys, &paths, true);
         private_reads.store(0, Ordering::SeqCst);
         for _ in 0..3 {
-            assert!(!inputs.changed(&sys, true));
+            assert!(inputs.changed(&sys, true).is_none());
         }
         assert_eq!(
             private_reads.load(Ordering::SeqCst),
@@ -474,11 +499,11 @@ mod tests {
         );
         sys.stat_of(&format!("{checkout}/.git"), directory);
         assert!(
-            inputs.changed(&sys, true),
+            inputs.changed(&sys, true) == Some(RepositoryWork::Repair),
             "an externally completed checkout is useful input"
         );
         private_reads.store(0, Ordering::SeqCst);
-        assert!(!inputs.changed(&sys, true));
+        assert!(inputs.changed(&sys, true).is_none());
         assert_eq!(
             private_reads.load(Ordering::SeqCst),
             0,
@@ -486,15 +511,34 @@ mod tests {
         );
         file(&format!("{checkout}/working.txt"), b"unrelated work");
         assert!(
-            !inputs.changed(&sys, true),
+            inputs.changed(&sys, true).is_none(),
             "ordinary worktree content is not observed"
         );
         file(&format!("{checkout}/.git/config"), b"repaired origin");
         assert!(
-            inputs.changed(&sys, true),
+            inputs.changed(&sys, true) == Some(RepositoryWork::Repair),
             "in-place Git identity repair is useful input"
         );
-        assert!(!inputs.changed(&sys, true));
+        assert!(inputs.changed(&sys, true).is_none());
+        for declared in [
+            b"[develop]\ncheckouts=['~/code']\n".as_slice(),
+            b"".as_slice(),
+        ] {
+            file(&profile, declared);
+            assert_eq!(inputs.changed(&sys, true), Some(RepositoryWork::Refresh));
+            private_reads.store(0, Ordering::SeqCst);
+            assert!(inputs.changed(&sys, true).is_none());
+            assert_eq!(
+                private_reads.load(Ordering::SeqCst),
+                0,
+                "settled refresh scope stays metadata-only"
+            );
+        }
+        file(&profile, b"[develop]\ncheckouts=[]\n");
+        assert!(
+            inputs.changed(&sys, true).is_none(),
+            "an empty declaration changes no refresh scope"
+        );
         for (path, bytes) in [
             (token.as_str(), b"inert_token_two".as_slice()),
             (helper.as_str(), b"helper two".as_slice()),
@@ -504,18 +548,72 @@ mod tests {
             ),
         ] {
             file(path, bytes);
-            assert!(inputs.changed(&sys, true), "changed declared input");
+            assert_eq!(
+                inputs.changed(&sys, true),
+                Some(RepositoryWork::Refresh),
+                "changed declared input"
+            );
             assert!(
-                !inputs.changed(&sys, true),
+                inputs.changed(&sys, true).is_none(),
                 "one wake for unchanged readiness"
             );
         }
+        let declaration = aterm_types::installed_command::path(std::path::Path::new(&user.home));
+        let custom = format!("{}/custom store/aterm", user.home);
+        let payload = format!("{}/custom payload/aterm", user.home);
+        sys.link(&custom, &payload);
+        let select = |path: &str| {
+            let bytes = aterm_types::installed_command::Selection::new(path.into())
+                .unwrap()
+                .encode()
+                .unwrap();
+            file(declaration.to_str().unwrap(), &bytes);
+        };
+        select(&custom);
+        assert!(
+            inputs.changed(&sys, true).is_some(),
+            "declared missing helper replaces legacy readiness"
+        );
+        assert!(inputs.changed(&sys, true).is_none());
+        private_reads.store(0, Ordering::SeqCst);
+        assert!(inputs.changed(&sys, true).is_none());
+        assert_eq!(
+            private_reads.load(Ordering::SeqCst),
+            0,
+            "settled declaration bytes stay unread"
+        );
+        file(&payload, b"arrived custom command");
+        assert!(
+            inputs.changed(&sys, true).is_some(),
+            "a dangling selected target repair wakes"
+        );
+        assert!(inputs.changed(&sys, true).is_none());
+        file(&helper, b"old legacy command changed");
+        assert!(
+            inputs.changed(&sys, true).is_none(),
+            "exclusive selection retires legacy paths"
+        );
+        let replacement_helper = format!("{}/replacement store/aterm", user.home);
+        select(&replacement_helper);
+        assert!(
+            inputs.changed(&sys, true).is_some(),
+            "declaration replacement is observed"
+        );
+        assert!(inputs.changed(&sys, true).is_none());
+        file(&payload, b"old custom command changed");
+        assert!(
+            inputs.changed(&sys, true).is_none(),
+            "old declared targets retire"
+        );
+        file(&replacement_helper, b"repaired replacement command");
+        assert!(inputs.changed(&sys, true).is_some());
+        assert!(inputs.changed(&sys, true).is_none());
         file(
             &format!("{}/.config/aterm/init.toml", user.home),
             b"[develop]\ncheckouts=[]\n",
         );
         assert!(
-            !inputs.changed(&sys, true),
+            inputs.changed(&sys, true).is_none(),
             "unrelated settings do not recreate a source change"
         );
         let selected = format!("{}/selected-token", user.home);
@@ -523,17 +621,20 @@ mod tests {
         let scoped = format!("[github]\naccount='fixture'\ntoken_file='{selected}'\n");
         file(&profile, scoped.as_bytes());
         assert!(
-            inputs.changed(&sys, true),
+            inputs.changed(&sys, true).is_some(),
             "a profile retarget is current input"
         );
-        assert!(!inputs.changed(&sys, true));
+        assert!(inputs.changed(&sys, true).is_none());
         private_reads.store(0, Ordering::SeqCst);
         file(&token, b"old_unselected_token");
-        assert!(!inputs.changed(&sys, true), "old token paths retire");
+        assert!(
+            inputs.changed(&sys, true).is_none(),
+            "old token paths retire"
+        );
         assert_eq!(private_reads.load(Ordering::SeqCst), 0);
         file(&selected, b"selected_token_two");
         assert!(
-            inputs.changed(&sys, true),
+            inputs.changed(&sys, true).is_some(),
             "new token path remains observed"
         );
         let parent = std::path::Path::new(&profile).parent().unwrap();
@@ -544,14 +645,14 @@ mod tests {
                 ..directory
             },
         );
-        assert!(inputs.changed(&sys, true));
-        assert!(!inputs.changed(&sys, true));
+        assert!(inputs.changed(&sys, true).is_some());
+        assert!(inputs.changed(&sys, true).is_none());
         sys.stat_of(parent.to_str().unwrap(), directory);
         assert!(
-            inputs.changed(&sys, true),
+            inputs.changed(&sys, true).is_some(),
             "unchanged-leaf parent admission repairs wake"
         );
-        assert!(!inputs.changed(&sys, true));
+        assert!(inputs.changed(&sys, true).is_none());
         let replacement = format!("{}/replacement-token", user.home);
         file(&replacement, b"replacement_token_one");
         let replacement_profile =
@@ -583,22 +684,25 @@ mod tests {
             format!("{scoped}# new selection read\n").as_bytes(),
         );
         assert!(
-            inputs.changed(&sys, true),
+            inputs.changed(&sys, true).is_some(),
             "a raced profile read is recaptured, not relabeled"
         );
-        assert!(!inputs.changed(&sys, true));
+        assert!(inputs.changed(&sys, true).is_none());
         file(&replacement, b"replacement_token_two");
         assert!(
-            inputs.changed(&sys, true),
+            inputs.changed(&sys, true).is_some(),
             "the raced-in selection remains observable"
         );
-        assert!(!inputs.changed(&sys, true));
+        assert!(inputs.changed(&sys, true).is_none());
         private_reads.store(0, Ordering::SeqCst);
         file(&replacement, b"inert_token_new");
-        assert!(!inputs.changed(&sys, false), "Stop/off holds the observer");
+        assert!(
+            inputs.changed(&sys, false).is_none(),
+            "Stop/off holds the observer"
+        );
         assert_eq!(private_reads.load(Ordering::SeqCst), 0);
         assert!(
-            inputs.changed(&sys, true),
+            inputs.changed(&sys, true) == Some(RepositoryWork::Refresh),
             "current authority resumes with fresh inputs"
         );
         assert!(

@@ -485,15 +485,21 @@ impl Connection {
             }
         }
     }
+    #[cfg(unix)]
     fn raw_source(&mut self, id: &str, end: Instant) -> Result<String, Failure> {
         remaining(end)?;
         match &mut self.source {
-            #[cfg(unix)]
             Source::Proton(shared) => Self::proton(shared, end, |mailbox| {
                 mailbox.read_source(id).map(|(message, _)| message.text)
             }),
             Source::Imap(_) => Err("Raw message source is unavailable for this mailbox".into()),
         }
+    }
+
+    #[cfg(not(unix))]
+    fn raw_source(&mut self, _id: &str, end: Instant) -> Result<String, Failure> {
+        remaining(end)?;
+        Err("Raw message source is unavailable for this mailbox".into())
     }
 
     fn select(&mut self, folder: &str, end: Instant) -> Result<(), Failure> {

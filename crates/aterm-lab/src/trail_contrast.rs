@@ -21,8 +21,10 @@ pub const CORE_SHARE: f64 = 0.70;
 pub use aterm_effects::rainbow_kitty::prism_glass::colour::{BLANK_BELOW, RING_REACH, SOLID_SHARE};
 /// The legibility bar the local measure counts pixels under (WCAG AA for text).
 pub const LEGIBLE: f64 = 4.5;
-/// The share of its own clean reading a glyph may lose before `--lowered-min` counts it as the
-/// effects' doing: the share the letter guard keeps a letter of (`letter_guard::OWN_SHARE`).
+/// The share of its own clean reading a glyph that reads under the bar on its clean twin may lose
+/// before `--lowered-min` counts it as the effects' doing: the share the letter guard keeps such a
+/// letter of (`letter_guard::OWN_SHARE`). A glyph that reads the bar or more on its twin keeps the
+/// bar ([`lowered_under`]).
 pub const LOWERED_SHARE: f64 = 0.97;
 /// A pixel the effects changed: a channel off by more than this.
 pub const DIFF_DELTA: u8 = 12;
@@ -52,7 +54,8 @@ counts where the whole cell's median ground would hide it; local_min is its wors
 (the letter guard keeps the same reading), or contrast for a glyph with no ground that near. Without a twin (--no-clean)
 the coarser `extreme` method is used. clean_local_contrast is local_contrast read on the twin itself: the glyph's own
 reading, low where the page draws it low (a coloured prompt segment). --lowered-min judges only what the effects did:
-a glyph under X that also reads under 97% of its own clean reading, so a page's own dim text is not the trail's.
+a glyph under X whose own clean reading is X or more, or that reads under 97% of that reading too, so a page's own dim text is
+not the trail's.
 The sidecars trail-gallery writes (.text.txt, .cursor.txt, .clean.png, .dims.txt) are read when present.
 
 exit: 0; 1 a threshold failed (--min: a selected cell, --newest-min: a glyph left of the caret, --caret-min: the caret's
@@ -729,11 +732,12 @@ fn clean_judged(cell: &J) -> Option<f64> {
         .or_else(|| cell.get("clean_contrast").and_then(J::as_f64))
 }
 
-/// Whether the effects took `cell` under `bar`: it reads under it, and under [`LOWERED_SHARE`] of
-/// its own clean reading ([`clean_judged`]).
+/// Whether the effects took `cell` under `bar`: it reads under it, and its own clean reading
+/// ([`clean_judged`]) reads the bar or more, or it reads under [`LOWERED_SHARE`] of that reading
+/// too (the letter guard's law: a letter at the bar keeps the bar, a dimmer one its share).
 fn lowered_under(cell: &J, bar: f64) -> bool {
     match (judged(cell), clean_judged(cell)) {
-        (Some(now), Some(own)) => now < bar && now < own * LOWERED_SHARE,
+        (Some(now), Some(own)) => now < bar && (own >= bar || now < own * LOWERED_SHARE),
         _ => false,
     }
 }

@@ -69,6 +69,7 @@ impl NativeFixture {
                 |raw, state, logins| {
                     let row = raw.row(&request.label).unwrap();
                     let staging = enrollment::Staging {
+                        native_row: None,
                         request: request.clone(),
                         store: bed.store.dir.canonicalize().unwrap(),
                         directory: stage.clone(),
@@ -211,6 +212,12 @@ fn required_native_recovery_joins_actual_code_response_across_publication_cuts()
             .published_grant(&fixture.request.label, result.generation.unwrap())
             .unwrap();
         assert!(logins.enrollment.authenticates_published_grant(&binding));
+        let witness = logins
+            .enrollment
+            .owner_witness(&binding)
+            .unwrap()
+            .expect("native publication must install its canonical owner witness");
+        assert!(witness.valid());
         let grant = crate::harness::codex_grant_owner::recover(
             &fixture.bed.env,
             &fixture.request,

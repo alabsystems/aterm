@@ -42,7 +42,7 @@ use crate::{
     },
     table::tests::Lab,
     typed::{
-        grid::tests::{Book, put},
+        grid::tests::{Book, elem, put},
         keys,
     },
 };
@@ -298,7 +298,6 @@ fn an_empty_view_waits_only_while_a_peer_holds_the_registry() {
         sent: None,
         received,
         deferred,
-        cause: None,
     };
     let recent = NOW - 60_000;
     let stale = NOW - 60 * 60_000;
@@ -311,7 +310,7 @@ fn an_empty_view_waits_only_while_a_peer_holds_the_registry() {
     assert!(
         waits(round(
             recent,
-            RepairOutcome::Failed,
+            RepairOutcome::Failed(aterm_types::network_state::RepairCause::Io),
             Some(RepairStage::Application),
             table,
             Some(1),
@@ -322,7 +321,7 @@ fn an_empty_view_waits_only_while_a_peer_holds_the_registry() {
     assert!(
         waits(round(
             recent,
-            RepairOutcome::Deferred,
+            RepairOutcome::Deferred(None),
             None,
             table,
             None,
@@ -334,7 +333,7 @@ fn an_empty_view_waits_only_while_a_peer_holds_the_registry() {
     // the registry it holds nothing back, since some peer of a large lab fails on every pass.
     let failed = round(
         recent,
-        RepairOutcome::Failed,
+        RepairOutcome::Failed(aterm_types::network_state::RepairCause::Io),
         Some(RepairStage::Application),
         table,
         None,
@@ -352,7 +351,7 @@ fn an_empty_view_waits_only_while_a_peer_holds_the_registry() {
     assert!(
         waits(round(
             recent,
-            RepairOutcome::Failed,
+            RepairOutcome::Failed(aterm_types::network_state::RepairCause::Io),
             Some(RepairStage::Transport),
             table,
             None,
@@ -416,7 +415,6 @@ fn the_labs_first_import_goes_on_a_drained_catalog_round() {
         sent: None,
         received,
         deferred,
-        cause: None,
     };
     let recent = NOW - 60_000;
     let stale = NOW - 60 * 60_000;
@@ -446,7 +444,7 @@ fn the_labs_first_import_goes_on_a_drained_catalog_round() {
     assert!(
         waits(round(
             recent,
-            RepairOutcome::Deferred,
+            RepairOutcome::Deferred(None),
             None,
             catalog,
             None,
@@ -457,7 +455,7 @@ fn the_labs_first_import_goes_on_a_drained_catalog_round() {
     // A failed catalog round says nothing: alone the import waits, beside a drained one it goes.
     let failed = round(
         recent,
-        RepairOutcome::Failed,
+        RepairOutcome::Failed(aterm_types::network_state::RepairCause::Io),
         Some(RepairStage::Application),
         catalog,
         None,
@@ -911,6 +909,37 @@ fn harness_files_are_read_and_a_bad_one_is_reported() {
     ]);
     let refused = run(paths, &named, Some(&Stand), &mut open, NOW).unwrap_err();
     assert!(!refused.to_string().contains("not rows"), "{refused}");
+}
+
+/// A harness file found beside the vault sheet that is a symlink (a dotfiles checkout's link into
+/// `~/.secrets`) is read through its link like a named one: a good one becomes a sheet, a bad one
+/// is reported in `unread`, and a dangling one is absent.
+/// NEGATIVE CONTROL: with `harness_sheets` keeping only paths whose `symlink_metadata` is a
+/// regular file, both links are dropped and the dry run refuses with `no sheet to import`.
+#[cfg(unix)]
+#[test]
+fn harness_files_found_through_a_symlink_are_read() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let secrets = paths.home.join(".secrets");
+    std::fs::create_dir_all(&secrets).unwrap();
+    let elsewhere = aterm_tempfile::tempdir().unwrap();
+    let pool = elsewhere.path().join("ai-pool.toml");
+    std::fs::write(&pool, "claude,ann@example.invalid,,m8 m9\n").unwrap();
+    let fleet = elsewhere.path().join("fleet-accounts.toml");
+    std::fs::write(&fleet, "not rows\n").unwrap();
+    std::os::unix::fs::symlink(&pool, secrets.join("ai-pool.toml")).unwrap();
+    std::os::unix::fs::symlink(&fleet, secrets.join("fleet-accounts.toml")).unwrap();
+    std::os::unix::fs::symlink(
+        elsewhere.path().join("gone.toml"),
+        secrets.join("ai-accounts-codex.toml"),
+    )
+    .unwrap();
+    EVERYONE.with(|held| held.set(Some(([0xab; 32], [0x11; 32]))));
+    let mut open = |_: &Path| Ok(());
+    let report = run(paths, &words(&["import"]), Some(&Stand), &mut open, NOW).unwrap();
+    assert_eq!(report["dry_run"], json!(true), "{report}");
+    assert_eq!(report["unread"], json!(["fleet-accounts.toml"]), "{report}");
 }
 /// `prefer` refuses a retired machine or account even when named by its primary key, while
 /// `unprefer` ends a lingering preference on a retired machine or account by label or key.
@@ -1811,7 +1840,7 @@ fn what_runs_on_a_machine_is_its_preferences_places_facts_and_sum() {
 
 /// A label a retired row and its live replacement share (the importer births the replacement
 /// for a retired m40 as `m40/2`, also labelled m40) names the live row, as the importer's
-/// `live_by_label` reads it; a label only a retired row holds still names that row, for its
+/// `rows_named` reads it; a label only a retired row holds still names that row, for its
 /// history; two live rows under one label name neither.
 /// NEGATIVE CONTROL: with `machine_named` counting every row alike (`found` in place of `live`),
 /// m40 names no row: `left: None right: Some("mc-new")`.
@@ -1991,6 +2020,154 @@ fn a_fleet_db_replica_imports_sealed_and_records_its_coverage() {
     assert!(!import::covered::read(&dir).unwrap().unwrap().covered);
     let check = verb(paths, &["check"]).unwrap();
     assert_eq!(check["registry"], json!("imported"), "{check}");
+}
+
+/// A replica's machine rows judge covered after a clean import: a row no Mac has joined stays
+/// `planned` and writes nothing on the next plan, with a stated node or without, where fleet_db's
+/// `active` for every row kept `status` and `src` of 38 live rows `unwritten`.
+/// NEGATIVE CONTROL: with `status_planned` reading only what this plan wants, as before, the second
+/// plan wants `active` on the held `planned` row: `` left: Bool(false) right: Bool(true) `` at
+/// `replica.covered`.
+#[test]
+fn a_replicas_machines_judge_covered_after_a_clean_import() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let dir = replica_fixture(paths, 1, "active");
+    {
+        let mut db = crate::fleet_db::open_at(&dir).unwrap();
+        for (label, node) in [
+            ("m50", json!(null)),
+            ("m51", json!("00112233445566778899aabbccddeeff")),
+        ] {
+            let row = json!({"label": label, "hostname": format!("{label}.local"),
+                "node_id": node, "make": "Apple", "status": "active"});
+            crate::fleet_db::put_row(&mut db, "computers", label, row).unwrap();
+        }
+    }
+    let mut never = |_: &Path| -> Result<()> { panic!("no review") };
+    let mut go = |list: &[&str]| run(paths, &words(list), Some(&Stand), &mut never, NOW);
+    let first = go(&["import", "--fleet-db", "--authoritative", "--apply"]).unwrap();
+    assert_eq!(first["replica"]["covered"], json!(true), "{first}");
+    assert_eq!(first["replica"]["uncovered"], json!(0), "{first}");
+    let rows = Registry::at(paths.clone())
+        .view()
+        .unwrap()
+        .project(&MACHINE);
+    let status = |label: &str| rows.rows[&keys::machine_pk(label)].get("status").cloned();
+    assert_eq!(status("m50"), Some(json!("planned")));
+    assert_eq!(status("m51"), Some(json!("planned")));
+    let again = go(&["import", "--fleet-db", "--authoritative", "--apply"]).unwrap();
+    assert_eq!(again["records"].as_u64(), Some(0), "{again}");
+    assert_eq!(again["replica"]["covered"], json!(true), "{again}");
+    assert!(import::covered::read(&dir).unwrap().unwrap().covered);
+}
+
+/// `merge` on a real lab: with no copy of the roster it refuses; a dry run names the two rows and
+/// writes nothing, `--apply` folds the duplicate into the node-bound row under the roster's name for
+/// the Mac, `check` no longer finds the name on two rows, and a second run has nothing to do. Both
+/// print keys, labels and columns, never a value.
+/// NEGATIVE CONTROL: with the verb applying on `--dry-run`, the dry run writes and says so: `` left:
+/// Bool(false) right: Bool(true) `` at `dry_run`. With the roster read as empty, the Mac keeps its
+/// old name: `` left: Object({"from": String("m36"), "to": String("m36")}) ``. With no refusal, a
+/// Mac with no roster plans anyway, and `unwrap_err` panics on the `Ok`.
+#[test]
+fn merge_dry_runs_then_folds_the_duplicate() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let (vault, logins) = sheets(scratch.path());
+    import(paths, &["--apply"], &vault, &logins, &mut Vec::new());
+    let keep = verb(paths, &["add", "machine", "m36"]).unwrap()["mc"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let gone = verb(paths, &["add", "machine", "m104"]).unwrap()["mc"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let handle = Handle::at(paths.clone(), &att::REGISTRY);
+    handle
+        .commit_owner(|_| {
+            let node = "00112233445566778899aabbccddeeff";
+            Ok((
+                (),
+                vec![vec![
+                    put(&MACHINE, &keep, "fleet_node", json!(node)),
+                    elem(&MACHINE, &keep, "aliases", "m104"),
+                    put(&MACHINE, &gone, "location", json!("Quiet Harbor")),
+                ]],
+            ))
+        })
+        .unwrap();
+    let held = verb(paths, &["check"]).unwrap();
+    assert!(
+        held["lab"].to_string().contains("label-ambiguous"),
+        "{held}"
+    );
+    let refused = verb(paths, &["merge", "--dry-run"]).unwrap_err();
+    assert!(refused.to_string().contains("no copy of it"), "{refused}");
+    let mut roster = aterm_secrets::client::admin_seed_swarm_roster(paths, &[]).unwrap();
+    roster.members[0].label = "m104".to_owned();
+    let admin = aterm_secrets::client::admin_open(paths).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(
+        &aterm_secrets::text::Audience::Everyone,
+        aterm_secrets::swarm_roster::ROSTER_ENTRY,
+        roster.to_toml().as_bytes(),
+    )
+    .unwrap();
+    aterm_secrets::client::admin_publish(paths, &admin, &doc).unwrap();
+    aterm_secrets::client::sync(paths, None).unwrap();
+    let rows = || {
+        Registry::at(paths.clone())
+            .view()
+            .unwrap()
+            .project(&MACHINE)
+    };
+    let dry = verb(paths, &["merge", "--dry-run"]).unwrap();
+    assert_eq!(dry["dry_run"], json!(true), "{dry}");
+    assert_eq!(dry["complete"], json!(true), "{dry}");
+    assert_eq!(dry["merges"][0]["keep"], json!(keep), "{dry}");
+    assert_eq!(dry["merges"][0]["gone"], json!([gone]), "{dry}");
+    assert_eq!(
+        dry["merges"][0]["label"],
+        json!({"from": "m36", "to": "m104"}),
+        "{dry}"
+    );
+    assert_eq!(
+        dry["merges"][0]["carried"][0]["column"],
+        json!("location"),
+        "{dry}"
+    );
+    assert!(dry["records"].as_u64().unwrap() > 0, "{dry}");
+    assert_eq!(rows().rows[&gone].lifecycle(), Some("live"));
+    assert_eq!(verb(paths, &["merge"]).unwrap()["dry_run"], json!(true));
+    let applied = verb(paths, &["merge", "--apply"]).unwrap();
+    assert_eq!(applied["dry_run"], json!(false), "{applied}");
+    for report in [&dry, &applied] {
+        assert!(!report.to_string().contains("Quiet Harbor"), "{report}");
+    }
+    let after = rows();
+    assert_eq!(after.rows[&gone].lifecycle(), Some("merged"));
+    assert_eq!(after.rows[&gone].get("merged_into"), Some(&json!(keep)));
+    assert_eq!(
+        after.rows[&keep].get("location"),
+        Some(&json!("Quiet Harbor"))
+    );
+    assert_eq!(after.rows[&keep].get("label"), Some(&json!("m104")));
+    assert!(
+        after.rows[&keep].fields["aliases"]
+            .members()
+            .contains("m36")
+    );
+    let settled = verb(paths, &["check"]).unwrap();
+    assert!(
+        !settled["lab"].to_string().contains("label-ambiguous"),
+        "{settled}"
+    );
+    let again = verb(paths, &["merge", "--apply"]).unwrap();
+    assert_eq!(again["written"], json!(0), "{again}");
+    assert_eq!(again["merges"], json!([]), "{again}");
 }
 
 /// A replica password shaped like a flag is covered only where it is a flag word that agrees

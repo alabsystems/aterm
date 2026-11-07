@@ -794,7 +794,9 @@ impl Sweep<'_> {
         let _ = writeln!(self.out, "atpkg: {line}");
     }
 
-    fn rm(&mut self, path: &Path, label: &str) {
+    /// Whether this call actually removed the owned entry, rather than planning,
+    /// finding it already absent, or leaving it in place.
+    fn rm(&mut self, path: &Path, label: &str) -> bool {
         if self.dry {
             let act = self.act();
             self.say(&format!("{act} {label}: {}", path.display()));
@@ -803,7 +805,7 @@ impl Sweep<'_> {
                 Ok(()) => self.say(&format!("removed {label}: {}", path.display())),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     self.say(&format!("gone already: {label}: {}", path.display()));
-                    return;
+                    return false;
                 }
                 Err(e) => {
                     let why = if self.as_root.is_some() {
@@ -817,11 +819,12 @@ impl Sweep<'_> {
                         path.display()
                     );
                     self.skipped += 1;
-                    return;
+                    return false;
                 }
             }
         }
         self.removed += 1;
+        !self.dry
     }
 
     /// Remove `path`: everything in it when `tree`, else only an empty folder. Under root it goes
@@ -1896,7 +1899,13 @@ fn self_uninstall_with_acaffeine(
                     .filter(|atpkg| atpkg.starts_with(&app));
                 match bundle_unproven(&mut s, p, &app, proven, hang) {
                     Some(why) => s.skip(&app.display().to_string(), &format!("kept: {why}")),
-                    None => s.rm(&app, "app bundle"),
+                    None => {
+                        let command = app.join("Contents/MacOS/aterm");
+                        let had_command = std::fs::symlink_metadata(&command).is_ok();
+                        if s.rm(&app, "app bundle") && had_command {
+                            remove_command_declaration(&mut s, p, &command);
+                        }
+                    }
                 }
             } else {
                 let why = bundle_identifier(&app).map_or_else(
@@ -1953,7 +1962,9 @@ fn self_uninstall_with_acaffeine(
         }
         let bin = bd.join("aterm");
         if bin_entry_is_ours(&bin, &p.store_dir) {
-            rm_link(&mut s, p, &bin, "aterm command");
+            if rm_link(&mut s, p, &bin, "aterm command") {
+                remove_command_declaration(&mut s, p, &bin);
+            }
         } else if let Some(t) = link_target(&bin) {
             s.skip(
                 &bin.display().to_string(),
@@ -2108,7 +2119,7 @@ fn self_uninstall_with_acaffeine(
     s.skipped == 0
 }
 
-fn rm_link(s: &mut Sweep<'_>, p: &Places, link: &Path, label: &str) {
+fn rm_link(s: &mut Sweep<'_>, p: &Places, link: &Path, label: &str) -> bool {
     match link_bundle(link) {
         Some(b) if other_aterm(p, &b) => {
             s.say(&format!(
@@ -2117,8 +2128,38 @@ fn rm_link(s: &mut Sweep<'_>, p: &Places, link: &Path, label: &str) {
                 b.display()
             ));
             s.kept += 1;
+            false
         }
         _ => s.rm(link, label),
+    }
+}
+
+fn remove_command_declaration(s: &mut Sweep<'_>, p: &Places, command: &Path) {
+    let our_uid = aterm_uds::peer::our_uid();
+    let owner = match home_as(our_uid, &p.home) {
+        RunAs::Me => Ok(our_uid),
+        RunAs::Account(uid) => Ok(uid),
+        RunAs::Nobody => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            NOT_AS_ROOT,
+        )),
+    };
+    match owner
+        .and_then(|uid| aterm_types::installed_command::remove_if_matches(&p.home, command, uid))
+    {
+        Ok(true) => {
+            s.say("removed the matching installed command declaration");
+            s.removed += 1;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            let _ = writeln!(
+                s.err,
+                "atpkg: SKIPPED installed command declaration after removing {}: {error}",
+                command.display()
+            );
+            s.skipped += 1;
+        }
     }
 }
 
@@ -2197,7 +2238,10 @@ fn sweep_store(s: &mut Sweep<'_>, p: &Places, acaffeine_kept: &[PathBuf]) {
         .partition(|entry| store_entry_is_ours(entry, run_as));
     let is_link = std::fs::symlink_metadata(store).is_ok_and(|m| m.file_type().is_symlink());
     if foreign.is_empty() && kept.is_empty() && !is_link {
-        s.rm(store, "source-built toolset");
+        let had_command = own.contains(&aterm);
+        if s.rm(store, "source-built toolset") && had_command {
+            remove_command_declaration(s, p, &aterm);
+        }
         return;
     }
     for entry in &kept {
@@ -2208,7 +2252,9 @@ fn sweep_store(s: &mut Sweep<'_>, p: &Places, acaffeine_kept: &[PathBuf]) {
         );
     }
     for entry in &own {
-        s.rm(entry, "source-built toolset entry");
+        if s.rm(entry, "source-built toolset entry") && entry == &aterm {
+            remove_command_declaration(s, p, &aterm);
+        }
     }
     if !foreign.is_empty() {
         let mut shown = foreign
@@ -2334,6 +2380,9 @@ fn hook_of(p: &Places, shell: &str) -> PathBuf {
 /// Options for [`shell_setup`].
 #[derive(Clone, Debug, Default)]
 pub struct Setup {
+    /// Explicitly record this placed command, only when it resolves to this
+    /// running executable. A declaration alone changes no shell integration.
+    pub installed_command: Option<PathBuf>,
     /// Wire the managed PATH block.
     pub path: bool,
     /// Write the shell completions.
@@ -2389,6 +2438,29 @@ pub fn shell_setup(
     }
     if setup.desktop {
         install_desktop_entry(p, env, setup.icons.as_deref(), setup.dry_run, out, err);
+    }
+    if let Some(command) = &setup.installed_command {
+        if setup.dry_run {
+            let _ = writeln!(
+                out,
+                "atpkg: would record installed command: {}",
+                command.display()
+            );
+        } else {
+            match aterm_types::installed_command::record(&p.home, command, exe) {
+                Ok(()) => {
+                    let _ = writeln!(
+                        out,
+                        "atpkg: recorded installed command: {}",
+                        command.display()
+                    );
+                }
+                Err(error) => {
+                    let _ = writeln!(err, "atpkg: installed command was not recorded: {error}");
+                    ok = false;
+                }
+            }
+        }
     }
     ok
 }
@@ -3004,11 +3076,17 @@ fn install_desktop_entry(
 /// [`crate::zdotdir::of_process`] learns it, so a `ZDOTDIR` this shell did not export is
 /// zsh's own answer, not `$HOME`.
 fn process_places() -> Option<Places> {
+    let mut places = process_places_from_env()?;
+    places.zdotdir = crate::zdotdir::of_process(&places.home);
+    Some(places)
+}
+
+fn process_places_from_env() -> Option<Places> {
     let home = aterm_types::dirs::home_dir()?;
     let account = crate::platform::account_home();
-    let mut places = places_from(&home, account.as_deref(), |name| std::env::var_os(name));
-    places.zdotdir = crate::zdotdir::of_process(&home);
-    Some(places)
+    Some(places_from(&home, account.as_deref(), |name| {
+        std::env::var_os(name)
+    }))
 }
 
 /// [`Places`] under `home` as the environment `var` reads them: an empty variable is unset,
@@ -3091,7 +3169,7 @@ pub fn self_uninstall_verb(rest: &[String]) -> ExitCode {
 /// CLI entry point for `aterm pkg shell-setup`.
 pub fn shell_setup_verb(rest: &[String]) -> ExitCode {
     const VERB: &str = "shell-setup";
-    let Some(mut places) = process_places() else {
+    let Some(mut places) = process_places_from_env() else {
         eprintln!("atpkg {VERB}: HOME is unset — no profile to wire");
         return ExitCode::from(2);
     };
@@ -3129,6 +3207,21 @@ pub fn shell_setup_verb(rest: &[String]) -> ExitCode {
                 Ok(())
             }
             "--icons" => take_dir(arg, &mut it, VERB).map(|d| setup.icons = Some(d)),
+            "--installed-command" => {
+                let path = it
+                    .next()
+                    .filter(|path| !path.is_empty() && !path.starts_with('-'));
+                match path {
+                    Some(path) => {
+                        setup.installed_command = Some(PathBuf::from(path));
+                        Ok(())
+                    }
+                    None => Err(crate::cli::usage_error(
+                        VERB,
+                        Some("--installed-command needs an absolute command path"),
+                    )),
+                }
+            }
             "--bin-dir" => take_dir(arg, &mut it, VERB).map(|d| places.bin_dir = d),
             "--man-root" => take_dir(arg, &mut it, VERB).map(|d| places.man_root = d),
             other => Err(crate::cli::usage_error(
@@ -3140,10 +3233,18 @@ pub fn shell_setup_verb(rest: &[String]) -> ExitCode {
             return code;
         }
     }
-    if !setup.path && !setup.completions && setup.man.is_none() && !setup.own_man && !setup.desktop
+    if !setup.path
+        && !setup.completions
+        && setup.man.is_none()
+        && !setup.own_man
+        && !setup.desktop
+        && setup.installed_command.is_none()
     {
         setup.path = true;
         setup.completions = true;
+    }
+    if setup.path {
+        places.zdotdir = crate::zdotdir::of_process(&places.home);
     }
     if setup.desktop && !cfg!(target_os = "linux") {
         println!("atpkg: desktop entry: skipped — an XDG desktop entry is a Linux desktop's");

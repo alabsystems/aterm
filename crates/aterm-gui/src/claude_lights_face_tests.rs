@@ -362,6 +362,7 @@ fn the_landed_words_say_what_aterm_checked() {
             check: false,
             said: said.to_owned(),
             at_ms: 0,
+            statement: aterm_agent::harness::land_receipt::Statement::Unread,
         }
     };
     let surfaces = |r: Option<&LandReceipt>| {
@@ -497,6 +498,7 @@ fn the_hovered_landed_title_keeps_what_aterm_checked_beside_the_footer() {
             "x".repeat(aterm_agent::harness::land_receipt::SAID_BYTES - 14)
         ),
         at_ms: 0,
+        statement: aterm_agent::harness::land_receipt::Statement::Unread,
     };
     let glass = told(TaskFace::Landed);
     let words = TitleWords {

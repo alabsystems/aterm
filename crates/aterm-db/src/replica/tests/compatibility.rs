@@ -381,6 +381,66 @@ fn native_atdb2_worker_retries_once_on_a_fresh_authenticated_channel() {
     assert_eq!(pair.count(1), 1);
 }
 
+/// A worker whose redial to an older peer fails (here refused: the peer's listener is gone once
+/// the first exchange runs) records that dial's cause at its transport, not the first exchange's
+/// probe failure, which the redial was there to recover from.
+/// NEGATIVE CONTROL: with the redial keeping what the first exchange left
+/// (`Endpoint::redial_keeps_first_attempt`, the worker before CS1), the same round reads as an
+/// application failure with the probe's cause, as the second half asserts.
+#[test]
+fn a_worker_redial_that_fails_is_recorded_with_its_dial_cause() {
+    use aterm_types::network_state::{RepairCause, RepairOutcome, RepairStage};
+    let recorded = |keeps_first_attempt: bool| {
+        let pair = log_pair();
+        let mut a = pair.endpoint(0, true);
+        a.redial_keeps_first_attempt = keeps_first_attempt;
+        let mut b = pair.endpoint(1, true);
+        b.legacy_projection = true;
+        // A plain socket, so closing it leaves the admitted connection's proof standing.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::scope(|scope| {
+            let server = scope.spawn(move || {
+                let stream = aterm_spec::wait::until_within(
+                    aterm_spec::wait::MUST_HAPPEN,
+                    "first application channel",
+                    || match listener.accept() {
+                        Ok((stream, _)) => Some(stream),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
+                        Err(error) => panic!("application listener failed: {error}"),
+                    },
+                );
+                // Nothing listens once the first exchange runs, so the worker's redial is refused.
+                drop(listener);
+                stream.set_nonblocking(false).unwrap();
+                let connection = Connection::admit(stream, LinkScope::Loopback).unwrap();
+                let mut repair = PeerRepair::default();
+                b.exchange(connection, Side::Responder, &mut repair)
+                    .unwrap();
+                assert!(repair.application_error().is_some());
+            });
+            let (_, success, report) =
+                crate::runtime::test_worker(a, address, PeerRepair::default());
+            server.join().unwrap();
+            assert!(!success);
+            report.observation().unwrap().1
+        })
+    };
+    let fixed = recorded(false);
+    assert_eq!(fixed.stage, Some(RepairStage::Transport));
+    assert_eq!(
+        fixed.outcome,
+        RepairOutcome::Failed(RepairCause::Unreachable)
+    );
+    let mutant = recorded(true);
+    assert_eq!(mutant.stage, Some(RepairStage::Application));
+    assert!(
+        matches!(mutant.outcome, RepairOutcome::Failed(cause) if cause != RepairCause::Unreachable),
+        "{mutant:?}"
+    );
+}
+
 /// This process's user plus system CPU time so far, as the kernel counts it.
 fn process_cpu() -> Duration {
     let pid = std::process::id();
@@ -530,7 +590,7 @@ fn one_root_policy_reads_report_their_retained_history_work() {
     let (application_allowed, application_reads, application_cpu) = observe(pair.scope.digest());
     assert!(catalog_allowed && application_allowed);
     assert_eq!(catalog_reads, Default::default());
-    assert!(application_reads.journal_read_attempts > 0);
+    assert!(application_reads.same_directory.lookups > 0);
     assert_eq!(application_reads.empty, Default::default());
     assert_eq!(application_reads.other_directory, Default::default());
     assert_eq!(application_reads.unavailable, Default::default());
@@ -689,7 +749,7 @@ fn quiet_rounds_observed(measured: u32, catalog: bool, history_reads: bool) {
     }
     if let Some(reads) = reads {
         assert!(
-            reads.journal_read_attempts > 0,
+            reads.same_directory.lookups > 0,
             "the actual cache must be observed"
         );
         eprintln!(
@@ -773,12 +833,14 @@ fn history_read_counts_value(
     ];
     assert_eq!(
         counts.journal_read_attempts,
-        rows.iter().map(|row| row.lookups).sum::<u64>()
+        rows.iter()
+            .map(|row| row.lookups - row.unmoved)
+            .sum::<u64>()
     );
     for row in rows {
         assert_eq!(
             row.lookups,
-            row.unchanged + row.extended + row.rebuilt + row.errors
+            row.unmoved + row.unchanged + row.extended + row.rebuilt + row.errors
         );
     }
     for row in [counts.empty, counts.other_directory, counts.unavailable] {
@@ -787,6 +849,7 @@ fn history_read_counts_value(
             "unchanged reuse requires a supplied prefix"
         );
         assert_eq!(row.extended, 0, "suffix replay requires a supplied prefix");
+        assert_eq!(row.unmoved, 0, "unmoved reuse requires a cached history");
     }
     assert_eq!(
         counts.replay_records_attempted,
@@ -803,6 +866,7 @@ fn history_read_counts_value(
     let row = |value: RetainedHistoryReadOutcomes| {
         aterm_json::json!({
             "lookups": value.lookups,
+            "unmoved": value.unmoved,
             "unchanged": value.unchanged,
             "extended": value.extended,
             "rebuilt": value.rebuilt,

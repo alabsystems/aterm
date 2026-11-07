@@ -7,9 +7,9 @@
 use aterm_scrollback::{Line, ScrollbackStorage};
 
 use super::Grid;
+use super::lazy_buffer::LazyBuffer;
 use super::reflow::{ReflowMode, ResizePolicy};
 use super::resize_handback::ResizeLaw;
-use super::scroll_convert::LazyBuffer;
 use super::state::{DetachedReaderAim, FillDebt, PendingScrollbackSettings};
 use crate::Damage;
 

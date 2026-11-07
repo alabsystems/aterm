@@ -322,9 +322,9 @@ fn version_names_build(text: &str, ok: bool, epoch: &str) -> Result<String, Stri
 pub fn cmd_smoke(args: &[String]) -> Res {
     let arches = parse_args(args)?;
     let l = Layout::find()?;
-    let _lock = windows::boot_lane(&l)?;
+    let mut lane = windows::boot_lane(&l)?;
     let results = state_dir()?;
-    let up = windows::bring_up(false)?;
+    let up = windows::bring_up(&mut lane, false)?;
     let repo = crate::paths::physical(&paths().repo);
     if let Err(e) = windows::copy_tree(&up.layout, &up.ssh, &repo) {
         up.release().map_err(Fail::die)?;

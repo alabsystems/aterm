@@ -3582,6 +3582,10 @@ impl App {
                     birth: capture_rescan_birth(now, ws.pending_deco_birth.take(), windowless),
                     cursor: live_viewport.then_some(grid_cursor),
                 });
+        // `trail status`'s `head_body=` is this frame's: a head gone since the last capture left
+        // its box in the status of every frame after it (the suspended branch's `open_words` does
+        // this), and the trail gallery read that box over the letters it no longer lay on.
+        ws.fx.cursor_mut().glow.note_head_body(None);
         let routed = crate::app_render::route_single_cursor_companion(
             ws,
             effect_geom,
@@ -14916,6 +14920,36 @@ mod headless_cursor_fx_tests {
             app.windows[&wid].fx.owner_space(),
             Some((terminal_id, true)),
             "decoration custody must stay on the screen paired with captured cells"
+        );
+    }
+
+    /// A captured frame that draws no head reports none, whatever the last one drew: the trail
+    /// gallery's status is read off captures.
+    #[test]
+    fn a_captured_frame_reports_only_the_head_it_drew() {
+        let mut app = App::headless_for_test();
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("fire".into());
+        let wid = WindowId(0);
+        let now = Instant::now();
+        let capture = app
+            .prepare_terminal_capture_grid_with_cursor_fx(
+                wid,
+                crate::app_render::ComposedCursorFxClock::Advance(now),
+            )
+            .expect("composed capture");
+        app.windows
+            .get_mut(&wid)
+            .expect("test window")
+            .fx
+            .cursor_mut()
+            .glow
+            .note_head_body(Some((1, 2, 3, 4)));
+        app.capture_words_sampled(wid, now, capture.focus.expect("focused capture sample"));
+        assert_eq!(
+            app.windows[&wid].fx.cursor().glow.head_body_window_box(),
+            None,
+            "the last frame's head stayed in this frame's status"
         );
     }
 

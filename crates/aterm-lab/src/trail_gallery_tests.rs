@@ -175,9 +175,12 @@ fn typed_gallery_resize_preserves_held_data_and_unknown_geometry_refuses() {
 
 fn focus_terminal(keys: &[u8]) -> aterm_core::terminal::Terminal {
     let mut output = Vec::new();
-    line_fixture(&mut std::io::Cursor::new(keys), &mut output, true, || {
-        Some((14, 32))
-    })
+    line_fixture(
+        &mut std::io::Cursor::new(keys),
+        &mut output,
+        LineMode::Focus,
+        || Some((14, 32)),
+    )
     .unwrap();
     let mut term = aterm_core::terminal::Terminal::new(14, 32);
     term.process(&output);
@@ -279,6 +282,10 @@ fn compiled_gallery_programs_preserve_an_occupied_script_and_argument_boundaries
         (Scenario::FoldRest, Some("fold")),
         (Scenario::FocusRoundtrip, Some("focus")),
         (Scenario::FocusWrap, Some("focus")),
+        (Scenario::LastRow, Some("last-row")),
+        (Scenario::Coloured, Some("coloured")),
+        (Scenario::Flood, Some("flood")),
+        (Scenario::RailG, Some("rail-g")),
     ] {
         let args = gallery_program(root.path(), scenario, Theme::Dark, &lab).unwrap();
         assert_eq!(args[0], lab.to_string_lossy().as_ref());
@@ -1150,6 +1157,494 @@ fn the_widened_scenarios_name_their_frames_and_paint_their_page() {
     for s in Scenario::ALL.into_iter().filter(|&s| s != Scenario::MoveUp) {
         assert!(!paint(s, Theme::Light).contains(MOVE_UP_MARK), "{s:?}");
     }
+}
+
+fn last_row_terminal(keys: &[u8], (rows, cols): (u16, u16)) -> aterm_core::terminal::Terminal {
+    let mut output = Vec::new();
+    line_fixture(
+        &mut std::io::Cursor::new(keys),
+        &mut output,
+        LineMode::LastRow,
+        || Some((rows, cols)),
+    )
+    .unwrap();
+    let mut term = aterm_core::terminal::Terminal::new(rows, cols);
+    term.process(&output);
+    term
+}
+
+/// `COLOURED` PAINTS EACH WORD IN ITS OWN INK, as a highlighter does, and in the theme's own once
+/// the line is killed, so its frames' clean twins hold the inks the glass must keep. NEGATIVE
+/// CONTROL: the typing fixture leaves the same line in the page's one ink.
+#[test]
+fn coloured_paints_each_word_in_its_own_ink() {
+    let run = |mode, keys: &[u8]| {
+        let mut output = Vec::new();
+        line_fixture(&mut std::io::Cursor::new(keys), &mut output, mode, || {
+            Some((14, 72))
+        })
+        .unwrap();
+        let mut term = aterm_core::terminal::Terminal::new(14, 72);
+        term.process(&output);
+        let frame = term.cell_frame(14, 72);
+        let row = &frame.cells[4];
+        let ink = |word: usize| {
+            let at = row
+                .iter()
+                .enumerate()
+                .filter(|(i, c)| c.ch == ' ' && *i > 1)
+                .nth(word.wrapping_sub(1))
+                .map_or(2, |(i, _)| i + 1);
+            row[at].fg
+        };
+        ink(0) != ink(1) && ink(1) != ink(2) && row[3].fg == ink(0)
+    };
+    assert!(run(LineMode::Coloured, b"echo the quick"));
+    assert!(run(LineMode::Coloured, b"echo\x15echo the quick"));
+    assert!(!run(LineMode::Typing, b"echo the quick"));
+}
+
+/// `FLOOD`'S SCREEN IS FULL OF WORDS, EACH IN AN INK OF ITS OWN, AND ITS KEYS TYPE THROUGH THEM TO
+/// THE LAST CELL with the page never scrolling: every place holds a word on the grid, no two words
+/// the screen has held (its own or a typed one) share an ink, and the typed word differs from the
+/// one it replaces. NEGATIVE CONTROL: the typing fixture leaves the same keys in one ink, and the
+/// screen scrolled by the same keys holds its first row no more.
+#[test]
+fn flood_fills_its_screen_with_words_in_their_own_inks_and_types_through_them() {
+    let (cols, rows, _) = Scenario::Flood.grid();
+    let (rows, cols) = (rows as usize, cols as usize);
+    let (grid_rows, grid_cols) = (rows as u16, cols as u16);
+    let places = rows * cols / FLOOD_WORD_CELLS;
+    assert_eq!(rows * cols, FLOOD_KEYS, "the default grid, a key a cell");
+    assert_eq!(rows * cols % FLOOD_WORD_CELLS, 0, "a word in every place");
+    let run = |keys: &[u8]| {
+        let mut output = Vec::new();
+        flood_fixture(&mut std::io::Cursor::new(keys), &mut output, || {
+            Some((grid_rows, grid_cols))
+        })
+        .unwrap();
+        let mut term = aterm_core::terminal::Terminal::new(grid_rows, grid_cols);
+        term.process(&output);
+        term
+    };
+    let word_at = |term: &mut aterm_core::terminal::Terminal, place: usize| {
+        let frame = term.cell_frame(rows, cols);
+        let (row, col) = (
+            place * FLOOD_WORD_CELLS / cols,
+            place * FLOOD_WORD_CELLS % cols,
+        );
+        let cells = &frame.cells[row][col..col + FLOOD_WORD_CELLS];
+        let text: String = cells.iter().map(|c| c.ch).collect();
+        assert!(cells[..5].iter().all(|c| c.fg == cells[0].fg), "{text}");
+        (text, cells[0].fg)
+    };
+
+    let mut laid = run(b"");
+    let frame = laid.cell_frame(rows, cols);
+    assert_eq!((frame.cursor_row, frame.cursor_col), (0, 0));
+    let mut inks = Vec::new();
+    for place in 0..places {
+        let (text, ink) = word_at(&mut laid, place);
+        assert_eq!(
+            text,
+            format!("{} ", FLOOD_WORDS[place % FLOOD_WORDS.len()]),
+            "place {place}"
+        );
+        inks.push(ink);
+    }
+
+    let text = flood_text();
+    assert_eq!(text.len(), FLOOD_KEYS);
+    let mut typed = run(text.as_bytes());
+    let frame = typed.cell_frame(rows, cols);
+    assert_eq!(frame.cursor_row, rows - 1, "typed to the last row");
+    for place in 0..places {
+        let (now, ink) = word_at(&mut typed, place);
+        let (was, _) = word_at(&mut laid, place);
+        assert_ne!(now, was, "place {place} holds a typed word");
+        assert_eq!(now.len(), FLOOD_WORD_CELLS);
+        inks.push(ink);
+    }
+    let held = inks.len();
+    inks.sort_by_key(|ink| format!("{ink:?}"));
+    inks.dedup();
+    assert_eq!(inks.len(), held, "no two words share an ink");
+
+    // One key further and the screen's top is typed again, unscrolled.
+    let again = run(format!("{text}g").as_bytes());
+    assert_eq!(again.row_text(0).unwrap().chars().next(), Some('g'));
+    assert_eq!(again.row_text(1), typed.row_text(1));
+
+    let mut plain = typed_terminal_at(&text.as_bytes()[..40], 72);
+    let row = &plain.cell_frame(14, 72).cells[4];
+    assert_eq!(row[2].fg, row[8].fg, "the typing fixture keeps one ink");
+}
+
+/// `FLOOD`'S FRAMES PRESS WHAT THE CARET'S TYPED RUN READS AS TYPED: every press in order, a frame's
+/// hop along a row no longer than [`FLOOD_KEYS_A_FRAME`], and each crossing of a wrap the three keys
+/// from a row's last two cells to the next row's second cell. A longer hop over a wrap reads as a
+/// jump and the ribbon stops on its first row (seen on a first try of this scene).
+#[test]
+fn flood_frames_fold_the_caret_over_each_wrap_as_typing() {
+    let frames = flood_frames(72, FLOOD_KEYS);
+    assert_eq!(frames.iter().sum::<usize>(), FLOOD_KEYS);
+    assert!(frames.iter().all(|&n| n > 0 && n <= FLOOD_KEYS_A_FRAME));
+    let (mut row, mut col) = (0, 0);
+    for keys in frames {
+        if col == 70 {
+            assert!(keys <= 3, "the wrap's fold, {keys} keys");
+            row += 1;
+            col = 1;
+        } else {
+            col += keys;
+            assert!(col <= 70 || row == 13, "{row},{col}");
+        }
+    }
+    assert_eq!(row, 14, "every row's fold, and the last row's tail");
+}
+
+/// The lights a frame's under stream holds through a real cursor step, publication and word yield,
+/// frame by frame, with the frames' keys `presses` on `flood`'s screen at the gallery's grid and pace
+/// and its GitHub Light; `railed`: with the yield's budget lifted, as if a frame's lights had no bound.
+#[cfg(target_os = "macos")]
+fn flood_lights(presses: &[usize], rest_ms: u64, railed: bool) -> Vec<usize> {
+    use aterm_core::terminal::{ClockReading, Rgb};
+    use aterm_effects::cursor_fx::CursorFxInput;
+    use aterm_effects::cursor_glow::glass_yield::with_no_light_budget;
+    use aterm_effects::cursor_glow::{Geom, GlowConfig, GlowStyle, Light, Live, ProbeTrust};
+    use aterm_effects::cursor_trail::TrailConfig;
+    use aterm_effects::host::{PageFacts, motion_print_anchor};
+    use aterm_effects::pipeline::{CursorStep, EffectsPipeline, RowProbe};
+    use aterm_render::{Renderer, Theme as RenderTheme, linear_luminance};
+
+    let (fg, bg) = (0x001f_2328_u32, 0x00ff_ffff_u32);
+    let (columns, lines, px) = Scenario::Flood.grid();
+    let (rows, cols) = (lines as usize, columns as usize);
+    let mut renderer = Renderer::from_system(px as f32, RenderTheme::default()).expect("a face");
+    renderer.debug_block_on_lazy_fallbacks();
+    let (cw, ch) = renderer.cell_size();
+    let admitted = PageFacts {
+        thin_ink: renderer
+            .glyph_ink()
+            .thin_share(linear_luminance(fg), linear_luminance(bg)),
+        ..PageFacts::OPAQUE
+    }
+    .glass();
+    assert!(admitted, "premise: the page takes the glass");
+    let mut term = aterm_core::terminal::Terminal::new(lines as u16, columns as u16);
+    term.set_default_foreground(Rgb {
+        r: 0x1f,
+        g: 0x23,
+        b: 0x28,
+    });
+    term.set_default_background(Rgb {
+        r: 0xff,
+        g: 0xff,
+        b: 0xff,
+    });
+    let mut screen = FloodScreen::new(lines as u16, columns as u16);
+    let mut bytes = Vec::new();
+    screen.lay(&mut bytes).unwrap();
+    term.process(&bytes);
+    let mut fx = EffectsPipeline::for_window();
+    let cfg = GlowConfig {
+        style: GlowStyle::RainbowKitty,
+        dark_theme: false,
+        theme_fg: fg,
+        theme_bg: bg,
+        color: fg,
+        duration: Duration::from_millis(650),
+        length: usize::MAX,
+        intensity: 1.0,
+        light: Light::at(Live::Glass).on_page(admitted),
+        ..Default::default()
+    };
+    let (w, h) = renderer.frame_size(rows, cols);
+    let geom = Geom {
+        cw,
+        ch,
+        rows,
+        cols,
+        origin_x: renderer.pad() as u16,
+        origin_y: renderer.grid_top() as u16,
+        win_w: w as u16,
+        win_h: h as u16,
+        head: 0,
+    };
+    let text = flood_text();
+    let t0 = ClockReading::now().monotonic;
+    let mut typed = 0;
+    let mut lights = Vec::new();
+    let mut row_cols = Vec::new();
+    let rest = (rest_ms / BURST_KEY_MS) as usize;
+    for frame in 0..presses.len() + rest {
+        let pressed = t0 + Duration::from_millis(frame as u64 * BURST_KEY_MS);
+        for at in typed..typed + presses.get(frame).copied().unwrap_or(0) {
+            fx.cursor_mut().glow.note_synthetic_typed(pressed, 1);
+            let mut bytes = Vec::new();
+            screen.key(&mut bytes, text.as_bytes()[at]).unwrap();
+            term.process_at(
+                &bytes,
+                ClockReading {
+                    monotonic: pressed,
+                    wall_ms: None,
+                },
+            );
+        }
+        typed += presses.get(frame).copied().unwrap_or(0);
+        let now = pressed + Duration::from_millis(BURST_KEY_MS / 2);
+        let base = term.cell_frame(rows, cols);
+        fx.cursor_mut()
+            .glow
+            .observe_glyph_ink(Some(renderer.glyph_ink_for(&base)));
+        let caret = (base.cursor_row as u16, base.cursor_col as u16);
+        term.row_cols_into(base.cursor_row, &mut row_cols);
+        fx.cursor_mut().glow.observe_ribbon_row(caret.0, &row_cols);
+        let (print_anchor, print_anchor_glyph) = motion_print_anchor(&term);
+        let _ = fx.cursor_step(
+            &CursorStep::new(
+                CursorFxInput {
+                    now,
+                    cur: Some(caret),
+                    live_viewport: true,
+                    cursor_style: term.cursor_style(),
+                    blink_phase: true,
+                    live_cursor: fg,
+                    cursor_color_pinned: false,
+                    default_bg: bg,
+                    cursor_cell_bg: None,
+                    geom,
+                    focused: true,
+                    shed_envelope: 1.0,
+                    trail_brightness: 1.0,
+                    body_allowed: true,
+                    momentum_glow: true,
+                    user_tinted: false,
+                    accent_pinned: false,
+                },
+                &cfg,
+                TrailConfig {
+                    enabled: false,
+                    duration: cfg.duration,
+                    max_len: cfg.length,
+                    color: cfg.color,
+                    intensity: cfg.intensity,
+                    warmth: 0.0,
+                },
+            )
+            .with_row_probe(Some(RowProbe {
+                row: caret.0,
+                caret: caret.1,
+                trust: ProbeTrust::Full,
+                cols: &row_cols,
+                flanks: None,
+            }))
+            .with_frame_cells(Some(base.cells.as_slice()))
+            .with_frame_cells_cols(base.cols)
+            .with_frame_marks(&base.combining)
+            .with_print_anchor(print_anchor)
+            .with_print_anchor_glyph(print_anchor_glyph),
+            std::iter::empty(),
+        );
+        let mut input = base.clone();
+        fx.publish_cursor(&mut input);
+        if railed {
+            with_no_light_budget(|| fx.yield_glass_unworded(&mut input));
+        } else {
+            fx.yield_glass_unworded(&mut input);
+        }
+        lights.push(input.glow_under_ramps.laid(input.glow_under.len()));
+    }
+    lights
+}
+
+/// `FLOOD` REACHES THE WORD YIELD'S FALLBACK, on the gallery's own grid and face: with the budget
+/// lifted its foot rails lay more lights than `CursorGlow::MAX_QUADS`; as it ships the frame that
+/// would is the first to differ, it keeps to the bound, and once the flood and the whole words' hold
+/// end a frame's lights match the railed lay again. The hold runs `WHOLE_WORDS_HOLD` from a
+/// refused try and no try is made while it holds, so it can end up to a hold past the last frame
+/// over the bound: the screen rests that long and two frames more. NEGATIVE CONTROL: the same
+/// screen typed by a typist, a key a frame, never comes near the bound.
+#[cfg(target_os = "macos")]
+#[test]
+fn flood_runs_the_word_yield_past_max_quads_and_it_takes_whole_words() {
+    use aterm_effects::cursor_glow::CursorGlow;
+    use aterm_effects::cursor_glow::glass_yield::WHOLE_WORDS_HOLD;
+
+    let (columns, _, _) = Scenario::Flood.grid();
+    let presses = flood_frames(columns as usize, FLOOD_KEYS);
+    let hold_ms = u64::try_from(WHOLE_WORDS_HOLD.as_millis()).expect("a hold of milliseconds");
+    let rest_ms = hold_ms + 2 * BURST_KEY_MS;
+    let railed = flood_lights(&presses, rest_ms, true);
+    let shipped = flood_lights(&presses, rest_ms, false);
+    let over: Vec<usize> = (0..railed.len())
+        .filter(|&f| railed[f] > CursorGlow::MAX_QUADS)
+        .collect();
+    let (&first, &last) = (over.first().unwrap(), over.last().unwrap());
+    assert!(
+        over.len() >= 5,
+        "the flood runs past the budget, at {over:?}, lights up to {}",
+        railed.iter().max().unwrap()
+    );
+    assert_eq!(railed[..first], shipped[..first], "railed until it passes");
+    assert!(
+        shipped.iter().all(|&l| l <= CursorGlow::MAX_QUADS),
+        "as it ships a frame keeps to the bound: {shipped:?}"
+    );
+    assert!(shipped[first] < railed[first], "the first frame past it");
+    assert!(last + 1 < railed.len(), "the ribbon outlasts the flood");
+    assert!(
+        (railed.len() - 1 - last) as u64 * BURST_KEY_MS >= hold_ms,
+        "the screen rests a hold past the last frame over the bound, {last} of {}",
+        railed.len()
+    );
+    assert_ne!(railed.last(), Some(&0), "the ribbon outlasts the flood");
+    assert_eq!(railed.last(), shipped.last(), "past the hold, the rail");
+    let typist = flood_lights(&vec![1; 60], 0, true);
+    assert!(
+        typist.iter().all(|&l| l < CursorGlow::MAX_QUADS / 2),
+        "{typist:?}"
+    );
+}
+
+/// `RAIL-G` LEAVES THE CARET JUST PAST THE `G` OF `LAZY DOG`, the burst's own line and pace, on a row
+/// under a row with a letter in every cell and blank rows below it, then, past a Ctrl+L that clears
+/// the line, on the grid's last row. NEGATIVE CONTROL: `last-row`'s line runs on past that `g` at
+/// each of the frames it keeps, and its `mid` stops short of it, so it shows none of this.
+#[test]
+fn rail_g_holds_the_caret_past_the_g_under_letters_and_on_the_last_row() {
+    let (columns, lines, font_px) = Scenario::RailG.grid();
+    assert_eq!(font_px, Scenario::LastRow.grid().2, "the gallery's 22 px");
+    let (rows, cols) = (lines as usize, columns as usize);
+    let (last, under) = (rows - 1, usize::from(RAIL_G_UNDER_ROW));
+    assert!(under + 1 < last, "the first line has blank rows below it");
+    assert!(BURST_TEXT.starts_with(RAIL_G_TEXT));
+    assert!(RAIL_G_TEXT.ends_with("lazy dog"));
+    let run = |keys: &[u8]| {
+        let mut output = Vec::new();
+        line_fixture(
+            &mut std::io::Cursor::new(keys),
+            &mut output,
+            LineMode::RailG,
+            || Some((lines as u16, columns as u16)),
+        )
+        .unwrap();
+        let mut term = aterm_core::terminal::Terminal::new(lines as u16, columns as u16);
+        term.process(&output);
+        term
+    };
+    let full: String = LAST_ROW_FULL.chars().cycle().take(cols).collect();
+    let row = |term: &aterm_core::terminal::Terminal, row: usize| {
+        term.row_text(row).unwrap().trim_end().to_string()
+    };
+    let past_g = |term: &mut aterm_core::terminal::Terminal, at: usize| {
+        let frame = term.cell_frame(rows, cols);
+        assert_eq!(
+            (frame.cursor_row, frame.cursor_col),
+            (at, 2 + RAIL_G_TEXT.len())
+        );
+        assert_eq!(frame.cells[at][1 + RAIL_G_TEXT.len()].ch, 'g');
+    };
+
+    let mut typed = run(RAIL_G_TEXT.as_bytes());
+    past_g(&mut typed, under);
+    assert_eq!(row(&typed, under), format!("$ {RAIL_G_TEXT}"));
+    assert_eq!(row(&typed, under - 1), full);
+    assert!(row(&typed, under + 1).is_empty(), "nothing under it");
+
+    let mut keys = RAIL_G_TEXT.as_bytes().to_vec();
+    keys.push(0x0c);
+    keys.extend_from_slice(RAIL_G_TEXT.as_bytes());
+    let mut again = run(&keys);
+    past_g(&mut again, last);
+    assert_eq!(row(&again, last), format!("$ {RAIL_G_TEXT}"));
+    assert_eq!(row(&again, last - 1), full);
+
+    // On `last-row` the caret is past that `g` only on its way, at no frame it keeps.
+    let at_key = |key: u64| 2 + key as usize + 1;
+    let g_cell = 2 + RAIL_G_TEXT.len();
+    assert_ne!(at_key(12), g_cell);
+    assert_ne!(at_key(BURST_FLY_KEY as u64), g_cell);
+    assert_ne!(2 + BURST_TEXT.len(), g_cell);
+}
+
+/// `LAST-ROW` TYPES ON THE GRID'S LAST ROW, UNDER LETTERS IT LAID ITSELF: the burst's line whole
+/// on that row under a row with a letter in every cell, ragged rows over that, every row above
+/// lettered; a Return leaves the prompt on that row under the answer, a row that reaches past the
+/// caret at `rmid` and ends short of it at the line's end. NEGATIVE CONTROL: the typing fixture's
+/// prompt has only blank rows over it, and `enter-bottom`'s page paints no letters.
+#[test]
+fn last_row_types_on_the_grids_last_row_under_full_and_ragged_rows() {
+    let (columns, lines, _) = Scenario::LastRow.grid();
+    let grid = (
+        u16::try_from(lines).unwrap(),
+        u16::try_from(columns).unwrap(),
+    );
+    let (rows, cols) = (usize::from(grid.0), usize::from(grid.1));
+    let last = rows - 1;
+    let over_the_prompt: String = LAST_ROW_FULL.chars().cycle().take(cols).collect();
+    let row = |term: &aterm_core::terminal::Terminal, row: usize| {
+        term.row_text(row).unwrap().trim_end().to_string()
+    };
+
+    let mut typed = last_row_terminal(BURST_TEXT.as_bytes(), grid);
+    let frame = typed.cell_frame(rows, cols);
+    assert_eq!(
+        (frame.cursor_row, frame.cursor_col),
+        (last, 2 + BURST_TEXT.len())
+    );
+    assert_eq!(row(&typed, last), format!("$ {BURST_TEXT}"));
+    assert_eq!(row(&typed, last - 1), over_the_prompt);
+    assert!(!over_the_prompt.contains(' '), "a letter in every cell");
+    let ragged = row(&typed, last - 2);
+    assert!(
+        LAST_ROW_RAGGED.contains(&ragged.as_str()) && ragged.len() < cols,
+        "{ragged}"
+    );
+    for at in 0..last {
+        assert!(!row(&typed, at).is_empty(), "row {at} has letters");
+    }
+
+    let mut keys = BURST_TEXT.as_bytes().to_vec();
+    keys.push(b'\r');
+    keys.extend_from_slice(TYPING_TEXT.as_bytes());
+    let mut answered = last_row_terminal(&keys, grid);
+    let frame = answered.cell_frame(rows, cols);
+    let caret_at_the_end = 2 + TYPING_TEXT.len();
+    assert_eq!(
+        (frame.cursor_row, frame.cursor_col),
+        (last, caret_at_the_end)
+    );
+    assert_eq!(row(&answered, last), format!("$ {TYPING_TEXT}"));
+    assert_eq!(row(&answered, last - 1), LAST_ROW_ANSWER);
+    assert_eq!(row(&answered, last - 2), format!("$ {BURST_TEXT}"));
+    assert_eq!(row(&answered, last - 3), over_the_prompt);
+    let caret_at_rmid = 2 + 13;
+    assert!(
+        caret_at_rmid < LAST_ROW_ANSWER.len() && LAST_ROW_ANSWER.len() < caret_at_the_end,
+        "the line runs under the answer and past its end"
+    );
+
+    // Any grid: the page keeps to its width, and Ctrl+L lays it again.
+    let mut narrow = last_row_terminal(b"echo\x0c", (6, 40));
+    assert_eq!(narrow.cell_frame(6, 40).cursor_row, 5);
+    assert_eq!(row(&narrow, 5), "$ echo");
+    assert_eq!(row(&narrow, 4).len(), 40);
+    assert!(!row(&narrow, 3).is_empty() && row(&narrow, 3).len() < 40);
+
+    let blank_over = typed_terminal(TYPING_TEXT.as_bytes());
+    assert_eq!(row(&blank_over, 4), format!("$ {TYPING_TEXT}"));
+    for at in 0..4 {
+        assert!(
+            row(&blank_over, at).is_empty(),
+            "control: row {at} is blank"
+        );
+    }
+    assert_eq!(
+        paint(Scenario::EnterBottom, Theme::Dark),
+        format!("{PAINT_HEAD}seq 1 40\nexec /bin/sh -i\n"),
+        "control: enter-bottom's rows are a command's short numbers"
+    );
 }
 
 fn rgb_png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {

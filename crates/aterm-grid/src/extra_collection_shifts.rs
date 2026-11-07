@@ -12,7 +12,17 @@ use crate::extra::{CellCoord, CellExtra};
 
 impl CellExtras {
     /// Shifts rows up within `[top, bottom]` by `n`, dropping `[top, top + n)` and compacting the row offset.
+    #[inline]
     pub(crate) fn shift_region_up_by(&mut self, top: u16, bottom: u16, n: u16) {
+        // A scroll region shifts every line feed; with no map entry and no ring there is nothing
+        // to move, and the call stays inline.
+        if self.data.is_empty() && !self.has_rings() {
+            return;
+        }
+        self.shift_region_up_by_held(top, bottom, n);
+    }
+
+    fn shift_region_up_by_held(&mut self, top: u16, bottom: u16, n: u16) {
         self.shift_rings_region_up(top, bottom, n);
         if n == 0 || self.data.is_empty() {
             return;
@@ -58,7 +68,15 @@ impl CellExtras {
     }
 
     /// Shifts rows down within `[top, bottom]` by `n`, dropping `[bottom - n + 1, bottom]` and compacting the row offset.
+    #[inline]
     pub(crate) fn shift_region_down_by(&mut self, top: u16, bottom: u16, n: u16) {
+        if self.data.is_empty() && !self.has_rings() {
+            return;
+        }
+        self.shift_region_down_by_held(top, bottom, n);
+    }
+
+    fn shift_region_down_by_held(&mut self, top: u16, bottom: u16, n: u16) {
         self.shift_rings_region_down(top, bottom, n);
         if n == 0 || self.data.is_empty() {
             return;

@@ -35,12 +35,13 @@ fn pipe() -> (RawFd, OwnedFd) {
 }
 
 /// One wait standing aside for a shell that reads `fd` to its end, armed as a front arms it, on a
-/// thread of its own.
+/// thread of its own. The shell's `cat` opens it by its `/dev/fd` name: a redirection names only
+/// a one-digit number in dash (Debian's and Ubuntu's `/bin/sh`), and `fd` is any free number.
 fn waiting(fd: RawFd) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let forwarding = super::arm_forwarding();
         let mut child = aterm_uds::spawnfd::transparent("/bin/sh")
-            .args(["-c", &format!("cat <&{fd} >/dev/null")])
+            .args(["-c", &format!("cat /dev/fd/{fd} >/dev/null")])
             .spawn()
             .expect("the shell");
         let status = super::wait_standing_aside(&mut child, forwarding).expect("waited");

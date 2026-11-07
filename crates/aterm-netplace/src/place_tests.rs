@@ -3,6 +3,9 @@
 
 use super::*;
 
+#[path = "place_temporal_tests.rs"]
+mod temporal;
+
 const HOME_HW: [u8; 6] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
 const CAFE_HW: [u8; 6] = [0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb];
 const PHONE_HW: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
@@ -146,7 +149,7 @@ fn a_new_network_no_member_answered_on_is_remote() {
             since_ms: Some(T0 + 10 * MIN)
         }
     );
-    assert_eq!((place.reachable, place.known), (0, Some(41)));
+    assert_eq!((place.heard, place.known), (0, Some(41)));
 }
 
 /// An expensive path is a phone hotspot: remote whoever answers on it, and never remembered
@@ -166,10 +169,7 @@ fn an_expensive_path_names_a_phone_hotspot_and_is_never_learned() {
         Some(&book(41)),
     );
     assert_eq!(place.at, Where::Remote(Kind::Hotspot { by_range: false }));
-    assert_eq!(
-        place.reachable, 3,
-        "the members on the hotspot are reachable"
-    );
+    assert_eq!(place.heard, 3, "the members on the hotspot are heard");
     assert_eq!(record.remembered.len(), 1, "the hotspot is never learned");
 }
 
@@ -216,7 +216,7 @@ fn enough_authenticated_members_in_one_stay_make_the_alab_lan_and_it_is_remember
     );
     assert_eq!(place.at, Where::AlabLan);
     assert_eq!(place.recognised, Some(Recognised::Members));
-    assert_eq!(place.reachable, 3);
+    assert_eq!(place.heard, 3);
     assert_eq!(record.remembered.len(), 1);
     let (_, back) = keep(
         record,
@@ -226,7 +226,7 @@ fn enough_authenticated_members_in_one_stay_make_the_alab_lan_and_it_is_remember
     );
     assert_eq!(back.at, Where::AlabLan);
     assert_eq!(back.recognised, Some(Recognised::Remembered));
-    assert_eq!(back.reachable, 0, "members not heard yet in this stay");
+    assert_eq!(back.heard, 0, "members not heard yet in this stay");
 }
 
 /// A fleet of two Macs never learns a network, however often they answer: three members, and a
@@ -381,7 +381,7 @@ fn a_gateway_not_yet_in_arp_reads_checking_then_a_weak_id_that_is_never_learned(
     );
     assert_eq!(place.at, Where::AlabLan);
     assert!(place.network.as_ref().is_some_and(NetworkId::is_strong));
-    assert_eq!(place.reachable, 3, "the stay and its evidence carried on");
+    assert_eq!(place.heard, 3, "the stay and its evidence carried on");
 }
 
 /// No default route and a path that cannot carry traffic is offline.
@@ -451,7 +451,7 @@ fn an_answer_off_this_networks_interface_or_stay_counts_for_no_network() {
         Some(&book(41)),
     );
     assert_eq!(place.at, Where::Remote(Kind::Lan));
-    assert_eq!(place.reachable, 0);
+    assert_eq!(place.heard, 0);
 }
 
 /// A home LAN split across routed segments (a VLAN, double NAT, a VM or Linux network): members

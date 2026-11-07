@@ -1805,6 +1805,7 @@ impl Root {
                 sid: stat.session,
                 has_tty: Some(stat.tty_nr != 0),
                 runnable_ns: None,
+                cores: None,
                 peak_footprint: None,
                 read_at,
                 coalition: None,

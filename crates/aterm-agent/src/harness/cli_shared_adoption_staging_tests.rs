@@ -64,7 +64,7 @@ fn observations(case: i64) -> Vec<aterm_spec::interp::State> {
     let evidence = fs::read(kept.join("retained-evidence")).unwrap();
     match case {
         7 => approval.live.store(false, Ordering::SeqCst),
-        8 => fs::write(
+        8 => crate::test_config::write(
             config_beside_for_test(&host.roster),
             "[harness]\nlogins = 'off'\n",
         )

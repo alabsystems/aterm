@@ -13,7 +13,7 @@ use aterm_phase::{ApiCause, Program};
 
 use super::super::config::{Autopilot, SupervisorConfig};
 use super::super::limit::ResetClock;
-use super::approval::QuestionPriority;
+use super::approval::PriorityWord;
 use super::exception::FUTILE_AFTER_TRIES;
 use super::go_ahead::{self, RULE_GO_AHEAD};
 use super::land_check;
@@ -10755,7 +10755,7 @@ pub(crate) fn is_continue_rule(rule: &str) -> bool {
 /// Whether `rule` answers a question the worker asked in prose.
 #[must_use]
 pub fn is_answer_rule(rule: &str) -> bool {
-    QuestionPriority::ALL
+    PriorityWord::ALL
         .into_iter()
         .any(|p| p.prose_rule_id() == rule)
 }
@@ -22697,10 +22697,6 @@ fn words_act(
         done,
         held,
     } = words;
-    debug_assert!(
-        cfg.question_priority != QuestionPriority::Land,
-        "Land's priority answers a dialog only; prose under Land is land_policy's"
-    );
     if reading.autopilot == Autopilot::Land {
         return Some(land_policy(state, reading, asked, done, budgeted));
     }

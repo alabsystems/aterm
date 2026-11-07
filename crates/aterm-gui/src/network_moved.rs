@@ -3,7 +3,7 @@
 
 //! THIS PROCESS'S "NETWORK MOVED" SIGNAL (docs/DESIGN-fluid-swarm-2026-10-28.md §3.5.2, F3c).
 //! Nothing carries the signal between processes, so the window and the node job each watch
-//! their own sources: the kernel's route socket ([`aterm_uds::network::RouteChanges`]), the one
+//! their own sources: the kernel's network-change socket ([`aterm_uds::network::RouteChanges`]), the one
 //! `_alab._tcp` browse a process holds, through the root LAN broker, which tells a member heard
 //! after every member's silence of [`aterm_secrets::discover::SILENCE`] and resolves what it
 //! holds to dial hints ([`hear_alab_tcp`]: the node job's,
@@ -39,10 +39,10 @@ pub(crate) enum Woke {
     Beacon,
     /// The network place settled ([`hear_place`], `aterm_netplace::moves`): the keeper read the
     /// new network, so it is usable now, told behind a route move's with only the flap rest
-    /// (`aterm_netplace::moves::REST_MS`). Off macOS and Linux nothing tells it, tests included
-    /// (they tell it on Unix).
+    /// (`aterm_netplace::moves::REST_MS`). The live source runs on macOS and Linux;
+    /// tests inject it on every platform.
     #[cfg_attr(
-        not(any(target_os = "macos", target_os = "linux")),
+        not(any(target_os = "macos", target_os = "linux", test)),
         expect(
             dead_code,
             reason = "the place source rides the route socket, macOS's and Linux's"
@@ -294,7 +294,7 @@ fn process() -> &'static Arc<Moved> {
     static PROCESS: OnceLock<Arc<Moved>> = OnceLock::new();
     PROCESS.get_or_init(|| {
         let moved = Arc::new(Moved::herded_by(process_spread(), members_here));
-        #[cfg(all(target_os = "macos", not(test)))]
+        #[cfg(all(any(target_os = "macos", target_os = "linux"), not(test)))]
         aterm_update::set_network_change_probe(updater_probe(&moved));
         start_sources(&moved);
         moved
@@ -303,7 +303,7 @@ fn process() -> &'static Arc<Moved> {
 
 /// Start this process's network observation for its automatic updater even
 /// when no fleet, account, or converge consumer has requested a watch yet.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn observe_for_updater() {
     if aterm_update::automatic() {
         let _ = process();
@@ -312,7 +312,7 @@ pub(crate) fn observe_for_updater() {
 
 /// Use a separate consuming watch so an updater check cannot steal another
 /// network consumer's notification. Keep the fleet's settling/spread policy.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn updater_probe(moved: &Arc<Moved>) -> Box<dyn Fn() -> bool + Send + Sync> {
     let watch = Mutex::new(moved.watch());
     Box::new(move || {
@@ -518,7 +518,7 @@ fn start_sources(moved: &Arc<Moved>) {
         hear_place(
             moved,
             aterm_netplace::record::dir(&state),
-            aterm_uds::network::RouteChanges::open(),
+            aterm_uds::network::RouteChanges::open().ok(),
             PLACE_LOOKS,
         );
     }
@@ -768,12 +768,15 @@ pub(crate) fn spawn_source(
 /// The route source: the kernel's route socket, each change of address or link a move.
 #[cfg(all(not(test), any(target_os = "macos", target_os = "linux")))]
 fn hear_routes(moved: &Arc<Moved>) {
-    let Some(changes) = aterm_uds::network::RouteChanges::open() else {
-        aterm_log::warn!(
-            "network moved: the kernel gave no route socket, so a change of network is heard \
-             only by the browse and the Commons beacon"
-        );
-        return;
+    let changes = match aterm_uds::network::RouteChanges::open() {
+        Ok(changes) => changes,
+        Err(why) => {
+            aterm_log::warn!(
+                "network moved: the kernel gave no route socket ({why}), so a change of network \
+                 is heard only by the browse and the Commons beacon"
+            );
+            return;
+        }
     };
     spawn_source(
         "aterm-moved-routes",

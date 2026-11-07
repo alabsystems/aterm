@@ -143,6 +143,7 @@ fn pre_promote_asks_the_commits_own_tree_and_leaves_no_worktree() {
             version: Some("0.104.0".into()),
             target,
             cutter: None,
+            gate: None,
             git_env: git.env.clone(),
         };
         let mut seen: Option<(PathBuf, String, PathBuf)> = None;
@@ -390,6 +391,97 @@ fn pre_promote_refuses_rather_than_check_some_other_code() {
         2
     );
     assert_eq!(worktrees(&git, &repo), 1);
+}
+
+/// Under a release's step 7, a check that passed takes the release's gate before the engine
+/// pushes: the push goes ahead where the gate was open, and nothing is pushed where the
+/// release's private sign went red first. A check that refused takes no gate.
+#[test]
+fn pre_promote_pushes_only_through_the_releases_open_gate() {
+    let (_dir, root, git) = scratch();
+    let (repo, first) = repo_with_history(&root, &git);
+    let gate = crate::release::PublishGate::at(root.join("logs/07-publish.gate"));
+    let facts = |gate: Option<&Path>| PrePromote {
+        commit: Some(first.clone()),
+        gate: gate.map(Path::to_path_buf),
+        git_env: git.env.clone(),
+        ..PrePromote::default()
+    };
+    let asks = |code: i32, gate: Option<&Path>| {
+        let mut check = |_: Asked<'_>, _: &str| Ok(code);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let got = pre_promote(&facts(gate), &repo, &mut check, &mut out, &mut err);
+        (got, String::from_utf8_lossy(&err).into_owned())
+    };
+
+    assert_eq!(
+        asks(0, Some(gate.path())).0,
+        0,
+        "an open gate: the push goes ahead"
+    );
+    assert_eq!(gate.word().unwrap().as_deref(), Some("push"));
+    assert!(
+        !gate.stop().unwrap(),
+        "the release then knows the push began"
+    );
+
+    gate.reset().unwrap();
+    assert!(gate.stop().unwrap(), "the release's stop came first");
+    let (code, err) = asks(0, Some(gate.path()));
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("nothing is pushed"), "{err}");
+
+    gate.reset().unwrap();
+    assert_eq!(
+        asks(1, Some(gate.path())).0,
+        1,
+        "the check's refusal is the hook's"
+    );
+    assert_eq!(gate.word().unwrap(), None, "a refused check takes no gate");
+
+    assert_eq!(asks(0, None).0, 0, "outside a release, no gate is asked");
+    let blocked = root.join("not-a-directory");
+    std::fs::write(&blocked, b"a file").unwrap();
+    let (code, err) = asks(0, Some(&blocked.join("07-publish.gate")));
+    assert_eq!(code, 2, "a gate that cannot be taken pushes nothing: {err}");
+}
+
+/// The gate's one word: whichever of the push and the stop comes first stands, whole, and every
+/// caller, racing, reads the same one.
+#[test]
+fn the_publish_gate_keeps_the_first_word_against_a_race() {
+    let (_dir, root, _) = scratch();
+    for round in 0..20 {
+        let gate = crate::release::PublishGate::at(root.join(format!("{round}/07-publish.gate")));
+        let won: Vec<(bool, bool)> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let gate = &gate;
+                    s.spawn(move || {
+                        let push = i % 2 == 0;
+                        let took = if push {
+                            gate.push().unwrap()
+                        } else {
+                            gate.stop().unwrap()
+                        };
+                        (push, took)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let word = gate.word().unwrap().unwrap();
+        assert!(word == "push" || word == "stop", "{word}");
+        for (push, took) in won {
+            assert_eq!(took, push == (word == "push"), "round {round}: {word}");
+        }
+        let dir = gate.path().parent().unwrap();
+        assert_eq!(
+            std::fs::read_dir(dir).unwrap().count(),
+            1,
+            "no temporary is left beside the gate"
+        );
+    }
 }
 
 fn astream_crate(dir: &Path, name: &str, deps: &str) {

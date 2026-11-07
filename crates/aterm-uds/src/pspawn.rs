@@ -15,6 +15,7 @@ use std::io;
 // Skip: bottoms out at the `posix_spawn` family of FFI calls.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn spawn_cloexec_default(program: &str, args: &[&str]) -> io::Result<u32> {
+    crate::spawnfd::note_spawn();
     use std::ffi::CString;
     type Attr = *mut core::ffi::c_void;
     type Actions = *mut core::ffi::c_void;

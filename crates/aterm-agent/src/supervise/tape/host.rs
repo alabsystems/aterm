@@ -17,6 +17,7 @@ use crate::harness::accounts::Sample;
 use crate::harness::acts::{Act, LandHeld, LandReceipt, TaskFace};
 use crate::harness::disk::Level;
 use crate::harness::hold_said::HoldSaid;
+use crate::harness::land_receipt::Statement;
 use crate::harness::leftover::LeftRead;
 use crate::harness::profile::AccountKey;
 use crate::harness::repo_work::{CleanAt, RepoRead, RepoWork};
@@ -1601,6 +1602,10 @@ struct CleanAtWire {
     /// and one with an empty branch writes none.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     branch: String,
+    /// What `head` states of how it was judged ([`CleanAt::statement`], design B10), as its
+    /// journal word ([`Statement::word`]); a tape recorded before it, and an unread one, hold none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stated: Option<String>,
 }
 
 /// [`RepoRead::Gone`] on a tape: `{"gone":"<folder>"}`, which neither a [`CheckedWire`] (no
@@ -1637,6 +1642,7 @@ impl TapeValue for RepoRead {
                     main_ref,
                     remote,
                     branch,
+                    statement,
                 } = at;
                 return json(&CheckedWire {
                     at: CleanAtWire {
@@ -1645,6 +1651,7 @@ impl TapeValue for RepoRead {
                         main_ref: main_ref.clone(),
                         remote: *remote,
                         branch: branch.clone(),
+                        stated: statement.word(),
                     },
                 });
             }
@@ -1690,12 +1697,20 @@ impl TapeValue for RepoRead {
             return Ok(RepoRead::Unread);
         }
         if let Ok(CheckedWire { at }) = of_json::<CheckedWire>(bytes) {
+            let statement = match at.stated.as_deref() {
+                None => Statement::Unread,
+                Some(word) => Statement::of_word(word).ok_or(CodecError {
+                    at: 0,
+                    why: "a checked reading's statement is no statement word",
+                })?,
+            };
             return Ok(RepoRead::Checked(CleanAt {
                 repo: at.repo,
                 head: at.head,
                 main_ref: at.main_ref,
                 remote: at.remote,
                 branch: at.branch,
+                statement,
             }));
         }
         if let Ok(GoneWire { gone }) = of_json::<GoneWire>(bytes) {

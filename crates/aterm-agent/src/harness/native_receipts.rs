@@ -21,6 +21,13 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+#[path = "native_receipts_account.rs"]
+mod account;
+pub use account::{
+    AccountObservation, AccountOutcome, AccountRelation, ClaimedState, claim_account_successor,
+    fence_account_successor, observe_account_successor, recover_account_successor,
+};
+
 const NAME: &str = "noexec";
 const ENROLLMENT: &str = "native-noexec.enrolled";
 const SUBJECT: &str = "native/noexec/1";
@@ -30,13 +37,18 @@ const ISSUER_BYTES: usize = BODY_BYTES + 1 + 32;
 const PHASE_SUBJECT: &str = "native/issuer/4";
 const SUCCESSOR_SUBJECT: &str = "native/successor/3";
 const SUCCESSOR_BYTES: usize = ISSUER_BYTES + 32;
+const ACCOUNT_SUBJECT: &str = "native/successor/4";
+const FENCE_SUBJECT: &str = "native/account-fence/4";
+const ACCOUNT_BYTES: usize = SUCCESSOR_BYTES + 1;
+const ACCOUNT_FRAME: usize = ACCOUNT_BYTES + ACCOUNT_SUBJECT.len() + aterm_journal::APPEND_OVERHEAD;
+const FENCE_FRAME: usize = ACCOUNT_BYTES + FENCE_SUBJECT.len() + aterm_journal::APPEND_OVERHEAD;
 const ISSUER_FRAME: usize = ISSUER_BYTES + ISSUER_SUBJECT.len() + aterm_journal::APPEND_OVERHEAD;
 const SUCCESSOR_FRAME: usize =
     SUCCESSOR_BYTES + SUCCESSOR_SUBJECT.len() + aterm_journal::APPEND_OVERHEAD;
 const LIMITS: Limits = Limits {
     records: 32_768,
     bytes: 16 * 1024 * 1024,
-    record_bytes: SUCCESSOR_BYTES,
+    record_bytes: ACCOUNT_BYTES,
 };
 
 type Digest = [u8; 32];
@@ -99,6 +111,7 @@ enum IssuerState {
     MayExecute,
     NoExec,
     Sealed { may_execute: bool },
+    Fenced,
 }
 
 impl IssuerState {
@@ -106,7 +119,7 @@ impl IssuerState {
         match self {
             Self::Prepared => 2,
             Self::MayExecute => 1,
-            Self::NoExec | Self::Sealed { .. } => 0,
+            Self::NoExec | Self::Sealed { .. } | Self::Fenced => 0,
         }
     }
 }
@@ -164,11 +177,15 @@ struct Entry {
     predecessor: Option<Digest>,
     successor: Option<Digest>,
     closed_phase: Option<ImagePhase>,
+    account: Option<account::Link>,
 }
 
 /// A verified observation, deliberately without any reusable native capability.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Observed {
+    /// Zero-based position of this exact record in the authenticated journal.
+    /// A retry retains the original position, independent of later appends.
+    pub sequence: u64,
     /// Local wall-clock timestamp, for attribution, not ordering or authorization.
     pub recorded_ms: u64,
 }
@@ -179,6 +196,8 @@ pub struct Observed {
 pub struct PhaseObserved {
     /// The phase explicitly committed by the original issuer.
     pub phase: ImagePhase,
+    /// Position of the original NoExec record, never the child's claim position.
+    pub sequence: u64,
     /// Local attribution time; it is not an ordering or authorization clock.
     pub recorded_ms: u64,
 }
@@ -217,6 +236,9 @@ impl View {
         )
     )]
     fn ingest(&mut self, key: &Key, body: &[u8]) -> io::Result<()> {
+        if body.starts_with(b"ANS4") || body.starts_with(b"ANF4") {
+            return account::ingest(self, key, body);
+        }
         let legacy = body.len() == BODY_BYTES && &body[..4] == b"ANE1";
         let issuer = body.len() == ISSUER_BYTES && &body[..4] == b"ANI2";
         let successor = body.len() == SUCCESSOR_BYTES && &body[..4] == b"ANI3";
@@ -262,6 +284,7 @@ impl View {
             old.and_then(|entry| entry.predecessor)
         };
         let retained_successor = old.and_then(|entry| entry.successor);
+        let account = old.and_then(|entry| entry.account);
         let (state, epoch) = if legacy {
             // An old reader rejects ANI2, so it cannot append legacy records
             // after opening an issuer history. Existing ANE1 receipts remain final.
@@ -274,15 +297,19 @@ impl View {
             if old.is_some_and(|old| old.receipt != receipt || old.epoch != Some(epoch)) {
                 return Err(invalid());
             }
-            (
-                if phased {
-                    Event::NoExec
-                } else {
-                    Event::parse(body[148])?
-                }
-                .advance(old.map(|old| old.state))?,
-                Some(epoch),
-            )
+            let event = if phased {
+                Event::NoExec
+            } else {
+                Event::parse(body[148])?
+            };
+            if event == Event::NoExec
+                && old.is_some_and(|old| {
+                    !account::permits_noexec(old, if phased { closed_phase } else { None })
+                })
+            {
+                return Err(invalid());
+            }
+            (event.advance(old.map(|old| old.state))?, Some(epoch))
         };
         let next_sequence = self.sequence.checked_add(1).ok_or_else(invalid)?;
         // Preserve the earlier conservative ANE1/ANI2 reservation size. New
@@ -306,6 +333,7 @@ impl View {
             Entry {
                 receipt,
                 observed: Observed {
+                    sequence: number(4),
                     recorded_ms: number(12),
                 },
                 state,
@@ -313,6 +341,7 @@ impl View {
                 predecessor,
                 successor: retained_successor,
                 closed_phase,
+                account,
             },
         );
         self.sequence = next_sequence;
@@ -487,9 +516,24 @@ fn record_subject(subject: &str, body: &[u8]) -> bool {
         || (subject == ISSUER_SUBJECT && body.starts_with(b"ANI2"))
         || (subject == SUCCESSOR_SUBJECT && body.starts_with(b"ANI3"))
         || (subject == PHASE_SUBJECT && body.starts_with(b"ANI4"))
+        || (subject == ACCOUNT_SUBJECT && body.starts_with(b"ANS4"))
+        || (subject == FENCE_SUBJECT && body.starts_with(b"ANF4"))
 }
 
 fn open(paths: &Paths, key: &Key, limits: Limits) -> io::Result<(Log, View)> {
+    open_with_enrollment(paths, key, limits, true)
+}
+
+fn open_existing(paths: &Paths, key: &Key, limits: Limits) -> io::Result<(Log, View)> {
+    open_with_enrollment(paths, key, limits, false)
+}
+
+fn open_with_enrollment(
+    paths: &Paths,
+    key: &Key,
+    limits: Limits,
+    may_enroll: bool,
+) -> io::Result<(Log, View)> {
     // Serialize enrollment as well as append across independent app processes.
     // This lock is acquired only on the control worker, never under native locks.
     let _enrollment = private_file::PrivateLock::take(
@@ -499,6 +543,9 @@ fn open(paths: &Paths, key: &Key, limits: Limits) -> io::Result<(Log, View)> {
         "native receipt enrollment is busy",
     )?;
     let established = enrolled(paths, key)?;
+    if !established && !may_enroll {
+        return Err(invalid());
+    }
     let dir = directory(paths);
     if !established {
         match std::fs::symlink_metadata(&dir) {
@@ -555,6 +602,19 @@ fn write_key(paths: &Paths) -> io::Result<Key> {
         }
     };
     Ok(Key::new(&identity))
+}
+
+// A closing record or successor consumes existing issuer history. Missing
+// custody must not enroll a new journal before discovering its parent is absent.
+fn existing_key(paths: &Paths) -> io::Result<Key> {
+    let identity = aterm_secrets::client::read_machine_identity(paths)
+        .map_err(|_| invalid())?
+        .ok_or_else(invalid)?;
+    let key = Key::new(&identity);
+    if !enrolled(paths, &key)? {
+        return Err(invalid());
+    }
+    Ok(key)
 }
 
 fn record_event_at(
@@ -672,6 +732,14 @@ fn receipt(key: &Key, prepare: &Prepare, binding: &Binding) -> io::Result<Receip
         reason = "The projection selects an independent physical byte cap before admission"
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountJournal",
+        action = "LegacyA",
+        project = "aterm_agent::harness::native_receipts::tests::accounts::model::transition"
+    )
+)]
 fn record_successor_at(
     paths: &Paths,
     predecessor: &Prepare,
@@ -690,11 +758,11 @@ fn record_successor_at(
     {
         return Err(invalid());
     }
-    let key = write_key(paths)?;
+    let key = existing_key(paths)?;
     let parent_receipt = receipt(&key, predecessor, predecessor_binding)?;
     let candidate = receipt(&key, prepare, binding)?;
     let epoch = key.digest(b"epoch\0", prepare.host_epoch.as_bytes());
-    let (mut log, view) = open(paths, &key, limits)?;
+    let (mut log, view) = open_existing(paths, &key, limits)?;
     let parent = view
         .entries
         .get(&parent_receipt.operation)
@@ -709,6 +777,7 @@ fn record_successor_at(
     }
     if let Some(old) = view.entries.get(&candidate.operation) {
         return if old.state == IssuerState::Prepared
+            && old.account.is_none()
             && old.receipt == candidate
             && old.epoch == Some(epoch)
             && old.predecessor == Some(parent_receipt.operation)
@@ -728,6 +797,7 @@ fn record_successor_at(
         ));
     }
     let observed = Observed {
+        sequence: view.sequence,
         recorded_ms: aterm_time::unix_millis().ok_or_else(invalid)?,
     };
     log.append(
@@ -913,6 +983,30 @@ fn record_event_at_limits(
         reason = "A transport can lose a response after the durable closure was recorded"
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountJournal",
+        action = "May",
+        project = "aterm_agent::harness::native_receipts::tests::accounts::model::transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountJournal",
+        action = "NoExec",
+        project = "aterm_agent::harness::native_receipts::tests::accounts::model::transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountJournal",
+        action = "Seal",
+        project = "aterm_agent::harness::native_receipts::tests::accounts::model::transition"
+    )
+)]
 fn record_with_phase_at_limits(
     paths: &Paths,
     prepare: &Prepare,
@@ -936,10 +1030,19 @@ fn record_with_phase_at_limits(
     if !valid_pair(prepare, binding) {
         return Err(invalid());
     }
-    let key = write_key(paths)?;
+    let may_enroll = event.is_none() || event == Some(Event::Prepare);
+    let key = if may_enroll {
+        write_key(paths)?
+    } else {
+        existing_key(paths)?
+    };
     let receipt = receipt(&key, prepare, binding)?;
     let epoch = key.digest(b"epoch\0", prepare.host_epoch.as_bytes());
-    let (mut log, view) = open(paths, &key, limits)?;
+    let (mut log, view) = if may_enroll {
+        open(paths, &key, limits)?
+    } else {
+        open_existing(paths, &key, limits)?
+    };
     let previous = view.entries.get(&receipt.operation);
     if let Some(old) = previous {
         if event == Some(Event::Prepare) && old.predecessor.is_some() {
@@ -955,6 +1058,9 @@ fn record_with_phase_at_limits(
         }
         if phase.is_some() && old.state == IssuerState::NoExec && old.closed_phase != phase {
             // A phase-less closure cannot acquire a guessed phase on retry.
+            return Err(invalid());
+        }
+        if event == Some(Event::NoExec) && !account::permits_noexec(old, phase) {
             return Err(invalid());
         }
         if event.map_or(old.state == IssuerState::NoExec, |event| {
@@ -974,6 +1080,7 @@ fn record_with_phase_at_limits(
         ));
     }
     let observed = Observed {
+        sequence: view.sequence,
         recorded_ms: aterm_time::unix_millis().ok_or_else(invalid)?,
     };
     let (subject, body) = if let Some(phase) = phase {
@@ -1077,6 +1184,7 @@ pub fn noexec_in_phase(
     )?;
     Ok(PhaseObserved {
         phase,
+        sequence: observed.sequence,
         recorded_ms: observed.recorded_ms,
     })
 }
@@ -1091,10 +1199,26 @@ pub fn observe_phase(prepare: &Prepare, binding: &Binding) -> io::Result<Option<
 
 #[cfg_attr(
     any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NoExecPhase",
+        action = "AppendOther",
+        reason = "The fixture interleaves an unrelated operation in the same authenticated journal"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
     aterm_spec_anchor::refines(
         machine = "NoExecPhase",
         action = "Read",
         project = "aterm_agent::harness::native_receipts::tests::phase::transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "TerminalPublication",
+        action = "Observe",
+        project = "aterm_gui::native_act::tests::publication::transition"
     )
 )]
 fn observe_phase_at(
@@ -1121,6 +1245,7 @@ fn observe_phase_at(
         .and_then(|entry| {
             entry.closed_phase.map(|phase| PhaseObserved {
                 phase,
+                sequence: entry.observed.sequence,
                 recorded_ms: entry.observed.recorded_ms,
             })
         }))
@@ -1232,14 +1357,6 @@ pub fn observe(binding: &Binding) -> io::Result<Option<Observed>> {
         project = "aterm_agent::harness::native_receipts::tests::issuer_transition"
     )
 )]
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::refines(
-        machine = "TerminalPublication",
-        action = "Observe",
-        project = "aterm_gui::native_act::tests::publication::transition"
-    )
-)]
 fn observe_at(paths: &Paths, binding: &Binding) -> io::Result<Option<Observed>> {
     let Some((key, view)) = read(paths)? else {
         return Ok(None);
@@ -1271,7 +1388,11 @@ fn observe_prepare_at(paths: &Paths, prepare: &Prepare) -> io::Result<Option<Obs
     Ok(view
         .entries
         .get(&key.operation(&prepare.id))
-        .filter(|entry| entry.state == IssuerState::NoExec && entry.receipt.prepare == digest)
+        .filter(|entry| {
+            entry.state == IssuerState::NoExec
+                && entry.account.is_none()
+                && entry.receipt.prepare == digest
+        })
         .map(|entry| entry.observed))
 }
 
@@ -1298,6 +1419,7 @@ pub mod testing {
         Prepare,
         MayExecute,
         NoExec,
+        NoExecInPhase(ImagePhase),
         Seal,
     }
 
@@ -1308,6 +1430,7 @@ pub mod testing {
         MayExecute,
         NoExec,
         Sealed { may_execute: bool },
+        Fenced,
     }
 
     /// The same admission and transition code used by the native issuer.
@@ -1332,13 +1455,14 @@ pub mod testing {
             binding: &Binding,
             event: Append,
         ) -> io::Result<Observed> {
-            let event = match event {
-                Append::Prepare => Event::Prepare,
-                Append::MayExecute => Event::MayExecute,
-                Append::NoExec => Event::NoExec,
-                Append::Seal => Event::Seal,
+            let (event, phase) = match event {
+                Append::Prepare => (Event::Prepare, None),
+                Append::MayExecute => (Event::MayExecute, None),
+                Append::NoExec => (Event::NoExec, None),
+                Append::NoExecInPhase(phase) => (Event::NoExec, Some(phase)),
+                Append::Seal => (Event::Seal, None),
             };
-            record_event_at(&self.paths, prepare, binding, Some(event))
+            record_with_phase_at_limits(&self.paths, prepare, binding, Some(event), phase, LIMITS)
         }
 
         /// Claim one successor using the production atomic journal transition.
@@ -1377,7 +1501,39 @@ pub mod testing {
                     IssuerState::MayExecute => State::MayExecute,
                     IssuerState::NoExec => State::NoExec,
                     IssuerState::Sealed { may_execute } => State::Sealed { may_execute },
+                    IssuerState::Fenced => State::Fenced,
                 }))
+        }
+
+        /// Exercise the production ANS4 writer with an isolated journal.
+        /// # Errors
+        /// Refuses an invalid relation, conflicting claim or damaged custody.
+        pub fn claim_account(
+            &self,
+            relation: AccountRelation<'_>,
+            binding: &Binding,
+        ) -> io::Result<AccountObservation> {
+            account::claim_at(&self.paths, relation, binding, LIMITS)
+        }
+
+        /// Recover an existing exact claim with the production durability path.
+        /// # Errors
+        /// Refuses mismatched relations, capabilities or damaged custody.
+        pub fn recover_account(
+            &self,
+            relation: AccountRelation<'_>,
+            binding: &Binding,
+        ) -> io::Result<Option<AccountObservation>> {
+            account::recover_at(&self.paths, relation, binding)
+        }
+
+        /// Count authenticated committed records, without returning their data.
+        /// # Errors
+        /// Refuses absent or damaged established custody.
+        pub fn record_count(&self) -> io::Result<u64> {
+            read(&self.paths)?
+                .map(|(_, view)| view.sequence)
+                .ok_or_else(invalid)
         }
 
         /// Read a terminal NoExec observation with the production reader.
@@ -1385,6 +1541,17 @@ pub mod testing {
         /// Refuses damaged or untrusted established custody.
         pub fn observe(&self, binding: &Binding) -> io::Result<Option<Observed>> {
             observe_at(&self.paths, binding)
+        }
+
+        /// Read the exact recorded phase without turning it into live authority.
+        /// # Errors
+        /// Refuses damaged or untrusted established custody.
+        pub fn observe_phase(
+            &self,
+            prepare: &Prepare,
+            binding: &Binding,
+        ) -> io::Result<Option<PhaseObserved>> {
+            observe_phase_at(&self.paths, prepare, binding)
         }
     }
 }

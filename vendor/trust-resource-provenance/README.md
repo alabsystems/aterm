@@ -1,5 +1,24 @@
 # trust-resource-provenance
 
+`program::HeldProgram` retains original executable/runtime files and selected
+directory observations for the new bounded metadata purpose. Its supported
+profile reads thin arm64 Mach-O load commands directly, including weak,
+reexport, lazy and upward loads; admits only checked sysroot `@rpath` leaves
+and OS dependencies; and regenerates the sole loader search path. It binds
+the actual suspended main image through the existing kernel reader. Keep it
+through real target retirement and validate its original inputs before
+accepting a comparison.
+
+This is explicitly held load-command input observation, with a local same-UID
+no-name-writer assumption and the OS loader/shared cache in the TCB. It is not
+an atomic DLL/namespace snapshot or the C cache's stronger runtime byte
+attestation. Outside-root ancestors keep original identity, ownership, mode
+and ACL checks; selected root/runtime directories and files keep full original
+stamps. Unrelated sibling activity cannot replace the original input. Do not
+use this new observation profile to relax existing authenticated test, compile
+or immutable cached-image validation. It supplies no CPU, GNU, memory, process,
+build, writer, source or proof authority.
+
 Read-only native discovery for the retained aterm resource custodian. Trust and
 aterm share this reader and the version-one Book/Record/FileId wire schema.
 The host remains responsible for publishing its immutable cache and account
@@ -27,3 +46,29 @@ ancestry cases. Shared-reader cases exercise an actual cached ancestor with a
 different loaded client image, post-reply image mutation, replaced backing,
 strict duplicate-free book parsing, bounded private files and Apple ACLs.
 Linux source has no execution qualification in this work.
+
+A native consumer can consume discovery with `Host::into_helper(deadline)`.
+`PinnedHelper` retains the original immutable image, account backing, socket
+parent and native host identity while closing the unused pre-HELLO stream.
+The actual helper reconnects for its operation. Cache this selection per root,
+then use `validate_child(&Child, deadline)` before delivering private data: the
+caller must hold the actual unreaped local helper, whose direct native parent,
+lifetime and loaded original image are checked. The local helper is never the
+hosted target. These checks grant no memory, CPU or launch authority.
+
+For a read-only operation the actual native producer can use
+`PinnedHelper::connect(deadline)` directly. It reconnects to the same original
+native peer and clones held image/socket backing instead of rehashing or
+selecting another record. Keep the returned `Host` alive through reply,
+post-response revalidation and ACK. This path needs no helper process or parent
+proof relay and carries no resource grant by itself.
+# Held metadata program observations
+
+`program::HeldProgram` retains selected executable/runtime inputs for bounded
+native metadata execution and checks the original held image against an actual
+native child. These are input observations, not source/writer authentication,
+an atomic loader namespace, resource authority or proof. Its explicit policy
+retains the system runtime as a TCB input and assumes no concurrent same-UID
+name writers. Existing custodian discovery and `PinnedProgram` authority checks
+remain unchanged. The maintained module was imported from aterm `77bd657741`
+alongside the canonical metadata controller.

@@ -114,10 +114,12 @@ fn cell_ground(px: &[u32], counts: &mut Vec<(u32, usize)>) -> Option<u32> {
 /// lab's `trail-contrast` judges a glyph against its clean twin (`twin`, the card with no
 /// light and no companion): its local contrast, what a reader sees round each stroke (each
 /// solid ink pixel against the median of the nearest ring, 1 then 2 px out, of pixels that
-/// are pure ground in the twin; the worst pixel row's lower median), the one reading the
-/// letter guard keeps; its whole-cell contrast (the median of its core ink against the median
-/// of its pure ground, as the frame has them) where no solid pixel has ground that near.
-/// `(reading, bare, row, col)` for each such letter, `bare` the same glyph read on the twin.
+/// are pure ground in the twin; the worst pixel row's lower median), and its whole-cell
+/// contrast (the median of its core ink against the median of its pure ground, as the frame
+/// has them), the lower of the two, the law the letter guard keeps (`letter_guard::ring`):
+/// the ring alone reads a tiny glyph's few solid pixels whole whatever burns elsewhere in its
+/// cell. `(reading, bare, row, col)` for each such letter, `bare` the same glyph read on the
+/// twin.
 /// A cell's ground is its most common colour in the twin, the first seen of a tie
 /// ([`cell_ground`]).
 ///
@@ -273,10 +275,9 @@ pub fn judged_letters(
                     least
                 };
                 let local = local_of(&solid).or_else(|| local_of(&cored));
-                // The ring round the strokes, what a reader sees round each one (the letter
-                // guard's one model, `letter_guard::ring`): the whole cell where no solid
-                // pixel has ground that near.
-                Some(local.unwrap_or(whole))
+                // The ring round the strokes, what a reader sees round each one, and the
+                // whole cell where that reads lower or no solid pixel has ground that near.
+                Some(local.map_or(whole, |local| local.min(whole)))
             };
             if let (Some(reading), Some(bare)) = (read(lit, &shown), read(twin, &clean)) {
                 out.push((reading, bare, row, col));

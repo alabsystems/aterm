@@ -751,8 +751,8 @@ fn a_new_server_yields_the_name_to_a_0_145_holder_that_answers() {
         lockers: Vec::new(),
     };
     let signed_seq4 = envelope::sign(&env_seq4, &seed).expect("sign seq 4");
-    std::fs::write(store_0145.join("alab.vault"), &signed_seq4).unwrap();
-    std::fs::write(store_new.join("alab.vault"), &signed_seq4).unwrap();
+    crate::fsx::write_owned_in_place(store_0145.join("alab.vault"), &signed_seq4);
+    crate::fsx::write_owned_in_place(store_new.join("alab.vault"), &signed_seq4);
 
     let listen_pinned = |store: &Path| {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
@@ -2988,7 +2988,7 @@ fn a_server_never_stores_an_envelope_the_pin_refuses() {
         lockers: Vec::new(),
     };
     let honest_bytes = envelope::sign(&honest_env, &honest_seed).unwrap();
-    std::fs::write(honest_dir.join("alab.vault"), &honest_bytes).unwrap();
+    crate::fsx::write_owned_in_place(honest_dir.join("alab.vault"), &honest_bytes);
 
     let forged_env = envelope::Unsigned {
         name: "alab".to_owned(),
@@ -2999,7 +2999,7 @@ fn a_server_never_stores_an_envelope_the_pin_refuses() {
         lockers: Vec::new(),
     };
     let forged_bytes = envelope::sign(&forged_env, &forger_seed).unwrap();
-    std::fs::write(forger_dir.join("alab.vault"), &forged_bytes).unwrap();
+    crate::fsx::write_owned_in_place(forger_dir.join("alab.vault"), &forged_bytes);
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let s_honest = crate::server::start(
@@ -3070,7 +3070,7 @@ fn a_held_0_145_server_job_moves_once_the_new_build_serves_its_store() {
     // Populate `m22`'s local server store (`m22.served()`) with the verified `alab.vault` copy.
     std::fs::create_dir_all(m22.served()).unwrap();
     let cached_bytes = std::fs::read(m22.cache_file()).expect("cached alab.vault");
-    std::fs::write(m22.served().join("alab.vault"), &cached_bytes).unwrap();
+    crate::fsx::write_owned_in_place(m22.served().join("alab.vault"), &cached_bytes);
     srv_seed.stop();
 
     struct RetiredGuard;
@@ -3517,7 +3517,7 @@ fn a_moved_server_serves_only_once_it_answers_with_the_alab_vault() {
         &seed,
     )
     .expect("signed");
-    std::fs::write(store.join("alab.vault"), signed).unwrap();
+    crate::fsx::write_owned_in_place(store.join("alab.vault"), signed);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let server = crate::server::start_with_clock(
         listener,
@@ -3590,7 +3590,7 @@ fn a_look_for_a_vault_books_no_plain_read() {
         &seed,
     )
     .expect("signed");
-    std::fs::write(store.join("looked.vault"), signed).unwrap();
+    crate::fsx::write_owned_in_place(store.join("looked.vault"), signed);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let server = crate::server::start_with_clock(
         listener,
@@ -3672,7 +3672,7 @@ fn the_windows_mend_moves_a_held_alab_server_only_watching_it_serve() {
         &seed,
     )
     .expect("signed");
-    std::fs::write(m22.served().join("alab.vault"), signed).unwrap();
+    crate::fsx::write_owned_in_place(m22.served().join("alab.vault"), signed);
     envelope::TEST_RETIRED.with(|cell| {
         *cell.borrow_mut() = Some(Retired {
             keys: Vec::new(),

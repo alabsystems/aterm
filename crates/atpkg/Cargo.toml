@@ -87,6 +87,9 @@ astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
 # CAP-1). Workspace crate; it adds aterm-sysprobe to the macOS graph, which the
 # `aterm` binary links already through aterm-gui.
 aterm-capacity = { workspace = true }
+# A build's or a test's telemetry row as its claim ends (`build_admit_telemetry`, Continuum
+# TM-1), through the log's one direct writer. Workspace crate; aterm-capacity links it already.
+aterm-telemetry = { workspace = true }
 # `FileLock` (flock LOCK_EX, the primitive aterm-update's apply/stage uses) serializes the
 # high-water floor's read-compare-write, so concurrent atpkg processes cannot move it down
 # (anti-rollback, CWE-362). Also `pick_slug`/`is_valid_slug` for `resolve_account()`.

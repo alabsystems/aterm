@@ -29,8 +29,9 @@ use aterm_spec::derive::*;
 /// batch also wraps S, a Mac with no seat, last, so the prefix may still decide S
 /// (`Log::undecided`): it holds `[everyone]`'s re-key, and Commons' too, which reads
 /// `[everyone]`'s leave-out. No record marks a batch's end, so a whole batch that ends in
-/// `Wrap`s reads as a prefix until its minter signs again: past `SETTLE_GRACE_MS` from first
-/// sight the hold ends whether the batch settled or not. Window 0 is every step before the
+/// `Wrap`s and could still wrap a Mac above its last one (S, which an earlier epoch wrapped)
+/// reads as a prefix until its minter signs again: past `SETTLE_GRACE_MS` from first sight the
+/// hold ends whether the batch settled or not. Window 0 is every step before the
 /// settle grace ends, window 1 the steps past it. `Rest` brings X the rest of A's batch. `mab`
 /// is what X held of A's batch when it first minted `[everyone]` (2 a prefix, 3 the whole), and
 /// `mt` the window.
@@ -57,7 +58,7 @@ use aterm_spec::derive::*;
 /// not reach mints its own, past the settle grace X mints each due audience whatever it holds
 /// of A's batch and whatever S's `Wrap` it lacks, and past its rank's step B mints though a head
 /// arrived since. The settle grace is that bound and claims nothing more: a batch that ends in
-/// `Wrap`s is closed only by it.
+/// `Wrap`s and could still wrap a Mac above its last one is closed only by it.
 ///
 /// Mutants: 1 every Mac's turn first at once, with no grace, as the exchange's repair once
 /// minted (`remove::UNRANKED`), so B mints its own rotation at its first pass; 2 a new head

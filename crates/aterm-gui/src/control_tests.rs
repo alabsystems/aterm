@@ -23070,7 +23070,16 @@ fn a_drives_home_relative_cwd_resolves_in_this_macs_home_and_stays_there() {
     for (rest, said) in [
         ("cwd=~/docs", "for a folder macOS guards"),
         ("cwd=~/vol", "for a folder macOS guards"),
-        ("cwd=~/data", "for a folder macOS guards"),
+        // Off macOS no data volume is mounted there: the walk finds no `/System`, before any
+        // spelling of a guarded folder.
+        (
+            "cwd=~/data",
+            if cfg!(target_os = "macos") {
+                "for a folder macOS guards"
+            } else {
+                "no such folder ~/data"
+            },
+        ),
         ("cwd=~/loop", "no such folder ~/loop"),
         ("cwd=$HOME/trust cwd=/private/tmp", "names one cwd="),
         (

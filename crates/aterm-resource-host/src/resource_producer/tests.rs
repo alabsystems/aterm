@@ -43,6 +43,7 @@ fn cached_helper_parent_challenge_and_stale_wrong_answer_refusals() {
     let scratch = std::mem::ManuallyDrop::new(aterm_tempfile::tempdir().unwrap());
     let root = std::fs::canonicalize(scratch.path()).unwrap();
     let store = aterm_capacity::host_executable::Store::prepare_at(&root.join("store")).unwrap();
+    aterm_capacity::host_executable::narrow_test_image();
     let program = store.cache_current().unwrap();
     let pinned = Arc::new(
         trust_resource_provenance::Store::open_at(&root.join("store"))

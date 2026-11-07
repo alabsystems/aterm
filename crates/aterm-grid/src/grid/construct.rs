@@ -7,7 +7,7 @@
 use aterm_scrollback::ScrollbackStorage;
 
 use super::ViewportRowCache;
-use super::scroll_convert::LazyBuffer;
+use super::lazy_buffer::LazyBuffer;
 use super::state::{FillDebt, GridCursorState, GridPresentationState, GridStorage};
 use super::{Cell, Grid, HorizontalMargins, PAGE_SIZE, PageStore, ScrollRegion};
 use crate::CellExtras;

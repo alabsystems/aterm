@@ -6,10 +6,11 @@
 # lease a run holds on the toolchain it resolved, the named lock and the interrupt
 # every wait for a lock or for capacity ends on, and the status digest a sealed
 # toolchain is rechecked by. Std only but for aterm-libc's signal declarations,
-# aterm-sysprobe's process sweep (a wait's stuck holder) and aterm-digest's SHA-256
-# (the status digest), so the check runner (aterm-verify), the libc oracle's gate
-# and the package manager (atpkg, which re-exports every module under its old path)
-# depend on it instead of compiling a file of another crate by `#[path]`.
+# aterm-sysprobe's process sweep (a wait's stuck holder), aterm-uds's account
+# home (where a wait is marked) and aterm-digest's SHA-256 (the status digest),
+# so the check runner (aterm-verify), the libc oracle's gate and the package
+# manager (atpkg, which re-exports every module under its old path) depend on it
+# instead of compiling a file of another crate by `#[path]`.
 
 [package]
 name = "aterm-toolchain"
@@ -41,6 +42,12 @@ aterm-digest = { workspace = true }
 # with no dependencies, which aterm-uds already links into every tool here.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+# Where this user's waits are marked (`waits::user_dir`): under the account database's home
+# (`aterm_uds::account::home`), whatever `$HOME` says, as the capacity ledger is kept, so a
+# tool under a scratch home marks where every session of this user reads. Workspace crate;
+# every crate that depends on this one already depends on it, and it does not depend on this
+# one.
+aterm-uds = { workspace = true }
 
 [dev-dependencies]
 # The lease tests' scratch prefixes, and their one-minute hang detector.

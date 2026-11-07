@@ -6,6 +6,7 @@
 // `DONE` note, read back by the next loop with that note's seq, dropped once the face moves.
 
 use crate::harness::acts::LandReceipt;
+use crate::harness::land_receipt::Statement;
 use crate::harness::repo_work::{CleanAt, RepoRead};
 
 const RECEIPT_DOOR: &str = "host.land_receipt";
@@ -92,12 +93,18 @@ impl IdleHost for Receipts {
 
 /// A clean repository at `head`, on `origin/main`.
 fn on_main(head: &str) -> RepoRead {
+    on_main_stating(head, Statement::Unread)
+}
+
+/// [`on_main`], its head stating `statement` of how it was judged (design B10).
+fn on_main_stating(head: &str, statement: Statement) -> RepoRead {
     RepoRead::Checked(CleanAt {
         repo: "/Users//a/Developer/parser".into(),
         head: head.into(),
         main_ref: "origin/main".into(),
         remote: true,
         branch: "main".into(),
+        statement,
     })
 }
 
@@ -264,6 +271,69 @@ fn the_receipt_is_told_before_the_face() {
             Told::Face(TaskFace::Landed),
         ],
         "a plain folder's landing: {lines:#?}"
+    );
+}
+
+/// A HEAD THAT STATES NO RECEIPT NEVER HOLDS A LANDING (design B10): a landing whose head states
+/// how it was judged and one whose head states nothing land alike, the same faces in the same
+/// order; each receipt records what its head states, and its journal line says so (`stated=`).
+/// NEGATIVE CONTROL: the two receipts differ in their statement alone.
+#[test]
+fn a_landing_lands_alike_whether_its_head_states_a_receipt_or_none() {
+    let judged = Statement::Stated(crate::harness::land_receipt::Judgment {
+        tree: "0a1b2c3d4e5f".into(),
+        rejudges: 0,
+        onto: String::new(),
+        inherited: 0,
+        secs: 2712,
+    });
+    let mut receipts = Vec::new();
+    for (name, statement) in [
+        ("receipt-stated", judged),
+        ("receipt-missing", Statement::Missing),
+    ] {
+        let (dir, ledger) = files(name, &[], &[]);
+        let host = Receipts::over(on_main_stating(HEAD, statement.clone()), None);
+        let (lines, turns) =
+            run_receipts(a_landing(), LANDING_GATES.to_vec(), &host, Some(&ledger));
+        assert_eq!(turns, 2, "the instruction, then the land check: {lines:#?}");
+        let told = host.told();
+        let Some(Told::Receipt(Some(receipt))) = told.get(1).cloned() else {
+            panic!("{name}: {told:#?}");
+        };
+        assert_eq!(
+            told,
+            [
+                Told::Face(TaskFace::Open),
+                Told::Receipt(Some(receipt.clone())),
+                Told::Face(TaskFace::Landed),
+            ],
+            "{name}: {lines:#?}"
+        );
+        assert_eq!(receipt.statement, statement, "{name}");
+        let ends = ends(&ledger);
+        let [(done, _, _), (line, _, _)] = &ends[..] else {
+            panic!("{name}: one DONE note, then its receipt: {ends:#?}");
+        };
+        assert!(landed_note(done), "{done}");
+        assert_eq!(*line, receipt.line(seq_of(done)), "{ends:#?}");
+        let word = statement.word().expect("a read statement");
+        assert!(line.contains(&format!(" stated={word} ")), "{line}");
+        receipts.push(receipt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let [stated, missing] = &receipts[..] else {
+        panic!("{receipts:#?}");
+    };
+    assert_ne!(stated.statement, missing.statement);
+    assert_eq!(
+        LandReceipt {
+            statement: Statement::Missing,
+            at_ms: missing.at_ms,
+            ..stated.clone()
+        },
+        *missing,
+        "only the statement differs"
     );
 }
 

@@ -4,8 +4,10 @@
 //! A Commons observation reads each file it holds at most once (a pinned layout opens its data file
 //! twice, validated and then read), and what is on disk when it starts is what it sees, whichever
 //! memo of exact bytes the last one left behind. The counts are what [`fsx::reads_under`] sees: the
-//! lock, the layout directory and the journal's own files are not among them, and the journal
-//! counts as one read of `frontiers.checkpoint`.
+//! lock, the layout directory and the journal's own files are not among them, and a read of the
+//! journal counts as one read of `frontiers.checkpoint`. The process-wide history cache reads it
+//! only where a journal file moved since it last validated it, which the tests running beside
+//! each other decide, so the checkpoint is held to at most one read, not to exactly one.
 
 use super::*;
 use crate::commons::{Observation, Unavailable};
@@ -55,13 +57,6 @@ fn vault_files(paths: &Paths) -> Vec<PathBuf> {
     ]
 }
 
-/// [`vault_files`] of a vault holding a log, its journal acknowledging it.
-fn logged_vault_files(paths: &Paths) -> Vec<PathBuf> {
-    let mut files = vault_files(paths);
-    files.push(paths.dir.join("frontiers.checkpoint"));
-    files
-}
-
 /// `lab` with an applied roster that denies a node, so that a denial check needs this Mac's device
 /// binding, and `m7` holding the version and its records.
 fn with_a_denied_node(lab: &TwoMacs) {
@@ -93,7 +88,7 @@ fn an_observation_of_an_applied_vault_reads_each_file_once() {
     let _answering = ServersAnswering::set();
     let lab = two_macs(&[]);
     with_a_denied_node(&lab);
-    let mut expected = logged_vault_files(&lab.m7);
+    let mut expected = vault_files(&lab.m7);
     expected.extend([
         lab.m7.cache_file(),
         lab.m7.records_file(),
@@ -119,7 +114,7 @@ fn an_observation_under_a_pinned_records_layout_opens_its_data_twice_and_the_res
     let _answering = ServersAnswering::set();
     let lab = two_macs(&[]);
     drop(crate::records_storage::write_path(&lab.m7.records_file(), true).unwrap());
-    let mut expected = logged_vault_files(&lab.m7);
+    let mut expected = vault_files(&lab.m7);
     expected.extend([
         lab.m7.cache_file(),
         lab.m7.dir.join("records.layout"),
@@ -143,7 +138,7 @@ fn an_observation_of_a_log_only_vault_reads_each_file_once() {
     let _answering = ServersAnswering::set();
     let (_root, paths, _config, state) = log_only_tests::applied_log();
     assert_eq!(state.digest, None);
-    let mut expected = logged_vault_files(&paths);
+    let mut expected = vault_files(&paths);
     expected.push(paths.records_file());
     let (observed, reads) = observed_with_reads(&paths);
     assert!(is_visible(&observed), "{observed:?}");
@@ -200,7 +195,7 @@ fn a_roster_read_of_an_applied_vault_reads_each_file_once() {
     let _answering = ServersAnswering::set();
     let lab = two_macs(&[]);
     with_a_denied_node(&lab);
-    let mut expected = logged_vault_files(&lab.m7);
+    let mut expected = vault_files(&lab.m7);
     expected.extend([lab.m7.cache_file(), lab.m7.records_file()]);
     let (roster, reads) = roster_with_reads(&lab.m7);
     assert!(roster.unwrap().unwrap().is_label_denied("m99"));
@@ -215,7 +210,7 @@ fn a_roster_read_of_a_log_only_vault_reads_each_file_once() {
     let _answering = ServersAnswering::set();
     let (_root, paths, _config, state) = log_only_tests::applied_log();
     assert_eq!(state.digest, None);
-    let mut expected = logged_vault_files(&paths);
+    let mut expected = vault_files(&paths);
     expected.push(paths.records_file());
     let (roster, reads) = roster_with_reads(&paths);
     assert!(roster.unwrap().is_some());
@@ -251,7 +246,6 @@ fn a_commons_log_read_reads_each_file_once() {
             lab.m7.source_file(),
             lab.m7.records_file(),
             lab.m7.dir.join("records.frontiers"),
-            lab.m7.dir.join("frontiers.checkpoint"),
         ],
     );
     lab.server.stop();
@@ -1158,10 +1152,12 @@ fn a_roster_denial_applied_between_two_observations_is_seen_by_the_second() {
 /// selection answers from its `lstat`, and the recovery steps share one read of the claim, the
 /// journal, the configuration and the records.
 ///
-/// NEGATIVE CONTROLS (2026-11-05): with [`retained_history::acknowledge_under`] reading for itself
+/// NEGATIVE CONTROLS (2026-11-05, the first again 2026-11-06): with
+/// [`retained_history::acknowledge_under`] reading for itself
 /// (`acknowledge_selected(&Reads::new(reads.paths()), ...)`), `read more than once` names
-/// `records.frontiers` and `frontiers.checkpoint`; with [`crate::records_storage::selected`] always
-/// through `data_path`, it names `records.layout`.
+/// `records.frontiers` (the journal's second ask, with no file of it moved, is answered by the
+/// history cache); with [`crate::records_storage::selected`] always through `data_path`, it names
+/// `records.layout`.
 #[test]
 fn a_state_lock_take_with_nothing_to_finish_reads_each_file_once() {
     let _answering = ServersAnswering::set();
@@ -1180,7 +1176,6 @@ fn a_state_lock_take_with_nothing_to_finish_reads_each_file_once() {
                 paths.source_file(),
                 paths.dir.join("records.layout"),
                 paths.dir.join("records.frontiers"),
-                paths.dir.join("frontiers.checkpoint"),
             ],
         );
     }

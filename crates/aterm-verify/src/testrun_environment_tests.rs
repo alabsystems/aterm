@@ -61,22 +61,21 @@ fn event(binary: &Binary, run: &Run) -> aterm_json::Value {
     event
 }
 
-/// The event of `run`, at a width of 3, with the fields every event has, and the history sample
+/// The event of `run`, at a width of 3 charged 4 cores, with the fields every event has, and the history sample
 /// it keeps, if it keeps one, with the figures the event has.
 fn event_and_sample(
     binary: &Binary,
     run: &Run,
     started: bool,
 ) -> (aterm_json::Value, Option<crate::test_history::Sample>) {
-    let (_, line, sample) = binary_event(
-        binary,
-        run,
-        started,
+    let mut ran = Ran::of(
+        run.clone(),
         Duration::from_millis(1250),
         Duration::from_millis(8500),
-        3,
-        Some(&"ab".repeat(32)),
     );
+    ran.planned.width = 3;
+    ran.planned.charge = 4;
+    let (_, line, sample) = binary_event(binary, &ran, started, Some(&"ab".repeat(32)));
     let event: aterm_json::Value =
         aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap();
     assert_eq!(event["schema"].as_u64(), Some(1));
@@ -86,12 +85,16 @@ fn event_and_sample(
     assert_eq!(event["waiting_s"].as_f64(), Some(1.25));
     assert_eq!(event["execution_s"].as_f64(), Some(8.5));
     assert_eq!(event["width"].as_u64(), Some(3));
+    assert_eq!(event["charge"].as_u64(), Some(4));
     assert_eq!(event["exe_sha256"].as_str(), Some("ab".repeat(32).as_str()));
     assert_eq!(event["carried"].as_bool(), Some(false));
     if let Some(sample) = &sample {
         assert_eq!(sample.width, 3);
         assert_eq!(event["tests"].as_u64(), sample.tests);
-        assert_eq!(sample.wall_ms, 8500);
+        assert_eq!(
+            sample.wall_ms,
+            if run.stopped_at.is_some() { 0 } else { 8500 }
+        );
     }
     (event, sample)
 }
@@ -105,16 +108,16 @@ fn measured_sample(binary: &Binary, run: &Run) -> (aterm_json::Value, crate::tes
     )
 }
 
-/// A BINARY'S HISTORY KEEPS ONLY THE RUNS THAT MEASURED IT: one the run's ceiling left no time
-/// to start ([`not_started`]), one something outside it ended (an interrupt that came before it
-/// started, a stuck holder: `spawn_error`) and one that ended as an interrupt was ending the run
-/// keep no sample, each with its event as before, and so does one verify stopped at its first red
-/// case (its FAIL event stands); one the ceiling ended mid-run keeps its sample, a lower bound
-/// with its wall and its test count. NEGATIVE CONTROL: the unstarted run counted as started, the
-/// stopped one with no stop, and the interrupted one once the run is no longer ending, each keep
-/// one.
+/// A BINARY'S HISTORY KEEPS ONLY A RUN THAT MEASURED IT OR ITS LATEST DECISIVE OUTCOME: one the
+/// run's ceiling left no time to start ([`not_started`]), one something outside it ended (an
+/// interrupt that came before it started, a stuck holder: `spawn_error`) and one that ended as an
+/// interrupt was ending the run keep no sample, each with its event as before. One verify stopped
+/// at its first red case keeps an outcome-only FAIL with zero wall and no usage, while one the
+/// ceiling ended mid-run keeps its measured lower bound with its wall and test count. NEGATIVE
+/// CONTROL: the unstarted run counted as started, the stopped one with no stop, and the
+/// interrupted one once the run is no longer ending each keep a measured sample.
 #[test]
-fn only_a_run_that_measured_its_binary_keeps_a_sample() {
+fn only_a_measured_run_or_a_decisive_outcome_keeps_a_sample() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -144,7 +147,14 @@ fn only_a_run_that_measured_its_binary_keeps_a_sample() {
     });
     let (event, sample) = event_and_sample(&binary, &stopped, true);
     assert_eq!(event["outcome"].as_str(), Some("FAIL"));
-    assert!(sample.is_none(), "{sample:?}");
+    let sample = sample.expect("a decisive red keeps its outcome");
+    assert_eq!(sample.outcome, "FAIL");
+    assert_eq!(sample.wall_ms, 0);
+    assert_eq!(
+        (sample.cpu_ms, sample.starved_ms, sample.peak_bytes),
+        (None, None, None)
+    );
+    assert_eq!((sample.width, sample.tests), (3, Some(2)));
     stopped.stopped_at = None;
     assert!(event_and_sample(&binary, &stopped, true).1.is_some());
 

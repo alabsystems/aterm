@@ -12,6 +12,7 @@
 //! /m/n-<id>/shared/quota/agy/<home>         an agy home's current row   relayed
 //! /m/n-<id>/shared/now/presence             presence (aterm-mesh, B7c)  relayed
 //! /m/n-<id>/shared/now/needs                sessions that need a person relayed
+//! /m/n-<id>/shared/now/activity             its agents, counted by word relayed
 //! /m/n-<id>/shared/now/unread               the pools it could not read relayed
 //! /m/n-<id>/shared/now/place/<account>      where an account is placed  relayed
 //! ```
@@ -674,6 +675,9 @@ pub enum Now {
     Needs,
     /// The account pools this Mac could not read ([`crate::row::UnreadRow`]).
     Unread,
+    /// What this Mac's agents are doing, counted by their own words, and their sessions by id
+    /// ([`crate::row::ActivityRow`]).
+    Activity,
     /// Where an account is placed here (`fill`, `borrow`, …: [`crate::row::PlaceRow`]).
     Place(AccountKey),
 }
@@ -846,6 +850,7 @@ impl Subject {
                     Some("presence") => Now::Presence,
                     Some("needs") => Now::Needs,
                     Some("unread") => Now::Unread,
+                    Some("activity") => Now::Activity,
                     Some("place") => Now::Place(
                         seg.next()
                             .and_then(AccountKey::parse)
@@ -879,6 +884,7 @@ impl fmt::Display for Subject {
                 Now::Presence => f.write_str("shared/now/presence"),
                 Now::Needs => f.write_str("shared/now/needs"),
                 Now::Unread => f.write_str("shared/now/unread"),
+                Now::Activity => f.write_str("shared/now/activity"),
                 Now::Place(account) => write!(f, "shared/now/place/{account}"),
             },
         }

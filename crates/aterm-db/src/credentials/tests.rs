@@ -1101,6 +1101,199 @@ fn a_note_an_earlier_build_kept_with_a_newline_still_reaches_the_table() {
     );
 }
 
+/// A copy whose publication fails waits alone: the custodian's other decisions in that pass (a
+/// person asked here) are committed all the same, and only the copy waits, naming the error,
+/// until a pass whose publish goes through publishes it. The vault's publish lock, held by
+/// another admin's publish, refuses this pass's.
+/// NEGATIVE CONTROL: a pass that returns on the error, as before, commits no ask; one that books
+/// the copy at the version the vault already held reports it published; a `need pass` that
+/// prints only the counts hides the failure.
+#[test]
+fn a_failed_publication_waits_alone_and_the_passs_other_decisions_stand() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let (custodian, requester) = (&lab.paths[0], &lab.paths[1]);
+    let admin = client::admin_open(custodian).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(
+        &Audience::Hosts(vec!["m1".into()]),
+        "release-notary",
+        b"apple",
+    )
+    .unwrap();
+    client::admin_publish(custodian, &admin, &doc).unwrap();
+    for paths in &lab.paths {
+        client::sync(paths, None).unwrap();
+    }
+    let mailbox = Want::parse("mailbox:m29").unwrap();
+    need::raise(requester, mailbox.clone(), Purpose::HarnessSignIn).unwrap();
+    need::raise(requester, Want::Notary, Purpose::ReleaseNotary).unwrap();
+    let now = 1_000_000_000;
+    assert_eq!(pass_at(requester, now).unwrap().posted, 2);
+    repair_commons(&lab, 3);
+    let swept = pass_at(custodian, now).unwrap();
+    assert_eq!(swept.swept, 2);
+    let thread = |want: &Want| swept.threads.iter().find(|t| t.want == *want).unwrap().id;
+    let (notary, asked) = (thread(&Want::Notary), thread(&mailbox));
+    let mut lock = lab.source.clone().into_os_string();
+    lock.push(".lock");
+    std::fs::write(&lock, "m9 1\n").unwrap();
+    let refused = custodian_pass_at(custodian, now).unwrap().unwrap();
+    assert_eq!(refused.asked, [asked], "{refused:?}");
+    assert!(refused.published.is_empty(), "{refused:?}");
+    assert!(
+        matches!(refused.failed.as_slice(),
+            [(id, why)] if *id == notary && why.contains("another publish to this vault holds it")),
+        "{refused:?}"
+    );
+    let summary = refused.summary();
+    assert!(
+        summary.contains("1 handed to a person")
+            && summary.contains(", 1 failed: the vault's publication failed: "),
+        "{summary}"
+    );
+    // `aterm secrets need pass`, the item's remedy, says the failure too.
+    let said = cli::run(custodian, &["pass".to_owned()]).unwrap();
+    assert!(
+        said.contains("1 failed: the vault's publication failed")
+            && said.contains("another publish to this vault holds it"),
+        "{said}"
+    );
+    let m2 = Audience::Hosts(vec!["m2".into()]);
+    assert!(
+        client::admin_open(custodian)
+            .unwrap()
+            .doc
+            .entry(&m2, "release-notary")
+            .is_none(),
+        "nothing was published"
+    );
+    repair_commons(&lab, 3);
+    pass_at(requester, now).unwrap();
+    let state = |want: &Want| {
+        let needs = need::list(requester).unwrap();
+        let need = needs.iter().find(|need| need.want == *want).unwrap();
+        (need.state, need.line.clone())
+    };
+    assert_eq!(
+        state(&mailbox).0,
+        State::AwaitingPerson,
+        "{}",
+        state(&mailbox).1
+    );
+    let (waits, line) = state(&Want::Notary);
+    assert!(waits != State::Published && !waits.ended(), "{line}");
+    std::fs::remove_file(&lock).unwrap();
+    let published = custodian_pass_at(custodian, now).unwrap().unwrap();
+    assert_eq!(
+        published
+            .published
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>(),
+        [notary],
+        "{published:?}"
+    );
+    assert!(
+        published.asked.is_empty() && published.failed.is_empty(),
+        "the ask stands once: {published:?}"
+    );
+    repair_commons(&lab, 3);
+    assert_eq!(pass_at(requester, now).unwrap().decided, 1);
+    assert_eq!(
+        state(&Want::Notary).0,
+        State::Published,
+        "{}",
+        state(&Want::Notary).1
+    );
+    assert_eq!(state(&mailbox).0, State::AwaitingPerson);
+}
+
+/// A copy the draft refuses leaves the draft as that request found it, and the request waits
+/// alone. Here the vault's text, long with comments (which only the admins' locker seals, so it
+/// still publishes), is within half a TOTP of its limit: the mailbox's password copies, and its
+/// TOTP would take the text past the limit. The password copied before the refusal is not
+/// published, the request is the pass's one failure, naming the refusal, and another request's
+/// copy in the same pass is published all the same.
+/// NEGATIVE CONTROL: a pass that returns on the refusal, as before, publishes nothing; one that
+/// keeps the draft the refused request wrote publishes the password into the requester's section
+/// without its TOTP or any record.
+#[test]
+fn a_refused_copy_leaves_the_draft_as_its_request_found_it_and_waits_alone() {
+    use aterm_secrets::text::{Document, MAX_TEXT};
+    const TOTP: usize = 1 << 16;
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let (custodian, requester) = (&lab.paths[0], &lab.paths[1]);
+    let admin = client::admin_open(custodian).unwrap();
+    let mut doc = admin.doc.clone();
+    let m1 = Audience::Hosts(vec!["m1".into()]);
+    doc.set_entry(&m1, "release-notary", b"apple").unwrap();
+    doc.set_entry(&m1, "m29_password", b"hunter2").unwrap();
+    doc.set_entry(&m1, "m29_totp", &vec![b't'; TOTP]).unwrap();
+    let held = doc.render();
+    let held = held.as_str().unwrap();
+    let line = format!("# {}\n", "c".repeat(TOTP - 3));
+    let room = MAX_TEXT - TOTP / 2 - held.len();
+    let mut text = line.repeat(room / line.len());
+    text.push_str(&"#\n".repeat(room % line.len() / 2));
+    text.push_str(held);
+    assert!(text.len() + TOTP > MAX_TEXT && text.len() + TOTP / 4 < MAX_TEXT);
+    client::admin_publish(custodian, &admin, &Document::parse(&text).unwrap()).unwrap();
+    for paths in &lab.paths {
+        client::sync(paths, None).unwrap();
+    }
+    let mailbox = Want::parse("mailbox:m29").unwrap();
+    need::raise(requester, mailbox.clone(), Purpose::HarnessSignIn).unwrap();
+    need::raise(requester, Want::Notary, Purpose::ReleaseNotary).unwrap();
+    let now = 1_000_000_000;
+    assert_eq!(pass_at(requester, now).unwrap().posted, 2);
+    repair_commons(&lab, 3);
+    let swept = pass_at(custodian, now).unwrap();
+    assert_eq!(swept.swept, 2);
+    let thread = |want: &Want| swept.threads.iter().find(|t| t.want == *want).unwrap().id;
+    let (notary, refused) = (thread(&Want::Notary), thread(&mailbox));
+    let pass = custodian_pass_at(custodian, now).unwrap().unwrap();
+    assert!(
+        matches!(pass.failed.as_slice(),
+            [(id, why)] if *id == refused
+                && why.starts_with("the copy from vault text failed: ")
+                && why.contains("larger than")),
+        "{pass:?}"
+    );
+    assert_eq!(
+        pass.published.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        [notary],
+        "{pass:?}"
+    );
+    assert!(pass.asked.is_empty() && pass.waiting.is_empty(), "{pass:?}");
+    let reopened = client::admin_open(custodian).unwrap();
+    let m2 = Audience::Hosts(vec!["m2".into()]);
+    assert!(
+        reopened.doc.entry(&m2, "release-notary").is_some(),
+        "the notary's copy was published"
+    );
+    for entry in ["m29_password", "m29_totp"] {
+        assert!(
+            reopened.doc.entry(&m2, entry).is_none(),
+            "{entry} stays where it was"
+        );
+    }
+    repair_commons(&lab, 3);
+    pass_at(requester, now).unwrap();
+    let needs = need::list(requester).unwrap();
+    let waits = needs.iter().find(|need| need.want == mailbox).unwrap();
+    assert!(
+        waits.state != State::Published && !waits.state.ended(),
+        "the mailbox waits: {}",
+        waits.line
+    );
+}
+
 /// A request the lab lapsed (no word from this Mac on it for 30 days: its windows stayed shut)
 /// is raised again at once while its need holds, as its line says, with no consumer to raise
 /// it: a need by hand posts a new request, under a new id, at the next pass, and supersedes the

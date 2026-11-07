@@ -9,6 +9,7 @@ use super::*;
 #[derive(Debug, Default)]
 struct Succession {
     retired: bool,
+    pending_account: Option<Prepare>,
     successor: Option<Prepare>,
 }
 
@@ -24,6 +25,15 @@ pub(super) struct ClosedRestart {
 }
 
 impl ClosedRestart {
+    #[cfg(test)]
+    pub(super) fn account_state(&self) -> (Option<Prepare>, Option<Prepare>, bool) {
+        let state = self.succession.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            state.pending_account.clone(),
+            state.successor.clone(),
+            state.retired,
+        )
+    }
     #[cfg(test)]
     pub(super) fn projected_state(&self) -> (bool, Option<Prepare>, bool) {
         let succession = self.succession.lock().unwrap_or_else(|p| p.into_inner());
@@ -199,6 +209,11 @@ impl ClosedRestart {
         (self.resume_phase == ImagePhase::Rollback).then_some(ImagePhase::Rollback)
     }
 
+    /// The host's frozen phase at closure, independently of a client's mirror.
+    pub(super) fn closed_phase(&self) -> ImagePhase {
+        self.resume_phase
+    }
+
     pub(super) fn noexec(&self) -> bool {
         // Capture only admits zero children for a positively NotGranted closure.
         self.children.is_empty()
@@ -206,12 +221,39 @@ impl ClosedRestart {
 
     pub(super) fn available(&self) -> bool {
         let succession = self.succession.lock().unwrap_or_else(|p| p.into_inner());
-        !succession.retired && succession.successor.is_none()
+        !succession.retired
+            && succession.pending_account.is_none()
+            && succession.successor.is_none()
     }
 
     pub(super) fn claimed_by(&self, request: &Prepare) -> bool {
         let succession = self.succession.lock().unwrap_or_else(|p| p.into_inner());
         !succession.retired && succession.successor.as_ref() == Some(request)
+    }
+
+    /// Historical ownership survives retirement; it grants no live authority.
+    pub(super) fn confirmed_successor(&self, request: &Prepare) -> bool {
+        self.succession
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .successor
+            .as_ref()
+            == Some(request)
+    }
+
+    /// An advisory retained successor identity, never an absence or grant proof.
+    pub(super) fn successor_id(&self) -> Option<String> {
+        self.succession
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .successor
+            .as_ref()
+            .map(|request| request.id.clone())
+    }
+
+    pub(super) fn pending_account_by(&self, request: &Prepare) -> bool {
+        let succession = self.succession.lock().unwrap_or_else(|p| p.into_inner());
+        !succession.retired && succession.pending_account.as_ref() == Some(request)
     }
 
     /// Called only at the matched terminal operation's admission boundary.
@@ -240,15 +282,56 @@ impl ClosedRestart {
             project = "native_act::tests::closed_restart_model::transition"
         )
     )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountClaimPublication",
+            action = "Rival",
+            project = "native_act::tests::account_continuation_tests::claim_model::transition"
+        )
+    )]
     pub(super) fn claim_successor(&self, request: &Prepare) -> bool {
         // Retirement can come from the service after preparation has released
         // the predecessor's operation lock. Keep its decision and this claim
         // in one critical section, including the availability check.
         let mut succession = self.succession.lock().unwrap_or_else(|p| p.into_inner());
-        if succession.retired || succession.successor.is_some() {
+        if succession.retired
+            || succession.pending_account.is_some()
+            || succession.successor.is_some()
+        {
             return false;
         }
         succession.successor = Some(request.clone());
+        true
+    }
+
+    /// Reserve the exact account candidate before journal I/O. This records no
+    /// acknowledged claim; a lost acknowledgement leaves the reservation unresolved.
+    pub(super) fn reserve_account_successor(&self, request: &Prepare) -> bool {
+        let mut succession = self.succession.lock().unwrap_or_else(|p| p.into_inner());
+        if succession.retired || succession.successor.is_some() {
+            return false;
+        }
+        match &succession.pending_account {
+            Some(pending) => pending == request,
+            None => {
+                succession.pending_account = Some(request.clone());
+                true
+            }
+        }
+    }
+
+    /// Retain the journal's acknowledged claim even if retirement raced with
+    /// the write. `claimed_by` still refuses live authority after retirement.
+    pub(super) fn confirm_account_successor(&self, request: &Prepare) -> bool {
+        let mut succession = self.succession.lock().unwrap_or_else(|p| p.into_inner());
+        if succession.successor.as_ref() == Some(request) {
+            return true;
+        }
+        if succession.successor.is_some() || succession.pending_account.as_ref() != Some(request) {
+            return false;
+        }
+        succession.successor = succession.pending_account.take();
         true
     }
 
@@ -258,6 +341,14 @@ impl ClosedRestart {
             machine = "ClosedRestartEvidence",
             action = "Retire",
             project = "native_act::tests::closed_restart_model::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountClaimPublication",
+            action = "Retire",
+            project = "native_act::tests::account_continuation_tests::claim_model::transition"
         )
     )]
     pub(super) fn retire(&self) {
@@ -272,7 +363,9 @@ impl ClosedRestart {
     ) -> bool {
         let cancelled = {
             let succession = self.succession.lock().unwrap_or_else(|p| p.into_inner());
-            succession.retired && succession.successor.is_none()
+            succession.retired
+                && succession.pending_account.is_none()
+                && succession.successor.is_none()
         };
         self.predecessor == *prepare
             && cancelled

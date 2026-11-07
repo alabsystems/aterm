@@ -217,6 +217,10 @@ fn the_develop_layer_follows_the_record_and_never_guesses() {
 /// Scripts the local git reads [`checkout::kept_here`] performs on `~/aterm`.
 pub(crate) fn script_local(sys: &Fake, alice: &User, url: &str, branch: bool, status: &str) {
     let path = Path::new("/Users//alice/aterm");
+    sys.on(
+        &checkout::Programs::listing(checkout::git(sys, alice, Some(path))).display(),
+        Ran::exit(1, ""),
+    );
     for (args, ran) in [
         (
             vec!["rev-parse", "--is-inside-work-tree"],
@@ -243,22 +247,28 @@ pub(crate) fn script_local(sys: &Fake, alice: &User, url: &str, branch: bool, st
             vec!["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
             Ran::ok("1111111111111111111111111111111111111111\n"),
         ),
-        (
-            vec![
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--untracked-files=normal",
-                "--ignore-submodules=all",
-            ],
-            Ran::ok(status),
-        ),
     ] {
         sys.on(
             &checkout::git(sys, alice, Some(path)).args(args).display(),
             ran,
         );
     }
+    sys.on(
+        &checkout::Programs::default()
+            .off(checkout::git(sys, alice, Some(path)))
+            .args(checkout::NO_SIDE_RUNS)
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=normal",
+                "--ignore-submodules=all",
+            ])
+            .display(),
+        Ran::ok(status),
+    );
 }
 
 /// The origin alice's fixture manifest admits (`[workspace.package] repository`).

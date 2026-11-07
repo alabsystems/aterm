@@ -12,20 +12,21 @@ use aterm_zstd::xxh64::Xxh64;
 
 use crate::error::{Error, Result};
 
-/// The aterm-zstd level every pack is compressed at: its highest, a price-based parse over
-/// a binary tree as `zstd -19`'s is.
-pub const LEVEL: u8 = aterm_zstd::encode::LEVEL_MAX;
+/// The aterm-zstd level every pack uses: a lazy hash-chain parse that prioritizes release
+/// latency. The large-library measurement recorded in
+/// `docs/measured/atpkg-zstd-large-library-2026-11-06.md` compares its time/size tradeoff.
+pub const LEVEL: u8 = 9;
 
 /// The widest window a pack declares, as a power of two: the widest the client's decoder
-/// accepts (`aterm_zstd::frame::WINDOW_MAX`, which libzstd's default decoder accepts too),
-/// so a repeat anywhere in the last 128 MiB of a pack's tar stream is one match.
+/// accepts (`aterm_zstd::frame::WINDOW_MAX`, which libzstd's default decoder accepts too).
+/// This bounds permitted back-references; the selected match finder may search less history.
 ///
 /// A pack declares the smallest window that holds its tar stream ([`options`]), and only a
 /// stream longer than 2^27 bytes declares this one. RFC 8878 §3.1.1.1.2 recommends that an
 /// encoder not need a window over 8 MB and leaves a decoder free to refuse one: a pack whose
-/// tar is within 8 MiB never needs more, and a longer one departs from that for its ratio
-/// (the trust pack 8% under `zstd -19`'s 2^23 frame), because every client that installs
-/// packs takes 2^27: atpkg's own decoder, and libzstd's default limit before it.
+/// tar is within 8 MiB never needs more, and a longer one departs from that for its ratio,
+/// because every client that installs packs takes 2^27: atpkg's own decoder, and
+/// libzstd's default limit before it.
 pub const WINDOW_LOG_MAX: u8 = aterm_zstd::encode::WINDOW_LOG_MAX;
 
 /// The encoder's options for a pack whose tar stream is `len` bytes: [`LEVEL`], a content
@@ -35,8 +36,8 @@ pub const WINDOW_LOG_MAX: u8 = aterm_zstd::encode::WINDOW_LOG_MAX;
 /// single segment whose window is the stream itself (RFC 8878 §3.1.1.1.2: a single
 /// segment's Window_Size is its Frame_Content_Size), and the encoder works in the smallest
 /// power of two that holds it. A longer stream is streamed under the [`WINDOW_LOG_MAX`]
-/// window with no declared size: these are the options every pack was compressed with
-/// before the window was fitted, so such a pack's frame is the bytes it was.
+/// window with no declared size. The frame's bytes depend only on that stream and these
+/// selected options, never on how the tar writer cuts its writes.
 #[must_use]
 pub fn options(len: u64) -> aterm_zstd::encode::Options {
     let options = aterm_zstd::encode::Options::new()

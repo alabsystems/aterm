@@ -374,6 +374,43 @@ pub(crate) fn count_printable(input: &[u8]) -> usize {
     find_non_printable(input).unwrap_or(input.len())
 }
 
+/// Whether `byte` belongs in a run of text lines: printable ASCII (`0x20..=0x7E`), CR or LF.
+#[inline]
+#[allow(
+    clippy::manual_range_contains,
+    reason = "the branch-free spelling the chunk classifier below vectorizes, as in `find_non_printable_neon`"
+)]
+pub(crate) const fn is_line_byte(byte: u8) -> bool {
+    (byte >= 0x20 && byte <= 0x7E) || byte == b'\n' || byte == b'\r'
+}
+
+/// Returns the length of `input`'s prefix of text-line bytes ([`is_line_byte`]): 16-byte chunks
+/// classified with one OR-reduction each (safe code the compiler vectorizes on every target), then
+/// the chunk that ends the run rescanned for its first other byte.
+#[inline]
+pub(crate) fn count_line_run(input: &[u8]) -> usize {
+    let (chunks, rem) = input.as_chunks::<16>();
+    let mut offset = 0usize;
+    for chunk in chunks {
+        let mut other = 0u8;
+        for &byte in chunk {
+            other |= u8::from(byte.wrapping_sub(0x20) > 0x5E)
+                & u8::from(byte != b'\n')
+                & u8::from(byte != b'\r');
+        }
+        if other != 0 {
+            let within = chunk.iter().position(|&b| !is_line_byte(b)).unwrap_or(16);
+            return offset.saturating_add(within);
+        }
+        offset = offset.saturating_add(16);
+    }
+    let within = rem
+        .iter()
+        .position(|&b| !is_line_byte(b))
+        .unwrap_or(rem.len());
+    offset.saturating_add(within)
+}
+
 /// Splits `input` into its printable-ASCII prefix and remainder.
 #[inline]
 pub(crate) fn take_printable(input: &[u8]) -> (&[u8], &[u8]) {

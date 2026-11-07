@@ -479,15 +479,9 @@ impl Store {
         self.transact_roster_records_held(held, roster, now, note, edit, WakeRule::Events)
     }
 
-    /// Native publication adds an authenticated owner baseline only after the
-    /// real renewal generation is derived and before canonical images exist.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "only tests reach this native custody step until its production caller lands; drop this then"
-        )
-    )]
+    /// Test convenience for owning a writer before the actual native callback.
+    /// Production callers retain their writer before opening owner/Auth claims.
+    #[cfg(test)]
     pub(in crate::harness) fn transact_roster_logins_native_within(
         &self,
         ladder: &[std::time::Duration],
@@ -501,8 +495,22 @@ impl Store {
             .acquire_within(ladder)
             .map_err(|why| why.to_string())?
             .ok_or_else(|| LOCK_HELD.to_owned())?;
+        self.transact_roster_logins_native_held(&held, roster, now, note, edit, native_publication)
+    }
+
+    /// Native publication under the caller's already-held canonical writer;
+    /// its actual generation callback and durability path are unchanged.
+    pub(in crate::harness) fn transact_roster_logins_native_held(
+        &self,
+        held: &Lock,
+        roster: &Path,
+        now: i64,
+        note: &mut Option<String>,
+        edit: impl FnOnce(&Roster, &mut State, &mut Logins) -> Result<Vec<Event>, String>,
+        native_publication: impl FnOnce(ActualPublicationPermit<'_>) -> NativePublicationResult,
+    ) -> Result<Vec<Event>, String> {
         self.transact_roster_records_native_held(
-            &held,
+            held,
             roster,
             now,
             note,
@@ -1035,13 +1043,27 @@ impl Store {
         advance_sign_in_receipts(&before.1, &mut logins, &state, &events)?;
         if let Some(native_publication) = native_publication {
             let derived = logins.clone();
-            if let Some(transition) =
-                native_publication(ActualPublicationPermit::new(&before.1, &derived))?
-            {
+            let channel = super::native_publication::PublicationChannel::new();
+            let transition = native_publication(ActualPublicationPermit::new(
+                self, &before.1, &derived, &channel,
+            ))?;
+            let mut native_changed = false;
+            // Authenticate the derived row image before the normal canonical
+            // owner-witness accessor can accept a new row's Applied record.
+            if let Some(receipt) = channel.into_receipt() {
+                logins
+                    .enrollment
+                    .attach_row_publication(receipt, &logins.labels)?;
+                native_changed = true;
+            }
+            if let Some(transition) = transition {
                 if !transition.is_fresh_activation() || transition.expected().is_some() {
                     return Err("native publication requires fresh activation evidence".into());
                 }
                 logins.enrollment.cas_owner_witness(&transition)?;
+                native_changed = true;
+            }
+            if native_changed {
                 logins.enrollment.commit(
                     &derived.enrollment,
                     &Default::default(),
@@ -1049,6 +1071,7 @@ impl Store {
                 )?;
             }
         }
+        logins.enrollment.require_complete_row_publications()?;
         let old_state = read(&self.state_file(), MAX_STATE_BYTES)?;
         let old_logins = read(&self.logins_file(), MAX_LOGINS_BYTES)?;
         let new_state = if state != before.0 || (!events.is_empty() && old_state.is_none()) {

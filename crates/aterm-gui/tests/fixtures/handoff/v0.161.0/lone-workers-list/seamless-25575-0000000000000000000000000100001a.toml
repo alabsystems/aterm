@@ -1,0 +1,17 @@
+0000000000000000000000000100001a
+schema = 1
+sessions = []
+next_turn_id = 4096
+outgoing_build = 1794029406
+roster_seq = 7
+machine_names = ["devhost", "devhost-2.local"]
+
+[window]
+rows = 30
+cols = 100
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+status_bar_rows = 0
+next_message_id = 1
+messages_captured_unix_ms = 1794029412794

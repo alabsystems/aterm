@@ -6,11 +6,11 @@
 
 use super::{
     discovery::{Hints, MemoryScope, Outcome, REMEMBERED_MAX, REMEMBERED_NAME, Remembered},
-    report::{AuthenticatedConnection, RepairRound, bounded_error},
+    report::{AuthenticatedConnection, RepairRound, bounded_failure},
 };
 use crate::{
     Result,
-    control::{Endpoint, Repair, Side},
+    control::{Endpoint, Failure, Repair, Side},
 };
 use aterm_net::lan::{Cancellation, Connection, Listener, Multicast, Scope};
 use aterm_secrets::commons::hearing::Said;
@@ -159,7 +159,8 @@ impl Worker {
                                         if error.kind() == io::ErrorKind::ConnectionRefused {
                                             repair.disown();
                                         }
-                                    })?;
+                                    })
+                                    .map_err(dial_failure)?;
                             (connection, Side::Initiator)
                         };
                         if !control
@@ -177,7 +178,15 @@ impl Worker {
                             return result;
                         }
                         // The old peer closed before any application payload. One
-                        // new connection rebuilds and revalidates the entire round.
+                        // new connection rebuilds and revalidates the entire round; a
+                        // redial that fails is this round's failure, not the probe's.
+                        #[cfg(test)]
+                        let redial = !endpoint.redial_keeps_first_attempt;
+                        #[cfg(not(test))]
+                        let redial = true;
+                        if redial {
+                            repair.redial();
+                        }
                     }
                     unreachable!("the second exchange always returns")
                 })();
@@ -187,9 +196,10 @@ impl Worker {
                         aterm_types::network_state::RepairCause::LegacyPastCrossing
                     )
                 {
-                    // A protocol fence can refuse control before entering application repair.
-                    // Preserve its cause without fabricating an application exchange.
-                    repair.failure_cause(error);
+                    // A protocol fence can refuse control before entering application repair:
+                    // the dial scheduler hears its cause without a fabricated application
+                    // exchange. The round's report carries it as the control failure's cause.
+                    repair.fenced(error);
                 }
                 let mut control = control.lock().unwrap_or_else(|p| p.into_inner());
                 let success =
@@ -210,20 +220,19 @@ impl Worker {
                     exchange_started,
                     cancelled: control.stopped,
                     phase: Some(repair.phase()),
-                    control: result.map_err(bounded_error),
+                    control: result.map_err(|error| bounded_failure(&Failure::of(&error))),
                     membership: repair.membership(),
-                    membership_error: repair.membership_error().map(bounded_error),
+                    membership_error: repair.membership_error().map(bounded_failure),
                     application: repair.application(),
-                    application_error: repair.application_error().map(bounded_error),
-                    application_cause: repair.application_cause(),
+                    application_error: repair.application_error().map(bounded_failure),
                     application_interrupted: repair.application_interrupted(),
                     application_deferral: repair.application_deferral().cloned().map(|mut why| {
-                        why.local_error = why.local_error.map(bounded_error);
+                        why.local_error = why.local_error.map(super::report::bounded_error);
                         why
                     }),
                     application_batch_deferral: repair.application_batch_deferral().cloned().map(
                         |mut why| {
-                            why.reason = bounded_error(why.reason);
+                            why.reason = super::report::bounded_error(why.reason);
                             why
                         },
                     ),
@@ -651,7 +660,9 @@ impl Transport {
     }
 
     fn fail_link(&mut self, source: IpAddr, operation: &str, error: io::Error) {
-        self.failure = Some(bounded_error(format!("{operation} on {source}: {error}")));
+        self.failure = Some(super::report::bounded_error(format!(
+            "{operation} on {source}: {error}"
+        )));
     }
     pub(super) fn interfaces(&self) -> usize {
         self.links.len()
@@ -1071,6 +1082,29 @@ impl Drop for Transport {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// A dial's failure as a typed refusal: this Mac's LAN held for its broker
+/// ([`aterm_uds::lan::Unavailable::of`], [`RepairCause::LanHeld`]), a dial that reached no peer
+/// ([`aterm_uds::lan::reached_no_peer`], [`RepairCause::Unreachable`]), or another I/O failure
+/// ([`RepairCause::Io`]). A peer's record names it only for a round whose first exchange
+/// authenticated and whose redial then failed ([`Repair::redial`]): a first dial that fails has
+/// no authenticated peer to record it against, and a LAN that waits for its broker from the start
+/// is the observation's own detail.
+///
+/// [`RepairCause::LanHeld`]: aterm_types::network_state::RepairCause::LanHeld
+/// [`RepairCause::Unreachable`]: aterm_types::network_state::RepairCause::Unreachable
+/// [`RepairCause::Io`]: aterm_types::network_state::RepairCause::Io
+pub(super) fn dial_failure(error: io::Error) -> crate::Error {
+    use aterm_types::network_state::RepairCause;
+    let cause = if aterm_uds::lan::Unavailable::of(&error).is_some() {
+        RepairCause::LanHeld
+    } else if aterm_uds::lan::reached_no_peer(&error) {
+        RepairCause::Unreachable
+    } else {
+        RepairCause::Io
+    };
+    crate::Error::repair(&error.to_string(), cause)
 }
 
 #[cfg(test)]

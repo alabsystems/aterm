@@ -488,6 +488,7 @@ pub fn as_built(chain: Chain, seen: &Seen, t0: i64) -> Seen {
                     check: true,
                     said: "Nothing left: the parser".into(),
                     at_ms: *t,
+                    statement: aterm_agent::harness::land_receipt::Statement::Unread,
                 };
                 journal.push((*t, r.line(seq.parse().unwrap_or(0))));
             }

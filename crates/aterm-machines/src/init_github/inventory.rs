@@ -14,13 +14,17 @@ use std::path::Path;
 pub(super) const FILE: &str = ".secrets/github-repositories.json";
 pub(super) const MAX_BYTES: usize = 1024 * 1024;
 
-#[derive(Clone, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Inventory {
+struct RawInventory {
     schema: u32,
-    pub(super) account: String,
+    account: String,
     repositories: Vec<aterm_json::Value>,
 }
+
+/// Only a complete validated private list can be retained by a captured source.
+#[derive(Clone)]
+pub(super) struct Inventory(Vec<repos::Repo>);
 
 impl Inventory {
     pub(super) fn read(sys: &dyn System, user: &User) -> Result<Self, String> {
@@ -29,22 +33,29 @@ impl Inventory {
             .map_err(|_| {
                 "repository metadata is not ready in the Secrets vault; waiting for its private github-repositories.json entry".to_owned()
             })?;
-        let inventory: Self = aterm_json::from_slice(&bytes)
+        let inventory: RawInventory = aterm_json::from_slice(&bytes)
             .map_err(|_| "the vault's repository metadata is not valid JSON".to_owned())?;
-        inventory.validate()?;
-        Ok(inventory)
+        inventory.try_into()
     }
 
-    fn validate(&self) -> Result<(), String> {
-        if self.schema != 2 || !super::login(&self.account) {
+    pub(super) fn repositories(&self) -> &[repos::Repo] {
+        &self.0
+    }
+
+    pub(super) fn into_repositories(self) -> Vec<repos::Repo> {
+        self.0
+    }
+}
+
+impl TryFrom<RawInventory> for Inventory {
+    type Error = String;
+
+    fn try_from(raw: RawInventory) -> Result<Self, Self::Error> {
+        if raw.schema != 2 || !super::login(&raw.account) {
             return Err("the vault's repository metadata has an unsupported schema or invalid development account".into());
         }
-        self.repositories().map(|_| ())
-    }
-
-    pub(super) fn repositories(&self) -> Result<repos::Inventory, String> {
         let listed =
-            repos::inventory_filtered(&self.repositories, None, Some(&self.account), |repo| {
+            repos::inventory_filtered(&raw.repositories, None, Some(&raw.account), |repo| {
                 !repo.fork && !repo.archived
             })?;
         if !listed.notes.is_empty() {
@@ -54,7 +65,7 @@ impl Inventory {
                 listed.repositories.len() + listed.notes.len()
             ));
         }
-        Ok(listed)
+        Ok(Self(listed.repositories))
     }
 }
 
@@ -71,39 +82,31 @@ mod tests {
 
     #[test]
     fn private_metadata_is_the_complete_inventory_and_account_source() {
-        let inventory = Inventory {
+        let repo = repository("fixture-owner", "private-code", 1);
+        let inventory = Inventory::try_from(RawInventory {
             schema: 2,
             account: "fixture-owner".into(),
-            repositories: vec![repository("fixture-owner", "private-code", 1)],
-        };
-        inventory.validate().unwrap();
-        let listed = inventory.repositories().unwrap();
-        assert_eq!(listed.repositories.len(), 1);
-        assert_eq!(listed.repositories[0].owner, "fixture-owner");
-        let mut invalid = inventory.clone();
-        invalid.schema = 1;
-        assert!(invalid.validate().is_err());
-        let mut duplicate = inventory;
-        duplicate
-            .repositories
-            .push(duplicate.repositories[0].clone());
-        assert!(duplicate.validate().is_err());
-    }
-
-    #[test]
-    fn private_inventory_never_drops_an_intended_repository_to_resolve_a_folder_collision() {
-        let inventory = Inventory {
-            schema: 2,
-            account: "alice".into(),
-            repositories: vec![
-                repository("alice", "shared", 1),
-                repository("team", "Shared", 2),
-            ],
-        };
-        let why = inventory.repositories().unwrap_err();
+            repositories: vec![repo.clone()],
+        })
+        .unwrap();
+        let listed = inventory.repositories();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].owner, "fixture-owner");
         assert!(
-            why.contains("1 conflicting destination(s) among 2 intended repositories"),
-            "{why}"
+            Inventory::try_from(RawInventory {
+                schema: 1,
+                account: "fixture-owner".into(),
+                repositories: vec![repo.clone()],
+            })
+            .is_err()
+        );
+        assert!(
+            Inventory::try_from(RawInventory {
+                schema: 2,
+                account: "fixture-owner".into(),
+                repositories: vec![repo.clone(), repo],
+            })
+            .is_err()
         );
     }
 
@@ -122,16 +125,16 @@ mod tests {
                 } else {
                     vec![active, excluded]
                 };
-                let inventory = Inventory {
+                let inventory = Inventory::try_from(RawInventory {
                     schema: 2,
                     account: "alice".into(),
                     repositories,
-                };
-                let listed = inventory.repositories().unwrap();
-                assert_eq!(listed.repositories.len(), 1);
-                assert_eq!(listed.repositories[0].owner, "team");
-                assert_eq!(listed.repositories[0].name, "shared");
-                assert!(listed.notes.is_empty());
+                })
+                .unwrap();
+                let listed = inventory.repositories();
+                assert_eq!(listed.len(), 1);
+                assert_eq!(listed[0].owner, "team");
+                assert_eq!(listed[0].name, "shared");
             }
         }
     }
@@ -148,21 +151,22 @@ mod tests {
             "clone_url".into(),
             aterm_json::Value::String("https://elsewhere.invalid/code.git".into()),
         );
-        let inventory = Inventory {
+        let inventory = RawInventory {
             schema: 2,
             account: "alice".into(),
             repositories: vec![active.clone(), excluded],
         };
-        assert!(inventory.repositories().is_err());
+        assert!(Inventory::try_from(inventory).is_err());
         let mut excluded = repository("team", "other", 1);
         excluded
             .as_object_mut()
             .unwrap()
             .insert("fork".into(), aterm_json::Value::Bool(true));
-        let inventory = Inventory {
+        let inventory = RawInventory {
+            schema: 2,
+            account: "alice".into(),
             repositories: vec![active, excluded],
-            ..inventory
         };
-        assert!(inventory.repositories().is_err());
+        assert!(Inventory::try_from(inventory).is_err());
     }
 }

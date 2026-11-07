@@ -424,6 +424,15 @@ impl Terminal {
         damage_class
     }
 
+    /// Test seam: with `on`, the engine takes every run of text lines one action at a time, as
+    /// before line feeds at the bottom of a history-free scroll region were coalesced, so the
+    /// differential tests can hold the coalesced path to it.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn set_reference_line_runs(&mut self, on: bool) {
+        self.transient.reference_line_runs = on;
+    }
+
     /// End an open synchronized-output (mode 2026) frame as its timeout does, without the parser, so a partly received character stays pending: whether one was open.
     pub fn end_synchronized_output(&mut self) -> bool {
         if !self.modes.synchronized_output {

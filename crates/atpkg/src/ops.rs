@@ -428,6 +428,7 @@ pub fn uninstall(layout: &Layout, program: &str) -> io::Result<()> {
 
     let prog_store = layout.prefix.join("store").join(program);
     let _first_exec = crate::store::first_exec_program_removal(&prog_store)?;
+    let sdk = crate::compat::prepare_sdk_removal(layout, program, true)?;
     if let Some(held) = crate::store::held_build_in(&prog_store) {
         return Err(io::Error::other(format!(
             "{} stays in place: a resolve check's child in it never exited on its own, and \
@@ -461,7 +462,7 @@ pub fn uninstall(layout: &Layout, program: &str) -> io::Result<()> {
         std::fs::remove_dir_all(&prog_store)?;
     }
 
-    crate::compat::remove_program(layout, program)?;
+    crate::compat::remove_program_guarded(layout, program, &sdk)?;
     Ok(())
 }
 
@@ -713,6 +714,67 @@ mod tests {
             "a build-number lookalike is not an installed build"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sdk_custody_refuses_uninstall_before_shims_or_payload_mutate() {
+        let l = layout("sdk-custody-uninstall");
+        let build = install(&l, "ay", 18);
+        install(&l, "ny", 9);
+        let subject = crate::lease::Subject::build("ay", 18).unwrap();
+        let lease =
+            crate::lease::take(&l.prefix, &subject, "SDK reader", std::time::Duration::ZERO)
+                .unwrap();
+        let child = lease.try_clone_descriptor().unwrap();
+        drop(lease);
+        assert_eq!(
+            uninstall(&l, "ay").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(which(&l, "ay").is_some() && crate::store::build_is_complete(&build));
+        drop(child);
+        uninstall(&l, "ay").unwrap();
+        assert!(which(&l, "ay").is_none() && !build.exists());
+        assert!(which(&l, "ny").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sdk_custody_ordinary_discard_and_matching_gc_guard_conserve_the_sdk() {
+        let l = layout("sdk-custody-discard");
+        let build = install(&l, "ay", 18);
+        let subject = crate::lease::Subject::build("ay", 18).unwrap();
+        let lease =
+            crate::lease::take(&l.prefix, &subject, "SDK reader", std::time::Duration::ZERO)
+                .unwrap();
+        let child = lease.try_clone_descriptor().unwrap();
+        drop(lease);
+        crate::store::discard_build(&build);
+        assert!(crate::store::build_is_complete(&build));
+        let wrong = crate::compat::sdk_mutation_guard(&l.prefix, "ay", 19).unwrap();
+        crate::store::discard_build_reclaimed(&build, &wrong);
+        assert!(crate::store::build_is_complete(&build));
+        drop(wrong);
+        drop(child);
+        let guard = crate::compat::sdk_mutation_guard(&l.prefix, "ay", 18).unwrap();
+        crate::store::discard_build_reclaimed(&build, &guard);
+        assert!(
+            !build.exists(),
+            "the actual original GC guard must not be recursively acquired"
+        );
+    }
+
+    #[test]
+    fn sdk_custody_keeps_unrepresentable_non_sdk_names_working() {
+        let l = layout("sdk-custody-ordinary-name");
+        let build = install(&l, "a.b", 18);
+        assert!(crate::lease::Subject::build("a.b", 18).is_none());
+        uninstall(&l, "a.b").unwrap();
+        assert!(!build.exists());
+        let build = install(&l, "go.tool", 19);
+        crate::store::discard_build(&build);
+        assert!(!build.exists());
     }
 
     #[test]

@@ -298,15 +298,19 @@ fn hold(words: &Words) -> u8 {
         End::Status(status) if libc::WIFSIGNALED(status) => survive(held, &meter, words),
         End::Status(_) | End::Unknown => held,
     };
-    let succeeded =
-        matches!(end, End::Status(s) if libc::WIFEXITED(s) && libc::WEXITSTATUS(s) == 0);
+    let built = match end {
+        End::Status(status) => {
+            super::BuildEnd::Status(std::os::unix::process::ExitStatusExt::from_raw(status))
+        }
+        End::Unknown => super::BuildEnd::Unknown,
+    };
     let ended = held.let_go();
     #[cfg(any(test, debug_assertions))]
-    trace_record(|| aterm_json::json!({"kind": "claim-released", "succeeded": succeeded}));
+    trace_record(|| aterm_json::json!({"kind": "claim-released", "succeeded": built.succeeded()}));
     let peak = meter.stop(0);
     #[cfg(any(test, debug_assertions))]
     trace_record(|| aterm_json::json!({"kind": "meter-stopped", "peak": peak}));
-    ended.keep(succeeded, peak, &mut |_| {});
+    ended.keep(built, peak, &mut |_| {});
     #[cfg(any(test, debug_assertions))]
     trace_record(|| {
         aterm_json::json!({

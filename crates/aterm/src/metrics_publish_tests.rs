@@ -9,7 +9,9 @@
 use super::{EVERY_ROW, Homes, Log, Places, Publisher, Report};
 use aterm_agent::harness::disk::discover::Running;
 use aterm_agent::harness::{accounts, claude_homes, provider_read, usage::rfc3339_utc};
-use aterm_metrics::row::{ManagerEntry, NeedEntry, NeedsRow, Row, Sid, Word};
+use aterm_metrics::row::{
+    ACTIVITY_REFRESH_S, ActivityRow, ManagerEntry, NeedEntry, NeedsRow, Row, Sid, Word,
+};
 use aterm_metrics::subject::{Class, Cli, Metric, Node, Now, Subject, Width};
 use std::collections::BTreeMap;
 use std::io;
@@ -599,6 +601,71 @@ fn a_needs_change_pushed_by_a_window_publishes_one_needs_row() {
     publisher.needs(Some(&log as &dyn Log), &windows, now + 9);
     let published = log.since(before);
     assert_eq!(published.len(), 1, "{published:?}");
+}
+
+/// THE ACTIVITY ROW is published on change and again each refresh: a count of no agents is a
+/// reading (the windows were read and run none), published on first sight; an unchanged count is
+/// not published again until one [`ACTIVITY_REFRESH_S`] newer comes, and is then, so a reader
+/// tells a count that still holds from a Mac that stopped publishing; a publisher started over a
+/// log that holds the count, as after a restart, publishes nothing; and a changed count is
+/// published at once. A `now` row this build does not name is passed over on the read back.
+/// NEGATIVE CONTROL: an empty needs row, which says what no row says, is not published.
+#[test]
+fn an_activity_count_publishes_on_change_and_each_refresh() {
+    let scratch = Scratch::new();
+    let publisher = Publisher::new(scratch.places());
+    let log = Kept::new();
+    let now = u64::try_from(scratch.now).expect("a time");
+    let report = publisher.needs(Some(&log as &dyn Log), &BTreeMap::new(), now);
+    assert_eq!((report.rows, log.len()), (0, 0), "an empty needs row");
+    let count = |at: u64, busy: u32| ActivityRow {
+        at,
+        busy,
+        ..ActivityRow::default()
+    };
+    let publish = |publisher: &Publisher, row: ActivityRow| {
+        let before = log.len();
+        let report = publisher.activity(Some(&log as &dyn Log), row, now);
+        let published = log.since(before);
+        assert_eq!(report.rows, published.len(), "{published:?}");
+        published
+    };
+    let zero = count(now, 0);
+    assert_eq!(
+        publish(&publisher, zero.clone()),
+        [(ActivityRow::subject(log.node()), Row::Activity(zero))],
+        "no agents, published on first sight"
+    );
+    assert_eq!(
+        publish(&publisher, count(now + ACTIVITY_REFRESH_S - 1, 0)),
+        [],
+        "unchanged, before its refresh"
+    );
+    let refreshed = count(now + ACTIVITY_REFRESH_S, 0);
+    assert_eq!(
+        publish(&publisher, refreshed.clone()),
+        [(ActivityRow::subject(log.node()), Row::Activity(refreshed))],
+        "unchanged, at its refresh"
+    );
+    // A later build's `now` row on the log, which this build's grammar does not name, is passed
+    // over as an older build passes over this one's activity row: the rest still reads back.
+    log.publish(
+        &format!("/m/{}/shared/now/zzz", log.node()),
+        b"a later build's row",
+    )
+    .expect("kept");
+    let restarted = Publisher::new(scratch.places());
+    assert_eq!(
+        publish(&restarted, count(now + ACTIVITY_REFRESH_S + 60, 0)),
+        [],
+        "a restart reads the count back"
+    );
+    let busy = count(now + ACTIVITY_REFRESH_S + 120, 1);
+    assert_eq!(
+        publish(&restarted, busy.clone()),
+        [(ActivityRow::subject(log.node()), Row::Activity(busy))],
+        "a changed count at once"
+    );
 }
 
 /// The node service's own `metrics.log` reads back what a pass published on it: the newest row of

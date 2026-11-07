@@ -115,6 +115,20 @@ pub trait Packer {
             "this packer cannot acquire upstream bottles",
         ))
     }
+
+    /// Admit and qualify an existing GNU bottle without building or repacking it.
+    /// The caller supplies a verified published merge base; this writes unsigned local files.
+    /// # Errors
+    /// An unsupported packer, changed payload, incompatible manifest or qualification refusal.
+    fn reuse_bottle(
+        &self,
+        _ctx: &Ctx,
+        _request: &crate::artifact::bottle::reuse::Request,
+    ) -> Result<crate::artifact::bottle::BottleOutcome> {
+        Err(crate::error::Error::cannot_run(
+            "this packer cannot reuse GNU bottles",
+        ))
+    }
 }
 
 /// The hello-world probe switch and the Trust sysroot that admits the packed compiler.

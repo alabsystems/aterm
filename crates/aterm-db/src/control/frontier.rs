@@ -796,26 +796,38 @@ pub(super) fn connected(
                 // do not hold up table repair: both sides stopped at the same frame boundary.
                 // An `atdb/4` session ends there, as 0.153's does.
                 #[cfg(test)]
-                let ending = if ending == Ending::Deferred
+                let ending = if matches!(ending, Ending::Deferred | Ending::Exhausted)
                     && mutants::on(mutants::Mutant::DeferredEndsSession)
                 {
                     Ending::Interrupted
                 } else {
                     ending
                 };
+                // Running out of rounds or time spends a bounded budget; a round that moved
+                // nothing spends none, and names no more specific category.
                 let stop = match ending {
                     Ending::Complete => None,
-                    Ending::Deferred if wire == Wire::Delta => None,
-                    Ending::Deferred => Some("Commons membership repair has more records"),
-                    Ending::Interrupted => Some("Commons membership repair ran out of time"),
+                    Ending::Deferred | Ending::Exhausted if wire == Wire::Delta => None,
+                    Ending::Deferred => Some((
+                        aterm_types::network_state::RepairCause::Other,
+                        "Commons membership repair moved nothing and has more records",
+                    )),
+                    Ending::Exhausted => Some((
+                        aterm_types::network_state::RepairCause::Quota,
+                        "Commons membership repair has more records",
+                    )),
+                    Ending::Interrupted => Some((
+                        aterm_types::network_state::RepairCause::Quota,
+                        "Commons membership repair ran out of time",
+                    )),
                 };
-                if let Some(stop) = stop {
-                    lease.membership_error = Some(stop.to_owned());
+                if let Some((cause, stop)) = stop {
+                    lease.membership_error = Some(super::Failure::new(cause, stop));
                     return Ok(control);
                 }
             }
             Err(error) => {
-                lease.membership_error = Some(error.to_string());
+                lease.membership_error = Some(super::Failure::of(&error));
                 return Ok(control);
             }
         }
@@ -1113,9 +1125,13 @@ pub(super) fn select_batch(
 enum Ending {
     /// Each side holds what the other offered.
     Complete,
-    /// Both sides stopped after the same round with records left (a round moved nothing, or the
-    /// rounds ran out), at a frame boundary.
+    /// Both sides stopped after the same round with records left, at a frame boundary: that round
+    /// moved nothing (offers held back after the peer refused them, or a local writer moved a
+    /// view).
     Deferred,
+    /// Both sides stopped with records left when the session's rounds ran out, at a frame
+    /// boundary.
+    Exhausted,
     /// This side's deadline passed before a round, which the peer may have begun: nothing more is
     /// read or sent.
     Interrupted,
@@ -1200,11 +1216,12 @@ fn repair_records(
         // The peer reads the same four counts (its sent is this side's received, its offer this
         // side's incoming), so both stop after this round together.
         if sent.sent + received.received == 0 && offered.is_empty() && incoming == 0 {
-            break;
+            total.deferred = total.deferred.max(1);
+            return Ok((total, Ending::Deferred));
         }
     }
     total.deferred = total.deferred.max(1);
-    Ok((total, Ending::Deferred))
+    Ok((total, Ending::Exhausted))
 }
 
 /// `ACE1` enrollment over a frontier wire: the member pushes its seat evidence and then the new

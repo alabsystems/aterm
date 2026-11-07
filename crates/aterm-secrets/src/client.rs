@@ -159,9 +159,9 @@ pub use remove::{
     CutPass, ListedMac, MemberRemoval, NodePass, NodePassHost, NodePassPace, NodePassReceipt,
     NodePassSaid, RemovedNote, RemovedNotes, TableCuts, UndoOffer, UndoShare, cut_own_removals,
     epoch_convergence_environment, gap_heal_environment, member_list, node_pass_receipt,
-    on_table_cuts, read_after_cutoff_lines, remove_member, removed_notes, removes_by_log,
-    reseal_waits, revoke_by_log, run_node_pass, tend_epochs, tend_epochs_at, undo_offers,
-    undo_removals, vault_admin_named, vault_pass_at,
+    on_table_cuts, read_after_cutoff_lines, remove_member, remove_seat, removed_notes,
+    removes_by_log, reseal_waits, revoke_by_log, run_node_pass, tend_epochs, tend_epochs_at,
+    undo_offers, undo_removals, vault_admin_named, vault_pass_at,
 };
 #[cfg(any(test, debug_assertions))]
 pub use remove::{test_put_everyone, test_remove_unposted};
@@ -193,7 +193,11 @@ pub use steward::{
     steward_revoke_check, steward_standby_server_check, stewardship,
 };
 pub use subscriber::mend_subscriber;
-pub use vault_memo::swarm_denied_nodes_now;
+pub(crate) use vault_memo::observe_commons_now;
+pub use vault_memo::{
+    DeskInputs, acknowledged_commons_log_now, desk_inputs, local_swarm_roster_for_log_now,
+    swarm_denied_nodes_now, swarm_roster_now_until,
+};
 #[cfg(test)]
 mod approver_queue_tests;
 #[cfg(test)]
@@ -224,6 +228,8 @@ mod peer_selection_tests;
 mod cold_read_tests;
 #[cfg(test)]
 mod envelope_denial_tests;
+#[cfg(test)]
+mod idle_reads_tests;
 #[cfg(test)]
 mod lab_start_over_tests;
 #[cfg(test)]
@@ -2841,18 +2847,50 @@ impl MaterializationSnapshot {
         }
     }
 
+    /// The full readiness check of [`Self::is_current`], without waiting for a writer.
+    /// A busy or missing state lock returns `false`. This is a point-in-time admission
+    /// check, not a lease over later effects.
+    /// # Errors
+    /// The local configuration or state cannot be safely read.
+    pub fn is_current_now(&self, paths: &Paths) -> crate::Result<bool> {
+        Ok(with_materialization_ready(paths, &self.config, || Ok(()))?
+            .is_some_and(|current| current.snapshot.holds_the_files_of(self)))
+    }
+
+    /// Whether the captured source's recorded membership and input digests still hold.
+    /// Observes the state lock once; a busy or missing lock returns `false`. This is only
+    /// a cancellation check for work admitted by a full readiness check: it does not
+    /// verify cached authority, the membership log, or file contents, and must never
+    /// admit an effect or report materialization ready. Call [`Self::is_current_now`]
+    /// again at effect boundaries.
+    /// # Errors
+    /// The local configuration or state cannot be safely read.
+    pub fn source_continues(&self, paths: &Paths) -> crate::Result<bool> {
+        let Some(observation) = StateLock::observe(paths)? else {
+            return Ok(false);
+        };
+        let Ok((_, state)) = materialization_source_state(paths, Some(&self.config), &observation)?
+        else {
+            return Ok(false);
+        };
+        Ok(!state.failed && state.pending.is_empty() && self.matches_manifest(&state.manifest))
+    }
+
     /// The same vault, with the same files at the same digests ([`Self::is_current`]).
     fn holds_the_files_of(&self, then: &Self) -> bool {
-        self.config == then.config
-            && match &then.entries {
-                None => self.manifest == then.manifest,
-                Some(entries) => entries.iter().all(|name| {
-                    then.manifest
-                        .files
-                        .get(name)
-                        .is_some_and(|digest| self.manifest.files.get(name) == Some(digest))
-                }),
-            }
+        self.config == then.config && then.matches_manifest(&self.manifest)
+    }
+
+    fn matches_manifest(&self, manifest: &Manifest) -> bool {
+        match &self.entries {
+            None => self.manifest == *manifest,
+            Some(entries) => entries.iter().all(|name| {
+                self.manifest
+                    .files
+                    .get(name)
+                    .is_some_and(|digest| manifest.files.get(name) == Some(digest))
+            }),
+        }
     }
 }
 
@@ -2932,6 +2970,36 @@ fn materialization_ready_with(
     ))
 }
 
+/// The common recorded source checks, with the caller holding the state lock.
+/// Full readiness additionally verifies denial evidence, cached authority and files.
+fn materialization_source_state(
+    paths: &Paths,
+    expected: Option<&Config>,
+    _observation: &StateLock,
+) -> crate::Result<Result<(Config, State), MaterializationBlocker>> {
+    use MaterializationBlocker as Blocker;
+    let Some(config) = config(paths)? else {
+        return Ok(Err(Blocker::Unconfigured));
+    };
+    if expected.is_some_and(|expected| *expected != config) {
+        return Ok(Err(Blocker::ConfigChanged));
+    }
+    if !pin_admitted(&config, None) {
+        return Ok(Err(Blocker::UntrustedPin));
+    }
+    let state = load_state(paths)?;
+    if state.membership == Stored::Revoked {
+        return Ok(Err(Blocker::Revoked));
+    }
+    if !matches!(state.membership, Stored::In | Stored::Plain) {
+        return Ok(Err(Blocker::NotAdmitted));
+    }
+    if !source_bound(&config, &state) && !log_only_source_bound(&config, &state) {
+        return Ok(Err(Blocker::SourceChanged));
+    }
+    Ok(Ok((config, state)))
+}
+
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -2949,35 +3017,17 @@ fn with_ready_state<T>(
 ) -> crate::Result<MaterializationObservation<T>> {
     use MaterializationBlocker as Blocker;
     let blocked = |why| Ok(MaterializationObservation::Blocked(why));
-    let Some(_observation) = StateLock::observe(paths)? else {
+    let Some(observation) = StateLock::observe(paths)? else {
         return blocked(Blocker::LockUnavailable);
     };
-    let Some(config) = config(paths)? else {
-        return blocked(Blocker::Unconfigured);
+    let (config, state) = match materialization_source_state(paths, expected, &observation)? {
+        Ok(ready) => ready,
+        Err(Blocker::Revoked) if dropped(paths) => return blocked(Blocker::Dropped),
+        Err(why) => return blocked(why),
     };
-    if expected.is_some_and(|expected| *expected != config) {
-        return blocked(Blocker::ConfigChanged);
-    }
-    if !pin_admitted(&config, None) {
-        return blocked(Blocker::UntrustedPin);
-    }
-    let state = load_state(paths)?;
-    if state.membership == Stored::Revoked {
-        return blocked(if dropped(paths) {
-            Blocker::Dropped
-        } else {
-            Blocker::Revoked
-        });
-    }
-    if !matches!(state.membership, Stored::In | Stored::Plain) {
-        return blocked(Blocker::NotAdmitted);
-    }
-    if !source_bound(&config, &state) && !log_only_source_bound(&config, &state) {
-        return blocked(Blocker::SourceChanged);
-    }
     if state.membership == Stored::In
         && config.signer.is_some()
-        && steward::local_recipient_denied_in_roster(paths)
+        && steward::local_recipient_denied_in_roster_held(paths, &observation)
     {
         return blocked(Blocker::Revoked);
     }
@@ -7402,8 +7452,12 @@ fn put_back_due(
 /// and a dial of the fleet's issuer must never hold up this long-poll (or, on an admin Mac, the
 /// approver beside it).
 #[cfg(not(test))]
-fn start_converge(exe: &Path, log: &dyn Fn(&str)) -> Option<aterm_uds::spawnfd::Child> {
-    crate::converge::start(exe, crate::converge::SUBSCRIBER)
+fn start_converge(
+    exe: &Path,
+    work: crate::converge::RepositoryWork,
+    log: &dyn Fn(&str),
+) -> Option<aterm_uds::spawnfd::Child> {
+    crate::converge::start(exe, crate::converge::SUBSCRIBER, work)
         .map_err(|error| log(&format!("could not start the converge pass: {error}")))
         .ok()
 }
@@ -7411,7 +7465,11 @@ fn start_converge(exe: &Path, log: &dyn Fn(&str)) -> Option<aterm_uds::spawnfd::
 /// A test build's live subscriber starts no runner: the test binary is no aterm. A test hands
 /// [`subscriber_loop_until`] a [`Converging`] of its own.
 #[cfg(test)]
-fn start_converge(_exe: &Path, _log: &dyn Fn(&str)) -> Option<aterm_uds::spawnfd::Child> {
+fn start_converge(
+    _exe: &Path,
+    _work: crate::converge::RepositoryWork,
+    _log: &dyn Fn(&str),
+) -> Option<aterm_uds::spawnfd::Child> {
     None
 }
 
@@ -7420,7 +7478,10 @@ fn start_converge(_exe: &Path, _log: &dyn Fn(&str)) -> Option<aterm_uds::spawnfd
 /// [`crate::server::route_sources`], or a test's own.
 struct Converging<'a> {
     /// Start the runner of the program at this path, without waiting for it.
-    start: &'a (dyn Fn(&Path) -> Option<aterm_uds::spawnfd::Child> + Sync),
+    start: &'a (
+            dyn Fn(&Path, crate::converge::RepositoryWork) -> Option<aterm_uds::spawnfd::Child>
+                + Sync
+        ),
     /// This Mac's routes.
     routes: &'a (dyn Fn() -> crate::converge::Routes + Sync),
 }
@@ -7626,7 +7687,7 @@ fn ask_members_if_due_with_native(
 }
 
 fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<()> {
-    let start = |exe: &Path| start_converge(exe, log);
+    let start = |exe: &Path, work| start_converge(exe, work, log);
     let converging = Converging {
         start: &start,
         routes: &crate::server::route_sources,
@@ -7657,15 +7718,20 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
         away: &away,
     };
     let projection = projection::Projection::observing(&converging, projection::inputs(paths));
-    let run = || subscriber_loop_projecting(paths, log, &|| false, &hearing, &projection);
+    let run = |maintain: &mut dyn FnMut() -> member_routes::Status| {
+        subscriber_loop_projecting(paths, log, &|| false, &hearing, &projection, maintain)
+    };
     member_routes::while_hearing(
         paths,
         &hearing.members,
         &ask,
         log,
         &|event| match event {
+            member_routes::ProjectionEvent::Maintenance => projection.maintain(),
             member_routes::ProjectionEvent::Admitted => projection.admitted(),
             member_routes::ProjectionEvent::Observe => projection.poll(),
+            member_routes::ProjectionEvent::Recovered => projection.recovered(),
+            member_routes::ProjectionEvent::Ended => bell.ring(crate::wake::Wake::Listener),
             member_routes::ProjectionEvent::BrokerReady => bell.ring(crate::wake::Wake::Broker),
         },
         member_routes::NativeChanges::new(),
@@ -7751,7 +7817,12 @@ fn subscriber_loop_until(
     hearing: &Hearing<'_>,
 ) -> crate::Result<()> {
     let projection = projection::Projection::new(converging);
-    subscriber_loop_projecting(paths, log, stop, hearing, &projection)
+    subscriber_loop_projecting(paths, log, stop, hearing, &projection, &mut || {
+        member_routes::Status {
+            listening: false,
+            retry: None,
+        }
+    })
 }
 
 fn subscriber_loop_projecting(
@@ -7760,6 +7831,7 @@ fn subscriber_loop_projecting(
     stop: &dyn Fn() -> bool,
     hearing: &Hearing<'_>,
     projection: &projection::Projection<'_>,
+    maintain: &mut dyn FnMut() -> member_routes::Status,
 ) -> crate::Result<()> {
     let mut backoff = Duration::from_secs(5);
     let mut failing = FIRST_RETRY;
@@ -7785,9 +7857,14 @@ fn subscriber_loop_projecting(
         if stop() {
             return Ok(());
         }
+        // Arm before reading the listener's level: a notice sent after this clear
+        // must survive to the nap, even if its handle is not finished just yet.
+        hearing.bell.clear();
         // Every round, healthy or not, reaps a runner that ended (how it ended is kept for the
         // next healthy round's due check): one started while the vault cannot be reached is no
         // zombie for as long as that lasts.
+        let listener = maintain();
+        projection.maintain();
         projection.reap();
         if projection.replaced() {
             log("this program was replaced on disk; exiting so the service starts the new one");
@@ -7798,6 +7875,12 @@ fn subscriber_loop_projecting(
             (hearing.hold)();
             std::thread::sleep(SWARM_LOOK);
             continue;
+        }
+        // A refused or ended listener is retained for retry at ordinary round boundaries.
+        // Keep observing here meanwhile, under the same fresh sharing gate. This fallback
+        // follows the network round; the healthy listener remains independent of its HTTP.
+        if !listener.listening {
+            projection.poll();
         }
         // Whether or not the vault's source answers: the members on this LAN can let this Mac
         // in while it cannot be reached.
@@ -7819,10 +7902,6 @@ fn subscriber_loop_projecting(
                 .map(|state| (state.seq, state.records_digest))
         };
         let before = progress();
-        // What rang before this pass is in it: the pass reads the routes and the servers heard
-        // as it goes. What rings while it runs ends the nap after it, and routes that move
-        // while it fails are a move that nap sees.
-        hearing.bell.clear();
         let routes = crate::server::route_sources();
         let started = Instant::now();
         let said = std::cell::Cell::new(SourceSaid::AtOnce);
@@ -7865,11 +7944,14 @@ fn subscriber_loop_projecting(
                 if failed_over_idle(pass) {
                     // The source is away and the servers found hold nothing newer: asked
                     // again as after an error, never in a loop.
-                    let moved = nap_after_failing(hearing, routes, backoff, log);
+                    let moved = nap_after_failing(hearing, routes, listener.limit(backoff), log);
                     backoff = retry_after(backoff, moved, (hearing.away)());
                 } else {
                     backoff = Duration::from_secs(5);
-                    std::thread::sleep(pause.saturating_sub(started.elapsed()));
+                    pause_on_bell(
+                        hearing.bell,
+                        listener.limit(pause.saturating_sub(started.elapsed())),
+                    );
                 }
             }
             Err(error) => {
@@ -7883,9 +7965,27 @@ fn subscriber_loop_projecting(
                 if stop() {
                     return Ok(());
                 }
-                let moved = nap_after_failing(hearing, routes, backoff, log);
+                let moved = nap_after_failing(hearing, routes, listener.limit(backoff), log);
                 backoff = retry_after(backoff, moved, (hearing.away)());
             }
+        }
+    }
+}
+
+/// Keep healthy batching's original deadline, while an ended readiness owner can
+/// request upkeep immediately. Other queued hints neither end nor renew this pause.
+fn pause_on_bell(bell: &crate::wake::Bell, pause: Duration) -> crate::wake::Wake {
+    let deadline = Instant::now() + pause;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return crate::wake::Wake::Timer;
+        }
+        if let why @ (crate::wake::Wake::Timer
+        | crate::wake::Wake::Listener
+        | crate::wake::Wake::Stop) = bell.nap(left)
+        {
+            return why;
         }
     }
 }
@@ -7919,7 +8019,11 @@ fn nap_after_failing_with(
         &mut || {
             matches!(
                 woke.get(),
-                Some(crate::wake::Wake::Browse | crate::wake::Wake::Broker)
+                Some(
+                    crate::wake::Wake::Browse
+                        | crate::wake::Wake::Broker
+                        | crate::wake::Wake::Listener
+                )
             ) || routes_moved()
         },
         &mut |most| wait_for_a_ring(hearing, &woke, most),

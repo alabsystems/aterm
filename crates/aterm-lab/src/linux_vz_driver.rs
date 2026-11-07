@@ -370,6 +370,8 @@ pub struct Vz {
     pub helper_sha256: String,
     /// The agent's hello.
     pub hello: Hello,
+    /// The first `Lost` a command of this run ended in ([`Vz::lost`]).
+    lost: std::sync::OnceLock<String>,
 }
 
 impl std::fmt::Debug for Vz {
@@ -399,7 +401,14 @@ impl Vz {
             in_dir,
             helper_sha256,
             hello,
+            lost: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The first `Lost` a command of this run ended in, when one did.
+    #[must_use]
+    pub fn lost(&self) -> Option<&str> {
+        self.lost.get().map(String::as_str)
     }
 
     fn with_link<T>(&self, f: impl FnOnce(&mut dyn Link) -> T) -> Option<T> {
@@ -411,8 +420,16 @@ impl Vz {
     }
 
     /// Run `exec` on a connection of its own, writing `stdin` when given, handing each
-    /// chunk of its stdout to `on_out`.
+    /// chunk of its stdout to `on_out`; a `Lost` end is kept as [`Vz::lost`].
     pub fn run(&self, exec: &Exec, stdin: Option<&[u8]>, on_out: &mut dyn FnMut(&[u8])) -> Ran {
+        let ran = self.run_once(exec, stdin, on_out);
+        if let Ended::Lost(why) = &ran.ended {
+            let _ = self.lost.set(why.clone());
+        }
+        ran
+    }
+
+    fn run_once(&self, exec: &Exec, stdin: Option<&[u8]>, on_out: &mut dyn FnMut(&[u8])) -> Ran {
         let t0 = Instant::now();
         let lost = |why: String, out: Vec<u8>, err: Vec<u8>| Ran {
             ended: Ended::Lost(why),
@@ -848,6 +865,10 @@ pub struct Opened {
     pub steps: Vec<(String, f64)>,
     /// This run's claim on the VM ([`crate::vm_admit`]): its memory and vCPUs when it boots.
     pub admitted: crate::vm_admit::Admitted,
+    /// The VM's processes ([`crate::vm_admit::vm_procs`]): its helper, which `setsid` parts
+    /// from the run that started it, and whatever holds the disk it booted, whether this run
+    /// booted it or not.
+    pub procs: Vec<u32>,
 }
 
 /// The share entry's name for the directory `path` of `kind` (`repo`, `git`):
@@ -900,14 +921,40 @@ pub fn shares(repo: &Path, in_dir: &Path) -> Vec<ShareEntry> {
     out
 }
 
+/// The claim a session's VM goes on under ([`open`]): `held`, the claim a bake's boot was
+/// admitted with, when the session boots the VM (the sealed disk); otherwise `held` is let go
+/// first and `admit` asked with whether the session boots, so a run on a VM already up claims
+/// its vCPUs alone.
+///
+/// # Errors
+/// As `admit`.
+fn boot_claim<A>(
+    held: Option<A>,
+    booting: bool,
+    admit: impl FnOnce(bool) -> Result<A, Fail>,
+) -> Result<A, Fail> {
+    match (held, booting) {
+        (Some(held), true) => {
+            println!("linux: capacity: the boot on the sealed disk goes on under the bake's claim");
+            Ok(held)
+        }
+        (held, _) => {
+            drop(held);
+            admit(booting)
+        }
+    }
+}
+
 /// The arm's `up`: the gates (Apple silicon, Rosetta for Linux, the `virtualization` row),
 /// the helper and the agent built and placed under the state, then a session, and only when
 /// it found no VM the kernel laid, the disks prepared and the boot; then the agent's
 /// `Ready` and the share mounted. A bake's boot comes back with its disk ([`Opened::bake`]).
+/// `held` is the claim that bake's boot was admitted under: the boot on the sealed disk goes
+/// on under it, not behind every claim made while the bake ran.
 ///
 /// # Errors
 /// NOT RUN where a gate, a build, the helper or the boot says so.
-pub fn open(repo: &Path) -> Result<Opened, Fail> {
+pub fn open(repo: &Path, held: Option<crate::vm_admit::Admitted>) -> Result<Opened, Fail> {
     if !cfg!(target_arch = "aarch64") {
         return Err(not_run("the vz lane needs Apple silicon"));
     }
@@ -960,7 +1007,9 @@ pub fn open(repo: &Path) -> Result<Opened, Fail> {
         t0.elapsed().as_secs_f64(),
         session.phase.name()
     );
-    let mut admitted = crate::vm_admit::admit(&crate::vm_admit::VZ, booted_here)?;
+    let mut admitted = boot_claim(held, booted_here, |booting| {
+        crate::vm_admit::admit(&crate::vm_admit::VZ, booting)
+    })?;
     let mut bake = None;
     let prepare = || -> Result<Plan, Fail> {
         let (plan, partial) = plan(&paths, &seed_user, &boot_share, &agent.sha256, &shares)?;
@@ -976,19 +1025,17 @@ pub fn open(repo: &Path) -> Result<Opened, Fail> {
             UpError::Prepare(fail) => fail,
             UpError::Client(e) => client_fail(e, &placed.exe, lab.replaced.as_ref()),
         })?;
+    let disk = bake
+        .as_ref()
+        .map_or_else(|| paths.live_disk(), |b| b.path().to_path_buf());
+    let helper = Record::read(&paths.record()).map(|r| r.pid);
+    let procs = crate::vm_admit::vm_procs(&disk, helper.as_slice());
     if booted_here {
         steps.push((
             if bake.is_some() { "bake boot" } else { "boot" }.to_string(),
             t0.elapsed().as_secs_f64(),
         ));
-        let disk = bake
-            .as_ref()
-            .map_or_else(|| paths.live_disk(), |b| b.path().to_path_buf());
-        let helper = Record::read(&paths.record()).map(|r| r.pid);
-        admitted.credit(
-            "linux",
-            &crate::vm_admit::vm_procs(&disk, helper.as_slice()),
-        );
+        admitted.credit("linux", &procs);
     }
     let vz = Vz::new(Box::new(session), user, paths, placed.sha256, hello);
     if let Err(why) = vz.mount(&shares) {
@@ -1003,6 +1050,7 @@ pub fn open(repo: &Path) -> Result<Opened, Fail> {
         bake,
         steps,
         admitted,
+        procs,
     })
 }
 
@@ -1924,9 +1972,9 @@ pub fn cmd_vz_smoke(rest: &[String]) -> crate::Res {
         }
     };
     crate::linux_driver::choose("vz")?;
-    let _lock = crate::linux::LaneLock::boot()?;
+    let mut lane = crate::linux::LaneLock::boot()?;
     let t0 = Instant::now();
-    let up = crate::linux::bring_up()?;
+    let up = crate::linux::bring_up(&mut lane)?;
     for step in &up.timings {
         println!("vz-smoke: bring-up: {} {:.1} s", step.name, step.secs);
     }

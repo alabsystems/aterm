@@ -57,6 +57,11 @@ pub mod unitgraph;
 pub use aterm_toolchain::discovery as toolchain;
 #[cfg(unix)]
 pub mod judged;
+/// `verify land`: merge main, judge the cone since it, push, compose or re-judge (design B10).
+#[cfg(unix)]
+pub mod land;
+#[cfg(unix)]
+mod remote;
 pub mod wasm_glue;
 mod wasm_page;
 pub mod wasm_smoke;
@@ -111,6 +116,11 @@ pub struct EnvSnapshot {
     pub cargo_build_jobs: Option<OsString>,
     /// `BUILD_SLOT_HELD`, raw: a managed run must name its admitted CPU share.
     pub build_slot_held: Option<OsString>,
+    /// `ATERM_RELEASE_POOL` ([`aterm_capacity::POOL_ENV`]), raw: the pool a release handed this
+    /// run, which [`main`] adopts ([`Ctx::pool`]) and the test run's charges are drawn from
+    /// ([`test_workers::share`]). Removed from every child (`ATERM_RELEASE_*` in
+    /// [`CHILD_ENV_REMOVED`]): the run charges its children itself.
+    pub release_pool: Option<OsString>,
     /// `RUSTDOC` or `CARGO_BUILD_RUSTDOC`.
     pub rustdoc_override: Option<OsString>,
     /// `RUSTC` and `CARGO_BUILD_RUSTC`, each when set: a compiler every compile child would take
@@ -157,6 +167,7 @@ impl EnvSnapshot {
             ssh_connection: std::env::var("SSH_CONNECTION").ok(),
             cargo_build_jobs: std::env::var_os("CARGO_BUILD_JOBS"),
             build_slot_held: std::env::var_os("BUILD_SLOT_HELD"),
+            release_pool: std::env::var_os(aterm_capacity::POOL_ENV),
             rustdoc_override: std::env::var_os("RUSTDOC")
                 .or_else(|| std::env::var_os("CARGO_BUILD_RUSTDOC")),
             rustc_vars: aterm_toolchain::rustc_movers::RUSTC_VARS
@@ -584,8 +595,6 @@ pub struct Ctx {
     pub checkers_in_tests: bool,
     /// `--app <APP>`.
     pub measure_artifact: Option<MeasureArtifact>,
-    /// Requested `--test-jobs` ceiling on binaries at once; [`Self::test_jobs`] applies admission.
-    pub test_jobs: Option<u32>,
     /// Requested `--test-threads`, else the caller's own `RUST_TEST_THREADS`: the widest a test
     /// binary runs ([`test_plan`]).
     pub test_threads: Option<u32>,
@@ -605,13 +614,15 @@ pub struct Ctx {
     /// Where the run keeps what each stage's memory peaked at, and the machine it claims on
     /// ([`memory::Book`], VERIFY-MEM); `None` measures nothing and keeps nothing.
     pub memory: Option<memory::Book>,
-    /// Where the run keeps what each test binary took ([`test_history`]), planning data and
-    /// never a verdict; `None` keeps nothing, as every run a test makes does.
+    /// Where the run keeps what each test binary took ([`test_history`]), which its test runs plan
+    /// by ([`test_plan`]): planning data, never a verdict. `None` keeps nothing and plans every
+    /// binary as unseen, as every run a test makes does.
     pub test_history: Option<PathBuf>,
     /// The test binaries a release's resume carries ([`testrun::carry`], `--passed-binaries`).
     pub passed_binaries: Option<testrun::Passed>,
-    /// Where a release writes each `check-finished` and `test-binary-finished` line whole,
-    /// apart from its output (`--events`), for its cutter's records (A19).
+    /// Where a run writes each `check-finished` and `test-binary-finished` line whole, apart
+    /// from its output, and its `run-finished` line last (`--events`): a release's cutter keeps
+    /// its records from it (A19), and `verify land` its judgment (B10).
     pub events: Option<event_log::EventLog>,
     /// A call of the run's test compile did not pass: every later call of it, and the test
     /// run's own compile, are COULD NOT RUN behind it and start no cargo, since a recompile of
@@ -634,6 +645,10 @@ pub struct Ctx {
     /// What names a test compile's heavy compiler for its unit's record ([`memory::read_unit`]
     /// but in a test).
     pub unit_reader: memory::UnitReader,
+    /// The release's pool this run adopted from [`EnvSnapshot::release_pool`] ([`run_cli`]):
+    /// the test run's share, its binaries' charges held in its tokens
+    /// ([`testrun::dispatch_pooled`]); `None` outside a release.
+    pub pool: Option<aterm_capacity::Jobserver>,
 }
 
 /// A `CARGO_BUILD_JOBS` value as a job count.
@@ -751,7 +766,6 @@ impl Ctx {
             compile_only: false,
             checkers_in_tests: false,
             measure_artifact: None,
-            test_jobs: None,
             test_threads: pinned_threads,
             test_recorder: std::env::current_exe().ok(),
             quiet: None,
@@ -767,6 +781,7 @@ impl Ctx {
             shape_run: Mutex::new(shape::Run::default()),
             began: std::time::SystemTime::now(),
             unit_reader: memory::read_unit,
+            pool: None,
         };
         ctx.refresh_test_threads();
         ctx
@@ -884,40 +899,41 @@ impl Ctx {
         parse_build_jobs(self.env.cargo_build_jobs.as_deref())
     }
 
-    /// The most test binaries that run at once ([`Ctx::test_jobs`] within the share, at least one).
+    /// The CPU share the test binaries are charged from ([`test_workers::share`]): the release's
+    /// pool's slots where a pool was adopted, the admitted share where a slot is held
+    /// ([`test_workers::admitted_share`]), else the host's cores. A context inspected before
+    /// [`run_with`] refuses malformed admission data (or a pool named and not adopted) still
+    /// names no unbounded share: one core.
     #[must_use]
-    pub fn test_jobs(&self) -> usize {
-        self.test_workers().0
+    pub fn test_share(&self) -> u32 {
+        match test_workers::share(&self.env, self.pool.as_ref()) {
+            Ok(test_workers::Share::Pool(slots)) => slots,
+            Ok(test_workers::Share::Claim(share)) => share.unwrap_or_else(|| self.cores()),
+            Err(_) => 1,
+        }
+        .max(1)
     }
 
-    /// The widest a test binary runs: the requested libtest count within the held CPU share or
-    /// host cores ([`test_plan`] picks each binary's width up to it).
+    /// The most libtest threads one test binary runs on, within `share` cores: `--test-threads`,
+    /// else the caller's `RUST_TEST_THREADS`, else the whole share.
+    #[must_use]
+    pub fn test_threads_within(&self, share: u32) -> u32 {
+        let share = share.max(1);
+        self.test_threads.map_or(share, |t| t.clamp(1, share))
+    }
+
+    /// The most libtest threads one test binary runs on, within [`Ctx::test_share`]; each
+    /// recorded binary runs at the width its plan gives it, at most this ([`test_plan::plan`]).
     #[must_use]
     pub fn test_threads(&self) -> u32 {
-        self.test_workers().1
+        self.test_threads_within(self.test_share())
     }
 
-    /// The most binaries at once and the widest binary within `share` ([`test_workers::ceilings`]).
-    pub(crate) fn test_workers_for(&self, share: u32) -> (usize, u32) {
-        let (jobs, threads) = test_workers::ceilings(self.test_jobs, self.test_threads, share);
-        (usize::try_from(jobs).unwrap_or(1), threads)
-    }
-
-    /// The share the test binaries' charges are drawn from: the admitted share when managed,
-    /// else the host's cores. Invalid managed input is refused before any stage runs; a
-    /// context inspected before that refusal still cannot advertise an unbounded pool.
-    pub(crate) fn test_share(&self) -> u32 {
-        test_workers::admitted_share(&self.env)
-            .map(|share| share.unwrap_or_else(|| self.cores()))
-            .unwrap_or(1)
-    }
-
-    fn test_workers(&self) -> (usize, u32) {
-        self.test_workers_for(self.test_share())
-    }
-
+    /// The `RUST_TEST_THREADS` every test child carries where a slot is held, a release's pool
+    /// was adopted or the caller pinned it: what cargo's own serial run, the doctests and a rerun
+    /// give each binary.
     pub(crate) fn test_thread_override(&self) -> Option<u32> {
-        (self.env.build_slot_held.is_some() || self.test_threads.is_some())
+        (self.env.build_slot_held.is_some() || self.pool.is_some() || self.test_threads.is_some())
             .then(|| self.test_threads())
     }
 
@@ -938,12 +954,11 @@ impl Ctx {
             .or_else(|| std::env::current_exe().ok())
     }
 
-    /// `--test-jobs <n>`.
+    /// The release's pool this run adopted ([`Ctx::pool`]): the test run's share, so the widest
+    /// binary its builders and serial fallbacks are pinned to is drawn from it.
     #[must_use]
-    pub fn with_test_jobs(mut self, jobs: Option<std::num::NonZeroU32>) -> Self {
-        if let Some(n) = jobs {
-            self.test_jobs = Some(n.get());
-        }
+    pub fn with_pool(mut self, pool: Option<aterm_capacity::Jobserver>) -> Self {
+        self.pool = pool;
         self.refresh_test_threads();
         self
     }
@@ -1029,7 +1044,7 @@ impl Ctx {
         self
     }
 
-    /// Write `line`, a `verify-event: ` line, to the release's events file, when it has one.
+    /// Write `line`, a `verify-event: ` line, to the run's events file, when it has one.
     pub fn record_event(&self, line: &str) {
         if let Some(events) = &self.events {
             events.write(line);
@@ -1135,7 +1150,7 @@ impl Ctx {
 
 /// How a claim in this user's capacity ledger is admitted, a timed stage's quiet claim or a
 /// stage's memory claim: [`aterm_capacity::admit`], or a test's.
-type Admitter = fn(
+pub(crate) type Admitter = fn(
     aterm_capacity::Need,
     aterm_capacity::Admit,
 ) -> Result<aterm_capacity::Claim, aterm_capacity::Error>;
@@ -1732,18 +1747,19 @@ fn held_note(
     ))
 }
 
-/// A stage's memory claim in this user's capacity ledger ([`claim_memory`]), held until the
-/// stage and its supported workers end, and what it did for the stage's time line.
-struct MemoryClaim {
+/// A stage's memory claim in this user's capacity ledger ([`claim_memory`]), or a test run's for
+/// its binaries ([`claim_test_memory`]), held until the stage and its supported workers end, and
+/// what it did for the stage's time line.
+pub(crate) struct MemoryClaim {
     /// The actual admitted claim, shared with supported workers until they finish.
-    claim: Arc<aterm_capacity::Claim>,
+    pub(crate) claim: Arc<aterm_capacity::Claim>,
     /// What it claimed, why, and how it was admitted.
-    said: String,
+    pub(crate) said: String,
 }
 
 impl MemoryClaim {
     /// The cover marker its stage's children are handed ([`memory::cover`]).
-    fn cover(&self) -> std::sync::Arc<str> {
+    pub(crate) fn cover(&self) -> std::sync::Arc<str> {
         std::sync::Arc::from(self.claim.record().cover_marker())
     }
 }
@@ -1814,27 +1830,59 @@ fn claim_memory(
     let Some(book) = ctx.memory.as_ref().filter(|_| spec.mem > 0) else {
         return Ok(None);
     };
-    if let Some(why) = ended(ctx) {
-        return Err(why);
-    }
-    let mode = ctx.quiet.unwrap_or(aterm_capacity::Admit::Wait);
-    let budget = book.budget();
     let need = book.need(spec, &memory::Key::of_stage(spec, ctx));
     let why = match &spec.part {
         Some(part) => format!("{} {}", aterm_capacity::size(spec.mem), part.said),
         None if need.bytes == spec.mem => need.to_string(),
         None => aterm_capacity::size(spec.mem),
     };
-    let title = &spec.title;
+    claim_bytes(ctx, &spec.title, spec.mem, &why, book.budget(), admit).map(Some)
+}
+
+/// Claim `bytes` for a test run's binaries (`what` says which: the most its plan's hold at once,
+/// [`test_plan::schedule`], or cargo's run of one at a time), from their history, as a stage's
+/// memory is claimed ([`claim_memory`]), admitted by `admit`: the test run's stage claims none of
+/// its own ([`memory::dispatched`]). `Ok(None)` for nothing to claim, or a run with no book.
+///
+/// # Errors
+/// Why no binary ran, as [`claim_memory`] says.
+pub(crate) fn claim_test_memory(
+    ctx: &Ctx,
+    title: &str,
+    bytes: u64,
+    what: &str,
+    admit: Admitter,
+) -> Result<Option<MemoryClaim>, String> {
+    let Some(book) = ctx.memory.as_ref().filter(|_| bytes > 0) else {
+        return Ok(None);
+    };
+    let why = format!("{} {what}", aterm_capacity::size(bytes));
+    claim_bytes(ctx, title, bytes, &why, book.budget(), admit).map(Some)
+}
+
+/// Claim `bytes` for `title` (`why` says what for) in this user's capacity ledger, admitted by
+/// `admit` as [`claim_memory`] says, alone where they reach `budget`.
+fn claim_bytes(
+    ctx: &Ctx,
+    title: &str,
+    bytes: u64,
+    why: &str,
+    budget: u64,
+    admit: Admitter,
+) -> Result<MemoryClaim, String> {
+    if let Some(why) = ended(ctx) {
+        return Err(why);
+    }
+    let mode = ctx.quiet.unwrap_or(aterm_capacity::Admit::Wait);
     let ask = |alone: bool| {
         let need = aterm_capacity::Need::new(format!("verify {title}"))
-            .mem(spec.mem)
+            .mem(bytes)
             .covers()
             .ends_when_stuck(STUCK_ENDS);
         if alone { need.alone() } else { need }
     };
-    let beyond = spec.mem >= budget;
-    let saying = claiming(why.clone());
+    let beyond = bytes >= budget;
+    let saying = claiming(why.to_owned());
     let mut admitted = admit(ask(beyond), mode);
     if !beyond && matches!(admitted, Err(aterm_capacity::Error::Never(_))) {
         admitted = admit(ask(true), mode);
@@ -1852,10 +1900,10 @@ fn claim_memory(
     match admitted {
         Ok(claim) => {
             let how = admitted_how(&claim, mode);
-            Ok(Some(MemoryClaim {
+            Ok(MemoryClaim {
                 claim: Arc::new(claim),
                 said: format!("memory: {what}{how}"),
-            }))
+            })
         }
         Err(aterm_capacity::Error::Stopped { .. }) if ctx.halted().is_some() => {
             Err(ctx.halted().unwrap_or_default().to_owned())
@@ -2070,7 +2118,9 @@ fn run_with(
     show: &Show<'_>,
     seams: Seams,
 ) -> std::io::Result<i32> {
-    if let Err(why) = test_workers::admitted_share(&ctx.env) {
+    if let Err(why) = test_workers::admitted_share(&ctx.env)
+        .and_then(|_| test_workers::share(&ctx.env, ctx.pool.as_ref()))
+    {
         writeln!(out, "verify: {why}; no check was run")?;
         let _ = writeln!(log, "verify: {why}; no check was run");
         return Ok(exit::USAGE);
@@ -2175,11 +2225,13 @@ fn run_with(
                         ctx.halted(),
                     );
                     // The check's record (A19) is read from this one line, written whole before
-                    // its rendered line, so the two are never split by another writer.
+                    // its rendered line, so the two are never split by another writer. The events
+                    // file takes it under the output's lock too, so both list checks in one order.
                     let event = report::check_event(&result, &mine);
-                    ctx.record_event(&event);
                     let text = report::render(&result, width);
-                    if let Ok(mut o) = out.lock() {
+                    let held = out.lock();
+                    ctx.record_event(&event);
+                    if let Ok(mut o) = held {
                         let _ = o
                             .write_all(event.as_bytes())
                             .and_then(|()| o.write_all(text.as_bytes()))
@@ -2228,6 +2280,7 @@ fn run_with(
         head_at_start.as_deref(),
         head_commit(&ctx.root, &ctx.path_env).as_deref(),
     );
+    ctx.record_event(&report::run_event(&results, code));
     let _ = writeln!(log, "\n{line}");
     writeln!(out, "{line}")?;
     if let Some(path) = show.log {
@@ -2541,6 +2594,10 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     if args.first().is_some_and(|a| a == "watch") {
         return watch::run(&args[1..], cwd);
     }
+    #[cfg(unix)]
+    if args.first().is_some_and(|a| a == "land") {
+        return land::run(&args[1..], cwd);
+    }
     // `perf`, `soak`, `glue`, `provision` and the browser lane's verbs
     // (`browser-site`, `browser-drive`) parse their own arguments, and none
     // needs targo to start: a host without Trust drives the browser lane, and
@@ -2640,6 +2697,20 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     if let Err(why) = test_workers::admitted_share(&env) {
         return stop(exit::USAGE, format!("verify: {why}; no check was run"));
     }
+    let pool = match env
+        .release_pool
+        .as_deref()
+        .map(aterm_capacity::Jobserver::adopt)
+    {
+        None => None,
+        Some(Ok(pool)) => Some(pool),
+        Some(Err(why)) => {
+            return could_not_run(format!(
+                "the release's pool ({}) cannot be adopted: {why}; no check was run",
+                aterm_capacity::POOL_ENV
+            ));
+        }
+    };
     let tools = match preflight(&env, &root) {
         Ok(tools) => tools,
         Err(why) => return could_not_run(why),
@@ -2725,7 +2796,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         .with_compile_only(parsed.compile_only)
         .with_measure_artifact(measure_artifact)
         .with_child_ceiling(parsed.timeout.unwrap_or(Some(exec::DEFAULT_CHILD_CEILING)))
-        .with_test_jobs(parsed.test_jobs)
+        .with_pool(pool)
         .with_test_threads(parsed.test_threads)
         .with_passed_binaries(passed_binaries)
         .with_events(events)
@@ -2931,15 +3002,15 @@ pub fn mktemp_dir(tag: &str) -> std::io::Result<PathBuf> {
 /// per text to a process, the one a later process finds whole, though first writers that raced
 /// may each run a slot of their own ([`aterm_tempfile::shared_stand_in`] says why that file has
 /// one name and no fixture holds one); where that cache cannot be used, the stand-in is written
-/// at `path` itself and runs no file of the cache.
+/// at `path` itself, mode 0755, and runs no file of the cache. Off Apple a child process writes
+/// it (`aterm_tempfile::written_by_a_child`), so no fork of this process holds it open for
+/// writing when it runs (Linux refuses that exec, `ETXTBSY`).
 ///
 /// # Panics
 /// When `path`'s directory cannot be made or the stand-in cannot be written.
 #[cfg(unix)]
 #[doc(hidden)]
 pub fn standin(path: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
-
     let text = format!("#!/bin/sh\n{body}\n");
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).expect("mkdir");
@@ -2950,17 +3021,24 @@ pub fn standin(path: &Path, body: &str) {
     {
         return;
     }
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o755)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)
-        .expect("open");
-    file.write_all(text.as_bytes()).expect("write");
-    file.set_permissions(std::fs::Permissions::from_mode(0o755))
-        .expect("chmod");
+    #[cfg(not(target_vendor = "apple"))]
+    aterm_tempfile::written_by_a_child(path, text.as_bytes(), 0o755)
+        .unwrap_or_else(|e| panic!("write the stand-in {}: {e}", path.display()));
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        use std::os::unix::fs::PermissionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)
+            .expect("open");
+        file.write_all(text.as_bytes()).expect("write");
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+    }
 }
 
 /// [`standin`] for a body that varies.
@@ -3912,10 +3990,12 @@ mod tests {
     }
 
     /// Each check's `check-finished` event is written once, whole, right before its own line and
-    /// before the verdict, with the word that line opens with, and the same line to the release's
-    /// events file, which its cutter keeps one record per check from (A19). Negative controls:
-    /// emitting the event after the rendered line fails the order assertion; one never recorded
-    /// leaves the events file empty.
+    /// before the verdict, with the word that line opens with, and the same line to the run's
+    /// events file, which a release's cutter keeps one record per check from (A19); the file
+    /// ends with the run's `run-finished` line, naming its exit and each check's word, by which
+    /// `verify land` knows the record whole (B10). Negative controls: emitting the event after
+    /// the rendered line fails the order assertion; one never recorded leaves the events file
+    /// without it.
     #[test]
     fn each_check_says_check_finished_once_before_its_line_and_the_verdict() {
         fn stage(_: &Ctx, spec: &plan::StageSpec) -> Report {
@@ -3990,7 +4070,28 @@ mod tests {
             })
             .collect();
         let kept = std::fs::read_to_string(&at).unwrap();
-        assert_eq!(kept.lines().collect::<Vec<_>>(), said, "{kept}");
+        let (last, checks) = kept
+            .lines()
+            .collect::<Vec<_>>()
+            .split_last()
+            .map(|(last, checks)| (last.to_string(), checks.to_vec()))
+            .expect("the events file");
+        assert_eq!(checks, said, "{kept}");
+        let finished: aterm_json::Value =
+            aterm_json::from_str(last.strip_prefix("verify-event: ").expect("an event")).unwrap();
+        assert_eq!(finished["event"].as_str(), Some("run-finished"), "{last}");
+        assert_eq!(
+            finished["code"].as_i64(),
+            Some(i64::from(exit::FAILED)),
+            "{last}"
+        );
+        let words: Vec<(&str, &str)> = finished["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .filter_map(|c| Some((c["check"].as_str()?, c["outcome"].as_str()?)))
+            .collect();
+        assert_eq!(words, [("fmt", "ok"), ("census", "FAIL")], "{last}");
     }
 
     /// A run whose checkout's HEAD moves while its stages run ends COULD NOT RUN, its checks'

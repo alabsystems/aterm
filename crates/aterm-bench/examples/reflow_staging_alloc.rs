@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Manual allocation-traffic comparison for grid row and frame preparation.
+//! Fixture entry points stay separate so inlining into one main does not couple sibling measurements.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
@@ -66,7 +67,28 @@ fn instructions() -> Option<u64> {
     None
 }
 
-fn main() {
+fn main() -> Result<(), String> {
+    if let Some(fixture) = std::env::args().nth(1) {
+        match fixture.as_str() {
+            "history-unscroll" => history_unscroll(),
+            "wide-restores" => wide_restores(),
+            "mixed-images" => mixed_image_rows(),
+            "inline-images" => inline_image_rows(),
+            "restore-links" => restore_links(),
+            "linked-writes" => linked_writes(),
+            "image-free" => image_free_frames(),
+            "floating" => floating_frames(),
+            "snapshot-copies" => snapshot_copies(),
+            "restore-rows" => restore_rows(),
+            "reflow-staging" => reflow_staging(),
+            _ => {
+                return Err(format!(
+                    "unknown fixture {fixture:?}; use history-unscroll, wide-restores, mixed-images, inline-images, restore-links, linked-writes, image-free, floating, snapshot-copies, restore-rows or reflow-staging"
+                ));
+            }
+        }
+        return Ok(());
+    }
     history_unscroll();
     wide_restores();
     mixed_image_rows();
@@ -75,7 +97,14 @@ fn main() {
     linked_writes();
     image_free_frames();
     floating_frames();
+    snapshot_copies();
     restore_rows();
+    reflow_staging();
+    Ok(())
+}
+
+#[inline(never)]
+fn reflow_staging() {
     for (rows, cols, next_cols) in [
         (24, 256, 16),
         (128, 256, 8),
@@ -120,6 +149,7 @@ fn main() {
     }
 }
 
+#[inline(never)]
 fn history_unscroll() {
     use aterm_grid::{Grid, ImageData, ImageFormat, ImageRef, ImageScaling};
     use std::sync::Arc;
@@ -224,6 +254,7 @@ fn history_unscroll() {
     }
 }
 
+#[inline(never)]
 fn wide_restores() {
     use aterm_grid::{Grid, ImageData, ImageFormat, ImageRef, ImageScaling};
     use std::sync::Arc;
@@ -345,6 +376,7 @@ fn wide_restores() {
     }
 }
 
+#[inline(never)]
 fn mixed_image_rows() {
     use aterm_grid::{Grid, ImageData, ImageFormat, ImageRef, ImageScaling};
     use std::sync::Arc;
@@ -441,6 +473,7 @@ fn mixed_image_rows() {
     }
 }
 
+#[inline(never)]
 fn inline_image_rows() {
     use aterm_grid::{Grid, ImageData, ImageFormat, ImageRef, ImageScaling};
     use std::sync::Arc;
@@ -517,6 +550,7 @@ fn inline_image_rows() {
     }
 }
 
+#[inline(never)]
 fn restore_links() {
     for (rows, cols, scopes) in [
         (1_u16, 4_u16, 1),
@@ -581,6 +615,7 @@ fn restore_links() {
     }
 }
 
+#[inline(never)]
 fn linked_writes() {
     for (label, linked, input) in [
         ("cursor", false, &b"\x1b[H"[..]),
@@ -620,6 +655,7 @@ fn linked_writes() {
     }
 }
 
+#[inline(never)]
 fn image_free_frames() {
     for (rows, cols) in [(24_u16, 80_u16), (40, 120)] {
         let mut term = Terminal::new(rows, cols);
@@ -669,6 +705,7 @@ fn image_free_frames() {
     }
 }
 
+#[inline(never)]
 fn floating_frames() {
     for (rows, cols) in [(4_u16, 16_u16), (24, 80)] {
         let mut term = Terminal::new(rows, cols);
@@ -707,9 +744,84 @@ fn floating_frames() {
         println!(
             "floating_frame rows={rows} cols={cols} iterations=64 allocation_calls={calls} allocated_bytes={bytes} ns={ns} instructions={retired:?} tiles={found}"
         );
+        image_reference_traffic(&frame.images, rows, cols);
+        clone_image_frame(&frame, rows, cols, "floating");
     }
 }
 
+#[inline(never)]
+fn image_reference_traffic(source: &[Vec<(usize, aterm_grid::ImageRef)>], rows: u16, cols: u16) {
+    for reuse in [false, true] {
+        let mut target = source.to_vec();
+        let before_instructions = instructions();
+        let before_calls = CALLS.load(Ordering::Relaxed);
+        let before_bytes = BYTES.load(Ordering::Relaxed);
+        let began = Instant::now();
+        for _ in 0..64 {
+            if reuse {
+                black_box(&mut target).clone_from_slice(black_box(source));
+            } else {
+                for (target, source) in black_box(&mut target).iter_mut().zip(black_box(source)) {
+                    target.clear();
+                    target.extend(source.iter().cloned());
+                }
+            }
+        }
+        let ns = began.elapsed().as_nanos();
+        let calls = CALLS.load(Ordering::Relaxed) - before_calls;
+        let bytes = BYTES.load(Ordering::Relaxed) - before_bytes;
+        let retired = instructions()
+            .zip(before_instructions)
+            .map(|(end, start)| end - start);
+        assert_eq!(target, source);
+        println!(
+            "image_reference_traffic rows={rows} cols={cols} reuse={reuse} iterations=64 allocation_calls={calls} allocated_bytes={bytes} ns={ns} instructions={retired:?}"
+        );
+    }
+}
+
+#[inline(never)]
+fn clone_image_frame(frame: &aterm_core::render::RenderInput, rows: u16, cols: u16, glyph: &str) {
+    let mut target = frame.clone();
+    let before_instructions = instructions();
+    let before_calls = CALLS.load(Ordering::Relaxed);
+    let before_bytes = BYTES.load(Ordering::Relaxed);
+    let began = Instant::now();
+    for _ in 0..64 {
+        black_box(&mut target).clone_from(black_box(frame));
+    }
+    let ns = began.elapsed().as_nanos();
+    let calls = CALLS.load(Ordering::Relaxed) - before_calls;
+    let bytes = BYTES.load(Ordering::Relaxed) - before_bytes;
+    let retired = instructions()
+        .zip(before_instructions)
+        .map(|(end, start)| end - start);
+    assert_eq!(target, *frame);
+    println!(
+        "image_frame_copy rows={rows} cols={cols} glyph={glyph} iterations=64 allocation_calls={calls} allocated_bytes={bytes} ns={ns} instructions={retired:?}"
+    );
+}
+
+#[inline(never)]
+fn snapshot_copies() {
+    for (glyph, text) in [
+        ("zwj", "👩‍💻"),
+        ("combining", "e\u{301}\u{302}\u{303}\u{304}\u{305}"),
+    ] {
+        for (rows, cols) in [(1, 8), (24, 80)] {
+            let mut term = Terminal::new(rows, cols);
+            for row in 0..rows {
+                term.process(
+                    format!("\x1b[{};1H{}", row + 1, text.repeat(usize::from(cols) / 2)).as_bytes(),
+                );
+            }
+            let frame = term.cell_frame(usize::from(rows), usize::from(cols));
+            clone_image_frame(&frame, rows, cols, glyph);
+        }
+    }
+}
+
+#[inline(never)]
 fn restore_rows() {
     for (rows, cols) in [(1_u16, 4_u16), (1, 80), (1, 256), (24, 80), (128, 80)] {
         let mut source = Terminal::new(rows, cols);

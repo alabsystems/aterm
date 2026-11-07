@@ -843,43 +843,8 @@ fn send_pipe(stream: &UnixStream, pipe: &[OwnedFd; 2], deadline: Instant) -> io:
 }
 
 fn send_handles(stream: &UnixStream, pipe: &[OwnedFd], deadline: Instant) -> io::Result<()> {
-    let mut byte = [1_u8];
-    // SAFETY: callers bound the population to one pair or MAX_CPU_FILES.
-    let control_bytes =
-        unsafe { libc::CMSG_SPACE((pipe.len() * size_of::<libc::c_int>()) as _) as usize };
-    let mut control = vec![0_usize; control_bytes.div_ceil(size_of::<usize>())];
-    let mut iovec = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
-    // SAFETY: zero is valid for the optional msghdr pointers/counts.
-    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-    message.msg_iov = &mut iovec;
-    message.msg_iovlen = 1;
-    message.msg_control = control.as_mut_ptr().cast();
-    // SAFETY: the aligned control buffer has room for this one rights header.
-    unsafe {
-        message.msg_controllen =
-            libc::CMSG_SPACE((pipe.len() * size_of::<libc::c_int>()) as _) as _;
-        let header = libc::CMSG_FIRSTHDR(&message);
-        (*header).cmsg_level = libc::SOL_SOCKET;
-        (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN((pipe.len() * size_of::<libc::c_int>()) as _) as _;
-        let data = libc::CMSG_DATA(header).cast::<libc::c_int>();
-        for (index, fd) in pipe.iter().enumerate() {
-            data.add(index).write_unaligned(fd.as_raw_fd());
-        }
-        loop {
-            check_deadline(deadline)?;
-            if libc::sendmsg(stream.as_raw_fd(), &message, libc::MSG_NOSIGNAL) == 1 {
-                break;
-            }
-            let error = io::Error::last_os_error();
-            match error.kind() {
-                io::ErrorKind::WouldBlock => ready(stream, libc::POLLOUT, deadline)?,
-                io::ErrorKind::Interrupted => {}
-                _ => return Err(error),
-            }
-        }
-    }
-    Ok(())
+    let descriptors = pipe.iter().map(std::os::fd::AsFd::as_fd).collect::<Vec<_>>();
+    super::descriptor_transfer::send(stream, &descriptors, 1, deadline)
 }
 
 #[cfg(test)]

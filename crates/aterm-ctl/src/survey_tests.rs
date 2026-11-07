@@ -63,6 +63,7 @@ fn reply(host: usize, rows: Vec<String>) -> HostReply {
     )];
     lines.extend(rows);
     HostReply {
+        reason: None,
         label: format!("pid {}", 1000 + host),
         remote: false,
         unproven: false,
@@ -358,6 +359,7 @@ fn thirty_lab_macs_keep_each_machines_most_pressing_words() {
             )];
             lines.extend(rows);
             HostReply {
+                reason: None,
                 label: format!("Lab-Mac-{h:02}.local"),
                 remote: true,
                 unproven: false,
@@ -439,6 +441,7 @@ fn thirty_macs_home_lines_fold_before_an_agent_loses_its_words() {
             )];
             lines.extend(rows);
             HostReply {
+                reason: None,
                 label: format!("Lab-Mac-{h:02}.local"),
                 remote: true,
                 unproven: false,
@@ -521,6 +524,7 @@ fn checkout_lines_fold_a_line_at_a_time() {
             lines.push(lab_agent(h, 1, "busy", "125000"));
             lines.extend((0..16).map(|n| repo(h, n)));
             HostReply {
+                reason: None,
                 label: format!("Lab-Mac-{h:02}.local"),
                 remote: true,
                 unproven: false,
@@ -614,6 +618,7 @@ fn a_hostile_title_and_excerpt_render_escaped() {
         ),
     ];
     let hostile = [HostReply {
+        reason: None,
         label: "lab".into(),
         remote: false,
         unproven: false,
@@ -673,6 +678,7 @@ fn the_json_form_with_a_sid_is_that_session_alone() {
     let replies = vec![
         reply(3, vec![busy_agent(3, 1), shell(2)]),
         HostReply {
+            reason: None,
             label: "pid 77".into(),
             remote: false,
             unproven: false,
@@ -693,6 +699,7 @@ fn the_json_form_is_every_record() {
     let replies = vec![
         reply(3, vec![busy_agent(3, 1), shell(2)]),
         HostReply {
+            reason: None,
             label: "pid 77".into(),
             remote: false,
             unproven: false,
@@ -866,6 +873,7 @@ fn a_record_naming_its_need_is_ranked_by_it() {
 
 fn peer(host: usize, level: &str, busy: usize, shells: usize) -> HostReply {
     HostReply {
+        reason: None,
         label: format!("lab-{host:02}"),
         remote: true,
         unproven: false,
@@ -888,6 +896,7 @@ fn peer_lines(host: usize, level: &str, busy: usize, shells: usize) -> Vec<Strin
 
 fn unanswered(label: &str, why: &str) -> HostReply {
     HostReply {
+        reason: None,
         label: label.to_owned(),
         remote: true,
         unproven: false,
@@ -967,6 +976,7 @@ fn a_peer_header_keeps_its_counts_and_its_reply_cap() {
             row("s-2", "prompt"),
         ];
         let reply = HostReply {
+            reason: None,
             label: label.to_owned(),
             remote: true,
             unproven: false,
@@ -1040,6 +1050,7 @@ fn a_peer_cannot_pass_for_this_machine() {
         wire_row(&[("sid", own), ("program", "zsh"), ("agent", "-")]),
     ];
     let from = |remote: bool| HostReply {
+        reason: None,
         label: if remote {
             "lab-07 at 10.0.0.5"
         } else {
@@ -1083,6 +1094,7 @@ fn a_cut_reply_says_what_it_left_out() {
         )];
         lines.extend((0..3).map(shell));
         let reply = HostReply {
+            reason: None,
             label: "lab".into(),
             remote: false,
             unproven: false,
@@ -1122,6 +1134,7 @@ fn a_sid_the_reply_cap_may_have_hidden_says_so() {
         )];
         lines.extend(rows);
         HostReply {
+            reason: None,
             label: label.into(),
             remote: true,
             unproven: false,
@@ -1154,6 +1167,7 @@ fn a_sid_the_reply_cap_may_have_hidden_says_so() {
         "{maybe}"
     );
     let frozen = || HostReply {
+        reason: None,
         label: "127.0.0.1:47603".into(),
         remote: true,
         unproven: false,
@@ -1769,6 +1783,7 @@ fn a_raised_attention_line_is_shown() {
     ]);
     let text = render_text(
         &[HostReply {
+            reason: None,
             label: "m7".into(),
             remote: true,
             unproven: false,
@@ -1925,6 +1940,7 @@ fn one_machine_reads_in_full() {
 #[test]
 fn one_cause_that_refused_every_peer_is_said_once() {
     let peer = |fault: PeerFault| PeerSurvey {
+        reason: None,
         label: "m7".to_owned(),
         answer: Err("no route to 10.0.0.7".to_owned()),
         fault,
@@ -1967,6 +1983,7 @@ fn one_cause_that_refused_every_peer_is_said_once() {
 #[test]
 fn a_fleet_reads_no_route_is_judged_on_the_link() {
     let refused = |addr: &str| PeerSurvey {
+        reason: None,
         label: format!("m at {addr}"),
         answer: Err("no route".to_owned()),
         fault: PeerFault::NoRoute,
@@ -2026,6 +2043,7 @@ fn a_fleet_reads_no_route_is_judged_on_the_link() {
 #[test]
 fn a_fleet_read_from_another_network_says_where_this_mac_is() {
     let peer = |fault: PeerFault| PeerSurvey {
+        reason: None,
         label: "m7".to_owned(),
         answer: Err("timed out".to_owned()),
         fault,
@@ -2137,6 +2155,7 @@ fn a_peer_row_cannot_forge_a_header_or_the_you_mark() {
         vec!["instance pid=7 host=lab version=0.105.0 sessions=5 level=facts at_ms=1".to_owned()];
     lines.extend(rows);
     let from = |remote: bool| HostReply {
+        reason: None,
         label: "lab-07".to_owned(),
         remote,
         unproven: false,
@@ -2173,6 +2192,7 @@ const STUB_NOTE: &str = "stub-note-0d6b: the read's closing line";
 fn stub_fleet(_: &FleetAsk<'_>) -> Result<FleetRead, FleetRefused> {
     Ok(FleetRead {
         peers: vec![PeerSurvey {
+            reason: None,
             label: "lab-01".to_owned(),
             answer: Ok(peer_lines(1, "content", 12, 4)),
             fault: PeerFault::Other,
@@ -2269,6 +2289,7 @@ fn the_fleet_clients_closing_line_ends_the_read_within_its_budget() {
 fn silent_peer(fault: PeerFault) -> FleetRead {
     FleetRead {
         peers: vec![PeerSurvey {
+            reason: None,
             label: "lab-01".to_owned(),
             answer: Err("stub-silent-7a2f".to_owned()),
             fault,
@@ -2343,6 +2364,7 @@ fn a_peer_with_more_instances_than_one_read_says_so() {
              at_ms=1"
         )];
         let reply = HostReply {
+            reason: None,
             label: "lab".to_owned(),
             remote,
             unproven: false,
@@ -2367,6 +2389,7 @@ fn a_peer_with_more_instances_than_one_read_says_so() {
 #[test]
 fn a_peer_whose_node_is_unproven_says_so() {
     let reply = |remote: bool, unproven: bool, label: &str| HostReply {
+        reason: None,
         label: label.to_owned(),
         remote,
         unproven,
@@ -2397,6 +2420,7 @@ fn a_peer_whose_node_is_unproven_says_so() {
 fn an_unanswered_peer_row_names_the_node_it_was_asked_for() {
     let node = "17df7cfa".repeat(4);
     let unanswered = |node: Option<String>| HostReply {
+        reason: None,
         label: "127.0.0.1:58733".to_owned(),
         remote: true,
         unproven: false,
@@ -2411,6 +2435,36 @@ fn an_unanswered_peer_row_names_the_node_it_was_asked_for() {
         )
     );
     assert!(!render_json(&[unanswered(None)]).contains("\"node\""));
+}
+
+/// A failed peer's row carries the kind of its failure as `"reason"` beside the words, which
+/// name its address; a row with no kind writes no key, and an answer carries none.
+#[test]
+fn survey_error_row_carries_reason() {
+    let peer = |answer: Result<Vec<String>, String>, reason| PeerSurvey {
+        label: "m119".to_owned(),
+        answer,
+        fault: PeerFault::HostAnswered,
+        unproven: false,
+        node: None,
+        addr: Some("192.168.1.119".to_owned()),
+        reason,
+    };
+    let silent = || Err("nothing listens on 192.168.1.119:7100".to_owned());
+    let row = render_json(&[peer_reply(peer(silent(), Some("nothing-listens")))]);
+    assert_eq!(
+        row,
+        "[{\"label\":\"m119\",\"fleet\":true,\"error\":\"nothing listens on \
+         192.168.1.119:7100\",\"reason\":\"nothing-listens\"}]\n"
+    );
+    let untyped = render_json(&[peer_reply(peer(silent(), None))]);
+    assert!(!untyped.contains("\"reason\""), "{untyped}");
+    assert!(untyped.contains("\"error\""), "{untyped}");
+    let answered = peer_reply(peer(
+        Ok(vec!["instance pid=1 version=0.160.0".to_owned()]),
+        Some("nothing-listens"),
+    ));
+    assert_eq!(answered.reason, None, "an answer has no failure kind");
 }
 
 #[test]
@@ -2698,6 +2752,7 @@ fn accounts_reply(remote: bool, head: &str, rows: Vec<String>) -> HostReply {
     )];
     lines.extend(rows);
     HostReply {
+        reason: None,
         label: if remote { "m7.local" } else { "pid 1" }.to_owned(),
         remote,
         unproven: false,

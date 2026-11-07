@@ -162,13 +162,10 @@ pub fn run(paths: &Paths, words: &[String]) -> Result<String, (String, u8)> {
             let mut out = pass_line(&pass);
             match super::custodian_pass(paths) {
                 Ok(None) => {}
-                Ok(Some(custodian)) => out.push_str(&format!(
-                    "custodian: {} published, {} handed to a person, {} retired, {} waiting\n",
-                    custodian.published.len(),
-                    custodian.asked.len(),
-                    custodian.retired.len(),
-                    custodian.waiting.len()
-                )),
+                Ok(Some(custodian)) => {
+                    out.push_str(&custodian.summary());
+                    out.push('\n');
+                }
                 Err(error) => out.push_str(&format!("custodian: {error}\n")),
             }
             Ok(out)

@@ -193,8 +193,8 @@ impl Mark {
         }
         #[cfg(not(test))]
         {
-            aterm_types::clt_mark::path().map_or_else(
-                || Self {
+            aterm_types::clt_mark::path().map_or(
+                Self {
                     path: None,
                     opened: true,
                 },
@@ -380,6 +380,17 @@ pub(crate) fn c_toolchain_installed() -> Option<bool> {
         std::env::var_os("PATH").as_deref(),
         &atpkg::prereq::CcHost::this_machine(),
     )
+}
+
+/// Whether setup's developer tools have arrived: Git and a compiler behind the system
+/// driver. Match init's standard PATH so an unrelated compiler cannot end this watch.
+/// Discovery only reads files; it never invokes Apple's stubs or a compiler.
+pub(crate) fn developer_tools_ready() -> bool {
+    aterm_types::clt_shim::developer_git()
+        && atpkg::prereq::installed_with(
+            Some(std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin")),
+            &atpkg::prereq::CcHost::this_machine(),
+        ) == Some(true)
 }
 
 /// What this Mac shows of an install of Apple's Command Line Tools under way, by itself
@@ -619,7 +630,7 @@ pub(crate) fn watch_for_tools() {
         .spawn(|| {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
-                let present = aterm_types::clt_shim::developer_git();
+                let present = developer_tools_ready();
                 let reading = (!present).then(installing_now);
                 let _ =
                     crate::workstation_setup::send_setup_wake(Wake::DeveloperToolsWatch(reading));
@@ -1738,9 +1749,10 @@ impl App {
     /// shells that have it.
     pub(crate) fn settle_developer_tools_shim(&self) {
         let setup = &self.workstation_setup;
-        let says = self.developer_tools_on_their_way();
+        let says = setup
+            .developer_tools_shim
+            .settle(|| self.developer_tools_on_their_way());
         setup.developer_tools_shim_said.set(Some(says));
-        setup.developer_tools_shim.settle(says);
     }
 
     /// Whether an install of the tools is on its way: this account may install them, and either

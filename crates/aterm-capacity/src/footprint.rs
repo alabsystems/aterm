@@ -39,6 +39,40 @@ pub const SCOPES: usize = 16;
 /// as fresh as it says them.
 pub const EVERY: Duration = Duration::from_secs(60);
 
+/// How many times as long as its last walk took a [`Meter`] rests before its next, at least
+/// ([`EVERY`] or a test's pace where that is longer): so it walks at most a tenth of the time,
+/// however much its directories hold, and its walks stay its holder's upkeep, which a waiter
+/// does not take for progress (`aterm_toolchain::stall::BUSY`, a quarter). A walk of the whole
+/// shared build cache, 583,000 entries, took 5.8-6.5 s on this Mac (2026-11-06), under it.
+pub const RESTS: u32 = 9;
+
+/// The pace a test set for the meters this process starts ([`pace_meters`]), milliseconds; 0
+/// for none.
+#[cfg(any(test, debug_assertions))]
+static PACED_MS: AtomicU64 = AtomicU64::new(0);
+
+/// A test's seam: every [`Meter`] this process starts from now on ([`Meter::start`]) measures
+/// every `every` instead of [`EVERY`], a run's meter compressed in time.
+#[cfg(any(test, debug_assertions))]
+pub fn pace_meters(every: Duration) {
+    PACED_MS.store(
+        u64::try_from(every.as_millis()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+}
+
+/// The pace [`Meter::start`] measures at: [`EVERY`], or the one a test set ([`pace_meters`]).
+fn pace() -> Duration {
+    #[cfg(any(test, debug_assertions))]
+    {
+        let ms = PACED_MS.load(Ordering::Relaxed);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    EVERY
+}
+
 /// The walks of a run's directories this process began ([`allocated_until`] over any): what
 /// verify's run reports it made (`verify-event: … "event":"disk"`), since one walk of a release
 /// clone's build directory reads every file of it.
@@ -213,25 +247,35 @@ impl fmt::Display for Estimate {
             if c.exact {
                 f.write_str("the most a run of it")?;
             } else if c.selections == 1 {
-                f.write_str("the most a run of the same checks over crates holding its")?;
+                f.write_str(
+                    "the most a run of a selection that did all of its checks over crates holding \
+                     its",
+                )?;
             } else {
                 write!(
                     f,
-                    "summed over {} selections of the same checks whose crates together hold its, \
-                     the most a run of each",
+                    "summed over {} selections that each did all of its checks and whose crates \
+                     together hold its, the most a run of each",
                     c.selections
                 )?;
             }
-            return write!(
+            write!(
                 f,
                 " in this machine's checkouts wrote, or held at its peak beyond {} (the \
                  least any run the record keeps began from, or these directories hold now, {}), \
-                 of {} run(s) the machine's record keeps: no run of it measured on these \
-                 directories",
+                 of {} run(s) the machine's record keeps",
                 size(c.floor),
                 size(self.holds),
                 c.runs
-            );
+            )?;
+            if c.bounded {
+                f.write_str(
+                    ", raised to what a run of a selection held by the one it was read from, or \
+                     by this run's, grew its directories by (runs of different builds of the tree \
+                     disagree)",
+                )?;
+            }
+            return f.write_str(": no run of it measured on these directories");
         }
         if self.runs == 0 && self.holds == 0 {
             write!(
@@ -493,12 +537,13 @@ struct Shared {
 pub type Measure = Box<dyn FnMut(&dyn Fn() -> bool) -> u64 + Send>;
 
 /// THE RUN'S OWN MEASURE OF ITS WRITES: a thread that measures the run's directories every
-/// [`EVERY`], tells its claim what they grew by ([`Claim::wrote`]), so a waiter counts only the
-/// rest of the run's need as reserved, and keeps the most they held, which [`Self::finish`]
-/// returns as the run's [`Footprint`]. The run's end walks nothing more where a sample completed:
-/// it halts a walk under way, whose partial count is discarded, and keeps the most the completed
-/// samples read. A run that ended before any sample completed (under [`EVERY`], or halted in its
-/// first walk) is measured once at its end, so its growth is what it wrote, not 0.
+/// [`EVERY`] (longer after a long walk, [`RESTS`]), tells its claim what they grew by
+/// ([`Claim::wrote`]), so a waiter counts only the rest of the run's need as reserved, and keeps
+/// the most they held, which [`Self::finish`] returns as the run's [`Footprint`]. The run's end
+/// walks nothing more where a sample completed: it halts a walk under way, whose partial count is
+/// discarded, and keeps the most the completed samples read. A run that ended before any sample
+/// completed (under [`EVERY`], or halted in its first walk) is measured once at its end, so its
+/// growth is what it wrote, not 0.
 pub struct Meter {
     start: u64,
     /// The tag of the directories it measures ([`Footprint::dirs`]).
@@ -523,9 +568,10 @@ impl fmt::Debug for Meter {
 }
 
 impl Meter {
-    /// Measure `dirs` ([`allocated_until`]) every [`EVERY`] from `start`, the bytes they held when
-    /// the run began, holding `claim` for the run; `tag` names them in the run's [`Footprint`]
-    /// ([`Footprint::dirs`]), and `scope` what it builds there ([`Footprint::scope`]).
+    /// Measure `dirs` ([`allocated_until`]) every [`EVERY`] (a test's pace, [`pace_meters`])
+    /// from `start`, the bytes they held when the run began, holding `claim` for the run; `tag`
+    /// names them in the run's [`Footprint`] ([`Footprint::dirs`]), and `scope` what it builds
+    /// there ([`Footprint::scope`]).
     #[must_use]
     pub fn start(
         dirs: Vec<PathBuf>,
@@ -538,7 +584,7 @@ impl Meter {
             start,
             Box::new(move |stopped| allocated_until(&dirs, stopped)),
             claim,
-            EVERY,
+            pace(),
         );
         meter.dirs = Some(tag);
         meter.scope = scope;
@@ -573,11 +619,14 @@ impl Meter {
             .name("capacity-meter".to_owned())
             .spawn(move || {
                 let mut sampled = false;
-                while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(every) {
+                let mut rest = every;
+                while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(rest) {
+                    let began = std::time::Instant::now();
                     let now = measure(&|| flag.load(Ordering::SeqCst));
                     if flag.load(Ordering::SeqCst) {
                         break;
                     }
+                    rest = every.max(began.elapsed().saturating_mul(RESTS));
                     keep(Some(now));
                     sampled = true;
                 }
@@ -608,8 +657,19 @@ impl Meter {
     /// End the run: let its claim go, and return what it took, tagged with the directories it
     /// measured and what it built there. It walks them only where no sample completed.
     #[must_use]
-    pub fn finish(mut self) -> Footprint {
-        let peak = self.halt();
+    pub fn finish(self) -> Footprint {
+        self.finish_emptying(|| {})
+    }
+
+    /// [`Self::finish`], running `empty` once what it took is measured and before its claim
+    /// goes. A caller that marked the run scratch can thereby return its ephemeral writes while
+    /// the claim is still visible; a waiter beyond the room rechecks the actual space by the
+    /// look at which the claim has ended ([`crate::Short::unservable`]).
+    #[must_use]
+    pub fn finish_emptying(mut self, empty: impl FnOnce()) -> Footprint {
+        let (peak, claim) = self.halt_holding();
+        empty();
+        drop(claim);
         Footprint {
             peak,
             grew: peak.saturating_sub(self.start),
@@ -619,22 +679,22 @@ impl Meter {
         }
     }
 
-    /// Halt a walk under way, stop the thread, and let the claim go: the most the directories
-    /// held, as the completed samples read it, or, with none, as one last look reads it.
-    fn halt(&mut self) -> u64 {
+    /// Halt a walk under way and stop the thread: the most the directories held, as the
+    /// completed samples read it, or, with none, as one last look reads it, and the claim, which
+    /// goes once the caller drops it.
+    fn halt_holding(&mut self) -> (u64, Option<Claim>) {
         self.halted.store(true, Ordering::SeqCst);
         drop(self.stop.take());
         let joined = self.thread.take().and_then(|t| t.join().ok());
         let mut s = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
-        drop(s.claim.take());
-        joined.unwrap_or(s.peak).max(s.peak)
+        (joined.unwrap_or(s.peak).max(s.peak), s.claim.take())
     }
 }
 
 impl Drop for Meter {
     fn drop(&mut self) {
         if self.thread.is_some() {
-            let _ = self.halt();
+            drop(self.halt_holding());
         }
     }
 }

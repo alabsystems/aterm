@@ -547,7 +547,7 @@ mod offload_tests {
     /// `trickle_lazy_bounded` skips during a flood on the saved primary's backlog and promotes once idle.
     #[test]
     fn trickle_skips_a_flood_that_outruns_it_on_the_backlog_the_worker_drains() {
-        let sb = Scrollback::new(64, 512, 2_000_000);
+        let sb = Scrollback::new(64, 512, 1_200_000);
         let mut t = Terminal::with_scrollback(24, 80, 8, sb);
         t.set_compress_offload_active(true);
         let mut buf = Vec::new();

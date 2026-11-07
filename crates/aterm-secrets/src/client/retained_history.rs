@@ -57,8 +57,11 @@ impl Context {
 #[derive(Clone, Default)]
 struct History(BTreeMap<RecordId, Context>, usize, usize);
 
-/// One decoded journal, bounded by the journal limits. A cache hit still asks the journal
-/// to validate the current private anchor, checkpoint and every acknowledged physical byte.
+/// One decoded journal, bounded by the journal limits, with the stamps its files and folder had
+/// before it was last validated ([`stamps`]). Where they stand so, a read takes it as it is: a
+/// write, a rename over, a new link, a mode or owner change all move a stamp, which nothing moves
+/// back. Where one moved, the read asks the journal to validate the current private anchor,
+/// checkpoint and every acknowledged physical byte again.
 struct ReadCache(
     Mutex<Option<CachedHistory>>,
     #[cfg(any(test, debug_assertions))] read_counts::Counters,
@@ -67,9 +70,11 @@ struct ReadCache(
 static CACHE: ReadCache = ReadCache::new();
 
 /// Numeric snapshots of the process-wide cache's `ReadCache::read` calls.
-/// This excludes enrollment checks and writer replay. Every journal read
-/// attempts fresh physical validation; an unchanged outcome is decoded reuse,
-/// not a skipped read. Join measured workers before comparing snapshots.
+/// This excludes enrollment checks and writer replay. A lookup whose journal
+/// files and folder had not moved since the last validation is `unmoved`, with
+/// no journal read; every other journal read attempts fresh physical
+/// validation, and an unchanged outcome is decoded reuse. Join measured
+/// workers before comparing snapshots.
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 #[must_use]
@@ -82,6 +87,14 @@ struct CachedHistory {
     dir: PathBuf,
     prefix: aterm_journal::Prefix,
     history: Arc<History>,
+    /// The journal's files and folder as they stood before the read that validated `prefix`.
+    stamps: Option<Arc<super::vault_memo::InputStamps>>,
+}
+
+/// The stamps of the journal's files ([`files`]: the claim, anchor, receipts and checkpoint) and
+/// of the vault folder, taken before a read validates them; `None` where one cannot be read.
+fn stamps(paths: &Paths) -> Option<Arc<super::vault_memo::InputStamps>> {
+    super::vault_memo::stamp_inputs(paths, |paths| Some(files(paths).into())).map(Arc::new)
 }
 
 impl ReadCache {
@@ -96,9 +109,8 @@ impl ReadCache {
     fn read(&self, paths: &Paths) -> Result<Arc<History>> {
         // Do not hold a process-wide mutex across filesystem reads or replay. Concurrent
         // readers can retain their own coherent checkpoint snapshots.
-        // The journal reads its own files, and every ask of it is one read of the journal.
-        #[cfg(test)]
-        fsx::count_read(&journal_file(paths, "checkpoint"));
+        // Taken before the journal is read: a write after this moves the next stamps.
+        let stamps = stamps(paths);
         #[cfg(any(test, debug_assertions))]
         let mut lookup = read_counts::Lookup::Unavailable;
         let known = self.0.lock().ok().and_then(|entry| {
@@ -115,8 +127,19 @@ impl ReadCache {
                 .filter(|entry| entry.dir == paths.dir)
                 .cloned()
         });
+        if let Some(known) = &known
+            && stamps.is_some()
+            && known.stamps == stamps
+        {
+            #[cfg(any(test, debug_assertions))]
+            self.1.unmoved(lookup);
+            return Ok(known.history.clone());
+        }
         #[cfg(any(test, debug_assertions))]
         self.1.lookup(lookup);
+        // The journal reads its own files, and every ask of it is one read of the journal.
+        #[cfg(test)]
+        fsx::count_read(&journal_file(paths, "checkpoint"));
         let committed = aterm_journal::read_committed(
             &paths.dir,
             NAME,
@@ -129,9 +152,18 @@ impl ReadCache {
         let committed = committed?;
         let (records, prefix, mut history) = match committed {
             aterm_journal::Committed::Unchanged => {
-                return known
-                    .map(|entry| entry.history)
-                    .ok_or_else(|| Error::new("missing retained receipt cache"));
+                let known = known.ok_or_else(|| Error::new("missing retained receipt cache"))?;
+                // The same bytes under moved stamps (a checkpoint saved again, a file touched):
+                // the next read compares against these.
+                if stamps.is_some()
+                    && let Ok(mut entry) = self.0.lock()
+                    && let Some(entry) = entry.as_mut()
+                    && entry.dir == paths.dir
+                    && Arc::ptr_eq(&entry.history, &known.history)
+                {
+                    entry.stamps = stamps;
+                }
+                return Ok(known.history);
             }
             aterm_journal::Committed::Extended { records, prefix } => (
                 records,
@@ -164,6 +196,7 @@ impl ReadCache {
                 dir: paths.dir.clone(),
                 prefix,
                 history: history.clone(),
+                stamps,
             });
             #[cfg(any(test, debug_assertions))]
             self.1.publish(replaces_other_directory);

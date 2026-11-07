@@ -800,14 +800,48 @@ fn old_and_new_live_builds_share_one_source_cooldown_without_minute_polling() {
     ));
 }
 
-/// Linux only: it runs a real native executable (a copy of `/bin/sh`) through the Linux
-/// loader; macOS kills a copy of an Apple binary off the system volume.
+#[test]
+fn network_recovery_retries_only_connection_failures_before_the_cooldown() {
+    let mut f = Fixture::new();
+    let source = Source {
+        owner: "alabsystems".into(),
+        repo: "aterm".into(),
+    };
+    f.state.check_owner.clone_from(&source.owner);
+    f.state.check_repo.clone_from(&source.repo);
+    f.state.next_check_unix = 2800;
+    for (outcome, failures, retry) in [
+        ("curl: (5) Could not resolve proxy: proxy.invalid", 1, true),
+        ("curl download failed (exit status: 6)", 1, true),
+        ("curl: (7) Could not connect", 3, true),
+        ("curl: (28) Operation timed out", 1, true),
+        ("curl download failed: HTTP 429", 1, false),
+        ("curl: (56) CONNECT tunnel failed, response 407", 1, false),
+        ("manifest signature mismatch", 1, false),
+        ("curl: (7) Could not connect", 0, false),
+    ] {
+        f.state.outcome = outcome.into();
+        f.state.failing_checks = failures;
+        assert!(!check_due(&f.state, &source, 1000, CheckTrigger::Scheduled));
+        assert!(check_due(&f.state, &source, 1000, CheckTrigger::Manual));
+        assert_eq!(
+            check_due(&f.state, &source, 1000, CheckTrigger::NetworkMoved),
+            retry,
+            "{outcome}"
+        );
+        assert!(check_due(&f.state, &source, 2800, CheckTrigger::Scheduled));
+    }
+}
+
+/// Linux only: it runs a copy of this architecture's test image through the
+/// loader. The VM's `/bin/sh` can belong to its other tested architecture.
 #[cfg(target_os = "linux")]
 #[test]
 fn bootstrap_executes_real_authenticated_native_inode_after_closing_all_writers() {
     let mut f = Fixture::new();
-    let source = f.root.join("native-loader-fixture");
-    fs::copy("/bin/sh", &source).unwrap();
+    let image = std::env::current_exe().unwrap();
+    let source = f.root.join(image.file_name().unwrap());
+    fs::copy(&image, &source).unwrap();
     fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
     let old_digest = hash_file(&f.context.dir.join("candidate")).unwrap();
     f.alter_manifest(&old_digest, &hash_file(&source).unwrap());
@@ -819,8 +853,9 @@ fn bootstrap_executes_real_authenticated_native_inode_after_closing_all_writers(
         masters: &[&f.master],
     };
     install_locked(&f.context, &source, &f.proof, pins, |path, _, _| {
-        let status = std::process::Command::new(path)
-            .args(["-c", "exit 0"])
+        let status = aterm_uds::spawnfd::command(path)
+            .arg("--list")
+            .stdout(aterm_uds::spawnfd::Stdio::null())
             .env_clear()
             .status()
             .map_err(|error| error.to_string())?;
@@ -2917,6 +2952,50 @@ fn a_pass_that_never_reached_the_lock_does_not_say_it_took_it() {
     drop(holder);
     let freed = check_recording_in(Ok(&f.context), 10, &settings_provider(false), false);
     assert!(freed.2, "the pass took the lock: {}", freed.0.outcome);
+}
+
+#[test]
+fn a_retired_linux_checker_does_not_start_another_transaction() {
+    use crate::checker_watch::CheckerWatch;
+    use std::sync::{Arc, atomic::AtomicUsize};
+    for retired_before_read in [false, true] {
+        let f = Fixture::new();
+        f.context.save(&f.state).unwrap();
+        let before = aterm_json::to_vec(&f.context.read_state().unwrap()).unwrap();
+        let watch = Arc::new(CheckerWatch::new());
+        let generation = watch.register(60);
+        if retired_before_read {
+            watch.supersede(generation).unwrap();
+        }
+        let reads = Arc::new(AtomicUsize::new(0));
+        let provider: crate::CheckSettingsProvider = {
+            let (watch, reads) = (Arc::clone(&watch), Arc::clone(&reads));
+            let settings = settings_provider(false);
+            Arc::new(move || {
+                reads.fetch_add(1, Ordering::SeqCst);
+                watch.supersede(generation).unwrap();
+                settings()
+            })
+        };
+        let result = check_recording_owned_in(
+            Ok(&f.context),
+            10,
+            &provider,
+            CheckTrigger::Scheduled,
+            Some((&watch, generation)),
+        );
+        assert!(result.0.outcome.contains("generation retired"));
+        assert_eq!(result.2, !retired_before_read);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            usize::from(!retired_before_read)
+        );
+        assert!(watch.snapshot().unwrap().lane.is_none());
+        assert_eq!(
+            aterm_json::to_vec(&f.context.read_state().unwrap()).unwrap(),
+            before
+        );
+    }
 }
 
 fn leave_temp(f: &Fixture, stem: &str) -> PathBuf {

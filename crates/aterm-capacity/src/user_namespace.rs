@@ -52,12 +52,26 @@ fn private(file: &File, directory: bool) -> io::Result<(u64, u64)> {
     }
     Ok((meta.dev(), meta.ino()))
 }
+/// The selector's parent, a directory of this user's that no one else may write. One of this
+/// user's that its group or others may write is narrowed first, through the descriptor checked
+/// (as `aterm_uds::private_file::ensure_private_dir` narrows its own): Linux's user-private-group
+/// umask, 002, leaves aterm's cache folder 0775 wherever a creator leaves the mode to the
+/// umask. Another user's is refused (another user may write it), and so is one the narrowing
+/// leaves writable.
 fn outer(path: &Path) -> io::Result<File> {
     let file = crate::cohort_namespace::directory(path)?;
     let meta = file.metadata()?;
     // SAFETY: geteuid takes no arguments and reads only this process identity.
-    if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
+    if meta.uid() != unsafe { libc::geteuid() } {
         return Err(refused("account selector parent is writable by others"));
+    }
+    if meta.mode() & 0o022 != 0 {
+        file.set_permissions(std::fs::Permissions::from_mode(
+            meta.mode() & 0o7777 & !0o022,
+        ))?;
+        if file.metadata()?.mode() & 0o022 != 0 {
+            return Err(refused("account selector parent is writable by others"));
+        }
     }
     Ok(file)
 }

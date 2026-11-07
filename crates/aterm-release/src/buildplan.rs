@@ -630,13 +630,45 @@ fn publish_staged_file(staged: &Path, out_dir: &Path, what: &str) -> Result<Path
     Ok(published)
 }
 
-fn build_slices(
-    plan: &BuildPlan,
-    take: &Take,
-    logs: &Path,
-) -> Result<(Vec<PathBuf>, Vec<SliceBuild>), String> {
-    // The x86_64 compat slice is the STOCK EXCEPTION (see the note at the file's head).
-    require_rustup_target(X86_64)?;
+/// The pool both slices draw their jobs from ([`slice_pool`]).
+struct SlicePool {
+    pool: aterm_capacity::Jobserver,
+    /// A pool this build made, with the Release core claim of all cores it bounds and its
+    /// private directory; `None` for the release's own pool. Dropped after `pool`, which removes
+    /// its FIFO first.
+    own: Option<(aterm_tempfile::TempDir, aterm_capacity::Claim)>,
+    /// How long the build's own claim waited for its cores (none for the release's).
+    waited: std::time::Duration,
+}
+
+/// The slices' pool: the one the release handed this build ([`aterm_capacity::POOL_ENV`]), which
+/// the release's own Release core claim already bounds, so the build makes no core claim of its
+/// own (a second claim of every core would count the release's other branches' claims and wait
+/// for them, serializing the release behind its own build); or, with no pool handed (a `ship
+/// build` run by hand), the pool `own` makes under this build's claim. A pool named but not
+/// adoptable refuses the build rather than fall back to a claim that would overrun the
+/// release's grant.
+fn slice_pool(
+    inherited: Option<std::io::Result<aterm_capacity::Jobserver>>,
+    own: impl FnOnce() -> Result<SlicePool, String>,
+) -> Result<SlicePool, String> {
+    match inherited {
+        Some(Ok(pool)) => Ok(SlicePool {
+            pool,
+            own: None,
+            waited: std::time::Duration::ZERO,
+        }),
+        Some(Err(error)) => Err(format!(
+            "release pool ({}): {error}",
+            aterm_capacity::POOL_ENV
+        )),
+        None => own(),
+    }
+}
+
+/// A pool of this build's own: a Release core claim of all cores, and a jobserver of the cores it
+/// granted in a private directory under `temporary`.
+fn own_slice_pool(temporary: &Path) -> Result<SlicePool, String> {
     let claim = aterm_capacity::admit(
         aterm_capacity::Need::new("release slice core pool")
             .rank(aterm_capacity::Rank::Release)
@@ -644,16 +676,39 @@ fn build_slices(
         aterm_capacity::Admit::Wait,
     )
     .map_err(|e| e.to_string())?;
-    let pool_dir = aterm_tempfile::Builder::new()
+    let dir = aterm_tempfile::Builder::new()
         .prefix("release-pool-")
-        .tempdir_in(&take.temporary_dir)
+        .tempdir_in(temporary)
         .map_err(|e| format!("release pool directory: {e}"))?;
-    let pool = aterm_capacity::Jobserver::new(&pool_dir.path().join("jobs"), claim.cores())
+    let pool = aterm_capacity::Jobserver::new(&dir.path().join("jobs"), claim.cores())
         .map_err(|e| format!("release jobserver: {e}"))?;
+    Ok(SlicePool {
+        pool,
+        waited: claim.waited(),
+        own: Some((dir, claim)),
+    })
+}
+
+fn build_slices(
+    plan: &BuildPlan,
+    take: &Take,
+    logs: &Path,
+) -> Result<(Vec<PathBuf>, Vec<SliceBuild>), String> {
+    // The x86_64 compat slice is the STOCK EXCEPTION (see the note at the file's head).
+    require_rustup_target(X86_64)?;
+    let slice_pool = slice_pool(aterm_capacity::Jobserver::inherited(), || {
+        own_slice_pool(&take.temporary_dir)
+    })?;
+    let pool = &slice_pool.pool;
     println!(
-        "==> release pool: S={} waiting_s={:.3}",
+        "==> release pool: S={} waiting_s={:.3} ({})",
         pool.slots(),
-        claim.waited().as_secs_f64()
+        slice_pool.waited.as_secs_f64(),
+        if slice_pool.own.is_some() {
+            "this build's own Release core claim"
+        } else {
+            "inherited from the release"
+        }
     );
     let slices: [(&'static str, Option<&'static str>, &str); 2] = [
         (ARM64, None, "Trust toolchain (+t): native build"),
@@ -693,7 +748,7 @@ fn build_slices(
                 index_hint: plan.index_hint.as_deref(),
                 static_crt: false,
             };
-            run_slice_profile(take, &run, Some(&log), None, Some(&pool))
+            run_slice_profile(take, &run, Some(&log), None, Some(pool))
         })();
         let secs = t.elapsed().as_secs();
         match built {
@@ -1058,6 +1113,16 @@ const fn release_profile_debug() -> (&'static str, &'static str) {
     }
 }
 
+/// The pilot's cold build claim. Its target is removed after a successful take, so its disk is
+/// scratch: a waiter may wait for the claim's end where those writes could return enough room.
+fn pilot_need(arm: crate::profile_pilot::Arm, root: &Path, cores: u32) -> aterm_capacity::Need {
+    aterm_capacity::Need::new(format!("profile-pilot {}", arm.name()))
+        .mem_gib(37)
+        .cores(cores)
+        .disk(30 * (1 << 30), root)
+        .scratch()
+}
+
 /// Build one pilot arm with the same sealed source and environment as a cut.
 /// Each target is new: a pilot never inherits Cargo intermediates from a cut.
 pub(crate) fn pilot_build(
@@ -1075,10 +1140,7 @@ pub(crate) fn pilot_build(
     let log = root.join("build.log");
     let waiting = Instant::now();
     let claim = aterm_capacity::admit(
-        aterm_capacity::Need::new(format!("profile-pilot {}", arm.name()))
-            .mem_gib(37)
-            .cores(aterm_capacity::cores())
-            .disk(30 * (1 << 30), root),
+        pilot_need(arm, root, aterm_capacity::cores()),
         aterm_capacity::Admit::Wait,
     )
     .map_err(|e| e.to_string())?;
@@ -1353,8 +1415,8 @@ pub(crate) fn build_static(
 
 /// The stable `cargo check` of the x86_64 compat slice's snapshot of `commit`, its output into `log`.
 /// The slice builds with stable (the STOCK EXCEPTION), whose std refuses what Trust's allows (a
-/// `const fn` calling a method stable does not make const), so the stage step runs this first and
-/// such a tree refuses before the build after the stage.
+/// `const fn` calling a method stable does not make const), so `ship check --compat` runs this to
+/// find such a tree without building a bundle.
 /// # Errors
 /// What [`Take::prepare`] refuses, no stable x86_64 std, and a check that fails (the tail of its log).
 pub(crate) fn compat_check(repo_root: &Path, commit: &str, log: &Path) -> Result<String, String> {
@@ -2821,6 +2883,67 @@ fn fmt_elapsed(start: Instant) -> String {
 mod tests {
     use std::io::Cursor;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+
+    /// Under the release's pool the slices make no core claim of their own and draw from that
+    /// pool; with none handed, `ship build` makes its own; a pool named but unadoptable refuses.
+    /// Negative control: a `slice_pool` that always calls `own` panics in the first case.
+    #[test]
+    fn slices_draw_from_a_handed_pool_without_a_core_claim_of_their_own() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let release = aterm_capacity::Jobserver::new(&dir.path().join("jobs"), 3).unwrap();
+        let handed = aterm_capacity::Jobserver::adopt(&release.handed()).unwrap();
+        let Ok(chosen) = super::slice_pool(Some(Ok(handed)), || {
+            panic!("a handed pool makes no claim of its own")
+        }) else {
+            panic!("the handed pool is adopted");
+        };
+        assert!(chosen.own.is_none());
+        assert_eq!(chosen.waited, std::time::Duration::ZERO);
+        assert_eq!(
+            (chosen.pool.slots(), chosen.pool.flags()),
+            (3, release.flags())
+        );
+        let held = chosen.pool.try_acquire().unwrap().expect("a token");
+        let rest: Vec<_> = std::iter::from_fn(|| release.try_acquire().unwrap()).collect();
+        assert_eq!(
+            rest.len(),
+            2,
+            "the slices drew from the release's own tokens"
+        );
+        drop(rest);
+        drop(held);
+
+        let asked = std::cell::Cell::new(false);
+        let own = super::slice_pool(None, || {
+            asked.set(true);
+            Err("own".into())
+        });
+        assert!(asked.get() && matches!(own, Err(why) if why == "own"));
+
+        let refused = super::slice_pool(Some(Err(std::io::Error::other("no FIFO"))), || {
+            panic!("a pool named but unadoptable is never replaced by a claim of every core")
+        });
+        assert!(
+            matches!(&refused, Err(why) if why.contains(aterm_capacity::POOL_ENV) && why.contains("no FIFO"))
+        );
+    }
+
+    /// The profile pilot's removable cold target is a scratch claim. Negative control: removing
+    /// `.scratch()` from `pilot_need` makes this fail while leaving the generic builder green.
+    #[test]
+    fn profile_pilot_marks_its_cold_intermediates_as_scratch() {
+        let root = std::path::Path::new("/pilot");
+        let need = super::pilot_need(crate::profile_pilot::Arm::Fat1, root, 7);
+        assert_eq!(need.what, "profile-pilot fat1");
+        assert_eq!(need.mem, 37 * (1 << 30));
+        assert_eq!(need.cores, 7);
+        assert_eq!(need.disk, 30 * (1 << 30));
+        assert_eq!(need.path.as_deref(), Some(root));
+        assert!(
+            need.scratch,
+            "the pilot removes its cold target after the take"
+        );
+    }
 
     #[test]
     fn compat_compile_keeps_the_main_lanes_cpu_grant() {

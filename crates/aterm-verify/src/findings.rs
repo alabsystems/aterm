@@ -17,8 +17,8 @@ pub const MESSAGE_LINES: usize = 12;
 /// The failed tests of a `targo test` child, one finding each, or one for the whole row where
 /// the log cannot account for every failure.
 #[must_use]
-pub fn test_findings(label: &str, output: &str, env: &[(OsString, OsString)]) -> Vec<Finding> {
-    split_test_findings(label, output, env).0
+pub fn test_findings(label: &str, output: &str, rerun: &Rerun) -> Vec<Finding> {
+    split_test_findings(label, output, rerun).0
 }
 
 /// [`test_findings`], and the names of the failed tests it leaves out.
@@ -26,7 +26,7 @@ pub fn test_findings(label: &str, output: &str, env: &[(OsString, OsString)]) ->
 pub fn split_test_findings(
     label: &str,
     output: &str,
-    env: &[(OsString, OsString)],
+    rerun: &Rerun,
 ) -> (Vec<Finding>, Vec<String>) {
     let plain = strip(output);
     let tests = if plain.contains(CEILING_KILL) {
@@ -42,22 +42,13 @@ pub fn split_test_findings(
     let mut refused: Vec<String> = refused.into_iter().map(|t| t.name).collect();
     refused.sort_unstable();
     refused.dedup();
-    let prefix: String = env
-        .iter()
-        .map(|(k, v)| {
-            format!(
-                "{}={} ",
-                k.to_string_lossy(),
-                shell_word(&v.to_string_lossy())
-            )
-        })
-        .collect();
     let found = tests
         .into_iter()
         .map(|t| Finding {
             id: one_line(&format!("{} -- {}", t.spec, t.name)),
             rerun: Some(format!(
-                "{prefix}targo --unverified test {} -- {} --exact",
+                "{}targo --unverified test {} -- {} --exact",
+                rerun.prefix(&t.spec),
                 t.spec,
                 shell_word(&t.name)
             )),
@@ -67,28 +58,81 @@ pub fn split_test_findings(
     (found, refused)
 }
 
-/// The variables a rerun of a test child's failures must set.
-#[must_use]
-pub fn rerun_env(cmd: &Cmd, test_threads: Option<u32>) -> Vec<(OsString, OsString)> {
-    const PLACEMENT: [&str; 6] = [
-        "CARGO_TARGET_DIR",
-        "CARGO_BUILD_JOBS",
-        "RUSTDOC",
-        crate::docdriver::DRIVER_ENV,
-        crate::docdriver::SKIP_ENV,
-        crate::testrun::SUBPROCESS_SLOTS_ENV,
-    ];
-    let mut env: Vec<(OsString, OsString)> = cmd
-        .envs
-        .iter()
-        .filter(|(k, _)| !PLACEMENT.iter().any(|p| k == p) && k != "RUST_TEST_THREADS")
-        .cloned()
-        .collect();
-    if let Some(n) = test_threads {
-        env.push(("RUST_TEST_THREADS".into(), n.to_string().into()));
-    }
-    env
+/// What a rerun of a test child's failures sets: the variables the child ran under, less those
+/// that only place its build, and the `RUST_TEST_THREADS` each binary ran at.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Rerun {
+    /// The variables every rerun sets, in the child's order, `RUST_TEST_THREADS` last where the
+    /// run pinned one.
+    env: Vec<(OsString, OsString)>,
+    /// The binaries that ran at a width of their own, by cargo's rerun spec, each with it: a
+    /// rerun of one sets it in place of the run's.
+    widths: Vec<(String, u32)>,
 }
+
+impl Rerun {
+    /// What a rerun of `cmd`'s failures sets: its variables less those that place its build, and
+    /// `RUST_TEST_THREADS=test_threads` where the run pinned one, never `cmd`'s own.
+    #[must_use]
+    pub fn of(cmd: &Cmd, test_threads: Option<u32>) -> Rerun {
+        const PLACEMENT: [&str; 6] = [
+            "CARGO_TARGET_DIR",
+            "CARGO_BUILD_JOBS",
+            "RUSTDOC",
+            crate::docdriver::DRIVER_ENV,
+            crate::docdriver::SKIP_ENV,
+            crate::testrun::SUBPROCESS_SLOTS_ENV,
+        ];
+        let mut env: Vec<(OsString, OsString)> = cmd
+            .envs
+            .iter()
+            .filter(|(k, _)| !PLACEMENT.iter().any(|p| k == p) && k != THREADS)
+            .cloned()
+            .collect();
+        if let Some(n) = test_threads {
+            env.push((THREADS.into(), n.to_string().into()));
+        }
+        Rerun {
+            env,
+            widths: Vec::new(),
+        }
+    }
+
+    /// This rerun, each binary `widths` names (by cargo's rerun spec) rerun at the width it ran
+    /// at.
+    #[must_use]
+    pub fn at_widths(self, widths: impl IntoIterator<Item = (String, u32)>) -> Rerun {
+        Rerun {
+            widths: widths.into_iter().collect(),
+            ..self
+        }
+    }
+
+    /// The variables a rerun of `spec`'s failures sets, as a shell command's prefix: the run's,
+    /// with `spec`'s own width as `RUST_TEST_THREADS` where it ran at one.
+    fn prefix(&self, spec: &str) -> String {
+        let own = self
+            .widths
+            .iter()
+            .find(|(s, _)| s == spec)
+            .map(|&(_, w)| (OsString::from(THREADS), OsString::from(w.to_string())));
+        self.env
+            .iter()
+            .filter(|(k, _)| own.is_none() || k != THREADS)
+            .chain(&own)
+            .map(|(k, v)| {
+                format!(
+                    "{}={} ",
+                    k.to_string_lossy(),
+                    shell_word(&v.to_string_lossy())
+                )
+            })
+            .collect()
+    }
+}
+
+/// The variable a test binary reads its width from.
+const THREADS: &str = "RUST_TEST_THREADS";
 
 /// The one line a stage group's survivors add to the receipt.
 #[must_use]
@@ -384,7 +428,7 @@ mod tests {
             "tar::ustar_is_pinned",
             "thread 'tar::ustar_is_pinned' panicked at src/tar.rs:9:5:\nassertion failed",
         );
-        let found = test_findings("targo test --tests", &log, &[]);
+        let found = test_findings("targo test --tests", &log, &Rerun::default());
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, "-p atpkg --test x -- tar::ustar_is_pinned");
         assert_eq!(
@@ -405,11 +449,12 @@ mod tests {
         let sentinel = crate::libtest::COULD_NOT_RUN_SENTINEL;
         let refused = failed_log("fish::live", &format!("{sentinel} — no fish on this host"));
         let real = failed_log("tar::ustar_is_pinned", "assertion failed");
-        let (found, left) = split_test_findings("t", &format!("{refused}{real}"), &[]);
+        let (found, left) =
+            split_test_findings("t", &format!("{refused}{real}"), &Rerun::default());
         let ids: Vec<&str> = found.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, ["-p atpkg --test x -- tar::ustar_is_pinned"]);
         assert_eq!(left, ["fish::live"]);
-        let (found, left) = split_test_findings("t", &refused, &[]);
+        let (found, left) = split_test_findings("t", &refused, &Rerun::default());
         assert_eq!(found.len(), 1);
         assert!(left.is_empty());
     }
@@ -419,7 +464,7 @@ mod tests {
         let log = "     Running tests/x.rs (target/debug/deps/x-1)\nerror: test failed, to rerun \
                    pass `-p atpkg --test x`\n\nCaused by:\n  process didn't exit successfully \
                    (signal: 11, SIGSEGV)\n";
-        let found = test_findings("targo test --tests", log, &[]);
+        let found = test_findings("targo test --tests", log, &Rerun::default());
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, "targo test --tests");
         assert_eq!(found[0].rerun, None);
@@ -439,9 +484,9 @@ mod tests {
             .env(crate::docdriver::SKIP_ENV, "plain")
             .env(crate::testrun::SUBPROCESS_SLOTS_ENV, "/s/slots")
             .env("ATERM_PAINT_BIN", "/b/My App/aterm");
-        let env = rerun_env(&cmd, Some(3));
+        let rerun = Rerun::of(&cmd, Some(3));
         let log = failed_log("laws::full_grid", "boom");
-        let found = test_findings("targo test --tests", &log, &env);
+        let found = test_findings("targo test --tests", &log, &rerun);
         assert_eq!(
             found[0].rerun.as_deref(),
             Some(
@@ -449,7 +494,32 @@ mod tests {
                  targo --unverified test -p atpkg --test x -- laws::full_grid --exact"
             )
         );
-        assert_eq!(rerun_env(&Cmd::new("targo"), None), Vec::new());
+        assert_eq!(Rerun::of(&Cmd::new("targo"), None), Rerun::default());
+    }
+
+    /// A FAILED TEST RERUNS AT THE WIDTH ITS BINARY RAN AT, where the plan ran it at one of its
+    /// own: a failure only one test thread shows is shown again by its rerun line.
+    /// NEGATIVE CONTROL: a binary of the same log that ran at the run's width reruns at that.
+    #[test]
+    fn a_failed_test_reruns_at_the_width_its_binary_ran_at() {
+        let cmd = Cmd::new("targo").env("TRAIL_LAWS_FULL", "1");
+        let rerun = Rerun::of(&cmd, Some(4)).at_widths([("-p atpkg --test x".to_owned(), 1)]);
+        let log = format!(
+            "{}{}",
+            failed_log("one::thread", "boom"),
+            failed_log("any::width", "boom").replace("--test x", "--test y")
+        );
+        let found = test_findings("targo test --tests", &log, &rerun);
+        let reruns: Vec<_> = found.iter().filter_map(|f| f.rerun.as_deref()).collect();
+        assert_eq!(
+            reruns,
+            [
+                "TRAIL_LAWS_FULL=1 RUST_TEST_THREADS=1 targo --unverified test -p atpkg --test x \
+                 -- one::thread --exact",
+                "TRAIL_LAWS_FULL=1 RUST_TEST_THREADS=4 targo --unverified test -p atpkg --test y \
+                 -- any::width --exact"
+            ]
+        );
     }
 
     #[test]

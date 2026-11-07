@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use aterm_spec::wait::{MUST_HAPPEN, until_within};
 
 use crate::libtest_fixture::{FIXTURE, NONCE};
-use crate::testrun::{Binary, Planned, Record};
+use crate::testrun::{Binary, Record, RunPlan};
 use crate::{Ctx, EnvSnapshot, Scope};
 
 /// Set (to a directory), the test binary is [`standin_live_run`], its rows, log and events there.
@@ -96,22 +96,8 @@ fn standin_live_run() {
     )
     .with_halt(crate::halt_of(false, armed));
     let mut r = crate::ladder::Report::new("test");
-    let planned = Planned {
-        bins: vec![a, b],
-        jobs: 1,
-        threads: 1,
-        cores: 1,
-        checkers: false,
-        preface: String::new(),
-    };
-    crate::testrun::run_planned(
-        &ctx,
-        &mut r,
-        "test",
-        planned,
-        crate::checks::Check::Test,
-        &[],
-    );
+    let planned = RunPlan::fixture(vec![a, b], 1);
+    crate::testrun::run_planned(&ctx, &mut r, "test", planned, crate::checks::Check::Test);
     let rows: String = r
         .outcomes()
         .map(|(o, label)| format!("{}\t{label}\n", crate::report::word(o)))

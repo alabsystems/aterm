@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use aterm_agent::node_service::{AlabTcpAdvertiser, NodeJobLock};
-use aterm_metrics::row::NeedsRow;
+use aterm_metrics::row::{ActivityRow, NeedsRow};
 use aterm_net::fleet::heard::{Heard, LiveSight, Sight};
 use aterm_net::fleet::link::{
     Incoming, LinkClock, LinkConfig, LinkStream, Neighbours, NoteProven, ServeFn, SystemClock,
@@ -1296,6 +1296,10 @@ pub struct NodeServeConfig {
     pub alab_browse: Option<Arc<aterm_secrets::discover::Watch>>,
     /// Optional pre-bound TCP listener for deterministic port-0 tests.
     pub prebound_listener: Option<TcpListener>,
+    /// Told the `[fleet] listen` each generation was started for, as it starts serving
+    /// (`None`: no one): a test's tap, by which a test waits for a generation that serves the
+    /// configuration as it stands, never one its watch is about to end.
+    pub on_generation: Option<OnGeneration>,
     /// Poll interval for key rotation, config changes, and `_alab._tcp` reconciliation.
     pub tick_every: Duration,
     /// Maximum wait for a woken window's `wf-<pid>.sock` relay on windowless `spawn`.
@@ -1321,6 +1325,10 @@ pub type UnitsFn = Arc<dyn Fn() -> Option<atpkg::store::Layout> + Send + Sync>;
 
 /// What is told each generation's neighbour table as it starts ([`NodeMesh::on_neighbours`]).
 pub type OnNeighbours = Arc<dyn Fn(&Arc<Neighbours>) + Send + Sync>;
+
+/// What is told each generation's `[fleet] listen` as it starts serving
+/// ([`NodeServeConfig::on_generation`]).
+pub type OnGeneration = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// What a node service's mesh is (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.4, §11 B5, B6):
 /// with it on, the service holds neighbour links ([`Neighbours`]), serves the ops only the mesh
@@ -1378,11 +1386,15 @@ impl NodeMesh {
             pass_pace: aterm_secrets::client::NodePassPace::LIVE,
             pass_converge: Arc::new(|| {
                 let exe = std::env::current_exe().ok()?;
-                aterm_secrets::converge::start(&exe, aterm_secrets::converge::SUBSCRIBER)
-                    .map_err(|error| {
-                        aterm_log::warn!("node: could not start the converge pass: {error}");
-                    })
-                    .ok()
+                aterm_secrets::converge::start(
+                    &exe,
+                    aterm_secrets::converge::SUBSCRIBER,
+                    aterm_secrets::converge::RepositoryWork::Repair,
+                )
+                .map_err(|error| {
+                    aterm_log::warn!("node: could not start the converge pass: {error}");
+                })
+                .ok()
             }),
         }
     }
@@ -2043,13 +2055,17 @@ fn node_lan_gate() -> fn() -> Option<String> {
     crate::network_moved::lan_unavailable
 }
 
+/// Local nonblocking upkeep retained by the node's owned runtime. Both idle
+/// rounds and the serving generation's existing watch invoke it.
+pub type NodeMaintenance = Arc<dyn Fn() + Send + Sync>;
+
 /// Foreground entry point for `aterm node serve` (`systems.alab.aterm-node`, C20–C23,
 /// §4.13): the job's lock first ([`own_node_job`]), then its boot apply
 /// ([`apply_node_update_at_boot`]), then `startup` (the job's Commons runtime), then the run. A start that finds the lock held is a second instance and
 /// does none of it, so it neither swaps a stage in nor counts a start against the boot trial of
 /// a build another instance runs, and starts no service beside the one that serves.
 #[must_use = "return or inspect the node service's exit status"]
-pub fn run_node_serve_owning(startup: impl FnOnce()) -> ExitCode {
+pub fn run_node_serve_owning(startup: impl FnOnce() -> Option<NodeMaintenance>) -> ExitCode {
     let Some(state_dir) = aterm_types::dirs::state_dir() else {
         eprintln!("aterm node serve: state directory is unavailable");
         return ExitCode::FAILURE;
@@ -2058,7 +2074,9 @@ pub fn run_node_serve_owning(startup: impl FnOnce()) -> ExitCode {
         &state_dir,
         apply_node_update_at_boot,
         startup,
-        |boot, job_lock| run_node_serve(state_dir.clone(), boot, job_lock),
+        |boot, job_lock, maintenance| {
+            run_node_serve(state_dir.clone(), boot, job_lock, maintenance)
+        },
     )
 }
 
@@ -2069,17 +2087,17 @@ pub fn run_node_serve_owning(startup: impl FnOnce()) -> ExitCode {
 /// its boot trial, and the crash-loop revert still reaches it. That start then fails, with no
 /// service started. The lock is close-on-exec, so a boot that execs the build it installed lets
 /// it go, and that build's start takes it again before it counts or confirms its trial.
-fn own_node_job(
+fn own_node_job<S>(
     state_dir: &Path,
     boot: impl FnOnce() -> NodeBoot,
-    startup: impl FnOnce(),
-    serve: impl FnOnce(NodeBoot, NodeJobLock) -> ExitCode,
+    startup: impl FnOnce() -> S,
+    serve: impl FnOnce(NodeBoot, NodeJobLock, S) -> ExitCode,
 ) -> ExitCode {
     match take_node_job_lock(state_dir) {
         JobLock::Taken(job_lock) => {
             let boot = boot();
-            startup();
-            serve(boot, job_lock)
+            let maintenance = startup();
+            serve(boot, job_lock, maintenance)
         }
         JobLock::HeldElsewhere => ExitCode::SUCCESS,
         JobLock::Unopenable => {
@@ -2125,7 +2143,12 @@ fn take_node_job_lock(state_dir: &Path) -> JobLock {
 
 /// The run of `aterm node serve` on `state_dir` that holds `job_lock`, after its boot found
 /// `boot`.
-fn run_node_serve(state_dir: PathBuf, boot: NodeBoot, job_lock: NodeJobLock) -> ExitCode {
+fn run_node_serve(
+    state_dir: PathBuf,
+    boot: NodeBoot,
+    job_lock: NodeJobLock,
+    maintenance: Option<NodeMaintenance>,
+) -> ExitCode {
     crate::descriptor_limit::raise_descriptor_limit_for_node();
     let relay_dir = node_relay_dir(&state_dir);
     let home_dir = aterm_types::dirs::home_dir();
@@ -2152,6 +2175,7 @@ fn run_node_serve(state_dir: PathBuf, boot: NodeBoot, job_lock: NodeJobLock) -> 
         members,
         alab_browse: None,
         prebound_listener: None,
+        on_generation: None,
         tick_every: retry(),
         wake_timeout: DEFAULT_WAKE_TIMEOUT,
         stop,
@@ -2168,7 +2192,7 @@ fn run_node_serve(state_dir: PathBuf, boot: NodeBoot, job_lock: NodeJobLock) -> 
             crate::harness_host::claims_off_as_the_node_job_stops,
         );
     }
-    serve_node_job(cfg, job_lock)
+    serve_node_job(cfg, job_lock, maintenance)
 }
 
 /// The account claims' look while no window runs on this Mac (docs/DESIGN-fluid-swarm-2026-10-28.md
@@ -2244,7 +2268,7 @@ fn spawn_claims_upkeep(relay_dir: PathBuf, stop: Arc<AtomicBool>) {
 #[must_use = "return or inspect the configured node service's exit status"]
 pub(crate) fn run_node_serve_with(cfg: NodeServeConfig) -> ExitCode {
     match take_node_job_lock(&cfg.state_dir) {
-        JobLock::Taken(job_lock) => serve_node_job(cfg, job_lock),
+        JobLock::Taken(job_lock) => serve_node_job(cfg, job_lock, None),
         JobLock::HeldElsewhere => ExitCode::SUCCESS,
         JobLock::Unopenable => ExitCode::FAILURE,
     }
@@ -2252,11 +2276,17 @@ pub(crate) fn run_node_serve_with(cfg: NodeServeConfig) -> ExitCode {
 
 /// The node job supervision loop of the instance that holds `job_lock`, which it keeps until it
 /// returns.
-fn serve_node_job(mut cfg: NodeServeConfig, job_lock: NodeJobLock) -> ExitCode {
+fn serve_node_job(
+    mut cfg: NodeServeConfig,
+    job_lock: NodeJobLock,
+    maintenance: Option<NodeMaintenance>,
+) -> ExitCode {
     if !cfg!(test) {
         crate::qos::set_self(crate::qos::Role::Background);
     }
     let _held_lock = job_lock;
+    // Local upkeep retires before the job relinquishes its exclusive lifetime.
+    let maintenance = maintenance;
     if !cfg.stop.load(Ordering::Acquire) {
         aterm_agent::service_repair_rpc::start_recovery_in_context(
             cfg.vault_paths.as_ref(),
@@ -2309,6 +2339,9 @@ fn serve_node_job(mut cfg: NodeServeConfig, job_lock: NodeJobLock) -> ExitCode {
     mesh_logs.bus = bus_keeper.as_ref().map(|keeper| Arc::clone(keeper.slot()));
 
     while !cfg.stop.load(Ordering::Acquire) {
+        if let Some(maintain) = &maintenance {
+            maintain();
+        }
         if fleet_turned_off_or_swarm_disabled(&cfg) {
             advertiser.stop();
             port_lock = None;
@@ -2450,6 +2483,7 @@ fn serve_node_job(mut cfg: NodeServeConfig, job_lock: NodeJobLock) -> ExitCode {
             &discovery,
             node.ok().flatten(),
             mesh_now.as_ref(),
+            maintenance.as_ref(),
         ) {
             port_lock = None;
             checkpoint_idle(
@@ -2556,13 +2590,16 @@ fn node_serving(
 /// reopen reads it whole) while that key stays, and closed as the job ends, however it ends.
 /// Presence (B7c) runs on them while they are held: this Mac's row every 30 seconds, and every
 /// seat's standing read from the rows; it stops before they close. So do the needs reads (Q4,
-/// §4.14), which hand every window's needs row to the installed [`WindowNeeds`].
+/// §4.14), which hand every window's needs row to the installed [`WindowNeeds`], and the activity
+/// reads, which hand the count of every window's agents to the installed [`WindowActivity`].
 #[derive(Default)]
 struct MeshHeld {
     mesh: Option<Arc<aterm_mesh::Mesh>>,
     presence: Option<aterm_mesh::presence::Presence>,
     /// The reads of this Mac's windows' needs ([`WindowNeedsReads`]).
     needs: Option<WindowNeedsReads>,
+    /// The counts of this Mac's windows' agents ([`WindowActivityReads`]).
+    activity: Option<WindowActivityReads>,
     /// The node listener's port this generation bound, which this Mac's row names.
     port: Arc<AtomicU16>,
     /// The last reason an open failed, journaled once.
@@ -2600,6 +2637,7 @@ impl MeshHeld {
             && key != Some(mesh.key())
         {
             aterm_log::info!("node: the node key changed, so the mesh logs reopen");
+            self.activity = None;
             self.needs = None;
             self.presence = None;
             mesh.close();
@@ -2661,12 +2699,29 @@ impl MeshHeld {
                 }
             }
         }
+        if self.activity.is_none() && self.mesh.is_some() {
+            match WindowActivityReads::start(
+                WindowRelays::new(cfg.relay_dir.clone(), Arc::clone(&cfg.launcher)),
+                ACTIVITY_EVERY,
+                installed_window_activity(),
+            ) {
+                Ok(activity) => self.activity = Some(activity),
+                Err(e) => {
+                    let why = format!("the activity reads did not start: {e}");
+                    if self.said.as_deref() != Some(why.as_str()) {
+                        aterm_log::warn!("node: {why}");
+                        self.said = Some(why);
+                    }
+                }
+            }
+        }
         self.mesh.clone()
     }
 }
 
 impl Drop for MeshHeld {
     fn drop(&mut self) {
+        self.activity = None;
         self.needs = None;
         self.presence = None;
         if let Some(mesh) = self.mesh.take() {
@@ -3018,6 +3073,110 @@ impl NeedsReads {
     fn left_first(&self, pid: u32) {
         if self.first.lock_or_recover().remove(&pid) {
             self.first_left.notify_all();
+        }
+    }
+}
+
+/// How often the node job counts its windows' agents ([`WindowActivityReads`]): the Fleet glance
+/// reads a Mac's copy as often, so a count is never older than one read; a publisher writes only
+/// a count that changed, and an unchanged one each `aterm_metrics::row::ACTIVITY_REFRESH_S`.
+const ACTIVITY_EVERY: Duration = Duration::from_secs(60);
+
+/// What this Mac's windows' agents are doing, counted at each read
+/// ([`activity_of_windows`]), handed to the metrics publisher for the Mac's `now/activity` row
+/// (`docs/DESIGN-fleet-field-2026-11-06.md` §11).
+pub type WindowActivity = Arc<dyn Fn(&ActivityRow) + Send + Sync>;
+
+/// The [`WindowActivity`] this process installed ([`install_window_activity`]).
+static WINDOW_ACTIVITY: OnceLock<WindowActivity> = OnceLock::new();
+
+/// Install `sink` as the node job's [`WindowActivity`], which the job's activity reads hand each
+/// count to while it holds the mesh. The first install stands: the answer says whether this call
+/// installed `sink`. With none installed, the job counts and calls nothing.
+pub fn install_window_activity(sink: WindowActivity) -> bool {
+    WINDOW_ACTIVITY.set(sink).is_ok()
+}
+
+/// What the node job's activity reads hand each count to: the installed [`WindowActivity`],
+/// looked up at each count.
+fn installed_window_activity() -> WindowActivity {
+    Arc::new(|row| {
+        if let Some(sink) = WINDOW_ACTIVITY.get() {
+            sink(row);
+        }
+    })
+}
+
+/// This Mac's agents at `at` (Unix seconds), counted from a facts survey of every window here
+/// ([`survey_every_window`], [`crate::fleet_glance::activity_of_survey`]), which every released
+/// window already answers, so no window needs a new stream for it: a zero count where no
+/// window runs (no agent runs here), and `None` where windows run and none answered a survey,
+/// or where the answer is partial (a window left unread, rows the reply cap cut), so nothing is
+/// published and the last whole count stands until it ages out at its readers.
+pub(crate) fn activity_of_windows(windows: &WindowRelays, at: u64) -> Option<ActivityRow> {
+    let header = RelayHeader::Survey {
+        content: false,
+        drive: false,
+        peer: None,
+    };
+    match survey_every_window(windows, &header, "survey\n") {
+        WindowsSurveyed::Answered(wire) => crate::fleet_glance::activity_of_survey(&wire, at),
+        WindowsSurveyed::Untaken(None) => Some(ActivityRow {
+            at,
+            ..ActivityRow::default()
+        }),
+        WindowsSurveyed::Untaken(Some(_)) => None,
+    }
+}
+
+/// The node job's counts of its windows' agents, run while it holds the mesh ([`MeshHeld`]): one
+/// thread that, every `every`, counts them ([`activity_of_windows`]) and hands its sink each count
+/// it made. Dropping it stops the thread and joins it, which waits out a survey under way
+/// (`SURVEY_ANSWER_WITHIN` at most).
+struct WindowActivityReads {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WindowActivityReads {
+    /// Count the agents of `windows` at once and every `every` after, handing `sink` each count.
+    ///
+    /// # Errors
+    /// The spawn of its thread.
+    fn start(
+        windows: WindowRelays,
+        every: Duration,
+        sink: WindowActivity,
+    ) -> std::io::Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = std::thread::Builder::new()
+            .name("aterm-node-activity".to_owned())
+            .spawn({
+                let stop = Arc::clone(&stop);
+                move || {
+                    while !stop.load(Ordering::Acquire) {
+                        let at = aterm_time::unix_secs().unwrap_or(0);
+                        if let Some(row) = activity_of_windows(&windows, at)
+                            && !stop.load(Ordering::Acquire)
+                        {
+                            sink(&row);
+                        }
+                        sleep_interruptible(&stop, every);
+                    }
+                }
+            })?;
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for WindowActivityReads {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
@@ -3401,6 +3560,7 @@ fn serve_one_node_generation(
     discovery: &Arc<Mutex<aterm_agent::node_service::MeshDiscovery>>,
     node: Option<NodeIdentity>,
     mesh_logs: Option<&Arc<aterm_mesh::Mesh>>,
+    maintenance: Option<&NodeMaintenance>,
 ) -> bool {
     // Announcements belong to this listener generation. Stop them before its
     // socket is released, including every early return while starting workers.
@@ -3561,6 +3721,7 @@ fn serve_one_node_generation(
         let automatic = automatic_handle.clone();
         let updates_watch = cfg.updates.clone();
         let health_inputs = health::Inputs::of(cfg);
+        let maintenance = maintenance.cloned();
         std::thread::Builder::new()
             .name("aterm-node-watch".to_owned())
             .spawn(move || {
@@ -3580,6 +3741,9 @@ fn serve_one_node_generation(
                     if stop.load(Ordering::Acquire) {
                         running.store(false, Ordering::Release);
                         return;
+                    }
+                    if let Some(maintain) = &maintenance {
+                        maintain();
                     }
                     if admission_network.take_at(Instant::now()).is_some()
                         && let Some(automatic) = &automatic
@@ -3789,6 +3953,9 @@ fn serve_one_node_generation(
     let units_for_serve = Arc::clone(&cfg.mesh.units);
     let ask_for_serve = Arc::clone(&ask);
 
+    if let Some(told) = &cfg.on_generation {
+        told(&initial_wanted.listen);
+    }
     aterm_net::fleet::serve_offering_with_ask_within(
         &listener,
         (

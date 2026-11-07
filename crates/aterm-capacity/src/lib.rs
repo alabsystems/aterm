@@ -9,21 +9,26 @@
 //! to, from the same knobs and the same measured room ([`floor::Watch`]). The
 //! [`Ledger`] holds every session's claims: a tool that needs memory, cores, disk or a quiet
 //! machine calls [`admit`] before its work starts and holds the [`Claim`] while it runs. Admit
-//! waits, with no deadline, until the need fits beside the claims already held and those that
-//! waited longer (first in, first out; a later claim goes first only when it fits beside every
-//! earlier one's reservation), printing one line a minute that names the shortfall and each
-//! holder. That is admission, not a retry. An earlier waiter whose disk need is more than the
-//! volume has free above its floor now reserves none of it ([`Short::unservable`]): what a
-//! claim wrote stays on the volume once it ends, so no claim's end can make room for it, only
-//! space freed, and the waiters behind it go first while it waits for that, so it is not kept
-//! from being overtaken (the trade, in [`mod@admit`]). A memory need with no margin that does
+//! waits until the need fits beside the claims already held and those that waited longer
+//! (first in, first out; a later claim goes first only when it fits beside every earlier one's
+//! reservation), printing one line a minute that names the shortfall and each holder. That is
+//! admission, not a retry, and it has no deadline: each wait ends when the claims it waits for
+//! end. A waiter whose disk need is more than the volume has free above its floor now
+//! ([`Short::unservable`]) reserves none of it: what a claim wrote stays on the volume once it
+//! ends, unless its disk is scratch ([`Need::scratch`]), so only space freed, or what a scratch
+//! claim held there may give back by its end, can make room for it, and the waiters behind it go
+//! first while it waits for that, so it is not kept from being overtaken (the trade, in
+//! [`mod@admit`]). Its relief runs at once, and a look still beyond the room after it, with no
+//! scratch claim held there that could meet it, is refused ([`Error::Unmet`], UNMET): nothing it
+//! would wait for frees disk. A memory need with no margin that does
 //! not fit, where no other claim holds memory or waits ahead for it, is admitted ALONE: what it
 //! is short of is work no claim holds, whose end no claim's end brings, so a wait for it would
 //! have no bound; it runs with no other memory claim beside it, each waiting while it is held
 //! ([`Short::Alone`]). Resource-only admission refuses at once a need that can never fit here: all the memory
 //! that can ever be available or more (physical memory less what is wired,
 //! [`Reading::reachable`]) unless it asks to be admitted alone ([`Need::alone`]), or more disk
-//! than the volume holds above its floor. Requested Timing also refuses unknown CPU/load
+//! than the volume holds above its floor; and, once it waits, a disk need UNMET as above.
+//! Requested Timing also refuses unknown CPU/load
 //! provenance and immediate overrides before starting work.
 //! Explicit load-only quiet work waits within its [`Patience`] and may start at its bound.
 //! [`Need::timing`] additionally requires measured CPU readiness, reserves claimed work from
@@ -155,12 +160,16 @@ pub use footprint::{
 #[cfg(any(test, debug_assertions))]
 pub use ledger::Turn;
 pub use ledger::{Accounting, ClaimGuardIdentity, CohortClaimState, Held, Ledger, Record};
+#[cfg(unix)]
+mod funded_scope;
+#[cfg(unix)]
+pub use funded_scope::{FundedMembership, FundedScope};
 pub use machine_footprint::{Cover, Kept, MachineFootprints, Selection};
 pub use overrun::{Overrun, overruns};
 #[cfg(any(test, debug_assertions))]
 pub use reading::Fixed;
 pub use reading::{
-    Live, Machine, Proc, Procs, Reading, TreeUse, Volume, between, claimable, cores,
+    Live, Machine, Proc, Procs, Reading, TreeUse, Volume, between, claimable, cores, read_volume,
 };
 
 /// This account's home as the account database has it, whatever `$HOME` says.
@@ -298,7 +307,7 @@ pub const RELEASE_RUN_ENV: &str = "ATERM_RELEASE_RUN";
 
 mod background;
 mod jobserver;
-pub use jobserver::{Jobserver, Token};
+pub use jobserver::{Jobserver, POOL_ENV, Token};
 
 /// What a claim needs. Sizes are bytes.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -331,6 +340,8 @@ pub struct Need {
     pub alone: bool,
     /// Its memory covers the builds its holder's tree starts ([`Self::covers`]).
     pub covers: bool,
+    /// Its disk is scratch ([`Self::scratch`]): space its writes may return by its claim's end.
+    pub scratch: bool,
     /// End its wait behind holders that make no progress ([`Self::ends_when_stuck`]): how long
     /// they may make none first. The waiter's own, never in a [`Record`].
     pub stuck_ends: Option<std::time::Duration>,
@@ -486,14 +497,28 @@ impl Need {
         self
     }
 
+    /// Its disk is scratch: its claim's end may return up to what it writes there (a profile
+    /// pilot's cold intermediates). A disk need beyond the room ([`Short::unservable`]) waits
+    /// while such claims are held where that upper bound would bring it within the room, then
+    /// rechecks once each ends; if the writes stayed, that look relieves or refuses it rather
+    /// than waiting again ([`Error::Unmet`]). A claim whose writes are durable (a build's caches,
+    /// a Trust run's held slots, a VM's disk) is not scratch.
+    #[must_use]
+    pub const fn scratch(mut self) -> Need {
+        self.scratch = true;
+        self
+    }
+
     /// End its wait once every claim it waits behind is held by a holder whose process tree,
-    /// with the processes its claim is credited with ([`Record::credit`]), has used no CPU time
-    /// and written nothing for `after`, as two looks in a row read them ([`Error::Stuck`]): the
-    /// claim leaves the queue, naming them, and nobody signals them (CW-WAIT-UNBOUNDED). A holder
-    /// that is itself waiting in a chain looks again every few seconds, so it works. Unset, a
-    /// wait lasts as long as its holders hold, its line naming each that has made no progress
-    /// for [`aterm_toolchain::stall::STALLED_AFTER`]: what a caller with no end of its own for
-    /// such a wait asks, so a tool that waits on a person's stopped job resumes with it.
+    /// with the processes its claim is credited with ([`Record::credit`]), has made no progress
+    /// for `after` (only kept its books: [`aterm_toolchain::stall`]), as two looks in a row read
+    /// them ([`Error::Stuck`]): the claim leaves the queue, naming them, and nobody signals them
+    /// (CW-WAIT-UNBOUNDED). A holder that is itself waiting in a chain is as stuck as what it
+    /// waits behind (its mark in this user's waits). Its looks judge a tree busy over a minute,
+    /// or over `after` where that is shorter. Unset, a wait lasts as long as its holders hold,
+    /// its line naming each that has made no progress for
+    /// [`aterm_toolchain::stall::STALLED_AFTER`]: what a caller with no end of its own for such a
+    /// wait asks, so a tool that waits on a person's stopped job resumes with it.
     #[must_use]
     pub const fn ends_when_stuck(mut self, after: std::time::Duration) -> Need {
         self.stuck_ends = Some(after);

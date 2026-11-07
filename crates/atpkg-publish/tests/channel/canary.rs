@@ -252,6 +252,93 @@ impl atpkg_publish::api::Indexer for Index {
     }
 }
 
+fn stage_existing(rig: &Rig, out: &Path) -> Result<()> {
+    canary::run(
+        &rig.ctx,
+        &[
+            "trust=8".into(),
+            "--out".into(),
+            out.to_str().unwrap().into(),
+            "--stage-receipt".into(),
+        ],
+    )
+}
+
+#[test]
+fn staging_canary_evidence_leaves_the_index_and_existing_receipts_unchanged() {
+    let (rig, q, source) = setup();
+    let out = install(&rig, &q, &source);
+    lay(&rig, &source, false);
+    rig.publish_head(&Doc::new(7, &[("trust", 7)]));
+    stage_existing(&rig, &out).unwrap();
+    let slug = rig.ctx.staging_slug("trust");
+    for name in [canary::RECEIPT, canary::SIGNATURE] {
+        assert_eq!(
+            rig.host.asset(&slug, "atpkg-trust-8", name).unwrap(),
+            std::fs::read(out.join(name)).unwrap()
+        );
+    }
+    let changes = rig.host.changes();
+    stage_existing(&rig, &out).unwrap();
+    assert_eq!(rig.host.changes(), changes, "an exact retry writes nothing");
+    let (head, _) = quad::fetch_head(&rig.ctx, &rig.ctx.index_slug(), &rig.path("head")).unwrap();
+    assert_eq!(head, 7, "staging evidence never publishes an index");
+
+    rig.host
+        .put_asset(&slug, "atpkg-trust-8", canary::RECEIPT, b"other evidence");
+    let changes = rig.host.changes();
+    let error = stage_existing(&rig, &out).unwrap_err();
+    assert!(
+        error.to_string().contains("different canary evidence"),
+        "{error}"
+    );
+    assert_eq!(
+        rig.host.changes(),
+        changes,
+        "conflicting evidence is preserved"
+    );
+    assert_eq!(
+        rig.host
+            .asset(&slug, "atpkg-trust-8", canary::RECEIPT)
+            .unwrap(),
+        b"other evidence"
+    );
+}
+
+#[test]
+fn staging_canary_evidence_refuses_changed_pack_bytes_and_invalid_signatures() {
+    for corrupt_archive in [true, false] {
+        let (rig, q, source) = setup();
+        let out = install(&rig, &q, &source);
+        lay(&rig, &source, false);
+        rig.publish_head(&Doc::new(7, &[("trust", 7)]));
+        let slug = rig.ctx.staging_slug("trust");
+        if corrupt_archive {
+            let receipt = canary::check_receipt(&rig.ctx, &q, &out, 8).unwrap();
+            rig.host.put_asset(
+                &slug,
+                "atpkg-trust-8",
+                &receipt.installed[0].asset,
+                b"changed after the canary ran",
+            );
+        } else {
+            std::fs::write(out.join(canary::SIGNATURE), b"invalid signature").unwrap();
+        }
+        let changes = rig.host.changes();
+        assert!(stage_existing(&rig, &out).is_err());
+        assert_eq!(
+            rig.host.changes(),
+            changes,
+            "a refused stage writes nothing"
+        );
+        assert!(
+            rig.host
+                .asset(&slug, "atpkg-trust-8", canary::RECEIPT)
+                .is_none()
+        );
+    }
+}
+
 #[test]
 fn staged_resume_never_repacks_and_is_idempotent_but_refuses_changed_staging() {
     let (rig, q, source) = setup();

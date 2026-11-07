@@ -526,7 +526,7 @@ mod pidfd {
 
 #[path = "process_ancestry.rs"]
 mod ancestry;
-pub use ancestry::stable_descendant;
+pub use ancestry::{Ancestry, stable_descendant};
 
 #[path = "process_kin.rs"]
 mod kin;

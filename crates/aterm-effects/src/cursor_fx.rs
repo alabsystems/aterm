@@ -409,6 +409,15 @@ pub const CARET_PAGE_MIN_CONTRAST: f32 = 4.5;
 /// rounding.
 const SPARKLE_PAPER_CARET_GUARD: f32 = 0.15;
 
+/// THE EMBER, THE EMITTER AND THE DROP KEEP A MARGIN OVER THE PAGE (after-land L3, L4, W8): the
+/// margin past [`CARET_PAGE_MIN_CONTRAST`] Fire's forge caret and Phaser's emitter keep against
+/// the page ([`caret_page_floor`]), and Water's liquid caret's band
+/// (`cursor_droplet::DROPLET_CARET_FLOOR`). Held to the bar itself, each rested on it: Fire's ember
+/// read 4.50 at rest on dark and Solarized Dark (`fire-dark.rest`, `fire-dark-idle10.idle10`) and
+/// Phaser's emitter 4.51 on Solarized Dark (`phaser-dark.mid`), worst of four captures; the band's
+/// edge laid Water's caret at 4.51 there.
+pub const EFFECT_CARET_PAGE_GUARD: f32 = 0.15;
+
 /// The least WCAG contrast the comet's cell bed alone leaves a letter it lies under: the theme's
 /// ink over the bed's tint of the page.
 pub const BED_INK_FLOOR: f32 = 10.0;
@@ -544,12 +553,16 @@ pub const fn floor_block_fill(
 }
 
 /// The page floor [`floor_block_fill`] holds `owner`'s caret to: [`CARET_PAGE_MIN_CONTRAST`], the
-/// rainbow kitty's paper caret's too.
+/// rainbow kitty's paper caret's too; Fire's ember and Phaser's emitter keep
+/// [`EFFECT_CARET_PAGE_GUARD`] past it.
 #[inline]
 #[must_use]
 pub const fn caret_page_floor(owner: BlockFillOwner) -> f32 {
     match owner {
         BlockFillOwner::Rainbow => crate::rainbow_kitty::ribbon::PAPER_CARET_CONTRAST,
+        BlockFillOwner::Forge | BlockFillOwner::Phaser => {
+            CARET_PAGE_MIN_CONTRAST + EFFECT_CARET_PAGE_GUARD
+        }
         _ => CARET_PAGE_MIN_CONTRAST,
     }
 }
@@ -1414,6 +1427,8 @@ impl CursorFx {
             trail: f.user_tinted,
             accent: f.accent_pinned,
         });
+        self.glow
+            .set_thin_caret(f.focused && thin_bar(f.cursor_style).is_some());
         let glow_fp = self
             .glow
             .tick(cur, now, glow_cfg, geom, &mut self.glow_scratch);
@@ -1675,6 +1690,8 @@ impl CursorFx {
         );
         let momentum_to = self.glow_scratch.len();
 
+        self.glow
+            .hold_classic_momentum(glow_cfg, &mut self.glow_scratch[momentum_from..momentum_to]);
         let held_print = if dark && momentum_to > momentum_from {
             if warm && glow_cfg.enabled && !tinted && matches!(glow_cfg.style, GlowStyle::Fire) {
                 #[cfg(test)]
@@ -2459,7 +2476,12 @@ mod tests {
                     base: None,
                 };
                 let floored = floor_block_fill(candidate, ground, live, None, false);
-                let bar = CARET_PAGE_MIN_CONTRAST;
+                let bar = match owner {
+                    BlockFillOwner::Forge | BlockFillOwner::Phaser => {
+                        CARET_PAGE_MIN_CONTRAST + EFFECT_CARET_PAGE_GUARD
+                    }
+                    _ => CARET_PAGE_MIN_CONTRAST,
+                };
                 assert_eq!(caret_page_floor(owner), bar, "{}", owner.label());
                 assert!(
                     contrast_ratio(floored.fill, ground) >= bar,
@@ -2960,6 +2982,84 @@ mod tests {
     /// hues (Sparkle's paper gold, a style's rod, the cursor's own). Control:
     /// [`CursorFx::momentum_chosen_unread`], the momentum glow alone reading no colour as
     /// chosen, which lays each case's paper halo off the pin.
+    /// After-land lows W10: on a dark page Classic's one-colour face wears its momentum glow in
+    /// the pin, as every pinned style's lights are worn ([`CursorGlow::hold_classic_momentum`]).
+    /// Its warm white, unheld, lay on the pin's neutral ground as a grey disc round the caret on
+    /// Solarized Dark after an Enter (`classic-pink/solarized-dark/...e470`). Every light of a
+    /// burst beside the pink pin on Solarized Dark keeps the pin's hue; the control, the glow
+    /// unheld, lays warm (amber to white) lights there.
+    #[test]
+    fn classic_pink_s_momentum_glow_wears_the_pin() {
+        use crate::color_math::rgb2hsv;
+        const PIN: u32 = 0x00D0_3A8C;
+        const SOLARIZED_DARK: u32 = 0x0000_2B36;
+        let (pin_hue, _, _) = rgb2hsv(PIN);
+        // The momentum glow's lights over a burst: the over stream's lights a twin with no
+        // momentum glow, fed the same frames, does not lay. Of them, (lit, off the pin): a lit
+        // one is off the pin when it wears no hue the eye names or one more than 40 degrees
+        // from the pin's.
+        let momentum_lights = |unheld: bool| -> (usize, usize) {
+            let (mut glow, mut trail) = style_cfgs(GlowStyle::Classic, SOLARIZED_DARK);
+            glow.color = PIN;
+            glow.accent = brighten(PIN, 1.5);
+            glow.classic_mono = true;
+            trail.color = PIN;
+            let mut fx = CursorFx::default();
+            fx.glow.classic_momentum_unheld = unheld;
+            let mut twin = CursorFx::default();
+            let t0 = Instant::now();
+            let (mut lit, mut off) = (0usize, 0usize);
+            for k in 0..24u16 {
+                let now = t0 + std::time::Duration::from_millis(50 * u64::from(k));
+                for f in [&mut fx, &mut twin] {
+                    f.glow.note_synthetic_typed(now, 1);
+                    f.trail.note_synthetic_typed(now);
+                    f.cadence.on_keystroke(now);
+                }
+                fx.momentum
+                    .on_key(now, crate::cursor_momentum::MOMENTUM_GLOW_TAU_S);
+                let input = |momentum_glow| CursorFxInput {
+                    cur: Some((2, 4 + k)),
+                    cursor_style: CursorStyle::SteadyBlock,
+                    live_cursor: 0x0093_A1A1,
+                    user_tinted: true,
+                    default_bg: SOLARIZED_DARK,
+                    momentum_glow,
+                    ..frame_input(now)
+                };
+                let _ = fx.tick(&input(true), &glow, trail);
+                let _ = twin.tick(&input(false), &glow, trail);
+                let mut own: Vec<GlowQuad> = twin.glow_scratch.clone();
+                for q in &fx.glow_scratch {
+                    if let Some(i) = own.iter().position(|o| o == q) {
+                        own.swap_remove(i);
+                        continue;
+                    }
+                    for c in [q.color, q.color2] {
+                        let (h, sat, v) = rgb2hsv(c & 0x00FF_FFFF);
+                        if v < 16.0 / 255.0 {
+                            continue;
+                        }
+                        lit += 1;
+                        let d = (h - pin_hue).abs();
+                        if sat < 0.25 || d.min(360.0 - d) > 40.0 {
+                            off += 1;
+                        }
+                    }
+                }
+            }
+            (lit, off)
+        };
+        let (lit, off) = momentum_lights(false);
+        assert!(lit > 0, "fixture: the burst lays a momentum glow");
+        assert_eq!(off, 0, "{off} of {lit} momentum lights wear no pin's hue");
+        let (_, control) = momentum_lights(true);
+        assert!(
+            control > 0,
+            "control: the unheld momentum glow lays its warm white"
+        );
+    }
+
     #[test]
     fn the_momentum_glow_wears_a_chosen_colour_in_its_own_hue_and_chroma() {
         use crate::color_math::rgb2hsv;

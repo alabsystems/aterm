@@ -86,6 +86,8 @@ impl PlannedCommand {
 
 struct SelectedCommand {
     line: String,
+    /// What `line` executes: the launch's `exe`, or the build past its twin ([`managed_twin_build`]).
+    exe: PathBuf,
     argv: Vec<String>,
     env: Vec<(String, String)>,
     tap_dropped: Option<String>,
@@ -123,8 +125,9 @@ pub(super) struct Launch<'a> {
     pub(super) agent: u32,
     /// Its argv, `argv[0]` first.
     pub(super) argv: &'a [String],
-    /// What the line executes, but for the managed twin on a line it would make yolo, where the
-    /// line executes the twin's build ([`past_unmarked_twin`]).
+    /// What the line executes, but for the managed twin on a line it would make yolo
+    /// ([`past_unmarked_twin`]) or in a cold plan ([`plan_with_cold`]), where the line executes
+    /// the twin's build.
     pub(super) exe: &'a Path,
     /// The model the relaunch asks for ([`with_model`]).
     pub(super) model: Option<&'a str>,
@@ -332,11 +335,14 @@ fn plan_with_cold(
             .map(|(name, value)| (*name, value.as_str()))
             .collect()
     });
+    // A cold restart execs what its command names and holds the child to that image, and a script
+    // twin's exec maps its build: named the twin, the agent runs and its outcome never matches.
+    let cold_build = cold.as_ref().and_then(|_| managed_twin_build(launch.exe));
     let selected = line_tap_selected(
         dialect,
         heal.as_deref(),
         cd.as_deref(),
-        launch.exe,
+        cold_build.as_deref().unwrap_or(launch.exe),
         launch.argv,
         launch.resume.then_some(launch.session),
         model,
@@ -391,7 +397,7 @@ fn plan_with_cold(
             dialect,
             heal,
             cwd: cd,
-            target: launch.exe.to_path_buf(),
+            target: selected.exe,
             argv: selected.argv,
             env: selected.env,
             unset,
@@ -705,21 +711,25 @@ pub(super) fn line_tap_kept(
     .map(|selected| (selected.line, selected.tap_dropped))
 }
 
-/// The build to type in place of `exe`, where `exe` is Claude Code's managed twin and `flags` hold
-/// nothing it reads as typed: it would add yolo, and a relaunch never enters bypass
-/// ([`with_permission_mode`]). A line with `--resume` or a mode written on it stays the twin's, as
-/// does one the build cannot be read for. [`Plan::command`] still names `exe`, so the native
-/// restart, off for Claude Code (`SessionPolicy::constructor_enabled`), would refuse such a line
-/// with `native-command-changed` rather than run the twin.
-fn past_unmarked_twin(exe: &Path, flags: &[String]) -> Option<PathBuf> {
-    let atpkg::yolo::Launch::Default(_) = atpkg::yolo::decide("claude", flags) else {
-        return None;
-    };
+/// The build the twin `exe` execs, where `exe` is Claude Code's managed twin and the build can be
+/// read.
+fn managed_twin_build(exe: &Path) -> Option<PathBuf> {
     let twin = super::upgrade_drive::managed_agent_twin("claude")?;
     if twin != exe {
         return None;
     }
     super::upgrade_drive::twin_build(exe, "claude")
+}
+
+/// The build to type in place of `exe` ([`managed_twin_build`]), where `flags` hold nothing the
+/// twin reads as typed: it would add yolo, and a relaunch never enters bypass
+/// ([`with_permission_mode`]). A typed line with `--resume` or a mode written on it stays the
+/// twin's. [`Plan::command`] names what the line types, so a cold restart execs the same file.
+fn past_unmarked_twin(exe: &Path, flags: &[String]) -> Option<PathBuf> {
+    let atpkg::yolo::Launch::Default(_) = atpkg::yolo::decide("claude", flags) else {
+        return None;
+    };
+    managed_twin_build(exe)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -754,6 +764,7 @@ fn line_tap_selected(
         upgrade::relaunch_line_selected(dialect, heal, cd, env, unset, exe, flags).map(|selected| {
             SelectedCommand {
                 line: selected.line,
+                exe: exe.to_path_buf(),
                 argv: flags.to_vec(),
                 env: selected.env,
                 tap_dropped: None,
@@ -1129,7 +1140,9 @@ pub(super) fn overtakable(st: &St, alive: impl Fn(u32) -> bool) -> bool {
     let unheld = match st.phase {
         upgrade::Phase::Exiting { .. } => true,
         upgrade::Phase::Relaunched { .. } if starts_afresh(&st.cause) => false,
-        upgrade::Phase::Relaunched { .. } => st.relaunched_pid == 0 || st.relaunched_gone(&alive),
+        upgrade::Phase::Relaunched { .. } => {
+            st.relaunched_pid == 0 || st.relaunched_gone(&alive, kernel_start)
+        }
         _ => false,
     };
     // The tab's holder is read from Claude Code's own session files.
@@ -1137,7 +1150,9 @@ pub(super) fn overtakable(st: &St, alive: impl Fn(u32) -> bool) -> bool {
         upgrade::Agent::Claude => true,
         upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => false,
     };
-    claude && unheld && (st.exited_at != 0 || !alive(st.pid))
+    claude
+        && unheld
+        && (st.exited_at != 0 || st.agent_exit_by(&alive, kernel_start) == AgentExit::Gone)
 }
 
 /// Whether process `pid`, holding conversation `held` in the foreground of the tab of the restart
@@ -1503,7 +1518,7 @@ fn relaunch_held(
         save(opts, session, st);
         return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
     }
-    if !st.native_prepare.is_empty() && alive(old) {
+    if !st.native_prepare.is_empty() && st.agent_exit() != AgentExit::Gone {
         let tab = st.tab.clone();
         // A prepare/signal reply may have been lost before mutation. Prove an explicit
         // pre-mutation abort before returning to a fresh at-rest constructor; never signal
@@ -1518,10 +1533,19 @@ fn relaunch_held(
             return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
         }
     }
-    // A record that already saw its agent gone ([`St::exited_at`]) waits on no pid: that
-    // number may name another process since (a reboot reuses them).
-    if st.exited_at == 0 && !super::upgrade_wake::wait_exit(old, opts.timings.exited) {
-        return said(r, "wait:exiting");
+    // The relaunch waits only on the process the record names by pid and kernel start
+    // ([`St::agent_exit`]), never on a pid alone, which may name another process since (a reboot
+    // reuses them); a record that already saw its agent gone ([`St::exited_at`]) waits on none.
+    if st.exited_at == 0 {
+        match st.agent_exit() {
+            AgentExit::Gone => {}
+            AgentExit::Runs => {
+                if !super::upgrade_wake::wait_exit_as(old, &st.pid_start, opts.timings.exited) {
+                    return said(r, "wait:exiting");
+                }
+            }
+            AgentExit::Unproven => return said(r, WAIT_EXIT_UNPROVEN),
+        }
     }
     st.seen_gone(now_s());
     hand.keep(c);
@@ -2421,6 +2445,7 @@ fn await_held(
                 }
             };
             st.relaunched_pid = sf.pid;
+            st.relaunched_start = squash(&sf.proc_start);
             let promise = Adopted::of(st, || none_owed);
             ledger(opts, &r, &promise.detail());
             save(opts, session, st);
@@ -4695,6 +4720,9 @@ fn restart_locked(
         }
     };
     *met = Met::Stood;
+    // A record an earlier build wrote, naming its agent by pid alone, takes no start from this
+    // live snapshot: a process born since at that pid would read as its agent. Its carry judges
+    // it unproven while that pid lives (`wait:exit-unproven`), never waiting on the bare pid.
     if let Some(st) = prior.clone().filter(St::in_flight) {
         if st.native_retired_unissued {
             return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
@@ -4846,13 +4874,13 @@ fn restart_locked(
         let still = again.is_some_and(|a| {
             a.session_id == session
                 && a.status == "idle"
-                && kernel_start(snap.pid).as_deref() == Some(squash(&a.proc_start).as_str())
+                && k.process_start(snap.pid).as_deref() == Some(squash(&a.proc_start).as_str())
         }) && foreground_shell(k.job(snap.pid)) == Ok(shell)
             && k.terminal(snap.pid)
                 .as_ref()
                 .is_some_and(|(p, name)| owned_by_aterm((*p, name.as_str())))
             && screen(&mut c, &tab).is_some_and(|scr| at_rest_for(why, &mut c, &tab, &scr))
-            && !background_holds(snap.pid)
+            && k.restart_background(snap.pid).is_empty()
             && !held(&mut c, &tab, opts.human_grace_s);
         if !still {
             break 'signal Some(said(r.clone(), "wait:changed"));
@@ -4870,7 +4898,7 @@ fn restart_locked(
             break 'signal Some(said(r.clone(), "wait:account-changed"));
         }
         (st.model_before, st.mark) = model_and_mark(recent.as_ref());
-        st.pid = snap.pid;
+        st.bind(snap.pid, &snap.start);
         st.shell = shell;
         st.tab.clone_from(&tab);
         st.line = line;
@@ -4935,7 +4963,7 @@ fn restart_locked(
             && (selected.is_some_and(|s| !s.is_current())
                 || foreground_shell(k.job(snap.pid)) != Ok(shell)
                 || !screen(&mut c, &tab).is_some_and(|scr| at_rest_for(why, &mut c, &tab, &scr))
-                || background_holds(snap.pid)
+                || !k.restart_background(snap.pid).is_empty()
                 || held(&mut c, &tab, opts.human_grace_s)
                 || records.unique_owner(&sf).is_err())
         {
@@ -6426,13 +6454,19 @@ fn after_exit_as(
         if st.tab != snap.tab && !host_ended {
             return said(r, "wait:conversation-in-other-tab");
         }
+        // A record an earlier build wrote names its agent by pid alone: it takes the start the
+        // snapshot of that pid carries (the layout's, after a restore), as RS1 carries an
+        // earlier host's restart by identity.
+        st.adopt_start(snap.pid, &snap.start);
         let overtaken = if host_ended && st.tab != snap.tab {
             Some((
                 "host-ended",
                 "aterm ended while this relaunch was in flight; its tab was reopened".to_string(),
             ))
         } else {
-            (st.pid != snap.pid || st.relaunched_gone(alive)).then(|| match st.phase {
+            (!st.names(snap.pid, &snap.start) || st.relaunched_gone(alive, kernel_start)).then(
+                || {
+                    match st.phase {
                 upgrade::Phase::Exiting { .. } => (
                     "resumed-elsewhere",
                     "the conversation was resumed in this tab outside aterm's relaunch, and that \
@@ -6443,7 +6477,9 @@ fn after_exit_as(
                     "exited-before-continuing",
                     "the relaunched agent exited before its continuation was typed".to_string(),
                 ),
-            })
+            }
+                },
+            )
         };
         let overtook = overtaken.is_some();
         if !overtook && hand_waits_out(opts, &mut st, &session, alive) {
@@ -6462,12 +6498,7 @@ fn after_exit_as(
                 save(opts, &session, &st);
             }
         } else {
-            if in_flight_exit_proven(
-                &st,
-                snap,
-                alive(snap.pid),
-                kernel_start(snap.pid).as_deref(),
-            ) {
+            if in_flight_exit_proven(&st, alive(st.pid), kernel_start(st.pid).as_deref()) {
                 // A restart in flight when aterm ended (a stall's or an asked one) waits on
                 // its agent's exit: proven here by its kernel start, never by a pid that may
                 // name another process since (a reboot reuses them).
@@ -6694,7 +6725,9 @@ fn launch_after_exit(
         ..
     } = plan;
     let session = r.session.clone();
-    st.pid = snap.pid;
+    // The agent this relaunch waits on, by its pid and kernel start: a prior record's exit
+    // stamp, kept by a restart that carried it, spoke of another agent and goes ([`St::bind`]).
+    st.bind(snap.pid, &snap.start);
     st.shell = shell;
     st.tab.clone_from(&snap.tab);
     st.line = line;
@@ -6703,11 +6736,7 @@ fn launch_after_exit(
         .and_then(|command| command.account_intent.clone());
     st.line_dir = line_dir.unwrap_or_default();
     st.phase = upgrade::Phase::Exiting { at_s: now_s() };
-    if gone_by_identity(
-        &snap.start,
-        alive(snap.pid),
-        kernel_start(snap.pid).as_deref(),
-    ) {
+    if st.exited_at == 0 && st.agent_exit() == AgentExit::Gone {
         // The process that ran as `snap.pid` is gone, by its kernel start: a live pid here
         // is another process (pids are reused, as after a reboot), never a guard to wait on.
         st.exited_at = now_s();
@@ -6747,19 +6776,14 @@ fn launch_after_exit(
     r
 }
 
-/// Whether the in-flight restart `st` was waiting on the exit of the agent `snap` names, and
-/// that agent is proven gone by its kernel start (its pid `alive`, born `start_now`), as
-/// [`gone_by_identity`] judges: only an Exiting record not yet stamped, of that same pid.
-pub(super) fn in_flight_exit_proven(
-    st: &St,
-    snap: &Snapshot,
-    alive: bool,
-    start_now: Option<&str>,
-) -> bool {
+/// Whether the in-flight restart `st` was waiting on its agent's exit and that agent is proven
+/// gone by the identity the record names ([`St::pid_start`], adopted from the snapshot of its
+/// pid where an earlier build recorded none): its pid `alive`, born `start_now`, as
+/// [`agent_exit`] judges. Only an Exiting record not yet stamped.
+pub(super) fn in_flight_exit_proven(st: &St, alive: bool, start_now: Option<&str>) -> bool {
     matches!(st.phase, upgrade::Phase::Exiting { .. })
         && st.exited_at == 0
-        && st.pid == snap.pid
-        && gone_by_identity(&snap.start, alive, start_now)
+        && agent_exit(&st.pid_start, alive, start_now) == AgentExit::Gone
 }
 
 /// Whether an exit's relaunch is a typed plan no native authority gates
@@ -6767,7 +6791,7 @@ pub(super) fn in_flight_exit_proven(
 /// its host knows it: a tab restored from the layout, never a stranded or rolled-back relaunch
 /// of this one), its record coordinated (an uncoordinated one takes its gates as before), the
 /// plan carries no deferred cold intent (it was admitted now), its exit is proven
-/// ([`St::exited_at`], by [`gone_by_identity`]), no native operation or rollback is left
+/// ([`St::exited_at`], by [`agent_exit`]), no native operation or rollback is left
 /// unresolved (one is reconciled or held as it is, never replaced by a line), and the record
 /// holds no native act of this process (`own`, [`native_of_this_host`]). Every native act of
 /// the ended process died with its epoch, so the record's kept coordination is no grant to
@@ -6801,14 +6825,6 @@ pub(super) fn in_flight_exit_proven(
     aterm_spec_anchor::spec_unmodeled(
         machine = "HostEndedRelaunch",
         action = "Deferred",
-        reason = "Select one input of the relaunch's fixture."
-    )
-)]
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::spec_unmodeled(
-        machine = "HostEndedRelaunch",
-        action = "Proven",
         reason = "Select one input of the relaunch's fixture."
     )
 )]
@@ -6873,12 +6889,112 @@ pub(super) fn native_of_this_host(st: &St, epoch: impl FnOnce() -> Option<String
     !stamped.is_empty() && epoch().is_none_or(|now| stamped.contains(&now.as_str()))
 }
 
-/// Whether the agent that ran with kernel start `start` is proven gone, by what the kernel
-/// answers for its pid now: gone when no process holds it (`now` is `None` and the pid is
-/// not `alive`) or one born at another time does (a reused pid, as after a reboot). An
-/// unrecorded `start` proves nothing, nor does a live pid whose start cannot be read.
-pub(super) fn gone_by_identity(start: &str, alive: bool, now: Option<&str>) -> bool {
-    !start.is_empty() && (!alive || now.is_some_and(|now| now != start))
+/// What the kernel says of the agent a record names by its pid and the kernel start it was
+/// born at ([`agent_exit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AgentExit {
+    /// Proven gone: no process holds its pid, or one born at another time does (a reused pid,
+    /// as after a reboot).
+    Gone,
+    /// The process born at its start still holds its pid: the one exit a relaunch waits on.
+    Runs,
+    /// A live pid the record cannot name: it recorded no start (an earlier build's record no
+    /// snapshot gave one), or the live process's start cannot be read. Never waited on by its
+    /// pid alone, and never proven gone.
+    Unproven,
+}
+
+/// The step word of a relaunch whose agent's exit is [`AgentExit::Unproven`]: it neither waits
+/// on the pid nor types a line over a process that may be its agent.
+pub(super) const WAIT_EXIT_UNPROVEN: &str = "wait:exit-unproven";
+
+/// What the kernel's answer for a record's pid now proves of the agent it names, born at
+/// `start` (`kernel_start`'s spelling; empty when the record recorded none): `alive`, and the
+/// live process's start `now` (`None`: unreadable). A free pid proves the exit whatever the
+/// record knows (a process keeps its pid until it is reaped); a live one proves it only by
+/// another start, and holds the relaunch only by the same one.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HostEndedRelaunch",
+        action = "Recorded",
+        reason = "Select one input of the relaunch's fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HostEndedRelaunch",
+        action = "Snapshot",
+        reason = "Select one input of the relaunch's fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HostEndedRelaunch",
+        action = "Same",
+        reason = "Select one input of the relaunch's fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HostEndedRelaunch",
+        action = "Reborn",
+        reason = "Select one input of the relaunch's fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HostEndedRelaunch",
+        action = "Unread",
+        reason = "Select one input of the relaunch's fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "HostEndedRelaunch",
+        action = "Judge",
+        project = "aterm_agent::harness::relaunch::native_gate_tests::host_ended_transition"
+    )
+)]
+pub(super) fn agent_exit(start: &str, alive: bool, now: Option<&str>) -> AgentExit {
+    if !alive {
+        return AgentExit::Gone;
+    }
+    match now {
+        _ if start.is_empty() => AgentExit::Unproven,
+        Some(now) if now == start => AgentExit::Runs,
+        Some(_) => AgentExit::Gone,
+        None => AgentExit::Unproven,
+    }
+}
+
+/// The step a relaunch answers while the agent its record names is not proven gone
+/// ([`AgentExit`], read by `exit`), or `None` once it is: an unproven one is never waited on,
+/// and a running one is waited on within `wait` (`wait_until` over the lane's limit), which only
+/// a proof ends. A start unread mid-wait (a slow kernel read) is no exit: the agent may run on.
+pub(super) fn exit_wait(
+    exit: impl Fn() -> AgentExit,
+    wait: impl FnOnce(&mut dyn FnMut() -> bool) -> bool,
+) -> Option<&'static str> {
+    match exit() {
+        AgentExit::Gone => None,
+        AgentExit::Unproven => Some(WAIT_EXIT_UNPROVEN),
+        AgentExit::Runs => {
+            if wait(&mut || exit() == AgentExit::Gone) {
+                return None;
+            }
+            match exit() {
+                AgentExit::Gone => None,
+                AgentExit::Runs => Some("wait:exiting"),
+                AgentExit::Unproven => Some(WAIT_EXIT_UNPROVEN),
+            }
+        }
+    }
 }
 
 /// The fallback origin an exit's relaunch of `session` records ([`fallback_carried`] of the one its last record keeps).
@@ -7135,7 +7251,7 @@ fn carry_own_step(opts: &Opts, r: Report, mut st: St, session: &str, tab: &str) 
         r.pid = st.relaunched_pid;
         return r;
     }
-    if carried_here(st.agent) && st.relaunched_gone(alive) {
+    if carried_here(st.agent) && st.relaunched_gone(alive, kernel_start) {
         if !opts.dry_run {
             st.close_overtaken("exited-before-continuing", now_s());
             ledger(
@@ -7287,7 +7403,7 @@ pub fn adopted_gone(opts: &Opts, tab: &str, session: &str) -> Option<bool> {
         .ok()
         .flatten()
         .filter(|st| st.in_flight() && st.tab == tab)?;
-    (st.relaunched_pid != 0).then(|| st.relaunched_gone(alive))
+    (st.relaunched_pid != 0).then(|| st.relaunched_gone(alive, kernel_start))
 }
 
 /// Whether a relaunch of conversation `session` is in flight in tab `tab` ([`St::in_flight`]).

@@ -3087,7 +3087,7 @@ fn reap_shell_draining(
         }
         #[cfg(any(test, debug_assertions))]
         if Some(tick) == kill_at {
-            while reap_kills_held() {
+            while HOLD_REAP_KILLS.held() {
                 if let Some(held) = held.as_ref() {
                     held.tend();
                 }
@@ -3188,33 +3188,47 @@ pub fn wait_for_reaps(bound: std::time::Duration) -> bool {
     *in_grace == 0
 }
 
-/// How many [`ReapKillHold`]s are alive. A count, not a flag: tests holding at once in one binary
-/// each drop their own guard, and one drop must not release a reap another test still holds.
 #[cfg(any(test, debug_assertions))]
-static HOLD_REAP_KILLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static HOLD_REAP_KILLS: ReapKillHolds = ReapKillHolds::new();
+
+#[cfg(any(test, debug_assertions))]
+struct ReapKillHolds(std::sync::atomic::AtomicUsize);
+
+#[cfg(any(test, debug_assertions))]
+impl ReapKillHolds {
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicUsize::new(0))
+    }
+
+    fn hold(&self) -> ReapKillHold<'_> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        ReapKillHold { holds: self }
+    }
+
+    fn held(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire) != 0
+    }
+}
 
 /// Test seam holding every [`reap_shell`] in its grace window until every guard drops.
 #[cfg(any(test, debug_assertions))]
 #[must_use]
-pub fn hold_reap_kills_for_test() -> ReapKillHold {
-    HOLD_REAP_KILLS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    ReapKillHold(())
+pub fn hold_reap_kills_for_test() -> ReapKillHold<'static> {
+    HOLD_REAP_KILLS.hold()
 }
 
-/// Whether any [`ReapKillHold`] is alive, which keeps a reap at its kill tick.
+/// [`hold_reap_kills_for_test`]'s guard: dropping the last guard lets the held reaps go on.
 #[cfg(any(test, debug_assertions))]
-fn reap_kills_held() -> bool {
-    HOLD_REAP_KILLS.load(std::sync::atomic::Ordering::Acquire) > 0
+pub struct ReapKillHold<'a> {
+    holds: &'a ReapKillHolds,
 }
 
-/// [`hold_reap_kills_for_test`]'s guard: once it and every other drops, the held reaps go on.
 #[cfg(any(test, debug_assertions))]
-pub struct ReapKillHold(());
-
-#[cfg(any(test, debug_assertions))]
-impl Drop for ReapKillHold {
+impl Drop for ReapKillHold<'_> {
     fn drop(&mut self) {
-        HOLD_REAP_KILLS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.holds
+            .0
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 

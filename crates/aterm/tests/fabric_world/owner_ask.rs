@@ -1999,6 +1999,7 @@ fn write_relaunch_fake(inst: &Inst, interpreter: Interpreter) {
          case \"$1\" in --version) echo '2.1.281 (Claude Code)'; exit 0 ;; esac\n\
          tmp=${{HOME%/home}}\n\
          printf '%s\\n' \"$PPID\" > \"$tmp/relaunch-parent\"\n\
+         printf '%s\\000' \"$@\" > \"$tmp/launch-$$.argv\"\n\
          echo \"$$ $*\" >> \"$tmp/launches.log\"\n\
          stty -icanon -echo min 0 time 2 2>/dev/null\n\
          sid={CONVERSATION}; prev=\n\
@@ -2049,6 +2050,32 @@ fn launches(inst: &Inst) -> Vec<(u32, String)> {
         .collect()
 }
 
+/// Check the actual argument boundaries: an admitted stable executable may add
+/// one managed status-line JSON argument without replacing the saved model or
+/// conversation. A build-cache executable is deliberately not admitted for the tap.
+fn assert_stored_resume_arguments(inst: &Inst, pid: u32) {
+    let encoded = std::fs::read_to_string(inst.root.join(format!("launch-{pid}.argv")))
+        .expect("the launch wrote its argv before announcing itself");
+    assert!(encoded.ends_with('\0'), "complete argument record");
+    let mut args: Vec<&str> = encoded.split_terminator('\0').collect();
+    if let Some(settings_at) = args.iter().position(|arg| *arg == "--settings") {
+        assert_eq!(args.iter().filter(|arg| **arg == "--settings").count(), 1);
+        let settings: aterm_json::Value = aterm_json::from_str(args[settings_at + 1])
+            .expect("the settings argument is an intact JSON document");
+        let settings = settings.as_object().expect("settings object");
+        assert_eq!(settings.len(), 1, "only managed status settings were added");
+        let status = settings.get("statusLine").expect("managed status line");
+        assert_eq!(status["type"].as_str(), Some("command"));
+        assert!(
+            status["command"]
+                .as_str()
+                .is_some_and(|command| !command.is_empty())
+        );
+        args.drain(settings_at..=settings_at + 1);
+    }
+    assert_eq!(args, ["--model", "opus", "--resume", CONVERSATION]);
+}
+
 /// Every `aterm.log` line under `inst`'s scratch (the harness's own log among them).
 fn host_log(inst: &Inst) -> String {
     fn walk(dir: &Path, out: &mut String) {
@@ -2071,6 +2098,14 @@ fn program_is(inst: &Inst, sid: &str, want: &str) {
     until_on(inst, sid, DEADLINE, &format!("program={want}"), || {
         (kv(&status_of(inst, sid), "program") == Some(want)).then_some(())
     });
+}
+
+/// The zsh legs 6 run on ([`aterm_spec::host::need_tool`]): `/bin/zsh` on macOS, its login
+/// shell; elsewhere the host's own, and a host with none ends the test COULD NOT RUN.
+fn zsh() -> String {
+    aterm_spec::host::need_tool("zsh")
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// **LEG 6 (6C-1, 6H-6): THE RELAUNCH**, on `shell` (its rc file `rc`, made empty): a
@@ -2353,6 +2388,114 @@ fn hosted_stand_in_as(
     (owner, a, s)
 }
 
+/// A crash onto a newer managed build. `--resume` marks the line, so a typed relaunch would keep
+/// the twin, but a cold one execs what its command names and holds the child to that image. Named
+/// the script twin, the agent ran on the build while the relaunch waited on an outcome that never
+/// matched, `supervisor=-` until its claim was given back a minute later.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn a_cold_relaunch_onto_a_newer_twin_execs_the_build_and_settles() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let owner = Owner::boot();
+    let root = owner.tmp.join("a");
+    let prefix = atpkg::store::default_prefix(&root.join("home"));
+    let twin = prefix.join("agents/claude");
+    let build = prefix.join("store/claude/1000002000001000318/bin/claude");
+    let foreign = root.join("foreign/claude");
+    let opts = Opts {
+        shell: Some(
+            relaunch_fixture_shell(&owner.tmp, "/bin/zsh")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        env: vec![(
+            aterm_agent::harness::agent_image::STANDINS_SEAM.to_string(),
+            std::env::join_paths([&twin, &build, &foreign])
+                .unwrap()
+                .into_string()
+                .unwrap(),
+        )],
+        ..Opts::default()
+    };
+    let a = Inst::boot(&owner, "a", NODE_A, opts);
+    a.wait_ready(&owner);
+    std::fs::write(a.root.join("home/.zshrc"), "").unwrap();
+    crate::native_claude::place(&a.root, &foreign, &idle_composer());
+    std::fs::create_dir_all(build.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(twin.parent().unwrap()).unwrap();
+    std::fs::write(build.with_file_name("fixture-version"), "2.1.318").unwrap();
+    aterm_uds::deadline::ad_hoc_copy(&aterm_tempfile::bin_exe("aterm-claude-fixture"), &build);
+    let mut proof = aterm_uds::spawnfd::command(&build)
+        .arg("--version")
+        .stdout(OwnedStdio::piped())
+        .spawn()
+        .expect("run the build in place");
+    aterm_uds::deadline::prints(
+        &mut proof,
+        "2.1.318 (Claude Code)",
+        aterm_uds::deadline::ECHO_HANG,
+    );
+    assert!(proof.wait().unwrap().success());
+    std::fs::write(
+        &twin,
+        format!("#!/bin/sh\nexec '{}' \"$@\"\n", build.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&twin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let s = spawn_tab(&a);
+    until_on(&a, &s, DEADLINE, "the shell's integration", || {
+        (kv(&status_of(&a, &s), "integration") == Some("on")).then_some(())
+    });
+    let quoted = aterm_agent::harness::upgrade::quote(
+        aterm_agent::harness::upgrade::Dialect::Zsh,
+        &a.root.to_string_lossy(),
+    );
+    type_line(
+        &a,
+        &s,
+        &format!(
+            "export ANTHROPIC_API_KEY=aterm-fabric-standin; export ATERM_CLAUDE_FIXTURE_ROOT={quoted}; cd {} && '{}'",
+            a.root.join("work").display(),
+            foreign.display()
+        ),
+    );
+    program_is(&a, &s, "claude");
+    until_on(&a, &s, DEADLINE, "the host attached", || {
+        kv(&status_of(&a, &s), "supervisor")
+            .is_some_and(|v| v.starts_with("aterm-harness"))
+            .then_some(())
+    });
+    until_on(&a, &s, DEADLINE, "the agent's first idle point", || {
+        host_log(&a).contains("EVENT idle").then_some(())
+    });
+    let pid = launches(&a).first().expect("the native launch").0;
+    until_on(&a, &s, DEADLINE, "the live native watch", || {
+        crate::native_claude::observed(&a.root, &s, pid).then_some(())
+    });
+    std::fs::write(a.root.join("die"), "").unwrap();
+    let resumed = until_on(&a, &s, DEADLINE, "the relaunched agent", || {
+        launches(&a).get(1).cloned()
+    });
+    assert_eq!(resumed.1, format!("--resume {CONVERSATION}"));
+    assert_eq!(
+        aterm_uds::process::read_process_path(i32::try_from(resumed.0).unwrap()),
+        Some(std::fs::canonicalize(&build).unwrap()),
+        "the build, not the stand-in it left"
+    );
+    let row = format!("harness @{s}: relaunch ");
+    until_on(&a, &s, DEADLINE, "the relaunch adopted its agent", || {
+        host_log(&a)
+            .lines()
+            .any(|l| l.contains(&row) && l.ends_with(" step=adopted"))
+            .then_some(())
+    });
+    until_on(&a, &s, DEADLINE, "the host back on the agent", || {
+        kv(&status_of(&a, &s), "supervisor")
+            .is_some_and(|v| v.starts_with("aterm-harness"))
+            .then_some(())
+    });
+}
+
 /// A stored route is admitted from the owned helper, without a parent-kernel environment prerequisite.
 #[test]
 fn a_stored_login_relaunch_uses_the_owned_helpers_context() {
@@ -2374,7 +2517,7 @@ fn a_stored_login_relaunch_uses_the_owned_helpers_context() {
     assert_eq!(got.len(), 2, "relaunched once: {got:?}");
     assert_ne!(got[0].0, got[1].0, "the helper exec produced a new agent");
     assert_eq!(got[0], first[0], "the original launch is retained");
-    assert_eq!(got[1].1, format!("--model opus --resume {CONVERSATION}"));
+    assert_stored_resume_arguments(&a, got[1].0);
     let resumed = a
         .root
         .join("home/.claude/sessions")
@@ -2454,34 +2597,12 @@ fn a_stored_login_relaunch_keeps_its_wait_when_the_shell_context_is_unavailable(
     }
 }
 
-/// **THE OWNER'S RULE THAT A RESTART RESUMES ITS WORK, ON macOS's LOGIN SHELL**: a stored-login
-/// Claude Code in a `/bin/zsh` tab, whose environment macOS shows no other process, crashes, and
-/// the harness relaunches it on its conversation, admitted on the launch environment its own exec
-/// environment recorded while it ran.
-#[test]
-fn a_stored_login_relaunch_on_a_platform_shell_resumes_on_its_recorded_launch_environment() {
-    let (_owner, a, s) =
-        hosted_stand_in_as("/bin/zsh", Some(".zshrc"), false, true, Interpreter::Own);
-    assert!(env_readable(launches(&a)[0].0), "the agent's own record");
-    std::fs::write(a.root.join("die"), "").unwrap();
-    let got = until_on(&a, &s, DEADLINE, "the relaunch", || {
-        let got = launches(&a);
-        (got.len() >= 2).then_some(got)
-    });
-    assert_eq!(got.len(), 2, "relaunched once: {got:?}");
-    assert_eq!(
-        got[1].1,
-        format!("--model opus --resume {CONVERSATION}"),
-        "{got:?}"
-    );
-}
-
 /// **LEG 6, THE RELAUNCH ON zsh** (macOS's login shell), the agent in the shell's own directory:
 /// the session file spells it as the agent's logical `$PWD` (`/tmp/…`), the kernel as its real
 /// path (`/private/tmp/…`), one directory, so the relaunch's line changes no directory.
 #[test]
 fn a_relaunch_lifts_the_failure_it_caused_and_says_so() {
-    let line = relaunch_leg("/bin/zsh", Some(".zshrc"), false, false);
+    let line = relaunch_leg(&zsh(), Some(".zshrc"), false, false);
     eprintln!("zsh relaunch line: {line}");
     assert!(
         !line.contains("cd --"),
@@ -2513,7 +2634,7 @@ fn on_bash_a_relaunch_into_another_directory_lifts_the_failure_too() {
 /// Then the relaunched agent exits 0 (`/exit`): its run reads `ok`.
 #[test]
 fn an_asked_restart_pages_nothing_and_says_who_asked() {
-    let (owner, a, s) = hosted_stand_in("/bin/zsh", Some(".zshrc"), false);
+    let (owner, a, s) = hosted_stand_in(&zsh(), Some(".zshrc"), false);
     let first = launches(&a).first().map(|l| l.0).expect("the first launch");
     let reply = a.text(&format!("@{s} restart"));
     assert!(
@@ -2640,7 +2761,7 @@ fn an_asked_restart_pages_nothing_and_says_who_asked() {
 /// so the failure is lifted and the restart labelled all the same.
 #[test]
 fn a_relaunch_whose_agent_registers_after_its_row_gave_up_still_lifts_the_failure() {
-    let line = relaunch_leg("/bin/zsh", Some(".zshrc"), false, true);
+    let line = relaunch_leg(&zsh(), Some(".zshrc"), false, true);
     eprintln!("late zsh relaunch line: {line}");
 }
 

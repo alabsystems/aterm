@@ -1146,6 +1146,21 @@ impl CellExtras {
         !self.is_empty() || self.complex_ring.is_some() || self.rgb_ring.is_some()
     }
 
+    /// Whether a dense ring (complex glyphs or true colour) is allocated.
+    #[must_use]
+    #[inline]
+    pub(crate) const fn has_rings(&self) -> bool {
+        self.complex_ring.is_some() || self.rgb_ring.is_some()
+    }
+
+    /// Whether the extras hold nothing at all: no map entry, live or stale, and no dense ring.
+    /// A full-screen scroll's shift ([`Self::shift_rows_up_by`]) then moves nothing.
+    #[must_use]
+    #[inline]
+    pub(crate) fn holds_nothing(&self) -> bool {
+        self.data.is_empty() && !self.has_rings()
+    }
+
     /// Iterate over all non-stale `(coord, extra)` pairs in external coordinates.
     pub fn iter(&self) -> impl Iterator<Item = (CellCoord, &CellExtra)> + '_ {
         let offset = self.row_offset;
@@ -1648,7 +1663,17 @@ impl CellExtras {
     }
 
     /// Scroll every row up by `n` (a full-screen scroll).
+    #[inline]
     pub fn shift_rows_up_by(&mut self, n: u16) {
+        // A full screen shifts every line feed; with no map entry and no ring there is nothing
+        // to move, and the call stays inline.
+        if self.data.is_empty() && !self.has_rings() {
+            return;
+        }
+        self.shift_rows_up_by_held(n);
+    }
+
+    fn shift_rows_up_by_held(&mut self, n: u16) {
         if n == 0 {
             return;
         }

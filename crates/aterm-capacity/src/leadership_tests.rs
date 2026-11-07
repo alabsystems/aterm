@@ -245,3 +245,31 @@ fn actual_holder_sigkill_allows_next_epoch_and_preserves_live_parent_claim() {
     assert_eq!(std::fs::read(claim.path()).unwrap(), before);
     assert_eq!(f.ledger.list().unwrap().len(), 1);
 }
+
+/// A host epoch read that a signal interrupts is read again, as `read_to_end` did: an
+/// interruption is no failure of the record.
+/// NEGATIVE CONTROL: a `fill` that hands `Interrupted` to its caller (dabbac544e) fails the
+/// read: `called `Result::unwrap()` on an `Err` value: Custom { kind: Interrupted, .. }`.
+#[test]
+fn an_interrupted_epoch_read_is_read_again() {
+    struct Interrupts<'a> {
+        once: bool,
+        rest: &'a [u8],
+    }
+    impl io::Read for Interrupts<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if std::mem::take(&mut self.once) {
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            self.rest.read(buf)
+        }
+    }
+    let record = [7u8; RECORD_LEN];
+    let mut buf = [0u8; RECORD_LEN + 1];
+    let mut reader = Interrupts {
+        once: true,
+        rest: &record,
+    };
+    assert_eq!(fill(&mut reader, &mut buf).unwrap(), RECORD_LEN);
+    assert_eq!(buf[..RECORD_LEN], record);
+}

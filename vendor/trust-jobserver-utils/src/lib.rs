@@ -7,7 +7,7 @@
 #[cfg(feature = "client")]
 use std::io;
 #[cfg(all(unix, feature = "client"))]
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(feature = "client")]
 use std::process::Command;
 #[cfg(all(unix, feature = "client"))]
@@ -16,6 +16,8 @@ use std::sync::Arc;
 #[cfg(feature = "client")]
 use jobserver::{Client, FromEnvErrorKind};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod descriptor_transfer;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod handoff;
 
@@ -93,6 +95,16 @@ impl Jobserver {
         &self.client
     }
 
+    /// The exact owned pipe advertised by [`Self::configure`], when this
+    /// server uses numeric Unix descriptors. Authenticated native launchers
+    /// retain the server and explicitly inherit these descriptors instead of
+    /// interpreting environment strings as scheduling authority. A named FIFO
+    /// has no inherited descriptor transport.
+    #[cfg(unix)]
+    pub fn pipe_descriptors(&self) -> Option<&[OwnedFd; 2]> {
+        self.pipe.as_deref()
+    }
+
     /// Allow unaware build scripts to hand this same pipe to Bootstrap shims.
     /// The caller must retain this owner through every relevant child wait.
     /// No tokens are acquired, created, replenished or proxied by this service.
@@ -157,6 +169,15 @@ impl Jobserver {
     ///
     /// The early-startup requirement of [`Jobserver::from_env`] applies.
     pub unsafe fn from_env_with_handoff() -> io::Result<Option<Self>> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(advertisement) = std::env::var_os(DESCENDANT_HANDOFF_ENV) {
+            if let Some(path) = Client::fifo_path_from_env()? {
+                // Authenticate the actual original FIFO witnesses BEFORE any
+                // pathname open. A malformed or mismatched role must not fall
+                // back to importing an unchecked ambient FIFO.
+                return Self::from_fifo_handoff(&path, &advertisement).map(Some);
+            }
+        }
         // SAFETY: the caller guarantees capture before descriptor reuse.
         match unsafe { Self::from_env() } {
             Ok(server) => Ok(server),
@@ -196,49 +217,31 @@ impl Jobserver {
 
     #[cfg(unix)]
     fn own_pipe(client: &Client) -> io::Result<Option<Arc<[OwnedFd; 2]>>> {
-        // Read the library's canonical metadata, not ambient MAKEFLAGS: this
-        // keeps its variable precedence and FIFO parsing authoritative.
-        let mut metadata = Command::new("__jobserver_metadata_only__");
-        client.configure(&mut metadata);
-        let flags = metadata
-            .get_envs()
-            .find_map(|(key, value)| (key == "CARGO_MAKEFLAGS").then_some(value).flatten())
-            .and_then(|flags| flags.to_str())
-            .expect("jobserver configured non-UTF-8 or absent flags");
-        let auth = flags
-            .split_whitespace()
-            .find_map(|flag| flag.strip_prefix("--jobserver-auth="))
-            .expect("jobserver configured no authentication metadata");
-        if auth.starts_with("fifo:") {
-            use std::os::unix::fs::FileTypeExt;
-
-            // jobserver 0.1.35 checks numeric descriptors but opens FIFO paths
-            // without checking their file type. Reject a stable non-FIFO path
-            // rather than treating a regular file as scheduling authority.
-            // This check does not authenticate mutable FIFO pathnames.
-            if !std::fs::metadata(&auth[5..])?.file_type().is_fifo() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "advertised jobserver FIFO path is not a FIFO",
-                ));
+        // Clone actual original descriptions from their native owner, never
+        // parse configured environment strings back into descriptor authority.
+        match client.transport_witnesses()? {
+            jobserver::TransportWitnesses::NumericPipe { read, write } => {
+                Ok(Some(Arc::new([read, write])))
             }
-            return Ok(None);
+            jobserver::TransportWitnesses::NamedFifo { path, read, write } => {
+                use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+                let selected = std::fs::metadata(path)?;
+                let read = std::fs::File::from(read).metadata()?;
+                let write = std::fs::File::from(write).metadata()?;
+                if !selected.file_type().is_fifo()
+                    || !read.file_type().is_fifo()
+                    || !write.file_type().is_fifo()
+                    || (selected.dev(), selected.ino()) != (read.dev(), read.ino())
+                    || (selected.dev(), selected.ino()) != (write.dev(), write.ino())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "original named GNU witnesses or selected FIFO changed",
+                    ));
+                }
+                Ok(None)
+            }
         }
-        let invalid =
-            || io::Error::new(io::ErrorKind::InvalidInput, "invalid jobserver pipe metadata");
-        let (read, write) = auth.split_once(',').ok_or_else(invalid)?;
-        let read = read.parse::<libc::c_int>().map_err(|_| invalid())?;
-        let write = write.parse::<libc::c_int>().map_err(|_| invalid())?;
-        // SAFETY: checked import just validated these inherited pipe numbers;
-        // no intervening operation closes them. Duplicate immediately so later
-        // file opens cannot affect the descriptors passed to the compiler.
-        let pipe = unsafe {
-            [
-                BorrowedFd::borrow_raw(read).try_clone_to_owned()?,
-                BorrowedFd::borrow_raw(write).try_clone_to_owned()?,
-            ]
-        };
-        Ok(Some(Arc::new(pipe)))
     }
 
     /// Configure the final child after all other environment/argv processing.

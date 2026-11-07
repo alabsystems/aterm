@@ -2317,6 +2317,109 @@ mod tests {
         }
     }
 
+    /// A GROK BUILD OR KIMI CODE TAB PUBLISHES WHAT ITS SCREEN DECIDES (their measured frames,
+    /// `aterm_phase::grok::phase` and `aterm_phase::kimi::phase`): a running turn `busy`, a
+    /// turn's end `idle`, and the walls their readers read (Grok Build's sign-in screen, its
+    /// 401's failure and its weekly upsell; Kimi Code's spent quota), where every frame read
+    /// `unknown` and every wall was dropped before. A card in the composer's place and Grok
+    /// Build's plan approval publish `prompt` with the box's kind (and, for a command, the
+    /// read-only rule's verdict). CONTROL: a shell showing those frames runs no agent.
+    #[test]
+    fn grok_and_kimi_tabs_publish_the_phase_and_walls_their_screens_decide() {
+        use aterm_phase::prompt::fixtures::screen;
+        use aterm_phase::{WallKind, grok, kimi};
+        let verdict = |program: &str, text: &str| {
+            agent_verdict(
+                Some(program),
+                false,
+                None,
+                &screen(text),
+                Cursor::Unknown,
+                t0(),
+            )
+        };
+        let wall_of = |v: &AgentVerdict| match v.reading().map(|r| &r.phase) {
+            Some(AgentPhase::Wall { kind, .. }) => Some(*kind),
+            _ => None,
+        };
+        for (program, text, word) in [
+            ("grok", grok::fixtures::BUSY_STREAMING, "busy"),
+            ("grok", grok::fixtures::BUSY_DRAFT, "busy"),
+            ("grok", grok::fixtures::TURN_ENDED_EMPTY, "idle"),
+            ("grok", grok::fixtures::IDLE_DRAFT, "idle"),
+            ("grok", grok::fixtures::BOX_SHELL, "prompt"),
+            ("grok", grok::fixtures::PLAN_APPROVAL, "prompt"),
+            ("kimi", kimi::fixtures::BUSY_HELD_240, "busy"),
+            ("kimi", kimi::fixtures::LIMIT_429_RETRYING_240, "busy"),
+            ("kimi", kimi::fixtures::END_OF_TURN_240, "idle"),
+            ("kimi", kimi::fixtures::BOX_SHELL_240, "prompt"),
+            ("kimi", kimi::fixtures::QUESTION_240, "prompt"),
+        ] {
+            let v = verdict(program, text);
+            assert_eq!(v.word(), word, "{program}: {v:?}");
+            assert_eq!(v.program(), aterm_phase::program_of(program), "{program}");
+            assert_eq!(
+                verdict("zsh", text).word(),
+                "-",
+                "CONTROL: {program} under a shell"
+            );
+        }
+        for (program, text, kind) in [
+            ("grok", grok::fixtures::SIGNED_OUT, WallKind::Auth),
+            ("grok", grok::fixtures::WALL_401_1_0_70, WallKind::Auth),
+            (
+                "grok",
+                grok::fixtures::UPSELL_WEEKLY_1_0_70,
+                WallKind::UsageWeekly,
+            ),
+            (
+                "kimi",
+                kimi::fixtures::LIMIT_429_FINAL_240,
+                WallKind::UsageSession,
+            ),
+        ] {
+            let v = verdict(program, text);
+            assert_eq!(wall_of(&v), Some(kind), "{program}: {v:?}");
+        }
+        assert_eq!(
+            verdict("grok", grok::fixtures::SIGNED_OUT).word(),
+            "wall:auth"
+        );
+        let detail_of = |v: &AgentVerdict| match v.reading().map(|r| &r.phase) {
+            Some(AgentPhase::Prompt { detail }) => detail.clone(),
+            _ => None,
+        };
+        for (program, text, detail) in [
+            ("grok", grok::fixtures::BOX_SHELL, "bash:not-read-only"),
+            ("grok", grok::fixtures::PLAN_APPROVAL, "plan-exit"),
+            ("grok", grok::fixtures::QUESTION, "question"),
+            ("kimi", kimi::fixtures::BOX_SHELL_240, "bash:read-only"),
+            ("kimi", kimi::fixtures::QUESTION_240, "question"),
+            ("kimi", kimi::fixtures::BOX_EDIT_252, "edit"),
+        ] {
+            let v = verdict(program, text);
+            assert_eq!(detail_of(&v).as_deref(), Some(detail), "{program}: {v:?}");
+        }
+        // A command's later line is judged on its own: `rm` on the `· ` row under a read-only
+        // first line makes the box not read-only. CONTROL: the first line alone is read-only.
+        let measured = "   $ echo lab-kimi-tool\n";
+        assert!(
+            kimi::fixtures::BOX_SHELL_240.contains(measured),
+            "PRECONDITION"
+        );
+        for (lines, detail) in [
+            ("   $ cat README.md\n", "bash:read-only"),
+            (
+                "   $ cat README.md\n   \u{b7} rm -rf build\n",
+                "bash:not-read-only",
+            ),
+        ] {
+            let text = kimi::fixtures::BOX_SHELL_240.replace(measured, lines);
+            let v = verdict("kimi", &text);
+            assert_eq!(detail_of(&v).as_deref(), Some(detail), "{lines:?}: {v:?}");
+        }
+    }
+
     #[test]
     fn a_node_run_codex_is_named_by_no_screen() {
         use aterm_phase::Program;

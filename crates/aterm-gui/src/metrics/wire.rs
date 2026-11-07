@@ -467,7 +467,7 @@ pub(crate) mod law_tests {
         for (key, raw) in members(json) {
             if key.ends_with("_schema") {
                 checked += 1;
-                if raw != "1" {
+                if raw.parse::<u64>().is_err() || raw == "0" {
                     out.push(format!("{key}={raw}"));
                 }
             } else if key.ends_with("_valid") || key == "last_present_drop_parked" {

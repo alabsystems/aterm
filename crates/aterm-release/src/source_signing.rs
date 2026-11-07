@@ -18,15 +18,6 @@ pub(crate) struct Tools {
 }
 
 impl Tools {
-    #[cfg(test)]
-    pub(crate) fn for_test() -> Self {
-        Self {
-            openssl: "/fixture/openssl".into(),
-            keys: "/fixture/keys".into(),
-            prerequisites: crate::managed_prerequisites::Tools::Simulated,
-        }
-    }
-
     /// Check the tools and the exact ring the publication engine will use.
     pub(crate) fn probe(
         repo: &Path,

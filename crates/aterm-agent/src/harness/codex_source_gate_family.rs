@@ -62,6 +62,7 @@ impl FamilySource<'_> {
     }
 }
 
+#[cfg(unix)]
 fn family_gate(identity: &Identity) -> Result<Held, &'static str> {
     let root = identity
         .gate
@@ -73,6 +74,11 @@ fn family_gate(identity: &Identity) -> Result<Held, &'static str> {
     let family = root.join(&identity.family);
     private_directory(&family)?;
     open_gate(&family)
+}
+
+#[cfg(not(unix))]
+fn family_gate(_: &Identity) -> Result<Held, &'static str> {
+    Err("native credential custody is unsupported on this platform")
 }
 
 pub struct FamilyWork<'source> {
@@ -178,6 +184,60 @@ impl SourceBorrow<'_, '_> {
     }
 }
 
+/// Owned only by a registry phase. Its source proof survives legitimate member
+/// retirement without claiming an old Ready observation is still current.
+pub(in crate::harness) struct ReservationFamilyExclusive {
+    source: codex_source_registry::SealingSource,
+    identity: Identity,
+    global: SourceWorkLease,
+    held: Held,
+}
+impl ReservationFamilyExclusive {
+    pub(in crate::harness) fn acquire(
+        source: codex_source_registry::SealingSource,
+    ) -> Result<Self, &'static str> {
+        if !source.current() {
+            return Err(UNAVAILABLE);
+        }
+        let identity = Identity {
+            caller: source.caller().clone(),
+            version: 0, // phase identity is retained by source, never a Ready version
+            family: family_key(source.caller(), source.source().binding())?,
+            gate: source.gate().clone(),
+        };
+        let global = identity.gate.shared()?;
+        let held = family_gate(&identity)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "registry phase retains this actual exclusive family lock"
+        )]
+        held.file.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => BUSY,
+            std::fs::TryLockError::Error(_) => UNAVAILABLE,
+        })?;
+        let guard = Self {
+            source,
+            identity,
+            global,
+            held,
+        };
+        guard.current()?;
+        Ok(guard)
+    }
+    pub(in crate::harness) fn current(&self) -> Result<(), &'static str> {
+        if !self.source.current() || self.source.gate() != &self.identity.gate {
+            return Err(UNAVAILABLE);
+        }
+        self.global.current()?;
+        self.held.current()
+    }
+}
+impl std::fmt::Debug for ReservationFamilyExclusive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReservationFamilyExclusive(redacted)")
+    }
+}
+
 macro_rules! redacted {
     ($($type:ident),*) => {$ (
         impl std::fmt::Debug for $type<'_> {
@@ -199,7 +259,7 @@ pub struct Fixture {
     identity: Identity,
     live: std::sync::atomic::AtomicBool,
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     fn fixture(home: &Path, grant: &str, version: u64) -> Fixture {

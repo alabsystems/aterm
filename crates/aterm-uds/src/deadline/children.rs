@@ -70,7 +70,7 @@ pub(super) fn poll(fds: &mut [PollFd], timeout: Duration) -> io::Result<bool> {
     let until = super::saturating_after(Instant::now(), timeout);
     loop {
         let left = until.saturating_duration_since(Instant::now());
-        let ms = i32::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX);
+        let ms = crate::deadline::poll_timeout_ms(left);
         let n = Nfds::try_from(fds.len()).unwrap_or(Nfds::MAX);
         // SAFETY: `fds` is a live, initialized array of `struct pollfd` of the length passed, which
         // `poll` reads and writes and does not retain.

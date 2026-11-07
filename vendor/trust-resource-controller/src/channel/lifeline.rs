@@ -174,7 +174,7 @@ mod tests {
         let (a, b) = UnixStream::pair().unwrap();
         let mut sender = Channel::new(a).unwrap();
         let mut receiver = Channel::new(b).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(60);
         assert!(sender.send_read_lifeline(writer.as_fd(), deadline).is_err());
         assert!(!sender.poisoned());
         // SAFETY: flag observation on the held source pipe reader only.
@@ -183,15 +183,30 @@ mod tests {
         let actual = receiver.receive_read_lifeline(deadline).unwrap();
         // SAFETY: flags of the held original/received descriptions only.
         unsafe {
-            assert_eq!(libc::fcntl(reader.as_raw_fd(), libc::F_GETFL), before);
+            assert_eq!(
+                crate::tests::caller_status_flags(libc::fcntl(reader.as_raw_fd(), libc::F_GETFL)),
+                crate::tests::caller_status_flags(before)
+            );
             assert_ne!(libc::fcntl(actual.as_raw_fd(), libc::F_GETFD) & libc::FD_CLOEXEC, 0);
         }
         let mut event = libc::pollfd { fd: actual.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         // SAFETY: zero-timeout poll observes this held actual read end only.
         assert_eq!(unsafe { libc::poll(&mut event, 1, 0) }, 0);
         drop(writer);
-        // SAFETY: original sole writer is gone; this held read end sees EOF.
-        assert_eq!(unsafe { libc::poll(&mut event, 1, 0) }, 1);
+        // A concurrent test's fork may briefly retain the writer before exec
+        // closes it. Wait for actual EOF, with a hang detector, not a latency bound.
+        loop {
+            let remaining =
+                deadline.checked_duration_since(Instant::now()).expect("writer retired");
+            let millis = remaining.as_millis().saturating_add(1).min(i32::MAX as u128) as i32;
+            // SAFETY: one initialized pollfd for our held read end, with a bounded timeout.
+            let ready = unsafe { libc::poll(&mut event, 1, millis) };
+            if ready < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            assert_eq!(ready, 1, "the sole writer must retire");
+            break;
+        }
         let mut byte = 0u8;
         // SAFETY: one initialized byte and the held ready pipe reader.
         assert_eq!(unsafe { libc::read(actual.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) }, 0);

@@ -1983,3 +1983,141 @@ fn an_integrated_bash_runs_bash_preexec_and_reports_each_command() {
         }
     }
 }
+
+/// Under functrace a `DEBUG` trap is handed to every function, so an rc's trap would also run for each
+/// command of aterm's helpers. It stays out of them and goes on running in a person's own prompt hook,
+/// which sees functrace on, as the next line does. A function wrapping aterm's trap there never reports
+/// one of aterm's own commands as a line.
+#[cfg(unix)]
+#[test]
+fn an_integrated_bash_under_functrace_keeps_an_rcs_trap_out_of_its_helpers() {
+    const RC: &str = r#"
+set -T
+rc_hook=0 rc_helper=0
+hook() { hook_t=${-//[!T]/}; : in-hook; }
+trap 'case " ${FUNCNAME[*]-} " in *" hook "*) rc_hook=$((rc_hook+1)) ;; *" __aterm_osc "*|*" __aterm_encode_cmd "*) rc_helper=$((rc_helper+1)) ;; esac' DEBUG
+"#;
+    let lines = [
+        ("echo one$((40+2))", "0", "echo\\x20one$((40+2))"),
+        ("false", "1", "false"),
+        ("(exit 3)", "", "(exit\\x203)"),
+    ];
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        for (joined, setup) in [
+            (false, "PROMPT_COMMAND=hook\n".to_owned()),
+            (
+                true,
+                format!(
+                    "__bp_newest=1\n{BASH_PREEXEC_SHAPE}\
+                     PROMPT_COMMAND=\"$PROMPT_COMMAND\"'; hook'\n"
+                ),
+            ),
+        ] {
+            let case = format!("{bash} joined={joined}");
+            let fx = LiveFixture::new();
+            let dir = install_script_set(&fx.base).expect("install");
+            std::fs::write(
+                fx.home.join(".bashrc"),
+                format!("HISTFILE=/dev/null\n{setup}{RC}"),
+            )
+            .expect(".bashrc");
+            let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, &dir, &[("ATERM_CHILD", "1")]);
+            sh.wait_for_line_editor();
+            let from = sh.len();
+            let mut end = from;
+            for (line, status, _) in lines {
+                let typed = sh.type_at_prompt(format!("{line}\r").as_bytes());
+                let done = if status.is_empty() {
+                    typed
+                } else {
+                    sh.wait_for_after(&format!("\x1b]133;D;{status}"), typed)
+                };
+                end = sh.wait_for_after("\x1b]133;A", done);
+            }
+            let reported: Vec<String> = stdout_between(&sh, from, end)
+                .split("\x1b]633;E;")
+                .skip(1)
+                .map(|rest| rest.split([';', '\x07']).next().unwrap_or("").to_owned())
+                .collect();
+            let typed = lines.map(|(_, _, reported)| reported);
+            assert!(
+                reported.iter().all(|line| typed.contains(&line.as_str())),
+                "{case}: a command of aterm's reported as a line: {reported:?}"
+            );
+            let start = sh.len();
+            let stop = sh.run_line(
+                r#"/bin/echo "helper=$rc_helper hook=$rc_hook hook_t=[$hook_t] now=[${-//[!T]/}]""#,
+                "0",
+            );
+            let out = stdout_between(&sh, start, stop);
+            let read = |word: &str| -> u32 {
+                out.split(word)
+                    .filter_map(|rest| {
+                        let digits: String =
+                            rest.chars().take_while(char::is_ascii_digit).collect();
+                        digits.parse().ok()
+                    })
+                    .next()
+                    .unwrap_or_else(|| panic!("{case}: {out:?}"))
+            };
+            assert_eq!(read("helper="), 0, "{case}: {out:?}");
+            assert!(out.contains("hook_t=[T] now=[T]"), "{case}: {out:?}");
+            if joined {
+                sh.finish();
+                continue;
+            }
+            assert!(
+                read("hook=") > 0,
+                "{case}: the rc's trap left the hook: {out:?}"
+            );
+            let from = sh.run_line(
+                r#"w() { local a=$1; eval -- "$WT"; : "$a"; }; eval "WT=($(trap -p DEBUG))"; WT=("${WT[2]}"); trap 'w "$_"' DEBUG"#,
+                "0",
+            );
+            sh.type_at_prompt(b"echo wrapped$((40+2))\r");
+            let at = sh.wait_for_after("wrapped42", from);
+            let end = sh.wait_for_after("\x1b]133;A", at);
+            let wrapped = stdout_between(&sh, from, end);
+            for rest in wrapped.split("\x1b]633;E;").skip(1) {
+                let line = rest.split([';', '\x07']).next().unwrap_or("");
+                assert_eq!(line, "echo\\x20wrapped$((40+2))", "{case}: {wrapped:?}");
+            }
+            sh.finish();
+        }
+    }
+}
+
+/// `__aterm_untraced` runs a command spelled `"$@"`, which reads as a top-level line once functrace is
+/// off. A person's own `"$@"` is spelled the same, and it still reports before its program runs, with no
+/// flag at all and under functrace.
+#[cfg(unix)]
+#[test]
+fn an_integrated_bash_reports_a_typed_dollar_at_line() {
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        for flag in ["", "set -T\n"] {
+            let fx = LiveFixture::new();
+            let dir = install_script_set(&fx.base).expect("install");
+            std::fs::write(
+                fx.home.join(".bashrc"),
+                format!("HISTFILE=/dev/null\n{flag}"),
+            )
+            .expect(".bashrc");
+            let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, &dir, &[("ATERM_CHILD", "1")]);
+            sh.wait_for_line_editor();
+            sh.run_line("set -- /bin/echo args-ran", "0");
+            let from = sh.len();
+            let end = sh.run_line("\"$@\"", "0");
+            let out = stdout_between(&sh, from, end);
+            let ran = out
+                .find("args-ran")
+                .unwrap_or_else(|| panic!("{bash} flag={flag:?}: {out:?}"));
+            assert!(
+                out[..ran].contains("\x1b]133;C"),
+                "{bash} flag={flag:?}: {out:?}"
+            );
+            sh.finish();
+        }
+    }
+}

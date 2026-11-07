@@ -184,10 +184,14 @@ fn unexpected(frame: &Frame) -> io::Error {
     )
 }
 
-/// The broker's [`Frame::Error`] as this process's error: an `errno`'s kind (a positive code), or
-/// `Other` (a DNS-SD error code), with the broker's words.
-fn failed(code: i32, words: &str) -> io::Error {
-    let kind = if code > 0 {
+/// The broker's [`Frame::Error`] as this process's error: an `errno`'s kind (a positive code;
+/// `EHOSTDOWN`, which std leaves uncategorized, is `HostUnreachable`, so a dial through the broker
+/// reads as [`super::reached_no_peer`] as a direct one does), or `Other` (a DNS-SD error code),
+/// with the broker's words.
+pub(super) fn failed(code: i32, words: &str) -> io::Error {
+    let kind = if code == libc::EHOSTDOWN {
+        io::ErrorKind::HostUnreachable
+    } else if code > 0 {
         io::Error::from_raw_os_error(code).kind()
     } else {
         io::ErrorKind::Other

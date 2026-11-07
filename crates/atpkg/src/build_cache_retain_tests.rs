@@ -17,7 +17,11 @@ impl World {
     fn new() -> Self {
         let directory = aterm_tempfile::tempdir().unwrap();
         let home = directory.path().canonicalize().unwrap().join("home");
-        std::fs::create_dir(&home).unwrap();
+        // Writable by its owner alone whatever the umask, as a person's home is.
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&home)
+            .unwrap();
         let owner = home.join("source");
         std::fs::create_dir(&owner).unwrap();
         std::fs::write(owner.join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();

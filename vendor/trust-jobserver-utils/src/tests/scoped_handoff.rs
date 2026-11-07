@@ -162,8 +162,10 @@ fn scoped_named_fifo_transport_preserves_inventory_and_refuses_replacement() {
     const EXACT: &str = "handoff::scoped_tests::scoped_named_fifo_transport_preserves_inventory_and_refuses_replacement";
     if std::env::var_os(NAMED).is_some() {
         let ad = std::env::var_os(ENV).unwrap();
-        let path = std::path::PathBuf::from(std::env::var_os("TRUST_SCOPED_FIFO_PATH").unwrap());
         assert!(recover_named_fifo_resources(&ad).is_err(), "unbound member must refuse");
+        #[cfg(feature = "client")]
+        // SAFETY: this fixture advertises only named metadata, no reusable slots.
+        assert!(unsafe { super::super::Jobserver::from_env_with_handoff() }.is_err());
         std::fs::write(std::env::var_os("TRUST_SCOPED_READY").unwrap(), b"ready").unwrap();
         let mut go = [0];
         std::io::stdin().read_exact(&mut go).unwrap();
@@ -180,14 +182,18 @@ fn scoped_named_fifo_transport_preserves_inventory_and_refuses_replacement() {
         }
         #[cfg(feature = "client")]
         {
-            let server = super::super::Jobserver::from_fifo_handoff(&path, &ad).unwrap();
+            // SAFETY: this child advertises only a named FIFO, never numeric
+            // descriptors; import must authenticate the scoped witnesses first.
+            let server =
+                unsafe { super::super::Jobserver::from_env_with_handoff() }.unwrap().unwrap();
             let token = server.client().acquire().unwrap();
             drop(token);
         }
         std::fs::write(std::env::var_os("TRUST_SCOPED_CONSUMED").unwrap(), b"done").unwrap();
         std::io::stdin().read_exact(&mut go).unwrap();
         #[cfg(feature = "client")]
-        assert!(super::super::Jobserver::from_fifo_handoff(&path, &ad).is_err());
+        // SAFETY: named-only metadata as above, now pointing at a replaced node.
+        assert!(unsafe { super::super::Jobserver::from_env_with_handoff() }.is_err());
         return;
     }
     use std::os::unix::fs::OpenOptionsExt;
@@ -209,9 +215,9 @@ fn scoped_named_fifo_transport_preserves_inventory_and_refuses_replacement() {
     command
         .args(["--exact", EXACT, "--nocapture"])
         .env(NAMED, "1")
-        .env("TRUST_SCOPED_FIFO_PATH", &path)
         .env("TRUST_SCOPED_READY", &ready)
         .env("TRUST_SCOPED_CONSUMED", &consumed)
+        .env("CARGO_MAKEFLAGS", format!("--jobserver-auth=fifo:{}", path.display()))
         .stdin(Stdio::piped());
     endpoint.configure(&mut command);
     let mut member = command.spawn().unwrap();

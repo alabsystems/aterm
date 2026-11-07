@@ -4162,7 +4162,18 @@ fn a_retarget_is_told_by_the_arm_that_made_it() {
     assert_eq!((st.wait.as_str(), st.salt), ("not-idle:busy", 100));
 }
 
-/// A [`Kernel`] that answers as scripted.
+/// What a scripted [`Kernel`] that states no process facts answers a look that asks for `fact`
+/// ([`Kernel::process_start`], [`Kernel::restart_background`]): a panic, never the machine's
+/// live answer, and never a stand-in that fails closed, under which a test of a hold would pass
+/// on a fact it never stated rather than on the guard it names. An upgrade fixture states its
+/// parked agent's facts through [`ParkedProcess`]; another lane's kernel states them itself.
+#[cfg(unix)]
+#[track_caller]
+pub(super) fn unstated(fact: &str) -> ! {
+    panic!("this kernel states no {fact}: state the parked agent's in the test's kernel")
+}
+
+/// A [`Kernel`] that answers as scripted. It states no process facts ([`unstated`]).
 #[cfg(unix)]
 struct Script {
     shell: u32,
@@ -4203,21 +4214,53 @@ impl Kernel for Script {
     fn terminal(&self, _: u32) -> Option<(u32, String)> {
         Some((1, "launchd".to_string()))
     }
+
+    fn process_start(&self, _: u32) -> Option<String> {
+        unstated("process start")
+    }
+
+    fn restart_background(&self, _: u32) -> Vec<String> {
+        unstated("background")
+    }
 }
 
-/// A visit's parked test process with its process facts injected (its start, its background work).
+/// A visit's or a restart's parked test process with its process facts injected (its start, its
+/// background work), which the last look before a signal reads ([`Kernel::process_start`],
+/// [`Kernel::restart_background`]), over the scripted kernel `script`'s answers for the rest.
+/// Read live, its background comes off the whole machine's process table, which reads as
+/// unreadable, and so as work, wherever the kernel holds that read past its bound (an exec in
+/// progress anywhere on the machine holds it): a fixture that left it live would hold its restart
+/// on a loaded machine.
 #[cfg(unix)]
-struct ParkedProcess<'a> {
-    script: &'a Script,
+struct ParkedProcess<'a, K: Kernel = Script> {
+    script: &'a K,
     pid: u32,
     start: Option<String>,
     background: Vec<String>,
 }
 
 #[cfg(unix)]
-impl Kernel for ParkedProcess<'_> {
+impl<'a, K: Kernel> ParkedProcess<'a, K> {
+    /// The parked agent `pid` born at `start` (`None`: gone, reaped), with no work under it, and
+    /// `script`'s answers for the rest.
+    fn new(script: &'a K, pid: u32, start: Option<&str>) -> Self {
+        ParkedProcess {
+            script,
+            pid,
+            start: start.map(squash),
+            background: Vec::new(),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl<K: Kernel> Kernel for ParkedProcess<'_, K> {
     fn job(&self, pid: u32) -> Option<(Job, u32)> {
         self.script.job(pid)
+    }
+
+    fn ids(&self, pid: u32) -> Option<(u32, i64, i64)> {
+        self.script.ids(pid)
     }
 
     fn parent(&self, pid: u32) -> Option<u32> {
@@ -4226,6 +4269,10 @@ impl Kernel for ParkedProcess<'_> {
 
     fn terminal(&self, pid: u32) -> Option<(u32, String)> {
         self.script.terminal(pid)
+    }
+
+    fn opener(&self, agent: u32, parent: u32) -> Option<String> {
+        self.script.opener(agent, parent)
     }
 
     fn process_start(&self, pid: u32) -> Option<String> {
@@ -4238,6 +4285,10 @@ impl Kernel for ParkedProcess<'_> {
         } else {
             vec![UNREADABLE_TABLE.to_string()]
         }
+    }
+
+    fn image(&self, pid: u32) -> Option<PathBuf> {
+        self.script.image(pid)
     }
 
     fn shell_holds_tab(&self, shell: u32) -> Option<bool> {
@@ -5287,7 +5338,8 @@ fn every_look_at_the_job_stands_between_a_ctrl_z_and_the_act() {
     let run = |phase: Phase, foreground: usize| {
         put(phase);
         let k = Script::new(shell, foreground, None);
-        let r = visit(&opts, &sf, &t, &newer(), &k);
+        let parked = ParkedProcess::new(&k, pid, Some(&sf.proc_start));
+        let r = visit(&opts, &sf, &t, &newer(), &parked);
         (r.step, k.reads.get())
     };
     let announced = Phase::Announced {
@@ -5381,6 +5433,14 @@ impl Kernel for PaneProgram {
     fn terminal(&self, _: u32) -> Option<(u32, String)> {
         Some((PTY_OWNER, self.opener.to_string()))
     }
+
+    fn process_start(&self, _: u32) -> Option<String> {
+        unstated("process start")
+    }
+
+    fn restart_background(&self, _: u32) -> Vec<String> {
+        unstated("background")
+    }
 }
 
 /// An agent a pane runs as its own program (`aterm -e claude`, `exec claude` in a tab) is no
@@ -5436,7 +5496,8 @@ fn an_agent_its_pane_runs_as_its_own_program_is_refused_before_the_announce_and_
     };
     let run = |o: &Opts, phase: Phase, k: &PaneProgram| {
         put(phase);
-        visit(o, &sf, &t, &newer(), k).step
+        let k = ParkedProcess::new(k, sf.pid, Some(&sf.proc_start));
+        visit(o, &sf, &t, &newer(), &k).step
     };
     let signals = || {
         asked.lock().map_or(usize::MAX, |a| {
@@ -5524,6 +5585,12 @@ fn a_shells_hold_on_its_tab_is_read_through_the_kernels_ids() {
         }
         fn terminal(&self, _: u32) -> Option<(u32, String)> {
             None
+        }
+        fn process_start(&self, _: u32) -> Option<String> {
+            unstated("process start")
+        }
+        fn restart_background(&self, _: u32) -> Vec<String> {
+            unstated("background")
         }
     }
     let (shell, agent) = (dead_pid(), dead_pid() + 1);
@@ -6143,6 +6210,7 @@ fn the_owed_relaunch_conforms_to_the_model() {
     let mut st = St::default();
     let _ = st.signalled(
         pid,
+        "",
         std::process::id(),
         TAB,
         "claude --resume x".to_string(),
@@ -7893,13 +7961,16 @@ fn the_orphan_pass_waits_out_a_hand_on_a_restarts_tab() {
 }
 
 /// The orphan pass stamps when a Claude Code restart's agent was seen gone ([`St::exited_at`], as
-/// the Codex lane does).
+/// the Codex lane does), by identity: a free pid, or one a process born at another time holds
+/// (a reboot reuses pids), is gone; the pid at the start the record bound, or a live pid a record
+/// an earlier build wrote names with no start, is not.
 #[test]
 fn a_restart_whose_agent_the_orphan_pass_sees_gone_says_when() {
     let dir = scratch("seen-gone");
     let opts = drive(&dir);
     std::fs::create_dir_all(state_dir(&opts)).expect("state");
     let (dead, me, now) = (dead_pid(), std::process::id(), now_s());
+    let born = kernel_start(me).expect("this process's kernel start");
     let cases = [
         (
             "aaaaaaaa-0000-0000-0000-000000000011",
@@ -7907,22 +7978,38 @@ fn a_restart_whose_agent_the_orphan_pass_sees_gone_says_when() {
                 at_s: now - STALE_S - 1,
             },
             dead,
+            String::new(),
         ),
         (
             "aaaaaaaa-0000-0000-0000-000000000012",
             Phase::Exiting { at_s: now },
             dead,
+            String::new(),
         ),
         (
             "aaaaaaaa-0000-0000-0000-000000000013",
             Phase::Exiting { at_s: now },
             me,
+            String::new(),
+        ),
+        (
+            "aaaaaaaa-0000-0000-0000-000000000014",
+            Phase::Exiting { at_s: now },
+            me,
+            "Thu Jan  1 00:00:00 1970".to_string(),
+        ),
+        (
+            "aaaaaaaa-0000-0000-0000-000000000015",
+            Phase::Exiting { at_s: now },
+            me,
+            born.clone(),
         ),
     ];
-    for (session, phase, pid) in &cases {
+    for (session, phase, pid, pid_start) in &cases {
         let st = St {
             phase: phase.clone(),
             pid: *pid,
+            pid_start: pid_start.clone(),
             shell: me,
             tab: TAB.to_string(),
             to: "2.1.281".to_string(),
@@ -7937,7 +8024,7 @@ fn a_restart_whose_agent_the_orphan_pass_sees_gone_says_when() {
         ..opts.clone()
     };
     let _ = orphans(&dry, &[], None);
-    assert!(cases.iter().all(|(s, _, _)| seen(s) == 0), "a dry run");
+    assert!(cases.iter().all(|(s, ..)| seen(s) == 0), "a dry run");
     let _ = orphans(&opts, &[], None);
     assert_ne!(seen(cases[0].0), 0, "expired: seen gone first");
     assert_eq!(
@@ -7945,10 +8032,16 @@ fn a_restart_whose_agent_the_orphan_pass_sees_gone_says_when() {
         Some(Phase::Failed("stale-exit".to_string()))
     );
     assert_ne!(seen(cases[1].0), 0, "carried on: seen gone");
-    assert_eq!(seen(cases[2].0), 0, "still exiting: not gone");
+    assert_eq!(
+        seen(cases[2].0),
+        0,
+        "no start, its pid live: not proven gone"
+    );
+    assert_ne!(seen(cases[3].0), 0, "its pid reborn: seen gone");
+    assert_eq!(seen(cases[4].0), 0, "still exiting: not gone");
     let mut again = load(&opts, cases[1].0).expect("stamped");
     assert_ne!(again.exited_at, 0);
-    let _ = again.signalled(me, me, TAB, "claude --resume x".to_string(), now);
+    let _ = again.signalled(me, &born, me, TAB, "claude --resume x".to_string(), now);
     assert_eq!(again.exited_at, 0, "a new signal: not seen gone");
     save(&opts, cases[1].0, &again);
     let _ = orphans(&opts, &[], None);
@@ -7987,6 +8080,7 @@ fn a_hung_exit_past_its_bound_is_noted_once_and_nothing_is_forced() {
             &St {
                 phase: Phase::Exiting { at_s },
                 pid: h.sf.pid,
+                pid_start: squash(&h.sf.proc_start),
                 ..settled()
             },
         );
@@ -11974,6 +12068,8 @@ fn restart_driven(
         }),
         _ => None,
     };
+    let script = Script::new(shell.id(), usize::MAX, None);
+    let kernel = ParkedProcess::new(&script, snap.pid, Some(&snap.start));
     let r = crate::harness::relaunch::restart_as(
         &opts,
         why,
@@ -11981,7 +12077,7 @@ fn restart_driven(
         roster,
         Ok(snap),
         selected.as_ref(),
-        &Script::new(shell.id(), usize::MAX, None),
+        &kernel,
     );
     let saved = if claim_blocked {
         assert!(
@@ -12223,6 +12319,12 @@ fn restart_asked_with(
             .locked
             .then(|| sweep_lock(&opts).expect("free").expect("a real run locks"));
         let ask = scene.ask.clone().unwrap_or_else(|| ask_of(&why));
+        let script = Script::new(shell.id(), usize::MAX, Some(std::process::id()));
+        let start = agent
+            .try_wait()
+            .expect("the fixture agent's status")
+            .is_none()
+            .then_some(snap.start.as_str());
         let r = crate::harness::relaunch::restart_as(
             &opts,
             &why,
@@ -12230,7 +12332,7 @@ fn restart_asked_with(
             &crate::harness::accounts::Roster::default(),
             Ok(snap.clone()),
             None,
-            &Script::new(shell.id(), usize::MAX, Some(std::process::id())),
+            &ParkedProcess::new(&script, agent.id(), start),
         );
         drop(held);
         said.push((r, load(&opts, SESSION)));
@@ -12681,6 +12783,7 @@ fn a_restart_asked_while_its_asker_is_exiting_waits_on_that_exit() {
         |agent, shell| St {
             phase: Phase::Exiting { at_s: now_s() },
             pid: agent,
+            pid_start: kernel_start(agent).expect("the asker's kernel start"),
             shell,
             tab: TAB.to_string(),
             cause: "upgrade".to_string(),
@@ -13942,6 +14045,8 @@ fn a_restart_in_place_records_the_directory_a_relative_homes_agent_files_under()
         home: Some(RELATIVE.to_string()),
         claude_dir: None,
     };
+    let script = Script::new(shell.id(), usize::MAX, None);
+    let kernel = ParkedProcess::new(&script, snap.pid, Some(&snap.start));
     let r = crate::harness::relaunch::restart_as(
         &opts,
         &Restart::Memory,
@@ -13949,7 +14054,7 @@ fn a_restart_in_place_records_the_directory_a_relative_homes_agent_files_under()
         &crate::harness::accounts::Roster::default(),
         Ok(snap),
         None,
-        &Script::new(shell.id(), usize::MAX, None),
+        &kernel,
     );
     let saved = load(&opts, SESSION);
     let mut relaunched = parked_bare().spawn().expect("the relaunched agent");
@@ -14050,6 +14155,35 @@ fn a_restart_in_place_types_the_usage_tap_under_the_switch_and_writes_no_setting
                 .map(|row| crate::harness::relaunch::AccountRestart::new(why, &snap, row, || true)),
             _ => None,
         };
+        let script = Script::new(shell.id(), usize::MAX, None);
+        let mut kernel = ParkedProcess::new(&script, agent.id(), Some(&snap.start));
+        if matches!(why, Restart::Memory) {
+            for (start, background) in [
+                (None, Vec::new()),
+                (Some("changed process".to_string()), Vec::new()),
+                (Some(snap.start.clone()), vec![UNREADABLE_TABLE.to_string()]),
+            ] {
+                kernel.start = start;
+                kernel.background = background;
+                let refused = crate::harness::relaunch::restart_as(
+                    &opts,
+                    why,
+                    &ask_of(why),
+                    roster,
+                    Ok(snap.clone()),
+                    selected.as_ref(),
+                    &kernel,
+                );
+                assert_eq!(refused.report.step, "wait:changed");
+                assert!(
+                    load(&opts, SESSION).is_none(),
+                    "no restart record on refusal"
+                );
+                assert!(agent.try_wait().expect("the agent's status").is_none());
+            }
+            kernel.start = Some(snap.start.clone());
+            kernel.background.clear();
+        }
         let r = crate::harness::relaunch::restart_as(
             &opts,
             why,
@@ -14057,7 +14191,7 @@ fn a_restart_in_place_types_the_usage_tap_under_the_switch_and_writes_no_setting
             roster,
             Ok(snap),
             selected.as_ref(),
-            &Script::new(shell.id(), usize::MAX, None),
+            &kernel,
         );
         let saved = load(&opts, SESSION);
         let after = std::fs::read_to_string(&settings).expect("settings");
@@ -15968,6 +16102,14 @@ impl Kernel for ShellHolds {
         None
     }
 
+    fn process_start(&self, _: u32) -> Option<String> {
+        unstated("process start")
+    }
+
+    fn restart_background(&self, _: u32) -> Vec<String> {
+        unstated("background")
+    }
+
     fn shell_holds_tab(&self, _: u32) -> Option<bool> {
         let at = self.next.get();
         self.next.set(at + 1);
@@ -16463,23 +16605,24 @@ fn a_restarts_line_is_judged_by_the_block_it_was_typed_into() {
             },
             ..opts
         };
-        let restart = || {
+        let script = Script::new(shell.id(), usize::MAX, None);
+        let restart = |start: Option<&str>| {
             crate::harness::relaunch::restart_with(
                 &opts,
                 &Restart::Memory,
                 &ask_of(&Restart::Memory),
                 Ok(snap.clone()),
-                &Script::new(shell.id(), usize::MAX, None),
+                &ParkedProcess::new(&script, pid, start),
             )
             .report
         };
-        let mut r = restart();
+        let mut r = restart(Some(&snap.start));
         assert!(
             ended.recv_timeout(HANG_DETECTOR).is_ok(),
             "{name}: the agent ended"
         );
         if turns(&asked) == 0 {
-            r = restart();
+            r = restart(None);
         }
         let st = load(&opts, SESSION).expect("the restart's record");
         let typed = turns(&asked);
@@ -16985,6 +17128,14 @@ impl Kernel for EachLineEnds {
         self.script.terminal(pid)
     }
 
+    fn process_start(&self, pid: u32) -> Option<String> {
+        self.script.process_start(pid)
+    }
+
+    fn restart_background(&self, pid: u32) -> Vec<String> {
+        self.script.restart_background(pid)
+    }
+
     fn shell_holds_tab(&self, _: u32) -> Option<bool> {
         let typed = turns(&self.asked);
         if typed > self.seen.get() {
@@ -17058,7 +17209,7 @@ fn a_move_onto_a_build_that_fails_only_at_a_real_start_is_taken_back_onto_the_bu
             &h.sf,
             &[(shell.id(), 1, "zsh".into())],
             &newer(),
-            &k,
+            &h.parked(&k),
         );
         assert!(
             ended.recv_timeout(HANG_DETECTOR).is_ok(),
@@ -17291,13 +17442,14 @@ fn a_restart_records_the_model_its_ready_answer_ran_and_where_that_read_ended() 
     args.argv
         .extend(["--model".to_string(), "claude-sonnet-5".to_string()]);
     let files = session_files(&opts.home);
+    let script = Script::new(shell, 3, None);
     let r = visit_with_claim(
         &opts,
         &sf,
         files.as_deref(),
         &t,
         &newer(),
-        &Script::new(shell, 3, None),
+        &ParkedProcess::new(&script, pid, Some(&sf.proc_start)),
         Some(&args),
         None,
     );
@@ -18818,13 +18970,29 @@ impl Parked {
     fn visit_with(&self, shell: u32, more: &[ProcRow]) -> Report {
         let mut table = vec![(shell, 1, "zsh".into())];
         table.extend(more.iter().cloned());
+        let script = Script::new(shell, usize::MAX, None);
         visit(
             &self.opts,
             &self.sf,
             &table,
             &newer(),
-            &Script::new(shell, usize::MAX, None),
+            &self.parked(&script),
         )
+    }
+
+    /// `script` over the parked agent's own facts, which the last look before a signal reads: no
+    /// work under it, and the start [`Parked::new`] registered for it, or none once the thread
+    /// [`Parked::reaped`] handed it to has taken it from its slot (it ended).
+    fn parked<'a, K: Kernel>(&self, script: &'a K) -> ParkedProcess<'a, K> {
+        let ended = self.agent.is_none()
+            && self.handed.as_ref().is_some_and(|handed| {
+                handed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_none()
+            });
+        let start = (!ended).then_some(self.sf.proc_start.as_str());
+        ParkedProcess::new(script, self.sf.pid, start)
     }
 
     /// The stand-in agent handed to a thread that reaps it the moment it ends
@@ -18897,21 +19065,15 @@ fn ledger_details(opts: &Opts, step: &str) -> Vec<String> {
         .collect()
 }
 
-/// A signed private `zsh`, or where none is installed (stock Debian and Ubuntu ship none) a
-/// copy of `/bin/sh` named `zsh`: [`tty_zsh`] needs a shell that leads its
+/// A signed private copy of the zsh this host has (`aterm_uds::host::find_tool`:
+/// `$ATERM_TEST_ZSH`, then where a zsh is installed), or where it has none (stock Debian and
+/// Ubuntu ship none) of `/bin/sh`, named `zsh`: [`tty_zsh`] needs a shell that leads its
 /// terminal and whose executable reads as zsh (`process_args(..).exec_path`,
 /// `Dialect::from_exe_name`), and only the file's name decides that.
 #[cfg(unix)]
 fn zsh_image() -> aterm_uds::deadline::KeptUntilRan {
-    let installed = Path::new("/bin/zsh");
-    shell_image(
-        if installed.exists() {
-            installed
-        } else {
-            Path::new("/bin/sh")
-        },
-        "zsh",
-    )
+    let installed = aterm_uds::host::find_tool("zsh");
+    shell_image(installed.as_deref().unwrap_or(Path::new("/bin/sh")), "zsh")
 }
 
 /// A child leading a session on a pseudo-terminal whose descriptors stay open only for the
@@ -22200,6 +22362,7 @@ fn a_roll_back_line_waits_on_the_whole_grace_for_keys_before_it() {
     };
     let _ = st.signalled(
         dead_pid(),
+        "",
         4242,
         TAB,
         " '/pkg/claude-2.1.310' '--resume' 'x'".to_string(),
@@ -25051,12 +25214,7 @@ fn visit_launched_env(
         launch,
         seed,
         env,
-        |pid, start| ParkedProcess {
-            script: kernel,
-            pid,
-            start: Some(start),
-            background: Vec::new(),
-        },
+        |pid, start| ParkedProcess::new(kernel, pid, Some(&start)),
     )
 }
 
@@ -25248,6 +25406,14 @@ impl Kernel for Racing<'_> {
     fn terminal(&self, pid: u32) -> Option<(u32, String)> {
         self.script.terminal(pid)
     }
+
+    fn process_start(&self, pid: u32) -> Option<String> {
+        self.script.process_start(pid)
+    }
+
+    fn restart_background(&self, pid: u32) -> Vec<String> {
+        self.script.restart_background(pid)
+    }
 }
 
 /// A restart never resumes a conversation whose transcript went after its step (Claude Code refuses
@@ -25285,7 +25451,7 @@ fn a_restart_never_resumes_a_conversation_whose_transcript_went_after_its_step()
             }),
         };
         h.opts.timings.held = Duration::from_millis(100);
-        let r = visit(&h.opts, &h.sf, &table, &newer(), &kernel);
+        let r = visit(&h.opts, &h.sf, &table, &newer(), &h.parked(&kernel));
         let status = ended.recv_timeout(HANG_DETECTOR).expect("the agent ended");
         shell.end();
         assert_eq!(status.signal(), Some(libc::SIGTERM), "{name}: {r:?}");
@@ -26738,13 +26904,14 @@ fn a_refused_signal_takes_back_the_model_it_asked() {
     save_model_record(&opts, SESSION, &earlier);
     let args = atpkg::caller_shell::process_args(pid).expect("agent argv");
     let files = session_files(&opts.home);
+    let script = Script::new(shell, usize::MAX, None);
     let r = visit_with_claim(
         &opts,
         &sf,
         files.as_deref(),
         &[(shell, 1, "zsh".into())],
         &newer(),
-        &Script::new(shell, usize::MAX, None),
+        &ParkedProcess::new(&script, pid, Some(&sf.proc_start)),
         Some(&args),
         None,
     );
@@ -26852,23 +27019,24 @@ fn a_restart_in_place_records_its_model_ask_only_with_the_line_that_asks_it() {
             },
             ..opts
         };
-        let restart = || {
+        let script = Script::new(shell.id(), usize::MAX, None);
+        let restart = |start: Option<&str>| {
             crate::harness::relaunch::restart_with(
                 &opts,
                 &Restart::Memory,
                 &ask_of(&Restart::Memory),
                 Ok(snap.clone()),
-                &Script::new(shell.id(), usize::MAX, None),
+                &ParkedProcess::new(&script, pid, start),
             )
             .report
         };
-        let mut r = restart();
+        let mut r = restart(Some(&snap.start));
         if let Some(ended) = &ended {
             assert!(
                 ended.recv_timeout(HANG_DETECTOR).is_ok(),
                 "{name}: the agent ended"
             );
-            r = restart();
+            r = restart(None);
         }
         let record = load_model_record(&opts, SESSION);
         let typed = turns(&asked);
@@ -33114,4 +33282,59 @@ fn agy_limit_reset_aligns_with_live_screen_model_and_unnamed_refill() {
         }),
         Some(u64::try_from(now - past_grace).unwrap())
     );
+}
+
+/// A session folder reached by a symbolic link (a projects or sessions folder kept on another
+/// volume) is read through it, as `Path::is_dir` reads one: the Claude Code transcript scans
+/// find the transcript filed there, and the Codex walks find the rollout filed there.
+/// NEGATIVE CONTROL: the entry's own type alone (`DirEntry::file_type().is_dir()`, 9445f7df77)
+/// passes every link over: `left: Some(false)`, `right: Some(true)` (a restart that would not
+/// resume).
+#[cfg(unix)]
+#[test]
+fn session_folders_reached_by_a_link_are_read_through_it() {
+    let dir = scratch("linked-session-folders");
+    let claude = dir.join(".claude");
+    let real = dir.join("volume/project");
+    file_transcript_in(&dir.join("volume-claude"), "project");
+    std::fs::create_dir_all(claude.join("projects")).expect("projects");
+    std::fs::create_dir_all(real.parent().expect("volume")).expect("volume");
+    std::fs::rename(dir.join("volume-claude/projects/project"), &real).expect("moved");
+    let linked = claude.join("projects/-Users-me-repo");
+    std::os::unix::fs::symlink(&real, &linked).expect("linked project");
+    let transcript = linked.join(format!("{SESSION}.jsonl"));
+    assert_eq!(transcript_exists_in(&claude, SESSION), Some(true));
+    assert_eq!(transcript_in(&claude, SESSION), Some(transcript.clone()));
+    let entry = super::super::footer::SessionEntry {
+        session_id: SESSION.into(),
+        cwd: PathBuf::from("/Users//me/another"),
+        version: None,
+        proc_start: None,
+        started_at: None,
+    };
+    assert_eq!(
+        super::super::footer::transcript_lookup(&claude, &entry),
+        Some((transcript, true))
+    );
+
+    let codex = dir.join("codex");
+    let thread = "019a0000-0000-7000-8000-000000000001";
+    let day = dir.join("volume/2026/11/05");
+    std::fs::create_dir_all(&day).expect("day");
+    let rollout = format!("rollout-2026-11-05T01-02-03-{thread}.jsonl");
+    std::fs::write(day.join(&rollout), "{}\n").expect("rollout");
+    std::fs::create_dir_all(codex.join("sessions")).expect("sessions");
+    std::os::unix::fs::symlink(dir.join("volume/2026"), codex.join("sessions/2026"))
+        .expect("linked year");
+    let found = codex.join("sessions/2026/11/05").join(&rollout);
+    assert_eq!(
+        codex_alab_drive::find_rollout(&codex, thread),
+        Some(found.clone())
+    );
+    let listed: Vec<PathBuf> = super::super::codex_rollout::rollouts_by_write(&codex)
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(listed, [found]);
+    let _ = std::fs::remove_dir_all(&dir);
 }

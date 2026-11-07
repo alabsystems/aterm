@@ -422,6 +422,7 @@ fn a_set_just_after_the_fleet_name_ends_publication_before_macos_is_asked() {
     assert_eq!(
         publish_through(
             &scratch.state,
+            &scratch.config,
             &policy,
             None,
             fleet_then_set(&scratch, 59, 60)
@@ -440,6 +441,7 @@ fn a_set_just_after_the_fleet_name_ends_publication_before_macos_is_asked() {
     assert_eq!(
         publish_through(
             &scratch.state,
+            &scratch.config,
             &policy,
             Some(&fake),
             fleet_then_set(&scratch, 60, 61)
@@ -450,7 +452,7 @@ fn a_set_just_after_the_fleet_name_ends_publication_before_macos_is_asked() {
 }
 
 #[test]
-fn a_final_system_verification_rejects_a_newer_canonical_name() {
+fn system_reads_reject_newer_canonical_names_and_naming_policy() {
     let scratch = fresh();
     chosen(&scratch.state, 59);
     let policy = Policy::read(&scratch.config, num(59)).unwrap();
@@ -474,6 +476,64 @@ fn a_final_system_verification_rejects_a_newer_canonical_name() {
         "the original apply was current when it began"
     );
     assert_eq!(reads.get(), 2);
+
+    for at in [1, 2] {
+        for (section, key, value, allowed) in [
+            ("identity", "name", Value::from(false), false),
+            ("identity", "name", Value::from("m60"), false),
+            ("ai", "machine", Value::from("m60"), false),
+            ("fleet", "machine", Value::from("m60"), false),
+            ("font", "size", Value::from(19), true),
+        ] {
+            let scratch = fresh();
+            chosen(&scratch.state, 59);
+            let policy = Policy::read(&scratch.config, num(59)).unwrap();
+            let reads = Cell::new(0);
+            let on_read = || {
+                reads.set(reads.get() + 1);
+                if reads.get() == at {
+                    let mut doc = parsed(&config_text(&scratch).unwrap()).unwrap();
+                    let root = doc.as_table_mut();
+                    if root.get(section).is_none() {
+                        root.insert(section, Item::Table(Table::new()));
+                    }
+                    root.get_mut(section)
+                        .unwrap()
+                        .as_table_like_mut()
+                        .unwrap()
+                        .insert(key, Item::Value(value.clone()));
+                    std::fs::write(&scratch.config, doc.to_string()).unwrap();
+                }
+            };
+            let mut fake = FakeNames::new(names([Some("m184"); 3]), &nothing);
+            fake.after = Some(names([Some("m59"); 3]));
+            fake.on_read = &on_read;
+            let result = publish(&scratch.state, &scratch.config, &policy, Some(&fake));
+            if allowed {
+                assert_eq!(result, Ok(()), "unrelated config edits stay allowed");
+            } else {
+                assert!(
+                    matches!(result, Err(Pending::Policy(_))),
+                    "read {at}, {section}.{key}: {result:?}"
+                );
+                assert_eq!(
+                    fake.applied().is_empty(),
+                    at == 1,
+                    "a late hold prevents the next OS effect without undoing an earlier one"
+                );
+            }
+            let current = parsed(&config_text(&scratch).unwrap()).unwrap();
+            assert_eq!(
+                current
+                    .get(section)
+                    .and_then(Item::as_table_like)
+                    .and_then(|table| table.get(key))
+                    .and_then(Item::as_value)
+                    .map(|held| (held.as_bool(), held.as_str(), held.as_integer())),
+                Some((value.as_bool(), value.as_str(), value.as_integer()))
+            );
+        }
+    }
 }
 
 #[test]

@@ -299,7 +299,7 @@ fn band(deck: &LabDeck, w: f32) -> (Vec<crate::widget::DrawPrim>, Vec<crate::sta
     };
     let inks = crate::stats_deck::cached_inks([20, 20, 20], [230, 230, 230], [100, 180, 200]);
     let snapshot = aterm_types::network_state::NetworkStateSnapshot::default();
-    crate::network_deck::paint_with_inks(&g, 340.0, &snapshot, deck, None, &inks, false)
+    crate::network_deck::paint_with_inks(&g, 340.0, &snapshot, deck, None, None, &inks, false)
 }
 
 fn lab_hits(hits: &[crate::stats_paint::Hit]) -> Vec<u64> {
@@ -398,8 +398,11 @@ fn the_lens_steps_from_secrets_onto_the_accounts_and_shows_their_rows() {
         "m2, 5 min ahead (its clock)"
     );
     let first = Target::LabAccount(deck.rows[0].id);
-    assert_eq!(step(&snapshot, &deck, Target::Secrets, true), first);
-    let rows = details_lab(&snapshot, &deck, first);
+    assert_eq!(
+        step(&snapshot, &deck, None, (700.0, 1.0), Target::Secrets, true),
+        first
+    );
+    let rows = details_lab(&snapshot, &deck, None, first);
     assert_eq!(rows[0].0, "Account");
     assert!(rows[0].1.starts_with("claude-0a1b2c"), "{rows:?}");
     for other in &deck.rows[1..] {
@@ -408,9 +411,9 @@ fn the_lens_steps_from_secrets_onto_the_accounts_and_shows_their_rows() {
             "{rows:?}"
         );
     }
-    let overview = details_lab(&snapshot, &deck, Target::Overview);
+    let overview = details_lab(&snapshot, &deck, None, Target::Overview);
     assert!(overview.iter().any(|(name, _)| name == "Lab accounts"));
-    let bare = details_lab(&snapshot, &LabDeck::default(), Target::Overview);
+    let bare = details_lab(&snapshot, &LabDeck::default(), None, Target::Overview);
     assert!(!bare.iter().any(|(name, _)| name == "Lab accounts"));
 }
 

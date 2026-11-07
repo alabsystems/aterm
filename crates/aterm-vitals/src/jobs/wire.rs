@@ -6,7 +6,7 @@
 use std::fmt::Write as _;
 
 use super::{
-    Class, Findings, JobKind, JobRow, NamedRow, StartWait, TierB, Verdict, Wait, WaitName,
+    Class, Findings, JobKind, JobRow, MuFrom, NamedRow, StartWait, TierB, Verdict, Wait, WaitName,
 };
 
 /// Count one local condition, keeping observed child activity distinct from independent jobs.
@@ -249,13 +249,19 @@ impl JobRow {
         }
     }
 
-    /// The quiet age against μ.
+    /// The quiet age against μ, named by where μ came from: the job's own gaps, its kind's, or
+    /// the prior the engine assumes before it has either (`mu_from=`).
     #[must_use]
     pub fn gap(&self) -> Option<String> {
         let (q, mu) = (self.quiet_ms?, self.mu_ms?);
         let times = (u128::from(q) + u128::from(mu) / 2) / u128::from(mu.max(1));
+        let whose = match self.mu_from {
+            Some(MuFrom::Own) | None => "its usual",
+            Some(MuFrom::Class) => "its kind's usual",
+            Some(MuFrom::Prior) => "the assumed",
+        };
         Some(format!(
-            "silent {}, about {times}× its usual {} s gap",
+            "silent {}, about {times}× {whose} {} s gap",
             exact_age(q),
             (u128::from(mu) + 500) / 1000
         ))

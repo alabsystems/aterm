@@ -84,9 +84,14 @@ fn ambient_git_state_cannot_rebind_the_explicit_source() {
             .git(&["remote", "get-url", "origin"])
             .unwrap();
         assert!(ordinary.success());
+        let redirected = if case == "dir" {
+            "https://example.invalid/fixture/redirect.git"
+        } else {
+            "https://github.com/fixture/redirect.git"
+        };
         assert_eq!(
             ordinary.stdout_utf8().trim(),
-            "https://github.com/fixture/redirect.git",
+            redirected,
             "negative control must activate the inherited Git redirect"
         );
         assert_eq!(origin_slug(&source).unwrap().key(), "fixture/actual");
@@ -94,6 +99,12 @@ fn ambient_git_state_cannot_rebind_the_explicit_source() {
         return;
     }
     let root = aterm_tempfile::tempdir().unwrap();
+    let global = root.path().join("global.gitconfig");
+    std::fs::write(
+        &global,
+        "[url \"https://example.invalid/\"]\n    insteadOf = https://github.com/\n",
+    )
+    .unwrap();
     let source = repo(root.path(), "source", false);
     let other = repo(root.path(), "other", false);
     git(
@@ -123,6 +134,11 @@ fn ambient_git_state_cannot_rebind_the_explicit_source() {
                 child.env_remove(key);
             }
         }
+        // Own the global rewrite too: a host's HTTPS-to-SSH rule must not decide
+        // this negative control. The command-config case's longer prefix wins.
+        child
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", &global);
         if case == "dir" {
             child.env("GIT_DIR", other.join(".git"));
         } else {

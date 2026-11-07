@@ -98,6 +98,18 @@ impl You {
             Role::Unavailable(_) => "this tab's share is not read now",
         }
     }
+
+    /// The tab clause beside a sentence that names no cause: [`Self::clause`] in words of the
+    /// figure alone, since "part of the cause" beside "no cause open" says two things at once.
+    #[must_use]
+    pub fn share_clause(&self) -> &'static str {
+        match self.role {
+            Role::Main => "this tab uses most of it",
+            Role::Part => "this tab uses a large part of it",
+            Role::Minor => "this tab uses little of it",
+            Role::None | Role::Unavailable(_) => self.clause(),
+        }
+    }
 }
 
 /// A cause that holds over the window, as a reply prints it.

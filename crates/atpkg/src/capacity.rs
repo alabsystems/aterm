@@ -11,15 +11,18 @@
 //! full peak)
 //! and its disk on its own volume (`disk <need> on <mount>, reserves <bytes> against the claims
 //! behind it`: its need less what it has written). A waiting claim's disk is marked
-//! [`UNSERVABLE`] where its need is more than that volume has free above the floor now: no
-//! claim's end can make room for it, only space freed, so it holds back no claim behind it
-//! (DISK-ADMIT, [`aterm_capacity::Short::unservable`]); a held claim is never marked. What a tree
-//! holds is the figure its reservation counts, with its footprint whole beside it where the pages
-//! the kernel compressed or swapped make that a tenth of a GiB or more
+//! [`UNSERVABLE`] where its need is more than that volume has free above the floor now: only
+//! space freed, or what a scratch claim held there may give back by its end, can make room for
+//! it, so it holds back no claim behind it while it is so. After that claim ends the waiter
+//! rechecks the actual space, and is refused if its relief leaves it short with no scratch claim
+//! held there that could meet it (DISK-ADMIT,
+//! [`aterm_capacity::Short::unservable`], [`aterm_capacity::Error::Unmet`]); a held claim is
+//! never marked. What a tree holds is the figure its reservation counts, with its footprint whole
+//! beside it where the pages the kernel compressed or swapped make that a tenth of a GiB or more
 //! ([`aterm_capacity::overrun::whole`]), and a held claim whose holder's tree holds more than it
-//! claimed says by how much ([`aterm_capacity::Overrun`]: `14.7 GiB past its 16 GiB claim`).
-//! Each volume a claim's disk is on is read, besides the one holding `<path>`, and has a disk line
-//! of its own (and, in `--json`, an entry of `volumes`).
+//! claimed says by how much ([`aterm_capacity::Overrun`]: `14.7 GiB past its 16 GiB claim`). Each
+//! volume a claim's disk is on is read, besides the one holding `<path>`, and has a disk line of its own
+//! (and, in `--json`, an entry of `volumes`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -130,7 +133,8 @@ fn reserves(
 }
 
 /// The mark on a waiting claim's disk whose need is more than its volume has free above the
-/// floor now ([`Reserve::unservable`]): it waits for space to be freed and reserves no disk.
+/// floor now ([`Reserve::unservable`]): it reserves no disk while it is so, and is refused if
+/// its relief leaves it so with no scratch claim held there that could meet it.
 const UNSERVABLE: &str = "unservable";
 
 /// What a claim's disk says where its volume could not be read, so it is not judged.
@@ -336,8 +340,8 @@ fn claim_line(
         );
         disk.push_str(&match reserve.disk {
             Some(left) if reserve.unservable && c.held.is_none() => format!(
-                ", {UNSERVABLE}: more than is free above the floor, so it waits for space to be \
-                 freed and reserves {} against the claims behind it",
+                ", {UNSERVABLE}: more than is free above the floor, so it is relieved and refused \
+                 if that frees too little, and reserves {} against the claims behind it",
                 gib(left)
             ),
             Some(left) => format!(", reserves {} against the claims behind it", gib(left)),

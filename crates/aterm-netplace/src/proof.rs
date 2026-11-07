@@ -20,7 +20,9 @@ use std::net::IpAddr;
 use std::path::Path;
 
 use crate::facts::Here;
-use crate::place::{Answer, Facts, NetworkId, step};
+#[cfg(test)]
+use crate::place::step;
+use crate::place::{Answer, Facts, NetworkId, observed_stay};
 
 /// What this Mac reads of its network now ([the module](self)).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -55,7 +57,7 @@ pub fn read_with(state: &Path, here: Here, now: u64) -> Now {
             crate::record::read_in(&judged)
                 .map(|written| written.record)
                 .unwrap_or_default(),
-            crate::heard::read_counted_in(&dir, &judged),
+            crate::heard::read_answers_in(&dir, &judged),
         ),
         Err(_) => (
             Default::default(),
@@ -65,11 +67,10 @@ pub fn read_with(state: &Path, here: Here, now: u64) -> Now {
             ),
         ),
     };
-    let (record, _) = step(&record, &here.facts, &evidence, None, now, None);
-    let stay = record.current();
+    let (stay_since_ms, stay_network) = observed_stay(record, &here.facts, now);
     Now {
-        stay_since_ms: stay.map(|stay| stay.start_ms),
-        stay_network: stay.and_then(|stay| stay.network.clone()),
+        stay_since_ms,
+        stay_network,
         answers: if passed == 0 {
             evidence.answers
         } else {
@@ -97,6 +98,150 @@ mod tests {
     use std::net::Ipv4Addr;
 
     const T0: u64 = 1_800_000_000_000;
+
+    #[test]
+    fn observed_stay_matches_full_step_across_history_facts_and_evidence() {
+        use crate::place::{Evidence, Known, Stay};
+        let home = on(5).facts;
+        let seed = step(
+            &Record::default(),
+            &home,
+            &Evidence::default(),
+            None,
+            T0,
+            None,
+        )
+        .0;
+        let mut records = vec![Record::default(), seed.clone()];
+        let mut ended = seed.clone();
+        ended.stays[0].end_ms = Some(T0 + 1);
+        records.push(ended);
+        let mut weak = seed.clone();
+        weak.stays[0].network = home.route.as_ref().map(NetworkId::weak);
+        records.push(weak);
+        let mut pending = seed.clone();
+        pending.stays[0].network = None;
+        records.push(pending);
+        let mut folding = seed.clone();
+        folding.stays = (0..8)
+            .map(|index| Stay {
+                start_ms: T0 + index,
+                end_ms: (index < 7).then_some(T0 + index + 1),
+                ..seed.stays[0].clone()
+            })
+            .collect();
+        records.push(folding);
+        let mut remembered = seed.clone();
+        remembered.remembered.push(Known {
+            network: seed.stays[0].network.clone().unwrap(),
+            learned_ms: T0,
+            confirmed_ms: T0,
+        });
+        records.push(remembered);
+        let mut overfull = seed.clone();
+        overfull.remembered = (0..=crate::place::REMEMBERED_MAX)
+            .map(|index| Known {
+                network: NetworkId::parse(&format!("n{index:016x}")).unwrap(),
+                learned_ms: T0,
+                confirmed_ms: T0 + index as u64,
+            })
+            .collect();
+        records.push(overfull);
+        let mut long = seed.clone();
+        long.stays = (0..=crate::place::STAYS_MAX)
+            .map(|index| Stay {
+                start_ms: T0 + index as u64,
+                end_ms: (index < crate::place::STAYS_MAX).then_some(T0 + index as u64 + 1),
+                network: if index == crate::place::STAYS_MAX {
+                    seed.stays[0].network.clone()
+                } else {
+                    NetworkId::parse(&format!("n{index:016x}"))
+                },
+                ..seed.stays[0].clone()
+            })
+            .collect();
+        records.push(long);
+        let mut weak_facts = home.clone();
+        weak_facts.route.as_mut().unwrap().gateway_hw = None;
+        let mut no_path = home.clone();
+        no_path.path = None;
+        let mut expensive = home.clone();
+        expensive.path.as_mut().unwrap().expensive = true;
+        let facts = [
+            home.clone(),
+            on(9).facts,
+            weak_facts,
+            no_path,
+            expensive,
+            Facts::default(),
+        ];
+        let answers: Vec<_> = (0..3)
+            .map(|index| Answer {
+                lane: Lane::Fleet,
+                member: member_key(Lane::Fleet, &format!("m{index}")),
+                addr: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 4, 9))),
+                via: home.route.as_ref().map(|route| route.address),
+                iface: Some("en0".to_owned()),
+                network: seed.stays[0].network.clone(),
+                logged: true,
+                began_ms: T0,
+                at_ms: T0 + 1,
+            })
+            .collect();
+        let mut future = answers.clone();
+        for answer in &mut future {
+            answer.at_ms = u64::MAX;
+        }
+        let silent = Evidence {
+            rounds: (0..3)
+                .map(|_| crate::place::Round {
+                    lane: Lane::Fleet,
+                    answered: 0,
+                    began_ms: T0,
+                    at_ms: T0 + 1,
+                    blocked: 0,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let evidence = [
+            Evidence::default(),
+            Evidence {
+                answers,
+                ..Default::default()
+            },
+            Evidence {
+                answers: future,
+                ..Default::default()
+            },
+            silent,
+        ];
+        for record in records {
+            for facts in &facts {
+                for evidence in &evidence {
+                    for now in [
+                        0,
+                        T0 - 1,
+                        T0,
+                        T0 + crate::place::SETTLE_MS,
+                        T0 + 120_000,
+                        u64::MAX,
+                    ] {
+                        let expected = step(&record, facts, evidence, None, now, None).0;
+                        let stay = expected.current();
+                        assert_eq!(
+                            observed_stay(record.clone(), facts, now),
+                            (
+                                stay.map(|stay| stay.start_ms),
+                                stay.and_then(|stay| stay.network.clone())
+                            ),
+                            "current-stay projection at {now} for {record:?} and {facts:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// This Mac on `192.168.4.31/22` behind the router whose hardware address ends in `hw`.
     fn on(hw: u8) -> Here {
@@ -128,8 +273,8 @@ mod tests {
     /// or there is no record, so nothing heard before counts as heard in it. The answers come
     /// back as the evidence file holds them, and nothing is written.
     /// NEGATIVE CONTROL: taking the record's current stay as it stands (`record.current()` of the
-    /// record read, not of `step`'s) gives no stay where there is no record, and "no record: a
-    /// stay opened now" fails.
+    /// record read, not of its current-fact observation) gives no stay where there is no record,
+    /// and "no record: a stay opened now" fails.
     #[test]
     fn the_stay_is_the_records_brought_up_to_the_facts_now() {
         let root = aterm_tempfile::tempdir().expect("a scratch directory");

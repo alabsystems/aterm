@@ -541,6 +541,62 @@ mod tests {
         );
     }
 
+    /// THE EMITTER KEEPS A MARGIN OVER THE PAGE (after-land L4): on Solarized
+    /// Dark the dark emitter, at every hue and charge and floored as the host
+    /// floors its caret ([`crate::cursor_fx::floor_block_fill`]), reads at
+    /// 4.6:1 or better, past the caret bar (4.5) by more than a renderer's
+    /// rounding. Negative control: floored to the bare bar (a bolt's floor,
+    /// [`crate::cursor_fx::CARET_PAGE_MIN_CONTRAST`]), its lowest reads under
+    /// 4.6, as the composed land's `phaser-dark.mid` read 4.51.
+    #[test]
+    fn the_dark_emitter_keeps_a_margin_over_the_page() {
+        use crate::cursor_glow::{BlockFill, BlockFillOwner};
+        let (g, c, t, page) = (geom(), cfg(), Instant::now(), 0x0000_2B36);
+        let mut out = Vec::new();
+        let (mut low, mut bare) = (f32::MAX, f32::MAX);
+        for i in 0..48 {
+            for k in 0..=8 {
+                let fill = CursorPhaser::default()
+                    .tick(
+                        Some((1, 1)),
+                        t,
+                        i as f32 / 48.0,
+                        k as f32 / 8.0,
+                        true,
+                        g,
+                        &c,
+                        &mut out,
+                    )
+                    .fill
+                    .expect("the emitter owns its fill");
+                let read = |owner| {
+                    let held = crate::cursor_fx::floor_block_fill(
+                        BlockFill {
+                            owner,
+                            fill,
+                            base: None,
+                        },
+                        page,
+                        0x0093_A1A1,
+                        None,
+                        false,
+                    );
+                    crate::color_math::contrast_ratio(held.fill, page)
+                };
+                low = low.min(read(BlockFillOwner::Phaser));
+                bare = bare.min(read(BlockFillOwner::Bolt));
+            }
+        }
+        assert!(
+            low >= 4.6,
+            "the emitter's lowest on Solarized Dark reads {low:.2}:1"
+        );
+        assert!(
+            bare < 4.6,
+            "control: floored to the bare bar its lowest reads {bare:.2}:1"
+        );
+    }
+
     /// The host's cursor colour is the emitter block on either theme polarity.
     #[test]
     fn host_base_is_the_settled_block_on_either_polarity() {

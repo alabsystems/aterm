@@ -344,9 +344,13 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
 /// The unshaped test compile `s` claims at least its estimate `e` ([`crate::shape::Shaped::Whole`])
 /// and a fifth more: its stage's lookup ([`crate::memory::need`]) reads its checkout's record
 /// first, however light (a run after a plain build had compiled it), and the narrower selections
-/// it holds only where nothing else is kept and they name every crate of it, by their least cover
-/// ([`crate::memory::composed`]), where the estimate reads every checkout's record and the
-/// narrower selections' heaviest cover. Where that raises its claim, its time line says by what.
+/// it holds only where nothing of its own selection is kept and they name every crate of it, by
+/// their least cover ([`crate::memory::composed`]), or a wider selection's record in another
+/// checkout where that claims less ([`crate::memory::wider_elsewhere`]), where the estimate reads
+/// every checkout's record and the heaviest disjoint narrower records summed. So the lesser of
+/// the lookup's two bounds decides the test compile's claim only where it exceeds that estimate;
+/// the lint's, the doctests' and the pulled cells', which nothing here raises, it always decides.
+/// Where the estimate raises its claim, its time line says by what.
 fn at_least(ctx: &Ctx, s: &mut StageSpec, e: &crate::shape::Estimate, book: &crate::memory::Book) {
     let floor = aterm_capacity::peak_claim(e.peak);
     if floor <= s.mem {
@@ -904,8 +908,9 @@ mod tests {
     }
 
     /// A run that measures memory plans each stage's claim from its book: the test compile its
-    /// kept peak and margin, the lint (never measured) the cold figure, the test run (which
-    /// compiles nothing) and the formatter (which touches no target directory) nothing.
+    /// kept peak and margin, the lint (never measured) the cold figure, the test run (whose
+    /// dispatcher claims each schedule's concurrent peak) and the formatter (which touches no
+    /// target directory) nothing.
     /// NEGATIVE CONTROL: a run that measures nothing plans no claim for any stage.
     #[test]
     fn a_run_that_measures_memory_plans_each_stages_claim_from_its_book() {
@@ -931,8 +936,8 @@ mod tests {
             claims(&ctx(&checks, scope.clone()).with_memory(book)),
             [
                 (StageId::TestCompile, 12 * GIB),
-                // Unmeasured, the test run claims cold: it runs binaries together.
-                (StageId::Test, 12 * GIB),
+                // The dispatch claims its plan's peak; the stage must not claim it again.
+                (StageId::Test, 0),
                 (StageId::Tippy, 12 * GIB),
                 (StageId::Formatting, 0),
             ]
@@ -1088,6 +1093,59 @@ mod tests {
         assert!(
             said.as_deref()
                 .is_some_and(|s| s.contains("the most `-p aterm-gui` kept in /vmem")),
+            "{said:?}"
+        );
+    }
+
+    /// THE TEST COMPILE CLAIMS AT LEAST ITS ESTIMATE, THE LINT THE LESSER: `-p a -p b` in /repo,
+    /// with `-p a` kept at 3 GiB in /one and `-p b` at 4 GiB in /two (a cover of 7 GiB) and `-p a
+    /// -p b -p c` at 5 GiB in /far, for the test compile and the lint alike. The lint's lookup
+    /// claims the lesser of the wider record elsewhere and the cover, 6 GiB
+    /// ([`crate::memory::wider_elsewhere`]); the test compile's lookup found the same 6 GiB, but
+    /// its estimate is the narrower selections' heaviest cover, so it claims that, 8.4 GiB, and its
+    /// time line says so. NEGATIVE CONTROL, by hand: with the estimate dropped ([`at_least`] not
+    /// called), the test compile claimed 6 GiB.
+    #[test]
+    fn the_test_compile_claims_its_estimate_where_the_lint_claims_the_lesser() {
+        const GIB: u64 = 1 << 30;
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let path = dir.path().join("stage-memory.json");
+        let mut r = crate::memory::Records::default();
+        for stage in ["TestCompile", "Tippy"] {
+            let key = |checkout: &str, crates: &[&str]| crate::memory::Key {
+                stage: stage.to_owned(),
+                checkout: checkout.to_owned(),
+                crates: Some(crates.iter().map(|c| (*c).to_owned()).collect()),
+                variant: None,
+            };
+            r.push(key("/one", &["a"]), 3 * GIB, 1);
+            r.push(key("/two", &["b"]), 4 * GIB, 2);
+            r.push(key("/far", &["a", "b", "c"]), 5 * GIB, 3);
+        }
+        r.save(&path).expect("saved");
+        let book = crate::memory::Book::at(
+            Some(path),
+            Some(48 * GIB),
+            Some(crate::shape::tests::BUDGET),
+        );
+        let crates = ["a".to_owned(), "b".to_owned()];
+        let c = ctx(&[Check::Test, Check::Lint], Scope::packages(&crates)).with_memory(book);
+        let p = plan(&c);
+        let of = |id: StageId| {
+            let s = p.iter().find(|s| s.id == id).expect("planned");
+            (s.mem, s.part.as_ref().map(|p| p.said.clone()))
+        };
+        assert_eq!(
+            of(StageId::Tippy),
+            (aterm_capacity::peak_claim(5 * GIB), None)
+        );
+        let (mem, said) = of(StageId::TestCompile);
+        assert_eq!(mem, aterm_capacity::peak_claim(7 * GIB));
+        assert!(
+            said.as_deref().is_some_and(|s| s.contains(&format!(
+                "more than the {} its stage's lookup found",
+                aterm_capacity::size(aterm_capacity::peak_claim(5 * GIB))
+            ))),
             "{said:?}"
         );
     }

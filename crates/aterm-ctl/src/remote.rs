@@ -311,14 +311,17 @@ pub(crate) fn run(
             (host.to_owned(), board::Placed::default())
         };
         let task = read_task_payload()?;
-        let link = drive(&chosen_host, within.get()).map_err(io::Error::other)?;
-        placed.node = placed
-            .node
-            .or_else(|| link.node.clone())
-            .or(Some(chosen_host));
-        placed.host = placed.host.or_else(|| Some(link.label.clone()));
-        let (code, spawned_sid) =
-            spawn_exchange(link, &format!("{head} len={}", task.len()), &task, within)?;
+        let began = std::time::Instant::now();
+        let dialled = drive(&chosen_host, within.get()).map_err(io::Error::other);
+        if let Ok(link) = &dialled {
+            placed.node = placed.node.or_else(|| link.node.clone());
+            placed.host = placed.host.or_else(|| Some(link.label.clone()));
+        }
+        placed.node = placed.node.or(Some(chosen_host));
+        let exchanged = dialled
+            .map(|link| spawn_exchange(link, &format!("{head} len={}", task.len()), &task, within));
+        crate::fleet_telemetry::spawned(&args, began, &exchanged, placed.node.as_deref());
+        let (code, spawned_sid) = exchanged??;
         if let Some(sid) = spawned_sid {
             board::record_spawned(&board::spawned(
                 &sid,
@@ -753,7 +756,9 @@ fn is_any_host(host: &str) -> bool {
     host.eq_ignore_ascii_case(any_host::ANY)
 }
 
-pub(crate) fn spawned_sid_from_answer(answer: &str) -> Option<String> {
+/// The sid a spawn's answer `answer` (`OK <sid> …`) names: `None` where it refused, or named none.
+#[must_use]
+pub fn spawned_sid_from_answer(answer: &str) -> Option<String> {
     let line = answer.trim_end_matches(['\r', '\n']);
     let rest = line.strip_prefix("OK ")?;
     rest.split_whitespace()

@@ -1411,3 +1411,76 @@ fn a_strike_s_corona_keeps_inside_its_grid() {
         "control: each segment read between its ends alone, no strike lights the grid's edge"
     );
 }
+
+/// After-land lows W9: a Laser crackle discharges from the bolt: it springs from the caret's
+/// own cell, at that cell's edge, into the blank row beside it. Sprung from a typed cell
+/// picked among the trail's last twelve, it hung under a letter one or more cells behind the
+/// bolt, apart from it and from anything lit (composed r3's judges: `laser-dark.t0`). The
+/// control picks the root along the trail, and some of its crackles spring a cell or more
+/// behind the caret.
+#[test]
+fn a_crackle_springs_from_the_bolt_s_own_cell() {
+    use aterm_core::terminal::RenderCell;
+    let g = tall_geom();
+    let (cw, ch) = (g.cw as f32, g.ch as f32);
+    let c = cfg(GlowStyle::Laser, true);
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    // Each crackle forged: how many cells its root lies behind the caret's cell, and whether
+    // it sprang from the row's edge.
+    let forge = |along_trail: bool| -> Vec<(f32, bool)> {
+        let mut cells = vec![vec![RenderCell::default(); g.cols]; g.rows];
+        for cell in cells.iter_mut().flatten() {
+            (cell.fg, cell.bg) = (rgb(c.theme_fg), rgb(c.theme_bg));
+        }
+        let mut glow = CursorGlow {
+            crackle_along_trail: along_trail,
+            ..CursorGlow::default()
+        };
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        let mut seen = Vec::new();
+        let mut roots = Vec::new();
+        for i in 0..120u16 {
+            let t = t0 + Duration::from_millis(45 * u64::from(i));
+            let col = 2 + i % 40;
+            for cell in cells[2].iter_mut().take(usize::from(col)) {
+                cell.ch = 'm';
+            }
+            let line: Vec<char> = cells[2].iter().map(|c| c.ch).collect();
+            glow.note_synthetic_typed(t, 1);
+            glow.observe_row(2, col, &line, t);
+            glow.observe_frame_text(Some((2, col)), &cells, t);
+            glow.tick(Some((2, col)), t, &c, g, &mut out);
+            for b in glow.bolts.iter().filter(|b| b.crackle) {
+                let (x, y) = b.pts.as_slice()[0];
+                let key = (b.born, x.to_bits());
+                if seen.contains(&key) {
+                    continue;
+                }
+                seen.push(key);
+                let behind = (f32::from(col) * cw - x) / cw;
+                let at_edge = (y - 2.0 * ch).abs() < 0.01 || (y - 3.0 * ch).abs() < 0.01;
+                roots.push((behind, at_edge));
+            }
+        }
+        roots
+    };
+    let roots = forge(false);
+    assert!(
+        roots.len() >= 3,
+        "fixture: only {} crackles forged",
+        roots.len()
+    );
+    for &(behind, at_edge) in &roots {
+        assert!(
+            (-1.0..=0.0).contains(&behind),
+            "a crackle springs {behind} cells behind the caret's cell: {roots:?}"
+        );
+        assert!(at_edge, "a crackle springs from its row's edge: {roots:?}");
+    }
+    let control = forge(true);
+    assert!(
+        control.iter().any(|&(behind, _)| behind > 0.5),
+        "control: along the trail some crackle springs behind the bolt: {control:?}"
+    );
+}

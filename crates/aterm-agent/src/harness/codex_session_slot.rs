@@ -4,9 +4,12 @@
 //! Per-process credential materializations. A slot never creates a grant or an
 //! assignment: both must arrive as current, typed native owner evidence.
 
+use super::native_custody_platform as platform;
+use super::native_custody_platform as private_file;
 use super::{accounts, cli::Env, codex_assignment, codex_grant_owner as owner};
-use aterm_secrets::{SecretBytes, age, client};
-use aterm_uds::private_file;
+#[cfg(all(test, unix))]
+use aterm_secrets::client;
+use aterm_secrets::{SecretBytes, age};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -166,6 +169,48 @@ impl std::fmt::Display for SlotError {
 }
 impl std::error::Error for SlotError {}
 
+#[path = "codex_session_slot_use_guard.rs"]
+mod use_guard;
+pub use use_guard::{refresh_for_use, source_for_use};
+
+/// Descriptive identities captured under actual MAC-authenticated Book and
+/// Slot claims. Equality joins physical aliases; neither path nor this value
+/// grants permission to load credentials or declare another cohort disjoint.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct SourceNamespaces {
+    book: codex_assignment::BookNamespace,
+    slot: platform::PhysicalIdentity,
+}
+impl SourceNamespaces {
+    fn capture(
+        book: &codex_assignment::BookNamespace,
+        store: &platform::Store,
+    ) -> Result<Self, String> {
+        #[cfg(unix)]
+        {
+            Ok(Self {
+                book: book.clone(),
+                slot: store.physical_identity().map_err(str::to_owned)?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = book;
+            match *store {}
+        }
+    }
+
+    pub(super) fn current(&self) -> bool {
+        self.book.current() && self.slot.current()
+    }
+    pub(super) fn shares_storage(&self, other: &Self) -> bool {
+        self.book == other.book || self.slot == other.slot
+    }
+    pub(super) fn book(&self) -> &codex_assignment::BookNamespace {
+        &self.book
+    }
+}
+
 pub struct SourceHandle {
     binding: std::sync::Arc<owner::GrantBinding>,
     slot: String,
@@ -174,7 +219,8 @@ pub struct SourceHandle {
     user: String,
     revision: Revision,
     assignment_generation: u64,
-    native_intent: Option<String>,
+    source_authority: codex_assignment::SourceAuthority,
+    namespaces: Option<std::sync::Arc<SourceNamespaces>>,
 }
 
 impl std::fmt::Debug for SourceHandle {
@@ -184,6 +230,9 @@ impl std::fmt::Debug for SourceHandle {
 }
 
 impl SourceHandle {
+    pub(super) fn namespaces(&self) -> Option<&SourceNamespaces> {
+        self.namespaces.as_deref()
+    }
     // Descriptive authenticated grant identity for native registration. This
     // does not extend the source receipt into assignment or activation authority.
     pub(super) fn binding(&self) -> &owner::GrantBinding {
@@ -212,7 +261,10 @@ impl SourceHandle {
         self.assignment_generation
     }
     pub fn native_intent(&self) -> Option<&str> {
-        self.native_intent.as_deref()
+        self.source_authority.native_intent()
+    }
+    pub(super) fn source_authority(&self) -> &codex_assignment::SourceAuthority {
+        &self.source_authority
     }
 }
 
@@ -223,7 +275,7 @@ pub(super) struct MaterializationReceipt {
     slot: String,
     revision: Revision,
     _auth: super::codex_app_login::AuthLock,
-    _store: super::pending_native_store::Store,
+    _store: platform::Store,
 }
 impl MaterializationReceipt {
     pub(super) fn caller(&self) -> &Caller {
@@ -333,7 +385,7 @@ fn materialization_location(
 }
 
 fn machine(home: &Path) -> Result<age::Identity, String> {
-    client::read_machine_identity(&client::Paths::locate_for_home(home))
+    platform::machine_identity(home)
         .map_err(|_| "slot identity unavailable")?
         .ok_or("slot identity unavailable".into())
 }
@@ -361,7 +413,7 @@ fn mac(identity: &age::Identity, record: &Record) -> Result<String, String> {
 }
 
 struct Opened {
-    store: super::pending_native_store::Store,
+    store: platform::Store,
     identity: age::Identity,
     directory: PathBuf,
     key: String,
@@ -370,21 +422,30 @@ struct Opened {
 
 impl Opened {
     fn open(env: &Env, caller: &Caller, create: bool) -> Result<Option<Self>, String> {
+        platform::require_available()?;
         let (directory, home, key) = location(env, caller)?;
         let identity = machine(&home)?;
         let opened = if create {
             let parent = directory.parent().ok_or("slot directory unavailable")?;
-            aterm_secrets::fsx::ensure_private_dir(parent)
-                .map_err(|_| "slot directory unavailable")?;
-            Some(super::pending_native_store::Store::open_owned(
-                &directory, &home, MAX_RECORD,
-            )?)
+            platform::ensure_private_dir(parent).map_err(|_| "slot directory unavailable")?;
+            Some(platform::Store::open_owned(&directory, &home, MAX_RECORD)?)
         } else {
-            super::pending_native_store::Store::open_owned_existing(&directory, &home, MAX_RECORD)?
+            platform::Store::open_owned_existing(&directory, &home, MAX_RECORD)?
         };
         let Some((store, bytes)) = opened else {
             return Ok(None);
         };
+        Self::from_store(store, bytes, identity, directory, key, caller).map(Some)
+    }
+
+    fn from_store(
+        store: platform::Store,
+        bytes: Option<SecretBytes>,
+        identity: age::Identity,
+        directory: PathBuf,
+        key: String,
+        caller: &Caller,
+    ) -> Result<Self, String> {
         if store.recipient() != identity.recipient() {
             return Err("slot identity changed".into());
         }
@@ -410,13 +471,13 @@ impl Opened {
             .map(|record| slot_key(caller, &record.binding))
             .transpose()?
             .unwrap_or(key);
-        Ok(Some(Self {
+        Ok(Self {
             store,
             identity,
             directory,
             key,
             record,
-        }))
+        })
     }
 
     fn materialization_directory(&self) -> PathBuf {
@@ -447,6 +508,7 @@ impl Opened {
         &self,
         grant: &owner::AdmittedGrant<'_>,
         record: &Record,
+        book_namespace: &codex_assignment::BookNamespace,
     ) -> Result<SourceHandle, String> {
         let bytes = self.read_materialized(record)?;
         if bytes.as_slice() != grant.document() || record.revision != *grant.revision() {
@@ -468,7 +530,11 @@ impl Opened {
             user: grant.identity().user.clone(),
             revision: record.revision.clone(),
             assignment_generation: record.assignment_generation,
-            native_intent: record.source_authority.native_intent().map(str::to_owned),
+            source_authority: record.source_authority.clone(),
+            namespaces: Some(std::sync::Arc::new(SourceNamespaces::capture(
+                book_namespace,
+                &self.store,
+            )?)),
         })
     }
 
@@ -528,25 +594,169 @@ fn auth_lock(
 /// Observe only a previously committed slot for this exact process. Discovery
 /// never guesses a default account, creates a slot, or adopts a credential file.
 pub fn source(env: &Env, caller: &Caller, operation: &str) -> Result<SourceProgress, SlotError> {
+    source_inner(env, caller, operation, None)
+}
+
+/// A known registered member may preload only its captured immutable scope.
+/// The caller retains its actual registry/App admission; this adds no repair,
+/// bootstrap, membership or target authority.
+pub(super) fn source_matching_registered(
+    env: &Env,
+    caller: &Caller,
+    operation: &str,
+    expected: &SourceHandle,
+) -> Result<SourceProgress, SlotError> {
+    source_inner(env, caller, operation, Some(expected))
+}
+
+/// Reauthenticate existing signed scope without owner admission, token reads,
+/// refresh, materialization or inferred bootstrap authority.
+pub(super) fn authenticate_source_scope(
+    env: &Env,
+    caller: &Caller,
+    expected: &SourceHandle,
+) -> Result<(), String> {
+    let namespaces = expected.namespaces().ok_or("source namespace is unknown")?;
+    if !namespaces.current() {
+        return Err("source namespace changed".into());
+    }
+    codex_assignment::with_current_assignment_namespace(
+        env,
+        caller,
+        expected.binding(),
+        expected.assignment_generation(),
+        expected.source_authority(),
+        |book| {
+            if book != namespaces.book() {
+                return Err("source Book namespace changed".into());
+            }
+            let opened = Opened::open(env, caller, false)?.ok_or("source Slot unavailable")?;
+            let record = opened.record.as_ref().ok_or("source Slot unavailable")?;
+            use_guard::check_record(env, caller, record, expected)
+                .map_err(|_| "source Slot changed")?;
+            if opened.store.physical_identity().map_err(str::to_owned)? != namespaces.slot {
+                return Err("source Slot namespace changed".into());
+            }
+            opened.store.unchanged().map_err(str::to_owned)
+        },
+    )
+}
+
+/// Authenticate a member's captured Book and Slot without resolving a new
+/// default, reading token bytes or materializing any revision.
+pub(super) fn authenticate_captured_namespaces(
+    caller: &Caller,
+    expected: &SourceHandle,
+    gate: &super::codex_source_gate::SourceGateIdentity,
+) -> Result<(), String> {
+    let namespaces = expected.namespaces().ok_or("source namespace unknown")?;
+    let home = gate.existing_home().ok_or("source home changed")?;
+    if !namespaces.current() {
+        return Err("source namespace changed".into());
+    }
+    codex_assignment::authenticate_namespace(
+        &home,
+        namespaces.book(),
+        caller,
+        expected.binding(),
+        expected.assignment_generation(),
+        expected.source_authority(),
+        || {
+            let directory = namespaces.slot.directory();
+            let identity = machine(&home)?;
+            let (store, bytes) =
+                platform::Store::open_owned_existing(directory, &home, MAX_RECORD)?
+                    .ok_or("source Slot unavailable")?;
+            if store.physical_identity().map_err(str::to_owned)? != namespaces.slot {
+                return Err("source Slot namespace changed".into());
+            }
+            let opened = Opened::from_store(
+                store,
+                bytes,
+                identity,
+                directory.into(),
+                expected.slot.clone(),
+                caller,
+            )?;
+            let record = opened.record.as_ref().ok_or("source Slot unavailable")?;
+            if record.binding != *expected.binding()
+                || record.assignment_generation != expected.assignment_generation
+                || record.source_authority != expected.source_authority
+                || opened.key != expected.slot
+                || record.revision.generation < expected.revision.generation
+                || (record.revision.generation == expected.revision.generation
+                    && record.revision.digest != expected.revision.digest)
+                || std::fs::canonicalize(opened.materialization_directory().join("auth.json"))
+                    .map_err(|_| "source file unavailable")?
+                    != expected.path
+            {
+                return Err("source Slot authority changed".into());
+            }
+            opened.store.unchanged().map_err(str::to_owned)
+        },
+    )
+}
+
+fn validate_expected_namespaces(
+    env: &Env,
+    caller: &Caller,
+    expected: &SourceHandle,
+) -> Result<(), SlotError> {
+    let Some(namespaces) = expected.namespaces() else {
+        return Ok(());
+    };
+    if !namespaces.current() {
+        return Err(SlotError::Unavailable);
+    }
+    codex_assignment::with_current_assignment_namespace(
+        env,
+        caller,
+        expected.binding(),
+        expected.assignment_generation(),
+        expected.source_authority(),
+        |actual| {
+            if actual != namespaces.book() {
+                return Err("source Book namespace changed".into());
+            }
+            Ok(())
+        },
+    )
+    .map_err(|_| SlotError::Unavailable)
+}
+
+fn source_inner(
+    env: &Env,
+    caller: &Caller,
+    operation: &str,
+    expected: Option<&SourceHandle>,
+) -> Result<SourceProgress, SlotError> {
     if !caller.valid() || !hex(operation, 32) {
         return Err(SlotError::InvalidRequest);
     }
     let before = existing(env, caller).map_err(|_| SlotError::Unavailable)?;
-    owner::with_current_published_grant(env, &before.binding, caller, |grant| {
-        codex_assignment::with_current_assignment(
+    if let Some(expected) = expected {
+        use_guard::check_record(env, caller, &before, expected)?;
+        validate_expected_namespaces(env, caller, expected)?;
+    }
+    #[cfg(test)]
+    use_guard::note_owner_entry();
+    let result = owner::with_current_published_grant(env, &before.binding, caller, |grant| {
+        codex_assignment::with_current_assignment_namespace(
             env,
             caller,
             &before.binding,
             before.assignment_generation,
             &before.source_authority,
-            || {
+            |book_namespace| {
                 let auth = auth_lock(env, caller, &before.binding)?;
                 let opened = Opened::open(env, caller, false)?.ok_or("unknown session slot")?;
                 if opened.record.as_ref() != Some(&before) {
                     return Err("session assignment changed".into());
                 }
                 if before.revision == *grant.revision() {
-                    return opened.readback(&grant, &before).map(SourceProgress::Ready);
+                    return opened
+                        .readback(&grant, &before, book_namespace)
+                        .map(SourceProgress::Ready);
                 }
                 if grant.revision().generation <= before.revision.generation {
                     return Err("slot credential revision did not advance".into());
@@ -562,12 +772,18 @@ pub fn source(env: &Env, caller: &Caller, operation: &str) -> Result<SourceProgr
                     // only the exact authenticated destination revision.
                     opened.read_materialized(&record)?;
                 }
-                let (source, _receipt) = materialize(opened, auth, &grant, record)?;
+                let (source, _receipt) = materialize(opened, auth, &grant, record, book_namespace)?;
                 Ok(SourceProgress::Ready(source))
             },
         )
     })
-    .map_err(|_| SlotError::Unavailable)
+    .map_err(|_| SlotError::Unavailable)?;
+    if let Some(expected) = expected {
+        let after = existing(env, caller).map_err(|_| SlotError::Unavailable)?;
+        use_guard::check_record(env, caller, &after, expected)?;
+        use_guard::check_source(&result, expected)?;
+    }
+    Ok(result)
 }
 
 fn prepare_materialization(
@@ -577,62 +793,16 @@ fn prepare_materialization(
 ) -> Result<(Opened, super::codex_app_login::AuthLock), String> {
     let (directory, home, _) = location(env, caller)?;
     machine(&home)?;
-    aterm_secrets::fsx::ensure_private_dir(directory.parent().ok_or("slot directory unavailable")?)
+    platform::ensure_private_dir(directory.parent().ok_or("slot directory unavailable")?)
         .map_err(|_| "slot directory unavailable")?;
-    aterm_secrets::fsx::ensure_private_dir(&directory).map_err(|_| "slot directory unavailable")?;
+    platform::ensure_private_dir(&directory).map_err(|_| "slot directory unavailable")?;
     let credentials = materialization_location(env, caller, binding)?;
-    aterm_secrets::fsx::ensure_private_dir(
-        credentials.parent().ok_or("slot directory unavailable")?,
-    )
-    .map_err(|_| "slot directory unavailable")?;
-    aterm_secrets::fsx::ensure_private_dir(&credentials)
+    platform::ensure_private_dir(credentials.parent().ok_or("slot directory unavailable")?)
         .map_err(|_| "slot directory unavailable")?;
+    platform::ensure_private_dir(&credentials).map_err(|_| "slot directory unavailable")?;
     let auth = auth_lock(env, caller, binding)?;
     let opened = Opened::open(env, caller, true)?.ok_or("slot unavailable")?;
     Ok((opened, auth))
-}
-
-/// Publish only after a real native assignment commit has acknowledged the
-/// process-wide boundary. The receipt holds custody through the owner's ACK.
-#[expect(
-    dead_code,
-    reason = "nothing calls this native custody step yet, tests included; its production caller lands with the custody RPC: drop this then"
-)]
-pub(super) fn install(
-    env: &Env,
-    grant: owner::AdmittedGrant<'_>,
-    assignment: &codex_assignment::AssignmentCommit,
-) -> Result<(SourceHandle, MaterializationReceipt), String> {
-    let caller = assignment.caller();
-    if !caller.valid()
-        || assignment.binding() != grant.binding()
-        || assignment.generation() == 0
-        || !hex(assignment.operation(), 32)
-        || !grant.revision().valid()
-        || grant.document().is_empty()
-        || grant.document().len() > MAX_DOCUMENT
-    {
-        return Err("invalid slot assignment".into());
-    }
-    let (opened, auth) = prepare_materialization(env, caller, grant.binding())?;
-    let record = Record {
-        schema: 2,
-        caller: caller.clone(),
-        binding: grant.binding().clone(),
-        assignment_generation: assignment.generation(),
-        source_authority: codex_assignment::SourceAuthority::Assignment {
-            operation: assignment.operation().into(),
-        },
-        revision: grant.revision().clone(),
-    };
-    if !installation_allowed(
-        opened.record.as_ref(),
-        &record,
-        assignment.previous_assignment_generation(),
-    ) {
-        return Err("session assignment changed".into());
-    }
-    materialize(opened, auth, &grant, record)
 }
 
 /// Retains the signed startup book and exact Slot claims through the native
@@ -655,7 +825,7 @@ pub(super) fn initialize_startup(
         return Err("invalid initial source".into());
     }
     let startup = codex_assignment::initialize_startup(env, grant, permit)?;
-    let (source, receipt) = startup.with_current(grant, permit, || {
+    let (source, receipt) = startup.with_current(grant, permit, |book_namespace| {
         let caller = permit.caller();
         let (opened, auth) = prepare_materialization(env, caller, grant.binding())?;
         let record = Record {
@@ -671,7 +841,7 @@ pub(super) fn initialize_startup(
         if !startup_installation_allowed(opened.record.as_ref(), &record) {
             return Err("initial source changed".into());
         }
-        materialize(opened, auth, grant, record)
+        materialize(opened, auth, grant, record, book_namespace)
     })?;
     Ok((
         source,
@@ -697,39 +867,12 @@ fn startup_installation_allowed(current: Option<&Record>, destination: &Record) 
     })
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "only tests reach this native custody step until its production caller lands; drop this then"
-    )
-)]
-fn installation_allowed(current: Option<&Record>, destination: &Record, previous: u64) -> bool {
-    if !destination.valid() || previous >= destination.assignment_generation {
-        return false;
-    }
-    let Some(current) = current else {
-        return previous == 0 && destination.assignment_generation > 0;
-    };
-    if current.caller != destination.caller {
-        return false;
-    }
-    if current.assignment_generation == destination.assignment_generation {
-        // A lost ACK or interrupted multi-file publication reconciles this exact
-        // native assignment. The Slot record cannot mint the required proof.
-        return current.binding == destination.binding
-            && current.source_authority == destination.source_authority
-            && (current.revision == destination.revision
-                || destination.revision.generation > current.revision.generation);
-    }
-    current.assignment_generation == previous && destination.assignment_generation > previous
-}
-
 fn materialize(
     mut opened: Opened,
     auth: super::codex_app_login::AuthLock,
     grant: &owner::AdmittedGrant<'_>,
     record: Record,
+    book_namespace: &codex_assignment::BookNamespace,
 ) -> Result<(SourceHandle, MaterializationReceipt), String> {
     opened.key = slot_key(&record.caller, &record.binding)?;
     let directory = opened.materialization_directory();
@@ -746,7 +889,7 @@ fn materialize(
         .dir(&directory)
         .map_err(|_| "slot publication durability unknown")?;
     opened.save(record.clone())?;
-    let source = opened.readback(grant, &record)?;
+    let source = opened.readback(grant, &record, book_namespace)?;
     let receipt = MaterializationReceipt {
         caller: record.caller,
         slot: opened.key,
@@ -762,10 +905,23 @@ pub fn refresh(
     caller: &Caller,
     request: &RefreshRequest,
 ) -> Result<RefreshProgress, SlotError> {
+    refresh_inner(env, caller, request, None)
+}
+
+fn refresh_inner(
+    env: &Env,
+    caller: &Caller,
+    request: &RefreshRequest,
+    expected: Option<&SourceHandle>,
+) -> Result<RefreshProgress, SlotError> {
     if !caller.valid() || !hex(&request.operation, 32) || !hex(&request.expected_digest, 64) {
         return Err(SlotError::InvalidRequest);
     }
     let before = existing(env, caller).map_err(|_| SlotError::Unavailable)?;
+    if let Some(expected) = expected {
+        use_guard::check_record(env, caller, &before, expected)?;
+        validate_expected_namespaces(env, caller, expected)?;
+    }
     if slot_key(caller, &before.binding).map_err(|_| SlotError::InvalidRequest)? != request.slot {
         return Err(SlotError::InvalidRequest);
     }
@@ -780,15 +936,17 @@ pub fn refresh(
         source_authority: before.source_authority.clone(),
         materialized_revision: before.revision.clone(),
     });
+    #[cfg(test)]
+    use_guard::note_owner_entry();
     let result =
         owner::with_refreshed_owner(env, &before.binding, caller, &admitted_request, |grant| {
-            codex_assignment::with_current_assignment(
+            codex_assignment::with_current_assignment_namespace(
                 env,
                 caller,
                 &before.binding,
                 before.assignment_generation,
                 &before.source_authority,
-                || {
+                |book_namespace| {
                     let auth = auth_lock(env, caller, &before.binding)?;
                     let opened = Opened::open(env, caller, false)?.ok_or("unknown session slot")?;
                     if opened.record.as_ref() != Some(&before) {
@@ -796,12 +954,18 @@ pub fn refresh(
                     }
                     let mut record = before.clone();
                     record.revision = grant.revision().clone();
-                    materialize(opened, auth, &grant, record)
+                    materialize(opened, auth, &grant, record, book_namespace)
                 },
             )
         });
     match result {
-        Ok((_, revision)) => Ok(RefreshProgress::Ready(revision)),
+        Ok((_, revision)) => {
+            if let Some(expected) = expected {
+                let after = existing(env, caller).map_err(|_| SlotError::Unavailable)?;
+                use_guard::check_record(env, caller, &after, expected)?;
+            }
+            Ok(RefreshProgress::Ready(revision))
+        }
         Err(owner::OwnerRefreshError::Unavailable) => Err(SlotError::Unavailable),
         Err(owner::OwnerRefreshError::Retaining(inner)) => {
             Ok(RefreshProgress::Retaining(RefreshRetention { inner }))
@@ -809,11 +973,15 @@ pub fn refresh(
     }
 }
 
+#[cfg(all(test, unix))]
+#[path = "codex_session_slot_metadata_fixture.rs"]
+pub(in crate::harness) mod metadata_fixture;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn caller() -> Caller {
+    pub(super) fn caller() -> Caller {
         Caller {
             sid: "s-slot-fixture".into(),
             pid: 42,
@@ -821,10 +989,11 @@ mod tests {
         }
     }
 
-    fn fixture(key: bool) -> (aterm_tempfile::TempDir, Env) {
+    #[cfg(unix)]
+    pub(super) fn fixture(key: bool) -> (aterm_tempfile::TempDir, Env) {
         let root = aterm_tempfile::tempdir().unwrap();
         let home = root.path().join("home");
-        aterm_secrets::fsx::ensure_private_dir(&home).unwrap();
+        platform::ensure_private_dir(&home).unwrap();
         if key {
             client::machine_identity_as(
                 &client::Paths::locate_for_home(&home),
@@ -863,7 +1032,7 @@ mod tests {
 
     // Persisted GrantBinding is data, never an admitted grant. This fixture can
     // exercise slot authentication but cannot construct AdmittedGrant or install.
-    fn record(caller: Caller) -> Record {
+    pub(super) fn record(caller: Caller) -> Record {
         let binding: owner::GrantBinding = aterm_json::from_value(aterm_json::json!({
             "request":{"id":"a".repeat(32),"caller":"b".repeat(64),"label":"fixture","revision":"c".repeat(64)},
             "reference":{"operation":"a".repeat(32),"capability":"d".repeat(64),
@@ -913,7 +1082,6 @@ mod tests {
             nonce: "9".repeat(32),
         };
         assert!(!startup_installation_allowed(Some(&startup), &later));
-        assert!(installation_allowed(Some(&startup), &assigned, 0));
         assert!(startup.source_authority.native_intent().is_none());
         assert_eq!(
             assigned.source_authority.native_intent(),
@@ -957,6 +1125,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn credential_revision_domains_do_not_share_a_materialization_or_slot_key() {
         let (_root, env) = fixture(true);
@@ -971,8 +1140,8 @@ mod tests {
         let first_path = materialization_location(&env, &caller, &first).unwrap();
         let second_path = materialization_location(&env, &caller, &second).unwrap();
         assert_ne!(first_path, second_path);
-        aterm_secrets::fsx::ensure_private_dir(&first_path).unwrap();
-        aterm_secrets::fsx::ensure_private_dir(&second_path).unwrap();
+        platform::ensure_private_dir(&first_path).unwrap();
+        platform::ensure_private_dir(&second_path).unwrap();
         private_file::write_private(&first_path, "auth.json", b"first-grant-revision-14").unwrap();
         private_file::write_private(&second_path, "auth.json", b"second-grant-revision-1").unwrap();
         assert_eq!(
@@ -985,40 +1154,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn lost_ack_reconciles_only_the_exact_assignment_without_revision_rollback() {
-        let current = record(caller());
-        assert!(installation_allowed(None, &current, 0));
-        assert!(installation_allowed(Some(&current), &current, 0));
-        assert!(!installation_allowed(Some(&current), &current, 1));
-        let mut destination = current.clone();
-        destination.revision.generation += 1;
-        destination.revision.digest = "4".repeat(64);
-        assert!(installation_allowed(Some(&current), &destination, 0));
-        assert!(!installation_allowed(Some(&destination), &current, 0));
-        destination = current.clone();
-        destination.revision.digest = "4".repeat(64);
-        assert!(!installation_allowed(Some(&current), &destination, 0));
-        destination = current.clone();
-        destination.source_authority = codex_assignment::SourceAuthority::Assignment {
-            operation: "5".repeat(32),
-        };
-        assert!(!installation_allowed(Some(&current), &destination, 0));
-        destination = current.clone();
-        destination.binding.generation += 1;
-        assert!(!installation_allowed(Some(&current), &destination, 0));
-        destination = current.clone();
-        destination.caller.birth += 1;
-        assert!(!installation_allowed(Some(&current), &destination, 0));
-        destination = current.clone();
-        destination.assignment_generation += 1;
-        destination.source_authority = codex_assignment::SourceAuthority::Assignment {
-            operation: "6".repeat(32),
-        };
-        assert!(installation_allowed(Some(&current), &destination, 1));
-        assert!(!installation_allowed(Some(&current), &destination, 0));
-    }
-
+    #[cfg(unix)]
     #[test]
     fn unknown_source_never_creates_a_slot_or_machine_identity() {
         for key in [false, true] {
@@ -1037,7 +1173,7 @@ mod tests {
         use std::os::unix::fs::{PermissionsExt, symlink};
         let root = aterm_tempfile::tempdir().unwrap();
         let directory = root.path().join("materialization");
-        aterm_secrets::fsx::ensure_private_dir(&directory).unwrap();
+        platform::ensure_private_dir(&directory).unwrap();
         let path = directory.join("auth.json");
         private_file::write_private(&directory, "auth.json", b"private-document").unwrap();
         assert_eq!(
@@ -1059,6 +1195,7 @@ mod tests {
         assert!(read_document(&directory).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn public_recipient_reencryption_cannot_retarget_an_authenticated_slot() {
         let (_root, env) = fixture(true);

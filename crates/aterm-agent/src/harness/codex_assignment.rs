@@ -7,8 +7,12 @@
 #[path = "codex_assignment_protocol.rs"]
 pub mod protocol;
 
+use super::native_custody_platform as platform;
+#[path = "codex_assignment_prepare.rs"]
+pub(super) mod prepare;
 use super::{accounts, cli::Env, codex_grant_owner as owner, codex_session_slot::Caller};
-use aterm_secrets::{SecretBytes, age, client};
+use aterm_secrets::{SecretBytes, age};
+pub use prepare::prepare;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -102,11 +106,15 @@ struct Book {
     consumer: Consumer,
     clock: u64,
     current: Current,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    prepared: Vec<prepare::Record>,
 }
 
 impl Book {
     fn valid(&self, caller: &Caller) -> bool {
-        self.schema == 2
+        ((self.schema == 2 && self.prepared.is_empty())
+            || (self.schema == 3 && !self.prepared.is_empty()))
+            && prepare::records_valid(&self.prepared)
             && self.caller == *caller
             && key(caller).is_ok()
             && self.consumer.pid == caller.pid
@@ -143,7 +151,7 @@ struct Envelope {
 }
 
 struct Claimed {
-    store: super::pending_native_store::Store,
+    store: platform::Store,
     book: Book,
 }
 
@@ -227,17 +235,21 @@ pub(super) fn initialize_startup(
     open_inner(env, permit.caller(), Some((grant.binding(), permit))).map(StartupClaim)
 }
 
+/// Physical metadata of an actual authenticated Book claim; not a grant.
+pub(super) type BookNamespace = platform::PhysicalIdentity;
+
 impl StartupClaim {
     pub(super) fn with_current<R>(
         &self,
         grant: &owner::AdmittedGrant<'_>,
         permit: &super::codex_source_registry::InitialSourcePermit,
-        materialize: impl FnOnce() -> Result<R, String>,
+        materialize: impl FnOnce(&BookNamespace) -> Result<R, String>,
     ) -> Result<R, String> {
         let claimed = self.0.try_lock().map_err(|_| "assignment custody busy")?;
         validate_startup(&claimed.book, grant.binding(), permit)?;
         claimed.store.unchanged().map_err(str::to_owned)?;
-        let result = materialize()?;
+        let namespace = claimed.store.physical_identity().map_err(str::to_owned)?;
+        let result = materialize(&namespace)?;
         claimed.store.unchanged().map_err(str::to_owned)?;
         validate_startup(&claimed.book, grant.binding(), permit)?;
         Ok(result)
@@ -252,6 +264,7 @@ fn open_inner(
         &super::codex_source_registry::InitialSourcePermit,
     )>,
 ) -> Result<Lease, String> {
+    platform::require_available()?;
     let key = key(caller)?;
     let home = env.home.as_ref().ok_or("assignment home unavailable")?;
     let directory = env
@@ -283,19 +296,19 @@ fn open_inner(
     if live.len() >= MAX_LIVE {
         return Err("assignment custody busy".into());
     }
-    let identity = client::read_machine_identity(&client::Paths::locate_for_home(home))
+    let identity = platform::machine_identity(home)
         .map_err(|_| "assignment identity unavailable")?
         .ok_or("assignment identity unavailable")?;
     let (mut store, bytes) = if startup.is_some() {
-        aterm_secrets::fsx::ensure_private_dir(
+        platform::ensure_private_dir(
             directory
                 .parent()
                 .ok_or("assignment location unavailable")?,
         )
         .map_err(|_| "assignment location unavailable")?;
-        super::pending_native_store::Store::open_owned(&directory, home, MAX_BOOK)?
+        platform::Store::open_owned(&directory, home, MAX_BOOK)?
     } else {
-        super::pending_native_store::Store::open_owned_existing(&directory, home, MAX_BOOK)?
+        platform::Store::open_owned_existing(&directory, home, MAX_BOOK)?
             .ok_or("assignment is unknown")?
     };
     let previously_published = bytes.is_some();
@@ -323,6 +336,7 @@ fn open_inner(
             caller: caller.clone(),
             consumer: Consumer::observe(caller)?,
             clock: 0,
+            prepared: Vec::new(),
             current: Current {
                 binding: binding.clone(),
                 generation: 0,
@@ -363,43 +377,6 @@ fn open_inner(
     Ok(lease)
 }
 
-/// Only the native assignment state machine may create this lease. Serialized
-/// book data and a signed Slot record cannot be deserialized into this proof.
-#[expect(
-    dead_code,
-    reason = "nothing calls this native custody step yet, tests included; its production caller lands with the custody RPC: drop this then"
-)]
-pub(super) struct AssignmentCommit {
-    caller: Caller,
-    binding: owner::GrantBinding,
-    generation: u64,
-    previous_generation: u64,
-    operation: String,
-    _lease: Lease,
-}
-
-#[expect(
-    dead_code,
-    reason = "nothing calls this native custody step yet, tests included; its production caller lands with the custody RPC: drop this then"
-)]
-impl AssignmentCommit {
-    pub(super) fn caller(&self) -> &Caller {
-        &self.caller
-    }
-    pub(super) fn binding(&self) -> &owner::GrantBinding {
-        &self.binding
-    }
-    pub(super) fn generation(&self) -> u64 {
-        self.generation
-    }
-    pub(super) fn previous_assignment_generation(&self) -> u64 {
-        self.previous_generation
-    }
-    pub(super) fn operation(&self) -> &str {
-        &self.operation
-    }
-}
-
 /// Hold the canonical assignment claim through a slot read/write. The shared
 /// live lease permits a Source read between install and ACK without reacquiring
 /// the same file lock. Each callback remains serialized, bounded and rechecked.
@@ -410,6 +387,19 @@ pub(super) fn with_current_assignment<R>(
     generation: u64,
     authority: &SourceAuthority,
     use_assignment: impl FnOnce() -> Result<R, String>,
+) -> Result<R, String> {
+    with_current_assignment_namespace(env, caller, binding, generation, authority, |_| {
+        use_assignment()
+    })
+}
+
+pub(super) fn with_current_assignment_namespace<R>(
+    env: &Env,
+    caller: &Caller,
+    binding: &owner::GrantBinding,
+    generation: u64,
+    authority: &SourceAuthority,
+    use_assignment: impl FnOnce(&BookNamespace) -> Result<R, String>,
 ) -> Result<R, String> {
     let lease = open(env, caller)?;
     let claimed = lease.try_lock().map_err(|_| "assignment custody busy")?;
@@ -424,12 +414,69 @@ pub(super) fn with_current_assignment<R>(
         return Err("session assignment changed".into());
     }
     claimed.store.unchanged().map_err(str::to_owned)?;
-    let result = use_assignment()?;
+    let namespace = claimed.store.physical_identity().map_err(str::to_owned)?;
+    let result = use_assignment(&namespace)?;
     claimed.store.unchanged().map_err(str::to_owned)?;
     if claimed.book.consumer != Consumer::observe(caller)? {
         return Err("assignment consumer changed".into());
     }
     Ok(result)
+}
+
+/// Reopen the exact captured namespace, not the current default selector. This
+/// is read-only authentication; neither metadata nor a path grants authority.
+pub(super) fn authenticate_namespace<R>(
+    home: &std::path::Path,
+    namespace: &BookNamespace,
+    caller: &Caller,
+    binding: &owner::GrantBinding,
+    generation: u64,
+    authority: &SourceAuthority,
+    inspect: impl FnOnce() -> Result<R, String>,
+) -> Result<R, String> {
+    #[cfg(unix)]
+    {
+        if !namespace.current() || !authority.valid(generation) {
+            return Err("assignment namespace changed".into());
+        }
+        let identity = platform::machine_identity(home)
+            .map_err(|_| "assignment identity unavailable")?
+            .ok_or("assignment identity unavailable")?;
+        let (store, bytes) =
+            platform::Store::open_owned_existing(namespace.directory(), home, MAX_BOOK)?
+                .ok_or("assignment is unknown")?;
+        let bytes = bytes.ok_or("assignment is unknown")?;
+        let envelope: Envelope =
+            aterm_json::from_slice(bytes.as_slice()).map_err(|_| "assignment book invalid")?;
+        if !envelope.book.valid(caller)
+            || !hex(&envelope.mac, 64)
+            || !aterm_digest::ct_eq(
+                signature(&identity, &envelope.book)?.as_bytes(),
+                envelope.mac.as_bytes(),
+            )
+            || envelope.book.current.binding != *binding
+            || envelope.book.current.generation != generation
+            || envelope.book.current.authority != *authority
+            || envelope.book.consumer != Consumer::observe(caller)?
+            || store.physical_identity().map_err(str::to_owned)? != *namespace
+        {
+            return Err("assignment namespace authority changed".into());
+        }
+        store.unchanged().map_err(str::to_owned)?;
+        let result = inspect()?;
+        store.unchanged().map_err(str::to_owned)?;
+        if envelope.book.consumer != Consumer::observe(caller)? {
+            return Err("assignment consumer changed".into());
+        }
+        Ok(result)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            home, namespace, caller, binding, generation, authority, inspect,
+        );
+        Err("assignment namespace unavailable".into())
+    }
 }
 
 #[cfg(test)]

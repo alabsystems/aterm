@@ -52,6 +52,8 @@ pub enum MetWord {
     BrowserControl,
     /// The authenticated issuer could not admit work; no bad login was proved.
     ServiceUnavailable,
+    /// The issuer admitted work but did not return a validated callback.
+    ChallengeFailed,
     /// Cloudflare's bot check, which did not clear
     /// ([`super::headless_oauth::BOT_CHECK_UNCLEARED`]).
     BotCheck,
@@ -69,6 +71,7 @@ impl MetWord {
             MetWord::BrowserStart => "browser-start",
             MetWord::BrowserControl => "browser-control",
             MetWord::ServiceUnavailable => "service-unavailable",
+            MetWord::ChallengeFailed => "challenge-failed",
             MetWord::BotCheck => "bot-check",
             MetWord::BlockPage => "block-page",
             MetWord::Stall => "stall",
@@ -139,6 +142,7 @@ impl Met {
             MetWord::BrowserStart,
             MetWord::BrowserControl,
             MetWord::ServiceUnavailable,
+            MetWord::ChallengeFailed,
             MetWord::BotCheck,
             MetWord::BlockPage,
             MetWord::Stall,
@@ -173,6 +177,9 @@ impl Met {
         match self.word {
             MetWord::BrowserStart => "its headless browser could not start".to_owned(),
             MetWord::ServiceUnavailable => "its fleet challenge service is unavailable".to_owned(),
+            MetWord::ChallengeFailed => {
+                "its fleet challenge service did not return a validated callback".to_owned()
+            }
             MetWord::BrowserControl => {
                 "it could not communicate with its headless browser".to_owned()
             }

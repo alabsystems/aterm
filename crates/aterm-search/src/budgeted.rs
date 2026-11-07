@@ -17,7 +17,7 @@ use crate::iterators::literal_occurrence;
 use crate::types::{SearchMatch, SearchResults};
 
 enum RowMatcher {
-    Literal,
+    Literal(crate::bytesearch::OwnedSearcher),
     CaseInsensitive(CaseInsensitiveMatcher),
     Regex(aterm_regex::Regex),
 }
@@ -25,7 +25,6 @@ enum RowMatcher {
 /// A budgeted, resumable search over the absolute rows `[base_row, base_row + total_rows)`, fed
 /// one row at a time in ascending order.
 pub struct BudgetedSearch {
-    query: String,
     matcher: RowMatcher,
     matches: Vec<SearchMatch>,
     base_row: usize,
@@ -68,7 +67,7 @@ impl BudgetedSearch {
         let matcher = if is_regex {
             RowMatcher::Regex(SearchIndex::compile_regex(query, case_sensitive)?)
         } else if case_sensitive {
-            RowMatcher::Literal
+            RowMatcher::Literal(crate::bytesearch::OwnedSearcher::new(query))
         } else {
             RowMatcher::CaseInsensitive(CaseInsensitiveMatcher::new(query))
         };
@@ -79,7 +78,6 @@ impl BudgetedSearch {
             0
         };
         Ok(Self {
-            query: query.to_string(),
             matcher,
             matches: Vec::new(),
             base_row,
@@ -209,7 +207,12 @@ impl BudgetedSearch {
         cells: Option<&LineCells>,
         truncated: bool,
     ) {
-        if self.query.is_empty() && !matches!(&self.matcher, RowMatcher::Regex(_)) {
+        let empty = match &self.matcher {
+            RowMatcher::Literal(owned) => owned.searcher().needle().is_empty(),
+            RowMatcher::CaseInsensitive(matcher) => matcher.is_empty(),
+            RowMatcher::Regex(_) => false,
+        };
+        if empty {
             return;
         }
         let col_map = match cells {
@@ -217,10 +220,10 @@ impl BudgetedSearch {
             None => ColumnMap::new(text, self.ambiguous_width),
         };
         match &mut self.matcher {
-            RowMatcher::Literal => {
-                let searcher = crate::bytesearch::Searcher::new(self.query.as_bytes());
+            RowMatcher::Literal(owned) => {
+                let searcher = owned.searcher();
                 for at in searcher.matches_in::<false>(text.as_bytes()) {
-                    let found = literal_occurrence(abs_row, at, self.query.len(), &col_map);
+                    let found = literal_occurrence(abs_row, at, searcher.needle().len(), &col_map);
                     if found.start_col == found.end_col {
                         continue;
                     }

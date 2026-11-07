@@ -21,7 +21,9 @@ use crate::{GlyphImage, GlyphKey, Renderer, StyleBits, TextBlending};
 
 mod frame;
 pub(crate) use frame::FrameInkMemo;
-pub use frame::{FrameGlyphInk, GlyphInkEpoch};
+#[cfg(any(test, debug_assertions))]
+pub use frame::with_narrow_evidence_only;
+pub use frame::{FrameGlyphInk, GlyphInkEpoch, InkRows};
 
 /// The first glyph [`GlyphInk`] measures (U+0020).
 const FIRST: u32 = 0x20;

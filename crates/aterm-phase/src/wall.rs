@@ -634,7 +634,16 @@ pub(crate) fn is_unreachable(text: &str) -> bool {
 /// The wall the worker's last turn ended on, if any: Claude Code's critical-memory banner first ([`memory_wall`]), then [`classify_wall`] over the rows [`crate::phase::limit_notice`] reads, every kind.
 #[must_use]
 pub fn wall(rows: &[String]) -> Option<Wall> {
-    memory_wall(rows).or_else(|| crate::phase::notice(rows))
+    memory_wall(rows).or_else(|| turn_wall(rows))
+}
+
+/// [`wall`] past Claude Code's critical-memory banner: the notice the worker's last turn ended on
+/// ([`crate::phase::notice`]), every kind, each limit notice ([`crate::phase::limit_notice`])
+/// among them. The banner is no end of a turn: Claude Code draws it over a live turn too, where a
+/// reading keeps it as its one wall ([`crate::ScreenReader::health_wall`]).
+#[must_use]
+pub(crate) fn turn_wall(rows: &[String]) -> Option<Wall> {
+    crate::phase::notice(rows)
 }
 
 /// Whether the screen says the login is back: the last thing said is the vendor's own word that a `/login` finished — `⎿  Login successful`, or `⎿  Login successful · account or organization changed` — hanging from the `❯ /login` a person typed, each row read up to the side panel's rule ([`crate::phase::Transcript`]).

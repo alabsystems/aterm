@@ -7,7 +7,10 @@ use crate::damage::compute_display_offset_damage;
 use crate::row::LineSize;
 
 use super::Grid;
+use super::lazy_buffer::WIDEST_PLAIN_ROW_BYTES;
+use super::ring_extras::RingSlot;
 use super::row_u16;
+use super::state::wrap_ring_index;
 use crate::Row;
 
 impl Grid {
@@ -25,7 +28,7 @@ impl Grid {
 
     /// Mark scroll damage: targeted rows for small scrolls, full for large.
     #[inline]
-    fn mark_scroll_damage(&mut self, n: usize) {
+    pub(super) fn mark_scroll_damage(&mut self, n: usize) {
         let visible_rows = self.storage.visible_rows;
         self.storage.mark_content_scroll(visible_rows, n);
     }
@@ -148,7 +151,7 @@ impl Grid {
         self.finish_scroll_up(n);
     }
 
-    fn scroll_up_storage(&mut self, n: usize) {
+    pub(super) fn scroll_up_storage(&mut self, n: usize) {
         debug_assert!(n > 0);
         debug_assert!(
             !self.storage.rows.is_empty(),
@@ -189,10 +192,9 @@ impl Grid {
         for i in 0..rows_to_add {
             let row_idx = row_u16(i);
             let phys = (self.storage.ring_head + ring_sb + i) % row_count;
-            let extracted =
-                Self::extract_row_extras(&self.storage.rows[phys], &self.storage.extras, row_idx);
-            self.storage.push_ring_extras(extracted);
-            self.storage.release_scrolled_row_extras(phys, row_idx);
+            let slot = self.scrolled_row_slot(phys, row_idx);
+            self.storage.ring_extras.push_back(slot);
+            self.release_scrolled_row(phys, row_idx);
         }
 
         self.storage.rows.reserve(rows_to_add);
@@ -240,25 +242,39 @@ impl Grid {
             );
         }
 
-        if self.storage.lazy_buffer.should_drain() {
-            // During an off-thread reflow the store is detached and drain is suppressed, so
-            // cap the buffer here.
-            if self.storage.scrollback_detached_for_reflow && self.storage.scrollback.is_none() {
-                self.bound_detached_lazy_buffer();
-            } else if self.storage.compress_offload_active {
-                let over = self.flood_overflow();
-                if over > 0 {
-                    self.drop_flood_overflow(over);
-                }
-            } else {
-                self.drain_lazy_buffer();
-            }
-        }
+        self.bound_staged_rows();
 
         self.storage.extras.shift_rows_up_by(row_u16(rows_to_reuse));
         let vis = self.storage.visible_rows;
         self.fill_bce_rgb_rows(vis.saturating_sub(row_u16(rows_to_reuse))..vis);
         self.storage.absolute_row_counter += rows_to_reuse as u64;
+    }
+
+    /// What a scroll that reused ring rows does once the staged rows pass the drain threshold:
+    /// cap them while a reflow has the store detached, shed a flood's overflow while compression
+    /// is handed off, and drain them into the store otherwise.
+    #[inline]
+    pub(super) fn bound_staged_rows(&mut self) {
+        if self.storage.lazy_buffer.should_drain() {
+            self.bound_staged_rows_past_threshold();
+        }
+    }
+
+    /// [`Self::bound_staged_rows`] once the staged rows are past the drain threshold: out of
+    /// line, so the threshold test stays in each line feed that calls it.
+    fn bound_staged_rows_past_threshold(&mut self) {
+        // During an off-thread reflow the store is detached and drain is suppressed, so cap the
+        // buffer here.
+        if self.storage.scrollback_detached_for_reflow && self.storage.scrollback.is_none() {
+            self.bound_detached_lazy_buffer();
+        } else if self.storage.compress_offload_active {
+            let over = self.flood_overflow();
+            if over > 0 {
+                self.drop_flood_overflow(over);
+            }
+        } else {
+            self.drain_lazy_buffer();
+        }
     }
 
     fn reuse_one_scrolled_row_no_scrollback(
@@ -269,9 +285,13 @@ impl Grid {
     ) {
         let fill = self.storage.cursor_template;
         let oldest = self.storage.ring_head;
-        let phys = (oldest + ring_sb) % row_count;
+        let phys = wrap_ring_index(oldest + ring_sb, row_count);
 
         if self.storage.ring_extras.is_empty() {
+        } else if self.scrolled_rows_hold_no_extras() {
+            // Extraction would find nothing: the slot the row takes is empty.
+            let _ = self.storage.ring_extras.pop_front();
+            self.storage.ring_extras.push_back(None);
         } else if let Some(mut bx) = self.storage.ring_extras.pop_front().flatten() {
             Self::extract_row_extras_into(
                 &mut bx,
@@ -287,17 +307,21 @@ impl Grid {
                 Self::extract_row_extras(&self.storage.rows[phys], &self.storage.extras, 0);
             self.storage.push_ring_extras(extracted);
         }
-        self.storage.release_scrolled_row_extras(phys, 0);
+        self.release_scrolled_row(phys, 0);
 
         {
             let storage = &mut self.storage;
             let pages = &mut storage.pages;
-            // SAFETY: The reused row remains stored in `storage.rows`, and `storage.pages`
-            // continues to outlive that owner.
-            unsafe { storage.rows[oldest].resize(cols, pages) };
-            storage.rows[oldest].reset_with(fill);
+            let row = &mut storage.rows[oldest];
+            // Only a row a width change left behind needs the out-of-line resize.
+            if row.cols() != cols {
+                // SAFETY: The reused row remains stored in `storage.rows`, and `storage.pages`
+                // continues to outlive that owner.
+                unsafe { row.resize(cols, pages) };
+            }
+            row.reset_with(fill);
         }
-        self.storage.ring_head = (self.storage.ring_head + 1) % row_count;
+        self.storage.ring_head = wrap_ring_index(self.storage.ring_head + 1, row_count);
     }
 
     fn reuse_scrolled_rows_general(
@@ -311,44 +335,76 @@ impl Grid {
         let fill = self.storage.cursor_template;
 
         if rows_to_reuse == 1 {
-            let phys = (self.storage.ring_head + ring_sb) % row_count;
-            let new_extras = Self::extract_row_extras(
-                &self.storage.rows[phys],
-                &self.storage.extras,
-                row_u16(0),
-            );
-            self.storage.release_scrolled_row_extras(phys, 0);
-            self.reuse_one_scrolled_row(new_extras, cols, row_count, has_scrollback, fill);
+            let phys = wrap_ring_index(self.storage.ring_head + ring_sb, row_count);
+            let new_slot = self.scrolled_row_slot(phys, 0);
+            self.release_scrolled_row(phys, 0);
+            self.reuse_one_scrolled_row(new_slot, cols, row_count, has_scrollback, fill);
             return;
         }
 
-        let new_scrollback_extras: Vec<_> = (0..rows_to_reuse)
+        let new_slots: Vec<_> = (0..rows_to_reuse)
             .map(|i| {
-                let row_idx = row_u16(i);
                 let phys = (self.storage.ring_head + ring_sb + i) % row_count;
-                Self::extract_row_extras(&self.storage.rows[phys], &self.storage.extras, row_idx)
+                self.scrolled_row_slot(phys, row_u16(i))
             })
             .collect();
         for i in 0..rows_to_reuse {
             let phys = (self.storage.ring_head + ring_sb + i) % row_count;
-            self.storage.release_scrolled_row_extras(phys, row_u16(i));
+            self.release_scrolled_row(phys, row_u16(i));
         }
 
-        for new_extras in new_scrollback_extras {
-            self.reuse_one_scrolled_row(new_extras, cols, row_count, has_scrollback, fill);
+        for new_slot in new_slots {
+            self.reuse_one_scrolled_row(new_slot, cols, row_count, has_scrollback, fill);
         }
+    }
+
+    /// The ring-history slot for the row at physical index `phys` (visible row `row_idx`) as it
+    /// scrolls off the screen: `None` with no extraction pass when the extras hold no live map
+    /// entry or dense ring, the one case where extraction is known to find nothing.
+    #[inline]
+    fn scrolled_row_slot(&self, phys: usize, row_idx: u16) -> RingSlot {
+        if self.scrolled_rows_hold_no_extras() {
+            return None;
+        }
+        let extras = &self.storage.extras;
+        let extracted = Self::extract_row_extras(&self.storage.rows[phys], extras, row_idx);
+        (!extracted.is_empty()).then(|| Box::new(extracted))
+    }
+
+    /// Release the map extras of the row at physical index `phys` (visible row `row_idx`) as it
+    /// scrolls off the screen ([`GridStorage::release_scrolled_row_extras`]), skipped where
+    /// [`Self::scrolled_rows_hold_no_extras`] holds: with no live map entry the release removes
+    /// nothing, and on every line feed of a flood its call cost more than the rest of the check.
+    #[inline]
+    fn release_scrolled_row(&mut self, phys: usize, row_idx: u16) {
+        if !self.scrolled_rows_hold_no_extras() {
+            self.storage.release_scrolled_row_extras(phys, row_idx);
+        }
+    }
+
+    /// Whether extracting a scrolled-off row's extras is known to find nothing: the extras hold
+    /// no live map entry or dense ring (off on the reference paths, which always extract). An
+    /// image is a map entry's layer, so no image either, and the image hint (a map lookup while
+    /// an entry is pending) is not read on every line feed.
+    #[inline]
+    pub(super) fn scrolled_rows_hold_no_extras(&self) -> bool {
+        let extras = &self.storage.extras;
+        let quiet = !extras.has_any_data();
+        #[cfg(test)]
+        let quiet = quiet && !crate::test_counters::reference_paths();
+        quiet
     }
 
     fn reuse_one_scrolled_row(
         &mut self,
-        new_extras: super::scroll_convert::ScrolledRowExtras,
+        new_slot: RingSlot,
         cols: u16,
         row_count: usize,
         has_scrollback: bool,
         fill: crate::Cell,
     ) {
         let oldest = self.storage.ring_head;
-        self.storage.push_ring_extras(new_extras);
+        self.storage.ring_extras.push_back(new_slot);
 
         let extras = self.storage.ring_extras.pop_front().flatten();
 
@@ -361,12 +417,52 @@ impl Grid {
         {
             let storage = &mut self.storage;
             let pages = &mut storage.pages;
+            let row = &mut storage.rows[oldest];
+            // Only a row a width change left behind needs the out-of-line resize.
+            if row.cols() != cols {
+                // SAFETY: The reused row remains stored in `storage.rows`, and `storage.pages`
+                // continues to outlive that owner.
+                unsafe { row.resize(cols, pages) };
+            }
+            row.reset_with(fill);
+        }
+        self.storage.ring_head = wrap_ring_index(self.storage.ring_head + 1, row_count);
+    }
+
+    /// The oldest ring row reused as a full ring's line feed reuses it, staged first where
+    /// `stages` ([`Self::reuse_one_scrolled_row`]) or dropped ([`Self::reuse_one_scrolled_row_no_scrollback`]),
+    /// for a line feed whose scrolled-off row carries no extras
+    /// ([`Self::scrolled_rows_hold_no_extras`]) under an empty cursor template: the slot that row
+    /// takes in `ring_extras` is `None`. While every slot is `None` (the slots retain no bytes)
+    /// the rotation that slot makes leaves the same slots, and the oldest row's slot is `None`,
+    /// so the rotation is skipped.
+    #[inline]
+    pub(super) fn reuse_quiet_scrolled_row(&mut self, stages: bool, cols: u16) {
+        let row_count = self.storage.rows.len();
+        let oldest = self.storage.ring_head;
+        let extras = if self.storage.ring_extras.retained_bytes() == 0 {
+            None
+        } else {
+            let slot = self.storage.ring_extras.pop_front().flatten();
+            self.storage.ring_extras.push_back(None);
+            slot
+        };
+        if stages {
+            self.storage
+                .lazy_buffer
+                .push_row_boxed(&self.storage.rows[oldest], extras);
+        }
+        let storage = &mut self.storage;
+        let pages = &mut storage.pages;
+        let row = &mut storage.rows[oldest];
+        // Only a row a width change left behind needs the out-of-line resize.
+        if row.cols() != cols {
             // SAFETY: The reused row remains stored in `storage.rows`, and `storage.pages`
             // continues to outlive that owner.
-            unsafe { storage.rows[oldest].resize(cols, pages) };
-            storage.rows[oldest].reset_with(fill);
+            unsafe { row.resize(cols, pages) };
         }
-        self.storage.ring_head = (self.storage.ring_head + 1) % row_count;
+        row.reset_with(crate::Cell::EMPTY);
+        self.storage.ring_head = wrap_ring_index(oldest + 1, row_count);
     }
 
     pub(crate) const DETACHED_LAZY_CAP: usize = 50_000;
@@ -403,6 +499,80 @@ impl Grid {
 
     /// Minimum lazy-backlog line capacity before flood overflow drops oldest staged rows.
     pub(crate) const ASYNC_COMPRESS_BACKPRESSURE: usize = 20_000;
+
+    /// Line feeds a screen text run stages before it sheds the flood's overflow.
+    const SCREEN_TEXT_SHED_BATCH: usize = 256;
+
+    /// When a run of screen text lines (`stages` its rows or not) may defer the per-row steps of
+    /// its line feeds ([`Self::bound_staged_rows`], the absolute row count, the history's
+    /// carried count) to one flush every so many of them: `(flush_at, byte_limit)`, the
+    /// deferred count at which it flushes and the staged bytes past which it flushes early;
+    /// `(1, usize::MAX)` (every line feed flushes, as one alone does) everywhere else.
+    ///
+    /// A flush leaves what those line feeds one at a time leave where the flood path bounds
+    /// staging (compression handed off, a store attached), no cut is open, the rows the ring
+    /// hands over carry no extras, and staging stays within the store's memory headroom once the
+    /// next row joins: the widest row weighs at most [`WIDEST_PLAIN_ROW_BYTES`], and
+    /// `byte_limit` keeps that much of the headroom free. Nothing but a shed touches the store
+    /// during a run, and a shed only takes lines from it, so the headroom a line feed one at a
+    /// time would see is never less. Then [`Self::flood_overflow`] sheds by lines alone,
+    /// `staged - max(share, F)` past the cap and none below it, so the one shed of a flush takes
+    /// what each line feed's would have taken in all. Whether the store holds lines does not
+    /// change that: a shed past the cap has staging alone over the share, so
+    /// [`Self::drop_flood_overflow`] takes every stored line (a truncation to nothing, which
+    /// cannot fail) whichever line feed sheds first, the store stays empty after, and the cut
+    /// stays shut (the hole is 0). That needs the cut shut when the run begins: with one open,
+    /// the line feeds' sheds past the cap can each leave a hole and renumber the history, which
+    /// a flush's one shed would do once. So a live session's flood batches though the compression
+    /// worker moved staged lines into the store before it or between its reads. The history's
+    /// length after each line feed one at a time grows by at most one (the shed that empties the
+    /// store makes it fall), so one carried count of `k` (capped at the length the flush leaves)
+    /// is the `k` counts of one.
+    ///
+    /// A run that stages nothing defers them too while staging holds no more rows than the
+    /// drain threshold: no row joins it, so every line feed's bound leaves it as it is, and the
+    /// history's length stays put.
+    pub(super) fn screen_text_shed_batch(&self, stages: bool) -> (usize, usize) {
+        let storage = &self.storage;
+        let buffer = &storage.lazy_buffer;
+        let per_line = (1, usize::MAX);
+        if !stages {
+            return if buffer.should_drain() {
+                per_line
+            } else {
+                (Self::SCREEN_TEXT_SHED_BATCH, usize::MAX)
+            };
+        }
+        if !storage.compress_offload_active || storage.ring_extras.retained_bytes() != 0 {
+            return per_line;
+        }
+        let Some(store) = storage.scrollback.as_ref() else {
+            return per_line;
+        };
+        let headroom = store
+            .memory_budget()
+            .saturating_sub(store.budgeted_memory_used());
+        let fits = headroom
+            .checked_sub(WIDEST_PLAIN_ROW_BYTES)
+            .filter(|&byte_limit| !buffer.outweighs(byte_limit));
+        if buffer.cut_open() {
+            #[cfg(test)]
+            if let Some(byte_limit) = fits {
+                crate::test_counters::count_screen_text_cut_refusal();
+                if crate::test_counters::screen_text_batch_ignores_cut() {
+                    return (Self::SCREEN_TEXT_SHED_BATCH, byte_limit);
+                }
+            }
+            return per_line;
+        }
+        #[cfg(test)]
+        if crate::test_counters::screen_text_batch_ignores_headroom() {
+            return (Self::SCREEN_TEXT_SHED_BATCH, usize::MAX);
+        }
+        fits.map_or(per_line, |byte_limit| {
+            (Self::SCREEN_TEXT_SHED_BATCH, byte_limit)
+        })
+    }
 
     /// Number of oldest staged rows that exceed the lazy-backlog line or byte limits.
     pub(crate) fn flood_overflow(&self) -> usize {
@@ -617,10 +787,7 @@ impl Grid {
         let region_size = bottom - top + 1;
         let n = n.min(region_size);
 
-        let history_enabled = self.storage.max_scrollback > 0
-            || self.storage.scrollback.is_some()
-            || self.storage.scrollback_detached_for_reflow;
-        if top == 0 && history_enabled {
+        if top == 0 && self.top_anchored_scroll_archives() {
             let blank_prefix = self.fresh_session_blank_prefix(n);
             if blank_prefix < n {
                 // Drop the leading fresh-session blanks with a history-free scroll, then
@@ -996,14 +1163,14 @@ impl Grid {
 #[cfg(test)]
 mod flood_cut_tests {
     use super::super::Grid;
-    use super::super::scroll_convert::FLOOD_MARKER_PREFIX;
+    use super::super::lazy_buffer::FLOOD_MARKER_PREFIX;
     use super::super::test_support::{feed_numbered_lines, history_trimmed};
     use crate::CellFlags;
     use aterm_scrollback::Scrollback;
 
     const DEFAULT_BUDGET: usize = 100 * 1024 * 1024;
 
-    const FLOOR_BUDGET: usize = 2 * 1024 * 1024;
+    const FLOOR_BUDGET: usize = 1024 * 1024;
 
     const BATCH: usize = 256;
 
@@ -1066,9 +1233,10 @@ mod flood_cut_tests {
         (total - 2).saturating_sub(limit)
     }
 
+    /// What staging the lightest row these floods stage once past their first lines (`L1000`
+    /// on) costs.
     fn staged_row_bytes() -> usize {
-        std::mem::size_of::<super::super::scroll_convert::DeferredLine>()
-            + 7 * std::mem::size_of::<crate::Cell>()
+        super::super::lazy_buffer::LazyBuffer::row_bytes(5)
     }
 
     fn assert_floor_is_the_cap(grid: &Grid) {
@@ -1155,8 +1323,7 @@ mod flood_cut_tests {
 
     #[test]
     fn a_full_width_flood_is_cut_at_the_memory_headroom_and_marked_exactly() {
-        let per_row = std::mem::size_of::<super::super::scroll_convert::DeferredLine>()
-            + 80 * std::mem::size_of::<crate::Cell>();
+        let per_row = super::super::lazy_buffer::LazyBuffer::row_bytes(80);
         let mut grid = flooded_grid(80, 8, 25_000 * per_row);
         feed_wide(&mut grid, 0, 5_000, 80);
         assert!(grid.scrollback_mut().is_some(), "drain it into the store");
@@ -1515,7 +1682,7 @@ mod flood_cut_tests {
 
     #[test]
     fn the_marker_states_the_count_first_and_fits_the_default_width() {
-        use super::super::scroll_convert::flood_marker_line;
+        use super::super::lazy_buffer::flood_marker_line;
         let line = flood_marker_line(9_999_999);
         let text = line.to_string();
         let width = text.chars().count();
@@ -1685,8 +1852,7 @@ mod flood_cut_tests {
             "the newest line"
         );
         assert_eq!(grid.truncated_lines(), 0);
-        let per_row = std::mem::size_of::<super::super::scroll_convert::DeferredLine>()
-            + 253 * std::mem::size_of::<crate::Cell>();
+        let per_row = super::super::lazy_buffer::LazyBuffer::row_bytes(253);
         assert!(
             peak <= DEFAULT_BUDGET / 2 + 300 * per_row,
             "the backlog peaked at {peak} bytes"
@@ -1782,8 +1948,7 @@ mod flood_cut_tests {
     }
 
     fn row_bytes(width: usize) -> usize {
-        std::mem::size_of::<super::super::scroll_convert::DeferredLine>()
-            + width * std::mem::size_of::<crate::Cell>()
+        super::super::lazy_buffer::LazyBuffer::row_bytes(width)
     }
 
     #[test]

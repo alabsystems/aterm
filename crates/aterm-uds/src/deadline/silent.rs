@@ -107,7 +107,12 @@ pub fn stand_in(from: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
-fn copy_regular_fresh(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<u64> {
+/// Copy the regular file `from` (no link) to `to`, made anew, with `from`'s permissions.
+#[cfg(any(target_vendor = "apple", not(unix)))]
+pub(crate) fn copy_regular_fresh(
+    from: &std::path::Path,
+    to: &std::path::Path,
+) -> std::io::Result<u64> {
     let (mut reader, meta) = crate::regular_file::open(from)?;
     let _ = std::fs::remove_file(to);
     let mut opts = std::fs::OpenOptions::new();
@@ -123,10 +128,90 @@ fn copy_regular_fresh(from: &std::path::Path, to: &std::path::Path) -> std::io::
     Ok(copied)
 }
 
-/// Copy the Apple binary `from` to `to`, signed ad hoc: a plain copy of its [`stand_in`], for a test that needs the executable at a path of its own (in a bundle, renamed over).
+/// The line [`copy_regular_fresh`]'s `sh` runs off Apple: `$1` opened under `set -C`, readable
+/// by this user alone (`umask 077`) until its permissions are set, holding its stdin. `set -C`
+/// (POSIX's noclobber; dash, bash and BusyBox's `sh` alike) makes a new file, with `O_EXCL`,
+/// where `$1` names nothing, and refuses a regular file, a link to one and a link to nothing; a
+/// file of another type, or a link to one (a device, a FIFO), it opens as it is, with no
+/// `O_EXCL` and no truncation.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+const WRITES_ITS_INPUT: &str = "set -C; umask 077; exec cat >\"$1\"";
+
+/// Copy the regular file `from` (no link) to `to`, made anew, with `from`'s permissions, the
+/// bytes written by a child process: Linux refuses to exec a file anything holds open for
+/// writing (`ETXTBSY`), and a child another thread forks while this process holds `to` open
+/// keeps that descriptor until its own exec (a paused fork, as long as it stays paused). The
+/// child reads `from` through this process's descriptor of it (its stdin), opens `to` after its
+/// fork and has exited before this returns, so no process holds a writer of `to` once it is
+/// made.
+///
+/// Whatever was at `to` is removed first, so the child's `set -C` opens a file there that it did
+/// not make only when one is put there after that, by whoever may write `to`'s directory. The
+/// permissions are then set through a descriptor this process opens to read on what is at `to`,
+/// not following a link ([`crate::regular_file::open`]) and only when it is a regular file of
+/// one name: a link, another type of file or a hard link put in its place is refused
+/// (`InvalidData`) and its target's mode left as it was.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+pub(crate) fn copy_regular_fresh(
+    from: &std::path::Path,
+    to: &std::path::Path,
+) -> std::io::Result<u64> {
+    copy_regular_fresh_by(from, to, WRITES_ITS_INPUT)
+}
+
+/// [`copy_regular_fresh`], its child's `sh` running `line` ([`WRITES_ITS_INPUT`]).
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn copy_regular_fresh_by(
+    from: &std::path::Path,
+    to: &std::path::Path,
+    line: &str,
+) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    let (reader, meta) = crate::regular_file::open(from)?;
+    let _ = std::fs::remove_file(to);
+    let status = crate::spawnfd::command("/bin/sh")
+        .args(["-c", line, "sh"])
+        .arg(to)
+        .stdin(crate::spawnfd::Stdio::from(reader))
+        .stdout(crate::spawnfd::Stdio::null())
+        .stderr(crate::spawnfd::Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "{}: the `sh` copying {} into it ended with {status}",
+            to.display(),
+            from.display()
+        )));
+    }
+    let (made, at) = crate::regular_file::open(to)?;
+    if at.nlink() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}: not the file the copy made", to.display()),
+        ));
+    }
+    made.set_permissions(meta.permissions())?;
+    Ok(at.len())
+}
+
+/// Copy the Apple binary `from` to `to`, signed ad hoc: a plain copy of its [`stand_in`], for a
+/// test that needs the executable at a path of its own (in a bundle, renamed over). On another
+/// Unix, a copy of the file `from` resolves to, since the copy takes only a regular file and a
+/// program there is often a link (Debian's and Ubuntu's `/bin/sh`, to dash), its bytes written
+/// by a child process (`copy_regular_fresh`).
+///
+/// The copy runs under `to`'s name, so `from` must be a program that acts as itself under any
+/// name. A multicall binary picks its tool by the name it runs under (`argv[0]`): a copy of
+/// BusyBox, or of uutils' `coreutils`, is the tool `from` names only when `to`'s file name is
+/// that tool's. Alpine's `/bin/cat` is a link to BusyBox, whose copy named `exe` says
+/// `exe: applet not found` and copies nothing.
 #[track_caller]
 pub fn ad_hoc_copy(from: &std::path::Path, to: &std::path::Path) {
+    #[cfg(not(all(unix, not(target_vendor = "apple"))))]
     let from = stand_in(from);
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    let from =
+        std::fs::canonicalize(from).unwrap_or_else(|e| panic!("resolve {}: {e}", from.display()));
     copy_regular_fresh(&from, to)
         .unwrap_or_else(|e| panic!("copy {} to {}: {e}", from.display(), to.display()));
 }
@@ -195,6 +280,7 @@ pub fn prints(child: &mut crate::spawnfd::Child, line: &str, hang: Duration) {
 }
 
 /// The longest `test <name> ... ` [`is_proof`] reads before a proof line, bytes.
+#[cfg(unix)]
 const LIBTEST_PREFIX_MAX: u64 = 1024;
 
 /// Whether `got`, one line of a child's output without its newline, is the proof line `wanted`:
@@ -202,6 +288,7 @@ const LIBTEST_PREFIX_MAX: u64 = 1024;
 /// test thread (`--test-threads=1`, or a `RUST_TEST_THREADS=1` it inherits) writes that prefix,
 /// unended, before the test it runs prints anything, so the test's first line follows it on the
 /// same line.
+#[cfg(unix)]
 fn is_proof(got: &[u8], wanted: &[u8]) -> bool {
     got == wanted
         || got.strip_suffix(wanted).is_some_and(|before| {
@@ -269,7 +356,11 @@ fn prints_judged(
     });
     match seen.recv_timeout(hang) {
         Ok(()) => {}
-        Err(RecvTimeoutError::Disconnected) => refused(child, line, "its output ended first"),
+        // How it ended says why: its own exit status, or a signal no test of its own sent.
+        Err(RecvTimeoutError::Disconnected) => match super::exit_within(child, ECHO_HANG) {
+            Some(status) => refused(child, line, &format!("its output ended first ({status})")),
+            None => refused(child, line, "its output ended first, and it ran on"),
+        },
         Err(RecvTimeoutError::Timeout) => match held_words(child.id(), hang, held(child.id())) {
             Some(words) => {
                 end(child);
@@ -707,6 +798,63 @@ mod tests {
         );
     }
 
+    /// OFF APPLE A COPY'S MODE IS SET ONLY ON THE FILE ITS CHILD MADE. A link to a FIFO put at
+    /// `to` after the copy cleared the name (here by the child's own line, ahead of its open) is
+    /// opened by `set -C`, and the child writes into the FIFO; the copy then refuses `to`
+    /// (`InvalidData`) and leaves the link, and the FIFO's mode, as they were. NEGATIVE CONTROL:
+    /// the bytes reached the FIFO, so the child did write through the link; and a plain copy
+    /// holds `from`'s bytes, with `from`'s mode.
+    #[cfg(not(target_vendor = "apple"))]
+    #[test]
+    fn a_copys_mode_is_never_set_through_a_link() {
+        use std::io::Read as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+        const SOURCE: &[u8] = b"#!/bin/sh\nexit 0\n";
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let mode = |path: &std::path::Path| {
+            std::fs::symlink_metadata(path)
+                .map(|m| m.mode() & 0o7777)
+                .ok()
+        };
+        let from = dir.path().join("from");
+        std::fs::write(&from, SOURCE).expect("the source");
+        std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o750)).expect("chmod");
+        let fifo = dir.path().join("fifo");
+        let made = super::ends_within(
+            crate::spawnfd::command("mkfifo")
+                .args(["-m", "600"])
+                .arg(&fifo),
+            super::ECHO_HANG,
+        );
+        assert!(made.status.success(), "mkfifo: {made:?}");
+        assert_eq!(mode(&fifo), Some(0o600));
+        let mut reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .expect("the FIFO's reader");
+        let to = dir.path().join("to");
+        let steered = format!("ln -s fifo \"$1\"; {}", super::WRITES_ITS_INPUT);
+        let refused = super::copy_regular_fresh_by(&from, &to, &steered);
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).expect("what the child wrote");
+        assert_eq!(got, SOURCE, "the child wrote through the link");
+        assert_eq!(mode(&fifo), Some(0o600), "the FIFO's mode was set");
+        assert!(
+            std::fs::symlink_metadata(&to).is_ok_and(|m| m.file_type().is_symlink()),
+            "the link is left"
+        );
+        assert_eq!(
+            refused.map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::InvalidData)
+        );
+        let plain = dir.path().join("plain");
+        let copied = super::copy_regular_fresh(&from, &plain).ok();
+        assert_eq!(copied, Some(SOURCE.len() as u64));
+        assert_eq!(std::fs::read(&plain).ok().as_deref(), Some(SOURCE));
+        assert_eq!(mode(&plain), Some(0o750));
+    }
+
     /// Only an echo of its line is a `cat`'s proof that it runs: `cat` itself passes and runs
     /// on until its stdin closes.
     #[test]
@@ -752,6 +900,36 @@ mod tests {
             unpiped.try_wait().expect("poll").is_some(),
             "killed and reaped"
         );
+    }
+
+    /// A copied program whose output ends before its line is named with how it ended, its own exit
+    /// status or the signal that ended it, so a failure says whether something else killed it.
+    #[test]
+    fn a_copied_program_that_ends_first_is_named_with_how_it_ended() {
+        use crate::spawnfd::{Stdio, command};
+        for (script, said) in [
+            ("exit 3", "(exit status: 3)"),
+            ("kill -9 $$", "(signal: 9 (SIGKILL))"),
+        ] {
+            let mut child = command("/bin/sh")
+                .args(["-c", script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn");
+            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::prints(&mut child, "parked", super::ECHO_HANG);
+            }))
+            .expect_err("no proof");
+            let words = refused
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .unwrap_or_default();
+            assert!(
+                words.ends_with(&format!("its output ended first {said}")),
+                "{script}: {words}"
+            );
+        }
     }
 
     /// Only the line itself is a copied program's proof that it runs: a child that writes other

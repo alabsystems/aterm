@@ -216,6 +216,7 @@ pub fn connection<S: Stream>(conn: S, system: &dyn System) {
         eprintln!("aterm-vz-agent: a request's answer was not sent: {e}");
     }
     conn.shutdown();
+    drain(reader);
 }
 
 /// The one child constructor (clippy.toml's one-child-constructor ban): std's, because the
@@ -421,8 +422,18 @@ fn pump<S: Stream>(
         })
 }
 
+/// Read what the host sends on `reader` and drop it, to the connection's end (the host's close,
+/// or the EOF the agent's own shutdown brings), so the agent never closes over bytes the host
+/// sent: Linux resets the peer of a unix (or TCP) socket closed over bytes it never read, and the
+/// host's read after the `Exit` would fail where its EOF belongs.
+fn drain<S: Stream>(mut reader: S) {
+    let _ = io::copy(&mut reader, &mut io::sink());
+}
+
 /// The host's frames during an `Exec`: stdin, its end, and signals for the group. A
-/// connection that ends before completion SIGKILLs the group.
+/// connection that ends before completion SIGKILLs the group. Stdin past the pending limits
+/// SIGKILLs it too, and the rest of the connection is [`drain`]ed, as every other frame of an
+/// `Exec` is read.
 fn host_input<S: Stream>(
     mut reader: S,
     mut stdin: Option<InputQueue>,
@@ -447,6 +458,8 @@ fn host_input<S: Stream>(
                     {
                         let _ = sys::kill_group(group, sys::SIGKILL);
                     }
+                    drop(stdin);
+                    drain(reader);
                     return;
                 }
             }
@@ -486,6 +499,7 @@ fn run<S: Stream>(conn: S, reader: S, exec: &Exec, system: &dyn System) {
             if let Ok(w) = writer.lock() {
                 w.shutdown();
             }
+            drain(reader);
             return;
         }
     };

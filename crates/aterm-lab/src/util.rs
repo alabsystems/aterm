@@ -308,12 +308,13 @@ impl Metered {
         })
     }
 
-    /// The build ended: keep its peak (never below `floor`, its reaped tree's largest resident
-    /// peak) when it `succeeded`, and let its claim go.
-    pub fn end(self, succeeded: bool, floor: u64) {
+    /// The build ended `end`: keep its peak (never below `floor`, its reaped tree's largest
+    /// resident peak) as [`atpkg::build_admit::Ended::keep`] judges it, write its row, and let its
+    /// claim go.
+    pub fn end(self, end: atpkg::build_admit::BuildEnd, floor: u64) {
         let peak = self.meter.stop(floor);
         self.held
-            .end(succeeded, peak, &mut |line| eprintln!("aterm-lab: {line}"));
+            .end(end, peak, &mut |line| eprintln!("aterm-lab: {line}"));
     }
 }
 
@@ -354,7 +355,10 @@ pub fn status_claimed(
     let (mut child, metered) = spawn_claimed(cmd, claim)?;
     let usage = child.wait_with_rusage()?;
     if let Some(m) = metered {
-        m.end(usage.status.success(), usage.maxrss);
+        m.end(
+            atpkg::build_admit::BuildEnd::Status(usage.status),
+            usage.maxrss,
+        );
     }
     Ok(usage.status)
 }
@@ -374,7 +378,7 @@ pub fn output_claimed(
     )?;
     let out = child.wait_with_output()?;
     if let Some(m) = metered {
-        m.end(out.status.success(), 0);
+        m.end(atpkg::build_admit::BuildEnd::Status(out.status), 0);
     }
     Ok(out)
 }
@@ -976,7 +980,7 @@ mod tests {
         let (child, metered) = super::spawn_claimed(&mut cmd, Some(claim)).expect("spawned");
         let out = child.wait_with_output().expect("its end");
         if let Some(m) = metered {
-            m.end(out.status.success(), 0);
+            m.end(atpkg::build_admit::BuildEnd::Status(out.status), 0);
         }
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),

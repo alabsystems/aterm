@@ -780,7 +780,7 @@ OTHER CLIS (`--cli codex|grok|kimi`; `--cli claude`, or none, is the above):
     tab a cold restore relaunches, and a self-claimed codex-alab aterm relaunches after it
     crashed or was restarted, leaves a row now limited, signed out or not signed in here for the
     serving one, the row it ran on read first where the records say it serves and its reading is
-    stale. A Kimi row whose `accounts refresh --cli kimi` panel reads a window full is walled
+    stale (once per relaunch: an attempt after that goes by the records). A Kimi row whose `accounts refresh --cli kimi` panel reads a window full is walled
     until that window's reset (a `harness limits` read of a tab records its sample alone). `aterm ai review`
     of Codex, Grok Build or Kimi Code CLI runs under the row a launch aterm makes takes as the
     records stand (a launch's own usage read can move it), and not at all where that launch
@@ -7190,6 +7190,20 @@ pub trait AccountsHost {
         }
     }
 
+    /// Save a Claude OAuth credential to this Mac's vault audience. Only a newly verified login
+    /// may replace a longer-lived saved token. Inert hosts do nothing; a live save returns the
+    /// entry name without exposing the credential.
+    #[cfg(unix)]
+    fn save_claude_oauth(
+        &self,
+        label: &str,
+        home: &Path,
+        verified_replacement: bool,
+    ) -> Result<Option<String>, String> {
+        let _ = (label, home, verified_replacement);
+        Ok(None)
+    }
+
     /// The peer's own unattended due pass, using its authenticated native fleet Drive.
     fn renew_remote(&self, _host: &str) -> Result<super::remote_renew::Output, String> {
         Err("this host runs no native fleet renewal".to_string())
@@ -7701,6 +7715,16 @@ impl AccountsHost for LiveAccounts {
 
     fn claude_identity_in_home(&self, home: &str, email: &str) -> profile::IdentityObservation {
         profile::identity_in_home(Path::new(home), email)
+    }
+
+    #[cfg(all(unix, not(test)))]
+    fn save_claude_oauth(
+        &self,
+        label: &str,
+        home: &Path,
+        verified_replacement: bool,
+    ) -> Result<Option<String>, String> {
+        super::claude_oauth_vault::save_with_policy(label, home, verified_replacement).map(Some)
     }
 
     fn renew_remote(&self, host: &str) -> Result<super::remote_renew::Output, String> {
@@ -9120,6 +9144,9 @@ struct RowReading {
     /// When a wall its rollouts show ends, which may have passed, Unix seconds
     /// ([`crate::ai::codex_limits::LoginWall`]).
     wall_until: Option<i64>,
+    /// A look at its rollouts could not read them all, so a wall can be missing from these figures
+    /// ([`crate::ai::codex_limits::LoginLooked::whole`]).
+    rollouts_unread: bool,
 }
 
 /// The newer of two read times.
@@ -9169,19 +9196,18 @@ impl RowReading {
 /// is one its rollouts show of any other kind, or a refusal: a worker sent there stops at once, so
 /// it stays `limited` until that wall ends, however old the reading. A row called `usable` on no
 /// reading, on one older than [`SURVEY_READ_FRESH_S`], or on one no newer than its newest wall,
-/// lapsed or not, is `unseen`, since no read says what became of that wall. Not enrolled, signed out
-/// and a written wall stand, and so does `low`, which a read showed. A row its own rollouts read
-/// lately, since any wall, is `usable`.
+/// lapsed or not, is `unseen`, since no read says what became of that wall. Not enrolled and signed
+/// out stand. A written wall stands until the later of its own end and the end of any wall its
+/// figures show, since a read can only lift it through a launch. `low` stands, since a read showed
+/// it. A row its own rollouts read lately, since any wall, is `usable`, unless a look at them could
+/// not read them all, which says nothing of room.
 fn survey_condition(
     base: accounts::Condition,
     reading: &RowReading,
     now: i64,
 ) -> accounts::Condition {
     use accounts::Condition;
-    if matches!(
-        base,
-        Condition::NotEnrolled | Condition::SignedOut | Condition::Limited { .. }
-    ) {
+    if matches!(base, Condition::NotEnrolled | Condition::SignedOut) {
         return base;
     }
     let spent = [reading.week, reading.five_hour]
@@ -9192,14 +9218,22 @@ fn survey_condition(
         .chain(reading.wall_until.filter(|until| *until > now))
         .max();
     if let Some(reset) = spent {
+        let until = reset.saturating_add(accounts::RESET_GRACE_S);
         return Condition::Limited {
-            until: reset.saturating_add(accounts::RESET_GRACE_S),
+            until: match base {
+                Condition::Limited { until: written } => until.max(written),
+                _ => until,
+            },
         };
     }
-    let fresh = reading.read_at.is_some_and(|at| {
-        now.saturating_sub(at) <= SURVEY_READ_FRESH_S
-            && reading.walled_at.is_none_or(|walled| at > walled)
-    });
+    if matches!(base, Condition::Limited { .. }) {
+        return base;
+    }
+    let fresh = !reading.rollouts_unread
+        && reading.read_at.is_some_and(|at| {
+            now.saturating_sub(at) <= SURVEY_READ_FRESH_S
+                && reading.walled_at.is_none_or(|walled| at > walled)
+        });
     match (base, fresh) {
         (Condition::Usable, false) => Condition::Unseen,
         (Condition::Unseen, true) => Condition::Usable,
@@ -9207,44 +9241,27 @@ fn survey_condition(
     }
 }
 
-/// What `row`'s own Codex sessions last wrote of its usage ([`crate::ai::codex_limits::login_sample`]),
-/// for a survey, which reads no provider: `home`'s default Codex home holds the rollouts of every
-/// row that shares it, and the row's own home those of a row with its own. A rollout says only
-/// which login opened it, and the pool resumes one on another row at a handoff or a cold restore,
-/// so its figures speak for a row only where no other login could have written them: `alone` says
-/// the row is the only one enrolled here, and the default home's login must be its own or none.
-/// Nor do they speak from before `since`, when the row last had room
-/// ([`accounts::Account::room_since`]). `None` otherwise, for another pool, a login kept in the keyring, or a row whose login names no
-/// account.
-fn row_rollout_sample(
+/// What `row`'s own Codex sessions last wrote of its usage ([`crate::ai::codex_limits::login_look`]),
+/// for a survey, which reads no provider. A rollout says only which login opened it, and the pool
+/// resumes one on another row at a handoff or a cold restore, so its figures speak for a row only
+/// where no other login could have written them: `alone` says the row is the only one enrolled here,
+/// and [`super::accounts_pool::rollout_login`] says which homes hold them under which login, and that
+/// the default home's login is its own or none. Nor do they speak from before `since`, when the row
+/// last had room ([`accounts::Account::room_since`]). `None` otherwise.
+fn row_rollout_look(
     cli: Cli,
     row: &accounts::Row,
     home: Option<&Path>,
     alone: bool,
     since: Option<i64>,
     now: i64,
-) -> Option<crate::ai::codex_limits::LoginSample> {
+) -> Option<crate::ai::codex_limits::LoginLooked> {
     if !alone {
         return None;
     }
-    let home =
-        home.filter(|home| cli == Cli::Codex && !super::accounts_pool::keyring_held_in(cli, home))?;
-    let default_home = home.join(cli.accounts().default_home);
-    let row_home = row
-        .dir
-        .as_deref()
-        .filter(|dir| !dir.is_empty())
-        .map_or_else(|| default_home.clone(), PathBuf::from);
-    let key = super::codex_app_login::stored_login_key(&row_home)?;
-    if super::codex_app_login::stored_login_key(&default_home).is_some_and(|there| there != key) {
-        return None;
-    }
-    let homes: Vec<&Path> = if row_home == default_home {
-        vec![&default_home]
-    } else {
-        vec![&default_home, &row_home]
-    };
-    crate::ai::codex_limits::login_sample(&homes, key, since, now)
+    let (key, homes) = super::accounts_pool::rollout_login(cli, row, home?)?;
+    let homes: Vec<&Path> = homes.iter().map(PathBuf::as_path).collect();
+    Some(crate::ai::codex_limits::login_look(&homes, key, since, now))
 }
 
 /// One pool as a survey reads it ([`survey_accounts`]).
@@ -9304,7 +9321,7 @@ impl PoolMoves {
 /// roster lists none and its tap read it, and each row's condition ([`survey_condition`]), windows
 /// and last use at `now`, and which row a launch would start on under `[harness] accounts`, the
 /// owner's pin and the program a launch runs. Reads no provider's usage: what it holds beside the
-/// records is what the sessions of the one login enrolled here wrote ([`row_rollout_sample`]). Each
+/// records is what the sessions of the one login enrolled here wrote ([`row_rollout_look`]). Each
 /// row's plan is the one the report names, from the stats series and the logins beside the records.
 /// # Errors
 /// The roster path is unknown, another CLI's `home` is, or the roster or account records could
@@ -9362,7 +9379,7 @@ pub fn survey_accounts(
         &roster,
         &state,
         &enrolled,
-        program.as_deref(),
+        (program.as_deref(), home),
         now,
     )
     .map(|row| row.label.as_str());
@@ -9427,13 +9444,20 @@ pub fn survey_accounts(
                 ),
                 walled_at: account.walled_at().filter(|at| since_pin(*at)),
                 wall_until: None,
+                rollouts_unread: false,
             };
-            let rollouts = here
-                .then(|| row_rollout_sample(cli, row, home, alone, account.room_since(), now))
+            let look = here
+                .then(|| row_rollout_look(cli, row, home, alone, account.room_since(), now))
                 .flatten();
-            let reading = rollouts
+            let rollouts_unread = look.as_ref().is_some_and(|look| !look.whole);
+            let reading = look
+                .and_then(|look| look.sample)
                 .as_ref()
                 .map_or(held, |read| held.with_rollouts(read, now));
+            let reading = RowReading {
+                rollouts_unread,
+                ..reading
+            };
             let base = accounts::condition(row, &state, here, now);
             let plan = plans.get(&row.label);
             SurveyAccount {
@@ -10187,7 +10211,7 @@ fn claude_worker_words(
         roster,
         state,
         &enrolled,
-        None,
+        (None, None),
         now,
     );
     match (row, own) {
@@ -13323,6 +13347,34 @@ fn accounts_use_decided(
                 let _ = writeln!(err, "aterm harness accounts: {note}");
             }
             result.map(|_| {
+                #[cfg(unix)]
+                if cli == Cli::Claude
+                    && let Some((roster, _, _)) = &taken
+                    && let Some(row) = roster.row(label)
+                {
+                    let home = row.dir.clone().map(PathBuf::from).or_else(|| {
+                        crate::ai::connector::claude_default_login_in_file()
+                            .then(|| store.default_login_home())
+                            .flatten()
+                    });
+                    if let Some(home) = home {
+                        match host.save_claude_oauth(label, &home, false) {
+                            Ok(Some(entry)) => {
+                                let _ = writeln!(
+                                    out,
+                                    "{label}: saved the current OAuth credential in host-scoped vault entry `{entry}`"
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(why) => {
+                                let _ = writeln!(
+                                    err,
+                                    "aterm harness accounts use: {label}: the account is selected, but its OAuth credential was not saved: {why}"
+                                );
+                            }
+                        }
+                    }
+                }
                 let said = match taken {
                     _ if cli == Cli::Claude => ACCOUNTS_USE_RECORDED.to_string(),
                     Some((roster, state, enrolled)) => {
@@ -15010,6 +15062,7 @@ fn drove_words(outcome: &super::login_drive::Outcome) -> String {
 /// The selected row and its binding snapshot, with the raw directory the roster supplied, and
 /// for Codex the program a launch aterm makes runs here ([`report_program`]).
 struct SignInPolicy<'a> {
+    native_enrollment: Option<&'a super::codex_enrollment::Request>,
     host: &'a dyn AccountsHost,
     row: &'a accounts::Row,
     logins: &'a accounts::Logins,
@@ -15022,6 +15075,9 @@ struct SignInPolicy<'a> {
 
 /// The route, pinned hosts and staging directory one of `cli`'s sign-ins of `row` runs with, under the machine's sign-in lock ([`accounts::Store::signin_within`]); `Err` is the renewal's end, already told.
 struct SignInPlan {
+    native_env: Option<Env>,
+    native_row_occurrence: Option<super::codex_native_row::NativeRowOccurrence>,
+    native_row_admission: Option<super::codex_native_row::NativeRowAdmission>,
     native_required: bool,
     native_grant: Option<super::codex_grant_owner::RetainedGrant>,
     publication: super::codex_app_login::PublicationCustody,
@@ -15122,6 +15178,26 @@ impl SignInPlan {
         Ok(())
     }
 
+    fn require_native_live(
+        &self,
+        env: &Env,
+        store: &accounts::Store,
+        roster: &Path,
+        now: i64,
+    ) -> Result<(), String> {
+        let admission = self
+            .native_row_admission
+            .as_ref()
+            .ok_or("native row admission unavailable")?;
+        let held = store
+            .acquire_within(&accounts::LOCK_LADDER)
+            .map_err(|_| "native row writer unavailable")?
+            .ok_or("native row writer busy")?;
+        let _live =
+            admission.inspect_current(env, store.native_row_snapshot_held(&held, roster, now)?)?;
+        Ok(())
+    }
+
     fn drive(
         &mut self,
         cli: Cli,
@@ -15144,6 +15220,7 @@ impl SignInPlan {
             hosts: self.hosts,
         };
         if let Some(native) = native {
+            self.native_env = Some(native.env.clone());
             let Some(operation) = self.enrollment.as_ref().filter(|_| cli == Cli::Codex) else {
                 return Drove {
                     outcome: Outcome::NotRun(
@@ -15153,27 +15230,39 @@ impl SignInPlan {
                 };
             };
             let prepared = (|| {
-                let records = store
-                    .read_account_records(
-                        Some(
-                            &native
-                                .env
-                                .accounts_roster_for(cli)
-                                .ok_or("account roster unavailable")?,
-                        ),
-                        host.now(),
-                    )
-                    .map_err(|_| "account records unavailable")?;
-                self.require_workflow(&records.raw_roster, &records.logins, &row.label)?;
-                let fence =
-                    accounts::pool_authority_revision(&records.raw_roster, &records.logins)?;
+                let roster = native
+                    .env
+                    .accounts_roster_for(cli)
+                    .ok_or("account roster unavailable")?;
+                let held = store
+                    .acquire_within(&accounts::LOCK_LADDER)
+                    .map_err(|_| "native row writer unavailable")?
+                    .ok_or("native row writer busy")?;
+                let admission = self
+                    .native_row_admission
+                    .as_ref()
+                    .ok_or("native row occurrence unavailable")?;
+                let live = admission.inspect_current(
+                    native.env,
+                    store.native_row_snapshot_held(&held, &roster, host.now())?,
+                )?;
+                let fence = live.policy();
                 super::codex_grant_owner::prepare(
                     native.env,
                     operation,
                     &super::codex_app_login::auth_path_in_home(&self.staging),
-                    &fence,
+                    fence,
                 )
             })();
+            let prepared = prepared.and_then(|prepared| {
+                let prepared =
+                    prepared.with_native_scope(native.env, self._begun.native_scope().cloned())?;
+                let admission = self
+                    .native_row_admission
+                    .take()
+                    .ok_or("native row occurrence unavailable")?;
+                prepared.with_row_admission(admission)
+            });
             let prepared = match prepared {
                 Ok(prepared) => prepared,
                 Err(_) => {
@@ -15199,6 +15288,31 @@ impl SignInPlan {
             .into_parts();
             if let Some(outcome) = outcome {
                 self.native_grant = native.capture(outcome);
+                let publication = match (
+                    &self.native_grant,
+                    self._begun.native_scope(),
+                    self.artifact
+                        .as_ref()
+                        .and_then(|artifact| artifact.producer_deadline()),
+                ) {
+                    (Some(grant), Some(turn), Some(deadline)) => {
+                        super::codex_grant_owner::admit_native_publication_within(
+                            native.env,
+                            operation,
+                            grant,
+                            turn,
+                            native.scope,
+                            deadline,
+                        )
+                    }
+                    _ => Err("native publication deadline or resources unavailable".into()),
+                };
+                if self.native_grant.is_some() && publication.is_err() {
+                    drove.outcome = Outcome::Unverified(
+                        "native publication resources are unavailable; response retained".into(),
+                    );
+                    return drove;
+                }
                 if let Some(grant) = &self.native_grant
                     && super::codex_enrollment::retain_grant(native.env, operation, grant).is_err()
                 {
@@ -15325,6 +15439,7 @@ fn sign_in_plan(
     err: &mut dyn Write,
 ) -> Result<SignInPlan, Renewal> {
     let SignInPolicy {
+        native_enrollment,
         host,
         row,
         logins: captured_logins,
@@ -15409,9 +15524,32 @@ fn sign_in_plan(
         );
         return Err(Renewal::Failed);
     };
-    let (lock, waited) = match sign_in.take_turn() {
-        Some(turn) => (turn, true),
-        None => signin_guard(store, host, label, verb, out, err)?,
+    enum PlanTurn {
+        Global(accounts::SigninTurn),
+        Native(std::sync::Arc<super::native_enrollment_admission::NativeBrowserTurn>),
+    }
+    if native_enrollment.is_some() && sign_in.has_turn() {
+        say(
+            err,
+            "native enrollment cannot reuse a legacy sign-in turn; nothing was run",
+        );
+        return Err(Renewal::Deferred);
+    }
+    let (turn, waited) = if let Some(request) = native_enrollment {
+        let turn = super::native_enrollment_admission::NativeBrowserTurn::acquire(
+            store, request, row, now,
+        )
+        .map_err(|why| {
+            say(err, &why);
+            Renewal::SigninHeld
+        })?;
+        (PlanTurn::Native(turn), false)
+    } else {
+        let (lock, waited) = match sign_in.take_turn() {
+            Some(turn) => (turn, true),
+            None => signin_guard(store, host, label, verb, out, err)?,
+        };
+        (PlanTurn::Global(lock), waited)
     };
     let now = if waited { host.now().max(now) } else { now };
     if let Some(selection) = sign_in.selection()
@@ -15480,33 +15618,48 @@ fn sign_in_plan(
     let mut native_recovery = None;
     #[cfg(not(unix))]
     let native_recovery = None;
-    if let Err(why) = store.transact_pool_logins_within(
-        &accounts::LOCK_LADDER,
-        roster_path,
-        now,
-        &mut None,
-        |raw, state, current| {
-            if sign_in
-                .selection()
-                .is_some_and(|selection| state.pending_pin.as_ref() != Some(selection))
-            {
-                return Err("the manual selection changed before sign-in admission".into());
-            }
-            shared_renewal::unmanaged(current, row, None, false)?;
-            parent.require_current(current, label)?;
-            signin_policy_matches(row, raw, own_dir)?;
-            accounts::admit_workflow(current, label)?;
-            #[cfg(unix)]
-            if matches!(cli, Cli::Agy | Cli::Kimi) {
-                native_recovery = Some(super::login_drive::RecoveryKey(
-                    parent.recovery_scope(row, state, current)?,
-                ));
-            }
-            #[cfg(not(unix))]
-            let _ = state;
-            Ok(Vec::new())
-        },
-    ) {
+    let mut native_row_occurrence = None;
+    let admitted = (|| {
+        let held = store
+            .acquire_within(&accounts::LOCK_LADDER)
+            .map_err(|_| "account writer unavailable")?
+            .ok_or("account writer busy")?;
+        store.transact_pool_logins_held(
+            &held,
+            roster_path,
+            now,
+            &mut None,
+            |raw, state, current| {
+                if sign_in
+                    .selection()
+                    .is_some_and(|selection| state.pending_pin.as_ref() != Some(selection))
+                {
+                    return Err("the manual selection changed before sign-in admission".into());
+                }
+                shared_renewal::unmanaged(current, row, None, false)?;
+                parent.require_current(current, label)?;
+                signin_policy_matches(row, raw, own_dir)?;
+                accounts::admit_workflow(current, label)?;
+                #[cfg(unix)]
+                if matches!(cli, Cli::Agy | Cli::Kimi) {
+                    native_recovery = Some(super::login_drive::RecoveryKey(
+                        parent.recovery_scope(row, state, current)?,
+                    ));
+                }
+                #[cfg(not(unix))]
+                let _ = state;
+                Ok(Vec::new())
+            },
+        )?;
+        if let Some(request) = native_enrollment {
+            native_row_occurrence = Some(super::codex_native_row::NativeRowOccurrence::capture(
+                store.native_row_snapshot_held(&held, roster_path, now)?,
+                request,
+            )?);
+        }
+        Ok::<(), String>(())
+    })();
+    if let Err(why) = admitted {
         say(err, &format!("{why}; nothing was run"));
         return Err(Renewal::Deferred);
     }
@@ -15581,7 +15734,17 @@ fn sign_in_plan(
     });
     #[cfg(not(unix))]
     let native_admission = None;
-    let begun = match begin_sign_in(sign_in, (cli, label), (store, lock), now, (verb, err)) {
+    let begun = match match turn {
+        PlanTurn::Global(lock) => {
+            begin_sign_in(sign_in, (cli, label), (store, lock), now, (verb, err))
+        }
+        PlanTurn::Native(turn) => sign_in
+            .begin_native(label, turn, store, now)
+            .map_err(|why| {
+                say(err, &why.words(now));
+                Renewal::Deferred
+            }),
+    } {
         Ok(begun) => begun,
         Err(renewal) => {
             drop_staging(&staging, err);
@@ -15589,6 +15752,9 @@ fn sign_in_plan(
         }
     };
     Ok(SignInPlan {
+        native_env: None,
+        native_row_occurrence,
+        native_row_admission: None,
         native_required: false,
         native_grant: None,
         publication: super::codex_app_login::PublicationCustody::default(),
@@ -15777,6 +15943,42 @@ fn signin_policy_matches(
     }
 }
 
+fn transact_signed_in(
+    native_publication: Option<(
+        &Env,
+        &super::codex_enrollment::Request,
+        &super::codex_grant_owner::RetainedGrant,
+    )>,
+    store: &accounts::Store,
+    roster_path: &Path,
+    now: i64,
+    note: &mut Option<String>,
+    edit: impl FnOnce(
+        &accounts::Roster,
+        &mut accounts::State,
+        &mut accounts::Logins,
+    ) -> Result<Vec<accounts::Event>, String>,
+) -> Result<Vec<accounts::Event>, String> {
+    if let Some((env, request, grant)) = native_publication {
+        let held = store
+            .acquire_within(&accounts::LOCK_LADDER)
+            .map_err(|_| "native publication writer unavailable")?
+            .ok_or("native publication writer busy")?;
+        super::codex_grant_owner::with_fresh_publication_response(env, request, grant, |response| {
+            store.transact_roster_logins_native_held(
+                &held,
+                roster_path,
+                now,
+                note,
+                edit,
+                |permit| response.initialize(&permit).map(Some),
+            )
+        })
+    } else {
+        store.transact_roster_logins_within(&accounts::LOCK_LADDER, roster_path, now, note, edit)
+    }
+}
+
 /// Binds `row` to the signed-in staging directory once its login file exists there. Its current roster policy must still match, and Codex's current credential must not contradict its expected identity or name different token users. The credential observation, checkpoint and [`accounts::note_renewed`] run under the store lock.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(
@@ -15839,6 +16041,7 @@ fn bind_signed_in(
     cli: Cli,
     floor: i64,
     host: &dyn AccountsHost,
+    native_env: Option<&Env>,
     store: &accounts::Store,
     (row, roster_path): (&accounts::Row, &Path),
     own_dir: Option<&str>,
@@ -15854,9 +16057,18 @@ fn bind_signed_in(
     if host.work_cancelled() {
         return Renewal::Deferred;
     }
-    if plan.native_required && plan.native_grant.is_none() {
-        return Renewal::Deferred;
-    }
+    let native_publication = if plan.native_required {
+        let (Some(env), Some(request), Some(grant)) = (
+            native_env,
+            plan.enrollment.as_ref(),
+            plan.native_grant.as_ref(),
+        ) else {
+            return Renewal::Deferred;
+        };
+        Some((env, request, grant))
+    } else {
+        None
+    };
     if plan
         .artifact
         .as_ref()
@@ -15994,21 +16206,27 @@ fn bind_signed_in(
     }
     let email = renewal_identity_email(cli, row).unwrap_or("");
     let mut note = None;
-    let done = store.transact_roster_logins_within(
-        &accounts::LOCK_LADDER,
-        roster_path,
-        now,
-        &mut note,
-        |raw, state, logins| {
-            plan.require_publication(host, store)?;
-            if host.work_cancelled() {
-                return Err(RenewalFailure::cancelled().to_string());
-            }
-            // Roster writers use this store lock. Recheck after the provider probe
-            // and before creating any recoverable completion checkpoint.
+    let edit = |raw: &Roster,
+                state: &mut accounts::State,
+                logins: &mut accounts::Logins,
+                current: Option<&super::codex_native_row::CurrentNativeRow<'_>>|
+     -> Result<Vec<accounts::Event>, String> {
+        plan.require_publication(host, store)?;
+        if host.work_cancelled() {
+            return Err(RenewalFailure::cancelled().to_string());
+        }
+        // Roster writers use this store lock. Recheck after the provider probe
+        // and before creating any recoverable completion checkpoint.
+        if let Some(current) = current {
+            current.require_edit_image(raw, state, logins)?;
+        } else {
             plan.require_workflow(raw, logins, label)?;
-            signin_policy_matches(row, raw, own_dir)?;
-            if let Some(artifact) = &plan.artifact {
+        }
+        signin_policy_matches(row, raw, own_dir)?;
+        if let Some(artifact) = &plan.artifact {
+            if let Some(current) = current {
+                current.require_admission(artifact.staging())?;
+            } else {
                 codex_enrollment_recovery::require_binding(
                     artifact.staging(),
                     store,
@@ -16016,12 +16234,24 @@ fn bind_signed_in(
                     state,
                     logins,
                 )?;
-                plan._begun.check_store(store)?;
-                if !artifact.work_current() {
-                    return Err("enrollment producer work expired".into());
-                }
             }
-            if let Some(recovered) = &plan.recovered {
+            plan._begun.check_store(store)?;
+            if !artifact.work_current() {
+                return Err("enrollment producer work expired".into());
+            }
+        }
+        if let Some(recovered) = &plan.recovered {
+            if let Some(current) = current {
+                let turn = plan
+                    ._begun
+                    .native_recovery_scope()
+                    .ok_or("native recovery role unavailable")?;
+                current.require_recovery(turn.admission())?;
+                logins.enrollment.require_native_publication_recovery(
+                    &recovered.admission.request,
+                    turn.admission().ownership(),
+                )?;
+            } else {
                 codex_enrollment_recovery::require_current(
                     &recovered.admission,
                     Some(recovered.claim),
@@ -16030,93 +16260,105 @@ fn bind_signed_in(
                     state,
                     logins,
                 )?;
-                plan._begun.check_store(store)?;
-                if recovered.deadline.passed() || host.work_cancelled() {
-                    return Err("enrollment recovery work expired".into());
-                }
             }
-            plan.check_native_google(cli, email, store)?;
-            #[cfg(unix)]
-            if let Some(snapshot) = &plan.reauthentication {
-                snapshot.check_current()?;
+            plan._begun.check_store(store)?;
+            if recovered.deadline.passed() || host.work_cancelled() {
+                return Err("enrollment recovery work expired".into());
             }
+        }
+        plan.check_native_google(cli, email, store)?;
+        #[cfg(unix)]
+        if let Some(snapshot) = &plan.reauthentication {
+            snapshot.check_current()?;
+        }
 
-            #[cfg(unix)]
-            if cli == Cli::Kimi && plan.native_admission.is_some() {
-                pool_admission::snapshot_current(
-                    row,
-                    state,
-                    logins,
-                    plan.native_parent
-                        .ok_or("Kimi publication has no admitted parent")?,
-                )?;
-            }
-            #[cfg(unix)]
-            let kimi_principal = if cli == Cli::Kimi {
-                plan.native_admission
-                    .as_ref()
-                    .map(|admission| {
-                        admission.kimi_principal(
-                            &plan.staging,
-                            row.vendor.region.ok_or("Kimi publication has no region")?,
-                            row.expected_identity_email().unwrap_or(""),
-                        )
-                    })
-                    .transpose()?
-                    .flatten()
-            } else {
-                None
-            };
-            #[cfg(unix)]
-            if cli == Cli::Kimi && plan.native_admission.is_some() {
-                shared_renewal::unmanaged(logins, row, kimi_principal, true)?;
-            }
-            #[cfg(unix)]
-            let proof = if kimi_principal.is_some() {
-                accounts::Proof::Status
-            } else {
-                proof
-            };
-            if cli == Cli::Claude {
-                shared_renewal::unmanaged(
-                    logins,
-                    row,
-                    host.claude_principal_in_home(&plan.staging_text),
-                    true,
-                )?;
-            } else if logins.shared.required(row)?.is_some() {
-                return Err("this account requires a supported shared renewal adapter".into());
-            }
-            // The provider probe and writer wait can outlive the initial file check.
-            // Refuse before creating evidence that recovery could later adopt.
-            if !has_login() {
-                return Err("the staging login disappeared before publication".into());
-            }
-            if cli == Cli::Codex {
-                super::codex_app_login::check_login_identity(
-                    &plan.staging,
-                    row.expected_identity_email(),
-                )
-                .map_err(|why| why.to_string())?;
-            }
-            if host.work_cancelled() {
-                return Err(RenewalFailure::cancelled().to_string());
-            }
-            if plan.native_required {
-                let request = plan
-                    .enrollment
-                    .as_ref()
-                    .ok_or("native grant has no operation")?;
-                let grant = plan
-                    .native_grant
-                    .as_ref()
-                    .ok_or("native grant has no retained response")?;
-                logins.enrollment.attach_grant(request, grant)?;
-            }
-            if !email.is_empty() {
-                plan.require_publication(host, store)?;
-                let checkpoint = if let Some(request) = &plan.enrollment {
-                    if let Some(recovered) = &plan.recovered {
+        #[cfg(unix)]
+        if cli == Cli::Kimi && plan.native_admission.is_some() {
+            pool_admission::snapshot_current(
+                row,
+                state,
+                logins,
+                plan.native_parent
+                    .ok_or("Kimi publication has no admitted parent")?,
+            )?;
+        }
+        #[cfg(unix)]
+        let kimi_principal = if cli == Cli::Kimi {
+            plan.native_admission
+                .as_ref()
+                .map(|admission| {
+                    admission.kimi_principal(
+                        &plan.staging,
+                        row.vendor.region.ok_or("Kimi publication has no region")?,
+                        row.expected_identity_email().unwrap_or(""),
+                    )
+                })
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        #[cfg(unix)]
+        if cli == Cli::Kimi && plan.native_admission.is_some() {
+            shared_renewal::unmanaged(logins, row, kimi_principal, true)?;
+        }
+        #[cfg(unix)]
+        let proof = if kimi_principal.is_some() {
+            accounts::Proof::Status
+        } else {
+            proof
+        };
+        if cli == Cli::Claude {
+            shared_renewal::unmanaged(
+                logins,
+                row,
+                host.claude_principal_in_home(&plan.staging_text),
+                true,
+            )?;
+        } else if logins.shared.required(row)?.is_some() {
+            return Err("this account requires a supported shared renewal adapter".into());
+        }
+        // The provider probe and writer wait can outlive the initial file check.
+        // Refuse before creating evidence that recovery could later adopt.
+        if !has_login() {
+            return Err("the staging login disappeared before publication".into());
+        }
+        if cli == Cli::Codex {
+            super::codex_app_login::check_login_identity(
+                &plan.staging,
+                row.expected_identity_email(),
+            )
+            .map_err(|why| why.to_string())?;
+        }
+        if host.work_cancelled() {
+            return Err(RenewalFailure::cancelled().to_string());
+        }
+        if plan.native_required {
+            let request = plan
+                .enrollment
+                .as_ref()
+                .ok_or("native grant has no operation")?;
+            let grant = plan
+                .native_grant
+                .as_ref()
+                .ok_or("native grant has no retained response")?;
+            logins.enrollment.attach_grant(request, grant)?;
+        }
+        if !email.is_empty() {
+            plan.require_publication(host, store)?;
+            let checkpoint = if let Some(request) = &plan.enrollment {
+                if let Some(recovered) = &plan.recovered {
+                    if let Some(current) = current {
+                        let turn = plan
+                            ._begun
+                            .native_recovery_scope()
+                            .ok_or("native recovery role unavailable")?;
+                        current.require_recovery(turn.admission())?;
+                        logins.enrollment.require_native_publication_recovery(
+                            &recovered.admission.request,
+                            turn.admission().ownership(),
+                        )?;
+                    } else {
                         codex_enrollment_recovery::require_current(
                             &recovered.admission,
                             Some(recovered.claim),
@@ -16125,155 +16367,217 @@ fn bind_signed_in(
                             state,
                             logins,
                         )?;
-                        plan._begun.check_store(store)?;
-                        if recovered.deadline.passed()
-                            || !super::codex_app_login::enrollment_bytes_current(
-                                &recovered.admission,
-                                &recovered.digest,
-                            )
-                        {
-                            return Err("enrollment recovery work or credential changed".into());
-                        }
                     }
-                    let admission = plan
-                        .artifact
-                        .as_ref()
-                        .map(|artifact| artifact.staging())
-                        .or_else(|| plan.recovered.as_ref().map(|view| &view.admission))
-                        .ok_or("enrollment has no native admission")?;
-                    let digest = super::codex_app_login::sealed_enrollment_digest(admission)?
-                        .ok_or("enrollment has no sealed native response")?;
-                    logins.enrollment.seal_publication(request, digest)?;
-                    let existing = if plan.recovered.is_some() {
-                        accounts::read_renewal_checkpoint_checked_for(
-                            Cli::Codex,
-                            &plan.staging,
-                            &plan.staging,
-                            now,
-                        )
-                        .map_err(|_| "enrollment checkpoint unavailable")?
-                    } else {
-                        None
-                    };
-                    if let Some(recovered) = &plan.recovered {
-                        let current = super::codex_app_login::enrollment_bytes_current(
+                    plan._begun.check_store(store)?;
+                    if recovered.deadline.passed()
+                        || !super::codex_app_login::enrollment_bytes_current(
                             &recovered.admission,
                             &recovered.digest,
-                        );
-                        plan._begun.check_store(store)?;
-                        if !recovered.admission.directories_current() {
-                            return Err("enrollment recovery directories changed".into());
-                        }
-                        if !current || recovered.deadline.passed() || host.work_cancelled() {
-                            return Err("enrollment recovery work or credential changed".into());
-                        }
+                        )
+                    {
+                        return Err("enrollment recovery work or credential changed".into());
                     }
-                    if let Some(artifact) = &plan.artifact {
-                        plan._begun.check_store(store)?;
-                        if !artifact.staging().directories_current()
-                            || !artifact.work_current()
-                            || host.work_cancelled()
-                        {
-                            return Err("enrollment directory or work changed".into());
-                        }
+                }
+                let admission = plan
+                    .artifact
+                    .as_ref()
+                    .map(|artifact| artifact.staging())
+                    .or_else(|| plan.recovered.as_ref().map(|view| &view.admission))
+                    .ok_or("enrollment has no native admission")?;
+                let digest = super::codex_app_login::sealed_enrollment_digest(admission)?
+                    .ok_or("enrollment has no sealed native response")?;
+                logins.enrollment.seal_publication(request, digest)?;
+                let existing = if plan.recovered.is_some() {
+                    accounts::read_renewal_checkpoint_checked_for(
+                        Cli::Codex,
+                        &plan.staging,
+                        &plan.staging,
+                        now,
+                    )
+                    .map_err(|_| "enrollment checkpoint unavailable")?
+                } else {
+                    None
+                };
+                if let Some(recovered) = &plan.recovered {
+                    let current = super::codex_app_login::enrollment_bytes_current(
+                        &recovered.admission,
+                        &recovered.digest,
+                    );
+                    plan._begun.check_store(store)?;
+                    if !recovered.admission.directories_current() {
+                        return Err("enrollment recovery directories changed".into());
                     }
-                    if let Some(checkpoint) = existing {
-                        if plan.recovered.as_ref().is_some_and(|recovered| {
-                            codex_enrollment_recovery::checkpoint_matches(
-                                &recovered.admission,
-                                &checkpoint,
-                                email,
-                            )
-                        }) {
-                            Ok(())
-                        } else {
-                            Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "enrollment checkpoint differs",
-                            ))
-                        }
+                    if !current || recovered.deadline.passed() || host.work_cancelled() {
+                        return Err("enrollment recovery work or credential changed".into());
+                    }
+                }
+                if let Some(artifact) = &plan.artifact {
+                    plan._begun.check_store(store)?;
+                    if !artifact.staging().directories_current()
+                        || !artifact.work_current()
+                        || host.work_cancelled()
+                    {
+                        return Err("enrollment directory or work changed".into());
+                    }
+                }
+                if let Some(checkpoint) = existing {
+                    if plan.recovered.as_ref().is_some_and(|recovered| {
+                        codex_enrollment_recovery::checkpoint_matches(
+                            &recovered.admission,
+                            &checkpoint,
+                            email,
+                        )
+                    }) {
+                        Ok(())
                     } else {
-                        accounts::write_enrollment_checkpoint(
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "enrollment checkpoint differs",
+                        ))
+                    }
+                } else {
+                    match current {
+                        Some(current) => accounts::write_native_enrollment_checkpoint(
+                            current, email, proof, now, logins,
+                        ),
+                        None => accounts::write_enrollment_checkpoint(
                             request,
                             email,
                             &plan.staging_text,
                             proof,
                             now,
                             logins,
-                        )
+                        ),
                     }
-                } else if cli == Cli::Agy {
-                    #[cfg(unix)]
-                    {
-                        accounts::write_google_renewal_checkpoint(
-                            label,
-                            &plan.staging_text,
-                            plan.native_google
-                                .as_ref()
-                                .ok_or("canonical Google proof is unavailable")?,
-                            now,
-                            logins,
-                        )
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        return Err(
-                            "native Google publication is unavailable on this platform".into()
-                        );
-                    }
-                } else {
-                    accounts::write_renewal_checkpoint_for(
-                        cli,
-                        row.vendor.region,
+                }
+            } else if cli == Cli::Agy {
+                #[cfg(unix)]
+                {
+                    accounts::write_google_renewal_checkpoint(
                         label,
-                        email,
                         &plan.staging_text,
-                        None,
-                        Some(proof),
+                        plan.native_google
+                            .as_ref()
+                            .ok_or("canonical Google proof is unavailable")?,
                         now,
                         logins,
                     )
-                };
-                checkpoint
-                    .map_err(|why| format!("completion checkpoint could not be saved: {why}"))?;
-            }
-            if plan
-                .recovered
+                }
+                #[cfg(not(unix))]
+                {
+                    return Err("native Google publication is unavailable on this platform".into());
+                }
+            } else {
+                accounts::write_renewal_checkpoint_for(
+                    cli,
+                    row.vendor.region,
+                    label,
+                    email,
+                    &plan.staging_text,
+                    None,
+                    Some(proof),
+                    now,
+                    logins,
+                )
+            };
+            checkpoint.map_err(|why| format!("completion checkpoint could not be saved: {why}"))?;
+        }
+        if plan
+            .recovered
+            .as_ref()
+            .is_some_and(|view| view.deadline.passed())
+            || plan
+                .artifact
                 .as_ref()
-                .is_some_and(|view| view.deadline.passed())
-                || plan
-                    .artifact
-                    .as_ref()
-                    .is_some_and(|artifact| !artifact.work_current())
-                || host.work_cancelled()
-            {
-                return Err("enrollment publication work expired".into());
+                .is_some_and(|artifact| !artifact.work_current())
+            || host.work_cancelled()
+        {
+            return Err("enrollment publication work expired".into());
+        }
+        plan.require_publication(host, store)?;
+        let events =
+            accounts::note_renewed(state, logins, label, own_dir, &plan.staging_text, None, now);
+        accounts::note_identity(logins, label, proof, (!email.is_empty()).then_some(email));
+        #[cfg(unix)]
+        if cli == Cli::Agy {
+            let grant = plan
+                .native_google
+                .as_ref()
+                .ok_or("canonical Google proof is unavailable")?;
+            accounts::note_google_identity(logins, label, email, grant.profile().principal);
+        }
+        if let Some(request) = &plan.enrollment {
+            logins.enrollment.publishing(request)?;
+        }
+        Ok(events)
+    };
+    let native_stage = plan
+        .artifact
+        .as_ref()
+        .map(|artifact| artifact.staging())
+        .or_else(|| plan.recovered.as_ref().map(|view| &view.admission))
+        .filter(|staging| staging.native_row.is_some());
+    let done = if let Some(staging) = native_stage {
+        (|| {
+            if !plan.native_required {
+                return Err("native row has no native publication authority".into());
             }
-            plan.require_publication(host, store)?;
-            let events = accounts::note_renewed(
-                state,
-                logins,
-                label,
-                own_dir,
-                &plan.staging_text,
-                None,
+            match (
+                plan._begun.native_scope(),
+                plan._begun.native_recovery_scope(),
+            ) {
+                (Some(turn), None) => turn.check_publication()?,
+                (None, Some(turn)) => turn.check_store(store)?,
+                _ => return Err("native row publication resources unavailable".into()),
+            }
+            let env = plan
+                .native_env
+                .as_ref()
+                .ok_or("native row environment unavailable")?;
+            let fresh = plan
+                .native_grant
+                .as_ref()
+                .ok_or("native row issuer unavailable")?;
+            let held = store
+                .acquire_within(&accounts::LOCK_LADDER)
+                .map_err(|_| "native row writer unavailable")?
+                .ok_or("native row writer busy")?;
+            super::codex_native_row::with_current_row(
+                env,
+                (store, &held),
+                roster_path,
                 now,
-            );
-            accounts::note_identity(logins, label, proof, (!email.is_empty()).then_some(email));
-            #[cfg(unix)]
-            if cli == Cli::Agy {
-                let grant = plan
-                    .native_google
-                    .as_ref()
-                    .ok_or("canonical Google proof is unavailable")?;
-                accounts::note_google_identity(logins, label, email, grant.profile().principal);
-            }
-            if let Some(request) = &plan.enrollment {
-                logins.enrollment.publishing(request)?;
-            }
-            Ok(events)
-        },
-    );
+                &staging.request,
+                fresh,
+                |current| {
+                    if let Some(turn) = plan._begun.native_recovery_scope() {
+                        current.require_recovery(turn.admission())?;
+                        turn.check_store(store)?;
+                    }
+                    store.transact_roster_logins_native_held(
+                        &held,
+                        roster_path,
+                        now,
+                        &mut note,
+                        |raw, state, logins| edit(raw, state, logins, Some(&current)),
+                        |permit| {
+                            current.attach_publication(&permit, fresh)?;
+                            current.initialize_owner(env, &permit, fresh).map(Some)
+                        },
+                    )
+                },
+            )
+        })()
+    } else {
+        transact_signed_in(
+            native_publication,
+            store,
+            roster_path,
+            now,
+            &mut note,
+            |raw, state, logins| edit(raw, state, logins, None),
+        )
+    };
     if let Some(note) = note {
         let _ = writeln!(err, "aterm harness accounts: {note}");
     }
@@ -16287,6 +16591,24 @@ fn bind_signed_in(
             }
             if plan.enrollment.is_some() {
                 cleanup_codex_enrollments(store, roster_path, now, &plan.staging);
+            }
+            #[cfg(unix)]
+            if cli == Cli::Claude {
+                match host.save_claude_oauth(label, &plan.staging, true) {
+                    Ok(Some(entry)) => {
+                        let _ = writeln!(
+                            out,
+                            "{label}: saved the OAuth credential in host-scoped vault entry `{entry}`"
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(why) => say(
+                        err,
+                        &format!(
+                            "the login is bound, but its OAuth credential was not saved to the vault: {why}"
+                        ),
+                    ),
+                }
             }
             let (var, value) = accounts::login_env_for(
                 cli,
@@ -16461,6 +16783,7 @@ fn renew_one_for_operation(
         cli,
         store,
         SignInPolicy {
+            native_enrollment: native.and(enrollment),
             host,
             row,
             logins: captured_logins,
@@ -16480,49 +16803,99 @@ fn renew_one_for_operation(
     plan.enrollment = enrollment.cloned();
     plan.native_required = native.is_some();
     if let Some(request) = enrollment {
-        let admitted = store.transact_roster_logins_within(
-            &accounts::LOCK_LADDER,
-            roster_path,
-            floor,
-            &mut None,
-            |raw, state, logins| {
-                if host.work_cancelled() {
-                    return Err("enrollment work cancelled".into());
-                }
-                plan._begun.check_store(store)?;
+        let occurrence = plan.native_row_occurrence.take();
+        let mut bind = |raw: &Roster,
+                        state: &mut accounts::State,
+                        logins: &mut accounts::Logins,
+                        live: Option<&super::codex_native_row::LiveNativeRow<'_>>|
+         -> Result<Vec<accounts::Event>, String> {
+            if host.work_cancelled() {
+                return Err("enrollment work cancelled".into());
+            }
+            plan._begun.check_preparation(store)?;
+            if let Some(live) = live {
+                live.require_image(raw, state, logins)?;
+            } else {
                 plan.require_workflow(raw, logins, label)?;
-                signin_policy_matches(row, raw, own_dir)?;
-                let staging = super::codex_enrollment::Staging {
-                    request: request.clone(),
-                    store: std::fs::canonicalize(&store.dir)
-                        .map_err(|_| "enrollment store unavailable")?,
-                    directory: std::fs::canonicalize(&plan.staging)
-                        .map_err(|_| "enrollment staging unavailable")?,
-                    store_identity: Some(super::codex_enrollment::DirectoryIdentity::capture(
-                        &store.dir,
-                    )?),
-                    directory_identity: Some(super::codex_enrollment::DirectoryIdentity::capture(
-                        &plan.staging,
-                    )?),
-                    parent: plan.parent,
-                    workflow: plan.workflow.value(),
-                    policy: accounts::pool_authority_revision(raw, logins)?,
-                    selection: state
-                        .pending_pin
-                        .as_ref()
-                        .map(accounts::PendingSelection::identity),
-                };
-                if let Some(owned) = plan._begun.selection()
-                    && Some(accounts::PendingSelection::identity(owned)) != staging.selection
-                {
-                    return Err("enrollment selection changed".into());
-                }
-                plan.artifact = Some(logins.enrollment.bind_staging(staging)?);
-                Ok(Vec::new())
-            },
-        );
+            }
+            signin_policy_matches(row, raw, own_dir)?;
+            let staging = super::codex_enrollment::Staging {
+                native_row: occurrence
+                    .as_ref()
+                    .map(|occurrence| occurrence.fence().clone()),
+                request: request.clone(),
+                store: std::fs::canonicalize(&store.dir)
+                    .map_err(|_| "enrollment store unavailable")?,
+                directory: std::fs::canonicalize(&plan.staging)
+                    .map_err(|_| "enrollment staging unavailable")?,
+                store_identity: Some(super::codex_enrollment::DirectoryIdentity::capture(
+                    &store.dir,
+                )?),
+                directory_identity: Some(super::codex_enrollment::DirectoryIdentity::capture(
+                    &plan.staging,
+                )?),
+                parent: plan.parent,
+                workflow: plan.workflow.value(),
+                policy: match occurrence.as_ref() {
+                    Some(occurrence) => occurrence.policy().to_owned(),
+                    None => accounts::pool_authority_revision(raw, logins)?,
+                },
+                selection: state
+                    .pending_pin
+                    .as_ref()
+                    .map(accounts::PendingSelection::identity),
+            };
+            if let Some(owned) = plan._begun.selection()
+                && Some(accounts::PendingSelection::identity(owned)) != staging.selection
+            {
+                return Err("enrollment selection changed".into());
+            }
+            plan.artifact = Some(logins.enrollment.bind_staging(staging)?);
+            Ok(Vec::new())
+        };
+        let admitted = if let Some(occurrence) = occurrence.as_ref() {
+            (|| {
+                let env = native.ok_or("native row environment unavailable")?.env;
+                let held = store
+                    .acquire_within(&accounts::LOCK_LADDER)
+                    .map_err(|_| "native row writer unavailable")?
+                    .ok_or("native row writer busy")?;
+                let live = occurrence.inspect_current(
+                    env,
+                    store.native_row_snapshot_held(&held, roster_path, floor)?,
+                )?;
+                store.transact_roster_logins_held(
+                    &held,
+                    roster_path,
+                    floor,
+                    &mut None,
+                    |raw, state, logins| bind(raw, state, logins, Some(&live)),
+                )
+            })()
+        } else {
+            store.transact_roster_logins_within(
+                &accounts::LOCK_LADDER,
+                roster_path,
+                floor,
+                &mut None,
+                |raw, state, logins| bind(raw, state, logins, None),
+            )
+        };
         if admitted.is_err() {
             return Renewal::Deferred;
+        }
+        if let Some(occurrence) = occurrence {
+            let Some(staging) = plan
+                .artifact
+                .as_ref()
+                .map(|artifact| artifact.staging().clone())
+            else {
+                return Renewal::Deferred;
+            };
+            match occurrence.finish(staging) {
+                Ok(admission) => plan.native_row_admission = Some(admission),
+                Err(_) => return Renewal::Deferred,
+            }
         }
         let Some(artifact) = &plan.artifact else {
             return Renewal::Deferred;
@@ -16545,9 +16918,14 @@ fn renew_one_for_operation(
             .and_then(|raw| accounts::current_workflow(raw, &records.logins));
         let (true, Some(workflow)) = (
             signin_policy_matches(row, &records.raw_roster, own_dir).is_ok()
-                && plan
-                    .require_workflow(&records.raw_roster, &records.logins, label)
-                    .is_ok(),
+                && match native {
+                    Some(native) => plan
+                        .require_native_live(native.env, store, roster_path, floor)
+                        .is_ok(),
+                    None => plan
+                        .require_workflow(&records.raw_roster, &records.logins, label)
+                        .is_ok(),
+                },
             workflow,
         ) else {
             let _ = writeln!(
@@ -16784,6 +17162,7 @@ fn renew_one_for_operation(
             cli,
             floor,
             host,
+            native.map(|native| native.env),
             store,
             (row, roster_path),
             own_dir,
@@ -17120,6 +17499,7 @@ fn run_accounts_login_for(
         cli,
         &store,
         SignInPolicy {
+            native_enrollment: None,
             host,
             row: &row,
             logins: &logins,
@@ -17193,6 +17573,7 @@ fn run_accounts_login_for(
         cli,
         env.now,
         host,
+        None,
         &store,
         (&row, &path),
         own_dir,
@@ -19193,12 +19574,36 @@ pub(super) fn enroll_codex_operation_custody(
     if !request.valid() {
         return Err("invalid enrollment request".into());
     }
-    let mut quiet = io::sink();
-    let path = accounts_roster_path_for(Cli::Codex, env, &mut quiet)
-        .ok_or("account roster unavailable")?;
     let store = env
         .accounts_store_for(Cli::Codex)
         .ok_or("account store unavailable")?;
+    // Retiring exact native cancellation custody needs neither a current row
+    // nor a usable roster. This branch cannot restore or publish a credential.
+    if let (Some(admitted_work), Some(native)) = (admitted_work, native)
+        && let Ok((logins, None)) = store.load_logins(env.now)
+        && logins
+            .enrollment
+            .require_native_retirement_candidate(request)
+            .is_ok()
+    {
+        codex_enrollment_recovery::retire_cancelled_native_row(
+            env,
+            request,
+            &store,
+            admitted_work,
+            native,
+        )?;
+        return store
+            .load_logins(env.now)
+            .map_err(|_| "account records unavailable")?
+            .0
+            .enrollment
+            .lookup(request)?
+            .ok_or_else(|| "enrollment operation disappeared".into());
+    }
+    let mut quiet = io::sink();
+    let path = accounts_roster_path_for(Cli::Codex, env, &mut quiet)
+        .ok_or("account roster unavailable")?;
     let records = store
         .read_account_records(Some(&path), env.now)
         .map_err(|_| "account records unavailable")?;
@@ -19208,11 +19613,35 @@ pub(super) fn enroll_codex_operation_custody(
                 cleanup_codex_enrollments(&store, &path, env.now, &admission.directory);
             }
         } else if status.phase == Phase::Running
-            && records.logins.enrollment.is_retired(request)?
+            && (records.logins.enrollment.is_retired(request)?
+                || (native.is_some()
+                    && records
+                        .logins
+                        .enrollment
+                        .require_native_recovery_candidate(request)
+                        .is_ok()))
             && records.logins.enrollment.staged(request)?.is_some()
         {
             if let Some(admitted_work) = admitted_work {
-                recover_codex_enrollment(env, host, request, &store, &path, admitted_work)?;
+                if records
+                    .logins
+                    .enrollment
+                    .staged(request)?
+                    .is_some_and(|staging| staging.native_row.is_some())
+                {
+                    if let Some(native) = native {
+                        codex_enrollment_recovery::recover_native_row_enrollment(
+                            env,
+                            host,
+                            request,
+                            (&store, &path),
+                            admitted_work,
+                            native,
+                        )?;
+                    }
+                } else {
+                    recover_codex_enrollment(env, host, request, &store, &path, admitted_work)?;
+                }
             }
             return store
                 .load_logins(env.now)
@@ -19319,38 +19748,44 @@ pub(super) fn enroll_codex_operation_custody(
         .ok_or_else(|| "enrollment operation disappeared".into())
 }
 
-/// Cancels only the exact retained operation; publication rechecks this record
-/// under the same account writer before creating its completion checkpoint.
-pub(super) fn cancel_codex_operation(
+/// One metadata-only native cancellation/retirement transaction. Legacy
+/// unfenced operations retain the existing roster-bound transaction unchanged.
+fn transact_enrollment_cancellation(
     env: &Env,
     request: &super::codex_enrollment::Request,
+    edit: impl FnOnce(&mut accounts::Logins) -> Result<(), String>,
 ) -> Result<super::codex_enrollment::Status, String> {
-    let mut quiet = io::sink();
-    let path = accounts_roster_path_for(Cli::Codex, env, &mut quiet)
-        .ok_or("account roster unavailable")?;
     let store = env
         .accounts_store_for(Cli::Codex)
         .ok_or("account store unavailable")?;
-    store.transact_roster_logins_within(
-        &accounts::LOCK_LADDER,
-        &path,
-        env.now,
-        &mut None,
-        |_, _, logins| {
-            if logins.enrollment.require_running(request).is_ok() {
-                logins
-                    .enrollment
-                    .finish(request, super::codex_enrollment::Phase::CancelRequested)?;
-            } else {
-                logins
-                    .enrollment
-                    .lookup(request)?
-                    .ok_or("unknown enrollment operation")?;
+    // Only a clean canonical observation can select the native bypass. A
+    // pending/overlapping publication follows ordinary counted repair below.
+    let native = match store.load_logins(env.now) {
+        Ok((before, None)) => before.enrollment.native_admitted(request)?,
+        _ => false,
+    };
+    if native {
+        store.transact_logins(env.now, &mut None, |_, logins| {
+            if !logins.enrollment.native_admitted(request)? {
+                return Err("native cancellation admission changed".into());
             }
-            logins.enrollment.retire_recorded_cancellation(request)?;
+            edit(logins)?;
             Ok(Vec::new())
-        },
-    )?;
+        })?;
+    } else {
+        let path = accounts_roster_path_for(Cli::Codex, env, &mut io::sink())
+            .ok_or("account roster unavailable")?;
+        store.transact_roster_logins_within(
+            &accounts::LOCK_LADDER,
+            &path,
+            env.now,
+            &mut None,
+            |_, _, logins| {
+                edit(logins)?;
+                Ok(Vec::new())
+            },
+        )?;
+    }
     store
         .load_logins(env.now)
         .map_err(|_| "account records unavailable")?
@@ -19360,34 +19795,35 @@ pub(super) fn cancel_codex_operation(
         .ok_or_else(|| "unknown enrollment operation".into())
 }
 
+/// Cancels only the exact retained operation; publication rechecks this record
+/// under the same account writer before creating its completion checkpoint.
+pub(super) fn cancel_codex_operation(
+    env: &Env,
+    request: &super::codex_enrollment::Request,
+) -> Result<super::codex_enrollment::Status, String> {
+    transact_enrollment_cancellation(env, request, |logins| {
+        if logins.enrollment.require_running(request).is_ok() {
+            logins
+                .enrollment
+                .finish(request, super::codex_enrollment::Phase::CancelRequested)?;
+        } else {
+            logins
+                .enrollment
+                .lookup(request)?
+                .ok_or("unknown enrollment operation")?;
+        }
+        logins.enrollment.retire_recorded_cancellation(request)
+    })
+}
+
 /// Release only the exact cancellation whose admitted work has retired.
 pub(super) fn retire_codex_operation(
     env: &Env,
     proof: &super::codex_enrollment::Retired,
 ) -> Result<super::codex_enrollment::Status, String> {
-    let mut quiet = io::sink();
-    let path = accounts_roster_path_for(Cli::Codex, env, &mut quiet)
-        .ok_or("account roster unavailable")?;
-    let store = env
-        .accounts_store_for(Cli::Codex)
-        .ok_or("account store unavailable")?;
-    store.transact_roster_logins_within(
-        &accounts::LOCK_LADDER,
-        &path,
-        env.now,
-        &mut None,
-        |_, _, logins| {
-            logins.enrollment.retire(proof)?;
-            Ok(Vec::new())
-        },
-    )?;
-    store
-        .load_logins(env.now)
-        .map_err(|_| "account records unavailable")?
-        .0
-        .enrollment
-        .lookup(proof.request())?
-        .ok_or_else(|| "unknown enrollment operation".into())
+    transact_enrollment_cancellation(env, proof.request(), |logins| {
+        logins.enrollment.retire(proof)
+    })
 }
 
 #[path = "cli_tests.rs"]

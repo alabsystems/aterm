@@ -5,6 +5,7 @@
 //! authorize a deletion and are deliberately separate from removal intents/outcomes.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// An existing cleanup guard that did not admit a step.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,6 +24,10 @@ pub(crate) enum KeepReason {
     Custody,
     CannotStage,
     NoPartsStaged,
+    NoStaleParts {
+        after: Duration,
+        observed: super::stale::Observations,
+    },
     IntentDeclined,
     StaleSetChanged,
     #[cfg(unix)]
@@ -54,6 +59,36 @@ impl std::fmt::Display for KeepReason {
             }
             Self::CannotStage => f.write_str("its name cannot be safely staged for removal"),
             Self::NoPartsStaged => f.write_str("no cache parts were staged for removal"),
+            Self::NoStaleParts { after, observed } => {
+                let compiler = match observed.last_build_current {
+                    Some(true) => "current store build",
+                    Some(false) => "former store build",
+                    None => "unavailable",
+                };
+                let release = if observed.release_record {
+                    "present"
+                } else {
+                    "unavailable"
+                };
+                write!(
+                    f,
+                    "no eligible stale cache parts under the selected {after:?} wait; \
+                     recognized survey entries only: incremental quiet/not-quiet/unknown \
+                     {}/{}/{}, units {}/{}/{}; last build {compiler}, \
+                     {}/{} profiles with post-switch compiler references, {} units without \
+                     compiler fingerprints; release record {release}, {} profiles naming used units",
+                    observed.incremental.quiet,
+                    observed.incremental.not_quiet,
+                    observed.incremental.unknown,
+                    observed.units.quiet,
+                    observed.units.not_quiet,
+                    observed.units.unknown,
+                    observed.profiles_with_compiler_references,
+                    observed.profiles,
+                    observed.units_without_compiler,
+                    observed.profiles_naming_used_units,
+                )
+            }
             Self::IntentDeclined => f.write_str("the cleanup pass declined a removal step"),
             Self::StaleSetChanged => {
                 f.write_str("no stale parts met the cleanup policy when rechecked")

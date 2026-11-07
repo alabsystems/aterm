@@ -7,7 +7,7 @@
 use std::io::{BufRead as _, BufReader, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use aterm_toolchain::named_lock::{self, Refused, Wait};
 use aterm_uds::spawnfd::Stdio;
@@ -55,7 +55,8 @@ refused), then the mainline 7.2.6 kernel and Mesa 26.3's Venus, and before any v
 this Mac's GPU and its GL zink over it (else NOT RUN); cargo and aterm-gui run with Venus as the only Vulkan driver and zink
 as GL (the display servers stay on llvmpipe). One run holds a VM at a time: a verb that finds it held waits for that run to
 end, naming it (pid, verb, checkout, since when) as the wait starts and once a minute; --no-wait answers NOT RUN at once
-instead, naming it. A verb that boots the VM first claims the disk its boots write (what the last ones wrote, else 10 GiB
+instead, naming it. A verb that boots the VM first takes its turn to boot, waiting for a run that boots it to end (one run
+of a VM claims its disk at a time), then claims the disk its boots write (what the last ones wrote, else 10 GiB
 less what the VM's directory holds) and waits for room before it waits for the lane, a line a minute naming the need and the
 holders; once it holds the lane, the boot claims the guest's 16 GiB and 8 vCPUs in this Mac's capacity ledger (`aterm pkg
 capacity`) and waits while they do not fit with 8 GiB to spare beside them, naming the claims that hold the room once a
@@ -158,7 +159,8 @@ reserved guest directory; historical ~/aterm-lane directories are retained.
                            browser-site`), then on each arch aterm-verify built in the guest, its pinned browsers
                            fetched and `verify browser-drive` run on that site, every GPU frame held to the CPU
                            frames and the wgpu-WebGL recording within the CPU tolerance: x86_64 (Rosetta)
-                           chrome-headless-shell linux64 on SwiftShader, aarch64 Firefox under Xvfb.
+                           chrome-headless-shell linux64 on SwiftShader, aarch64 Firefox under Xvfb and WebKit's
+                           WPE, headless.
                            Exit 0 pass, 1 a row failed, 3 NOT RUN. Report and frames: $LAB_STATE/linux/
   vz-agent                 cross-build the vz guest agent (crates/aterm-vz-agent; STOCK EXCEPTION: rustup stable,
                            static aarch64-unknown-linux-musl, linked by its rust-lld) and place it at
@@ -519,6 +521,29 @@ pub fn pick_limactl(
     }
 }
 
+/// How long a command cut off on the GPU instance waits for lima to read the VM down
+/// ([`left_running`]): lima reads a VM whose krunkit just died as running until its host agent
+/// sees the death, which can come after the cut ssh's 255.
+pub const LOSS_WAIT: Duration = Duration::from_secs(15);
+
+/// Whether the VM left running within `wait`, `running` (lima's reading: running or not, `None`
+/// where it reads none) asked every `pace` until then. A VM lima cannot read is not claimed down.
+pub fn left_running(
+    mut running: impl FnMut() -> Option<bool>,
+    wait: Duration,
+    pace: Duration,
+) -> bool {
+    let t0 = Instant::now();
+    loop {
+        match running() {
+            Some(false) => return true,
+            None => return false,
+            Some(true) if t0.elapsed() >= wait => return false,
+            Some(true) => std::thread::sleep(pace),
+        }
+    }
+}
+
 /// The `limactl` this Mac has, and the instance this run drives with it.
 pub struct Lima {
     pub bin: PathBuf,
@@ -528,6 +553,9 @@ pub struct Lima {
     /// instance's krunkit, [`crate::linux_gpu::lima_env`]).
     pub env: Vec<(String, String)>,
     owned: owned::Namespace,
+    /// Why the GPU instance went down under a command of this run ([`Lima::loss`]): every
+    /// later command is lost with it, unrun.
+    lost: OnceLock<String>,
 }
 
 impl Lima {
@@ -561,6 +589,7 @@ impl Lima {
             vm: crate::linux_gpu::vm(),
             env,
             owned,
+            lost: OnceLock::new(),
         })
     }
 
@@ -642,6 +671,9 @@ impl Lima {
     /// keeps its writes, is stopped as it always was.
     #[must_use]
     pub fn stop(&self) -> Out {
+        if self.lost.get().is_some() {
+            return self.run(&["stop".into(), "--force".into(), self.vm.into()]);
+        }
         if self.vm == crate::linux_gpu::VM {
             let sync = ["timeout", "60", "sync"].map(String::from);
             let _ = self.shell("/", &sync, None);
@@ -687,6 +719,15 @@ impl Lima {
         if let Err(why) = self.owned.admit_vm(&self.owned.vm_dir()) {
             return Self::refused(why);
         }
+        if let Some(out) = self.after_loss() {
+            return out;
+        }
+        let since = SystemTime::now();
+        let out = self.shell_run(workdir, argv, stdin);
+        self.loss(since, out)
+    }
+
+    fn shell_run(&self, workdir: &str, argv: &[String], stdin: Option<&str>) -> Out {
         let t0 = Instant::now();
         let mut cmd = self.command();
         cmd.args(self.shell_argv(workdir, argv))
@@ -744,6 +785,15 @@ impl Lima {
         if let Err(why) = self.owned.admit_vm(&self.owned.vm_dir()) {
             return Self::refused(why);
         }
+        if let Some(out) = self.after_loss() {
+            return out;
+        }
+        let since = SystemTime::now();
+        let out = self.shell_streamed_run(workdir, argv, prefix);
+        self.loss(since, out)
+    }
+
+    fn shell_streamed_run(&self, workdir: &str, argv: &[String], prefix: &str) -> Out {
         let t0 = Instant::now();
         let mut merged = vec![
             "sh".to_string(),
@@ -809,6 +859,58 @@ impl Lima {
             not_started: None,
             lost: None,
         }
+    }
+
+    /// Why the GPU instance went down under a command of this run, when it did.
+    #[must_use]
+    pub fn lost(&self) -> Option<&str> {
+        self.lost.get().map(String::as_str)
+    }
+
+    /// A command after the GPU instance went down: lost with it, unrun.
+    fn after_loss(&self) -> Option<Out> {
+        let why = self.lost.get()?;
+        Some(Out {
+            code: None,
+            text: String::new(),
+            secs: 0.0,
+            signal: None,
+            not_started: None,
+            lost: Some(format!("{why} (earlier in this run; not run)")),
+        })
+    }
+
+    /// `out` of a command begun at `since`, lost when it was cut off because the GPU instance
+    /// went down (L-REALGPU's krunkit aborts, LR-3): its shell ended with no status or ssh's
+    /// 255, and lima no longer reads the VM running. Why is macOS's krunkit crash report, by
+    /// [`crate::linux_gpu::krunkit_lost`]; `limactl stop --force` then clears what the dead VM
+    /// left, so the next `lab linux --gpu up` boots it again.
+    fn loss(&self, since: SystemTime, mut out: Out) -> Out {
+        let cut = matches!(out.code, None | Some(255)) && out.signal.is_none();
+        if self.vm != crate::linux_gpu::VM || out.lost.is_some() || !cut {
+            return out;
+        }
+        let running = || match self.state() {
+            Ok(Some(vm)) => Some(vm.status == "Running"),
+            _ => None,
+        };
+        if !left_running(running, LOSS_WAIT, Duration::from_millis(250)) {
+            return out;
+        }
+        let reports = aterm_uds::account::home()
+            .unwrap_or_default()
+            .join(crate::linux_gpu::CRASH_REPORTS);
+        let why = crate::linux_gpu::krunkit_lost(&reports, since, crate::linux_gpu::REPORT_WAIT);
+        let cleared = self.run(&["stop".into(), "--force".into(), self.vm.into()]);
+        let after = if cleared.ok() {
+            format!(
+                "; the VM is down (`limactl stop --force` cleared it; `{LAB} linux --gpu up` boots it again)"
+            )
+        } else {
+            format!("; `limactl stop --force` failed: {}", cleared.tail(2))
+        };
+        out.lost = Some(self.lost.get_or_init(|| format!("{why}{after}")).clone());
+        out
     }
 
     /// Copy a guest file to this Mac.
@@ -907,18 +1009,20 @@ pub fn gib(n: u64) -> String {
 
 /// The one lane run of this Mac: a [`named_lock`] on [`lane_lock_path`], whose file names the
 /// run that holds it, released by `LOCK_UN` before the file closes (clippy.toml's flock rule).
-/// Taken for a boot ([`LaneLock::boot`]), it holds the boot's disk claim too, let go, and what
-/// the VM's directory took kept, when the lock is.
+/// Taken for a boot ([`LaneLock::boot`]), it holds the VM's turn to boot and the boot's disk
+/// claim too, let go, and what the VM's directory took kept, when the lock is.
 pub struct LaneLock {
     held: named_lock::NamedLock,
     /// The lane and its boot's disk claim ([`claim_boot_disk`]).
     disk: Option<(&'static str, atpkg::admit_disk::Admitted)>,
+    /// The VM's turn to boot ([`boot_turn_path`]), let go after the lane and the claim.
+    turn: Option<named_lock::NamedLock>,
 }
 
 impl Drop for LaneLock {
     fn drop(&mut self) {
         if let Some((lane, held)) = self.disk.take() {
-            boot_disk_done(lane, held);
+            boot_disk_done(lane, held, crate::vm_admit::granted());
         }
     }
 }
@@ -962,6 +1066,10 @@ pub fn run_verb(lane: &str) -> String {
         .map_or_else(|| format!("lab {lane}"), |(verb, ..)| verb.clone())
 }
 
+/// The remedy beside what to free that a lane's claim refused as UNMET names: the lane's own
+/// `--admit now`, which takes the claim at once.
+pub const AT_ONCE: &str = "or boot at once by adding `--admit now` before the verb";
+
 /// How this run admits its boot's disk and its VM (`--admit wait|now`, [`name_run`]): waiting,
 /// unless the dispatch named `now`.
 #[must_use]
@@ -977,38 +1085,74 @@ impl LaneLock {
         self.held.waited()
     }
 
-    /// Take the lane for a run that boots the VM: the boot's disk claimed first
-    /// ([`claim_boot_disk`]), so no run holds the lane while it waits for disk and none that
-    /// holds disk waits behind one that does, then the lane ([`LaneLock::take`]). The claim is
-    /// held, and the VM's directory measured, until the lock is let go at the run's end. A lima
-    /// lane with no `limactl` is NOT RUN before any wait.
+    /// Name the lane's VM's processes `pids` (its host agent or helper, QEMU, the process holding
+    /// its disk: [`crate::vm_admit::vm_procs`]) in the lane's record, so a run waiting for the
+    /// lane reads the guest's work with this run's own (`named_lock::NamedLock::credit`): launchd
+    /// parents them, and this run's own processes while its guest works are an ssh client that
+    /// moves only when the guest prints, or a relay in this process. A record that cannot be
+    /// written is said, and the run goes on.
+    pub fn credit(&mut self, pids: &[u32]) {
+        if let Err(e) = self.held.credit(pids) {
+            eprintln!(
+                "aterm-lab: the lane's record does not name the VM's processes ({e}): a run \
+                 waiting for the lane reads this run's own processes alone"
+            );
+        }
+    }
+
+    /// Take the lane for a run that boots the VM: the VM's turn to boot first
+    /// ([`LaneLock::turn`]), then the boot's disk claimed ([`claim_boot_disk`]), so no run holds
+    /// the lane while it waits for disk and none that holds disk waits behind one that does, then
+    /// the lane ([`LaneLock::take`]). The claim is held, and the VM's directory measured, until
+    /// the lock is let go at the run's end. A lima lane with no `limactl` is NOT RUN before any
+    /// wait.
     /// # Errors
-    /// As [`claim_boot_disk`] and [`LaneLock::take`], and lima's absence.
+    /// As [`LaneLock::turn`], [`claim_boot_disk`] and [`LaneLock::take`], and lima's absence.
     pub fn boot() -> Result<LaneLock, Fail> {
         let kind = crate::linux_driver::kind()?;
         if kind == Kind::Lima {
             Lima::find()?;
         }
+        let path = LaneLock::path()?;
         LaneLock::boot_with(
             "linux",
+            || LaneLock::turn(&path, "linux"),
             || claim_boot_disk("linux", linux_boot_run(kind)?),
-            LaneLock::take,
+            || LaneLock::at(&path, "linux"),
         )
     }
 
-    /// `lane` taken for a boot: `claim` claims the boot's disk, and only then does `take` take
-    /// the lane, the lock holding the claim until it is let go. A claim refused takes no lane.
+    /// `lane` taken for a boot: `turn` takes the VM's turn to boot, `claim` then claims the
+    /// boot's disk, and only then does `take` take the lane, the lock holding the turn and the
+    /// claim until it is let go. Runs of one VM that queue for it so claim its disk one at a
+    /// time, each once the run before it is over: one VM's boots write one directory in turn, and
+    /// a run queued behind another claimed the same room again (2026-10-30: two runs of the
+    /// Windows lane held 35 and 32.5 GiB for its one 33.8 GiB disk). A turn refused claims
+    /// nothing; a claim refused takes no lane.
     /// # Errors
-    /// `claim`'s or `take`'s.
+    /// `turn`'s, `claim`'s or `take`'s.
     pub(crate) fn boot_with(
         lane: &'static str,
+        turn: impl FnOnce() -> Result<named_lock::NamedLock, Fail>,
         claim: impl FnOnce() -> Result<Option<atpkg::admit_disk::Admitted>, Fail>,
         take: impl FnOnce() -> Result<LaneLock, Fail>,
     ) -> Result<LaneLock, Fail> {
+        let turn = turn()?;
         let disk = claim()?;
         let mut lock = take()?;
         lock.disk = disk.map(|d| (lane, d));
+        lock.turn = Some(turn);
         Ok(lock)
+    }
+
+    /// The lane lock's path for this run's driver.
+    /// # Errors
+    /// The driver's, or where it keeps its VM cannot be read.
+    fn path() -> Result<PathBuf, Fail> {
+        Ok(match crate::linux_driver::kind()? {
+            Kind::Lima => lima_namespace()?.lock_path(),
+            Kind::Vz => crate::linux_vz_driver::lane_lock_path(&crate::linux_vz_driver::root()?),
+        })
     }
 
     /// Take the lane, waiting for the run that holds it ([`LaneLock::at`]).
@@ -1016,11 +1160,29 @@ impl LaneLock {
     /// `--no-wait` and another run holds it (NOT RUN, naming it), an interrupt while waiting, or
     /// the lock file cannot be made.
     pub fn take() -> Result<LaneLock, Fail> {
-        let path = match crate::linux_driver::kind()? {
-            Kind::Lima => lima_namespace()?.lock_path(),
-            Kind::Vz => crate::linux_vz_driver::lane_lock_path(&crate::linux_vz_driver::root()?),
-        };
-        LaneLock::at(&path, "linux")
+        LaneLock::at(&LaneLock::path()?, "linux")
+    }
+
+    /// Take the turn to boot the VM whose lane lock is at `lane_lock` ([`boot_turn_path`]) as
+    /// this run, as [`LaneLock::at`] takes the lane: a boot of the VM that another run holds is
+    /// waited for, or NOT RUN under `--no-wait`.
+    /// # Errors
+    /// [`LaneLock::at`]'s, for the turn.
+    pub fn turn(lane_lock: &Path, lane: &str) -> Result<named_lock::NamedLock, Fail> {
+        let (verb, wait) = RUN
+            .get()
+            .map(|r| (r.0.clone(), r.1))
+            .unwrap_or_else(|| (format!("lab {lane}"), Wait::Block));
+        let me = named_lock::Holder::me(&verb, Path::new(&repo()));
+        LaneLock::named(
+            &boot_turn_path(lane_lock),
+            lane,
+            TURN,
+            &me,
+            wait,
+            &mut |line| println!("{line}"),
+            &crate::stop::check,
+        )
     }
 
     /// Take the lane lock at `path` for `lane` as this run ([`name_run`]; `lab <lane>`, waiting,
@@ -1059,6 +1221,26 @@ impl LaneLock {
         say: &mut dyn FnMut(&str),
         stopped: &dyn Fn() -> Result<(), crate::stop::Stopped>,
     ) -> Result<LaneLock, Fail> {
+        LaneLock::named(path, lane, "the lane", me, wait, say, stopped).map(|held| LaneLock {
+            held,
+            disk: None,
+            turn: None,
+        })
+    }
+
+    /// [`LaneLock::at_as`] for the lock at `path`, which its holder's lines name as `holds`
+    /// (`the lane`, or [`TURN`]).
+    /// # Errors
+    /// As [`LaneLock::at_as`].
+    fn named(
+        path: &Path,
+        lane: &str,
+        holds: &str,
+        me: &named_lock::Holder,
+        wait: Wait,
+        say: &mut dyn FnMut(&str),
+        stopped: &dyn Fn() -> Result<(), crate::stop::Stopped>,
+    ) -> Result<named_lock::NamedLock, Fail> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
                 .map_err(|e| Fail::die(format!("{}: {e}", dir.display())))?;
@@ -1070,7 +1252,7 @@ impl LaneLock {
             &mut |holder, waited| {
                 say(&if waited < named_lock::SAY_EVERY {
                     format!(
-                        "{lane}: waiting for {}, which holds the lane ({})",
+                        "{lane}: waiting for {}, which holds {holds} ({})",
                         holder_name(holder),
                         path.display()
                     )
@@ -1085,9 +1267,9 @@ impl LaneLock {
             &|| stopped().is_err(),
         );
         match taken {
-            Ok(held) => Ok(LaneLock { held, disk: None }),
+            Ok(held) => Ok(held),
             Err(Refused::Held(holder)) => Err(not_run(format!(
-                "{} holds the lane ({}); --no-wait does not wait for it",
+                "{} holds {holds} ({}); --no-wait does not wait for it",
                 holder_name(holder.as_ref()),
                 path.display()
             ))),
@@ -1096,7 +1278,7 @@ impl LaneLock {
                     .inspect(|sig| crate::stop::note(*sig))
                     .or_else(|| stopped().err().map(|s| s.0)),
                 ..not_run(format!(
-                    "interrupted while waiting for {}, which holds the lane ({}); this run took \
+                    "interrupted while waiting for {}, which holds {holds} ({}); this run took \
                      no part of it",
                     holder_name(holder.as_ref()),
                     path.display()
@@ -1125,6 +1307,23 @@ fn holder_name(holder: Option<&named_lock::Holder>) -> String {
 #[must_use]
 pub fn lane_lock_path(vm: &str, home: &Path) -> PathBuf {
     home.join(format!(".{vm}.lane.lock"))
+}
+
+/// What a run waiting for [`boot_turn_path`]'s lock says its holder holds.
+const TURN: &str = "the VM's turn to boot, whose disk one run claims at a time";
+
+/// The lock a boot of the VM whose lane lock is at `lane_lock` holds from before it claims its
+/// disk until its run ends ([`LaneLock::boot_with`]): beside it, `boot` in place of its `lane`
+/// (`.aterm-linux.boot.lock`, the Windows lane's `.boot.lock`).
+#[must_use]
+pub fn boot_turn_path(lane_lock: &Path) -> PathBuf {
+    let name = lane_lock
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    lane_lock.with_file_name(
+        name.strip_suffix("lane.lock")
+            .map_or_else(|| format!("{name}.boot"), |stem| format!("{stem}boot.lock")),
+    )
 }
 
 fn lima_namespace() -> Result<owned::Namespace, Fail> {
@@ -1341,6 +1540,7 @@ pub fn boot_run(
         cold,
         on: base.to_path_buf(),
         stuck_ends: None,
+        scratch: false,
         machine: None,
     }
 }
@@ -1368,7 +1568,8 @@ fn linux_boot_run(kind: Kind) -> Result<atpkg::admit_disk::Run, Fail> {
 /// the VM boots without a claim.
 ///
 /// # Errors
-/// NOT RUN: the need is more than the volume holds above its floor.
+/// NOT RUN: the need is more than the volume holds above its floor, or than it has free above its
+/// floor once the relief ran, which no wait admits.
 pub fn claim_boot_disk(
     lane: &str,
     run: atpkg::admit_disk::Run,
@@ -1407,6 +1608,9 @@ fn claim_boot_disk_with(
             "{why}; the VM can never boot there. Fix: free room on that volume, or move the VM \
              to a larger one"
         ))),
+        Err(e @ atpkg::admit_disk::Error::Unmet { .. }) => Err(not_run(format!(
+            "{lane}: the boot's disk claim was refused: {e}, {AT_ONCE}; this run booted nothing"
+        ))),
         Err(e @ atpkg::admit_disk::Error::Stopped { signal, .. }) => Err(Fail {
             stopped: signal.inspect(|sig| crate::stop::note(*sig)),
             ..not_run(format!(
@@ -1423,9 +1627,16 @@ fn claim_boot_disk_with(
 }
 
 /// A boot's claim let go at its run's end, with what the VM's directory took kept for the next
-/// boot and said.
-fn boot_disk_done(lane: &str, held: atpkg::admit_disk::Admitted) {
+/// boot and said where the run's VM was admitted (`ran`). A run whose VM was never admitted (an
+/// interrupt or a NOT RUN ended its wait) booted nothing, so what it took is no boot's and is not
+/// kept: kept, a first run's few KiB would be the next boot's whole claim.
+fn boot_disk_done(lane: &str, held: atpkg::admit_disk::Admitted, ran: bool) {
     let claimed = held.estimate;
+    if !ran {
+        drop(held);
+        println!("{lane}: disk: claimed {claimed}; this run booted nothing, so none of it is kept");
+        return;
+    }
     let took = held.finish();
     println!(
         "{lane}: disk: claimed {claimed}; the VM's directory grew by {} this run (it held {} at \
@@ -1459,15 +1670,16 @@ fn guest_path_var(guest: &Driver, var: &str) -> Option<String> {
 }
 
 /// Create, mount, boot, and provision the lane VM as needed, through this run's driver
-/// ([`crate::linux_driver::kind`]).
+/// ([`crate::linux_driver::kind`]), under `lane`, which this run holds: once the VM is up, its
+/// processes are named in the lane's record ([`LaneLock::credit`]), before any guest step.
 /// # Errors
 /// NOT RUN: no lima (or the vz arm's gates), or the VM could not be made, booted or
 /// provisioned.
-pub fn bring_up() -> Result<Up, Fail> {
+pub fn bring_up(lane: &mut LaneLock) -> Result<Up, Fail> {
     let repo = repo();
     let (guest, booted_here, timings, admitted, booter) = match crate::linux_driver::kind()? {
-        Kind::Lima => bring_up_lima(&repo)?,
-        Kind::Vz => bring_up_vz(&repo)?,
+        Kind::Lima => bring_up_lima(&repo, lane)?,
+        Kind::Vz => bring_up_vz(&repo, lane)?,
     };
     finish_bring_up(guest, booted_here, timings, &repo, admitted, booter)
 }
@@ -1494,11 +1706,14 @@ pub fn booter_path() -> Result<PathBuf, Fail> {
 
 /// The vz arm's boot: [`crate::linux_vz_driver::open`], and where that boot is a bake's,
 /// the bake (§4: provisioned through the agent, finished, powered off and sealed), then the
-/// bring-up again on a clone of the sealed disk.
-fn bring_up_vz(repo: &str) -> Result<Brought, Fail> {
+/// bring-up again on a clone of the sealed disk, under the claim the bake was admitted with;
+/// each VM opened is named in `lane`'s record.
+fn bring_up_vz(repo: &str, lane: &mut LaneLock) -> Result<Brought, Fail> {
     let mut timings = Vec::new();
+    let mut held = None;
     for _ in 0..2 {
-        let opened = crate::linux_vz_driver::open(Path::new(repo))?;
+        let opened = crate::linux_vz_driver::open(Path::new(repo), held.take())?;
+        lane.credit(&opened.procs);
         timings.extend(opened.steps.iter().map(|(n, s)| Step::done(n, *s)));
         let Some(partial) = opened.bake else {
             return Ok((
@@ -1529,6 +1744,7 @@ fn bring_up_vz(repo: &str) -> Result<Brought, Fail> {
         }
         let Up {
             guest: Driver::Vz(vz),
+            admitted,
             ..
         } = up
         else {
@@ -1537,6 +1753,7 @@ fn bring_up_vz(repo: &str) -> Result<Brought, Fail> {
         let sealed = crate::linux_vz_driver::finish_bake(*vz, partial)?;
         println!("linux: baked {}", sealed.display());
         timings.push(Step::done("bake", t0.elapsed().as_secs_f64()));
+        held = Some(admitted);
     }
     Err(not_run(
         "the bake sealed its disk, but the bring-up after it found no baked disk",
@@ -1545,8 +1762,9 @@ fn bring_up_vz(repo: &str) -> Result<Brought, Fail> {
 
 /// lima's `create`, `edit` (the mounts), and `start`, behind the driver: a running VM a dead
 /// one-shot run left is stopped first, as `down` stops it, and a boot is admitted
-/// ([`crate::vm_admit`]) and recorded before `start`.
-fn bring_up_lima(repo: &str) -> Result<Brought, Fail> {
+/// ([`crate::vm_admit`]) and recorded before `start`; the VM up, its processes are named in
+/// `lane`'s record.
+fn bring_up_lima(repo: &str, lane: &mut LaneLock) -> Result<Brought, Fail> {
     let mut lima = Lima::find()?;
     let vm_name = lima.vm;
     let booter = booter_path()?;
@@ -1625,12 +1843,75 @@ fn bring_up_lima(repo: &str) -> Result<Brought, Fail> {
         let out = lima.run(&["start".into(), "--tty=false".into(), vm_name.into()]);
         timings.push(Step::done("boot", out.secs));
         if !out.ok() {
-            return Err(not_run(format!("limactl start failed: {}", out.tail(8))));
+            let running = matches!(lima.state(), Ok(Some(vm)) if vm.status == "Running");
+            let revived = after_failed_start(
+                running,
+                &mut |script| lima.shell("/", &["sh".into(), "-c".into(), script.into()], None),
+                &mut || lima.run(&["stop".into(), "--force".into(), vm_name.into()]),
+            );
+            match revived {
+                Ok(line) => println!("linux: {line}"),
+                Err(after) => {
+                    if running {
+                        crate::vm_admit::clear(&booter);
+                    }
+                    return Err(not_run(format!(
+                        "limactl start failed: {}{after}",
+                        out.tail(8)
+                    )));
+                }
+            }
         }
-        admitted.credit("linux", &lima_procs(&vm.dir));
+    }
+    let procs = lima_procs(&vm.dir);
+    if booted_here {
+        admitted.credit("linux", &procs);
         crate::vm_admit::record_vm(recorded.as_deref(), lima_agent(&vm.dir));
     }
+    lane.credit(&procs);
     Ok((Driver::Lima(lima), booted_here, timings, admitted, recorded))
+}
+
+/// lima's guest agent, which a boot installs from its cidata and systemd runs.
+const GUEST_AGENT: &str = "lima-guestagent";
+
+/// What a run does with a VM `limactl start` failed on (`running`: lima reads it running), so a
+/// failed start never leaves a VM up that nothing uses. LR-3: a VM that went down with its
+/// writes unflushed (a krunkit abort) keeps a guest agent binary that is garbage, so the next
+/// boot's systemd fails it (`Exec format error`) until it stops retrying, before lima's boot
+/// scripts install the agent afresh; `limactl start` then ends degraded on a guest that is
+/// otherwise up. That unit is reset and restarted (`shell` runs a script in the guest) and the
+/// boot goes on, saying so; any other failure stops the VM (`stop`). `Err` is what the NOT RUN
+/// adds after limactl's own words.
+fn after_failed_start(
+    running: bool,
+    shell: &mut dyn FnMut(&str) -> Out,
+    stop: &mut dyn FnMut() -> Out,
+) -> Result<String, String> {
+    if !running {
+        return Err(String::new());
+    }
+    if shell(&format!("systemctl is-failed --quiet {GUEST_AGENT}")).ok() {
+        let restarted = shell(&format!(
+            "sudo systemctl reset-failed {GUEST_AGENT} && sudo systemctl restart {GUEST_AGENT} \
+             && systemctl is-active --quiet {GUEST_AGENT}"
+        ));
+        if restarted.ok() {
+            return Ok(format!(
+                "lima's guest agent had failed at boot (as after a loss cut the last boot's \
+                 writes off); {GUEST_AGENT} reset and restarted, the boot goes on"
+            ));
+        }
+    }
+    let stopped = stop();
+    Err(if stopped.ok() {
+        "; the VM it left running is stopped (`limactl stop --force`)".to_string()
+    } else {
+        format!(
+            "; `limactl stop --force` of the VM it left running failed: {}",
+            stopped.tail(2)
+        )
+    })
 }
 
 /// Both arms' rest of a bring-up: the guest's HOME and `XDG_RUNTIME_DIR`, provisioning in
@@ -1905,8 +2186,8 @@ fn provision(up: &Up) -> Result<Option<f64>, Fail> {
 }
 
 fn cmd_up() -> Res {
-    let _lock = LaneLock::boot()?;
-    let up = bring_up()?;
+    let mut lane = LaneLock::boot()?;
+    let up = bring_up(&mut lane)?;
     for step in &up.timings {
         match &step.failed {
             None => println!("linux: {} {:.1} s", step.name, step.secs),
@@ -2095,8 +2376,8 @@ pub fn parse_exec(args: &[String]) -> Result<ExecArgs, Fail> {
 fn cmd_exec(args: &[String]) -> Res {
     let ask = parse_exec(args)?;
     crate::linux_gpu::arches(vec![ask.arch], "exec")?;
-    let _lock = LaneLock::boot()?;
-    let up = bring_up()?;
+    let mut lane = LaneLock::boot()?;
+    let up = bring_up(&mut lane)?;
     let mut env = up.cargo_env(ask.arch, &format!("{}/target", up.lane_dir()), true);
     env.push((
         "DBUS_SESSION_BUS_ADDRESS".into(),
@@ -2299,8 +2580,8 @@ pub fn start_weston_capturing_with(up: &Up, renderer: &str) -> Result<String, St
 }
 
 fn cmd_clean() -> Res {
-    let _lock = LaneLock::boot()?;
-    let up = bring_up()?;
+    let mut lane = LaneLock::boot()?;
+    let up = bring_up(&mut lane)?;
     let cleaned = up.clean_build();
     let df = up.sh(&[
         "df".into(),
@@ -2342,6 +2623,26 @@ fn cmd_destroy() -> Res {
     }
     println!("linux: {} deleted with its disk", lima.vm);
     Ok(0)
+}
+
+/// A run on the scripted guest `guest`, for the lane's tests.
+#[cfg(test)]
+pub(crate) fn fake_up(guest: &crate::linux_driver::fake::Guest, booted_here: bool) -> Up {
+    Up {
+        guest: Driver::Fake(guest.clone()),
+        home: "/home/u.guest".into(),
+        runtime: "/run/user/501".into(),
+        build_dir: "/home/u.guest/aterm-lane".into(),
+        booted_here,
+        config: OnceLock::new(),
+        timings: Vec::new(),
+        weston_renderer: "gl",
+        admitted: crate::vm_admit::Admitted {
+            claim: None,
+            jobs: 3,
+        },
+        booter: None,
+    }
 }
 
 /// The most of one stream of a guest run [`read_lines`] reads. A verbose test run reaches tens of
@@ -2395,6 +2696,28 @@ fn read_lines(from: impl Read, limit: usize, mut each: impl FnMut(&str)) -> Read
 
 #[cfg(test)]
 mod tests {
+    /// LR-3's race: a VM lima still reads running when the cut command returns is down once it
+    /// reads it so within the wait; one that stays running, or that lima cannot read, is not.
+    #[test]
+    fn a_cut_command_waits_for_lima_to_read_the_vm_down() {
+        use std::time::Duration;
+        let pace = Duration::from_millis(1);
+        let mut readings = [Some(true), Some(true), Some(false)].into_iter();
+        let mut asked = 0;
+        let down = super::left_running(
+            || {
+                asked += 1;
+                readings.next().flatten()
+            },
+            Duration::from_secs(60),
+            pace,
+        );
+        assert!(down);
+        assert_eq!(asked, 3, "it asked until lima read the VM down");
+        assert!(!super::left_running(|| Some(true), Duration::ZERO, pace));
+        assert!(!super::left_running(|| None, Duration::from_secs(60), pace));
+    }
+
     /// A stream past the limit stops there, keeps only a prefix, and says it was cut.
     #[test]
     fn a_stream_past_the_limit_stops_and_says_it_was_cut() {
@@ -2432,6 +2755,7 @@ mod tests {
             vm: VM,
             env: Vec::new(),
             owned,
+            lost: OnceLock::new(),
         };
         for verb in ["list", "create", "stop", "start", "edit", "delete", "copy"] {
             let out = lima.run(&[verb.into(), VM.into()]);
@@ -2829,10 +3153,11 @@ mod tests {
         assert_eq!(f.msg.as_deref(), Some("NOT RUN: no limactl"));
     }
 
-    /// A boot claims its disk before it takes the lane, so a run waiting for disk holds no lane
-    /// that a run holding disk would wait for. With the lane held by another run, the claim is
-    /// made first and only then is the lane found held. Negative control: a claim the volume can
-    /// never hold is NOT RUN, and the lane is never asked for.
+    /// A boot takes the VM's turn, then claims its disk, then takes the lane, so a run waiting
+    /// for disk holds no lane that a run holding disk would wait for. With the lane held by
+    /// another run, the turn and the claim are taken first and only then is the lane found held.
+    /// Negative control: a claim the volume can never hold is NOT RUN, and the lane is never
+    /// asked for.
     #[test]
     fn a_boot_claims_its_disk_before_it_takes_the_lane() {
         let dir = aterm_tempfile::Builder::new()
@@ -2840,13 +3165,19 @@ mod tests {
             .tempdir()
             .expect("a scratch dir");
         let path = dir.path().join(".aterm-linux.lane.lock");
+        let turn = boot_turn_path(&path);
         let holder = named_lock::Holder::me("lab linux proof", Path::new("/checkouts/holder"));
         let _held = LaneLock::at_as(&path, "linux", &holder, Wait::No, &mut |_| {}, &go_on)
             .unwrap_or_else(|f| panic!("the lane is free: {:?}", f.msg));
         let me = named_lock::Holder::me("lab linux exec", Path::new("/checkouts/waiter"));
         let order = std::cell::RefCell::new(Vec::new());
+        let take_turn = || {
+            order.borrow_mut().push("turn");
+            LaneLock::named(&turn, "linux", TURN, &me, Wait::No, &mut |_| {}, &go_on)
+        };
         let refused = LaneLock::boot_with(
             "linux",
+            take_turn,
             || {
                 order.borrow_mut().push("claim");
                 Ok(None)
@@ -2858,11 +3189,12 @@ mod tests {
         )
         .err()
         .expect("the lane is held");
-        assert_eq!(*order.borrow(), ["claim", "lane"]);
+        assert_eq!(*order.borrow(), ["turn", "claim", "lane"]);
         assert_eq!(refused.code, NOT_RUN, "{:?}", refused.msg);
         order.borrow_mut().clear();
         let never = LaneLock::boot_with(
             "linux",
+            take_turn,
             || {
                 order.borrow_mut().push("claim");
                 Err(not_run(
@@ -2876,10 +3208,103 @@ mod tests {
         )
         .err()
         .expect("never fits");
-        assert_eq!(*order.borrow(), ["claim"], "no lane asked for");
+        assert_eq!(*order.borrow(), ["turn", "claim"], "no lane asked for");
         assert!(
             never.msg.is_some_and(|m| m.contains("can never boot")),
             "the claim's NOT RUN"
+        );
+    }
+
+    /// F2 (2026-10-30: two queued runs of the Windows lane held 35 and 32.5 GiB for its one
+    /// 33.8 GiB disk): a run queued behind another run's boot of the same VM claims no disk until
+    /// that run is over. It waits for the VM's turn, naming its holder, with its claim not yet
+    /// made, and makes it once the first run lets its lock go. `--no-wait` is NOT RUN at once,
+    /// naming the holder, with nothing claimed. Negative control: a boot of another VM, whose
+    /// turn is its own, claims at once beside it.
+    #[test]
+    fn queued_boots_of_one_vm_claim_its_disk_one_at_a_time() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("lab-lane-turn-")
+            .tempdir()
+            .expect("a scratch dir");
+        let lane = dir.path().join(".aterm-linux.lane.lock");
+        assert_eq!(
+            boot_turn_path(&lane),
+            dir.path().join(".aterm-linux.boot.lock")
+        );
+        assert_eq!(
+            boot_turn_path(Path::new("/h/windows-lane/.lane.lock")),
+            Path::new("/h/windows-lane/.boot.lock")
+        );
+        let claims = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&str>::new()));
+        let boot = |lane: &Path, who: &'static str, wait: Wait, say: &mut dyn FnMut(&str)| {
+            let me = named_lock::Holder::me(&format!("lab linux {who}"), Path::new("/checkouts"));
+            let claims = std::sync::Arc::clone(&claims);
+            LaneLock::boot_with(
+                "linux",
+                || LaneLock::named(&boot_turn_path(lane), "linux", TURN, &me, wait, say, &go_on),
+                move || {
+                    claims.lock().expect("the claims").push(who);
+                    Ok(None)
+                },
+                || LaneLock::at_as(lane, "linux", &me, wait, &mut |_| {}, &go_on),
+            )
+        };
+        let first = boot(&lane, "first", Wait::No, &mut |_| {})
+            .unwrap_or_else(|f| panic!("the VM is free: {:?}", f.msg));
+        let refused = boot(&lane, "now", Wait::No, &mut |_| {})
+            .err()
+            .expect("--no-wait does not wait for the VM's turn");
+        let why = refused.msg.unwrap_or_default();
+        assert_eq!(refused.code, NOT_RUN, "{why}");
+        assert!(
+            why.contains("(lab linux first, /checkouts, since ")
+                && why.contains("holds the VM's turn to boot"),
+            "{why}"
+        );
+        let other = boot(
+            &dir.path().join(".aterm-linux-gpu.lane.lock"),
+            "other",
+            Wait::No,
+            &mut |_| {},
+        )
+        .unwrap_or_else(|f| panic!("another VM's turn is its own: {:?}", f.msg));
+        assert_eq!(*claims.lock().expect("the claims"), ["first", "other"]);
+        drop(other);
+
+        let (waiting, heard) = std::sync::mpsc::channel();
+        let (booted, done) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let held = boot(&lane, "queued", Wait::Block, &mut |line| {
+                    let _ = waiting.send(line.to_string());
+                });
+                let _ = booted.send(held.map(drop).map_err(|f| f.msg));
+            });
+            // The one-minute hang detectors: a held turn is named as its wait starts, and is
+            // the waiter's once its holder lets it go.
+            let line = heard
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the queued run waits for the VM's turn");
+            assert!(
+                line.starts_with("linux: waiting for pid ")
+                    && line.contains("(lab linux first, /checkouts, since ")
+                    && line.contains("which holds the VM's turn to boot"),
+                "{line}"
+            );
+            assert_eq!(
+                *claims.lock().expect("the claims"),
+                ["first", "other"],
+                "the queued run claims nothing while the first holds the VM"
+            );
+            drop(first);
+            done.recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the queued run boots once the first is over")
+                .expect("its turn, its claim and the lane");
+        });
+        assert_eq!(
+            *claims.lock().expect("the claims"),
+            ["first", "other", "queued"]
         );
     }
 
@@ -2921,6 +3346,94 @@ mod tests {
             )))
         });
         assert!(matches!(unclaimed, Ok(None)));
+    }
+
+    /// A run whose VM was never admitted lets its boot's disk claim go and keeps nothing it took,
+    /// so the next boot still claims the cold budget less what the VM's directory holds; its
+    /// negative control, a run whose VM was admitted, keeps what it took, and the next boot
+    /// claims that. Either way the claim leaves the ledger.
+    #[test]
+    fn a_run_that_booted_nothing_keeps_no_boot_footprint() {
+        use aterm_capacity::floor::GIB;
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let ledger = aterm_capacity::Ledger::at(dir.path().join("ledger"));
+        let mut reading = aterm_capacity::Reading::of_gib(48, 40, 14);
+        reading.volume = Some(aterm_capacity::Volume {
+            mount: dir.path().to_path_buf(),
+            total: 400 * GIB,
+            free: 300 * GIB,
+            floor: 4 * GIB,
+            room: 2 * GIB,
+        });
+        let machine = aterm_capacity::Fixed::new(reading);
+        let vm = dir.path().join(VM);
+        std::fs::create_dir_all(&vm).expect("the VM's directory");
+        let record = dir.path().join(".aterm-linux.boot-footprint.json");
+        let run = boot_run(
+            "linux",
+            dir.path(),
+            vm.clone(),
+            record.clone(),
+            BOOT_COLD_DISK,
+        );
+        let admit = || {
+            let mut relief = atpkg::admit_disk::Reclaim::of(
+                Box::new(|_, _| panic!("a volume with room is relieved of nothing")),
+                Box::new(|_, _, _| panic!("a volume with room asks the window nothing")),
+                Box::new(|_, _| Vec::new()),
+            );
+            atpkg::admit_disk::admit_on(
+                run.clone(),
+                &ledger,
+                &machine,
+                Admit::Wait,
+                aterm_capacity::Pace::default(),
+                &mut relief,
+                &mut |_| {},
+            )
+            .expect("room on the volume")
+        };
+        let claims = || ledger.list().expect("the ledger").len();
+        let mut wrote = 0u32;
+        let mut write = || {
+            wrote += 1;
+            std::fs::write(vm.join(format!("disk-{wrote}")), vec![1u8; 1 << 20]).expect("write");
+        };
+
+        let first = admit();
+        assert_eq!(
+            (first.estimate.runs, claims()),
+            (0, 1),
+            "the cold budget, claimed"
+        );
+        write();
+        boot_disk_done("linux", first, false);
+        assert_eq!(claims(), 0, "the claim was let go");
+        assert!(
+            !record.exists(),
+            "a run that booted nothing keeps no footprint"
+        );
+        let second = admit();
+        assert_eq!(
+            second.estimate.runs, 0,
+            "the next boot claims the cold budget again"
+        );
+        assert!(
+            second.estimate.bytes > BOOT_COLD_DISK - GIB,
+            "{}",
+            second.estimate
+        );
+
+        write();
+        boot_disk_done("linux", second, true);
+        assert_eq!(claims(), 0, "the claim was let go");
+        let third = admit();
+        assert_eq!(
+            third.estimate.runs, 1,
+            "a run whose VM was admitted keeps what it took"
+        );
+        assert!(third.estimate.bytes < GIB, "{}", third.estimate);
+        boot_disk_done("linux", third, true);
     }
 
     /// Set, the test binary is [`standin_boot_disk_claim_interrupted`].
@@ -2997,21 +3510,7 @@ mod tests {
     use crate::linux_driver::fake::{Answer, Call, Guest};
 
     fn up_on(guest: &Guest, booted_here: bool) -> Up {
-        Up {
-            guest: Driver::Fake(guest.clone()),
-            home: "/home/u.guest".into(),
-            runtime: "/run/user/501".into(),
-            build_dir: "/home/u.guest/aterm-lane".into(),
-            booted_here,
-            config: OnceLock::new(),
-            timings: Vec::new(),
-            weston_renderer: "gl",
-            admitted: crate::vm_admit::Admitted {
-                claim: None,
-                jobs: 3,
-            },
-            booter: None,
-        }
+        super::fake_up(guest, booted_here)
     }
 
     /// The guest's `cargo` runs as many jobs as cores this run was admitted, on every arch, on
@@ -3163,6 +3662,53 @@ mod tests {
             not_started: None,
             lost: None,
         }
+    }
+
+    /// A start that failed on a VM lima reads running: a guest agent systemd gave up on (as
+    /// after a krunkit abort, measured 2026-10-29) is reset and restarted and the boot goes on;
+    /// anything else stops the VM, so the failed start leaves nothing up.
+    #[test]
+    fn a_failed_start_revives_a_failed_guest_agent_or_stops_the_vm() {
+        let run = |running: bool, failed: bool, restarts: bool| {
+            let (mut scripts, mut stops) = (Vec::new(), 0);
+            let result = after_failed_start(
+                running,
+                &mut |script| {
+                    scripts.push(script.to_string());
+                    let ok = if script.starts_with("systemctl is-failed") {
+                        failed
+                    } else {
+                        restarts
+                    };
+                    out(Some(i32::from(!ok)), None)
+                },
+                &mut || {
+                    stops += 1;
+                    out(Some(0), None)
+                },
+            );
+            (result, scripts.len(), stops)
+        };
+        let (revived, scripts, stops) = run(true, true, true);
+        assert!(
+            revived
+                .as_ref()
+                .is_ok_and(|l| l.contains("reset and restarted")),
+            "{revived:?}"
+        );
+        assert_eq!((scripts, stops), (2, 0), "revived, the VM stays up");
+        // The negative controls: an agent that did not fail, or would not restart, and a VM
+        // that is not running.
+        let (stopped, scripts, stops) = run(true, false, true);
+        assert!(
+            stopped.as_ref().is_err_and(|e| e.contains("is stopped")),
+            "{stopped:?}"
+        );
+        assert_eq!((scripts, stops), (1, 1));
+        let (stopped, scripts, stops) = run(true, true, false);
+        assert!(stopped.is_err());
+        assert_eq!((scripts, stops), (2, 1));
+        assert_eq!(run(false, true, true), (Err(String::new()), 0, 0));
     }
 
     #[test]

@@ -10,7 +10,7 @@ use aterm_json::Value;
 use crate::harness::accounts::Sample;
 use crate::harness::codex_rollout::{
     Conversation, META_BYTES, Prefix, Streamed, TurnReader, first_line_into, first_line_of,
-    rollouts_by_write, stamp_ms, stream_open_ends_ref, tail_after_file,
+    first_line_read, rollouts_by_write, stamp_ms, stream_open_ends_ref, tail_after_file,
 };
 use crate::harness::profile::{AccountKey, Word};
 
@@ -20,7 +20,8 @@ pub const TAIL_BYTES: u64 = 512 * 1024;
 /// How old a usage reading may be and still be read.
 pub const FRESH_S: i64 = 6 * 3600;
 
-/// How far back from a rollout's end its readings are looked for ([`rollout_readings`]).
+/// How far into a rollout the end of a copied prefix is looked for, from its first byte
+/// ([`rollout_readings`]). Its readings are looked for [`TAIL_BYTES`] back from its end.
 pub const CONTEXT_REACH: u64 = 64 * 1024 * 1024;
 
 /// How many of the newest rollouts are read for a usage reading before the search gives up.
@@ -247,14 +248,32 @@ pub fn opening_account(first_line: &str) -> Option<AccountKey> {
     )
 }
 
+/// A rollout could not be opened or read: a look may find otherwise with nothing about it changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadFailed;
+
+/// Where a legacy fork's own lines begin, past its copied prefix ([`copy_end_and_account`]): `own`,
+/// or the end of a file read whole that holds none. `None` where the prefix runs past the reach,
+/// which an append cannot change, since it leaves the bytes in reach as they are.
+fn own_lines_from(
+    own: Option<u64>,
+    read: &crate::harness::codex_rollout::RolloutRead,
+    from: u64,
+) -> Result<Option<u64>, ReadFailed> {
+    if own.is_none() && read.failed {
+        return Err(ReadFailed);
+    }
+    Ok(own.or_else(|| read.complete.then_some(from + read.read)))
+}
+
 /// Where the rollout in `file`'s own lines begin ([`TurnReader`]), plus its opening account when
-/// `with_account` is set.
+/// `with_account` is set. `Ok(None)` where a copied prefix runs past `reach`.
 fn copy_end_and_account(
     file: &std::fs::File,
     reach: u64,
     with_account: bool,
     first: &mut Vec<u8>,
-) -> Option<(u64, Option<AccountKey>)> {
+) -> Result<Option<(u64, Option<AccountKey>)>, ReadFailed> {
     if reach >= META_BYTES && first_line_into(file, first) {
         let body_len = first.len() - 1;
         if body_len <= crate::harness::usage::MAX_LINE_BYTES
@@ -269,7 +288,7 @@ fn copy_end_and_account(
             let mut reader = TurnReader::default();
             let _ = reader.line(text);
             if reader.prefix == Prefix::Own {
-                return Some((line1_end, account));
+                return Ok(Some((line1_end, account)));
             }
             let mut own = None;
             let read = stream_open_ends_ref(
@@ -288,8 +307,10 @@ fn copy_end_and_account(
                     std::ops::ControlFlow::Continue(())
                 },
             );
-            let own_from = own.or_else(|| read.complete.then_some(line1_end + read.read))?;
-            return Some((own_from, account));
+            let Some(own_from) = own_lines_from(own, &read, line1_end)? else {
+                return Ok(None);
+            };
+            return Ok(Some((own_from, account)));
         }
     }
     let mut reader = TurnReader::default();
@@ -314,11 +335,37 @@ fn copy_end_and_account(
         }
         std::ops::ControlFlow::Continue(())
     });
-    let own_from = own.or_else(|| read.complete.then_some(read.read))?;
+    let Some(own_from) = own_lines_from(own, &read, 0)? else {
+        return Ok(None);
+    };
     if saw_invalid_line0 {
         line0_account = first_line_of(file).as_deref().and_then(opening_account);
     }
-    Some((own_from, line0_account))
+    Ok(Some((own_from, line0_account)))
+}
+
+/// One rollout's readings: `Ok(None)` where a copied prefix runs past the reach, so it has none to
+/// give, and an append does not change that.
+type RolloutReadings = Result<Option<Vec<CodexLimits>>, ReadFailed>;
+
+/// The readings of the rollout at `path` ([`RolloutReadings`]).
+fn rollout_readings_checked(
+    path: &Path,
+    reach: u64,
+    with_account: bool,
+    scratch: &mut Vec<u8>,
+) -> RolloutReadings {
+    let mut file = crate::harness::footer::open_regular(path).ok_or(ReadFailed)?;
+    let Some((own_from, account)) = copy_end_and_account(&file, reach, with_account, scratch)?
+    else {
+        return Ok(None);
+    };
+    let tail = tail_after_file(&mut file, own_from, TAIL_BYTES).ok_or(ReadFailed)?;
+    let mut readings = rollout_rate_limits(&tail);
+    for r in &mut readings {
+        r.account = account;
+    }
+    Ok(Some(readings))
 }
 
 fn rollout_readings_inner(
@@ -327,14 +374,9 @@ fn rollout_readings_inner(
     with_account: bool,
     scratch: &mut Vec<u8>,
 ) -> Option<Vec<CodexLimits>> {
-    let mut file = crate::harness::footer::open_regular(path)?;
-    let (own_from, account) = copy_end_and_account(&file, reach, with_account, scratch)?;
-    let tail = tail_after_file(&mut file, own_from, TAIL_BYTES)?;
-    let mut readings = rollout_rate_limits(&tail);
-    for r in &mut readings {
-        r.account = account;
-    }
-    Some(readings)
+    rollout_readings_checked(path, reach, with_account, scratch)
+        .ok()
+        .flatten()
 }
 
 /// The usage readings of the rollout at `path` ([`opening_account`]).
@@ -503,13 +545,14 @@ const LOGIN_REACH_S: i64 = 7 * 86_400;
 /// How many of a home's rollouts written last a survey looks through for one login's readings
 /// ([`login_readings`]). Each costs its first line ([`META_BYTES`] at most). One that login opened
 /// costs that line again, one tail ([`TAIL_BYTES`]) and any copied prefix a legacy fork holds
-/// ([`CONTEXT_REACH`] at most). Six that hold a reading from `since` on end the look. A rollout that
-/// holds none is paid for and not counted, and it need not be short: it can hold only another
-/// family's readings, or only readings from before `since`. So the worst case reads all 256: 160 MiB
-/// a home where first lines fit one 64 KiB read and none is a legacy fork, and at most about 17 GiB a
-/// home where each is read to the reach for a copied prefix. This many rollouts written after a wall
-/// take that wall out of view. A node's metrics pass surveys every minute, so a look whose rollouts
-/// have not changed reads none of them ([`LOGIN_LOOKS`]).
+/// ([`CONTEXT_REACH`] at most). A look ends once six hold a reading from `since` on and no older
+/// rollout could hold a newer one. A rollout that holds none is paid for and not counted, and it need
+/// not be short: it can hold only another family's readings, or only readings from before `since`.
+/// One written lately whose readings are old is paid for too, since it does not end the look. So the
+/// worst case reads all 256: 160 MiB a home where first lines fit one 64 KiB read and none is a legacy
+/// fork, and at most about 17 GiB a home where each is read to the reach for a copied prefix. This many
+/// rollouts written after a wall take that wall out of view. A node's metrics pass surveys every
+/// minute, so a look whose rollouts have not changed reads none of them ([`LOGIN_LOOKS`]).
 const LOGIN_SCAN: usize = 256;
 
 /// A [`login_readings`]: what it was asked, the rollouts it had in reach, and what it found.
@@ -517,42 +560,72 @@ struct LoginLook {
     since: Option<i64>,
     listed: Vec<(std::path::PathBuf, std::time::SystemTime, u64)>,
     rollouts: Vec<Vec<CodexLimits>>,
+    whole: bool,
 }
 
-/// The last look at each home for each login. Its answer is a function of the rollouts in reach and
-/// `since` alone, so it stands until one of those changes. It holds six rollouts' readings and a
-/// listing of [`LOGIN_SCAN`] at most, for each of the few homes and logins a survey reads.
+/// The last look at each home for each login, where its answer is a function of the listed
+/// rollouts' bytes and `since`. It stands until a listed size or write time or `since` changes: new
+/// bytes under the same size and write time stay unread. A look that could not open or read a folder
+/// or a rollout is not kept, since that could go otherwise with nothing listed having changed. One
+/// that met a fork whose copied prefix runs past the reach is kept, since that fork's bytes fix what a
+/// read of it finds, and it says it is not whole, since that fork's own lines went unread. It holds
+/// six rollouts' readings and a listing of [`LOGIN_SCAN`] at most, for each of the homes and logins a
+/// survey reads.
 static LOGIN_LOOKS: std::sync::Mutex<
     std::collections::BTreeMap<(std::path::PathBuf, AccountKey), LoginLook>,
 > = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// The usage readings, from `since` on, of the six (`NEWEST_READ`) rollouts of `home` written last
-/// that opened under the login `key` ([`opening_account`]) and still hold a reading of the `codex`
-/// family. A rollout with no reading says nothing of a wall, and a session that starts on a wall
-/// writes no figure, so such a rollout is not counted among the six. Six that do hold a reading say
-/// more of the windows than an older one could. So, up to [`LOGIN_SCAN`] rollouts, neither a login's
-/// own rollouts with no reading nor other sessions' in the same home push its wall out of view. The
-/// look reaches back only as far as a rollout can still speak: one last written before `since` holds
-/// no reading from `since` on, since a reading is stamped before it is written, and one last written
-/// over [`LOGIN_REACH_S`] ago holds no running window. A look that finds what the last one had in
-/// reach, unchanged, reads none of it ([`LOGIN_LOOKS`]).
+/// The usage readings, from `since` on, of the six (`NEWEST_READ`) rollouts of `home` whose newest
+/// reading of the `codex` family is newest, of those that opened under the login `key`
+/// ([`opening_account`]). A rollout with no such reading says nothing of a wall, and a session that
+/// starts on a wall writes no figure, so such a rollout is not counted among the six. Six newer
+/// readings say more of the windows than an older one could. A write time says nothing of that, since
+/// a rollout written again can add no reading, so the look goes on past six until no older rollout
+/// could hold a newer reading: a reading is stamped before it is written. So, up to [`LOGIN_SCAN`]
+/// rollouts, neither a login's own rollouts with no newer reading nor other sessions' in the same home
+/// push its wall out of view. The look reaches back only as far as a rollout can still speak: one last
+/// written before `since` holds no reading from `since` on, and one last written over
+/// [`LOGIN_REACH_S`] ago holds no running window. A look that finds what the last one had in reach,
+/// unchanged, reads none of it ([`LOGIN_LOOKS`]). The answer also says whether the look read everything
+/// it needed; where it did not, a wall can be missing from what it found.
 fn login_readings(
     home: &Path,
     key: AccountKey,
     since: Option<i64>,
     now_unix: i64,
-) -> Vec<Vec<CodexLimits>> {
+) -> (Vec<Vec<CodexLimits>>, bool) {
+    login_readings_with(
+        home,
+        key,
+        since,
+        now_unix,
+        &rollout_opening,
+        &|path, scratch| rollout_readings_checked(path, CONTEXT_REACH, true, scratch),
+    )
+}
+
+/// The first line of the rollout at `path`, `None` where it has none within [`META_BYTES`].
+fn rollout_opening(path: &Path) -> Result<Option<String>, ReadFailed> {
+    let file = crate::harness::footer::open_regular(path).ok_or(ReadFailed)?;
+    let mut line = Vec::new();
+    let found = first_line_read(&file, &mut line).map_err(|_| ReadFailed)?;
+    Ok(found.then(|| String::from_utf8_lossy(&line).into_owned()))
+}
+
+/// [`login_readings`], reading each rollout through `opening` and `readings`.
+fn login_readings_with(
+    home: &Path,
+    key: AccountKey,
+    since: Option<i64>,
+    now_unix: i64,
+    opening: &dyn Fn(&Path) -> Result<Option<String>, ReadFailed>,
+    readings: &dyn Fn(&Path, &mut Vec<u8>) -> RolloutReadings,
+) -> (Vec<Vec<CodexLimits>>, bool) {
     let mut scratch = Vec::with_capacity(64 * 1024);
     let week_ago = now_unix.saturating_sub(LOGIN_REACH_S);
     let reach = u64::try_from(since.map_or(week_ago, |since| since.max(week_ago))).unwrap_or(0);
-    let opened_under_key = |path: &Path| {
-        crate::harness::footer::open_regular(path)
-            .and_then(|file| first_line_of(&file))
-            .as_deref()
-            .and_then(opening_account)
-            == Some(key)
-    };
-    let listed: Vec<_> = crate::harness::codex_rollout::rollouts_by_write_sized(home)
+    let (all_listed, walked_whole) = crate::harness::codex_rollout::rollouts_by_write_sized(home);
+    let listed: Vec<_> = all_listed
         .into_iter()
         .take_while(|(_, written, _)| {
             written
@@ -563,32 +636,93 @@ fn login_readings(
         .collect();
     let slot = (home.to_path_buf(), key);
     let looks = || LOGIN_LOOKS.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(look) = looks().get(&slot)
+    if walked_whole
+        && let Some(look) = looks().get(&slot)
         && look.since == since
         && look.listed == listed
     {
-        return look.rollouts.clone();
+        return (look.rollouts.clone(), look.whole);
     }
-    let rollouts: Vec<Vec<CodexLimits>> = listed
-        .iter()
-        .filter(|(path, _, _)| opened_under_key(path))
-        .filter_map(|(path, _, _)| rollout_readings_inner(path, CONTEXT_REACH, true, &mut scratch))
-        .flat_map(|rollout| readings_since(vec![rollout], since))
-        .filter(|rollout| rollout.iter().any(|r| r.speaks_of(CODEX_FAMILY)))
-        .take(NEWEST_READ)
-        .collect();
-    looks().insert(
-        slot,
-        LoginLook {
-            since,
-            listed,
-            rollouts: rollouts.clone(),
-        },
-    );
-    rollouts
+    let mut keep = walked_whole;
+    let mut whole = walked_whole;
+    // Each rollout kept, in the order listed, with its newest reading's stamp in milliseconds.
+    let mut kept: Vec<(i64, Vec<CodexLimits>)> = Vec::with_capacity(NEWEST_READ + 1);
+    for (path, written, size) in &listed {
+        if kept.len() == NEWEST_READ {
+            let written_ms = written
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |at| i64::try_from(at.as_millis()).unwrap_or(i64::MAX));
+            if kept.iter().all(|(newest, _)| written_ms <= *newest) {
+                break;
+            }
+        }
+        match opening(path) {
+            Ok(line) if line.as_deref().and_then(opening_account) == Some(key) => {}
+            // Its first line runs past the cap, so its login is not known and it may be this one.
+            Ok(None) if *size > META_BYTES => {
+                whole = false;
+                continue;
+            }
+            Ok(_) => continue,
+            Err(ReadFailed) => {
+                keep = false;
+                whole = false;
+                continue;
+            }
+        }
+        let rollout = match readings(path, &mut scratch) {
+            Ok(Some(rollout)) => rollout,
+            Ok(None) => {
+                whole = false;
+                continue;
+            }
+            Err(ReadFailed) => {
+                keep = false;
+                whole = false;
+                continue;
+            }
+        };
+        let rollout: Vec<CodexLimits> = readings_since(vec![rollout], since)
+            .into_iter()
+            .flatten()
+            .collect();
+        let newest = rollout
+            .iter()
+            .filter(|reading| reading.speaks_of(CODEX_FAMILY))
+            .map(|reading| reading.at_ms)
+            .max();
+        let Some(newest) = newest else {
+            continue;
+        };
+        kept.push((newest, rollout));
+        if kept.len() > NEWEST_READ {
+            // The oldest goes, and of a tie the one listed last, whose write came first.
+            let oldest = kept
+                .iter()
+                .enumerate()
+                .min_by_key(|(at, (newest, _))| (*newest, std::cmp::Reverse(*at)))
+                .map(|(at, _)| at);
+            if let Some(oldest) = oldest {
+                kept.remove(oldest);
+            }
+        }
+    }
+    let rollouts: Vec<Vec<CodexLimits>> = kept.into_iter().map(|(_, rollout)| rollout).collect();
+    if keep {
+        looks().insert(
+            slot,
+            LoginLook {
+                since,
+                listed,
+                rollouts: rollouts.clone(),
+                whole,
+            },
+        );
+    }
+    (rollouts, whole)
 }
 
-/// A wall a login's rollouts show ([`login_sample`]).
+/// A wall a login's rollouts show ([`login_look`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoginWall {
     /// When the reading it stands on was written (unix seconds): for a full window the earliest
@@ -600,7 +734,7 @@ pub struct LoginWall {
     pub until: i64,
 }
 
-/// What the rollouts of a login hold of it ([`login_sample`]).
+/// What the rollouts of a login hold of it ([`login_look`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoginSample {
     /// What is left of its five-hour window and its week ([`sample_of`]). `at` is its newest
@@ -609,6 +743,16 @@ pub struct LoginSample {
     /// The wall its readings show, which no [`Sample`] can hold: a window of another length or none
     /// reads no figure, and a refusal can stand with every window below full.
     pub wall: Option<LoginWall>,
+}
+
+/// What a look at a login's rollouts found ([`login_look`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginLooked {
+    /// What they hold of it, where a reading is fresh or a wall still stands.
+    pub sample: Option<LoginSample>,
+    /// The look read everything it needed. Where it did not, a wall can be missing from `sample`, so
+    /// neither its absence nor a reading in it says the row has room.
+    pub whole: bool,
 }
 
 /// The wall `pick` and the `newest` reading of a login show: a window full, whatever its kind and
@@ -650,26 +794,41 @@ fn login_wall(pick: Option<&Pick>, newest: &CodexLimits) -> Option<LoginWall> {
 /// A ROLLOUT NAMES ONLY THE LOGIN THAT OPENED IT: one resumed under another login keeps its
 /// opening line, and nothing says which login wrote a reading ([`conversation_newest`]). So this
 /// speaks for `key` only in a home no other login writes to, which the caller answers for as things
-/// stand now ([`crate::harness::cli::survey_accounts`]): a login removed from that home within the
-/// week can still have its wall credited here, which only keeps a row from being picked until
-/// that wall ends or a launch reads it. Reads files alone.
+/// stand now ([`crate::harness::cli::survey_accounts`]). A login removed from that home within the
+/// week can have written under this one's opening line: its wall reads as this one's, which keeps a
+/// row from being picked until that wall ends or a launch reads it, and its later reading with room
+/// lifts a wall of this one only rollouts knew, which a launch's read of the row then shows again.
+/// Reads files alone.
 #[must_use]
-pub fn login_sample(
+pub fn login_look(
     homes: &[&Path],
     key: AccountKey,
     since: Option<i64>,
     now_unix: i64,
-) -> Option<LoginSample> {
+) -> LoginLooked {
+    let mut whole = true;
     let rollouts: Vec<Vec<CodexLimits>> = homes
         .iter()
-        .flat_map(|home| login_readings(home, key, since, now_unix))
+        .flat_map(|home| {
+            let (rollouts, read) = login_readings(home, key, since, now_unix);
+            whole &= read;
+            rollouts
+        })
         .collect();
+    LoginLooked {
+        sample: login_sample_of(&rollouts, now_unix),
+        whole,
+    }
+}
+
+/// [`login_look`]'s sample of what it found in `rollouts`.
+fn login_sample_of(rollouts: &[Vec<CodexLimits>], now_unix: i64) -> Option<LoginSample> {
     let newest = rollouts
         .iter()
         .flatten()
         .filter(|r| r.speaks_of(CODEX_FAMILY))
         .max_by_key(|r| r.at_ms)?;
-    let pick = pick(&rollouts, CODEX_FAMILY, now_unix);
+    let pick = pick(rollouts, CODEX_FAMILY, now_unix);
     let wall = login_wall(pick.as_ref(), newest);
     let stands = wall.is_some_and(|wall| wall.until > now_unix);
     (stands || now_unix.saturating_sub(newest.at_unix) <= FRESH_S).then(|| LoginSample {
@@ -684,7 +843,7 @@ pub fn login_sample(
 /// A [`Pick`] as the account pool's usage [`Sample`]: its five-hour window is the session, its
 /// week the week, each share taken up to the next whole percent (so a share is never read as
 /// further from its wall than it is) and each reset and read time as picked. Another window, an
-/// unplaced one and a void one ([`Pick::void`]) give no figure, which [`login_sample`]'s wall
+/// unplaced one and a void one ([`Pick::void`]) give no figure, which [`LoginSample::wall`]
 /// makes up for where such a window is full. `at` is the newest reading's stamp; `by` is left for
 /// [`crate::harness::accounts::note_sample`] to stamp.
 #[must_use]
@@ -1911,7 +2070,7 @@ mod tests {
 
     /// A ROLLOUT WITH NO READING SAYS NOTHING OF A WALL, so a login's own such rollouts do not count
     /// among the six: a session that starts on a wall writes no figure, and launches that read
-    /// nothing first make them one after another. Six that hold a reading do push it out, since they
+    /// nothing first make them one after another. Six that hold newer readings do push it out, since they
     /// say more of its windows than it can, and so a reading is counted only while it still speaks
     /// (`since`). NEGATIVE CONTROL: the six were counted before any was read, so six such launches
     /// hid the wall and the row read `usable` or `unseen`.
@@ -1976,6 +2135,371 @@ mod tests {
                 until: week
             }),
             "readings from before `since` no longer speak, so they are not counted"
+        );
+    }
+
+    /// SIX ROLLOUTS WRITTEN LATELY DO NOT HIDE A NEWER READING: a session resumed since can write no
+    /// reading, so what it was written last says nothing of how new its readings are. A wall read an
+    /// hour ago stays in view behind six written a minute ago that hold readings from two hours ago.
+    /// NEGATIVE CONTROL: the look took the six written last and the row lost its wall. CONTROL: six
+    /// whose readings are newer than anything an older rollout can hold end the look, so a rollout
+    /// past them is not read, which its impossible stamp would show. CONTROL: of more than six the
+    /// newest six are read, whatever order they were written in.
+    #[test]
+    fn six_rollouts_written_lately_do_not_hide_a_newer_reading() {
+        let now = T0 / 1000;
+        let week = now + 300_000;
+        let a = key(LOGIN_A).expect("a key");
+        let reading = |ago_s: i64, pct: f64| {
+            rate(T0 - ago_s * 1000, "codex", None, Some((pct, 10_080, week)))
+        };
+
+        let (home, day) = rollout_home();
+        let homes = [home.path()];
+        lay_rollout(&day, 0, now - 3_600, &[reading(3_600, 100.0)]);
+        for n in 1..=NEWEST_READ {
+            lay_rollout(&day, n, now - 60, &[reading(7_200, 7.0)]);
+        }
+        assert_eq!(
+            login_sample(&homes, a, None, now).and_then(|s| s.wall),
+            Some(LoginWall {
+                at: now - 3_600,
+                until: week
+            }),
+            "the reading an hour old is among the newest six"
+        );
+
+        let (home, day) = rollout_home();
+        let homes = [home.path()];
+        lay_rollout(&day, 0, now - 3_600, &[reading(10, 100.0)]);
+        for n in 1..=NEWEST_READ {
+            lay_rollout(&day, n, now - 60, &[reading(60, 7.0)]);
+        }
+        assert_eq!(
+            login_sample(&homes, a, None, now).and_then(|s| s.wall),
+            None,
+            "CONTROL: no older rollout can hold a newer reading, so this one is not read"
+        );
+
+        let (home, day) = rollout_home();
+        let homes = [home.path()];
+        for n in 0..NEWEST_READ {
+            let ago = i64::try_from(n).expect("small") + 100;
+            lay_rollout(&day, n, now - 60, &[reading(ago, 7.0)]);
+        }
+        // Written after the oldest of the six read, so the look goes on to them.
+        lay_rollout(&day, NEWEST_READ, now - 90, &[reading(95, 100.0)]);
+        lay_rollout(&day, NEWEST_READ + 1, now - 95, &[reading(99, 100.0)]);
+        let wall = login_sample(&homes, a, None, now).and_then(|s| s.wall);
+        assert_eq!(
+            wall.map(|wall| wall.at),
+            Some(now - 99),
+            "CONTROL: both are newer than the oldest of the six, so both displace one"
+        );
+    }
+
+    /// [`login_look`]'s sample alone.
+    fn login_sample(
+        homes: &[&Path],
+        key: AccountKey,
+        since: Option<i64>,
+        now_unix: i64,
+    ) -> Option<LoginSample> {
+        login_look(homes, key, since, now_unix).sample
+    }
+
+    /// A legacy fork opening as `thread` under `LOGIN_A`, whose copied burst runs past [`META_BYTES`].
+    fn fork_past_meta_bytes(thread: &str) -> String {
+        let mut body = meta_as(
+            T0,
+            thread,
+            thread,
+            Some(ROOT),
+            Some("legacy"),
+            Some(LOGIN_A),
+        );
+        body.push_str(&meta(T0, ROOT, ROOT, None));
+        let line = message(T0 + 1);
+        while u64::try_from(body.len()).expect("small") <= META_BYTES + 1024 {
+            body.push_str(&line);
+        }
+        body
+    }
+
+    /// A READ THAT FAILED IS TOLD FROM A FILE THAT HOLDS NOTHING TO READ: a directory opens and
+    /// cannot be read, so it stands in for an I/O error on a rollout. NEGATIVE CONTROL: each read
+    /// the same, so a failure was remembered or a fork past the reach never was.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_that_failed_is_told_from_a_file_with_nothing_to_read() {
+        use crate::harness::codex_rollout::stream_open_ends_ref;
+
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("codex-read-failed-")
+            .tempdir()
+            .expect("temp dir");
+        let folder = std::fs::File::open(dir.path()).expect("a folder opens");
+        let mut scratch = Vec::new();
+        assert!(first_line_read(&folder, &mut scratch).is_err());
+        assert!(
+            stream_open_ends_ref(&folder, 0, None, 1024, |_, _, _| {
+                std::ops::ControlFlow::Continue(())
+            })
+            .failed
+        );
+        assert_eq!(
+            copy_end_and_account(&folder, 1024, true, &mut scratch),
+            Err(ReadFailed)
+        );
+
+        let short = dir.path().join("short");
+        std::fs::write(&short, "no newline").expect("write");
+        let short = std::fs::File::open(short).expect("open");
+        assert_eq!(first_line_read(&short, &mut scratch).ok(), Some(false));
+
+        let fork = dir.path().join("fork");
+        std::fs::write(&fork, fork_past_meta_bytes(SUB)).expect("write");
+        assert_eq!(
+            rollout_readings_checked(&fork, META_BYTES, true, &mut scratch),
+            Ok(None),
+            "a copy past the reach"
+        );
+        let own = dir.path().join("own");
+        let filler = fork_past_meta_bytes(SUB);
+        let (_, filler) = filler.split_once('\n').expect("its first line");
+        let opening = meta_as(T0, ROOT, ROOT, None, Some(PAGINATED), Some(LOGIN_A));
+        std::fs::write(&own, format!("{opening}{filler}")).expect("write");
+        assert!(
+            matches!(
+                rollout_readings_checked(&own, META_BYTES, true, &mut scratch),
+                Ok(Some(_))
+            ),
+            "CONTROL: as long a rollout that is no fork"
+        );
+    }
+
+    /// A LOOK THAT FAILED TO READ A ROLLOUT SAYS SO AND IS NOT KEPT, at its first line or at its
+    /// readings. One that met a fork whose copy runs past the reach is kept and is not whole, since
+    /// that fork's own lines went unread and can hold a wall. NEGATIVE CONTROL: the wall stayed
+    /// hidden until another write, a fork's 64 MiB was read every minute with nothing listed having
+    /// changed, or a row read `usable` past the wall in that fork.
+    #[test]
+    fn a_look_says_whether_it_read_everything_and_keeps_only_one_that_did() {
+        let now = T0 / 1000;
+        let week = now + 300_000;
+        let a = key(LOGIN_A).expect("a key");
+        let wall = rate(T0 - 60_000, "codex", None, Some((100.0, 10_080, week)));
+        let product = |path: &Path, scratch: &mut Vec<u8>| {
+            rollout_readings_checked(path, CONTEXT_REACH, true, scratch)
+        };
+        let shows_wall = |homes: &[&Path]| {
+            let look = login_look(homes, a, None, now);
+            (look.sample.and_then(|s| s.wall).is_some(), look.whole)
+        };
+
+        let (home, day) = rollout_home();
+        lay_rollout(&day, 0, now - 60, std::slice::from_ref(&wall));
+        let (found, whole) =
+            login_readings_with(home.path(), a, None, now, &|_| Err(ReadFailed), &product);
+        assert_eq!((found.len(), whole), (0, false), "its first line failed");
+        assert_eq!(
+            shows_wall(&[home.path()]),
+            (true, true),
+            "nothing listed changed, and the first line reads now"
+        );
+
+        let (home, day) = rollout_home();
+        lay_rollout(&day, 0, now - 60, std::slice::from_ref(&wall));
+        let (found, whole) =
+            login_readings_with(home.path(), a, None, now, &rollout_opening, &|_, _| {
+                Err(ReadFailed)
+            });
+        assert_eq!((found.len(), whole), (0, false), "its readings failed");
+        assert_eq!(shows_wall(&[home.path()]), (true, true));
+
+        let (home, day) = rollout_home();
+        let thread = "01900000-0000-7000-8000-000000000000";
+        std::fs::write(
+            day.join(format!("rollout-2026-10-16T08-00-00-{thread}.jsonl")),
+            fork_past_meta_bytes(thread),
+        )
+        .expect("write the fork");
+        let reads = std::cell::Cell::new(0);
+        let past_the_reach = |path: &Path, scratch: &mut Vec<u8>| {
+            reads.set(reads.get() + 1);
+            rollout_readings_checked(path, META_BYTES, true, scratch)
+        };
+        for _ in 0..2 {
+            let (found, whole) =
+                login_readings_with(home.path(), a, None, now, &rollout_opening, &past_the_reach);
+            assert_eq!(
+                (found.len(), whole),
+                (0, false),
+                "its own lines went unread"
+            );
+        }
+        assert_eq!(reads.get(), 1, "the second look read nothing");
+    }
+
+    /// A ROLLOUT WHOSE FIRST LINE RUNS PAST THE CAP MAY BE THIS LOGIN'S, so a look that skipped it
+    /// did not read everything. NEGATIVE CONTROL: it counted as another login's, and a row read
+    /// `usable` past the wall in it. CONTROL: an empty file and a first line still being written
+    /// name no login and are nothing to read, so they cost no row its `usable`.
+    #[test]
+    fn a_first_line_past_the_cap_is_a_look_that_is_not_whole() {
+        let now = T0 / 1000;
+        let a = key(LOGIN_A).expect("a key");
+        let name = |n: usize| {
+            format!("rollout-2026-10-16T08-00-0{n}-01900000-0000-7000-8000-00000000000{n}.jsonl")
+        };
+        let (home, day) = rollout_home();
+        std::fs::write(day.join(name(1)), "").expect("write");
+        std::fs::write(day.join(name(2)), "{\"type\":\"session_meta\"").expect("write");
+        assert!(login_look(&[home.path()], a, None, now).whole, "CONTROL");
+        let long = usize::try_from(META_BYTES).expect("small") + 1;
+        let line = format!("{}\n", " ".repeat(long));
+        std::fs::write(day.join(name(3)), line).expect("write");
+        assert!(!login_look(&[home.path()], a, None, now).whole);
+    }
+
+    /// A LINKED ROLLOUT IS AS ITS TARGET IS. The walk lists a link to a file on purpose and a read
+    /// follows it, so a look judged by the link's own size and time kept its answer past a write to
+    /// the target. NEGATIVE CONTROL: the look answered 40% with the target at its wall. A target that
+    /// could not be examined leaves the look not whole, and a dangling link is nothing to read.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_rollout_is_as_its_target_is() {
+        let now = T0 / 1000;
+        let week = now + 300_000;
+        let a = key(LOGIN_A).expect("a key");
+        let (home, day) = rollout_home();
+        let far = aterm_tempfile::Builder::new()
+            .prefix("codex-login-target-")
+            .tempdir()
+            .expect("temp dir");
+        let target = far.path().join("target.jsonl");
+        let opening = meta_as(
+            T0 - 7_200_000,
+            ROOT,
+            ROOT,
+            None,
+            Some(PAGINATED),
+            Some(LOGIN_A),
+        );
+        let reading =
+            |ago_ms: i64, pct: f64| rate(T0 - ago_ms, "codex", None, Some((pct, 10_080, week)));
+        std::fs::write(&target, format!("{opening}{}", reading(120_000, 40.0))).expect("write");
+        let link = format!("rollout-2026-10-16T08-00-00-{ROOT}.jsonl");
+        std::os::unix::fs::symlink(&target, day.join(&link)).expect("link");
+        let homes = [home.path()];
+        let first = login_look(&homes, a, None, now);
+        assert_eq!(
+            first.sample.as_ref().and_then(|s| s.wall),
+            None,
+            "CONTROL: it reads through the link"
+        );
+        assert!(first.whole);
+        let mut appended = std::fs::read(&target).expect("read");
+        appended.extend_from_slice(reading(60_000, 100.0).as_bytes());
+        std::fs::write(&target, appended).expect("write");
+        assert!(
+            login_look(&homes, a, None, now)
+                .sample
+                .and_then(|s| s.wall)
+                .is_some(),
+            "the write to its target shows"
+        );
+
+        let (home, day) = rollout_home();
+        std::os::unix::fs::symlink(day.join("gone"), day.join(&link)).expect("link");
+        assert!(login_look(&[home.path()], a, None, now).whole, "dangling");
+
+        let (home, day) = rollout_home();
+        let looped = day.join(&link);
+        std::os::unix::fs::symlink(&looped, &looped).expect("link");
+        assert!(
+            !login_look(&[home.path()], a, None, now).whole,
+            "a target that could not be examined"
+        );
+    }
+
+    /// A FOLDER THAT COULD NOT BE READ IS A LOOK THAT DID NOT READ EVERYTHING, whose listing can
+    /// come back as it was. NEGATIVE CONTROL: the look called itself whole with a day's rollouts
+    /// out of its listing, so a row read `usable` past the wall they hold.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_could_not_be_read_is_a_look_that_is_not_whole() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (home, day) = rollout_home();
+        let now = T0 / 1000;
+        let week = now + 300_000;
+        let a = key(LOGIN_A).expect("a key");
+        let wall = rate(T0 - 60_000, "codex", None, Some((100.0, 10_080, week)));
+        lay_rollout(&day, 0, now - 60, std::slice::from_ref(&wall));
+        let set_mode = |mode: u32| {
+            std::fs::set_permissions(&day, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        };
+        set_mode(0o000);
+        if std::fs::read_dir(&day).is_ok() {
+            // A user whom a mode does not refuse (root) cannot stage this.
+            set_mode(0o755);
+            return;
+        }
+        let homes = [home.path()];
+        let look = login_look(&homes, a, None, now);
+        set_mode(0o755);
+        assert_eq!((look.sample, look.whole), (None, false));
+        assert!(
+            login_look(&homes, a, None, now).whole,
+            "CONTROL: it reads again"
+        );
+    }
+
+    /// A LOOK THAT COULD NOT OPEN A ROLLOUT IS NOT REMEMBERED: nothing listed changes when that
+    /// rollout can be read again, so a remembered look would hide its wall until another write, up
+    /// to a week. NEGATIVE CONTROL: the second look answered from the first and said no wall.
+    #[cfg(unix)]
+    #[test]
+    fn a_look_that_could_not_open_a_rollout_is_not_remembered() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (home, day) = rollout_home();
+        let now = T0 / 1000;
+        let week = now + 300_000;
+        let homes = [home.path()];
+        let a = key(LOGIN_A).expect("a key");
+        let wall = rate(T0 - 60_000, "codex", None, Some((100.0, 10_080, week)));
+        lay_rollout(&day, 0, now - 60, std::slice::from_ref(&wall));
+        let path = std::fs::read_dir(&day)
+            .expect("its day")
+            .next()
+            .expect("one rollout")
+            .expect("an entry")
+            .path();
+        let set_mode = |mode: u32| {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        };
+        set_mode(0o000);
+        if crate::harness::footer::open_regular(&path).is_some() {
+            // A user whom a mode does not refuse (root) cannot stage this.
+            set_mode(0o600);
+            return;
+        }
+        let look = login_look(&homes, a, None, now);
+        assert_eq!(
+            (look.sample, look.whole),
+            (None, false),
+            "CONTROL: it cannot be read, and says so"
+        );
+        set_mode(0o600);
+        assert_eq!(
+            login_sample(&homes, a, None, now).and_then(|s| s.wall),
+            Some(LoginWall {
+                at: now - 60,
+                until: week
+            }),
+            "nothing listed changed, and it is read now"
         );
     }
 

@@ -7546,6 +7546,9 @@ pub fn drive_cdp_oauth(
 /// between its reads apart ([`drive_cdp_oauth_with_webmail`], [`BotCheckClock`]).
 const MAX_OAUTH_STEPS: usize = 120;
 
+/// A bot challenge goes to the visible central browser well before the 90-second OAuth deadline.
+const BOT_CHECK_RELAY_AFTER: Duration = Duration::from_secs(5);
+
 /// A Claude sign-in's end on Cloudflare's bot check ([`bot_check`]) that did not clear within
 /// [`VENDOR_STALL`] or the drive's deadline.
 pub const BOT_CHECK_UNCLEARED: &str =
@@ -7556,6 +7559,18 @@ pub const BLOCK_PAGE_MET: &str =
     "Cloudflare's block page answered the sign-in; aterm never tries to pass it";
 
 const CHALLENGE_UNAVAILABLE: &str = "the fleet challenge service cannot admit account work";
+pub const CHALLENGE_FAILED: &str = "the fleet challenge service did not complete the sign-in";
+
+fn challenge_failed(error: &super::challenge_relay::RequestError) {
+    note_met(MetWord::ChallengeFailed, None);
+    #[cfg(not(test))]
+    eprintln!(
+        "aterm: central Claude challenge failed: {}",
+        super::one_line(&error.to_string(), 320)
+    );
+    #[cfg(test)]
+    let _ = error;
+}
 
 thread_local! {
     /// Why this thread's last headless Claude sign-in ended without the callback
@@ -7604,10 +7619,11 @@ pub(super) fn finish_deadline<T>(
 /// `&mut CdpClient` to `mailbox_credential` so webmail inboxes can be polled in a secondary CDP
 /// tab. Cloudflare's bot check is waited on, its reads (and a gap of idle reads between two,
 /// [`BotCheckClock`]) not counted against the drive's steps. Once it has stood for
-/// [`VENDOR_STALL`], or its block page is read, a Claude flow asks the fleet issuer's visible
+/// [`BOT_CHECK_RELAY_AFTER`], or its block page is read, a Claude flow asks the fleet issuer's visible
 /// challenge service for the exact callback; software never operates that challenge. An
-/// unavailable or unsuccessful service retains [`BOT_CHECK_UNCLEARED`] or [`BLOCK_PAGE_MET`].
-/// Either end, and a drive that reached no callback in time, is noted for [`take_met`].
+/// unavailable service returns [`CHALLENGE_UNAVAILABLE`]; another service failure returns
+/// [`CHALLENGE_FAILED`] instead of being misreported as the provider's challenge. Page outcomes
+/// are noted for [`take_met`], as is a drive that reached no callback in time.
 pub fn drive_cdp_oauth_with_webmail(
     cdp: &mut CdpClient,
     authorize_url: &str,
@@ -7929,14 +7945,17 @@ fn drive_cdp_oauth_flow_until(
                                 note_met(MetWord::ServiceUnavailable, None);
                                 return Err(CHALLENGE_UNAVAILABLE);
                             }
-                            Err(_) => {}
+                            Err(error) => {
+                                challenge_failed(&error);
+                                return Err(CHALLENGE_FAILED);
+                            }
                         }
                     }
                     note_met(MetWord::BlockPage, last_host.as_deref());
                     return Err(BLOCK_PAGE_MET);
                 }
                 "bot_check" => {
-                    if bot.check(url, deadline.now()) >= bot_stall {
+                    if bot.check(url, deadline.now()) >= bot_stall.min(BOT_CHECK_RELAY_AFTER) {
                         if google_config.is_none() {
                             match central_callback(&flow, authorize_url, email.as_deref()) {
                                 Ok(callback) => {
@@ -7946,7 +7965,10 @@ fn drive_cdp_oauth_flow_until(
                                     note_met(MetWord::ServiceUnavailable, None);
                                     return Err(CHALLENGE_UNAVAILABLE);
                                 }
-                                Err(_) => {}
+                                Err(error) => {
+                                    challenge_failed(&error);
+                                    return Err(CHALLENGE_FAILED);
+                                }
                             }
                         }
                         note_met(MetWord::BotCheck, last_host.as_deref());
@@ -9960,6 +9982,7 @@ fn in_profile(
 /// ran is made up first ([`super::browser_window::make_up_tidy`]); the mailbox configured for
 /// that email, its inbox rows chosen by the vendor's senders.
 pub struct VendorApprover {
+    native_scope: Option<std::sync::Arc<super::native_enrollment_admission::NativeBrowserTurn>>,
     /// Google identities share the harness root across native and federated providers.
     #[cfg(unix)]
     pub(super) google_state: PathBuf,
@@ -10015,6 +10038,13 @@ fn google_state_dir(shared_dir: &Path) -> PathBuf {
 }
 
 impl VendorApprover {
+    pub(super) fn with_native_scope(
+        mut self,
+        scope: Option<std::sync::Arc<super::native_enrollment_admission::NativeBrowserTurn>>,
+    ) -> Self {
+        self.native_scope = scope;
+        self
+    }
     /// Retain the caller's automatic lifetime through browser I/O workers.
     #[must_use]
     pub fn with_work(mut self, work: Option<super::account_work::Scope>) -> Self {
@@ -10034,6 +10064,7 @@ impl VendorApprover {
         let senders = cli.accounts().mail_senders;
         mailbox.senders = senders.iter().map(|sender| (*sender).to_owned()).collect();
         Self {
+            native_scope: None,
             work: None,
             #[cfg(unix)]
             google_state: google_state_dir(shared_dir),
@@ -10086,6 +10117,7 @@ impl VendorApprover {
         let mailbox_source = found.clone();
         let mailbox = found.filter(|cfg| cfg.is_configured_for(email));
         VendorApprover {
+            native_scope: None,
             work: None,
             #[cfg(unix)]
             google_state: google_state_dir(shared_dir),
@@ -10123,6 +10155,11 @@ impl VendorApprover {
 }
 
 impl super::login_drive::Approver for VendorApprover {
+    fn native_enrollment_scope(
+        &self,
+    ) -> Option<std::sync::Arc<super::native_enrollment_admission::NativeBrowserTurn>> {
+        self.native_scope.clone()
+    }
     fn work_scope(&self) -> Option<super::account_work::Scope> {
         self.work.clone()
     }
@@ -10250,21 +10287,33 @@ impl super::login_drive::Approver for VendorApprover {
             profile_dir.parent().unwrap_or(&self.shared_dir),
         );
         let _ = aterm_types::fs_restricted::ensure_private_dir(&profile_dir);
-        let _claimed = match super::browser_window::ProfileLock::claim(&profile_dir) {
-            Ok(claimed) => claimed,
-            Err(why) => {
-                let message = format!("the row's browser profile is {}", why.words(&profile_dir));
-                return match why {
-                    super::browser_window::Refusal::Held(
-                        super::browser_window::Holder::Browser(_)
-                        | super::browser_window::Holder::Elsewhere { .. },
-                    ) => Approval::NeedsYou(message),
-                    super::browser_window::Refusal::Held(super::browser_window::Holder::Aterm(
-                        _,
-                    ))
-                    | super::browser_window::Refusal::Unlockable(_) => Approval::NotRun(message),
-                };
+        let _claimed = if let Some(scope) = &self.native_scope {
+            if let Err(why) = scope.check_profile(&profile_dir) {
+                return Approval::NotRun(why);
             }
+            None
+        } else {
+            Some(
+                match super::browser_window::ProfileLock::claim(&profile_dir) {
+                    Ok(claimed) => claimed,
+                    Err(why) => {
+                        let message =
+                            format!("the row's browser profile is {}", why.words(&profile_dir));
+                        return match why {
+                            super::browser_window::Refusal::Held(
+                                super::browser_window::Holder::Browser(_)
+                                | super::browser_window::Holder::Elsewhere { .. },
+                            ) => Approval::NeedsYou(message),
+                            super::browser_window::Refusal::Held(
+                                super::browser_window::Holder::Aterm(_),
+                            )
+                            | super::browser_window::Refusal::Unlockable(_) => {
+                                Approval::NotRun(message)
+                            }
+                        };
+                    }
+                },
+            )
         };
         let browser = match super::headless_fetch::ensure_headless_browser(
             self.home.as_deref(),

@@ -318,6 +318,38 @@ impl ReclaimAfter {
     const MOVED: Self = Self::CALM;
 }
 
+/// Keep explicit age policies unchanged. A manual per-volume observation only
+/// selects the wait for stale parts, never whole-cache retirement eligibility.
+#[derive(Clone, Copy)]
+enum ReclaimPolicy<'a> {
+    Fixed(ReclaimAfter),
+    Observed(&'a dyn Fn(&Path) -> Option<(u64, u64)>),
+}
+
+impl From<ReclaimAfter> for ReclaimPolicy<'_> {
+    fn from(after: ReclaimAfter) -> Self {
+        Self::Fixed(after)
+    }
+}
+
+impl ReclaimPolicy<'_> {
+    fn whole(self) -> ReclaimAfter {
+        match self {
+            Self::Fixed(after) => after,
+            Self::Observed(_) => ReclaimAfter::CALM,
+        }
+    }
+
+    fn leaf(self, path: &Path) -> ReclaimAfter {
+        match self {
+            Self::Fixed(after) => after,
+            Self::Observed(observe) => observe(path).map_or(ReclaimAfter::CALM, |(free, floor)| {
+                ReclaimAfter::by_floor(free <= floor)
+            }),
+        }
+    }
+}
+
 /// The shim's half, rendered ahead of a `targo`/`targo-tippy` shim's `exec` on macOS:
 /// shell builtins only.
 const SH_BLOCK: &str = r#"# aterm: build intermediates out of Spotlight
@@ -924,7 +956,7 @@ fn reclaim_watched_on(
     record: &mut dyn FnMut(&Path, Unused) -> bool,
     fence: &fence::Fence<'_>,
 ) -> Vec<(PathBuf, Unused)> {
-    reclaim_root_on(root, home, now, after, placing, record, fence).0
+    reclaim_root_on(root, home, now, after.into(), placing, record, fence).0
 }
 
 /// [`reclaim_watched_on`], and whether the record declined a prune, which speaks for what a pass
@@ -933,7 +965,7 @@ fn reclaim_root_on(
     root: &Path,
     home: Option<&Path>,
     now: SystemTime,
-    after: ReclaimAfter,
+    after: ReclaimPolicy<'_>,
     placing: Option<&checkout::Placing>,
     record: &mut dyn FnMut(&Path, Unused) -> bool,
     fence: &fence::Fence<'_>,
@@ -984,7 +1016,7 @@ fn reclaim_moved_on(
             root,
             home: None,
             now,
-            after: ReclaimAfter::MOVED,
+            after: ReclaimAfter::MOVED.into(),
             placing: None,
             moved: true,
             compiler_store: None,
@@ -1007,8 +1039,8 @@ struct Sweep<'a, 'r> {
     root: &'a Path,
     home: Option<&'a Path>,
     now: SystemTime,
-    /// How long a gone workspace's build directory and a stale part must be unwritten.
-    after: ReclaimAfter,
+    /// Whole-cache eligibility stays fixed; stale parts can observe their actual leaf volume.
+    after: ReclaimPolicy<'a>,
     /// What places a workspace nested in a removed checkout ([`checkout::gone_placed`]).
     placing: Option<&'a checkout::Placing>,
     /// `root` is the one the cache moved from ([`reclaim_moved`]): each build directory goes whole once [`MOVED_AFTER`] quiet, or stays whole.
@@ -1158,19 +1190,24 @@ impl Sweep<'_, '_> {
             return false;
         };
         let profiles = profiles_of(&seen.locks);
-        let doomed = stale::decide(
-            &stale::survey(
-                &stale::Disk,
-                leaf,
-                &profiles,
-                self.compiler_store.as_deref(),
-            ),
-            self.now,
-            self.after.stale,
+        // Observe this actual leaf exactly once. Both surveys, the removal
+        // outcome and a no-eligible-parts diagnostic use this same chosen wait.
+        let after = self.after.leaf(leaf);
+        let survey = stale::survey(
+            &stale::Disk,
+            leaf,
+            &profiles,
+            self.compiler_store.as_deref(),
         );
+        let doomed = stale::decide(&survey, self.now, after.stale);
         if doomed.is_empty() {
+            self.fence.note_with(leaf, || KeepReason::NoStaleParts {
+                after: after.stale,
+                observed: stale::observations(&survey, self.now, after.stale),
+            });
             return false;
         }
+        drop(survey);
         if !self.fence.clear(leaf, leaf) {
             return false;
         }
@@ -1190,7 +1227,7 @@ impl Sweep<'_, '_> {
                 self.compiler_store.as_deref(),
             ),
             self.now,
-            self.after.stale,
+            after.stale,
         );
         if doomed.is_empty() {
             self.fence.note(leaf, KeepReason::StaleSetChanged);
@@ -1236,7 +1273,7 @@ impl Sweep<'_, '_> {
             incremental,
             units,
             superseded,
-            after: self.after.stale,
+            after: after.stale,
         };
         // A rename acts by name: a keep published at the leaf as its parts moved would lose
         // them, so custody is read there again once they moved, and one it keeps moves back.
@@ -1308,7 +1345,7 @@ impl Sweep<'_, '_> {
                     workspace_of(root, dir).and_then(|ws| {
                         unused(
                             &child,
-                            &|seen| whole(&ws, seen, home, now, self.after, self.placing),
+                            &|seen| whole(&ws, seen, home, now, self.after.whole(), self.placing),
                             self.fence,
                         )
                     })
@@ -1731,7 +1768,7 @@ pub fn reclaim_home_watched(
         reclaim_roots(
             &home,
             SystemTime::now(),
-            after,
+            after.into(),
             placing,
             true,
             &fence,
@@ -1789,7 +1826,7 @@ pub fn gone_leaves(root: &Path, home: Option<&Path>) -> std::collections::BTreeS
 fn reclaim_roots(
     home: &Path,
     now: SystemTime,
-    after: ReclaimAfter,
+    after: ReclaimPolicy<'_>,
     placing: Option<&checkout::Placing>,
     shared: bool,
     fence: &fence::Fence<'_>,
@@ -1845,7 +1882,7 @@ pub fn reclaim_beside_sessions(
     reclaim_roots(
         home,
         now,
-        ReclaimAfter::by_floor(below_floor),
+        ReclaimAfter::by_floor(below_floor).into(),
         placing,
         below_floor && cfg!(target_os = "macos"),
         &fence::Fence::default(),
@@ -1868,17 +1905,31 @@ pub(crate) fn reclaim_home_report() -> (Vec<(PathBuf, Unused)>, Vec<RetainedChec
     }
     let fence = fence::Fence::default().with_reporting();
     let removed = aterm_types::dirs::home_dir().map_or_else(Vec::new, |home| {
-        reclaim_roots(
+        reclaim_home_report_on(
             &home,
             SystemTime::now(),
-            ReclaimAfter::CALM,
-            None,
-            true,
+            &|path| aterm_capacity::read_volume(path).map(|volume| (volume.free, volume.floor)),
             &fence,
-            &mut |_, _| true,
         )
     });
     (removed, fence.retained())
+}
+
+fn reclaim_home_report_on(
+    home: &Path,
+    now: SystemTime,
+    observe: &dyn Fn(&Path) -> Option<(u64, u64)>,
+    fence: &fence::Fence<'_>,
+) -> Vec<(PathBuf, Unused)> {
+    reclaim_roots(
+        home,
+        now,
+        ReclaimPolicy::Observed(observe),
+        None,
+        true,
+        fence,
+        &mut |_, _| true,
+    )
 }
 
 /// An advisory cleanup candidate from [`plan`]: a whole build directory, its stale parts,
@@ -1937,6 +1988,16 @@ pub fn plan(
     after: ReclaimAfter,
     placing: Option<&checkout::Placing>,
 ) -> Vec<Planned> {
+    plan_on(root, home, now, after.into(), placing)
+}
+
+fn plan_on(
+    root: &Path,
+    home: Option<&Path>,
+    now: SystemTime,
+    after: ReclaimPolicy<'_>,
+    placing: Option<&checkout::Placing>,
+) -> Vec<Planned> {
     let mut planned = Vec::new();
     if std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
         let store = compiler_store(home);
@@ -1952,34 +2013,47 @@ pub fn plan(
 pub fn plan_moved(root: &Path, now: SystemTime) -> Vec<Planned> {
     let mut planned = Vec::new();
     if std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
-        let pass = (root, None, now, ReclaimAfter::MOVED, None, None, true);
+        let pass = (
+            root,
+            None,
+            now,
+            ReclaimPolicy::Fixed(ReclaimAfter::MOVED),
+            None,
+            None,
+            true,
+        );
         plan_walk(pass, root, 0, &mut planned);
     }
     planned
 }
 
 /// Advisory candidates for this user's current, moved, tooling and registered caches, with
-/// the day's age window ([`reclaim_home`]'s). Active use is checked by cleanup. Nothing is
-/// listed off macOS or without a home.
+/// the same observed per-volume stale-parts policy as explicit cleanup. Whole-cache,
+/// moved and tooling policies remain fixed. Active use is checked by cleanup. Nothing
+/// is listed off macOS or without a home.
 #[must_use]
 pub fn plan_home() -> Vec<Planned> {
     if !cfg!(target_os = "macos") {
         return Vec::new();
     }
     aterm_types::dirs::home_dir().map_or_else(Vec::new, |home| {
-        let now = SystemTime::now();
-        let mut planned = plan(
-            &cache_root(&home),
-            Some(&home),
-            now,
-            ReclaimAfter::CALM,
-            None,
-        );
-        planned.extend(plan_moved(&moved_from(&home), now));
-        planned.extend(tooling::plan(&tooling::root(&home), now));
-        planned.extend(registered::plan(&home, now));
-        planned
+        plan_home_on(&home, SystemTime::now(), &|path| {
+            aterm_capacity::read_volume(path).map(|volume| (volume.free, volume.floor))
+        })
     })
+}
+
+fn plan_home_on(
+    home: &Path,
+    now: SystemTime,
+    observe: &dyn Fn(&Path) -> Option<(u64, u64)>,
+) -> Vec<Planned> {
+    let policy = ReclaimPolicy::Observed(observe);
+    let mut planned = plan_on(&cache_root(home), Some(home), now, policy, None);
+    planned.extend(plan_moved(&moved_from(home), now));
+    planned.extend(tooling::plan(&tooling::root(home), now));
+    planned.extend(registered::plan_on(home, now, policy));
+    planned
 }
 
 /// What one [`plan`] judges by: its `root`, `home`, `now`, `after`, `placing`, the
@@ -1988,7 +2062,7 @@ type PlanPass<'a> = (
     &'a Path,
     Option<&'a Path>,
     SystemTime,
-    ReclaimAfter,
+    ReclaimPolicy<'a>,
     Option<&'a checkout::Placing>,
     Option<&'a Path>,
     bool,
@@ -2022,7 +2096,8 @@ fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Pla
             let goes = if was_moved {
                 moved(&seen, now)
             } else {
-                workspace_of(root, dir).and_then(|ws| whole(&ws, &seen, home, now, after, placing))
+                workspace_of(root, dir)
+                    .and_then(|ws| whole(&ws, &seen, home, now, after.whole(), placing))
             };
             if let Some(why) = goes {
                 if stage_for(&child, dir, OsStr::new(DOOMED)).is_some() {
@@ -2040,7 +2115,8 @@ fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Pla
                 continue;
             }
             let survey = stale::survey(&stale::Disk, &child, &profiles_of(&seen.locks), store);
-            let doomed = stale::decide(&survey, now, after.stale);
+            let stale = after.leaf(&child);
+            let doomed = stale::decide(&survey, now, stale.stale);
             if doomed.is_empty() {
                 continue;
             }
@@ -2051,7 +2127,7 @@ fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Pla
                     incremental: count(stale::Part::Incremental),
                     units: count(stale::Part::Unit),
                     superseded: count(stale::Part::Superseded),
-                    after: after.stale,
+                    after: stale.stale,
                 },
                 paths: doomed.into_iter().flat_map(|d| d.paths).collect(),
                 held,

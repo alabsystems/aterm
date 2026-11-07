@@ -1380,3 +1380,86 @@ fn a_private_attachment_is_loopback_alone_and_never_reads_the_lan() {
         Err(Status::Offline)
     );
 }
+
+thread_local! {
+    /// The simulated clock [`serve_paced`] reads in its tests.
+    static SIMULATED: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+fn simulated() -> Instant {
+    SIMULATED
+        .with(std::cell::Cell::get)
+        .expect("the simulated clock is set")
+}
+
+fn advance(by: Duration) {
+    SIMULATED.with(|now| now.set(Some(simulated() + by)));
+}
+
+/// The polled rounds a serving loop ([`serve_paced`]) runs in a simulated minute whose rounds each
+/// take `round`, the loop's [`TICK`] waits advancing the same clock. Counted, never timed.
+fn rounds_in_a_minute(round: Duration) -> usize {
+    let start = Instant::now();
+    SIMULATED.with(|now| now.set(Some(start)));
+    let mut rounds = 0;
+    let served: std::result::Result<(), Status> = serve_paced(
+        simulated,
+        || simulated() >= start + Duration::from_secs(60),
+        advance,
+        |_, due| {
+            if due {
+                rounds += 1;
+                advance(round);
+            }
+            Ok(Flow::Serve)
+        },
+    );
+    assert_eq!(served, Ok(()));
+    rounds
+}
+
+/// A serving loop rests a whole [`POLL`] after each polled round, by the loop itself
+/// ([`serve_paced`], which `serve_selected` and `serve_presence` run under), whatever the round
+/// took: over a simulated minute ticked every [`TICK`], instant rounds run 29 times, one per
+/// [`POLL`], and rounds of 3 s (a busy vault waited for, a slow interface read) 12 times, each 2 s
+/// after the last one ended. Counted on a simulated clock, never timed.
+///
+/// NEGATIVE CONTROLS (2026-11-06), each planted in `serve_paced`, the loop both serving functions
+/// run, not in a helper they call: with the rest left out (`due` never moved), every tick after
+/// the first [`POLL`] runs a round (`left: 580, right: 29`); with the next round due [`POLL`] after
+/// the last one started (`due = now + POLL`, the loops' `poll = now + POLL` before), 3 s rounds
+/// run back to back, one [`TICK`] apart (`left: 19, right: 12`).
+#[test]
+fn a_round_slower_than_the_poll_still_rests_after_it() {
+    assert_eq!(rounds_in_a_minute(Duration::ZERO), 29);
+    assert_eq!(rounds_in_a_minute(Duration::from_secs(3)), 12);
+}
+
+/// A tick that ends a serving loop ends it there, with what it came to: [`Flow::End`] as
+/// `Ok(())`, a refusal as itself, and no wait or tick after it.
+#[test]
+fn a_tick_that_ends_the_loop_ends_it_at_once() {
+    for (ends, outcome) in [
+        (Ok(Flow::End), Ok(())),
+        (Err(Status::Disabled), Err(Status::Disabled)),
+    ] {
+        let start = Instant::now();
+        SIMULATED.with(|now| now.set(Some(start)));
+        let mut ticks = 0;
+        let mut waits = 0;
+        let served = serve_paced(
+            simulated,
+            || false,
+            |rest| {
+                waits += 1;
+                advance(rest);
+            },
+            |_, due| {
+                ticks += 1;
+                if due { ends.clone() } else { Ok(Flow::Serve) }
+            },
+        );
+        assert_eq!(served, outcome);
+        assert_eq!((ticks, waits), (21, 20));
+    }
+}

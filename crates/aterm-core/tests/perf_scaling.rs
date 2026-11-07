@@ -568,6 +568,7 @@ fn hot_scrollback_walks_allocate_only_owned_line_payloads() {
 
 #[test]
 fn engine_steady_state_processing_is_allocation_free() {
+    snapshot_copies_reuse_immutable_payloads();
     glyph_history_restore_reuses_storage();
     image_history_restore_reuses_layer_storage();
     linked_history_restore_reuses_payload_storage();
@@ -600,4 +601,60 @@ fn engine_steady_state_processing_is_allocation_free() {
     );
 
     render_extras_avoid_temporary_allocations();
+}
+
+fn snapshot_copies_reuse_immutable_payloads() {
+    use aterm_core::terminal::Terminal;
+    use std::hint::black_box;
+
+    for glyph in ["👩‍💻", "e\u{301}\u{302}\u{303}\u{304}\u{305}"] {
+        for (rows, cols) in [(1, 8), (24, 80)] {
+            let mut term = Terminal::new(rows, cols);
+            for row in 0..rows {
+                term.process(
+                    format!("\x1b[{};1H{}", row + 1, glyph.repeat(usize::from(cols) / 2))
+                        .as_bytes(),
+                );
+            }
+            let mut source = term.cell_frame(usize::from(rows), usize::from(cols));
+            source.apron_row.present = true;
+            source.apron_row.clusters.push((1, Box::from("👩‍💻")));
+            source
+                .apron_row
+                .combining
+                .push((2, Box::from(['\u{301}', '\u{302}'])));
+            let mut target = source.clone();
+            for damage_cache in [false, true] {
+                let calls = count_allocations(|| {
+                    for _ in 0..64 {
+                        if damage_cache {
+                            black_box(&mut target).clone_damage_cache_from(black_box(&source));
+                        } else {
+                            black_box(&mut target).clone_from(black_box(&source));
+                        }
+                    }
+                });
+                assert_eq!(
+                    calls, 0,
+                    "{glyph:?} {rows}x{cols}, damage_cache={damage_cache}"
+                );
+                assert_eq!(target, source);
+            }
+            source.clusters[0] = vec![(3, Box::from("👨‍👩‍👧"))];
+            source.combining[0] = vec![(5, Box::from(['\u{303}']))];
+            source.apron_row.clusters.clear();
+            source.apron_row.combining = vec![(1, Box::from(['\u{304}']))];
+            target.clone_damage_cache_from(&source);
+            assert_eq!(target, source);
+            assert_eq!(target.apron_row.clusters, source.apron_row.clusters);
+            assert_eq!(target.apron_row.combining, source.apron_row.combining);
+            source.clusters.clear();
+            source.combining.clear();
+            source.apron_row.clear();
+            target.clone_from(&source);
+            assert_eq!(target, source);
+            assert!(target.apron_row.clusters.is_empty());
+            assert!(target.apron_row.combining.is_empty());
+        }
+    }
 }

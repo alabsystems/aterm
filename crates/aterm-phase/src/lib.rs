@@ -61,9 +61,11 @@ pub use panel::{
     PanelRenderer, SettingsPanel, panel_tail, settings_panel, usage_tab_mark, usage_unsettled,
 };
 pub use phase::{
-    ApiRetryRow, Phase, RetryCause, api_retry_row, background_only, background_rest, busy_signal,
-    busy_zone_start, context_left, limit_notice, notice_reset, opened_by_own_wake, shells_running,
-    transcript_end, turn_over_background, worker_phase,
+    ApiRetryRow, Phase, RetryCause, api_retry_row, background_only, background_rest,
+    background_rest_seen, background_wait_seen, busy_seen, busy_signal, busy_zone_start,
+    context_left, delegated_shown, limit_notice, notice_reset, opened_by_own_wake, shells_running,
+    title_live, title_rests, title_runs, transcript_end, turn_over_background, worker_phase,
+    worker_phase_seen,
 };
 pub use prompt::{
     Opt, Origin, PromptKind, PromptV2, Role, footer_keys, parse_prompt, parse_prompt_v2,
@@ -76,7 +78,7 @@ pub use question::{
 pub use reader::{
     AgyReader, BLANK_GAP, ClaudeReader, CodexReader, GenericReader, GrokReader, KimiReader,
     MuseReader, Program, RETIRED_AGENT, RETIRED_AGENTS, Reading, ScreenReader, identify,
-    live_zone_reaches_above, live_zone_start, may_host_agent, program_of, read, read_at,
+    live_zone_reaches_above, live_zone_start, may_host_agent, program_of, read, read_at, read_seen,
     retired_agent, shell_alone,
 };
 pub use reset::{

@@ -48,6 +48,8 @@ struct Node {
     relay_stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<ExitCode>>,
     log: Arc<LocalLog>,
+    /// The `[fleet] listen` of each generation the job started serving, in order.
+    served: Arc<std::sync::Mutex<Vec<String>>>,
     _relay: aterm_tempfile::TempDir,
 }
 
@@ -57,6 +59,8 @@ impl Node {
         let stop = Arc::new(AtomicBool::new(false));
         let relay_stop = Arc::new(AtomicBool::new(false));
         let log = Arc::new(LocalLog::of(&machine.vault));
+        let served = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let told = Arc::clone(&served);
         let launcher = Arc::new(MockWindowLauncher::new(true, true, Arc::clone(&relay_stop)));
         let bell = Arc::new(aterm_secrets::wake::Bell::default());
         let browse = aterm_secrets::discover::Watch::idle_for(
@@ -73,6 +77,11 @@ impl Node {
             members: Some(Arc::clone(&log)),
             alab_browse: Some(Arc::new(browse)),
             prebound_listener: Some(listener),
+            on_generation: Some(Arc::new(move |listen: &str| {
+                told.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(listen.to_owned());
+            })),
             tick_every: Duration::from_millis(20),
             wake_timeout: DIAL_WITHIN,
             stop: Arc::clone(&stop),
@@ -86,8 +95,18 @@ impl Node {
             relay_stop,
             worker: Some(std::thread::spawn(move || run_node_serve_with(cfg))),
             log,
+            served,
             _relay: relay,
         }
+    }
+
+    /// Whether a generation the job started serves `listen`.
+    fn serves(&self, listen: &str) -> bool {
+        self.served
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|served| served == listen)
     }
 
     fn finish(mut self) {
@@ -277,6 +296,26 @@ fn a_fresh_vault_member_joins_the_default_fleet_and_can_be_driven() {
         .unwrap()
         .unwrap();
     assert_eq!(read_key_file(&newcomer.state).unwrap(), secret);
+    // A generation the job started before the sync's last write (the key with no `[fleet]` yet
+    // serves the default listen) is ended by its watch once it reads the listen the sync wrote,
+    // and a drive it admitted is hung up as it ends. So the drive waits for a generation that
+    // serves that listen, which nothing ends from here on, and for the node key each generation
+    // binds in the membership log as it starts.
+    let written: aterm_toml::edit::DocumentMut = std::fs::read_to_string(&newcomer.config)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let listen = written
+        .get("fleet")
+        .and_then(|fleet| fleet.get("listen"))
+        .and_then(aterm_toml::edit::Item::as_str)
+        .expect("the sync wrote a [fleet] listen")
+        .to_owned();
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "a node generation serves the [fleet] listen the sync wrote",
+        || newcomer_node.serves(&listen).then_some(()),
+    );
     let keys = aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
         "the node generation binds its key in the real membership log",

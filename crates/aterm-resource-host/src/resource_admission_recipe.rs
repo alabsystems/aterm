@@ -17,6 +17,68 @@ use std::{
 pub(super) enum Kind {
     Ay,
     Targo,
+    Metadata,
+    Resolver,
+}
+pub(super) struct Probe {
+    worker: Option<preparation::Worker<()>>,
+    receive: std::sync::mpsc::Receiver<io::Result<Option<Recipe>>>,
+}
+impl Probe {
+    #[cfg(test)]
+    pub(super) fn paused() -> (Self, std::sync::mpsc::SyncSender<()>) {
+        let (release, wait) = std::sync::mpsc::sync_channel(0);
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let _ = wait.recv_timeout(Duration::from_secs(60));
+            let _ = send.send(Err(refused(
+                "controlled preparation did not qualify an executable",
+            )));
+        });
+        (
+            Self {
+                receive,
+                worker: Some(preparation::Worker::new(worker)),
+            },
+            release,
+        )
+    }
+    pub(super) fn poll(&mut self) -> io::Result<Option<Option<Recipe>>> {
+        if !self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+        {
+            return Ok(None);
+        }
+        self.worker
+            .take()
+            .ok_or_else(|| refused("missing recipe worker"))?
+            .join()
+            .map_err(|_| refused("recipe worker failed"))?;
+        self.receive
+            .try_recv()
+            .map_err(|_| refused("recipe probe unavailable"))?
+            .map(Some)
+    }
+    pub(super) fn finished(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_none_or(|worker| worker.is_finished())
+    }
+}
+pub(super) fn metadata_request(request: &Submission) -> bool {
+    request.cpu_units == 1
+        && request
+            .timeout_ms
+            .is_some_and(|ms| (1..=600_000).contains(&ms))
+        && matches!(request.argv.as_slice(), [_, purpose] if purpose == b"--resource-metadata-v1")
+}
+pub(super) fn metadata_purpose(request: &Submission) -> bool {
+    request
+        .argv
+        .get(1)
+        .is_some_and(|word| word == b"--resource-metadata-v1")
 }
 pub(super) struct Recipe {
     pub(super) kind: Kind,
@@ -25,13 +87,15 @@ pub(super) struct Recipe {
     pub(super) environment: Vec<(OsString, OsString)>,
     pub(super) cwd: PathBuf,
     pub(super) width: u32,
+    pub(super) metadata_sdk: Option<std::sync::Arc<sdk::Keeper>>,
     pub(super) compiler: Option<compiler::Selection>,
 }
 impl Recipe {
-    pub(super) fn probe(
+    pub(super) fn probe_in(
         request: &Submission,
         physical: u32,
-    ) -> io::Result<std::sync::mpsc::Receiver<io::Result<Option<Self>>>> {
+        layout: Option<atpkg::store::Layout>,
+    ) -> io::Result<Probe> {
         // This copy is private input for recipe selection, never a peer or
         // admission credential. Only the queue head may own an active probe.
         let copied = Submission {
@@ -47,14 +111,44 @@ impl Recipe {
             timeout_ms: request.timeout_ms,
         };
         let (send, receive) = std::sync::mpsc::sync_channel(1);
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("resource-recipe-probe".into())
             .spawn(move || {
-                let _ = send.send(Self::qualify(&copied, physical));
+                let qualified = match layout {
+                    Some(layout) => Self::qualify_in(&copied, physical, Some(&layout)),
+                    None => Self::qualify(&copied, physical),
+                };
+                let _ = send.send(qualified);
             })?;
-        Ok(receive)
+        Ok(Probe {
+            receive,
+            worker: Some(preparation::Worker::new(worker)),
+        })
     }
     pub(super) fn qualify(request: &Submission, physical: u32) -> io::Result<Option<Self>> {
+        Self::qualify_in(
+            request,
+            physical,
+            atpkg::store::resolve_configured().as_ref(),
+        )
+    }
+    /// The layout is trusted owner configuration, never a request/environment
+    /// authority. Private native qualification supplies its own manager store.
+    pub(super) fn qualify_in(
+        request: &Submission,
+        physical: u32,
+        layout: Option<&atpkg::store::Layout>,
+    ) -> io::Result<Option<Self>> {
+        if metadata_purpose(request) && !metadata_request(request) {
+            return Err(refused(
+                "metadata service requires the closed fixed-one request",
+            ));
+        }
+        if resolver_root::purpose(request) && !resolver_root::closed_request(request) {
+            return Err(refused(
+                "resolver service requires the closed fixed-one request",
+            ));
+        }
         if request.cpu_units > physical {
             return Err(refused("requested CPU width exceeds this host"));
         }
@@ -91,6 +185,48 @@ impl Recipe {
         // Never execute an arbitrary argv merely because its basename claims
         // to be a native capability query. Partial overlap requires the actual
         // manager-selected complete artifact, not PATH or stdout as authority.
+        let managed = requested
+            .filter(|name| matches!(*name, "ay" | "targo"))
+            .and_then(|name| managed_artifact_in(layout?, name, &program));
+        if metadata_request(request) || resolver_root::closed_request(request) {
+            let selected =
+                managed.ok_or_else(|| refused("managed metadata service unavailable"))?;
+            if requested != Some("targo") {
+                return Err(refused(
+                    "metadata service is not the selected managed Targo",
+                ));
+            }
+            let resolver = resolver_root::closed_request(request);
+            let mut environment = service_environment(request, &selected, resolver)?;
+            // No preparatory subprocess: actual ARM/BIND/root ownership must
+            // exist before ANY selected service code runs. Live readiness is
+            // negotiated by that same original root before member admission.
+            let sdk = sdk::Keeper::capture(
+                layout.ok_or_else(|| refused("managed service layout unavailable"))?,
+                &selected.target,
+            )?;
+            if resolver {
+                sdk.require_resolver_protocol(Instant::now() + Duration::from_secs(30))?;
+            }
+            for (key, value) in sdk.runtime_environment()? {
+                environment.retain(|(old, _)| old != &key);
+                environment.push((key, value));
+            }
+            return Ok(Some(Self {
+                kind: if resolver {
+                    Kind::Resolver
+                } else {
+                    Kind::Metadata
+                },
+                program: selected.target,
+                arguments,
+                environment,
+                cwd,
+                width: 1,
+                metadata_sdk: Some(sdk),
+                compiler: None,
+            }));
+        }
         let compiler = if requested == Some("targo") {
             let Some(selected) = compiler::select(request, &program)? else {
                 return Ok(None);
@@ -166,15 +302,17 @@ impl Recipe {
             environment.push((key.as_str().into(), value.as_str().into()));
         }
         let width = request.cpu_units;
-        if arguments
-            .first()
-            .is_none_or(|arg| arg != "--resource-worker-v3")
+        if !matches!(kind, Kind::Metadata)
+            && arguments
+                .first()
+                .is_none_or(|arg| arg != "--resource-worker-v3")
         {
             arguments.insert(0, "--resource-worker-v3".into());
         }
-        if arguments
-            .get(1)
-            .is_none_or(|arg| arg != "--resource-subgroups-v3")
+        if !matches!(kind, Kind::Metadata)
+            && arguments
+                .get(1)
+                .is_none_or(|arg| arg != "--resource-subgroups-v3")
         {
             arguments.insert(1, "--resource-subgroups-v3".into());
         }
@@ -185,6 +323,7 @@ impl Recipe {
             environment,
             cwd,
             width,
+            metadata_sdk: None,
             compiler,
         }))
     }
@@ -196,9 +335,98 @@ impl Recipe {
             .env_clear()
             .envs(self.environment.iter().map(|(key, value)| (key, value)))
             .current_dir(&self.cwd)
+            .setsid(matches!(self.kind, Kind::Metadata))
             .start_suspended(true);
         command
     }
+}
+
+fn service_environment(
+    request: &Submission,
+    selected: &atpkg::ops::Managed,
+    resolver: bool,
+) -> io::Result<Vec<(OsString, OsString)>> {
+    let resolver_keys: &[&[u8]] = &[b"CARGO_HOME", b"CARGO", b"RUSTC", b"CARGO_CACHE_RUSTC_INFO"];
+    let compiler = selected
+        .target
+        .parent()
+        .ok_or_else(|| refused("SDK bin missing"))?
+        .join("trustc");
+    if resolver
+        && resolver_keys
+            .iter()
+            .any(|key| !request.env.iter().any(|(name, _)| name == key))
+    {
+        return Err(refused(
+            "resolver root requires explicit request-bound Cargo environment",
+        ));
+    }
+    for (key, value) in &request.env {
+        let resolver_value = if resolver {
+            match key.as_slice() {
+                b"CARGO" => Some(value == selected.target.as_os_str().as_bytes()),
+                b"RUSTC" => Some(value == compiler.as_os_str().as_bytes()),
+                b"CARGO_CACHE_RUSTC_INFO" => Some(value == b"0"),
+                b"CARGO_HOME" => Some(
+                    value.len() > 1
+                        && value.len() <= 4096
+                        && value.starts_with(b"/")
+                        && !value.contains(&0)
+                        && value[1..]
+                            .split(|byte| *byte == b'/')
+                            .all(|part| !part.is_empty() && part != b"." && part != b".."),
+                ),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if resolver_value == Some(false) {
+            return Err(refused(
+                "resolver environment differs from the selected SDK/profile",
+            ));
+        }
+        let semantic = matches!(key.as_slice(), b"LANG" | b"LC_ALL") && value == b"C";
+        let selection = key == b"PATH";
+        let owned = selected
+            .env
+            .entries()
+            .iter()
+            .any(|(name, expected)| key == name.as_bytes() && value == expected.as_bytes());
+        if !semantic && !selection && !owned && resolver_value != Some(true) {
+            return Err(refused(
+                "metadata service environment is outside the closed native profile",
+            ));
+        }
+    }
+    let mut environment: Vec<(OsString, OsString)> = vec![
+        ("LANG".into(), "C".into()),
+        ("LC_ALL".into(), "C".into()),
+        (
+            "ATERM_SESSION_ID".into(),
+            request.binding.session.clone().into(),
+        ),
+        (
+            "ATERM_PARENT_SESSION_ID".into(),
+            request.binding.session.clone().into(),
+        ),
+    ];
+    for (key, value) in selected.env.entries() {
+        environment.retain(|(old, _)| old != key.as_str());
+        environment.push((key.as_str().into(), value.as_str().into()));
+    }
+    if resolver {
+        for (key, value) in &request.env {
+            if resolver_keys.contains(&key.as_slice()) {
+                environment.retain(|(old, _)| old.as_bytes() != key);
+                environment.push((
+                    OsString::from_vec(key.clone()),
+                    OsString::from_vec(value.clone()),
+                ));
+            }
+        }
+    }
+    Ok(environment)
 }
 
 fn ay(value: &aterm_json::Value, words: &[Option<&str>]) -> bool {
@@ -287,7 +515,14 @@ pub(super) fn resolve(request: &Submission) -> io::Result<PathBuf> {
 
 pub(super) fn managed_artifact(name: &str, selected: &Path) -> Option<atpkg::ops::Managed> {
     let layout = atpkg::store::resolve_configured()?;
-    let managed = atpkg::ops::managed(&layout, name)?;
+    managed_artifact_in(&layout, name, selected)
+}
+fn managed_artifact_in(
+    layout: &atpkg::store::Layout,
+    name: &str,
+    selected: &Path,
+) -> Option<atpkg::ops::Managed> {
+    let managed = atpkg::ops::managed(layout, name)?;
     let target = managed.target.canonicalize().ok()?;
     let (program, build) = atpkg::ops::store_build_of(&layout.prefix, &target)?;
     if !atpkg::store::build_is_complete(&layout.build_dir(&program, build)) {
@@ -309,6 +544,47 @@ pub(super) fn managed_artifact(name: &str, selected: &Path) -> Option<atpkg::ops
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn malformed_metadata_purpose_cannot_fall_back_to_a_legacy_preparation_probe() {
+        let mut request = Submission {
+            binding: Binding {
+                session: "s-a".into(),
+                attempt: [1; 16],
+            },
+            peer_pid: std::process::id(),
+            peer_birth: 1,
+            argv: vec![
+                b"/does-not-exist/targo".to_vec(),
+                b"--resource-metadata-v1".to_vec(),
+            ],
+            cwd: b"/".to_vec(),
+            env: Vec::new(),
+            cpu_units: 2,
+            memory_bytes: 1024,
+            label: "closed metadata purpose".into(),
+            timeout_ms: Some(600_000),
+        };
+        for extra in [false, true] {
+            if extra {
+                request.cpu_units = 1;
+                request.argv.push(b"unexpected".to_vec());
+            }
+            let error = Recipe::qualify_in(&request, 2, None)
+                .err()
+                .expect("closed profile must refuse");
+            assert!(
+                error.to_string().contains("closed fixed-one request"),
+                "refuse BEFORE executable/store selection: {error}"
+            );
+        }
+        request.argv.pop();
+        for timeout in [None, Some(600_001), Some(u64::MAX)] {
+            request.timeout_ms = timeout;
+            assert!(!metadata_request(&request));
+            let error = Recipe::qualify_in(&request, 2, None).err().unwrap();
+            assert!(error.to_string().contains("closed fixed-one request"));
+        }
+    }
     #[test]
     fn original_root_discards_ancestor_jobserver_endpoints() {
         assert!(stale_fd_var(

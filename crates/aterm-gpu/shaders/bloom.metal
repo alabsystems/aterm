@@ -86,7 +86,7 @@ static inline float white_part(float3 c) {
     return min(min(c.r, c.g), c.b);
 }
 
-// One 25-tap gaussian kernel, two radii (design §L5): the source's white part
+// One gaussian kernel (25 taps, 49 past a radius of 6), two radii (design §L5): the source's white part
 // spreads at `radius`, its chroma at the shorter `chroma_radius`, and the two sum
 // into one halo, so a meteor reads as an over-white streak dying into a coloured
 // train and less colour smears into the glyphs beside it.
@@ -97,11 +97,16 @@ fragment float4 fs_bloom(VsOut in [[stage_in]],
     float white = 0.0;
     float3 chroma = float3(0.0, 0.0, 0.0);
     float wsum = 0.0;
-    for (int j = -2; j <= 2; j = j + 1) {
-        for (int i = -2; i <= 2; i = i + 1) {
-            float2 tap = float2(float(i), float(j)) * bu.texel;
+    // `taps_per_side` (aterm-render's bloom.rs): two taps a side to a radius of 6, three
+    // past it, so no two taps stand wider apart than 6 texels.
+    int n = clamp(int(ceil(bu.radius / 3.0)), 2, 3);
+    float step = 2.0 / float(n);
+    float spread = float(n * n);
+    for (int j = -n; j <= n; j = j + 1) {
+        for (int i = -n; i <= n; i = i + 1) {
+            float2 tap = float2(float(i), float(j)) * step * bu.texel;
             float d2 = float(i * i + j * j);
-            float w = exp(-d2 / 4.0);
+            float w = exp(-d2 / spread);
             float3 sw = bloom_src.sample(bloom_samp, in.uv + tap * bu.radius).rgb;
             white = white + white_part(sw) * w;
             float3 sc = bloom_src.sample(bloom_samp, in.uv + tap * bu.chroma_radius).rgb;

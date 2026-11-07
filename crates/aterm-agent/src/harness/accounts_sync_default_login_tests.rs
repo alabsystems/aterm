@@ -61,7 +61,7 @@ impl Bed {
         fs::create_dir_all(&config).unwrap();
         fs::create_dir_all(&state).unwrap();
         let toml = config.join("aterm.toml");
-        fs::write(&toml, "").unwrap();
+        crate::test_config::write(&toml, "").unwrap();
         let env = Env {
             state,
             aterm_state: None,
@@ -791,7 +791,7 @@ impl Bed {
             })
             .collect();
         fs::write(secrets.join(cli_fleet_file(cli)), rows).unwrap();
-        fs::write(&self.toml, "[fleet]\nmachine = \"m16\"\n").unwrap();
+        crate::test_config::write(&self.toml, "[fleet]\nmachine = \"m16\"\n").unwrap();
     }
 
     /// `accounts sync --cli <id>` with no source named, `--json`: its exit, document and stderr.
@@ -1253,7 +1253,7 @@ fn the_report_and_the_sync_judge_a_source_that_changes_a_hold_alike() {
     let bed = Bed::new();
     let ann = email("ann");
     bed.fleet_file(cli, &[("codex-aaaaaa", &ann)]);
-    fs::write(&bed.toml, "").unwrap();
+    crate::test_config::write(&bed.toml, "").unwrap();
     seed(&bed, &ann, false);
     let (code, doc, err) = bed.sync_plain_any(cli);
     if code == ExitCode::SUCCESS {
@@ -1279,7 +1279,7 @@ fn the_report_and_the_sync_judge_a_source_that_changes_a_hold_alike() {
             ),
         )
         .unwrap();
-        fs::write(&bed.toml, "[fleet]\nmachine = \"m16\"\n").unwrap();
+        crate::test_config::write(&bed.toml, "[fleet]\nmachine = \"m16\"\n").unwrap();
         seed(&bed, &ann, false);
         let named = report_folds(&bed, cli, &ann, None);
         let (code, doc, err) = bed.sync_plain(cli);

@@ -17,8 +17,11 @@ mod recovery;
 /// Where the tools install.
 pub const CLT_DIR: &str = "/Library/Developer/CommandLineTools";
 
-/// The file whose presence means the tools are installed.
+/// The Git executable supplied by the tools.
 pub const CLT_GIT: &str = "/Library/Developer/CommandLineTools/usr/bin/git";
+
+/// The compiler executable supplied by the tools.
+pub const CLT_CLANG: &str = "/Library/Developer/CommandLineTools/usr/bin/clang";
 
 /// The tools' package receipt (its version is the report's).
 pub const CLT_RECEIPT: &str = "com.apple.pkg.CLTools_Executables";
@@ -299,11 +302,15 @@ fn selected(sys: &dyn System) -> Result<Option<String>, String> {
 }
 
 fn installed(sys: &dyn System) -> Result<bool, String> {
-    match sys.stat(Path::new(CLT_GIT)) {
-        Ok(_) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(format!("{CLT_GIT}: {e}")),
+    for executable in [CLT_GIT, CLT_CLANG] {
+        match sys.stat(Path::new(executable)) {
+            Ok(stat) if !stat.dir && !stat.symlink && stat.mode & 0o111 != 0 && stat.len > 0 => {}
+            Ok(_) => return Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(format!("{executable}: {e}")),
+        }
     }
+    Ok(true)
 }
 
 fn receipt_version(sys: &dyn System) -> Option<String> {
@@ -618,9 +625,7 @@ impl CommandLineTools {
                 format!("{}: {}", install.display(), ran.describe()),
             ));
         }
-        if !installed(sys).map_err(|why| Failure::new(Unfinished::Other, why))?
-            && receipt_version(sys).is_none()
-        {
+        if !installed(sys).map_err(|why| Failure::new(Unfinished::Other, why))? {
             let said = ran
                 .err()
                 .lines()
@@ -632,7 +637,7 @@ impl CommandLineTools {
             return Err(Failure::new(
                 Unfinished::Installer,
                 format!(
-                    "{} exited 0 but installed nothing ({CLT_RECEIPT} has no receipt): {said}",
+                    "{} exited 0 but the Git and compiler executables are not both installed: {said}",
                     install.display()
                 ),
             ));
@@ -883,12 +888,41 @@ mod tests {
             .on("/usr/bin/xcode-select -p", Ran::ok(&format!("{CLT_DIR}\n")))
             .on(RETAINED_INSTALL, installed_quietly())
             .on_stat(RETAINED_INSTALL, Path::new(CLT_GIT), git())
+            .on_stat(RETAINED_INSTALL, Path::new(CLT_CLANG), git())
             .on(PKGUTIL, Ran::ok(RECEIPT))
             .on(
                 "/usr/bin/xcode-select --switch /Library/Developer/CommandLineTools",
                 Ran::ok(""),
             );
         sys
+    }
+
+    #[test]
+    fn a_remaining_git_does_not_hide_a_missing_compiler_from_repair() {
+        for compiler in [
+            None,
+            Some(Stat { dir: true, ..git() }),
+            Some(Stat {
+                symlink: true,
+                ..git()
+            }),
+            Some(Stat {
+                mode: 0o644,
+                ..git()
+            }),
+            Some(Stat { len: 0, ..git() }),
+        ] {
+            let sys = retained_system();
+            sys.stat_of(CLT_GIT, git())
+                .on(SOFTWAREUPDATE_LIST, Ran::ok(VM_LIST));
+            if let Some(compiler) = compiler {
+                sys.stat_of(CLT_CLANG, compiler);
+            }
+            let rows = engine::run(&retained_items(), Mode::Apply, &sys, &ctx(), &mut NoJournal);
+            assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
+            assert!(sys.calls().iter().any(|call| call == RETAINED_INSTALL));
+            assert!(installed(&sys).unwrap());
+        }
     }
 
     const RETAINED_INSTALL: &str =
@@ -1316,6 +1350,8 @@ Software Update found the following new or updated software:\n\
             "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
             installed_quietly(),
         )
+        .on_stat(RETAINED_INSTALL, Path::new(CLT_GIT), git())
+        .on_stat(RETAINED_INSTALL, Path::new(CLT_CLANG), git())
         .on(PKGUTIL, Ran::ok(RECEIPT));
         CommandLineTools::install(&sys).unwrap();
         let calls = sys.calls();
@@ -1385,7 +1421,7 @@ Software Update found the following new or updated software:\n\
             );
             if !low_data {
                 sys.on_sleep(|sys, _| {
-                    sys.stat_of(CLT_GIT, git());
+                    sys.stat_of(CLT_GIT, git()).stat_of(CLT_CLANG, git());
                 });
             }
             let result = CommandLineTools::install(&sys);
@@ -1425,6 +1461,13 @@ Software Update found the following new or updated software:\n\
                 )
                 .on(INSTALL, installed_quietly())
                 .on(PKGUTIL, Ran::ok(RECEIPT));
+            sys.on_sleep(|sys, _| {
+                sys.on_stat(INSTALL, Path::new(CLT_GIT), git()).on_stat(
+                    INSTALL,
+                    Path::new(CLT_CLANG),
+                    git(),
+                );
+            });
             let result = CommandLineTools::install(&sys);
             if reached_installer {
                 assert_eq!(result.unwrap_err().class, Unfinished::Installer);
@@ -1505,6 +1548,7 @@ Software Update found the following new or updated software:\n\
     fn installed_and_selected_tools_are_ok_with_their_receipt_version() {
         let sys = Fake::root();
         sys.stat_of(CLT_GIT, git())
+            .stat_of(CLT_CLANG, git())
             .on(
                 "/usr/bin/xcode-select -p",
                 Ran::ok("/Library/Developer/CommandLineTools\n"),
@@ -1543,6 +1587,8 @@ Software Update found the following new or updated software:\n\
                 "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
                 installed_quietly(),
             )
+            .on_stat(RETAINED_INSTALL, Path::new(CLT_GIT), git())
+            .on_stat(RETAINED_INSTALL, Path::new(CLT_CLANG), git())
             .on(PKGUTIL, Ran::ok(RECEIPT))
             .on(
                 "/usr/bin/xcode-select --switch /Library/Developer/CommandLineTools",
@@ -1567,7 +1613,7 @@ Software Update found the following new or updated software:\n\
                 }
             );
             items[0].apply(&sys, &ctx()).unwrap();
-            sys.stat_of(CLT_GIT, git());
+            sys.stat_of(CLT_GIT, git()).stat_of(CLT_CLANG, git());
             items[0].probe(&sys, &ctx())
         };
         assert!(matches!(rows, Probe::Ok { .. }), "{rows:?}");
@@ -1618,6 +1664,8 @@ Software Update found the following new or updated software:\n\
                 "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
                 installed_quietly(),
             )
+            .on_stat(RETAINED_INSTALL, Path::new(CLT_GIT), git())
+            .on_stat(RETAINED_INSTALL, Path::new(CLT_CLANG), git())
             .on(PKGUTIL, Ran::ok(RECEIPT));
         CommandLineTools::install(&unstopped).unwrap();
         let calls = unstopped.calls();
@@ -1690,6 +1738,8 @@ Software Update found the following new or updated software:\n\
                 "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
                 installed_quietly(),
             )
+            .on_stat(RETAINED_INSTALL, Path::new(CLT_GIT), git())
+            .on_stat(RETAINED_INSTALL, Path::new(CLT_CLANG), git())
             .on(PKGUTIL, Ran::ok(RECEIPT));
         CommandLineTools::install(&sys).unwrap();
         let calls = sys.calls();
@@ -1753,7 +1803,7 @@ Software Update found the following new or updated software:\n\
         let sys = Fake::root();
         sys.on(SOFTWAREUPDATE_LIST, Ran::ok("No new software available.\n"));
         sys.on_sleep(|sys, _| {
-            sys.stat_of(CLT_GIT, git());
+            sys.stat_of(CLT_GIT, git()).stat_of(CLT_CLANG, git());
         });
         CommandLineTools::install(&sys).unwrap();
         let calls = sys.calls();
@@ -1796,7 +1846,7 @@ Software Update found the following new or updated software:\n\
                     .count()
                     == 2
                 {
-                    sys.stat_of(CLT_GIT, git());
+                    sys.stat_of(CLT_GIT, git()).stat_of(CLT_CLANG, git());
                 }
             });
             CommandLineTools::install(&sys).unwrap();
@@ -1824,6 +1874,8 @@ Software Update found the following new or updated software:\n\
                 "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
                 installed_quietly(),
             )
+            .on_stat(RETAINED_INSTALL, Path::new(CLT_GIT), git())
+            .on_stat(RETAINED_INSTALL, Path::new(CLT_CLANG), git())
             .on(PKGUTIL, Ran::ok(RECEIPT));
         assert_eq!(holder(&control, false), Holder::Nothing);
         CommandLineTools::install(&control).unwrap();
@@ -1852,7 +1904,7 @@ Software Update found the following new or updated software:\n\
                     &["/sbin/launchd", APPLE_WINDOW],
                 );
             sys.on_sleep(|sys, _| {
-                sys.stat_of(CLT_GIT, git());
+                sys.stat_of(CLT_GIT, git()).stat_of(CLT_CLANG, git());
             });
             CommandLineTools::install(&sys).unwrap();
             let calls = sys.calls();
@@ -1971,6 +2023,8 @@ Software Update found the following new or updated software:\n\
                 "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
                 installed_quietly(),
             )
+            .on_stat(RETAINED_INSTALL, Path::new(CLT_GIT), git())
+            .on_stat(RETAINED_INSTALL, Path::new(CLT_CLANG), git())
             .on(PKGUTIL, Ran::ok(RECEIPT));
         CommandLineTools::install(&sys).unwrap();
         let calls = sys.calls();
@@ -2017,36 +2071,56 @@ Software Update found the following new or updated software:\n\
     }
 
     #[test]
-    fn an_install_softwareupdate_refused_with_exit_0_fails_with_its_own_words() {
-        let sys = Fake::root();
-        sys.on("/usr/bin/xcode-select -p", none_selected())
-            .on("/usr/sbin/softwareupdate -l", Ran::ok(VM_LIST))
-            .on(
-                "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
-                no_space(),
-            )
-            .on(PKGUTIL, no_receipt());
-        let items = expand(
-            &Table {
-                command_line_tools: Some(true),
-                debugger: None,
-                ..Table::default()
-            },
-            &ctx(),
-        )
-        .unwrap();
-        let rows = engine::run(&items, Mode::Apply, &sys, &ctx(), &mut NoJournal);
-        assert_eq!(rows[0].outcome, Outcome::Failed);
-        let why = rows[0].why.as_deref().unwrap();
-        assert!(why.contains("installed nothing"), "{why}");
-        assert!(why.contains("9.52 GB is required"), "{why}");
-        let calls = sys.calls();
-        assert!(calls.iter().all(|c| !c.contains("--switch")));
-        assert!(
-            calls
-                .iter()
-                .any(|c| c.starts_with("remove /tmp/.com.apple.dt"))
-        );
+    fn an_install_refused_with_exit_0_fails_even_with_a_stale_receipt() {
+        for stat in [
+            None,
+            Some(Stat { dir: true, ..git() }),
+            Some(Stat {
+                symlink: true,
+                ..git()
+            }),
+            Some(Stat {
+                mode: 0o644,
+                ..git()
+            }),
+            Some(Stat { len: 0, ..git() }),
+        ] {
+            for receipt in [no_receipt(), Ran::ok(RECEIPT)] {
+                let sys = Fake::root();
+                sys.stat_of(CLT_CLANG, git());
+                if let Some(stat) = stat {
+                    sys.stat_of(CLT_GIT, stat);
+                }
+                sys.on("/usr/bin/xcode-select -p", none_selected())
+                    .on("/usr/sbin/softwareupdate -l", Ran::ok(VM_LIST))
+                    .on(
+                        "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
+                        no_space(),
+                    )
+                    .on(PKGUTIL, receipt);
+                let items = expand(
+                    &Table {
+                        command_line_tools: Some(true),
+                        debugger: None,
+                        ..Table::default()
+                    },
+                    &ctx(),
+                )
+                .unwrap();
+                let rows = engine::run(&items, Mode::Apply, &sys, &ctx(), &mut NoJournal);
+                assert_eq!(rows[0].outcome, Outcome::Failed);
+                let why = rows[0].why.as_deref().unwrap();
+                assert!(why.contains("9.52 GB is required"), "{why}");
+                let calls = sys.calls();
+                assert!(calls.iter().all(|c| !c.contains("--switch")));
+                assert!(
+                    calls
+                        .iter()
+                        .any(|c| c.starts_with("remove /tmp/.com.apple.dt"))
+                );
+                assert_eq!(items[0].unfinished(), Some(Unfinished::Installer));
+            }
+        }
     }
 
     #[test]
@@ -2066,6 +2140,7 @@ Software Update found the following new or updated software:\n\
             .on(SOFTWAREUPDATE_LIST, Ran::ok(VM_LIST))
             .on(install, installed_quietly())
             .on_stat(install, Path::new(CLT_GIT), git())
+            .on_stat(install, Path::new(CLT_CLANG), git())
             .on(PKGUTIL, Ran::ok(RECEIPT))
             .on(
                 "/usr/bin/xcode-select --switch /Library/Developer/CommandLineTools",
@@ -2104,6 +2179,7 @@ Software Update found the following new or updated software:\n\
     fn installed_tools_with_nothing_selected_are_only_selected() {
         let sys = Fake::root();
         sys.stat_of(CLT_GIT, git())
+            .stat_of(CLT_CLANG, git())
             .on("/usr/bin/xcode-select -p", none_selected())
             .on("/usr/bin/xcode-select -p", none_selected())
             .on(
@@ -2144,6 +2220,8 @@ Software Update found the following new or updated software:\n\
             "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
             installed_quietly(),
         )
+        .on_stat(RETAINED_INSTALL, Path::new(CLT_GIT), git())
+        .on_stat(RETAINED_INSTALL, Path::new(CLT_CLANG), git())
         .on(PKGUTIL, Ran::ok(RECEIPT));
         let items = expand(
             &Table {
@@ -2204,6 +2282,8 @@ Software Update found the following new or updated software:\n\
                     "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
                     installed_quietly(),
                 )
+                .on_stat(RETAINED_INSTALL, Path::new(CLT_GIT), git())
+                .on_stat(RETAINED_INSTALL, Path::new(CLT_CLANG), git())
                 .on(PKGUTIL, Ran::ok(RECEIPT));
             sys
         };
@@ -2298,6 +2378,8 @@ Software Update found the following new or updated software:\n\
                     "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
                     installed_quietly(),
                 )
+                .on_stat(RETAINED_INSTALL, Path::new(CLT_GIT), git())
+                .on_stat(RETAINED_INSTALL, Path::new(CLT_CLANG), git())
                 .on(PKGUTIL, Ran::ok(RECEIPT));
             installers(&sys, None);
             sys
@@ -2365,6 +2447,8 @@ Software Update found the following new or updated software:\n\
             .on("/usr/sbin/softwareupdate -l", Ran::ok(VM_LIST))
             .on(install, installed_quietly())
             .on_write(install, Path::new(PLACEHOLDER), b"aterm 4243 2000\n")
+            .on_stat(install, Path::new(CLT_GIT), git())
+            .on_stat(install, Path::new(CLT_CLANG), git())
             .on(PKGUTIL, Ran::ok(RECEIPT));
         installers(&taken, None);
         CommandLineTools::install(&taken).unwrap();
@@ -2441,6 +2525,8 @@ Software Update found the following new or updated software:\n\
                 "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
                 installed_quietly(),
             )
+            .on_stat(RETAINED_INSTALL, Path::new(CLT_GIT), git())
+            .on_stat(RETAINED_INSTALL, Path::new(CLT_CLANG), git())
             .on(PKGUTIL, Ran::ok(RECEIPT));
         sys
     }
@@ -2524,7 +2610,7 @@ Software Update found the following new or updated software:\n\
                     .count()
                     == 2
                 {
-                    sys.stat_of(CLT_GIT, git());
+                    sys.stat_of(CLT_GIT, git()).stat_of(CLT_CLANG, git());
                 }
             });
             CommandLineTools::install(&sys).unwrap();

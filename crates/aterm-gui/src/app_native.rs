@@ -1466,6 +1466,15 @@ pub(crate) enum NativeConfigOrigin {
         reply: crate::native_app::ReplyToken<ConfigPatchOutcome>,
         theme_request: Option<Box<(u64, String)>>,
         follows: Vec<crate::native_app::OperationId>,
+        /// No mark said the gesture that made this write was anyone but a person
+        /// ([`App::gesture_unvouched`]). It is read while that gesture is dispatched, because the
+        /// write lands after it has ended.
+        #[cfg(target_os = "macos")]
+        person: bool,
+        /// The service had `allow_notifications` off just before this write, as the lane read it
+        /// on taking the write ([`NativeConfigOrigin::with_notices_before`]). `false` until then.
+        #[cfg(target_os = "macos")]
+        notices_were_off: bool,
     },
     SeriousMode {
         desired: bool,
@@ -1491,6 +1500,25 @@ pub(crate) enum NativeConfigOrigin {
         value: Option<String>,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     },
+}
+
+#[cfg(target_os = "macos")]
+impl NativeConfigOrigin {
+    /// Note on a Settings view's origin whether `before`, the service's snapshot from just before
+    /// its write, had `allow_notifications` off. The lane takes one write at a time, so `before`
+    /// holds what the write ahead of this one left, however far the running config has followed.
+    fn with_notices_before(
+        mut self,
+        before: &crate::native_config_service::ConfigSnapshot,
+    ) -> Self {
+        if let Self::View {
+            notices_were_off, ..
+        } = &mut self
+        {
+            *notices_were_off = !before.config.allow_notifications.unwrap_or(false);
+        }
+        self
+    }
 }
 
 pub(crate) struct NativeConfigRequest {
@@ -4137,6 +4165,29 @@ impl App {
         Ok(true)
     }
 
+    /// The origin of a write a Settings view's reducer asked for, made while the gesture that
+    /// asked is still being dispatched.
+    fn native_config_view_origin(
+        &self,
+        instance: crate::tab_model::AppInstanceId,
+        view: crate::tab_model::ViewId,
+        reply: crate::native_app::ReplyToken<ConfigPatchOutcome>,
+        theme_request: Option<Box<(u64, String)>>,
+        follows: Vec<crate::native_app::OperationId>,
+    ) -> NativeConfigOrigin {
+        NativeConfigOrigin::View {
+            instance,
+            view,
+            reply,
+            theme_request,
+            follows,
+            #[cfg(target_os = "macos")]
+            person: self.gesture_unvouched().is_none(),
+            #[cfg(target_os = "macos")]
+            notices_were_off: false,
+        }
+    }
+
     fn execute_native_effect(
         &mut self,
         wid: WindowId,
@@ -4179,14 +4230,10 @@ impl App {
                     })
                     .map(Box::new);
                 let theme_request_id = theme_request.as_deref().map(|(id, _)| *id);
+                let origin =
+                    self.native_config_view_origin(instance, view, reply, theme_request, follows);
                 self.native_config_pending.push_back(NativeConfigRequest {
-                    origin: NativeConfigOrigin::View {
-                        instance,
-                        view,
-                        reply,
-                        theme_request,
-                        follows,
-                    },
+                    origin,
                     work: NativeConfigWork::Patch(patch),
                 });
                 if let Err(error) = self.pump_native_config() {
@@ -4210,16 +4257,9 @@ impl App {
                         (NativeConfigWork::UndoLanding(write), vec![write])
                     }
                 };
-                self.native_config_pending.push_back(NativeConfigRequest {
-                    origin: NativeConfigOrigin::View {
-                        instance,
-                        view,
-                        reply,
-                        theme_request: None,
-                        follows,
-                    },
-                    work,
-                });
+                let origin = self.native_config_view_origin(instance, view, reply, None, follows);
+                self.native_config_pending
+                    .push_back(NativeConfigRequest { origin, work });
                 self.pump_native_config()?;
             }
             AppEffect::OpenExternal { request, reply } => {
@@ -5021,6 +5061,8 @@ impl App {
         request: NativeConfigRequest,
     ) -> (NativeConfigOrigin, Result<ConfigPatchResult, String>) {
         let NativeConfigRequest { origin, mut work } = request;
+        #[cfg(target_os = "macos")]
+        let origin = origin.with_notices_before(&self.native_config_service.snapshot());
         if let NativeConfigOrigin::View { view, follows, .. } = &origin {
             let landings = self.take_native_config_landings(*view, follows);
             if let NativeConfigWork::Patch(patch) = &mut work {
@@ -5680,7 +5722,17 @@ impl App {
                 reply,
                 theme_request,
                 follows: _,
+                #[cfg(target_os = "macos")]
+                person,
+                #[cfg(target_os = "macos")]
+                notices_were_off,
             } => {
+                #[cfg(target_os = "macos")]
+                self.ask_macos_on_program_notices_turned_on(
+                    person && notices_were_off,
+                    &outcome,
+                    authoritative.as_ref(),
+                );
                 self.note_native_config_view_landing(view, reply.operation, &outcome);
                 if let Some(theme_request) = theme_request {
                     let (request_id, id) = *theme_request;
@@ -5797,6 +5849,27 @@ impl App {
                     self.request_redraw_all_windows();
                 }
             }
+        }
+    }
+
+    /// A person's Settings write that turned `allow_notifications` on is the one thing that asks
+    /// macOS. `persons_turn_on` says the write was a person's and found the key off. A program's
+    /// notice, a hand edit and `aterm ctl settings set` never reach this, and a press through
+    /// `aterm ctl act`, the accessibility tree or another process's input arrives with it unset.
+    /// The running config is no witness here: it trails the lane by a generation, so it can still
+    /// read on when a quick off and on lands, and off when another row's write follows the press.
+    #[cfg(target_os = "macos")]
+    fn ask_macos_on_program_notices_turned_on(
+        &self,
+        persons_turn_on: bool,
+        outcome: &ConfigPatchOutcome,
+        authoritative: Option<&crate::native_config_service::ConfigSnapshot>,
+    ) {
+        let saved_on = matches!(outcome, ConfigPatchOutcome::Applied { .. })
+            && authoritative
+                .is_some_and(|snapshot| snapshot.config.allow_notifications.unwrap_or(false));
+        if persons_turn_on && saved_on {
+            crate::notify::ask_macos(self.notice_center);
         }
     }
 

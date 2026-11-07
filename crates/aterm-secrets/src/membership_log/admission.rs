@@ -257,11 +257,11 @@ impl Log {
         _audience: &EpochAudience,
         denied: impl Fn(&Member) -> bool,
     ) -> BTreeSet<Recipient> {
-        let membership = self.membership();
+        let membership = self.membership_ref();
         membership
             .members()
             .values()
-            .filter(|seat| self.seat_is_current(&membership, seat) && !denied(seat))
+            .filter(|seat| self.seat_is_current(membership, seat) && !denied(seat))
             .map(|seat| seat.binding.recipient())
             .collect()
     }
@@ -328,7 +328,7 @@ impl Log {
     ) -> Vec<Gap> {
         let old = old_gap_rule();
         let effective = self.effective();
-        let membership = self.membership();
+        let membership = self.membership_ref();
         let removed = self.removed_recipients();
         let mut gaps = Vec::new();
         for (audience, epoch) in Self::admission_epochs(opened, audiences) {
@@ -341,7 +341,7 @@ impl Log {
             };
             let wrapped = opened.wrapped_recipients.get(&epoch);
             let heals = !old
-                && self.heals_omissions(opened, &membership, &audience, &epoch, &removed, &denied);
+                && self.heals_omissions(opened, membership, &audience, &epoch, &removed, &denied);
             for (actor, member) in membership.members() {
                 if old
                     && (self.left_out(opened, &audience, actor)
@@ -356,7 +356,7 @@ impl Log {
                 let known = entry_at == epoch_at || effective.before(entry_at, epoch_at);
                 if !gap(
                     opens,
-                    old || self.seat_is_current(&membership, member),
+                    old || self.seat_is_current(membership, member),
                     wrapped.is_some_and(|set| set.contains(&recipient)),
                     known,
                     heals,
@@ -440,11 +440,11 @@ impl Log {
         member: &MemberId,
     ) -> bool {
         let old = old_gap_rule();
-        let membership = self.membership();
+        let membership = self.membership_ref();
         let Some(seat) = membership.get(member) else {
             return false;
         };
-        if !old && !self.seat_is_current(&membership, seat) {
+        if !old && !self.seat_is_current(membership, seat) {
             return false;
         }
         let Some(Body::Epoch { audience, .. }) = self.get(epoch).map(Record::body) else {
@@ -469,7 +469,7 @@ impl Log {
         if !old
             && self.heals_omissions(
                 opened,
-                &membership,
+                membership,
                 audience,
                 epoch,
                 &self.removed_recipients(),
@@ -507,7 +507,7 @@ impl Log {
         me: &MemberId,
     ) -> Option<usize> {
         let old = old_gap_rule();
-        let membership = self.membership();
+        let membership = self.membership_ref();
         let wrapped = opened.wrapped_recipients.get(&gap.epoch);
         let minter = self.get(&gap.epoch).map(|record| *record.actor());
         let batch: BTreeSet<Recipient> = if old {
@@ -531,7 +531,7 @@ impl Log {
                     self.left_out(opened, &gap.audience, actor)
                         || self.left_out(opened, &EpochAudience::Everyone, actor)
                 } else {
-                    !self.seat_is_current(&membership, member)
+                    !self.seat_is_current(membership, member)
                 };
                 !skipped
                     && ((old && Some(**actor) == minter)
@@ -562,7 +562,7 @@ impl Log {
         audience: &EpochAudience,
         member: &MemberId,
     ) -> bool {
-        let membership = self.membership();
+        let membership = self.membership_ref();
         let Some(seat) = membership.get(member) else {
             return true;
         };
@@ -642,7 +642,7 @@ impl Log {
         taken: &BTreeSet<String>,
         counted: &BTreeSet<String>,
     ) -> Option<String> {
-        let membership = self.membership();
+        let membership = self.membership_ref();
         let held: BTreeSet<&str> = taken
             .iter()
             .chain(membership.claimed_labels())

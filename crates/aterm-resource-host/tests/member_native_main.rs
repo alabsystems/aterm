@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 // Actual private host/helper integration; these modules are the production source.
-#![expect(
-    unused_imports,
-    dead_code,
-    reason = "The standalone native entry reuses production modules and their libtest fixture code; libtest-only functions are not registered by this harness=false target"
+// Off Unix every module and re-export below is compiled out, so nothing is left unused.
+#![cfg_attr(
+    unix,
+    expect(
+        unused_imports,
+        dead_code,
+        reason = "The standalone native entry reuses production modules and their libtest fixture code; libtest-only functions are not registered by this harness=false target"
+    )
 )]
 #[cfg(unix)]
 #[path = "../src/actor.rs"]
@@ -21,6 +25,18 @@ mod forward;
 #[cfg(unix)]
 #[path = "../src/inspection.rs"]
 mod inspection;
+#[cfg(unix)]
+#[path = "../src/metadata_prelude.rs"]
+mod metadata_prelude;
+#[cfg(unix)]
+#[path = "../src/metadata_transport.rs"]
+mod metadata_transport;
+#[cfg(unix)]
+#[path = "../src/resolver_transport.rs"]
+mod resolver_transport;
+#[cfg(unix)]
+#[path = "../src/resource_accounting.rs"]
+mod resource_accounting;
 #[cfg(unix)]
 #[path = "../src/resource_context.rs"]
 mod resource_context;

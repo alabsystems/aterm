@@ -167,7 +167,9 @@ fn landing(path: Path, landed: u64, seen: u64) -> Vec<Vec<(u16, u16, u16)>> {
         at(landed),
     );
     rig.pty_in(pane.index, &composer(rule, pane.cols), at(landed));
-    let prompt = pane.row_off + rule;
+    // The frame's row: below the chrome the window draws above its grid (Linux's tab strip).
+    let chrome = rig.with_app(at(landed), |app, wid| app.chrome_rows(wid));
+    let prompt = chrome + pane.row_off + rule;
     (0..3u64)
         .map(|k| {
             let now: Instant = at(seen + 16 * k);

@@ -353,6 +353,18 @@ impl Parser {
                 let Some((&byte, tail)) = remaining.split_first() else {
                     break;
                 };
+
+                // A line feed that more text lines follow: hand the run over whole to a sink
+                // that takes one (`ActionSink::print_lines`).
+                if S::TAKES_LINES && byte == b'\n' {
+                    let run = 1 + super::simd::count_line_run(tail);
+                    if run > 1 {
+                        let (lines, after) = remaining.split_at(run);
+                        sink.print_lines(pty_wrap_ref(lines));
+                        remaining = after;
+                        continue;
+                    }
+                }
                 remaining = tail;
 
                 if byte == 0x1B && remaining.first() == Some(&b'[') {

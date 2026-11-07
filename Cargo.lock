@@ -146,7 +146,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.161.0"
+version = "0.162.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -256,6 +256,7 @@ dependencies = [
  "aterm-log",
  "aterm-lz4",
  "aterm-mail",
+ "aterm-mesh",
  "aterm-messages",
  "aterm-models-db",
  "aterm-models-harness",
@@ -472,6 +473,7 @@ dependencies = [
  "aterm-theme-pack",
  "aterm-time",
  "aterm-toml",
+ "aterm-toolchain",
  "aterm-types",
  "aterm-uds",
  "aterm-update",
@@ -588,6 +590,7 @@ dependencies = [
  "aterm-pty",
  "aterm-stamp",
  "aterm-sysprobe",
+ "aterm-telemetry",
  "aterm-tempfile",
  "aterm-types",
  "aterm-uds",
@@ -1089,6 +1092,7 @@ dependencies = [
  "aterm-png",
  "aterm-pty",
  "aterm-regex",
+ "aterm-render",
  "aterm-secrets",
  "aterm-spec",
  "aterm-stamp",
@@ -1210,6 +1214,7 @@ dependencies = [
  "aterm-log",
  "aterm-objc",
  "aterm-pty",
+ "aterm-repo-storage",
  "aterm-secrets",
  "aterm-serde",
  "aterm-stamp",
@@ -1505,6 +1510,7 @@ name = "aterm-netplace"
 version = "0.0.0"
 dependencies = [
  "aterm-hash",
+ "aterm-heap-count",
  "aterm-log",
  "aterm-objc",
  "aterm-tempfile",
@@ -1685,6 +1691,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "aterm-repo-storage"
+version = "0.0.0"
+dependencies = [
+ "aterm-dirfd",
+ "aterm-json",
+ "aterm-serde",
+ "aterm-tempfile",
+ "libc",
+ "ring",
+]
+
+[[package]]
 name = "aterm-resource-host"
 version = "0.0.0"
 dependencies = [
@@ -1766,6 +1784,7 @@ dependencies = [
  "aterm-regex",
  "aterm-spec",
  "aterm-types",
+ "libc",
 ]
 
 [[package]]
@@ -2030,6 +2049,7 @@ dependencies = [
  "aterm-tempfile",
  "aterm-time",
  "aterm-uds",
+ "trust-resource-controller",
 ]
 
 [[package]]
@@ -2037,7 +2057,9 @@ name = "aterm-uds"
 version = "0.0.0"
 dependencies = [
  "astream-sys",
+ "aterm-dirfd",
  "aterm-durable",
+ "aterm-spec",
  "aterm-stamp",
  "aterm-sysprobe",
  "aterm-tempfile",
@@ -2321,6 +2343,7 @@ dependencies = [
  "aterm-spec",
  "aterm-stamp",
  "aterm-sysprobe",
+ "aterm-telemetry",
  "aterm-tempfile",
  "aterm-time",
  "aterm-toml",
@@ -2508,6 +2531,7 @@ dependencies = [
 name = "trust-resource-controller"
 version = "0.13.0"
 dependencies = [
+ "jobserver_utils",
  "libc",
  "trust-resource-provenance",
 ]

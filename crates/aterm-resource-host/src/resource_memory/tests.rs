@@ -222,3 +222,37 @@ fn owned_memory_samples_one_actual_small_native_group() {
     child.1.take();
     assert!(child.0.wait().unwrap().success());
 }
+
+#[test]
+#[cfg(target_vendor = "apple")]
+fn anchor_census_cannot_trust_a_later_dead_parent_or_empty_error() {
+    let leader = 71;
+    let parent = 72;
+    let unseen_child = 73;
+    let mut probe = Fake {
+        group_presence: Some(ProcessPresence::Unknown),
+        ..Fake::default()
+    };
+    // Snapshot P then P forks C and exits before a later status read. The
+    // stale snapshot plus P's exit must never authorize reaping the anchor.
+    probe.members.insert(
+        leader,
+        GroupMembers {
+            pids: vec![leader as i32, parent],
+            complete: true,
+        },
+    );
+    probe.presence.insert(parent, ProcessPresence::Exited);
+    probe
+        .presence
+        .insert(unseen_child, ProcessPresence::Present);
+    assert!(!other_members_exited_with(leader, &probe));
+    probe.members.get_mut(&leader).unwrap().pids.clear();
+    assert!(!other_members_exited_with(leader, &probe));
+    let members = probe.members.get_mut(&leader).unwrap();
+    members.pids.push(leader as i32);
+    members.complete = false;
+    assert!(!other_members_exited_with(leader, &probe));
+    probe.members.get_mut(&leader).unwrap().complete = true;
+    assert!(other_members_exited_with(leader, &probe));
+}

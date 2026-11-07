@@ -39,6 +39,21 @@ struct Epoch {
     generation: Generation,
 }
 
+/// Read `reader` into `buf` until it ends or `buf` is full, answering how much it read; a read a
+/// signal interrupted is read again, as `read_to_end` does.
+fn fill(reader: &mut impl io::Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut len = 0;
+    while len < buf.len() {
+        match reader.read(&mut buf[len..]) {
+            Ok(0) => break,
+            Ok(n) => len += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(len)
+}
+
 impl Epoch {
     fn encode(self, nonce: &str) -> [u8; RECORD_LEN] {
         let mut bytes = [0u8; RECORD_LEN];
@@ -57,14 +72,7 @@ impl Epoch {
             return Err(refused("private host epoch changed during open"));
         }
         let mut buf = [0u8; RECORD_LEN + 1];
-        let mut len = 0;
-        let mut reader = file.take((RECORD_LEN + 1) as u64);
-        while len < buf.len() {
-            match reader.read(&mut buf[len..])? {
-                0 => break,
-                n => len += n,
-            }
-        }
+        let len = fill(&mut file.take((RECORD_LEN + 1) as u64), &mut buf)?;
         let bytes = &buf[..len];
         if bytes.len() != RECORD_LEN
             || !bytes.starts_with(MAGIC)

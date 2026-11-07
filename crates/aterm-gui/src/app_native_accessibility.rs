@@ -1211,8 +1211,11 @@ mod tests {
         // (init-on-by-default design §6.1), and navigation before it answers nothing.
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
+        // A window 270 points tall (a headless window's scale is 1), whatever this platform's
+        // face makes a row: the page's head shows and its accounts line lies below it.
+        let (_, cell_h) = app.win_cell_size(wid);
         let window = app.windows.get_mut(&wid).unwrap();
-        window.rows = 18;
+        window.rows = u16::try_from(270 / cell_h).unwrap();
         window.cols = 90;
         window.os_window_for_test = true;
         assert!(app.open_system_state_tab());
@@ -1234,6 +1237,15 @@ mod tests {
         } else {
             "system-state/line/mac/switch"
         });
+        assert_eq!(
+            app.compiled_native_ui(wid)
+                .unwrap()
+                .semantic(&key)
+                .unwrap()
+                .offscreen,
+            action == Action::ScrollIntoView,
+            "premise: the accounts line lies below the window, the Mac line within it"
+        );
         set_a11y_active(&mut app, wid, true);
         assert!(app.prepare_native_input_scratch(wid));
         let (update, published) = app.take_native_accessibility_update(wid).unwrap().unwrap();

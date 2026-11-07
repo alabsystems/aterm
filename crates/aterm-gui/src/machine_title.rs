@@ -17,10 +17,10 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::Duration;
 
-use amacs_files::watch::FileWatch;
 use aterm_agent::machine_name::{InFleet, NameTo, NickTo};
 use aterm_secrets::client::Paths;
 use aterm_types::machine_name::Number;
+use aterm_uds::file_watch::FileWatch;
 use aterm_window::event_loop::EventLoopProxy;
 
 use crate::Wake;

@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::super::codex_alab as ca;
-use super::super::relaunch::{ExitCause, NO_SHELL, WAIT_HAND_LIFTS, exit_clock, hand_waits_out};
+use super::super::relaunch::{
+    AgentExit, ExitCause, NO_SHELL, WAIT_HAND_LIFTS, exit_clock, exit_wait, hand_waits_out,
+};
 use super::upgrade::{Agent, Dialect, Phase};
 use super::{
     Client, Hand, Kernel, Live, NoPlan, Opts, Plan, PromptLook, RelaunchLineError, Report,
@@ -111,7 +113,17 @@ impl AlabKernel for Live {
     }
 
     fn birth(&self, pid: u32) -> Option<String> {
-        super::super::restart_stamp::kernel_start(pid)
+        // macOS's kernel record reads any user's process in the same spelling: another user's
+        // (a daemon that took a rebooted Mac's pid) is unreadable to `restart_stamp`'s, which
+        // would leave the TUI's exit unproven.
+        #[cfg(target_os = "macos")]
+        {
+            super::kernel_start(pid)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            super::super::restart_stamp::kernel_start(pid)
+        }
     }
 
     fn first_frame(
@@ -169,7 +181,7 @@ pub(super) fn find_rollout(home: &Path, thread: &str) -> Option<PathBuf> {
         std::fs::read_dir(p)
             .map(|d| {
                 d.flatten()
-                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                    .filter(crate::harness::entry_is_dir)
                     .map(|e| e.path())
                     .collect()
             })
@@ -307,7 +319,7 @@ pub(super) fn self_claimed_after_exit(
         Ok(lock) => lock,
         Err(why) => return said(r, format!("busy:{why}")),
     };
-    if k.alive(snap.pid) && super::kernel_start(snap.pid).as_deref() == Some(snap.start.as_str()) {
+    if k.alive(snap.pid) && k.birth(snap.pid).as_deref() == Some(snap.start.as_str()) {
         return said(r, "wait:not-exited");
     }
     let witnesses = super::super::self_claimed::Witnesses::under(&opts.state);
@@ -317,7 +329,10 @@ pub(super) fn self_claimed_after_exit(
     };
     if let Some(mut st) = prior.filter(St::in_flight) {
         let want_cwd = resume.cwd.as_deref().unwrap_or(snap.cwd.as_str());
-        if st.pid == snap.pid
+        // A record an earlier build wrote names its TUI by pid alone: it takes the start the
+        // snapshot of that pid carries, as RS1 carries an earlier host's restart by identity.
+        st.adopt_start(snap.pid, &snap.start);
+        if st.names(snap.pid, &snap.start)
             && st.resume_argv == resume.argv
             && st.cwd == want_cwd
             && st.codex_home_env == resume.codex_home
@@ -366,6 +381,7 @@ pub(super) fn self_claimed_after_exit(
         resume_home: resume.codex_home.clone().unwrap_or_default(),
         resume_start: snap.start.clone(),
         pid: snap.pid,
+        pid_start: squash(&snap.start),
         shell: snap.shell,
         proc_start: snap.start.clone(),
         tab: tab.clone(),
@@ -424,18 +440,16 @@ fn relaunch_held(
     hand: &mut Hand,
     k: &dyn AlabKernel,
 ) -> Report {
-    let old = st.pid;
-    // The TUI is gone once its pid is free or names a process born at another time than
-    // the one this record relaunches (`proc_start`): after a reboot pids are reused, and
-    // waiting on another process's pid would hold the relaunch until it gives up.
-    let born = st.proc_start.clone();
-    let gone = || {
-        !k.alive(old)
-            || super::super::relaunch::gone_by_identity(&born, true, k.birth(old).as_deref())
-    };
-    if !wait_until(EXIT_WAIT, gone) {
+    // The relaunch waits only on the TUI the record names by pid and kernel start
+    // ([`St::pid_start`]): after a reboot pids are reused, and waiting on another process's
+    // pid would hold the relaunch until it gives up. A record whose TUI is not named so (an
+    // earlier build's with no snapshot's start, or a live start unread) is never waited on.
+    let exit = |st: &St| st.agent_exit_by(|pid| k.alive(pid), |pid| k.birth(pid));
+    if st.exited_at == 0
+        && let Some(step) = exit_wait(|| exit(st), |done| wait_until(EXIT_WAIT, done))
+    {
         // Never a signal: a later step finds the TUI as it is.
-        return said(r, "wait:exiting");
+        return said(r, step);
     }
     hand.keep(c);
     if st.exited_at == 0 {
@@ -751,7 +765,10 @@ pub(super) fn carry_in_flight_with(
         return said(r, format!("would-resume:{}", st.phase.word()));
     }
     let see_gone = |st: &mut St| -> bool {
-        if st.exited_at != 0 || st.pid == 0 || k.alive(st.pid) {
+        if st.exited_at != 0
+            || st.pid == 0
+            || st.agent_exit_by(|pid| k.alive(pid), |pid| k.birth(pid)) != AgentExit::Gone
+        {
             return false;
         }
         st.exited_at = now_s();

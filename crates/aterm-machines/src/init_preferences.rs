@@ -2431,13 +2431,31 @@ pub(crate) mod tests {
         let get = item.command().args(["--get", "UserKeyMapping"]).display();
         sys.on(&get, Ran::ok("RegistryID Key Value\n10002160e UserKeyMapping (null)\n100021604 UserKeyMapping (null)\n"));
         let dump = hid_dump_command(&who).display();
-        sys.on(
-            &dump,
-            Ran::ok(&hid_dump(&[
-                (0x10002160e, &[], &[]),
-                (0x100021604, &[], &[]),
-            ])),
-        );
+        sys.simulate(move |sys, cmd| {
+            if cmd.display() != dump {
+                return None;
+            }
+            let changes = sys.keyboard_changes();
+            let rows: Vec<_> = if changes.is_empty() {
+                vec![
+                    (0x10002160e, &[][..], &[][..]),
+                    (0x100021604, &[][..], &[][..]),
+                ]
+            } else {
+                changes
+                    .iter()
+                    .rev()
+                    .map(|change| {
+                        (
+                            change.registry,
+                            change.native.as_deref().unwrap_or(&change.before_native),
+                            change.user.as_deref().unwrap_or(&change.before_user),
+                        )
+                    })
+                    .collect()
+            };
+            Some(Ran::ok(&hid_dump(&rows)))
+        });
         let c = ctx(&[who]);
         assert!(matches!(item.probe(&sys, &c), Probe::Change { .. }));
         // No service maps Caps Lock yet: System State reads the key as Caps Lock.
@@ -2452,15 +2470,6 @@ pub(crate) mod tests {
             [0x10002160e, 0x100021604]
         );
         assert!(changes.iter().all(|change| change.user.is_none()));
-        let mapped = [(keyboard::CAPS_LOCK, keyboard::LEFT_CONTROL)];
-        sys.on(
-            &dump,
-            Ran::ok(&hid_dump(&[
-                (0x100021604, &mapped, &[]),
-                (0x10002160e, &mapped, &[]),
-            ])),
-        );
-        let _ = item.mappings(&sys).unwrap();
         assert!(matches!(item.probe(&sys, &c), Probe::Ok { .. }));
         assert_eq!(item.detail(&sys, &c), None);
     }

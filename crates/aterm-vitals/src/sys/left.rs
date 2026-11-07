@@ -129,6 +129,28 @@ fn proof_words(row: &LeftRow) -> String {
     }
 }
 
+/// The `left` view's sentence for a person: how many rows outlived their owner (`state=left`),
+/// how many carry a token `aterm ctl end` takes, and how many macOS's program check holds. A
+/// partial read ([`LeftView::complete`] false) can say a row is left, never that none is.
+fn summary_words(rows: &[&LeftRow], complete: bool, held: usize) -> String {
+    let left = rows.iter().filter(|r| r.state == State::Left).count();
+    let ends = rows.iter().filter(|r| r.token.is_some()).count();
+    let left = match (left, complete) {
+        (0, true) => "nothing left running".to_owned(),
+        (0, false) => "nothing left running found so far (a partial read)".to_owned(),
+        (n, _) => format!("{n} left running"),
+    };
+    let ends = match ends {
+        0 => "nothing to end".to_owned(),
+        n => format!("{n} to end (`aterm ctl end <token>`)"),
+    };
+    let held = match held {
+        0 => String::new(),
+        n => format!(" · {n} held at macOS's program check"),
+    };
+    format!("summary {left} · {ends}{held}")
+}
+
 /// How many held rows `rows` show, and the longest held, ms.
 fn held_count(rows: &[&LeftRow]) -> (usize, Option<u64>) {
     let held: Vec<u64> = rows
@@ -221,6 +243,11 @@ pub(super) fn left_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut V
     let shown = shown(ctx, view, scope);
     let (held, oldest) = held_count(&shown.rows);
     let num = |v: Option<u64>| v.map_or_else(|| "-".to_owned(), |v| v.to_string());
+    lines.push(Line {
+        key: "summary".into(),
+        text: summary_words(&shown.rows, view.complete, held),
+        value: true,
+    });
     lines.push(Line {
         key: "left".into(),
         text: format!(

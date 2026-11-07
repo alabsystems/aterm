@@ -768,7 +768,7 @@ mod tests {
         assert_eq!(ids, ["a2", "b4", "a1"], "tab 9's row is not this scope's");
         assert_eq!(
             summary(&rows),
-            "3 jobs · 1 running · 1 stuck · 1 exited · worst: silent 19m12s, about 19× its usual 60 s gap, φ 8.34"
+            "3 jobs · 1 running · 1 stuck · 1 exited · worst: silent 19m12s, about 19× the assumed 60 s gap, φ 8.34"
         );
         assert_eq!(summary(&rows_in(&v, &[42])), "no jobs");
     }

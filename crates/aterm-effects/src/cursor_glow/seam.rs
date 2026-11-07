@@ -3138,7 +3138,14 @@ impl CursorGlow {
             // A typed move's particles live their tuned lives times the duration's share of
             // the default, as its sparks do (`move_spark_life`): on a dark page Comet's dust
             // and Sparkle's stars are most of the trail a typist sees.
+            // Fire's embers keep their tuned flight at a longer duration
+            // (`fire_ember_life_scale`, after-land F5): the flame's run carries it.
             let (_, scale) = super::typed_life_basis(cfg.duration, self.typed_life_unscaled());
+            let scale = if mv.fire {
+                self.fire_ember_life_scale(scale)
+            } else {
+                scale
+            };
             let mut pi = particles_before.min(self.particles.len());
             while pi < self.particles.len() {
                 let p = &mut self.particles[pi];

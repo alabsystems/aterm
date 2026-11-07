@@ -96,7 +96,7 @@ fn observations(case: u8) -> Vec<aterm_spec::interp::State> {
     });
     let config = config_beside(&bed.path);
     if case == 11 {
-        fs::write(&config, "[harness]\nlogins = 'off'\n").unwrap();
+        crate::test_config::write(&config, "[harness]\nlogins = 'off'\n").unwrap();
     }
     // This factory is local and needs no LAN, central server or provider request.
     let expected_home = bed.home.clone();

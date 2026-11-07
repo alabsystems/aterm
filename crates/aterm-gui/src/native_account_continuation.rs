@@ -6,12 +6,28 @@
 //! activation also needs bounded lineage retention and durable client slots.
 
 use super::*;
+use aterm_agent::harness::native_account_wire::Relation;
+
+#[cfg(unix)]
+pub(super) fn recorded_state(
+    outcome: aterm_agent::harness::native_receipts::AccountOutcome,
+) -> Option<aterm_agent::harness::native_account_wire::ChildState> {
+    use aterm_agent::harness::native_account_wire::ChildState;
+    use aterm_agent::harness::native_receipts::{AccountOutcome, ClaimedState};
+    Some(match outcome {
+        AccountOutcome::Fenced => return None,
+        AccountOutcome::Claimed(state) => match state {
+            ClaimedState::Prepared => ChildState::Prepared,
+            ClaimedState::MayExecute => ChildState::MayExecute,
+            ClaimedState::NoExec { phase } => ChildState::NoExec(phase),
+            ClaimedState::Sealed { may_execute } => ChildState::Sealed { may_execute },
+        },
+    })
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct AccountContinuation {
-    binding: Binding,
-    candidate: Prepare,
-    phase: ImagePhase,
+    relation: Relation,
     proof: Arc<ClosedRestart>,
     actor: Process,
     conversation: Conversation,
@@ -27,12 +43,13 @@ impl AccountContinuation {
     )]
     fn capture(
         ctx: &crate::SessionCtx,
-        binding: &Binding,
-        candidate: &Prepare,
-        phase: ImagePhase,
+        relation: &Relation,
         caller: &SupervisorInputCaller,
         kernel: &dyn Kernel,
     ) -> Result<Self, &'static str> {
+        let parent = relation.predecessor();
+        let binding = parent.binding();
+        let candidate = relation.candidate();
         let previous = ctx
             .fenced_writes
             .native
@@ -44,6 +61,7 @@ impl AccountContinuation {
             .ok_or(UNKNOWN)?;
         let op = previous.lock().unwrap_or_else(|p| p.into_inner());
         if op.binding != *binding
+            || op.request != *parent.prepare()
             || !op.authority.builtin
             || op.authority.renewal.is_some()
             || op.grant_record != GrantRecord::None
@@ -71,12 +89,14 @@ impl AccountContinuation {
             return Err(UNKNOWN);
         }
         if !proof.noexec() || (!proof.available() && !proof.claimed_by(candidate)) {
-            return Err(DENIED);
+            return Err(if proof.pending_account_by(candidate) {
+                UNKNOWN
+            } else {
+                DENIED
+            });
         }
         let account = Self {
-            binding: binding.clone(),
-            candidate: candidate.clone(),
-            phase,
+            relation: relation.clone(),
             proof: Arc::clone(proof),
             actor: op.authority.actor.clone().ok_or(DENIED)?,
             conversation: op.authority.conversation.clone().ok_or(DENIED)?,
@@ -95,11 +115,11 @@ impl AccountContinuation {
     ) -> Result<Option<aterm_agent::harness::accounts_pool::ExecutionGuard>, ()> {
         let NativePlan::Restart {
             forward, rollback, ..
-        } = &self.candidate.plan
+        } = &self.relation.candidate().plan
         else {
             return Err(());
         };
-        let command = match self.phase {
+        let command = match self.relation.phase() {
             ImagePhase::Forward => forward.as_ref(),
             ImagePhase::Rollback => rollback.as_deref().ok_or(())?,
         };
@@ -110,11 +130,12 @@ impl AccountContinuation {
         &self.proof
     }
 
+    pub(super) fn relation(&self) -> &Relation {
+        &self.relation
+    }
+
     pub(super) fn same_relation(&self, other: &Self) -> bool {
-        self.binding == other.binding
-            && self.candidate == other.candidate
-            && self.phase == other.phase
-            && Arc::ptr_eq(&self.proof, &other.proof)
+        self.relation == other.relation && Arc::ptr_eq(&self.proof, &other.proof)
     }
 
     /// This is additional authority, never a replacement for current native
@@ -126,18 +147,15 @@ impl AccountContinuation {
         caller: &SupervisorInputCaller,
         kernel: &dyn Kernel,
     ) -> bool {
-        self.candidate == *candidate
+        self.relation.candidate() == candidate
+            && self.proof.predecessor == *self.relation.predecessor().prepare()
             && candidate.host_epoch == self.proof.predecessor.host_epoch
             && host_epoch() == Some(candidate.host_epoch.as_str())
-            && self
-                .proof
-                .initial_resume_phase()
-                .unwrap_or(ImagePhase::Forward)
-                == self.phase
+            && self.proof.closed_phase() == self.relation.phase()
             && self
                 .proof
                 .predecessor
-                .account_successor_recipe(candidate, self.phase)
+                .account_successor_recipe(candidate, self.relation.phase())
             && self.proof.noexec()
             && self.proof.quiescent(kernel)
             && self.conversation.current(ctx)
@@ -247,27 +265,75 @@ impl AccountContinuation {
         reason = "The independently locked account store refuses the selected generation or account policy."
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountContinuation",
+        action = "Predecessor",
+        reason = "The caller supplies a structurally valid relation for a different original preparation"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountClaimPublication",
+        action = "ReserveA",
+        project = "native_act::tests::account_continuation_tests::claim_model::transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountClaimPublication",
+        action = "ReserveB",
+        project = "native_act::tests::account_continuation_tests::claim_model::transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountClaimPublication",
+        action = "Persist",
+        project = "native_act::tests::account_continuation_tests::claim_model::transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountClaimPublication",
+        action = "Confirm",
+        project = "native_act::tests::account_continuation_tests::claim_model::transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountClaimPublication",
+        action = "CloseOnDisk",
+        reason = "Another publisher advances the journal while an admission acknowledgement is lost"
+    )
+)]
 pub(super) fn prepare_account(
     ctx: &crate::SessionCtx,
     master: i32,
-    predecessor: &Binding,
-    candidate: Prepare,
-    phase: ImagePhase,
+    relation: Relation,
     caller: SupervisorInputCaller,
     kernel: &dyn Kernel,
 ) -> String {
     serve_with_publication(
         ctx,
-        Request::prepare(candidate.clone()),
+        Request::prepare(relation.candidate().clone()),
         kernel,
         false,
         |_| {
-            let _parent_flight =
-                match ReceiptFlight::begin(ctx, &Request::Query(predecessor.clone())) {
-                    Ok(flight) => flight,
-                    Err(()) => return UNKNOWN.into(),
-                };
-            prepare_account_relation(ctx, master, predecessor, candidate, phase, caller, kernel)
+            let _parent_flight = match ReceiptFlight::begin(
+                ctx,
+                &Request::Query(relation.predecessor().binding().clone()),
+            ) {
+                Ok(flight) => flight,
+                Err(()) => return UNKNOWN.into(),
+            };
+            prepare_account_relation(ctx, master, relation, caller, kernel)
         },
     )
 }
@@ -282,12 +348,11 @@ pub(super) fn prepare_account(
 fn prepare_account_relation(
     ctx: &crate::SessionCtx,
     master: i32,
-    predecessor: &Binding,
-    candidate: Prepare,
-    phase: ImagePhase,
+    relation: Relation,
     caller: SupervisorInputCaller,
     kernel: &dyn Kernel,
 ) -> String {
+    let candidate = relation.candidate();
     // A lost acknowledgement may have consumed the predecessor already. Only
     // the exact retained child relation can recover it, never a fresh capture.
     let previous = ctx
@@ -303,28 +368,20 @@ fn prepare_account_relation(
         let Some(account) = &op.authority.account else {
             return DENIED.into();
         };
-        if &account.binding != predecessor
-            || account.phase != phase
-            || account.candidate != candidate
-        {
+        if account.relation != relation {
             return DENIED.into();
         }
         let account = account.clone();
         drop(op);
         account
     } else {
-        let account = match AccountContinuation::capture(
-            ctx,
-            predecessor,
-            &candidate,
-            phase,
-            &caller,
-            kernel,
-        ) {
+        let account = match capture_or_replay(ctx, &relation, || {
+            AccountContinuation::capture(ctx, &relation, &caller, kernel)
+        }) {
             Ok(account) => account,
             Err(refusal) => return refusal.into(),
         };
-        if account.proof().claimed_by(&candidate)
+        if account.proof().claimed_by(candidate)
             && !ctx
                 .fenced_writes
                 .native
@@ -337,5 +394,44 @@ fn prepare_account_relation(
         }
         account
     };
-    prepare_inner(ctx, master, candidate, caller, kernel, Some(account))
+    prepare_inner(
+        ctx,
+        master,
+        candidate.clone(),
+        caller,
+        kernel,
+        Some(account),
+    )
+}
+
+/// A concurrent exact publisher may consume or retire the predecessor between
+/// the first child lookup and capture. Recheck its retained relation, never
+/// turn that race into a fresh capability or a contradictory denial.
+pub(super) fn capture_or_replay(
+    ctx: &crate::SessionCtx,
+    relation: &Relation,
+    capture: impl FnOnce() -> Result<AccountContinuation, &'static str>,
+) -> Result<AccountContinuation, &'static str> {
+    match capture() {
+        Ok(account) => Ok(account),
+        Err(refusal) => {
+            let child = ctx
+                .fenced_writes
+                .native
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .by_id
+                .get(&relation.candidate().id)
+                .cloned()
+                .ok_or(refusal)?;
+            let child = child.lock().unwrap_or_else(|p| p.into_inner());
+            child
+                .authority
+                .account
+                .as_ref()
+                .filter(|account| account.relation == *relation)
+                .cloned()
+                .ok_or(DENIED)
+        }
+    }
 }

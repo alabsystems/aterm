@@ -211,8 +211,13 @@ struct Claim {
     intent: Intent,
     phase: Phase,
 }
+/// Where this vault slot keeps its creation claim, which a reader of the vault's identity reads.
+pub(super) fn claim_file(paths: &Paths) -> std::path::PathBuf {
+    paths.dir.join(CLAIM)
+}
+
 fn claim(paths: &Paths) -> crate::Result<Option<Claim>> {
-    let Some(bytes) = fsx::read_private(&paths.dir.join(CLAIM), 101 + MAX_INTENT)? else {
+    let Some(bytes) = fsx::read_private(&claim_file(paths), 101 + MAX_INTENT)? else {
         return Ok(None);
     };
     if bytes.as_slice().len() <= 101 || &bytes.as_slice()[..4] != b"ACC2" {

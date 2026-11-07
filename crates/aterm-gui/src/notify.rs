@@ -204,20 +204,13 @@ struct AdmittedDelivery {
     msg: NotifyMsg,
     policy: DeliveryPolicy,
     #[cfg(target_os = "macos")]
-    alerts: bool,
-    #[cfg(target_os = "macos")]
     silent: bool,
 }
 
 /// The first dequeue's decision, shared with tests that inject only the transport.
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 fn admit_delivery(msg: NotifyMsg, policy: &DeliveryPolicy) -> Option<AdmittedDelivery> {
-    let alerts = policy.own_alerts.load(Ordering::Acquire);
-    if !delivers(
-        &msg,
-        &policy.suppress.lock().unwrap_or_else(|p| p.into_inner()),
-        alerts,
-    ) {
+    if !policy.wanted(&msg) {
         return None;
     }
     Some(AdmittedDelivery {
@@ -225,8 +218,6 @@ fn admit_delivery(msg: NotifyMsg, policy: &DeliveryPolicy) -> Option<AdmittedDel
         silent: policy.silent.load(Ordering::Acquire),
         msg,
         policy: policy.clone(),
-        #[cfg(target_os = "macos")]
-        alerts,
     })
 }
 
@@ -266,7 +257,6 @@ pub(crate) fn spawn_delivery(
                 admitted.silent,
                 Some(msg.session),
                 center,
-                admitted.alerts,
                 || admitted.policy.wanted(msg),
             );
             #[cfg(windows)]
@@ -304,7 +294,6 @@ fn deliver(
     _silent: bool,
     session: Option<u64>,
     center: crate::notice_center::NoticeCenter,
-    alerts: bool,
     wanted: impl Fn() -> bool,
 ) {
     use aterm_uds::spawnfd::Stdio;
@@ -317,10 +306,7 @@ fn deliver(
     // A bundle's voice is aterm's own: posted in-process as the bundle, or
     // not at all. A center that would not take the notice, or none to post
     // through, is one log line, never a subprocess.
-    match post_for(
-        way_for(center, running_bundled(), alerts, &ASKED, &wanted),
-        &wanted,
-    ) {
+    match post_of(center, running_bundled(), &wanted) {
         Some(Post::Center) => {
             let posted = center.post(&crate::notice_center::Notice {
                 title,
@@ -356,6 +342,17 @@ enum Post {
     Osascript,
 }
 
+/// The post a notice gets as `center` stands now. A notice reads what macOS said and never asks it:
+/// asking is [`ask_macos`]'s.
+#[cfg(target_os = "macos")]
+fn post_of(
+    center: crate::notice_center::NoticeCenter,
+    bundled: bool,
+    wanted: impl Fn() -> bool,
+) -> Option<Post> {
+    post_for(route(center.answer(), bundled), wanted)
+}
+
 /// The post a notice routed `way` gets: the center's for [`Route::Center`] and osascript's for
 /// [`Route::Osascript`], each only while `wanted`; any other way is one log line and no post.
 #[cfg(target_os = "macos")]
@@ -370,14 +367,11 @@ fn post_for(way: Route, wanted: impl Fn() -> bool) -> Option<Post> {
             );
             None
         }
-        Route::Ask | Route::Unasked => {
-            aterm_log::info!("notices: one not posted: macOS has not authorized notifications");
-            None
-        }
-        Route::Lapsed => {
+        Route::Unasked => {
             aterm_log::info!(
-                "notices: one not posted: the queued intent ended, aterm's own notices were \
-                 turned off or its tab came into view"
+                "notices: one not posted: macOS has not authorized notifications; a person \
+                 turning Allow programs to show desktop notifications off and on in Settings \
+                 \u{25B8} Security asks it"
             );
             None
         }
@@ -411,69 +405,31 @@ fn osascript_script(title: &str, body: &str) -> String {
     )
 }
 
+/// Ask macOS to let aterm post as itself, and wake the App once it has answered, so the center's
+/// delegate is adopted and a click comes back. A person turning the Settings row on is the only
+/// caller (`App::publish_native_config_origin`). The center's ask runs on a thread of its own, so
+/// the main thread never waits, and a Mac that has already answered sees nothing.
 #[cfg(target_os = "macos")]
-static ASKED: AtomicBool = AtomicBool::new(false);
-
-#[cfg(target_os = "macos")]
-const ASK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
-
-#[cfg(target_os = "macos")]
-fn way_for(
-    center: crate::notice_center::NoticeCenter,
-    bundled: bool,
-    alerts: bool,
-    asked: &AtomicBool,
-    wanted: impl Fn() -> bool,
-) -> Route {
-    match route(
-        center.answer(),
-        bundled,
-        alerts,
-        asked.load(Ordering::Acquire),
-    ) {
-        Route::Ask if !asked.swap(true, Ordering::AcqRel) => {}
-        Route::Ask => return Route::Unasked,
-        way => return way,
-    }
-    let (answered, answer) = std::sync::mpsc::sync_channel::<()>(1);
-    center.ask(Box::new(move || {
-        let _ = answered.try_send(());
-    }));
-    if answer.recv_timeout(ASK_WAIT) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-        aterm_log::info!("notices: macOS has not answered aterm's ask within {ASK_WAIT:?}");
-    }
-    wake(crate::Wake::NoticeReady);
-    match route(center.answer(), bundled, alerts, true) {
-        Route::Center if !wanted() => Route::Lapsed,
-        way => way,
-    }
+pub(crate) fn ask_macos(center: crate::notice_center::NoticeCenter) {
+    center.ask(Box::new(|| wake(crate::Wake::NoticeReady)));
 }
 
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Route {
     Center,
-    Ask,
     Withheld,
     Unasked,
-    #[cfg(target_os = "macos")]
-    Lapsed,
     Centerless,
     Osascript,
 }
 
 #[cfg(any(target_os = "macos", test))]
-const fn route(
-    center: crate::notice_center::Center,
-    bundled: bool,
-    alerts: bool,
-    asked: bool,
-) -> Route {
+const fn route(center: crate::notice_center::Center, bundled: bool) -> Route {
     use crate::notice_center::Center;
     match center {
         Center::Granted => Route::Center,
         Center::Refused => Route::Withheld,
-        Center::Unasked | Center::Provisional if alerts && !asked => Route::Ask,
         Center::Unasked | Center::Provisional => Route::Unasked,
         Center::Absent if bundled => Route::Centerless,
         Center::Absent => Route::Osascript,
@@ -565,7 +521,7 @@ thread_local! {
     static WAKES: std::cell::RefCell<Vec<crate::Wake>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The wakes this thread's notices handed the App since the last call (test-only): what a click or an ask would have sent through the proxy. macOS's only: its readers are the center's click tests, and Windows' balloon has none in a test build.
+/// The wakes this thread's notices handed the App since the last call (test-only): what a click or an ask would have sent through the proxy. macOS's only: its readers are the center's click tests and the ask's wake test, and Windows' balloon has none in a test build.
 #[cfg(all(target_os = "macos", test))]
 pub(crate) fn take_wakes() -> Vec<crate::Wake> {
     WAKES.with(|wakes| std::mem::take(&mut *wakes.borrow_mut()))
@@ -1475,51 +1431,32 @@ mod tests {
             Center::Unasked,
             Center::Absent,
             status_answer(1),
+            status_answer(3),
             status_answer(-1),
         ];
-        for alerts in [true, false] {
-            for asked in [true, false] {
-                let case = format!("alerts={alerts} asked={asked}");
-                assert_eq!(
-                    route(Center::Granted, true, alerts, asked),
-                    Route::Center,
-                    "{case}"
-                );
-                for refused in [Center::Refused, status_answer(1), status_answer(-1)] {
-                    assert_eq!(
-                        route(refused, true, alerts, asked),
-                        Route::Withheld,
-                        "{case}"
-                    );
-                }
-                let unasked = if alerts && !asked {
-                    Route::Ask
-                } else {
-                    Route::Unasked
-                };
-                assert_eq!(
-                    route(Center::Unasked, true, alerts, asked),
-                    unasked,
-                    "{case}"
-                );
-                assert_eq!(
-                    route(Center::Absent, true, alerts, asked),
-                    Route::Centerless,
-                    "Absent while bundled: {case}"
-                );
-                for answer in answers {
-                    assert!(
-                        !matches!(route(answer, true, alerts, asked), Route::Osascript),
-                        "a bundle reached a subprocess: {answer:?} {case}"
-                    );
-                }
-                assert_eq!(
-                    route(Center::Absent, false, alerts, asked),
-                    Route::Osascript,
-                    "a bare binary: {case}"
-                );
-            }
+        assert_eq!(route(Center::Granted, true), Route::Center);
+        for refused in [Center::Refused, status_answer(1), status_answer(-1)] {
+            assert_eq!(route(refused, true), Route::Withheld);
         }
+        for unasked in [Center::Unasked, status_answer(3)] {
+            assert_eq!(route(unasked, true), Route::Unasked);
+        }
+        assert_eq!(
+            route(Center::Absent, true),
+            Route::Centerless,
+            "Absent while bundled"
+        );
+        for answer in answers {
+            assert!(
+                !matches!(route(answer, true), Route::Osascript),
+                "a bundle reached a subprocess: {answer:?}"
+            );
+        }
+        assert_eq!(
+            route(Center::Absent, false),
+            Route::Osascript,
+            "a bare binary"
+        );
     }
 
     /// What a route posts: the center's notice for a granted center and osascript's for a bare
@@ -1531,10 +1468,8 @@ mod tests {
         use super::{Post, Route, osascript_script, post_for};
         for way in [
             Route::Center,
-            Route::Ask,
             Route::Withheld,
             Route::Unasked,
-            Route::Lapsed,
             Route::Centerless,
             Route::Osascript,
         ] {
@@ -1556,126 +1491,78 @@ mod tests {
         );
     }
 
+    /// An ask hands the App one [`crate::Wake::NoticeReady`] once macOS answers and none before,
+    /// so the center's delegate is adopted when there is a center to adopt. The stand-in answers on
+    /// this thread because `WAKES` is thread-local: an answer from another thread would hide the
+    /// wake from `take_wakes`.
     #[cfg(target_os = "macos")]
     #[test]
-    fn the_first_notice_asks_macos_once() {
-        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-        use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
-        use std::time::Duration;
+    fn asking_macos_wakes_the_app_once_it_answers() {
+        use std::cell::RefCell;
 
-        use super::{Route, route, way_for};
+        use super::{ask_macos, take_wakes};
+        use crate::Wake;
         use crate::notice_center::{Center, NoticeCenter};
 
-        const HANG: Duration = Duration::from_secs(60);
-        const READING: Duration = Duration::from_millis(50);
-        static SAID: Mutex<Center> = Mutex::new(Center::Unasked);
-        static ANSWERS: Mutex<Option<Center>> = Mutex::new(None);
-        static ASKS: AtomicU32 = AtomicU32::new(0);
-        static CLICKED: Mutex<bool> = Mutex::new(false);
-        static CLICK: Condvar = Condvar::new();
-        static WANTED: AtomicBool = AtomicBool::new(true);
-        fn lock<T>(held: &Mutex<T>) -> MutexGuard<'_, T> {
-            held.lock().unwrap_or_else(PoisonError::into_inner)
+        type Then = Box<dyn FnOnce() + Send>;
+        thread_local! {
+            static ASKED: RefCell<Vec<Then>> = const { RefCell::new(Vec::new()) };
         }
-        fn click() {
-            *lock(&CLICKED) = true;
-            CLICK.notify_all();
+        fn hold(then: Then) {
+            ASKED.with(|asked| asked.borrow_mut().push(then));
         }
-        fn answer() -> Center {
-            *lock(&SAID)
-        }
-        fn ask(then: Box<dyn FnOnce() + Send>) {
-            ASKS.fetch_add(1, Ordering::AcqRel);
-            let Some(answered) = *lock(&ANSWERS) else {
-                return;
-            };
-            std::thread::spawn(move || {
-                let clicked = *CLICK
-                    .wait_timeout_while(lock(&CLICKED), HANG, |clicked| !*clicked)
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .0;
-                if clicked {
-                    *lock(&SAID) = answered;
-                    then();
-                }
-            });
-        }
-        fn macos(answers: Option<Center>) {
-            *lock(&SAID) = Center::Unasked;
-            *lock(&ANSWERS) = answers;
-            *lock(&CLICKED) = false;
-            ASKS.store(0, Ordering::Release);
-            WANTED.store(true, Ordering::Release);
-        }
-        let center = NoticeCenter::stand_in(answer, ask);
+        let center = NoticeCenter::stand_in(|| Center::Unasked, hold);
 
-        macos(Some(Center::Granted));
-        let (answered, answer_came) = std::sync::mpsc::channel();
-        center.ask(Box::new(move || {
-            let _ = answered.send(());
-        }));
-        assert_eq!(
-            route(center.answer(), true, true, true),
-            Route::Unasked,
-            "no wait: macOS has not answered yet"
+        let _ = take_wakes();
+        ask_macos(center);
+        let mut asked = ASKED.with(RefCell::take);
+        assert_eq!(asked.len(), 1, "one press is one ask");
+        assert!(
+            take_wakes().is_empty(),
+            "macOS has not answered, so nothing wakes"
         );
-        click();
-        assert_eq!(answer_came.recv_timeout(HANG), Ok(()));
-        assert_eq!(route(center.answer(), true, true, true), Route::Center);
+        let answered = asked.pop().expect("the held ask");
+        answered();
+        assert!(
+            matches!(take_wakes()[..], [Wake::NoticeReady]),
+            "the answer wakes the App once"
+        );
+    }
 
-        let notices = |answers: Option<Center>, alerts: bool, closes: bool| {
-            macos(answers);
-            let person = (answers.is_some() && alerts).then(|| {
-                std::thread::spawn(move || {
-                    std::thread::sleep(READING);
-                    if closes {
-                        WANTED.store(false, Ordering::Release);
-                    }
-                    click();
-                })
-            });
-            let asked = AtomicBool::new(false);
-            let ways = [
-                way_for(center, true, alerts, &asked, || {
-                    WANTED.load(Ordering::Acquire)
-                }),
-                way_for(center, true, alerts, &asked, || true),
-            ];
-            if let Some(person) = person {
-                person.join().expect("the person clicks");
+    /// A notice on a center macOS has not answered is held and asks nothing, so no program's bytes
+    /// can raise the dialog. The granted center is the control: `post_of` reads the stand-in.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_notice_macos_has_not_answered_is_held_and_asks_nothing() {
+        use std::cell::Cell;
+
+        use super::{Post, post_of};
+        use crate::notice_center::{Center, NoticeCenter};
+
+        thread_local! {
+            static ASKS: Cell<u32> = const { Cell::new(0) };
+        }
+        fn counted(_then: Box<dyn FnOnce() + Send>) {
+            ASKS.with(|asks| asks.set(asks.get() + 1));
+        }
+        for bundled in [true, false] {
+            for center in [
+                NoticeCenter::stand_in(|| Center::Unasked, counted),
+                NoticeCenter::stand_in(|| Center::Provisional, counted),
+            ] {
+                assert_eq!(post_of(center, bundled, || true), None, "held");
             }
-            (
-                ways,
-                ASKS.load(Ordering::Acquire),
-                asked.load(Ordering::Acquire),
-            )
-        };
-
-        assert_eq!(
-            notices(Some(Center::Granted), true, false),
-            ([Route::Center, Route::Center], 1, true),
-            "a yes: the first asks and waits for it, and both go out as aterm"
-        );
-        assert_eq!(
-            notices(Some(Center::Granted), true, true),
-            ([Route::Lapsed, Route::Center], 1, true),
-            "gates closed while macOS asked: the first is not posted, a later one is"
-        );
-        assert_eq!(
-            notices(Some(Center::Refused), true, false),
-            ([Route::Withheld, Route::Withheld], 1, true),
-            "a no: withheld"
-        );
-        assert_eq!(
-            notices(None, true, false),
-            ([Route::Unasked, Route::Unasked], 1, true),
-            "no answer: held, and asked once"
-        );
-        assert_eq!(
-            notices(Some(Center::Granted), false, false),
-            ([Route::Unasked, Route::Unasked], 0, false),
-            "notices off: a program's notification asks nothing"
-        );
+            assert_eq!(
+                post_of(
+                    NoticeCenter::stand_in(|| Center::Granted, counted),
+                    bundled,
+                    || true
+                ),
+                Some(Post::Center),
+                "control: an answered center posts"
+            );
+        }
+        assert_eq!(ASKS.with(Cell::get), 0, "no notice asked macOS");
     }
 
     #[test]

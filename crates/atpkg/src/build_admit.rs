@@ -17,8 +17,11 @@
 //! from what earlier builds of it kept here and elsewhere ([`aterm_capacity::book::TARGO_RECORD`])
 //! and verify's run of the stage whose work holds its own, its analogue
 //! ([`aterm_capacity::book::VERIFY_RECORD`]: a test build's `TestCompile`, a lint's `Tippy`), and
-//! a fifth more; else a wider selection's; the cold figure where none is kept. A need at or beyond what can ever be available here asks to run alone, as verify's do,
-//! and one the ledger finds can never fit beside others asks again alone.
+//! a fifth more; else a wider selection's in its checkout, then a wider named selection's in
+//! another checkout, its own book's or verify's, unless a narrower record or a unit's peak shows
+//! that run warm, at most the cold figure; the cold figure where none is kept. A need at or
+//! beyond what can ever be available here asks to run alone, as verify's do, and one the ledger
+//! finds can never fit beside others asks again alone.
 //!
 //! When it claims nothing ([`admit`]): a held claim of its own process or an ancestor's that
 //! covers its tree's builds ([`aterm_capacity::covering`]) already holds its memory (a verify
@@ -369,7 +372,7 @@ pub fn classify(args: &[String], tool: Tool) -> Option<Build> {
         format!("{program} {verb}")
     };
     let holds: Option<(&'static str, Within)> = match (program, trust, verb) {
-        ("targo", false, "test") => Some(("TestCompile", in_test_compile)),
+        ("targo", false, "test") => Some((book::TEST_COMPILE, in_test_compile)),
         ("targo", false, "tippy") => Some(("Tippy", in_lint)),
         _ => None,
     };
@@ -472,10 +475,15 @@ pub fn key(build: &Build, cwd: &Path) -> Key {
     }
 }
 
-/// What a build kept under `key` claims on a machine of `physical` bytes: what `own` (the plain
-/// builds' records) keeps for it, else, for a build that has one ([`Build::analogue`]), what
-/// `verify` keeps for its analogue over the same selection ([`book::need`]), whose key has no
-/// variant: verify's stage builds what its analogue's targets name and more.
+/// What a build kept under `key` claims on a machine of `physical` bytes, as [`book::chain`] reads
+/// it ([`book::need`]): the most of what `own` (the plain builds' records) keeps for it, here or
+/// in another checkout, and, for a build that has one ([`Build::analogue`]), what `verify` keeps
+/// for its analogue over the same selection, as verify reads it or in another checkout (its key
+/// has no variant: verify's stage builds what its analogue's targets name and more); else a wider
+/// selection's in `own` in its checkout; else the more of a wider named selection's in another
+/// checkout, in `own` and of the analogue in `verify`, each refused where a narrower record or a
+/// unit's peak shows that run warm, at most the cold figure; and the cold figure where none is
+/// kept.
 #[must_use]
 pub fn need(
     build: &Build,
@@ -571,7 +579,16 @@ impl Held {
             claim, key, own, ..
         } = self;
         let claimed = claim.record().need.mem;
-        (claim, Ended { claimed, key, own })
+        let run = telemetry::Run::of(&claim);
+        (
+            claim,
+            Ended {
+                claimed,
+                key,
+                own,
+                run,
+            },
+        )
     }
 
     /// The claim.
@@ -586,10 +603,11 @@ impl Held {
         &self.key
     }
 
-    /// The build ended: let the claim go, then keep its peak ([`Ended::keep`]). The bytes kept;
-    /// `None` when nothing was, or the record could not be written (said in one line).
-    pub fn end(self, succeeded: bool, peak: u64, say: &mut dyn FnMut(&str)) -> Option<u64> {
-        self.let_go().keep(succeeded, peak, say)
+    /// The build ended `end`: let the claim go, then keep its peak and write its row
+    /// ([`Ended::keep`]). The bytes kept; `None` when nothing was, or the record could not be
+    /// written (said in one line).
+    pub fn end(self, end: BuildEnd, peak: u64, say: &mut dyn FnMut(&str)) -> Option<u64> {
+        self.let_go().keep(end, peak, say)
     }
 
     /// Drop local controller custody before reading or recording its final memory sample.
@@ -601,18 +619,26 @@ impl Held {
             claim, key, own, ..
         } = self;
         let claimed = claim.record().need.mem;
+        let run = telemetry::Run::of(&claim);
         drop(claim);
-        Ended { claimed, key, own }
+        Ended {
+            claimed,
+            key,
+            own,
+            run,
+        }
     }
 }
 
 /// A build whose local controller ended ([`Held::let_go`]): its requested memory and
-/// sample key/path. This does not certify closure of a retained durable cohort.
+/// sample key/path, and what its claim's record said of it for its telemetry row. This does not
+/// certify closure of a retained durable cohort.
 #[derive(Debug)]
 pub struct Ended {
     claimed: u64,
     key: Key,
     own: Option<PathBuf>,
+    run: telemetry::Run,
 }
 
 impl Ended {
@@ -622,12 +648,23 @@ impl Ended {
     /// next claim, and one below would lower it), unless the run was light beside the heavy peak
     /// its key keeps ([`Records::keep_unless_light`]: a fresh build that compiled nothing). A key
     /// whose builds keep failing (an edit-test loop's red runs, a build stopped for swap) so
-    /// learns what its compile takes. The bytes kept; `None` when nothing was, or the record could
-    /// not be written (said in one line).
-    pub fn keep(self, succeeded: bool, peak: u64, say: &mut dyn FnMut(&str)) -> Option<u64> {
-        let Ended { claimed, key, own } = self;
+    /// learns what its compile takes. It `succeeded` as [`BuildEnd::succeeded`] judges `end`.
+    /// Then, where its claim was held in this user's own ledger, it writes the build's
+    /// `kind=build` or `kind=test` row ([`telemetry`]). The bytes kept; `None` when nothing was,
+    /// or the record could not be written (said in one line).
+    pub fn keep(self, end: BuildEnd, peak: u64, say: &mut dyn FnMut(&str)) -> Option<u64> {
+        let Ended {
+            claimed,
+            key,
+            own,
+            run,
+        } = self;
+        let succeeded = end.succeeded();
         let raises = aterm_capacity::peak_claim(peak) > claimed;
-        match own.filter(|_| peak > 0 && (succeeded || raises)) {
+        // The row goes after the book, so its lock wait and first host read never hold up the
+        // peak a next claim of this key reads.
+        let stage = key.stage.clone();
+        let kept = match own.filter(|_| peak > 0 && (succeeded || raises)) {
             Some(path) => {
                 let at = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -644,7 +681,9 @@ impl Ended {
                 }
             }
             None => None,
-        }
+        };
+        telemetry::ended(&run, &stage, &end, peak);
+        kept
     }
 }
 
@@ -944,8 +983,9 @@ fn admit_for(
 }
 
 /// The largest resident peak of this process's reaped children, bytes (`getrusage`'s
-/// `RUSAGE_CHILDREN`): the floor a front puts under its meter's read, true only of a process
-/// whose one child was the build. 0 where it is unread.
+/// `RUSAGE_CHILDREN`): the floor a front puts under its meter's read where it rose while the
+/// build ran ([`supervise`]), since a process that reaped an earlier child (another tool's run)
+/// holds that child's peak too. 0 where it is unread.
 #[cfg(all(
     unix,
     target_pointer_width = "64",
@@ -1011,8 +1051,9 @@ pub fn children_maxrss() -> u64 {
 /// catchable one that ends a process with no core, and the terminal keys' where the terminal's
 /// key would not reach it itself), handed the claim's cover marker ([`aterm_capacity::COVER_ENV`])
 /// so the builds it starts claim nothing more, its tree metered while a claim is held, and its
-/// peak (never
-/// below `floor`'s read once it is reaped) kept as [`Held::end`] keeps one. Its status.
+/// peak kept as [`Held::end`] keeps one: never below `floor`'s read once it is reaped where that
+/// read rose past its read before the launch (a peak `floor` held before is an earlier child's,
+/// no floor of this build). Its status.
 /// Build pass-through commands with [`aterm_uds::spawnfd::TransparentCommand::into_command`]
 /// to preserve inherited handles such as compiler jobserver pipes. The native owned-child
 /// boundary uses ordinary spawn for ordinary admission. [`admit_cohort`] instead requires
@@ -1355,6 +1396,8 @@ fn supervise_launch(
             held.claim().record().cover_marker(),
         );
     }
+    // The floor's read before the launch: a peak it already held is an earlier child's.
+    let floor_before = held.as_ref().map(|_| floor());
     let front = arm();
     let (mut owned, mut launch_error) = match launch_held(held.as_mut(), command) {
         Ok(child) => child,
@@ -1471,9 +1514,14 @@ fn supervise_launch(
         });
     if let (Some(held), Some(meter)) = (held, meter) {
         let ended = held.let_go();
-        let peak = meter.stop(floor());
+        let after = floor();
+        let peak = meter.stop(if floor_before.is_some_and(|before| after > before) {
+            after
+        } else {
+            0
+        });
         ended.keep(
-            !cancelled && settled && status.as_ref().is_ok_and(std::process::ExitStatus::success),
+            BuildEnd::judged(status.as_ref().ok().copied(), !cancelled && settled),
             peak,
             say,
         );
@@ -2537,6 +2585,10 @@ mod becoming;
 
 #[path = "build_admit_hold.rs"]
 pub mod hold;
+
+#[path = "build_admit_telemetry.rs"]
+mod telemetry;
+pub use telemetry::BuildEnd;
 
 #[cfg(test)]
 #[path = "build_admit_tests.rs"]

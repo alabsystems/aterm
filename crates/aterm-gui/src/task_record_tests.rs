@@ -232,7 +232,7 @@ fn the_same_mark_twice_moves_nothing_and_a_change_bumps_the_rev() {
     let t0 = Instant::now();
     let mut working = TaskMark::new(TaskState::Working);
     working.from = Some(SID.to_string());
-    let (first, moved) = working.apply(None, false, t0, 1_000);
+    let (first, moved) = working.apply(None, &Asks::default(), t0, 1_000);
     assert!(moved);
     assert_eq!(
         (first.rev, first.state, first.from.as_str()),
@@ -240,21 +240,37 @@ fn the_same_mark_twice_moves_nothing_and_a_change_bumps_the_rev() {
     );
     assert_eq!(first.since_unix_ms, 1_000);
 
-    let (again, moved) = working.apply(Some(&first), false, t0 + Duration::from_secs(1), 2_000);
+    let (again, moved) = working.apply(
+        Some(&first),
+        &Asks::default(),
+        t0 + Duration::from_secs(1),
+        2_000,
+    );
     assert!(!moved);
     assert_eq!(again, first, "no rev, no since moved");
-    let (kept, moved) = TaskMark::new(TaskState::Working).apply(Some(&first), false, t0, 2_000);
+    let (kept, moved) =
+        TaskMark::new(TaskState::Working).apply(Some(&first), &Asks::default(), t0, 2_000);
     assert!(!moved && kept.from == SID);
 
     let mut done = TaskMark::new(TaskState::Done);
     done.why = Some("landed");
     done.result_bytes = 42;
-    let (finished, moved) = done.apply(Some(&first), false, t0 + Duration::from_secs(2), 3_000);
+    let (finished, moved) = done.apply(
+        Some(&first),
+        &Asks::default(),
+        t0 + Duration::from_secs(2),
+        3_000,
+    );
     assert!(moved);
     assert_eq!((finished.rev, finished.state), (2, TaskState::Done));
     assert_eq!((finished.since_unix_ms, finished.result_bytes), (3_000, 42));
     assert_eq!(finished.from, SID, "the record keeps its origin");
-    let (same, moved) = done.apply(Some(&finished), false, t0 + Duration::from_secs(9), 9_000);
+    let (same, moved) = done.apply(
+        Some(&finished),
+        &Asks::default(),
+        t0 + Duration::from_secs(9),
+        9_000,
+    );
     assert!(
         !moved && same.rev == 2,
         "a harness marking done again wakes no one"
@@ -262,7 +278,7 @@ fn the_same_mark_twice_moves_nothing_and_a_change_bumps_the_rev() {
 
     let (resized, moved) = TaskMark::new(TaskState::Done).apply(
         Some(&finished),
-        false,
+        &Asks::default(),
         t0 + Duration::from_secs(3),
         4_000,
     );
@@ -271,11 +287,22 @@ fn the_same_mark_twice_moves_nothing_and_a_change_bumps_the_rev() {
     assert_eq!((resized.why, resized.result_bytes), (None, 0));
     let (raised, moved) = TaskMark::new(TaskState::Done).apply(
         Some(&resized),
-        true,
+        &Asks::of_owners([1]),
         t0 + Duration::from_secs(4),
         5_000,
     );
     assert!(moved && raised.rev == 4 && raised.attention && raised.has_news());
+    let bare = TaskMark::new(TaskState::Done);
+    let (asked, moved) = bare.apply(Some(&raised), &Asks::of_owners([1, 2]), t0, 6_000);
+    assert!(
+        moved && asked.rev == 5,
+        "a second ask beside the first is news"
+    );
+    let (fewer, moved) = bare.apply(Some(&asked), &Asks::of_owners([2]), t0, 7_000);
+    assert!(
+        !moved && fewer.rev == 5 && fewer.asks == Asks::of_owners([2]),
+        "one of two taken down is none, and the record keeps the ask that stands"
+    );
 }
 
 /// A MAC ASLEEP BEFORE AN UPDATE SPENDS NONE OF A CARRIED CLOCK: the successor's `since` and
@@ -299,6 +326,7 @@ fn a_carried_record_keeps_only_the_time_it_was_awake() {
         result_bytes: 0,
         result_path: None,
         attention: false,
+        asks: Asks::default(),
         since_unix_ms: 10_000,
         since: t0 + Duration::from_secs(6),
         started_unix_ms: 4_000,
@@ -363,6 +391,7 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         result_bytes: 9,
         result_path: Some(tasks().join("r 1.txt")),
         attention: true,
+        asks: Asks::default(),
         since_unix_ms: 10_000,
         since: t0,
         started_unix_ms: 10_000,
@@ -530,6 +559,7 @@ fn the_reply_event_and_status_spellings() {
         result_bytes: 120,
         result_path: None,
         attention: false,
+        asks: Asks::default(),
         since_unix_ms: 0,
         since: Instant::now(),
         started_unix_ms: 0,
@@ -575,6 +605,27 @@ fn the_reply_event_and_status_spellings() {
         )
     );
     assert!(await_row(SID, Some(&record), "-", "-", "-", true).contains(" state=closed "));
+    // A closed row says its record's own state: a task that concluded says the state it ended
+    // in; one closed while working says so, its `failed` the closed tab's reading alone.
+    assert!(
+        await_row(SID, Some(&record), "-", "-", "-", true)
+            .ends_with(" result_bytes=120 task_state=done conclusion=finished why=landed")
+    );
+    let working = TaskRecord {
+        state: TaskState::Working,
+        why: None,
+        ..record.clone()
+    };
+    assert!(
+        await_row(SID, Some(&working), "-", "-", "-", true)
+            .ends_with(" result_bytes=120 task_state=working conclusion=failed"),
+        "{}",
+        await_row(SID, Some(&working), "-", "-", "-", true)
+    );
+    assert!(
+        !await_row(SID, Some(&working), "-", "-", "-", false).contains("task_state="),
+        "a live row's state is its record's"
+    );
 }
 
 fn words(line: &str) -> Vec<&str> {
@@ -813,16 +864,29 @@ fn a_workers_needs_you_entry_raises_the_task_records_attention() {
     write(needs, MetaEdit::Set("a release credential"));
     assert_eq!(flag(), (2, true), "NEEDS YOU raises it");
     write(supervisor, MetaEdit::Set("a dialog"));
+    assert_eq!(
+        flag(),
+        (3, true),
+        "a second ask under the standing one is news"
+    );
     write(needs, MetaEdit::Clear);
-    assert!(flag().1, "the supervisor's entry still stands");
+    assert_eq!(
+        flag(),
+        (3, true),
+        "the supervisor's entry still stands, and an ask taken down from two is none"
+    );
     write(supervisor, MetaEdit::Clear);
-    assert!(!flag().1, "both cleared");
+    assert_eq!(flag(), (4, false), "both cleared");
     let codex = crate::task_record::SELF_CLAIM_ATTENTION_OWNER;
     assert!(crate::task_record::owner_moves_task(codex));
     write(codex, MetaEdit::Set("box: Allow this command?"));
-    assert!(flag().1, "a point codex-alab left to a person raises it");
+    assert_eq!(
+        flag(),
+        (5, true),
+        "a point codex-alab left to a person raises it"
+    );
     write(codex, MetaEdit::Clear);
-    assert!(!flag().1, "and its clearing lowers it");
+    assert_eq!(flag(), (6, false), "and its clearing lowers it");
     let before = flag();
     write_attention_kind(
         ctx,
@@ -833,6 +897,74 @@ fn a_workers_needs_you_entry_raises_the_task_records_attention() {
     )
     .unwrap();
     assert_eq!(flag(), before, "a person's entry is not the task's news");
+}
+
+/// THE SAME NEEDS ENTRY IS NO NEWS WHETHER ITS NEEDS ARE KNOWN OR NOT ([`Asks::joins`]): with no
+/// told set describing it (a record a seamless update carried, a proven self-claim's set gone
+/// with its claim) the entry asks its words alone, and a set describing the same words told
+/// after, or the set that did gone, joins nothing. CONTROL: beside a told set a need joining is
+/// news though the words hold and one taken down is none, new words no set describes are news,
+/// and an entry raised is news where its clearing is none.
+#[test]
+fn the_same_needs_entry_is_no_news_with_its_needs_known_or_not() {
+    let owner = crate::harness_host::NEEDS_ATTENTION_OWNER;
+    let one = "claude needs you: sign 0.48.0 — carrying on";
+    let two = "claude needs you: sign 0.48.0 (+1 more) — carrying on";
+    let asks = |entry: Option<&str>, told: &[&str]| {
+        let mut meta = crate::session_timeline::SessionMeta::default();
+        let mut set = crate::needs::ToldNeeds::default();
+        if let Some(entry) = entry {
+            meta.set_attention_kind(
+                owner,
+                Some(entry.to_string()),
+                Some(aterm_types::needs::AttentionKind::Ask),
+            )
+            .expect("room for the entry");
+            let told: Vec<String> = told.iter().map(|need| (*need).to_string()).collect();
+            let held = crate::needs::HarnessNeeds::told(&told, entry).map(std::sync::Arc::new);
+            set.tell(held, Some(entry));
+        }
+        supervisor_asks(&meta, &set)
+    };
+    let words = asks(Some(one), &[]);
+    let known = asks(Some(one), &["sign 0.48.0"]);
+    assert_ne!(
+        words, known,
+        "a told set's needs are asked, not its entry's words"
+    );
+    assert!(
+        !known.joins(&words),
+        "the set told after a carry is no news"
+    );
+    assert!(
+        !words.joins(&known),
+        "the set gone with its claim is no news"
+    );
+
+    let both = asks(Some(two), &["sign 0.48.0", "grant Full Disk Access"]);
+    assert!(
+        both.joins(&known) && both.joins(&words),
+        "CONTROL: a need joins"
+    );
+    assert!(
+        !known.joins(&both),
+        "CONTROL: one of two taken down is none"
+    );
+    let swapped = asks(Some(two), &["sign 0.48.0", "restart the Mac"]);
+    assert!(
+        swapped.joins(&both),
+        "CONTROL: a need joins under the same words"
+    );
+    assert!(
+        asks(Some(two), &[]).joins(&known),
+        "CONTROL: new words no set describes are news"
+    );
+    let none = asks(None, &[]);
+    assert!(none.is_empty() && !words.is_empty());
+    assert!(
+        words.joins(&none) && !none.joins(&words),
+        "CONTROL: raised is news, cleared none"
+    );
 }
 
 /// A WAIT IS NO TASK NEWS: `await task` wakes on a worker done, exited, stalled or needing a
@@ -1635,6 +1767,7 @@ fn the_carry_holds_the_fact_word_and_its_rev_and_reads_them_leniently() {
         result_bytes: 0,
         result_path: None,
         attention: false,
+        asks: Asks::default(),
         since_unix_ms: 10_000,
         since: t0,
         started_unix_ms: 10_000,
@@ -2059,9 +2192,9 @@ fn a_done_marks_what_aterm_checked_and_the_record_carries_it() {
     let mark = parse(&format!("done why=landed checked={on} result_bytes=12")).expect("a mark");
     assert_eq!(mark.checked.as_deref(), Some(on));
     let working = TaskMark::new(TaskState::Working)
-        .apply(None, false, t0, 9_000)
+        .apply(None, &Asks::default(), t0, 9_000)
         .0;
-    let (record, moved) = mark.apply(Some(&working), false, t0, 10_000);
+    let (record, moved) = mark.apply(Some(&working), &Asks::default(), t0, 10_000);
     assert!(moved);
     assert_eq!(record.checked.as_deref(), Some(on));
     let wire = record.wire_fields();
@@ -2079,12 +2212,14 @@ fn a_done_marks_what_aterm_checked_and_the_record_carries_it() {
         "{}",
         await_row(SID, Some(&record), "idle", "-", "-", false)
     );
-    let (again, _) = mark.apply(Some(&record), false, t0, 11_000);
+    let (again, _) = mark.apply(Some(&record), &Asks::default(), t0, 11_000);
     assert_eq!(again.rev, record.rev, "the same mark again moves nothing");
-    let (reopened, _) =
-        parse("working why=turn")
-            .expect("a reopening")
-            .apply(Some(&record), false, t0, 12_000);
+    let (reopened, _) = parse("working why=turn").expect("a reopening").apply(
+        Some(&record),
+        &Asks::default(),
+        t0,
+        12_000,
+    );
     assert_eq!(reopened.checked, None, "{reopened:?}");
     assert!(!reopened.wire_fields().contains("checked="));
     for word in [
@@ -2134,9 +2269,9 @@ fn a_landing_mark_keeps_its_left_word() {
     let mark = parse("done why=landed left=kept:2 result_bytes=12").expect("a mark");
     assert_eq!(mark.left.as_deref(), Some("kept:2"));
     let working = TaskMark::new(TaskState::Working)
-        .apply(None, false, t0, 9_000)
+        .apply(None, &Asks::default(), t0, 9_000)
         .0;
-    let (record, moved) = mark.apply(Some(&working), false, t0, 10_000);
+    let (record, moved) = mark.apply(Some(&working), &Asks::default(), t0, 10_000);
     assert!(moved);
     assert_eq!(record.left.as_deref(), Some("kept:2"));
     assert!(
@@ -2150,10 +2285,12 @@ fn a_landing_mark_keeps_its_left_word() {
     assert_eq!(back.left.as_deref(), Some("kept:2"));
     let waited = await_row(SID, Some(&record), "idle", "-", "-", false);
     assert!(waited.contains(" left=kept:2"), "{waited}");
-    let (reopened, _) =
-        parse("working why=turn")
-            .expect("a reopening")
-            .apply(Some(&record), false, t0, 12_000);
+    let (reopened, _) = parse("working why=turn").expect("a reopening").apply(
+        Some(&record),
+        &Asks::default(),
+        t0,
+        12_000,
+    );
     assert_eq!(reopened.left, None, "{reopened:?}");
     for word in ["0", "kept:1", "3", "unchecked"] {
         assert_eq!(
@@ -2251,9 +2388,9 @@ fn unicode_receipts_mark_done_and_roundtrip_through_records_and_result_sidecars(
         )
         .expect("the receipt's token is a valid done mark");
         let working = TaskMark::new(TaskState::Working)
-            .apply(None, false, now, 9_000)
+            .apply(None, &Asks::default(), now, 9_000)
             .0;
-        let (record, changed) = mark.apply(Some(&working), false, now, 10_000);
+        let (record, changed) = mark.apply(Some(&working), &Asks::default(), now, 10_000);
         assert!(changed && record.state == TaskState::Done);
         assert_eq!(record.checked.as_deref(), Some(word.as_str()));
         let row = record.carry_row(now);
@@ -2344,7 +2481,7 @@ fn a_conclusion_stands_exactly_where_a_task_is_terminal() {
             why,
             ..TaskMark::new(state)
         }
-        .apply(None, false, Instant::now(), 1_000)
+        .apply(None, &Asks::default(), Instant::now(), 1_000)
         .0;
         assert_eq!(record.conclusion(), conclusion, "{state:?} why={why:?}");
     }
@@ -2359,7 +2496,7 @@ fn a_conclusion_stands_exactly_where_a_task_is_terminal() {
 fn the_wire_says_how_a_task_ended() {
     let t0 = Instant::now();
     let working = TaskMark::new(TaskState::Working)
-        .apply(None, false, t0, 1_000)
+        .apply(None, &Asks::default(), t0, 1_000)
         .0;
     assert!(!working.wire_fields().contains("conclusion="));
     let row = |record: &TaskRecord, closed: bool| {
@@ -2372,7 +2509,7 @@ fn the_wire_says_how_a_task_ended() {
         why: Some(WHY_COULD_NOT_FINISH),
         ..TaskMark::new(TaskState::Failed)
     }
-    .apply(Some(&working), false, t0, 2_000)
+    .apply(Some(&working), &Asks::default(), t0, 2_000)
     .0;
     let fields = failed.wire_fields();
     assert!(fields.contains("state=failed"), "{fields}");
@@ -2389,7 +2526,7 @@ fn the_wire_says_how_a_task_ended() {
         why: Some(WHY_LANDED),
         ..TaskMark::new(TaskState::Done)
     }
-    .apply(Some(&working), false, t0, 2_000)
+    .apply(Some(&working), &Asks::default(), t0, 2_000)
     .0;
     assert!(row(&landed, false).contains(" conclusion=finished"));
     assert!(
@@ -2440,7 +2577,7 @@ fn every_ending_the_supervisor_marks_is_a_word_the_record_takes() {
 fn an_exit_keeps_how_the_task_ended() {
     let t0 = Instant::now();
     let working = TaskMark::new(TaskState::Working)
-        .apply(None, false, t0, 1_000)
+        .apply(None, &Asks::default(), t0, 1_000)
         .0;
     let exit = TaskMark {
         why: Some(WHY_EXIT),
@@ -2454,9 +2591,9 @@ fn an_exit_keeps_how_the_task_ended() {
         left: Some("kept:1".to_string()),
         ..TaskMark::new(TaskState::Done)
     }
-    .apply(Some(&working), false, t0, 2_000)
+    .apply(Some(&working), &Asks::default(), t0, 2_000)
     .0;
-    let (gone, moved) = exit.apply(Some(&landed), false, t0, 3_000);
+    let (gone, moved) = exit.apply(Some(&landed), &Asks::default(), t0, 3_000);
     assert!(moved);
     assert_eq!(gone.why, Some(WHY_LANDED));
     assert_eq!(gone.checked.as_deref(), Some("abc@origin/main"));
@@ -2472,9 +2609,9 @@ fn an_exit_keeps_how_the_task_ended() {
             why,
             ..TaskMark::new(TaskState::Done)
         }
-        .apply(Some(&working), false, t0, 2_000)
+        .apply(Some(&working), &Asks::default(), t0, 2_000)
         .0;
-        let (gone, _) = exit.apply(Some(&finished), false, t0, 3_000);
+        let (gone, _) = exit.apply(Some(&finished), &Asks::default(), t0, 3_000);
         assert_eq!((gone.state, gone.why), (TaskState::Exited, why), "{why:?}");
         assert_eq!(gone.conclusion(), Some(Conclusion::Finished), "{why:?}");
         assert_eq!(gone.entered, finished.entered, "{why:?}");
@@ -2489,15 +2626,15 @@ fn an_exit_keeps_how_the_task_ended() {
         why: Some(WHY_COULD_NOT_FINISH),
         ..TaskMark::new(TaskState::Failed)
     }
-    .apply(Some(&working), false, t0, 2_000)
+    .apply(Some(&working), &Asks::default(), t0, 2_000)
     .0;
-    let (gone, _) = exit.apply(Some(&failed), false, t0, 3_000);
+    let (gone, _) = exit.apply(Some(&failed), &Asks::default(), t0, 3_000);
     assert_eq!(gone.state, TaskState::Exited);
     assert_eq!(gone.why, Some(WHY_COULD_NOT_FINISH));
     assert_eq!(gone.entered, failed.entered);
     assert_eq!(gone.conclusion(), Some(Conclusion::Failed));
 
-    let (gone, _) = exit.apply(Some(&working), false, t0, 3_000);
+    let (gone, _) = exit.apply(Some(&working), &Asks::default(), t0, 3_000);
     assert_eq!(gone.why, Some(WHY_EXIT));
     assert_eq!(gone.conclusion(), Some(Conclusion::Failed));
     assert!(!gone.finished);
@@ -2506,9 +2643,9 @@ fn an_exit_keeps_how_the_task_ended() {
 
     // A turn after the landing opens it again: an exit then reads as it stands.
     let open = TaskMark::new(TaskState::Working)
-        .apply(Some(&landed), false, t0, 3_500)
+        .apply(Some(&landed), &Asks::default(), t0, 3_500)
         .0;
-    let (gone, _) = exit.apply(Some(&open), false, t0, 4_000);
+    let (gone, _) = exit.apply(Some(&open), &Asks::default(), t0, 4_000);
     assert_eq!(gone.conclusion(), Some(Conclusion::Failed));
 }
 
@@ -2609,7 +2746,7 @@ fn autopilot_off_fails_a_working_task_and_the_switch_back_opens_it() {
     };
     let person = aterm_slog::Actor::Human;
     let working = TaskMark::new(TaskState::Working)
-        .apply(None, false, t0, 1_000)
+        .apply(None, &Asks::default(), t0, 1_000)
         .0;
 
     let off = autopilot_mark(
@@ -2675,7 +2812,7 @@ fn autopilot_off_fails_a_working_task_and_the_switch_back_opens_it() {
             why: Some(why),
             ..TaskMark::new(TaskState::Failed)
         }
-        .apply(Some(&working), false, t0, 2_000)
+        .apply(Some(&working), &Asks::default(), t0, 2_000)
         .0
     };
     for why in [WHY_OFF, WHY_OFF_CTL, WHY_EXPIRED] {
@@ -2731,7 +2868,7 @@ fn an_off_fails_a_task_only_once_it_has_stood() {
         since_ms: 2_000,
     };
     let working = TaskMark::new(TaskState::Working)
-        .apply(None, false, Instant::now(), 1_000)
+        .apply(None, &Asks::default(), Instant::now(), 1_000)
         .0;
     let at = |now| autopilot_mark(&working, Some(Autopilot::Off), Some(&set), now);
     assert_eq!(at(2_000), None, "a click passing through");

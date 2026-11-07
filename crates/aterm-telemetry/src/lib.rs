@@ -20,10 +20,15 @@
 //! an agent's tool calls (the jobs engine's `agent-call` jobs) and worker spawns. In the
 //! claimant: each admission decided in the account's own capacity ledger (`aterm-capacity`
 //! writes its `kind=admission` row as the decision is made, its `wall_ms` and `wait_ms` both the
-//! admission wait, its CPU and peak `na`).
+//! admission wait, its CPU and peak `na`). Where its claim ends: each build or test that claim
+//! held (atpkg's build admission, `kind=build` and `kind=test`). In `aterm ctl`: each worker a
+//! fleet spawn sent to another Mac (`kind=spawn`, `on=` that Mac's node id), and its board row's
+//! close with that Mac's record (`kind=task`). A process with no [`Sink`] writes through the one
+//! direct writer, [`direct`].
 
 #![warn(missing_docs)]
 
+pub mod direct;
 pub mod facts;
 pub mod log;
 pub mod row;

@@ -129,12 +129,14 @@ fn spare_app_in(cwd: &str) -> App {
     app
 }
 
-/// Each adoption gate reports its miss reason and leaves the spare in place on refusal.
+/// Each adoption gate reports its miss reason and leaves the spare in place on refusal, but for
+/// age: an over-age spare is retired where it is refused, and its successor booked.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn each_adoption_gate_names_its_miss_and_a_spare_that_passes_them_is_taken() {
     let wid = WindowId(0);
     let mut app = app_in("/tmp");
+    app.spares.captured = Some(Vec::new());
     app.session_factory.shell_override = Some("/bin/zsh".to_owned());
     let grid = app.spawn_grid(wid);
     let plain = SpawnAsk::new(None);
@@ -183,8 +185,21 @@ fn each_adoption_gate_names_its_miss_and_a_spare_that_passes_them_is_taken() {
     app.spares.slot.as_mut().unwrap().cwd = Some("/tmp".into());
     app.spares.shared.pre_hold.store(0, Ordering::Release);
     app.spares.slot.as_mut().unwrap().since = Instant::now().checked_sub(PARKED_MAX_AGE).unwrap();
+    app.spares.tick_at.set(None);
     assert_eq!(try_with(&mut app, &plain, grid), Err("age"));
-    app.spares.slot.as_mut().unwrap().since = Instant::now();
+    assert!(
+        app.spares.slot.is_none(),
+        "an over-age spare is retired where it is refused"
+    );
+    assert_eq!(app.spares.discards, vec![("age", 1)]);
+    assert!(
+        app.spares
+            .tick_at
+            .get()
+            .is_some_and(|at| at <= Instant::now()),
+        "and its successor is booked at the next tick"
+    );
+    app.spares.slot = Some(parked_slot(&app, id, Some("/tmp")));
     app.spares.slot.as_ref().unwrap().link.taint(taint::BELL);
     assert_eq!(try_with(&mut app, &plain, grid), Err("taint"));
     app.spares.slot = Some(parked_slot(&app, id, Some("/tmp")));
@@ -228,7 +243,10 @@ fn each_adoption_gate_names_its_miss_and_a_spare_that_passes_them_is_taken() {
     app.update_handoff_prelaunch = Some(record);
     assert_eq!(try_with(&mut app, &plain, grid), Err("update"));
     app.update_handoff_prelaunch = None;
-    assert!(app.spares.slot.is_some(), "every refusal leaves the spare");
+    assert!(
+        app.spares.slot.is_some(),
+        "every other refusal leaves the spare"
+    );
 
     let (slot, session) = app
         .try_adopt_spare(wid, Some(wid), grid, &plain)
@@ -2949,7 +2967,8 @@ fn an_update_retires_the_spare_and_a_spare_is_never_activity() {
     assert!(app.spares.swallows(id), "and its late wakes swallowed");
 }
 
-/// A spare held by the warm budget or an update handoff has a time to look again.
+/// A spare held by the warm budget or an update handoff has a time to look again, the budget's
+/// only while a person seen would still pass the warm gates when it reopens.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_held_gate_with_no_clearing_event_says_when_to_look_again() {
@@ -2960,6 +2979,27 @@ fn a_held_gate_with_no_clearing_event_says_when_to_look_again() {
     assert_eq!(app.spare_recheck_at("budget", t), Some(oldest + HOUR));
     assert_eq!(app.spare_recheck_at("update", t), Some(t + UPDATE_RECHECK));
     assert_eq!(app.spare_recheck_at("power", t), None);
+
+    app.spares.person.set(Some(t));
+    assert_eq!(
+        app.spare_recheck_at("budget", t),
+        None,
+        "it reopens past the person window: the person's next gesture looks"
+    );
+    let soon = t - HOUR + Duration::from_secs(60);
+    app.spares.warm_discards = [soon].into_iter().collect();
+    assert_eq!(
+        app.spare_recheck_at("budget", t),
+        Some(soon + HOUR),
+        "it reopens inside the window"
+    );
+    app.spares.warm_discards = [oldest].into_iter().collect();
+    app.config.spare_shell_needs_person = Some(false);
+    assert_eq!(
+        app.spare_recheck_at("budget", t),
+        Some(oldest + HOUR),
+        "with no person needed, whenever it reopens"
+    );
 }
 
 /// A parked spare the `power` gate refused promotes once the host recovers, not an hour later.
@@ -3153,6 +3193,49 @@ fn a_spawned_spare_unparked_at_its_deadline_is_retired_and_a_younger_one_kept() 
     assert!(app.spares.slot.is_none(), "no parked mark: retired");
     assert_eq!(app.spares.parked_failed, Some(key), "and spares are off");
     assert_eq!(app.spares.discards, vec![("no_park", 1)]);
+}
+
+/// A parked spare arms no timer for its age, so an idle aterm holds no spare deadline; a tick
+/// something else armed retires it once it is past `PARKED_MAX_AGE`.
+#[test]
+fn a_parked_spare_arms_no_age_timer_and_a_later_tick_retires_it() {
+    let mut app = App::headless_for_test();
+    app.spares.captured = Some(Vec::new());
+    // CONTROL: a ready spare arms its own age-out.
+    let mut ready = parked_slot(&app, 62, None);
+    ready.state = SlotState::Ready;
+    let since = ready.since;
+    app.spares.slot = Some(ready);
+    app.spares.tick_at.set(None);
+    app.spare_age(since + Duration::from_millis(1), SpareMode::Auto);
+    assert_eq!(
+        app.spares.tick_at.get(),
+        Some(since + ready_max_age()),
+        "a ready spare's age-out is armed"
+    );
+
+    let parked = parked_slot(&app, 63, None);
+    let since = parked.since;
+    app.spares.slot = Some(parked);
+    app.spares.tick_at.set(None);
+    app.spare_age(
+        since + PARKED_MAX_AGE - Duration::from_millis(1),
+        SpareMode::Auto,
+    );
+    assert_eq!(
+        app.spares.slot.as_ref().map(|s| s.state),
+        Some(SlotState::Parked),
+        "a millisecond short of its age it is kept"
+    );
+    assert_eq!(
+        app.spares.tick_at.get(),
+        None,
+        "and no timer is armed for its age"
+    );
+
+    app.spare_age(since + PARKED_MAX_AGE, SpareMode::Auto);
+    assert!(app.spares.slot.is_none(), "at its age a tick retires it");
+    assert_eq!(app.spares.discards, vec![("age", 1)]);
 }
 
 /// A start record arriving while `Booked` retires a parked-capable spare.
@@ -3463,7 +3546,12 @@ fn a_fish_run_whose_record_names_no_roots_teaches_nothing_clean() {
         seen.input = Some(input);
         seen.fg_pgrp = 42;
         seen.image = Some(PathBuf::from("/owned/shell"));
-        judge(&obs, &seen, &mut Some(now + Duration::from_secs(3600)))
+        judge(
+            &obs,
+            SAMPLE_WINDOW,
+            &seen,
+            &mut Some(now + Duration::from_secs(3600)),
+        )
     };
     assert_eq!(judged(ShellType::Fish, None), Sample::Unclean);
     assert_eq!(
@@ -4616,7 +4704,12 @@ fn a_visible_run_needs_two_observed_matching_shell_images() {
         seen.input = Some(input);
         seen.fg_pgrp = 42;
         seen.image = current.map(PathBuf::from);
-        judge(&obs, &seen, &mut Some(now + Duration::from_secs(3600)))
+        judge(
+            &obs,
+            SAMPLE_WINDOW,
+            &seen,
+            &mut Some(now + Duration::from_secs(3600)),
+        )
     };
     assert_eq!(
         judged(Some("/owned/shell"), Some("/owned/shell")),
@@ -4633,6 +4726,64 @@ fn a_visible_run_needs_two_observed_matching_shell_images() {
         Sample::Unclean,
         "absence cannot match a shell image"
     );
+}
+
+/// A visible run is held to the window read as it was queued: a record later than the product's
+/// window fails it, the same record judged under a window that covers it keeps every rule (its
+/// scan, spaced out here, is inconclusive), and a run with no record is due at its own window's
+/// end.
+#[test]
+fn a_run_is_held_to_the_window_it_was_queued_with() {
+    let session = crate::stub_session(93);
+    let input = session.ctx.sink.driven_input();
+    let now = Instant::now();
+    let rc = SAMPLE_WINDOW + Duration::from_secs(1);
+    let started_at = now
+        .checked_sub(rc)
+        .expect("this clock has run longer than one rc");
+    let witness = Arc::new(Witness::default());
+    witness
+        .shell
+        .set((42, Some(PathBuf::from("/owned/shell"))))
+        .unwrap();
+    let obs = Observation {
+        witness,
+        sid: "s-0123456789abcdef0123".into(),
+        started_at,
+        input0: Some(input),
+        host_effects0: 0,
+        early_control0: 0,
+        inputs: GenInputs {
+            shell: aterm_core::shell_integration::ShellType::Zsh,
+            shell_path: PathBuf::new(),
+            home: PathBuf::new(),
+            launch_zdotdir: PathBuf::new(),
+            fingerprint: 1,
+            containment: 1,
+        },
+    };
+    let mut seen = a_start_seen(StartKind::Cold);
+    seen.at = now;
+    seen.input = Some(input);
+    seen.fg_pgrp = 42;
+    seen.image = Some(PathBuf::from("/owned/shell"));
+    let judged = |window| {
+        judge(
+            &obs,
+            window,
+            &seen,
+            &mut Some(now + Duration::from_secs(3600)),
+        )
+    };
+    assert_eq!(judged(SAMPLE_WINDOW), Sample::Unclean, "past the window");
+    assert_eq!(judged(rc), Sample::Inconclusive, "within its own window");
+    let pending = Pending {
+        obs: Box::new(obs),
+        stamp: 0,
+        window: rc,
+        not_before: None,
+    };
+    assert_eq!(due(&pending), started_at + rc, "no record: due at its end");
 }
 
 fn verify_posture_only(

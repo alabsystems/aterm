@@ -137,25 +137,76 @@ impl Caps {
     /// `("pressure", "unavailable(not_enabled:psi)")`.
     #[must_use]
     pub fn rows(&self) -> Vec<(&'static str, String)> {
-        let cap = |name: &'static str, c: Cap| (name, c.to_string());
+        self.described_rows()
+            .into_iter()
+            .map(|(name, word, _)| (name, word))
+            .collect()
+    }
+
+    /// Every row as `(name, word, meaning)`: [`Caps::rows`] with what each row measures, in words
+    /// for a reader who has not seen this struct (`aterm help sys machine` prints them).
+    #[must_use]
+    pub fn described_rows(&self) -> Vec<(&'static str, String, &'static str)> {
+        let cap =
+            |name: &'static str, c: Cap, meaning: &'static str| (name, c.to_string(), meaning);
         vec![
-            ("os", self.os.to_owned()),
-            cap("per_core", self.per_core),
-            cap("core_kinds", self.core_kinds),
-            cap("cores_withdrawn", self.cores_withdrawn),
-            cap("memory_classes", self.memory_classes),
-            cap("pressure", self.pressure),
-            cap("commit", self.commit),
-            cap("compressor", self.compressor),
-            cap("swap", self.swap),
-            cap("gpu_device", self.gpu_device),
-            cap("gpu_per_proc", self.gpu_per_proc),
-            cap("proc_cpu_others", self.proc_cpu_others),
-            cap("proc_memory_others", self.proc_memory_others),
-            cap("throttle", self.throttle),
-            cap("volume", self.volume),
-            cap("coalitions", self.coalitions),
-            ("capacity", self.capacity.word().to_owned()),
+            (
+                "os",
+                self.os.to_owned(),
+                "the OS these readers were built for",
+            ),
+            cap(
+                "per_core",
+                self.per_core,
+                "each logical core's busy and idle time",
+            ),
+            cap(
+                "core_kinds",
+                self.core_kinds,
+                "the cores grouped by performance level",
+            ),
+            cap(
+                "cores_withdrawn",
+                self.cores_withdrawn,
+                "which cores the OS took away (offline, parked)",
+            ),
+            cap(
+                "memory_classes",
+                self.memory_classes,
+                "memory by the OS's classes (yes: they add up to RAM)",
+            ),
+            cap("pressure", self.pressure, "the kernel's memory pressure"),
+            cap("commit", self.commit, "the commit charge and its limit"),
+            cap(
+                "compressor",
+                self.compressor,
+                "compressed memory (macOS's compressor, zswap)",
+            ),
+            cap("swap", self.swap, "swap in use and allocated"),
+            cap("gpu_device", self.gpu_device, "the GPU's device-wide use"),
+            cap("gpu_per_proc", self.gpu_per_proc, "GPU use per process"),
+            cap(
+                "proc_cpu_others",
+                self.proc_cpu_others,
+                "other users' processes' CPU time",
+            ),
+            cap(
+                "proc_memory_others",
+                self.proc_memory_others,
+                "other users' processes' memory",
+            ),
+            cap("throttle", self.throttle, "the throttle level"),
+            cap("volume", self.volume, "a volume's size and free space"),
+            cap(
+                "coalitions",
+                self.coalitions,
+                "every user's resource coalitions (why's split)",
+            ),
+            (
+                "capacity",
+                self.capacity.word().to_owned(),
+                "what capacity is counted against: host or cgroup_limit",
+            ),
         ]
     }
 

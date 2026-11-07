@@ -67,7 +67,7 @@ impl Chrome {
         let profile = dir.path().join("profile");
         let log = dir.path().join("browser.log");
         let (out, err) = log_stdio(&log).map_err(|stop| match stop {
-            Stop::CouldNotRun(why) | Stop::Fail(why) => unavailable(why),
+            Stop::CouldNotRun(why) | Stop::Fail(why) | Stop::Lacks(why) => unavailable(why),
         })?;
         let pipe = || std::io::pipe().map_err(|e| unavailable(format!("no pipe: {e}")));
         let ((cmd_read, cmd_write), (out_read, out_write)) = (pipe()?, pipe()?);

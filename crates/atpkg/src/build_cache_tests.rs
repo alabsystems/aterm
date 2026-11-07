@@ -234,7 +234,7 @@ fn cleanup_reports_postrename_and_resumed_guard_subjects() {
                     root: &root,
                     home: Some(&f.home),
                     now: SystemTime::now(),
-                    after: ReclaimAfter::CALM,
+                    after: ReclaimAfter::CALM.into(),
                     placing: None,
                     moved: false,
                     compiler_store: None,
@@ -341,7 +341,7 @@ fn cleanup_reports_prune_decline_and_no_staged_parts_without_an_intent() {
                 root: &root,
                 home: Some(&f.home),
                 now: SystemTime::now(),
-                after: ReclaimAfter::CALM,
+                after: ReclaimAfter::CALM.into(),
                 placing: None,
                 moved: false,
                 compiler_store: None,
@@ -385,8 +385,7 @@ impl Fixture {
         let dir = crate::testdir::dir(label);
         let root = std::fs::canonicalize(&*dir).unwrap();
         let home = root.join("home");
-        std::fs::create_dir_all(&home).unwrap();
-        // Private whatever the umask, as macOS makes a home's `Library` and its `Caches`.
+        // Private whatever the umask, as macOS makes a home, its `Library` and its `Caches`.
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt as _;
@@ -4050,7 +4049,7 @@ fn a_process_arriving_at_intent_keeps_the_cache_before_staging() {
         root: &root,
         home: Some(&f.home),
         now: SystemTime::now(),
-        after: ReclaimAfter::CALM,
+        after: ReclaimAfter::CALM.into(),
         placing: None,
         moved: false,
         compiler_store: None,
@@ -4512,6 +4511,196 @@ fn below_the_floor_a_live_worktree_gives_up_what_no_build_wrote_for_an_hour() {
     assert!(current.is_dir());
 }
 
+#[cfg(unix)]
+#[test]
+fn explicit_cleanup_observes_each_leaf_and_registered_root_without_spilling_pressure() {
+    let f = Fixture::new("explicit-cache-pressure");
+    let root = cache_root(&f.home);
+    let mut leaves = Vec::new();
+    for name in ["pressured", "roomy", "unknown", "exact-floor"] {
+        let workspace = f.dir(&format!("home/{name}"));
+        std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+        leaves.push(build_dir(&root, &workspace));
+    }
+    let owner = f.dir("home/registered-owner");
+    std::fs::write(owner.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let target = f.home.join("registered.noindex");
+    assert!(registered::create_checked(&f.home, &target, &owner).unwrap());
+    leaves.push(target);
+    for leaf in &leaves {
+        let profile = leaf.join("debug");
+        let old = profile.join("incremental/old");
+        let young = profile.join("incremental/young");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&young).unwrap();
+        std::fs::create_dir_all(profile.join("deps")).unwrap();
+        std::fs::write(profile.join(".cargo-build-lock"), b"").unwrap();
+        std::fs::write(profile.join("deps/preserve.rlib"), b"existing dependency").unwrap();
+        age_tree(&old, Duration::from_secs(2 * 60 * 60));
+        age_tree(&young, Duration::from_secs(10 * 60));
+    }
+    let observed = std::cell::RefCell::new(Vec::new());
+    let observe = |path: &Path| {
+        observed.borrow_mut().push(path.to_path_buf());
+        match leaves.iter().position(|leaf| leaf == path) {
+            Some(0 | 4) => Some((9, 10)),
+            Some(1) => Some((11, 10)),
+            Some(3) => Some((10, 10)),
+            _ => None,
+        }
+    };
+    let planned = plan_home_on(&f.home, SystemTime::now(), &observe);
+    let selected: std::collections::BTreeSet<_> = planned
+        .iter()
+        .filter(|plan| matches!(plan.why, Unused::Stale { after, .. } if after == RECLAIM_STALE_UNDER_PRESSURE))
+        .map(|plan| plan.path.clone()).collect();
+    assert_eq!(
+        selected,
+        [leaves[0].clone(), leaves[3].clone(), leaves[4].clone()]
+            .into_iter()
+            .collect()
+    );
+    observed.borrow_mut().clear();
+    let fence = fence::Fence::default().with_reporting();
+    let removed = reclaim_home_report_on(&f.home, SystemTime::now(), &observe, &fence);
+    for (index, leaf) in leaves.iter().enumerate() {
+        assert!(
+            observed.borrow().contains(leaf),
+            "missing actual-root observation: {leaf:?}"
+        );
+        assert_eq!(
+            observed
+                .borrow()
+                .iter()
+                .filter(|path| *path == leaf)
+                .count(),
+            1,
+            "one observation per prune: {leaf:?}"
+        );
+        assert_eq!(
+            leaf.join("debug/incremental/old").is_dir(),
+            matches!(index, 1 | 2),
+            "root{index}, removed={removed:?}"
+        );
+        assert!(leaf.join("debug/incremental/young").is_dir());
+        assert_eq!(
+            std::fs::read(leaf.join("debug/deps/preserve.rlib")).unwrap(),
+            b"existing dependency"
+        );
+    }
+    for index in [1, 2] {
+        assert!(fence.retained().iter().any(|kept| kept.path == leaves[index] && matches!(&kept.reason, KeepReason::NoStaleParts { after, observed } if *after == RECLAIM_STALE && observed.incremental.not_quiet == 2 && observed.incremental.quiet == 0)));
+    }
+    assert_eq!(removed.iter().filter(|(_, why)| matches!(why, Unused::Stale { after, .. } if *after == RECLAIM_STALE_UNDER_PRESSURE)).count(), 3);
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_cleanup_pressure_preserves_custody_locks_and_uncertain_process_use() {
+    use aterm_uds::holders::{PathScan, PathUse};
+    let f = Fixture::new("explicit-cache-pressure-guards");
+    let root = cache_root(&f.home);
+    let mut leaves = Vec::new();
+    for name in ["retained", "locked", "busy", "unknown-process"] {
+        let workspace = f.dir(&format!("home/{name}"));
+        std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let leaf = build_dir(&root, &workspace);
+        std::fs::create_dir_all(leaf.join("debug/incremental/old")).unwrap();
+        std::fs::write(leaf.join("debug/.cargo-build-lock"), b"").unwrap();
+        age_tree(
+            &leaf.join("debug/incremental/old"),
+            Duration::from_secs(2 * 60 * 60),
+        );
+        leaves.push(leaf);
+    }
+    std::fs::write(
+        leaves[0].join(registered::MARKER),
+        b"unreadable or unknown custody keeps output",
+    )
+    .unwrap();
+    let _held = crate::lock::Flock::try_lock(
+        std::fs::File::open(leaves[1].join("debug/.cargo-build-lock")).unwrap(),
+    )
+    .unwrap();
+    let processes = |paths: &[PathBuf], _: &[u32]| {
+        if paths.iter().any(|path| path == &leaves[3]) {
+            return Err(std::io::Error::other("fixture scan unavailable"));
+        }
+        let users = paths
+            .iter()
+            .any(|path| path == &leaves[2])
+            .then(|| PathUse {
+                pid: 31,
+                how: "exe",
+                path: leaves[2].join("debug/deps/program"),
+            })
+            .into_iter()
+            .collect();
+        Ok(PathScan {
+            users,
+            ..PathScan::default()
+        })
+    };
+    let fence = fence::Fence::new(&processes).with_reporting();
+    let removed = reclaim_home_report_on(&f.home, SystemTime::now(), &|_| Some((0, 10)), &fence);
+    assert!(removed.is_empty(), "{removed:?}");
+    assert!(
+        leaves
+            .iter()
+            .all(|leaf| leaf.join("debug/incremental/old").is_dir())
+    );
+    for (index, reason) in [
+        (0, KeepReason::Custody),
+        (1, KeepReason::CargoLocks),
+        (3, KeepReason::ProcessUnavailable),
+    ] {
+        assert!(
+            fence
+                .retained()
+                .iter()
+                .any(|kept| kept.path == leaves[index] && kept.reason == reason),
+            "missing guard{index}: {:?}",
+            fence.retained()
+        );
+    }
+    assert!(fence.retained().iter().any(|kept| kept.path == leaves[2]
+        && matches!(kept.reason, KeepReason::ProcessUsed { pid: 31, .. })));
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_cleanup_pressure_does_not_shorten_whole_cache_age_for_a_standing_folder() {
+    let f = Fixture::new("explicit-cache-pressure-whole");
+    let workspace = f.dir("home/standing-without-manifest");
+    let leaf = lay(
+        &cache_root(&f.home),
+        &workspace,
+        Duration::from_secs(2 * 60 * 60),
+    );
+    let planned = plan_home_on(&f.home, SystemTime::now(), &|_| Some((0, 10)));
+    assert!(
+        !planned.iter().any(|plan| plan.path == leaf
+            && matches!(plan.why, Unused::Gone { .. } | Unused::Idle { .. }))
+    );
+    let removed = reclaim_home_report_on(
+        &f.home,
+        SystemTime::now(),
+        &|_| Some((0, 10)),
+        &fence::Fence::default(),
+    );
+    assert!(
+        leaf.is_dir(),
+        "observed pressure cannot promote whole-cache age: {removed:?}"
+    );
+    assert_eq!(
+        std::fs::read(leaf.join("debug/deps/x")).unwrap(),
+        b"0123456789"
+    );
+    assert!(!removed.iter().any(
+        |(path, why)| path == &leaf && matches!(why, Unused::Gone { .. } | Unused::Idle { .. })
+    ));
+}
+
 /// BESIDE A SESSION, THE FLOOR DECIDES WHAT THE LOOK SWEEPS: the window's look with a supervised
 /// session leaves the shared cache alone with room on the volume, even a gone workspace's build
 /// directory a calm sweep would take. Below the floor it takes that, and prunes a live worktree's
@@ -4620,7 +4809,7 @@ fn each_long_step_of_a_pass_says_it_is_working() {
             root,
             home: Some(home),
             now: SystemTime::now(),
-            after: ReclaimAfter::CALM,
+            after: ReclaimAfter::CALM.into(),
             placing: None,
             moved: false,
             compiler_store: None,

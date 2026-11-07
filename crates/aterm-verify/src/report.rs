@@ -434,6 +434,26 @@ pub fn check_event(r: &CheckResult, reports: &[&Report]) -> String {
     )
 }
 
+/// The run's `run-finished` event, one newline-terminated line, written last to its events file
+/// (`--events`): its exit code and each check it finished with its word, so a reader of the file
+/// can tell a whole record from one that lost a line (`verify land`, design B10).
+#[must_use]
+pub fn run_event(results: &[CheckResult], code: i32) -> String {
+    let checks: Vec<_> = results
+        .iter()
+        .map(|r| aterm_json::json!({"check": r.check.name(), "outcome": word(r.outcome)}))
+        .collect();
+    format!(
+        "verify-event: {}\n",
+        aterm_json::json!({
+            "schema": 1,
+            "event": "run-finished",
+            "code": code,
+            "checks": checks,
+        })
+    )
+}
+
 /// The word a check's line opens with.
 #[must_use]
 pub const fn word(o: Outcome) -> &'static str {

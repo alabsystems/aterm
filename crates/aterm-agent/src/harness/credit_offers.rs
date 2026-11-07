@@ -23,6 +23,9 @@
 //!   `https://claude.ai` + `webPath` + `/` + [`CLAIM_LINK_VARIANT`], then `/` + the lowercased
 //!   `oauthAccount.organizationUuid` where `claimLinkIncludesOrganization` is `true`. The grant
 //!   happens on that page; the CLI makes no claim call, so a signed-in browser is needed.
+//!   Claude Code 2.1.319 removed `/claim-credit` and deletes this status at its first save, so
+//!   once a session of that build has started, this offer reads as not live
+//!   (`docs/measured/claude-code-2.1.319-2026-11-06.md`).
 //! - [`OfferId::ApiCredits`]: the flag `cachedGrowthBookFeatures.tengu_snug_storm.text`
 //!   (1 to 240 characters, naming a link) and its status
 //!   `apiCreditLinkStatusCache[<organizationUuid>].eligibleSince`. Live when that is a number.

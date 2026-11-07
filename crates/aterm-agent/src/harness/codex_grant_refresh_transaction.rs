@@ -6,7 +6,32 @@
 
 use super::*;
 use crate::harness::codex_source_gate::SourceWorkLease;
+use crate::harness::native_enrollment_admission::RefreshExchangeLease;
+
+/// Own the established source-before-exchange order through response settlement.
+/// Reconciliation borrows this guard instead of taking another shared kernel lock.
+pub(super) struct RefreshWorkLease {
+    // Drop exchange exclusion before the source lease that preceded it.
+    exchange: RefreshExchangeLease,
+    source: SourceWorkLease,
+}
+impl RefreshWorkLease {
+    fn for_env(env: &Env) -> Result<Self, OwnerRefreshError> {
+        let home = env.home.as_deref().ok_or(OwnerRefreshError::Unavailable)?;
+        let source = SourceWorkLease::for_home(home).map_err(|_| OwnerRefreshError::Unavailable)?;
+        let exchange =
+            RefreshExchangeLease::for_env(env).map_err(|_| OwnerRefreshError::Unavailable)?;
+        let held = Self { exchange, source };
+        held.current().map_err(|_| OwnerRefreshError::Unavailable)?;
+        Ok(held)
+    }
+    pub(super) fn current(&self) -> Result<(), String> {
+        self.source.current().map_err(str::to_owned)?;
+        self.exchange.current()
+    }
+}
 use std::io::Read as _;
+use std::time::Duration;
 
 fn delivery_operation(
     binding: &GrantBinding,
@@ -169,7 +194,7 @@ fn synchronize_canonical(claimed: &Claimed, canonical_auth: &Path) -> Result<(),
         return Err("canonical auth unavailable".into());
     }
     let actual = SecretBytes::new(
-        private_file::read_private(parent, "auth.json", MAX_DOCUMENT)
+        platform::read_private(parent, "auth.json", MAX_DOCUMENT)
             .map_err(|_| "canonical auth unavailable")?,
     );
     let matches_current = aterm_digest::ct_eq(actual.as_slice(), current.document.as_slice());
@@ -181,10 +206,10 @@ fn synchronize_canonical(claimed: &Claimed, canonical_auth: &Path) -> Result<(),
         return Err("canonical auth differs from authenticated owner".into());
     }
     if !matches_current {
-        private_file::write_private(parent, "auth.json", current.document.as_slice())
+        platform::write_private(parent, "auth.json", current.document.as_slice())
             .map_err(|_| "canonical owner cache publication unavailable")?;
     }
-    let (file, metadata) = private_file::open_private(parent, "auth.json")
+    let (file, metadata) = platform::open_private(parent, "auth.json")
         .map_err(|_| "canonical owner cache unavailable")?;
     if metadata.len() > MAX_DOCUMENT as u64 {
         return Err("canonical owner cache unavailable".into());
@@ -352,18 +377,17 @@ fn reconcile_held(
     Err("owner reconciliation did not settle".into())
 }
 
-fn with_source_work<R>(
+fn with_refresh_work<R>(
     env: &Env,
-    run: impl FnOnce(&SourceWorkLease) -> Result<R, OwnerRefreshError>,
+    run: impl FnOnce(&RefreshWorkLease) -> Result<R, OwnerRefreshError>,
 ) -> Result<R, OwnerRefreshError> {
-    let home = env.home.as_deref().ok_or(OwnerRefreshError::Unavailable)?;
-    let lease = SourceWorkLease::for_home(home).map_err(|_| OwnerRefreshError::Unavailable)?;
+    let lease = RefreshWorkLease::for_env(env)?;
     lease
         .current()
         .map_err(|_| OwnerRefreshError::Unavailable)?;
     match run(&lease) {
         Err(OwnerRefreshError::Retaining(retention)) => {
-            Err(OwnerRefreshError::Retaining(retention.retain_source(lease)))
+            Err(OwnerRefreshError::Retaining(retention.retain_work(lease)))
         }
         outcome => {
             lease
@@ -374,21 +398,15 @@ fn with_source_work<R>(
     }
 }
 
-/// Explicit app-worker reconciliation; no Slot, original sender or HTTP action
-/// is needed to finish an already durably encrypted response.
-pub(in crate::harness) fn reconcile_current(
+fn reconcile_current_held_work(
     env: &Env,
     binding: &GrantBinding,
     caller: &slot::Caller,
+    source: &RefreshWorkLease,
 ) -> Result<bool, OwnerRefreshError> {
-    with_source_work(env, |_| reconcile_current_held_source(env, binding, caller))
-}
-
-fn reconcile_current_held_source(
-    env: &Env,
-    binding: &GrantBinding,
-    caller: &slot::Caller,
-) -> Result<bool, OwnerRefreshError> {
+    source
+        .current()
+        .map_err(|_| OwnerRefreshError::Unavailable)?;
     let mut retained = None;
     let result = super::super::with_current_published_grant(env, binding, caller, |mut grant| {
         let canonical_auth = grant.canonical_auth.to_owned();
@@ -397,6 +415,9 @@ fn reconcile_current_held_source(
     if let Some(retained) = retained {
         return Err(OwnerRefreshError::Retaining(retained));
     }
+    source
+        .current()
+        .map_err(|_| OwnerRefreshError::Unavailable)?;
     result.map_err(|_| OwnerRefreshError::Unavailable)
 }
 
@@ -408,17 +429,32 @@ pub(super) fn reconcile_retained(
     binding: &GrantBinding,
     scope: &crate::harness::account_work::Scope,
 ) -> Result<(), OwnerRefreshError> {
-    with_source_work(env, |_| {
-        let mut retained = None;
-        let result = super::super::with_maintenance_owner(env, binding, scope, |mut grant| {
-            let canonical_auth = grant.canonical_auth().to_owned();
-            reconcile_held(env, binding, grant.anchor(), &canonical_auth, &mut retained).map(|_| ())
-        });
-        if let Some(retained) = retained {
-            return Err(OwnerRefreshError::Retaining(retained));
-        }
-        result.map_err(|_| OwnerRefreshError::Unavailable)
+    with_refresh_work(env, |source| {
+        reconcile_retained_held_work(env, binding, scope, source)
     })
+}
+
+pub(super) fn reconcile_retained_held_work(
+    env: &Env,
+    binding: &GrantBinding,
+    scope: &crate::harness::account_work::Scope,
+    source: &RefreshWorkLease,
+) -> Result<(), OwnerRefreshError> {
+    source
+        .current()
+        .map_err(|_| OwnerRefreshError::Unavailable)?;
+    let mut retained = None;
+    let result = super::super::with_maintenance_owner(env, binding, scope, |mut grant| {
+        let canonical_auth = grant.canonical_auth().to_owned();
+        reconcile_held(env, binding, grant.anchor(), &canonical_auth, &mut retained).map(|_| ())
+    });
+    if let Some(retained) = retained {
+        return Err(OwnerRefreshError::Retaining(retained));
+    }
+    source
+        .current()
+        .map_err(|_| OwnerRefreshError::Unavailable)?;
+    result.map_err(|_| OwnerRefreshError::Unavailable)
 }
 
 struct PreparedExchange {
@@ -602,18 +638,18 @@ pub(in crate::harness) fn with_refreshed_owner<R>(
     request: &slot::RefreshRequest,
     materialize: impl FnOnce(AdmittedGrant<'_>) -> Result<(R, slot::MaterializationReceipt), String>,
 ) -> Result<(R, slot::Revision), OwnerRefreshError> {
-    with_source_work(env, |source| {
-        with_refreshed_owner_held_source(env, binding, caller, request, materialize, source)
+    with_refresh_work(env, |source| {
+        with_refreshed_owner_held_work(env, binding, caller, request, materialize, source)
     })
 }
 
-fn with_refreshed_owner_held_source<R>(
+fn with_refreshed_owner_held_work<R>(
     env: &Env,
     binding: &GrantBinding,
     caller: &slot::Caller,
     request: &slot::RefreshRequest,
     materialize: impl FnOnce(AdmittedGrant<'_>) -> Result<(R, slot::MaterializationReceipt), String>,
-    source: &SourceWorkLease,
+    source: &RefreshWorkLease,
 ) -> Result<(R, slot::Revision), OwnerRefreshError> {
     let deadline = crate::harness::auth_deadline::Deadline::after(REFRESH_BUDGET);
     let operation = delivery_operation(binding, caller, request)?;
@@ -622,7 +658,7 @@ fn with_refreshed_owner_held_source<R>(
         source
             .current()
             .map_err(|_| OwnerRefreshError::Unavailable)?;
-        reconcile_current(env, binding, caller)?;
+        reconcile_current_held_work(env, binding, caller, source)?;
         current_source(env, binding, &operation).map_err(|_| OwnerRefreshError::Unavailable)?;
         match prepare(env, binding, caller, &operation)? {
             Preparation::Reconcile => continue,
@@ -655,6 +691,7 @@ fn with_refreshed_owner_held_source<R>(
                     return Err(OwnerRefreshError::Unavailable);
                 }
                 match codex_app_login::exchange_owned_refresh(document.as_slice(), deadline, || {
+                    source.current()?;
                     current_source(env, binding, &operation)
                 }) {
                     Ok(codex_app_login::RefreshExchange::Completed(response)) => {
@@ -664,14 +701,14 @@ fn with_refreshed_owner_held_source<R>(
                         drop(claimed);
                         // No original-slot predicate may suppress this shared
                         // promotion; delivery remains separately scoped below.
-                        reconcile_current(env, binding, caller)?;
+                        reconcile_current_held_work(env, binding, caller, source)?;
                     }
                     Ok(codex_app_login::RefreshExchange::NotSent) | Err(_) => {
                         let claimed = claimed
                             .mark_not_sent(witness)
                             .map_err(OwnerRefreshError::Retaining)?;
                         drop(claimed);
-                        reconcile_current(env, binding, caller)?;
+                        reconcile_current_held_work(env, binding, caller, source)?;
                         return Err(OwnerRefreshError::Unavailable);
                     }
                     Ok(codex_app_login::RefreshExchange::Unknown) => {
@@ -687,9 +724,139 @@ fn with_refreshed_owner_held_source<R>(
     Err(OwnerRefreshError::Unavailable)
 }
 
+/// Test-only received-response promotion through the same canonical C2 writer.
+#[cfg(all(test, unix))]
+pub(in crate::harness) fn fixture_promote_received_response(
+    env: &crate::harness::cli::Env,
+    binding: &super::GrantBinding,
+    scope: &crate::harness::account_work::Scope,
+) {
+    tests::inject_received_response(env, binding, scope);
+    assert!(reconcile_retained(env, binding, scope).is_ok());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn exchange_file(env: &Env) -> std::fs::File {
+        let namespace = crate::harness::codex_source_gate::existing_namespace_for_home(
+            env.home.as_deref().unwrap(),
+        )
+        .unwrap();
+        private_file::open_private_rw(namespace.directory().unwrap(), "native-code-exchange.lock")
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test the actual kernel exclusion used by native refresh"
+    )]
+    fn exchange_is_exclusive(file: &std::fs::File) -> bool {
+        match file.try_lock() {
+            Ok(()) => true,
+            Err(std::fs::TryLockError::WouldBlock) => false,
+            Err(std::fs::TryLockError::Error(error)) => panic!("kernel lock failed: {error}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_exchange_exclusion_precedes_owner_work_and_releases_after_completion() {
+        // Real kernel locks only; this fixture grants no credential or HTTP authority.
+        let fixture = super::super::super::maintenance_tests::fixture();
+        let lease = RefreshWorkLease::for_env(&fixture.env).unwrap();
+        let file = exchange_file(&fixture.env);
+        assert!(!exchange_is_exclusive(&file));
+        drop(lease);
+        assert!(exchange_is_exclusive(&file));
+        let mut entered = false;
+        let result = with_refresh_work(&fixture.env, |_| {
+            entered = true;
+            Ok(())
+        });
+        assert!(matches!(result, Err(OwnerRefreshError::Unavailable)));
+        assert!(!entered, "exchange contention must precede owner work");
+        drop(file);
+        with_refresh_work(&fixture.env, |work| {
+            work.current().unwrap();
+            assert!(!exchange_is_exclusive(&exchange_file(&fixture.env)));
+            Ok(())
+        })
+        .unwrap();
+        assert!(exchange_is_exclusive(&exchange_file(&fixture.env)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_signin_excludes_refresh_before_owner_work() {
+        let fixture = super::super::super::maintenance_tests::fixture();
+        let store = fixture
+            .env
+            .accounts_store_for(crate::harness::accounts::Cli::Codex)
+            .unwrap();
+        let signin = store.signin_now().unwrap().unwrap();
+        let mut entered = false;
+        let result = with_refresh_work(&fixture.env, |_| {
+            entered = true;
+            Ok(())
+        });
+        assert!(matches!(result, Err(OwnerRefreshError::Unavailable)));
+        assert!(
+            !entered,
+            "legacy sign-in must exclude refresh before owner work"
+        );
+        let publication = crate::harness::codex_source_gate::PublicationLock::for_home(
+            fixture.env.home.as_deref().unwrap(),
+        )
+        .expect("failed refresh admission must release its source lease");
+        drop(publication);
+        drop(signin);
+        with_refresh_work(&fixture.env, |work| {
+            work.current().unwrap();
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uncertain_retention_and_continuation_keep_the_original_exchange_lease() {
+        // Force an actual encrypted-store failure. This tests custody plumbing,
+        // not a provider response or a qualified process/source census.
+        let fixture = super::super::super::maintenance_tests::fixture();
+        let lifetime = crate::harness::account_work::Lifetime::default();
+        let scope = lifetime.enter().unwrap();
+        let claimed = super::super::super::with_maintenance_owner(
+            &fixture.env,
+            &fixture.binding,
+            &scope,
+            |_| {
+                Claimed::open(&fixture.env, &fixture.binding, false)?.ok_or("journal absent".into())
+            },
+        )
+        .unwrap();
+        let directory = claimed.directory.clone();
+        let held_directory = directory.with_extension("retention-test-held");
+        let result = with_refresh_work::<()>(&fixture.env, |_| {
+            std::fs::rename(&directory, &held_directory).unwrap();
+            let Err(retention) = claimed.persist() else {
+                panic!("moved store must refuse the write");
+            };
+            Err(OwnerRefreshError::Retaining(retention))
+        });
+        let Err(OwnerRefreshError::Retaining(retention)) = result else {
+            panic!("uncertain write lost its owned retention");
+        };
+        assert!(!exchange_is_exclusive(&exchange_file(&fixture.env)));
+        std::fs::rename(&held_directory, &directory).unwrap();
+        let continuation = retention.retry().unwrap();
+        assert!(!exchange_is_exclusive(&exchange_file(&fixture.env)));
+        continuation.reconcile(&fixture.env, &scope).unwrap();
+        assert!(exchange_is_exclusive(&exchange_file(&fixture.env)));
+    }
 
     fn operation() -> Operation {
         Operation {
@@ -709,18 +876,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cancelled_sender_durable_response_promotes_shared_owner_once_without_delivery() {
-        // Synthetic provider completion; all account, issuer-seal, encrypted
-        // journal and canonical generation/witness paths are real. This does
-        // not qualify OAuth or the prospective source-publication barrier.
-        let fixture = super::super::super::maintenance_tests::fixture();
-        let lifetime = crate::harness::account_work::Lifetime::default();
-        let scope = lifetime.enter().unwrap();
+    /// Synthetic received-boundary input; real owner/anchor/journal writes.
+    /// No network, Slot, Caller admission or provider-origin proof is minted.
+    #[cfg(unix)]
+    pub(super) fn inject_received_response(
+        env: &crate::harness::cli::Env,
+        binding: &super::super::GrantBinding,
+        scope: &crate::harness::account_work::Scope,
+    ) {
         super::super::super::with_maintenance_owner(
-            &fixture.env, &fixture.binding, &scope, |mut grant| {
+            env, binding, scope, |mut grant| {
                 let mut witness = grant.anchor().read()?.ok_or("fixture witness missing")?;
-                let mut claimed = Claimed::open(&fixture.env, &fixture.binding, false)?
+                let mut claimed = Claimed::open(env, binding, false)?
                     .ok_or("fixture journal missing")?;
                 let current = claimed.view(&witness)?;
                 let mut original = operation();
@@ -751,7 +918,7 @@ mod tests {
                 let pending = journal.pending.as_mut().ok_or("fixture attempt missing")?;
                 pending.phase = Phase::Responded;
                 pending.response = Some(Response {
-                    status: 200, received_at: Some(fixture.env.now as u64),
+                    status: 200, received_at: Some(env.now as u64),
                     body: aterm_codec::base64::encode(
                         br#"{"access_token":"fresh-access-only","refresh_token":"rotated-refresh-only"}"#
                     ).map_err(|_| "fixture encoding failed")?,
@@ -764,6 +931,18 @@ mod tests {
                 Ok(())
             },
         ).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cancelled_sender_durable_response_promotes_shared_owner_once_without_delivery() {
+        // Synthetic provider completion; all account, issuer-seal, encrypted
+        // journal and canonical generation/witness paths are real. This does
+        // not qualify OAuth or the prospective source-publication barrier.
+        let fixture = super::super::super::maintenance_tests::fixture();
+        let lifetime = crate::harness::account_work::Lifetime::default();
+        let scope = lifetime.enter().unwrap();
+        inject_received_response(&fixture.env, &fixture.binding, &scope);
         scope.cancellation().cancel();
         assert!(scope.cancelled());
         for _ in 0..2 {
@@ -860,6 +1039,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn missing_assignment_book_refuses_the_actual_refresh_send_for_both_source_modes() {
         let fixture = super::super::super::maintenance_tests::fixture();
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();

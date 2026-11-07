@@ -57,22 +57,35 @@ pub(crate) fn sample(groups: &[i32]) -> io::Result<u64> {
 /// This supplies no control or closure authority. A controller may use it
 /// only while retaining its actual unreaped dedicated leader.
 pub(crate) fn other_members_exited(leader: u32) -> bool {
+    other_members_exited_with(leader, &Native)
+}
+
+fn other_members_exited_with(leader: u32, probe: &impl Probe) -> bool {
     if leader <= 1 {
         return false;
     }
-    if process::group_presence(leader) == ProcessPresence::Absent {
+    if probe.group_presence(leader) == ProcessPresence::Absent {
         return true;
     }
-    process::group_members(leader).is_some_and(|members| {
-        members.complete
-            && members.pids.iter().all(|pid| {
-                u32::try_from(*pid).ok() == Some(leader)
-                    || matches!(
-                        process::process_presence(*pid),
-                        ProcessPresence::Exited | ProcessPresence::Absent
-                    )
-            })
-    })
+    #[cfg(target_vendor = "apple")]
+    {
+        // XNU proc_listpids holds proc_list_lock across allproc AND zombproc.
+        // A complete singleton census therefore leaves no other member that
+        // could fork. Do not replace this with later per-PID exit readings:
+        // a listed parent could fork an unlisted child and exit between them.
+        // Empty/error and zombie siblings retain the actual unreaped pin.
+        // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/proc_info.c
+        probe.members(leader).is_some_and(|members| {
+            members.complete
+                && i32::try_from(leader).is_ok_and(|pid| members.pids.as_slice() == [pid])
+        })
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        // The /proc walk is not an atomic membership census. This host's
+        // retained launch path refuses before spawn until its control is wired.
+        false
+    }
 }
 
 fn sample_with(groups: &[i32], probe: &impl Probe) -> io::Result<u64> {

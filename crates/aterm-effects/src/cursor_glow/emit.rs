@@ -10,6 +10,13 @@ struct FlameLightCapMemo {
     pair_memo: Option<((u32, u32), f32)>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The negative control of `paper_lumen_s_tracer_end_walks_in_as_its_far_spark_goes_dark`:
+    /// [`CursorGlow::lumen_paper_taper`] counts every stretch of its run whole.
+    pub(super) static LUMEN_END_STEPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl CursorGlow {
     /// Emit the live lightning bolts through [`comet_beam`].
     #[inline]
@@ -399,6 +406,18 @@ impl CursorGlow {
         while vi > 0 {
             vi -= 1;
             let v = &self.vapor[vi];
+            // AN ERASE THROWS NO SMOKE ON PAPER. A grey cloud has no reading
+            // there that is not a defect: small and dark, one Backspace's two
+            // puffs were a `¨` beside the caret; wide and pale, they were discs
+            // that rose onto the letters of the row above and stood over the
+            // style's own body. A style's grains and its body are what an erase
+            // shows on paper, with its sound; the cloud stays on a dark page,
+            // where it is light on the dark. Dropped, not skipped: a puff a
+            // theme flip carries here does not come back on the next dark frame.
+            if v.kind == VaporKind::Poof && !cfg.dark_theme {
+                self.vapor.swap_remove(vi);
+                continue;
+            }
             if !fire && v.kind != VaporKind::Poof {
                 continue;
             }
@@ -424,10 +443,7 @@ impl CursorGlow {
                 VaporKind::Smoke => {
                     (if cfg.dark_theme { 34.0 } else { 52.0 }) * one_minus_t * cfg.intensity
                 }
-                VaporKind::Poof if cfg.dark_theme => {
-                    (84.0 * one_minus_t * one_minus_t) * cfg.intensity
-                }
-                VaporKind::Poof => (140.0 * one_minus_t * one_minus_t) * cfg.intensity,
+                VaporKind::Poof => (84.0 * one_minus_t * one_minus_t) * cfg.intensity,
             };
             if peak < 1.0 {
                 continue;
@@ -465,15 +481,10 @@ impl CursorGlow {
                         lerp_rgb(0x0060_544A, 0x0084_7E78, t)
                     },
                 ),
-                VaporKind::Poof if cfg.dark_theme => (
+                VaporKind::Poof => (
                     cell * 0.34,
                     1.0 + 2.2 * t,
                     lerp_rgb(0x009A_A0A6, 0x005F_6368, t),
-                ),
-                VaporKind::Poof => (
-                    cell * 0.16,
-                    1.0 + 2.6 * t,
-                    lerp_rgb(0x005A_6065, 0x008B_9196, t),
                 ),
             };
             let r = r0 * grow;
@@ -543,6 +554,13 @@ impl CursorGlow {
         self.comet_run_typing.clear();
         let mut prev: Option<(u16, u16)> = None;
         let mut head_full = 0u8;
+        #[cfg(test)]
+        let stack = if self.beam_tube_r3 && matches!(cfg.style, GlowStyle::Beam) {
+            &BEAM_LAYERS_R3[..]
+        } else {
+            streak_layers(cfg.style)
+        };
+        #[cfg(not(test))]
         let stack = streak_layers(cfg.style);
         let beam_pw = match (cfg.style, self.sparks.last()) {
             (GlowStyle::Beam, Some(s)) => {
@@ -578,7 +596,18 @@ impl CursorGlow {
             if self.rail_even {
                 *shape = shape.rail_even();
             }
+            if self.sparkle_rail_blunt && matches!(cfg.style, GlowStyle::Sparkle) {
+                shape.lit_rail_taper = 0.0;
+            }
+            let (ink, page) = Self::bed_pair(cfg);
+            if self.dark_unrailed
+                && matches!(cfg.style, GlowStyle::Lumen | GlowStyle::Beam)
+                && !bed::page_lit(page, bed::dark_bed_budget(ink))
+            {
+                shape.dark_rail = 0.0;
+            }
         }
+        let leap_caps_typed = BedShape::of(cfg.style, 1.0).is_some();
         let mut fire_lift_memo: Option<((u32, u32), BandLifts)> = None;
         let fire_core = (chf * (0.13 + 0.09 * self.fire_t())).max(2.0);
         let fire_text = if matches!(cfg.style, GlowStyle::Fire)
@@ -701,6 +730,7 @@ impl CursorGlow {
                 run: &mut self.comet_run,
                 typing: &mut self.comet_typing,
                 run_typing: &mut self.comet_run_typing,
+                leap_caps_typed,
             };
             runs.chain(&mut runs_len, prev, here, sample, s_typing);
             prev = Some(here);
@@ -711,6 +741,7 @@ impl CursorGlow {
             run: &mut self.comet_run,
             typing: &mut self.comet_typing,
             run_typing: &mut self.comet_run_typing,
+            leap_caps_typed,
         }
         .publish(&mut runs_len);
         if runs_len == 0 {
@@ -891,11 +922,28 @@ impl CursorGlow {
             GlowStyle::Phaser => (chf * 0.66).max(8.0),
             GlowStyle::Fire => fire_core,
             GlowStyle::Laser => (chf * 0.26).max(3.5),
-            GlowStyle::Beam => (chf * (0.08 + 0.26 * beam_pw)).max(2.0),
+            GlowStyle::Beam => {
+                #[cfg(test)]
+                let rod = if self.beam_tube_r3 {
+                    0.08 + 0.26 * beam_pw
+                } else {
+                    Self::beam_rod(beam_pw)
+                };
+                #[cfg(not(test))]
+                let rod = Self::beam_rod(beam_pw);
+                (chf * rod).max(2.0)
+            }
             GlowStyle::Sparkle => (chf * 0.45).max(5.0),
             _ => (chf * 0.13).max(2.0),
         };
         let straighten = cwf.max(chf) * 0.8;
+        // Beam's tube rounds its ends off ([`Self::BEAM_END_FEATHER`]); every other streak
+        // lays its layers whole to its ends.
+        let feather = if matches!(cfg.style, GlowStyle::Beam) {
+            Self::BEAM_END_FEATHER
+        } else {
+            0.0
+        };
 
         let mut beam_scratch = std::mem::take(&mut self.beam_scratch);
         let aura_from = halos.len();
@@ -959,7 +1007,7 @@ impl CursorGlow {
                 out,
                 geom.beam_clip(),
                 r,
-                core_thick,
+                (core_thick, feather),
                 tol,
                 &color_at,
                 stack,
@@ -973,7 +1021,7 @@ impl CursorGlow {
                     out,
                     geom.beam_clip(),
                     pair,
-                    core_thick,
+                    (core_thick, 0.0),
                     0.0,
                     &color_at,
                     stack,
@@ -1396,8 +1444,11 @@ impl CursorGlow {
             probe,
             stride,
             budget,
+            tube_melt: 0.0,
+            wide_keep: LIGHT_WIDE_BED_KEEP,
         };
         let mut band_run = std::mem::take(&mut self.light_band_run);
+        let mut dense = std::mem::take(&mut self.light_dense_run);
         let mut index = 0;
         while index < runs_len {
             let run = &self.comet_runs[index];
@@ -1436,14 +1487,6 @@ impl CursorGlow {
                         color
                     } else {
                         ground.body_ink(Self::comet_paper_ice(cfg.color))
-                    };
-                    let (needle, swell) = if tube {
-                        (0.06, 0.40)
-                    } else {
-                        (
-                            Self::COMET_LIGHT_NEEDLE.0,
-                            Self::COMET_LIGHT_NEEDLE.1 - Self::COMET_LIGHT_NEEDLE.0,
-                        )
                     };
                     let head = run[run.len() - 1];
                     let back = if run.len() >= 2 && run[run.len() - 2].x > head.x {
@@ -1491,10 +1534,47 @@ impl CursorGlow {
                     let tail = cwf * cells;
                     let ox = f32::from(geom.origin_x);
                     let col = ((head.x - ox) * inv_cw).floor();
-                    let (lead_edge, trail_edge) = if back < 0.0 {
-                        (ox + (col + 1.0) * cwf, ox + col * cwf)
+                    // Its tail runs at the letters' foot only where it has letters to
+                    // clear ([`Self::COMET_LIGHT_SPINE`]): the wedge's cells, the head's
+                    // among them, on a line of text, a word gap with it; a row the frame did
+                    // not read counts as text. One spine for the whole wedge, so its tail
+                    // stays one straight taper. Over the cells a Backspace erased it fills
+                    // the row's middle ([`Self::COMET_LIGHT_BLANK`]), where the droplets of
+                    // the run it left lie: lifted to the foot there, it read as a droplet
+                    // row and a separate needle with a gap between (`comet-light-steam`).
+                    let far = ((head.x + back * tail - ox) * inv_cw).floor() as i32;
+                    let lettered = TextView::new(self.probed_text_spans(), Some(&self.frame_text))
+                        .over_text_range(head_row, (far.min(col as i32), far.max(col as i32)));
+                    #[cfg(test)]
+                    let lettered =
+                        (lettered || self.comet_foot_on_blanks) && !self.comet_light_mid_spine;
+                    let (spine, shape) = if lettered {
+                        (Self::COMET_LIGHT_SPINE, Self::COMET_LIGHT_NEEDLE)
                     } else {
-                        (ox + col * cwf, ox + (col + 1.0) * cwf)
+                        Self::COMET_LIGHT_BLANK
+                    };
+                    let (needle, swell) = if tube {
+                        (0.06, 0.40)
+                    } else {
+                        (shape.0, shape.1 - shape.0)
+                    };
+                    // BEHIND A BAR THE HEAD SEATS ON THE BAR (after-land L2): a bar caret
+                    // is its insertion point (`head_dx`, the bar `2 * head_dx` of the cell
+                    // wide from its left edge, as Classic's streak reads it), so the head
+                    // leads at the bar's far side and its nucleus lies behind the bar's near
+                    // side. Laid as on a block, its cap ran on to the cell's far edge and the
+                    // coma's rim circled the bar like a second outline
+                    // (`shape-bar/comet-light.t0`).
+                    #[cfg(test)]
+                    let bar = cfg.head_dx < 0.5 && !self.comet_bar_unseated;
+                    #[cfg(not(test))]
+                    let bar = cfg.head_dx < 0.5;
+                    let bar_w = (2.0 * cfg.head_dx * cwf).round().clamp(1.0, cwf);
+                    let (lead_edge, trail_edge) = match (back < 0.0, bar) {
+                        (true, false) => (ox + (col + 1.0) * cwf, ox + col * cwf),
+                        (false, false) => (ox + col * cwf, ox + (col + 1.0) * cwf),
+                        (true, true) => (ox + col * cwf + bar_w, ox + col * cwf),
+                        (false, true) => (ox + col * cwf, ox + col * cwf + bar_w),
                     };
                     let cap = (lead_edge - head.x).abs().min(cwf * 0.65);
                     let mut wedge = [head; KNOTS + CAP_KNOTS + 1];
@@ -1533,7 +1613,7 @@ impl CursorGlow {
                         let fall = 0.6 + 0.4 * along;
                         let girth = if tube { along } else { along * along };
                         (
-                            chf * 0.04,
+                            chf * spine,
                             chf * (needle + swell * girth) * round,
                             (f32::from(s.cov) * 4.0).min(body_cap)
                                 * crate::color_math::sqrt_f32(along)
@@ -1575,8 +1655,20 @@ impl CursorGlow {
                         );
                         clip_quads_to(under.quads(), q1, hold);
                     }
-                    if fresh > 0.02 {
-                        let budget = under.quads().len().saturating_add(Self::MAX_QUADS);
+                    // Behind a bar the head is the tail's swell seated on the bar, with
+                    // no coma: its ring round a bar read as a second outline (L2), and its
+                    // fill alone, cut at the bar and at the row's top, as a pale
+                    // flat-topped patch over the letter behind the bar (after-land r1's
+                    // judge, `shape-bar/comet-light.t0` x365-377 y104-112).
+                    #[cfg(test)]
+                    let coma = !bar || self.comet_bar_coma;
+                    #[cfg(not(test))]
+                    let coma = !bar;
+                    if fresh > 0.02 && coma {
+                        let q2 = under.quads().len();
+                        let budget = q2.saturating_add(Self::MAX_QUADS);
+                        let fill = body_cap * 0.28 * fresh;
+                        let rim = if bar { fill } else { body_cap * 0.92 * fresh };
                         push_ink_ring(
                             under.quads(),
                             geom,
@@ -1584,9 +1676,12 @@ impl CursorGlow {
                             chf * Self::COMET_LIGHT_COMA_R,
                             (chf * Self::COMET_LIGHT_COMA_RIM).max(1.5),
                             color,
-                            (body_cap * 0.28 * fresh, body_cap * 0.92 * fresh),
+                            (fill, rim),
                             budget,
                         );
+                        if bar {
+                            clip_quads_to(under.quads(), q2, hold);
+                        }
                     }
                     // Its tail strings no glint: the four-point crosses it
                     // laid above and below the letters read as blue dash-ticks
@@ -1679,6 +1774,30 @@ impl CursorGlow {
                     // in another blue (composed r3, O9(b)).
                     let color = resolve_body_ink(ground, &mut ink_memo, cfg.color);
                     let (drop, reach) = Self::LUMEN_PAPER_TRACER;
+                    // Its light never rises toward its tail and fades in from
+                    // it over [`Self::LUMEN_PAPER_TAIL_CELLS`], so the far
+                    // end of a run its Backspaces walked back along ends as
+                    // softly as a typed run's. A run's sparks keep their own
+                    // lives, and the typed burst's last letters outlived the
+                    // Backspaces' quick moves: the tracer ended in a blunt,
+                    // brighter bar past the caret (the after-land lows' W4,
+                    // `steam.bs06`).
+                    #[cfg(test)]
+                    let blunt = self.lumen_paper_blunt;
+                    #[cfg(not(test))]
+                    let blunt = false;
+                    let run = if blunt {
+                        run
+                    } else {
+                        band_run.clear();
+                        band_run.extend_from_slice(run);
+                        #[cfg(test)]
+                        if self.lumen_paper_one_side {
+                            Self::lumen_paper_one_side(&mut band_run);
+                        }
+                        Self::lumen_paper_taper(&mut band_run, cwf * Self::LUMEN_PAPER_TAIL_CELLS);
+                        &band_run[..]
+                    };
                     ctx.pass(under, &mut verts, run, true, |s| {
                         (
                             chf * drop,
@@ -1690,7 +1809,7 @@ impl CursorGlow {
                 }
                 GlowStyle::Beam => {
                     let body = resolve_body_ink(ground, &mut ink_memo, cfg.color);
-                    ctx.banded(under, &mut verts, &mut band_run, run, |s| {
+                    ctx.banded(under, &mut verts, &mut band_run, run, false, |s| {
                         (0.0, chf * 0.40, f32::from(s.cov) * 0.55 * beam_pw, body)
                     });
                 }
@@ -1714,14 +1833,104 @@ impl CursorGlow {
                     });
                 }
                 GlowStyle::Phaser => {
-                    ctx.banded(under, &mut verts, &mut band_run, run, |s| {
-                        (
-                            0.0,
-                            chf * 0.40,
-                            f32::from(s.cov) * 1.6,
-                            resolve_body_ink(ground, &mut ink_memo, self.comet_color(cfg, s.pos)),
-                        )
-                    });
+                    // THE PAPER PHASER IS A NEON TUBE, LIT TO THE CARET
+                    // (after-land L4): its spectrum laid as itself
+                    // ([`LightGround::vivid_body_ink`], walked toward white
+                    // only as far as the letters over it ask), in a tube
+                    // with a crisp edge ([`Self::PHASER_PAPER_TUBE`]), and
+                    // lit up to the caret where Backspace drew the caret
+                    // back over it. In its hue's one-weight body ink across
+                    // a soft 0.40-row band, eased in at its tail, it read as
+                    // a pastel pink-green smear over the last word, and
+                    // after Backspace faded in a cell away from the caret
+                    // (`phaser-light-steam.bs06`, x308-330).
+                    #[cfg(test)]
+                    let (pastel, attach) = (self.phaser_paper_pastel, !self.phaser_band_detached);
+                    #[cfg(not(test))]
+                    let (pastel, attach) = (false, true);
+                    if pastel {
+                        ctx.banded(under, &mut verts, &mut band_run, run, attach, |s| {
+                            (
+                                0.0,
+                                chf * 0.40,
+                                f32::from(s.cov) * 1.6,
+                                resolve_body_ink(
+                                    ground,
+                                    &mut ink_memo,
+                                    self.comet_color(cfg, s.pos),
+                                ),
+                            )
+                        });
+                    } else {
+                        // Laid every quarter cell, so the spectrum's
+                        // neighbouring inks lie close: a lerp across a
+                        // whole cell between two vivid inks dips darker
+                        // than either.
+                        let (reach, melt, strength) = Self::PHASER_PAPER_TUBE;
+                        #[cfg(test)]
+                        let long_way = self.phaser_hue_long_way;
+                        #[cfg(not(test))]
+                        let long_way = false;
+                        dense.clear();
+                        let step = cwf * 0.25;
+                        let mut si = 0;
+                        while si < run.len() {
+                            let s = run[si];
+                            if si > 0 {
+                                let p = run[si - 1];
+                                let n = ((s.x - p.x).abs() / step).ceil().min(16.0) as usize;
+                                let mut k = 1;
+                                while k < n {
+                                    let t = k as f32 / n as f32;
+                                    dense.push(CometSample {
+                                        x: p.x + (s.x - p.x) * t,
+                                        y: p.y + (s.y - p.y) * t,
+                                        cov: (f32::from(p.cov)
+                                            + (f32::from(s.cov) - f32::from(p.cov)) * t)
+                                            .round()
+                                            as u8,
+                                        pos: spectrum_between(p.pos, s.pos, t, long_way),
+                                    });
+                                    k += 1;
+                                }
+                            }
+                            dense.push(s);
+                            si += 1;
+                        }
+                        #[cfg(test)]
+                        let wide_keep = if self.phaser_tube_wide_pastel {
+                            LIGHT_WIDE_BED_KEEP
+                        } else {
+                            Self::phaser_tube_wide_keep(fg, bg)
+                        };
+                        #[cfg(not(test))]
+                        let wide_keep = Self::phaser_tube_wide_keep(fg, bg);
+                        let tube = LightPassCtx {
+                            tube_melt: melt,
+                            wide_keep,
+                            ..ctx
+                        };
+                        let mut vivid_memo: Option<(u32, u32)> = None;
+                        tube.banded(under, &mut verts, &mut band_run, &dense, attach, |s| {
+                            #[cfg(test)]
+                            let neon = if self.phaser_tube_steps_hues {
+                                self.comet_color(cfg, s.pos)
+                            } else {
+                                self.phaser_tube_color(s.pos)
+                            };
+                            #[cfg(not(test))]
+                            let neon = self.phaser_tube_color(s.pos);
+                            let ink = match vivid_memo {
+                                Some((prev, solved)) if prev == neon => solved,
+                                _ => {
+                                    let solved = ground.vivid_body_ink(neon);
+                                    vivid_memo = Some((neon, solved));
+                                    solved
+                                }
+                            };
+                            (0.0, chf * reach, f32::from(s.cov) * strength, ink)
+                        });
+                    }
                 }
                 GlowStyle::Sparkle => {
                     #[cfg(not(test))]
@@ -1730,7 +1939,27 @@ impl CursorGlow {
                     let vivid = !self.sparkle_paper_bold_ink;
                     let mut vivid_memo: Option<(u32, u32)> = None;
                     let pinned = self.sparkle_pinned(cfg);
-                    ctx.banded(under, &mut verts, &mut band_run, run, |s| {
+                    #[cfg(not(test))]
+                    let tail_reach = Self::SPARKLE_PAPER_TAIL_REACH;
+                    #[cfg(test)]
+                    let tail_reach = if self.sparkle_paper_even {
+                        1.0
+                    } else {
+                        Self::SPARKLE_PAPER_TAIL_REACH
+                    };
+                    // The run's head and the way it runs; its taper spans the
+                    // run, and no less than [`Self::SPARKLE_PAPER_TAPER_CELLS`].
+                    let (head_x, dir, inv_span) = match (run.first(), run.last()) {
+                        (Some(tail), Some(head)) => (
+                            head.x,
+                            if head.x < tail.x { -1.0 } else { 1.0 },
+                            1.0 / (head.x - tail.x)
+                                .abs()
+                                .max(cwf * Self::SPARKLE_PAPER_TAPER_CELLS),
+                        ),
+                        _ => (0.0, 1.0, 0.0),
+                    };
+                    ctx.banded(under, &mut verts, &mut band_run, run, false, |s| {
                         let color = if vivid {
                             let key = s.pos.to_bits();
                             match vivid_memo {
@@ -1746,7 +1975,9 @@ impl CursorGlow {
                         } else {
                             resolve_body_ink(ground, &mut ink_memo, self.comet_color(cfg, s.pos))
                         };
-                        (0.0, chf * 0.40, f32::from(s.cov) * 0.55, color)
+                        let behind = ((head_x - s.x) * dir * inv_span).clamp(0.0, 1.0);
+                        let taper = 1.0 - (1.0 - tail_reach) * behind;
+                        (0.0, chf * 0.40 * taper, f32::from(s.cov) * 0.55, color)
                     });
                 }
                 _ => {}
@@ -1755,6 +1986,118 @@ impl CursorGlow {
         }
         self.light_verts = verts;
         self.light_band_run = band_run;
+        self.light_dense_run = dense;
+    }
+
+    /// Shape paper Lumen's run (tail first, head last) so it lies once along
+    /// the row, its light never rises away from its head, and it fades in from
+    /// each far end over `span` px (a smoothstep of the distance along the
+    /// row, a stretch whose far sample is going dark counted for less; the head
+    /// by the longer side's reach, which a run with one side makes the fade it
+    /// always was). A run that turned back on itself
+    /// (Backspaces retracing the letters just typed) keeps, from its head back,
+    /// the samples that reach farther out on their side of the head than every
+    /// one before them, and comes back in row order with its head inside it:
+    /// laid whole, the typed leg and the Backspaces' leg stacked over the
+    /// erased cells, and the turn, its tail's fade spent on the leg laid back
+    /// past it, stood as the tracer's deepest ink in a blunt bar at its far
+    /// end (the trail gallery's `steam.bs06`). Kept to one side, the typed leg
+    /// went out in the frame of the first Backspace and ink grew back only
+    /// over the erased cells (the after-land review's `@2480`).
+    #[inline]
+    pub(super) fn lumen_paper_taper(run: &mut Vec<CometSample>, span: f32) {
+        let Some(&head) = run.last() else {
+            return;
+        };
+        let (mut left, mut right) = (0.0_f32, 0.0_f32);
+        let mut keep = run.len() - 1;
+        let mut i = keep;
+        while i > 0 {
+            i -= 1;
+            let d = run[i].x - head.x;
+            let far = if d < 0.0 { -d > left } else { d > right };
+            if far {
+                if d < 0.0 {
+                    left = -d;
+                } else {
+                    right = d;
+                }
+                keep -= 1;
+                run[keep] = run[i];
+            }
+        }
+        run.drain(..keep);
+        run.sort_unstable_by(|a, b| a.x.total_cmp(&b.x));
+        let at = run.partition_point(|s| s.x < head.x);
+        let (behind, ahead) = run.split_at_mut(at);
+        let Some((held, ahead)) = ahead.split_first_mut() else {
+            return;
+        };
+        let mut ceiling = held.cov;
+        for s in behind.iter_mut().rev() {
+            s.cov = s.cov.min(ceiling);
+            ceiling = s.cov;
+        }
+        ceiling = held.cov;
+        for s in ahead.iter_mut() {
+            s.cov = s.cov.min(ceiling);
+            ceiling = s.cov;
+        }
+        if span > 0.0 {
+            let inv = 1.0 / span;
+            let ease = |s: &mut CometSample, d: f32| {
+                let k = (d * inv).clamp(0.0, 1.0);
+                s.cov = (f32::from(s.cov) * k * k * (3.0 - 2.0 * k)).round() as u8;
+            };
+            // How far a sample stands from the run's end, a stretch whose far sample has fallen
+            // under [`Self::LUMEN_PAPER_END_LIT`] of its near one counted by what is left of that:
+            // a spark going dark takes its stretch with it, so the end of its life moves the fade
+            // by nothing, and the tracer's end walks in. Counted whole, the end stepped a cell in
+            // that frame, and a cell read 30, then 2 (the after-land review's Steam, `@2592`).
+            let walk = |samples: &mut dyn Iterator<Item = &mut CometSample>| {
+                let mut d = 0.0_f32;
+                let mut far: Option<(f32, u8)> = None;
+                let mut reach = |x: f32, cov: u8| {
+                    if let Some((fx, fcov)) = far {
+                        let lit =
+                            f32::from(fcov) / (Self::LUMEN_PAPER_END_LIT * f32::from(cov.max(1)));
+                        let lit = lit.min(1.0);
+                        #[cfg(test)]
+                        let lit = if LUMEN_END_STEPS.get() { 1.0 } else { lit };
+                        d += (x - fx).abs() * lit;
+                    }
+                    far = Some((x, cov));
+                    d
+                };
+                for s in samples {
+                    let d = reach(s.x, s.cov);
+                    ease(s, d);
+                }
+                reach(head.x, head.cov)
+            };
+            let left = walk(&mut behind.iter_mut());
+            let right = walk(&mut ahead.iter_mut().rev());
+            ease(held, left.max(right));
+        }
+        // A run that lies wholly to its head's right runs tail first still.
+        if at == 0 {
+            run.reverse();
+        }
+    }
+
+    /// Test-only: `run` kept to the side of its head its nearest other sample
+    /// lies on, as [`Self::lumen_paper_taper`] first kept it (the negative
+    /// control of `paper_lumen_s_tracer_holds_through_a_backspace`).
+    #[cfg(test)]
+    fn lumen_paper_one_side(run: &mut Vec<CometSample>) {
+        let Some(&head) = run.last() else {
+            return;
+        };
+        let dir = match run.iter().rev().find(|s| (s.x - head.x).abs() > 0.5) {
+            Some(s) if s.x < head.x => -1.0,
+            _ => 1.0,
+        };
+        run.retain(|s| (s.x - head.x) * dir >= 0.0);
     }
 
     /// Emit per-pixel fire patches for each hot cell of the envelope.
@@ -1986,14 +2329,18 @@ impl CursorGlow {
                         break;
                     }
                 }
-                let ranks = if typed_head {
-                    &Self::FIRE_DARK_AIR_RANKS[..]
+                // The run stretches with the Trail duration
+                // ([`Self::FIRE_DARK_RUN_STRETCH_MAX`]); an untyped head burns alone.
+                let stretch = self.fire_run_stretch(cfg);
+                let run = if typed_head {
+                    let last = (Self::FIRE_DARK_AIR_RANKS.len() - 1) as f32;
+                    (last * stretch).round() as usize + 1
                 } else {
-                    &Self::FIRE_DARK_AIR_RANKS[..1]
+                    1
                 };
                 let mut rank = 1;
-                while rank < ranks.len() {
-                    let share = ranks[rank];
+                while rank < run {
+                    let share = fire_rank_share(rank as f32 / stretch);
                     let col = head_col + back * rank as i32;
                     if col < 0
                         || col >= geom.cols as i32
@@ -3635,7 +3982,8 @@ impl CursorGlow {
                 if d >= 1.0 {
                     continue;
                 }
-                let side = crate::color_math::powf_pos_f32(1.0 - d * d, 1.6);
+                let side =
+                    crate::color_math::powf_pos_f32(1.0 - d * d, this.fire_light_side_fall());
                 let ta = CursorGlow::FIRE_LIGHT_ALPHA * side * root_in * tip;
                 if ta <= 0.0 {
                     continue;
@@ -3722,6 +4070,17 @@ impl CursorGlow {
                 Self::FIRE_LIGHT_ROOT_EASE_PX
             };
             let squat = self.fire_light_squat();
+            // A tongue thins toward its tip by the power
+            // [`Self::FIRE_LIGHT_TIP_FALL`] of the rise left above it.
+            #[cfg(test)]
+            let pale = self.fire_paper_pale;
+            #[cfg(not(test))]
+            let pale = false;
+            let tip_fall = if pale {
+                0.55
+            } else {
+                Self::FIRE_LIGHT_TIP_FALL
+            };
             let mut tongues = [(0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32); MAX_TONGUES];
             let mut n = 0usize;
             let mut peak_h = 0.0f32;
@@ -3864,8 +4223,8 @@ impl CursorGlow {
                     if root_in <= 0.0 {
                         continue;
                     }
-                    let tip = crate::color_math::powf_pos_f32(1.0 - rise, 0.55);
-                    let c = flame_light_ramp(rise);
+                    let tip = crate::color_math::powf_pos_f32(1.0 - rise, tip_fall);
+                    let c = flame_light_ramp(rise, pale);
                     let c_rgb = [
                         ((c >> 16) & 0xff) as f32,
                         ((c >> 8) & 0xff) as f32,
@@ -3971,6 +4330,46 @@ impl CursorGlow {
         (root - box_top).max(0.0)
     }
 
+    /// How a paper tongue's opacity falls from its middle to its sides
+    /// ([`Self::FIRE_LIGHT_SIDE_FALL`]).
+    #[inline]
+    const fn fire_light_side_fall(&self) -> f32 {
+        #[cfg(test)]
+        if self.fire_paper_pale {
+            return 1.6;
+        }
+        Self::FIRE_LIGHT_SIDE_FALL
+    }
+
+    /// How far the dark air run behind a typed head stretches at this Trail duration
+    /// ([`Self::FIRE_DARK_RUN_STRETCH_MAX`]): the square root of the typed life's scale
+    /// ([`super::typed_life_basis`]) up to its bound, and exactly 1 at the default or shorter.
+    #[inline]
+    pub(super) const fn fire_run_stretch(&self, cfg: &GlowConfig) -> f32 {
+        #[cfg(test)]
+        if self.fire_run_unstretched {
+            return 1.0;
+        }
+        let (_, scale) = super::typed_life_basis(cfg.duration, self.typed_life_unscaled());
+        if scale <= 1.0 {
+            return 1.0;
+        }
+        crate::color_math::sqrt_f32(scale).clamp(1.0, Self::FIRE_DARK_RUN_STRETCH_MAX)
+    }
+
+    /// The share of its tuned life a typed key's Fire ember lives at `scale`
+    /// ([`super::typed_life_scale`]): a shorter duration shortens its flight, a longer one leaves
+    /// it as tuned, since an ember that flies four times as long drifts rows up over the lines
+    /// above as dust ([`Self::FIRE_DARK_RUN_STRETCH_MAX`] carries the longer trail instead).
+    #[inline]
+    pub(super) const fn fire_ember_life_scale(&self, scale: f32) -> f32 {
+        #[cfg(test)]
+        if self.fire_embers_duration_scaled {
+            return scale;
+        }
+        scale.min(1.0)
+    }
+
     #[inline]
     const fn flame_light_cap(
         &self,
@@ -4055,7 +4454,20 @@ impl CursorGlow {
         let (cw, ch) = (geom.cw as f32, geom.ch as f32);
         let heat = self.heat.clamp(0.0, 1.0);
         let swell_rate = 6.0 + 6.0 * heat;
-        let swell_amp = ch * (Self::WATER_SWELL.0 + Self::WATER_SWELL.1 * heat);
+        // The wave runs along the letters' foot ([`Self::WATER_FOOT_DY`]).
+        #[cfg(test)]
+        let mid_line = self.water_mid_line;
+        #[cfg(not(test))]
+        let mid_line = false;
+        #[cfg(test)]
+        let (line_dy, swell_share) = if mid_line {
+            (Self::WATER_LINE_DY, 1.0)
+        } else {
+            (Self::WATER_FOOT_DY, Self::WATER_FOOT_SWELL)
+        };
+        #[cfg(not(test))]
+        let (line_dy, swell_share) = (Self::WATER_FOOT_DY, Self::WATER_FOOT_SWELL);
+        let swell_amp = ch * (Self::WATER_SWELL.0 + Self::WATER_SWELL.1 * heat) * swell_share;
 
         if self.water_seen.len() == Self::WATER_OWNER_SLOTS {
             self.water_seen.fill(0);
@@ -4065,7 +4477,7 @@ impl CursorGlow {
         }
 
         let mut head: Option<(u8, f32)> = None;
-        let line_dy_px = ch * Self::WATER_LINE_DY;
+        let line_dy_px = ch * line_dy;
         let drift_scale = cw * 0.36;
         let mut si = self.sparks.len();
         while si > 0 {
@@ -4170,7 +4582,11 @@ impl CursorGlow {
             });
         }
 
-        let under_thickness = ch * (0.28 + 0.13 * heat);
+        let under_thickness = if mid_line {
+            ch * (0.28 + 0.13 * heat)
+        } else {
+            ch * (Self::WATER_FOOT_UNDERTOW.0 + Self::WATER_FOOT_UNDERTOW.1 * heat)
+        };
         let crest_thickness = ch * (0.10 + 0.09 * heat);
         if !cfg.dark_theme {
             self.emit_water_light(cfg, geom, (under_thickness, crest_thickness), out);
@@ -4482,6 +4898,7 @@ impl CursorGlow {
                 run: &mut self.comet_run,
                 typing: &mut self.comet_typing,
                 run_typing: &mut self.comet_run_typing,
+                leap_caps_typed: false,
             }
             .chain(&mut runs_len, prev, here, sample, true);
             prev = Some(here);
@@ -4491,6 +4908,7 @@ impl CursorGlow {
             run: &mut self.comet_run,
             typing: &mut self.comet_typing,
             run_typing: &mut self.comet_run_typing,
+            leap_caps_typed: false,
         }
         .publish(&mut runs_len);
         if runs_len == 0 {
@@ -5654,6 +6072,35 @@ impl CursorGlow {
         lo as u8
     }
 
+    /// Beam's rod on a dark page, as a share of the cell height, at the tube's power `pw`
+    /// ([`beam_power`]): its white core and ice body, sleeved in [`aterm_render::BEAM_LAYERS`]'
+    /// haze. At a third of a cell at full power (`0.08 + 0.26 * pw`) its body lay over a
+    /// Backspace's erased cells as a white slab two thirds of the row tall (composed r3's
+    /// judges: `beam-dark-steam.t120`; the after-land lows' W6).
+    #[inline]
+    #[must_use]
+    pub(super) const fn beam_rod(pw: f32) -> f32 {
+        0.06 + 0.18 * pw
+    }
+
+    /// How far each layer of Beam's tube fades in from its ends, as a share of its own
+    /// half-thickness ([`aterm_render::layered_beam_quads_with`]): the tube's ends round off.
+    /// Laid whole to its ends, its sleeve stood as a lavender box with hard ends (the paper
+    /// card's dark twin at motion-1500: a column at x529-540 straddling the caret; the after-land
+    /// lows' W6).
+    pub(super) const BEAM_END_FEATHER: f32 = 1.5;
+
+    /// Paper Water's landing ripple's height as a share of its width: the near half of a
+    /// flat ellipse in the leading under the caret's row, a ripple seen from above the
+    /// water, not a ring standing through the letters.
+    pub(super) const WATER_PAPER_RIPPLE_FLAT: f32 = 0.26;
+
+    /// How deep paper Water's landing ripple lies in the foot of the caret's own row, as a
+    /// share of the cell height, on the grid's last row, which has no leading under it. Its
+    /// wings stay this low however wide it spreads: taller, they stood beside the caret as
+    /// the `)` the leading keeps it from.
+    pub(super) const WATER_PAPER_RIPPLE_LAST_ROW_DEPTH: f32 = 0.18;
+
     /// How far a dark fire's landing flash spreads at the end of its life, in rows.
     pub(super) const FIRE_DARK_LANDING_REACH: f32 = 1.0;
 
@@ -5694,11 +6141,17 @@ impl CursorGlow {
     ) {
         let rf = classic_ring_radius_factor(ring.scale);
         if matches!(cfg.style, GlowStyle::Water) {
+            /// One paper ripple: an ellipse of `flat` height to width about `centre`, no
+            /// taller than `most`, kept to the pixels at or below `foot` when there is one.
+            #[allow(
+                clippy::too_many_arguments,
+                reason = "the ripple's resolved facts (centre, foot, life, ink) handed over from emit_ring_light"
+            )]
             #[inline]
             fn push_water_light_ripple(
                 out: &mut Vec<GlowQuad>,
                 geom: Geom,
-                centre: (f32, f32),
+                (centre, foot, flat, most): ((f32, f32), Option<i32>, f32, f32),
                 ch_rf: f32,
                 tt: f32,
                 cov: u8,
@@ -5708,7 +6161,7 @@ impl CursorGlow {
                     return;
                 }
                 let rx = (0.7 + 1.5 * tt) * ch_rf;
-                let ry = (rx * 0.38).max(2.0);
+                let ry = (rx * flat).clamp(2.0, most.max(2.0));
                 let from = out.len();
                 push_ripple_ring(
                     out,
@@ -5718,18 +6171,77 @@ impl CursorGlow {
                     2.0,
                     premul_rgb(0x00FF_FFFF, cov),
                 );
+                if let Some(foot) = foot {
+                    // `retain` visits in order: the first `from` quads are older lights.
+                    let mut seen = 0usize;
+                    out.retain(|q| {
+                        seen += 1;
+                        seen <= from || i32::from(q.y) >= foot
+                    });
+                }
                 let ink = InkRole::OverText.ink(color);
                 reink_quads(&mut out[from..], LIGHT_INK_ALPHA_CAP as u8, |_| ink);
             }
-            let centre = (ring.cx, ring.cy + geom.ch as f32 * 0.28);
+            #[cfg(test)]
+            let (whole, leading_only) = (
+                self.water_paper_ripple_whole,
+                self.water_paper_ripple_leading_only,
+            );
+            #[cfg(not(test))]
+            let (whole, leading_only) = (false, false);
+            // On paper the ripple spreads in the leading under the caret's row, its near
+            // half alone (a shallow `‿` under the caret), where a whole ellipse through the
+            // row lost its left arcs to the letters and its right ones read as a `)` beside
+            // the caret (the after-land lows' W1: the paper card at motion-0900). The grid's
+            // last row, where a filled screen's prompt sits, has no leading under it: there
+            // the ripple lies as shallow in the row's own foot, wholly inside the effects box,
+            // so that box's edge fade (for a light that crosses it) is not read for it; in the
+            // leading alone every quad fell past the box and the landing spread nothing.
+            let foot = ring.cy + geom.ch as f32 * 0.5;
+            let (ripple, box_geom) = if whole {
+                (
+                    (
+                        (ring.cx, ring.cy + geom.ch as f32 * 0.28),
+                        None,
+                        0.38,
+                        f32::INFINITY,
+                    ),
+                    geom,
+                )
+            } else if !leading_only && foot.round() as i32 >= geom.fx_bot() {
+                let depth = geom.ch as f32 * Self::WATER_PAPER_RIPPLE_LAST_ROW_DEPTH;
+                let centre = foot - depth;
+                (
+                    (
+                        (ring.cx, centre),
+                        Some(centre.round() as i32),
+                        Self::WATER_PAPER_RIPPLE_FLAT,
+                        depth,
+                    ),
+                    Geom {
+                        rows: geom.rows + 1,
+                        ..geom
+                    },
+                )
+            } else {
+                (
+                    (
+                        (ring.cx, foot),
+                        Some(foot.round() as i32),
+                        Self::WATER_PAPER_RIPPLE_FLAT,
+                        f32::INFINITY,
+                    ),
+                    geom,
+                )
+            };
             let ch_rf = geom.ch as f32 * rf;
-            push_water_light_ripple(out, geom, centre, ch_rf, t, cov, color);
+            push_water_light_ripple(out, box_geom, ripple, ch_rf, t, cov, color);
             if t > 0.30 {
                 let t2 = (t - 0.30) * (1.0 / 0.70);
                 push_water_light_ripple(
                     out,
-                    geom,
-                    centre,
+                    box_geom,
+                    ripple,
                     ch_rf,
                     t2,
                     (150.0 * (1.0 - t2) * cfg.intensity) as u8,
@@ -5941,6 +6453,21 @@ impl CursorGlow {
         };
         let unbudgeted = self.streak_unbudgeted();
         let comet_dark_leading = dark && matches!(cfg.style, GlowStyle::Comet) && !unbudgeted;
+        // Beside a bar or an underline a Water drop keeps off the caret's cell and the
+        // cell either side of it: a block hid the beads a splash lays in its own cell and
+        // hugged the rest, and a bar, at its cell's left edge, stood among them, two or three
+        // bright beads about it that read as a `:` or a `·`, and a lone bead in the blank
+        // cell before it as a `·` of its own (the after-land lows' W2: shape-bar's
+        // enter-bottom.e120).
+        #[cfg(test)]
+        let drops_on_thin_caret = self.water_drops_on_thin_caret;
+        #[cfg(not(test))]
+        let drops_on_thin_caret = false;
+        let water_off_thin_caret = water && self.caret_thin && !drops_on_thin_caret;
+        #[cfg(test)]
+        let beads_unlatched = self.water_beads_unlatched;
+        #[cfg(not(test))]
+        let beads_unlatched = false;
         // On the reference dark, where Water's crest is its trail's whole
         // light, its beads are fuller ([`Self::WATER_DARK_BEAD_GROW`]).
         let water_bead_grow = if water && Self::water_dark_reference(cfg) {
@@ -6529,6 +7056,9 @@ impl CursorGlow {
             // it was born, and Fire's embers rise through the row
             // ([`Self::DENSE_SEAT_CELLS`]); one the caret has caught up with
             // is gone.
+            // A seated Fire ember's size, shrinking with its way out
+            // ([`Self::DENSE_EMBER_TAPER`]); 1 for every other mark.
+            let mut seat_scale = 1.0f32;
             let (x, y, held) = match dense_ahead {
                 Some((cr, caret_col, past))
                     if ((p.y0 - oyf) * inv_ch).floor() as i32 == cr
@@ -6556,24 +7086,54 @@ impl CursorGlow {
                     // rises through its life. Seated at a random depth,
                     // round 2's lay level across the row, three crisp dots
                     // on paper that read as an ellipsis (round 3).
+                    // Their height scatters wider the farther out they sit,
+                    // a plume fanning off the flame and not one dotted line
+                    // (after-land L3, [`Self::DENSE_EMBER_FAN`]).
                     #[cfg(test)]
                     let level = self.dense_embers_level;
                     #[cfg(not(test))]
                     let level = false;
-                    let lift = if level {
+                    // The way out across the whole seat, so the far embers
+                    // keep climbing and fanning.
+                    let way = ((sx - past) / (Self::DENSE_SEAT_CELLS * cwf)).clamp(0.0, 1.0);
+                    let spread = Self::DENSE_EMBER_SCATTER + Self::DENSE_EMBER_FAN * way;
+                    #[cfg_attr(not(test), allow(unused_mut))]
+                    let mut lift = if level {
                         0.5 * depth + 0.5 * life
                     } else {
-                        let out =
-                            ((sx - past) / (Self::DENSE_EMBER_CLIMB_CELLS * cwf)).clamp(0.0, 1.0);
-                        Self::DENSE_EMBER_SCATTER * depth
-                            + Self::DENSE_EMBER_CLIMB * out
+                        Self::DENSE_EMBER_FLOOR
+                            + spread * (depth - 0.5)
+                            + Self::DENSE_EMBER_CLIMB * crate::color_math::powf_pos_f32(way, 0.7)
                             + Self::DENSE_EMBER_RISE * life
                     };
+                    #[cfg(test)]
+                    if self.dense_embers_line {
+                        let out =
+                            ((sx - past) / (Self::DENSE_EMBER_CLIMB_CELLS * cwf)).clamp(0.0, 1.0);
+                        lift = Self::DENSE_EMBER_SCATTER * depth
+                            + Self::DENSE_EMBER_CLIMB_LINE * out
+                            + Self::DENSE_EMBER_RISE * life;
+                    }
                     let sy = if sparkle {
                         top + band * (0.1 + 0.8 * depth)
                     } else {
                         top + band * (1.0 - lift).clamp(0.0, 1.0)
                     };
+                    // The farther out its seat, the smaller and dimmer:
+                    // sparks dying off the flame, not beads of one size
+                    // ([`Self::DENSE_EMBER_TAPER`]). Read off the seat's own
+                    // share of the way across it, so a caret moving on leaves
+                    // each where and as it was.
+                    #[cfg(test)]
+                    let tapered = !sparkle && !self.dense_embers_untapered;
+                    #[cfg(not(test))]
+                    let tapered = !sparkle;
+                    let taper = if tapered {
+                        1.0 - Self::DENSE_EMBER_TAPER * ahead
+                    } else {
+                        1.0
+                    };
+                    seat_scale = taper;
                     let seat_col = ((sx - oxf) * inv_cw).floor() as i32;
                     let seat_end = ((sx + seat_r - oxf) * inv_cw).floor() as i32;
                     if sx - seat_r < past
@@ -6584,7 +7144,11 @@ impl CursorGlow {
                     {
                         continue;
                     }
-                    (sx, sy, self.seat_air_light(now, cr, (seat_col, seat_end)))
+                    (
+                        sx,
+                        sy,
+                        self.seat_air_light(now, cr, (seat_col, seat_end)) * taper,
+                    )
                 }
                 _ => (x, y, 1.0),
             };
@@ -6592,6 +7156,48 @@ impl CursorGlow {
             if (!dark || sparkle) && (lawful || light_fire) && grid.on_caret(x, y) {
                 continue;
             }
+            // A Water bead beside a thin caret is judged once along its life
+            // ([`CaretBead`]), as a filled row judges it: hidden and shown from
+            // where it stood each frame, one born behind the bar popped in whole
+            // as the caret stepped away, and one the caret came to dropped out
+            // and returned at the next key.
+            let bead_ease = if water_off_thin_caret {
+                let behind = grid.on_caret_padded(x, y, cwf - reach);
+                if beads_unlatched {
+                    if behind {
+                        continue;
+                    }
+                    1.0
+                } else {
+                    match (latch.caret_bead, behind) {
+                        (CaretBead::Unread | CaretBead::Behind, true) => {
+                            self.particles[pi].latch.caret_bead = CaretBead::Behind;
+                            continue;
+                        }
+                        (CaretBead::Unread, false) => {
+                            self.particles[pi].latch.caret_bead = CaretBead::Clear { since: None };
+                            1.0
+                        }
+                        (CaretBead::Behind, false) => {
+                            self.particles[pi].latch.caret_bead =
+                                CaretBead::Clear { since: Some(age) };
+                            0.0
+                        }
+                        (CaretBead::Clear { .. }, true) => {
+                            self.particles[pi].latch.end = age;
+                            continue;
+                        }
+                        (CaretBead::Clear { since }, false) => {
+                            let k = since.map_or(1.0, |since| {
+                                ((age - since) / Self::WATER_BEAD_EMERGE_S).clamp(0.0, 1.0)
+                            });
+                            k * k * (3.0 - 2.0 * k)
+                        }
+                    }
+                }
+            } else {
+                1.0
+            };
             let over_text = (lawful || beam) && text.covers_cell(row, col);
             if over_text && (!dark || sparkle || beam) {
                 continue;
@@ -6625,7 +7231,7 @@ impl CursorGlow {
             } else {
                 1.0
             };
-            let cov = (raw_cov * text_dim * held) as u8;
+            let cov = (raw_cov * text_dim * held * bead_ease) as u8;
             if cov == 0 {
                 continue;
             }
@@ -6799,7 +7405,8 @@ impl CursorGlow {
                         * 0.6
                         * t;
                     if light_fire {
-                        let r = (ch * (0.06 + 0.06 * p.hue)).max(1.8) * (0.7 + 0.3 * fade);
+                        let r =
+                            (ch * (0.06 + 0.06 * p.hue)).max(1.8) * (0.7 + 0.3 * fade) * seat_scale;
                         // A bead floated beside a filled bar keeps its whole
                         // disc off it, as the dark embers do.
                         let xw = x + waft;
@@ -6820,7 +7427,8 @@ impl CursorGlow {
                     let cell = ch;
                     let base = (cell * (Self::FIRE_EMBER_R + Self::FIRE_EMBER_R_HOT * p.hue))
                         .max(1.2)
-                        * (0.6 + 0.4 * fade);
+                        * (0.6 + 0.4 * fade)
+                        * seat_scale;
                     let vx = p.vx;
                     let vy = p.vy + p.gy * age;
                     let rx = base * (1.0 + (vx.abs() * inv_ch).min(1.4) * 0.6);
@@ -6973,7 +7581,15 @@ impl CursorGlow {
                             if over_text {
                                 continue;
                             }
-                            let r = (Self::MOON_DUST_RATIO * dust_r(ch, p.hue)).max(2.5);
+                            #[cfg(test)]
+                            let least = if self.moon_r3_size {
+                                2.5
+                            } else {
+                                ch * Self::MOON_MIN_R
+                            };
+                            #[cfg(not(test))]
+                            let least = ch * Self::MOON_MIN_R;
+                            let r = (Self::MOON_DUST_RATIO * dust_r(ch, p.hue)).max(least);
                             let moon = (230.0
                                 * p.cov_scale
                                 * crate::color_math::powf_pos_f32(fade, Self::MOON_FADE_POW)
@@ -7272,6 +7888,30 @@ impl CursorGlow {
             }
         }
         lo
+    }
+
+    /// The paper Phaser tube's colour at path position `pos`: the whole wheel, yellow in it.
+    /// [`Self::comet_color`] steps over the muddy hues because a body darkened to paper's bar
+    /// lays them as olive; the tube's ink is the colour as itself, walked toward white
+    /// ([`LightGround::vivid_body_ink`]), so its yellow shows yellow, and stepped over it took a
+    /// hard orange-to-green edge on a tube that otherwise turns smoothly (`phaser-light.t0`,
+    /// x316-324, after-land B7).
+    #[inline]
+    #[must_use]
+    const fn phaser_tube_color(&self, pos: f32) -> u32 {
+        hsv2rgb((self.hue + pos).fract(), 0.95, 1.0)
+    }
+
+    /// What the paper Phaser's tube keeps of the text's contrast under a wide glyph
+    /// ([`Self::PHASER_PAPER_WIDE_KEEP`]), on a theme with no room for that the most a narrow
+    /// letter over the tube keeps ([`BODY_CONTRAST_BAR`]), and never more than a soft body's.
+    #[inline]
+    #[must_use]
+    const fn phaser_tube_wide_keep(fg: u32, bg: u32) -> f32 {
+        let clean = crate::color_math::contrast_ratio(fg, bg).max(1.0);
+        Self::PHASER_PAPER_WIDE_KEEP
+            .max((BODY_CONTRAST_BAR + BODY_CONTRAST_GUARD) / clean)
+            .min(LIGHT_WIDE_BED_KEEP)
     }
 
     /// The comet colour at path position `pos` (0 tail .. 1 head) for the style.
@@ -8210,7 +8850,22 @@ const fn flame_tip_fade(rise: f32) -> f32 {
     }
 }
 
+/// THE PAPER FLAME BURNS DEEP (after-land L3): a paper tongue's colour up
+/// its rise, a red-orange root to an amber tip. Rooted orange and tipped in
+/// pale gold (`#FF6F0A` to `#FFC848`), each tongue's thinning upper half
+/// composited onto the paper as a pale peach, under a heavy maroon caret
+/// (`fire-light.t0`).
 const FLAME_LIGHT_STOPS: [(f32, u32); 4] = [
+    (0.0, 0x00E8_460C),
+    (0.32, 0x00FF_6A12),
+    (0.62, 0x00FF_8C1A),
+    (1.0, 0x00FF_AE2E),
+];
+
+/// The composed land's paper flame ([`FLAME_LIGHT_STOPS`]), after-land L3's
+/// negative control (`fire_paper_pale`).
+#[cfg(test)]
+const FLAME_LIGHT_STOPS_PALE: [(f32, u32); 4] = [
     (0.0, 0x00FF_6F0A),
     (0.32, 0x00FF_8C14),
     (0.62, 0x00FF_A820),
@@ -8240,7 +8895,17 @@ const fn flame_light_paint_bounds() -> (u32, u32) {
 }
 
 #[inline]
-const fn flame_light_ramp(rise: f32) -> u32 {
+const fn flame_light_ramp(rise: f32, pale: bool) -> u32 {
+    #[cfg(test)]
+    if pale {
+        let rise = rise.clamp(0.0, 1.0);
+        let stops = FLAME_LIGHT_STOPS_PALE;
+        let i = (rise >= stops[1].0) as usize + (rise >= stops[2].0) as usize;
+        let (a, b) = (stops[i], stops[i + 1]);
+        return lerp_rgb(a.1, b.1, (rise - a.0) / (b.0 - a.0));
+    }
+    #[cfg(not(test))]
+    let _ = pale;
     let rise = rise.clamp(0.0, 1.0);
     let i = (rise >= FLAME_LIGHT_STOPS[1].0) as usize + (rise >= FLAME_LIGHT_STOPS[2].0) as usize;
     let (a, b) = (FLAME_LIGHT_STOPS[i], FLAME_LIGHT_STOPS[i + 1]);
@@ -8281,6 +8946,17 @@ fn fire_band_lifts(
     lifts
 }
 
+/// Beam's tube as composed r3 laid it, its sleeve three and five and a half rods wide (the
+/// after-land lows' W6 negative control, [`CursorGlow::beam_tube_r3`]).
+#[cfg(test)]
+const BEAM_LAYERS_R3: [(f32, f32, u32, f32, f32, usize); 5] = [
+    (0.55, 1.00, 0x00FF_FFFF, 0.55, 0.30, 1),
+    (1.0, 0.95, 0x00FF_FFFF, 0.20, 0.08, 1),
+    (1.6, 0.58, aterm_render::BEAM_SPACE_HAZE, 0.18, 0.0, 1),
+    (3.0, 0.30, aterm_render::BEAM_SPACE_HAZE, 0.55, 0.0, 2),
+    (5.5, 0.13, aterm_render::BEAM_SPACE_HAZE, 0.85, 0.0, 2),
+];
+
 #[inline]
 const fn streak_layers(style: GlowStyle) -> &'static [(f32, f32, u32, f32, f32, usize)] {
     match style {
@@ -8297,6 +8973,9 @@ struct CometRuns<'a> {
     run: &'a mut Vec<CometSample>,
     typing: &'a mut Vec<Vec<bool>>,
     run_typing: &'a mut Vec<bool>,
+    /// A leap that carries on a typed run takes it down to the leap's tail: the
+    /// style lays a bed ([`BedShape::of`]).
+    leap_caps_typed: bool,
 }
 
 impl CometRuns<'_> {
@@ -8311,6 +8990,16 @@ impl CometRuns<'_> {
     ) {
         if breaks_comet_run(prev, here) {
             self.publish(runs_len);
+        }
+        // A RUN FADES ONE WAY, ACROSS A LEAP TOO. A leap's tail starts dimmer than the hand's last
+        // keys and falls sooner, so the typed stretch it carries on stood brighter than the middle
+        // of the run, the far end of Beam's rail on the card (the after-land lows' A5).
+        if self.leap_caps_typed && !typing && self.run_typing.last() == Some(&true) {
+            let mut i = 0;
+            while i < self.run.len() {
+                self.run[i].cov = self.run[i].cov.min(sample.cov);
+                i += 1;
+            }
         }
         self.run.push(sample);
         self.run_typing.push(typing);
@@ -8357,6 +9046,43 @@ fn publish_comet_run(
     }
     std::mem::swap(&mut runs[*runs_len], run);
     *runs_len += 1;
+}
+
+/// The share of the head's strength the dark air run burns at `x` ranks behind it, read off
+/// [`CursorGlow::FIRE_DARK_AIR_RANKS`]' profile between its ranks and held at its last: at a
+/// whole `x`, that rank's share exactly.
+#[inline]
+const fn fire_rank_share(x: f32) -> f32 {
+    let ranks = &CursorGlow::FIRE_DARK_AIR_RANKS;
+    let last = ranks.len() - 1;
+    if x.is_nan() || x <= 0.0 {
+        return ranks[0];
+    }
+    if x >= last as f32 {
+        return ranks[last];
+    }
+    let i = x as usize;
+    let f = x - i as f32;
+    if f == 0.0 {
+        ranks[i]
+    } else {
+        ranks[i] + (ranks[i + 1] - ranks[i]) * f
+    }
+}
+
+/// The paper Phaser's spectrum place `t` of the way from `a` to `b`, the short way round its
+/// wheel (a place is read modulo one, [`CursorGlow::comet_color`]). A run's places wrap from
+/// near one to near nought where its hue passes the wheel's start, a cell's step apart, and the
+/// straight mean of the two walked the whole wheel back across that one cell: a wrong-way
+/// rainbow about ten pixels wide, a pale seam in the neon tube between two words (after-land
+/// r1's judge, `phaser-light.t0` x326-342). `long_way` lays the straight mean (the negative
+/// control).
+#[inline]
+const fn spectrum_between(a: f32, b: f32, t: f32, long_way: bool) -> f32 {
+    let d = b - a;
+    let d = if long_way { d } else { d - d.round() };
+    let p = a + d * t;
+    p - p.floor()
 }
 
 #[inline]
@@ -8449,6 +9175,14 @@ struct LightPassCtx<'a> {
     probe: Option<(u16, &'a [char])>,
     stride: usize,
     budget: usize,
+    /// The px over which a crisp tube's edges melt to nothing; 0 lays a
+    /// soft body (its core half its reach, [`aterm_render::ribbon_profile`]).
+    /// The paper Phaser's tube is crisp ([`CursorGlow::PHASER_PAPER_TUBE`],
+    /// [`aterm_render::ribbon_glass_into`]).
+    tube_melt: f32,
+    /// The share of the text's contrast a band keeps under a wide glyph: [`LIGHT_WIDE_BED_KEEP`],
+    /// or the Phaser tube's ([`CursorGlow::phaser_tube_wide_keep`]).
+    wide_keep: f32,
 }
 
 impl LightPassCtx<'_> {
@@ -8490,6 +9224,24 @@ impl LightPassCtx<'_> {
     ) -> aterm_render::RibbonVertex {
         let available = (self.chf * 0.5 - dy.abs()).max(0.0);
         let reach = reach.clamp(0.5_f32.min(available), available);
+        if self.tube_melt > 0.0 {
+            // A crisp tube: its spine on its foot, its light reaching the
+            // whole tube up and melting away over `tube_melt` px at its top
+            // ([`aterm_render::glass_profile`]) and its foot.
+            let melt = self.tube_melt.min(reach);
+            return aterm_render::RibbonVertex {
+                x,
+                spine: y + dy + reach - melt,
+                up: 2.0 * reach - melt,
+                dn: melt,
+                core_up: 0.0,
+                core_dn: 0.0,
+                color,
+                cov: alpha.clamp(0.0, self.body_cap),
+                lift: 0.0,
+                lift_span: 0.0,
+            };
+        }
         aterm_render::RibbonVertex {
             x,
             spine: y + dy,
@@ -8511,9 +9263,21 @@ impl LightPassCtx<'_> {
         verts: &mut Vec<aterm_render::RibbonVertex>,
         run: &[CometSample],
         feather: bool,
+        layer: impl FnMut(&CometSample) -> (f32, f32, f32, u32),
+    ) {
+        self.lay(verts, run, feather, layer);
+        self.raster(under, verts);
+    }
+
+    /// [`Self::pass`]'s vertices.
+    #[inline]
+    fn lay(
+        &self,
+        verts: &mut Vec<aterm_render::RibbonVertex>,
+        run: &[CometSample],
+        feather: bool,
         mut layer: impl FnMut(&CometSample) -> (f32, f32, f32, u32),
     ) {
-        use aterm_render::{GlowBlend, ribbon_beam_into};
         verts.clear();
         if let [lone] = run {
             verts.push(self.ribbon_vertex(lone.x - self.cwf * 0.45, lone.y, layer(lone)));
@@ -8535,17 +9299,40 @@ impl LightPassCtx<'_> {
                 si += 1;
             }
         }
-        ribbon_beam_into(
-            under,
-            self.geom.beam_clip(),
-            verts,
-            1.0,
-            self.stride,
-            self.budget,
-            GlowBlend::Over,
-        );
     }
 
+    /// [`Self::pass`]'s raster of `verts`: a crisp tube or a soft body.
+    #[inline]
+    fn raster(&self, under: &mut RampSink<'_>, verts: &[aterm_render::RibbonVertex]) {
+        use aterm_render::{GlowBlend, ribbon_beam_into};
+        if self.tube_melt > 0.0 {
+            aterm_render::ribbon_glass_into(
+                under,
+                self.geom.beam_clip(),
+                verts,
+                self.stride,
+                self.budget,
+                aterm_render::WEDGE_EDGE_PX,
+                self.tube_melt,
+            );
+        } else {
+            ribbon_beam_into(
+                under,
+                self.geom.beam_clip(),
+                verts,
+                1.0,
+                self.stride,
+                self.budget,
+                GlowBlend::Over,
+            );
+        }
+    }
+
+    /// The band of `run` ([`Self::pass`]): its tail end eased in over
+    /// [`CursorGlow::LIGHT_BAND_TAIL_CELLS`] and, where the caret has left its
+    /// head, its head feathered out. With `attach`, the ease is measured
+    /// along the run's path and not across the row, so a run Backspace
+    /// folded back over itself stays lit along its way back to the caret.
     #[inline]
     fn banded(
         &self,
@@ -8553,6 +9340,7 @@ impl LightPassCtx<'_> {
         verts: &mut Vec<aterm_render::RibbonVertex>,
         band_run: &mut Vec<CometSample>,
         run: &[CometSample],
+        attach: bool,
         mut band: impl FnMut(&CometSample) -> (f32, f32, f32, u32),
     ) {
         let tail = match run {
@@ -8562,57 +9350,75 @@ impl LightPassCtx<'_> {
             }
             _ => None,
         };
-        let run = match (tail, run.last()) {
+        let head_cut = match (tail, run.last()) {
             (Some((_, dir)), Some(&head))
                 if matches!(
                     self.cur,
                     Some((cr, cc)) if (i32::from(cr), i32::from(cc)) != self.cell_of(&head)
                 ) =>
             {
-                let from = head.x + dir * self.cwf * (0.5 - bed::DARK_BED_HEAD_FEATHER_CELLS);
-                band_run.clear();
-                let mut si = 0;
-                while si < run.len() {
-                    let s = run[si];
-                    if (s.x - from) * dir >= 0.0 {
-                        break;
-                    }
-                    band_run.push(s);
-                    si += 1;
-                }
-                const LIGHT_BAND_HEAD_FEATHER: [(f32, f32); CursorGlow::LIGHT_BAND_HEAD_KNOTS + 1] = {
-                    let knots = CursorGlow::LIGHT_BAND_HEAD_KNOTS;
-                    let mut out = [(0.0f32, 0.0f32); CursorGlow::LIGHT_BAND_HEAD_KNOTS + 1];
-                    let mut j = 0;
-                    while j <= knots {
-                        let u = j as f32 / knots as f32;
-                        out[j] = (u, 1.0 - u * u * (3.0 - 2.0 * u));
-                        j += 1;
-                    }
-                    out
-                };
-                let head_cov = f32::from(head.cov);
-                let feather_span = dir * self.cwf * bed::DARK_BED_HEAD_FEATHER_CELLS;
-                let mut fi = 0;
-                while fi < LIGHT_BAND_HEAD_FEATHER.len() {
-                    let (u, w) = LIGHT_BAND_HEAD_FEATHER[fi];
-                    band_run.push(CometSample {
-                        x: from + feather_span * u,
-                        cov: (head_cov * w).round() as u8,
-                        ..head
-                    });
-                    fi += 1;
-                }
-                &band_run[..]
+                Some((dir, head))
             }
-            _ => run,
+            _ => None,
+        };
+        if let Some((dir, head)) = head_cut {
+            band_run.clear();
+            let from = head.x + dir * self.cwf * (0.5 - bed::DARK_BED_HEAD_FEATHER_CELLS);
+            let mut si = 0;
+            while si < run.len() {
+                let s = run[si];
+                if (s.x - from) * dir >= 0.0 {
+                    break;
+                }
+                band_run.push(s);
+                si += 1;
+            }
+            const LIGHT_BAND_HEAD_FEATHER: [(f32, f32); CursorGlow::LIGHT_BAND_HEAD_KNOTS + 1] = {
+                let knots = CursorGlow::LIGHT_BAND_HEAD_KNOTS;
+                let mut out = [(0.0f32, 0.0f32); CursorGlow::LIGHT_BAND_HEAD_KNOTS + 1];
+                let mut j = 0;
+                while j <= knots {
+                    let u = j as f32 / knots as f32;
+                    out[j] = (u, 1.0 - u * u * (3.0 - 2.0 * u));
+                    j += 1;
+                }
+                out
+            };
+            let head_cov = f32::from(head.cov);
+            let feather_span = dir * self.cwf * bed::DARK_BED_HEAD_FEATHER_CELLS;
+            let mut fi = 0;
+            while fi < LIGHT_BAND_HEAD_FEATHER.len() {
+                let (u, w) = LIGHT_BAND_HEAD_FEATHER[fi];
+                band_run.push(CometSample {
+                    x: from + feather_span * u,
+                    cov: (head_cov * w).round() as u8,
+                    ..head
+                });
+                fi += 1;
+            }
+        }
+        let run = if head_cut.is_some() {
+            &band_run[..]
+        } else {
+            run
         };
         let mut held_memo: Option<(u32, f32)> = None;
-        self.pass(under, verts, run, true, |s| {
+        let mut walked: Option<(f32, f32)> = None;
+        self.lay(verts, run, true, |s| {
             let (dy, reach, alpha, color) = band(s);
             let alpha = match tail {
                 Some((x0, dir)) => {
-                    let k = ((s.x - x0) * dir * self.inv_band_tail_w).clamp(0.0, 1.0);
+                    let along = if attach {
+                        let arc = match walked {
+                            Some((px, arc)) => arc + (s.x - px).abs(),
+                            None => 0.0,
+                        };
+                        walked = Some((s.x, arc));
+                        arc + self.cwf * 0.5
+                    } else {
+                        (s.x - x0) * dir
+                    };
+                    let k = (along * self.inv_band_tail_w).clamp(0.0, 1.0);
                     alpha * k * k * (3.0 - 2.0 * k)
                 }
                 None => alpha,
@@ -8621,7 +9427,7 @@ impl LightPassCtx<'_> {
                 let held = match held_memo {
                     Some((c, h)) if c == color => h,
                     _ => {
-                        let h = light_alpha_keeping(color, self.fg, self.bg, LIGHT_WIDE_BED_KEEP);
+                        let h = light_alpha_keeping(color, self.fg, self.bg, self.wide_keep);
                         held_memo = Some((color, h));
                         h
                     }
@@ -8631,6 +9437,37 @@ impl LightPassCtx<'_> {
                 (dy, reach, alpha, color)
             }
         });
+        // A band whose colour changes along it (the phaser's spectrum)
+        // lerps between its vertices, and halfway between two vivid inks it
+        // runs darker than either, each solved to hold the letters only at
+        // its own vertex: each step keeps its halfway point to the bar the
+        // letters keep over a body ([`BODY_CONTRAST_BAR`]), or over a wide
+        // glyph to its hold (`wide_keep`).
+        if let Some(first) = run.first() {
+            let clean = crate::color_math::contrast_ratio(self.fg, self.bg);
+            let body_keep = (BODY_CONTRAST_BAR + BODY_CONTRAST_GUARD) / clean.max(1.0);
+            let mut i = 1;
+            while i < verts.len() {
+                let (a, b) = (verts[i - 1], verts[i]);
+                let wide = self.wide_or_after_wide(&CometSample { x: a.x, ..*first })
+                    || self.wide_or_after_wide(&CometSample { x: b.x, ..*first });
+                let keep = if wide { self.wide_keep } else { body_keep };
+                if a.color != b.color && keep < 1.0 {
+                    let held = light_alpha_keeping(
+                        lerp_rgb(a.color, b.color, 0.5),
+                        self.fg,
+                        self.bg,
+                        keep,
+                    );
+                    if 0.5 * (a.cov + b.cov) > held {
+                        verts[i - 1].cov = a.cov.min(held);
+                        verts[i].cov = b.cov.min(held);
+                    }
+                }
+                i += 1;
+            }
+        }
+        self.raster(under, verts);
     }
 }
 
@@ -8698,9 +9535,15 @@ impl ParticleGridCtx<'_> {
 
     #[inline]
     const fn on_caret(&self, x: f32, y: f32) -> bool {
+        self.on_caret_padded(x, y, 0.0)
+    }
+
+    /// Whether `(x, y)` lies within the caret's reach widened by `pad_x` either side.
+    #[inline]
+    const fn on_caret_padded(&self, x: f32, y: f32, pad_x: f32) -> bool {
         matches!(
             self.caret_reach,
-            Some((x0, y0, x1, y1)) if x > x0 && x < x1 && y > y0 && y < y1
+            Some((x0, y0, x1, y1)) if x > x0 - pad_x && x < x1 + pad_x && y > y0 && y < y1
         )
     }
 

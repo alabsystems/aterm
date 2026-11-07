@@ -150,12 +150,13 @@ fn concluded_tasks_never_expire() {
         for why in [Some(WHY_LANDED), Some(WHY_USAGE_LIMIT), None] {
             let mut mark = TaskMark::new(state);
             mark.why = why;
-            let (record, _) = mark.apply(None, false, t, 1_000);
+            let (record, _) = mark.apply(None, &Default::default(), t, 1_000);
             assert!(settled(&record));
             assert_eq!(over(&record, t + LINGER * 100, None), None);
         }
     }
-    let (mut record, _) = TaskMark::new(TaskState::Working).apply(None, false, t, 1_000);
+    let (mut record, _) =
+        TaskMark::new(TaskState::Working).apply(None, &Default::default(), t, 1_000);
     record.trusted_cwd = Some(claim_folder());
     assert_eq!(over(&record, t + WORKER_FOR - MOMENT, None), None);
     assert_eq!(over(&record, t + WORKER_FOR, None), Some(Over::RanOut));

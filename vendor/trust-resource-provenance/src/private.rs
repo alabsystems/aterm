@@ -42,6 +42,14 @@ fn owned(file: &File, directory: bool) -> io::Result<()> {
     if if directory { !m.is_dir() } else { !m.is_file() || m.nlink() != 1 } {
         return Err(refused("provenance backing has wrong kind or link count"));
     }
+    require_no_acl_grants(file)?;
+    Ok(())
+}
+
+/// Read-only ACL admission shared with native owners. The caller must also
+/// check its required owner, kind, link count, POSIX modes and path custody.
+/// No cache, process, resource or proof authority is created by this check.
+pub fn require_no_acl_grants(file: &File) -> io::Result<()> {
     if acl_allows(file)? {
         return Err(refused("provenance backing ACL grants access"));
     }

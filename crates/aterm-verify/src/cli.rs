@@ -53,8 +53,8 @@ pub struct Args {
     /// at once, saying what it lacks. Neither lifts the run's own memory budget
     /// ([`crate::sched::memory_holders`]).
     pub admit: aterm_capacity::Admit,
+    /// `--test-threads`: the most libtest threads any test binary runs on.
     pub test_threads: Option<NonZeroU32>,
-    pub test_jobs: Option<NonZeroU32>,
     /// `--timeout`: `Some(None)` is `off`; `None` keeps the default ceiling.
     pub timeout: Option<Option<Duration>>,
     pub log: Option<PathBuf>,
@@ -62,9 +62,9 @@ pub struct Args {
     /// this tree before, each `<sha256> <spec>` on its own line; one whose executable still
     /// hashes so is carried, not run again ([`crate::testrun::carry`]).
     pub passed_binaries: Option<PathBuf>,
-    /// `--events <path>`: with `release`, the file each `check-finished` and
-    /// `test-binary-finished` line is appended to whole, apart from the output its children
-    /// share ([`crate::event_log`]): what its cutter keeps its records from.
+    /// `--events <path>`: the file each `check-finished` and `test-binary-finished` line is
+    /// appended to whole, apart from the output its children share ([`crate::event_log`]): what a
+    /// release's cutter keeps its records from, and `verify land` its judgment.
     pub events: Option<PathBuf>,
 }
 
@@ -181,7 +181,6 @@ where
                 }
             }
             "--test-threads" => a.test_threads = Some(count("--test-threads", &value(&flag)?)?),
-            "--test-jobs" => a.test_jobs = Some(count("--test-jobs", &value(&flag)?)?),
             "--timeout" => {
                 let v = value("--timeout")?;
                 match crate::exec::parse_ceiling(&v) {
@@ -318,9 +317,6 @@ where
                 .into(),
         );
     }
-    if a.events.is_some() && !a.release {
-        return usage("--events keeps a release's events; run it with `release`".into());
-    }
     Ok(a)
 }
 
@@ -426,6 +422,8 @@ Run aterm's checks in place, alone or in any combination.
   verify release --app <APP>      everything publication requires
   verify release --tree           its tree half: no bundle, nothing timed
   verify watch                    idle-capacity main samples; journaled verdicts, no gate
+  verify land                     merge main, judge the cone since it, push; compose a
+                                  moved main or re-judge its delta (`verify land --help`)
   verify release --bundle --app <APP>
                                   its bundle half, after the build and the tree
   verify list                     every check: sets, needs, what it runs
@@ -442,13 +440,15 @@ Run aterm's checks in place, alone or in any combination.
   verify browser-site DIR         the browser check's first half: both web
                                   modules built and the site laid in DIR
   verify browser-drive SITE OUT [--engine metal|swiftshader|firefox|webkit|safari]...
-                       [--admit wait|now]
+                       [--no-worker NAME]... [--admit wait|now]
                                   its second half: the sessions run on a laid
                                   site, frames in OUT (no targo: the Linux
                                   lane's guest); webkit and safari, whose pages
-                                  keep windows, only when named; safari's waits
-                                  for a quiet machine (--admit wait, the
-                                  default; under now it is could-not-run)
+                                  keep windows (WebKit's on macOS), only when
+                                  named; safari's waits for a quiet machine
+                                  (--admit wait, the default; under now it is
+                                  could-not-run); --no-worker leaves a
+                                  session's worker row out of the run's set
 
 Sets:
   dev      fmt census export-scan lint test doc (the default); its lint brings cells,
@@ -498,12 +498,11 @@ Options:
                           they claim fits together in what can ever be
                           available here (one that alone does not runs
                           with no other that claims memory)
-      --test-threads <n>  the widest RUST_TEST_THREADS a test binary is planned
-                          at (each binary's width comes from its last runs)
-      --test-jobs <n>     how many test binaries run at once (default: the
-                          share); the running binaries' charges stay within
-                          held CARGO_BUILD_JOBS, or host cores when no
-                          build-slot share is held
+      --test-threads <n>  RUST_TEST_THREADS ceiling for every test binary; each
+                          runs at the width its last runs call for, charged
+                          the cores it used, and the binaries running at
+                          once stay within held CARGO_BUILD_JOBS, or host
+                          cores when no build-slot share is held
       --timeout <s|off>   hang ceiling on each child's work (default 3h); its
                           waits for a lock or for room are left out
       --log <path>        where the full log goes (default: a new file in
@@ -512,8 +511,8 @@ Options:
                           with release and its test check: binaries that passed
                           in this tree, `<sha256> <spec>` per line; each whose
                           executable hashes the same is carried, not run again
-      --events <path>     with release: append each check-finished and
-                          test-binary-finished line there too, whole
+      --events <path>     append each check-finished and test-binary-finished
+                          line there too, whole
   -h, --help
 
 Exit: 0 every check that ran passed, 1 a check failed, 2 usage, 3 could not run.
@@ -608,8 +607,8 @@ mod tests {
     }
 
     /// `--passed-binaries` goes only with a release whose run holds `test`, the whole release's
-    /// or a resume's, and `--events` with any release. Negative control: dropping either rule
-    /// lets a dev `test --all` take it.
+    /// or a resume's; `--events` with any run (a release's cutter and `verify land` keep them).
+    /// Negative control: dropping the first rule lets a dev `test --all` take the binaries.
     #[test]
     fn a_release_resume_carries_the_binaries_that_passed_only_into_its_test_run() {
         assert_eq!(
@@ -645,10 +644,14 @@ mod tests {
                 "/a",
             ],
             &["test", "--all", "--passed-binaries", "/p"],
-            &["test", "--all", "--events", "/e"],
         ] {
             assert!(parse(args.iter().copied()).is_err(), "{args:?}");
         }
+        assert_eq!(
+            ok(&["--base", "abc", "--events", "/e"]).events.as_deref(),
+            Some(std::path::Path::new("/e")),
+            "a dev run keeps its events (verify land's judgment)"
+        );
     }
 
     /// `release --tree` and `release --bundle --app A` run its halves, both its whole set, and
@@ -718,7 +721,8 @@ mod tests {
             &["-p="],
             &["-p=--all"],
             &["-p", "--all"],
-            &["--test-jobs", "0"],
+            &["--test-threads", "0"],
+            &["--test-jobs", "2"],
             &["--timeout", "45m"],
             &["--admit", "later"],
             &["list", "fmt"],
@@ -756,8 +760,6 @@ mod tests {
         let a = ok(&[
             "test",
             "--test-threads=3",
-            "--test-jobs",
-            "2",
             "--timeout",
             "off",
             "--log",
@@ -767,7 +769,6 @@ mod tests {
             "main",
         ]);
         assert_eq!(a.test_threads.map(NonZeroU32::get), Some(3));
-        assert_eq!(a.test_jobs.map(NonZeroU32::get), Some(2));
         assert_eq!(a.timeout, Some(None));
         assert_eq!(a.log.as_deref(), Some(std::path::Path::new("/tmp/x.log")));
         assert!(a.no_windows);

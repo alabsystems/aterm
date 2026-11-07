@@ -1542,11 +1542,11 @@ fn an_outsider_minter_carries_no_host_list_and_a_vault_at_a_path_rotates_it() {
 }
 
 /// m7 lets in m44 on its own side, and m22, which never hears of it, re-keys Commons
-/// ([`rekey`]). m7 and m40..m43 take m22's `Epoch` and `Wrap`s but never its last record, so the
-/// batch never settles there, and m22 runs no pass. Each step every holder's vault pass runs,
-/// and what one signs reaches the others at the end of the step. Returns how many `Wrap`s hand
-/// m22's epoch to m44, and every `(epoch, recipient)` two `Wrap`s hand on.
-fn late_settle() -> (usize, Vec<(RecordId, Recipient)>) {
+/// ([`rekey`]): its `Epoch`, a `Wrap` to each of the six in recipient order, then its `Put`. m7
+/// and m40..m43 take the first `held` records of that batch and never the rest, and m22 runs no
+/// pass. Each step every holder's vault pass runs, and what one signs reaches the others at the
+/// end of the step ([`GapOfM44`]).
+fn gap_of_m44(held: usize) -> GapOfM44 {
     let lab = six();
     let (_m44, _, rec44) = let_in_by(&lab.macs, &lab.macs.m7, "m44", "m44");
     let wire = load_records(&lab.all[1]).unwrap().encode();
@@ -1559,54 +1559,107 @@ fn late_settle() -> (usize, Vec<(RecordId, Recipient)>) {
         !wrapped_by(&log_of(&lab.all[0]), &epoch).contains(&rec44),
         "CONTROL: m22 never heard of m44"
     );
+    assert_eq!(batch.len(), LATE + 2, "an `Epoch`, six `Wrap`s and a `Put`");
     let holders = &lab.all[1..];
-    let prefix = encode_records(&batch[..batch.len() - 1]);
+    let prefix = encode_records(&batch[..held]);
     for paths in holders {
         save_records(paths, &prefix).unwrap();
     }
+    let to_m44 = |record: &Record| {
+        matches!(
+            record.body(),
+            Body::Wrap { epoch: of, recipient, .. } if *of == epoch && *recipient == rec44
+        )
+    };
+    let rank = holders
+        .iter()
+        .zip(&lab.actors[1..])
+        .filter_map(|(paths, actor)| {
+            let log = log_of(paths);
+            let identity = read_identity(paths).unwrap().unwrap();
+            let opened = log.open_audience_entries(&identity).unwrap()?;
+            log.wrap_gaps(
+                &opened,
+                &crate::membership_log::admission_audiences(&opened),
+            )
+            .iter()
+            .filter(|gap| gap.epoch == epoch && gap.recipient == rec44)
+            .find_map(|gap| log.gap_rank(&opened, gap, actor))
+        })
+        .min()
+        .map(|rank| rank as u64);
     let t0 = aterm_time::unix_millis().unwrap_or(0);
+    let mut first = None;
     for k in 0..24 {
-        let signers: Vec<usize> = (0..holders.len())
-            .filter(|&i| {
-                !vault_pass_at(&holders[i], t0 + k * GAP_STEP_MS)
-                    .unwrap()
-                    .is_empty()
-            })
-            .collect();
+        let mut signers = Vec::new();
+        for (i, paths) in holders.iter().enumerate() {
+            let signed = vault_pass_at(paths, t0 + k * GAP_STEP_MS).unwrap();
+            if signed.iter().any(to_m44) {
+                first.get_or_insert(k);
+            }
+            if !signed.is_empty() {
+                signers.push(i);
+            }
+        }
         for i in signers {
             carry(holders, i);
         }
     }
     let union = union(holders);
-    let closed = union
-        .records()
-        .filter(|record| {
-            matches!(
-                record.body(),
-                Body::Wrap { epoch: of, recipient, .. } if *of == epoch && *recipient == rec44
-            )
-        })
-        .count();
+    let closed = union.records().filter(|record| to_m44(record)).count();
     lab.macs.server.stop();
-    (closed, duplicate_wraps(&union))
+    GapOfM44 {
+        closed,
+        first,
+        duplicates: duplicate_wraps(&union),
+        rank,
+    }
 }
 
-/// A wrap gap on a batch that settles late, or never, is closed once ([`late_settle`]): after
-/// [`log_entries::SETTLE_GRACE_MS`] the holders' ranks count a step apart from when the grace let
-/// the gap go, so one holder signs before the next looks, and no two `Wrap`s hand one epoch to
-/// one Mac.
+/// What [`gap_of_m44`] saw.
+struct GapOfM44 {
+    /// How many `Wrap`s hand m22's epoch to m44.
+    closed: usize,
+    /// The step the first of them was signed in.
+    first: Option<u64>,
+    /// Every `(epoch, recipient)` two `Wrap`s hand on.
+    duplicates: Vec<(RecordId, Recipient)>,
+    /// The best rank a holder has for m44's gap before the first step (`Log::gap_rank`, where
+    /// the gap is open by then): m22 holds a rank too, and runs no pass, so where it ranks first
+    /// the holders start at rank 1.
+    rank: Option<u64>,
+}
+
+/// What [`gap_of_m44`]'s holders take of m22's batch where it settles late, or never: its
+/// `Epoch` and every `Wrap` but the last, so a Mac m22 could wrap sorts above the last `Wrap`
+/// they hold and nothing tells them it is left out.
+const LATE: usize = 6;
+
+/// A wrap gap on a batch that settles late, or never, is closed once ([`gap_of_m44`] with
+/// [`LATE`]): after [`log_entries::SETTLE_GRACE_MS`] the holders' ranks count a step apart from
+/// when the grace let the gap go, so one holder signs before the next looks, and no two `Wrap`s
+/// hand one epoch to one Mac.
 ///
 /// NEGATIVE CONTROLS: with `GAPS_FROM_FIRST_SIGHT` (ranks counted from first sight, so the
 /// grace puts every rank due at once) or `remove::UNRANKED` (every holder first) two or more
 /// holders sign m44's `Wrap` in one step.
 #[test]
 fn a_gap_on_a_batch_that_settles_late_is_closed_once() {
-    let (closed, duplicates) = late_settle();
+    let GapOfM44 {
+        closed,
+        first,
+        duplicates,
+        ..
+    } = gap_of_m44(LATE);
     assert_eq!(closed, 1, "one holder hands m44 the epoch");
+    assert!(
+        first >= Some(log_entries::SETTLE_GRACE_MS / GAP_STEP_MS),
+        "healed at step {first:?}, before the grace"
+    );
     assert_eq!(duplicates, Vec::new(), "no duplicate wraps");
 
     log_entries::GAPS_FROM_FIRST_SIGHT.with(|cell| cell.set(true));
-    let (from_first_sight, _) = late_settle();
+    let from_first_sight = gap_of_m44(LATE).closed;
     log_entries::GAPS_FROM_FIRST_SIGHT.with(|cell| cell.set(false));
     assert!(
         from_first_sight >= 2,
@@ -1614,11 +1667,51 @@ fn a_gap_on_a_batch_that_settles_late_is_closed_once() {
     );
 
     remove::UNRANKED.with(|cell| cell.set(true));
-    let (unranked, _) = late_settle();
+    let unranked = gap_of_m44(LATE).closed;
     remove::UNRANKED.with(|cell| cell.set(false));
     assert!(
         unranked >= 2,
         "CONTROL: unranked holders close the gap {unranked} times"
+    );
+}
+
+/// One-mesh §11 H2: a gap of a batch whose `Wrap`s reach every Mac its minter could wrap heals
+/// at once ([`gap_of_m44`]). The holders take m22's `Epoch` and every `Wrap` of it, and never its
+/// `Put`, so no record of m22's says the batch is whole. Yet each Mac m22 could wrap holds a
+/// `Wrap` of it, and m44, a seat m22 never heard of, is none of them (a gap wherever it sorts):
+/// the batch reads settled as it arrives, and the best-ranked holder hands m44 the epoch at its
+/// rank's step from its first pass, once: step 0, or 1 where m22, which runs no pass, ranks first. A seat its minter could wrap, left out below its last `Wrap`, is the
+/// conformance walk's `OldMintUnder` (`gap_heal_conformance_tests.rs`).
+///
+/// NEGATIVE CONTROL: with `rekey::FRONTIER_BLIND` (a batch that ends in `Wrap`s reads as a prefix
+/// until its minter signs again, as before H2) no holder heals m44 before the settle grace.
+#[test]
+fn a_gap_below_a_settled_frontier_heals_at_once() {
+    let wraps = LATE + 1;
+    let GapOfM44 {
+        closed,
+        first,
+        duplicates,
+        rank,
+    } = gap_of_m44(wraps);
+    assert_eq!(closed, 1, "one holder hands m44 the epoch");
+    assert!(
+        rank.is_some_and(|rank| rank <= 1),
+        "a holder ranks first or second for m44's open gap: {rank:?}"
+    );
+    assert_eq!(
+        first, rank,
+        "at the best-ranked holder's step, from its first pass"
+    );
+    assert_eq!(duplicates, Vec::new(), "no duplicate wraps");
+
+    crate::membership_log::rekey::FRONTIER_BLIND.with(|cell| cell.set(true));
+    let GapOfM44 { closed, first, .. } = gap_of_m44(wraps);
+    crate::membership_log::rekey::FRONTIER_BLIND.with(|cell| cell.set(false));
+    assert_eq!(closed, 1, "CONTROL: the grace still closes it once");
+    assert!(
+        first >= Some(log_entries::SETTLE_GRACE_MS / GAP_STEP_MS),
+        "CONTROL: a frontier-blind holder heals m44 at step {first:?}, before the grace"
     );
 }
 
@@ -1630,8 +1723,8 @@ fn a_gap_on_a_batch_that_settles_late_is_closed_once() {
 /// every seated Mac neither removal names and not S, which no seat binds and so is no member
 /// (M1, M4), however a 0.154.0 batch wrapped it. Past the grace X re-keys over the prefix,
 /// carries the seated Macs in flight and leaves S out: no record marks a batch's end, so a
-/// whole one reads as a prefix until its minter signs again
-/// ([`a_batch_that_ends_in_wraps_holds_a_removal_only_the_settle_grace`]). Under the current
+/// whole one that could still wrap a Mac above its last `Wrap` reads as a prefix until its
+/// minter signs again ([`a_batch_that_ends_in_wraps_holds_a_removal_only_the_settle_grace`]). Under the current
 /// carry alone no batch wraps S at all, so it holds nothing: the hold matters only while a
 /// 0.154.0 Mac still mints.
 ///
@@ -1749,7 +1842,8 @@ fn removal_after_wrapped_retirement(
     (wraps, r, seatless, removed)
 }
 
-/// A whole batch that ends in `Wrap`s and left a Mac with no seat out reads as a prefix for good
+/// A whole batch that ends in `Wrap`s and left out a Mac with no seat that an earlier epoch
+/// wrapped and that sorts above its last `Wrap` reads as a prefix for good
 /// ([`removal_after_wrapped_retirement`]), yet holds a removal's re-key only the settle grace:
 /// once the grace, Z's and X's rank have passed, X rotates `[everyone]` without T and without S.
 ///

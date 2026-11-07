@@ -1406,6 +1406,29 @@ pub struct Custodian {
     pub retired: Vec<([u8; 16], Reason)>,
     /// Requests still waiting, and on whom.
     pub waiting: Vec<([u8; 16], String)>,
+    /// Requests whose copy or publication failed this pass, and the error: each waits alone,
+    /// and the next pass tries it again.
+    pub failed: Vec<([u8; 16], String)>,
+}
+
+impl Custodian {
+    /// The words every surface reports the pass in (`sync.requests`, `aterm secrets need
+    /// pass`): its counts, then how many failed and the first one's error.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let mut said = format!(
+            "custodian: {} published, {} handed to a person, {} retired, {} waiting",
+            self.published.len(),
+            self.asked.len(),
+            self.retired.len(),
+            self.waiting.len()
+        );
+        if let Some((_, why)) = self.failed.first() {
+            use std::fmt::Write as _;
+            let _ = write!(said, ", {} failed: {why}", self.failed.len());
+        }
+        said
+    }
 }
 
 enum Plan {
@@ -1426,10 +1449,13 @@ enum Plan {
 /// whether the vault holds the entry. A held entry is copied into the requester's own host
 /// section (matched by the recipient its Commons binding names) and published; one the vault
 /// lacks waits for the sweeps or the want window, then goes to a person when one can make it
-/// and is retired `not-held` when none can. Every decision is attested.
+/// and is retired `not-held` when none can. Every decision is attested. A copy the draft refuses,
+/// or a publication that fails, is the failure of the requests it carries alone
+/// ([`Custodian::failed`]): the pass's other decisions are committed all the same.
 ///
 /// # Errors
-/// The vault cannot be published, or the table cannot be read or written.
+/// The table's generation link or this Mac's vault facts cannot be read, the table cannot be
+/// read or written, this Mac is not a Commons Writer, or a decision cannot be signed or attested.
 pub fn custodian_pass(paths: &Paths) -> Result<Option<Custodian>> {
     custodian_pass_at(paths, now_ms())
 }
@@ -1513,13 +1539,22 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
                 asked,
             } => {
                 // The first entry answers the want; the others (a mailbox's TOTP) go with it
-                // where the vault holds them, and never without it.
+                // where the vault holds them, and never without it. A copy the draft refuses
+                // leaves the draft as this request found it, and the request waits alone.
+                let draft = admin.doc.clone();
                 let mut first = None;
+                let mut wrote = false;
+                let mut refused = None;
                 for entry in want.entries() {
-                    let (outcome, _) = admin
-                        .copy_to_requester(&recipient, &entry, want.if_absent())
-                        .map_err(crate::table::failure)?;
-                    changed |= outcome == Copied::Copied;
+                    let outcome =
+                        match admin.copy_to_requester(&recipient, &entry, want.if_absent()) {
+                            Ok((outcome, _)) => outcome,
+                            Err(error) => {
+                                refused = Some(error);
+                                break;
+                            }
+                        };
+                    wrote |= outcome == Copied::Copied;
                     if first.is_none() {
                         first = Some(outcome);
                         if !matches!(outcome, Copied::Copied | Copied::AlreadyThere) {
@@ -1527,6 +1562,14 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
                         }
                     }
                 }
+                if let Some(error) = refused {
+                    admin.doc = draft;
+                    report
+                        .failed
+                        .push((id, format!("the copy from vault text failed: {error}")));
+                    continue;
+                }
+                changed |= wrote;
                 match first.unwrap_or(Copied::NotHeld) {
                     Copied::Copied | Copied::AlreadyThere => copied.push((id, recipient)),
                     Copied::NoHost => report.waiting.push((
@@ -1567,14 +1610,22 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
             }
         }
     }
-    if !copied.is_empty() {
-        let seq = if !changed {
-            admin.seq()
-        } else {
-            client::admin_publish(paths, &admin, &admin.doc)
-                .map_err(crate::table::failure)?
-                .seq
-        };
+    // A publication that fails leaves every copy in it waiting, and nothing else: the pass's
+    // other decisions need no publication and are committed all the same.
+    let seq = match (copied.is_empty(), changed) {
+        (true, _) => None,
+        (false, false) => Some(admin.seq()),
+        (false, true) => match client::admin_publish(paths, &admin, &admin.doc) {
+            Ok(published) => Some(published.seq),
+            Err(error) => {
+                let why = format!("the vault's publication failed: {error}");
+                let failed = copied.iter().map(|(id, _)| (*id, why.clone()));
+                report.failed.extend(failed);
+                None
+            }
+        },
+    };
+    if let Some(seq) = seq {
         for (id, recipient) in copied {
             let mut body = Map::new();
             body.insert("vault".into(), Value::from(admin.config.name.clone()));

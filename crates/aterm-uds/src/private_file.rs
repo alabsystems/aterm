@@ -229,6 +229,10 @@ pub struct JudgedDir<'a> {
     judged: DirIs,
 }
 
+#[path = "private_file_dir.rs"]
+mod directory;
+pub use directory::{DirectoryView, PrivateDirectory};
+
 impl<'a> JudgedDir<'a> {
     /// `dir`'s verdict, taken now. A missing, linked, foreign or open directory is no error
     /// here: each [`Self::open`] refuses on it as [`open_private`] would.

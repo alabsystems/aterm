@@ -862,7 +862,7 @@ pub(super) fn ids(pid: u32) -> Option<(u32, i64, i64)> {
     }
 }
 
-fn process_group(pid: u32) -> Option<i64> {
+pub(super) fn process_group(pid: u32) -> Option<i64> {
     #[cfg(unix)]
     {
         let pid = libc::pid_t::try_from(pid).ok()?;
@@ -1228,12 +1228,15 @@ pub(super) trait Kernel {
             .filter(|(owner, _)| *owner == parent)
             .map(|(_, name)| name)
     }
-    fn process_start(&self, pid: u32) -> Option<String> {
-        kernel_start(pid)
-    }
-    fn restart_background(&self, pid: u32) -> Vec<String> {
-        live_background(pid)
-    }
+    /// `pid`'s kernel start ([`kernel_start`]; `None`: gone or unread), which the last look before
+    /// a signal holds to the start its session file names. Required, as
+    /// [`Self::restart_background`] is, so that no kernel reads the machine at that look unless it
+    /// says so.
+    fn process_start(&self, pid: u32) -> Option<String>;
+    /// The work under `pid` a restart would end ([`live_background`]; [`UNREADABLE_TABLE`] where
+    /// the process table was not read), which the last look before a signal requires to be none
+    /// unless the owner pressed the restart.
+    fn restart_background(&self, pid: u32) -> Vec<String>;
     fn image(&self, pid: u32) -> Option<PathBuf> {
         exe_of(pid)
     }
@@ -1274,6 +1277,14 @@ impl Kernel for Live {
 
     fn opener(&self, agent: u32, parent: u32) -> Option<String> {
         opener(agent, parent)
+    }
+
+    fn process_start(&self, pid: u32) -> Option<String> {
+        kernel_start(pid)
+    }
+
+    fn restart_background(&self, pid: u32) -> Vec<String> {
+        live_background(pid)
     }
 
     fn describe(&self, agent: u32, procs: &[(u32, String)]) -> Vec<upgrade::Held> {
@@ -3968,7 +3979,14 @@ pub(super) struct St {
     pub(super) salt: u64,
     pub(super) last_seq: u64,
     pub(super) seq_since_s: u64,
+    /// The agent process the record names. It is written only with [`Self::pid_start`]
+    /// ([`Self::bind`]), so its exit is judged by identity ([`Self::agent_exit`]).
     pub(super) pid: u32,
+    /// The kernel start of the process [`Self::pid`] names ([`kernel_start`]'s spelling), read
+    /// when the record bound it: what proves that process's exit once its pid is free or names
+    /// a process born at another time (a reboot reuses pids). Empty only in a record an earlier
+    /// build wrote, which takes the start of a snapshot naming its pid ([`Self::adopt_start`]).
+    pub(super) pid_start: String,
     pub(super) notice_pid: u32,
     pub(super) notice_start: String,
     pub(super) shell: u32,
@@ -5087,6 +5105,7 @@ impl St {
             ("to", &self.to),
             ("source", &self.source),
             ("marker", &self.marker),
+            ("pid_start", &self.pid_start),
             ("notice_start", &self.notice_start),
             ("relaunched_start", &self.relaunched_start),
             ("tab", &self.tab),
@@ -5407,6 +5426,7 @@ impl St {
             last_seq: n("last_seq"),
             seq_since_s: n("seq_since"),
             pid: small("pid"),
+            pid_start: s("pid_start"),
             notice_pid: small("notice_pid"),
             notice_start: s("notice_start"),
             shell: small("shell"),
@@ -5631,6 +5651,19 @@ impl St {
         if v.get("notices").is_none() {
             st.notices = upgrade_status::round_notices(&st.phase, &st.streak_why, st.stop_streak);
         }
+        if v.get("pid_start").is_none() {
+            // An earlier build's codex-alab, Muse Code or agy record wrote its agent's start as
+            // `proc_start`, beside `pid`, from the one snapshot it was filed on, and no step of
+            // those lanes rebinds either: the start that names its agent ([`Self::pid_start`]).
+            // A Claude Code record's `proc_start` is its upgrade notice's process, so it takes
+            // a start only from a snapshot of its pid ([`Self::adopt_start`]).
+            match st.agent {
+                upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => {
+                    st.pid_start = squash(&st.proc_start);
+                }
+                upgrade::Agent::Claude => {}
+            }
+        }
         let generation = v.get("native_generation").map_or(Some(0), Value::as_u64)?;
         let write_id = match v.get("native_write_id") {
             None => None,
@@ -5651,8 +5684,72 @@ impl St {
             || matches!(self.phase, Phase::Exiting { .. } | Phase::Relaunched { .. })
     }
 
-    pub(super) fn relaunched_gone(&self, alive: impl Fn(u32) -> bool) -> bool {
-        self.relaunched_pid != 0 && !alive(self.relaunched_pid)
+    /// Whether the agent the relaunch started ([`Self::relaunched_pid`]) is gone: its pid free,
+    /// or, where its start was recorded with it ([`Self::relaunched_start`]), born again as
+    /// another process.
+    /// `alive` and `start_of` are the kernel's answers for a pid.
+    pub(super) fn relaunched_gone(
+        &self,
+        alive: impl Fn(u32) -> bool,
+        start_of: impl Fn(u32) -> Option<String>,
+    ) -> bool {
+        self.relaunched_pid != 0
+            && (!alive(self.relaunched_pid)
+                || !self.relaunched_start.is_empty()
+                    && start_of(self.relaunched_pid)
+                        .is_some_and(|now| squash(&now) != self.relaunched_start))
+    }
+
+    /// Bind the agent process `pid`, born at `start` ([`kernel_start`]'s spelling): the writer of
+    /// [`Self::pid`] beside its start, so a record names its agent by identity. A stamp of an
+    /// exit ([`Self::exited_at`]) spoke of the agent bound before, so it goes with another one.
+    pub(super) fn bind(&mut self, pid: u32, start: &str) {
+        let start = squash(start);
+        if (self.pid, self.pid_start.as_str()) != (pid, start.as_str()) {
+            self.exited_at = 0;
+        }
+        self.pid = pid;
+        self.pid_start = start;
+    }
+
+    /// Take `start` as the start of [`Self::pid`] where a snapshot of `pid`, born at `start`,
+    /// names it and this record, written by an earlier build, recorded none: the identity the
+    /// host kept for its agent (the layout's, after a restore), as RS1 carries an earlier
+    /// host's restart by identity. A record that recorded its own start keeps it.
+    pub(super) fn adopt_start(&mut self, pid: u32, start: &str) {
+        if pid != 0 && self.pid == pid && self.pid_start.is_empty() {
+            self.pid_start = squash(start);
+        }
+    }
+
+    /// Whether this record's agent is the process `pid` born at `start`: the same pid, and the
+    /// same start where the record recorded one.
+    pub(super) fn names(&self, pid: u32, start: &str) -> bool {
+        self.pid == pid && (self.pid_start.is_empty() || self.pid_start == squash(start))
+    }
+
+    /// What the kernel says now of the agent this record names ([`super::relaunch::agent_exit`]).
+    pub(super) fn agent_exit(&self) -> super::relaunch::AgentExit {
+        self.agent_exit_by(alive, kernel_start)
+    }
+
+    /// [`Self::agent_exit`] by `alive` and `start_of`, the kernel's answers for a pid.
+    pub(super) fn agent_exit_by(
+        &self,
+        alive: impl Fn(u32) -> bool,
+        start_of: impl Fn(u32) -> Option<String>,
+    ) -> super::relaunch::AgentExit {
+        if self.pid == 0 {
+            // The record names no process: there is no exit to wait on.
+            return super::relaunch::AgentExit::Gone;
+        }
+        let live = alive(self.pid);
+        // Both starts in one spelling ([`Self::bind`] squashes the one it records).
+        let now = live
+            .then(|| start_of(self.pid))
+            .flatten()
+            .map(|now| squash(&now));
+        super::relaunch::agent_exit(&self.pid_start, live, now.as_deref())
     }
 
     pub(super) fn close_overtaken(&mut self, why: &str, now: u64) {
@@ -5716,7 +5813,7 @@ impl St {
         if self.native_retired_unissued
             || self.exited_at != 0
             || self.pid == 0
-            || !super::upgrade_wake::wait_exit(self.pid, Duration::ZERO)
+            || self.agent_exit() != super::relaunch::AgentExit::Gone
         {
             return false;
         }
@@ -5735,7 +5832,7 @@ impl St {
         if !ends
             || !matches!(self.phase, Phase::Exiting { .. })
             || self.pid == 0
-            || !super::upgrade_wake::wait_exit(self.pid, Duration::ZERO)
+            || self.agent_exit() != super::relaunch::AgentExit::Gone
         {
             return false;
         }
@@ -5865,6 +5962,7 @@ impl St {
     pub(super) fn signalled(
         &mut self,
         pid: u32,
+        start: &str,
         shell: u32,
         tab: &str,
         line: String,
@@ -5877,7 +5975,7 @@ impl St {
             markers: std::mem::take(&mut self.markers),
             fallback_from: self.fallback_from.clone(),
         };
-        self.pid = pid;
+        self.bind(pid, start);
         self.shell = shell;
         tab.clone_into(&mut self.tab);
         self.line = line;
@@ -7279,7 +7377,7 @@ pub(super) fn transcript_exists_in(claude_dir: &Path, session: &str) -> Option<b
     match std::fs::read_dir(claude_dir.join("projects")) {
         Ok(dirs) => Some(
             dirs.flatten()
-                .any(|e| e.file_type().is_ok_and(|t| t.is_dir()) && e.path().join(&name).is_file()),
+                .any(|e| crate::harness::entry_is_dir(&e) && e.path().join(&name).is_file()),
         ),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && claude_dir.is_dir() => Some(false),
         Err(_) => None,
@@ -8452,7 +8550,7 @@ pub(super) fn transcript_in(claude_dir: &Path, session: &str) -> Option<PathBuf>
         .ok()?
         .flatten()
     {
-        if !e.file_type().is_ok_and(|t| t.is_dir()) {
+        if !crate::harness::entry_is_dir(&e) {
             continue;
         }
         let p = e.path().join(&name);
@@ -10595,8 +10693,21 @@ fn visit_models(
         if st.tab != tab {
             return said(r, "wait:conversation-in-other-tab");
         }
-        if sf.pid == st.pid {
-            let r = said(r, "wait:exiting");
+        // The live process holding the conversation is the agent the restart waits on only by
+        // its pid and kernel start: one born at another time at that pid is another process
+        // (a reboot reuses pids), never the exit to wait for.
+        if st.names(sf.pid, &sf.proc_start) {
+            // A record an earlier build wrote names its agent by pid alone: the live process at
+            // that pid may be it or one born since, so it is neither waited on as the agent nor
+            // taken for another's resume of the conversation.
+            let r = said(
+                r,
+                if st.pid_start.is_empty() {
+                    super::relaunch::WAIT_EXIT_UNPROVEN
+                } else {
+                    "wait:exiting"
+                },
+            );
             note_stuck(opts, &r, &mut st, &sf.session_id, now_s());
             return r;
         }
@@ -11975,7 +12086,9 @@ fn orphans(opts: &Opts, files: &[SessionFile], live_tabs: Option<&[LiveTab]>) ->
             }
             continue;
         }
-        if alive(st.pid) {
+        // Held only by the agent the record names by pid and kernel start, never by another
+        // process at its pid (a reboot reuses them): that one would hold it here for good.
+        if st.agent_exit() != super::relaunch::AgentExit::Gone {
             note_stuck(opts, &r, &mut st, &session, now_s());
             continue;
         }
@@ -12909,7 +13022,7 @@ fn restart(
         let Ok(pid) = i32::try_from(sf.pid) else {
             break 'signal Some(said(r.clone(), "wait:pid"));
         };
-        let back = st.signalled(sf.pid, shell, tab, line, now_s());
+        let back = st.signalled(sf.pid, &sf.proc_start, shell, tab, line, now_s());
         st.back_line.clone_from(&back_line);
         st.account_intent = command
             .as_ref()
@@ -12958,7 +13071,9 @@ fn restart(
             st,
             &sf.session_id,
             super::contract::Scope::Upgrade,
-            &target.exe,
+            command
+                .as_ref()
+                .map_or(target.exe.as_path(), |command| command.target.as_path()),
             command.as_ref(),
             back_command.as_ref(),
         );

@@ -5,6 +5,12 @@
 
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
+// Trust's std hands a spawned child its stdio and nothing else; a pass-through command
+// (`spawnfd::transparent`) asks for upstream's inheritance back where std spawns it (`build.rs`).
+#![cfg_attr(
+    all(trust_std, unix, not(target_vendor = "apple")),
+    feature(trust_process_inherit_fds)
+)]
 #![cfg_attr(
     test,
     allow(
@@ -239,6 +245,8 @@ pub mod fdpass;
 /// Exclusive file-lock waits with bounded contention backoff and deadline rechecks.
 #[cfg(any(unix, windows))]
 pub mod file_lock;
+/// Path-aware file events, with optional debounce and content-stamp filtering.
+pub mod file_watch;
 
 /// Test support (test and debug builds): the `git` a fixture runs, isolated from this machine.
 #[cfg(all(any(test, debug_assertions), not(target_arch = "wasm32")))]
@@ -294,6 +302,9 @@ pub mod left;
 #[cfg(unix)]
 pub mod proc_connector;
 pub mod process;
+
+/// Atomic image-specific signalling available only from actual owned children.
+pub mod owned_signal;
 /// A kernel witness of a session's `exec`s (card engine §3.3): one kqueue per shell, its forks and the `exec`s and exits of its children and of the terminal's holder.
 #[cfg(unix)]
 pub mod procwatch;

@@ -11,8 +11,16 @@
 //! mid-write leaves a line with no line feed: the next append ends it first, so the fragment
 //! is a line of its own whose checksum fails, and every reader skips it as torn. Nothing is
 //! flushed to disk: a power loss may take the newest rows, which the reader shows as missing,
-//! never as wrong. The folder is the account's own (`0700`) and each file in it (`0600`): rows
-//! say what this account ran, and no other account reads them.
+//! never as wrong.
+//!
+//! A writer that could not append a row leaves a loss record in the folder
+//! (`lost-<writer>-<rows>`, [`mark_lost`]), with no lock; the next append of any writer, under
+//! the lock, takes each one it can remove and says their rows in a `kind=gap` line before its
+//! batch. So a row lost by a process that writes no other (a build's holder) is still said.
+//! The window's writer says its own losses in its next batch.
+//!
+//! The folder is the account's own (`0700`) and each file in it (`0600`): rows say what this
+//! account ran, and no other account reads them.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write as _};
@@ -156,16 +164,58 @@ impl Log {
     }
 
     /// Append `lines` (each sealed, ending in a line feed) as one write, rotating first when
-    /// they would take `rows.log` past its bound.
+    /// they would take `rows.log` past its bound, after a gap line for the folder's loss records
+    /// ([`mark_lost`]).
     ///
     /// # Errors
     /// The lock was not had within its wait ([`LOCK_WAIT`] unless [`Self::waiting`] set
     /// another), or a file could not be opened, renamed or written.
     pub fn append(&self, lines: &[String]) -> io::Result<Appended> {
-        if lines.is_empty() {
+        self.append_saying(0, lines).map_err(|(e, _)| e)
+    }
+
+    /// [`Self::append`] under one wait for the lock, its gap line also saying `said` rows the
+    /// caller lost and kept no record of (a direct writer's own count). The gap line is a write
+    /// of its own, so a batch that fails after it never leaves its rows to be said again. `Err`
+    /// says whether the gap line was written: where it was not, the folder's records it took are
+    /// left again as one, and the caller's `said` rows are still its own to say.
+    ///
+    /// # Errors
+    /// As [`Self::append`].
+    pub fn append_saying(
+        &self,
+        said: u64,
+        lines: &[String],
+    ) -> Result<Appended, (io::Error, bool)> {
+        if lines.is_empty() && said == 0 {
             return Ok(Appended::default());
         }
-        let _held = self.lock()?;
+        let _held = self.lock().map_err(|e| (e, false))?;
+        let taken = take_lost(&self.dir);
+        let mut gap = Appended::default();
+        if let Some(rows) = taken.checked_add(said).filter(|&rows| rows > 0) {
+            let line = [crate::row::gap_line(crate::now_ms(), rows)];
+            gap = match self.append_held(&line) {
+                Ok(done) => done,
+                Err(e) => {
+                    if taken > 0 {
+                        // Taken off the folder and not said: left again as one record.
+                        let _ = mark_lost(&self.dir, &fresh_writer("refold"), None, taken);
+                    }
+                    return Err((e, false));
+                }
+            };
+        }
+        let done = self.append_held(lines).map_err(|e| (e, true))?;
+        Ok(Appended {
+            lines: done.lines,
+            rotated: gap.rotated || done.rotated,
+            mended: gap.mended || done.mended,
+        })
+    }
+
+    /// [`Self::append`] with the lock held.
+    fn append_held(&self, lines: &[String]) -> io::Result<Appended> {
         let mut done = Appended {
             lines: lines.len(),
             ..Appended::default()
@@ -233,6 +283,74 @@ impl Log {
         }
         Ok(())
     }
+}
+
+/// The prefix of a loss record's name: `lost-<writer>-<rows>`.
+const LOST_PREFIX: &str = "lost-";
+
+/// A writer name for [`mark_lost`] no other writer of this account has: `<what>.<pid>.<ns>.<n>`,
+/// this process's id, the time it was made and a count of the names this process made.
+#[must_use]
+pub fn fresh_writer(what: &str) -> String {
+    static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let made = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let what: String = what.chars().filter(char::is_ascii_alphanumeric).collect();
+    format!("{what}.{}.{ns}.{made}", std::process::id())
+}
+
+/// Record that `writer` (a [`fresh_writer`] name) lost `rows` rows of the log in `dir`, with no
+/// lock, for the next append to say. `was` is the count the writer's record holds where it left
+/// one: that record is renamed to the sum, and where it is gone (an append took it) a new one is
+/// made, so a record is taken whole or not at all. The new count, or the error that left none.
+///
+/// # Errors
+/// The folder could not be made, or no record could be renamed or made.
+pub fn mark_lost(dir: &Path, writer: &str, was: Option<u64>, rows: u64) -> io::Result<u64> {
+    let name = |n: u64| dir.join(format!("{LOST_PREFIX}{writer}-{n}"));
+    if let Some(was) = was {
+        let now = was.saturating_add(rows);
+        match std::fs::rename(name(was), name(now)) {
+            Ok(()) => return Ok(now),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    own_dir(dir)?;
+    own_file(OpenOptions::new().write(true).create_new(true)).open(name(rows))?;
+    Ok(rows)
+}
+
+/// With the log's lock held: remove every loss record in `dir` ([`mark_lost`]) and return the
+/// rows they hold. A record renamed meanwhile is not removed here and not counted: the next
+/// append takes it under its new name.
+fn take_lost(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut rows = 0u64;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(count) = name.to_str().and_then(lost_rows) else {
+            continue;
+        };
+        if std::fs::remove_file(entry.path()).is_ok() {
+            rows = rows.saturating_add(count);
+        }
+    }
+    rows
+}
+
+/// The rows a loss record's file name holds: `lost-<writer>-<rows>`, at most `u32::MAX` (a name
+/// that says more is no record of this log's: left alone and not counted).
+fn lost_rows(name: &str) -> Option<u64> {
+    let (writer, rows) = name.strip_prefix(LOST_PREFIX)?.rsplit_once('-')?;
+    (!writer.is_empty() && !rows.starts_with('+'))
+        .then(|| rows.parse::<u32>().ok())
+        .flatten()
+        .map(u64::from)
 }
 
 /// Make `dir` (and any folder above it that is missing) the account's own: `0700` on Unix.
@@ -334,7 +452,7 @@ pub fn read(dir: &Path, files: u32, since_ms: Option<u64>) -> io::Result<Reading
                 }
                 LineSince::Gap { at_ms, dropped } => {
                     if at_ms >= since {
-                        out.dropped += dropped;
+                        out.dropped = out.dropped.saturating_add(dropped);
                     }
                 }
             }

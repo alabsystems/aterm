@@ -767,7 +767,7 @@ pub struct Ended {
     pub peak_bytes: Option<u64>,
     /// The most CPU a pass read its members (and the children they reaped) to have spent, ns.
     pub cpu_ns: Option<u64>,
-    /// Its last pass judged it stuck.
+    /// The last pass that read it live judged it stuck.
     pub stuck: bool,
 }
 
@@ -780,7 +780,7 @@ pub struct BlockMeter {
     pub block: u64,
     /// The largest lifetime-peak footprint a pass read of a member other than the shell, bytes.
     pub peak_bytes: Option<u64>,
-    /// Its last pass judged it stuck.
+    /// The last pass that read it live judged it stuck.
     pub stuck: bool,
 }
 

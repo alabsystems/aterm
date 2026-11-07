@@ -32,7 +32,7 @@ use astream_wire::sync::Digest;
 use aterm_json::{Map, Value, json};
 use aterm_secrets::client::Paths;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::Write,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -85,6 +85,11 @@ pub const USAGE: &str = "aterm db alab — the ALab lab model on Commons (Unix)\
   adopt [--dry-run|--apply]\n\
                     bind the Macs the vault's swarm roster names to their machine rows, by fleet\n\
                     node, host, then label or alias; never births a row\n\
+  merge [--dry-run|--apply]\n\
+                    fold each machine row that shares a name with a node-bound row into that\n\
+                    row (merged_into): the Mac's current name is its label and the others its\n\
+                    aliases, a cell only the duplicate holds moves, its preferences move. Prints\n\
+                    keys, labels and columns, never a value; rows it cannot decide are held\n\
   prefer <machine> <account> [--rank <n>]\n\
                     this machine prefers this account (smaller ranks are tried first). A\n\
                     mapping, never a limit: any other live account can still run there\n\
@@ -293,10 +298,11 @@ fn whole(name: &str, raw: &std::ffi::OsStr) -> Result<u64> {
 }
 
 /// The verbs `run` takes.
-const VERBS: [&str; 20] = [
+const VERBS: [&str; 21] = [
     "import",
     "check",
     "adopt",
+    "merge",
     "prefer",
     "unprefer",
     "roll",
@@ -327,7 +333,7 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
                 .ok_or_else(|| Error::new(&format!("{name} needs a value")))
         };
         match (verb, word.as_str()) {
-            ("import" | "adopt" | "roll" | "export", "--apply") => args.apply = true,
+            ("import" | "adopt" | "merge" | "roll" | "export", "--apply") => args.apply = true,
             ("import", flag @ ("--authoritative" | "--fill-only")) => {
                 let mode = if flag == "--authoritative" {
                     Mode::Authoritative
@@ -352,7 +358,9 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
                 }
                 args.compare = Some(value("--compare-sheet")?);
             }
-            ("import" | "adopt" | "roll" | "export", "--dry-run") => args.dry_run = true,
+            ("import" | "adopt" | "merge" | "roll" | "export", "--dry-run") => {
+                args.dry_run = true;
+            }
             ("import", "--review") => args.review = true,
             ("import", "--no-review") => args.review = false,
             ("import" | "adopt", "--findings") => args.findings = true,
@@ -649,6 +657,7 @@ pub fn run_io(
             }))
         }
         "adopt" => adopt(paths, &args, now_ms),
+        "merge" => merge(paths, &args),
         "roll" => roll(paths, &args, now_ms),
         "export" => super::export::run(paths, vendors, args.apply, now_ms / 1000),
         "prefer" | "unprefer" => prefer(paths, &args, verb == "prefer", now_ms),
@@ -810,20 +819,27 @@ pub(super) fn known_macs_from_roster(
                 .as_deref()
                 .and_then(aterm_net::fleet::NodeKey::from_hex)
                 .map(|key| aterm_net::fleet_member::node_principal(key)[2..].to_owned()),
+            fleet_node: member
+                .node_id
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .filter(|id| aterm_codec::hex::is_lower(id, 32)),
             hosts: Vec::new(),
         })
         .collect()
 }
 
-/// The Macs the vault's swarm roster names: label, aliases and fleet node.
+/// The Macs the vault's swarm roster names: label, aliases and fleet node. `None` when this Mac
+/// holds no copy of the roster.
+fn roster_macs(paths: &Paths) -> Result<Option<Vec<KnownMac>>> {
+    let roster = aterm_secrets::client::swarm_roster_until(paths, crate::admission::deadline())
+        .map_err(crate::table::failure)?;
+    Ok(roster.as_ref().map(known_macs_from_roster))
+}
+
+/// The Macs the vault's swarm roster names, none where this Mac holds no copy of it.
 fn known_macs(paths: &Paths) -> Result<Vec<KnownMac>> {
-    let Some(roster) =
-        aterm_secrets::client::swarm_roster_until(paths, crate::admission::deadline())
-            .map_err(crate::table::failure)?
-    else {
-        return Ok(Vec::new());
-    };
-    Ok(known_macs_from_roster(&roster))
+    Ok(roster_macs(paths)?.unwrap_or_default())
 }
 
 /// The harness files this import reads: those named, else the ones beside the vault sheet that
@@ -858,7 +874,6 @@ fn harness_sheets(
         .into_iter()
         .map(|name| (SheetKind::FleetAccounts, secrets.join(name)))
         .chain([(SheetKind::AiPool, secrets.join("ai-pool.toml"))])
-        .filter(|(_, path)| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()))
         .collect()
     };
     let everyone = everyone(paths);
@@ -870,9 +885,20 @@ fn harness_sheets(
             .and_then(|n| n.to_str())
             .ok_or_else(|| Error::new("a source's file name is not UTF-8"))?
             .to_owned();
+        // A file found is read through a final link like a named one; one absent (a dangling
+        // link included) or not a regular file is not there, and one there and unreadable is
+        // reported in `unread`.
+        let bytes = if named {
+            crate::import::read_bounded(&path).ok()
+        } else {
+            match crate::import::read_bounded_if_file(&path) {
+                Ok(None) => continue,
+                Ok(Some(bytes)) => Some(bytes),
+                Err(_) => None,
+            }
+        };
         // Never the parser's own words, which may quote a row.
-        let read = everyone.as_ref().and_then(|(_, key)| {
-            let bytes = crate::import::read_bounded(&path).ok()?;
+        let read = everyone.as_ref().zip(bytes).and_then(|((_, key), bytes)| {
             let text = std::str::from_utf8(&bytes).ok()?;
             let rows = vendors.stated(kind, &name, text).ok()?;
             Sheet::stated(kind, &name, &bytes, &rows, key).ok()
@@ -1163,8 +1189,8 @@ pub(super) fn empty_view_wait<'r>(
         else {
             continue;
         };
-        let deferred =
-            round.outcome == RepairOutcome::Deferred || round.deferred.is_some_and(|n| n > 0);
+        let deferred = matches!(round.outcome, RepairOutcome::Deferred(_))
+            || round.deferred.is_some_and(|n| n > 0);
         let exchanged = matches!(
             round.outcome,
             RepairOutcome::Exchanged | RepairOutcome::NoCommonTable
@@ -1717,6 +1743,71 @@ fn adopt(paths: &Paths, args: &Args, now_ms: u64) -> Result<Value> {
     let plan = import::plan(&input, &view.cells)?;
     let mut report = summary(&plan, &[], &macs, "held", args.findings);
     insert(&mut report, "dry_run", json!(true));
+    insert(
+        &mut report,
+        "records",
+        json!(crate::att::pack(plan.rows)?.len()),
+    );
+    Ok(report)
+}
+
+/// `merge`: the registry's duplicate machine rows folded into their node-bound rows, planned over
+/// what this Mac holds; `--apply` plans again under the writer.
+/// What `merge` would do over `view`: the machines any Mac's own facts row names move only by it.
+pub(super) fn merge_plan(
+    view: &att::View,
+    roster: &super::merge::Roster,
+) -> Result<super::merge::Plan> {
+    let facts = view.owned.get(registry::MACHINE_FACTS.name);
+    let bound: BTreeSet<String> = facts
+        .into_iter()
+        .flat_map(|facts| facts.rows.values())
+        .flat_map(|row| ["mac", "merged_into"].map(|column| row.value.get(column)))
+        .filter_map(|cell| cell.and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    super::merge::plan(
+        &view.project(&MACHINE),
+        &view.project(&PREFERENCE),
+        &bound,
+        roster,
+    )
+}
+
+fn merge(paths: &Paths, args: &Args) -> Result<Value> {
+    // Which name is a Mac's current one, and whether two names are two Macs, is the roster's word:
+    // without it a merge would fold what it would hold and keep names it would change.
+    let roster: super::merge::Roster = roster_macs(paths)?
+        .ok_or_else(|| Error::new("merge reads the roster, and this Mac holds no copy of it"))?
+        .iter()
+        .filter_map(|mac| {
+            let label = mac.label.as_ref()?.canonical();
+            let stated = [("node", &mac.node), ("fleet_node", &mac.fleet_node)]
+                .into_iter()
+                .filter_map(|(column, node)| Some((column, node.clone()?)))
+                .collect();
+            Some((label, stated))
+        })
+        .collect();
+    let planned = |view: &att::View| merge_plan(view, &roster);
+    let cells = |rows: &[Vec<crate::database::Change>]| rows.iter().map(Vec::len).sum::<usize>();
+    let handle = Handle::at(paths.clone(), &att::REGISTRY);
+    if args.apply {
+        let (mut report, applied) = handle.commit_owner(|view| {
+            let mut plan = planned(view)?;
+            let rows = std::mem::take(&mut plan.rows);
+            Ok((plan.report(), rows))
+        })?;
+        insert(&mut report, "dry_run", json!(false));
+        insert(&mut report, "records", json!(applied.records));
+        insert(&mut report, "written", json!(applied.cells));
+        return Ok(report);
+    }
+    let view = handle.view()?;
+    let plan = planned(&view)?;
+    let mut report = plan.report();
+    insert(&mut report, "dry_run", json!(true));
+    insert(&mut report, "complete", json!(view.complete));
+    insert(&mut report, "cells", json!(cells(&plan.rows)));
     insert(
         &mut report,
         "records",

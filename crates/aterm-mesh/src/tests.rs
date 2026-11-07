@@ -1155,16 +1155,22 @@ fn with_reused_incarnation_a_restart_reuses_numbers() {
     );
 }
 
-/// A neighbour that stopped uncleanly and came back in another boot finds its logs at a new
-/// generation, with lineage: each relay to it resumes its cursor, so every table record that
-/// landed while it was away reaches it, none skipped.
+/// A neighbour that stopped uncleanly and came back in another boot finds its tables log at a
+/// new generation, with lineage, where that log served a weak tier (Ordered, on Apple), and at
+/// the same identity where it served Strict (Ordered off Apple, which has no barrier), whose
+/// acks were on stable media: either way each relay to it resumes its cursor, so every table
+/// record that landed while it was away reaches it, none skipped.
 #[test]
 fn a_neighbour_back_from_a_reboot_gets_what_it_missed() {
     let lab = Lab::new();
     let mut macs = lab_of(&lab, 2);
     macs[0].table("10", "before");
     macs[1].until_held(MeshLog::Tables, "/t/>", &["before"]);
-    let was = macs[1].mesh().broker(MeshLog::Tables).log_identity();
+    let tables = macs[1].mesh().broker(MeshLog::Tables);
+    let (was, weak) = (
+        tables.log_identity(),
+        tables.served_durability().served != astream_broker::Tier::Strict,
+    );
     for log in MeshLog::ALL {
         macs[1].mesh().broker(log).arm_unclean_stop();
     }
@@ -1192,8 +1198,8 @@ fn a_neighbour_back_from_a_reboot_gets_what_it_missed() {
     .expect("B starts again, in another boot");
     let now = macs[1].mesh().broker(MeshLog::Tables).log_identity();
     assert!(
-        now.id == was.id && now.generation > was.generation,
-        "the reboot moved {was} to {now}"
+        now.id == was.id && (now.generation > was.generation) == weak,
+        "the reboot moved {was} to {now} (weak tier: {weak})"
     );
     macs[1].until_held(
         MeshLog::Tables,

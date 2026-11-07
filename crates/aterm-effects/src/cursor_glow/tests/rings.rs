@@ -1831,3 +1831,154 @@ fn the_one_colour_ring_is_whole_or_not_drawn_in_a_split_s_pane() {
         "a landing in a pane's middle: drawn {drawn}, past {past}, whole {whole}"
     );
 }
+
+/// After-land lows W1: paper Water's landing ripple spreads in the leading under the caret's
+/// row and lays no ink inside the row itself. Composed r3 laid a whole ellipse through the
+/// row: the letters' guard took its left arcs, and its right ones stood beside the caret as a
+/// `)` (the paper card at motion-0900, block and bar). At every point of its life the ripple
+/// lays nothing in the caret's row, and still spreads at least two cells wide under it. The
+/// control lays the composed r3 ripple, whose arcs light the row right of the caret.
+#[test]
+fn paper_water_s_ripple_lays_no_bracket_beside_the_caret() {
+    let g = tall_geom();
+    let (row, col) = (3u16, 20u16);
+    let (cx, cy) = g.cell_center(row, col);
+    let born = Instant::now();
+    let ring = Ring {
+        cx,
+        cy,
+        born,
+        life: 0.30,
+        scale: 1.0,
+        caret: Some((row, col)),
+    };
+    let mut c = cfg(GlowStyle::Water, true);
+    c.dark_theme = false;
+    let (top, bot) = (
+        i32::from(row) * g.ch as i32,
+        i32::from(row + 1) * g.ch as i32,
+    );
+    let right_of_caret = (i32::from(col) + 1) * g.cw as i32;
+    let ripples = |whole: bool, ms: u64| -> Vec<GlowQuad> {
+        let glow = CursorGlow {
+            ring: Some(ring),
+            water_paper_ripple_whole: whole,
+            ..Default::default()
+        };
+        let (mut out, mut halos) = (Vec::new(), Vec::new());
+        glow.emit_ring(
+            born + Duration::from_millis(ms),
+            &c,
+            g,
+            Some((row, col)),
+            &mut out,
+            &mut halos,
+        );
+        assert!(halos.is_empty(), "the paper ripples are quads");
+        out.retain(|q| q.color != 0 && q.alpha > 0);
+        out
+    };
+    let in_row = |quads: &[GlowQuad]| {
+        quads
+            .iter()
+            .filter(|q| (top..bot).contains(&i32::from(q.y)))
+            .count()
+    };
+    let mut control_bracket = 0;
+    for ms in [20u64, 60, 100, 150, 200, 250] {
+        let quads = ripples(false, ms);
+        assert_eq!(
+            in_row(&quads),
+            0,
+            "{ms} ms: the ripple lights the caret's row"
+        );
+        let (x0, x1) = quads.iter().fold((i32::MAX, i32::MIN), |(a, b), q| {
+            (a.min(i32::from(q.x)), b.max(i32::from(q.x + q.w)))
+        });
+        assert!(
+            x1 - x0 >= 2 * g.cw as i32,
+            "{ms} ms: the ripple spreads under the caret: {x0}..{x1}"
+        );
+        control_bracket += ripples(true, ms)
+            .iter()
+            .filter(|q| (top..bot).contains(&i32::from(q.y)) && i32::from(q.x) >= right_of_caret)
+            .count();
+    }
+    assert!(
+        control_bracket > 0,
+        "control: composed r3's ripple stands in the row right of the caret"
+    );
+}
+
+/// The review of W1: paper Water's landing ripple spreads on the grid's last row too, where a
+/// filled screen's prompt sits. W1's ripple lies in the leading under the caret's row, and the
+/// last row has none: every quad fell past the effects box and the landing spread nothing at
+/// any point of its life. There it lies in the row's own foot, as shallow as the depth it
+/// keeps ([`CursorGlow::WATER_PAPER_RIPPLE_LAST_ROW_DEPTH`]), so its wings do not stand beside
+/// the caret as W1's `)`, and still spreads at least two cells wide, seen whole (the box's edge
+/// fade is for a light that crosses the box). The control keeps it to the leading.
+#[test]
+fn paper_water_s_ripple_spreads_on_the_last_row() {
+    let g = tall_geom();
+    let (last, col) = (g.rows as u16 - 1, 20u16);
+    let born = Instant::now();
+    let mut c = cfg(GlowStyle::Water, true);
+    c.dark_theme = false;
+    let bottom = g.rows as i32 * g.ch as i32;
+    let depth = (g.ch as f32 * CursorGlow::WATER_PAPER_RIPPLE_LAST_ROW_DEPTH).ceil() as i32;
+    let ripples = |row: u16, leading_only: bool, ms: u64| -> Vec<GlowQuad> {
+        let (cx, cy) = g.cell_center(row, col);
+        let ring = Ring {
+            cx,
+            cy,
+            born,
+            life: 0.30,
+            scale: 1.0,
+            caret: Some((row, col)),
+        };
+        let glow = CursorGlow {
+            ring: Some(ring),
+            water_paper_ripple_leading_only: leading_only,
+            ..Default::default()
+        };
+        let (mut out, mut halos) = (Vec::new(), Vec::new());
+        glow.emit_ring(
+            born + Duration::from_millis(ms),
+            &c,
+            g,
+            Some((row, col)),
+            &mut out,
+            &mut halos,
+        );
+        out.retain(|q| q.color != 0 && q.alpha > 0);
+        out
+    };
+    let peak = |quads: &[GlowQuad]| quads.iter().map(|q| q.alpha).max().unwrap_or(0);
+    for ms in [20u64, 60, 100, 150, 200, 250] {
+        let quads = ripples(last, false, ms);
+        assert!(!quads.is_empty(), "{ms} ms: the landing lays no ripple");
+        for q in &quads {
+            let (y0, y1) = (i32::from(q.y), i32::from(q.y) + i32::from(q.h));
+            assert!(
+                y0 >= bottom - depth - 1 && y1 <= bottom,
+                "{ms} ms: {y0}..{y1} leaves the row's foot, {depth} px over {bottom}"
+            );
+        }
+        let (x0, x1) = quads.iter().fold((i32::MAX, i32::MIN), |(a, b), q| {
+            (a.min(i32::from(q.x)), b.max(i32::from(q.x + q.w)))
+        });
+        assert!(
+            x1 - x0 >= 2 * g.cw as i32,
+            "{ms} ms: the ripple spreads under the caret: {x0}..{x1}"
+        );
+        assert_eq!(
+            peak(&quads),
+            peak(&ripples(3, false, ms)),
+            "{ms} ms: the last row's ripple is as bright as another row's"
+        );
+        assert!(
+            ripples(last, true, ms).is_empty(),
+            "control: {ms} ms: kept to the leading it lays nothing on the last row"
+        );
+    }
+}

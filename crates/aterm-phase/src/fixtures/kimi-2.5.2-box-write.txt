@@ -1,0 +1,51 @@
+# kimi 2.5.2 · MEASURED 2026-11-06, `aterm ctl text` of an `aterm-lab kimi` instance (a private headless aterm, 144x50, aterm 0.161.0, a debug build of main) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login, in a project folder that is no git work tree (so Kimi asks before writing) · the stub's `tool` mode asks for `Write` `{path: <proj>/notes-for-the-lab.txt, content: "a line\n"}`: in the composer's place the approval panel `▶ Write this file?`, its file block (the path two columns in from the rules, then the numbered content), four numbered choices, `1. Approve once` focused, and the key row `↑/↓ select · 1/2/3/4 choose · ↵ confirm · ctrl+e preview` · the lab's random project dir is spelled /private/tmp/at.H2aa here
+
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                                                            │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                                                            │
+ │  ▐█████▌  Send /help for help information.                                                                                                 │
+ │                                                                                                                                            │
+ │  Directory: /private/tmp/at.H2aa/proj                                                                                                      │
+ │  Session:   session_0d138b75-1ec2-4237-87e7-a9f71e396dfd                                                                                   │
+ │  Model:     lab-model                                                                                                                      │
+ │  Version:   2.5.2                                                                                                                          │
+ │                                                                                                                                            │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+   No session yet — one will be created on your first message.
+
+ ❯ toolstart write the notes
+
+ ● Using Write (/private/tmp/at.H2aa/proj/notes-for-the-lab.txt)
+      1  a line
+      2
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ▶ Write this file?
+
+   /private/tmp/at.H2aa/proj/notes-for-the-lab.txt
+      1  a line
+      2
+
+   ▶ 1. Approve once
+     2. Approve for this session
+     3. Reject
+     4. Reject with feedback
+
+   ↑/↓ select · 1/2/3/4 choose · ↵ confirm · ctrl+e preview
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ lab-model  …/tmp/at.H2aa/proj                                                                                             /model: switch model
+                                                                                                                         context: 1% (85/97.7k)
+
+
+
+
+
+
+
+
+
+
+
+
+
+

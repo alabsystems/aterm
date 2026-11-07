@@ -7,7 +7,9 @@ use std::io::Write;
 
 use aterm_phase::{Opt, QuestionDialog, QuestionForm, QuestionOption, Role};
 
-use super::super::policy::approval::{Answer, AnswerTarget, Choice, Decision, QuestionPriority};
+use super::super::policy::approval::{
+    Answer, AnswerTarget, Choice, Decision, PriorityWord, QuestionPriority,
+};
 use super::super::policy::question::{
     Pane, answer_question, focus_position, recommended_set, target_focus,
 };
@@ -16,7 +18,8 @@ use super::*;
 
 /// No question dialog on the screen.
 pub const EXIT_NO_BOX: u8 = 1;
-/// The answer does not fit the dialog, or `--box` names another: nothing typed.
+/// The answer does not fit the dialog, `--box` names another, or the program is read, not
+/// supervised: nothing typed.
 pub const EXIT_REFUSED: u8 = 2;
 /// A key the host or the dialog did not take as decided.
 pub const EXIT_NOT_SERVED: u8 = 3;
@@ -111,7 +114,7 @@ fn option_named<'a>(options: &'a [QuestionOption], word: &str) -> Option<&'a Que
         .find(|o| o.label.trim().eq_ignore_ascii_case(word))
 }
 
-fn policy_refusal(answer: &str, who: &str, p: QuestionPriority) -> String {
+fn policy_refusal(answer: &str, who: &str, p: PriorityWord) -> String {
     format!(
         "{answer:?} is a question policy, not an answer: `aterm ctl {who} meta set questions \
          {}` has the window answer this session's questions by it (an answer here is an \
@@ -121,7 +124,7 @@ fn policy_refusal(answer: &str, who: &str, p: QuestionPriority) -> String {
 }
 
 fn names_no_option(answer: &str, who: &str) -> String {
-    match QuestionPriority::parse(answer).filter(|p| p.text().is_some()) {
+    match PriorityWord::parse(answer).filter(|p| p.text().is_some()) {
         Some(p) => policy_refusal(answer, who, p),
         None => format!("{answer:?} names no option: a free-text answer is a person's to type"),
     }
@@ -199,7 +202,7 @@ fn plan(
             )),
         };
     }
-    let policy = QuestionPriority::parse(answer).filter(|p| p.text().is_some());
+    let policy = PriorityWord::parse(answer).filter(|p| p.text().is_some());
     let free_text = || names_no_option(answer, who);
     match &dialog.form {
         QuestionForm::Single { options, .. } | QuestionForm::Preview { options, .. } => {
@@ -415,6 +418,20 @@ impl<C: Ctl> Session<'_, C> {
                 EXIT_NO_BOX,
             );
         };
+        // A program the supervisor does not host (`aterm_phase::Program::supervisable`) is read,
+        // never answered: its reader names its question for display, and the question is a
+        // person's.
+        let program = reader.program();
+        if !program.supervisable() {
+            return say(
+                format!(
+                    "REFUSED {who} {} is read, not supervised: its question is a person's, \
+                     nothing typed",
+                    program.product()
+                ),
+                EXIT_REFUSED,
+            );
+        }
         if let (Some(want), Some(on)) = (&opts.box_token, prompt_box_token(&prompt))
             && !on.eq_ignore_ascii_case(want.trim())
         {

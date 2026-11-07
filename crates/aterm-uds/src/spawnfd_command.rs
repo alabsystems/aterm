@@ -378,6 +378,49 @@ impl Command {
         Ok(self)
     }
 
+    /// Preserve exact already-owned descriptor numbers across an in-place
+    /// native exec, including slots3/4. Ordinary guard inheritance deliberately
+    /// relocates those reserved bridge slots. No mapping or occupied-number
+    /// replacement is performed here; every source remains its own target.
+    /// A native exec privately copies its sources before applying file actions.
+    /// This supplies no resource entitlement or authority to adopt raw slots.
+    #[cfg(unix)]
+    pub fn inherit_exec_guards(&mut self, guards: Vec<OwnedFd>) -> io::Result<&mut Self> {
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = guards;
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "exact exec guards require the native Apple launch boundary",
+            ));
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            let mut targets = std::collections::BTreeSet::new();
+            if guards.len() > super::MAX_GUARD_FDS
+                || guards.iter().any(|guard| {
+                    let fd = guard.as_raw_fd();
+                    !(3..super::ACTION_FD_LIMIT).contains(&fd) || !targets.insert(fd)
+                })
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid original exec guard slots",
+                ));
+            }
+            let mut placed = Vec::with_capacity(guards.len());
+            for source in guards {
+                crate::keep_out_of_children(&source)?;
+                placed.push(Guard {
+                    target: source.as_raw_fd(),
+                    source,
+                });
+            }
+            self.guards = placed;
+            Ok(self)
+        }
+    }
+
     /// Inherit these owned descriptions at explicit child-only descriptor numbers.
     /// Private source copies are kept off every target before native file actions;
     /// no occupied descriptor in this process is replaced or unmarked.
@@ -391,10 +434,10 @@ impl Command {
         #[cfg(not(target_vendor = "apple"))]
         {
             let _ = guards;
-            return Err(io::Error::new(
+            Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "mapped guards need native spawn actions",
-            ));
+            ))
         }
         #[cfg(target_vendor = "apple")]
         {
@@ -872,6 +915,10 @@ pub struct Child {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rusage {
     pub status: ExitStatus,
+    /// CPU time spent in user mode, as reported by the owning kernel wait.
+    pub user: std::time::Duration,
+    /// CPU time spent in kernel mode, as reported by the same owning wait.
+    pub system: std::time::Duration,
     /// User plus system CPU time.
     pub cpu: std::time::Duration,
     /// The largest process's resident peak, in bytes on every host.
@@ -1242,14 +1289,28 @@ impl Command {
     /// Replace this process with the program (`POSIX_SPAWN_SETEXEC`): it holds this process's
     /// stdio and explicitly named guards. This process's own table is untouched if exec fails.
     pub fn exec(&mut self) -> io::Error {
-        match self.launch(Fallback::Inherit, true, true) {
+        match self.launch(Fallback::Inherit, true, true, false) {
             Ok(_) => io::Error::other("the exec returned a child"),
             Err(error) => error,
         }
     }
 
+    /// Replace this process and stop the activated image before user code.
+    /// The original parent must own and acknowledge the new kernel stop, check
+    /// the selected image and policy, and explicitly resume the same child.
+    /// This creates no child or resource grant. Ordinary [`Self::exec`] keeps
+    /// refusing suspended exec; mapped guards, disclaim and tether also retain
+    /// their existing refusals. A failed exec preserves this process's table.
+    pub fn exec_suspended(&mut self) -> io::Error {
+        self.suspended = true;
+        match self.launch(Fallback::Inherit, true, true, true) {
+            Ok(_) => io::Error::other("the suspended exec returned a child"),
+            Err(error) => error,
+        }
+    }
+
     fn start(&mut self, fallback: Fallback, needs_stdin: bool) -> io::Result<Child> {
-        let (pid, [stdin, stdout, stderr]) = self.launch(fallback, needs_stdin, false)?;
+        let (pid, [stdin, stdout, stderr]) = self.launch(fallback, needs_stdin, false, false)?;
         Ok(Child {
             stdin: stdin.map(ChildStdin::from),
             stdout: stdout.map(ChildStdout::from),
@@ -1271,6 +1332,7 @@ impl Command {
         fallback: Fallback,
         needs_stdin: bool,
         replace: bool,
+        suspended_exec: bool,
     ) -> io::Result<(i32, [Option<OwnedFd>; 3])> {
         use super::{
             F_GETFD, F_SETFD, FD_CLOEXEC, Image, Placement, Source, c_string, fcntl, placeable,
@@ -1294,7 +1356,7 @@ impl Command {
                 "an exec cannot disclaim responsibility: spawn the disclaimed child instead",
             ));
         }
-        if replace && self.suspended {
+        if replace && self.suspended && !suspended_exec {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "an exec cannot start suspended: spawn the child instead",
@@ -1592,6 +1654,13 @@ const SIG_SETMASK: i32 = 2;
 
 #[cfg(not(target_vendor = "apple"))]
 impl Command {
+    /// This platform has no qualified same-process suspended exec boundary.
+    pub fn exec_suspended(&mut self) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "suspended exec requires the native Apple launch boundary",
+        )
+    }
     /// Replace this process with the program: [`super::InheritStrip`] marks this process's own table first, so a failed exec leaves every descriptor close-on-exec ([`super::InheritNothing`] says what that means). Explicit guards are refused before that strip: their fork-only inheritance hook cannot safely modify this process's table on an exec failure.
     pub fn exec(&mut self) -> io::Error {
         use std::os::unix::process::CommandExt as _;
@@ -1614,6 +1683,7 @@ impl Command {
     }
 
     fn start(&mut self, fallback: Fallback, needs_stdin: bool) -> io::Result<Child> {
+        super::note_spawn();
         let mut command = self.forked()?;
         if self.stdin.is_none() && !needs_stdin {
             command.stdin(std::process::Stdio::null());
@@ -1715,7 +1785,12 @@ impl Command {
             reason = "spawnfd's own Command, with its explicit descriptor policy installed before the native process hook"
         )]
         let mut command = std::process::Command::new(&self.program);
-        if !self.inherit_all {
+        if self.inherit_all {
+            // Trust's std strips every descriptor above stdio from a child unless told not to;
+            // upstream's std hands on the whole non-close-on-exec table by itself.
+            #[cfg(trust_std)]
+            command.inherit_all_fds();
+        } else {
             command.inherit_nothing();
         }
         command.args(&self.args);

@@ -2404,7 +2404,7 @@ fn muse_active_session_lock(
             .into_iter()
             .flatten()
             .flatten()
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter(crate::harness::entry_is_dir)
             .map(|e| e.path())
             .collect();
         out.sort();

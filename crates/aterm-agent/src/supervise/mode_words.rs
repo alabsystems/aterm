@@ -288,6 +288,7 @@ mod tests {
             check: false,
             said: said.to_owned(),
             at_ms: 0,
+            statement: crate::harness::land_receipt::Statement::Unread,
         }
     }
 

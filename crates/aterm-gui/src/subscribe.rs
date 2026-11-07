@@ -4198,9 +4198,14 @@ mod tests {
         exited.result_path = Some(std::path::PathBuf::from("/s/tasks/r"));
         {
             let mut t = timeline.lock().unwrap();
-            let _ = t.mark_task(&TaskMark::new(TaskState::Working), false, now, 1);
-            let _ = t.mark_task(&exited, false, now, 2);
-            let _ = t.mark_task(&exited, false, now, 3);
+            let _ = t.mark_task(
+                &TaskMark::new(TaskState::Working),
+                &Default::default(),
+                now,
+                1,
+            );
+            let _ = t.mark_task(&exited, &Default::default(), now, 2);
+            let _ = t.mark_task(&exited, &Default::default(), now, 3);
         }
         let mut out = String::new();
         let wm = drain_timeline_events(&timeline.lock().unwrap(), "7", seeded, &mut out);

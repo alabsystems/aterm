@@ -18,7 +18,11 @@
 //!   grows it.
 //!
 //! Between passes each window pushes its needs rows to the node service
-//! (`aterm_gui::install_window_needs`), and the Mac's `now/needs` row is published on change.
+//! (`aterm_gui::install_window_needs`), and the Mac's `now/needs` row is published on change. Once
+//! a minute the node service counts its windows' agents (`aterm_gui::install_window_activity`), and
+//! the Mac's `now/activity` row is published when the count changed, and again each
+//! [`ACTIVITY_REFRESH_S`] it did not, so a reader can tell a count that still holds from one a Mac
+//! stopped publishing.
 //!
 //! The pass is the node service's own, not the journal flusher's: the flusher runs in whichever
 //! process holds the Commons owner lease (a window, after a node restart), and not at all while
@@ -30,8 +34,8 @@
 //! and publishes nothing. `[alab] journal = false` stops the account rows and token windows, as it
 //! stops the journal, and what was served while it was off is never published: its samples are
 //! dropped and a window that spans it is withheld, by spans kept beside the journal's spool
-//! (`metrics-off`) so a restart keeps them. The needs row is not account data and is published as
-//! presence is. What a pass publishes is decided against what this Mac's log holds: the first
+//! (`metrics-off`) so a restart keeps them. The needs and activity rows are not account data and
+//! are published as presence is. What a pass publishes is decided against what this Mac's log holds: the first
 //! pass of a process reads its own shared rows back, so a restart neither republishes an
 //! unchanged row nor restarts a window's revision at 0.
 
@@ -47,8 +51,8 @@ use aterm_agent::harness::{
 };
 use aterm_db::alab::journal::{self as journal, BookFacts, Pk, Spool};
 use aterm_metrics::row::{
-    AgyGroup, AgyRow, Label, ManagerEntry, NEEDS_MAX, NeedsRow, PCT_MAX, PlaceRow, QuotaRow,
-    REMAINING_MAX, Row, SignIn, UnreadRow, WindowRecord, Word,
+    ACTIVITY_REFRESH_S, ActivityRow, AgyGroup, AgyRow, Label, ManagerEntry, NEEDS_MAX, NeedsRow,
+    PCT_MAX, PlaceRow, QuotaRow, REMAINING_MAX, Row, SignIn, UnreadRow, WindowRecord, Word,
 };
 use aterm_metrics::rules::{HOUR_AGE, MINUTE_AGE};
 use aterm_metrics::subject::{
@@ -732,8 +736,8 @@ fn codex_key(path: &Path, turn: &Turn) -> u64 {
 /// What this Mac's log holds of its own rows, as the publisher last saw or wrote them.
 struct Shown {
     node: Node,
-    /// Each snapshot subject's row, encoded with its `at` cleared.
-    rows: BTreeMap<Subject, Vec<u8>>,
+    /// Each snapshot subject's row, encoded with its `at` cleared, and that `at`.
+    rows: BTreeMap<Subject, (Vec<u8>, u64)>,
     /// Each window's highest revision and its summary.
     windows: BTreeMap<(Metric, u64), (u64, Summary)>,
 }
@@ -795,7 +799,7 @@ impl Shown {
             .collect();
         self.rows
             .iter()
-            .filter_map(|(subject, body)| {
+            .filter_map(|(subject, (body, _))| {
                 let Subject::Now {
                     now: Now::Place(_), ..
                 } = subject
@@ -826,7 +830,7 @@ impl Shown {
     fn ended_accounts(&self, accounts: &Accounts, now: u64) -> Vec<(Subject, Row)> {
         self.rows
             .iter()
-            .filter_map(|(subject, body)| {
+            .filter_map(|(subject, (body, _))| {
                 let Subject::Quota { cli, .. } = subject else {
                     return None;
                 };
@@ -846,14 +850,15 @@ impl Shown {
     }
 }
 
-/// `row`'s encoding with its `at` cleared: what change detection compares.
-fn timeless(row: &mut Row) -> Option<Vec<u8>> {
+/// `row`'s encoding with its `at` cleared, what change detection compares, and its `at`.
+fn timeless(row: &mut Row) -> Option<(Vec<u8>, u64)> {
     let at = match row {
         Row::Quota(r) => std::mem::replace(&mut r.at, 0),
         Row::Agy(r) => std::mem::replace(&mut r.at, 0),
         Row::Place(r) => std::mem::replace(&mut r.at, 0),
         Row::Needs(r) => std::mem::replace(&mut r.at, 0),
         Row::Unread(r) => std::mem::replace(&mut r.at, 0),
+        Row::Activity(r) => std::mem::replace(&mut r.at, 0),
         Row::Window(_) => return None,
     };
     let encoded = row.encode();
@@ -863,22 +868,35 @@ fn timeless(row: &mut Row) -> Option<Vec<u8>> {
         Row::Place(r) => r.at = at,
         Row::Needs(r) => r.at = at,
         Row::Unread(r) => r.at = at,
+        Row::Activity(r) => r.at = at,
         Row::Window(_) => {}
     }
-    Some(encoded)
+    Some((encoded, at))
 }
 
-/// Whether a row that is not on the log reads as `row`: an empty needs or unread row says what
-/// no row says.
-fn absent_reads_as(row: &Row) -> bool {
+/// Whether `row`, whose bytes are the ones the log holds, is due again over the one the log holds
+/// written at `shown_at`: an activity row is, from a count [`ACTIVITY_REFRESH_S`] newer, so a
+/// reader can tell a count that still holds from one a Mac stopped publishing; no other row is.
+/// A count no newer than the one shown (the windows went unread meanwhile) is never due.
+fn due_again(row: &Row, shown_at: u64) -> bool {
     match row {
-        Row::Needs(r) => r.needs.is_empty() && r.held.is_empty() && r.managers.is_empty(),
-        Row::Unread(r) => r.pools.is_empty(),
+        Row::Activity(r) => r.at.saturating_sub(shown_at) >= ACTIVITY_REFRESH_S,
         _ => false,
     }
 }
 
-/// What one pass or one needs change published.
+/// Whether a row that is not on the log reads as `row`: an empty needs or unread row says what
+/// no row says. An activity row of no agents does not: it says this Mac's windows were read and
+/// run none, where no row says nothing was read.
+fn absent_reads_as(row: &Row) -> bool {
+    match row {
+        Row::Needs(r) => r.needs.is_empty() && r.held.is_empty() && r.managers.is_empty(),
+        Row::Unread(r) => r.pools.is_empty(),
+        Row::Activity(_) | Row::Quota(_) | Row::Agy(_) | Row::Place(_) | Row::Window(_) => false,
+    }
+}
+
+/// What one pass, one needs change or one activity count published.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Report {
     /// Snapshot rows published.
@@ -925,6 +943,8 @@ pub(crate) struct Publisher {
     shown: Mutex<Option<Shown>>,
     /// The needs row the windows' latest pushes make, once the node service has read them.
     needs: Mutex<Option<NeedsRow>>,
+    /// The activity row the node service's latest count of its windows' agents makes.
+    activity: Mutex<Option<ActivityRow>>,
 }
 
 impl Publisher {
@@ -943,6 +963,7 @@ impl Publisher {
             })),
             shown: Mutex::new(None),
             needs: Mutex::new(None),
+            activity: Mutex::new(None),
         }
     }
 
@@ -1005,6 +1026,24 @@ impl Publisher {
         )
     }
 
+    /// The node service counted its windows' agents as `row`: publish the Mac's activity row on
+    /// `log` when it changed, or when the one the log holds is [`ACTIVITY_REFRESH_S`] older. With
+    /// no log the row waits for the next pass that has one.
+    pub(crate) fn activity(&self, log: Option<&dyn Log>, row: ActivityRow, now: u64) -> Report {
+        *self.activity.lock_or_recover() = Some(row);
+        let Some(log) = log else {
+            return Report::default();
+        };
+        self.publish(
+            log,
+            now,
+            Projected {
+                rows: None,
+                windows: BTreeMap::new(),
+            },
+        )
+    }
+
     fn publish(&self, log: &dyn Log, now: u64, projected: Projected) -> Report {
         let mut report = Report::default();
         let node = log.node();
@@ -1037,6 +1076,9 @@ impl Publisher {
         if let Some(needs) = self.needs.lock_or_recover().clone() {
             rows.push((NeedsRow::subject(node), Row::Needs(needs)));
         }
+        if let Some(activity) = self.activity.lock_or_recover().clone() {
+            rows.push((ActivityRow::subject(node), Row::Activity(activity)));
+        }
         #[cfg(any(test, debug_assertions))]
         let every = every_row();
         #[cfg(not(any(test, debug_assertions)))]
@@ -1055,7 +1097,7 @@ impl Publisher {
                 continue;
             };
             let same = match shown.rows.get(subject) {
-                Some(was) => *was == timeless,
+                Some((was, at)) => *was == timeless.0 && !due_again(row, *at),
                 None => absent_reads_as(row),
             };
             if same && !every {
@@ -1378,13 +1420,19 @@ fn merged_needs(windows: &BTreeMap<u32, NeedsRow>, now: u64) -> NeedsRow {
 static PUBLISHER: OnceLock<Publisher> = OnceLock::new();
 
 /// Start publishing from `aterm node serve`: a pass every [`PASS_EVERY`] on a thread of its own,
-/// and the Mac's needs row on each change of the windows' needs.
+/// the Mac's needs row on each change of the windows' needs, and its activity row on each count
+/// of the windows' agents.
 pub(crate) fn start() {
     let publisher = PUBLISHER.get_or_init(|| Publisher::new(Places::of_process()));
     let _ = aterm_gui::install_window_needs(Arc::new(move |windows| {
         let log = NodeLog::current();
         let now = aterm_time::unix_secs().unwrap_or(0);
         publisher.needs(log.as_ref().map(|l| l as &dyn Log), windows, now);
+    }));
+    let _ = aterm_gui::install_window_activity(Arc::new(move |row| {
+        let log = NodeLog::current();
+        let now = aterm_time::unix_secs().unwrap_or(0);
+        publisher.activity(log.as_ref().map(|l| l as &dyn Log), row.clone(), now);
     }));
     let publishing = journal::Publishing::new(aterm_types::dirs::aterm_config_path());
     let spawned = std::thread::Builder::new()

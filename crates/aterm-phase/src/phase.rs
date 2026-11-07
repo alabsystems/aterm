@@ -13,7 +13,7 @@ use crate::wall::{Placement, Wall, WallKind, classify_wall};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 16, "0.16");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 17, "0.17");
 
 /// The worker's phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +79,18 @@ pub fn title_runs(title: &str) -> bool {
     chars
         .next()
         .is_some_and(|c| const { crate::anchor!("title.running") }.contains(c))
+        && chars.next() == Some(' ')
+}
+
+/// Claude Code's window title says its REPL is at rest: the rest glyph (`title.rest`, `✳`), a
+/// blank, then the title. A title that leads with no glyph says neither this nor
+/// [`title_runs`].
+#[must_use]
+pub fn title_rests(title: &str) -> bool {
+    let mut chars = title.chars();
+    chars
+        .next()
+        .is_some_and(|c| const { crate::anchor!("title.rest") }.contains(c))
         && chars.next() == Some(' ')
 }
 
@@ -157,6 +169,8 @@ pub enum Zone {
     Footer,
     /// No composer frame on the screen.
     Screen,
+    /// The program's window title, where the screen shows no turn ([`busy_seen`]).
+    Title,
 }
 
 /// One busy verdict: where it was read and which rule fired.
@@ -194,6 +208,7 @@ impl fmt::Display for Busy {
             Zone::Hint => "hint",
             Zone::Footer => "footer",
             Zone::Screen => "whole screen, no composer frame",
+            Zone::Title => "title",
         };
         write!(f, "{zone}: {}", self.rule)
     }
@@ -407,19 +422,26 @@ fn counts_work(row: &str) -> bool {
     row_items(row).any(work_count)
 }
 
-/// An item ([`row_items`]) that counts background work under any label: a count ([`counted`])
-/// whose label's last word is a kind of work, whatever words qualify it (`1 MCP task`, `1 Artifact
-/// comment monitor`, `◇ 1 cloud session`, `2 background tasks`, `1 shell`).
+/// An item ([`row_items`]) that counts background work under any label: a count whose noun
+/// ([`counted_noun`]) is a kind of work, whatever words qualify it (`1 MCP task`, `1 Artifact
+/// comment monitor`, `◇ 1 cloud session`, `2 background tasks`, `1 shell`): a shell, a monitor or
+/// work the agent handed off ([`DELEGATED_NOUNS`]).
 fn work_count(item: &str) -> bool {
-    const WORK: [&str; 7] = [
-        "shell", "monitor", "task", "agent", "workflow", "session", "team",
-    ];
-    counted(item).is_some_and(|(_, label)| {
-        label
-            .rsplit(' ')
-            .next()
-            .is_some_and(|noun| WORK.contains(&singular(noun)))
-    })
+    counted_noun(item)
+        .is_some_and(|noun| noun == "shell" || noun == "monitor" || DELEGATED_NOUNS.contains(&noun))
+}
+
+/// The nouns of a count ([`counted_noun`]) that names work the agent handed off, which runs
+/// Claude Code's title with its turn over (2.1.311: `delegatedActive`): a task, an agent, a
+/// workflow, a session or a team. A shell or a monitor, qualified or not, is none.
+const DELEGATED_NOUNS: [&str; 5] = ["task", "agent", "workflow", "session", "team"];
+
+/// An item ([`row_items`]) that counts work the agent handed off: a count whose noun
+/// ([`counted_noun`]) is one of [`DELEGATED_NOUNS`], whatever words qualify it (`1 MCP task`,
+/// `2 background tasks`, `◇ 1 cloud session`, `1 local agent`); never a shell's or a monitor's
+/// (`1 Artifact comment monitor`).
+fn delegated_count(item: &str) -> bool {
+    counted_noun(item).is_some_and(|noun| DELEGATED_NOUNS.contains(&noun))
 }
 
 /// An item ([`row_items`], or a part of a done row's label) that counts the work the process
@@ -584,7 +606,8 @@ pub fn shells_running(rows: &[String]) -> Option<u32> {
 /// `claude-2.1.283-wall-session-wrapup-waiting-measured.txt`; `· 13 shells, 3 monitors` on
 /// 2.1.316, `claude-2.1.316-waiting-agents-and-workflows-turn-over-panel.txt`), each trimmed and
 /// without the `·` of a row that opens or ends on one or its leading `◇ `. The one item reader
-/// of [`footer_count`], [`shells_running`], [`counts_work`] and [`footer_work`].
+/// of [`footer_count`], [`shells_running`], [`counts_work`], [`footer_work`] and
+/// [`delegated_shown`].
 fn row_items(row: &str) -> impl Iterator<Item = &str> {
     row.split(" · ")
         .flat_map(|item| item.split("   "))
@@ -600,7 +623,7 @@ fn row_items(row: &str) -> impl Iterator<Item = &str> {
 /// THE COUNT ONE ITEM NAMES ([`row_items`], or a part of a done row's label): `N <label>`, alone
 /// or followed by ` still running`, `N` ASCII digits that fit a `u32`, with `label` the words
 /// after it. The one reading of a count that [`item_count`] (and through it [`process_count`])
-/// and [`work_count`] share.
+/// and [`counted_noun`] (and through it [`work_count`] and [`delegated_count`]) share.
 fn counted(item: &str) -> Option<(u32, &str)> {
     let item = item.strip_suffix(" still running").unwrap_or(item);
     let (count, label) = item.split_once(' ')?;
@@ -608,6 +631,13 @@ fn counted(item: &str) -> Option<(u32, &str)> {
         return None;
     }
     Some((count.parse().ok()?, label))
+}
+
+/// The noun one count names ([`counted`]): its label's last word, without a plural `s`, whatever
+/// words qualify it (`1 Artifact comment monitor`: `monitor`). The one noun reading
+/// [`work_count`] and [`delegated_count`] share.
+fn counted_noun(item: &str) -> Option<&str> {
+    counted(item).map(|(_, label)| singular(label.rsplit_once(' ').map_or(label, |(_, last)| last)))
 }
 
 /// `noun` without a plural `s`.
@@ -843,6 +873,116 @@ pub fn work_left(rows: &[String]) -> Option<&'static str> {
         return None;
     }
     shell_or_monitor_left(rows)
+}
+
+/// THE SCREEN SHOWS WORK THE AGENT HANDED OFF, which runs Claude Code's title with its turn over
+/// (2.1.311: `delegatedActive`, a running local or remote agent, in-process teammate or local
+/// workflow), so there its title says nothing of the turn ([`title_live`]): work Claude Code runs
+/// in its own process ([`in_process_work`]: its status row's `Waiting for …`, the wait it carries
+/// above its own wake, a done row's `… still running` naming more than shells and monitors counted
+/// alone, though a done row ends the turn, which [`title_live`] reads ahead of this), a footer
+/// item that counts a task, an agent, a workflow, a session or a team, whatever words qualify it
+/// ([`delegated_count`]: `1 MCP task`, `2 background tasks`, `◇ 1 cloud session`), a workflow's
+/// progress row under the footer ([`is_workflow_progress`]), or a running agent or workflow in
+/// the agents panel drawn there (its row neither paused nor idle). A shell or a monitor in the
+/// footer, counted alone or qualified (`1 Artifact comment monitor`), is no handed-off work: the
+/// title rests over them ([`work_left`]). A progress row can outlive its workflow, and a counted
+/// task or session need not run the title: the title then holds nothing, and the screen's own
+/// reading stands. Past a message submitted under the status row neither [`in_process_work`] nor
+/// a footer count is read ([`background_wait`]'s bounds): that message opens a turn, which runs
+/// the title itself.
+#[must_use]
+pub fn delegated_shown(rows: &[String]) -> bool {
+    use crate::agents_panel::{Bullet, Elapsed, RowKind, one_cell, parse_row};
+    let Some(frame) = composer_frame(rows) else {
+        return false;
+    };
+    let footer = &rows[frame.bottom + 1..];
+    let panel_runs = |row: &str| {
+        parse_row(row, one_cell).is_some_and(|r| {
+            matches!(r.kind, RowKind::Agent | RowKind::Workflow)
+                && r.bullet.is_none_or(|(_, b)| b != Bullet::Paused)
+                && r.elapsed.is_none_or(|(_, e)| e != Elapsed::Idle)
+        })
+    };
+    in_process_work(rows).is_some()
+        || (!turn_just_begun(rows)
+            && footer
+                .iter()
+                .flat_map(|r| row_items(r))
+                .any(delegated_count))
+        || footer
+            .iter()
+            .any(|r| is_workflow_progress(r) || panel_runs(r))
+}
+
+/// CLAUDE CODE'S TITLE SAYS A TURN RUNS THAT ITS SCREEN DOES NOT SHOW: the title runs (`runs`,
+/// [`crate::ScreenReader::runs`]), the composer's frame is drawn with no box over it, and the
+/// screen shows no end of a turn and nothing else that runs the title. That is no done row
+/// ([`done_row_drawn`]), no wall a turn ends on ([`crate::wall::turn_wall`], which holds every
+/// [`limit_notice`]), no interrupt ([`crate::turn::interrupted`]), no handed-off work
+/// ([`delegated_shown`]) and no live turn the screen already reads ([`no_live_turn`]). The
+/// critical-memory banner ([`crate::wall::memory_wall`]) is no such end: Claude Code draws it over
+/// a live turn too, and a reading under a running title keeps it as a hard busy does.
+///
+/// This is a reply drawn under a status line: the footer has no `esc to interrupt` and the
+/// spinner row is gone once its first line is drawn (ATERM-KI-1027-3). `runs` of `None` (no
+/// title, or one the program never set) and `Some(false)` are never live.
+#[must_use]
+pub fn title_live(rows: &[String], runs: Option<bool>) -> bool {
+    runs == Some(true)
+        && composer_frame(rows).is_some()
+        && parse_prompt(rows).is_none()
+        && !turn_over(rows)
+        && no_live_turn(rows)
+        && !delegated_shown(rows)
+        && !crate::turn::interrupted(rows)
+        && crate::wall::turn_wall(rows).is_none()
+}
+
+/// [`busy_signal`] read beside the title: a hard busy in [`Zone::Title`] (`title: running`)
+/// where [`title_live`], else the screen's own.
+#[must_use]
+pub fn busy_seen(rows: &[String], runs: Option<bool>) -> Option<Busy> {
+    if title_live(rows, runs) {
+        Some(Busy::hard(Zone::Title, "running"))
+    } else {
+        busy_signal(rows)
+    }
+}
+
+/// [`background_wait`] read beside the title: no break of the agent's own background work
+/// where [`title_live`], since the title runs for a turn and not for a shell or a monitor.
+#[must_use]
+pub fn background_wait_seen(rows: &[String], runs: Option<bool>) -> Option<&'static str> {
+    if title_live(rows, runs) {
+        None
+    } else {
+        background_wait(rows)
+    }
+}
+
+/// [`background_rest`] read beside the title: no rest where [`title_live`], since a turn the title
+/// runs is no turn over under a shell or a monitor it left.
+#[must_use]
+pub fn background_rest_seen(rows: &[String], runs: Option<bool>) -> Option<Phase> {
+    if title_live(rows, runs) {
+        None
+    } else {
+        background_rest(rows)
+    }
+}
+
+/// [`worker_phase`] read beside the title: an Idle or a Question is Busy where [`title_live`].
+/// A box, a limit and a wall stand as read, as does every Busy.
+#[must_use]
+pub fn worker_phase_seen(rows: &[String], runs: Option<bool>) -> Phase {
+    let phase = worker_phase(rows);
+    if matches!(phase, Phase::Idle | Phase::Question) && title_live(rows, runs) {
+        Phase::Busy
+    } else {
+        phase
+    }
 }
 
 /// Who opened the turn drawn last, read up from the composer's top rule.

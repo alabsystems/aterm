@@ -60,6 +60,51 @@ fn adoption_preserves_cpu_child_and_requires_original_selector_and_denial() {
     std::fs::remove_file(paths(&world.legacy).unwrap().0).unwrap();
     assert!(resolve(&world.legacy).is_err());
 }
+/// THE ADMISSION ROW'S LEDGER (Continuum TM-1): once this account's ledger was adopted into a
+/// memory namespace, its claims are decided in the namespace's backend, so an admission row is
+/// held to the account ledger's own folder ([`crate::Ledger::user`]'s `dir`) and written.
+/// NEGATIVE CONTROL: held to the capacity folder it was adopted from, as TM-0 held it, none is.
+#[test]
+fn an_adopted_accounts_admissions_are_held_to_its_namespaced_ledger() {
+    let world = World::new();
+    world.adopt().unwrap();
+    let ledger = crate::Ledger::account_at(world.legacy.clone());
+    assert_eq!(ledger.dir(), world.fixture.namespace.backend());
+    let asked = crate::telemetry::Asked::of(&crate::Need::new("targo test".to_owned()));
+    let refused: Result<crate::Claim, crate::Error> = Err(crate::Error::Never("too big".into()));
+    let mut n = 0;
+    crate::telemetry::decided_from(
+        &ledger,
+        world.legacy.clone(),
+        "m101",
+        aterm_telemetry::Digest::dir("/facts"),
+        &asked,
+        &refused,
+        |_| {
+            n += 1;
+            true
+        },
+    );
+    assert_eq!(
+        n, 1,
+        "the account ledger's own folder, as `decided` reads it"
+    );
+    let mut held_to_source = 0;
+    crate::telemetry::decided_in(
+        &ledger,
+        &world.legacy,
+        "m101",
+        aterm_telemetry::Digest::dir("/facts"),
+        &asked,
+        &refused,
+        |_| {
+            held_to_source += 1;
+            true
+        },
+    );
+    assert_eq!(held_to_source, 0, "the folder it was adopted from");
+}
+
 #[test]
 fn account_reader_reopens_retained_backend_and_rechecks_source_every_time() {
     let world = World::new();
@@ -183,4 +228,36 @@ fn a_prebarrier_intent_from_an_earlier_boot_cannot_authorize_readiness() {
     assert!(fenced);
     assert_eq!(barrier_boot, aterm_uds::process::boot_id().unwrap());
     assert!(!paths(&world.legacy).unwrap().0.exists());
+}
+
+/// A selector parent of this user's that its group or others may write (Linux's
+/// user-private-group umask, 002, leaves aterm's cache folder 0775) is narrowed through the
+/// descriptor checked, dropping exactly those write bits, not refused: an account never adopted
+/// reads as having no selector, and an adopted one as its namespace. (Here the parent is also the
+/// cohort's private home, which adoption holds to 0700, so the adopted case narrows 0720.)
+/// NEGATIVE CONTROL (by hand): `outer` refusing such a parent again, the first `resolve` here
+/// fails, as every capacity claim of the account did (`verify`'s on Linux, 2026-11-06).
+#[test]
+fn a_selector_parent_its_group_may_write_is_narrowed_not_refused() {
+    let world = World::new();
+    let parent = world.legacy.parent().unwrap().to_path_buf();
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().mode() & 0o7777;
+    let set = |bits: u32| {
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(bits)).unwrap();
+    };
+    set(0o775);
+    assert_eq!(resolve(&world.legacy).unwrap(), None);
+    assert_eq!(mode(&parent), 0o755);
+    set(0o700);
+    let pool =
+        crate::build_cpu::Pool::open_in(&world.legacy, std::num::NonZeroU32::new(2).unwrap())
+            .unwrap();
+    world.adopt().unwrap();
+    set(0o720);
+    assert_eq!(
+        resolve(&world.legacy).unwrap(),
+        Some(world.fixture.namespace.clone())
+    );
+    assert_eq!(mode(&parent), 0o700);
+    drop(pool);
 }

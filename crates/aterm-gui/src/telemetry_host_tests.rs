@@ -203,8 +203,11 @@ fn a_command_row_says_what_its_block_and_readings_say() {
     let typed = command_row(&unconfirmed, None, None, (Some("s-7"), "m14", facts()));
     assert_eq!((typed.label.as_str(), typed.key), ("-", None));
     assert!(!typed.line().contains("hunter2"), "{}", typed.line());
-    assert_eq!(no_d.wait_ms, Fig::unknown(source::CAPACITY));
-    assert_eq!(no_d.cache, Fig::unknown(source::TARGO));
+    assert_eq!(
+        (no_d.wait_ms.clone(), no_d.cache.clone()),
+        (Fig::Na, Fig::Na),
+        "an admission's wait and a cache tier are a build row's"
+    );
 }
 
 fn fact(detail: Option<&str>, end: crate::session_log::BlockEnd) -> crate::session_log::BlockFact {
@@ -286,10 +289,16 @@ fn an_agent_call_row_is_sampled_from_its_job() {
 #[test]
 fn a_spawn_row_is_ok_or_refused_by_its_answer() {
     let ok = spawn_row("claude", Some("/w"), 900, "OK s-12 tab=3", "m14", facts());
-    assert_eq!((ok.kind, ok.outcome), (Kind::Spawn, Outcome::Ok));
+    assert_eq!((ok.kind.clone(), ok.outcome), (Kind::Spawn, Outcome::Ok));
     assert_eq!((ok.cpu_ms.clone(), ok.cache.clone()), (Fig::Na, Fig::Na));
+    assert_eq!(ok.wait_ms, Fig::Na);
+    assert_eq!(
+        (ok.sid.as_deref(), ok.on.as_deref()),
+        (Some("s-12"), None),
+        "the worker it started, here"
+    );
     let refused = spawn_row("claude", None, 3, "ERR spawn: no room", "m14", facts());
-    assert_eq!(refused.outcome, Outcome::Refused);
+    assert_eq!((refused.outcome, refused.sid), (Outcome::Refused, None));
 }
 
 #[test]
@@ -499,12 +508,13 @@ fn a_pid_taken_anew_or_never_read_is_never_watched_as_the_calls() {
     assert_eq!(calls.watching(), 0, "a start never read");
     calls.watch_with(&[live_call(pid, Some(start))], birth);
     assert_eq!(calls.watching(), 1, "the true start is watched");
-    // A pass whose sweep missed the leader, though it lives, keeps its watch.
+    // A read never lets a watch go without a status, even of a leader its sweep did not list;
+    // only `watch_with`, once the engine holds the call no longer open, does.
     assert!(calls.read(|_| false).is_empty());
     assert_eq!(
         calls.watching(),
         1,
-        "a live leader's watch outlives a partial sweep"
+        "a watch with no status is let go only by the engine's rows"
     );
     // A call the engine no longer holds open lets its watch go.
     calls.watch_with(&[], birth);

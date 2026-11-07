@@ -300,13 +300,14 @@ fn visit_at(
     let table = vec![(shell, 1, "zsh".into())];
     let args = atpkg::caller_shell::process_args(agent.id()).expect("argv");
     let files = session_files(&opts.home);
+    let script = Script::new(shell, fg, None);
     let r = visit_with_claim(
         &opts,
         &sf,
         files.as_deref(),
         &table,
         targets,
-        &Script::new(shell, fg, None),
+        &ParkedProcess::new(&script, sf.pid, Some(&sf.proc_start)),
         Some(&args),
         None,
     );

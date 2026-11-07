@@ -1049,12 +1049,37 @@ fn started_for(events: &[Event], since: usize, reason: Reason) -> usize {
         .count()
 }
 
+/// Rot the newest batch of the stopped log at `file`: its last byte, inside the newest record's
+/// frame, flipped. The next open cannot tell rot in the newest batch from a torn write, so it
+/// cuts that batch and announces the cut on every tier: the log's generation moves, with lineage
+/// at the head it keeps (astream's `recover.rs`, "What 'written' means for a cut").
+fn rot_the_newest_batch(file: &Path) {
+    use std::os::unix::fs::FileExt as _;
+    let log = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(file)
+        .expect("the stopped log");
+    let last = log
+        .metadata()
+        .expect("the log's length")
+        .len()
+        .checked_sub(1)
+        .expect("a log that holds records");
+    let mut byte = [0u8];
+    log.read_exact_at(&mut byte, last)
+        .expect("the log's last byte");
+    log.write_all_at(&[!byte[0]], last).expect("the rot");
+}
+
 /// The lineage event (`relay_live_island.rs`'s `lineage_repaired`): a neighbour whose log answered
 /// a record and whose stores lost it before they held it for good comes back in another boot, at a
 /// later generation of its log with lineage. The relay to it reads the cursor moved and asks the
 /// lineage exchange, which brings the record back. With `KEPT_ON_A_MOVED_LOG` (the island's
 /// `keptOnMove`), the relay resumes as if the log were the same, asks nothing, and the record
-/// never returns.
+/// never returns. The log moves for the unclean stop where it served a weak tier (Ordered, on
+/// Apple); where it served Strict (Ordered off Apple), whose acks were on stable media, it moves
+/// for its newest batch, which rots while B is away ([`rot_the_newest_batch`]).
 #[test]
 fn a_neighbour_that_lost_what_it_answered_gets_it_back_by_the_lineage_exchange() {
     for lineage_rule in [true, false] {
@@ -1073,7 +1098,19 @@ fn a_neighbour_that_lost_what_it_answered_gets_it_back_by_the_lineage_exchange()
         let at = offset_of(&macs[1].0, "answered");
         let ingest = macs[1].0.mesh().ingest().expect("an ingest consumer");
         assert!(ingest.wait_committed_for_test(at, Instant::now() + HANG));
-        let was = macs[1].0.mesh().broker(MeshLog::Tables).log_identity();
+        let tables = macs[1].0.mesh().broker(MeshLog::Tables);
+        let was = tables.log_identity();
+        // Where its unclean stop moves nothing (Strict), B's newest batch rots instead, and the
+        // open cuts it. A later record and B's commit past it come first, so the cut keeps every
+        // record through `spare`: at most B's ingest loses its commit past `spare` and reads it
+        // again, which its stores hold.
+        let rots = (tables.served_durability().served == astream_broker::Tier::Strict).then(|| {
+            macs[0].1.write("w", "spare");
+            macs[1].1.until_holds("spare");
+            let spare = offset_of(&macs[1].0, "spare");
+            assert!(ingest.wait_committed_for_test(spare, Instant::now() + HANG));
+            macs[1].0.mesh().log_file(MeshLog::Tables)
+        });
         for log in MeshLog::ALL {
             macs[1].0.mesh().broker(log).arm_unclean_stop();
         }
@@ -1087,6 +1124,9 @@ fn a_neighbour_that_lost_what_it_answered_gets_it_back_by_the_lineage_exchange()
         });
         macs[1].1.forget("answered");
         assert!(!macs[1].1.holds("answered"));
+        if let Some(file) = &rots {
+            rot_the_newest_batch(file);
+        }
         let mark = macs[0].0.seen.mark();
         std::thread::scope(|scope| {
             scope
@@ -1671,6 +1711,8 @@ fn append_from_a_child(mac: &Mac, fake: &Fake, what: &str) {
             "tests::tables::child_append",
             "--ignored",
             "--nocapture",
+            // The pretty single-threaded formatter prefixes the proof line with the test name.
+            "--quiet",
         ])
         .env(CHILD_DIR, &fake.dir)
         .env(CHILD_STATE, mac.dir.path())

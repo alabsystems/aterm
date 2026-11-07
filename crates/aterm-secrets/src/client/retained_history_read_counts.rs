@@ -6,10 +6,14 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Journal outcomes after one kind of decoded-history cache lookup.
-/// Every attempt still calls `read_committed`, including an unchanged result.
+/// A lookup whose journal files and folder had not moved since the cached
+/// history was validated is `unmoved` and calls nothing; every other lookup
+/// calls `read_committed`, including an unchanged result.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RetainedHistoryReadOutcomes {
     pub lookups: u64,
+    /// Lookups answered from the cache with no journal read: no stamp moved.
+    pub unmoved: u64,
     pub unchanged: u64,
     pub extended: u64,
     pub rebuilt: u64,
@@ -21,6 +25,7 @@ impl RetainedHistoryReadOutcomes {
     fn checked_delta(self, before: Self) -> Option<Self> {
         Some(Self {
             lookups: self.lookups.checked_sub(before.lookups)?,
+            unmoved: self.unmoved.checked_sub(before.unmoved)?,
             unchanged: self.unchanged.checked_sub(before.unchanged)?,
             extended: self.extended.checked_sub(before.extended)?,
             rebuilt: self.rebuilt.checked_sub(before.rebuilt)?,
@@ -86,6 +91,7 @@ pub(super) enum Lookup {
 
 struct Outcomes {
     lookups: AtomicU64,
+    unmoved: AtomicU64,
     unchanged: AtomicU64,
     extended: AtomicU64,
     rebuilt: AtomicU64,
@@ -96,6 +102,7 @@ impl Outcomes {
     const fn new() -> Self {
         Self {
             lookups: AtomicU64::new(0),
+            unmoved: AtomicU64::new(0),
             unchanged: AtomicU64::new(0),
             extended: AtomicU64::new(0),
             rebuilt: AtomicU64::new(0),
@@ -106,6 +113,7 @@ impl Outcomes {
     fn snapshot(&self) -> RetainedHistoryReadOutcomes {
         RetainedHistoryReadOutcomes {
             lookups: self.lookups.load(Ordering::Relaxed),
+            unmoved: self.unmoved.load(Ordering::Relaxed),
             unchanged: self.unchanged.load(Ordering::Relaxed),
             extended: self.extended.load(Ordering::Relaxed),
             rebuilt: self.rebuilt.load(Ordering::Relaxed),
@@ -150,6 +158,13 @@ impl Counters {
             Lookup::OtherDirectory => &self.other_directory,
             Lookup::Unavailable => &self.unavailable,
         }
+    }
+
+    /// A lookup the cache answered with no journal read: none of its stamps moved.
+    pub(super) fn unmoved(&self, lookup: Lookup) {
+        let row = self.row(lookup);
+        row.lookups.fetch_add(1, Ordering::Relaxed);
+        row.unmoved.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn lookup(&self, lookup: Lookup) {

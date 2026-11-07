@@ -40,10 +40,6 @@ pub(crate) mod source {
     pub(crate) const JOBS: &str = "jobs";
     /// Wall time: the shell's OSC 133 stamps.
     pub(crate) const OSC133: &str = "osc133";
-    /// Admission wait: the claim's own row in aterm-capacity's ledger.
-    pub(crate) const CAPACITY: &str = "aterm-capacity";
-    /// A build's cache tier: the build tool's own action records.
-    pub(crate) const TARGO: &str = "targo";
 }
 
 /// This process's host: its name and facts' digest, once the writer started.
@@ -258,7 +254,7 @@ fn sid_of(local: u64) -> Option<String> {
 }
 
 /// The jobs engine's readings of each block's foreground job: (session, block) → (peak bytes,
-/// judged stuck at its last pass), the newest [`BLOCK_JOBS_KEEP`].
+/// judged stuck by the last pass that read it live), the newest [`BLOCK_JOBS_KEEP`].
 static BLOCK_JOBS: Mutex<BlockJobs> = Mutex::new(BlockJobs {
     map: BTreeMap::new(),
     order: VecDeque::new(),
@@ -346,6 +342,7 @@ fn agent_call_row(
         dir: None,
         label: aterm_telemetry::row::label(program.unwrap_or("")),
         sid: sid_of(e.tab),
+        on: None,
         host: host_name.to_owned(),
         facts,
         wall_ms: Fig::Known(e.ended_ms.saturating_sub(e.opened_ms)),
@@ -356,8 +353,8 @@ fn agent_call_row(
         peak_bytes: e
             .peak_bytes
             .map_or_else(|| Fig::unknown(source::JOBS), Fig::Known),
-        wait_ms: Fig::unknown(source::CAPACITY),
-        cache: Fig::unknown(source::TARGO),
+        wait_ms: Fig::Na,
+        cache: Fig::Na,
         outcome,
         stop,
         code,
@@ -405,6 +402,7 @@ pub(crate) fn call_counts() -> (u64, u64, u64) {
     )
 }
 
+#[cfg(target_vendor = "apple")]
 fn count(n: &AtomicU64) {
     n.fetch_add(1, Ordering::Relaxed);
 }
@@ -684,6 +682,7 @@ fn command_row(
         dir: b.dir.map(Digest::dir),
         label: aterm_telemetry::row::label(b.program.unwrap_or("")),
         sid: sid.map(str::to_owned),
+        on: None,
         host: host_name.to_owned(),
         facts,
         wall_ms: match (b.started_ms, b.ended_ms) {
@@ -697,8 +696,8 @@ fn command_row(
         peak_bytes: job
             .and_then(|(peak, _)| peak)
             .map_or_else(|| Fig::unknown(source::JOBS), Fig::Known),
-        wait_ms: Fig::unknown(source::CAPACITY),
-        cache: Fig::unknown(source::TARGO),
+        wait_ms: Fig::Na,
+        cache: Fig::Na,
         outcome,
         stop,
         code,
@@ -716,6 +715,8 @@ pub(crate) fn spawned(agent: &str, cwd: Option<&str>, wall_ms: u64, reply: &str)
     emit(spawn_row(agent, cwd, wall_ms, reply, host_name, facts));
 }
 
+/// The spawn verb's row: the worker its answer named ([`aterm_ctl::spawned_sid_from_answer`],
+/// as a fleet spawn's sender reads it), no `on=` (it runs here), `ok` or `refused` by the answer.
 fn spawn_row(
     agent: &str,
     cwd: Option<&str>,
@@ -724,27 +725,20 @@ fn spawn_row(
     host_name: &str,
     facts: Digest,
 ) -> Row {
-    let ok = reply.starts_with("OK");
-    Row {
-        at_ms: aterm_telemetry::now_ms(),
-        kind: Kind::Spawn,
-        key: Some(Digest::key(&Kind::Spawn, agent, cwd)),
-        dir: cwd.map(Digest::dir),
-        label: aterm_telemetry::row::label(agent),
-        sid: None,
-        host: host_name.to_owned(),
-        facts,
-        wall_ms: Fig::Known(wall_ms),
-        cpu_ms: Fig::Na,
-        peak_bytes: Fig::Na,
-        wait_ms: Fig::unknown(source::CAPACITY),
-        cache: Fig::Na,
-        outcome: if ok { Outcome::Ok } else { Outcome::Refused },
-        stop: if ok { Stop::Exit } else { Stop::Unknown },
-        code: None,
-        sig: None,
-        meter: Meter::Stamped,
+    let sid = aterm_ctl::spawned_sid_from_answer(reply);
+    aterm_ctl::fleet_telemetry::Spawn {
+        agent,
+        cwd,
+        wall_ms,
+        outcome: if reply.starts_with("OK") {
+            Outcome::Ok
+        } else {
+            Outcome::Refused
+        },
+        sid: sid.as_deref(),
+        on: None,
     }
+    .row(aterm_telemetry::now_ms(), host_name, facts)
 }
 
 /// The `telemetry` verb: `telemetry [rows] [--since <t>] [--kind <k>] [--limit <n>]`, its JSON

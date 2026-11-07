@@ -1580,7 +1580,7 @@ impl Log {
     /// Any addressed [`Body::Wrap`] fails authentication or epoch commitment verification.
     pub fn commons_epoch_view(&self, identity: &Identity) -> Result<Option<CommonsEpochView>> {
         let my_recipient = identity.recipient();
-        let membership = self.membership();
+        let membership = self.membership_ref();
         if self.recipient_is_removed(&my_recipient)
             || self.audience_left_out_recipient(&EpochAudience::Commons, &my_recipient)
             || self.audience_left_out_recipient(&EpochAudience::Everyone, &my_recipient)
@@ -1714,7 +1714,7 @@ impl Log {
         identity: &Identity,
     ) -> Result<Option<Zeroizing<[u8; 32]>>> {
         let my_recipient = identity.recipient();
-        let membership = self.membership();
+        let membership = self.membership_ref();
         if self.recipient_is_removed(&my_recipient)
             || self.audience_left_out_recipient(&EpochAudience::Commons, &my_recipient)
             || self.audience_left_out_recipient(&EpochAudience::Everyone, &my_recipient)
@@ -1788,7 +1788,7 @@ impl Log {
     /// Any addressed `Commons` [`Body::Wrap`] or [`Body::Put`] fails authentication or validation.
     pub fn open_commons_control(&self, identity: &Identity) -> Result<Option<SecretBytes>> {
         let my_recipient = identity.recipient();
-        let membership = self.membership();
+        let membership = self.membership_ref();
         if self.recipient_is_removed(&my_recipient)
             || self.audience_left_out_recipient(&EpochAudience::Commons, &my_recipient)
             || self.audience_left_out_recipient(&EpochAudience::Everyone, &my_recipient)
@@ -1956,7 +1956,7 @@ impl Log {
         {
             return Ok(false);
         }
-        let membership = self.membership();
+        let membership = self.membership_ref();
         let has_active_seat = membership.members().values().any(|member| {
             member.binding.recipient() == me && !membership.member_node_removed(member)
         });
@@ -2068,14 +2068,12 @@ impl Log {
         // runs there and its overlay leaves the audience's entries alone.
         let mut uncovered_keyed: BTreeMap<EpochAudience, Vec<RecordId>> = BTreeMap::new();
         let mut keyless_keyed: BTreeSet<EpochAudience> = BTreeSet::new();
-        let keyed_epochs = self.keyed_epochs_in(effective);
-        let members = if keyed_epochs.is_empty() {
-            eval::Membership::default()
-        } else {
-            self.membership()
-        };
-        for keyed in keyed_epochs {
-            if !keyed.holders.iter().any(|h| members.contains(h)) {
+        for keyed in self.keyed_epochs_in(effective) {
+            if !keyed
+                .holders
+                .iter()
+                .any(|h| self.membership_ref().contains(h))
+            {
                 continue;
             }
             if !keyed_keys.contains_key(&keyed.epoch) {
@@ -2333,7 +2331,7 @@ impl Log {
         identity: &Identity,
         member: &MemberId,
     ) -> Result<Vec<(Audience, String)>> {
-        if self.membership().removal(member).is_none() {
+        if self.membership_ref().removal(member).is_none() {
             return Ok(Vec::new());
         }
         Ok(self
@@ -2350,7 +2348,7 @@ impl Log {
         opened: &OpenedAudienceEntries,
         member: &MemberId,
     ) -> Vec<(Audience, String)> {
-        if self.membership().removal(member).is_none() {
+        if self.membership_ref().removal(member).is_none() {
             return Vec::new();
         }
         let effective = self.effective();

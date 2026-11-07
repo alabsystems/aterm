@@ -23,6 +23,7 @@ const MAX_REPLY: usize = 65536;
 enum Command<'a> {
     Capabilities,
     Attach,
+    AttachAccounted,
     Inspect(&'a str),
     Enroll(&'a str),
 }
@@ -43,6 +44,7 @@ fn parse(rest: &str) -> Option<Command<'_>> {
     match words.as_slice() {
         ["capabilities"] => Some(Command::Capabilities),
         ["attach"] => Some(Command::Attach),
+        ["attach-accounted-v1"] => Some(Command::AttachAccounted),
         ["enroll", field] => {
             let nonce = field.strip_prefix("nonce=")?;
             aterm_codec::hex::is_lower(nonce, 64).then_some(Command::Enroll(nonce))
@@ -198,45 +200,55 @@ pub(crate) fn serve(
                 }
                 json_reply("inspect", observation)
             }
-            Command::Attach => {
+            Command::Attach | Command::AttachAccounted => {
+                let accounted = matches!(command, Command::AttachAccounted);
                 let admitted = Cell::new(None);
-                crate::resource_admission_attach::attach(
-                    stream,
-                    true,
-                    deadline,
-                    |request, peer| {
-                        let Some(fence) =
-                            session_authorized(store, &request.binding.session, peer, deadline)
-                        else {
-                            return false;
-                        };
-                        if !crate::resource_admission_host::authorize(request, peer) {
-                            return false;
-                        }
-                        admitted.set(Some(fence));
-                        true
-                    },
-                    |authorized| {
-                        let fence = admitted.get().ok_or_else(denied)?;
-                        if !session_matches(
-                            store,
-                            &authorized.request.binding.session,
-                            authorized.peer,
-                            fence,
-                            deadline,
-                        ) {
-                            return Err(denied());
-                        }
+                let authorize = |request: &aterm_types::resource_admission::Submission,
+                                 peer: Peer| {
+                    let Some(fence) =
+                        session_authorized(store, &request.binding.session, peer, deadline)
+                    else {
+                        return false;
+                    };
+                    if !crate::resource_admission_host::authorize(request, peer) {
+                        return false;
+                    }
+                    admitted.set(Some(fence));
+                    true
+                };
+                let submit = |authorized: transport::AuthorizedSubmission| {
+                    let fence = admitted.get().ok_or_else(denied)?;
+                    if !session_matches(
+                        store,
+                        &authorized.request.binding.session,
+                        authorized.peer,
+                        fence,
+                        deadline,
+                    ) {
+                        return Err(denied());
+                    }
+                    if accounted {
+                        crate::resource_admission_host::submit_accounted(authorized)
+                    } else {
                         crate::resource_admission_host::submit(authorized)
-                    },
-                )?;
+                    }
+                };
+                if accounted {
+                    crate::resource_admission_attach::attach_accounted(
+                        stream, true, deadline, authorize, submit,
+                    )
+                } else {
+                    crate::resource_admission_attach::attach(
+                        stream, true, deadline, authorize, submit,
+                    )
+                }?;
                 // The attachment ACK was written directly. No second status,
                 // especially no claimed Started event, belongs on this socket.
                 Ok(String::new())
             }
         }
     })();
-    if matches!(command, Command::Attach) {
+    if matches!(command, Command::Attach | Command::AttachAccounted) {
         // A final error reply cannot buy more time after the handoff expired.
         // Closing without another line preserves ambiguous-delivery semantics.
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {

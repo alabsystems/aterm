@@ -16,21 +16,14 @@ use aterm_secrets::membership_log::RecordBudgets;
 
 const NOW_MS: u64 = 1_760_000_000_000;
 
-#[test]
-fn registry_labels_override_a_stale_local_name_and_resolve_both_node_ids() {
-    use aterm_db::{
-        alab::{
-            Registry,
-            register::{Outcome, Probe},
-            registry::MACHINE,
-        },
-        typed::cell::{self, CellKey, CellValue},
-    };
-    let lab = Lab::new("registry-label-authority");
-    let registry = Registry::at(lab.paths.clone());
+/// This Mac's own registry row, registered and adopted in `lab`'s vault, labelled `label`: the
+/// registry and its row's key (this Mac's MACHINE_FACTS row is the only one the fixture can
+/// give, since a facts row counts only where its own Mac signed it).
+fn label_this_mac(lab: &Lab, label: &str) -> (aterm_db::alab::Registry, String) {
+    use aterm_db::alab::register::{Outcome, Probe};
+    let registry = aterm_db::alab::Registry::at(lab.paths.clone());
     registry.open().unwrap();
-    let own = own_node();
-    let principal = member::node_principal(own.key());
+    let principal = member::node_principal(own_node().key());
     let probe = Probe {
         hw_model: "Mac16,8".into(),
         hosts: vec!["m42-studio".into()],
@@ -44,20 +37,38 @@ fn registry_labels_override_a_stale_local_name_and_resolve_both_node_ids() {
     let Outcome::Adopted { mac, .. } = pass.outcome else {
         panic!("expected adoption of the migrated historical row")
     };
+    relabel(&registry, &mac, label);
+    (registry, mac)
+}
+
+/// Write `label` into the registry row `mac`.
+fn relabel(registry: &aterm_db::alab::Registry, mac: &str, label: &str) {
+    use aterm_db::{
+        alab::registry::MACHINE,
+        typed::cell::{self, CellKey, CellValue},
+    };
     registry
         .write(vec![vec![
             cell::change(
                 &MACHINE,
                 CellKey {
-                    pk: &mac,
+                    pk: mac,
                     col: "label",
                     elem: None,
                 },
-                &CellValue::owner(MACHINE.version, aterm_json::Value::from("m42")),
+                &CellValue::owner(MACHINE.version, aterm_json::Value::from(label)),
             )
             .unwrap(),
         ]])
         .unwrap();
+}
+
+#[test]
+fn registry_labels_override_a_stale_local_name_and_resolve_both_node_ids() {
+    let lab = Lab::new("registry-label-authority");
+    let own = own_node();
+    let principal = member::node_principal(own.key());
+    let (registry, mac) = label_this_mac(&lab, "m42");
     write_private(&lab.places.state, member::NAME_FILE, b"m22\n").unwrap();
     assert_eq!(
         names_this_machine(&lab.places, "M42").unwrap(),
@@ -67,20 +78,7 @@ fn registry_labels_override_a_stale_local_name_and_resolve_both_node_ids() {
         names_this_machine(&lab.places, "m22").is_err(),
         "a stale primary or roster label cannot bypass the registry"
     );
-    registry
-        .write(vec![vec![
-            cell::change(
-                &MACHINE,
-                CellKey {
-                    pk: &mac,
-                    col: "label",
-                    elem: None,
-                },
-                &CellValue::owner(MACHINE.version, aterm_json::Value::from("m42-1234")),
-            )
-            .unwrap(),
-        ]])
-        .unwrap();
+    relabel(&registry, &mac, "m42-1234");
     assert_eq!(
         names_this_machine(&lab.places, "M42-1234").unwrap(),
         Some(own.node().to_owned())
@@ -91,6 +89,96 @@ fn registry_labels_override_a_stale_local_name_and_resolve_both_node_ids() {
     assert_eq!(derived.actor, old.actor);
     assert_eq!(derived.transport, own.node());
     assert_eq!(derived.node, principal);
+}
+
+/// A person's `remove <word>` as `aterm members remove` and `aterm fleet remove` run it, with
+/// `lab`'s places for B2's resolver (`removal_seat_at`), never this account's.
+fn remove_by_person(lab: &Lab, word: &str) -> Result<Vec<String>, String> {
+    let words = ["remove".to_owned(), word.to_owned()];
+    let Ok(crate::members_cli::LabVerb::Remove(args)) =
+        crate::members_cli::parse_lab(crate::members_cli::Front::Members, &words)
+    else {
+        panic!("remove {word} is a removal");
+    };
+    crate::members_cli::remove_said(&lab.paths, &args, &|word| {
+        removal_seat_at(&lab.places, &lab.paths, word)
+    })
+}
+
+/// Every record `lab`'s vault holds.
+fn held(lab: &Lab) -> std::collections::BTreeSet<aterm_secrets::membership_log::RecordId> {
+    client::load_records(&lab.paths).unwrap().inventory()
+}
+
+/// The member `lab`'s log seats under `label` now.
+fn standing(lab: &Lab, label: &str) -> Option<aterm_secrets::membership_log::MemberId> {
+    let store = client::load_records(&lab.paths).unwrap();
+    let membership = store.log().unwrap().membership();
+    membership
+        .members()
+        .iter()
+        .find(|(_, member)| member.label == label)
+        .map(|(actor, _)| *actor)
+}
+
+/// Whether `lab`'s log removed `actor`.
+fn removed(lab: &Lab, actor: &aterm_secrets::membership_log::MemberId) -> bool {
+    let store = client::load_records(&lab.paths).unwrap();
+    store.log().unwrap().membership().removal(actor).is_some()
+}
+
+/// B12: a person's removal by node id takes out the seat B2's resolver names, and names the log
+/// name and node id it acted on; a second removal by that node id is refused (no standing seat
+/// binds it now) and signs nothing.
+///
+/// NEGATIVE CONTROL: make `removal_seat_at` return `Ok(None)` at once: the node id goes to the
+/// word path, which names no Mac by it, and the removal's `expect` fails.
+#[test]
+fn a_persons_removal_by_node_id_removes_the_seat_the_resolver_names() {
+    let lab = Lab::new("remove-by-node-id");
+    let m9 = standing(&lab, "m9").expect("CONTROL: m9 stands");
+    let node = member::node_principal(lab.m9.key());
+    let said = remove_by_person(&lab, &node).expect("m22 removes m9 by its node id");
+    assert!(said[0].starts_with("removed m9: "), "{said:?}");
+    assert!(
+        said.iter()
+            .any(|line| line.starts_with("m9 was ") && line.ends_with(&format!("node {node}"))),
+        "{said:?}"
+    );
+    assert!(removed(&lab, &m9), "m9's seat is removed");
+
+    let before = held(&lab);
+    let refused = remove_by_person(&lab, &node).expect_err("no standing seat binds it now");
+    assert!(refused.contains("no unique standing seat"), "{refused}");
+    assert_eq!(held(&lab), before, "a refused removal signs nothing");
+}
+
+/// B12, the discriminating control: where the registry calls this Mac `m9` while the log's `m9`
+/// is another Mac, a person's `remove m9` takes the registry's seat, this Mac's own, and refuses
+/// (a Mac does not remove itself), signing nothing; resolving the word in secrets would remove
+/// the log's `m9`, the hazard B2 closed.
+///
+/// NEGATIVE CONTROL: make `removal_seat_at` return `Ok(None)` at once: `m9` goes to the word
+/// path, which removes the log's m9, and the refusal's `expect_err` fails.
+#[test]
+fn a_registry_label_removes_the_registrys_seat_never_the_logs_label() {
+    let lab = Lab::new("remove-by-registry-label");
+    let m9 = standing(&lab, "m9").expect("CONTROL: the log's m9 stands");
+    let _ = label_this_mac(&lab, "m9");
+    let seat = registry_target(&lab.places, "m9")
+        .unwrap()
+        .expect("CONTROL: the registry names a seat m9");
+    assert_ne!(
+        seat.actor, m9,
+        "CONTROL: the registry's m9 is not the log's"
+    );
+    assert_eq!(seat.node, member::node_principal(own_node().key()));
+
+    let before = held(&lab);
+    let refused = remove_by_person(&lab, "m9").expect_err("the registry's m9 is this Mac");
+    assert!(refused.contains("does not remove itself"), "{refused}");
+    assert_eq!(held(&lab), before, "a refused removal signs nothing");
+    assert_eq!(standing(&lab, "m9"), Some(m9), "the log's m9 stays in");
 }
 
 struct Lab {
@@ -243,7 +331,7 @@ impl Lab {
             .map(|id| format!("\"{}:{}\"", id.node(), id.key().hex()))
             .collect();
         std::fs::create_dir_all(places.config.parent().unwrap()).unwrap();
-        std::fs::write(
+        crate::test_config::write(
             &places.config,
             format!(
                 "[fleet]\nallow = \"drive\"\ndrive_from = [{}]\n",
@@ -1341,7 +1429,7 @@ fn the_fleet_taken_again_under_the_vault_joined_drives_by_its_grants_as_before()
         m31.node(),
         m31.key().hex()
     );
-    std::fs::write(&lab.places.config, &grant_m31).unwrap();
+    crate::test_config::write(&lab.places.config, &grant_m31).unwrap();
     assert_eq!(
         drives_here(&lab.places, m31.node()),
         Some(false),
@@ -1350,7 +1438,7 @@ fn the_fleet_taken_again_under_the_vault_joined_drives_by_its_grants_as_before()
 
     // The take again, in a join's order: the grants made beside the vault left out (the join's
     // `Ungrant::OtherVault` lowers drive to content), then the vault joined recorded.
-    std::fs::write(&lab.places.config, "[fleet]\nallow = \"content\"\n").unwrap();
+    crate::test_config::write(&lab.places.config, "[fleet]\nallow = \"content\"\n").unwrap();
     {
         let book = member::hold_book(&lab.places.state).unwrap();
         crate::fleet_vault::take(&book, Vault::configured(&lab.paths).as_ref()).unwrap();
@@ -1361,13 +1449,13 @@ fn the_fleet_taken_again_under_the_vault_joined_drives_by_its_grants_as_before()
         "PRECONDITION: the take again keeps no grant"
     );
     // The person's grant, made under the vault joined.
-    std::fs::write(&lab.places.config, &grant_m31).unwrap();
+    crate::test_config::write(&lab.places.config, &grant_m31).unwrap();
     assert_eq!(
         drives_here(&lab.places, m31.node()),
         Some(true),
         "m31, which the vault joined seats, drives by its grant made under it"
     );
-    std::fs::write(
+    crate::test_config::write(
         &lab.places.config,
         format!(
             "[fleet]\nallow = \"drive\"\ndrive_from = [\"{}:{}\", \"{}:{}\"]\n",

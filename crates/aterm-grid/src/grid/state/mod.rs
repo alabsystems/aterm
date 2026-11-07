@@ -12,4 +12,5 @@ pub use crate::{GridCursorState, GridPresentationState};
 pub use storage::GridStorage;
 pub(crate) use storage::{
     DetachedReaderAim, FillDebt, PendingScrollbackSettings, UNLIMITED_RING_SCROLLBACK,
+    wrap_ring_index,
 };

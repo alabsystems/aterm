@@ -162,7 +162,14 @@ pub fn relocate_with(
         }
     }
 
-    let mut donors: BTreeSet<PathBuf> = BTreeSet::new();
+    // Explicit admitted toolchains are both the copy allowlist and a source of
+    // runtime libraries. A portable input may have only origin-relative rpaths
+    // (MC's toolchain install link), so no absolute rpath identifies its donor.
+    let mut donors: BTreeSet<PathBuf> = donor_roots
+        .iter()
+        .map(|root| root.join("lib"))
+        .filter(|lib| lib.is_dir())
+        .collect();
     let mut queue: Vec<PathBuf> = Vec::new();
     let mut prescanned: BTreeMap<PathBuf, ObjectRefs> = BTreeMap::new();
     let mut group_first: BTreeMap<(u64, u64), PathBuf> = BTreeMap::new();
@@ -235,10 +242,10 @@ pub fn relocate_with(
                 let base = basename(dep);
                 let unresolved_in_payload =
                     dep.starts_with("@rpath/") || is_shared_lib_basename(&base);
-                if unresolved_in_payload
-                    && !have.contains(&base)
-                    && let Some(src) = find_in_donors(&base, &donors)
-                {
+                if !unresolved_in_payload || have.contains(&base) {
+                    continue;
+                }
+                if let Some(src) = find_in_donors(&base, &donors) {
                     if vendor_file(
                         &src,
                         &VendorTo {
@@ -255,6 +262,11 @@ pub fn relocate_with(
                         queue.push(dest);
                     }
                     changed = true;
+                } else if dep.starts_with("@rpath/") {
+                    report.unresolved.push(format!(
+                        "{}: {dep} is absent from the payload and declared donor libraries",
+                        rel_display(stage, &obj)
+                    ));
                 }
             }
         }
@@ -1503,6 +1515,118 @@ mod tests {
             record.contains(&format!("{want} librustc_driver-0123456789abcdef.dylib lib/librustc_driver-0123456789abcdef.dylib")),
             "{record}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_donor_libraries_resolve_portable_and_transitive_rpaths() {
+        let (_dir, d) = scratch("portable-donor");
+        let stage = d.join("stage");
+        let seal = d.join("seal");
+        std::fs::create_dir_all(seal.join("lib")).unwrap();
+        let driver = "librustc_driver-0123456789abcdef.dylib";
+        let runtime = "libstd-0123456789abcdef.dylib";
+        for name in [driver, runtime] {
+            std::fs::write(seal.join("lib").join(name), format!("OBJ {name}")).unwrap();
+        }
+        let tool = stage.join("bin/tool");
+        std::fs::write(&tool, b"OBJ tool").unwrap();
+        let backend = ScriptedBackend {
+            refs: BTreeMap::from([
+                (
+                    tool,
+                    ObjectRefs {
+                        needed: vec![format!("@rpath/{driver}")],
+                        rpaths: vec!["@loader_path/../toolchain/lib".into()],
+                        ..ObjectRefs::default()
+                    },
+                ),
+                (
+                    stage.join(VENDOR_REL).join(driver),
+                    ObjectRefs {
+                        needed: vec![format!("@rpath/{runtime}")],
+                        rpaths: vec!["@loader_path".into()],
+                        ..ObjectRefs::default()
+                    },
+                ),
+            ]),
+        };
+        let report = relocate_with(&stage, &backend, None, std::slice::from_ref(&seal)).unwrap();
+        assert!(report.unresolved.is_empty(), "{:?}", report.unresolved);
+        assert_eq!(report.vendored.len(), 2);
+        assert_eq!(report.vendored_from.len(), 2);
+        for name in [driver, runtime] {
+            let original = seal.join("lib").join(name);
+            let record = report
+                .vendored_from
+                .iter()
+                .find(|v| v.name == name)
+                .unwrap();
+            assert_eq!(record.sha256, atpkg::tree::sha256_file(&original).unwrap());
+            assert_eq!(record.donor_rel, format!("lib/{name}"));
+            let original_bytes = std::fs::read(original).unwrap();
+            let copy = std::fs::read(stage.join(VENDOR_REL).join(name)).unwrap();
+            assert!(copy.starts_with(&original_bytes));
+            assert!(copy.ends_with(b"|sig"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_portable_dependencies_are_reported_without_ambient_search() {
+        let (_dir, d) = scratch("missing-portable");
+        let stage = d.join("stage");
+        let seal = d.join("seal");
+        std::fs::create_dir_all(seal.join("lib")).unwrap();
+        std::fs::create_dir_all(d.join("ambient/lib")).unwrap();
+        std::fs::write(d.join("ambient/lib/libmissing.dylib"), b"OBJ ambient").unwrap();
+        let tool = stage.join("bin/tool");
+        std::fs::write(&tool, b"OBJ tool").unwrap();
+        let backend = ScriptedBackend {
+            refs: BTreeMap::from([(
+                tool,
+                ObjectRefs {
+                    needed: vec!["@rpath/libmissing.dylib".into()],
+                    rpaths: vec!["@loader_path/../toolchain/lib".into()],
+                    ..ObjectRefs::default()
+                },
+            )]),
+        };
+        for donors in [vec![], vec![seal]] {
+            let report = relocate_with(&stage, &backend, None, &donors).unwrap();
+            assert_eq!(report.unresolved.len(), 1);
+            assert!(report.unresolved[0].contains("@rpath/libmissing.dylib is absent"));
+            assert!(report.vendored.is_empty());
+            assert!(!stage.join(VENDOR_REL).exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_donor_discovery_cannot_follow_a_library_outside_its_root() {
+        let (_dir, d) = scratch("portable-escape");
+        let stage = d.join("stage");
+        let seal = d.join("seal");
+        std::fs::create_dir_all(seal.join("lib")).unwrap();
+        let outside = d.join("outside.dylib");
+        std::fs::write(&outside, b"OBJ outside").unwrap();
+        std::os::unix::fs::symlink(&outside, seal.join("lib/libescape.dylib")).unwrap();
+        let tool = stage.join("bin/tool");
+        std::fs::write(&tool, b"OBJ tool").unwrap();
+        let backend = ScriptedBackend {
+            refs: BTreeMap::from([(
+                tool,
+                ObjectRefs {
+                    needed: vec!["@rpath/libescape.dylib".into()],
+                    ..ObjectRefs::default()
+                },
+            )]),
+        };
+        let report = relocate_with(&stage, &backend, None, std::slice::from_ref(&seal)).unwrap();
+        assert_eq!(report.unresolved.len(), 1);
+        assert!(report.unresolved[0].contains("is not inside a declared donor root"));
+        assert!(report.vendored.is_empty());
+        assert!(!stage.join(VENDOR_REL).exists());
     }
 
     /// A library that exists outside every declared donor root is left unresolved and not

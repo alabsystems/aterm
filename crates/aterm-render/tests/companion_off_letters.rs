@@ -11,7 +11,7 @@ use crate::trail_letters_read::{
     TYPING_TEXT, typed,
 };
 use aterm_effects::cursor_fx::TrailColor;
-use aterm_effects::kitty_pet::OldPath;
+use aterm_effects::kitty_pet::{OldPath, art_cols};
 use std::ops::RangeInclusive;
 
 /// The companion styles.
@@ -44,7 +44,13 @@ pub fn coats_driven(
     old: &[OldPath],
     drive: Drive,
 ) -> Vec<Judged> {
-    let mut r = Replay::sized(style, look, TrailColor::Automatic, scene.rows());
+    let mut r = Replay::gridded(
+        style,
+        look,
+        TrailColor::Automatic,
+        scene.rows(),
+        scene.cols(),
+    );
     r.coat = true;
     r.keys_unnoted = drive != Drive::Console;
     if drive == Drive::Gallery {
@@ -57,9 +63,7 @@ pub fn coats_driven(
     // The word pass on, as the app's default config has it: its icons on glass and the
     // page's ink it reads for the companion.
     r.fx.set_sparkle_enabled(true);
-    for &law in old {
-        r.fx.set_pet_old_path(law, true);
-    }
+    r.old_paths = old.to_vec();
     if let (Ok(dir), Ok(ms)) = (std::env::var("COAT_DUMP"), std::env::var("COAT_DUMP_MS")) {
         for f in ms.split(',').filter_map(|v| v.parse::<u64>().ok()) {
             r.dump.push((
@@ -127,6 +131,11 @@ fn survey_where_the_companion_lies() {
         Scene::SplitBurst,
         Scene::MoveUp,
         Scene::MoveUpHasty,
+        Scene::FoldRest,
+        Scene::FocusWrap,
+        Scene::StatusWrap,
+        Scene::LastRow,
+        Scene::Steam,
     ] {
         for look in [DARK, GITHUB_LIGHT, DEFAULT_LIGHT, SOLARIZED_DARK] {
             for style in COMPANIONS {
@@ -153,10 +162,15 @@ fn survey_where_the_companion_lies() {
                 if let Ok(frames) = std::env::var("COAT_FRAMES") {
                     for j in &judged {
                         let c = &j.coat;
-                        if frames == "all" || c.ink_px > 0 || c.icon_px > 0 || c.caret_px > 0 {
+                        if frames == "all"
+                            || c.ink_px > 0
+                            || c.icon_px > 0
+                            || c.caret_px > 0
+                            || !c.box_cells.is_empty()
+                        {
                             println!(
-                                "  {:5} ms pet {:?} ink {} caret {} icon {} cells {:?}",
-                                j.ms, c.pet, c.ink_px, c.caret_px, c.icon_px, c.cells
+                                "  {:5} ms pet {:?} ink {} caret {} icon {} cells {:?} box {:?}",
+                                j.ms, c.pet, c.ink_px, c.caret_px, c.icon_px, c.cells, c.box_cells
                             );
                         }
                     }
@@ -188,9 +202,13 @@ fn move_up_enter(scene: Scene) -> u64 {
 /// the line's last letters ([`Scene::MoveUpHasty`]), where it steps clear along the line
 /// instead of dropping onto the program's row: judged from 120 ms after that Enter, as the
 /// `k` the hand typed under its tail a moment before (the start of a typing run, not a
-/// program's letter) is left behind. Negative control: without the law that keeps it
-/// watching from beside the line ([`OldPath::WatchFromTheLine`] reverted alone) the cat lies
-/// on `NORMAL`, each way, until the ink sends it off.
+/// program's letter) is left behind. Its stand there may be flush with the `k`'s cell, and the
+/// coil it gathers there to leap when the caret moves up keeps its stretch off the `k`
+/// (`kitty_pet`'s `keep_stretch_off_letters`; stretched about its centre, the dog's coil on the
+/// gallery's frames laid its body on the `k`'s ink at 2559 ms under Linux's bundled JetBrains
+/// Mono's 13 x 29 px cells, a body 6.25 cells across). Negative control: without the law that
+/// keeps it watching from beside the line ([`OldPath::WatchFromTheLine`] reverted alone) the
+/// cat lies on `NORMAL`, each way, until the ink sends it off.
 #[test]
 fn the_companion_keeps_off_the_letters_a_program_writes() {
     for (scene, drive) in [
@@ -241,9 +259,120 @@ fn the_companion_keeps_off_the_letters_a_program_writes() {
     }
 }
 
-/// The cat's sit after the hand's last key (`kitty_pet`'s `SIT_AFTER`), and the hop that
-/// takes a cat waiting at the wall off the line's last letters then, and its landing.
+/// The cat's sit after the hand's last key (`kitty_pet`'s `SIT_AFTER`), and, for a cat the margin
+/// found no row beside the line for, the hop off the line's last letters then and its landing.
 const SAT_AND_HOPPED_MS: u64 = 1_400 + 600;
+
+/// `window` with the cat's wait at the wall read clear of the writing that comes on over it
+/// ([`writing_over_the_wait_cleared`] on each frame's coat). The caret, the icons and their
+/// blinks are judged as before.
+fn the_writing_over_the_wait(window: &[Judged], cell: (usize, usize)) -> Vec<Judged> {
+    let mut window = window.to_vec();
+    writing_over_the_wait_cleared(window.iter_mut().map(|j| &mut j.coat), cell);
+    window
+}
+
+/// `coats`, a run's in time order, with the cat's wait at the wall read clear of the writing
+/// that comes on over it: from a frame whose box stands against the grid's right edge (`COLS`
+/// cells of `cell` px) meeting no lettered cell, the seat, to the last frame before one whose
+/// box leaves that edge, each frame has the ink its body lies on cleared ([`Coat::ink_px`],
+/// [`Coat::cells`]) where every cell of it lies in the cells the seat's box met, all blank as
+/// it came: the line's last letters, typed into the seat since. A frame whose box leaves the
+/// edge ends the seat, and a frame arriving at the edge over a lettered cell starts none.
+fn writing_over_the_wait_cleared<'a>(
+    coats: impl Iterator<Item = &'a mut Coat>,
+    cell: (usize, usize),
+) {
+    let (cw, ch) = (cell.0 as i32, cell.1 as i32);
+    let edge = i32::from(crate::trail_letters_read::COLS) * cw;
+    let mut seat: Option<(RangeInclusive<usize>, RangeInclusive<usize>)> = None;
+    for coat in coats {
+        seat = match (seat.take(), coat.pet) {
+            (Some(held), Some((_, x1, ..))) if x1 == edge => Some(held),
+            (_, Some((x0, x1, y0, y1))) if x1 == edge && coat.box_cells.is_empty() => Some((
+                (y0 / ch) as usize..=((y1 - 1) / ch) as usize,
+                (x0 / cw) as usize..=((x1 - 1) / cw) as usize,
+            )),
+            _ => None,
+        };
+        if let Some((rows, cols)) = &seat
+            && coat
+                .cells
+                .iter()
+                .all(|c| rows.contains(&c.0) && cols.contains(&c.1))
+        {
+            coat.ink_px = 0;
+            coat.cells.clear();
+        }
+    }
+}
+
+/// THE WAIT'S WRITING IS READ OFF ONLY THE SEAT IT CAME TO CLEAR
+/// ([`writing_over_the_wait_cleared`], which the burst's laws read the run's frames through):
+/// on 13 x 29 px cells, a cat that comes to the wall (its box's right edge on the grid's) over
+/// blank cells has the letters later typed into its seat read off its body while it stands
+/// there; the same letters are judged on its body where it came to the wall over a lettered
+/// cell, in the frame its box leaves the wall and after, and where any cell its body lies on
+/// is outside the seat it came to.
+#[test]
+fn the_wait_s_writing_is_read_off_only_the_seat_it_came_to_clear() {
+    let cell = (13usize, 29usize);
+    let edge = i32::from(crate::trail_letters_read::COLS) * 13;
+    // A body six cells wide on row 5 (its box from row 4), against the wall or a cell off it.
+    let at_wall = Some((edge - 6 * 13, edge, 4 * 29 + 10, 6 * 29));
+    let off_wall = Some((edge - 7 * 13, edge - 13, 4 * 29 + 10, 6 * 29));
+    let coat = |pet, box_cells: &[(usize, usize)], cells: &[(usize, usize, usize)]| Coat {
+        pet,
+        ink_px: cells.iter().map(|c| c.2).sum(),
+        cells: cells.to_vec(),
+        box_cells: box_cells.to_vec(),
+        ..Coat::default()
+    };
+    let read = |run: Vec<Coat>| -> Vec<usize> {
+        let mut run = run;
+        writing_over_the_wait_cleared(run.iter_mut(), cell);
+        run.iter().map(|c| c.ink_px).collect()
+    };
+    // Typed into the seat it came to clear: read off its body while it waits there.
+    let typed = [(5usize, 68usize, 9usize), (5, 69, 4)];
+    assert_eq!(
+        read(vec![
+            coat(at_wall, &[], &[]),
+            coat(at_wall, &[(5, 68)], &typed[..1]),
+            coat(at_wall, &[(5, 68), (5, 69)], &typed),
+        ]),
+        [0, 0, 0],
+        "the letters typed into the seat it came to clear are its wait's"
+    );
+    // Come to the wall over a lettered cell: no seat, its letters judged.
+    assert_eq!(
+        read(vec![
+            coat(at_wall, &[(5, 68)], &typed[..1]),
+            coat(at_wall, &[(5, 68), (5, 69)], &typed),
+        ]),
+        [9, 13],
+        "control: a cat come to the wall over a letter had that letter read off its body"
+    );
+    // Off the wall, and after: the seat is over.
+    assert_eq!(
+        read(vec![
+            coat(at_wall, &[], &[]),
+            coat(off_wall, &[(5, 68)], &typed[..1]),
+            coat(at_wall, &[(5, 68), (5, 69)], &typed),
+        ]),
+        [0, 9, 13],
+        "control: a frame off the wall, or back at it over the letters, had them read off"
+    );
+    // A cell outside the seat: the row above the box's own, lettered under the body.
+    assert_eq!(
+        read(vec![
+            coat(at_wall, &[], &[]),
+            coat(at_wall, &[(3, 68)], &[(3, 68, 7), (5, 68, 9)]),
+        ]),
+        [0, 16],
+        "control: a body on a cell outside its seat had its letters read off"
+    );
+}
 
 /// THE BURST NEVER LAYS A RUNNING OR RESTING COMPANION ON ITS LETTERS, ITS ICONS OR THE CARET
 /// (the trail gallery's `burst`, looks8 rounds 2 and 3, r23 K6): no frame lays the
@@ -251,12 +380,17 @@ const SAT_AND_HOPPED_MS: u64 = 1_400 + 600;
 /// it lay on an icon, the icon yielded to it and came back: a blink), and no icon blinks, from
 /// the first key to the last (the run's start, where round 2 caught the body on `echo the
 /// qu` as the first keys were typed under the cat landing at the prompt, and the run to the
-/// wall) and from the cat's sit on to the scene's end, 4.6 s past the last key. Between, the
-/// cat waits at the wall for a wrap the hand may still type, the line's last letters over
-/// it: no bound leaves for a wrap that has not come (r23 K6-1: leaving early, it hung over
-/// the line and came down on the next line's start for a wrap that never came), and once the
-/// hand has stopped it hops off them to the seat by the caret that covers none. It rests
-/// there: its drawn box keeps its place, within its breath, through the scene's last second.
+/// wall), from the last key to its sit and from the sit on to the scene's end, 4.6 s past the
+/// last key. It waits at the wall for a wrap the hand may still type, on the blank row under
+/// the line, where it slid as it took the margin (`margin_seat_off_the_line`), so the line's
+/// last letters are typed past it: no bound leaves for a wrap that has not come (r23 K6-1:
+/// leaving early, it hung over the line and came down on the next line's start for a wrap that
+/// never came). The run's frames read writing typed into a seat at the wall the cat came to
+/// clear as the wait's ([`the_writing_over_the_wait`]): before the slide, the wider the body,
+/// the sooner the writing came over it at the wall on the line, and under Linux's bundled
+/// JetBrains Mono (13 x 29 px cells, a body 6.25 cells across) the cat stood at the wall from
+/// 4112 ms and the line's last letter but one was typed over its tail at 4252. It rests there:
+/// its drawn box keeps its place, within its breath, through the scene's last second.
 /// With the cat on dark and the dog on Solarized Dark, the keys typed through the console
 /// and, as the gallery types them (`aterm ctl key`), past it. Negative control: without the
 /// first keys' landing ahead of them ([`OldPath::FirstKeysAhead`]) they are typed under the
@@ -274,6 +408,7 @@ fn the_burst_never_lays_a_running_or_resting_companion_on_its_letters() {
     let (first_key, last_key) = (keys[0], keys[keys.len() - 1]);
     let end = last_key + tail;
     let rested = last_key + SAT_AND_HOPPED_MS;
+    let cell = Replay::new("off", DARK, TrailColor::Automatic).cell;
     let on_letters = |judged: &[Judged], from: u64, to: u64| -> usize {
         judged
             .iter()
@@ -308,12 +443,21 @@ fn the_burst_never_lays_a_running_or_resting_companion_on_its_letters() {
                 look.name,
                 rest.first().zip(rest.last())
             );
-            for (part, from, to) in [("run", first_key, last_key), ("rest", rested, end)] {
+            for (part, from, to) in [
+                ("run", first_key, last_key),
+                ("wait", last_key, rested),
+                ("rest", rested, end),
+            ] {
                 let window: Vec<Judged> = judged
                     .iter()
                     .filter(|j| j.ms >= from && j.ms <= to)
                     .cloned()
                     .collect();
+                let window = if part == "run" {
+                    the_writing_over_the_wait(&window, cell)
+                } else {
+                    window
+                };
                 let s = sum(&window, from);
                 let icons = window.iter().filter(|j| j.coat.icon_px > 0).count();
                 assert_eq!(
@@ -343,14 +487,15 @@ fn the_burst_never_lays_a_running_or_resting_companion_on_its_letters() {
 /// THE SPLIT'S BURST NEVER LAYS A RUNNING OR RESTING COMPANION ON ITS LETTERS (the trail
 /// gallery's `split`, looks8 round 3, r23 K6): the burst typed on the last row but one of the
 /// caret's 6-row pane, so the row under the line is the pane's last, where the body's head
-/// would lie in the line. From the first key to the last, and from the cat's sit on to the
-/// scene's end, 4.6 s past the last key, no frame lays the companion's drawn body on a
+/// would lie in the line. From the first key to the scene's end, 4.6 s past the last key, no
+/// frame lays the companion's drawn body on a
 /// lettered cell, the caret's cell or a word icon, no icon blinks, and it has come to rest by
-/// the scene's last second: once the hand has stopped it hops off the line's last letters at
-/// the wall onto the row over the line (round 3's first capture caught a bound coming down onto
-/// `the` 1.65 s after the last key, to rest with its head in the line). With the cat on dark
-/// and the dog on Solarized Dark, the keys typed through the console and, as the gallery types
-/// them, past it.
+/// the scene's last second: as it takes the margin it slides onto the row over the line
+/// (`margin_seat_off_the_line`; round 3's first capture caught a bound coming down onto
+/// `the` 1.65 s after the last key, to rest with its head in the line). The run's frames read
+/// writing typed into a seat at the wall it came to clear as the burst's wait does
+/// ([`the_writing_over_the_wait`]). With the cat on dark and the dog on Solarized Dark, the keys
+/// typed through the console and, as the gallery types them, past it.
 #[test]
 fn the_split_s_burst_never_lays_a_running_or_resting_companion_on_its_letters() {
     let scene = Scene::SplitBurst;
@@ -363,6 +508,7 @@ fn the_split_s_burst_never_lays_a_running_or_resting_companion_on_its_letters() 
     let (first_key, last_key) = (keys[0], keys[keys.len() - 1]);
     let end = last_key + tail;
     let rested = last_key + SAT_AND_HOPPED_MS;
+    let cell = Replay::new("off", DARK, TrailColor::Automatic).cell;
     for drive in [Drive::Console, Drive::Ctl] {
         for (style, look) in [("rainbow kitty pet", DARK), ("rainbow dog", SOLARIZED_DARK)] {
             let judged = coats_driven(style, look, scene, &[], drive);
@@ -384,12 +530,21 @@ fn the_split_s_burst_never_lays_a_running_or_resting_companion_on_its_letters() 
                 look.name,
                 rest.first().zip(rest.last())
             );
-            for (part, from, to) in [("run", first_key, last_key), ("rest", rested, end)] {
+            for (part, from, to) in [
+                ("run", first_key, last_key),
+                ("wait", last_key, rested),
+                ("rest", rested, end),
+            ] {
                 let window: Vec<Judged> = judged
                     .iter()
                     .filter(|j| j.ms >= from && j.ms <= to)
                     .cloned()
                     .collect();
+                let window = if part == "run" {
+                    the_writing_over_the_wait(&window, cell)
+                } else {
+                    window
+                };
                 let s = sum(&window, from);
                 let icons = window.iter().filter(|j| j.coat.icon_px > 0).count();
                 assert_eq!(
@@ -561,11 +716,12 @@ const TYPING_FROM: u64 = 1_000;
 /// law ([`OldPath::HeadUnderLetters`] reverted alone) the box lies on the row above's letters
 /// (186 frames under `gjpqy`, 73 under the sentence, measured by ink).
 ///
-/// Under ragged output above (words six cells apart, a long listing's columns, words 24 cells
-/// apart), the gaps wider than the body: the law reads the row above as far past the body,
-/// either side, as its ease can take it ([`OldPath::HeadLooksAhead`]; reverted alone, the box
-/// of the cat getting going out of the gap it rests in meets the next word's first letters),
-/// at the speed the run can reach in the ease and past a stand the writing carries on
+/// Under ragged output above (words the body's width apart, rounded up to a cell, a long
+/// listing's columns as far apart, words 24 cells apart), the gaps wider than the body: the
+/// law reads the row above as far past the body, either side, as its ease can take it
+/// ([`OldPath::HeadLooksAhead`]; reverted alone, the box of the cat getting going out of the
+/// gap it rests in meets the next word's first letters), at the speed the run can reach in the
+/// ease and past a stand the writing carries on
 /// ([`OldPath::LookAheadAtTopSpeed`]; reverted alone, under words 24 cells apart the cat
 /// speeding up off the first keys meets `efgh` before its sink is done, r24 K7-1), and once
 /// drawn down the body stays down across a gap wider than that ([`OldPath::HeadHeldAcrossGaps`];
@@ -576,15 +732,20 @@ const TYPING_FROM: u64 = 1_000;
 fn the_companion_keeps_off_a_lettered_row_above_the_prompt() {
     let gj = "gjpqy ".repeat(12);
     let fox = "the quick brown fox jumps over the lazy dog";
-    let ragged = "abcd      efgh      ijkl      mnop      qrst      uvwx      yz";
-    let listing = "ls -la      total 48      drwxr-xr-x      staff      Oct 29";
+    // The ragged rows' gaps: the body's width rounded up to a cell ([`art_cols`]), six cells
+    // on the gallery's 14 x 26 px cells (a body 5.2 cells across) and seven under Linux's
+    // bundled JetBrains Mono's 13 x 29 (6.25 across), where six held no body.
+    let cell = Replay::new("off", DARK, TrailColor::Automatic).cell;
+    let gap = " ".repeat(art_cols(cell.0 as u16, cell.1 as u16).ceil() as usize);
+    let ragged = ["abcd", "efgh", "ijkl", "mnop", "qrst", "uvwx", "yz"].join(&gap);
+    let listing = ["ls -la", "total 48", "drwxr-xr-x", "staff", "Oct 29"].join(&gap);
     let wide = format!("abcd{0}efgh{0}ijkl", " ".repeat(24));
     let from = 600;
     for rows in [
         (gj.as_str(), ""),
         (fox, ""),
-        (ragged, ""),
-        (listing, ""),
+        (ragged.as_str(), ""),
+        (listing.as_str(), ""),
         (wide.as_str(), ""),
     ] {
         for (style, look) in [
@@ -635,7 +796,7 @@ fn the_companion_keeps_off_a_lettered_row_above_the_prompt() {
         "rainbow kitty pet",
         DARK,
         4,
-        (ragged, ""),
+        (ragged.as_str(), ""),
         &[OldPath::HeadLooksAhead],
         false,
     );
@@ -736,11 +897,15 @@ fn the_companion_keeps_off_a_lettered_row_above_a_prompt_on_the_last_row() {
 /// bound blank and the output's line two above it), and with an output line that runs on to
 /// within two cells of the row's end, so no seat past it fits a body and the cat stands under
 /// it: the long line lands over the cat resting whole beside the caret's line, and the head
-/// law judges a body as the page under it changes ([`OldPath::JudgedAsThePageChanges`]).
+/// law judges a body as the page under it changes ([`OldPath::JudgedAsThePageChanges`]); and
+/// with that line and the new prompt 24 cells in, the caret beside the resting cat.
 /// Negative controls, each reverted alone: [`OldPath::RowFit`], under the long line its box
-/// meets the line above the last row; [`OldPath::JudgedAsThePageChanges`], the long line lies
-/// under its whole box until it next moves (31 frames, half a second, for every companion
-/// style); [`OldPath::HeadClearInFlight`], with the blank line, its
+/// meets the line above the last row; [`OldPath::JudgedAsThePageChanges`], with the prompt 24
+/// cells in, the long line lies under the cat's whole box until it next moves (156 frames, to
+/// the scene's end, on 13 x 29, 14 x 26 and 11 x 28 px cells: the effects' replay); with the
+/// prompt at the row's start the cat gathers to leave at once and reads its way as it does
+/// ([`OldPath::WayBeforeSettingOff`]), judged there after 7 frames in that replay (32, half a
+/// second, with that law reverted too); [`OldPath::HeadClearInFlight`], with the blank line, its
 /// box meets the output's letters two rows above mid-bound (in the scene as the gallery has it,
 /// the fit now keeps the bound in its row too); [`OldPath::ArcJudgedInTheAir`], with the blank
 /// line, the cat's box meets them as the output lands after the bound's take-off (18 frames).
@@ -748,10 +913,13 @@ fn the_companion_keeps_off_a_lettered_row_above_a_prompt_on_the_last_row() {
 fn the_companion_keeps_off_the_echo_over_a_return_at_the_last_row() {
     let enter = 1_000 + 60 * TYPING_TEXT.len() as u64 + 200;
     let long = format!("{:.70}\r\n$ ", "the quick brown fox ".repeat(4));
-    let outputs: [&[u8]; 3] = [
+    // The long line, the new prompt 24 cells in: the caret lands beside the resting cat.
+    let under = format!("{:.70}\r\n{:24}$ ", "the quick brown fox ".repeat(4), "");
+    let outputs: [&[u8]; 4] = [
         b"the quick brown fox\r\n$ ",
         b"the quick brown fox\r\n\r\n$ ",
         long.as_bytes(),
+        under.as_bytes(),
     ];
     let run = |style: &str, look: Look, old: &[OldPath], output: &[u8]| {
         let mut r = Replay::new(style, look, TrailColor::Automatic);
@@ -814,7 +982,7 @@ fn the_companion_keeps_off_the_echo_over_a_return_at_the_last_row() {
         "rainbow kitty pet",
         DARK,
         &[OldPath::JudgedAsThePageChanges],
-        outputs[2],
+        outputs[3],
     );
     assert!(
         boxes_on_glyphs(&old, enter, 12..=12) >= 10,
@@ -850,6 +1018,23 @@ fn steamed_between_lettered_rows(
     old: &[OldPath],
     drive: Drive,
 ) -> (Vec<Judged>, i32) {
+    steamed_then(style, look, page, old, drive, &[])
+}
+
+/// A program's bytes after the steam scene's Backspaces, each with when it lands (ms after the
+/// last Backspace).
+type Then<'a> = &'a [(u64, &'a [u8])];
+
+/// [`steamed_between_lettered_rows`], and each of `then` landing as it says, the coats read to
+/// 1.6 s after the last.
+fn steamed_then(
+    style: &str,
+    look: Look,
+    page: &str,
+    old: &[OldPath],
+    drive: Drive,
+    then: Then<'_>,
+) -> (Vec<Judged>, i32) {
     let mut r = Replay::new(style, look, TrailColor::Automatic);
     r.coat = true;
     r.keys_unnoted = drive != Drive::Console;
@@ -867,6 +1052,9 @@ fn steamed_between_lettered_rows(
             Ev::Key('\u{7f}', b"\x08 \x08".to_vec()),
         )
     }));
+    for &(after, bytes) in then {
+        ev.push((erase_from + 50 * 11 + after, Ev::Out(bytes.to_vec())));
+    }
     (r.run(&ev, 1_600), ch)
 }
 
@@ -884,7 +1072,8 @@ enum Steam {
     /// the margin, on each of the [`SEAT_ROWS`] rows under the prompt.
     Deep,
     /// As the gallery has them on the alternate screen, where a full-screen program's rows
-    /// under its line are its own and the cat keeps its line's row, fitted there.
+    /// under its line are its own and the cat keeps its line's row
+    /// ([`OldPath::FullScreenKeepsItsRow`]): at a seat along it, or fitted there by the caret.
     FullScreen,
 }
 
@@ -1125,48 +1314,202 @@ fn a_body_fitted_to_its_row_stays_fitted_along_it() {
     );
 }
 
-/// A BODY HELD IN ITS ROW IS DRAWN NO TALLER THAN ITS FIT ([`OldPath::HeldNoTaller`]): in the
-/// `steam` scene typed at the window, a cat fitted to the prompt's row between two lettered rows
-/// has 0.08 of a row over its ears, and a pose's stretch (a purr's swell, an ear's twitch up)
-/// took them 3 px into the row above's letters. With the law no frame of the cat on dark or the
-/// dog on Solarized Dark on the prompt's row ([`on_row`]) meets a lettered cell, where no seat
-/// in reach draws the body whole ([`Steam::Deep`]) and on the alternate screen
-/// ([`Steam::FullScreen`]). Negative control (the law reverted alone, the cat on dark, on the
-/// alternate screen): a frame's box meets the row above's letters.
+/// A BODY HELD IN ITS ROW IS DRAWN NO TALLER THAN ITS FIT ([`OldPath::HeldNoTaller`],
+/// [`OldPath::DrawnDownNoTaller`]): in the `steam` scene typed at the window, a cat fitted to
+/// the prompt's row between two lettered rows has 0.08 of a row over its ears, and a pose's
+/// stretch (a leap's take-off, a purr's swell, an ear's twitch up) took them 3 px into the row
+/// above's letters; a cat drawn down its row has as little, and a leap straight down from it
+/// took them 4 px in. With the laws no frame of the cat on dark or the dog on Solarized Dark on
+/// the prompt's row ([`on_row`]) meets a lettered cell, where no seat in reach draws the body
+/// whole ([`Steam::Deep`]), on the alternate screen ([`Steam::FullScreen`]), and there under a
+/// row lettered past the seats along the prompt's row, the cat held in it by the caret, when
+/// the program moves the caret five rows down and back after the Backspaces, three times down
+/// and twice up a second apart (vim's `5j` and `5k`), and the cat leaps straight down from the
+/// prompt's row, fitted the first time and drawn down after, and back up into it; there no
+/// frame at all, in the air or on the ground, meets the row above's letters. Negative controls
+/// (the cat on dark, in those leaps): the stretch takes its box into the row above's letters,
+/// at every take-off, touchdown and landing with [`OldPath::HeldNoTaller`] reverted (eight
+/// frames or more; 11 under Linux's bundled JetBrains Mono, 13 x 29 px cells), at each
+/// touchdown back into the drawn-down row with [`OldPath::DrawnDownNoTaller`] reverted (two or
+/// more; 2 on macOS), and at each take-off down from that row as well with it and
+/// [`OldPath::CrossingRisesIntoTheLine`] reverted: a take-off down is a crossing off a row the
+/// body was held on, and the crossing law draws it no taller too (four or more; 6 on macOS, the
+/// count [`OldPath::DrawnDownNoTaller`] alone took before the crossing law joined it). The
+/// effects' own `a_body_held_fitted_or_drawn_down_is_drawn_no_taller_than_its_fit_on_every_face`
+/// judges the leaps, and the three controls, on 13 x 29, 14 x 26 and 11 x 28 px cells.
 #[test]
 fn a_body_held_in_its_row_is_drawn_no_taller_than_its_fit() {
     let from = 600;
-    let run = |style: &str, look: Look, steam: Steam, old: &[OldPath]| {
-        let page = steam_page(STEAM_ROWS[0], steam);
-        let (judged, ch) = steamed_between_lettered_rows(style, look, &page, old, Drive::Console);
+    // Lettered past the seats along the prompt's row (the body's width short of the margin),
+    // over a row under whose letters end before the caret's column after the Backspaces.
+    let held = (
+        "the quick brown fox jumps over the lazy dog, every glyph legible here",
+        "Below: pqgyj",
+    );
+    let down: &[u8] = b"\x1b[10;15H";
+    let up: &[u8] = b"\x1b[5;15H";
+    let moves: Then<'_> = &[
+        (300, down),
+        (1_300, up),
+        (2_300, down),
+        (3_300, up),
+        (4_300, down),
+    ];
+    let scenes: [(_, _, Then<'_>); 3] = [
+        (STEAM_ROWS[0], Steam::Deep, &[]),
+        (STEAM_ROWS[0], Steam::FullScreen, &[]),
+        (held, Steam::FullScreen, moves),
+    ];
+    // Frames on the prompt's row whose box meets a lettered cell; and, where the program moves
+    // the caret, frames whose box meets the row above's letters.
+    let run = |style: &str, look: Look, scene: usize, old: &[OldPath]| {
+        let (rows, steam, then) = scenes[scene];
+        let page = steam_page(rows, steam);
+        let (judged, ch) = steamed_then(style, look, &page, old, Drive::Console, then);
         let on = past_the_first_keys(&on_row(&judged, from, 4, ch), TYPING_FROM, 4);
         assert!(
             on.len() >= 40,
-            "fixture: {style} on {} ({steam:?}) rests on the prompt's row",
+            "fixture: {style} on {} ({steam:?}, {then:?}) rests on the prompt's row",
             look.name
         );
-        boxes_on_glyphs(&on, from, 0..=23)
+        let above = if then.is_empty() {
+            0
+        } else {
+            boxes_on_glyphs(&judged, from, 3..=3)
+        };
+        (boxes_on_glyphs(&on, from, 0..=23), above)
     };
-    for steam in [Steam::Deep, Steam::FullScreen] {
+    for (scene, case) in scenes.iter().enumerate() {
         for (style, look) in [("rainbow kitty pet", DARK), ("rainbow dog", SOLARIZED_DARK)] {
             assert_eq!(
-                run(style, look, steam, &[]),
-                0,
-                "{style} on {} ({steam:?}): frames on the prompt's row whose box meets a \
-                 lettered cell",
+                run(style, look, scene, &[]),
+                (0, 0),
+                "{style} on {} ({case:?}): frames on the prompt's row whose box meets a lettered \
+                 cell, frames whose box meets the row above's letters as it leaps",
                 look.name
             );
         }
     }
-    assert!(
-        run(
+    let controls: [(&[OldPath], usize); 3] = [
+        (&[OldPath::HeldNoTaller], 8),
+        (&[OldPath::DrawnDownNoTaller], 2),
+        (
+            &[
+                OldPath::DrawnDownNoTaller,
+                OldPath::CrossingRisesIntoTheLine,
+            ],
+            4,
+        ),
+    ];
+    for (old, bites) in controls {
+        let (_, above) = run("rainbow kitty pet", DARK, 2, old);
+        assert!(
+            above >= bites,
+            "negative control ({old:?}): stretched past its fit, the box met the row above's \
+             letters in {above} frames"
+        );
+    }
+}
+
+/// A FULL-SCREEN PROGRAM'S ROWS UNDER ITS LINE ARE ITS OWN ([`OldPath::FullScreenKeepsItsRow`]):
+/// in the `steam` scene on the alternate screen ([`Steam::FullScreen`]) the cat keeps its line's
+/// row. Seated three rows under the prompt at rest and while the hand wrote, it flew up across
+/// the lettered row under the prompt at the first Backspace and back down across it once the
+/// caret rested (under Linux's bundled JetBrains Mono, 13 x 29 px cells: 26 of the cat's frames
+/// on dark whose box met that row's letters, 1,392 px of their ink under its body). Kept on its
+/// row, it comes to rest whole flush past the row above's last letter, and sets off back into
+/// the line drawn down or fitted for its way ([`OldPath::WayBeforeSettingOff`]): drawn for it
+/// only from its first step or its take-off, its box met that letter's cell for three or four
+/// frames as it went. Between the gallery's own rows and between descenders and a sentence, the
+/// cat on dark and the dog on Solarized Dark, keys typed at the window and as the gallery types
+/// them, from 600 ms to the scene's end: no frame's foot lies past the row under the prompt (a
+/// body drawn down its row reaches into that row where it is blank,
+/// [`aterm_effects::kitty_pet::head_law`]), none meets a lettered cell of that row by a pixel
+/// or more or lays the body on its ink, and no frame's box meets a lettered cell of the row
+/// above. Negative controls (each law reverted alone, the cat on dark, the gallery's rows, both
+/// ways of typing): with [`OldPath::FullScreenKeepsItsRow`] 40 frames or more stand under the
+/// row under and 10 or more meet its letters (167 and 26 at the window, 98 and 29 as the
+/// gallery types, under JetBrains Mono; 98 and 31 under Iosevka Term's 11 x 28); with
+/// [`OldPath::WayBeforeSettingOff`] two frames or more meet the row above's letters as it sets
+/// off (three and four there). The effects' own tests judge both laws, and both controls, on
+/// 13 x 29, 14 x 26 and 11 x 28 px cells.
+#[test]
+fn a_full_screen_program_s_rows_under_its_line_are_its_own() {
+    let from = 600;
+    // Frames whose foot lies past the row under the prompt (row 5), and frames whose box or
+    // body meets that row's letters.
+    let under = |judged: &[Judged], ch: i32| -> (usize, usize) {
+        let past = judged
+            .iter()
+            .filter(|j| j.ms >= from && j.coat.pet.is_some_and(|p| p.3 > 6 * ch))
+            .count();
+        let on = judged
+            .iter()
+            .filter(|j| {
+                j.ms >= from
+                    && (j.coat.box_cells.iter().any(|c| c.0 == 5)
+                        || j.coat.cells.iter().any(|c| c.0 == 5))
+            })
+            .count();
+        (past, on)
+    };
+    let mut runs = Vec::new();
+    for rows in STEAM_ROWS {
+        for (style, look) in [("rainbow kitty pet", DARK), ("rainbow dog", SOLARIZED_DARK)] {
+            for drive in [Drive::Console, Drive::Ctl] {
+                runs.push((rows, style, look, drive));
+            }
+        }
+    }
+    aterm_spec::check::each(&runs, |&(rows, style, look, drive)| {
+        let page = steam_page(rows, Steam::FullScreen);
+        let (judged, ch) = steamed_between_lettered_rows(style, look, &page, &[], drive);
+        let drawn = judged
+            .iter()
+            .filter(|j| j.ms >= from && j.coat.pet.is_some())
+            .count();
+        assert!(
+            drawn >= 200,
+            "fixture: {style} on {} between {rows:?} ({drive:?}) is drawn ({drawn} frames)",
+            look.name
+        );
+        assert_eq!(
+            (under(&judged, ch), boxes_on_glyphs(&judged, from, 3..=3)),
+            ((0, 0), 0),
+            "{style} on {} between {rows:?} ({drive:?}): frames standing past the row under the \
+             prompt, frames on that row's letters; frames whose box meets the row above's letters",
+            look.name
+        );
+    });
+    for drive in [Drive::Console, Drive::Ctl] {
+        let page = steam_page(STEAM_ROWS[0], Steam::FullScreen);
+        let (old, ch) = steamed_between_lettered_rows(
             "rainbow kitty pet",
             DARK,
-            Steam::FullScreen,
-            &[OldPath::HeldNoTaller]
-        ) > 0,
-        "negative control: stretched past its fit, the box never met the row above's letters"
-    );
+            &page,
+            &[OldPath::FullScreenKeepsItsRow],
+            drive,
+        );
+        let (past, on) = under(&old, ch);
+        assert!(
+            past >= 40 && on >= 10,
+            "negative control ({drive:?}): seated under the line, the cat stood past the row \
+             under in {past} frames and met its letters in {on}"
+        );
+        let (old, _) = steamed_between_lettered_rows(
+            "rainbow kitty pet",
+            DARK,
+            &page,
+            &[OldPath::WayBeforeSettingOff],
+            drive,
+        );
+        let above = boxes_on_glyphs(&old, from, 3..=3);
+        assert!(
+            above >= 2,
+            "negative control ({drive:?}): drawn for its way from its first step or take-off, \
+             the cat's box met the row above's letters in {above} frames"
+        );
+    }
 }
 
 /// The gallery's `context` in the replay ([`Scene::Context`]), the companion's laws in `old`
@@ -1506,9 +1849,10 @@ fn a_seat_past_a_line_s_end_keeps_the_body_whole() {
 /// What [`Scene::Wrapped`] shows of the companion on `look`, its laws in `old` reverted, keys
 /// through the console: the highest the wrap's crossing carries its box's foot (frame px, the
 /// least `y1` from its take-off off the line's first row to the frame it is down on the second),
-/// the cell height, and the frames from the one it is down on to the scene's end whose drawn
-/// box meets a glyph's cell on the first row or whose body lies on that row's ink.
-fn wrapped_coat(style: &str, look: Look, old: &[OldPath]) -> (i32, i32, usize) {
+/// the cell height, the frames from the one it is down on to the scene's end whose drawn box
+/// meets a glyph's cell on the first row or whose body lies on that row's ink, and those frames
+/// from the wrap on, its crossing among them.
+fn wrapped_coat(style: &str, look: Look, old: &[OldPath]) -> (i32, i32, usize, usize) {
     let judged = coats_driven(style, look, Scene::Wrapped, old, Drive::Console);
     let ch = Replay::new(style, look, TrailColor::Automatic).cell.1 as i32;
     let wrap = TYPING_FROM + 60 * (usize::from(crate::trail_letters_read::COLS) - 2) as u64;
@@ -1532,31 +1876,35 @@ fn wrapped_coat(style: &str, look: Look, old: &[OldPath]) -> (i32, i32, usize) {
         .map(|&(_, y1)| y1)
         .min()
         .unwrap_or(i32::MAX);
+    let meets_the_line = |j: &&crate::trail_letters_read::Judged| {
+        j.coat.box_cells.iter().any(|c| c.0 == 4) || j.coat.cells.iter().any(|c| c.0 == 4)
+    };
     let on_the_line = judged
         .iter()
-        .filter(|j| {
-            j.ms >= down
-                && (j.coat.box_cells.iter().any(|c| c.0 == 4)
-                    || j.coat.cells.iter().any(|c| c.0 == 4))
-        })
+        .filter(|j| j.ms >= down)
+        .filter(meets_the_line)
         .count();
-    (apex, ch, on_the_line)
+    let crossing = judged
+        .iter()
+        .filter(|j| j.ms >= wrap)
+        .filter(meets_the_line)
+        .count();
+    (apex, ch, on_the_line, crossing)
 }
 
 /// A COMPANION CROSSING A WRAP AND RESTING BESIDE THE CARET ON THE LINE'S SECOND ROW KEEPS OFF
 /// THE LINE (r24 K7-4, K7-6): a line typed past the margin onto a second row and stopped there
-/// ([`Scene::Wrapped`]). The wrap's crossing carries the body high over the line's first row,
-/// its box's foot at the bound's apex no more than a quarter row into that row: the landing's
-/// head law is judged and eased in for the crossing's last `HEAD_EASE_S` only
-/// ([`OldPath::SinkAtTheLanding`]). Once down on the second row, through its run with the writing
-/// and its rest beside the caret under the line's full first row, no frame's drawn box meets a
-/// glyph's cell on the first row or lays the body on its ink: its head is drawn down its row
-/// ([`aterm_effects::kitty_pet::head_law`]). Every companion style, on dark, Solarized Dark,
-/// GitHub Light and Default Light. (Coming down through the first row in the crossing's last
-/// frames, its body passes behind letters knocked out of it, a body in motion with the writing,
-/// r24 K7-1.) Negative controls, each alone: with the landing's sink from the take-off
-/// ([`OldPath::SinkAtTheLanding`]) the arc flies 0.65 of a row over its path instead of 1.43 and
-/// the box's foot stays three quarters of a row into the first row; without the head law
+/// ([`Scene::Wrapped`]). The body has slid under the line at the margin
+/// ([`OldPath::MarginKeepsTheLine`]), so from the wrap on, through its crossing along the second
+/// row, its run with the writing and its rest beside the caret under the line's full first row,
+/// no frame's drawn box meets a glyph's cell on the first row or lays the body on its ink: its
+/// head is drawn down its row ([`aterm_effects::kitty_pet::head_law`]). Every companion style, on
+/// dark, Solarized Dark, GitHub Light and Default Light. Negative controls: with the margin's
+/// slide reverted alone the crossing leaves from the first row, and meets its letters; there the
+/// wrap's crossing still carries the body high over the first row, its box's foot at the bound's
+/// apex no more than a quarter row into it, the landing's head law judged and eased in for the
+/// crossing's last `HEAD_EASE_S` only ([`OldPath::SinkAtTheLanding`], reverted with the slide, the
+/// foot stays three quarters of a row into it); without the head law
 /// ([`OldPath::HeadUnderLetters`]) its head lies on the first row's letters beside the caret.
 #[test]
 fn a_companion_crossing_a_wrap_keeps_off_the_line() {
@@ -1565,31 +1913,151 @@ fn a_companion_crossing_a_wrap_keeps_off_the_line() {
             .into_iter()
             .zip([DARK, SOLARIZED_DARK, GITHUB_LIGHT, DEFAULT_LIGHT])
     {
-        let (apex, ch, on_the_line) = wrapped_coat(style, look, &[]);
+        let (.., crossing) = wrapped_coat(style, look, &[]);
+        assert_eq!(
+            crossing, 0,
+            "{style} on {}: frames from the wrap on whose box meets the first row's letters or \
+             whose body lies on their ink",
+            look.name
+        );
+        let (apex, ch, on_the_line, _) = wrapped_coat(style, look, &[OldPath::MarginKeepsTheLine]);
         assert!(
             apex <= 4 * ch + ch / 4,
-            "{style} on {}: the crossing's apex left its box's foot {:.2} rows into the line's \
-             first row",
+            "{style} on {}, no slide: the crossing's apex left its box's foot {:.2} rows into \
+             the line's first row",
             look.name,
             f64::from(apex - 4 * ch) / f64::from(ch)
         );
         assert_eq!(
             on_the_line, 0,
-            "{style} on {}: frames down on the second row whose box meets the first row's \
-             letters or whose body lies on their ink",
+            "{style} on {}, no slide: frames down on the second row whose box meets the first \
+             row's letters or whose body lies on their ink",
             look.name
         );
     }
-    let (low, ch, _) = wrapped_coat("rainbow kitty pet", DARK, &[OldPath::SinkAtTheLanding]);
+    let (.., through) = wrapped_coat("rainbow kitty pet", DARK, &[OldPath::MarginKeepsTheLine]);
+    assert!(
+        through > 0,
+        "negative control: without the margin's slide the crossing kept off the first row"
+    );
+    let (low, ch, ..) = wrapped_coat(
+        "rainbow kitty pet",
+        DARK,
+        &[OldPath::MarginKeepsTheLine, OldPath::SinkAtTheLanding],
+    );
     assert!(
         low > 4 * ch + ch / 4,
         "negative control: with the landing's sink from the take-off the apex still cleared \
          the line ({:.2} rows into it)",
         f64::from(low - 4 * ch) / f64::from(ch)
     );
-    let (_, _, headed) = wrapped_coat("rainbow kitty pet", DARK, &[OldPath::HeadUnderLetters]);
+    let (.., headed) = wrapped_coat("rainbow kitty pet", DARK, &[OldPath::HeadUnderLetters]);
     assert!(
         headed > 0,
         "negative control: without the head law the companion kept its head off the first row"
+    );
+}
+
+/// ON A FULL SCREEN'S LAST ROW THE COMPANION STANDS BESIDE THE CARET (the trail gallery's
+/// `last-row`): the row over it holds a letter in every cell and no row under it is on the grid,
+/// so it has no seat off the line and is fitted to its row. Typed along that row to the margin and
+/// held there, past the first keys, no frame's drawn box meets a lettered cell, and it never leaves
+/// the glass. Every companion style on every page. Negative control:
+/// [`OldPath::FitCentredAtTheWall`] reverted alone, its box lies across the line's last letter.
+#[test]
+fn on_a_full_screen_s_last_row_the_companion_stands_beside_the_caret() {
+    const FIRST_KEYS: u64 = 300;
+    let (ev, _) = Scene::LastRow.events();
+    let enter = ev
+        .iter()
+        .find(|(_, e)| matches!(e, crate::trail_letters_read::Ev::Key('\r', _)))
+        .map_or(0, |(at, _)| *at);
+    type Held = (u64, Vec<(usize, usize)>, bool);
+    let held = |style: &str, look: Look, old: &[OldPath]| -> Vec<Held> {
+        coats_driven(style, look, Scene::LastRow, old, Drive::Ctl)
+            .iter()
+            .filter(|j| j.ms >= TYPING_FROM + FIRST_KEYS && j.ms < enter)
+            .map(|j| (j.ms, j.coat.box_cells.clone(), j.coat.pet.is_some()))
+            .collect()
+    };
+    for look in [DARK, SOLARIZED_DARK, GITHUB_LIGHT, DEFAULT_LIGHT] {
+        for style in COMPANIONS {
+            let frames = held(style, look, &[]);
+            let met: Vec<_> = frames.iter().filter(|f| !f.1.is_empty()).collect();
+            assert!(
+                met.is_empty(),
+                "{style} on {}: {} frames on the letters: {met:?}",
+                look.name,
+                met.len()
+            );
+            assert!(
+                frames.iter().all(|f| f.2),
+                "{style} on {}: the companion left the glass",
+                look.name
+            );
+        }
+    }
+    let old = held("rainbow kitty pet", DARK, &[OldPath::FitCentredAtTheWall]);
+    assert!(
+        old.iter().filter(|f| !f.1.is_empty()).count() > 10,
+        "negative control: centred in its whole box the fitted body kept off the last letter"
+    );
+}
+
+/// THE MARGIN KEEPS THE COMPANION OFF THE LINE (the trail gallery's `fold-rest` and `focus-wrap`):
+/// writing that runs into the margin, stops short of it and wraps, the body at the wall under it
+/// from before the letters come. Past the first keys (typed under a body that is getting going,
+/// r24 K7-1), no frame's drawn box meets a lettered cell on any row or the caret's cell. Every
+/// companion style on every page. Negative controls: [`OldPath::MarginKeepsTheLine`] reverted
+/// alone, the letters run under the body at the wall and its crossing flies out through them;
+/// [`OldPath::CrossingRisesIntoTheLine`] reverted alone, on [`Scene::StatusWrap`], whose crossing
+/// lands a row lower, the body rises from under the line into it as it leaves.
+#[test]
+fn the_margin_keeps_the_companion_off_the_line() {
+    const FIRST_KEYS: u64 = 300;
+    let hits = |style: &str, look: Look, scene: Scene, old: &[OldPath]| -> Vec<String> {
+        coats_driven(style, look, scene, old, Drive::Ctl)
+            .iter()
+            .filter(|j| {
+                j.ms >= TYPING_FROM + FIRST_KEYS
+                    && (!j.coat.box_cells.is_empty() || j.coat.ink_px > 0 || j.coat.caret_px > 0)
+            })
+            .map(|j| format!("{} ms, box {:?}: {:?}", j.ms, j.coat.pet, j.coat.box_cells))
+            .collect()
+    };
+    for scene in [Scene::FoldRest, Scene::FocusWrap, Scene::StatusWrap] {
+        for look in [DARK, SOLARIZED_DARK, GITHUB_LIGHT, DEFAULT_LIGHT] {
+            for style in COMPANIONS {
+                let met = hits(style, look, scene, &[]);
+                assert!(
+                    met.is_empty(),
+                    "{style} on {}, {scene:?}: {} frames on the writing: {met:?}",
+                    look.name,
+                    met.len()
+                );
+            }
+        }
+        let old = hits(
+            "rainbow kitty pet",
+            DARK,
+            scene,
+            &[OldPath::MarginKeepsTheLine],
+        );
+        assert!(
+            old.len() > 10,
+            "negative control: {scene:?} without the margin's slide met the writing in {} frames",
+            old.len()
+        );
+    }
+    let old = hits(
+        "rainbow kitty pet",
+        DARK,
+        Scene::StatusWrap,
+        &[OldPath::CrossingRisesIntoTheLine],
+    );
+    assert!(
+        old.len() > 5,
+        "negative control: a crossing drawn whole off the row under the line met it in {} frames",
+        old.len()
     );
 }

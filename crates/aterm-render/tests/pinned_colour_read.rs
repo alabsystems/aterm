@@ -742,21 +742,22 @@ fn rail_core(k: &Kept, page: u32) -> Vec<u32> {
 /// up to 18% more vivid than the pin where the pinned lights' hold left it whole; laid at the
 /// pin's own saturation instead, the dark page's grey dilutes it 9-16% duller. The rail now
 /// composes on the page to the pin ([`aterm_effects::classic_wake`]'s `pinned_rail_ink`).
-/// Typing the gallery's line on the dark page under the pink pin, every frame's rail core (its
-/// pixels at 2:1 or more on the page under the caret's row) reads a median OKLCH chroma per
-/// lightness within a tenth of the pin's. Negative control
+/// Typing the gallery's line on the dark page and on Solarized Dark under the pink pin, every
+/// frame's rail core (its pixels at 2:1 or more on the page under the caret's row) reads a
+/// median OKLCH chroma per lightness within a tenth of the pin's; on Solarized Dark it reads 2-10%
+/// over the pin (the after-land lows' W10b). Negative control
 /// (`EffectsPipeline::set_classic_pin_own_chroma(false)`, the old saturation floors): some
-/// frame reads past a tenth.
+/// frame on the dark page reads past a tenth.
 #[test]
 fn classic_pink_s_rail_wears_the_pin_s_chroma() {
     let want = chroma_per_lightness(PINK_PIN);
-    let read = |own: bool| -> Vec<(u64, f64)> {
-        typed_pinned("classic", DARK, PINK_PIN, |fx| {
+    let read = |look: Look, own: bool| -> Vec<(u64, f64)> {
+        typed_pinned("classic", look, PINK_PIN, |fx| {
             fx.set_classic_pin_own_chroma(own);
         })
         .iter()
         .filter_map(|k| {
-            let mut c: Vec<f64> = rail_core(k, DARK.bg)
+            let mut c: Vec<f64> = rail_core(k, look.bg)
                 .into_iter()
                 .map(chroma_per_lightness)
                 .collect();
@@ -767,22 +768,110 @@ fn classic_pink_s_rail_wears_the_pin_s_chroma() {
         })
         .collect()
     };
-    let frames = read(true);
-    assert!(
-        frames.len() >= 20,
-        "fixture: Classic pink lays its rail in {} frames",
-        frames.len()
-    );
-    for &(ms, c) in &frames {
+    for look in [DARK, SOLARIZED_DARK] {
+        let frames = read(look, true);
         assert!(
-            (c / want - 1.0).abs() <= 0.10,
-            "Classic pinned to {PINK_PIN:06x} at {ms} ms: its rail reads chroma {c:.3} per \
-             lightness against the pin's {want:.3}"
+            frames.len() >= 20,
+            "fixture: Classic pink lays its rail in {} frames on {}",
+            frames.len(),
+            look.name
         );
+        for &(ms, c) in &frames {
+            assert!(
+                (c / want - 1.0).abs() <= 0.10,
+                "Classic pinned to {PINK_PIN:06x} on {} at {ms} ms: its rail reads chroma {c:.3} \
+                 per lightness against the pin's {want:.3}",
+                look.name
+            );
+        }
     }
-    let floored = read(false);
+    let floored = read(DARK, false);
     assert!(
         floored.iter().any(|&(_, c)| (c / want - 1.0).abs() > 0.10),
         "negative control: the old floors keep the rail within a tenth of the pin: {floored:?}"
+    );
+}
+
+/// Each kept frame's rail core ([`rail_core`]) as its median OKLCH chroma per lightness's offset
+/// from `pin`'s (`0.1` is a tenth over): Classic pinned to `pin` typing the gallery's line on
+/// `look`, `controls` set first. Frames whose core holds fewer than 8 pixels are left out.
+fn rail_chroma_offsets(
+    look: Look,
+    pin: u32,
+    controls: impl Fn(&mut EffectsPipeline),
+) -> Vec<(u64, f64)> {
+    let want = chroma_per_lightness(pin);
+    typed_pinned("classic", look, pin, controls)
+        .iter()
+        .filter_map(|k| {
+            let mut c: Vec<f64> = rail_core(k, look.bg)
+                .into_iter()
+                .map(chroma_per_lightness)
+                .collect();
+            (c.len() >= 8).then(|| {
+                c.sort_by(f64::total_cmp);
+                (k.ms, c[c.len() / 2] / want - 1.0)
+            })
+        })
+        .collect()
+}
+
+/// A PINNED RAIL TAKES NO RAISE FROM A PAGE TINTED IN ITS HUE (the after-land lows' W10b).
+/// Classic's one-colour rail raises a chosen colour's saturation by the share the page's grey
+/// takes of its core, and read the page's whole brightness as that grey; Solarized Dark's teal,
+/// which shares a blue pin's hue, lends the rail chroma rather than diluting it, and a blue pin
+/// `#40a0e0` reads 14-21% over its own chroma there. The raise now leaves out the page's tint
+/// along the pin's hue (`classic_wake`'s `page_grey_under`). Typing the gallery's line pinned
+/// to that blue, every frame's rail core on Solarized Dark and on the dark page reads a median
+/// OKLCH chroma per lightness within a tenth of the pin's, and the pink pin's rail across the
+/// teal is the same frame for frame. Negative control
+/// (`EffectsPipeline::set_classic_rail_tint_read(false)`, the whole brightness): some frame of
+/// the blue on Solarized Dark reads past a tenth.
+///
+/// The law's limit on a tinted page, measured and left as it is (no raise holds it, and it is
+/// not loosened for every style): a rail fading over the page reads between the pin's chroma
+/// per lightness and the page's, so a pin less chromatic per lightness than its page cannot
+/// keep within a tenth through the fade. Solarized Dark reads 0.182 (OKLCH chroma per
+/// lightness of `#002b36`), the default dark 0.057; the pale lavender `#b0b0c8` reads 0.045, so
+/// its rail reads +30..+99% on Solarized Dark and +8..+14% on the dark, and the pastel pink
+/// `#f0b8d0` (0.085), across the teal's hue, spreads 35 points frame to frame there (-29..+7%),
+/// past the law's 20-point window for any one ink. Probed with 24 other raises (sRGB and
+/// linear-light, over and additive, one alpha and minimax over the fade) on the rail core and
+/// letter guard before round 27: none held either pin on both pages.
+#[test]
+fn a_pinned_rail_takes_no_raise_from_a_page_tinted_in_its_hue() {
+    const BLUE_PIN: u32 = 0x0040_A0E0;
+    for look in [SOLARIZED_DARK, DARK] {
+        let frames = rail_chroma_offsets(look, BLUE_PIN, |_| {});
+        assert!(
+            frames.len() >= 20,
+            "fixture: Classic pinned to {BLUE_PIN:06x} lays its rail in {} frames on {}",
+            frames.len(),
+            look.name
+        );
+        for &(ms, off) in &frames {
+            assert!(
+                off.abs() <= 0.10,
+                "Classic pinned to {BLUE_PIN:06x} on {} at {ms} ms: its rail reads {:+.0}% off \
+                 the pin's chroma per lightness",
+                look.name,
+                off * 100.0
+            );
+        }
+    }
+    assert_eq!(
+        rail_chroma_offsets(SOLARIZED_DARK, PINK_PIN, |_| {}),
+        rail_chroma_offsets(SOLARIZED_DARK, PINK_PIN, |fx| {
+            fx.set_classic_rail_tint_read(false);
+        }),
+        "the pink pin's rail across Solarized Dark's teal keeps its raise"
+    );
+    let blind = rail_chroma_offsets(SOLARIZED_DARK, BLUE_PIN, |fx| {
+        fx.set_classic_rail_tint_read(false);
+    });
+    assert!(
+        blind.iter().any(|&(_, off)| off.abs() > 0.10),
+        "negative control: raised by Solarized Dark's whole brightness the blue rail keeps \
+         within a tenth of the pin: {blind:?}"
     );
 }

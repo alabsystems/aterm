@@ -251,6 +251,32 @@ __aterm_flags_put() {
     { return "${2:-0}"; } 2>/dev/null
 }
 
+# Run `"$@"` with FUNCTRACE (`set -T`, or `shopt -s extdebug`) off. Under it a DEBUG
+# or RETURN trap reaches every function, so an rc's trap would run for each command
+# of aterm's helpers, hundreds a line. `set +T` leaves the trap in the function that
+# runs it and hides it from those it calls, which have none to pass on whatever
+# `set -T` says later. What runs below this is aterm's own code, atpkg's generated hook
+# and any signal trap that fires meanwhile. `local -` (bash 4.4+) puts the flag back
+# however the call ends, and with it any other `set` option changed below; on an older
+# bash an interrupt in the call loses the flag, as it loses XTRACE.
+if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
+    __aterm_untraced() {
+        case $- in *T*) local -; set +T ;; esac
+        "$@"
+    }
+else
+    __aterm_untraced() {
+        case $- in
+            *T*)
+                set +T
+                "$@"
+                set -T
+                ;;
+            *) "$@" ;;
+        esac
+    }
+fi
+
 # Remove any legacy `~/.aterm/bin` PATH entry once per shell on in-place upgrade
 # (`__aterm_old_bin_off` is already set on fresh loads). Kept in a separate file
 # so fresh shells do not pay to parse it.
@@ -870,7 +896,7 @@ __aterm_mark_exec_finish() {
 __aterm_end_command() {
     [[ -n "$__aterm_last_command" ]] || return 0
     __aterm_rekey_take
-    __aterm_mark_exec_finish "$1"
+    __aterm_untraced __aterm_mark_exec_finish "$1"
 }
 
 # Backslash-hex encode semicolons, backslashes, and bytes <= 0x20 for OSC 633;E
@@ -904,7 +930,8 @@ __aterm_mark_integration_rev() {
 # Returns 0 so `extdebug` does not skip the user's command. Only inspects
 # `FUNCNAME[1]` when `functrace`/`extdebug` (`T` in `$-`) is active, so wrapper
 # functions installed by frameworks (e.g. starship on bash < 4.4) do not suppress
-# command capture.
+# command capture, and because bash 3.2 keeps the frames of a function a Ctrl-C ended
+# in `FUNCNAME`, which outside functrace must not cost a shell its marks.
 __aterm_preexec() {
     { local __aterm_flags=$-; set +xv; } 2>/dev/null
     local __aterm_in_fn=""
@@ -952,7 +979,7 @@ __aterm_bp_preexec() {
             eval "$__aterm_prev_debug_handler"
         { __aterm_flags=$-; set +xv; } 2>/dev/null
     fi
-    [[ -n "$__aterm_last_command" ]] || __aterm_line_start "$1"
+    [[ -n "$__aterm_last_command" ]] || __aterm_untraced __aterm_line_start "$1"
     __aterm_flags_put "$__aterm_flags"
 }
 
@@ -1028,7 +1055,10 @@ __aterm_body_ps0() {
     [[ -n "$REPLY" ]] || return 0
     __aterm_hist_mark=
     __aterm_hist_seen=
-    __aterm_line_start "$REPLY"
+    # With functrace off, `__aterm_untraced`'s own `"$@"` would read as a top-level command.
+    __aterm_in_prompt_cmd=1
+    __aterm_untraced __aterm_line_start "$REPLY"
+    __aterm_in_prompt_cmd=0
     return 0
 }
 
@@ -1128,6 +1158,26 @@ __aterm_spare_hold() {
 __aterm_body_prompt_command() {
     { [[ -n ${2+x} ]] || local __aterm_flags=$-; set +xv; } 2>/dev/null
     local last_status=$1 __aterm_lastarg=${3-}
+    __aterm_untraced __aterm_body_pc_open
+    # Run scalar original PROMPT_COMMAND with original `$?`, `$_`, and flags,
+    # passing non-zero status via `||` so `set -e` and `ERR` traps do not fire.
+    if ! (( __aterm_prompt_cmd_is_array )) && [[ -n "$__aterm_original_prompt_command" ]]; then
+        if (( last_status )); then
+            __aterm_flags_put "$__aterm_flags" "$last_status" "$__aterm_lastarg" ||
+                eval "$__aterm_original_prompt_command"
+        else
+            __aterm_flags_put "$__aterm_flags" 0 "$__aterm_lastarg" &&
+                eval "$__aterm_original_prompt_command"
+        fi
+        { __aterm_flags=$-; set +xv; } 2>/dev/null
+    fi
+    __aterm_untraced __aterm_body_pc_close
+    (( __aterm_prompt_end_armed )) || __aterm_in_prompt_cmd=0
+    [[ -n ${2+x} ]] || __aterm_flags_put "$__aterm_flags"
+}
+
+# What each prompt does before the user's PROMPT_COMMAND.
+__aterm_body_pc_open() {
     __aterm_last_exit=$last_status
     __aterm_in_prompt_cmd=1
     __aterm_hist_mark=
@@ -1167,20 +1217,10 @@ __aterm_body_prompt_command() {
 
     __aterm_mark_integration_rev
     __aterm_mark_prompt_start
+}
 
-    # Run scalar original PROMPT_COMMAND with original `$?`, `$_`, and flags,
-    # passing non-zero status via `||` so `set -e` and `ERR` traps do not fire.
-    if ! (( __aterm_prompt_cmd_is_array )) && [[ -n "$__aterm_original_prompt_command" ]]; then
-        if (( last_status )); then
-            __aterm_flags_put "$__aterm_flags" "$last_status" "$__aterm_lastarg" ||
-                eval "$__aterm_original_prompt_command"
-        else
-            __aterm_flags_put "$__aterm_flags" 0 "$__aterm_lastarg" &&
-                eval "$__aterm_original_prompt_command"
-        fi
-        { __aterm_flags=$-; set +xv; } 2>/dev/null
-    fi
-
+# What each prompt does after the user's PROMPT_COMMAND.
+__aterm_body_pc_close() {
     # One-shot prompt setup after original PROMPT_COMMAND so it survives
     # frameworks (starship, oh-my-bash) that set PS1 at init.
     if [[ -n "${__aterm_pending_prompt_setup:-}" ]]; then
@@ -1231,8 +1271,6 @@ __aterm_body_prompt_command() {
         __aterm_hist_mark_take
     fi
     __aterm_pc_first
-    (( __aterm_prompt_end_armed )) || __aterm_in_prompt_cmd=0
-    [[ -n ${2+x} ]] || __aterm_flags_put "$__aterm_flags"
 }
 
 # ─── Prompt Override ───

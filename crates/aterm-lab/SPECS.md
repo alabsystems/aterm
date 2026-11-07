@@ -482,7 +482,7 @@ real keys (`l13-keys-account`).
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
 lab-windowed-argv	contract	lab::instance_argv, lab::windowed	∀ run, aterm, lifeline: windowed(run) ⇔ run.window = "1". If windowed(run): instance_argv(run, aterm, None, lifeline) = (if lifeline then [run.run/bin/aterm-lab, "keeper", "--"] else []) ++ [aterm, "--no-reroute", "--control-sock", run.sock, "-d", run.proj, "--columns", run.cols, "--lines", run.rows], with no "--headless" and no "--lifeline-fd" (a window refuses both). Otherwise the line starts [aterm, "--headless"] and holds the lifeline flag when lifeline.	lab.rs::a_windowed_lab_s_instance_opens_a_window_its_keeper_holding_the_lifeline	Vec<String> building, PathBuf join, a bool branch	1,5
 crash-refuses-window	contract	crash::crash, crash::may_be_keeper	∀ run, a, ops: when windowed(run) ∧ ops.keeper(run.instance_pid), crash(run, a, ops) = Err(usage, code 2) and ops records no event (nothing killed, nothing relaunched), so a SIGKILL never hits an armed window's keeper and leaves its aterm running; when ¬ops.keeper(run.instance_pid) (`up --window`, whose recorded pid is its aterm) or ¬windowed(run), crash proceeds through the kill and relaunch. may_be_keeper(line) ⇔ line = "" ∨ line contains "aterm-lab keeper -- ".	crash.rs::a_windowed_lab_is_crashed_only_where_its_pid_is_its_aterm, crash.rs::a_keeper_is_known_by_its_command_line	an early return before an Ops trait's effects (fakes), &str is_empty/contains	1,3,8
-l13-keys-account	contract	forever::cover::judge_theirs, forever::cover::keys_unaccounted, forever::cover::keyed_line	∀ seen with seen.cover.keyed = Some(k) and a numeric person_stamp: keys_unaccounted(k) = None ⇔ k.seq_after = Some(a) ∧ a ≥ k.seq_before ∧ a − k.seq_before = k.posted ∧ k.posted > 0; where it is Some(why), judge_theirs(seen, t0) = Unobserved(why …), whatever the harness did in the exchange. Where it is None, judge_theirs judges the exchange exactly as for the seam (an act in it is a FAIL), and a PASS opens with keyed_line(k). With keyed = None a PASS opens with "typed through the `as=person` seam".	forever_tests.rs::land_p_typed_through_hwkey_passes_only_where_the_keys_account_for_the_stamp, forever_tests.rs::land_p_s_prompt_is_typed_key_by_key_through_hwkey	Option/checked_sub arithmetic, format!, a judge over journal, ledger and status records	1,5,7
+l13-keys-account	contract	forever::cover::judge_theirs, forever::cover::keys_unaccounted, forever::cover::keyed_line	∀ seen with seen.cover.keyed = Some(k) and a numeric person_stamp: keys_unaccounted(k) = None ⇔ k.seq_after = Some(a) ∧ a ≥ k.seq_before ∧ a − k.seq_before = k.posted ∧ k.posted > 0; where it is Some(why), judge_theirs(seen, t0) = Unobserved(why …), whatever the harness did in the exchange. Where it is None, judge_theirs judges the exchange exactly as for the seam (an act in it is a FAIL), and a PASS opens with keyed_line(k). With keyed = None a PASS opens with "typed through the `as=person` seam".	forever_tests.rs::native_controller_delivery_needs_composer_effects_and_unchanged_person_count, forever_tests.rs::land_p_does_not_claim_person_takeover_from_controller_delivery, forever_tests.rs::land_p_s_prompt_is_typed_key_by_key_through_hwkey	Option/checked_sub arithmetic, format!, a judge over journal, ledger and status records	1,5,7
 composer-labelled-rule	contract	screen::is_rule, screen::composer_row, screen::composer_of	∀ row r: is_rule(r) ⇔ count(trim(r)) ≥ 40 ∧ (every char of trim(r) ∈ {─, ━} ∨ aterm_phase::phase::is_rule(trim(r))). So Claude Code's top rule with the top-effort mode's label inside it (`──── <name> ─`, which a windowed aterm's defaults turn on) frames the composer as a bare rule does, while a short labelled run, a rule with a table's joint (┬) and a row of words frame nothing.	screen.rs::claude_code_s_labelled_top_rule_frames_its_composer	char counting, a delegated predicate	1
 ```
 
@@ -1071,19 +1071,23 @@ src/trail_contrast_tests.rs	a_light_away_from_the_strokes_leaves_the_letter_its_
 ## 27. Added 2026-11-03: what the effects did, apart from the page's own dim text
 
 `trail-contrast --lowered-min X` counts a glyph cell only where the effects took it down: its
-judged reading (§26) under X and under `LOWERED_SHARE` (0.97, the letter guard's `OWN_SHARE`) of the
-same reading on its clean twin, `clean_local_contrast`. A page's own low-contrast text (a coloured
-prompt segment) reads the same with and without the effects, and is not counted. Without a clean
-twin it is an error, never a pass. Read the same way as §1.
+judged reading (§26) under X, and the same reading on its clean twin, `clean_local_contrast`, X or
+more, or the judged reading under `LOWERED_SHARE` (0.97, the letter guard's `OWN_SHARE`) of it too:
+the letter guard's law, a letter at the bar keeping the bar and a dimmer one its share (amended
+2026-11-05, after-land round 3: a glyph at 4.56 of its own read 4.49 under Comet's tail, which the
+share excused). A page's own low-contrast text (a coloured prompt segment) reads the same with and
+without the effects, and is not counted. Without a clean twin it is an error, never a pass. Read the
+same way as §1.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
-trail-contrast-lowered	contract	trail_contrast::{clean_judged,lowered_under,measure_cell,report}	For every measured cell c with a clean twin: report counts c under --lowered-min X iff judged(c) < X and judged(c) < LOWERED_SHARE * clean_judged(c), where clean_judged(c) = c.clean_local_contrast where measure_cell gave one, else c.clean_contrast; a cell whose reading the effects left unchanged is never counted, and --lowered-min with no clean twin is a report error.	-	1	-
+trail-contrast-lowered	contract	trail_contrast::{clean_judged,lowered_under,measure_cell,report}	For every measured cell c with a clean twin: report counts c under --lowered-min X iff judged(c) < X and (clean_judged(c) >= X or judged(c) < LOWERED_SHARE * clean_judged(c)), where clean_judged(c) = c.clean_local_contrast where measure_cell gave one, else c.clean_contrast; a cell whose reading the effects left unchanged is never counted, and --lowered-min with no clean twin is a report error.	-	1	-
 ```
 
 ```tsv
 file	test	primary	also
 src/trail_contrast_tests.rs	lowered_min_counts_only_the_glyphs_the_effects_took_down	trail-contrast-lowered	
+src/trail_contrast_tests.rs	lowered_min_holds_a_glyph_at_the_bar_to_the_bar	trail-contrast-lowered	
 ```
 
 ## 28. Added 2026-11-03: bounded regular-file reads in `util`

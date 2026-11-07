@@ -758,102 +758,333 @@ pub fn auto_slots(cores: usize) -> usize {
     (cores / 6).max(1)
 }
 
-/// The memory a check of a library claims: its last recorded peak (`cost`'s largest process)
-/// plus a margin ([`aterm_capacity::peak_claim`]), or with no peak recorded 16 GiB or half of
+/// The memory a check of a library claims: its last recorded peak (`cost`'s largest process,
+/// the row read under the prover that runs: [`Costs`]) plus a margin
+/// ([`aterm_capacity::peak_claim`]), or with no peak recorded 16 GiB or half of
 /// `ram` (this host's RAM, when read; 0 unread), whichever is less
 /// ([`aterm_capacity::cold_claim`]), so a host of any size can admit a library it has not
-/// measured. A claim is never cut to fit the RAM: one that is not below what can ever be
-/// available (the RAM less what is wired) is refused up front ([`trust_facts::peak_seen`]), and
-/// under `--try-refused` it starts at once ([`Admission::admit`]).
+/// measured. A peak a check cut short reached ([`Cost::cut`]) is the least it needs; where no
+/// check of the library under its prover has finished ([`Cost::finished`]) that says nothing of
+/// its scale, so it claims the larger of the two. A run takes the larger of this and what
+/// another prover's row claims where no check under its own has finished ([`Costs::claim`]).
+/// A claim is never cut to fit the RAM: one that is not below what can ever be available (the
+/// RAM less what is wired) is refused up front ([`trust_facts::peak_seen`]), and under
+/// `--try-refused` it starts at once ([`Admission::admit`]).
 #[must_use]
 pub fn claim_need(cost: Option<&Cost>, ram: u64) -> u64 {
+    let cold = aterm_capacity::cold_claim(Some(ram).filter(|r| *r > 0));
     match cost.filter(|c| c.maxrss > 0) {
+        Some(c) if !c.finished() => aterm_capacity::peak_claim(c.maxrss).max(cold),
         Some(c) => aterm_capacity::peak_claim(c.maxrss),
-        None => aterm_capacity::cold_claim(Some(ram).filter(|r| *r > 0)),
+        None => cold,
     }
 }
 
-/// Historical resource cost of a library's last completed check.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Historical resource cost of a library's last check under one prover.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Cost {
     pub cpu: u64,
     pub wall: u64,
-    /// Peak resident set size in bytes.
+    /// Its peak memory in bytes ([`Ended::maxrss`]; a row recorded before 2026-10-31 has the
+    /// largest process's resident high-water mark alone).
     pub maxrss: u64,
     /// RFC 3339 timestamp when the cost was recorded.
     pub when: String,
+    /// The prover that ran the check: the first line of its `targo --version` ([`Driver::id`]),
+    /// as floors.tsv names it. Empty for a row recorded before rows named their prover, or
+    /// under one whose version could not be read.
+    pub prover: String,
+    /// How the check was cut short, where it was: then its CPU, wall time and peak are what
+    /// it took before it ended, each the least it would have taken. `None` for a check that
+    /// finished, whose figures are what it took.
+    pub cut: Option<Cut>,
+    /// Whether this row of a cut check raised the row of a check under its prover that
+    /// finished ([`keep`]), as its eighth column says it (`raised`): its prover has then
+    /// measured the library ([`Cost::finished`]). Always `false` where [`Cost::cut`] is `None`.
+    pub raised: bool,
 }
 
-const COSTS_HEADER: &str = "# trust lane cost history: <name> <CPU s> <wall s> <largest process's peak RSS bytes> <when>; the slots take the longest first, a library with no row first of all, and each check claims its peak and a margin before it starts (a claim not below what can ever be available, the RAM less what is wired, is refused up front)";
+impl Cost {
+    /// Whether a check of its library under its prover finished: its own, or one whose row a
+    /// cut check's raised ([`Cost::raised`]). Such a row's length and scale are measured, so it
+    /// claims its peak and margin alone ([`claim_need`]), takes its place by its CPU
+    /// ([`order`]), and no other prover's row stands in for it ([`Costs::of`]).
+    #[must_use]
+    pub const fn finished(&self) -> bool {
+        self.cut.is_none() || self.raised
+    }
+}
 
-/// The committed seed's first line ([`trust_facts::COSTS`]), above [`COSTS_HEADER`].
-const SEED_HEADER: &str = "# The trust lane's cost-history SEED: the fallback a clone with no history of its own reads (a library's newer row of this file and its git directory's aterm-release/trust-costs.tsv is the one read). `targo --unverified ship trust run -p <crate>… --update-ratchet` rewrites it with floors.tsv and memory.tsv. A library in neither file runs first, claiming 16 GiB or half the RAM, whichever is less.";
+/// The word a [`Cost::raised`] row's eighth column holds.
+const RAISED: &str = "raised";
 
-/// Loads cost history: for each library the newer of the committed `seed`'s row and the local
-/// `history`'s (by its stamp; the history's on a tie), so a peak measured on another host
-/// after this clone's last run of it is the one read.
-#[must_use]
-pub fn read_costs(history: Option<&Path>, seed: &Path) -> BTreeMap<String, Cost> {
-    let mut all = cost_file(seed);
-    for (name, row) in history.map(cost_file).unwrap_or_default() {
-        if all.get(&name).is_none_or(|c| row.when >= c.when) {
-            all.insert(name, row);
+/// How a check that did not finish ended ([`Cost::cut`]), as its cost row's seventh column
+/// says it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cut {
+    /// Ended at its wall-clock budget (OVER-BUDGET).
+    OverBudget,
+    /// Ended by the run's stop: an interrupt, or another check that could not start
+    /// ([`Finished::interrupted`]).
+    Interrupted,
+    /// Ended by itself without a whole summary, or with its transport to trustd failed: what
+    /// the judge does not take as a measurement of its library.
+    Failed,
+}
+
+impl Cut {
+    /// The word its row's seventh column holds.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Cut::OverBudget => "over-budget",
+            Cut::Interrupted => "interrupted",
+            Cut::Failed => "failed",
         }
     }
-    all
+
+    /// Reads [`Cut::word`].
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Cut> {
+        [Cut::OverBudget, Cut::Interrupted, Cut::Failed]
+            .into_iter()
+            .find(|c| c.word() == word)
+    }
+}
+
+/// A cost file's rows by library: one per prover that ran it ([`Cost::prover`]), oldest first,
+/// so a reader that keeps a library's last row keeps its newest.
+pub type CostRows = BTreeMap<String, Vec<Cost>>;
+
+/// A clone's cost history read for the prover that runs ([`read_costs`]). Two provers ask
+/// different obligations of one library and peak differently on it (aterm-gui's 62.45 GB was
+/// a locally built 1.101 prover's, 5176e9d23d, where 20565c325's check reached at least
+/// 47.20 GB), so a library is measured under a prover only by that prover's rows. Its memory is
+/// another matter: where no check under the prover that runs has finished, another prover's
+/// peak of the same library is the best estimate there is, so it sizes the claim and refuses up
+/// front ([`Costs::claim`], [`Costs::peak`]) until this prover's own measurement decides: a
+/// finished check of it, or a cut one whose peak is by itself refused.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Costs {
+    /// Each library's row under that prover: its own, else its newest row where that names no
+    /// prover. The order is read from these alone, and they are what a run's own rows raise.
+    pub rows: BTreeMap<String, Cost>,
+    /// Each library whose row here is missing, or holds no check of it under that prover that
+    /// finished ([`Cost::finished`]), and that another prover has a row of: that prover's
+    /// newest. The library still runs first, as one with no row does, and its claim is at least
+    /// that row's ([`Costs::claim`]).
+    pub elsewhere: BTreeMap<String, Cost>,
+}
+
+impl Costs {
+    /// `rows` read for `prover` (its one-line `targo --version`).
+    #[must_use]
+    pub fn of(rows: &CostRows, prover: &str) -> Costs {
+        let mut costs = Costs::default();
+        for (name, all) in rows {
+            let read = all
+                .iter()
+                .rev()
+                .find(|c| c.prover == prover)
+                .or_else(|| all.last().filter(|c| c.prover.is_empty()));
+            if let Some(c) = read {
+                costs.rows.insert(name.clone(), c.clone());
+            }
+            if read.is_none_or(|c| !c.finished())
+                && let Some(c) = all
+                    .iter()
+                    .rev()
+                    .find(|c| !c.prover.is_empty() && c.prover != prover)
+            {
+                costs.elsewhere.insert(name.clone(), c.clone());
+            }
+        }
+        costs
+    }
+
+    /// Another prover's row of `name` that stands in for this prover's ([`Costs::elsewhere`]),
+    /// unless the peak of `name`'s row here, the least its check needs, already claims what can
+    /// never be available below `bound` (the plan's [`trust_facts::Host::admits_below`]; 0
+    /// unread): this prover's own measurement then refuses it up front by itself, and another
+    /// prover's, which peaks differently, could only misname that peak and size the claim
+    /// `--try-refused` holds on it.
+    fn other(&self, name: &str, bound: u64) -> Option<&Cost> {
+        let decided = self
+            .rows
+            .get(name)
+            .is_some_and(|c| bound > 0 && aterm_capacity::peak_claim(c.maxrss) >= bound);
+        self.elsewhere.get(name).filter(|_| !decided)
+    }
+
+    /// The memory a check of `name` claims on `ram` ([`claim_need`] of its row here), and where
+    /// no check of it under this prover has finished, at least what another prover's row
+    /// claims ([`Costs::other`], under `bound`).
+    #[must_use]
+    pub fn claim(&self, name: &str, ram: u64, bound: u64) -> u64 {
+        let there = self
+            .other(name, bound)
+            .map_or(0, |c| claim_need(Some(c), ram));
+        claim_need(self.rows.get(name), ram).max(there)
+    }
+
+    /// Another prover's row of `name` where it raises the claim above what `name`'s row here
+    /// claims on `ram` ([`Costs::claim`]): the estimate a run that checks it names.
+    #[must_use]
+    pub fn estimate(&self, name: &str, ram: u64, bound: u64) -> Option<&Cost> {
+        self.other(name, bound)
+            .filter(|_| self.claim(name, ram, bound) > claim_need(self.rows.get(name), ram))
+    }
+
+    /// The row whose peak sizes `name`'s claim, as the up-front refusal reads it
+    /// ([`trust_facts::peak_seen`]): its row here, or another prover's ([`Costs::other`],
+    /// under `bound`) where that one's peak is larger.
+    #[must_use]
+    pub fn peak(&self, name: &str, bound: u64) -> Option<trust_facts::Peak> {
+        let peak = |c: &Cost, of: &str| trust_facts::Peak {
+            rss: c.maxrss,
+            when: c.when.clone(),
+            own: of.is_empty() && !c.prover.is_empty(),
+            least: c.cut.is_some(),
+            of: of.to_string(),
+        };
+        let here = self.rows.get(name);
+        match self.other(name, bound) {
+            Some(o) if here.is_none_or(|c| o.maxrss > c.maxrss) => Some(peak(o, &o.prover)),
+            _ => here.map(|c| peak(c, "")),
+        }
+    }
+}
+
+const COSTS_HEADER: &str = "# trust lane cost history: <name> <CPU s> <wall s> <peak memory bytes: the larger of the largest process's resident high-water mark and the largest footprint its processes were read with> <when> <prover> <cut> <raised>, one row per library and prover (its `targo --version`; a row with none predates rows that name one); <cut>, where a check did not finish, says how it ended (over-budget, interrupted or failed), and its figures are then each the least it would have taken, which its row raises and never lowers, and <raised> is `raised` where it raised the row of a check that finished; a run reads its prover's row, else a library's newest row where that names no prover, and a library with neither is unmeasured; the slots take the longest first, a library with no row or none of a check that finished first of all, and each check claims its peak and a margin (at least what a library with no row claims, where no check of it finished) before it starts, and where no check under its prover has finished, at least what another prover's newest row of it claims, unless its own row's peak is refused by itself (a claim not below what can ever be available, the RAM less what is wired, is refused up front)";
+
+/// The committed seed's first line ([`trust_facts::COSTS`]), above [`COSTS_HEADER`].
+const SEED_HEADER: &str = "# The trust lane's cost-history SEED: the fallback a clone with no history of its own reads (of a library's rows under one prover in this file and its git directory's aterm-release/trust-costs.tsv, the newer is the one read). `targo --unverified ship trust run -p <crate>… --update-ratchet` rewrites it with floors.tsv and memory.tsv. A library with no row a run can read, or one with no check under its prover that finished, runs first, claiming at least 16 GiB or half the RAM, whichever is less, and at least what another prover's newest row of it claims, unless its own row's peak is refused by itself.";
+
+/// Loads cost history for `prover` ([`Costs::of`]): of a library's rows under one prover, the
+/// newer of the committed `seed`'s and the local `history`'s (by its stamp; the history's on a
+/// tie), so a peak measured on another host after this clone's last run of it is the one read.
+#[must_use]
+pub fn read_costs(history: Option<&Path>, seed: &Path, prover: &str) -> Costs {
+    let mut all = cost_file(seed);
+    for (name, rows) in history.map(cost_file).unwrap_or_default() {
+        for row in rows {
+            keep(&mut all, &name, row);
+        }
+    }
+    Costs::of(&all, prover)
 }
 
 /// The rows of a cost file; one that cannot be read has none.
-fn cost_file(path: &Path) -> BTreeMap<String, Cost> {
+fn cost_file(path: &Path) -> CostRows {
     crate::durable::read_text(path)
         .map(|t| parse_costs(&t))
         .unwrap_or_default()
 }
 
-/// Merges existing seed rows with `history` for `--update-ratchet`.
+/// Adds `row` to `name`'s rows unless its row under the same prover is newer (by stamp; `row`
+/// wins a tie). A row that names no prover and is no newer than one that names a prover is
+/// never read again ([`Costs::of`]), so it is dropped, or not added. A cut check's row
+/// ([`Cost::cut`]) holds the least it would have taken, so it never lowers what its prover
+/// reads (its own row, else the newest that names none): where that row's peak is at least its
+/// own it is not added, and otherwise it keeps that row's CPU and wall time where they are
+/// larger, and is [`Cost::raised`] where that row's check, or one whose row that raised,
+/// finished, so the measurement stays its prover's ([`Cost::finished`]).
+fn keep(rows: &mut CostRows, name: &str, row: Cost) {
+    let all = rows.entry(name.to_string()).or_default();
+    if all.iter().any(|c| {
+        (c.prover == row.prover && c.when > row.when)
+            || (row.prover.is_empty() && !c.prover.is_empty() && c.when >= row.when)
+    }) {
+        return;
+    }
+    let read = all
+        .iter()
+        .rev()
+        .find(|c| c.prover == row.prover)
+        .or_else(|| all.iter().rev().find(|c| c.prover.is_empty()));
+    let row = match read {
+        Some(c) if row.cut.is_some() && c.maxrss >= row.maxrss => return,
+        Some(c) if row.cut.is_some() => Cost {
+            cpu: row.cpu.max(c.cpu),
+            wall: row.wall.max(c.wall),
+            raised: c.finished(),
+            ..row
+        },
+        _ => row,
+    };
+    all.retain(|c| c.prover != row.prover && !(c.prover.is_empty() && c.when <= row.when));
+    all.push(row);
+    all.sort_by(|a, b| a.when.cmp(&b.when));
+}
+
+/// Merges existing seed rows with `history` for `--update-ratchet`, row by row ([`keep`]).
 #[must_use]
-pub fn seed_rows(
-    committed: BTreeMap<String, Cost>,
-    history: BTreeMap<String, Cost>,
-    libraries: &BTreeSet<String>,
-) -> BTreeMap<String, Cost> {
+pub fn seed_rows(committed: CostRows, history: CostRows, libraries: &BTreeSet<String>) -> CostRows {
     let mut all = committed;
-    for (name, row) in history {
-        if all.get(&name).is_none_or(|c| row.when >= c.when) {
-            all.insert(name, row);
+    for (name, rows) in history {
+        for row in rows {
+            keep(&mut all, &name, row);
         }
     }
     all.retain(|name, _| libraries.contains(name));
     all
 }
 
-/// Parses cost history text into a map by row name.
+/// Parses cost history text into each library's rows ([`keep`]: a later row of one library
+/// and prover overrides on a tie). A row whose seventh column names no [`Cut`], or whose eighth
+/// is other than [`RAISED`] on a cut row's, is not read.
 #[must_use]
-pub fn parse_costs(text: &str) -> BTreeMap<String, Cost> {
-    text.lines()
-        .filter(|l| !l.starts_with('#'))
-        .filter_map(|l| {
-            let mut f = l.split('\t');
-            Some((
-                f.next()?.to_string(),
-                Cost {
-                    cpu: parse_uint(f.next()?)?,
-                    wall: parse_uint(f.next()?)?,
-                    maxrss: parse_uint(f.next()?)?,
-                    when: f.next().map_or_else(String::new, str::to_string),
-                },
-            ))
-        })
-        .collect()
+pub fn parse_costs(text: &str) -> CostRows {
+    let mut all = CostRows::new();
+    for l in text.lines().filter(|l| !l.starts_with('#')) {
+        let mut f = l.split('\t');
+        let (Some(name), Some(cpu), Some(wall), Some(maxrss)) = (
+            f.next(),
+            f.next().and_then(parse_uint),
+            f.next().and_then(parse_uint),
+            f.next().and_then(parse_uint),
+        ) else {
+            continue;
+        };
+        let (when, prover) = (f.next(), f.next());
+        let cut = match f.next().filter(|w| !w.is_empty()) {
+            None => None,
+            Some(w) => match Cut::parse(w) {
+                Some(cut) => Some(cut),
+                None => continue,
+            },
+        };
+        let raised = match f.next().filter(|w| !w.is_empty()) {
+            None => false,
+            Some(RAISED) if cut.is_some() => true,
+            Some(_) => continue,
+        };
+        let field = |v: Option<&str>| v.map_or_else(String::new, str::to_string);
+        keep(
+            &mut all,
+            name,
+            Cost {
+                cpu,
+                wall,
+                maxrss,
+                when: field(when),
+                prover: field(prover),
+                cut,
+                raised,
+            },
+        );
+    }
+    all
 }
 
-/// Orders `names` for execution, unknown cost first, then by descending CPU time.
+/// Orders `names` for execution, unknown cost first (no row, or one of no check under its
+/// prover that finished: [`Cost::finished`]), then by descending CPU time.
 #[must_use]
 pub fn order(names: &[&str], costs: &BTreeMap<String, Cost>) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..names.len()).collect();
     idx.sort_unstable_by_key(|&i| match costs.get(names[i]) {
-        None => (0, 0, i),
-        Some(c) => (1, u64::MAX - c.cpu, i),
+        Some(c) if c.finished() => (1, u64::MAX - c.cpu, i),
+        _ => (0, 0, i),
     });
     idx
 }
@@ -903,7 +1134,12 @@ pub struct Ended {
     pub code: i32,
     /// Total user and system CPU time across the check and reaped children.
     pub cpu: Duration,
-    /// Peak resident set size in bytes.
+    /// Its peak memory in bytes: the larger of the resident high-water mark the kernel reports
+    /// at the reap and the largest footprint a read of its processes showed ([`TreeTimes::peak`]).
+    /// Under memory pressure the kernel compresses a process's pages out of its resident set, so
+    /// the first alone can be far below what the check needed (ATERM-GUI-MEM: aterm-gui's trustc
+    /// under 20565c325 had peaked at a 47.2 GB footprint when no read of its resident pages, every
+    /// 30 s, had found more than 29.5 GB).
     pub maxrss: u64,
     /// How long its processes' threads ran and were runnable ([`TreeTimes`]); `None` when no
     /// read of the process table found them.
@@ -1267,6 +1503,9 @@ pub struct Finished {
     pub wall: Duration,
     /// Whether the check was terminated for exceeding its wall-clock budget.
     pub over_budget: bool,
+    /// Whether the run's stop ended it ([`Stopped`]: an interrupt, or a check that could not
+    /// start): it decides nothing, and is handed on only for what it measured.
+    pub interrupted: bool,
     /// The host's mean one-minute load over the polls the check ran through ([`Checks::load`]);
     /// `None` when none could be read.
     pub load: Option<f64>,
@@ -1287,7 +1526,8 @@ pub enum Stopped {
 /// lowest-numbered slot no check runs in and none holds ([`Checks::held`]): a slot a check was
 /// killed or failed in, or whose record another run left, is held, so the next check starts in
 /// another. A check starts only once its memory claim is admitted ([`Checks::admit`]), and
-/// holds it until it ends; the checks behind it wait with it.
+/// holds it until it ends; the checks behind it wait with it. Every check that started is
+/// handed to `done` once it ends, those a stop ends marked [`Finished::interrupted`].
 ///
 /// # Errors
 /// Returns [`Stopped`] if interrupted or if a check cannot be started.
@@ -1309,21 +1549,45 @@ pub fn run_slots(
         /// [`Checks::trustd_lost`] as it started.
         lost: u32,
     }
+    /// `r`, ended as `ended`, as `done` is handed it, and its claim, held until `done` has it.
+    fn finished(
+        r: Running,
+        ended: Ended,
+        (over_budget, interrupted): (bool, bool),
+        checks: &dyn Checks,
+    ) -> (Finished, Admitted) {
+        let f = Finished {
+            wall: checks.now().saturating_sub(r.since),
+            job: r.job,
+            ended,
+            over_budget,
+            interrupted,
+            load: (r.load.1 > 0).then(|| r.load.0 / f64::from(r.load.1)),
+            trustd_lost: checks.trustd_lost() > r.lost,
+        };
+        (f, r._claim)
+    }
+    /// Ends every running check, each handed to `done` as interrupted.
+    fn stop_all(
+        running: &mut Vec<Running>,
+        checks: &mut dyn Checks,
+        done: &mut dyn FnMut(Finished, &mut dyn Checks),
+    ) {
+        for mut r in running.drain(..) {
+            let ended = r.check.end();
+            let (f, _claim) = finished(r, ended, (false, true), checks);
+            done(f, checks);
+        }
+    }
     let mut queue: VecDeque<Job> = jobs.into();
     let slots = slots.max(1);
     let mut running: Vec<Running> = Vec::new();
-    let stop_all = |running: &mut Vec<Running>| {
-        for r in running.iter_mut() {
-            r.check.end();
-        }
-        running.clear();
-    };
     // Whether the last pass asked the launch gate and its head still waits: only then does what
     // the gate says it waits for stand, not while the head waits for a slot or for trustd.
     let mut gated = false;
     loop {
         if checks.interrupted() {
-            stop_all(&mut running);
+            stop_all(&mut running, checks, done);
             return Err(Stopped::Interrupted(
                 gated.then(|| checks.waiting()).flatten(),
             ));
@@ -1354,7 +1618,7 @@ pub fn run_slots(
                     lost: checks.trustd_lost(),
                 }),
                 Err(e) => {
-                    stop_all(&mut running);
+                    stop_all(&mut running, checks, done);
                     return Err(Stopped::Unstartable(format!(
                         "the check of {} could not be started: {e}",
                         job.name
@@ -1382,17 +1646,8 @@ pub fn run_slots(
             };
             if let Some((ended, over_budget)) = ended {
                 let r = running.swap_remove(i);
-                done(
-                    Finished {
-                        wall: checks.now().saturating_sub(r.since),
-                        job: r.job,
-                        ended,
-                        over_budget,
-                        load: (r.load.1 > 0).then(|| r.load.0 / f64::from(r.load.1)),
-                        trustd_lost: checks.trustd_lost() > r.lost,
-                    },
-                    checks,
-                );
+                let (f, _claim) = finished(r, ended, (over_budget, false), checks);
+                done(f, checks);
             } else {
                 i += 1;
             }
@@ -1422,17 +1677,22 @@ pub fn pace_of(f: &Finished, cores: usize) -> trust_facts::Pace {
 /// How often a running check's processes are read for their threads' times ([`TreeTimes`]).
 const THREADS_EVERY: Duration = Duration::from_secs(5);
 
-/// A check's processes' CPU and runnable time ([`trust_facts::Threads`]), from reads of the
-/// process table while it runs: each process's latest read, by pid and start, summed at the
-/// end, so one that ended between reads keeps what it last showed.
+/// One process's latest read: its CPU and runnable time in nanoseconds, and where it ran.
+type ProcRead = (u64, u64, Option<aterm_sysprobe::CoreSplit>);
+
+/// A check's processes' CPU and runnable time ([`trust_facts::Threads`]), and on a host with two
+/// kinds of core where it ran, from reads of the process table while it runs: each process's
+/// latest read, by pid and start, summed at the end, so one that ended between reads keeps what
+/// it last showed. Beside them, the largest footprint any of them was read with ([`Self::peak`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TreeTimes {
-    seen: BTreeMap<(u32, u64), (u64, u64)>,
+    seen: BTreeMap<(u32, u64), ProcRead>,
+    peak: u64,
 }
 
 impl TreeTimes {
     /// Takes from `procs` `root` and every process under it, by parent, that a read showed both
-    /// times of.
+    /// times of, and the largest footprint any of them has had.
     pub fn take(&mut self, root: u32, procs: &[aterm_sysprobe::procs::ProcessReading]) {
         let mut under: BTreeMap<u32, Vec<&aterm_sysprobe::procs::ProcessReading>> = BTreeMap::new();
         for p in procs.iter().filter(|p| p.pid != p.ppid) {
@@ -1445,22 +1705,45 @@ impl TreeTimes {
                 continue;
             }
             if let (Some(start), Some(cpu), Some(runnable)) = (p.start, p.cpu_ns, p.runnable_ns) {
-                self.seen.insert((p.pid, start), (cpu, runnable));
+                self.seen.insert((p.pid, start), (cpu, runnable, p.cores));
             }
+            self.peak = self.peak.max(p.peak_footprint.unwrap_or(0));
             next.extend(under.get(&p.pid).into_iter().flatten().copied());
         }
     }
 
-    /// The sums, in milliseconds; `None` while nothing was taken.
+    /// The sums, times in milliseconds; `None` while nothing was taken. Where they ran is
+    /// summed only where every process taken was read with it.
     #[must_use]
     pub fn threads(&self) -> Option<trust_facts::Threads> {
-        let ns = |pick: fn(&(u64, u64)) -> u64| {
-            self.seen.values().map(pick).fold(0u64, u64::saturating_add) / 1_000_000
+        let sum = |pick: &dyn Fn(&ProcRead) -> u64| {
+            self.seen.values().map(pick).fold(0u64, u64::saturating_add)
         };
+        let split =
+            |pick: fn(&aterm_sysprobe::CoreSplit) -> u64| sum(&|t| t.2.as_ref().map_or(0, pick));
+        let cores = self
+            .seen
+            .values()
+            .all(|t| t.2.is_some())
+            .then(|| trust_facts::Cores {
+                p_ms: split(|c| c.p_cpu_ns) / 1_000_000,
+                instructions: split(|c| c.instructions),
+                p_instructions: split(|c| c.p_instructions),
+            });
         (!self.seen.is_empty()).then(|| trust_facts::Threads {
-            ran_ms: ns(|t| t.0),
-            runnable_ms: ns(|t| t.1),
+            ran_ms: sum(&|t| t.0) / 1_000_000,
+            runnable_ms: sum(&|t| t.1) / 1_000_000,
+            cores,
         })
+    }
+
+    /// The largest footprint, in bytes, any process of the tree was read with (macOS
+    /// `ri_lifetime_max_phys_footprint`, which counts what the kernel compressed or swapped of
+    /// it, as CAP-1 meters a claim's holder); 0 where no read had one (off macOS). Up to
+    /// [`THREADS_EVERY`] of a process's growth before it ends goes unread.
+    #[must_use]
+    pub fn peak(&self) -> u64 {
+        self.peak
     }
 }
 
@@ -1558,8 +1841,11 @@ trait Bench {
     /// made.
     ///
     /// # Errors
-    /// The need can never fit on the volume ([`atpkg::admit_disk::Error::Never`]), or the
-    /// ledger could not be used.
+    /// The need can never fit on the volume ([`atpkg::admit_disk::Error::Never`]), is more than
+    /// it has free above its floor once the relief ran with no scratch claim held there that
+    /// could meet it
+    /// ([`atpkg::admit_disk::Error::Unmet`]), an interrupt ended the wait
+    /// ([`atpkg::admit_disk::Error::Stopped`]), or the ledger could not be used.
     fn disk(
         &mut self,
         run: atpkg::admit_disk::Run,
@@ -1758,9 +2044,10 @@ struct Prepared {
     bound: u64,
     cores: usize,
     costs_path: Option<PathBuf>,
-    /// Each library's last recorded cost ([`read_costs`]): the order, the claims and the
-    /// up-front refusals for a claim not below what can ever be available are all read from it.
-    costs: BTreeMap<String, Cost>,
+    /// Each library's last recorded cost under this run's prover ([`read_costs`]): the order,
+    /// the claims and the up-front refusals for a claim not below what can ever be available
+    /// are all read from its rows.
+    costs: Costs,
     /// The host's one-minute load as the run began ([`load_word`]).
     load_start: String,
     /// All library row names in the resolved graph ([`seed_rows`]).
@@ -2022,7 +2309,11 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
     let ceiling = driver_ceiling(bench, &driver, state.as_deref(), out);
     let load_start = load_word(bench.load());
     let costs_path = state.as_ref().map(|s| s.join("trust-costs.tsv"));
-    let costs = read_costs(costs_path.as_deref(), &cfg.repo.join(trust_facts::COSTS));
+    let costs = read_costs(
+        costs_path.as_deref(),
+        &cfg.repo.join(trust_facts::COSTS),
+        &one_line(&driver.id),
+    );
     let host_obs = state.as_ref().map(|s| s.join("trust-memory-host.tsv"));
     let mut plan = String::new();
     plan.push_str(trust_facts::PLAN_MAGIC);
@@ -2088,9 +2379,12 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
         ));
     }
     let parsed = Plan::parse(&plan)?;
-    let peaks: BTreeMap<String, (u64, String)> = costs
-        .iter()
-        .map(|(name, c)| (name.clone(), (c.maxrss, c.when.clone())))
+    let bound = parsed.facts.host.admits_below();
+    let peaks: BTreeMap<String, trust_facts::Peak> = costs
+        .rows
+        .keys()
+        .chain(costs.elsewhere.keys())
+        .filter_map(|name| Some((name.clone(), costs.peak(name, bound)?)))
         .collect();
     let (admit_lines, refusals) = parsed.admit(&peaks)?;
     plan.push_str(&admit_lines);
@@ -2098,6 +2392,17 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
     crate::durable::write_fresh(&plan_path, &plan)
         .map_err(|e| format!("{}: {e}", plan_path.display()))?;
     let refused: BTreeSet<String> = refusals.iter().map(|(n, _)| n.clone()).collect();
+    for s in &selected {
+        if let (Decision::Gate(_), Some(c)) = (&s.decision, costs.estimate(&s.lib.name, mem, bound))
+            && !refused.contains(&s.lib.name)
+        {
+            let _ = writeln!(
+                out,
+                "trust: {}",
+                estimated(&s.lib.name, c, costs.claim(&s.lib.name, mem, bound))
+            );
+        }
+    }
     if !refusals.is_empty() {
         for (_, l) in &refusals {
             let _ = writeln!(out, "trust: {l}");
@@ -2118,7 +2423,7 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
         files: filing,
         jobs,
         mem,
-        bound: parsed.facts.host.admits_below(),
+        bound,
         cores,
         costs_path,
         costs,
@@ -2127,6 +2432,28 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
         root,
         _lock: lock,
     })
+}
+
+/// What a run says of `name`, no check of which under this prover has finished, whose claim
+/// (`claim`, [`Costs::claim`]) another prover's row (`c`, [`Costs::estimate`]) raised: it runs
+/// first, as an unmeasured library does, and names whose peak it claims on.
+#[allow(clippy::cast_precision_loss)]
+fn estimated(name: &str, c: &Cost, claim: u64) -> String {
+    let on = c
+        .when
+        .get(..10)
+        .map_or_else(String::new, |d| format!(" on {d}"));
+    let reached = if c.cut.is_some() {
+        "was cut short after reaching"
+    } else {
+        "peaked at"
+    };
+    format!(
+        "{name} has no finished check under this prover: its last check under {} {reached} {:.2} GB{on}, the best estimate there is; it runs first, claiming {}",
+        c.prover,
+        c.maxrss as f64 / 1e9,
+        aterm_capacity::gib(claim)
+    )
 }
 
 /// The libraries `prep` checks: those gated that the memory guard did not refuse.
@@ -2167,7 +2494,7 @@ fn check_and_conclude(
     let seed = cfg.repo.join(trust_facts::COSTS);
     let costs = &prep.costs;
     let names: Vec<&str> = work.iter().map(|s| s.lib.name.as_str()).collect();
-    let jobs: Vec<Job> = order(&names, costs)
+    let jobs: Vec<Job> = order(&names, &costs.rows)
         .into_iter()
         .map(|i| {
             let lib = &work[i].lib;
@@ -2181,7 +2508,7 @@ fn check_and_conclude(
                     .then(|| PathBuf::from(format!("{}.report", log.display()))),
                 log,
                 target: PathBuf::new(),
-                need: claim_need(costs.get(&lib.name), prep.mem),
+                need: costs.claim(&lib.name, prep.mem, prep.bound),
                 lock: None,
                 cover: None,
             }
@@ -2205,6 +2532,13 @@ fn check_and_conclude(
         let budget = cfg.budget;
         let cores = prep.cores;
         let mut done = |f: Finished, checks: &mut dyn Checks| {
+            if f.interrupted {
+                // Ended by the run's stop, it decides nothing: only what it measured is kept.
+                if let Some(c) = cost_of(&f, &prep.driver) {
+                    new_costs.insert(f.job.name.clone(), c);
+                }
+                return;
+            }
             let mut probe = || checks.probe_trustd();
             if let Some(l) = f.load {
                 loads.push(l);
@@ -2218,7 +2552,7 @@ fn check_and_conclude(
             if let Some(r) = &reducer {
                 r.send(&f.job);
             }
-            if let Some(c) = finished_cost(&f) {
+            if let Some(c) = cost_of(&f, &prep.driver) {
                 new_costs.insert(f.job.name.clone(), c);
             }
         };
@@ -2310,7 +2644,9 @@ fn check_and_conclude(
             .map(cost_file)
             .unwrap_or_default();
         let mut all = seed_rows(cost_file(&seed), history, &prep.libraries);
-        all.extend(new_costs);
+        for (name, row) in new_costs {
+            keep(&mut all, &name, row);
+        }
         write_cost_file(
             &seed,
             &format!("{SEED_HEADER}\n{COSTS_HEADER}\n"),
@@ -2430,43 +2766,75 @@ impl Drop for Reducer {
     }
 }
 
-/// Extracts the resource [`Cost`] of a completed check that produced a summary.
-fn finished_cost(f: &Finished) -> Option<Cost> {
-    if f.over_budget {
-        return None;
-    }
-    let file = crate::durable::open_regular_file(&f.job.log).ok()?;
-    let m = trust_facts::Measured::of_log(BufReader::new(file), &f.ended.code.to_string());
-    (!m.summary.is_empty() && m.ended.is_empty() && !m.transport).then(|| Cost {
+/// The resource [`Cost`] of `f` under the prover `driver` names: what a check that finished
+/// took (its log has a summary, a whole one, and no transport failure), or what one cut short
+/// took before it ended ([`Cut`]: at its budget, by the run's stop, or by itself), each figure
+/// then the least it would have taken. `None` for a cut check whose peak was not read.
+fn cost_of(f: &Finished, driver: &Driver) -> Option<Cost> {
+    let finished = || {
+        crate::durable::open_regular_file(&f.job.log).is_ok_and(|file| {
+            let m = trust_facts::Measured::of_log(BufReader::new(file), &f.ended.code.to_string());
+            !m.summary.is_empty() && m.ended.is_empty() && !m.transport
+        })
+    };
+    let cut = if f.interrupted {
+        Some(Cut::Interrupted)
+    } else if f.over_budget {
+        Some(Cut::OverBudget)
+    } else {
+        (!finished()).then_some(Cut::Failed)
+    };
+    (cut.is_none() || f.ended.maxrss > 0).then(|| Cost {
         cpu: f.ended.cpu.as_secs(),
         wall: f.wall.as_secs(),
         maxrss: f.ended.maxrss,
         when: utc_now(),
+        prover: one_line(&driver.id),
+        cut,
+        raised: false,
     })
 }
 
-/// Merges `new` into the cost history file at `path`.
+/// Merges `new` into the cost history file at `path` ([`keep`]).
 fn write_costs(path: Option<&Path>, new: &BTreeMap<String, Cost>, out: &mut dyn Write) {
     let Some(path) = path.filter(|_| !new.is_empty()) else {
         return;
     };
-    let mut all = crate::durable::read_text(path)
-        .map(|t| parse_costs(&t))
-        .unwrap_or_default();
-    all.extend(new.iter().map(|(k, v)| (k.clone(), v.clone())));
+    let mut all = cost_file(path);
+    for (name, row) in new {
+        keep(&mut all, name, row.clone());
+    }
     write_cost_file(path, &format!("{COSTS_HEADER}\n"), &all, out);
 }
 
-/// Atomically writes cost entries `all` under `header` to `path`.
-fn write_cost_file(path: &Path, header: &str, all: &BTreeMap<String, Cost>, out: &mut dyn Write) {
+/// Atomically writes cost entries `all` under `header` to `path`, a row's prover in a sixth
+/// column where it names one, how its check was cut short in a seventh where it was, and
+/// [`RAISED`] in an eighth where it is [`Cost::raised`].
+fn write_cost_file(path: &Path, header: &str, all: &CostRows, out: &mut dyn Write) {
     let now = utc_now();
     let mut text = header.to_string();
-    for (name, c) in all {
+    for (name, c) in all
+        .iter()
+        .flat_map(|(n, rows)| rows.iter().map(move |c| (n, c)))
+    {
         let when = if c.when.is_empty() { &now } else { &c.when };
         text.push_str(&format!(
-            "{name}\t{}\t{}\t{}\t{when}\n",
+            "{name}\t{}\t{}\t{}\t{when}",
             c.cpu, c.wall, c.maxrss
         ));
+        if !c.prover.is_empty() || c.cut.is_some() {
+            text.push('\t');
+            text.push_str(&one_line(&c.prover));
+        }
+        if let Some(cut) = c.cut {
+            text.push('\t');
+            text.push_str(cut.word());
+            if c.raised {
+                text.push('\t');
+                text.push_str(RAISED);
+            }
+        }
+        text.push('\n');
     }
     let tmp = path.with_extension(format!("tsv.{}", std::process::id()));
     let written = path
@@ -2569,6 +2937,7 @@ fn disk_run(cfg: &Config, root: &Path) -> atpkg::admit_disk::Run {
         cold: COLD_DISK,
         on: root.to_path_buf(),
         stuck_ends: None,
+        scratch: false,
         machine: None,
     }
 }
@@ -2577,8 +2946,9 @@ fn disk_run(cfg: &Config, root: &Path) -> atpkg::admit_disk::Run {
 /// starts. A ledger that cannot be used is said, and the run goes on without a claim.
 ///
 /// # Errors
-/// The volume holding the root can never hold the need above its floor, or an interrupt ended
-/// the wait: COULD NOT RUN.
+/// The volume holding the root can never hold the need above its floor, has less free above it
+/// than the need once the relief ran (which no wait admits), or an interrupt ended the wait:
+/// COULD NOT RUN.
 fn claim_disk(
     cfg: &Config,
     root: &Path,
@@ -2593,6 +2963,10 @@ fn claim_disk(
         ))),
         Err(e @ atpkg::admit_disk::Error::Stopped { .. }) => Err(Stop::CouldNotRun(format!(
             "the run's disk claim was {e}; no check started, so nothing was decided"
+        ))),
+        Err(e @ atpkg::admit_disk::Error::Unmet { .. }) => Err(Stop::CouldNotRun(format!(
+            "the run's disk claim was refused, no check started: {e}, or start it at once with \
+             `--admit now`"
         ))),
         Err(e) => {
             let _ = writeln!(
@@ -2820,10 +3194,16 @@ impl CheckRecord {
     }
 
     /// Whether the run that started the check, another than this one, still runs: the check
-    /// is that run's to end.
+    /// is that run's to end. One that exited unreaped (a zombie, whose serial Linux still
+    /// reads) runs nothing. Its presence is read before its serial: a pid holds its process
+    /// until that is reaped, so a serial that matches after a presence read not `Exited` shows
+    /// the run had not exited at that read.
     fn lane_runs(&self) -> bool {
         self.lane.is_some_and(|(pid, serial)| {
-            self.lane != this_lane() && aterm_uds::process::process_serial(pid) == Some(serial)
+            self.lane != this_lane()
+                && aterm_uds::process::process_presence(pid)
+                    != aterm_uds::process::ProcessPresence::Exited
+                && aterm_uds::process::process_serial(pid) == Some(serial)
         })
     }
 }
@@ -4137,7 +4517,7 @@ impl RealCheck {
                 .code()
                 .unwrap_or_else(|| 128 + usage.status.signal().unwrap_or(0)),
             cpu: usage.cpu,
-            maxrss: usage.maxrss,
+            maxrss: usage.maxrss.max(self.times.peak()),
             threads: self.times.threads(),
         };
         if left.spent() && held {
@@ -4201,7 +4581,7 @@ impl Check for RealCheck {
             let e = Ended {
                 code: 128 + proc_tree::SIGKILL,
                 cpu: Duration::ZERO,
-                maxrss: 0,
+                maxrss: self.times.peak(),
                 threads: self.times.threads(),
             };
             self.ended = Some(e);
@@ -6352,6 +6732,11 @@ mod tests {
         assert!(matches!(all[2].decision, Decision::Gate(_)));
     }
 
+    /// Each library's rows of one name, as a cost file reads under `prover` ([`Costs::of`]).
+    fn read(rows: &CostRows, prover: &str) -> BTreeMap<String, Cost> {
+        Costs::of(rows, prover).rows
+    }
+
     #[test]
     fn the_cost_history_keeps_every_row_and_adds_the_new() {
         let d = tmp("trust-lane-costs");
@@ -6362,6 +6747,9 @@ mod tests {
             wall: cpu,
             maxrss: 7,
             when: format!("2026-10-0{cpu}T00:00:00Z"),
+            prover: P.into(),
+            cut: None,
+            raised: false,
         };
         write_costs(
             Some(&path),
@@ -6381,7 +6769,7 @@ mod tests {
         let got = parse_costs(&fs::read_to_string(&path).unwrap());
         assert_eq!(
             got,
-            BTreeMap::from([("a".into(), one(3)), ("b".into(), one(2))])
+            BTreeMap::from([("a".into(), vec![one(3)]), ("b".into(), vec![one(2)])])
         );
         assert!(out.is_empty());
 
@@ -6389,11 +6777,14 @@ mod tests {
         write_cost_file(
             &seed,
             &format!("{SEED_HEADER}\n{COSTS_HEADER}\n"),
-            &BTreeMap::from([("a".to_string(), one(9)), ("c".to_string(), one(4))]),
+            &BTreeMap::from([
+                ("a".to_string(), vec![one(9)]),
+                ("c".to_string(), vec![one(4)]),
+            ]),
             &mut out,
         );
         assert_eq!(
-            read_costs(Some(&path), &seed),
+            read_costs(Some(&path), &seed, P).rows,
             BTreeMap::from([
                 ("a".into(), one(9)),
                 ("b".into(), one(2)),
@@ -6408,7 +6799,8 @@ mod tests {
             &mut out,
         );
         assert_eq!(
-            read_costs(Some(&path), &seed)
+            read_costs(Some(&path), &seed, P)
+                .rows
                 .into_iter()
                 .map(|(n, c)| (n, c.cpu))
                 .collect::<Vec<_>>(),
@@ -6416,16 +6808,500 @@ mod tests {
             "the history's row on a tie, and wherever it is newer"
         );
         let none = d.path().join("no-history.tsv");
-        assert_eq!(read_costs(Some(&none), &seed).len(), 2, "a fresh clone");
-        assert_eq!(read_costs(None, &seed).len(), 2, "no state at all");
-        assert!(read_costs(None, &none).is_empty(), "every library heavy");
+        assert_eq!(
+            read_costs(Some(&none), &seed, P).rows.len(),
+            2,
+            "a fresh clone"
+        );
+        assert_eq!(read_costs(None, &seed, P).rows.len(), 2, "no state at all");
+        assert_eq!(
+            read_costs(None, &none, P),
+            Costs::default(),
+            "every library heavy"
+        );
         let committed = aterm_tempfile::manifest_dir()
             .join("../..")
             .join(trust_facts::COSTS);
         assert!(
-            !read_costs(None, &committed).is_empty(),
+            !read_costs(None, &committed, P).rows.is_empty(),
             "{}",
             committed.display()
+        );
+    }
+
+    /// The prover the cost tests run under, and another.
+    const P: &str = "targo 1.99.0-dev (20565c325 2026-10-19) (targo 0.11.0+g20565c325)";
+    const OTHER: &str = "targo 1.101.0-dev (targo 0.10.0)";
+
+    /// MEM-COSTS-NOT-PER-PROVER: cost rows are kept per prover, and a run reads its own
+    /// prover's row, else a library's newest row where that names no prover (one recorded
+    /// before rows named theirs); a library whose newest row another prover recorded, with
+    /// none of this one's, is unmeasured under it, that row set aside for its claim alone
+    /// ([`Costs::elsewhere`]). aterm-gui's 62.45 GB row of the locally
+    /// built 1.101 prover (5176e9d23d) is not 20565c325's, nor is its older row that names no
+    /// prover read once a named row is newer. NEGATIVE CONTROLS: under the 1.101 prover the
+    /// same file reads that peak; a row that names no prover is read under any prover, as every
+    /// row was before rows named theirs; and this prover's own row wins over a newer one of
+    /// another's.
+    #[test]
+    fn a_run_reads_only_its_own_provers_cost_rows() {
+        let peaks = |rows: &[Cost]| {
+            rows.iter()
+                .map(|c| (c.maxrss, c.prover.clone()))
+                .collect::<Vec<_>>()
+        };
+        let text = format!(
+            "{COSTS_HEADER}\n\
+             aterm-gui\t1222\t1159\t14015578112\t2026-10-20T03:58:10Z\n\
+             aterm-gui\t16972\t17245\t62450089984\t2026-10-20T17:45:18Z\t{OTHER}\n\
+             aterm-effects\t8281\t8304\t26018627584\t2026-10-27T07:27:24Z\n\
+             aterm-font\t1\t1\t15125987328\t2026-10-25T00:00:00Z\t{P}\n\
+             aterm-font\t1\t1\t9000000000\t2026-10-27T00:00:00Z\t{OTHER}\n"
+        );
+        let rows = parse_costs(&text);
+        assert_eq!(
+            peaks(&rows["aterm-gui"]),
+            [(62_450_089_984, OTHER.to_string())],
+            "the older row that names no prover is dropped: no prover reads it again"
+        );
+        let here = Costs::of(&rows, P);
+        assert!(!here.rows.contains_key("aterm-gui"), "{here:?}");
+        assert_eq!(here.elsewhere["aterm-gui"].prover, OTHER);
+        assert_eq!(here.rows["aterm-effects"].maxrss, 26_018_627_584);
+        assert_eq!(here.rows["aterm-font"].maxrss, 15_125_987_328);
+        let there = Costs::of(&rows, OTHER);
+        assert_eq!(there.rows["aterm-gui"].maxrss, 62_450_089_984);
+        assert_eq!(there.rows["aterm-effects"].maxrss, 26_018_627_584);
+        assert_eq!(there.rows["aterm-font"].maxrss, 9_000_000_000);
+        assert!(there.elsewhere.is_empty(), "{there:?}");
+
+        let d = tmp("trust-lane-provers");
+        let path = d.path().join("trust-costs.tsv");
+        fs::write(&path, &text).unwrap();
+        let mut out = Vec::new();
+        write_costs(
+            Some(&path),
+            &BTreeMap::from([(
+                "aterm-gui".to_string(),
+                Cost {
+                    maxrss: 30 * GIB,
+                    when: "2026-10-30T00:00:00Z".into(),
+                    prover: P.into(),
+                    ..Cost::default()
+                },
+            )]),
+            &mut out,
+        );
+        let kept = cost_file(&path);
+        assert_eq!(
+            peaks(&kept["aterm-gui"]),
+            [
+                (62_450_089_984, OTHER.to_string()),
+                (30 * GIB, P.to_string())
+            ],
+            "a row per prover, oldest first: a reader that keeps a library's last row keeps its newest"
+        );
+        assert_eq!(read(&kept, P)["aterm-gui"].maxrss, 30 * GIB);
+        assert_eq!(read(&kept, OTHER)["aterm-gui"].maxrss, 62_450_089_984);
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("\naterm-effects\t8281\t8304\t26018627584\t2026-10-27T07:27:24Z\n"),
+            "a row that names no prover is written as it was read: {written}"
+        );
+        assert!(out.is_empty());
+    }
+
+    /// F9: a check cut short (over budget, interrupted, or ended without a whole summary) keeps
+    /// what it measured in its prover's row, each figure the least it would have taken: the row
+    /// raises the peak its prover reads (its own row, else the newest that names none) and never
+    /// lowers it, keeps the larger times, is marked `raised` where the row it raised was a
+    /// finished check's, is written with how it was cut and read back so, and, where no check of
+    /// the library under its prover finished, claims at least what an unmeasured library claims
+    /// and runs first, as one with no row does. One that raised a finished check's row claims
+    /// its peak and margin alone and takes its place by its CPU: its prover has measured the
+    /// library. NEGATIVE CONTROLS: a finished check's row replaces a higher one, claims its peak
+    /// and its margin alone, and is ordered by its CPU; a seventh column naming no cut, and an
+    /// eighth naming anything but `raised` or on a finished row, are not read.
+    #[test]
+    fn a_cut_checks_peak_is_a_lower_bound_its_prover_reads() {
+        let row = |maxrss: u64, day: u64, cut: Option<Cut>| Cost {
+            cpu: 100 * day,
+            wall: 100 * day,
+            maxrss,
+            when: format!("2026-11-0{day}T00:00:00Z"),
+            prover: P.into(),
+            cut,
+            raised: false,
+        };
+        let (over, interrupted) = (Some(Cut::OverBudget), Some(Cut::Interrupted));
+        let mut rows = CostRows::new();
+        keep(&mut rows, "a", row(40 * GIB, 1, None));
+        keep(&mut rows, "a", row(20 * GIB, 2, interrupted));
+        assert_eq!(
+            read(&rows, P)["a"],
+            row(40 * GIB, 1, None),
+            "a cut check that reached less lowers nothing"
+        );
+        keep(
+            &mut rows,
+            "a",
+            Cost {
+                cpu: 50,
+                wall: 60,
+                ..row(47 * GIB, 3, over)
+            },
+        );
+        let raised = Cost {
+            cpu: 100,
+            wall: 100,
+            raised: true,
+            ..row(47 * GIB, 3, over)
+        };
+        assert_eq!(
+            rows["a"],
+            [raised],
+            "one that reached more raises the peak, keeping the larger times and that a check finished"
+        );
+        let mut again = rows.clone();
+        keep(&mut again, "a", row(48 * GIB, 4, interrupted));
+        assert!(
+            again["a"][0].raised,
+            "a row that raised a finished one's stays measured: {again:?}"
+        );
+        let mut finished = rows.clone();
+        keep(&mut finished, "a", row(20 * GIB, 4, None));
+        assert_eq!(
+            finished["a"],
+            [row(20 * GIB, 4, None)],
+            "NEGATIVE CONTROL: a finished check's row is what it took, lower or not"
+        );
+        let mut unnamed = CostRows::new();
+        keep(
+            &mut unnamed,
+            "b",
+            Cost {
+                prover: String::new(),
+                ..row(30 * GIB, 1, None)
+            },
+        );
+        keep(&mut unnamed, "b", row(10 * GIB, 2, interrupted));
+        assert_eq!(
+            (read(&unnamed, P)["b"].maxrss, read(&unnamed, P)["b"].cut),
+            (30 * GIB, None),
+            "a prover with no row of its own reads the one that names none, which a lower cut row leaves"
+        );
+        let mut unmeasured = CostRows::new();
+        keep(&mut unmeasured, "e", row(10 * GIB, 1, interrupted));
+        keep(&mut unmeasured, "e", row(20 * GIB, 2, over));
+        assert!(
+            !unmeasured["e"][0].raised,
+            "a cut row that raised only a cut one's is no measurement: {unmeasured:?}"
+        );
+
+        let d = tmp("trust-lane-cut");
+        let path = d.path().join("trust-costs.tsv");
+        let mut out = Vec::new();
+        rows.insert(
+            "c".into(),
+            vec![Cost {
+                prover: String::new(),
+                ..row(GIB, 1, Some(Cut::Failed))
+            }],
+        );
+        write_cost_file(
+            &path,
+            &format!(
+                "{COSTS_HEADER}
+"
+            ),
+            &rows,
+            &mut out,
+        );
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(&format!(
+                "
+a	100	100	{}	2026-11-03T00:00:00Z	{P}	over-budget	raised
+",
+                47 * GIB
+            )) && text.contains(&format!(
+                "
+c	100	100	{GIB}	2026-11-01T00:00:00Z		failed
+"
+            )),
+            "{text}"
+        );
+        assert_eq!(parse_costs(&text), rows, "read back as written");
+        assert!(out.is_empty());
+        assert!(
+            parse_costs(&format!(
+                "d	1	1	1	2026-11-01T00:00:00Z	{P}	later
+"
+            ))
+            .is_empty(),
+            "a seventh column naming no cut is not read"
+        );
+        for eighth in ["over-budget\tlater", "\traised"] {
+            assert!(
+                parse_costs(&format!(
+                    "d\t1\t1\t1\t2026-11-01T00:00:00Z\t{P}\t{eighth}\n"
+                ))
+                .is_empty(),
+                "{eighth:?}"
+            );
+        }
+
+        let ram = 48 * GIB;
+        let low = row(GIB, 1, Some(Cut::Failed));
+        assert_eq!(
+            claim_need(Some(&low), ram),
+            16 * GIB,
+            "a cut check's small peak claims what an unmeasured library does"
+        );
+        assert_eq!(
+            claim_need(
+                Some(&Cost {
+                    cut: None,
+                    ..low.clone()
+                }),
+                ram
+            ),
+            2 * GIB,
+            "NEGATIVE CONTROL: a finished check's claims its peak and its margin"
+        );
+        assert_eq!(
+            claim_need(Some(&row(47 * GIB, 1, interrupted)), ram),
+            aterm_capacity::peak_claim(47 * GIB),
+            "a high one claims its peak and its margin"
+        );
+        let measured = Cost {
+            raised: true,
+            ..low.clone()
+        };
+        assert_eq!(
+            claim_need(Some(&measured), ram),
+            2 * GIB,
+            "one that raised a finished check's row claims its peak and its margin alone"
+        );
+        let costs = BTreeMap::from([
+            ("long".to_string(), row(GIB, 9, None)),
+            ("cut".to_string(), low),
+            ("raised".to_string(), measured),
+        ]);
+        assert_eq!(
+            order(&["long", "cut", "new", "raised"], &costs),
+            [1, 2, 0, 3],
+            "a cut row's length is unknown: it runs first, as one with no row does, unless a check under its prover finished"
+        );
+    }
+
+    /// The store's default prover when TRUST-MEM-2 ended, under which aterm-gui has no row.
+    const NEW: &str = "targo 1.101.0-dev (29ebb403d 2026-10-28) (targo 0.12.0+g29ebb403d)";
+
+    /// TRUST-MEM-2: where no check of a library under the prover that runs has finished,
+    /// another prover's newest row of it is the best estimate of what its check needs, so its
+    /// claim is at least that row's, and the up-front refusal reads that row where its peak is
+    /// the larger, naming its prover. aterm-gui under 29ebb403d, with 20565c325's 47.20 GB
+    /// interrupted row and the older 1.101 62.45 GB one, claims on the newer. A small peak
+    /// another prover recorded still claims what an unmeasured library claims, since a prover
+    /// that took a ceiling held its peaks down. A row of this prover's own that finished
+    /// replaces the other's; one cut short below it does not. NEGATIVE CONTROL: the rows this
+    /// prover reads, and so the order, hold none of another prover's.
+    #[test]
+    fn another_provers_peak_sizes_the_claim_until_this_provers_own_replaces_it() {
+        let ram = 48 * GIB;
+        let bound = REACH;
+        let row = |maxrss: u64, day: u64, prover: &str, cut: Option<Cut>| Cost {
+            cpu: 100,
+            wall: 100,
+            maxrss,
+            when: format!("2026-10-{day}T00:00:00Z"),
+            prover: prover.into(),
+            cut,
+            raised: false,
+        };
+        let gui = row(47_198_031_152, 31, P, Some(Cut::Interrupted));
+        let mut rows = CostRows::new();
+        keep(&mut rows, "aterm-gui", row(62_450_089_984, 20, OTHER, None));
+        keep(&mut rows, "aterm-gui", gui.clone());
+        keep(&mut rows, "tiny", row(2 * GIB, 20, OTHER, None));
+        let costs = Costs::of(&rows, NEW);
+        assert!(costs.rows.is_empty(), "{costs:?}");
+        assert_eq!(costs.elsewhere["aterm-gui"], gui, "the newest other row");
+        assert_eq!(
+            costs.claim("aterm-gui", ram, bound),
+            aterm_capacity::peak_claim(47_198_031_152)
+        );
+        assert_eq!(costs.estimate("aterm-gui", ram, bound), Some(&gui));
+        assert_eq!(
+            costs.peak("aterm-gui", bound),
+            Some(trust_facts::Peak {
+                rss: 47_198_031_152,
+                when: gui.when.clone(),
+                own: false,
+                least: true,
+                of: P.into(),
+            })
+        );
+        assert_eq!(costs.claim("tiny", ram, bound), 16 * GIB);
+        assert_eq!(
+            costs.estimate("tiny", ram, bound),
+            None,
+            "a row that raises nothing is no estimate a run names"
+        );
+        assert_eq!(costs.claim("unknown", ram, bound), 16 * GIB);
+        assert_eq!(order(&["tiny", "aterm-gui"], &costs.rows), [0, 1]);
+
+        let mut own = rows.clone();
+        keep(
+            &mut own,
+            "aterm-gui",
+            row(20 * GIB, 30, NEW, Some(Cut::OverBudget)),
+        );
+        let costs = Costs::of(&own, NEW);
+        assert_eq!(
+            costs.claim("aterm-gui", ram, bound),
+            aterm_capacity::peak_claim(47_198_031_152),
+            "a cut row of its own below the other's peak leaves the other's claim"
+        );
+        assert_eq!(
+            costs.peak("aterm-gui", bound).map(|p| p.of),
+            Some(P.to_string())
+        );
+        keep(&mut own, "aterm-gui", row(10 * GIB, 30, NEW, None));
+        let costs = Costs::of(&own, NEW);
+        assert!(!costs.elsewhere.contains_key("aterm-gui"), "{costs:?}");
+        assert_eq!(costs.claim("aterm-gui", ram, bound), 12 * GIB);
+        assert_eq!(
+            costs.peak("aterm-gui", bound),
+            Some(trust_facts::Peak {
+                rss: 10 * GIB,
+                when: "2026-10-30T00:00:00Z".into(),
+                own: true,
+                least: false,
+                of: String::new(),
+            }),
+            "a finished row of its own replaces the other's"
+        );
+    }
+
+    /// What this 48 GiB Mac can ever make available, the RAM less 3.5 GiB wired.
+    const REACH: u64 = 48 * GIB - 7 * GIB / 2;
+
+    /// TRUST-MEM-2's review: this prover's own measurement stands against another prover's
+    /// peak wherever it decides by itself. costs.tsv's two aterm-gui rows, on this 48 GiB Mac:
+    /// under 20565c325 its own interrupted 47.20 GB row claims 56.64 GB, which is refused by
+    /// itself, so it is refused as `own-least` on that peak and claims that, though the older
+    /// 1.101 row peaked at 62.45 GB; under 29ebb403d, with no row of its own, it is refused as
+    /// `other-least` naming 20565c325, on the same claim. A check that finished under the
+    /// prover that runs, then one cut short above it, leaves its row measured: it claims its own
+    /// peak and margin and is refused or admitted on that, and no other prover's row stands in,
+    /// older or newer. NEGATIVE CONTROLS: a cut row of its own whose claim is admissible, though
+    /// newer than another prover's row, leaves that row's larger claim, since a check cut short
+    /// early says nothing of the library's scale; and where 20565c325's own peak decides
+    /// nothing (the memory unread, or a host where its claim fits), its run claims on the 1.101
+    /// peak, the larger.
+    #[test]
+    fn this_provers_own_measurement_stands_where_it_decides() {
+        let host = trust_facts::Host {
+            mem: 48 * GIB,
+            reach: REACH,
+            uncapped: true,
+            ..trust_facts::Host::default()
+        };
+        let (ram, bound) = (host.mem, host.admits_below());
+        let gui = |rows: &CostRows, prover: &str, bound: u64| {
+            let costs = Costs::of(rows, prover);
+            let peak = costs.peak("aterm-gui", bound).unwrap();
+            let seen = trust_facts::peak_seen(&host, &peak).map(|s| (s.outcome, s.prover));
+            (seen, peak.rss, costs.claim("aterm-gui", ram, bound))
+        };
+        let rows = parse_costs(&format!(
+            "{COSTS_HEADER}\n\
+             aterm-gui\t16972\t17245\t62450089984\t2026-10-20T17:45:18Z\t{OTHER}\n\
+             aterm-gui\t5862\t7547\t47198031152\t2026-10-31T01:00:39Z\t{P}\tinterrupted\n"
+        ));
+        let least = aterm_capacity::peak_claim(47_198_031_152);
+        assert_eq!(least, 56_637_637_382);
+        assert_eq!(
+            gui(&rows, P, bound),
+            (
+                Some((trust_facts::OWN_LEAST.into(), String::new())),
+                47_198_031_152,
+                least
+            ),
+            "under 20565c325, its own peak"
+        );
+        assert_eq!(
+            gui(&rows, NEW, bound),
+            (
+                Some((trust_facts::OTHER_LEAST.into(), P.into())),
+                47_198_031_152,
+                least
+            ),
+            "under 29ebb403d, 20565c325's"
+        );
+        let bigger = aterm_capacity::peak_claim(62_450_089_984);
+        for undecided in [0, 128 * GIB] {
+            let (_, rss, claim) = gui(&rows, P, undecided);
+            assert_eq!(
+                (rss, claim),
+                (62_450_089_984, bigger),
+                "NEGATIVE CONTROL: a bound of {undecided} that its own peak does not reach"
+            );
+        }
+
+        let row = |maxrss: u64, when: &str, prover: &str, cut: Option<Cut>| Cost {
+            cpu: 100,
+            wall: 100,
+            maxrss,
+            when: format!("2026-11-{when}T00:00:00Z"),
+            prover: prover.into(),
+            cut,
+            raised: false,
+        };
+        for other in ["02", "04"] {
+            let mut rows = CostRows::new();
+            keep(&mut rows, "x", row(10 * GIB, "01", P, None));
+            keep(&mut rows, "x", row(62_450_089_984, other, OTHER, None));
+            keep(
+                &mut rows,
+                "x",
+                row(11 * GIB, "03", P, Some(Cut::Interrupted)),
+            );
+            let costs = Costs::of(&rows, P);
+            assert!(costs.rows["x"].raised, "{costs:?}");
+            assert!(costs.elsewhere.is_empty(), "{other}: {costs:?}");
+            assert_eq!(
+                costs.claim("x", ram, bound),
+                aterm_capacity::peak_claim(11 * GIB),
+                "{other}: its own peak and margin, not 16 GiB nor the other's"
+            );
+            let peak = costs.peak("x", bound).unwrap();
+            assert_eq!((peak.rss, peak.own, peak.least), (11 * GIB, true, true));
+            assert_eq!(trust_facts::peak_seen(&host, &peak), None, "{other}");
+            assert_eq!(costs.estimate("x", ram, bound), None, "{other}");
+        }
+
+        let mut early = CostRows::new();
+        keep(
+            &mut early,
+            "aterm-gui",
+            row(47_198_031_152, "01", P, Some(Cut::Interrupted)),
+        );
+        keep(
+            &mut early,
+            "aterm-gui",
+            row(10 * GIB, "02", NEW, Some(Cut::Interrupted)),
+        );
+        assert_eq!(
+            gui(&early, NEW, bound),
+            (
+                Some((trust_facts::OTHER_LEAST.into(), P.into())),
+                47_198_031_152,
+                least
+            ),
+            "NEGATIVE CONTROL: its own newer 10 GiB lower bound decides nothing"
         );
     }
 
@@ -6815,7 +7691,10 @@ mod tests {
         assert_eq!(w.starts, ["a", "b", "c", "d"]);
         assert_eq!(w.peak, 2);
         assert_eq!(done.len(), 4);
-        assert!(done.iter().all(|d| !d.over_budget && d.ended.code == 0));
+        assert!(
+            done.iter()
+                .all(|d| !d.over_budget && !d.interrupted && d.ended.code == 0)
+        );
         assert!(
             done.iter()
                 .all(|d| d.job.target == Path::new(&format!("/slots/j{}", d.job.slot))),
@@ -7046,6 +7925,9 @@ mod tests {
             wall: 7256,
             maxrss: 15_018_508_288,
             when: "2026-10-21T14:40:38Z".into(),
+            prover: String::new(),
+            cut: None,
+            raised: false,
         };
         let need = claim_need(Some(&render), 48 * GIB);
         let mut check = job("aterm-render");
@@ -7315,7 +8197,7 @@ mod tests {
             cpu: 1,
             wall: 1,
             maxrss,
-            when: String::new(),
+            ..Cost::default()
         };
         assert_eq!(claim_need(None, 48 * GIB), 16 * GIB);
         assert_eq!(claim_need(Some(&cost(0)), 48 * GIB), 16 * GIB);
@@ -7342,7 +8224,7 @@ mod tests {
             cpu: 1,
             wall: 1,
             maxrss: 15 * GIB,
-            when: String::new(),
+            ..Cost::default()
         };
         for big in [claim_need(Some(&peaked), 16 * GIB), 16 * GIB] {
             let mut f = fake(&[("new", 3), ("huge", 3)]);
@@ -7484,7 +8366,23 @@ mod tests {
         let jobs = ["a", "b", "c"].map(job).to_vec();
         let (r, done) = slots(&mut f, jobs, 2, 100);
         assert_eq!(r, Err(Stopped::Interrupted(None)));
-        assert!(done.is_empty());
+        let mut ended: Vec<_> = done
+            .iter()
+            .map(|d| {
+                (
+                    d.job.name.as_str(),
+                    d.interrupted,
+                    d.over_budget,
+                    d.ended.code,
+                )
+            })
+            .collect();
+        ended.sort_unstable();
+        assert_eq!(
+            ended,
+            [("a", true, false, 137), ("b", true, false, 137)],
+            "each check the interrupt ended is handed on once, marked, for what it measured"
+        );
         let w = f.w.borrow();
         assert_eq!(w.ended_by_lane, ["a", "b"]);
         assert_eq!(w.live, 0);
@@ -7496,9 +8394,15 @@ mod tests {
         let mut f = fake(&[]);
         f.unstartable = Some("b".into());
         let jobs = ["a", "b"].map(job).to_vec();
-        let (r, _) = slots(&mut f, jobs, 2, 100);
+        let (r, done) = slots(&mut f, jobs, 2, 100);
         assert!(matches!(r, Err(Stopped::Unstartable(why)) if why.contains("no targo")));
         assert_eq!(f.w.borrow().ended_by_lane, ["a"]);
+        assert_eq!(
+            done.iter()
+                .map(|d| (d.job.name.as_str(), d.interrupted))
+                .collect::<Vec<_>>(),
+            [("a", true)]
+        );
     }
 
     /// A slot held before the run, or one the lane just ended a check in, takes no check; one
@@ -7533,9 +8437,53 @@ mod tests {
             },
             wall: Duration::from_secs(5),
             over_budget: over,
+            interrupted: false,
             load: Some(30.0),
             trustd_lost: false,
         }
+    }
+
+    /// F9: a check's cost row keeps what it measured whether or not it finished, under the
+    /// prover that ran it: a finished check's is what it took, and one ended at its budget, by
+    /// the run's stop, or by itself without a whole summary or with its transport to trustd
+    /// failed says how it was cut short. NEGATIVE CONTROL: a cut check whose peak was not read
+    /// keeps nothing, where a finished one with none still keeps its times.
+    #[test]
+    fn a_check_cut_short_keeps_what_it_measured() {
+        let d = tmp("trust-lane-cost-of");
+        let driver = Driver {
+            bin: PathBuf::new(),
+            targo: PathBuf::new(),
+            id: P.into(),
+        };
+        let cut = |f: &Finished| cost_of(f, &driver).map(|c| c.cut);
+        let done = finished(d.path(), DONE, 0, false);
+        let c = cost_of(&done, &driver).unwrap();
+        assert_eq!((c.cpu, c.wall, c.maxrss, c.cut), (4, 5, 9, None));
+        assert_eq!(c.prover, P);
+        assert_eq!(
+            cut(&finished(d.path(), DONE, 137, true)),
+            Some(Some(Cut::OverBudget))
+        );
+        let mut stopped = finished(d.path(), "", 137, false);
+        stopped.interrupted = true;
+        assert_eq!(cut(&stopped), Some(Some(Cut::Interrupted)));
+        for log in [
+            "error: could not compile `alpha`\n",
+            "Summary: 5 proved, 0 failed (20 total); reproducible\n",
+        ] {
+            assert_eq!(
+                cut(&finished(d.path(), log, 101, false)),
+                Some(Some(Cut::Failed)),
+                "{log}"
+            );
+        }
+        let mut unread = finished(d.path(), "", 137, true);
+        unread.ended.maxrss = 0;
+        assert_eq!(cut(&unread), None, "nothing of its memory was read");
+        let mut quiet = finished(d.path(), DONE, 0, false);
+        quiet.ended.maxrss = 0;
+        assert_eq!(cut(&quiet), Some(None));
     }
 
     const DONE: &str = "Summary: 5 proved, 0 failed (20 total); reproducible\nCoverage: 3/3 eligible function bodies verified (complete)\n";
@@ -7611,15 +8559,36 @@ mod tests {
         f.ended.threads = Some(trust_facts::Threads {
             ran_ms: 3600,
             runnable_ms: 4000,
+            cores: None,
         });
         record(&f, Duration::from_secs(60), 14, &mut || String::new()).unwrap();
         let pace = fs::read_to_string(beside("pace")).unwrap();
         assert_eq!(pace, "4000 5000 3000 14 3600 4000\n");
         let pace = trust_facts::Pace::parse(pace.trim()).unwrap();
         assert!(!pace.starved(), "its threads ran: {}", pace.said());
+        // The same threads, a third of their time on efficiency cores at half the speed.
+        f.ended.threads = Some(trust_facts::Threads {
+            ran_ms: 3600,
+            runnable_ms: 4000,
+            cores: Some(trust_facts::Cores {
+                p_ms: 2400,
+                instructions: 3_000_000,
+                p_instructions: 2_400_000,
+            }),
+        });
+        record(&f, Duration::from_secs(60), 14, &mut || String::new()).unwrap();
+        let pace = fs::read_to_string(beside("pace")).unwrap();
+        assert_eq!(pace, "4000 5000 3000 14 3600 4000 2400 3000000 2400000\n");
+        let pace = trust_facts::Pace::parse(pace.trim()).unwrap();
+        assert!(
+            pace.starved(),
+            "0.75 at a performance core's speed: {}",
+            pace.said()
+        );
     }
 
-    /// A check's times are its own processes', each at its latest read.
+    /// A check's times are its own processes', each at its latest read, and its peak the largest
+    /// footprint one of them had.
     #[test]
     fn a_checks_times_sum_its_own_processes_latest_reads() {
         use aterm_sysprobe::procs::ProcessReading;
@@ -7634,6 +8603,7 @@ mod tests {
         let sums = |t: &TreeTimes| t.threads().map(|t| (t.ran_ms, t.runnable_ms));
         let mut t = TreeTimes::default();
         assert_eq!(sums(&t), None);
+        assert_eq!(t.threads().and_then(|t| t.cores), None);
         // The root 10, its child 11 and grandchild 12; a stranger 20 and its child 21; pid 0,
         // its own parent.
         let stranger = [
@@ -7672,6 +8642,79 @@ mod tests {
         let mut none = TreeTimes::default();
         none.take(10, &stranger);
         assert_eq!(sums(&none), None, "no root read, nothing taken");
+        assert_eq!(none.peak(), 0);
+
+        // ATERM-GUI-MEM: the largest footprint any of the tree's processes had, read with or
+        // without its times, and never the stranger's.
+        let peaked = |mut r: ProcessReading, peak| {
+            r.peak_footprint = Some(peak);
+            r
+        };
+        let mut m = TreeTimes::default();
+        m.take(
+            10,
+            &[
+                peaked(p(10, 1, 100, 1, Some(1)), 3),
+                peaked(p(11, 10, 110, 1, None), 40),
+                peaked(p(20, 1, 200, 1, Some(1)), 900),
+            ],
+        );
+        assert_eq!(m.peak(), 40);
+        m.take(10, &[peaked(p(10, 1, 100, 1, Some(1)), 7)]);
+        assert_eq!(m.peak(), 40, "one that ended keeps the largest it showed");
+    }
+
+    /// FONT-ECORE-SHARE: where a check's processes ran is summed with their times, its
+    /// performance cores' time in milliseconds; a process read without it (a host with one kind
+    /// of core, or a read that had none) leaves the sum without it, so no share is weighed on
+    /// part of the tree.
+    #[test]
+    fn a_checks_core_split_is_summed_only_where_every_process_has_one() {
+        use aterm_sysprobe::{CoreSplit, procs::ProcessReading};
+        let p = |pid, ppid, ran_ms: u64, cores: Option<(u64, u64, u64)>| ProcessReading {
+            pid,
+            ppid,
+            start: Some(u64::from(pid)),
+            cpu_ns: Some(ran_ms * 1_000_000),
+            runnable_ns: Some(ran_ms * 2_000_000),
+            cores: cores.map(|(p_ms, instructions, p_instructions)| CoreSplit {
+                p_cpu_ns: p_ms * 1_000_000,
+                instructions,
+                p_instructions,
+            }),
+            ..ProcessReading::default()
+        };
+        let mut t = TreeTimes::default();
+        t.take(
+            10,
+            &[
+                p(10, 1, 100, Some((100, 500, 500))),
+                p(11, 10, 300, Some((200, 900, 700))),
+            ],
+        );
+        let both = t.threads().unwrap();
+        assert_eq!((both.ran_ms, both.runnable_ms), (400, 800));
+        assert_eq!(
+            both.cores,
+            Some(trust_facts::Cores {
+                p_ms: 300,
+                instructions: 1400,
+                p_instructions: 1200,
+            })
+        );
+        assert_eq!(
+            both.worked_ms(),
+            350,
+            "300 ms on P, 100 ms on E at half the rate"
+        );
+        t.take(
+            10,
+            &[p(10, 1, 100, Some((100, 500, 500))), p(12, 10, 50, None)],
+        );
+        let mixed = t.threads().unwrap();
+        assert_eq!(mixed.ran_ms, 450);
+        assert_eq!(mixed.cores, None, "one process read without a split");
+        assert_eq!(mixed.worked_ms(), 450);
     }
 
     /// A running check's times come off the live process table: its root's and what the root
@@ -7733,6 +8776,86 @@ mod tests {
         assert_eq!(read, BTreeSet::from([root, under.pid]), "{:?}", check.times);
         check.child.kill().unwrap();
         let _ = check.child.wait();
+    }
+
+    /// ATERM-GUI-MEM: a check's recorded peak ([`Ended::maxrss`]) is the larger of the resident
+    /// high-water mark its reap reports and the largest footprint a read of its tree showed
+    /// ([`TreeTimes::peak`]), whether it ends by itself (`poll`) or the lane ends it (`end`):
+    /// under memory pressure the kernel compresses pages out of the resident set, so the first
+    /// alone can be far below what the check needed (aterm-gui's 29.5 GB resident against a
+    /// 47.2 GB footprint). NEGATIVE CONTROL: with no footprint read, its peak is the resident
+    /// mark alone, far below the footprint the other arm was read with.
+    #[test]
+    fn a_checks_peak_counts_its_trees_largest_footprint() {
+        const FOOTPRINT: u64 = 1 << 40;
+        for by_itself in [true, false] {
+            for read in [true, false] {
+                let d = tmp("trust-lane-peak");
+                let nonce = nonce();
+                let mut cmd = command("/bin/sh");
+                cmd.arg("-c")
+                    .arg("read -r go")
+                    .env(CHECK_VAR, &nonce)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                proc_tree::new_session(&mut cmd);
+                let child = cmd.spawn().unwrap();
+                let root = child.id();
+                let target = d.path().join("j0");
+                owner_dirs(&target).unwrap();
+                let record = d.path().join(".check.0");
+                fs::write(&record, "the lane's own\n").unwrap();
+                let mut check = RealCheck {
+                    child,
+                    record,
+                    target,
+                    mark: proc_tree::Mark {
+                        nonce: Some(nonce),
+                        root: Some((i32::try_from(root).unwrap(), serial_of(root))),
+                        kept: BTreeSet::new(),
+                    },
+                    ended: None,
+                    times: TreeTimes::default(),
+                    read_at: None,
+                    sweep: || None,
+                };
+                if read {
+                    check.times.take(
+                        root,
+                        &[aterm_sysprobe::procs::ProcessReading {
+                            pid: root,
+                            ppid: 1,
+                            peak_footprint: Some(FOOTPRINT),
+                            ..aterm_sysprobe::procs::ProcessReading::default()
+                        }],
+                    );
+                }
+                let ended = if by_itself {
+                    open(&mut check.child).unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(60);
+                    loop {
+                        if let Some(ended) = check.poll().unwrap() {
+                            break ended;
+                        }
+                        assert!(Instant::now() < deadline, "the root never ended");
+                        aterm_uds::deadline::poll_yield();
+                    }
+                } else {
+                    check.end()
+                };
+                let how = if by_itself { "poll" } else { "end" };
+                if read {
+                    assert_eq!(ended.maxrss, FOOTPRINT, "{how}");
+                } else {
+                    assert!(
+                        ended.maxrss > 0 && ended.maxrss < FOOTPRINT,
+                        "{how}: {}",
+                        ended.maxrss
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -7825,6 +8948,8 @@ mod tests {
         root: PathBuf,
         log: &'static str,
         interrupt: bool,
+        /// Each check runs until the run is interrupted at this moment ([`Hung`]).
+        stop_at: Option<Duration>,
         now: Duration,
         started: &'a mut Vec<String>,
         stamp: Option<SystemTime>,
@@ -7856,6 +8981,23 @@ mod tests {
         }
     }
 
+    /// A check that runs until the lane ends it, having reached a 5 GiB peak.
+    struct Hung;
+
+    impl Check for Hung {
+        fn poll(&mut self) -> std::io::Result<Option<Ended>> {
+            Ok(None)
+        }
+        fn end(&mut self) -> Ended {
+            Ended {
+                code: 137,
+                cpu: Duration::from_secs(2),
+                maxrss: 5 * GIB,
+                threads: None,
+            }
+        }
+    }
+
     impl Checks for Quick<'_> {
         fn start(&mut self, job: &mut Job) -> std::io::Result<Box<dyn Check>> {
             self.started.push(job.name.clone());
@@ -7871,6 +9013,9 @@ mod tests {
                     .set_modified(t)?;
             }
             fs::write(&job.log, self.log)?;
+            if self.stop_at.is_some() {
+                return Ok(Box::new(Hung));
+            }
             Ok(Box::new(Over))
         }
         fn trustd_held(&self) -> bool {
@@ -7880,7 +9025,9 @@ mod tests {
             "ours\tthis build's".into()
         }
         fn interrupted(&self) -> bool {
-            self.interrupt || (self.gate.is_some() && self.now >= GATE_HANG)
+            self.interrupt
+                || self.stop_at.is_some_and(|t| self.now >= t)
+                || (self.gate.is_some() && self.now >= GATE_HANG)
         }
         fn now(&self) -> Duration {
             self.now
@@ -7916,6 +9063,8 @@ mod tests {
         started: Vec<String>,
         log: &'static str,
         interrupt: bool,
+        /// Each check runs until the run is interrupted at this moment ([`Quick::stop_at`]).
+        stop_at: Option<Duration>,
         meanwhile: Option<fn(&Path)>,
         /// The stamp each check's dep-info gets ([`Quick`]).
         stamp: Option<SystemTime>,
@@ -8024,6 +9173,7 @@ mod tests {
                 root: prep.root.clone(),
                 log: self.log,
                 interrupt: self.interrupt,
+                stop_at: self.stop_at,
                 now: Duration::ZERO,
                 started: &mut self.started,
                 stamp: self.stamp,
@@ -8146,6 +9296,7 @@ mod tests {
             started: Vec::new(),
             log: DONE,
             interrupt: false,
+            stop_at: None,
             meanwhile: None,
             stamp: None,
             load: None,
@@ -8302,6 +9453,7 @@ mod tests {
                 cold: COLD_DISK,
                 on: root.clone(),
                 stuck_ends: None,
+                scratch: false,
                 machine: None,
             }
         );
@@ -8604,23 +9756,36 @@ mod tests {
         let seed = s.repo.join(trust_facts::COSTS);
         let (outcome, said, _) = run_site(&mut s);
         assert_eq!(outcome, Outcome::Pass, "{said}");
-        let costs = read_costs(None, &seed);
-        let alpha = &costs["alpha"];
-        assert_eq!((alpha.cpu, alpha.maxrss), (1, 1), "this run's measurement");
-        assert_ne!(alpha.when, "2026-10-01T00:00:00Z", "stamped by this run");
+        let rows = cost_file(&seed);
+        let alpha = &rows["alpha"];
         assert_eq!(
-            costs["zeta"],
-            Cost {
+            alpha.len(),
+            1,
+            "this run's row stands in for the row that named no prover"
+        );
+        assert_eq!(
+            (alpha[0].cpu, alpha[0].maxrss),
+            (1, 1),
+            "this run's measurement"
+        );
+        assert_ne!(alpha[0].when, "2026-10-01T00:00:00Z", "stamped by this run");
+        assert_eq!(alpha[0].prover, "targo 0.0.0-test", "under its prover");
+        assert_eq!(
+            rows["zeta"],
+            [Cost {
                 cpu: 50,
                 wall: 60,
                 maxrss: 70,
                 when: "2026-10-02T00:00:00Z".into(),
-            },
+                prover: String::new(),
+                cut: None,
+                raised: false,
+            }],
             "a row it did not measure keeps its own, over an older row of the history"
         );
         assert!(
-            !costs.contains_key("gone"),
-            "a library outside the graph is not written back: {costs:?}"
+            !rows.contains_key("gone"),
+            "a library outside the graph is not written back: {rows:?}"
         );
     }
 
@@ -8662,11 +9827,16 @@ mod tests {
 
     #[test]
     fn the_seed_keeps_the_later_row_of_each_library_still_in_the_graph() {
-        let row = |cpu: u64, when: &str| Cost {
-            cpu,
-            wall: cpu,
-            maxrss: cpu,
-            when: when.into(),
+        let row = |cpu: u64, when: &str| {
+            vec![Cost {
+                cpu,
+                wall: cpu,
+                maxrss: cpu,
+                when: when.into(),
+                prover: P.into(),
+                cut: None,
+                raised: false,
+            }]
         };
         let committed = BTreeMap::from([
             ("newer-here".to_string(), row(1, "2026-10-01T00:00:00Z")),
@@ -8692,7 +9862,7 @@ mod tests {
         .into_iter()
         .map(String::from)
         .collect();
-        let cpu: BTreeMap<String, u64> = seed_rows(committed, history, &graph)
+        let cpu: BTreeMap<String, u64> = read(&seed_rows(committed, history, &graph), P)
             .into_iter()
             .map(|(n, c)| (n, c.cpu))
             .collect();
@@ -8866,6 +10036,39 @@ mod tests {
         assert!(filed.is_empty());
     }
 
+    /// F9: a run interrupted while a check runs decides nothing, and keeps what the check
+    /// measured in its prover's row of the clone's cost history, marked interrupted: its 5 GiB
+    /// peak is the least it needs. NEGATIVE CONTROL: a run interrupted before any check started
+    /// keeps no row.
+    #[test]
+    fn an_interrupted_check_keeps_its_peak_and_decides_nothing() {
+        for stop_at in [Some(Duration::from_secs(3)), None] {
+            let mut s = site(Scope::WholeTree);
+            s.stop_at = stop_at;
+            s.interrupt = stop_at.is_none();
+            let (outcome, said, filed) = run_site(&mut s);
+            assert!(
+                matches!(&outcome, Outcome::CouldNotRun(why) if why.starts_with("interrupted")),
+                "{outcome:?}: {said}"
+            );
+            assert!(filed.is_empty(), "{filed:?}");
+            let rows = cost_file(&s.cfg.state.clone().unwrap().join("trust-costs.tsv"));
+            if stop_at.is_some() {
+                assert_eq!(s.started, ["alpha"], "{said}");
+                let alpha = &rows["alpha"];
+                assert_eq!(
+                    (alpha.len(), alpha[0].maxrss, alpha[0].cut),
+                    (1, 5 * GIB, Some(Cut::Interrupted)),
+                    "{rows:?}"
+                );
+                assert_eq!(alpha[0].prover, "targo 0.0.0-test");
+            } else {
+                assert!(s.started.is_empty(), "{said}");
+                assert!(rows.is_empty(), "{rows:?}");
+            }
+        }
+    }
+
     #[test]
     fn a_floor_this_host_cannot_reproduce_narrows_the_run() {
         for stop in [true, false] {
@@ -8932,18 +10135,255 @@ mod tests {
     }
 
     /// A site whose cost history says alpha's last check peaked at `maxrss` bytes on
-    /// 2026-10-20, under a prover that does (`takes`) or does not take a memory ceiling.
+    /// 2026-10-20, on a row that names no prover, under a prover that does (`takes`) or does
+    /// not take a memory ceiling.
     fn with_peak(maxrss: u64, takes: bool) -> Site {
-        let mut s = site(Scope::Packages(vec!["alpha".into()]));
+        let mut s = with_peak_of(maxrss, "");
         s.ceiling = Ok(takes);
+        s
+    }
+
+    /// A site whose cost history says alpha's last check peaked at `maxrss` bytes on
+    /// 2026-10-20 under `prover` (none where empty).
+    fn with_peak_of(maxrss: u64, prover: &str) -> Site {
+        let mut s = site(Scope::Packages(vec!["alpha".into()]));
+        s.ceiling = Ok(false);
         let state = s.cfg.state.clone().unwrap();
         fs::create_dir_all(&state).unwrap();
+        let named = if prover.is_empty() {
+            String::new()
+        } else {
+            format!("\t{prover}")
+        };
         fs::write(
             state.join("trust-costs.tsv"),
-            format!("{COSTS_HEADER}\nalpha\t16972\t17245\t{maxrss}\t2026-10-20T17:45:18Z\n"),
+            format!("{COSTS_HEADER}\nalpha\t16972\t17245\t{maxrss}\t2026-10-20T17:45:18Z{named}\n"),
         )
         .unwrap();
         s
+    }
+
+    /// TRUST-MEM-2 through the whole run, on a 48 GiB host with the launch gate on: aterm-gui
+    /// under a prover with no row of its own (29ebb403d's place), whose only row is
+    /// 20565c325's 47.20 GB interrupted one, is refused up front on that peak with its margin,
+    /// its plan row `other-least` naming that prover, its line saying no check under this
+    /// prover has finished, and no check starts; a finished 62.45 GB row of the 1.101 prover is
+    /// refused as `other-peak`. The rule this replaced admitted the first on the 16 GiB claim of
+    /// an unmeasured library, which let one reach a 33 GB footprint on 2026-10-30 while the
+    /// other steps' claims waited behind it. A 30 GiB peak another prover recorded runs first,
+    /// claiming 36 GiB on it, and the run names whose peak that is. NEGATIVE CONTROLS: the same
+    /// 47.20 GB beside a finished 10 GiB row of this prover's own runs on its own, claiming
+    /// 12 GiB, and names no other prover; so does a 1.101 62.45 GB row beside this prover's
+    /// finished 10 GiB check and the 11 GiB one cut short after it, older or newer; and
+    /// costs.tsv's two aterm-gui rows, this prover in 20565c325's place, refuse it as
+    /// `own-least` on its own 47.20 GB, not the 1.101 prover's larger peak.
+    #[test]
+    fn another_provers_peak_refuses_up_front_until_this_provers_own_replaces_it() {
+        const P15698: &str = "targo 1.99.0-dev (20565c325 2026-10-19) (targo 0.11.0+g20565c325)";
+        let gate = |s: &mut Site, tag: &str, available: u64| {
+            let dir = tmp(tag);
+            let ledger = aterm_capacity::Ledger::at(dir.path().join("ledger"));
+            s.gate = Some((
+                aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, available, 14)),
+                ledger.clone(),
+            ));
+            (dir, ledger)
+        };
+        for (maxrss, prover, word, peaked, token) in [
+            (
+                47_198_031_152,
+                format!("{P15698}\tinterrupted"),
+                "other-least",
+                "was cut short after reaching 47.20 GB on 2026-10-20, the least it needs",
+                "~52.7 GiB",
+            ),
+            (
+                62_450_089_984,
+                "targo 1.101.0-dev (targo 0.10.0)".to_string(),
+                "other-peak",
+                "peaked at 62.45 GB on 2026-10-20",
+                "~69.8 GiB",
+            ),
+        ] {
+            let mut s = with_peak_of(maxrss, &prover);
+            let (_dir, ledger) = gate(&mut s, "trust-other-refused", 28);
+            let (outcome, said, _) = run_site(&mut s);
+            assert!(
+                matches!(&outcome, Outcome::Narrowed(l) if l == &[format!("alpha: needs {token}")]),
+                "{outcome:?}: {said}"
+            );
+            assert!(s.started.is_empty(), "no check starts: {said}");
+            let named = prover.split('\t').next().unwrap();
+            a_line_names(
+                &said,
+                &format!(
+                    "trust: alpha not verified here: no check of it under this prover has finished, and its last check under {named} {peaked}"
+                ),
+                &["51.5 GB (48 GiB)"],
+            );
+            let plan = fs::read_to_string(root_of(&s).join("logs/.plan")).unwrap();
+            assert!(
+                plan.contains(&format!(
+                    "\nrefused alpha\t{word}\t-\t{maxrss}\t2026-10-20T17:45:18Z\t{named}\n"
+                )),
+                "{plan}"
+            );
+            assert!(ledger.list().unwrap().is_empty(), "nothing claimed");
+        }
+
+        let mut fits = with_peak_of(30 * GIB, P15698);
+        let (_dir, ledger) = gate(&mut fits, "trust-other-fits", 40);
+        let (outcome, said, _) = run_site(&mut fits);
+        assert_eq!((outcome, fits.started.len()), (Outcome::Pass, 1), "{said}");
+        a_line_names(
+            &said,
+            "trust: alpha has no finished check under this prover",
+            &[
+                &format!("its last check under {P15698} peaked at 32.21 GB on 2026-10-20"),
+                "runs first, claiming 36 GiB",
+            ],
+        );
+        assert!(ledger.list().unwrap().is_empty(), "its claim let go");
+
+        let mut own = with_peak_of(47_198_031_152, &format!("{P15698}\tinterrupted"));
+        let state = own.cfg.state.clone().unwrap().join("trust-costs.tsv");
+        let text = format!(
+            "{}alpha\t1\t1\t{}\t2026-10-30T00:00:00Z\ttargo 0.0.0-test\n",
+            fs::read_to_string(&state).unwrap(),
+            10 * GIB
+        );
+        fs::write(&state, text).unwrap();
+        let (_dir, _ledger) = gate(&mut own, "trust-other-own", 28);
+        let (outcome, said, _) = run_site(&mut own);
+        assert_eq!((outcome, own.started.len()), (Outcome::Pass, 1), "{said}");
+        assert!(
+            !said.contains("no finished check") && !said.contains(P15698),
+            "its own row stands alone: {said}"
+        );
+        let plan = fs::read_to_string(root_of(&own).join("logs/.plan")).unwrap();
+        assert!(!plan.contains("\nrefused "), "{plan}");
+
+        const P1101: &str = "targo 1.101.0-dev (targo 0.10.0)";
+        let with_rows = |rows: &[String]| {
+            let s = with_peak_of(1, "");
+            let state = s.cfg.state.clone().unwrap().join("trust-costs.tsv");
+            fs::write(&state, format!("{COSTS_HEADER}\n{}", rows.concat())).unwrap();
+            s
+        };
+        for other in ["2026-10-30", "2026-11-01"] {
+            let mut measured = with_rows(&[
+                format!(
+                    "alpha\t1\t1\t{}\t2026-10-29T00:00:00Z\ttargo 0.0.0-test\n",
+                    10 * GIB
+                ),
+                format!("alpha\t16972\t17245\t62450089984\t{other}T00:00:00Z\t{P1101}\n"),
+                format!(
+                    "alpha\t2\t2\t{}\t2026-10-31T00:00:00Z\ttargo 0.0.0-test\tinterrupted\n",
+                    11 * GIB
+                ),
+            ]);
+            let (_dir, _ledger) = gate(&mut measured, "trust-own-measured", 28);
+            let (outcome, said, _) = run_site(&mut measured);
+            assert_eq!(
+                (outcome, measured.started.len()),
+                (Outcome::Pass, 1),
+                "{other}: {said}"
+            );
+            assert!(
+                !said.contains("no finished check") && !said.contains(P1101),
+                "{other}: a check under this prover finished: {said}"
+            );
+        }
+
+        let mut cut = with_rows(&[
+            format!("alpha\t16972\t17245\t62450089984\t2026-10-20T17:45:18Z\t{P1101}\n"),
+            "alpha\t5862\t7547\t47198031152\t2026-10-31T01:00:39Z\ttargo 0.0.0-test\tinterrupted\n"
+                .to_string(),
+        ]);
+        let (_dir, ledger) = gate(&mut cut, "trust-own-cut", 28);
+        let (outcome, said, _) = run_site(&mut cut);
+        assert!(
+            matches!(&outcome, Outcome::Narrowed(l) if l == &["alpha: needs ~52.7 GiB"]),
+            "{outcome:?}: {said}"
+        );
+        assert!(cut.started.is_empty(), "no check starts: {said}");
+        a_line_names(
+            &said,
+            "trust: alpha not verified here: its last check under this prover",
+            &[
+                "was cut short after reaching 47.20 GB on 2026-10-31, the least it needs",
+                "it claims 56.64 GB",
+            ],
+        );
+        assert!(!said.contains(P1101), "{said}");
+        let plan = fs::read_to_string(root_of(&cut).join("logs/.plan")).unwrap();
+        assert!(
+            plan.contains("\nrefused alpha\town-least\t-\t47198031152\t2026-10-31T01:00:39Z\t-\n"),
+            "{plan}"
+        );
+        assert!(ledger.list().unwrap().is_empty(), "nothing claimed");
+    }
+
+    /// F9 through the whole run: a peak this prover's last check reached before it was cut short
+    /// (aterm-gui's 47.20 GB under 20565c325, interrupted) is the least it needs, so a claim
+    /// sized from it that this 48 GiB host can never make available is refused up front, its
+    /// plan row `own-least` and its line saying the check was cut short. NEGATIVE CONTROL: the
+    /// same row from a check that finished is refused as its peak.
+    #[test]
+    fn a_cut_checks_peak_refuses_up_front_as_the_least_it_needs() {
+        for cut in ["\tinterrupted", ""] {
+            let mut s = with_peak_of(47_198_031_152, &format!("targo 0.0.0-test{cut}"));
+            let (outcome, said, _) = run_site(&mut s);
+            assert!(
+                matches!(&outcome, Outcome::Narrowed(l) if l == &["alpha: needs ~52.7 GiB"]),
+                "{outcome:?}: {said}"
+            );
+            assert!(s.started.is_empty(), "no check starts: {said}");
+            let plan = fs::read_to_string(root_of(&s).join("logs/.plan")).unwrap();
+            let (word, peaked) = if cut.is_empty() {
+                ("own-peak", "peaked at 47.20 GB on 2026-10-20, and")
+            } else {
+                (
+                    "own-least",
+                    "was cut short after reaching 47.20 GB on 2026-10-20, the least it needs, and",
+                )
+            };
+            a_line_names(
+                &said,
+                "trust: alpha not verified here: its last check under this prover",
+                &[peaked, "it claims 56.64 GB", "51.5 GB (48 GiB)"],
+            );
+            assert!(
+                plan.contains(&format!(
+                    "\nrefused alpha\t{word}\t-\t47198031152\t2026-10-20T17:45:18Z\t-\n"
+                )),
+                "{plan}"
+            );
+        }
+    }
+
+    /// F9 through the whole run: a check that ends by itself without a whole summary keeps its
+    /// peak in its prover's row of the clone's cost history, marked failed, where it used to
+    /// keep none. NEGATIVE CONTROL: a check that finished keeps its row unmarked.
+    #[test]
+    fn a_check_that_fails_keeps_its_peak_in_its_provers_row() {
+        for (log, cut) in [
+            ("error: could not compile `alpha`\n", Some(Cut::Failed)),
+            (DONE, None),
+        ] {
+            let mut s = site(Scope::Packages(vec!["alpha".into()]));
+            s.log = log;
+            let (outcome, said, _) = run_site(&mut s);
+            assert_eq!(s.started, ["alpha"], "{outcome:?}: {said}");
+            let rows = cost_file(&s.cfg.state.clone().unwrap().join("trust-costs.tsv"));
+            let alpha = &rows["alpha"];
+            assert_eq!(alpha.len(), 1, "{rows:?}");
+            assert_eq!(
+                (alpha[0].maxrss, alpha[0].prover.as_str(), alpha[0].cut),
+                (1, "targo 0.0.0-test", cut),
+                "{log}: {said}"
+            );
+        }
     }
 
     /// Asserts that one line of `said` starts with `head` and names each of `facts`.
@@ -8978,7 +10418,7 @@ mod tests {
             assert!(said.contains("more RAM than its recorded peak"), "{said}");
             let plan = fs::read_to_string(root_of(&s).join("logs/.plan")).unwrap();
             assert!(
-                plan.contains("\nrefused alpha\tpeak\t-\t62450089984\t2026-10-20T17:45:18Z\n"),
+                plan.contains("\nrefused alpha\tpeak\t-\t62450089984\t2026-10-20T17:45:18Z\t-\n"),
                 "{plan}"
             );
         }
@@ -9035,7 +10475,7 @@ mod tests {
         for row in [
             format!("\nhost-reach {reach}\n"),
             format!(
-                "\nrefused alpha\tpeak\t{reach}\t{}\t2026-10-20T17:45:18Z\n",
+                "\nrefused alpha\tpeak\t{reach}\t{}\t2026-10-20T17:45:18Z\t-\n",
                 38 * GIB
             ),
         ] {
@@ -12045,7 +13485,9 @@ mod tests {
 
     /// With the root gone and nothing carrying the mark, a member working in the slot may still
     /// be the check's and exec a fresh build there: it holds the record, unsignalled and
-    /// whatever the stamp says, until it is gone.
+    /// whatever the stamp says, until it is gone. The member drops the mark before it starts:
+    /// one that carried it would be the check's by it, which Linux reads (macOS withholds a
+    /// platform binary's environment), and a reap would end it.
     #[test]
     fn what_a_gone_root_left_working_in_its_slot_holds_it_unsignalled() {
         let d = tmp("trust-lane-working");
@@ -12058,9 +13500,10 @@ mod tests {
         let nonce = nonce();
         let mut cmd = command("/bin/sh");
         cmd.arg("-c")
-            .arg("(/bin/sleep 600 & echo $! > \"$1\"); exec /bin/sleep 600")
+            .arg("(unset \"$2\"; /bin/sleep 600 & echo $! > \"$1\"); exec /bin/sleep 600")
             .arg("sh")
             .arg(&pidfile)
+            .arg(CHECK_VAR)
             .current_dir(&slot)
             .env(CHECK_VAR, &nonce)
             .stdin(Stdio::null())

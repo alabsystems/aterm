@@ -170,7 +170,7 @@ pass trend=easing src=kernel
 do class=none may=agent destructive=0
 cannot what=index_progress why=unsupported
 cannot what=index_folder why=needs_privilege:root
-CPU hardware: not sampled; `sys cores` reads it
+CPU hardware: not in this reading; `sys cores` or `sys why fresh=0` takes a sample
 OS thermal state 0 (nominal); low power off; nominal thermal state does not exclude another limit
 ";
 
@@ -265,7 +265,7 @@ fn example_b_a_calm_mac_is_two_lines() {
         "OK 4 sys v=1 view=why subject=global as_of=22:10:02.120 age_ms=120 window_ms=5000 next=7f3a.7
 why     calm: 0.4 of 18 cores busy; memory 16.6 GiB used · available not reported · 128 GiB total, pressure normal; swap 0; no cause open
 you tab=1 role=minor basis=machine_calm cpu_mc=120 share_pm=300
-CPU hardware: not sampled; `sys cores` reads it
+CPU hardware: not in this reading; `sys cores` or `sys why fresh=0` takes a sample
 OS thermal state 0 (nominal); low power off; nominal thermal state does not exclude another limit
 "
     );
@@ -340,7 +340,7 @@ fn the_memory_reply_reads_its_classes_and_footprints() {
     assert_eq!(
         t,
         "OK 15 sys v=1 view=why subject=global.mem as_of=22:10:02.120 age_ms=120 window_ms=5000 next=7f3a.7
-why     global memory: 16.5 of 128 GiB used; pressure normal; swap 0; nothing compressed; no cause open; this tab is not the cause
+why     global memory: 16.5 of 128 GiB used; pressure normal; swap 0; nothing compressed; no cause open; this tab uses little of it
 classes total_bytes=137438953472 app_bytes=12545392640 wired_bytes=5132959744 compressed_bytes=0 used_bytes=17678352384 cache_bytes=27967258624 free_bytes=89733971968 src=kernel
 classes not_in_vm_bytes=2059370496 src=derived
 you tab=1 role=minor fp_bytes=33554432 share_pm=2
@@ -353,7 +353,7 @@ pass trend=steady src=kernel
 do class=none may=agent destructive=0
 cannot what=wired_by_process why=needs_privilege:root
 cannot what=uncharged_memory why=unsupported
-CPU hardware: not sampled; `sys cores` reads it
+CPU hardware: not in this reading; `sys cores` or `sys why fresh=0` takes a sample
 OS thermal state 0 (nominal); low power off; nominal thermal state does not exclude another limit
 "
     );
@@ -1127,7 +1127,7 @@ fn a_memory_role_that_turns_on_an_unread_part_keeps_the_tabs_footprint() {
         "CONTROL: every part read: {t}"
     );
     assert!(
-        lines(&t, "why")[0].ends_with("; this tab is the main cause"),
+        lines(&t, "why")[0].ends_with("; no cause open; this tab uses most of it"),
         "{t}"
     );
 }
@@ -1288,7 +1288,8 @@ fn a_why_without_cpu_stats_says_so_and_keeps_what_needs_none() {
     for text in ["why", "why mem", "why cpu"] {
         let hw = hardware_lines(text, &s);
         assert_eq!(
-            hw[0], "CPU hardware: not sampled; `sys cores` reads it",
+            hw[0],
+            "CPU hardware: not in this reading; `sys cores` or `sys why fresh=0` takes a sample",
             "{text}"
         );
         let kept = |p: &str| hw.iter().filter(|l| l.starts_with(p)).count();

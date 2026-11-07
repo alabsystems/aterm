@@ -181,7 +181,8 @@ impl Purpose {
             ));
         }
         if let Some(machine) = host.map(|host| host.machine).or(declared) {
-            let tree = gnu_runtime::inspect_tree(incoming, machine).map_err(StageError::Payload)?;
+            let tree = gnu_runtime::inspect_tree(incoming, machine)
+                .map_err(|why| StageError::Payload(why.to_string()))?;
             if declared.is_some() && tree.objects == 0 {
                 return Err(StageError::Payload(
                     "elf-binary contains no runtime ELF object".into(),
@@ -771,10 +772,15 @@ fn finish_stage(
         return Ok(root);
     }
 
-    if let Err(e) = swap_into_place(build_dir, incoming) {
-        let _ = crate::store::remove_tree(incoming);
-        return Err(io_step("swap the staged tree into place", e));
-    }
+    // Keep the original native gate through every sidecar and Ready write.
+    // GC must not reclaim the unready tree between rename and publication.
+    let _sdk = match swap_into_place(build_dir, incoming) {
+        Ok(guard) => guard,
+        Err(e) => {
+            let _ = crate::store::remove_tree(incoming);
+            return Err(io_step("swap the staged tree into place", e));
+        }
+    };
 
     if !sidecars.is_empty() {
         for (suffix, bytes) in &sidecars {
@@ -831,7 +837,7 @@ fn finish_local_stage(
     }
     if let Purpose::Install(Some(host)) = purpose {
         aterm_toolchain::gnu_runtime::admit_open_file(&local.file, host)
-            .map_err(StageError::Payload)?;
+            .map_err(|why| StageError::Payload(why.to_string()))?;
     }
     let sidecars = hooks
         .sidecars
@@ -1889,8 +1895,12 @@ fn reverified_root(
     Ok(walked)
 }
 
-fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
+fn swap_into_place(
+    build_dir: &Path,
+    incoming: &Path,
+) -> std::io::Result<Option<crate::lease::ReclaimGuard>> {
     let first_exec = crate::store::first_exec_removal(build_dir)?;
+    let sdk = crate::compat::sdk_mutation_guard_for_build(build_dir)?;
     first_exec.check(incoming)?;
     for other in [
         crate::store::superseded_dir(build_dir),
@@ -1989,7 +1999,7 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
     if let Some(mark) = crate::store::sidecar_path(build_dir, crate::store::UNPROVEN_SUFFIX) {
         let _ = std::fs::remove_file(mark);
     }
-    Ok(())
+    Ok(sdk)
 }
 
 /// Put the outgoing tree parked at `old` back at `out` (the build's name, or its aside, whose
@@ -2260,11 +2270,70 @@ mod tests {
             !crate::store::build_is_complete_on(&compatible, Some(older)),
             "an old ready marker cannot override this host's runtime"
         );
+        #[cfg(unix)]
+        {
+            let pipe =
+                std::ffi::CString::new(compatible.join("pipe").as_os_str().as_encoded_bytes())
+                    .unwrap();
+            // SAFETY: `pipe` is a valid NUL-terminated path in this test's scratch store.
+            assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o600) }, 0);
+            assert!(
+                crate::store::build_is_complete_on(&compatible, Some(host)),
+                "an entry the admission cannot read is no verdict: the ready marker answers"
+            );
+            assert!(
+                !crate::store::build_is_complete_on(&compatible, Some(older)),
+                "nor does it hide this host's refusal"
+            );
+        }
         assert!(
             crate::store::ready_marker_path(&compatible)
                 .unwrap()
                 .is_file(),
             "a probe preserves the existing tree and marker"
+        );
+    }
+
+    /// A build that is a link, even to the very tree admitted there, or a file is no complete
+    /// install on a GNU host, whatever ready marker stands beside it: its root is a refusal, and
+    /// no admission read what is behind it. CONTROL: the tree at its own folder is complete.
+    /// NEGATIVE CONTROL: class a link or file root "cannot judge" (`gnu_runtime`'s walk) and the
+    /// marker answers for each.
+    #[cfg(unix)]
+    #[test]
+    fn a_build_that_is_a_link_or_a_file_is_incomplete_whatever_its_marker() {
+        use aterm_toolchain::gnu_runtime::{Host, Version};
+        let b = bundle_with("gnu-root", make_gnu_archive);
+        let mut artifact = b.art.clone();
+        artifact.target = "x86_64-unknown-linux-gnu".into();
+        artifact.kind = "elf-binary".into();
+        let build = b.build();
+        let host = Host {
+            machine: 62,
+            glibc: Version::parse("2.39").unwrap(),
+        };
+        verify_stage(
+            &artifact,
+            &b.archive,
+            &build,
+            &StageHooks::NONE,
+            Purpose::Install(Some(host)),
+        )
+        .unwrap();
+        assert!(crate::store::build_is_complete_on(&build, Some(host)));
+        let elsewhere = b.dir.join("elsewhere");
+        std::fs::rename(&build, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &build).unwrap();
+        assert!(crate::store::ready_marker_path(&build).unwrap().is_file());
+        assert!(
+            !crate::store::build_is_complete_on(&build, Some(host)),
+            "a link where the build was"
+        );
+        std::fs::remove_file(&build).unwrap();
+        std::fs::write(&build, b"no folder").unwrap();
+        assert!(
+            !crate::store::build_is_complete_on(&build, Some(host)),
+            "a file where the build was"
         );
     }
 
@@ -2626,6 +2695,40 @@ mod tests {
         assert!(scratch_beside(&build).is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn sdk_custody_refuses_same_build_swap_until_final_close() {
+        let b = bundle("sdk-custody-swap");
+        let (build, witness) = b.installed();
+        let incoming = crate::store::incoming_dir(&build).unwrap();
+        std::fs::create_dir_all(incoming.join("bin")).unwrap();
+        std::fs::write(incoming.join("bin/new"), b"owned inert fixture").unwrap();
+        let prefix = build.ancestors().nth(3).unwrap();
+        let subject = crate::lease::Subject::of_dir(prefix, &build).unwrap();
+        let lease =
+            crate::lease::take(prefix, &subject, "SDK reader", std::time::Duration::ZERO).unwrap();
+        let child = lease.try_clone_descriptor().unwrap();
+        drop(lease);
+        assert_eq!(
+            swap_into_place(&build, &incoming).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(witness.exists() && crate::store::build_is_complete(&build));
+        assert!(incoming.join("bin/new").is_file());
+        drop(child);
+        let publication = swap_into_place(&build, &incoming).unwrap();
+        assert!(!witness.exists() && build.join("bin/new").is_file());
+        assert!(matches!(
+            crate::lease::reclaim(prefix, &subject),
+            crate::lease::Reclaim::Keep(_)
+        ));
+        drop(publication);
+        assert!(matches!(
+            crate::lease::reclaim(prefix, &subject),
+            crate::lease::Reclaim::Clear(_)
+        ));
+    }
+
     #[test]
     fn a_swap_that_cannot_begin_restores_the_marker_it_took_down() {
         let b = bundle("swap-blocked");
@@ -2689,7 +2792,7 @@ mod tests {
             crate::store::remove_tree(&target).unwrap();
         }
         let incoming = crate::store::incoming_dir(&build).unwrap();
-        swap_into_place(&build, &incoming).unwrap();
+        drop(swap_into_place(&build, &incoming).unwrap());
         assert!(
             build.is_dir() && !witness.exists(),
             "unheld swap never reacquires its own gate"

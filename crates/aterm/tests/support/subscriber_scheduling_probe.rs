@@ -254,6 +254,7 @@ mod native {
         let escaped = child_read(aterm_secrets::converge::runner(
             &exe,
             aterm_secrets::converge::SUBSCRIBER,
+            aterm_secrets::converge::RepositoryWork::Refresh,
         ))?;
         let outside: i32 = std::env::var(DEFAULT_PRIORITY)
             .map_err(io::Error::other)?

@@ -550,18 +550,27 @@ fn a_workers_time_counts_from_its_start_and_a_persons_typing() {
     use crate::task_record::TaskMark;
     let t0 = Instant::now();
     let later = |secs| t0 + Duration::from_secs(secs);
-    let (first, _) = TaskMark::new(TaskState::Working).apply(None, false, t0, 1_000);
-    let (flipped, _) =
-        TaskMark::new(TaskState::Stalled).apply(Some(&first), false, later(120), 2_000);
-    let (back, _) =
-        TaskMark::new(TaskState::Working).apply(Some(&flipped), false, later(240), 3_000);
+    let (first, _) = TaskMark::new(TaskState::Working).apply(None, &Default::default(), t0, 1_000);
+    let (flipped, _) = TaskMark::new(TaskState::Stalled).apply(
+        Some(&first),
+        &Default::default(),
+        later(120),
+        2_000,
+    );
+    let (back, _) = TaskMark::new(TaskState::Working).apply(
+        Some(&flipped),
+        &Default::default(),
+        later(240),
+        3_000,
+    );
     assert_eq!(stood(&back, later(600), None), Duration::from_secs(600));
     assert_eq!(back.started_unix_ms, 1_000);
     assert_eq!(
         stood(&back, later(600), Some(Duration::from_secs(5))),
         Duration::from_secs(5)
     );
-    let (exited, _) = TaskMark::new(TaskState::Exited).apply(Some(&back), false, later(600), 4_000);
+    let (exited, _) =
+        TaskMark::new(TaskState::Exited).apply(Some(&back), &Default::default(), later(600), 4_000);
     assert_eq!(stood(&exited, later(660), None), Duration::from_secs(660));
 }
 

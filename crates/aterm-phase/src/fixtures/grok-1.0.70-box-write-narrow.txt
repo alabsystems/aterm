@@ -1,0 +1,41 @@
+# grok 1.0.70 · MEASURED 2026-11-06, `aterm ctl text` of an `aterm-lab grok` instance (a private headless aterm, a debug build of this branch) running the real Grok Build 1.0.70, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME` and the lab's local stub of xAI's API (crates/aterm-lab) · the stub's `tool` mode asks to write `notes-for-the-lab.txt` eight folders below the project, at 70x40 (resized from 144x50 by `aterm ctl resize 40 70`): the file card's title keeps one row and shortens the path in its middle (`Allow Edit to /private/tmp/at.lab0…/notes-for-the-lab.txt?`), and its key row is cut short of `Esc:scrollback` (`1/4:select  │  Tab:next option  │  Ctrl+o:always-approve  │`) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  /p/t/at.lab0/proj                         11K / 256K │ [Dashboard]
+
+
+     ❯ toolstart write the notes                           6:10 PM
+
+
+     ◆ Creating crates/aterm-phase/src/fixtures/generated/
+                measurements/long-directory-name-for-a-wrapping-
+                path/another-level/notes-for-the-lab.txt             █
+                                                                     █
+       1  a line                                                     █
+                                                                     █
+                                                                     █
+                                                                     █
+                                                                     █
+                                                                     █
+                                                                     █
+                                                                     █
+                                                                     █
+                                                                     █
+                                                                     █
+                                                                     █
+                                                                     █
+                                                                     █
+                                                                     █
+
+    ◆ Running Write `/private/tmp/at.lab0/p… 24s   24s ⇣11.8k [stop]
+
+  ┃
+  ┃  ›  Allow Edit to /private/tmp/at.lab0…/notes-for-the-lab.txt?
+  ┃
+  ┃  1 (○) Yes, and don't ask again for anything (always-approve m
+  ┃  2 (○) Yes, allow all edits during this session
+  ┃  3 (●) Yes
+  ┃  4 (○) No, reject (type to add feedback)
+  ┃
+
+  1/4:select  │  Tab:next option  │  Ctrl+o:always-approve  │
+

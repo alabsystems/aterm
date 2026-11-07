@@ -17,6 +17,7 @@ const fn os(name: &'static str, at: &'static [&'static str], why: &'static str) 
         pin: None,
         provider: Provider::Os,
         in_guest: false,
+        linux_package: None,
     }
 }
 
@@ -43,6 +44,7 @@ const fn windows(name: &'static str, why: &'static str) -> Tool {
         pin: None,
         provider: Provider::Windows,
         in_guest: false,
+        linux_package: None,
     }
 }
 
@@ -56,6 +58,7 @@ const fn clt(name: &'static str, at: &'static [&'static str], why: &'static str)
         pin: None,
         provider: Provider::Clt,
         in_guest: false,
+        linux_package: None,
     }
 }
 
@@ -69,6 +72,7 @@ const fn toolset(name: &'static str, program: &'static str, why: &'static str) -
         pin: None,
         provider: Provider::Toolset { program },
         in_guest: false,
+        linux_package: None,
     }
 }
 
@@ -89,6 +93,7 @@ const fn workspace(
         pin,
         provider: Provider::Workspace { when },
         in_guest: false,
+        linux_package: None,
     }
 }
 
@@ -102,6 +107,7 @@ const fn release_host(name: &'static str, at: &'static [&'static str], why: &'st
         pin: None,
         provider: Provider::ReleaseHost,
         in_guest: false,
+        linux_package: None,
     }
 }
 
@@ -115,6 +121,7 @@ const fn guest(name: &'static str, at: &'static [&'static str], why: &'static st
         pin: None,
         provider: Provider::Guest,
         in_guest: false,
+        linux_package: None,
     }
 }
 
@@ -134,6 +141,7 @@ const fn unprovided(
         pin: None,
         provider: Provider::Unprovided { because },
         in_guest: false,
+        linux_package: None,
     }
 }
 
@@ -143,6 +151,16 @@ const fn unprovided(
 const fn in_guest(tool: Tool) -> Tool {
     Tool {
         in_guest: true,
+        ..tool
+    }
+}
+
+/// `tool`, a [`Provider::Os`] row macOS ships that a Linux distribution packages apart from its
+/// base install, as `package` (Debian's and Ubuntu's name): a Linux host without it is sent to
+/// its package manager.
+const fn packaged(tool: Tool, package: &'static str) -> Tool {
+    Tool {
+        linux_package: Some(package),
         ..tool
     }
 }
@@ -165,6 +183,7 @@ const fn hardware(name: &'static str, what: &'static str, why: &'static str) -> 
         pin: None,
         provider: Provider::Hardware(what),
         in_guest: false,
+        linux_package: None,
     }
 }
 
@@ -224,19 +243,23 @@ pub const TOOLS: &[Tool] = &[
          signal interrupts the open: 3.2, macOS's /bin/bash (bash 5 restarts it); the Linux guest \
          builds GNU's 3.2.57 as /usr/local/bin/bash-3.2",
     ),
-    os(
+    packaged(
+        os(
+            "zsh",
+            &[
+                "/bin/zsh",
+                "/usr/bin/zsh",
+                "/usr/local/bin/zsh",
+                "/opt/homebrew/bin/zsh",
+                r"C:\Program Files\Git\usr\bin\zsh.exe",
+                r"C:\msys64\usr\bin\zsh.exe",
+            ],
+            "macOS's login shell, which aterm integrates; the zsh integration and the live \
+             headless tests run it. On Windows, MSYS2's zsh, unpacked into Git for Windows or in \
+             MSYS2's own tree: Claude Code's Bash tool runs it there only when CLAUDE_CODE_SHELL \
+             names it",
+        ),
         "zsh",
-        &[
-            "/bin/zsh",
-            "/usr/bin/zsh",
-            "/usr/local/bin/zsh",
-            "/opt/homebrew/bin/zsh",
-            r"C:\Program Files\Git\usr\bin\zsh.exe",
-            r"C:\msys64\usr\bin\zsh.exe",
-        ],
-        "macOS's login shell, which aterm integrates; the zsh integration and the live headless \
-         tests run it. On Windows, MSYS2's zsh, unpacked into Git for Windows or in MSYS2's own \
-         tree: Claude Code's Bash tool runs it there only when CLAUDE_CODE_SHELL names it",
     ),
     workspace(
         "fish",

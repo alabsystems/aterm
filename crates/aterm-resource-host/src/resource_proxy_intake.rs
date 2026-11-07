@@ -50,6 +50,7 @@ pub(crate) struct Incoming {
     pub helper: Peer,
     pub proof: TransportProof,
     pub rights: Rights,
+    pub accounted: bool,
 }
 fn refused() -> io::Error {
     io::Error::new(
@@ -108,6 +109,28 @@ pub(crate) fn receive(
     deadline: Instant,
     provisional: impl FnOnce(&Request, Peer) -> bool,
 ) -> io::Result<Incoming> {
+    receive_mode(stream, expected_job, program, deadline, provisional, false)
+}
+pub(crate) fn receive_accounted(
+    stream: &CtlStream,
+    expected_job: &Binding,
+    program: &Arc<PinnedProgram>,
+    deadline: Instant,
+    provisional: impl FnOnce(&Request, Peer) -> bool,
+) -> io::Result<Incoming> {
+    if !crate::resource_accounting::supported() {
+        return Err(io::ErrorKind::Unsupported.into());
+    }
+    receive_mode(stream, expected_job, program, deadline, provisional, true)
+}
+fn receive_mode(
+    stream: &CtlStream,
+    expected_job: &Binding,
+    program: &Arc<PinnedProgram>,
+    deadline: Instant,
+    provisional: impl FnOnce(&Request, Peer) -> bool,
+    accounted: bool,
+) -> io::Result<Incoming> {
     stream.set_nonblocking(true)?;
     let helper = transport::local_peer(stream)?;
     pin(stream, program, helper, deadline)?;
@@ -146,6 +169,7 @@ pub(crate) fn receive(
         request,
         helper,
         proof,
+        accounted,
         rights: Rights {
             events: events.into(),
             ..rights

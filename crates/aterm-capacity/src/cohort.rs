@@ -229,6 +229,53 @@ pub struct Cohort {
 pub struct RecordedCohort(Cohort);
 
 impl RecordedCohort {
+    pub(crate) fn membership(&self, ancestry: &process::Ancestry) -> crate::FundedMembership {
+        use crate::FundedMembership::{Inside, Outside, Unknown};
+        match self.0.scope.ended_or_unknown() {
+            Some(Lifetime::Drained) => return Outside,
+            Some(_) => return Unknown,
+            None => {}
+        }
+        // Group equality is a conservative overlap even if a number was
+        // reused. Outside requires the original group's live native leader.
+        if ancestry
+            .nodes()
+            .iter()
+            .any(|node| node.pgid == self.0.group as u32)
+        {
+            return Inside;
+        }
+        let Some(leader) = process::read_lineage(self.0.group) else {
+            return if self.lifetime() == Lifetime::Drained {
+                Outside
+            } else {
+                Unknown
+            };
+        };
+        if leader.uniqueid != self.0.leader_serial {
+            return if self.lifetime() == Lifetime::Drained {
+                Outside
+            } else {
+                Unknown
+            };
+        }
+        let inside = ancestry
+            .nodes()
+            .iter()
+            .any(|node| node.identity == leader.identity);
+        if process::read_lineage(self.0.group) != Some(leader) {
+            Unknown
+        } else if inside {
+            Inside
+        } else if leader.pgid != self.0.group as u32 {
+            // A still-live original birth that left its captured group is
+            // not evidence of absence. This observation does not repair or
+            // broaden that group's separate custody/settlement contract.
+            Unknown
+        } else {
+            Outside
+        }
+    }
     pub(crate) fn in_scope(&self, scope: &Scope) -> bool {
         self.0.scope == *scope
     }

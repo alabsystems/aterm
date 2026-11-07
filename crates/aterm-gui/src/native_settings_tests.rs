@@ -8033,6 +8033,30 @@ fn cursor_styles_open_on_the_saved_style_from_another_page() {
     assert!(water.rect.bottom() <= list.bottom() + 0.01);
 }
 
+/// After-land lows W7: a Cursor Styles row says the blurb of the caret chosen, a block's or a
+/// bar's, for each style whose block row promises what a bar does not draw. The control is that
+/// the two differ, so a row that ignored the caret could not pass.
+#[test]
+fn a_style_row_says_the_blurb_of_the_caret_chosen() {
+    use aterm_effects::cursor_glow::spellings::{TRAIL_STYLE_BAR_BLURBS, blurb_for};
+    let said = |toml: &str, value: &str| {
+        let service = VersionedConfigService::new(toml.to_string()).unwrap();
+        let state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
+        listed_cursor_styles(&state)
+            .into_iter()
+            .find(|style| style.value == value)
+            .expect("the style is listed")
+            .description
+    };
+    for (value, _) in TRAIL_STYLE_BAR_BLURBS {
+        let block = said(&trail_drawn(""), value);
+        let bar = said(&trail_drawn("cursor_style = \"bar\"\n"), value);
+        assert_eq!(Some(block.as_str()), blurb_for(value, false), "{value}");
+        assert_eq!(Some(bar.as_str()), blurb_for(value, true), "{value}");
+        assert_ne!(block, bar, "control: {value}'s two carets read alike");
+    }
+}
+
 #[test]
 fn off_leads_the_cursor_styles_and_says_what_it_draws() {
     let off_description = |toml: &str| {

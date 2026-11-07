@@ -401,7 +401,7 @@ impl shared_provider::Provider for Observed {
         match self.case {
             4 => return Ok(proof.map(|proof| Box::new(DifferentEmail(proof)) as _)),
             24 => return Ok(proof.map(|proof| Box::new(ZeroPrincipal(proof)) as _)),
-            5 => fs::write(
+            5 => crate::test_config::write(
                 context.env.config.as_ref().unwrap(),
                 "[harness]\nlogins = 'off'\n",
             )

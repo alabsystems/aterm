@@ -594,6 +594,8 @@ struct RestoredAttempt {
     landed: bool,
     faults: u32,
     in_flight_only: bool,
+    /// This relaunch's use of its account ([`ColdUse`]).
+    cold_use: Arc<ColdUse>,
 }
 
 impl RestoredAttempt {
@@ -2905,6 +2907,8 @@ type WorkOverlapFn =
 type TranscriptFn = dyn Fn(&Snapshot) -> Option<(PathBuf, String)> + Send + Sync;
 /// A tasked session's record told its agent is gone for good ([`Acts::task_exited`]): its sid.
 type TaskExitedFn = dyn Fn(&str) + Send + Sync;
+/// Whether the window that hosts the sessions is ending ([`Acts::window_ending`]).
+type WindowEndingFn = dyn Fn() -> bool + Send + Sync;
 /// Every session with a task record, as the startup deadline reads it ([`Acts::startups`]).
 type StartupsFn = dyn Fn(&std::collections::HashSet<String>) -> Vec<Startup> + Send + Sync;
 /// The startup deadline's mark on session `sid` ([`Acts::startup_mark`]).
@@ -2969,7 +2973,76 @@ pub(crate) enum ColdEnd {
 }
 /// A checked cold Codex relaunch: `Ok(None)` keeps the saved login, while an error retains
 /// the pending conversation without executing it ([`Acts::codex_cold`]).
-type CodexColdFn = dyn Fn(&Snapshot) -> Result<Option<Snapshot>, String> + Send + Sync;
+type CodexColdFn = dyn Fn(&Snapshot, &ColdUse) -> Result<Option<Snapshot>, String> + Send + Sync;
+/// One cold Codex relaunch's use of its account ([`Acts::codex_cold`]). A timer retries the relaunch
+/// for as long as its row cannot serve, so only the first attempt that reaches a read may read a
+/// provider: the relaunch is the use of the account (`DESIGN-alab-one-mesh-2026-11-05.md` §4.15), and
+/// a later attempt judges the row by what is on record. An attempt refused before it read spends
+/// nothing.
+#[derive(Debug, Default)]
+pub(crate) struct ColdUse {
+    read: AtomicBool,
+}
+
+impl ColdUse {
+    /// Whether an attempt of this relaunch has read a provider.
+    pub(crate) fn has_read(&self) -> bool {
+        self.read.load(Ordering::SeqCst)
+    }
+
+    /// An attempt of this relaunch is reading a provider.
+    pub(crate) fn note_read(&self) {
+        self.read.store(true, Ordering::SeqCst);
+    }
+}
+
+/// `inner`, noting on `used` that an attempt reached a read ([`codex_cold_attempt`]).
+struct NotedRead<'a> {
+    inner: aterm_agent::harness::accounts_pool::ReadUsage<'a>,
+    used: &'a ColdUse,
+}
+
+impl aterm_agent::harness::accounts_pool::UsageReader for NotedRead<'_> {
+    fn read_observed_on(
+        &self,
+        seat: &aterm_agent::harness::accounts_pool::Seat<'_>,
+        cli: accounts::Cli,
+        home: &Path,
+        expected_email: Option<&str>,
+        now: i64,
+        use_token: aterm_agent::harness::provider_read::Use,
+    ) -> aterm_agent::harness::accounts_pool::UsageObservation {
+        self.used.note_read();
+        self.inner
+            .read_observed_on(seat, cli, home, expected_email, now, use_token)
+    }
+
+    fn read(
+        &self,
+        cli: accounts::Cli,
+        home: &Path,
+        expected_email: Option<&str>,
+        now: i64,
+        use_token: aterm_agent::harness::provider_read::Use,
+    ) -> aterm_agent::harness::codex_app_login::Reading {
+        self.used.note_read();
+        self.inner.read(cli, home, expected_email, now, use_token)
+    }
+
+    fn read_observed(
+        &self,
+        cli: accounts::Cli,
+        home: &Path,
+        expected_email: Option<&str>,
+        now: i64,
+        use_token: aterm_agent::harness::provider_read::Use,
+    ) -> aterm_agent::harness::accounts_pool::UsageObservation {
+        self.used.note_read();
+        self.inner
+            .read_observed(cli, home, expected_email, now, use_token)
+    }
+}
+
 /// Whether `snap` is a foreground agent that resumes a conversation ([`Acts::agent_resumed`]).
 type AgentResumedFn = dyn Fn(&str, &Snapshot) -> bool + Send + Sync;
 type BackoffFn = dyn Fn(usize) -> Duration + Send + Sync;
@@ -3557,8 +3630,9 @@ pub(crate) struct Acts {
     /// Capture live native evidence only after the snapshot is published and its locks released.
     pub(crate) observe_snapshot: Arc<ObserveSnapshotFn>,
     /// How long a worker waits for its relaunch snapshot read ([`reread`]) and its note behind
-    /// ([`note_within`]): [`POINT_READ_BOUND`] live; `Acts::inert`'s a hang detector's minute, so a
-    /// test's read lands before its worker goes on unless the test shortens the wait.
+    /// ([`note_within`]), and the restored queue for its landing's look ([`restored_landing_look`]):
+    /// [`POINT_READ_BOUND`] live; `Acts::inert`'s a hang detector's minute, so a test's read lands
+    /// before its worker goes on unless the test shortens the wait.
     pub(crate) point_read: Duration,
     pub(crate) follow: Arc<FollowFn>,
     pub(crate) status: Arc<StatusFn>,
@@ -3643,6 +3717,10 @@ pub(crate) struct Acts {
     pub(crate) transcript: Arc<TranscriptFn>,
     /// The task is over with its agent: a tasked session whose agent left and that nothing brings back.
     pub(crate) task_exited: Arc<TaskExitedFn>,
+    /// Whether this window is ending on a terminating signal or the system's quit
+    /// ([`window_ends`]): an agent that ends on a signal then ends with its host, whose restore
+    /// brings it back, and is never forgotten as its own end ([`self_claimed_exit`]).
+    pub(crate) window_ending: Arc<WindowEndingFn>,
     /// The deadlines' look ([`look_at_startups`]): every session of this instance with a task record.
     pub(crate) startups: Arc<StartupsFn>,
     /// The deadlines' mark ([`StartupMark`]).
@@ -9804,8 +9882,9 @@ fn land_snapshot(
 }
 
 /// How long a worker waits for a read it runs off its thread (the relaunch snapshot, the upgrade's,
-/// the note behind) before it goes on without it: on a loaded machine an idle step that made the
-/// snapshot read took up to 57 s (`docs/measured/idle-look-under-load-2026-10-23.md`).
+/// the note behind, a restored landing's look) before it goes on without it: on a loaded machine
+/// an idle step that made the snapshot read took up to 57 s
+/// (`docs/measured/idle-look-under-load-2026-10-23.md`).
 const POINT_READ_BOUND: Duration = Duration::from_millis(500);
 
 /// What [`Acts::inert`]'s worker waits for such a read: a hang detector's minute.
@@ -11230,6 +11309,25 @@ fn self_claimed_exit(
 ) -> Option<self_claimed::Copy> {
     let sid = job.sid.as_str();
     let grace = job.opts.policy.human_grace_s;
+    if asked.is_none()
+        && copy.resume.is_ok()
+        && self_claimed::ended_on_a_signal(copy)
+        && (hooks.acts.window_ending)()
+    {
+        // The signal that ended it ended this window too (a restart or shut down that sends
+        // every process SIGTERM, or the system's quit): its end is its host's, not its own. Its
+        // snapshot, with the line its copy validated, its copy (so a publication as the window
+        // goes keeps that line) and its task stay for the restore, which relaunches it; nothing
+        // is typed here as the window goes. A copy with no valid line has nothing to come back
+        // on, and its end is decided as any other.
+        settled(job);
+        aterm_log::info!(
+            "harness @{sid}: the self-supervised codex-alab {} ended on a signal as this window \
+             ends: its snapshot and task are kept for the restore",
+            copy.pid
+        );
+        return None;
+    }
     crate::self_claim::take_copy(sid, copy.pid, &copy.start);
     let decide = || {
         let status = (hooks.acts.status)(sid);
@@ -11364,6 +11462,7 @@ fn self_claimed_exit(
     // `lab codex-alab-proof` counts as the crash rule's relaunch, and what a reader of the log
     // has to tell this relaunch from codex-alab's own.
     let mut said = false;
+    let cold_use = ColdUse::default();
     let gone = relaunch_until_with(
         job,
         hooks,
@@ -11373,7 +11472,7 @@ fn self_claimed_exit(
         GoneUnread::HandedBack,
         || {
             // Retry admission after each wait, before publishing or typing a new line.
-            let moved = match (hooks.acts.codex_cold)(&owed) {
+            let moved = match (hooks.acts.codex_cold)(&owed, &cold_use) {
                 Ok(moved) => moved,
                 Err(why) => {
                     aterm_log::info!("harness @{sid}: cold account admission waits: {why}");
@@ -12735,6 +12834,9 @@ struct Shared {
     login_latches: Arc<LoginLatches>,
     restored: Mutex<RestoredQueue>,
     restored_wake: Condvar,
+    /// A restored landing's look still out ([`restored_landing_look`]): no other starts until it
+    /// ends, so a read that hangs keeps one thread, not one a look.
+    landing_look_out: Arc<AtomicBool>,
     inbox_lane: u64,
     #[cfg(test)]
     restart_panics: AtomicBool,
@@ -12920,6 +13022,7 @@ impl HostHandle {
                 login_latches: Arc::default(),
                 restored: Mutex::default(),
                 restored_wake: Condvar::new(),
+                landing_look_out: Arc::default(),
                 inbox_lane: crate::message_inbox::current_lane(),
                 #[cfg(test)]
                 restart_panics: AtomicBool::new(false),
@@ -13884,6 +13987,7 @@ fn queue_restored_guarded(
                         landed: false,
                         faults: 0,
                         in_flight_only: false,
+                        cold_use: Arc::default(),
                     }),
             );
         !std::mem::replace(&mut queue.running, true)
@@ -14021,6 +14125,7 @@ fn relaunch_restored_queue(shared: &Arc<Shared>, hooks: &Hooks) {
             seen: attempt.agent_seen,
             carried: attempt.carried,
             landed: attempt.landed,
+            cold_use: Arc::clone(&attempt.cold_use),
         };
         drop(queue);
         let relaunched = AtomicBool::new(taken.landed);
@@ -14049,6 +14154,7 @@ struct RestoredTaken {
     seen: bool,
     carried: bool,
     landed: bool,
+    cold_use: Arc<ColdUse>,
 }
 
 /// One step of one restored attempt ([`relaunch_restored_queue`]).
@@ -14068,6 +14174,7 @@ fn restored_step(shared: &Shared, hooks: &Hooks, taken: &RestoredTaken, relaunch
         seen,
         carried,
         landed,
+        ref cold_use,
     } = *taken;
     let restored = || {
         shared
@@ -14163,7 +14270,7 @@ fn restored_step(shared: &Shared, hooks: &Hooks, taken: &RestoredTaken, relaunch
             .codex()
             .is_some_and(|run| run.self_claimed.is_some())
     {
-        (hooks.acts.codex_cold)(&agent.snap).map(relaunch::ColdAdmission::immediate)
+        (hooks.acts.codex_cold)(&agent.snap, cold_use).map(relaunch::ColdAdmission::immediate)
     } else {
         Ok(relaunch::ColdAdmission::Immediate(None))
     };
@@ -14196,6 +14303,13 @@ fn restored_step(shared: &Shared, hooks: &Hooks, taken: &RestoredTaken, relaunch
                 }
                 relaunch::ColdAdmission::Deferred(intent) => (&agent.snap, Some(intent)),
             };
+            // The line a cold restore relaunches a self-claimed codex-alab on is typed as the
+            // crash rule's is ([`crate::self_claim::typed`]): the claim the relaunched process
+            // makes inherits it while its own record names no line yet, so the snapshot keeps
+            // it for a restart that ends that process again before then.
+            if let Some(resume) = snap.codex().and_then(|run| run.self_claimed.as_ref()) {
+                crate::self_claim::typed(&agent.sid, resume);
+            }
             let deferred_admit = |_: &Snapshot| match deferred {
                 Some(intent) => Ok(relaunch::ColdAdmission::Deferred(intent.clone())),
                 None => Ok(relaunch::ColdAdmission::Immediate(None)),
@@ -14562,14 +14676,18 @@ enum LandingLook {
 
 const LANDED_GONE: &str = "exited-before-read";
 
-/// The agent a restored step landed in tab `sid`.
+/// The agent a restored step landed in tab `sid`, looked at off the restored queue's thread
+/// ([`landing_look_of`]) and waited for [`Acts::point_read`] at most, so a slow read holds no other
+/// tab's step behind it. A look not back by then, or asked while an earlier one is still out, is
+/// [`LandingLook::Unread`]: its attempt is kept and looked at again after [`LANDED_LOOK`], and the
+/// look still out lands what it reads as it ends, through [`SnapshotRead::refresh`]'s guard.
 fn restored_landing_look(
     shared: &Shared,
     hooks: &Hooks,
     sid: &str,
     seen: bool,
     snap: &Snapshot,
-    revoked: &AtomicBool,
+    revoked: &Arc<AtomicBool>,
 ) -> LandingLook {
     if seen || revoked.load(Ordering::SeqCst) {
         return LandingLook::Read;
@@ -14585,8 +14703,65 @@ fn restored_landing_look(
     if host_carries_relaunch(snap.agent().program()) {
         with_kept_of(&kept, |k| k.carry_asked = true);
     }
-    if refresh_snapshot_guarded(sid, &kept, hooks, Some(revoked)) {
-        if let Some(pid) = landing_watched(sid, &kept, hooks, Some(revoked)) {
+    if shared.landing_look_out.swap(true, Ordering::SeqCst) {
+        return LandingLook::Unread;
+    }
+    let (said, heard) = std::sync::mpsc::sync_channel(1);
+    let out = Arc::clone(&shared.landing_look_out);
+    let job = (
+        sid.to_string(),
+        Arc::clone(&kept),
+        hooks.clone(),
+        snap.clone(),
+        Arc::clone(revoked),
+    );
+    let spawned = crate::qos::spawn_lane_thread(
+        format!("{THREAD_PREFIX}restored-look"),
+        crate::qos::Role::Background,
+        move || {
+            let (sid, kept, hooks, snap, revoked) = job;
+            let looked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                landing_look_of(&sid, &kept, &hooks, &snap, &revoked)
+            }));
+            out.store(false, Ordering::SeqCst);
+            let _ = said.send(looked);
+        },
+    );
+    if let Err(e) = spawned {
+        shared.landing_look_out.store(false, Ordering::SeqCst);
+        aterm_log::warn!(
+            "harness @{sid}: no thread for the look at its relaunch's landing ({e}); it is looked \
+             at here"
+        );
+        return landing_look_of(sid, &kept, hooks, snap, revoked);
+    }
+    match heard.recv_timeout(hooks.acts.point_read) {
+        Ok(Ok(look)) => look,
+        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            aterm_log::info!(
+                "harness @{sid}: the look at the agent the relaunch after aterm ended landed is \
+                 still out after {} ms; the queue goes on, and the look lands as it ends",
+                hooks.acts.point_read.as_millis()
+            );
+            LandingLook::Unread
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => LandingLook::Unread,
+    }
+}
+
+/// One look at the agent a restored step landed in tab `sid` ([`restored_landing_look`]): its
+/// relaunch snapshot read and the exit watch on what that read found, else its conversation's
+/// record and the roster.
+fn landing_look_of(
+    sid: &str,
+    kept: &Arc<Mutex<Kept>>,
+    hooks: &Hooks,
+    snap: &Snapshot,
+    revoked: &AtomicBool,
+) -> LandingLook {
+    if refresh_snapshot_guarded(sid, kept, hooks, Some(revoked)) {
+        if let Some(pid) = landing_watched(sid, kept, hooks, Some(revoked)) {
             aterm_log::info!(
                 "harness @{sid}: the relaunch after aterm ended landed (pid {pid}); its agent's \
                  exit is watched until a pass names it"
@@ -15572,6 +15747,8 @@ impl InstallWork {
 pub(crate) struct Startup {
     pub(crate) sid: String,
     pub(crate) state: StartupState,
+    /// The task revision this look read; an install stall applies only to that record.
+    pub(crate) record_rev: u64,
     /// When the record entered its state (its `since_ms=`): where the deadline counts from.
     pub(crate) since: Instant,
     /// What its screen shows.
@@ -16035,13 +16212,27 @@ pub(crate) struct HeldRead {
     /// A proven self-claim carries the session ([`crate::self_claim`]): its program
     /// answers for its own holds with its own attention, as codex-alab does.
     pub(crate) carried: bool,
+    /// The why of the point only a person can answer that its loop told standing, one the held
+    /// deadline judges at any verdict ([`held_judges_exception`], `SessionTimeline::loop_exception`):
+    /// a fact for later that reaches no task record by itself.
+    pub(crate) exception: Option<String>,
 }
 
 impl HeldRead {
-    /// Whether the worker is at a screen the held deadline judges.
+    /// Whether the worker is at a screen the held deadline judges: one its verdict names
+    /// ([`held_judges`]), or any where its loop told a point the deadline judges
+    /// ([`Self::exception`]).
     #[must_use]
     pub(crate) fn may_be_held(&self) -> bool {
-        held_judges(&self.word) && !self.escalated && !self.carried
+        (held_judges(&self.word) || self.exception.is_some()) && !self.escalated && !self.carried
+    }
+
+    /// Whether a worker the held deadline stalled at verdict `was` is held still: at a screen
+    /// the deadline judges ([`Self::may_be_held`]), or at that same verdict, since only movement
+    /// ends a held stall and a loop's point lifted at its end (a handover, the harness switched
+    /// off) moves nothing.
+    fn stays_held(&self, was: &str) -> bool {
+        self.may_be_held() || (self.word == was && !self.escalated && !self.carried)
     }
 }
 
@@ -16124,7 +16315,44 @@ pub(crate) fn held_judges(word: &str) -> bool {
     !(word == "busy" || word == "idle" || word.starts_with("wall"))
 }
 
-/// The supervisor's attention for a worker held `held_for` at what `read` shows.
+/// WHETHER THE HELD DEADLINE JUDGES A WORKER AT ITS LOOP'S STANDING `exception`, whatever its
+/// verdict ([`HeldRead::exception`]): a fact for later (`Urgency::Later`; a Now one is escalated
+/// or raises the owner's ask) that the loop tells only once its own means at that point are
+/// spent, so what the worker waits on is a person, not the loop's next act: a request the API
+/// refused at each of `FUTILE_AFTER_TRIES` tries (`Refused`), a context compaction cannot shrink
+/// (`Context`), a model with no reset and no fallback the tab can make (`Bucket`), a limit that
+/// answers each try the same, stands an hour past its reset or passed over a conversation the
+/// loop cannot read (`Futile`), and the same reply or no work held after aterm's acts (a
+/// `Stalled` one with its `held` arm, Land's same-reply hold among them).
+///
+/// It judges none the loop recovers from or still works at: the standing go-ahead's refusal
+/// (`Exception::refuses_go_ahead`, after which the loop changes approach on its pacing ladder),
+/// a spend limit told at first sight while the loop still resumes it (`Spend`), a cleared
+/// `/goal` (`GoalCleared`), and the stall canary's stuck screens and background calls
+/// (`Stalled` with no `held` arm, `Dialog`), whose verdicts the deadline reads as it reads any.
+/// Cruise's same reply with no wall is no exception at all (its forward recovery types on), so
+/// it is never told here.
+#[must_use]
+pub(crate) fn held_judges_exception(
+    exception: &aterm_agent::supervise::policy::exception::Exception,
+) -> bool {
+    use aterm_agent::supervise::policy::outlook::ExceptionKind;
+    exception.when == aterm_agent::supervise::policy::exception::Urgency::Later
+        && match exception.kind {
+            ExceptionKind::Refused
+            | ExceptionKind::Context
+            | ExceptionKind::Bucket
+            | ExceptionKind::Futile => true,
+            ExceptionKind::Stalled => exception.held.is_some() && !exception.refuses(),
+            ExceptionKind::Login
+            | ExceptionKind::Spend
+            | ExceptionKind::GoalCleared
+            | ExceptionKind::Dialog => false,
+        }
+}
+
+/// The supervisor's attention for a worker held `held_for` at what `read` shows, the point its
+/// loop told first where one stands ([`HeldRead::exception`]).
 #[must_use]
 pub(crate) fn held_attention(read: &HeldRead, held_for: Duration) -> String {
     let secs = held_for.as_secs();
@@ -16145,8 +16373,19 @@ pub(crate) fn held_attention(read: &HeldRead, held_for: Duration) -> String {
     };
     let head = format!("{HELD_HEAD}nothing moved for {took} {at}");
     let tail = " (its task is marked stalled why=held)";
-    let room = crate::session_timeline::META_ATTENTION_KEYED_MAX
-        .saturating_sub(head.len() + tail.len() + ", its screen ending \"\"".len());
+    let room =
+        crate::session_timeline::META_ATTENTION_KEYED_MAX.saturating_sub(head.len() + tail.len());
+    let point = read
+        .exception
+        .as_deref()
+        .map(|why| {
+            crate::session_timeline::sanitize_presentation_line(
+                &format!(", it needs a person: {why}"),
+                room,
+            )
+        })
+        .unwrap_or_default();
+    let room = room.saturating_sub(point.len() + ", its screen ending \"\"".len());
     let ends = read
         .last_row
         .as_deref()
@@ -16154,7 +16393,7 @@ pub(crate) fn held_attention(read: &HeldRead, held_for: Duration) -> String {
         .filter(|row| !row.is_empty())
         .map(|row| format!(", its screen ending \"{row}\""))
         .unwrap_or_default();
-    format!("{head}{ends}{tail}")
+    format!("{head}{point}{ends}{tail}")
 }
 
 /// Whether the supervisor's attention standing on a worker (`standing`) is a deadline's own ([`STARTUP_HEAD`], [`HELD_HEAD`]).
@@ -16169,6 +16408,12 @@ pub(crate) enum StartupMark<'a> {
     /// `stalled why=startup`, with what holds the screen ([`StartupHold::attention_on`]) as the
     /// supervisor's attention.
     Stalled { hold: &'a StartupHold },
+    /// An install's quiet deadline, bound to the task and launcher episode read by the look.
+    InstallStalled {
+        hold: &'a StartupHold,
+        record_rev: u64,
+        install_mark: u64,
+    },
     /// `working` again, and the attention the startup stall set taken down.
     Started,
     /// `stalled why=held`, with what `read` shows after `held_for` with nothing moving
@@ -16182,25 +16427,29 @@ pub(crate) enum StartupMark<'a> {
     /// No mark: the record has moved on from a deadline's stall by another writer's mark.
     Over,
     /// No mark: a startup stall still standing names `hold` now, its attention the startup
-    /// stall's own still ([`restates`]).
+    /// stall's own still ([`restates`]), and no news: codex-alab's own write of the words it
+    /// quotes was (`task_record::AttentionEdit::Restate`).
     Restated { hold: &'a StartupHold },
 }
 
 /// The held deadline's clock for one worker ([`Startups::held`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct HeldClock {
     progress: Progress,
     since: Instant,
     hand: Option<Instant>,
+    /// The verdict's word at its last judged look ([`HeldRead::stays_held`]).
+    word: String,
 }
 
 impl HeldClock {
     /// A clock started at `now` on what `read` shows.
-    const fn at(read: &HeldRead, now: Instant) -> Self {
+    fn at(read: &HeldRead, now: Instant) -> Self {
         Self {
             progress: read.progress,
             since: now,
             hand: None,
+            word: read.word.clone(),
         }
     }
 }
@@ -16303,12 +16552,14 @@ fn look_at_startups(
                     soonest(at);
                 }
             }
-            (StartupState::Reopened, _) => {
+            (StartupState::Reopened, _) if !w.installing => {
                 if let Some(at) = judge_held(books, w, now, from.max(back), hooks) {
                     soonest(at);
                 }
             }
-            (StartupState::Working, _) if books.started.contains(&w.sid) => {
+            (StartupState::Working | StartupState::Reopened, _)
+                if books.started.contains(&w.sid) =>
+            {
                 if let Some(at) = judge_held(books, w, now, from.max(back), hooks) {
                     soonest(at);
                 }
@@ -16327,7 +16578,13 @@ fn look_at_startups(
                 books.off.insert(w.sid.clone(), now);
                 soonest(now + STARTUP_UNREAD_LOOK);
             }
-            (StartupState::Working, StartupSeen::Holds(hold)) => {
+            (StartupState::Working | StartupState::Reopened, StartupSeen::Holds(hold)) => {
+                if w.installing {
+                    if let Some(at) = judge_install_startup(books, w, hold, now, from, hooks) {
+                        soonest(at);
+                    }
+                    continue;
+                }
                 // The harness's own waits count no more here than at the held deadline.
                 // An agent's exit in hand for a relaunch (whose shell a successor that
                 // never saw the worker start reads as no agent), and the panel the loop's own
@@ -16337,12 +16594,7 @@ fn look_at_startups(
                 // screen the harness holds an act on for a hand, it falls no sooner than a
                 // whole one after that hold ends, a driver's counted from the last look
                 // that found it standing.
-                // A launcher installing the worker's program or checking its sign-in has typed
-                // nothing yet: the deadline falls a whole one after the last look that found it so,
-                // unless none of its own work moves for the quiet limit, which stalls the worker
-                // saying what holds its screen ([`install_held`]). This look is the check because
-                // the launcher can be stuck in the spawn itself, and nothing here ends its child. A
-                // launcher holding its launch for a pool has typed nothing either, but what it waits
+                // A launcher holding its launch for a pool has typed nothing yet, but what it waits
                 // for may be days off: that stalls at this same deadline, naming the hold, and a
                 // hold that ends first leaves the line typed then a whole deadline to start in.
                 let panel = books
@@ -16352,30 +16604,6 @@ fn look_at_startups(
                 if books.waits.relaunching.contains(&w.sid) || panel.is_some() {
                     books.off.insert(w.sid.clone(), now);
                     soonest(panel.map_or(now + HELD_RELOOK, |until| until.min(now + HELD_RELOOK)));
-                    continue;
-                }
-                if w.installing {
-                    let clock =
-                        books
-                            .installs
-                            .entry(w.sid.clone())
-                            .or_insert_with(|| InstallClock {
-                                mark: w.install_mark,
-                                work: w.install_work.clone(),
-                                since: now,
-                            });
-                    if clock.mark != w.install_mark || clock.work != w.install_work {
-                        clock.mark = w.install_mark;
-                        clock.work.clone_from(&w.install_work);
-                        clock.since = now;
-                    }
-                    let limit = clock.since.max(from).max(w.since) + INSTALL_QUIET_LIMIT;
-                    if now < limit {
-                        books.off.insert(w.sid.clone(), now);
-                        soonest(limit.min(now + HELD_RELOOK));
-                    } else {
-                        (hooks.acts.startup_mark)(&w.sid, &StartupMark::Stalled { hold });
-                    }
                     continue;
                 }
                 let driven = w.held.as_ref().is_some_and(|read| read.driver);
@@ -16411,6 +16639,55 @@ fn look_at_startups(
     next
 }
 
+/// The install deadline shared by initial and reopened task records. Actual work and each
+/// launcher episode get their own quiet clock; a heartbeat alone does not move it.
+/// It also judges a launcher stuck inside spawn. This marks the task, never ends its child.
+fn judge_install_startup(
+    books: &mut Startups,
+    w: &Startup,
+    hold: &StartupHold,
+    now: Instant,
+    from: Instant,
+    hooks: &Hooks,
+) -> Option<Instant> {
+    let panel = books
+        .waits
+        .own_panel_until(&w.sid, STARTUP_DEADLINE)
+        .filter(|until| now < *until);
+    if books.waits.relaunching.contains(&w.sid) || panel.is_some() {
+        books.off.insert(w.sid.clone(), now);
+        return Some(panel.map_or(now + HELD_RELOOK, |until| until.min(now + HELD_RELOOK)));
+    }
+    let clock = books
+        .installs
+        .entry(w.sid.clone())
+        .or_insert_with(|| InstallClock {
+            mark: w.install_mark,
+            work: w.install_work.clone(),
+            since: now,
+        });
+    if clock.mark != w.install_mark || clock.work != w.install_work {
+        clock.mark = w.install_mark;
+        clock.work.clone_from(&w.install_work);
+        clock.since = now;
+    }
+    let limit = clock.since.max(from).max(w.since) + INSTALL_QUIET_LIMIT;
+    if now < limit {
+        books.off.insert(w.sid.clone(), now);
+        Some(limit.min(now + HELD_RELOOK))
+    } else {
+        (hooks.acts.startup_mark)(
+            &w.sid,
+            &StartupMark::InstallStalled {
+                hold,
+                record_rev: w.record_rev,
+                install_mark: w.install_mark,
+            },
+        );
+        Some(now + HELD_RELOOK)
+    }
+}
+
 /// The held deadline's judgement of a started worker `w` ([`look_at_startups`]).
 fn judge_held(
     books: &mut Startups,
@@ -16440,6 +16717,7 @@ fn judge_held(
         clock.progress = read.progress;
         clock.since = now;
     }
+    clock.word.clone_from(&read.word);
     if read.driver {
         clock.hand = Some(now);
     }
@@ -16476,7 +16754,7 @@ fn look_at_held_stall(
         .waits
         .own_panel_until(&w.sid, books.held_after)
         .is_some_and(|until| now < until);
-    if read.may_be_held()
+    if read.stays_held(&clock.word)
         && !books.waits.relaunching.contains(&w.sid)
         && !own_panel
         && clock.progress == read.progress
@@ -19209,6 +19487,9 @@ fn live_acts(
         }),
         transcript: Arc::new(upgrade_drive::snapshot_transcript),
         task_exited: Arc::new(move |sid| task_exited_live(&task_sock, sid)),
+        window_ending: Arc::new(|| {
+            WINDOW_ENDING.load(Ordering::SeqCst) || crate::owned_endpoint::quit_signalled()
+        }),
         startups: Arc::new(move |judged| startups_of(&startups_store, judged)),
         startup_mark: Arc::new(move |sid, mark| {
             startup_mark_live(&startup_store, sid, mark);
@@ -19262,7 +19543,7 @@ fn live_acts(
                 || atpkg::caller_shell::process_args(snap.shell).map(|args| args.env),
             )
         }),
-        codex_cold: Arc::new(move |snap| {
+        codex_cold: Arc::new(move |snap, used| {
             if snap.codex().is_none() {
                 return Ok(None);
             }
@@ -19285,7 +19566,7 @@ fn live_acts(
                 home,
                 now,
             };
-            codex_cold_live(&seat, snap)
+            codex_cold_live(&seat, snap, used)
         }),
         hold: Arc::new(move |sid, until| {
             o12(sid, 0).is_none_or(|o| upgrade_drive::hold_clock(&o, until))
@@ -19819,6 +20100,7 @@ fn startups_on(
                     person: None,
                     driver: false,
                     carried,
+                    exception: tl.loop_exception().map(str::to_string),
                 };
                 (
                     record,
@@ -19878,14 +20160,19 @@ fn startups_on(
                     })
                 };
             let for_start = state == StartupState::StalledAtStartup
-                || (state == StartupState::Working && !judged.contains(&sid));
+                || (state == StartupState::Working && !judged.contains(&sid))
+                || (state == StartupState::Reopened && installing);
             let for_held = !program_worker
                 && matches!(state, StartupState::Working | StartupState::Reopened)
                 && held.may_be_held();
             // Read here, past the timeline's lock: only the limit on an awaited worker's install
             // reads this file ([`look_at_startups`]).
             let install_work = install_child
-                .filter(|_| for_start && !carried && state == StartupState::Working)
+                .filter(|_| {
+                    for_start
+                        && !carried
+                        && matches!(state, StartupState::Working | StartupState::Reopened)
+                })
                 .and_then(|child| InstallWork::read(&atpkg_store()?, child));
             // A proven self-claim is a start: its program read the tab and carries it.
             let read = ((for_start && !carried) || for_held)
@@ -19960,6 +20247,7 @@ fn startups_on(
             Some(Startup {
                 sid,
                 state,
+                record_rev: record.rev,
                 since: record.since,
                 seen,
                 held,
@@ -20034,7 +20322,7 @@ fn startup_mark_named(
     member: impl FnOnce() -> Option<String>,
 ) -> Option<(u64, crate::task_record::MarkedWith)> {
     use crate::task_record::{
-        AttentionEdit, TaskMark, TaskRecord, TaskState, mark_session_task_with,
+        AttentionEdit, TaskMark, TaskRecord, TaskState, mark_session_task_with_timeline,
     };
     let h = store
         .read()
@@ -20042,9 +20330,9 @@ fn startup_mark_named(
         .by_sid(&aterm_session::SessionId::new(sid))
         .cloned()?;
     let said = match mark {
-        StartupMark::Stalled { hold } | StartupMark::Restated { hold } => {
-            hold.attention_on(member().as_deref())
-        }
+        StartupMark::Stalled { hold }
+        | StartupMark::InstallStalled { hold, .. }
+        | StartupMark::Restated { hold } => hold.attention_on(member().as_deref()),
         StartupMark::Held { read, held_for } => held_attention(read, *held_for),
         StartupMark::Started => "started after all".to_string(),
         StartupMark::Moved => "it moved".to_string(),
@@ -20061,6 +20349,11 @@ fn startup_mark_named(
             Some(stalled("startup")),
             AttentionEdit::Raise(&said),
             |r, _| r.state == TaskState::Working && r.why.is_none(),
+        ),
+        StartupMark::InstallStalled { .. } => (
+            Some(stalled("startup")),
+            AttentionEdit::Raise(&said),
+            |r, _| r.state == TaskState::Working && matches!(r.why, None | Some("turn" | "moved")),
         ),
         StartupMark::Held { .. } => (
             Some(stalled("held")),
@@ -20088,20 +20381,36 @@ fn startup_mark_named(
                 && r.why
                     .is_some_and(|why| matches!(why, "startup" | "held") || refused_stall(why)))
         }),
-        StartupMark::Restated { .. } => (None, AttentionEdit::Raise(&said), |r, standing| {
+        StartupMark::Restated { .. } => (None, AttentionEdit::Restate(&said), |r, standing| {
             r.state == TaskState::Stalled
                 && r.why == Some("startup")
                 && standing.is_some_and(|s| s.starts_with(STARTUP_HEAD))
         }),
     };
     let fence = h.ctx.fabric.fence_wait();
-    let marked = match mark_session_task_with(
+    let marked = match mark_session_task_with_timeline(
         &h.ctx,
         h.local_id,
         next.as_ref(),
         edit,
         fence,
-        |r, standing| r.is_some_and(|r| when(r, standing)),
+        |timeline, standing| {
+            timeline.task().is_some_and(|r| {
+                when(r, standing)
+                    && match mark {
+                        StartupMark::InstallStalled {
+                            record_rev,
+                            install_mark,
+                            ..
+                        } => {
+                            r.rev == *record_rev
+                                && timeline.worker_installing()
+                                && timeline.worker_install_mark() == *install_mark
+                        }
+                        _ => true,
+                    }
+            })
+        },
     ) {
         Ok(marked) => marked,
         Err(_) => {
@@ -20114,7 +20423,10 @@ fn startup_mark_named(
     // §3.6 keeps at tier C, in RAM; the log keeps its length. The other marks' words are this
     // function's own.
     let said_words = match mark {
-        StartupMark::Stalled { .. } | StartupMark::Held { .. } | StartupMark::Restated { .. } => {
+        StartupMark::Stalled { .. }
+        | StartupMark::InstallStalled { .. }
+        | StartupMark::Held { .. }
+        | StartupMark::Restated { .. } => {
             format!(" attention={}B", said.len())
         }
         StartupMark::Started | StartupMark::Moved | StartupMark::Over => format!(": {said}"),
@@ -20133,7 +20445,9 @@ fn startup_mark_named(
                 .map_or((0, "-", None), |r| (r.rev, r.state.as_str(), r.why));
             let why = why.map_or_else(String::new, |w| format!(" why={w}"));
             let launch = match mark {
-                StartupMark::Stalled { .. } => launch_words(&h.ctx),
+                StartupMark::Stalled { .. } | StartupMark::InstallStalled { .. } => {
+                    launch_words(&h.ctx)
+                }
                 _ => String::new(),
             };
             aterm_log::info!(
@@ -21828,8 +22142,28 @@ fn note_cold_conversation(
 fn codex_cold_live(
     seat: &aterm_agent::harness::accounts_pool::Seat<'_>,
     snap: &Snapshot,
+    used: &ColdUse,
 ) -> Result<Option<Snapshot>, String> {
-    codex_cold_at(seat, snap, &aterm_agent::harness::accounts_pool::LiveUsage)
+    codex_cold_attempt(
+        seat,
+        snap,
+        used,
+        &aterm_agent::harness::accounts_pool::LiveUsage,
+    )
+}
+
+/// [`codex_cold_at`] for one attempt of a relaunch: `read` reads until an attempt has read, and after
+/// that no attempt contacts a provider ([`ColdUse`]).
+fn codex_cold_attempt(
+    seat: &aterm_agent::harness::accounts_pool::Seat<'_>,
+    snap: &Snapshot,
+    used: &ColdUse,
+    read: aterm_agent::harness::accounts_pool::ReadUsage<'_>,
+) -> Result<Option<Snapshot>, String> {
+    if used.has_read() {
+        return codex_cold_at(seat, snap, &aterm_agent::harness::accounts_pool::NoUsage);
+    }
+    codex_cold_at(seat, snap, &NotedRead { inner: read, used })
 }
 
 /// [`codex_cold_live`] over `read`.
@@ -23460,7 +23794,7 @@ fn disk_watch(
         let seen: Vec<(String, aterm_phase::disk_full::DiskFull)> = sids
             .iter()
             .filter_map(|sid| {
-                let rows = screen_rows(&store, sid)?;
+                let rows = screen_rows_now(&store, sid)?;
                 Some((sid.clone(), aterm_phase::disk_full::disk_full(&rows)?))
             })
             .collect();
@@ -23491,7 +23825,7 @@ static DISK_CWD_UNKNOWN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 static DISK_POKED: AtomicBool = AtomicBool::new(false);
 
 /// The visible rows of tab `sid`'s screen, read in memory (the store's lock, then the terminal's, never waited on).
-pub(crate) fn screen_rows(store: &Store, sid: &str) -> Option<Vec<String>> {
+fn screen_rows_now(store: &Store, sid: &str) -> Option<Vec<String>> {
     let handle = {
         let g = store.read().unwrap_or_else(PoisonError::into_inner);
         g.by_sid(&aterm_session::SessionId::new(sid))?.clone()
@@ -23501,6 +23835,31 @@ pub(crate) fn screen_rows(store: &Store, sid: &str) -> Option<Vec<String>> {
     Some(
         (0..rows)
             .map(|i| t.row_text(i).unwrap_or_default())
+            .collect(),
+    )
+}
+
+/// The rows of tab `sid`'s live screen, for a read made once whose answer a miss would change (a
+/// worker's starter's pill, [`crate::task_launch`]), on a thread of its own holding no lock: it
+/// waits its turn at the terminal's lock and for a DEC 2026 frame in flight, to that frame's bound,
+/// and reads the screen wherever a person has scrolled the viewport. `None`: no such tab.
+pub(crate) fn live_screen_rows(store: &Store, sid: &str) -> Option<Vec<String>> {
+    let handle = {
+        let g = store.read().unwrap_or_else(PoisonError::into_inner);
+        g.by_sid(&aterm_session::SessionId::new(sid))?.clone()
+    };
+    let t = crate::term_lock_whole_when(
+        &handle.term,
+        crate::park::Lane::SERVED.ignoring_hangup(),
+        |_| true,
+    );
+    Some(
+        (0..t.rows())
+            .map(|row| {
+                let mut text = String::new();
+                t.grid().row_text_screen_into(row, &mut text);
+                text
+            })
             .collect(),
     )
 }
@@ -25996,6 +26355,9 @@ pub(crate) fn claims_quiet_before_sleep() {
 /// then (a quit sheet nobody answers), and its sessions would run on with no claims.
 #[cfg(target_os = "macos")]
 pub(crate) fn claims_off_as_the_system_quits() {
+    if crate::system_quit::by_the_system() {
+        window_ends();
+    }
     if crate::system_quit::by_the_system() && CLAIMS_LIVE.load(Ordering::SeqCst) {
         claims_down(
             aterm_agent::harness::claims::Act::Off,
@@ -26019,13 +26381,31 @@ pub(crate) fn claims_off_as_the_window_dies() {
     }
 }
 
-/// Arm the window's terminating signals (`crate::owned_endpoint::arm_orderly_quit`): `off` first
-/// (production passes [`claims_off_as_the_window_dies`]), then the process dies of the signal as
-/// it did before, with no clean exit marked (`crate::owned_endpoint::die_of_signal`); a second
-/// signal ends it at once. A headless instance arms its own orderly quit instead.
+/// Set once this window is ending ([`window_ends`]); read by [`Acts::window_ending`], whose live
+/// arm also reads the signal handler's own claim (`crate::owned_endpoint::quit_signalled`): a
+/// signal's end is the host's from the moment it lands, not only once the quit's thread, which
+/// can wait for a core as a shut down loads the Mac, calls [`window_ends`].
+static WINDOW_ENDING: AtomicBool = AtomicBool::new(false);
+
+/// This window is ending: a terminating signal arrived ([`arm_claims_off_as_the_window_dies`]),
+/// or the system's quit went ahead ([`claims_off_as_the_system_quits`]). A restart or shut down
+/// ends the agents in its tabs with the same signal while the window still runs, for up to
+/// [`QUIET_WITHIN`] of claims work: from now on such an end is the host's, and the restore
+/// brings the agent back.
+#[cfg(unix)]
+pub(crate) fn window_ends() {
+    WINDOW_ENDING.store(true, Ordering::SeqCst);
+}
+
+/// Arm the window's terminating signals (`crate::owned_endpoint::arm_orderly_quit`): the window
+/// marked ending ([`window_ends`]), `off` (production passes [`claims_off_as_the_window_dies`]),
+/// then the process dies of the signal as it did before, with no clean exit marked
+/// (`crate::owned_endpoint::die_of_signal`); a second signal ends it at once. A headless
+/// instance arms its own orderly quit instead.
 #[cfg(unix)]
 pub(crate) fn arm_claims_off_as_the_window_dies(off: fn()) {
     if let Err(err) = crate::owned_endpoint::arm_orderly_quit(move |sig| {
+        window_ends();
         off();
         crate::owned_endpoint::die_of_signal(sig);
     }) {
@@ -26975,6 +27355,7 @@ impl Acts {
             work_overlap: Arc::new(|_| None),
             transcript: Arc::new(|_| None),
             task_exited: Arc::new(|_| {}),
+            window_ending: Arc::new(|| false),
             startups: Arc::new(|_| Vec::new()),
             startup_mark: Arc::new(|_, _| {}),
             standing_limit: Arc::new(|_, _| None),
@@ -26992,7 +27373,7 @@ impl Acts {
             background: Arc::new(|_| false),
             account_made: Arc::new(|_, _, _| {}),
             account_cold: Arc::new(|_, _, _| Ok(relaunch::ColdAdmission::Immediate(None))),
-            codex_cold: Arc::new(|_| Ok(None)),
+            codex_cold: Arc::new(|_, _| Ok(None)),
             hold: Arc::new(|_, _| true),
             route: Arc::new(|_, _, _| Route::Custom("inert".to_string())),
             claude_env: Arc::new(|_, _, _| {

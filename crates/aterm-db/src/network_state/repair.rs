@@ -12,8 +12,8 @@ pub(super) fn value(observation: &RepairObservation) -> Value {
         "outbound": observation.outbound,
         "stage": observation.stage.map(stage),
         "outcome": outcome(observation.outcome),
-        "cause": observation.cause.map(RepairCause::word),
-        "needs_update": observation.cause.map(|cause| matches!(cause, RepairCause::LegacyPastCrossing | RepairCause::NeedsUpdate)),
+        "cause": observation.cause().map(RepairCause::word),
+        "needs_update": observation.cause().map(|cause| matches!(cause, RepairCause::LegacyPastCrossing | RepairCause::NeedsUpdate)),
         "table": observation.table.map(|id| aterm_codec::hex::encode_lower(&id)),
         "sent": observation.sent,
         "received": observation.received,
@@ -38,13 +38,28 @@ pub(super) fn read(row: &Value) -> Result<Option<RepairObservation>> {
         None if value.get("stage").is_some_and(Value::is_null) => None,
         _ => return Err(bad()),
     };
-    let outcome = match value.get("outcome").and_then(Value::as_str) {
-        Some("failed") => RepairOutcome::Failed,
-        Some("cancelled") => RepairOutcome::Cancelled,
-        Some("deferred") => RepairOutcome::Deferred,
-        Some("not-observed") => RepairOutcome::NotObserved,
-        Some("no-common-table") => RepairOutcome::NoCommonTable,
-        Some("exchanged") => RepairOutcome::Exchanged,
+    // A word a newer aterm added reads as `other`: its writer's record stays readable here, and
+    // nothing beyond this closed vocabulary is kept.
+    let cause = match value.get("cause") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(word)) => {
+            Some(RepairCause::from_word(word).unwrap_or(RepairCause::Other))
+        }
+        Some(_) => return Err(bad()),
+    };
+    let outcome = match (value.get("outcome").and_then(Value::as_str), cause) {
+        (Some("failed"), Some(cause)) => RepairOutcome::Failed(cause),
+        // A failure an older aterm recorded without its cause (before causes were kept, or a
+        // control, membership or credential failure whose cause the round's report dropped)
+        // names no more specific category: `other`, its stage, table and counts kept, so what it
+        // received or deferred still holds an import back (`alab::command::empty_view_wait`).
+        (Some("failed"), None) => RepairOutcome::Failed(RepairCause::Other),
+        (Some("deferred"), cause) => RepairOutcome::Deferred(cause),
+        // An older aterm kept an application refusal's cause on an attempt the owner stopped.
+        (Some("cancelled"), _) => RepairOutcome::Cancelled,
+        (Some("not-observed"), None) => RepairOutcome::NotObserved,
+        (Some("no-common-table"), None) => RepairOutcome::NoCommonTable,
+        (Some("exchanged"), None) => RepairOutcome::Exchanged,
         _ => return Err(bad()),
     };
     let count = |key: &str| match value.get(key) {
@@ -59,18 +74,6 @@ pub(super) fn read(row: &Value) -> Result<Option<RepairObservation>> {
         return Err(bad());
     }
     Ok(Some(RepairObservation {
-        cause: match value.get("cause").and_then(Value::as_str) {
-            Some("legacy-past-crossing") => Some(RepairCause::LegacyPastCrossing),
-            Some("table-undeclared") => Some(RepairCause::TableUndeclared),
-            Some("quota") => Some(RepairCause::Quota),
-            Some("io") => Some(RepairCause::Io),
-            Some("decode") => Some(RepairCause::Decode),
-            Some("not-ready") => Some(RepairCause::NotReady),
-            Some("needs-update") => Some(RepairCause::NeedsUpdate),
-            Some("other") => Some(RepairCause::Other),
-            None if value.get("cause").is_none_or(Value::is_null) => None,
-            _ => return Err(bad()),
-        },
         completed_at_ms,
         outbound: value
             .get("outbound")
@@ -101,9 +104,9 @@ fn stage(stage: RepairStage) -> &'static str {
 
 fn outcome(outcome: RepairOutcome) -> &'static str {
     match outcome {
-        RepairOutcome::Failed => "failed",
+        RepairOutcome::Failed(_) => "failed",
         RepairOutcome::Cancelled => "cancelled",
-        RepairOutcome::Deferred => "deferred",
+        RepairOutcome::Deferred(_) => "deferred",
         RepairOutcome::NotObserved => "not-observed",
         RepairOutcome::NoCommonTable => "no-common-table",
         RepairOutcome::Exchanged => "exchanged",
@@ -161,23 +164,72 @@ mod tests {
             RepairCause::TableUndeclared,
             RepairCause::Quota,
             RepairCause::Io,
+            RepairCause::LanHeld,
+            RepairCause::Unreachable,
             RepairCause::Decode,
             RepairCause::NotReady,
             RepairCause::NeedsUpdate,
+            RepairCause::Other,
         ] {
-            let mut observation = failed(1000);
-            observation.cause = Some(cause);
-            let encoded = value(&observation);
-            assert_eq!(encoded["cause"].as_str(), Some(cause.word()));
-            assert_eq!(
-                read(&json!({"last_repair":encoded})).unwrap(),
-                Some(observation)
-            );
+            for outcome in [
+                RepairOutcome::Failed(cause),
+                RepairOutcome::Deferred(Some(cause)),
+            ] {
+                let mut observation = failed(1000);
+                observation.outcome = outcome;
+                let encoded = value(&observation);
+                assert_eq!(encoded["cause"].as_str(), Some(cause.word()));
+                assert_eq!(
+                    read(&json!({"last_repair":encoded})).unwrap(),
+                    Some(observation)
+                );
+            }
         }
-        assert!(
-            read(&json!({"last_repair": {"completed_at_ms":1000,"cause":"private payload"}}))
-                .is_err()
+        let mut deferred = failed(1000);
+        deferred.outcome = RepairOutcome::Deferred(None);
+        assert!(value(&deferred)["cause"].is_null());
+        assert_eq!(
+            read(&json!({"last_repair":value(&deferred)})).unwrap(),
+            Some(deferred)
         );
+        // A word this build does not know (a newer aterm's) reads as `other`, keeping none of it.
+        let private = with(value(&failed(1000)), "cause", json!("private payload"));
+        let read_back = read(&json!({"last_repair":private})).unwrap().unwrap();
+        assert_eq!(read_back.outcome, RepairOutcome::Failed(RepairCause::Other));
+        assert!(!format!("{read_back:?}").contains("private"));
+        assert!(
+            read(&json!({"last_repair":with(value(&failed(1000)), "cause", json!(7))})).is_err()
+        );
+        // An outcome that never names a cause refuses one.
+        let exchanged = with(value(&failed(1000)), "outcome", json!("exchanged"));
+        assert!(read(&json!({"last_repair":exchanged})).is_err());
+    }
+
+    /// A failure an older aterm recorded without its cause (m22's 43 `failed (cause
+    /// unavailable)` rows) reads as `other` with its stage, table and counts, so no failure
+    /// without a cause reaches a reader and what it received still counts; a stopped attempt
+    /// keeps reading with an older writer's cause dropped.
+    #[test]
+    fn a_failure_recorded_without_its_cause_reads_as_other_with_its_counts() {
+        let mut legacy = with(value(&failed(1000)), "cause", Value::Null);
+        let expected = RepairObservation {
+            outcome: RepairOutcome::Failed(RepairCause::Other),
+            ..failed(1000)
+        };
+        assert_eq!(
+            read(&json!({"last_repair":legacy.clone()})).unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(expected.received, Some(3));
+        legacy.as_object_mut().unwrap().remove("cause");
+        assert_eq!(
+            read(&json!({"last_repair":legacy})).unwrap(),
+            Some(expected)
+        );
+        let stopped = with(value(&failed(1000)), "outcome", json!("cancelled"));
+        let read_back = read(&json!({"last_repair":stopped})).unwrap().unwrap();
+        assert_eq!(read_back.outcome, RepairOutcome::Cancelled);
+        assert_eq!(read_back.cause(), None);
     }
 
     fn identity(n: u8) -> MachineIdentity {
@@ -188,13 +240,18 @@ mod tests {
         }
     }
 
+    /// `row` with `key` set to `field`.
+    fn with(mut row: Value, key: &str, field: Value) -> Value {
+        row.as_object_mut().unwrap().insert(key.into(), field);
+        row
+    }
+
     fn failed(at: u64) -> RepairObservation {
         RepairObservation {
-            cause: None,
             completed_at_ms: at,
             outbound: true,
             stage: Some(RepairStage::Application),
-            outcome: RepairOutcome::Failed,
+            outcome: RepairOutcome::Failed(RepairCause::Io),
             table: Some([7; 32]),
             sent: Some(2),
             received: Some(3),

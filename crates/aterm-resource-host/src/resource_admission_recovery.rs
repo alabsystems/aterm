@@ -46,6 +46,9 @@ impl Owner {
                 }
                 "settled" => self.journal.finish(&binding)?,
                 "member_prepared" | "member_bound" | "member_running" | "member_terminal" => {
+                    // A cpu_loan row is retained bookkeeping, never a way to
+                    // recreate live members, a runnable parent or resume authority.
+                    // Cold recovery closes only the authenticated aggregate below.
                     // Members borrow the original aggregate memory claim and
                     // ordinary kernel CPU rights. This row owns no fixed grant.
                     let memory = CohortClosureRef::from_json(&record["memory"])?;

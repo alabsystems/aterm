@@ -1,8 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Native ownership controls: the existing publication image runs in place, never copied.
-//! The controlled body starts only its own sleeping leaf, with no compiler or provider.
+//! Native ownership controls: on macOS the existing publication image runs in place, never
+//! copied; elsewhere it runs from a private copy in each fixture's home ([`image`]). The
+//! controlled body starts only its own sleeping leaf, with no compiler or provider.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -35,6 +36,40 @@ fn ended(token: &str) -> bool {
             process::process_presence(expected.pid),
             ProcessPresence::Absent | ProcessPresence::Exited
         )
+}
+
+/// The manager image a fixture in `home` pins: on macOS the publication image itself, run in
+/// place. macOS's default umask, 022, leaves the artifact 0755, which a manager runs (it runs no
+/// image the group or others can write), and every copy of a Mach-O costs a first exec's
+/// assessment.
+#[cfg(target_vendor = "apple")]
+fn image(_home: &Path) -> PathBuf {
+    aterm_tempfile::bin_exe("atpkg-publish")
+}
+
+/// The manager image a fixture in `home` pins: off Apple a copy of the publication image there,
+/// mode 0755. A build under umask 002 (Ubuntu's default) links the artifact 0775, which a manager
+/// refuses (it runs no image the group or others can write), and the copy leaves the shared cargo
+/// artifact, which another process may have pinned, as the build made it. A child writes the
+/// copy: Linux refuses to exec a file anything holds open for writing (`ETXTBSY`), and a fork
+/// another test makes while this process held it open would keep that writer until its own exec.
+/// A second launch in the same home pins the copy already there.
+#[cfg(not(target_vendor = "apple"))]
+fn image(home: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let image = home.join("atpkg-publish");
+    if !image.is_file() {
+        let mut cp = aterm_uds::spawnfd::command("cp");
+        cp.arg(aterm_tempfile::bin_exe("atpkg-publish")).arg(&image);
+        let copied = aterm_uds::deadline::output_within(&mut cp, HANG).expect("cp of the image");
+        assert!(
+            copied.status.success(),
+            "a copy of the publication image: {copied:?}"
+        );
+        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o755))
+            .expect("the image copy writable by its owner alone");
+    }
+    image
 }
 
 struct Running {
@@ -90,14 +125,9 @@ impl Running {
         fixture: Fixture,
         watch: bool,
     ) -> Self {
-        let prepared = harness_local::prepare_fixture(
-            &aterm_tempfile::bin_exe("atpkg-publish"),
-            &home,
-            &config,
-            watch,
-            fixture,
-        )
-        .expect("prepare fixture");
+        let prepared =
+            harness_local::prepare_fixture(&image(&home), &home, &config, watch, fixture)
+                .expect("prepare fixture");
         let mut command = aterm_uds::spawnfd::command(&prepared.program);
         command
             .args(&prepared.args)

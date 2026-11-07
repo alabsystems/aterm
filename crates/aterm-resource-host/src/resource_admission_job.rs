@@ -96,6 +96,7 @@ pub(super) fn inspection(
 }
 impl Owner {
     pub(super) fn tick_jobs(&mut self) {
+        self.tick_resolver_roots();
         let fence = &self.fence;
         let journal = &self.journal;
         let faulted = &mut self.faulted;
@@ -103,7 +104,7 @@ impl Owner {
             // This is sampled governance over actual owned groups, not a hard
             // kernel quota or evidence of closure. Unknown coverage is never
             // treated as zero. Original custody remains held during cleanup.
-            if job.launched
+            if (job.launched || job.resolver.is_some())
                 && !job.settled
                 && (!job.reaped || job.members.values().any(|member| member.group().is_some()))
                 && job.memory_at.elapsed() >= Duration::from_millis(100)
@@ -206,7 +207,10 @@ impl Owner {
                 // the zombie; retain original control until it is available.
                 if (!job.launched || job.ended.is_some()) && drained {
                     let _ = job.child.request_group(CohortSignal::Kill);
-                    if let Ok(Some(status)) = job.child.child_mut().try_wait() {
+                    if let Ok(Some((status, observation))) = crate::resource_accounting::try_reap(
+                        job.child.child_mut(),
+                        job.events.requires_accounting(),
+                    ) {
                         job.reaped = true;
                         let outcome = match (status.code(), status.signal()) {
                             (Some(code), _) => Some(Outcome::Exit(code)),
@@ -214,6 +218,15 @@ impl Owner {
                             _ => None,
                         };
                         if let Some(outcome) = outcome {
+                            if job
+                                .metadata_sdk
+                                .as_ref()
+                                .is_some_and(|sdk| sdk.validate().is_err())
+                            {
+                                // Preserve the real exit while refusing input
+                                // integrity. This check grants no drain fact.
+                                job.cause = CompletionCause::ResourceLimit;
+                            }
                             let runtime_ns = u64::try_from(
                                 job.ended
                                     .get_or_insert_with(Instant::now)
@@ -221,14 +234,21 @@ impl Owner {
                                     .as_nanos(),
                             )
                             .unwrap_or(u64::MAX);
-                            if job.launched {
-                                let _ = job.events.emit(Event::Finished {
-                                    outcome,
-                                    cause: job.cause,
-                                    runtime_ns,
-                                });
+                            let event = Event::Finished {
+                                outcome,
+                                cause: job.cause,
+                                runtime_ns,
+                            };
+                            if job.events.requires_accounting() && job.launched {
+                                // An owning wait is an outcome observation, not a
+                                // resource-settlement fact. Retain it until closure.
+                                job.completion = Some((event, observation));
+                            } else {
+                                if job.launched {
+                                    let _ = job.events.emit(event);
+                                }
+                                job.terminal_sent = true;
                             }
-                            job.terminal_sent = true;
                             if journal
                                 .update(&job.binding, "terminal", aterm_json::json!({}))
                                 .is_err()
@@ -254,6 +274,20 @@ impl Owner {
                 if closed.is_ok() && journal.settle(&job.binding).is_ok() {
                     job.settled = true;
                 }
+            }
+            if job.settled
+                && !job.terminal_sent
+                && let Some((event, observation)) = job.completion.take()
+            {
+                // All member owners and the original cohort have positively
+                // settled. Drop remaining original SDK/GNU/image owners before
+                // publishing the accounted root terminal.
+                job.resolver.take();
+                job.metadata_sdk.take();
+                job.metadata_gnu.take();
+                job.compiler.take();
+                let _ = job.events.emit_terminal(event, observation);
+                job.terminal_sent = true;
             }
             !(job.settled && job.terminal_sent && job.events.drained())
         });

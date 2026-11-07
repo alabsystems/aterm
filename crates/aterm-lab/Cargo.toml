@@ -152,6 +152,9 @@ aterm-capacity = { workspace = true }
 # macOS only, as `linux vz-host` (`mod linux_vz_host`) is: the guest agent's library is
 # Linux's and the macOS seam's, and builds on no Windows host.
 [target.'cfg(target_os = "macos")'.dependencies]
+# The private instance's away-deadline fixture writes genuine history with the production
+# codec; commons-lan tests also script the route the real LAN admission reader uses.
+aterm-netplace = { workspace = true }
 # Real prepared harness inputs for the development-only retained-owner window lab.
 atpkg-publish = { path = "../atpkg-publish" }
 # Physical service acceptance verifies the same signed images as the shipped updater.
@@ -173,12 +176,13 @@ aterm-lan = { workspace = true }
 # own summon (`kitty_cursor::CursorCat` on the typing momentum): the model the
 # scenario is paced for, not a copy of its constants.
 aterm-effects = { workspace = true }
+# `trail-gallery flood`'s page through the real step, publication and word yield: its
+# light count against `CursorGlow::MAX_QUADS`. Not a new edge in the build graph: aterm-effects
+# above already depends on it, with these features.
+aterm-render = { path = "../aterm-render", default-features = false }
 # The tests' one-minute hang detector and the unclocked first exec of a script
 # a test just wrote (`aterm_spec::wait`): the agy launch fixture.
 aterm-spec = { workspace = true }
-# `commons-lan home-lan`'s tests script this Mac's default route (`facts::script_here`), the
-# one the lab home's check reads. Not a new edge in the build graph: aterm-secrets depends on it.
-aterm-netplace = { workspace = true }
 
 [lints]
 workspace = true

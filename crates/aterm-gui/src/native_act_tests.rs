@@ -42,6 +42,9 @@ mod account_execution;
 #[path = "native_issuer_tests.rs"]
 mod issuer;
 #[cfg(unix)]
+#[path = "native_phase_receipt_tests.rs"]
+mod phase_receipts;
+#[cfg(unix)]
 #[path = "native_publication_tests.rs"]
 mod publication;
 #[cfg(unix)]
@@ -56,7 +59,7 @@ type PublicationGate = (mpsc::SyncSender<()>, Arc<(Mutex<bool>, std::sync::Condv
 enum JournalEvent {
     Prepare,
     MayExecute,
-    NoExec,
+    NoExec(ImagePhase),
     Seal,
 }
 
@@ -74,6 +77,8 @@ struct JournalEntry {
     state: JournalState,
     predecessor: Option<String>,
     successor: Option<String>,
+    closed_phase: Option<ImagePhase>,
+    account_phase: Option<ImagePhase>,
 }
 
 struct Facts {
@@ -116,6 +121,19 @@ struct Facts {
 }
 
 impl Facts {
+    fn receipt_finished(&self) {
+        if let Some((entered, proceed)) = &self.receipt_gate {
+            entered.send(()).unwrap();
+            let (lock, ready) = &**proceed;
+            let (guard, waited) = ready
+                .wait_timeout_while(lock.lock().unwrap(), PATIENCE, |go| !*go)
+                .unwrap();
+            assert!(
+                *guard && !waited.timed_out(),
+                "receipt worker was not released"
+            );
+        }
+    }
     /// The host double rejects the same illegal transitions as the real issuer
     /// journal. History vectors are observations, not permission to advance.
     fn journal_event(
@@ -132,16 +150,32 @@ impl Facts {
         let prior = previous.map(|old| old.state);
         let predecessor = previous.and_then(|old| old.predecessor.clone());
         let successor = previous.and_then(|old| old.successor.clone());
+        let closed_phase = match event {
+            JournalEvent::NoExec(phase) => Some(phase),
+            _ => previous.and_then(|old| old.closed_phase),
+        };
+        let account_phase = previous.and_then(|old| old.account_phase);
+        if account_phase == Some(ImagePhase::Rollback)
+            && matches!(event, JournalEvent::NoExec(ImagePhase::Forward))
+        {
+            return None;
+        }
+        if matches!(prior, Some(JournalState::NoExec))
+            && matches!(event, JournalEvent::NoExec(_))
+            && previous.and_then(|old| old.closed_phase) != closed_phase
+        {
+            return None;
+        }
         let state = match (prior, event) {
             (None, JournalEvent::Prepare) => JournalState::Prepared,
             (Some(JournalState::Prepared), JournalEvent::Prepare)
             | (Some(JournalState::MayExecute), JournalEvent::MayExecute)
-            | (Some(JournalState::NoExec), JournalEvent::NoExec)
+            | (Some(JournalState::NoExec), JournalEvent::NoExec(_))
             | (Some(JournalState::Sealed | JournalState::NoExec), JournalEvent::Seal) => {
                 return Some(false);
             }
             (Some(JournalState::Prepared), JournalEvent::MayExecute) => JournalState::MayExecute,
-            (Some(JournalState::Prepared), JournalEvent::NoExec) => JournalState::NoExec,
+            (Some(JournalState::Prepared), JournalEvent::NoExec(_)) => JournalState::NoExec,
             (Some(JournalState::Prepared | JournalState::MayExecute), JournalEvent::Seal) => {
                 JournalState::Sealed
             }
@@ -155,6 +189,8 @@ impl Facts {
                 state,
                 predecessor,
                 successor,
+                closed_phase,
+                account_phase,
             },
         );
         Some(true)
@@ -239,6 +275,201 @@ impl Facts {
 }
 
 impl Kernel for Facts {
+    fn record_account_closure(
+        &self,
+        prepare: &Prepare,
+        binding: &Binding,
+        phase: ImagePhase,
+    ) -> Option<account_observation::ClosureRecord> {
+        #[cfg(unix)]
+        {
+            if !self.record_noexec(prepare, binding, phase) {
+                return None;
+            }
+            let record = self
+                .native_journal
+                .as_ref()?
+                .observe_phase(prepare, binding)
+                .ok()??;
+            Some(account_observation::ClosureRecord {
+                phase: record.phase,
+                sequence: record.sequence,
+                recorded_ms: record.recorded_ms,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (prepare, binding, phase);
+            None
+        }
+    }
+    fn recover_account_observation(
+        &self,
+        relation: &aterm_agent::harness::native_account_wire::Relation,
+        binding: &Binding,
+    ) -> Option<account_observation::ClaimRecord> {
+        #[cfg(unix)]
+        {
+            if !self.receipt_readable.load(Ordering::SeqCst)
+                || !self.prepare_journal_ack.load(Ordering::SeqCst)
+            {
+                return None;
+            }
+            let record = self
+                .native_journal
+                .as_ref()?
+                .recover_account(
+                    aterm_agent::harness::native_receipts::AccountRelation {
+                        predecessor: relation.predecessor().prepare(),
+                        predecessor_binding: relation.predecessor().binding(),
+                        phase: relation.phase(),
+                        candidate: relation.candidate(),
+                    },
+                    binding,
+                )
+                .ok()??;
+            self.receipt_finished();
+            Some(account_observation::ClaimRecord {
+                state: account_continuation::recorded_state(record.outcome)?,
+                sequence: record.sequence,
+                recorded_ms: record.recorded_ms,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (relation, binding);
+            None
+        }
+    }
+    fn recover_account_claim(
+        &self,
+        relation: &aterm_agent::harness::native_account_wire::Relation,
+        binding: &Binding,
+    ) -> Option<aterm_agent::harness::native_account_wire::ChildState> {
+        use aterm_agent::harness::native_account_wire::ChildState;
+        if !self.prepare_journal_ack.load(Ordering::SeqCst) {
+            return None;
+        }
+        #[cfg(unix)]
+        if let Some(journal) = &self.native_journal {
+            return account_continuation::recorded_state(
+                journal
+                    .recover_account(
+                        aterm_agent::harness::native_receipts::AccountRelation {
+                            predecessor: relation.predecessor().prepare(),
+                            predecessor_binding: relation.predecessor().binding(),
+                            phase: relation.phase(),
+                            candidate: relation.candidate(),
+                        },
+                        binding,
+                    )
+                    .ok()??
+                    .outcome,
+            );
+        }
+        let journal = self.journal.lock().unwrap();
+        let parent = journal.get(&relation.predecessor().prepare().id)?;
+        let child = journal.get(&relation.candidate().id)?;
+        if parent.prepare != *relation.predecessor().prepare()
+            || parent.binding != *relation.predecessor().binding()
+            || parent.successor.as_deref() != Some(&relation.candidate().id)
+            || child.prepare != *relation.candidate()
+            || child.binding != *binding
+            || child.account_phase != Some(relation.phase())
+        {
+            return None;
+        }
+        match child.state {
+            JournalState::Prepared => Some(ChildState::Prepared),
+            JournalState::MayExecute => Some(ChildState::MayExecute),
+            JournalState::NoExec => child.closed_phase.map(ChildState::NoExec),
+            JournalState::Sealed => Some(ChildState::Sealed { may_execute: true }),
+        }
+    }
+    fn record_account_claim(
+        &self,
+        relation: &aterm_agent::harness::native_account_wire::Relation,
+        binding: &Binding,
+    ) -> Option<aterm_agent::harness::native_account_wire::ChildState> {
+        use aterm_agent::harness::native_account_wire::ChildState;
+        if !self.prepare_record_allowed() {
+            return None;
+        }
+        let predecessor = relation.predecessor().prepare();
+        let predecessor_binding = relation.predecessor().binding();
+        let prepare = relation.candidate();
+        #[cfg(unix)]
+        let from_disk = if let Some(journal) = &self.native_journal {
+            let observed = journal
+                .claim_account(
+                    aterm_agent::harness::native_receipts::AccountRelation {
+                        predecessor,
+                        predecessor_binding,
+                        phase: relation.phase(),
+                        candidate: prepare,
+                    },
+                    binding,
+                )
+                .ok()?;
+            Some(account_continuation::recorded_state(observed.outcome)?)
+        } else {
+            None
+        };
+        #[cfg(not(unix))]
+        let from_disk: Option<ChildState> = None;
+        let mut journal = self.journal.lock().unwrap();
+        let parent = journal.get(&predecessor.id)?;
+        if parent.prepare != *predecessor
+            || parent.binding != *predecessor_binding
+            || parent.state != JournalState::NoExec
+            || parent.closed_phase != Some(relation.phase())
+        {
+            return None;
+        }
+        if let Some(old) = journal.get(&prepare.id) {
+            let exact = old.prepare == *prepare
+                && old.binding == *binding
+                && old.account_phase == Some(relation.phase())
+                && old.predecessor.as_ref() == Some(&predecessor.id)
+                && parent.successor.as_ref() == Some(&prepare.id);
+            let observed = from_disk.or_else(|| match old.state {
+                JournalState::Prepared => Some(ChildState::Prepared),
+                JournalState::MayExecute => Some(ChildState::MayExecute),
+                JournalState::NoExec => old.closed_phase.map(ChildState::NoExec),
+                JournalState::Sealed => Some(ChildState::Sealed { may_execute: true }),
+            });
+            drop(journal);
+            return if exact && self.prepare_record_acknowledged() {
+                observed
+            } else {
+                None
+            };
+        }
+        if parent.successor.is_some() {
+            return None;
+        }
+        journal.get_mut(&predecessor.id).unwrap().successor = Some(prepare.id.clone());
+        journal.insert(
+            prepare.id.clone(),
+            JournalEntry {
+                prepare: prepare.clone(),
+                binding: binding.clone(),
+                state: JournalState::Prepared,
+                predecessor: Some(predecessor.id.clone()),
+                successor: None,
+                closed_phase: None,
+                account_phase: Some(relation.phase()),
+            },
+        );
+        drop(journal);
+        self.prepared_history
+            .lock()
+            .unwrap()
+            .push((prepare.clone(), binding.clone()));
+        self.prepare_record_acknowledged()
+            .then_some(from_disk.unwrap_or(ChildState::Prepared))
+    }
+
     fn account_admission(
         &self,
         _: &aterm_agent::harness::accounts_pool::ExecutionIntent,
@@ -280,6 +511,7 @@ impl Kernel for Facts {
         }
         if let Some(old) = journal.get(&prepare.id) {
             let exact = old.state == JournalState::Prepared
+                && old.account_phase.is_none()
                 && old.prepare == *prepare
                 && old.binding == *binding
                 && old.predecessor.as_ref() == Some(&predecessor.id)
@@ -299,6 +531,8 @@ impl Kernel for Facts {
                 state: JournalState::Prepared,
                 predecessor: Some(predecessor.id.clone()),
                 successor: None,
+                closed_phase: None,
+                account_phase: None,
             },
         );
         drop(journal);
@@ -397,8 +631,17 @@ impl Kernel for Facts {
                 .iter()
                 .any(|(prepare, _)| prepare.id == id))
     }
-    fn record_noexec(&self, prepare: &Prepare, binding: &Binding) -> bool {
-        if !self.receipt_allowed.load(Ordering::SeqCst) {
+    fn record_noexec(&self, prepare: &Prepare, binding: &Binding, phase: ImagePhase) -> bool {
+        if !self.receipt_allowed.load(Ordering::SeqCst)
+            || (phase == ImagePhase::Rollback
+                && !matches!(
+                    &prepare.plan,
+                    NativePlan::Restart {
+                        rollback: Some(_),
+                        ..
+                    }
+                ))
+        {
             return false;
         }
         #[cfg(unix)]
@@ -407,25 +650,15 @@ impl Kernel for Facts {
                 .record(
                     prepare,
                     binding,
-                    aterm_agent::harness::native_receipts::testing::Append::NoExec,
+                    aterm_agent::harness::native_receipts::testing::Append::NoExecInPhase(phase),
                 )
                 .is_err()
         }) {
             return false;
         }
-        if let Some((entered, proceed)) = &self.receipt_gate {
-            entered.send(()).unwrap();
-            let (lock, ready) = &**proceed;
-            let guard = lock.lock().unwrap();
-            let (guard, waited) = ready
-                .wait_timeout_while(guard, PATIENCE, |go| !*go)
-                .unwrap();
-            assert!(
-                *guard && !waited.timed_out(),
-                "receipt worker was not released"
-            );
-        }
-        let Some(changed) = self.journal_event(prepare, binding, JournalEvent::NoExec) else {
+        self.receipt_finished();
+        let Some(changed) = self.journal_event(prepare, binding, JournalEvent::NoExec(phase))
+        else {
             return false;
         };
         if changed {

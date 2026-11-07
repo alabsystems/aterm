@@ -27,6 +27,8 @@ mod cadence_bounds;
 mod check_lane;
 #[cfg(target_os = "macos")]
 mod check_receipt;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+mod check_wake;
 /// The background check loop's heartbeat and the pure judgement of it that the window's watchdog,
 /// `aterm ctl update status` and the tests share.
 pub mod checker_watch;
@@ -2419,7 +2421,7 @@ fn spawn_background_check_in(
         gate: std::sync::Arc::new(checker_gate),
         check: std::sync::Arc::new(github::check_and_stage),
         pause: None,
-        wake: &cadence::SYSTEM_WOKE,
+        wake: &check_wake::SYSTEM_WOKE,
         wake_settle: cadence::WAKE_SETTLE,
     });
     let generation = checker_watch::WATCH.register(
@@ -2548,14 +2550,14 @@ fn asked_check<T>(automatic: bool, sweep: &UncheckedSweep, check: impl FnOnce() 
 /// Tell the background check that the system just woke.
 #[cfg(target_os = "macos")]
 pub fn note_system_woke() {
-    cadence::SYSTEM_WOKE.post();
+    check_wake::SYSTEM_WOKE.post();
 }
 
 /// Observe the host's settled network changes during the existing checker
 /// wait. The consuming probe must do no network or filesystem work.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn set_network_change_probe(probe: Box<dyn Fn() -> bool + Send + Sync>) {
-    cadence::SYSTEM_WOKE.set_network_probe(probe);
+    check_wake::SYSTEM_WOKE.set_network_probe(probe);
 }
 
 /// How long the check loop pauses after the host did not answer its settings query.
@@ -2681,8 +2683,14 @@ pub fn respawn_stalled_checker(stalled_generation: u64) -> Option<u64> {
     }
 }
 
-/// Linux supervises its own enrolled checker.
-#[cfg(not(target_os = "macos"))]
+/// Replace an enrolled Linux checker through the same host watchdog.
+#[cfg(target_os = "linux")]
+pub fn respawn_stalled_checker(stalled_generation: u64) -> Option<u64> {
+    linux::respawn_stalled_checker(stalled_generation)
+}
+
+/// No checker runs on unsupported platforms.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn respawn_stalled_checker(_stalled_generation: u64) -> Option<u64> {
     None
 }
@@ -4570,6 +4578,11 @@ mod checker_gate_tests {
         };
         assert!(unreachable_before_the_channel(
             dns,
+            &filed("network", started),
+            started
+        ));
+        assert!(unreachable_before_the_channel(
+            "curl HEAD x failed (exit status: 5): curl: (5) Could not resolve proxy: proxy.invalid",
             &filed("network", started),
             started
         ));

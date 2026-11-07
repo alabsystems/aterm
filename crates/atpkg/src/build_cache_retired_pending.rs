@@ -57,6 +57,32 @@ fn identity(path: &Path) -> Result<Option<[u64; 2]>, String> {
     }
 }
 
+/// Now as the file system dates a write made from here on: never after the time such a write
+/// takes, so work arriving after a removal began is never older than its cutoff
+/// ([`unchanged_since`]). Linux dates a write by its coarse clock (`CLOCK_REALTIME_COARSE`, the
+/// wall clock at its last tick), up to a tick behind the wall clock, so a file written just
+/// after a read of the wall clock can be dated before it; a write in the tick that reading
+/// falls in is then dated at the cutoff, and stays. Elsewhere it is the wall clock.
+pub(super) fn file_clock_now() -> SystemTime {
+    #[cfg(target_os = "linux")]
+    {
+        const CLOCK_REALTIME_COARSE: libc::clockid_t = 5;
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `clock_gettime` writes the one `timespec` it is handed, live on this frame.
+        if unsafe { libc::clock_gettime(CLOCK_REALTIME_COARSE, &raw mut now) } == 0
+            && let (Ok(seconds), Ok(nanos)) =
+                (u64::try_from(now.tv_sec), u32::try_from(now.tv_nsec))
+            && nanos < 1_000_000_000
+        {
+            return SystemTime::UNIX_EPOCH + Duration::new(seconds, nanos);
+        }
+    }
+    SystemTime::now()
+}
+
 /// Unlike ordinary cache age discovery, custody revalidation includes nested Git
 /// bookkeeping and fails closed on unreadable entries. The remover only unlinks files;
 /// folder times and the root .git it restores are the two writes it can cause itself.
@@ -232,7 +258,7 @@ pub(super) fn begin(
     head: &str,
     gitfile: &[u8],
 ) -> Result<Pending, String> {
-    let pending = prepare(wt, entry, head, gitfile, SystemTime::now())?;
+    let pending = prepare(wt, entry, head, gitfile, file_clock_now())?;
     commit(checkout, &pending)?;
     Ok(pending)
 }

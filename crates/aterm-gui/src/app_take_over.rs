@@ -109,16 +109,18 @@ pub(crate) struct AgentsState {
     pub(crate) controller_gesture: bool,
     /// The gesture being dispatched came through the window's accessibility tree
     /// ([`App::with_assistive_source`]). No person is known to stand behind it for the owner's
-    /// keys ([`crate::owner_keys_save`]) or a person-only press
-    /// ([`App::person_only_press_refusal`]); everywhere else a screen reader's press is the
-    /// person's.
+    /// keys ([`crate::owner_keys_save`]), a person-only press
+    /// ([`App::person_only_press_refusal`]) or macOS's notification ask
+    /// (`App::ask_macos_on_program_notices_turned_on`); everywhere else a screen reader's press is
+    /// the person's.
     pub(crate) assistive_gesture: bool,
     /// The gesture being dispatched came from a key, click or scroll another process posted into
     /// the window ([`App::with_origin_mark`], `aterm_window::event::InputOrigin::Relayed`): a
     /// person's own relay (Screen Sharing, an on-screen keyboard) and a program holding aterm's
     /// Accessibility grant, as every tab's program does through aterm, send the same events. No
-    /// person is known to stand behind it for the owner's keys ([`crate::owner_keys_save`]);
-    /// everywhere else it is the person's.
+    /// person is known to stand behind it for the owner's keys ([`crate::owner_keys_save`]), a
+    /// person-only press ([`App::person_only_press_refusal`]) or macOS's notification ask
+    /// (`App::ask_macos_on_program_notices_turned_on`); everywhere else it is the person's.
     pub(crate) relayed_gesture: bool,
     /// How many control-client gestures were dispatched in this process
     /// ([`App::with_gesture_source`] with `controller` set), anywhere. System

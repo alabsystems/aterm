@@ -106,9 +106,9 @@ mod status;
 mod style;
 mod thermal;
 pub(crate) use bed::{
-    AirLight, BedScratch, BedShape, DARK_BED_ALPHA_CAP, air_lit, clip_quads_to, clip_stream_to,
-    dark_bed_budget, dark_bed_ink, lay_dark_bed, lit_rail_drop, night_rgb, page_lit, page_lit_ink,
-    split_air_runs,
+    AirLight, BedScratch, BedShape, DARK_BED_ALPHA_CAP, FootInk, air_lit, clip_quads_to,
+    clip_stream_to, dark_bed_budget, dark_bed_ink, lay_dark_bed, lit_rail_drop, night_rgb,
+    page_lit, page_lit_ink, split_air_runs,
 };
 #[cfg(any(test, debug_assertions))]
 pub use caret_letter::CaretLetterLaw;
@@ -119,9 +119,12 @@ pub(crate) use emit::drop_cut_particle;
 use ink_ledger::BandLifts;
 pub(crate) use ink_ledger::InkLedger;
 pub use ink_ledger::OverInkTier;
+pub use ink_ledger::letter_bar;
 pub(crate) use ink_ledger::{
-    LETTER_GUARD_RING, LetterGuard, RIM_SHOWN_SHARE, RIM_UNDER_LETTERS, ThinCaret,
+    LETTER_GUARD_RING, LetterGuard, RIM_SHOWN_SHARE, RIM_UNDER_LETTERS, ThinCaret, foot_ring_light,
 };
+#[cfg(any(test, debug_assertions))]
+pub use ink_ledger::{with_aa_unrounded, with_share_over_aa};
 pub(crate) use light_body::*;
 pub use probe::*;
 pub use raster::*;
@@ -210,6 +213,8 @@ struct ParticleLatch {
     end: f32,
     /// A Comet grain's seat in the dust beside a typed row.
     seat: DustSeat,
+    /// A Water bead's standing beside a thin caret.
+    caret_bead: CaretBead,
 }
 
 impl ParticleLatch {
@@ -218,7 +223,23 @@ impl ParticleLatch {
         judged: false,
         end: f32::INFINITY,
         seat: DustSeat::Unseated,
+        caret_bead: CaretBead::Unread,
     };
+}
+
+/// A Water bead's standing beside a bar or an underline ([`CursorGlow::emit_particles`]). It
+/// keeps off the caret's cell and the cell either side of it, where it reads as a `·` or a
+/// `:`, once: a bead born there stays hidden until it is clear and eases in from nothing, and
+/// one that is clear and comes to lie there goes out for good ([`ParticleLatch::end`]), so no
+/// bead pops in whole as a caret steps away or drops out and returns at the next key.
+#[derive(Clone, Copy, PartialEq)]
+enum CaretBead {
+    /// Not read yet.
+    Unread,
+    /// Has lain beside the caret since its first paint, and has not been drawn.
+    Behind,
+    /// Clear of the caret: since its first paint, or since the age it came clear.
+    Clear { since: Option<f32> },
 }
 
 /// A Comet grain's seat beside the typed row it was shed by, taken the first
@@ -600,6 +621,15 @@ pub struct CursorGlow {
     /// ([`Self::observe_frame_text_marked`]).
     #[cfg(any(test, debug_assertions))]
     frame_marks_unread: bool,
+    /// A test's negative control: the feet a rail in its row's foot band
+    /// parts round read with no cell's deep ink, an underlined cell a foot
+    /// by its glyph alone ([`Self::set_feet_deep_unread`]).
+    #[cfg(any(test, debug_assertions))]
+    feet_deep_unread: bool,
+    /// A test's negative control: the lane a rail takes past a foot read by its glyph's raster
+    /// alone, a cell the frame lays deep ink in too ([`Self::set_lanes_deep_unread`]).
+    #[cfg(any(test, debug_assertions))]
+    lanes_deep_unread: bool,
     /// A test's negative control: a sample in the air by its own cell
     /// alone, beside a letter too ([`bed::air_lit`]).
     #[cfg(any(test, debug_assertions))]
@@ -842,11 +872,114 @@ pub struct CursorGlow {
     /// as looks9 laid it (looks10 L4's negative control).
     #[cfg(test)]
     comet_light_tube: bool,
+    /// Test-only: the paper comet's tail laid about the row's middle, as the
+    /// composed land laid it (after-land L1's negative control,
+    /// [`Self::COMET_LIGHT_SPINE`]).
+    #[cfg(test)]
+    comet_light_mid_spine: bool,
+    /// Test-only: the paper comet's tail at the letters' foot over cells that
+    /// hold none, as after-land L1 first laid it
+    /// ([`Self::COMET_LIGHT_BLANK`]'s negative control).
+    #[cfg(test)]
+    comet_foot_on_blanks: bool,
+    /// Test-only: behind a bar caret the paper comet's head laid as on a
+    /// block, its coma's rim circling the bar and its cap reaching the cell's
+    /// far edge (after-land L2's negative control).
+    #[cfg(test)]
+    comet_bar_unseated: bool,
+    /// Test-only: behind a bar caret the paper comet still lays its coma's
+    /// fill, clipped at the bar (after-land r1's negative control: a pale,
+    /// flat-topped patch over the letter behind the bar).
+    #[cfg(test)]
+    comet_bar_coma: bool,
     /// Test-only: the paper comet's dust seated in its own lettered row's
     /// leading (as looks9's crosses were), not in the blank row beside it
     /// (looks10 L4's negative control).
     #[cfg(test)]
     comet_dust_in_row: bool,
+    /// Test-only: paper Lumen's tracer laid as composed r3 laid it, each
+    /// spark at its own light, its tail end blunt (the after-land lows' W4
+    /// negative control).
+    #[cfg(test)]
+    lumen_paper_blunt: bool,
+    /// Test-only: paper Lumen's run kept to one side of its head, which a
+    /// first Backspace puts its typed leg on the wrong side of
+    /// ([`Self::lumen_paper_one_side`]).
+    #[cfg(test)]
+    lumen_paper_one_side: bool,
+    /// Test-only: Lumen and Beam lay no rail on the reference dark, their bed
+    /// alone, as composed r3 laid them (the after-land lows' W4 and W6
+    /// negative control).
+    #[cfg(test)]
+    dark_unrailed: bool,
+    /// Test-only: Beam's bed under a lit page's letters laid in its stop's
+    /// own hue at the page's luminance, the page itself to the eye on
+    /// Solarized Dark (the after-land lows' must-fix negative control,
+    /// [`bed::BedShape::lit_body_turn`]).
+    #[cfg(test)]
+    lit_bodiless: bool,
+    /// Test-only: Beam's body under a lit page's letters weighed and cut by
+    /// the letter guard with the lights in its cells, not kept whole as a
+    /// page shade ([`bed::BedScratch::shade_runs`]).
+    #[cfg(any(test, debug_assertions))]
+    lit_body_weighed: bool,
+    /// Test-only: a bar caret's rail laid to its cell's far edge, as under a
+    /// block, past the bar (the after-land judge's bar low's negative
+    /// control, [`bed::BedScratch::bar`]).
+    #[cfg(test)]
+    rail_past_bar: bool,
+    /// Test-only: paper Water's landing ripple laid as composed r3 laid it, a
+    /// whole ellipse through the caret's row whose arcs right of the caret
+    /// read as a `)` (the after-land lows' W1 negative control).
+    #[cfg(test)]
+    water_paper_ripple_whole: bool,
+    /// Test-only: paper Water's landing ripple kept to the leading under the
+    /// caret's row on the grid's last row too, where it has none and every
+    /// quad falls past the effects box.
+    #[cfg(test)]
+    water_paper_ripple_leading_only: bool,
+    /// Test-only: a Water bead beside a thin caret hidden frame by frame from
+    /// where it stands, no latch ([`CaretBead`]'s negative control).
+    #[cfg(test)]
+    water_beads_unlatched: bool,
+    /// Test-only: Sparkle's paper body an even band to its tail, as
+    /// composed r3 laid it (the after-land lows' W9 negative control).
+    #[cfg(test)]
+    sparkle_paper_even: bool,
+    /// Test-only: Sparkle's moons as small as composed r3 laid them (the
+    /// after-land lows' W9 negative control).
+    #[cfg(test)]
+    moon_r3_size: bool,
+    /// Test-only: Sparkle's rail an even band to its tail, as composed r3
+    /// laid it (the after-land lows' W9 negative control).
+    #[cfg(test)]
+    sparkle_rail_blunt: bool,
+    /// Test-only: Water's wave runs through its letters' middle as composed
+    /// r3 laid it (the after-land lows' W8 negative control).
+    #[cfg(test)]
+    water_mid_line: bool,
+    /// Test-only: dark Water's drops bead about a bar or underline caret as
+    /// composed r3 laid them (the after-land lows' W2 negative control).
+    #[cfg(test)]
+    water_drops_on_thin_caret: bool,
+    /// Test-only: a Laser crackle springs from a typed cell picked among the
+    /// trail's last twelve, as composed r3's did (the after-land lows' W9
+    /// negative control).
+    #[cfg(test)]
+    crackle_along_trail: bool,
+    /// Test-only: Beam's tube at composed r3's rod and sleeve (a third of a
+    /// cell at full power, its sleeve five and a half rods wide; the
+    /// after-land lows' W6 negative control).
+    #[cfg(test)]
+    beam_tube_r3: bool,
+    /// Test-only: Classic's one-colour face leaves the momentum glow in its
+    /// own warm white, as composed r3 did (the after-land lows' W10 negative
+    /// control).
+    #[cfg(test)]
+    pub(crate) classic_momentum_unheld: bool,
+    /// The caret is a bar or an underline this frame ([`Self::set_thin_caret`]):
+    /// its cell shows what a block would hide.
+    caret_thin: bool,
     /// The frame's night grounds ([`push_night_ground`]), laid first under
     /// the letters.
     night_out: Vec<GlowQuad>,
@@ -956,6 +1089,59 @@ pub struct CursorGlow {
     /// [`Self::DENSE_EMBER_CLIMB`]).
     #[cfg(test)]
     dense_embers_level: bool,
+    /// Test-only: a dense row's seated embers climb on one straight line
+    /// with an even scatter, as the composed land laid them (after-land L3's
+    /// negative control, [`Self::DENSE_EMBER_FAN`]).
+    #[cfg(test)]
+    dense_embers_line: bool,
+    /// Test-only: draw every seated Fire ember at its own size and light
+    /// whatever its way out (after-land L3's negative control,
+    /// [`Self::DENSE_EMBER_TAPER`]).
+    #[cfg(test)]
+    dense_embers_untapered: bool,
+    /// Test-only: lay the paper Phaser as the composed land did, its hue's
+    /// body ink across a soft band (after-land L4's negative control,
+    /// [`Self::PHASER_PAPER_TUBE`]).
+    #[cfg(test)]
+    phaser_paper_pastel: bool,
+    /// Test-only: ease the paper Phaser's band in at its tail even where the
+    /// caret meets it (after-land L4's negative control for the attached
+    /// band).
+    #[cfg(test)]
+    phaser_band_detached: bool,
+    /// Test-only: lay the paper Phaser's quarter-cell knots at the straight
+    /// mean of their neighbours' spectrum places, so a run's wrap walks the
+    /// whole wheel back between two cells (after-land r1's negative control,
+    /// `spectrum_between` in `emit.rs`).
+    #[cfg(test)]
+    phaser_hue_long_way: bool,
+    /// Test-only: lay the paper Phaser's tube in the wheel that steps over the muddy hues
+    /// (after-land B7's negative control, [`Self::phaser_tube_color`]).
+    #[cfg(test)]
+    phaser_tube_steps_hues: bool,
+    /// Test-only: hold the paper Phaser's tube over a wide glyph as a soft body's band is held
+    /// (after-land B7's negative control, [`Self::PHASER_PAPER_WIDE_KEEP`]).
+    #[cfg(test)]
+    phaser_tube_wide_pastel: bool,
+    /// Test-only: lay the paper flame in the composed land's pale stops and
+    /// tip fall (after-land L3's negative control, [`Self::FIRE_LIGHT_TIP_FALL`]).
+    #[cfg(test)]
+    fire_paper_pale: bool,
+    /// Test-only: burn the dark air run behind a typed head at its default
+    /// length whatever the Trail duration (after-land F5's negative control,
+    /// [`Self::FIRE_DARK_RUN_STRETCH_MAX`]).
+    #[cfg(test)]
+    fire_run_unstretched: bool,
+    /// Test-only: let a typed key's embers live their tuned flight times the
+    /// Trail duration's share of the default, as the composed land did
+    /// (after-land F5's negative control, [`Self::fire_ember_life_scale`]).
+    #[cfg(test)]
+    fire_embers_duration_scaled: bool,
+    /// Test-only: a forward leap along its row flies Fire's meteor alone, its
+    /// landing left dark, as the composed land did (after-land L3's negative
+    /// control, [`Self::fire_meteor_lays_its_landing`]).
+    #[cfg(test)]
+    fire_meteor_lands_dark: bool,
     /// Test-only: Comet's tail in its own row's foot band as faint as round
     /// 1 laid it (looks10 L2's negative control,
     /// [`bed::BedScratch::row_tail_faint`]).
@@ -999,6 +1185,9 @@ pub struct CursorGlow {
     paper_pin_unread: bool,
     light_verts: Vec<aterm_render::RibbonVertex>,
     light_band_run: Vec<CometSample>,
+    /// The paper Phaser's run laid every quarter cell
+    /// ([`Self::PHASER_PAPER_TUBE`]).
+    light_dense_run: Vec<CometSample>,
     bed_scratch: BedScratch,
     air_runs: Vec<Vec<CometSample>>,
     wedge_runs: Vec<Vec<CometSample>>,
@@ -1625,6 +1814,17 @@ impl CursorGlow {
     const FIRE_DARK_AIR_CAP_COLD: f32 = 96.0;
     const FIRE_DARK_AIR_CAP_HEAT: f32 = 64.0;
     const FIRE_DARK_AIR_RANKS: [f32; 6] = [1.0, 0.92, 0.82, 0.68, 0.5, 0.32];
+    /// THE TRAIL'S DURATION LENGTHENS THE FLAME, NOT ITS DUST (after-land F5). Behind a typed
+    /// head the dark air burns a run of [`Self::FIRE_DARK_AIR_RANKS`]' length whatever the
+    /// duration, and a key's embers flew their life times the duration's share of the default
+    /// (`typed_life_scale`): at 1200 ms the Cursor card's fire burned the same six cells and
+    /// its embers drifted up to eight rows up as dust over the lines above (the composed
+    /// final judge: "more drifting embers rather than a longer flame"). The run now stretches
+    /// by the square root of that share up to this (1200 ms: twelve cells), its shares read off
+    /// the ranks' profile; at the default and shorter durations, whose sparks' shorter lives
+    /// already show, it is the ranks exactly. A key's embers keep their tuned flight at a
+    /// longer duration ([`Self::fire_ember_life_scale`]).
+    const FIRE_DARK_RUN_STRETCH_MAX: f32 = 2.2;
     const FIRE_DARK_AIR_PEAK: f32 = 2.4;
     const FIRE_DARK_AIR_TEMP: f32 = 0.72;
     const FIRE_DARK_AIR_TONGUE_CAP: f32 = 208.0;
@@ -1732,9 +1932,19 @@ impl CursorGlow {
     /// A paper tongue's widest half-width per pixel of its height (no tongue wider than tall).
     const FIRE_LIGHT_TONGUE_ASPECT: f32 = 0.45;
     /// The least run over which a paper tongue's root eases in, laid a pixel a slab; over 3 px in
-    /// the flame's 2 px slabs, a short gap tongue's root is cut flat in two steps.
-    const FIRE_LIGHT_ROOT_EASE_PX: f32 = 6.0;
+    /// the flame's 2 px slabs, a short gap tongue's root is cut flat in two steps. It was 6 px
+    /// before the tongue's body filled out ([`Self::FIRE_LIGHT_SIDE_FALL`]).
+    const FIRE_LIGHT_ROOT_EASE_PX: f32 = 7.0;
     const FIRE_LIGHT_ALPHA: f32 = 240.0;
+    /// How a paper tongue's opacity thins toward its tip: the power of the
+    /// share of its rise left above it. At 0.55 its upper half composited
+    /// as a pale peach (after-land L3, with the paper flame's stops,
+    /// `FLAME_LIGHT_STOPS`).
+    const FIRE_LIGHT_TIP_FALL: f32 = 0.35;
+    /// How a paper tongue's opacity falls from its middle to its sides: the
+    /// power of `1 - d²` at `d` of its half-width out. At 1.6 its body was a
+    /// thin bright line in a pale peach (after-land L3).
+    const FIRE_LIGHT_SIDE_FALL: f32 = 0.8;
     const FIRE_LIGHT_ROOT: f32 = 0.70;
     const FIRE_LIGHT_RISE_COLD: f32 = 2.3;
     const FIRE_LIGHT_RISE_HOT: f32 = 0.85;
@@ -1755,9 +1965,30 @@ impl CursorGlow {
     const GRAIN_OVER_GLYPH_DIM: f32 = 0.30;
     const LIGHT_GRAIN_GAIN: f32 = 1.2;
     const MOON_DUST_RATIO: f32 = 2.0;
+    /// The least radius of Sparkle's crescent moon, a share of the cell
+    /// height (after-land lows' W9): at twice its grain's dust radius alone
+    /// the low-seeded moons were 0.14 of a cell, about 6 px across at 1x, a
+    /// gold dot that read as no crescent (composed r3's judges); its
+    /// largest stay 0.24.
+    const MOON_MIN_R: f32 = 0.2;
     const SPARKLE_DARK_LIFT: f32 = 1.35;
     const SPARKLE_DARK_GROW: f32 = 1.3;
     const LIGHT_BAND_TAIL_CELLS: f32 = 1.5;
+    /// The paper Phaser's neon tube (after-land L4): its reach about the
+    /// row's middle (a share of the row), the px its edges melt over, so
+    /// they are crisp where a soft body melts over half its reach, and its
+    /// opacity per unit of the run's coverage (a fresh sample's 126 lays it
+    /// whole).
+    pub(super) const PHASER_PAPER_TUBE: (f32, f32, f32) = (0.32, 1.0, 2.1);
+    /// The share of the theme's text contrast on its paper the Phaser's tube keeps under a wide
+    /// glyph. A soft body's three quarters ([`LIGHT_WIDE_BED_KEEP`]) leave the hues whose ink lies
+    /// far under paper's luminance (red, pink, violet, blue) at saturation 0.14-0.25 while the
+    /// narrow cells two back wear 0.68-0.86: half the tube went pastel over CJK by the caret, with
+    /// a hard edge where the hold began (`phaser-light-cjk.t0`, after-land B7). At two fifths
+    /// GitHub Light's text still reads 6.3:1 on the tube, past the 5.25 a narrow letter keeps over
+    /// it ([`BODY_CONTRAST_BAR`]) and what the letter guard asks of a glyph it reads by its solid
+    /// ink, and the same hues wear 0.40-0.62.
+    pub(super) const PHASER_PAPER_WIDE_KEEP: f32 = 0.40;
     /// The cells a light Comet's typing wedge reaches back behind its head:
     /// at 3.5 its light was gone two cells behind the caret, a soft blue blob
     /// with a weak tail on paper (`comet-light.t0`, looks9 Q2). Its light
@@ -1782,8 +2013,21 @@ impl CursorGlow {
     const COMET_LIGHT_ICE_HUE: f32 = 196.0;
     /// A paper comet's tail at its far end and at its nucleus, as a share of
     /// the cell height (its half-height, the nucleus's round cap aside): a
-    /// needle swelling to the head, where Beam's tube is even.
-    const COMET_LIGHT_NEEDLE: (f32, f32) = (0.04, 0.46);
+    /// needle swelling to the head, where Beam's tube is even. It swells no
+    /// higher than the foot band it runs in ([`Self::COMET_LIGHT_SPINE`]):
+    /// swelling to 0.46 about the row's middle, it crossed the last word at
+    /// mid-height like a strikethrough (after-land L1).
+    const COMET_LIGHT_NEEDLE: (f32, f32) = (0.03, 0.17);
+    /// THE PAPER COMET'S TAIL RUNS AT THE LETTERS' FOOT (after-land L1): its
+    /// spine's drop below the row's middle, a share of the cell height. The
+    /// dark comet's tail runs in the leading under the row; laid about the
+    /// row's middle (0.04), the paper tail crossed `fox` at mid-height like a
+    /// strikethrough (`comet-light.t0`). Its nucleus and coma keep the head.
+    pub(super) const COMET_LIGHT_SPINE: f32 = 0.32;
+    /// A paper comet's tail where its wedge's cells hold no letter to clear:
+    /// its spine ([`Self::COMET_LIGHT_SPINE`]) and its needle
+    /// ([`Self::COMET_LIGHT_NEEDLE`]), the row's middle and the row's height.
+    const COMET_LIGHT_BLANK: (f32, (f32, f32)) = (0.04, (0.04, 0.46));
     const COMET_LIGHT_COMA_RIM: f32 = 0.11;
     /// A paper comet's dust behind its head: each mote's seat, in cells
     /// behind the head, its depth into the blank row beside the typed one
@@ -1885,18 +2129,65 @@ impl CursorGlow {
     /// of the band it is seated in ([`Self::DENSE_SEAT_CELLS`]).
     const DENSE_EMBER_RISE: f32 = 0.2;
     /// How far a seated ember sits higher for being seated farther past the
-    /// caret's reach, a share of its band, reached
-    /// [`Self::DENSE_EMBER_CLIMB_CELLS`] out: the embers climb away from the
-    /// flame.
-    pub(super) const DENSE_EMBER_CLIMB: f32 = 0.85;
-    /// How many cells past the caret's reach a seated ember has climbed
-    /// [`Self::DENSE_EMBER_CLIMB`] (most seated embers lie inside it).
+    /// caret's reach, a share of its band, reached at the seats' far end
+    /// ([`Self::DENSE_SEAT_CELLS`]): the embers climb away from the flame,
+    /// quickest near it (as the way out to the power 0.7), as a plume's
+    /// middle rises off a flame.
+    pub(super) const DENSE_EMBER_CLIMB: f32 = 0.62;
+    /// The share of its band a seated ember beside the flame sits above the
+    /// band's foot ([`Self::DENSE_EMBER_CLIMB`]).
+    const DENSE_EMBER_FLOOR: f32 = 0.08;
+    /// How many cells past the caret's reach a seated ember had climbed the
+    /// composed land's whole climb (most seated embers lie inside it); the
+    /// line law alone reads it (`dense_embers_line`, `dense_embers_level`'s
+    /// sibling, after-land L3).
+    #[cfg(test)]
     const DENSE_EMBER_CLIMB_CELLS: f32 = 1.6;
-    /// How far a seated ember's height scatters, a share of its band.
+    /// How far a seated ember's height scatters beside the flame, a share of
+    /// its band.
     const DENSE_EMBER_SCATTER: f32 = 0.1;
+    /// THE DENSE ROW'S EMBERS RISE IN A PLUME (after-land L3): how much wider
+    /// a seated ember's height scatters at the seats' far end
+    /// ([`Self::DENSE_SEAT_CELLS`]) than beside the flame, a share of its
+    /// band, so the embers fan out as they climb. With the scatter even (a
+    /// tenth of the band) and the climb straight, the embers stood on one
+    /// line, a straight, evenly spaced dotted diagonal right of the caret on
+    /// every theme (`fire-*-context.t0`, x468-505 y98-112).
+    const DENSE_EMBER_FAN: f32 = 0.6;
+    /// How much smaller and dimmer a seated Fire ember is drawn at the seats'
+    /// far end ([`Self::DENSE_SEAT_CELLS`]) than beside the flame, a share of
+    /// its size and light, falling evenly with its seat's way across them.
+    /// Of one size and light, the fanned embers in the row's ten-pixel band
+    /// still read as a dotted line, nearly level, a dotted ellipsis on paper
+    /// (after-land r1's gallery, `fire-*-context.t0`); tapering, they read as
+    /// sparks dying off the flame.
+    const DENSE_EMBER_TAPER: f32 = 0.5;
+    /// The composed land's climb ([`Self::DENSE_EMBER_CLIMB`]), the law
+    /// after-land L3's negative control restores (`dense_embers_line`).
+    #[cfg(test)]
+    const DENSE_EMBER_CLIMB_LINE: f32 = 0.85;
     /// How long a fresh grain of Comet's dark dust takes to brighten, s.
     const COMET_DARK_DUST_RISE_S: f32 = 0.12;
+    /// Where Water's wave once ran, below the caret's centre, a share of the
+    /// cell height: through its letters' middle (a test's control,
+    /// [`Self::WATER_FOOT_DY`]).
+    #[cfg(test)]
     const WATER_LINE_DY: f32 = 0.10;
+    /// WATER'S WAVE RUNS ALONG ITS LETTERS' FOOT (the after-land lows' W8):
+    /// its line below the caret's centre, a share of the cell height, under
+    /// the letters' baseline. At a tenth of a cell, its swell a fifth, it ran
+    /// through the letters' middle: on paper a blue line struck through the
+    /// words typed, and on the reference dark the letter guard held it to a
+    /// faint thread where it crossed them (composed r3's judges).
+    const WATER_FOOT_DY: f32 = 0.30;
+    /// The share of [`Self::WATER_SWELL`] the wave swells by along the
+    /// letters' foot ([`Self::WATER_FOOT_DY`]): its crests keep under the
+    /// baseline and in its own row.
+    const WATER_FOOT_SWELL: f32 = 0.5;
+    /// The undertow's thickness along the letters' foot, a share of the cell
+    /// height and its share more at full heat: a band under the crest, not
+    /// the row's lower half.
+    const WATER_FOOT_UNDERTOW: (f32, f32) = (0.16, 0.08);
     /// The swell of Water's lit rail below the row, a share of the cell
     /// height ([`super::bed::BedScratch::rail_wave`]).
     const WATER_RAIL_SWELL: f32 = 0.14;
@@ -1982,6 +2273,16 @@ impl CursorGlow {
     const SPARKLE_PAPER_STAR: u32 = 0x00A6_6000;
     const SPARKLE_PAPER_MOON: u32 = 0x00C4_7C00;
     const SPARKLE_PAPER_BEAD: f32 = 0.85;
+    /// The share of its head's reach Sparkle's paper body keeps at its tail
+    /// end, narrowing in a line from its head over its run (and no less than
+    /// [`Self::SPARKLE_PAPER_TAPER_CELLS`]; after-land lows' W9): an even
+    /// band its whole length read as a highlighter stroke across the typed
+    /// word, not a gold comet.
+    const SPARKLE_PAPER_TAIL_REACH: f32 = 0.3;
+    /// The fewest cells Sparkle's paper body narrows over
+    /// ([`Self::SPARKLE_PAPER_TAIL_REACH`]): a run of one or two cells
+    /// narrows only as far as its length along that span.
+    const SPARKLE_PAPER_TAPER_CELLS: f32 = 3.0;
     const LASER_AURA_COV: f32 = 0.42;
     /// Distance in cells from the path's head over which the laser aura keeps its peak.
     pub(super) const LASER_AURA_FULL_CELLS: f32 = 0.5;
@@ -1996,12 +2297,22 @@ impl CursorGlow {
     /// 120 ms after the last key, and at rest paper Lumen was Off (composed
     /// r2's judges, O9(b)).
     const LUMEN_PAPER_CHAIN_KEYS: f32 = 7.0;
+    /// How long a Water bead that came clear of a thin caret takes to ease in, in seconds
+    /// ([`CaretBead`]).
+    const WATER_BEAD_EMERGE_S: f32 = 0.08;
     /// The longest a paper Lumen spark lives ([`Self::LUMEN_PAPER_CHAIN_KEYS`]).
     const LUMEN_PAPER_LIFE_MAX: f32 = 0.9;
     /// Paper Lumen's tracer: its spine's drop below the row's centre and its
     /// soft reach either side, as shares of the cell height, a glow along
     /// the foot of the letters just typed.
     pub(super) const LUMEN_PAPER_TRACER: (f32, f32) = (0.30, 0.20);
+    /// How far paper Lumen's tracer takes to rise from nothing at its tail,
+    /// in cells ([`Self::lumen_paper_taper`]).
+    pub(super) const LUMEN_PAPER_TAIL_CELLS: f32 = 2.0;
+    /// The share of its near sample's light under which a paper Lumen sample's stretch starts to
+    /// leave its run's fade ([`Self::lumen_paper_taper`]): over it, as along a run's ordinary
+    /// decline, a stretch counts whole and the tracer keeps its length.
+    const LUMEN_PAPER_END_LIT: f32 = 0.75;
     const BEAM_CHAIN_KEYS: f32 = 3.5;
     const BEAM_CHAIN_GAP_MAX: f32 = 0.75;
     const BEAM_CHAIN_LIFE_MAX: f32 = 1.2;
@@ -2071,6 +2382,13 @@ impl CursorGlow {
         self.colour_pins = pins;
     }
 
+    /// Whether the caret this frame is a bar or an underline, its cell open to the lights a
+    /// block would hide (the host's cursor shape; set before [`Self::tick`]).
+    #[inline]
+    pub const fn set_thin_caret(&mut self, thin: bool) {
+        self.caret_thin = thin;
+    }
+
     /// A test's negative control: `on` (as shipped), a pinned trail colour's light-ground inks
     /// keep its chroma ([`LightGround::chosen`]); off, they are its hue's vivid ink.
     #[cfg(any(test, debug_assertions))]
@@ -2133,6 +2451,24 @@ impl CursorGlow {
     #[inline]
     pub const fn set_classic_pin_own_chroma(&mut self, on: bool) {
         self.classic.mono_pin_floored = !on;
+    }
+
+    /// A test's negative control: `on` (as shipped), the one-colour rail's raise leaves out
+    /// the page's tint along a chosen colour's hue; off, it reads the page's whole brightness
+    /// as grey, as before the after-land lows' W10b.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_classic_rail_tint_read(&mut self, on: bool) {
+        self.classic.mono_rail_tint_blind = !on;
+    }
+
+    /// A test's negative control: `on` (as shipped), Beam's body under a lit page's letters is a
+    /// page shade the letter guard keeps whole; off, it is weighed and cut with the lights in its
+    /// cells ([`bed::BedScratch::shade_runs`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_lit_body_a_shade(&mut self, on: bool) {
+        self.lit_body_weighed = !on;
     }
 
     /// Whether a typed light lives its tuned life whatever the duration
@@ -2731,13 +3067,16 @@ impl CursorGlow {
             // feet; the caret's own cell is no foot. A test's control
             // ([`Self::set_bed_row_rails`]) names no row's feet.
             let mut feet = std::mem::take(&mut self.bed_scratch.feet);
+            let mut foot_ink = std::mem::take(&mut self.bed_scratch.foot_ink);
             let mut soles = [None; 2];
             feet.clear();
+            foot_ink.clear();
             if cfg.classic_mono && cfg.dark_theme && !self.bed_scratch.row_rail_off {
                 self.foot_boxes(geom, &mut feet, &mut soles);
                 if let Some((r, c)) = cur {
                     bed::carve_cell(&mut feet, geom, (i32::from(r), i32::from(c)));
                 }
+                self.foot_ink(geom, &feet, &mut foot_ink);
             }
             let bed_ground = if self.night_grounded(cfg) && self.classic_pin_grounded(cfg) {
                 self.night_ground(cfg).map(|ng| ng.ink)
@@ -2756,11 +3095,12 @@ impl CursorGlow {
                     text: TextView::new(spans, Some(&self.frame_text)),
                     ledger: &mut self.ink_ledger,
                     chosen: self.colour_pins.trail && cfg.style.draws_trail_color(),
-                    feet: (feet.as_slice(), soles),
+                    feet: (feet.as_slice(), foot_ink.as_slice(), soles),
                     bed_ground,
                 },
             );
             self.bed_scratch.feet = feet;
+            self.bed_scratch.foot_ink = foot_ink;
             if let Some((from, to)) = self.classic.take_spawn() {
                 self.spawns += 1;
                 self.log_licensed_as(now, from, to, AdmissionRecord::LICENCE_MOTION);

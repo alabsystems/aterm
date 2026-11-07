@@ -13,6 +13,23 @@ extern "C" fn stop(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
+/// Whether this run was the harness probing a copy laid as a managed build: `fixture-version` beside
+/// it names the version it answers, and a probe's environment carries no fixture root.
+fn answered_build_probe() -> bool {
+    let Some(version) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| std::fs::read_to_string(exe.with_file_name("fixture-version")).ok())
+    else {
+        return false;
+    };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args == ["--version"] {
+        println!("{} (Claude Code)", version.trim());
+        return true;
+    }
+    args == ["--help"]
+}
+
 fn append(path: &Path, bytes: &[u8]) {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -88,6 +105,9 @@ pub(super) fn run_if_selected() -> bool {
     if !selected {
         return false;
     }
+    if answered_build_probe() {
+        return true;
+    }
     let Some(root) = std::env::var_os("ATERM_CLAUDE_FIXTURE_ROOT").map(PathBuf::from) else {
         return false;
     };
@@ -104,6 +124,12 @@ pub(super) fn run_if_selected() -> bool {
     // SAFETY: getppid observes this synthetic child process's parent without dereferencing data.
     let parent = unsafe { libc::getppid() };
     std::fs::write(root.join("relaunch-parent"), parent.to_string()).unwrap();
+    let mut recorded_argv = Vec::new();
+    for arg in &args {
+        recorded_argv.extend_from_slice(arg.as_bytes());
+        recorded_argv.push(0);
+    }
+    std::fs::write(root.join(format!("launch-{pid}.argv")), recorded_argv).unwrap();
     append(
         &root.join("launches.log"),
         format!("{pid} {}\n", args.join(" ")).as_bytes(),

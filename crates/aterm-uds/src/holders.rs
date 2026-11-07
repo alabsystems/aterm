@@ -2915,14 +2915,16 @@ mod listing_tests {
         use std::os::fd::AsRawFd as _;
         use std::os::unix::net::UnixListener;
         let me = std::process::id();
+        // The forged name holds the folder's path twice, so both names stay short.
         let dir = aterm_tempfile::Builder::new()
+            .prefix("f")
             .tempdir_in("/tmp")
             .expect("a scratch folder short enough for sun_path");
         let base = dir
             .path()
             .canonicalize()
             .expect("the scratch folder's own spelling");
-        let (a, v) = (base.join("a.sock"), base.join("v.sock"));
+        let (a, v) = (base.join("a"), base.join("v"));
         let real = UnixListener::bind(&a).expect("bind a");
         let link = std::fs::read_link(format!("/proc/self/fd/{}", real.as_raw_fd()))
             .expect("the listener's descriptor link");

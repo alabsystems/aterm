@@ -81,6 +81,30 @@ pub fn turn_option_words(rest: &str) -> (Vec<(&str, &str)>, &str) {
     }
 }
 
+/// `why=` of a worker its launcher refused because its CLI is signed out, which only a person can
+/// fix: a stall's reason ([`is_stall_why`]).
+pub const TASK_WHY_SIGNIN: &str = "signin";
+
+/// `why=` of a worker its launcher refused because atpkg's install of its absent program failed:
+/// a stall's reason ([`is_stall_why`]).
+pub const TASK_WHY_INSTALL: &str = "install";
+
+/// `why=` of a worker whose launcher a shutdown or update stopped before its line was typed: a
+/// stall's reason ([`is_stall_why`]).
+pub const TASK_WHY_CANCELLED: &str = "cancelled";
+
+/// Whether a task record's `why=` is a stall's own reason: its worker never started (`startup`,
+/// `shell`), was held past its deadline (`held`), its launcher refused it (`signin`, `install`), or
+/// a shutdown or update stopped its launcher (`cancelled`). A closed record keeps its last `why=`, so
+/// a task that ended where it stalled ends for the stall's reason.
+#[must_use]
+pub fn is_stall_why(why: &str) -> bool {
+    matches!(why, "held" | "startup" | "shell")
+        || why == TASK_WHY_SIGNIN
+        || why == TASK_WHY_INSTALL
+        || why == TASK_WHY_CANCELLED
+}
+
 /// The line a server answers a worker's spawn head (`spawn … agent=<word> len=<n>`) with when it will read the n bytes of task that follow, its newline included.
 #[must_use]
 pub fn task_frame_go(len: usize) -> String {
@@ -2291,13 +2315,15 @@ pub const VERBS: &[VerbSpec] = &[
          `lan`, `ax`, `vault`, `repos`, …). Network: \
          `net=<alab-lan|remote|offline|checking|-> net_kind=<hotspot|lan|cellular|vpn|-> \
          net_since_ms= internet=<ok|down|path-up|unknown|-> internet_ms= \
-         members=<reachable>/<known>|- away_since_ms=` (this Mac's network place, one Mac-wide \
-         answer every reporter words alike: where it is, whether the internet answered a \
-         measurement in this stay (`path-up` is the path alone, never measured), and how much \
-         of the ALab LAN it reaches; `net_since_ms=`, `internet_ms=` and `away_since_ms=` are \
-         unix ms, `-` where unknown; `checking` while a move settles or before any network is \
-         learned as the ALab LAN, which raises nothing; read from the place's record, cached \
-         for 2 s). Presence: \
+         members=<up>/<members>|- away_since_ms=` (this Mac's network place, one Mac-wide \
+         answer every reporter words alike: where it is and whether the internet answered a \
+         measurement in this stay (`path-up` is the path alone, never measured); \
+         `net_since_ms=`, `internet_ms=` and `away_since_ms=` are unix ms, `-` where unknown; \
+         `checking` while a move settles or before any network is learned as the ALab LAN, \
+         which raises nothing; read from the place's record, cached for 2 s. `members=` is \
+         apart from the place: how many of the lab's members presence reads up, from this \
+         window's last read of this Mac's copy (its Fleet glance, macOS with the mesh on; \
+         `aterm fleet` reads it whole), `-` without a fresh one). Presence: \
          `hand=<turn:<id>[:<holder>]|lease:<holder>|driving:<sid>|-> hand_pid= \
          level=<quiet|note|story|driving|driven|attention|limited|hold> story= why= \
          needs=<frozen|stopped|stalled|login|memory|wall|ask|approval|question|-> needs_n= \
@@ -2615,9 +2641,16 @@ pub const VERBS: &[VerbSpec] = &[
          reaped spent between them), each agent tool call the jobs engine saw end \
          (`kind=agent-call`, sampled at its 2 s passes: wall an upper bound, CPU and peak \
          memory lower bounds; its end its leader's exit status, read by a kernel exit watch; \
-         `label=` the program it ran, never the agent's shell wrapper), each `spawn` (`kind=spawn`) and each claim decided in this \
+         `label=` the program it ran, never the agent's shell wrapper), each `spawn` this aterm answered or sent over the fleet (`kind=spawn`, \
+         `on=` the Mac it was sent to), each worker on this Mac's board as its row closes \
+         with the conclusion its Mac reported (`kind=task`: wall from its spawn, outcome its \
+         conclusion, stop its `why=`; a worker's last task row is its end), each claim decided in this \
          account's capacity ledger (`kind=admission`, written by the claimant: `wall_ms` and \
-         `wait_ms` its wait, CPU and peak `na`). The first line is `telemetry \
+         `wait_ms` its wait, CPU and peak `na`) and each build or test such a claim held \
+         (`kind=build`, `kind=test` for the verb `test`, written as its claim ends: `wall_ms` \
+         from its admission, `wait_ms` its admission wait, `peak_bytes` its tree's metered \
+         peak, its end as the process that saw it knows it; `cache=?targo`). An `on=` key, \
+         written only where known, names the fleet node the action ran on. The first line is `telemetry \
          schema=1 rows= dropped= torn= files= bytes= since= oldest= host= facts= dir=` \
          (`dropped=`: rows the writer lost, said by its `gap` lines; `torn=`: lines a crash cut, \
          skipped), then `kind=<k> n= failed= stalled= wall_p50_ms= wall_p90_ms= wall_unknown= \
@@ -2625,8 +2658,8 @@ pub const VERBS: &[VerbSpec] = &[
          kind, and last `calls watched= read= missed=` (this aterm's exit watches on agent \
          calls' leaders, the statuses read, the calls that ended with none). `telemetry rows` prints the newest `--limit` rows (50) as the log spells them: \
          `key=` and `dir=` are digests (`key=-` for a command no program was confirmed for), \
-         `label=` one word (a confirmed program, a shell builtin or keyword, an admission's \
-         claimant) and `sid=` the session's public id, never a command line; \
+         `label=` one word (a confirmed program, a shell builtin or keyword, an admission's or \
+         a build's claimant) and `sid=` the session's public id, never a command line; \
          a figure aterm cannot know reads `?<source>`, naming what would supply it \
          (`cache=?targo`), and `na` where it means nothing for the kind. `--json` answers one \
          object (`kinds`, `host`, and `rows` under `rows`). `aterm help telemetry` has the \
@@ -2710,43 +2743,11 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Lines,
         Session,
-        "sys [<view>] [--json] [since=<c>]: cores, GPU, memory, disk of the machine, aterm and \
-         this tab",
-        "— views: `overview` (default) | `tab` | `aterm` | `global` | `jobs` | `cores` | `gpu` | \
-         `mem` | `disk` | `net` | `procs` | `why` | `left`; options: \
-         `scope=pane|tab|window|aterm|global` \
-         (on resource/job views), `top=<n>` (default 8, max 64), `fresh=<ms>` (0 forces a live \
-         sample; stale replies add `state=stale age_ms=`), `depth=` (on `disk`), `instances=all` \
-         (folded by `aterm ctl`). Header: \
-         `OK <n> sys v=1 view= as_of= age_ms= window_ms= next=<ep>.<seq>`; \
-         `since=<ep>.<seq>` returns changed lines, `same <keys>`, `e` events, or `gap \
-         why=reset|evicted` (`ERR bad since head=` if ahead). Records use `key=value` in base \
-         units (`cpu_mc=`, `fp_bytes=`, `write_bps=`, `busy_pm=`) or `unavailable(<why>)` / \
-         `lane_off:`. `jobs` lists stuck-engine rows (`job id= kind= consumer= … class= [wait=] \
-         [quiet_ms= phi=] verdict= [no_progress=1]`) and `finding` rows. Owner-only \
-         `sys name job=<id>|task=<id>` explicitly samples one quiet waiting job in this \
-         session on macOS. One accepted result per current episode and identity/progress \
-         revision, one in flight per instance; process \
-         identity and job progress are rechecked before publication. Replies \
-         `OK named=<word> job=<id> [holder=unknown] took_ms=<n>` or \
-         `ERR unavailable name why=<reason>`; raw stacks stay private, and a lock name \
-         proves no holder. `--json` returns one schema-1 `sys.name` object. Other platforms \
-         reply `why=unsupported`. `disk` lists roots \
-         (`state=complete|walking|<refusal> alloc_bytes= [walked_entries=] entries= growth_bps=`) \
-         and top `dir` subtrees. Processes print `pid=` and `exe=<word|->` (never argv/env; paths \
-         only for the caller's tab; `caller=` is advisory; machine-wide rows beyond the caller's \
-         scope read `withheld=<n>`). `why [cpu|mem]` says who uses the CPU or memory and why, \
-         with the cause aterm can name, the caller's `you` role and the split; `why` alone picks \
-         what deviates most. `left` (`scope=pane|tab|aterm`; with no `@` target it reads \
-         `scope=aterm`, Owner's alone) lists what closed tabs and dead verify runs left running \
-         and what macOS's program check holds, each with its proof, never a name: `proc pid= \
-         state=program-check|waiting|orphaned|left … tier=auto|offer|name|never \
-         why=live|orphaned|owner-gone|launcher-dead|daemon proof=<w,…|-> from= \
-         [left_of=<sid>] end=<token|->` (`left_of=` on a row that counts in that session's \
-         `status left=`) \
-         and `run id= state=live|dead … left=<n> [next=verify]`; `end <token>` ends an \
-         offered row by its `end=` token, re-proven first (`aterm ctl help end`). See `aterm \
-         help sys` and `await sys`.",
+        "sys [<view>] [<option>…] [--json]: what the machine, aterm and this tab use now",
+        "— `aterm help sys` is the reference: every view (the word after `sys`), option, \
+         header field, record and unit, with examples; `aterm help sys <section>` opens one \
+         part in full (jobs, why, disk, left, cpu, …), and `aterm help sys wait` covers \
+         `await sys`.",
     )
     .forms(&[form(Word("name")).framing(Status)])
     .lane(Wait)
@@ -3693,7 +3694,9 @@ pub const VERBS: &[VerbSpec] = &[
          starts later; an install or sign-in check with no progress for 45 minutes; a program \
          atpkg keeps off, and why; and `no shell prompt`, with what the shell showed: one that drew \
          nothing and used no CPU is stuck at its start, as on a Mac that needs a restart), or \
-         `stalled why=held` if stuck 120 s at an unhandled screen. Refuses with `ERR \
+         `stalled why=held` if stuck 120 s at an unhandled screen, or `stalled why=cancelled` if a \
+         shutdown or update stopped a launch that holds an account scope before it \
+         was typed. Refuses with `ERR \
          unsupervised: <switch>` when the window harness cannot supervise (`[harness] enabled = \
          false`, `headless = false`, or `autopilot = \"off\"`), and with `ERR spawn \
          agent=<word>: <why>` for an agent whose turn end no reader sees yet (`grok`, until \
@@ -3793,7 +3796,7 @@ pub const VERBS: &[VerbSpec] = &[
          program_state=`, a codex's or Grok Build's own report, `-` otherwise). `state=`: `working`, `done` (under Land, a clean `Nothing left:` \
          defense and a `git` check that found nothing left to land where it could read; `aterm help \
          harness` names where it cannot), `exited` (`exit=<code>`), or `stalled` \
-         (`why=startup|shell|held|signin|install`; a `why=startup` one resumes plain `working`, \
+         (`why=startup|shell|held|signin|install|cancelled`; a `why=startup` one resumes plain `working`, \
          with no `why=`, when its agent starts, a `why=held` one `working why=moved` when it \
          moves, and the others stay `stalled` until a `task` mark; a worker a restart brings \
          back is `working why=restored`, or `exited` where its agent does not come back), or \
@@ -3808,8 +3811,9 @@ pub const VERBS: &[VerbSpec] = &[
          says how any ended task ended, once it has: `finished` for `done` and for `exited` \
          after any `done` (which keeps that `why=` and `checked=`), `failed` for `failed`, \
          `stalled` (until it resumes) and any other `exited`. `why=` is \
-         `landed|marker|done-check|exit|shell|startup|held|turn|moved|signin|install|restored|\
-         could-not-finish|off|off-ctl|expired|repeated`. \
+         `landed|marker|done-check|exit|exit-status|no-exit-status|shell|startup|held|turn|moved|\
+         signin|install|cancelled|restored|could-not-finish|usage-limit|off|off-ctl|expired|\
+         repeated`. \
          `checked=` is what aterm checked at the landing that marked it `done` \
          (also on `await task` rows): `<head>@<ref>` where `HEAD`'s 12 digits were on the remote \
          main git named (`3f9a1c2e4b7d@origin/main`), else `pushed`, `no-remote`, `no-repo` or \
@@ -3890,24 +3894,10 @@ pub const VERBS: &[VerbSpec] = &[
          command finishes after the wait is armed, by an OSC 133/633 `D` that follows its `C`, \
          which follows its prompt's `A` and `B`, with no other `A` and no reset (RIS) between \
          them (a `D` out of that order answers nothing; `wait` also answers a command that \
-         already finished). `await sys <condition> \
-         [for=<dur>] [scope=tab|aterm]`: the terms `aterm help sys` lists, joined by `and`; a \
-         bare `quiet` is `cpu<25% wait<0.25 \
-         gpu<10% swap<1MB/s` and a `thermal` level that claims no throttling (below serious; \
-         Linux's estimate at none), a term it cannot measure dropped as \
-         `skipped=<metric>:<why>` (`OK sys <metric>=<value> … held_ms= as_of= next=`, a `job=` \
-         term's reading `job=<id> verdict= class= [wait=] [quiet_ms=] [phi=] [exit=]`; `ERR \
-         unavailable <metric> why=<…>`, `ERR gone job=<id>`). On a volume, one or two of \
-         `free>=<size|room>`, `free><size|room>` (`room` is `status disk_room_mb=`) or \
-         `disk=<word>[,…]` joined by `and`, `[vol=<absolute path>]`: for an owner-class caller \
-         an unmet upward `free` term first frees unused build caches. `free<<size>` and \
-         `free<=<size>` observe low space, use explicit whole sizes (never `room`), and \
-         never request cleanup; they may join `disk=`, never upward admission. Observers \
-         read the volume fresh at arm time, refresh parked readings aged ten seconds, and \
-         refuse a changed/unreadable volume (`disk=` alone only waits) (`OK \
-         sys free_bytes= disk= vol= freed_bytes= held_ms=0 as_of=`, `ERR unmet free_bytes= \
-         need_bytes= vol= freed_bytes= why=<spent|held-back|cleanup-off|settings|not-reclaimed> \
-         hogs= largest_bytes= [key=idle_build_dirs]`, or `ERR unavailable free why=<…>`). \
+         already finished). `await sys <condition> [for=<dur>] \
+         [scope=tab|aterm]`: a machine state, a job's verdict, or a volume's free space (`OK sys \
+         <metric>=<value> … held_ms= as_of=`); every term, value, unit and reply is in `aterm \
+         help sys wait`. \
          `await momentum <floor 0..=1>`: `trail status momentum=` falls to `<floor>` (`OK \
          momentum <v>`). `await inbox since=<id>|re=<off> [topic=<t>] [kinds=<k|hold,...>]`: \
          an inbox row past `since=` of those kinds, a reply to `re=<off>` (an `ack … verdict=` \
@@ -3934,11 +3924,13 @@ pub const VERBS: &[VerbSpec] = &[
          `fact_since=` (by default the `fact_rev` at the wait; a clear wakes nothing), or the \
          session closing (`OK <n>`, or `OK <n> status=timeout`, then `@<sid> rev=<n> \
          state=<working|done|exited|stalled|failed|-|closed> agent=<word> \
-         program_state=<word|-> attention=<pct|-> result_bytes=<n> \
+         program_state=<word|-> attention=<pct|-> result_bytes=<n> [task_state=<state>] \
          [conclusion=<finished|failed>] [why=<word>] [checked=<word>] [left=<word>] \
          [exit=<n>] [fact=<word|-> fact_rev=<n>] task_news=<0|1>` rows, `conclusion=`, `why=`, \
          `checked=`, `left=` and `exit=` as `task` says \
-         (a tab closed on a task with no conclusion reads `conclusion=failed`); \
+         (a tab closed on a task with no conclusion reads `conclusion=failed`; a closed row's \
+         `task_state=` is its record's own state, so `task_state=working conclusion=failed` is \
+         that closed tab's reading, not an end its task came to); \
          `program_state=` is `status program_state=`, a claim that never wakes it). `aterm ctl \
          [--host <h>] await task board …` waits on a `board`'s open rows instead of named sids. \
          `await wake [timeout=<ms>]`: \
@@ -4583,8 +4575,10 @@ pub const VERBS: &[VerbSpec] = &[
          brief=sha256:<64 hex> brief_bytes= from= started_ms= \
          state=<working|done|exited|stalled|failed|closed> rev= conclusion= why= \
          checked=<12 hex>@<ref>|pushed|no-remote|no-repo|gone landed=<12 hex> attention= \
-         accept= accept_ms= heard_ms= after= area=`, values percent-encoded, `-` for none \
-         (`node=-`: this Mac; never the brief's text). A row is written when `aterm ctl \
+         accept= accept_ms= heard_ms= after= area= told=<outcome>.<stop>`, values \
+         percent-encoded, `-` for none (`node=-`: this Mac; never the brief's text; `told=` the \
+         end the worker's last `kind=task` telemetry row told, so a close to the same end writes \
+         no second). A row is written when `aterm ctl \
          [--host <h>|any] spawn agent=… [label=<word>]` starts a worker (`label=` stays on \
          this Mac), and moved on by the aterm serving it, which waits on each open row, and \
          by a wait here that asks a worker where its row says it runs. `aterm ctl board \

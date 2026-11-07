@@ -1,0 +1,309 @@
+//! Resolver support declaration read from the original held image description.
+//! This is a pre-GO protocol predicate, never custody, readiness or authority.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+use std::os::unix::fs::FileExt as _;
+
+use super::*;
+
+const SECTION: &[u8; 16] = b"__trust_resolve\0";
+const TEXT: &[u8; 16] = b"__TEXT\0\0\0\0\0\0\0\0\0\0";
+fn word(bytes: &[u8], offset: usize) -> io::Result<u32> {
+    Ok(u32::from_le_bytes(
+        bytes
+            .get(offset..offset + 4)
+            .ok_or_else(|| refused("truncated resolver Mach-O word"))?
+            .try_into()
+            .map_err(|_| refused("resolver Mach-O word differs"))?,
+    ))
+}
+fn wide(bytes: &[u8], offset: usize) -> io::Result<u64> {
+    Ok(u64::from_le_bytes(
+        bytes
+            .get(offset..offset + 8)
+            .ok_or_else(|| refused("truncated resolver Mach-O address"))?
+            .try_into()
+            .map_err(|_| refused("resolver Mach-O address differs"))?,
+    ))
+}
+fn range(start: u64, length: u64, bound: u64) -> io::Result<std::ops::Range<u64>> {
+    let end = start.checked_add(length).ok_or_else(|| refused("resolver Mach-O range overflow"))?;
+    if end > bound {
+        return Err(refused("resolver Mach-O range exceeds original image"));
+    }
+    Ok(start..end)
+}
+fn overlaps(a: &std::ops::Range<u64>, b: &std::ops::Range<u64>) -> bool {
+    a.start < b.end && b.start < a.end
+}
+fn read(file: &File, output: &mut [u8], offset: u64, deadline: Instant) -> io::Result<()> {
+    let mut cursor = 0;
+    while cursor < output.len() {
+        time(deadline)?;
+        let count = file.read_at(&mut output[cursor..], offset + cursor as u64)?;
+        if count == 0 {
+            return Err(refused("truncated original resolver image"));
+        }
+        cursor += count;
+    }
+    Ok(())
+}
+
+/// All image/section arithmetic is checked before reading the declaration.
+fn marker_offset(header: &[u8], file_length: u64) -> io::Result<u64> {
+    if word(header, 0)? != 0xfeed_facf || word(header, 4)? != 0x0100_000c || word(header, 12)? != 2
+    {
+        return Err(refused("resolver marker requires a thin arm64 Mach-O executable"));
+    }
+    let count = word(header, 16)? as usize;
+    let bytes = word(header, 20)? as usize;
+    if count == 0
+        || count > MAX_COMMANDS
+        || bytes > MAX_COMMAND_BYTES
+        || count > bytes / 8
+        || header.len() != 32 + bytes
+        || header.len() as u64 > file_length
+    {
+        return Err(refused("resolver Mach-O commands exceed bound"));
+    }
+    let mut cursor = 32usize;
+    let mut marker = None;
+    let mut texts = 0;
+    let mut segments = Vec::new();
+    let mut sections = Vec::new();
+    for _ in 0..count {
+        let kind = word(header, cursor)?;
+        let length = word(header, cursor + 4)? as usize;
+        if length < 8 || length % 8 != 0 {
+            return Err(refused("invalid resolver Mach-O command size"));
+        }
+        let next =
+            cursor.checked_add(length).ok_or_else(|| refused("resolver command overflow"))?;
+        let command = header
+            .get(cursor..next)
+            .ok_or_else(|| refused("resolver command extends beyond header"))?;
+        if kind == 0x19 {
+            if length < 72 {
+                return Err(refused("truncated resolver segment"));
+            }
+            let nsects = word(command, 64)? as usize;
+            if nsects > MAX_COMMANDS
+                || nsects.checked_mul(80).and_then(|n| n.checked_add(72)) != Some(length)
+            {
+                return Err(refused("resolver segment section census differs"));
+            }
+            let vm = wide(command, 24)?;
+            let vmsize = wide(command, 32)?;
+            let fileoff = wide(command, 40)?;
+            let filesize = wide(command, 48)?;
+            let vmend =
+                vm.checked_add(vmsize).ok_or_else(|| refused("resolver VM range overflow"))?;
+            let file = range(fileoff, filesize, file_length)?;
+            if !file.is_empty() {
+                segments.push(file.clone());
+            }
+            let text = command.get(8..24) == Some(TEXT.as_slice());
+            if text {
+                texts += 1;
+                if fileoff != 0
+                    || file.end < header.len() as u64
+                    || word(command, 56)? != 5
+                    || word(command, 60)? != 5
+                {
+                    return Err(refused(
+                        "resolver declaration segment is not original read-only text",
+                    ));
+                }
+            }
+            for index in 0..nsects {
+                let section = &command[72 + index * 80..72 + (index + 1) * 80];
+                let address = wide(section, 32)?;
+                let size = wide(section, 40)?;
+                let offset = word(section, 48)? as u64;
+                let flags = word(section, 64)?;
+                let section_type = flags & 0xff;
+                let backed = !matches!(section_type, 1 | 0xc | 0x12);
+                if backed && size != 0 {
+                    let section_file = range(offset, size, file_length)?;
+                    if section_file.start < file.start || section_file.end > file.end {
+                        return Err(refused("resolver section is outside its original segment"));
+                    }
+                    sections.push(section_file);
+                }
+                if section.get(..16) == Some(SECTION.as_slice()) {
+                    if marker.is_some()
+                        || !text
+                        || section.get(16..32) != Some(TEXT.as_slice())
+                        || size != 64
+                        || offset < header.len() as u64
+                        || offset % 8 != 0
+                        || address % 8 != 0
+                        || word(section, 52)? < 3
+                        || word(section, 52)? > 31
+                        || flags & !0x1000_0000 != 0
+                        || word(section, 56)? != 0
+                        || word(section, 60)? != 0
+                        || word(section, 68)? != 0
+                        || word(section, 72)? != 0
+                        || word(section, 76)? != 0
+                        || address < vm
+                        || address.checked_add(size).is_none_or(|end| end > vmend)
+                        || address - vm != offset - fileoff
+                    {
+                        return Err(refused("resolver marker section has unsupported layout"));
+                    }
+                    marker = Some(offset);
+                }
+            }
+        }
+        cursor = next;
+    }
+    if cursor != header.len() || texts != 1 {
+        return Err(refused("resolver text/command census differs"));
+    }
+    for ranges in [&segments, &sections] {
+        for (index, left) in ranges.iter().enumerate() {
+            if ranges[index + 1..].iter().any(|right| overlaps(left, right)) {
+                return Err(refused("resolver image ranges overlap"));
+            }
+        }
+    }
+    marker.ok_or_else(|| refused("original executable does not declare native resolver support"))
+}
+
+pub(super) fn require(file: &File, expected: &[u8; 64], deadline: Instant) -> io::Result<()> {
+    time(deadline)?;
+    if &expected[..16] != b"TRUSTRESOLVER001"
+        || expected[16..]
+            .chunks_exact(8)
+            .map(|v| u64::from_be_bytes(v.try_into().unwrap()))
+            .ne([3, 5, 32, 33, 34, 1])
+    {
+        return Err(refused("unsupported resolver protocol marker format"));
+    }
+    let mut initial = [0u8; 32];
+    read(file, &mut initial, 0, deadline)?;
+    let size = word(&initial, 20)? as usize;
+    if size > MAX_COMMAND_BYTES {
+        return Err(refused("resolver command bytes exceed bound"));
+    }
+    let mut header = vec![0u8; 32 + size];
+    read(file, &mut header, 0, deadline)?;
+    let offset = marker_offset(&header, file.metadata()?.len())?;
+    let mut observed = [0u8; 64];
+    read(file, &mut observed, offset, deadline)?;
+    if &observed != expected {
+        return Err(refused("original resolver protocol declaration differs"));
+    }
+    time(deadline)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn put(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    fn put64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    fn expected() -> [u8; 64] {
+        let mut out = [0; 64];
+        out[..16].copy_from_slice(b"TRUSTRESOLVER001");
+        for (index, value) in [3u64, 5, 32, 33, 34, 1].iter().enumerate() {
+            out[16 + index * 8..24 + index * 8].copy_from_slice(&value.to_be_bytes());
+        }
+        out
+    }
+    fn image() -> Vec<u8> {
+        let mut bytes = vec![0u8; 320];
+        put(&mut bytes, 0, 0xfeed_facf);
+        put(&mut bytes, 4, 0x0100_000c);
+        put(&mut bytes, 12, 2);
+        put(&mut bytes, 16, 1);
+        put(&mut bytes, 20, 152);
+        put(&mut bytes, 32, 0x19);
+        put(&mut bytes, 36, 152);
+        bytes[40..56].copy_from_slice(TEXT);
+        put64(&mut bytes, 56, 0x100000000);
+        put64(&mut bytes, 64, 320);
+        put64(&mut bytes, 80, 320);
+        put(&mut bytes, 88, 5);
+        put(&mut bytes, 92, 5);
+        put(&mut bytes, 96, 1);
+        bytes[104..120].copy_from_slice(SECTION);
+        bytes[120..136].copy_from_slice(TEXT);
+        put64(&mut bytes, 136, 0x100000100);
+        put64(&mut bytes, 144, 64);
+        put(&mut bytes, 152, 256);
+        put(&mut bytes, 156, 3);
+        bytes[256..320].copy_from_slice(&expected());
+        bytes
+    }
+    fn check(bytes: &[u8]) -> io::Result<()> {
+        use std::io::Write as _;
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(bytes).unwrap();
+        require(&file, &expected(), Instant::now() + std::time::Duration::from_secs(2))
+    }
+    #[test]
+    fn original_fd_marker_accepts_only_closed_native_section_and_exact_protocol() {
+        assert!(check(&image()).is_ok());
+        for (offset, value) in [
+            (4, 0x01000007),
+            (12, 6),
+            (88, 7),
+            (92, 7),
+            (152, 128),
+            (156, 2),
+            (160, 1),
+            (164, 1),
+            (168, 1),
+            (176, 1),
+        ] {
+            let mut bytes = image();
+            put(&mut bytes, offset, value);
+            assert!(check(&bytes).is_err(), "offset {offset}");
+        }
+        let mut bytes = image();
+        bytes[300] ^= 1;
+        assert!(check(&bytes).is_err());
+    }
+    #[test]
+    fn same_magic_in_arbitrary_bytes_or_mutable_data_is_no_support_declaration() {
+        let mut bytes = image();
+        bytes[104] = b'X';
+        assert!(check(&bytes).is_err());
+        let mut bytes = image();
+        bytes[40] = b'X';
+        assert!(check(&bytes).is_err());
+        let mut bytes = image();
+        put64(&mut bytes, 144, 65);
+        assert!(check(&bytes).is_err());
+        let mut bytes = image();
+        put64(&mut bytes, 136, u64::MAX);
+        assert!(check(&bytes).is_err());
+    }
+    #[test]
+    fn original_open_description_survives_path_substitution_without_accepting_replacement() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("targo");
+        std::fs::write(&path, image()).unwrap();
+        let original = File::open(&path).unwrap();
+        std::fs::rename(&path, dir.path().join("held")).unwrap();
+        File::create(&path).unwrap().write_all(b"replacement").unwrap();
+        assert!(
+            require(&original, &expected(), Instant::now() + std::time::Duration::from_secs(2))
+                .is_ok()
+        );
+        assert!(
+            require(
+                &File::open(&path).unwrap(),
+                &expected(),
+                Instant::now() + std::time::Duration::from_secs(2)
+            )
+            .is_err()
+        );
+        // HeldProgram's enclosing validate additionally refuses the changed path.
+    }
+}

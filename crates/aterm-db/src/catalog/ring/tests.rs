@@ -330,6 +330,34 @@ fn a_lost_ring_state_leaves_no_ring_storage_behind() {
     }
 }
 
+/// A retirement cut short after it deleted a period's table storage, before its enrollment
+/// claim, leaves the claim alone to hold the period: a ring state lost then is rebuilt holding
+/// it from the claim, and the next writer pass deletes the claim.
+/// NEGATIVE CONTROL: a rebuild that reads the claims folder for `table-<hex>` names (4f9aaa2144)
+/// decodes no claim, holds no period, and leaves the claim behind: `claim left, day 500`.
+#[test]
+fn a_lost_ring_state_rebuilds_a_period_held_by_its_claim_alone() {
+    let lab = Lab::new(&[Role::Writer]);
+    with_writer(&lab, |session, directory| {
+        directory
+            .enroll_ring(session, &CLAIMS, D - 1, at(D, 60))
+            .unwrap();
+        adopt_window(session, directory, D);
+        let scope = CLAIMS.scope(directory.trust, D - 1).unwrap();
+        std::fs::remove_dir_all(directory.path(scope).unwrap()).unwrap();
+        let claims = claim_dir(session).unwrap();
+        let claim = claims.join(claim_name(scope));
+        assert!(claim.exists());
+        std::fs::remove_file(claims.join(CLAIMS.state_name())).unwrap();
+        let rebuilt = directory
+            .rebuild_ring_state(session, &CLAIMS, at(D, 60))
+            .unwrap();
+        assert!(rebuilt.held.contains(&(D - 1)), "held: {:?}", rebuilt.held);
+        directory.retire(session, &CLAIMS, at(D + 500, 60)).unwrap();
+        assert!(!claim.exists(), "claim left, day 500");
+    });
+}
+
 /// A writer pass on a clock three days ahead raises the floor to day D+2 and deletes day D's
 /// window. Back on day D, the window is the clock's again: none of its tables is held yet, a
 /// peer's offer of days D-1 to D+1 is taken up for reading, the tables at and above the floor stay

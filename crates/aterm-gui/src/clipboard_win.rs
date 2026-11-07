@@ -238,6 +238,9 @@ mod tests {
             round_trip_on_a_private_station();
             return;
         }
+        aterm_uds::host::could_not_run_in_session_zero(
+            "the test makes a private window station for its clipboard",
+        );
         let exe = std::env::current_exe().expect("this test binary");
         let out = aterm_uds::spawnfd::command(&exe)
             .args([

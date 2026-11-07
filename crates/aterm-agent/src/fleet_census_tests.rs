@@ -1123,12 +1123,12 @@ fn every_mac_computes_its_census_from_its_own_book_and_dials_no_member() {
     }
     aterm_uds::private_file::ensure_private_dir(&steward_state).unwrap();
     aterm_uds::private_file::ensure_private_dir(&reader_state).unwrap();
-    std::fs::write(
+    crate::test_config::write(
         steward_home.join(".config/aterm/aterm.toml"),
         "[swarm]\nlabel = \"m1\"\n",
     )
     .unwrap();
-    std::fs::write(
+    crate::test_config::write(
         reader_home.join(".config/aterm/aterm.toml"),
         "[swarm]\nlabel = \"m15\"\n",
     )
@@ -1415,7 +1415,7 @@ fn census_excludes_denied_and_log_held_out_members_from_book_facts_and_walled_ac
     // (`ai_pool::system_hostnames`), so a test that names no home names no Mac.
     let home = dir.path().join("home");
     std::fs::create_dir_all(home.join(".config/aterm")).unwrap();
-    std::fs::write(
+    crate::test_config::write(
         home.join(".config/aterm/aterm.toml"),
         "[swarm]\nlabel = \"m1\"\n",
     )
@@ -1565,7 +1565,7 @@ fn denied_node_key_excludes_member_peer_and_pushed_facts_in_census() {
     // (`ai_pool::system_hostnames`), so a test that names no home names no Mac.
     let home = dir.path().join("home");
     std::fs::create_dir_all(home.join(".config/aterm")).unwrap();
-    std::fs::write(
+    crate::test_config::write(
         home.join(".config/aterm/aterm.toml"),
         "[swarm]\nlabel = \"m1\"\n",
     )
@@ -2029,7 +2029,7 @@ fn census_fleet_names_resolve_bound_issuer_book_sequences_reject_impostor_keys_a
     let home = dir.path().join("home");
     aterm_uds::private_file::ensure_private_dir(&state).unwrap();
     std::fs::create_dir_all(home.join(".config/aterm")).unwrap();
-    std::fs::write(
+    crate::test_config::write(
         home.join(".config/aterm/aterm.toml"),
         "[ai]\nmachine = \"m22\"\n",
     )

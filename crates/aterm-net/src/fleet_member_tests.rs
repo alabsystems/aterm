@@ -12348,3 +12348,113 @@ mod heartbeat_descriptor;
 
 #[path = "fleet_member_tests/book_fallback.rs"]
 mod book_fallback;
+
+/// Every failure names its kind as one token of [`REASONS`], and every token but the reader's
+/// own `gone` names some failure; two failures of one kind at two addresses share the token
+/// though their words differ, which is what lets a reader group by it.
+#[test]
+fn reasons_typed_by_producer() {
+    let at: SocketAddr = (Ipv4Addr::new(192, 168, 1, 22), 7681).into();
+    let other: SocketAddr = (Ipv4Addr::new(192, 168, 1, 124), 7681).into();
+    let connect = |at, kind| Unreached::Connect(at, io::Error::from(kind));
+    let hung = Unreached::Handshake(
+        at,
+        FleetError::Io(io::Error::from(io::ErrorKind::UnexpectedEof)),
+    );
+    let within = Duration::from_secs(1);
+    let cases = [
+        (Unreached::Resolve("m22.local".into()), "no-name"),
+        (Unreached::Lookup("m22.local".into(), within), "no-name"),
+        (
+            connect(at, io::ErrorKind::ConnectionRefused),
+            "nothing-listens",
+        ),
+        (connect(at, io::ErrorKind::TimedOut), "no-answer"),
+        (connect(at, io::ErrorKind::WouldBlock), "no-answer"),
+        (Unreached::Deadline(Stage::Connect, within), "no-answer"),
+        (connect(at, io::ErrorKind::HostUnreachable), "no-route"),
+        (connect(at, io::ErrorKind::NetworkUnreachable), "no-route"),
+        (connect(at, io::ErrorKind::PermissionDenied), "refused-here"),
+        (connect(at, io::ErrorKind::ConnectionReset), "reset"),
+        (connect(at, io::ErrorKind::ConnectionAborted), "reset"),
+        (connect(at, io::ErrorKind::AddrNotAvailable), "connect"),
+        (hung, "no-handshake"),
+        (
+            Unreached::Deadline(Stage::Handshake, within),
+            "no-handshake",
+        ),
+        (
+            Unreached::Handshake(at, FleetError::ListenerWrongSecret),
+            "handshake",
+        ),
+        (
+            Unreached::Handshake(at, FleetError::AddressBusy),
+            "handshake",
+        ),
+        (Unreached::Reply(at, "no".into()), "no-reply"),
+        (Unreached::Deadline(Stage::Answer, within), "no-reply"),
+        (Unreached::Deadline(Stage::Book, within), "no-reply"),
+        (
+            Unreached::OtherNode {
+                at,
+                said: "node-a".into(),
+                want: "node-b".into(),
+            },
+            "identity",
+        ),
+        (
+            Unreached::Impostor {
+                at,
+                node: "node-a".into(),
+                issuer: false,
+            },
+            "identity",
+        ),
+        (
+            Unreached::Misnamed {
+                at,
+                proved: "node-a".into(),
+                claimed: "node-b".into(),
+            },
+            "identity",
+        ),
+        (
+            Unreached::Unproved {
+                at,
+                node: "node-a".into(),
+            },
+            "identity",
+        ),
+        (Unreached::Unbound { at, node: None }, "identity"),
+        (Unreached::NotFleet(at), "not-dialled"),
+        (Unreached::Local("no key".into()), "not-dialled"),
+    ];
+    for (why, token) in &cases {
+        assert_eq!(why.reason(), *token, "{why}");
+        assert!(REASONS.contains(&why.reason()), "{why}");
+        assert_eq!(
+            why.copied().reason(),
+            *token,
+            "a copy keeps its kind: {why}"
+        );
+    }
+    for token in REASONS {
+        assert!(
+            *token == "gone" || cases.iter().any(|(_, named)| named == token),
+            "{token} names no failure"
+        );
+    }
+    let here = connect(at, io::ErrorKind::TimedOut);
+    let there = connect(other, io::ErrorKind::TimedOut);
+    assert_ne!(
+        here.to_string(),
+        there.to_string(),
+        "the words name the address"
+    );
+    assert_eq!(here.reason(), there.reason(), "the token does not");
+    assert_ne!(
+        here.reason(),
+        connect(at, io::ErrorKind::ConnectionRefused).reason(),
+        "a refusal is not a silence"
+    );
+}

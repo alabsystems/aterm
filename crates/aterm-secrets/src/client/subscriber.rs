@@ -127,11 +127,10 @@ mod tests {
         .unwrap();
         assert!(!configured_for_recovery(&paths).unwrap());
         save_state(&paths, &State::default()).unwrap();
-        std::fs::write(
+        crate::fsx::write_owned_in_place(
             root.path().join(".config/aterm/aterm.toml"),
             "[swarm]\nenabled = false\n",
-        )
-        .unwrap();
+        );
         assert!(!configured_for_recovery(&paths).unwrap());
     }
 

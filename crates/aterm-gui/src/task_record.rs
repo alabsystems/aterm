@@ -3,6 +3,7 @@
 
 //! Worker session task records (`task`, `task mark`, `await task`, `result`).
 
+use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -155,11 +156,17 @@ pub(crate) const WHY_NO_EXIT_STATUS: &str = "no-exit-status";
 
 /// `why=` of a worker its launcher refused because its CLI is signed out, which only a person
 /// can fix (`task_launch::refused_why`).
-pub(crate) const WHY_SIGNIN: &str = "signin";
+pub(crate) const WHY_SIGNIN: &str = aterm_types::control_verbs::TASK_WHY_SIGNIN;
 
 /// `why=` of a worker its launcher refused because atpkg's install of its absent program failed
 /// (`task_launch::refused_why`).
-pub(crate) const WHY_INSTALL: &str = "install";
+pub(crate) const WHY_INSTALL: &str = aterm_types::control_verbs::TASK_WHY_INSTALL;
+
+/// `why=` of a worker whose launcher a shutdown or update stopped before its line was typed
+/// (`task_launch::stall_cancelled`). No agent ran, so no deadline reads it as a started worker's
+/// stall. It stays until a later mark, or a restore that hands back no shell turns it `exited
+/// why=exit`: a lead starts it again.
+pub(crate) const WHY_CANCELLED: &str = aterm_types::control_verbs::TASK_WHY_CANCELLED;
 
 /// `why=` of a running worker's record after a restore other than a seamless update
 /// (`harness_host::credit_claim::note_restored_worker`, [`seed_restored`]): its worker started
@@ -181,6 +188,7 @@ pub(crate) const TASK_WHY: &[&str] = &[
     "moved",
     WHY_SIGNIN,
     WHY_INSTALL,
+    WHY_CANCELLED,
     WHY_RESTORED,
     WHY_COULD_NOT_FINISH,
     WHY_OFF,
@@ -216,9 +224,10 @@ pub(crate) fn failed_words(state: TaskState, why: Option<&str>) -> String {
     }
 }
 
-/// Whether `why` is a stall's own reason ([`stall_words`] words each).
+/// Whether `why` is a stall's own reason ([`stall_words`] words each): the one list, which a
+/// worker's telemetry row reads too.
 fn is_stall_why(why: &str) -> bool {
-    matches!(why, "held" | "startup" | "shell") || why == WHY_SIGNIN || why == WHY_INSTALL
+    aterm_types::control_verbs::is_stall_why(why)
 }
 
 /// A stalled task's words for a person, by its `why=` (the need's `what` and the menu bar's
@@ -231,6 +240,7 @@ pub(crate) fn stall_words(why: Option<&str>) -> String {
         Some("startup" | "shell") => "never started".to_string(),
         Some(WHY_SIGNIN) => "never started: signed out, a person must sign in".to_string(),
         Some(WHY_INSTALL) => "never started: its program could not be installed".to_string(),
+        Some(WHY_CANCELLED) => "never started: a shutdown or update stopped its launch".to_string(),
         Some(why) => format!("stalled ({why})"),
         None => "stalled".to_string(),
     }
@@ -285,7 +295,8 @@ fn unix_ms_now() -> u64 {
 /// Per-session task record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TaskRecord {
-    /// Monotonic revision incremented on record changes and when [`Self::attention`] moves.
+    /// Monotonic revision incremented on record changes, when [`Self::attention`] moves and when
+    /// an ask joins [`Self::asks`].
     pub(crate) rev: u64,
     /// Current task state.
     pub(crate) state: TaskState,
@@ -325,8 +336,13 @@ pub(crate) struct TaskRecord {
     /// Path to the result file under [`tasks_dir`], if any.
     pub(crate) result_path: Option<PathBuf>,
     /// Whether a supervisor's, a `NEEDS YOU:` or codex-alab's own ask stands on the session
-    /// ([`supervisor_attention`]); a `kind=wait` entry is none.
+    /// ([`supervisor_asks`]); a `kind=wait` entry is none.
     pub(crate) attention: bool,
+    /// The asks behind [`Self::attention`] ([`supervisor_asks`]): one that joins them
+    /// ([`Asks::joins`]) is news, so one raised while another stands moves [`Self::rev`] as the
+    /// first did. The words stay in the session's meta, and neither the wire nor a carry row
+    /// holds the hashes.
+    pub(crate) asks: Asks,
     /// Wall-clock timestamp (unix ms) when the current state was entered.
     pub(crate) since_unix_ms: u64,
     /// Monotonic instant when the current state was entered.
@@ -603,6 +619,7 @@ impl TaskRecord {
                 "1" => true,
                 _ => return None,
             },
+            asks: Asks::default(),
             since_unix_ms,
             since: now.checked_sub(age).unwrap_or(now),
             started_unix_ms,
@@ -816,15 +833,17 @@ impl TaskMark {
         Ok(mark)
     }
 
-    /// Applies this mark to `current` at `now` and `now_unix_ms`, returning `(record, moved)`.
+    /// Applies this mark to `current` with `asks` standing ([`supervisor_asks`]) at `now` and
+    /// `now_unix_ms`, returning `(record, moved)`. The record keeps `asks` though it did not move.
     #[must_use]
     pub(crate) fn apply(
         &self,
         current: Option<&TaskRecord>,
-        attention: bool,
+        asks: &Asks,
         now: Instant,
         now_unix_ms: u64,
     ) -> (TaskRecord, bool) {
+        let attention = !asks.is_empty();
         let from = self
             .from
             .clone()
@@ -845,6 +864,7 @@ impl TaskMark {
                 result_bytes: self.result_bytes,
                 result_path: self.result_path.clone(),
                 attention,
+                asks: asks.clone(),
                 since_unix_ms: now_unix_ms,
                 since: now,
                 started_unix_ms: now_unix_ms,
@@ -887,8 +907,10 @@ impl TaskMark {
             && current.finished == finished
             && current.result_bytes == self.result_bytes
             && current.result_path == self.result_path
-            && current.attention == attention;
+            && current.attention == attention
+            && !asks.joins(&current.asks);
         let mut next = current.clone();
+        next.asks.clone_from(asks);
         if same {
             return (next, false);
         }
@@ -984,13 +1006,105 @@ pub(crate) fn owner_moves_task(owner: &str) -> bool {
     TASK_ATTENTION_OWNERS.contains(&owner)
 }
 
-/// Whether a supervisor's, a worker's `NEEDS YOU:` or codex-alab's own ask stands in `meta`. A
-/// `kind=wait` entry under those owners (a limit the harness waits out) is no news: `await task`
-/// wakes on a worker done, exited, stalled or needing a person, and a wait it sits out is none.
-pub(crate) fn supervisor_attention(meta: &crate::session_timeline::SessionMeta) -> bool {
-    TASK_ATTENTION_OWNERS
-        .iter()
-        .any(|owner| meta.attention_owners.ask(owner).is_some())
+/// [`supervisor_asks`] in `meta` beside the needs sets every reader reads
+/// ([`crate::needs::told_of`]): a proven self-claim's own while it stands
+/// ([`crate::session_timeline::SessionMeta::self_needs`]), else those aterm's own loop told
+/// `timeline`, read under the two locks the caller holds, the meta's taken first.
+pub(crate) fn asks_standing(
+    meta: &crate::session_timeline::SessionMeta,
+    timeline: &crate::session_timeline::SessionTimeline,
+) -> Asks {
+    let told = meta
+        .self_needs(crate::metrics::now_us())
+        .unwrap_or_else(|| timeline.harness_needs());
+    supervisor_asks(meta, &told)
+}
+
+/// The supervisor's, the worker's `NEEDS YOU:` and codex-alab's own asks standing in `meta`
+/// ([`TaskRecord::asks`]): one hash of each owner and its words and, where a set whoever drives
+/// the worker told the window describes the needs entry (`told`,
+/// [`crate::needs::ToldNeeds::words_for`]), one of each need of it, since the entry names only
+/// the first and a count: a set whose first and count hold while a need changes keeps its words,
+/// and one need taken down rewrites them. A `kind=wait` entry under those owners (a limit the
+/// harness waits out) is no news: `await task` wakes on a worker done, exited, stalled or needing
+/// a person, and a wait it sits out is none.
+pub(crate) fn supervisor_asks(
+    meta: &crate::session_timeline::SessionMeta,
+    told: &crate::needs::ToldNeeds,
+) -> Asks {
+    use std::hash::{Hash, Hasher};
+    let hash = |owner: &str, words: &str| {
+        let mut hash = std::hash::DefaultHasher::new();
+        (owner, words).hash(&mut hash);
+        hash.finish()
+    };
+    let mut asks = Asks::default();
+    for owner in TASK_ATTENTION_OWNERS {
+        let Some(text) = meta.attention_owners.ask(owner) else {
+            continue;
+        };
+        if owner == crate::harness_host::NEEDS_ATTENTION_OWNER {
+            asks.entry = Some(hash(owner, text));
+            asks.needs = told
+                .words_for(Some(text))
+                .map(|needs| needs.iter().map(|need| hash(owner, need)).collect());
+        } else {
+            asks.owners.insert(hash(owner, text));
+        }
+    }
+    asks
+}
+
+/// THE ASKS STANDING UNDER THE TASK OWNERS ([`supervisor_asks`]): one hash of each owner's words
+/// and, for the worker's `NEEDS YOU:` entry, of each need a told set describing it names.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Asks {
+    /// One hash of each owner but the needs owner and its words: the supervisor's, codex-alab's.
+    owners: BTreeSet<u64>,
+    /// One hash of the needs owner's entry and its words, where one stands.
+    entry: Option<u64>,
+    /// One hash of each need the set describing [`Self::entry`] names; `None` where no told set
+    /// describes it.
+    needs: Option<BTreeSet<u64>>,
+}
+
+impl Asks {
+    /// Whether no ask stands: the task record's attention is down.
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.owners.is_empty() && self.entry.is_none()
+    }
+
+    /// Whether an ask here joins those of `before`, which is news: an owner's words not among
+    /// them, or a needs entry where none stood. Beside a needs entry that stood, a need joins
+    /// where told sets describe both entries and a need here is not among those before, though
+    /// the words hold (one taken down rewrites them and is none); where a told set describes
+    /// neither or only one of the two, the words decide, so the same entry is no news however
+    /// its needs are known: the told set does not cross a seamless update ([`seed_carried`]),
+    /// and a proven self-claim's goes when that claim lapses.
+    #[must_use]
+    pub(crate) fn joins(&self, before: &Self) -> bool {
+        if !self.owners.is_subset(&before.owners) {
+            return true;
+        }
+        let Some(entry) = self.entry else {
+            return false;
+        };
+        match (&self.needs, &before.needs, before.entry) {
+            (_, _, None) => true,
+            (Some(now), Some(was), Some(_)) => !now.is_subset(was),
+            (_, _, Some(was)) => entry != was,
+        }
+    }
+
+    /// Asks of these owners' hashes alone, for a test that needs asks but not their words.
+    #[cfg(test)]
+    pub(crate) fn of_owners(hashes: impl IntoIterator<Item = u64>) -> Self {
+        Self {
+            owners: hashes.into_iter().collect(),
+            ..Self::default()
+        }
+    }
 }
 
 /// Error returned when a mark times out waiting on a committing update's session fence.
@@ -1045,6 +1159,12 @@ pub(crate) enum AttentionEdit<'a> {
     Keep,
     /// Raise the attention entry with the given text.
     Raise(&'a str),
+    /// Raise the attention entry with the given text, which restates an ask another owner raised
+    /// or took down (a startup stall following codex-alab's words,
+    /// `harness_host::StartupMark::Restated`): with no mark, the record keeps the asks then
+    /// standing and moves its rev only where its attention flag flips, since the owner's own
+    /// write was the news.
+    Restate(&'a str),
     /// Clear the attention entry if the predicate holds on the standing text.
     TakeDown(fn(Option<&str>) -> bool),
 }
@@ -1069,7 +1189,7 @@ pub(crate) fn mark_session_task_seen(
     fence_wait: std::time::Duration,
     when: impl FnOnce(&crate::session_timeline::SessionTimeline) -> bool,
 ) -> Result<Option<(TaskRecord, bool)>, MarkFenced> {
-    let marked = mark_on_timeline(
+    let marked = mark_session_task_with_timeline(
         ctx,
         local_id,
         Some(mark),
@@ -1089,7 +1209,7 @@ pub(crate) fn mark_session_task_with(
     fence_wait: std::time::Duration,
     when: impl FnOnce(Option<&TaskRecord>, Option<&str>) -> bool,
 ) -> Result<Option<MarkedWith>, MarkFenced> {
-    mark_on_timeline(
+    mark_session_task_with_timeline(
         ctx,
         local_id,
         mark,
@@ -1100,7 +1220,8 @@ pub(crate) fn mark_session_task_with(
 }
 
 /// [`mark_session_task_with`], its `when` reading the whole timeline.
-fn mark_on_timeline(
+/// The predicate runs with metadata and timeline locked; it must not acquire either lock.
+pub(crate) fn mark_session_task_with_timeline(
     ctx: &SessionCtx,
     local_id: u64,
     mark: Option<&TaskMark>,
@@ -1119,11 +1240,13 @@ fn mark_on_timeline(
             }
             let attention_moved = match edit {
                 AttentionEdit::Keep => false,
-                AttentionEdit::Raise(text) => crate::session_timeline::put_supervisor_attention(
-                    &mut meta,
-                    &mut timeline,
-                    Some(text),
-                ),
+                AttentionEdit::Raise(text) | AttentionEdit::Restate(text) => {
+                    crate::session_timeline::put_supervisor_attention(
+                        &mut meta,
+                        &mut timeline,
+                        Some(text),
+                    )
+                }
                 AttentionEdit::TakeDown(stands) => {
                     stands(meta.attention_owners.get(owner))
                         && crate::session_timeline::put_supervisor_attention(
@@ -1133,15 +1256,19 @@ fn mark_on_timeline(
                         )
                 }
             };
-            let attention = supervisor_attention(&meta);
+            let asks = asks_standing(&meta, &timeline);
             let (record, moved) = match mark {
                 Some(mark) => {
                     let (record, moved) =
-                        timeline.mark_task(mark, attention, Instant::now(), unix_ms_now());
+                        timeline.mark_task(mark, &asks, Instant::now(), unix_ms_now());
                     (Some(record), moved)
                 }
                 None => {
-                    let moved = timeline.note_task_attention(attention);
+                    let moved = if matches!(edit, AttentionEdit::Restate(_)) {
+                        timeline.restate_task_attention(asks)
+                    } else {
+                        timeline.note_task_attention(asks)
+                    };
                     (timeline.task().cloned(), moved)
                 }
             };
@@ -1614,7 +1741,10 @@ pub(crate) fn note_program_block(
         .unwrap_or(false)
 }
 
-/// Restores a carried task record onto `ctx` during seamless-update adoption.
+/// Restores a carried task record onto `ctx` during seamless-update adoption, with the asks the
+/// carried escalations stand as ([`asks_standing`]). The told NEEDS YOU sets do not cross, so the
+/// needs entry's words stand for it until its loop tells the set again, which is no news by
+/// itself ([`Asks::joins`]).
 pub(crate) fn seed_carried(ctx: &SessionCtx, row: Option<&str>) {
     let Some(row) = row else {
         return;
@@ -1628,11 +1758,13 @@ pub(crate) fn seed_carried(ctx: &SessionCtx, row: Option<&str>) {
         return;
     };
     record.carried_entered = Some(record.entered);
-    record.attention = supervisor_attention(&ctx.meta.lock().unwrap_or_else(|p| p.into_inner()));
-    ctx.timeline
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .seed_task(record);
+    let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+    record.asks = asks_standing(&meta, &timeline);
+    record.attention = !record.asks.is_empty();
+    timeline.seed_task(record);
+    drop(timeline);
+    drop(meta);
     crate::session_timeline::keep_worker_autopilot(ctx);
 }
 
@@ -1898,7 +2030,10 @@ pub(crate) fn parse_await_task(words: &[&str], list: bool) -> Result<AwaitTaskAr
 /// record's fact word was ever edited, [`TaskRecord::push_fact`]); `program` is the
 /// `program_state=` column, a claim shown
 /// beside `agent=` that no wait reads. A tab closed on a task with no conclusion yet reads
-/// `conclusion=failed`: nothing is left to finish it.
+/// `conclusion=failed`: nothing is left to finish it. A closed row also says its record's own
+/// state, ` task_state=`, before its conclusion: `task_state=working conclusion=failed` is the
+/// closed tab's reading, not an end the task came to (a board writes no task row of it,
+/// `aterm_ctl::fleet_telemetry`).
 #[must_use]
 pub(crate) fn await_row(
     sid: &str,
@@ -1916,6 +2051,10 @@ pub(crate) fn await_row(
          attention={attention} result_bytes={result_bytes}"
     );
     if let Some(record) = record {
+        if closed {
+            row.push_str(" task_state=");
+            row.push_str(record.state.as_str());
+        }
         let conclusion = record.conclusion().or(closed.then_some(Conclusion::Failed));
         if let Some(conclusion) = conclusion {
             row.push_str(" conclusion=");

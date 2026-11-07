@@ -162,8 +162,50 @@ fn ok(r: (Result<Outcome>, Transcript)) -> (Outcome, Transcript) {
 
 #[test]
 fn missing_declared_gnu_git_rows_are_acquired_without_a_repo_build_and_resume_to_publication() {
-    let fx = Fx::at(scratch("linux-upstream-git"));
-    fx.publish_pkg("git", 12, &manifest("git", 12, &DARWIN));
+    use atpkg_publish::artifact::pkgdoc::{self, BottleRow, Header, Kind};
+
+    // Preserve the ordinary missing-row producer route as well as retained-package reuse.
+    {
+        let fx = Fx::at(scratch("linux-upstream-git"));
+        fx.publish_pkg("git", 12, &manifest("git", 12, &DARWIN));
+        fx.publish_head(7, &[("git", 12)]);
+        let w = World::of(fx);
+        w.fx.packer.upstream.store(true, Ordering::SeqCst);
+        w.builder.0.lock().unwrap().clear();
+        w.keyless();
+        let (dry, _) = ok(w.run(true));
+        assert!(matches!(decision(&dry, "git"), Decision::Build { .. }));
+        assert!(w.fx.packer.legs().is_empty());
+        let (staged, _) = ok(w.run(false));
+        assert_eq!(staged.staged, ["git"]);
+        assert_eq!(staged.ready, ["git"]);
+        assert!(staged.signed.is_empty());
+        assert_eq!(w.fx.packer.legs().len(), 2);
+        assert!(
+            w.fx.packer
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|r| r.checkout.as_os_str().is_empty())
+        );
+        assert!(w.fx.calls("clone ").is_empty());
+        w.rekey();
+        let (published, _) = ok(w.run(false));
+        assert_eq!(published.signed, ["git"]);
+        assert_eq!(w.fx.packer.legs().len(), 2);
+        let (complete, _) = ok(w.run(true));
+        assert_eq!(*decision(&complete, "git"), Decision::Ok);
+    }
+    let fx = Fx::at(scratch("linux-retained-git"));
+    let public = manifest("git", 12, &DARWIN)
+        .replacen("schema = 2", "schema = 1", 1)
+        .replacen(
+            "build_number = 12\n",
+            "build_number = 12\nexposes = [\"git\"]\n",
+            1,
+        );
+    fx.publish_pkg("git", 12, &public);
     fx.publish_head(7, &[("git", 12)]);
     let w = World::of(fx);
     w.fx.packer.upstream.store(true, Ordering::SeqCst);
@@ -172,19 +214,106 @@ fn missing_declared_gnu_git_rows_are_acquired_without_a_repo_build_and_resume_to
     let (dry, _) = ok(w.run(true));
     assert!(matches!(decision(&dry, "git"), Decision::Build { .. }));
     assert!(w.fx.packer.legs().is_empty());
+    let mut retained = Vec::new();
+    for target in [X86, ARM] {
+        let dir = w.fx.tmp.path().join(format!("retained-{target}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = format!("fixture qualified payload {target}").into_bytes();
+        let row = BottleRow {
+            triple: target,
+            kind: Kind::ElfBinary,
+            asset: pkgdoc::asset_name("git", 12, target),
+            sha256: atpkg::tree::sha256_bytes(&archive),
+            tree_root: "cd".repeat(32),
+            size: archive.len() as u64,
+            disk_installed: archive.len() as u64,
+        };
+        let header = Header {
+            program: "git".into(),
+            version: "1.0.0".into(),
+            build: 12,
+            exposes: vec!["git".into()],
+            shim_env: Vec::new(),
+        };
+        let path = dir.join("pkg-git-12.toml");
+        std::fs::write(dir.join(&row.asset), &archive).unwrap();
+        std::fs::write(&path, pkgdoc::fresh_bottle(&header, &row).unwrap().bytes()).unwrap();
+        retained.push(path);
+    }
+    let staged_paths =
+        atpkg_publish::lane::reuse::stage(&w.fx.ctx, &retained, &w.fx.packer).unwrap();
+    assert_eq!(
+        staged_paths,
+        [linux::staged_manifest(&w.staged(), "git", 12)]
+    );
+    let bytes = std::fs::read(&staged_paths[0]).unwrap();
+    assert!(
+        bytes.starts_with(public.as_bytes()),
+        "old Darwin bytes are never rewritten"
+    );
+    assert!(!staged_paths[0].with_extension("toml.sig").exists());
+    assert!(
+        w.fx.packer.legs().is_empty(),
+        "retained bytes start no build/pack"
+    );
+    atpkg_publish::lane::reuse::stage(&w.fx.ctx, &retained, &w.fx.packer).unwrap();
+    assert_eq!(
+        std::fs::read(&staged_paths[0]).unwrap(),
+        bytes,
+        "repeat import is unchanged"
+    );
+    assert_eq!(
+        w.fx.public_asset("git", 12, "pkg-git-12.toml").unwrap(),
+        public.as_bytes()
+    );
+    let wrong_pin = w.fx.tmp.path().join("wrong-pin.toml");
+    std::fs::write(
+        &wrong_pin,
+        std::fs::read_to_string(&retained[0])
+            .unwrap()
+            .replace("build_number = 12", "build_number = 13"),
+    )
+    .unwrap();
+    let before = w.fx.packer.reused.lock().unwrap().len();
+    assert!(atpkg_publish::lane::reuse::stage(&w.fx.ctx, &[wrong_pin], &w.fx.packer).is_err());
+    assert_eq!(
+        w.fx.packer.reused.lock().unwrap().len(),
+        before,
+        "wrong pin reaches no artifact admission"
+    );
+    // A fresh signed owner extension that is not our stage's prefix cannot be overwritten.
+    let arm = atpkg_publish::lane::rows::local(&retained[1]).unwrap();
+    let row = arm.artifact_for(ARM.as_str()).unwrap();
+    let newer = pkgdoc::merge_bottle(
+        public.as_bytes().to_vec(),
+        &Header {
+            program: "git".into(),
+            version: "1.0.0".into(),
+            build: 12,
+            exposes: vec!["git".into()],
+            shim_env: Vec::new(),
+        },
+        &BottleRow {
+            triple: ARM,
+            kind: Kind::ElfBinary,
+            asset: row.asset.clone(),
+            sha256: row.sha256.clone(),
+            tree_root: row.tree_root.clone(),
+            size: row.size,
+            disk_installed: row.cost.disk_installed,
+        },
+    )
+    .unwrap();
+    w.fx.publish_pkg("git", 12, std::str::from_utf8(newer.bytes()).unwrap());
+    assert!(atpkg_publish::lane::reuse::stage(&w.fx.ctx, &retained, &w.fx.packer).is_err());
+    assert_eq!(std::fs::read(&staged_paths[0]).unwrap(), bytes);
+    w.fx.publish_pkg("git", 12, &public);
+
     let (staged, _) = ok(w.run(false));
-    assert_eq!(staged.staged, ["git"]);
+    assert!(staged.staged.is_empty());
     assert_eq!(staged.ready, ["git"]);
     assert!(staged.signed.is_empty());
-    assert_eq!(w.fx.packer.legs().len(), 2);
-    assert!(
-        w.fx.packer
-            .requests
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|request| request.checkout.as_os_str().is_empty())
-    );
+    assert!(w.fx.packer.legs().is_empty());
     assert!(
         w.fx.calls("clone ").is_empty(),
         "an upstream Git package is not built from the aterm repo"
@@ -192,9 +321,8 @@ fn missing_declared_gnu_git_rows_are_acquired_without_a_repo_build_and_resume_to
     w.rekey();
     let (published, _) = ok(w.run(false));
     assert_eq!(published.signed, ["git"]);
-    assert_eq!(
-        w.fx.packer.legs().len(),
-        2,
+    assert!(
+        w.fx.packer.legs().is_empty(),
         "staged qualified rows are reused"
     );
     let (complete, _) = ok(w.run(true));

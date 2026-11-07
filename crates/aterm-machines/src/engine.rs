@@ -131,6 +131,10 @@ impl aterm_converge::Item for Bound<'_> {
         self.item.refresh(self.sys, self.ctx)
     }
 
+    fn refresh_changes(&self) -> bool {
+        self.item.refresh_changes(self.sys, self.ctx)
+    }
+
     fn activation(&self) -> Option<Arc<dyn aterm_converge::Activation + '_>> {
         self.item.activation().map(|inner| {
             Arc::new(BoundActivation {

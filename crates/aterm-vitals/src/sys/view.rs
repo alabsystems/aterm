@@ -348,7 +348,7 @@ fn global_clauses(ctx: &Ctx<'_>, s: &Snapshot) -> Vec<String> {
         parts.push(t.phrase());
     }
     if let Some(w) = s.global.wait.filter(|w| *w >= 0.1) {
-        parts.push(format!("≥{} waiting for a core (own processes)", c1(w)));
+        parts.push(format!("≥{} waiting for a core (your processes)", c1(w)));
     }
     if s.gpu_sample().is_some() {
         parts.push(format!("GPU {}", gpu_words(s)));
@@ -831,9 +831,17 @@ fn overview_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     if let Some(r) = rest_line(ctx, s, &tab) {
         lines.push(r);
     }
+    let views: Vec<&str> = View::ALL
+        .iter()
+        .filter(|v| **v != View::Overview)
+        .map(|v| v.word())
+        .collect();
     lines.push(note(
         "more",
-        "more=views:tab,aterm,global,jobs,cores,gpu,mem,disk,net,procs,why · aterm ctl @self sys --json",
+        format!(
+            "more=views:{} · aterm ctl @self sys --json · aterm help sys",
+            views.join(",")
+        ),
     ));
 }
 
@@ -1222,7 +1230,7 @@ fn global_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>)
             .map_or_else(|| unavailable("not_sampled"), |w| format!("≥{}", c2(w)))
     );
     th.push_str(&format!(
-        " (own processes; {} other-user processes unread)",
+        " (your processes; {} other-user processes unread)",
         s.global.refused
     ));
     if let Some(l) = s.load {
@@ -1320,7 +1328,7 @@ fn gpu_words(s: &Snapshot) -> String {
     };
     let mut t = g.device_pct.map_or_else(
         || format!("{} busy", unavailable("not_sampled:device_utilization")),
-        |pct| format!("{}% busy, whole percent", pct.min(100)),
+        |pct| format!("{}% busy device-wide", pct.min(100)),
     );
     if let Some(name) = g.name.as_deref() {
         t.push_str(&format!(" · {}", device_word(name)));
@@ -1329,7 +1337,7 @@ fn gpu_words(s: &Snapshot) -> String {
         t.push_str(&format!(" · {cores} cores"));
     }
     if let (Some(r), Some(ti)) = (g.renderer_pct, g.tiler_pct) {
-        t.push_str(&format!(" (renderer {r}, tiler {ti})"));
+        t.push_str(&format!(" · renderer {r}%, tiler {ti}%"));
     }
     if let Some(b) = g.in_use_bytes {
         t.push_str(&format!(" · {} in use", words::mem(b)));

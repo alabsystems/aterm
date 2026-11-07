@@ -302,6 +302,57 @@ pub const BROWSER_ARM64: &[&str] = &[
     "libxrender1",
 ];
 
+/// The libraries the browser lane's aarch64 WebKit loads (`linux browser`'s webkit session): every
+/// `NEEDED` entry of Playwright's WPE MiniBrowser bundle for Ubuntu 24.04 on arm64 (build 2359: its
+/// `bin/` and `lib/`, and the `sys/lib/` it carries) that the bundle does not carry, as the guest's
+/// own packages, and the EGL and GLES that libepoxy opens at run time.
+pub const BROWSER_WEBKIT_ARM64: &[&str] = &[
+    "libatk-bridge2.0-0t64",
+    "libatk1.0-0t64",
+    "libavif16",
+    "libdrm2",
+    "libegl1",
+    "libenchant-2-2",
+    "libepoxy0",
+    "libevent-2.1-7t64",
+    "libexpat1",
+    "libflite1",
+    "libfontconfig1",
+    "libfreetype6",
+    "libgbm1",
+    "libgcrypt20",
+    "libgles2",
+    "libglib2.0-0t64",
+    "libgpg-error0",
+    "libgstreamer-gl1.0-0",
+    "libgstreamer-plugins-bad1.0-0",
+    "libgstreamer-plugins-base1.0-0",
+    "libgstreamer1.0-0",
+    "libharfbuzz-icu0",
+    "libharfbuzz0b",
+    "libhyphen0",
+    "libicu74",
+    "libjpeg-turbo8",
+    "liblcms2-2",
+    "libmanette-0.2-0",
+    "libnghttp2-14",
+    "libopus0",
+    "libpng16-16t64",
+    "libpsl5t64",
+    "libsqlite3-0",
+    "libsystemd0",
+    "libtasn1-6",
+    "libwayland-client0",
+    "libwayland-egl1",
+    "libwayland-server0",
+    "libwebp7",
+    "libwebpdemux2",
+    "libwebpmux3",
+    "libxkbcommon0",
+    "libxml2",
+    "libxslt1.1",
+];
+
 /// Every package the guest installs, `:amd64` names last, and those only when `x86_64`.
 #[must_use]
 pub fn packages_for(x86_64: bool) -> Vec<String> {
@@ -309,7 +360,8 @@ pub fn packages_for(x86_64: bool) -> Vec<String> {
         .iter()
         .chain(DEV_LIBRARIES)
         .chain(MESA)
-        .chain(BROWSER_ARM64);
+        .chain(BROWSER_ARM64)
+        .chain(BROWSER_WEBKIT_ARM64);
     let foreign = DEV_LIBRARIES
         .iter()
         .chain(MESA)

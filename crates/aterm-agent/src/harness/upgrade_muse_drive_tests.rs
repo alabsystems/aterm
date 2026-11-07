@@ -255,6 +255,10 @@ impl Kernel for Script {
             _ => None,
         }
     }
+
+    fn restart_background(&self, _: u32) -> Vec<String> {
+        crate::harness::upgrade_drive::tests::unstated("background")
+    }
 }
 
 impl MuseKernel for Script {
@@ -2427,4 +2431,26 @@ fn holders_in_reports_live_tui_and_ignores_non_tui_commands() {
             "non-TUI argv {argv:?} must not count as a live TUI holder without live_tabs"
         );
     }
+}
+
+/// A Muse Code session folder reached by a symbolic link (a year kept on another volume) is read
+/// through it, as `Path::is_dir` reads one: the session's lock is found there.
+/// NEGATIVE CONTROL: the entry's own type alone (`DirEntry::file_type().is_dir()` in
+/// `child_dirs`, 9445f7df77) passes the linked year over: `left: None`.
+#[cfg(unix)]
+#[test]
+fn a_session_lock_under_a_linked_year_is_found() {
+    let dir = scratch("linked-year");
+    let root = dir.join("sessions");
+    let real = dir.join("volume/2026");
+    let session = real.join("10/17").join(S1);
+    std::fs::create_dir_all(&session).expect("session");
+    std::fs::write(session.join(mz::LOCK), "{}").expect("lock");
+    std::fs::create_dir_all(&root).expect("root");
+    std::os::unix::fs::symlink(&real, root.join("2026")).expect("linked year");
+    assert_eq!(
+        find_lock(&root, S1),
+        Some(root.join("2026/10/17").join(S1).join(mz::LOCK))
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

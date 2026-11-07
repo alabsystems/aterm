@@ -879,7 +879,10 @@ mod live_tests {
         /// its exec is done: the kernel names the task after the copy (`comm`) only after it has
         /// settled the task's dumpability (`begin_new_exec`).
         fn start(copy: &Path, mode: u32, held: &Path) -> Self {
-            std::fs::copy("/bin/sleep", copy).expect("copy /bin/sleep");
+            // A child writes the copy (`copy_regular_fresh`), so no fork another test makes holds
+            // it open for writing past the spawn's `ETXTBSY` retries.
+            crate::deadline::copy_regular_fresh(Path::new("/bin/sleep"), copy)
+                .expect("copy /bin/sleep");
             std::fs::set_permissions(copy, std::fs::Permissions::from_mode(mode)).expect("chmod");
             let file = std::fs::File::open(held).expect("open the held file");
             let sleeper = Self(

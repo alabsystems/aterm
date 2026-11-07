@@ -608,7 +608,7 @@ fn a_pass_leaves_a_package_target_to_its_second_run() {
     let first = super::super::reclaim_dead_on(
         &world.home,
         now,
-        after,
+        after.into(),
         None,
         &mut |_, _| {
             asked += 1;
@@ -622,7 +622,7 @@ fn a_pass_leaves_a_package_target_to_its_second_run() {
     let second = super::super::reclaim_live_on(
         &world.home,
         now,
-        after,
+        after.into(),
         None,
         &mut |_, _| {
             asked += 1;

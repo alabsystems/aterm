@@ -73,12 +73,57 @@ pub const fn paced(place: &Place) -> bool {
         )
 }
 
-/// Whether the automatic LAN lanes pace themselves now under the state root `state`
-/// ([`paced`] of [`crate::keeper::read_cached`]).
+/// Whether the automatic LAN lanes pace themselves now under the state root `state`.
+/// Reuses only the pacing decision for [`crate::keeper::CACHE_FOR`], not a place snapshot;
+/// fresh LAN admission proof remains independent of this scheduling hint.
 #[cfg(unix)]
 #[must_use]
 pub fn paced_now(state: &Path) -> bool {
-    paced(&crate::keeper::read_cached(state))
+    {
+        let cache = PACING.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(value) = cache.get(state, std::time::Instant::now()) {
+            return value;
+        }
+    }
+    let value = paced(&crate::keeper::read(state));
+    // Observation time precedes any wait for the publishing lock, so contention
+    // cannot extend the freshness window of a completed read.
+    let at = std::time::Instant::now();
+    PACING
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remember(state, at, value);
+    value
+}
+
+#[cfg(unix)]
+static PACING: Mutex<PacingCache> = Mutex::new(PacingCache { entry: None });
+
+/// The last pacing decision, keyed by state root and observation time.
+#[cfg(unix)]
+#[derive(Default)]
+struct PacingCache {
+    entry: Option<(PathBuf, std::time::Instant, bool)>,
+}
+
+#[cfg(unix)]
+impl PacingCache {
+    fn get(&self, state: &Path, now: std::time::Instant) -> Option<bool> {
+        self.entry.as_ref().and_then(|(root, at, value)| {
+            (root == state && now.duration_since(*at) < crate::keeper::CACHE_FOR).then_some(*value)
+        })
+    }
+
+    fn remember(&mut self, state: &Path, at: std::time::Instant, value: bool) {
+        if let Some((root, held_at, held_value)) = &mut self.entry
+            && root == state
+        {
+            *held_at = at;
+            *held_value = value;
+            return;
+        }
+        self.entry = Some((state.to_path_buf(), at, value));
+    }
 }
 
 /// The local address the route to an address takes (`route_source_ipv4`), injected.
@@ -344,6 +389,64 @@ impl Round {
 mod tests {
     use super::*;
     use crate::place::{Answer, InternetState, member_key};
+
+    #[cfg(unix)]
+    #[test]
+    fn pacing_cache_separates_roots_and_expires_at_the_existing_boundary() {
+        let mut cache = PacingCache::default();
+        let first = Path::new("fixture/first");
+        let other = Path::new("fixture/other");
+        let at = std::time::Instant::now();
+        let due = at + crate::keeper::CACHE_FOR;
+        assert_eq!(cache.get(first, at), None);
+        cache.remember(first, at, true);
+        assert_eq!(cache.get(first, at), Some(true));
+        assert_eq!(cache.get(other, at), None, "another root never borrows it");
+        assert_eq!(
+            cache.get(first, due - std::time::Duration::from_nanos(1)),
+            Some(true)
+        );
+        assert_eq!(cache.get(first, due), None, "the boundary is exclusive");
+        assert_eq!(
+            cache.get(first, due + std::time::Duration::from_secs(1)),
+            None
+        );
+        cache.remember(first, due, false);
+        assert_eq!(
+            cache.get(first, due),
+            Some(false),
+            "refresh replaces the decision"
+        );
+        cache.remember(other, due, true);
+        assert_eq!(cache.get(other, due), Some(true));
+        assert_eq!(cache.get(first, due), None, "only the last root is cached");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pacing_cache_hits_and_same_root_refreshes_allocate_nothing() {
+        let mut cache = PacingCache::default();
+        let root = Path::new("fixture/pacing-state");
+        let at = std::time::Instant::now();
+        let (_, control) =
+            aterm_heap_count::allocations_in(|| std::hint::black_box(root.to_path_buf()));
+        assert!(control > 0, "the allocation counter sees an owned root");
+        cache.remember(root, at, true);
+        let (_, allocations) = aterm_heap_count::allocations_in(|| {
+            for step in 0..64 {
+                let now = at + std::time::Duration::from_nanos(step);
+                cache.remember(root, now, step % 2 == 0);
+                assert_eq!(
+                    std::hint::black_box(cache.get(root, now)),
+                    Some(step % 2 == 0)
+                );
+            }
+        });
+        assert_eq!(
+            allocations, 0,
+            "the cache retains only its root and a boolean"
+        );
+    }
 
     const HOTSPOT_ADDR: Ipv4Addr = Ipv4Addr::new(172, 20, 10, 2);
 

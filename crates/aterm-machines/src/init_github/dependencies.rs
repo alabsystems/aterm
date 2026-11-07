@@ -27,14 +27,18 @@ fn require_local_reads(sys: &dyn System, user: &User, repo: &Repo) -> Result<(),
     if repo.required_submodules.is_empty() {
         return Ok(());
     }
-    // The environment variable can be silently ignored by older Git. Its equivalent
-    // global option must be recognized before any object read or submodule operation.
-    let ran = sys.run_complete_stdout(&local(sys, user, None).arg("--version"))
-        .map_err(|_| "cannot check Git's --no-lazy-fetch capability; required dependencies stay untouched")?;
-    if !ran.success() {
+    if !supports_local_reads(sys, user)? {
         return Err("Git must support --no-lazy-fetch to inspect required dependencies safely; required dependencies stay untouched".into());
     }
     Ok(())
+}
+
+/// The selected executable must recognize the option; its environment equivalent
+/// alone can be silently ignored by older Git. No repository or object is read.
+pub(super) fn supports_local_reads(sys: &dyn System, user: &User) -> Result<bool, String> {
+    let ran = sys.run_complete_stdout(&local(sys, user, None).arg("--version"))
+        .map_err(|_| "cannot check Git's --no-lazy-fetch capability; required dependencies stay untouched")?;
+    Ok(ran.success())
 }
 
 /// Admit canonical, bounded relative paths, with no overlaps even on a case-insensitive
@@ -238,10 +242,13 @@ fn resolve(
         "100644",
     )?;
     // An edited declaration or staged gitlink is the person's intent, not permission to
-    // overwrite it using the tree the automatic pass initially saw.
+    // overwrite it using the tree the automatic pass initially saw. The worktree's copy is
+    // compared as it is on disk: no filter driver the parent names runs on it.
+    let programs = checkout::Programs::named(sys, git())
+        .map_err(|why| format!("the parent: {why}; required dependencies were left untouched"))?;
     read(
         sys,
-        git().args([
+        programs.off(git()).args([
             "diff",
             "--no-ext-diff",
             "--no-textconv",
@@ -411,9 +418,14 @@ fn state(
     // A checkout may lazily fetch missing blobs in a partial clone. Moving only a
     // complete, self-contained dependency keeps network work in the admitted fetch below.
     complete_storage(sys, user, &path)?;
+    // Its files are compared as they are on disk: no filter driver it names (git-lfs, say)
+    // runs on one, so a stat-dirty file a driver would clean reads as changed, and the
+    // dependency is left as it is.
+    let programs = checkout::Programs::named(sys, git())
+        .map_err(|why| format!("required dependency: {why}; left untouched"))?;
     let status = read(
         sys,
-        git().args([
+        programs.off(git()).args([
             "status",
             "--porcelain=v1",
             "-z",
@@ -505,7 +517,7 @@ fn network(
     )
 }
 
-fn complete_storage(sys: &dyn System, user: &User, path: &Path) -> Result<(), String> {
+pub(super) fn complete_storage(sys: &dyn System, user: &User, path: &Path) -> Result<(), String> {
     repos::verify_integrity(sys, user, path)
         .map_err(|_| "required dependency has shallow or partial history; left untouched")?;
     let alternates = text(

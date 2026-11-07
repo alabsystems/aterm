@@ -100,6 +100,17 @@ pub(crate) fn main_entry(rest: &[OsString]) -> ExitCode {
     let docs: Option<&DocsRepair<'_>> = Some(&rust_docs);
     #[cfg(not(target_os = "macos"))]
     let docs = None;
+    #[cfg(target_os = "macos")]
+    let clone_tuning =
+        |state: &Path| reading.clone_tuning(state, Box::new(crate::converge::setup_holds));
+    #[cfg(target_os = "macos")]
+    let tuning = Some(TuningRepair {
+        id: aterm_machines::clone_tuning::ID,
+        family: aterm_machines::clone_tuning::FAMILY,
+        build: &clone_tuning,
+    });
+    #[cfg(not(target_os = "macos"))]
+    let tuning = None;
     let wait = wait_for_pass("doctor");
     let ran = run(
         &args,
@@ -111,6 +122,7 @@ pub(crate) fn main_entry(rest: &[OsString]) -> ExitCode {
             not_own_account: aterm_types::dirs::not_own_account(),
             develop,
             docs,
+            tuning,
             wait: person_at_terminal().then_some(&wait as &Wait),
         },
     );
@@ -161,6 +173,35 @@ pub(crate) type DocsRepair<'a> = dyn Fn() -> Result<Vec<Box<dyn Item + 'a>>, Str
 /// The id of the workstation item [`DocsRepair`] binds, without its `@<user>`.
 const RUST_DOCS: &str = "init.spotlight.rust-docs";
 
+/// [`TuningRepair::build`]: its items bound for the engine over the account's state root, or why
+/// they cannot be built.
+pub(crate) type BuildTuning<'a> = dyn Fn(&Path) -> Result<Vec<Box<dyn Item + 'a>>, String> + 'a;
+
+/// The repair that tunes each clone of the vault's inventory as its repository declares:
+/// macOS's `aterm_machines::init::Doctor::clone_tuning` under System State's holds as each
+/// probe and apply reads them, a stand-in in tests, none elsewhere.
+pub(crate) struct TuningRepair<'a> {
+    /// Its one item's id without its `@<user>`, as `--only` names it.
+    pub(crate) id: &'static str,
+    /// Its item's family.
+    pub(crate) family: &'static str,
+    /// Its items bound for the engine over the account's state root, or why they cannot be
+    /// built.
+    pub(crate) build: &'a BuildTuning<'a>,
+}
+
+impl TuningRepair<'_> {
+    /// Whether `token` can name the tuning's item before it is built: its id with or without an
+    /// `@<user>`, its family or its layer. The built item settles a user's name.
+    fn names(&self, token: &str) -> bool {
+        aterm_converge::selects(token, self.id, self.family, Some(Layer::Workstation))
+            || token
+                .strip_prefix(self.id)
+                .and_then(|rest| rest.strip_prefix('@'))
+                .is_some_and(|user| !user.is_empty())
+    }
+}
+
 /// [`DevelopLayer::rows`]: the `--only` words in, the rows or why they cannot be ordered out.
 pub(crate) type DevelopRows<'a> =
     Box<dyn FnOnce(&[String]) -> Result<Vec<ItemReport>, String> + 'a>;
@@ -191,6 +232,9 @@ pub(crate) struct Ports<'a> {
     /// The `rust-docs` repair ([`DocsRepair`]), built and run in the account's own shell when
     /// the gather found Spotlight indexing rust-docs pages; `None` where aterm has none.
     pub(crate) docs: Option<&'a DocsRepair<'a>>,
+    /// The clones' tuning ([`TuningRepair`]), built and run in the account's own shell with a
+    /// state root when no word narrows the run or one names it; `None` where aterm has none.
+    pub(crate) tuning: Option<TuningRepair<'a>>,
     /// The wait behind an install pass holding the store, for a person at the terminal, taken
     /// only when a repair needs the store ([`needs_the_store`]); `None` with nobody there, and
     /// the pass's own items are left to it ([`How::LeftToPass`]).
@@ -250,7 +294,13 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
     let mut unmatched: Vec<String> = missed
         .into_iter()
         .filter(|token| {
-            !cli::names(token) && !develop_word(token) && !atpkg::converge::names(token)
+            !cli::names(token)
+                && !develop_word(token)
+                && !atpkg::converge::names(token)
+                && !ports
+                    .tuning
+                    .as_ref()
+                    .is_some_and(|tuning| tuning.names(token))
         })
         .collect();
     let mut read_early = None;
@@ -383,6 +433,45 @@ fn converge<'a>(
         }),
         _ => Vec::new(),
     };
+    // The vault's clones, each tuned as its repository declares (a relay-class repair of the
+    // account's own): never from another account's shell, whose clones are not its own, and
+    // never with no state root, where what aterm set could not be recorded.
+    // A word that names another login's item names none of this one's.
+    let mut tuning_unbuilt = None;
+    let mut tuning_unnamed = Vec::new();
+    let tuning: Vec<Box<dyn Item + 'a>> = match (&ports.tuning, ports.state) {
+        (Some(tuning), Some(state)) if own => {
+            let named: Vec<String> = tokens
+                .iter()
+                .filter(|token| tuning.names(token))
+                .cloned()
+                .collect();
+            if tokens.is_empty() || !named.is_empty() {
+                let built = (tuning.build)(state).unwrap_or_else(|why| {
+                    tuning_unbuilt = Some(why);
+                    Vec::new()
+                });
+                let (kept, missed) = aterm_converge::select(built, &named);
+                if tuning_unbuilt.is_none() {
+                    tuning_unnamed = missed;
+                }
+                kept
+            } else {
+                Vec::new()
+            }
+        }
+        // A word that names it where it is not built gets its row all the same.
+        (Some(tuning), state) if tokens.iter().any(|token| tuning.names(token)) => {
+            tuning_unbuilt = Some(match (ports.not_own_account, state) {
+                (Some(why), _) => {
+                    format!("aterm tunes them only from the account's own shell, and {why}")
+                }
+                _ => "no state root records what aterm sets in them".to_owned(),
+            });
+            Vec::new()
+        }
+        _ => Vec::new(),
+    };
 
     let scope = Scope {
         not_own_account: ports.not_own_account,
@@ -427,25 +516,29 @@ fn converge<'a>(
         _ => How::Applied,
     };
     laps.lap("lock");
-    let (facts, repairs, docs) = match &how {
-        // The facts and the rust-docs touch nothing of the store (the stale copies are the
-        // facts' one change; the rust-docs repair sets aside rustup's own toolchains' HTML).
+    let (facts, repairs, docs, tuning) = match &how {
+        // The facts, the rust-docs and the clones' tuning touch nothing of the store (the stale
+        // copies are the facts' one change; the rust-docs repair sets aside rustup's own
+        // toolchains' HTML; the tuning writes the clones' own git config and index).
         How::StoodAside(line) => (
             facts,
             beside_the_pass(repairs, &StoodAside::Lock(line.clone()), false),
             docs,
+            tuning,
         ),
         How::HeldBack(line) => (
             aterm_converge::held_back(facts, line),
             aterm_converge::held_back(repairs, line),
             aterm_converge::held_back(docs, line),
+            aterm_converge::held_back(tuning, line),
         ),
         How::LeftToPass(_) => (
             facts,
             beside_the_pass(repairs, &StoodAside::Lock(CONTENDED.to_owned()), true),
             docs,
+            tuning,
         ),
-        How::Applied | How::Planned => (facts, repairs, docs),
+        How::Applied | How::Planned => (facts, repairs, docs, tuning),
     };
     let mode = if how == How::Planned {
         Mode::Plan
@@ -479,6 +572,7 @@ fn converge<'a>(
             ));
         }
     }
+    let tuning_rows = ran(&tuning, "doctor.tuning");
     if let Some(why) = docs_unbuilt {
         refused.push(unmeasured(
             RUST_DOCS,
@@ -486,6 +580,24 @@ fn converge<'a>(
             Some(Layer::Workstation),
             format!("rust-docs stay in Spotlight: {why}"),
         ));
+    }
+    if let Some(tuning) = &ports.tuning {
+        if let Some(why) = tuning_unbuilt {
+            refused.push(unmeasured(
+                tuning.id,
+                tuning.family,
+                Some(Layer::Workstation),
+                format!("the vault's clones stay as they are: {why}"),
+            ));
+        }
+        for token in tuning_unnamed {
+            refused.push(unmeasured(
+                tuning.id,
+                tuning.family,
+                Some(Layer::Workstation),
+                format!("--only {token}: names another login's clones, which this one leaves"),
+            ));
+        }
     }
     laps.lap("repairs");
     if !fact_rows.iter().any(|row| row.id == cli::SHELL) {
@@ -560,6 +672,7 @@ fn converge<'a>(
         if !fact_rows
             .iter()
             .chain(&repair_rows)
+            .chain(&tuning_rows)
             .chain(&develop_rows)
             .chain(&packages)
             .chain(&refused)
@@ -576,6 +689,7 @@ fn converge<'a>(
     let row_count = fact_rows.len()
         + repair_rows.len()
         + docs_rows.len()
+        + tuning_rows.len()
         + develop_rows.len()
         + packages.len()
         + refused.len();
@@ -584,6 +698,7 @@ fn converge<'a>(
             .iter()
             .chain(&repair_rows)
             .chain(&docs_rows)
+            .chain(&tuning_rows)
             .chain(&develop_rows),
         &packages,
         &refused,
@@ -607,6 +722,7 @@ fn converge<'a>(
             .into_iter()
             .chain(repair_rows)
             .chain(docs_rows)
+            .chain(tuning_rows)
             .chain(develop_rows)
             .chain(packages)
             .chain(refused)
@@ -655,6 +771,7 @@ fn converge<'a>(
         let hold = ports.not_own_account.map(aterm_converge::not_own_account);
         sections.extend(repair_section(&repair_rows, &how, hold.as_deref()));
         sections.extend(docs_section(&docs_rows));
+        sections.extend(tuning_section(&tuning_rows));
         sections.extend(develop_section(&develop_rows));
         if !packages.is_empty() {
             let (healthy, lines) = atpkg::doctor::packages_view(&packages);
@@ -676,6 +793,7 @@ fn converge<'a>(
             [
                 ("repair:", repair_rows.as_slice()),
                 ("rust-docs:", docs_rows.as_slice()),
+                ("clones:", tuning_rows.as_slice()),
                 ("develop:", develop_rows.as_slice()),
                 ("packages:", packages.as_slice()),
                 ("doctor:", refused.as_slice()),
@@ -813,6 +931,13 @@ fn brief_rows<'r>(
                     row.from.as_deref().unwrap_or("rust-docs in Spotlight")
                 ),
                 "rust-docs:" => format!("{why}{}", remedy(row)),
+                "clones:" if row.outcome == Outcome::Planned => format!(
+                    "{} \u{2014} fix: {TUNING_FIX}",
+                    row.from
+                        .as_deref()
+                        .unwrap_or("a vault clone differs from its declaration")
+                ),
+                "clones:" => format!("{why}{}", remedy(row)),
                 "develop:" => format!("{}: {why}{}", row.id, remedy(row)),
                 "doctor:" => why.to_owned(),
                 _ => match (row.outcome, aside) {
@@ -918,7 +1043,9 @@ pub(crate) fn init_base(lock: aterm_machines::init::BaseLock) -> aterm_machines:
 /// window launch runs (update with the unattended lanes' `--defer-busy-flip`), each waiting for
 /// the store lock unless `--no-wait` made `lock` [`aterm_machines::init::BaseLock::Try`].
 #[cfg(unix)]
-fn toolset(lock: aterm_machines::init::BaseLock) -> aterm_machines::init_toolset::Toolset {
+pub(crate) fn toolset(
+    lock: aterm_machines::init::BaseLock,
+) -> aterm_machines::init_toolset::Toolset {
     use aterm_machines::init_toolset::{Atpkg, Toolset, WAIT_LOCK};
     Toolset::new(
         Box::new(toolset_found),
@@ -957,7 +1084,7 @@ fn toolset_found() -> aterm_machines::init_toolset::Found {
 /// atpkg may install them and Automatic updates are on, and otherwise off, saying why first
 /// (init never undoes a decline, Automatic updates off or `auto_install = false`).
 #[cfg(unix)]
-fn toolset_reads(
+pub(crate) fn toolset_reads(
     row: Option<&ItemReport>,
     adoption: atpkg::Adoption,
     enabled: bool,
@@ -1591,9 +1718,10 @@ fn ai_accounts_claude_probe(env: &aterm_agent::harness::cli::Env) -> aterm_conve
 }
 
 /// `base.clt` ([`aterm_machines::init_clt`]): its probe is atpkg's C toolchain probe over
-/// this process's `PATH`, which raises no Apple dialog ([`base_clt_probe`]), beside whether the
-/// git init runs is there (the tools', else Xcode's); its root half runs from this executable, and names the Mac
-/// by the swarm label its vault's roster gave it where that is known by the time the root half
+/// the standard system tool path, which raises no Apple dialog ([`base_clt_probe`]), beside
+/// whether init has a Git provider (managed Git or Apple's developer tools). Its root half
+/// runs from this executable and names the Mac by the swarm label its vault's roster gave it
+/// where that is known by the time the root half
 /// runs ([`crate::converge::mac_name_label`]), so the one password also aligns the Mac's
 /// own names. On a Mac that has the tools it still asks for that password where the
 /// elevation's other root steps are owed ([`aterm_machines::root_steps::owed_here`]: developer
@@ -1608,7 +1736,7 @@ fn command_line_tools() -> Option<aterm_machines::init_clt::CommandLineTools> {
         aterm_machines::init_clt::CommandLineTools::new(
             Box::new(|sys: &dyn aterm_machines::port::System| {
                 clt_found(
-                    &base_clt_probe(std::env::var_os("PATH").as_deref()),
+                    &base_clt_probe(Some(std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin"))),
                     aterm_machines::init_github::git_installed(sys),
                 )
             }),
@@ -1625,18 +1753,29 @@ fn command_line_tools() -> Option<aterm_machines::init_clt::CommandLineTools> {
 /// macOS's first check of the compiler, which a slow network stretches past the 5 s a status
 /// read waits; under that bound the tools there read as unknown, and the tab ended on "could not
 /// verify the developer tools" with setup's one password unasked (E3's lossy row, 2026-11-05).
+/// Setup judges the selected tools with their default SDK, independently of an inherited
+/// `SDKROOT` chosen for a build. Ordinary build probes retain that override.
 #[cfg(target_os = "macos")]
 fn base_clt_probe(path: Option<&std::ffi::OsStr>) -> atpkg::prereq::CcVerdict {
-    atpkg::prereq::probe_with(path, &atpkg::prereq::CcHost::waited_on())
+    base_clt_probe_on(path, atpkg::prereq::CcHost::waited_on())
+}
+
+#[cfg(target_os = "macos")]
+fn base_clt_probe_on(
+    path: Option<&std::ffi::OsStr>,
+    mut host: atpkg::prereq::CcHost,
+) -> atpkg::prereq::CcVerdict {
+    host.sdkroot_override = None;
+    atpkg::prereq::probe_with(path, &host)
 }
 
 /// What `base.clt` reads in a C toolchain verdict ([`atpkg::prereq::CcVerdict`]) and whether
-/// the git init runs is there (`clt_git`: [`aterm_machines::items::github::installed_git`],
-/// the tools' own, else Xcode's): a missing developer directory or `cc` is what the install
+/// init has a Git provider (`clt_git`: [`aterm_machines::init_github::git_installed`], managed
+/// Git or Apple's developer tools): a missing developer directory or `cc` is what the install
 /// supplies, and so is git beside a compiler that answers (a developer directory without a
 /// git, which the GitHub setup's clones need); an Xcode with its git is no install's to make;
 /// a compiler that refuses with the tools installed is theirs already (an unaccepted Xcode
-/// license, a PATH-first `cc` without an SDK); a compiler that did not answer is unknown.
+/// license); a compiler that did not answer is unknown.
 #[cfg(target_os = "macos")]
 fn clt_found(verdict: &atpkg::prereq::CcVerdict, clt_git: bool) -> aterm_machines::init_clt::Found {
     use aterm_machines::init_clt::Found;
@@ -1898,6 +2037,40 @@ fn docs_section(rows: &[ItemReport]) -> Option<Section> {
     };
     Some(Section {
         label: "rust-docs:",
+        mark,
+        fact,
+    })
+}
+
+/// What tunes the vault's clones, as a planned row's fix says it.
+const TUNING_FIX: &str = "bare `aterm doctor` tunes them as each declares";
+
+/// The clones' tuning section: what it did, or what is left and why; `None` when it did not
+/// run (another account's shell, no state root, or a word that does not name it).
+fn tuning_section(rows: &[ItemReport]) -> Option<Section> {
+    let row = rows.first()?;
+    let why = row.why.as_deref().unwrap_or("not done");
+    let (mark, fact) = match row.outcome {
+        Outcome::Ok | Outcome::NotApplicable => (Mark::Ok, why.to_owned()),
+        Outcome::Changed => (Mark::Ok, row.detail.clone().unwrap_or_default()),
+        Outcome::Planned => (
+            Mark::Warn,
+            format!(
+                "{} \u{2014} {TUNING_FIX}",
+                row.from
+                    .as_deref()
+                    .unwrap_or("a vault clone differs from its declaration")
+            ),
+        ),
+        Outcome::Deferred => (Mark::Note, why.to_owned()),
+        Outcome::Failed => (
+            Mark::Warn,
+            format!("NOT done \u{2014} {why}{}", remedy(row)),
+        ),
+        _ => (Mark::Warn, format!("{why}{}", remedy(row))),
+    };
+    Some(Section {
+        label: "clones:",
         mark,
         fact,
     })

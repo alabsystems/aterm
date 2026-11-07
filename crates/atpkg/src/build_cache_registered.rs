@@ -2457,6 +2457,14 @@ pub fn retire(
 /// this planner does not probe. Current-compiler dependencies stay while any owner still exists.
 #[must_use]
 pub fn plan(home: &Path, now: std::time::SystemTime) -> Vec<super::Planned> {
+    plan_on(home, now, super::ReclaimAfter::CALM.into())
+}
+
+pub(super) fn plan_on(
+    home: &Path,
+    now: std::time::SystemTime,
+    policy: super::ReclaimPolicy<'_>,
+) -> Vec<super::Planned> {
     let mut planned = Vec::new();
     for cache in roots(home) {
         let Some(preliminary) = read(&cache.receipt_path) else {
@@ -2544,6 +2552,7 @@ pub fn plan(home: &Path, now: std::time::SystemTime) -> Vec<super::Planned> {
             continue;
         }
         let store = super::compiler_store(Some(home));
+        let after = policy.leaf(&cache.root);
         let doomed = super::stale::decide(
             &super::stale::survey(
                 &super::stale::Disk,
@@ -2552,7 +2561,7 @@ pub fn plan(home: &Path, now: std::time::SystemTime) -> Vec<super::Planned> {
                 store.as_deref(),
             ),
             now,
-            super::RECLAIM_STALE,
+            after.stale,
         );
         if !doomed.is_empty() {
             let count = |which| doomed.iter().filter(|part| part.part == which).count();
@@ -2566,7 +2575,7 @@ pub fn plan(home: &Path, now: std::time::SystemTime) -> Vec<super::Planned> {
                     incremental,
                     units,
                     superseded,
-                    after: super::RECLAIM_STALE,
+                    after: after.stale,
                 },
                 held,
                 stays: None,
@@ -2628,7 +2637,7 @@ pub(super) fn reclaim_on(
 pub(super) fn reclaim_dead_on(
     home: &Path,
     now: std::time::SystemTime,
-    after: super::ReclaimAfter,
+    after: super::ReclaimPolicy<'_>,
     placing: Option<&super::checkout::Placing>,
     record: &mut dyn FnMut(&Path, super::Unused) -> bool,
     fence: &super::fence::Fence<'_>,
@@ -2643,7 +2652,7 @@ pub(super) fn reclaim_dead_on(
 pub(super) fn reclaim_live_on(
     home: &Path,
     now: std::time::SystemTime,
-    after: super::ReclaimAfter,
+    after: super::ReclaimPolicy<'_>,
     placing: Option<&super::checkout::Placing>,
     record: &mut dyn FnMut(&Path, super::Unused) -> bool,
     fence: &super::fence::Fence<'_>,
@@ -2661,15 +2670,16 @@ enum Selection<'a> {
 }
 
 #[cfg(unix)]
-fn reclaim_selected_on(
+fn reclaim_selected_on<'policy>(
     home: &Path,
     now: std::time::SystemTime,
-    after: super::ReclaimAfter,
+    after: impl Into<super::ReclaimPolicy<'policy>>,
     placing: Option<&super::checkout::Placing>,
     record: &mut dyn FnMut(&Path, super::Unused) -> bool,
     fence: &super::fence::Fence<'_>,
     selection: Selection<'_>,
 ) -> Vec<(PathBuf, super::Unused)> {
+    let after = after.into();
     let dead_only = matches!(selection, Selection::Dead);
     let live_only = matches!(selection, Selection::Live);
     let (selected_cache, requested, kernel) = match selection {
@@ -3202,7 +3212,7 @@ pub fn reclaim(
 pub(super) fn reclaim_dead_on(
     _: &Path,
     _: std::time::SystemTime,
-    _: super::ReclaimAfter,
+    _: super::ReclaimPolicy<'_>,
     _: Option<&super::checkout::Placing>,
     _: &mut dyn FnMut(&Path, super::Unused) -> bool,
     _: &super::fence::Fence<'_>,
@@ -3214,7 +3224,7 @@ pub(super) fn reclaim_dead_on(
 pub(super) fn reclaim_live_on(
     _: &Path,
     _: std::time::SystemTime,
-    _: super::ReclaimAfter,
+    _: super::ReclaimPolicy<'_>,
     _: Option<&super::checkout::Placing>,
     _: &mut dyn FnMut(&Path, super::Unused) -> bool,
     _: &super::fence::Fence<'_>,
@@ -3306,7 +3316,12 @@ mod tests {
 
         fn in_directory(directory: aterm_tempfile::TempDir) -> Self {
             let home = directory.path().canonicalize().unwrap().join("home");
-            std::fs::create_dir(&home).unwrap();
+            // Writable by its owner alone whatever the umask, as a person's home is: the index
+            // binds only such folders, so a home umask 002 left group-writable registers nothing.
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&home)
+                .unwrap();
             let owner = home.join("source");
             std::fs::create_dir(&owner).unwrap();
             std::fs::write(owner.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
@@ -3953,7 +3968,12 @@ mod tests {
         // protected roots. Exit zero for an unmanaged observation must not acknowledge it.
         let nested = world.home.join("nested-home");
         let protected = nested.join("Library/Containers/cache.noindex");
-        std::fs::create_dir_all(protected.parent().unwrap()).unwrap();
+        // Private whatever the umask: a target is laid only through such folders.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(protected.parent().unwrap())
+            .unwrap();
         assert!(create_checked(&world.home, &protected, &world.owner).unwrap());
         let project = nested.join("project");
         std::fs::create_dir(&project).unwrap();
@@ -4157,7 +4177,11 @@ mod tests {
             );
         }
         let target = world.home.join("ordinary-target");
-        std::fs::create_dir(&target).unwrap();
+        // Private whatever the umask: a build folder is laid only through such folders.
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&target)
+            .unwrap();
         std::fs::write(target.join("keep"), b"unmanaged target output").unwrap();
         let child = target.join(super::super::TARGET_BUILD_LEAF);
         let typed = vec![
@@ -6058,8 +6082,12 @@ mod tests {
                     return;
                 }
                 if shape == "relinked" {
-                    std::fs::remove_file(link).unwrap();
-                    std::os::unix::fs::symlink("../outputs.noindex", link).unwrap();
+                    // A new link renamed over the old, so the replacement is a node of its own:
+                    // one made after the old is removed can take the freed inode number back
+                    // (Linux's ext4 reuses it at once), and no stat tells that from the original.
+                    let fresh = link.with_extension("fresh");
+                    std::os::unix::fs::symlink("../outputs.noindex", &fresh).unwrap();
+                    std::fs::rename(&fresh, link).unwrap();
                 } else {
                     let deeper = home.join("deeper");
                     std::fs::DirBuilder::new()

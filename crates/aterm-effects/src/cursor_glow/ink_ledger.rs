@@ -9,9 +9,13 @@ use aterm_render::GlowEnd;
 mod letter_guard;
 #[cfg(any(test, debug_assertions))]
 mod state_words;
+pub use letter_guard::letter_bar;
 pub(crate) use letter_guard::{
     LetterGuard, RIM_SHOWN_SHARE, RIM_UNDER_LETTERS, RING as LETTER_GUARD_RING, ThinCaret,
+    foot_ring_light,
 };
+#[cfg(any(test, debug_assertions))]
+pub use letter_guard::{with_aa_unrounded, with_share_over_aa};
 
 /// Per-band RGB lift per unit coverage for a streak sample ([`InkLedger::admit_axis`]).
 pub(super) type BandLifts = [[f32; 3]; InkLedger::BANDS];
@@ -306,9 +310,10 @@ impl InkLedger {
     /// foot band: the row's last pixel rows, under its letters' baseline and
     /// the judge's ring round it, parted round every cell of the row whose
     /// ink may reach under the baseline (`rainbow_kitty::ribbon::ROW_RAIL_CH`),
-    /// on a row whose glyphs the host named. It meets no letter's ring, of
-    /// its row or the row below (whose tallest letters stand a few pixels
-    /// under its top), so the letter guard neither weighs nor cuts it: the
+    /// or past it in a lane the frame's rasters leave (`bed::part_round_feet`), on
+    /// a row whose glyphs the host named. It meets no letter's ring in its whole
+    /// light, of its row or the row below (whose tallest letters stand a few
+    /// pixels under its top), so the letter guard neither weighs nor cuts it: the
     /// guard reads a lettered cell's whole box as ink, and weighed there the
     /// rail's vivid ink was the brightest ground of every cell of its row,
     /// and on Solarized Dark the row's cuts took the ribbon's bed with it
@@ -589,6 +594,19 @@ impl InkLedger {
         }
         self.light_owned = merged;
         self.light_owned_ramps.clear();
+    }
+
+    /// Test-only: how many of the under stream's quads and ramps this frame
+    /// keeps whole, neither weighed nor cut (foot rails and page shades,
+    /// [`Self::note_foot_rail_laid`], [`Self::note_page_shade_laid`]).
+    #[cfg(test)]
+    pub(crate) fn kept_whole(&self) -> usize {
+        self.rails
+            .iter()
+            .chain(self.rail_ramps.iter())
+            .filter(|&&(_, _, foot)| foot)
+            .map(|&(from, to, _)| (to - from) as usize)
+            .sum()
     }
 
     /// Forget the frame's rails ([`Self::note_rail`], [`Self::note_rail_laid`])

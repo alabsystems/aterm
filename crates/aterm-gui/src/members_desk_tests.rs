@@ -765,3 +765,86 @@ fn a_member_commons_control_leaves_out_keeps_its_desk() {
     });
     fixture.server.stop();
 }
+
+thread_local! {
+    /// The simulated clock [`Lane`] reads in [`the_lane_reads_the_vault_again_only_once_it_moved`].
+    static SIMULATED: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn simulated() -> std::time::Instant {
+    SIMULATED
+        .with(std::cell::Cell::get)
+        .expect("the simulated clock is set")
+}
+
+/// The desk lane looks at this Mac's membership every [`LOCAL_EVERY`] and at every network move,
+/// and reads the vault again only once a file it is read from moved since a settled read: over
+/// ten looks, each followed by a network move and the loop's next look, a member whose vault
+/// stands still is read once. Its removal moves the vault, so the next look reads it and drops the
+/// desk, and a Mac that left is not read again while its vault stands still either. Counted on a
+/// simulated clock, never timed.
+///
+/// NEGATIVE CONTROLS (2026-11-06): with `Lane::look` reading at every look whatever its inputs
+/// say (the lane before), the ten looks read ten times (`left: 10, right: 1`); with `Lane::moved`
+/// also starting a look at once (the lane's `looked = None` before), twenty (`left: 20, right:
+/// 1`).
+#[test]
+fn the_lane_reads_the_vault_again_only_once_it_moved() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let fixture = client::test_commons_excluded(root.path()).expect("the excluded member");
+    let slot: &'static Slot = Box::leak(Box::new(Mutex::new(None)));
+    SIMULATED.with(|now| now.set(Some(std::time::Instant::now())));
+    let advance = || SIMULATED.with(|now| now.set(Some(simulated() + LOCAL_EVERY)));
+    let mut lane = Lane::new(fixture.member.clone(), simulated);
+    for _ in 0..10 {
+        lane.look(slot);
+        lane.moved(slot);
+        lane.look(slot);
+        advance();
+    }
+    assert_eq!(lane.reads, 1);
+    assert!(slot.lock().unwrap().is_some(), "the member's desk");
+
+    client::remove_member(&fixture.admin, "member", false).expect("the admin removes the member");
+    client::sync(&fixture.member, None).expect("the member syncs its removal");
+    lane.look(slot);
+    assert_eq!(lane.reads, 2, "the removal moved the vault");
+    assert!(slot.lock().unwrap().is_none(), "its desk is dropped");
+    for _ in 0..3 {
+        advance();
+        lane.look(slot);
+    }
+    assert_eq!(lane.reads, 2, "a Mac that left, its vault standing still");
+    fixture.server.stop();
+}
+
+/// A debug build's lab vault names its home LAN in its own file (`members::lab_lan`), and its
+/// home is that file under this Mac's route at the read, so the lane reads that vault with its
+/// home at every look and at once after a network move, as it read every vault before it kept
+/// one that stood still: over ten looks, each followed by a move and the loop's next look, twenty
+/// reads. Counted on a simulated clock, never timed.
+///
+/// NEGATIVE CONTROL (2026-11-06): with the lane reading the home from the place for every desk
+/// (no `HomeFrom::Vault` arm, as first merged with the lab home), the ten looks read once (`left:
+/// 1, right: 20`) and the lab's home never follows the route.
+#[test]
+fn a_lab_vaults_home_is_read_with_its_vault_at_every_look_and_move() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let fixture = client::test_commons_excluded(root.path()).expect("the excluded member");
+    let cidr = members::lab_lan::Cidr::parse("192.168.64.0/24").expect("a lab home LAN");
+    members::lab_lan::write(&fixture.member, &cidr).expect("the lab names its home LAN");
+    let slot: &'static Slot = Box::leak(Box::new(Mutex::new(None)));
+    SIMULATED.with(|now| now.set(Some(std::time::Instant::now())));
+    let advance = || SIMULATED.with(|now| now.set(Some(simulated() + LOCAL_EVERY)));
+    let mut lane = Lane::new(fixture.member.clone(), simulated);
+    for _ in 0..10 {
+        lane.look(slot);
+        lane.moved(slot);
+        lane.look(slot);
+        advance();
+    }
+    assert_eq!(home_from(slot), Some(HomeFrom::Vault), "the lab's desk");
+    assert_eq!(lane.reads, 20);
+    fixture.server.stop();
+}

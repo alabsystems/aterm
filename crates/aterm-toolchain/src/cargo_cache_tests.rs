@@ -6,12 +6,27 @@
 use super::*;
 use std::{
     fs::{File, OpenOptions, TryLockError},
-    os::unix::fs::{MetadataExt as _, PermissionsExt as _},
+    io::Write as _,
+    os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
 
 const MUTATE: &str = ".package-cache-mutate";
+
+/// A lock file this user made owner-only, as the guard makes a missing one, whatever the
+/// process umask (Ubuntu's user-private-group 002 would leave its group the write bit the
+/// guard refuses). Only the controls of that refusal give a file a wider mode.
+fn write_owned(path: &Path, bytes: &[u8]) {
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut file| file.write_all(bytes))
+        .unwrap();
+}
 
 /// An independent native exclusive contender on a Cargo lock file, let go by `LOCK_UN` when
 /// dropped (clippy.toml's flock release rule), so no sibling test's fork keeps it held.
@@ -23,12 +38,14 @@ impl Drop for Exclusive {
     }
 }
 
+/// [`Exclusive`] on `path`, making a missing file as [`write_owned`] does.
 fn exclusive(path: &Path) -> Result<Exclusive, TryLockError> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
+        .mode(0o600)
         .open(path)
         .map_err(TryLockError::Error)?;
     #[expect(
@@ -77,7 +94,7 @@ fn shared_guards_allow_download_and_exclude_mutation_until_last_close() {
     send_static::<SourceCacheGuard>();
     let home = aterm_tempfile::tempdir().unwrap();
     let path = home.path().join(MUTATE);
-    std::fs::write(&path, b"existing Cargo rendezvous bytes").unwrap();
+    write_owned(&path, b"existing Cargo rendezvous bytes");
     let before = std::fs::metadata(&path).unwrap();
     let first = SourceCacheGuard::try_acquire(home.path()).unwrap();
     let second = SourceCacheGuard::try_acquire(home.path()).unwrap();
@@ -150,7 +167,7 @@ fn unsupported_filesystem_and_lock_errors_never_become_acquired() {
 fn lock_files_own_unsupported_filesystem_refuses_before_any_lock() {
     let home = aterm_tempfile::tempdir().unwrap();
     let path = home.path().join(MUTATE);
-    std::fs::write(&path, b"keep original mount file bytes").unwrap();
+    write_owned(&path, b"keep original mount file bytes");
     let mut probes = 0;
     let called = AtomicBool::new(false);
     let refused = imp::acquire_with(
@@ -184,7 +201,7 @@ fn lock_name_replacement_is_detected_without_releasing_the_original_guard() {
     let guard = SourceCacheGuard::try_acquire(home.path()).unwrap();
     let old = home.path().join("original-lock");
     std::fs::rename(home.path().join(MUTATE), &old).unwrap();
-    std::fs::write(home.path().join(MUTATE), b"replacement").unwrap();
+    write_owned(&home.path().join(MUTATE), b"replacement");
     assert!(guard.check_current().is_err());
     assert!(matches!(exclusive(&old), Err(TryLockError::WouldBlock)));
     drop(exclusive(&home.path().join(MUTATE)).unwrap());
@@ -291,7 +308,8 @@ fn identity_drift_after_actual_lock_acquisition_refuses_and_closes_only_its_file
             )]
             file.try_lock_shared().map_err(io::Error::from)?;
             std::fs::rename(home.path().join(MUTATE), &old)?;
-            std::fs::write(home.path().join(MUTATE), b"replacement")
+            write_owned(&home.path().join(MUTATE), b"replacement");
+            Ok(())
         },
     )
     .unwrap_err();

@@ -31,6 +31,33 @@ use crate::metal::resources::{MetalResourceDevice, SealedTexture, SharedBuffer};
 #[cfg(target_os = "macos")]
 pub(crate) const METAL_MAX_TEXTURE_DIM: u32 = 16384;
 
+/// The GL arm's 2-D texture dimension ceiling, whatever the driver reports: Metal's, and the
+/// widest placement raster (`aterm_render::MAX_PLACEMENT_RASTER_SIDE`).
+#[cfg(any(gl_arm, test))]
+pub(crate) const GL_MAX_TEXTURE_DIM: u32 = 16384;
+
+/// The GL arm's texture dimension ceiling: the driver's `GL_MAX_TEXTURE_SIZE` answer, 0 for a
+/// negative one, and never above [`GL_MAX_TEXTURE_DIM`]. Only [`GlMaxTexture::from_driver`] makes
+/// one, so a `GlCaps` cannot carry the driver's raw answer. Unclamped, a driver that reports 65,536
+/// lets an image plane a 16,384-texel raster wide stack 65,536 rows, whose `tw * th * 4` bytes are
+/// 2^32 and whose staging buffer no frame should allocate.
+#[cfg(any(gl_arm, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GlMaxTexture(u32);
+
+#[cfg(any(gl_arm, test))]
+impl GlMaxTexture {
+    /// The ceiling for the driver's answer `raw`.
+    pub(crate) fn from_driver(raw: i32) -> Self {
+        Self(u32::try_from(raw).unwrap_or(0).min(GL_MAX_TEXTURE_DIM))
+    }
+
+    /// Its texels per side.
+    pub(crate) const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 /// The six texel formats the Metal foundation models (`metal::ffi::PixelFormat`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TexelFormat {
@@ -1492,5 +1519,33 @@ mod tests {
             .or_else(|| err.downcast_ref::<&str>().map(|m| (*m).to_owned()))
             .unwrap_or_default();
         assert!(msg.contains("MTLBuffer"), "got: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod gl_texture_dim_tests {
+    use super::{GL_MAX_TEXTURE_DIM, GlMaxTexture};
+
+    fn gl_max_texture_dim(raw: i32) -> u32 {
+        GlMaxTexture::from_driver(raw).get()
+    }
+
+    /// Bytes of the tallest image plane a texture side `cap` admits, as a u32 product: a raster
+    /// at the placement side over rasters stacked `cap` rows (`build_image_plane`), `None` where
+    /// the product wraps.
+    fn plane_bytes_u32(cap: u32) -> Option<u32> {
+        let side = u32::try_from(aterm_render::MAX_PLACEMENT_RASTER_SIDE).expect("16,384 fits");
+        side.min(cap).checked_mul(cap)?.checked_mul(4)
+    }
+
+    #[test]
+    fn a_driver_reporting_65536_is_held_to_the_ceiling() {
+        assert_eq!(gl_max_texture_dim(65_536), GL_MAX_TEXTURE_DIM);
+        assert_eq!(gl_max_texture_dim(i32::MAX), GL_MAX_TEXTURE_DIM);
+        assert_eq!(gl_max_texture_dim(4096), 4096, "a smaller answer stands");
+        assert_eq!(gl_max_texture_dim(-1), 0, "a negative answer is no texture");
+        assert!(plane_bytes_u32(gl_max_texture_dim(65_536)).is_some());
+        // Negative control: the driver's raw answer admits a plane whose bytes wrap a u32.
+        assert_eq!(plane_bytes_u32(65_536), None);
     }
 }

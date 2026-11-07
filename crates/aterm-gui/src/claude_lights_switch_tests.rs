@@ -326,21 +326,82 @@ fn a_switch_turning_off_says_so_and_takes_no_click() {
     policy(&mut app, "[harness]\n");
     set_program(&app, session, Some("agy"));
     frame(&mut app, wid);
+    assert_eq!(
+        app.windows[&wid].claude_lights.sessions[&session].autopilot,
+        Some(AutopilotView::Cruise),
+        "agy with harness on records Cruise"
+    );
+    {
+        let s = app
+            .windows
+            .get_mut(&wid)
+            .expect("window")
+            .claude_lights
+            .sessions
+            .get_mut(&session)
+            .expect("session lights");
+        s.autopilot_pending = Some((Autopilot::Land, Instant::now() + Duration::from_secs(60)));
+        s.rewritten = true;
+    }
     arm(&mut app, false);
     policy(&mut app, MASTER_OFF);
+    *app.windows[&wid].claude_footer_texts.borrow_mut() = Default::default();
+    let _ = crate::work_counts::take_footer_rule_masks();
     frame(&mut app, wid);
+    assert_eq!(
+        crate::work_counts::take_footer_rule_masks(),
+        0,
+        "agy bare while off does not mask the bottom composer rule"
+    );
+    let s = &app.windows[&wid].claude_lights.sessions[&session];
     assert!(
-        app.windows[&wid].claude_lights.sessions[&session]
-            .switch_turning
-            .is_none(),
+        s.switch_turning.is_none(),
         "agy's bare off read-back also lets `turning off` go"
     );
+    assert_eq!(
+        s.autopilot,
+        Some(AutopilotView::MasterOff),
+        "agy's bare off read-back updates SessionLights::autopilot to MasterOff"
+    );
+    assert!(
+        s.autopilot_pending.is_none() && !s.rewritten,
+        "agy's bare off read-back clears in-flight autopilot_pending and rewritten"
+    );
+    policy(&mut app, "[harness.agy]\nenabled = false\n");
+    frame(&mut app, wid);
+    assert_eq!(
+        app.windows[&wid].claude_lights.sessions[&session].autopilot,
+        Some(AutopilotView::AgentOff(aterm_phase::Program::Agy)),
+        "agy's agent-off read-back updates SessionLights::autopilot to AgentOff(Agy)"
+    );
     policy(&mut app, "[harness]\n");
+    set_program(&app, session, Some("claude"));
     frame(&mut app, wid);
     assert_eq!(
         switch(&app, wid).map(|b| b.face),
         Some(HarnessSwitch::On),
         "turning back on shows On, never stale TurningOff"
+    );
+    app.windows
+        .get_mut(&wid)
+        .expect("window")
+        .claude_lights
+        .sessions
+        .get_mut(&session)
+        .expect("session lights")
+        .autopilot_pending = Some((Autopilot::Land, Instant::now() + Duration::from_secs(60)));
+    policy(&mut app, MASTER_OFF);
+    frame(&mut app, wid);
+    assert!(
+        app.windows[&wid].claude_lights.sessions[&session]
+            .autopilot_pending
+            .is_none(),
+        "turning the harness off clears an in-flight Autopilot mode click"
+    );
+    let bottom = row_text(&app, wid, footer_row(&app, wid));
+    assert!(
+        bottom.contains("\u{2298} off") && !bottom.contains("\u{25cc}"),
+        "bottom rule draws `\u{2298} off`, never stale pending `\u{25cc}`: {bottom:?}"
     );
 }
 
@@ -1696,6 +1757,68 @@ fn the_keyboard_walks_to_the_switch_and_return_presses_it() {
     assert_eq!(autopilot(&app, session), before, "no word written");
     assert_eq!(selected(&app, wid), None);
     assert!(pty(&mut reader, 0).is_empty(), "nothing typed");
+
+    later(&mut app, wid, session);
+    policy(&mut app, MASTER_OFF);
+    set_program(&app, session, Some("agy"));
+    frame(&mut app, wid);
+    assert!(
+        app.windows[&wid].claude_lights.footers.is_empty(),
+        "agy bare while off draws no bottom footer rule"
+    );
+    assert_eq!(
+        switch(&app, wid).map(|b| b.face),
+        Some(HarnessSwitch::Off(SwitchOff::Master)),
+        "agy bare while off still draws the top-rule switch"
+    );
+    chord(&mut app, wid);
+    frame(&mut app, wid);
+    assert_eq!(
+        selected(&app, wid),
+        Some((session, Target::Switch)),
+        "ctrl+shift+tab walks directly to agy's bare off switch"
+    );
+    let top_row = switch(&app, wid).expect("switch").term_row;
+    app.windows
+        .get_mut(&wid)
+        .expect("window")
+        .chrome_rows
+        .push(top_row..top_row + 1);
+    tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
+    assert!(
+        not_saved(&app, "harness.enabled").is_some_and(|said| said.contains("= false")),
+        "NEGATIVE CONTROL: Return on a chrome-covered switch does not flip it on"
+    );
+    assert_eq!(
+        pty(&mut reader, 1),
+        b"\r",
+        "NEGATIVE CONTROL: Return on a covered switch passes through to the PTY"
+    );
+    chord(&mut app, wid);
+    assert_eq!(
+        selected(&app, wid),
+        None,
+        "NEGATIVE CONTROL: ctrl+shift+tab skips a chrome-covered switch"
+    );
+    app.windows
+        .get_mut(&wid)
+        .expect("window")
+        .chrome_rows
+        .clear();
+    chord(&mut app, wid);
+    frame(&mut app, wid);
+    assert_eq!(
+        selected(&app, wid),
+        Some((session, Target::Switch)),
+        "ctrl+shift+tab walks directly to agy's bare off switch once uncovered"
+    );
+    tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
+    assert!(
+        not_saved(&app, "harness.enabled").is_some_and(|said| said.contains("= true")),
+        "Return on agy's bare off switch turns the harness back on"
+    );
+    assert_eq!(selected(&app, wid), None);
+    assert!(pty(&mut reader, 0).is_empty(), "nothing typed to agy");
 
     let (mut app, wid, session, _reader) = super::gesture_tests::app();
     assert!(app.apply_term_resize(wid, 50, 144));

@@ -79,7 +79,7 @@ impl Log {
         if keyed.is_empty() {
             return Vec::new();
         }
-        let membership = self.membership();
+        let membership = self.membership_ref();
         let member_of: BTreeMap<Recipient, MemberId> = membership
             .members()
             .iter()

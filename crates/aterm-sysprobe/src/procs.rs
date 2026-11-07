@@ -129,6 +129,9 @@ pub struct ProcessReading {
     pub exec: Option<bool>,
     /// Time its threads spent runnable (running or waiting for a core) since it started, nanoseconds (macOS `ri_runnable_time`); `None` where refused or not read.
     pub runnable_ns: Option<u64>,
+    /// Which kind of core its threads ran on, on a host with more than one ([`CoreSplit`]);
+    /// `None` where the host has one kind, where refused or not read, and off macOS.
+    pub cores: Option<CoreSplit>,
     /// The largest footprint it has had (macOS `ri_lifetime_max_phys_footprint`); `None` where refused or not read.
     pub peak_footprint: Option<u64>,
     /// When its counters were read (a zombie's: at its second read, after every live process's).
@@ -146,6 +149,22 @@ pub struct ProcessReading {
     /// finds it: nothing records it between two readings or after the process exits. `None`
     /// where its record named another parent (a new process at the pid), and off macOS.
     pub reaps_unwaited: Option<bool>,
+}
+
+/// Of a process's CPU time since it started, what ran on the host's performance cores and what
+/// its threads retired there (macOS `RUSAGE_INFO_V6`, read where `hw.nperflevels` is above 1:
+/// Apple silicon's performance and efficiency cores). An efficiency core runs a thread's
+/// instructions slower, so the time on one does less work than the same time on a performance
+/// core.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CoreSplit {
+    /// User plus system time on performance cores, nanoseconds (`ri_user_ptime +
+    /// ri_system_ptime`); at most [`ProcessReading::cpu_ns`].
+    pub p_cpu_ns: u64,
+    /// Instructions retired on every core (`ri_instructions`).
+    pub instructions: u64,
+    /// Of those, the instructions retired on performance cores (`ri_pinstructions`).
+    pub p_instructions: u64,
 }
 
 /// What a sweep reads beyond each process's row ([`processes_with`]).
@@ -432,7 +451,7 @@ pub fn kernel_timebase() -> Option<(u32, u32)> {
 pub(crate) mod imp {
     use std::ffi::c_int;
 
-    use super::{MAX_PROCESSES, ProcessReading, Sweep, SweepOpts, ticks_to_ns};
+    use super::{CoreSplit, MAX_PROCESSES, ProcessReading, Sweep, SweepOpts, ticks_to_ns};
     use crate::jobs::RunState;
     use crate::jobs::darwin::{PROC_FLAG_CONTROLT, PROC_FLAG_EXEC};
     use crate::rusage::{Flavor, RusageV6, Usage};
@@ -584,6 +603,24 @@ pub(crate) mod imp {
         Ok(Usage { ri, v6 })
     }
 
+    /// Whether this host has more than one kind of core (`hw.nperflevels` above 1), the only
+    /// host whose performance cores' share says where a thread ran. Read once.
+    fn split_cores() -> bool {
+        static SPLIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *SPLIT.get_or_init(|| crate::macos::sysctl_int(c"hw.nperflevels").is_some_and(|n| n > 1))
+    }
+
+    /// `u`'s performance cores' share ([`CoreSplit`]), its time in ns at the timebase
+    /// `numer/denom`; `None` from a V4 read or where the host has one kind of core.
+    fn cores_of(u: &Usage, numer: u32, denom: u32) -> Option<CoreSplit> {
+        let (p_ticks, instructions, p_instructions) = u.performance_cores()?;
+        split_cores().then(|| CoreSplit {
+            p_cpu_ns: ticks_to_ns(p_ticks, numer, denom),
+            instructions,
+            p_instructions,
+        })
+    }
+
     fn priority(pid: c_int, which: c_int) -> Result<i32, i32> {
         // SAFETY: errno is thread-local; getpriority only reads the named process's policy.
         let (value, errno) = unsafe {
@@ -701,13 +738,13 @@ pub(crate) mod imp {
                 }
             };
             let after = after_read.ok();
-            let usage = match (before, after) {
+            let (usage, split) = match (before, after) {
                 (Some(before), Some(after))
                     if before.ri.ri_proc_start_abstime == after.ri.ri_proc_start_abstime =>
                 {
-                    Some(after)
+                    (Some(after), cores_of(&after, numer, denom))
                 }
-                (None, None) => None,
+                (None, None) => (None, None),
                 _ => continue,
             };
             let read_at = Some(std::time::Instant::now());
@@ -736,6 +773,7 @@ pub(crate) mod imp {
                 has_tty: Some(info.flags & PROC_FLAG_CONTROLT != 0),
                 exec: Some(info.flags & PROC_FLAG_EXEC != 0),
                 runnable_ns: usage.map(|u| ticks_to_ns(u.ri.ri_runnable_time, numer, denom)),
+                cores: split,
                 peak_footprint: usage.map(|u| u.ri.ri_lifetime_max_phys_footprint),
                 read_at,
                 coalition,
@@ -761,6 +799,7 @@ pub(crate) mod imp {
             procs.push(ProcessReading {
                 pid: pid as u32,
                 start: last.map(|u| u.ri.ri_proc_start_abstime),
+                cores: last.and_then(|u| cores_of(&u, numer, denom)),
                 ppid: k.ppid,
                 cpu_ns: last.map(|u| cpu_of(&u.ri, numer, denom)),
                 child_cpu_ns: last.map(|u| child_cpu_of(&u.ri, numer, denom)),
@@ -1234,6 +1273,33 @@ mod tests {
              {kernel} ns (timebase {:?})",
             kernel_timebase()
         );
+    }
+
+    /// The sweep says which kind of core a busy child ran on where the host has two
+    /// (`hw.nperflevels` above 1: Apple silicon's performance and efficiency cores), within what
+    /// it counts in all: its time on performance cores is at most its CPU time, and its
+    /// instructions there at most all it retired, of which there are some. A host with one kind
+    /// (an Intel Mac) reads no split.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_sweep_splits_a_busy_childs_cpu_by_kind_of_core() {
+        use super::stopped_spinner::read;
+        let row = |pid: u32| processes().and_then(|s| s.procs.into_iter().find(|p| p.pid == pid));
+        let (swept, _) = read(200_000_000, |pid| row(pid)?.cpu_ns, row);
+        let swept = swept.expect("the sweep reads its own child");
+        let cpu = swept.cpu_ns.expect("its CPU time");
+        let levels = crate::macos::sysctl_int(c"hw.nperflevels").unwrap_or(0);
+        match swept.cores {
+            Some(c) => {
+                assert!(levels > 1, "{levels} kinds of core, split: {swept:?}");
+                assert!(c.p_cpu_ns <= cpu, "{swept:?}");
+                assert!(
+                    c.instructions > 0 && c.p_instructions <= c.instructions,
+                    "{swept:?}"
+                );
+            }
+            None => assert!(levels <= 1, "{levels} kinds of core, no split: {swept:?}"),
+        }
     }
 
     /// A sweep asked for coalitions reads each process's, and its pid version, as the one-process readers do, another user's too (launchd's, root's); a plain sweep reads neither.

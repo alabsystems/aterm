@@ -27,6 +27,7 @@ mod git_text;
 mod macos;
 mod pinned;
 pub(crate) mod reference;
+pub mod reuse;
 mod source;
 pub mod upstream;
 
@@ -1774,6 +1775,86 @@ mod tests {
                     .expect("wrapper")
                     .contains("GIT_EXEC_PATH=")
             );
+            // The actual retained-archive route keeps the payload bytes and still performs
+            // client hash/tree/ELF admission. Native execution is injected here because these
+            // deliberately minimal ELF fixtures are never executable programs.
+            let reuse_request = reuse::Request {
+                manifest: result.manifest.clone(),
+                triple,
+                merge_from: result.manifest.clone(),
+                out: tmp.path().join(format!("reuse-{triple}")),
+            };
+            let admitted = reuse::prepare_with(&reuse_request, |_, tree, _| {
+                assert!(tree.join("libexec/git-core/git").is_file());
+                Ok(())
+            })
+            .expect("unchanged retained archive is admitted");
+            assert_eq!(
+                std::fs::read(&admitted.asset).unwrap(),
+                std::fs::read(&result.asset).unwrap()
+            );
+            assert_eq!(
+                std::fs::read(&admitted.manifest).unwrap(),
+                std::fs::read(&result.manifest).unwrap()
+            );
+            assert!(admitted.signature.is_none());
+            let mut refused = reuse_request.clone();
+            refused.out = tmp.path().join(format!("qualification-refused-{triple}"));
+            assert!(
+                reuse::prepare_with(&refused, |_, _, _| Err(Error::refused(
+                    "capability refused"
+                )))
+                .is_err()
+            );
+            let corrupt = tmp.path().join(format!("corrupt-retained-{triple}"));
+            std::fs::create_dir(&corrupt).unwrap();
+            std::fs::copy(
+                &result.manifest,
+                corrupt.join(result.manifest.file_name().unwrap()),
+            )
+            .unwrap();
+            let mut damaged = std::fs::read(&result.asset).unwrap();
+            damaged[0] ^= 1;
+            std::fs::write(corrupt.join(result.asset.file_name().unwrap()), damaged).unwrap();
+            refused.manifest = corrupt.join(result.manifest.file_name().unwrap());
+            refused.out = tmp.path().join(format!("corrupt-output-{triple}"));
+            assert!(
+                reuse::prepare_with(&refused, |_, _, _| panic!(
+                    "corrupt bytes reach no qualification"
+                ))
+                .is_err()
+            );
+            for (label, broken) in [
+                (
+                    "path",
+                    std::fs::read_to_string(&result.manifest).unwrap().replace(
+                        &format!("asset = \"{}\"", row.asset),
+                        "asset = \"../outside.tar.zst\"",
+                    ),
+                ),
+                (
+                    "tree",
+                    std::fs::read_to_string(&result.manifest).unwrap().replace(
+                        &format!("tree_root = \"{}\"", row.tree_root),
+                        "tree_root = \"\"",
+                    ),
+                ),
+            ] {
+                let bad = tmp.path().join(format!("bad-{label}-{triple}.toml"));
+                std::fs::write(&bad, broken).unwrap();
+                refused.manifest = bad;
+                refused.out = tmp.path().join(format!("bad-{label}-output-{triple}"));
+                assert!(
+                    reuse::prepare_with(&refused, |_, _, _| panic!(
+                        "invalid metadata reaches no qualification"
+                    ))
+                    .is_err()
+                );
+                assert!(
+                    !refused.out.exists(),
+                    "invalid metadata creates no archive output"
+                );
+            }
             let preserved = tmp.path().join(format!("git-{triple}.pkg.toml"));
             std::fs::copy(&result.manifest, &preserved).expect("preserve manifest for merge");
             previous = Some(preserved);

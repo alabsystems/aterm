@@ -169,6 +169,11 @@ enum Stop {
     CouldNotRun(String),
     /// A finding about the tree: a page failed or hung.
     Fail(String),
+    /// A page found, before aterm ran, that the browser lacks what it needs (`unsupported` in its
+    /// post: worker.mjs's worker given no WebGL2 context at all). A finding wherever the lane has
+    /// measured that browser's worker WebGL2; only [`Engine::worker_stop`] makes one
+    /// could-not-run, for WPE on Linux ([`webkit::worker_stop`]).
+    Lacks(String),
 }
 
 /// One page's answer and what it cost.
@@ -187,8 +192,9 @@ struct Session {
     ready_ms: Option<f64>,
     cpu: Page,
     gpu: Page,
-    /// The worker page, judged on its own row: its failure ends only that row.
-    worker: Result<Page, Stop>,
+    /// The worker page, judged on its own row: its failure ends only that row. `None` where the
+    /// run's set leaves the row out (`browser-drive --no-worker`).
+    worker: Option<Result<Page, Stop>>,
     served: usize,
     /// What its driver did beside the pages: owned automation cleanup and any uncertainty.
     notes: Vec<String>,
@@ -205,7 +211,7 @@ enum Engine {
     Chromium(chromium::Browser, chromium::Angle),
     /// Firefox, driven by its pages.
     Firefox(firefox::Firefox),
-    /// WebKit, driven by its pages; it keeps a window.
+    /// WebKit, driven by its pages; on macOS it keeps a window.
     WebKit(webkit::WebKit),
     /// The system Safari, its first page opened over WebDriver and the rest driven by the pages;
     /// its window takes the desk ([`Engine::takes_the_desk`]).
@@ -270,15 +276,34 @@ impl Engine {
         }
     }
 
-    /// Boot the pages in this engine's browser, on the private `profile`.
-    fn drive(&self, site: &Path, work: &Path, profile: &Path) -> Result<Session, Stop> {
+    /// Boot the pages in this engine's browser, on the private `profile`: the cpu and gpu pages,
+    /// and the worker page where `worker` keeps its row in the run's set.
+    fn drive(
+        &self,
+        site: &Path,
+        work: &Path,
+        profile: &Path,
+        worker: bool,
+    ) -> Result<Session, Stop> {
         match self {
             Engine::Chromium(browser, angle) => {
-                drive_chromium(browser, site, work, profile, *angle)
+                drive_chromium(browser, site, work, profile, *angle, worker)
             }
-            Engine::Firefox(firefox) => drive_firefox(firefox, site, work, profile),
-            Engine::WebKit(webkit) => drive_webkit(webkit, site, work, profile),
-            Engine::Safari(safari) => drive_safari(safari, site, work),
+            Engine::Firefox(firefox) => drive_firefox(firefox, site, work, profile, worker),
+            Engine::WebKit(webkit) => drive_webkit(webkit, site, work, profile, worker),
+            Engine::Safari(safari) => drive_safari(safari, site, work, worker),
+        }
+    }
+
+    /// The worker row's stop on `os`: a page's [`Stop::Lacks`] is a finding for every engine whose
+    /// worker WebGL2 the lane has measured (Chromium's, Firefox's, Safari's, macOS's WebKit), and
+    /// could-not-run only for WPE on Linux, which `render_nodes` (the host's DRM render nodes)
+    /// says why of ([`webkit::worker_stop`]).
+    fn worker_stop(&self, os: &str, render_nodes: &dyn Fn() -> Vec<String>, stop: Stop) -> Stop {
+        match (self, stop) {
+            (Engine::WebKit(_), stop) => webkit::worker_stop(os, render_nodes, stop),
+            (_, Stop::Lacks(why)) => Stop::Fail(why),
+            (_, stop) => stop,
         }
     }
 }
@@ -311,8 +336,10 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
     let t0 = Instant::now();
     let (chromium, firefox, webkit) = (chromium::find(), firefox::find(), webkit::find());
     let safari = safari::HERE.then(safari::find);
-    let windowed_runs =
-        !ctx.no_windows && (webkit.is_ok() || safari.as_ref().is_some_and(Result::is_ok));
+    // Only a WebKit that keeps windows (macOS's) is a named skip under --no-windows.
+    let skip_webkit = ctx.no_windows && webkit::keeps_windows(std::env::consts::OS);
+    let windowed_runs = (webkit.is_ok() && !skip_webkit)
+        || (!ctx.no_windows && safari.as_ref().is_some_and(Result::is_ok));
     if let (Err(c), Err(f), false) = (&chromium, &firefox, windowed_runs) {
         let w: String = [
             webkit.as_ref().err(),
@@ -327,7 +354,7 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
         ));
         return;
     }
-    let webkit = if ctx.no_windows {
+    let webkit = if skip_webkit {
         Windowed::Skip(webkit::no_windows_skip(webkit.is_err().then(webkit::fix)))
     } else {
         Windowed::Run(webkit)
@@ -349,6 +376,7 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
         scratch: ctx.scratch.clone(),
         ceiling: ctx.child_ceiling,
         quiet: None,
+        no_worker: Vec::new(),
     };
     sessions(r, &built, &chromium, &firefox, webkit, safari, &[]);
 }
@@ -498,6 +526,9 @@ struct Built {
     /// its own: a verify run's stage holds the run's quiet machine ([`takes_the_desk`]), or the
     /// run takes none.
     quiet: Option<aterm_capacity::Admit>,
+    /// The sessions whose worker row the run's set leaves out (`browser-drive --no-worker`):
+    /// they drive the cpu and gpu pages alone.
+    no_worker: Vec<String>,
 }
 
 /// Files and directories laid by [`assemble`].
@@ -578,6 +609,9 @@ struct DriveArgs {
     work: PathBuf,
     /// The sessions `--engine` named, each once, in order.
     wanted: Vec<String>,
+    /// The sessions `--no-worker` named, whose worker row the caller's set leaves out
+    /// ([`Built::no_worker`]).
+    no_worker: Vec<String>,
     /// `--admit wait|now` (wait by default), as verify's own: how a session that takes the desk
     /// admits its quiet machine ([`Built::quiet`]).
     admit: aterm_capacity::Admit,
@@ -593,19 +627,22 @@ impl DriveArgs {
             scratch,
             ceiling: Some(crate::exec::DEFAULT_CHILD_CEILING),
             quiet: Some(self.admit),
+            no_worker: self.no_worker.clone(),
         }
     }
 }
 
-/// Parse `verify browser-drive SITE OUT [--engine NAME]... [--admit wait|now]`. A flag's value
-/// follows it or is joined by `=`, as in verify's own arguments.
+/// Parse `verify browser-drive SITE OUT [--engine NAME]... [--no-worker NAME]... [--admit
+/// wait|now]`. A flag's value follows it or is joined by `=`, as in verify's own arguments.
 ///
 /// # Errors
-/// An unknown option, a flag without its value, an `--engine` that names no session, an
-/// `--admit` other than `wait` or `now`, or other than a site and an output directory.
+/// An unknown option, a flag without its value, an `--engine` or `--no-worker` that names no
+/// session, an `--admit` other than `wait` or `now`, or other than a site and an output
+/// directory.
 fn drive_args(args: &[String]) -> Result<DriveArgs, String> {
     let mut paths = Vec::new();
     let mut wanted: Vec<String> = Vec::new();
+    let mut no_worker: Vec<String> = Vec::new();
     let mut admit = aterm_capacity::Admit::Wait;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -619,13 +656,18 @@ fn drive_args(args: &[String]) -> Result<DriveArgs, String> {
             _ => Err(format!("{flag} needs a value")),
         };
         match flag {
-            "--engine" => {
+            "--engine" | "--no-worker" => {
                 let name = value()?;
                 if !ENGINES.contains(&name.as_str()) {
-                    return Err(format!("--engine names a session, not `{name}`"));
+                    return Err(format!("{flag} names a session, not `{name}`"));
                 }
-                if !wanted.contains(&name) {
-                    wanted.push(name);
+                let names = if flag == "--engine" {
+                    &mut wanted
+                } else {
+                    &mut no_worker
+                };
+                if !names.contains(&name) {
+                    names.push(name);
                 }
             }
             aterm_capacity::Admit::FLAG => {
@@ -643,19 +685,20 @@ fn drive_args(args: &[String]) -> Result<DriveArgs, String> {
         site,
         work,
         wanted,
+        no_worker,
         admit,
     })
 }
 
-/// `verify browser-drive SITE OUT [--engine NAME]... [--admit wait|now]`.
+/// `verify browser-drive SITE OUT [--engine NAME]... [--no-worker NAME]... [--admit wait|now]`.
 pub fn drive_main(args: &[String]) -> i32 {
     let asked = match drive_args(args) {
         Ok(asked) => asked,
         Err(why) => {
             eprintln!(
-                "verify browser-drive: {why} (verify browser-drive SITE OUT [--engine {}]... \
-                 [--admit wait|now])",
-                ENGINES.join("|")
+                "verify browser-drive: {why} (verify browser-drive SITE OUT [--engine {e}]... \
+                 [--no-worker {e}]... [--admit wait|now])",
+                e = ENGINES.join("|")
             );
             return exit::USAGE;
         }
@@ -719,13 +762,20 @@ fn session(
         r.cannot_run(format!("{label} — could not create {}: {e}", dir.display()));
         return None;
     }
-    let not_run = format!("{worker_label} — the session's pages did not run (above)");
+    let worker = !built.no_worker.iter().any(|n| n == name);
+    let not_run = |r: &mut Report| {
+        if worker {
+            r.cannot_run(format!(
+                "{worker_label} — the session's pages did not run (above)"
+            ));
+        }
+    };
     let desk = if engine.takes_the_desk() {
         match desk_claim(built.quiet, &engine.label()) {
             Ok(desk) => desk,
             Err(why) => {
                 r.cannot_run(format!("{label} — {why}"));
-                r.cannot_run(not_run);
+                not_run(r);
                 return None;
             }
         }
@@ -742,7 +792,7 @@ fn session(
         let _quiet = desk
             .as_ref()
             .map(|(claim, _)| crate::holding_quiet_claim(Some(std::sync::Arc::clone(claim))));
-        let result = session_engine.drive(&session_site, &session_dir, &profile);
+        let result = session_engine.drive(&session_site, &session_dir, &profile, worker);
         if let Some((claim, _)) = desk {
             claim.timing_admission().map_err(|why| {
                 Stop::CouldNotRun(format!(
@@ -752,26 +802,30 @@ fn session(
         }
         result
     });
-    let session = match driven {
+    let mut session = match driven {
         Ok(Ok(s)) => s,
         Ok(Err(Stop::CouldNotRun(why))) => {
             r.cannot_run(format!("{label} — {why}"));
-            r.cannot_run(not_run);
+            not_run(r);
             return None;
         }
-        Ok(Err(Stop::Fail(why))) => {
+        Ok(Err(Stop::Fail(why) | Stop::Lacks(why))) => {
             r.fail(label);
             r.raw(why);
-            r.cannot_run(not_run);
+            not_run(r);
             return None;
         }
         Err(why) => {
             r.fail(label);
             r.raw(format!("the browser session {}", why.sentence()));
-            r.cannot_run(not_run);
+            not_run(r);
             return None;
         }
     };
+    let nodes = || webkit::render_nodes(Path::new(webkit::DRI));
+    session.worker = session
+        .worker
+        .map(|w| w.map_err(|stop| engine.worker_stop(std::env::consts::OS, &nodes, stop)));
     let gpu = &session.gpu.answer;
     let timings = json!({
         "browser": session.product,
@@ -786,8 +840,11 @@ fn session(
         "cpu": page_timings(&session.cpu),
         "gpu": page_timings(&session.gpu),
         "worker": match &session.worker {
-            Ok(p) => page_timings(p),
-            Err(Stop::CouldNotRun(why) | Stop::Fail(why)) => json!({"error": why}),
+            None => json!({"left_out": "browser-drive --no-worker"}),
+            Some(Ok(p)) => page_timings(p),
+            Some(Err(Stop::CouldNotRun(why) | Stop::Fail(why) | Stop::Lacks(why))) => {
+                json!({"error": why})
+            }
         },
     });
     let ready = session
@@ -802,7 +859,7 @@ fn session(
     }
     r.raw(say(timing_line("cpu page (aterm-wasm)", &session.cpu)));
     r.raw(say(timing_line("gpu page (aterm-gpu-web)", &session.gpu)));
-    if let Ok(w) = &session.worker {
+    if let Some(Ok(w)) = &session.worker {
         r.raw(say(timing_line("worker (aterm-gpu-web)", w)));
     }
     let record = dir.join("timings.json");
@@ -866,12 +923,15 @@ fn session(
         r.pass(label);
     }
     match &session.worker {
-        Err(Stop::CouldNotRun(why)) => r.cannot_run(format!("{worker_label} — {why}")),
-        Err(Stop::Fail(why)) => {
+        None => r.raw(say(
+            "no worker row: the run's set leaves it out (browser-drive --no-worker)".to_string(),
+        )),
+        Some(Err(Stop::CouldNotRun(why))) => r.cannot_run(format!("{worker_label} — {why}")),
+        Some(Err(Stop::Fail(why) | Stop::Lacks(why))) => {
             r.fail(worker_label);
             r.raw(why.clone());
         }
-        Ok(w) => {
+        Some(Ok(w)) => {
             let say_worker = |text: String| say(format!("worker: {text}"));
             let mut failures = held(
                 r,
@@ -1144,13 +1204,14 @@ fn log_stdio(log: &Path) -> Result<(ChildStdio, ChildStdio), Stop> {
     ))
 }
 
-/// Launch Chromium on `angle` and drive the three pages over DevTools.
+/// Launch Chromium on `angle` and drive the pages over DevTools (the worker's where `worker`).
 fn drive_chromium(
     browser: &chromium::Browser,
     site: &Path,
     work: &Path,
     profile: &Path,
     angle: chromium::Angle,
+    worker: bool,
 ) -> Result<Session, Stop> {
     let _ = std::fs::remove_dir_all(profile);
     std::fs::create_dir_all(profile)
@@ -1188,7 +1249,7 @@ fn drive_chromium(
     let server = serve::Server::start(site).map_err(Stop::CouldNotRun)?;
     let cpu = page(&mut cdp, &server, "cpu")?;
     let gpu = page(&mut cdp, &server, "gpu")?;
-    let worker = page(&mut cdp, &server, "worker");
+    let worker = worker.then(|| page(&mut cdp, &server, "worker"));
     let served = server.served();
     drop(server);
     let _ = cdp.call(None, "Browser.close", json!({}));
@@ -1217,6 +1278,7 @@ fn drive_firefox(
     site: &Path,
     work: &Path,
     profile: &Path,
+    worker: bool,
 ) -> Result<Session, Stop> {
     if let Some(why) =
         firefox::display_missing(std::env::consts::OS, std::env::var_os("DISPLAY").as_deref())
@@ -1225,12 +1287,20 @@ fn drive_firefox(
     }
     firefox::make_profile(profile).map_err(Stop::CouldNotRun)?;
     let home = ScratchHome(firefox::home_of(profile));
-    let pages = drive_by_posts("Firefox", &firefox.path, site, work, &home, |url, home| {
-        (
-            firefox::launch_args(profile, url),
-            firefox::launch_env(std::env::vars_os(), home),
-        )
-    })?;
+    let pages = drive_by_posts(
+        "Firefox",
+        &firefox.path,
+        site,
+        work,
+        &home,
+        worker,
+        |url, home| {
+            (
+                firefox::launch_args(profile, url),
+                firefox::launch_env(std::env::vars_os(), home),
+            )
+        },
+    )?;
     drop(home);
     let product = firefox::product(&pages.gpu.answer.user_agent);
     Ok(pages.session(product))
@@ -1242,27 +1312,44 @@ fn drive_webkit(
     site: &Path,
     work: &Path,
     profile: &Path,
+    worker: bool,
 ) -> Result<Session, Stop> {
     webkit::make_profile(profile).map_err(Stop::CouldNotRun)?;
     let home = ScratchHome(webkit::home_of(profile));
-    let frameworks = webkit::frameworks_dir(&webkit.path);
-    let pages = drive_by_posts("WebKit", &webkit.path, site, work, &home, |url, home| {
-        (
-            webkit::launch_args(profile, url),
-            webkit::launch_env(std::env::vars_os(), home, &frameworks),
-        )
-    })?;
+    let frameworks =
+        webkit::keeps_windows(std::env::consts::OS).then(|| webkit::frameworks_dir(&webkit.path));
+    let pages = drive_by_posts(
+        "WebKit",
+        &webkit.path,
+        site,
+        work,
+        &home,
+        worker,
+        |url, home| {
+            (
+                webkit::launch_args(profile, url, std::env::consts::OS),
+                webkit::launch_env(std::env::vars_os(), home, frameworks.as_deref()),
+            )
+        },
+    )?;
     drop(home);
     let product = webkit::product(&pages.gpu.answer.user_agent);
     Ok(pages.session(product))
 }
 
-/// The three answers a browser driven by its pages posted.
+/// The answers a browser driven by its pages posted: the worker's where its row is in the set.
 struct PostedPages {
     cpu: Page,
     gpu: Page,
-    worker: Result<Page, Stop>,
+    worker: Option<Result<Page, Stop>>,
     served: usize,
+}
+
+/// The first page a browser driven by its pages opens on `origin`: the cpu page, which opens
+/// the gpu page and then, where `worker`, the worker page (`postBack` in lane.mjs).
+fn first_page(origin: &str, worker: bool) -> String {
+    let next = if worker { "gpu,worker" } else { "gpu" };
+    format!("{origin}/cpu.html?post=1&next={next}")
 }
 
 impl PostedPages {
@@ -1279,19 +1366,21 @@ impl PostedPages {
     }
 }
 
-/// Serve `site`, launch `browser`, and collect the three posted page answers.
+/// Serve `site`, launch `browser`, and collect the posted page answers (the worker's where
+/// `worker`).
 fn drive_by_posts(
     what: &str,
     browser: &Path,
     site: &Path,
     work: &Path,
     home: &ScratchHome,
+    worker: bool,
     launch: impl FnOnce(&str, &Path) -> (Vec<OsString>, Vec<(OsString, OsString)>),
 ) -> Result<PostedPages, Stop> {
     let log = work.join("browser.log");
     let (out, err) = log_stdio(&log)?;
     let mut server = serve::Server::start(site).map_err(Stop::CouldNotRun)?;
-    let url = format!("{}/cpu.html?post=1&next=gpu,worker", server.origin());
+    let url = first_page(&server.origin(), worker);
     let (args, env) = launch(&url, &home.0);
     let mut cmd = LaneCommand::new(browser);
     cmd.args(args)
@@ -1302,7 +1391,7 @@ fn drive_by_posts(
     let child = spawn(cmd)
         .map_err(|e| Stop::CouldNotRun(format!("could not start {}: {e}", browser.display())))?;
     let mut running = Running(child);
-    let pages = take_posts(&mut server, &log, Instant::now(), || {
+    let pages = take_posts(&mut server, &log, Instant::now(), worker, || {
         running
             .ended()
             .map(|status| format!("{what} exited ({status})"))
@@ -1312,13 +1401,14 @@ fn drive_by_posts(
     pages
 }
 
-/// The three answers the pages post to `server`, the first timed from `since`, each waited for
-/// while `ended` says nothing ended (the browser, or its driver): what did, said whole; its log
-/// at `log` goes with a refusal.
+/// The answers the pages post to `server` (the worker's where `worker`), the first timed from
+/// `since`, each waited for while `ended` says nothing ended (the browser, or its driver): what
+/// did, said whole; its log at `log` goes with a refusal.
 fn take_posts(
     server: &mut serve::Server,
     log: &Path,
     mut since: Instant,
+    worker: bool,
     mut ended: impl FnMut() -> Option<String>,
 ) -> Result<PostedPages, Stop> {
     let mut take = |kind: &str| -> Result<Page, Stop> {
@@ -1345,7 +1435,7 @@ fn take_posts(
     };
     let cpu = take("cpu")?;
     let gpu = take("gpu")?;
-    let worker = take("worker");
+    let worker = worker.then(|| take("worker"));
     Ok(PostedPages {
         cpu,
         gpu,
@@ -1361,11 +1451,16 @@ fn take_posts(
 /// said beside them and decides nothing by itself. Cleanup deletes only the created automation
 /// session and ends the owned driver. A process census is no proof of application ownership:
 /// the shared Safari application is left alone, including after an uncertain session reply.
-fn drive_safari(safari: &safari::Safari, site: &Path, work: &Path) -> Result<Session, Stop> {
+fn drive_safari(
+    safari: &safari::Safari,
+    site: &Path,
+    work: &Path,
+    worker: bool,
+) -> Result<Session, Stop> {
     let log = work.join("browser.log");
     let (out, err) = log_stdio(&log)?;
     let mut server = serve::Server::start(site).map_err(Stop::CouldNotRun)?;
-    let url = format!("{}/cpu.html?post=1&next=gpu,worker", server.origin());
+    let url = first_page(&server.origin(), worker);
     let port = safari::free_port().map_err(Stop::CouldNotRun)?;
     let mut cmd = LaneCommand::new(&safari.driver);
     cmd.args(safari::driver_args(port))
@@ -1396,7 +1491,7 @@ fn drive_safari(safari: &safari::Safari, site: &Path, work: &Path) -> Result<Ses
             if let Err(why) = session.open(&url) {
                 notes.push(format!("{why}; the pages' answers are what is judged"));
             }
-            let pages = take_posts(&mut server, &log, since, || {
+            let pages = take_posts(&mut server, &log, since, worker, || {
                 driver
                     .ended()
                     .map(|status| format!("safaridriver exited ({status})"))
@@ -1419,6 +1514,7 @@ fn drive_safari(safari: &safari::Safari, site: &Path, work: &Path) -> Result<Ses
     let pages = pages.map_err(|stop| match stop {
         Stop::CouldNotRun(why) => Stop::CouldNotRun(noted(why)),
         Stop::Fail(why) => Stop::Fail(noted(why)),
+        Stop::Lacks(why) => Stop::Lacks(noted(why)),
     })?;
     let product = safari::product(&pages.gpu.answer.user_agent);
     let mut session = pages.session(product);
@@ -1491,13 +1587,19 @@ impl Drop for ScratchHome {
     }
 }
 
-/// Parse a posted page answer or error payload.
+/// Parse a posted page answer or error payload. An error the page marks `unsupported` is a lack
+/// the page found before aterm ran ([`Stop::Lacks`]: worker.mjs's worker given no WebGL2 context
+/// at all); what it means for the row is the engine's ([`Engine::worker_stop`]).
 fn posted(kind: &str, body: &[u8]) -> Result<judge::Answer, Stop> {
     let fail = |what: String| Stop::Fail(format!("the {kind} page: {what}"));
     let v: Value =
         aterm_json::from_slice(body).map_err(|e| fail(format!("its answer is not JSON: {e}")))?;
     if let Some(error) = v.get("error") {
-        return Err(fail(error.as_str().unwrap_or("failed").to_string()));
+        let error = error.as_str().unwrap_or("failed").to_string();
+        if v.get("unsupported").and_then(Value::as_bool) == Some(true) {
+            return Err(Stop::Lacks(format!("the {kind} page: {error}")));
+        }
+        return Err(fail(error));
     }
     let answer = v
         .get("answer")
@@ -1673,6 +1775,7 @@ mod tests {
             scratch: scratch.path().to_owned(),
             ceiling: Some(cdp::HANG_DETECTOR),
             quiet: Some(aterm_capacity::Admit::Now),
+            no_worker: Vec::new(),
         };
         // No real browser or driver is eligible to start in this control.
         let engine = Engine::Safari(safari::Safari {
@@ -1863,7 +1966,8 @@ mod tests {
         }
     }
 
-    /// A posted answer parses, and a page's error is a finding naming it.
+    /// A posted answer parses, and a page's error is a finding naming it, unless the page marks
+    /// it the browser's lack, which the engine judges ([`Engine::worker_stop`]).
     #[test]
     fn a_posted_answer_or_error_is_read_back() {
         let ok = br#"{"answer": {"module": "aterm-wasm", "adapter": "cpu", "frames": []}}"#;
@@ -1873,9 +1977,100 @@ mod tests {
             posted("worker", failed),
             Err(Stop::Fail(why)) if why == "the worker page: init_offscreen(canvas): no WebGL2"
         ));
+        let lacks = br#"{"error": "the worker: no WebGL2 context", "unsupported": true}"#;
+        assert!(matches!(
+            posted("worker", lacks),
+            Err(Stop::Lacks(why)) if why == "the worker page: the worker: no WebGL2 context"
+        ));
+        let not_marked = br#"{"error": "the worker: no WebGL2 context", "unsupported": "yes"}"#;
+        assert!(
+            matches!(posted("worker", not_marked), Err(Stop::Fail(_))),
+            "only `unsupported: true` makes an error the browser's"
+        );
         assert!(matches!(posted("gpu", b"{}"), Err(Stop::Fail(why)) if why.contains("no answer")));
         assert!(
             matches!(posted("gpu", b"<html>"), Err(Stop::Fail(why)) if why.contains("not JSON"))
+        );
+    }
+
+    /// A worker that posts `unsupported` fails its row in every engine whose worker WebGL2 the
+    /// lane has measured: Chromium's, Firefox's (on Linux too), Safari's and macOS's WebKit. Only
+    /// WPE on Linux cannot run it. Any other stop stays as it is.
+    #[test]
+    fn only_wpe_on_linux_lacking_worker_webgl2_cannot_run_its_row() {
+        let lacks = || {
+            let body = br#"{"error": "the worker: no WebGL2 context", "unsupported": true}"#;
+            posted("worker", body).expect_err("an unsupported post is a stop")
+        };
+        let at = PathBuf::from("/absent");
+        let measured = [
+            Engine::Chromium(
+                chromium::Browser {
+                    path: at.clone(),
+                    shell: true,
+                    source: String::new(),
+                },
+                chromium::Angle::SwiftShader,
+            ),
+            Engine::Firefox(firefox::Firefox {
+                path: at.clone(),
+                source: String::new(),
+            }),
+            Engine::Safari(safari::Safari { driver: at.clone() }),
+        ];
+        let wpe = Engine::WebKit(webkit::WebKit {
+            path: at,
+            source: String::new(),
+        });
+        for os in ["linux", "macos"] {
+            for engine in &measured {
+                assert!(
+                    matches!(engine.worker_stop(os, &Vec::new, lacks()), Stop::Fail(_)),
+                    "{} on {os}",
+                    engine.name()
+                );
+            }
+        }
+        assert!(matches!(
+            wpe.worker_stop("macos", &Vec::new, lacks()),
+            Stop::Fail(_)
+        ));
+        assert!(matches!(
+            wpe.worker_stop("linux", &Vec::new, lacks()),
+            Stop::CouldNotRun(why) if why.starts_with("the worker page: the worker: no WebGL2")
+        ));
+        assert!(matches!(
+            measured[1].worker_stop("linux", &Vec::new, Stop::CouldNotRun("gone".into())),
+            Stop::CouldNotRun(why) if why == "gone"
+        ));
+    }
+
+    /// `--no-worker` names a session whose worker row the run leaves out, whose browser then
+    /// opens no worker page; the page chain is the cpu page's `next`.
+    #[test]
+    fn no_worker_leaves_the_worker_page_out_of_the_chain() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        let asked = drive_args(&s(&[
+            "s",
+            "o",
+            "--engine",
+            "webkit",
+            "--no-worker=webkit",
+            "--no-worker",
+            "webkit",
+        ]))
+        .expect("parses");
+        assert_eq!(asked.wanted, ["webkit"]);
+        assert_eq!(asked.built(PathBuf::new()).no_worker, ["webkit"]);
+        assert!(drive_args(&s(&["s", "o", "--no-worker", "wpe"])).is_err());
+        assert!(drive_args(&s(&["s", "o", "--no-worker"])).is_err());
+        assert_eq!(
+            first_page("http://127.0.0.1:9", true),
+            "http://127.0.0.1:9/cpu.html?post=1&next=gpu,worker"
+        );
+        assert_eq!(
+            first_page("http://127.0.0.1:9", false),
+            "http://127.0.0.1:9/cpu.html?post=1&next=gpu"
         );
     }
 }

@@ -146,9 +146,9 @@ fn with_nothing_kept_a_compiling_stage_claims_the_cold_figure() {
         );
         assert_eq!((n.bytes, &n.how), (want, &How::Cold), "{physical:?}");
     }
-    // The test run starts its binaries side by side: unmeasured, it claims the cold figure too
-    // (A9). NEGATIVE CONTROL: a stage that runs only what an earlier one built, one at a time
-    // (a measuring row), still claims nothing.
+    // The test run's dispatch claims what its plan holds together once it knows its binaries, so
+    // the stage claims nothing here (A9). NEGATIVE CONTROL: a stage that runs only what an
+    // earlier one built, one at a time (a measuring row), still claims nothing for the old reason.
     let run = spec(StageId::Test, Lane::MainTarget);
     let n = need(
         &none,
@@ -157,7 +157,7 @@ fn with_nothing_kept_a_compiling_stage_claims_the_cold_figure() {
         &over(&run, &gui()),
         Some(24 * GIB),
     );
-    assert_eq!((n.bytes, n.how), (12 * GIB, How::Together));
+    assert_eq!((n.bytes, n.how), (0, How::Dispatched));
     let rows = spec(StageId::MeasuringTests, Lane::MainTarget);
     let n = need(
         &none,
@@ -277,7 +277,7 @@ fn a_wider_selections_most_peak_bounds_a_narrower_one() {
     );
     apart.push(
         Key {
-            variant: Some("jobs 4".to_owned()),
+            variant: Some("cells linux-arm".to_owned()),
             ..key(&["a", "b"])
         },
         20 * GIB,
@@ -293,9 +293,10 @@ fn a_wider_selections_most_peak_bounds_a_narrower_one() {
 /// A stage with no record in its checkout, a new worktree's first run, claims by what its stage
 /// and selection kept in another checkout: the most any other checkout keeps (15 GiB of /vmem's
 /// 15 and 10, beside /other's 12), and a fifth more. A record in its own checkout, its own or a
-/// wider selection's, wins over another checkout's; another checkout's record of a wider
-/// selection, another stage or another variant (30 GiB each) is not read. NEGATIVE CONTROL: read
-/// in its own checkout alone, as before, the new worktree's compile claimed the cold 12 GiB.
+/// wider selection's, wins over another checkout's; its own selection's in another checkout wins
+/// over another checkout's record of a wider selection (30 GiB), and another stage's or another
+/// variant's (30 GiB each) is not read. NEGATIVE CONTROL: read in its own checkout alone, as
+/// before, the new worktree's compile claimed the cold 12 GiB.
 #[test]
 fn a_new_checkout_claims_what_another_checkout_kept() {
     let at = |checkout: &str, scope: &Scope| Key {
@@ -310,7 +311,7 @@ fn a_new_checkout_claims_what_another_checkout_kept() {
     r.push(at("/far", &wider), 30 * GIB, 4);
     r.push(
         Key {
-            variant: Some("jobs 4".to_owned()),
+            variant: Some("cells linux-arm".to_owned()),
             ..at("/far", &gui())
         },
         30 * GIB,
@@ -651,12 +652,9 @@ fn a_selection_of_crates_kept_apart_claims_their_sum() {
         &over(&run, &packages(&["a", "b"])),
         Some(48 * GIB),
     );
-    // A test run is not composed from its parts' records: it runs binaries side by side (A9),
-    // so with no record of its own it claims the cold figure.
-    assert_eq!(
-        (n.bytes, n.how),
-        (aterm_capacity::cold_claim(Some(48 * GIB)), How::Together)
-    );
+    // A test run is not composed from stage records: its dispatch claims from each binary's own
+    // history once it knows the plan (A9).
+    assert_eq!((n.bytes, n.how), (0, How::Dispatched));
 }
 
 /// A COVER WEIGHS AT LEAST WHAT SELECTIONS INSIDE IT KEPT: with the lint's `-p a -p b` kept at
@@ -750,11 +748,265 @@ fn a_cover_weighs_at_least_what_selections_inside_it_kept() {
     );
 }
 
+/// A NEW WORKTREE CLAIMS WHAT A WIDER SELECTION KEPT ELSEWHERE (measured 2026-11-06 on this
+/// 48 GiB Mac): a fresh worktree's `verify -p aterm-sysprobe`, with no run of `-p aterm-sysprobe`
+/// kept anywhere, claimed its test compile and its lint the cold 16 GiB each, and each waited 16
+/// minutes for it and peaked under 1 GiB, while another checkout's record of `-p aterm-release -p
+/// aterm-sysprobe` held the test compile at 4.55 GiB and the lint at 3.4. Each now claims that
+/// and a fifth more ([`wider_elsewhere`]), and says so. The test run, which compiles nothing,
+/// claims nothing beside a wider test run's record elsewhere: its dispatch claims for its
+/// binaries ([`How::Dispatched`]). NEGATIVE CONTROL, by
+/// hand: with the rule taken out of [`need`], the test compile claimed the cold 16 GiB
+/// ([`How::Cold`]).
+#[test]
+fn a_new_worktree_claims_what_a_wider_selection_kept_elsewhere() {
+    let at = |checkout: &str, id: StageId, crates: &[&str]| Key {
+        checkout: checkout.to_owned(),
+        ..Key::of(id, &packages(crates))
+    };
+    let wide = ["aterm-release", "aterm-sysprobe"];
+    let compile_peak = 4_885_525_299; // 4.55 GiB.
+    let lint_peak = 3_650_722_201; // 3.4 GiB.
+    let mut r = Records::default();
+    r.push(
+        at("/sw-trust", StageId::TestCompile, &wide),
+        compile_peak,
+        1,
+    );
+    r.push(at("/sw-trust", StageId::Tippy, &wide), lint_peak, 2);
+    for (stage, peak) in [
+        (compile(), compile_peak),
+        (spec(StageId::Tippy, Lane::TippyTarget), lint_peak),
+    ] {
+        let n = need(
+            &r,
+            &Records::default(),
+            &stage,
+            &at("/vwider", stage.id, &["aterm-sysprobe"]),
+            Some(48 * GIB),
+        );
+        assert_eq!(
+            (n.bytes, &n.how),
+            (
+                aterm_capacity::peak_claim(peak),
+                &How::WiderElsewhere(Wider {
+                    key: at("/sw-trust", stage.id, &wide),
+                    peak,
+                    runs: 1,
+                })
+            ),
+            "{n}"
+        );
+        assert!(
+            n.to_string().contains(&format!(
+                "the most a run over a wider selection (-p aterm-release -p aterm-sysprobe) in \
+                 /sw-trust used ({}) and a fifth more, at least 1 GiB: no run of it is kept",
+                aterm_capacity::size(peak)
+            )),
+            "{n}"
+        );
+    }
+    let run = spec(StageId::Test, Lane::MainTarget);
+    r.push(at("/sw-trust", StageId::Test, &wide), 2 * GIB, 3);
+    let n = need(
+        &r,
+        &Records::default(),
+        &run,
+        &at("/vwider", StageId::Test, &["aterm-sysprobe"]),
+        Some(48 * GIB),
+    );
+    assert_eq!((n.bytes, n.how), (0, How::Dispatched));
+}
+
+/// A WIDER RECORD ELSEWHERE CLAIMS AT MOST THE COLD FIGURE: `-p a` in a new checkout, with `-p a
+/// -p b` kept at 20 GiB in /far, claims 16 GiB on a 48 GiB Mac and 12 on a 24 GiB one, the cold
+/// figure, and says so: the rule stands in for the cold figure and only ever lowers it. The most
+/// of every wider record elsewhere answers, so `-p a -p c` kept at 2 GiB in /near beside it
+/// lowers nothing: a light superset is as likely a warm run as a tighter bound. NEGATIVE CONTROL,
+/// by hand: with the cap taken out of [`need`], the 48 GiB Mac's claim was 24 GiB.
+#[test]
+fn a_wider_record_elsewhere_claims_at_most_the_cold_figure() {
+    let at = |checkout: &str, crates: &[&str]| Key {
+        checkout: checkout.to_owned(),
+        ..over(&compile(), &packages(crates))
+    };
+    let mut r = Records::default();
+    r.push(at("/far", &["a", "b"]), 20 * GIB, 1);
+    r.push(at("/near", &["a", "c"]), 2 * GIB, 2);
+    for (physical, want) in [(48 * GIB, 16 * GIB), (24 * GIB, 12 * GIB)] {
+        let n = need(
+            &r,
+            &Records::default(),
+            &compile(),
+            &at("/new", &["a"]),
+            Some(physical),
+        );
+        assert_eq!(n.bytes, want, "{n}");
+        assert!(matches!(n.how, How::WiderElsewhere(_)), "{n}");
+        assert!(
+            n.to_string().contains(
+                "(20 GiB) and a fifth more, at most the cold figure (16 GiB, at most half of \
+                 physical memory)"
+            ),
+            "{n}"
+        );
+    }
+}
+
+/// THE LESSER OF A WIDER RECORD ELSEWHERE AND A COVER: `-p a -p b` in a new checkout, with `-p a`
+/// kept at 3 GiB in /one and `-p b` at 4 GiB in /two (a cover of 7 GiB, claiming 8.4) and `-p a
+/// -p b -p c` at 5 GiB in /far, claims the wider record's 6 GiB; with the wider record at 9 GiB
+/// instead, the cover's 8.4; at 7 GiB, a tie, the cover's. A wider record lighter than a
+/// selection inside the key kept (2 GiB, a warm run, beside `-p b`'s 4) bounds nothing: the
+/// cover answers (8.4 GiB), and with no cover (no `-p a` kept) the cold figure, since `-p b`'s
+/// record bounds none of `a`; at `-p b`'s 4 GiB, no lighter, it answers (5 GiB). NEGATIVE
+/// CONTROLS, by hand: the wider record read before the cover claimed 10.8 GiB for the second; the
+/// cover read before the wider record claimed 8.4 GiB for the first; with the warm record let in
+/// ([`Records::wider_elsewhere`] without its narrower records' refusal), it claimed 3 GiB beside
+/// the cover.
+#[test]
+fn a_selection_claims_the_lesser_of_a_wider_record_elsewhere_and_a_cover() {
+    let at = |checkout: &str, crates: &[&str]| Key {
+        checkout: checkout.to_owned(),
+        ..over(&compile(), &packages(crates))
+    };
+    let need_of = |r: &Records| {
+        need(
+            r,
+            &Records::default(),
+            &compile(),
+            &at("/new", &["a", "b"]),
+            Some(48 * GIB),
+        )
+    };
+    let mut parts = Records::default();
+    parts.push(at("/one", &["a"]), 3 * GIB, 1);
+    parts.push(at("/two", &["b"]), 4 * GIB, 2);
+    let with_wider = |base: &Records, gib: u64| {
+        let mut r = base.clone();
+        r.push(at("/far", &["a", "b", "c"]), gib * GIB, 3);
+        r
+    };
+    let n = need_of(&with_wider(&parts, 5));
+    assert_eq!(
+        (n.bytes, matches!(n.how, How::WiderElsewhere(_))),
+        (aterm_capacity::peak_claim(5 * GIB), true),
+        "{n}"
+    );
+    for gib in [9, 7] {
+        let n = need_of(&with_wider(&parts, gib));
+        assert_eq!(
+            (n.bytes, matches!(n.how, How::Composed(_))),
+            (aterm_capacity::peak_claim(7 * GIB), true),
+            "{gib} GiB: {n}"
+        );
+    }
+    let mut lone = Records::default();
+    lone.push(at("/two", &["b"]), 4 * GIB, 2);
+    for (base, want, cover) in [
+        (&parts, aterm_capacity::peak_claim(7 * GIB), true),
+        (&lone, 16 * GIB, false),
+    ] {
+        let n = need_of(&with_wider(base, 2));
+        assert_eq!(
+            (
+                n.bytes,
+                matches!(n.how, How::Composed(_)),
+                n.how == How::Cold
+            ),
+            (want, cover, !cover),
+            "{n}"
+        );
+    }
+    let n = need_of(&with_wider(&lone, 4));
+    assert_eq!(
+        (n.bytes, matches!(n.how, How::WiderElsewhere(_))),
+        (aterm_capacity::peak_claim(4 * GIB), true),
+        "{n}"
+    );
+}
+
+/// A WIDER RECORD ELSEWHERE LIGHTER THAN A UNIT OF THE TEST COMPILE'S CRATES IS REFUSED: `-p a`,
+/// one crate, which no narrower named selection is inside, in /new, with `-p a -p b` kept at
+/// 2 GiB in /far and `a`'s lib-test unit kept at 5 GiB in /old (a cold compile of `-p a` compiles
+/// that unit, so the wider run that kept 2 GiB was warm): its test compile claims the cold
+/// figure, and so does a `-p a@1.0.0` spec's, read by its package name. A wider record at the
+/// unit's 5 GiB answers. The lint, whose work keeps no unit's peak, still reads its own wider
+/// record elsewhere however warm (the documented limit), and a shaped call's variant reads no
+/// floor: it compiles part of the work. NEGATIVE CONTROL, by hand: with the floor not passed
+/// ([`wider_elsewhere`] reading `records.wider_elsewhere(key, 0)`), the first test compile
+/// claimed 3 GiB, the wider record's 2 GiB and 1 GiB more.
+#[test]
+fn a_wider_record_elsewhere_lighter_than_a_unit_of_the_test_compile_is_refused() {
+    assert_eq!(
+        Key::of(StageId::TestCompile, &gui()).stage,
+        aterm_capacity::book::TEST_COMPILE,
+        "the book's test compile is verify's"
+    );
+    let at = |checkout: &str, id: StageId, crates: &[&str]| Key {
+        checkout: checkout.to_owned(),
+        ..Key::of(id, &packages(crates))
+    };
+    let unit = crate::shape::unit_key(
+        "/old",
+        &crate::unitgraph::UnitName {
+            package: "a".to_owned(),
+            kind: "a lib".to_owned(),
+        },
+    );
+    let with_wider = |gib: u64| {
+        let mut r = Records::default();
+        r.push(unit.clone(), 5 * GIB, 1);
+        for id in [StageId::TestCompile, StageId::Tippy] {
+            r.push(at("/far", id, &["a", "b"]), gib * GIB, 2);
+        }
+        r
+    };
+    let warm = with_wider(2);
+    let need_of = |r: &Records, stage: &StageSpec, key: &Key| {
+        need(r, &Records::default(), stage, key, Some(48 * GIB))
+    };
+    for crates in [["a"], ["a@1.0.0"]] {
+        let n = need_of(
+            &warm,
+            &compile(),
+            &at("/new", StageId::TestCompile, &crates),
+        );
+        assert_eq!((n.bytes, &n.how), (16 * GIB, &How::Cold), "{crates:?}: {n}");
+    }
+    let n = need_of(
+        &with_wider(5),
+        &compile(),
+        &at("/new", StageId::TestCompile, &["a"]),
+    );
+    assert_eq!(
+        (n.bytes, matches!(n.how, How::WiderElsewhere(_))),
+        (aterm_capacity::peak_claim(5 * GIB), true),
+        "{n}"
+    );
+    let lint = spec(StageId::Tippy, Lane::TippyTarget);
+    let n = need_of(&warm, &lint, &at("/new", StageId::Tippy, &["a"]));
+    assert_eq!(
+        (n.bytes, matches!(n.how, How::WiderElsewhere(_))),
+        (aterm_capacity::peak_claim(2 * GIB), true),
+        "{n}"
+    );
+    let lib = Key {
+        variant: Some("lib".to_owned()),
+        ..at("/new", StageId::TestCompile, &["a"])
+    };
+    assert_eq!(warm.unit_floor(&lib), 0, "a shaped call's variant");
+    assert_eq!(
+        warm.unit_floor(&at("/new", StageId::TestCompile, &["a"])),
+        5 * GIB
+    );
+}
+
 /// A run keys each stage's record by its checkout, its selection where the stage reads it, and
 /// its variant ([`StageKey::of_run`]): the test compile over `-p aterm-gui` in `/ck` by that crate
 /// in `/ck`; the export, whose work is the same whatever is selected, by the workspace; the test
-/// run by the test binaries it runs at once; the cells asked for by their sorted names, and
-/// cells a selection pulled by its crates. NEGATIVE CONTROL: the same stages in another checkout
+/// run by nothing more; the cells asked for by their sorted names, and cells a selection pulled
+/// by its crates. NEGATIVE CONTROL: the same stages in another checkout
 /// key apart.
 #[test]
 fn a_run_keys_each_stage_by_its_checkout_selection_and_variant() {
@@ -778,12 +1030,9 @@ fn a_run_keys_each_stage_by_its_checkout_selection_and_variant() {
     );
     let export = Key::of_run(StageId::Export, &here);
     assert_eq!((export.crates, export.variant), (None, None));
-    assert_eq!(
-        Key::of_run(StageId::Test, &here).variant,
-        Some(format!("jobs {}", here.test_jobs()))
-    );
+    assert_eq!(Key::of_run(StageId::Test, &here).variant, None);
     let checker = Key::of_run(StageId::SpecCheckers, &here);
-    assert_eq!(checker.variant, Some(format!("jobs {}", here.test_jobs())));
+    assert_eq!(checker.variant, None);
     assert_eq!(checker.crates, Some(vec!["aterm-gui".to_owned()]));
     let mut cells = ctx("/ck");
     cells.cells = vec!["win".to_owned(), "linux-arm".to_owned()];
@@ -852,8 +1101,9 @@ fn a_light_run_does_not_hide_a_heavy_one_it_keeps() {
 /// A compiling stage's book keeps nothing for a run light beside its heaviest peak of the last
 /// two weeks: after a 16 GiB test compile, a 2 GiB one (its units were fresh) is not kept and the
 /// next run still claims by 16 GiB, while a 5 GiB one is. A stage that compiles nothing keeps
-/// every run: the test run's light peak after a heavy one. NEGATIVE CONTROL: with the compile
-/// kept as the test run is, the 2 GiB run was kept.
+/// every run: the measuring rows' light peak after a heavy one. The test run, whose dispatch
+/// claims from each binary's own history, keeps none. NEGATIVE CONTROL: with the compile kept as
+/// the measuring rows are, the 2 GiB run was kept.
 #[test]
 fn a_compile_light_beside_its_heavy_peak_keeps_nothing() {
     let dir = aterm_tempfile::tempdir().expect("scratch");
@@ -879,7 +1129,7 @@ fn a_compile_light_beside_its_heavy_peak_keeps_nothing() {
         book.keep(&compile(), &key, 5 * GIB).expect("kept"),
         Kept::Kept
     );
-    let run = spec(StageId::Test, Lane::MainTarget);
+    let run = spec(StageId::MeasuringTests, Lane::MainTarget);
     let run_key = over(&run, &gui());
     assert_eq!(
         book.keep(&run, &run_key, 16 * GIB).expect("kept"),
@@ -887,6 +1137,13 @@ fn a_compile_light_beside_its_heavy_peak_keeps_nothing() {
     );
     assert_eq!(book.keep(&run, &run_key, GIB).expect("kept"), Kept::Kept);
     assert_eq!(book.records().learned(&run_key).map(|l| l.runs), Some(2));
+    let tests = spec(StageId::Test, Lane::MainTarget);
+    let tests_key = over(&tests, &gui());
+    assert_eq!(
+        book.keep(&tests, &tests_key, 16 * GIB).expect("nothing"),
+        Kept::Nowhere
+    );
+    assert_eq!(book.records().learned(&tests_key).map(|l| l.runs), None);
     let fmt = spec(StageId::Formatting, Lane::Pure);
     assert_eq!(
         book.keep(&fmt, &over(&fmt, &gui()), GIB).expect("nothing"),

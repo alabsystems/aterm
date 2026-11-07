@@ -20,6 +20,12 @@ pub(super) struct Coordinator {
 }
 
 impl Coordinator {
+    /// A failed sampling round observed no reliable transition. Keep the owned
+    /// task and retry clock, and announce its next fresh scope again.
+    pub(super) fn invalidate_observation(&mut self) {
+        self.observed = None;
+    }
+
     pub(super) fn round_with(
         &mut self,
         scope: &Result<InputSetupScope, String>,

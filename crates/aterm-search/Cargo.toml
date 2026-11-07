@@ -24,6 +24,7 @@ aterm-regex = { workspace = true }
 [dev-dependencies]
 # The seeded `XorShift` tests/search_vs_bruteforce.rs draws from.
 aterm-spec = { workspace = true }
+libc = { workspace = true }
 
 [lints]
 workspace = true

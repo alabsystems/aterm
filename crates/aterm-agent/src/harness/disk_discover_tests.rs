@@ -960,6 +960,392 @@ fn an_xpy_checkout_gives_its_bootstrap_build_dirs_and_never_a_sysroot() {
     }
 }
 
+/// An x.py build tree at `tree` as bootstrap lays one: `stage1-rustc`, `stage1-std` and
+/// `stage1-tools` under the host (each a tagged cargo build directory), a `host` link, a stage
+/// sysroot, and bootstrap's own `bootstrap/` build directory; the stage trees, relative to
+/// `tree`, sorted.
+fn lay_xpy_tree(tree: &Path) -> Vec<PathBuf> {
+    let host = mkdirs(&tree.join("aarch64-apple-darwin"));
+    symlink("aarch64-apple-darwin", tree.join("host")).expect("host link");
+    let stages: Vec<PathBuf> = ["stage1-rustc", "stage1-std", "stage1-tools"]
+        .iter()
+        .map(|n| {
+            lay_target(&host.join(n));
+            PathBuf::from("aarch64-apple-darwin").join(n)
+        })
+        .collect();
+    lay_target(&host.join("stage1"));
+    lay_target(&tree.join("bootstrap"));
+    stages
+}
+
+/// What discovery finds under an x.py checkout `repo` from `$HOME`: each build directory, as
+/// its path relative to `under` (or whole, when it is elsewhere), with its kind.
+fn found_in(tmp: &Tmp, under: &Path) -> Vec<(PathBuf, &'static str)> {
+    let d = discover(&roots_at(tmp), Budget::SHIPPED);
+    let under = canon(under);
+    let mut got: Vec<(PathBuf, &'static str)> = kinds(&d)
+        .into_iter()
+        .map(|(p, k)| {
+            (
+                p.strip_prefix(&under).map_or(p.clone(), Path::to_path_buf),
+                k,
+            )
+        })
+        .collect();
+    got.sort();
+    got
+}
+
+/// THE SANCTIONED `build -> build.noindex` LINK IS THE BUILD TREE: a Trust checkout whose
+/// `build` is a link to its real sibling `build.noindex` gives the same stage build directories
+/// as one whose `build/` is real, each a bootstrap tree, read where the link leads, and nothing
+/// under `build.noindex` is a checkout's build directory (which the idle tier could empty).
+/// NEGATIVE CONTROLS: a bare `build.noindex` with no link (named in a note as a stray tree,
+/// and so is one beside a fresh real `build/`, whose own trees are the only ones found), a
+/// dangling link, a link to another folder of the checkout (one the walk reaches, `build ->
+/// build.local`, whose `bootstrap/` it would otherwise take as a checkout's, and one below its
+/// depth), a link to a `build.noindex` outside it (a shared tree or another volume), a
+/// `build.noindex` that is itself a link, a link through another link (named as not followed,
+/// with no stray claimed) and, on a case-insensitive volume, a bare `Build.noindex` give no
+/// build directory at all.
+#[test]
+fn an_xpy_checkouts_sanctioned_build_link_gives_the_same_bootstrap_dirs() {
+    let tmp = Tmp::new("discover-xpy-noindex");
+    let home = mkdirs(&tmp.path().join("home"));
+    let repo = mkdirs(&home.join("trust"));
+    std::fs::write(repo.join("x.py"), b"#!/usr/bin/env python3\n").expect("x.py");
+    let want = |tree: &str, stages: &[PathBuf]| -> Vec<(PathBuf, &'static str)> {
+        stages
+            .iter()
+            .map(|s| (PathBuf::from(tree).join(s), "bootstrap"))
+            .collect()
+    };
+
+    let stages = lay_xpy_tree(&repo.join("build"));
+    let real = found_in(&tmp, &repo);
+    assert_eq!(real, want("build", &stages), "a real build/");
+
+    let stray = |tmp: &Tmp| -> Vec<String> {
+        discover(&roots_at(tmp), Budget::SHIPPED)
+            .notes
+            .into_iter()
+            .filter(|n| n.contains("build.noindex"))
+            .collect()
+    };
+    assert_eq!(stray(&tmp), Vec::<String>::new(), "a real build/ alone");
+    std::fs::rename(repo.join("build"), repo.join("build.noindex")).expect("move aside");
+    assert_eq!(
+        found_in(&tmp, &repo),
+        [],
+        "a bare build.noindex is bootstrap's, and with no link it is no build tree"
+    );
+    let note = format!(
+        "cargo-targets: {} is a build.noindex of an x.py checkout that its `build` does not lead \
+         to: it is not read as the checkout's build tree, and nothing here removes it",
+        canon(&repo).join("build.noindex").display()
+    );
+    assert_eq!(
+        stray(&tmp),
+        std::slice::from_ref(&note),
+        "a bare build.noindex is named"
+    );
+    let fresh = lay_xpy_tree(&repo.join("build"));
+    assert_eq!(
+        found_in(&tmp, &repo),
+        want("build", &fresh),
+        "beside a fresh real build/, only that tree's"
+    );
+    assert_eq!(stray(&tmp), [note], "and the stray tree is named");
+    std::fs::remove_dir_all(repo.join("build")).expect("rm the fresh build/");
+    symlink("build.noindex", repo.join("build")).expect("sanctioned link");
+    let linked = found_in(&tmp, &repo);
+    assert_eq!(
+        linked,
+        want("build.noindex", &stages),
+        "the sanctioned link"
+    );
+    assert_eq!(
+        stray(&tmp),
+        Vec::<String>::new(),
+        "the link's target is no stray"
+    );
+    let d = discover(&roots_at(&tmp), Budget::SHIPPED);
+    assert!(
+        d.found.iter().all(|f| f.origin
+            == Origin::Bootstrap {
+                repo: canon(&repo),
+                slim: false
+            }),
+        "{:#?}",
+        d.found
+    );
+    assert!(
+        d.found
+            .iter()
+            .all(|f| crate::harness::disk::idle::checkout_of(&f.origin, &f.path).is_none()),
+        "no tree under build.noindex is a checkout's: {:#?}",
+        d.found
+    );
+
+    std::fs::remove_file(repo.join("build")).expect("unlink");
+    symlink("build.gone", repo.join("build")).expect("dangling link");
+    assert_eq!(found_in(&tmp, &repo), [], "a dangling link");
+    std::fs::remove_file(repo.join("build")).expect("unlink");
+
+    let local = mkdirs(&repo.join("build.local"));
+    lay_xpy_tree(&local);
+    symlink("build.local", repo.join("build")).expect("link to a sibling");
+    assert_eq!(
+        found_in(&tmp, &repo),
+        [],
+        "a link to a sibling the walk reaches"
+    );
+    std::fs::remove_file(repo.join("build")).expect("unlink");
+    std::fs::remove_dir_all(&local).expect("rm build.local");
+
+    // Below the checkout walk's depth, so only a followed link could reach it.
+    let other = mkdirs(&repo.join("src/other"));
+    lay_xpy_tree(&other);
+    symlink("src/other", repo.join("build")).expect("link to another folder");
+    assert_eq!(found_in(&tmp, &repo), [], "a link to another folder");
+    std::fs::remove_file(repo.join("build")).expect("unlink");
+    std::fs::remove_dir_all(repo.join("src")).expect("rm src");
+
+    let shared = mkdirs(&tmp.path().join("shared/build.noindex"));
+    lay_xpy_tree(&shared);
+    symlink(&shared, repo.join("build")).expect("link out of the checkout");
+    assert_eq!(
+        found_in(&tmp, &repo),
+        [],
+        "a link to a build.noindex outside the checkout"
+    );
+    std::fs::remove_file(repo.join("build")).expect("unlink");
+
+    std::fs::remove_dir_all(repo.join("build.noindex")).expect("rm build.noindex");
+    symlink(&shared, repo.join("build.noindex")).expect("build.noindex a link");
+    symlink("build.noindex", repo.join("build")).expect("link to the link");
+    assert_eq!(
+        found_in(&tmp, &repo),
+        [],
+        "a build.noindex that is itself a link"
+    );
+    std::fs::remove_file(repo.join("build")).expect("unlink");
+    std::fs::remove_file(repo.join("build.noindex")).expect("unlink build.noindex");
+
+    // A link through another link may lead to the real build.noindex beside it: that link is
+    // not followed, and named as such; the folder is called no stray.
+    std::fs::create_dir(repo.join("build.noindex")).expect("build.noindex");
+    lay_xpy_tree(&repo.join("build.noindex"));
+    symlink("build.noindex", repo.join("hop")).expect("hop");
+    symlink("hop", repo.join("build")).expect("link through a link");
+    assert_eq!(found_in(&tmp, &repo), [], "a link through a link");
+    let notes: Vec<String> = discover(&roots_at(&tmp), Budget::SHIPPED)
+        .notes
+        .into_iter()
+        .filter(|n| n.contains("x.py checkout"))
+        .collect();
+    assert_eq!(
+        notes,
+        [format!(
+            "cargo-targets: {} is a link of an x.py checkout that is not followed here: only a \
+             link whose words name build.noindex directly inside the checkout is read as its \
+             build tree",
+            canon(&repo).join("build").display()
+        )],
+        "named, and no stray claimed"
+    );
+    std::fs::remove_file(repo.join("build")).expect("unlink");
+    std::fs::remove_file(repo.join("hop")).expect("unlink hop");
+    std::fs::remove_dir_all(repo.join("build.noindex")).expect("rm build.noindex");
+
+    // A Mac's default volume ignores case: there `Build.noindex` is the folder `build.noindex`
+    // names, bootstrap's and never the walk's. Elsewhere the probe skips it.
+    std::fs::write(repo.join("case-probe"), b"").expect("probe");
+    if std::fs::symlink_metadata(repo.join("CASE-PROBE")).is_ok() {
+        let upper = mkdirs(&repo.join("Build.noindex"));
+        lay_xpy_tree(&upper);
+        assert_eq!(found_in(&tmp, &repo), [], "a bare Build.noindex");
+        let named = stray(&tmp);
+        assert!(
+            named.len() == 1 && named[0].contains("Build.noindex"),
+            "the stray Build.noindex is named: {named:?}"
+        );
+    }
+}
+
+/// AN X.PY CHECKOUT MET INSIDE A WALK HAS ITS BUILD TREE READ AS A CHECKOUT ROOT'S IS: in a
+/// session's scratchpad or nested in a checkout, its stage trees, under a real `build/` or the
+/// sanctioned link, are found as bootstrap trees (one row with `./x.py clean`, never removed
+/// whole), never left unseen nor bootstrap's own `bootstrap/` or a stage sysroot; a deeper
+/// folder its `build` link names (`build -> out/tree`, the checkout's absolute spelling of it,
+/// or other-case words on a case-blind volume) is never the session's. NEGATIVE
+/// CONTROL: the scratchpad's ordinary build directory beside it is the session's as it always
+/// was.
+#[test]
+fn an_xpy_checkout_met_inside_a_walk_gives_its_build_tree_as_bootstraps() {
+    let tmp = Tmp::new("discover-xpy-scratch");
+    let home = mkdirs(&tmp.path().join("home"));
+    let claude = tmp.path().join("claude-tmp");
+    let plain = scratch_build(&claude, &home, DEAD, "w");
+    let repo = mkdirs(&claude.join("-proj").join(DEAD).join("scratchpad/trust"));
+    std::fs::write(repo.join("x.py"), b"#!/usr/bin/env python3\n").expect("x.py");
+    let want = |tree: &str, stages: &[PathBuf]| -> Vec<(PathBuf, &'static str)> {
+        let mut want: Vec<(PathBuf, &'static str)> = stages
+            .iter()
+            .map(|s| (canon(&repo).join(tree).join(s), "bootstrap"))
+            .collect();
+        want.push((plain.clone(), "scratch"));
+        want.sort();
+        want
+    };
+    let got = |tmp: &Tmp| {
+        let mut got = kinds(&discover(&roots_at(tmp), Budget::SHIPPED));
+        got.sort();
+        got
+    };
+    let stages = lay_xpy_tree(&repo.join("build"));
+    assert_eq!(got(&tmp), want("build", &stages), "a real build/");
+    std::fs::rename(repo.join("build"), repo.join("build.noindex")).expect("move aside");
+    symlink("build.noindex", repo.join("build")).expect("sanctioned link");
+    assert_eq!(
+        got(&tmp),
+        want("build.noindex", &stages),
+        "the sanctioned link"
+    );
+    // A link to a deeper folder of the checkout (`build -> out/tree`) names bootstrap's tree:
+    // never followed, and never the session's scratch builds where the walk meets it.
+    std::fs::remove_file(repo.join("build")).expect("unlink");
+    let out = mkdirs(&repo.join("out"));
+    std::fs::rename(repo.join("build.noindex"), out.join("tree")).expect("move deeper");
+    symlink("out/tree", repo.join("build")).expect("link to a deeper folder");
+    assert_eq!(
+        got(&tmp),
+        want("build", &[]),
+        "a deeper folder a link names"
+    );
+    std::fs::remove_file(repo.join("build")).expect("unlink");
+    symlink(canon(&repo).join("out/tree"), repo.join("build")).expect("an absolute link");
+    assert_eq!(
+        got(&tmp),
+        want("build", &[]),
+        "the checkout's absolute spelling"
+    );
+    if std::fs::symlink_metadata(repo.join("OUT")).is_ok() {
+        std::fs::remove_file(repo.join("build")).expect("unlink");
+        symlink("Out/Tree", repo.join("build")).expect("link in another case");
+        assert_eq!(got(&tmp), want("build", &[]), "link words in another case");
+    }
+
+    let outer = mkdirs(&home.join("proj"));
+    mkdirs(&outer.join(".git"));
+    let nested = mkdirs(&outer.join("rust"));
+    std::fs::write(nested.join("x.py"), b"#!/usr/bin/env python3\n").expect("x.py");
+    let inner = lay_xpy_tree(&nested.join("build"));
+    let d = discover(&roots_at(&tmp), Budget::SHIPPED);
+    for s in &inner {
+        let path = canon(&nested).join("build").join(s);
+        assert!(
+            d.found.iter().any(|f| f.path == path
+                && f.origin
+                    == Origin::Bootstrap {
+                        repo: canon(&nested),
+                        slim: false
+                    }),
+            "{}: {:#?}",
+            path.display(),
+            d.found
+        );
+    }
+}
+
+/// A session working inside the moved tree (its working directory spelled through the
+/// sanctioned link, which a canonical path names `build.noindex`) is no checkout of its own:
+/// its worktree's stage trees are found as bootstrap's, never a stage sysroot or bootstrap's
+/// own build directory; nor is one inside the folder a `build -> build.local` or a
+/// `build -> out/tree` link names (in another case too, on a case-blind volume). One between the
+/// checkout and that folder (in `out/`) is walked as a checkout of its own, and leaves that folder
+/// to bootstrap.
+/// NEGATIVE CONTROL: with no worktree root above it, nothing.
+#[test]
+fn a_cwd_inside_a_moved_xpy_build_tree_is_no_checkout() {
+    let tmp = Tmp::new("discover-xpy-noindex-cwd");
+    let repo = mkdirs(&tmp.path().join("trust"));
+    std::fs::write(repo.join("x.py"), b"#!/usr/bin/env python3\n").expect("x.py");
+    let stages = lay_xpy_tree(&repo.join("build.noindex"));
+    symlink("build.noindex", repo.join("build")).expect("sanctioned link");
+    let cwd = repo.join("build/aarch64-apple-darwin");
+    let only = Roots {
+        cwds: vec![cwd.clone()],
+        ..Roots::default()
+    };
+    assert_eq!(
+        discover(&only, Budget::SHIPPED).found,
+        [],
+        "no worktree root: nothing"
+    );
+    mkdirs(&repo.join(".git"));
+    let d = discover(&only, Budget::SHIPPED);
+    let mut got: Vec<PathBuf> = d.found.iter().map(|f| f.path.clone()).collect();
+    got.sort();
+    let want: Vec<PathBuf> = stages
+        .iter()
+        .map(|s| canon(&repo.join("build.noindex").join(s)))
+        .collect();
+    assert_eq!(got, want);
+    assert!(
+        d.found
+            .iter()
+            .all(|f| matches!(f.origin, Origin::Bootstrap { .. })),
+        "{:#?}",
+        d.found
+    );
+
+    // Nor is one inside the folder another `build` link names (`build -> build.local`), where
+    // bootstrap builds through that link: its stage trees are no checkout's build directories.
+    let local = mkdirs(&tmp.path().join("rust"));
+    std::fs::write(local.join("x.py"), b"#!/usr/bin/env python3\n").expect("x.py");
+    mkdirs(&local.join(".git"));
+    lay_xpy_tree(&local.join("build.local"));
+    symlink("build.local", local.join("build")).expect("link to a sibling");
+    let inside = Roots {
+        cwds: vec![local.join("build/aarch64-apple-darwin")],
+        ..Roots::default()
+    };
+    let d = discover(&inside, Budget::SHIPPED);
+    assert_eq!(d.found, [], "a cwd inside build.local");
+    std::fs::remove_file(local.join("build")).expect("unlink");
+    let out = mkdirs(&local.join("out"));
+    std::fs::rename(local.join("build.local"), out.join("tree")).expect("move deeper");
+    symlink("out/tree", local.join("build")).expect("link to a deeper folder");
+    let deeper = Roots {
+        cwds: vec![local.join("build/aarch64-apple-darwin")],
+        ..Roots::default()
+    };
+    let d = discover(&deeper, Budget::SHIPPED);
+    assert_eq!(d.found, [], "a cwd inside the deeper folder a link names");
+    // One between the checkout and that folder meets it before any walk of the checkout.
+    let between = Roots {
+        cwds: vec![local.join("out")],
+        ..Roots::default()
+    };
+    let d = discover(&between, Budget::SHIPPED);
+    assert_eq!(d.found, [], "a cwd between the checkout and the folder");
+    // Link words in another case name the same folder on a Mac's case-blind volume.
+    if std::fs::symlink_metadata(local.join("OUT")).is_ok() {
+        std::fs::remove_file(local.join("build")).expect("unlink");
+        symlink("Out/Tree", local.join("build")).expect("link in another case");
+        for cwd in [local.join("build/aarch64-apple-darwin"), local.join("out")] {
+            let roots = Roots {
+                cwds: vec![cwd.clone()],
+                ..Roots::default()
+            };
+            let d = discover(&roots, Budget::SHIPPED);
+            assert_eq!(d.found, [], "another case, from {}", cwd.display());
+        }
+    }
+}
+
 #[test]
 fn the_rust_build_cache_gives_each_workspace_build_directory() {
     let tmp = Tmp::new("discover-build-cache");

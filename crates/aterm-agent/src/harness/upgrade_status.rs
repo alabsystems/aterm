@@ -375,7 +375,7 @@ fn ended_unstamped(st: &St, now: u64) -> bool {
         if st.exited_at == 0
             && st.pid != 0
             && now.saturating_sub(at_s) > STALE_S
-            && super::super::upgrade_wake::wait_exit(st.pid, std::time::Duration::ZERO))
+            && st.agent_exit() == super::super::relaunch::AgentExit::Gone)
 }
 
 const fn read_age(st: &St) -> u64 {

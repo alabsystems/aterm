@@ -272,7 +272,7 @@ impl GlDevice {
         if let Some(old) = slot.take() {
             old.retire();
         }
-        let max = self.caps().max_texture_dim;
+        let max = self.caps().max_texture_dim.get();
         let room = |n: u32| {
             if resized {
                 n.saturating_add(n / 4).next_multiple_of(64).min(max).max(n)
@@ -344,7 +344,7 @@ impl GlDevice {
     ) -> Result<GlTexture, String> {
         let (storage, views) = self.storage_of(format, alias)?;
         let f = gl_format(storage)?;
-        let max = self.caps().max_texture_dim;
+        let max = self.caps().max_texture_dim.get();
         if width == 0 || height == 0 || width > max || height > max {
             return Err(format!(
                 "gl: a {width}x{height} texture is outside 1..={max} per side"

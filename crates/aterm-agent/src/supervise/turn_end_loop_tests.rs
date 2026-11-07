@@ -1995,7 +1995,7 @@ fn a_question_in_prose_is_answered_by_the_sessions_priority_word() {
     };
     let long = SuperviseOpts {
         policy: SupervisorConfig {
-            question_priority: crate::supervise::QuestionPriority::LongTerm,
+            question_priority: crate::supervise::PriorityWord::LongTerm,
             ..owners_policy()
         },
         ..auto(30)

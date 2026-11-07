@@ -129,8 +129,9 @@ fn a_macs_best_row_is_the_one_a_worker_would_run_on() {
 /// A LAUNCH ON A LOGIN NO ROW LISTS LEAVES ITS MEMBER REFUSED, since no row can show what stands on
 /// that login: a Codex login the keyring holds, or `accounts = "off"` with no pin, on a roster of
 /// directories alone, and Claude Code's default login no row lists. So does one a row lists and no
-/// read can show a wall on: the keyring's on a row with no directory, or rotation off with a second
-/// row enrolled, pinned or not (`a_row_no_read_can_show_a_wall_on_takes_no_launch`). Every row says
+/// read can show a wall on: the keyring's on a row with no directory, rotation off with a second row
+/// enrolled, pinned or not, or rotation off on a row whose rollouts cannot be read as its login
+/// (`a_row_no_read_can_show_a_wall_on_takes_no_launch`). Every row says
 /// `launch=0`, and
 /// the refusal names no cause it cannot show, says where to read which and why, and that
 /// `--host <node>` still starts a worker there. CONTROL: a row the launch starts on is chosen.
@@ -275,6 +276,7 @@ fn a_member_is_weighed_by_the_row_its_launch_would_start_on() {
 
     // On the wire: `launch=1`, `launch=0`, and nothing or `-` from an aterm older than the field.
     let peer = |launch: &str| PeerSurvey {
+        reason: None,
         label: "m6.local".to_owned(),
         answer: Ok(vec![
             "instance pid=9 host=m6.local version=0.148.0 sessions=0 level=facts \
@@ -569,6 +571,7 @@ fn a_refusal_counts_how_far_the_members_got() {
 #[test]
 fn a_survey_reply_reads_as_a_member() {
     let peer = |answer: Result<Vec<String>, String>| PeerSurvey {
+        reason: None,
         label: "m7.local at 192.168.1.7".to_owned(),
         answer,
         fault: survey::PeerFault::Other,
@@ -849,6 +852,7 @@ fn a_usable_row_that_names_no_read_takes_no_worker() {
 
     // A read's `-` and an older aterm's nothing read alike, and either is refused for `usable`.
     let peer = |row: &str| PeerSurvey {
+        reason: None,
         label: "m21.local at 192.168.1.21".to_owned(),
         answer: Ok(vec![
             "instance pid=9 host=m21.local version=0.146.0 sessions=0 level=facts \
@@ -1303,6 +1307,7 @@ fn a_refusal_with_needs_counts_those_that_meet_them_apart() {
 #[test]
 fn a_survey_reply_carries_the_members_home_and_checkouts() {
     let peer = |lines: &[&str]| PeerSurvey {
+        reason: None,
         label: "m7.local at 192.168.1.7".to_owned(),
         answer: Ok(lines.iter().map(|l| (*l).to_owned()).collect()),
         fault: survey::PeerFault::Other,

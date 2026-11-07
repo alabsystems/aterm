@@ -65,7 +65,7 @@ pub const FIRST_PARTY_VENDORED: &[FirstPartyVendored] = &[
     },
     FirstPartyVendored {
         dir: "vendor/trust-resource-controller",
-        upstream: "Trust crates/trust-resource-controller at 0116515bbffd; the manifest's \
+        upstream: "Trust crates/trust-resource-controller at 5db4b0acbd29; the manifest's \
           [package.metadata.aterm-vendor] records the repository and commit",
         why: "Original Andrew Yates code shared with the Trust compiler: the private native \
           resource member proxy codec. Its Rust source is exact upstream; the manifest only \

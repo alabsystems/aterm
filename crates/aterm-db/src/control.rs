@@ -351,6 +351,35 @@ impl std::fmt::Debug for Heard {
     }
 }
 
+/// One local refusal in a repair round: the value-free cause an observation publishes
+/// ([`aterm_types::network_state::RepairOutcome::Failed`]), and diagnostic text that stays in
+/// this process. A round's failure has no other form, so no failed attempt lacks a cause.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Failure {
+    /// What an observation of this round publishes.
+    pub cause: aterm_types::network_state::RepairCause,
+    /// Local diagnostic text: never published, never a key or a payload.
+    pub text: String,
+}
+impl Failure {
+    /// A refusal for `cause`, described locally by `text`.
+    pub fn new(cause: aterm_types::network_state::RepairCause, text: impl Into<String>) -> Self {
+        Self {
+            cause,
+            text: text.into(),
+        }
+    }
+    /// `error`'s refusal: its typed cause ([`Error::repair_cause`]) and its words.
+    pub(crate) fn of(error: &Error) -> Self {
+        Self::new(error.repair_cause(), error.to_string())
+    }
+}
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
 /// Volatile scheduling hint, never a claim of delivery. Keep one per peer.
 /// Advancing past a deferred node prevents it from starving later restrictions;
 /// wraparound retries it even if the caller does not maintain a timer.
@@ -371,11 +400,12 @@ pub struct Repair {
     data: crate::replica::Repair,
     application: Option<crate::replica::Report>,
     membership: Option<Report>,
-    membership_error: Option<String>,
+    membership_error: Option<Failure>,
     said: Said,
-    application_error: Option<String>,
-    application_cause: Option<aterm_types::network_state::RepairCause>,
-    handoff: Option<std::result::Result<usize, String>>,
+    application_error: Option<Failure>,
+    /// A protocol fence that refused this round's control exchange ([`Self::fenced`]).
+    fence: Option<aterm_types::network_state::RepairCause>,
+    handoff: Option<std::result::Result<usize, Failure>>,
 }
 impl Repair {
     /// This attempt's local progress, including its last operation on failure.
@@ -389,7 +419,7 @@ impl Repair {
         self.membership_error = None;
         self.said = Said::Unknown;
         self.application_error = None;
-        self.application_cause = None;
+        self.fence = None;
         self.handoff = None;
         self.data.retry_probe = false;
         self.data.deferral = None;
@@ -406,6 +436,15 @@ impl Repair {
         self.authenticated = None;
         self.unanswered = false;
         self.disowned = false;
+        self.clear_application();
+    }
+    /// Ready this round's second dial after an older peer closed its application probe
+    /// ([`Self::retry_application_probe`]): what the first exchange's application attempt left
+    /// goes, and its peer's authentication stays, so a redial that fails is this round's own
+    /// failure at its transport, named by its dial's cause, not the probe's. The probe's alias
+    /// choice is kept for the redial.
+    pub(crate) fn redial(&mut self) {
+        self.phase = Phase::Connecting;
         self.clear_application();
     }
     /// What this round learned says no peer of this lab is at the endpoint it dialled: its host
@@ -504,31 +543,35 @@ impl Repair {
     }
     /// Failure of the negotiated membership exchange. Control history may
     /// already be retained; no later application exchange was admitted.
-    pub fn membership_error(&self) -> Option<&str> {
-        self.membership_error.as_deref()
+    pub const fn membership_error(&self) -> Option<&Failure> {
+        self.membership_error.as_ref()
     }
 
     /// Credential transfers published this round, or a bounded protocol failure. None
     /// means no runtime handoff was negotiated; it says nothing about vault contents.
-    pub fn handoff(&self) -> Option<&std::result::Result<usize, String>> {
+    pub const fn handoff(&self) -> Option<&std::result::Result<usize, Failure>> {
         self.handoff.as_ref()
     }
     /// The last application upgrade's failure in this round. A missing error
     /// does not establish that an application round completed; check
     /// [`Self::application`] separately. Starting another round clears it.
-    pub fn application_error(&self) -> Option<&str> {
-        self.application_error.as_deref()
+    pub const fn application_error(&self) -> Option<&Failure> {
+        self.application_error.as_ref()
     }
-    /// Value-free application refusal, independent of local diagnostic text.
+    /// Value-free refusal of this round's application exchange, or of its control exchange by a
+    /// protocol fence ([`Self::fenced`]), independent of local diagnostic text.
     pub fn application_cause(&self) -> Option<aterm_types::network_state::RepairCause> {
-        self.application_cause
+        self.fence
+            .or_else(|| self.application_error.as_ref().map(|failure| failure.cause))
     }
     pub(crate) fn application_failed(&mut self, error: Error) {
-        self.failure_cause(&error);
-        self.application_error = Some(error.to_string());
+        self.application_error = Some(Failure::of(&error));
     }
-    pub(crate) fn failure_cause(&mut self, error: &Error) {
-        self.application_cause = Some(error.repair_cause());
+    /// A protocol fence refused this round's control exchange before application repair, for
+    /// `error`'s cause: [`Self::application_cause`] names it without fabricating an application
+    /// exchange.
+    pub(crate) fn fenced(&mut self, error: &Error) {
+        self.fence = Some(error.repair_cause());
     }
     /// An unavailable inventory in a completed application round. This preserves
     /// a local refusal separately from a peer's unexplained unavailable inventory.
@@ -633,6 +676,10 @@ pub struct Endpoint {
     /// Use the released `atdb/3` offer when a test specifically exercises that boundary.
     #[cfg(test)]
     pub(crate) legacy_credentials: bool,
+    /// MUTANT: a worker's redial keeps what its first exchange left, as before CS1, so a redial
+    /// that fails is recorded as the first attempt's probe failure.
+    #[cfg(test)]
+    pub(crate) redial_keeps_first_attempt: bool,
 }
 
 /// One exchange's absolute deadline: the product's [`crate::network::WITHIN`]. A test needs each
@@ -696,7 +743,7 @@ impl Endpoint {
         let Some(log) = &self.snapshot_log else {
             return std::collections::BTreeMap::new();
         };
-        let membership = log.membership();
+        let membership = log.membership_ref();
         aterm_net::fleet_member::read_peers(state)
             .unwrap_or_default()
             .into_iter()
@@ -730,7 +777,7 @@ impl Endpoint {
         let Some(log) = &self.snapshot_log else {
             return std::collections::BTreeSet::new();
         };
-        log.membership()
+        log.membership_ref()
             .nodes()
             .iter()
             .filter_map(|(key, standing)| match standing {
@@ -1142,6 +1189,8 @@ impl Endpoint {
                 legacy_projection: false,
                 #[cfg(test)]
                 legacy_credentials: false,
+                #[cfg(test)]
+                redial_keeps_first_attempt: false,
             })
         })
     }
@@ -1244,6 +1293,8 @@ impl Endpoint {
             legacy_projection: false,
             #[cfg(test)]
             legacy_credentials: false,
+            #[cfg(test)]
+            redial_keeps_first_attempt: false,
         })
     }
 
@@ -1297,6 +1348,8 @@ impl Endpoint {
             legacy_projection: false,
             #[cfg(test)]
             legacy_credentials: false,
+            #[cfg(test)]
+            redial_keeps_first_attempt: false,
         })
     }
 
@@ -1524,7 +1577,7 @@ impl Endpoint {
                 match self.trade_recovery(pass, stream, side, &mut lease, both_acx2, protocol) {
                     Ok(common) => common,
                     Err(error) => {
-                        lease.membership_error = Some(error.to_string());
+                        lease.membership_error = Some(Failure::of(&error));
                         return Ok(report);
                     }
                 };
@@ -1607,7 +1660,7 @@ impl Endpoint {
         actor: Actor,
         side: Side,
         stream: &mut (impl Read + Write),
-    ) -> Option<std::result::Result<usize, String>> {
+    ) -> Option<std::result::Result<usize, Failure>> {
         pass.spend();
         let (Some(paths), Some((owner, config))) = (&self.paths, &self.credentials) else {
             return None;
@@ -1623,7 +1676,7 @@ impl Endpoint {
                 side,
                 stream,
             )
-            .map_err(|_| "credential handoff failed".to_owned()),
+            .map_err(|error| Failure::new(error.repair_cause(), "credential handoff failed")),
         )
     }
 
@@ -1810,8 +1863,7 @@ impl Endpoint {
             if self.legacy_projection {
                 let result =
                     application.exchange_legacy_projection(stream, actor, side, &mut repair.data);
-                repair.application_error = result.as_ref().err().map(ToString::to_string);
-                repair.application_cause = result.as_ref().err().map(Error::repair_cause);
+                repair.application_error = result.as_ref().err().map(Failure::of);
                 repair.application = result.ok();
                 return;
             }
@@ -1820,8 +1872,7 @@ impl Endpoint {
             } else {
                 application.exchange_with_compatibility(stream, actor, side, &mut repair.data)
             };
-            repair.application_error = result.as_ref().err().map(ToString::to_string);
-            repair.application_cause = result.as_ref().err().map(Error::repair_cause);
+            repair.application_error = result.as_ref().err().map(Failure::of);
             repair.application = result.ok();
         }
     }
@@ -2107,7 +2158,7 @@ fn roster_or_last_until(
     roster_after(
         &LAST,
         &paths.dir,
-        aterm_secrets::client::swarm_roster_until(paths, deadline),
+        aterm_secrets::client::swarm_roster_now_until(paths, deadline),
     )
 }
 

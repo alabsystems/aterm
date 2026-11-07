@@ -924,7 +924,7 @@ pub(crate) fn run(args: &Args, record: bool) -> LaneRun {
             eprint!("{}", report(&arms));
             if let Some(path) = &args.json_out {
                 let text = json(&arms, &aterm, &load).to_string();
-                if let Err(e) = super::publication::publish(path, &(text + "\n")) {
+                if let Err(e) = super::publication::publish_named(path, text + "\n") {
                     return LaneRun::fail(format!("could not write {}: {e}", path.display()));
                 }
                 eprintln!("  json -> {}", path.display());

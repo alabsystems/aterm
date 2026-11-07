@@ -366,6 +366,65 @@ fn bound_ipv4_only_looks_up_matching_addresses_and_keeps_ambiguity() {
     }
 }
 
+/// A recheck that finds the kernel's interface generation where it was reads the attachments
+/// once, not once for each of a link's rechecks: 100 rechecks of one link under one generation
+/// enumerate once; a moved generation, another link's `(local, selected)` and a read older than
+/// [`ATTACHMENTS_REREAD`] each enumerate again; a failed read is never kept; and with no
+/// generation every recheck enumerates, as before.
+///
+/// NEGATIVE CONTROL (2026-11-06): with the memo's lookup never finding a kept read (the shape
+/// before, every recheck enumerating), the 100 rechecks enumerate 100 times (`left: 100, right:
+/// 1`).
+#[test]
+fn rechecks_under_one_interface_generation_enumerate_once() {
+    let memo = AttachmentMemo::new();
+    let lan = Attachment {
+        index: 3,
+        name: "en0".into(),
+        address: "192.0.2.1".parse().unwrap(),
+        netmask: "255.255.255.0".parse().unwrap(),
+        flags: REQUIRED_FLAGS,
+        physical: true,
+    };
+    let local = Some("192.0.2.1:0".parse().unwrap());
+    let enumerations = std::cell::Cell::new(0);
+    let start = Instant::now();
+    let recheck = |generation: Option<u64>, at: Duration, local: Option<SocketAddr>| {
+        memo.read(generation, start + at, local, None, || {
+            enumerations.set(enumerations.get() + 1);
+            Ok(vec![lan.clone()])
+        })
+        .unwrap()
+    };
+    for tick in 0..100 {
+        assert_eq!(
+            recheck(Some(7), Duration::from_millis(tick), local),
+            std::slice::from_ref(&lan)
+        );
+    }
+    assert_eq!(enumerations.get(), 1, "one generation");
+    recheck(Some(8), Duration::ZERO, local);
+    recheck(Some(8), Duration::ZERO, local);
+    assert_eq!(enumerations.get(), 2, "a moved generation");
+    recheck(Some(8), Duration::ZERO, None);
+    assert_eq!(enumerations.get(), 3, "another link");
+    recheck(Some(8), ATTACHMENTS_REREAD, local);
+    assert_eq!(enumerations.get(), 4, "a read past its age");
+
+    let failed = memo.read(Some(9), start, local, None, || {
+        enumerations.set(enumerations.get() + 1);
+        Err(refuse("interface vanished"))
+    });
+    assert!(failed.is_err());
+    recheck(Some(9), Duration::ZERO, local);
+    assert_eq!(enumerations.get(), 6, "a failed read is not kept");
+
+    for _ in 0..10 {
+        recheck(None, Duration::ZERO, local);
+    }
+    assert_eq!(enumerations.get(), 16, "no generation");
+}
+
 #[test]
 fn attachment_scan_still_validates_ipv6_zones() {
     let entry = aterm_uds::network::InterfaceAddress {

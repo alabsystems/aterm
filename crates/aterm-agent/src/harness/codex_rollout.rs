@@ -66,17 +66,32 @@ pub fn rollouts_by_write(home: &Path) -> Vec<(PathBuf, SystemTime)> {
         .collect()
 }
 
-/// [`rollouts_by_write`] with each rollout's size: what says it is as a look last found it.
+/// [`rollouts_by_write`] with each rollout's size, what says it is as a look last found it, and
+/// whether every directory and entry on the way could be read. A link's size and time are its
+/// target's, since a read of it reads the target: newest first by those.
 #[must_use]
-pub fn rollouts_by_write_sized(home: &Path) -> Vec<(PathBuf, SystemTime, u64)> {
-    rollout_walk(home)
+pub fn rollouts_by_write_sized(home: &Path) -> (Vec<(PathBuf, SystemTime, u64)>, bool) {
+    let walk = rollout_walk(home);
+    let mut whole = walk.whole && !walk.unexamined;
+    let mut listed: Vec<_> = walk
         .listed
         .into_iter()
-        .map(|l| {
-            let size = l.meta.len();
-            (l.path, l.at, size)
+        .filter_map(|l| {
+            if !l.meta.file_type().is_symlink() {
+                let size = l.meta.len();
+                return Some((l.path, l.at, size));
+            }
+            match std::fs::metadata(&l.path).and_then(|m| m.modified().map(|at| (m.len(), at))) {
+                Ok((size, at)) => Some((l.path, at, size)),
+                Err(_) => {
+                    whole = false;
+                    None
+                }
+            }
         })
-        .collect()
+        .collect();
+    listed.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+    (listed, whole)
 }
 
 /// One rollout a [`rollout_walk`] found.
@@ -94,6 +109,9 @@ struct Walk {
     listed: Vec<Listed>,
     /// Every directory and entry under `sessions/` could be read (an absent `sessions/` reads whole).
     whole: bool,
+    /// A link so named has a target that could not be examined. It may be a rollout, which matters to
+    /// a look for a wall. A reader of turns cannot open it either, so it holds none that reader can count.
+    unexamined: bool,
 }
 
 /// Every `rollout-*.jsonl` under `home/sessions/<y>/<m>/<d>/` with its metadata, and whether nothing on the way could not be read.
@@ -109,7 +127,9 @@ fn rollout_walk(home: &Path) -> Walk {
         let mut out = Vec::new();
         for e in entries {
             match e.and_then(|e| e.file_type().map(|t| (e, t))) {
-                Ok((e, t)) if t.is_dir() => out.push(e.path()),
+                Ok((e, t)) if t.is_dir() || (t.is_symlink() && e.path().is_dir()) => {
+                    out.push(e.path());
+                }
                 Ok(_) => {}
                 Err(_) => *whole = false,
             }
@@ -117,6 +137,7 @@ fn rollout_walk(home: &Path) -> Walk {
         out
     }
     let mut whole = true;
+    let mut unexamined = false;
     let mut listed = Vec::new();
     for year in subdirs(&home.join("sessions"), true, &mut whole) {
         for month in subdirs(&year, false, &mut whole) {
@@ -137,19 +158,28 @@ fn rollout_walk(home: &Path) -> Walk {
                     }
                     match e.metadata().and_then(|m| m.modified().map(|at| (m, at))) {
                         // A regular file, or a link to one: a directory, a dangling link or
-                        // another kind of entry so named is no rollout, and nothing to read.
-                        Ok((meta, at))
-                            if meta.is_file()
-                                || (meta.file_type().is_symlink()
-                                    && std::fs::metadata(e.path()).is_ok_and(|m| m.is_file())) =>
-                        {
-                            listed.push(Listed {
-                                path: e.path(),
-                                meta,
-                                at,
-                            });
+                        // another kind of entry so named is no rollout, and nothing to read. A
+                        // target that could not be examined may be one.
+                        Ok((meta, at)) => {
+                            let rollout = if meta.file_type().is_symlink() {
+                                match std::fs::metadata(e.path()) {
+                                    Ok(target) => target.is_file(),
+                                    Err(why) => {
+                                        unexamined |= why.kind() != std::io::ErrorKind::NotFound;
+                                        false
+                                    }
+                                }
+                            } else {
+                                meta.is_file()
+                            };
+                            if rollout {
+                                listed.push(Listed {
+                                    path: e.path(),
+                                    meta,
+                                    at,
+                                });
+                            }
                         }
-                        Ok(_) => {}
                         Err(_) => whole = false,
                     }
                 }
@@ -157,7 +187,11 @@ fn rollout_walk(home: &Path) -> Walk {
         }
     }
     listed.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| b.path.cmp(&a.path)));
-    Walk { listed, whole }
+    Walk {
+        listed,
+        whole,
+        unexamined,
+    }
 }
 
 /// The identity `meta` carries, where the platform keeps one in a file's metadata (Unix); `None` elsewhere, where only an open file tells it.
@@ -490,6 +524,8 @@ pub struct RolloutRead {
     pub read: u64,
     /// Whether the rollout was read to EOF without hitting the byte cap or an I/O error.
     pub complete: bool,
+    /// Whether an I/O error ended the read, which reaching the byte cap does not.
+    pub failed: bool,
     /// Number of lines exceeding [`crate::harness::usage::MAX_LINE_BYTES`] skipped unread.
     pub long: u64,
 }
@@ -562,6 +598,7 @@ pub(crate) fn stream_open_ends_ref(
     let mut file = std::io::BufReader::with_capacity(64 * 1024, file);
     let mut out = RolloutRead::default();
     if file.seek(std::io::SeekFrom::Start(from)).is_err() {
+        out.failed = true;
         return out;
     }
     let mut line: Vec<u8> = Vec::new();
@@ -572,7 +609,10 @@ pub(crate) fn stream_open_ends_ref(
         let buf = match file.fill_buf() {
             Ok(buf) => buf,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return out,
+            Err(_) => {
+                out.failed = true;
+                return out;
+            }
         };
         if buf.is_empty() {
             break;
@@ -1033,12 +1073,22 @@ fn parse_session_meta_ids(first_line: &str) -> Option<SessionMetaIds<'_>> {
 
 /// Reads the first newline-terminated line of open `file` from offset 0 into `line` up to
 /// [`META_BYTES`], returning `true` when a terminating `\n` was found within the cap.
-pub(crate) fn first_line_into(mut file: &std::fs::File, line: &mut Vec<u8>) -> bool {
+pub(crate) fn first_line_into(file: &std::fs::File, line: &mut Vec<u8>) -> bool {
+    first_line_read(file, line).unwrap_or(false)
+}
+
+/// [`first_line_into`], which also tells a read that failed from a file with no such line.
+///
+/// # Errors
+///
+/// A seek or read failed, for any reason but an interruption.
+pub(crate) fn first_line_read(
+    mut file: &std::fs::File,
+    line: &mut Vec<u8>,
+) -> std::io::Result<bool> {
     use std::io::{Read as _, Seek as _};
     line.clear();
-    if file.seek(std::io::SeekFrom::Start(0)).is_err() {
-        return false;
-    }
+    file.seek(std::io::SeekFrom::Start(0))?;
     let cap = usize::try_from(META_BYTES).unwrap_or(usize::MAX);
     let mut buf = [0u8; 65_536];
     while line.len() < cap {
@@ -1047,16 +1097,16 @@ pub(crate) fn first_line_into(mut file: &std::fs::File, line: &mut Vec<u8>) -> b
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return false,
+            Err(e) => return Err(e),
         };
         let chunk = &buf[..n];
         if let Some(nl) = chunk.iter().position(|&b| b == b'\n') {
             line.extend_from_slice(&chunk[..=nl]);
-            return true;
+            return Ok(true);
         }
         line.extend_from_slice(chunk);
     }
-    false
+    Ok(false)
 }
 
 /// Reads the first line of open `file` from offset 0 up to [`META_BYTES`].
@@ -2070,6 +2120,8 @@ mod tests {
             day.join(format!("rollout-2026-11-05T10-00-02-{SUB}.jsonl")),
         )
         .expect("a dangling link so named");
+        let looped = day.join(format!("rollout-2026-11-05T10-00-03-{OTHER}.jsonl"));
+        std::os::unix::fs::symlink(&looped, &looped).expect("a link that cannot be examined");
         let mut rollouts = Rollouts::default();
         let mut got = Vec::new();
         let caught_up = rollouts.fold(home.path(), now - 3600, u64::MAX, &mut |path, turn| {

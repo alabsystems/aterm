@@ -38,7 +38,7 @@ pub(crate) struct Shim {
     /// Where it is laid: this account's ([`aterm_types::clt_shim::shim_dir`]), a test's own, or
     /// nowhere (a test that lays none, or no state home).
     dir: Option<PathBuf>,
-    /// Whether the developer tools are installed now ([`aterm_types::clt_shim::developer_git`]).
+    /// Whether Git and the system compiler are installed now ([`crate::clt_install::developer_tools_ready`]).
     present: fn() -> bool,
     /// The program its links point at: this process's own executable, or a test's stand-in.
     exe: Option<PathBuf>,
@@ -54,7 +54,7 @@ impl Default for Shim {
             present: if cfg!(test) {
                 (|| false) as fn() -> bool
             } else {
-                aterm_types::clt_shim::developer_git
+                crate::clt_install::developer_tools_ready
             },
             exe: None,
         }
@@ -74,7 +74,7 @@ impl Shim {
             } else {
                 None
             },
-            present: aterm_types::clt_shim::developer_git,
+            present: crate::clt_install::developer_tools_ready,
             exe: None,
         };
         shim.reconcile();
@@ -118,10 +118,17 @@ impl Shim {
     /// not be laid leaves nothing wanted, and a process whose start named its developer directory
     /// keeps that name ([`settle_session_path`]), which on macOS 26.6 makes Apple's stubs fail
     /// `missing DEVELOPER_DIR path` (measured with the tools installed; a Mac without them is not).
-    pub(crate) fn settle(&self, installing: bool) {
-        if let Some(dir) = &self.dir {
-            refresh(dir, !(self.present)(), installing, self.exe.as_deref());
-        }
+    /// Returns the installing word, reading it only while the tools are missing or no directory
+    /// is kept; once this shim finds the tools, its word is false and both marks go without that
+    /// reading. With no directory, the owner's word is kept for its watch bookkeeping.
+    pub(crate) fn settle(&self, installing: impl FnOnce() -> bool) -> bool {
+        let Some(dir) = &self.dir else {
+            return installing();
+        };
+        let missing = !(self.present)();
+        let installing = missing && installing();
+        refresh(dir, missing, installing, self.exe.as_deref());
+        installing
     }
 
     /// This shim as a launch keeps it, ahead of the launch's first shell. The marks an earlier
@@ -138,7 +145,7 @@ impl Shim {
                 let _ = relay(dir, self.exe.as_deref());
             }
         }
-        self.settle(false);
+        self.settle(|| false);
     }
 
     /// Whether the directory is laid now.
@@ -230,7 +237,7 @@ fn relay(_dir: &Path, _exe: Option<&Path>) -> std::io::Result<()> {
 #[must_use]
 pub(crate) fn wanted_dir() -> Option<String> {
     aterm_types::clt_shim::shim_dir()
-        .filter(|dir| is_wanted(dir) && !aterm_types::clt_shim::developer_git())
+        .filter(|dir| is_wanted(dir) && !crate::clt_install::developer_tools_ready())
         .and_then(|dir| dir.to_str().map(str::to_owned))
 }
 
@@ -509,14 +516,14 @@ mod tests {
             "from the launch, with no pass"
         );
         assert!(!installing());
-        shim.settle(true);
+        shim.settle(|| true);
         assert!(shim.wanted() && installing());
-        shim.settle(false);
+        shim.settle(|| false);
         assert!(shim.wanted(), "a Stop, or an unfinished install, leaves it");
         assert!(!installing());
         let links = std::fs::read_dir(&dir).unwrap().count();
         PRESENT.store(true, Ordering::SeqCst);
-        shim.settle(true);
+        shim.settle(|| true);
         assert!(!shim.wanted() && !installing(), "the tools exist");
         assert!(shim.laid());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), links);
@@ -760,7 +767,7 @@ mod tests {
         // The tools arrived: the window settles the shim.
         std::fs::write(&arrived, b"").unwrap();
         let kept = Shim::at(shim.clone(), || true);
-        kept.settle(true);
+        kept.settle(|| true);
         assert!(!kept.wanted(), "new shells no longer get it");
         let mut stdin = child.stdin.take().unwrap();
         stdin.write_all(b"\n").unwrap();

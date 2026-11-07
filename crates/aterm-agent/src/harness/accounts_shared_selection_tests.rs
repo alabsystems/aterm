@@ -318,6 +318,7 @@ fn progress(bed: &Bed) -> (bool, usize) {
         },
         mailbox: &|_, _, _| (super::super::sign_in_ladder::Mailbox::None, None),
         log: Arc::new(|_| {}),
+        save_oauth: |_, _| Ok("inert".into()),
         shared: shared_renewal::Effects::default(),
         run_attempt: Some(Arc::new(move |_, _| {
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

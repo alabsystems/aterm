@@ -4,12 +4,50 @@
 use super::*;
 use aterm_agent::harness::{accounts, accounts_pool::ExecutionIntent};
 
+#[path = "native_account_claim_model_tests.rs"]
+mod claim_model;
+
+#[cfg(unix)]
+#[path = "native_account_observation_tests.rs"]
+mod observation;
+
+#[cfg(unix)]
+#[path = "native_account_claim_tests.rs"]
+mod transaction;
+
 struct World {
     handle: crate::session_store::SessionHandle,
     facts: Facts,
     original: Prepare,
     binding: Binding,
     caller: SupervisorInputCaller,
+}
+
+#[cfg(unix)]
+fn attach_journal(world: &mut World) -> aterm_tempfile::TempDir {
+    use aterm_agent::harness::native_receipts::testing::{Append, Journal};
+    let home = aterm_tempfile::tempdir().unwrap();
+    let journal = Journal::new(home.path());
+    let phase = lookup(&world.handle.ctx, &world.binding)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .closed_restart
+        .as_ref()
+        .unwrap()
+        .closed_phase();
+    journal
+        .record(&world.original, &world.binding, Append::Prepare)
+        .unwrap();
+    journal
+        .record(
+            &world.original,
+            &world.binding,
+            Append::NoExecInPhase(phase),
+        )
+        .unwrap();
+    world.facts.native_journal = Some(journal);
+    home
 }
 
 fn intent(login: &str) -> ExecutionIntent {
@@ -115,12 +153,17 @@ fn candidate(world: &World, id: &str, phase: ImagePhase) -> Prepare {
 }
 
 fn admit(world: &World, candidate: Prepare, phase: ImagePhase) -> String {
+    use aterm_agent::harness::native_account_wire::{Predecessor, Relation};
+    let Some(parent) = Predecessor::new(world.original.clone(), world.binding.clone()) else {
+        return DENIED.into();
+    };
+    let Some(relation) = Relation::new(parent, phase, candidate) else {
+        return DENIED.into();
+    };
     account_continuation::prepare_account(
         &world.handle.ctx,
         -1,
-        &world.binding,
-        candidate,
-        phase,
+        relation,
         world.caller.clone(),
         &world.facts,
     )
@@ -205,6 +248,85 @@ fn ordinary_account_does_not_inherit_renewal_policy_exceptions() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn account_predecessor_persistence_uses_the_retained_closure_phase() {
+    use aterm_agent::harness::native_receipts::testing::{Append, Journal};
+    for (local, phase) in [(8344, ImagePhase::Forward), (8345, ImagePhase::Rollback)] {
+        let mut world = world(local, phase);
+        let home = aterm_tempfile::tempdir().unwrap();
+        let journal = Journal::new(home.path());
+        journal
+            .record(&world.original, &world.binding, Append::Prepare)
+            .unwrap();
+        world.facts.native_journal = Some(journal);
+        let next = candidate(&world, "f5", phase);
+        let child = admitted_binding(&admit(&world, next.clone(), phase));
+        let real = Journal::new(home.path());
+        let claim = real
+            .claim_account(
+                aterm_agent::harness::native_receipts::AccountRelation {
+                    predecessor: &world.original,
+                    predecessor_binding: &world.binding,
+                    phase,
+                    candidate: &next,
+                },
+                &child,
+            )
+            .unwrap();
+        assert_eq!(claim.sequence, 2);
+        assert!(
+            real.successor(&world.original, &world.binding, &next, &child)
+                .is_err()
+        );
+        assert_eq!(
+            Journal::new(home.path())
+                .observe_phase(&world.original, &world.binding)
+                .unwrap()
+                .unwrap()
+                .phase,
+            phase
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_phase_less_predecessor_cannot_gain_a_phase_or_consume_its_claim_slot() {
+    use aterm_agent::harness::native_receipts::testing::{Append, Journal};
+    for (local, phase) in [(8346, ImagePhase::Forward), (8347, ImagePhase::Rollback)] {
+        let mut world = world(local, phase);
+        let home = aterm_tempfile::tempdir().unwrap();
+        let journal = Journal::new(home.path());
+        journal
+            .record(&world.original, &world.binding, Append::Prepare)
+            .unwrap();
+        journal
+            .record(&world.original, &world.binding, Append::NoExec)
+            .unwrap();
+        world.facts.native_journal = Some(journal);
+        let next = candidate(&world, "f6", phase);
+        assert_eq!(admit(&world, next.clone(), phase), UNKNOWN);
+        assert!(!world.facts.journal.lock().unwrap().contains_key(&next.id));
+        assert!(
+            lookup(&world.handle.ctx, &world.binding)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .closed_restart
+                .as_ref()
+                .unwrap()
+                .available()
+        );
+        assert!(
+            Journal::new(home.path())
+                .observe_phase(&world.original, &world.binding)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
 #[test]
 fn ordinary_account_lost_append_ack_retains_exact_child_and_phase() {
     let mut world = world(8245, ImagePhase::Rollback);
@@ -217,7 +339,11 @@ fn ordinary_account_lost_append_ack_retains_exact_child_and_phase() {
             .record(&world.original, &world.binding, Append::Prepare)
             .unwrap();
         journal
-            .record(&world.original, &world.binding, Append::NoExec)
+            .record(
+                &world.original,
+                &world.binding,
+                Append::NoExecInPhase(ImagePhase::Rollback),
+            )
             .unwrap();
         world.facts.native_journal = Some(journal);
         home
@@ -232,6 +358,22 @@ fn ordinary_account_lost_append_ack_retains_exact_child_and_phase() {
     assert_eq!(admit(&world, next.clone(), ImagePhase::Rollback), UNKNOWN);
     let operation = world.handle.ctx.fenced_writes.native.lock().unwrap().by_id[&next.id].clone();
     let pending = operation.lock().unwrap().binding.clone();
+    let proof = lookup(&world.handle.ctx, &world.binding)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .closed_restart
+        .clone()
+        .unwrap();
+    assert!(!proof.available());
+    assert!(
+        !proof.claimed_by(&next),
+        "an unacknowledged claim remains pending"
+    );
+    assert!(
+        !proof.claim_successor(&candidate(&world, "f8", ImagePhase::Rollback)),
+        "a generic successor cannot race the pending account journal"
+    );
     assert!(operation.lock().unwrap().custody.is_none());
     assert_eq!(
         operation.lock().unwrap().resume_phase,
@@ -253,6 +395,7 @@ fn ordinary_account_lost_append_ack_retains_exact_child_and_phase() {
         admit(&world, next.clone(), ImagePhase::Rollback),
         admitted(&pending)
     );
+    assert!(proof.claimed_by(&next));
     assert_eq!(world.facts.prepared_history.lock().unwrap().len(), 2);
     for request in [
         Request::Signal(pending.clone()),
@@ -268,6 +411,423 @@ fn ordinary_account_lost_append_ack_retains_exact_child_and_phase() {
             DENIED
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn account_revoked_during_claim_retires_the_same_durable_child() {
+    use aterm_agent::harness::native_receipts::testing::{Append, Journal};
+    use aterm_agent::harness::native_receipts::{AccountOutcome, AccountRelation, ClaimedState};
+    let mut world = world(8492, ImagePhase::Forward);
+    let home = aterm_tempfile::tempdir().unwrap();
+    let journal = Journal::new(home.path());
+    journal
+        .record(&world.original, &world.binding, Append::Prepare)
+        .unwrap();
+    journal
+        .record(
+            &world.original,
+            &world.binding,
+            Append::NoExecInPhase(ImagePhase::Forward),
+        )
+        .unwrap();
+    world.facts.native_journal = Some(journal);
+    let (entered, receiver) = mpsc::sync_channel(1);
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    world.facts.prepare_journal_gate = Some((entered, Arc::clone(&gate)));
+    let next = candidate(&world, "b8", ImagePhase::Forward);
+    let binding = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| admit(&world, next.clone(), ImagePhase::Forward));
+        receiver.recv_timeout(PATIENCE).unwrap();
+        assert!(world.handle.ctx.meta.try_lock().is_ok());
+        assert!(world.handle.ctx.fenced_writes.native.try_lock().is_ok());
+        let operation =
+            world.handle.ctx.fenced_writes.native.lock().unwrap().by_id[&next.id].clone();
+        let binding = operation.try_lock().unwrap().binding.clone();
+        let parent = lookup(&world.handle.ctx, &world.binding).unwrap();
+        let proof = parent.lock().unwrap().closed_restart.clone().unwrap();
+        assert!(!proof.claimed_by(&next));
+        assert!(!proof.claim_successor(&candidate(&world, "b9", ImagePhase::Forward)));
+        world.facts.account_allowed.store(false, Ordering::SeqCst);
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        assert_eq!(worker.join().unwrap(), NOEXEC);
+        assert_eq!(
+            lookup(&world.handle.ctx, &binding)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .binding,
+            binding
+        );
+        binding
+    });
+    assert_eq!(world.facts.grant_journal_calls.load(Ordering::SeqCst), 0);
+    let replay = Journal::new(home.path())
+        .claim_account(
+            AccountRelation {
+                predecessor: &world.original,
+                predecessor_binding: &world.binding,
+                phase: ImagePhase::Forward,
+                candidate: &next,
+            },
+            &binding,
+        )
+        .unwrap();
+    assert_eq!(replay.sequence, 2);
+    assert_eq!(
+        replay.outcome,
+        AccountOutcome::Claimed(ClaimedState::NoExec {
+            phase: ImagePhase::Forward
+        })
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_replayed_terminal_claim_settles_without_admission() {
+    use aterm_agent::harness::native_receipts::testing::{Append, Journal};
+    for (index, terminal) in [
+        Append::NoExecInPhase(ImagePhase::Forward),
+        Append::NoExecInPhase(ImagePhase::Rollback),
+        Append::MayExecute,
+        Append::Seal,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let closed_phase = match &terminal {
+            Append::NoExecInPhase(phase) => Some(*phase),
+            _ => None,
+        };
+        let mut world = world(8500 + index as u64, ImagePhase::Forward);
+        let home = aterm_tempfile::tempdir().unwrap();
+        let journal = Journal::new(home.path());
+        journal
+            .record(&world.original, &world.binding, Append::Prepare)
+            .unwrap();
+        journal
+            .record(
+                &world.original,
+                &world.binding,
+                Append::NoExecInPhase(ImagePhase::Forward),
+            )
+            .unwrap();
+        world.facts.native_journal = Some(journal);
+        let next = candidate(&world, "d8", ImagePhase::Forward);
+        world
+            .facts
+            .prepare_journal_ack
+            .store(false, Ordering::SeqCst);
+        assert_eq!(admit(&world, next.clone(), ImagePhase::Forward), UNKNOWN);
+        let operation =
+            world.handle.ctx.fenced_writes.native.lock().unwrap().by_id[&next.id].clone();
+        let binding = operation.lock().unwrap().binding.clone();
+        Journal::new(home.path())
+            .record(&next, &binding, terminal)
+            .unwrap();
+        let relation = aterm_agent::harness::native_receipts::AccountRelation {
+            predecessor: &world.original,
+            predecessor_binding: &world.binding,
+            phase: ImagePhase::Forward,
+            candidate: &next,
+        };
+        let before = Journal::new(home.path())
+            .recover_account(relation, &binding)
+            .unwrap()
+            .unwrap();
+        let records = Journal::new(home.path()).record_count().unwrap();
+        world
+            .facts
+            .prepare_journal_ack
+            .store(true, Ordering::SeqCst);
+        if closed_phase.is_some() {
+            let NativePlan::Restart { process, .. } = &next.plan else {
+                unreachable!()
+            };
+            world
+                .facts
+                .processes
+                .lock()
+                .unwrap()
+                .insert(process.pid, process.clone());
+            assert_eq!(admit(&world, next.clone(), ImagePhase::Forward), UNKNOWN);
+            assert_eq!(operation.lock().unwrap().phase, Phase::Queued);
+            world.facts.processes.lock().unwrap().remove(&process.pid);
+        }
+        for _ in 0..2 {
+            let reply = admit(&world, next.clone(), ImagePhase::Forward);
+            assert_eq!(
+                reply,
+                if closed_phase.is_some() {
+                    NOEXEC
+                } else {
+                    UNKNOWN
+                }
+            );
+            let op = operation.lock().unwrap();
+            assert_eq!(op.binding, binding);
+            assert!(op.preparation.recorded);
+            assert!(matches!(op.phase, Phase::Completed(_)));
+            assert_eq!(
+                op.closed_restart.as_ref().map(|proof| proof.closed_phase()),
+                closed_phase
+            );
+            assert!(op.custody.is_none());
+            drop(op);
+            assert_eq!(Journal::new(home.path()).record_count().unwrap(), records);
+            assert_eq!(
+                Journal::new(home.path())
+                    .recover_account(relation, &binding)
+                    .unwrap(),
+                Some(before)
+            );
+        }
+        {
+            let mut table = world.handle.ctx.fenced_writes.native.lock().unwrap();
+            let retired = table.compact_account_lineages();
+            assert_eq!(
+                table.account_lineages.pins(&next.id),
+                closed_phase.is_some()
+            );
+            drop(table);
+            drop(retired);
+        }
+        assert_eq!(
+            run(
+                &world.handle.ctx,
+                &world.facts,
+                Request::Resume(binding, ImagePhase::Forward, "1.1".into(), 0),
+                world.caller.clone()
+            ),
+            DENIED
+        );
+        assert_eq!(world.facts.grant_journal_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn stale_or_observation_only_retries_do_not_create_account_claims() {
+    for case in 0..5 {
+        let mut world = world(8540 + case, ImagePhase::Forward);
+        #[cfg(unix)]
+        let _journal_home = attach_journal(&mut world);
+        #[cfg(not(unix))]
+        let _ = &mut world;
+        let next = candidate(&world, "d9", ImagePhase::Forward);
+        world
+            .facts
+            .prepare_journal_allowed
+            .store(false, Ordering::SeqCst);
+        assert_eq!(admit(&world, next.clone(), ImagePhase::Forward), UNKNOWN);
+        let operation =
+            world.handle.ctx.fenced_writes.native.lock().unwrap().by_id[&next.id].clone();
+        let binding = operation.lock().unwrap().binding.clone();
+        world
+            .facts
+            .prepare_journal_allowed
+            .store(true, Ordering::SeqCst);
+        match case {
+            0 => world.facts.clock.store(next.deadline_us, Ordering::SeqCst),
+            1 => lookup(&world.handle.ctx, &world.binding)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .closed_restart
+                .as_ref()
+                .unwrap()
+                .retire(),
+            2 => world.facts.account_allowed.store(false, Ordering::SeqCst),
+            _ => {}
+        }
+        let reply = if case == 3 {
+            run(
+                &world.handle.ctx,
+                &world.facts,
+                Request::Reconcile(binding.clone()),
+                world.caller.clone(),
+            )
+        } else if case == 4 {
+            assert!(!preparation::settle_retired(
+                &world.handle.ctx,
+                operation.clone(),
+                &world.facts
+            ));
+            UNKNOWN.into()
+        } else {
+            admit(&world, next.clone(), ImagePhase::Forward)
+        };
+        assert_eq!(reply, UNKNOWN);
+        assert!(!world.facts.journal.lock().unwrap().contains_key(&next.id));
+        let op = operation.lock().unwrap();
+        assert!(!op.preparation.recorded);
+        assert_eq!(op.binding, binding);
+        assert_eq!(op.phase, Phase::Queued);
+        assert!(op.custody.is_none());
+        drop(op);
+        #[cfg(unix)]
+        {
+            let journal = world.facts.native_journal.as_ref().unwrap();
+            assert_eq!(journal.record_count().unwrap(), 2);
+            assert_eq!(
+                journal
+                    .recover_account(
+                        aterm_agent::harness::native_receipts::AccountRelation {
+                            predecessor: &world.original,
+                            predecessor_binding: &world.binding,
+                            phase: ImagePhase::Forward,
+                            candidate: &next,
+                        },
+                        &binding
+                    )
+                    .unwrap(),
+                None
+            );
+        }
+    }
+}
+
+#[test]
+fn a_capture_race_replays_the_exact_published_child_even_after_retirement() {
+    use aterm_agent::harness::native_account_wire::{Predecessor, Relation};
+    for retired in [false, true] {
+        let world = world(8570 + u64::from(retired), ImagePhase::Forward);
+        let next = candidate(&world, "df", ImagePhase::Forward);
+        let relation = Relation::new(
+            Predecessor::new(world.original.clone(), world.binding.clone()).unwrap(),
+            ImagePhase::Forward,
+            next.clone(),
+        )
+        .unwrap();
+        let account = account_continuation::capture_or_replay(&world.handle.ctx, &relation, || {
+            // The first lookup missed C. Its original publisher now completes
+            // while this caller is still capturing the predecessor.
+            world
+                .facts
+                .prepare_journal_ack
+                .store(false, Ordering::SeqCst);
+            assert_eq!(admit(&world, next.clone(), ImagePhase::Forward), UNKNOWN);
+            if retired {
+                lookup(&world.handle.ctx, &world.binding)
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .closed_restart
+                    .as_ref()
+                    .unwrap()
+                    .retire();
+            }
+            Err(DENIED)
+        })
+        .unwrap();
+        world
+            .facts
+            .prepare_journal_ack
+            .store(true, Ordering::SeqCst);
+        let reply = prepare_inner(
+            &world.handle.ctx,
+            -1,
+            next.clone(),
+            world.caller.clone(),
+            &world.facts,
+            Some(account),
+        );
+        if retired {
+            assert_eq!(reply, NOEXEC);
+        } else {
+            assert!(matches!(Reply::parse(&reply), Some(Reply::Admitted(_))));
+        }
+    }
+}
+
+#[test]
+fn retired_parent_confirmation_transfers_history_without_live_authority() {
+    let world = world(8550, ImagePhase::Forward);
+    let next = candidate(&world, "da", ImagePhase::Forward);
+    world
+        .facts
+        .prepare_journal_ack
+        .store(false, Ordering::SeqCst);
+    assert_eq!(admit(&world, next.clone(), ImagePhase::Forward), UNKNOWN);
+    let proof = lookup(&world.handle.ctx, &world.binding)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .closed_restart
+        .clone()
+        .unwrap();
+    proof.retire();
+    world
+        .facts
+        .prepare_journal_ack
+        .store(true, Ordering::SeqCst);
+    assert_eq!(admit(&world, next.clone(), ImagePhase::Forward), NOEXEC);
+    assert!(proof.confirmed_successor(&next));
+    assert!(!proof.claimed_by(&next));
+    let mut table = world.handle.ctx.fenced_writes.native.lock().unwrap();
+    let retired = table.compact_account_lineages();
+    assert!(!table.by_id.contains_key(&world.original.id));
+    assert!(!table.account_lineages.pins(&world.original.id));
+    assert!(table.account_lineages.pins(&next.id));
+    assert_eq!(table.account_lineages.spares(), 1);
+    drop(table);
+    drop(retired);
+}
+
+#[test]
+fn uncertain_cohort_cannot_opaque_seal_an_account_successor() {
+    let mut world = world(8551, ImagePhase::Forward);
+    let next = candidate(&world, "db", ImagePhase::Forward);
+    let binding = admitted_binding(&admit(&world, next.clone(), ImagePhase::Forward));
+    let (completed, completion_rx) = mpsc::sync_channel(1);
+    world.facts.outcome_gate = Some((
+        completed,
+        Arc::new((Mutex::new(true), std::sync::Condvar::new())),
+    ));
+    let mut watching = crate::session_watch::Subscription::new();
+    let dirty = watching.watch(&world.handle.ctx.watchers);
+    dirty.store(false, Ordering::SeqCst);
+    let source = match &next.plan {
+        NativePlan::Restart { process, .. } => process.clone(),
+        _ => unreachable!(),
+    };
+    world
+        .facts
+        .processes
+        .lock()
+        .unwrap()
+        .insert(source.pid, source.clone());
+    assert_eq!(
+        run(
+            &world.handle.ctx,
+            &world.facts,
+            Request::Abort(binding.clone()),
+            world.caller.clone()
+        ),
+        UNKNOWN
+    );
+    let op = lookup(&world.handle.ctx, &binding).unwrap();
+    assert_eq!(op.lock().unwrap().phase, Phase::Started);
+    assert!(completion_rx.try_recv().is_err());
+    world.facts.clock.store(next.deadline_us, Ordering::SeqCst);
+    reconcile_extinct_by(&world.handle.ctx, &world.facts);
+    assert_eq!(op.lock().unwrap().phase, Phase::Started);
+    assert!(
+        !dirty.load(Ordering::SeqCst),
+        "no state change must not wake its own watchers"
+    );
+    assert_eq!(
+        world.facts.journal.lock().unwrap()[&next.id].state,
+        JournalState::Prepared
+    );
+    world.facts.processes.lock().unwrap().remove(&source.pid);
+    reconcile_extinct_by(&world.handle.ctx, &world.facts);
+    assert_eq!(
+        op.lock().unwrap().phase,
+        Phase::Completed(Decision::Retired(Retirement::NotGranted))
+    );
+    assert!(op.lock().unwrap().closed_restart.is_some());
+    assert!(dirty.load(Ordering::SeqCst));
 }
 
 #[test]
@@ -289,6 +849,44 @@ fn ineligible_account_cannot_consume_the_predecessor() {
     );
     world.facts.account_allowed.store(true, Ordering::SeqCst);
     admitted_binding(&admit(&world, next, ImagePhase::Forward));
+}
+
+#[test]
+fn full_predecessor_must_match_on_fresh_admission_and_exact_replay() {
+    for claimed in [false, true] {
+        let mut world = world(8490 + u64::from(claimed), ImagePhase::Forward);
+        let next = candidate(&world, "a6", ImagePhase::Forward);
+        let issued =
+            claimed.then(|| admitted_binding(&admit(&world, next.clone(), ImagePhase::Forward)));
+        let before = world.facts.prepared_history.lock().unwrap().len();
+        world.original.revision += 1;
+        let parent = aterm_agent::harness::native_account_wire::Predecessor::new(
+            world.original.clone(),
+            world.binding.clone(),
+        )
+        .unwrap();
+        assert!(
+            aterm_agent::harness::native_account_wire::Relation::new(
+                parent,
+                ImagePhase::Forward,
+                next.clone()
+            )
+            .is_some(),
+            "the stale predecessor passes structural validation"
+        );
+        assert_eq!(admit(&world, next.clone(), ImagePhase::Forward), DENIED);
+        assert_eq!(world.facts.prepared_history.lock().unwrap().len(), before);
+        if let Some(issued) = issued {
+            assert_eq!(
+                lookup(&world.handle.ctx, &issued)
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .request,
+                next
+            );
+        }
+    }
 }
 
 #[test]
@@ -552,7 +1150,11 @@ pub(crate) fn transition(state: &State, action: &str) -> State {
                     .unwrap()
                     .insert(7000, process(7000, 400, 4242, 400, 90));
             }
-            7 => phase = ImagePhase::Rollback,
+            7 => {
+                phase = ImagePhase::Rollback;
+                next = candidate(&world, "f6", phase);
+            }
+            11 => world.original.revision += 1,
             6 => {
                 let NativePlan::Restart { forward, .. } = &mut next.plan else {
                     unreachable!()
@@ -593,6 +1195,7 @@ pub(crate) fn transition(state: &State, action: &str) -> State {
             "Policy" => 8,
             "Cohort" => 9,
             "AccountPool" => 10,
+            "Predecessor" => 11,
             _ => unreachable!("unmapped account admission action"),
         };
         result.insert("case", case);

@@ -8,6 +8,7 @@ pub(super) fn transition(state: &State, action: &str) -> State {
     let mut preparation = Preparation {
         predecessor: None,
         recorded: state["recorded"] == 1,
+        account_state: None,
         serial: state["serial"] as u64,
         active: (state["active"] == 1).then_some(state["serial"] as u64),
     };

@@ -92,6 +92,7 @@ fn cached_custodian_helper() {
     println!("cached-custodian-ran");
     std::io::stdout().flush().unwrap();
     let store = Store::open_at(Path::new(&path)).unwrap();
+    aterm_capacity::host_executable::narrow_test_image();
     let program = store.cache_current().unwrap();
     let sock = Path::new(&path).join("h.sock");
     let listener = aterm_uds::kept_out(|| aterm_uds::CtlListener::bind(&sock)).unwrap();
@@ -151,6 +152,7 @@ fn cached_host_queries_real_descendants_with_different_loaded_images() {
         .unwrap();
     let store_path = root.path().join("s");
     let store = Store::prepare_at(&store_path).unwrap();
+    aterm_capacity::host_executable::narrow_test_image();
     let program = store.cache_current().unwrap();
     let mut command = aterm_uds::spawnfd::command(program.path());
     command

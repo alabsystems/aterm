@@ -757,7 +757,9 @@ fn redact_credentials(value: &mut Value) {
     match value {
         Value::Object(object) => {
             for (key, value) in object {
-                if sensitive_field(key, value) {
+                // An empty credential field holds no secret: it reads as itself, so a redacted
+                // read of the row writes back.
+                if sensitive_field(key, value) && value.as_str() != Some("") {
                     erase_credentials(std::mem::replace(value, Value::from(REDACTED)));
                 } else {
                     redact_credentials(value);
@@ -2487,8 +2489,11 @@ pub(crate) fn try_run_with(
             let [file_path] = args.as_slice() else {
                 return Err(Error::new("usage: aterm db load <file>"));
             };
-            let (bytes, _) =
-                aterm_uds::atomic_file::read_regular(Path::new(file_path), 64 * 1024 * 1024)?;
+            // A user-named snapshot may be a stream (`/dev/stdin`, `<(…)`), so not regular-only.
+            let bytes = aterm_uds::atomic_file::read_bounded_stream(
+                Path::new(file_path),
+                64 * 1024 * 1024,
+            )?;
             let doc: Value = aterm_json::from_slice(&bytes)
                 .map_err(|_| Error::new("snapshot file must be valid JSON"))?;
             let mut db = open_at(&dir)?;
@@ -2631,6 +2636,27 @@ mod tests {
             resolve_fleet_secret(&tmp.path().join("db")).unwrap(),
             SECRET
         );
+    }
+
+    /// An empty credential field holds no secret, so an ordinary read shows it as itself and that
+    /// redacted read loads back. NEGATIVE CONTROL: with empty fields masked too, the redacted
+    /// dump's load was refused as "a redacted read".
+    #[test]
+    fn an_empty_credential_field_reads_as_itself_and_loads_back() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut a = replica(&root.path().join("a"));
+        put_row(
+            &mut a,
+            "ai_accounts",
+            "a1",
+            json!({ "id": "a1", "api_key": "", "oauth": { "refresh_token": "" } }),
+        )
+        .unwrap();
+        let shown = dump_all(&a, false).unwrap();
+        let row = &shown["ai_accounts"][0];
+        assert_eq!(row["api_key"], json!(""), "{row}");
+        assert_eq!(row["oauth"]["refresh_token"], json!(""), "{row}");
+        load_all(&mut a, &shown).expect("a redacted read holding no secret loads back");
     }
 
     #[test]
@@ -4956,5 +4982,42 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// `aterm db load` reads the snapshot a user names, and that may be a stream: a pipe named by
+    /// `/dev/fd/N` (`aterm db load <(…)`, `/dev/stdin`) loads like a file does, while a directory
+    /// is still refused.
+    /// NEGATIVE CONTROL: with the `load` arm back on `atomic_file::read_regular`, the pipe is
+    /// refused: `` called `Result::unwrap()` on an `Err` value: Error("not a regular file") ``.
+    #[cfg(unix)]
+    #[test]
+    fn load_reads_a_snapshot_from_a_pipe_and_refuses_a_directory() {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        aterm_uds::private_file::write_private(tmp.path(), "fleet.key", SECRET).unwrap();
+        let dir = tmp.path().join("db");
+        drop(replica(&dir));
+        let fleet = |list: &[&str]| {
+            let dir = dir.clone();
+            let words: Vec<String> = list.iter().map(|w| (*w).to_owned()).collect();
+            try_run_with(&words, move || Ok(dir))
+        };
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        let doc = br#"{"computers": [{"label": "m1", "notes": "from a pipe"}]}"#;
+        let feeder = std::thread::spawn(move || writer.write_all(doc));
+        let named = format!("/dev/fd/{}", reader.as_raw_fd());
+        let report = fleet(&["load", &named]).unwrap().unwrap();
+        feeder.join().unwrap().unwrap();
+        drop(reader);
+        assert_eq!(report["operations_committed"], json!(1), "{report}");
+        let db = Database::open(&dir).expect("open");
+        let shown = dump_all(&db, true).unwrap();
+        assert_eq!(
+            shown["computers"][0]["notes"],
+            json!("from a pipe"),
+            "{shown}"
+        );
+        assert!(fleet(&["load", tmp.path().to_str().unwrap()]).is_err());
     }
 }

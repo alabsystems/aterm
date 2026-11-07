@@ -295,6 +295,8 @@ pub struct Completed {
     pub outcome: admission::Outcome,
     pub cause: admission::CompletionCause,
     pub runtime_ns: u64,
+    /// Original owning-wait data only on the explicitly negotiated route.
+    pub accounting: Option<admission::AccountingObservation>,
 }
 /// A prelaunch refusal remains distinct from actual child termination.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -361,6 +363,8 @@ pub struct RemoteChild {
     failure: Option<(io::ErrorKind, String)>,
     cancel: Vec<u8>,
     cancel_written: usize,
+    accounted: bool,
+    accounting: Option<admission::AccountingObservation>,
 }
 impl RemoteChild {
     fn new(
@@ -385,6 +389,8 @@ impl RemoteChild {
             failure: None,
             cancel: Vec::new(),
             cancel_written: 0,
+            accounted: false,
+            accounting: None,
         })
     }
     /// Observe an independently authenticated transport's private lifecycle channel.
@@ -400,6 +406,20 @@ impl RemoteChild {
         .encode()?;
         aterm_uds::keep_out_of_children(&events)?;
         Self::new(CtlStream::from(events), binding, None, None, None)
+    }
+    /// Observe a separately authenticated, negotiated owning-wait channel.
+    /// This constructor authenticates no endpoint and creates no authority.
+    /// Plain legacy terminals are refused; completion waits for clean EOF.
+    ///
+    /// # Errors
+    /// The binding or owned event description is invalid.
+    pub fn from_private_events_accounted(
+        binding: admission::Binding,
+        events: OwnedFd,
+    ) -> io::Result<Self> {
+        let mut child = Self::from_private_events(binding, events)?;
+        child.accounted = true;
+        Ok(child)
     }
     /// Connect anew to a pinned native host and submit this member once. Never retries admission.
     /// # Errors
@@ -512,6 +532,7 @@ impl RemoteChild {
         self.started.as_ref()
     }
     fn fail<T>(&mut self, error: io::Error) -> io::Result<T> {
+        self.accounting = None;
         self.failure = Some((error.kind(), error.to_string()));
         Err(error)
     }
@@ -547,6 +568,7 @@ impl RemoteChild {
                     outcome,
                     cause,
                     runtime_ns,
+                    accounting: self.accounting,
                 }));
                 self.phase = Phase::Terminal;
             }
@@ -572,9 +594,30 @@ impl RemoteChild {
         loop {
             match self.reader.poll(&self.events, &mut budget) {
                 Ok(Some(bytes)) => {
-                    let event = match admission::EventFrame::decode(&bytes, &self.binding) {
-                        Ok(frame) => frame.event,
-                        Err(e) => return self.fail(e),
+                    let event = if self.accounted {
+                        match admission::AccountedEventFrame::decode(&bytes, &self.binding) {
+                            Ok(frame) => {
+                                self.accounting = Some(frame.observation);
+                                frame.finished.event
+                            }
+                            Err(_) => match admission::EventFrame::decode(&bytes, &self.binding) {
+                                Ok(frame)
+                                    if !matches!(
+                                        frame.event,
+                                        admission::Event::Finished { .. }
+                                            | admission::Event::Refused { .. }
+                                    ) =>
+                                {
+                                    frame.event
+                                }
+                                _ => return self.fail(invalid()),
+                            },
+                        }
+                    } else {
+                        match admission::EventFrame::decode(&bytes, &self.binding) {
+                            Ok(frame) => frame.event,
+                            Err(e) => return self.fail(e),
+                        }
                     };
                     if let Err(e) = self.event(event) {
                         return self.fail(e);
@@ -589,7 +632,11 @@ impl RemoteChild {
                     if self.terminal.is_some() && self.reader.pending() {
                         return self.fail(invalid());
                     }
-                    return Ok(self.terminal.clone());
+                    return Ok(if self.accounted {
+                        None
+                    } else {
+                        self.terminal.clone()
+                    });
                 }
                 Err(e)
                     if e.kind() == io::ErrorKind::UnexpectedEof

@@ -155,7 +155,8 @@ fn readings(log: &str) -> String {
         code: Some(101),
         ..crate::exec::Run::default()
     };
-    let (findings, refused) = crate::findings::split_test_findings("test", &log, &[]);
+    let (findings, refused) =
+        crate::findings::split_test_findings("test", &log, &crate::findings::Rerun::default());
     format!(
         "failed_tests: {:#?}\nenvironment_refusals: {:?}\nout_of_disk: {}\ntests_run: {:?}\n\
          passed_by_target: {:?}\nfindings: {:#?}\nrefused: {:?}\nenvironment_failure: {:?}",

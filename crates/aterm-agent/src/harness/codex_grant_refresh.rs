@@ -8,7 +8,7 @@
 use super::*;
 use crate::harness::codex_assignment::SourceAuthority;
 use crate::harness::codex_enrollment::{OwnerAttempt, OwnerWitness};
-use crate::harness::{codex_session_slot as slot, pending_native_store};
+use crate::harness::{codex_session_slot as slot, native_custody_platform as pending_native_store};
 
 const MAX_JOURNAL: usize = 4 * 1024 * 1024;
 const MAX_OPERATIONS: usize = 256;
@@ -427,9 +427,10 @@ impl Claimed {
         create: bool,
         fresh: Option<&FreshActivationGuard<'_>>,
     ) -> Result<Option<Self>, String> {
+        platform::require_available()?;
         let (owner, home) = Store::location(env, &binding.request.id)?;
         let directory = owner.join("refresh");
-        let identity = client::read_machine_identity(&client::Paths::locate_for_home(&home))
+        let identity = platform::machine_identity(&home)
             .map_err(|_| "owner revision identity unavailable")?
             .ok_or("owner revision identity unavailable")?;
         let opened = if create {
@@ -613,7 +614,7 @@ impl Claimed {
                 plaintext,
                 raw: None,
                 no_send: None,
-                source_lease: None,
+                work_lease: None,
             }))
         }
     }
@@ -638,7 +639,7 @@ impl Claimed {
                 plaintext: None,
                 raw: Some((received, expected)),
                 no_send: None,
-                source_lease: None,
+                work_lease: None,
             }));
         };
         if !valid {
@@ -648,7 +649,7 @@ impl Claimed {
                 plaintext: None,
                 raw: Some((received, expected)),
                 no_send: None,
-                source_lease: None,
+                work_lease: None,
             }));
         }
         let journal = self.journal.as_mut().expect("validated refresh journal");
@@ -685,7 +686,7 @@ impl Claimed {
                 plaintext: None,
                 raw: None,
                 no_send: None,
-                source_lease: None,
+                work_lease: None,
             }));
         }
         let journal = self.journal.as_mut().expect("validated send preparation");
@@ -723,7 +724,7 @@ impl Claimed {
                 plaintext: None,
                 raw: None,
                 no_send: None,
-                source_lease: None,
+                work_lease: None,
             }));
         }
         let journal = self.journal.as_mut().expect("validated not-sent proof");
@@ -758,7 +759,6 @@ pub(super) fn current_revision(
 
 /// Initialize only under the actual fresh-publication authority. An existing
 /// active journal is never reset, even when its credential bytes match.
-#[cfg(test)]
 pub(in crate::harness) fn initialize_revision(
     env: &Env,
     guard: &FreshActivationGuard<'_>,
@@ -883,7 +883,7 @@ pub(in crate::harness) struct OwnedRefreshRetention {
     plaintext: Option<SecretBytes>,
     raw: Option<(codex_app_login::ReceivedRefresh, OwnerWitness)>,
     no_send: Option<OwnerWitness>,
-    source_lease: Option<crate::harness::codex_source_gate::SourceWorkLease>,
+    work_lease: Option<transaction::RefreshWorkLease>,
 }
 impl std::fmt::Debug for OwnedRefreshRetention {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -903,17 +903,14 @@ impl std::fmt::Debug for OwnerRefreshError {
     }
 }
 impl OwnedRefreshRetention {
-    pub(in crate::harness) fn retain_source(
-        mut self: Box<Self>,
-        lease: crate::harness::codex_source_gate::SourceWorkLease,
-    ) -> Box<Self> {
-        self.source_lease = Some(lease);
+    fn retain_work(mut self: Box<Self>, lease: transaction::RefreshWorkLease) -> Box<Self> {
+        self.work_lease = Some(lease);
         self
     }
 
     fn continued(
         result: Result<Claimed, Box<Self>>,
-        source_lease: Option<crate::harness::codex_source_gate::SourceWorkLease>,
+        work_lease: Option<transaction::RefreshWorkLease>,
     ) -> Result<OwnerRefreshContinuation, Box<Self>> {
         match result {
             Ok(claimed) => Box::new(Self {
@@ -921,11 +918,11 @@ impl OwnedRefreshRetention {
                 plaintext: None,
                 raw: None,
                 no_send: None,
-                source_lease,
+                work_lease,
             })
             .settled(),
             Err(mut retention) => {
-                retention.source_lease = source_lease;
+                retention.work_lease = work_lease;
                 Err(retention)
             }
         }
@@ -937,7 +934,7 @@ impl OwnedRefreshRetention {
         };
         Ok(OwnerRefreshContinuation {
             binding: journal.binding.clone(),
-            source_lease: self.source_lease,
+            work_lease: self.work_lease,
         })
     }
 
@@ -947,7 +944,7 @@ impl OwnedRefreshRetention {
         if let Some((received, expected)) = self.raw.take() {
             return Self::continued(
                 self.claimed.retain_received(received, expected),
-                self.source_lease,
+                self.work_lease,
             );
         }
         if self.plaintext.is_none() {
@@ -974,7 +971,7 @@ impl OwnedRefreshRetention {
             });
         if settled.is_ok() {
             if let Some(expected) = self.no_send.take() {
-                return Self::continued(self.claimed.mark_not_sent(expected), self.source_lease);
+                return Self::continued(self.claimed.mark_not_sent(expected), self.work_lease);
             }
             self.settled()
         } else {
@@ -989,7 +986,7 @@ impl OwnedRefreshRetention {
 #[must_use = "reconcile shared credential progress before retiring the app operation"]
 pub(in crate::harness) struct OwnerRefreshContinuation {
     binding: GrantBinding,
-    source_lease: Option<crate::harness::codex_source_gate::SourceWorkLease>,
+    work_lease: Option<transaction::RefreshWorkLease>,
 }
 impl std::fmt::Debug for OwnerRefreshContinuation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1003,16 +1000,22 @@ impl OwnerRefreshContinuation {
         scope: &crate::harness::account_work::Scope,
     ) -> Result<(), OwnerRefreshError> {
         if self
-            .source_lease
+            .work_lease
             .as_ref()
             .is_some_and(|lease| lease.current().is_err())
         {
             return Err(OwnerRefreshError::Unavailable);
         }
-        match transaction::reconcile_retained(env, &self.binding, scope) {
+        let result = match self.work_lease.as_ref() {
+            Some(source) => {
+                transaction::reconcile_retained_held_work(env, &self.binding, scope, source)
+            }
+            None => transaction::reconcile_retained(env, &self.binding, scope),
+        };
+        match result {
             Err(OwnerRefreshError::Retaining(mut retention)) => {
-                if let Some(lease) = self.source_lease {
-                    retention = retention.retain_source(lease);
+                if let Some(lease) = self.work_lease {
+                    retention = retention.retain_work(lease);
                 }
                 Err(OwnerRefreshError::Retaining(retention))
             }
@@ -1020,3 +1023,6 @@ impl OwnerRefreshContinuation {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+pub(in crate::harness) use transaction::fixture_promote_received_response;

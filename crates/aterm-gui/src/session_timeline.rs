@@ -33,8 +33,8 @@ pub(crate) const META_QUESTIONS_MAX: usize = 16;
 
 /// The policy words `meta set questions` accepts.
 pub(crate) const QUESTIONS_POLICY_WORDS: [&str;
-    1 + aterm_agent::supervise::QuestionPriority::WORDS.len()] = {
-    let w = aterm_agent::supervise::QuestionPriority::WORDS;
+    1 + aterm_agent::supervise::PriorityWord::WORDS.len()] = {
+    let w = aterm_agent::supervise::PriorityWord::WORDS;
     ["ask", w[0], w[1], w[2]]
 };
 
@@ -2351,11 +2351,10 @@ pub(crate) fn write_attention_kind(
         .map_err(|AttentionOwnersFull| AttentionWriteError::OwnersFull)?;
     let changed = moved.effective;
     meta.driver_writes |= MetaField::Attention.bit();
-    let supervisor = crate::task_record::owner_moves_task(owner)
-        .then(|| crate::task_record::supervisor_attention(&meta));
+    let supervisor = crate::task_record::owner_moves_task(owner);
     let needs_moved = moved.entry && owner == crate::harness_host::NEEDS_ATTENTION_OWNER;
     let (mut task_moved, mut log_owed) = (false, false);
-    if changed || supervisor.is_some() || needs_moved {
+    if changed || supervisor || needs_moved {
         let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         if needs_moved {
             timeline.settle_harness_needs(
@@ -2371,8 +2370,9 @@ pub(crate) fn write_attention_kind(
             );
             timeline.record_meta_change(change, &meta);
         }
-        if let Some(raised) = supervisor {
-            task_moved = timeline.note_task_attention(raised);
+        if supervisor {
+            let asks = crate::task_record::asks_standing(&meta, &timeline);
+            task_moved = timeline.note_task_attention(asks);
         }
         log_owed = timeline.slog_take_wake();
     }
@@ -3673,6 +3673,9 @@ pub(crate) struct SessionTimeline {
     /// The words moved since the hold was last stored ([`Self::set_land_held`] says so once).
     land_said_untold: bool,
     land_receipt: Option<Arc<aterm_agent::harness::acts::LandReceipt>>,
+    /// The why of the point its loop told standing that the held deadline judges
+    /// ([`Self::loop_exception()`]).
+    loop_exception: Option<String>,
     cwd_witness: Option<(u64, i32)>,
     holder_image: Option<std::sync::Arc<crate::holder_image::HolderImage>>,
     drawer_groups: crate::holder_image::DrawerGroups,
@@ -4702,29 +4705,52 @@ impl SessionTimeline {
         &self.need
     }
 
-    /// Apply `mark` to the task record ([`crate::task_record::TaskMark::apply`]) at `now`.
+    /// Apply `mark` to the task record with `asks` standing
+    /// ([`crate::task_record::TaskMark::apply`]) at `now`.
     pub(crate) fn mark_task(
         &mut self,
         mark: &crate::task_record::TaskMark,
-        attention: bool,
+        asks: &crate::task_record::Asks,
         now: std::time::Instant,
         now_unix_ms: u64,
     ) -> (crate::task_record::TaskRecord, bool) {
-        let (next, changed) = mark.apply(self.task.as_ref(), attention, now, now_unix_ms);
+        let (next, changed) = mark.apply(self.task.as_ref(), asks, now, now_unix_ms);
         if changed {
             let at = self.slog.now();
             self.slog.observe_task(&next, at);
             self.record("task-change");
-            self.task = Some(next.clone());
         }
+        self.task = Some(next.clone());
         (next, changed)
     }
 
-    /// The supervisor's attention entry was raised (`true`) or cleared.
-    pub(crate) fn note_task_attention(&mut self, raised: bool) -> bool {
-        let Some(task) = self.task.as_mut().filter(|task| task.attention != raised) else {
+    /// The asks standing under the task owners moved ([`crate::task_record::supervisor_asks`]):
+    /// the record's rev moves when they raise or clear its attention or one joins them
+    /// ([`crate::task_record::Asks::joins`]), never when one of several is taken down or the same
+    /// ask is written again.
+    pub(crate) fn note_task_attention(&mut self, asks: crate::task_record::Asks) -> bool {
+        self.note_task_asks(asks, true)
+    }
+
+    /// [`Self::note_task_attention`] after words that restate another owner's ask
+    /// (`task_record::AttentionEdit::Restate`): the record keeps `asks`, its rev moving only
+    /// where they raise or clear its attention.
+    pub(crate) fn restate_task_attention(&mut self, asks: crate::task_record::Asks) -> bool {
+        self.note_task_asks(asks, false)
+    }
+
+    /// The record keeps `asks`; its rev moves where they raise or clear its attention or, with
+    /// `joined` news, one joins them.
+    fn note_task_asks(&mut self, asks: crate::task_record::Asks, joined: bool) -> bool {
+        let Some(task) = self.task.as_mut() else {
             return false;
         };
+        let raised = !asks.is_empty();
+        let news = task.attention != raised || (joined && asks.joins(&task.asks));
+        task.asks = asks;
+        if !news {
+            return false;
+        }
         task.attention = raised;
         task.rev = task.rev.saturating_add(1);
         let at = self.slog.now();
@@ -6321,6 +6347,20 @@ impl SessionTimeline {
     /// the landing answered the land check is its `check` (`mode_words::said_words` words it).
     pub(crate) fn land_receipt(&self) -> Option<&Arc<aterm_agent::harness::acts::LandReceipt>> {
         self.land_receipt.as_ref()
+    }
+
+    /// Replace the point the session's loop told standing ([`Self::loop_exception()`]).
+    pub(crate) fn set_loop_exception(&mut self, why: Option<String>) {
+        self.loop_exception = why;
+    }
+
+    /// The why of the point only a person can answer that the session's loop last told this
+    /// window's host standing (`HostNote::ResumeException`), where it is one the held deadline
+    /// judges at any verdict (`harness_host::held_judges_exception`): a fact for later told once
+    /// the loop's own tries at it are spent. `None` once the loop lifts it, ends, or tells one
+    /// the deadline does not judge.
+    pub(crate) fn loop_exception(&self) -> Option<&str> {
+        self.loop_exception.as_deref()
     }
 
     /// `(path word, "path_evidence= copy= upgrade=")` for `status` and roster rows, after

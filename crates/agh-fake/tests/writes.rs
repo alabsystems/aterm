@@ -746,6 +746,52 @@ fn refs_create_read_and_collide() {
     );
 }
 
+/// An `updateRefs` names its repository by the node ID the repository reports, exactly: the
+/// same number spelled with a leading zero names none, and moves no ref.
+/// NEGATIVE CONTROL: a node ID parsed as any run of digits (088d1e753e) takes `R_0<id>` for
+/// the repository and moves `main`: `R_0<id> names no repository`.
+#[test]
+fn update_refs_takes_only_the_canonical_node_id() {
+    let (fake, dev, _) = with_main();
+    let node = api("/repos/fixture-dev/app")
+        .token(&dev)
+        .send(fake.ports().api)
+        .json()["node_id"]
+        .as_str()
+        .expect("node ID")
+        .to_string();
+    let digits = node.strip_prefix("R_").expect("R_ node ID");
+    let mutation = |repository: &str| {
+        send_json(
+            &fake,
+            "POST",
+            "/graphql",
+            &dev,
+            &json!({
+                "query": "mutation($input: UpdateRefsInput!) { updateRefs(input: $input) { clientMutationId } }",
+                "variables": {"input": {
+                    "repositoryId": repository,
+                    "clientMutationId": "m",
+                    "refUpdates": [{
+                        "name": "refs/heads/main",
+                        "beforeOid": MAIN_SHA,
+                        "afterOid": MAIN_SHA,
+                        "force": false,
+                    }],
+                }},
+            }),
+        )
+    };
+    let padded = mutation(&format!("R_0{digits}"));
+    assert_eq!(padded.status, 404, "R_0<id> names no repository");
+    let exact = mutation(&node);
+    assert_eq!(exact.status, 200);
+    assert_eq!(
+        exact.json()["data"]["updateRefs"]["clientMutationId"],
+        json!("m")
+    );
+}
+
 #[test]
 fn keys_need_the_scope() {
     let (fake, dev, _) = fake();

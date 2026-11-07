@@ -168,6 +168,22 @@ unsafe extern "system" {
     pub(crate) fn GetConsoleProcessList(lpdwProcessList: *mut u32, dwProcessCount: u32) -> u32;
     /// This process's pseudo-handle (`crate::elevation`).
     pub(crate) fn GetCurrentProcess() -> RawHandle;
+    /// This process's id (`crate::host`, with [`ProcessIdToSessionId`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn GetCurrentProcessId() -> u32;
+    /// The Remote Desktop session `dwProcessId` runs in (`crate::host`): session 0 is the
+    /// services', where an SSH session's processes run too.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn ProcessIdToSessionId(dwProcessId: u32, pSessionId: *mut u32) -> i32;
+    /// One mitigation policy of `hProcess` (`crate::host`: `ProcessRedirectionTrustPolicy`),
+    /// written to `lpBuffer`, `dwLength` bytes.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn GetProcessMitigationPolicy(
+        hProcess: RawHandle,
+        MitigationPolicy: i32,
+        lpBuffer: *mut core::ffi::c_void,
+        dwLength: usize,
+    ) -> i32;
     /// One of this machine's names (`crate::process`: its DNS host name, its
     /// NetBIOS name), by `COMPUTER_NAME_FORMAT` (`name_type`). `size` is the
     /// buffer's length in UTF-16 units, NUL included; on success it is set to

@@ -542,6 +542,7 @@ pub(crate) fn owner_input(snap: &Snapshot) -> DeckInput<'_> {
         network_place: None,
         network_target: crate::network_deck::Target::Overview,
         lab: None,
+        fleet: None,
         snap: Some(snap),
         prev_snap: None,
         tab_panes: vec![FRONT],

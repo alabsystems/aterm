@@ -195,6 +195,13 @@ impl Journal {
         aterm_durable::durable(&private(&self.active, true)?)
     }
     pub(super) fn update(&self, binding: &Binding, phase: &str, fields: Value) -> io::Result<()> {
+        self.edit(binding, Some(phase), fields)
+    }
+    /// Update retained bookkeeping without resurrecting the native life phase.
+    pub(super) fn patch(&self, binding: &Binding, fields: Value) -> io::Result<()> {
+        self.edit(binding, None, fields)
+    }
+    fn edit(&self, binding: &Binding, phase: Option<&str>, fields: Value) -> io::Result<()> {
         self.validate()?;
         let path = self.active.join(name(binding)?);
         let mut record = read(&path)?;
@@ -202,7 +209,9 @@ impl Journal {
         let object = record
             .as_object_mut()
             .ok_or_else(|| refused("invalid attempt record"))?;
-        object.insert("phase".into(), Value::String(phase.into()));
+        if let Some(phase) = phase {
+            object.insert("phase".into(), Value::String(phase.into()));
+        }
         for (key, value) in fields
             .as_object()
             .ok_or_else(|| refused("invalid attempt update"))?

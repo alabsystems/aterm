@@ -53,12 +53,12 @@ impl World {
         world.write_receipt(&world.receipt);
         world
     }
+    /// Private whatever the umask, as the producer records it: local custody refuses a file
+    /// the group or others can write.
     fn write_receipt(&self, receipt: &aterm_json::Value) {
-        std::fs::write(
-            self.artifact.join("local-build.json"),
-            aterm_json::to_vec(receipt).unwrap(),
-        )
-        .unwrap();
+        let path = self.artifact.join("local-build.json");
+        std::fs::write(&path, aterm_json::to_vec(receipt).unwrap()).unwrap();
+        crate::platform::set_mode(&path, 0o600).unwrap();
     }
     fn authority(&self) -> LocalAuthority {
         LocalAuthority::new(PROGRAM, COMMAND, SOURCE, crate::cli::current_triple()).unwrap()
@@ -76,7 +76,8 @@ fn the_producers_claude_package_and_distinct_command_stage_then_select_only_afte
     let w = World::new("local-harness-stage");
     let lock = w.lock();
     let vendor = w.layout.program_current("claude");
-    std::fs::create_dir_all(vendor.parent().unwrap()).unwrap();
+    // Laid as an install lays its program's folder, whatever the umask.
+    crate::store::make_build_parent(&vendor).unwrap();
     std::os::unix::fs::symlink("/untouched/vendor", &vendor).unwrap();
     let staged = stage(&lock, &w.authority(), &w.artifact).unwrap();
     assert_eq!(w.receipt["program"].as_str(), Some("claude-code-alab"));

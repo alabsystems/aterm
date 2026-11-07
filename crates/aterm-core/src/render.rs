@@ -1467,6 +1467,56 @@ impl Clone for RenderInput {
     }
 }
 
+/// Replace one resolved extra only when its payload changed, then advance the live prefix.
+pub(crate) fn reuse_frame_extra<T: ?Sized>(
+    out: &mut Vec<(usize, Box<T>)>,
+    written: &mut usize,
+    col: usize,
+    same: impl FnOnce(&T) -> bool,
+    make: impl FnOnce() -> Box<T>,
+) {
+    if let Some((old_col, payload)) = out.get_mut(*written) {
+        if !same(payload.as_ref()) {
+            *payload = make();
+        }
+        *old_col = col;
+    } else {
+        out.push((col, make()));
+    }
+    *written += 1;
+}
+
+fn clone_box_extras<T: ?Sized + PartialEq>(
+    target: &mut Vec<(usize, Box<T>)>,
+    source: &[(usize, Box<T>)],
+) where
+    Box<T>: Clone,
+{
+    let mut written = 0;
+    for (col, payload) in source {
+        reuse_frame_extra(
+            target,
+            &mut written,
+            *col,
+            |old| old == payload.as_ref(),
+            || payload.clone(),
+        );
+    }
+    target.truncate(written);
+}
+
+fn clone_box_rows<T: ?Sized + PartialEq>(
+    target: &mut Vec<Vec<(usize, Box<T>)>>,
+    source: &[Vec<(usize, Box<T>)>],
+) where
+    Box<T>: Clone,
+{
+    target.resize_with(source.len(), Vec::new);
+    for (target, source) in target.iter_mut().zip(source) {
+        clone_box_extras(target, source);
+    }
+}
+
 fn images_eq(
     a: &[Vec<(usize, aterm_grid::ImageRef)>],
     b: &[Vec<(usize, aterm_grid::ImageRef)>],
@@ -1613,8 +1663,8 @@ impl ApronRow {
         } = self;
         *present = source.present;
         cells.clone_from(&source.cells);
-        clusters.clone_from(&source.clusters);
-        combining.clone_from(&source.combining);
+        clone_box_extras(clusters, &source.clusters);
+        clone_box_extras(combining, &source.combining);
         *line_size = source.line_size;
         *cursor_col = source.cursor_col;
     }
@@ -1724,8 +1774,8 @@ impl RenderInput {
         self.selection_bg = source.selection_bg;
         self.selection_fg = source.selection_fg;
         self.selections.clone_from(&source.selections);
-        self.clusters.clone_from(&source.clusters);
-        self.combining.clone_from(&source.combining);
+        clone_box_rows(&mut self.clusters, &source.clusters);
+        clone_box_rows(&mut self.combining, &source.combining);
         self.visual_to_logical.clone_from(&source.visual_to_logical);
         self.line_sizes.clone_from(&source.line_sizes);
         self.line_size_spans.clone_from(&source.line_size_spans);

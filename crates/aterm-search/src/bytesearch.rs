@@ -3,11 +3,13 @@
 
 //! SWAR byte scanning (`memchr`, `memchr2`) and Two-Way substring search (`Searcher`).
 
+use std::borrow::Cow;
 use std::cell::Cell;
 
 #[cfg(test)]
 std::thread_local! {
     static BYTE_READS: Cell<usize> = const { Cell::new(0) };
+    static FACTORIZATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
 const WORD: usize = core::mem::size_of::<usize>();
@@ -412,6 +414,8 @@ fn maximal_suffix<const REV: bool, const FOLD: bool>(
 }
 
 fn factorize<const REV: bool, const FOLD: bool>(needle: &View<'_, REV, FOLD>) -> Factorization {
+    #[cfg(test)]
+    FACTORIZATIONS.with(|n| n.set(n.get() + 1));
     let (cut_less, period_less) = maximal_suffix(needle, false);
     let (cut_more, period_more) = maximal_suffix(needle, true);
     let (cut, period) = if cut_less >= cut_more {
@@ -584,12 +588,49 @@ impl<const REV: bool, const FOLD: bool> Iterator for Matches<'_, '_, REV, FOLD> 
 pub(crate) struct Searcher<'n, const FOLD: bool = false> {
     /// The bytes being searched for.
     needle: &'n [u8],
+    plan: Cow<'n, NeedlePlan>,
+}
+
+#[derive(Clone)]
+struct NeedlePlan {
     /// The factorization used reading forwards.
     forward: Cell<Option<Factorization>>,
     /// The factorization used reading backwards, computed on first use.
     backward: Cell<Option<Factorization>>,
     /// The skip byte and its physical offset in the needle.
     rare: Cell<Option<(u8, usize)>>,
+}
+
+impl NeedlePlan {
+    const fn new() -> Self {
+        Self {
+            forward: Cell::new(None),
+            backward: Cell::new(None),
+            rare: Cell::new(None),
+        }
+    }
+}
+
+/// An immutable owned query and its preparation, shared by successive row searches.
+pub(crate) struct OwnedSearcher {
+    needle: Box<[u8]>,
+    plan: NeedlePlan,
+}
+
+impl OwnedSearcher {
+    pub(crate) fn new(query: &str) -> Self {
+        Self {
+            needle: query.as_bytes().into(),
+            plan: NeedlePlan::new(),
+        }
+    }
+
+    pub(crate) fn searcher(&self) -> Searcher<'_> {
+        Searcher {
+            needle: &self.needle,
+            plan: Cow::Borrowed(&self.plan),
+        }
+    }
 }
 
 impl<'n> Searcher<'n> {
@@ -653,20 +694,18 @@ impl<'n, const FOLD: bool> Searcher<'n, FOLD> {
     const fn with_mode(needle: &'n [u8]) -> Self {
         Self {
             needle,
-            forward: Cell::new(None),
-            backward: Cell::new(None),
-            rare: Cell::new(None),
+            plan: Cow::Owned(NeedlePlan::new()),
         }
     }
 
     /// The skip byte and its physical offset, choosing it once.
     #[inline]
     fn rare(&self) -> Option<(u8, usize)> {
-        match self.rare.get() {
+        match self.plan.rare.get() {
             Some(ready) => Some(ready),
             None => {
                 let chosen = rare_byte::<FOLD>(self.needle)?;
-                self.rare.set(Some(chosen));
+                self.plan.rare.set(Some(chosen));
                 Some(chosen)
             }
         }
@@ -681,7 +720,11 @@ impl<'n, const FOLD: bool> Searcher<'n, FOLD> {
     /// The factorization for `REV`, computing it once.
     #[inline]
     fn factorization<const REV: bool>(&self) -> Factorization {
-        let slot = if REV { &self.backward } else { &self.forward };
+        let slot = if REV {
+            &self.plan.backward
+        } else {
+            &self.plan.forward
+        };
         match slot.get() {
             Some(ready) => ready,
             None => {
@@ -731,6 +774,33 @@ impl<'n, const FOLD: bool> Searcher<'n, FOLD> {
 #[cfg(test)]
 mod tests {
     use super::{Searcher, memchr};
+
+    #[test]
+    fn owned_query_preparation_is_shared_across_rows_and_directions() {
+        use super::{FACTORIZATIONS, OwnedSearcher};
+        for query in ["abababab".to_owned(), "界é界é".to_owned(), "a".repeat(4096)] {
+            let owned = OwnedSearcher::new(&query);
+            let row = format!("x{query}y{query}z");
+            let want = [1, query.len() + 2];
+            let before = FACTORIZATIONS.with(std::cell::Cell::get);
+            for _ in 0..128 {
+                let searcher = owned.searcher();
+                assert_eq!(
+                    searcher
+                        .matches_in::<false>(row.as_bytes())
+                        .collect::<Vec<_>>(),
+                    want
+                );
+                assert_eq!(
+                    searcher
+                        .matches_in::<true>(row.as_bytes())
+                        .collect::<Vec<_>>(),
+                    [want[1], want[0]]
+                );
+            }
+            assert_eq!(FACTORIZATIONS.with(std::cell::Cell::get) - before, 2);
+        }
+    }
 
     #[test]
     fn ascii_folded_cursors_match_a_byte_reference_in_both_directions() {

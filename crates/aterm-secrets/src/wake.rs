@@ -23,6 +23,8 @@ pub enum Wake {
     Browse,
     /// The local LAN broker began answering its verified hello.
     Broker,
+    /// The subscriber's local readiness listener ended and needs upkeep.
+    Listener,
     /// The server stored a new version, which its advert names.
     Put,
     /// This Mac woke from a sleep ([`aterm_uds::power::Power::Woke`]), before which the server
@@ -41,6 +43,7 @@ impl Wake {
             Wake::Route => "a route change",
             Wake::Browse => "a vault server the browse heard",
             Wake::Broker => "the LAN broker becoming ready",
+            Wake::Listener => "the readiness listener ending",
             Wake::Put => "a new version stored",
             Wake::Resumed => "this Mac waking from sleep",
             Wake::Stop => "its end",
@@ -117,7 +120,7 @@ const HEAR_STEP: Duration = Duration::from_secs(5);
 pub fn route_changes() -> Option<impl FnMut(Duration) -> bool + Send + 'static> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        let changes = crate::network::RouteChanges::open()?;
+        let changes = crate::network::RouteChanges::open().ok()?;
         Some(move |most: Duration| changes.wait(most))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]

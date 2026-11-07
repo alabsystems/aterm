@@ -534,6 +534,26 @@ fn lowered_min_counts_only_the_glyphs_the_effects_took_down() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `--lowered-min X` judges the letter guard's law: a glyph whose own clean reading is X or more
+/// is the effects' doing once it reads under X, however little it lost (the flood's `p`, 4.49 of
+/// its own 4.56 under Comet's tail on Default Light); one whose own reading is under X only once it
+/// reads under 97% of it. A glyph that keeps its reading, or reads X, is not counted.
+#[test]
+fn lowered_min_holds_a_glyph_at_the_bar_to_the_bar() {
+    let cell = |now: f64, own: f64| {
+        J::obj([
+            ("local_contrast", J::Float(now)),
+            ("clean_local_contrast", J::Float(own)),
+        ])
+    };
+    assert!(lowered_under(&cell(4.49, 4.56), 4.5));
+    assert!(lowered_under(&cell(4.45, 4.54), 4.5));
+    assert!(lowered_under(&cell(4.30, 4.45), 4.5));
+    assert!(!lowered_under(&cell(4.40, 4.45), 4.5));
+    assert!(!lowered_under(&cell(4.50, 4.56), 4.5));
+    assert!(!lowered_under(&cell(4.20, 4.20), 4.5));
+}
+
 /// A Settings frame's grid is its cursor scene card, a small part of the window: the page the
 /// caret is judged on is the card's, the grid's most common colour, not the window chrome that
 /// fills the most of the frame (the negative control).

@@ -34,18 +34,23 @@ pub(crate) trait Backend {
         producer: OwnedFd,
         stdio: StdioConfig,
         delegated: Delegations,
+        accounted: bool,
     ) -> Result<RemoteChild, SubmitError>;
 }
 
 /// Recognize only the exact private entry; helper success is transport health,
 /// never the target's exit code. No diagnostics use the target's standard I/O.
 pub(crate) fn entry(args: &[OsString], backend: &mut dyn Backend) -> Option<ExitCode> {
-    let fds = match wire::HelperFds::parse(args) {
-        Ok(None) => return None,
-        Ok(Some(fds)) => fds,
+    let (fds, accounted) = match wire::HelperFds::parse(args) {
+        Ok(None) => match wire::HelperFds::parse_accounted(args) {
+            Ok(Some(fds)) => (fds, true),
+            Ok(None) => return None,
+            Err(_) => return Some(ExitCode::from(75)),
+        },
+        Ok(Some(fds)) => (fds, false),
         Err(_) => return Some(ExitCode::from(75)),
     };
-    Some(if run(fds, backend).is_ok() {
+    Some(if run(fds, backend, accounted).is_ok() {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(75)
@@ -216,14 +221,20 @@ fn intake(fds: wire::HelperFds, request: &wire::Request) -> io::Result<(StdioCon
         Delegations { cpu, gnu, fences },
     ))
 }
-fn run(fds: wire::HelperFds, backend: &mut dyn Backend) -> io::Result<()> {
+fn run(fds: wire::HelperFds, backend: &mut dyn Backend, accounted: bool) -> io::Result<()> {
     let control = socket(fds.control)?;
     let producer = socket(fds.producer)?;
     let mut channel = wire::Channel::new(UnixStream::from(control))?;
-    let request = wire::Request::decode(&channel.receive(Instant::now() + EXCHANGE)?)?;
+    let bytes = channel.receive(Instant::now() + EXCHANGE)?;
+    let request = if accounted {
+        wire::accounting::AccountedRequest::decode(&bytes)?.request
+    } else {
+        wire::Request::decode(&bytes)?
+    };
     let context = Context {
         root: request.binding.root_attempt,
         member: request.member_attempt,
+        accounted,
     };
     let (stdio, delegated) = match intake(fds, &request) {
         Ok(rights) => rights,
@@ -236,7 +247,8 @@ fn run(fds: wire::HelperFds, backend: &mut dyn Backend) -> io::Result<()> {
             );
         }
     };
-    let (mut child, attached) = match backend.submit(request, producer, stdio, delegated) {
+    let (mut child, attached) = match backend.submit(request, producer, stdio, delegated, accounted)
+    {
         Ok(child) => (child, true),
         Err(SubmitError::Unknown { child, .. }) => (*child, false),
         Err(SubmitError::NotSubmitted(_)) => {
@@ -257,18 +269,41 @@ fn run(fds: wire::HelperFds, backend: &mut dyn Backend) -> io::Result<()> {
 struct Context {
     root: [u8; 16],
     member: [u8; 16],
+    accounted: bool,
 }
 impl Context {
     fn send(&self, channel: &mut wire::Channel, status: wire::Status) -> io::Result<()> {
-        channel.send(
-            &wire::StatusFrame {
-                root_attempt: self.root,
-                member_attempt: self.member,
-                status,
-            }
-            .encode()?,
-            Instant::now() + EXCHANGE,
+        self.send_observed(
+            channel,
+            status,
+            wire::accounting::Observation::uncollected(),
         )
+    }
+    fn send_observed(
+        &self,
+        channel: &mut wire::Channel,
+        status: wire::Status,
+        observation: wire::accounting::Observation,
+    ) -> io::Result<()> {
+        let frame = wire::StatusFrame {
+            root_attempt: self.root,
+            member_attempt: self.member,
+            status,
+        };
+        let bytes = if self.accounted
+            && matches!(
+                frame.status,
+                wire::Status::Finished { .. } | wire::Status::Refused { .. }
+            ) {
+            wire::accounting::TerminalFrame {
+                finished: frame,
+                observation,
+            }
+            .encode()?
+        } else {
+            frame.encode()?
+        };
+        channel.send(&bytes, Instant::now() + EXCHANGE)
     }
 }
 trait ObservedChild {
@@ -336,7 +371,15 @@ fn observe(
             started = Some(actual);
         }
         match terminal {
-            Ok(Some(done)) => return context.send(channel, completed(done)),
+            Ok(Some(done)) => {
+                let observation = match &done {
+                    Terminal::Finished(value) => value
+                        .accounting
+                        .unwrap_or_else(wire::accounting::Observation::uncollected),
+                    Terminal::Refused { .. } => wire::accounting::Observation::uncollected(),
+                };
+                return context.send_observed(channel, completed(done), observation);
+            }
             Err(_) => {
                 let _ = context.send(
                     channel,

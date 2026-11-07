@@ -515,7 +515,7 @@ impl Grid {
                             row.write_wide_char_packed_no_fixup(col, chars[pos + i], colors, flags);
                         }
                     }
-                    row.settle_len_after_wide_run(end_col_run, end_half_blanked);
+                    row.settle_len_after_wide_run(cursor_col, end_col_run, end_half_blanked);
                     row.mark_has_wide_chars();
                 } else {
                     for i in 0..to_write {
@@ -613,7 +613,7 @@ impl Grid {
                             row.write_wide_char_packed_no_fixup(col, chars[pos + j], colors, flags);
                         }
                     }
-                    row.settle_len_after_wide_run(end_col, end_half_blanked);
+                    row.settle_len_after_wide_run(cursor_col, end_col, end_half_blanked);
                     row.mark_has_wide_chars();
                 } else {
                     for j in 0..to_write {
@@ -723,7 +723,7 @@ impl Grid {
                             row.write_wide_char_packed_no_fixup(col, c, bmp_colors, fl);
                         }
                     }
-                    row.settle_len_after_wide_run(end_col, end_half_blanked);
+                    row.settle_len_after_wide_run(cursor_col, end_col, end_half_blanked);
                     row.mark_has_wide_chars();
                 } else {
                     for (j, &c) in slice.iter().enumerate() {

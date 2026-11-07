@@ -21,6 +21,7 @@ const CAPABILITIES: u8 = 1;
 const AUTHORIZE: u8 = 2;
 const INSPECT: u8 = 3;
 const SUBMIT: u8 = 4;
+const SUBMIT_ACCOUNTED: u8 = 5;
 
 fn refused() -> io::Error {
     io::Error::new(
@@ -111,13 +112,19 @@ impl Forwarder {
         })
     }
     pub(crate) fn submit(&self, submission: AuthorizedSubmission) -> io::Result<()> {
+        self.submit_mode(submission, false)
+    }
+    pub(crate) fn submit_accounted(&self, submission: AuthorizedSubmission) -> io::Result<()> {
+        self.submit_mode(submission, true)
+    }
+    fn submit_mode(&self, submission: AuthorizedSubmission, accounted: bool) -> io::Result<()> {
         self.with(|stream, deadline| {
             if submission.request.peer_pid != submission.peer.pid
                 || submission.request.peer_birth != submission.peer.birth
             {
                 return Err(refused());
             }
-            let mut frame = vec![SUBMIT];
+            let mut frame = vec![if accounted { SUBMIT_ACCOUNTED } else { SUBMIT }];
             frame.extend(submission.request.encode()?);
             wire::write_frame(stream, &frame, deadline)?;
             wire::send_attachments(stream, &submission.fds, deadline)?;
@@ -178,7 +185,7 @@ pub(crate) fn serve(
             CAPABILITIES if body.is_empty() => {
                 json_write(stream, &crate::actor::capabilities(), deadline)?
             }
-            AUTHORIZE | SUBMIT => {
+            AUTHORIZE | SUBMIT | SUBMIT_ACCOUNTED => {
                 let request = Submission::decode(body)?;
                 let peer = Peer {
                     pid: request.peer_pid,
@@ -196,7 +203,12 @@ pub(crate) fn serve(
                     if wire::local_peer(stream)? != original {
                         return Err(refused());
                     }
-                    crate::actor::submit(AuthorizedSubmission { request, peer, fds })?;
+                    let submission = AuthorizedSubmission { request, peer, fds };
+                    if *op == SUBMIT_ACCOUNTED {
+                        crate::actor::submit_accounted(submission)?;
+                    } else {
+                        crate::actor::submit(submission)?;
+                    }
                     wire::write_frame(stream, &[1], deadline)?;
                 }
             }

@@ -10,6 +10,11 @@ use std::ffi::OsString;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+mod lines;
+use lines::Lines;
+#[cfg(test)]
+mod lines_tests;
+
 use aterm_agent::supervise::{BackgroundCall, BackgroundEvidence, HeldCall};
 
 use aterm_sysprobe::jobs::{
@@ -1356,52 +1361,6 @@ impl JobFeed {
             shell_ms: fed.shell.map(ms),
             typed_ms: fed.typed,
         }
-    }
-}
-
-/// What a fed chunk holds of lines.
-struct Lines {
-    /// A line feed.
-    ends: bool,
-    /// A line feed after text in the chunk itself.
-    ended: bool,
-    /// Text after its last line feed, or all of it when it holds none.
-    tail: bool,
-    /// A control sequence that puts the cursor on a row of the program's choosing or moves rows
-    /// (CUP, HVP, VPA, DECSTBM, IL, DL, SU, SD): the program draws the screen (nvim, Emacs, a
-    /// pager), and its line feeds are cursor moves, not lines it printed. A spinner's `\r` and
-    /// erase draw nothing.
-    drawn: bool,
-}
-
-impl Lines {
-    fn of(chunk: &[u8]) -> Self {
-        let mut lines = Self {
-            ends: false,
-            ended: false,
-            tail: false,
-            drawn: false,
-        };
-        lines.drawn = (0..chunk.len()).any(|i| {
-            let Some(rest) = chunk.get(i..).and_then(|c| c.strip_prefix(b"\x1b[")) else {
-                return false;
-            };
-            rest.iter()
-                .find(|b| (0x40..=0x7e).contains(*b))
-                .is_some_and(|b| matches!(b, b'H' | b'f' | b'd' | b'r' | b'L' | b'M' | b'S' | b'T'))
-        });
-        for &b in chunk {
-            match b {
-                b'\n' => {
-                    lines.ends = true;
-                    lines.ended |= lines.tail;
-                    lines.tail = false;
-                }
-                b'\r' => {}
-                _ => lines.tail = true,
-            }
-        }
-        lines
     }
 }
 

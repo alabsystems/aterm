@@ -11,6 +11,67 @@ use crate::spawnfd::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
+/// A poll(2) timeout: round positive millisecond fragments up and saturate at its signed limit.
+/// Rounding down would turn the last fragment of a deadline into a busy zero-timeout poll.
+#[must_use]
+pub fn poll_timeout_ms(left: Duration) -> i32 {
+    i32::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX)
+}
+
+#[cfg(test)]
+mod poll_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn positive_fragments_round_up_and_long_waits_saturate() {
+        for (duration, expected) in [
+            (Duration::ZERO, 0),
+            (Duration::from_nanos(1), 1),
+            (Duration::from_nanos(999_999), 1),
+            (Duration::from_millis(1), 1),
+            (Duration::from_nanos(1_000_001), 2),
+            (Duration::MAX, i32::MAX),
+        ] {
+            assert_eq!(poll_timeout_ms(duration), expected);
+        }
+    }
+
+    #[test]
+    fn a_poll_timeout_is_the_smallest_millisecond_ceiling() {
+        let limit_ns = u64::try_from(i32::MAX).unwrap() * 1_000_000;
+        for nanos in [
+            0,
+            1,
+            999_999,
+            1_000_000,
+            1_000_001,
+            199_999_999,
+            200_000_000,
+            200_000_001,
+            limit_ns - 1,
+            limit_ns,
+        ] {
+            let budget = Duration::from_nanos(nanos);
+            let millis = poll_timeout_ms(budget);
+            let represented = Duration::from_millis(u64::try_from(millis).unwrap());
+            if budget.is_zero() {
+                assert!(represented.is_zero());
+            } else {
+                assert!(represented >= budget, "{budget:?}: {millis}");
+                assert!(represented - budget < Duration::from_millis(1));
+            }
+        }
+    }
+
+    #[test]
+    fn a_poll_timeout_saturates_at_the_signed_limit() {
+        let limit = Duration::from_millis(u64::try_from(i32::MAX).unwrap());
+        for budget in [limit, limit + Duration::from_nanos(1), Duration::MAX] {
+            assert_eq!(poll_timeout_ms(budget), i32::MAX);
+        }
+    }
+}
+
 #[cfg(unix)]
 mod children;
 
@@ -23,9 +84,11 @@ mod complete;
 #[cfg(unix)]
 mod custody;
 pub use complete::{
-    CompleteOutputError, MAX_COMPLETE_STDOUT_BYTES, output_until_complete_stdout,
-    output_until_complete_stdout_from, output_until_complete_stdout_from_observed,
-    output_until_complete_stdout_observed, output_until_complete_stdout_with_limit,
+    CompleteOutputError, MAX_COMPLETE_LISTING_BYTES, MAX_COMPLETE_STDOUT_BYTES,
+    output_until_complete_listing, output_until_complete_stdout, output_until_complete_stdout_from,
+    output_until_complete_stdout_from_observed, output_until_complete_stdout_observed,
+    output_until_complete_stdout_with_limit, output_within_complete_listing,
+    output_within_complete_stdout_records, output_within_complete_stdout_records_from,
 };
 #[cfg(unix)]
 pub use complete::{RetainedOutputError, output_until_complete_stdout_retained};
@@ -207,6 +270,8 @@ pub fn poll_yield() {
 
 #[cfg(any(test, debug_assertions))]
 mod silent;
+#[cfg(all(test, any(target_vendor = "apple", target_os = "linux")))]
+pub(crate) use silent::copy_regular_fresh;
 #[cfg(all(unix, test))]
 pub(crate) use silent::std_ends_within;
 #[cfg(any(test, debug_assertions))]
@@ -704,6 +769,31 @@ pub fn output_while_progressing(
     window: Duration,
     progress: &mut dyn FnMut() -> u64,
 ) -> Result<Output, RunError> {
+    progressing_until(cmd, window, None, progress)
+}
+
+/// Runs while native progress advances within `window`, without extending
+/// the original absolute deadline when progress occurs.
+/// # Errors
+/// The original deadline expires, progress stalls, or native spawn/wait fails.
+pub fn output_while_progressing_until(
+    cmd: &mut Command,
+    window: Duration,
+    deadline: Instant,
+    progress: &mut dyn FnMut() -> u64,
+) -> Result<Output, RunError> {
+    if Instant::now() >= deadline {
+        return Err(RunError::TimedOut);
+    }
+    progressing_until(cmd, window, Some(deadline), progress)
+}
+
+fn progressing_until(
+    cmd: &mut Command,
+    window: Duration,
+    deadline: Option<Instant>,
+    progress: &mut dyn FnMut() -> u64,
+) -> Result<Output, RunError> {
     let tick = PROGRESS_TICK.min(window / 4).max(Duration::from_millis(1));
     let mut last: Option<(u64, Instant)> = None;
     output_by(
@@ -720,7 +810,8 @@ pub fn output_while_progressing(
                 }
             };
             let quiet = now.saturating_duration_since(since);
-            window.saturating_sub(quiet).min(tick)
+            let left = window.saturating_sub(quiet).min(tick);
+            deadline.map_or(left, |limit| left.min(limit.saturating_duration_since(now)))
         },
         &mut end,
     )
@@ -998,6 +1089,14 @@ fn end(child: &mut Child) {
 pub fn kill_within(child: &mut Child, hang: Duration) {
     let _ = child.kill();
     reap_within(child, None, saturating_after(Instant::now(), hang));
+}
+
+/// `child`'s exit status once it exits within `hang`, without ending it; `None` while it still
+/// runs at `hang`, or when it cannot be waited on.
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub(crate) fn exit_within(child: &mut Child, hang: Duration) -> Option<std::process::ExitStatus> {
+    reap_within(child, None, saturating_after(Instant::now(), hang));
+    child.try_wait().ok().flatten()
 }
 
 fn reap_within<C: Waited>(child: &mut C, exit: Option<&mut ExitWait>, by: Instant) {
@@ -1480,8 +1579,33 @@ mod tests {
         }
     }
 
-    /// [`super::output_within_from`] hands its child the stdin it is given, and ends a child
-    /// still reading it `within` from now. CONTROL: the same `cat` whose input ends reads it.
+    #[cfg(unix)]
+    #[test]
+    fn advancing_progress_does_not_renew_an_absolute_native_child_deadline() {
+        let mut command = crate::spawnfd::command("/bin/sleep");
+        command.arg("2");
+        let mut observations = 0;
+        let result = super::output_while_progressing_until(
+            &mut command,
+            HANG,
+            Instant::now() + Duration::from_millis(200),
+            &mut || {
+                observations += 1;
+                observations
+            },
+        );
+        assert!(matches!(result, Err(super::RunError::TimedOut)));
+        assert!(
+            observations > 0,
+            "the actual child was observed before its original bound"
+        );
+        let mut never = crate::spawnfd::command("/must-not-be-spawned");
+        assert!(matches!(
+            super::output_while_progressing_until(&mut never, HANG, Instant::now(), &mut || 0,),
+            Err(super::RunError::TimedOut)
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn output_within_from_feeds_its_stdin_and_ends_the_child_at_its_bound() {

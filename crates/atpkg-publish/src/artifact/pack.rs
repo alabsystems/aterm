@@ -20,6 +20,8 @@ use crate::identity::MachineKey;
 use crate::programs::{self, Harness, Shape};
 use crate::triple::{Os, Triple};
 
+mod diagnostics;
+
 /// The plain-program packer.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Pack;
@@ -45,6 +47,14 @@ impl Packer for Pack {
 
     fn can_pack_bottle(&self, program: &str, triple: Triple) -> std::result::Result<(), String> {
         super::bottle::upstream::can_build(program, triple).map_err(|error| error.to_string())
+    }
+
+    fn reuse_bottle(
+        &self,
+        ctx: &Ctx,
+        request: &super::bottle::reuse::Request,
+    ) -> Result<super::bottle::BottleOutcome> {
+        super::bottle::reuse::prepare(ctx, request)
     }
 }
 
@@ -81,7 +91,8 @@ pub fn cpu_floor(triple: Triple) -> Option<&'static str> {
     }
 }
 
-/// The `RUSTFLAGS` a pack's build sets — always set, so a repo's own target rustflags (its `target-cpu=native`) are replaced, never inherited.
+/// The CPU override retained for explicit cross builds. Native builds append
+/// their floor to Cargo's target configuration instead of replacing policy.
 #[must_use]
 pub fn rustflags(triple: Triple) -> String {
     cpu_floor(triple).map_or_else(String::new, |cpu| format!("-C target-cpu={cpu}"))
@@ -93,11 +104,19 @@ pub fn rustflags(triple: Triple) -> String {
 /// first ([`SCRUBBED_ENV`]).
 pub const HARNESS_VERSION_ENV: &str = "ALAB_HARNESS_VERSION";
 
-/// Inherited variables a pack's build removes: each outranks, wraps or reroutes the `RUSTC` / `RUSTFLAGS` the pack sets (`CARGO_ENCODED_RUSTFLAGS` beats `RUSTFLAGS`, a wrapper runs whatever it likes, `RUSTUP_TOOLCHAIN` reroutes a proxy), or is a version only the pack may give ([`HARNESS_VERSION_ENV`]).
+/// Inherited variables a pack removes so the compiler, repository policy, CPU
+/// floor and harness version come from the admitted build inputs.
 pub const SCRUBBED_ENV: &[&str] = &[
     HARNESS_VERSION_ENV,
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
     "CARGO_ENCODED_RUSTFLAGS",
+    "CARGO_ENCODED_RUSTDOCFLAGS",
     "CARGO_BUILD_RUSTFLAGS",
+    "CARGO_BUILD_RUSTDOCFLAGS",
+    "CARGO_BUILD_TARGET",
+    "TRUSTFLAGS",
+    "CARGO_ENCODED_TRUSTFLAGS",
     "CARGO_BUILD_RUSTC",
     "RUSTC_WRAPPER",
     "RUSTC_WORKSPACE_WRAPPER",
@@ -613,8 +632,204 @@ fn metadata(
     parse_metadata(&ran.stdout, program)
 }
 
-/// The build, with the lane flag, the target, the CPU floor and the seal's own compiler, and a
-/// harness's minted version as [`HARNESS_VERSION_ENV`] (`harness_version`).
+/// Remove ambient compiler-policy and routing replacements from both config
+/// discovery and compilation, so they observe the same repository inputs.
+fn build_env_remove(triple: Triple) -> Vec<String> {
+    let mut removed: Vec<_> = SCRUBBED_ENV
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    let target = triple.as_str().replace('-', "_").to_ascii_uppercase();
+    for prefix in ["TARGET", "HOST"] {
+        for suffix in ["RUSTFLAGS", "RUSTDOCFLAGS"] {
+            removed.push(format!("CARGO_{prefix}_{target}_{suffix}"));
+        }
+    }
+    removed.extend([
+        "CARGO_HOST_RUSTFLAGS".into(),
+        "CARGO_HOST_RUSTDOCFLAGS".into(),
+    ]);
+    removed
+}
+
+/// Keep the compiler defaults previously selected by an empty cross override
+/// explicit when repository flags are preserved on a native build.
+fn native_cpu_floor(triple: Triple) -> &'static str {
+    cpu_floor(triple).unwrap_or(match triple.arch() {
+        crate::triple::Arch::Aarch64 => "generic",
+        crate::triple::Arch::X86_64 => "x86-64",
+    })
+}
+
+fn nonempty_flags(value: &aterm_json::Value) -> Result<bool> {
+    if let Some(values) = value.as_array() {
+        if values.iter().all(|v| v.as_str().is_some()) {
+            return Ok(!values.is_empty());
+        }
+    } else if let Some(text) = value.as_str() {
+        return Ok(!text.trim().is_empty());
+    }
+    Err(Error::refused(
+        "Cargo rustflags must be strings or string arrays",
+    ))
+}
+
+/// Array overrides carry only the suffix: replaying the resolved array would
+/// duplicate Cargo's existing merged arguments. A scalar must instead replace
+/// its old scalar with the same text plus the floor.
+fn floor_config(key: &str, original: Option<&aterm_json::Value>, cpu: &str) -> Result<OsString> {
+    let value = match original.and_then(aterm_json::Value::as_str) {
+        Some(text) => aterm_json::to_string(&format!("{text} -C target-cpu={cpu}")),
+        None => {
+            if let Some(value) = original {
+                nonempty_flags(value)?;
+            }
+            aterm_json::to_string(&["-C", &format!("target-cpu={cpu}")])
+        }
+    }
+    .map_err(|_| Error::refused("could not encode the Cargo CPU floor"))?;
+    Ok(format!("{key}={value}").into())
+}
+
+fn native_floor_args(
+    tools: &dyn Tools,
+    tc: &toolchain::Toolchain,
+    request: &PackRequest,
+    meta: &Metadata,
+) -> Result<Vec<OsString>> {
+    let mut args: Vec<OsString> = [
+        "-Z",
+        "unstable-options",
+        "config",
+        "get",
+        "--format",
+        "json",
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
+    let mut declared = meta.build_args.iter();
+    while let Some(arg) = declared.next() {
+        if arg == "--" {
+            break;
+        }
+        if arg == "--target" {
+            if declared.next().map(String::as_str) != Some(request.triple.as_str()) {
+                return Err(Error::refused(
+                    "native pack metadata selects a different target",
+                ));
+            }
+        } else if let Some(target) = arg.strip_prefix("--target=") {
+            if target != request.triple.as_str() {
+                return Err(Error::refused(
+                    "native pack metadata selects a different target",
+                ));
+            }
+        } else if matches!(arg.as_str(), "--config" | "-Z" | "-C") {
+            let value = declared
+                .next()
+                .ok_or_else(|| Error::refused("missing Cargo configuration argument"))?;
+            args.extend([arg.into(), value.into()]);
+        } else if arg.starts_with("--config=") || arg.starts_with("-Z") || arg.starts_with("-C") {
+            args.push(arg.into());
+        }
+    }
+    let mut query = Run::new(tc.targo(), args);
+    query.cwd = Some(request.checkout.clone());
+    query.env_remove = build_env_remove(request.triple);
+    query.env.extend(
+        request
+            .env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.into())),
+    );
+    query.env.push(("RUSTC".into(), tc.trustc().into()));
+    let ran = tools
+        .run(&query)
+        .map_err(|e| Error::cannot_run(format!("read Cargo configuration: {e}")))?;
+    if !ran.success() {
+        return Err(Error::refused(format!(
+            "could not resolve native Cargo policy (exit {:?})",
+            ran.code
+        )));
+    }
+    // The complete configuration may contain unrelated credentials. Keep it
+    // only in memory; never include it in diagnostics, receipts or argv.
+    let config: aterm_json::Value = aterm_json::from_slice(&ran.stdout)
+        .map_err(|_| Error::refused("Cargo configuration did not return JSON"))?;
+    if config.as_object().is_none() {
+        return Err(Error::refused("Cargo configuration did not return a table"));
+    }
+    if let Some(target) = config.get("build").and_then(|v| v.get("target")) {
+        let matches = target.as_str().map_or_else(
+            || {
+                target.as_array().is_some_and(|targets| {
+                    !targets.is_empty()
+                        && targets
+                            .iter()
+                            .all(|t| t.as_str() == Some(request.triple.as_str()))
+                })
+            },
+            |target| target == request.triple.as_str(),
+        );
+        if !matches {
+            return Err(Error::refused(
+                "native pack build.target selects a different target",
+            ));
+        }
+    }
+    let cpu = native_cpu_floor(request.triple);
+    let mut overrides = Vec::new();
+    if let Some(targets) = config.get("target").and_then(aterm_json::Value::as_object) {
+        for (target, table) in targets {
+            if let Some(flags) = table.get("rustflags") {
+                // Turning an empty target segment into a nonempty one would
+                // hide build.rustflags, which Cargo uses only as a fallback.
+                if nonempty_flags(flags)? {
+                    let quoted = aterm_json::to_string(target)
+                        .map_err(|_| Error::refused("could not encode Cargo target"))?;
+                    overrides.push(floor_config(
+                        &format!("target.{quoted}.rustflags"),
+                        Some(flags),
+                        cpu,
+                    )?);
+                }
+            }
+        }
+    }
+    overrides.push(floor_config(
+        "build.rustflags",
+        config.get("build").and_then(|v| v.get("rustflags")),
+        cpu,
+    )?);
+    let host = config.get("host");
+    // Cargo selects an existing specific host table as a whole, even when it
+    // only declares a linker. Do not invent one and shadow default host policy.
+    let (key, flags) = match host.and_then(|h| h.get(request.triple.as_str())) {
+        Some(specific) => {
+            let quoted = aterm_json::to_string(request.triple.as_str())
+                .map_err(|_| Error::refused("could not encode Cargo host"))?;
+            (
+                format!("host.{quoted}.rustflags"),
+                specific.get("rustflags"),
+            )
+        }
+        None => (
+            "host.rustflags".into(),
+            host.and_then(|h| h.get("rustflags")),
+        ),
+    };
+    overrides.push(floor_config(&key, flags, cpu)?);
+    Ok(overrides
+        .into_iter()
+        .flat_map(|value| ["--config".into(), value])
+        .collect())
+}
+
+/// Build with the admitted compiler and distribution floor. Native builds keep
+/// repository flags: append floor suffixes to Cargo's resolved target, fallback
+/// and selected host policy. An explicit native target or RUSTFLAGS replaces it.
+/// Cross builds retain their explicit target and existing flag policy.
 fn build(
     tools: &dyn Tools,
     tc: &toolchain::Toolchain,
@@ -622,19 +837,21 @@ fn build(
     meta: &Metadata,
     stage_dir: &Path,
     harness_version: Option<&str>,
+    compiler_host: &str,
 ) -> Result<Vec<PathBuf>> {
-    let mut args: Vec<OsString> = vec![
-        "--unverified".into(),
-        "build".into(),
-        "--release".into(),
-        "--target".into(),
-        request.triple.as_str().into(),
-    ];
+    let native = compiler_host == request.triple.as_str();
+    let mut args: Vec<OsString> = vec!["--unverified".into(), "build".into(), "--release".into()];
+    if !native {
+        args.extend(["--target".into(), request.triple.as_str().into()]);
+    }
     args.extend(meta.build_args.iter().map(OsString::from));
+    if native {
+        args.extend(native_floor_args(tools, tc, request, meta)?);
+    }
     args.push("--message-format=json".into());
     let mut run = Run::new(tc.targo(), args);
     run.cwd = Some(request.checkout.clone());
-    run.env_remove = SCRUBBED_ENV.iter().map(|k| (*k).to_string()).collect();
+    run.env_remove = build_env_remove(request.triple);
     run.env.extend(
         request
             .env
@@ -642,14 +859,21 @@ fn build(
             .map(|(k, v)| (k.clone(), OsString::from(v))),
     );
     run.env.push(("RUSTC".into(), tc.trustc().into()));
-    run.env
-        .push(("RUSTFLAGS".into(), rustflags(request.triple).into()));
+    if !native {
+        run.env
+            .push(("RUSTFLAGS".into(), rustflags(request.triple).into()));
+    }
     if let Some(v) = harness_version {
         run.env.push((HARNESS_VERSION_ENV.into(), v.into()));
     }
     let ran = tools
         .run(&run)
         .map_err(|e| Error::cannot_run(format!("the build: {e}")))?;
+    if !ran.success() {
+        return Err(Error::refused(
+            diagnostics::Failure::capture(&run, &ran).refusal(stage_dir),
+        ));
+    }
     let log = stage_dir.join("build.stderr");
     let _ = std::fs::remove_file(&log);
     {
@@ -662,13 +886,6 @@ fn build(
             opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
         let _ = opts.open(&log).and_then(|mut f| f.write_all(&ran.stderr));
-    }
-    if !ran.success() {
-        return Err(Error::refused(format!(
-            "the build FAILED (see {}):\n{}",
-            log.display(),
-            tail(&ran.stderr, 5)
-        )));
     }
     let exes = built_executables(&ran.stdout, meta);
     if exes.is_empty() {
@@ -940,7 +1157,15 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
     };
     pkgdoc::check_exposes(program, &meta.expose)?;
     let harness_version = harness_id.as_ref().map(|id| id.version.as_str());
-    let exes = build(tools, &tc, request, &meta, &stage_dir, harness_version)?;
+    let exes = build(
+        tools,
+        &tc,
+        request,
+        &meta,
+        &stage_dir,
+        harness_version,
+        &compiler.content.version.host,
+    )?;
     if let Some(identity) = &harness_id {
         identity.recheck(&request.checkout)?;
     }

@@ -1451,6 +1451,10 @@ pub(crate) struct FrameText {
     /// as the face's table seats it ([`aterm_render::GlyphInk::raster`]): a narrow glyph with no
     /// combining mark, no slant, no decoration line, no emoji presentation and no script shift.
     pub(super) plain: Vec<bool>,
+    /// Row-major, alongside [`Self::pairs`]: whether the cell lays ink its glyph's raster does
+    /// not that may reach under the baseline: an underline of any style (a blank cell's too), a
+    /// combining mark (one may stand under its letter) or a subscript's low seat.
+    pub(super) deep: Vec<bool>,
     pub(super) cols: usize,
     /// The window column of `pairs`' first column (a split pane's offset).
     pub(super) col0: i32,
@@ -1477,6 +1481,7 @@ impl FrameText {
         short: Vec::new(),
         glyph: Vec::new(),
         plain: Vec::new(),
+        deep: Vec::new(),
         cols: 0,
         col0: 0,
         pane: None,
@@ -1533,6 +1538,19 @@ impl FrameText {
         let idx = i as usize * self.cols + col as usize;
         let plain = self.plain.as_slice();
         idx < plain.len() && plain[idx]
+    }
+
+    /// Whether cell `(row, col)` lays ink its glyph's raster does not that may reach under the
+    /// baseline ([`Self::deep`]); `false` for a cell the frame did not read.
+    #[inline]
+    pub(crate) const fn deep(&self, row: i32, col: i32) -> bool {
+        let (i, col) = (row - self.lo, col - self.col0);
+        if i < 0 || i as usize >= self.rows.len() || col < 0 || col as usize >= self.cols {
+            return false;
+        }
+        let idx = i as usize * self.cols + col as usize;
+        let deep = self.deep.as_slice();
+        idx < deep.len() && deep[idx]
     }
 
     /// Whether cell `(row, col)`'s glyph keeps under the x-height

@@ -9,23 +9,42 @@ const MAGIC: &[u8; 8] = b"TRPCV003";
 pub(crate) fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid private resource controller frame")
 }
-pub(crate) struct Encoder(pub(crate) Vec<u8>);
+pub(crate) struct Encoder(pub(crate) Vec<u8>, usize);
 impl Encoder {
     pub(crate) fn new(kind: u64) -> Self {
-        let mut e = Self(MAGIC.to_vec());
+        let mut e = Self(MAGIC.to_vec(), MAX_PAYLOAD);
         e.number(kind);
         e
+    }
+    pub(crate) fn metadata_report() -> Self {
+        let mut e = Self::new(16);
+        e.1 = crate::METADATA_REPORT_MAX_BYTES;
+        e
+    }
+    pub(crate) fn resolver_report() -> Self {
+        let mut e = Self::new(34);
+        e.1 = crate::resolver::RESOLVER_REPORT_MAX_BYTES;
+        e
+    }
+    pub(crate) fn resolver_metadata(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.bounded_bytes(bytes, crate::resolver::RESOLVER_MAX_METADATA)
     }
     pub(crate) fn number(&mut self, n: u64) {
         self.0.extend_from_slice(&n.to_be_bytes());
     }
     pub(crate) fn bytes(&mut self, b: &[u8]) -> io::Result<()> {
-        if b.len() > MAX_FIELD {
+        self.bounded_bytes(b, MAX_FIELD)
+    }
+    pub(crate) fn frame_bytes(&mut self, b: &[u8]) -> io::Result<()> {
+        self.bounded_bytes(b, MAX_PAYLOAD)
+    }
+    fn bounded_bytes(&mut self, b: &[u8], bound: usize) -> io::Result<()> {
+        if b.len() > bound {
             return Err(invalid());
         }
         self.number(b.len() as u64);
         self.0.extend_from_slice(b);
-        if self.0.len() > MAX_PAYLOAD {
+        if self.0.len() > self.1 {
             return Err(invalid());
         }
         Ok(())
@@ -35,7 +54,7 @@ impl Encoder {
         self.number(d.target.into());
     }
     pub(crate) fn finish(self) -> io::Result<Vec<u8>> {
-        if self.0.len() > MAX_PAYLOAD { Err(invalid()) } else { Ok(self.0) }
+        if self.0.len() > self.1 { Err(invalid()) } else { Ok(self.0) }
     }
 }
 pub(crate) struct Decoder<'a>(&'a [u8]);
@@ -62,6 +81,17 @@ impl<'a> Decoder<'a> {
         let n = self.count(MAX_FIELD)?;
         Ok(self.take(n)?.to_vec())
     }
+    pub(crate) fn frame_bytes(&mut self) -> io::Result<Vec<u8>> {
+        let n = self.count(MAX_PAYLOAD)?;
+        Ok(self.take(n)?.to_vec())
+    }
+    pub(crate) fn resolver_metadata(&mut self) -> io::Result<Vec<u8>> {
+        let n = self.count(crate::resolver::RESOLVER_MAX_METADATA)?;
+        Ok(self.take(n)?.to_vec())
+    }
+    pub(crate) fn remaining(&self) -> &'a [u8] {
+        self.0
+    }
     pub(crate) fn text(&mut self) -> io::Result<String> {
         String::from_utf8(self.bytes()?).map_err(|_| invalid())
     }
@@ -76,7 +106,13 @@ impl<'a> Decoder<'a> {
     }
 }
 pub(crate) fn header(bytes: &[u8], kind: u64) -> io::Result<Decoder<'_>> {
-    if bytes.len() > MAX_PAYLOAD {
+    bounded_header(bytes, kind, MAX_PAYLOAD)
+}
+pub(crate) fn metadata_report_header(bytes: &[u8]) -> io::Result<Decoder<'_>> {
+    bounded_header(bytes, 16, crate::METADATA_REPORT_MAX_BYTES)
+}
+fn bounded_header(bytes: &[u8], kind: u64, bound: usize) -> io::Result<Decoder<'_>> {
+    if bytes.len() > bound {
         return Err(invalid());
     }
     let mut d = Decoder(bytes);
@@ -97,7 +133,16 @@ impl Request {
         e.number(match self.role {
             Role::MetadataVersion => 0,
             Role::Compile => 1,
+            Role::MetadataProbe => 2,
+            Role::SealedMetadata => METADATA_REQUEST_ROLE,
+            Role::MachOLinker(_) => MACHO_LINKER_REQUEST_ROLE,
+            Role::ResolverQuery => crate::resolver::RESOLVER_REQUEST_ROLE,
         });
+        if let Role::MachOLinker(loan) = self.role {
+            e.0.extend(loan.parent_attempt);
+            e.0.extend(loan.nonce);
+            e.number(u64::from(loan.cpu_slot));
+        }
         e.number(self.timeout_ns.unwrap_or(0));
         e.bytes(&self.command.program)?;
         e.number(u64::from(self.command.arg0.is_some()));
@@ -149,6 +194,14 @@ impl Request {
         let role = match d.number()? {
             0 => Role::MetadataVersion,
             1 => Role::Compile,
+            2 => Role::MetadataProbe,
+            METADATA_REQUEST_ROLE => Role::SealedMetadata,
+            MACHO_LINKER_REQUEST_ROLE => Role::MachOLinker(Loan {
+                parent_attempt: d.array()?,
+                nonce: d.array()?,
+                cpu_slot: u32::try_from(d.number()?).map_err(|_| invalid())?,
+            }),
+            crate::resolver::RESOLVER_REQUEST_ROLE => Role::ResolverQuery,
             _ => return Err(invalid()),
         };
         let timeout = d.number()?;
@@ -441,4 +494,16 @@ impl ProducerChallenge {
         value.encode_kind(kind)?;
         Ok(value)
     }
+}
+
+/// A separately bounded root report; never a socket/native command frame.
+pub(crate) fn resolver_report_header(bytes: &[u8]) -> io::Result<Decoder<'_>> {
+    if bytes.len() > crate::resolver::RESOLVER_REPORT_MAX_BYTES
+        || bytes.len() < 16
+        || &bytes[..8] != MAGIC
+        || u64::from_be_bytes(bytes[8..16].try_into().map_err(|_| invalid())?) != 34
+    {
+        return Err(invalid());
+    }
+    Ok(Decoder(&bytes[16..]))
 }

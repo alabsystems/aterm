@@ -363,21 +363,31 @@ fn resolve_logs(
     read_latest_run(latest_run)
 }
 
-/// Preflight verifiers write into their enclosing release step, not the final
-/// qualification log. Later publishing steps retain that final qualification.
+/// Step 1's preflight verifiers write into its own log, and step 4's `verify release` into its
+/// tree branch's; every later step keeps the bundle half's, the final qualification.
 fn check_log(logs: &Path, step: Option<&str>) -> std::path::PathBuf {
-    use crate::release::Step;
-    let phase = Step::ALL
-        .into_iter()
-        .find(|phase| Some(phase.name()) == step)
-        .filter(|phase| {
-            matches!(
-                phase,
-                Step::Checks | Step::Stage | Step::Build | Step::Verify
-            )
-        })
-        .unwrap_or(Step::Verify);
-    logs.join(format!("{:02}-{}.log", phase.number(), phase.name()))
+    use crate::release::{Branch, Step};
+    let named = |phase: Step| Some(phase.name()) == step;
+    if named(Step::Checks) {
+        logs.join(format!(
+            "{:02}-{}.log",
+            Step::Checks.number(),
+            Step::Checks.name()
+        ))
+    } else if named(Step::Qualify) {
+        logs.join(format!(
+            "{:02}-{}-{}.log",
+            Step::Qualify.number(),
+            Step::Qualify.name(),
+            Branch::Tree.name()
+        ))
+    } else {
+        logs.join(format!(
+            "{:02}-{}.log",
+            Step::Bundle.number(),
+            Step::Bundle.name()
+        ))
+    }
 }
 
 /// Read the journal and its logs without claiming, resuming or building a release.
@@ -725,25 +735,22 @@ mod tests {
     #[test]
     fn preflight_progress_and_failures_are_read_from_the_enclosing_step() {
         let dir = aterm_tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("06-verify.log"), b"").unwrap();
+        std::fs::write(dir.path().join("05-bundle.log"), b"").unwrap();
         let start = aterm_json::json!({"schema":1,"event":"stage-started",
             "stage_index":1,"stage":"checker compile"});
         let failure = aterm_json::json!({"schema":1,"event":"test-case-failed",
             "outcome":"FAIL","test":"source closure"});
-        for phase in [
-            crate::release::Step::Checks,
-            crate::release::Step::Stage,
-            crate::release::Step::Build,
+        for (phase, log) in [
+            (crate::release::Step::Checks, "01-checks.log"),
+            (crate::release::Step::Qualify, "04-qualify-tree.log"),
         ] {
-            let path = dir
-                .path()
-                .join(format!("{:02}-{}.log", phase.number(), phase.name()));
             std::fs::write(
-                path,
+                dir.path().join(log),
                 format!("verify-event: {start}\nverify-event: {failure}\n"),
             )
             .unwrap();
             let selected = check_log(dir.path(), Some(phase.name()));
+            assert_eq!(selected, dir.path().join(log));
             let events = read_events(std::fs::File::open(selected).unwrap()).unwrap();
             assert_eq!(events.first_failure, Some(failure.clone()));
             assert_eq!(
@@ -753,10 +760,16 @@ mod tests {
                 ])
             );
         }
-        for phase in [None, Some("publish"), Some("check"), Some("../outside")] {
+        for phase in [
+            None,
+            Some("bundle"),
+            Some("publish"),
+            Some("check"),
+            Some("../outside"),
+        ] {
             assert_eq!(
                 check_log(dir.path(), phase),
-                dir.path().join("06-verify.log")
+                dir.path().join("05-bundle.log")
             );
         }
     }
@@ -764,7 +777,7 @@ mod tests {
     #[test]
     fn compiler_telemetry_keeps_the_current_release_stage_and_journal_binding() {
         let stage = aterm_json::json!({"schema":1,"event":"release-stage",
-            "source":"current-source","version":"0.150.0","stage":"build","outcome":"started"});
+            "source":"current-source","version":"0.150.0","stage":"qualify","outcome":"started"});
         let child = aterm_json::json!({"schema":1,"event":"build-child-finished",
             "package":"aterm","outcome":"ok","execution_s":3});
         let log = format!("release-event: {stage}\nrelease-event: {child}\n");
@@ -787,7 +800,7 @@ mod tests {
                     .as_ref()
                     .and_then(|event| event["stage"].as_str())
             )
-            .ends_with("05-build.log")
+            .ends_with("04-qualify-tree.log")
         );
     }
 

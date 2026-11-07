@@ -286,7 +286,7 @@ fn a_rollback_by_hand_from_an_alab_build_lands_on_alab_builds_only() {
     crate::shim_env::write_sidecar(&from_vendor.build_dir("codex", B), &alab_env).unwrap();
     crate::alab::choose_vendor(&from_vendor, "codex").unwrap();
     let f = Fake::default();
-    f.publish_codex_default("0.165.0");
+    f.publish_codex_default_for(ALAB_TARGET, "0.165.0");
     let (policy, trust) = (Policy::default(), world::trust());
     let o = install_one(
         &alab_lane(&from_vendor, &f, &policy, &trust, true),

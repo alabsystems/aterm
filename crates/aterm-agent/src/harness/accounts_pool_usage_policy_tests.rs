@@ -704,6 +704,199 @@ fn a_read_showing_room_lifts_a_lone_rows_wall_and_its_launch_runs() {
     );
 }
 
+/// `main` with a wall on record, listed beside a row for another Mac, whose login is not made here.
+fn main_walled_beside_a_row_with_no_login_here(world: &World, window: &str) {
+    lone_main_walled(world, window);
+    let there = world.root.join("logins").join("codex").join("there");
+    std::fs::create_dir_all(&there).expect("login dir");
+    let text = format!(
+        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n[[account]]\n\
+         label = \"there\"\nclass = \"dedicated\"\ndir = {}\n",
+        toml(&there)
+    );
+    std::fs::write(world.cfg.join("accounts-codex.toml"), text).unwrap();
+}
+
+/// A ROSTER THAT LISTS A ROW FOR ANOTHER MAC IS A LONE ROW HERE: no pick can leave a wall on the one
+/// row enrolled here, so a launch reads through it as it does on a roster of one, and a read showing
+/// room starts the worker (m22 lists `main` and `codex-m22`, whose login is not made there).
+/// NEGATIVE CONTROL: the read looked for a roster of one row, so a wall lifted early refused this
+/// launch until the wall's end. CONTROL: a read that shows no room leaves the wall. CONTROL: with a
+/// second row enrolled the launch reads that row and never the walled one.
+#[test]
+fn a_read_showing_room_lifts_the_wall_on_the_one_row_enrolled_here() {
+    let room = |_: &Path| plain_usage();
+    let spent = |_: &Path| spent_usage();
+    let run = |world: &World, answer: &(dyn Fn(&Path) -> Reading + Sync)| {
+        let reads = Reads {
+            user_home: &world.home,
+            homes: std::sync::Mutex::default(),
+            answer,
+        };
+        let launched = super::super::launch_env(&world.seat(), Cli::Codex, &reads);
+        let read = reads.homes.lock().unwrap().clone();
+        (launched, read)
+    };
+    let walled = |world: &World| {
+        world
+            .load(Cli::Codex)
+            .account("main")
+            .limited_until(NOW)
+            .is_some()
+    };
+    let main_home = |world: &World| world.home.join(Cli::Codex.accounts().default_home);
+
+    let world = World::new("launch-sole-lift");
+    main_walled_beside_a_row_with_no_login_here(&world, accounts::SESSION_LIMIT);
+    let (launched, read) = run(&world, &room);
+    assert!(launched.is_ok(), "{launched:?}");
+    assert_eq!(read, [main_home(&world)], "one read, of that row");
+    assert!(!walled(&world), "the read lifted it");
+
+    let world = World::new("launch-sole-stays");
+    main_walled_beside_a_row_with_no_login_here(&world, accounts::SESSION_LIMIT);
+    let (launched, read) = run(&world, &spent);
+    let refused = launched.expect_err("the wall stands");
+    assert!(refused.contains("no usable account"), "{refused}");
+    assert_eq!(read, [main_home(&world)]);
+    assert!(walled(&world));
+
+    let world = World::new("launch-sole-two");
+    let work = world.two(Cli::Codex);
+    world
+        .seat()
+        .store(Cli::Codex)
+        .transact(NOW - 600, &mut None, |state| {
+            Ok(accounts::note_wall(
+                state,
+                "main",
+                accounts::SESSION_LIMIT,
+                Some(NOW + HOUR),
+                NOW - 600,
+                NOW - 600,
+            ))
+        })
+        .unwrap();
+    let (launched, read) = run(&world, &room);
+    assert!(launched.is_ok(), "{launched:?}");
+    assert_eq!(read, [work], "the row it starts on, and not the walled one");
+    assert!(walled(&world));
+}
+
+/// A ROW A LAUNCH COULD NOT START ON IS NOT READ, under the owner's no-polling rule, wall or no: on
+/// a preparation or another Mac's lease nothing reads a wall through. NEGATIVE CONTROL: the read
+/// looked only at which row was enrolled, so a launch that could only be refused spent a provider
+/// read, and could renew that login. CONTROL: the same roster with neither reads it.
+#[test]
+fn a_launch_reads_no_wall_on_a_row_it_could_not_start_on() {
+    let room = |_: &Path| plain_usage();
+    let run = |tag: &str, seed: &dyn Fn(&mut accounts::State)| {
+        let world = World::new(tag);
+        main_walled_beside_a_row_with_no_login_here(&world, accounts::SESSION_LIMIT);
+        world
+            .seat()
+            .store(Cli::Codex)
+            .transact(NOW - 600, &mut None, |state| {
+                seed(state);
+                Ok(Vec::new())
+            })
+            .unwrap();
+        let reads = Reads {
+            user_home: &world.home,
+            homes: std::sync::Mutex::default(),
+            answer: &room,
+        };
+        let launched = super::super::launch_env(&world.seat(), Cli::Codex, &reads);
+        let lifted = lift_lone_wall(&world.seat(), Cli::Codex, &reads, None);
+        let read = reads.homes.lock().unwrap().len();
+        (launched.is_ok(), lifted, read)
+    };
+    assert_eq!(
+        run("launch-sole-prepared", &|state| {
+            state.prepared_accounts.insert("main".into());
+        }),
+        (false, false, 0),
+        "only a preparation holds that row"
+    );
+    assert_eq!(
+        run("launch-sole-leased", &|state| {
+            state.leases.insert(
+                "main".to_owned(),
+                accounts::AccountLease {
+                    holder: "m9".to_owned(),
+                    until: NOW + HOUR,
+                    at: NOW - HOUR,
+                },
+            );
+        }),
+        (false, false, 0),
+        "another Mac holds it"
+    );
+    assert_eq!(
+        run("launch-sole-free", &|_| {}),
+        (true, false, 1),
+        "CONTROL: the launch's read lifted it, so the command had nothing left to lift"
+    );
+}
+
+/// ONE LAUNCH READS A ROW ONCE, even where the answer leaves it due: a refusal with no figure for a
+/// window writes no sample. NEGATIVE CONTROL: read_launch_rows and read_lone_wall each read it, and
+/// one launch asked the provider twice. CONTROL: the launcher's next launch may read it again.
+#[test]
+fn one_launch_reads_a_row_once_where_the_answer_leaves_it_due() {
+    let refuses = |_: &Path| {
+        Reading::Usage(Usage {
+            sample: Sample {
+                at: NOW,
+                ..Sample::default()
+            },
+            walls: vec![(accounts::SESSION_LIMIT, Some(NOW + HOUR))],
+        })
+    };
+    let beside_another: fn(&World) = |world| {
+        main_walled_beside_a_row_with_no_login_here(world, accounts::SESSION_LIMIT);
+        world
+            .seat()
+            .store(Cli::Codex)
+            .transact(NOW - 600, &mut None, |state| {
+                let main = state.accounts.get_mut("main").expect("its row");
+                main.walls.clear();
+                Ok(Vec::new())
+            })
+            .unwrap();
+    };
+    for (tag, roster) in [
+        ("launch-once-lone", lone_main as fn(&World)),
+        ("launch-once-sole", beside_another),
+    ] {
+        let world = World::new(tag);
+        roster(&world);
+        let reads = Reads {
+            user_home: &world.home,
+            homes: std::sync::Mutex::default(),
+            answer: &refuses,
+        };
+        let mut pick = super::super::LaunchPick::for_worker_launch();
+        for _ in 0..4 {
+            let launched = pick.pick(&world.seat(), Cli::Codex, &reads, None);
+            assert!(launched.is_err(), "{tag}: {launched:?}");
+        }
+        assert_eq!(reads.homes.lock().unwrap().len(), 1, "{tag}");
+        let launched = super::super::LaunchPick::for_worker_launch().pick(
+            &world.seat(),
+            Cli::Codex,
+            &reads,
+            None,
+        );
+        assert!(launched.is_err(), "{tag}: {launched:?}");
+        assert_eq!(
+            reads.homes.lock().unwrap().len(),
+            2,
+            "a distinct invocation has its own allowance: {tag}"
+        );
+    }
+}
+
 /// A LONE WALL'S READ IS ONE OF A LAUNCH'S OWN (the no-polling rule's token): it needs that launch's
 /// allowance, and the journal books it to the row with the reason a launch gives. NEGATIVE CONTROL:
 /// with the allowance spent nothing reaches the provider and the wall on record stands.
@@ -724,7 +917,7 @@ fn a_lone_walls_read_takes_a_launchs_allowance_and_is_booked_as_its_read() {
     let enrolled = accounts::enrolled_in(Cli::Codex, &snapshot.roster, seat.home);
     let mut spent = Launch::launch_use(super::super::LaunchUse(()));
     for _ in 0..super::super::LAUNCH_READS {
-        let account = Account::in_home(Read::CodexEndpoint, &world.home, Some("main"));
+        let account = Account::in_home(Read::CodexEndpoint, &world.home, Some("another"));
         let _spent = Use::launch_read_use(&mut spent, account).unwrap();
     }
     let (spent_read, events) = provider_read::captured(|| {
@@ -733,6 +926,7 @@ fn a_lone_walls_read_takes_a_launchs_allowance_and_is_booked_as_its_read() {
             Cli::Codex,
             &mut snapshot,
             &enrolled,
+            None,
             &reads,
             &mut spent,
         )
@@ -796,13 +990,21 @@ fn a_persons_command_lifts_a_lone_wall_as_a_launch_would_and_reads_nothing_else(
     lone_main_walled(&world, accounts::SESSION_LIMIT);
     assert_eq!(run(&world, &spent), (false, 1), "the wall stands");
 
+    let world = World::new("lift-sole");
+    main_walled_beside_a_row_with_no_login_here(&world, accounts::SESSION_LIMIT);
+    assert_eq!(
+        run(&world, &room),
+        (true, 1),
+        "a row for another Mac leaves it the row the command starts on"
+    );
+
     let world = World::new("lift-no-wall");
     lone_main(&world);
     assert_eq!(run(&world, &room), (false, 0), "nothing refuses it");
 
     let world = World::new("lift-off");
     lone_main_walled(&world, accounts::SESSION_LIMIT);
-    std::fs::write(world.cfg.join("aterm.toml"), "[harness]\naccounts='off'\n").unwrap();
+    crate::test_config::write(world.cfg.join("aterm.toml"), "[harness]\naccounts='off'\n").unwrap();
     assert_eq!(run(&world, &room), (false, 0), "rotation off reads nothing");
 
     let world = World::new("lift-two");
@@ -922,7 +1124,7 @@ fn a_wall_on_a_lone_row_holds_its_launch_until_the_wall_ends() {
 
     let off = World::new("launch-lone-off");
     lone_main(&off);
-    std::fs::write(off.cfg.join("aterm.toml"), "[harness]\naccounts='off'\n").unwrap();
+    crate::test_config::write(off.cfg.join("aterm.toml"), "[harness]\naccounts='off'\n").unwrap();
     let reads = Reads {
         user_home: &off.home,
         homes: std::sync::Mutex::default(),

@@ -32,7 +32,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use aterm_verify::checks::{Check, RELEASE};
+use aterm_verify::checks::{Check, RELEASE, RELEASE_BUNDLE, RELEASE_TREE};
 
 use crate::ledger::GitRunner;
 use crate::release::{Answer, Refusal};
@@ -289,24 +289,56 @@ impl Failed {
     }
 }
 
-/// What a resumed `verify release` runs: the checks the records lack, in [`RELEASE`] order, and
-/// the test binaries that passed in this tree (each spec with its executable's SHA-256).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// The half of `verify release` one run judges: R's tree ([`RELEASE_TREE`], step 4's tree branch,
+/// beside the build) or the bundle built from it ([`RELEASE_BUNDLE`], step 5, once the build
+/// passed and the tree branch ended).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Half {
+    Tree,
+    Bundle,
+}
+
+impl Half {
+    /// Its checks, in [`RELEASE`] order.
+    #[must_use]
+    pub const fn checks(self) -> &'static [Check] {
+        match self {
+            Self::Tree => &RELEASE_TREE,
+            Self::Bundle => &RELEASE_BUNDLE,
+        }
+    }
+
+    /// The flag that narrows `verify release` to it.
+    #[must_use]
+    pub const fn flag(self) -> &'static str {
+        match self {
+            Self::Tree => "--tree",
+            Self::Bundle => "--bundle",
+        }
+    }
+}
+
+/// What one `verify release` of a [`Half`] runs: its checks the records lack, in [`RELEASE`]
+/// order, and the test binaries that passed in this tree (each spec with its executable's
+/// SHA-256).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyRun {
+    pub half: Half,
     pub checks: Vec<String>,
     pub passed_binaries: Vec<(String, String)>,
 }
 
 impl VerifyRun {
-    /// Whether this is fewer than every check a release requires: its run then names them
+    /// Whether this is fewer than every check of its half: its run then names them
     /// (`--checks a,b`).
     #[must_use]
     pub fn strict_subset(&self) -> bool {
-        self.checks.len() != RELEASE.len()
+        let half = self.half.checks();
+        self.checks.len() != half.len()
             || self
                 .checks
                 .iter()
-                .zip(RELEASE.iter())
+                .zip(half.iter())
                 .any(|(a, b)| a != b.name())
     }
 
@@ -513,13 +545,20 @@ impl Checks {
         &self.answer.words
     }
 
-    /// What a resume runs: the missing checks, with the test binaries that passed when test is
-    /// among them.
+    /// What a run of `half` runs: its missing checks, with the test binaries that passed when
+    /// test is among them. Empty when every check of `half` has a passing record.
     #[must_use]
-    pub fn run(&self) -> VerifyRun {
-        let test = self.missing.iter().any(|m| m == "test");
+    pub fn run(&self, half: Half) -> VerifyRun {
+        let checks: Vec<String> = self
+            .missing
+            .iter()
+            .filter(|m| half.checks().iter().any(|c| c.name() == m.as_str()))
+            .cloned()
+            .collect();
+        let test = checks.iter().any(|m| m == "test");
         VerifyRun {
-            checks: self.missing.clone(),
+            half,
+            checks,
             passed_binaries: if test {
                 self.resume.clone()
             } else {
@@ -915,8 +954,8 @@ pub struct RunFacts<'a> {
     pub commit: &'a str,
     pub tree: &'a str,
     pub seal: &'a str,
-    /// U: the executable the run judges.
-    pub executable: &'a str,
+    /// U: the executable a bundle half judges; a tree half judges none.
+    pub executable: Option<&'a str>,
     /// Its log, which every record names.
     pub log: &'a Path,
     /// The release run (its logs directory's name).
@@ -1049,7 +1088,12 @@ pub fn write_run(
             {
                 continue;
             };
-            let u = bundle(check).then_some(facts.executable);
+            // A bundle check's record names the executable it judged; with none, it judged none.
+            let u = match (bundle(check), facts.executable) {
+                (false, _) => None,
+                (true, Some(u)) => Some(u),
+                (true, None) => continue,
+            };
             let mut r = record(facts, ended, name, outcome, u);
             r.seconds = event["seconds"].as_f64().unwrap_or(0.0);
             event["detail"]
@@ -1195,7 +1239,7 @@ pub fn record_run(
         commit,
         tree: &tree,
         seal,
-        executable,
+        executable: Some(executable),
         log: &log,
         run: "test-run",
         asked: &asked,
@@ -1268,7 +1312,7 @@ mod tests {
                 commit: COMMIT,
                 tree: TREE,
                 seal,
-                executable,
+                executable: Some(executable),
                 log: &self.log,
                 run: RUN,
                 asked: &self.asked,
@@ -1366,6 +1410,36 @@ mod tests {
         );
     }
 
+    /// A tree half judges no executable, so it keeps no record of a bundle check its events
+    /// name: measure's record always names the bytes it judged, and the tree's records stand
+    /// without one. Negative control: the same events with the executable keep measure under it.
+    #[test]
+    fn a_tree_half_keeps_no_bundle_record() {
+        let f = Fixture::new();
+        let facts = RunFacts {
+            executable: None,
+            ..f.facts("s1", "")
+        };
+        begin_run(&f.root, &facts).unwrap();
+        let lines = write_run(
+            &f.root,
+            &facts,
+            RunEnd {
+                exit: 0,
+                log_sha256: &u(9),
+                events: Ok(&all_ok()),
+            },
+        )
+        .unwrap();
+        assert!(lines.iter().all(|l| !l.starts_with("measure")), "{lines:?}");
+        assert_eq!(f.judge("s1", Some(&u(1))).missing, ["measure"]);
+        f.write("s1", &u(1), 0, &all_ok());
+        assert!(
+            f.judge("s1", Some(&u(1))).complete(),
+            "the control keeps it"
+        );
+    }
+
     /// A FAIL record refuses the tree under its seal, and a measure FAIL of another build of the
     /// tree refuses it too; NOT RUN and skip are missing, and a resume runs only those, carrying
     /// the test binaries that passed with a known digest. Negative controls: dropping the bundle
@@ -1433,24 +1507,36 @@ mod tests {
             .filter(|c| !["fmt", "lint", "census"].contains(&c.as_str()))
             .collect();
         assert_eq!(judged.missing, want);
-        let resume = judged.run();
-        assert_eq!(resume.checks, judged.missing);
+        let resume = judged.run(Half::Tree);
+        let tree_missing: Vec<String> = judged
+            .missing
+            .iter()
+            .filter(|m| RELEASE_TREE.iter().any(|c| c.name() == m.as_str()))
+            .cloned()
+            .collect();
+        assert_eq!(resume.checks, tree_missing);
         assert_eq!(
             resume.passed_binaries,
             [("-p a --lib".to_owned(), u(1))],
             "a binary whose digest is not known runs again"
         );
-        assert!(resume.strict_subset() && resume.reads_the_bundle());
+        assert!(resume.strict_subset() && !resume.reads_the_bundle());
+        let bundle = judged.run(Half::Bundle);
+        assert_eq!(bundle.checks, ["appkit", "measure"]);
+        assert!(!bundle.strict_subset() && bundle.reads_the_bundle());
+        assert!(bundle.passed_binaries.is_empty(), "test is the tree's");
         let all = VerifyRun {
-            checks: release_names(),
+            half: Half::Tree,
+            checks: RELEASE_TREE.iter().map(|c| c.name().to_owned()).collect(),
             passed_binaries: Vec::new(),
         };
         assert!(!all.strict_subset());
         let tree_only = VerifyRun {
+            half: Half::Tree,
             checks: vec!["lint".into(), "test".into()],
             passed_binaries: Vec::new(),
         };
-        assert!(!tree_only.reads_the_bundle());
+        assert!(tree_only.strict_subset() && !tree_only.reads_the_bundle());
     }
 
     /// A test check killed before it finished is recorded from its binaries (FAIL when one
@@ -1572,7 +1658,7 @@ mod tests {
         let judged = f.judge("s1", Some(&u(1)));
         assert!(judged.failed.is_empty(), "{}", judged.line());
         assert_eq!(
-            judged.run().passed_binaries,
+            judged.run(Half::Tree).passed_binaries,
             [("-p a --lib".to_owned(), u(1))]
         );
 

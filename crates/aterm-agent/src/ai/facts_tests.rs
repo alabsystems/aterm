@@ -1002,7 +1002,8 @@ fn pooled_codex_serves_enrolled_staging_login_without_default_auth_and_rotates_p
     // 5. With [harness] accounts = "off" and no pin, a launch takes no row and runs on this
     //    machine's own login, so the pool serves `main`, its row, whose run unsets
     //    CODEX_AUTH_PATH; the default home holds no login file.
-    std::fs::write(config.join("aterm.toml"), "[harness]\naccounts = \"off\"\n").expect("cfg");
+    crate::test_config::write(config.join("aterm.toml"), "[harness]\naccounts = \"off\"\n")
+        .expect("cfg");
     let f4 = gather(&m, &CODEX);
     let pool4 = f4.pool.as_ref().expect("codex pool under rotation off");
     assert_eq!(pool4.serving_label.as_deref(), Some("main"));

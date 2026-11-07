@@ -12,7 +12,11 @@ mod connection;
 #[cfg(unix)]
 mod private;
 #[cfg(unix)]
+pub use private::require_no_acl_grants;
+#[cfg(unix)]
 pub mod process;
+#[cfg(unix)]
+pub mod program;
 #[cfg(unix)]
 mod reader;
 #[cfg(unix)]

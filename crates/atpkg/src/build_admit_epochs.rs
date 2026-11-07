@@ -389,7 +389,11 @@ impl Table {
             drop(controller);
             let peak = meter.map_or(0, |meter| meter.stop(0));
             let _ = ended.keep(
-                status.completed_roots != 0 && status.failed_roots == 0,
+                crate::build_admit::BuildEnd::of_roots(
+                    usize::try_from(roots).unwrap_or(usize::MAX),
+                    status.completed_roots,
+                    status.failed_roots,
+                ),
                 peak,
                 say,
             );

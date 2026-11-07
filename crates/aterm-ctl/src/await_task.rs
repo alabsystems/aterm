@@ -532,26 +532,40 @@ fn row_news(row: &str, target: &Target, facts: bool) -> bool {
 }
 
 /// The row a wait makes for `target` once its Mac no longer hosts it. From `last`, the last row
-/// that Mac answered for it, it is that row with `state=closed` and its `task_news=` as `1`: its
-/// rev is the Mac's, which a board takes as one its worker reported ([`crate::board::Row::merge`];
-/// a row from a Mac too old to write `task_news=` stays without one, and is taken as below). With
-/// none read, it is a row of every column a server's has, at the asker's edge and with no
-/// `task_news=`, which a board reads as no rev its worker reported.
+/// that Mac answered for it, it is that row with `state=closed`, the state that row named kept as
+/// its record's own (`task_state=`, as a Mac's own close says it), and its `task_news=` as `1`:
+/// its rev is the Mac's, which a board takes as one its worker reported
+/// ([`crate::board::Row::merge`]; a row from a Mac too old to write `task_news=` stays without
+/// one, and is taken as below). With none read, it is a row of every column a server's has, at
+/// the asker's edge and with no `task_news=`, which a board reads as no rev its worker reported.
 fn closed_row(last: Option<&str>, target: &Target) -> String {
     match last {
-        Some(row) => row
-            .split_whitespace()
-            .map(|t| {
+        Some(row) => {
+            let state = row_field(row, "state")
+                .filter(|s| !matches!(*s, "closed" | "-" | ""))
+                .filter(|_| row_field(row, "task_state").is_none())
+                .map(|s| format!("task_state={s}"));
+            let mut words: Vec<String> = Vec::new();
+            for t in row.split_whitespace() {
                 if t.starts_with("state=") {
-                    "state=closed"
+                    words.push("state=closed".to_owned());
                 } else if t.starts_with("task_news=") {
-                    "task_news=1"
+                    words.push("task_news=1".to_owned());
                 } else {
-                    t
+                    words.push(t.to_owned());
                 }
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
+            }
+            // The record's own state goes where a Mac's own closed row says it: after
+            // `result_bytes=`, before its conclusion (or at the end of a row with none).
+            if let Some(state) = state {
+                let at = words
+                    .iter()
+                    .position(|w| w.starts_with("result_bytes="))
+                    .map_or(words.len(), |i| i + 1);
+                words.insert(at, state);
+            }
+            words.join(" ")
+        }
         None => format!(
             "@{} rev={} state=closed agent=- program_state=- attention=- result_bytes=0",
             target.selector,
@@ -2103,8 +2117,9 @@ mod tests {
         assert!(!row_closed(row));
         assert_eq!(
             closed_row(Some(row), &targets[0]),
-            "@s-a rev=7 state=closed agent=- program_state=idle attention=- result_bytes=1",
-            "the server's last row stands, its program's report with it"
+            "@s-a rev=7 state=closed agent=- program_state=idle attention=- result_bytes=1 \
+             task_state=done",
+            "the server's last row stands, its program's report and its record's state with it"
         );
         assert_eq!(
             closed_row(None, &targets[0]),
@@ -2588,7 +2603,7 @@ mod tests {
             rows,
             [
                 "@s-a rev=2 state=done agent=- attention=- result_bytes=9",
-                "@s-b rev=1 state=closed agent=busy attention=- result_bytes=0",
+                "@s-b rev=1 state=closed agent=busy attention=- result_bytes=0 task_state=working",
                 "@s-c rev=3 state=exited agent=- attention=- result_bytes=0",
             ]
         );
@@ -2613,7 +2628,7 @@ mod tests {
         assert_eq!(
             rows,
             [
-                "@s-a rev=1 state=closed agent=- attention=- result_bytes=0",
+                "@s-a rev=1 state=closed agent=- attention=- result_bytes=0 task_state=working",
                 "@s-b rev=4 state=closed agent=- attention=- result_bytes=0",
             ]
         );
@@ -3267,7 +3282,13 @@ mod tests {
         match wait("ERR no such session @s-a1") {
             Ok(Waited::Rows { rows, answered }) => assert_eq!(
                 (rows, answered),
-                (vec![BUSY.replace("state=working", "state=closed")], true)
+                (
+                    vec![format!(
+                        "{} task_state=working",
+                        BUSY.replace("state=working", "state=closed")
+                    )],
+                    true
+                )
             ),
             Ok(Waited::Ungranted { why, .. }) => panic!("a gone worker read as a grant: {why}"),
             Ok(Waited::Unanswered { why, .. }) => panic!("unanswered: {why}"),
@@ -3402,7 +3423,7 @@ mod tests {
                 ),
                 &target,
             ),
-            "@s-a rev=1 state=closed agent=busy program_state=- attention=- result_bytes=0 task_news=1"
+            "@s-a rev=1 state=closed agent=busy program_state=- attention=- result_bytes=0 task_state=working task_news=1"
         );
 
         let (x, y) = ("/x.sock", "/y.sock");

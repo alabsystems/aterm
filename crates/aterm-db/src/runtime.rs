@@ -110,6 +110,46 @@ pub use discovery::db_discovery_replacement_environment;
 
 const POLL: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(100);
+
+/// What one tick of a serving loop ([`serve_paced`]) came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Flow {
+    /// Serve on: the next tick follows a [`TICK`] later.
+    Serve,
+    /// The loop ends with `Ok(())`: what it serves moved under it (a source, a generation, an
+    /// enrollment's witness, Commons control come into view).
+    End,
+}
+
+/// A serving loop: `tick(now, round)` every [`TICK`] until `stopped`, ending at the first tick
+/// that ends it ([`Flow::End`]) or fails. `round` says that the loop's polled checks (the
+/// generation, lease, custody and vault rechecks, the address refresh) are due in this tick: the
+/// first [`POLL`] after the loop starts, then [`POLL`] after the last tick that ran them returned,
+/// by `clock`, not after it started. A round slower than the interval (a busy vault waited for, a
+/// slow interface read) so still leaves the loop that long at rest before the next, instead of
+/// running round after round with no rest between. The rest belongs to the loop, not to the
+/// round: no path through a tick can leave it out.
+fn serve_paced<E>(
+    clock: impl Fn() -> Instant,
+    stopped: impl Fn() -> bool,
+    mut wait: impl FnMut(Duration),
+    mut tick: impl FnMut(Instant, bool) -> std::result::Result<Flow, E>,
+) -> std::result::Result<(), E> {
+    let mut due = clock() + POLL;
+    while !stopped() {
+        let now = clock();
+        let round = now >= due;
+        let flow = tick(now, round);
+        if round {
+            due = clock() + POLL;
+        }
+        if flow? == Flow::End {
+            return Ok(());
+        }
+        wait(TICK);
+    }
+    Ok(())
+}
 /// Local custody admission budget: 2 s in product, 60 s hang detector on loaded test hosts.
 #[cfg(not(test))]
 const ADMISSION: Duration = Duration::from_secs(2);
@@ -1312,146 +1352,147 @@ fn serve_selected(
     // publish anything with.
     let mut lab = (!pending).then(|| crate::alab::upkeep::Upkeep::new(Instant::now()));
     let mut refresh = Instant::now() + Duration::from_secs(30);
-    let result = (|| {
+    let result = {
         let _serving = board.serving();
         let mut pushing: Option<Ask> = None;
-        let mut poll = Instant::now() + POLL;
-        while !stop.requested() {
-            if yield_to_window.is_some_and(owner::window_claimed) {
-                return Err(Status::Waiting);
-            }
-            let now = Instant::now();
-            if now >= poll {
-                crate::generation::guard(paths, false).map_err(refusal("generation guard"))?;
-                if now >= refresh {
-                    if crate::generation::refresh_required(paths)
-                        .map_err(refusal("generation refresh"))?
-                    {
-                        return Ok(());
+        serve_paced(
+            Instant::now,
+            || stop.requested(),
+            |rest| stop.wait(rest),
+            |now, round| {
+                if yield_to_window.is_some_and(owner::window_claimed) {
+                    return Err(Status::Waiting);
+                }
+                if round {
+                    crate::generation::guard(paths, false).map_err(refusal("generation guard"))?;
+                    if now >= refresh {
+                        if crate::generation::refresh_required(paths)
+                            .map_err(refusal("generation refresh"))?
+                        {
+                            return Ok(Flow::End);
+                        }
+                        refresh = now + Duration::from_secs(30);
                     }
-                    refresh = now + Duration::from_secs(30);
-                }
-                lease.recheck().map_err(refusal("owner lease"))?;
-                if owner_relay.as_ref().is_none_or(|relay| !relay.is_running()) {
-                    drop(owner_relay.take());
-                    owner_relay = history.transport_relay(&commons_dir).ok();
-                }
-                custody.recheck().map_err(refusal("custody"))?;
-                if !enabled(config).map_err(refusal("configuration"))? {
-                    return Err(Status::Disabled);
-                }
-                match commons::observe_until(paths, now + Duration::from_millis(200))
-                    .map_err(refusal("vault observation"))?
-                {
-                    commons::Observation::Visible(snapshot) => {
-                        if !snapshot.same_observation(&source_snapshot) {
-                            return Ok(());
+                    lease.recheck().map_err(refusal("owner lease"))?;
+                    if owner_relay.as_ref().is_none_or(|relay| !relay.is_running()) {
+                        drop(owner_relay.take());
+                        owner_relay = history.transport_relay(&commons_dir).ok();
+                    }
+                    custody.recheck().map_err(refusal("custody"))?;
+                    if !enabled(config).map_err(refusal("configuration"))? {
+                        return Err(Status::Disabled);
+                    }
+                    match commons::observe_until_settled(paths, now + Duration::from_millis(200))
+                        .map_err(refusal("vault observation"))?
+                    {
+                        commons::Observation::Visible(snapshot) => {
+                            if !snapshot.same_observation(&source_snapshot) {
+                                return Ok(Flow::End);
+                            }
+                        }
+                        commons::Observation::Unavailable(commons::Unavailable::Busy) => {}
+                        commons::Observation::Unavailable(_) => return Err(Status::Dormant),
+                    }
+                    if pending {
+                        if bootstrap
+                            .log_witness()
+                            .map_err(refusal("log witness"))?
+                            .is_some()
+                        {
+                            return Ok(Flow::End);
+                        }
+                        let journal = aterm_secrets::commons::journal::Journal::read_existing(
+                            bootstrap.journal_dir(),
+                            bootstrap.trust(),
+                        )
+                        .map_err(refusal("control journal"))?;
+                        if bootstrap
+                            .witness_in(&journal)
+                            .map_err(refusal("control witness"))?
+                            .is_some()
+                        {
+                            return Ok(Flow::End);
                         }
                     }
-                    commons::Observation::Unavailable(commons::Unavailable::Busy) => {}
-                    commons::Observation::Unavailable(_) => return Err(Status::Dormant),
+                    let candidates = network.addresses()?;
+                    network.may_use(&candidates)?;
+                    network.refresh(&mut transport, &candidates);
                 }
-                if pending {
-                    if bootstrap
-                        .log_witness()
-                        .map_err(refusal("log witness"))?
-                        .is_some()
-                    {
-                        return Ok(());
-                    }
-                    let journal = aterm_secrets::commons::journal::Journal::read_existing(
-                        bootstrap.journal_dir(),
-                        bootstrap.trust(),
-                    )
-                    .map_err(refusal("control journal"))?;
-                    if bootstrap
-                        .witness_in(&journal)
-                        .map_err(refusal("control witness"))?
-                        .is_some()
-                    {
-                        return Ok(());
+                if let Some(ask) = board.take() {
+                    pushing = Some(ask);
+                    if transport.hurry(ask.table, now) == 0 {
+                        pushing = None;
+                        transport.calm();
+                        board.settle(ask.id, Pushed::NoPeers);
                     }
                 }
-                let candidates = network.addresses()?;
-                network.may_use(&candidates)?;
-                network.refresh(&mut transport, &candidates);
-                poll = now + POLL;
-            }
-            if let Some(ask) = board.take() {
-                pushing = Some(ask);
-                if transport.hurry(ask.table, now) == 0 {
-                    pushing = None;
-                    transport.calm();
-                    board.settle(ask.id, Pushed::NoPeers);
+                transport.tick(now).map_err(|_| Status::Offline)?;
+                if let Some(ask) = pushing {
+                    let settled = if transport.reached() {
+                        Some(Pushed::Reached)
+                    } else {
+                        (now >= ask.deadline).then_some(Pushed::TimedOut)
+                    };
+                    if let Some(pushed) = settled {
+                        pushing = None;
+                        transport.calm();
+                        board.settle(ask.id, pushed);
+                    }
                 }
-            }
-            transport.tick(now).map_err(|_| Status::Offline)?;
-            if let Some(ask) = pushing {
-                let settled = if transport.reached() {
-                    Some(Pushed::Reached)
+                let completed: Vec<_> = transport.reports().collect();
+                if let Some(lab) = &mut lab {
+                    lab.tick(paths, now);
+                }
+                #[cfg(test)]
+                network.observed(&mut transport);
+                let contacts = transport.take_contacts();
+                if let Some(hearing) = &mut hearing {
+                    hearing.tick(paths, &bootstrap, &contacts, now);
+                }
+                // The Commons journal and this custody's access, read once this tick for every
+                // reader of its contacts, and only by the first that needs them.
+                let resolved = std::cell::OnceCell::new();
+                if let Some(clocks) = &mut clocks {
+                    clocks.tick(&bootstrap, &resolved, &contacts, now);
+                }
+                observe_contacts(
+                    &bootstrap,
+                    &resolved,
+                    history,
+                    contacts
+                        .into_iter()
+                        .map(|contact| (contact.actor, contact.at))
+                        .collect(),
+                    &completed,
+                    &network.place,
+                    || (aterm_time::unix_millis().unwrap_or(0), Instant::now()),
+                );
+                for completed in completed {
+                    reports(completed);
+                }
+                observe_transport(
+                    history,
+                    &transport,
+                    if pending {
+                        ObservationMode::Enrollment
+                    } else {
+                        ObservationMode::Repair
+                    },
+                );
+                report(if transport.interfaces() == 0 {
+                    Status::Offline
+                } else if pending {
+                    Status::Pending
                 } else {
-                    (now >= ask.deadline).then_some(Pushed::TimedOut)
-                };
-                if let Some(pushed) = settled {
-                    pushing = None;
-                    transport.calm();
-                    board.settle(ask.id, pushed);
-                }
-            }
-            let completed: Vec<_> = transport.reports().collect();
-            if let Some(lab) = &mut lab {
-                lab.tick(paths, now);
-            }
-            #[cfg(test)]
-            network.observed(&mut transport);
-            let contacts = transport.take_contacts();
-            if let Some(hearing) = &mut hearing {
-                hearing.tick(paths, &bootstrap, &contacts, now);
-            }
-            // The Commons journal and this custody's access, read once this tick for every
-            // reader of its contacts, and only by the first that needs them.
-            let resolved = std::cell::OnceCell::new();
-            if let Some(clocks) = &mut clocks {
-                clocks.tick(&bootstrap, &resolved, &contacts, now);
-            }
-            observe_contacts(
-                &bootstrap,
-                &resolved,
-                history,
-                contacts
-                    .into_iter()
-                    .map(|contact| (contact.actor, contact.at))
-                    .collect(),
-                &completed,
-                &network.place,
-                || (aterm_time::unix_millis().unwrap_or(0), Instant::now()),
-            );
-            for completed in completed {
-                reports(completed);
-            }
-            observe_transport(
-                history,
-                &transport,
-                if pending {
-                    ObservationMode::Enrollment
-                } else {
-                    ObservationMode::Repair
-                },
-            );
-            report(if transport.interfaces() == 0 {
-                Status::Offline
-            } else if pending {
-                Status::Pending
-            } else {
-                Status::Active {
-                    interfaces: transport.interfaces(),
-                    hints: transport.peers(),
-                }
-            });
-            stop.wait(TICK);
-        }
-        Ok(())
-    })();
+                    Status::Active {
+                        interfaces: transport.interfaces(),
+                        hints: transport.peers(),
+                    }
+                });
+                Ok(Flow::Serve)
+            },
+        )
+    };
     // Every exit drains and joins workers before the owner lease is released,
     // including cancellation or a configuration/source transition.
     drop(vault_reader);
@@ -1801,43 +1842,47 @@ fn serve_presence(
     let mut transport = network
         .open(None, &candidates)
         .map_err(|_| Status::Offline)?;
-    let mut poll = Instant::now() + POLL;
     let mut refresh = Instant::now() + Duration::from_secs(30);
     report(Status::Dormant);
-    while !stop.requested() {
-        if yield_to_window.is_some_and(owner::window_claimed) {
-            return Err(Status::Waiting);
-        }
-        let now = Instant::now();
-        if now >= poll {
-            crate::generation::guard(paths, false).map_err(refusal("generation guard"))?;
-            if now >= refresh {
-                if crate::generation::refresh_required(paths)
-                    .map_err(refusal("generation refresh"))?
-                {
-                    return Ok(());
+    serve_paced(
+        Instant::now,
+        || stop.requested(),
+        |rest| stop.wait(rest),
+        |now, round| {
+            if yield_to_window.is_some_and(owner::window_claimed) {
+                return Err(Status::Waiting);
+            }
+            if round {
+                crate::generation::guard(paths, false).map_err(refusal("generation guard"))?;
+                if now >= refresh {
+                    if crate::generation::refresh_required(paths)
+                        .map_err(refusal("generation refresh"))?
+                    {
+                        return Ok(Flow::End);
+                    }
+                    refresh = now + Duration::from_secs(30);
                 }
-                refresh = now + Duration::from_secs(30);
+                if !enabled(config).map_err(refusal("configuration"))? {
+                    return Err(Status::Disabled);
+                }
+                // Control this Mac cannot see stays unseen until a vault file moves: the
+                // observation kept from the last poll answers until then
+                // (`commons::observe_settled`).
+                if matches!(
+                    commons::observe_until_settled(paths, now + Duration::from_millis(200)),
+                    Ok(commons::Observation::Visible(_))
+                ) {
+                    return Ok(Flow::End);
+                }
+                let candidates = network.addresses()?;
+                network.may_use(&candidates)?;
+                network.refresh(&mut transport, &candidates);
             }
-            if !enabled(config).map_err(refusal("configuration"))? {
-                return Err(Status::Disabled);
-            }
-            if matches!(
-                commons::observe_until(paths, now + Duration::from_millis(200)),
-                Ok(commons::Observation::Visible(_))
-            ) {
-                return Ok(());
-            }
-            let candidates = network.addresses()?;
-            network.may_use(&candidates)?;
-            network.refresh(&mut transport, &candidates);
-            poll = now + POLL;
-        }
-        transport.tick(now).map_err(|_| Status::Offline)?;
-        observe_transport(history, &transport, ObservationMode::Discovery);
-        stop.wait(TICK);
-    }
-    Ok(())
+            transport.tick(now).map_err(|_| Status::Offline)?;
+            observe_transport(history, &transport, ObservationMode::Discovery);
+            Ok(Flow::Serve)
+        },
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -2155,7 +2200,10 @@ mod accounts_exchange_tests {
         failed.exchange_started = true;
         failed.phase = Some(crate::control::Phase::Application);
         failed.control = Ok(Default::default());
-        failed.application_error = Some("private fixture error".into());
+        failed.application_error = Some(crate::control::Failure::new(
+            aterm_types::network_state::RepairCause::Decode,
+            "private fixture error",
+        ));
         failed.completed_at_ms = 1500;
         observe_contacts(
             &bootstrap,
@@ -2182,7 +2230,10 @@ mod accounts_exchange_tests {
         );
         let attempt = state.peers[0].last_repair.as_ref().unwrap();
         assert_eq!(attempt.completed_at_ms, 1500);
-        assert_eq!(attempt.outcome, RepairOutcome::Failed);
+        assert_eq!(
+            attempt.outcome,
+            RepairOutcome::Failed(aterm_types::network_state::RepairCause::Decode)
+        );
         assert_eq!(attempt.stage, Some(RepairStage::Application));
         assert!(
             !crate::network_state::value(&state)

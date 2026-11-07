@@ -253,6 +253,163 @@ pub struct SeatQuery {
     pub held_sky: bool,
 }
 
+/// THE HEAD FITS ITS ROW WHERE NO SEAT HOLDS IT WHOLE. The head is taller than its row, so with
+/// letters over and under it (the screen's last row under a full row, the row under it off the
+/// grid) neither [`placement`] nor the placement's letter law can clear it, and it stayed over the
+/// row above's letters, down to 1.00:1 (the trail gallery's `last-row`). Fitted to its row, as
+/// [`crate::kitty_pet::head_law`] fits the walking companions, it stands beside the caret in the
+/// blank cells ahead of it, and is smaller still where the margin leaves it less room, no smaller
+/// than [`HEAD_FIT_FLOOR`], where its face still reads. Eased, at the pet's rate, and held until
+/// its whole seat clears with air to spare, so it never pops or blinks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HeadFit {
+    from: f32,
+    to: f32,
+    since: Option<Instant>,
+}
+
+/// How fast (its size's share a second) the head is fitted to its row and back: the pet's
+/// (`kitty_pet::FIT_RATE`).
+pub const HEAD_FIT_RATE: f32 = 4.5;
+/// The smallest the head is fitted to: 28 px wide on the gallery's 26 px row, a face at 1x.
+pub const HEAD_FIT_FLOOR: f32 = 0.40;
+/// The share of its row's height a head fitted to it fills (`kitty_pet::ROW_FIT`'s).
+const HEAD_ROW_SHARE: f32 = 0.92;
+
+impl HeadFit {
+    /// The head drawn whole.
+    pub const WHOLE: Self = Self {
+        from: 1.0,
+        to: 1.0,
+        since: None,
+    };
+
+    /// The share of its size the head is drawn at, at `now`.
+    #[must_use]
+    #[inline]
+    pub fn at(&self, now: Instant) -> f32 {
+        let Some(since) = self.since else {
+            return self.to;
+        };
+        let way = self.to - self.from;
+        let step = now.saturating_duration_since(since).as_secs_f32() * HEAD_FIT_RATE;
+        if step >= way.abs() {
+            self.to
+        } else {
+            self.from + way.signum() * step
+        }
+    }
+
+    /// Whether the head is fitted, or on its way to it.
+    #[must_use]
+    #[inline]
+    pub fn fitted(&self) -> bool {
+        self.to < 1.0
+    }
+
+    /// Ease to `to` from where it stands at `now`; at once where the host does not animate.
+    #[inline]
+    pub fn aim(&mut self, to: f32, now: Instant, animate: bool) {
+        if !animate {
+            *self = Self {
+                from: to,
+                to,
+                since: None,
+            };
+        } else if to != self.to {
+            self.from = self.at(now);
+            self.to = to;
+            self.since = Some(now);
+        }
+    }
+}
+
+/// The size [`HeadFit`] takes the head to for the caret at `caret` and a whole head `rest`, and the
+/// box `(x, y, w, h)` it stands in at that size: on the caret's row, its middle on the row's, as
+/// near the caret as the head's ring of air allows and no further than the grid's end, which at
+/// the last columns lays it across the caret and the letter behind it: fewer letters than the whole
+/// head lies on there, over two rows. `None` where the cells ahead of the caret hold letters (a line
+/// edited in the middle), which fitting would not clear.
+#[must_use]
+pub fn head_fit_seat<F>(
+    caret: (u16, u16),
+    rest: CatFootprint,
+    (cw, ch, cols): (i32, i32, u16),
+    gap: i32,
+    ink: &F,
+) -> Option<(f32, (i32, i32, i32, i32))>
+where
+    F: Fn(u16, u16) -> Option<bool>,
+{
+    #[cfg(any(test, debug_assertions))]
+    if HEAD_FIT_UNREAD.with(std::cell::Cell::get) {
+        return None;
+    }
+    if rest.w == 0 || rest.h == 0 || cw <= 0 || ch <= 0 {
+        return None;
+    }
+    let grid_w = i32::from(cols).saturating_mul(cw);
+    let caret_right = (i32::from(caret.1) + 1).saturating_mul(cw);
+    let (rest_w, rest_h) = (f32::from(rest.w), f32::from(rest.h));
+    let by_row = HEAD_ROW_SHARE * ch as f32 / rest_h;
+    let by_room = (grid_w - caret_right - gap) as f32 / rest_w;
+    let goal = by_row.min(by_room).clamp(HEAD_FIT_FLOOR, 1.0);
+    let (w, h) = (
+        (rest_w * goal).round() as i32,
+        (rest_h * goal).round() as i32,
+    );
+    let x = (caret_right + gap).min(grid_w - w).max(0);
+    let y = i32::from(caret.0) * ch + (ch - h) / 2;
+    let (_, last) = cell_span(x, w, cw, cols);
+    let lettered = (caret.1.saturating_add(1)..=last).any(|c| ink(caret.0, c) == Some(true));
+    (!lettered).then_some((goal, (x, y, w, h)))
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// Tests' negative control over [`head_fit_seat`]: on, the head is never fitted to its row.
+    static HEAD_FIT_UNREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests' negative control over [`head_fit_seat`] on this thread: `true` keeps the head whole.
+#[cfg(any(test, debug_assertions))]
+pub fn set_head_fit_unread(unread: bool) {
+    HEAD_FIT_UNREAD.with(|cell| cell.set(unread));
+}
+
+/// Whether a box `(x, y, w, h)` lies clear of the caret's cell and every lettered cell, `air` px
+/// to spare above and below it. A cell the host cannot read is no letter.
+#[must_use]
+pub fn box_clear<F>(
+    (x, y, w, h): (i32, i32, i32, i32),
+    caret: (u16, u16),
+    (cw, ch, rows, cols): (i32, i32, u16, u16),
+    air: i32,
+    ink: &F,
+) -> bool
+where
+    F: Fn(u16, u16) -> Option<bool>,
+{
+    if cw <= 0 || ch <= 0 || w <= 0 || h <= 0 {
+        return true;
+    }
+    let (first, last) = cell_span(x, w, cw, cols);
+    let (top, bottom) = (y - air, y + h + air - 1);
+    let (r0, r1) = (top.max(0) / ch, bottom.max(0) / ch);
+    let mut r = r0;
+    while r <= r1 && r < i32::from(rows) {
+        let mut c = first;
+        while c <= last {
+            if (r as u16 == caret.0 && c == caret.1) || ink(r as u16, c) == Some(true) {
+                return false;
+            }
+            c += 1;
+        }
+        r += 1;
+    }
+    true
+}
+
 /// The seat rule (§6.5 layer 13): the row and the side ([`seat_on_a_row`]), then the
 /// body's height within its row ([`keep_off_rows_beside`]).
 #[must_use]

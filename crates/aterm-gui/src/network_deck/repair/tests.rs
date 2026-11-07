@@ -4,13 +4,12 @@
 use super::*;
 use crate::network_deck::{Target, details as peer_details};
 use aterm_types::network_state::{
-    MachineIdentity, NetworkStateSnapshot, PeerObservation, Reachability, ServiceAvailability,
-    Visibility,
+    MachineIdentity, NetworkStateSnapshot, PeerObservation, Reachability, RepairCause,
+    ServiceAvailability, Visibility,
 };
 
 fn observation(outcome: RepairOutcome) -> RepairObservation {
     RepairObservation {
-        cause: None,
         completed_at_ms: 3000,
         outbound: true,
         stage: Some(RepairStage::Application),
@@ -58,11 +57,14 @@ fn retained_attempts_stay_distinct_without_changing_presence_or_service_access()
     let mut snapshot = snapshot();
     let accounts = peer_details(&snapshot, Target::Accounts);
     let secrets = peer_details(&snapshot, Target::Secrets);
-    let absent = peer_details(&snapshot, Target::Peer(2));
+    let absent = peer_details(
+        &snapshot,
+        Target::Seat(crate::network_deck::SeatKey::Observed(2)),
+    );
     let mut rendered_outcomes = vec![row(&absent, "Last repair").to_owned()];
     for outcome in [
-        RepairOutcome::Failed,
-        RepairOutcome::Deferred,
+        RepairOutcome::Failed(RepairCause::Io),
+        RepairOutcome::Deferred(None),
         RepairOutcome::Exchanged,
         RepairOutcome::Cancelled,
         RepairOutcome::NotObserved,
@@ -70,7 +72,10 @@ fn retained_attempts_stay_distinct_without_changing_presence_or_service_access()
     ] {
         snapshot.network.peers[0].last_repair = Some(observation(outcome));
         let before = snapshot.clone();
-        let rows = peer_details(&snapshot, Target::Peer(2));
+        let rows = peer_details(
+            &snapshot,
+            Target::Seat(crate::network_deck::SeatKey::Observed(2)),
+        );
         let rendered = row(&rows, "Last repair");
         assert!(!rendered_outcomes.iter().any(|prior| prior == rendered));
         rendered_outcomes.push(rendered.to_owned());
@@ -81,7 +86,10 @@ fn retained_attempts_stay_distinct_without_changing_presence_or_service_access()
             let mut aged = before.clone();
             aged.network.visibility = visibility;
             aged.network.observed_at_ms = sampled;
-            let projected = peer_details(&aged, Target::Peer(2));
+            let projected = peer_details(
+                &aged,
+                Target::Seat(crate::network_deck::SeatKey::Observed(2)),
+            );
             for key in [
                 "Last repair",
                 "Repair time",
@@ -93,7 +101,13 @@ fn retained_attempts_stay_distinct_without_changing_presence_or_service_access()
         }
     }
     snapshot.network.peers[0].last_repair = None;
-    assert_eq!(peer_details(&snapshot, Target::Peer(2)), absent);
+    assert_eq!(
+        peer_details(
+            &snapshot,
+            Target::Seat(crate::network_deck::SeatKey::Observed(2))
+        ),
+        absent
+    );
 }
 
 #[test]
@@ -106,7 +120,7 @@ fn each_unobserved_receipt_is_distinct_from_an_observed_zero() {
         }
     }
     for index in 0..3 {
-        let mut unknown = observation(RepairOutcome::Failed);
+        let mut unknown = observation(RepairOutcome::Failed(RepairCause::Io));
         let mut zero = unknown.clone();
         *field(&mut unknown, index) = None;
         *field(&mut zero, index) = Some(0);
@@ -115,4 +129,25 @@ fn each_unobserved_receipt_is_distinct_from_an_observed_zero() {
             row(&details(Some(&zero)), "Record receipts")
         );
     }
+}
+
+#[test]
+fn a_failed_or_deferred_attempt_names_its_cause() {
+    let shown = |outcome| row(&details(Some(&observation(outcome))), "Last repair").to_owned();
+    assert_eq!(
+        shown(RepairOutcome::Failed(RepairCause::LanHeld)),
+        "Failed (lan-held) · application data"
+    );
+    assert_eq!(
+        shown(RepairOutcome::Deferred(Some(RepairCause::Quota))),
+        "Work deferred (quota) · application data"
+    );
+    assert_eq!(
+        shown(RepairOutcome::Deferred(None)),
+        "Work deferred · application data"
+    );
+    assert_ne!(
+        shown(RepairOutcome::Failed(RepairCause::LanHeld)),
+        shown(RepairOutcome::Failed(RepairCause::Unreachable))
+    );
 }

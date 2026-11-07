@@ -18,7 +18,7 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use crate::place::{Facts, PathFacts, RouteFacts};
@@ -28,11 +28,48 @@ pub trait Sense: Send {
     /// The facts now.
     fn facts(&self) -> Facts;
 
-    /// Waits at most `most` for the network to change; `true` when it did.
-    fn wait(&self, most: Duration) -> bool;
+    /// Waits at most `most` for the network to change; `true` when it did. A sticky `stop`
+    /// ends the wait with `false`, without consuming or manufacturing a network change.
+    fn wait(&self, most: Duration, stop: &AtomicBool) -> bool;
+
+    /// A notification-only handle; it retains neither the monitor nor the route socket.
+    fn stop_wake(&self) -> std::io::Result<StopWake>;
 
     /// Told once each time the keeper's lock is found held, before the candidate waits for it.
     fn lock_held(&self) {}
+}
+
+/// A keeper's non-owning notification handle. Stopping never manufactures changed facts.
+#[derive(Debug)]
+pub struct StopWake(WakeTarget);
+
+#[derive(Debug)]
+enum WakeTarget {
+    Live(Weak<PathState>),
+    Scripted(Weak<Scripted>),
+}
+
+impl StopWake {
+    pub(crate) fn ring(&self) {
+        match &self.0 {
+            WakeTarget::Live(path) => {
+                if let Some(path) = path.upgrade() {
+                    let _held = path.reading.lock().unwrap_or_else(PoisonError::into_inner);
+                    path.wake.notify_all();
+                    #[cfg(unix)]
+                    if let Some(bell) = &path.bell {
+                        bell.ring();
+                    }
+                }
+            }
+            WakeTarget::Scripted(sense) => {
+                if let Some(sense) = sense.upgrade() {
+                    let _held = sense.facts.lock().unwrap_or_else(PoisonError::into_inner);
+                    sense.wake.notify_all();
+                }
+            }
+        }
+    }
 }
 
 /// Whether `name` is a tunnel's interface: a VPN's `utun`, `ipsec`, `ppp`, `tun`, `tap` or
@@ -578,24 +615,34 @@ pub struct Live {
     _monitor: Option<aterm_objc::path_monitor::PathMonitor>,
 }
 
-#[derive(Default)]
+/// Notification resources prepared without starting route or path observation.
+pub(crate) struct PreparedLive(Arc<PathState>);
+
+impl PreparedLive {
+    pub(crate) fn start(self) -> Live {
+        Live::start_with(self.0)
+    }
+}
+
+#[derive(Debug, Default)]
 struct PathState {
     reading: Mutex<Option<PathFacts>>,
     changed: AtomicBool,
     wake: Condvar,
     /// The bell a waiter on the route socket also hears when `changed` is set.
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     bell: Option<Bell>,
 }
 
 /// A nonblocking pipe a path reading rings and a wait polls beside the route socket.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
+#[derive(Debug)]
 struct Bell {
     hear: std::io::PipeReader,
     ring: std::io::PipeWriter,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 impl Bell {
     fn new() -> Option<Self> {
         use std::os::fd::{AsFd as _, AsRawFd as _};
@@ -636,10 +683,26 @@ impl Bell {
 }
 
 impl PathState {
+    /// Wait with the reading held. The monitor takes the same lock when it
+    /// latches a change, so the condition-variable release cannot miss it.
+    fn wait_reading(
+        &self,
+        held: MutexGuard<'_, Option<PathFacts>>,
+        left: Duration,
+        stop: &AtomicBool,
+    ) {
+        let _ = self
+            .wake
+            .wait_timeout_while(held, left, |_| {
+                !self.changed.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst)
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+
     /// A reading changed: tell a waiter on the condition variable or on the route socket. The
     /// bell coalesces readings while `changed` is set. Its nonblocking I/O also protects the
     /// monitor's queue when a wait consumes the flag before a notification is written.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", all(test, unix)))]
     fn tell(&self) {
         let told = self.changed.swap(true, Ordering::SeqCst);
         self.wake.notify_all();
@@ -651,13 +714,13 @@ impl PathState {
     /// The bell's end a wait polls, where this platform rings one.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn bell_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
-        #[cfg(target_os = "macos")]
+        #[cfg(unix)]
         {
             self.bell
                 .as_ref()
                 .map(|bell| std::os::fd::AsFd::as_fd(&bell.hear))
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(unix))]
         {
             None
         }
@@ -666,7 +729,7 @@ impl PathState {
     /// Drains the bell's readiness without clearing the latched path change.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn hush(&self) {
-        #[cfg(target_os = "macos")]
+        #[cfg(unix)]
         if let Some(bell) = &self.bell {
             bell.hush();
         }
@@ -677,18 +740,37 @@ impl PathState {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Woke {
-    Routes,
+    Routes(bool),
     Bell,
     Deadline,
     Failed,
 }
 
-/// Polls `routes` and `bell` until one is readable or `left` passes.
+/// Polls `routes` and `bell` until one is ready or `left` passes, then reads the
+/// route socket, in error or not, to distinguish network changes from unrelated traffic.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn poll_both(
     routes: &aterm_uds::network::RouteChanges,
     bell: Option<std::os::fd::BorrowedFd<'_>>,
     left: Duration,
+) -> Woke {
+    poll_both_by(routes, bell, left, |fds, millis| {
+        // SAFETY: `fds` is two live pollfds (a negative fd is ignored by poll).
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, millis) };
+        if ready < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn poll_both_by(
+    routes: &aterm_uds::network::RouteChanges,
+    bell: Option<std::os::fd::BorrowedFd<'_>>,
+    left: Duration,
+    poll: impl FnOnce(&mut [libc::pollfd; 2], libc::c_int) -> std::io::Result<()>,
 ) -> Woke {
     use std::os::fd::{AsFd as _, AsRawFd as _};
     let mut fds = [
@@ -703,22 +785,92 @@ fn poll_both(
             revents: 0,
         },
     ];
-    let millis = libc::c_int::try_from(left.as_millis()).unwrap_or(libc::c_int::MAX);
-    // SAFETY: `fds` is two live pollfds (a negative fd is ignored by poll) and the count is 2.
-    let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, millis) };
-    if ready < 0 {
-        return if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+    let millis = aterm_uds::deadline::poll_timeout_ms(left);
+    if let Err(error) = poll(&mut fds, millis) {
+        return if error.kind() == std::io::ErrorKind::Interrupted {
             Woke::Deadline
         } else {
             Woke::Failed
         };
     }
-    if fds[1].revents != 0 {
+    // The bell's error or hangup would poll ready again at once: a failure.
+    if fds[1].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+        Woke::Failed
+    } else if fds[1].revents & libc::POLLIN != 0 {
         Woke::Bell
     } else if fds[0].revents != 0 {
-        Woke::Routes
+        // The route socket is read whatever its poll reported, an error included, and the read
+        // decides: Linux reports a netlink overflow (ENOBUFS) as POLLERR until a read takes it,
+        // and the read counts the overflow as a change. Only a read that fails is a failure.
+        match routes.read_waiting() {
+            Some(changed) => Woke::Routes(changed),
+            None => Woke::Failed,
+        }
     } else {
         Woke::Deadline
+    }
+}
+
+/// Waits for a path change until the original deadline. The backend receives
+/// the reading guard so its condition-variable release uses the monitor's lock.
+fn wait_on_path(
+    path: &PathState,
+    stop: &AtomicBool,
+    deadline: Instant,
+    now: impl Fn() -> Instant,
+    mut wait: impl FnMut(MutexGuard<'_, Option<PathFacts>>, Duration),
+) -> bool {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        if path.changed.swap(false, Ordering::SeqCst) {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            path.hush();
+            return true;
+        }
+        if deadline.saturating_duration_since(now()).is_zero() {
+            return false;
+        }
+        let held = path.reading.lock().unwrap_or_else(PoisonError::into_inner);
+        // Acquiring the lock may itself have waited. Recalculate the budget;
+        // the backend checks the change flag even if no time remains.
+        wait(held, deadline.saturating_duration_since(now()));
+    }
+}
+
+/// Waits on routes and the path bell, falling back to the path's condition
+/// variable after route I/O fails. Both waits keep the same absolute deadline.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn wait_on_routes(
+    path: &PathState,
+    stop: &AtomicBool,
+    most: Duration,
+    now: impl Fn() -> Instant,
+    mut poll: impl FnMut(Duration) -> Woke,
+    wait_path: impl FnMut(MutexGuard<'_, Option<PathFacts>>, Duration),
+) -> bool {
+    let deadline = now() + most;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        if path.changed.swap(false, Ordering::SeqCst) {
+            path.hush();
+            return true;
+        }
+        let left = deadline.saturating_duration_since(now());
+        if left.is_zero() {
+            return false;
+        }
+        match poll(left) {
+            Woke::Routes(true) => return true,
+            Woke::Routes(false) | Woke::Deadline => {}
+            Woke::Bell => path.hush(),
+            // A failed descriptor can remain readable. Stop polling it for
+            // this wait while still hearing the independent path monitor.
+            Woke::Failed => return wait_on_path(path, stop, deadline, now, wait_path),
+        }
     }
 }
 
@@ -729,14 +881,26 @@ impl std::fmt::Debug for Live {
 }
 
 impl Live {
-    /// Starts the readers: the route-change socket and, on macOS, the path monitor.
-    #[must_use]
-    pub fn start() -> Self {
-        let path = Arc::new(PathState {
-            #[cfg(target_os = "macos")]
-            bell: Bell::new(),
+    /// Starts live observation after admitting the keeper's stop-notification transport.
+    ///
+    /// # Errors
+    /// The notification pipe could not be created or made nonblocking.
+    pub fn start() -> std::io::Result<Self> {
+        Ok(Self::prepare()?.start())
+    }
+
+    pub(crate) fn prepare() -> std::io::Result<PreparedLive> {
+        Ok(PreparedLive(Arc::new(PathState {
+            #[cfg(unix)]
+            bell: Some(Bell::new().ok_or_else(|| {
+                std::io::Error::other("keeper stop notification pipe unavailable")
+            })?),
             ..PathState::default()
-        });
+        })))
+    }
+
+    /// Starts the readers: the route-change socket and, on macOS, the path monitor.
+    fn start_with(path: Arc<PathState>) -> Self {
         #[cfg(target_os = "macos")]
         let monitor = {
             let path = Arc::clone(&path);
@@ -761,7 +925,7 @@ impl Live {
         };
         Self {
             #[cfg(any(target_os = "macos", target_os = "linux"))]
-            routes: aterm_uds::network::RouteChanges::open(),
+            routes: aterm_uds::network::RouteChanges::open().ok(),
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             routes: None,
             path,
@@ -788,53 +952,38 @@ impl Sense for Live {
         }
     }
 
-    fn wait(&self, most: Duration) -> bool {
-        let deadline = Instant::now() + most;
-        loop {
-            if self.path.changed.swap(false, Ordering::SeqCst) {
-                self.path.hush();
-                return true;
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return false;
-            }
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
-            if let Some(routes) = &self.routes {
-                match poll_both(routes, self.path.bell_fd(), left) {
-                    Woke::Bell => self.path.hush(),
-                    // Read what came: a message that names no change of network is passed over,
-                    // and a socket that fails is waited out like a failed poll, never polled
-                    // again at once (it would poll readable and fail again, a spin).
-                    Woke::Routes => match routes.read_waiting() {
-                        Some(true) => return true,
-                        Some(false) => {}
-                        None => {
-                            std::thread::sleep(left);
-                            return false;
-                        }
-                    },
-                    Woke::Deadline => {}
-                    Woke::Failed => {
-                        std::thread::sleep(left);
-                        return false;
-                    }
-                }
-                continue;
-            }
-            let held = self
-                .path
-                .reading
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            // The monitor sets `changed` with `reading` held, so a change between the look above
-            // and this wait is seen here rather than slept through.
-            let _ = self
-                .path
-                .wake
-                .wait_timeout_while(held, left, |_| !self.path.changed.load(Ordering::SeqCst))
-                .unwrap_or_else(PoisonError::into_inner);
+    fn stop_wake(&self) -> std::io::Result<StopWake> {
+        #[cfg(unix)]
+        if self.path.bell.is_none() {
+            return Err(std::io::Error::other(
+                "keeper stop notification pipe unavailable",
+            ));
         }
+        Ok(StopWake(WakeTarget::Live(Arc::downgrade(&self.path))))
+    }
+
+    fn wait(&self, most: Duration, stop: &AtomicBool) -> bool {
+        let wait_path = |held: MutexGuard<'_, Option<PathFacts>>, left| {
+            self.path.wait_reading(held, left, stop);
+        };
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(routes) = &self.routes {
+            return wait_on_routes(
+                &self.path,
+                stop,
+                most,
+                Instant::now,
+                |left| poll_both(routes, self.path.bell_fd(), left),
+                wait_path,
+            );
+        }
+        wait_on_path(
+            &self.path,
+            stop,
+            Instant::now() + most,
+            Instant::now,
+            wait_path,
+        )
     }
 }
 
@@ -883,6 +1032,9 @@ impl Scripted {
 }
 
 impl Sense for Arc<Scripted> {
+    fn stop_wake(&self) -> std::io::Result<StopWake> {
+        Ok(StopWake(WakeTarget::Scripted(Arc::downgrade(self))))
+    }
     fn facts(&self) -> Facts {
         self.facts
             .lock()
@@ -891,13 +1043,18 @@ impl Sense for Arc<Scripted> {
             .clone()
     }
 
-    fn wait(&self, most: Duration) -> bool {
+    fn wait(&self, most: Duration, stop: &AtomicBool) -> bool {
         let held = self.facts.lock().unwrap_or_else(PoisonError::into_inner);
         self.waits.fetch_add(1, Ordering::SeqCst);
         let (mut held, _) = self
             .wake
-            .wait_timeout_while(held, most, |held| held.1 == held.2)
+            .wait_timeout_while(held, most, |held| {
+                held.1 == held.2 && !stop.load(Ordering::SeqCst)
+            })
             .unwrap_or_else(PoisonError::into_inner);
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
         let changed = held.1 != held.2;
         held.2 = held.1;
         changed
@@ -908,9 +1065,13 @@ impl Sense for Arc<Scripted> {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 #[path = "facts_bell_tests.rs"]
 mod bell_tests;
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[path = "facts_wait_tests.rs"]
+mod wait_tests;
 
 #[cfg(test)]
 mod tests {
@@ -959,7 +1120,7 @@ mod tests {
                 "the scripted route"
             );
             assert_eq!(route_via("10.8.0.1".parse().expect("an address")), None);
-            assert_eq!(Live::start().facts(), script.facts);
+            assert_eq!(Live::start().unwrap().facts(), script.facts);
         });
         let elsewhere = std::thread::spawn(scripted).join().expect("another thread");
         assert_eq!(elsewhere, None, "another thread reads the Mac's own");

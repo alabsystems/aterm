@@ -13,8 +13,9 @@ use crate::ledger::{BYTE_EXACT, GitCli, GitRunner};
 use crate::line::{Fix, Hop, Line};
 use crate::provision::{AskWords, Finding};
 use crate::release::{
-    AfterCut, Answer, Artifact, Backend, Built, Candidate, CutState, EngineNow, EngineRows, Facts,
-    Prover, RELEASE_COMMAND, Ran, Refusal, Reservation, StageTarget, Step,
+    AfterCut, Answer, Artifact, Backend, Branch, BranchStop, Branches, BuildWork, Built, Candidate,
+    CutState, EngineNow, EngineRows, Facts, PUBLISH_GATE_ENV, Prover, PublishGate, RELEASE_COMMAND,
+    Ran, Refusal, Reservation, Side, StageTarget, Step,
 };
 
 #[path = "release_scanner_tools.rs"]
@@ -242,6 +243,225 @@ pub struct Real {
     /// The release's one disk claim ([`Backend::claim_disk`]), named to every child it starts.
     disk_claim: Option<atpkg::admit_disk::Whole>,
     fleet_line: Option<crate::line_claim::Claim>,
+    /// The qualify graph's one pool ([`Backend::qualify_begin`]), handed to every child it starts.
+    pool: Option<Pool>,
+}
+
+/// The qualify graph's cores: its one Release core claim, the jobserver of that many slots every
+/// branch's children draw from, and the share of it the export holds while it runs (the
+/// engine's gate passes `CARGO_BUILD_JOBS` alone, so its cargo cannot draw from the jobserver).
+struct Pool {
+    _claim: aterm_capacity::Claim,
+    jobs: aterm_capacity::Jobserver,
+    export: u32,
+}
+
+/// The qualify graph's pool at `path`: one Release core claim of every core, as `admit` answers
+/// it, a jobserver of as many slots as it granted, and the export's share of them where `export`
+/// runs ([`export_share`]).
+fn qualify_pool(
+    path: &Path,
+    export: bool,
+    admit: impl FnOnce(aterm_capacity::Need) -> Result<aterm_capacity::Claim, aterm_capacity::Error>,
+) -> Result<Pool, Refusal> {
+    let claim = admit(
+        aterm_capacity::Need::new("release qualify pool")
+            .rank(aterm_capacity::Rank::Release)
+            .cores(aterm_capacity::cores()),
+    )
+    .map_err(|e| {
+        Refusal::new(
+            format!("the qualify graph's core claim was not admitted: {e} — nothing ran"),
+            format!("run {RELEASE_COMMAND} again once the ledger admits it"),
+        )
+        .could_not_run()
+    })?;
+    let slots = claim.cores().max(1);
+    // A run that died leaves its FIFO behind, and mkfifo never replaces one.
+    let _ = std::fs::remove_file(path);
+    let jobs = aterm_capacity::Jobserver::new(path, slots).map_err(|e| {
+        Refusal::new(
+            format!(
+                "cannot make the qualify graph's jobserver at {}: {e} — nothing ran",
+                path.display()
+            ),
+            format!("fix what it names, then {RELEASE_COMMAND}"),
+        )
+        .could_not_run()
+    })?;
+    Ok(Pool {
+        _claim: claim,
+        jobs,
+        export: export_share(slots, export),
+    })
+}
+
+/// The export's share of the pool's `slots` while it runs: a quarter of them, at least one, and
+/// never every slot (none of one slot), so the tree and the build always draw.
+fn export_share(slots: u32, export: bool) -> u32 {
+    if !export || slots < 2 {
+        return 0;
+    }
+    (slots / 4).clamp(1, slots - 1)
+}
+
+/// The real backend's view the qualify graph's branches run on ([`Backend::branches`]), with the
+/// export's share of the pool taken from it before any branch starts, given back as the export
+/// ends.
+struct RealBranches<'a> {
+    real: &'a Real,
+    export: std::sync::Mutex<Vec<aterm_capacity::Token<'a>>>,
+}
+
+impl Branches for RealBranches<'_> {
+    fn say(&self, line: &str) {
+        say_to(&self.real.transcript(), line);
+    }
+
+    fn now(&self) -> u64 {
+        now()
+    }
+
+    fn interrupted(&self) -> bool {
+        interrupt::caught().is_some()
+    }
+
+    fn branch_log(&self, branch: Branch) -> PathBuf {
+        self.real.side_log(Step::Qualify, branch.name())
+    }
+
+    fn tree_admitted(&self, ended: &dyn Fn() -> bool) {
+        let me = std::process::id();
+        let began = std::time::Instant::now();
+        while !ended() && began.elapsed() < crate::release::TREE_HEAD_START {
+            if interrupt::caught().is_some() || tree_holds_memory(me) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+
+    fn export(
+        &self,
+        c: &Candidate,
+        prover: &Prover,
+        target: StageTarget,
+        stop: &BranchStop,
+    ) -> Result<Ran, Refusal> {
+        let held = std::mem::take(&mut *self.export.lock().unwrap_or_else(|e| e.into_inner()));
+        let jobs = u32::try_from(held.len()).ok().filter(|n| *n > 0);
+        let ran = self
+            .real
+            .export_run(c, prover, target, Step::Qualify, Some((stop, jobs)));
+        drop(held);
+        ran
+    }
+
+    fn build(
+        &self,
+        c: &Candidate,
+        reserved: &Reservation,
+        prover: &Prover,
+        work: BuildWork,
+        stop: &BranchStop,
+    ) -> Built {
+        self.real.build_branch(c, reserved, prover, work, stop)
+    }
+
+    fn verify(
+        &self,
+        c: &Candidate,
+        prover: &Prover,
+        run: &crate::check_record::VerifyRun,
+        artifact: Option<&Artifact>,
+        stop: &BranchStop,
+    ) -> Result<Ran, Refusal> {
+        self.real.verify_half(c, prover, run, artifact, stop)
+    }
+
+    fn side_log(&self, side: Side) -> PathBuf {
+        match side {
+            Side::Source => self.real.step_log(Step::Publish),
+            Side::Sign => self.real.side_log(Step::Publish, side.name()),
+        }
+    }
+
+    fn publish_gate(&self) -> PublishGate {
+        PublishGate::at(self.real.logs.join(format!(
+            "{:02}-{}.gate",
+            Step::Publish.number(),
+            Step::Publish.name()
+        )))
+    }
+
+    fn source(
+        &self,
+        prover: &Prover,
+        gate: &PublishGate,
+        stop: &BranchStop,
+    ) -> Result<Ran, Refusal> {
+        let mut cmd = self.real.publish_command(prover)?;
+        cmd.env(PUBLISH_GATE_ENV, gate.path());
+        Ok(self.real.logged_in(
+            Logged {
+                step: Step::Publish,
+                log: self.side_log(Side::Source),
+                stream: self.real.verbose,
+                // The engine's KeyboardInterrupt ends its whole tree before its push.
+                stop: Some((stop, interrupt::SIGINT)),
+                push: None,
+                arrivals: true,
+            },
+            &mut cmd,
+        ))
+    }
+
+    fn sign(&self, args: &[String], prover: &Prover, stop: &BranchStop) -> Ran {
+        match self.real.cut_command(args, prover) {
+            Ok(mut cmd) => self.real.logged_in(
+                Logged {
+                    step: Step::Publish,
+                    log: self.side_log(Side::Sign),
+                    stream: false,
+                    stop: Some((stop, interrupt::SIGTERM)),
+                    push: None,
+                    arrivals: false,
+                },
+                &mut cmd,
+            ),
+            Err(why) => Ran {
+                code: -1,
+                detail: vec![format!("not started: {why}")],
+            },
+        }
+    }
+}
+
+/// Whether the user's ledger holds an admitted memory claim of `verify release` under this
+/// process `me`: the tree branch's, the only `verify` the release runs while its build waits.
+fn tree_holds_memory(me: u32) -> bool {
+    let Some(records) = aterm_capacity::Ledger::user().and_then(|l| l.list().ok()) else {
+        return false;
+    };
+    let Some(procs) = interrupt::listing() else {
+        return false;
+    };
+    let parent: std::collections::BTreeMap<i32, i32> =
+        procs.iter().map(|p| (p.pid, p.parent)).collect();
+    let descends = |pid: u32| {
+        let mut at = i32::try_from(pid).unwrap_or(0);
+        for _ in 0..64 {
+            match parent.get(&at) {
+                Some(&up) if u32::try_from(up).is_ok_and(|up| up == me) => return true,
+                Some(&up) if up > 1 => at = up,
+                _ => return false,
+            }
+        }
+        false
+    };
+    records.iter().any(|r| {
+        r.held.is_some() && r.need.what.starts_with("verify ") && r.need.mem > 0 && descends(r.pid)
+    })
 }
 
 struct Forwarded {
@@ -339,6 +559,7 @@ impl Real {
             engine_agh_explicit: std::env::var_os(ENGINE_AGH_ENV),
             disk_claim: None,
             fleet_line: None,
+            pool: None,
         })
     }
 
@@ -412,18 +633,39 @@ impl Real {
         &self,
         cmd: &mut Command,
     ) -> std::io::Result<(aterm_uds::spawnfd::Child, Forwarded)> {
+        self.spawn_stoppable(self.step, cmd, None)
+    }
+
+    /// [`Real::spawn_forwarded`] for a child of `step` (noted as that step's while it runs), which
+    /// a branch's `stop` ends too (sent its signal, then `SIGKILL`); none starts once that stop
+    /// fired.
+    fn spawn_stoppable(
+        &self,
+        step: Step,
+        cmd: &mut Command,
+        stop: Option<(&BranchStop, i32)>,
+    ) -> std::io::Result<(aterm_uds::spawnfd::Child, Forwarded)> {
         if interrupt::caught().is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
                 "not started: the release was interrupted",
             ));
         }
+        if stop.is_some_and(|(stop, _)| stop.fired()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "not started: another branch went red",
+            ));
+        }
         self.apply_prerequisites(cmd)
             .map_err(std::io::Error::other)?;
         detach(cmd);
         let child = cmd.spawn()?;
-        let running = interrupt::Running::enter(child.id());
-        let note = self.note_child(child.id());
+        let running = match stop {
+            Some((stop, sig)) => interrupt::Running::enter_stoppable(child.id(), stop.clone(), sig),
+            None => interrupt::Running::enter(child.id()),
+        };
+        let note = self.note_child(step, child.id());
         Ok((
             child,
             Forwarded {
@@ -499,12 +741,48 @@ impl Real {
         if let Some(tools) = &self.source_signing {
             tools.apply(&mut cmd);
         }
-        if let Some(tools) = &self.scanner_tools {
-            tools.apply(&mut cmd);
-        }
         hand_inputs_seal(&mut cmd, (self.handed_inputs)());
         if let Some(claim) = &self.disk_claim {
             cmd.env(aterm_capacity::DISK_COVER_ENV, claim.marker());
+        }
+        cmd
+    }
+
+    /// Hand step 4's pool to a branch child that adopts it ([`aterm_capacity::Jobserver::hand_to`]):
+    /// `ship build`, whose slices draw from it, and the tree's `verify`, whose test binaries
+    /// do. With `less_export` the child's share is the pool less the export's
+    /// ([`aterm_capacity::Jobserver::hand_share_to`]: the same FIFO, by the jobserver's own path,
+    /// with fewer slots), so no test binary's charge waits holding tokens on what the export
+    /// holds. Nothing else is handed it: the export draws its share as `CARGO_BUILD_JOBS`, and a
+    /// child outside the graph has no pool. Refused, before the child runs, only for a share
+    /// the pool cannot carry, which [`export_share`] never leaves.
+    fn hand_pool(&self, cmd: &mut Command, less_export: bool) -> Result<(), Refusal> {
+        let Some(pool) = &self.pool else {
+            return Ok(());
+        };
+        if !less_export {
+            pool.jobs.hand_to(cmd);
+            return Ok(());
+        }
+        let slots = pool.jobs.slots();
+        let share = slots.saturating_sub(pool.export);
+        pool.jobs.hand_share_to(cmd, share).map_err(|e| {
+            Refusal::new(
+                format!(
+                    "the qualify graph's jobserver cannot hand a share of {share} of its {slots} \
+                     slots: {e} — nothing ran"
+                ),
+                format!("run {RELEASE_COMMAND} again"),
+            )
+            .could_not_run()
+        })
+    }
+
+    /// The engine's operation with the export guards' scanner tools this run prepared
+    /// ([`Real::prepare_scanner_tools`]): a stage's and a publish's, no other child's.
+    fn with_scanners(&self, mut cmd: Command) -> Command {
+        if let Some(tools) = &self.scanner_tools {
+            tools.apply(&mut cmd);
         }
         cmd
     }
@@ -647,7 +925,7 @@ impl Real {
     }
 
     fn publish_command(&self, prover: &Prover) -> Result<Command, Refusal> {
-        let mut cmd = self.engine_child(&self.engine, Some(prover))?;
+        let mut cmd = self.with_scanners(self.engine_child(&self.engine, Some(prover))?);
         cmd.args(["publish", "aterm", "--skip-site", "--repo-path"])
             .arg(&self.repo);
         if let Ok(exe) = std::env::current_exe() {
@@ -663,7 +941,30 @@ impl Real {
     }
 
     fn logged_to(&self, step: Step, cmd: &mut Command, stream: bool) -> Ran {
-        let log = self.step_log(step);
+        self.logged_in(
+            Logged {
+                step,
+                log: self.step_log(step),
+                stream,
+                stop: None,
+                push: None,
+                arrivals: step == Step::Publish,
+            },
+            cmd,
+        )
+    }
+
+    /// Run `cmd` as a child of `at.step` into `at.log`, its output streamed when `at.stream`,
+    /// ended by `at.stop` too, and its lines read by `at.push`.
+    fn logged_in(&self, at: Logged<'_>, cmd: &mut Command) -> Ran {
+        let Logged {
+            step,
+            log,
+            stream,
+            stop,
+            push,
+            arrivals,
+        } = at;
         let mut file = match crate::durable::open_append(&log, true) {
             Ok(f) => f,
             Err(e) => {
@@ -682,12 +983,12 @@ impl Real {
             return not_started();
         }
         cmd.stdin(Stdio::null());
-        // The publish step's lines are always read as they arrive: when each came is the only
-        // split of the engine's time (`publish-line` records, A1), whether or not they echo.
-        let arrivals = (step == Step::Publish && !self.scratch_logs)
+        // The publish's lines are always read as they arrive: when each came is the only split
+        // of the engine's time (`publish-line` records, A1), whether or not they echo.
+        let arrivals = (arrivals && !self.scratch_logs)
             .then(|| crate::durable::open_append(&self.side_log(step, "arrivals"), true).ok())
             .flatten();
-        let pipe = if stream || arrivals.is_some() {
+        let pipe = if stream || arrivals.is_some() || push.is_some() {
             let made = std::io::pipe().and_then(|(r, w)| Ok((r, w.try_clone()?, w)));
             match made {
                 Ok((reader, out, err)) => {
@@ -713,11 +1014,16 @@ impl Real {
             None
         };
         let started_at_unix_ms = now_ms();
-        let spawned = self.spawn_forwarded(cmd);
+        let spawned = self.spawn_stoppable(step, cmd, stop);
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
         let (mut child, forwarded) = match spawned {
             Ok(spawned) => spawned,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return not_started(),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                return Ran {
+                    code: 130,
+                    detail: vec![e.to_string()],
+                };
+            }
             Err(e) => {
                 let _ = writeln!(file, "spawn: {e}");
                 return Ran {
@@ -730,6 +1036,7 @@ impl Real {
             let mut log = file.try_clone().ok()?;
             let (done, finished) = std::sync::mpsc::channel::<()>();
             let mut arrivals = arrivals.map(Arrivals::new);
+            let mut push = push;
             std::thread::spawn(move || {
                 let mut reader = reader;
                 let mut buf = [0u8; 8192];
@@ -743,6 +1050,9 @@ impl Real {
                     }
                     if let Some(arrivals) = &mut arrivals {
                         arrivals.read(&buf[..n]);
+                    }
+                    if let Some(push) = &mut push {
+                        push.read(&buf[..n]);
                     }
                 }
                 let _ = done.send(());
@@ -770,8 +1080,8 @@ impl Real {
         }
     }
 
-    fn note_child(&self, pid: u32) -> Option<PathBuf> {
-        (!self.scratch_logs).then(|| note_child_in(&self.release, self.step, pid))
+    fn note_child(&self, step: Step, pid: u32) -> Option<PathBuf> {
+        (!self.scratch_logs).then(|| note_child_in(&self.release, step, pid))
     }
 
     fn step_log(&self, step: Step) -> PathBuf {
@@ -1564,27 +1874,53 @@ impl Real {
             })
     }
 
-    fn stage_run(
-        &mut self,
+    /// `pub stage` of R (to the staging tier, or `--dry-run` without its push) on an engine
+    /// its caller synced, with this run's scanner tools, then the engine synced again. In step
+    /// 4's graph (`branch`: its stop and the export's share of the pool as `CARGO_BUILD_JOBS`)
+    /// it logs as the export branch, its push begun read from its lines ([`PushWatch`]), and an
+    /// engine that cannot be synced after it is COULD NOT RUN, no red of R; outside it (step 7's
+    /// stage again) it logs as `step`'s child. A local check must leave a complete passing
+    /// attestation of R.
+    fn export_run(
+        &self,
         c: &Candidate,
         prover: &Prover,
         target: StageTarget,
+        step: Step,
+        branch: Option<(&BranchStop, Option<u32>)>,
     ) -> Result<Ran, Refusal> {
-        // The export's content guards run once, in the stage below; `verify`'s dev set
-        // (`export-scan`) holds each change to them before it lands. The engine is synced
-        // first, so the scanner tools the test compile prepares are its current ones.
-        self.engine_sync()?;
-        // Compile the required test graph and check source closure before public staging or product builds. Use the
-        // same checkout, driver and scrubbed environment as verify below, retaining its
-        // normal target cache rather than creating another cold qualification tree.
-        self.compile_tests(c, prover)?;
-        self.compat_check(c)?;
-        self.engine_sync()?;
-        let (mut cmd, handed) = self.stage_command(&c.commit, prover, target)?;
-        if let Ok(mut file) = crate::durable::open_append(&self.step_log(self.step), true) {
+        let (cmd, handed) = self.stage_command(&c.commit, prover, target)?;
+        let mut cmd = self.with_scanners(cmd);
+        if let Some((_, Some(jobs))) = branch {
+            cmd.env("CARGO_BUILD_JOBS", jobs.to_string());
+        }
+        let log = match branch {
+            Some(_) => self.side_log(step, Branch::Export.name()),
+            None => self.step_log(step),
+        };
+        if let Ok(mut file) = crate::durable::open_append(&log, true) {
             let _ = writeln!(file, "{handed}");
         }
-        let ran = self.logged(self.step, &mut cmd);
+        let push = branch
+            .filter(|_| target == StageTarget::Remote && !self.scratch_logs)
+            .map(|(stop, _)| PushWatch {
+                stop: stop.clone(),
+                transcript: self.transcript(),
+                line: Vec::new(),
+                seen: false,
+            });
+        let ran = self.logged_in(
+            Logged {
+                step,
+                log,
+                stream: self.verbose,
+                // The engine's KeyboardInterrupt ends its gate's whole tree.
+                stop: branch.map(|(stop, _)| (stop, interrupt::SIGINT)),
+                push,
+                arrivals: false,
+            },
+            &mut cmd,
+        );
         if target == StageTarget::Local && ran.code == 0 {
             let path = self.repo.join("publish/.out/attestation.json");
             let qualified = crate::gates::read_bounded_string(&path, 16 << 20)
@@ -1599,7 +1935,10 @@ impl Real {
                 ));
             }
         }
-        self.engine_sync()?;
+        self.engine_sync().map_err(|refusal| match branch {
+            Some(_) => refusal.could_not_run(),
+            None => refusal,
+        })?;
         Ok(ran)
     }
 
@@ -1610,89 +1949,6 @@ impl Real {
                 &self.repo, &self.home, i64::try_from(now()).unwrap_or(i64::MAX), self.prepared_source_helper.as_deref(),
                 self.prerequisites.as_ref().ok_or_else(|| prerequisite_refusal("publication prerequisites were not acquired".into()))?.clone(),
             ).map_err(|why| Refusal::new(format!("source signing preflight: {why}"), "restore the source signing tools and the complete registered release ring, then retry"))?);
-        }
-        Ok(())
-    }
-
-    fn compile_tests(&mut self, c: &Candidate, prover: &Prover) -> Result<(), Refusal> {
-        self.scanner_tools = None;
-        let refuse_tree = || {
-            Refusal::new(
-                "the clone changed before or during required test compilation",
-                format!("restore the clean candidate tree, then {RELEASE_COMMAND}"),
-            )
-        };
-        if let Some(off) = self.off_tree(&c.commit) {
-            return Err(refuse_tree().detail(off));
-        }
-        self.prepare_scanner_tools(prover)?;
-        self.prepare_source_signing()?;
-        let mut cmd = self.child(prover.bin.join("targo"), Some(prover));
-        cmd.args([
-            "--unverified",
-            "run",
-            "-q",
-            "-p",
-            "aterm-verify",
-            "--",
-            "test",
-            "--all",
-            "--compile-only",
-            "--as-release",
-        ]);
-        let ran = self.logged(self.step, &mut cmd);
-        if ran.code != 0 {
-            return Err(Refusal::new(
-                format!("required workspace test compilation failed (exit {}); this attempt starts no downstream product build", ran.code),
-                format!("fix the compilation failure: {}", crate::release::fix_remedy(&c.commit)),
-            ).detail(ran.detail));
-        }
-        self.source_closure(prover, &c.commit, |cmd| self.logged(self.step, cmd))?;
-        if let Some(off) = self.off_tree(&c.commit) {
-            return Err(refuse_tree().detail(off));
-        }
-        Ok(())
-    }
-
-    fn source_closure(
-        &self,
-        prover: &Prover,
-        head: &str,
-        run: impl FnOnce(&mut Command) -> Ran,
-    ) -> Result<(), Refusal> {
-        // The models package on the workspace's feature graph, which the verify compile
-        // above built: its feature unification around `test` (the pinned driver bypasses
-        // atpkg's shim, so nothing adds it here) resolves `-p aterm-models` as `--workspace`
-        // was, so no dependency is compiled again.
-        let mut cmd = self.child(prover.bin.join("targo"), Some(prover));
-        cmd.env("ATERM_SPEC_CHECKERS", "1");
-        // Match the verifier's cache, and the physical target every verify child is handed,
-        // after `child` has removed the caller's Cargo layout overrides: a test compiled here
-        // through the clone's `target -> target.noindex` link would spell its
-        // `CARGO_BIN_EXE_*` unlike verify's. Its `--config` goes before the verb, beside the
-        // test graph's: one after the verb would replace those before it.
-        let (target, layout) = verify_layout(&self.repo);
-        cmd.env("CARGO_TARGET_DIR", &target);
-        if let Some(layout) = layout {
-            cmd.arg("--config").arg(layout);
-        }
-        cmd.args(aterm_toolchain::build_cache::with_test_graph(
-            &[
-                "--unverified",
-                "test",
-                "-p",
-                "aterm-models",
-                "--test",
-                "spec_xref_closure",
-            ]
-            .map(String::from),
-        ));
-        let ran = run(&mut cmd);
-        if ran.code != 0 {
-            return Err(Refusal::new(
-                format!("required source-to-spec closure failed (exit {}); this attempt starts no downstream product build", ran.code),
-                format!("fix the source/model bindings: {}", crate::release::fix_remedy(head)),
-            ).detail(ran.detail));
         }
         Ok(())
     }
@@ -1734,44 +1990,6 @@ impl Real {
         }
         let handed = hand_transforms_cutter(&mut cmd, commit);
         Ok((cmd, handed))
-    }
-
-    fn compat_check(&self, c: &Candidate) -> Result<(), Refusal> {
-        let log = self.side_log(self.step, "x86_64-check");
-        match crate::buildplan::compat_check(&self.repo, &c.commit, &log) {
-            Ok(note) => {
-                if let Ok(mut file) = crate::durable::open_append(&self.step_log(self.step), true) {
-                    let _ = writeln!(file, "{note}");
-                }
-                Ok(())
-            }
-            Err(why) => {
-                let errors: Vec<String> = why
-                    .lines()
-                    .filter(|l| l.starts_with("error"))
-                    .take(8)
-                    .map(str::to_string)
-                    .collect();
-                Err(Refusal::new(
-                    format!(
-                        "stable does not compile {}'s x86_64 compat slice — nothing was staged \
-                         (log: {})",
-                        short(&c.commit),
-                        log.display()
-                    ),
-                    format!(
-                        "fix it (rustup run stable cargo check --release --target \
-                         x86_64-apple-darwin -p aterm names it): {}",
-                        crate::release::fix_remedy(&c.commit)
-                    ),
-                )
-                .detail(if errors.is_empty() {
-                    why.lines().take(8).map(str::to_string).collect()
-                } else {
-                    errors
-                }))
-            }
-        }
     }
 
     fn captured(
@@ -1837,11 +2055,218 @@ impl Real {
         })
     }
 
+    /// `verify release` of `run`'s half in the clone at R ([`Branches::verify`]): the tree's in
+    /// step 4's tree branch, the bundle's in step 5 on `artifact`, each into its own log and
+    /// events; its records kept only where R's tree stayed clean and the seal held throughout.
+    fn verify_half(
+        &self,
+        c: &Candidate,
+        prover: &Prover,
+        run: &crate::check_record::VerifyRun,
+        artifact: Option<&Artifact>,
+        stop: &BranchStop,
+    ) -> Result<Ran, Refusal> {
+        let r = short(&c.commit).to_string();
+        let fix = format!(
+            "put the clone back at {r} and clean (git -C {} status), then {RELEASE_COMMAND}",
+            self.repo.display()
+        );
+        if let Some(off) = self.off_tree(&c.commit) {
+            return Err(Refusal::new(
+                format!("the clone is not at {r}'s tree and clean, so `verify release` would not judge it"),
+                fix,
+            )
+            .detail(off)
+            .could_not_run());
+        }
+        let unsealed = |error: String| {
+            Refusal::new(
+                format!("{error} — nothing was recorded"),
+                "restore the release build inputs and retry",
+            )
+            .could_not_run()
+        };
+        let seal = (self.build_inputs)().map_err(unsealed)?;
+        let tree = self
+            .git_out(&["rev-parse", &format!("{}^{{tree}}", c.commit)])
+            .ok_or_else(|| {
+                Refusal::new(
+                    format!("git cannot name {r}'s tree — nothing ran"),
+                    fix.clone(),
+                )
+                .could_not_run()
+            })?;
+        let (step, log) = match run.half {
+            crate::check_record::Half::Tree => (
+                Step::Qualify,
+                self.side_log(Step::Qualify, Branch::Tree.name()),
+            ),
+            crate::check_record::Half::Bundle => (Step::Bundle, self.step_log(Step::Bundle)),
+        };
+        let side = |what: &str| log.with_extension(what);
+        let cannot = |path: &Path, e: std::io::Error| {
+            Refusal::new(
+                format!("write {}: {e} — nothing ran", path.display()),
+                format!("check {}, then {RELEASE_COMMAND}", self.logs.display()),
+            )
+            .could_not_run()
+        };
+        let mut cmd = self.child(prover.bin.join("targo"), Some(prover));
+        self.hand_pool(&mut cmd, true)?;
+        cmd.args(crate::release::VERIFY_ARGS).arg(run.half.flag());
+        if run.strict_subset() {
+            cmd.arg("--checks").arg(run.checks.join(","));
+        }
+        if !run.passed_binaries.is_empty() {
+            let path = side("passed-binaries");
+            let mut text = String::new();
+            for (spec, sha256) in &run.passed_binaries {
+                text.push_str(sha256);
+                text.push(' ');
+                text.push_str(spec);
+                text.push('\n');
+            }
+            crate::durable::write_atomic_durable(&path, text.as_bytes(), 0o600)
+                .map_err(|e| cannot(&path, e))?;
+            cmd.arg("--passed-binaries").arg(&path);
+        }
+        // The records are read from verify's own events file, which no child and no other writer
+        // shares, never from its output; it starts empty, so it holds this run's alone.
+        let events = side("events");
+        crate::durable::write_atomic_durable(&events, b"", 0o600)
+            .map_err(|e| cannot(&events, e))?;
+        cmd.arg("--events").arg(&events);
+        // `--app` goes with the check that reads it, and verify refuses it beside none.
+        let artifact = artifact.filter(|_| run.half == crate::check_record::Half::Bundle);
+        if run.reads_the_bundle() {
+            let Some(artifact) = artifact else {
+                return Err(Refusal::new(
+                    "`verify release` would run measure with no bundle to judge — nothing ran",
+                    format!("{RELEASE_COMMAND} (step 4 builds it)"),
+                )
+                .could_not_run());
+            };
+            cmd.arg("--app").arg(&artifact.app);
+        }
+        let root = self.release.join(crate::check_record::DIR);
+        let run_id = self
+            .logs
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let facts = crate::check_record::RunFacts {
+            commit: &c.commit,
+            tree: &tree,
+            seal: &seal,
+            executable: artifact.map(|a| a.macho_sha256.as_str()),
+            log: &log,
+            run: &run_id,
+            asked: &run.checks,
+        };
+        // From here until every FAIL it shows is kept, the run reads as a FAIL of R's tree.
+        crate::check_record::begin_run(&root, &facts).map_err(|e| {
+            Refusal::new(
+                format!("cannot record that `verify release` begins: {e} — nothing ran"),
+                format!("fix what it names, then {RELEASE_COMMAND}"),
+            )
+            .could_not_run()
+        })?;
+        let mut ran = self.logged_in(
+            Logged {
+                step,
+                log: log.clone(),
+                // The bundle half runs alone; the tree's output would interleave the build's.
+                stream: run.half == crate::check_record::Half::Bundle || self.verbose,
+                stop: Some((stop, interrupt::SIGTERM)),
+                push: None,
+                arrivals: false,
+            },
+            &mut cmd,
+        );
+        // Records are kept only for R's tree, clean throughout, under the seal the run began
+        // with: either moving makes the run COULD NOT RUN, and it keeps nothing.
+        let abandoned = |refusal: Refusal| match crate::check_record::abandon_run(&root, &facts) {
+            Ok(()) => refusal,
+            Err(e) => refusal.detail([format!("its begun record stays: {e}")]),
+        };
+        if let Some(off) = self.off_tree(&c.commit) {
+            return Err(abandoned(
+                Refusal::new(
+                    format!(
+                        "the clone moved during `verify release`, so its records are not {r}'s — \
+                         nothing was recorded"
+                    ),
+                    fix,
+                )
+                .detail(off)
+                .could_not_run(),
+            ));
+        }
+        match (self.build_inputs)() {
+            Ok(now) if now == seal => {}
+            Ok(_) => {
+                return Err(abandoned(unsealed(
+                    "compiler or SDK bytes changed during release verification".into(),
+                )));
+            }
+            Err(e) => return Err(abandoned(unsealed(e))),
+        }
+        let log_sha256 = crate::artifact::file_sha256(&log).unwrap_or_else(|e| {
+            ran.detail.push(format!("its log could not be hashed: {e}"));
+            String::new()
+        });
+        let read = crate::check_record::events(&events)
+            .map_err(|e| format!("read {}: {e}", events.display()));
+        let written = crate::check_record::write_run(
+            &root,
+            &facts,
+            crate::check_record::RunEnd {
+                exit: ran.code,
+                log_sha256: &log_sha256,
+                events: read.as_ref().map_err(String::as_str),
+            },
+        );
+        match written {
+            Ok(lines) => ran
+                .detail
+                .extend(lines.into_iter().map(|line| format!("record: {line}"))),
+            Err(e) => ran
+                .detail
+                .push(format!("its records were not all written: {e}")),
+        }
+        Ok(ran)
+    }
+
+    /// The build branch: `ship build` of R under `reserved` (when `work.bundle`), then the
+    /// release's own handoff fixtures (when `work.fixtures`) — after the slices, so the
+    /// generator's compile never adds to their memory peak — each into the branch's log.
+    fn build_branch(
+        &self,
+        c: &Candidate,
+        reserved: &Reservation,
+        prover: &Prover,
+        work: BuildWork,
+        stop: &BranchStop,
+    ) -> Built {
+        let log = self.side_log(Step::Qualify, Branch::Build.name());
+        let artifact = work
+            .bundle
+            .then(|| self.build_run(c, reserved, prover, &log, stop));
+        let built = artifact.as_ref().is_none_or(Result::is_ok);
+        let fixtures = (work.fixtures && built && !stop.fired()).then(|| {
+            let log = self.side_log(Step::Qualify, "build-fixtures");
+            self.stage_fixtures_run(Step::Qualify, c, reserved, prover, &log)
+        });
+        Built { artifact, fixtures }
+    }
+
     fn build_run(
         &self,
         c: &Candidate,
         reserved: &Reservation,
         prover: &Prover,
+        log: &Path,
+        stop: &BranchStop,
     ) -> Result<Artifact, Refusal> {
         let mut cmd = self
             .cut_command(&["build".to_string()], prover)
@@ -1851,7 +2276,18 @@ impl Real {
                     format!("run {RELEASE_COMMAND} again from the clone (nothing was claimed)"),
                 )
             })?;
-        let ran = self.logged(Step::Build, &mut cmd);
+        self.hand_pool(&mut cmd, false)?;
+        let ran = self.logged_in(
+            Logged {
+                step: Step::Qualify,
+                log: log.to_path_buf(),
+                stream: self.verbose,
+                stop: Some((stop, interrupt::SIGTERM)),
+                push: None,
+                arrivals: false,
+            },
+            &mut cmd,
+        );
         if ran.code != 0 {
             return Err(Refusal::new(
                 format!("the build did not finish (ship build exited {})", ran.code),
@@ -2147,6 +2583,80 @@ fn now_ms() -> Option<u64> {
         .and_then(|d| u64::try_from(d.as_millis()).ok())
 }
 
+/// How [`Real::logged_in`] runs a step's child.
+struct Logged<'a> {
+    step: Step,
+    log: PathBuf,
+    stream: bool,
+    /// A qualify branch's stop, and the signal it sends the child's group.
+    stop: Option<(&'a BranchStop, i32)>,
+    /// The export's watch for its staging push.
+    push: Option<PushWatch>,
+    /// Its lines' arrivals are kept as `publish-line` records ([`Arrivals`]): the engine's
+    /// publish.
+    arrivals: bool,
+}
+
+/// The engine's line that its export's public-clone check passed: what `pub stage` prints right
+/// before it pushes the snapshot to the staging tier (`swap_staging_main`), with nothing between.
+const PUSH_BEGINS: &str = "== PASSED";
+const PUSH_BEGINS_AFTER: &str = " under anonymous git: ";
+
+/// Reads an export's output for the line its staging push begins after ([`PUSH_BEGINS`]): once
+/// it comes, the branch's stop can no longer end it ([`BranchStop::push`]), and the release's
+/// transcript says so (a `qualify-branch` `push-began` event). The engine runs unbuffered, so
+/// the line comes as it is printed.
+struct PushWatch {
+    stop: BranchStop,
+    transcript: PathBuf,
+    line: Vec<u8>,
+    seen: bool,
+}
+
+impl PushWatch {
+    fn read(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if b != b'\n' {
+                if self.line.len() < 4096 {
+                    self.line.push(b);
+                }
+                continue;
+            }
+            let line = String::from_utf8_lossy(&self.line).into_owned();
+            self.line.clear();
+            if !self.seen && line.starts_with(PUSH_BEGINS) && line.contains(PUSH_BEGINS_AFTER) {
+                self.seen = true;
+                let (stop, transcript) = (&self.stop, &self.transcript);
+                // The push and its event in the graph's one order: no red is told between them.
+                stop.in_order(|| {
+                    if stop.push() {
+                        let at = now();
+                        say_to(
+                            transcript,
+                            &format!(
+                                "release-event: {{\"schema\":1,\"event\":\"qualify-branch\",\
+                                 \"branch\":\"export\",\"phase\":\"push-began\",\
+                                 \"at_unix_s\":{at},\"seconds\":0}}"
+                            ),
+                        );
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Say `line` on this process's terminal and in the run's transcript, in one write each.
+fn say_to(transcript: &Path, line: &str) {
+    let whole = format!("{line}\n");
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(whole.as_bytes());
+    let _ = out.flush();
+    if let Ok(mut f) = crate::durable::open_append(transcript, true) {
+        let _ = f.write_all(whole.as_bytes());
+    }
+}
+
 /// When each line of a step's output arrived, as `publish-line` records in a side log: the
 /// engine stamps none of its own, and promote's sections reach the log only once it ends.
 struct Arrivals {
@@ -2237,6 +2747,8 @@ fn step_child_event(
                 "reaped-child-and-waited-descendants".into(),
             ),
             ("observed_s".to_string(), u.cpu.as_secs_f64().into()),
+            ("user_s".to_string(), u.user.as_secs_f64().into()),
+            ("system_s".to_string(), u.system.as_secs_f64().into()),
         ]))
     });
     let peak_bytes = usage
@@ -2306,7 +2818,8 @@ fn scrub_fixture_command(cmd: &mut Command) {
 /// Remove from `cmd` each of `inherited` (the names of this process's environment) that a step
 /// runs without: what [`clears`] and [`launcher_env`] name, the cutter this process may have
 /// been handed ([`RELEASE_CUTTER_ENV`], [`RELEASE_CUTTER_SINCE_ENV`]), which a child has only
-/// from [`hand_this_cutter`], the build-inputs seal it may have been handed
+/// from [`hand_this_cutter`], step 7's gate ([`PUBLISH_GATE_ENV`]), which only the source's
+/// `pub publish` is handed ([`Branches::source`]), the build-inputs seal it may have been handed
 /// ([`crate::build_inputs::SEAL_ENV`]), which a child has only from [`hand_inputs_seal`], and a
 /// disk claim it may have been named ([`aterm_capacity::DISK_COVER_ENV`]), which a child has
 /// only from this release's own claim ([`Real::scrubbed`]).
@@ -2317,6 +2830,7 @@ fn scrub_names(cmd: &mut Command, inherited: impl IntoIterator<Item = std::ffi::
                 || launcher_env(name)
                 || name == RELEASE_CUTTER_ENV
                 || name == RELEASE_CUTTER_SINCE_ENV
+                || name == PUBLISH_GATE_ENV
                 || name == crate::build_inputs::SEAL_ENV
                 || name == aterm_capacity::DISK_COVER_ENV)
         {
@@ -2353,19 +2867,6 @@ fn fixture_root(repo: &Path) -> Result<PathBuf, Refusal> {
             )
             .could_not_run()
         })
-}
-
-fn joined(
-    handle: std::thread::ScopedJoinHandle<'_, Result<String, Refusal>>,
-    what: &str,
-) -> Result<String, Refusal> {
-    handle.join().unwrap_or_else(|_| {
-        Err(Refusal::new(
-            format!("{what} stopped unexpectedly (its thread panicked)"),
-            format!("read its log, then run {RELEASE_COMMAND} again to resume"),
-        )
-        .could_not_run())
-    })
 }
 
 fn cut_refusal(gate: &str, why: &str) -> Refusal {
@@ -3573,12 +4074,7 @@ impl Backend for Real {
     }
 
     fn say(&mut self, line: &str) {
-        let mut out = std::io::stdout().lock();
-        let _ = writeln!(out, "{line}");
-        let _ = out.flush();
-        if let Ok(mut f) = crate::durable::open_append(&self.transcript(), true) {
-            let _ = writeln!(f, "{line}");
-        }
+        say_to(&self.transcript(), line);
     }
 
     fn interrupted(&mut self) -> Option<i32> {
@@ -3712,7 +4208,7 @@ impl Backend for Real {
         crate::durable::read_text(&self.state.join("steps.tsv")).unwrap_or_default()
     }
 
-    fn record_time(&mut self, version: &str, step: Step, secs: u64) {
+    fn record_time(&mut self, version: &str, row: &str, secs: u64) {
         let _ = std::fs::create_dir_all(&self.state);
         let mut open = std::fs::OpenOptions::new();
         open.create(true).append(true);
@@ -3724,7 +4220,7 @@ impl Backend for Real {
         if let Ok(mut f) = open.open(self.state.join("steps.tsv"))
             && f.metadata().is_ok_and(|m| m.is_file())
         {
-            let _ = writeln!(f, "{}\t{version}\t{}\t{secs}", now(), step.name());
+            let _ = writeln!(f, "{}\t{version}\t{row}\t{secs}", now());
         }
     }
 
@@ -4642,16 +5138,6 @@ impl Backend for Real {
         found
     }
 
-    fn stage_fixtures(
-        &mut self,
-        c: &Candidate,
-        reserved: &Reservation,
-        prover: &Prover,
-    ) -> Result<String, Refusal> {
-        let log = self.step_log(self.step);
-        self.stage_fixtures_run(self.step, c, reserved, prover, &log)
-    }
-
     fn land_fixtures(
         &mut self,
         c: &Candidate,
@@ -4684,7 +5170,8 @@ impl Backend for Real {
         let staged = match crate::fixtures::staged(&root, &pins) {
             Some(staged) => staged,
             None => {
-                words.push(self.stage_fixtures(c, reserved, prover)?);
+                let log = self.step_log(self.step);
+                words.push(self.stage_fixtures_run(self.step, c, reserved, prover, &log)?);
                 crate::fixtures::staged(&root, &pins).ok_or_else(|| {
                     Refusal::new(
                         format!(
@@ -4758,206 +5245,71 @@ impl Backend for Real {
         })
     }
 
-    fn build(
-        &mut self,
-        c: &Candidate,
-        reserved: &Reservation,
-        prover: &Prover,
-        fixtures: bool,
-    ) -> Built {
-        let fixtures_log = self.side_log(Step::Build, "fixtures");
-        let this = &*self;
-        std::thread::scope(|s| {
-            let staged = if fixtures {
-                let log = &fixtures_log;
-                Some(
-                    s.spawn(move || this.stage_fixtures_run(Step::Build, c, reserved, prover, log)),
-                )
-            } else {
-                None
-            };
-            let artifact = this.build_run(c, reserved, prover);
-            Built {
-                artifact,
-                fixtures: staged.map(|h| joined(h, "the handoff fixture generator")),
-            }
-        })
-    }
-
-    fn verify(
-        &mut self,
-        c: &Candidate,
-        prover: &Prover,
-        artifact: &Artifact,
-        run: &crate::check_record::VerifyRun,
-    ) -> Result<Ran, Refusal> {
-        let r = short(&c.commit).to_string();
-        let fix = format!(
-            "put the clone back at {r} and clean (git -C {} status), then {RELEASE_COMMAND}",
-            self.repo.display()
-        );
-        if let Some(off) = self.off_tree(&c.commit) {
-            return Err(Refusal::new(
-                format!("the clone is not at {r}'s tree and clean, so `verify release` would not judge it"),
-                fix,
-            )
-            .detail(off)
-            .could_not_run());
-        }
-        let unsealed = |error: String| {
-            Refusal::new(
-                format!("{error} — nothing was recorded"),
-                "restore the release build inputs and retry",
-            )
-            .could_not_run()
-        };
-        let seal = (self.build_inputs)().map_err(unsealed)?;
-        let tree = self
-            .git_out(&["rev-parse", &format!("{}^{{tree}}", c.commit)])
-            .ok_or_else(|| {
-                Refusal::new(
-                    format!("git cannot name {r}'s tree — nothing ran"),
-                    fix.clone(),
-                )
-                .could_not_run()
-            })?;
-        let side = |what: &str| {
-            self.logs.join(format!(
-                "{:02}-{}.{what}",
-                Step::Verify.number(),
-                Step::Verify.name()
-            ))
-        };
-        let cannot = |path: &Path, e: std::io::Error| {
-            Refusal::new(
-                format!("write {}: {e} — nothing ran", path.display()),
-                format!("check {}, then {RELEASE_COMMAND}", self.logs.display()),
-            )
-            .could_not_run()
-        };
-        let mut cmd = self.child(prover.bin.join("targo"), Some(prover));
-        cmd.args(crate::release::VERIFY_ARGS);
-        if run.strict_subset() {
-            cmd.arg("--checks").arg(run.checks.join(","));
-        }
-        if !run.passed_binaries.is_empty() {
-            let path = side("passed-binaries");
-            let mut text = String::new();
-            for (spec, sha256) in &run.passed_binaries {
-                text.push_str(sha256);
-                text.push(' ');
-                text.push_str(spec);
-                text.push('\n');
-            }
-            crate::durable::write_atomic_durable(&path, text.as_bytes(), 0o600)
-                .map_err(|e| cannot(&path, e))?;
-            cmd.arg("--passed-binaries").arg(&path);
-        }
-        // The records are read from verify's own events file, which no child and no other writer
-        // shares, never from its output; it starts empty, so it holds this run's alone.
-        let events = side("events");
-        crate::durable::write_atomic_durable(&events, b"", 0o600)
-            .map_err(|e| cannot(&events, e))?;
-        cmd.arg("--events").arg(&events);
-        // `--app` goes with the check that reads it, and verify refuses it beside none.
-        if run.reads_the_bundle() {
-            cmd.arg("--app").arg(&artifact.app);
-        }
-        let log = self.step_log(Step::Verify);
-        let root = self.release.join(crate::check_record::DIR);
-        let run_id = self
-            .logs
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let facts = crate::check_record::RunFacts {
-            commit: &c.commit,
-            tree: &tree,
-            seal: &seal,
-            executable: &artifact.macho_sha256,
-            log: &log,
-            run: &run_id,
-            asked: &run.checks,
-        };
-        // From here until every FAIL it shows is kept, the run reads as a FAIL of R's tree.
-        crate::check_record::begin_run(&root, &facts).map_err(|e| {
-            Refusal::new(
-                format!("cannot record that `verify release` begins: {e} — nothing ran"),
-                format!("fix what it names, then {RELEASE_COMMAND}"),
-            )
-            .could_not_run()
-        })?;
-        let mut ran = self.logged_to(Step::Verify, &mut cmd, true);
-        // Records are kept only for R's tree, clean throughout, under the seal the run began
-        // with: either moving makes the run COULD NOT RUN, and it keeps nothing.
-        let abandoned = |refusal: Refusal| match crate::check_record::abandon_run(&root, &facts) {
-            Ok(()) => refusal,
-            Err(e) => refusal.detail([format!("its begun record stays: {e}")]),
-        };
-        if let Some(off) = self.off_tree(&c.commit) {
-            return Err(abandoned(
-                Refusal::new(
-                    format!(
-                        "the clone moved during `verify release`, so its records are not {r}'s — \
-                         nothing was recorded"
-                    ),
-                    fix,
-                )
-                .detail(off)
-                .could_not_run(),
-            ));
-        }
-        match (self.build_inputs)() {
-            Ok(now) if now == seal => {}
-            Ok(_) => {
-                return Err(abandoned(unsealed(
-                    "compiler or SDK bytes changed during release verification".into(),
-                )));
-            }
-            Err(e) => return Err(abandoned(unsealed(e))),
-        }
-        let log_sha256 = crate::artifact::file_sha256(&log).unwrap_or_else(|e| {
-            ran.detail.push(format!("its log could not be hashed: {e}"));
-            String::new()
-        });
-        let read = crate::check_record::events(&events)
-            .map_err(|e| format!("read {}: {e}", events.display()));
-        let written = crate::check_record::write_run(
-            &root,
-            &facts,
-            crate::check_record::RunEnd {
-                exit: ran.code,
-                log_sha256: &log_sha256,
-                events: read.as_ref().map_err(String::as_str),
-            },
-        );
-        match written {
-            Ok(lines) => ran
-                .detail
-                .extend(lines.into_iter().map(|line| format!("record: {line}"))),
-            Err(e) => ran
-                .detail
-                .push(format!("its records were not all written: {e}")),
-        }
-        Ok(ran)
-    }
-
     fn stage(
         &mut self,
         c: &Candidate,
         prover: &Prover,
         target: StageTarget,
     ) -> Result<Ran, Refusal> {
-        self.stage_run(c, prover, target)
-    }
-
-    fn publish(&mut self, prover: &Prover) -> Result<Ran, Refusal> {
         self.scanner_tools = None;
         self.engine_sync()?;
         self.prepare_scanner_tools(prover)?;
-        self.prepare_source_signing()?;
-        let mut cmd = self.publish_command(prover)?;
-        Ok(self.logged(Step::Publish, &mut cmd))
+        self.export_run(c, prover, target, Step::Publish, None)
+    }
+
+    fn qualify_begin(&mut self, prover: &Prover, export: bool) -> Result<String, Refusal> {
+        self.pool = None;
+        if export {
+            // The export's engine and its scanner tools are made ready here, before any branch
+            // starts, so every branch runs on `&self`.
+            self.scanner_tools = None;
+            self.engine_sync()?;
+            self.prepare_scanner_tools(prover)?;
+        }
+        let path = self.logs.join("qualify.jobs");
+        let pool = qualify_pool(&path, export, |need| {
+            aterm_capacity::admit(need, aterm_capacity::Admit::Wait)
+        })?;
+        let words = format!(
+            "{} cores in one Release claim, a jobserver of as many slots ({}) every branch's \
+             children draw from{}",
+            pool.jobs.slots(),
+            pool.jobs.path().display(),
+            if pool.export > 0 {
+                format!(
+                    ", {} of them the export's while it runs (CARGO_BUILD_JOBS={})",
+                    pool.export, pool.export
+                )
+            } else {
+                String::new()
+            }
+        );
+        self.pool = Some(pool);
+        Ok(words)
+    }
+
+    fn qualify_end(&mut self) {
+        self.pool = None;
+    }
+
+    fn branches(&mut self) -> Box<dyn Branches + '_> {
+        let real = &*self;
+        let export = real.pool.as_ref().map_or_else(Vec::new, |pool| {
+            (0..pool.export)
+                .map_while(|_| pool.jobs.try_acquire().ok().flatten())
+                .collect()
+        });
+        Box::new(RealBranches {
+            real,
+            export: std::sync::Mutex::new(export),
+        })
+    }
+
+    fn publish_begin(&mut self, prover: &Prover) -> Result<(), Refusal> {
+        self.scanner_tools = None;
+        self.engine_sync()?;
+        self.prepare_scanner_tools(prover)?;
+        self.prepare_source_signing()
     }
 
     fn source_publication(&mut self, c: &Candidate) -> Result<(), Refusal> {
@@ -4983,6 +5335,9 @@ impl Backend for Real {
         ))
     }
 
+    fn discard_signed(&mut self, version: &str, build: u64) -> Vec<String> {
+        crate::publish::discard_signed(&self.repo.join("dist"), version, build)
+    }
     fn cut(&mut self, args: &[String], prover: &Prover) -> Ran {
         match self.cut_command(args, prover) {
             Ok(mut cmd) => self.logged(Step::Cut, &mut cmd),
@@ -5442,6 +5797,79 @@ mod public_reads_http_tests;
 
 #[cfg(test)]
 mod tests {
+    /// THE QUALIFY POOL GOES ONLY TO THE BRANCH CHILDREN THAT ADOPT IT: with step 4's pool made
+    /// (one claim of every core, a quarter of them the export's), `ship build` is handed the whole
+    /// pool and the tree's verify the pool less the export's share, each as
+    /// `ATERM_RELEASE_POOL=<slots>:<fifo>` with `<fifo>` the jobserver's own path of the FIFO the
+    /// release asked for, spelled the same for both whatever spelling the release asked by; a
+    /// plain step child (an engine's, the fixtures') gets none, and with no pool nothing is
+    /// handed. NEGATIVE CONTROLS: putting the pool in every child's scrubbed environment hands
+    /// the plain child it, handing verify the whole pool gives it every slot, the export's
+    /// included, and handing verify the FIFO by the path the release asked for hands it a second
+    /// spelling of the FIFO the build is handed.
+    #[test]
+    fn the_qualify_pool_goes_only_to_the_branch_children_that_adopt_it() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let repo = std::env::current_dir().unwrap();
+        let mut real = Real::new(&repo, None, true, false).unwrap();
+        // `<slots>:<fifo>`, each exactly as handed.
+        let pool_of = |cmd: &Command| {
+            let value = cmd
+                .get_envs()
+                .find(|(k, _)| *k == aterm_capacity::POOL_ENV)
+                .and_then(|(_, v)| v)?;
+            let value = value.to_str().expect("this test's pool value is UTF-8");
+            let (slots, fifo) = value.split_once(':').expect("<slots>:<fifo>");
+            Some((slots.to_owned(), std::ffi::OsString::from(fifo)))
+        };
+        let mut none = command("verify");
+        real.hand_pool(&mut none, true).unwrap();
+        assert_eq!(pool_of(&none), None, "no pool, nothing handed");
+
+        // Asked for by a spelling no child is handed: a `.` component, and a doubled separator
+        // too where `TMPDIR` holds one (as `$TMPDIR/.ubd/` does where `$TMPDIR` ends in a
+        // separator).
+        let path = dir.path().join(".").join("qualify.jobs");
+        let pool = qualify_pool(&path, true, |need| {
+            aterm_capacity::admit(need, aterm_capacity::Admit::Now)
+        })
+        .unwrap();
+        let (slots, export) = (pool.jobs.slots(), pool.export);
+        assert_eq!(export, export_share(slots, true));
+        let fifo = pool.jobs.path().as_os_str().to_owned();
+        assert_eq!(
+            Path::new(&fifo),
+            path,
+            "the pool's FIFO is the one asked for"
+        );
+        real.pool = Some(pool);
+
+        let mut build = command("ship");
+        real.hand_pool(&mut build, false).unwrap();
+        assert_eq!(pool_of(&build), Some((slots.to_string(), fifo.clone())));
+        let mut verify = command("targo");
+        real.hand_pool(&mut verify, true).unwrap();
+        let share = if export > 0 { slots - export } else { slots };
+        assert_eq!(
+            pool_of(&verify),
+            Some((share.to_string(), fifo)),
+            "verify is handed the build's FIFO, spelled the same, less the export's share"
+        );
+        let plain = real.child("generator", None);
+        assert_eq!(pool_of(&plain), None, "a plain child is handed no pool");
+    }
+
+    /// The export's share: a quarter of the pool, at least one slot and never all of them, and
+    /// none where it does not run or the pool has one slot.
+    #[test]
+    fn the_export_takes_a_quarter_of_the_pool_and_never_all_of_it() {
+        assert_eq!(export_share(18, true), 4);
+        assert_eq!(export_share(3, true), 1);
+        assert_eq!(export_share(2, true), 1);
+        assert_eq!(export_share(1, true), 0);
+        assert_eq!(export_share(18, false), 0);
+    }
+
     #[test]
     fn a_direct_fixtures_runtime_manifest_survives_the_launcher_scrub() {
         let mut cmd = aterm_uds::spawnfd::command("generator");
@@ -7109,7 +7537,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn scanner_and_test_compilation_failures_stop_before_export_or_product_builds() {
+    fn scanner_failures_stop_the_export_and_its_tools_reach_only_the_engine() {
         let dir = aterm_tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         crate::ledger::testing::init(
@@ -7143,7 +7571,7 @@ mod tests {
             commit: "test".into(),
             source: "test".into(),
         };
-        // An engine clone with no bin/pub, synced from its origin before anything is compiled.
+        // An engine clone with no bin/pub, synced from its origin before the export runs.
         let engine = dir.path().join("engine");
         let origin = dir.path().join("engine-origin.git");
         crate::ledger::testing::init(
@@ -7167,17 +7595,16 @@ mod tests {
         let mut real = Real::new(&repo, Some(&engine), true, false).unwrap();
         real.home = dir.path().join("empty-home");
         real.prerequisite_acquire = crate::managed_prerequisites::simulated;
-        let unsynced = Real::new(&repo, Some(&dir.path().join("missing-engine")), true, false)
-            .unwrap()
-            .stage_run(&candidate, &prover, StageTarget::Remote)
-            .unwrap_err();
+        let mut missing =
+            Real::new(&repo, Some(&dir.path().join("missing-engine")), true, false).unwrap();
+        let unsynced =
+            Backend::stage(&mut missing, &candidate, &prover, StageTarget::Remote).unwrap_err();
         assert!(
             unsynced.why.starts_with("cannot fetch the engine's origin"),
-            "the engine is synced before the test compile: {unsynced:?}"
+            "the engine is synced before the export: {unsynced:?}"
         );
-        let scanner_failure = real
-            .stage_run(&candidate, &prover, StageTarget::Remote)
-            .unwrap_err();
+        let scanner_failure =
+            Backend::stage(&mut real, &candidate, &prover, StageTarget::Remote).unwrap_err();
         assert!(
             scanner_failure
                 .why
@@ -7185,42 +7612,70 @@ mod tests {
         );
         assert!(real.scanner_tools.is_none());
         real.scanner_probe = |_| Ok(scanner_tools::test_output());
-        let unready = real
-            .stage_run(&candidate, &prover, StageTarget::Remote)
-            .unwrap_err();
-        assert!(
-            unready.why.starts_with("source signing preflight:"),
-            "{unready:?}"
-        );
-        real.source_signing = Some(crate::source_signing::Tools::for_test());
-        let failure = real
-            .stage_run(&candidate, &prover, StageTarget::Remote)
-            .unwrap_err();
-        assert!(
-            failure
-                .why
-                .contains("required workspace test compilation failed"),
-            "{failure:?}"
-        );
-        let compiled = std::fs::read_to_string(real.step_log(real.step)).unwrap();
-        assert!(
-            compiled.contains("--compile-only") && compiled.contains("--as-release"),
-            "{compiled}"
-        );
-        std::fs::remove_file(bin.join("targo")).unwrap();
-        std::os::unix::fs::symlink("/usr/bin/true", bin.join("targo")).unwrap();
-        real.compile_tests(&candidate, &prover).unwrap();
+        let ran = Backend::stage(&mut real, &candidate, &prover, StageTarget::Remote).unwrap();
+        assert_ne!(ran.code, 0, "the engine has no bin/pub: {ran:?}");
         let report = real.logs.canonicalize().unwrap().join("scanner-tools.json");
         for cmd in [
-            real.stage_command(&candidate.commit, &prover, StageTarget::Remote)
-                .unwrap()
-                .0,
+            real.with_scanners(
+                real.stage_command(&candidate.commit, &prover, StageTarget::Remote)
+                    .unwrap()
+                    .0,
+            ),
             real.publish_command(&prover).unwrap(),
         ] {
             assert!(cmd.get_envs().any(
                 |(name, value)| name == scanner_tools::ENV && value == Some(report.as_os_str())
             ));
         }
+        // Negative control: no other child of the run is handed them (the build's, verify's);
+        // each has the name removed, so none inherits one either.
+        assert!(
+            real.child(prover.bin.join("targo"), Some(&prover))
+                .get_envs()
+                .any(|(name, value)| name == scanner_tools::ENV && value.is_none())
+        );
+        // The stage outside the graph (step 7's, again) is that step's child, in its log; the
+        // graph's export is the export branch, in its own.
+        let logged = |path: PathBuf| std::fs::read_to_string(path).unwrap_or_default();
+        let branch_log = real.side_log(Step::Qualify, Branch::Export.name());
+        assert!(
+            logged(real.step_log(Step::Publish)).contains("\"stage\""),
+            "the stage again logs as step 7's child"
+        );
+        assert!(!branch_log.exists(), "and not as step 4's export");
+        let ran = Backend::branches(&mut real)
+            .export(
+                &candidate,
+                &prover,
+                StageTarget::Remote,
+                &BranchStop::default(),
+            )
+            .unwrap();
+        assert_ne!(ran.code, 0, "{ran:?}");
+        assert!(logged(branch_log).contains("\"stage\""));
+        // An engine that cannot be synced after the graph's export says nothing of R: COULD NOT
+        // RUN, so it stops no other branch. NEGATIVE CONTROL: the same refusal outside the graph
+        // stays a refusal.
+        std::fs::rename(&origin, dir.path().join("gone.git")).unwrap();
+        let unsynced = Backend::branches(&mut real)
+            .export(
+                &candidate,
+                &prover,
+                StageTarget::Remote,
+                &BranchStop::default(),
+            )
+            .unwrap_err();
+        assert!(
+            unsynced.why.starts_with("cannot fetch the engine's origin") && unsynced.could_not_run,
+            "{unsynced:?}"
+        );
+        let refused =
+            Backend::stage(&mut real, &candidate, &prover, StageTarget::Remote).unwrap_err();
+        assert!(
+            refused.why.starts_with("cannot fetch the engine's origin") && !refused.could_not_run,
+            "{refused:?}"
+        );
+        std::fs::rename(dir.path().join("gone.git"), &origin).unwrap();
         let failures: [scanner_tools::Probe; 3] = [
             |_| Err("engine missing or probe timed out".into()),
             |_| {
@@ -7238,7 +7693,8 @@ mod tests {
         ];
         for (index, probe) in failures.into_iter().enumerate() {
             real.scanner_probe = probe;
-            let refusal = real.compile_tests(&candidate, &prover).unwrap_err();
+            let refusal =
+                Backend::stage(&mut real, &candidate, &prover, StageTarget::Remote).unwrap_err();
             assert!(refusal.why.starts_with("publication scanner preflight:"));
             if index == 2 {
                 assert!(
@@ -7257,18 +7713,10 @@ mod tests {
                     .any(|(name, value)| name == scanner_tools::ENV && value.is_none())
             );
         }
-        real.scanner_probe = |_| Ok(scanner_tools::test_output());
-        std::fs::write(repo.join("untracked"), "changed").unwrap();
-        assert!(
-            real.compile_tests(&candidate, &prover)
-                .unwrap_err()
-                .why
-                .contains("clone changed")
-        );
     }
 
     /// The fixture generator compiles the clone's working tree, so a clone off the candidate's
-    /// tree is refused before it runs, in the build step as in the stage step.
+    /// tree is refused before it runs, in the build branch as in the after-cut step.
     #[cfg(unix)]
     #[test]
     fn the_fixture_generator_refuses_a_clone_off_the_candidates_tree() {
@@ -7309,7 +7757,7 @@ mod tests {
         let log = dir.path().join("fixtures.log");
         let off_tree = |refusal: &Refusal| refusal.why.contains("tree and clean");
         let clean = real.stage_fixtures_run(
-            Step::Build,
+            Step::Qualify,
             &candidate,
             &Reservation::default(),
             &prover,
@@ -7319,7 +7767,7 @@ mod tests {
         std::fs::write(repo.join("untracked"), "changed").unwrap();
         let dirty = real
             .stage_fixtures_run(
-                Step::Build,
+                Step::Qualify,
                 &candidate,
                 &Reservation::default(),
                 &prover,
@@ -7331,78 +7779,6 @@ mod tests {
             dirty.detail.iter().any(|line| line.contains("untracked")),
             "{dirty:?}"
         );
-    }
-
-    #[test]
-    fn source_closure_uses_the_workspace_graph_and_refuses_a_failed_check() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        // A release clone's layout: its target is a link, and the closure builds through
-        // the physical directory verify's children are handed.
-        std::fs::create_dir(dir.path().join("target.noindex")).unwrap();
-        std::os::unix::fs::symlink("target.noindex", dir.path().join("target")).unwrap();
-        let physical = std::fs::canonicalize(dir.path())
-            .unwrap()
-            .join("target.noindex");
-        let real = Real::new(dir.path(), Some(Path::new("/unused/engine")), true, false).unwrap();
-        let prover = Prover {
-            bin: dir.path().join("toolchain"),
-            commit: "test".into(),
-            source: "test".into(),
-        };
-        for code in [0, 101, -1] {
-            let result = real.source_closure(&prover, &"c".repeat(40), |cmd| {
-                assert!(cmd.get_envs().any(
-                    |(k, v)| k == "ATERM_SPEC_CHECKERS" && v == Some(std::ffi::OsStr::new("1"))
-                ));
-                assert_eq!(cmd.get_program(), prover.bin.join("targo"));
-                assert_eq!(cmd.get_current_dir(), Some(dir.path()));
-                let args = cmd.get_args().collect::<Vec<_>>();
-                let [config, workspace] = aterm_toolchain::build_cache::TEST_GRAPH_CONFIG;
-                assert_eq!(args.len(), 11);
-                assert_eq!(args[0], "--config");
-                assert_eq!(
-                    args[1].to_string_lossy(),
-                    format!(
-                        "build.build-dir='{}'",
-                        physical.join("build.noindex").display()
-                    )
-                );
-                assert_eq!(
-                    args[2..],
-                    [
-                        "--unverified",
-                        config,
-                        workspace,
-                        "test",
-                        aterm_toolchain::build_cache::TEST_GRAPH_FLAG,
-                        "-p",
-                        "aterm-models",
-                        "--test",
-                        "spec_xref_closure"
-                    ]
-                );
-                let target = cmd
-                    .get_envs()
-                    .find(|(k, _)| *k == "CARGO_TARGET_DIR")
-                    .and_then(|(_, v)| v);
-                assert_eq!(target, Some(physical.as_os_str()));
-                Ran {
-                    code,
-                    detail: vec!["unbound model action".into()],
-                }
-            });
-            if code == 0 {
-                assert!(result.is_ok());
-            } else {
-                let refused = result.unwrap_err();
-                assert_eq!(refused.detail, ["unbound model action"]);
-                assert!(
-                    refused.remedy.contains("--fix") && refused.remedy.contains(&"c".repeat(9)),
-                    "a red carries its fix onto the line's head: {}",
-                    refused.remedy
-                );
-            }
-        }
     }
 
     /// The stage step's `pub stage` is a child with the prover's bin, handed this cutter only as
@@ -8042,9 +8418,9 @@ mod tests {
             "-c",
             "/bin/sh -c 'i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done' & wait; echo done; exit 3",
         ]);
-        let ran = real.logged(Step::Build, &mut cmd);
+        let ran = real.logged(Step::Qualify, &mut cmd);
         assert_eq!(ran.code, 3, "{ran:?}");
-        let log = std::fs::read_to_string(real.step_log(Step::Build)).unwrap();
+        let log = std::fs::read_to_string(real.step_log(Step::Qualify)).unwrap();
         let line = log
             .lines()
             .find(|l| l.contains("\"step-child-finished\""))
@@ -8055,7 +8431,7 @@ mod tests {
         );
         let event: aterm_json::Value =
             aterm_json::from_str(line.strip_prefix("release-event: ").unwrap()).unwrap();
-        assert_eq!(event["step"].as_str(), Some("build"), "{event}");
+        assert_eq!(event["step"].as_str(), Some("qualify"), "{event}");
         assert_eq!(event["exit_code"].as_u64(), Some(3), "{event}");
         assert!(event.get("outcome").is_none(), "{event}");
         assert!(
@@ -8066,6 +8442,14 @@ mod tests {
             .as_f64()
             .expect("wait4 CPU");
         assert!(cpu > 0.0, "{event}");
+        let user = event["child_cpu"]["user_s"]
+            .as_f64()
+            .expect("wait4 user CPU");
+        let system = event["child_cpu"]["system_s"]
+            .as_f64()
+            .expect("wait4 system CPU");
+        assert!(user > 0.0 && system >= 0.0, "{event}");
+        assert!((cpu - user - system).abs() < 1e-9, "{event}");
         assert!(
             event["program"].as_str().unwrap().starts_with("sh -c"),
             "{event}"
@@ -8083,7 +8467,7 @@ mod tests {
             "-c",
             "i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done; echo out; echo err >&2; exit 4",
         ]);
-        let (out, record) = real.output_accounted(Step::Stage, &mut cmd).unwrap();
+        let (out, record) = real.output_accounted(Step::Qualify, &mut cmd).unwrap();
         assert_eq!(out.status.code(), Some(4));
         assert_eq!(
             (out.stdout.as_slice(), out.stderr.as_slice()),
@@ -8091,13 +8475,21 @@ mod tests {
         );
         let event: aterm_json::Value =
             aterm_json::from_str(record.strip_prefix("release-event: ").unwrap()).unwrap();
-        assert_eq!(event["step"].as_str(), Some("stage"), "{event}");
+        assert_eq!(event["step"].as_str(), Some("qualify"), "{event}");
         assert_eq!(event["exit_code"].as_u64(), Some(4), "{event}");
         assert!(event.get("outcome").is_none(), "{event}");
         let cpu = event["child_cpu"]["observed_s"]
             .as_f64()
             .expect("wait4 CPU");
         assert!(cpu > 0.0, "{event}");
+        let user = event["child_cpu"]["user_s"]
+            .as_f64()
+            .expect("wait4 user CPU");
+        let system = event["child_cpu"]["system_s"]
+            .as_f64()
+            .expect("wait4 system CPU");
+        assert!(user > 0.0 && system >= 0.0, "{event}");
+        assert!((cpu - user - system).abs() < 1e-9, "{event}");
     }
 
     /// The publish step's lines are stamped as they arrive, in a side log, even when they are

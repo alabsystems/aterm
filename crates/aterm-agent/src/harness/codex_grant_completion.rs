@@ -6,15 +6,21 @@
 
 use super::{AuthLock, Secret};
 use crate::harness::codex_renewal::Identity;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 const SLOT_AUTH_MAX: usize = 16 * 1024;
 
 /// An opened destination parent, without any provider or credential authority.
+#[cfg(unix)]
 pub struct StagedWitness {
     auth_file: PathBuf,
     parent: std::fs::File,
 }
+
+#[cfg(not(unix))]
+pub enum StagedWitness {}
 
 impl StagedWitness {
     pub(in crate::harness) fn open(auth_file: &Path) -> Result<Self, String> {
@@ -209,6 +215,11 @@ impl std::fmt::Debug for FreshCodeGrant<'_> {
 /// exact response/failure, never an error string that discards completed secrets.
 pub(in crate::harness) trait CodeGrantCapture {
     type Output;
+    /// Reacquire already prepared custody before taking the staged AuthLock.
+    /// This does not authorize dispatch or persist an attempted exchange.
+    fn claim_exchange(&mut self) -> Result<(), String> {
+        Ok(())
+    }
     fn begin_exchange(&mut self) -> Result<(), String>;
     /// Called only by the live producer before invoking the HTTP send.
     fn not_dispatched(self) -> Self::Output;

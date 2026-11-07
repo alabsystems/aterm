@@ -521,6 +521,12 @@ fn wrap_ahead_words(f: &mut Fold, ahead: WrapAhead) {
             f.put("kind", 2);
             pair(f, (col, row));
         }
+        WrapAhead::OffTheLine { row, over, kept } => {
+            f.put("kind", 3);
+            f.f32("row", row);
+            f.flag("over", over);
+            f.f32("kept", kept);
+        }
     }
 }
 

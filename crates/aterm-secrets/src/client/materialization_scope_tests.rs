@@ -52,6 +52,8 @@ fn scoped_materialization_allows_unrelated_updates_but_not_changed_or_missing_in
             .unwrap();
     });
     assert!(scoped.is_current(&paths).unwrap());
+    assert!(scoped.is_current_now(&paths).unwrap());
+    assert!(scoped.source_continues(&paths).unwrap());
     assert!(
         !broad.snapshot.is_current(&paths).unwrap(),
         "broad callers retain their existing contract"
@@ -66,12 +68,14 @@ fn scoped_materialization_allows_unrelated_updates_but_not_changed_or_missing_in
             !then.is_current(&paths).unwrap(),
             "changed scoped input {name}"
         );
+        assert!(!then.source_continues(&paths).unwrap(), "{name}");
     }
     let then = capture(&paths);
     publish(&paths, &|doc| {
         doc.unset_entry(&Audience::Everyone, "inventory").unwrap();
     });
     assert!(!then.is_current(&paths).unwrap());
+    assert!(!then.source_continues(&paths).unwrap());
     assert!(
         with_materialization_ready_for_entries::<()>(&paths, &configured, &INPUTS, || {
             panic!("a missing registered input must not reach the reader")
@@ -104,5 +108,41 @@ fn scoped_materialization_still_requires_complete_ready_source_and_membership() 
             _ => unreachable!(),
         }
         assert!(!captured.is_current(&paths).unwrap(), "{failure}");
+        assert!(!captured.is_current_now(&paths).unwrap(), "{failure}");
+        assert_eq!(
+            captured.source_continues(&paths).unwrap(),
+            failure == "incomplete",
+            "file integrity is checked at full boundaries, not by continuation"
+        );
+    }
+}
+
+#[test]
+fn continuation_and_full_observation_refuse_a_held_writer_without_waiting_for_release() {
+    let (_root, paths) = fixture();
+    let captured = capture(&paths);
+    let writer = StateLock::take(&paths).unwrap();
+    // The writer remains held through both observations: neither may wait for it.
+    assert!(!captured.source_continues(&paths).unwrap());
+    assert!(!captured.is_current_now(&paths).unwrap());
+    drop(writer);
+    assert!(captured.source_continues(&paths).unwrap());
+    assert!(captured.is_current_now(&paths).unwrap());
+    for failure in ["failed", "pending"] {
+        let mut state = load_state(&paths).unwrap();
+        match failure {
+            "failed" => state.failed = true,
+            "pending" => {
+                state
+                    .pending
+                    .insert("inventory".into(), "unfinished".into());
+            }
+            _ => unreachable!(),
+        }
+        save_state(&paths, &state).unwrap();
+        assert!(!captured.source_continues(&paths).unwrap(), "{failure}");
+        state.failed = false;
+        state.pending.clear();
+        save_state(&paths, &state).unwrap();
     }
 }

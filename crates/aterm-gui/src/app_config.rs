@@ -2480,7 +2480,7 @@ impl Config {
             .unwrap_or(self.cursor_trail.unwrap_or(DEFAULT_DECORATIVE_EFFECTS))
     }
 
-    /// Whether a config apply should warm the demand-driven effect pipelines (`aterm_gpu::EffectPipeline`) off the frame path.
+    /// Whether a config apply should warm the demand-driven effect pipelines (`aterm_gpu::GpuRenderer::warm_effect_pipelines`) off the frame path.
     pub(crate) fn warms_effect_pipelines(&self) -> bool {
         self.cursor_trail_drawn()
     }

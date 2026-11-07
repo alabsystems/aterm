@@ -524,6 +524,23 @@ impl PolledMark {
 pub fn wait_exit(pid: u32, limit: Duration) -> bool {
     wait_exit_inner(
         pid,
+        None,
+        limit,
+        #[cfg(all(test, target_os = "macos"))]
+        None,
+    )
+    .0
+}
+
+/// Wait at most `limit` for the process `pid` names while it is the one born at `start`
+/// (`upgrade_drive::kernel_start`'s spelling) to exit: true once its pid is free or names a
+/// process born at another time, never by another process's exit. The watch is armed before
+/// the start is read, so it watches that process.
+#[must_use]
+pub fn wait_exit_as(pid: u32, start: &str, limit: Duration) -> bool {
+    wait_exit_inner(
+        pid,
+        Some(start),
         limit,
         #[cfg(all(test, target_os = "macos"))]
         None,
@@ -533,10 +550,16 @@ pub fn wait_exit(pid: u32, limit: Duration) -> bool {
 
 fn wait_exit_inner(
     pid: u32,
+    born: Option<&str>,
     limit: Duration,
     #[cfg(all(test, target_os = "macos"))] parks: Option<&std::sync::atomic::AtomicUsize>,
 ) -> (bool, Option<i16>) {
-    let gone = || !super::upgrade_drive::alive(pid) || zombie(pid);
+    let reborn = || {
+        born.is_some_and(|born| {
+            super::upgrade_drive::kernel_start(pid).is_some_and(|now| now != born)
+        })
+    };
+    let gone = || !super::upgrade_drive::alive(pid) || zombie(pid) || reborn();
     #[cfg(target_os = "macos")]
     if let Ok(kq) = kqueue() {
         use std::os::fd::AsRawFd as _;
@@ -1364,14 +1387,17 @@ mod tests {
             .unwrap();
         let stdin = child.stdin.take().unwrap();
         let pid = child.id();
-        assert_eq!(wait_exit_inner(pid, Duration::ZERO, None), (false, None));
+        assert_eq!(
+            wait_exit_inner(pid, None, Duration::ZERO, None),
+            (false, None)
+        );
         assert!(!wait_exit(pid, Duration::ZERO));
 
         let parks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let parks_waiter = std::sync::Arc::clone(&parks);
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
-            tx.send(wait_exit_inner(pid, FALLBACK, Some(&parks_waiter)))
+            tx.send(wait_exit_inner(pid, None, FALLBACK, Some(&parks_waiter)))
                 .unwrap();
         });
         wait_parked(&parks, 1);
@@ -1417,7 +1443,7 @@ mod tests {
         );
         let parks = std::sync::atomic::AtomicUsize::new(0);
         assert_eq!(
-            wait_exit_inner(pid, FALLBACK, Some(&parks)),
+            wait_exit_inner(pid, None, FALLBACK, Some(&parks)),
             (true, None),
             "a zombie returns immediately as exited without parking"
         );

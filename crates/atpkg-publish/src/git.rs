@@ -5,6 +5,7 @@
 
 use std::path::Path;
 use std::process::Output;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use aterm_uds::deadline::{CompleteOutputError, MAX_COMPLETE_STDOUT_BYTES, RunError};
@@ -40,7 +41,8 @@ impl SourceRepo {
         &self.root
     }
 
-    /// Read one immutable object query with no ambient Git routing/replacement/lazy fetch.
+    /// Run a bounded local metadata operation with no ambient Git routing, replacement or
+    /// lazy fetch. Callers use object queries and remove only their own temporary refs.
     /// # Errors
     /// Missing objects, invalid output, spawn or bounded collection failure.
     pub(crate) fn query(&self, args: &[&str]) -> Result<String> {
@@ -72,6 +74,53 @@ impl SourceRepo {
         }
         String::from_utf8(out.stdout).map_err(|_| Error::refused("source metadata is not UTF-8"))
     }
+}
+
+static MAIN_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Read a repository's owner-bound main through the selected host, preserving the checkout,
+/// origin/main and FETCH_HEAD. The native route never falls back to the publisher's raw
+/// network Git or ambient origin credentials.
+pub(crate) fn main_of_record(
+    host: &dyn crate::host::ReleaseHost,
+    repo: &Path,
+    slug: &crate::host::Slug,
+) -> Result<(SourceRepo, String)> {
+    let source = SourceRepo::open(repo)?;
+    let origin = source.query(&["remote", "get-url", "origin"])?;
+    if !crate::artifact::package::names_repo(origin.trim(), &slug.owner, &slug.repo) {
+        return Err(Error::refused(format!(
+            "the source origin does not name {slug}; its main cannot judge this cut"
+        )));
+    }
+    let reference = format!(
+        "refs/agh/atpkg-publish/main-{}-{}",
+        std::process::id(),
+        MAIN_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let fetched = host
+        .fetch_main(slug, source.root(), &reference)
+        .map_err(|error| Error::cannot_run(format!("read {slug}'s main from its host: {error}")))
+        .and_then(|()| source.query(&["rev-parse", "--verify", &reference]));
+    let dropped = source.query(&["update-ref", "-d", &reference]);
+    let tip = fetched?;
+    dropped?;
+    let tip = tip.trim();
+    if tip.len() != 40
+        || !tip
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(Error::refused(
+            "the host's main did not name a full raw commit OID",
+        ));
+    }
+    if source.query(&["cat-file", "-t", tip])?.trim() != "commit" {
+        return Err(Error::refused(
+            "the host's main named another Git object kind",
+        ));
+    }
+    Ok((source, tip.to_owned()))
 }
 
 /// How long a local git query or checkout ([`run`]) may take before it is taken for hung and

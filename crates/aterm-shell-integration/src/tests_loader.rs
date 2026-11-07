@@ -178,13 +178,13 @@ fn a_compiled_zsh_set_is_sourced_from_its_wordcode() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 #[test]
 fn a_real_zsh_sources_the_body_alone_cleanly() {
     let dir = aterm_tempfile::tempdir().unwrap();
     ensure_scripts(dir.path()).unwrap();
     let body = dir.path().join(format!("{BODY_FILE_STEM}.zsh"));
-    let out = shell_command("/bin/zsh")
+    let out = shell_command(need_zsh())
         .args([
             "-f",
             "-c",
@@ -316,7 +316,7 @@ impl BodyFixture {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn spawn_live_zsh_from(
     zsh: &str,
     fx: &LiveFixture,
@@ -547,10 +547,10 @@ fn live_body_pickup(label: &str, sh: &mut LiveShell, bf: &BodyFixture, hooked: b
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 #[test]
 fn a_live_zsh_takes_a_newer_body_at_its_next_prompt() {
-    let zsh = zsh_shell().expect("macOS ships /bin/zsh");
+    let zsh = need_zsh();
     for hooked in [true, false] {
         let bf = BodyFixture::new();
         let pointer = bf.pointer.to_str().unwrap().to_string();
@@ -941,10 +941,10 @@ fn live_typed_upgrade(label: &str, shell: ShellType, sh: &mut LiveShell, bf: &Bo
     assert!(!err.contains("unbound"), "{label}: set -u clean: {err}");
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 #[test]
 fn a_live_zsh_from_before_loaders_is_upgraded_by_the_typed_line() {
-    let zsh = zsh_shell().expect("macOS ships /bin/zsh");
+    let zsh = need_zsh();
     let bf = BodyFixture::new();
     let old = preloader_folder(&bf.fx);
     lay_aterm_bin(&bf.fx);
@@ -1056,10 +1056,10 @@ fn nested_shell_is_left_alone(label: &str, shell: ShellType, sh: &mut LiveShell,
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 #[test]
 fn a_nested_zsh_is_not_integrated_by_the_typed_line() {
-    let zsh = zsh_shell().expect("macOS ships /bin/zsh");
+    let zsh = need_zsh();
     let bf = BodyFixture::new();
     bf.fx.lay_dirs();
     let path = format!("/usr/bin:/bin:{}", bf.fx.reroute.display());
@@ -1585,10 +1585,10 @@ const UNNAMED_LOADER_CASES: [(&str, SpawnedBy, bool, bool); 8] = [
     (STARTED_SINCE, SPAWNED_BY_ANOTHER, false, false),
 ];
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 #[test]
 fn a_live_zsh_takes_an_older_loaders_aterm_bin_off_and_only_that() {
-    let zsh = zsh_shell().expect("macOS ships /bin/zsh");
+    let zsh = need_zsh();
     live_older_loaders_aterm_bin("zsh", |bf, dir, spawned_by| {
         let pointer = bf.pointer.to_str().unwrap().to_string();
         let mut env = vec![
@@ -1795,10 +1795,10 @@ fn live_pickup_keeps_user_bindings(label: &str, sh: &mut LiveShell, bf: &BodyFix
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 #[test]
 fn a_live_zsh_keeps_the_users_key_bindings_across_a_newer_body() {
-    let zsh = zsh_shell().expect("macOS ships /bin/zsh");
+    let zsh = need_zsh();
     let bf = BodyFixture::new();
     let pointer = bf.pointer.to_str().unwrap().to_string();
     let mut sh = spawn_live_zsh_from(
@@ -1834,10 +1834,10 @@ fn a_live_fish_keeps_the_users_key_bindings_across_a_newer_body() {
     sh.finish();
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 #[test]
 fn a_live_zsh_with_a_line_init_hook_is_upgraded_without_a_widget_loop() {
-    let zsh = zsh_shell().expect("macOS ships /bin/zsh");
+    let zsh = need_zsh();
     let bf = BodyFixture::new();
     let old = preloader_folder(&bf.fx);
     std::fs::write(

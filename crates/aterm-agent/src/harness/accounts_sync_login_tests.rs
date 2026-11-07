@@ -1233,6 +1233,7 @@ pub(super) fn upkeep_effects<'a>(
         mailbox: &ladder_mailbox_files,
         log: Arc::new(|_: &str| {}),
         run_attempt: None,
+        save_oauth: |_, _| Ok("inert".into()),
         shared: shared_renewal::Effects::default(),
     }
 }

@@ -171,6 +171,7 @@ fn config_of_m2(
         config_path: None,
         vault_paths: Some(lab.m2.clone()),
         prebound_listener: None,
+        on_generation: None,
         tick_every: Duration::from_millis(20),
         wake_timeout: Duration::from_secs(1),
         lan_unavailable: || Some("no root LAN broker answers".to_owned()),

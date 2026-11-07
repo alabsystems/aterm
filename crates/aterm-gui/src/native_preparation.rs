@@ -9,17 +9,31 @@ use super::*;
 pub(super) struct Preparation {
     predecessor: Option<Box<(Prepare, Binding)>>,
     pub(super) recorded: bool,
+    account_state: Option<aterm_agent::harness::native_account_wire::ChildState>,
     serial: u64,
     active: Option<u64>,
 }
 
 impl Preparation {
+    pub(super) fn terminal_already_recorded(&self) -> bool {
+        use aterm_agent::harness::native_account_wire::ChildState;
+        matches!(
+            self.account_state,
+            Some(ChildState::MayExecute | ChildState::Sealed { .. })
+        )
+    }
+
     pub(super) fn transfers(&self, request: &Prepare, binding: &Binding) -> bool {
         self.recorded
             && self
                 .predecessor
                 .as_deref()
                 .is_some_and(|(parent, capability)| parent == request && capability == binding)
+    }
+
+    /// A typed claim cannot acknowledge a writer that still owns admission.
+    pub(super) fn settled_account(&self, request: &Prepare, binding: &Binding) -> bool {
+        self.active.is_none() && self.transfers(request, binding)
     }
 
     #[cfg(test)]
@@ -33,6 +47,7 @@ impl Preparation {
         Self {
             predecessor: predecessor.map(Box::new),
             recorded: !required,
+            account_state: None,
             serial: 1,
             active: Some(1),
         }
@@ -127,7 +142,12 @@ impl Preparation {
         )
     )]
     fn can_admit(&self, current: bool) -> bool {
-        self.recorded && self.active.is_some() && current
+        self.recorded
+            && self.active.is_some()
+            && current
+            && self.account_state.is_none_or(|state| {
+                state == aterm_agent::harness::native_account_wire::ChildState::Prepared
+            })
     }
 
     #[cfg_attr(
@@ -251,6 +271,21 @@ fn preparation_current(
     kernel: &dyn Kernel,
     preflight: bool,
 ) -> bool {
+    op.preparation.can_admit(authority_current(
+        ctx, master, op, meta, caller, kernel, preflight,
+    ))
+}
+
+pub(super) fn authority_current(
+    ctx: &crate::SessionCtx,
+    master: i32,
+    op: &Operation,
+    meta: &crate::session_timeline::SessionMeta,
+    caller: &SupervisorInputCaller,
+    kernel: &dyn Kernel,
+    preflight: bool,
+) -> bool {
+    let pending = !op.preparation.recorded;
     let crash_proven = op.observation.as_ref().is_some_and(|proof| {
         observe_control::context(ctx, meta, caller, kernel).is_some_and(|context| {
             proof.reprove_with(
@@ -261,7 +296,7 @@ fn preparation_current(
             )
         })
     });
-    let current = preflight
+    preflight
         && same_actor(op, caller, kernel)
         && kernel.constructor_enabled(op.request.plan.constructor())
         && meta.supervisor_authority(crate::metrics::now_us()) == op.authority.snapshot
@@ -273,7 +308,11 @@ fn preparation_current(
         })
         && op.authority.account.as_ref().is_none_or(|account| {
             account.current(ctx, &op.request, caller, kernel)
-                && account.proof().claimed_by(&op.request)
+                && if pending {
+                    account.proof().pending_account_by(&op.request)
+                } else {
+                    account.proof().claimed_by(&op.request)
+                }
         })
         && (!matches!(op.request.plan, NativePlan::Restart { .. })
             || ctx.human_input.seq() == op.human_seq)
@@ -283,8 +322,7 @@ fn preparation_current(
             .conversation
             .as_ref()
             .is_none_or(|guard| guard.current(ctx))
-        && op.clock.remaining(op.request.deadline_us).is_some();
-    op.preparation.can_admit(current)
+        && op.clock.remaining(op.request.deadline_us).is_some()
 }
 
 pub(super) fn finish_preparation(
@@ -296,7 +334,7 @@ pub(super) fn finish_preparation(
     admit: bool,
 ) -> String {
     let operation = &attempt.operation;
-    let (prepare, binding, predecessor, recorded, handoff, renewal, account) = {
+    let (prepare, binding, predecessor, recorded, handoff, renewal, account, mut account_state) = {
         let op = operation.lock().unwrap_or_else(|p| p.into_inner());
         (
             op.request.clone(),
@@ -309,6 +347,7 @@ pub(super) fn finish_preparation(
                 .map(|custody| custody.handoff_guard()),
             op.authority.renewal.clone(),
             op.authority.account.clone(),
+            op.preparation.account_state,
         )
     };
     // A retry can have no input custody. Its app hold lasts only this worker,
@@ -328,8 +367,44 @@ pub(super) fn finish_preparation(
         },
         None => None,
     };
+    // A published preparation can remain queued while custody or live facts
+    // are unavailable. Before admitting that retry, recover the journal again:
+    // a cached Prepared classification cannot override a later terminal frame.
+    if recorded
+        && let Some(account) = &account
+        && account_state.is_none_or(|state| {
+            state == aterm_agent::harness::native_account_wire::ChildState::Prepared
+        })
+    {
+        let Some(recovered) = kernel.recover_account_claim(account.relation(), &binding) else {
+            return UNKNOWN.into();
+        };
+        let mut op = operation.lock().unwrap_or_else(|p| p.into_inner());
+        if !op.preparation.acknowledge(attempt.serial) {
+            return UNKNOWN.into();
+        }
+        op.preparation.account_state = Some(recovered);
+        account_state = Some(recovered);
+    }
     if !recorded {
-        let confirmed = if let Some((parent, parent_binding)) = predecessor.as_deref() {
+        let confirmed = if let Some(account) = &account {
+            account_state = kernel.recover_account_claim(account.relation(), &binding);
+            if account_state.is_none() && admit {
+                let guard = account.admit(kernel);
+                let fresh = {
+                    let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+                    let op = operation.lock().unwrap_or_else(|p| p.into_inner());
+                    !op.channel_closed
+                        && !aterm_control::hangup::caller_hung_up()
+                        && authority_current(ctx, master, &op, &meta, caller, kernel, guard.is_ok())
+                };
+                drop(guard);
+                if fresh {
+                    account_state = kernel.record_account_claim(account.relation(), &binding);
+                }
+            }
+            account_state.is_some()
+        } else if let Some((parent, parent_binding)) = predecessor.as_deref() {
             kernel.record_successor(parent, parent_binding, &prepare, &binding)
         } else {
             kernel.record_prepared(&prepare, &binding)
@@ -337,14 +412,38 @@ pub(super) fn finish_preparation(
         if !confirmed {
             return UNKNOWN.into();
         }
-        if !operation
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .preparation
-            .acknowledge(attempt.serial)
+        if account
+            .as_ref()
+            .is_some_and(|account| !account.proof().confirm_account_successor(&prepare))
         {
             return UNKNOWN.into();
         }
+        let mut op = operation.lock().unwrap_or_else(|p| p.into_inner());
+        if !op.preparation.acknowledge(attempt.serial) {
+            return UNKNOWN.into();
+        }
+        op.preparation.account_state = account_state;
+    }
+    if account_state.is_some_and(|state| {
+        state != aterm_agent::harness::native_account_wire::ChildState::Prepared
+    }) {
+        let mut op = operation.lock().unwrap_or_else(|p| p.into_inner());
+        let completion = match account_state.expect("recorded account state") {
+            aterm_agent::harness::native_account_wire::ChildState::NoExec(phase) => {
+                if command_for(&op, phase).is_none()
+                    || retirement(&op, kernel) != Some(Retirement::NotGranted)
+                {
+                    return UNKNOWN.into();
+                }
+                // Disk identifies the phase; retained kernel evidence alone
+                // permits constructing the closed witness for that phase.
+                op.resume_phase = Some(phase);
+                op.seal_retirement(Retirement::NotGranted, kernel)
+            }
+            _ => op.seal_completion(Decision::Unknown),
+        };
+        drop(op);
+        return finish(ctx, operation, completion);
     }
     // The original worker retains its marker across cancellation until earlier
     // admitted input drains. An uncertain write above instead releases it in
@@ -493,7 +592,7 @@ pub(super) fn settle_retired(
         (op.request.clone(), op.binding.clone(), record)
     };
     match record {
-        TerminalRecord::NoExec => kernel.record_noexec(&prepare, &binding),
+        TerminalRecord::NoExec(phase) => kernel.record_noexec(&prepare, &binding, phase),
         TerminalRecord::Sealed => kernel.record_sealed(&prepare, &binding),
     }
 }

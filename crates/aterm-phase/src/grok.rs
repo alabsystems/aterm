@@ -33,23 +33,37 @@
 //! screen reads neither as a row's opening (aterm-agent's login-ended words read both). An MCP
 //! server's, Grove's or a deployment key's texts are none of them. No signed-in account has drawn
 //! any of them on a screen yet, so where they sit on one is not measured. The reader therefore
-//! claims nothing it has not seen: every phase is `idle` NOT authoritatively (its busy row is
-//! unmeasured), and a wall is read only off a row that OPENS with one of those texts
-//! in the screen's live zone, never off prose that quotes one. Its composer's box is measured
+//! claims nothing it has not seen: a wall is read only off a row that OPENS with one of those
+//! texts in the screen's live zone, never off prose that quotes one. Its composer's box is measured
 //! (1.0.70's idle, busy and draft frames in `fixtures/`): the rounded box whose first inner row
 //! opens with `│ ❯`, the model's name in its bottom edge, a draft past one row growing it upward
 //! ([`composer_rows`]). Only its rows are read, never its words: the empty composer can offer a
 //! suggestion after its caret (`❯ Lab stub session`, `Tab/→:accept suggestion` on the key row),
 //! which plain rows cannot tell from a typed draft. Its header's token counts (`12K / 256K`,
 //! on the same measured frames) are read as the context left, for the window's displays only.
+//!
+//! Its phase is read off the rows around that box ([`phase`], measured on 1.0.70's busy,
+//! turn-ended, idle, plan and card frames at 144 columns,
+//! `docs/measured/grok-forever-2026-10-29.md`): a running turn's status row stands over the box's
+//! top edge ending `[stop]` (`⠋ Responding… 8.9s … [stop]`) and the key row under the box offers
+//! `Ctrl+c:cancel`; the turn's end takes both away. A plan approval names itself in the box's
+//! bottom edge (`lab-stub · plan approval`). The cards a turn raises in the box's place (a tool's
+//! permission, a question) and the plan approval wait on the person: each is a prompt, read as a
+//! box for display ([`prompt`]) and answered by no one here, since Grok Build is read, not
+//! supervised. Any other screen with no box decides its phase only by a wall it shows (the
+//! sign-in screen, an upsell). A shell card and a file card are measured at 70 columns too
+//! (`fixtures/grok-1.0.70-box-*-narrow.txt`), where the key row is cut short of its right end.
+//! Other widths, other tools' cards, the cancel-turn panel and the window's title are unmeasured.
 
+use crate::phase::Phase;
+use crate::prompt::{Opt, PromptKind, PromptV2, Role, Select};
 use crate::wall::{Placement, Wall, WallKind};
 
 /// The Grok (`grok`) harness version, `MAJOR.MINOR` with no third part.
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 16, "0.16");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 17, "0.17");
 
 /// How many of the screen's last worded rows a wall row may stand in ([`live_from`]): the
 /// notice a turn ended on, with room for a composer and key rows under it.
@@ -191,15 +205,86 @@ pub fn is_grok_screen(rows: &[String]) -> bool {
 /// frames), told by a radio option row on its bar (`┃  1 (○) …`, the taken one `(●)`). Agy's
 /// notice cards stand on the same bar with no option on them.
 fn panel_standing(rows: &[String]) -> bool {
-    rows.iter().any(|row| {
-        let Some(inner) = crate::text::trim_start(row).strip_prefix('┃') else {
-            return false;
-        };
-        let inner = inner.trim_start_matches(' ');
-        let mut chars = inner.chars();
-        matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric())
-            && matches!(chars.as_str(), s if s.starts_with(" (○)") || s.starts_with(" (●)"))
-    })
+    rows.iter().any(|row| radio(row).is_some())
+}
+
+/// The words on a row of a card's heavy left bar (`┃`): past the bar and its indent, the
+/// scrollbar gutter's `█` at the screen's right edge aside; `None` for a row off the bar.
+fn bar_words(row: &str) -> Option<&str> {
+    let inner = crate::text::trim_start(row).strip_prefix('┃')?;
+    Some(crate::text::trim(
+        crate::text::trim_end(inner).trim_end_matches('█'),
+    ))
+}
+
+/// A card's radio option on `row`: its key (a digit, or a letter such as a question's write-in
+/// `z`), whether it is the taken one (`(●)`, else `(○)`), and its words (measured on 1.0.70's
+/// approval, question and upsell cards: `┃  3 (●) Yes, proceed`).
+fn radio(row: &str) -> Option<(char, bool, &str)> {
+    let words = bar_words(row)?;
+    let mut chars = words.chars();
+    let key = chars.next().filter(char::is_ascii_alphanumeric)?;
+    let rest = chars.as_str();
+    let (taken, label) = match rest.strip_prefix(" (●)") {
+        Some(label) => (true, label),
+        None => (false, rest.strip_prefix(" (○)")?),
+    };
+    Some((key, taken, crate::text::trim(label)))
+}
+
+/// The rows of a card a running turn raises in the composer's place and waits on the person
+/// with: an approval of a tool's call or a question ([`card`]).
+#[derive(Debug, Clone, Copy)]
+struct Card {
+    /// The first and last rows of its heavy left bar.
+    first: usize,
+    last: usize,
+    /// Its key row, the screen's last worded row.
+    keys: usize,
+}
+
+/// The card standing on `rows`, a screen with no composer's box (measured on 1.0.70's approval
+/// and question frames): its key row is the screen's last worded row ([`worded`]) and names the
+/// card in either focus (`Tab:next option` on an approval or `Tab:next answer` on a question,
+/// and `Esc:scrollback` after them, while the card has it; `Tab/Space:permission` once Esc gave
+/// it to the scrollback). The hints at the row's start are the ones a narrow screen keeps: at 70
+/// columns 1.0.70 cuts an approval's row short of `Esc:scrollback`. Right over that row, past blank rows, stands an unbroken run of
+/// rows on the heavy bar holding a radio option ([`radio`]); and the first worded row over the
+/// run is the running turn's status row ([`stops`]), whose turn waits on the card. An upsell
+/// draws the same card with no turn running, which leaves it the wall it is ([`wall`]); agy's
+/// notice cards stand on the same bar with no option on them.
+fn card(rows: &[String]) -> Option<Card> {
+    let keys = rows.iter().rposition(|r| worded(r))?;
+    let names_card = |needle: &str| crate::text::contains(&rows[keys], needle);
+    if ![
+        crate::anchor!("grok.card.keys.next_option"),
+        crate::anchor!("grok.card.keys.next_answer"),
+        crate::anchor!("grok.card.keys.scrollback"),
+        crate::anchor!("grok.card.keys.permission"),
+    ]
+    .into_iter()
+    .any(names_card)
+    {
+        return None;
+    }
+    let last = rows[..keys].iter().rposition(|r| worded(r) || on_bar(r))?;
+    if !on_bar(&rows[last]) {
+        return None;
+    }
+    let first = rows[..last]
+        .iter()
+        .rposition(|r| !on_bar(r))
+        .map_or(0, |gap| gap + 1);
+    if !rows[first..=last].iter().any(|r| radio(r).is_some()) {
+        return None;
+    }
+    let status = rows[..first].iter().rev().find(|r| worded(r))?;
+    stops(status).then_some(Card { first, last, keys })
+}
+
+/// Whether `row` stands on a card's heavy left bar (`┃`).
+fn on_bar(row: &str) -> bool {
+    crate::text::trim_start(row).starts_with('┃')
 }
 
 /// The text of `row` past its indent, at most one leading mark (a glyph or a frame's edge and
@@ -327,6 +412,213 @@ fn caret_row(row: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
 }
 
+/// Whether `row` carries a word, a letter or a digit: a blank row and the scrollbar gutter's
+/// `█` rows carry none.
+fn worded(row: &str) -> bool {
+    row.chars().any(char::is_alphanumeric)
+}
+
+/// Whether `row` is a running turn's status row: its words end with `[stop]`, the scrollbar
+/// gutter's `█` at the screen's right edge aside (measured over the composer on 1.0.70's busy
+/// frames, and over the card a turn raises in its place).
+fn stops(row: &str) -> bool {
+    let text = crate::text::trim_end(row);
+    crate::text::trim_end(text.trim_end_matches('█')).ends_with(crate::anchor!("grok.busy.stop"))
+}
+
+/// Whether `row` opens with a braille spinner's glyph (U+2801 to U+28FF), as a running turn's
+/// status row does on 1.0.70's busy frames (`⠋ Responding… 8.9s`).
+fn spins(row: &str) -> bool {
+    matches!(
+        crate::text::trim_start(row).chars().next(),
+        Some('\u{2801}'..='\u{28FF}')
+    )
+}
+
+/// Whether the composer whose box ends at row `bottom` is a plan approval's: its bottom edge
+/// names the state after the model (`╰─…─ lab-stub · plan approval ─╯`, measured on 1.0.70's plan
+/// frames).
+fn plan_approval(rows: &[String], bottom: usize) -> bool {
+    crate::text::trim_end(&rows[bottom])
+        .strip_suffix('╯')
+        .map(|edge| crate::text::trim_end(edge.trim_end_matches('─')))
+        .is_some_and(|edge| edge.ends_with(crate::anchor!("grok.plan.edge")))
+}
+
+/// Whether the plan approval whose composer's box ends at row `bottom` ([`plan_approval`]) waits
+/// on the person: the key row under the box, its first worded row, offers `a:approve`, as it
+/// does in both measured focuses (the plan's, and the composer's after `s request changes`).
+fn plan_waits(rows: &[String], bottom: usize) -> bool {
+    plan_approval(rows, bottom)
+        && rows[bottom + 1..]
+            .iter()
+            .find(|r| worded(r))
+            .is_some_and(|r| crate::text::contains(r, crate::anchor!("grok.plan.keys.approve")))
+}
+
+/// Grok Build's phase on `rows` and whether the screen decides it.
+///
+/// Where the composer's box is drawn ([`composer_rows`]), the rows around it decide: a running
+/// turn's status row, the first worded row ([`worded`]) over the box's top edge, ends with
+/// `[stop]` ([`stops`]), and the key row, the first worded row under its bottom edge, offers
+/// `Ctrl+c:cancel`. Both make it busy; neither, with no spinner's glyph opening that first row
+/// ([`spins`]), makes it idle; anything else (a frame caught mid-redraw, or an anchor the build
+/// no longer draws) decides nothing. A plan approval's box that offers its approval
+/// ([`plan_waits`]) is a prompt; one that does not decides nothing. Where no box is drawn, a card
+/// its running turn raised in the box's place ([`card`]) is a prompt; otherwise (the sign-in
+/// screen, a launch or an exit) only a wall the screen shows ([`wall`]) decides it, idle, and not
+/// while a running turn's status row stands in the live zone.
+#[must_use]
+pub fn phase(rows: &[String]) -> (Phase, bool) {
+    let Some((top, _, bottom)) = composer_rows(rows) else {
+        if card(rows).is_some() {
+            return (Phase::Prompt, true);
+        }
+        let turn_runs = rows[live_from(rows)..].iter().any(|r| stops(r));
+        return (Phase::Idle, !turn_runs && wall(rows).is_some());
+    };
+    if plan_approval(rows, bottom) {
+        return if plan_waits(rows, bottom) {
+            (Phase::Prompt, true)
+        } else {
+            (Phase::Idle, false)
+        };
+    }
+    let status = rows[..top].iter().rev().find(|r| worded(r));
+    let keys = rows[bottom + 1..].iter().find(|r| worded(r));
+    let running = status.is_some_and(|r| stops(r));
+    let spinning = status.is_some_and(|r| spins(r));
+    let cancels =
+        keys.is_some_and(|r| crate::text::contains(r, crate::anchor!("grok.keys.cancel")));
+    match (running, cancels) {
+        (true, true) => (Phase::Busy, true),
+        (false, false) if !spinning => (Phase::Idle, true),
+        _ => (Phase::Busy, false),
+    }
+}
+
+/// The box that waits on the person on `rows` ([`phase`]'s prompt), for display: `None` on any
+/// other screen. Nothing answers it here: Grok Build is read, not supervised
+/// ([`crate::Program::supervisable`]), so the options carry no role ([`Role::Other`]), and Esc,
+/// which on a card only gives the focus to the scrollback, cancels nothing.
+#[must_use]
+pub fn prompt(rows: &[String]) -> Option<PromptV2> {
+    match composer_rows(rows) {
+        Some((top, _, bottom)) => plan_waits(rows, bottom).then(|| plan_prompt(rows, top, bottom)),
+        None => card(rows).map(|c| card_prompt(rows, c)),
+    }
+}
+
+/// A card's box ([`card`]). Its first worded bar row is its title. An approval's opens with `›`:
+/// a shell command's (`›  Remove the lab file.`) carries the command on gutter rows under it
+/// (`│ rm lab-made.txt`), a file's says `Allow Edit to <path>?`, its command the path as drawn
+/// and its path only when drawn whole (a long one is shortened in its middle with `…`, measured
+/// at 70 columns), and any other is a tool's approval of a kind not measured. A question's title is the question. Its radio rows are the
+/// options, and a digit picks one (measured). A question's options are read up to the two-space
+/// gap before each one's description; an approval's carry none, and are read whole, since what
+/// one names (`Always allow: <command>`) may hold two spaces of its own.
+fn card_prompt(rows: &[String], c: Card) -> PromptV2 {
+    let title = (c.first..=c.last).find(|&i| bar_words(&rows[i]).is_some_and(worded));
+    let said = title.and_then(|i| bar_words(&rows[i])).unwrap_or_default();
+    let asked = said.strip_prefix('›').map(crate::text::trim);
+    let command_rows: Vec<String> = match (title, asked) {
+        (Some(at), Some(_)) => (at + 1..=c.last)
+            .map_while(|i| bar_words(&rows[i]).and_then(|w| w.strip_prefix('│')))
+            .map(|w| crate::text::trim(w).to_string())
+            .collect(),
+        _ => Vec::new(),
+    };
+    let file = asked
+        .and_then(|a| a.strip_prefix(crate::anchor!("grok.card.edit")))
+        .map(|p| p.strip_suffix('?').unwrap_or(p));
+    let path = file.filter(|p| !p.contains('…')).map(str::to_string);
+    let kind = match asked {
+        None => PromptKind::Question,
+        Some(_) if !command_rows.is_empty() => PromptKind::Bash,
+        Some(_) if file.is_some() => PromptKind::Edit,
+        Some(_) => PromptKind::Tool,
+    };
+    let options = (c.first..=c.last)
+        .filter_map(|i| {
+            let (key, taken, words) = radio(&rows[i])?;
+            let label = match kind {
+                PromptKind::Question => words.split_once("  ").map_or(words, |(label, _)| label),
+                _ => words,
+            };
+            Some(Opt {
+                n: key.to_digit(10).and_then(|d| u8::try_from(d).ok()),
+                label: crate::text::trim(label).to_string(),
+                role: Role::Other,
+                focused: taken,
+                row: i,
+                kept: false,
+            })
+        })
+        .collect();
+    let command = match kind {
+        PromptKind::Bash => command_rows.join(" "),
+        PromptKind::Edit => file.unwrap_or_default().to_string(),
+        _ => String::new(),
+    };
+    PromptV2 {
+        kind,
+        title: asked.unwrap_or(said).to_string(),
+        gutter: kind == PromptKind::Bash,
+        command_rows,
+        description_rows: 0,
+        command,
+        description: match kind {
+            PromptKind::Edit => String::new(),
+            _ => asked.unwrap_or(said).to_string(),
+        },
+        notes: Vec::new(),
+        auto_deny: None,
+        path,
+        options,
+        select: Select::Digits,
+        cancel: None,
+        question: title,
+        span: (c.first, c.keys),
+        footer: Some(crate::text::trim(&rows[c.keys]).to_string()),
+        head_off_screen: false,
+        question_dialog: None,
+        reason_rows: Vec::new(),
+    }
+}
+
+/// A plan approval's box ([`plan_waits`]): its title is the status row over the composer's box
+/// (`◆ Waiting on plan approval`), and its key row the one under it. Its answers are letter keys
+/// (`a approve`, `s request changes`, …), which no [`Select`] names, so it lists no option.
+fn plan_prompt(rows: &[String], top: usize, bottom: usize) -> PromptV2 {
+    let status = rows[..top].iter().rposition(|r| worded(r));
+    let keys = (bottom + 1..rows.len())
+        .find(|&i| worded(&rows[i]))
+        .unwrap_or(bottom);
+    PromptV2 {
+        kind: PromptKind::PlanExit,
+        title: status
+            .map(|i| opening(&rows[i]).to_string())
+            .unwrap_or_default(),
+        command_rows: Vec::new(),
+        description_rows: 0,
+        gutter: false,
+        command: String::new(),
+        description: String::new(),
+        notes: Vec::new(),
+        auto_deny: None,
+        path: None,
+        options: Vec::new(),
+        select: Select::Digits,
+        cancel: None,
+        question: status,
+        span: (status.unwrap_or(top), keys),
+        footer: Some(crate::text::trim(&rows[keys]).to_string()),
+        head_off_screen: false,
+        question_dialog: None,
+        reason_rows: Vec::new(),
+    }
+}
+
 /// The wall `rows` show: the sign-in screen ([`sign_in_row`], [`WallKind::Auth`]), or a row in the
 /// live zone that opens with a limit text (its window, `LIMIT_OPENERS`) or says an ended login's
 /// (`login_ended`, [`WallKind::Auth`]). Where no such row stands in the live zone, a limit upsell's
@@ -386,12 +678,16 @@ pub mod fixtures {
         include_str!("fixtures/grok-1.0.70-draft-multiline-typed.txt");
     /// A reply streaming over a one-row draft (MEASURED).
     pub const BUSY_DRAFT: &str = include_str!("fixtures/grok-1.0.70-busy-draft.txt");
+    /// A reply streaming over the empty composer, its status row ending `[stop]` (MEASURED).
+    pub const BUSY_STREAMING: &str = include_str!("fixtures/grok-1.0.70-busy-streaming.txt");
     /// A turn ended over an empty composer (MEASURED).
     pub const TURN_ENDED_EMPTY: &str = include_str!("fixtures/grok-1.0.70-turn-ended-empty.txt");
     /// A shell approval box standing, no composer drawn (MEASURED).
     pub const BOX_SHELL: &str = include_str!("fixtures/grok-1.0.70-box-shell.txt");
     /// A plan approval over the composer (MEASURED).
     pub const PLAN_APPROVAL: &str = include_str!("fixtures/grok-1.0.70-plan-approval.txt");
+    /// A question card standing, no composer drawn (MEASURED).
+    pub const QUESTION: &str = include_str!("fixtures/grok-1.0.70-question.txt");
     /// A 401's drawn authentication failure under the prompt (MEASURED).
     pub const WALL_401_1_0_70: &str = include_str!("fixtures/grok-1.0.70-wall-401.txt");
     /// A 429 after the program's one retry, its server text under the prompt (MEASURED).

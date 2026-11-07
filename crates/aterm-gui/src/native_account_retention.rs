@@ -226,7 +226,7 @@ impl Operations {
                 continue;
             };
             if !child.preparation.transfers(&request, &binding)
-                || !proof.claimed_by(&child.request)
+                || !proof.confirmed_successor(&child.request)
                 || !child
                     .authority
                     .account
@@ -235,8 +235,16 @@ impl Operations {
             {
                 continue;
             }
+            let retain_child =
+                !matches!(child.phase, Phase::Completed(_)) || child.closed_restart.is_some();
             drop(child);
-            self.account_lineages.advance(&id, candidate);
+            if retain_child {
+                self.account_lineages.advance(&id, candidate);
+            } else {
+                // An acknowledged terminal child without a live closure proof
+                // cannot be another account frontier; release its credit now.
+                self.account_lineages.entries.remove(&id);
+            }
             self.completed.retain(|old| old != &id);
             if let Some(parent) = self.by_id.remove(&id) {
                 retired.push(parent);

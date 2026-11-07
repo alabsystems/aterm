@@ -131,9 +131,9 @@ pub struct TabFact {
     pub key: u64,
     /// Its stable session id (`s-…`).
     pub sid: String,
-    /// Its window, 1-based; `None` for a session no window shows.
+    /// Its window's stable id (`sessions`' `window=`); `None` for a session no window shows.
     pub window: Option<usize>,
-    /// Its tab in that window, 1-based.
+    /// Its tab's place in that window's tab bar, 1-based.
     pub tab: Option<usize>,
 }
 
@@ -144,9 +144,9 @@ pub struct Target {
     pub key: u64,
     /// Its stable session id.
     pub sid: String,
-    /// Its window, 1-based.
+    /// Its window's stable id (`sessions`' `window=`).
     pub window: Option<usize>,
-    /// Its tab, 1-based.
+    /// Its tab's place in that window's tab bar, 1-based.
     pub tab: Option<usize>,
     /// Every session in its tab (its split panes), itself included.
     pub panes: Vec<u64>,
@@ -237,6 +237,9 @@ pub enum Gap {
     Reset,
     /// The reply it names has left the ring.
     Evicted,
+    /// The reply it names is another request's: another view, scope, `top=`, `depth=`, subject,
+    /// target or caller tab, or `--json` where this one has none (or the reverse).
+    OtherRequest,
 }
 
 impl Gap {
@@ -246,6 +249,7 @@ impl Gap {
         match self {
             Self::Reset => "reset",
             Self::Evicted => "evicted",
+            Self::OtherRequest => "other-request",
         }
     }
 }
@@ -312,7 +316,7 @@ impl Ctx<'_> {
         self.tabs.iter().find(|t| t.key == key).and_then(|t| t.tab)
     }
 
-    /// The window number of the session `key`, where known.
+    /// The window id of the session `key` (`sessions`' `window=`), where known.
     #[must_use]
     pub fn window_number(&self, key: u64) -> Option<usize> {
         self.tabs

@@ -211,6 +211,7 @@ fn publication_case_with_unread_policy(cli: Cli, case: i64, unread: u8) -> [bool
             mailbox: &ladder_mailbox_files,
             log: std::sync::Arc::new(|_| {}),
             run_attempt: None,
+            save_oauth: |_, _| Ok("inert".into()),
             shared: shared_renewal::Effects::default(),
         };
         let before = fs::read(store.logins_file()).unwrap();

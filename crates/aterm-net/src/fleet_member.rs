@@ -6419,6 +6419,25 @@ pub enum Unreached {
     Local(String),
 }
 
+/// Every token a survey's error row may carry as `"reason"`: each [`Unreached::reason`], and
+/// `gone` for a member that left this network's link (the reader's
+/// `aterm_netplace::words::GONE_FROM_THE_LINK` row).
+pub const REASONS: &[&str] = &[
+    "no-name",
+    "nothing-listens",
+    "no-answer",
+    "no-route",
+    "refused-here",
+    "reset",
+    "connect",
+    "no-handshake",
+    "handshake",
+    "no-reply",
+    "identity",
+    "not-dialled",
+    "gone",
+];
+
 /// Where a peer's one deadline came ([`Unreached::Deadline`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
@@ -6515,6 +6534,35 @@ impl Unreached {
                     | io::ErrorKind::UnexpectedEof
             )
         )
+    }
+
+    /// One token for the kind of failure, out of [`REASONS`]: what a reader groups and draws by,
+    /// where the words ([`fmt::Display`]) name the address and are for a person. A survey's
+    /// error row carries it as `"reason"`.
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Resolve(_) | Self::Lookup(..) => "no-name",
+            Self::Connect(_, e) => match e.kind() {
+                io::ErrorKind::ConnectionRefused => "nothing-listens",
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => "no-answer",
+                io::ErrorKind::HostUnreachable | io::ErrorKind::NetworkUnreachable => "no-route",
+                io::ErrorKind::PermissionDenied => "refused-here",
+                io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted => "reset",
+                _ => "connect",
+            },
+            Self::Deadline(Stage::Connect, _) => "no-answer",
+            Self::Deadline(Stage::Handshake, _) => "no-handshake",
+            Self::Handshake(..) if self.hung_up() => "no-handshake",
+            Self::Handshake(..) => "handshake",
+            Self::Reply(..) | Self::Deadline(Stage::Answer | Stage::Book, _) => "no-reply",
+            Self::OtherNode { .. }
+            | Self::Impostor { .. }
+            | Self::Misnamed { .. }
+            | Self::Unproved { .. }
+            | Self::Unbound { .. } => "identity",
+            Self::NotFleet(_) | Self::Local(_) => "not-dialled",
+        }
     }
 
     /// Whether the listener took the connection and only could not serve this dial just then: it

@@ -56,7 +56,7 @@ fn trial_with_stamp(case: i64, action: &str, stamped: bool) -> [i64; 7] {
                 .unwrap();
             }
             2 => {
-                std::fs::write(
+                crate::test_config::write(
                     world.cfg.join("aterm.toml"),
                     "[harness]\naccounts = 'off'\n",
                 )
@@ -221,7 +221,7 @@ fn a_nonmoving_plan_commits_without_touching_the_store_again() {
     let cli = Cli::Codex;
     world.two(cli);
     world.on_main(cli, &[]);
-    std::fs::write(
+    crate::test_config::write(
         world.cfg.join("aterm.toml"),
         "[harness]\naccounts = 'off'\n",
     )

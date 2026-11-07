@@ -16,6 +16,11 @@ use std::time::{Duration, Instant};
 /// The default APIs retain their existing one-MiB limit.
 pub const MAX_COMPLETE_STDOUT_BYTES: usize = 16 * 1024 * 1024;
 
+/// Hard maximum for [`output_until_complete_listing`]: 64 MiB, which holds Spotlight's listing
+/// of every page of several toolchains' docs (`aterm doctor`'s `spotlight:` row reads one of
+/// some 22 MB on a Mac with three, and refuses one past this rather than count it short).
+pub const MAX_COMPLETE_LISTING_BYTES: usize = 64 * 1024 * 1024;
+
 /// Why a call requiring complete stdout cannot use the child's output.
 #[derive(Debug)]
 pub enum CompleteOutputError {
@@ -249,7 +254,44 @@ pub fn output_until_complete_stdout_with_limit(
     deadline: Instant,
     limit: usize,
 ) -> Result<Output, CompleteOutputError> {
-    if limit > MAX_COMPLETE_STDOUT_BYTES {
+    capped(cmd, deadline, limit, MAX_COMPLETE_STDOUT_BYTES)
+}
+
+/// As [`output_until_complete_stdout_with_limit`], for a listing that runs to tens of MiB: an
+/// explicit inclusive limit no larger than [`MAX_COMPLETE_LISTING_BYTES`], so the callers sized
+/// by [`MAX_COMPLETE_STDOUT_BYTES`] keep their bound.
+///
+/// # Errors
+/// An `InvalidInput` spawn refusal before dispatch for an excessive limit;
+/// otherwise the same refusals as [`output_until_complete_stdout`].
+pub fn output_until_complete_listing(
+    cmd: &mut Command,
+    deadline: Instant,
+    limit: usize,
+) -> Result<Output, CompleteOutputError> {
+    capped(cmd, deadline, limit, MAX_COMPLETE_LISTING_BYTES)
+}
+
+/// As [`output_until_complete_listing`], ending `within` from now.
+///
+/// # Errors
+/// The same errors as [`output_until_complete_listing`].
+pub fn output_within_complete_listing(
+    cmd: &mut Command,
+    within: Duration,
+    limit: usize,
+) -> Result<Output, CompleteOutputError> {
+    output_until_complete_listing(cmd, super::saturating_after(Instant::now(), within), limit)
+}
+
+/// A complete capture of at most `limit` bytes of stdout, refused before dispatch past `cap`.
+fn capped(
+    cmd: &mut Command,
+    deadline: Instant,
+    limit: usize,
+    cap: usize,
+) -> Result<Output, CompleteOutputError> {
+    if limit > cap {
         return Err(CompleteOutputError::Run(RunError::Spawn(io::Error::new(
             io::ErrorKind::InvalidInput,
             "complete stdout limit exceeds hard maximum",
@@ -261,6 +303,54 @@ pub fn output_until_complete_stdout_with_limit(
         deadline,
         || {},
         move |pipe, stream| drain_stdout_with_limit(pipe, stream, limit),
+    )
+}
+
+/// Capture complete stdout read as `separator`-ended records, keeping only those `keep`
+/// accepts: the run reads its whole stdout to proven EOF however long it is, while what it holds
+/// stays within `limit` (at most [`MAX_COMPLETE_STDOUT_BYTES`]). The answer's stdout is the kept
+/// records, each with its separator; a last record with none is offered too and kept as it ends.
+/// Stderr retains the bounded-tail policy.
+///
+/// # Errors
+/// An `InvalidInput` spawn refusal before dispatch for an excessive limit;
+/// [`CompleteOutputError::StdoutTooLarge`] once the kept records, or one record being read,
+/// pass `limit`; otherwise the same refusals as [`output_until_complete_stdout`].
+pub fn output_within_complete_stdout_records(
+    cmd: &mut Command,
+    within: Duration,
+    separator: u8,
+    limit: usize,
+    keep: impl FnMut(&[u8]) -> bool + Send + 'static,
+) -> Result<Output, CompleteOutputError> {
+    output_within_complete_stdout_records_from(cmd, Stdio::null(), within, separator, limit, keep)
+}
+
+/// As [`output_within_complete_stdout_records`], with `stdin` as the child's standard input.
+///
+/// # Errors
+/// The same errors as [`output_within_complete_stdout_records`].
+pub fn output_within_complete_stdout_records_from(
+    cmd: &mut Command,
+    stdin: Stdio,
+    within: Duration,
+    separator: u8,
+    limit: usize,
+    keep: impl FnMut(&[u8]) -> bool + Send + 'static,
+) -> Result<Output, CompleteOutputError> {
+    if limit > MAX_COMPLETE_STDOUT_BYTES {
+        return Err(CompleteOutputError::Run(RunError::Spawn(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "complete stdout limit exceeds hard maximum",
+        ))));
+    }
+    let deadline = super::saturating_after(Instant::now(), within);
+    capture(
+        cmd,
+        stdin,
+        deadline,
+        || {},
+        move |pipe, stream| drain_stdout_records(pipe, stream, separator, limit, keep),
     )
 }
 
@@ -485,6 +575,84 @@ fn drain_stdout_with_limit(
         .name("child-complete-stdout".into())
         .spawn(move || {
             let result = read_stdout(stream, limit);
+            let _ = finished.send(result);
+        })?;
+    Ok(CompleteDrain { ended, pipe })
+}
+
+/// `stream` read to its end as `separator`-ended records, the ones `keep` accepts kept with
+/// their separators, within `limit` held bytes. Past `limit` it reads on to the end, keeping
+/// nothing, so the refusal still waits on the writer's EOF.
+fn read_records(
+    mut stream: impl Read,
+    separator: u8,
+    limit: usize,
+    mut keep: impl FnMut(&[u8]) -> bool,
+) -> Result<Vec<u8>, CompleteOutputError> {
+    let mut kept = Vec::new();
+    let mut record = Vec::new();
+    let mut too_large = false;
+    let mut chunk = [0u8; 8192];
+    let mut offer = |record: &[u8], body: &[u8], kept: &mut Vec<u8>| {
+        if !keep(body) {
+            return true;
+        }
+        if kept.len() + record.len() > limit {
+            return false;
+        }
+        kept.extend_from_slice(record);
+        true
+    };
+    loop {
+        let n = match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(CompleteOutputError::StdoutRead(error)),
+        };
+        if too_large {
+            continue;
+        }
+        for piece in chunk[..n].split_inclusive(|b| *b == separator) {
+            record.extend_from_slice(piece);
+            // `limit` bounds a record's body; its separator is not held against it.
+            if record.len() - usize::from(record.last() == Some(&separator)) > limit {
+                too_large = true;
+                break;
+            }
+            if record.last() == Some(&separator) {
+                let body = &record[..record.len() - 1];
+                if !offer(&record, body, &mut kept) {
+                    too_large = true;
+                    break;
+                }
+                record.clear();
+            }
+        }
+        if too_large {
+            record = Vec::new();
+            kept = Vec::new();
+        }
+    }
+    if too_large || (!record.is_empty() && !offer(&record, &record, &mut kept)) {
+        return Err(CompleteOutputError::StdoutTooLarge { limit });
+    }
+    Ok(kept)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn drain_stdout_records(
+    pipe: Option<PipeEnd>,
+    stream: impl Read + Send + 'static,
+    separator: u8,
+    limit: usize,
+    keep: impl FnMut(&[u8]) -> bool + Send + 'static,
+) -> io::Result<CompleteDrain> {
+    let (finished, ended) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("child-complete-records".into())
+        .spawn(move || {
+            let result = read_records(stream, separator, limit, keep);
             let _ = finished.send(result);
         })?;
     Ok(CompleteDrain { ended, pipe })

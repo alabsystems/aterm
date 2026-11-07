@@ -33,6 +33,12 @@ use closed_restart::ClosedRestart;
 mod account_continuation;
 use account_continuation::AccountContinuation;
 
+#[path = "native_account_observation.rs"]
+mod account_observation;
+
+#[path = "native_account_claim.rs"]
+mod account_claim;
+
 #[path = "native_account_retention.rs"]
 mod account_retention;
 use account_retention::{AccountLineages, AccountSlot};
@@ -945,12 +951,31 @@ impl Operation {
                     .is_some_and(|seal| seal.intent_active()))
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountNoEffectClosure",
+            action = "Close",
+            project = "native_act::tests::account_continuation_tests::claim_model::noeffect_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountNoEffectClosure",
+            action = "CohortGone",
+            reason = "The retained kernel witness observes cohort drainage"
+        )
+    )]
     fn seal_without_effect(&mut self, kernel: &dyn Kernel) -> Option<Completion> {
         if !self.preparation.can_publish() || self.grant_record != GrantRecord::None {
             return None;
         }
         if self.resume_only && retirement(self, kernel) == Some(Retirement::NotGranted) {
             self.seal_retirement(Retirement::NotGranted, kernel)
+        } else if self.authority.account.is_some() {
+            // Missing cohort evidence is not an opaque terminal account outcome.
+            None
         } else {
             self.seal_completion(Decision::ProvenNotCommittedRollbackSafe)
         }
@@ -1016,7 +1041,36 @@ enum Phase {
 /// Process/image facts are injected in conformance tests; the production arm reads the
 /// kernel, never a caller's holder, argv text, pathname alone or status-as-permission.
 trait Kernel {
+    fn record_account_closure(
+        &self,
+        _prepare: &Prepare,
+        _binding: &Binding,
+        _phase: ImagePhase,
+    ) -> Option<account_observation::ClosureRecord> {
+        None
+    }
+    fn recover_account_observation(
+        &self,
+        _relation: &aterm_agent::harness::native_account_wire::Relation,
+        _binding: &Binding,
+    ) -> Option<account_observation::ClaimRecord> {
+        None
+    }
     fn record_prepared(&self, prepare: &Prepare, binding: &Binding) -> bool;
+    fn record_account_claim(
+        &self,
+        _relation: &aterm_agent::harness::native_account_wire::Relation,
+        _binding: &Binding,
+    ) -> Option<aterm_agent::harness::native_account_wire::ChildState> {
+        None
+    }
+    fn recover_account_claim(
+        &self,
+        _relation: &aterm_agent::harness::native_account_wire::Relation,
+        _binding: &Binding,
+    ) -> Option<aterm_agent::harness::native_account_wire::ChildState> {
+        None
+    }
     fn record_successor(
         &self,
         predecessor: &Prepare,
@@ -1028,7 +1082,7 @@ trait Kernel {
     fn record_sealed(&self, prepare: &Prepare, binding: &Binding) -> bool;
     /// The private control worker calls this after sealing and draining, outside
     /// every native/GUI lock. It is never an execution or successor grant.
-    fn record_noexec(&self, prepare: &Prepare, binding: &Binding) -> bool;
+    fn record_noexec(&self, prepare: &Prepare, binding: &Binding, phase: ImagePhase) -> bool;
     /// Authenticated read-only history; absent, damaged or unavailable is false.
     fn historical_noexec(&self, request: &Request) -> bool;
     fn recorded_operation(&self, id: &str) -> Result<bool, ()>;
@@ -1083,6 +1137,93 @@ trait Kernel {
 struct System<'a>(&'a crate::native_session_policy::SessionPolicy, bool);
 
 impl Kernel for System<'_> {
+    fn record_account_closure(
+        &self,
+        prepare: &Prepare,
+        binding: &Binding,
+        phase: ImagePhase,
+    ) -> Option<account_observation::ClosureRecord> {
+        #[cfg(unix)]
+        {
+            let record =
+                aterm_agent::harness::native_receipts::noexec_in_phase(prepare, binding, phase)
+                    .ok()?;
+            Some(account_observation::ClosureRecord {
+                phase: record.phase,
+                sequence: record.sequence,
+                recorded_ms: record.recorded_ms,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (prepare, binding, phase);
+            None
+        }
+    }
+    fn recover_account_observation(
+        &self,
+        relation: &aterm_agent::harness::native_account_wire::Relation,
+        binding: &Binding,
+    ) -> Option<account_observation::ClaimRecord> {
+        #[cfg(unix)]
+        {
+            use aterm_agent::harness::native_receipts;
+            let record = native_receipts::recover_account_successor(
+                native_receipts::AccountRelation {
+                    predecessor: relation.predecessor().prepare(),
+                    predecessor_binding: relation.predecessor().binding(),
+                    phase: relation.phase(),
+                    candidate: relation.candidate(),
+                },
+                binding,
+            )
+            .ok()??;
+            Some(account_observation::ClaimRecord {
+                state: account_continuation::recorded_state(record.outcome)?,
+                sequence: record.sequence,
+                recorded_ms: record.recorded_ms,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (relation, binding);
+            None
+        }
+    }
+    fn recover_account_claim(
+        &self,
+        relation: &aterm_agent::harness::native_account_wire::Relation,
+        binding: &Binding,
+    ) -> Option<aterm_agent::harness::native_account_wire::ChildState> {
+        self.recover_account_observation(relation, binding)
+            .map(|record| record.state)
+    }
+    fn record_account_claim(
+        &self,
+        relation: &aterm_agent::harness::native_account_wire::Relation,
+        binding: &Binding,
+    ) -> Option<aterm_agent::harness::native_account_wire::ChildState> {
+        #[cfg(unix)]
+        {
+            use aterm_agent::harness::native_receipts;
+            let observation = native_receipts::claim_account_successor(
+                native_receipts::AccountRelation {
+                    predecessor: relation.predecessor().prepare(),
+                    predecessor_binding: relation.predecessor().binding(),
+                    phase: relation.phase(),
+                    candidate: relation.candidate(),
+                },
+                binding,
+            )
+            .ok()?;
+            account_continuation::recorded_state(observation.outcome)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (relation, binding);
+            None
+        }
+    }
     fn resolve_cold(
         &self,
         _ctx: &crate::SessionCtx,
@@ -1163,14 +1304,14 @@ impl Kernel for System<'_> {
             Ok(false)
         }
     }
-    fn record_noexec(&self, prepare: &Prepare, binding: &Binding) -> bool {
+    fn record_noexec(&self, prepare: &Prepare, binding: &Binding, phase: ImagePhase) -> bool {
         #[cfg(unix)]
         {
-            aterm_agent::harness::native_receipts::noexec(prepare, binding).is_ok()
+            aterm_agent::harness::native_receipts::noexec_in_phase(prepare, binding, phase).is_ok()
         }
         #[cfg(not(unix))]
         {
-            let _ = (prepare, binding);
+            let _ = (prepare, binding, phase);
             false
         }
     }
@@ -1802,7 +1943,10 @@ fn persist_noexec_predecessor(
         {
             return Err(UNKNOWN);
         }
-        (op.request.clone(), op.binding.clone())
+        if op.resume_phase.unwrap_or(ImagePhase::Forward) != proof.closed_phase() {
+            return Err(UNKNOWN);
+        }
+        (op.request.clone(), op.binding.clone(), proof.closed_phase())
     };
     // A sweep may have closed the operation without a control response. Finish
     // publishing its positive NoExec before consuming the in-memory successor
@@ -1810,7 +1954,7 @@ fn persist_noexec_predecessor(
     let _handoff = aterm_types::update_boundary::Boundary::process()
         .try_hold(aterm_types::update_boundary::GuardedItem::HarnessNativeMutation)
         .ok_or(UNKNOWN)?;
-    if kernel.record_noexec(&record.0, &record.1) {
+    if kernel.record_noexec(&record.0, &record.1, record.2) {
         Ok(())
     } else {
         Err(UNKNOWN)
@@ -2188,10 +2332,13 @@ fn prepare_inner(
         capability,
     };
     let custody = Arc::new(custody);
-    if continuation
-        .as_ref()
-        .is_some_and(|proof| !proof.claim_successor(&request))
-    {
+    if continuation.as_ref().is_some_and(|proof| {
+        if authority.account.is_some() {
+            !proof.reserve_account_successor(&request)
+        } else {
+            !proof.claim_successor(&request)
+        }
+    }) {
         drop(table);
         drop(meta);
         drop(custody);
@@ -3371,9 +3518,11 @@ fn reconcile_extinct_by(ctx: &crate::SessionCtx, kernel: &dyn Kernel) {
             && !op.resume_sent
             && op.resume_attempt.is_none()
         {
-            let completion = op.seal_without_effect(kernel);
+            let Some(completion) = op.seal_without_effect(kernel) else {
+                continue;
+            };
             drop(op);
-            let _receipt = finish(ctx, &operation, completion);
+            let _receipt = finish(ctx, &operation, Some(completion));
             ctx.watchers.ring_watchers();
             continue;
         }
@@ -3480,7 +3629,7 @@ fn request_operation(ctx: &crate::SessionCtx, request: &Request) -> Option<Arc<M
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TerminalRecord {
-    NoExec,
+    NoExec(ImagePhase),
     Sealed,
 }
 
@@ -3524,7 +3673,20 @@ enum TerminalRecord {
         reason = "Other native request handlers can return Unknown for an already terminal operation"
     )
 )]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "TerminalPublication",
+        action = "StartRollback",
+        reason = "The Resume protocol establishes the active phase before terminal publication"
+    )
+)]
 fn terminal_record(op: &Operation, reply: &str) -> Option<TerminalRecord> {
+    // These classifications were already acknowledged by exact claim recovery.
+    // Observing possible execution must not silently append a new opaque seal.
+    if op.preparation.terminal_already_recorded() {
+        return None;
+    }
     if !op.preparation.can_publish()
         || matches!(op.request.plan, NativePlan::OwnImage { .. })
         || !matches!(op.phase, Phase::Completed(_))
@@ -3540,11 +3702,19 @@ fn terminal_record(op: &Operation, reply: &str) -> Option<TerminalRecord> {
             if op.grant_record != GrantRecord::None {
                 return None;
             }
-            TerminalRecord::NoExec
+            let phase = op.resume_phase.unwrap_or(ImagePhase::Forward);
+            if op
+                .closed_restart
+                .as_ref()
+                .is_some_and(|proof| proof.closed_phase() != phase)
+            {
+                return None;
+            }
+            TerminalRecord::NoExec(phase)
         }
         _ => TerminalRecord::Sealed,
     };
-    (reply != NOEXEC || record == TerminalRecord::NoExec).then_some(record)
+    (reply != NOEXEC || matches!(record, TerminalRecord::NoExec(_))).then_some(record)
 }
 
 /// The reply may have been captured before the drain settled. Its text cannot
@@ -3675,7 +3845,7 @@ fn serve_with_publication(
             |record| {
                 let (prepare, binding, _) = evidence.as_ref().expect("selected terminal evidence");
                 match record {
-                    TerminalRecord::NoExec => kernel.record_noexec(prepare, binding),
+                    TerminalRecord::NoExec(phase) => kernel.record_noexec(prepare, binding, phase),
                     TerminalRecord::Sealed => kernel.record_sealed(prepare, binding),
                 }
             },
@@ -3847,10 +4017,12 @@ fn serve_request(
             if op.phase != Phase::Started || !before_mutation {
                 return UNKNOWN.into();
             }
-            let completion = op.seal_without_effect(kernel);
+            let Some(completion) = op.seal_without_effect(kernel) else {
+                return UNKNOWN.into();
+            };
             drop(op);
             kernel.completion_sealed();
-            finish(ctx, &operation, completion)
+            finish(ctx, &operation, Some(completion))
         }
         Request::Reconcile(_) => {
             if matches!(op.phase, Phase::Completed(_)) {

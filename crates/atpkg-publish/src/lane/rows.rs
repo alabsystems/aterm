@@ -12,7 +12,7 @@ use crate::api::Build;
 use crate::artifact::pkgdoc::{manifest_name, sig_name};
 use crate::artifact::upload::tag;
 use crate::error::{Error, Result};
-use crate::host::{HostError, HostRef, Slug};
+use crate::host::{HostError, HostRef, Probe, Slug};
 use crate::quad::VerifiedQuad;
 use crate::triple::Triple;
 
@@ -72,7 +72,28 @@ pub enum Fetched {
     Invalid(String),
 }
 
-/// Downloads `pkg-<program>-<build>.toml` and its `.sig` from `slug` into `dir` and verifies it.
+/// Fetch a published package without requesting a draft-inclusive writer read.
+/// The package must still verify under the supplied fresh quad and exact program/build.
+#[must_use]
+pub fn fetch_published(
+    host: &HostRef,
+    slug: &Slug,
+    program: &str,
+    build: Build,
+    dir: &Path,
+    quad: &VerifiedQuad,
+) -> Fetched {
+    fetch_with(host, slug, program, build, dir, quad, Visibility::Published)
+}
+
+#[derive(Clone, Copy)]
+enum Visibility {
+    Drafts,
+    Published,
+}
+
+/// Downloads a draft-inclusive publisher view of the package and its signature, then verifies
+/// it. Public-only readers use [`fetch_published`] without requiring the writer identity.
 #[must_use]
 pub fn fetch(
     host: &HostRef,
@@ -82,17 +103,39 @@ pub fn fetch(
     dir: &Path,
     quad: &VerifiedQuad,
 ) -> Fetched {
+    fetch_with(host, slug, program, build, dir, quad, Visibility::Drafts)
+}
+
+fn fetch_with(
+    host: &HostRef,
+    slug: &Slug,
+    program: &str,
+    build: Build,
+    dir: &Path,
+    quad: &VerifiedQuad,
+    visibility: Visibility,
+) -> Fetched {
     let tag = tag(program, build);
     let (pkg, sig) = (manifest_name(program, build), sig_name(program, build));
-    match host.release(slug, &tag) {
-        Ok(_) => {}
-        Err(HostError::NotFound) => return Fetched::Absent(format!("{slug} has no release {tag}")),
-        Err(e) => return Fetched::Unreachable(format!("{slug} {tag}: {e}")),
+    if matches!(visibility, Visibility::Drafts) {
+        match host.release(slug, &tag) {
+            Ok(_) => {}
+            Err(HostError::NotFound) => {
+                return Fetched::Absent(format!("{slug} has no release {tag}"));
+            }
+            Err(e) => return Fetched::Unreachable(format!("{slug} {tag}: {e}")),
+        }
     }
     let mut last = String::new();
     let mut fetched = false;
     for _ in 0..3 {
-        match host.download(slug, &tag, &[pkg.as_str(), sig.as_str()], dir) {
+        let download = match visibility {
+            Visibility::Drafts => host.download(slug, &tag, &[pkg.as_str(), sig.as_str()], dir),
+            // The published asset transport proves visibility itself; a tag-existence read
+            // would add a round trip without contributing package signature authority.
+            Visibility::Published => download_public(host, slug, &tag, &pkg, &sig, dir),
+        };
+        match download {
             Ok(()) => {
                 fetched = true;
                 break;
@@ -123,4 +166,25 @@ pub fn fetch(
         )),
         Err(e) => Fetched::Invalid(format!("{pkg} on {slug}: {e}")),
     }
+}
+
+fn download_public(
+    host: &HostRef,
+    slug: &Slug,
+    tag: &str,
+    package: &str,
+    signature: &str,
+    dir: &Path,
+) -> std::result::Result<(), HostError> {
+    for (name, cap) in [
+        (package, atpkg::net::MANIFEST_CAP),
+        (signature, atpkg::net::SIG_CAP),
+    ] {
+        match host.fetch_public(slug, tag, name, &dir.join(name), cap) {
+            Probe::Present => {}
+            Probe::Absent => return Err(HostError::NotFound),
+            Probe::Unknown(why) => return Err(HostError::Unreachable(why)),
+        }
+    }
+    Ok(())
 }

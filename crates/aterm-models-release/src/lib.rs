@@ -9,8 +9,12 @@
 
 mod models_release;
 mod models_release_publish_once;
+mod models_release_qualify;
+mod models_release_sign_beside;
 mod models_trust_facts;
 
 pub use models_release::*;
 pub use models_release_publish_once::release_publish_once_model;
+pub use models_release_qualify::release_qualify_model;
+pub use models_release_sign_beside::release_sign_beside_publish_model;
 pub use models_trust_facts::trust_facts_reuse_model;

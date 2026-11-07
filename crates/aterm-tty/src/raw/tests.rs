@@ -344,33 +344,51 @@ fn run_child(how: &str, slave: &OwnedFd) -> std::process::Output {
 
 #[test]
 fn restores_on_panic_and_on_sigterm() {
-    for how in ["panic", "sigterm"] {
-        let (master, slave) = pty();
-        let before = Termios::read(slave.as_raw_fd()).expect("the slave's settings");
-        let out = run_child(how, &slave);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        match how {
-            "panic" => assert_eq!(out.status.code(), Some(101), "{how}: {stderr}"),
-            _ => assert_eq!(out.status.signal(), Some(libc::SIGTERM), "{how}: {stderr}"),
+    for utf8 in [false, true] {
+        for how in ["panic", "sigterm"] {
+            let (master, slave) = pty();
+            let mut configured = Termios::read(slave.as_raw_fd()).expect("the slave's settings");
+            // SAFETY: `configured` owns an aligned termios just filled by tcgetattr.
+            let flags = unsafe { &mut (*configured.as_mut_ptr()).c_iflag };
+            if utf8 {
+                *flags |= libc::IUTF8;
+            } else {
+                *flags &= !libc::IUTF8;
+            }
+            configured
+                .apply(slave.as_raw_fd(), libc::TCSANOW)
+                .expect("configure UTF-8 mode");
+            let before = Termios::read(slave.as_raw_fd()).expect("the slave's settings");
+            // SAFETY: `before` owns an aligned termios just filled by tcgetattr.
+            assert_eq!(
+                unsafe { (*before.as_ptr()).c_iflag } & libc::IUTF8 != 0,
+                utf8
+            );
+            let out = run_child(how, &slave);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            match how {
+                "panic" => assert_eq!(out.status.code(), Some(101), "{how}: {stderr}"),
+                _ => assert_eq!(out.status.signal(), Some(libc::SIGTERM), "{how}: {stderr}"),
+            }
+            let after = Termios::read(slave.as_raw_fd()).expect("the settings after");
+            assert_eq!(
+                settings(&after),
+                settings(&before),
+                "{how}: the settings are back"
+            );
+            let mut reader = Seen::new(master);
+            let seen = reader.until(b"\x1b[?1049l");
+            let mark = seen
+                .windows(RAW_MARK.len())
+                .position(|w| w == RAW_MARK)
+                .unwrap_or_else(|| panic!("{how}: the child set raw mode first: {stderr}"));
+            assert_ne!(
+                modes_after(&seen[..mark]),
+                untouched(),
+                "{how}: the modes took"
+            );
+            assert_eq!(modes_after(seen), untouched(), "{how}");
         }
-        let after = Termios::read(slave.as_raw_fd()).expect("the settings after");
-        assert_eq!(
-            settings(&after),
-            settings(&before),
-            "{how}: the settings are back"
-        );
-        let mut reader = Seen::new(master);
-        let seen = reader.until(b"\x1b[?1049l");
-        let mark = seen
-            .windows(RAW_MARK.len())
-            .position(|w| w == RAW_MARK)
-            .unwrap_or_else(|| panic!("{how}: the child set raw mode first: {stderr}"));
-        assert_ne!(
-            modes_after(&seen[..mark]),
-            untouched(),
-            "{how}: the modes took"
-        );
-        assert_eq!(modes_after(seen), untouched(), "{how}");
     }
 }
 
@@ -447,10 +465,68 @@ fn suspend_puts_back_then_reenters() {
 }
 
 #[test]
+fn controlling_terminal_attachment_preserves_termios() {
+    let exe = std::env::current_exe().expect("the test binary");
+    let (master, slave, mut child) = aterm_pty::spawn_session_leader_on_pty(|slave| {
+        let before = Termios::read(slave.as_raw_fd())?;
+        #[expect(
+            clippy::disallowed_types,
+            reason = "spawn_session_leader_on_pty installs InheritNothing and controlling-terminal pre_exec"
+        )]
+        let mut command = std::process::Command::new(&exe);
+        command
+            .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads", "1"])
+            .env(CHILD, "baseline")
+            .env("ATERM_TTY_EXPECTED_SETTINGS", settings(&before))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        Ok(command)
+    })
+    .expect("a child on its own controlling terminal");
+    let status = aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(10), || {
+        child.try_wait().expect("the child's status")
+    });
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the baseline child did not finish");
+    }
+    let output = child.wait_with_output().expect("the child's report");
+    assert!(
+        output.status.success(),
+        "baseline mismatch: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("controlling terminal baseline checked"),
+        "the child checked its settings"
+    );
+    drop((master, slave));
+}
+
+#[test]
 fn child() {
     let Ok(how) = std::env::var(CHILD) else {
         return;
     };
+    if how == "baseline" {
+        let expected = std::env::var("ATERM_TTY_EXPECTED_SETTINGS").expect("parent's baseline");
+        let current = Termios::read(0).expect("the attached controlling terminal");
+        assert_eq!(
+            settings(&current),
+            expected,
+            "after controlling-terminal attachment"
+        );
+        let tty = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .expect("the child's controlling terminal");
+        let current = Termios::read(tty.as_raw_fd()).expect("settings through /dev/tty");
+        assert_eq!(settings(&current), expected, "after opening /dev/tty");
+        println!("controlling terminal baseline checked");
+        return;
+    }
     let mut guard = RawGuard::enter(0).expect("raw mode on the pty");
     let mut modes = ALL_MODES;
     if how == "sigterm" {

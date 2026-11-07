@@ -511,8 +511,9 @@ const STARTER_CONFIG: &str = concat!(
 # --- program permissions (default OFF unless noted) --------------------------
 # allow_window_ops = false         # XTWINOPS title/grid/pixel/cell-size reports (position/screen size stay unanswered);
 #                                  #   Linux also applies window ops except move
-# allow_notifications = false      # OSC 9/99/777 desktop notifications (default off; macOS: UNUserNotificationCenter
-#                                  #   from Applications/aterm.app once authorized, else /usr/bin/osascript;
+# allow_notifications = false      # OSC 9/99/777 desktop notifications (default off; macOS: aterm.app posts through
+#                                  #   UNUserNotificationCenter once macOS allows it, and only turning the Settings row
+#                                  #   on asks, not this line; a bare binary uses /usr/bin/osascript;
 #                                  #   Windows: Shell_NotifyIcon balloon/toast; Linux: D-Bus org.freedesktop.Notifications)
 # allow_palette_reconfigure = true   # allow OSC 4/21 256-colour palette changes for the session (default ON)
 # allow_kitty_file_transfer = false # allow Kitty file/temp-file/shm media to read host files (new sessions)

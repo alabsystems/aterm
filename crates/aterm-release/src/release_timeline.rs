@@ -3,7 +3,9 @@
 
 //! Where one release run's time and CPU went, read back from the records its steps left
 //! (`docs/DESIGN-fast-build-release-2026-11-05.md` §4.1, A1): the release's `release-stage`
-//! events in `transcript.log`, and in every step log the `step-child-finished` record of each
+//! events in `transcript.log`, step 4's `qualify-branch` events there (each branch's start, its
+//! staging push and its end, and the log it wrote), and in every step log the
+//! `step-child-finished` record of each
 //! child (`wait4`'s CPU and peak), verify's `stage-started`/`stage-finished`, the slices'
 //! `build-child-finished`, `compile-finished`, the inputs seal's `inputs`, verify's `disk`
 //! record and the publish step's `publish-line` arrivals. A run that another handed the release
@@ -31,6 +33,27 @@ struct StepRow {
     execution_s: Option<f64>,
 }
 
+/// One run of a qualify graph branch, from its `qualify-branch` events.
+struct QualifyRow {
+    branch: String,
+    /// The branch's log's file name; its side logs are `<stem>-*.log`.
+    log: Option<String>,
+    started_at_unix_s: Option<u64>,
+    push_began_at_unix_s: Option<u64>,
+    ended_at_unix_s: Option<u64>,
+    outcome: Option<String>,
+    execution_s: Option<u64>,
+}
+
+/// One `step-child-finished` record: the log it was in, when the child ended, and what `wait4`
+/// booked for it.
+struct ChildRow {
+    log: String,
+    ended_at_unix_ms: Option<u64>,
+    cpu_s: Option<f64>,
+    peak_bytes: Option<u64>,
+}
+
 #[derive(Default)]
 struct ChildTotals {
     cpu_s: Option<f64>,
@@ -48,6 +71,9 @@ pub struct Timeline {
     run_started_at_unix_s: Option<u64>,
     steps: Vec<StepRow>,
     step_children: BTreeMap<String, ChildTotals>,
+    /// Every step child, by the log it was in: a qualify branch's are its log's.
+    children: Vec<ChildRow>,
+    qualify: Vec<QualifyRow>,
     branches: Vec<aterm_json::Value>,
     /// Verify's open stages, by (log, stage index): when each started.
     open_stages: BTreeMap<(String, u64), Option<u64>>,
@@ -111,6 +137,7 @@ impl Timeline {
         }
         match event["event"].as_str() {
             Some("release-stage") => self.release_stage(event),
+            Some("qualify-branch") => self.qualify_branch(event),
             Some("step-child-finished") => {
                 let Some(step) = event["step"].as_str() else {
                     return;
@@ -126,6 +153,14 @@ impl Timeline {
                 add_f(&mut totals.cpu_s, event["child_cpu"]["observed_s"].as_f64());
                 if let Some(peak) = event["peak_bytes"].as_u64() {
                     totals.peak_bytes = Some(totals.peak_bytes.map_or(peak, |p| p.max(peak)));
+                }
+                if self.children.len() < MAX_ROWS {
+                    self.children.push(ChildRow {
+                        log: log.to_owned(),
+                        ended_at_unix_ms: event["ended_at_unix_ms"].as_u64(),
+                        cpu_s: event["child_cpu"]["observed_s"].as_f64(),
+                        peak_bytes: event["peak_bytes"].as_u64(),
+                    });
                 }
                 if step == crate::release::Step::Publish.name() {
                     self.publish_ended_at_unix_ms = event["ended_at_unix_ms"].as_u64();
@@ -252,6 +287,112 @@ impl Timeline {
         row.outcome = Some(outcome.to_owned());
         row.waiting_s = event["waiting_s"].as_f64();
         row.execution_s = event["execution_s"].as_f64();
+    }
+
+    /// A qualify branch's start opens its row, its staging push dates the row's push, and its
+    /// end (passed, red, could-not-run, stopped) closes the open row; a red dates a red.
+    fn qualify_branch(&mut self, event: &aterm_json::Value) {
+        let (Some(branch), Some(phase)) = (event["branch"].as_str(), event["phase"].as_str())
+        else {
+            return;
+        };
+        let at = event["at_unix_s"].as_u64();
+        if phase == "started" {
+            if self.qualify.len() < MAX_ROWS {
+                self.qualify.push(QualifyRow {
+                    branch: branch.to_owned(),
+                    log: event["log"].as_str().map(str::to_owned),
+                    started_at_unix_s: at,
+                    push_began_at_unix_s: None,
+                    ended_at_unix_s: None,
+                    outcome: None,
+                    execution_s: None,
+                });
+            }
+            return;
+        }
+        if phase == "red" {
+            self.red(at.map(|s| s.saturating_mul(1000)), event);
+        }
+        let open = self
+            .qualify
+            .iter()
+            .rposition(|row| row.branch == branch && row.ended_at_unix_s.is_none());
+        let at_row = match open {
+            Some(at_row) => at_row,
+            // A branch the graph never started ends stopped with no start.
+            None if self.qualify.len() < MAX_ROWS => {
+                self.qualify.push(QualifyRow {
+                    branch: branch.to_owned(),
+                    log: event["log"].as_str().map(str::to_owned),
+                    started_at_unix_s: None,
+                    push_began_at_unix_s: None,
+                    ended_at_unix_s: None,
+                    outcome: None,
+                    execution_s: None,
+                });
+                self.qualify.len() - 1
+            }
+            None => return,
+        };
+        let row = &mut self.qualify[at_row];
+        if phase == "push-began" {
+            row.push_began_at_unix_s = at;
+            return;
+        }
+        row.ended_at_unix_s = at;
+        row.outcome = Some(phase.to_owned());
+        row.execution_s = event["seconds"]
+            .as_u64()
+            .filter(|_| row.started_at_unix_s.is_some());
+    }
+
+    /// The qualify branches' rows, each with the CPU and peak of the children that ended in its
+    /// log or a side log of it (`<stem>-*.log`) while it ran: a second round's branch, in the
+    /// same log, is booked only its own.
+    fn qualify_rows(&self) -> Vec<aterm_json::Value> {
+        self.qualify
+            .iter()
+            .map(|row| {
+                let mut totals = ChildTotals::default();
+                let window = row
+                    .started_at_unix_s
+                    .zip(row.ended_at_unix_s)
+                    .map(|(s, e)| {
+                        (
+                            s.saturating_mul(1000),
+                            e.saturating_mul(1000).saturating_add(999),
+                        )
+                    });
+                let stem = row.log.as_deref().and_then(|l| l.strip_suffix(".log"));
+                for child in &self.children {
+                    let in_log = stem.is_some_and(|stem| {
+                        child.log.strip_prefix(stem).is_some_and(|rest| {
+                            rest == ".log" || (rest.starts_with('-') && rest.ends_with(".log"))
+                        })
+                    });
+                    let in_window = window
+                        .zip(child.ended_at_unix_ms)
+                        .is_some_and(|((from, to), at)| (from..=to).contains(&at));
+                    if !(in_log && in_window) {
+                        continue;
+                    }
+                    totals.children += 1;
+                    add_f(&mut totals.cpu_s, child.cpu_s);
+                    if let Some(peak) = child.peak_bytes {
+                        totals.peak_bytes = Some(totals.peak_bytes.map_or(peak, |p| p.max(peak)));
+                    }
+                }
+                aterm_json::json!({
+                    "branch": row.branch, "log": row.log, "outcome": row.outcome,
+                    "started_at_unix_s": row.started_at_unix_s,
+                    "push_began_at_unix_s": row.push_began_at_unix_s,
+                    "ended_at_unix_s": row.ended_at_unix_s, "execution_s": row.execution_s,
+                    "cpu_s": totals.cpu_s, "peak_bytes": totals.peak_bytes,
+                    "children": totals.children,
+                })
+            })
+            .collect()
     }
 
     fn verify_stage(&mut self, log: &str, event: &aterm_json::Value) {
@@ -495,8 +636,8 @@ impl Timeline {
                 ]))
             })
             .collect();
-        // Before the qualify graph runs branches beside each other, the steps run one after
-        // another, so the critical path is their summed execution (owner waits excluded).
+        // The steps run one after another (step 4's branches run beside each other inside its
+        // one row), so the critical path is their summed execution (owner waits excluded).
         let mut critical_path_s = None;
         for s in self.steps.iter().filter_map(|row| row.execution_s) {
             *critical_path_s.get_or_insert(0.0) += s;
@@ -535,6 +676,10 @@ impl Timeline {
                 self.first_red.clone().unwrap_or(aterm_json::Value::Null),
             ),
             ("steps".to_owned(), aterm_json::Value::Array(steps)),
+            (
+                "qualify".to_owned(),
+                aterm_json::Value::Array(self.qualify_rows()),
+            ),
             (
                 "branches".to_owned(),
                 aterm_json::Value::Array(self.branches.clone()),
@@ -666,6 +811,100 @@ mod tests {
         assert_eq!(value["units"]["fresh"].as_u64(), Some(610));
         assert_eq!(value["units"]["compiled"].as_u64(), Some(7));
         assert_eq!(value["output_bytes"].as_u64(), Some(1024));
+    }
+
+    /// EACH QUALIFY BRANCH IS ITS OWN ROW, BOOKED ONLY ITS OWN CHILDREN: a branch's start, staging
+    /// push and end come from its `qualify-branch` events; it is booked the children that ended
+    /// in its log or a side log of it (the build's fixtures) while it ran, so a second round's
+    /// build in the same log is booked only its own; a branch's red dates the first red; and a
+    /// branch never started is a row with no start. NEGATIVE CONTROLS: booking a log's children
+    /// without the branch's window gives the second build the first one's CPU too, and booking
+    /// the branch's own log alone leaves the fixtures' CPU out of the first build's.
+    #[test]
+    fn each_qualify_branch_is_its_own_row_booked_only_its_own_children() {
+        let branch = |b: &str, phase: &str, at: u64, secs: u64| {
+            format!(
+                "release-event: {}\n",
+                aterm_json::json!({"schema": 1, "event": "qualify-branch", "branch": b,
+                    "log": format!("04-qualify-{b}.log"), "phase": phase,
+                    "at_unix_s": at, "seconds": secs})
+            )
+        };
+        let child_at = |cpu: f64, ended_ms: u64| {
+            format!(
+                "release-event: {}\n",
+                aterm_json::json!({"schema": 1, "event": "step-child-finished",
+                    "step": "qualify", "exit_code": 0, "ended_at_unix_ms": ended_ms,
+                    "child_cpu": {"observed_s": cpu}, "peak_bytes": (cpu as u64) << 20})
+            )
+        };
+        let transcript = [
+            stage("checks", "started", 990, 0, 0),
+            stage("checks", "ok", 1000, 0, 10),
+            stage("qualify", "started", 1000, 0, 0),
+            branch("tree", "started", 1000, 0),
+            branch("build", "started", 1010, 0),
+            branch("export", "started", 1011, 0),
+            branch("export", "push-began", 1300, 0),
+            branch("tree", "red", 1600, 600),
+            branch("build", "stopped", 1601, 591),
+            branch("export", "passed", 1700, 689),
+            branch("build", "started", 2000, 0),
+            branch("build", "passed", 2500, 500),
+            stage("qualify", "FAIL", 2500, 0, 1500),
+        ]
+        .concat();
+        let value = timeline_of(&[
+            ("transcript.log", &transcript),
+            ("04-qualify-tree.log", &child_at(100.0, 1_599_000)),
+            (
+                "04-qualify-build.log",
+                &[child_at(300.0, 1_590_000), child_at(50.0, 2_400_000)].concat(),
+            ),
+            ("04-qualify-build-fixtures.log", &child_at(20.0, 1_595_000)),
+            ("04-qualify-export.log", &child_at(5.0, 1_699_500)),
+        ]);
+        let rows = value["qualify"].as_array().expect("qualify rows");
+        let row = |b: &str, n: usize| {
+            rows.iter()
+                .filter(|r| r["branch"].as_str() == Some(b))
+                .nth(n)
+                .unwrap_or_else(|| panic!("no row {n} of {b}: {value}"))
+        };
+        assert_eq!(rows.len(), 4, "{value}");
+        assert_eq!(row("tree", 0)["outcome"].as_str(), Some("red"));
+        assert_eq!(row("tree", 0)["cpu_s"].as_f64(), Some(100.0), "{value}");
+        assert_eq!(row("build", 0)["outcome"].as_str(), Some("stopped"));
+        assert_eq!(row("build", 0)["execution_s"].as_u64(), Some(591));
+        assert_eq!(row("build", 0)["cpu_s"].as_f64(), Some(320.0), "{value}");
+        assert_eq!(row("build", 0)["peak_bytes"].as_u64(), Some(300 << 20));
+        assert_eq!(row("build", 1)["cpu_s"].as_f64(), Some(50.0), "{value}");
+        assert_eq!(
+            row("export", 0)["push_began_at_unix_s"].as_u64(),
+            Some(1300)
+        );
+        assert_eq!(row("export", 0)["cpu_s"].as_f64(), Some(5.0));
+        // The tree's red at 1600 s, 610 s after the run began.
+        assert_eq!(
+            value["time_to_first_red_s"].as_f64(),
+            Some(610.0),
+            "{value}"
+        );
+        assert_eq!(value["first_red"]["branch"].as_str(), Some("tree"));
+        // Every qualify child is the step's: its sum is the graph's CPU.
+        assert_eq!(value["steps"][1]["cpu_s"].as_f64(), Some(475.0), "{value}");
+
+        let never = timeline_of(&[("transcript.log", &branch("export", "stopped", 1601, 0))]);
+        let row = &never["qualify"][0];
+        assert!(
+            row["started_at_unix_s"].is_null() && row["execution_s"].is_null(),
+            "{never}"
+        );
+        assert_eq!(row["outcome"].as_str(), Some("stopped"));
+        assert!(
+            row["cpu_s"].is_null(),
+            "no record is null, never 0: {never}"
+        );
     }
 
     /// A RELEASE COUNTS NO FULL HASH ONLY WHERE EVERY CUTTER OF IT LOGGED ITS OWN SEAL CALL: the

@@ -4,13 +4,34 @@
 //! One subscriber's ordinary converge job, shared by HTTP rounds and local member progress.
 
 use super::{Converging, SourceSaid, SyncOutcome, converge_after_pass};
-use crate::converge::{Due, Last};
+use crate::converge::{Due, Last, RepositoryWork};
 use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
-/// An executable's local readiness observer. It runs on the subscriber's existing polling
-/// lane, starts no helper or network request, and grants no authority to the resulting job.
-pub type SubscriberInputs = Box<dyn FnMut() -> bool + Send>;
+/// An executable's readiness observer and optional local worker upkeep, on the
+/// subscriber's existing lane. Readiness starts no helper or network request and
+/// grants no authority to the resulting job; upkeep never admits vault work.
+pub struct SubscriberInputs {
+    observe: Box<dyn FnMut() -> Option<RepositoryWork> + Send>,
+    maintenance: Option<Box<dyn FnMut() + Send>>,
+}
+
+impl SubscriberInputs {
+    /// Readiness observation grants no authority to the converge job it requests.
+    pub fn new(observe: Box<dyn FnMut() -> Option<RepositoryWork> + Send>) -> Self {
+        Self {
+            observe,
+            maintenance: None,
+        }
+    }
+
+    /// Add nonblocking local upkeep to the same host lifetime. It runs while
+    /// sharing is off too, independently of vault/network work.
+    pub fn with_maintenance(mut self, maintenance: Box<dyn FnMut() + Send>) -> Self {
+        self.maintenance = Some(maintenance);
+        self
+    }
+}
 
 type MakeInputs = fn(&super::Paths) -> SubscriberInputs;
 static INPUTS: std::sync::OnceLock<MakeInputs> = std::sync::OnceLock::new();
@@ -23,7 +44,7 @@ pub fn on_subscriber_inputs(make: MakeInputs) {
 
 pub(super) fn inputs(paths: &super::Paths) -> SubscriberInputs {
     INPUTS.get().map_or_else(
-        || Box::new(|| false) as SubscriberInputs,
+        || SubscriberInputs::new(Box::new(|| None)),
         |make| make(paths),
     )
 }
@@ -44,7 +65,7 @@ pub(super) struct Projection<'a> {
 impl<'a> Projection<'a> {
     #[cfg(test)]
     pub(super) fn new(ports: &'a Converging<'a>) -> Self {
-        Self::observing(ports, Box::new(|| false))
+        Self::observing(ports, SubscriberInputs::new(Box::new(|| None)))
     }
 
     pub(super) fn observing(ports: &'a Converging<'a>, inputs: SubscriberInputs) -> Self {
@@ -84,7 +105,7 @@ impl<'a> Projection<'a> {
             && !self.replaced()
             && let Some(exe) = self.program.path()
         {
-            running.child = (self.ports.start)(exe);
+            running.child = (self.ports.start)(exe, running.due.repository_work());
             if running.child.is_none() {
                 running.due.reaped(Last::Failed, now);
             }
@@ -96,19 +117,39 @@ impl<'a> Projection<'a> {
     }
 
     pub(super) fn poll(&self) {
-        let changed = {
+        self.poll_with(false);
+    }
+
+    /// An interrupted observation can have consumed local changes. Request ordinary
+    /// readback once after recovery; the job still admits every effect from current facts.
+    pub(super) fn recovered(&self) {
+        self.poll_with(true);
+    }
+
+    fn poll_with(&self, recovering: bool) {
+        let work = {
             let mut inputs = self.inputs.lock().unwrap_or_else(PoisonError::into_inner);
-            inputs()
+            (inputs.observe)()
         };
-        self.update(if changed {
-            Due::after_local_progress
-        } else {
-            Due::poll
+        self.update(|due, now, routes, last| {
+            match work.max(recovering.then_some(RepositoryWork::Refresh)) {
+                Some(work) => due.after_local_progress(work, now, routes, last),
+                None => due.poll(now, routes, last),
+            }
         });
     }
 
+    pub(super) fn maintain(&self) {
+        let mut inputs = self.inputs.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(maintain) = &mut inputs.maintenance {
+            maintain();
+        }
+    }
+
     pub(super) fn admitted(&self) {
-        self.update(Due::after_local_progress);
+        self.update(|due, now, routes, last| {
+            due.after_local_progress(RepositoryWork::Refresh, now, routes, last)
+        });
     }
 
     pub(super) fn after_pass(&self, outcome: &SyncOutcome, source: SourceSaid) {

@@ -30,6 +30,10 @@ pub const RECLAIM_STALE_UNDER_PRESSURE: Duration = Duration::from_secs(60 * 60);
 /// `{"rustc":<u64>,` first.
 const FINGERPRINT_HEAD: usize = 64;
 
+/// Extra receipt reads across one fingerprint directory, including a byte that must
+/// remain unused to establish that each required metadata file was read in full.
+const OUTPUT_METADATA_BUDGET: usize = 64 * 1024;
+
 /// The most of `.rustc_info.json` read: a few dozen kilobytes in practice. A longer one is
 /// not read, and no compiler is called current.
 const RUSTC_INFO_MAX: usize = 1 << 20;
@@ -76,7 +80,8 @@ pub struct Stamp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unit {
     pub fingerprint: Stamp,
-    /// The `rustc` every JSON in the fingerprint folder names.
+    /// The `rustc` every ordinary compiler JSON in the fingerprint folder names;
+    /// recognized native output metadata is not another compiler fingerprint.
     pub rustc: Option<u64>,
     pub artifacts: Vec<Stamp>,
     /// Its hash, cargo's name for it within the profile ([`unit_hash`]).
@@ -140,6 +145,92 @@ pub struct Survey {
     pub began: Option<SystemTime>,
     /// The packages that run built tests of ([`Used::members`]): the workspace's own.
     pub members: BTreeSet<String>,
+}
+
+/// Ages of recognized survey entries, never a census of the whole cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Ages {
+    pub quiet: usize,
+    pub not_quiet: usize,
+    pub unknown: usize,
+}
+
+impl Ages {
+    fn add(&mut self, known: bool, quiet: bool) {
+        if !known {
+            self.unknown += 1;
+        } else if quiet {
+            self.quiet += 1;
+        } else {
+            self.not_quiet += 1;
+        }
+    }
+}
+
+/// Evidence already in a survey. No reads, byte estimates or removal authority.
+/// Unrecognized/unreadable layouts can be absent from the survey entirely.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct Observations {
+    pub incremental: Ages,
+    pub units: Ages,
+    pub last_build_current: Option<bool>,
+    pub profiles: usize,
+    pub profiles_with_compiler_references: usize,
+    pub units_without_compiler: usize,
+    pub release_record: bool,
+    pub profiles_naming_used_units: usize,
+}
+
+/// Describe recognized observations without inferring current-compiler units from
+/// missing old-compiler evidence, or treating an omitted entry as young or unused.
+pub(super) fn observations(survey: &Survey, now: SystemTime, after: Duration) -> Observations {
+    let mut seen = Observations {
+        last_build_current: survey.last_built.map(|last| last.current),
+        profiles: survey.profiles.len(),
+        release_record: survey.began.is_some(),
+        ..Observations::default()
+    };
+    for profile in &survey.profiles {
+        for folder in &profile.crates {
+            seen.incremental
+                .add(folder.newest.is_some(), stale_at(folder.newest, now, after));
+        }
+        for unit in &profile.units {
+            let known = unit.fingerprint.newest.is_some()
+                && unit.artifacts.iter().all(|a| a.newest.is_some());
+            seen.units.add(known, quiet_at(unit, now, after));
+            seen.units_without_compiler += usize::from(unit.rustc.is_none());
+        }
+        seen.profiles_with_compiler_references +=
+            usize::from(survey.last_built.is_some_and(|last| {
+                profile
+                    .units
+                    .iter()
+                    .any(|unit| compiler_reference(unit, last).is_some())
+            }));
+        seen.profiles_naming_used_units +=
+            usize::from(profile.used.as_ref().is_some_and(|used| !used.is_empty()));
+    }
+    seen
+}
+
+fn stale_at(at: Option<SystemTime>, now: SystemTime, after: Duration) -> bool {
+    at.is_some_and(|at| now.duration_since(at).unwrap_or(Duration::ZERO) >= after)
+}
+
+fn quiet_at(unit: &Unit, now: SystemTime, after: Duration) -> bool {
+    stale_at(unit.fingerprint.newest, now, after)
+        && unit
+            .artifacts
+            .iter()
+            .all(|a| stale_at(a.newest, now, after))
+}
+
+fn compiler_reference(unit: &Unit, last: LastBuilt) -> Option<u64> {
+    unit.fingerprint
+        .newest
+        .filter(|at| *at >= last.since)
+        .and(unit.rustc)
 }
 
 /// What one doomed thing is.
@@ -410,12 +501,8 @@ pub struct Doomed {
 /// began nor for `after` ([`Part::Superseded`]).
 #[must_use]
 pub fn decide(survey: &Survey, now: SystemTime, after: Duration) -> Vec<Doomed> {
-    let stale = |t: Option<SystemTime>| {
-        t.is_some_and(|t| now.duration_since(t).unwrap_or(Duration::ZERO) >= after)
-    };
-    let quiet = |unit: &Unit| {
-        stale(unit.fingerprint.newest) && unit.artifacts.iter().all(|a| stale(a.newest))
-    };
+    let stale = |at| stale_at(at, now, after);
+    let quiet = |unit: &Unit| quiet_at(unit, now, after);
     let mut doomed = Vec::new();
     for profile in &survey.profiles {
         for folder in profile.crates.iter().filter(|c| stale(c.newest)) {
@@ -479,8 +566,7 @@ fn old_compilers(survey: &Survey, profile: &Profile) -> Vec<bool> {
     let current: BTreeSet<u64> = profile
         .units
         .iter()
-        .filter(|u| u.fingerprint.newest.is_some_and(|t| t >= last.since))
-        .filter_map(|u| u.rustc)
+        .filter_map(|u| compiler_reference(u, last))
         .collect();
     if last.current && current.is_empty() {
         return none;
@@ -735,18 +821,103 @@ pub fn unit_hash(name: &str) -> Option<&str> {
     })
 }
 
-/// The compiler every JSON of the fingerprint folder `dir` names (its leading `{"rustc":N`).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeOutputMetadataV1 {
+    schema: u32,
+    #[serde(rename = "fingerprint")]
+    _fingerprint: u64,
+    outputs: Vec<NativeOutputRecord>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeOutputMetadataV2 {
+    schema: u32,
+    #[serde(rename = "fingerprint")]
+    _fingerprint: u64,
+    compiler: NativeOutputCompiler,
+    outputs: Vec<NativeOutputRecord>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeOutputRecord {
+    path_sha256: String,
+    size: u64,
+    sha256: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeOutputCompiler {
+    rustc_key: u64,
+    #[serde(rename = "content_blake3")]
+    _content_blake3: [u8; 32],
+    #[serde(rename = "workspace")]
+    _workspace: bool,
+    #[serde(rename = "mode")]
+    _mode: NativeOutputMode,
+    #[serde(rename = "build_script")]
+    _build_script: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum NativeOutputMode {
+    Build,
+    Check,
+    CheckTest,
+    Test,
+}
+
+/// Recognize the producer's bounded metadata shape, without verifying output bytes,
+/// trusting declared paths, authenticating execution or granting cleanup authority.
+fn native_output_metadata(bytes: &[u8], rustc: u64) -> bool {
+    let outputs_valid = |outputs: &[NativeOutputRecord]| {
+        let digest = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        !outputs.is_empty()
+            && outputs.len() <= 4096
+            && outputs.iter().all(|output| {
+                output.size <= 8 * 1024 * 1024 * 1024
+                    && digest(&output.path_sha256)
+                    && digest(&output.sha256)
+            })
+    };
+    if let Ok(metadata) = aterm_json::from_slice::<NativeOutputMetadataV1>(bytes) {
+        return metadata.schema == 1 && outputs_valid(&metadata.outputs);
+    }
+    aterm_json::from_slice::<NativeOutputMetadataV2>(bytes).is_ok_and(|metadata| {
+        metadata.schema == 2
+            && metadata.compiler.rustc_key == rustc
+            && outputs_valid(&metadata.outputs)
+    })
+}
+
+/// The compiler every ordinary JSON in `dir` names (its leading `{"rustc":N`).
+/// Native output metadata must have a readable ordinary companion and supported
+/// shape; every other unknown or unreadable JSON still makes the compiler unknown.
 fn compiler(fs: &dyn Fs, dir: &Path) -> Option<u64> {
     aterm_uds::progress::tick();
+    let entries = fs.list(dir)?;
     let mut seen = None;
-    for (name, meta) in fs.list(dir)? {
+    let mut ordinary = BTreeMap::new();
+    for (name, meta) in &entries {
         if !name.to_str().is_some_and(|n| n.ends_with(".json")) {
             continue;
         }
-        if meta?.kind != Kind::File {
+        if meta.as_ref()?.kind != Kind::File {
             return None;
         }
-        let head = fs.head(&dir.join(&name), FINGERPRINT_HEAD)?;
+        if name.to_str()?.starts_with("outputs-") {
+            continue;
+        }
+        let head = fs.head(&dir.join(name), FINGERPRINT_HEAD)?;
         let digits = head.strip_prefix(b"{\"rustc\":")?;
         let end = digits.iter().position(|c| !c.is_ascii_digit())?;
         let rustc: u64 = std::str::from_utf8(&digits[..end]).ok()?.parse().ok()?;
@@ -754,6 +925,25 @@ fn compiler(fs: &dyn Fs, dir: &Path) -> Option<u64> {
             return None;
         }
         seen = Some(rustc);
+        ordinary.insert(name.clone(), rustc);
+    }
+    let mut remaining = OUTPUT_METADATA_BUDGET;
+    for (name, _) in &entries {
+        let Some(companion) = name
+            .to_str()
+            .filter(|name| name.ends_with(".json"))
+            .and_then(|name| name.strip_prefix("outputs-"))
+        else {
+            continue;
+        };
+        let rustc = *ordinary.get(std::ffi::OsStr::new(companion))?;
+        let bytes = fs.head(&dir.join(name), remaining)?;
+        // A full-budget read cannot distinguish EOF from a longer file. Keep
+        // this unit unknown, including at the exact conservative boundary.
+        if bytes.len() >= remaining || !native_output_metadata(&bytes, rustc) {
+            return None;
+        }
+        remaining -= bytes.len();
     }
     seen
 }
@@ -823,14 +1013,44 @@ fn last_built(fs: &dyn Fs, leaf: &Path, store: Option<&Path>) -> Option<LastBuil
     })
 }
 
-/// The one absolute path among the outputs `.rustc_info.json` keeps: the `--print sysroot`
-/// line (the other lines are file names, cfgs and `-vV`'s). `None` for none, or several.
+/// The one absolute path among eligible successful probe outputs in `.rustc_info.json`:
+/// conventionally the `--print sysroot` line (the other lines are file names, cfgs and
+/// `-vV`'s). `None` for none, or several. Failed stdout is cached too, but names no compiler.
+/// This selects records with the producer's successful-output shape; it neither validates
+/// all cache data nor authenticates the opaque process-hash key or the recorded stdout.
 fn sysroot_named(info: &[u8]) -> Option<PathBuf> {
     let value: aterm_json::Value = aterm_json::from_slice(info).ok()?;
     let mut found = BTreeSet::new();
     for output in value.get("outputs")?.as_object()?.values() {
-        let stdout = output.get("stdout").and_then(aterm_json::Value::as_str);
-        for line in stdout.unwrap_or_default().lines() {
+        if output.get("success").and_then(aterm_json::Value::as_bool) != Some(true)
+            || output.get("code").and_then(aterm_json::Value::as_i64) != Some(0)
+            || output.get("status").and_then(aterm_json::Value::as_str) != Some("")
+            || output
+                .get("stderr")
+                .and_then(aterm_json::Value::as_str)
+                .is_none()
+        {
+            continue;
+        }
+        let Some(stdout) = output.get("stdout").and_then(aterm_json::Value::as_str) else {
+            continue;
+        };
+        #[cfg(unix)]
+        let lines = {
+            // Unix paths can contain CR: lines() would silently turn a reported
+            // `/sdk\r` into a different `/sdk`. Ambiguous eligible output keeps
+            // the whole inference unknown, even alongside a clean record.
+            if stdout
+                .bytes()
+                .any(|byte| byte.is_ascii_control() && byte != b'\n')
+            {
+                return None;
+            }
+            stdout.split('\n')
+        };
+        #[cfg(not(unix))]
+        let lines = stdout.lines();
+        for line in lines {
             if Path::new(line).is_absolute() {
                 found.insert(PathBuf::from(line));
             }

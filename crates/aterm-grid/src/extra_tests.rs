@@ -5,6 +5,45 @@
 use super::*;
 
 #[test]
+fn image_ref_clone_from_copies_placement_and_releases_replaced_payloads() {
+    let mut source = ImageRef {
+        image: Arc::new(ImageData {
+            bytes: vec![7; 4],
+            format: ImageFormat::Png,
+            cols: 1,
+            rows: 1,
+            z_index: 0,
+            band_lift_px: 0,
+            cell_offset_px: (0, 0),
+            scaling: ImageScaling::Fit,
+            source_rect: None,
+        }),
+        cell_row: 2,
+        cell_col: 3,
+        kitty: Some(KittyPlacementTag {
+            image_id: 7,
+            placement_id: 11,
+            image_serial: std::num::NonZeroU32::MIN,
+            serial: std::num::NonZeroU32::MIN,
+        }),
+    };
+    let mut target = source.clone();
+    source.cell_row = 5;
+    source.cell_col = 6;
+    source.kitty = None;
+    target.clone_from(&source);
+    assert_eq!(target, source);
+    assert!(Arc::ptr_eq(&target.image, &source.image));
+    assert_eq!(Arc::strong_count(&source.image), 2);
+    let old = Arc::downgrade(&target.image);
+    source.image = Arc::new((*source.image).clone());
+    target.clone_from(&source);
+    assert!(old.upgrade().is_none());
+    assert!(Arc::ptr_eq(&target.image, &source.image));
+    assert_eq!(target, source);
+}
+
+#[test]
 fn refill_hides_spare_payloads_reuses_matches_and_releases_replacements() {
     let mut extra = CellExtra::default();
     extra.set_complex_char(Some(Arc::from("👩‍💻")));

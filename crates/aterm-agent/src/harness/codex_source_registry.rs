@@ -18,6 +18,17 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+#[path = "codex_source_preload_custody.rs"]
+mod preload_custody;
+#[path = "codex_source_reservation.rs"]
+mod reservation;
+pub(in crate::harness) use reservation::seal::SealingSource;
+pub use reservation::{
+    BeginAdmission, CensusCondition, CensusMember, CleanupAdmission, OwnedUseCleanup, Quiescence,
+    RegisteredMemberCleanup, RegisteredMemberWork, Reservation, SourceSeal, SourceUse, UseAction,
+    UseCleanupRequest, UseCommand, UseIdentity, UseNonce, UseProgress, UseReceipt, UseRequest,
+};
+
 pub const LAUNCH_ENV: &str = "ATERM_CODEX_SOURCE_LAUNCH";
 const MAX_MEMBERS: usize = 128;
 const MAX_LAUNCHES: usize = 64;
@@ -496,6 +507,7 @@ struct Member {
 struct Issued {
     operation: String,
     connection: Connection,
+    parent_use: Option<reservation::ParentUse>,
 }
 struct Actor {
     process: Process,
@@ -510,11 +522,15 @@ pub struct MemberAllocation {
 
 #[derive(Default)]
 struct State {
+    app_lifetime: Option<super::account_work::Lifetime>,
     version: u64,
     members: BTreeMap<String, Member>,
     unrelated: BTreeMap<String, UnrelatedMember>,
     launches: BTreeMap<String, Launch>,
     actors: BTreeMap<String, Actor>,
+    uses: BTreeMap<String, reservation::Uses>,
+    preloads: BTreeMap<String, Arc<preload_custody::Pending>>,
+    reservations: BTreeMap<String, Arc<Mutex<reservation::Cell>>>,
 }
 #[derive(Default)]
 pub struct Registry {
@@ -612,7 +628,8 @@ fn same_source_scope(left: &slot::SourceHandle, right: &slot::SourceHandle) -> b
         && left.slot() == right.slot()
         && left.path() == right.path()
         && left.assignment_generation() == right.assignment_generation()
-        && left.native_intent() == right.native_intent()
+        && left.source_authority() == right.source_authority()
+        && left.namespaces() == right.namespaces()
         && left.account() == right.account()
         && left.user() == right.user()
 }
@@ -756,6 +773,17 @@ impl ReaderSourceProof {
 }
 
 impl Registry {
+    /// Bind this native instance to its actual App lifetime namespace. This
+    /// clone counts no operation and cannot be rebound by a client message.
+    pub fn for_app(lifetime: &super::account_work::Lifetime) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(State {
+                app_lifetime: Some(lifetime.clone()),
+                ..State::default()
+            })),
+        }
+    }
+
     /// Native-issued IDs retain a process epoch and monotone ordinal. Only the
     /// active set is bounded; retired IDs can never reopen a source registration.
     pub fn open_member(
@@ -763,6 +791,16 @@ impl Registry {
         peer: &Peer,
         connection: &Connection,
         operation: &str,
+    ) -> Result<MemberAllocation, Error> {
+        self.open_member_inner(peer, connection, operation, None)
+    }
+
+    fn open_member_inner(
+        &self,
+        peer: &Peer,
+        connection: &Connection,
+        operation: &str,
+        context: Option<&SourceUse>,
     ) -> Result<MemberAllocation, Error> {
         if !peer.current() || !hex(operation, 32) || !connection.alive.load(Ordering::Acquire) {
             return Err(Error::Denied);
@@ -787,6 +825,8 @@ impl Registry {
                 },
             );
         }
+        let closed = state.reservations.contains_key(&key);
+        let parent_use = context.map(reservation::parent_use);
         let actor = state.actors.get_mut(&key).ok_or(Error::Unavailable)?;
         if actor.process != peer.process {
             return Err(Error::Stale);
@@ -796,6 +836,9 @@ impl Registry {
             .iter_mut()
             .find(|(_, issued)| issued.operation == operation)
         {
+            if issued.parent_use != parent_use {
+                return Err(Error::Stale);
+            }
             if !issued.connection.same(connection) {
                 if issued.connection.alive.load(Ordering::Acquire) {
                     return Err(Error::Stale);
@@ -807,9 +850,18 @@ impl Registry {
                 operation: operation.into(),
             });
         }
+        // Exact pre-reserve open nonces above may reconcile. A delayed,
+        // transport-only request cannot allocate after native closure.
+        if closed && context.is_none() {
+            return Err(Error::Busy);
+        }
         if actor.issued.len() >= MAX_MEMBERS {
             return Err(Error::Busy);
         }
+        if let Some(context) = context {
+            reservation::admit_derived(&state, peer, connection, context)?;
+        }
+        let actor = state.actors.get_mut(&key).ok_or(Error::Unavailable)?;
         actor.highwater = actor.highwater.checked_add(1).ok_or(Error::Unavailable)?;
         let member = format!("{}{:016x}", actor.epoch, actor.highwater);
         actor.issued.insert(
@@ -817,8 +869,12 @@ impl Registry {
             Issued {
                 operation: operation.into(),
                 connection: connection.clone(),
+                parent_use,
             },
         );
+        if closed {
+            reservation::join_derived(&state, &peer.caller, &member, operation)?;
+        }
         Ok(MemberAllocation {
             member,
             operation: operation.into(),
@@ -841,6 +897,10 @@ impl Registry {
         let mut state = lock(&self.state)?;
         if !peer.current() || !connection.is_live() {
             return Err(Error::Stale);
+        }
+        if reservation::has_credential_uses(&state, &key) || preload_custody::running(&state, &key)
+        {
+            return Err(Error::Busy);
         }
         let actor = state
             .actors
@@ -874,6 +934,8 @@ impl Registry {
         } else if registration.is_some() || !allocation.connection.same(connection) {
             return Err(Error::Stale);
         }
+        let preload = state.preloads.remove(&key);
+        state.uses.remove(&key);
         state.members.remove(&key);
         state.unrelated.remove(&key);
         state
@@ -883,6 +945,8 @@ impl Registry {
             .issued
             .remove(member);
         version(&mut state)?;
+        drop(state);
+        drop(preload);
         Ok(())
     }
 
@@ -1222,15 +1286,23 @@ impl Registry {
             return Err(Error::Denied);
         }
         let key = member_key(&peer.caller, member)?;
-        {
+        let expected = {
             let state = lock(&self.state)?;
             issued_on(&state, &peer, member, connection)?;
-        }
+            reservation::reservation_allows_member(&state, &peer.caller, member)?;
+            state.members.get(&key).map(|member| member.source.clone())
+        };
+        let _worker = preload_custody::enter(self, &peer, member, operation, connection)?;
         let gate = SourceWorkLease::for_home(env.home.as_deref().ok_or(Error::Unavailable)?)
             .map_err(|_| Error::Busy)?;
-        let source = match slot::source(env, &peer.caller, operation) {
+        let progress = match expected.as_ref() {
+            Some(source) => slot::source_matching_registered(env, &peer.caller, operation, source),
+            None => slot::source(env, &peer.caller, operation),
+        };
+        let source = match progress {
             Ok(slot::SourceProgress::Ready(source)) => Arc::new(source),
             Ok(slot::SourceProgress::Waiting) => return Err(Error::Busy),
+            Err(_) if expected.is_some() => return Err(Error::Unavailable),
             Err(_) => {
                 let (source, receipt) = self
                     .with_initial_source(env, &peer, connection, |grant, permit| {
@@ -1258,6 +1330,7 @@ impl Registry {
         // Retirement or EOF may race the bounded source read. Never revive a
         // retired native member or publish a source to a disconnected actor.
         issued_on(&state, &peer, member, connection)?;
+        reservation::reservation_allows_member(&state, &peer.caller, member)?;
         if state.unrelated.contains_key(&key) {
             return Err(Error::Denied);
         }
@@ -1334,6 +1407,7 @@ impl Registry {
         {
             let state = lock(&self.state)?;
             issued(&state, &peer, member)?;
+            reservation::reservation_allows_member(&state, &peer.caller, member)?;
         }
         let _gate = SourceWorkLease::for_home(env.home.as_deref().ok_or(Error::Unavailable)?)
             .map_err(|_| Error::Busy)?;
@@ -1353,6 +1427,7 @@ impl Registry {
             }
         }
         issued(&state, &peer, member)?;
+        reservation::reservation_allows_member(&state, &peer.caller, member)?;
         let current = state.members.get_mut(&key).ok_or(Error::Stale)?;
         if current.process != peer.process
             || current.operation != operation
@@ -1400,7 +1475,11 @@ impl Registry {
             }
             Ready::PolicyUnavailable => ReadyRole::PolicyUnavailable,
         };
+        // A Ready ACK cannot outrun the source worker whose custody it settles.
+        preload_custody::check_completion(&state, &key, operation, connection)?;
+        let current = state.members.get_mut(&key).ok_or(Error::Stale)?;
         current.readiness.complete(role)?;
+        let preload = state.preloads.remove(&key);
         if let Some(token) = peer.launch
             && let Some(launch) = state.launches.get_mut(&token)
         {
@@ -1410,6 +1489,8 @@ impl Registry {
             launch.gate.take();
             launch._scope.take();
         }
+        drop(state);
+        drop(preload);
         Ok(())
     }
 
@@ -1527,6 +1608,11 @@ impl Registry {
                 .launches
                 .retain(|_, launch| !launch.process.as_ref().is_some_and(gone));
             state.actors.retain(|_, actor| !gone(&actor.process));
+            let members: std::collections::BTreeSet<String> =
+                state.members.keys().cloned().collect();
+            state.uses.retain(|key, _| members.contains(key));
+            let actors: std::collections::BTreeSet<String> = state.actors.keys().cloned().collect();
+            state.reservations.retain(|actor, _| actors.contains(actor));
         }
     }
 }
@@ -1550,6 +1636,7 @@ redacted!(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn replaced_gate_reconnect_keeps_old_reader_custody_and_refuses_manager_retarget() {
         let home = aterm_tempfile::tempdir().unwrap();
@@ -1576,6 +1663,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn direct_reader_retains_real_gate_through_eof_and_reconnect_until_retirement() {
         // Exercises the exact member readiness/lease transitions with a real
@@ -1619,6 +1707,7 @@ mod tests {
         assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn reader_proof_role_is_stale_after_gate_path_replacement() {
         let home = aterm_tempfile::tempdir().unwrap();
@@ -1646,6 +1735,7 @@ mod tests {
         assert!(!revision_descends(13, "other", 13, "current"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn manager_and_policy_readiness_cannot_be_relabelled_as_direct_reader() {
         let home = aterm_tempfile::tempdir().unwrap();
@@ -1671,6 +1761,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn revoking_unclaimed_typed_permission_releases_gate_but_not_claimed_process() {
         // Constructor permission metadata only; this does not mint a qualified
@@ -1721,6 +1812,7 @@ mod tests {
         assert!(super::super::codex_source_gate::PublicationLock::for_home(home.path()).is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn unrelated_completion_retires_constructor_without_minting_a_source() {
         // Metadata lifecycle only. This deliberately cannot construct a real
@@ -1845,6 +1937,7 @@ mod tests {
         registry.connection_closed(replacement.id);
     }
 
+    #[cfg(unix)]
     #[test]
     fn app_pause_revokes_only_cancelled_unclaimed_permissions_and_bind_transfers_scope() {
         // Constructor lifetime metadata, not qualified peer/source authority.

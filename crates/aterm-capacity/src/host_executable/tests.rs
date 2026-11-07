@@ -14,6 +14,7 @@ fn scratch() -> aterm_tempfile::TempDir {
         .unwrap()
 }
 fn store(root: &Path) -> Store {
+    narrow_test_image();
     Store::prepare_at(&root.join("store")).unwrap()
 }
 fn clean_images(store: &Store) {

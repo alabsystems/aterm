@@ -615,7 +615,9 @@ fn the_water_surface_is_a_swell_and_a_leap_is_straight() {
         smooth * 2.5 < chords,
         "the crest turns {smooth:.1}° at a knot (its chords {chords:.1}°)"
     );
-    assert!(chords >= 20.0, "control: the chords turn only {chords:.1}°");
+    // Along the letters' foot the wave swells half as far as it did through their middle
+    // (the after-land lows' W8): its chords turn about 18 degrees where they turned past 20.
+    assert!(chords >= 15.0, "control: the chords turn only {chords:.1}°");
     let stair: Vec<WaterSample> = samples
         .iter()
         .enumerate()
@@ -818,4 +820,73 @@ fn water_s_enter_keeps_its_leap_to_the_prompt_row() {
         rows.iter().any(|&r| r != 4),
         "the control (a navigation jump) laid sparks on rows {rows:?} only"
     );
+}
+
+/// AFTER-LAND LOWS W8: WATER'S WAVE RUNS ALONG ITS LETTERS' FOOT
+/// ([`CursorGlow::WATER_FOOT_DY`]). A tenth of a cell under the caret's centre, swelling a
+/// fifth, it ran through the letters' middle: on paper a blue line struck through the words
+/// typed, and on the reference dark the letter guard held it to a faint thread where it crossed
+/// them (composed r3's judges). Typing a run on paper and on the reference dark, the light the
+/// wake lays in its typed cells' middle band (three to seven tenths of the cell down, the
+/// letters' x-height) is under a fifth of what it lays in the cells. The control lays composed
+/// r3's line (`water_mid_line`): over two fifths in the middle band.
+#[test]
+fn water_s_wave_runs_along_its_letters_foot() {
+    let g = geom();
+    let row = 2u16;
+    for dark in [false, true] {
+        let mut c = cfg(GlowStyle::Water, true);
+        c.dark_theme = dark;
+        (c.theme_fg, c.theme_bg) = if dark {
+            (0x00C8_D3F5, 0x0011_1318)
+        } else {
+            (0x001F_2328, 0x00FF_FFFF)
+        };
+        let middle_share = |mid_line: bool| {
+            let mut glow = CursorGlow {
+                water_mid_line: mid_line,
+                ..CursorGlow::default()
+            };
+            let (mut out, mut t) = (Vec::new(), Instant::now());
+            let mut text = vec![' '; g.cols];
+            glow.tick(Some((row, 1)), t, &c, g, &mut out);
+            let (mut middle, mut whole) = (0.0f64, 0.0f64);
+            for col in 2..=14u16 {
+                t += Duration::from_millis(50);
+                text[usize::from(col - 1)] = 'x';
+                glow.note_synthetic_typed(t, 1);
+                glow.observe_row(row, col, &text, t);
+                glow.tick(Some((row, col)), t, &c, g, &mut out);
+                let mut glass = Glass::new(g, c.theme_bg);
+                glass.add_quads(glow.under_quads());
+                glass.add_quads(&out);
+                let bg = glass.level(0, 0);
+                for typed in 1..col {
+                    let (x0, y0, x1, y1) = glass.cell_rect(row, typed);
+                    let (top, bot) = (y0 + g.ch as i32 * 3 / 10, y0 + g.ch as i32 * 7 / 10);
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            let d = f64::from((glass.level(y, x) - bg).abs());
+                            whole += d;
+                            if (top..bot).contains(&y) {
+                                middle += d;
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(whole > 0.0, "fixture: the wake lays light on dark {dark}");
+            middle / whole
+        };
+        let share = middle_share(false);
+        assert!(
+            share < 0.20,
+            "dark {dark}: the wave lays {share:.2} of its light through the letters' middle"
+        );
+        let control = middle_share(true);
+        assert!(
+            control > 0.40,
+            "dark {dark}: control: composed r3's wave runs through the letters' middle ({control:.2})"
+        );
+    }
 }

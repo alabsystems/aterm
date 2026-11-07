@@ -232,25 +232,33 @@ static RESOLVING: Slots = Slots::new(MAX_RESOLVING);
 
 /// Resolve `name` with the system resolver (`getaddrinfo`) within `within`, each address on
 /// `port`. The resolution runs on its own thread, which a resolver that never answers leaves
-/// behind until it does; at most [`MAX_RESOLVING`] run at once.
+/// behind until it does; at most [`MAX_RESOLVING`] run at once. A literal address (`127.0.0.1`,
+/// `::1`) is its own answer, as the resolver would give it, with no thread and no slot: a
+/// fan-out to more servers than [`MAX_RESOLVING`] by address (a vault publish to a policy's
+/// mirrors) is never refused for want of a lookup it does not need.
 ///
 /// # Errors
-/// `InvalidInput` for a zero `within`, `WouldBlock` (`EAGAIN`) with [`MAX_RESOLVING`] running,
-/// `TimedOut`, or the resolver's error.
+/// `InvalidInput` for a zero `within`, `WouldBlock` (`EAGAIN`) for a name with
+/// [`MAX_RESOLVING`] running, `TimedOut`, or the resolver's error.
 pub fn resolve(name: &str, port: u16, within: Duration) -> io::Result<Vec<SocketAddr>> {
-    resolve_in(&RESOLVING, name, within, move |asked| {
+    resolve_in(&RESOLVING, name, port, within, |asked, port| {
         (asked, port).to_socket_addrs().map(Iterator::collect)
     })
 }
 
-/// [`resolve`] with `lookup` as the resolver, on a thread holding one of `slots`.
+/// [`resolve`] with `lookup` as the resolver, on a thread holding one of `slots`, for a name
+/// that is not a literal address.
 fn resolve_in(
     slots: &'static Slots,
     name: &str,
+    port: u16,
     within: Duration,
-    lookup: impl FnOnce(&str) -> io::Result<Vec<SocketAddr>> + Send + 'static,
+    lookup: impl FnOnce(&str, u16) -> io::Result<Vec<SocketAddr>> + Send + 'static,
 ) -> io::Result<Vec<SocketAddr>> {
     let deadline = deadline_in(within)?;
+    if let Ok(literal) = name.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(literal, port)]);
+    }
     let slot = slots
         .take()
         .ok_or_else(|| io::Error::from_raw_os_error(libc::EAGAIN))?;
@@ -260,7 +268,7 @@ fn resolve_in(
         .name("lan-resolve".into())
         .spawn(move || {
             let _slot = slot;
-            let _ = answer.send(lookup(&asked));
+            let _ = answer.send(lookup(&asked, port));
         })?;
     match heard.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(resolved) => resolved,
@@ -505,27 +513,27 @@ mod tests {
         let held = std::sync::Arc::new(std::sync::Mutex::new(held));
         let hang = || {
             let held = std::sync::Arc::clone(&held);
-            move |_: &str| {
+            move |_: &str, _: u16| {
                 let _ = held.lock().unwrap().recv();
                 Ok(Vec::new())
             }
         };
         for _ in 0..2 {
             assert_eq!(
-                resolve_in(&SLOTS, "hangs", Duration::from_millis(1), hang())
+                resolve_in(&SLOTS, "hangs", 7, Duration::from_millis(1), hang())
                     .unwrap_err()
                     .kind(),
                 io::ErrorKind::TimedOut
             );
         }
-        let refused = resolve_in(&SLOTS, "third", MUST_HAPPEN, hang()).unwrap_err();
+        let refused = resolve_in(&SLOTS, "third", 7, MUST_HAPPEN, hang()).unwrap_err();
         assert_eq!(refused.raw_os_error(), Some(libc::EAGAIN), "{refused}");
         release.send(()).unwrap();
         release.send(()).unwrap();
-        let answered = |_: &str| Ok(vec![SocketAddr::from(([127, 0, 0, 1], 7))]);
+        let answered = |_: &str, _: u16| Ok(vec![SocketAddr::from(([127, 0, 0, 1], 7))]);
         let start = Instant::now();
         let resolved = loop {
-            match resolve_in(&SLOTS, "fourth", MUST_HAPPEN, answered) {
+            match resolve_in(&SLOTS, "fourth", 7, MUST_HAPPEN, answered) {
                 Err(error) if error.raw_os_error() == Some(libc::EAGAIN) => {
                     assert!(
                         start.elapsed() < MUST_HAPPEN,
@@ -537,6 +545,42 @@ mod tests {
             }
         };
         assert_eq!(resolved, vec![SocketAddr::from(([127, 0, 0, 1], 7))]);
+    }
+
+    /// A literal address answers at once with every slot held by a lookup that never ends, as the
+    /// system resolver would answer it, and is never looked up; a name still meets the bound. A
+    /// vault publish to 33 loopback mirrors (`aterm-secrets`' approver queue tests) lost the
+    /// 33rd PUT to `EAGAIN` this way, and the mirror it missed answered a join `404`.
+    ///
+    /// NEGATIVE CONTROL: drop the literal answer from `resolve_in`: each literal is refused
+    /// `EAGAIN` behind the held slot, and the unwrap fails.
+    #[test]
+    fn a_literal_address_answers_with_every_slot_taken() {
+        static SLOTS: Slots = Slots::new(1);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let hang = move |_: &str, _: u16| {
+            let _ = held.recv();
+            Ok(Vec::new())
+        };
+        assert_eq!(
+            resolve_in(&SLOTS, "hangs", 7, Duration::from_millis(1), hang)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        let unasked =
+            |name: &str, _: u16| -> io::Result<Vec<SocketAddr>> { panic!("{name} was looked up") };
+        for literal in ["127.0.0.1", "::1", "192.0.2.7", "fe80::1"] {
+            let expected: Vec<SocketAddr> = (literal, 7).to_socket_addrs().unwrap().collect();
+            assert_eq!(
+                resolve_in(&SLOTS, literal, 7, MUST_HAPPEN, unasked).unwrap(),
+                expected,
+                "{literal}"
+            );
+        }
+        let refused = resolve_in(&SLOTS, "localhost", 7, MUST_HAPPEN, unasked).unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(libc::EAGAIN), "{refused}");
+        release.send(()).unwrap();
     }
 
     #[test]

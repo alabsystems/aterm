@@ -807,7 +807,7 @@ fn busy_or_corrupt_activity_still_settles_the_senior_peer_and_refuses_home_launc
         if corrupt {
             let file = held.as_ref().unwrap().dir.join(FILE);
             drop(held.take());
-            std::fs::write(file, b"{").unwrap();
+            crate::test_config::write(file, b"{").unwrap();
         }
         assert!(matches!(
             lab.touch("second", Act::Look, NOW),

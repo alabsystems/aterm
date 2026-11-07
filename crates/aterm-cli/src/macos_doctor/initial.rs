@@ -16,8 +16,7 @@ pub use check::{check_initial_setup, check_initial_setup_observed};
 #[cfg(any(test, debug_assertions))]
 pub use input_activation::input_setup_scope_at;
 pub use input_activation::{
-    InputServiceSet, InputSetupScope, activate_input_attachments, input_activation_revision,
-    input_setup_scope,
+    InputServiceSet, InputSetupScope, activate_input_attachments, input_setup_scope,
 };
 pub use input_pass::{
     InitialInputPass, PendingInputAdmission, initial_setup_input_park_mark,

@@ -471,6 +471,18 @@ pub struct Stat {
     pub len: u64,
 }
 
+/// Which file a path names, and on which filesystem ([`System::file_id`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileId {
+    /// The filesystem's device (`st_dev`).
+    pub dev: u64,
+    /// The file's number on it (`st_ino`).
+    pub ino: u64,
+    /// When the file was made, in nanoseconds since the epoch, where the filesystem keeps it
+    /// (APFS's birth time, ext4's through `statx`).
+    pub born_ns: Option<u128>,
+}
+
 /// One no-follow descriptor's metadata: kind/owner admission and change identity refer to
 /// the same opened object. It supplies no file content or executable authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -977,6 +989,13 @@ pub trait System: Sync {
 
     /// Return `lstat(path)` metadata without following symlinks.
     fn stat(&self, path: &Path) -> io::Result<Stat>;
+
+    /// The filesystem `path` is on and its file there (`lstat`'s `st_dev` and `st_ino`, and its
+    /// birth time where kept), or an error where this port cannot say (this default).
+    fn file_id(&self, path: &Path) -> io::Result<FileId> {
+        let _ = path;
+        Err(io::ErrorKind::Unsupported.into())
+    }
 
     /// List entry names in directory `path`.
     fn list_dir(&self, path: &Path) -> io::Result<Vec<String>>;
@@ -2158,6 +2177,20 @@ impl System for Live {
         })
     }
 
+    fn file_id(&self, path: &Path) -> io::Result<FileId> {
+        use std::os::unix::fs::MetadataExt as _;
+        let m = std::fs::symlink_metadata(path)?;
+        Ok(FileId {
+            dev: m.dev(),
+            ino: m.ino(),
+            born_ns: m
+                .created()
+                .ok()
+                .and_then(|born| born.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|born| born.as_nanos()),
+        })
+    }
+
     fn list_dir(&self, path: &Path) -> io::Result<Vec<String>> {
         let mut names = Vec::new();
         for entry in std::fs::read_dir(path)? {
@@ -2733,8 +2766,8 @@ pub use fake::Fake;
 mod fake {
     use super::scratch::{OwnedDirectory, prefix};
     use super::{
-        Cmd, GithubError, GithubFailure, GithubResponse, Ran, Relaying, RunFailed, Scratch, Secret,
-        StagedChild, Stat, System, User,
+        Cmd, FileId, GithubError, GithubFailure, GithubResponse, Ran, Relaying, RunFailed, Scratch,
+        Secret, StagedChild, Stat, System, User,
     };
     use std::collections::BTreeMap;
     use std::io;
@@ -2774,6 +2807,7 @@ mod fake {
         files: Mutex<BTreeMap<PathBuf, (Vec<u8>, u32)>>,
         runtime_refusals: Mutex<BTreeMap<PathBuf, String>>,
         stats: Mutex<BTreeMap<PathBuf, Stat>>,
+        file_ids: Mutex<BTreeMap<PathBuf, FileId>>,
         stat_errors: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
         stat_errors_once: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
         rename_errors: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
@@ -3499,6 +3533,15 @@ mod fake {
         /// Seed a `stat` answer.
         pub fn stat_of(&self, path: &str, stat: Stat) -> &Self {
             self.stats.lock().unwrap().insert(PathBuf::from(path), stat);
+            self
+        }
+
+        /// Seed one physical filesystem identity, independently of file contents.
+        pub fn file_id_of(&self, path: &Path, identity: FileId) -> &Self {
+            self.file_ids
+                .lock()
+                .unwrap()
+                .insert(path.to_owned(), identity);
             self
         }
 
@@ -4402,6 +4445,15 @@ mod fake {
                 .unwrap()
                 .push(format!("own {uid}:{gid} {mode:o} {}", path.display()));
             Ok(())
+        }
+
+        fn file_id(&self, path: &Path) -> io::Result<FileId> {
+            self.file_ids
+                .lock()
+                .unwrap()
+                .get(path)
+                .copied()
+                .ok_or_else(|| io::ErrorKind::Unsupported.into())
         }
 
         fn stat(&self, path: &Path) -> io::Result<Stat> {

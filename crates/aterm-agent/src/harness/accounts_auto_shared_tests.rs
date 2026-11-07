@@ -712,6 +712,7 @@ impl Bed {
             mailbox: &|_, _, _| (super::super::sign_in_ladder::Mailbox::Ready, None),
             log: Arc::new(|_| {}),
             run_attempt: None,
+            save_oauth: |_, _| Ok("inert".into()),
             shared: shared_renewal::Effects {
                 authority: None,
                 checkpoint_authority: None,
@@ -852,6 +853,7 @@ impl Bed {
             },
             log,
             run_attempt: Some(Arc::new(|_, _| panic!("no unguarded fallback"))),
+            save_oauth: |_, _| Ok("inert".into()),
             shared: shared_renewal::Effects {
                 authority: factory,
                 checkpoint_authority: factory,
@@ -1648,10 +1650,11 @@ fn shared_upkeep_refuses_missing_authority_routes_required_profiles_and_local_of
             bed.approval.live.store(false, Ordering::SeqCst);
         }
         if case == 4 {
-            fs::write(config_beside(&bed.roster), "[harness]\nlogins = \"off\"\n").unwrap();
+            crate::test_config::write(config_beside(&bed.roster), "[harness]\nlogins = \"off\"\n")
+                .unwrap();
         }
         if case == 5 {
-            fs::write(
+            crate::test_config::write(
                 config_beside(&bed.roster),
                 "[harness]\naccounts = \"off\"\n",
             )
@@ -1726,7 +1729,8 @@ fn queued_shared_work_rechecks_the_root_and_the_local_login_switch() {
         if stopped {
             bed.approval.live.store(false, Ordering::SeqCst);
         } else {
-            fs::write(config_beside(&bed.roster), "[harness]\nlogins = \"off\"\n").unwrap();
+            crate::test_config::write(config_beside(&bed.roster), "[harness]\nlogins = \"off\"\n")
+                .unwrap();
         }
         let job = jobs.lock().unwrap().pop().unwrap();
         job();
@@ -2703,7 +2707,9 @@ fn changed_shared_policy_during_provider_or_failed_status_is_deferred() {
                 }
                 4 => {
                     let path = config_beside(&bed.roster);
-                    Box::new(move || fs::write(&path, "[harness]\nlogins = \"off\"\n").unwrap())
+                    Box::new(move || {
+                        crate::test_config::write(&path, "[harness]\nlogins = \"off\"\n").unwrap()
+                    })
                 }
                 _ => unreachable!(),
             };

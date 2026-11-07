@@ -127,9 +127,9 @@ impl Program {
         }
     }
 
-    /// Whether the supervisor's screen policy acts on this program. Grok Build's and Kimi
-    /// Code's readers read no busy turn yet ([`crate::grok`], [`crate::kimi`]), so no policy acts
-    /// on them.
+    /// Whether the supervisor's screen policy acts on this program. Grok Build's and Kimi Code's
+    /// readers are display readers ([`crate::grok::phase`], [`crate::kimi::phase`]): their
+    /// supervision belongs to grok-alab and kimi-alab, so no policy here acts on them.
     #[inline]
     #[must_use]
     pub const fn supervisable(self) -> bool {
@@ -522,6 +522,78 @@ pub trait ScreenReader: Sync {
     fn end_drawn(&self, _rows: &[String]) -> bool {
         false
     }
+    /// What `title`, the program's window title read with the screen, says of its run
+    /// ([`Self::title_runs`]): `None` where there is no title (a host that sends none, or a tape
+    /// recorded from one) or it is empty (one the program never set), which say nothing.
+    fn runs(&self, title: Option<&str>) -> Option<bool> {
+        title
+            .filter(|t| !t.is_empty())
+            .and_then(|t| self.title_runs(t))
+    }
+    /// Whether `rows` show work the agent handed off running, which runs its title with its turn
+    /// over. The default shows none; Claude Code's is [`crate::phase::delegated_shown`].
+    fn delegated_shown(&self, _rows: &[String]) -> bool {
+        false
+    }
+    /// Whether the title says a turn runs that `rows` do not show: `runs` is `Some(true)` where
+    /// the rows alone read Idle or a Question ([`Self::phase`]), with no end drawn
+    /// ([`Self::end_drawn`]), no wall and no handed-off work shown ([`Self::delegated_shown`]).
+    /// Claude Code's is [`crate::phase::title_live`].
+    fn title_live(&self, rows: &[String], runs: Option<bool>) -> bool {
+        runs == Some(true)
+            && matches!(self.phase(rows), Phase::Idle | Phase::Question)
+            && !self.end_drawn(rows)
+            && self.wall(rows).is_none()
+            && !self.delegated_shown(rows)
+    }
+    /// [`Self::phase`] read beside the title (`runs`, [`Self::runs`]): an Idle or a Question is
+    /// Busy where [`Self::title_live`]. A box, a limit, a wall and every Busy stand as read.
+    fn phase_seen(&self, rows: &[String], runs: Option<bool>) -> Phase {
+        let phase = self.phase(rows);
+        if matches!(phase, Phase::Idle | Phase::Question) && self.title_live(rows, runs) {
+            Phase::Busy
+        } else {
+            phase
+        }
+    }
+    /// [`Self::background_wait`] read beside the title. The default is the screen's alone;
+    /// Claude Code's reads no break where its title runs a turn
+    /// ([`crate::phase::background_wait_seen`]).
+    fn background_wait_seen(&self, rows: &[String], _runs: Option<bool>) -> Option<&'static str> {
+        self.background_wait(rows)
+    }
+    /// [`Self::background_rest`] read beside the title. The default is the screen's alone;
+    /// Claude Code's reads no rest where its title runs a turn
+    /// ([`crate::phase::background_rest_seen`]).
+    fn background_rest_seen(&self, rows: &[String], _runs: Option<bool>) -> Option<Phase> {
+        self.background_rest(rows)
+    }
+    /// [`Self::read`] with its phase read beside the title ([`Self::phase_seen`]). A turn the
+    /// title holds is a hard busy, so the reading carries only a health wall, as
+    /// [`Self::read`] does under a live turn.
+    fn read_titled(
+        &self,
+        rows: &[String],
+        cursor_col: Option<usize>,
+        runs: Option<bool>,
+    ) -> Reading {
+        let phase = self.phase_seen(rows, runs);
+        let held = phase == Phase::Busy && self.title_live(rows, runs);
+        compose(self, rows, cursor_col, phase, held)
+    }
+    /// [`Self::read_at`] read beside the title: [`Self::read_titled`], then
+    /// [`Self::cursor_vouches`].
+    fn read_seen(
+        &self,
+        rows: &[String],
+        cursor_row: Option<usize>,
+        cursor_col: Option<usize>,
+        runs: Option<bool>,
+    ) -> Reading {
+        let mut reading = self.read_titled(rows, cursor_col, runs);
+        reading.phase_authoritative &= self.cursor_vouches(rows, &reading, cursor_row);
+        reading
+    }
     /// Whether cursor position `cursor_row` vouches for `reading`.
     fn cursor_vouches(
         &self,
@@ -546,36 +618,49 @@ pub trait ScreenReader: Sync {
 
     /// Read `rows` at `cursor_col`.
     fn read(&self, rows: &[String], cursor_col: Option<usize>) -> Reading {
-        let phase = self.phase(rows);
-        let phase_authoritative = self.phase_authoritative(rows, &phase);
-        let prompt = (phase == Phase::Prompt)
-            .then(|| self.prompt(rows))
-            .flatten();
-        let hard_busy = phase == Phase::Busy && busy_signal(rows).is_some_and(|b| !b.soft);
-        let wall = if phase == Phase::Prompt {
-            None
-        } else if hard_busy {
-            self.health_wall(rows)
-        } else {
-            self.wall(rows)
-        };
-        Reading {
-            program: self.program(),
-            phase,
-            phase_authoritative,
-            wall,
-            prompt,
-            survey: self.survey(rows),
-            context_left: self.context_shown(rows),
-            suggestion: cursor_col.and_then(|c| self.suggestion(rows, c)),
-            goal_active: self.goal_active(rows),
-            said_tail: self.said_tail(rows),
-            interrupted: self.interrupted(rows),
-            fresh: self.fresh(rows),
-            composer: self.composer(rows),
-            credits: self.credits(rows),
-            warning: self.usage_warning(rows),
-        }
+        compose(self, rows, cursor_col, self.phase(rows), false)
+    }
+}
+
+/// The [`Reading`] of `rows` in `phase`: [`ScreenReader::read`]'s, and
+/// [`ScreenReader::read_titled`]'s where `title_busy` says the title holds a turn the screen does
+/// not show, a hard busy.
+fn compose<R: ScreenReader + ?Sized>(
+    reader: &R,
+    rows: &[String],
+    cursor_col: Option<usize>,
+    phase: Phase,
+    title_busy: bool,
+) -> Reading {
+    let phase_authoritative = reader.phase_authoritative(rows, &phase);
+    let prompt = (phase == Phase::Prompt)
+        .then(|| reader.prompt(rows))
+        .flatten();
+    let hard_busy =
+        phase == Phase::Busy && (title_busy || busy_signal(rows).is_some_and(|b| !b.soft));
+    let wall = if phase == Phase::Prompt {
+        None
+    } else if hard_busy {
+        reader.health_wall(rows)
+    } else {
+        reader.wall(rows)
+    };
+    Reading {
+        program: reader.program(),
+        phase,
+        phase_authoritative,
+        wall,
+        prompt,
+        survey: reader.survey(rows),
+        context_left: reader.context_shown(rows),
+        suggestion: cursor_col.and_then(|c| reader.suggestion(rows, c)),
+        goal_active: reader.goal_active(rows),
+        said_tail: reader.said_tail(rows),
+        interrupted: reader.interrupted(rows),
+        fresh: reader.fresh(rows),
+        composer: reader.composer(rows),
+        credits: reader.credits(rows),
+        warning: reader.usage_warning(rows),
     }
 }
 
@@ -752,6 +837,21 @@ impl ScreenReader for ClaudeReader {
     /// Its done row under the reply ([`crate::phase::done_row_drawn`]).
     fn end_drawn(&self, rows: &[String]) -> bool {
         crate::phase::done_row_drawn(rows)
+    }
+    fn delegated_shown(&self, rows: &[String]) -> bool {
+        crate::phase::delegated_shown(rows)
+    }
+    fn title_live(&self, rows: &[String], runs: Option<bool>) -> bool {
+        crate::phase::title_live(rows, runs)
+    }
+    fn phase_seen(&self, rows: &[String], runs: Option<bool>) -> Phase {
+        crate::phase::worker_phase_seen(rows, runs)
+    }
+    fn background_wait_seen(&self, rows: &[String], runs: Option<bool>) -> Option<&'static str> {
+        crate::phase::background_wait_seen(rows, runs)
+    }
+    fn background_rest_seen(&self, rows: &[String], runs: Option<bool>) -> Option<Phase> {
+        crate::phase::background_rest_seen(rows, runs)
     }
     /// Claude Code's `idle` at a prompt box is evidence only where that box holds the
     /// cursor ([`crate::phase::prompt_box_holds`]); a wall and every other phase stand as
@@ -1045,7 +1145,8 @@ impl ScreenReader for MuseReader {
     }
 }
 
-/// Screen reader for Grok Build ([`crate::grok`]): its walls, and no phase as evidence.
+/// Screen reader for Grok Build ([`crate::grok`]), for display: its phase, its walls and the
+/// boxes that wait on the person ([`grok::prompt`]), which nothing here answers.
 #[derive(Debug, Clone, Copy)]
 pub struct GrokReader;
 
@@ -1053,13 +1154,26 @@ impl ScreenReader for GrokReader {
     fn program(&self) -> Program {
         Program::Grok
     }
-    /// No evidence: its busy row is unmeasured, so every reading is a non-authoritative `idle`
-    /// (its composer's box is read for the point cut, [`grok::composer_rows`], never its words).
-    fn phase(&self, _rows: &[String]) -> Phase {
-        Phase::Idle
+    /// Busy or idle by the rows around its composer's box ([`grok::phase`]; the box is read for
+    /// the point cut too, [`grok::composer_rows`], never for what is typed in it); a prompt for a
+    /// plan approval whose key row offers `a:approve`, or a card a running turn draws where no
+    /// box is ([`grok::prompt`]).
+    fn phase(&self, rows: &[String]) -> Phase {
+        grok::phase(rows).0
     }
+    fn prompt(&self, rows: &[String]) -> Option<PromptV2> {
+        grok::prompt(rows)
+    }
+    /// Its wall ([`grok::wall`]), none while a turn runs or waits on a box: a wall row such a
+    /// frame still shows in its live zone is an earlier turn's.
     fn wall(&self, rows: &[String]) -> Option<Wall> {
+        if matches!(grok::phase(rows).0, Phase::Busy | Phase::Prompt) {
+            return None;
+        }
         grok::wall(rows)
+    }
+    fn phase_authoritative(&self, rows: &[String], _: &Phase) -> bool {
+        grok::phase(rows).1
     }
     /// The context its header's token counts leave ([`grok::context_left`]), for the window's
     /// displays: the header names no compaction, so the watch does not take it.
@@ -1068,7 +1182,8 @@ impl ScreenReader for GrokReader {
     }
 }
 
-/// Screen reader for Kimi Code ([`crate::kimi`]): its composer and walls, and no phase as evidence.
+/// Screen reader for Kimi Code ([`crate::kimi`]), for display: its phase, composer and walls,
+/// and the boxes that wait on the person ([`kimi::prompt`]), which nothing here answers.
 #[derive(Debug, Clone, Copy)]
 pub struct KimiReader;
 
@@ -1076,9 +1191,16 @@ impl ScreenReader for KimiReader {
     fn program(&self) -> Program {
         Program::Kimi
     }
-    /// No evidence: a busy turn is unmeasured, so every reading is a non-authoritative `idle`.
-    fn phase(&self, _rows: &[String]) -> Phase {
-        Phase::Idle
+    /// Busy or idle by the rows over its composer ([`kimi::phase`]); a prompt for a box drawn
+    /// between two rules in the composer's place ([`kimi::prompt`]).
+    fn phase(&self, rows: &[String]) -> Phase {
+        kimi::phase(rows).0
+    }
+    fn phase_authoritative(&self, rows: &[String], _: &Phase) -> bool {
+        kimi::phase(rows).1
+    }
+    fn prompt(&self, rows: &[String]) -> Option<PromptV2> {
+        kimi::prompt(rows)
     }
     fn wall(&self, rows: &[String]) -> Option<Wall> {
         kimi::wall(rows)
@@ -1192,6 +1314,21 @@ pub fn read_at(
     identify(program, rows).read_at(rows, cursor_row, cursor_col)
 }
 
+/// Identify the reader for `(program, rows)` and run [`ScreenReader::read_seen`] with what
+/// `title`, the program's window title read with `rows`, says of its run
+/// ([`ScreenReader::runs`]).
+#[must_use]
+pub fn read_seen(
+    program: Option<&str>,
+    rows: &[String],
+    cursor_row: Option<usize>,
+    cursor_col: Option<usize>,
+    title: Option<&str>,
+) -> Reading {
+    let reader = identify(program, rows);
+    reader.read_seen(rows, cursor_row, cursor_col, reader.runs(title))
+}
+
 /// Where the live zone of `n` rows starts: `n` rows up from the last drawn row, a run of
 /// [`BLANK_GAP`] or more blank rows counting as one.
 #[must_use]
@@ -1259,6 +1396,10 @@ pub fn shell_alone(rows: &[String]) -> bool {
     let last = rows.iter().rposition(drawn).unwrap_or(first);
     rows[first..=last].iter().all(drawn)
 }
+
+#[cfg(test)]
+#[path = "title_tests.rs"]
+mod title_tests;
 
 #[cfg(test)]
 mod tests {

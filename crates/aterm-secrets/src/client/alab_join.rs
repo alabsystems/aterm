@@ -455,14 +455,14 @@ mod tests {
         let paths = Paths::for_home(root.path());
         prepare_alab_join_retry(&paths).unwrap();
         let settings = paths.home.join(".config/aterm/aterm.toml");
-        std::fs::write(&settings, "[swarm]\nenabled = false\n").unwrap();
+        crate::fsx::write_owned_in_place(&settings, "[swarm]\nenabled = false\n");
         resume_attempt(
             &paths,
             |_, _| panic!("sharing off"),
             |_, _| panic!("sharing off"),
         )
         .unwrap();
-        std::fs::write(&settings, "[swarm]\nenabled = true\n").unwrap();
+        crate::fsx::write_owned_in_place(&settings, "[swarm]\nenabled = true\n");
         let selected = Config {
             source: Source::Path(root.path().join("personal.vault")),
             mirrors: Vec::new(),
@@ -574,7 +574,7 @@ mod tests {
         let admin = Paths::for_home(&root.path().join("admin"));
         let import = root.path().join("import");
         std::fs::create_dir(&import).unwrap();
-        std::fs::write(import.join("bootstrap-test"), b"fixture-only").unwrap();
+        crate::fsx::write_owned_in_place(import.join("bootstrap-test"), b"fixture-only");
         let created = test_create_unbound(&admin, &url, Some(&import), Some("admin")).unwrap();
         let options = JoinOptions {
             source: format!("{url}#{}", created.signer),
@@ -680,11 +680,11 @@ mod tests {
         let paths = Paths::for_home(root.path());
         prepare_alab_join_retry(&paths).unwrap();
         let settings = paths.home.join(".config/aterm/aterm.toml");
-        std::fs::write(&settings, "[swarm]\nenabled = false\n").unwrap();
+        crate::fsx::write_owned_in_place(&settings, "[swarm]\nenabled = false\n");
         assert!(prepare_alab_join_retry(&paths).is_err());
         resume_with(&paths, |_, _| panic!("sharing off must hold the retry")).unwrap();
         assert!(paths.dir.join(FILE).exists());
-        std::fs::write(&settings, "[swarm]\nenabled = true\n").unwrap();
+        crate::fsx::write_owned_in_place(&settings, "[swarm]\nenabled = true\n");
         let chosen = Config {
             source: Source::Path(root.path().join("personal.vault")),
             mirrors: Vec::new(),
@@ -740,7 +740,7 @@ mod tests {
         let stopped = resume_with(&paths, |paths, expected| {
             join_with(paths, &options, expected, |_| {
                 // The fetch began with sharing on, and finishes after the user turned it off.
-                std::fs::write(&settings, "[swarm]\nenabled = false\n").unwrap();
+                crate::fsx::write_owned_in_place(&settings, "[swarm]\nenabled = false\n");
                 Ok(Fetched::Body(bytes.clone()))
             })
             .map(drop)
@@ -755,7 +755,7 @@ mod tests {
         assert!(transport::list_joins(&url).unwrap().is_empty());
 
         // Turning sharing on retries the retained intent and queues the same ordinary join.
-        std::fs::write(&settings, "[swarm]\nenabled = true\n").unwrap();
+        crate::fsx::write_owned_in_place(&settings, "[swarm]\nenabled = true\n");
         resume_with(&paths, |paths, expected| {
             join_with(paths, &options, expected, |_| {
                 Ok(Fetched::Body(bytes.clone()))
@@ -770,11 +770,10 @@ mod tests {
         // An explicit manual join keeps its authority even with automatic sharing off.
         let manual = Paths::for_home(&root.path().join("manual"));
         std::fs::create_dir_all(manual.home.join(".config/aterm")).unwrap();
-        std::fs::write(
+        crate::fsx::write_owned_in_place(
             manual.home.join(".config/aterm/aterm.toml"),
             "[swarm]\nenabled = false\n",
-        )
-        .unwrap();
+        );
         join_with(&manual, &options, ExpectedConfig::Read(None), |_| {
             Ok(Fetched::Body(bytes.clone()))
         })
@@ -789,7 +788,7 @@ mod tests {
         let settings = partial.home.join(".config/aterm/aterm.toml");
         let say = |event: &JoinEvent<'_>| {
             if matches!(event, JoinEvent::Machine { .. }) {
-                std::fs::write(&settings, "[swarm]\nenabled = false\n").unwrap();
+                crate::fsx::write_owned_in_place(&settings, "[swarm]\nenabled = false\n");
             }
         };
         let options = JoinOptions {
@@ -807,7 +806,7 @@ mod tests {
         assert!(!partial.dir.join(FILE).exists());
         assert_eq!(transport::list_joins(&url).unwrap().len(), 2);
 
-        std::fs::write(&settings, "[swarm]\nenabled = true\n").unwrap();
+        crate::fsx::write_owned_in_place(&settings, "[swarm]\nenabled = true\n");
         subscriber_pass(&partial, &mut None, &FOUND_NONE).unwrap();
         assert_eq!(load_state(&partial).unwrap().membership, Stored::Pending);
         // The normal join grace elapses: its ordinary subscriber re-ask finishes the request.

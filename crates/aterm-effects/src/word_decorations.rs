@@ -420,6 +420,25 @@ impl KittyCursorPlacement {
     where
         F: Fn(u16, u16) -> Option<bool>,
     {
+        self.keep_off(geom, caret, ink, true);
+    }
+
+    /// [`Self::keep_off_letters`] for a head fitted to its row
+    /// ([`crate::rainbow_kitty::companion::HeadFit`]): it stays on that row, so it is never lifted
+    /// clear, and one with no room left past the caret keeps its seat beside it.
+    #[inline]
+    pub fn keep_fitted_off_letters<F>(&mut self, geom: EffectGeom, caret: (u16, u16), ink: F)
+    where
+        F: Fn(u16, u16) -> Option<bool>,
+    {
+        self.keep_off(geom, caret, ink, false);
+    }
+
+    #[inline]
+    fn keep_off<F>(&mut self, geom: EffectGeom, caret: (u16, u16), ink: F, may_lift: bool)
+    where
+        F: Fn(u16, u16) -> Option<bool>,
+    {
         let Some(draw) = self.drawn.as_mut() else {
             return;
         };
@@ -561,6 +580,7 @@ impl KittyCursorPlacement {
         let to = match (nudged.or(grazed), pushed) {
             (Some(at), _) => Some(at),
             (None, Some(px)) if is_clear(px, y) => Some((px, y)),
+            _ if !may_lift => None,
             _ => {
                 // Lift clear of each cell it would cover, a row at a time.
                 let mut ly = blocked_xy - h - 1;

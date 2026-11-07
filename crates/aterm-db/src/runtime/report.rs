@@ -4,6 +4,7 @@
 //! Bounded metadata from completed automatic repair workers. No payload or key
 //! material leaves the transport through this observation.
 
+use crate::control::Failure;
 use astream_wire::sync::Actor;
 use std::net::SocketAddr;
 
@@ -35,14 +36,15 @@ pub struct RepairRound {
     pub cancelled: bool,
     /// Last local operation entered; None when a worker panicked before reporting.
     pub phase: Option<crate::control::Phase>,
-    pub control: std::result::Result<crate::control::Report, String>,
+    /// The control exchange's report, or its typed failure. Each failure below carries its own
+    /// value-free cause beside bounded local text, so an observation of a failed round always
+    /// names one.
+    pub control: std::result::Result<crate::control::Report, Failure>,
     /// Signed membership records retained independently of application access.
     pub membership: Option<crate::control::Report>,
-    pub membership_error: Option<String>,
+    pub membership_error: Option<Failure>,
     pub application: Option<crate::replica::Report>,
-    pub application_error: Option<String>,
-    /// Closed diagnostic category, with no error text or payload.
-    pub application_cause: Option<aterm_types::network_state::RepairCause>,
+    pub application_error: Option<Failure>,
     /// Lower bounds observed before an application error. These are not a
     /// completed round or proof that the peer received local receipts.
     pub application_interrupted: Option<crate::replica::Report>,
@@ -53,7 +55,7 @@ pub struct RepairRound {
     /// availability. The reason contains bounded metadata, never a wire value.
     pub application_batch_deferral: Option<crate::replica::BatchDeferral>,
     /// Optional credential exchange; values and ciphertext never enter this report.
-    pub handoff: Option<std::result::Result<usize, String>>,
+    pub handoff: Option<std::result::Result<usize, Failure>>,
     /// Process-local completion order, independent of wall-clock adjustment.
     pub completed_at: std::time::Instant,
     pub completed_at_ms: u64,
@@ -74,6 +76,11 @@ pub(super) fn bounded_error(error: impl std::fmt::Display) -> String {
         value.push('…');
     }
     value
+}
+
+/// `failure` with its text bounded like other worker errors; its cause is unchanged.
+pub(super) fn bounded_failure(failure: &Failure) -> Failure {
+    Failure::new(failure.cause, bounded_error(&failure.text))
 }
 
 impl RepairRound {
@@ -117,42 +124,73 @@ impl RepairRound {
 
     /// A local diagnostic for this attempt's authenticated peer. Error strings,
     /// credentials and payloads never enter the published observation.
-    pub(super) fn observation(
+    pub(crate) fn observation(
         &self,
     ) -> Option<(
         Actor,
         aterm_types::network_state::RepairObservation,
         std::time::Instant,
     )> {
-        use aterm_types::network_state::{RepairObservation, RepairOutcome, RepairStage};
+        use aterm_types::network_state::{
+            RepairCause, RepairObservation, RepairOutcome, RepairStage,
+        };
         if !self.exchange_started || self.completed_at_ms == 0 {
             return None;
         }
         let actor = self.actor?;
         let application = self.application.or(self.application_interrupted);
+        // A local deferral's cause: an unavailable inventory's local refusal, else a batch's.
+        let deferral = self
+            .application_deferral
+            .as_ref()
+            .and_then(|why| why.local_cause)
+            .or_else(|| {
+                self.application_batch_deferral
+                    .as_ref()
+                    .map(|why| why.cause)
+            });
         let (stage, outcome) = if self.cancelled {
             (self.phase.map(stage), RepairOutcome::Cancelled)
-        } else if self.membership_error.is_some() {
-            (Some(RepairStage::Membership), RepairOutcome::Failed)
-        } else if self.application_error.is_some() || self.application_interrupted.is_some() {
-            (Some(RepairStage::Application), RepairOutcome::Failed)
-        } else if self.handoff.as_ref().is_some_and(Result::is_err) {
-            (Some(RepairStage::Credentials), RepairOutcome::Failed)
-        } else if self.control.is_err() {
-            (self.phase.map(stage), RepairOutcome::Failed)
+        } else if let Some(failure) = &self.membership_error {
+            (
+                Some(RepairStage::Membership),
+                RepairOutcome::Failed(failure.cause),
+            )
+        } else if let Some(failure) = &self.application_error {
+            (
+                Some(RepairStage::Application),
+                RepairOutcome::Failed(failure.cause),
+            )
+        } else if self.application_interrupted.is_some() {
+            // The replica records an interruption only beside the exchange error that
+            // `application_error` carries; a round assembled with one alone names no category.
+            (
+                Some(RepairStage::Application),
+                RepairOutcome::Failed(RepairCause::Other),
+            )
+        } else if let Some(Err(failure)) = &self.handoff {
+            (
+                Some(RepairStage::Credentials),
+                RepairOutcome::Failed(failure.cause),
+            )
+        } else if let Err(failure) = &self.control {
+            (self.phase.map(stage), RepairOutcome::Failed(failure.cause))
         } else if self.application_deferral.is_some()
             || self.application_batch_deferral.is_some()
             || application.is_some_and(|report| report.deferred != 0)
         {
-            (Some(RepairStage::Application), RepairOutcome::Deferred)
+            (
+                Some(RepairStage::Application),
+                RepairOutcome::Deferred(deferral),
+            )
         } else if self.membership.is_some_and(|report| report.deferred != 0) {
-            (Some(RepairStage::Membership), RepairOutcome::Deferred)
+            (Some(RepairStage::Membership), RepairOutcome::Deferred(None))
         } else if self
             .control
             .as_ref()
             .is_ok_and(|report| report.deferred != 0)
         {
-            (Some(RepairStage::Control), RepairOutcome::Deferred)
+            (Some(RepairStage::Control), RepairOutcome::Deferred(None))
         } else {
             (
                 Some(RepairStage::Application),
@@ -166,23 +204,6 @@ impl RepairRound {
         Some((
             actor,
             RepairObservation {
-                cause: self
-                    .application_cause
-                    .or_else(|| {
-                        self.application_deferral
-                            .as_ref()
-                            .and_then(|why| why.local_cause)
-                    })
-                    .or_else(|| {
-                        self.application_batch_deferral
-                            .as_ref()
-                            .map(|why| why.cause)
-                    })
-                    .or_else(|| {
-                        self.application_error
-                            .as_ref()
-                            .map(|_| aterm_types::network_state::RepairCause::Other)
-                    }),
                 completed_at_ms: self.completed_at_ms,
                 outbound: self.target.is_some(),
                 stage,
@@ -398,12 +419,14 @@ impl RepairRound {
             exchange_started: false,
             cancelled: false,
             phase: None,
-            control: Err("automatic repair worker panicked".into()),
+            control: Err(Failure::new(
+                aterm_types::network_state::RepairCause::Other,
+                "automatic repair worker panicked",
+            )),
             membership: None,
             membership_error: None,
             application: None,
             application_error: None,
-            application_cause: None,
             application_interrupted: None,
             application_deferral: None,
             application_batch_deferral: None,
@@ -434,13 +457,16 @@ fn only_a_clean_round_that_left_nothing_to_fetch_is_evidence() {
     };
     assert_eq!(clean().drained_table(), Some(table));
     assert_eq!(RepairRound::panicked(None).drained_table(), None);
+    fn no() -> Failure {
+        Failure::new(aterm_types::network_state::RepairCause::Other, "no")
+    }
     let edited: [fn(&mut RepairRound); 12] = [
         |r| r.cancelled = true,
         |r| r.exchange_started = false,
         |r| r.actor = None,
-        |r| r.control = Err("no".into()),
-        |r| r.membership_error = Some("no".into()),
-        |r| r.application_error = Some("no".into()),
+        |r| r.control = Err(no()),
+        |r| r.membership_error = Some(no()),
+        |r| r.application_error = Some(no()),
         |r| r.application = None,
         |r| r.application.as_mut().unwrap().received = 1,
         |r| r.application.as_mut().unwrap().deferred = 1,
@@ -493,11 +519,14 @@ mod tests {
                     RepairCause::$cause,
                 ));
                 let mut round = attempted();
-                round.application_error = repair.application_error().map(str::to_owned);
-                round.application_cause = repair.application_cause();
+                round.application_error = repair.application_error().map(bounded_failure);
                 let (_, observation, _) = round.observation().unwrap();
-                assert_eq!(observation.outcome, RepairOutcome::Failed);
-                assert_eq!(observation.cause.unwrap().word(), $word);
+                assert_eq!(
+                    observation.outcome,
+                    RepairOutcome::Failed(RepairCause::$cause)
+                );
+                assert_eq!(observation.cause().unwrap().word(), $word);
+                assert_eq!(RepairCause::from_word($word), Some(RepairCause::$cause));
                 assert!(!format!("{observation:?}").contains("private"));
                 repair.begin_round();
                 assert!(repair.application_cause().is_none());
@@ -519,6 +548,9 @@ mod tests {
     cause_test!(records_decode, Decode, "decode");
     cause_test!(records_not_ready, NotReady, "not-ready");
     cause_test!(records_needs_update, NeedsUpdate, "needs-update");
+    cause_test!(records_lan_held, LanHeld, "lan-held");
+    cause_test!(records_unreachable, Unreachable, "unreachable");
+    cause_test!(records_other, Other, "other");
 
     fn attempted() -> RepairRound {
         let mut round = RepairRound::panicked(Some("127.0.0.1:41384".parse().unwrap()));
@@ -530,11 +562,15 @@ mod tests {
         round
     }
 
+    fn failure(cause: aterm_types::network_state::RepairCause) -> Failure {
+        Failure::new(cause, "private fixture error and payload")
+    }
+
     #[test]
     fn repair_diagnostics_keep_failures_and_partial_counts_without_error_text() {
-        use aterm_types::network_state::{RepairOutcome, RepairStage};
+        use aterm_types::network_state::{RepairCause, RepairOutcome, RepairStage};
         let mut round = attempted();
-        round.application_error = Some("private fixture error and payload".into());
+        round.application_error = Some(failure(RepairCause::Io));
         round.application_interrupted = Some(crate::replica::Report {
             table: Some([2; 32]),
             sent: 3,
@@ -544,7 +580,7 @@ mod tests {
         });
         let (actor, observation, _) = round.observation().unwrap();
         assert_eq!(actor, [7; 48]);
-        assert_eq!(observation.outcome, RepairOutcome::Failed);
+        assert_eq!(observation.outcome, RepairOutcome::Failed(RepairCause::Io));
         assert_eq!(observation.stage, Some(RepairStage::Application));
         assert_eq!(observation.table, Some([2; 32]));
         assert_eq!(observation.sent, Some(3));
@@ -570,7 +606,7 @@ mod tests {
 
     #[test]
     fn an_authenticated_round_does_not_imply_an_application_exchange() {
-        use aterm_types::network_state::{RepairOutcome, RepairStage};
+        use aterm_types::network_state::{RepairCause, RepairOutcome, RepairStage};
         let mut round = attempted();
         assert_eq!(
             round.observation().unwrap().1.outcome,
@@ -589,7 +625,7 @@ mod tests {
         round.application.as_mut().unwrap().deferred = 1;
         assert_eq!(
             round.observation().unwrap().1.outcome,
-            RepairOutcome::Deferred
+            RepairOutcome::Deferred(None)
         );
         round.application.as_mut().unwrap().deferred = 0;
         round.membership = Some(crate::control::Report {
@@ -607,14 +643,14 @@ mod tests {
             Some(RepairStage::Control)
         );
         round.control.as_mut().unwrap().deferred = 0;
-        round.handoff = Some(Err("private fixture credential error".into()));
+        round.handoff = Some(Err(failure(RepairCause::NotReady)));
         assert_eq!(
             round.observation().unwrap().1.stage,
             Some(RepairStage::Credentials)
         );
         assert_eq!(
             round.observation().unwrap().1.outcome,
-            RepairOutcome::Failed
+            RepairOutcome::Failed(RepairCause::NotReady)
         );
         round.cancelled = true;
         assert_eq!(
@@ -625,6 +661,7 @@ mod tests {
 
     #[test]
     fn only_successful_outbound_rounds_expose_authenticated_endpoints() {
+        use aterm_types::network_state::RepairCause;
         let address = "127.0.0.1:41384".parse().unwrap();
         let mut round = RepairRound::panicked(Some(address));
         round.actor = Some([7; 48]);
@@ -642,11 +679,11 @@ mod tests {
             |r| r.actor = None,
             |r| r.exchange_started = false,
             |r| r.cancelled = true,
-            |r| r.control = Err("control failed after authentication".into()),
-            |r| r.membership_error = Some("membership failed".into()),
-            |r| r.application_error = Some("application failed".into()),
+            |r| r.control = Err(failure(RepairCause::Io)),
+            |r| r.membership_error = Some(failure(RepairCause::Quota)),
+            |r| r.application_error = Some(failure(RepairCause::Decode)),
             |r| r.application_interrupted = Some(crate::replica::Report::default()),
-            |r| r.handoff = Some(Err("handoff failed".into())),
+            |r| r.handoff = Some(Err(failure(RepairCause::NotReady))),
             |r| r.completed_at_ms = 0,
         ];
         for (index, fail) in failures.into_iter().enumerate() {
@@ -657,5 +694,46 @@ mod tests {
                 "failure {index} promoted an endpoint"
             );
         }
+    }
+
+    /// Every way a round fails names its cause: a membership trade, a credential handoff, and a
+    /// control step after a finished application exchange (the shape of m22's 43 `failed (cause
+    /// unavailable)` records: stage application, sent and received 0; here a busy custody
+    /// refusing a re-check after the exchange), which the round's report once kept only as text.
+    /// The negative control is the type: a round failure is a [`Failure`], and an outcome
+    /// `RepairOutcome::Failed` without a cause does not compile (`aterm_types`' `compile_fail`
+    /// example).
+    #[test]
+    fn every_failed_round_names_its_cause() {
+        use aterm_types::network_state::{RepairCause, RepairOutcome, RepairStage};
+        let mut round = attempted();
+        round.membership_error = Some(failure(RepairCause::Quota));
+        let observation = round.observation().unwrap().1;
+        assert_eq!(observation.stage, Some(RepairStage::Membership));
+        assert_eq!(
+            observation.outcome,
+            RepairOutcome::Failed(RepairCause::Quota)
+        );
+
+        let mut round = attempted();
+        round.handoff = Some(Err(failure(RepairCause::Io)));
+        let observation = round.observation().unwrap().1;
+        assert_eq!(observation.stage, Some(RepairStage::Credentials));
+        assert_eq!(observation.outcome, RepairOutcome::Failed(RepairCause::Io));
+
+        let mut round = attempted();
+        round.phase = Some(crate::control::Phase::VersionReport);
+        round.application = Some(crate::replica::Report {
+            table: Some([3; 32]),
+            ..Default::default()
+        });
+        round.control = Err(bounded_failure(&Failure::of(&crate::Error::busy())));
+        let observation = round.observation().unwrap().1;
+        assert_eq!(observation.stage, Some(RepairStage::Application));
+        assert_eq!((observation.sent, observation.received), (Some(0), Some(0)));
+        assert_eq!(
+            observation.outcome,
+            RepairOutcome::Failed(RepairCause::NotReady)
+        );
     }
 }

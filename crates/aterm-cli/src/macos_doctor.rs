@@ -34,14 +34,14 @@ pub use initial::{
     initial_setup_park_mark, initial_setup_pending_inputs, initial_setup_pending_repositories,
     initial_setup_pending_workstation_revision, initial_setup_review_revision,
     initial_setup_revision, initial_setup_snapshot, initial_setup_snapshot_read_only,
-    input_activation_revision, input_setup_scope, look_for_the_vault_again,
-    note_person_asked_for_access, note_setup_interrupted, observe_initial_setup,
-    provisional_setup_widened, provisional_setup_widens, put_back_held_initial_setup,
-    request_initial_setup_stop, restart_initial_setup, restart_initial_setup_observed,
-    retry_parked_setup_stages, run_initial_input_pass, run_initial_setup_pass,
-    set_aside_unreadable_setup, set_aside_unreadable_setup_observing, setup_is_newer,
-    setup_ledger_environment, setup_records_held, take_back_setup_interrupted,
-    validate_initial_setup_plan, vault_config_unread, with_initial_setup_vault_sync,
+    input_setup_scope, look_for_the_vault_again, note_person_asked_for_access,
+    note_setup_interrupted, observe_initial_setup, provisional_setup_widened,
+    provisional_setup_widens, put_back_held_initial_setup, request_initial_setup_stop,
+    restart_initial_setup, restart_initial_setup_observed, retry_parked_setup_stages,
+    run_initial_input_pass, run_initial_setup_pass, set_aside_unreadable_setup,
+    set_aside_unreadable_setup_observing, setup_is_newer, setup_ledger_environment,
+    setup_records_held, take_back_setup_interrupted, validate_initial_setup_plan,
+    vault_config_unread, with_initial_setup_vault_sync,
 };
 #[cfg(any(test, debug_assertions))]
 pub use initial::{
@@ -674,13 +674,9 @@ pub fn run_observed(action: Action) -> InitialSetupObserved<Report> {
         });
     }
     initial::observe_person(|root, before| {
-        mutation_observed(
-            &mut NativeHost::new(),
-            root,
-            before,
-            action,
-            initial::choice_lock_wait(),
-        )
+        mutation_observed(root, before, action, initial::choice_lock_wait(), |root| {
+            run_mutation(&mut NativeHost::new(), root, action)
+        })
     })
 }
 
@@ -750,31 +746,32 @@ pub fn restore_observed(
 ) -> InitialSetupObserved<Option<Report>> {
     initial::observe_person(|root, before| {
         restore_at(
-            &mut NativeHost::new(),
             root,
             before,
             initial::choice_lock_wait(),
             waits,
             holding,
+            |root| run_mutation(&mut NativeHost::new(), root, Action::Restore),
         )
     })
 }
 
 /// [`restore_observed`] at `root`, `wait` waiting for the profile lock another holds as a
-/// choice does ([`mutation_observed`]).
+/// choice does ([`mutation_observed`]). Construct the mutation host inside `restore`, after
+/// the lease and the final `holding` decision, so its FDA reading belongs to this operation.
 fn restore_at(
-    host: &mut dyn Host,
     root: &Path,
     before: Option<InitialSetupObservation>,
     wait: impl FnMut() -> bool,
     waits: impl FnMut(),
     holding: impl FnOnce() -> bool,
+    restore: impl FnOnce(&Path) -> Result<Report, String>,
 ) -> InitialSetupObserved<Option<Report>> {
     initial::observe_choice_at(root, before, initial::noting_first(waits, wait), |root| {
         if !holding() {
             return Ok(None);
         }
-        run_mutation(host, root, Action::Restore).map(Some)
+        restore(root).map(Some)
     })
 }
 
@@ -783,14 +780,14 @@ fn restore_at(
 /// ALab watch widening a plan, a Stop's fold), asking again while `wait` says so, and is refused
 /// in the person's words ([`SETUP_BUSY`]) only past that wait, which System State then queues
 /// (design §3.4). `aterm doctor --apply` is refused at once, as it always was.
+/// `operation` constructs its host only after the observer owns the profile lease.
 fn mutation_observed(
-    host: &mut dyn Host,
     root: &Path,
     before: Option<InitialSetupObservation>,
     action: Action,
     wait: impl FnMut() -> bool,
+    operation: impl FnOnce(&Path) -> Result<Report, String>,
 ) -> InitialSetupObserved<Report> {
-    let operation = |root: &Path| run_mutation(host, root, action);
     if action == Action::Restore {
         initial::observe_choice_at(root, before, wait, operation)
     } else {
@@ -3551,39 +3548,48 @@ fn follow_up_setup_reading_revision(
     Ok(Some(report))
 }
 
-/// Once Full Disk Access is granted, put back what a Restore could not for want of it, and apply
-/// any container preferences withheld from earlier passes.
-pub fn finish_withheld_preferences<S>(
-    reserve: impl FnMut() -> S,
-) -> Result<Option<Report>, String> {
-    let (observed, slot) = finish_withheld_preferences_observed(reserve);
-    drop(slot);
-    observed.result
+/// A finite deferred-preference attempt. A held lease or unavailable grant retains the
+/// request in its owner; it is never mistaken for completed recovery.
+#[derive(Debug)]
+pub enum WithheldFollowUp<S> {
+    /// No effect ran. The existing owner may try again after its ordinary backoff.
+    Held,
+    /// The result and its setup-slot reservation, kept until publication. The profile
+    /// lock is already released; no operation needs no reservation.
+    Finished(Box<(InitialSetupObserved<Option<Report>>, Option<S>)>),
 }
 
-/// [`finish_withheld_preferences`], binding its success or failure to the setup records while
-/// holding their profile lock. The returned reservation stays with the result until its caller
-/// publishes it; the profile lock has already gone. With no operation it returns no reservation.
-pub fn finish_withheld_preferences_observed<S>(
-    reserve: impl FnMut() -> S,
-) -> (InitialSetupObserved<Option<Report>>, Option<S>) {
-    finish_withheld_preferences_observed_unless_stopped(reserve, |_| false)
+impl<S> WithheldFollowUp<S> {
+    fn finished(
+        result: Result<Option<Report>, String>,
+        observation: Option<InitialSetupObservation>,
+        reservation: Option<S>,
+    ) -> Self {
+        Self::Finished(Box::new((
+            InitialSetupObserved::new(result, observation),
+            reservation,
+        )))
+    }
 }
 
-/// The observed follow-up with the window's exact-run Stop check. Waiting Restore
-/// work remains independent of the deferred setup changes.
-pub fn finish_withheld_preferences_observed_unless_stopped<S>(
-    reserve: impl FnMut() -> S,
+/// Put back waiting Restore originals, then finish still-authorized deferred setup changes.
+/// Each attempt tries the setup slot before the profile lock without waiting on either.
+/// The grant and current time are captured only with both leases held. Stop, the current
+/// revision and Restore remain the effect boundary's own checks.
+pub fn try_finish_withheld_preferences_unless_stopped<S>(
+    reserve: impl FnMut() -> Option<S>,
     stopped: impl Fn(u64) -> bool,
-) -> (InitialSetupObserved<Option<Report>>, Option<S>) {
+) -> WithheldFollowUp<S> {
     if aterm_types::dirs::runs_under_private_state_root() {
-        return (InitialSetupObserved::new(Ok(None), None), None);
+        return WithheldFollowUp::finished(Ok(None), None, None);
     }
     let root = match state_root() {
         Ok(root) => root,
-        Err(why) => return (InitialSetupObserved::new(Err(why), None), None),
+        Err(why) => {
+            return WithheldFollowUp::finished(Err(why), None, None);
+        }
     };
-    follow_up_finished_waiting_observed_unless_stopped(
+    follow_up_attempt_at(
         &root,
         reserve,
         || {
@@ -3591,8 +3597,7 @@ pub fn finish_withheld_preferences_observed_unless_stopped<S>(
             Ok(NativeHost::new())
         },
         &aterm_stamp::build_id(),
-        std::time::SystemTime::now(),
-        follow_up_lock_wait(),
+        std::time::SystemTime::now,
         stopped,
     )
 }
@@ -3605,122 +3610,84 @@ fn follow_up_finished_at<S, H: Host>(
     build: &str,
     now: std::time::SystemTime,
 ) -> Result<Option<Report>, String> {
-    follow_up_finished_waiting(root, reserve, host, build, now, || false)
-}
-
-/// How long the follow-up with Full Disk Access waits for the profile lock another holds: a pass
-/// in another process (`aterm doctor` in a terminal), the launch's bring-forward or the ALab
-/// watch's look. A pass of this process holds System State's busy slot, which the follow-up
-/// waits for first. Past it, what waits is put back at the next launch.
-const FOLLOW_UP_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
-
-/// How often the follow-up looks at the profile lock while another holds it.
-const FOLLOW_UP_LOCK_POLL: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// [`follow_up_finished_waiting_observed`]'s wait in a live process: a [`FOLLOW_UP_LOCK_POLL`] at a
-/// time, `false` once [`FOLLOW_UP_LOCK_WAIT`] has passed.
-fn follow_up_lock_wait() -> impl FnMut() -> bool {
-    let now = std::time::Instant::now();
-    let deadline = now
-        .checked_add(FOLLOW_UP_LOCK_WAIT)
-        .unwrap_or_else(|| now + std::time::Duration::from_secs(365 * 86_400));
-    move || {
-        let more = std::time::Instant::now() < deadline;
-        if more {
-            std::thread::sleep(FOLLOW_UP_LOCK_POLL);
-        }
-        more
-    }
-}
-
-/// The follow-up with Full Disk Access ([`finish_withheld_preferences`]): with something owed and
-/// the grant, it takes System State's busy slot (`reserve`) and the profile lock and runs. While
-/// another holds the lock it lets the slot go, so the page stays usable, and `wait`s (which says
-/// whether to look again) until the lock is free, then takes both again. So a grant recorded while
-/// a pass elsewhere holds the lock, just after that pass's own follow-up point, is still followed
-/// up in this launch once the pass ends. What the holder followed up meanwhile is owed no more.
-#[cfg(test)]
-fn follow_up_finished_waiting<S, H: Host>(
-    root: &Path,
-    reserve: impl FnMut() -> S,
-    host: impl FnOnce() -> Result<H, String>,
-    build: &str,
-    now: std::time::SystemTime,
-    wait: impl FnMut() -> bool,
-) -> Result<Option<Report>, String> {
-    let (observed, slot) =
-        follow_up_finished_waiting_observed(root, reserve, host, build, now, wait);
+    let (observed, slot) = follow_up_finished_observed_at(root, reserve, host, build, now);
     drop(slot);
     observed.result
 }
 
 #[cfg(test)]
-fn follow_up_finished_waiting_observed<S, H: Host>(
-    root: &Path,
-    reserve: impl FnMut() -> S,
-    host: impl FnOnce() -> Result<H, String>,
-    build: &str,
-    now: std::time::SystemTime,
-    wait: impl FnMut() -> bool,
-) -> (InitialSetupObserved<Option<Report>>, Option<S>) {
-    follow_up_finished_waiting_observed_unless_stopped(
-        root,
-        reserve,
-        host,
-        build,
-        now,
-        wait,
-        |_| false,
-    )
-}
-
-fn follow_up_finished_waiting_observed_unless_stopped<S, H: Host>(
+fn follow_up_finished_observed_at<S, H: Host>(
     root: &Path,
     mut reserve: impl FnMut() -> S,
     host: impl FnOnce() -> Result<H, String>,
     build: &str,
     now: std::time::SystemTime,
-    mut wait: impl FnMut() -> bool,
-    stopped: impl Fn(u64) -> bool,
 ) -> (InitialSetupObserved<Option<Report>>, Option<S>) {
-    let (mut observation, mut reserved) = (None, None);
+    match follow_up_attempt_at(root, || Some(reserve()), host, build, || now, |_| false) {
+        WithheldFollowUp::Held => (InitialSetupObserved::new(Ok(None), None), None),
+        WithheldFollowUp::Finished(finished) => *finished,
+    }
+}
+
+fn follow_up_attempt_at<S, H: Host>(
+    root: &Path,
+    mut reserve: impl FnMut() -> Option<S>,
+    host: impl FnOnce() -> Result<H, String>,
+    build: &str,
+    now: impl FnOnce() -> std::time::SystemTime,
+    stopped: impl Fn(u64) -> bool,
+) -> WithheldFollowUp<S> {
+    match follow_up_owed(root) {
+        Ok(false) => {
+            // A Restore can hold the profile while its waiting debt is not published yet.
+            // Only an empty observation under that lease can retire the grant's request.
+            let empty = match HeldLock::try_take(root) {
+                Ok(Some(_read)) => follow_up_owed(root).map(|owed| !owed),
+                Ok(None) => return WithheldFollowUp::Held,
+                Err(why) => return WithheldFollowUp::finished(Err(why), None, None),
+            };
+            match empty {
+                Ok(true) => return WithheldFollowUp::finished(Ok(None), None, None),
+                Err(why) => return WithheldFollowUp::finished(Err(why), None, None),
+                Ok(false) => {}
+            }
+            // The read-only lease above is gone before acquiring the effect slot.
+        }
+        Err(why) => {
+            return WithheldFollowUp::finished(Err(why), None, None);
+        }
+        Ok(true) => {}
+    }
+    let Some(slot) = reserve() else {
+        return WithheldFollowUp::Held;
+    };
+    let lock = match HeldLock::try_take(root) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return WithheldFollowUp::Held,
+        Err(why) => {
+            return WithheldFollowUp::finished(Err(why), None, None);
+        }
+    };
+    let mut grant_held = false;
     let result = (|| {
         if !follow_up_owed(root)? {
             return Ok(None);
         }
         let mut host = host()?;
         if host.full_disk_access() != Some(true) {
+            grant_held = true;
             return Ok(None);
         }
-        loop {
-            let slot = reserve();
-            if let Some(lock) = HeldLock::try_take(root)? {
-                let report = follow_up_owed(root).and_then(|owed| {
-                    if owed {
-                        follow_up_at_unless_stopped(root, &mut host, build, now, &stopped)
-                    } else {
-                        Ok(None)
-                    }
-                });
-                observation = initial::observation_at(root).ok();
-                // The caller publishes while retaining the slot, after releasing the profile
-                // lock, so no newer operation's report can be replaced by this one.
-                drop(lock);
-                reserved = Some(slot);
-                return report;
-            }
-            drop(slot);
-            loop {
-                if !wait() {
-                    return Ok(None);
-                }
-                if !HeldLock::profile_active(root)? {
-                    break;
-                }
-            }
-        }
+        follow_up_at_unless_stopped(root, &mut host, build, now(), &stopped)
     })();
-    (InitialSetupObserved::new(result, observation), reserved)
+    if grant_held {
+        return WithheldFollowUp::Held;
+    }
+    let observation = initial::observation_at(root).ok();
+    // The caller publishes while retaining the slot, after releasing the profile lock,
+    // so no newer operation's report can be replaced by this one.
+    drop(lock);
+    WithheldFollowUp::finished(result, observation, Some(slot))
 }
 
 fn follow_up_locked_at(root: &Path) -> Result<Option<Report>, String> {
@@ -5261,6 +5228,7 @@ mod tests {
     /// words, which System State queues.
     #[test]
     fn restore_waits_for_a_short_lock_as_a_choice_does() {
+        use std::cell::Cell;
         let root = aterm_tempfile::tempdir().unwrap();
         let target = Target::new("com.apple.AppleMultitouchTrackpad", "TrackpadScroll");
         save_backup(
@@ -5276,12 +5244,18 @@ mod tests {
         let mut host = Fake::default();
         host.values.insert(target.clone(), PValue::Bool(true));
         let mut asked = 0;
-        let observed = mutation_observed(&mut host, root.path(), None, Action::Restore, || {
-            asked += 1;
-            // The other holder's write ends.
-            holder = None;
-            true
-        });
+        let observed = mutation_observed(
+            root.path(),
+            None,
+            Action::Restore,
+            || {
+                asked += 1;
+                // The other holder's write ends.
+                holder = None;
+                true
+            },
+            |root| run_mutation(&mut host, root, Action::Restore),
+        );
         let report = observed
             .result
             .expect("a Restore pressed during a short write runs");
@@ -5290,8 +5264,70 @@ mod tests {
         assert_eq!(host.read(&target).unwrap(), Some(PValue::Bool(false)));
 
         let _holder = HeldLock::take(root.path()).unwrap();
-        let refused = mutation_observed(&mut host, root.path(), None, Action::Restore, || false);
+        let refused = mutation_observed(
+            root.path(),
+            None,
+            Action::Restore,
+            || false,
+            |_| panic!("a refused Restore constructs no mutation host"),
+        );
         assert_eq!(refused.result.unwrap_err(), SETUP_BUSY);
+
+        // The actual native-host factory must capture the grant after a queued CLI or page
+        // Restore wins its lease. A grant worker can finish its empty look in between.
+        for on_page in [false, true] {
+            let queued = aterm_tempfile::tempdir().unwrap();
+            let mut native = InitialSetupWithheldStopTest::unfinished(queued.path()).unwrap();
+            let (cleared, _) = native.follow_up(|| Some(()), |_| false);
+            cleared.result.unwrap();
+            assert!(!native.owed().unwrap());
+            let writes = native.notification_center_writes();
+            let grant = Cell::new(false);
+            let constructed = Cell::new(None);
+            let factory = || {
+                assert!(HeldLock::try_take(queued.path()).unwrap().is_none());
+                constructed.set(Some(grant.get()));
+                native.host(grant.get())
+            };
+            let mut holder = Some(HeldLock::take(queued.path()).unwrap());
+            let wait = || {
+                grant.set(true);
+                holder.take();
+                let WithheldFollowUp::Finished(finished) = follow_up_attempt_at(
+                    queued.path(),
+                    || Some(()),
+                    || Ok(native.host(grant.get())),
+                    BUILD,
+                    std::time::SystemTime::now,
+                    |_| false,
+                ) else {
+                    panic!("the grant worker must win the empty profile lease");
+                };
+                assert!(finished.0.result.as_ref().unwrap().is_none());
+                true
+            };
+            let operation = |root: &Path| run_mutation(&mut factory(), root, Action::Restore);
+            let observed = if on_page {
+                let observed = restore_at(queued.path(), None, wait, || {}, || true, operation);
+                InitialSetupObserved::new(
+                    observed
+                        .result
+                        .map(|report| report.expect("the queued page Restore runs")),
+                    observed.observation,
+                )
+            } else {
+                mutation_observed(queued.path(), None, Action::Restore, wait, operation)
+            };
+            let report = observed.result.unwrap();
+            assert!(
+                !report.needs_attention(),
+                "the queued Restore must use the grant now held: {}",
+                report.to_text()
+            );
+            assert_eq!(constructed.get(), Some(true));
+            assert!(!native.owed().unwrap());
+            assert_eq!(native.notification_center_writes(), writes + 1);
+        }
     }
 
     /// System State's Restore says the moment its own attempt finds the profile lock another
@@ -5317,23 +5353,23 @@ mod tests {
         let holder = HeldLock::take(root.path()).unwrap();
         let mut waited = 0;
         let refused = restore_at(
-            &mut host,
             root.path(),
             None,
             || false,
             || waited += 1,
             || panic!("it never held the records"),
+            |_| panic!("a refused Restore constructs no mutation host"),
         );
         assert_eq!(refused.result.unwrap_err(), SETUP_BUSY);
         assert_eq!(waited, 1, "said once, as it found the lock held");
         drop(holder);
         let overtaken = restore_at(
-            &mut host,
             root.path(),
             None,
             || false,
             || panic!("the lock was free"),
             || false,
+            |_| panic!("an overtaken Restore constructs no mutation host"),
         );
         assert!(overtaken.result.unwrap().is_none(), "let go");
         assert_eq!(
@@ -5342,12 +5378,12 @@ mod tests {
             "it changed nothing"
         );
         let restored = restore_at(
-            &mut host,
             root.path(),
             None,
             || false,
             || panic!("the lock was free"),
             || true,
+            |root| run_mutation(&mut host, root, Action::Restore),
         );
         assert!(restored.result.unwrap().is_some());
         assert_eq!(host.read(&target).unwrap(), Some(PValue::Bool(false)));
@@ -6090,20 +6126,20 @@ mod tests {
                     .is_none()
             );
         }
-        assert_eq!(taken.borrow().len(), 0, "no grant: no slot");
+        assert_eq!(taken.borrow().len(), 2, "each grant read holds both leases");
         let report = follow_up_finished_at(root.path(), reserve, || host(Some(true)), BUILD, now)
             .unwrap()
             .expect("the follow-up runs");
         assert!(!report.needs_attention(), "{}", report.to_text());
-        assert_eq!(*taken.borrow(), [true], "the slot, before the lock");
+        assert_eq!(*taken.borrow(), [true; 3], "the slot, before the lock");
         assert_eq!(
             *probed.borrow(),
-            [(0, true); 3],
-            "the grant measured before the slot and the lock"
+            [(1, false), (2, false), (3, false)],
+            "each grant is measured after acquiring the slot and the lock"
         );
         assert_eq!(
             *released.borrow(),
-            [(true, true)],
+            [(true, false), (true, false), (true, true)],
             "the slot, after the follow-up and its lock"
         );
         record_withheld(root.path(), &[WIDGETS.to_owned()], &[], &[], (BUILD, 0)).unwrap();
@@ -6114,7 +6150,11 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(taken.borrow().len(), 1, "a stopped setup takes no slot");
+        assert_eq!(
+            taken.borrow().len(),
+            3,
+            "a stopped setup takes no further slot"
+        );
         assert_eq!(
             Withholding::withheld(root.path()),
             [WIDGETS],
@@ -9358,7 +9398,7 @@ mod tests {
                 .unwrap();
             }
             let held = Cell::new(false);
-            let (observed, slot) = follow_up_finished_waiting_observed(
+            let (observed, slot) = follow_up_finished_observed_at(
                 root.path(),
                 || {
                     held.set(true);
@@ -9370,7 +9410,6 @@ mod tests {
                 || Ok(host),
                 BUILD,
                 std::time::SystemTime::now(),
-                || false,
             );
             assert!(slot.is_some() && held.get());
             assert!(HeldLock::try_take(root.path()).unwrap().is_some());
@@ -9517,8 +9556,8 @@ mod tests {
     }
 
     /// The follow-up the window starts as it records Full Disk Access granted
-    /// (`finish_withheld_preferences`): after a Restore that left nothing waiting it measures
-    /// nothing and takes no slot; after one that left Notification Center's widget list waiting
+    /// (`try_finish_withheld_preferences_unless_stopped`): after a Restore with nothing
+    /// waiting it measures nothing and takes no slot; after one that left the widget list waiting
     /// for the grant it puts that back once, holding the slot, and the next grant's follow-up
     /// finds nothing owed.
     #[test]
@@ -9571,13 +9610,12 @@ mod tests {
         }
     }
 
-    /// The grant's follow-up that finds the profile lock taken (a pass in another process, the
-    /// launch's bring-forward, the ALab watch's look) waits for it, without System State's busy
-    /// slot, and puts back what waits for Full Disk Access in this launch once the holder lets
-    /// it go. A holder that keeps it past the wait leaves it for the next launch, slot untaken.
+    /// A busy lease leaves recovery explicitly held, without constructing a host or capturing
+    /// its grant/time. A later attempt after the old ten-minute budget takes fresh facts and
+    /// puts back the same waiting Restore in this launch.
     #[test]
     fn a_grants_follow_up_waits_for_the_profile_lock_and_puts_back_in_this_launch() {
-        use std::cell::{Cell, RefCell};
+        use std::cell::Cell;
         let mut widgets = Selection::none();
         widgets.set(Setting::Widgets, true);
         let now = std::time::SystemTime::now();
@@ -9602,53 +9640,68 @@ mod tests {
                 self.0.set(false);
             }
         }
-        for released in [true, false] {
-            let root = aterm_tempfile::tempdir().unwrap();
-            let host = waiting(root.path());
-            let holder = RefCell::new(Some(HeldLock::take(root.path()).unwrap()));
-            let (held, slots, waits) = (Cell::new(false), Cell::new(0_u8), Cell::new(0_u8));
-            let report = follow_up_finished_waiting(
+        let root = aterm_tempfile::tempdir().unwrap();
+        let host = waiting(root.path());
+        let held = Cell::new(false);
+        let slots = Cell::new(0);
+        let reserve = || {
+            held.set(true);
+            slots.set(slots.get() + 1);
+            Some(Slot(&held))
+        };
+        let unbuilt = || -> Result<Fake, String> { panic!("held work constructs no host") };
+        let uncaptured = || panic!("held work captures no effect time");
+        assert!(matches!(
+            follow_up_attempt_at(
                 root.path(),
-                || {
-                    held.set(true);
-                    slots.set(slots.get() + 1);
-                    Slot(&held)
-                },
-                || Ok(host),
+                || None::<Slot<'_>>,
+                unbuilt,
                 BUILD,
-                now,
-                || {
-                    waits.set(waits.get() + 1);
-                    assert!(!held.get(), "no slot while it waits");
-                    if released {
-                        holder.borrow_mut().take();
-                    }
-                    released || waits.get() < 3
-                },
-            )
-            .unwrap();
-            if released {
-                let report = report.expect("put back in this launch");
-                assert_eq!(
-                    report.restore.unwrap().outcome.rows,
-                    [(Some(Setting::Widgets), PutBack::Back)]
-                );
-                assert!(restore_waiting(root.path()).unwrap().is_empty());
-                assert_eq!(
-                    (waits.get(), slots.get()),
-                    (1, 2),
-                    "the slot again once free"
-                );
-            } else {
-                assert!(report.is_none());
-                assert!(
-                    !restore_waiting(root.path()).unwrap().is_empty(),
-                    "kept for later"
-                );
-                assert_eq!((waits.get(), slots.get()), (3, 1));
-            }
+                uncaptured,
+                |_| false
+            ),
+            WithheldFollowUp::Held
+        ));
+        let holder = HeldLock::take(root.path()).unwrap();
+        for _ in 0..3 {
+            assert!(matches!(
+                follow_up_attempt_at(root.path(), reserve, unbuilt, BUILD, uncaptured, |_| false,),
+                WithheldFollowUp::Held
+            ));
             assert!(!held.get());
+            assert!(!restore_waiting(root.path()).unwrap().is_empty());
         }
+        drop(holder);
+        let after_budget = now + std::time::Duration::from_secs(20 * 60);
+        let WithheldFollowUp::Finished(finished) = follow_up_attempt_at(
+            root.path(),
+            reserve,
+            || {
+                assert!(held.get());
+                assert!(HeldLock::try_take(root.path()).unwrap().is_none());
+                Ok(host)
+            },
+            BUILD,
+            || {
+                assert!(held.get());
+                assert!(HeldLock::try_take(root.path()).unwrap().is_none());
+                after_budget
+            },
+            |_| false,
+        ) else {
+            panic!("the unlocked finite attempt must run");
+        };
+        let (observed, slot) = *finished;
+        let report = observed.result.unwrap().expect("put back in this launch");
+        assert_eq!(
+            report.restore.unwrap().outcome.rows,
+            [(Some(Setting::Widgets), PutBack::Back)]
+        );
+        assert!(restore_waiting(root.path()).unwrap().is_empty());
+        assert_eq!(slots.get(), 4);
+        assert!(held.get(), "publication retains its slot");
+        drop(slot);
+        assert!(!held.get());
     }
 
     fn report_of(rows: &[(&str, &str, &str)]) -> Report {
@@ -9736,8 +9789,13 @@ mod tests {
     fn apply_refused_by_the_windows_setup_names_setup() {
         let root = aterm_tempfile::tempdir().unwrap();
         let _window_setup = HeldLock::take(root.path()).unwrap();
-        let mut host = Fake::default();
-        let refused = mutation_observed(&mut host, root.path(), None, Action::Apply, || false);
+        let refused = mutation_observed(
+            root.path(),
+            None,
+            Action::Apply,
+            || false,
+            |_| panic!("a refused Apply constructs no mutation host"),
+        );
         let why = refused.result.unwrap_err();
         assert_eq!(why, SETTING_UP);
         assert!(why.contains("System State"), "{why}");

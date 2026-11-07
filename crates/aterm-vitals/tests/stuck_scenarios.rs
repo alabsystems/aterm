@@ -9660,3 +9660,47 @@ fn a_wrappers_subshell_is_passed_over_for_what_it_runs() {
     let _ = w.tick(TICK_MS);
     assert_eq!(ended_call(&mut w).ran.as_deref(), Some("git"));
 }
+
+#[test]
+fn a_wrappers_own_child_comes_before_a_lower_pid_it_did_not_start() {
+    // `(sed …) | git log`: the wrapper's subshell (named as it is, passed over) started `sed`
+    // at a lower pid than the wrapper's own child `git`. The wrapper's own child is its program.
+    // NEGATIVE CONTROL: a_wrappers_subshell_is_passed_over_for_what_it_runs, where the
+    // subshell's child is the only program.
+    let mut w = World::new();
+    let mut sub = sleeper(401, "zsh");
+    sub.exe = Some("zsh".to_owned());
+    w.call(1, 300, 400, sub, None);
+    for (pid, ppid, name) in [(402, 401, "sed"), (403, 400, "git")] {
+        let mut p = Proc::new(pid, ppid, name);
+        p.pgid = 400;
+        p.sid = 400;
+        w.add(p);
+    }
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    for pid in [403, 402, 401, 400] {
+        w.exit(pid, false);
+    }
+    let _ = w.tick(TICK_MS);
+    assert_eq!(ended_call(&mut w).ran.as_deref(), Some("git"));
+}
+
+#[test]
+fn a_call_judged_stuck_ends_stuck_whatever_the_pass_that_finds_it_gone_judges() {
+    use aterm_vitals::jobs::{ExitOf, LeaderExit};
+    let mut w = nested_detached_work();
+    let v = run_to(&mut w, 1_200_000, |_, _| {});
+    assert_eq!(v.row("a400").unwrap().verdict, Verdict::Stuck);
+    // The person interrupts the stuck wrapper: its row keeps the judgement of the last pass that
+    // read it live, never the `exited` of the pass that finds it gone.
+    w.exits.push(LeaderExit {
+        pid: 400,
+        start: start_of(400),
+        end: ExitOf::Signal(2),
+    });
+    w.exit(400, false);
+    let _ = w.tick(TICK_MS);
+    let call = ended_call(&mut w);
+    assert!(call.stuck, "its last live pass judged it stuck: {call:?}");
+    assert_eq!(call.ended_by, Some(ExitOf::Signal(2)));
+}

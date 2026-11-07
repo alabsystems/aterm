@@ -260,6 +260,11 @@ pub struct EffectsPipeline {
     /// The caret row the flying head last sat in the sky seat over
     /// ([`crate::rainbow_kitty::companion::SeatQuery::held_sky`]).
     flying_sky_row: Option<u16>,
+    /// How the flying head is fitted to its row ([`crate::rainbow_kitty::companion::HeadFit`]).
+    flying_fit: crate::rainbow_kitty::companion::HeadFit,
+    /// The size a fitted head goes to this frame, as its route read it, the time, and whether
+    /// the host animates.
+    flying_fit_goal: Option<(f32, Instant, bool)>,
 
     decos: WordDecorations,
     /// Compiled lexicon + resolved config.
@@ -407,6 +412,8 @@ impl EffectsPipeline {
             pending_keys: 0,
             row_probe_scratch: Vec::new(),
             flying_sky_row: None,
+            flying_fit: crate::rainbow_kitty::companion::HeadFit::WHOLE,
+            flying_fit_goal: None,
             decos: WordDecorations::default(),
             sparkle: None,
             deco_cfg: DecoConfig::default(),
@@ -1015,6 +1022,24 @@ impl EffectsPipeline {
     #[inline]
     pub const fn set_classic_pin_own_chroma(&mut self, on: bool) {
         self.cursor.glow.set_classic_pin_own_chroma(on);
+    }
+
+    /// A test's negative control: `on` (as shipped), Beam's body under a lit page's letters is a
+    /// page shade the letter guard keeps whole; off, it is weighed and cut with the lights in its
+    /// cells (`CursorGlow::set_lit_body_a_shade`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_lit_body_a_shade(&mut self, on: bool) {
+        self.cursor.glow.set_lit_body_a_shade(on);
+    }
+
+    /// A test's negative control: `on` (as shipped), Classic's one-colour rail raises a chosen
+    /// colour's saturation by the page's grey less its tint along the colour's hue; off, by the
+    /// page's whole brightness, as before the after-land lows' W10b.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_classic_rail_tint_read(&mut self, on: bool) {
+        self.cursor.glow.set_classic_rail_tint_read(on);
     }
 
     /// A test's negative control: Classic's one-colour face adds its light straight onto a

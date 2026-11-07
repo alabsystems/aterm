@@ -57,10 +57,9 @@
 //!   `login`, that member-readable address row. A phone's key is random; the importer finds an
 //!   existing phone by opening its `number`. No phone row is made from free text.
 //! - **Labels** go through the one parser (`machines::Reading`): `M109` is `m109`, `m27-2` is
-//!   number 2 on m27, `m3.2` number 2 on m3, a bare `m3` number 1. Every label resolves against
-//!   the live rows' labels and aliases, then the Macs this Mac knows of (by label or alias, and
-//!   their row by fleet node), before a placeholder is minted, so a re-import after a relabel
-//!   finds the original row.
+//!   number 2 on m27, `m3.2` number 2 on m3, a bare `m3` number 1. A machine matches a row by
+//!   fleet node, host, then label or alias ([`names`]), before a placeholder is minted, so a
+//!   re-import after a relabel finds the original row, and a name two rows answer is a finding.
 //! - **Preferences are mappings** (design §0): each account of a row gets one preference per
 //!   machine its cells, or the harness's fleet and pool files, name. The number is a rank and
 //!   nothing else. No machine and no rank is ever read from an address, and no allocator move is
@@ -95,6 +94,7 @@ use std::{
 
 pub mod covered;
 mod dump;
+mod names;
 mod toml;
 pub(crate) mod xlsx;
 pub use dump::{DUMP_TABLES, dump_sheets};
@@ -570,6 +570,9 @@ pub struct KnownMac {
     pub aliases: Vec<Label>,
     /// Its key-derived node principal, 16 lower-case hex digits without `n-`.
     pub node: Option<String>,
+    /// The older transport id a roster row may still state, 32 lower-case hex digits: what a row's
+    /// `fleet_node` holds. The principal is not derived from it, so it finds a row on its own.
+    pub fleet_node: Option<String>,
     pub hosts: Vec<String>,
 }
 
@@ -617,7 +620,9 @@ pub enum Kind {
     NotAnAddress,
     /// A row with cells but no address.
     NoAddress,
-    /// A label names more than one live machine.
+    /// A machine name more than one live row answers, a source's row names a name another row
+    /// holds, or a name answers a row another Mac's node holds: no row is born for it and it is
+    /// written on neither.
     LabelAmbiguous,
     /// A label spelled other than its stored form (`M109`, `m27-2`): read as the stored form.
     LabelRespelled,
@@ -631,9 +636,12 @@ pub enum Kind {
     CoordinatesTruncated,
     /// A known Mac matched an existing row by its fleet node.
     AdoptedByNode,
-    /// More than one live row names a known Mac's fleet node: nothing of that Mac is written
-    /// until the owner keeps one.
+    /// More than one live row names the fleet node of a known Mac or a source's machine: nothing
+    /// of that machine is written until the owner keeps one.
     NodeAmbiguous,
+    /// More than one live row holds a host a source's machine states: nothing of that machine is
+    /// written until the owner keeps one.
+    HostAmbiguous,
     /// More than one address row says a source's address now, and no row holds the key it
     /// derives: until the owner keeps one, nothing of a source row whose own address it is is
     /// written, and a source row that only refers to it (a root, a receiving or a mailbox
@@ -683,6 +691,7 @@ impl Kind {
             Self::CoordinatesTruncated => "coordinates-truncated",
             Self::AdoptedByNode => "adopted-by-node",
             Self::NodeAmbiguous => "node-ambiguous",
+            Self::HostAmbiguous => "host-ambiguous",
             Self::AddressAmbiguous => "address-ambiguous",
             Self::Unadopted => "unadopted",
             Self::NoLongerListed => "no-longer-listed",
@@ -996,6 +1005,12 @@ struct Planner<'a> {
     roster: (String, String),
     /// Every address either sheet lists as an AI login.
     logins: BTreeSet<String>,
+    /// The machine names this run's sources state together.
+    links: names::NameLinks,
+    /// What a replica's machine rows state of `status`, by key, until the table is read.
+    statuses: Vec<(String, String, Coord)>,
+    /// Every machine name a sheet stated so far this run.
+    stated: BTreeSet<String>,
 }
 
 /// The digits of a phone number as the registry keeps them: ASCII digits only, a US number's
@@ -1113,6 +1128,9 @@ pub fn plan(input: &Input<'_>, cells: &Cells) -> Result<Plan> {
         minted_labels: BTreeSet::new(),
         roster: roster_source(input.macs),
         logins: listed_logins(input.sheets),
+        links: names::NameLinks::read(input.sheets, input.macs),
+        statuses: Vec::new(),
+        stated: BTreeSet::new(),
     };
     let mut order: Vec<usize> = (0..input.sheets.len()).collect();
     order.sort_by_key(|&n| (input.sheets[n].mode, input.sheets[n].kind));
@@ -1717,7 +1735,7 @@ impl Planner<'_> {
         for preferred in reading.preferences() {
             // A preference the vault sheet decides is only compared: no machine is born for it.
             let machine = if lower {
-                self.machine_key(preferred.machine)
+                self.machine_compared(preferred.machine, &at)
             } else {
                 self.machine_for(preferred.machine, &at)
             };
@@ -2486,18 +2504,8 @@ impl Planner<'_> {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                 {
-                    let parsed = Label::parse(part).or_else(|e| {
-                        if part.contains('.') {
-                            Label::parse(&part.replace('.', "-"))
-                        } else {
-                            Err(e)
-                        }
-                    });
-                    if let Ok(alias_label) = parsed {
-                        let canon = alias_label.canonical();
-                        if canon != label.canonical() {
-                            self.element(&MACHINE, &pk, "aliases", &canon, &at);
-                        }
+                    if let Some(alias) = names::alias_name(part) {
+                        self.alias_element(&pk, &alias, &at);
                     } else if guard::text(part, 64).is_ok()
                         && !part.contains('@')
                         && !extra_nick_aliases.iter().any(|s| s == part)
@@ -2733,225 +2741,6 @@ impl Planner<'_> {
         Ok(())
     }
 
-    /// The live machine rows whose label or an alias is `label`.
-    fn live_by_label(&self, label: &str) -> Vec<String> {
-        self.current[MACHINE.name]
-            .rows
-            .iter()
-            .filter(|(_, row)| row.live())
-            .filter(|(_, row)| {
-                row.get("label").and_then(Value::as_str) == Some(label)
-                    || row
-                        .fields
-                        .get("aliases")
-                        .is_some_and(|f| f.has_member(label))
-            })
-            .map(|(pk, _)| pk.clone())
-            .collect()
-    }
-
-    /// The live machine rows whose fleet node is `node`: one, or a clash any writer could make,
-    /// since `node` is an owner cell.
-    fn live_by_node(&self, node: &str) -> Vec<String> {
-        self.current[MACHINE.name]
-            .rows
-            .iter()
-            .filter(|(_, row)| row.live() && row.get("node").and_then(Value::as_str) == Some(node))
-            .map(|(pk, _)| pk.clone())
-            .collect()
-    }
-
-    fn live_by_host(&self, hosts: &[&str]) -> Option<String> {
-        self.current[MACHINE.name]
-            .rows
-            .iter()
-            .find(|(_, row)| {
-                row.live()
-                    && row
-                        .get("hosts")
-                        .and_then(Value::as_array)
-                        .is_some_and(|list| {
-                            list.iter()
-                                .filter_map(Value::as_str)
-                                .any(|h| hosts.contains(&h))
-                        })
-            })
-            .map(|(pk, _)| pk.clone())
-    }
-
-    /// The known Mac a label names, by its label or an alias.
-    fn known(&self, label: &Label) -> Option<&KnownMac> {
-        self.input
-            .macs
-            .iter()
-            .find(|mac| mac.label.as_ref() == Some(label) || mac.aliases.contains(label))
-    }
-
-    /// The machine row a label names: a live row by label or alias; else the known Mac it names,
-    /// by its row's fleet node or host, or a new row keyed by its node; else a planned
-    /// placeholder keyed by the label ([`keys::planned_machine_pk`]: a retired row holding that key
-    /// leaves it, and the placeholder takes the first free `<label>/<n>`). `None` when the label is ambiguous or births are off and
-    /// nothing matched.
-    fn machine_for(&mut self, label: Label, at: &Coord) -> Option<String> {
-        let stored = label.canonical();
-        let found = self.live_by_label(&stored);
-        match found.len() {
-            1 => return found.into_iter().next(),
-            0 => {}
-            _ => {
-                self.find(
-                    Kind::LabelAmbiguous,
-                    Some(MACHINE.name),
-                    None,
-                    vec![at.clone()],
-                );
-                return None;
-            }
-        }
-        if let Some(mac) = self.known(&label).cloned() {
-            return self.known_row(&mac);
-        }
-        if !self.input.births {
-            return None;
-        }
-        // The label's birth key unless a row holds it (a retired Mac the label named, or one
-        // relabelled away): then the first free `<label>/<n>`, as `add machine` keys it, so the
-        // new preference names a row of its own and the old row's history stays apart.
-        let rows = &self.current[MACHINE.name].rows;
-        let pk = keys::planned_machine_pk(&stored, |pk| rows.contains_key(pk))?;
-        self.want(&MACHINE, &pk, "label", json!(stored), at);
-        self.want(&MACHINE, &pk, "status", json!("planned"), at);
-        Some(pk)
-    }
-
-    /// The live row a known Mac already has: by its fleet node (`true`), then a host, then its
-    /// label or an alias. `Err` when more than one live row names its node: then no row is the
-    /// Mac's until the owner keeps one.
-    fn known_found(&self, mac: &KnownMac) -> std::result::Result<Option<(String, bool)>, ()> {
-        let by_node = valid_node(mac)
-            .map(|node| self.live_by_node(&node))
-            .unwrap_or_default();
-        match by_node.as_slice() {
-            [pk] => return Ok(Some((pk.clone(), true))),
-            [] => {}
-            _ => return Err(()),
-        }
-        Ok(self.known_fallback(mac))
-    }
-
-    /// A known Mac's live row by a host, then its label or an alias.
-    fn known_fallback(&self, mac: &KnownMac) -> Option<(String, bool)> {
-        let hosts = valid_hosts(mac);
-        if !hosts.is_empty()
-            && let Some(pk) = self.live_by_host(&hosts)
-        {
-            return Some((pk, false));
-        }
-        let mut names: Vec<String> = mac.label.iter().map(Label::canonical).collect();
-        names.extend(mac.aliases.iter().map(Label::canonical));
-        names.iter().find_map(|name| {
-            let hits = self.live_by_label(name);
-            (hits.len() == 1).then(|| (hits[0].clone(), false))
-        })
-    }
-
-    /// The machine key a label names, with no side effect: what [`Self::machine_for`] resolves
-    /// to, for comparing a lower source's machines with the ones a higher source named.
-    fn machine_key(&self, label: Label) -> Option<String> {
-        let stored = label.canonical();
-        let found = self.live_by_label(&stored);
-        match found.len() {
-            1 => return found.into_iter().next(),
-            0 => {}
-            _ => return None,
-        }
-        if let Some(mac) = self.known(&label) {
-            return match self.known_found(mac) {
-                Ok(Some((pk, _))) => Some(pk),
-                Ok(None) => known_birth(mac, |pk| self.current[MACHINE.name].rows.contains_key(pk)),
-                Err(()) => None,
-            };
-        }
-        let rows = &self.current[MACHINE.name].rows;
-        keys::planned_machine_pk(&stored, |pk| rows.contains_key(pk))
-    }
-
-    /// The row of a known Mac: by fleet node, then host, then its label or an alias among live
-    /// rows; else, with births on, a new row keyed by its node (or its label). Its values come
-    /// from the roster, so they carry the roster's coordinate, whichever sheet label led here.
-    fn known_row(&mut self, mac: &KnownMac) -> Option<String> {
-        let label = mac.label.as_ref().map(Label::canonical);
-        let place = self
-            .input
-            .macs
-            .iter()
-            .position(|known| known == mac)
-            .unwrap_or(0);
-        let at = Coord {
-            sheet: ROSTER,
-            source: self.roster.0.clone(),
-            row: place + 1,
-            col: 0,
-        };
-        let Ok(found) = self.known_found(mac) else {
-            self.findings.insert(Finding {
-                kind: Kind::NodeAmbiguous,
-                collection: Some(MACHINE.name),
-                pk: None,
-                column: Some("node".to_owned()),
-                at: vec![at],
-            });
-            return None;
-        };
-        if let Some((pk, true)) = &found {
-            self.findings.insert(Finding {
-                kind: Kind::AdoptedByNode,
-                collection: Some(MACHINE.name),
-                pk: Some(pk.clone()),
-                column: Some("node".to_owned()),
-                at: Vec::new(),
-            });
-        }
-        let found = found.map(|(pk, _)| pk);
-        let pk = match found {
-            Some(pk) => pk,
-            None if self.input.births => {
-                let rows = &self.current[MACHINE.name].rows;
-                known_birth(mac, |pk| rows.contains_key(pk))?
-            }
-            None => {
-                self.findings.insert(Finding {
-                    kind: Kind::Unadopted,
-                    collection: Some(MACHINE.name),
-                    pk: None,
-                    column: label.map(|l| format!("label {l}")),
-                    at: Vec::new(),
-                });
-                return None;
-            }
-        };
-        if let Some(label) = &label {
-            self.want(&MACHINE, &pk, "label", json!(label), &at);
-        }
-        self.want(&MACHINE, &pk, "status", json!("active"), &at);
-        let hosts = valid_hosts(mac);
-        if !hosts.is_empty() {
-            self.want(&MACHINE, &pk, "hosts", json!(hosts), &at);
-        }
-        for alias in &mac.aliases {
-            self.element(&MACHINE, &pk, "aliases", &alias.canonical(), &at);
-        }
-        Some(pk)
-    }
-
-    fn known_macs(&mut self) {
-        for mac in self.input.macs {
-            if mac.label.is_some() || valid_node(mac).is_some() {
-                self.known_row(mac);
-            }
-        }
-    }
-
     fn finish(self) -> Result<Plan> {
         let Self {
             input,
@@ -2963,6 +2752,7 @@ impl Planner<'_> {
             unsettled,
             unsettled_logins,
             address_unread,
+            links,
             ..
         } = self;
         let mut plan = Plan {
@@ -3307,6 +3097,8 @@ impl Planner<'_> {
                                             .elements
                                             .get(column.as_str())
                                             .is_some_and(|elems| elems.contains_key(elem))
+                                        && !(name == MACHINE.name
+                                            && Self::linked_to(&links, row, elem))
                                         && let Some((ret_sheet, ret_source)) = retract_source(field)
                                     {
                                         step(
@@ -3628,38 +3420,6 @@ impl Planner<'_> {
         plan.findings.sort_unstable();
         plan.findings.dedup();
         Ok(plan)
-    }
-}
-
-fn valid_node(mac: &KnownMac) -> Option<String> {
-    let node = mac.node.as_deref()?.trim();
-    (node.len() == 16 && node.bytes().all(|b| b.is_ascii_hexdigit()))
-        .then(|| node.to_ascii_lowercase())
-}
-
-fn valid_hosts(mac: &KnownMac) -> Vec<&str> {
-    let mut out: Vec<&str> = Vec::new();
-    for host in &mac.hosts {
-        let h = host.trim();
-        if !h.is_empty() && guard::text(h, 64).is_ok() && !out.contains(&h) {
-            out.push(h);
-            if out.len() == 4 {
-                break;
-            }
-        }
-    }
-    out
-}
-
-/// The key a known Mac with no live row is born under: the planned key
-/// ([`keys::planned_machine_pk`]) of its fleet node (`n-<node>`), else of its label. Either
-/// skips a key `held` by a row: a retired row the node or the label once named keeps its
-/// history, and the Mac named again gets a live row of its own.
-fn known_birth(mac: &KnownMac, held: impl Fn(&str) -> bool) -> Option<String> {
-    match (valid_node(mac), &mac.label) {
-        (Some(node), _) => keys::planned_machine_pk(&format!("n-{node}"), held),
-        (None, Some(label)) => keys::planned_machine_pk(&label.canonical(), held),
-        (None, None) => None,
     }
 }
 

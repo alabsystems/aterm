@@ -966,7 +966,9 @@ pub fn run(
     if result == Renewal::Renewed {
         ExitCode::SUCCESS
     } else {
-        guard.failed(&store, policy, begun.lock(), now, err);
+        if let Some(lock) = begun.lock() {
+            guard.failed(&store, policy, lock, now, err);
+        }
         ExitCode::from(1)
     }
 }
@@ -1023,11 +1025,12 @@ pub(in crate::harness) fn background(
         && !observation
             .as_ref()
             .is_some_and(super::RenewalObservation::service_deferred)
+        && let Some(lock) = signin.lock()
     {
         guard.failed(
             store,
             policy,
-            signin.lock(),
+            lock,
             host.now().max(env.now),
             &mut io::sink(),
         );

@@ -190,7 +190,7 @@ fn a_fleet_document_others_may_write_is_refused() {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = aterm_tempfile::tempdir().expect("tempdir");
     let config = dir.path().join("aterm.toml");
-    std::fs::write(&config, "[ai]\n").expect("config");
+    crate::test_config::write(&config, "[ai]\n").expect("config");
     let fleet = dir.path().join(FLEET_FILE);
     std::fs::write(&fleet, "schema = 1\npreferred = \"codex\"\n").expect("fleet");
     std::fs::set_permissions(&fleet, std::fs::Permissions::from_mode(0o644)).expect("chmod");
@@ -216,7 +216,7 @@ fn a_group_writable_fleet_document_is_read_only_on_its_owners_private_group() {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = aterm_tempfile::tempdir().expect("tempdir");
     let config = dir.path().join("aterm.toml");
-    std::fs::write(&config, "[ai]\n").expect("config");
+    crate::test_config::write(&config, "[ai]\n").expect("config");
     let fleet = dir.path().join(FLEET_FILE);
     std::fs::write(&fleet, "schema = 1\npreferred = \"codex\"\n").expect("fleet");
     // SAFETY: getgid has no preconditions and cannot fail.
@@ -267,7 +267,7 @@ fn a_fleet_document_an_access_acl_shares_is_refused_on_the_private_group_too() {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     let dir = aterm_tempfile::tempdir().expect("tempdir");
     let config = dir.path().join("aterm.toml");
-    std::fs::write(&config, "[ai]\n").expect("config");
+    crate::test_config::write(&config, "[ai]\n").expect("config");
     let fleet = dir.path().join(FLEET_FILE);
     std::fs::write(&fleet, "schema = 1\npreferred = \"codex\"\n").expect("fleet");
     std::fs::set_permissions(&fleet, std::fs::Permissions::from_mode(0o664)).expect("chmod");
@@ -389,7 +389,7 @@ fn a_refused_fleet_document_applies_nothing() {
 fn a_dangling_default_fleet_entry_is_refused_not_absent() {
     let dir = aterm_tempfile::tempdir().expect("scratch");
     let config = dir.path().join("aterm.toml");
-    std::fs::write(&config, "[ai]\n").expect("config");
+    crate::test_config::write(&config, "[ai]\n").expect("config");
     assert_eq!(
         load(Some(&config)).fleet,
         FleetState::None,
@@ -401,6 +401,72 @@ fn a_dangling_default_fleet_entry_is_refused_not_absent() {
         load(Some(&config)).fleet,
         FleetState::Refused { .. }
     ));
+}
+
+/// AN `aterm.toml` GROUP OR OTHERS MAY WRITE SETS NOTHING ([`read_config`], the rule every reader
+/// of it holds): every choice is its default and no fleet document is read, the one beside it
+/// included, as the window runs every setting at its default when it refuses the file at launch;
+/// the window's look stays on, and a note names the file and why. CONTROL: the same file,
+/// private or only readable by others, sets the table, over the fleet document beside it.
+#[cfg(unix)]
+#[test]
+fn an_aterm_toml_others_may_write_sets_nothing_and_names_no_fleet_document() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("aterm.toml");
+    let fleet = dir.path().join(FLEET_FILE);
+    aterm_uds::atomic_file::write(&fleet, b"schema = 1\nreview_count = 1\n", 0o600).expect("fleet");
+    crate::test_config::write(
+        &config,
+        "[ai]\nenabled = false\npreferred = \"codex\"\nreviews = false\n\
+         review_permissions = \"yolo\"\n",
+    )
+    .expect("config");
+    let chmod = |mode: u32| {
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    };
+    for mode in [0o600, 0o644] {
+        chmod(mode);
+        let s = load(Some(&config));
+        assert!(!s.enabled, "{mode:o}");
+        assert_eq!(
+            (s.preferred.0.id, s.preferred.1),
+            ("codex", From::Local),
+            "{mode:o}"
+        );
+        assert_eq!(s.reviews, (false, From::Local), "{mode:o}");
+        assert_eq!(s.review_permissions.1, From::Local, "{mode:o}");
+        assert_eq!(s.review_count, (1, From::Fleet), "{mode:o}");
+        assert!(s.notes.is_empty(), "{mode:o}: {:?}", s.notes);
+    }
+    for mode in [0o620, 0o602, 0o664] {
+        chmod(mode);
+        let s = load(Some(&config));
+        assert!(s.enabled, "{mode:o}");
+        assert_eq!(s.preferred.1, From::Default, "{mode:o}");
+        assert_eq!(s.reviews, (true, From::Default), "{mode:o}");
+        assert_eq!(
+            s.review_permissions,
+            (Choice::Inherit, From::Default),
+            "{mode:o}"
+        );
+        assert_eq!(
+            s.review_count,
+            (REVIEW_COUNT_DEFAULT, From::Default),
+            "{mode:o}"
+        );
+        assert_eq!(
+            (s.fleet, s.fleet_source),
+            (FleetState::None, None),
+            "{mode:o}"
+        );
+        assert!(
+            matches!(&s.notes[..], [note] if note.starts_with(&config.display().to_string())
+                && note.contains("lets other users write it")),
+            "{mode:o}: {:?}",
+            s.notes
+        );
+    }
 }
 
 fn signer() -> (String, Vec<u8>) {

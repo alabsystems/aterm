@@ -46,6 +46,8 @@ mod challenge_window;
 pub mod claims;
 #[cfg(unix)]
 pub mod claude_homes;
+#[cfg(unix)]
+mod claude_oauth_vault;
 pub mod cli;
 mod codex_account_custody;
 pub mod codex_alab;
@@ -56,6 +58,8 @@ pub mod codex_enrollment;
 pub mod codex_exec_handoff;
 pub mod codex_facts;
 mod codex_grant_owner;
+mod codex_native_retirement;
+mod codex_native_row;
 pub mod codex_renewal;
 pub mod codex_rollout;
 pub mod codex_rotation;
@@ -105,7 +109,10 @@ pub mod mailbox_seen;
 pub mod muse_usage;
 mod native_account_handoff;
 mod native_account_recipe;
+pub mod native_account_wire;
 pub mod native_act;
+mod native_custody_platform;
+pub mod native_enrollment_admission;
 pub mod native_keys;
 #[cfg(unix)]
 mod native_launch;
@@ -164,6 +171,15 @@ pub mod witness;
 pub mod work_record;
 pub mod worker;
 pub mod workflow_journal;
+
+/// Whether `entry` is a directory or a symbolic link to one, as [`std::path::Path::is_dir`] reads
+/// it: a session root's folder may be a link elsewhere (a projects folder on another volume). Only
+/// a link costs a look past the entry's own type.
+pub(crate) fn entry_is_dir(entry: &std::fs::DirEntry) -> bool {
+    entry
+        .file_type()
+        .is_ok_and(|t| t.is_dir() || (t.is_symlink() && entry.path().is_dir()))
+}
 
 /// The longest prefix of `s` that is at most `max` bytes and ends on a character boundary.
 pub(crate) fn truncate_bytes(s: &str, max: usize) -> &str {

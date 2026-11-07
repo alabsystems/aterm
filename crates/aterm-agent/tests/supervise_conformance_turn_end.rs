@@ -17,7 +17,7 @@ use aterm_agent::supervise::policy::turn_end::{
     RULE_DONE_CHECK, TurnEndAction, TurnEndReading, TurnEndState, TurnEndTiming, WaitKind,
     decide_turn_end,
 };
-use aterm_agent::supervise::{QuestionPriority, SupervisorConfig};
+use aterm_agent::supervise::{PriorityWord, SupervisorConfig};
 use aterm_models_harness::supervisor_turn_end_model;
 use aterm_phase::WallKind;
 use aterm_spec::derive::Model;
@@ -59,8 +59,8 @@ thread_local! {
     /// What this walk's turns end on ([`REPORT`], [`CHOICE`]).
     static SAID: std::cell::Cell<&'static str> = const { std::cell::Cell::new(REPORT) };
     /// The question priority this walk's policy answers a choice by.
-    static PRIORITY: std::cell::Cell<QuestionPriority> =
-        const { std::cell::Cell::new(QuestionPriority::Recommended) };
+    static PRIORITY: std::cell::Cell<PriorityWord> =
+        const { std::cell::Cell::new(PriorityWord::Recommended) };
 }
 
 /// The rule a `Continue` of the walk under way types at `st`: the defend
@@ -804,7 +804,7 @@ fn walk(m: &Model, cfg: &SupervisorConfig, variant: bool) -> BTreeMap<&'static s
     let base = Instant::now() + Duration::from_secs(3600);
     let streak = cnst(m, "Streak");
     let take = cnst(m, "Take");
-    let others: Vec<(QuestionPriority, SupervisorConfig)> = QuestionPriority::ALL
+    let others: Vec<(PriorityWord, SupervisorConfig)> = PriorityWord::ALL
         .into_iter()
         .filter(|q| {
             SAID.with(std::cell::Cell::get) == CHOICE && *q != PRIORITY.with(std::cell::Cell::get)
@@ -949,7 +949,7 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
             let acts = walk(&capped, &cfg, false);
             assert!(acts.get("escalate").copied().unwrap_or(0) > 0, "{acts:?}");
         });
-        for q in QuestionPriority::ALL {
+        for q in PriorityWord::ALL {
             scope.spawn(move || {
                 SAID.with(|s| s.set(CHOICE));
                 PRIORITY.with(|p| p.set(q));

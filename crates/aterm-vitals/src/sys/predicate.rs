@@ -25,11 +25,12 @@ pub const USAGE: &str = "ERR usage: await sys <predicate> [for=<n>(ms|s|m|h)] [s
                          <volume> := free>=<size|room> | free><size|room> | free<<size> | free<=<size> \
                          | disk=ok|low|short|emergency[,…], never with quiet, a <term>, for= or \
                          scope=; \
-                         <size> := <n>(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB), a whole <n> for free\n";
+                         <size> := <n>(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB), a whole <n> for free \
+                         (aterm help sys wait)\n";
 
 /// The refusal of a predicate that mixes the volume wait with the machine's.
 pub const MIXED: &str = "ERR usage: await sys: free and disk= wait on their volume alone; \
-                         wait for the machine terms in a second await\n";
+                         wait for the machine terms in a second await (aterm help sys wait)\n";
 
 /// A snapshot whose slots were read longer ago than this reads `slots` as warming.
 pub const SLOTS_FRESH_MS: u64 = 10_000;

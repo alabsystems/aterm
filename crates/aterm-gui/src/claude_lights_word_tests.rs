@@ -646,3 +646,118 @@ fn the_name_takes_only_cells_the_rule_spares() {
     assert!(laid > 0, "CONTROL: some width lays the name");
     assert!(withheld > 0, "CONTROL: some width spares it no cells");
 }
+
+/// A NAME `word_at` DOES NOT DRAW READS NO CLOCK AND MOVES NO KEY, AND AN OFF SWITCH LETS IT GO:
+/// while a click is in flight, the mode has moved on, or a standing task face (`Landed`) owns the
+/// chip, neither `fingerprint` nor `block_key` reads the clock and `fingerprint` is 0; when the
+/// harness switch turns off, `note_switch_face` clears `word` so `word_wake` and `words_due` stop
+/// immediately.
+#[test]
+fn a_suppressed_or_switched_off_mode_name_reads_no_clock_and_moves_no_key() {
+    use crate::autopilot::{HarnessSwitch, SwitchOff};
+    use crate::claude_lights::Clock;
+    use crate::harness_glass::Stamp;
+    use aterm_agent::harness::acts::TaskFace;
+    use std::cell::Cell;
+
+    let t0 = Instant::now();
+    let mut w = WindowLights::default();
+    w.note_autopilot(S, Some(Autopilot::Land), AutopilotView::Land, t0);
+    w.sessions.get_mut(&S).expect("noted").word = Some(land_at(t0, true));
+
+    let reads = Cell::new(0);
+    assert_ne!(
+        w.fingerprint(|| {
+            reads.set(reads.get() + 1);
+            t0
+        }),
+        0,
+        "CONTROL: a drawn mode name moves the repaint key"
+    );
+    assert_eq!(reads.get(), 1, "CONTROL: fingerprint read the clock once");
+    let key = w.sessions[&S].block_key(|| {
+        reads.set(reads.get() + 1);
+        t0
+    });
+    assert_eq!(key.word, Some(("land", 0)));
+    assert_eq!(reads.get(), 2, "CONTROL: block_key read the clock once");
+
+    // 1. Click in flight (`autopilot_pending.is_some()`).
+    w.sessions.get_mut(&S).expect("noted").autopilot_pending =
+        Some((Autopilot::Off, t0 + ms(2500)));
+    assert_eq!(
+        w.fingerprint(|| panic!("in-flight click read the clock in fingerprint")),
+        0
+    );
+    assert_eq!(
+        w.sessions[&S]
+            .block_key(|| panic!("in-flight click read the clock in block_key"))
+            .word,
+        None
+    );
+    w.sessions.get_mut(&S).expect("noted").autopilot_pending = None;
+
+    // 2. Mode moved to another word (`AutopilotView::Off`).
+    w.note_autopilot(S, Some(Autopilot::Off), AutopilotView::Off, t0);
+    assert_eq!(
+        w.fingerprint(|| panic!("other mode read the clock in fingerprint")),
+        0
+    );
+    assert_eq!(
+        w.sessions[&S]
+            .block_key(|| panic!("other mode read the clock in block_key"))
+            .word,
+        None
+    );
+    assert_eq!(w.word_wake(t0), None, "other mode schedules no wake");
+    assert!(
+        !w.words_due(t0 + WORD_HOLD),
+        "other mode owes no frame at hold end"
+    );
+
+    // 3. Standing task face (`TaskFace::Landed`) under `AutopilotView::Land`.
+    w.note_autopilot(S, Some(Autopilot::Land), AutopilotView::Land, t0);
+    {
+        let glass = &mut w.sessions.get_mut(&S).expect("noted").glass;
+        glass.task = Some(TaskFace::Landed);
+        glass.task_at = Some(Stamp {
+            clock: Clock::of_minute(17 * 60 + 42),
+            day: 20_378,
+        });
+    }
+    assert_eq!(
+        w.fingerprint(|| panic!("standing face read the clock in fingerprint")),
+        0
+    );
+    assert_eq!(
+        w.sessions[&S]
+            .block_key(|| panic!("standing face read the clock in block_key"))
+            .word,
+        None
+    );
+    assert_eq!(w.word_wake(t0), None, "standing face schedules no wake");
+    assert!(
+        !w.words_due(t0 + WORD_HOLD),
+        "standing face owes no frame at hold end"
+    );
+    assert!(
+        !w.words_due(t0 + WORD_HOLD + WORD_FADE),
+        "standing face owes no frame when suppressed word expires"
+    );
+    assert_eq!(
+        w.sessions[&S].word, None,
+        "expired suppressed word is still dropped"
+    );
+    w.sessions.get_mut(&S).expect("noted").word = Some(land_at(t0, true));
+
+    // 4. Turning the harness switch off clears `word` and cancels its wake.
+    w.sessions.get_mut(&S).expect("noted").glass = super::ChipGlass::default();
+    assert!(w.word_wake(t0).is_some(), "CONTROL: wake armed while on");
+    w.note_switch_face(S, Some(HarnessSwitch::Off(SwitchOff::Master)));
+    assert_eq!(w.sessions[&S].word, None, "off switch clears the mode name");
+    assert_eq!(w.word_wake(t0), None, "no wake after switch turns off");
+    assert!(
+        !w.words_due(t0 + WORD_HOLD),
+        "no frame owed after switch turns off"
+    );
+}

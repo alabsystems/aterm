@@ -303,7 +303,9 @@ fn shell_setup_with_no_zdotdir_in_its_environment_reads_zsh_s_zshenv() {
     let fx = Fixture::new("shell-setup-zshenv");
     std::fs::create_dir_all(fx.home.join("zdot")).unwrap();
     std::fs::write(fx.rc(".zshenv"), "export ZDOTDIR=\"$HOME/zdot\"\n").unwrap();
-    let out = fx.shell_setup("/bin/zsh", "/bin/bash");
+    // A zsh that runs, the login shell asked which ZDOTDIR its zshenv sets.
+    let zsh = aterm_uds::host::need_tool("zsh");
+    let out = fx.shell_setup(&zsh.to_string_lossy(), "/bin/bash");
     let text = describe(&out);
     assert!(out.status.success(), "{text}");
     assert_eq!(fx.rc_files(), Vec::<&str>::new(), "no ~/.zshrc: {text}");
@@ -330,7 +332,9 @@ fn the_seed_with_no_zdotdir_in_its_environment_wires_the_zshrc_zsh_reads() {
     let fx = Fixture::new("seed-zshenv");
     std::fs::create_dir_all(fx.home.join("zdot")).unwrap();
     std::fs::write(fx.rc(".zshenv"), "export ZDOTDIR=\"$HOME/zdot\"\n").unwrap();
-    let out = fx.seed("/bin/zsh", "/bin/bash");
+    // A zsh that runs, the login shell asked which ZDOTDIR its zshenv sets.
+    let zsh = aterm_uds::host::need_tool("zsh");
+    let out = fx.seed(&zsh.to_string_lossy(), "/bin/bash");
     let text = describe(&out);
     assert!(out.status.success(), "{text}");
     assert_eq!(fx.rc_files(), Vec::<&str>::new(), "no ~/.zshrc: {text}");

@@ -62,6 +62,9 @@ SET UP
                               not (alias: name)
 
 LOOK
+    storage plan --git-common-dir ABS [--json] [--verify-io-bytes N]
+                              bounded local Git pack storage report; content verification
+                              reads at most N bytes across both files (default 0)
     ls [--json]               the inventory
     tabs [<host>…] [--json]   aterm instances, tabs, vitals (CPU, GPU, RAM, disk, load,
                               network RTT) and AI CLI status of the hosts named, else of
@@ -187,6 +190,7 @@ At each Mac, once (the visit no software replaces):
 
 const VERBS: &[&str] = &[
     "init",
+    "storage",
     "scan",
     "enroll",
     "unenroll",
@@ -312,6 +316,17 @@ fn sweep_retired_dir(sys: &dyn System, home: &Path, below: &Path) {
 /// `aterm machines <args>`.
 #[must_use = "handle or propagate the command's exit status"]
 pub fn main_entry(args: Vec<OsString>) -> ExitCode {
+    // Local read-only storage has no controller or legacy-agent setup. Preserve
+    // pathname bytes and dispatch before any global live/controller actions.
+    if let Some(route) = storage_route(&args) {
+        return match route {
+            StorageRoute::Run(words) => storage_exit(aterm_repo_storage::cli::main_entry(words)),
+            StorageRoute::Help => {
+                storage_exit(aterm_repo_storage::cli::main_entry(&["--help".into()]))
+            }
+            StorageRoute::Controller => refuse("storage is local and does not take --controller"),
+        };
+    }
     let args: Vec<String> = args
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
@@ -338,6 +353,7 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
             ExitCode::SUCCESS
         }
         "agent" => crate::agent::main(&args[1..], &sys),
+        "storage" => refuse("storage is local and does not take --controller"),
         "scan" => {
             #[cfg(not(test))]
             retire_lan_agent();
@@ -361,6 +377,39 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
         other => refuse(&format!("unknown verb {other:?}")),
     }
 }
+
+#[derive(Debug, PartialEq, Eq)]
+enum StorageRoute<'a> {
+    Run(&'a [OsString]),
+    Help,
+    Controller,
+}
+
+fn storage_route(args: &[OsString]) -> Option<StorageRoute<'_>> {
+    if args.first().is_some_and(|word| word == "storage") {
+        Some(StorageRoute::Run(&args[1..]))
+    } else if args.len() == 2 && args[0] == "help" && args[1] == "storage" {
+        Some(StorageRoute::Help)
+    } else if args.first().is_some_and(|word| word == "--controller")
+        && args.get(2).is_some_and(|word| word == "storage")
+    {
+        Some(StorageRoute::Controller)
+    } else {
+        None
+    }
+}
+
+fn storage_exit(code: i32) -> ExitCode {
+    match code {
+        0 => ExitCode::SUCCESS,
+        2 => ExitCode::from(2),
+        _ => ExitCode::FAILURE,
+    }
+}
+
+#[cfg(test)]
+#[path = "cli/storage_tests.rs"]
+mod storage_tests;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Opts {

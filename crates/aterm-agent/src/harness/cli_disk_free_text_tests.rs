@@ -9,7 +9,8 @@ fn fixture() -> (Tmp, Env) {
     let home = tmp.path().join("home");
     std::fs::create_dir_all(home.join(".cache")).unwrap();
     env.home = Some(std::fs::canonicalize(home).unwrap());
-    std::fs::write(env.config.as_ref().unwrap(), b"[disk]\nauto_free_gib = 0\n").unwrap();
+    crate::test_config::write(env.config.as_ref().unwrap(), b"[disk]\nauto_free_gib = 0\n")
+        .unwrap();
     (tmp, env)
 }
 
@@ -158,7 +159,7 @@ fn disk_free_text_delivery_errors_are_one_safe_line() {
         for json in [false, true] {
             for flush in [false, true] {
                 let (_tmp, env) = fixture();
-                std::fs::write(
+                crate::test_config::write(
                     env.config.as_ref().unwrap(),
                     b"[disk]\nauto_free_gib = 10\n",
                 )

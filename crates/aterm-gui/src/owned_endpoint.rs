@@ -5,8 +5,8 @@
 
 #[cfg(unix)]
 pub(crate) use imp::{
-    arm_orderly_quit, die_of_quit_signal, die_of_signal, hold_quit_for_exec, publish, rebound,
-    release,
+    arm_orderly_quit, die_of_quit_signal, die_of_signal, hold_quit_for_exec, publish,
+    quit_signalled, rebound, release,
 };
 
 /// How long a terminating signal's orderly quit runs before the process ends anyway
@@ -175,6 +175,19 @@ mod imp {
         state
             .compare_exchange(0, sig, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+    }
+
+    /// A terminating signal holds the orderly quit's claim on `state` ([`claim_quit`]); a cold
+    /// `exec`'s hold ([`EXEC_IN_FLIGHT`]) is none.
+    pub(super) fn quit_claimed(state: &AtomicI32) -> bool {
+        state.load(Ordering::Acquire) > 0
+    }
+
+    /// THIS PROCESS IS ENDING OF A TERMINATING SIGNAL: its handler claimed the orderly quit
+    /// ([`on_exit_signal`]). The handler sets it as the signal lands, before the quit's thread
+    /// (Background QoS, which can wait seconds for a core on a loaded Mac) runs at all.
+    pub(crate) fn quit_signalled() -> bool {
+        quit_claimed(&QUIT_SIGNAL)
     }
 
     /// The claim a cold `exec` holds ([`hold_for_exec`]) while it is in flight.
@@ -368,6 +381,12 @@ pub(crate) fn publish(_plan: &crate::control_auth::SocketPlan) {
 #[cfg(not(unix))]
 pub(crate) fn die_of_quit_signal() {}
 
+/// Off Unix no terminating signal quits the instance.
+#[cfg(not(unix))]
+pub(crate) fn quit_signalled() -> bool {
+    false
+}
+
 /// The graceful exit's removal off Unix ([`crate::control_auth::cleanup_socket`]).
 #[cfg(not(unix))]
 pub(crate) fn release(plan: &crate::control_auth::SocketPlan) {
@@ -378,7 +397,7 @@ pub(crate) fn release(plan: &crate::control_auth::SocketPlan) {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::imp::{Owned, Published, claim_quit, hold_for_exec};
+    use super::imp::{Owned, Published, claim_quit, hold_for_exec, quit_claimed};
 
     const STAND_IN_DIR: &str = "ATERM_TEST_OWNED_ENDPOINT_SIGNAL_DIR";
     const STAND_IN_HOLD: &str = "ATERM_TEST_OWNED_ENDPOINT_SIGNAL_HOLD";
@@ -607,5 +626,21 @@ mod tests {
             !claim_quit(&state, libc::SIGINT),
             "a second signal is not claimed"
         );
+    }
+
+    /// The process reads as ending of a signal from the moment its handler claims the orderly
+    /// quit, never while a cold `exec` holds the claim or before anything claimed it.
+    #[test]
+    fn a_process_is_ending_of_its_signal_once_the_handler_claims_the_quit() {
+        use std::sync::atomic::AtomicI32;
+        let state = AtomicI32::new(0);
+        assert!(!quit_claimed(&state), "nothing claimed");
+        {
+            let _held = hold_for_exec(&state).expect("the exec may run");
+            assert!(!quit_claimed(&state), "an exec in flight is no ending");
+        }
+        assert!(!quit_claimed(&state), "the exec returned");
+        assert!(claim_quit(&state, libc::SIGTERM));
+        assert!(quit_claimed(&state), "the handler's claim: ending");
     }
 }

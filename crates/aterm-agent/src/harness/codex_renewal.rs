@@ -837,6 +837,7 @@ pub fn prepare_restart(
         .map_err(|_| "restart-record-unreadable")?
         .unwrap_or_else(|| upgrade_drive::St {
             pid: process.pid,
+            pid_start: super::native_restart::vendor_start(process),
             shell: shell.pid,
             tab: sid.into(),
             phase: super::upgrade::Phase::Exiting {
@@ -1607,25 +1608,26 @@ mod tests {
         auth(&new, "other-workspace", Some("user"), None);
         assert!(with_successor(&env, &old.join("auth.json"), &identity, |_| Ok(true)).is_err());
         auth(&new, "workspace", Some("user"), None);
-        std::fs::write(env.config.as_ref().unwrap(), "[harness]\nlogins='off'\n").unwrap();
+        crate::test_config::write(env.config.as_ref().unwrap(), "[harness]\nlogins='off'\n")
+            .unwrap();
         assert!(with_successor(&env, &old.join("auth.json"), &identity, |_| Ok(true)).is_err());
         for setting in ["relaunch", "resume_limits"] {
-            std::fs::write(
+            crate::test_config::write(
                 env.config.as_ref().unwrap(),
                 format!("[harness]\n{setting}=false\n"),
             )
             .unwrap();
             assert!(with_successor(&env, &old.join("auth.json"), &identity, |_| Ok(true)).is_err());
         }
-        std::fs::write(
+        crate::test_config::write(
             env.config.as_ref().unwrap(),
             "[harness.codex]\nenabled=false\n",
         )
         .unwrap();
         assert!(with_successor(&env, &old.join("auth.json"), &identity, |_| Ok(true)).is_err());
-        std::fs::write(env.config.as_ref().unwrap(), "[harness").unwrap();
+        crate::test_config::write(env.config.as_ref().unwrap(), "[harness").unwrap();
         assert!(with_successor(&env, &old.join("auth.json"), &identity, |_| Ok(true)).is_err());
-        std::fs::write(env.config.as_ref().unwrap(), "").unwrap();
+        crate::test_config::write(env.config.as_ref().unwrap(), "").unwrap();
         std::fs::write(
             env.accounts_roster_for(accounts::Cli::Codex).unwrap(),
             raw + "held_by='m2'\n",

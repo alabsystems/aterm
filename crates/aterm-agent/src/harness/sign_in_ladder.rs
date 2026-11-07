@@ -1166,6 +1166,46 @@ impl SignIn {
         Ok(spaced_until(last.as_ref(), self.cli, &self.label, now))
     }
 
+    pub(super) fn begin_native(
+        self,
+        label: &str,
+        turn: std::sync::Arc<super::native_enrollment_admission::NativeBrowserTurn>,
+        store: &super::accounts::Store,
+        now: i64,
+    ) -> Result<Begun, Refused> {
+        super::native_custody_platform::require_available()
+            .map_err(|error| Refused::Record(error.into()))?;
+        if !self.names(super::accounts::Cli::Codex, label)
+            || !turn.names(label)
+            || self.turn.is_some()
+        {
+            return Err(Refused::Another);
+        }
+        turn.check_preparation(store).map_err(Refused::Record)?;
+        #[cfg(unix)]
+        let _spacing = aterm_uds::private_file::PrivateLock::take(
+            &store.shared_dir(),
+            "native-signin-spacing.lock",
+            std::time::Duration::from_secs(1),
+            "sign-in spacing busy",
+        )
+        .map_err(|_| Refused::Record("sign-in spacing unavailable".into()))?;
+        if let Some(until) = self.spaced(store, now)? {
+            return Err(Refused::Spaced { until });
+        }
+        super::upgrade_models::write_atomic(
+            &spacing_path(store),
+            &Started::new(super::accounts::Cli::Codex, label, now).text(),
+        )
+        .map_err(|error| Refused::Record(error.to_string()))?;
+        Ok(Begun {
+            signin: SigninOwner::Native(turn),
+            cli: self.cli,
+            label: self.label,
+            selection_owner: self.selection_owner,
+        })
+    }
+
     /// Starts this sign-in of `cli`'s `label` under the sign-in lock `signin` took from `store`
     /// ([`super::accounts::Store::signin_now`], [`super::accounts::Store::signin_within`]):
     /// it refuses a token for another account, and an automatic sign-in within [`SPACING_S`] of
@@ -1204,7 +1244,7 @@ impl SignIn {
         )
         .map_err(|e| Refused::Record(e.to_string()))?;
         Ok(Begun {
-            signin,
+            signin: SigninOwner::Global(signin),
             cli: self.cli,
             label: self.label,
             selection_owner: self.selection_owner,
@@ -1217,13 +1257,45 @@ impl SignIn {
 #[derive(Debug)]
 #[must_use]
 pub(super) struct Begun {
-    signin: super::accounts::SigninTurn,
+    signin: SigninOwner,
     cli: super::accounts::Cli,
     label: String,
     selection_owner: Option<super::accounts_sync::ManualSelectionOwner>,
 }
 
+#[derive(Debug)]
+enum SigninOwner {
+    Global(super::accounts::SigninTurn),
+    Native(std::sync::Arc<super::native_enrollment_admission::NativeBrowserTurn>),
+    NativeRecovery(Box<super::native_enrollment_admission::NativeRecoveryTurn>),
+}
+
 impl Begun {
+    pub(super) fn native_recovery(
+        turn: super::native_enrollment_admission::NativeRecoveryTurn,
+        store: &super::accounts::Store,
+        label: &str,
+    ) -> Result<Self, String> {
+        if turn.admission().request().label != label {
+            return Err("native recovery row changed".into());
+        }
+        turn.check_store(store)?;
+        Ok(Self {
+            signin: SigninOwner::NativeRecovery(Box::new(turn)),
+            cli: store.cli(),
+            label: label.to_owned(),
+            selection_owner: None,
+        })
+    }
+    pub(super) fn native_recovery_scope(
+        &self,
+    ) -> Option<&super::native_enrollment_admission::NativeRecoveryTurn> {
+        match &self.signin {
+            SigninOwner::NativeRecovery(turn) => Some(turn),
+            _ => None,
+        }
+    }
+
     /// A checked publication-only recovery retains the fresh actual signer but starts no provider.
     pub(super) fn recovery(
         signin: super::accounts::SigninTurn,
@@ -1234,16 +1306,38 @@ impl Begun {
             .check_store(store)
             .map_err(|error| error.to_string())?;
         Ok(Self {
-            signin,
+            signin: SigninOwner::Global(signin),
             cli: store.cli(),
             label: label.to_owned(),
             selection_owner: None,
         })
     }
     pub(super) fn check_store(&self, store: &super::accounts::Store) -> Result<(), String> {
-        self.signin
-            .check_store(store)
-            .map_err(|error| error.to_string())
+        match &self.signin {
+            SigninOwner::Global(turn) => turn.check_store(store).map_err(|error| error.to_string()),
+            SigninOwner::NativeRecovery(turn) => turn.check_store(store),
+            SigninOwner::Native(turn) => {
+                turn.check_preparation(store)?;
+                turn.check_publication()
+            }
+        }
+    }
+    pub(super) fn check_preparation(&self, store: &super::accounts::Store) -> Result<(), String> {
+        match &self.signin {
+            SigninOwner::Global(turn) => turn.check_store(store).map_err(|error| error.to_string()),
+            SigninOwner::Native(turn) => turn.check_preparation(store),
+            SigninOwner::NativeRecovery(_) => {
+                Err("publication-only recovery cannot prepare a sign-in".into())
+            }
+        }
+    }
+    pub(super) fn native_scope(
+        &self,
+    ) -> Option<&std::sync::Arc<super::native_enrollment_admission::NativeBrowserTurn>> {
+        match &self.signin {
+            SigninOwner::Global(_) | SigninOwner::NativeRecovery(_) => None,
+            SigninOwner::Native(turn) => Some(turn),
+        }
     }
     pub(super) fn selection(&self) -> Option<&super::accounts::PendingSelection> {
         self.selection_owner
@@ -1252,8 +1346,11 @@ impl Begun {
     }
     /// The sign-in lock it holds.
     #[must_use]
-    pub(super) fn lock(&self) -> &super::accounts::Lock {
-        &self.signin
+    pub(super) fn lock(&self) -> Option<&super::accounts::Lock> {
+        match &self.signin {
+            SigninOwner::Global(turn) => Some(turn),
+            SigninOwner::Native(_) | SigninOwner::NativeRecovery(_) => None,
+        }
     }
 
     /// Whether it is `cli`'s `label`'s sign-in.
@@ -1278,7 +1375,7 @@ pub(super) fn begun_fixture(
     label: &str,
 ) -> Begun {
     Begun {
-        signin,
+        signin: SigninOwner::Global(signin),
         cli,
         label: label.to_owned(),
         selection_owner: None,

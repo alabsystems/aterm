@@ -409,7 +409,7 @@ fn exchange(initiator: &Endpoint, responder: &Endpoint, rounds: usize) -> Result
             (Ok(_), Ok(_)) => {}
         }
         let app_err = match (mine.application_error(), theirs.application_error()) {
-            (Some(m), Some(t)) if is_busy_error(t) && !is_busy_error(m) => Some(t),
+            (Some(m), Some(t)) if is_busy_error(&t.text) && !is_busy_error(&m.text) => Some(t),
             (Some(m), _) => Some(m),
             (None, Some(t)) => Some(t),
             (None, None) => None,

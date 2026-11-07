@@ -51,6 +51,37 @@ pub struct Prepared {
     phase: Phase,
 }
 impl Prepared {
+    /// Retain another host-owned lifetime guard without replacing existing
+    /// CPU/GNU mappings. This is transport, not allocation or SDK validation.
+    pub(crate) fn retain_guard(&mut self, guard: OwnedFd) -> io::Result<u32> {
+        if self.phase != Phase::Fresh {
+            return Err(refused("lifetime guard requires an unconfigured member"));
+        }
+        let mapped = self
+            .mapped
+            .as_mut()
+            .ok_or_else(|| refused("missing member maps"))?;
+        if mapped.len() >= spawnfd::MAX_GUARD_FDS {
+            return Err(refused("too many member lifetime guards"));
+        }
+        let targets = mapped
+            .iter()
+            .map(|(_, target)| *target)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut excluded = Vec::new();
+        let mut candidate = guard;
+        loop {
+            let target = candidate.as_raw_fd();
+            // Keep the private bootstrap lanes and all existing target slots.
+            if target > 4 && !targets.contains(&target) {
+                mapped.push((candidate, target));
+                return u32::try_from(target).map_err(|_| refused("invalid lifetime guard"));
+            }
+            let next = duplicate(candidate.as_fd())?;
+            excluded.push(candidate);
+            candidate = next;
+        }
+    }
     /// Actual adopted kernel unit's observational key, never standalone CPU authority.
     pub fn cpu_slot(&self) -> Option<u32> {
         self.lease.as_ref().map(Lease::slot)
@@ -210,6 +241,15 @@ impl Prepared {
     /// # Errors
     /// Repeated use, existing guards, changed FIFO identity or invalid native mapping.
     pub fn configure(&mut self, command: &mut spawnfd::Command) -> io::Result<()> {
+        self.configure_with_extra(command, Vec::new())
+    }
+    /// One owner-private preparation channel. Extras confer no scheduling
+    /// authority and must be removed before the selected image's exec.
+    pub(crate) fn configure_with_extra(
+        &mut self,
+        command: &mut spawnfd::Command,
+        extra: Vec<(OwnedFd, i32)>,
+    ) -> io::Result<()> {
         if self.phase != Phase::Fresh {
             return Err(refused("scheduling setup already consumed"));
         }
@@ -220,7 +260,7 @@ impl Prepared {
         if let Some(named) = &self.named {
             named.validate()?;
         }
-        let mapped = self
+        let mut mapped = self
             .mapped
             .take()
             .ok_or_else(|| refused("missing scheduling inheritance"))?;
@@ -229,6 +269,7 @@ impl Prepared {
         } else {
             None
         };
+        mapped.extend(extra);
         if !mapped.is_empty() {
             command.inherit_guards_at(mapped)?;
         }

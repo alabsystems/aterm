@@ -31,6 +31,35 @@ pub fn legacy_file_reader_allowed(auth: &Path) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn retained_document_needs_exact_bytes_parent_and_its_actual_auth_lock() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let other = root.path().join("other");
+        for directory in [&home, &other] {
+            aterm_types::fs_restricted::ensure_private_dir(directory).unwrap();
+            write_auth_doc(directory, &json!({"auth_mode":"chatgpt"})).unwrap();
+        }
+        let path = auth_path_in_home(&home);
+        let expected = std::fs::read(&path).unwrap();
+        let witness = StagedWitness::open(&path).unwrap();
+        let auth = AuthLock::try_take(&path).unwrap().unwrap();
+        let wrong = AuthLock::try_take(&auth_path_in_home(&other))
+            .unwrap()
+            .unwrap();
+        assert!(retained_document_current(&witness, &auth, &expected));
+        assert!(!retained_document_current(&witness, &wrong, &expected));
+        std::fs::write(&path, b"changed retained bytes").unwrap();
+        assert!(!retained_document_current(&witness, &auth, &expected));
+        std::fs::write(&path, &expected).unwrap();
+        assert!(retained_document_current(&witness, &auth, &expected));
+        std::fs::rename(&home, root.path().join("old-home")).unwrap();
+        aterm_types::fs_restricted::ensure_private_dir(&home).unwrap();
+        write_auth_doc(&home, &json!({"auth_mode":"chatgpt"})).unwrap();
+        assert!(!retained_document_current(&witness, &auth, &expected));
+    }
+
     #[test]
     fn exact_custom_auth_basename_is_never_replaced_by_a_default_guess() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -150,7 +179,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::{PermissionsExt, symlink};
-            std::fs::set_permissions(&owner, std::fs::Permissions::from_mode(0o000)).unwrap();
+            std::fs::set_permissions(&owner, std::fs::Permissions::from_mode(0o0)).unwrap();
             assert!(!legacy_reader_allowed(home));
             std::fs::remove_file(&owner).unwrap();
             symlink(home.join("missing"), &owner).unwrap();
@@ -166,6 +195,7 @@ mod tests {
         assert!(!legacy_reader_allowed(&custom));
     }
     #[test]
+    #[cfg(unix)]
     fn marker_published_under_auth_lock_during_usage_refuses_401_refresh_and_stale_readiness() {
         let now = 1_800_000_000;
         let body=br#"{"plan_type":"pro","rate_limit":{"allowed":true,"primary_window":{"used_percent":42.0,"limit_window_seconds":18000,"reset_at":1800003600}}}"#;

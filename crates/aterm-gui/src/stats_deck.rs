@@ -370,6 +370,9 @@ pub(crate) struct DeckInput<'a> {
     /// The lab's account rows ([`crate::lab_deck`]), drawn on the network band's Shared State
     /// line; absent where the network band is.
     pub(crate) lab: Option<&'a crate::lab_deck::LabDeck>,
+    /// The Network State band's Fleet Field ([`crate::network_deck::field`]); `None` where the
+    /// band draws the observer's peers (no fleet glance, no fleet) or is not drawn.
+    pub(crate) fleet: Option<&'a crate::network_deck::field::Field>,
     /// The latest snapshot, `None` before the first.
     pub(crate) snap: Option<&'a Snapshot>,
     /// The snapshot immediately preceding [`Self::snap`], when available, for smooth value
@@ -1589,22 +1592,27 @@ impl<'a> Deck<'a> {
         }
     }
 
-    /// The column a time gap's notch stands in, from `end`, its end's column (the span's first
-    /// column at its newer end, where `newer` holds, and its last at its older end): `end` itself
-    /// where no pip stands within a device px of it, else the first column inward, toward the
-    /// span's other end, with a device px of ground between it and every pip, each `w` px wide
-    /// from its left px in `pips` (the second review's own review, 2026-11-06). Vitals sets an
-    /// aterm crash and its restart at a crash gap's two ends and a wake at a sleep gap's newer
-    /// end, and a pip stands up from the rail as tall as a notch, so on the end itself the pip
-    /// would hide its notch.
-    fn notch_column(end: f32, newer: bool, pips: &[f32], w: f32) -> f32 {
-        let mut c = end;
-        // Each step passes one pip, never to meet it again, so this ends within `pips.len()`
-        // steps.
-        while let Some(&a) = pips.iter().find(|&&a| a - 1.0 <= c && c < a + w + 1.0) {
-            c = if newer { a + w + 1.0 } else { a - 2.0 };
+    /// The columns a time gap's notches stand in over its span `gx0..gx1` of the rail, its newer
+    /// end's first (the second review's own review, 2026-11-06, and the third review). A notch
+    /// stands only on a column of the span with a device px of ground between it and every pip,
+    /// each `w` px wide from its left px in `pips`: vitals sets an aterm crash and its restart at a
+    /// crash gap's two ends and a wake at a sleep gap's newer end, and a pip stands up from the
+    /// rail as tall as a notch, so a notch on its end would stand under the pip, and one beside it
+    /// would read as part of it. The newer end's notch stands on the first such column from its
+    /// end, the older end's on the last, each on its end where no pip stands within a device px of
+    /// it. The two keep a device px of ground between them too, unless both stand on their ends
+    /// (a span 2 px wide): where one has stepped inward and they would stand side by side, as one
+    /// mark 2 px wide in the gap's ink, only the one nearer its own end stands, the newer where
+    /// they are as near. A span with no such column draws no notch: its pips mark its ends.
+    fn notch_columns((gx0, gx1): (f32, f32), pips: &[f32], w: f32) -> [Option<f32>; 2] {
+        let clear = |c: &f32| pips.iter().all(|&a| *c < a - 1.0 || *c >= a + w + 1.0);
+        let mut cols = (gx0 as i32..gx1 as i32).map(|k| k as f32).filter(clear);
+        match (cols.next(), cols.next_back()) {
+            (Some(n), Some(o)) if o - n < 2.0 && (n > gx0 || o < gx1 - 1.0) => {
+                [Some(if gx1 - 1.0 - o < n - gx0 { o } else { n }), None]
+            }
+            (newer, older) => [newer, older],
         }
-        c
     }
 
     /// The device-px span `x0..x1` `strip`'s fine band stands in at rest
@@ -1686,8 +1694,9 @@ impl<'a> Deck<'a> {
     /// vertical event marker lines + cap pips for [`StripEvent`]s (`Crash`, `Restart`,
     /// `SleepWake`, `PressureSpike`), each pip standing up from the rail, its foot the rail's px
     /// ([`Self::pip`]; the second review, 2026-11-06). The events are placed first, so a notch
-    /// an event's pip would stand on steps inward clear of it ([`Self::notch_column`]; the second
-    /// review's own review, 2026-11-06).
+    /// an event's pip would stand on steps inward clear of it ([`Self::notch_columns`]; the second
+    /// review's own review, 2026-11-06), and the gaps are drawn before the pips, so each pip
+    /// stands over a gap's rail and keeps its foot there.
     fn strip_axis_and_events(
         &mut self,
         strip: &Strip,
@@ -1773,18 +1782,13 @@ impl<'a> Deck<'a> {
                 // own rail, just drawn, so where the rail breaks over a cap the notch does too and
                 // keeps a device px of ground over the cap. Where an event's pip stands on an end
                 // or within a device px of its notch, the notch steps inward, clear of the pip
-                // ([`Self::notch_column`]).
+                // ([`Self::notch_columns`]).
                 let nh = (2.0 * self.s as f32).round().max(2.0);
-                let newer = Self::notch_column(gx0, true, &pips, pip);
-                let older =
-                    (gx1 - gx0 >= 2.0).then(|| Self::notch_column(gx1 - 1.0, false, &pips, pip));
-                for c in [Some(newer), older.filter(|&c| c != newer)]
+                for c in Self::notch_columns((gx0, gx1), &pips, pip)
                     .into_iter()
                     .flatten()
                 {
-                    if gx0 <= c && c < gx1 {
-                        self.rect((c, y_axis + 1.0 - nh, 1.0, nh - 1.0), 0.0, gink);
-                    }
+                    self.rect((c, y_axis + 1.0 - nh, 1.0, nh - 1.0), 0.0, gink);
                 }
             }
         }
@@ -3188,6 +3192,7 @@ pub(crate) fn deck_paint_kept(
             resource_geom.h,
             snapshot,
             input.lab.unwrap_or(&empty),
+            input.fleet,
             input.network_place,
             &network_inks,
             input.dwc,
@@ -3495,6 +3500,10 @@ impl crate::App {
         self.lab_deck_feed.revision().hash(&mut h);
         if f.form == StatsBars::Deck {
             f.network_place.hash(&mut h);
+            self.fleet_field
+                .as_ref()
+                .map(|field| field.key)
+                .hash(&mut h);
         }
         self.vitals
             .prev_snapshot
@@ -3526,6 +3535,9 @@ impl crate::App {
             network_place: f.network_place.as_ref(),
             network_target: crate::network_deck::Target::Overview,
             lab: (f.form == StatsBars::Deck).then_some(self.lab_deck.as_ref()),
+            fleet: (f.form == StatsBars::Deck)
+                .then_some(self.fleet_field.as_deref())
+                .flatten(),
             snap,
             prev_snap: self.vitals.prev_snapshot.as_deref(),
             tab_panes: f.tab_panes.clone(),
@@ -4049,27 +4061,16 @@ impl crate::App {
                 }),
             });
         let mut group = stats_a11y_group(self.vitals.snapshot.as_deref(), &f.tab_panes, &loc);
-        for target in crate::network_deck::targets_with(&self.network_snapshot, &self.lab_deck) {
-            let words =
-                crate::network_deck::details_lab(&self.network_snapshot, &self.lab_deck, target);
-            // A lab account's first row names it; the others' second row says what they are.
-            let named = if matches!(target, crate::network_deck::Target::LabAccount(_)) {
-                0
-            } else {
-                1
-            };
-            let name = words.get(named).map_or_else(
-                || "Network State".to_owned(),
-                |(name, value)| format!("{name}: {value}"),
-            );
+        for (name, words) in crate::network_deck::meters(
+            &self.network_snapshot,
+            &self.lab_deck,
+            self.fleet_field.as_deref(),
+            (f.geom.w, f.geom.scale),
+        ) {
             group.meters.push(crate::a11y_tree::StatsMeter {
                 name,
                 value: None,
-                words: words
-                    .into_iter()
-                    .map(|(name, value)| format!("{name}: {value}"))
-                    .collect::<Vec<_>>()
-                    .join(". "),
+                words,
             });
         }
         Some(crate::a11y_tree::GridStats {
@@ -4925,6 +4926,7 @@ pub(crate) mod tests {
             network_place: None,
             network_target: crate::network_deck::Target::Overview,
             lab: None,
+            fleet: None,
             snap: Some(snap),
             prev_snap: None,
             tab_panes: vec![7],

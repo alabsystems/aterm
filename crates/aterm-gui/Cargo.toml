@@ -614,3 +614,8 @@ workspace = true
 name = "jumplist_acceptance"
 harness = false
 test = false
+
+# Pure production chunk classifier and its original oracle, without a GUI host.
+[[bench]]
+name = "job_chunk_cost"
+harness = false

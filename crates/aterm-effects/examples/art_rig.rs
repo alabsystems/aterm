@@ -964,6 +964,9 @@ mod pet {
         const BLUSH: &str = "#F2A9B4";
         /// A dog's nose is a dark button, not a cat's pink triangle.
         const DOG_NOSE: &str = "#2B2530";
+        /// A dog's drop ear: dark leather over any coat, lighter than the
+        /// outline so the flap's edge still reads where it crosses it.
+        const DOG_EAR: &str = "#5E4236";
 
         /// The outline half-width added to every coat part.
         const S: f64 = 4.0;
@@ -1277,6 +1280,9 @@ mod pet {
             let rot = radians(p.hrot);
             let core = blob(p.hx, p.hy, &scaled(&sp, p.hr), rot, p.hsx, p.hsy);
             let out = blob(p.hx, p.hy, &scaled(&sp, p.hr + S), rot, p.hsx, p.hsy);
+            if dog(p) && !p.front {
+                return (vec![core, dog_snout(p, 0.0)], vec![out, dog_snout(p, S)]);
+            }
             (vec![core], vec![out])
         }
 
@@ -1322,36 +1328,45 @@ mod pet {
             catmull_closed(&[a, mid_a, (tx, ty), mid_b, b], 0.10)
         }
 
+        /// How much of a pose's ear swivel a profile drop ear takes
+        /// ([`ear_drop`]).
+        const DROP_EAR_FLICK: f64 = 0.4;
+
         /// The DOG ear: a long rounded lobe HANGING down the side of the skull.
+        ///
+        /// Face-on, one hangs at each side. In profile (after-land R8) the
+        /// near ear hangs from the crown down the back of the skull, behind
+        /// the far eye, its fold standing just proud of the skull line, and
+        /// the far ear's fold peeks over the crown ahead of it with its lobe
+        /// behind the skull: at 1x a 3/4 drop ear on each side read as cheeks
+        /// and the head as a seal's.
         fn ear_drop(p: &Pose, side: f64, inset: f64) -> String {
-            let flat_scale = 1.0;
             let near = side > 0.0;
-            let mut base_a = if p.front {
-                62.0 * side
-            } else {
-                58.0 * side + if near { 10.0 } else { -4.0 }
-            };
-            if !p.front {
-                base_a += (if near { 4.0 } else { -6.0 }) * p.yaw;
-            }
             let sweep = if near { p.ear_near } else { p.ear_far };
-            let th = radians(base_a - 90.0 + p.hrot);
-            let bx = p.hx + th.cos() * (p.hr - 6.0) * p.hsx;
-            let by = p.hy + th.sin() * (p.hr - 6.0) * p.hsy;
-            let ear_k = if p.front || near {
-                1.0
+            // A profile drop ear hangs from the crown, so a flick lifts the
+            // flap partway: the cat's whole swivel (70 degrees on
+            // `pet_stand_ear`) swung it straight back from the head, a
+            // horizontal tab at 1x (the after-land r1 judge's R8 low).
+            let sweep = if p.front {
+                sweep
             } else {
-                lerp(1.0, 0.82, p.yaw)
+                DROP_EAR_FLICK * sweep
             };
-            let w = (15.5 - inset * 0.55) * flat_scale * ear_k;
-            let h = (27.0 - inset)
-                * flat_scale
-                * if ear_k == 1.0 {
-                    1.0
-                } else {
-                    lerp(1.0, 0.90, p.yaw)
-                };
-            let tip_a = base_a + side * 82.0 + sweep + p.ear_flat * 26.0;
+            // (base angle, base depth inside the skull, hang angle, width, length)
+            let (base_a, base_in, hang, w0, h0) = if p.front {
+                let a = 62.0 * side;
+                (a, 6.0, a + side * 82.0, 15.5, 27.0)
+            } else if near {
+                (lerp(-44.0, -30.0, p.yaw), -1.0, 196.0, 15.0, 34.0)
+            } else {
+                (lerp(-14.0, -4.0, p.yaw), -2.0, 196.0, 12.0, 24.0)
+            };
+            let th = radians(base_a - 90.0 + p.hrot);
+            let bx = p.hx + th.cos() * (p.hr - base_in) * p.hsx;
+            let by = p.hy + th.sin() * (p.hr - base_in) * p.hsy;
+            let w = w0 - inset * 0.55;
+            let h = h0 - inset;
+            let tip_a = hang + sweep + p.ear_flat * 26.0;
             let tth = radians(tip_a - 90.0 + p.hrot);
             let (dx, dy) = (tth.cos(), tth.sin());
             let (px, py) = (-tth.sin(), tth.cos());
@@ -1393,10 +1408,15 @@ mod pet {
             (coat, out)
         }
 
-        /// Inner ear paths, inset further on a hanging dog ear than on a cat's.
+        /// Inner ear paths. A dog's hanging ear shows its outer leather, not
+        /// a pink inside: the whole flap in [`DOG_EAR`], over the skull (in
+        /// profile only the near ear's: the far one hangs behind the skull).
         fn inner_ear_paths(p: &Pose) -> Vec<String> {
-            let inset = if dog(p) { 13.0 } else { 9.0 };
-            vec![ear_shape(p, -1.0, inset), ear_shape(p, 1.0, inset)]
+            if dog(p) {
+                let sides: &[f64] = if p.front { &[-1.0, 1.0] } else { &[1.0] };
+                return sides.iter().map(|&side| ear_shape(p, side, 0.8)).collect();
+            }
+            vec![ear_shape(p, -1.0, 9.0), ear_shape(p, 1.0, 9.0)]
         }
 
         fn tail_pts(p: &Pose) -> Vec<Pt> {
@@ -1470,18 +1490,52 @@ mod pet {
             )]
         }
 
-        /// How far the DOG's muzzle sits ahead of the cat's: modest on purpose.
+        /// How far the DOG's muzzle sits ahead of the cat's. In profile it
+        /// stands out past the skull (after-land R8: kept inside it, the
+        /// round head read as a seal's at 1x).
         fn dog_snout_dx(p: &Pose) -> f64 {
             muzzle_dx(p)
                 + if p.front {
                     0.0
                 } else {
-                    lerp(0.08, 0.12, p.yaw)
+                    lerp(0.36, 0.40, p.yaw)
                 }
         }
 
-        /// The snout: the cat's round muzzle drawn out along the facing axis,
-        /// shallower on top and longer ahead (90 degrees is the +x side).
+        /// The profile snout's spokes (90 degrees is the +x side): shallow on
+        /// top, long ahead.
+        const SNOUT: [Pt; 8] = [
+            (0.0, 11.0),
+            (45.0, 15.5),
+            (90.0, 21.0),
+            (135.0, 17.0),
+            (180.0, 12.5),
+            (225.0, 12.0),
+            (270.0, 11.0),
+            (315.0, 10.0),
+        ];
+
+        /// The profile snout's centre on the skull.
+        fn dog_snout_centre(p: &Pose) -> Pt {
+            face_anchor(p, dog_snout_dx(p), 0.42)
+        }
+
+        /// The profile snout grown by `grow`: part of the head's silhouette,
+        /// so the outline rings it.
+        fn dog_snout(p: &Pose, grow: f64) -> String {
+            let (cx, cy) = dog_snout_centre(p);
+            let spokes: Vec<Pt> = SNOUT.iter().map(|&(a, r)| (a, r + grow)).collect();
+            blob(cx, cy, &spokes, radians(p.hrot), 1.0, 1.0)
+        }
+
+        /// A point `(ax, ay)` from the profile snout's centre, turned with the head.
+        fn on_snout(p: &Pose, ax: f64, ay: f64) -> Pt {
+            let (cx, cy) = dog_snout_centre(p);
+            rot_about(cx + ax, cy + ay, cx, cy, p.hrot)
+        }
+
+        /// The muzzle: face-on, the cat's round muzzle drawn wider below;
+        /// in profile, the snout itself a step inside its coat.
         fn dog_muzzle_paths(p: &Pose) -> Vec<String> {
             if p.front {
                 let (cx, cy) = face_anchor(p, dog_snout_dx(p), 0.46);
@@ -1500,21 +1554,7 @@ mod pet {
                     ],
                 )];
             }
-            let (cx, cy) = face_anchor(p, dog_snout_dx(p), 0.44);
-            vec![blob0(
-                cx,
-                cy,
-                &[
-                    (0.0, 11.0),
-                    (45.0, 15.5),
-                    (90.0, 20.0),
-                    (135.0, 17.0),
-                    (180.0, 13.5),
-                    (225.0, 12.0),
-                    (270.0, 11.0),
-                    (315.0, 10.0),
-                ],
-            )]
+            vec![dog_snout(p, -1.5)]
         }
 
         /// Near and far eye centres on the skull, sliding toward the leading edge when yawed.
@@ -1715,26 +1755,31 @@ mod pet {
             )
         }
 
-        /// The yawed forward shift of the dog's nose and mouth along its snout.
-        fn dog_nose_dx(p: &Pose) -> f64 {
-            dog_snout_dx(p)
-                + if p.front {
-                    0.0
-                } else {
-                    lerp(0.28, 0.34, p.yaw)
-                }
+        /// The dog's nose centre: face-on below the eyes, in profile a
+        /// button at the snout's tip.
+        fn dog_nose(p: &Pose) -> Pt {
+            if p.front {
+                face_anchor(p, dog_snout_dx(p), 0.56)
+            } else {
+                on_snout(p, 14.5, -3.5)
+            }
+        }
+
+        /// The dog's mouth anchor, under its nose.
+        fn dog_mouth(p: &Pose) -> Pt {
+            if p.front {
+                face_anchor(p, dog_snout_dx(p), 0.62)
+            } else {
+                on_snout(p, 11.0, -1.5)
+            }
         }
 
         fn nose_paths(p: &Pose) -> Vec<String> {
             if dog(p) {
-                let (cx, cy) = if p.front {
-                    face_anchor(p, dog_snout_dx(p), 0.56)
-                } else {
-                    face_anchor(p, dog_snout_dx(p) + lerp(0.28, 0.34, p.yaw), 0.58)
-                };
+                let (cx, cy) = dog_nose(p);
                 let mut out = Vec::new();
                 if p.mouth == "yawn" {
-                    let (mcx, mcy) = face_anchor(p, dog_nose_dx(p), 0.62);
+                    let (mcx, mcy) = dog_mouth(p);
                     out.push(gape(mcx, mcy));
                 }
                 out.push(blob0(
@@ -1770,7 +1815,7 @@ mod pet {
 
         fn mouth_paths(p: &Pose) -> Vec<String> {
             let (cx, cy) = if dog(p) {
-                face_anchor(p, dog_nose_dx(p), 0.62)
+                dog_mouth(p)
             } else {
                 face_anchor(p, muzzle_dx(p), 0.38)
             };
@@ -2023,7 +2068,12 @@ mod pet {
                 ("outline", INK, "fixed", outline),
                 ("coat", COAT, "coat", coat),
                 ("pattern", PATTERN, "fixed", pattern_paths(p)),
-                ("inner_ear", INNER_EAR, "fixed", inner_ear_paths(p)),
+                (
+                    "inner_ear",
+                    if dog(p) { DOG_EAR } else { INNER_EAR },
+                    "fixed",
+                    inner_ear_paths(p),
+                ),
                 ("muzzle", MUZZLE, "fixed", muzzle_paths(p)),
                 ("eye", EYE, "fixed", eye_paths(p)),
                 ("iris", IRIS, "iris", iris_paths(p)),

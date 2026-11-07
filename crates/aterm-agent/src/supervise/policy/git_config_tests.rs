@@ -403,6 +403,87 @@ fn an_assume_unchanged_entry_holds_a_grep_of_the_index() {
     }
 }
 
+/// A repository whose index holds `a.rs` first and then 10,000 empty entries, each path ending in
+/// `tail` bytes, added straight to the index (no worktree files), so its listings run long.
+fn large_index(tag: &str, tail: usize) -> Scratch {
+    const EMPTY_BLOB: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+    let r = repo(tag);
+    std::fs::write(r.0.path().join("a.rs"), "").unwrap();
+    git(r.0.path(), &["add", "a.rs"]);
+    let tail = "p".repeat(tail);
+    let entries: Vec<String> = (0..10_000)
+        .map(|i| format!("100644,{EMPTY_BLOB},d{i:05}/{tail}"))
+        .collect();
+    for batch in entries.chunks(2_000) {
+        let mut args = vec!["update-index", "--add"];
+        for entry in batch {
+            args.extend(["--cacheinfo", entry.as_str()]);
+        }
+        git(r.0.path(), &args);
+    }
+    r
+}
+
+/// An ordinary large repository's index lists past one MiB (MEASURED 2026-11-06: aterm's own
+/// checkout's `git ls-files -z --stage -v` wrote 4878197 bytes), and a read there is judged on
+/// the whole index: its first entry's assume-unchanged mark, which a kept tail of the listing
+/// would lose, is still seen.
+#[test]
+fn a_large_index_is_read_whole() {
+    let r = large_index("large-index", 60);
+    let mut cmd = Command::new(crate::test_program::git());
+    cmd.args(["ls-files", "-z", "--stage", "-v"])
+        .current_dir(r.0.path());
+    let listed = aterm_uds::deadline::output_until_complete_stdout_with_limit(
+        &mut cmd,
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES,
+    )
+    .expect("the whole listing");
+    assert!(
+        listed.stdout.len() > aterm_uds::deadline::OUTPUT_KEEP,
+        "{} bytes",
+        listed.stdout.len()
+    );
+    let v = isolated()
+        .raw_git_view(r.0.path(), &|_| false)
+        .expect("a large index is read");
+    // NEGATIVE CONTROL: the first entry unmarked.
+    assert!(!v.assume_unchanged, "{v:?}");
+    git(r.0.path(), &["update-index", "--assume-unchanged", "a.rs"]);
+    let v = isolated()
+        .raw_git_view(r.0.path(), &|_| false)
+        .expect("a large index is read");
+    assert!(v.assume_unchanged, "{v:?}");
+}
+
+/// A large checkout's path list (and `check-attr`'s answer for it) runs past one MiB, and the
+/// filter drivers its attributes select are still judged on every path: a configured driver no
+/// path selects is no hazard there, and one a path selects is. NEGATIVE CONTROL: with the path
+/// list cut at `OUTPUT_KEEP`, `filters_selected` was unread (`None`) and every configured driver
+/// counted as selected.
+#[test]
+fn a_large_checkouts_filter_drivers_are_judged_on_every_path() {
+    let r = large_index("large-filter", 120);
+    let global = r.0.path().join("global.cfg");
+    std::fs::write(
+        &global,
+        "[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n",
+    )
+    .unwrap();
+    let probe = WorkerEnv::hermetic(Some(&global));
+    let v = probe
+        .raw_git_view(r.0.path(), &|_| false)
+        .expect("git config");
+    assert_eq!(v.filters_selected, Some(Vec::new()), "{v:?}");
+
+    std::fs::write(r.0.path().join(".gitattributes"), "a.rs filter=lfs\n").unwrap();
+    let v = probe
+        .raw_git_view(r.0.path(), &|_| false)
+        .expect("git config");
+    assert_eq!(v.filters_selected, Some(vec!["lfs".to_string()]), "{v:?}");
+}
+
 #[test]
 fn each_dangerous_key_in_the_repository_is_seen() {
     for key in [
@@ -1276,7 +1357,8 @@ fn stand_in_git(dir: &Path, body: &str) -> PathBuf {
     git
 }
 
-/// More than [`aterm_uds::deadline::OUTPUT_KEEP`]: what a git read keeps of it is its tail.
+/// More than [`aterm_uds::deadline::OUTPUT_KEEP`] (two MiB of NULs): the config list keeps only
+/// its tail, while the index, path-list and attribute reads go through it to its end.
 #[cfg(unix)]
 const FLOOD: &str = "/usr/bin/head -c 2097152 /dev/zero";
 
@@ -1350,8 +1432,10 @@ fn read_by_stand_in<T>(tag: &str, body: &str, read: impl FnOnce(&Probe<'_>, &Pat
     read(&probe, r.0.path())
 }
 
-// A git read whose output outgrew what a read keeps (its tail) is refused, never judged on
-// that tail. The same reads of a real repository are the controls
+// The config list, whose read keeps only its tail, is refused once it outgrows that, never
+// judged on the tail. The index, path-list and attribute reads go to their proven end, holding
+// only what they use, and refuse one record over what a read keeps, or a path list past the
+// bound on a complete listing. The same reads of a real repository are the controls
 // (a_filter_driver_counts_only_where_the_attributes_select_it,
 // a_check_attr_that_never_answers_is_killed_at_its_wait and the rest of this file).
 
@@ -1365,39 +1449,69 @@ fn a_config_list_larger_than_a_read_keeps_is_refused() {
     assert!(why.contains("whole git config"), "{why}");
 }
 
+/// The index listing is read whole, holding only the entries it reads: a flood of entries
+/// (`FLOOD`'s NULs end two million empty ones) is read, and one entry that outgrows what a read
+/// keeps is refused, never cut.
 #[cfg(unix)]
 #[test]
-fn an_index_larger_than_a_read_keeps_is_refused() {
-    let body = format!(
-        "case \"$2 $3\" in\n'config --list') exit 0 ;;\n'rev-parse --show-toplevel') pwd ;;\n\
-         'ls-files -z') {FLOOD} ;;\n*) exit 1 ;;\nesac"
-    );
-    let why = read_by_stand_in("keep-index", &body, |probe, top| {
+fn an_index_entry_larger_than_a_read_keeps_is_refused() {
+    let listing = |list: &str| {
+        format!(
+            "case \"$2 $3\" in\n'config --list') exit 0 ;;\n'rev-parse --show-toplevel') pwd \
+             ;;\n'ls-files -z') {list} ;;\n*) exit 1 ;;\nesac"
+        )
+    };
+    // NEGATIVE CONTROL: many entries, each within the bound.
+    read_by_stand_in("keep-index-many", &listing(FLOOD), |probe, top| {
         probe.view_at(top, 0, &mut 0)
     })
-    .expect_err("an index listing over what a read keeps");
+    .expect("a flood of entries is read whole");
+    let runaway = format!("{FLOOD} | /usr/bin/tr '\\000' x");
+    let why = read_by_stand_in("keep-index", &listing(&runaway), |probe, top| {
+        probe.view_at(top, 0, &mut 0)
+    })
+    .expect_err("an index entry over what a read keeps");
     assert!(why.contains("whole index"), "{why}");
 }
 
-/// `None`: every configured filter driver counts as selected.
+/// A path list longer than a read keeps is read whole (`Some`: judged on every path), while one
+/// past the hard bound on a complete read is unread: `None`, every configured filter driver
+/// counted as selected.
 #[cfg(unix)]
 #[test]
-fn a_path_list_larger_than_a_read_keeps_leaves_every_driver_selected() {
-    let body =
-        format!("case \"$2\" in\nls-files) {FLOOD} ;;\ncheck-attr) /bin/cat > /dev/null ;;\nesac");
-    let read = read_by_stand_in("keep-paths", &body, |probe, top| {
+fn a_path_list_past_the_complete_read_bound_leaves_every_driver_selected() {
+    let paths = |list: &str| {
+        format!("case \"$2\" in\nls-files) {list} ;;\ncheck-attr) /bin/cat > /dev/null ;;\nesac")
+    };
+    // NEGATIVE CONTROL: past what a read keeps, within the complete bound.
+    let read = read_by_stand_in("keep-paths", &paths(FLOOD), |probe, top| {
+        probe.filters_selected(top)
+    });
+    assert_eq!(read, Some(Vec::new()));
+    let past = format!(
+        "/usr/bin/head -c {} /dev/zero",
+        aterm_uds::deadline::MAX_COMPLETE_LISTING_BYTES + 1
+    );
+    let read = read_by_stand_in("keep-paths-past", &paths(&past), |probe, top| {
         probe.filters_selected(top)
     });
     assert_eq!(read, None);
 }
 
-/// `None`: every configured filter driver counts as selected.
+/// `check-attr`'s answer is read to its end holding only the drivers it names: a flood of empty
+/// fields selects none, and one field longer than a read keeps is refused (`None`: every
+/// configured filter driver counts as selected), never cut.
 #[cfg(unix)]
 #[test]
-fn attributes_larger_than_a_read_keeps_leave_every_driver_selected() {
-    let body = format!("/bin/cat > /dev/null\n{FLOOD}");
-    let read = read_by_stand_in("keep-attributes", &body, |probe, top| {
-        probe.drivers_selected(top, b"a.bin\0".to_vec(), aterm_spec::wait::MUST_HAPPEN)
-    });
-    assert_eq!(read, None);
+fn an_attribute_field_larger_than_a_read_keeps_leaves_every_driver_selected() {
+    let drivers = |body: &str, at: &str| {
+        let body = format!("/bin/cat > /dev/null\n{body}");
+        read_by_stand_in(at, &body, |probe, top| {
+            probe.drivers_selected(top, b"a.bin\0".to_vec(), aterm_spec::wait::MUST_HAPPEN)
+        })
+    };
+    // NEGATIVE CONTROL: a flood of fields, each within the bound.
+    assert_eq!(drivers(FLOOD, "keep-attributes-many"), Some(Vec::new()));
+    let runaway = format!("{FLOOD} | /usr/bin/tr '\\000' x");
+    assert_eq!(drivers(&runaway, "keep-attributes"), None);
 }

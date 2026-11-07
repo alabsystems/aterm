@@ -2516,20 +2516,43 @@ pub(crate) mod world {
 
         /// The codex package name for [`triple`].
         pub(crate) fn codex_asset() -> String {
-            format!("codex-package-{}.tar.gz", triple())
+            Self::codex_asset_for(triple())
+        }
+
+        /// The codex package name for the target `target`.
+        fn codex_asset_for(target: &str) -> String {
+            format!("codex-package-{target}.tar.gz")
         }
 
         /// The codex payload URL for `version`.
         pub(crate) fn codex_payload_url(version: &str) -> String {
-            format!("{CODEX_DL}rust-v{version}/{}", Self::codex_asset())
+            Self::codex_payload_url_for(version, triple())
+        }
+
+        /// The codex payload URL for `version` on the target `target`.
+        fn codex_payload_url_for(version: &str, target: &str) -> String {
+            format!(
+                "{CODEX_DL}rust-v{version}/{}",
+                Self::codex_asset_for(target)
+            )
         }
 
         /// Publish codex `version`: a tarball of `files` (`(path, bytes, mode)`), its
         /// `SHA256SUMS` on GitHub and the release JSON (the head) agreeing on its digest.
         pub(crate) fn publish_codex(&self, version: &str, files: &[(&str, &[u8], u32)]) {
+            self.publish_codex_for(triple(), version, files);
+        }
+
+        /// [`Fake::publish_codex`], its package for the target `target` rather than this host's.
+        pub(crate) fn publish_codex_for(
+            &self,
+            target: &str,
+            version: &str,
+            files: &[(&str, &[u8], u32)],
+        ) {
             let tarball = tarball(files);
             let digest = sha(&tarball);
-            let asset = Self::codex_asset();
+            let asset = Self::codex_asset_for(target);
             let release = format!(
                 "{{\"tag_name\":\"rust-v{version}\",\"assets\":[{{\"name\":\"{asset}\",\
                  \"digest\":\"sha256:{digest}\",\"browser_download_url\":\
@@ -2537,23 +2560,29 @@ pub(crate) mod world {
             );
             self.doc(CODEX_HEAD, release.as_bytes());
             let sums = format!(
-                "{}  codex-app-server-package-{}.tar.gz\n{digest}  {asset}\n",
+                "{}  codex-app-server-package-{target}.tar.gz\n{digest}  {asset}\n",
                 "0".repeat(64),
-                triple()
             );
             self.doc(
                 &format!("{CODEX_DL}rust-v{version}/codex-package_SHA256SUMS"),
                 sums.as_bytes(),
             );
-            self.payload(&Self::codex_payload_url(version), &tarball);
+            self.payload(&Self::codex_payload_url_for(version, target), &tarball);
         }
 
         /// The codex tree a genuine package lays: the entry, a helper, and data — one
         /// executable-mode data file among it, as 0.156.0 ships.
         pub(crate) fn publish_codex_default(&self, version: &str) {
+            self.publish_codex_default_for(triple(), version);
+        }
+
+        /// [`Fake::publish_codex_default`], its package for the target `target` rather than this
+        /// host's.
+        pub(crate) fn publish_codex_default_for(&self, target: &str, version: &str) {
             let codex = native_exe(&format!("codex {version}"));
             let helper = native_exe("rg");
-            self.publish_codex(
+            self.publish_codex_for(
+                target,
                 version,
                 &[
                     (&bin("codex"), &codex, 0o755),

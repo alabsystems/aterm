@@ -1969,6 +1969,76 @@ fn another_holders_claim_is_named_apart_from_this_hosts() {
     assert_eq!(read(&app), (true, true, true), "another holder's claim");
 }
 
+/// A GROK BUILD OR KIMI CODE BOX NEEDS THE PERSON: its box drawn in a tab no supervisor holds
+/// (Grok Build's shell approval card and Kimi Code's question, measured) is told by its frame,
+/// published `agent=prompt` with its kind (and, for a command, the read-only rule's verdict), and
+/// raises the box's need: an approval and a question. Where both readers named no box, both
+/// published `unknown` and raised none. CONTROL: the same programs' idle frames raise no need.
+#[test]
+fn a_grok_or_kimi_box_needs_the_person() {
+    use aterm_types::needs::NeedWord;
+    let draw = |app: &App, sid: u64, text: &str, rows: u16, cols: u16| {
+        let screen = aterm_phase::prompt::fixtures::screen(text);
+        let pooled = app.pool.get(sid).expect("pooled");
+        let mut t = crate::term_lock(&pooled.term);
+        t.resize(rows, cols);
+        let mut bytes = String::from("\x1b[H\x1b[2J");
+        for (i, row) in screen.iter().enumerate() {
+            bytes.push_str(&format!("\x1b[{};1H{row}", i + 1));
+        }
+        t.process(bytes.as_bytes());
+    };
+    let need = |app: &App, sid: u64| {
+        let handle = app.store.read().unwrap().by_local(sid).cloned();
+        let handle = handle.as_ref().expect("the session");
+        let f = app.need_facts_with(
+            handle,
+            |_| false,
+            &Default::default(),
+            crate::metrics::now_us(),
+            0,
+        );
+        assert!(!f.supervised, "no supervisor speaks for the box");
+        crate::needs::of(&f).need.map(|n| n.word)
+    };
+    for (text, idle, rows, cols, detail, word) in [
+        (
+            aterm_phase::grok::fixtures::BOX_SHELL,
+            aterm_phase::grok::fixtures::TURN_ENDED_EMPTY,
+            50,
+            144,
+            "bash:not-read-only",
+            NeedWord::Approval,
+        ),
+        (
+            aterm_phase::kimi::fixtures::QUESTION_240,
+            aterm_phase::kimi::fixtures::END_OF_TURN_240,
+            32,
+            110,
+            "question",
+            NeedWord::Question,
+        ),
+    ] {
+        let (mut app, sid) = app_with_stub();
+        draw(&app, sid, idle, rows, cols);
+        let _ = take_posts();
+        looking_at(&app, &[]);
+        let t0 = Instant::now();
+        sweep(&mut app, t0);
+        assert_eq!(published(&app, sid).word, "idle", "CONTROL: {detail}");
+        assert_eq!(need(&app, sid), None, "CONTROL: {detail}");
+        draw(&app, sid, text, rows, cols);
+        sweep(&mut app, t0 + Duration::from_secs(1));
+        let p = published(&app, sid);
+        assert_eq!(
+            (p.word, p.detail.as_deref()),
+            ("prompt", Some(detail)),
+            "{p:?}"
+        );
+        assert_eq!(need(&app, sid), Some(word), "{detail}");
+    }
+}
+
 /// A rostered harness's scoped claim (contract v3) stands aterm down for exactly its scope
 /// (`docs/DESIGN-harness-repos-2026-10-24.md` §8.1 item 4): grok-alab's `relaunch,upgrade` speaks
 /// for no box and no wall, so a box on its session still needs the person, where any other

@@ -1,365 +1,336 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use super::*;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
-fn seen(width: u32, wall_s: f64, cpu_s: f64) -> Seen {
+use super::*;
+
+const GIB: u64 = 1 << 30;
+
+fn secs(s: f64) -> Duration {
+    Duration::from_secs_f64(s)
+}
+
+/// A binary whose last run took `wall` seconds at width `width` over `tests` tests, `cpu`
+/// seconds of CPU.
+fn seen(wall: f64, cpu: f64, width: u32, tests: u32) -> Seen {
     Seen {
+        wall: secs(wall),
         width,
-        wall_s,
-        cpu_s,
-        floor_s: wall_s,
-        tests: None,
+        tests,
+        per_thread: (cpu / wall / f64::from(width.min(tests).max(1))).max(1.0),
+        peak: 0,
         failed: false,
     }
 }
 
-fn history(rows: &[(&str, Seen)]) -> BTreeMap<String, Seen> {
-    rows.iter()
-        .map(|(spec, s)| ((*spec).to_string(), s.clone()))
-        .collect()
+fn planned(index: usize, charge: u32, peak: u64, wall: f64) -> Planned {
+    Planned {
+        index,
+        width: charge,
+        charge,
+        peak,
+        predicted: Some(secs(wall)),
+    }
 }
 
-/// THE BUDGET: the charges of the binaries running never sum past the share, every binary runs
-/// once at its planned width, and the answers come back by index. NEGATIVE CONTROL: the same
-/// binaries started by as many workers as the share with no budget (the pool `e77a54f4d9`
-/// replaced held `jobs × threads` fixed) hold the first six charges, 14 cores, at once.
+/// Binary `index` of plan `p`.
+fn at(p: &Plan, index: usize) -> Planned {
+    p.order
+        .iter()
+        .find(|b| b.index == index)
+        .copied()
+        .unwrap_or_else(|| panic!("binary {index} is not in {p:?}"))
+}
+
+/// THE ORDER: binaries with no history first in cargo's order, then the ones whose last run
+/// failed, then the rest, each of those groups longest predicted first. NEGATIVE CONTROL: the
+/// same binary passing last time sits by its length among the rest.
 #[test]
-fn running_charges_never_exceed_the_share() {
-    let specs: Vec<String> = (0..12).map(|i| format!("b{i}")).collect();
-    let refs: Vec<&str> = specs.iter().map(String::as_str).collect();
-    let mut plan = plan(&refs, &BTreeMap::new(), 6, 6);
-    plan.order = (0..12).collect();
-    for i in 0..12 {
-        plan.width[i] = [4, 4, 2, 2, 1, 1][i % 6];
-        plan.charge[i] = plan.width[i];
-    }
-    let held = AtomicU32::new(0);
-    let peak = AtomicU32::new(0);
-    let started = AtomicU32::new(0);
-    let answers = dispatch(&plan, 6, |i, width| {
-        assert_eq!(width, plan.width[i]);
-        started.fetch_add(1, Ordering::SeqCst);
-        let now = held.fetch_add(plan.charge[i], Ordering::SeqCst) + plan.charge[i];
-        peak.fetch_max(now, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(5));
-        held.fetch_sub(plan.charge[i], Ordering::SeqCst);
-        i
-    });
-    assert!(peak.load(Ordering::SeqCst) <= 6, "{peak:?}");
-    assert_eq!(answers, (0..12).map(Some).collect::<Vec<_>>());
+fn unseen_binaries_start_first_then_the_failed_then_the_longest() {
+    let short = seen(2.0, 2.0, 1, 1);
+    let long = seen(30.0, 30.0, 1, 1);
+    let failed = Seen {
+        failed: true,
+        ..seen(5.0, 5.0, 1, 1)
+    };
+    let order = |p: &Plan| -> Vec<usize> { p.order.iter().map(|b| b.index).collect::<Vec<_>>() };
+    let plan_of = |third: Seen| {
+        plan(
+            &[Some(short), None, Some(long), Some(third), None],
+            8,
+            None,
+            GIB,
+        )
+    };
+    assert_eq!(order(&plan_of(failed)), [1, 4, 3, 2, 0]);
     assert_eq!(
-        started.load(Ordering::SeqCst),
-        12,
-        "each binary started once"
+        order(&plan_of(Seen {
+            failed: false,
+            ..failed
+        })),
+        [1, 4, 2, 3, 0]
     );
-
-    let held = AtomicU32::new(0);
-    let peak = AtomicU32::new(0);
-    let all_started = std::sync::Barrier::new(6);
-    let next = AtomicU32::new(0);
-    std::thread::scope(|scope| {
-        for _ in 0..6 {
-            scope.spawn(|| {
-                let mut first = true;
-                while let Some(&i) = plan.order.get(next.fetch_add(1, Ordering::SeqCst) as usize) {
-                    let now = held.fetch_add(plan.charge[i], Ordering::SeqCst) + plan.charge[i];
-                    peak.fetch_max(now, Ordering::SeqCst);
-                    if std::mem::take(&mut first) {
-                        all_started.wait();
-                    }
-                    held.fetch_sub(plan.charge[i], Ordering::SeqCst);
-                }
-            });
-        }
-    });
-    // The first six charges (14 cores) are all held at the barrier.
-    assert!(peak.load(Ordering::SeqCst) >= 14, "the control overloads");
-}
-
-/// Binaries whose charges fit together run together: two charges of three in a share of six
-/// each wait for the other to start (a one-minute hang detector), so a dispatcher that ran them
-/// one at a time would hang here.
-#[test]
-fn charges_that_fit_run_together() {
-    let mut plan = plan(&["a", "b"], &BTreeMap::new(), 6, 6);
-    plan.charge = vec![3, 3];
-    let started = (Mutex::new(0_u32), Condvar::new());
-    let met = dispatch(&plan, 6, |_, _| {
-        let mut n = started.0.lock().unwrap();
-        *n += 1;
-        started.1.notify_all();
-        let (n, waited) = started
-            .1
-            .wait_timeout_while(n, aterm_spec::wait::MUST_HAPPEN, |n| *n < 2)
-            .unwrap();
-        *n == 2 && !waited.timed_out()
-    });
-    assert_eq!(met, [Some(true), Some(true)]);
-}
-
-/// A charge as wide as the share runs alone, and a run of one-core binaries fills the share.
-#[test]
-fn a_full_share_charge_runs_alone_and_narrow_ones_fill_the_share() {
-    let specs = ["wide", "n1", "n2", "n3", "n4"];
-    let mut plan = plan(&specs, &BTreeMap::new(), 4, 4);
-    plan.order = vec![0, 1, 2, 3, 4];
-    plan.charge = vec![4, 1, 1, 1, 1];
-    let held = AtomicU32::new(0);
-    let wide_alone = std::sync::atomic::AtomicBool::new(true);
-    let peak_narrow = AtomicU32::new(0);
-    dispatch(&plan, 4, |i, _| {
-        let now = held.fetch_add(plan.charge[i], Ordering::SeqCst) + plan.charge[i];
-        if i == 0 && now != 4 {
-            wide_alone.store(false, Ordering::SeqCst);
-        }
-        if i > 0 {
-            peak_narrow.fetch_max(now, Ordering::SeqCst);
-        }
-        std::thread::sleep(Duration::from_millis(5));
-        held.fetch_sub(plan.charge[i], Ordering::SeqCst);
-    });
-    assert!(wide_alone.load(Ordering::SeqCst));
-    assert!(peak_narrow.load(Ordering::SeqCst) <= 4);
-}
-
-/// THE WIDTHS: the short binaries drop to one thread, each charged one core, and the plan is
-/// the one whose schedule ends soonest: the pole takes the whole share and the shorts then run
-/// together (14 s), not the pole at the least width within `T*` = 12.5 s with the shorts queued
-/// one at a time in the core it leaves (15.4 s). NEGATIVE CONTROL: the rule `e77a54f4d9` left
-/// gives every binary the whole share, so one runs at a time; and the `T*`-bound plan, the
-/// first candidate, predicts the longer schedule it was passed over for.
-#[test]
-fn short_binaries_run_narrow_and_the_plan_is_the_shortest_schedule() {
-    let mut rows = vec![("pole", seen(8, 10.0, 80.0))];
-    let shorts: Vec<String> = (0..5).map(|i| format!("short{i}")).collect();
-    for s in &shorts {
-        let mut short = seen(8, 1.0, 4.0);
-        short.tests = Some(4);
-        rows.push((s.as_str(), short));
-    }
-    let specs: Vec<&str> = rows.iter().map(|(k, _)| *k).collect();
-    let h = history(&rows);
-    let p = plan(&specs, &h, 8, 8);
-    let target = p.target_s.expect("history gives a target");
-    assert!((target - 14.0).abs() < 1e-9, "{target}");
-    assert_eq!(p.width[0], 8, "{p:?}");
-    assert_eq!(&p.width[1..], [1; 5], "{p:?}");
-    assert_eq!(&p.charge[1..], [1; 5], "{p:?}");
-    assert_eq!(p.order[0], 0, "longest predicted first");
-    assert_ne!(
-        p.width[1..],
-        [4; 5],
-        "the control's whole-share widths are gone"
-    );
-    let seen: Vec<Option<&Seen>> = specs.iter().map(|s| h.get(*s)).collect();
-    let bound = super::plan_within(&seen, 8, 8, Some(100.0 / 8.0));
-    assert_eq!(bound.width[0], 7, "{bound:?}");
-    let longer = bound.makespan();
-    assert!((longer - (80.0 / 7.0 + 4.0)).abs() < 1e-9, "{longer}");
-}
-
-/// A binary seen only at width 1 is not pinned there: its tests are a queue, so four threads
-/// drain it in a quarter of the time. NEGATIVE CONTROL: the shortest wall it has taken (100 s at
-/// width 1) is no floor, and taken as one it would hold the binary at 100 s at every width.
-#[test]
-fn a_binary_seen_narrow_is_predicted_to_drain_its_tests_wider() {
-    let mut narrow = seen(1, 100.0, 100.0);
-    narrow.tests = Some(100);
-    narrow.floor_s = 0.0;
+    let unseen = plan_of(failed);
     assert!(
-        (narrow.predicted(4) - 25.0).abs() < 1e-9,
-        "{}",
-        narrow.predicted(4)
+        unseen.order[..2]
+            .iter()
+            .all(|b| (b.width, b.charge, b.peak, b.predicted)
+                == (UNSEEN_WIDTH, UNSEEN_WIDTH, GIB, None)),
+        "a binary with no history is planned as heavy as the heaviest kept: {unseen:?}"
     );
-    let p = plan(&["narrow"], &history(&[("narrow", narrow.clone())]), 4, 4);
-    assert_eq!((p.width[0], p.charge[0]), (4, 4), "{p:?}");
-    let pinned = Seen {
-        floor_s: 100.0,
-        ..narrow
-    };
-    assert_eq!(pinned.predicted(4), 100.0, "the control");
-}
-
-/// A thread that waited holds its core: a binary that used half a core per thread is predicted
-/// to take twice as long per thread when narrowed, and the target counts the cores its threads
-/// held, not only the CPU they burned. NEGATIVE CONTROL: the CPU alone (400 core-seconds over a
-/// share of 4) would set a target of 100 s that the two cannot meet side by side.
-#[test]
-fn a_binary_whose_threads_wait_holds_its_width_of_the_share() {
-    let waits = seen(4, 100.0, 200.0);
-    assert!((waits.rate(1) - 0.5).abs() < 1e-9, "{}", waits.rate(1));
-    assert!((waits.predicted(1) - 400.0).abs() < 1e-9);
-    assert!((waits.held_s() - 400.0).abs() < 1e-9);
-    let rows = [("a", waits.clone()), ("b", waits)];
-    let p = plan(&["a", "b"], &history(&rows), 4, 4);
-    let target = p.target_s.expect("a target");
-    assert!((target - 200.0).abs() < 1e-9, "{target}");
-    assert_ne!(target, 400.0 / 4.0, "the control's CPU-only target");
-    assert_eq!((p.width, p.charge), (vec![2, 2], vec![2, 2]));
-}
-
-/// A binary whose tests start busy children is charged the cores they used, not its width, and
-/// one with a single test runs one thread.
-#[test]
-fn charges_follow_descendants_and_widths_follow_test_counts() {
-    let mut spawner = seen(1, 10.0, 40.0);
-    spawner.tests = Some(3);
-    let mut single = seen(8, 2.0, 2.0);
-    single.tests = Some(1);
-    let rows = [("spawner", spawner), ("single", single)];
-    let p = plan(&["spawner", "single"], &history(&rows), 8, 8);
-    assert_eq!((p.width[0], p.charge[0]), (1, 4), "{p:?}");
-    assert_eq!((p.width[1], p.charge[1]), (1, 1), "{p:?}");
-    let mut capped = seen(1, 10.0, 400.0);
-    capped.tests = Some(1);
-    let p = plan(&["capped"], &history(&[("capped", capped)]), 8, 8);
-    assert_eq!(p.charge[0], 8, "a charge never passes the share");
-}
-
-/// THE ORDER: binaries with no history first at [`NEW_WIDTH`] (within the cap), then the ones
-/// that failed last time, then the rest longest predicted first; ties keep cargo's order.
-#[test]
-fn new_then_failed_then_longest_first() {
-    let mut failed = seen(2, 1.0, 2.0);
-    failed.failed = true;
-    let rows = [
-        ("short", seen(2, 1.0, 2.0)),
-        ("failed", failed),
-        ("long", seen(2, 30.0, 60.0)),
-    ];
-    let specs = ["short", "failed", "fresh", "long", "fresh2"];
-    let p = plan(&specs, &history(&rows), 8, 8);
-    assert_eq!(p.order, [2, 4, 1, 3, 0], "{p:?}");
-    assert_eq!((p.width[2], p.charge[2]), (NEW_WIDTH, NEW_WIDTH));
-    assert_eq!(p.class[1], Class::FailedLast);
-    let narrow = plan(&["fresh"], &BTreeMap::new(), 8, 3);
-    assert_eq!(narrow.width, [3], "the cap bounds a new binary's width");
-    assert_eq!(narrow.target_s, None);
-    let tiny = plan(&["fresh"], &BTreeMap::new(), 2, 8);
     assert_eq!(
-        (tiny.width[0], tiny.charge[0]),
-        (2, 2),
-        "and the share does"
+        plan(&[None], 2, None, 0).order[0].width,
+        2,
+        "never wider than the share"
+    );
+    assert_eq!(
+        plan(&[None], 8, Some(3), 0).order[0].width,
+        3,
+        "nor than the ceiling"
     );
 }
 
-/// A history row reads as its newest sample (its width, wall, CPU, test count and verdict), with
-/// the shortest wall of the samples that ran every test at once as its floor; a sample whose
-/// CPU was unread stands at its wall times its width. NEGATIVE CONTROL: the shortest wall of all
-/// its samples (a queue drained at width 3) is not the floor.
+/// THE WIDTHS: each binary runs at the narrowest width whose predicted wall is within the plan's
+/// target, and the target is the one, of the work's bound and the walls above it, whose schedule
+/// ends first. On four cores, a binary that takes 40 s on four threads and two that take 60 s on
+/// one: the bound is their 280 thread-seconds over four cores, 70 s, and the planner's target,
+/// 80 s, runs the first two threads wide beside the other two, all ending at 80 s. NEGATIVE
+/// CONTROLS: the target at the bound itself widens the first to three threads, which wait for the
+/// other two and end at 113 s; and target 15 s packs all three four wide and predicts 70 s, but
+/// is deliberately below the measured regularization floor. The two-binary control makes the
+/// strict-head fragmentation explicit: its below-bound plan predicts 1.5 s against the searched
+/// plans' 2 s, but the planner still excludes it because the measured every-wall search regressed
+/// real wall time.
 #[test]
-fn a_row_reads_as_its_newest_sample_and_its_all_at_once_floor() {
-    use crate::test_history::{Row, Sample};
-    let sample = |width: u32, wall_ms: u64, cpu_ms: Option<u64>, outcome: &str| Sample {
-        at_ms: 1,
-        outcome: outcome.into(),
-        wall_ms,
-        cpu_ms,
-        starved_ms: None,
-        peak_bytes: None,
-        width,
-        tests: Some(12),
+fn the_widths_are_those_whose_schedule_ends_first_from_the_bound_up() {
+    let wide = seen(40.0, 160.0, 4, 100);
+    let narrow = seen(60.0, 60.0, 1, 100);
+    let all = [Some(wide), Some(narrow), Some(narrow)];
+    let known: Vec<(usize, Seen)> = all
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| Some((i, (*s)?)))
+        .collect();
+    assert_eq!(bound(&known, 4, 4), secs(70.0));
+    let p = plan(&all, 4, None, 0);
+    assert_eq!(p.target, secs(80.0), "{p:?}");
+    assert_eq!(
+        (at(&p, 0).width, at(&p, 0).charge, at(&p, 0).predicted),
+        (2, 2, Some(secs(80.0))),
+        "{p:?}"
+    );
+    for i in 1..3 {
+        assert_eq!((at(&p, i).width, at(&p, i).charge), (1, 1), "{p:?}");
+    }
+    assert_eq!(schedule(&p).end, secs(80.0), "{p:?}");
+    let at_bound = Plan {
+        share: 4,
+        target: secs(70.0),
+        order: at_target(&known, secs(70.0), 4, 4),
     };
-    let row = Row {
-        test: "-p x --lib".into(),
-        samples: vec![
-            sample(3, 1000, Some(2000), "ok"),
-            sample(12, 2500, Some(9000), "ok"),
-            sample(12, 1500, Some(9000), "ok"),
-            sample(3, 6000, Some(12000), "FAIL"),
+    assert_eq!(at(&at_bound, 0).width, 3, "{at_bound:?}");
+    assert_eq!(
+        schedule(&at_bound).end,
+        secs(60.0) + wide.wall_at(3),
+        "{at_bound:?}"
+    );
+    let packed = Plan {
+        share: 4,
+        target: secs(15.0),
+        order: at_target(&known, secs(15.0), 4, 4),
+    };
+    assert!(packed.order.iter().all(|b| b.width == 4), "{packed:?}");
+    assert_eq!(schedule(&packed).end, secs(70.0), "{packed:?}");
+
+    let pair = [Some(seen(1.0, 1.0, 1, 2)), Some(seen(2.0, 2.0, 1, 2))];
+    let pair_known: Vec<(usize, Seen)> = pair
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| Some((i, (*s)?)))
+        .collect();
+    let pair_floor = bound(&pair_known, 2, 2);
+    assert_eq!(pair_floor, secs(1.5));
+    let below = Plan {
+        share: 2,
+        target: secs(0.5),
+        order: at_target(&pair_known, secs(0.5), 2, 2),
+    };
+    assert!(below.order.iter().all(|b| b.width == 2), "{below:?}");
+    assert_eq!(schedule(&below).end, pair_floor, "{below:?}");
+    let regularized = plan(&pair, 2, None, 0);
+    assert_eq!(regularized.target, secs(2.0), "{regularized:?}");
+    assert_eq!(schedule(&regularized).end, secs(2.0), "{regularized:?}");
+}
+
+/// THE TIES: of the plans that end together, the narrowest. On eight cores, a binary busy on all
+/// eight for 80 s and four that each compute 80 s, 10 s at eight wide: their bound is 960
+/// thread-seconds over eight cores, 120 s, and targets of 120 s, 128 s and 160 s all end at
+/// 160 s, so the busy binary runs at the last one's four threads beside the four on one each.
+/// NEGATIVE CONTROL: the target at the bound runs it six wide.
+#[test]
+fn of_plans_that_end_together_the_narrowest() {
+    let busy = seen(80.0, 640.0, 8, 100);
+    let quick = seen(10.0, 80.0, 8, 100);
+    let all = [
+        Some(busy),
+        Some(quick),
+        Some(quick),
+        Some(quick),
+        Some(quick),
+    ];
+    let p = plan(&all, 8, None, 0);
+    assert_eq!(p.target, secs(160.0), "{p:?}");
+    assert_eq!(schedule(&p).end, secs(160.0), "{p:?}");
+    assert_eq!((at(&p, 0).width, at(&p, 0).charge), (4, 4), "{p:?}");
+    for i in 1..5 {
+        assert_eq!(
+            (at(&p, i).width, at(&p, i).charge, at(&p, i).predicted),
+            (1, 1, Some(secs(80.0))),
+            "{p:?}"
+        );
+    }
+    let known: Vec<(usize, Seen)> = all
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| Some((i, (*s)?)))
+        .collect();
+    let at_bound = Plan {
+        share: 8,
+        target: secs(120.0),
+        order: at_target(&known, secs(120.0), 8, 8),
+    };
+    assert_eq!(at(&at_bound, 0).width, 6, "{at_bound:?}");
+    assert_eq!(schedule(&at_bound).end, secs(160.0), "{at_bound:?}");
+}
+
+/// THE WALL: the threads, not the CPU, scale a wall. A binary that waits on all eight threads
+/// for 10 s and computes on almost none takes 80 s on one thread, as long as one that computed
+/// on all eight; a binary of two tests is no faster on more than two threads, and none runs
+/// wider than the ceiling. NEGATIVE CONTROL: the two binaries' CPU differ eightfold and their
+/// walls on one thread do not.
+#[test]
+fn a_binarys_threads_scale_its_wall() {
+    let waits = seen(10.0, 10.0, 8, 100);
+    let computes = seen(10.0, 80.0, 8, 100);
+    assert_eq!(waits.wall_at(1), secs(80.0));
+    assert_eq!(waits.wall_at(1), computes.wall_at(1));
+    assert_eq!(waits.wall_at(8), secs(10.0));
+    let few = seen(9.0, 18.0, 8, 2);
+    assert_eq!(few.wall_at(8), few.wall_at(2), "two tests use two threads");
+    assert_eq!(
+        plan(&[Some(few)], 8, None, 0).order[0].width,
+        2,
+        "no wider than its tests"
+    );
+    let busy = seen(80.0, 640.0, 8, 100);
+    let narrowed = plan(&[Some(busy), Some(waits)], 8, Some(4), 0);
+    assert_eq!(
+        (at(&narrowed, 0).width, schedule(&narrowed).end),
+        (4, secs(160.0)),
+        "the busy binary at the ceiling's four threads: {narrowed:?}"
+    );
+}
+
+/// THE CHARGE: a binary is charged its width, or the cores it used, whichever is more, up to the
+/// share: tests that spawn processes use more than their threads. NEGATIVE CONTROL: the same
+/// binary using one core per thread is charged its width.
+#[test]
+fn a_binary_that_used_more_than_its_threads_is_charged_what_it_used() {
+    let spawns = Seen {
+        per_thread: 2.5,
+        ..seen(10.0, 100.0, 4, 50)
+    };
+    assert_eq!(spawns.charge_at(4, 16), 10);
+    assert_eq!(spawns.charge_at(4, 8), 8, "never more than the share");
+    assert_eq!(
+        Seen {
+            per_thread: 1.0,
+            ..spawns
+        }
+        .charge_at(4, 16),
+        4
+    );
+}
+
+/// THE WIDEST: a binary whose tests each use more than their thread (processes, a pool of their
+/// own) runs no wider than the width at which what it uses fits the share, however long that
+/// takes; one that uses more than the share on one thread runs one wide, charged the share.
+/// NEGATIVE CONTROL: the same binary using one core per thread runs at the whole share.
+#[test]
+fn a_binary_that_uses_more_than_its_threads_runs_no_wider_than_the_share_holds() {
+    // 11.1 cores at six threads: 1.85 per thread, so 5.55 at three and 7.4 at four.
+    let pools = seen(100.0, 1110.0, 6, 50);
+    let planned = at(&plan(&[Some(pools)], 6, None, 0), 0);
+    assert_eq!((planned.width, planned.charge), (3, 6), "{planned:?}");
+    assert_eq!(planned.predicted, Some(secs(200.0)));
+    let threads = seen(100.0, 600.0, 6, 50);
+    let planned = at(&plan(&[Some(threads)], 6, None, 0), 0);
+    assert_eq!((planned.width, planned.charge), (6, 6), "{planned:?}");
+    let lanes = Seen {
+        per_thread: 14.0,
+        ..pools
+    };
+    let planned = at(&plan(&[Some(lanes)], 6, None, 0), 0);
+    assert_eq!((planned.width, planned.charge), (1, 6), "{planned:?}");
+}
+
+/// THE DISPATCHER: the head starts only while its charge fits in what the running binaries leave
+/// of the share and its peak in what they leave of the memory, and, beside a running binary, only
+/// while the live rate and its charge stay within the share and one core; an ending binary gives
+/// both back once; a halt starts nothing more. NEGATIVE CONTROLS: a second finish of one binary is
+/// refused, and the third binary, which fits, waits behind the head, which does not.
+#[test]
+fn the_dispatcher_starts_the_head_only_while_its_charge_fits() {
+    let p = Plan {
+        share: 8,
+        target: secs(10.0),
+        order: vec![
+            planned(0, 4, 2 * GIB, 10.0),
+            planned(1, 4, 2 * GIB, 10.0),
+            planned(2, 6, GIB, 5.0),
+            planned(3, 1, GIB, 1.0),
         ],
     };
-    let seen = Seen::of(&row).expect("a sample");
+    let mut d = Dispatcher::new(&p, Some(5 * GIB));
+    assert_eq!(d.next(0.0).map(|b| b.index), Some(0));
+    assert_eq!(d.next(0.0).map(|b| b.index), Some(1));
+    assert_eq!((d.held(), d.held_bytes()), (8, 4 * GIB));
+    assert_eq!(d.next(0.0), None, "6 cores do not fit in none");
+    assert_eq!(d.finish(0), Ok(()));
+    assert_eq!(d.finish(0), Err("that binary is not running"));
+    assert_eq!(d.held(), 4);
     assert_eq!(
-        (seen.width, seen.wall_s, seen.cpu_s, seen.tests, seen.failed),
-        (3, 6.0, 12.0, Some(12), true)
+        d.next(0.0),
+        None,
+        "6 cores do not fit in 4, and 3 waits behind"
     );
-    assert_eq!(seen.floor_s, 1.5, "the shortest all-at-once wall");
-    assert_ne!(seen.floor_s, 1.0, "the control: a width-3 queue's wall");
-    let unread = Row {
-        test: "-p y --lib".into(),
-        samples: vec![sample(3, 2000, None, "ok")],
-    };
-    let unread = Seen::of(&unread).expect("a sample");
-    assert_eq!((unread.cpu_s, unread.floor_s), (6.0, 0.0));
-    let empty = Row {
-        test: "-p z --lib".into(),
-        samples: Vec::new(),
-    };
-    assert_eq!(Seen::of(&empty), None);
-}
-
-/// A binary whose callback panics returns its charge: the binary queued behind it, which needs
-/// the whole share, still runs, and the panic is the dispatcher's once it has. NEGATIVE CONTROL:
-/// were the charge kept, the second binary would wait for it forever, which the one-minute hang
-/// detector here reports.
-#[test]
-fn a_panicking_binary_returns_its_charge() {
-    let mut plan = plan(&["boom", "after"], &BTreeMap::new(), 2, 2);
-    plan.order = vec![0, 1];
-    plan.charge = vec![2, 2];
-    let (said, heard) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let ran_after = std::sync::atomic::AtomicBool::new(false);
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            dispatch(&plan, 2, |i, _| {
-                assert!(i != 0, "the first binary's callback panics");
-                ran_after.store(true, Ordering::SeqCst);
-            })
-        }));
-        said.send((outcome.is_err(), ran_after.load(Ordering::SeqCst)))
-            .ok();
-    });
-    let (panicked, ran_after) = heard
-        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-        .expect("the queued binary was never started: the panicking one kept its charge");
-    assert!(panicked, "the panic is the dispatcher's");
-    assert!(ran_after, "the queued binary still ran");
-}
-
-/// THE BACKSTOP: while the binaries running use the whole share, as their meter reads it, no
-/// other starts beside them though its charge fits; once nothing runs, the next starts whatever
-/// the rate says. NEGATIVE CONTROL: with the rate low, the same two binaries meet each other
-/// (a one-minute hang detector), so the rate alone held them apart.
-#[test]
-fn a_hot_live_rate_holds_back_a_start_its_charge_allows() {
-    let mut plan = plan(&["a", "b", "c"], &BTreeMap::new(), 6, 6);
-    plan.order = vec![0, 1, 2];
-    plan.charge = vec![1, 1, 1];
-    let running = AtomicU32::new(0);
-    let peak = AtomicU32::new(0);
-    let hot = || Some(6.5);
-    dispatch_with(&plan, 3, &|_| {}, &hot, |_, _| {
-        let now = running.fetch_add(1, Ordering::SeqCst) + 1;
-        peak.fetch_max(now, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(5));
-        running.fetch_sub(1, Ordering::SeqCst);
-    });
+    assert_eq!(d.finish(1), Ok(()));
+    assert_eq!(d.next(0.0).map(|b| b.index), Some(2));
     assert_eq!(
-        peak.load(Ordering::SeqCst),
-        1,
-        "one at a time while the share is hot"
+        d.next(8.5),
+        None,
+        "8.5 live cores and 1 more pass 8 and one"
     );
-
-    let mut two = plan.clone();
-    two.order = vec![0, 1];
-    two.width.truncate(2);
-    two.charge.truncate(2);
-    let cool = || Some(1.0);
-    let started = (Mutex::new(0_u32), Condvar::new());
-    let met = dispatch_with(&two, 2, &|_| {}, &cool, |_, _| {
-        let mut n = started.0.lock().unwrap();
-        *n += 1;
-        started.1.notify_all();
-        let (n, waited) = started
-            .1
-            .wait_timeout_while(n, aterm_spec::wait::MUST_HAPPEN, |n| *n < 2)
-            .unwrap();
-        *n == 2 && !waited.timed_out()
-    });
-    assert_eq!(met, [Some(true), Some(true)]);
+    assert_eq!(d.next(8.0).map(|b| b.index), Some(3));
+    assert!(!d.waiting());
+    assert_eq!(d.phase(3), Some(Phase::Running));
+    let mut halted = Dispatcher::new(&p, None);
+    halted.halt();
+    assert_eq!(halted.next(0.0), None);
+    assert!(!halted.waiting());
+    let mut alone = Dispatcher::new(&p, Some(GIB));
+    assert_eq!(alone.memory(), Some(2 * GIB), "raised to the largest peak");
+    assert_eq!(
+        alone.next(100.0).map(|b| b.index),
+        Some(0),
+        "nothing running: the head starts whatever the live rate"
+    );
+    assert_eq!(
+        alone.next(0.0),
+        None,
+        "its peak leaves no room for the next"
+    );
 }
 
 /// THE METER'S RATE: a group's rate is the CPU its members gained between two reads over the time
@@ -392,4 +363,36 @@ fn the_meter_reads_the_cores_its_live_groups_use() {
     );
     meter.ended(7);
     assert_eq!(meter.live_rate(), Some(1.0));
+}
+
+/// THE CLAIM: the most memory the schedule holds at once, not every binary's at once. The 10 GiB
+/// binary takes the whole share and runs alone; the two 3 GiB ones run together after it. A
+/// binary with no history holds what the plan gave it, the heaviest kept. NEGATIVE CONTROL: on a
+/// share that fits them all at once, their sum.
+#[test]
+fn the_memory_claim_is_the_schedules_own_concurrent_peak() {
+    let p = |share: u32| Plan {
+        share,
+        target: secs(10.0),
+        order: vec![
+            planned(0, 4, 10 * GIB, 10.0),
+            planned(1, 2, 3 * GIB, 5.0),
+            planned(2, 2, 3 * GIB, 5.0),
+        ],
+    };
+    assert_eq!(
+        schedule(&p(4)),
+        Schedule {
+            end: secs(15.0),
+            peak: 10 * GIB
+        }
+    );
+    assert_eq!(schedule(&p(8)).peak, 16 * GIB);
+    assert_eq!(
+        schedule(&plan(&[None, None], 4, None, GIB)).peak,
+        GIB,
+        "two unseen binaries four wide take turns on four cores"
+    );
+    assert_eq!(schedule(&plan(&[None, None], 8, None, GIB)).peak, 2 * GIB);
+    assert_eq!(schedule(&plan(&[None, None], 8, None, 0)).peak, 0);
 }

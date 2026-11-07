@@ -268,6 +268,9 @@ impl Record {
         if self.need.covers {
             o.insert("covers".to_owned(), Value::from(true));
         }
+        if self.need.scratch {
+            o.insert("scratch".to_owned(), Value::from(true));
+        }
         if let Some(p) = self.need.patience {
             let mut q = Map::new();
             q.insert("reserve_ms".to_owned(), Value::from(millis(p.reserve)));
@@ -425,6 +428,7 @@ impl Record {
             checkout: None,
             alone: head.get("alone").and_then(Value::as_bool) == Some(true),
             covers: head.get("covers").and_then(Value::as_bool) == Some(true),
+            scratch: head.get("scratch").and_then(Value::as_bool) == Some(true),
             stuck_ends: None,
             at_bound: crate::AtBound::Refuse,
         };
@@ -1209,6 +1213,29 @@ impl Ledger {
     /// The directory could not be listed (never `NotFound`, which is no claims), or a claim file could not be tested.
     pub fn list(&self) -> io::Result<Vec<Record>> {
         self.scan(false)
+    }
+
+    /// Read every funded original cohort scope through its validated immutable
+    /// checkpoint and complete custody journal. Unarmed, pending and unknown
+    /// execution scope never becomes evidence of absence. This does not reap,
+    /// adopt, grant or release custody. Legacy ledgers are unsupported.
+    /// # Errors
+    /// The account selector, namespace, checkpoint or bounded journal fails.
+    #[cfg(unix)]
+    pub fn funded_scopes(
+        &self,
+        deadline: std::time::Instant,
+    ) -> io::Result<Vec<crate::FundedScope>> {
+        self.check_mode()?;
+        if let Mode::Cohort(namespace) = &self.mode {
+            let scopes = cohort_ledger::funded_scopes(namespace, deadline)?;
+            self.check_mode()?;
+            return Ok(scopes);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "funded scopes require a cohort ledger",
+        ))
     }
 
     /// Every live claim of the process `pid`, oldest first, read as [`Self::list`] reads them: only

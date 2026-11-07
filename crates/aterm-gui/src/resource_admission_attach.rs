@@ -21,7 +21,48 @@ pub(crate) fn attach(
     authorize: impl FnOnce(&Submission, Peer) -> bool,
     submit: impl FnOnce(AuthorizedSubmission) -> io::Result<()>,
 ) -> io::Result<()> {
-    let authorized = transport::receive(stream, owner_authenticated, deadline, authorize)?;
+    attach_mode(
+        stream,
+        owner_authenticated,
+        deadline,
+        authorize,
+        submit,
+        false,
+    )
+}
+pub(crate) fn attach_accounted(
+    stream: &CtlStream,
+    owner_authenticated: bool,
+    deadline: Instant,
+    authorize: impl FnOnce(&Submission, Peer) -> bool,
+    submit: impl FnOnce(AuthorizedSubmission) -> io::Result<()>,
+) -> io::Result<()> {
+    attach_mode(
+        stream,
+        owner_authenticated,
+        deadline,
+        authorize,
+        submit,
+        true,
+    )
+}
+fn attach_mode(
+    stream: &CtlStream,
+    owner_authenticated: bool,
+    deadline: Instant,
+    authorize: impl FnOnce(&Submission, Peer) -> bool,
+    submit: impl FnOnce(AuthorizedSubmission) -> io::Result<()>,
+    accounted: bool,
+) -> io::Result<()> {
+    let authorized = if accounted {
+        transport::receive_accounted(stream, owner_authenticated, deadline, authorize)
+    } else {
+        transport::receive(stream, owner_authenticated, deadline, authorize)
+    }?;
     submit(authorized)?;
-    transport::acknowledge(stream, deadline)
+    if accounted {
+        transport::acknowledge_accounted(stream, deadline)
+    } else {
+        transport::acknowledge(stream, deadline)
+    }
 }

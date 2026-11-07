@@ -600,50 +600,60 @@ fn cpu_bloom_twin_matches_the_gpu_bloom() {
             0,
         ),
     ];
-    let params = aterm_render::bloom::BloomParams::default();
-    gpu.set_bloom(true);
-    gpu.set_bloom_params(params.strength, params.radius);
-    let lit = gpu.render_input(&mut win, &input, None);
-    gpu.set_bloom(false);
     let base = cpu.render_input(&input);
-    let twin = |strength: f32| {
-        let mut frame = base.clone();
-        aterm_render::bloom::apply(
-            &mut frame,
-            &input.cursor_glow_add,
-            rows,
-            aterm_render::bloom::BloomParams { strength, ..params },
-        )
-        .unwrap();
-        frame
-    };
-    let energy = |frame: &aterm_render::Frame| -> i64 {
-        frame
-            .pixels
-            .iter()
-            .zip(&base.pixels)
-            .map(|(&p, &b)| {
-                [16u32, 8, 0]
-                    .iter()
-                    .map(|&sh| i64::from((p >> sh) & 0xff) - i64::from((b >> sh) & 0xff))
-                    .sum::<i64>()
-            })
-            .sum()
-    };
-    let cpu_lit = twin(params.strength);
-    let worst = max_channel_delta(&cpu_lit.pixels, &lit.pixels);
-    assert!(worst <= 2, "the CPU twin is within float rounding: {worst}");
-    let (gpu_energy, cpu_energy) = (energy(&lit), energy(&cpu_lit));
-    assert!(gpu_energy > 0, "the GPU blooms");
-    assert!(
-        (gpu_energy - cpu_energy).abs() * 100 <= gpu_energy,
-        "the same light in total: {cpu_energy} against {gpu_energy}"
-    );
-    let dim = twin(params.strength / 2.0);
-    assert!(
-        max_channel_delta(&dim.pixels, &lit.pixels) > 2,
-        "negative control: half the strength misses"
-    );
+    // The default radius's 25-tap kernel, and the Bloom size knob's top, past a radius of 6, its
+    // 49-tap one (`bloom::taps_per_side`, which `fs_bloom` in each shader computes alike).
+    for radius in [aterm_render::bloom::BLOOM_RADIUS, 8.0] {
+        let params = aterm_render::bloom::BloomParams {
+            radius,
+            ..Default::default()
+        };
+        gpu.set_bloom(true);
+        gpu.set_bloom_params(params.strength, params.radius);
+        let lit = gpu.render_input(&mut win, &input, None);
+        gpu.set_bloom(false);
+        let twin = |strength: f32| {
+            let mut frame = base.clone();
+            aterm_render::bloom::apply(
+                &mut frame,
+                &input.cursor_glow_add,
+                rows,
+                aterm_render::bloom::BloomParams { strength, ..params },
+            )
+            .unwrap();
+            frame
+        };
+        let energy = |frame: &aterm_render::Frame| -> i64 {
+            frame
+                .pixels
+                .iter()
+                .zip(&base.pixels)
+                .map(|(&p, &b)| {
+                    [16u32, 8, 0]
+                        .iter()
+                        .map(|&sh| i64::from((p >> sh) & 0xff) - i64::from((b >> sh) & 0xff))
+                        .sum::<i64>()
+                })
+                .sum()
+        };
+        let cpu_lit = twin(params.strength);
+        let worst = max_channel_delta(&cpu_lit.pixels, &lit.pixels);
+        assert!(
+            worst <= 2,
+            "radius {radius}: the CPU twin is within float rounding: {worst}"
+        );
+        let (gpu_energy, cpu_energy) = (energy(&lit), energy(&cpu_lit));
+        assert!(gpu_energy > 0, "the GPU blooms");
+        assert!(
+            (gpu_energy - cpu_energy).abs() * 100 <= gpu_energy,
+            "radius {radius}: the same light in total: {cpu_energy} against {gpu_energy}"
+        );
+        let dim = twin(params.strength / 2.0);
+        assert!(
+            max_channel_delta(&dim.pixels, &lit.pixels) > 2,
+            "negative control: half the strength misses"
+        );
+    }
 }
 
 /// looks10 L1, composed r2 B1: a frame whose bloom spares its letters

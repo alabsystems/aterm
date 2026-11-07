@@ -4,6 +4,8 @@
 //! Kernel exclusion for supported native Codex source work. An exclusive file
 //! lock alone is not proof of consumer registration or publication authority.
 
+use super::native_custody_platform as platform;
+#[cfg(unix)]
 use aterm_uds::private_file;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -16,6 +18,7 @@ struct Held {
     path: PathBuf,
 }
 
+#[cfg(unix)]
 fn private_directory(path: &Path) -> Result<(), &'static str> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -31,6 +34,7 @@ fn private_directory(path: &Path) -> Result<(), &'static str> {
     private_file::check_private_dir(path).map_err(|_| UNAVAILABLE)
 }
 
+#[cfg(unix)]
 fn opened(home: &Path) -> Result<Held, &'static str> {
     if !home.is_absolute() {
         return Err(UNAVAILABLE);
@@ -43,6 +47,7 @@ fn opened(home: &Path) -> Result<Held, &'static str> {
     open_gate(&directory)
 }
 
+#[cfg(unix)]
 fn open_gate(directory: &Path) -> Result<Held, &'static str> {
     let file = match private_file::open_private_rw(directory, "gate") {
         Ok(file) => file,
@@ -54,7 +59,7 @@ fn open_gate(directory: &Path) -> Result<Held, &'static str> {
                 |_| Ok(()),
             )
             .map_err(|_| UNAVAILABLE)?;
-            private_file::open_private_rw(directory, "gate").map_err(|_| UNAVAILABLE)?
+            platform::open_private_rw(directory, "gate").map_err(|_| UNAVAILABLE)?
         }
         Err(_) => return Err(UNAVAILABLE),
     };
@@ -77,15 +82,20 @@ impl Held {
             return Err(UNAVAILABLE);
         }
         let parent = self.path.parent().ok_or(UNAVAILABLE)?;
-        private_file::check_private_dir(parent).map_err(|_| UNAVAILABLE)?;
-        let checked = private_file::open_private_rw(parent, "gate").map_err(|_| UNAVAILABLE)?;
+        platform::check_private_dir(parent).map_err(|_| UNAVAILABLE)?;
+        let checked = platform::open_private_rw(parent, "gate").map_err(|_| UNAVAILABLE)?;
         if !astream_sys::file_matches_path(&checked, &self.path).map_err(|_| UNAVAILABLE)? {
             return Err(UNAVAILABLE);
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
-            if checked.metadata().map_err(|_| UNAVAILABLE)?.nlink() != 1 {
+            let original = self.file.metadata().map_err(|_| UNAVAILABLE)?;
+            let reopened = checked.metadata().map_err(|_| UNAVAILABLE)?;
+            if (original.dev(), original.ino()) != (reopened.dev(), reopened.ino())
+                || original.nlink() != 1
+                || reopened.nlink() != 1
+            {
                 return Err(UNAVAILABLE);
             }
         }
@@ -127,13 +137,46 @@ impl Held {
     }
 }
 impl SourceGateIdentity {
+    /// Selected real home namespace of this captured gate; metadata only.
+    pub(in crate::harness) fn existing_home(&self) -> Option<PathBuf> {
+        if !self.current() {
+            return None;
+        }
+        self.path
+            .parent()?
+            .parent()?
+            .parent()
+            .map(Path::to_path_buf)
+    }
+
+    /// Compare the existing native namespace without creating a gate or taking
+    /// another lock. This metadata join grants no source or lock authority.
+    pub(super) fn matches_home(&self, home: &Path) -> bool {
+        existing_identity_for_home(home).is_ok_and(|identity| identity == *self)
+    }
+
+    /// Recheck only the actual captured private gate identity. This neither
+    /// creates a namespace nor acquires a source lock or credential authority.
+    pub(super) fn current(&self) -> bool {
+        let existing = || -> Result<SourceGateIdentity, &'static str> {
+            let directory = self.path.parent().ok_or(UNAVAILABLE)?;
+            platform::check_private_dir(directory).map_err(|_| UNAVAILABLE)?;
+            let held = Held {
+                file: platform::open_private_rw(directory, "gate").map_err(|_| UNAVAILABLE)?,
+                path: self.path.clone(),
+            };
+            held.identity()
+        };
+        existing().is_ok_and(|identity| identity == *self)
+    }
+
     fn shared(&self) -> Result<SourceWorkLease, &'static str> {
         let directory = self.path.parent().ok_or(UNAVAILABLE)?;
-        private_file::check_private_dir(directory).map_err(|_| UNAVAILABLE)?;
+        platform::check_private_dir(directory).map_err(|_| UNAVAILABLE)?;
         // An identity is a reference to an existing gate, never permission to
         // recreate a missing/replaced namespace during a read acquisition.
         let held = Held {
-            file: private_file::open_private_rw(directory, "gate").map_err(|_| UNAVAILABLE)?,
+            file: platform::open_private_rw(directory, "gate").map_err(|_| UNAVAILABLE)?,
             path: self.path.clone(),
         };
         if held.identity()? != *self {
@@ -154,6 +197,46 @@ impl SourceGateIdentity {
     }
 }
 
+/// Metadata of an existing native machine-home gate. This owns no lock and
+/// confers no source, credential, constructor, or publication authority.
+pub(super) struct SourceNamespace(SourceGateIdentity);
+impl std::fmt::Debug for SourceNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SourceNamespace(redacted)")
+    }
+}
+impl SourceNamespace {
+    pub(super) fn directory(&self) -> Result<&Path, &'static str> {
+        if !self.0.current() {
+            return Err(UNAVAILABLE);
+        }
+        self.0.path.parent().ok_or(UNAVAILABLE)
+    }
+}
+/// Inspect only an already existing native-home gate. Unlike for_home this
+/// neither creates the namespace nor acquires/reacquires source exclusion.
+pub(super) fn existing_namespace_for_home(home: &Path) -> Result<SourceNamespace, &'static str> {
+    Ok(SourceNamespace(existing_identity_for_home(home)?))
+}
+
+// One metadata-only resolver serves both namespace equality and exchange
+// admission, so private-path and native gate identity rules cannot diverge.
+fn existing_identity_for_home(home: &Path) -> Result<SourceGateIdentity, &'static str> {
+    if !home.is_absolute() {
+        return Err(UNAVAILABLE);
+    }
+    let home = home.canonicalize().map_err(|_| UNAVAILABLE)?;
+    let profile = home.join(".aterm");
+    platform::check_private_dir(&profile).map_err(|_| UNAVAILABLE)?;
+    let directory = profile.join("codex-source-custody");
+    platform::check_private_dir(&directory).map_err(|_| UNAVAILABLE)?;
+    let held = Held {
+        file: platform::open_private_rw(&directory, "gate").map_err(|_| UNAVAILABLE)?,
+        path: directory.join("gate"),
+    };
+    held.identity()
+}
+
 /// Shared native source work. Keep it through child retirement, or transfer its
 /// lifetime to a real source-ready registration; typing a command is not ready.
 pub struct SourceWorkLease(Held);
@@ -165,20 +248,30 @@ impl std::fmt::Debug for SourceWorkLease {
 }
 
 impl SourceWorkLease {
+    pub(super) fn namespace(&self) -> Result<SourceNamespace, &'static str> {
+        Ok(SourceNamespace(self.0.identity()?))
+    }
     /// Acquire without waiting. This is source exclusion, not permission to
     /// execute a program, read credentials, or change a native assignment.
     pub fn for_home(home: &Path) -> Result<Self, &'static str> {
+        Self::try_for_home(home)?.ok_or(BUSY)
+    }
+
+    /// Only kernel contention is retryable. Invalid namespaces and I/O errors
+    /// must not become an indefinite admission wait.
+    pub(crate) fn try_for_home(home: &Path) -> Result<Option<Self>, &'static str> {
         let held = opened(home)?;
         #[expect(
             clippy::disallowed_methods,
             reason = "this source gate owns the kernel shared claim"
         )]
-        held.file.try_lock_shared().map_err(|error| match error {
-            std::fs::TryLockError::WouldBlock => BUSY,
-            std::fs::TryLockError::Error(_) => UNAVAILABLE,
-        })?;
+        match held.file.try_lock_shared() {
+            Ok(()) => (),
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(_)) => return Err(UNAVAILABLE),
+        }
         held.current()?;
-        Ok(Self(held))
+        Ok(Some(Self(held)))
     }
 
     pub fn identity(&self) -> Result<SourceGateIdentity, &'static str> {
@@ -193,35 +286,32 @@ impl SourceWorkLease {
 
 /// Exclusive exclusion only. This deliberately cannot be used as a fresh
 /// activation lease: live registered source and manager proof is still required.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "only tests reach this native custody step until its production caller lands; drop this then"
-    )
-)]
 pub(crate) struct PublicationLock(Held);
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "only tests reach this native custody step until its production caller lands; drop this then"
-    )
-)]
 impl PublicationLock {
+    pub(super) fn namespace(&self) -> Result<SourceNamespace, &'static str> {
+        Ok(SourceNamespace(self.0.identity()?))
+    }
+    #[cfg(test)]
     pub(crate) fn for_home(home: &Path) -> Result<Self, &'static str> {
+        Self::try_for_home(home)?.ok_or(BUSY)
+    }
+
+    /// Only actual kernel contention is retryable; namespace and I/O failures
+    /// remain errors and never become an indefinite admission wait.
+    pub(crate) fn try_for_home(home: &Path) -> Result<Option<Self>, &'static str> {
         let held = opened(home)?;
         #[expect(
             clippy::disallowed_methods,
             reason = "this source gate owns the kernel exclusive claim"
         )]
-        held.file.try_lock().map_err(|error| match error {
-            std::fs::TryLockError::WouldBlock => BUSY,
-            std::fs::TryLockError::Error(_) => UNAVAILABLE,
-        })?;
+        match held.file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(_)) => return Err(UNAVAILABLE),
+        }
         held.current()?;
-        Ok(Self(held))
+        Ok(Some(Self(held)))
     }
 
     pub(crate) fn current(&self) -> Result<(), &'static str> {
@@ -231,9 +321,10 @@ impl PublicationLock {
 
 #[path = "codex_source_gate_family.rs"]
 mod family;
+pub(in crate::harness) use family::ReservationFamilyExclusive;
 pub use family::{FamilyExclusive, FamilySource, FamilyWork, SourceBorrow};
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -255,4 +346,53 @@ mod tests {
             .unwrap();
         assert!(publication.current().is_err());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn namespace_join_checks_existing_gate_and_accepts_canonical_home_alias() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let other = root.path().join("other");
+        let missing = root.path().join("missing-gate");
+        for directory in [&home, &other, &missing] {
+            private_file::create_private_dir(directory).unwrap();
+        }
+        let work = SourceWorkLease::for_home(&home).unwrap();
+        let identity = work.identity().unwrap();
+        assert!(identity.matches_home(&home));
+        assert!(identity.current());
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+        assert!(identity.matches_home(&alias));
+        drop(work);
+        let _publication = PublicationLock::for_home(&home).unwrap();
+        // Namespace validation performs no hidden shared acquisition, even
+        // while this actual gate is exclusively held.
+        assert!(identity.matches_home(&home));
+        assert!(
+            identity.current(),
+            "captured metadata remains valid after READY released its lease; no shared reacquisition under exclusive publication"
+        );
+        // A metadata comparison cannot manufacture a missing namespace.
+        assert!(!identity.matches_home(&missing));
+        assert!(!missing.join(".aterm").exists());
+        let _other = SourceWorkLease::for_home(&other).unwrap();
+        assert!(!identity.matches_home(&other));
+        // Even the same path is insufficient after kernel identity changes.
+        let gate = identity.path.clone();
+        std::fs::rename(&gate, gate.with_extension("old")).unwrap();
+        private_file::write_private_new(gate.parent().unwrap(), "gate", b"replacement", |_| Ok(()))
+            .unwrap();
+        assert!(!identity.matches_home(&home));
+        assert!(!identity.matches_home(&alias));
+        assert!(
+            !identity.current(),
+            "a READY snapshot cannot survive physical gate replacement"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn opened(_: &Path) -> Result<Held, &'static str> {
+    Err("native credential custody is unsupported on this platform")
 }

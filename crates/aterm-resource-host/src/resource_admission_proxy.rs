@@ -50,8 +50,10 @@ impl Owner {
         let Ok(coverage) = job::inspection(&self.fence, &self.debt, job) else {
             return false;
         };
-        translate(request, helper, coverage.memory.bytes)
-            .is_ok_and(|input| member_recipe::command(job, &input).is_ok())
+        translate(request, helper, coverage.memory.bytes).is_ok_and(|input| {
+            member_recipe::command(job, &input, request.timeout_ns.map(Duration::from_nanos))
+                .is_ok()
+        })
     }
     pub(in super::super) fn submit_proxy(
         &mut self,
@@ -62,6 +64,7 @@ impl Owner {
             helper,
             proof,
             rights,
+            accounted,
         } = incoming;
         let producer = proof.producer();
         let peer = Peer {
@@ -90,6 +93,9 @@ impl Owner {
                     attempt: request.member_attempt,
                 },
             ) {
+                if accounted && events.account().is_err() {
+                    return;
+                }
                 let _ = events.emit(aterm_types::resource_admission::Event::Refused {
                     reason: "native producer or original coverage refused before launch".into(),
                 });
@@ -98,6 +104,12 @@ impl Owner {
         };
         let named_targets = match &request.delegations.gnu {
             wire::GnuTransport::NamedFifo { read, write, .. } => Some([read.target, write.target]),
+            _ => None,
+        };
+        let loan = match request.role {
+            wire::Role::MachOLinker(loan) => {
+                Some(parent_loan::Edge::of(loan, request.member_attempt))
+            }
             _ => None,
         };
         self.submit_member_proved(
@@ -116,6 +128,7 @@ impl Owner {
             request.command.arg0,
             request.timeout_ns.map(Duration::from_nanos),
             named_targets,
+            member_queue::ProxyMode { loan, accounted },
         );
     }
 }

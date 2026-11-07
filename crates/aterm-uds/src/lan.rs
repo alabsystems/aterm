@@ -115,6 +115,36 @@ impl std::fmt::Display for Unavailable {
     }
 }
 
+impl std::error::Error for Unavailable {}
+
+impl Unavailable {
+    /// The broker's absence or refusal an [`std::io::Error`] made by [`LanError::into_io`]
+    /// carries, so a caller above the `io` boundary can tell a LAN held for its broker from a
+    /// dial that failed.
+    #[must_use]
+    pub fn of(error: &std::io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref::<Self>()
+    }
+}
+
+/// Whether a LAN dial's `error` says it reached no peer at its address: refused, timed out, no
+/// route, the host down (asleep or gone from the link: `EHOSTDOWN`, which std leaves
+/// uncategorized), or no usable source address. A LAN this process may not use yet is
+/// [`Unavailable::of`], not this.
+#[must_use]
+pub fn reached_no_peer(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionRefused
+            | ErrorKind::TimedOut
+            | ErrorKind::HostUnreachable
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::NetworkDown
+            | ErrorKind::AddrNotAvailable
+    ) || error.raw_os_error() == Some(libc::EHOSTDOWN)
+}
+
 /// Why a LAN act of aterm's did not happen: the broker is not there to ask, or the act failed.
 #[derive(Debug)]
 pub enum LanError {
@@ -128,13 +158,12 @@ pub enum LanError {
 
 impl LanError {
     /// This error as an [`std::io::Error`]: [`LanError::Unavailable`] is `NotConnected`, its
-    /// words naming the broker and what installs it.
+    /// words naming the broker and what installs it, and it carries the [`Unavailable`] itself
+    /// ([`Unavailable::of`]).
     #[must_use]
     pub fn into_io(self) -> std::io::Error {
         match self {
-            Self::Unavailable(why) => {
-                std::io::Error::new(std::io::ErrorKind::NotConnected, why.to_string())
-            }
+            Self::Unavailable(why) => std::io::Error::new(std::io::ErrorKind::NotConnected, why),
             Self::Io(error) => error,
         }
     }

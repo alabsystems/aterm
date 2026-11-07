@@ -35,7 +35,9 @@ mod enrollment_artifact_bridge;
 mod grant_completion;
 use custody::legacy_reader_allowed;
 pub use custody::{OWNER_MARKER_SUFFIX, OWNER_MARKER_TEXT, legacy_file_reader_allowed};
-pub(super) use enrollment_artifact_bridge::reconcile_retained_enrollment;
+pub(super) use enrollment_artifact_bridge::{
+    reconcile_native_recovery, reconcile_retained_enrollment,
+};
 
 #[path = "codex_app_login_rejection.rs"]
 mod code_rejection;
@@ -817,6 +819,40 @@ pub(super) fn materialize_enrollment(
     materialize_enrollment_held(admission, deadline, work, store, signer, &_held)
 }
 
+enum EnrollmentPublicationGuard<'a> {
+    Legacy {
+        store: &'a super::accounts::Store,
+        signer: &'a super::accounts::SigninTurn,
+    },
+    #[cfg(unix)]
+    Native {
+        store: &'a super::accounts::Store,
+        turn: &'a super::native_enrollment_admission::NativeRecoveryTurn,
+        current: &'a super::codex_native_row::CurrentNativeRow<'a>,
+    },
+}
+impl EnrollmentPublicationGuard<'_> {
+    fn check(&self, _admission: &super::codex_enrollment::Staging) -> Result<(), String> {
+        match self {
+            Self::Legacy { store, signer } => signer
+                .check_store(store)
+                .map_err(|_| "enrollment signer changed".into()),
+            #[cfg(unix)]
+            Self::Native {
+                store,
+                turn,
+                current,
+            } => {
+                current.require_recovery(turn.admission())?;
+                if turn.admission().staging() != _admission {
+                    return Err("native recovery admission changed".into());
+                }
+                turn.check_store(store)
+            }
+        }
+    }
+}
+
 fn materialize_enrollment_held(
     admission: &super::codex_enrollment::Staging,
     deadline: WakeDeadline,
@@ -825,11 +861,25 @@ fn materialize_enrollment_held(
     signer: &super::accounts::SigninTurn,
     _held: &AuthLock,
 ) -> Result<String, String> {
+    materialize_enrollment_guarded(
+        admission,
+        deadline,
+        work,
+        &EnrollmentPublicationGuard::Legacy { store, signer },
+        _held,
+    )
+}
+
+fn materialize_enrollment_guarded(
+    admission: &super::codex_enrollment::Staging,
+    deadline: WakeDeadline,
+    work: Option<&super::account_work::Scope>,
+    guard: &EnrollmentPublicationGuard<'_>,
+    _held: &AuthLock,
+) -> Result<String, String> {
     let home = &admission.directory;
     require_private_enrollment_directory(home)?;
-    signer
-        .check_store(store)
-        .map_err(|_| "enrollment signer changed")?;
+    guard.check(admission)?;
     if deadline.passed() || work.is_some_and(super::account_work::Scope::cancelled) {
         return Err("enrollment recovery work expired".into());
     }
@@ -867,9 +917,7 @@ fn materialize_enrollment_held(
         if conflicting_users(&parsed) {
             return Err("conflicting enrollment identity".into());
         }
-        signer
-            .check_store(store)
-            .map_err(|_| "enrollment signer changed")?;
+        guard.check(admission)?;
         let directories_current = admission.directories_current();
         if !directories_current
             || deadline.passed()
@@ -880,9 +928,7 @@ fn materialize_enrollment_held(
         super::upgrade_models::write_atomic(&auth_path_in_home(home), &candidate.0)
             .map_err(|_| "enrollment credential publication failed")?;
     }
-    signer
-        .check_store(store)
-        .map_err(|_| "enrollment signer changed")?;
+    guard.check(admission)?;
     let directories_current = admission.directories_current();
     if !directories_current
         || deadline.passed()
@@ -900,6 +946,33 @@ pub(super) fn enrollment_bytes_current(
 ) -> bool {
     read_auth_file_bounded(&admission.directory)
         .is_some_and(|bytes| credential_digest(bytes.as_bytes()) == digest)
+}
+
+/// Compare the exact retained bytes under their original parent and actual
+/// AuthLock. This read-only check supplies no producer or publication authority.
+pub(super) fn retained_document_current(
+    witness: &StagedWitness,
+    auth: &AuthLock,
+    expected: &[u8],
+) -> bool {
+    let Ok((path, _, _)) = witness.coordinates() else {
+        return false;
+    };
+    let Some(home) = path.parent() else {
+        return false;
+    };
+    let current = || {
+        witness.matches_auth_file(path)
+            && astream_sys::file_matches_path(&auth.0, &lock_path(path)).unwrap_or(false)
+    };
+    if expected.is_empty() || auth_path_in_home(home) != path || !current() {
+        return false;
+    }
+    let matches = read_auth_file_bounded(home).is_some_and(|actual| {
+        let actual = zeroize::Zeroizing::new(actual);
+        aterm_digest::ct_eq(actual.as_bytes(), expected)
+    });
+    matches && current()
 }
 
 pub(super) fn sealed_enrollment_digest(
@@ -2907,7 +2980,10 @@ fn build_authorize_url(
     format!("{base}/oauth/authorize?{query}")
 }
 
-fn bind_callback_listener(ports: &[u16], deadline: WakeDeadline) -> std::io::Result<TcpListener> {
+pub(super) fn bind_callback_listener(
+    ports: &[u16],
+    deadline: WakeDeadline,
+) -> std::io::Result<TcpListener> {
     let mut last_err = std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         "no callback port configured",
@@ -3555,6 +3631,7 @@ pub(super) struct NativeDestination<'a> {
 }
 
 struct CodeExchange<'a> {
+    native_scope: Option<&'a super::native_enrollment_admission::NativeBrowserTurn>,
     enrollment: Option<&'a super::codex_enrollment::Artifact>,
     publication: Option<&'a PublicationCustody>,
     home: &'a Path,
@@ -3636,7 +3713,7 @@ impl CodeExchange<'_> {
         .0
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn persist_capturing<C: CodeGrantCapture>(
         self,
         owner: Option<&str>,
@@ -3660,21 +3737,6 @@ impl CodeExchange<'_> {
         )
     }
 
-    #[cfg(test)]
-    #[expect(
-        dead_code,
-        reason = "nothing calls this native custody step yet, tests included; its production caller lands with the custody RPC: drop this then"
-    )]
-    fn persist_capturing_using<C: CodeGrantCapture>(
-        self,
-        owner: Option<&str>,
-        capture: Option<C>,
-        take_lock: impl FnOnce(&Path, WakeDeadline) -> Option<AuthLock>,
-    ) -> (Option<Option<String>>, Option<C::Output>) {
-        let (result, captured) = self.persist_capturing_inner(owner, capture, take_lock, None);
-        (result.ok(), captured)
-    }
-
     // The admitted enrollment journal and the managed grant carrier are
     // independent custody channels. Publication failure must retain the carrier;
     // carrier existence must never pretend an enrollment journal was sealed.
@@ -3692,6 +3754,7 @@ impl CodeExchange<'_> {
         let mut dispatched = false;
         let result = (|| {
             let Self {
+                native_scope,
                 enrollment,
                 publication,
                 home,
@@ -3711,6 +3774,9 @@ impl CodeExchange<'_> {
                 enrollment.bind_deadline(deadline).ok()?;
             }
             let owner = owner.filter(|owner| !owner.is_empty())?;
+            if let Some(scope) = native_scope {
+                scope.enter_exchange(deadline, work).ok()?;
+            }
             let token_url = &endpoints.token_url;
             if work.is_some_and(super::account_work::Scope::cancelled)
                 || deadline.passed()
@@ -3727,6 +3793,11 @@ impl CodeExchange<'_> {
             } else {
                 None
             };
+            // Reopen the exact prepared owner claim under exchange admission,
+            // before taking the staged credential lock.
+            if let Some(capture) = capture.as_mut() {
+                capture.claim_exchange().ok()?;
+            }
             let _held = take_lock(home, deadline.within(SIGN_IN_LOCK_WAIT))?;
             let existing_journal = RefreshJournal::read(home).ok()?;
             if matches!(
@@ -3787,6 +3858,9 @@ impl CodeExchange<'_> {
             let wait = deadline.remaining().min(EXCHANGE_WAIT);
             if wait.is_zero() {
                 return None;
+            }
+            if let Some(scope) = native_scope {
+                scope.check_exchange().ok()?;
             }
             // From this point any transport error may have reached the provider.
             dispatched = true;
@@ -4068,6 +4142,7 @@ pub(in crate::harness) fn login_with_enrollment_custody<C: CodeGrantCapture>(
     custody: (NativeDestination<'_>, Option<C>),
 ) -> CapturedLogin<C::Output> {
     let (destination, mut capture) = custody;
+    let native_scope = approver.native_enrollment_scope();
     let mut retained = None;
     let drove = (|| {
         let rng = SystemRandom::new();
@@ -4124,7 +4199,10 @@ pub(in crate::harness) fn login_with_enrollment_custody<C: CodeGrantCapture>(
             };
         }
 
-        let listener = match bind_callback_listener(&endpoints.callback_ports, deadline) {
+        let listener = match match &native_scope {
+            Some(scope) => scope.callback().map_err(std::io::Error::other),
+            None => bind_callback_listener(&endpoints.callback_ports, deadline),
+        } {
             Ok(listener) => listener,
             Err(e) => {
                 return Drove {
@@ -4287,6 +4365,7 @@ pub(in crate::harness) fn login_with_enrollment_custody<C: CodeGrantCapture>(
         }
         let now = crate::supervise::limit::unix_now();
         let exchange = CodeExchange {
+            native_scope: native_scope.as_deref(),
             enrollment: destination.enrollment,
             publication: destination.publication,
             home,

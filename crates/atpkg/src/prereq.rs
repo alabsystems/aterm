@@ -184,13 +184,16 @@ impl CcHost {
         }
     }
 
+    /// A caller's explicit selection, excluding aterm's temporary setup directory.
+    fn developer_override(&self) -> Option<&Path> {
+        self.developer_dir_override.as_deref().filter(|dir| {
+            !dir.as_os_str().is_empty() && !aterm_types::clt_shim::is_shim_developer_dir(dir)
+        })
+    }
+
     /// The developer directory Apple's tools use, looking through aterm's temporary shim.
     fn developer_dir(&self) -> PathBuf {
-        self.developer_dir_override
-            .as_deref()
-            .filter(|dir| {
-                !dir.as_os_str().is_empty() && !aterm_types::clt_shim::is_shim_developer_dir(dir)
-            })
+        self.developer_override()
             .map(Path::to_path_buf)
             .or_else(|| std::fs::read_link(&self.xcode_select_link).ok())
             .or_else(|| {
@@ -481,7 +484,7 @@ fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &Cc
         let mut cmd = aterm_uds::spawnfd::command(cc);
         cmd.arg("-o").arg(&program).arg(&source).current_dir(dir);
         cmd.env_remove("DEVELOPER_DIR").env_remove("SDKROOT");
-        if let Some(developer) = &host.developer_dir_override {
+        if let Some(developer) = host.developer_override() {
             cmd.env("DEVELOPER_DIR", developer);
         }
         if let Some(path) = path_var {
@@ -554,7 +557,7 @@ fn ask(bin: &Path, driver: &Path, args: &[&str], host: &CcHost) -> CcVerdict {
     let mut cmd = aterm_uds::spawnfd::command(bin);
     cmd.args(args);
     cmd.env_remove("DEVELOPER_DIR").env_remove("SDKROOT");
-    if let Some(developer) = &host.developer_dir_override {
+    if let Some(developer) = host.developer_override() {
         cmd.env("DEVELOPER_DIR", developer);
     }
     if let Some(sdk) = host.sdkroot() {
@@ -584,12 +587,12 @@ fn ask(bin: &Path, driver: &Path, args: &[&str], host: &CcHost) -> CcVerdict {
     }
 }
 
-/// A regular file this user may execute (never a directory named `cc`).
+/// A nonempty regular file this user may execute (never a directory named `cc`).
 fn is_executable(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
-    if !meta.is_file() {
+    if !meta.is_file() || meta.len() == 0 {
         return false;
     }
     #[cfg(unix)]
@@ -638,6 +641,44 @@ mod tests {
             bound: ANSWER,
             tmp_root,
         }
+    }
+
+    #[test]
+    fn empty_executable_files_are_missing_compilers_in_path_and_developer_discovery() {
+        let root = scratch("empty-compiler");
+        let empty = root.join("empty");
+        let apple = root.join("usr-bin");
+        let developer = root.join("developer");
+        for file in [empty.join("cc"), developer.join("usr/bin/clang")] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, []).unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let host = plain_host(&root);
+        assert!(matches!(
+            locate_without_setup_shim(Some(empty.as_os_str()), &host, &[]),
+            Err(CcVerdict::NoDriver)
+        ));
+        script(&apple.join("cc"), "exit 1");
+        let path = std::env::join_paths([&empty, &apple]).unwrap();
+        assert!(matches!(
+            locate_without_setup_shim(Some(&path), &host, &[]),
+            Ok(Located::Plain(cc)) if cc == apple.join("cc")
+        ));
+        let host = CcHost {
+            shim_dir: Some(apple.clone()),
+            default_developer_dir: developer.clone(),
+            ..host
+        };
+        assert!(matches!(
+            locate_without_setup_shim(Some(&path), &host, &[]),
+            Err(CcVerdict::NoDeveloperDir)
+        ));
+        script(&developer.join("usr/bin/clang"), "exit 0");
+        assert!(matches!(
+            locate_without_setup_shim(Some(&path), &host, &[]),
+            Ok(Located::Shim(cc)) if cc == apple.join("cc")
+        ));
     }
 
     #[test]
@@ -1143,6 +1184,39 @@ mod tests {
         assert_eq!(
             probe_cached(path, &host, Some(&cache)),
             CcVerdict::NoDeveloperDir
+        );
+    }
+
+    #[test]
+    fn a_setup_developer_override_is_not_reintroduced_after_discovering_real_tools() {
+        let root = scratch("installed-after-start");
+        let shim = root.join("usr-bin");
+        let developer = root.join("real-developer");
+        script(&developer.join("usr/bin/clang"), "exit 0");
+        script(
+            &shim.join("xcrun"),
+            &format!(
+                "[ -n \"$DEVELOPER_DIR\" ] && {{ echo 'setup override reached xcrun' >&2; exit 1; }}\necho '{}/usr/bin/cc'",
+                developer.display()
+            ),
+        );
+        script(
+            &shim.join("cc"),
+            "[ -n \"$DEVELOPER_DIR\" ] && { echo 'setup override reached compiler' >&2; exit 1; }\nprintf x > \"$2\"",
+        );
+        let host = CcHost {
+            shim_dir: Some(shim.clone()),
+            default_developer_dir: developer.clone(),
+            developer_dir_override: Some(root.join("clt-shim/developer")),
+            ..plain_host(&root)
+        };
+        let path = Some(shim.as_os_str());
+        assert_eq!(installed_with(path, &host), Some(true));
+        assert_eq!(
+            probe_with(path, &host),
+            CcVerdict::Ready {
+                driver: developer.join("usr/bin/cc")
+            }
         );
     }
 

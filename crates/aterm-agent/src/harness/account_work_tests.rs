@@ -6,6 +6,141 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 #[test]
+fn cancellation_observers_complete_while_the_actual_state_mutex_is_held() {
+    for paused in [false, true] {
+        let lifetime = Lifetime::default();
+        let scope = lifetime.enter().unwrap();
+        let cancellation = scope.cancellation();
+        let pause = paused.then(|| lifetime.pause().unwrap());
+        let state = lifetime.0.state.lock().unwrap();
+        let worker_scope = scope.clone();
+        let worker_cancellation = cancellation.clone();
+        let worker_lifetime = lifetime.clone();
+        let (send, receive) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let observed = (
+                worker_scope.cancelled(),
+                worker_cancellation.cancelled(),
+                worker_cancellation.retired(),
+                worker_cancellation.owned_by(&worker_lifetime),
+            );
+            let _ = send.send(observed);
+        });
+        let observed = receive.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+        // An observation must arrive before unlock; release even on a regression.
+        drop(state);
+        let joined = worker.join();
+        joined.unwrap();
+        assert_eq!(observed.unwrap(), (paused, paused, false, true));
+        drop(scope);
+        assert!(cancellation.retired());
+        assert!(cancellation.cancelled());
+        if let Some(pause) = pause {
+            pause.try_wait().unwrap().resume().unwrap();
+            assert!(
+                cancellation.cancelled(),
+                "old epoch never becomes live again"
+            );
+            assert!(!lifetime.enter().unwrap().cancelled());
+        }
+    }
+}
+
+#[test]
+fn final_scope_drop_stops_work_before_its_blocked_count_retirement() {
+    let lifetime = Lifetime::default();
+    let mut scope = lifetime.enter().unwrap();
+    let other = lifetime.enter().unwrap();
+    let other_cancellation = other.cancellation();
+    let (dropping_send, dropping_receive) = mpsc::channel();
+    Arc::get_mut(&mut scope.0).unwrap().dropping = Some(dropping_send);
+    let cancellation = scope.cancellation();
+    let state = lifetime.0.state.lock().unwrap();
+    let worker = std::thread::spawn(move || drop(scope));
+    let dropping = dropping_receive.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    let counted = state.operations;
+    let observer_cancellation = cancellation.clone();
+    let (send, receive) = mpsc::channel();
+    let observer = std::thread::spawn(move || {
+        let _ = send.send((
+            observer_cancellation.cancelled(),
+            observer_cancellation.retired(),
+            other_cancellation.cancelled(),
+        ));
+    });
+    let observed = receive.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    drop(state);
+    let joined = worker.join();
+    let observer_joined = observer.join();
+    dropping.expect("actual final Operation destructor entered");
+    joined.unwrap();
+    observer_joined.unwrap();
+    assert_eq!(counted, 2, "blocked destructor has not retired its count");
+    assert_eq!(observed.unwrap(), (true, false, false));
+    assert!(cancellation.retired());
+    assert!(cancellation.cancelled());
+    assert!(!other.cancelled());
+    let pause = lifetime.pause().unwrap();
+    let pause = pause
+        .try_wait()
+        .expect_err("unrelated original work still owns its count");
+    drop(other);
+    let drained = pause.wait();
+    assert!(cancellation.retired());
+    drained.resume().unwrap();
+    assert!(!lifetime.enter().unwrap().cancelled());
+}
+
+#[test]
+fn actual_drained_receipt_observes_final_retirement_already_published() {
+    let lifetime = Lifetime::default();
+    let mut scope = lifetime.enter().unwrap();
+    let (dropping_send, dropping_receive) = mpsc::channel();
+    Arc::get_mut(&mut scope.0).unwrap().dropping = Some(dropping_send);
+    let cancellation = scope.cancellation();
+    let pause = lifetime.pause().unwrap();
+    let state = lifetime.0.state.lock().unwrap();
+    let worker = std::thread::spawn(move || drop(scope));
+    let dropping = dropping_receive.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    let counted = state.operations;
+    let observer_cancellation = cancellation.clone();
+    let (send, receive) = mpsc::channel();
+    let observer = std::thread::spawn(move || {
+        let _ = send.send((
+            observer_cancellation.cancelled(),
+            observer_cancellation.retired(),
+        ));
+    });
+    let observed = receive.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    let drain_cancellation = cancellation.clone();
+    let (drained_send, drained_receive) = mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let drained = pause.wait();
+        let _ = drained_send.send((drained, drain_cancellation.retired()));
+    });
+    drop(state);
+    let joined = worker.join();
+    let observer_joined = observer.join();
+    let received = drained_receive.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    let waiter_joined = waiter.join();
+    dropping.expect("actual final Operation destructor entered");
+    joined.unwrap();
+    observer_joined.unwrap();
+    waiter_joined.unwrap();
+    assert_eq!(counted, 1);
+    assert_eq!(observed.unwrap(), (true, false));
+    let (drained, retired) = received.unwrap();
+    assert!(
+        retired,
+        "count-zero proof must follow retirement publication"
+    );
+    assert!(cancellation.retired());
+    drained.resume().unwrap();
+    assert!(cancellation.cancelled());
+    assert!(!lifetime.enter().unwrap().cancelled());
+}
+
+#[test]
 fn detached_scope_retains_the_closed_epoch_until_its_last_drop() {
     let lifetime = Lifetime::default();
     let scope = lifetime.enter().unwrap();
@@ -159,4 +294,42 @@ fn cancellation_observation_follows_epoch_pause_without_retaining_work() {
     paused.try_wait().unwrap().resume().unwrap();
     assert!(cancellation.cancelled());
     assert!(!lifetime.enter().unwrap().cancelled());
+}
+
+#[test]
+fn release_turn_is_counted_before_seal_and_cannot_invalidate_drained() {
+    let lifetime = Lifetime::default();
+    let pause = lifetime.pause().unwrap();
+    assert!(lifetime.enter().is_none());
+    let release = lifetime
+        .release_turn()
+        .expect("retained cleanup remains possible before seal");
+    let pause = pause
+        .try_wait()
+        .expect_err("release actor owns counted retirement custody");
+    drop(release);
+    let drained = pause.try_wait().unwrap();
+    assert!(
+        lifetime.release_turn().is_none(),
+        "late cleanup cannot invalidate issued Drained"
+    );
+    assert_eq!(lifetime.0.state.lock().unwrap().operations, 0);
+    drained.resume().unwrap();
+    assert!(lifetime.release_turn().is_some());
+}
+
+#[test]
+fn late_release_waiter_cannot_enter_after_blocking_drain_seals() {
+    let lifetime = Lifetime::default();
+    let (send, receive) = mpsc::channel();
+    let other = lifetime.clone();
+    let worker = std::thread::spawn(move || {
+        receive.recv_timeout(Duration::from_secs(60)).unwrap();
+        other.release_turn().is_none()
+    });
+    let drained = lifetime.pause().unwrap().wait();
+    send.send(()).unwrap();
+    assert!(worker.join().unwrap());
+    assert_eq!(lifetime.0.state.lock().unwrap().operations, 0);
+    drained.resume().unwrap();
 }

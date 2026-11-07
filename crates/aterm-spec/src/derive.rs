@@ -1728,6 +1728,18 @@ mod tests {
     }
 
     #[test]
+    fn mixed_boolean_operators_keep_their_ast_grouping() {
+        assert_eq!(
+            or_(and_(Expr::Bool(true), Expr::Bool(false)), Expr::Bool(true)).to_tla(),
+            "((TRUE /\\ FALSE) \\/ TRUE)"
+        );
+        assert_eq!(
+            and_(Expr::Bool(true), or_(Expr::Bool(false), Expr::Bool(true))).to_tla(),
+            "(TRUE /\\ (FALSE \\/ TRUE))"
+        );
+    }
+
+    #[test]
     fn a_quantifier_cannot_swallow_what_follows_it() {
         let quantified = forall("i", int(0), int(1), le(var("i"), var("x")));
         assert_eq!(

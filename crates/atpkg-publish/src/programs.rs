@@ -336,6 +336,19 @@ pub static PROGRAMS: &[ProgramDef] = &[
         }),
     },
     ProgramDef {
+        name: "pkgconf",
+        repo: "aterm",
+        group: None,
+        system: None,
+        unavailable_hint: Some("The qualified pkgconf build is available for ARM macOS only"),
+        shape: Shape::Bottle(BottleDef {
+            exposes: &["pkgconf", "pkg-config"],
+            darwin: &[AARCH64_APPLE_DARWIN],
+            linux: &[],
+            origin: BottleOrigin::Pinned(&aterm_uds::host::upstream::PKGCONF),
+        }),
+    },
+    ProgramDef {
         name: "carcara",
         repo: "aterm",
         group: None,

@@ -22,6 +22,7 @@ pub fn account_continuation_model() -> Model {
             action Policy when (checked == 0) { case = 8; }
             action Cohort when (checked == 0) { case = 9; }
             action AccountPool when (checked == 0) { case = 10; }
+            action Predecessor when (checked == 0) { case = 11; }
             action Check when (checked == 0) {
                 checked = 1;
                 accepted = if case == 0 { if Buggy == 11 {0} else {1} }
@@ -29,7 +30,8 @@ pub fn account_continuation_model() -> Model {
                         || (Buggy == 3 && case == 3) || (Buggy == 4 && case == 4)
                         || (Buggy == 5 && case == 5) || (Buggy == 6 && case == 6)
                         || (Buggy == 7 && case == 7) || (Buggy == 8 && case == 8)
-                        || (Buggy == 9 && case == 9) || (Buggy == 10 && case == 10) {1} else {0} };
+                        || (Buggy == 9 && case == 9) || (Buggy == 10 && case == 10)
+                        || (Buggy == 12 && case == 11) {1} else {0} };
             }
             invariant NoExited: accepted == 0 || case <= 0 || case > 1;
             invariant NoGrant: accepted == 0 || case <= 1 || case > 2;
@@ -40,9 +42,10 @@ pub fn account_continuation_model() -> Model {
             invariant SamePhase: accepted == 0 || case <= 6 || case > 7;
             invariant OrdinaryPolicy: accepted == 0 || case <= 7 || case > 8;
             invariant Quiescent: accepted == 0 || case <= 8 || case > 9;
-            invariant EligibleAccount: accepted == 0 || case <= 9;
+            invariant EligibleAccount: accepted == 0 || case <= 9 || case > 10;
+            invariant ExactPredecessor: accepted == 0 || case <= 10;
             invariant ValidAdmitted: checked == 0 || case > 0 || accepted == 1;
-            bound Finite: 0 <= case && case <= 10 && 0 <= checked && checked <= 1
+            bound Finite: 0 <= case && case <= 11 && 0 <= checked && checked <= 1
                 && 0 <= accepted && accepted <= 1;
         }
     }

@@ -723,7 +723,14 @@ fn state(command: &PlannedCommand) -> (St, super::super::upgrade_drive::Unsent) 
         ..St::default()
     };
     let line = command.capture().unwrap().legacy_line().unwrap();
-    let back = st.signalled(process.pid, process.pid, SID, line.clone(), 2);
+    let back = st.signalled(
+        process.pid,
+        &super::super::upgrade_drive::kernel_start(process.pid).unwrap_or_default(),
+        process.pid,
+        SID,
+        line.clone(),
+        2,
+    );
     st.back_line = line;
     (st, back)
 }

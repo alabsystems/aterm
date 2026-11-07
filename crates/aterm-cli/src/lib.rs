@@ -168,7 +168,9 @@ pub enum Verb {
     Pkg,
     /// `aterm agh` — the GitHub client: reads and writes as the routed identity, JSON out, typed exits.
     Agh,
-    /// `aterm fleet` — fleet membership (`init`, `join`, `peers`, `allow`, `leave`).
+    /// `aterm fleet` — the lab's status line and one row per seat; the lab verbs (`remove`,
+    /// `admit`, `invite`, `requests`, `ignore`); fleet membership (`init`, `join`, `peers`,
+    /// `allow`, `leave`).
     Fleet,
     /// `aterm name` — this machine's name: its NAME and nickname
     /// (`docs/DESIGN-machine-names-2026-11-04.md` §5.7).
@@ -409,12 +411,14 @@ impl Verb {
                 "JSON out, typed exits (`aterm agh help`).",
             ],
             Verb::Fleet => &[
-                "This machine's membership in a fleet, the aterms",
-                "of one LAN that read each other (init | join |",
-                "peers | allow | publish | sync | leave); `allow",
-                "drive --from <host|node>` lets that node drive",
-                "this machine, `--all` every member (`aterm ctl",
-                "--host <h> …`, `aterm help workers`). Unix only.",
+                "The lab at a glance: its status line and one row",
+                "per seat, from this Mac's own copy (`--json`);",
+                "remove | admit | invite | requests | ignore, as",
+                "`aterm members` does them; and this machine's",
+                "membership in a fleet (init | join | peers | allow",
+                "| publish | sync | leave); `allow drive --from",
+                "<host|node>` lets that node drive this machine",
+                "(`aterm help workers`). Unix only.",
             ],
             Verb::Name => &[
                 "This machine's name: its NAME (m8, or m0 until",
@@ -503,7 +507,8 @@ impl Verb {
                 "(join), a person presses Allow on any one and",
                 "types the phrase it shows; any member removes",
                 "(requests | allow | invite | ignore | list |",
-                "remove | undo | join | status). Unix only.",
+                "remove | undo | join | status; `aterm fleet`",
+                "runs the same lab verbs). Unix only.",
             ],
             Verb::Db => &[
                 "Encrypted embedded application databases, local",
@@ -3756,9 +3761,12 @@ enum CliAction {
     /// `<diag> --help`: print that subcommand's description and usage, exit 0,
     /// never run it.
     DiagHelp { cmd: String },
-    /// `help [topic]`: print a manual page ([`manual`]); exit 0, or 2 for an
-    /// unknown topic.
-    Manual { topic: Option<String> },
+    /// `help [<topic> [<section>]]`: print a manual page or one of its sections ([`manual`]);
+    /// exit 0, or 2 for an unknown topic or section.
+    Manual {
+        topic: Option<String>,
+        section: Option<String>,
+    },
     /// `agents [<cmd> [<agent>…]]`: manage the coding-agent primer and exit
     /// without spawning a shell.
     Agents { rest: Vec<String> },
@@ -3778,7 +3786,14 @@ fn decide_args<I: Iterator<Item = String>>(args: I) -> CliAction {
     let mut args = args.peekable();
     if args.peek().map(String::as_str) == Some("help") {
         let _ = args.next();
-        return CliAction::Manual { topic: args.next() };
+        let topic = args.next();
+        let section = args.next();
+        if let Some(extra) = args.next() {
+            return CliAction::Usage(format!(
+                "aterm help: a topic and at most one section (`aterm help sys wait`), not {extra:?}"
+            ));
+        }
+        return CliAction::Manual { topic, section };
     }
     if args.peek().map(String::as_str) == Some("agents") {
         let _ = args.next();
@@ -4001,9 +4016,10 @@ pub fn parse_args(argv: Vec<std::ffi::OsString>) -> bool {
                 std::process::exit(2);
             }
         },
-        CliAction::Manual { topic } => {
+        CliAction::Manual { topic, section } => {
             let session = manual::in_session();
-            let (out, code) = manual::render(topic.as_deref(), session.as_deref());
+            let (out, code) =
+                manual::render(topic.as_deref(), section.as_deref(), session.as_deref());
             if code == 0 {
                 answer_and_exit(&out, 0);
             }
@@ -5102,13 +5118,31 @@ mod tests {
 
     #[test]
     fn help_word_routes_to_the_manual_and_is_advertised() {
-        assert_eq!(decide(&["help"]), CliAction::Manual { topic: None });
+        assert_eq!(
+            decide(&["help"]),
+            CliAction::Manual {
+                topic: None,
+                section: None
+            }
+        );
         assert_eq!(
             decide(&["help", "trust"]),
             CliAction::Manual {
-                topic: Some("trust".to_string())
+                topic: Some("trust".to_string()),
+                section: None
             }
         );
+        assert_eq!(
+            decide(&["help", "sys", "wait"]),
+            CliAction::Manual {
+                topic: Some("sys".to_string()),
+                section: Some("wait".to_string())
+            }
+        );
+        assert!(matches!(
+            decide(&["help", "sys", "wait", "now"]),
+            CliAction::Usage(_)
+        ));
         assert_eq!(decide(&["-h"]), CliAction::Help);
         assert!(
             help_text()
@@ -6624,6 +6658,7 @@ mod tests {
         let lit = crate::spotlight::Spotlit {
             docs_kept: None,
             builds: vec![("~/w/target".into(), 12)],
+            xpy: Vec::new(),
             rustup: None,
         };
         let (r, code) = report(Some(Ok(lit)));
@@ -6634,6 +6669,7 @@ mod tests {
         let clean = crate::spotlight::Spotlit {
             docs_kept: None,
             builds: vec![],
+            xpy: Vec::new(),
             rustup: None,
         };
         let (r, _) = report(Some(Ok(clean)));

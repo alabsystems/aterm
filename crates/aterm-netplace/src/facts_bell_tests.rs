@@ -5,6 +5,7 @@ use std::io::{ErrorKind, Write as _};
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd};
 
 use super::*;
+use std::cell::Cell;
 
 fn sense() -> Live {
     Live {
@@ -13,6 +14,7 @@ fn sense() -> Live {
             bell: Some(Bell::new().expect("notification pair")),
             ..PathState::default()
         }),
+        #[cfg(target_os = "macos")]
         _monitor: None,
     }
 }
@@ -36,17 +38,106 @@ fn tell(path: &PathState) {
 }
 
 #[test]
+fn stop_wakes_real_condvar_and_registered_poll_without_a_network_change() {
+    for mode in 0..3 {
+        let sense = sense();
+        let path = Arc::clone(&sense.path);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let wake = sense.stop_wake().unwrap();
+        let (entered, receiving) = std::sync::mpsc::channel();
+        let (answer, result) = std::sync::mpsc::channel();
+        let hang = Duration::from_secs(60);
+        let outside_hang_detector = Duration::from_secs(3600);
+        let worker = std::thread::spawn(move || {
+            let entered = std::cell::RefCell::new(Some(entered));
+            let mut wait_path = |held: MutexGuard<'_, Option<PathFacts>>, left| {
+                if let Some(entered) = entered.borrow_mut().take() {
+                    entered.send(()).unwrap();
+                }
+                path.wait_reading(held, left, &stop);
+            };
+            let changed = if mode == 0 {
+                wait_on_path(
+                    &path,
+                    &stop,
+                    Instant::now() + outside_hang_detector,
+                    Instant::now,
+                    wait_path,
+                )
+            } else {
+                let routes = aterm_uds::network::RouteChanges::open().unwrap();
+                wait_on_routes(
+                    &path,
+                    &stop,
+                    outside_hang_detector,
+                    Instant::now,
+                    |left| {
+                        if mode == 1 {
+                            Woke::Failed
+                        } else {
+                            // Registration uses the actual bell FD; a stop immediately before the
+                            // kernel poll must be as observable as one arriving after it began.
+                            poll_both_by(&routes, path.bell_fd(), left, |fds, millis| {
+                                // This control concerns our private bell, not ambient route
+                                // traffic. poll ignores a negative descriptor.
+                                fds[0].fd = -1;
+                                if let Some(entered) = entered.borrow_mut().take() {
+                                    entered.send(()).unwrap();
+                                }
+                                // SAFETY: this array holds the live bell descriptor and an ignored
+                                // negative descriptor; poll receives its actual two-element length.
+                                if unsafe { libc::poll(fds.as_mut_ptr(), 2, millis) } < 0 {
+                                    Err(std::io::Error::last_os_error())
+                                } else {
+                                    Ok(())
+                                }
+                            })
+                        }
+                    },
+                    &mut wait_path,
+                )
+            };
+            answer.send(changed).unwrap();
+        });
+        let ready = receiving.recv_timeout(hang);
+        stopping.store(true, Ordering::SeqCst);
+        wake.ring();
+        let changed = result.recv_timeout(hang);
+        // Rescue is cleanup only: it cannot qualify the automatic stop observation above.
+        if changed.is_err() {
+            tell(&sense.path);
+        }
+        worker.join().unwrap();
+        ready.unwrap();
+        assert!(!changed.unwrap(), "stop is not a network observation");
+        assert!(!sense.path.changed.load(Ordering::SeqCst));
+    }
+}
+
+#[test]
+fn a_closed_bell_is_a_failed_wait_not_an_endless_notification() {
+    let routes = aterm_uds::network::RouteChanges::open().expect("network event socket");
+    let (hear, ring) = std::io::pipe().unwrap();
+    drop(ring);
+    assert_eq!(
+        poll_both(&routes, Some(hear.as_fd()), Duration::ZERO),
+        Woke::Failed
+    );
+}
+
+#[test]
 fn path_changes_consumed_before_poll_leave_no_stale_readiness() {
     let sense = sense();
     for _ in 0..32 {
         tell(&sense.path);
         tell(&sense.path);
-        assert!(sense.wait(Duration::ZERO));
+        assert!(sense.wait(Duration::ZERO, &AtomicBool::new(false)));
         assert!(
             !readable(sense.path.bell_fd().unwrap()),
             "acknowledged path changes must not leave a stale notification"
         );
-        assert!(!sense.wait(Duration::ZERO));
+        assert!(!sense.wait(Duration::ZERO, &AtomicBool::new(false)));
     }
 }
 
@@ -87,11 +178,74 @@ fn draining_the_bell_keeps_the_path_change_latched() {
     assert!(!readable(sense.path.bell_fd().unwrap()));
     let (answer, result) = std::sync::mpsc::channel();
     let waiter = std::thread::spawn(move || {
-        answer.send(sense.wait(Duration::ZERO)).unwrap();
+        answer
+            .send(sense.wait(Duration::ZERO, &AtomicBool::new(false)))
+            .unwrap();
     });
     assert!(
         result.recv_timeout(Duration::from_secs(60)).unwrap(),
         "draining readiness must not clear the separately latched path change"
     );
     waiter.join().unwrap();
+}
+
+/// The waker starts only while the wait backend holds the reading lock. It
+/// cannot latch its change until the condition variable releases that lock.
+/// Both entry points use the production condition-variable backend.
+fn notified_wait(failed_route: bool) {
+    let path = sense().path;
+    let wake_path = Arc::clone(&path);
+    let (entered, waiting) = std::sync::mpsc::channel();
+    let hang = Duration::from_secs(60);
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let waker = scope.spawn(move || {
+            waiting
+                .recv_timeout(hang)
+                .expect("the wait backend entered");
+            tell(&wake_path);
+        });
+        let mut entered = Some(entered);
+        let wait_path = |held: MutexGuard<'_, Option<PathFacts>>, left| {
+            if let Some(entered) = entered.take() {
+                entered.send(()).expect("the waker is listening");
+            }
+            path.wait_reading(held, left, &stop);
+        };
+        let polls = Cell::new(0);
+        let changed = if failed_route {
+            wait_on_routes(
+                &path,
+                &stop,
+                hang,
+                Instant::now,
+                |_| {
+                    polls.set(polls.get() + 1);
+                    assert_eq!(polls.get(), 1, "a failed route is not polled again");
+                    Woke::Failed
+                },
+                wait_path,
+            )
+        } else {
+            wait_on_path(&path, &stop, Instant::now() + hang, Instant::now, wait_path)
+        };
+        waker.join().expect("the waker ended");
+        assert!(
+            changed,
+            "the notification, rather than expiry, ended the wait"
+        );
+        assert_eq!(polls.get(), usize::from(failed_route));
+        assert!(!path.changed.load(Ordering::SeqCst));
+        assert!(!readable(path.bell_fd().unwrap()));
+    });
+}
+
+#[test]
+fn a_path_notification_wakes_the_failed_route_fallback() {
+    notified_wait(true);
+}
+
+#[test]
+fn a_path_notification_wakes_the_path_only_wait() {
+    notified_wait(false);
 }

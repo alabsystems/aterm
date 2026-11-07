@@ -120,7 +120,7 @@ pub const CHECKS: [Spec; 19] = [
             "chrome-headless-shell",
         ],
         also: "",
-        runs: "targo test <selection> --tests (no examples; under release, the measuring benches compiled too), binaries in parallel",
+        runs: "targo test <selection> --tests (no examples; under release, the measuring benches compiled too), binaries side by side within the run's CPU share, unseen first, then last run's failures, then longest known",
     },
     Spec {
         check: Check::Doc,
@@ -178,8 +178,8 @@ pub const CHECKS: [Spec; 19] = [
         stages: &[StageId::BrowserLane],
         reach: Reach::WholeTree,
         needs: &["chrome-headless-shell", "firefox", "rustup"],
-        also: "stable's wasm32; on macOS Playwright's WebKit (`verify provision`), whose rows keep windows, and the system Safari, whose `safaridriver` an administrator enables once (`sudo safaridriver --enable`)",
-        runs: "both web modules (dev) in headless Chromium, WebGL2 on ANGLE Metal (macOS) and SwiftShader, in headless Firefox, in Playwright's WebKit (it keeps a window: a named skip under --no-windows), and on macOS in the system Safari over safaridriver (its window takes the desk: it holds the quiet machine, and is a named skip under --no-windows); the GPU module on the page and in a worker (init_offscreen): a WebGL2 boot, GPU vs CPU pixels, GPU vs the recorded wgpu-WebGL frames (STOCK EXCEPTION)",
+        also: "stable's wasm32; on macOS and Linux arm64 Playwright's WebKit (`verify provision`), whose rows keep windows on macOS, and on macOS the system Safari, whose `safaridriver` an administrator enables once (`sudo safaridriver --enable`)",
+        runs: "both web modules (dev) in headless Chromium, WebGL2 on ANGLE Metal (macOS) and SwiftShader, in headless Firefox, in Playwright's WebKit (on macOS it keeps a window: a named skip under --no-windows; on Linux, WPE, headless), and on macOS in the system Safari over safaridriver (its window takes the desk: it holds the quiet machine, and is a named skip under --no-windows); the GPU module on the page and in a worker (init_offscreen): a WebGL2 boot, GPU vs CPU pixels, GPU vs the recorded wgpu-WebGL frames (STOCK EXCEPTION)",
     },
     Spec {
         check: Check::Libc,
@@ -207,7 +207,7 @@ pub const CHECKS: [Spec; 19] = [
         reach: Reach::Selection,
         needs: &["targo", "ty"],
         also: "",
-        runs: "ATERM_SPEC_CHECKERS=1 reruns compiled tests (main target dir; after test; binaries in parallel); under release, test asserts the variable itself",
+        runs: "ATERM_SPEC_CHECKERS=1 reruns compiled tests (main target dir; after test; binaries side by side within the run's CPU share); under release, test asserts the variable itself",
     },
     Spec {
         check: Check::Appkit,

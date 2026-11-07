@@ -1072,9 +1072,12 @@ pub(super) fn seed_log_from_document_with_commons_generation(
     }
     let mut minted = Vec::new();
     for plan in doc.lockers() {
-        let mut recipients = Vec::with_capacity(plan.recipients.len());
+        // In ascending recipient order, as every batch wraps (a plan sorts its keys as text,
+        // which is not their order): a Mac that holds the seed's `Wrap`s up to one of them reads
+        // a recipient below it that they lack as left out (`Log::batch_whole`).
+        let mut recipients = BTreeSet::new();
         for text in &plan.recipients {
-            recipients.push(Recipient::parse(text).map_err(|_| Error::new("bad machine key"))?);
+            recipients.insert(Recipient::parse(text).map_err(|_| Error::new("bad machine key"))?);
         }
         if recipients.is_empty() {
             continue;
@@ -1525,7 +1528,7 @@ pub(super) fn recipient_denied_by_roster_or_log(
     recipient: &Recipient,
 ) -> bool {
     let rec_str = recipient.to_bech32();
-    let membership = log.membership();
+    let membership = log.membership_ref();
     let newest_seat = membership
         .members()
         .iter()
@@ -1572,7 +1575,7 @@ pub(super) fn machine_denied_by_roster_or_log(
         return true;
     }
     let rec_str = recipient.to_bech32();
-    let membership = log.membership();
+    let membership = log.membership_ref();
     let has_authoritative_seat = roster
         .is_some_and(|ros| ros.member_by_recipient(&rec_str).is_some())
         || membership
@@ -4293,6 +4296,7 @@ fn draft_document_diff_with(
 /// What a store's membership log is for judging a Commons peer ([`acknowledged_commons_log`]).
 /// Only [`CommonsLog::Trusted`] judges one; the others say why it does not, so a reader that
 /// must refuse a log of another root or lineage can tell it from one with nothing to judge by.
+#[derive(Clone)]
 pub enum CommonsLog {
     /// A log of `trust`'s root and the configured vault lineage that carries
     /// [`EpochAudience::Commons`] epochs (`F18`), with its heads digest. Boxed: a log is large
@@ -7513,9 +7517,12 @@ pub const REMOVER_GRACE_MS: u64 = 10 * GAP_STEP_MS;
 /// may hold only a prefix of its minter's batch (`unsettled_of_others`), from first sight. Not
 /// every batch ends in a record that settles it (a rotation of an audience its minter does not
 /// open whole ends in `Wrap`s), and no record kind could end one without writing a value, a
-/// name or a node key, so a minter that falls silent after its last `Wrap` holds the audience
-/// only this long, a Mac with no seat its batch may still wrap ([`Log::undecided`]) included:
-/// a whole batch that left such a Mac out reads the same until its minter signs again.
+/// name or a node key. A seat audience's batch whose last `Wrap` sorts above every recipient it
+/// could wrap settles as it arrives ([`Log::unsettled`], one-mesh §11 H2); one that could still
+/// wrap a Mac above it, and a host list's, hold the audience only this long when their minter
+/// falls silent after its last `Wrap`, a Mac with no seat the batch may still wrap
+/// ([`Log::undecided`]) included: a whole batch that left such a Mac out above its last `Wrap`
+/// reads the same until its minter signs again.
 pub const SETTLE_GRACE_MS: u64 = REMOVER_GRACE_MS;
 
 /// The epochs of `epochs` a Mac other than `me` minted whose batch `log` may hold only a prefix

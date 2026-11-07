@@ -811,6 +811,115 @@ fn published_reads_need_no_writer() {
     }
     assert_eq!(w.fake.violations(), Vec::<String>::new());
 
+    // The unsigned Linux staging reader needs the paired signed package too. Exercise its
+    // real AghHost transport with no writer route, rather than FakeHost's permissive reads.
+    let package_world = AghWorld::build(Setup {
+        token: false,
+        writer: false,
+        anonymous: true,
+        ..Setup::PLAN
+    });
+    let keys = atpkg_publish::testkit::Keys::mint("public-package-reader", &[]);
+    let ctx = keys.ctx_over(package_world._dir.path(), Arc::new(FakeHost::new()));
+    let quad_dir = package_world._dir.path().join("quad");
+    keys.write_quad(
+        &quad_dir,
+        &keys.index_toml(7, &[("git", "aterm")], &[("git", 12)]),
+    );
+    let quad = atpkg_publish::quad::verify_dir(&ctx, &quad_dir).unwrap();
+    let package = |program: &str, build: u64| {
+        format!(
+            "schema = 1\nprogram = \"{program}\"\nversion = \"2.56.0\"\nbuild_number = {build}\nexposes = [\"git\"]\n"
+        )
+    };
+    let bytes = package("git", 12).into_bytes();
+    let signature = keys.sign(&bytes);
+    put_on(
+        &package_world.fake,
+        "atpkg-git-12",
+        false,
+        true,
+        &[
+            ("pkg-git-12.toml", &bytes),
+            ("pkg-git-12.toml.sig", &signature),
+        ],
+    );
+    let host: atpkg_publish::host::HostRef = Arc::new(package_world.host);
+    use atpkg_publish::lane::rows::{self, Fetched};
+    let fetch = |program, build, label| {
+        rows::fetch_published(
+            &host,
+            &slug(),
+            program,
+            build,
+            &package_world._dir.path().join(label),
+            &quad,
+        )
+    };
+    assert!(
+        matches!(fetch("git", 12, "package"), Fetched::Present { .. }),
+        "a signed public package requires no writer route"
+    );
+    for (program, build, body, draft, missing_signature, invalid_signature, label) in [
+        ("ay", 12, package("git", 12), false, false, false, "program"),
+        ("git", 13, package("git", 12), false, false, false, "build"),
+        (
+            "git",
+            14,
+            package("git", 14),
+            false,
+            false,
+            true,
+            "signature",
+        ),
+        ("git", 15, package("git", 15), true, false, false, "draft"),
+        ("git", 16, package("git", 16), false, true, false, "missing"),
+    ] {
+        let mut signature = keys.sign(body.as_bytes());
+        if invalid_signature {
+            signature[0] ^= 1;
+        }
+        let manifest_name = format!("pkg-{program}-{build}.toml");
+        let signature_name = format!("{manifest_name}.sig");
+        let mut assets = vec![(manifest_name.as_str(), body.as_bytes())];
+        if !missing_signature {
+            assets.push((signature_name.as_str(), signature.as_slice()));
+        }
+        put_on(
+            &package_world.fake,
+            &format!("atpkg-{program}-{build}"),
+            draft,
+            true,
+            &assets,
+        );
+        let result = fetch(program, build, label);
+        if draft || missing_signature {
+            assert!(matches!(result, Fetched::Absent(_)), "{label}: {result:?}");
+        } else {
+            assert!(matches!(result, Fetched::Invalid(_)), "{label}: {result:?}");
+        }
+    }
+    package_world.fake.fault_always(
+        Match::web("/fixture-dev/packs/releases/download/atpkg-git-12/").method("GET"),
+        Fault::Status {
+            status: 500,
+            body: String::new(),
+            headers: Vec::new(),
+        },
+    );
+    assert!(matches!(
+        fetch("git", 12, "unreachable"),
+        Fetched::Unreachable(_)
+    ));
+    assert!(
+        package_world
+            .fake
+            .seen()
+            .iter()
+            .all(|request| !request.had_authorization)
+    );
+    assert!(package_world.fake.violations().is_empty());
+
     let w = AghWorld::build(Setup {
         fine_grained: true,
         ..Setup::PLAN

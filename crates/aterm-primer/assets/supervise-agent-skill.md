@@ -119,6 +119,8 @@ and old news never fires twice.
     member in `attention=`. Keep that program off that member until the line is mended.
   - `why=held`: it started and stands 2 minutes at a screen the harness could not handle. It reads
     `working why=moved` when it moves.
+  - `why=cancelled`: a shutdown or update stopped a launch that holds an account scope before
+    its line was typed, so no agent ran. `attention=` says nothing of it: start it again.
 - `attention=`: something the harness could not settle, or a `NEEDS YOU:` line from the
   worker (`owner=needs`, raised immediately while the host keeps the worker going); inspect
   with `aterm ctl @<sid> text tail=40 trim`.

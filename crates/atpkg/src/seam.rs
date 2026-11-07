@@ -431,11 +431,10 @@ fn dir_mismatch(build: &Path, view: &Path, dir: &str, depth: Depth) -> Option<Pa
     }
 }
 
-/// `lstat` says a real directory; a symlink to one is not.
-#[cfg(unix)]
-/// Whether `lstat` reports `path` as a real directory (not a symlink).
+/// Whether `lstat` reports a real directory, excluding symlinks and Windows
+/// reparse points such as junctions.
 pub(crate) fn is_real_dir(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && !crate::platform::is_reparse(&m))
 }
 
 /// The directory that holds the view at `view`: `<name>.noindex` when `view` is its link
@@ -2441,6 +2440,29 @@ fn verified_store_current_build(layout: &Layout, current: &Path) -> io::Result<P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn real_directory_check_refuses_files_missing_paths_and_directory_aliases() {
+        let world = aterm_tempfile::tempdir().unwrap();
+        let real = world.path().join("real");
+        let file = world.path().join("file");
+        let alias = world.path().join("alias");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(&file, b"preserved").unwrap();
+        std::fs::write(real.join("kept"), b"target contents").unwrap();
+        assert!(is_real_dir(&real));
+        assert!(!is_real_dir(&file));
+        assert!(!is_real_dir(&world.path().join("missing")));
+        crate::platform::atomic_symlink(&real, &alias).unwrap();
+        assert!(!is_real_dir(&alias));
+        crate::platform::remove_link(&alias);
+        assert!(std::fs::symlink_metadata(&alias).is_err());
+        assert_eq!(
+            std::fs::read(real.join("kept")).unwrap(),
+            b"target contents"
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"preserved");
+    }
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;

@@ -5,6 +5,54 @@
 
 use aterm_search::{BudgetedSearch, SearchDirection, SearchIndex};
 
+#[cfg(target_os = "macos")]
+fn instructions() -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
+    // SAFETY: the selected flavor initializes this complete buffer on success.
+    let result = unsafe {
+        libc::proc_pid_rusage(
+            libc::getpid(),
+            libc::RUSAGE_INFO_V4,
+            info.as_mut_ptr().cast(),
+        )
+    };
+    // SAFETY: success initialized the selected buffer above.
+    (result == 0).then(|| unsafe { info.assume_init() }.ri_instructions)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn instructions() -> Option<u64> {
+    None
+}
+
+#[test]
+#[ignore = "manual before/after incremental query preparation measurement"]
+fn incremental_query_preparation_cost() {
+    const ROWS: usize = 2048;
+    for len in [1, 16, 256, 4096] {
+        let query = "a".repeat(len);
+        let text = format!("{query}b");
+        let rows = vec![text; ROWS];
+        let mut search = BudgetedSearch::new(&query, true, false, 0, ROWS).unwrap();
+        let before = instructions();
+        let began = std::time::Instant::now();
+        for row in rows {
+            search.feed_row_owned(row);
+        }
+        let elapsed = began.elapsed();
+        let retired = before.zip(instructions()).map(|(a, b)| b - a);
+        let result = search.results();
+        assert_eq!(result.matches.len(), ROWS);
+        for (row, found) in result.matches.iter().enumerate() {
+            assert_eq!((found.line, found.start_col, found.end_col), (row, 0, len));
+        }
+        eprintln!(
+            "incremental_preparation query_bytes={len} rows={ROWS} instructions={retired:?} elapsed_ns={}",
+            elapsed.as_nanos()
+        );
+    }
+}
+
 #[test]
 fn overlapping_matches_keep_columns_order_and_budgeted_parity() {
     for (text, query, expected) in [

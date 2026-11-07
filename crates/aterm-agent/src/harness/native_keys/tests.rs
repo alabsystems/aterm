@@ -36,7 +36,7 @@ fn native_launch_refuses_unknown_local_policy_before_credential_selection() {
                     std::fs::remove_file(&config).unwrap();
                     std::fs::create_dir(&config).unwrap();
                 } else {
-                    std::fs::write(&config, "[harness\naccounts = 'off'\n").unwrap();
+                    crate::test_config::write(&config, "[harness\naccounts = 'off'\n").unwrap();
                 }
                 refused.push(run().is_err());
             }

@@ -331,9 +331,10 @@ const TABLE: &[Verb] = &[
         tier: Tier::Plumbing,
         usage: "aterm pkg shell-setup [--path] [--completions] [--man <dir> | --own-man] \
                 [--desktop [--icons <dir>]] [--toolset-coming] [--dry-run] [--bin-dir <dir>] \
-                [--man-root <dir>]  — the managed PATH block, this binary's shell completions, \
+                [--man-root <dir>] [--installed-command <absolute-path>]  — the managed PATH block, this binary's shell completions, \
                 the man pages (a checkout's, or this binary's own) and the Linux desktop entry \
-                (bare: --path --completions)",
+                (bare: --path --completions); --installed-command records only a placed runtime \
+                that resolves to this executable",
         arity: Arity::Own,
         program_flags: None,
         mutates_store: false,
@@ -8255,34 +8256,43 @@ pub(crate) fn clt_which_line(
     ) {
         Ok(format!("{tool} → {}", verdict.line()))
     } else {
-        Err(format!(
-            "atpkg: {tool}: {} — next: `aterm pkg install clt` ({})",
-            verdict.line(),
-            crate::prereq::act()
-        ))
+        Err(format!("atpkg: {tool}: {}", verdict.line()))
     }
 }
 
 fn cmd_install_clt() -> ExitCode {
     let host = crate::prereq::CcHost::this_machine();
-    let verdict = crate::prereq::probe_with(std::env::var_os("PATH").as_deref(), &host);
+    let path = std::env::var_os("PATH");
+    let verdict = crate::prereq::probe_with(path.as_deref(), &host);
+    let exe = std::env::current_exe().ok();
+    install_clt_with(
+        verdict,
+        exe.as_deref(),
+        |exe| {
+            aterm_uds::spawnfd::command(exe)
+                .args(["init", "--only", crate::converge::CLT])
+                .status()
+        },
+        || crate::prereq::probe_with(path.as_deref(), &host),
+    )
+}
+
+fn install_clt_with(
+    verdict: crate::prereq::CcVerdict,
+    exe: Option<&std::path::Path>,
+    install: impl FnOnce(&std::path::Path) -> std::io::Result<std::process::ExitStatus>,
+    read_back: impl FnOnce() -> crate::prereq::CcVerdict,
+) -> ExitCode {
     if matches!(&verdict, crate::prereq::CcVerdict::Ready { .. }) {
-        println!("atpkg: clt: already ready — {}", verdict.line());
-        if let Some(line) = c_toolchain_marker(&verdict) {
-            emit_marker_line(&line);
-        }
-        return ExitCode::SUCCESS;
+        return report_clt_install(verdict);
     }
-    if verdict.blocks_builds()
+    if verdict.fix().is_some()
         && cfg!(target_os = "macos")
-        && let Ok(exe) = std::env::current_exe()
+        && let Some(exe) = exe
         && exe.file_name().and_then(|s| s.to_str()) == Some("aterm")
     {
-        match aterm_uds::spawnfd::command(&exe)
-            .args(["init", "--only", crate::converge::CLT])
-            .status()
-        {
-            Ok(status) if status.success() => return ExitCode::SUCCESS,
+        match install(exe) {
+            Ok(status) if status.success() => return report_clt_install(read_back()),
             Ok(status) => {
                 return ExitCode::from(
                     status
@@ -8300,9 +8310,20 @@ fn cmd_install_clt() -> ExitCode {
             }
         }
     }
-    eprintln!("atpkg: {}", verdict.line());
-    eprintln!("atpkg:   next — {}", crate::prereq::act());
-    ExitCode::from(1)
+    report_clt_install(verdict)
+}
+
+fn report_clt_install(verdict: crate::prereq::CcVerdict) -> ExitCode {
+    if matches!(&verdict, crate::prereq::CcVerdict::Ready { .. }) {
+        println!("atpkg: clt: ready — {}", verdict.line());
+        if let Some(line) = c_toolchain_marker(&verdict) {
+            emit_marker_line(&line);
+        }
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("atpkg: {}", verdict.line());
+        ExitCode::from(1)
+    }
 }
 
 fn cmd_install_for_update(program: &String) -> ExitCode {

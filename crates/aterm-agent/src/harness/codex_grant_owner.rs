@@ -5,12 +5,15 @@
 //! response is not a published account, independent grant, or session assignment.
 //! Only the successful exchange producer can supply verified response evidence.
 
+use super::native_custody_platform as platform;
 use super::{cli::Env, codex_app_login, codex_enrollment, codex_renewal::Identity};
-use aterm_secrets::{SecretBytes, age, client};
-use aterm_uds::private_file::{self, PrivateLock};
+#[cfg(all(test, unix))]
+use aterm_secrets::client;
+use aterm_secrets::{SecretBytes, age};
+#[cfg(all(test, unix))]
+use aterm_uds::private_file;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use zeroize::Zeroize;
 
 const MAX_DOCUMENT: usize = 16 * 1024;
@@ -20,9 +23,58 @@ const MAX_RETAINED_DOCUMENT: usize = 2 * 1024 * 1024;
 const MAX_ENVELOPE: usize = 4 * 1024 * 1024;
 const MAX_PENDING: usize = 256;
 
+/// Owned physical obstruction used only by the isolated pending-custody fixture.
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub(super) struct PendingFixtureRestore {
+    directory: PathBuf,
+    held: PathBuf,
+}
+
+#[cfg(all(unix, any(test, debug_assertions)))]
+impl PendingFixtureRestore {
+    pub(super) fn restore(&mut self) -> Result<(), String> {
+        if !self.held.exists() {
+            return Ok(());
+        }
+        std::fs::remove_dir(&self.directory).map_err(|_| "fixture replacement removal failed")?;
+        std::fs::rename(&self.held, &self.directory)
+            .map_err(|_| "fixture custody restore failed".to_owned())
+    }
+}
+
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub(super) fn pending_custody_fixture(
+    env: &Env,
+    request: &codex_enrollment::Request,
+    stage: &Path,
+    original: &super::account_work::Scope,
+    turn: std::sync::Arc<super::native_enrollment_admission::NativeBrowserTurn>,
+) -> Result<(CaptureOutcome, PendingFixtureRestore), String> {
+    let deadline = super::wake_deadline::WakeDeadline::after(super::login_drive::HANG);
+    let mut pending = prepare(env, request, stage, &"d".repeat(64))?
+        .with_native_scope(env, Some(turn.clone()))?;
+    turn.enter_exchange(deadline, Some(original))?;
+    drop(turn);
+    pending.begin_exchange()?;
+    let directory = pending.store.held()?.directory.clone();
+    let held = directory.with_extension("fixture-held");
+    std::fs::rename(&directory, &held).map_err(|_| "fixture custody move failed")?;
+    platform::ensure_private_dir(&directory).map_err(|_| "fixture replacement failed")?;
+    pending.capture_response(
+        br#"{"tokens":{"access_token":"isolated-fixture-only"}}"#,
+        Some(Identity::from_native("fixture-account", "fixture-user")),
+        Some("fixture-code-owner".into()),
+    );
+    let outcome = pending.settle_response();
+    if !matches!(&outcome, CaptureOutcome::Pending(_)) {
+        return Err("physical replacement did not retain pending custody".into());
+    }
+    Ok((outcome, PendingFixtureRestore { directory, held }))
+}
+
 #[path = "codex_grant_refresh.rs"]
 mod refresh;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) use refresh::initialize_revision;
 pub(super) use refresh::{
     OwnedRefreshRetention, OwnerRefreshContinuation, OwnerRefreshError, OwnerWitnessTransition,
@@ -55,6 +107,24 @@ impl FreshActivationGuard<'_> {
     pub(super) fn document(&self) -> &[u8] {
         self.document
     }
+}
+
+/// Initialize the mutable owner revision while the live publication transaction
+/// holds the exact authenticated response and its derived canonical binding.
+fn initialize_fresh_revision(
+    env: &Env,
+    binding: &GrantBinding,
+    identity: &Identity,
+    document: &[u8],
+) -> Result<OwnerWitnessTransition, String> {
+    refresh::initialize_revision(
+        env,
+        &FreshActivationGuard {
+            binding,
+            identity,
+            document,
+        },
+    )
 }
 
 /// A borrowed admission under the account, owner and native auth claims. There
@@ -241,6 +311,8 @@ struct Response {
     producer_seal: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     predecessor: Option<StagePredecessor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_row: Option<codex_enrollment::Staging>,
 }
 
 impl Drop for Response {
@@ -288,47 +360,67 @@ impl Drop for Record {
 
 impl Record {
     fn valid(&self) -> bool {
-        ((self.schema == 1
-            && !matches!(self.phase, Phase::NotDispatched | Phase::RejectedResponse)
-            && self.no_dispatch_seal.is_none()
-            && self.rejection.is_none()
-            && self
+        (self.schema == 6
+            || self
                 .response
                 .as_ref()
-                .is_none_or(|response| response.predecessor.is_none()))
-            || (self.schema == 5
-                && self.phase == Phase::VerifiedResponse
+                .is_none_or(|response| response.native_row.is_none()))
+            && ((self.schema == 1
+                && !matches!(self.phase, Phase::NotDispatched | Phase::RejectedResponse)
                 && self.no_dispatch_seal.is_none()
                 && self.rejection.is_none()
                 && self
                     .response
                     .as_ref()
-                    .and_then(|response| response.predecessor.as_ref())
-                    .is_some_and(StagePredecessor::valid))
-            || (self.schema == 2
-                && self.phase == Phase::NotDispatched
-                && self.rejection.is_none()
-                && self
-                    .no_dispatch_seal
-                    .as_ref()
-                    .is_some_and(|seal| valid_hex(seal, 64)))
-            || (matches!(self.schema, 3 | 4)
-                && self.phase == Phase::RejectedResponse
-                && self.no_dispatch_seal.is_none()
-                && self.rejection.as_ref().is_some_and(|evidence| {
-                    ((self.schema == 3 && evidence.retirement_seal.is_none())
-                        || (self.schema == 4
-                            && evidence
-                                .retirement_seal
-                                .as_ref()
-                                .is_some_and(|seal| valid_hex(seal, 64))))
-                        && evidence.status == 400
-                        && valid_hex(&evidence.body_digest, 64)
-                        && evidence
-                            .producer_mac
+                    .is_none_or(|response| response.predecessor.is_none()))
+                || (self.schema == 5
+                    && self.phase == Phase::VerifiedResponse
+                    && self.no_dispatch_seal.is_none()
+                    && self.rejection.is_none()
+                    && self
+                        .response
+                        .as_ref()
+                        .and_then(|response| response.predecessor.as_ref())
+                        .is_some_and(StagePredecessor::valid))
+                || (self.schema == 6
+                    && self.phase == Phase::VerifiedResponse
+                    && self.no_dispatch_seal.is_none()
+                    && self.rejection.is_none()
+                    && self.response.as_ref().is_some_and(|response| {
+                        response
+                            .predecessor
                             .as_ref()
-                            .is_some_and(|mac| valid_hex(mac, 64))
-                })))
+                            .is_some_and(StagePredecessor::valid)
+                            && response.native_row.as_ref().is_some_and(|staging| {
+                                super::codex_native_row::staging_shape(staging)
+                                    && staging.request == self.request
+                                    && staging.directory.join("auth.json") == self.stage
+                            })
+                    }))
+                || (self.schema == 2
+                    && self.phase == Phase::NotDispatched
+                    && self.rejection.is_none()
+                    && self
+                        .no_dispatch_seal
+                        .as_ref()
+                        .is_some_and(|seal| valid_hex(seal, 64)))
+                || (matches!(self.schema, 3 | 4)
+                    && self.phase == Phase::RejectedResponse
+                    && self.no_dispatch_seal.is_none()
+                    && self.rejection.as_ref().is_some_and(|evidence| {
+                        ((self.schema == 3 && evidence.retirement_seal.is_none())
+                            || (self.schema == 4
+                                && evidence
+                                    .retirement_seal
+                                    .as_ref()
+                                    .is_some_and(|seal| valid_hex(seal, 64))))
+                            && evidence.status == 400
+                            && valid_hex(&evidence.body_digest, 64)
+                            && evidence
+                                .producer_mac
+                                .as_ref()
+                                .is_some_and(|mac| valid_hex(mac, 64))
+                    })))
             && self.request.valid()
             && valid_hex(&self.capability, 64)
             && valid_hex(&self.source_fence, 64)
@@ -400,7 +492,7 @@ fn stage_path(path: &Path) -> Result<PathBuf, String> {
     let parent = path
         .parent()
         .ok_or("invalid staged OAuth response location")?;
-    private_file::check_private_dir(parent)
+    platform::check_private_dir(parent)
         .map_err(|_| "staged OAuth response directory is not private")?;
     let parent = std::fs::canonicalize(parent)
         .map_err(|_| "staged OAuth response directory is unavailable")?;
@@ -418,7 +510,7 @@ fn stage_shape(path: &Path) -> bool {
 }
 
 struct Store {
-    journal: super::pending_native_store::Store,
+    journal: platform::Store,
     directory: PathBuf,
     home: PathBuf,
     identity: age::Identity,
@@ -439,22 +531,19 @@ impl Store {
     }
 
     fn open(env: &Env, id: &str, prepare: bool) -> Result<Option<(Self, Option<Record>)>, String> {
+        platform::require_available()?;
         let (directory, home) = Self::location(env, id)?;
-        let identity = client::read_machine_identity(&client::Paths::locate_for_home(&home))
+        let identity = platform::machine_identity(&home)
             .map_err(|_| "grant owner identity unavailable")?
             .ok_or("grant owner identity unavailable")?;
         let opened = if prepare {
-            Some(super::pending_native_store::Store::open_owned(
+            Some(platform::Store::open_owned(
                 &directory,
                 &home,
                 MAX_ENVELOPE,
             )?)
         } else {
-            super::pending_native_store::Store::open_owned_existing(
-                &directory,
-                &home,
-                MAX_ENVELOPE,
-            )?
+            platform::Store::open_owned_existing(&directory, &home, MAX_ENVELOPE)?
         };
         let Some((journal, plaintext)) = opened else {
             return Ok(None);
@@ -484,7 +573,7 @@ impl Store {
     }
 
     fn current(&self) -> Result<(), String> {
-        let identity = client::read_machine_identity(&client::Paths::locate_for_home(&self.home))
+        let identity = platform::machine_identity(&self.home)
             .map_err(|_| "grant owner identity unavailable")?
             .ok_or("grant owner identity unavailable")?;
         if identity.recipient() != self.identity.recipient() {
@@ -501,10 +590,9 @@ impl Store {
             aterm_json::to_vec(record).map_err(|_| "grant custody cannot be encoded")?,
         );
         if self.current().is_err() {
-            let identity =
-                client::read_machine_identity(&client::Paths::locate_for_home(&self.home))
-                    .map_err(|_| "grant owner identity unavailable")?
-                    .ok_or("grant owner identity unavailable")?;
+            let identity = platform::machine_identity(&self.home)
+                .map_err(|_| "grant owner identity unavailable")?
+                .ok_or("grant owner identity unavailable")?;
             if identity.recipient() != self.identity.recipient()
                 || !self
                     .journal
@@ -755,7 +843,29 @@ impl Store {
             owner,
             &response.document,
         );
-        if let Some(predecessor) = &response.predecessor {
+        if let Some(staging) = &response.native_row {
+            if record.schema != 6 || !super::codex_native_row::staging_shape(staging) {
+                return Err("native row issuer evidence unavailable".into());
+            }
+            let predecessor = response
+                .predecessor
+                .as_ref()
+                .ok_or("native row predecessor unavailable")?;
+            let body = SecretBytes::new(
+                aterm_json::to_vec(&(
+                    "aterm/codex-code-response-origin/v3",
+                    legacy,
+                    predecessor,
+                    staging,
+                ))
+                .map_err(|_| "native row origin cannot be encoded")?,
+            );
+            machine_mac(
+                &self.identity,
+                b"aterm/codex-code-response-origin/key/v3\0",
+                body.as_slice(),
+            )
+        } else if let Some(predecessor) = &response.predecessor {
             let body = SecretBytes::new(
                 aterm_json::to_vec(&("aterm/codex-code-response-origin/v2", legacy, predecessor))
                     .map_err(|_| "grant origin cannot be encoded")?,
@@ -825,15 +935,87 @@ pub(super) fn machine_mac(
     ))
 }
 
+// A live preparation may release its owner claim while a browser waits. The
+// original encrypted revision remains the only admissible reopening target.
+struct PreparedStore {
+    active: Option<Store>,
+    parked: Option<(Env, [u8; 32])>,
+}
+impl PreparedStore {
+    fn park(&mut self, env: &Env) -> Result<(), String> {
+        let store = self.active.as_ref().ok_or("grant custody is not held")?;
+        store.current()?;
+        let digest = store
+            .journal
+            .sealed_digest()
+            .ok_or("grant preparation is not durable")?;
+        self.parked = Some((env.clone(), digest));
+        self.active = None;
+        Ok(())
+    }
+    fn resume(&mut self, operation: &str) -> Result<(), String> {
+        if self.active.is_some() {
+            return Ok(());
+        }
+        let (env, expected) = self.parked.as_ref().ok_or("grant custody is unavailable")?;
+        let (store, record) =
+            Store::open(env, operation, false)?.ok_or("grant preparation disappeared")?;
+        if store.journal.sealed_digest() != Some(*expected)
+            || !record.is_some_and(|record| record.phase == Phase::Prepared)
+        {
+            return Err("grant preparation changed while browser was active".into());
+        }
+        store.current()?;
+        self.active = Some(store);
+        self.parked = None;
+        Ok(())
+    }
+    fn held(&self) -> Result<&Store, String> {
+        self.active
+            .as_ref()
+            .ok_or_else(|| "grant custody is not held".into())
+    }
+    fn held_mut(&mut self) -> Result<&mut Store, String> {
+        self.active
+            .as_mut()
+            .ok_or_else(|| "grant custody is not held".into())
+    }
+    fn write(&mut self, record: &Record) -> Result<(), String> {
+        self.held_mut()?.write(record)
+    }
+    fn no_dispatch_mac(&self, record: &Record) -> Result<String, String> {
+        self.held()?.no_dispatch_mac(record)
+    }
+    fn origin_seal(&self, record: &Record) -> Result<String, String> {
+        self.held()?.origin_seal(record)
+    }
+    fn rejection_mac(&self, record: &Record) -> Result<String, String> {
+        self.held()?.rejection_mac(record)
+    }
+    fn issuance(&self, record: &Record) -> Result<GrantReference, String> {
+        self.held()?.issuance(record)
+    }
+    fn authenticates_no_dispatch(&self, record: &Record) -> bool {
+        self.held()
+            .is_ok_and(|store| store.authenticates_no_dispatch(record))
+    }
+    fn authenticates_rejection(&self, record: &Record) -> bool {
+        self.held()
+            .is_ok_and(|store| store.authenticates_rejection(record))
+    }
+}
+
 /// One staged exchange's durable custody, prepared before the authorization code
 /// can be spent. Different enrollments hold different locks.
 pub(super) struct PreparedGrant {
-    store: Store,
+    store: PreparedStore,
     record: Record,
     stage_witness: codex_app_login::StagedWitness,
     fresh_origin: bool,
     no_dispatch_pending: bool,
     rejection_origin: bool,
+    native_scope: Option<std::sync::Arc<super::native_enrollment_admission::NativeBrowserTurn>>,
+    row_admission: Option<super::codex_native_row::NativeRowAdmission>,
 }
 
 impl std::fmt::Debug for PreparedGrant {
@@ -848,6 +1030,7 @@ pub(super) fn prepare(
     stage: &Path,
     source_fence: &str,
 ) -> Result<PreparedGrant, String> {
+    platform::require_available()?;
     if !request.valid() || !valid_hex(source_fence, 64) {
         return Err("invalid grant preparation".into());
     }
@@ -858,10 +1041,8 @@ pub(super) fn prepare(
     let root = directory
         .parent()
         .ok_or("grant custody directory unavailable")?;
-    aterm_secrets::fsx::ensure_private_dir(root)
-        .map_err(|_| "grant custody directory unavailable")?;
-    let _registry = PrivateLock::take(root, "registry.lock", Duration::ZERO, "grant registry busy")
-        .map_err(|_| "grant registry is busy")?;
+    platform::ensure_private_dir(root).map_err(|_| "grant custody directory unavailable")?;
+    let _registry = platform::registry_lock(root).map_err(|_| "grant registry is busy")?;
     let mut entries = std::fs::read_dir(root).map_err(|_| "grant registry unavailable")?;
     let count = entries.by_ref().take(MAX_PENDING + 2).count();
     if count > MAX_PENDING && !directory.exists() {
@@ -902,13 +1083,133 @@ pub(super) fn prepare(
         record
     };
     Ok(PreparedGrant {
-        store,
+        store: PreparedStore {
+            active: Some(store),
+            parked: None,
+        },
         record,
         stage_witness,
         fresh_origin: false,
         no_dispatch_pending: false,
         rejection_origin: false,
+        native_scope: None,
+        row_admission: None,
     })
+}
+
+/// Resource identity derived only from an authenticated retained native response.
+/// Labels, email, profile paths and locally minted owner IDs are excluded.
+#[derive(PartialEq, Eq)]
+pub(super) struct PublicationIdentity {
+    operation: String,
+    resources: Vec<String>,
+}
+impl PublicationIdentity {
+    pub(super) fn operation(&self) -> &str {
+        &self.operation
+    }
+    pub(super) fn resources(&self) -> &[String] {
+        &self.resources
+    }
+}
+fn response_resource_identity(
+    request: &codex_enrollment::Request,
+    identity: &Identity,
+    document: &[u8],
+) -> Result<PublicationIdentity, String> {
+    let document: aterm_json::Value =
+        aterm_json::from_slice(document).map_err(|_| "native publication identity unavailable")?;
+    let refresh = document
+        .get("tokens")
+        .and_then(|tokens| tokens.get("refresh_token"))
+        .and_then(aterm_json::Value::as_str)
+        .filter(|refresh| !refresh.is_empty())
+        .ok_or("native publication refresh lineage unavailable")?;
+    let resource = |domain: &[u8], bytes: &[u8]| {
+        let mut input = zeroize::Zeroizing::new(domain.to_vec());
+        input.extend_from_slice(bytes);
+        aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(input.as_slice()))
+    };
+    let mut resources = vec![
+        resource(
+            b"aterm native publication account v1\0",
+            identity.account.as_bytes(),
+        ),
+        resource(b"aterm native publication refresh v1\0", refresh.as_bytes()),
+    ];
+    resources.sort();
+    resources.dedup();
+    Ok(PublicationIdentity {
+        operation: request.id.clone(),
+        resources,
+    })
+}
+fn publication_identity(
+    env: &Env,
+    request: &codex_enrollment::Request,
+    grant: &RetainedGrant,
+) -> Result<PublicationIdentity, String> {
+    with_retained_response(env, request, grant, |identity, document, _, _, _| {
+        response_resource_identity(request, identity, document)
+    })
+}
+
+/// Historical authenticated resource names, never publication or source proof.
+#[derive(PartialEq, Eq)]
+pub(super) struct RetirementIdentity(PublicationIdentity);
+impl RetirementIdentity {
+    pub(super) fn operation(&self) -> &str {
+        self.0.operation()
+    }
+    pub(super) fn resources(&self) -> &[String] {
+        self.0.resources()
+    }
+}
+fn retirement_identity(
+    env: &Env,
+    candidate: &super::codex_native_retirement::NativeRetirementCandidate,
+    grant: &RetainedGrant,
+) -> Result<RetirementIdentity, String> {
+    let (owner, record) = open_authenticated(env, candidate.request(), &grant.reference())?;
+    let response = record
+        .response
+        .as_ref()
+        .ok_or("native retirement response unavailable")?;
+    if record.schema != 6 || response.native_row.as_ref() != Some(candidate.staging()) {
+        return Err("native retirement issuer stage changed".into());
+    }
+    let identity = response
+        .identity
+        .as_ref()
+        .ok_or("native retirement identity unavailable")?;
+    let document = decoded_document(response, MAX_DOCUMENT)?;
+    let result = response_resource_identity(candidate.request(), identity, document.as_slice())?;
+    owner.current()?;
+    Ok(RetirementIdentity(result))
+}
+/// Wait only after the actual response is durable. The first identity read
+/// drops owner/Auth claims before higher-ranked publication resources wait;
+/// successful admission then reopens and checks the same immutable response.
+pub(super) fn admit_native_publication_within(
+    env: &Env,
+    request: &codex_enrollment::Request,
+    grant: &RetainedGrant,
+    turn: &super::native_enrollment_admission::NativeBrowserTurn,
+    scope: &super::account_work::Scope,
+    deadline: super::wake_deadline::WakeDeadline,
+) -> Result<(), String> {
+    let identity = publication_identity(env, request, grant)?;
+    turn.admit_publication_within(&identity, scope, deadline)?;
+    let result = publication_identity(env, request, grant).and_then(|current| {
+        if current != identity || scope.cancelled() || deadline.passed() {
+            return Err("native publication identity or work changed".into());
+        }
+        turn.check_publication()
+    });
+    if result.is_err() {
+        turn.reject_publication();
+    }
+    result
 }
 
 /// Retained fresh-code evidence. It is still pending canonical account
@@ -995,7 +1296,7 @@ pub(super) struct RejectedCompletion {
     _request: codex_enrollment::Request,
 }
 impl RejectedCompletion {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn matches_request(&self, request: &codex_enrollment::Request) -> bool {
         self._request == *request
     }
@@ -1023,9 +1324,79 @@ impl NotDispatched {
     }
 }
 
+/// Only a successfully persisted exact live completion can release exchange
+/// exclusion. This grants neither provider identity nor publication authority.
+pub(super) struct DurableExchangeSettlement {
+    operation: String,
+}
+impl DurableExchangeSettlement {
+    pub(super) fn operation(&self) -> &str {
+        &self.operation
+    }
+}
+
 impl PreparedGrant {
+    pub(super) fn with_row_admission(
+        mut self,
+        admission: super::codex_native_row::NativeRowAdmission,
+    ) -> Result<Self, String> {
+        let staging = admission.staging();
+        if !super::codex_native_row::staging_shape(staging)
+            || staging.request != self.record.request
+            || staging.directory.join("auth.json") != self.record.stage
+            || !self.stage_witness.matches_auth_file(&self.record.stage)
+            || self
+                .native_scope
+                .as_ref()
+                .is_none_or(|scope| !scope.matches_request(&self.record.request))
+        {
+            return Err("native row admission does not match this producer".into());
+        }
+        self.row_admission = Some(admission);
+        Ok(self)
+    }
+
+    pub(super) fn with_native_scope(
+        mut self,
+        env: &Env,
+        scope: Option<std::sync::Arc<super::native_enrollment_admission::NativeBrowserTurn>>,
+    ) -> Result<Self, String> {
+        if let Some(scope) = &scope {
+            if !scope.matches_request(&self.record.request) {
+                return Err("native browser reservation belongs to another enrollment".into());
+            }
+            scope.check_preparation(
+                &env.accounts_store_for(super::accounts::Cli::Codex)
+                    .ok_or("native account store unavailable")?,
+            )?;
+            scope.bind_source_home(
+                env.home
+                    .as_deref()
+                    .ok_or("native source home unavailable")?,
+            )?;
+            self.store.park(env)?;
+        }
+        self.native_scope = scope;
+        Ok(self)
+    }
+    pub(super) fn native_scope(
+        &self,
+    ) -> Option<std::sync::Arc<super::native_enrollment_admission::NativeBrowserTurn>> {
+        self.native_scope.clone()
+    }
+
+    fn release_settled_exchange(&self) {
+        if let Some(scope) = &self.native_scope {
+            scope.response_durable(&DurableExchangeSettlement {
+                operation: self.record.request.id.clone(),
+            });
+        }
+    }
     fn settle_not_dispatched(mut self) -> CaptureOutcome {
         self.no_dispatch_pending = true;
+        if self.store.resume(&self.record.request.id).is_err() {
+            return CaptureOutcome::Pending(Box::new(RetentionFailure { pending: self }));
+        }
         if matches!(self.record.phase, Phase::Prepared | Phase::Attempted) {
             // First settle an uncertain acknowledgment of the exact attempted
             // write. Only the live no-send branch may advance it to this proof.
@@ -1045,12 +1416,14 @@ impl PreparedGrant {
         {
             return CaptureOutcome::Pending(Box::new(RetentionFailure { pending: self }));
         }
+        self.release_settled_exchange();
         CaptureOutcome::NotDispatched(NotDispatched {
             request: self.record.request.clone(),
         })
     }
 
     pub(super) fn begin_exchange(&mut self) -> Result<(), String> {
+        self.store.resume(&self.record.request.id)?;
         if self.record.phase != Phase::Prepared {
             return Err("grant exchange is already attempted".into());
         }
@@ -1075,7 +1448,7 @@ impl PreparedGrant {
                     .record
                     .stage
                     .parent()
-                    .is_some_and(|parent| private_file::check_private_dir(parent).is_ok())
+                    .is_some_and(|parent| platform::check_private_dir(parent).is_ok())
                 && witness.matches_auth_file(&self.record.stage)
                 && document.len() <= MAX_DOCUMENT;
             self.capture_response(
@@ -1090,6 +1463,14 @@ impl PreparedGrant {
                     .as_mut()
                     .expect("captured response")
                     .predecessor = Some(predecessor);
+            }
+            if self.record.phase == Phase::VerifiedResponse
+                && let Some(admission) = self.row_admission.as_ref()
+            {
+                self.record.schema = 6;
+                if let Some(response) = self.record.response.as_mut() {
+                    response.native_row = Some(admission.staging().clone());
+                }
             }
             self.settle_response()
         })
@@ -1147,6 +1528,7 @@ impl PreparedGrant {
             login_owner: owner,
             producer_seal: None,
             predecessor: None,
+            native_row: None,
         });
         // Only the live FreshCodeGrant callback supplies a verified identity
         // in production. Encrypted recovery never constructs this volatile fact.
@@ -1200,21 +1582,31 @@ impl PreparedGrant {
             if !self.store.authenticates_rejection(&self.record) {
                 return CaptureOutcome::Pending(Box::new(RetentionFailure { pending: self }));
             }
+            self.release_settled_exchange();
             CaptureOutcome::Rejected(RejectedCompletion {
                 _request: self.record.request.clone(),
             })
         } else if self.record.phase == Phase::VerifiedResponse {
             match self.store.issuance(&self.record) {
-                Ok(reference) => CaptureOutcome::Verified(RetainedGrant {
-                    reference,
-                    request: self.record.request.clone(),
-                }),
+                Ok(reference) => {
+                    self.release_settled_exchange();
+                    CaptureOutcome::Verified(RetainedGrant {
+                        reference,
+                        request: self.record.request.clone(),
+                    })
+                }
                 Err(_) => CaptureOutcome::Pending(Box::new(RetentionFailure { pending: self })),
             }
         } else {
-            let Some(digest) = self.store.journal.sealed_digest() else {
+            let Some(digest) = self
+                .store
+                .held()
+                .ok()
+                .and_then(|store| store.journal.sealed_digest())
+            else {
                 return CaptureOutcome::Pending(Box::new(RetentionFailure { pending: self }));
             };
+            self.release_settled_exchange();
             CaptureOutcome::Unverified(RetainedResponse {
                 _operation: self.record.request.id.clone(),
                 _issuance_digest: aterm_codec::hex::encode_lower(&digest),
@@ -1225,6 +1617,13 @@ impl PreparedGrant {
 
 impl codex_app_login::CodeGrantCapture for PreparedGrant {
     type Output = CaptureOutcome;
+
+    fn claim_exchange(&mut self) -> Result<(), String> {
+        if !self.stage_witness.matches_auth_file(&self.record.stage) {
+            return Err("grant preparation stage changed".into());
+        }
+        self.store.resume(&self.record.request.id)
+    }
 
     fn begin_exchange(&mut self) -> Result<(), String> {
         PreparedGrant::begin_exchange(self)
@@ -1360,7 +1759,7 @@ pub(super) fn recover_rejection_retirement(
     finish_rejection_retirement(&mut store, &record).map(Some)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn recover_rejection(
     env: &Env,
     request: &codex_enrollment::Request,
@@ -1513,6 +1912,364 @@ fn open_authenticated(
     Ok((store, record))
 }
 
+/// Authenticated immutable issuer, retained under its actual owner claim. It
+/// can sign only the exact staging/reference already authenticated on open.
+pub(super) struct RowPublicationIssuer {
+    owner: Store,
+    record: Record,
+    reference: GrantReference,
+}
+
+/// Exact producer bytes under the original issuer and stage authentication
+/// claims. This cannot be reconstructed from a row receipt or document bytes.
+pub(super) struct PublicationResponse<'a> {
+    issuer: &'a RowPublicationIssuer,
+    identity: Identity,
+    document: SecretBytes,
+    witness: codex_app_login::StagedWitness,
+    auth: codex_app_login::AuthLock,
+}
+impl PublicationResponse<'_> {
+    fn current(&self) -> Result<(), String> {
+        self.issuer.owner.current()?;
+        let record = &self.issuer.record;
+        let (path, device, inode) = self.witness.coordinates()?;
+        if path != record.stage
+            || device != record.stage_device
+            || inode != record.stage_inode
+            || !self.witness.matches_auth_file(path)
+        {
+            return Err("native publication stage changed".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(super) fn with_original_stage<R>(
+        &self,
+        use_stage: impl FnOnce(
+            &[u8],
+            &codex_app_login::StagedWitness,
+            &codex_app_login::AuthLock,
+            Option<Option<&str>>,
+        ) -> Result<R, String>,
+    ) -> Result<R, String> {
+        self.current()?;
+        let predecessor = self
+            .issuer
+            .record
+            .response
+            .as_ref()
+            .and_then(|response| response.predecessor.as_ref())
+            .map(StagePredecessor::digest);
+        let result = use_stage(
+            self.document.as_slice(),
+            &self.witness,
+            &self.auth,
+            predecessor,
+        )?;
+        self.current()?;
+        Ok(result)
+    }
+
+    pub(super) fn initialize_revision(
+        &self,
+        env: &Env,
+        permit: &super::accounts::ActualPublicationPermit<'_>,
+        fresh: &RetainedGrant,
+    ) -> Result<OwnerWitnessTransition, String> {
+        self.current()?;
+        if fresh.reference() != self.issuer.reference {
+            return Err("native publication issuer changed".into());
+        }
+        permit.require_staging_store(self.issuer.staging())?;
+        if !codex_app_login::retained_document_current(
+            &self.witness,
+            &self.auth,
+            self.document.as_slice(),
+        ) {
+            return Err("native publication document differs from issuer".into());
+        }
+        let binding = permit.binding(&self.issuer.record.request, fresh)?;
+        let transition =
+            initialize_fresh_revision(env, &binding, &self.identity, self.document.as_slice())?;
+        self.current()?;
+        if !codex_app_login::retained_document_current(
+            &self.witness,
+            &self.auth,
+            self.document.as_slice(),
+        ) {
+            return Err("native publication document changed".into());
+        }
+        Ok(transition)
+    }
+}
+
+impl RowPublicationIssuer {
+    pub(super) fn publication_response(&self) -> Result<PublicationResponse<'_>, String> {
+        self.owner.current()?;
+        let witness = codex_app_login::StagedWitness::open(&self.record.stage)?;
+        let (path, device, inode) = witness.coordinates()?;
+        if path != self.record.stage
+            || device != self.record.stage_device
+            || inode != self.record.stage_inode
+        {
+            return Err("native publication stage parent changed".into());
+        }
+        let auth = codex_app_login::AuthLock::try_take(path)
+            .map_err(|_| "native publication stage custody unavailable")?
+            .ok_or("native publication stage custody busy")?;
+        let response = self
+            .record
+            .response
+            .as_ref()
+            .ok_or("native response absent")?;
+        let held = PublicationResponse {
+            issuer: self,
+            identity: response.identity.clone().ok_or("native identity absent")?,
+            document: decoded_document(response, MAX_DOCUMENT)?,
+            witness,
+            auth,
+        };
+        held.current()?;
+        Ok(held)
+    }
+
+    pub(super) fn reference(&self) -> GrantReference {
+        self.reference.clone()
+    }
+
+    pub(super) fn staging(&self) -> &codex_enrollment::Staging {
+        self.record
+            .response
+            .as_ref()
+            .and_then(|response| response.native_row.as_ref())
+            .expect("issuer constructor requires native staging")
+    }
+    pub(super) fn sign_publication(
+        &self,
+        permit: &super::accounts::ActualPublicationPermit<'_>,
+        fresh: &RetainedGrant,
+    ) -> Result<RowPublicationSignature, String> {
+        permit.require_staging_store(self.staging())?;
+        let binding = permit.binding(&self.record.request, fresh)?;
+        let fingerprint = permit.after_binding_digest(&self.record.request, fresh)?;
+        let staging = self.staging().clone();
+        let mac = self.authenticate_receipt(&binding, &staging, &fingerprint)?;
+        Ok(RowPublicationSignature {
+            stamp: permit.stamp(),
+            binding,
+            staging,
+            fingerprint,
+            mac,
+        })
+    }
+
+    pub(super) fn verify_publication(
+        &self,
+        data: &super::codex_native_row::PublicationReceiptData,
+    ) -> Result<(), String> {
+        if !data.valid() {
+            return Err("native publication receipt is invalid".into());
+        }
+        let expected =
+            self.authenticate_receipt(data.binding(), data.staging(), data.binding_fingerprint())?;
+        if !aterm_digest::ct_eq(expected.as_bytes(), data.seal().as_bytes()) {
+            return Err("native publication receipt seal differs".into());
+        }
+        Ok(())
+    }
+
+    fn authenticate_receipt(
+        &self,
+        binding: &GrantBinding,
+        staging: &codex_enrollment::Staging,
+        fingerprint: &str,
+    ) -> Result<String, String> {
+        self.owner.current()?;
+        if binding.request != self.record.request
+            || binding.reference != self.reference
+            || binding.generation == 0
+            || staging != self.staging()
+        {
+            return Err("native row issuer does not match publication".into());
+        }
+        let body = aterm_json::to_vec(&(
+            "aterm/native-row-publication/v1",
+            binding,
+            staging,
+            fingerprint,
+        ))
+        .map_err(|_| "native publication receipt cannot be encoded")?;
+        machine_mac(
+            &self.owner.identity,
+            b"aterm/native-row-publication/key/v1\0",
+            &body,
+        )
+    }
+}
+
+/// A single actual permit's signed occurrence. No serialized-data constructor,
+/// cloning or replacement stamp; consuming it retains the original channel.
+pub(super) struct RowPublicationSignature {
+    stamp: super::accounts::ActualPublicationStamp,
+    binding: GrantBinding,
+    staging: codex_enrollment::Staging,
+    fingerprint: String,
+    mac: String,
+}
+impl RowPublicationSignature {
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        super::accounts::ActualPublicationStamp,
+        GrantBinding,
+        codex_enrollment::Staging,
+        String,
+        String,
+    ) {
+        (
+            self.stamp,
+            self.binding,
+            self.staging,
+            self.fingerprint,
+            self.mac,
+        )
+    }
+}
+
+pub(super) fn admit_native_recovery_publication(
+    env: &Env,
+    store: &super::accounts::Store,
+    candidate: super::codex_native_row::NativeRecoveryCandidate,
+    fresh: &RetainedGrant,
+    scope: &super::account_work::Scope,
+    deadline: super::wake_deadline::WakeDeadline,
+) -> Result<super::native_enrollment_admission::NativeRecoveryResources, String> {
+    if !fresh.matches_request(candidate.request())
+        || fresh.reference() != *candidate.reference()
+        || std::fs::canonicalize(
+            env.home
+                .as_deref()
+                .ok_or("native recovery home unavailable")?,
+        )
+        .ok()
+        .as_deref()
+            != Some(candidate.source_home())
+    {
+        return Err("native recovery response or namespace changed".into());
+    }
+    // This bounded observation releases its actual owner/Auth claims before
+    // acquiring the higher-ranked Source/E/principal resources.
+    let identity = publication_identity(env, candidate.request(), fresh)?;
+    let turn = super::native_enrollment_admission::NativeRecoveryResources::acquire(
+        store, candidate, &identity, scope, deadline,
+    )?;
+    let result = publication_identity(env, turn.candidate().request(), fresh).and_then(|current| {
+        if current != identity {
+            return Err("native recovery response changed".into());
+        }
+        turn.check_store(store)
+    });
+    result?;
+    Ok(turn)
+}
+
+pub(super) fn admit_native_retirement(
+    env: &Env,
+    store: &super::accounts::Store,
+    candidate: super::codex_native_retirement::NativeRetirementCandidate,
+    fresh: &RetainedGrant,
+    scope: &super::account_work::Scope,
+    release: super::account_work::ReleaseTurn,
+    deadline: super::wake_deadline::WakeDeadline,
+) -> Result<super::native_enrollment_admission::NativeRetirementResources, String> {
+    if !fresh.matches_request(candidate.request())
+        || fresh.reference() != *candidate.reference()
+        || std::fs::canonicalize(
+            env.home
+                .as_deref()
+                .ok_or("native retirement home unavailable")?,
+        )
+        .ok()
+        .as_deref()
+            != Some(candidate.source_home())
+    {
+        return Err("native retirement response or namespace changed".into());
+    }
+    // Historical issuer custody releases before kernel waits. No stage or
+    // AuthLock is opened: this role can only retire canonical metadata.
+    let identity = retirement_identity(env, &candidate, fresh)?;
+    let resources = super::native_enrollment_admission::NativeRetirementResources::acquire(
+        store, candidate, &identity, scope, release, deadline,
+    )?;
+    if retirement_identity(env, resources.candidate(), fresh)? != identity {
+        return Err("native retirement response changed".into());
+    }
+    resources.check_store(store)?;
+    Ok(resources)
+}
+
+pub(super) fn admit_native_retirement_released(
+    env: &Env,
+    store: &super::accounts::Store,
+    candidate: super::codex_native_retirement::NativeRetirementCandidate,
+    fresh: &RetainedGrant,
+    operation: &super::account_work::ReleaseOperation,
+    deadline: super::wake_deadline::WakeDeadline,
+) -> Result<super::native_enrollment_admission::NativeRetirementResources, String> {
+    if !fresh.matches_request(candidate.request())
+        || fresh.reference() != *candidate.reference()
+        || std::fs::canonicalize(
+            env.home
+                .as_deref()
+                .ok_or("native retirement home unavailable")?,
+        )
+        .ok()
+        .as_deref()
+            != Some(candidate.source_home())
+    {
+        return Err("native retirement response or namespace changed".into());
+    }
+    // Historical issuer custody releases before kernel waits. No stage or
+    // AuthLock is opened: this role can only retire canonical metadata.
+    let identity = retirement_identity(env, &candidate, fresh)?;
+    let resources =
+        super::native_enrollment_admission::NativeRetirementResources::acquire_released(
+            store, candidate, &identity, operation, deadline,
+        )?;
+    if retirement_identity(env, resources.candidate(), fresh)? != identity {
+        return Err("native retirement response changed".into());
+    }
+    resources.check_store(store)?;
+    Ok(resources)
+}
+
+pub(super) fn row_publication_issuer(
+    env: &Env,
+    request: &codex_enrollment::Request,
+    fresh: &RetainedGrant,
+) -> Result<RowPublicationIssuer, String> {
+    if !fresh.matches_request(request) {
+        return Err("native publication request differs".into());
+    }
+    let (owner, record) = open_authenticated(env, request, &fresh.reference)?;
+    if record.schema != 6
+        || record
+            .response
+            .as_ref()
+            .and_then(|r| r.native_row.as_ref())
+            .is_none()
+    {
+        return Err("native publication has no row issuer".into());
+    }
+    Ok(RowPublicationIssuer {
+        owner,
+        record,
+        reference: fresh.reference(),
+    })
+}
+
 /// Observe the exact authenticated retained response while its original
 /// opened stage parent and AuthLock remain held. This does not adopt or rewrite
 /// any existing stage document; a caller must prove its own write transition.
@@ -1561,6 +2318,59 @@ pub(super) fn with_retained_response<R>(
         return Err("retained stage parent changed".into());
     }
     Ok(result)
+}
+
+/// Publication-only initialization while the original retained response and
+/// stage AuthLock remain held by `with_retained_response`.
+pub(super) struct FreshPublicationResponse<'a> {
+    env: &'a Env,
+    request: &'a codex_enrollment::Request,
+    grant: &'a RetainedGrant,
+    identity: &'a Identity,
+    document: &'a [u8],
+    witness: &'a codex_app_login::StagedWitness,
+    auth: &'a codex_app_login::AuthLock,
+}
+impl FreshPublicationResponse<'_> {
+    pub(super) fn initialize(
+        &self,
+        permit: &super::accounts::ActualPublicationPermit<'_>,
+    ) -> Result<OwnerWitnessTransition, String> {
+        if !codex_app_login::retained_document_current(self.witness, self.auth, self.document) {
+            return Err("native publication document differs from issuer".into());
+        }
+        let binding = permit.binding(self.request, self.grant)?;
+        let transition =
+            initialize_fresh_revision(self.env, &binding, self.identity, self.document)?;
+        if !codex_app_login::retained_document_current(self.witness, self.auth, self.document) {
+            return Err("native publication document changed".into());
+        }
+        Ok(transition)
+    }
+}
+
+pub(super) fn with_fresh_publication_response<R>(
+    env: &Env,
+    request: &codex_enrollment::Request,
+    grant: &RetainedGrant,
+    publish: impl FnOnce(FreshPublicationResponse<'_>) -> Result<R, String>,
+) -> Result<R, String> {
+    with_retained_response(
+        env,
+        request,
+        grant,
+        |identity, document, witness, auth, _| {
+            publish(FreshPublicationResponse {
+                env,
+                request,
+                grant,
+                identity,
+                document,
+                witness,
+                auth,
+            })
+        },
+    )
 }
 
 /// Revalidate the actual canonical publication, current source policy and
@@ -1690,13 +2500,155 @@ pub(super) fn with_current_published_grant<R>(
     )
 }
 
+/// Resolve one target from the same canonical publication used by admission.
+/// No global pool pin, sign-in, provider request or assignment is changed.
+pub(super) fn with_selected_target<R>(
+    env: &Env,
+    caller: &super::codex_session_slot::Caller,
+    pool_revision: &str,
+    selection: &super::codex_assignment::protocol::Selection,
+    source: &GrantBinding,
+    retained: Option<&GrantBinding>,
+    use_grant: impl FnOnce(AdmittedGrant<'_>) -> Result<R, String>,
+) -> Result<R, String> {
+    use super::{accounts, codex_assignment::protocol::Selection, native_act::Process};
+    let process = Process::observe(caller.pid).ok_or("credential consumer unavailable")?;
+    if process.birth != caller.birth || !consumer_capable(&process, false)? {
+        return Err("credential consumer unsupported".into());
+    }
+    let store = env
+        .accounts_store_for(accounts::Cli::Codex)
+        .ok_or("account store unavailable")?;
+    let writer = store
+        .acquire_bounded()
+        .map_err(|_| "account writer unavailable")?
+        .ok_or("account writer busy")?;
+    let roster_path = env
+        .accounts_roster_for(accounts::Cli::Codex)
+        .ok_or("account roster unavailable")?;
+    let records = store
+        .peek_account_records(&roster_path, env.now)
+        .map_err(|_| "account publication unavailable")?;
+    if accounts::pool_authority_revision(&records.raw_roster, &records.logins)? != pool_revision {
+        return Err("assignment pool revision changed".into());
+    }
+    if !records
+        .logins
+        .enrollment
+        .authenticates_published_grant(source)
+    {
+        return Err("assignment source publication changed".into());
+    }
+    let source_row = records
+        .roster
+        .row(&source.request.label)
+        .ok_or("assignment source unavailable")?;
+    let source_policy = super::accounts_sync::codex_completion_source(env, source_row)
+        .map_err(|_| "assignment source policy unavailable")?;
+    if source_row.held_by.is_some()
+        || source_policy.held_by.is_some()
+        || source_policy.fleet.as_ref().is_some_and(|fleet| {
+            fleet.roster.accounts.iter().any(|account| {
+                account.label == source_row.label
+                    && (account.vendor != source_row.vendor
+                        || !source_row
+                            .expected_identity_email()
+                            .is_some_and(|email| accounts::email_matches(email, &account.email)))
+            })
+        })
+    {
+        return Err("assignment source policy changed".into());
+    }
+    let enrolled = store.enrolled_here(&records.roster);
+    let candidates = accounts::candidates(
+        &records.roster,
+        &records.state,
+        &enrolled,
+        None,
+        &accounts::Point::TurnEnd,
+        env.now,
+    );
+    let mut selected = None;
+    for (label, eligible) in candidates {
+        if eligible.is_err() {
+            continue;
+        }
+        let matches = match selection {
+            Selection::Auto => label != source.request.label,
+            Selection::Account(id) => super::codex_enrollment::account_id(&label) == *id,
+        };
+        if !matches {
+            continue;
+        }
+        let Some(bound) = records.logins.get(&label) else {
+            continue;
+        };
+        let Some(binding) = records
+            .logins
+            .enrollment
+            .published_grant(&label, bound.last_success_generation)
+        else {
+            continue;
+        };
+        if retained.is_some_and(|expected| expected != &binding) {
+            continue;
+        }
+        if matches!(selection, Selection::Account(_)) && selected.is_some() {
+            return Err("assignment target is ambiguous".into());
+        }
+        selected = Some(binding);
+        if matches!(selection, Selection::Auto) {
+            break;
+        }
+    }
+    let binding = selected.ok_or("assignment target unavailable")?;
+    let result = with_canonical_owner_held(
+        env,
+        &binding,
+        CanonicalContext {
+            store: &store,
+            writer: &writer,
+            roster_path: &roster_path,
+            records: &records,
+        },
+        |grant| {
+            lineage_consumers_capable(env, grant.canonical_auth, grant.identity)?;
+            if Process::observe(caller.pid).as_ref() != Some(&process) {
+                return Err("credential consumer changed".into());
+            }
+            Ok(())
+        },
+        |grant| {
+            let result = use_grant(AdmittedGrant {
+                binding: grant.binding,
+                identity: grant.identity,
+                revision: grant.revision,
+                document: grant.document,
+                canonical_auth: grant.canonical_auth,
+                anchor: grant.anchor,
+            })?;
+            if Process::observe(caller.pid).as_ref() != Some(&process) {
+                return Err("credential consumer changed".into());
+            }
+            Ok(result)
+        },
+    )?;
+    if super::accounts_sync::codex_completion_source(env, source_row)
+        .map_err(|_| "assignment source policy unavailable")?
+        != source_policy
+    {
+        return Err("assignment source policy changed".into());
+    }
+    Ok(result)
+}
+
 fn with_canonical_owner<R>(
     env: &Env,
     binding: &GrantBinding,
     before_use: impl FnOnce(&CanonicalGrant<'_>) -> Result<(), String>,
     use_owner: impl FnOnce(CanonicalGrant<'_>) -> Result<R, String>,
 ) -> Result<R, String> {
-    use super::{accounts, accounts_sync};
+    use super::accounts;
     if binding.generation == 0 || !binding.request.valid() || !binding.reference.valid() {
         return Err("invalid published grant binding".into());
     }
@@ -1713,6 +2665,41 @@ fn with_canonical_owner<R>(
     let records = store
         .peek_account_records(&roster_path, env.now)
         .map_err(|_| "account publication unavailable")?;
+    with_canonical_owner_held(
+        env,
+        binding,
+        CanonicalContext {
+            store: &store,
+            writer: &_writer,
+            roster_path: &roster_path,
+            records: &records,
+        },
+        before_use,
+        use_owner,
+    )
+}
+
+struct CanonicalContext<'a> {
+    store: &'a super::accounts::Store,
+    writer: &'a super::accounts::Lock,
+    roster_path: &'a Path,
+    records: &'a super::accounts::AccountRecords,
+}
+
+fn with_canonical_owner_held<R>(
+    env: &Env,
+    binding: &GrantBinding,
+    context: CanonicalContext<'_>,
+    before_use: impl FnOnce(&CanonicalGrant<'_>) -> Result<(), String>,
+    use_owner: impl FnOnce(CanonicalGrant<'_>) -> Result<R, String>,
+) -> Result<R, String> {
+    use super::{accounts, accounts_sync};
+    let CanonicalContext {
+        store,
+        writer,
+        roster_path,
+        records,
+    } = context;
     if !records
         .logins
         .enrollment
@@ -1747,7 +2734,7 @@ fn with_canonical_owner<R>(
         return Err("account source changed".into());
     }
     let (owner, issuance) = open_authenticated(env, &binding.request, &binding.reference)?;
-    let anchor = codex_enrollment::OwnerAnchorWriter::new(&store, &_writer, binding, env.now);
+    let anchor = codex_enrollment::OwnerAnchorWriter::new(store, writer, binding, env.now);
     let witness = anchor
         .read()?
         .ok_or("published owner has no canonical activation witness")?;
@@ -1780,17 +2767,8 @@ fn with_canonical_owner<R>(
     let parent = canonical_auth
         .parent()
         .ok_or("native auth location invalid")?;
-    let (bytes, metadata) =
-        private_file::read_private_with_metadata(parent, "auth.json", MAX_DOCUMENT)
-            .map_err(|_| "native auth document unavailable")?;
-    let bytes = SecretBytes::new(bytes);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if metadata.nlink() != 1 {
-            return Err("native auth document has aliases".into());
-        }
-    }
+    let bytes = platform::read_single_link_private(parent, "auth.json", MAX_DOCUMENT)
+        .map_err(|_| "native auth document unavailable")?;
     if !current.canonical_matches(bytes.as_slice())
         || codex_app_login::renewal_identity(parent).as_ref() != Some(&current.identity)
     {
@@ -1814,7 +2792,7 @@ fn with_canonical_owner<R>(
     let result = use_owner(grant)?;
     owner.current()?;
     let after = store
-        .peek_account_records(&roster_path, env.now)
+        .peek_account_records(roster_path, env.now)
         .map_err(|_| "account publication unavailable")?;
     if after.raw_roster != records.raw_roster
         || !after
@@ -1909,21 +2887,29 @@ fn lineage_consumers_capable(
     Ok(())
 }
 
-#[cfg(test)]
+// The only fixture constructor owns its fresh private world; no caller path,
+// response document, grant, or existing account authority can be supplied.
+#[cfg(all(unix, any(test, debug_assertions)))]
+#[path = "codex_grant_owner_row_fixture.rs"]
+mod row_fixture;
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub(super) use row_fixture::create as native_recovery_row_fixture;
+
+#[cfg(all(test, unix))]
 #[path = "codex_grant_owner_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "codex_grant_maintenance_tests.rs"]
 mod maintenance_tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(in crate::harness) fn with_code_rejection_fixture(
     test: impl FnOnce(&Env, &Path, &codex_enrollment::Request),
 ) {
     let (_world, mut env, stage, request) = tests::fixture(true);
     let config = env.home.as_ref().unwrap().join("config");
-    aterm_secrets::fsx::ensure_private_dir(&config).unwrap();
+    platform::ensure_private_dir(&config).unwrap();
     let path = config.join("aterm.toml");
     std::fs::write(&path, "").unwrap();
     env.config = Some(path);
@@ -1932,6 +2918,57 @@ pub(in crate::harness) fn with_code_rejection_fixture(
     test(&env, &stage, &request);
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "codex_initial_source_tests.rs"]
 mod initial_source_tests;
+
+#[cfg(all(test, unix))]
+pub(in crate::harness) type NativeRowFixture = (
+    codex_enrollment::Request,
+    codex_enrollment::Staging,
+    RetainedGrant,
+    Option<codex_enrollment::Artifact>,
+);
+
+/// Synthetic encrypted issuer inputs for actual writer/adapter tests. This
+/// supplies no provider, independent-lineage or consumer-readiness proof.
+#[cfg(all(test, unix))]
+pub(in crate::harness) fn with_two_native_rows_fixture(
+    test: impl FnOnce(&Env, &super::accounts::Store, &Path, [NativeRowFixture; 2]),
+) {
+    tests::with_two_native_rows_fixture(test)
+}
+
+/// Exact synthetic response retention cut before canonical attachment.
+#[cfg(all(test, unix))]
+pub(in crate::harness) fn with_unattached_native_rows_fixture(
+    test: impl FnOnce(&Env, &super::accounts::Store, &Path, [NativeRowFixture; 2]),
+) {
+    tests::with_native_rows_at_attachment_cut(false, test)
+}
+
+#[cfg(all(test, unix))]
+pub(in crate::harness) use refresh::fixture_promote_received_response;
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    #[test]
+    fn grant_reference_codec_is_portable_strict_and_redacted() {
+        let value = aterm_json::json!({
+            "operation": "a".repeat(32), "capability": "b".repeat(64),
+            "issuance_digest": "c".repeat(64), "producer_mac": "d".repeat(64)
+        });
+        let reference: GrantReference = aterm_json::from_value(value.clone()).unwrap();
+        assert!(reference.valid());
+        assert_eq!(aterm_json::to_value(&reference).unwrap(), value);
+        assert!(!format!("{reference:?}").contains(&"b".repeat(64)));
+        let mut unknown = value;
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".into(), true.into());
+        assert!(aterm_json::from_value::<GrantReference>(unknown).is_err());
+    }
+}

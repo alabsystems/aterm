@@ -69,9 +69,8 @@ pub fn vault_git_credentials(sys: &dyn System) -> Result<GithubRead, String> {
             }
         } else {
             GithubRead::Deferred(format!(
-                "{KEYCHAIN_BLOCK}, and aterm's helper runs {}, which is not there (atpkg repair \
-                 puts it back)",
-                Helper::launcher(&user).display()
+                "{KEYCHAIN_BLOCK}; {}",
+                Helper::unavailable(sys, &user)
             ))
         });
     }
@@ -118,12 +117,7 @@ pub fn sync_vault_git_credentials(sys: &dyn System, journaled: &str) -> Result<S
     if block.revert() != journaled {
         return Err("git's GitHub settings changed since their revert was journaled".into());
     }
-    let helper = helper(sys, &user).ok_or_else(|| {
-        format!(
-            "{} left before the keychain GitHub block could be replaced",
-            Helper::launcher(&user).display()
-        )
-    })?;
+    let helper = helper(sys, &user).ok_or_else(|| Helper::unavailable(sys, &user))?;
     git.replace_keychain_block(sys, &user, &block, &helper)?;
     Ok("replaced the keychain GitHub block with aterm's helper; no repositories changed".into())
 }

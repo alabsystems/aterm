@@ -193,7 +193,11 @@ fn lost_native_lock_never_touches_or_removes_a_replacement() {
         let guard = lock.guard();
         if replace_inode {
             std::fs::rename(&path, path.with_extension("retained")).unwrap();
-            std::fs::create_dir(&path).unwrap();
+            // A peer's lock is 0700 too: the lease, not a mode check, must tell it apart.
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
         } else {
             stamp(&path, SystemTime::now() + Duration::from_secs(60));
         }

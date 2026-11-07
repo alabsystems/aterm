@@ -706,6 +706,15 @@ pub fn verdict(copy: &Copy, asked: bool) -> Verdict {
     }
 }
 
+/// Whether the last live `copy` shows its agent ended on a signal (its record's `exit` is a
+/// `signal:<n>`): an end [`verdict`] reads as the agent's own unless aterm asked for it, and
+/// one that is its host's when the window ends on that signal too.
+#[must_use]
+pub fn ended_on_a_signal(copy: &Copy) -> bool {
+    matches!(&copy.seen, Seen::Present(record)
+        if record.exit.as_deref().is_some_and(|word| word.starts_with("signal:")))
+}
+
 /// Whether `copy` indicates the agent is already shutting down or has exited.
 #[must_use]
 pub fn shows_end(copy: &Copy) -> bool {

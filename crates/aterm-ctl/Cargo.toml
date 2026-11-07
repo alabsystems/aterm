@@ -50,6 +50,10 @@ aterm-netplace = { workspace = true }
 # The board records a worker's brief by its SHA-256, never its text (`board::brief_digest`).
 # First-party: astream-digest's SHA-256, which has no dependencies.
 aterm-digest = { workspace = true }
+# A fleet spawn's and a worker's close's telemetry rows (`fleet_telemetry`), written through the
+# log's one direct writer. First-party, and so is each crate it brings; it depends on no
+# aterm-ctl.
+aterm-telemetry = { workspace = true }
 
 # The census's process table (`kproc::records`), read in-process instead of running `ps`.
 # First-party, and so is each crate it brings (its `libc` is aterm-libc).

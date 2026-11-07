@@ -6,7 +6,9 @@
 use super::*;
 use aterm_capacity::{CohortClaimState, CohortClosureRef, Fixed, Need, Polled, Reading};
 use aterm_ctl::resource_admission_transport::{self as wire, Attachments};
-use aterm_types::resource_admission::{Event, EventFrame, Outcome, Submission};
+#[cfg(target_os = "macos")]
+use aterm_types::resource_admission::Outcome;
+use aterm_types::resource_admission::{Event, EventFrame, Submission};
 use aterm_uds::{
     CtlStream,
     process::{self, ProcessPresence},
@@ -26,6 +28,38 @@ use std::{
 const HANG: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(10);
 const MEMORY: u64 = 1024 * 1024 * 1024;
+
+#[test]
+fn loan_bookkeeping_does_not_resurrect_a_native_terminal_phase() {
+    let world = World::new();
+    let binding = Binding {
+        session: "s-ab".into(),
+        attempt: [17; 16],
+    };
+    world.owner.journal.create(&binding).unwrap();
+    world
+        .owner
+        .journal
+        .update(&binding, "member_terminal", aterm_json::json!({}))
+        .unwrap();
+    world
+        .owner
+        .journal
+        .patch(
+            &binding,
+            aterm_json::json!({"cpu_loan":{"state":"returned"}}),
+        )
+        .unwrap();
+    let records = world.owner.journal.outstanding().unwrap();
+    let encoded = aterm_codec::hex::encode_lower(&binding.attempt);
+    let row = records
+        .iter()
+        .find(|row| row["attempt"].as_str() == Some(encoded.as_str()))
+        .unwrap();
+    assert_eq!(row["phase"].as_str(), Some("member_terminal"));
+    assert_eq!(row["cpu_loan"]["state"].as_str(), Some("returned"));
+    world.owner.journal.settle(&binding).unwrap();
+}
 
 struct Scratch {
     path: PathBuf,
@@ -81,6 +115,100 @@ struct World {
     scratch: Scratch,
 }
 
+#[test]
+#[cfg(target_os = "macos")]
+fn fresh_metadata_refuses_funded_native_ancestor_but_admits_unrelated_original_capacity() {
+    crate::runtime::test_endpoint().unwrap();
+    let mut world = World::new();
+    let (binding, memory, events) = world.queue_sleep(HANG);
+    let first = world.owner.pending.front_mut().unwrap();
+    first.submission.request.argv = vec![b"/bin/sleep".to_vec(), b"60".to_vec()];
+    world.owner.tick_queue();
+    assert_eq!(read_event(&events, &binding), Event::Queued);
+    let Event::Started { pid, .. } = read_event(&events, &binding) else {
+        panic!("original funded root did not start")
+    };
+    let native = process::read_identity(pid as i32).unwrap();
+    assert_eq!(world.owner.debt.reserved().unwrap(), 1);
+    assert!(
+        Fence::acquire(&world.namespace, Instant::now()).is_err(),
+        "a different locator cannot acquire another canonical owner fence"
+    );
+
+    let (second_binding, second_memory, second_events) = world.queue_sleep_attempt(HANG, [8; 16]);
+    let mut second = world.owner.pending.pop_back().unwrap();
+    second.submission.request.argv = vec![
+        b"/not-selected/targo".to_vec(),
+        b"--resource-metadata-v1".to_vec(),
+    ];
+    second.submission.request.env.clear();
+    second.submission.peer = Peer {
+        pid,
+        birth: native.birth.0,
+    };
+    second.submission.request.peer_pid = pid;
+    second.submission.request.peer_birth = native.birth.0;
+    world.owner.pending.push_front(second);
+    world.owner.tick_queue();
+    assert_eq!(read_event(&second_events, &second_binding), Event::Queued);
+    assert!(matches!(
+        read_event(&second_events, &second_binding),
+        Event::Refused { .. }
+    ));
+    assert!(world.owner.pending.is_empty());
+    assert_eq!(
+        world
+            .owner
+            .ledger
+            .cohort_claim_state(&second_memory)
+            .unwrap(),
+        CohortClaimState::Closed
+    );
+    assert_eq!(world.owner.debt.reserved().unwrap(), 1);
+
+    // The same original pool still has one real unit. An unrelated requesting
+    // process is allowed beside the first funded root, without shadow pools or
+    // a blanket refusal whenever any other reservation exists.
+    let (third_binding, third_memory, third_events) = world.queue_sleep_attempt(HANG, [9; 16]);
+    let third = world.owner.pending.back_mut().unwrap();
+    third.submission.request.argv = vec![
+        b"/not-selected/targo".to_vec(),
+        b"--resource-metadata-v1".to_vec(),
+    ];
+    let (probe, release) = recipe::Probe::paused();
+    third.recipe = None;
+    third.probe = Some(probe);
+    world.owner.tick_queue();
+    let third = world.owner.pending.front_mut().unwrap();
+    assert!(third.admitted.is_some());
+    assert_eq!(world.owner.debt.reserved().unwrap(), 2);
+    // Cancel the controlled preparation and drain both original reservations.
+    third.cancelled = true;
+    drop(release);
+    world
+        .owner
+        .jobs
+        .get_mut(&(binding.session.clone(), binding.attempt))
+        .unwrap()
+        .child
+        .request_group(aterm_capacity::cohort::launch::CohortSignal::Kill)
+        .unwrap();
+    world.settle();
+    world.assert_settled(&binding, &memory, pid);
+    assert_eq!(
+        world
+            .owner
+            .ledger
+            .cohort_claim_state(&third_memory)
+            .unwrap(),
+        CohortClaimState::Closed
+    );
+    assert!(!world.owner.journal.fresh(&second_binding).unwrap());
+    assert!(!world.owner.journal.fresh(&third_binding).unwrap());
+    drop(third_events);
+    drop(second_events);
+}
+
 impl World {
     fn new() -> Self {
         Self::with_scratch(Scratch::new())
@@ -117,6 +245,9 @@ impl World {
             faulted: false,
             recovered_at: Instant::now(),
             failed: Vec::new(),
+            recipe_layout: None,
+            #[cfg(target_os = "macos")]
+            metadata_pause: None,
         };
         Self {
             owner,
@@ -125,7 +256,12 @@ impl World {
             scratch,
         }
     }
+}
 
+// A queued job's root starts stopped at its exec (`Recipe::command`), which only
+// Darwin's spawn does: elsewhere the launch refuses before any child exists.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl World {
     fn queue_sleep(&mut self, timeout: Duration) -> (Binding, CohortClosureRef, CtlStream) {
         self.queue_sleep_attempt(timeout, [7; 16])
     }
@@ -191,6 +327,7 @@ impl World {
         };
         submission.request.validate().unwrap();
         self.owner.pending.push_back(Pending {
+            resolver: None,
             submission,
             events,
             recipe: Some(recipe::Recipe {
@@ -201,11 +338,16 @@ impl World {
                 environment: Vec::new(),
                 cwd: self.scratch.path.clone(),
                 width: 1,
+                metadata_sdk: None,
             }),
+            sdk: None,
             probe: None,
             waiter: None,
             claim: Some(claim),
             recovery: None,
+            admitted: None,
+            scope_reference: None,
+            cancelled: false,
         });
         (binding, reference, client)
     }
@@ -283,17 +425,19 @@ impl Drop for World {
                 std::thread::sleep(POLL);
             }
         }
-        self.scratch.preserve =
+        self.scratch.preserve |=
             !self.owner.idle() || self.owner.debt.reserved().map_or(true, |units| units != 0);
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn read_event(client: &CtlStream, binding: &Binding) -> Event {
     let bytes = wire::read_frame(client, Instant::now() + HANG).unwrap();
     EventFrame::decode(&bytes, binding).unwrap().event
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn actual_owner_timeout_and_caller_cancel_reap_and_settle_original_resources() {
     crate::runtime::test_endpoint().unwrap();
     for cancel_caller in [false, true] {
@@ -407,6 +551,7 @@ fn actual_owner_timeout_and_caller_cancel_reap_and_settle_original_resources() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn impossible_memory_head_refuses_before_arm_and_next_job_runs() {
     crate::runtime::test_endpoint().unwrap();
     let mut world = World::new();
@@ -436,8 +581,103 @@ fn impossible_memory_head_refuses_before_arm_and_next_job_runs() {
     world.assert_settled(&next, &memory, pid);
 }
 
+#[cfg(target_os = "macos")]
 #[path = "resource_admission_owner_tests/context_rpc.rs"]
 mod context_rpc;
+
+#[test]
+fn cancelled_paid_metadata_preparation_joins_before_native_release_and_settlement() {
+    for fault_owner in [false, true] {
+        let mut world = World::new();
+        let (binding, memory, client) = world.queue_sleep(HANG);
+        let pending = world.owner.pending.back_mut().unwrap();
+        pending.submission.request.argv = vec![
+            b"/unselected/targo".to_vec(),
+            b"--resource-metadata-v1".to_vec(),
+        ];
+        pending.recipe = None;
+        let (probe, release) = recipe::Probe::paused();
+        pending.probe = Some(probe);
+        world.owner.tick_queue();
+        assert!(world.owner.pending.front().unwrap().admitted.is_some());
+        assert_eq!(
+            world.owner.debt.reserved().unwrap(),
+            1,
+            "expensive metadata preparation has one actual original CPU"
+        );
+        assert_eq!(
+            world.owner.ledger.list().unwrap().len(),
+            1,
+            "original memory claim stays retained"
+        );
+        assert!(world.owner.jobs.is_empty(), "no native target was launched");
+        drop(client);
+        world.owner.faulted = fault_owner;
+        world.owner.tick();
+        assert_eq!(
+            world.owner.pending.len(),
+            1,
+            "unjoined preparation remains occupied even on owner failure"
+        );
+        assert_eq!(world.owner.debt.reserved().unwrap(), 1);
+        assert!(
+            !world.owner.journal.outstanding().unwrap().is_empty(),
+            "cancel is not a settlement receipt"
+        );
+        release.send(()).unwrap();
+        let deadline = Instant::now() + HANG;
+        while !world
+            .owner
+            .pending
+            .front()
+            .unwrap()
+            .probe
+            .as_ref()
+            .unwrap()
+            .finished()
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(POLL);
+        }
+        world.owner.tick_queue();
+        assert!(world.owner.pending.is_empty());
+        assert_eq!(
+            world.owner.failed.len(),
+            1,
+            "original unused custody is retained for affirmative finish"
+        );
+        assert_eq!(world.owner.debt.reserved().unwrap(), 1);
+        assert!(
+            !world.owner.journal.outstanding().unwrap().is_empty(),
+            "journal cannot settle before original CPU/memory finish"
+        );
+        world.owner.tick_failed();
+        assert!(world.owner.failed.is_empty());
+        assert_eq!(world.owner.debt.reserved().unwrap(), 0);
+        assert!(world.owner.journal.outstanding().unwrap().is_empty());
+        assert_eq!(
+            world.owner.ledger.reap_cohort_claim(&memory).unwrap(),
+            CohortClaimState::Closed
+        );
+        assert!(!world.owner.journal.fresh(&binding).unwrap());
+    }
+}
+
+#[path = "resource_admission_owner_tests/metadata_native.rs"]
+#[cfg(target_os = "macos")]
+mod metadata_native;
+#[cfg(target_os = "macos")]
+pub(super) fn metadata_native_role() {
+    metadata_native::early_role();
+}
+
+#[path = "resource_admission_owner_tests/resolver_native.rs"]
+#[cfg(target_os = "macos")]
+mod resolver_native;
+
+#[path = "resource_admission_owner_tests/resolver_engineering.rs"]
+#[cfg(target_os = "macos")]
+mod resolver_engineering;
 
 #[test]
 fn known_member_attempt_never_receives_a_new_no_child_refusal() {
@@ -514,6 +754,255 @@ fn known_member_attempt_never_receives_a_new_no_child_refusal() {
 #[path = "resource_admission_owner_tests/member_native.rs"]
 mod member_native;
 #[cfg(target_os = "macos")]
-pub(super) fn member_fixture(args: &[OsString]) -> std::process::ExitCode {
-    member_native::run(args)
+pub(super) fn member_fixture(
+    args: &[OsString],
+    gnu: Option<[std::os::fd::OwnedFd; 2]>,
+) -> std::process::ExitCode {
+    member_native::run(args, gnu)
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn accounted_root_waits_for_original_settlement_and_preserves_real_outcomes() {
+    crate::runtime::test_endpoint().unwrap();
+    use aterm_types::resource_admission::AccountedEventFrame;
+    use std::io::Read as _;
+    for (script, cancel, expected) in [
+        ("exit 0", false, Some(0)),
+        ("exit 7", false, Some(7)),
+        ("exec /bin/sleep 60", true, None),
+    ] {
+        let mut world = World::new();
+        let (binding, memory, events) = world.queue_sleep(HANG);
+        let pending = world.owner.pending.front_mut().unwrap();
+        pending.events.account().unwrap();
+        let recipe = pending.recipe.as_mut().unwrap();
+        recipe.program = "/bin/sh".into();
+        recipe.arguments = vec!["-c".into(), script.into()];
+        pending.submission.request.argv = vec![
+            b"/bin/sh".to_vec(),
+            b"-c".to_vec(),
+            script.as_bytes().to_vec(),
+        ];
+        world.owner.tick_queue();
+        assert_eq!(read_event(&events, &binding), Event::Queued);
+        let Event::Started { pid, .. } = read_event(&events, &binding) else {
+            panic!("actual accounted root did not start")
+        };
+        // Delay only durable settlement in this fixture. Original exit/reap
+        // must not publish the accounted terminal or release its paid custody.
+        let key = (binding.session.clone(), binding.attempt);
+        world.owner.jobs.get_mut(&key).unwrap().settlement_at = Some(Instant::now() + HANG);
+        if cancel {
+            wire::send_cancel(
+                &events,
+                aterm_types::resource_admission::Cancel {
+                    binding: binding.clone(),
+                },
+                Instant::now() + HANG,
+            )
+            .unwrap();
+        }
+        let deadline = Instant::now() + HANG;
+        while !world.owner.jobs.get(&key).unwrap().reaped {
+            world.owner.tick();
+            assert!(
+                Instant::now() < deadline,
+                "original root owning wait did not finish"
+            );
+            std::thread::sleep(POLL);
+        }
+        let job = world.owner.jobs.get_mut(&key).unwrap();
+        assert!(!job.settled && !job.terminal_sent && job.completion.is_some());
+        assert_eq!(world.owner.debt.reserved().unwrap(), 1);
+        events.set_nonblocking(true).unwrap();
+        assert_eq!(
+            (&events).read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let job = world.owner.jobs.get_mut(&key).unwrap();
+        let cached = job
+            .child
+            .child_mut()
+            .try_wait_with_rusage()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            job.completion
+                .as_ref()
+                .unwrap()
+                .1
+                .cpu_times
+                .unwrap()
+                .user_ns,
+            u64::try_from(cached.user.as_nanos()).unwrap()
+        );
+        assert_eq!(
+            job.completion
+                .as_ref()
+                .unwrap()
+                .1
+                .cpu_times
+                .unwrap()
+                .system_ns,
+            u64::try_from(cached.system.as_nanos()).unwrap()
+        );
+        job.settlement_at = None;
+        world.settle();
+        world.assert_settled(&binding, &memory, pid);
+        let frame = AccountedEventFrame::decode(
+            &wire::read_frame(&events, Instant::now() + HANG).unwrap(),
+            &binding,
+        )
+        .unwrap();
+        let Event::Finished { outcome, cause, .. } = frame.finished.event else {
+            panic!("no accounted finished")
+        };
+        if let Some(code) = expected {
+            assert_eq!(outcome, Outcome::Exit(code));
+        } else {
+            assert!(matches!(outcome, Outcome::Signal(_)));
+        }
+        assert_eq!(
+            cause,
+            if cancel {
+                CompletionCause::Cancelled
+            } else {
+                CompletionCause::Exited
+            }
+        );
+        assert!(
+            frame.observation.cpu_times.is_some() && frame.observation.peak_rss_bytes.is_some()
+        );
+        assert_eq!((&events).read(&mut [0]).unwrap(), 0);
+    }
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn accounted_paid_no_child_refusal_waits_for_original_custody_settlement() {
+    use aterm_types::resource_admission::AccountedEventFrame;
+    use std::io::Read as _;
+    crate::runtime::test_endpoint().unwrap();
+    let mut world = World::new();
+    let (binding, memory, events) = world.queue_sleep(HANG);
+    let missing = world
+        .scratch
+        .path
+        .join("actual-image-disappeared-before-launch");
+    let pending = world.owner.pending.front_mut().unwrap();
+    pending.events.account().unwrap();
+    pending.recipe.as_mut().unwrap().program = missing.clone();
+    pending.submission.request.argv[0] = missing.as_os_str().as_bytes().to_vec();
+    world.owner.tick_queue();
+    assert_eq!(read_event(&events, &binding), Event::Queued);
+    assert_eq!(
+        world.owner.failed.len(),
+        1,
+        "actual native launch must produce a retained no-child failure"
+    );
+    assert_eq!(world.owner.debt.reserved().unwrap(), 1);
+    world.owner.failed[0].checked_at = Some(Instant::now() + HANG);
+    world.owner.tick();
+    events.set_nonblocking(true).unwrap();
+    let premature = (&events).read(&mut [0]);
+    world.owner.failed[0].checked_at = None;
+    assert!(
+        matches!(&premature, Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+        "accounted refusal must not return before paid original custody settles: {premature:?}"
+    );
+    world.settle();
+    assert_eq!(world.owner.debt.reserved().unwrap(), 0);
+    assert_eq!(
+        world.owner.ledger.reap_cohort_claim(&memory).unwrap(),
+        CohortClaimState::Closed
+    );
+    assert!(world.owner.journal.outstanding().unwrap().is_empty());
+    let refused = AccountedEventFrame::decode(
+        &wire::read_frame(&events, Instant::now() + HANG).unwrap(),
+        &binding,
+    )
+    .unwrap();
+    assert!(matches!(refused.finished.event, Event::Refused { .. }));
+    assert_eq!(
+        refused.observation,
+        aterm_types::resource_admission::AccountingObservation::uncollected()
+    );
+    assert_eq!((&events).read(&mut [0]).unwrap(), 0);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn accounted_memory_only_refusal_keeps_original_funded_ancestor_untouched() {
+    use aterm_types::resource_admission::AccountedEventFrame;
+    use std::io::Read as _;
+    crate::runtime::test_endpoint().unwrap();
+    let mut world = World::new();
+    let (original, original_memory, original_events) = world.queue_sleep(HANG);
+    world.owner.tick_queue();
+    assert_eq!(read_event(&original_events, &original), Event::Queued);
+    let Event::Started { pid, .. } = read_event(&original_events, &original) else {
+        panic!("original funded root absent")
+    };
+    let native = process::read_identity(pid as i32).unwrap();
+    let (binding, memory, events) = world.queue_sleep_attempt(HANG, [39; 16]);
+    let pending = world.owner.pending.back_mut().unwrap();
+    pending.events.account().unwrap();
+    pending.submission.request.argv = vec![
+        b"/not-selected/targo".to_vec(),
+        b"--resource-metadata-v1".to_vec(),
+    ];
+    pending.submission.peer = Peer {
+        pid,
+        birth: native.birth.0,
+    };
+    pending.submission.request.peer_pid = pid;
+    pending.submission.request.peer_birth = native.birth.0;
+    world.owner.tick_queue();
+    assert_eq!(read_event(&events, &binding), Event::Queued);
+    assert_eq!(world.owner.failed.len(), 1);
+    assert_eq!(
+        world.owner.debt.reserved().unwrap(),
+        1,
+        "no second CPU was admitted"
+    );
+    assert!(matches!(
+        world.owner.failed[0].custody,
+        Some(Custody::Cooperative(_))
+    ));
+    world.owner.failed[0].checked_at = Some(Instant::now() + HANG);
+    world.owner.tick_failed();
+    events.set_nonblocking(true).unwrap();
+    let premature = (&events).read(&mut [0]);
+    world.owner.failed[0].checked_at = None;
+    assert!(matches!(premature, Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+    world.owner.tick_failed();
+    assert!(world.owner.failed.is_empty());
+    assert_eq!(
+        world.owner.ledger.reap_cohort_claim(&memory).unwrap(),
+        CohortClaimState::Closed
+    );
+    let refusal = AccountedEventFrame::decode(
+        &wire::read_frame(&events, Instant::now() + HANG).unwrap(),
+        &binding,
+    )
+    .unwrap();
+    assert!(matches!(refusal.finished.event, Event::Refused { .. }));
+    assert_eq!(
+        refusal.observation,
+        aterm_types::resource_admission::AccountingObservation::uncollected()
+    );
+    assert_eq!((&events).read(&mut [0]).unwrap(), 0);
+    assert_eq!(world.owner.debt.reserved().unwrap(), 1);
+    assert!(process::read_identity(pid as i32).is_some());
+    wire::send_cancel(
+        &original_events,
+        aterm_types::resource_admission::Cancel {
+            binding: original.clone(),
+        },
+        Instant::now() + HANG,
+    )
+    .unwrap();
+    world.settle();
+    world.assert_settled(&original, &original_memory, pid);
 }

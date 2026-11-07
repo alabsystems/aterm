@@ -238,8 +238,18 @@ pub fn load_roster(
     Ok((roster, Some(RosterSnapshot { raw, sig })))
 }
 
-fn roster_txn_path(path: &str) -> String {
+/// Where the redo transaction of the roster pair whose body is `path` is kept.
+#[must_use]
+pub fn roster_txn_path(path: &str) -> String {
     concat(&[path, ".atpkg-keys.txn"])
+}
+
+/// The writer lock of the roster pair whose body is `path`. [`lock_roster`] creates it before
+/// any protocol writer writes either half or a transaction, and no roster code removes it:
+/// once present, the pair is read under it.
+#[must_use]
+pub fn roster_lock_path(path: &str) -> String {
+    concat(&[path, ".lock"])
 }
 
 /// Refuse to read a roster while a committed transaction is pending.
@@ -650,7 +660,7 @@ impl RosterLock {
 
 /// Acquire the roster writer lock, replaying any committed transaction first.
 pub fn lock_roster(path: &str) -> Result<RosterLock, String> {
-    let lock_path = concat(&[path, ".lock"]);
+    let lock_path = roster_lock_path(path);
     ensure_parent_dir(&lock_path).map_err(|e| {
         concat(&[
             "create the roster-lock directory for ",
@@ -672,7 +682,7 @@ pub fn lock_roster(path: &str) -> Result<RosterLock, String> {
 pub fn lock_roster_read_only(path: &str) -> Result<RosterLock, String> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
-    let lock_path = concat(&[path, ".lock"]);
+    let lock_path = roster_lock_path(path);
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)

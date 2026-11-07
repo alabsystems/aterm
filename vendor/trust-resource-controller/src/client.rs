@@ -47,7 +47,16 @@ pub struct Client {
 }
 impl Client {
     pub fn discover(deadline: Instant) -> io::Result<Self> {
-        let host = Store::open_account()?.connect_ancestor(deadline)?;
+        Self::from_store(Store::open_account()?, deadline)
+    }
+    /// Explicit per-invocation discovery data, never a resource/store creator
+    /// or a fallback. Applies the SAME original backing/image/native ancestor
+    /// checks as account discovery; a pathname or decoded book grants nothing.
+    pub fn discover_at(path: &std::path::Path, deadline: Instant) -> io::Result<Self> {
+        Self::from_store(Store::open_at(path)?, deadline)
+    }
+    fn from_store(store: Store, deadline: Instant) -> io::Result<Self> {
+        let host = store.connect_ancestor(deadline)?;
         Ok(Self::from_helper(Arc::new(host.into_helper(deadline)?)))
     }
     pub fn from_helper(host: Arc<PinnedHelper>) -> Self {
@@ -61,16 +70,106 @@ impl Client {
         query: &ContextQuery,
         deadline: Instant,
     ) -> Result<ContextReply, CallError> {
+        self.context_role(query, deadline, "native-context")
+    }
+    /// Explicit new codec/custody purpose. There is no legacy-role fallback.
+    /// The reply still carries observations; the actual inherited keeper must
+    /// separately match after this authenticated call.
+    pub fn context_with_sdk(
+        &self,
+        query: &ContextQuery,
+        deadline: Instant,
+    ) -> Result<ContextReply, CallError> {
+        let reply = self.context_role(query, deadline, crate::CONTEXT_SDK_ROLE)?;
+        if reply.context.sdk.is_none() {
+            return Err(CallError {
+                delivery: Delivery::ContextUnavailable,
+                error: io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "native context has no original inherited SDK keeper",
+                ),
+            });
+        }
+        Ok(reply)
+    }
+    /// Negotiate INSIDE the already registered original metadata root; there
+    /// is no preparatory capability subprocess lacking durable ARM custody.
+    /// Readiness data does not mint capacity. The host still requires its real
+    /// root/SDK/GNU/memory and binds all later members to that original owner.
+    pub fn metadata_context(
+        &self,
+        query: &ContextQuery,
+        deadline: Instant,
+    ) -> Result<ContextReply, CallError> {
+        query.validate().map_err(before)?;
+        let hello = format!(
+            "{{\"version\":3,\"role\":\"{}\",\"session\":\"{}\",\"capabilities\":{}}}",
+            crate::METADATA_READY_ROLE,
+            query.binding.session,
+            crate::METADATA_CAPABILITIES_JSON
+        );
+        let reply = self.context_exchange(query, deadline, hello.as_bytes())?;
+        if reply.context.sdk.is_none() {
+            return Err(CallError {
+                delivery: Delivery::ContextUnavailable,
+                error: io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "metadata readiness has no original inherited SDK keeper",
+                ),
+            });
+        }
+        Ok(reply)
+    }
+    /// Distinct Ready purpose INSIDE the original fixed-one resolver root.
+    /// Data never replaces its actual original SDK/GNU/CPU/memory custody.
+    pub fn resolver_context(
+        &self,
+        query: &ContextQuery,
+        deadline: Instant,
+    ) -> Result<ContextReply, CallError> {
+        query.validate().map_err(before)?;
+        let hello = format!(
+            "{{\"version\":3,\"role\":\"{}\",\"session\":\"{}\",\"capabilities\":{}}}",
+            crate::resolver::RESOLVER_READY_ROLE,
+            query.binding.session,
+            crate::resolver::RESOLVER_CAPABILITIES_JSON,
+        );
+        let reply = self.context_exchange(query, deadline, hello.as_bytes())?;
+        if reply.context.sdk.is_none() {
+            return Err(CallError {
+                delivery: Delivery::ContextUnavailable,
+                error: io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "resolver readiness has no original inherited SDK keeper",
+                ),
+            });
+        }
+        Ok(reply)
+    }
+    fn context_role(
+        &self,
+        query: &ContextQuery,
+        deadline: Instant,
+        role: &str,
+    ) -> Result<ContextReply, CallError> {
+        query.validate().map_err(before)?;
+        let hello = format!(
+            "{{\"version\":3,\"role\":\"{role}\",\"session\":\"{}\"}}",
+            query.binding.session
+        );
+        self.context_exchange(query, deadline, hello.as_bytes())
+    }
+    fn context_exchange(
+        &self,
+        query: &ContextQuery,
+        deadline: Instant,
+        hello: &[u8],
+    ) -> Result<ContextReply, CallError> {
         let payload = query.encode().map_err(before)?;
         let host = self.host.connect(deadline).map_err(before)?;
         let mut channel =
             Channel::new(host.stream().try_clone().map_err(before)?).map_err(before)?;
-        // Canonical SID validation above excludes JSON quoting/injection.
-        let hello = format!(
-            "{{\"version\":3,\"role\":\"native-context\",\"session\":\"{}\"}}",
-            query.binding.session
-        );
-        channel.send(hello.as_bytes(), deadline).map_err(before)?;
+        channel.send(hello, deadline).map_err(before)?;
         let exchange = (|| {
             channel.send(&payload, deadline)?;
             let response = ContextResponse::decode(&channel.receive(deadline)?, query)?;
@@ -101,10 +200,15 @@ impl Client {
 }
 
 mod member;
-pub use member::{MemberError, MemberIo, ProxyChild};
+pub use member::{MemberError, MemberIo, ProxyChild, inherit_descriptions};
+
+mod metadata;
+pub use metadata::{MetadataError, MetadataIo, MetadataMember, MetadataResult};
 
 mod telemetry;
 pub use telemetry::ReceivedTelemetry;
 
 mod liveness;
 pub use liveness::HostLifeline;
+
+pub mod sdk;

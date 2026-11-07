@@ -137,17 +137,52 @@ fn holds(state: &Path, number: Number) -> io::Result<bool> {
     Ok(file::read(state)?.is_some_and(|name| name.num == Some(number)))
 }
 
-/// `Ok` while the name file holds `number`.
+/// `Ok` while the name file holds `number` and the current naming policy still names it.
 ///
 /// # Errors
 /// [`Pending::Superseded`] once it holds another number or none, [`Pending::NameUnread`] when it
-/// cannot be read.
-fn still(state: &Path, number: Number) -> Result<(), Pending> {
+/// cannot be read, or [`Pending::Policy`] when configuration is unreadable, holds naming off
+/// or no longer names this number. Unrelated configuration edits remain allowed.
+pub fn check_current(state: &Path, config: &Path, number: Number) -> Result<(), Pending> {
+    let policy = (|| {
+        let snapshot = ConfigFile::open(config).map_err(|e| e.to_string())?;
+        let doc = parsed(snapshot.text().map_err(|e| e.to_string())?.unwrap_or(""))?;
+        if held_off(&doc) {
+            return Err(HELD_OFF.to_owned());
+        }
+        let missing = missing_policy_keys(&doc, &number.to_string());
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "the naming policy changed during synchronization ({})",
+                missing.join(", ")
+            ))
+        }
+    })();
+    // The config read can block too: keep the canonical-number fence last, retaining its
+    // precedence over a policy error when a newer number replaced this request.
     match holds(state, number) {
         Ok(true) => Ok(()),
         Ok(false) => Err(Pending::Superseded(SUPERSEDED.to_owned())),
         Err(e) => Err(Pending::NameUnread(e.to_string())),
-    }
+    }?;
+    policy.map_err(Pending::Policy)
+}
+
+/// The current policy keys that do not name `number`.
+fn missing_policy_keys(doc: &DocumentMut, number: &str) -> Vec<&'static str> {
+    POLICY_KEYS
+        .iter()
+        .filter(|(section, key, _)| {
+            doc.get(section)
+                .and_then(Item::as_table_like)
+                .and_then(|table| table.get(key))
+                .and_then(Item::as_str)
+                != Some(number)
+        })
+        .map(|(_, _, label)| *label)
+        .collect()
 }
 
 /// A step that did not finish, and `why`, judged again by the name file: superseded, in the
@@ -291,13 +326,15 @@ impl Pending {
 /// 2. the fleet name in `state`, through `aterm fleet name set`'s checked writer
 ///    ([`crate::fleet_member::choose_machine_name_at`]), which reads the `[[fleet.peers]]` of
 ///    the aterm.toml at `config` among the machines that may already answer to it and checks
-///    the number again under the fleet writer's lock;
+///    the committed policy and number again under the fleet writer's lock;
 /// 3. with `system`, macOS's three names: read, and where any does not read the number, set
 ///    under one approval and read again.
 ///
 /// The name file is read again after the fleet name, and again once macOS's names read the
 /// number or have been set; a file that holds another number (or none) then ends publication
-/// as [`Pending::Superseded`].
+/// as [`Pending::Superseded`]. The current naming policy is checked alongside it after each
+/// step, before an OS apply and before success; a changed naming key or hold retires this work
+/// without undoing an earlier step or overwriting the newer configuration.
 ///
 /// # Errors
 /// The first step that did not finish; later steps do not run. A step that failed while the
@@ -309,7 +346,7 @@ pub fn publish(
     policy: &Policy,
     system: Option<&dyn SystemNames>,
 ) -> Result<(), Pending> {
-    publish_through(state, policy, system, || {
+    publish_through(state, config, policy, system, || {
         crate::fleet_member::choose_machine_name_at(state, config, policy.number).map(|_| ())
     })
 }
@@ -321,6 +358,7 @@ pub fn publish(
 /// As [`publish`], with `fleet`'s words for the fleet step.
 fn publish_through(
     state: &Path,
+    config: &Path,
     policy: &Policy,
     system: Option<&dyn SystemNames>,
     fleet: impl FnOnce() -> Result<(), String>,
@@ -328,22 +366,23 @@ fn publish_through(
     let number = policy.number;
     write_policy(state, policy)
         .map_err(|e| judged(state, number, e.to_string(), Pending::Policy))?;
+    check_current(state, config, number)?;
     fleet().map_err(|why| judged(state, number, why, Pending::FleetName))?;
-    still(state, number)?;
+    check_current(state, config, number)?;
     let Some(system) = system else {
         return Ok(());
     };
     let observed = system.read();
-    still(state, number)?;
+    check_current(state, config, number)?;
     if all_read(&observed, number) {
         return Ok(());
     }
     system
         .apply(number)
         .map_err(|why| judged(state, number, why, Pending::SystemNames))?;
-    still(state, number)?;
+    check_current(state, config, number)?;
     let observed = system.read();
-    still(state, number)?;
+    check_current(state, config, number)?;
     if !all_read(&observed, number) {
         return Err(judged(
             state,
@@ -453,17 +492,7 @@ pub fn publication_of(
     };
     let word = number.to_string();
     let mut owed = Vec::new();
-    let keys: Vec<&'static str> = POLICY_KEYS
-        .iter()
-        .filter(|(section, key, _)| {
-            doc.get(section)
-                .and_then(Item::as_table_like)
-                .and_then(|table| table.get(key))
-                .and_then(Item::as_str)
-                != Some(word.as_str())
-        })
-        .map(|(_, _, label)| *label)
-        .collect();
+    let keys = missing_policy_keys(&doc, &word);
     if !keys.is_empty() {
         owed.push(Owed::Policy(keys));
     }

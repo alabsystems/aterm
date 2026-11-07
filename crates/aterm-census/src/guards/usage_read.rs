@@ -45,10 +45,7 @@ const READS: &[&str] = &[
 
 /// The functions that make a read for an account they hold in use. The walk does not enter them.
 const IN_USE: &[(&str, &str)] = &[
-    (
-        "launch_env_using",
-        "one launch and its shared read allowance",
-    ),
+    ("launch_env_for", "one launch and its shared read allowance"),
     ("run_agy", "a person's command for the active agy home"),
     (
         "run_kimi_refresh_with",
@@ -59,7 +56,10 @@ const IN_USE: &[(&str, &str)] = &[
         "a running Codex session's weekly wall",
     ),
     ("read_launch_rows", "the row a launch starts on"),
-    ("pooled_starter", "the row a worker's launch starts on"),
+    (
+        "pooled_starter_held",
+        "one worker invocation and its retained read allowance",
+    ),
     ("codex_cold_live", "the row a cold relaunch starts on"),
     (
         "cold_launch_who_capturing",

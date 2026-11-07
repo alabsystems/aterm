@@ -1209,22 +1209,8 @@ mod tests {
         PathBuf::from(named)
     }
 
-    fn make_runnable(path: &Path) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-        }
-    }
-
     fn exec_stub(path: &Path) {
-        let path = &runnable(path);
-        fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write");
-        make_runnable(path);
+        crate::test_script::script(&runnable(path), "#!/bin/sh\nexit 0\n");
     }
 
     fn driver_stub(path: &Path) {
@@ -1234,12 +1220,7 @@ mod tests {
         #[cfg(windows)]
         fs::copy(std::env::current_exe().expect("this test binary"), path).expect("copy");
         #[cfg(not(windows))]
-        fs::write(
-            path,
-            format!("#!/bin/sh\necho '{}'\n", sysroot.display()).as_bytes(),
-        )
-        .expect("write");
-        make_runnable(path);
+        crate::test_script::script(path, &format!("#!/bin/sh\necho '{}'\n", sysroot.display()));
     }
 
     /// CRT initializer so a copied test binary on Windows answers `--print sysroot` before libtest.
@@ -1308,12 +1289,10 @@ mod tests {
         let stubs = home.join("pkg-bin");
         fs::create_dir_all(&stubs).expect("mkdir");
         for name in ["targo", "trustc"] {
-            fs::write(
-                stubs.join(name),
-                b"#!/bin/sh\n# atpkg pending-program stub v1\nexit 127\n",
-            )
-            .expect("write");
-            make_runnable(&stubs.join(name));
+            crate::test_script::script(
+                &stubs.join(name),
+                "#!/bin/sh\n# atpkg pending-program stub v1\nexit 127\n",
+            );
         }
         let real = pinned_bin(&home.join("real/bin"));
         let path = std::env::join_paths([&stubs, &real]).expect("join");
@@ -1505,15 +1484,13 @@ mod tests {
     fn dated_bin(fixture: &Path, sysroot: &Path, date: &str) -> PathBuf {
         let script = fixture.join("dated-trustc");
         if !script.is_file() {
-            fs::write(
+            crate::test_script::script(
                 &script,
                 "#!/bin/sh\nroot=$(cd \"$(dirname \"$0\")/..\" && pwd -P)\n\
                  case \"$1\" in\n  --print) echo \"$root\" ;;\n  \
                  -vV) d=$(cat \"$root/commit-date\"); echo \"rustc 1.99.0-dev (0000000 $d)\"; \
                  echo \"commit-date: $d\" ;;\nesac\n",
-            )
-            .expect("write");
-            make_runnable(&script);
+            );
             let _ = std::process::Command::new(&script).output();
         }
         let bin = sysroot.join("bin");
@@ -1537,14 +1514,14 @@ mod tests {
         } else {
             ""
         };
-        fs::write(
-            script,
-            original.replace(
+        // In place, through the shared inode, so every sysroot's `trustc` link records.
+        crate::test_script::script(
+            &script,
+            &original.replace(
                 "case \"$1\" in",
                 &format!("{guard}echo probed >> \"$root/probes\"\ncase \"$1\" in"),
             ),
-        )
-        .expect("record probes");
+        );
     }
 
     #[cfg(unix)]
@@ -1866,17 +1843,14 @@ mod tests {
         for tool in ["targo", TIPPY, TRUSTFMT] {
             exec_stub(&bin.join(tool));
         }
-        let trustc = bin.join("trustc");
-        fs::write(
-            &trustc,
-            format!(
+        crate::test_script::script(
+            &bin.join("trustc"),
+            &format!(
                 "#!/bin/sh\ncase \"$1\" in -vV) printf 'rustc 1.0\\ncommit-hash: {commit}\\n' ;; \
                  *) echo '{}' ;; esac\n",
                 dir.display()
             ),
-        )
-        .expect("write trustc");
-        make_runnable(&trustc);
+        );
         crate::trust_lock::write_tree_root_record(&dir, root).expect("record");
         fs::write(crate::trust_lock::ready_marker(prefix, build), "ok\n").expect("ready");
         fs::canonicalize(bin).expect("canonicalize")
@@ -2322,14 +2296,13 @@ mod tests {
         let hidden = prefix.join("store/trust/hidden-current");
         fs::rename(&current, &hidden).expect("hide current");
         let shims = pinned_bin(&prefix.join("bin"));
-        fs::write(
-            shims.join("trustc"),
-            format!(
+        crate::test_script::script(
+            &shims.join("trustc"),
+            &format!(
                 "#!/bin/sh\necho '{}'\n",
                 store.parent().expect("sysroot").display()
             ),
-        )
-        .expect("write the shim's sysroot response");
+        );
         exec_stub(&shims.join(TIPPY));
         let path = std::env::join_paths([&stray, &shims]).expect("join");
         for pin in [None, Some("stable")] {

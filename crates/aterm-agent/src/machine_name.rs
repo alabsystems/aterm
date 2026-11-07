@@ -70,7 +70,8 @@ impl InFleet {
 
     /// This Mac's, with its fleet key in `state` and its vault at `vault`
     /// ([`Standing::membership_of`], which spawns nothing), or the key alone where no vault is
-    /// read ([`standing_vault`]).
+    /// read ([`standing_vault`]). Revocation is read before the key decides membership; only
+    /// a keyless, nonrevoked Mac needs its standing read too.
     #[must_use]
     pub fn read(state: &Path, vault: Option<&client::Paths>) -> Self {
         let fleet_key = aterm_net::fleet::read_key_file(state).is_ok();
@@ -85,7 +86,13 @@ impl InFleet {
                 ..
             })
         );
-        Self::of(fleet_key, revoked, &Standing::membership_of(paths, status))
+        if revoked {
+            return Self::Out;
+        }
+        if fleet_key {
+            return Self::In;
+        }
+        Self::of(false, false, &Standing::membership_of(paths, status))
     }
 
     /// `aterm name`'s `fleet=` word.

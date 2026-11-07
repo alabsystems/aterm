@@ -136,7 +136,7 @@ fn exercise(case: Case, peer: Peer) {
     let store = crate::session_store::new_store();
     h.ctx.timeline.lock().unwrap().mark_task(
         &crate::task_record::TaskMark::new(crate::task_record::TaskState::Working),
-        false,
+        &Default::default(),
         std::time::Instant::now(),
         1,
     );

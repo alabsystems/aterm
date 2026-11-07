@@ -2229,10 +2229,12 @@ fn debug_present() -> bool {
 
 /// The milliseconds the spare seam `name` sets: its variable's digits, or, where it names an
 /// absolute path, the digits that file holds when it is read, so a test can move the seam while
-/// its aterm runs (a warm spare's `T_READY` is read as each one starts warming).
+/// its aterm runs (a warm spare's `T_READY` is read as each one starts warming, a visible run's
+/// `WINDOW` as each one is queued).
 fn debug_ms(name: &'static str) -> Option<Duration> {
     let raw = match name {
         "T_READY" => aterm_types::dev_seam!("ATERM_DEBUG_SPARE_TREADY_MS"),
+        "WINDOW" => aterm_types::dev_seam!("ATERM_DEBUG_SPARE_WINDOW_MS"),
         "IDLE" => aterm_types::dev_seam!("ATERM_DEBUG_SPARE_IDLE_MS"),
         "PERSON" => aterm_types::dev_seam!("ATERM_DEBUG_SPARE_PERSON_MS"),
         "READY_AGE" => aterm_types::dev_seam!("ATERM_DEBUG_SPARE_READY_AGE_MS"),
@@ -2268,6 +2270,10 @@ fn scan_every() -> Duration {
 
 fn parked_deadline() -> Duration {
     debug_ms("PARKED").unwrap_or(PARKED_DEADLINE)
+}
+
+fn sample_window() -> Duration {
+    debug_ms("WINDOW").unwrap_or(SAMPLE_WINDOW)
 }
 
 /// Process-wide [`Shared`] gate mirror.
@@ -2316,6 +2322,9 @@ pub(crate) fn stop_thread() {
 struct Pending {
     obs: Box<Observation>,
     stamp: u64,
+    /// The longest rc that counts clean, read once as the run is queued, so its deadline and
+    /// its `slow` rule agree.
+    window: Duration,
     not_before: Option<Instant>,
 }
 
@@ -2358,6 +2367,7 @@ fn worker(rx: Receiver<Job>) {
                 pending.push(Pending {
                     obs,
                     stamp,
+                    window: sample_window(),
                     not_before: None,
                 });
                 false
@@ -2438,14 +2448,14 @@ fn worker(rx: Receiver<Job>) {
 }
 
 fn due(p: &Pending) -> Instant {
-    let at = due_at(&p.obs);
+    let at = due_at(&p.obs, p.window);
     p.not_before.map_or(at, |nb| at.max(nb))
 }
 
-fn due_at(obs: &Observation) -> Instant {
+fn due_at(obs: &Observation, window: Duration) -> Instant {
     match obs.witness.start_seen.get() {
         Some(seen) => seen.at + SCAN_GRACE,
-        None => obs.started_at + SAMPLE_WINDOW,
+        None => obs.started_at + window,
     }
 }
 
@@ -2496,7 +2506,9 @@ fn evaluate(
             });
         }
     }
-    let Pending { obs, stamp, .. } = p;
+    let Pending {
+        obs, stamp, window, ..
+    } = p;
     OBSERVED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2505,7 +2517,7 @@ fn evaluate(
     let Some(seen) = w.start_seen.get() else {
         aterm_log::info!(
             "spare gate: unclean run: failed=start: no start record within {} ms",
-            SAMPLE_WINDOW.as_millis()
+            window.as_millis()
         );
         aterm_log::info!("spare gate: generation {stamp:016x} saw a visible run: Unclean");
         book.sample(stamp, Sample::Unclean);
@@ -2527,7 +2539,7 @@ fn evaluate(
         );
         return None;
     }
-    let sample = judge(&obs, seen, last_scan);
+    let sample = judge(&obs, window, seen, last_scan);
     aterm_log::info!("spare gate: generation {stamp:016x} saw a visible run: {sample:?}");
     if let Sample::Clean { rc_ms } = sample {
         let mut recent = shared.rc_ms.lock().unwrap_or_else(|e| e.into_inner());
@@ -2540,7 +2552,12 @@ fn evaluate(
     None
 }
 
-fn judge(obs: &Observation, seen: &StartSeen, last_scan: &mut Option<Instant>) -> Sample {
+fn judge(
+    obs: &Observation,
+    window: Duration,
+    seen: &StartSeen,
+    last_scan: &mut Option<Instant>,
+) -> Sample {
     let w = &obs.witness;
     if seen
         .input
@@ -2560,7 +2577,7 @@ fn judge(obs: &Observation, seen: &StartSeen, last_scan: &mut Option<Instant>) -
         || seen.mark.roots.is_some();
     let failed: Vec<&str> = [
         (seen.mark.kind == StartKind::Cold, "kind"),
-        (rc <= SAMPLE_WINDOW, "slow"),
+        (rc <= window, "slow"),
         (flags_clean, "flags"),
         (roots_named, "roots"),
         (pid > 1 && seen.fg_pgrp == pid, "fg"),
@@ -2808,6 +2825,7 @@ impl Wake {
             Wake::GrokSigninLooked { session } => Some(*session),
             Wake::LeaseChanged { .. }
             | Wake::CrashJournalOwed
+            | Wake::HostMaintenance
             | Wake::FabricChanged { .. }
             | Wake::Typed { .. }
             | Wake::Driven { .. }
@@ -3068,6 +3086,8 @@ impl Wake {
             Wake::CancelSessionRename { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::AllocationMonitorChanged => None,
+            #[cfg(all(unix, not(test)))]
+            Wake::NetworkPlaceChanged => None,
             Wake::AccountsDrained { .. }
             | Wake::MailChanged
             | Wake::NoMacosDialog
@@ -3628,10 +3648,11 @@ impl App {
         if let Some(slot) = &self.spares.slot {
             let at = match slot.state {
                 SlotState::Spawned => Some(slot.since + parked_by),
-                SlotState::Parked => Some(slot.since + PARKED_MAX_AGE),
                 SlotState::Warming => Some(slot.since + slot.t_ready),
                 SlotState::Ready => Some(slot.since + ready_max_age()),
-                SlotState::Booked | SlotState::Verifying => None,
+                // A parked spare's age is judged at adoption and on a tick something else armed,
+                // never by a timer of its own (design §7.3 G7, §16 D7).
+                SlotState::Parked | SlotState::Booked | SlotState::Verifying => None,
             };
             if let Some(at) = at {
                 self.spares.arm(at);
@@ -3927,12 +3948,24 @@ impl App {
     /// reaches the spare by no event of its own. The others' clearing arms a tick where it happens.
     fn spare_recheck_at(&self, why: &str, now: Instant) -> Option<Instant> {
         match why {
-            "budget" => self
-                .spares
-                .warm_discards
-                .iter()
-                .find(|at| now.saturating_duration_since(**at) < HOUR)
-                .map(|oldest| *oldest + HOUR),
+            "budget" => {
+                let reopens = self
+                    .spares
+                    .warm_discards
+                    .iter()
+                    .find(|at| now.saturating_duration_since(**at) < HOUR)
+                    .map(|oldest| *oldest + HOUR)?;
+                // Once the person window has run out the warm gates refuse with `no-person`, and
+                // the person's next gesture arms a tick (`note_person`), so no look waits past it.
+                let person_gone = self
+                    .config
+                    .spare_shell_needs_person_or_default()
+                    .then(|| self.spares.person.get().map(|at| at + person_window()))
+                    .flatten();
+                person_gone
+                    .is_none_or(|gone| reopens < gone)
+                    .then_some(reopens)
+            }
             // A handoff ends at many sites, and this timer lives only while one is in flight.
             "update" => Some(now + UPDATE_RECHECK),
             _ => None,
@@ -4327,6 +4360,8 @@ impl App {
             _ => age >= ready_max_age(),
         };
         if too_old {
+            // Never adopted now, so the aging rule retires it at once and books its successor.
+            self.spare_age(now, self.spare_mode());
             return Err("age");
         }
         if warm && generation != slot.generation {

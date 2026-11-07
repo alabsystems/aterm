@@ -937,9 +937,7 @@ fn admitted_test_workers_keep_their_share_on_replay_and_serial_fallback() {
         ctx.env.cargo_build_jobs = Some("6".into());
         ctx.child_env_add
             .push(("CARGO_BUILD_JOBS".into(), "6".into()));
-        ctx = ctx
-            .with_test_jobs(NonZeroU32::new(u32::MAX))
-            .with_test_threads(NonZeroU32::new(2));
+        ctx = ctx.with_test_threads(NonZeroU32::new(2));
         ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
         let spec = plan::plan(&ctx)
             .into_iter()
@@ -954,14 +952,11 @@ fn admitted_test_workers_keep_their_share_on_replay_and_serial_fallback() {
                 "{block}"
             );
         }
-        if extra.is_empty() {
-            assert!(
-                block.contains("widths planned within a share of 6 cores, at most 4 at once"),
-                "{block}"
-            );
-        } else {
-            assert!(block.contains("run by cargo, one at a time"), "{block}");
-        }
+        assert_eq!(
+            block.contains("run by cargo, one at a time"),
+            !extra.is_empty(),
+            "{block}"
+        );
     }
 }
 
@@ -1072,13 +1067,12 @@ fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
 
     let mut ctx = repo.ctx(&land(), Scope::workspace());
     ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
-    ctx.test_jobs = Some(2);
     ctx.test_threads = Some(6);
-    // A held share of 12, so two new binaries at their starting width of 4 fit together on any
-    // host, and `--test-jobs 2` holds the run to two at a time: unheld, the share is the host's
-    // cores.
+    // A held share of exactly two unseen binaries' charges (each at width four, within the
+    // ceiling of six), so the dispatch runs two at a time on any host: unheld, the share is the
+    // host's cores.
     ctx.env.build_slot_held = Some("1".into());
-    ctx.env.cargo_build_jobs = Some("12".into());
+    ctx.env.cargo_build_jobs = Some("8".into());
     let history = repo.scratch.join("verify/test-binaries.json");
     ctx.test_history = Some(history.clone());
     let spec = plan::plan(&ctx)
@@ -1107,7 +1101,7 @@ fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
                 .iter()
                 .map(|s| (s.width, s.outcome.as_str(), s.tests))
                 .collect::<Vec<_>>(),
-            [(aterm_verify::test_plan::NEW_WIDTH, outcome, Some(tests))],
+            [(4, outcome, Some(tests))],
             "{test}"
         );
     }
@@ -1139,13 +1133,11 @@ fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
             && at("Running tests/b.rs") < at("Running tests/c.rs"),
         "printed in cargo's order, whatever order they ran in:\n{block}"
     );
-    // No history: each binary starts at the new width, within the asked ceiling of 6.
-    let new = aterm_verify::test_plan::NEW_WIDTH;
     for (name, pkg, threads) in [
-        ("a", "fixture", new),
-        ("b", "fixture", new),
-        ("c", "fixture", new),
-        ("d", "fixture2", new),
+        ("a", "fixture", 4),
+        ("b", "fixture", 4),
+        ("c", "fixture", 4),
+        ("d", "fixture2", 4),
     ] {
         let want = format!(
             "{name}: cwd={} pkg={pkg} threads={threads} args=\n",
@@ -1172,6 +1164,144 @@ fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
         "{block}"
     );
     assert!(t.could_not_run.is_empty(), "{t:?}");
+}
+
+/// A BINARY WHOSE LAST RUN FAILED STARTS FIRST, so a red shows early: the run keeps what each
+/// binary took and how it ended, and the next plans by it; the failing binary is kept as the
+/// shortest by far, so by length alone it would start last. NEGATIVE CONTROL: the first run, with
+/// nothing kept, starts them in cargo's order, the failing one second.
+#[test]
+fn a_binary_that_failed_last_run_starts_first() {
+    let repo = FakeRepo::new();
+    let order = repo.scratch.join("order");
+    let bins = [
+        ("fixture", "--test a", "a"),
+        ("fixture", "--test b", "b"),
+        ("fixture", "--test c", "c"),
+    ];
+    with_recording_cargo(&repo, &bins, "");
+    for (_, _, name) in bins {
+        let verdict = if name == "b" {
+            "test t::broke ... FAILED\\n\\nfailures:\\n    t::broke\\n\\ntest result: FAILED. 0 passed; 1 \
+             failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n\\n'\nexit 101"
+        } else {
+            "test t::fine ... ok\\n\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 \
+             filtered out; finished in 0.01s\\n\\n'"
+        };
+        common::standin_body(
+            &repo.root.join(format!("target/debug/deps/{name}-1")),
+            &format!(
+                "echo {name} >> '{}'\nprintf '\\nrunning 1 test\\n{verdict}",
+                order.display()
+            ),
+        );
+    }
+    let mut ctx = repo.ctx(&[Check::Test], Scope::workspace());
+    ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
+    ctx.test_history = Some(repo.scratch.join("test-binaries.json"));
+    // A share of one core: one binary at a time, so the order they start in is the order they ran.
+    ctx.env.build_slot_held = Some("1".into());
+    ctx.env.cargo_build_jobs = Some("1".into());
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::Test)
+        .expect("test stage");
+    let ran = |ctx: &aterm_verify::Ctx| {
+        fs::remove_file(&order).ok();
+        let block = stages::run_stage(ctx, &spec).render();
+        assert_eq!(tags(&block), ["FAIL"], "{block}");
+        fs::read_to_string(&order).expect("order")
+    };
+    assert_eq!(ran(&ctx), "a\nb\nc\n");
+    let kept = aterm_verify::test_history::load(ctx.test_history.as_deref().expect("history"));
+    let failed = kept.seen("-p fixture --test b").expect("b was kept");
+    assert!(failed.failed && failed.tests == 1, "{failed:?}");
+    assert!(!kept.seen("-p fixture --test a").expect("a was kept").failed);
+    let took = |wall_ms: u64, outcome: &str| aterm_verify::test_history::Sample {
+        at_ms: 1,
+        outcome: outcome.to_owned(),
+        wall_ms,
+        cpu_ms: None,
+        starved_ms: None,
+        peak_bytes: None,
+        width: 1,
+        tests: Some(1),
+    };
+    aterm_verify::test_history::keep(
+        ctx.test_history.as_deref().expect("history"),
+        vec![
+            ("-p fixture --test a".to_owned(), took(30_000, "ok")),
+            ("-p fixture --test b".to_owned(), took(10, "FAIL")),
+            ("-p fixture --test c".to_owned(), took(20_000, "ok")),
+        ],
+    )
+    .expect("keep");
+    assert_eq!(ran(&ctx), "b\na\nc\n");
+}
+
+/// A FAILED TEST RERUNS AT THE WIDTH ITS BINARY RAN AT: on a share of four, the plan runs `b`,
+/// whose history kept one test, one thread wide, and its failure's rerun line sets
+/// `RUST_TEST_THREADS=1`, so a failure only one test thread shows is shown again.
+/// NEGATIVE CONTROL: `c`, with no history, runs at the run's width, and its rerun line sets 4.
+#[test]
+fn a_failed_test_reruns_at_the_width_its_binary_ran_at() {
+    let repo = FakeRepo::new();
+    let bins = [("fixture", "--test b", "b"), ("fixture", "--test c", "c")];
+    with_recording_cargo(&repo, &bins, "");
+    for (_, _, name) in bins {
+        common::standin_body(
+            &repo.root.join(format!("target/debug/deps/{name}-1")),
+            &format!(
+                "printf '\\nrunning 1 test\\ntest t::{name} ... FAILED\\n\\nfailures:\\n\\n\
+                 ---- t::{name} stdout ----\\nboom\\n\\nfailures:\\n    t::{name}\\n\\ntest \
+                 result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; \
+                 finished in 0.01s\\n\\n'\nexit 101"
+            ),
+        );
+    }
+    let mut ctx = repo.ctx(&[Check::Test], Scope::workspace());
+    ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
+    ctx.test_history = Some(repo.scratch.join("test-binaries.json"));
+    ctx.env.build_slot_held = Some("1".into());
+    ctx.env.cargo_build_jobs = Some("4".into());
+    aterm_verify::test_history::keep(
+        ctx.test_history.as_deref().expect("history"),
+        vec![(
+            "-p fixture --test b".to_owned(),
+            aterm_verify::test_history::Sample {
+                at_ms: 1,
+                outcome: "ok".to_owned(),
+                wall_ms: 10,
+                cpu_ms: None,
+                starved_ms: None,
+                peak_bytes: None,
+                width: 4,
+                tests: Some(1),
+            },
+        )],
+    )
+    .expect("keep");
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::Test)
+        .expect("test stage");
+    let report = stages::run_stage(&ctx, &spec);
+    let block = report.render();
+    assert_eq!(tags(&block), ["FAIL"], "{block}");
+    let findings = report.findings();
+    let reruns: Vec<_> = findings
+        .iter()
+        .filter_map(|f| f.rerun.as_deref())
+        .map(|r| r.rsplit_once("RUST_TEST_THREADS=").map_or(r, |(_, at)| at))
+        .collect();
+    assert_eq!(
+        reruns,
+        [
+            "1 targo --unverified test -p fixture --test b -- t::b --exact",
+            "4 targo --unverified test -p fixture --test c -- t::c --exact"
+        ],
+        "{block}"
+    );
 }
 
 /// The first test binary that fails ends a run whose halt is armed (`release`, `--fail-fast`): no
@@ -1222,7 +1352,9 @@ fn the_first_failing_test_binary_ends_a_halted_run_and_nothing_else_does() {
         }
         let mut ctx = repo.ctx(&land(), Scope::workspace()).with_halt(halt);
         ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
-        ctx.test_jobs = Some(1);
+        // A share of one core: one binary at a time, so none starts beside the first.
+        ctx.env.build_slot_held = Some("1".into());
+        ctx.env.cargo_build_jobs = Some("1".into());
         let spec = plan::plan(&ctx)
             .into_iter()
             .find(|s| s.id == StageId::Test)
@@ -1324,7 +1456,8 @@ fn a_json_binary_ends_at_its_first_decisive_red_case_and_nothing_else_does() {
             .ctx(&land(), Scope::workspace())
             .with_halt(Halt::at_first_red("the run", |_| {}));
         ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
-        ctx.test_jobs = Some(1);
+        ctx.env.build_slot_held = Some("1".into());
+        ctx.env.cargo_build_jobs = Some("1".into());
         ctx.child_ceiling = Some(aterm_spec::wait::MUST_HAPPEN);
         let spec = plan::plan(&ctx)
             .into_iter()
@@ -1402,7 +1535,8 @@ fn a_refused_probe_runs_every_binary_in_the_human_format() {
     }
     let mut ctx = repo.ctx(&land(), Scope::workspace());
     ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
-    ctx.test_jobs = Some(1);
+    ctx.env.build_slot_held = Some("1".into());
+    ctx.env.cargo_build_jobs = Some("1".into());
     let spec = plan::plan(&ctx)
         .into_iter()
         .find(|s| s.id == StageId::Test)
@@ -1461,7 +1595,8 @@ fn a_probe_a_crash_leaves_unanswered_asks_the_next_binary() {
         }
         let mut ctx = repo.ctx(&land(), Scope::workspace());
         ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
-        ctx.test_jobs = Some(1);
+        ctx.env.build_slot_held = Some("1".into());
+        ctx.env.cargo_build_jobs = Some("1".into());
         let spec = plan::plan(&ctx)
             .into_iter()
             .find(|s| s.id == StageId::Test)
@@ -1502,7 +1637,9 @@ fn a_binary_the_ceiling_left_no_time_to_start_keeps_no_history() {
     common::standin_body(&deps.join("b-1"), "echo 'b ran'\nexit 0");
     let mut ctx = repo.ctx(&land(), Scope::workspace());
     ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
-    ctx.test_jobs = Some(1);
+    // A share of one core: one binary at a time, the second only after the first.
+    ctx.env.build_slot_held = Some("1".into());
+    ctx.env.cargo_build_jobs = Some("1".into());
     ctx.test_threads = Some(1);
     ctx.child_ceiling = Some(std::time::Duration::from_secs(3));
     let history = repo.scratch.join("verify/test-binaries.json");
@@ -1690,79 +1827,4 @@ fn a_recorded_binary_that_cannot_start_is_its_own_could_not_run_row() {
             && !block.contains("could not execute"),
         "{block}"
     );
-}
-
-/// FAILED FIRST (A9): with a test history, the binary that failed last time runs first and the
-/// rest longest-predicted first, each planned from its newest sample, and each run adds its
-/// sample. NEGATIVE CONTROL: with no history the same run keeps cargo's order.
-#[test]
-fn the_test_history_runs_last_times_failure_first() {
-    use aterm_verify::test_history::{Sample, keep, load};
-    for with_history in [true, false] {
-        let repo = FakeRepo::new();
-        let bins = [
-            ("fixture", "--test a", "a"),
-            ("fixture", "--test b", "b"),
-            ("fixture", "--test c", "c"),
-        ];
-        with_recording_cargo(&repo, &bins, "");
-        let order = repo.scratch.join("order");
-        for (_, _, name) in bins {
-            common::standin_body(
-                &repo.root.join(format!("target/debug/deps/{name}-1")),
-                &format!(
-                    "echo {name} >> '{}'\nprintf '\\nrunning 2 tests\\ntest {name}::x ... ok\\ntest {name}::y ... ok\\n\\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n\\n'",
-                    order.display()
-                ),
-            );
-        }
-        let history = repo.scratch.join("verify/test-binaries.json");
-        let sample = |wall_ms: u64, outcome: &str| Sample {
-            at_ms: 1,
-            outcome: outcome.into(),
-            wall_ms,
-            cpu_ms: Some(wall_ms),
-            starved_ms: None,
-            peak_bytes: None,
-            width: 1,
-            tests: Some(2),
-        };
-        if with_history {
-            keep(
-                &history,
-                vec![
-                    ("-p fixture --test a".into(), sample(1000, "ok")),
-                    ("-p fixture --test b".into(), sample(500, "FAIL")),
-                    ("-p fixture --test c".into(), sample(9000, "ok")),
-                ],
-            )
-            .expect("seed history");
-        }
-        let mut ctx = repo.ctx(&[Check::Test], Scope::workspace());
-        ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
-        ctx.test_jobs = Some(1);
-        ctx.test_history = Some(history.clone());
-        let spec = plan::plan(&ctx)
-            .into_iter()
-            .find(|s| s.id == StageId::Test)
-            .expect("test stage");
-        let report = stages::run_stage(&ctx, &spec);
-        let block = report.render();
-        assert!(!tally(std::slice::from_ref(&report)).failed(), "{block}");
-        let ran = fs::read_to_string(&order).expect("order");
-        let kept = load(&history);
-        if with_history {
-            assert_eq!(ran, "b\nc\na\n", "{block}");
-            assert!(
-                block.contains("1 that failed last time, 2 by history"),
-                "{block}"
-            );
-            let b = kept.row("-p fixture --test b").expect("b's row");
-            assert_eq!(b.samples.len(), 2, "{kept:?}");
-            assert_eq!(b.samples[1].outcome, "ok", "{kept:?}");
-        } else {
-            assert_eq!(ran, "a\nb\nc\n", "{block}");
-            assert!(block.contains("3 new"), "{block}");
-        }
-    }
 }

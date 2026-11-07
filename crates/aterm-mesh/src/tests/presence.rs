@@ -9,7 +9,7 @@
 //! detector.
 
 use super::{HANG, Lab, Mac, incarnation, lab_of, lock, seating};
-use crate::logs::{MESH_DIR, Standings};
+use crate::logs::{MESH_DIR, MeshLog, Standings};
 use crate::presence::{
     Build, EVERY, Event, Facts, Held, Presence, PresenceConfig, Refusal, STALE_ROWS_UP, Standing,
 };
@@ -298,6 +298,124 @@ fn a_mac_whose_row_names_a_topic_is_a_holder_on_the_others() {
     round(&lab, &[&pa, &pb], &all);
     assert_eq!(b.mesh().holders(), BTreeSet::new(), "A names none now");
     drop((pa, pb));
+}
+
+/// §4.12, B9: a reader on a Mac asks its node service for the view and is answered every seat's
+/// standing and newest row, as presence there reads them, and every seat's newest needs row and
+/// activity row, the ones another Mac published included once the relay carried them there; it
+/// starts nothing and dials no other Mac. Once presence stops, nothing answers there. A `now`
+/// row this build does not name (a later build's) rides the same relay and changes neither map,
+/// as this build's rows change nothing in an older build's view.
+/// NEGATIVE CONTROL: A, which published no needs or activity row, has none in the view (the view
+/// names no row it was not given), and once A's presence stops an ask reads `NoNode`.
+#[test]
+fn a_reader_asks_the_node_for_every_seat_and_its_needs_row() {
+    use aterm_metrics::row::{ActivityRow, NeedEntry, NeedsRow, Sid, Word};
+    use aterm_metrics::subject::Node;
+    let lab = Lab::new();
+    let macs = lab_of(&lab, 2);
+    let (a, b) = (&macs[0], &macs[1]);
+    let all = [a.principal.as_str(), &b.principal];
+    let mut pa = present(a);
+    let pb = present(b);
+    let t = wall(&lab) / 1000;
+    let needs = |word: &str| NeedsRow {
+        at: t,
+        needs: vec![NeedEntry {
+            sid: Sid::parse("s-0123456789abcdef0123").expect("a sid"),
+            word: Word::new(word).expect("a word"),
+            harness: true,
+            worker_of: None,
+            since: Some(t),
+        }],
+        held: Vec::new(),
+        managers: Vec::new(),
+    };
+    let b_node = Node::parse(&b.principal).expect("a node");
+    let subject = NeedsRow::subject(b_node).to_string();
+    b.mesh()
+        .publish(MeshLog::Metrics, &subject, &needs("stalled").encode())
+        .expect("B publishes its needs row");
+    let activity = ActivityRow {
+        at: t,
+        busy: 2,
+        waiting: 1,
+        ..ActivityRow::default()
+    };
+    b.mesh()
+        .publish(
+            MeshLog::Metrics,
+            &ActivityRow::subject(b_node).to_string(),
+            &activity.encode(),
+        )
+        .expect("B publishes its activity row");
+    b.mesh()
+        .publish(
+            MeshLog::Metrics,
+            &format!("/m/{}/shared/now/zzz", b.principal),
+            b"a later build's row",
+        )
+        .expect("B publishes a row this build does not name");
+    // B's presence row of this round follows its needs row on the relay to A.
+    let at = round(&lab, &[&pa, &pb], &all);
+    let mesh_dir = a.dir.path().join(MESH_DIR);
+    let view = crate::view::ask(&mesh_dir, HANG).expect("A's node answers");
+    assert_eq!(view.me, a.principal);
+    assert!(view.standings, "A read the membership standings");
+    let seats: Vec<(&str, bool, Standing, Option<u64>)> = view
+        .seats
+        .iter()
+        .map(|seat| {
+            (
+                seat.principal.as_str(),
+                seat.me,
+                seat.standing,
+                seat.row.as_ref().map(|(_, row)| row.at_ms),
+            )
+        })
+        .collect();
+    let mut want = vec![
+        (a.principal.as_str(), true, Standing::Up, Some(at)),
+        (b.principal.as_str(), false, Standing::Up, Some(at)),
+    ];
+    want.sort_unstable_by_key(|seat| seat.0);
+    assert_eq!(seats, want, "both seats up, each with this round's row");
+    let held = view.needs.expect("A read the needs rows");
+    assert_eq!(
+        held.get(&b.principal),
+        Some(&needs("stalled")),
+        "B's needs row reached A"
+    );
+    assert_eq!(held.get(&a.principal), None, "A published none");
+    assert_eq!(held.len(), 1, "the needs map holds needs rows alone");
+    let doing = view.activity.expect("A read the activity rows");
+    assert_eq!(
+        doing.get(&b.principal),
+        Some(&activity),
+        "B's activity row reached A"
+    );
+    assert_eq!(doing.get(&a.principal), None, "A published none");
+    assert_eq!(doing.len(), 1, "the activity map holds activity rows alone");
+    b.mesh()
+        .publish(MeshLog::Metrics, &subject, &needs("asking").encode())
+        .expect("B publishes again");
+    assert_eq!(
+        crate::view::ask(&b.dir.path().join(MESH_DIR), HANG)
+            .expect("B's node answers")
+            .needs
+            .and_then(|mut needs| needs.remove(&b.principal)),
+        Some(needs("asking")),
+        "a Mac's own newest row is in its view at once"
+    );
+    pa.presence.stop();
+    assert!(
+        matches!(
+            crate::view::ask(&mesh_dir, HANG),
+            Err(crate::view::Unserved::NoNode)
+        ),
+        "a stopped presence serves no view"
+    );
+    drop(pb);
 }
 
 /// §10 "Presence": a restarted Mac's first row wins at once on every other Mac. Its number is in

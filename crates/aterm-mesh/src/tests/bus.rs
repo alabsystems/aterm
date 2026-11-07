@@ -852,6 +852,19 @@ fn identities(mesh: &crate::Mesh, bus: &BusHost) -> String {
     )
 }
 
+/// Whether each log, in [`identities`]' order, serves a weak tier, whose acks a crash can lose,
+/// so a run of it left open moves its generation in another boot: `metrics.log` and `bus.log`
+/// (Relaxed) everywhere, `tables.log` (Ordered) only where Ordered has its barrier (Apple), as
+/// it serves Strict elsewhere.
+fn weak_tiers(mesh: &crate::Mesh, bus: &BusHost) -> [bool; 3] {
+    [
+        mesh.broker(crate::MeshLog::Tables).served_durability(),
+        mesh.broker(crate::MeshLog::Metrics).served_durability(),
+        bus.broker().served_durability(),
+    ]
+    .map(|served| served.served != astream_broker::Tier::Strict)
+}
+
 /// The stand-in: the node service's mesh and keeper, as it runs them (each registered for the
 /// quit by its own open), a record on every log, each log's identity written, then the quit's
 /// close where `QUIT_CLOSES` says so, and death by SIGKILL, which runs no drop.
@@ -919,7 +932,9 @@ fn quit_stand_in(state: &Path) -> ! {
 /// was flushed and marked closed.
 ///
 /// NEGATIVE CONTROL: the same stand-in dying without the close leaves every log open, and
-/// another boot's opening moves each one's generation.
+/// another boot's opening moves the generation of each that served a weak tier ([`weak_tiers`]:
+/// every one on Apple; elsewhere `tables.log` serves Strict, whose acks were on stable media, and
+/// keeps its own).
 #[test]
 fn a_quit_signal_leaves_every_log_closed_cleanly() {
     use std::os::unix::process::ExitStatusExt as _;
@@ -977,17 +992,18 @@ fn a_quit_signal_leaves_every_log_closed_cleanly() {
             "closes = {closes}: the stand-in died of its kill ({status})"
         );
         let before = std::fs::read_to_string(&out).expect("the stand-in's identities");
-        let (after, held) = std::thread::scope(|scope| {
+        let (after, weak, held) = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
                     crate::logs::BOOT.with(|boot| boot.set(Some([12; 16])));
                     let mesh = quit_mesh(state.path()).expect("the mesh opens again");
                     let bus = BusHost::open(quit_spec(root.path())).expect("bus.log opens again");
                     let after = identities(&mesh, &bus);
+                    let weak = weak_tiers(&mesh, &bus);
                     let held = held(&root, &format!("/f/{FLEET}/in/>"));
                     bus.shut();
                     mesh.close();
-                    (after, held)
+                    (after, weak, held)
                 })
                 .join()
                 .expect("the reopening thread")
@@ -996,10 +1012,16 @@ fn a_quit_signal_leaves_every_log_closed_cleanly() {
             assert_eq!(after, before, "a log the quit closed kept its generation");
             assert_eq!(held, ["kept"], "the post the quit flushed is held");
         } else {
-            for (was, now) in before.lines().zip(after.lines()) {
-                assert_ne!(
-                    was, now,
-                    "a log left open moves its generation in another boot"
+            assert!(
+                weak[1] && weak[2],
+                "PRECONDITION: the Relaxed logs serve Relaxed"
+            );
+            for ((was, now), weak) in before.lines().zip(after.lines()).zip(weak) {
+                assert_eq!(
+                    was != now,
+                    weak,
+                    "a log left open moves its generation in another boot where it served a weak \
+                     tier ({was} to {now})"
                 );
             }
         }

@@ -141,6 +141,8 @@ pub(crate) use control_session::turn_ids_past_handoff_ceiling;
 pub(crate) use control_session::{RestWrite, rest_run_event, rest_writes, typed_key_events};
 pub(crate) use control_session::{TURN_ID_RESERVE, raise_turn_ids, turn_ids_minted};
 #[cfg(test)]
+pub(crate) use control_session::{TaskTarget, await_task};
+#[cfg(test)]
 pub(crate) use control_session::{TurnIo, cmd_turn};
 #[cfg(test)]
 pub(crate) use control_session::{caller_actor_of, cmd_exits, owner_tab_sid};
@@ -3505,13 +3507,16 @@ pub(crate) fn spawn(
             };
             let _owner = socket.take_owner();
             let token = socket.token().clone();
+            let source_registry = Arc::new(
+                aterm_agent::harness::codex_source_registry::Registry::for_app(&account_work),
+            );
             let worker_context = Arc::new(ControlWorkerContext {
                 active: active.clone(),
                 store: store.clone(),
                 proxy: proxy.clone(),
                 account_services: AccountServices {
                     lifetime: account_work,
-                    source_registry: Arc::new(Default::default()),
+                    source_registry,
                     interactive_browser,
                 },
                 token: token.clone(),
@@ -3580,7 +3585,8 @@ pub(crate) fn spawn(
             #[cfg(unix)]
             crate::fabric_launch::spawn_supervisor(&startup_config);
             crate::fleet_listen::start_fleet_listener(startup_config.effective_fleet());
-            crate::net_place::start();
+            #[cfg(all(unix, not(test)))]
+            crate::net_place::start(proxy.clone());
             if let Some(state) = aterm_types::dirs::state_dir() {
                 crate::board_keeper::start(state);
             }

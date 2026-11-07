@@ -6,8 +6,8 @@
 //!
 //! Two axes that never merge: where (`alab-lan`, `remote:<hotspot|lan|cellular|vpn>`,
 //! `offline`, `checking`) and the internet (`ok`, `down`, `path-up`, `unknown`, always with its
-//! source), with the ALab LAN's reach beside them (members reachable of those the book knows,
-//! away since). [`place`] decides it, purely; [`words`] says it; [`record`] keeps the keeper's
+//! source), with the ALab LAN axis beside them (here, away since, learning). Who in the lab is up
+//! is presence's, never the place's: a reporter hands that in ([`words::Seats`]). [`place`] decides it, purely; [`words`] says it; [`record`] keeps the keeper's
 //! memory; [`heard`] is the evidence every process notes into; [`facts`] reads the Mac;
 //! [`keeper`] is the one writer and [`keeper::read`] what every reader calls; [`moves`] tells a
 //! settled place as a network move, and [`routes`] says which member addresses an automatic LAN
@@ -20,11 +20,12 @@
 //! ALab LAN admission reads [`proof`], never the place's word: a remembered network is no proof.
 
 pub mod place;
+mod time;
 
 pub use place::{
     Alab, Answer, Book, BookMember, Checking, ComputedBy, Evidence, Facts, Internet, InternetNote,
-    InternetSource, InternetState, Kind, Lane, Link, NetworkId, PathFacts, Place, Recognised,
-    Record, Round, RouteFacts, Where, member_key, step,
+    InternetSource, InternetState, Kind, Lane, Link, NetworkId, PathFacts, Place, Projection,
+    Recognised, Record, Round, RouteFacts, Where, member_key, step, step_with_deadline,
 };
 
 // The Mac's readers, the files and the keeper stand on aterm-uds's Unix-only network tables and
@@ -47,7 +48,7 @@ pub mod words;
 pub mod sample;
 
 #[cfg(unix)]
-pub use keeper::{read, read_cached, read_with};
+pub use keeper::{read, read_with};
 
 /// Now, unix ms (0 before the epoch).
 #[must_use]

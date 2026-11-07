@@ -27603,7 +27603,12 @@ mod tests {
         /// One that said `Hello` and named the state dir's device (the test's scratch holds the
         /// log and the state dir), as every attach of a bridge whose log shares its volume
         /// does: the fence is the pin's barriers and the broker's settle (critic item F07,
-        /// [`Bridge::make_the_pin_fence`]).
+        /// [`Bridge::make_the_pin_fence`]). Apple only: elsewhere no log's full flush drains its
+        /// device (`astream_broker::LogDevice::flush_drains_device`), so no broker settles the pin.
+        #[cfg_attr(
+            not(target_vendor = "apple"),
+            expect(dead_code, reason = "no broker settles the pin off Apple")
+        )]
         Hello,
         /// [`FirstLink::Hello`] on a broker whose every full flush fails
         /// (`astream_broker::InjectedFaults::sync`), so it refuses the settle.
@@ -28040,7 +28045,7 @@ mod tests {
     /// grace more; and with the pass ahead of what is queued
     /// ([`crate::sim::world::Mutant::MirrorAheadOfTheFirstDelivery`]), the first round sends the
     /// settle ahead of its delivery and the second takes.
-    #[cfg(unix)]
+    #[cfg(target_vendor = "apple")]
     #[test]
     fn the_first_take_after_an_attach_goes_at_the_round_that_reads_the_settle() {
         use crate::sim::world::Mutant;
@@ -28174,19 +28179,19 @@ mod tests {
     }
 
     /// **A SETTLE THE BROKER REFUSED LEAVES THE PIN TO THE BRIDGE'S OWN FULL FLUSH** (critic item
-    /// F07): on a link that named the state dir's device, a broker whose full flush fails
-    /// (`astream_broker::InjectedFaults::sync`) refuses the settle (`durability flush failed`,
-    /// [`Bridge::pin_settle_refused`]). The fence is then the bridge's own durable replace of the
-    /// pin ([`StateDir::ensure_logpin_durable`]: a second `logpin_fence` row behind the barriers'),
-    /// made by the next pass, which takes; that broker is not asked again on this link
-    /// ([`Bridge::broker_settles_the_pin`]).
+    /// F07): on a link that named the state dir's device (Apple only, as [`FirstLink::Hello`]), a
+    /// broker whose full flush fails (`astream_broker::InjectedFaults::sync`) refuses the settle
+    /// (`durability flush failed`, [`Bridge::pin_settle_refused`]). The fence is then the
+    /// bridge's own durable replace of the pin ([`StateDir::ensure_logpin_durable`]: a second
+    /// `logpin_fence` row behind the barriers'), made by the next pass, which takes; that broker
+    /// is not asked again on this link ([`Bridge::broker_settles_the_pin`]).
     ///
     /// NEGATIVE CONTROLS: with the refusal forgotten
     /// ([`crate::sim::world::Mutant::SettleRefusalForgotten`]), the next pass asks again and
     /// takes nothing; with the refusal taken as the answer
     /// ([`crate::sim::world::Mutant::RefusedSettleMakesTheFence`]), the pin is held as the fence
     /// on its barriers alone, no full flush behind them.
-    #[cfg(unix)]
+    #[cfg(target_vendor = "apple")]
     #[test]
     fn a_refused_settle_leaves_the_pin_to_the_bridges_own_full_flush() {
         use crate::sim::world::Mutant;

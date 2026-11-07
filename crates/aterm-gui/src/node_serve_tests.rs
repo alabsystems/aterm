@@ -441,6 +441,7 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
         config_path: Some(config_path),
         vault_paths: None,
         prebound_listener: Some(prebound),
+        on_generation: None,
         tick_every: Duration::from_millis(40),
         wake_timeout: aterm_spec::wait::MUST_HAPPEN,
         lan_unavailable: || None,
@@ -763,6 +764,7 @@ fn serve_node_reading(
         members,
         alab_browse: None,
         prebound_listener: Some(prebound),
+        on_generation: None,
         tick_every: Duration::from_millis(40),
         wake_timeout: Duration::from_secs(1),
         lan_unavailable: || None,
@@ -1174,6 +1176,7 @@ fn a_moved_member_is_found_by_its_alab_tcp_advert() {
         members: None,
         alab_browse: Some(browse),
         prebound_listener: Some(prebound),
+        on_generation: None,
         tick_every: Duration::from_millis(40),
         wake_timeout: Duration::from_secs(1),
         lan_unavailable: || None,
@@ -1258,6 +1261,7 @@ fn an_ask_on_the_node_jobs_port_reaches_the_windows_desk_or_is_refused_with_none
         config_path: Some(config_path),
         vault_paths: None,
         prebound_listener: Some(prebound),
+        on_generation: None,
         tick_every: Duration::from_millis(30),
         wake_timeout: Duration::from_secs(1),
         lan_unavailable: || None,
@@ -1354,10 +1358,80 @@ fn an_ask_on_the_node_jobs_port_reaches_the_windows_desk_or_is_refused_with_none
     assert_eq!(server.join().expect("join"), ExitCode::SUCCESS);
 }
 
+/// A listener at `addr` once every holder of the one a stopped node job served there has let it
+/// go. The job closes its listener as it stops; but where no close-on-fork mark keeps a socket
+/// out of a child (Linux, an Apple kernel that ignores the mark), a child another test thread
+/// forks meanwhile holds a copy until its `exec` closes it (on Linux the socket goes only as
+/// that `exec` returns), and the port stays listening until then. So the bind waits that window
+/// out; the minute is a hang detector, never a latency budget, and a listener nothing lets go
+/// fails there. On Linux the caller first shows this process holds no copy
+/// (`descriptors_of_sockets`), so the wait covers only another process's.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn bind_once_released(addr: SocketAddr) -> TcpListener {
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "a bind of the port the stopped node job let go, as the GUI's",
+        || match aterm_uds::kept_out(|| TcpListener::bind(addr)) {
+            Ok(listener) => Some(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
+            Err(error) => panic!("bind {addr}: {error}"),
+        },
+    )
+}
+
+/// The inode of each socket listening at `addr`, an IPv4 one, as `/proc/net/tcp` lists this
+/// network namespace's: its address column is the address's four bytes read as a native `u32`
+/// and the port, both in hex, and its state `0A` is `LISTEN`.
+#[cfg(target_os = "linux")]
+fn sockets_listening_at(addr: SocketAddr) -> Vec<u64> {
+    let SocketAddr::V4(at) = addr else {
+        panic!("{addr}: /proc/net/tcp lists IPv4 sockets");
+    };
+    let local = format!(
+        "{:08X}:{:04X}",
+        u32::from_ne_bytes(at.ip().octets()),
+        at.port()
+    );
+    let table = std::fs::read_to_string("/proc/net/tcp").expect("read /proc/net/tcp");
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|row| {
+            let columns: Vec<&str> = row.split_whitespace().collect();
+            (columns.get(1) == Some(&local.as_str()) && columns.get(3) == Some(&"0A"))
+                .then(|| columns.get(9)?.parse().ok())
+                .flatten()
+        })
+        .collect()
+}
+
+/// Each of this process's descriptors (`/proc/self/fd`) that is one of the sockets `inodes`
+/// names, as `fd -> socket:[inode]`.
+#[cfg(target_os = "linux")]
+fn descriptors_of_sockets(inodes: &[u64]) -> Vec<String> {
+    let names: Vec<String> = inodes
+        .iter()
+        .map(|inode| format!("socket:[{inode}]"))
+        .collect();
+    std::fs::read_dir("/proc/self/fd")
+        .expect("read /proc/self/fd")
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let target = std::fs::read_link(entry.path()).ok()?;
+            let target = target.to_string_lossy();
+            names
+                .iter()
+                .any(|name| *name == target)
+                .then(|| format!("fd {} -> {target}", entry.file_name().to_string_lossy()))
+        })
+        .collect()
+}
+
 /// THE NODE JOB HOLDS ITS PORT AND LETS IT GO: while it runs, `node-job.lock` is held and a
 /// second bind of its port is refused; once it stops, the lock is free and the GUI binds the
-/// port. The test claims the port for its whole run ([`ports::PortClaim`]), so no other pick, in
-/// this binary or another, takes it in the moment between the job letting it go and that bind.
+/// port once every copy of the job's listener is let go ([`bind_once_released`]). The test claims
+/// the port for its whole run ([`ports::PortClaim`]), so no other pick, in this binary or
+/// another, takes it in the moment between the job letting it go and that bind.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn node_job_lock_prevents_dual_bind_and_releases_when_node_serve_stops() {
@@ -1384,6 +1458,7 @@ fn node_job_lock_prevents_dual_bind_and_releases_when_node_serve_stops() {
         config_path: Some(config_path.clone()),
         vault_paths: None,
         prebound_listener: Some(prebound),
+        on_generation: None,
         tick_every: Duration::from_millis(30),
         wake_timeout: Duration::from_secs(1),
         lan_unavailable: || None,
@@ -1423,6 +1498,7 @@ fn node_job_lock_prevents_dual_bind_and_releases_when_node_serve_stops() {
         config_path: Some(config_path),
         vault_paths: None,
         prebound_listener: None,
+        on_generation: None,
         tick_every: Duration::from_millis(30),
         wake_timeout: Duration::from_secs(1),
         lan_unavailable: || None,
@@ -1439,11 +1515,30 @@ fn node_job_lock_prevents_dual_bind_and_releases_when_node_serve_stops() {
     });
     assert_eq!(second, ExitCode::SUCCESS);
 
-    // Stopping the node job releases both `node-job.lock` and the TCP port cleanly.
+    // The socket the job listens on now, whichever of its generations bound it.
+    #[cfg(target_os = "linux")]
+    let listening = sockets_listening_at(addr);
+    #[cfg(target_os = "linux")]
+    assert!(
+        !listening.is_empty(),
+        "/proc/net/tcp lists the job's listener at {addr}"
+    );
+
+    // Stopping the node job releases `node-job.lock` at once (its drop unlocks the open file,
+    // whatever child holds a copy of the descriptor) and the TCP port once every copy of its
+    // listener is let go. This process holds none once the job has returned: no generation's
+    // thread or clone of the listener outlives it, so the wait below covers only a copy another
+    // process holds.
     stop.store(true, Ordering::Release);
     assert_eq!(server.join().expect("join"), ExitCode::SUCCESS);
     assert!(!node_job_holds_lock(&state_dir));
-    aterm_uds::kept_out(|| TcpListener::bind(addr)).expect("GUI can bind port once node job stops");
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        descriptors_of_sockets(&listening),
+        Vec::<String>::new(),
+        "this process still holds the stopped node job's listener"
+    );
+    drop(bind_once_released(addr));
 }
 
 #[test]
@@ -1520,6 +1615,7 @@ fn member_node_with_identity_only_aterm_toml_preserves_default_drive_grant() {
         config_path: Some(config_path),
         vault_paths: None,
         prebound_listener: Some(prebound),
+        on_generation: None,
         tick_every: Duration::from_millis(30),
         wake_timeout: aterm_spec::wait::MUST_HAPPEN,
         lan_unavailable: || None,
@@ -1597,6 +1693,7 @@ fn the_port_lock_is_held_only_while_the_node_serves_the_port() {
         config_path: Some(config_path),
         vault_paths: None,
         prebound_listener: Some(prebound),
+        on_generation: None,
         tick_every: tick,
         wake_timeout: Duration::from_secs(1),
         lan_unavailable: || None,
@@ -1658,6 +1755,7 @@ fn the_node_job_waits_for_the_lan_broker_before_it_serves_the_lan() {
         config_path: Some(config_path),
         vault_paths: None,
         prebound_listener: Some(prebound),
+        on_generation: None,
         tick_every: Duration::from_millis(20),
         wake_timeout: Duration::from_secs(1),
         lan_unavailable: || {
@@ -1720,6 +1818,7 @@ fn an_aterm_toml_the_node_cannot_read_starts_no_listener() {
         config_path: Some(config_path),
         vault_paths: None,
         prebound_listener: None,
+        on_generation: None,
         tick_every: Duration::from_millis(20),
         wake_timeout: Duration::from_secs(1),
         lan_unavailable: || None,
@@ -1796,6 +1895,7 @@ fn a_running_window_that_takes_no_hand_over_is_answered_busy() {
         config_path: Some(config_path),
         vault_paths: None,
         prebound_listener: Some(prebound),
+        on_generation: None,
         tick_every: Duration::from_millis(40),
         wake_timeout: Duration::from_secs(1),
         lan_unavailable: || None,
@@ -2305,6 +2405,7 @@ fn an_unreadable_swarm_switch_ends_the_node_jobs_generation() {
         config_path: Some(config_path),
         vault_paths: None,
         prebound_listener: None,
+        on_generation: None,
         tick_every: Duration::from_millis(20),
         wake_timeout: Duration::from_secs(1),
         lan_unavailable: || Some("no root LAN broker answers".to_owned()),
@@ -2411,7 +2512,7 @@ fn the_node_job_raises_launchds_descriptor_limit_to_serve_every_fleet_slot() {
         // The test binary has no root LAN broker: the broker answers, as it does on a Mac
         // with aterm installed.
         let _ = super::NODE_LAN_GATE_FOR_TEST.set(|| None);
-        let server = std::thread::spawn(|| super::run_node_serve_owning(|| {}));
+        let server = std::thread::spawn(|| super::run_node_serve_owning(|| None));
         let mut reader = JobsReader::new();
         let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         let port = loop {
@@ -3040,6 +3141,7 @@ fn serve_updating(
         config_path: Some(config_path),
         vault_paths: None,
         prebound_listener: prebound,
+        on_generation: None,
         tick_every: Duration::from_millis(20),
         wake_timeout: Duration::from_secs(1),
         lan_unavailable: || None,
@@ -3107,6 +3209,16 @@ fn a_node_job_with_a_window_stages_and_ends_its_run_only_once_the_window_quits()
 /// holds it, then its startup, then the run, which lets it go as it returns.
 #[test]
 fn a_node_start_that_finds_the_jobs_lock_held_boots_and_starts_nothing() {
+    struct Upkeep<'a>(&'a std::sync::Mutex<Vec<&'static str>>, &'a Path);
+    impl Drop for Upkeep<'_> {
+        fn drop(&mut self) {
+            assert!(
+                node_job_holds_lock(self.1),
+                "upkeep retires under the host lease"
+            );
+            lock(self.0).push("upkeep-ended");
+        }
+    }
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let state = root.path().join("state");
     let calls = std::sync::Mutex::new(Vec::new());
@@ -3120,7 +3232,7 @@ fn a_node_start_that_finds_the_jobs_lock_held_boots_and_starts_nothing() {
                 NodeBoot::nothing_at(Instant::now())
             },
             || lock(&calls).push("startup"),
-            |_, _| {
+            |_, _, ()| {
                 lock(&calls).push("serve");
                 ExitCode::SUCCESS
             },
@@ -3144,9 +3256,13 @@ fn a_node_start_that_finds_the_jobs_lock_held_boots_and_starts_nothing() {
                 );
                 NodeBoot::nothing_at(Instant::now())
             },
-            || lock(&calls).push("startup"),
-            |_, job_lock| {
+            || {
+                lock(&calls).push("startup");
+                Upkeep(&calls, &state)
+            },
+            |_, job_lock, upkeep| {
                 lock(&calls).push("serve");
+                drop(upkeep);
                 drop(job_lock);
                 ExitCode::FAILURE
             },
@@ -3163,7 +3279,7 @@ fn a_node_start_that_finds_the_jobs_lock_held_boots_and_starts_nothing() {
     );
     drop(held);
     assert_eq!(start(), ExitCode::FAILURE, "CONTROL: the run's own status");
-    assert_eq!(*lock(&calls), ["boot", "startup", "serve"]);
+    assert_eq!(*lock(&calls), ["boot", "startup", "serve", "upkeep-ended"]);
     assert!(
         !node_job_holds_lock(&state),
         "the run kept the job's lock past its return"
@@ -3505,6 +3621,7 @@ fn node_health_rechecks_inputs_after_a_window_relay_answers_or_refuses() {
                 members: None,
                 alab_browse: None,
                 prebound_listener: None,
+                on_generation: None,
                 tick_every: Duration::from_millis(20),
                 wake_timeout: Duration::from_secs(1),
                 stop: Arc::clone(&updater.stop),
@@ -3571,6 +3688,7 @@ fn node_health_fences_probes_and_preserves_only_definite_holds() {
             members: None,
             alab_browse: None,
             prebound_listener: None,
+            on_generation: None,
             tick_every: Duration::from_millis(20),
             wake_timeout: Duration::from_secs(1),
             stop: Arc::clone(&updater.stop),
@@ -3756,6 +3874,7 @@ fn run_staging_node_job(scratch: &Path) {
         config_path: Some(config_path),
         vault_paths: None,
         prebound_listener: None,
+        on_generation: None,
         tick_every: Duration::from_millis(20),
         wake_timeout: Duration::from_secs(1),
         lan_unavailable: || Some("no root LAN broker answers".to_owned()),

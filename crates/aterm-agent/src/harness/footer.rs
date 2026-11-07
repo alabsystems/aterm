@@ -585,7 +585,7 @@ fn find_transcript_in_projects(claude_dir: &Path, entry: &SessionEntry) -> Optio
     let mut found = std::fs::read_dir(&projects)
         .ok()?
         .filter_map(Result::ok)
-        .filter(|dir| dir.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(crate::harness::entry_is_dir)
         .map(|dir| dir.path().join(&file))
         .filter(|candidate| candidate.is_file());
     let first = found.next()?;

@@ -154,9 +154,13 @@ impl Blend {
         color: BlendComponent::SCREEN,
         alpha: BlendComponent::SCREEN,
     };
-    /// The one-sided generalization the flat `GlowQuad` streams take:
-    /// `out = src + dst*(1 - src_a)`, which is `One`/`One` at `src_a == 0`.
-    const GLOW_OVER: Self = Self {
+    /// Premultiplied source-over on both halves, `out = src + dst*(1 - src_a)`
+    /// (`wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING`). The flat `GlowQuad` streams and the
+    /// fx layers' Exact law take it as the one-sided generalization of `One`/`One`, which it is
+    /// at `src_a == 0`; the text glyphs take it because their fragment lays its own light
+    /// (`fg * cov`), so a blend unit that rounds its source alpha to the target's 8 bits rounds
+    /// only the ground's share.
+    const PREMULTIPLIED_OVER: Self = Self {
         color: BlendComponent::OVER,
         alpha: BlendComponent::OVER,
     };
@@ -632,7 +636,7 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         vs: "vs_glyph",
         fs: "fs_glyph",
         target: TargetRole::OffscreenSrgb,
-        blend: Some(Blend::ALPHA_BLENDING),
+        blend: Some(Blend::PREMULTIPLIED_OVER),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Glyph,
         #[cfg(any(gl_arm, d3d11_arm, test))]
@@ -671,7 +675,7 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         vs: "vs_glow",
         fs: "fs_glow",
         target: TargetRole::OffscreenUnorm,
-        blend: Some(Blend::GLOW_OVER),
+        blend: Some(Blend::PREMULTIPLIED_OVER),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Glow,
         #[cfg(any(gl_arm, d3d11_arm, test))]
@@ -853,7 +857,7 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         vs: "vs_fx",
         fs: "fs_fx",
         target: TargetRole::OffscreenUnorm,
-        blend: Some(Blend::GLOW_OVER),
+        blend: Some(Blend::PREMULTIPLIED_OVER),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Fx,
         #[cfg(any(gl_arm, d3d11_arm, test))]
@@ -892,7 +896,7 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         vs: "vs_glow_items",
         fs: "fs_glow",
         target: TargetRole::OffscreenUnorm,
-        blend: Some(Blend::GLOW_OVER),
+        blend: Some(Blend::PREMULTIPLIED_OVER),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::None,
         #[cfg(any(gl_arm, d3d11_arm, test))]

@@ -764,7 +764,7 @@ fn remove_snapshot(
         (None, None) if half_removed(checkout, wt).is_some() => None,
         (None, None) => return Err(unlisted(checkout)),
     };
-    let cutoff = SystemTime::now();
+    let cutoff = pending::file_clock_now();
     let prepared = if recovery.is_none()
         && let (Some(entry), Some(listed)) = (&own, &now_listed)
     {

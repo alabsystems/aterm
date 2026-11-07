@@ -21,7 +21,8 @@ pub const RECEIPT: &str = "train-receipt.toml";
 /// Signature over the exact receipt bytes.
 pub const SIGNATURE: &str = "train-receipt.toml.sig";
 /// Command line.
-pub const SYNOPSIS: &str = "canary trust=<N> --out DIR [--consumer NAME=CHECKOUT]…";
+pub const SYNOPSIS: &str =
+    "canary trust=<N> --out DIR [--consumer NAME=CHECKOUT]… [--stage-receipt]";
 
 /// One consumer's observation, never an index gate.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -341,6 +342,9 @@ pub fn install(
         .canonicalize()
         .map_err(|e| Error::io("resolve canary output", &e))?;
     let out = physical_out.as_path();
+    let layout = atpkg::Layout {
+        prefix: out.join("prefix"),
+    };
     let (pkg, manifest_sha256) = manifest_with_digest(quad, source, build)?;
     let mut installed = Vec::new();
     let rustup_home = out.join("rustup");
@@ -355,9 +359,7 @@ pub fn install(
                 artifact.target
             )));
         }
-        let dest = out
-            .join("prefix/store/trust")
-            .join(format!("{build}.noindex"));
+        let dest = layout.build_dir("trust", build);
         let root = atpkg::verify_and_stage(
             artifact,
             &source.join(&artifact.asset),
@@ -378,9 +380,7 @@ pub fn install(
     let item = installed
         .first()
         .ok_or_else(|| Error::refused("no native installation"))?;
-    let bin = out
-        .join("prefix/store/trust")
-        .join(format!("{build}.noindex/bin"));
+    let bin = layout.build_dir("trust", build).join("bin");
     let reports = consumers
         .iter()
         .map(|(name, dir)| runner.consumer(name, dir, &bin, &rustup_home, item))
@@ -424,18 +424,20 @@ pub fn install(
     Ok(receipt)
 }
 
-/// Download only the staged manifest and its signed artifacts. The current head's
-/// roster authorizes a new build without requiring the head to pin it first.
+/// Install the staged pack, or stage an existing signed receipt without moving the index.
+/// The current head's roster authorizes a new build without pinning it first.
 ///
 /// # Errors
-/// Download, manifest verification, install or signing fails.
+/// Download, verification, install, signing or staging fails.
 pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let mut build = None;
     let mut out = None;
     let mut consumers = BTreeMap::new();
+    let mut stage_existing = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--stage-receipt" => stage_existing = true,
             "--out" => {
                 out = Some(PathBuf::from(crate::channel::flag_value(
                     args, &mut i, "--out",
@@ -457,6 +459,18 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     }
     let build = build.ok_or_else(|| Error::usage(SYNOPSIS))?;
     let out = out.ok_or_else(|| Error::usage(SYNOPSIS))?;
+    if stage_existing {
+        if !consumers.is_empty() {
+            return Err(Error::usage(
+                "--stage-receipt stages existing evidence; it takes no --consumer",
+            ));
+        }
+        stage_receipt(ctx, &out, build)?;
+        Log::echo("atpkg-publish canary").say(format!(
+            "staged verified canary evidence for Trust {build}; index unchanged"
+        ));
+        return Ok(());
+    }
     for name in ["aterm", "ay", "ty", "clean"] {
         consumers
             .entry(name.to_string())
@@ -517,10 +531,43 @@ pub fn publish_staged(
     let build = *builds
         .get("trust")
         .ok_or_else(|| Error::refused("staged group has no Trust build"))?;
-    let scratch = Scratch::new("publish-staged")?;
+    let pkg = stage_receipt(ctx, &out.join("canary"), build)?;
+    let target = crate::triple::Triple::parse(&pkg.artifacts[0].target)?;
+    let mut delta = crate::api::Delta::default();
+    if target == crate::programs::PIN_TRIPLE {
+        delta.pins = builds.clone();
+    } else {
+        delta.target_pins.insert(target, builds.clone());
+    }
+    let published = indexer.publish(
+        ctx,
+        &crate::api::IndexRequest {
+            baseline: crate::api::Baseline::ChannelHead,
+            delta,
+            out: out.join("index"),
+            upload: true,
+            pack_dir: None,
+        },
+    )?;
+    log.say(format!(
+        "published staged Trust {build} with byte-bound canary receipt"
+    ));
+    Ok(crate::channel::group::GroupOutcome {
+        builds,
+        index_build: Some(published.index_build),
+        out: out.to_path_buf(),
+    })
+}
+
+/// Stage an existing signed receipt against the complete, re-downloaded pack.
+/// This leaves the index unchanged so one later delta can include other packages.
+///
+/// # Errors
+/// Missing, changed or invalid staged bytes or evidence, or a staging upload refusal.
+pub fn stage_receipt(ctx: &Ctx, evidence: &Path, build: u64) -> Result<atpkg::PkgManifest> {
+    let scratch = Scratch::new("stage-canary")?;
     let (_, head) = quad::fetch_head(ctx, &ctx.index_slug(), &scratch.path().join("head"))?;
-    let evidence = out.join("canary");
-    check_receipt(ctx, &head, &evidence, build)?;
+    check_receipt(ctx, &head, evidence, build)?;
     let slug = ctx.staging_slug("trust");
     let tag = upload::tag("trust", build);
     let dir = scratch.path().join("pack");
@@ -563,32 +610,7 @@ pub fn publish_staged(
             .upload(&slug, &tag, &missing, crate::host::Replace::Never)
             .map_err(|e| host_error("stage canary evidence", &e))?;
     }
-    let pkg = manifest(&head, &dir, build)?;
-    let target = crate::triple::Triple::parse(&pkg.artifacts[0].target)?;
-    let mut delta = crate::api::Delta::default();
-    if target == crate::programs::PIN_TRIPLE {
-        delta.pins = builds.clone();
-    } else {
-        delta.target_pins.insert(target, builds.clone());
-    }
-    let published = indexer.publish(
-        ctx,
-        &crate::api::IndexRequest {
-            baseline: crate::api::Baseline::ChannelHead,
-            delta,
-            out: out.join("index"),
-            upload: true,
-            pack_dir: None,
-        },
-    )?;
-    log.say(format!(
-        "published staged Trust {build} with byte-bound canary receipt"
-    ));
-    Ok(crate::channel::group::GroupOutcome {
-        builds,
-        index_build: Some(published.index_build),
-        out: out.to_path_buf(),
-    })
+    manifest(&head, &dir, build)
 }
 
 /// Verify a newly selected Trust build even when its public release already exists.

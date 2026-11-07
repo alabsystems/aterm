@@ -17,35 +17,55 @@ pub fn with_nonblocking<T>(
     fd: BorrowedFd<'_>,
     work: impl FnOnce() -> io::Result<T>,
 ) -> io::Result<T> {
-    struct Restore<'a> {
-        fd: BorrowedFd<'a>,
-        flags: i32,
-    }
-    impl Restore<'_> {
-        fn apply(&self) -> io::Result<()> {
-            // SAFETY: the borrowed descriptor remains open; F_SETFL takes this integer flag word.
-            if unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, self.flags) } < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        }
-    }
-    impl Drop for Restore<'_> {
-        fn drop(&mut self) {
-            let _ = self.apply();
-        }
-    }
     // SAFETY: F_GETFL reads the flags of the live borrowed descriptor.
     let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
     if flags < 0 {
         return Err(io::Error::last_os_error());
     }
-    let restore = Restore { fd, flags };
-    // SAFETY: F_SETFL updates the status flags of that same open descriptor.
-    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(io::Error::last_os_error());
+    with_nonblocking_by(
+        flags,
+        |flags| {
+            // SAFETY: fd remains borrowed for this scope; F_SETFL takes an integer flag word.
+            if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags) } < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        },
+        work,
+    )
+}
+
+fn with_nonblocking_by<T>(
+    flags: i32,
+    set: impl Fn(i32) -> io::Result<()>,
+    work: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    struct Restore<F: Fn(i32) -> io::Result<()>> {
+        set: F,
+        flags: i32,
+        restored: bool,
     }
+    impl<F: Fn(i32) -> io::Result<()>> Restore<F> {
+        fn apply(&mut self) -> io::Result<()> {
+            if !self.restored {
+                (self.set)(self.flags)?;
+                self.restored = true;
+            }
+            Ok(())
+        }
+    }
+    impl<F: Fn(i32) -> io::Result<()>> Drop for Restore<F> {
+        fn drop(&mut self) {
+            let _ = self.apply();
+        }
+    }
+    let mut restore = Restore {
+        set,
+        flags,
+        restored: false,
+    };
+    (restore.set)(flags | libc::O_NONBLOCK)?;
     let result = work();
     let restored = restore.apply();
     result.and_then(|value| restored.map(|()| value))
@@ -105,14 +125,7 @@ fn pair(
 /// # Errors
 /// Empty or unrepresentable set, or poll error other than interruption.
 pub fn any_until(fds: &[BorrowedFd<'_>], deadline: std::time::Instant) -> io::Result<Vec<usize>> {
-    if fds.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "empty readiness set",
-        ));
-    }
-    let mut reads: Vec<_> = fds.iter().copied().map(read_pollfd).collect();
-    ready_indices(&mut reads, Wait::Until(deadline))
+    ready_set(fds, |fd| read_pollfd(*fd), Wait::Until(deadline))
 }
 
 /// Wait for mixed read/write interests until an absolute deadline, without
@@ -125,7 +138,7 @@ pub fn any_interests_until(
     interests: &[Watch<'_>],
     deadline: std::time::Instant,
 ) -> io::Result<Vec<usize>> {
-    ready_indices(&mut interest_fds(interests)?, Wait::Until(deadline))
+    ready_set(interests, interest_fd, Wait::Until(deadline))
 }
 
 /// Ask native readiness once with zero timeout. Like [`any_interests_until`],
@@ -134,27 +147,48 @@ pub fn any_interests_until(
 /// # Errors
 /// Empty or unrepresentable set, or poll error other than interruption.
 pub fn any_interests_now(interests: &[Watch<'_>]) -> io::Result<Vec<usize>> {
-    ready_indices(&mut interest_fds(interests)?, Wait::Now)
+    ready_set(interests, interest_fd, Wait::Now)
 }
 
-fn interest_fds(interests: &[Watch<'_>]) -> io::Result<Vec<libc::pollfd>> {
-    if interests.is_empty() {
+fn interest_fd(watch: &Watch<'_>) -> libc::pollfd {
+    libc::pollfd {
+        fd: watch.fd.as_raw_fd(),
+        events: match watch.interest {
+            Interest::Read => libc::POLLIN,
+            Interest::Write => libc::POLLOUT,
+        },
+        revents: 0,
+    }
+}
+
+fn ready_set<T>(
+    watches: &[T],
+    mut native: impl FnMut(&T) -> libc::pollfd,
+    wait: Wait,
+) -> io::Result<Vec<usize>> {
+    if watches.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "empty readiness set",
         ));
     }
-    Ok(interests
-        .iter()
-        .map(|watch| libc::pollfd {
-            fd: watch.fd.as_raw_fd(),
-            events: match watch.interest {
-                Interest::Read => libc::POLLIN,
-                Interest::Write => libc::POLLOUT,
-            },
-            revents: 0,
-        })
-        .collect())
+    // Most waits watch a socket and a bell. Keep their native descriptors on
+    // the stack; larger dynamic sets retain the same heap-backed behavior.
+    let mut stack = [libc::pollfd {
+        fd: -1,
+        events: 0,
+        revents: 0,
+    }; 8];
+    if watches.len() <= stack.len() {
+        let fds = &mut stack[..watches.len()];
+        for (fd, watch) in fds.iter_mut().zip(watches) {
+            *fd = native(watch);
+        }
+        ready_indices(fds, wait)
+    } else {
+        let mut fds: Vec<_> = watches.iter().map(native).collect();
+        ready_indices(&mut fds, wait)
+    }
 }
 
 fn ready_indices(fds: &mut [libc::pollfd], wait: Wait) -> io::Result<Vec<usize>> {
@@ -381,6 +415,7 @@ mod tests {
         let (mut ended, close) = std::io::pipe().unwrap();
         source.write_all(b"r").unwrap();
         drop(close);
+        ended_pipe(ended.as_fd());
         let interests = [
             Watch::new(quiet.as_fd(), Interest::Read),
             Watch::new(writable.as_fd(), Interest::Write),
@@ -486,6 +521,7 @@ mod tests {
         let (third, closed) = std::io::pipe().unwrap();
         writer.write_all(b"x").unwrap();
         drop(closed);
+        ended_pipe(third.as_fd());
         let found = any_until(
             &[first.as_fd(), second.as_fd(), third.as_fd()],
             std::time::Instant::now() + HANG,
@@ -506,6 +542,56 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn readiness_stack_and_spill_preserve_indices_bytes_and_hangup() {
+        use super::*;
+        use std::io::{Read as _, Write as _};
+        use std::os::fd::AsFd as _;
+        use std::time::Instant;
+
+        for size in [1, 8, 9, 32] {
+            let (mut readers, mut writers): (Vec<_>, Vec<_>) =
+                (0..size).map(|_| std::io::pipe().unwrap()).unzip();
+            for writer in &mut writers {
+                writer.write_all(b"x").unwrap();
+            }
+            {
+                let fds: Vec<_> = readers.iter().map(|reader| reader.as_fd()).collect();
+                let interests: Vec<_> = readers
+                    .iter()
+                    .map(|reader| Watch::new(reader.as_fd(), Interest::Read))
+                    .collect();
+                let expected: Vec<_> = (0..size).collect();
+                assert_eq!(any_until(&fds, Instant::now() + HANG).unwrap(), expected);
+                assert_eq!(any_interests_now(&interests).unwrap(), expected);
+                assert!(any_until(&fds, Instant::now()).unwrap().is_empty());
+                assert!(
+                    any_interests_until(&interests, Instant::now())
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            for reader in &mut readers {
+                let mut byte = [0];
+                reader.read_exact(&mut byte).unwrap();
+                assert_eq!(byte, *b"x");
+            }
+            let interests: Vec<_> = readers
+                .iter()
+                .map(|reader| Watch::new(reader.as_fd(), Interest::Read))
+                .collect();
+            assert!(any_interests_now(&interests).unwrap().is_empty());
+            drop(writers);
+            for reader in &readers {
+                ended_pipe(reader.as_fd());
+            }
+            assert_eq!(
+                any_interests_now(&interests).unwrap(),
+                (0..size).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
@@ -556,6 +642,119 @@ mod tests {
         assert_eq!(after, before);
     }
 
+    #[test]
+    fn scoped_nonblocking_restores_once_after_success_or_operation_error() {
+        use std::cell::Cell;
+        for fails in [false, true] {
+            let flags = Cell::new(0);
+            let calls = Cell::new(0);
+            let result = super::with_nonblocking_by(
+                0,
+                |value| {
+                    calls.set(calls.get() + 1);
+                    flags.set(value);
+                    Ok(())
+                },
+                || {
+                    assert_ne!(flags.get() & libc::O_NONBLOCK, 0);
+                    if fails {
+                        Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert_eq!(result.is_err(), fails);
+            assert_eq!(flags.get(), 0);
+            assert_eq!(calls.get(), 2, "set nonblocking, then restore once");
+        }
+    }
+
+    #[test]
+    fn scoped_nonblocking_unwind_restores_and_failed_restoration_still_retries() {
+        use std::cell::Cell;
+        let flags = Cell::new(0);
+        let calls = Cell::new(0);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: std::io::Result<()> = super::with_nonblocking_by(
+                0,
+                |value| {
+                    calls.set(calls.get() + 1);
+                    flags.set(value);
+                    Ok(())
+                },
+                || panic!("operation unwinds"),
+            );
+        }));
+        assert!(panic.is_err());
+        assert_eq!(flags.get(), 0);
+        assert_eq!(calls.get(), 2);
+
+        calls.set(0);
+        let error = super::with_nonblocking_by(
+            0,
+            |value| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 2 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                }
+                flags.set(value);
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            flags.get(),
+            0,
+            "Drop retries the failed explicit restoration"
+        );
+        assert_eq!(calls.get(), 3);
+
+        calls.set(0);
+        let error = super::with_nonblocking_by(
+            0,
+            |value| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+                }
+                flags.set(value);
+                Ok(())
+            },
+            || -> std::io::Result<()> { panic!("failed setup cannot run the operation") },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(flags.get(), 0);
+        assert_eq!(calls.get(), 2, "failed setup still attempts restoration");
+    }
+
+    #[test]
+    fn scoped_nonblocking_restores_native_flags_during_unwind() {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        // SAFETY: reader retains its live descriptor throughout this test.
+        let before = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+        assert!(before >= 0);
+        let panic = std::panic::catch_unwind(|| {
+            let _: std::io::Result<()> = super::with_nonblocking(reader.as_fd(), || {
+                // SAFETY: the scope retains the same live descriptor.
+                let during = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+                assert!(during >= 0);
+                assert_ne!(during & libc::O_NONBLOCK, 0);
+                panic!("operation unwinds");
+            });
+        });
+        assert!(panic.is_err());
+        // SAFETY: reader still retains that descriptor after unwinding.
+        assert_eq!(
+            unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) },
+            before
+        );
+    }
+
     use super::{Ready, either, one};
     use std::io::{Read as _, Write as _};
     use std::os::fd::AsFd as _;
@@ -564,6 +763,20 @@ mod tests {
 
     /// The one-minute hang detector on a wait that must end.
     const HANG: Duration = Duration::from_secs(60);
+
+    /// Waits under the hang detector for the pipe `reader` reads, with nothing left in it, to be
+    /// at its end. Once a test drops its writer the end must come, but not always at once: a
+    /// sibling test's child parked between fork and exec (`fork_window::Parked`, or a `pre_exec`
+    /// spawn) holds a copy of every descriptor this process had open, that writer included, until
+    /// it execs. A check that reads a set of ends at once comes after this, so it reads the set,
+    /// not a race with a sibling's fork.
+    fn ended_pipe(reader: std::os::fd::BorrowedFd<'_>) {
+        assert_eq!(
+            super::any_until(&[reader], std::time::Instant::now() + HANG).unwrap(),
+            [0],
+            "the pipe's end"
+        );
+    }
 
     #[test]
     fn deadline_readiness_keeps_buffered_bytes_and_eof_after_disconnect() {

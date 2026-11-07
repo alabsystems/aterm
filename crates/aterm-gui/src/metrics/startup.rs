@@ -141,8 +141,6 @@ impl Startup {
             Some(close_startup_gpu(read_probe(), worker.gpu_build_ns)).filter(|gpu| gpu.valid)
         })
         .unwrap_or_default();
-        let (effect_builds, effect_build_ns, effect_built_mask) =
-            aterm_gpu::startup_probe::effect_build_ledger();
         let gui_entry = self.gui_entry.get().copied();
         StartupFacts {
             present: self.present.get().copied().unwrap_or_default(),
@@ -155,9 +153,6 @@ impl Startup {
                 .and_then(|(entry, ready)| duration_ns(entry, ready))
                 .unwrap_or(0),
             birth_to_main_ns: self.birth_to_main(read_birth),
-            effect_builds,
-            effect_build_ns,
-            effect_built_mask,
         }
     }
 
@@ -927,7 +922,9 @@ fn derive_startup_attach(
 
 const STARTUP_WORKER_SCHEMA: u64 = 1;
 
-const STARTUP_GPU_SCHEMA: u64 = 1;
+/// 2: the legs every arm runs (context, font thread and join, assembly); 1 was
+/// wgpu's instance, adapter, device and pipeline legs.
+const STARTUP_GPU_SCHEMA: u64 = 2;
 
 /// Background backend-build worker leg durations in nanoseconds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1422,47 +1419,23 @@ fn derive_startup_worker(
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct StartupGpuSample {
     valid: bool,
-    instance_ns: u64,
-    adapter_ns: u64,
-    device_ns: u64,
-    context_tail_ns: u64,
+    context_ns: u64,
     font_thread_ns: u64,
     font_join_ns: u64,
-    pipelines_ns: u64,
-    pipe_shader_ns: u64,
-    pipe_uniform_atlas_ns: u64,
-    pipe_cell_ns: u64,
-    pipe_blit_ns: u64,
-    pipe_tray_ns: u64,
-    pipe_bloom_ns: u64,
-    pipe_vbuf_ns: u64,
-    pipe_tail_ns: u64,
+    assemble_ns: u64,
     tail_ns: u64,
-    cell_pipeline_ns: [u64; aterm_gpu::startup_probe::CELL_PIPELINE_COUNT],
 }
 
 fn read_gpu_probe() -> StartupGpuSample {
-    use aterm_gpu::startup_probe::{Leg, cell_pipeline_ns, leg_ns};
-    let pipelines_ns = leg_ns(Leg::PipeTotal);
+    use aterm_gpu::startup_probe::{Leg, leg_ns};
+    let assemble_ns = leg_ns(Leg::Assemble);
     StartupGpuSample {
         valid: true,
-        instance_ns: leg_ns(Leg::GpuInstance),
-        adapter_ns: leg_ns(Leg::GpuAdapter),
-        device_ns: leg_ns(Leg::GpuDevice),
-        context_tail_ns: leg_ns(Leg::GpuContextTail),
+        context_ns: leg_ns(Leg::Context),
         font_thread_ns: leg_ns(Leg::FontThread),
         font_join_ns: leg_ns(Leg::FontJoin),
-        pipelines_ns,
-        pipe_shader_ns: leg_ns(Leg::PipeShader),
-        pipe_uniform_atlas_ns: leg_ns(Leg::PipeUniformAtlas),
-        pipe_cell_ns: leg_ns(Leg::PipeCell),
-        pipe_blit_ns: leg_ns(Leg::PipeBlit),
-        pipe_tray_ns: leg_ns(Leg::PipeTray),
-        pipe_bloom_ns: leg_ns(Leg::PipeBloom),
-        pipe_vbuf_ns: leg_ns(Leg::PipeVertexBuffers),
-        pipe_tail_ns: leg_ns(Leg::PipeTail),
+        assemble_ns,
         tail_ns: 0,
-        cell_pipeline_ns: cell_pipeline_ns(),
     }
 }
 
@@ -1470,29 +1443,19 @@ fn close_startup_gpu(sample: StartupGpuSample, gpu_build_ns: u64) -> StartupGpuS
     // A zero slot is the probe's UNSET sentinel (a recorded leg floors at 1 ns),
     // so any zero here means a leg never ran in this process.
     if [
-        sample.instance_ns,
-        sample.adapter_ns,
-        sample.device_ns,
-        sample.context_tail_ns,
+        sample.context_ns,
         sample.font_thread_ns,
         sample.font_join_ns,
-        sample.pipelines_ns,
+        sample.assemble_ns,
     ]
     .into_iter()
     .any(|leg| leg == 0)
     {
         return StartupGpuSample::default();
     }
-    let exclusive_ns = [
-        sample.instance_ns,
-        sample.adapter_ns,
-        sample.device_ns,
-        sample.context_tail_ns,
-        sample.font_join_ns,
-        sample.pipelines_ns,
-    ]
-    .into_iter()
-    .try_fold(0u64, |total, leg| total.checked_add(leg));
+    let exclusive_ns = [sample.context_ns, sample.font_join_ns, sample.assemble_ns]
+        .into_iter()
+        .try_fold(0u64, |total, leg| total.checked_add(leg));
     let Some(tail_ns) = exclusive_ns.and_then(|measured| gpu_build_ns.checked_sub(measured)) else {
         return StartupGpuSample::default();
     };
@@ -1562,11 +1525,6 @@ pub(crate) struct StartupFacts {
     gui_prepare_ns: u64,
     /// The kernel's birth → Rust `main` ([`Startup::birth_to_main`]).
     birth_to_main_ns: Option<u64>,
-    /// The effect pipelines built on demand: count, wall time and the built
-    /// slots' mask (`aterm_gpu::startup_probe::effect_build_ledger`).
-    effect_builds: u64,
-    effect_build_ns: u64,
-    effect_built_mask: u64,
 }
 
 impl StartupFacts {
@@ -1646,54 +1604,13 @@ impl StartupFacts {
         let gpu = self.gpu;
         s.count("startup_gpu_schema", STARTUP_GPU_SCHEMA);
         s.flag("startup_gpu_valid", gpu.valid);
-        s.decimal("startup_gpu_instance_ms", ms(gpu.instance_ns));
-        s.decimal("startup_gpu_adapter_ms", ms(gpu.adapter_ns));
-        s.decimal("startup_gpu_device_ms", ms(gpu.device_ns));
-        s.decimal("startup_gpu_context_tail_ms", ms(gpu.context_tail_ns));
+        s.decimal("startup_gpu_context_ms", ms(gpu.context_ns));
         s.decimal("startup_gpu_font_thread_ms", ms(gpu.font_thread_ns));
         s.decimal("startup_gpu_font_join_ms", ms(gpu.font_join_ns));
-        s.decimal("startup_gpu_pipelines_ms", ms(gpu.pipelines_ns));
-        s.decimal("startup_gpu_pipe_shader_ms", ms(gpu.pipe_shader_ns));
-        s.decimal(
-            "startup_gpu_pipe_uniform_atlas_ms",
-            ms(gpu.pipe_uniform_atlas_ns),
-        );
-        s.decimal("startup_gpu_pipe_cell_ms", ms(gpu.pipe_cell_ns));
-        s.decimal("startup_gpu_pipe_blit_ms", ms(gpu.pipe_blit_ns));
-        s.decimal("startup_gpu_pipe_tray_ms", ms(gpu.pipe_tray_ns));
-        s.decimal("startup_gpu_pipe_bloom_ms", ms(gpu.pipe_bloom_ns));
-        s.decimal("startup_gpu_pipe_vbuf_ms", ms(gpu.pipe_vbuf_ns));
-        s.decimal("startup_gpu_pipe_tail_ms", ms(gpu.pipe_tail_ns));
+        s.decimal("startup_gpu_assemble_ms", ms(gpu.assemble_ns));
         s.decimal("startup_gpu_tail_ms", ms(gpu.tail_ns));
-        let cell_pipelines: Vec<(&str, wire::Cell<'_>)> =
-            aterm_gpu::startup_probe::CELL_PIPELINE_NAMES
-                .iter()
-                .zip(gpu.cell_pipeline_ns)
-                .map(|(name, ns)| (*name, wire::Cell::Decimal(ms(ns))))
-                .collect();
-        s.pairs("startup_gpu_cell_pipeline_ms", &cell_pipelines, "none");
-        s.count("effect_pipeline_builds", self.effect_builds);
-        s.decimal("effect_pipeline_build_ms", ms(self.effect_build_ns));
-        s.label(
-            "effect_pipelines_built",
-            &effect_pipeline_names(self.effect_built_mask),
-        );
         s.decimal("first_present_ms", ms(self.present.gui_entry_ns));
         s.decimal("first_visible_ms", ms(self.first_visible_ns));
-    }
-}
-
-fn effect_pipeline_names(mask: u64) -> String {
-    let built = aterm_gpu::EFFECT_PIPELINE_NAMES
-        .iter()
-        .enumerate()
-        .filter(|(slot, _)| mask & (1u64 << slot) != 0)
-        .map(|(_, name)| *name)
-        .collect::<Vec<_>>();
-    if built.is_empty() {
-        "none".to_string()
-    } else {
-        built.join(",")
     }
 }
 
@@ -2119,29 +2036,17 @@ mod startup_worker_tests {
     pub(super) fn probe() -> StartupGpuSample {
         StartupGpuSample {
             valid: true,
-            instance_ns: 10_000,
-            adapter_ns: 7_000_000,
-            device_ns: 2_400_000,
-            context_tail_ns: 5_000,
+            context_ns: 9_400_000,
             font_thread_ns: 5_400_000,
             font_join_ns: 10_000,
-            pipelines_ns: 2_500_000,
-            pipe_shader_ns: 850_000,
-            pipe_uniform_atlas_ns: 50_000,
-            pipe_cell_ns: 1_400_000,
-            pipe_blit_ns: 100_000,
-            pipe_tray_ns: 40_000,
-            pipe_bloom_ns: 30_000,
-            pipe_vbuf_ns: 20_000,
-            pipe_tail_ns: 1_000,
+            assemble_ns: 2_500_000,
             tail_ns: 0,
-            cell_pipeline_ns: [100_000; aterm_gpu::startup_probe::CELL_PIPELINE_COUNT],
         }
     }
 
     #[test]
     fn the_gpu_tail_absorbs_whatever_the_probe_did_not_measure() {
-        let exclusive_ns = 10_000 + 7_000_000 + 2_400_000 + 5_000 + 10_000 + 2_500_000;
+        let exclusive_ns = 9_400_000 + 10_000 + 2_500_000;
         let sample = close_startup_gpu(probe(), exclusive_ns + 80_000);
         assert!(sample.valid);
         assert_eq!(sample.tail_ns, 80_000);
@@ -2152,7 +2057,7 @@ mod startup_worker_tests {
     fn an_unset_probe_is_not_a_zero_length_gpu_build() {
         assert!(!close_startup_gpu(StartupGpuSample::default(), 12_000_000).valid);
         let mut partial = probe();
-        partial.device_ns = 0;
+        partial.context_ns = 0;
         assert!(!close_startup_gpu(partial, 12_000_000).valid);
     }
 
@@ -2245,7 +2150,7 @@ mod facts_tests {
         assert!(!facts.gpu.valid);
         assert_eq!(ledger.gpu.get(), None);
         let in_flight = || StartupGpuSample {
-            pipelines_ns: 0,
+            assemble_ns: 0,
             ..probe()
         };
         assert!(!ledger.facts_from(|| None, in_flight).gpu.valid);

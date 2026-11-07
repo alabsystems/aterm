@@ -547,15 +547,16 @@ impl Directory {
         now: u64,
     ) -> Result<RingState> {
         let claims = claim_dir(session)?;
-        // Every table digest this Mac holds storage or a claim under, decoded once: matching each
-        // period's digest against them needs neither disk I/O nor string allocation per period.
+        // Every table digest this Mac holds storage (`<hex>`) or a claim (`<hex>.claim`,
+        // `claim_name`) under, decoded once: matching each period's digest against them needs
+        // neither disk I/O nor string allocation per period.
         let mut digests = BTreeSet::new();
-        for (dir, prefix) in [(&self.root, ""), (&claims, "table-")] {
+        for (dir, suffix) in [(&self.root, ""), (&claims, ".claim")] {
             match std::fs::read_dir(dir) {
                 Ok(entries) => {
                     for entry in entries {
                         let name = entry?.file_name();
-                        if let Some(hex) = name.to_str().and_then(|s| s.strip_prefix(prefix))
+                        if let Some(hex) = name.to_str().and_then(|s| s.strip_suffix(suffix))
                             && let Ok(digest) = crate::database::decode_hex::<32>(hex)
                         {
                             digests.insert(digest);

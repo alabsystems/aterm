@@ -6549,8 +6549,12 @@ fn a_list_is_reused_for_another_room_exactly_where_it_plans_its_stops_alike() {
 }
 
 /// A least bar's keyboard span told on the list laid out now, as 301c728680 told it, is caught.
+/// Its divergence is the keyboard's on Import…, so it runs where Import… takes the keyboard.
 #[test]
 fn a_least_told_on_the_list_laid_out_now_is_caught() {
+    if !import_takes_the_keyboard() {
+        return;
+    }
     let caught = |by_now: bool| {
         let sweep = Sweep::new(Scenario {
             keyboard: Keyboard::On(IMPORT),
@@ -7952,8 +7956,13 @@ fn drawn_of(spec: &str) -> Drawn {
 
 #[test]
 fn first_frames_show_whole_what_eb53a9b243_showed_whole() {
+    // Where Import… cannot take the keyboard, no frame owes it a whole place; its landings stay.
+    let import = import_takes_the_keyboard();
     let frames: Vec<(Scenario, Drawn, bool)> = FIRST_WHOLE
         .iter()
+        .filter(|&&(keyboard, _, control, _)| {
+            import || !control || keyboard != Keyboard::On(IMPORT)
+        })
         .flat_map(|&(keyboard, theme, control, starts)| {
             let scenario = Scenario {
                 keyboard,

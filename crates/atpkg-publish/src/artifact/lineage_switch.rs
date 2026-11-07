@@ -11,6 +11,7 @@ static SWITCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
 use crate::ctx::Ctx;
 use crate::error::Result;
+use crate::host::{HostRole, gh_serves};
 
 /// What the switch reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +96,31 @@ fn read_switch(ctx: &Ctx, repo: &Path) -> Switch {
             short(&here)
         ))
     };
+    if !gh_serves(ctx, HostRole::Staging) {
+        return match crate::git::main_of_record(
+            &*ctx.hosts.staging,
+            repo,
+            &ctx.staging_slug("trust"),
+        ) {
+            Ok((source, tip)) => match source.query(&["show", &format!("{tip}:{LEDGER}")]) {
+                Ok(ledger)
+                    if ledger
+                        .lines()
+                        .any(|line| line.starts_with("[release.mint]")) =>
+                {
+                    Switch::Live
+                }
+                Ok(ledger) if !ledger.is_empty() => Switch::Dormant,
+                _ => required(format!(
+                    "the host's main ({}) has no readable seed ledger",
+                    short(&tip)
+                )),
+            },
+            Err(why) => required(format!(
+                "its native host could not read the owner-bound main ({why})"
+            )),
+        };
+    }
     let live = match bounded_git(repo, &[], &["ls-remote", "origin", "refs/heads/main"]) {
         Bounded::TimedOut => {
             return required(format!(

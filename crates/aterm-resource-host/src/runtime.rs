@@ -30,7 +30,7 @@ struct Endpoint {
     telemetry: Option<Arc<crate::resource_telemetry::Telemetry>>,
 }
 static ENDPOINT: OnceLock<Endpoint> = OnceLock::new();
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn test_endpoint() -> io::Result<()> {
     let program = std::env::current_exe()?.canonicalize()?;
     let existing = ENDPOINT.get_or_init(|| Endpoint {
@@ -98,6 +98,9 @@ pub(crate) fn read_json(stream: &CtlStream, deadline: Instant) -> io::Result<ate
 /// The exact private role owns its two inherited socket slots once; no path,
 /// budget or process identity is accepted as a command-line authority.
 pub fn entry(args: &[OsString]) -> Option<ExitCode> {
+    if let Some(result) = crate::metadata_prelude::entry(args) {
+        return Some(result);
+    }
     if args.first().is_none_or(|arg| arg != OsStr::new(VERB)) {
         return None;
     }
@@ -306,6 +309,33 @@ fn serve_one(stream: &CtlStream, program: &Program, guis: Arc<AtomicUsize>) -> i
         Some("native-context") if hello["version"].as_u64() == Some(3) => {
             crate::resource_context::serve(stream, peer, &hello, deadline, crate::actor::context)
         }
+        Some("native-context-sdk-v1") if hello["version"].as_u64() == Some(3) => {
+            crate::resource_context::serve_sdk(
+                stream,
+                peer,
+                &hello,
+                deadline,
+                crate::actor::context,
+            )
+        }
+        Some("native-metadata-ready-v1") if hello["version"].as_u64() == Some(3) => {
+            crate::resource_context::serve_metadata_ready(
+                stream,
+                peer,
+                &hello,
+                deadline,
+                crate::actor::metadata_ready,
+            )
+        }
+        Some("native-resolver-ready-v1") if hello["version"].as_u64() == Some(3) => {
+            crate::resource_context::serve_resolver_ready(
+                stream,
+                peer,
+                &hello,
+                deadline,
+                crate::actor::resolver_ready,
+            )
+        }
         Some("inspect") if hello["version"].as_u64() == Some(3) => {
             let session = hello["session"].as_str().ok_or_else(refused)?;
             let observed = crate::actor::inspect(peer, session)?.json()?;
@@ -321,21 +351,62 @@ fn serve_one(stream: &CtlStream, program: &Program, guis: Arc<AtomicUsize>) -> i
             }
             Ok(())
         }
-        Some("proxy-member") if hello["version"].as_u64() == Some(3) => {
-            let job = crate::actor::proxy_binding(&hello)?;
+        Some("sealed-metadata-v1") => {
+            let job = crate::actor::metadata_binding(&hello)?;
+            if wire::local_peer(stream)? != peer {
+                return Err(refused());
+            }
+            wire::write_frame(stream, aterm_types::resource_subgroup::PREPARE, deadline)?;
+            let member = crate::metadata_transport::receive(stream, &job, deadline)?;
+            crate::actor::submit_metadata(member)?;
+            aterm_ctl::resource_subgroup_client::acknowledge(stream, deadline)
+        }
+        Some("sealed-resolver-query-v1") => {
+            let job = crate::actor::resolver_binding(&hello)?;
+            if wire::local_peer(stream)? != peer {
+                return Err(refused());
+            }
+            wire::write_frame(stream, aterm_types::resource_subgroup::PREPARE, deadline)?;
+            let member = crate::resolver_transport::receive(stream, &job, deadline)?;
+            crate::actor::submit_resolver_query(member)?;
+            aterm_ctl::resource_subgroup_client::acknowledge(stream, deadline)
+        }
+        Some(role)
+            if hello["version"].as_u64() == Some(3)
+                && matches!(
+                    role,
+                    "proxy-member" | trust_resource_controller::accounting::PROXY_ROLE
+                ) =>
+        {
+            let accounted = role == trust_resource_controller::accounting::PROXY_ROLE;
+            let job = if accounted {
+                crate::actor::proxy_binding_accounted(&hello)?
+            } else {
+                crate::actor::proxy_binding(&hello)?
+            };
             let native = native_program()?;
             native.validate_cached_process(
                 trust_resource_provenance::process::read_identity(peer.pid)?,
                 deadline,
             )?;
             wire::write_frame(stream, aterm_types::resource_subgroup::PREPARE, deadline)?;
-            let incoming = crate::resource_proxy_intake::receive(
-                stream,
-                &job,
-                &native,
-                deadline,
-                crate::actor::provisional_proxy,
-            )?;
+            let incoming = if accounted {
+                crate::resource_proxy_intake::receive_accounted(
+                    stream,
+                    &job,
+                    &native,
+                    deadline,
+                    crate::actor::provisional_proxy,
+                )?
+            } else {
+                crate::resource_proxy_intake::receive(
+                    stream,
+                    &job,
+                    &native,
+                    deadline,
+                    crate::actor::provisional_proxy,
+                )?
+            };
             crate::actor::submit_proxy(incoming)?;
             aterm_ctl::resource_subgroup_client::acknowledge(stream, deadline)
         }

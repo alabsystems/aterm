@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! A WAIT FOR ADMISSION OR A LOCK, MARKED WHERE A CEILING CAN SEE IT
-//! (`docs/DESIGN-adaptive-build-2026-10-24.md`, CEILING-WAIT).
+//! (`docs/DESIGN-adaptive-build-2026-10-24.md`, CEILING-WAIT), AND WHERE A WAITER BEHIND IT CAN.
 //!
 //! A tool that ends a child at a ceiling (verify's per-check one) times the child's work, not
 //! its waits: it names a directory in [`VAR`] for the child's tree, and a process of that tree
@@ -14,6 +14,11 @@
 //! holder lets its lock go. A live holder whose processes make no progress ([`crate::stall`]) is
 //! what can keep it for ever, so the record says when every holder the wait is behind has made
 //! none for the waiter's bound ([`Stuck`]), and the tool over it may end the wait on that.
+//!
+//! Every wait is marked in this user's own directory too ([`user_dir`]), whatever ceiling it
+//! runs under or none: a holder that waits in its turn does no work of its own while it waits,
+//! and the waiter behind it reads there that it waits, and whether what it waits behind is stuck
+//! ([`user_waiting`]), rather than calling it stuck for a wait that is not its own doing.
 
 use std::io::{self, Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -44,21 +49,114 @@ pub fn dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// A wait of this process, marked while it lasts; the mark goes when it drops.
+/// How old a mark still being laid must be before [`Mark::begin`] takes it for one its waiter
+/// died laying: laying takes a moment.
+const LAYING: Duration = Duration::from_secs(60);
+
+/// In a Unix test binary, the variable naming the directory it takes for this user's waits
+/// ([`user_dir`]): a test sets it, to its own, on a stand-in whose marks it reads. Read nowhere
+/// else.
+pub const TEST_USER_VAR: &str = "ATERM_TEST_USER_WAITS";
+
+/// This user's own waits directory, where every wait is marked whatever ceiling it runs under
+/// ([`Mark::begin`]): `~/Library/Caches/aterm/waits` on macOS, `~/.cache/aterm/waits` on Linux,
+/// `%LOCALAPPDATA%\aterm\waits` on Windows; `None` with no home. On Unix `~` is the account
+/// database's home, whatever `$HOME` says, so a tool run under a scratch home (the lab, verify's
+/// smoke stages) marks its waits where every session of this user reads them, as the capacity
+/// ledger is kept. A Unix test binary's waits stay out of them: its own scratch root's `waits`
+/// ([`aterm_uds::test_binary::scratch_root`]), or the one [`TEST_USER_VAR`] names.
+#[must_use]
+pub fn user_dir() -> Option<PathBuf> {
+    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    if cfg!(windows) {
+        return var("LOCALAPPDATA").map(|d| PathBuf::from(d).join("aterm").join("waits"));
+    }
+    #[cfg(unix)]
+    if let Some(root) = aterm_uds::test_binary::scratch_root() {
+        return Some(var(TEST_USER_VAR).map_or_else(|| root.join("waits"), PathBuf::from));
+    }
+    #[cfg(unix)]
+    let home = aterm_uds::account::home().or_else(|| var("HOME").map(PathBuf::from))?;
+    #[cfg(not(unix))]
+    let home = PathBuf::from(var("HOME")?);
+    Some(if cfg!(target_os = "macos") {
+        home.join("Library/Caches/aterm/waits")
+    } else {
+        home.join(".cache/aterm/waits")
+    })
+}
+
+/// The waits marked in this user's own directory now ([`user_dir`], [`waiting`]), this
+/// process's own left out: what a waiter reads of the holder it waits behind
+/// ([`crate::stall::Waits`]), and its own waits are not that holder's. None with no home.
+#[must_use]
+pub fn user_waiting() -> Vec<Waiting> {
+    let me = std::process::id();
+    user_dir().map_or_else(Vec::new, |d| {
+        let mut found = waiting(&d);
+        found.retain(|w| w.pid != me);
+        found
+    })
+}
+
+/// A wait of this process, marked while it lasts in each directory it was laid in; the marks go
+/// when it drops.
 #[derive(Debug)]
 pub struct Mark {
+    laid: Vec<Laid>,
+    since: u64,
+}
+
+/// One file of a [`Mark`], which its waiter keeps locked.
+#[derive(Debug)]
+struct Laid {
     lock: RecordLock,
     path: PathBuf,
-    since: u64,
 }
 
 impl Mark {
     /// Mark this process's wait, `text` saying what it waits for, in the directory [`VAR`]
-    /// names. `None` where it names none, or the mark cannot be laid there (a directory its
-    /// ceiling has let go): a wait never fails for its mark.
+    /// names and in this user's own ([`user_dir`], made where it is missing, the marks of
+    /// waiters that died there removed first). `None` where it is laid in neither (no ceiling
+    /// and no home, or a directory its ceiling has let go): a wait never fails for its mark.
     #[must_use]
     pub fn begin(text: &str) -> Option<Mark> {
-        Mark::at(&dir()?, text).ok()
+        Mark::in_each(&Mark::dirs(), text)
+    }
+
+    /// Where [`Mark::begin`] lays a mark: the directory [`VAR`] names, and this user's own
+    /// once it is made, its dead marks swept.
+    #[must_use]
+    pub fn dirs() -> Vec<PathBuf> {
+        let user = user_dir().filter(|d| {
+            let mut made = std::fs::DirBuilder::new();
+            made.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                made.mode(0o700);
+            }
+            made.create(d).is_ok()
+        });
+        if let Some(d) = &user {
+            sweep(d);
+        }
+        dir().into_iter().chain(user).collect()
+    }
+
+    /// Mark this process's wait in each of `dirs` that takes one ([`Mark::at`]); `None` where
+    /// none does.
+    #[must_use]
+    pub fn in_each(dirs: &[PathBuf], text: &str) -> Option<Mark> {
+        let mut laid = Vec::new();
+        let since = now_secs();
+        for dir in dirs {
+            if let Ok(mut one) = Mark::at(dir, text) {
+                one.since = since;
+                laid.append(&mut one.laid);
+            }
+        }
+        (!laid.is_empty()).then(|| Mark { laid, since })
     }
 
     /// Mark this process's wait in `dir`, which must exist: laid under a name no reader looks
@@ -97,14 +195,13 @@ impl Mark {
             }
         };
         let mut mark = Mark {
-            lock,
-            path: taking,
+            laid: vec![Laid { lock, path: taking }],
             since: now_secs(),
         };
         mark.write(text, None)?;
         let named = dir.join(format!("{stem}{MARK}"));
-        std::fs::rename(&mark.path, &named)?;
-        mark.path = named;
+        std::fs::rename(&mark.laid[0].path, &named)?;
+        mark.laid[0].path = named;
         Ok(mark)
     }
 
@@ -120,19 +217,101 @@ impl Mark {
         let _ = self.write(text, stuck);
     }
 
+    /// Write the record to each of its files; the first error, once every file was tried.
     fn write(&mut self, text: &str, stuck: Option<&Stuck>) -> io::Result<()> {
         let line = record(std::process::id(), self.since, text, stuck);
-        self.lock.seek(io::SeekFrom::Start(0))?;
-        self.lock.write_all(line.as_bytes())?;
-        self.lock
-            .set_len(u64::try_from(line.len()).unwrap_or(RECORD))
+        let mut first = Ok(());
+        for laid in &mut self.laid {
+            let wrote = laid
+                .lock
+                .seek(io::SeekFrom::Start(0))
+                .and_then(|_| laid.lock.write_all(line.as_bytes()))
+                .and_then(|()| {
+                    laid.lock
+                        .set_len(u64::try_from(line.len()).unwrap_or(RECORD))
+                });
+            if first.is_ok() {
+                first = wrote;
+            }
+        }
+        first
     }
 }
 
 impl Drop for Mark {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        for laid in &self.laid {
+            let _ = std::fs::remove_file(&laid.path);
+        }
     }
+}
+
+/// Remove the marks in `dir` whose waiters died without removing them (killed while they
+/// waited), so a directory every wait of this user is marked in does not grow: a mark whose lock
+/// can be taken is no wait ([`live`]), and one still being laid is a dead waiter's once it is
+/// [`LAYING`] old. A mark named over the dead one meanwhile (its pid reused) is left alone.
+fn sweep(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let laying = name.ends_with(TAKING);
+        if !laying && !name.ends_with(MARK) {
+            continue;
+        }
+        let path = e.path();
+        let Ok(file) = open_mark(&path) else {
+            continue;
+        };
+        let Ok(meta) = file.metadata() else {
+            continue;
+        };
+        let young = || {
+            meta.modified()
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_none_or(|age| age < LAYING)
+        };
+        if !meta.is_file() || (laying && young()) {
+            continue;
+        }
+        if let Ok(dead) = RecordLock::try_lock(file, RECORD) {
+            if same_file(&meta, &path) {
+                let _ = std::fs::remove_file(&path);
+            }
+            drop(dead);
+        }
+    }
+}
+
+/// Whether `path` still names the file whose metadata is `open`.
+#[cfg(unix)]
+fn same_file(open: &std::fs::Metadata, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.dev() == open.dev() && m.ino() == open.ino())
+}
+
+/// Whether `path` still names the file whose metadata is `open`: a name cannot be given to
+/// another file while this process holds the file open, so it does.
+#[cfg(not(unix))]
+fn same_file(_open: &std::fs::Metadata, _path: &Path) -> bool {
+    true
+}
+
+/// `path` opened to read, never following a link at it nor blocking on a FIFO.
+fn open_mark(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    options.open(path)
 }
 
 /// A wait a mark names.
@@ -157,6 +336,20 @@ struct LiveMark {
 }
 
 impl Waiting {
+    /// A wait as a record says it, with no live file behind it, so it confirms no mark
+    /// ([`Self::same_mark`]): a test's stand-in for one read in this user's waits.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn said(pid: u32, since: u64, text: &str, stuck: Option<Stuck>) -> Waiting {
+        Waiting {
+            pid,
+            since,
+            text: text.to_owned(),
+            stuck,
+            identity: None,
+        }
+    }
+
     /// Whether both snapshots came from the same observed locked mark and record identity.
     /// Text and elapsed duration are not identity. Unavailable file identity never confirms
     /// another observation, and this comparison does not establish that a past mark is still live.
@@ -202,14 +395,7 @@ pub fn waiting(dir: &Path) -> Vec<Waiting> {
 
 /// The wait `path` marks, while its waiter holds it.
 fn live(path: &Path) -> Option<Waiting> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
-    }
-    let mut file = options.open(path).ok()?;
+    let mut file = open_mark(path).ok()?;
     let metadata = file.metadata().ok()?;
     if !metadata.is_file() {
         return None;
@@ -352,7 +538,7 @@ mod tests {
         );
         mark.say("waiting for pid 7, which works again");
         assert_eq!(waiting(dir.path())[0].stuck, None, "a record said anew");
-        let path = mark.path.clone();
+        let path = mark.laid[0].path.clone();
         drop(mark);
         assert!(waiting(dir.path()).is_empty());
         assert!(!path.exists(), "the mark goes with its wait");
@@ -377,11 +563,51 @@ mod tests {
             assert_eq!(live(&fifo), None);
             let held = Mark::at(dir.path(), "real waiter").expect("held");
             let link = dir.path().join("link-0.wait");
-            std::os::unix::fs::symlink(&held.path, &link).expect("symlink");
+            std::os::unix::fs::symlink(&held.laid[0].path, &link).expect("symlink");
             assert_eq!(live(&link), None);
             assert_eq!(waiting(dir.path()).len(), 1);
             drop(held);
         }
+    }
+
+    /// A mark laid in two directories is a wait in each, says the same in each, and goes from
+    /// each with its wait; a directory that takes none leaves it laid in the other, and one laid
+    /// in none is none. Before a wait is marked in this user's directory its dead marks go: a
+    /// mark nobody holds, and one still being laid once it is old; a live mark, and one being
+    /// laid now, stay.
+    #[test]
+    fn a_mark_is_laid_in_each_directory_and_the_dead_are_swept() {
+        let a = scratch("each-a");
+        let b = scratch("each-b");
+        let gone = a.path().join("let-go");
+        let dirs = [a.path().to_path_buf(), gone.clone(), b.path().to_path_buf()];
+        let mut mark = Mark::in_each(&dirs, "waits for the lane").expect("laid");
+        mark.say("still waits for the lane");
+        for d in [a.path(), b.path()] {
+            let seen = waiting(d);
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            assert_eq!(seen[0].text, "still waits for the lane");
+        }
+        assert!(Mark::in_each(std::slice::from_ref(&gone), "x").is_none());
+        let dead = a.path().join("1-0.wait");
+        std::fs::write(&dead, record(1, 0, "a waiter that died", None)).expect("dead");
+        let laying = a.path().join("1-1.taking");
+        std::fs::write(&laying, "").expect("one being laid");
+        sweep(a.path());
+        assert!(!dead.exists(), "a dead mark stays");
+        assert!(laying.exists(), "a mark being laid now went");
+        assert_eq!(waiting(a.path()).len(), 1, "the live mark went");
+        let old = std::time::SystemTime::now() - LAYING - Duration::from_secs(1);
+        std::fs::File::options()
+            .write(true)
+            .open(&laying)
+            .and_then(|f| f.set_modified(old))
+            .expect("aged");
+        sweep(a.path());
+        assert!(!laying.exists(), "a dead waiter's half-laid mark stays");
+        drop(mark);
+        assert!(waiting(a.path()).is_empty() && waiting(b.path()).is_empty());
+        assert_eq!(std::fs::read_dir(b.path()).expect("b").count(), 0);
     }
 
     #[cfg(any(unix, windows))]
@@ -389,7 +615,7 @@ mod tests {
     fn a_live_marks_identity_survives_words_and_elapsed_duration() {
         let dir = scratch("identity");
         let mut mark = Mark::at(dir.path(), "waiting behind a working holder").unwrap();
-        let first = live(&mark.path).unwrap();
+        let first = live(&mark.laid[0].path).unwrap();
         assert!(first.same_mark(&first));
         for seconds in [900, 901] {
             mark.say_stuck(
@@ -399,7 +625,7 @@ mod tests {
                     span: Duration::from_secs(seconds),
                 }),
             );
-            let next = live(&mark.path).unwrap();
+            let next = live(&mark.laid[0].path).unwrap();
             assert!(first.same_mark(&next));
             assert!(next.same_mark(&first));
             let mut other_record = next.clone();
@@ -422,8 +648,8 @@ mod tests {
         other.since = 1;
         first.say("same wait");
         other.say("same wait");
-        let before = live(&first.path).unwrap();
-        let simultaneous = live(&other.path).unwrap();
+        let before = live(&first.laid[0].path).unwrap();
+        let simultaneous = live(&other.laid[0].path).unwrap();
         assert_eq!(
             (before.pid, before.since),
             (simultaneous.pid, simultaneous.since)
@@ -431,7 +657,7 @@ mod tests {
         assert!(!before.same_mark(&simultaneous));
 
         let alias = dir.path().join("alias.wait");
-        std::fs::hard_link(&first.path, &alias).unwrap();
+        std::fs::hard_link(&first.laid[0].path, &alias).unwrap();
         let aliased = live(&alias).unwrap();
         assert_eq!(
             before.identity.as_ref().unwrap().file,
@@ -443,10 +669,10 @@ mod tests {
         );
         std::fs::remove_file(alias).unwrap();
 
-        let path = first.path.clone();
-        std::fs::rename(&other.path, &path).unwrap();
-        other.path = path;
-        let replaced = live(&other.path).unwrap();
+        let path = first.laid[0].path.clone();
+        std::fs::rename(&other.laid[0].path, &path).unwrap();
+        other.laid[0].path = path;
+        let replaced = live(&other.laid[0].path).unwrap();
         assert_eq!((before.pid, before.since), (replaced.pid, replaced.since));
         assert_eq!(
             before.identity.as_ref().unwrap().path,
@@ -457,7 +683,7 @@ mod tests {
             "replacing a path cannot inherit its old confirmation"
         );
         // The original open handle remains alive, so its inode cannot have been recycled.
-        assert!(first.lock.metadata().is_ok());
+        assert!(first.laid[0].lock.metadata().is_ok());
         drop(other);
         drop(first);
     }
@@ -467,7 +693,7 @@ mod tests {
     fn an_unidentified_record_cannot_confirm_any_mark() {
         let dir = scratch("unidentified");
         let mark = Mark::at(dir.path(), "waiting").unwrap();
-        let current = live(&mark.path).unwrap();
+        let current = live(&mark.laid[0].path).unwrap();
         let parsed = parse(&record(current.pid, current.since, &current.text, None)).unwrap();
         assert!(!parsed.same_mark(&parsed));
         assert!(!parsed.same_mark(&current));

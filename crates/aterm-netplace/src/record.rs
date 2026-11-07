@@ -3,19 +3,22 @@
 
 //! The keeper's memory on disk: `<state>/netplace/place.toml`, 0600 in a 0700 directory, written
 //! whole by atomic rename and only by the process that holds `keeper.lock` ([`crate::keeper`]).
-//! It holds the stays (the current one last), the networks remembered as the ALab LAN, the path
-//! monitor's last reading (for a reader that runs no monitor) and who wrote it. Readers never
+//! It holds the stays (the current one last), the networks remembered as the ALab LAN
+//! and who wrote it. Readers never
 //! lock it: a rename replaces it whole.
 //!
 //! The file is a flat TOML subset this module writes and reads back: a schema this build does
 //! not know, or a line it cannot read, makes the whole file unread, and the place is worked out
 //! afresh (away-since then reads unknown rather than an invented time).
+//! Schema 1's optional retired path field is validated and discarded on read, and omitted on
+//! write. The format already permits that omission, so history remains readable by existing
+//! processes. Reading never forces a rewrite or discards saved stays and remembered networks.
 
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
-use crate::place::{Known, Link, NetworkId, PathFacts, Record, Stay, StayAt};
+use crate::place::{Known, Link, NetworkId, Record, Stay, StayAt};
 
 /// The directory under the state root.
 pub const DIR: &str = "netplace";
@@ -50,23 +53,9 @@ pub struct Written {
     pub record: Record,
 }
 
-fn write_path_line(out: &mut String, path: &PathFacts) {
-    use std::fmt::Write as _;
-    let _ = write!(
-        out,
-        "usable={} expensive={} constrained={} link={}",
-        match path.usable {
-            Some(true) => "1",
-            Some(false) => "0",
-            None => "-",
-        },
-        u8::from(path.expensive),
-        u8::from(path.constrained),
-        path.link.word()
-    );
-}
-
-fn parse_path(text: &str) -> Option<PathFacts> {
+/// Schema 1 retained monitor state. Validate that retired field so migration preserves the
+/// historical memory without accepting malformed records or constructing current path facts.
+fn validate_legacy_path(text: &str) -> Option<()> {
     let mut usable = None;
     let mut expensive = None;
     let mut constrained = None;
@@ -100,12 +89,8 @@ fn parse_path(text: &str) -> Option<PathFacts> {
             _ => return None,
         }
     }
-    Some(PathFacts {
-        usable: usable?,
-        expensive: expensive?,
-        constrained: constrained?,
-        link: link?,
-    })
+    (usable.is_some() && expensive.is_some() && constrained.is_some() && link.is_some())
+        .then_some(())
 }
 
 fn valid_subnet(subnet: &str) -> bool {
@@ -213,11 +198,6 @@ pub fn format(written: &Written) -> String {
         let _ = writeln!(out, "keeper_started_ms = {ms}");
     }
     let _ = writeln!(out, "written_ms = {}", written.written_ms);
-    if let Some(path) = &written.record.path {
-        out.push_str("path = \"");
-        write_path_line(&mut out, path);
-        out.push_str("\"\n");
-    }
     out.push_str("stays = [\n");
     for stay in &written.record.stays {
         out.push_str("  \"");
@@ -238,8 +218,8 @@ pub fn format(written: &Written) -> String {
     out
 }
 
-/// The record a [`format`] text holds; `None` for another schema or any line this build cannot
-/// read.
+/// The record a [`format`] text holds, validating and discarding its optional retired path.
+/// Unknown schemas or malformed fields make the whole record unread.
 #[must_use]
 pub fn parse(text: &str) -> Option<Written> {
     let mut schema = None;
@@ -247,7 +227,7 @@ pub fn parse(text: &str) -> Option<Written> {
     let mut keeper_pid = None;
     let mut keeper_started_ms = None;
     let mut written_ms = None;
-    let mut path = None;
+    let mut legacy_path_seen = false;
     let mut stays: Option<Vec<Stay>> = None;
     let mut remembered: Option<Vec<Known>> = None;
     let mut list: Option<&str> = None;
@@ -281,8 +261,9 @@ pub fn parse(text: &str) -> Option<Written> {
                 keeper_started_ms = Some(value.parse().ok()?);
             }
             "written_ms" if written_ms.is_none() => written_ms = Some(value.parse().ok()?),
-            "path" if path.is_none() => {
-                path = Some(parse_path(value.strip_prefix('"')?.strip_suffix('"')?)?);
+            "path" if !legacy_path_seen => {
+                validate_legacy_path(value.strip_prefix('"')?.strip_suffix('"')?)?;
+                legacy_path_seen = true;
             }
             "stays" if value == "[" && stays.is_none() => {
                 stays = Some(Vec::new());
@@ -306,7 +287,6 @@ pub fn parse(text: &str) -> Option<Written> {
         record: Record {
             stays: stays?,
             remembered: remembered?,
-            path,
         },
     })
 }
@@ -336,14 +316,9 @@ pub fn write(dir: &Path, written: &Written) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    /// What the keeper writes it reads back whole, and a record of another schema or with one
-    /// line it cannot read is unread as a whole, so no half-read memory invents a time.
-    /// NEGATIVE CONTROL: passing over a key this build does not know (`_ => {}` in `parse`)
-    /// reads the record with the unknown key, and this test fails.
-    #[test]
-    fn the_record_reads_back_and_an_unknown_one_is_unread_whole() {
+    fn historical() -> Written {
         let id = NetworkId::parse("n0123456789abcdef").expect("an id");
-        let written = Written {
+        Written {
             revision: 7,
             keeper_pid: Some(4242),
             keeper_started_ms: Some(1_000),
@@ -374,14 +349,17 @@ mod tests {
                     learned_ms: 1_100,
                     confirmed_ms: 1_400,
                 }],
-                path: Some(PathFacts {
-                    usable: Some(false),
-                    expensive: true,
-                    constrained: false,
-                    link: Link::Wifi,
-                }),
             },
-        };
+        }
+    }
+
+    /// What the keeper writes it reads back whole, and a record of another schema or with one
+    /// line it cannot read is unread as a whole, so no half-read memory invents a time.
+    /// NEGATIVE CONTROL: passing over a key this build does not know (`_ => {}` in `parse`)
+    /// reads the record with the unknown key, and this test fails.
+    #[test]
+    fn the_record_reads_back_and_an_unknown_one_is_unread_whole() {
+        let written = historical();
         let text = format(&written);
         assert_eq!(parse(&text), Some(written));
         assert_eq!(parse(&text.replace("schema = 1", "schema = 2")), None);
@@ -399,10 +377,49 @@ mod tests {
         assert_eq!(parse(""), None);
     }
 
-    /// Truncated files, duplicate keys, malformed `path` booleans, and invalid CIDR `subnet`
+    #[test]
+    fn schema_one_memory_survives_without_retaining_its_retired_path() {
+        let legacy = "path = \"usable=0 expensive=1 constrained=0 link=wifi\"\n\
+            revision = 7\nkeeper_pid = 4242\nkeeper_started_ms = 1000\nwritten_ms = 2000\n\
+            stays = [\n\"1000 1500 alab-lan n0123456789abcdef 192.168.4.0/22 192.168.4.1 1\",\n\
+            \"1500 - offline - - - 0\",\n]\nschema = 1\n\
+            remembered = [\n\"n0123456789abcdef 1100 1400\",\n]\n";
+        let expected = historical();
+        assert_eq!(parse(legacy), Some(expected.clone()));
+        let without_path = legacy.lines().skip(1).collect::<Vec<_>>().join("\n");
+        assert_eq!(parse(&without_path), Some(expected.clone()));
+        for malformed in [
+            legacy.replace("expensive=1", "expensive=yes"),
+            legacy.replace("constrained=0", "constrained=2"),
+            legacy.replace("usable=0", "usable=0 usable=1"),
+            legacy.replace("link=wifi", "link=unknown-link"),
+            format!("{legacy}path = \"usable=0 expensive=1 constrained=0 link=wifi\"\n"),
+            legacy.replace("schema = 1", "schema = 2"),
+            legacy.replace("schema = 1", "schema = 3"),
+        ] {
+            assert_eq!(parse(&malformed), None);
+        }
+        let root = aterm_tempfile::tempdir().unwrap();
+        let dir = dir(root.path());
+        aterm_uds::private_file::ensure_private_dir(&dir).unwrap();
+        aterm_uds::private_file::write_private(&dir, FILE, legacy.as_bytes()).unwrap();
+        assert_eq!(read(&dir), Some(expected.clone()));
+        assert_eq!(
+            std::fs::read(dir.join(FILE)).unwrap(),
+            legacy.as_bytes(),
+            "reading does not force a rewrite"
+        );
+        write(&dir, &expected).unwrap();
+        let rewritten = std::fs::read_to_string(dir.join(FILE)).unwrap();
+        assert!(rewritten.lines().any(|line| line == "schema = 1"));
+        assert!(!rewritten.lines().any(|line| line.starts_with("path = ")));
+        assert_eq!(read(&dir), Some(expected));
+    }
+
+    /// Truncated files, duplicate keys and invalid CIDR `subnet`
     /// tokens make the whole record unread rather than inventing defaults or overwriting fields.
     /// NEGATIVE CONTROL: defaulting missing `revision`/`written_ms`/`stays`/`remembered` or
-    /// parsing `expensive=yes` as `false` accepts corrupted `place.toml` inputs, failing this test.
+    /// accepting an invalid CIDR accepts corrupted `place.toml` inputs, failing this test.
     #[test]
     fn truncated_duplicate_and_malformed_record_fields_are_unread_whole() {
         let base = format(&Written {
@@ -419,12 +436,6 @@ mod tests {
                     from_start: true,
                 }],
                 remembered: Vec::new(),
-                path: Some(PathFacts {
-                    usable: Some(true),
-                    expensive: false,
-                    constrained: false,
-                    link: Link::Wired,
-                }),
             },
             ..Written::default()
         });
@@ -439,9 +450,6 @@ mod tests {
             parse(&base.replace("stays = [", "stays = [\n]\nstays = [")),
             None
         );
-        assert_eq!(parse(&base.replace("expensive=0", "expensive=yes")), None);
-        assert_eq!(parse(&base.replace("constrained=0", "constrained=2")), None);
-        assert_eq!(parse(&base.replace("usable=1", "usable=1 usable=0")), None);
         assert_eq!(parse(&base.replace("10.0.0.0/24", "10.0.0.0/33")), None);
         assert_eq!(parse(&base.replace("10.0.0.0/24", "not-a-cidr")), None);
     }

@@ -18,14 +18,46 @@ pub(super) enum Selection {
     Managed(Arc<Selected>),
     // A private, actual native fixture image qualifies only the custom integration binary.
     #[cfg(all(test, target_os = "macos"))]
-    NativeFixture(PathBuf),
+    NativeFixture {
+        execution: PathBuf,
+        build: u64,
+        lease: Arc<atpkg::lease::Lease>,
+    },
 }
 impl Selection {
     pub(super) fn execution(&self) -> &Path {
         match self {
             Self::Managed(selected) => selected.execution(),
             #[cfg(all(test, target_os = "macos"))]
-            Self::NativeFixture(path) => path,
+            Self::NativeFixture { execution, .. } => execution,
+        }
+    }
+    pub(super) fn lease_descriptor(&self) -> io::Result<std::os::fd::OwnedFd> {
+        match self {
+            Self::Managed(selected) => selected.lease_descriptor(),
+            #[cfg(all(test, target_os = "macos"))]
+            Self::NativeFixture { lease, .. } => lease.try_clone_descriptor(),
+        }
+    }
+    pub(super) fn check_lease(&self) -> io::Result<()> {
+        match self {
+            Self::Managed(selected) => selected.check_lease(),
+            #[cfg(all(test, target_os = "macos"))]
+            Self::NativeFixture { lease, .. } => lease.check_current(),
+        }
+    }
+    pub(super) fn lease_path(&self) -> &Path {
+        match self {
+            Self::Managed(selected) => selected.lease_path(),
+            #[cfg(all(test, target_os = "macos"))]
+            Self::NativeFixture { lease, .. } => lease.path(),
+        }
+    }
+    pub(super) fn build(&self) -> u64 {
+        match self {
+            Self::Managed(selected) => selected.build(),
+            #[cfg(all(test, target_os = "macos"))]
+            Self::NativeFixture { build, .. } => *build,
         }
     }
     pub(super) fn targo(&self) -> PathBuf {

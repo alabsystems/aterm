@@ -4,6 +4,10 @@
 //! The session rules with the Fake `Helper` (§13): §5.1's table, verb by verb, through the
 //! real client, protocol, serve loop and core, with the Fake machine on a thread over a
 //! scratch state directory. Every wait is a one-minute hang detector.
+//!
+//! A test whose session meets a running helper needs it proved live by this machine's kernel
+//! ([`Kernel`]: its pid's unique id and start time), which only Apple's gives (only macOS runs
+//! the helper); such a test is Apple only.
 
 use super::fake::Threaded;
 use super::*;
@@ -148,6 +152,7 @@ impl Rig {
     }
 }
 
+#[cfg(target_vendor = "apple")]
 #[test]
 fn up_keeps_the_vm_and_an_exec_under_up_attaches_and_leaves_it_running() {
     let mut rig = Rig::new();
@@ -331,6 +336,7 @@ fn down_asks_an_earlier_builds_helper_to_stop_and_signals_nothing() {
 
 /// A session that finds a helper an earlier build started asks it to `Stop`, names it as the
 /// one replaced, and starts its own, whose record names its start.
+#[cfg(target_vendor = "apple")]
 #[test]
 fn a_session_replaces_an_earlier_builds_helper_without_a_signal() {
     let mut rig = Rig::new();
@@ -481,6 +487,7 @@ fn a_connection_the_helper_closed_before_its_span_is_a_closed_session() {
     assert_eq!(e, ClientError::Closed);
 }
 
+#[cfg(target_vendor = "apple")]
 #[test]
 fn the_same_agent_with_other_shares_swaps_the_share_with_no_reboot() {
     let mut rig = Rig::new();
@@ -664,6 +671,7 @@ fn a_command_lost_while_the_vm_stops_hears_why_it_stopped_never_only_stopping() 
     let _ = rig.ended();
 }
 
+#[cfg(target_vendor = "apple")]
 #[test]
 fn up_prepares_the_disks_only_for_a_session_that_found_no_vm() {
     let mut rig = Rig::new();
@@ -717,6 +725,7 @@ fn a_plan_that_could_not_be_made_boots_nothing_and_the_helper_ends() {
     assert_eq!(rig.boots(), 0);
 }
 
+#[cfg(target_vendor = "apple")]
 #[test]
 fn join_never_stops_or_replaces_the_vm_it_is_refused_by() {
     // A guest still booting (no hello yet), as `up` left it for an `exec` in another shell.

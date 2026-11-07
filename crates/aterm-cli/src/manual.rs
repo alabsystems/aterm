@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 mod fabric_page_tests;
 
+/// `aterm help sys [<section>]`: the reference for `aterm ctl sys` and `await sys`.
+mod sys_page;
+
 /// The environment blurb at the top of the front page and the agent brief.
 fn overview() -> String {
     format!(
@@ -404,12 +407,12 @@ GOTCHAS
     },
     Topic {
         name: "sys",
-        tagline: "what this machine, aterm and this tab use now, and what this OS can measure (`aterm ctl sys`)",
-        body: None, // generated — see `sys_page()`
+        tagline: "CPU, GPU, memory, disk and jobs of this machine, aterm and this tab, now (`aterm ctl sys`)",
+        body: None, // generated — see `sys_page::page()`
     },
     Topic {
         name: "telemetry",
-        tagline: "one row per action this Mac ran: commands, agent calls, spawns, admissions (`aterm ctl telemetry`)",
+        tagline: "one row per action this Mac ran: commands, agent calls, spawns, tasks, admissions, builds, tests (`aterm ctl telemetry`)",
         body: Some(
             r#"telemetry — one versioned row for each action aterm watched, in a local log
 
@@ -422,15 +425,24 @@ WHAT IS AN ACTION
   command     each command a tab's shell ran (its OSC 133 block, from C to D), closed
               by the tab-status sweep: `tab_status = false` in aterm.toml writes none
   agent-call  each agent tool call the jobs engine saw end (`aterm ctl sys jobs`)
-  spawn       each `aterm ctl spawn` this aterm answered, ok or refused
+  spawn       each `aterm ctl spawn` this aterm answered, ok or refused, and each one
+              `aterm ctl --host <h>` sent to another Mac (on= that Mac's node id)
+  task        each worker on this Mac's board (`aterm ctl board`: spawned here, or over
+              the fleet, on= its Mac), when its row closed and the board held the
+              conclusion its Mac reported (none for a tab gone with no conclusion heard);
+              again only where a close reversed and it came to another end: a worker's
+              last task row is its end
   admission   each claim decided in this account's capacity ledger (aterm-capacity), in
               the claimant's own process: admitted, refused or ended while it waited
+  build       each build such a claim held (atpkg's build admission: `targo`, a lab's
+              builds), written as its claim ends, by the process that saw it end
+  test        the same, for the verb test (`targo test`)
   Rows come from what aterm already measures: there is no second sampler.
 
 THE ROW (schema=1; one line, space-separated key=value, a checksum last)
-  at=<unix ms> kind= key=<digest> dir=<digest> label=<program> sid=<session> host=
-  facts=<digest> wall_ms= cpu_ms= peak_bytes= wait_ms= cache= outcome= stop= code= sig=
-  meter= sum=
+  at=<unix ms> kind= key=<digest> dir=<digest> label=<program> sid=<session>
+  [on=<node>] host= facts=<digest> wall_ms= cpu_ms= peak_bytes= wait_ms= cache= outcome=
+  stop= code= sig= meter= sum=
   key     a digest of the kind, the command line and its folder: the same action keeps
           its key on every host, and no row holds a command line, an environment value or
           a path. Each NAME=value assignment is dropped before the digest, and a command
@@ -441,11 +453,16 @@ THE ROW (schema=1; one line, space-separated key=value, a checksum last)
           or interpreter that ran it) or a shell builtin or keyword aterm knows (`while`),
           `-` when none was confirmed; for an agent call, the program it ran as the kernel
           named it (its leader, or what the agent's shell wrapper started: `zsh -c 'git
-          status'` is `git`), `-` (and key=-) when it ran shell builtins alone; for a
-          spawn, the agent; for an admission, the first word of the description
-          its claimant wrote (`targo`, `lab`)
+          status'` is `git`; the last one a pass saw live), `-` (and key=-) when no pass
+          saw one live (builtins alone, or programs that ran between passes); for a
+          spawn, the agent; for an admission, a build or a test, the first word of the
+          description its claimant wrote (`targo`, `lab`)
   sid     the session's public id (`s-…`, as `aterm ctl @<sid>` and the survey name it),
-          `-` for a spawn or an admission, or before the sweep has read the session
+          `-` for an admission, a build or a test, or before the sweep has read the
+          session; a spawn's and a task's are the worker's
+  on      the fleet node id of the Mac the action ran on, written only where that is
+          another Mac; a reader older than a key skips it, and keeps a kind it does not
+          know under its word
   facts   a digest of the host's facts: machine model, CPU, cores, memory, OS and aterm
           version, spelled once at the head of each log file in a `kind=host` line
   outcome ok, fail, refused or unknown
@@ -456,8 +473,9 @@ THE ROW (schema=1; one line, space-separated key=value, a checksum last)
   meter   exact (read at the action's own edges), sampled (read at the jobs engine's 2 s
           passes: wall an upper bound, CPU and peak memory lower bounds) or stamped
           (timed around the call; nothing to sample)
-  A figure aterm cannot know reads ?<source>, naming what would supply it
-  (wait_ms=?aterm-capacity, cache=?targo); na means it has no meaning for the kind.
+  A figure aterm cannot know reads ?<source>, naming what would supply it (a build's
+  cache=?targo); na means it has no meaning for the kind (a command's, an agent call's
+  and a spawn's wait_ms and cache: an admission's wait is its build's row's).
   aterm never guesses a figure.
 
 WHERE THE FIGURES COME FROM
@@ -469,10 +487,28 @@ WHERE THE FIGURES COME FROM
               reads though aterm is not its parent (code= its exit code, or sig= the
               signal that ended it); a call no pass saw live with its start read, one past
               the 64 watches at once, and every call off macOS end unknown
-  spawn       the spawn verb's own time; CPU, memory and cache are na
+  spawn       the spawn verb's own time, or a fleet spawn's from its dial to the
+              answer; outcome refused where the answer named no worker, unknown where the
+              exchange was lost (its task may have arrived); CPU, memory, wait, cache na
+  task        wall from its spawn to the close this Mac read (meter=stamped); outcome
+              by its conclusion (finished ok, failed fail), stop by its why= (exit and
+              exit-status exit, a stall stalled, any other word unknown), code= its exit=;
+              a close writes one only where the board holds a conclusion its Mac
+              reported: the close's record's (a Mac's own failed for a tab closed while
+              its task was working is none), or one heard while the row was open, then
+              its end whatever the close says; a row reopened and closed again writes
+              another only where its end changed; CPU, memory, wait and cache na
   admission   wall_ms and wait_ms are both the admission's wait: an admitted claim's own
               clock (meter=exact), a refused or ended one's stopwatch (stamped); CPU and
-              peak memory are na (they are the work's, which its command row carries)
+              peak memory are na (they are the work's, which its build or test row and
+              its command row carry)
+  build/test  wall from its admission to its end; wait_ms its admission wait (when it
+              was admitted less when it asked); either ?clock where the wall clock was set
+              back between its stamps; peak memory its build tree's meter's peak
+              (meter=sampled, a lower bound); outcome and stop as the process that saw it
+              end knows them: its root's exit code or signal, or ok or fail alone (an
+              epoch's roots); a run that was cancelled or left work running and exited 0
+              is unknown; cpu_ms=na, cache=?targo (Targo names no cache tier yet)
   A command's CPU is unknown, not charged, when a job of the shell's that ran beside it
   (`make &` from before) was reaped while it ran; a job a command leaves running spends
   its CPU after the command, which its row does not hold.
@@ -484,8 +520,11 @@ THE LOG
   folder, which only this account can read (0700, its files 0600). A writer thread
   appends a batch at a time under the folder's lock, so a session never waits on the
   disk; when its queue is full it drops rows and writes a `kind=gap dropped=<n>` line,
-  which the reader counts as dropped=. A line a crash cut is mended on the next append
-  and counted as torn= when read, never read as a row.
+  which the reader counts as dropped=. A process with no window (a build's front or
+  holder, aterm ctl) appends its row at once, waiting at most 50 ms for the lock; a row
+  that misses it leaves a loss record in the folder (lost-<writer>-<rows>), which the
+  next append of any writer says in a gap line. A line a crash cut is mended on the next
+  append and counted as torn= when read, never read as a row.
 
 THE SUMMARY
   telemetry schema=1 rows= dropped= torn= files= bytes= since= oldest= host= facts= dir=
@@ -1265,11 +1304,19 @@ SETUP AT EACH MAC (`aterm machines help enroll` is the checklist)
 
 VERBS
   set up      init, scan, enroll, unenroll, rename
-  look        ls, tabs, monitor, status, outstanding
+  look        ls, tabs, monitor, status, outstanding, storage plan
   change      plan, apply, attach, run, github login|revoke, rekey
   people      person, screen
   on a host   here plan|apply <baseline.toml> (apply under sudo); here apply --plain
               (Apple's Command Line Tools from the built-in baseline, reading no file)
+
+LOCAL REPOSITORY STORAGE
+    aterm machines storage plan --git-common-dir ABS [--json] [--verify-io-bytes N]
+  A bounded read-only report of pack-file candidates under one explicit local Git
+  common directory. It needs no controller or enrollment. With the default N=0,
+  it reads metadata only; an explicit byte budget permits exact content comparison.
+  Candidate bytes, verified equal contents and physical space are separate figures.
+  The report grants no cleanup authority; use `aterm machines help storage` for limits.
 
   Exit status: 0 nothing failed; 1 something failed; 2 some hosts were unreachable, or
   the command line was refused. If no LAN host answers, `aterm doctor` says whether the
@@ -2563,331 +2610,6 @@ fn overview_page() -> String {
     s
 }
 
-/// `aterm help sys`: what `aterm ctl sys` reads, with THIS machine read at
-/// the moment of the call.
-fn sys_page() -> String {
-    let words = aterm_sysprobe::machine_words();
-    let layout = aterm_sysprobe::cpu_layout();
-    let mem = aterm_sysprobe::memory_detail();
-    let gpu = aterm_sysprobe::gpu();
-    let load = aterm_sysprobe::load_average();
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let volume = home.as_deref().and_then(aterm_sysprobe::volume);
-    let mut s = String::new();
-    s.push_str("aterm help sys — what this machine, aterm and this tab use, measured now\n\n");
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = writeln!(
-            s,
-            "DIAGNOSTIC CLIENT\n  This help runs from {}. sys cores/procs also name the running server's diagnostic_executable. If PATH resolves an older development copy, use that server executable for ctl; do not overwrite an installed app.\n",
-            exe.display()
-        );
-    }
-    s.push_str("AUTHORIZED CPU POLICY DIAGNOSTICS (macOS)\n  aterm ctl @self sys policy status --json reads operation status without prompting. sys policy collect requests one bounded, read-only collection of Game Mode, CarPlay and runaway-mitigation flags through aterm's own password sheet; focus the requesting tab. sys policy cancel requests cancellation. Repeated requests cannot launch another operation until the exact collector and pipe readers have drained. sys report --json includes per-PID generation, per-selector values/errors, actual collector euid, observation window and coverage; a zero-hit census is not an atomic global all-clear or a hardware diagnosis. No automatic reboot or policy change.\n\n");
-    s.push_str("SCHEDULING\n  sys procs reports Darwin nice, target application and requested-background bits, suppression, application role and lifetime CPU nanoseconds by QoS; zero/false are measured values, and refusal, unsupported and OS errors remain distinct. A process row's cpu_mc covers only its own interval CPU, not its children's work. JSON cpu_accounting keeps exact decimal-string cumulative self and reaped-descendant CPU, counter timestamp, process identity and automatic-reaping flag; sys report retains these with anomaly frames after workers exit. Compare counters only for the same process generation. Do not add reaped-child CPU to the row's rate: it can overlap observed children, and Darwin automatic reaping can charge it twice. QoS counters are lifetime CPU by class, not core residency. sys cores/procs/why show cluster occupancy and flag runnable wait with idle performance cores only across aligned nominal sampling windows. Unchanged core counters leave current utilization unavailable; a held drawing value is not a new measurement. This is an observation, not proof of which cores a worker used or why it waited. nice=0/background=false do not rule out a QoS ceiling. For a deliberate macOS policy change, taskpolicy -a must wrap the actual worker exec: an outer wrapper's role does not survive fork, and -B only clears Darwin backgrounding. Preserve loader environment and job ownership, and measure counter deltas and the result.\n\n");
-    s.push_str("THIS MACHINE (read now)\n");
-    let clusters: Vec<String> = layout
-        .clusters
-        .iter()
-        .map(|c| format!("{} {}", c.logical.len(), c.name))
-        .collect();
-    let _ = writeln!(
-        s,
-        "  {} · {} · {} cores: {}",
-        words.os.as_deref().unwrap_or("OS unreadable"),
-        words.cpu.as_deref().unwrap_or("CPU brand unreadable"),
-        layout.logical_cores(),
-        clusters.join(", ")
-    );
-    match &gpu {
-        Some(g) => {
-            let _ = writeln!(
-                s,
-                "  GPU {}{}: one device-wide figure{}",
-                g.name.as_deref().unwrap_or("(unnamed)"),
-                g.cores.map(|c| format!(", {c} cores")).unwrap_or_default(),
-                g.device_pct
-                    .map(|p| format!(", {p}% busy now"))
-                    .unwrap_or_default()
-            );
-        }
-        None => s.push_str("  GPU: unavailable(unsupported) — no reader on this OS\n"),
-    }
-    match &mem {
-        Some(m) => {
-            let _ = writeln!(
-                s,
-                "  memory {} · swap {} used of {} · pressure {}",
-                size_word(m.total),
-                size_word(m.swap_used),
-                size_word(m.swap_total),
-                m.pressure
-                    .map_or("unavailable(unsupported)", |p| p.as_str())
-            );
-        }
-        None => s.push_str("  memory: unavailable(unsupported) — no reader on this OS\n"),
-    }
-    match load {
-        Some([a, b, c]) => {
-            let _ = writeln!(s, "  load {a:.2} {b:.2} {c:.2} (1, 5, 15 min)");
-        }
-        None => s.push_str("  load: unavailable(unsupported)\n"),
-    }
-    match &volume {
-        Some(v) => {
-            let _ = writeln!(
-                s,
-                "  your home's volume ({}, {}): {} free of {}",
-                v.mount.display(),
-                v.fs,
-                size_word(v.available),
-                size_word(v.total)
-            );
-        }
-        None => s.push_str("  your home's volume: unreadable\n"),
-    }
-    s.push_str("\nWHAT THIS MACHINE CAN SAY (asked now: yes, estimate, or unavailable(<why>))\n");
-    let rows = aterm_sysprobe::caps().rows();
-    let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
-    for (name, word) in rows {
-        let _ = writeln!(s, "  {name:<width$}  {word}");
-    }
-    s.push_str(SYS_CAPS_NOTE);
-    s.push_str(SYS_PAGE_COVERAGE);
-    s.push_str(SYS_PAGE_BODY);
-    s
-}
-
-/// A byte count as `aterm help sys` prints it: binary units, one decimal.
-fn size_word(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut v = bytes as f64;
-    let mut unit = 0;
-    while v >= 1024.0 && unit + 1 < UNITS.len() {
-        v /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{v:.1} {}", UNITS[unit])
-    }
-}
-
-/// Where `sys` reads a figure through the window's own probe rather than
-/// the reader a row above names.
-#[cfg(target_os = "macos")]
-const SYS_CAPS_NOTE: &str = "  (throttle: the row is the counter reader's; `sys` reads macOS's thermal state\n  and Low Power Mode from ProcessInfo instead, as `sys global` prints)\n";
-
-/// Where `sys` reads a figure through the window's own probe rather than
-/// the reader a row above names.
-#[cfg(not(target_os = "macos"))]
-const SYS_CAPS_NOTE: &str = "";
-
-/// What this build measures on the OS the page runs on, and what it cannot.
-#[cfg(target_os = "macos")]
-const SYS_PAGE_COVERAGE: &str = r#"
-WHAT THIS OS MEASURES (macOS)
-  CPU per core and per cluster (host_processor_info, clusters from hw.perflevelN
-  and the device tree); memory by page class, the compressor, swap, the kernel's
-  pressure level and its paging counters; the GPU's device-wide busy percent and
-  memory in use (IORegistry), and each process's GPU time, every user's, from the
-  GPU's user clients (`sys gpu`, `gpu_ppm=`); the thermal state and Low Power
-  Mode; every process you own: CPU time, time waiting to run, footprint and its
-  peak, bytes written (libproc); each volume's free space (statfs); your tabs'
-  folders' sizes (`sys disk`, from a background walk); each job in your tabs
-  (`sys jobs`): its class, the wait it is in, how long it has been quiet and
-  whether it still makes progress, from its file descriptors, sockets and kqueue.
-
-WHAT IT CANNOT MEASURE HERE
-  - which core a process runs on: macOS does not say. `sys cores` shows each
-    scope's SHARE of each cluster, never placement.
-  - CPU frequency (delivered or requested): read as unavailable.
-  - GPU use per core: one device-wide figure.
-  - other users' processes one by one: "services" is the machine's CPU minus
-    what aterm reads (by subtraction), and a negative residual is printed signed;
-    `sys why` reads them per coalition.
-  - the size of a folder it does not walk (protected, another user's, remote,
-    removable, too broad): unavailable(<why>), never zero.
-"#;
-
-/// What this build measures on the OS the page runs on, and what it cannot.
-#[cfg(target_os = "linux")]
-const SYS_PAGE_COVERAGE: &str = r#"
-WHAT THIS OS MEASURES (Linux)
-  CPU per core (/proc/stat), grouped by performance level where the kernel
-  names one (cpu_core/cpu_atom PMUs, or cpu_capacity with one level per core
-  design and top clock); memory classes, swap and the commit charge
-  (/proc/meminfo); pressure from PSI where it is enabled; the GPU's
-  busy percent where its driver says (amdgpu's sysfs file, NVIDIA's NVML; a
-  sleeping card reads idle without being woken, and a laptop's runtime-managed
-  dGPU is not read); thermal throttling from trip points and throttle
-  counters; processes from /proc; each volume's free space (statvfs); your tabs'
-  folders' sizes (`sys disk`, from a background walk); each job in your tabs
-  (`sys jobs`), from /proc's wait channels and fdinfo.
-
-WHAT IT CANNOT MEASURE HERE
-  - the classes do not partition RAM: `sys mem` names the rest "no class", and
-    the commit limit is advisory under overcommit.
-  - an Intel GPU's busy percent (i915, xe): only with CAP_PERFMON, which aterm
-    never asks for, so it reads unavailable(needs_privilege:cap_perfmon).
-  - paging rates, a process's time waiting to run, its peak footprint and the
-    bytes it wrote: unavailable(not_sampled) or absent.
-  - which core a process runs on: `sys cores` shows each scope's SHARE.
-  - the size of a folder it does not walk (protected, another user's, remote,
-    removable, too broad): unavailable(<why>), never zero.
-"#;
-
-/// What this build measures on the OS the page runs on, and what it cannot.
-#[cfg(windows)]
-const SYS_PAGE_COVERAGE: &str = r#"
-WHAT THIS OS MEASURES (Windows)
-  CPU per core, grouped by CPU Sets' efficiency class; memory in use, the
-  kernel's pools, the standby cache, the page files, and the commit charge
-  against its enforced limit (with the low-memory notification as pressure);
-  every process in one system call (CPU time and private commit); each fixed
-  drive's free space.
-
-WHAT IT CANNOT MEASURE HERE
-  - the GPU (its engine counters are not read), the thermal level and the
-    compression store: unavailable, never zero.
-  - jobs (`sys jobs`): the stuck engine reads no Windows process in this build.
-  - process groups, terminals, paging rates, time waiting to run and bytes
-    written: Windows has no such process facts here.
-  - ownership outside aterm: those process rows say scope=unknown, and the
-    own-processes/services split reads unavailable(not_sampled).
-  - which core a process runs on: `sys cores` shows each scope's SHARE.
-  - folder sizes: no disk walker runs on Windows; they read unavailable, never
-    zero.
-"#;
-
-/// What this build measures on the OS the page runs on, and what it cannot.
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-const SYS_PAGE_COVERAGE: &str = r#"
-WHAT THIS OS MEASURES
-  No machine reader ships for this OS in this build: `aterm ctl sys` answers,
-  and every figure reads unavailable(unsupported), never zero.
-"#;
-
-/// The part of `aterm help sys` that does not depend on the machine.
-const SYS_PAGE_BODY: &str = r#"
-SCOPES
-  tab      this tab: its shell and every process under it
-  aterm    every process of this aterm instance: all tabs, aterm itself, its helpers
-  global   the machine
-  `sys global` splits the machine's CPU into tab + the rest of aterm + your other
-  processes + services (+ unaccounted); the parts sum to the whole. `2.3c` is 2.3
-  cores' worth of CPU time per second. `≥` and `≤` mark bounds (a process refused
-  a read); `unavailable(<why>)` is never zero (`unsupported`, `not_sampled`,
-  `refused`, `warming`, `lane_off:…`).
-  A reader that cannot establish ownership keeps the measured process figures
-  with scope=unknown and withholds the own-processes/services split.
-
-READ — `aterm ctl @self sys [<view>] [--json] [since=<cursor>]`
-  aterm ctl @self sys               one sentence per scope (overview)
-  aterm ctl @self sys tab --json    this tab, for parsing (schema 1, kind sys.tab)
-  aterm ctl @self sys cores         use per core, grouped by cluster
-  aterm ctl @self sys mem           memory, compressor, swap, pressure, who holds it
-  aterm ctl @self sys disk          this tab's folders' volumes, and who writes
-  aterm ctl @self sys net           network interfaces, rates, and TCP socket states
-  aterm ctl @self sys procs         this tab's processes, busiest first
-  aterm ctl @self sys jobs          this tab's commands and agent calls: whether
-                                    each still makes progress (fine, quiet, busy,
-                                    slow, stuck, never-returns, waiting-you,
-                                    parked, exited) and the wait it is in; once
-                                    one ends, `aterm ctl telemetry` keeps its row
-                                    (`aterm help telemetry`)
-  aterm ctl @self sys left          what this tab and its verify runs left
-                                    running, and what macOS's program check
-                                    holds, each with its proof and tier;
-                                    scope=aterm lists every tab's (owner only)
-  aterm ctl end <token>...          end each row named by its end= token,
-                                    re-proven before every signal (no all, no
-                                    pattern, no bare pid; a held row has none)
-  aterm ctl @self sys since=<c>     only what changed since the reply that printed
-                                    next=<c>, plus the events since (pressure,
-                                    thermal, swap, disk, load, tab, orphan,
-                                    lane, job)
-  Views: overview tab aterm global jobs cores gpu mem disk net procs why report
-  left;
-  options scope=, top=, fresh=<ms>, depth=; `instances=all` asks every aterm here,
-  each reply in turn. The header (stderr) carries as_of=, age_ms=, window_ms= and
-  next=. `aterm ctl help sys` is the full grammar.
-
-WHY — `aterm ctl @self sys why [cpu|mem] [top=<n>] [--json]`
-  aterm ctl @self sys why           who uses what deviates most, and why: the
-                                    CPU, memory, or (calm) one sentence and you
-  aterm ctl @self sys why cpu       the CPU: split, you, who, cause, pass, do
-  aterm ctl @self sys why mem       memory: classes, you, owners, who
-  The CPU splits per resource coalition (macOS) into tab + aterm_rest + others +
-  services + unaccounted; `who` rows are coalitions, busiest first (memory: by
-  footprint), each its lead's pid=, birth_ms=, exe= and voucher= (apple,
-  app_store, development, enterprise, developer_id, ad_hoc, unsigned, unknown);
-  `more` and `withheld` sum the rows left out. you role= is main, part, minor,
-  none or unavailable(<why>). Causes: spotlight, tab-work, aterm-work, app-work,
-  unexplained, and the contexts startup, wake, pressure, throttled. spotlight is
-  the work of Apple-signed com.apple.mds, com.apple.mds_stores,
-  com.apple.mdworker_shared and com.apple.corespotlightd, mostly deferred. src=
-  says where a fact comes from: kernel, signature (the code signature) or
-  derived. cannot what= names a limit: index_progress, index_folder,
-  wired_by_process, uncharged_memory, coalitions (no coalition lane: Linux,
-  Windows, or macOS's self-check missed; the split is then by subtraction and no
-  who row prints), coalition_list (truncated), finished_tab_work, remedy. A
-  caller that is not owner-class sees only the coalitions wholly in the target's
-  tab, never aterm's; the rest sum on withheld. Past 2,048 bytes a text reply
-  moves rows into more unless top= is given (--json is cut by top= alone; the
-  events a since= reply carries are never cut). `sys global`, `sys aterm` and
-  the `rest` line still split by subtraction over each reading's own window
-  (1 s with the bars in view), not `sys why`'s, so their parts can differ. A
-  previous aterm's coalition with no live tab shell counts in others. A calm
-  reply needs pressure, swap rates and the thermal state read: where one is
-  not (Windows; Linux without PSI or a thermal reading) a bare why names the
-  CPU or memory instead.
-
-WAIT — `aterm ctl @self await sys <condition> [for=<dur>] [timeout=<ms>]`
-  aterm ctl @self await sys quiet for=20s timeout=600000
-  aterm ctl @self await sys 'cpu<30%' and mem=normal timeout=600000
-  aterm ctl @self await sys 'free>50GB' timeout=600000
-  aterm ctl @self await sys 'free<68GiB' vol=/System/Volumes/Data timeout=600000
-  aterm ctl @self await sys job=a40977 done,stuck timeout=600000
-  aterm ctl @self await sys 'slots>=1' and 'avail>=8GiB' for=20m timeout=600000
-  Terms: cpu, cpu.<cluster>, aterm, tab, wait, gpu, mem (normal|warn|critical),
-  swap, decompress, thrash, tab.mem, aterm.mem, thermal (the OS's level,
-  nominal|fair|serious|critical; Linux's estimate none|light|heavy|severe ranks
-  alike), jobs.stuck, jobs.quiet, jobs.running, load (1-minute load per core),
-  cores_idle (cores less the 5-minute load), avail (memory free without
-  paging), slots (build slots proven free); job=<id> or task=<id> then
-  verdicts (done is exited) or class=<classes>; free/disk= alone wait on a
-  volume. Quote a term with < or > (`'cpu<30%'`): the shell reads them as
-  redirections. It answers `OK sys …` with the reading that met it, or
-  `OK timeout` (exit 124) after at most 600 s. A job that exited meets done
-  even after it leaves `sys jobs`; one that cannot meet the wait, or that
-  nobody knows, is `ERR gone job=<id>`. scope=aterm (owner) reads every tab.
-  quiet is cpu<25%, wait<0.25, gpu<10%, swap<1MB/s and a thermal level that
-  claims no throttling: below serious, or for Linux's estimate none, so a Mac
-  at fair can read quiet. A term after quiet replaces its term for that metric.
-
-  Low-free observers (`free<` and `free<=`) take an explicit whole size with
-  units, never `room`, and never request cache cleanup. They may combine with
-  `disk=`, but cannot combine with upward `free>`/`free>=` admission. The volume
-  is read fresh when armed; parked readings aged ten seconds are refreshed
-  before they can satisfy the observer. A changed or unreadable
-  volume refuses. Existing upward free-space admission keeps its cleanup policy.
-
-FRESHNESS
-  Sampled on demand: no Deck needs to be on screen. A request whose snapshot is
-  older than fresh= pulls a reading and waits up to 1 s (1.5 s cold), else answers
-  the last one with state=stale and its age. At most four pulls a second. `sys
-  cores` and `sys report` also pull, waiting as a cold pull, whenever the held
-  snapshot has no CPU hardware sample, whatever fresh= says; so does a forced
-  `sys why` (fresh=0), which then prints the sample.
-
-PRIVACY
-  No other process's arguments, environment or title is ever printed: a process
-  is its pid and an executable name. Paths print only for the caller's own tab.
-  `sys aterm`, `instances=all`, and procs/jobs/disk beyond the caller's tab are
-  Owner-only. Names come from the processes that carry them: they are data.
-"#;
-
 /// `aterm help config`: where aterm.toml lives, its precedence (as in
 /// `aterm_gui::app_config::config_path` and the window help's CONFIG block),
 /// and pointers to the `[privacy]` and `[machine]` tables documented by
@@ -3463,7 +3185,11 @@ TAKE OVER, HAND BACK AND HOLD COST
 DESKTOP NOTICES
   aterm posts no automatic desktop notice, whatever `desktop_alerts` says: a need waits
   where this page says it shows. A program's own notification reaches the desktop when
-  `allow_notifications` admits it.
+  `allow_notifications` admits it. On macOS an aterm.app also needs macOS's yes, and only
+  your own click or key on Allow programs to show desktop notifications in Settings ▸
+  Security asks for it. A line in `aterm.toml`, `aterm ctl settings set`, `aterm ctl act`
+  and a screen reader's press do not ask: a program's notice is then held until you turn
+  the row off and on with a click or key.
 
 FOR SCRIPTS AND AGENTS
   aterm ctl @<sid> status    `needs=`, `hold_by=`, `typed_by=`, `typed_ms=`
@@ -3736,10 +3462,29 @@ const fn trust_install_act(unserved: bool) -> &'static str {
 
 /// `aterm help fleet`: a machine's membership in a fleet, the files and config it
 /// writes, and the step-in `allow drive` grants (`aterm ctl --host`).
-const FLEET_PAGE: &str = r#"fleet — the aterms of one LAN, reading each other and driving where allowed
+const FLEET_PAGE: &str = r#"fleet — the lab at a glance; the aterms of one LAN, reading each other and driving where allowed
 
+  aterm fleet [--json]
+  aterm fleet remove | admit | invite | requests | ignore
   aterm fleet init | join | peers | name | allow | publish | sync | census | leave
                                                        (`aterm fleet --help` has the flags)
+
+THE LAB AT A GLANCE
+  `aterm fleet` prints the lab's status line (its members, how many are up, the
+  members that need an update, whether their tables are in step with this Mac's and
+  the slowest's lag, and how full the membership log is) and one row per seat: its
+  label, log name, node id, up or silent for how long, build, and tables. It reads
+  only this Mac's own copy: the node service's presence view, the membership log and
+  the book's signed entries. It dials no Mac and starts nothing; where no node serves
+  presence it says so and reads no one up. `--json` gives one object. `aterm status`'s
+  fleet line is this Mac's own row of it.
+  `remove`, `admit` (`aterm members allow`), `invite`, `requests` and `ignore` run the
+  same code as `aterm members`: `aterm fleet remove m12` signs what `aterm members
+  remove m12` signs, and both name the log name and node id they acted on. A node
+  id removes the one standing seat the acknowledged log binds to that node key,
+  with no registry read; a registry label removes the seat the registry and the
+  signed seats agree on, and is refused where they do not; a name or join code is
+  read from the log.
 
 WHAT IT IS
   A FLEET links the aterms on a LAN that share a fleet secret and prove per-machine
@@ -5202,7 +4947,8 @@ fn agent_page(sid: Option<&str>) -> String {
              \x20               ls: every session, with its window= and detail= (the program it is\n  \
              \x20               running; * marks you). Then drive any peer with @<its-sid>.\n  \
              See the machine: aterm ctl @{id} sys — this tab, aterm and the machine\n  \
-             \x20               (cores, GPU, memory, disk); `await sys <condition>` waits for a state.",
+             \x20               (cores, GPU, memory, disk); `await sys <condition>` waits for a state\n  \
+             \x20               (`aterm help sys` is the reference).",
         );
     }
     s.push_str(
@@ -5288,24 +5034,19 @@ fn agent_page(sid: Option<&str>) -> String {
          `aterm ctl @self await sys 'free>=room' timeout=600000` (or `'free>=<size>'`, units\n  \
          required) answers at once when that much is free; otherwise aterm frees build caches\n  \
          nobody is using until it is, and the wait answers `OK sys …` (exit 0), `ERR unmet …`\n  \
-         (exit 1: what is left is not aterm's to free; `aterm harness disk` names the largest\n  \
-         holders), or exits 124 (still short: run it again). `ERR unavailable … why=no-watch`:\n  \
-         this aterm's harness is off, so nothing frees space for you. `why=watch-stalled`:\n  \
-         aterm's disk watch has made no progress for two minutes, so nothing frees space for\n  \
-         you now. `timeout=` goes up to 600000; a tool that ends commands sooner needs a\n  \
-         shorter one. aterm removes only build caches no build holds and no process uses,\n  \
-         never source, and records each removal in `aterm harness ledger disk`. A build\n  \
-         directory you delete by hand may be one another session's build is using.\n  \
-         Measure `aterm ctl @self sys disk` before and after cleanup on the same volume.\n  \
-         Directory sizes and counted removals can share storage; compare `free_bytes` and\n  \
-         report the net change separately, since other sessions can write or remove data.\n",
+         (exit 1: what is left is not aterm's to free), `ERR unavailable …` (nothing frees space\n  \
+         for you now), or exits 124 (still short: run it again); `aterm help sys wait` has\n  \
+         every reply. `timeout=` goes up to 600000; a tool that ends commands sooner needs a\n  \
+         shorter one. A build directory you delete by hand may be one another session's build\n  \
+         is using. Measure `aterm ctl @self sys disk` before and after cleanup on the same\n  \
+         volume, and report the net change in `free_bytes`.\n",
     );
     s.push_str(
         "\nLEFTOVERS (what your tab and its verify runs left running)\n  \
          `aterm ctl @self sys left` lists them and what macOS's program check holds, each with\n  \
          its proof; `aterm ctl end <token>` ends one row, re-proven first. Never pkill.\n  \
          `aterm ctl @self status`'s `left=<n>:<oldest_ms>` counts the ones you started, each\n  \
-         marked `left_of=<your sid>` there.\n",
+         marked `left_of=<your sid>` there (`aterm help sys left`).\n",
     );
     if cfg!(target_os = "macos") {
         push_macos_walls(&mut s);
@@ -5670,10 +5411,28 @@ fn init_page() -> String {
     )
 }
 
-/// Render the manual: `topic` is the optional `help <topic>` argument, `session` the caller's
-/// sid inside an aterm session ([`in_session`]); every page ends its last line.
-pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
-    let (mut page, code) = render_page(topic.map(page_of), session);
+/// Render the manual: `topic` is the optional `help <topic>` argument, `section` the optional
+/// word after it, `session` the caller's sid inside an aterm session ([`in_session`]). A section
+/// opens that part of a page that has them (`aterm help sys why`); a word it has none of answers
+/// the page's list of sections (exit 2), and a section word on a page without sections exits 2.
+/// Every page ends its last line.
+pub fn render(topic: Option<&str>, section: Option<&str>, session: Option<&str>) -> (String, i32) {
+    let topic = topic.map(page_of);
+    let (mut page, code) = match (topic, section) {
+        (_, None) | (None, Some(_)) => render_page(topic, session),
+        (Some("sys"), Some(word)) => sys_page::section(word)
+            .map_or_else(|| (sys_page::unknown_section(word), 2), |text| (text, 0)),
+        (Some(name), Some(word)) => match render_page(Some(name), session) {
+            (_, 0) => (
+                format!(
+                    "aterm help: `{name}` has no sections, so '{word}' names none; \
+                     `aterm help {name}` is the whole page\n"
+                ),
+                2,
+            ),
+            refused => refused,
+        },
+    };
     if !page.ends_with('\n') {
         page.push('\n');
     }
@@ -5694,7 +5453,7 @@ fn render_page(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
         Some("topics") | Some("index") => (overview_page(), 0),
         Some("introspection") => (introspection_page(), 0),
         Some("rust") => (rust_page(), 0),
-        Some("sys") => (sys_page(), 0),
+        Some("sys") => (sys_page::page(), 0),
         Some("theme") => (theme_page(), 0),
         Some("agh") => (agh::cli::help::manual(), 0),
         Some("config") => (CONFIG_PAGE.to_string(), 0),
@@ -5742,42 +5501,23 @@ fn render_page(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
 mod tests {
     use super::*;
 
-    /// `aterm help sys` is built at the call: it names this machine's OS and
-    /// core count as the sampler's readers see them now, says what this OS
-    /// cannot measure, and claims no surface this build does not sample.
+    /// `aterm help <topic> <section>` opens a section of a page that has them (`sys`), refuses
+    /// a word that names none with the page's list, and refuses any second word on a page that
+    /// has no sections, or on an unknown topic as that topic.
     #[test]
-    fn the_sys_page_reads_this_machine_at_the_call() {
-        let (page, code) = render(Some("sys"), None);
+    fn a_section_word_opens_that_section_or_is_refused() {
+        let (page, code) = render(Some("sys"), Some("wait"), None);
         assert_eq!(code, 0);
-        assert!(page.starts_with("aterm help sys — "), "{page}");
-        let cores = aterm_sysprobe::cpu_layout().logical_cores();
-        assert!(page.contains(&format!(" {cores} cores: ")), "{page}");
-        if let Some(os) = aterm_sysprobe::machine_words().os {
-            assert!(page.contains(&os), "{page}");
-        }
-        for heading in [
-            "THIS MACHINE (read now)",
-            "WHAT THIS MACHINE CAN SAY",
-            "WHAT THIS OS MEASURES",
-            "SCOPES",
-            "READ",
-            "WHY",
-            "WAIT",
-            "PRIVACY",
-        ] {
-            assert!(page.contains(heading), "{heading}: {page}");
-        }
-        assert!(
-            page.contains("unavailable(not_sampled)") || page.contains("unavailable(unsupported)")
-        );
-        assert!(page.contains("sys jobs"), "{page}");
-        // Every capability row the readers measure here is on the page.
-        for (name, word) in aterm_sysprobe::caps().rows() {
-            assert!(page.contains(&format!("  {name} ")), "{name}: {page}");
-            assert!(page.contains(&word), "{name}={word}: {page}");
-        }
-        assert_eq!(size_word(512), "512 B");
-        assert_eq!(size_word(3 << 30), "3.0 GiB");
+        assert!(page.starts_with("aterm help sys wait — "), "{page}");
+        let (msg, code) = render(Some("sys"), Some("bogus"), None);
+        assert_eq!(code, 2);
+        assert!(msg.contains("aterm help sys: no section 'bogus'"), "{msg}");
+        let (msg, code) = render(Some("telemetry"), Some("rows"), None);
+        assert_eq!(code, 2);
+        assert!(msg.contains("no sections"), "{msg}");
+        let (msg, code) = render(Some("bogus"), Some("x"), None);
+        assert_eq!(code, 2);
+        assert!(msg.contains("unknown topic 'bogus'"), "{msg}");
     }
 
     /// `aterm help themes` (and the colour words) is the theme page, and its
@@ -5786,10 +5526,14 @@ mod tests {
     #[test]
     fn the_themes_page_lists_every_key_the_parser_reads() {
         use aterm_types::scheme::THEME_KEYS;
-        let (page, code) = render(Some("theme"), None);
+        let (page, code) = render(Some("theme"), None, None);
         assert_eq!(code, 0);
         for alias in ["themes", "colors", "colours", "color-scheme"] {
-            assert_eq!(render(Some(alias), None), (page.clone(), 0), "{alias}");
+            assert_eq!(
+                render(Some(alias), None, None),
+                (page.clone(), 0),
+                "{alias}"
+            );
         }
         // The list is the run of key lines under THE FORMAT, grouped under a
         // `  <group>:` line wherever the table's group changes.
@@ -5837,7 +5581,7 @@ mod tests {
     #[test]
     fn every_front_door_verb_resolves() {
         for v in crate::Verb::ALL {
-            let (page, code) = render(Some(v.name()), None);
+            let (page, code) = render(Some(v.name()), None, None);
             assert_eq!(code, 0, "`aterm help {}` exits {code}", v.name());
             assert!(
                 !page.contains("unknown topic"),
@@ -5847,7 +5591,7 @@ mod tests {
             assert!(page.len() > 200, "`aterm help {}` is a stub", v.name());
         }
         for (name, _) in crate::DIAG_COMMANDS {
-            let (page, code) = render(Some(name), None);
+            let (page, code) = render(Some(name), None, None);
             assert_eq!(code, 0, "`aterm help {name}` exits {code}");
             assert!(!page.contains("unknown topic"), "`aterm help {name}` 404s");
             assert!(page.contains(name), "`aterm help {name}` never says {name}");
@@ -5873,7 +5617,7 @@ mod tests {
     #[test]
     fn every_topic_renders() {
         for name in topic_names() {
-            let (page, code) = render(Some(name), None);
+            let (page, code) = render(Some(name), None, None);
             assert_eq!(code, 0, "topic {name} should render 0");
             assert!(!page.trim().is_empty(), "topic {name} rendered empty");
             assert!(
@@ -6551,7 +6295,7 @@ mod tests {
     fn page_never_runs_a_pending_targo() {
         const CHILD: &str = "ATERM_TEST_HELP_RUST_PENDING_CHILD";
         if let Some(out) = std::env::var_os(CHILD) {
-            let (page, code) = render(Some("rust"), None);
+            let (page, code) = render(Some("rust"), None, None);
             assert_eq!(code, 0);
             std::fs::write(out, page).expect("write the page");
             return;
@@ -6631,7 +6375,7 @@ mod tests {
             "the usage line and five forms: {help}"
         );
 
-        let (page, code) = render(Some("doctor"), None);
+        let (page, code) = render(Some("doctor"), None, None);
         assert_eq!(code, 0);
         assert!(page.contains(&help), "{page}");
         assert!(
@@ -6664,7 +6408,7 @@ mod tests {
             "the setup prose moved: {page}"
         );
 
-        let (setup, code) = render(Some("setup"), None);
+        let (setup, code) = render(Some("setup"), None, None);
         assert_eq!(code, 0);
         for kept in [
             "aterm doctor --check",
@@ -6683,9 +6427,9 @@ mod tests {
     /// A test binary reads no state; the table shows the states it is given (the control).
     #[test]
     fn help_privacy_is_the_permissions_page_and_it_opens_with_the_live_table() {
-        let (page, code) = render(Some("privacy"), None);
+        let (page, code) = render(Some("privacy"), None, None);
         assert_eq!(code, 0, "{page}");
-        assert_eq!(page, render(Some("permissions"), None).0);
+        assert_eq!(page, render(Some("permissions"), None, None).0);
         assert!(page.starts_with("permissions — "), "{page}");
         let head = &page[..page.find("\nDETAILS\n").expect("a DETAILS heading")];
         let table: Vec<&str> = head
@@ -6789,7 +6533,7 @@ mod tests {
     #[test]
     fn every_extra_page_dispatches() {
         for name in EXTRA_PAGES {
-            let (page, code) = render(Some(name), None);
+            let (page, code) = render(Some(name), None, None);
             assert_eq!(code, 0, "extra page {name} should render 0");
             assert!(!page.trim().is_empty(), "extra page {name} rendered empty");
             assert!(
@@ -6798,7 +6542,7 @@ mod tests {
                 page.lines().last()
             );
         }
-        let (front, code) = render(None, None);
+        let (front, code) = render(None, None, None);
         assert_eq!(code, 0);
         assert!(
             front.ends_with('\n'),
@@ -6826,7 +6570,7 @@ mod tests {
     }
     #[test]
     fn unknown_topic_is_a_usage_error_listing_topics() {
-        let (msg, code) = render(Some("nonesuch"), None);
+        let (msg, code) = render(Some("nonesuch"), None, None);
         assert_eq!(code, 2);
         assert!(msg.contains("unknown topic") && msg.contains("trust"));
         assert!(msg.ends_with('\n'), "{msg:?}");
@@ -6835,7 +6579,7 @@ mod tests {
     /// `aterm help fabric` answers to the words an agent types when it has mail.
     #[test]
     fn fabric_topic_answers_to_its_aliases() {
-        let (page, code) = render(Some("fabric"), None);
+        let (page, code) = render(Some("fabric"), None, None);
         assert_eq!(code, 0);
         for name in [
             "inbox",
@@ -6847,7 +6591,7 @@ mod tests {
             "messaging",
         ] {
             assert_eq!(
-                render(Some(name), None),
+                render(Some(name), None, None),
                 (page.clone(), 0),
                 "`aterm help {name}`"
             );
@@ -6858,11 +6602,11 @@ mod tests {
     /// credentials vault.
     #[test]
     fn the_secrets_page_answers_to_its_words() {
-        let (page, code) = render(Some("secrets"), None);
+        let (page, code) = render(Some("secrets"), None, None);
         assert_eq!(code, 0);
         for name in ["secret", "vault", "credentials"] {
             assert_eq!(
-                render(Some(name), None),
+                render(Some(name), None, None),
                 (page.clone(), 0),
                 "`aterm help {name}`"
             );
@@ -6873,11 +6617,11 @@ mod tests {
     /// the words a model types for it.
     #[test]
     fn the_workers_page_answers_to_its_words() {
-        let (page, code) = render(Some("workers"), None);
+        let (page, code) = render(Some("workers"), None, None);
         assert_eq!(code, 0);
         for name in ["worker", "survey", "result", "subagent", "subagents"] {
             assert_eq!(
-                render(Some(name), None),
+                render(Some(name), None, None),
                 (page.clone(), 0),
                 "`aterm help {name}`"
             );
@@ -6888,11 +6632,11 @@ mod tests {
     /// types for a need, stepping in and desktop notices.
     #[test]
     fn the_needs_page_answers_to_its_words() {
-        let (page, code) = render(Some("needs"), None);
+        let (page, code) = render(Some("needs"), None, None);
         assert_eq!(code, 0);
         for name in ["need", "take-over", "takeover", "hand-back", "notify"] {
             assert_eq!(
-                render(Some(name), None),
+                render(Some(name), None, None),
                 (page.clone(), 0),
                 "`aterm help {name}`"
             );

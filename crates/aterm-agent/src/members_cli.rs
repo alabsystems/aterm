@@ -10,6 +10,11 @@
 //! the default vault for an admin's approval, and starts the subscriber, which proves and asks
 //! again while it waits. An explicitly supplied phrase retains the manual join flow.
 //!
+//! The lab verbs (`requests`, `allow`, `invite`, `ignore`, `remove`) are `aterm fleet`'s too
+//! (`requests`, `admit`, `invite`, `ignore`, `remove`; one-mesh §4.16, B9): both front ends parse
+//! into one [`LabVerb`] ([`parse_lab`]) and run it with [`run_lab`], so each signs and asks
+//! exactly what the other does, in its own name.
+//!
 //! F16's verbs run in this process, on this Mac's own vault files: `list` prints the membership
 //! log's members and the Macs it removed, `remove` takes a member out as this Mac (any member,
 //! no admin), and `undo` lists the "Undo <label>'s removals" rows this Mac shows and where each
@@ -18,6 +23,7 @@
 //! script over SSH cannot give. On a vault with no membership log yet, `remove` says an admin's
 //! `aterm secrets revoke` is the way.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::Path;
@@ -97,6 +103,119 @@ fn join_place(state: &Path) -> join::JoinPlace {
     }
 }
 
+/// The front end a lab verb was typed at: its name in every line the verb says, and its usage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Front {
+    /// `aterm members`.
+    Members,
+    /// `aterm fleet` (one-mesh §4.16).
+    Fleet,
+}
+
+impl Front {
+    /// Its name, as each of its lines opens.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Members => "aterm members",
+            Self::Fleet => "aterm fleet",
+        }
+    }
+
+    /// Its usage.
+    fn usage(self) -> &'static str {
+        match self {
+            Self::Members => USAGE,
+            Self::Fleet => crate::fleet_member::USAGE,
+        }
+    }
+}
+
+/// One lab verb as either front end parsed it ([`parse_lab`]): what runs, the same for both.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LabVerb {
+    /// The Macs asking that this Mac hears (`requests`).
+    Requests,
+    /// The line this Mac's running window answers (`members allow|ignore|invite …`), and whether
+    /// it shows a phrase on this Mac's screen.
+    Window {
+        /// The request, one line.
+        request: String,
+        /// `allow` (`admit`) and `invite` show a phrase.
+        shows: bool,
+    },
+    /// Take a Mac out of the lab as this Mac (`remove`).
+    Remove(RemoveArgs),
+}
+
+/// Why a front end's words are no lab verb.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LabRefusal {
+    /// Not one of its lab verbs, or one given the wrong words: its usage, exit 2.
+    Usage,
+    /// The verb's own refusal of its words, said after the front end's name: exit 2.
+    Said(String),
+}
+
+/// `args` (the verb and its words) of `front` as a lab verb: `aterm members requests | allow
+/// [--again] <name> | invite | ignore <name> | remove <name> [--stolen]`, and `aterm fleet`'s
+/// same verbs, with `admit` for `allow` (`aterm fleet allow` is this Mac's own grant).
+pub(crate) fn parse_lab(front: Front, args: &[String]) -> Result<LabVerb, LabRefusal> {
+    let mut words = args.to_vec();
+    match (front, words.first().map(String::as_str)) {
+        (Front::Fleet, Some("admit")) => words[0] = "allow".to_owned(),
+        (Front::Fleet, Some("allow")) => return Err(LabRefusal::Usage),
+        _ => {}
+    }
+    match words.first().map(String::as_str) {
+        Some("requests") if words.len() == 1 => Ok(LabVerb::Requests),
+        Some("remove") => RemoveArgs::parse(&words[1..])
+            .map(LabVerb::Remove)
+            .map_err(|why| LabRefusal::Said(format!("remove: {why}"))),
+        Some(verb @ ("allow" | "ignore" | "invite")) => {
+            let shows = verb != "ignore";
+            window_request(&words)
+                .map(|request| LabVerb::Window { request, shows })
+                .map_err(|_| LabRefusal::Usage)
+        }
+        _ => Err(LabRefusal::Usage),
+    }
+}
+
+/// Run `verb` as `front`'s.
+pub(crate) fn run_lab(front: Front, verb: LabVerb) -> ExitCode {
+    match verb {
+        LabVerb::Requests => {
+            // The requests a member hears are the ones on its network: where this Mac is says
+            // why none come from a phone hotspot. On stderr, so the reply stays the wire's.
+            if let Some(header) = network_header() {
+                eprintln!("{header}");
+            }
+            aterm_ctl::main_entry(vec!["members".into(), "requests".into()])
+        }
+        LabVerb::Window { request, shows } => to_window(front, &request, shows),
+        LabVerb::Remove(remove) => in_vault(front, |paths| {
+            remove_said(paths, &remove, &|word| {
+                crate::fleet_member::removal_seat(paths, word)
+            })
+        }),
+    }
+}
+
+/// `args` of `front` parsed and run as a lab verb ([`parse_lab`], [`run_lab`]).
+pub(crate) fn lab_entry(front: Front, args: &[String]) -> ExitCode {
+    match parse_lab(front, args) {
+        Ok(verb) => run_lab(front, verb),
+        Err(LabRefusal::Usage) => {
+            eprintln!("{}", front.usage());
+            ExitCode::from(2)
+        }
+        Err(LabRefusal::Said(why)) => {
+            eprintln!("{} {why}", front.name());
+            ExitCode::from(2)
+        }
+    }
+}
+
 /// `aterm members …`: `argv[1..]` in, exit code out.
 pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
     let args: Vec<String> = argv
@@ -108,34 +227,13 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
             println!("{USAGE}");
             ExitCode::SUCCESS
         }
-        Some("requests") if args.len() == 1 => {
-            // The requests a member hears are the ones on its network: where this Mac is says
-            // why none come from a phone hotspot. On stderr, so the reply stays the wire's.
-            if let Some(header) = network_header() {
-                eprintln!("{header}");
-            }
-            aterm_ctl::main_entry(vec!["members".into(), "requests".into()])
+        Some("requests" | "allow" | "ignore" | "invite" | "remove") => {
+            lab_entry(Front::Members, &args)
         }
-        Some("allow" | "ignore") if args.len() == 2 && valid_window_target(&args[1]) => {
-            to_window(&args)
-        }
-        Some("allow")
-            if args.len() == 3 && args[1] == "--again" && valid_window_target(&args[2]) =>
-        {
-            to_window(&args)
-        }
-        Some("list") if args.len() == 1 => in_vault(list_said),
-        Some("remove") => match RemoveArgs::parse(&args[1..]) {
-            Ok(remove) => in_vault(|paths| remove_said(paths, &remove)),
-            Err(why) => {
-                eprintln!("aterm members remove: {why}");
-                ExitCode::from(2)
-            }
-        },
-        Some("undo") if args.len() <= 2 => {
-            in_vault(|paths| undo_said(paths, args.get(1).map(String::as_str)))
-        }
-        Some("invite") if args.len() == 1 => to_window(&args),
+        Some("list") if args.len() == 1 => in_vault(Front::Members, list_said),
+        Some("undo") if args.len() <= 2 => in_vault(Front::Members, |paths| {
+            undo_said(paths, args.get(1).map(String::as_str))
+        }),
         Some("join") => match JoinArgs::parse(&args[1..]) {
             Ok(join) => run_join(&join),
             Err(why) => {
@@ -153,7 +251,7 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
 
 /// `remove`'s arguments.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct RemoveArgs {
+pub(crate) struct RemoveArgs {
     who: String,
     stolen: bool,
 }
@@ -170,30 +268,47 @@ impl RemoveArgs {
             }
         }
         if out.who.is_empty() {
-            return Err("name the Mac to remove: its label, name or join code".to_owned());
+            return Err("name the Mac to remove: its node id, label, name or join code".to_owned());
         }
         Ok(out)
     }
 }
 
-/// Run one of F16's in-process verbs on this Mac's own vault files: its lines on stdout, or its
-/// refusal on stderr and exit 1.
-fn in_vault(verb: impl FnOnce(&Paths) -> Result<Vec<String>, String>) -> ExitCode {
+/// Run one of F16's in-process verbs on this Mac's own vault files: its lines on stdout (a
+/// closed pipe or a full disk said as every answer says them), or its refusal on stderr and
+/// exit 1, each in `front`'s name.
+fn in_vault(front: Front, verb: impl FnOnce(&Paths) -> Result<Vec<String>, String>) -> ExitCode {
     let said = Paths::live()
         .map_err(|error| error.to_string())
         .and_then(|paths| verb(&paths));
     match said {
         Ok(lines) => {
-            for line in lines {
-                println!("{line}");
-            }
-            ExitCode::SUCCESS
+            let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+            aterm_uds::stdout::answer_exit(front.name(), &text, 0)
         }
         Err(why) => {
-            eprintln!("aterm members: {why}");
+            eprintln!("{}: {why}", front.name());
             ExitCode::from(1)
         }
     }
+}
+
+/// Each current seat's host name and node id, by its log label: what a removal names besides
+/// the label it reports.
+fn seats_by_label(paths: &Paths) -> BTreeMap<String, (String, Option<String>)> {
+    let Ok(read) = client::load_acknowledged_and_ahead(paths) else {
+        return BTreeMap::new();
+    };
+    let Some(log) = read.acknowledged.log() else {
+        return BTreeMap::new();
+    };
+    crate::fleet_view::log_seats(log)
+        .into_iter()
+        .map(|seat| {
+            let node = seat.node_key.as_ref().map(crate::fleet_view::principal_of);
+            (seat.label, (seat.name, node))
+        })
+        .collect()
 }
 
 /// `list`'s lines: one per member, then one per Mac the log removed, then one per pair of
@@ -229,17 +344,52 @@ fn list_said(paths: &Paths) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// `remove`'s lines: what was removed and rotated, what the Mac could read, and on `--stolen`
-/// the one `NEEDS YOU:` line.
-fn remove_said(paths: &Paths, args: &RemoveArgs) -> Result<Vec<String>, String> {
-    let removal =
-        client::remove_member(paths, &args.who, args.stolen).map_err(|error| error.to_string())?;
+/// What a person's removal resolves its word to ([`crate::fleet_member::removal_seat`], live):
+/// the seat B2's resolver names, `None` for a word the removal resolves by itself, or the
+/// resolver's refusal.
+pub(crate) type SeatOf<'a> =
+    &'a dyn Fn(&str) -> Result<Option<crate::fleet_member::RemovalSeat>, String>;
+
+/// `remove`'s lines: what was removed and rotated, the log name and node id it acted on (§4.16),
+/// what the Mac could read, and on `--stolen` the one `NEEDS YOU:` line. Where `seat_of` names a
+/// seat (live: for a node id or a registry label, B12) that seat is removed
+/// ([`client::remove_seat`]), and where it refuses nothing is signed; any other word is resolved
+/// by [`client::remove_member`].
+pub(crate) fn remove_said(
+    paths: &Paths,
+    args: &RemoveArgs,
+    seat_of: SeatOf<'_>,
+) -> Result<Vec<String>, String> {
+    let (removal, acted_on) = match seat_of(&args.who)? {
+        Some(seat) => (
+            client::remove_seat(paths, seat.actor, args.stolen),
+            Some((seat.name, Some(seat.node))),
+        ),
+        None => {
+            // Read before the removal: the seat is gone once its `Remove` stands.
+            let mut seats = seats_by_label(paths);
+            let removal = client::remove_member(paths, &args.who, args.stolen);
+            let acted_on = removal
+                .as_ref()
+                .ok()
+                .and_then(|removal| seats.remove(&removal.label));
+            (removal, acted_on)
+        }
+    };
+    let removal = removal.map_err(|error| error.to_string())?;
     let mut lines = vec![format!(
         "removed {}: {} records, new keys for {}",
         removal.label,
         removal.signed,
         removal.rotated.join(", ")
     )];
+    if let Some((name, node)) = acted_on {
+        lines.push(format!(
+            "{} was {name}, node {}",
+            removal.label,
+            node.as_deref().unwrap_or("- (it bound no node key)")
+        ));
+    }
     if !removal.could_read.is_empty() {
         lines.push(format!(
             "{} could read: {}",
@@ -319,17 +469,14 @@ fn window_request(args: &[String]) -> Result<String, &'static str> {
     }
 }
 
-/// A member's verb, sent to this Mac's running window, which answers one line. `allow` and
-/// `invite` with no window (SSH alone, no login) refuse as §3.3.5 says.
-fn to_window(args: &[String]) -> ExitCode {
-    let Ok(request) = window_request(args) else {
-        eprintln!("{USAGE}");
-        return ExitCode::from(2);
-    };
-    let shows = matches!(args[0].as_str(), "allow" | "invite");
+/// A member's verb, the line `request`, sent to this Mac's running window, which answers one
+/// line. A verb that `shows` a phrase (`allow`, `invite`) with no window (SSH alone, no login)
+/// refuses as §3.3.5 says.
+fn to_window(front: Front, request: &str, shows: bool) -> ExitCode {
+    let front = front.name();
     let Some(sock) = aterm_ctl::front_door_instance() else {
         eprintln!(
-            "aterm members: {}",
+            "{front}: {}",
             if shows {
                 "press Allow on a Mac with a screen"
             } else {
@@ -338,24 +485,23 @@ fn to_window(args: &[String]) -> ExitCode {
         );
         return ExitCode::from(1);
     };
-    match aterm_ctl::front_door_send(&sock, &request) {
+    match aterm_ctl::front_door_send(&sock, request) {
         Ok(reply) => match reply.strip_prefix("OK ") {
             Some(said) => {
-                println!("{said}");
-                ExitCode::SUCCESS
+                let mut said = said.to_owned();
+                if !said.ends_with('\n') {
+                    said.push('\n');
+                }
+                aterm_uds::stdout::answer_exit(front, &said, 0)
             }
             None => {
                 let why = reply.strip_prefix("ERR ").unwrap_or(&reply);
-                eprintln!(
-                    "aterm {}",
-                    why.strip_prefix("members: ")
-                        .map_or(why.to_owned(), |why| format!("members: {why}"))
-                );
+                eprintln!("{front}: {}", why.strip_prefix("members: ").unwrap_or(why));
                 ExitCode::from(1)
             }
         },
         Err(error) => {
-            eprintln!("aterm members: this Mac's window did not answer: {error}");
+            eprintln!("{front}: this Mac's window did not answer: {error}");
             ExitCode::from(1)
         }
     }
@@ -3170,7 +3316,7 @@ mod tests {
         let mac = me(root.path(), "j");
         let config = mac.paths.home.join(".config/aterm");
         std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(config.join("aterm.toml"), "[swarm]\nenabled = false\n").unwrap();
+        crate::test_config::write(config.join("aterm.toml"), "[swarm]\nenabled = false\n").unwrap();
         let ((code, said), dials) = with_member(&m1, |dial| {
             let reach = Reach {
                 browse: &|| Ok(vec![M1.to_owned()]),
@@ -3523,6 +3669,102 @@ mod tests {
         );
         assert!(lines[1].contains("this Mac signed its share"), "{lines:?}");
         assert_eq!(undo_lines(&offers, Some("M12-CODE")).len(), 1);
+    }
+
+    /// The kinds of the records `paths`' log holds that `before` does not, in order of kind.
+    fn signed_since(
+        paths: &Paths,
+        before: &std::collections::BTreeSet<aterm_secrets::membership_log::RecordId>,
+    ) -> Vec<aterm_secrets::membership_log::Kind> {
+        let store = client::load_records(paths).expect("records");
+        let mut kinds: Vec<_> = store
+            .log()
+            .expect("a log")
+            .records()
+            .filter(|record| !before.contains(record.id()))
+            .map(aterm_secrets::membership_log::Record::kind)
+            .collect();
+        kinds.sort_unstable();
+        kinds
+    }
+
+    /// `aterm fleet remove` and `aterm members remove` are one verb (one-mesh §4.16): each front
+    /// parses to the same removal, which signs the same records into a like vault and says the
+    /// same lines, the log name and node id it acted on among them.
+    ///
+    /// NEGATIVE CONTROL: in `parse_lab`, set `stolen` on the fleet front's `remove`: its removal
+    /// says the `NEEDS YOU:` line and the two no longer compare equal.
+    #[test]
+    fn fleet_remove_and_members_remove_sign_the_same_records() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let words = ["remove".to_owned(), "member".to_owned()];
+        let mut removals = Vec::new();
+        for (front, dir) in [(Front::Members, "members"), (Front::Fleet, "fleet")] {
+            let Ok(LabVerb::Remove(remove)) = parse_lab(front, &words) else {
+                panic!("{} remove member is a removal", front.name());
+            };
+            let fixture =
+                client::test_commons_excluded(&root.path().join(dir)).expect("a vault and member");
+            let before = client::load_records(&fixture.admin)
+                .expect("records")
+                .inventory();
+            // `member` is no node id or registry label: the removal resolves it by word.
+            let said =
+                remove_said(&fixture.admin, &remove, &|_| Ok(None)).expect("the admin removes it");
+            let signed = signed_since(&fixture.admin, &before);
+            fixture.server.stop();
+            removals.push((remove, said, signed));
+        }
+        assert_eq!(removals[0], removals[1]);
+        let (_, said, signed) = &removals[0];
+        assert!(
+            signed.contains(&aterm_secrets::membership_log::Kind::Remove),
+            "{signed:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|line| line.ends_with("was member, node - (it bound no node key)")),
+            "{said:?}"
+        );
+    }
+
+    /// Both front ends read the same lab verbs; `aterm fleet` says `admit` where `aterm members`
+    /// says `allow`, since `aterm fleet allow` is this Mac's own drive grant.
+    #[test]
+    fn both_fronts_read_the_same_lab_verbs() {
+        let words = |text: &str| -> Vec<String> { text.split(' ').map(str::to_owned).collect() };
+        for (members, fleet) in [
+            ("requests", "requests"),
+            ("invite", "invite"),
+            ("ignore m12", "ignore m12"),
+            ("allow m12", "admit m12"),
+            ("allow --again m12", "admit --again m12"),
+            ("remove m12", "remove m12"),
+            ("remove --stolen m12", "remove --stolen m12"),
+        ] {
+            let (m, f) = (
+                parse_lab(Front::Members, &words(members)),
+                parse_lab(Front::Fleet, &words(fleet)),
+            );
+            assert!(m.is_ok(), "{members}: {m:?}");
+            assert_eq!(m, f, "{members} / {fleet}");
+        }
+        assert_eq!(
+            parse_lab(Front::Fleet, &words("allow m12")),
+            Err(LabRefusal::Usage)
+        );
+        assert_eq!(
+            parse_lab(Front::Members, &words("admit m12")),
+            Err(LabRefusal::Usage)
+        );
+        assert_eq!(
+            parse_lab(Front::Fleet, &words("requests now")),
+            Err(LabRefusal::Usage)
+        );
+        assert!(matches!(
+            parse_lab(Front::Fleet, &words("remove")),
+            Err(LabRefusal::Said(_))
+        ));
     }
 
     /// `members remove` names one Mac, with `--stolen` anywhere; no Mac, two, or another flag

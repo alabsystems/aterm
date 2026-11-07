@@ -304,7 +304,7 @@ fn a_trusted_disk_worker_folder_makes_a_disk_worker() {
 /// A BOX UNDER LAND READS BACK AS WRITTEN: its facts carry the priority `land` (and a person's
 /// input since the loop's text) and decode as written; facts from before the person fact read
 /// it as none. NEGATIVE CONTROL: a priority no build writes is refused. MUTANT: the decode
-/// reading only the three words a person sets (`QuestionPriority::parse`).
+/// reading only the three words a person sets (`PriorityWord::parse`).
 #[test]
 fn facts_under_land_read_back_as_written() {
     let mut facts = every_fact();

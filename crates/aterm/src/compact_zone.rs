@@ -7,8 +7,9 @@
 //! type/size buckets, faulting ~14–15 MiB of empty `Malloc Small` pages across an 18-core Mac
 //! even when `aterm`'s entire live Rust heap is ~3 MiB. `CompactZoneAlloc` serves small layouts
 //! (`<= 4 KiB`) from lock-free per-thread magazines backed by shared `os_unfair_lock`-protected
-//! `16 KiB` slabs that `munmap` emptied slabs back to XNU, and serves larger layouts (`<= 512 KiB`)
-//! via an O(1) page-bucketed `mmap` recycle cache drained on [`release_free_memory`].
+//! `16 KiB` slabs, keeps emptied slabs mapped for reuse up to [`RETAINED_EMPTY_BYTES`] across
+//! every class and `munmap`s the rest back to XNU, and serves larger layouts (`<= 512 KiB`) via
+//! an O(1) page-bucketed `mmap` recycle cache. [`release_free_memory`] gives back both caches.
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::cell::UnsafeCell;
@@ -110,6 +111,58 @@ impl Bin {
 
 static BINS: [Bin; NUM_CLASSES] = [const { Bin::new() }; NUM_CLASSES];
 static CACHED_PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+/// The most emptied slabs keep mapped, in bytes across every class (256 slabs). A reader that
+/// allocates and frees the same working set every round (a membership evaluation's bitsets, a
+/// roster's rows) took and gave back each of its slabs every round when an emptied slab was
+/// unmapped at once: a VM-entry change, zero-fill faults and, for the unmap, a TLB shootdown,
+/// each under the class's lock that the other threads wait on (2026-11-06, an idle 0.147.0 at
+/// one to two cores with `__mmap` the hottest leaf of three threads). 4 MiB holds an R = 4000
+/// bitset round (about 2 MiB in one class) with room for the classes beside it.
+const RETAINED_EMPTY_BYTES: usize = 4 * 1024 * 1024;
+
+/// What the emptied slabs kept mapped in every bin's partial list hold, and the most they may.
+/// An emptied slab is kept while that fits, and as before, past it, where it is its class's only
+/// partial slab: so the bytes kept stay within the cap and one slab for each class.
+struct Retained {
+    bytes: AtomicUsize,
+    cap: usize,
+}
+
+impl Retained {
+    const fn new(cap: usize) -> Self {
+        Self {
+            bytes: AtomicUsize::new(0),
+            cap,
+        }
+    }
+
+    /// Count one more emptied slab kept, where it fits under the cap or is `lone`. Whether it is.
+    fn keep(&self, lone: bool) -> bool {
+        if lone {
+            self.bytes.fetch_add(SLAB_BYTES, Ordering::Relaxed);
+            return true;
+        }
+        self.bytes
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                held.checked_add(SLAB_BYTES)
+                    .filter(|&more| more <= self.cap)
+            })
+            .is_ok()
+    }
+
+    /// One kept slab is empty no longer: a slot was taken from it, or it was unmapped.
+    fn release(&self) {
+        self.bytes.fetch_sub(SLAB_BYTES, Ordering::Relaxed);
+    }
+
+    /// Whether lone slabs kept past the cap put it over.
+    fn over(&self) -> bool {
+        self.bytes.load(Ordering::Relaxed) > self.cap
+    }
+}
+
+static RETAINED: Retained = Retained::new(RETAINED_EMPTY_BYTES);
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -318,12 +371,19 @@ unsafe fn unlink_partial(state: &mut BinState, hdr: *mut SlabHeader) {
 
 #[inline]
 #[cfg_attr(trust_verify, trust::skip)]
-unsafe fn pop_one_from_partial(state: &mut BinState, slot_bytes: usize) -> *mut u8 {
+unsafe fn pop_one_from_partial(
+    state: &mut BinState,
+    slot_bytes: usize,
+    retained: &Retained,
+) -> *mut u8 {
     // SAFETY: Caller holds `state.lock`.
     unsafe {
         let hdr = state.partial_head;
         if hdr.is_null() {
             return null_mut();
+        }
+        if (*hdr).live == 0 {
+            retained.release();
         }
         let slab_base = slab_base_from_header(hdr);
         let ptr = if !(*hdr).free_head.is_null() {
@@ -343,9 +403,13 @@ unsafe fn pop_one_from_partial(state: &mut BinState, slot_bytes: usize) -> *mut 
     }
 }
 
+/// Return `ptr`'s slot to its slab. A slab it empties stays mapped in the partial list, counted
+/// in `retained`, where [`Retained::keep`] has room for it; otherwise its base comes back for the
+/// caller to unmap outside the lock. A slab joining the list unmaps a lone emptied head only
+/// while lone slabs hold `retained` over its cap.
 #[inline]
 #[cfg_attr(trust_verify, trust::skip)]
-unsafe fn return_one_to_state(state: &mut BinState, ptr: *mut u8) -> *mut u8 {
+unsafe fn return_one_to_state(state: &mut BinState, ptr: *mut u8, retained: &Retained) -> *mut u8 {
     let slab_base = ptr.wrapping_sub((ptr as usize) & (SLAB_BYTES - 1));
     // SAFETY: Caller holds `state.lock`, and `ptr` belongs to `slab_base` in this bin.
     unsafe {
@@ -358,7 +422,7 @@ unsafe fn return_one_to_state(state: &mut BinState, ptr: *mut u8) -> *mut u8 {
             } else {
                 !state.partial_head.is_null()
             };
-            if has_other_partial {
+            if !retained.keep(!has_other_partial) {
                 if (*hdr).in_partial {
                     unlink_partial(state, hdr);
                 }
@@ -377,8 +441,13 @@ unsafe fn return_one_to_state(state: &mut BinState, ptr: *mut u8) -> *mut u8 {
             let mut unmap = null_mut();
             if !(*hdr).in_partial {
                 let old_head = state.partial_head;
-                if !old_head.is_null() && (*old_head).live == 0 && (*old_head).next.is_null() {
+                if !old_head.is_null()
+                    && (*old_head).live == 0
+                    && (*old_head).next.is_null()
+                    && retained.over()
+                {
                     unlink_partial(state, old_head);
+                    retained.release();
                     unmap = slab_base_from_header(old_head);
                 }
                 push_partial_front(state, hdr);
@@ -386,6 +455,56 @@ unsafe fn return_one_to_state(state: &mut BinState, ptr: *mut u8) -> *mut u8 {
             unmap
         }
     }
+}
+
+/// Unlink up to `out.len()` emptied slabs from `state`'s partial list into `out`, uncounting each
+/// from `retained`, for the caller to unmap outside the lock. How many it took.
+#[cfg_attr(trust_verify, trust::skip)]
+unsafe fn take_empty_slabs(
+    state: &mut BinState,
+    retained: &Retained,
+    out: &mut [*mut u8],
+) -> usize {
+    let mut taken = 0;
+    // SAFETY: Caller holds `state.lock`; each `next` is read before its slab is unlinked.
+    unsafe {
+        let mut cur = state.partial_head;
+        while !cur.is_null() && taken < out.len() {
+            let next = (*cur).next;
+            if (*cur).live == 0 {
+                unlink_partial(state, cur);
+                retained.release();
+                out[taken] = slab_base_from_header(cur);
+                taken += 1;
+            }
+            cur = next;
+        }
+    }
+    taken
+}
+
+/// A fresh slab of class `idx` whose first `taken` slots are handed out, not yet in any list.
+#[inline]
+#[cfg_attr(trust_verify, trust::skip)]
+fn map_slab(idx: usize, taken: u16) -> *mut u8 {
+    let slab_base = mmap_slab();
+    if slab_base.is_null() {
+        return null_mut();
+    }
+    // SAFETY: `slab_base` is a fresh `SLAB_BYTES` mapping no other thread has seen, and its
+    // header sits in its last `HEADER_BYTES`, past every slot.
+    unsafe {
+        header_from_slab_base(slab_base).write(SlabHeader {
+            prev: null_mut(),
+            next: null_mut(),
+            free_head: null_mut(),
+            bump: taken,
+            capacity: SLAB_CAPS[idx],
+            live: taken,
+            in_partial: false,
+        });
+    }
+    slab_base
 }
 
 #[cold]
@@ -397,7 +516,7 @@ fn alloc_from_bin_global(idx: usize, req_size: usize, zeroed: bool) -> *mut u8 {
     // before joining `partial_head`.
     unsafe {
         os_unfair_lock_lock(&raw mut (*cell).lock);
-        let ptr = pop_one_from_partial(&mut *cell, slot_bytes);
+        let ptr = pop_one_from_partial(&mut *cell, slot_bytes, &RETAINED);
         os_unfair_lock_unlock(&raw mut (*cell).lock);
         if !ptr.is_null() {
             if zeroed {
@@ -405,20 +524,11 @@ fn alloc_from_bin_global(idx: usize, req_size: usize, zeroed: bool) -> *mut u8 {
             }
             return ptr;
         }
-        let slab_base = mmap_slab();
+        let slab_base = map_slab(idx, 1);
         if slab_base.is_null() {
             return null_mut();
         }
         let hdr = header_from_slab_base(slab_base);
-        hdr.write(SlabHeader {
-            prev: null_mut(),
-            next: null_mut(),
-            free_head: null_mut(),
-            bump: 1,
-            capacity: SLAB_CAPS[idx],
-            live: 1,
-            in_partial: false,
-        });
         os_unfair_lock_lock(&raw mut (*cell).lock);
         push_partial_front(&mut *cell, hdr);
         os_unfair_lock_unlock(&raw mut (*cell).lock);
@@ -434,7 +544,7 @@ fn dealloc_to_bin_global(idx: usize, ptr: *mut u8) {
     // unmapped after releasing the lock.
     unsafe {
         os_unfair_lock_lock(&raw mut (*cell).lock);
-        let unmap_base = return_one_to_state(&mut *cell, ptr);
+        let unmap_base = return_one_to_state(&mut *cell, ptr, &RETAINED);
         os_unfair_lock_unlock(&raw mut (*cell).lock);
         if !unmap_base.is_null() {
             let _ = libc::munmap(unmap_base.cast(), SLAB_BYTES);
@@ -551,7 +661,7 @@ unsafe fn refill_local_bin(
     unsafe {
         os_unfair_lock_lock(&raw mut (*cell).lock);
         while got < want {
-            let p = pop_one_from_partial(&mut *cell, slot_bytes);
+            let p = pop_one_from_partial(&mut *cell, slot_bytes, &RETAINED);
             if p.is_null() {
                 break;
             }
@@ -575,27 +685,18 @@ unsafe fn refill_local_bin(
             return first;
         }
 
-        let slab_base = mmap_slab();
+        let cap = SLAB_CAPS[idx] as usize;
+        let take = want.min(cap);
+        let slab_base = map_slab(idx, take as u16);
         if slab_base.is_null() {
             return null_mut();
         }
-        let cap = SLAB_CAPS[idx] as usize;
-        let take = want.min(cap);
         for s in 1..take {
             let node = slab_base.add(s * slot_bytes).cast::<FreeNode>();
             (*node).next = head;
             head = node;
         }
         let hdr = header_from_slab_base(slab_base);
-        hdr.write(SlabHeader {
-            prev: null_mut(),
-            next: null_mut(),
-            free_head: null_mut(),
-            bump: take as u16,
-            capacity: SLAB_CAPS[idx],
-            live: take as u16,
-            in_partial: false,
-        });
         if take < cap {
             os_unfair_lock_lock(&raw mut (*cell).lock);
             push_partial_front(&mut *cell, hdr);
@@ -631,7 +732,7 @@ unsafe fn flush_local_bin(idx: usize, local: &mut LocalBin, keep: u16) {
                 }
                 local.head = (*node).next;
                 local.len -= 1;
-                let unmap = return_one_to_state(&mut *cell, node.cast::<u8>());
+                let unmap = return_one_to_state(&mut *cell, node.cast::<u8>(), &RETAINED);
                 if !unmap.is_null() {
                     unmaps[unmap_n] = unmap;
                     unmap_n += 1;
@@ -916,8 +1017,8 @@ unsafe fn dealloc_large(ptr: *mut u8, layout: Layout) {
     }
 }
 
-/// Flush the calling thread's small-object magazine, drop any empty spare `16 KiB` slabs, and
-/// unmap all cached large blocks back to XNU.
+/// Flush the calling thread's small-object magazine, unmap every emptied `16 KiB` slab kept for
+/// reuse, and unmap all cached large blocks back to XNU.
 #[cfg_attr(trust_verify, trust::skip)]
 pub(crate) fn release_free_memory() {
     if TLS_STATE.load(Ordering::Acquire) == TLS_READY {
@@ -935,18 +1036,20 @@ pub(crate) fn release_free_memory() {
     }
     for bin in &BINS {
         let cell = bin.0.get();
-        let mut unmap = null_mut::<u8>();
-        // SAFETY: `os_unfair_lock` serializes inspection and unlinking of any empty spare slab.
-        unsafe {
-            os_unfair_lock_lock(&raw mut (*cell).lock);
-            let head = (*cell).partial_head;
-            if !head.is_null() && (*head).live == 0 && (*head).next.is_null() {
-                unlink_partial(&mut *cell, head);
-                unmap = slab_base_from_header(head);
-            }
-            os_unfair_lock_unlock(&raw mut (*cell).lock);
-            if !unmap.is_null() {
-                let _ = libc::munmap(unmap.cast(), SLAB_BYTES);
+        loop {
+            let mut unmaps = [null_mut::<u8>(); 32];
+            // SAFETY: `os_unfair_lock` serializes unlinking the emptied slabs, and each one is
+            // unmapped outside the lock, in batches of 32.
+            unsafe {
+                os_unfair_lock_lock(&raw mut (*cell).lock);
+                let taken = take_empty_slabs(&mut *cell, &RETAINED, &mut unmaps);
+                os_unfair_lock_unlock(&raw mut (*cell).lock);
+                for &u in &unmaps[..taken] {
+                    let _ = libc::munmap(u.cast(), SLAB_BYTES);
+                }
+                if taken < unmaps.len() {
+                    break;
+                }
             }
         }
     }
@@ -1206,6 +1309,161 @@ mod tests {
             );
             CompactZoneAlloc.dealloc(z, layout);
         }
+    }
+
+    /// One bin driven through its own state machine as the global path drives it (a slot from a
+    /// partial slab, else a fresh slab), on a bin and a budget no other thread touches: the
+    /// global bins serve this test binary's every thread.
+    struct Bench {
+        state: super::BinState,
+        idx: usize,
+        retained: super::Retained,
+        maps: usize,
+        unmaps: usize,
+    }
+
+    impl Bench {
+        fn new(size: usize, cap: usize) -> Self {
+            Self {
+                state: super::BinState {
+                    lock: super::OsUnfairLock(0),
+                    partial_head: std::ptr::null_mut(),
+                },
+                idx: class_index(size, 16).expect("a slab class"),
+                retained: super::Retained::new(cap),
+                maps: 0,
+                unmaps: 0,
+            }
+        }
+
+        fn take(&mut self) -> *mut u8 {
+            // SAFETY: `self.state` is this bench's own bin, which no other thread reaches, and a
+            // fresh slab joins it as the global path's does.
+            unsafe {
+                let p =
+                    super::pop_one_from_partial(&mut self.state, CLASSES[self.idx], &self.retained);
+                if !p.is_null() {
+                    return p;
+                }
+                let slab = super::map_slab(self.idx, 1);
+                assert!(!slab.is_null(), "a slab maps");
+                self.maps += 1;
+                super::push_partial_front(&mut self.state, super::header_from_slab_base(slab));
+                slab
+            }
+        }
+
+        fn give(&mut self, ptr: *mut u8) {
+            // SAFETY: `ptr` is a live slot `take` handed out of this bench's bin.
+            unsafe {
+                let unmap = super::return_one_to_state(&mut self.state, ptr, &self.retained);
+                if !unmap.is_null() {
+                    let _ = libc::munmap(unmap.cast(), super::SLAB_BYTES);
+                    self.unmaps += 1;
+                }
+            }
+        }
+
+        /// One round that takes `live` slots and gives every one back: the slabs it mapped and
+        /// unmapped.
+        fn round(&mut self, live: usize) -> (usize, usize) {
+            let (maps, unmaps) = (self.maps, self.unmaps);
+            let slots: Vec<*mut u8> = (0..live).map(|_| self.take()).collect();
+            for slot in slots {
+                self.give(slot);
+            }
+            (self.maps - maps, self.unmaps - unmaps)
+        }
+
+        /// What a relief does to the bin: every emptied slab unmapped. How many.
+        fn relieve(&mut self) -> usize {
+            let mut relieved = 0;
+            loop {
+                let mut out = [std::ptr::null_mut::<u8>(); 32];
+                // SAFETY: the bench owns its bin; each slab taken is unmapped once.
+                let taken =
+                    unsafe { super::take_empty_slabs(&mut self.state, &self.retained, &mut out) };
+                for &slab in &out[..taken] {
+                    // SAFETY: `slab` was unlinked from the bin and nothing holds a slot in it.
+                    let _ = unsafe { libc::munmap(slab.cast(), super::SLAB_BYTES) };
+                }
+                relieved += taken;
+                if taken < out.len() {
+                    return relieved;
+                }
+            }
+        }
+
+        fn slabs(&self) -> usize {
+            let mut n = 0;
+            let mut cur = self.state.partial_head;
+            while !cur.is_null() {
+                n += 1;
+                // SAFETY: every slab in the bench's partial list is mapped and linked.
+                cur = unsafe { (*cur).next };
+            }
+            n
+        }
+    }
+
+    /// A reader that takes and gives back the same working set every round (1,200 bitsets of a
+    /// membership evaluation, 152 bytes each) maps its slabs in the first round and none after,
+    /// and unmaps none until a relief, which gives every one back.
+    ///
+    /// NEGATIVE CONTROL (2026-11-06): with an emptied slab kept only when it is its class's only
+    /// partial slab (`Retained::keep` returning `lone`, the shape before), the first round already
+    /// unmaps all but one of the 15 slabs it mapped (`left: (15, 14), right: (15, 0)`), and every
+    /// later round maps them again.
+    #[test]
+    fn a_round_that_gives_back_what_it_took_reuses_its_slabs() {
+        let mut bench = Bench::new(152, super::RETAINED_EMPTY_BYTES);
+        let per_slab = usize::from(super::SLAB_CAPS[bench.idx]);
+        let slabs = 1_200usize.div_ceil(per_slab);
+        assert_eq!(bench.round(1_200), (slabs, 0), "the first round");
+        for _ in 1..20 {
+            assert_eq!(bench.round(1_200), (0, 0), "a later round");
+        }
+        assert_eq!(bench.slabs(), slabs);
+        assert_eq!(
+            bench
+                .retained
+                .bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            slabs * super::SLAB_BYTES
+        );
+        assert_eq!(bench.relieve(), slabs, "a relief gives every slab back");
+        assert_eq!(bench.slabs(), 0);
+        assert_eq!(
+            bench
+                .retained
+                .bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    /// The slabs kept stay within the cap in bytes: a working set of 20 slabs under a cap of 4
+    /// keeps 4 and unmaps the rest, maps 16 again each round, and a relief gives back the 4.
+    ///
+    /// NEGATIVE CONTROL (2026-11-06): with `Retained::keep` keeping every emptied slab (no cap),
+    /// the first round unmaps none of the 20 (`left: (20, 0), right: (20, 16)`).
+    #[test]
+    fn the_slabs_kept_stay_within_the_cap() {
+        const CAP_SLABS: usize = 4;
+        let mut bench = Bench::new(152, CAP_SLABS * super::SLAB_BYTES);
+        let per_slab = usize::from(super::SLAB_CAPS[bench.idx]);
+        let live = 20 * per_slab;
+        assert_eq!(bench.round(live), (20, 20 - CAP_SLABS));
+        assert_eq!(bench.slabs(), CAP_SLABS);
+        assert_eq!(bench.round(live), (20 - CAP_SLABS, 20 - CAP_SLABS));
+        assert_eq!(
+            bench
+                .retained
+                .bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            CAP_SLABS * super::SLAB_BYTES
+        );
+        assert_eq!(bench.relieve(), CAP_SLABS);
     }
 
     /// The global zone's large path: blocks of one bucket come back from the cache zeroed on

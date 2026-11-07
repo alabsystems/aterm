@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! ATERM'S OWN VOICE on macOS.
+//! The macOS notification center a bundled aterm posts a program's notices through, and its ask.
 
-/// What macOS has said about aterm posting its own notices as itself.
+/// What macOS has said about aterm posting a program's notices as itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(
     all(not(target_os = "macos"), not(test)),
@@ -15,8 +15,8 @@ pub(crate) enum Center {
     /// A bundle macOS has not been asked about yet (`UNAuthorizationStatusNotDetermined`).
     Unasked,
     /// macOS lets aterm post quietly, to Notification Center only
-    /// (`UNAuthorizationStatusProvisional`). Explicitly enabled program notifications
-    /// request full delivery before posting, as from [`Center::Unasked`].
+    /// (`UNAuthorizationStatusProvisional`). A notice is held, as on [`Center::Unasked`],
+    /// until a person's press of the Settings row requests full delivery.
     Provisional,
     /// macOS said no, or aterm's notifications are off in System Settings ▸ Notifications.
     Refused,

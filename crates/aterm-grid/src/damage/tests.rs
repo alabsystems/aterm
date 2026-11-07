@@ -264,3 +264,56 @@ fn mark_random_cells_tracks_expected_rows_and_bounds() {
         assert_eq!(actual_bounds, expected_bounds);
     }
 }
+
+/// A tracker's row bits, each row's damage bounds and its mark clock.
+type TrackerState = (Vec<u64>, Vec<Option<(u16, u16)>>, u64);
+
+/// The tracker's whole state: its bits, bounds and mark clock.
+fn tracker_state(t: &DamageTracker) -> TrackerState {
+    let rows = u16::try_from(t.row_bits.len() * 64).unwrap_or(u16::MAX);
+    (
+        t.row_bits.clone(),
+        (0..rows).map(|r| t.row_damage_bounds(r)).collect(),
+        t.mark_seq,
+    )
+}
+
+/// `mark_rows` writes a range in bulk exactly as its row-by-row reference does: the same bits,
+/// bounds and mark clock, over generated trackers (sizes across the 64-row words), ranges (empty,
+/// reversed, past the end) and the cell marks between them that leave partial bounds.
+#[test]
+fn bulk_mark_rows_matches_marking_each_row() {
+    let mut rng = aterm_spec::rng::XorShift::new(0xDA3A_6E50_0F17);
+    let mut words_spanned = 0usize;
+    for _ in 0..4_000 {
+        let rows = u16::try_from(1 + rng.below(200)).unwrap_or(1);
+        let (mut fast, mut slow) = (DamageTracker::new(rows), DamageTracker::new(rows));
+        for _ in 0..1 + rng.below(12) {
+            if rng.below(3) == 0 {
+                let (row, col) = (
+                    u16::try_from(rng.below(u64::from(rows) + 8)).unwrap_or(0),
+                    u16::try_from(rng.below(300)).unwrap_or(0),
+                );
+                fast.mark_cell(row, col);
+                slow.mark_cell(row, col);
+                continue;
+            }
+            let start = u16::try_from(rng.below(u64::from(rows) + 8)).unwrap_or(0);
+            let end = u16::try_from(rng.below(u64::from(rows) + 80)).unwrap_or(0);
+            if end > start && start / 64 != end.saturating_sub(1).min(rows - 1) / 64 {
+                words_spanned += 1;
+            }
+            fast.mark_rows(start, end);
+            crate::test_counters::on_reference_paths(|| slow.mark_rows(start, end));
+            assert_eq!(
+                tracker_state(&fast),
+                tracker_state(&slow),
+                "{rows} rows: mark_rows({start}, {end})"
+            );
+        }
+    }
+    assert!(
+        words_spanned > 100,
+        "ranges across a word boundary: {words_spanned}"
+    );
+}

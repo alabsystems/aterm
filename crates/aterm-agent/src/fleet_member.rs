@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! CLI front-end for `aterm fleet init|join|peers|allow|publish|sync|census|name|leave` over
-//! [`aterm_net::fleet_member`].
+//! [`aterm_net::fleet_member`], and the whole `aterm fleet --help` ([`USAGE`]), which also names
+//! the view ([`crate::fleet_view`]) and the lab verbs ([`crate::members_cli::parse_lab`]).
 
 use std::ffi::OsString;
 use std::io::{self, IsTerminal as _, Read as _, Write as _};
@@ -24,8 +25,38 @@ use aterm_uds::private_file::ANOTHER_LINK;
 
 /// The whole `aterm fleet --help` (`fleet_cli` prints it), and each verb's `--help`.
 pub(crate) const USAGE: &str = "\
-aterm fleet — this machine's membership in a fleet: the aterms of one LAN that
-hold one secret, each reading the others at the level they allow
+aterm fleet — the lab: its status line and one row per seat, the verbs that
+let a Mac in and take one out, and this machine's membership in a fleet: the
+aterms of one LAN that hold one secret, each reading the others at the level
+they allow
+
+THE LAB:
+  aterm fleet [--json]   the status line (members, up, the members that need an
+                         update, tables in step and the slowest's lag, the
+                         membership log's fill), then one row per seat: its
+                         label, log name, node id, up or silent for how long,
+                         build or `needs update`, and whether its tables are
+                         in step. Read from this Mac's own copy (the node
+                         service's presence view, the membership log, the
+                         book's signed entries); it dials no Mac and starts
+                         nothing
+  aterm fleet remove <node|label|name|code> [--stolen]
+                         take that Mac out of the lab as this Mac, printing the
+                         log name and node id it acted on (as `aterm members
+                         remove` does: the same code signs the same records).
+                         A node id takes the one standing seat the log binds
+                         to that node key, with no registry read; a registry
+                         label takes the seat the registry and the signed
+                         seats agree on, refused where they do not; a name
+                         or join code is read from the membership log
+  aterm fleet admit [--again] <name|code>
+                         show a phrase for that asking Mac on this Mac's screen
+                         (--again: a Mac the vault removed, which its join
+                         restores); `aterm members allow`
+  aterm fleet invite     show a phrase for whichever Mac types it next
+  aterm fleet requests   the Macs asking that this Mac hears
+  aterm fleet ignore <name|code>
+                         hide that Mac's request on this Mac
 
 DEFAULT ALAB:
   Normal ALab setup joins its signed default fleet automatically once the
@@ -298,19 +329,19 @@ fn name_machine(places: &Places, args: &[String]) -> Result<String, Failure> {
 
 /// Publish an explicitly chosen machine number as the fleet name in `state` through the same
 /// checked writer as `fleet name set` ([`set_primary_name`]), while `state`'s machine name still
-/// holds `number`, which it reads again under the fleet writer's lock. Existing signed and
-/// registered holders are never overwritten. `config` is the aterm.toml whose `[[fleet.peers]]`
-/// hosts are read, beside the swarm roster, the book and its copy of the issuer's book, among the
-/// machines that may already answer to the name; it is read for nothing else, and one that
-/// cannot be read lists none. The
-/// roster is the vault's beside `state`, or the live one where `state` is the live account's
-/// ([`crate::fleet_vault::vault_paths_for`]); with neither it names no machine.
+/// holds `number` and the aterm.toml at `config` still names it in all three policy keys already
+/// committed by the publisher. Both sources are read again under the fleet writer's lock,
+/// after its other reads, with the canonical number last. Existing signed and registered holders
+/// are never overwritten. `config`'s `[[fleet.peers]]` hosts are read, beside the swarm roster,
+/// the book and its copy of the issuer's book, among the machines that may already answer to the
+/// name. The roster is the vault's beside `state`, or the live one where `state` is the live
+/// account's ([`crate::fleet_vault::vault_paths_for`]); with neither it names no machine.
 ///
 /// # Errors
 /// `state` cannot be made private or its node identity read; the swarm roster is unread; another
 /// registered machine, a peer in either book or a `[[fleet.peers]]` host answers to the name; the
-/// name file no longer holds `number` or cannot be read; or the book cannot be locked or read,
-/// or the fleet name cannot be written.
+/// name file no longer holds `number` or cannot be read; the naming policy is unread, off or no
+/// longer names it; or the book cannot be locked or read, or the fleet name cannot be written.
 #[cfg(unix)]
 pub(crate) fn choose_machine_name_at(
     state: &Path,
@@ -330,13 +361,17 @@ enum Writer<'a> {
     /// The person (`aterm fleet name set`): the name is theirs, and no follow replaces it, unless
     /// it is a swarm label (`m<N>`) the roster gives this Mac no more ([`FleetName::Due`]).
     Person,
-    /// The canonical number must still match under the fleet writer lock.
+    /// The committed policy and canonical number must still match under the fleet writer lock.
     #[cfg(unix)]
     Canonical(aterm_types::machine_name::Number),
     /// `sync.identity`'s follow, which read the fleet name as `saw`: it writes only if the name
-    /// is still that once the write lock is held, and records the name as its own
-    /// ([`FOLLOWED_FILE`]).
-    Follow { saw: Option<&'a str> },
+    /// is still that once the write lock is held and `current` still admits the source intent,
+    /// and records the name as its own ([`FOLLOWED_FILE`]). The callback reads local naming
+    /// sources only, taking no roster or book lock.
+    Follow {
+        saw: Option<&'a str>,
+        current: &'a dyn Fn() -> Result<(), String>,
+    },
 }
 
 /// The name `sync.identity`'s follow last wrote as this machine's fleet name, beside
@@ -370,14 +405,7 @@ fn set_primary_name(places: &Places, name: &str, writer: &Writer<'_>) -> Result<
         )));
     }
     member::write_held(&places.state, Began::Here, |_held| {
-        #[cfg(unix)]
-        if let Writer::Canonical(number) = writer {
-            let current = crate::machine_name::file::read(&places.state).map_err(failed)?;
-            if current.is_none_or(|current| current.num != Some(*number)) {
-                return Err(failed("the canonical machine number changed before fleet publication"));
-            }
-        }
-        if let Writer::Follow { saw } = writer {
+        if let Writer::Follow { saw, .. } = writer {
             let now = member::read_primary_name(&places.state).map_err(failed)?;
             if now.as_deref() != *saw {
                 let now = now.unwrap_or_else(|| "unset".to_owned());
@@ -393,6 +421,17 @@ fn set_primary_name(places: &Places, name: &str, writer: &Writer<'_>) -> Result<
             return Err(failed(format!(
                 "{name} already names {other}; use its node alias to disambiguate"
             )));
+        }
+        // All potentially blocking roster, peer and policy reads precede the final canonical
+        // source check; a callback reads local sources only, never re-entering either lock.
+        match writer {
+            #[cfg(unix)]
+            Writer::Canonical(number) => {
+                crate::machine_name::publish::check_current(&places.state, &places.config, *number)
+                    .map_err(|why| failed(why.phrase()))?;
+            }
+            Writer::Follow { current, .. } => current().map_err(failed)?,
+            Writer::Person => {}
         }
         aterm_uds::private_file::write_private(
             &places.state,
@@ -507,10 +546,17 @@ pub fn fleet_name_for(wanted: &str, earlier: &dyn Fn(&str) -> bool) -> Result<Fl
 /// roster moved this Mac from, is left as it is.
 ///
 /// # Errors
-/// As [`fleet_name_for`], or the name is another machine's, or it could not be written.
-pub fn follow_fleet_name(wanted: &str, earlier: &dyn Fn(&str) -> bool) -> Result<String, String> {
+/// As [`fleet_name_for`], or the name is another machine's, it could not be written, or `current`
+/// no longer admits the source naming intent. That callback runs under the fleet writer lock,
+/// after its reads and immediately before the name write; it must read only local sources,
+/// acquiring no roster or book lock.
+pub fn follow_fleet_name(
+    wanted: &str,
+    earlier: &dyn Fn(&str) -> bool,
+    current: &dyn Fn() -> Result<(), String>,
+) -> Result<String, String> {
     let places = Places::here().map_err(Failure::into_text)?;
-    follow_fleet_name_at(&places, wanted, earlier)
+    follow_fleet_name_at(&places, wanted, earlier, current)
 }
 
 fn fleet_name_at(
@@ -583,6 +629,7 @@ fn follow_fleet_name_at(
     places: &Places,
     wanted: &str,
     earlier: &dyn Fn(&str) -> bool,
+    current: &dyn Fn() -> Result<(), String>,
 ) -> Result<String, String> {
     let wanted = wanted.to_ascii_lowercase();
     let (name, saw) = fleet_name_read(places, &wanted, earlier)?;
@@ -598,6 +645,7 @@ fn follow_fleet_name_at(
             &wanted,
             &Writer::Follow {
                 saw: saw.as_deref(),
+                current,
             },
         )
         .map_err(Failure::into_text),
@@ -6397,18 +6445,6 @@ pub fn check_from_cache() -> Result<FleetCheck, String> {
     check_with(&places, || vault_code(Fetch::Cache)).map_err(Failure::into_text)
 }
 
-/// How many peers this machine knows, from its book and `aterm.toml`'s `[[fleet.peers]]` alone
-/// (the list `aterm fleet peers` dials), read without a dial or a write.
-///
-/// # Errors
-/// There is no state directory or config path, or the book or `aterm.toml` cannot be read.
-pub fn known_peer_count() -> Result<usize, String> {
-    let places = Places::here().map_err(Failure::into_text)?;
-    known_peers(&places)
-        .map(|known| known.peers.len())
-        .map_err(Failure::into_text)
-}
-
 /// [`check_from_cache`] over `places`, `vault` naming the default fleet's code.
 fn check_with(
     places: &Places,
@@ -7841,6 +7877,64 @@ fn registry_target(places: &Places, word: &str) -> Result<Option<RegistryTarget>
     Ok(Some(target))
 }
 
+/// The seat a person's removal names where B2's resolver named it ([`removal_seat`]): its actor,
+/// which `aterm-secrets` removes as given, its node id and its log name.
+pub(crate) struct RemovalSeat {
+    pub(crate) actor: aterm_secrets::membership_log::MemberId,
+    pub(crate) node: String,
+    pub(crate) name: String,
+}
+
+/// The seat `word` names for a person's removal from the vault at `paths` (`aterm fleet remove`
+/// and `aterm members remove`; one-mesh B12): [`registry_target`] over this Mac's own places,
+/// which [`removal_seat_at`] reads.
+///
+/// # Errors
+/// This Mac has no state directory or config path, or as [`removal_seat_at`].
+pub(crate) fn removal_seat(
+    paths: &aterm_secrets::client::Paths,
+    word: &str,
+) -> Result<Option<RemovalSeat>, String> {
+    removal_seat_at(&Places::here().map_err(failure_words)?, paths, word)
+}
+
+/// [`removal_seat`] over `places`: `None` where `word` is neither a node id nor a registry label,
+/// which the removal resolves by word; else the one standing seat B2's resolver names. A word the
+/// resolver refuses is refused, never resolved again by word: the log label `m12` can be another
+/// Mac than the one the registry calls `m12`.
+///
+/// # Errors
+/// `word` is a node id or a registry label and the vault `places` reads is not `paths`'s, or
+/// [`registry_target`] refuses it: the membership log is unread or no membership is
+/// acknowledged; no single standing seat binds the node id; for a label, the registry is unread
+/// or its history incomplete, no live registry row carries the label or more than one does, that
+/// row's label or node cell is missing, raw or conflicted, or the registry and the seats disagree
+/// on the label.
+fn removal_seat_at(
+    places: &Places,
+    paths: &aterm_secrets::client::Paths,
+    word: &str,
+) -> Result<Option<RemovalSeat>, String> {
+    if !member::is_node_id(word) && registry_label(word).is_none() {
+        return Ok(None);
+    }
+    let read = vault_paths_for(places).map(|vault| vault.dir);
+    if read.as_ref() != Some(&paths.dir) {
+        return Err(format!(
+            "{word}: this Mac's fleet state reads {}, not the vault {} this removal signs in",
+            read.map_or_else(|| "no vault".to_owned(), |dir| dir.display().to_string()),
+            paths.dir.display()
+        ));
+    }
+    let target = registry_target(places, word)?
+        .ok_or_else(|| format!("{word}: the registry resolver named no seat"))?;
+    Ok(Some(RemovalSeat {
+        actor: target.actor,
+        node: target.node,
+        name: target.name,
+    }))
+}
+
 struct LabelSeat {
     actor: aterm_secrets::membership_log::MemberId,
     node: String,
@@ -9226,6 +9320,7 @@ fn survey_fleet_in(
                 unproven: false,
                 node: None,
                 addr: None,
+                reason: Some("not-dialled"),
             }),
     );
     Ok(aterm_ctl::FleetRead {
@@ -9362,6 +9457,10 @@ fn peer_survey(
             .err()
             .map_or(aterm_ctl::PeerFault::Other, fault_of),
         unproven: matches!(&read, Ok(surveyed) if !surveyed.proven),
+        reason: read
+            .as_ref()
+            .err()
+            .map(|why| if gone { "gone" } else { why.reason() }),
         answer: read.map(|surveyed| surveyed.lines).map_err(|e| {
             if gone {
                 aterm_netplace::words::GONE_FROM_THE_LINK.to_owned()

@@ -10,6 +10,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 impl Owner {
     pub(super) fn launch(&mut self, mut pending: Pending, mut custody: Custody) {
+        let mut metadata_gnu = None;
+        let service_sdk = pending
+            .recipe
+            .as_ref()
+            .and_then(|recipe| recipe.metadata_sdk.clone());
         let result: io::Result<(spawnfd::Command, aterm_types::resource_subgroup::JobContext)> =
             (|| {
                 let recipe = pending
@@ -17,6 +22,21 @@ impl Owner {
                     .as_ref()
                     .ok_or_else(|| refused("missing admitted recipe"))?;
                 let mut command = recipe.command(&pending.submission.request);
+                let resolver = matches!(recipe.kind, recipe::Kind::Resolver);
+                if matches!(recipe.kind, recipe::Kind::Metadata | recipe::Kind::Resolver) {
+                    let sdk = service_sdk
+                        .as_ref()
+                        .ok_or_else(|| refused("metadata service has no original SDK keeper"))?;
+                    sdk.validate()?;
+                    let mut gnu = metadata::RootGnu::new()?;
+                    if !resolver {
+                        gnu.configure(&mut command, vec![(sdk.descriptor()?, sdk::TARGET)])?;
+                    }
+                    command.env("ATERM_SDK_LEASE_V3", sdk::TARGET.to_string());
+                    metadata_gnu = Some(gnu);
+                } else {
+                    pending.sdk = sdk::root(recipe.compiler.as_ref(), &mut command)?;
+                }
                 // Locator only: the helper itself accepts custody lookup only
                 // from this exact cached image and a validated native ancestor.
                 command.env(
@@ -30,6 +50,32 @@ impl Owner {
                     capability: aterm_types::resource_subgroup::Capability::from_bytes(secret),
                 };
                 command.env("ATERM_RESOURCE_JOB_V3", delegation.encode()?);
+                if resolver {
+                    let sdk = service_sdk
+                        .as_ref()
+                        .ok_or_else(|| refused("resolver root SDK keeper is unavailable"))?;
+                    let deadline = Instant::now()
+                        + Duration::from_millis(
+                            pending
+                                .submission
+                                .request
+                                .timeout_ms
+                                .unwrap_or(0)
+                                .min(30_000),
+                        );
+                    let (mut preparation, mut prelude) =
+                        resolver_root::Preparation::new(&command, sdk.clone(), deadline)?;
+                    metadata_gnu
+                        .as_mut()
+                        .ok_or_else(|| refused("resolver root original GNU is unavailable"))?
+                        .configure(
+                            &mut prelude,
+                            vec![(sdk.descriptor()?, sdk::TARGET), preparation.extra()?],
+                        )?;
+                    preparation.configured(&prelude)?;
+                    pending.resolver = Some(preparation);
+                    command = prelude;
+                }
                 command
                     .stdin(spawnfd::Stdio::from(
                         pending.submission.fds.stdin.try_clone()?,
@@ -47,16 +93,20 @@ impl Owner {
             Err(_) => {
                 // No ARM was attempted; keep the exact custody for its normal
                 // no-launch completion rather than inventing a birth receipt.
-                let _ = pending.events.emit(Event::Refused {
-                    reason: "child preparation refused before launch".into(),
-                });
+                let refusal = failure::stage_refusal(
+                    pending.events,
+                    "child preparation refused before launch",
+                );
                 self.failed.push(Failed {
                     _compiler: pending.recipe.as_ref().and_then(|r| r.compiler.clone()),
                     binding: pending.submission.request.binding,
-                    custody,
+                    custody: Some(custody),
+                    refusal,
+                    settled: false,
                     spawned: None,
                     no_child: None,
                     checked_at: None,
+                    _sdk: service_sdk,
                 });
                 return;
             }
@@ -66,27 +116,36 @@ impl Owner {
             Custody::Cooperative(claim) => claim.launch_cohort(&mut command),
         };
         match child {
-            Ok(child) => self.start_bound(pending, custody, child, delegation),
+            Ok(child) => self.start_bound(
+                pending,
+                custody,
+                child,
+                delegation,
+                metadata_gnu,
+                service_sdk,
+            ),
             Err(error) => {
-                let (spawned, no_child) = match error {
-                    LaunchError::NotSpawned(proof) => {
-                        let _ = pending.events.emit(Event::Refused {
-                            reason: "native target did not start".into(),
-                        });
-                        (None, Some(proof))
-                    }
-                    LaunchError::Unbound { spawned, .. } => (Some(spawned), None),
-                    LaunchError::Refused(_) => (None, None),
+                let (spawned, no_child, refusal) = match error {
+                    LaunchError::NotSpawned(proof) => (
+                        None,
+                        Some(proof),
+                        failure::stage_refusal(pending.events, "native target did not start"),
+                    ),
+                    LaunchError::Unbound { spawned, .. } => (Some(spawned), None, None),
+                    LaunchError::Refused(_) => (None, None, None),
                 };
                 // An unbound or unknown native outcome has no affirmative
                 // Refused/Started fact. Closing yields transport-unknown.
                 self.failed.push(Failed {
                     _compiler: pending.recipe.as_ref().and_then(|r| r.compiler.clone()),
                     binding: pending.submission.request.binding,
-                    custody,
+                    custody: Some(custody),
+                    refusal,
+                    settled: false,
                     spawned,
                     no_child,
                     checked_at: None,
+                    _sdk: service_sdk,
                 });
                 self.faulted = true;
             }
@@ -98,6 +157,8 @@ impl Owner {
         custody: Custody,
         mut child: aterm_capacity::cohort::launch::CohortChild,
         delegation: aterm_types::resource_subgroup::JobContext,
+        metadata_gnu: Option<metadata::RootGnu>,
+        service_sdk: Option<std::sync::Arc<sdk::Keeper>>,
     ) {
         let binding = pending.submission.request.binding;
         let pid = child.child_mut().id();
@@ -117,19 +178,32 @@ impl Owner {
             .recipe
             .as_ref()
             .is_some_and(|recipe| matches!(recipe.kind, recipe::Kind::Targo));
+        let metadata_root = pending
+            .recipe
+            .as_ref()
+            .is_some_and(|recipe| matches!(recipe.kind, recipe::Kind::Metadata));
         let prepared = self.journal.update(
             &binding,
             "bound",
             aterm_json::json!({"root_pid":pid,"root_birth":birth,
-            "cohort":child.cohort().record().encode()}),
+            "cohort":child.cohort().record().encode(),"sdk":sdk::json(&pending.sdk)}),
         );
         let mut job = Job {
             binding: binding.clone(),
             delegation,
             program,
             native_targo,
+            metadata_root,
+            metadata_ready: false,
+            resolver_ready: false,
+            resolver_queries: 0,
+            metadata_gnu,
+            metadata_sdk: service_sdk,
+            resolver: pending.resolver,
             compiler: pending.recipe.as_ref().and_then(|r| r.compiler.clone()),
+            sdk: pending.sdk,
             members: BTreeMap::new(),
+            loans: BTreeMap::new(),
             events: pending.events,
             custody,
             child,
@@ -150,6 +224,7 @@ impl Owner {
             cleanup_at: None,
             reaped: false,
             terminal_sent: false,
+            completion: None,
             launched: false,
             settled: false,
             settlement_at: None,
@@ -158,7 +233,26 @@ impl Owner {
             && birth.is_some()
             && job.exit_moment.is_some()
             && !job.events.cancelled()
+            && job.metadata_sdk.as_ref().is_none_or(|sdk| {
+                sdk.validate().is_ok()
+                    && (job.resolver.is_some()
+                        || (sdk.validate_loaded(pid).is_ok()
+                            && aterm_uds::process::LoadedImage::read(pid as i32).is_some_and(
+                                |image| image.matches_file(&job.program) == Some(true),
+                            )))
+            })
+            && job
+                .metadata_gnu
+                .as_mut()
+                .is_none_or(|gnu| gnu.bind_child(pid).is_ok())
         {
+            // The first hold is the trusted prelude, not the selected resolver.
+            // Its owned preparation performs the two-stop transition; only a
+            // positively validated selected image may receive final GO/Started.
+            if job.resolver.is_some() {
+                self.jobs.insert((binding.session, binding.attempt), job);
+                return;
+            }
             let running = self
                 .journal
                 .update(&binding, "running", aterm_json::json!({}));

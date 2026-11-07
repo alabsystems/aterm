@@ -347,6 +347,7 @@ mod imp {
     const IN_CLOSE_WRITE: u32 = 0x0000_0008;
     const IN_Q_OVERFLOW: u32 = 0x0000_4000;
     const IN_IGNORED: u32 = 0x0000_8000;
+    const IN_ALL_EVENTS: u32 = 0x0000_0fff;
 
     const DIR_MASK: u32 = libc::IN_CREATE
         | libc::IN_ATTRIB
@@ -539,7 +540,11 @@ mod imp {
                         wds.gone.extend(all);
                         continue;
                     }
-                    if let Some(of_wd) = wds.ids.get(&wd) {
+                    // A directory's watch also hears its entries' attribute changes, each by
+                    // its name: those are no change of the directory's entries or of itself
+                    // (as on macOS, whose directory watch hears its own alone).
+                    let entry_attributes = mask & IN_ALL_EVENTS == libc::IN_ATTRIB && len > 0;
+                    if !entry_attributes && let Some(of_wd) = wds.ids.get(&wd) {
                         ids.extend(of_wd.iter().copied());
                     }
                     if mask & IN_IGNORED != 0 {

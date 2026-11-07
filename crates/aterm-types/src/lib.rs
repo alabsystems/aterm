@@ -31,6 +31,7 @@ pub mod clt_shim;
 pub mod fleet_name;
 mod hyperlink;
 pub mod identity;
+pub mod installed_command;
 pub use hyperlink::HyperlinkData;
 pub mod lab_window_guard;
 pub mod machine_name;
@@ -39,10 +40,14 @@ pub mod network_state;
 pub mod private_edit;
 #[cfg(not(target_family = "wasm"))]
 pub mod reach;
+pub mod retry_schedule;
 
 mod cursor;
 
 pub mod index;
+
+/// The trailers `verify land` writes on a landing merge, and their one reader (design B10).
+pub mod land_trailer;
 
 #[macro_use]
 mod bitflags;

@@ -8,7 +8,7 @@ use crate::checkout::{Origin, Stands, git, github_origin as origin_matches};
 use crate::github_pages::Page;
 use crate::items::{Ctx, Item};
 use crate::model::{Probe, User};
-use crate::port::{Cmd, Scratch, Secret, System};
+use crate::port::{Cmd, FileId, Scratch, Secret, System};
 use aterm_capacity::admit::gib;
 use aterm_capacity::reading::Volume;
 use aterm_json::Value;
@@ -424,6 +424,228 @@ pub(super) fn partition(sys: &dyn System, user: &User, all: &[Repo]) -> Result<P
         }
     }
     Ok(standing)
+}
+
+pub(super) struct Refreshed {
+    pub(super) moved: bool,
+    pub(super) failed: Vec<String>,
+}
+
+/// Refresh only ordinary, locally eligible checkouts from a previously admitted
+/// private inventory. Cached refs establish eligibility, never remote freshness.
+/// Every preservation decision precedes a remote read; Git's existing guarded
+/// alignment owns the fetch and fast-forward. Up to [`LANES`] independent stores
+/// run together; unknown or shared storage keeps the serial path.
+pub(super) fn refresh_existing(
+    sys: &dyn System,
+    user: &User,
+    standing: &Partition,
+    recorded: &BTreeSet<PathBuf>,
+    current: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<Refreshed, String> {
+    struct Job<'a> {
+        index: usize,
+        repo: &'a Repo,
+        path: &'a Path,
+        physical: Option<[FileId; 3]>,
+    }
+    struct Batch<'a> {
+        pending: std::collections::VecDeque<Job<'a>>,
+        stopped: bool,
+        fault: Option<(usize, String)>,
+    }
+    current()?;
+    let mut paths = BTreeSet::new();
+    let mut subjects = BTreeSet::new();
+    let mut independent = true;
+    let mut jobs = std::collections::VecDeque::new();
+    for (index, (repo, path)) in standing
+        .present
+        .iter()
+        .chain(&standing.dependencies)
+        .enumerate()
+    {
+        if recorded.contains(path) || !paths.insert(path.clone()) {
+            continue;
+        }
+        let physical = refresh_subjects(sys, path).ok();
+        if let Some(physical) = &physical {
+            for identity in physical {
+                independent &= subjects.insert((identity.dev, identity.ino, identity.born_ns));
+            }
+        } else {
+            independent = false;
+        }
+        jobs.push_back(Job {
+            index,
+            repo,
+            path,
+            physical,
+        });
+    }
+    // Identity is scheduling evidence alone. Unknown or shared storage retains
+    // the old serial behavior; no valid checkout is omitted or newly refused.
+    let lanes = if independent {
+        jobs.len().min(LANES)
+    } else {
+        1
+    };
+    if lanes <= 1 {
+        for job in &mut jobs {
+            job.physical = None;
+        }
+    }
+    let batch = std::sync::Mutex::new(Batch {
+        pending: jobs,
+        stopped: false,
+        fault: None,
+    });
+    let results = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..lanes {
+            scope.spawn(|| {
+                loop {
+                    let job = {
+                        let mut batch = batch
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if batch.stopped {
+                            return;
+                        }
+                        let Some(job) = batch.pending.pop_front() else {
+                            return;
+                        };
+                        job
+                    };
+                    let admitted = || {
+                        let checked = current().and_then(|()| {
+                            if job.physical.is_some_and(|expected| {
+                                refresh_subjects(sys, job.path).ok() != Some(expected)
+                            }) {
+                                Err(format!(
+                                    "~/{}: checkout storage changed during refresh",
+                                    job.repo.name
+                                ))
+                            } else {
+                                Ok(())
+                            }
+                        });
+                        if let Err(why) = &checked {
+                            let mut batch = batch
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            batch.stopped = true;
+                            if batch
+                                .fault
+                                .as_ref()
+                                .is_none_or(|(index, _)| job.index < *index)
+                            {
+                                batch.fault = Some((job.index, why.clone()));
+                            }
+                        }
+                        checked
+                    };
+                    let result = refresh_one(sys, user, job.repo, job.path, &admitted);
+                    if result.as_ref().is_err_and(|unread| unread.offline) {
+                        batch
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .stopped = true;
+                    }
+                    results
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push((job.index, job.repo, result));
+                }
+            });
+        }
+    });
+    let final_current = current();
+    if let Some((_, why)) = batch
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .fault
+    {
+        return Err(why);
+    }
+    final_current?;
+    let mut results = results
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    results.sort_by_key(|(index, _, _)| *index);
+    let mut refreshed = Refreshed {
+        moved: false,
+        failed: Vec::new(),
+    };
+    for (_, repo, result) in results {
+        match result {
+            Ok(Some(Stands::Behind { .. })) => refreshed.moved = true,
+            Ok(_) => {}
+            Err(unread) => refreshed
+                .failed
+                .push(format!("~/{}: {}", repo.name, unread.why)),
+        }
+    }
+    Ok(refreshed)
+}
+
+fn refresh_subjects(sys: &dyn System, path: &Path) -> io::Result<[FileId; 3]> {
+    Ok([
+        sys.file_id(path)?,
+        sys.file_id(&path.join(".git"))?,
+        sys.file_id(&path.join(".git/objects"))?,
+    ])
+}
+
+fn refresh_one(
+    sys: &dyn System,
+    user: &User,
+    repo: &Repo,
+    path: &Path,
+    current: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<Option<Stands>, crate::checkout::Unread> {
+    current()?;
+    // Linked worktrees and foreign/linked object storage are preserved, as
+    // are deliberately shallow or partial clones. Inspect no working files.
+    if [
+        path.to_owned(),
+        path.join(".git"),
+        path.join(".git/objects"),
+    ]
+    .iter()
+    .any(|path| {
+        !sys.stat(path)
+            .is_ok_and(|stat| stat.dir && !stat.symlink && stat.uid == user.uid)
+    }) || super::dependencies::complete_storage(sys, user, path).is_err()
+    {
+        return Ok(None);
+    }
+    let origin = repo.origin();
+    let branch = match crate::checkout::read_fetched(sys, user, path, &origin) {
+        Ok(Stands::Kept(_)) | Err(crate::checkout::NotFetched::Unrecorded { .. }) => {
+            return Ok(None);
+        }
+        Err(crate::checkout::NotFetched::Unread(unread)) => return Err(unread),
+        Ok(
+            Stands::Current { branch, .. }
+            | Stands::Behind { branch, .. }
+            | Stands::Unfetched { branch, .. },
+        ) => branch,
+    };
+    if !crate::checkout::tracks_origin(sys, user, path, &branch) {
+        return Ok(None);
+    }
+    let admitted = || {
+        current()?;
+        if !crate::checkout::tracks_origin(sys, user, path, &branch) {
+            return Err(format!(
+                "~/{}: upstream tracking changed during refresh; work preserved",
+                repo.name
+            ));
+        }
+        Ok(())
+    };
+    crate::checkout::align_guarded(sys, user, path, &origin, &admitted).map(Some)
 }
 
 pub(super) fn admit_home(sys: &dyn System, user: &User) -> Result<(), String> {
@@ -1994,22 +2216,32 @@ pub(super) mod tests {
                 vec!["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
                 format!("{A}\n"),
             ),
-            (
-                vec![
-                    "status",
-                    "--porcelain=v1",
-                    "-z",
-                    "--untracked-files=normal",
-                    "--ignore-submodules=all",
-                ],
-                status.to_owned(),
-            ),
         ] {
             sys.on(
                 &git(sys, who, Some(path)).args(args).display(),
                 Ran::ok(&output),
             );
         }
+        sys.on(
+            &crate::checkout::Programs::listing(git(sys, who, Some(path))).display(),
+            Ran::exit(1, ""),
+        );
+        sys.on(
+            &crate::checkout::Programs::default()
+                .off(git(sys, who, Some(path)))
+                .args(crate::checkout::NO_SIDE_RUNS)
+                .args([
+                    "-c",
+                    "core.fsmonitor=false",
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=normal",
+                    "--ignore-submodules=all",
+                ])
+                .display(),
+            Ran::ok(status),
+        );
     }
 
     #[test]

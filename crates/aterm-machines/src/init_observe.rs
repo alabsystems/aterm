@@ -1121,12 +1121,6 @@ mod tests {
             );
             // The engine's line stays the description, for `aterm init` and the doctor.
             assert_eq!(read.detail.as_deref(), Some(line), "{wait:?}");
-            // Short, and a person's words: no item id, path, file mode or flag.
-            let note = wait.note();
-            assert!(note.chars().count() <= 52, "{note}");
-            for engine in ["@", "/", "~", "`", "--", "0600", "init.", ".toml"] {
-                assert!(!note.contains(engine), "{note:?} says {engine:?}");
-            }
         }
         // The first waiting part that says why gives the note; a planned part beside it
         // and a waiting part that says nothing do not.

@@ -106,6 +106,7 @@ fn standin_disk(dir: &Path) -> atpkg::admit_disk::Run {
         cold: 1 << 30,
         on: dir.to_path_buf(),
         stuck_ends: None,
+        scratch: false,
         machine: None,
     }
 }

@@ -3412,8 +3412,13 @@ pub(crate) mod windows_tests {
 
     /// A directory junction at `link`: unlike `symlink_dir` it needs no
     /// privilege or Developer Mode, so the tests that use it run on every
-    /// host.
+    /// host, but not under sshd's Redirection Guard, which follows no
+    /// junction this user made: there a refusal through it is the guard's,
+    /// not the code's under test, so they end COULD NOT RUN.
     pub(crate) fn junction(link: &std::path::Path, target: &std::path::Path) {
+        aterm_uds::host::could_not_run_under_redirection_guard(
+            "the test plants a junction this user makes where the code under test goes",
+        );
         let plain = |path: &std::path::Path| {
             let text = path.to_str().expect("test paths are UTF-8");
             text.strip_prefix(r"\\?\").unwrap_or(text).to_owned()

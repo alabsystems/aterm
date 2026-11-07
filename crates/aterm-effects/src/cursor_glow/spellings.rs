@@ -58,7 +58,7 @@ pub const TRAIL_STYLES: &[TrailStyleRow] = &[
         "rainbow kitty flying",
         Some(GlowStyle::RainbowKitty),
         "Flying kitty",
-        "The rainbow ribbon; a kitty flies in after a few seconds of steady typing",
+        "The rainbow ribbon; a kitty flies in at its head once your typing gathers speed",
     ),
     row_of(
         "rainbow kitty flat",
@@ -336,6 +336,45 @@ pub const fn blurb(raw: &str) -> Option<&'static str> {
         Some(r) => Some(r.blurb),
         None => None,
     }
+}
+
+/// What a style's Settings row says with a bar caret, where its own blurb promises a caret
+/// a bar does not draw, as `(canonical name, blurb)`. A bar caret is a thin rod in the trail's
+/// colour in every style, glowing in it: Lightning's bolt, Fire's ember, Water's drop and
+/// Comet's nucleus are block carets, and with a bar the rows promised what the caret did not
+/// show (composed r3's judges; the after-land lows' W7).
+pub const TRAIL_STYLE_BAR_BLURBS: &[(&str, &str)] = &[
+    (
+        "fire",
+        "Flames behind what you type; a bar caret glows ember",
+    ),
+    (
+        "water",
+        "A rolling blue wave with droplets; a bar caret glows sea blue",
+    ),
+    ("laser", "Lightning on jumps; a bar caret glows violet"),
+    ("comet", "An icy comet tail; a bar caret glows at its head"),
+];
+
+/// The one-line description of the style a spelling resolves to, as the Settings row says it
+/// for a bar caret when `bar` ([`TRAIL_STYLE_BAR_BLURBS`]).
+#[inline]
+#[must_use]
+pub const fn blurb_for(raw: &str, bar: bool) -> Option<&'static str> {
+    let Some(r) = row(raw) else {
+        return None;
+    };
+    if bar {
+        let mut i = 0;
+        while i < TRAIL_STYLE_BAR_BLURBS.len() {
+            let (name, said) = TRAIL_STYLE_BAR_BLURBS[i];
+            if eq_ascii_ci(name.as_bytes(), r.name) {
+                return Some(said);
+            }
+            i += 1;
+        }
+    }
+    Some(r.blurb)
 }
 
 #[cfg(test)]

@@ -3,12 +3,12 @@
 
 use crate::supervise::policy::question::{LAND_TEXT, LONG_TERM_TEXT, SHORT_TERM_TEXT};
 use crate::supervise::policy::{
-    QuestionPriority, RULE_ANSWER_LAND, RULE_ANSWER_LONG_TERM, RULE_ANSWER_RECOMMENDED,
-    RULE_ANSWER_SHORT_TERM,
+    PriorityWord, QuestionPriority, RULE_ANSWER_LAND, RULE_ANSWER_LONG_TERM,
+    RULE_ANSWER_RECOMMENDED, RULE_ANSWER_SHORT_TERM,
 };
 
-const LONG: QuestionPriority = QuestionPriority::LongTerm;
-const SHORT: QuestionPriority = QuestionPriority::ShortTerm;
+const LONG: PriorityWord = PriorityWord::LongTerm;
+const SHORT: PriorityWord = PriorityWord::ShortTerm;
 
 /// A current host ([`questioned`]) whose `send` names its generation fence
 /// (`FENCED_SEND_HELP`) and whose reads carry the person count
@@ -21,7 +21,7 @@ fn texting(screens: Vec<Vec<String>>) -> Mock {
 }
 
 /// The stop-at-review loop answering questions under `p`.
-fn answering_by(p: QuestionPriority) -> SuperviseOpts {
+fn answering_by(p: PriorityWord) -> SuperviseOpts {
     let mut opts = answering(30);
     opts.policy.question_priority = p;
     opts
@@ -31,7 +31,7 @@ fn answering_by(p: QuestionPriority) -> SuperviseOpts {
 /// `question_priority` `p`, and a person's quiet window of 10 s (`[harness]
 /// human_grace_s`, as [`answering`]'s): the quiet every read the loop keys
 /// on must show.
-fn hosted_by(p: QuestionPriority) -> SuperviseOpts {
+fn hosted_by(p: PriorityWord) -> SuperviseOpts {
     let mut opts = hosted_answering(true);
     opts.policy.question_priority = p;
     opts.policy.human_grace_s = 10;
@@ -59,7 +59,7 @@ fn with_text(capture: &str, text: &str) -> Vec<String> {
 }
 
 /// The text `p` writes.
-fn text_of(p: QuestionPriority) -> &'static str {
+fn text_of(p: PriorityWord) -> &'static str {
     p.text().expect("a text priority")
 }
 
@@ -184,11 +184,7 @@ fn a_dialog_under_land_is_answered_by_the_land_text() {
         m.vanish_after = Some(1);
         m.autopilot = Some("land");
         m.questions = word;
-        let lines = hosted_run(
-            &mut m,
-            &hosted_by(QuestionPriority::Recommended),
-            Some(&ledger),
-        );
+        let lines = hosted_run(&mut m, &hosted_by(PriorityWord::Recommended), Some(&ledger));
         let writes = m.writes();
         assert_eq!(
             writes[..writes.len().min(4)],
@@ -241,7 +237,7 @@ fn a_dialog_under_land_is_answered_by_the_land_text() {
     let mut m = texting(vec![opt1, busy_screen(), idle_screen()]);
     m.vanish_after = Some(1);
     m.autopilot = Some("cruise");
-    let lines = hosted_run(&mut m, &hosted_by(QuestionPriority::Recommended), None);
+    let lines = hosted_run(&mut m, &hosted_by(PriorityWord::Recommended), None);
     assert_eq!(m.writes(), ["enter"], "{:#?}", m.requests);
     assert!(sends(&m).is_empty(), "{:#?}", m.requests);
     let told: Vec<&String> = lines.iter().filter(|l| l.starts_with("CHOSE ")).collect();
@@ -304,7 +300,7 @@ fn a_switch_mid_dialog_finishes_under_its_first_keys_priority() {
         m.questions = Some("long-term");
         m.autopilot = from;
         m.autopilot_at = vec![(3, to)];
-        let _ = hosted_run(&mut m, &hosted_by(QuestionPriority::Recommended), None);
+        let _ = hosted_run(&mut m, &hosted_by(PriorityWord::Recommended), None);
         let first_key = m
             .requests
             .iter()
@@ -610,7 +606,8 @@ fn tier1_the_policy_text_goes_only_where_the_model_allows() {
         let (opt1, opt2, free, typed) = single_screens(text_of(p));
         let mut m = texting(vec![opt1, opt2, free, typed, idle_screen()]);
         let model = text_model(1, 0, 0);
-        let (st, keys, _) = q_bound_with(&mut m, &model, 0, Some(p), &answering_by(p), |_| {});
+        let (st, keys, _) =
+            q_bound_with(&mut m, &model, 0, Some(p.into()), &answering_by(p), |_| {});
         assert_eq!(
             keys,
             ["down", "down", "text", "enter"],
@@ -625,14 +622,21 @@ fn tier1_the_policy_text_goes_only_where_the_model_allows() {
     let mut m = texting(vec![opt1, opt2, free, typed, idle_screen()]);
     m.autopilot = Some("land");
     let land = QuestionPriority::Land;
-    let rec = answering_by(QuestionPriority::Recommended);
+    let rec = answering_by(PriorityWord::Recommended);
     let (st, keys, _) = q_bound_with(&mut m, &text_model(1, 0, 0), 0, Some(land), &rec, |_| {});
     assert_eq!(keys, ["down", "down", "text", "enter"], "{:#?}", m.requests);
     assert_eq!(st["tab"], 2, "Land: the dialog closed: {st:?}");
 
     let mut m = texting(multi_screens(LONG_TERM_TEXT));
     let model = text_model(1, 1, 1);
-    let (st, keys, _) = q_bound_with(&mut m, &model, 0, Some(LONG), &answering_by(LONG), |_| {});
+    let (st, keys, _) = q_bound_with(
+        &mut m,
+        &model,
+        0,
+        Some(LONG.into()),
+        &answering_by(LONG),
+        |_| {},
+    );
     assert_eq!(
         keys,
         ["down", "down", "down", "text", "down", "enter", "enter"],
@@ -656,11 +660,11 @@ fn tier1_the_policy_text_goes_only_where_the_model_allows() {
             &mut m,
             &text_model(1, 0, 0),
             0,
-            Some(LONG),
+            Some(LONG.into()),
             &answering_by(LONG),
             move |s| {
-                s.question.typed.insert(key, LONG);
-                s.question.mode = Some(LONG);
+                s.question.typed.insert(key, LONG.into());
+                s.question.mode = Some(LONG.into());
             },
         )
     }));
@@ -1014,7 +1018,7 @@ fn the_sessions_short_term_word_answers_over_a_global_recommended() {
         });
         m.vanish_after = Some(1);
         m.questions = word;
-        let lines = hosted_run(&mut m, &hosted_by(QuestionPriority::Recommended), None);
+        let lines = hosted_run(&mut m, &hosted_by(PriorityWord::Recommended), None);
         let told: Vec<&String> = lines.iter().filter(|l| l.starts_with("CHOSE ")).collect();
         if word.is_some() {
             assert_eq!(
@@ -1638,8 +1642,14 @@ fn a_persons_key_between_the_read_and_the_send_skips_the_policy_text() {
     m.human = vec!["15000"];
     m.person_at_send = 1;
     let model = text_model(1, 0, 0);
-    let (st, keys, raced) =
-        q_bound_with(&mut m, &model, 0, Some(LONG), &answering_by(LONG), |_| {});
+    let (st, keys, raced) = q_bound_with(
+        &mut m,
+        &model,
+        0,
+        Some(LONG.into()),
+        &answering_by(LONG),
+        |_| {},
+    );
     assert_eq!(
         keys,
         ["down", "down", "text", "enter"],
@@ -1671,7 +1681,7 @@ fn a_word_changed_after_the_first_key_hands_the_dialog_over() {
     m.vanish_after = Some(0);
     m.questions = Some("long-term");
     m.questions_at = vec![(3, Some("recommended"))];
-    let _ = hosted_run(&mut m, &hosted_by(QuestionPriority::Recommended), None);
+    let _ = hosted_run(&mut m, &hosted_by(PriorityWord::Recommended), None);
     assert!(
         !m.presses().iter().any(|p| p.ends_with(" enter")),
         "{:#?}",
@@ -1691,7 +1701,7 @@ fn a_word_changed_after_the_first_key_hands_the_dialog_over() {
     m.questions = Some("long-term");
     m.human_ms_reads = VecDeque::from([None, Some(300)]);
     m.questions_at = vec![(3, Some("recommended"))];
-    let _ = hosted_run(&mut m, &hosted_by(QuestionPriority::Recommended), None);
+    let _ = hosted_run(&mut m, &hosted_by(PriorityWord::Recommended), None);
     assert!(sends(&m).is_empty(), "{:#?}", m.requests);
     assert_eq!(m.writes(), ["enter"], "{:#?}", m.requests);
 }
@@ -2321,7 +2331,7 @@ fn tier1_a_tab_that_falls_back_goes_only_where_the_model_allows() {
         &mut m,
         &text_model(1, 0, 0),
         0,
-        Some(LONG),
+        Some(LONG.into()),
         &answering_by(LONG),
         |_| {},
     );
@@ -2353,7 +2363,7 @@ fn tier1_a_tab_that_falls_back_goes_only_where_the_model_allows() {
         &mut m,
         &text_model(3, 1, 0),
         0,
-        Some(LONG),
+        Some(LONG.into()),
         &answering_by(LONG),
         |_| {},
     );

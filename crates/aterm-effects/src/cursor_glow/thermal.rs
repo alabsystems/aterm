@@ -214,9 +214,10 @@ pub(super) struct ForgeBand {
 }
 
 impl ForgeBand {
-    /// The least contrast every forge fill keeps against its page: the host's caret floor ([`crate::cursor_fx::CARET_PAGE_MIN_CONTRAST`], WCAG's text minimum, since a block caret draws the glyph beneath it in the page colour), so the floor finds the band's ember already clear.
-    pub(super) const PAGE_CONTRAST: f32 = crate::cursor_fx::CARET_PAGE_MIN_CONTRAST;
-    /// The deep rest point a cold forge took before its page was solved, kept wherever it already reads (a light page).
+    /// The least contrast every forge fill keeps against its page: the host's floor for the forge caret ([`crate::cursor_fx::caret_page_floor`], WCAG's text minimum, since a block caret draws the glyph beneath it in the page colour, and [`crate::cursor_fx::EFFECT_CARET_PAGE_GUARD`] past it), so the floor finds the band's ember already clear.
+    pub(super) const PAGE_CONTRAST: f32 =
+        crate::cursor_fx::caret_page_floor(crate::cursor_glow::BlockFillOwner::Forge);
+    /// The deep rest point a cold forge took before its page was solved: the bright side's rest wherever it already reads; the deep side (a light page) rests no deeper than [`Self::MIN_ARC`] below its full heat.
     pub(super) const COLD: f32 = 0.10;
     /// The shipped full-heat point: orange-gold, short of cream.
     pub(super) const HOT: f32 = 0.74;
@@ -228,6 +229,13 @@ impl ForgeBand {
     /// Solve the band for `ground`, preferring the side `dark` names.
     #[inline]
     pub(super) const fn solve(ground: u32, dark: bool) -> Self {
+        Self::solve_to(ground, dark, Self::PAGE_CONTRAST)
+    }
+
+    /// [`Self::solve`] against the page at `bar` and not [`Self::PAGE_CONTRAST`] (a test reads the
+    /// band the bare caret floor gave).
+    #[inline]
+    pub(super) const fn solve_to(ground: u32, dark: bool, bar: f32) -> Self {
         const LUM_TOP: f32 = crate::color_math::relative_luminance(fire_ramp(ForgeBand::TOP));
         const LUM_COLD: f32 = crate::color_math::relative_luminance(fire_ramp(ForgeBand::COLD));
         const LUM_ZERO: f32 = crate::color_math::relative_luminance(fire_ramp(0.0));
@@ -237,31 +245,37 @@ impl ForgeBand {
             (l.max(lum) + 0.05) / (l.min(lum) + 0.05)
         }
         #[inline]
-        const fn lit_l(lum: f32, l: f32) -> bool {
-            l > lum && (l + 0.05) / (lum + 0.05) >= ForgeBand::PAGE_CONTRAST
+        const fn lit_l(lum: f32, l: f32, bar: f32) -> bool {
+            l > lum && (l + 0.05) / (lum + 0.05) >= bar
         }
         #[inline]
-        const fn deep_ok_l(lum: f32, l: f32) -> bool {
-            l < lum && (lum + 0.05) / (l + 0.05) >= ForgeBand::PAGE_CONTRAST
+        const fn deep_ok_l(lum: f32, l: f32, bar: f32) -> bool {
+            l < lum && (lum + 0.05) / (l + 0.05) >= bar
         }
         let lum = crate::color_math::relative_luminance(ground);
-        let bright = if lit_l(lum, LUM_TOP) {
-            let lo = if lit_l(lum, LUM_COLD) {
+        let bright = if lit_l(lum, LUM_TOP, bar) {
+            let lo = if lit_l(lum, LUM_COLD, bar) {
                 Self::COLD
             } else {
-                bisect_edge(lum, Self::COLD, Self::TOP, true).1
+                bisect_edge(lum, Self::COLD, Self::TOP, true, bar).1
             };
             Some((lo, (lo + Self::MIN_ARC).clamp(Self::HOT, Self::TOP)))
         } else {
             None
         };
-        let deep = if deep_ok_l(lum, LUM_ZERO) {
-            let hi = if deep_ok_l(lum, LUM_HOT) {
+        let deep = if deep_ok_l(lum, LUM_ZERO, bar) {
+            let hi = if deep_ok_l(lum, LUM_HOT, bar) {
                 Self::HOT
             } else {
-                bisect_edge(lum, 0.0, Self::HOT, false).0
+                bisect_edge(lum, 0.0, Self::HOT, false, bar).0
             };
-            Some((Self::COLD.min(hi), hi))
+            // THE PAPER EMBER GLOWS RED (after-land L3): resting at
+            // [`Self::COLD`] on paper, the ember was a near-black maroon
+            // (`#510a00`, 15:1 on white), a heavy block under the paper's
+            // flames (`fire-light.t0`); it rests [`Self::MIN_ARC`] below its
+            // full heat, as the bright side heats [`Self::MIN_ARC`] above its
+            // rest.
+            Some(((hi - Self::MIN_ARC).max(Self::COLD.min(hi)), hi))
         } else {
             None
         };
@@ -310,11 +324,17 @@ impl ForgeBand {
     }
 }
 
-/// The edge of a predicate that holds on `[lo, edge]` and fails past it, to
-/// well under one ramp step; the caller has checked it holds at `lo` and
-/// fails at `hi`.
+/// The edge of a predicate (a fill against the page at `bar`) that holds on
+/// `[lo, edge]` and fails past it, to well under one ramp step; the caller
+/// has checked it holds at `lo` and fails at `hi`.
 #[inline]
-const fn bisect_edge(lum: f32, mut lo: f32, mut hi: f32, want_not_lit: bool) -> (f32, f32) {
+const fn bisect_edge(
+    lum: f32,
+    mut lo: f32,
+    mut hi: f32,
+    want_not_lit: bool,
+    bar: f32,
+) -> (f32, f32) {
     let table = crate::color_math::relative_luminance_table();
     let (mut lo_rgb, mut hi_rgb) = (fire_ramp(lo), fire_ramp(hi));
     let mut i = 0;
@@ -328,9 +348,9 @@ const fn bisect_edge(lum: f32, mut lo: f32, mut hi: f32, want_not_lit: bool) -> 
         } else {
             let l = crate::color_math::relative_luminance_with(table, mid_rgb);
             let holds = if want_not_lit {
-                !(l > lum && (l + 0.05) / (lum + 0.05) >= ForgeBand::PAGE_CONTRAST)
+                !(l > lum && (l + 0.05) / (lum + 0.05) >= bar)
             } else {
-                l < lum && (lum + 0.05) / (l + 0.05) >= ForgeBand::PAGE_CONTRAST
+                l < lum && (lum + 0.05) / (l + 0.05) >= bar
             };
             if holds {
                 lo = mid;

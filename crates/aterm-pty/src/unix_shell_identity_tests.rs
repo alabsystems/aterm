@@ -379,9 +379,10 @@ fn clocal_set(fd: i32) -> bool {
 }
 
 /// A fifo in `scratch` named `name`, opened read and write so neither end's open waits for the
-/// other: its path and the descriptor.
+/// other: its path and an owned descriptor retained until the handler acknowledges the line.
 #[cfg(target_os = "macos")]
-fn gate_fifo(scratch: &std::path::Path, name: &str) -> (std::path::PathBuf, i32) {
+fn gate_fifo(scratch: &std::path::Path, name: &str) -> (std::path::PathBuf, std::os::fd::OwnedFd) {
+    use std::os::fd::FromRawFd as _;
     use std::os::unix::ffi::OsStrExt as _;
     let path = scratch.join(format!("{name}.fifo"));
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a path has no NUL");
@@ -390,27 +391,13 @@ fn gate_fifo(scratch: &std::path::Path, name: &str) -> (std::path::PathBuf, i32)
     // SAFETY: `c` is a valid NUL-terminated path.
     let gate = unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
     assert!(gate >= 0, "the gate's fifo opens");
-    (path, gate)
-}
-
-/// Tests in one binary hold reap kills at once, each dropping its own guard as its row ends: one
-/// drop must leave the reap another test still holds at its kill tick, or that shell is killed
-/// mid-handler and its marker never written. A hold that is a flag, not a count, fails here.
-#[test]
-fn a_hold_dropped_beside_another_keeps_the_other_holding() {
-    let first = hold_reap_kills_for_test();
-    let second = hold_reap_kills_for_test();
-    drop(first);
-    assert!(
-        reap_kills_held(),
-        "one hold's drop released the reap another hold still keeps"
-    );
-    drop(second);
+    // SAFETY: `open` returned this fresh descriptor, owned by nothing else.
+    (path, unsafe { std::os::fd::OwnedFd::from_raw_fd(gate) })
 }
 
 /// Ends the test's own shell if it is still there and waits for teardown, which reaps it.
 #[cfg(target_os = "macos")]
-fn end_row(pid: i32, hold: ReapKillHold) {
+fn end_row(pid: i32, hold: ReapKillHold<'_>) {
     if child_exit_unreaped(pid) == Some(false) {
         // SAFETY: ending the test's own child, which teardown then reaps.
         unsafe {
@@ -419,6 +406,21 @@ fn end_row(pid: i32, hold: ReapKillHold) {
     }
     drop(hold);
     assert!(wait_for_reaps(HANG_DETECTOR), "teardown completed");
+}
+
+#[test]
+fn overlapping_reap_kill_holds_last_until_every_guard_is_dropped() {
+    let holds = ReapKillHolds::new();
+    let first = holds.hold();
+    let second = holds.hold();
+    assert!(holds.held());
+    drop(first);
+    assert!(
+        holds.held(),
+        "one caller cannot release another caller's hold"
+    );
+    drop(second);
+    assert!(!holds.held(), "the final guard releases the hold");
 }
 
 /// Mid-handler, the master's close is end of file and no second hang-up: a `cat` the HUP trap runs
@@ -471,15 +473,18 @@ fn the_terminals_close_mid_handler_is_end_of_file_and_no_hang_up() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_foreground_jobs_write_back_mid_handler_is_undone_before_the_close() {
+    use std::os::fd::AsRawFd as _;
     let scratch = aterm_tempfile::tempdir().expect("scratch");
     for name in ["zsh-zshexit", "bash-exit-trap"] {
         let hold = hold_reap_kills_for_test();
         let (gate_path, gate) = gate_fifo(scratch.path(), name);
+        let (open_path, open_gate) = gate_fifo(scratch.path(), &format!("{name}-open"));
         let cleared = scratch.path().join(format!("{name}.cleared"));
         let marker = scratch.path().join(format!("{name}.done"));
         let work = format!(
-            "stty -clocal; echo cleared > {}; read line < {}",
+            "stty -clocal; echo cleared > {}; read open < {}; read line < {}",
             cleared.display(),
+            open_path.display(),
             gate_path.display()
         );
         let (script, rc, text) = handler_row(scratch.path(), name, &work, &marker);
@@ -494,6 +499,7 @@ fn a_foreground_jobs_write_back_mid_handler_is_undone_before_the_close() {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(cleared.exists(), "{name}'s `stty -clocal` ran");
+        let deadline = Instant::now() + HANG_DETECTOR;
         while !clocal_set(sh.master) && Instant::now() < deadline {
             let _ = read(sh.master, &mut [0u8; 256]);
             std::thread::sleep(Duration::from_millis(5));
@@ -503,21 +509,33 @@ fn a_foreground_jobs_write_back_mid_handler_is_undone_before_the_close() {
         // few bytes from a valid buffer, written only once the master is closed.
         let wrote = unsafe {
             libc::close(sh.master);
-            let wrote = libc::write(gate, b"go\n".as_ptr().cast(), 3);
-            libc::close(gate);
-            wrote
+            libc::write(gate.as_raw_fd(), b"go\n".as_ptr().cast(), 3)
         };
         assert_eq!(wrote, 3, "the go line reaches the fifo");
+        // Only now may the shell open the go FIFO: the queued line must outlive a late reader.
+        // SAFETY: `open_gate` is live and the go line is a valid three-byte buffer.
+        assert_eq!(
+            unsafe { libc::write(open_gate.as_raw_fd(), b"go\n".as_ptr().cast(), 3) },
+            3
+        );
+        let deadline = Instant::now() + HANG_DETECTOR;
         while restored && !marker.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
         let finished = marker.exists();
+        // The shell may open the FIFO only after its `cleared` write. Keep its writer until
+        // that late reader consumed the queued line and the handler acknowledged completion.
+        drop(gate);
+        drop(open_gate);
         end_row(sh.pid, hold);
         assert!(
             restored,
             "teardown left `CLOCAL` clear after {name}'s foreground job cleared it"
         );
-        assert!(finished, "the master's close cut {name}'s exit handler");
+        assert!(
+            finished,
+            "{name}'s exit handler did not acknowledge the queued line after the master's close"
+        );
     }
 }
 

@@ -1169,7 +1169,7 @@ warm = ["m3"]
         seed_local_swarm_roster(home, "m100", &["m32"]);
         let config = home.join(".config/aterm/aterm.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
-        fs::write(&config, "[fleet]\nmachine = \"m999\"\n").unwrap();
+        crate::test_config::write(&config, "[fleet]\nmachine = \"m999\"\n").unwrap();
 
         let paths = aterm_secrets::client::Paths::for_home(home);
         let writer = std::rc::Rc::new(std::cell::RefCell::new(Some(
@@ -1252,7 +1252,7 @@ warm = ["m3"]
         aterm_secrets::client::sync(&denied_paths, None).unwrap();
         let denied_cfg = denied_home.join(".config/aterm/aterm.toml");
         fs::create_dir_all(denied_cfg.parent().unwrap()).unwrap();
-        fs::write(&denied_cfg, "[fleet]\nmachine = \"m100\"\n").unwrap();
+        crate::test_config::write(&denied_cfg, "[fleet]\nmachine = \"m100\"\n").unwrap();
         assert_eq!(
             aterm_secrets::client::resolve_local_swarm_label(&denied_paths, &["m100".to_owned()])
                 .unwrap(),
@@ -1288,7 +1288,7 @@ warm = ["m3"]
         // Even if `aterm.toml` claims a different label (`m200`), a machine whose vault
         // `source.toml` host (`m100`) is in `deny_labels` has `recipient_denied = true` and
         // cannot fall back to `aterm.toml`.
-        fs::write(&denied_cfg, "[fleet]\nmachine = \"m200\"\n").unwrap();
+        crate::test_config::write(&denied_cfg, "[fleet]\nmachine = \"m200\"\n").unwrap();
         assert_eq!(
             resolve_local_pool_identity(Some(&denied_home), Some(&denied_cfg), None).unwrap(),
             None
@@ -1479,7 +1479,7 @@ warm = ["m3"]
             "email,computer,claude,codex\ncsv-only@example.test,m100,1,1\n",
         )
         .unwrap();
-        fs::write(
+        crate::test_config::write(
             config_dir.join("aterm.toml"),
             "[fleet]\nmachine = \"m100\"\n",
         )
@@ -1498,7 +1498,7 @@ warm = ["m3"]
         // Now deliver `~/.secrets/ai-pool.toml`: it outranks `ai-accounts.csv`, resolves `m100`
         // + alias `m32` from `swarm-roster.toml`, warms both `a01` (home `m100`) and `a02` (via
         // alias `m32`, home `m9`), retains `csv-only` as `held_by = "pool"`, and syncs Codex too.
-        fs::write(config_dir.join("aterm.toml"), "").unwrap();
+        crate::test_config::write(config_dir.join("aterm.toml"), "").unwrap();
         let pool_v1 = r#"
 version = 1
 

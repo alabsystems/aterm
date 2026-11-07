@@ -23,16 +23,20 @@ fn parse_takes_the_design_defaults() {
     assert_eq!(args.minutes, 5);
     assert_eq!(args.seed, 7);
     assert_eq!(args.control, None);
-    assert!(!args.record && !args.keep && args.label.is_none());
+    assert!(!args.record && !args.keep && !args.whole_wraps && args.label.is_none());
 }
 
 #[test]
 fn parse_reads_every_flag() {
     let args = parse(
-        &words("--n 14 --seed 42 --minutes 2 --aterm /x/aterm --keep --record --label first"),
+        &words(
+            "--n 14 --seed 42 --minutes 2 --whole-wraps --aterm /x/aterm --keep --record \
+             --label first",
+        ),
         0,
     )
     .expect("they parse");
+    assert!(args.whole_wraps);
     assert_eq!(args.n, 14);
     assert_eq!(args.seed, 42);
     assert_eq!(args.minutes, 2);
@@ -55,6 +59,9 @@ fn parse_refuses_what_the_lab_cannot_run() {
         "--negative-control no-inventory-on-gap",
         "--negative-control reused-incarnation",
         "--negative-control nothing",
+        "--negative-control frontier-blind",
+        "--negative-control unsettled-ok --whole-wraps",
+        "--negative-control old-gap-rule --whole-wraps",
         "--frobnicate",
         "--n",
     ] {
@@ -63,13 +70,22 @@ fn parse_refuses_what_the_lab_cannot_run() {
     }
 }
 
-/// Each control the lab runs parses to itself, and its world's environment names it.
+/// Each control the lab runs parses to itself in the arm that judges its check, and its world's
+/// environment names it.
 /// NEGATIVE CONTROL: putting back the refusal that waited for A3 fails the parse.
 #[test]
 fn parse_takes_each_control_the_lab_runs_into_every_macs_world() {
     for control in CONTROLS {
-        let args =
-            parse(&words(&format!("--negative-control {}", control.name)), 0).expect(control.name);
+        let arm = if control.whole_wraps {
+            " --whole-wraps"
+        } else {
+            ""
+        };
+        let args = parse(
+            &words(&format!("--negative-control {}{arm}", control.name)),
+            0,
+        )
+        .expect(control.name);
         assert_eq!(args.control, Some(*control));
         assert_eq!(
             control_env(args.control),
@@ -79,12 +95,28 @@ fn parse_takes_each_control_the_lab_runs_into_every_macs_world() {
     assert_eq!(control_env(None), None);
 }
 
+/// Each control breaks a check the judgement of its arm makes, and that arm judges no check of
+/// the other's: [`PREFIX_HELD`] outside `--whole-wraps`, [`FRONTIER_SETTLED`] in it.
 #[test]
 fn every_control_breaks_a_check_the_judgement_makes() {
-    let names: BTreeSet<&str> = judge(&Evidence::default()).iter().map(|c| c.name).collect();
+    let names = |whole_wraps: bool| -> BTreeSet<&str> {
+        judge(&Evidence {
+            whole_wraps,
+            ..Evidence::default()
+        })
+        .iter()
+        .map(|c| c.name)
+        .collect()
+    };
     for control in CONTROLS {
-        assert!(names.contains(control.breaks), "{}", control.name);
+        assert!(
+            names(control.whole_wraps).contains(control.breaks),
+            "{}",
+            control.name
+        );
     }
+    assert!(names(false).contains(PREFIX_HELD) && !names(false).contains(FRONTIER_SETTLED));
+    assert!(names(true).contains(FRONTIER_SETTLED) && !names(true).contains(PREFIX_HELD));
 }
 
 #[test]
@@ -177,6 +209,31 @@ fn a_kill_mid_batch_leaves_the_everyone_epoch_and_half_its_wraps() {
     assert_eq!(prefix_len(&[], None), 0);
 }
 
+/// The `--whole-wraps` cut takes the `[everyone]` epoch and every `Wrap` right after it, the
+/// admin's included, and stops at its first `Put`.
+/// NEGATIVE CONTROL: [`prefix_len`]'s half cut leaves two of four `Wrap`s (4, not 6).
+#[test]
+fn the_whole_wraps_cut_takes_every_wrap_and_no_put() {
+    use Kind::{Epoch, Put, Remove, Wrap};
+    let (e, ring) = ((Epoch, true), (Epoch, false));
+    let (r, w, p) = ((Remove, false), (Wrap, false), (Put, false));
+    let batch = [r, e, w, w, w, w, p, ring, w];
+    assert_eq!(whole_wraps_len(&batch), 6, "Remove, Epoch, its four Wraps");
+    assert_eq!(prefix_len(&batch, None), 4, "CONTROL: the half cut");
+    assert_eq!(
+        whole_wraps_len(&[r, ring, w, w, e, w, w, p]),
+        7,
+        "the ring epoch whole, then the [everyone] epoch and its Wraps"
+    );
+    assert_eq!(whole_wraps_len(&[r, e]), 2);
+    assert_eq!(
+        whole_wraps_len(&[r, ring, w, w]),
+        2,
+        "no [everyone] epoch: half"
+    );
+    assert_eq!(whole_wraps_len(&[]), 0);
+}
+
 #[test]
 fn record_arms_name_what_differs_from_the_default() {
     let mut args = parse(&[], 3).expect("parses");
@@ -188,6 +245,11 @@ fn record_arms_name_what_differs_from_the_default() {
     assert_eq!(arm, "-n14-nc-old-gap-rule-first");
     assert!(flags.contains("--n 14") && flags.contains("--negative-control old-gap-rule"));
     assert!(flags.contains("--seed 3"));
+    args.whole_wraps = true;
+    args.control = None;
+    let (arm, flags) = record_arm(&args);
+    assert_eq!(arm, "-n14-whole-wraps-first");
+    assert!(flags.contains(" --whole-wraps"));
 }
 
 /// A record names the tree its run began on, and says where the checkout was when it was written
@@ -310,8 +372,10 @@ fn holding() -> Evidence {
                 1_000 + client::SETTLE_GRACE_MS + 61_000,
             )],
             newer: Vec::new(),
+            heal_ms: 1_000 + 30_000,
             read: true,
         },
+        whole_wraps: false,
         control: None,
     }
 }
@@ -544,6 +608,43 @@ fn the_prefix_hold_reads_when_the_heal_signed() {
             "{check} judged unread"
         );
     }
+}
+
+/// The `--whole-wraps` arm judges the heal's first `Wrap` against the settle grace from its
+/// batch's posting: inside it the frontier settled the batch, past it the heal waited the grace.
+/// Where the islands began to heal past half the grace, the records' crossing after it could
+/// carry a heal at once past the grace: the run cannot tell the two, and judges nothing.
+/// NEGATIVE CONTROL: a first heal `Wrap` past the grace, where `frontier-blind` leaves it, fails
+/// the check, and the control bites on it.
+#[test]
+fn the_frontier_check_reads_when_the_heal_first_signed() {
+    let whole = |first_after: u64| {
+        let mut ev = holding();
+        ev.whole_wraps = true;
+        ev.partial.heal_wraps.clear();
+        healed_after(&mut ev, first_after);
+        ev
+    };
+    let at_once = whole(40_000);
+    assert_eq!(failing(&at_once), Vec::<&str>::new());
+    let control = CONTROLS[2];
+    assert_eq!(control.breaks, FRONTIER_SETTLED);
+    assert!(
+        !verdict(&judge(&at_once), Some(control)),
+        "a control that did not bite"
+    );
+    let blind = whole(client::SETTLE_GRACE_MS + 61_000);
+    assert!(failing(&blind).contains(&FRONTIER_SETTLED));
+    assert!(verdict(&judge(&blind), Some(control)));
+    let mut late = whole(client::SETTLE_GRACE_MS + 61_000);
+    late.partial.heal_ms = late.partial.reached_ms + client::SETTLE_GRACE_MS / 2;
+    let c = judge(&late)
+        .into_iter()
+        .find(|c| c.name == FRONTIER_SETTLED);
+    assert!(
+        c.is_some_and(|c| !c.ran && !c.pass),
+        "a heal begun past half the grace tells nothing"
+    );
 }
 
 #[test]

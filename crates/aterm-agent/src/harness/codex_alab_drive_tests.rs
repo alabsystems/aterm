@@ -433,6 +433,16 @@ impl Kernel for Crashed {
     fn terminal(&self, _: u32) -> Option<(u32, String)> {
         Some((1, "launchd".to_string()))
     }
+
+    /// No start through the shared kernel (`None`: unread, never an end): the codex-alab lane
+    /// reads its processes' births through [`AlabKernel::birth`], which scripts them in order.
+    fn process_start(&self, _: u32) -> Option<String> {
+        None
+    }
+
+    fn restart_background(&self, _: u32) -> Vec<String> {
+        crate::harness::upgrade_drive::tests::unstated("background")
+    }
 }
 
 impl AlabKernel for Crashed {
@@ -1874,8 +1884,68 @@ fn a_reused_tui_pid_after_a_reboot_does_not_hold_the_relaunch() {
             assert_ne!(r.step, "wait:exiting", "{r:?}\n{:#?}", rig.asked());
             assert_eq!(rig.typed().len(), 1, "{:#?}", rig.asked());
         } else {
-            assert_eq!(r.step, "wait:exiting", "{r:?}");
+            assert_eq!(r.step, "wait:not-exited", "{r:?}");
             assert!(rig.typed().is_empty(), "{:#?}", rig.asked());
+        }
+    }
+}
+
+/// A RECORD AN EARLIER BUILD SAVED MID-RESTART, WITH NO `pid_start` AND NO EXIT STAMP (RS2): it
+/// names its TUI by the start it wrote beside that pid (`proc_start`, read at load), so after a
+/// reboot reuses the pid its exit is proven by identity and the relaunch types its line at once,
+/// never waiting on the bare pid until the stale clock. CONTROL: a live pid whose start cannot be
+/// read proves nothing, and the relaunch is never held on it (`wait:exit-unproven`, nothing
+/// typed).
+#[test]
+fn a_record_saved_mid_restart_by_an_earlier_build_relaunches_after_a_reboot() {
+    for (name, birth, unproven) in [
+        ("reused", Some("Fri Nov  6 07:00:00 2026"), false),
+        ("unread", None, true),
+    ] {
+        let mut rig = Rig::new(
+            &format!("legacy-in-flight-{name}"),
+            &["zsh: killed     codex"],
+        );
+        let snap = rig.snap(None);
+        let resume = rig.resume(None);
+        *rig.status_extra.lock().expect("status") = " human_ms=500".to_string();
+        let r =
+            self_claimed_after_exit(&rig.opts, &snap, &resume, ExitCause::HostEnded, &rig.kernel);
+        assert_eq!(r.step, "wait:held", "{name}: {r:?}");
+        // The record as an earlier build wrote it: no `pid_start`, and no exit stamp.
+        let mut legacy = rig.state();
+        legacy.exited_at = 0;
+        let mut json: aterm_json::Value = aterm_json::from_str(&legacy.to_json()).expect("json");
+        json.as_object_mut().expect("an object").remove("pid_start");
+        std::fs::write(
+            state_dir(&rig.opts).join(format!("{}.json", key(TAB))),
+            aterm_json::to_string(&json).expect("json"),
+        )
+        .expect("the earlier build's record");
+        assert_eq!(
+            rig.state().pid_start,
+            squash(&snap.start),
+            "{name}: its TUI named by the start it wrote beside its pid"
+        );
+        rig.status_extra.lock().expect("status").clear();
+        rig.kernel.tui_alive = true;
+        rig.kernel.tui_birth = birth.map(str::to_string);
+        let r =
+            self_claimed_after_exit(&rig.opts, &snap, &resume, ExitCause::HostEnded, &rig.kernel);
+        if unproven {
+            assert_eq!(
+                r.step,
+                crate::harness::relaunch::WAIT_EXIT_UNPROVEN,
+                "{name}: {r:?}"
+            );
+            assert!(rig.typed().is_empty(), "{name}: {:#?}", rig.asked());
+        } else {
+            assert!(
+                !r.step.starts_with("wait:"),
+                "{name}: {r:?}\n{:#?}",
+                rig.asked()
+            );
+            assert_eq!(rig.typed().len(), 1, "{name}: {:#?}", rig.asked());
         }
     }
 }

@@ -4252,8 +4252,9 @@ struct CachedGlyph {
     /// The knock-out's ring of a mono raster ([`knock_ring`]), built the first time the glyph
     /// lies on a companion's body and dropped with the entry.
     ring: std::cell::OnceCell<Box<[u8]>>,
-    /// Coverage is measured once for this raster and evicted with it.
-    coverage: std::cell::OnceCell<Option<std::sync::Arc<GlyphCoverage>>>,
+    /// Coverage, and where the raster lays its ink row by row in its cell, are measured once
+    /// for this raster and evicted with it.
+    coverage: std::cell::OnceCell<Option<(std::sync::Arc<GlyphCoverage>, glyph_ink::InkRows)>>,
 }
 
 impl CachedGlyph {
@@ -19556,6 +19557,7 @@ pub struct BeamScratch {
     stack: Vec<(usize, usize)>,
     kept: Vec<usize>,
     verts: Vec<BeamVertex>,
+    feathered: Vec<BeamVertex>,
 }
 
 impl BeamScratch {
@@ -19566,6 +19568,7 @@ impl BeamScratch {
         stack: Vec::new(),
         kept: Vec::new(),
         verts: Vec::new(),
+        feathered: Vec::new(),
     };
 
     fn simplify(&mut self, run: &[CometSample], straighten: f32) {
@@ -20730,13 +20733,17 @@ pub fn layer_stack_lift(
 /// The deep-space nebula haze wrapped around the photon beam's outer layers (`0x00RRGGBB`).
 pub const BEAM_SPACE_HAZE: u32 = 0x005A_3BD6;
 
-/// The beam tube layers (same tuple shape as [`COMET_LAYERS`]).
-pub const BEAM_LAYERS: [(f32, f32, u32, f32, f32, usize); 5] = [
+/// The beam tube layers (same tuple shape as [`COMET_LAYERS`]): a white-hot core in an ice
+/// rod, sleeved in a faint haze no wider than two and a half rods, so the tube keeps to its
+/// own row. Its sleeve once reached three and five and a half rods: at a full-power rod a third
+/// of a cell thick, the outer one stood a row and three quarters tall, and over a Backspace's
+/// erased cells the tube lay as a white slab between two nested lavender boxes over the
+/// letters of the rows above and below (composed r3's judges; the after-land lows' W6).
+pub const BEAM_LAYERS: [(f32, f32, u32, f32, f32, usize); 4] = [
     (0.55, 1.00, MIX_WHITE, 0.55, 0.30, 1),
     (1.0, 0.95, MIX_WHITE, 0.20, 0.08, 1),
     (1.6, 0.58, BEAM_SPACE_HAZE, 0.18, 0.0, 1),
-    (3.0, 0.30, BEAM_SPACE_HAZE, 0.55, 0.0, 2),
-    (5.5, 0.13, BEAM_SPACE_HAZE, 0.85, 0.0, 2),
+    (2.5, 0.24, BEAM_SPACE_HAZE, 0.55, 0.0, 2),
 ];
 
 /// The laser filament layers (same tuple shape as [`COMET_LAYERS`]).
@@ -20794,13 +20801,18 @@ pub fn beam_glow_quads<S: BeamRows + ?Sized>(
 }
 
 /// Shared body of [`comet_glow_quads`] / [`phaser_streak_quads`] / [`beam_glow_quads`], without the per-call scratch they build.
+///
+/// `feather` rounds each layer's two ends off: a layer fades from nothing at each end of the
+/// run to its own light over `feather` of its half-thickness (`0`: flat ends, every layer
+/// whole to the run's last pixel). A wide sleeve laid whole to its ends stands as a box, its
+/// ends hard edges as tall as the sleeve is thick (Beam's haze, the after-land lows' W6).
 #[allow(clippy::too_many_arguments)]
 pub fn layered_beam_quads_with<S: BeamRows + ?Sized>(
     scratch: &mut BeamScratch,
     out: &mut S,
     clip: BeamClip,
     run: &[CometSample],
-    core_px: f32,
+    (core_px, feather): (f32, f32),
     straighten: f32,
     color_at: &dyn Fn(f32) -> u32,
     layers: &[(f32, f32, u32, f32, f32, usize)],
@@ -20813,6 +20825,7 @@ pub fn layered_beam_quads_with<S: BeamRows + ?Sized>(
         styles,
         kept,
         verts,
+        feathered,
         ..
     } = scratch;
     styles.clear();
@@ -20833,8 +20846,61 @@ pub fn layered_beam_quads_with<S: BeamRows + ?Sized>(
                 cov: (s.cov as f32 * cmul) as u8,
             });
         }
-        comet_beam(out, clip, verts, core_px * tmul, lstep, 0.0);
+        let thickness = core_px * tmul;
+        if feather > 0.0 && feather_ends(verts, feathered, feather * 0.5 * thickness) {
+            comet_beam(out, clip, feathered, thickness, lstep, 0.0);
+        } else {
+            comet_beam(out, clip, verts, thickness, lstep, 0.0);
+        }
     }
+}
+
+/// `verts` with each end faded from nothing over `span` px of its length (or half the
+/// polyline's length, if shorter), into `out`: a vertex at each end at no light, and one
+/// `span` in from it at the light the polyline lays there. `false` (and `out` untouched) for a
+/// polyline with no length.
+fn feather_ends(verts: &[BeamVertex], out: &mut Vec<BeamVertex>, span: f32) -> bool {
+    let seg = |a: &BeamVertex, b: &BeamVertex| (b.x - a.x).hypot(b.y - a.y);
+    let total: f32 = verts.windows(2).map(|w| seg(&w[0], &w[1])).sum();
+    if verts.len() < 2 || !total.is_finite() || total <= 1e-3 {
+        return false;
+    }
+    let d = span.min(total * 0.5).max(0.0);
+    // The vertex `at` px along the polyline.
+    let at = |at: f32| -> BeamVertex {
+        let mut walked = 0.0f32;
+        for w in verts.windows(2) {
+            let l = seg(&w[0], &w[1]);
+            if walked + l >= at && l > 0.0 {
+                let t = ((at - walked) / l).clamp(0.0, 1.0);
+                let (a, b) = (w[0], w[1]);
+                return BeamVertex {
+                    x: a.x + (b.x - a.x) * t,
+                    y: a.y + (b.y - a.y) * t,
+                    color: lerp_rgb_f(a.color, b.color, t),
+                    cov: (f32::from(a.cov) + (f32::from(b.cov) - f32::from(a.cov)) * t) as u8,
+                };
+            }
+            walked += l;
+        }
+        verts[verts.len() - 1]
+    };
+    out.clear();
+    out.push(BeamVertex { cov: 0, ..verts[0] });
+    out.push(at(d));
+    let mut walked = 0.0f32;
+    for w in verts.windows(2) {
+        walked += seg(&w[0], &w[1]);
+        if walked > d && walked < total - d {
+            out.push(w[1]);
+        }
+    }
+    out.push(at(total - d));
+    out.push(BeamVertex {
+        cov: 0,
+        ..verts[verts.len() - 1]
+    });
+    true
 }
 
 #[inline]
@@ -20852,7 +20918,7 @@ fn layered_beam_quads<S: BeamRows + ?Sized>(
         out,
         clip,
         run,
-        core_px,
+        (core_px, 0.0),
         straighten,
         color_at,
         layers,
@@ -32600,6 +32666,89 @@ mod comet_beam_tests {
             color: 0x0050_FA7B,
             cov,
         }
+    }
+
+    /// AFTER-LAND LOWS W6: A FEATHERED TUBE ROUNDS EVERY LAYER'S ENDS OFF. Laid whole to its
+    /// run's ends, Beam's sleeve stood as a box with hard edges as tall as it is thick (over a
+    /// Backspace's erased cells a white slab between lavender boxes, and on the dark Settings
+    /// card a lavender column with a hard edge, composed r3's judges). Fed an even run, a
+    /// feathered tube lays the column a pixel in from its end at under a third of the light
+    /// of the column a whole thickness in, at both ends. Control: `feather` 0, every layer
+    /// whole to the run's last pixel.
+    #[test]
+    fn a_feathered_beam_rounds_each_layer_s_ends() {
+        let clip = BeamClip::grid(300, 96, 32);
+        let run = [
+            CometSample {
+                x: 40.0,
+                y: 48.0,
+                cov: 255,
+                pos: 0.0,
+            },
+            CometSample {
+                x: 240.0,
+                y: 48.0,
+                cov: 255,
+                pos: 1.0,
+            },
+        ];
+        let core = 6.0;
+        let reach = (core * 2.5) as i32;
+        // The light (a light's premultiplied green, the white tube's every channel, summed down
+        // each column) the tube lays in each column.
+        let columns = |feather: f32| {
+            let (mut scratch, mut out) = (super::BeamScratch::default(), Vec::<GlowQuad>::new());
+            super::layered_beam_quads_with(
+                &mut scratch,
+                &mut out,
+                clip,
+                &run,
+                (core, feather),
+                0.0,
+                &|_| 0x00FF_FFFF,
+                &super::BEAM_LAYERS,
+            );
+            let mut col = vec![0u32; 300];
+            for q in &out {
+                let w = u32::from(q.w.max(1));
+                for i in 0..w {
+                    let (g0, g1) = ((q.color >> 8) & 0xff, (q.color2 >> 8) & 0xff);
+                    let a = if q.is_flat() {
+                        g0
+                    } else {
+                        (g0 * (2 * w - (2 * i + 1)) + g1 * (2 * i + 1) + w) / (2 * w)
+                    };
+                    col[usize::from(q.x) + i as usize] += a * u32::from(q.h);
+                }
+            }
+            col
+        };
+        // The end's light against the light a whole thickness in, at the tail and the head.
+        let ends = |col: &[u32]| {
+            let first = col
+                .iter()
+                .position(|&c| c > 0)
+                .expect("the tube lays light") as i32;
+            let last = col
+                .iter()
+                .rposition(|&c| c > 0)
+                .expect("the tube lays light") as i32;
+            let at = |x: i32| col[x as usize] as f32;
+            (
+                at(first + 1) / at(first + reach).max(1.0),
+                at(last - 1) / at(last - reach).max(1.0),
+            )
+        };
+        let (tail, head) = ends(&columns(1.5));
+        assert!(
+            tail < 0.34 && head < 0.34,
+            "the tube's ends are hard: tail {tail:.2}, head {head:.2} of its light"
+        );
+        let (tail, head) = ends(&columns(0.0));
+        assert!(
+            tail >= 0.34 && head >= 0.34,
+            "control: a tube laid whole to its ends ends hard (tail {tail:.2}, head {head:.2})"
+        );
     }
 
     /// A comet beam laid into a ramp sink is its legacy quads: an x-major

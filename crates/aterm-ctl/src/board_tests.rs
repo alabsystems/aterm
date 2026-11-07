@@ -300,17 +300,30 @@ fn an_idle_keeper_is_due_at_its_next_prune_ask_or_backoff() {
 /// its next due an hour away; the write is caught even when it lands before the rest begins.
 /// NEGATIVE CONTROL: `Rest::until` sleeping to `due` without its watch hangs past the
 /// one-minute hang detector, and "the write ended the rest" fails.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_resting_keeper_wakes_when_its_board_is_written() {
     let (_dir, board) = scratch();
-    board.ensure().expect("the board's folder");
+    let mut row = worker("s-0c1", "L", now_ms());
+    board.record(&row).expect("the initial row and lock exist");
+    let lock = aterm_uds::file_watch::FileStamp::of(&board.dir().join(LOCK));
     let mut rest = Rest::new(board.dir());
-    board
-        .record(&worker("s-0c1", "L", now_ms()))
-        .expect("record");
+    row.label = Some("rewritten while resting".into());
+    // Publish independently of the writer lock. On Linux even closing a lock opened writable
+    // can emit CLOSE_WRITE, so calling record here could hide a mistaken lock-only watch.
+    aterm_uds::atomic_file::write(
+        &board.dir().join(&row.sid),
+        format!("{}\n", row.line()).as_bytes(),
+        0o600,
+    )
+    .expect("replace the existing row without touching the lock");
+    assert_eq!(
+        aterm_uds::file_watch::FileStamp::of(&board.dir().join(LOCK)),
+        lock,
+        "updating a row does not change the lock entry"
+    );
     let (done, ended) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    let waiting = std::thread::spawn(move || {
         let changed = rest.until(std::time::Instant::now() + Duration::from_secs(3600));
         let _ = done.send(changed);
     });
@@ -319,6 +332,113 @@ fn a_resting_keeper_wakes_when_its_board_is_written() {
         Ok(true),
         "the write ended the rest"
     );
+    waiting.join().expect("the rest finished");
+    assert_eq!(board.scan().rows, [row]);
+}
+
+/// A new registration must return before waiting for a later write or deadline. The minute
+/// detects a hang, not a latency budget; a failed test's directory and process retire the watch.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rearmed_without_another_write(mut rest: Rest, why: &str) -> Rest {
+    let (done, ended) = std::sync::mpsc::channel();
+    let waiting = std::thread::spawn(move || {
+        let invalidated = rest.until(std::time::Instant::now() + Duration::from_secs(3600));
+        let _ = done.send((rest, invalidated));
+    });
+    let (rest, invalidated) = ended.recv_timeout(Duration::from_secs(60)).expect(why);
+    waiting.join().expect("the rest finished");
+    assert!(invalidated, "{why}");
+    rest
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_rearmed_board_watch_requires_a_fresh_snapshot_after_creation() {
+    let (_dir, board) = scratch();
+    let mut rest = Rest::new(board.dir());
+    assert!(board.scan().rows.is_empty());
+    assert!(!rest.until(std::time::Instant::now()), "no folder to watch");
+
+    let row = worker("s-0d1", "L", now_ms());
+    board.record(&row).expect("write before the watch exists");
+    let mut rest = rearmed_without_another_write(
+        rest,
+        "a new watch invalidates the snapshot taken before registration",
+    );
+    assert_eq!(board.scan().rows, [row]);
+    assert!(
+        !rest.until(std::time::Instant::now()),
+        "the retained watch does not invalidate an unchanged snapshot"
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_rearmed_board_watch_requires_a_fresh_snapshot_after_replacement() {
+    let (dir, board) = scratch();
+    board.ensure().expect("the original board folder");
+    let mut rest = Rest::new(board.dir());
+    std::fs::rename(board.dir(), dir.path().join("previous-board"))
+        .expect("move the watched directory away");
+    assert!(rest.until(std::time::Instant::now()), "the watch is gone");
+    assert!(board.scan().rows.is_empty());
+
+    let row = worker("s-0d2", "L", now_ms());
+    board
+        .record(&row)
+        .expect("write before the replacement watch");
+    let mut rest = rearmed_without_another_write(
+        rest,
+        "a replacement watch invalidates the snapshot taken before registration",
+    );
+    assert_eq!(board.scan().rows, [row]);
+    assert!(
+        !rest.until(std::time::Instant::now()),
+        "the replacement watch stays armed without another invalidation"
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_board_watch_hears_replacement_of_its_state_directory() {
+    let root = aterm_tempfile::tempdir().expect("scratch");
+    let state = root.path().join("state");
+    let board = Board::in_state(&state);
+    board.ensure().expect("the original board");
+    let original = aterm_uds::directory_identity::read(board.dir()).unwrap();
+    let rest = Rest::new(board.dir());
+    assert!(board.scan().rows.is_empty());
+
+    let previous = root.path().join("previous-state");
+    std::fs::rename(&state, &previous).expect("move the state ancestor");
+    let row = worker("s-0e1", "L", now_ms());
+    board
+        .record(&row)
+        .expect("write into the replacement board");
+    assert_eq!(
+        aterm_uds::directory_identity::read(&previous.join(DIR)).unwrap(),
+        original
+    );
+    assert_ne!(
+        aterm_uds::directory_identity::read(board.dir()).unwrap(),
+        original
+    );
+    let mut rest = rearmed_without_another_write(
+        rest,
+        "a moved state directory invalidates the old board snapshot",
+    );
+    assert_eq!(board.scan().rows.as_slice(), std::slice::from_ref(&row));
+    assert!(
+        !rest.until(std::time::Instant::now()),
+        "the new path is armed"
+    );
+
+    let later = worker("s-0e2", "L", now_ms());
+    board.record(&later).expect("write after recovery");
+    let _rest = rearmed_without_another_write(rest, "a later write at the new path is heard");
+    let mut rows = board.scan().rows;
+    rows.sort_by(|a, b| a.sid.cmp(&b.sid));
+    assert_eq!(rows, [row, later]);
 }
 
 #[test]
@@ -624,8 +744,9 @@ fn a_board_prunes_a_closed_row_a_keeper_keeps_reading_as_gone() {
         Some(now - 6 * day),
         "a re-ask that reads it gone leaves when it closed"
     );
-    let _lock = board.lock().expect("the board's lock");
-    board.prune_locked(later);
+    let bound = board.bind(false).expect("bound board");
+    let _lock = bound.lock().expect("the board's lock");
+    bound.prune_locked(later);
     assert!(board.row("s-0a1").is_none(), "closed over a week: pruned");
 }
 
@@ -721,4 +842,158 @@ fn a_wait_writes_only_rows_of_the_mac_that_answered() {
     );
     apply_seen(&seen, Writes::Rows);
     assert_eq!(states(), ["done", "closed"]);
+}
+
+/// Old round replies and pruning remain on the board whose keeper lock is held, even
+/// when the same pathname now names new rows with the same worker ids.
+#[cfg(unix)]
+#[test]
+fn a_keeper_lease_binds_reads_merges_and_pruning_to_its_locked_directory() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let state = scratch.path().join("state");
+    let retired = scratch.path().join("retired");
+    let board = Board::in_state(&state);
+    let original = worker("s-0a1", "original", at(1));
+    board.record(&original).unwrap();
+    let held = board.keeper_lock().unwrap();
+    std::fs::rename(&state, &retired).unwrap();
+    let replacement = worker("s-0a1", "replacement", at(2));
+    board.record(&replacement).unwrap();
+    let new_keeper = board.keeper_lock().unwrap();
+    assert!(!held.board.is_current());
+    assert!(new_keeper.board.is_current());
+    assert_eq!(
+        held.board.scan().rows.as_slice(),
+        std::slice::from_ref(&original)
+    );
+    let read = held.board.row("s-0a1").unwrap();
+    assert_eq!(read, original);
+    assert_eq!(
+        held.board
+            .apply(
+                &["@s-0a1 rev=3 state=done conclusion=finished".to_owned()],
+                now_ms()
+            )
+            .unwrap(),
+        1
+    );
+    let old_board = Board::in_state(&retired);
+    let updated = old_board.row("s-0a1").unwrap();
+    assert_eq!(updated.rev, 3);
+    assert_eq!(updated.label, original.label);
+    assert_eq!(updated.started_ms, original.started_ms);
+    assert_eq!(board.row("s-0a1").unwrap(), replacement);
+    assert!(
+        old_board.keeper_lock().is_none(),
+        "the old lease still owns the retired board"
+    );
+    let _writer = held.board.lock().unwrap();
+    held.board.prune_locked(now_ms() + millis(UNHEARD_KEPT));
+    assert!(old_board.row("s-0a1").is_none());
+    assert_eq!(board.row("s-0a1").unwrap(), replacement);
+    drop((held, new_keeper));
+    assert!(old_board.keeper_lock().is_some());
+}
+
+/// A waiter already asleep on the retired inode must discard it after handoff, then
+/// acquire the directory currently named by the board. The callback proves pre-opening;
+/// the minute bounds a hang, not a promised handoff latency.
+#[cfg(unix)]
+#[test]
+fn a_preopened_keeper_waiter_rebinds_after_directory_replacement() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let state = scratch.path().join("state");
+    let retired = scratch.path().join("retired");
+    let board = Board::in_state(&state);
+    let first = board.keeper_lock().unwrap();
+    let (held, found_held) = std::sync::mpsc::channel();
+    let (finished, result) = std::sync::mpsc::channel();
+    let waiter = {
+        let board = board.clone();
+        std::thread::spawn(move || {
+            let binding = board.wait_keeper_lock(|| {
+                held.send(()).unwrap();
+            });
+            finished
+                .send(binding)
+                .unwrap_or_else(|_| panic!("waiter result receiver gone"));
+        })
+    };
+    found_held
+        .recv_timeout(Duration::from_secs(60))
+        .expect("waiter pre-opened the old lock");
+    std::fs::rename(&state, &retired).unwrap();
+    let replacement = worker("s-0a1", "replacement", at(1));
+    board.record(&replacement).unwrap();
+    drop(first);
+    let second = result
+        .recv_timeout(Duration::from_secs(60))
+        .expect("keeper handoff did not finish")
+        .unwrap();
+    waiter.join().unwrap();
+    assert!(second.board.is_current());
+    assert_eq!(second.board.scan().rows, [replacement]);
+    assert!(
+        board.keeper_lock().is_none(),
+        "the returned lease owns the current board"
+    );
+    assert!(
+        Board::in_state(&retired).keeper_lock().is_some(),
+        "the retired lock was released"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_writer_transaction_keeps_its_directory_when_the_state_path_is_replaced() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let state = scratch.path().join("state");
+    let retired = scratch.path().join("retired");
+    let board = Board::in_state(&state);
+    let original = worker("s-0a1", "original", at(1));
+    board.record(&original).unwrap();
+    use std::os::unix::fs::MetadataExt as _;
+    let transaction = board.bind(false).unwrap();
+    let old_writer = transaction.lock().unwrap();
+    std::fs::rename(&state, &retired).unwrap();
+    let metadata = std::fs::metadata(retired.join(DIR).join(LOCK)).unwrap();
+    let replacement = worker("s-0a1", "replacement", at(2));
+    board.record(&replacement).unwrap();
+    let (events, first_event) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let mut contended = Some(events.clone());
+        let result = aterm_uds::file_lock::with_lock_wait_observer(
+            move |file| {
+                if let Some(events) = contended.take() {
+                    let metadata = file.metadata().unwrap();
+                    events.send(Some((metadata.dev(), metadata.ino()))).unwrap();
+                }
+            },
+            || transaction.accept("@s-0a1", "passed", now_ms()),
+        );
+        // A wrong-directory lock would complete instead of contending: report that too,
+        // so the failure is observed without using absence or a short timing threshold.
+        let _ = events.send(None);
+        result
+    });
+    let first = first_event
+        .recv_timeout(Duration::from_secs(60))
+        .expect("writer progress");
+    drop(old_writer);
+    let accepted = writer.join().unwrap().unwrap();
+    assert_eq!(
+        first,
+        Some((metadata.dev(), metadata.ino())),
+        "the transaction locks the retired directory it bound"
+    );
+    assert_eq!(accepted.label, original.label);
+    assert_eq!(
+        Board::in_state(&retired)
+            .row("s-0a1")
+            .unwrap()
+            .accept
+            .as_deref(),
+        Some("passed")
+    );
+    assert_eq!(board.row("s-0a1").unwrap(), replacement);
 }

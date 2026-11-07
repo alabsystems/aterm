@@ -384,6 +384,37 @@ pub(super) fn scan(
     reap: bool,
     named: &dyn Fn(&str) -> bool,
 ) -> io::Result<Vec<Record>> {
+    scan_inventory(namespace, reap, named, None, None)
+}
+
+pub(super) fn funded_scopes(
+    namespace: &Namespace,
+    deadline: std::time::Instant,
+) -> io::Result<Vec<crate::FundedScope>> {
+    if std::time::Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "funded scope observation deadline expired",
+        ));
+    }
+    let mut scopes = Vec::new();
+    scan_inventory(
+        namespace,
+        false,
+        &|_| true,
+        Some(&mut scopes),
+        Some(deadline),
+    )?;
+    Ok(scopes)
+}
+
+fn scan_inventory(
+    namespace: &Namespace,
+    reap: bool,
+    named: &dyn Fn(&str) -> bool,
+    mut scopes: Option<&mut Vec<crate::FundedScope>>,
+    deadline: Option<std::time::Instant>,
+) -> io::Result<Vec<Record>> {
     let backend = namespace.open_backend()?;
     for entry in fd::Dir::read_from(backend.as_fd())? {
         let entry = entry?;
@@ -403,6 +434,12 @@ pub(super) fn scan(
     let mut records = Vec::new();
     let mut count = 0;
     for entry in fd::Dir::read_from(active.as_fd())? {
+        if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "funded scope observation deadline expired",
+            ));
+        }
         let entry = entry?;
         let name = entry
             .file_name()
@@ -415,12 +452,22 @@ pub(super) fn scan(
         if count > 4096 || !checkpoint::metadata_name(name) {
             return Err(refused("unknown or unbounded active cohort entry"));
         }
-        let Some((working, record)) = scan_listed(namespace, &active, name, reap)? else {
+        let Some(ScannedClaim {
+            working,
+            record,
+            scope,
+        }) = scan_listed_full(namespace, &active, name, reap, scopes.is_some())?
+        else {
             continue;
         };
         if let Some(record) = record
             && named(&working)
         {
+            if let Some(scope) = scope
+                && let Some(scopes) = scopes.as_mut()
+            {
+                scopes.push(scope);
+            }
             records.push(record)
         }
     }
@@ -435,27 +482,55 @@ pub(super) fn scan(
 ///
 /// # Errors
 /// As [`scan_entry`], for a claim directory still in `active`.
+#[cfg(test)]
 fn scan_listed(
     namespace: &Namespace,
     active: &File,
     name: &str,
     reap: bool,
 ) -> io::Result<Option<(String, Option<Record>)>> {
-    match scan_entry(namespace, active, name, reap) {
+    scan_listed_full(namespace, active, name, reap, false)
+        .map(|entry| entry.map(|entry| (entry.working, entry.record)))
+}
+
+struct ScannedClaim {
+    working: String,
+    record: Option<Record>,
+    scope: Option<crate::FundedScope>,
+}
+
+fn scan_listed_full(
+    namespace: &Namespace,
+    active: &File,
+    name: &str,
+    reap: bool,
+    observe_scope: bool,
+) -> io::Result<Option<ScannedClaim>> {
+    match scan_entry_full(namespace, active, name, reap, observe_scope) {
         Ok(entry) => Ok(Some(entry)),
         Err(_) if left_active(active, name)? => Ok(None),
         Err(error) => Err(error),
     }
 }
 
-/// The active claim directory `name`'s working claim name and, unless drained (and retired
-/// when `reap`), its record.
+/// The active claim directory's original checkpointed working record.
+#[cfg(test)]
 fn scan_entry(
     namespace: &Namespace,
     active: &File,
     name: &str,
     reap: bool,
 ) -> io::Result<(String, Option<Record>)> {
+    scan_entry_full(namespace, active, name, reap, false).map(|entry| (entry.working, entry.record))
+}
+
+fn scan_entry_full(
+    namespace: &Namespace,
+    active: &File,
+    name: &str,
+    reap: bool,
+    observe_scope: bool,
+) -> io::Result<ScannedClaim> {
     let anchor = Anchor::open_name(active, name, namespace.nonce())?;
     let directory = anchor.directory.try_clone()?;
     let mut transaction = if reap {
@@ -464,10 +539,10 @@ fn scan_entry(
         anchor.lock(&directory)?
     };
     if reap {
-        transaction.recover_pending(&directory, namespace.nonce())?
+        transaction.recover_pending(&directory, namespace.nonce())?;
     }
     let working = transaction.scan_name()?.to_owned();
-    let record = probe_under(
+    let observed = probe_under_full(
         namespace,
         &directory,
         &working,
@@ -475,7 +550,43 @@ fn scan_entry(
         reap,
         &mut transaction,
     )?;
-    Ok((working, record))
+    let mut scope = None;
+    let record = if let Some((record, journal)) = observed {
+        if observe_scope && record.held.is_some() {
+            let file = open_mode(&directory, &working, false, false)?;
+            let metadata = file.metadata()?;
+            use std::os::unix::fs::MetadataExt as _;
+            let reference = anchor.closure_ref(
+                namespace.nonce(),
+                ClaimGuardIdentity {
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                },
+            )?;
+            let current = transaction.observe(&directory, &file, &working)?;
+            let (_, current) =
+                Journal::decode(&current, working.ends_with(CLAIM), namespace.nonce())?;
+            if current != journal {
+                return Err(refused(
+                    "funded scope changed during original checkpoint observation",
+                ));
+            }
+            let mut observed = journal.funded_scope(reference);
+            // Numeric external credits do not carry an original birth. The
+            // current writer API refuses them, but retained generations must
+            // still preserve that missing scope rather than infer absence.
+            observed.unresolved |= !record.credit.is_empty();
+            scope = Some(observed);
+        }
+        Some(record)
+    } else {
+        None
+    };
+    Ok(ScannedClaim {
+        working,
+        record,
+        scope,
+    })
 }
 
 /// Whether the claim directory `name` has left `active`. Retirement moves the whole directory
@@ -514,6 +625,18 @@ fn probe_under(
     reap: bool,
     transaction: &mut Transaction,
 ) -> io::Result<Option<Record>> {
+    probe_under_full(namespace, directory, name, admitted, reap, transaction)
+        .map(|observed| observed.map(|(record, _)| record))
+}
+
+fn probe_under_full(
+    namespace: &Namespace,
+    directory: &File,
+    name: &str,
+    admitted: bool,
+    reap: bool,
+    transaction: &mut Transaction,
+) -> io::Result<Option<(Record, Journal)>> {
     if reap {
         transaction.recover_pending(directory, namespace.nonce())?;
     }
@@ -559,11 +682,11 @@ fn probe_under(
                 if record.accounting != Accounting::CohortOwned {
                     record.accounting = Accounting::Whole;
                 }
-                Ok(Some(record))
+                Ok(Some((record, journal)))
             }
         }
         Err(std::fs::TryLockError::WouldBlock) => {
-            Journal::decode(&before, admitted, namespace.nonce()).map(|(r, _)| Some(r))
+            Journal::decode(&before, admitted, namespace.nonce()).map(Some)
         }
         Err(std::fs::TryLockError::Error(error)) => Err(error),
     }
@@ -1701,6 +1824,95 @@ pub(super) mod tests {
             },
             cohort,
         )
+    }
+
+    #[test]
+    fn funded_scope_inventory_retains_unknown_and_distinguishes_actual_native_membership() {
+        use crate::FundedMembership::{Inside, Outside, Unknown};
+        let f = Fixture::new();
+        let mut claim = match Waiter::enter_cohort(
+            &f.ledger,
+            &f.machine,
+            Need::new("scope inventory").mem_gib(1),
+        )
+        .unwrap()
+        .poll(&f.machine)
+        {
+            Polled::Admitted(claim) => claim,
+            other => panic!("scope claim was not admitted: {other:?}"),
+        };
+        let reference = claim.cohort_closure_ref().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let caller = aterm_uds::process::read_identity(std::process::id() as i32).unwrap();
+        let ancestry =
+            aterm_uds::process::Ancestry::capture(std::process::id(), caller.birth, deadline)
+                .unwrap();
+        let unarmed = f.ledger.funded_scopes(deadline).unwrap();
+        assert_eq!(unarmed.len(), 1);
+        assert_eq!(unarmed[0].claim(), &reference);
+        assert_eq!(
+            unarmed[0].membership(&ancestry),
+            Unknown,
+            "the creator of cohort-owned debt is not its execution scope"
+        );
+        let (mut running, root) = start(&mut claim);
+        let child = aterm_uds::process::read_identity(running.child.id() as i32).unwrap();
+        let child_path =
+            aterm_uds::process::Ancestry::capture(running.child.id(), child.birth, deadline)
+                .unwrap();
+        let bound = f.ledger.funded_scopes(deadline).unwrap();
+        assert_eq!(bound[0].membership(&child_path), Inside);
+        assert_eq!(
+            bound[0].membership(&ancestry),
+            Outside,
+            "an unrelated native caller may use remaining original capacity"
+        );
+        assert_eq!(
+            claim.credit(&[running.child.id()]).unwrap_err().kind(),
+            io::ErrorKind::Unsupported,
+            "current public cohort writers cannot create numeric scope credit"
+        );
+        // Retained-reader compatibility still observes already-checkpointed
+        // credit lines from an actual original writer, never numeric ancestry.
+        let (_, mut writer) = Laid::adopt(
+            claim.descriptor().unwrap(),
+            claim.path(),
+            Some(claim.cohort_writer_descriptor().unwrap()),
+        )
+        .unwrap();
+        writer
+            .append(&Record::credit_line(&[running.child.id()]))
+            .unwrap();
+        assert_eq!(
+            f.ledger.funded_scopes(deadline).unwrap()[0].membership(&ancestry),
+            Unknown
+        );
+        writer.append(&Record::credit_line(&[])).unwrap();
+        drop(writer);
+        assert_eq!(
+            f.ledger.funded_scopes(deadline).unwrap()[0].membership(&ancestry),
+            Outside
+        );
+        let attempt = claim.arm_subgroup(&root).unwrap();
+        assert_eq!(
+            f.ledger.funded_scopes(deadline).unwrap()[0].membership(&ancestry),
+            Unknown,
+            "a still-unbound subgroup must not disappear from admission observations"
+        );
+        let failed = spawnfd::command(f.namespace.backend().join("missing-subgroup"))
+            .spawn_cohort(attempt)
+            .unwrap_err();
+        claim
+            .cancel_subgroup(failed.into_not_spawned().unwrap())
+            .unwrap();
+        assert_eq!(
+            f.ledger.funded_scopes(deadline).unwrap()[0].membership(&ancestry),
+            Outside
+        );
+        running.finish();
+        claim.finish_cohort().unwrap();
+        drop(claim);
+        assert!(f.ledger.funded_scopes(deadline).unwrap().is_empty());
     }
 
     #[test]

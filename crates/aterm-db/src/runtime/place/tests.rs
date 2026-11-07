@@ -89,7 +89,7 @@ fn three_incarnations_count_as_one_machine_and_three_machines_can_identify_home(
         None,
     );
     let (observed, place) = step(&initial, &facts, &evidence, Some(&book), 3000, None);
-    assert_eq!(place.reachable, 1);
+    assert_eq!(place.heard, 1);
     assert_ne!(place.at, Where::AlabLan);
     assert!(observed.remembered.is_empty());
 
@@ -104,7 +104,7 @@ fn three_incarnations_count_as_one_machine_and_three_machines_can_identify_home(
     let evidence = heard::read(&dir);
     assert_eq!(evidence.answers.len(), 3);
     let (observed, place) = step(&initial, &facts, &evidence, Some(&book), 3000, None);
-    assert_eq!(place.reachable, 3);
+    assert_eq!(place.heard, 3);
     assert_eq!(place.at, Where::AlabLan);
     assert_eq!(observed.remembered.len(), 1);
 }
@@ -147,7 +147,7 @@ fn captured_socket_route_and_original_time_cannot_identify_a_later_network() {
         None,
     );
     let (away, place) = step(&away, &moved, &evidence, Some(&book), 5000, None);
-    assert_eq!(place.reachable, 0);
+    assert_eq!(place.heard, 0);
     assert_ne!(place.at, Where::AlabLan);
     assert!(away.remembered.is_empty());
 
@@ -157,7 +157,7 @@ fn captured_socket_route_and_original_time_cannot_identify_a_later_network() {
     }
     let (_, place) = step(&initial, &facts, &tunnel, Some(&book), 3000, None);
     assert_eq!(
-        place.reachable, 0,
+        place.heard, 0,
         "on-subnet peer addresses do not hide a different socket route"
     );
 }
@@ -231,8 +231,14 @@ fn current_membership_and_local_custody_gate_shared_evidence_but_table_failure_d
     assert!(heard::read(&dir).answers.is_empty());
 
     let mut failed = connected.clone();
-    failed.control = Err("authenticated, but control repair failed".into());
-    failed.application_error = Some("no table repair".into());
+    failed.control = Err(crate::control::Failure::new(
+        aterm_types::network_state::RepairCause::Io,
+        "authenticated, but control repair failed",
+    ));
+    failed.application_error = Some(crate::control::Failure::new(
+        aterm_types::network_state::RepairCause::TableUndeclared,
+        "no table repair",
+    ));
     observe_contacts(
         &bootstrap,
         &std::cell::OnceCell::new(),

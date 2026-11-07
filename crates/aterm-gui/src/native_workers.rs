@@ -131,11 +131,22 @@ pub(crate) fn row_state(record: Option<&TaskRecord>, need: bool) -> RowState {
 }
 
 /// Whether `record`'s agent has left its tab: it exited, or it never started (a stall at the
-/// shell or at startup). The tab's title is its shell's by then, a folder that names no worker.
+/// shell, at startup, for a sign-in or an install, or a launch a shutdown stopped). The tab's title
+/// is its shell's by then, a folder that names no worker. A `why=held` worker has started and may
+/// yet move on.
 pub(crate) fn agent_gone(record: &TaskRecord) -> bool {
     match record.state {
         TaskState::Exited => true,
-        TaskState::Stalled => matches!(record.why, Some("startup" | "shell")),
+        TaskState::Stalled => matches!(
+            record.why,
+            Some(
+                "startup"
+                    | "shell"
+                    | crate::task_record::WHY_SIGNIN
+                    | crate::task_record::WHY_INSTALL
+                    | crate::task_record::WHY_CANCELLED
+            )
+        ),
         TaskState::Working | TaskState::Done | TaskState::Failed => false,
     }
 }
@@ -1077,6 +1088,7 @@ mod tests {
             result_bytes: 0,
             result_path: None,
             attention: false,
+            asks: Default::default(),
             since_unix_ms: at,
             since: now,
             started_unix_ms: at,

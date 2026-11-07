@@ -14,8 +14,8 @@
 //!
 //! - [`subject`]: the subject grammar, `/m/n-<id>/{local,shared}/…`, with compiled metric
 //!   names.
-//! - [`row`]: the row codecs (quota, agy, place, needs, unread, and the window record), words
-//!   and numbers only.
+//! - [`row`]: the row codecs (quota, agy, place, needs, unread, activity, and the window
+//!   record), words and numbers only.
 //! - [`rules`]: the log's retention, astream's `Retention`.
 //! - [`merge`]: the two merges (snapshots by highest sequence, counters by highest revision
 //!   then a sum) and the view model with ages.

@@ -524,6 +524,7 @@ pub fn processes(bytes: &[u8], base: u64) -> Sweep {
                     has_tty: None,
                     exec: None,
                     runnable_ns: None,
+                    cores: None,
                     peak_footprint: None,
                     read_at: None,
                     coalition: None,

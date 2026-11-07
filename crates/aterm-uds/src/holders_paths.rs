@@ -2137,8 +2137,14 @@ mod tests {
         let dir = fresh("execd");
         let bin_dir = fresh("execd-bin");
         let bin = bin_dir.join("other");
-        std::fs::copy(std::env::current_exe().expect("the test binary"), &bin)
-            .expect("a copy of the test binary");
+        // Off Apple a child writes the copy: a fork another test makes while this process holds
+        // the copy open for writing (the paused fork beside this test) keeps it busy past the
+        // spawn's retries, and Linux refuses its exec (`ETXTBSY`) until that fork goes.
+        crate::deadline::copy_regular_fresh(
+            &std::env::current_exe().expect("the test binary"),
+            &bin,
+        )
+        .expect("a copy of the test binary");
         let mut other = crate::spawnfd::command(&bin)
             .args([
                 "--exact",
@@ -3191,6 +3197,9 @@ mod win_tests {
     }
 
     fn junction(target: &Path, link: &Path) {
+        crate::host::could_not_run_under_redirection_guard(
+            "the test makes a junction as this user and goes through it",
+        );
         let status = crate::spawnfd::command("cmd")
             .args(["/C", "mklink", "/J", &for_cmd(link), &for_cmd(target)])
             .stdin(crate::spawnfd::Stdio::null())

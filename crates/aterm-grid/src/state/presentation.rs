@@ -195,6 +195,28 @@ impl SelectionDamage {
         match (self, other) {
             (Self::All, _) | (_, Self::All) => Self::All,
             (Self::None, x) | (x, Self::None) => x,
+            (
+                Self::Band {
+                    lo_abs: a_lo,
+                    hi_abs: a_hi,
+                },
+                Self::Band {
+                    lo_abs: b_lo,
+                    hi_abs: b_hi,
+                },
+            ) if Self::bands_join(a_lo, a_hi, b_lo, b_hi) => {
+                // The merge below on two bands that overlap or touch: sorted by low edge, the
+                // first's low edge and the larger high edge. A scroll's band each line feed.
+                let ((lo_abs, first_hi), second_hi) = if a_lo > b_lo {
+                    ((b_lo, b_hi), a_hi)
+                } else {
+                    ((a_lo, a_hi), b_hi)
+                };
+                Self::Band {
+                    lo_abs,
+                    hi_abs: first_hi.max(second_hi),
+                }
+            }
             (a, b) => {
                 let mut buf = [(0u64, 0u64); MAX_SELECTION_DAMAGE_BANDS * 2];
                 let head = a.spill(&mut buf);
@@ -202,6 +224,45 @@ impl SelectionDamage {
                 let merged = merge_bands(&mut buf[..total]);
                 Self::from_merged(&buf[..merged])
             }
+        }
+    }
+
+    /// `*self = self.union(Band { lo_abs, hi_abs })`, written where the value stands when the band
+    /// lands on `None` or joins a lone band: the cases a scroll or a line of output meets on every
+    /// line, which through [`Self::union`] copy the whole value, band set and all, in and out.
+    #[inline]
+    pub(crate) fn union_band(&mut self, lo_abs: u64, hi_abs: u64) {
+        match self {
+            Self::None => *self = Self::Band { lo_abs, hi_abs },
+            Self::Band {
+                lo_abs: a_lo,
+                hi_abs: a_hi,
+            } if Self::bands_join(*a_lo, *a_hi, lo_abs, hi_abs) => {
+                // `union`'s join arm: the lower low edge's band first, then the larger high edge.
+                let (first_lo, first_hi, second_hi) = if *a_lo > lo_abs {
+                    (lo_abs, hi_abs, *a_hi)
+                } else {
+                    (*a_lo, *a_hi, hi_abs)
+                };
+                *a_lo = first_lo;
+                *a_hi = first_hi.max(second_hi);
+            }
+            _ => *self = self.union(Self::Band { lo_abs, hi_abs }),
+        }
+    }
+
+    /// Whether [`merge_bands`] merges bands `a` and `b` into one: sorted by low edge (`b` first only
+    /// when its low edge is strictly lower), the second starts at most one past the first's end.
+    #[inline]
+    fn bands_join(a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64) -> bool {
+        #[cfg(test)]
+        if crate::test_counters::reference_paths() {
+            return false;
+        }
+        if a_lo > b_lo {
+            a_lo <= b_hi.saturating_add(1)
+        } else {
+            b_lo <= a_hi.saturating_add(1)
         }
     }
 
@@ -391,6 +452,58 @@ impl GridPresentationState {
                 record.len += 1;
             }
             None => record.inexact = true,
+        }
+    }
+
+    /// Record `times` moves of screen rows `top..=bottom` by `delta` each, leaving the record
+    /// exactly as `times` calls of [`Self::record_row_band_move`] leave it. Once the newest entry
+    /// is this band with this sign and top, every further call composes into it, so those are
+    /// summed at once: up to the last sum `i16` holds, with `inexact` set where a call's sum would
+    /// overflow (the entry then keeps that last sum, as the failed calls leave it). A call that
+    /// leaves the record as it found it (a full record that cannot take the move) leaves it so
+    /// for every call after it, so the rest are skipped.
+    pub(crate) fn record_row_band_moves(
+        &mut self,
+        top: u16,
+        bottom: u16,
+        delta: i16,
+        times: usize,
+    ) {
+        if delta == 0 || top > bottom {
+            return;
+        }
+        let mut left = times;
+        while left > 0 {
+            let record = &mut self.row_band_moves;
+            let newest = usize::from(record.len)
+                .checked_sub(1)
+                .and_then(|i| record.moves.get_mut(i));
+            if let Some(newest) = newest
+                && newest.top == top
+                && newest.bottom == bottom
+                && newest.delta.signum() == delta.signum()
+            {
+                let room = if delta > 0 {
+                    i32::from(i16::MAX) - i32::from(newest.delta)
+                } else {
+                    i32::from(newest.delta) - i32::from(i16::MIN)
+                };
+                let fit = usize::try_from(room / i32::from(delta).abs()).unwrap_or(0);
+                let taken = left.min(fit);
+                let sum = i32::from(newest.delta)
+                    + i32::from(delta) * i32::try_from(taken).unwrap_or(i32::MAX);
+                newest.delta = i16::try_from(sum).unwrap_or(newest.delta);
+                if left > fit {
+                    record.inexact = true;
+                }
+                return;
+            }
+            let before = *record;
+            self.record_row_band_move(top, bottom, delta);
+            left -= 1;
+            if self.row_band_moves == before {
+                return;
+            }
         }
     }
 
@@ -647,6 +760,102 @@ mod tests {
             band(0, 100),
             "…which is to say the set must not have collapsed to its hull"
         );
+    }
+
+    /// The two-band join answers what the sort-and-merge does for every pair of bands, the
+    /// degenerate ones (`lo > hi`) and the edges of `u64` included: generated pairs, and each of
+    /// them folded onto a running union, on both paths and by `union_band` in place.
+    #[test]
+    fn the_two_band_join_matches_the_merge() {
+        let mut rng = aterm_spec::rng::XorShift::new(0x5E1E_C710_0B4D);
+        let edges = [0u64, 1, 2, 3, 7, 8, u64::MAX - 2, u64::MAX - 1, u64::MAX];
+        let pick = |rng: &mut aterm_spec::rng::XorShift| match rng.below(3) {
+            0 => *rng.pick(&edges),
+            1 => rng.below(12),
+            _ => rng.next_u64(),
+        };
+        let (mut joined, mut apart) = (0usize, 0usize);
+        let mut fast_acc = SelectionDamage::None;
+        let mut slow_acc = SelectionDamage::None;
+        let mut in_place = SelectionDamage::None;
+        for _ in 0..200_000 {
+            let a = band(pick(&mut rng), pick(&mut rng));
+            let (b_lo, b_hi) = (pick(&mut rng), pick(&mut rng));
+            let b = band(b_lo, b_hi);
+            let fast = a.union(b);
+            let slow = crate::test_counters::on_reference_paths(|| a.union(b));
+            assert_eq!(fast, slow, "{a:?} ∪ {b:?}");
+            match fast {
+                SelectionDamage::Band { .. } => joined += 1,
+                _ => apart += 1,
+            }
+            fast_acc = fast_acc.union(b);
+            slow_acc = crate::test_counters::on_reference_paths(|| slow_acc.union(b));
+            assert_eq!(fast_acc, slow_acc, "running union after {b:?}");
+            in_place.union_band(b_lo, b_hi);
+            assert_eq!(in_place, slow_acc, "in-place union after {b:?}");
+            if rng.below(16) == 0 {
+                (fast_acc, slow_acc, in_place) = Default::default();
+            }
+        }
+        assert!(
+            joined > 1000 && apart > 1000,
+            "both arms: {joined} joined, {apart} apart"
+        );
+    }
+
+    /// `record_row_band_moves(top, bottom, delta, times)` leaves the record `times` calls of
+    /// `record_row_band_move` leave: from records of every fill, near both `i16` ends, after a
+    /// move its band narrows, and with counts past the room left.
+    #[test]
+    fn repeated_band_moves_record_what_one_call_each_records() {
+        use super::{RowBandMove, RowBandMoves};
+        let mut rng = aterm_spec::rng::XorShift::new(0x5EED_BA4D);
+        let mut composed_past_one = 0usize;
+        for _ in 0..20_000 {
+            let mut start = RowBandMoves::default();
+            for _ in 0..rng.index(10) {
+                let len = usize::from(start.len);
+                if let Some(slot) = start.moves.get_mut(len) {
+                    let top = u16::try_from(rng.index(6)).unwrap_or(0);
+                    *slot = RowBandMove {
+                        top,
+                        bottom: top + u16::try_from(rng.index(6)).unwrap_or(0),
+                        delta: match rng.index(4) {
+                            0 => i16::MIN + i16::try_from(rng.index(4)).unwrap_or(0),
+                            1 => i16::MAX - i16::try_from(rng.index(4)).unwrap_or(0),
+                            _ => i16::try_from(rng.index(9)).unwrap_or(0) - 4,
+                        },
+                    };
+                    start.len += 1;
+                }
+            }
+            start.inexact = rng.index(5) == 0;
+            let top = u16::try_from(rng.index(6)).unwrap_or(0);
+            let bottom = top + u16::try_from(rng.index(6)).unwrap_or(0);
+            let delta = i16::try_from(rng.index(7)).unwrap_or(0) - 3;
+            let times = match rng.index(3) {
+                0 => rng.index(4),
+                1 => rng.index(40),
+                _ => 32_000 + rng.index(4_000),
+            };
+            let mut once = crate::Grid::new(4, 4);
+            let once = &mut once.storage.presentation;
+            once.row_band_moves = start;
+            once.record_row_band_moves(top, bottom, delta, times);
+            let mut each = crate::Grid::new(4, 4);
+            let each = &mut each.storage.presentation;
+            each.row_band_moves = start;
+            for _ in 0..times {
+                each.record_row_band_move(top, bottom, delta);
+            }
+            assert_eq!(
+                once.row_band_moves, each.row_band_moves,
+                "from {start:?}: ({top}, {bottom}, {delta}) x {times}"
+            );
+            composed_past_one += usize::from(times > 1 && once.row_band_moves != start);
+        }
+        assert!(composed_past_one > 1000, "{composed_past_one} cases moved");
     }
 
     /// `None` is the unit and `All` absorbs, in both argument positions.

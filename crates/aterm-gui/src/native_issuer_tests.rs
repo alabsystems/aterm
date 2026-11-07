@@ -687,8 +687,14 @@ fn a_drain_that_settles_after_an_unknown_reply_still_records_the_strong_noexec_f
     let op = operation.lock().unwrap();
     // Reproduce the state seen by the outer worker after the input drain has
     // settled since its inner reply was computed. Text is not terminal evidence.
-    assert_eq!(terminal_record(&op, UNKNOWN), Some(TerminalRecord::NoExec));
-    assert_eq!(terminal_record(&op, NOEXEC), Some(TerminalRecord::NoExec));
+    assert_eq!(
+        terminal_record(&op, UNKNOWN),
+        Some(TerminalRecord::NoExec(ImagePhase::Forward))
+    );
+    assert_eq!(
+        terminal_record(&op, NOEXEC),
+        Some(TerminalRecord::NoExec(ImagePhase::Forward))
+    );
     assert_ne!(terminal_record(&op, UNKNOWN), Some(TerminalRecord::Sealed));
 }
 

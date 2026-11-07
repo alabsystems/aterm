@@ -108,7 +108,7 @@ fn native_fleet_registration_finishes_before_discovery_fallback() {
 }
 
 #[test]
-fn canonical_name_publication_rejects_a_superseded_number() {
+fn canonical_name_publication_keeps_its_committed_policy_and_number_current() {
     use aterm_types::machine_name::Number;
     let world = World::new("canonical-name-publication");
     aterm_uds::private_file::ensure_private_dir(&world.places.state).unwrap();
@@ -131,6 +131,32 @@ fn canonical_name_publication_rejects_a_superseded_number() {
         member::read_primary_name(&world.places.state).unwrap(),
         None
     );
+    for policy in [
+        "[identity]\nname = false\n",
+        "[identity]\nname = \"m60\"\n[ai]\nmachine = \"m59\"\n[fleet]\nmachine = \"m59\"\n",
+        "[identity\n",
+    ] {
+        aterm_uds::atomic_file::write(&world.places.config, policy.as_bytes(), 0o600).unwrap();
+        assert!(
+            set_primary_name(
+                &world.places,
+                "m59",
+                &Writer::Canonical(Number::new(59).unwrap())
+            )
+            .is_err()
+        );
+        assert_eq!(
+            member::read_primary_name(&world.places.state).unwrap(),
+            None
+        );
+        assert_eq!(followed_name(&world.places.state), None);
+    }
+    aterm_uds::atomic_file::write(
+        &world.places.config,
+        b"[identity]\nname = \"m59\"\n[ai]\nmachine = \"m59\"\n[fleet]\nmachine = \"m59\"\n[font]\nsize = 14\n",
+        0o600,
+    )
+    .unwrap();
     set_primary_name(
         &world.places,
         "m59",
@@ -141,6 +167,26 @@ fn canonical_name_publication_rejects_a_superseded_number() {
         name.num = Number::new(60);
         Ok(())
     })
+    .unwrap();
+    assert!(
+        set_primary_name(
+            &world.places,
+            "m59",
+            &Writer::Canonical(Number::new(59).unwrap())
+        )
+        .is_err()
+    );
+    assert_eq!(
+        member::read_primary_name(&world.places.state)
+            .unwrap()
+            .as_deref(),
+        Some("m59")
+    );
+    aterm_uds::private_file::write_private(
+        &world.places.state,
+        crate::machine_name::file::FILE,
+        b"unread name",
+    )
     .unwrap();
     assert!(
         set_primary_name(
@@ -252,14 +298,14 @@ fn peer_scans_refresh_reachability_without_admission_evidence() {
     let evidence = aterm_netplace::heard::read_for_place(&dir);
     let (_, place) = aterm_netplace::step(&record, &facts, &evidence, None, t + 3, None);
     assert_eq!(
-        place.reachable, 1,
+        place.heard, 1,
         "the shared network view sees the direct scan"
     );
     let mut moved = facts;
     moved.route.as_mut().unwrap().address = "172.20.10.2".parse().unwrap();
     let (_, place) = aterm_netplace::step(&record, &moved, &evidence, None, t + 3, None);
     assert_eq!(
-        place.reachable, 0,
+        place.heard, 0,
         "old-route answers do not follow a network move"
     );
 }
@@ -359,7 +405,7 @@ fn the_fleet_name_follows_the_swarm_label_once_and_keeps_a_persons_name() {
         fleet_name_at(&world.places, "m42", &no).unwrap(),
         FleetName::Due { .. }
     ));
-    follow_fleet_name_at(&world.places, "m42", &no).unwrap();
+    follow_fleet_name_at(&world.places, "m42", &no, &|| Ok(())).unwrap();
     let file = world.places.state.join(member::NAME_FILE);
     let written = std::fs::metadata(&file).unwrap().modified().unwrap();
     assert_eq!(
@@ -372,7 +418,7 @@ fn the_fleet_name_follows_the_swarm_label_once_and_keeps_a_persons_name() {
         fleet_name_at(&world.places, "M42", &no).unwrap(),
         FleetName::Current
     );
-    follow_fleet_name_at(&world.places, "m42", &no).unwrap();
+    follow_fleet_name_at(&world.places, "m42", &no, &|| Ok(())).unwrap();
     assert_eq!(
         std::fs::metadata(&file).unwrap().modified().unwrap(),
         written,
@@ -380,7 +426,7 @@ fn the_fleet_name_follows_the_swarm_label_once_and_keeps_a_persons_name() {
     );
 
     // The roster relabelled this Mac m42 -> m100: the label aterm wrote itself follows.
-    follow_fleet_name_at(&world.places, "m100", &no).unwrap();
+    follow_fleet_name_at(&world.places, "m100", &no, &|| Ok(())).unwrap();
     assert_eq!(
         member::read_primary_name(&world.places.state)
             .unwrap()
@@ -395,14 +441,14 @@ fn the_fleet_name_follows_the_swarm_label_once_and_keeps_a_persons_name() {
         fleet_name_at(&world.places, "m100", &no).unwrap(),
         FleetName::Kept("m42".to_owned())
     );
-    follow_fleet_name_at(&world.places, "m100", &no).unwrap();
+    follow_fleet_name_at(&world.places, "m100", &no, &|| Ok(())).unwrap();
     assert_eq!(
         member::read_primary_name(&world.places.state)
             .unwrap()
             .as_deref(),
         Some("m42")
     );
-    follow_fleet_name_at(&world.places, "m100", &yes).unwrap();
+    follow_fleet_name_at(&world.places, "m100", &yes, &|| Ok(())).unwrap();
     assert_eq!(
         member::read_primary_name(&world.places.state)
             .unwrap()
@@ -416,7 +462,7 @@ fn the_fleet_name_follows_the_swarm_label_once_and_keeps_a_persons_name() {
         fleet_name_at(&world.places, "m100", &yes).unwrap(),
         FleetName::Kept("studio".to_owned())
     );
-    follow_fleet_name_at(&world.places, "m100", &yes).unwrap();
+    follow_fleet_name_at(&world.places, "m100", &yes, &|| Ok(())).unwrap();
     assert_eq!(
         member::read_primary_name(&world.places.state)
             .unwrap()
@@ -436,7 +482,7 @@ fn the_fleet_name_follows_the_swarm_label_once_and_keeps_a_persons_name() {
 fn the_fleet_name_follows_a_changed_identity_name_it_wrote_itself() {
     let no = |_: &str| false;
     let world = World::new("follow-changed");
-    follow_fleet_name_at(&world.places, "studio", &no).unwrap();
+    follow_fleet_name_at(&world.places, "studio", &no, &|| Ok(())).unwrap();
     let name = || member::read_primary_name(&world.places.state).unwrap();
     assert_eq!(name().as_deref(), Some("studio"));
     assert_eq!(
@@ -445,9 +491,9 @@ fn the_fleet_name_follows_a_changed_identity_name_it_wrote_itself() {
             from: "studio".to_owned()
         }
     );
-    follow_fleet_name_at(&world.places, "lab", &no).unwrap();
+    follow_fleet_name_at(&world.places, "lab", &no, &|| Ok(())).unwrap();
     assert_eq!(name().as_deref(), Some("lab"));
-    follow_fleet_name_at(&world.places, "m42", &no).unwrap();
+    follow_fleet_name_at(&world.places, "m42", &no, &|| Ok(())).unwrap();
     assert_eq!(name().as_deref(), Some("m42"));
 
     name_machine(&world.places, &args(&["set", "den"])).unwrap();
@@ -455,7 +501,7 @@ fn the_fleet_name_follows_a_changed_identity_name_it_wrote_itself() {
         fleet_name_at(&world.places, "m42", &no).unwrap(),
         FleetName::Kept("den".to_owned())
     );
-    follow_fleet_name_at(&world.places, "m42", &no).unwrap();
+    follow_fleet_name_at(&world.places, "m42", &no, &|| Ok(())).unwrap();
     assert_eq!(name().as_deref(), Some("den"));
 }
 
@@ -482,11 +528,11 @@ fn a_stale_swarm_label_follows_the_rosters_label_and_a_persons_name_is_kept() {
             from: "m58".to_owned()
         }
     );
-    follow_fleet_name_at(&world.places, "m176", &gives).unwrap();
+    follow_fleet_name_at(&world.places, "m176", &gives, &|| Ok(())).unwrap();
     assert_eq!(name().as_deref(), Some("m176"));
 
     name_machine(&world.places, &args(&["set", "m58"])).unwrap();
-    follow_fleet_name_at(&world.places, "m176", &gives).unwrap();
+    follow_fleet_name_at(&world.places, "m176", &gives, &|| Ok(())).unwrap();
     assert_eq!(name().as_deref(), Some("m176"));
 
     name_machine(&world.places, &args(&["set", "studio"])).unwrap();
@@ -494,18 +540,27 @@ fn a_stale_swarm_label_follows_the_rosters_label_and_a_persons_name_is_kept() {
         fleet_name_at(&world.places, "m176", &gives).unwrap(),
         FleetName::Kept("studio".to_owned())
     );
-    follow_fleet_name_at(&world.places, "m176", &gives).unwrap();
+    follow_fleet_name_at(&world.places, "m176", &gives, &|| Ok(())).unwrap();
     assert_eq!(name().as_deref(), Some("studio"));
 }
 
 /// A follow writes only over the fleet name it read: a name the person set between its read and
-/// its write (under the write lock) is kept. NEGATIVE CONTROL: the same follow over the name it
+/// its write (under the write lock) is kept. A retired source intent also writes neither the
+/// name nor its ownership record. NEGATIVE CONTROL: the same admitted follow over the name it
 /// did read writes.
 #[test]
 fn a_follow_never_writes_over_a_name_set_after_it_read() {
     let world = World::new("follow-race");
     name_machine(&world.places, &args(&["set", "studio"])).unwrap();
-    let said = set_primary_name(&world.places, "m42", &Writer::Follow { saw: None }).unwrap();
+    let said = set_primary_name(
+        &world.places,
+        "m42",
+        &Writer::Follow {
+            saw: None,
+            current: &|| Ok(()),
+        },
+    )
+    .unwrap();
     assert!(said.contains("kept"), "{said}");
     assert_eq!(
         member::read_primary_name(&world.places.state)
@@ -513,11 +568,30 @@ fn a_follow_never_writes_over_a_name_set_after_it_read() {
             .as_deref(),
         Some("studio")
     );
+    assert!(
+        set_primary_name(
+            &world.places,
+            "m42",
+            &Writer::Follow {
+                saw: Some("studio"),
+                current: &|| Err("a newer naming choice retired this follow".to_owned()),
+            },
+        )
+        .is_err()
+    );
+    assert_eq!(
+        member::read_primary_name(&world.places.state)
+            .unwrap()
+            .as_deref(),
+        Some("studio")
+    );
+    assert_eq!(followed_name(&world.places.state), None);
     set_primary_name(
         &world.places,
         "m42",
         &Writer::Follow {
             saw: Some("studio"),
+            current: &|| Ok(()),
         },
     )
     .unwrap();
@@ -548,7 +622,7 @@ fn the_fleet_name_never_takes_a_name_another_machine_holds() {
         fleet_name_at(&world.places, "m42", &|_| false).unwrap(),
         FleetName::Taken(_)
     ));
-    let left = follow_fleet_name_at(&world.places, "m42", &|_| false).unwrap();
+    let left = follow_fleet_name_at(&world.places, "m42", &|_| false, &|| Ok(())).unwrap();
     assert!(left.contains("already names"), "{left}");
     assert_eq!(
         member::read_primary_name(&world.places.state).unwrap(),
@@ -562,7 +636,7 @@ fn the_fleet_name_never_takes_a_name_another_machine_holds() {
     );
 
     let free = World::new("follow-free");
-    follow_fleet_name_at(&free.places, "m42", &|_| false).unwrap();
+    follow_fleet_name_at(&free.places, "m42", &|_| false, &|| Ok(())).unwrap();
     assert_eq!(
         member::read_primary_name(&free.places.state)
             .unwrap()
@@ -3134,7 +3208,8 @@ fn an_init_beside_an_aterm_that_answers_nothing_says_so_at_once() {
 #[test]
 fn a_stall_on_the_port_the_node_job_claims_names_the_job_and_every_cause_it_leaves_open() {
     let world = World::new("stall-node-job");
-    std::fs::create_dir_all(&world.places.state).unwrap();
+    // Private, as aterm keeps it: the lock's reader refuses any other state directory.
+    aterm_uds::private_file::ensure_private_dir(&world.places.state).unwrap();
     let at = SocketAddr::from(([127, 0, 0, 1], 7100));
     let stall = |here: &Here| own_listener_stalled(&world.places, at, " just now", here);
     let unclaimed = stall(&Here::Absent);
@@ -11621,7 +11696,7 @@ fn a_roster_label_or_this_machines_own_name_comes_before_a_short_name() {
         "no machine name: a short name"
     );
     std::fs::create_dir_all(world.places.config.parent().unwrap()).unwrap();
-    std::fs::write(&world.places.config, "[fleet]\nmachine = \"m31\"\n").unwrap();
+    crate::test_config::write(&world.places.config, "[fleet]\nmachine = \"m31\"\n").unwrap();
     assert_eq!(word("m31", &[]), Ok("m31".to_owned()));
     assert_eq!(
         this_machine_alone(&world.places, "m31", None),
@@ -11801,7 +11876,7 @@ fn fleet_machine_in_aterm_toml_names_this_machine_and_survives_join_allow_and_le
     let (_issuer, code, _serving) = issuing("fleet-machine-issuer");
     let member = World::new("fleet-machine-member");
     std::fs::create_dir_all(member.places.config.parent().unwrap()).unwrap();
-    std::fs::write(&member.places.config, "[fleet]\nmachine = \"m32\"\n").unwrap();
+    crate::test_config::write(&member.places.config, "[fleet]\nmachine = \"m32\"\n").unwrap();
     ok(join(&member.places, &sync_here(), &code));
 
     let own = own_node(&member.places).expect("joined node");
@@ -12158,7 +12233,7 @@ fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_list
 
     // Even if `[fleet] machine = "m4"` is in `aterm.toml`, `names_this_machine` must reject it.
     std::fs::create_dir_all(member.places.config.parent().unwrap()).unwrap();
-    std::fs::write(&member.places.config, "[fleet]\nmachine = \"m4\"\n").unwrap();
+    crate::test_config::write(&member.places.config, "[fleet]\nmachine = \"m4\"\n").unwrap();
     assert!(names_this_machine(&member.places, "m4").is_err());
 
     // Removing the denied alias preserves the roster's key metadata, but a registry binding
@@ -12304,6 +12379,18 @@ fn a_no_route_on_this_network_is_that_members_own() {
         "the dial's address"
     );
     assert_eq!(row.fault, aterm_ctl::PeerFault::NoRoute);
+    assert_eq!(
+        row.reason,
+        Some("gone"),
+        "the row's kind is the link's, not the dial's"
+    );
+    let stayed = peer_survey(
+        &peer,
+        Err(no_route([172, 20, 10, 5])),
+        (&[], None, None),
+        false,
+    );
+    assert_eq!(stayed.reason, Some("no-route"), "the dial's own kind");
     let refused = Unreached::Connect(
         std::net::SocketAddr::from(([172, 20, 10, 6], 7100)),
         std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
@@ -12313,6 +12400,7 @@ fn a_no_route_on_this_network_is_that_members_own() {
         (refused_row.fault, refused_row.addr.as_deref()),
         (aterm_ctl::PeerFault::HostAnswered, Some("172.20.10.6"))
     );
+    assert_eq!(refused_row.reason, Some("nothing-listens"));
     let home_member = no_route([192, 168, 4, 9]);
     let elsewhere = on_link_of(&hotspot, [Err(&home_member)]);
     assert!(!gone_off_the_link(

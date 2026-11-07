@@ -317,9 +317,12 @@ pub(super) fn begin_completed_rollback(
     if command.capture().as_ref() != Some(back.as_ref()) {
         return Err("native-completed-target-changed");
     }
-    st.pid = observed.registration.vendor.pid;
-    // `exited_at` speaks of the agent `st.pid` named; the rollback's vendor is another one,
-    // whose exit the relaunch still waits on.
+    // The rollback's vendor is another agent than the one `st.pid` named, bound by its pid and
+    // kernel start: its exit is what the relaunch waits on, and `exited_at` spoke of the other.
+    st.bind(
+        observed.registration.vendor.pid,
+        &vendor_start(&observed.registration.vendor),
+    );
     st.exited_at = 0;
     st.shell = observed.registration.shell.pid;
     let target = command.target.clone();
@@ -335,6 +338,41 @@ pub(super) fn begin_completed_rollback(
         Some((observed.registration, observed.binding)),
         None,
     )
+}
+
+/// The kernel start (`upgrade_drive::kernel_start`'s spelling) of the native process `vendor`
+/// names, what proves its exit once its pid is free or holds a process born at another time. On
+/// Apple it is its recorded birth itself (whole microseconds of the start the kernel spells in
+/// seconds), whatever the pid holds now; elsewhere it is read only while the pid still names that
+/// process (its birth read the same before and after), and empty once it is gone, when only its
+/// free pid proves the exit.
+pub(super) fn vendor_start(vendor: &super::native_act::Process) -> String {
+    #[cfg(target_vendor = "apple")]
+    {
+        super::footer::lstart_utc(vendor.birth / 1_000_000)
+    }
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    {
+        let born = || {
+            i32::try_from(vendor.pid)
+                .ok()
+                .and_then(aterm_uds::process::read_birth)
+                .is_some_and(|birth| birth.0 == vendor.birth)
+        };
+        if !born() {
+            return String::new();
+        }
+        let start = upgrade_drive::kernel_start(vendor.pid);
+        if !born() {
+            return String::new();
+        }
+        start.unwrap_or_default()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = vendor;
+        String::new()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -790,7 +828,7 @@ mod tests {
             phase: Phase::Announced { at_s: 7, asks: 1 },
             ..St::default()
         };
-        let back = st.signalled(4242, 400, "tab", "exact-forward".into(), 8);
+        let back = st.signalled(4242, "", 400, "tab", "exact-forward".into(), 8);
         st.native_prepare = "original-id-and-plan deadline-us=123".into();
         st.native = Some(Binding {
             id: "ab".repeat(16),

@@ -8,6 +8,8 @@ mod imp {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
+    use crate::release::BranchStop;
+
     pub const SIGHUP: i32 = 1;
     pub const SIGINT: i32 = 2;
     pub const SIGKILL: i32 = 9;
@@ -183,10 +185,20 @@ mod imp {
     impl Running {
         /// Starts forwarding caught signals for the process group led by `leader`.
         pub fn enter(leader: u32) -> Self {
+            Self::forwarding(leader, None)
+        }
+
+        /// [`Running::enter`] for a qualify branch's child, which its branch's stop ends too:
+        /// once `stop` fires the group is sent `sig`, and [`BranchStop::GRACE`] later `SIGKILL`.
+        pub fn enter_stoppable(leader: u32, stop: BranchStop, sig: i32) -> Self {
+            Self::forwarding(leader, Some((stop, sig)))
+        }
+
+        fn forwarding(leader: u32, stop: Option<(BranchStop, i32)>) -> Self {
             let done = Arc::new(AtomicBool::new(false));
             let thread = i32::try_from(leader).ok().map(|group| {
                 let done = Arc::clone(&done);
-                std::thread::spawn(move || forward(group, &done))
+                std::thread::spawn(move || forward(group, &done, stop.as_ref()))
             });
             Self {
                 done,
@@ -207,12 +219,22 @@ mod imp {
 
     /// Every 50 ms until `done`, sends `group` what [`Stop`] answers for the signals caught so
     /// far, read then: the signal that interrupted the release, or `SIGKILL` ([`forward_with`]).
-    fn forward(group: i32, done: &AtomicBool) {
+    /// A branch's fired `stop` counts as one more signal caught, and as a second once
+    /// [`BranchStop::GRACE`] passed, so it is answered as a person's stop and then a second one;
+    /// with no signal caught, the group is sent the branch's.
+    fn forward(group: i32, done: &AtomicBool, stop: Option<&(BranchStop, i32)>) {
         let active = || !done.load(Ordering::SeqCst);
+        let stopped = || {
+            stop.and_then(|(stop, _)| stop.fired_for())
+                .map_or(0, |since| if since >= BranchStop::GRACE { 2 } else { 1 })
+        };
         forward_with(&Forwarding {
             active: &active,
-            caught: &|| COUNT.load(Ordering::SeqCst),
-            signal: &|| SIGNAL.load(Ordering::SeqCst),
+            caught: &|| COUNT.load(Ordering::SeqCst) + stopped(),
+            signal: &|| match SIGNAL.load(Ordering::SeqCst) {
+                0 => stop.map_or(SIGTERM, |(_, sig)| *sig),
+                caught => caught,
+            },
             clock: &std::time::Instant::now,
             send: &|sig| signal_group(group, sig, &active),
             pause: &|| {
@@ -303,12 +325,18 @@ mod imp {
 
 #[cfg(not(unix))]
 mod imp {
+    use crate::release::BranchStop;
+    pub const SIGINT: i32 = 2;
+    pub const SIGTERM: i32 = 15;
     pub fn install() {}
     pub fn caught() -> Option<i32> {
         None
     }
     pub struct Running;
     impl Running {
+        pub fn enter_stoppable(_leader: u32, _stop: BranchStop, _sig: i32) -> Self {
+            Self
+        }
         pub fn enter(_leader: u32) -> Self {
             Self
         }

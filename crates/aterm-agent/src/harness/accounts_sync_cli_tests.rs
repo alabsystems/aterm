@@ -618,7 +618,7 @@ fn the_upkeep_tells_an_unread_sheet_from_rows_that_agree() {
 #[test]
 fn a_look_at_the_sheet_asks_the_host_its_name_once() {
     let bed = Bed::new("host-once");
-    fs::write(bed.aterm_toml(), "").unwrap();
+    crate::test_config::write(bed.aterm_toml(), "").unwrap();
     bed.secret(
         ACCOUNTS_CSV_FILE,
         "email,computer,claude,notes\nnew@example.test,m16,1,\n",
@@ -859,7 +859,7 @@ fn the_source_table_includes_pending_rows_without_a_sync_or_machine_id() {
     assert!(!bed.roster(Cli::Kimi).exists());
 
     let pool_bed = Bed::new("source-table-ai-pool-no-machine");
-    fs::write(pool_bed.aterm_toml(), "").unwrap();
+    crate::test_config::write(pool_bed.aterm_toml(), "").unwrap();
     pool_bed.secret(
         super::super::ai_pool::AI_POOL_FILE,
         "version = 1\n\n[[account]]\nprovider = \"codex\"\nemail = \"codex-one@example.test\"\nwarm = [\"m16\"]\n",
@@ -1314,7 +1314,7 @@ fn the_resync_source_check_keeps_each_pools_policy_and_reports_refused_sources()
             has_source(),
             "{cli:?}: a refused source is reported without a local roster"
         );
-        fs::write(
+        crate::test_config::write(
             bed.aterm_toml(),
             "[fleet]\nmachine = 'm16'\n[harness]\naccounts = 'off'\n",
         )
@@ -1382,7 +1382,7 @@ fn a_pools_converge_read_names_what_its_sync_adds_and_nothing_once_it_ran() {
         Ok(vec!["kimi-1".to_owned()]),
         "CONTROL: a listed pool needs no local roster"
     );
-    fs::write(
+    crate::test_config::write(
         off.aterm_toml(),
         "[fleet]\nmachine = 'm16'\n[harness]\naccounts = 'off'\n",
     )
@@ -1598,6 +1598,7 @@ fn with_logged_effects<R>(
         mailbox: &ladder_mailbox_files,
         log,
         run_attempt: None,
+        save_oauth: |_, _| Ok("inert".into()),
         shared: shared_renewal::Effects::default(),
     };
     run(&fx)
@@ -1608,7 +1609,7 @@ fn with_logged_effects<R>(
 fn accounts_bed(tag: &str, off: bool) -> Bed {
     let bed = Bed::new(tag);
     if off {
-        fs::write(
+        crate::test_config::write(
             bed.aterm_toml(),
             "[fleet]\nmachine = \"m16\"\n[harness]\naccounts = \"off\"\n",
         )
@@ -1654,7 +1655,7 @@ fn harness_accounts_off_turns_every_automatic_sync_off() {
         } else {
             ""
         };
-        fs::write(
+        crate::test_config::write(
             bed.aterm_toml(),
             format!(
                 "{switch}[fleet]\nmachine = \"m16\"\naccounts_source = {}\n",
@@ -1771,7 +1772,7 @@ fn a_kept_pools_due_login_renews_unless_its_sign_ins_are_off() {
     );
     let pools = cli_pools(&bed.aterm_toml(), &bed.state, &bed.home, NOW);
     assert_eq!(cli_pools_words(&pools).as_deref(), Some("kimi 2"));
-    fs::write(
+    crate::test_config::write(
         bed.aterm_toml(),
         "[fleet]\nmachine = \"m16\"\n[harness]\nlogins = \"off\"\n",
     )
@@ -1781,7 +1782,7 @@ fn a_kept_pools_due_login_renews_unless_its_sign_ins_are_off() {
         0,
         "`[harness] logins = \"off\"` stops the background renewal"
     );
-    fs::write(
+    crate::test_config::write(
         bed.aterm_toml(),
         "[fleet]\nmachine = \"m16\"\n[harness]\nenabled = false\n",
     )
@@ -1791,7 +1792,7 @@ fn a_kept_pools_due_login_renews_unless_its_sign_ins_are_off() {
         0,
         "`[harness] enabled = false` stops it too, as it stops the host's"
     );
-    fs::write(
+    crate::test_config::write(
         bed.aterm_toml(),
         "[fleet]\nmachine = \"m16\"\n[harness.claude]\nenabled = false\n",
     )
@@ -1896,7 +1897,7 @@ fn each_pools_sign_ins_read_the_harness_and_its_own_switch() {
             Some("`[harness] accounts = \"off\"`"),
         ),
     ] {
-        fs::write(bed.aterm_toml(), config).unwrap();
+        crate::test_config::write(bed.aterm_toml(), config).unwrap();
         let (read, _) = crate::supervise::config::SupervisorConfig::from_aterm_toml(config);
         for cli in all {
             let held = off.contains(&cli);
@@ -1926,7 +1927,8 @@ fn each_pools_sign_ins_read_the_harness_and_its_own_switch() {
     }
     // An aterm.toml that is not valid TOML, whose lines are read one by one, says so, and where
     // the parser stopped.
-    fs::write(bed.aterm_toml(), "[harness]\naccounts = \"off\"\n[broken\n").unwrap();
+    crate::test_config::write(bed.aterm_toml(), "[harness]\naccounts = \"off\"\n[broken\n")
+        .unwrap();
     for cli in all {
         assert!(!sign_ins_on(&bed.aterm_toml(), cli), "{cli:?}");
         let said = sign_ins_off_for(&bed.aterm_toml(), cli).expect("named");
@@ -1937,7 +1939,7 @@ fn each_pools_sign_ins_read_the_harness_and_its_own_switch() {
         );
     }
     // CONTROL: the same lines read as valid TOML name the setting.
-    fs::write(bed.aterm_toml(), "[harness]\naccounts = \"off\"\n").unwrap();
+    crate::test_config::write(bed.aterm_toml(), "[harness]\naccounts = \"off\"\n").unwrap();
     assert_eq!(
         sign_ins_off_for(&bed.aterm_toml(), Cli::Claude).as_deref(),
         Some("`[harness] accounts = \"off\"`")
@@ -2061,7 +2063,7 @@ fn codex_rows_sync_by_default_with_no_roster_file() {
 fn harness_accounts_off_still_stops_codex_rows_syncing_by_default() {
     let off = |tag: &str| {
         let bed = Bed::new(tag);
-        fs::write(
+        crate::test_config::write(
             bed.aterm_toml(),
             "[fleet]\nmachine = \"m16\"\n[harness]\naccounts = \"off\"\n",
         )
@@ -2111,7 +2113,7 @@ fn harness_accounts_off_still_stops_codex_rows_syncing_by_default() {
 #[test]
 fn codex_by_default_writes_nothing_where_the_fleet_lists_no_row_of_this_macs() {
     let bed = Bed::new("codex-unlisted");
-    fs::write(bed.aterm_toml(), "[fleet]\nmachine = \"m9\"\n").unwrap();
+    crate::test_config::write(bed.aterm_toml(), "[fleet]\nmachine = \"m9\"\n").unwrap();
     bed.secret(ACCOUNTS_CSV_FILE, SHEET);
     let before = Bed::tree(bed._dir.path());
     let unlisted = bed.sync(Cli::Codex, None);
@@ -2204,7 +2206,7 @@ fn an_unlisted_mac_syncs_codex_again_only_once_its_inputs_change() {
     });
 
     let pool_bed = Bed::new("codex-unlisted-ai-pool-quiet");
-    fs::write(pool_bed.aterm_toml(), "[fleet]\nmachine = \"m9\"\n").unwrap();
+    crate::test_config::write(pool_bed.aterm_toml(), "[fleet]\nmachine = \"m9\"\n").unwrap();
     pool_bed.secret(
         super::super::ai_pool::AI_POOL_FILE,
         "version = 1\n\n[[account]]\nprovider = \"codex\"\nemail = \"codex-one@example.com\"\nwarm = [\"m16\"]\n",
@@ -2925,6 +2927,7 @@ region = \"global\"
         mailbox: &ladder_mailbox_files,
         log: std::sync::Arc::new(|_: &str| {}),
         run_attempt: None,
+        save_oauth: |_, _| Ok("inert".into()),
         shared: shared_renewal::Effects::default(),
     };
     assert!(renew_pool_due(
@@ -3007,6 +3010,7 @@ region = \"global\"
             mailbox: &ladder_mailbox_files,
             log: std::sync::Arc::new(|_: &str| {}),
             run_attempt: None,
+            save_oauth: |_, _| Ok("inert".into()),
             shared: shared_renewal::Effects::default(),
         };
         assert_eq!(
@@ -3056,6 +3060,7 @@ fn kimi_pool_upkeep(bed: &Bed, guard: &Arc<Mutex<AutoRenewGuard>>, now: i64) -> 
         mailbox: &ladder_mailbox_files,
         log: std::sync::Arc::new(|_: &str| {}),
         run_attempt: None,
+        save_oauth: |_, _| Ok("inert".into()),
         shared: shared_renewal::Effects::default(),
     };
     renew_pool_due(
@@ -3570,6 +3575,7 @@ region = \"global\"
         mailbox: &ladder_mailbox_files,
         log: std::sync::Arc::new(|_: &str| {}),
         run_attempt: None,
+        save_oauth: |_, _| Ok("inert".into()),
         shared: shared_renewal::Effects::default(),
     };
     assert!(renew_pool_due(
@@ -3808,6 +3814,7 @@ region = \"global\"
         mailbox: &ladder_mailbox_files,
         log: std::sync::Arc::new(|_: &str| {}),
         run_attempt: None,
+        save_oauth: |_, _| Ok("inert".into()),
         shared: shared_renewal::Effects::default(),
     };
     assert!(
@@ -3881,6 +3888,7 @@ region = \"global\"
         mailbox: &ladder_mailbox_files,
         log: std::sync::Arc::new(|_: &str| {}),
         run_attempt: None,
+        save_oauth: |_, _| Ok("inert".into()),
         shared: shared_renewal::Effects::default(),
     };
     assert!(
@@ -4009,7 +4017,7 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
     )
     .unwrap();
     // Even with `[harness] logins = "off"`, an explicit saved choice must resume.
-    fs::write(
+    crate::test_config::write(
         bed.aterm_toml(),
         "[fleet]\nmachine = \"m16\"\n[harness]\nlogins = \"off\"\n",
     )
@@ -4147,6 +4155,7 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
         mailbox: &ladder_mailbox_files,
         log: std::sync::Arc::new(|_: &str| {}),
         run_attempt: None,
+        save_oauth: |_, _| Ok("inert".into()),
         shared: shared_renewal::Effects::default(),
     };
     let _ = upkeep(
@@ -4192,7 +4201,7 @@ fn harness_accounts_off_stops_window_upkeep_sign_ins_as_well_as_sync() {
         .unwrap();
 
         let mode = if off { "off" } else { "early" };
-        fs::write(
+        crate::test_config::write(
             bed.aterm_toml(),
             format!(
                 "[fleet]\nmachine = \"m16\"\n[harness]\naccounts = \"{mode}\"\nlogins = \"renew\"\n"
@@ -4228,6 +4237,7 @@ fn harness_accounts_off_stops_window_upkeep_sign_ins_as_well_as_sync() {
             mailbox: &ladder_mailbox_files,
             log: std::sync::Arc::new(|_: &str| {}),
             run_attempt: None,
+            save_oauth: |_, _| Ok("inert".into()),
             shared: shared_renewal::Effects::default(),
         };
         let upkept = upkeep(
@@ -4554,7 +4564,7 @@ fn a_used_row_whose_login_went_is_not_renewed_where_its_source_cannot_be_read_he
     ] {
         let bed = Bed::new("other-macs-unread");
         keep_a_row_with_no_login(&bed, Cli::Claude);
-        fs::write(
+        crate::test_config::write(
             bed.aterm_toml(),
             format!("[fleet]\nmachine = \"m16\"\naccounts_source = \"{source}\"\n"),
         )
@@ -4736,7 +4746,7 @@ fn under_a_pool_file_this_mac_goes_by_the_name_the_pool_resolves() {
     for cli in [Cli::Claude, Cli::Codex] {
         let bed = Bed::new("other-macs-pool");
         keep_a_row_with_no_login(&bed, cli);
-        fs::write(bed.aterm_toml(), "[fleet]\nmachine = \"m32\"\n").unwrap();
+        crate::test_config::write(bed.aterm_toml(), "[fleet]\nmachine = \"m32\"\n").unwrap();
         super::super::ai_pool::tests::seed_local_swarm_roster(&bed.home, "m100", &["m32"]);
         let other_macs = |warm: &str| {
             bed.secret(
@@ -4766,7 +4776,7 @@ fn under_a_pool_file_this_mac_goes_by_the_name_the_pool_resolves() {
 fn a_configured_source_says_whose_an_account_is() {
     let bed = Bed::new("other-macs-key");
     keep_a_row_with_no_login(&bed, Cli::Claude);
-    fs::write(
+    crate::test_config::write(
         bed.aterm_toml(),
         "[fleet]\nmachine = \"m16\"\naccounts_source = \"sheet.csv\"\n",
     )
@@ -4788,7 +4798,7 @@ fn a_configured_source_says_whose_an_account_is() {
         accounts::OtherMacs::NONE,
         "CONTROL"
     );
-    fs::write(
+    crate::test_config::write(
         bed.aterm_toml(),
         "[fleet]\nmachine = \"m16\"\naccounts_source = \"https://example.test/sheet.csv\"\n",
     )
@@ -4812,7 +4822,7 @@ fn a_pool_that_refuses_this_macs_name_leaves_its_rows_unread() {
     for denied in [false, true] {
         let bed = Bed::new("other-macs-pool-denied");
         keep_a_row_with_no_login(&bed, cli);
-        fs::write(bed.aterm_toml(), "[fleet]\nmachine = \"m100\"\n").unwrap();
+        crate::test_config::write(bed.aterm_toml(), "[fleet]\nmachine = \"m100\"\n").unwrap();
         let deny: &[&str] = if denied { &["m100"] } else { &[] };
         super::super::ai_pool::tests::seed_local_swarm_roster_denying(&bed.home, "m100", &[], deny);
         bed.secret(
@@ -4862,7 +4872,7 @@ fn with_no_home_a_claude_row_with_no_login_is_unread() {
 fn a_vault_that_cannot_be_read_leaves_the_row_unread() {
     let bed = Bed::new("other-macs-vault");
     keep_a_row_with_no_login(&bed, Cli::Claude);
-    fs::write(bed.aterm_toml(), "[fleet]\nmachine = \"m16\"\n").unwrap();
+    crate::test_config::write(bed.aterm_toml(), "[fleet]\nmachine = \"m16\"\n").unwrap();
     fs::write(
         bed.config.join(FLEET_ROSTER_FILE),
         "opt_in = \"named\"\n\n[[account]]\nlabel = \"other\"\n\
@@ -4892,7 +4902,7 @@ fn a_vault_that_cannot_be_read_leaves_the_row_unread() {
 fn sheet_rows_that_conflict_over_an_account_say_whose_it_is() {
     let bed = Bed::new("other-macs-conflict");
     keep_a_row_with_no_login(&bed, Cli::Claude);
-    fs::write(bed.aterm_toml(), "[fleet]\nmachine = \"m16\"\n").unwrap();
+    crate::test_config::write(bed.aterm_toml(), "[fleet]\nmachine = \"m16\"\n").unwrap();
     let conflict = |first: &str, second: &str| {
         bed.secret(
             ACCOUNTS_CSV_FILE,
@@ -4921,7 +4931,7 @@ fn sheet_rows_that_conflict_over_an_account_say_whose_it_is() {
 fn a_sheet_naming_a_name_this_mac_had_gives_it_to_this_mac() {
     let bed = Bed::new("other-macs-alias");
     keep_a_row_with_no_login(&bed, Cli::Claude);
-    fs::write(bed.aterm_toml(), "[fleet]\nmachine = \"m100\"\n").unwrap();
+    crate::test_config::write(bed.aterm_toml(), "[fleet]\nmachine = \"m100\"\n").unwrap();
     super::super::ai_pool::tests::seed_local_swarm_roster(&bed.home, "m100", &["m32"]);
     let named = |computer: &str| {
         bed.secret(
@@ -4941,7 +4951,7 @@ fn a_sheet_naming_a_name_this_mac_had_gives_it_to_this_mac() {
 fn a_pending_lab_leaves_whose_an_account_is_unread() {
     let bed = Bed::new("other-macs-pending");
     keep_a_row_with_no_login(&bed, Cli::Claude);
-    fs::write(bed.aterm_toml(), "[fleet]\nmachine = \"m16\"\n").unwrap();
+    crate::test_config::write(bed.aterm_toml(), "[fleet]\nmachine = \"m16\"\n").unwrap();
     fs::write(
         bed.config.join(FLEET_ROSTER_FILE),
         "opt_in = \"named\"\n\n[[account]]\nlabel = \"other\"\n\
@@ -4969,7 +4979,7 @@ fn a_syncs_receipt_lists_no_sign_in_of_another_macs_account() {
     let needs = |machine: &str| {
         let bed = Bed::new("other-macs-receipt");
         keep_a_row_with_no_login(&bed, Cli::Claude);
-        fs::write(bed.aterm_toml(), "[fleet]\nmachine = \"m16\"\n").unwrap();
+        crate::test_config::write(bed.aterm_toml(), "[fleet]\nmachine = \"m16\"\n").unwrap();
         fs::write(
             bed.config.join(FLEET_ROSTER_FILE),
             format!(

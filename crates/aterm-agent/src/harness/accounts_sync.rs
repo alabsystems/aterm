@@ -2296,19 +2296,50 @@ fn fold_transcript_row(
     }
 }
 
-/// The rows of one transcript [`find_transcript_walls_by_email`] books.
-fn transcript_rows(path: &Path, roster: &Roster, now: i64) -> Vec<TranscriptRow> {
+/// The byte cap on what one [`find_transcript_walls_by_email`] scan reads over all its
+/// transcripts, newest first. The window's per-read `footer::FOLD_BUDGET` is no cap on one
+/// transcript (booking its newest rows needs its `session_context` and `/login` rows from its
+/// start, however long it is), but each transcript still to be read keeps that much of this, so
+/// one long transcript never leaves the older ones less than the fold budget they had.
+const TRANSCRIPT_WALLS_SCAN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// What the next transcript of a scan may read: the scan's `left`, less the fold budget each of
+/// the `after` transcripts still to be read keeps.
+fn transcript_allowance(left: u64, after: usize) -> u64 {
+    let kept = super::footer::FOLD_BUDGET.saturating_mul(u64::try_from(after).unwrap_or(u64::MAX));
+    left.saturating_sub(kept)
+}
+
+/// The rows of one transcript [`find_transcript_walls_by_email`] books, read from its start, line
+/// by line ([`super::usage::MAX_LINE_BYTES`]), spending at most `budget` bytes (what it reads is
+/// taken off). A last line with no newline (one still being written, or one the budget cut) books
+/// nothing.
+fn transcript_rows(path: &Path, roster: &Roster, now: i64, budget: &mut u64) -> Vec<TranscriptRow> {
     let Some(f) = super::footer::open_regular(path) else {
         return Vec::new();
     };
-    let mut reader = io::BufReader::new(f.take(super::footer::FOLD_BUDGET));
+    let mut reader = io::BufReader::new(f.take(*budget));
     let mut rows = Vec::new();
     let mut last_at = 0;
-    let _ = each_bounded_line(&mut reader, super::usage::MAX_LINE_BYTES, |raw| {
+    // The rows before the last line handed over, and that line's length.
+    let mut last = (0, 0);
+    let through = each_bounded_line(&mut reader, super::usage::MAX_LINE_BYTES, |raw| {
+        last = (rows.len(), raw.len());
         if let Ok(line) = std::str::from_utf8(raw) {
             fold_transcript_row(line, roster, now, &mut last_at, &mut rows);
         }
     });
+    let left = reader.into_inner().limit();
+    let read = budget.saturating_sub(left);
+    *budget = left;
+    // `each_bounded_line` hands over an unterminated last line no longer than the line bound;
+    // one longer than any line it hands over cannot be the last one handed.
+    if let Ok(through) = through {
+        let tail = read.saturating_sub(through);
+        if tail > 0 && u64::try_from(last.1).is_ok_and(|len| len == tail) {
+            rows.truncate(last.0);
+        }
+    }
     rows
 }
 
@@ -2381,14 +2412,20 @@ pub fn find_transcript_walls_by_email(
     files_with_mtime.sort_by_key(|a| std::cmp::Reverse(a.0));
     files_with_mtime.truncate(16);
 
+    let mut budget = TRANSCRIPT_WALLS_SCAN_BYTES;
     let read: Vec<(Option<String>, Vec<TranscriptRow>)> = files_with_mtime
         .iter()
-        .map(|(_, path)| {
+        .enumerate()
+        .map(|(at, (_, path))| {
             let conversation = path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .map(str::to_owned);
-            (conversation, transcript_rows(path, roster, now))
+            let after = files_with_mtime.len() - at - 1;
+            let mut allowance = transcript_allowance(budget, after);
+            let rows = transcript_rows(path, roster, now, &mut allowance);
+            budget -= transcript_allowance(budget, after) - allowance;
+            (conversation, rows)
         })
         .collect();
     let Some(spans) = spans() else {
@@ -7377,6 +7414,7 @@ struct UpkeepEffects<'a> {
     /// One run of `claude auth login` for a route, where it is not the live one
     /// ([`spawn_row_renewal`]).
     run_attempt: Option<RunAttempt>,
+    save_oauth: fn(&str, &Path) -> Result<String, String>,
     shared: shared_renewal::Effects<'a>,
 }
 
@@ -8013,6 +8051,16 @@ fn live_effects<'a>() -> UpkeepEffects<'a> {
         mailbox: &ladder_mailbox_live,
         log: std::sync::Arc::new(log_sign_in),
         run_attempt: None,
+        save_oauth: {
+            #[cfg(unix)]
+            {
+                super::claude_oauth_vault::save
+            }
+            #[cfg(not(unix))]
+            {
+                |_, _| Err("Claude OAuth snapshots require a Unix vault".into())
+            }
+        },
         shared: shared_renewal::Effects::live(),
     }
 }
@@ -8062,6 +8110,9 @@ fn upkeep(
         return Upkept::Off;
     }
     let claude = upkeep_claude(home, state_dir, (roster_path, now, step), fx);
+    if step.renews() {
+        save_claude_oauth_snapshots(home, state_dir, roster_path, now, fx);
+    }
     upkeep_pools(home, state_dir, (roster_path, now, step), fx);
     if fx
         .scope
@@ -8082,6 +8133,42 @@ fn upkeep(
         }
     }
     claude
+}
+
+fn save_claude_oauth_snapshots(
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    now: i64,
+    fx: &UpkeepEffects<'_>,
+) {
+    let store = accounts::Store::at_for(state_dir, Cli::Claude, home);
+    let Ok(raw) = store.read_roster(Some(roster_path), now) else {
+        return;
+    };
+    let Ok((logins, _)) = store.load_logins(now) else {
+        return;
+    };
+    for row in accounts::bound(&raw, &logins).rows {
+        let login = row.dir.map(std::path::PathBuf::from).or_else(|| {
+            crate::ai::connector::claude_default_login_in_file()
+                .then(|| store.default_login_home())
+                .flatten()
+        });
+        let Some(login) = login else {
+            continue;
+        };
+        if crate::ai::connector::stored_login_file(Cli::Claude.connector(), &login).is_none() {
+            continue;
+        }
+        if let Err(why) = (fx.save_oauth)(&row.label, &login) {
+            (fx.log)(&format!(
+                "Claude OAuth snapshot {}: {}",
+                row.label,
+                super::one_line(&why, 320)
+            ));
+        }
+    }
 }
 
 /// Both explicit local switches must remain on throughout first adoption.
@@ -20521,6 +20608,152 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert_eq!(machine_id_among(names(&[])), None);
     }
 
+    /// A transcript longer than the window's per-read fold budget (`footer::FOLD_BUDGET`) is read
+    /// whole: its newest walls and `/login` rows lie past that many bytes, and booking them needs the
+    /// `session_context` at its start. A last line with no newline yet (one Claude Code is still
+    /// writing) books nothing until it is whole.
+    #[test]
+    fn transcript_walls_past_the_fold_budget_are_booked_and_an_unfinished_last_line_is_not() {
+        use std::io::Write as _;
+
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-walls-long-")
+            .tempdir()
+            .expect("tempdir");
+        let proj = dir.path().join("projects").join("ws");
+        fs::create_dir_all(&proj).unwrap();
+        let context = |who: &str| {
+            format!(
+                "{{\"type\":\"attachment\",\"attachment\":{{\"type\":\"session_context\",\"context\":{{\"userEmail\":\"The user's email address is {who}@example.test. Use it only to identify the user.\"}}}}}}\n"
+            )
+        };
+        let wall = |at: &str, resets: u64| {
+            format!(
+                "{{\"type\":\"assistant\",\"timestamp\":\"{at}\",\"isApiErrorMessage\":true,\"error\":\"rate_limit\",\"message\":{{\"model\":\"<synthetic>\",\"content\":[{{\"type\":\"text\",\"text\":\"You've hit your weekly limit\"}}]}},\"quotaLimits\":{{\"status\":\"rejected\",\"resetsAt\":{resets},\"rateLimitType\":\"seven_day\"}}}}\n"
+            )
+        };
+        let login = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"<local-command-stdout>Login successful</local-command-stdout>\"}}\n";
+        let filler = format!(
+            "{{\"type\":\"progress\",\"data\":\"{}\"}}\n",
+            "x".repeat(1 << 20)
+        );
+        let line_len = filler.len() as u64;
+        let pad = usize::try_from(super::super::footer::FOLD_BUDGET / line_len + 2).unwrap();
+        let long = proj.join("long.jsonl");
+        {
+            let mut out = io::BufWriter::new(fs::File::create(&long).unwrap());
+            out.write_all(context("first").as_bytes()).unwrap();
+            for _ in 0..pad {
+                out.write_all(filler.as_bytes()).unwrap();
+            }
+            out.write_all(wall("2026-10-20T06:50:53Z", 1_792_767_600).as_bytes())
+                .unwrap();
+            out.write_all(login.as_bytes()).unwrap();
+            out.write_all(context("second").as_bytes()).unwrap();
+            out.write_all(wall("2026-10-22T06:21:44Z", 1_792_731_600).as_bytes())
+                .unwrap();
+            out.flush().unwrap();
+        }
+        assert!(fs::metadata(&long).unwrap().len() > super::super::footer::FOLD_BUDGET);
+        let roster = Roster {
+            rows: vec![
+                Row {
+                    label: "m15-2".into(),
+                    dir: None,
+                    email: Some("second@example.test".into()),
+                    ..Row::default()
+                },
+                Row {
+                    label: "m15".into(),
+                    dir: Some("/tmp/m15".into()),
+                    email: Some("first@example.test".into()),
+                    ..Row::default()
+                },
+                Row {
+                    label: "m15-3".into(),
+                    dir: Some("/tmp/m15-3".into()),
+                    email: Some("third@example.test".into()),
+                    ..Row::default()
+                },
+            ],
+        };
+        let now = 1_792_660_000;
+        let walls =
+            find_transcript_walls_by_email(dir.path(), &roster, || Some(BTreeMap::new()), now);
+        assert_eq!(
+            walls.get("m15").and_then(|w| w.until),
+            Some(1_792_767_600),
+            "the wall past the fold budget is booked to the session_context at the start: {walls:?}"
+        );
+        assert_eq!(
+            walls.get("m15-2").and_then(|w| w.until),
+            Some(1_792_731_600),
+            "the /login and session_context past the fold budget book the newest wall: {walls:?}"
+        );
+        fs::remove_file(&long).unwrap();
+
+        let short = proj.join("short.jsonl");
+        let unfinished = wall("2026-10-22T06:21:44Z", 1_792_731_600);
+        fs::write(
+            &short,
+            [context("third"), unfinished.trim_end().to_owned()].concat(),
+        )
+        .unwrap();
+        let walls =
+            find_transcript_walls_by_email(dir.path(), &roster, || Some(BTreeMap::new()), now);
+        assert_eq!(
+            walls.get("m15-3"),
+            None,
+            "an unfinished last line books nothing"
+        );
+        fs::write(&short, [context("third"), unfinished].concat()).unwrap();
+        let walls =
+            find_transcript_walls_by_email(dir.path(), &roster, || Some(BTreeMap::new()), now);
+        assert_eq!(
+            walls.get("m15-3").and_then(|w| w.until),
+            Some(1_792_731_600),
+            "control: the same line, once whole, books its wall"
+        );
+    }
+
+    /// One long newest transcript leaves every older one of the scan its fold budget, and a
+    /// transcript with none after it may read all that is left.
+    #[test]
+    fn a_long_transcript_leaves_the_older_ones_their_fold_budget() {
+        let fold = super::super::footer::FOLD_BUDGET;
+        let total = TRANSCRIPT_WALLS_SCAN_BYTES;
+        assert_eq!(transcript_allowance(total, 15), total - 15 * fold);
+        assert!(
+            transcript_allowance(total, 15) > 8 * fold,
+            "a long one reads well past the fold budget"
+        );
+        assert_eq!(transcript_allowance(total, 0), total);
+        assert_eq!(transcript_allowance(fold, 3), 0);
+    }
+
+    /// The scan's byte budget cuts a transcript at a line it reads only in part: that line books
+    /// nothing, the lines before it do, and what was read is taken off the budget.
+    #[test]
+    fn a_transcript_the_scan_budget_cuts_books_no_part_line() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-walls-budget-")
+            .tempdir()
+            .expect("tempdir");
+        let path = dir.path().join("cut.jsonl");
+        let login = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"<local-command-stdout>Login successful</local-command-stdout>\"}}\n";
+        fs::write(&path, [login, login].concat()).unwrap();
+        let roster = Roster::default();
+        let whole = u64::try_from(login.len()).unwrap();
+        let mut budget = whole + whole - 1;
+        let rows = transcript_rows(&path, &roster, 0, &mut budget);
+        assert_eq!(rows.len(), 1, "the line the budget cut books nothing");
+        assert_eq!(budget, 0);
+        let mut budget = whole * 3;
+        let rows = transcript_rows(&path, &roster, 0, &mut budget);
+        assert_eq!(rows.len(), 2, "control: both whole lines book");
+        assert_eq!(budget, whole);
+    }
+
     #[test]
     fn transcript_walls_by_email_retains_prior_account_wall_after_in_session_login_switch() {
         let dir = aterm_tempfile::Builder::new()
@@ -21585,6 +21818,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                     logged.lock().unwrap().push(line.to_owned());
                 }),
                 run_attempt: self.run_attempt.clone(),
+                save_oauth: |_, _| Ok("inert".into()),
                 shared: shared_renewal::Effects::default(),
             }
         }
@@ -23356,6 +23590,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             mailbox: &ladder_mailbox_files,
             log: std::sync::Arc::new(|_: &str| {}),
             run_attempt: None,
+            save_oauth: |_, _| Ok("inert".into()),
             shared: shared_renewal::Effects::default(),
         };
         // Historical saved intent remains readable even where new FIFO admission
@@ -23785,7 +24020,8 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         let cfg_dir = home.join(".config").join("aterm");
         let state_dir = root.join("state");
         fs::create_dir_all(&cfg_dir).unwrap();
-        fs::write(cfg_dir.join("aterm.toml"), "[fleet]\nmachine = \"m27\"\n").unwrap();
+        crate::test_config::write(cfg_dir.join("aterm.toml"), "[fleet]\nmachine = \"m27\"\n")
+            .unwrap();
         let source_path = root.join("accounts.csv");
         fs::write(
             &source_path,

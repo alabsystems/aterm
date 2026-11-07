@@ -1402,7 +1402,7 @@ fn the_status_record_says_where_this_mac_is_on_the_network() {
     let fields = after_setup(&away);
     assert_eq!(
         fields,
-        aterm_netplace::words::status_fields(&place),
+        aterm_netplace::words::status_fields(&place, None),
         "{away}"
     );
     assert!(

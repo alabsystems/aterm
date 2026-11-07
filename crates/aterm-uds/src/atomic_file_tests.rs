@@ -4,6 +4,7 @@
 //! The careful writer and aterm.toml's, against a scratch directory.
 
 use super::*;
+use crate::atomic_file::read_bounded_stream;
 use std::os::unix::fs::PermissionsExt as _;
 
 /// A scratch directory of this test's own, removed on drop.
@@ -758,4 +759,36 @@ fn chmod_replacement_link_never_changes_the_target() {
         0o600,
         "replacement link target changed"
     );
+}
+
+/// A user-named input may be a pipe (`/dev/fd/N`, `/dev/stdin`): it reads whole up to the bound and
+/// is refused one byte past it; a regular file reads the same way; a directory is refused.
+/// NEGATIVE CONTROL: with `read_bounded_stream` refusing all but `is_file()`, as `read_regular`
+/// does, the pipe read fails: `` called `Result::unwrap()` on an `Err` value: … not a regular
+/// file, FIFO or character device ``.
+#[test]
+fn a_bounded_stream_reads_a_pipe_within_its_bound_and_refuses_a_directory() {
+    use std::io::Write as _;
+    use std::os::fd::AsRawFd as _;
+    let piped = |bytes: &'static [u8], max: u64| {
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        let feeder = std::thread::spawn(move || {
+            // The reader may stop at its bound and close before every byte is taken.
+            let _ = writer.write_all(bytes);
+        });
+        let got = read_bounded_stream(Path::new(&format!("/dev/fd/{}", reader.as_raw_fd())), max);
+        drop(reader);
+        feeder.join().expect("feeder");
+        got
+    };
+    assert_eq!(piped(b"0123456789", 10).unwrap(), b"0123456789");
+    let over = piped(b"0123456789", 9).unwrap_err();
+    assert_eq!(over.kind(), io::ErrorKind::InvalidData, "{over}");
+    let scratch = Scratch::new("stream");
+    let file = scratch.0.join("snapshot.json");
+    std::fs::write(&file, b"{}").unwrap();
+    assert_eq!(read_bounded_stream(&file, 2).unwrap(), b"{}");
+    assert!(read_bounded_stream(&file, 1).is_err());
+    let dir = read_bounded_stream(&scratch.0, 1024).unwrap_err();
+    assert_eq!(dir.kind(), io::ErrorKind::InvalidInput, "{dir}");
 }

@@ -1224,21 +1224,20 @@ fn network_history_gallery() {
         let repair_scene = name.contains("-repair-");
         if repair_scene {
             let outcome = if name.contains("failed") {
-                RepairOutcome::Failed
+                RepairOutcome::Failed(aterm_types::network_state::RepairCause::Io)
             } else if name.contains("deferred") {
-                RepairOutcome::Deferred
+                RepairOutcome::Deferred(None)
             } else {
                 RepairOutcome::Exchanged
             };
             snapshot.network.peers[0].last_repair = Some(RepairObservation {
-                cause: None,
                 completed_at_ms: snapshot.network.observed_at_ms - 10_000,
                 outbound: true,
                 stage: Some(RepairStage::Application),
                 outcome,
                 table: Some([7; 32]),
                 sent: Some(7),
-                received: (outcome != RepairOutcome::Failed).then_some(3),
+                received: (!matches!(outcome, RepairOutcome::Failed(_))).then_some(3),
                 deferred: Some(if outcome == RepairOutcome::Exchanged {
                     0
                 } else {
@@ -1450,7 +1449,7 @@ fn network_history_gallery() {
             assert!(app.open_network_lens());
             if name.starts_with("peer-") {
                 app.windows.get_mut(&wid).unwrap().stats_lens.network_target =
-                    crate::network_deck::Target::Peer(1);
+                    crate::network_deck::Target::Seat(crate::network_deck::SeatKey::Observed(1));
             }
             if name.starts_with("services") {
                 app.windows.get_mut(&wid).unwrap().stats_lens.network_target =

@@ -43,6 +43,7 @@ fn verify_run(dir: &Path) -> Run {
         cold: 27 * GIB,
         on: PathBuf::from("/Volumes/scratch"),
         stuck_ends: None,
+        scratch: false,
         machine: None,
     }
 }
@@ -51,6 +52,19 @@ fn verify_run(dir: &Path) -> Run {
 /// record, the tag of its directories counts no run, so any tag reads the same.
 fn first_run() -> aterm_capacity::Estimate {
     Footprints::default().need(0, 27 * GIB, 0, scope_tag(SCOPE))
+}
+
+/// A claim of `gib` GiB on [`image`]'s volume, held at once: what a run beside it is short of.
+fn held_beside(ledger: &Ledger, m: &Fixed, gib: u64) -> aterm_capacity::Claim {
+    aterm_capacity::admit_with(
+        ledger,
+        m,
+        aterm_capacity::Need::new("held").disk(gib * GIB, "/Volumes/scratch"),
+        Admit::Now,
+        Pace::default(),
+        &mut |_| {},
+    )
+    .expect("held")
 }
 
 /// `line` names each of `figures`.
@@ -69,12 +83,14 @@ fn joined<T>(thread: std::thread::JoinHandle<T>, what: &str) -> T {
     thread.join().expect(what)
 }
 
-/// A first run claims the 27 GiB cold budget, and says so first. On a volume 18 GiB above its
-/// floor it reclaims first (its line naming what stayed of a stage the pass could not finish),
-/// then asks the window's watch, and only then waits, its line naming the need, the free space
-/// and the largest holder; it is admitted once room comes, and what it wrote is kept.
-/// Negative control: the next run, with room, is relieved of nothing and says nothing, and it
-/// claims what the first run wrote, not the cold budget.
+/// A first run claims the 27 GiB cold budget, and says so first. On a volume 16 GiB above its
+/// floor beside a held 5 GiB claim it reclaims first (13 GiB, its line naming what stayed of a
+/// stage the pass could not finish), then asks the window's watch for the floor, the held claim
+/// and its need, and only then waits, within the room but short of what that claim holds, its
+/// line naming the need, the free space, what is reserved and the largest holder; it is admitted
+/// once room comes, and what it wrote is kept. Negative control: the next run, with room, is
+/// relieved of nothing and says nothing, and it claims what the first run wrote, not the cold
+/// budget.
 #[test]
 fn a_short_volume_is_reclaimed_first_then_waited_for() {
     let dir = aterm_tempfile::Builder::new()
@@ -83,6 +99,7 @@ fn a_short_volume_is_reclaimed_first_then_waited_for() {
         .expect("scratch");
     let ledger = Ledger::at(dir.path().join("ledger"));
     let m = Arc::new(Fixed::new(image(40, 20)));
+    let held = held_beside(&ledger, &m, 5);
     let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
     let (tx, rx) = mpsc::channel::<String>();
     let run = verify_run(dir.path());
@@ -98,9 +115,9 @@ fn a_short_volume_is_reclaimed_first_then_waited_for() {
             Box::new(move |room: super::Room<'_>, _stopped| {
                 assert_eq!(room.mount, Path::new("/Volumes/scratch"));
                 pass_order.lock().expect("order").push("reclaim");
-                pass_m.set(image(40, 22));
+                pass_m.set(image(40, 33));
                 (
-                    2 * GIB,
+                    13 * GIB,
                     vec![PathBuf::from("/Volumes/scratch/gone/.cargo-build")],
                     vec![
                         "1 entry of /Volumes/scratch/left/.cargo-build.removing stayed: tmp/d"
@@ -110,7 +127,7 @@ fn a_short_volume_is_reclaimed_first_then_waited_for() {
             }),
             Box::new(move |bytes, _mount, _stopped| {
                 ask_order.lock().expect("order").push("ask");
-                assert_eq!(bytes, 31 * GIB, "the floor and the need");
+                assert_eq!(bytes, 36 * GIB, "the floor, the held claim and the need");
                 Some("OK why=no-room".to_owned())
             }),
             Box::new(|_mount, _stopped| {
@@ -139,26 +156,27 @@ fn a_short_volume_is_reclaimed_first_then_waited_for() {
         &reclaimed,
         &[
             "/Volumes/scratch",
-            "2 GiB",
+            "13 GiB",
             "gone/.cargo-build",
             "; 1 entry of /Volumes/scratch/left/.cargo-build.removing stayed: tmp/d",
         ],
     );
     let asked = rx.recv_timeout(MUST_HAPPEN).expect("the watch's line");
-    names(&asked, &["31 GiB", "why=no-room"]);
+    names(&asked, &["36 GiB", "why=no-room"]);
     let wait = rx.recv_timeout(MUST_HAPPEN).expect("the wait line");
     names(
         &wait,
         &[
             "verify lint -p aterm-capacity",
             "27 GiB",
-            "18 GiB",
+            "29 GiB",
+            "5 GiB reserved",
             "/Volumes/scratch/ballast",
         ],
     );
     assert_eq!(*order.lock().expect("order"), ["reclaim", "ask"]);
     assert!(!waiting.is_finished(), "it waits instead of starting short");
-    m.set(image(40, 36));
+    m.set(image(40, 40));
     let admitted = joined(waiting, "the run's admission once room came").expect("admitted");
     assert_eq!(
         (admitted.estimate.bytes, admitted.estimate.runs),
@@ -193,6 +211,89 @@ fn a_short_volume_is_reclaimed_first_then_waited_for() {
     assert_eq!(next.estimate.runs, 1, "{}", next.estimate);
     assert!(next.estimate.bytes < GIB, "{}", next.estimate);
     let _ = next.finish();
+    drop(held);
+}
+
+/// UNMET: a first run's 27 GiB on a volume 16 GiB above its floor, which its relief brings to
+/// 18 GiB (the pass reclaims 2 GiB, the watch it asks frees nothing), is refused at the next
+/// look, no wait line said: the lines are its figure's why, the reclaim's and the watch's, and
+/// the refusal names the run, what it is short of, what holds the most on the volume, how much
+/// to free there and that its relief ran (the way to start it at once is its caller's to add).
+/// The claim leaves the ledger and nothing is kept. The
+/// admission runs on a thread of its own, joined within the hang detector, so a wait fails the
+/// test. NEGATIVE CONTROL: [`a_short_volume_is_reclaimed_first_then_waited_for`], within the room
+/// after its relief, waits and is admitted.
+#[test]
+fn a_run_its_relief_leaves_beyond_the_room_is_refused_at_once() {
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("admit-disk-unmet-")
+        .tempdir()
+        .expect("scratch");
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let m = Arc::new(Fixed::new(image(40, 20)));
+    let run = verify_run(dir.path());
+    let record = run.record.clone();
+    let (theirs, their_ledger) = (Arc::clone(&m), ledger.clone());
+    let deciding = std::thread::spawn(move || {
+        let pass_m = Arc::clone(&theirs);
+        let mut relief = Reclaim::of(
+            Box::new(move |_room, _stopped| {
+                pass_m.set(image(40, 22));
+                (
+                    2 * GIB,
+                    vec![PathBuf::from("/Volumes/scratch/gone/.cargo-build")],
+                    Vec::new(),
+                )
+            }),
+            Box::new(|_bytes, _mount, _stopped| Some("OK why=no-room".to_owned())),
+            Box::new(|_mount, _stopped| {
+                vec![(PathBuf::from("/Volumes/scratch/ballast"), 18 * GIB)]
+            }),
+        );
+        let mut said = Vec::new();
+        let got = admit_on(
+            run,
+            &their_ledger,
+            &*theirs,
+            Admit::Wait,
+            Pace {
+                poll: Duration::from_millis(5),
+                line_every: Duration::from_secs(60),
+            },
+            &mut relief,
+            &mut |l| said.push(l.to_owned()),
+        );
+        (got.map(|a| a.estimate.bytes), said)
+    });
+    let (got, said) = joined(deciding, "its refusal");
+    let refused = match got {
+        Err(e @ aterm_capacity::Error::Unmet { .. }) => e.to_string(),
+        other => panic!("refused as unmet, got {other:?}"),
+    };
+    names(
+        &refused,
+        &[
+            "verify lint -p aterm-capacity: disk short by 9 GiB",
+            "needs 27 GiB on /Volumes/scratch, 18 GiB free above its 4 GiB floor",
+            "largest on /Volumes/scratch: /Volumes/scratch/ballast 18 GiB",
+            "Free at least 9 GiB on /Volumes/scratch",
+            "once its relief freed what it could",
+        ],
+    );
+    assert_eq!(
+        said.len(),
+        3,
+        "the figure, the reclaim and the ask: {said:?}"
+    );
+    names(&said[0], &[&first_run().to_string()]);
+    names(&said[1], &["2 GiB", "gone/.cargo-build"]);
+    names(&said[2], &["31 GiB", "why=no-room"]);
+    assert!(said.iter().all(|l| !l.contains(" waits ")), "{said:?}");
+    assert!(
+        ledger.list().expect("listed").is_empty(),
+        "it left the queue"
+    );
+    assert!(Footprints::load(&record).runs().is_empty(), "nothing kept");
 }
 
 /// A need above what the volume holds over its floor is refused at once, naming the need and
@@ -283,8 +384,9 @@ fn a_claim_says_why_its_figure_is_what_it_is_before_it_starts_short() {
 /// The window's disk watch is asked for the floor, what the claims ahead reserve and the run's
 /// need, never for the need of a waiter ahead that no claim's end can admit: that waiter needs
 /// 30 GiB on a volume 16 GiB above its floor and reserves nothing, so the run's ask is the
-/// 31 GiB its own 27 GiB and the 4 GiB floor make, not 61 GiB, and its wait line says how to
-/// start it now. Once that waiter has left and room comes, the run is admitted.
+/// 31 GiB its own 27 GiB and the 4 GiB floor make, not 61 GiB. The run, as far beyond the room,
+/// is then refused, saying its relief ran. NEGATIVE CONTROL: once that waiter has left and
+/// room has come, the same run is admitted at once.
 #[test]
 fn the_watch_is_not_asked_for_a_waiter_no_claims_end_can_admit() {
     let dir = aterm_tempfile::Builder::new()
@@ -303,7 +405,7 @@ fn the_watch_is_not_asked_for_a_waiter_no_claims_end_can_admit() {
     let (tx, rx) = mpsc::channel::<String>();
     let run = verify_run(dir.path());
     let (theirs, their_asked, their_ledger) = (Arc::clone(&m), Arc::clone(&asked), ledger.clone());
-    let waiting = std::thread::spawn(move || {
+    let deciding = std::thread::spawn(move || {
         let mut relief = Reclaim::of(
             Box::new(|_, _| (0, Vec::new(), Vec::new())),
             Box::new(move |bytes, _, _| {
@@ -334,30 +436,91 @@ fn the_watch_is_not_asked_for_a_waiter_no_claims_end_can_admit() {
     names(&reclaimed, &["/Volumes/scratch", "nothing unused"]);
     let ask = rx.recv_timeout(MUST_HAPPEN).expect("the watch's line");
     names(&ask, &["31 GiB", "why=spent"]);
-    let wait = rx.recv_timeout(MUST_HAPPEN).expect("the wait line");
+    let refused = match joined(deciding, "its refusal") {
+        Err(e @ aterm_capacity::Error::Unmet { .. }) => e.to_string(),
+        other => panic!("refused as unmet, got {other:?}"),
+    };
     names(
-        &wait,
+        &refused,
         &[
             "verify lint -p aterm-capacity",
             "27 GiB",
             "16 GiB",
             "4 GiB",
-            "0 GiB",
-            "--admit now",
+            "once its relief freed what it could",
         ],
     );
     assert_eq!(*asked.lock().expect("asked"), [31 * GIB]);
     drop(ahead);
     m.set(image(40, 36));
-    let claimed = joined(waiting, "the run's admission once room came").expect("admitted");
-    assert_eq!(claimed, 27 * GIB);
+    let claimed = admit_on(
+        verify_run(dir.path()),
+        &ledger,
+        &*m,
+        Admit::Wait,
+        Pace::default(),
+        &mut no_relief(),
+        &mut |_| {},
+    )
+    .expect("admitted at once");
+    assert_eq!(claimed.estimate.bytes, 27 * GIB);
+    let _ = claimed.finish();
+}
+
+/// A scratch run that removes what it wrote does so while its claim is still held
+/// ([`Admitted::finish_emptying`]). Inside `empty` the ledger still says the claim is scratch;
+/// after it, the claim is gone, and what the run kept is what its directories grew by before
+/// they were emptied. NEGATIVE CONTROL: a claim let go before `empty` ran reads 0 claims inside
+/// it, and one that forgot the scratch marker reads `false` inside it.
+#[test]
+fn a_run_empties_its_scratch_before_its_claim_goes() {
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("admit-disk-emptying-")
+        .tempdir()
+        .expect("scratch");
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let mut run = verify_run(dir.path());
+    run.scratch = true;
+    let claimed = admit_on(
+        run.clone(),
+        &ledger,
+        &Fixed::new(image(40, 36)),
+        Admit::Wait,
+        Pace::default(),
+        &mut no_relief(),
+        &mut |_| {},
+    )
+    .expect("admitted at once");
+    let build = dir.path().join("target/build.noindex");
+    std::fs::create_dir_all(&build).expect("a build directory");
+    std::fs::write(build.join("slot.o"), vec![7u8; 3 << 20]).expect("written");
+    let mut inside = None;
+    let took = claimed.finish_emptying(|| {
+        let claims = ledger.list().expect("listed");
+        inside = Some((claims.len(), claims[0].need.scratch));
+        std::fs::remove_dir_all(&build).expect("emptied");
+    });
+    assert_eq!(
+        inside,
+        Some((1, true)),
+        "emptied while its scratch claim is held"
+    );
+    assert!(
+        ledger.list().expect("listed").is_empty(),
+        "then its claim went"
+    );
+    assert!(
+        took.grew >= 3 << 20,
+        "measured before it was emptied: {took:?}"
+    );
+    assert_eq!(Footprints::load(&run.record).runs(), &[took]);
 }
 
 /// A kind never measured here claims its cold budget less what its directories hold already:
 /// a warm build directory with no record, holding more than the budget, claims nothing, so a
 /// short volume neither reclaims nor waits for it, and that run's own growth is kept for the
-/// next. Negative control: the same run on empty directories claims the whole budget, and on
-/// that short volume waits for it.
+/// next. Negative control: the same run on empty directories claims the whole budget, which on
+/// that short volume is refused (UNMET, beyond the room once its relief ran).
 #[test]
 fn warm_directories_with_no_record_claim_only_the_rest_of_the_budget() {
     let dir = aterm_tempfile::Builder::new()
@@ -400,7 +563,7 @@ fn warm_directories_with_no_record_claim_only_the_rest_of_the_budget() {
     let run = verify_run(dir.path());
     let (tx, rx) = mpsc::channel::<String>();
     let (theirs, their_ledger) = (Arc::new(m), ledger.clone());
-    let waiting = {
+    let deciding = {
         let theirs = Arc::clone(&theirs);
         std::thread::spawn(move || {
             let mut relief = Reclaim::of(
@@ -428,12 +591,10 @@ fn warm_directories_with_no_record_claim_only_the_rest_of_the_budget() {
     names(&figure, &[&first_run().to_string()]);
     let line = rx.recv_timeout(MUST_HAPPEN).expect("the relief's line");
     names(&line, &["/Volumes/scratch"]);
-    let wait = rx.recv_timeout(MUST_HAPPEN).expect("the wait line");
-    names(&wait, &["27 GiB"]);
-    theirs.set(image(40, 36));
-    let cold = joined(waiting, "the run's admission once room came").expect("admitted");
-    assert_eq!((cold.estimate.bytes, cold.estimate.runs), (27 * GIB, 0));
-    let _ = cold.finish();
+    match joined(deciding, "its refusal") {
+        Err(e @ aterm_capacity::Error::Unmet { .. }) => names(&e.to_string(), &["needs 27 GiB"]),
+        other => panic!("refused as unmet, got {other:?}"),
+    }
 }
 
 /// A run whose record holds one warm run that grew 64 KiB, its build directory under `dir`
@@ -555,9 +716,10 @@ fn a_relief_that_empties_the_runs_directories_sizes_its_claim_again() {
 }
 
 /// A CLAIM IS SIZED AGAIN AS IT IS ADMITTED, AFTER ITS DIRECTORIES WENT WHILE IT WAITED. The same
-/// warm run claims 64 KiB on a volume at its floor; its relief removes nothing and no watch
-/// answers, so it waits. Then a pass that is not its own (another waiting run's, which keeps
-/// only that run's directories, or the window's watch's each minute) removes its build directory
+/// warm run claims 64 KiB on a volume 4 GiB above its floor, all of it held by a claim ahead;
+/// its relief removes nothing and no watch answers, so it waits for that claim. Then a pass that
+/// is not its own (another waiting run's, which keeps only that run's directories, or the
+/// window's watch's each minute) removes its build directory
 /// and room comes: at the look that admits it the claim is sized again from the emptied
 /// directories, says so, and is held at that figure in the ledger, and the run's writes are
 /// measured from empty. Negative control: sized only after its own relief, it is admitted
@@ -571,7 +733,8 @@ fn a_build_directory_emptied_while_it_waits_sizes_its_claim_again() {
     let ledger = Ledger::at(dir.path().join("ledger"));
     let (run, build, warm, then) = warm_run(dir.path());
     let (record, dirs) = (run.record.clone(), run.dirs.clone());
-    let m = Arc::new(Fixed::new(image(40, 4)));
+    let m = Arc::new(Fixed::new(image(40, 8)));
+    let ahead = held_beside(&ledger, &m, 4);
     let (tx, rx) = mpsc::channel::<String>();
     let (their_ledger, theirs) = (ledger.clone(), Arc::clone(&m));
     let waiting = std::thread::spawn(move || {
@@ -616,9 +779,15 @@ fn a_build_directory_emptied_while_it_waits_sizes_its_claim_again() {
         .recv_timeout(MUST_HAPPEN)
         .expect("the line sizing it again");
     names(&resized, &[&now.to_string()]);
-    let held = ledger.list().expect("listed");
+    let held: Vec<_> = ledger
+        .list()
+        .expect("listed")
+        .into_iter()
+        .filter(|r| r.need.what == "verify lint -p aterm-capacity")
+        .collect();
     assert_eq!(held.len(), 1, "{held:?}");
     assert_eq!(held[0].need.disk, now.bytes, "the claim holds it");
+    drop(ahead);
 
     std::fs::create_dir_all(&build).expect("written again");
     std::fs::write(build.join("lib.rlib"), vec![7u8; 8 << 20]).expect("written");
@@ -711,6 +880,7 @@ fn a_claims_relief_waits_the_hour_only_below_the_floor() {
                 above_floor,
                 floor: 10 * GIB,
                 reserved: GIB,
+                held: Vec::new(),
             }],
             holders: Vec::new(),
         };
@@ -762,6 +932,7 @@ fn a_workspace_removed_while_a_run_waits_renews_its_relief() {
             above_floor: 12 * GIB,
             floor: 10 * GIB,
             reserved: 0,
+            held: Vec::new(),
         }],
         holders: Vec::new(),
     };
@@ -831,7 +1002,8 @@ extern "C" fn tool_handler(sig: libc::c_int) {
 
 /// Run by [`an_interrupt_ends_a_disk_claim_and_its_relief`] in a process of its own: catches
 /// SIGINT and SIGTERM in a handler of its own, as `ship trust run` and the lab do, then claims a
-/// first verify run's 27 GiB on a volume 16 GiB above its floor, looking every two minutes
+/// first verify run's 27 GiB on a volume 36 GiB above its floor beside a held 10 GiB claim (it
+/// fits the room but not beside that claim, so it waits), looking every two minutes
 /// (twice the test's hang detector, so only a nap the interrupt ends ends in time), writing
 /// `waiting` once its wait (or its relief's ask) is under way, and exits 3, a tool's NOT RUN,
 /// naming the signal and what it was short of.
@@ -860,6 +1032,9 @@ fn standin_claims_disk_until_interrupted() {
     if measuring {
         run.cold = 0;
     }
+    let ledger = Ledger::at(dir.join("ledger"));
+    let machine = Fixed::new(image(40, 40));
+    let held = held_beside(&ledger, &machine, 10);
     let waiting = dir.join("waiting");
     let ask_lasts = std::env::var_os(STANDIN_ASK).is_some();
     let asking = waiting.clone();
@@ -880,8 +1055,8 @@ fn standin_claims_disk_until_interrupted() {
     );
     let got = admit_on(
         run,
-        &Ledger::at(dir.join("ledger")),
-        &Fixed::new(image(40, 20)),
+        &ledger,
+        &machine,
         Admit::Wait,
         Pace {
             poll: MUST_HAPPEN * 2,
@@ -895,6 +1070,7 @@ fn standin_claims_disk_until_interrupted() {
         },
     );
     drop(outer);
+    drop(held);
     match got {
         Err(
             e @ aterm_capacity::Error::Stopped {
@@ -928,7 +1104,8 @@ impl Drop for Standin {
     }
 }
 
-/// A disk claim held up by a short volume ends on SIGTERM, or SIGINT, as NOT RUN well inside
+/// A disk claim held up by what a claim ahead holds on its volume ends on SIGTERM, or SIGINT, as
+/// NOT RUN well inside
 /// the one-minute hang detector (the time is reported), whether the signal comes while it waits
 /// (its next look two minutes off) or while its relief asks the window's watch, which would
 /// last a minute; it names the signal and the need, and leaves nothing in the ledger. Negative
@@ -1429,7 +1606,6 @@ fn machinewide(dir: &Path) -> super::Machinewide {
             work: "lint".to_owned(),
             crates: Some(vec!["aterm-capacity".to_owned()]),
         },
-        more: vec!["lint".to_owned(), "test".to_owned()],
     }
 }
 
@@ -1743,10 +1919,13 @@ fn a_sized_claim_is_held_unwalked_and_keeps_nothing() {
     assert!(ledger.list().expect("listed").is_empty());
 }
 
-/// A SIZED CLAIM ON A SHORT VOLUME IS RELIEVED, THEN WAITS, saying first what it claims: the
-/// pass is asked for the short volume, and once room comes the claim is admitted, having
-/// waited. NEGATIVE CONTROL: the claim admitted at once ([`a_sized_claim_is_held_unwalked_and_keeps_nothing`])
-/// asks no relief.
+/// A SIZED CLAIM ON A SHORT VOLUME IS RELIEVED, THEN WAITS, saying first what it claims: within
+/// the room but short of what a held claim reserves, the pass is asked for the short volume, and
+/// once room comes the claim is admitted, having waited. Beyond the room once relieved, it is
+/// refused at once (UNMET), naming how much to free, and leaves the ledger; the release has no
+/// way to start at once, so it is offered none.
+/// NEGATIVE CONTROL: the claim admitted at once
+/// ([`a_sized_claim_is_held_unwalked_and_keeps_nothing`]) asks no relief.
 #[test]
 fn a_sized_claim_on_a_short_volume_is_relieved_then_waits() {
     let dir = aterm_tempfile::Builder::new()
@@ -1754,7 +1933,8 @@ fn a_sized_claim_on_a_short_volume_is_relieved_then_waits() {
         .tempdir()
         .expect("scratch");
     let ledger = Ledger::at(dir.path().join("ledger"));
-    let m = Arc::new(Fixed::new(image(100, 30)));
+    let m = Arc::new(Fixed::new(image(100, 50)));
+    let ahead = held_beside(&ledger, &m, 10);
     let passes = Arc::new(Mutex::new(0usize));
     let (theirs, their_passes, their_ledger) =
         (Arc::clone(&m), Arc::clone(&passes), ledger.clone());
@@ -1790,10 +1970,351 @@ fn a_sized_claim_on_a_short_volume_is_relieved_then_waits() {
     let first = rx.recv_timeout(MUST_HAPPEN).expect("its first line");
     names(&first, &[&size(39 * GIB), "release 0.156.0"]);
     aterm_spec::wait::until_within(MUST_HAPPEN, "the claim to wait", || {
-        (ledger.list().ok()?.first()?.held.is_none()).then_some(())
+        let listed = ledger.list().ok()?;
+        let release = listed.iter().find(|r| r.need.what == "release 0.156.0")?;
+        release.held.is_none().then_some(())
     });
     m.set(image(100, 80));
     let waited = joined(waiting, "the sized claim to be admitted").expect("admitted");
     assert!(waited > Duration::ZERO);
     assert_eq!(*passes.lock().expect("passes"), 1, "relieved once");
+    drop(ahead);
+
+    let short = Fixed::new(image(100, 30));
+    let mut said = Vec::new();
+    let refused = super::admit_sized_on(
+        release_claim(dir.path(), 39 * GIB),
+        &ledger,
+        &short,
+        Admit::Wait,
+        Pace {
+            poll: Duration::from_millis(5),
+            ..Pace::default()
+        },
+        &mut no_relief(),
+        &mut |l| said.push(l.to_owned()),
+    );
+    match refused {
+        Err(e @ aterm_capacity::Error::Unmet { .. }) => names(
+            &e.to_string(),
+            &[
+                "release 0.156.0",
+                "Free at least 13 GiB on /Volumes/scratch",
+            ],
+        ),
+        other => panic!("refused as unmet, got {other:?}"),
+    }
+    names(&said[0], &[&size(39 * GIB), "release 0.156.0"]);
+    assert!(
+        ledger.list().expect("listed").is_empty(),
+        "it left the queue"
+    );
+}
+
+/// Set, the test binary is [`standin_holds_a_metered_claim`], its run's directories under this
+/// path.
+#[cfg(unix)]
+const METERED: &str = "ATPKG_ADMIT_DISK_METERED";
+
+/// Set with [`METERED`], the metered stand-in starts a child: `works` one that works
+/// ([`standin_works`]), `ticks` one that only keeps its books ([`standin_ticks`]).
+#[cfg(unix)]
+const METERED_CHILD: &str = "ATPKG_ADMIT_DISK_METERED_CHILD";
+
+/// Set, the test binary is [`standin_works`].
+#[cfg(unix)]
+const WORKS: &str = "ATPKG_ADMIT_DISK_WORKS";
+
+/// Set, the test binary is [`standin_ticks`].
+#[cfg(unix)]
+const TICKS: &str = "ATPKG_ADMIT_DISK_TICKS";
+
+/// How often the metered stand-in's meter walks its directories, and its ticking child wakes:
+/// 120 times their pace in a run ([`aterm_capacity::footprint::EVERY`], a Go runtime's minute),
+/// so a test that reads its holder every two of them, each read standing for a minute, sees each
+/// of them move between reads.
+#[cfg(unix)]
+const METER_PACE: Duration = Duration::from_millis(500);
+
+/// Run by [`a_holder_that_only_keeps_its_books_is_stuck_and_one_whose_child_works_is_not`] in a
+/// process of its own: claims a verify run's disk in the ledger under [`METERED`] through the
+/// real claim ([`admit_on`]), its [`aterm_capacity::Meter`] walking the run's 600 files and
+/// writing its claim every [`METER_PACE`]; starts the child [`METERED_CHILD`] names; writes
+/// `admitted`; then sleeps, doing nothing more of its own, until its test kills it (twice the
+/// hang detector at most).
+#[cfg(unix)]
+#[test]
+fn standin_holds_a_metered_claim() {
+    let Some(dir) = std::env::var_os(METERED).map(PathBuf::from) else {
+        return;
+    };
+    aterm_capacity::footprint::pace_meters(METER_PACE);
+    let run = verify_run(&dir);
+    for d in &run.dirs {
+        for i in 0..300 {
+            let sub = d.join(format!("{}", i % 30));
+            std::fs::create_dir_all(&sub).expect("a directory of the run");
+            // Empty: the walk's work is its entries, and the files' bytes, flushed after the
+            // test reads it, would be writes its holder made.
+            std::fs::write(sub.join(format!("{i}.rlib")), []).expect("a file of the run");
+        }
+    }
+    let mut never = Reclaim::of(
+        Box::new(|_, _| (0, Vec::new(), Vec::new())),
+        Box::new(|_, _, _| None),
+        Box::new(|_, _| Vec::new()),
+    );
+    let held = admit_on(
+        run,
+        &Ledger::at(dir.join("ledger")),
+        &Fixed::new(image(400, 300)),
+        Admit::Wait,
+        Pace::default(),
+        &mut never,
+        &mut |_| {},
+    )
+    .expect("admitted at once");
+    let child = std::env::var(METERED_CHILD).ok().map(|kind| {
+        let (test, var) = match kind.as_str() {
+            "works" => ("admit_disk::tests::standin_works", WORKS),
+            "ticks" => ("admit_disk::tests::standin_ticks", TICKS),
+            other => panic!("no child {other}"),
+        };
+        aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
+            .args(["--exact", test, "--test-threads=1"])
+            .env(var, "1")
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .spawn()
+            .expect("the child")
+    });
+    std::fs::write(dir.join("admitted"), std::process::id().to_string()).expect("said admitted");
+    std::thread::sleep(MUST_HAPPEN * 2);
+    drop((held, child));
+}
+
+/// Run by [`standin_holds_a_metered_claim`] as its working child: keeps a core busy until its
+/// parent is gone (twice the hang detector at most).
+#[cfg(unix)]
+#[test]
+fn standin_works() {
+    if std::env::var_os(WORKS).is_none() {
+        return;
+    }
+    let parent = std::os::unix::process::parent_id();
+    let until = std::time::Instant::now() + MUST_HAPPEN * 2;
+    let mut n = 0u64;
+    while std::os::unix::process::parent_id() == parent && std::time::Instant::now() < until {
+        for i in 0..1_000_000u64 {
+            n = std::hint::black_box(n.wrapping_mul(31).wrapping_add(i));
+        }
+    }
+}
+
+/// Run by [`standin_holds_a_metered_claim`] as its child that only keeps its books, as an idle Go
+/// runtime does (lima's `limactl shell`, which on this Mac used 55 µs of CPU time in a minute):
+/// wakes every [`METER_PACE`] and spins for 50 µs, until its parent is gone (twice the hang
+/// detector at most).
+#[cfg(unix)]
+#[test]
+fn standin_ticks() {
+    if std::env::var_os(TICKS).is_none() {
+        return;
+    }
+    let parent = std::os::unix::process::parent_id();
+    let until = std::time::Instant::now() + MUST_HAPPEN * 2;
+    let mut n = 0u64;
+    while std::os::unix::process::parent_id() == parent && std::time::Instant::now() < until {
+        std::thread::sleep(METER_PACE);
+        let woke = std::time::Instant::now();
+        while woke.elapsed() < Duration::from_micros(50) {
+            n = std::hint::black_box(n.wrapping_mul(31).wrapping_add(1));
+        }
+    }
+}
+
+/// CW-WAIT-UNBOUNDED, A HOLDER THAT ONLY KEEPS ITS BOOKS IS NO PROGRESS: three stand-ins each
+/// take a real disk claim (held in a scratch ledger, its meter walking its directories and
+/// writing its claim every [`METER_PACE`]) and then do nothing more of their own; one has no
+/// child, one a child that only keeps its books ([`standin_ticks`], an idle `limactl shell`'s Go
+/// runtime) and one a child that works ([`standin_works`]). Read as a waiter reads them (one live
+/// sweep with this user's waits, as `stall::tree_work`), every two meter walks, each read
+/// standing for a minute of the stall's injected clock and judged busy over the time between
+/// reads (`Stall::over`, a minute's), the first two are called stuck at the bound, though the
+/// meter's walks moved the holder's CPU time and the ticks its child's at most reads (each
+/// reported, with the largest share of a core the tree was runnable between reads); the third
+/// is never stuck. NEGATIVE CONTROLS: the rule before any audit, any change of the tree's CPU
+/// time progress, never calls the first two stuck; the rule before this one, any change of a
+/// descendant's CPU time progress, never calls the holder with the ticking child stuck.
+#[cfg(unix)]
+#[test]
+fn a_holder_that_only_keeps_its_books_is_stuck_and_one_whose_child_works_is_not() {
+    use aterm_toolchain::stall::{STALLED_AFTER, Stall, Work, sweep, work_with};
+    /// How a rule reads a holder: the minute its measure last moved, and that measure.
+    #[derive(Default)]
+    struct Rule {
+        since: u32,
+        was: Option<u64>,
+        stuck_at: Option<u32>,
+        moved: u32,
+    }
+    impl Rule {
+        fn read(&mut self, m: u32, now: u64) {
+            if self.was != Some(now) {
+                self.moved += u32::from(self.was.is_some());
+                self.since = m;
+                self.was = Some(now);
+            }
+            if m - self.since >= 15 && self.stuck_at.is_none() {
+                self.stuck_at = Some(m);
+            }
+        }
+    }
+    if sweep().is_none() {
+        eprintln!("no process sweep here: nothing to read");
+        return;
+    }
+    let began = std::time::Instant::now();
+    let kinds = [None, Some("ticks"), Some("works")];
+    let dirs: Vec<_> = kinds
+        .iter()
+        .map(|_| {
+            aterm_tempfile::Builder::new()
+                .prefix("admit-disk-metered-")
+                .tempdir()
+                .expect("scratch")
+        })
+        .collect();
+    let holders: Vec<Standin> = kinds
+        .iter()
+        .zip(&dirs)
+        .map(|(kind, dir)| {
+            let mut cmd =
+                aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"));
+            if let Some(kind) = kind {
+                cmd.env(METERED_CHILD, kind);
+            }
+            Standin(
+                cmd.args([
+                    "--exact",
+                    "admit_disk::tests::standin_holds_a_metered_claim",
+                    "--test-threads=1",
+                ])
+                .env(METERED, dir.path())
+                .stdin(aterm_uds::spawnfd::Stdio::null())
+                .stdout(aterm_uds::spawnfd::Stdio::null())
+                .stderr(aterm_uds::spawnfd::Stdio::null())
+                .spawn()
+                .expect("the holder"),
+            )
+        })
+        .collect();
+    let pids: Vec<u32> = holders
+        .iter()
+        .zip(&dirs)
+        .map(|(holder, dir)| {
+            let pid: u32 =
+                aterm_spec::wait::until_within(MUST_HAPPEN, "the holder's claim", || {
+                    std::fs::read_to_string(dir.path().join("admitted"))
+                        .ok()?
+                        .trim()
+                        .parse()
+                        .ok()
+                });
+            assert_eq!(pid, holder.0.id());
+            let held: Vec<u32> = Ledger::at(dir.path().join("ledger"))
+                .list()
+                .expect("listed")
+                .into_iter()
+                .filter(|r| r.held.is_some())
+                .map(|r| r.pid)
+                .collect();
+            assert_eq!(held, [pid], "the holder's claim is held");
+            pid
+        })
+        .collect();
+    eprintln!("the holders held their claims in {:?}", began.elapsed());
+    let between = METER_PACE * 2 + Duration::from_millis(50);
+    let t0 = std::time::Instant::now();
+    let mut stalls: Vec<Stall> = kinds.iter().map(|_| Stall::over(METER_PACE * 2)).collect();
+    let mut now_rule: Vec<Option<u32>> = vec![None; kinds.len()];
+    let mut tree_rule: Vec<Rule> = kinds.iter().map(|_| Rule::default()).collect();
+    let mut child_rule: Vec<Rule> = kinds.iter().map(|_| Rule::default()).collect();
+    let mut last: Vec<Option<(std::time::Instant, u64)>> = vec![None; kinds.len()];
+    let mut share = vec![0f64; kinds.len()];
+    let waits = aterm_toolchain::waits::user_waiting();
+    for m in 0..=17u32 {
+        if m > 0 {
+            std::thread::sleep(between);
+        }
+        let (procs, at) = sweep().expect("a sweep");
+        for (i, &pid) in pids.iter().enumerate() {
+            let work = work_with(pid, &[], &procs, &waits).expect("the holder is swept");
+            assert_eq!(
+                work.members,
+                1 + usize::from(kinds[i].is_some()),
+                "the holder and its child"
+            );
+            let own = procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.cpu_ns);
+            if let Some((then, ran)) = last[i] {
+                let ran = Duration::from_nanos(work.runnable_ns.saturating_sub(ran));
+                share[i] = share[i]
+                    .max(ran.as_secs_f64() / at.saturating_duration_since(then).as_secs_f64());
+            }
+            last[i] = Some((at, work.runnable_ns));
+            let span = stalls[i].stuck(
+                pid,
+                Some(Work {
+                    at: Some(at),
+                    ..work
+                }),
+                t0 + Duration::from_secs(60) * m,
+                STALLED_AFTER,
+            );
+            if span.is_some() && now_rule[i].is_none() {
+                now_rule[i] = Some(m);
+            }
+            tree_rule[i].read(m, work.cpu_ns);
+            child_rule[i].read(m, work.cpu_ns.saturating_sub(own));
+        }
+    }
+    eprintln!("18 reads in {:?}", t0.elapsed());
+    for (i, kind) in kinds.iter().enumerate() {
+        eprintln!(
+            "child {kind:?}: stuck at minute {:?}; runnable at most {:.1}% of a core between \
+             reads; its CPU time moved at {} of 17 reads (stuck at {:?} by that), its child's \
+             at {} (stuck at {:?} by that)",
+            now_rule[i],
+            share[i] * 100.0,
+            tree_rule[i].moved,
+            tree_rule[i].stuck_at,
+            child_rule[i].moved,
+            child_rule[i].stuck_at,
+        );
+    }
+    let [idle, ticks, works] = [0, 1, 2];
+    assert_eq!(now_rule[idle], Some(15), "the holder alone, at the bound");
+    assert_eq!(
+        now_rule[ticks],
+        Some(15),
+        "the holder with a ticking child, at the bound"
+    );
+    assert_eq!(
+        now_rule[works], None,
+        "a holder whose child works was called stuck"
+    );
+    assert_eq!(
+        tree_rule[idle].stuck_at, None,
+        "the rule before any audit calls the holder alone stuck"
+    );
+    assert_eq!(
+        tree_rule[ticks].stuck_at, None,
+        "the rule before any audit calls the holder with a ticking child stuck"
+    );
+    assert_eq!(
+        child_rule[ticks].stuck_at, None,
+        "the rule before this one calls the holder with a ticking child stuck"
+    );
+    drop(holders);
 }

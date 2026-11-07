@@ -1,5 +1,121 @@
 # Native resource member controller
 
+The canonical metadata implementation was recovered from the maintained aterm
+source at `77bd657741` after its advertised vendor commits could not be resolved
+through the Trust repository's commit API. Metadata request role `3` and the
+separate syntax-only Mach-O linker loan role `4` coexist; neither syntax is a
+resource grant. Refresh consumers from a qualified canonical commit, preserving
+both protocols rather than overwriting one with an older vendor snapshot.
+
+The linker loan still requires an independently quiescent parent, authenticated
+actual CPU backing, a durable host return, a strict paired-linker recipe and a
+qualified native supervisor. Prefix and final cap strings alone do not establish
+that the linker parsed them as options. This library enables none of that work.
+
+`sealed-metadata-v1` is a separately negotiated metadata-only protocol. Its
+canonical capability data and startup/query arguments are Rust constants;
+they confer no admission and must not be advertised by an incomplete executor.
+The existing compile, version, context and telemetry protocols retain their
+original semantics. The matched host/native-Targo implementation is required
+before any paired probe stage can execute.
+
+The exact HELLO has `version:3`, `role:"sealed-metadata-v1"`, canonical `session`
+and the original resource-root hex `attempt`. After PREPARE `0x50`, kind12
+`SealedMetadataRequest` binds the existing Request (role3) to a canonical SDK
+root and expected image SHA256. That SDK root is distinct from the original
+resource-root capability. Shared borrowing supplies one original CPU right;
+fixed borrowing supplies none and must match the host's actual retained one-CPU
+grant. Both require the original GNU context and refuse lifetime fences. A
+decoded mode/count never creates a resource owner. Unsupported ancestor custody
+refuses; it must never trigger a fresh root or replacement GNU server.
+
+After live native-peer/job authorization and READY `0x41`, one `0x46` marker
+carries actual rights in this order: stdin, stdout, stderr, events, optional
+shared CPU, GNU read, GNU write. Source numbers label the producer's actual
+owned bundle; the host uses received rights, never environment-selected source
+descriptors. ACK `0x01` is attachment only. The host retains CPU/GNU, original
+memory and input descriptions through preparation, GO, cancellation and actual
+scope retirement. Ambiguous delivery never permits replay.
+
+The event protocol requires one kind13 `MetadataPrepared` inventory before
+Started. Its bounded file/runtime/path/host observations are data, not image,
+source, writer, resource or proof authority. Kind14 `MetadataCompletion` wraps
+the actual Finished status and post-drain input-validation result, preserving
+the actual failing exit/signal even when changed inputs invalidate comparison.
+Plain Finished is invalid for this purpose. The native executor owns ordering,
+exact attempts, finite stream/deadline checks and final drain; a codec cannot
+establish them. Closed argv are `-vV`, `--print sysroot`, and
+`--unverified --version`, with at most 30 target seconds and 64 KiB combined tool
+output. The complete semantic environment admits only `LANG=C`/`LC_ALL=C`;
+the actual owner regenerates checked runtime and scheduling transports.
+
+The capability explicitly advertises `metadata_role:3`. Published role2
+`MetadataProbe` remains the separate borrowed-CPU, no-GNU, eight-second
+single-argument built-in print query. It does not authorize this sealed-root
+runtime profile or genuine two-argument Targo version probe. Unpublished
+private role2 sealed-metadata baselines remain retained evidence; current
+producers/hosts neither reinterpret those bytes nor retry another role.
+
+With `client`, `Client::metadata` sends the negotiated request directly over
+the original pinned native ancestor connection and transfers only the caller's
+actual owned descriptions. It creates no helper or scheduler. After request
+delivery, an attachment failure returns the still-owned `MetadataMember` with
+unknown delivery; it must not cause replay. `MetadataMember::poll` retains
+those descriptions and the authenticated host through exactly one Attached,
+Prepared and Started sequence and Completed after real drain. Missing,
+duplicate, foreign-policy and contradictory events refuse. A plain Finished
+cannot substitute for Completed. A terminal record also requires clean event
+EOF and stdout/stderr EOF, so trailing or truncated frames cannot hide behind
+successful exit. Combined output collection is bounded at64KiB; excess sends
+Cancel and still waits for the same actual retirement. The target outcome and
+post-drain input integrity remain separate results. These source controls do
+not establish that a native Targo service or the complete paired runner has
+been qualified; that requires actual host/service integration.
+
+The metadata service explicitly advertises
+`context_sdk:"inherited-sdk-keeper-v1"` and negotiates with
+`Client::metadata_context`, HELLO role `native-metadata-ready-v1`, after its
+actual root is registered and durably ARM-tracked. The four HELLO fields are
+version, role, canonical session and the complete fixed capabilities object.
+The host validates its actual original peer/job/SDK/GNU/memory and records
+one readiness on that same root before authorizing any sealed member. Generic
+context lookups never activate it. There is no preparatory metadata capability
+subprocess outside the root's durable tracked lifetime. The service requires
+the current Context SDK field and separately verifies the actual early
+inherited keeper. It never retries an
+older role or strips the field. Existing ordinary context/telemetry entry
+points retain their behavior; their broader unversioned codec cutover remains
+a separate migration concern. Private native qualification is not permission
+to publish or replace an installed custodian.
+
+Kinds15/16 are bounded frontend-to-service data for one finite batch of at most
+six closed probes, distinct from the host's kinds12/13/14 and carrying no root
+capability. The input binds the service executable bytes separately from each
+target root, uses that target root as cwd and optionally names one explicit
+host discovery store. Explicit discovery uses the same private store, actual
+native ancestor, peer, image and original backing checks as account discovery;
+failure never creates/repairs a store, selects a pool, retries another host or
+falls back to account state. No ambient store override is accepted. A response
+retains the current service's held native input observations and exact
+authenticated Context frame, actual completed outcomes/output and any start
+known for the one incomplete failing member. Saved records confer no authority.
+
+An incomplete client exchange can expose its original bounded stream bytes
+once with `MetadataMember::take_failure_observation`. This poisons the same
+client unit and never supplies completion, exit, input or retirement authority.
+The observation retains combined target output up to 64 KiB, actual EOF and
+overflow, and the first 64 KiB of received length-framed native events with an
+explicit total/truncation count. Partial or malformed frames remain raw data.
+Report16 appends this strict kind17/version1 data annex only on incomplete
+failure; successful legacy bytes are unchanged. Aggregate report data is
+bounded at 8 MiB for six finite input inventories; native control/event frames
+remain bounded at 1 MiB. This annex is never a host lifecycle event or request.
+
+Metadata cancellation travels on the transferred bidirectional events socket,
+not the completed handshake. After attachment, the client revalidates its
+original held `PinnedHelper` image/host/boot/ancestry/backing; it never asks a
+closed handshake for Darwin peer credentials or reselects another host.
+
 One private binary protocol shared by the native Targo/Trust proxy adapter and
 aterm's cached immutable helper. It carries no new-root admission authority.
 
@@ -14,6 +130,13 @@ must be disjoint from the actual control/proof sockets BEFORE duplication. Targe
 descriptors belong to a different child namespace and may start at 3. The helper
 must close its duplicate stdio ends after attachment and never pass control or
 proof endpoints to the target.
+
+The optional client can be compiled with stock Rust for consumers' portable
+builds. Native member launch requires Trust std's explicit descriptor inheritance
+and returns `io::ErrorKind::Unsupported` before spawning a helper when that
+capability is absent. A build-time compiler identity probe selects the Trust
+extension; metadata/context APIs do not require it. There is no process-wide
+CLOEXEC mutation or implicit-inheritance fallback on stock std.
 
 Request and lifecycle frames carry distinct original-root and member attempts.
 The command environment is a complete lossless Unix-byte snapshot, never merged
@@ -77,3 +200,14 @@ and says nothing about original-root execution or resource release. The native
 consumer must validate debt/manifest and initial-vs-borrowed CPU rules before
 admission. The optional path has no role in the default host codec dependency
 closure and does not activate v3.
+
+The distinct resolver root negotiates `sealed-resolver-v1` and
+`query_environment=resolver-root-fixed-env4-v1` before configuration. Query role5
+requires exactly LANG=C, LC_ALL=C, CARGO, RUSTC, CARGO_HOME and
+CARGO_CACHE_RUSTC_INFO=0; the host additionally matches those four semantic
+values to its original admitted root. Role3 metadata and role4 linker stay closed.
+`ResolverReport` kind34 is bounded root-output data (96MiB aggregate,64MiB
+semantic metadata), separate from the unchanged 1MiB native socket and64KiB
+field limits. It retains completed/incomplete query observations without private
+request capabilities. Decoded reports create no SDK, CPU, memory, execution,
+retirement, source authentication or proof authority.

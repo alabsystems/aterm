@@ -177,33 +177,50 @@ fn a_since_cursor_answers_a_delta_and_its_gaps() {
     assert!(moved.lines().any(|l| l.starts_with("cpu ")), "{moved}");
     assert!(moved.lines().any(|l| l.starts_with("same ")), "{moved}");
     let other = ask(&shared, &format!("cores since={cursor}"));
-    assert!(other.lines().any(|l| l == "gap why=evicted"), "{other}");
+    assert!(
+        other.lines().any(|l| l == "gap why=other-request"),
+        "{other}"
+    );
     assert!(!other.lines().next().unwrap().contains("delta=1"));
     let shorter = ask(&shared, &format!("global top=1 since={cursor}"));
-    assert!(shorter.lines().any(|l| l == "gap why=evicted"), "{shorter}");
+    assert!(
+        shorter.lines().any(|l| l == "gap why=other-request"),
+        "{shorter}"
+    );
+    shared.publish_for_test(synthetic(5, 0.6), Vec::new());
+    let json = cursor_of(&ask(&shared, "global --json"));
+    let json_again = ask(&shared, &format!("global --json since={json}"));
+    assert!(!json_again.contains("\"gap\""), "{json_again}");
+    let text_of_json = ask(&shared, &format!("global since={json}"));
+    assert!(
+        text_of_json.lines().any(|l| l == "gap why=other-request"),
+        "{text_of_json}"
+    );
+    let gone = ask(&shared, &format!("global since={:x}.1", *EPOCH));
+    assert!(gone.lines().any(|l| l == "gap why=evicted"), "{gone}");
     let reset = ask(&shared, &format!("global since={:x}.3", *EPOCH ^ 1));
     assert!(reset.lines().any(|l| l == "gap why=reset"), "{reset}");
     let ahead = ask(&shared, &format!("global since={:x}.99", *EPOCH));
-    assert_eq!(ahead, format!("ERR bad since head={:x}.4\n", *EPOCH));
+    assert_eq!(ahead, format!("ERR bad since head={:x}.5\n", *EPOCH));
 }
 
 #[test]
 fn a_why_since_cursor_folds_only_against_the_same_reply() {
     let shared = Shared::new();
     shared.publish_for_test(synthetic(3, 0.1), Vec::new());
-    let evicted = |reply: &str| reply.lines().any(|l| l == "gap why=evicted");
+    let other = |reply: &str| reply.lines().any(|l| l == "gap why=other-request");
     let mem = cursor_of(&ask(&shared, "why mem"));
     let cpu = ask(&shared, &format!("why cpu since={mem}"));
-    assert!(evicted(&cpu), "{cpu}");
+    assert!(other(&cpu), "{cpu}");
     let bare = cursor_of(&ask(&shared, "why"));
     let top = ask(&shared, &format!("why top=8 since={bare}"));
-    assert!(evicted(&top), "{top}");
+    assert!(other(&top), "{top}");
     let again = ask(&shared, &format!("why since={bare}"));
     assert!(
         again.lines().next().unwrap().ends_with(" delta=1"),
         "{again}"
     );
-    assert!(!evicted(&again), "{again}");
+    assert!(!other(&again), "{again}");
     let procs = cursor_of(&ask(&shared, "procs top=8"));
     let folded = ask(&shared, &format!("procs since={procs}"));
     assert!(

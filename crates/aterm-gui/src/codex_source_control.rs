@@ -12,13 +12,18 @@ use std::collections::{BTreeMap, VecDeque};
 use std::os::fd::BorrowedFd;
 use std::sync::{
     OnceLock,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+
+#[path = "codex_source_use_control.rs"]
+mod use_control;
 
 const MAX_FRAME: usize = 16 * 1024;
 const MAX_CONNECTIONS: usize = 256;
 const MAX_PENDING: usize = 256;
 const MAX_RUNNING: usize = 64;
+const MAX_CLEANUP_PENDING: usize = 64;
+const MAX_CLEANUP_RUNNING: usize = 16;
 const RECENT_PER_CONNECTION: usize = 8;
 const UNAVAILABLE: &str = "ERR codex-auth unavailable\n";
 
@@ -51,6 +56,7 @@ impl Sequence {
 
 #[derive(Clone, PartialEq, Eq)]
 enum Action {
+    Use(registry::UseAction),
     Open,
     Preload,
     Ready {
@@ -123,6 +129,25 @@ impl Request {
             hex(value, 32).then(|| value.to_owned())
         };
         let action = match action {
+            "member-use-begin" | "member-use-close" => {
+                registry::UseNonce::parse(&operation)?;
+                let registration = registration(&mut fields)?;
+                Action::Use(if action == "member-use-begin" {
+                    registry::UseAction::Begin { registration }
+                } else {
+                    registry::UseAction::Close { registration }
+                })
+            }
+            "member-use-end" => {
+                registry::UseNonce::parse(&operation)?;
+                let capability = fields.remove("capability")?;
+                if !hex(capability, 64) {
+                    return None;
+                }
+                Action::Use(registry::UseAction::End {
+                    capability: capability.into(),
+                })
+            }
             "member-open" => Action::Open,
             "member-preload" => Action::Preload,
             "member-ready" | "member-reader-ready" => {
@@ -203,8 +228,15 @@ impl Request {
             action,
         })
     }
+    fn cleanup(&self) -> bool {
+        matches!(
+            &self.action,
+            Action::Use(registry::UseAction::End { .. } | registry::UseAction::Close { .. })
+        )
+    }
     fn name(&self) -> &'static str {
         match self.action {
+            Action::Use(_) => "member-use",
             Action::Open => "member-open",
             Action::Preload => "member-preload",
             Action::Ready { .. } => "member-ready",
@@ -228,40 +260,48 @@ struct Caller {
     process: Process,
     start: String,
 }
-fn claim(
-    ctx: &crate::SessionCtx,
-    master: i32,
-    registry: &registry::Registry,
-) -> Result<(Caller, registry::Peer), registry::Error> {
+fn identify(ctx: &crate::SessionCtx) -> Result<Caller, registry::Error> {
+    identify_for_session(ctx.self_id.as_str())
+}
+fn identify_for_session(sid: &str) -> Result<Caller, registry::Error> {
     let pid = crate::control::serving_peer_pid().ok_or(registry::Error::Denied)?;
     let process = Process::observe(pid).ok_or(registry::Error::Unavailable)?;
     let caller = slot::Caller {
-        sid: ctx.self_id.as_str().into(),
+        sid: sid.into(),
         pid,
         birth: process.birth,
-    };
-    let args = atpkg::caller_shell::process_args(pid).ok_or(registry::Error::Unavailable)?;
-    let peer = if let Some(token) = args.env_var(registry::LAUNCH_ENV) {
-        registry.reserved_peer(&caller, token)?
-    } else {
-        if master < 0 {
-            return Err(registry::Error::Denied);
-        }
-        // SAFETY: borrow the actual session PTY; no descriptor is transferred.
-        registry::Peer::foreground(&caller, unsafe { BorrowedFd::borrow_raw(master) })?
     };
     let start = restart_stamp::kernel_start(pid).ok_or(registry::Error::Unavailable)?;
     if Process::observe(pid).as_ref() != Some(&process) {
         return Err(registry::Error::Stale);
     }
-    Ok((
-        Caller {
-            caller,
-            process,
-            start,
-        },
-        peer,
-    ))
+    Ok(Caller {
+        caller,
+        process,
+        start,
+    })
+}
+fn claim(
+    ctx: &crate::SessionCtx,
+    master: i32,
+    registry: &registry::Registry,
+) -> Result<(Caller, registry::Peer), registry::Error> {
+    let caller = identify(ctx)?;
+    let args =
+        atpkg::caller_shell::process_args(caller.caller.pid).ok_or(registry::Error::Unavailable)?;
+    let peer = if let Some(token) = args.env_var(registry::LAUNCH_ENV) {
+        registry.reserved_peer(&caller.caller, token)?
+    } else {
+        if master < 0 {
+            return Err(registry::Error::Denied);
+        }
+        // SAFETY: borrow the actual session PTY; no descriptor is transferred.
+        registry::Peer::foreground(&caller.caller, unsafe { BorrowedFd::borrow_raw(master) })?
+    };
+    if Process::observe(caller.caller.pid).as_ref() != Some(&caller.process) {
+        return Err(registry::Error::Stale);
+    }
+    Ok((caller, peer))
 }
 
 fn session(caller: &Caller, epoch: &str) -> aterm_json::Value {
@@ -291,6 +331,7 @@ fn execute(
     let mut value = envelope(request, caller, epoch, request.member.as_deref());
     let member = request.member.as_deref().unwrap_or("");
     match &request.action {
+        Action::Use(_) => return Err(registry::Error::Denied),
         Action::Open => {
             let allocation = registry.open_member(&peer, connection, &request.operation)?;
             value
@@ -423,6 +464,8 @@ struct Job {
     request: Request,
     caller: Caller,
     progress: Mutex<Progress>,
+    prepared_use: Mutex<Option<registry::UseCommand>>,
+    use_accounted: AtomicBool,
 }
 impl Job {
     fn finish(&self, result: Result<String, registry::Error>) {
@@ -445,6 +488,7 @@ struct ConnectionJobs {
 struct Jobs {
     connections: BTreeMap<u64, ConnectionJobs>,
     running: Arc<AtomicUsize>,
+    cleanup_running: Arc<AtomicUsize>,
 }
 #[derive(Debug, PartialEq, Eq)]
 enum AdmissionError {
@@ -477,13 +521,29 @@ impl Jobs {
         }
     }
     fn reserve(&self, job: Arc<Job>) -> (Arc<Job>, bool) {
-        let room = self.running.load(Ordering::Acquire) < MAX_RUNNING;
+        if matches!(&job.request.action, Action::Use(_)) {
+            return (job, false);
+        }
+        self.reserve_ready(job)
+    }
+    fn reserve_ready(&self, job: Arc<Job>) -> (Arc<Job>, bool) {
+        if matches!(&job.request.action, Action::Use(_))
+            && !job.use_accounted.load(Ordering::Acquire)
+        {
+            return (job, false);
+        }
+        let (running, limit) = if job.request.cleanup() {
+            (&self.cleanup_running, MAX_CLEANUP_RUNNING)
+        } else {
+            (&self.running, MAX_RUNNING)
+        };
+        let room = running.load(Ordering::Acquire) < limit;
         let start = {
             let mut state = job.progress.lock().unwrap_or_else(|p| p.into_inner());
             if room && matches!(*state, Progress::Waiting) {
-                self.running.fetch_add(1, Ordering::AcqRel);
+                running.fetch_add(1, Ordering::AcqRel);
                 *state = Progress::Running {
-                    _permit: RunningPermit(Arc::clone(&self.running)),
+                    _permit: RunningPermit(Arc::clone(running)),
                 };
                 true
             } else {
@@ -527,9 +587,18 @@ impl Jobs {
         if self
             .connections
             .values()
-            .map(|c| c.active.len())
+            .map(|c| {
+                c.active
+                    .values()
+                    .filter(|job| job.request.cleanup() == request.cleanup())
+                    .count()
+            })
             .sum::<usize>()
-            >= MAX_PENDING
+            >= if request.cleanup() {
+                MAX_CLEANUP_PENDING
+            } else {
+                MAX_PENDING
+            }
         {
             // No counter/prefix/body has been accepted and no worker started.
             return Err(AdmissionError::Capacity);
@@ -549,6 +618,8 @@ impl Jobs {
             request: request.clone(),
             caller: caller.clone(),
             progress: Mutex::new(Progress::Waiting),
+            prepared_use: Mutex::new(None),
+            use_accounted: AtomicBool::new(false),
         });
         connection.active.insert(sequence.counter, Arc::clone(&job));
         Ok(self.reserve(job))
@@ -581,6 +652,9 @@ pub(super) fn serve(
     let Some(id) = connection_id.filter(|id| *id != 0) else {
         return "ERR codex-auth denied\n".into();
     };
+    if matches!(&request.action, Action::Use(_)) {
+        return use_control::serve(ctx, request, registry, id);
+    }
     let (caller, peer) = match claim(ctx, master, registry) {
         Ok(claimed) => claimed,
         Err(registry::Error::Busy) => return "ERR codex-auth busy\n".into(),
@@ -907,5 +981,170 @@ mod tests {
             ))
             .is_none()
         );
+    }
+    fn use_request(counter: u64, verb: &str) -> Request {
+        let extra = if verb == "member-use-end" {
+            format!("capability={}", "c".repeat(64))
+        } else {
+            format!("registration={}", "b".repeat(32))
+        };
+        Request::parse(&format!("{verb} schema=1 request=1234567890abcdef{counter:016x} operation=aaaaaaaaaaaaaaaa0000000000000001 member={} {extra}", "a".repeat(32))).unwrap()
+    }
+
+    #[test]
+    fn use_wire_is_closed_and_semantic_nonce_is_distinct_from_rpc_sequence() {
+        for verb in ["member-use-begin", "member-use-end", "member-use-close"] {
+            let request = use_request(7, verb);
+            assert_eq!(request.name(), "member-use");
+            assert_eq!(request.cleanup(), verb != "member-use-begin");
+            let extra = if verb == "member-use-end" {
+                format!("capability={}", "c".repeat(64))
+            } else {
+                format!("registration={}", "b".repeat(32))
+            };
+            let line = format!(
+                "{verb} schema=1 request=1234567890abcdef0000000000000007 operation=aaaaaaaaaaaaaaaa0000000000000001 member={} {extra}",
+                "a".repeat(32)
+            );
+            assert!(Request::parse(&format!("{line} unexpected=1")).is_none());
+            assert!(
+                Request::parse(&line.replace(
+                    "aaaaaaaaaaaaaaaa0000000000000001",
+                    "aaaaaaaaaaaaaaaa0000000000000000"
+                ))
+                .is_none()
+            );
+            assert!(Request::parse(&format!("{line} {extra}")).is_none());
+        }
+    }
+
+    #[test]
+    fn full_begin_worker_budget_cannot_starve_release_and_replay_body_is_shared() {
+        let caller = caller();
+        let mut jobs = Jobs::default();
+        jobs.running.store(MAX_RUNNING, Ordering::Release);
+        let (begin, start) = jobs
+            .admit(1, &caller, &use_request(1, "member-use-begin"))
+            .unwrap();
+        assert!(!start);
+        let release_request = use_request(2, "member-use-end");
+        let (release, start) = jobs.admit(1, &caller, &release_request).unwrap();
+        assert!(!start, "native preparation precedes worker admission");
+        use_control::prepare_before_waiting(&release, || {
+            Ok(registry::UseCommand::Settled(registry::UseProgress::Closed))
+        })
+        .unwrap();
+        let (_, start) = jobs.reserve_ready(Arc::clone(&release));
+        assert!(start);
+        assert_eq!(jobs.cleanup_running.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            jobs.admit(1, &caller, &use_request(2, "member-use-close")),
+            Err(AdmissionError::Changed)
+        ));
+        release.finish(Ok("closed-fixture".into()));
+        assert_eq!(jobs.cleanup_running.load(Ordering::Acquire), 0);
+        assert!(
+            use_control::prepare_before_waiting(&begin, || Err(registry::Error::Busy)).is_err()
+        );
+        assert!(
+            begin.prepared_use.lock().unwrap().is_none(),
+            "a backend refusal cannot become an accepted Waiting receipt"
+        );
+    }
+
+    #[test]
+    fn use_closed_frame_contains_no_fabricated_registration_or_revision() {
+        let request = use_request(1, "member-use-close");
+        let line = use_control::response(
+            &request,
+            &caller(),
+            "test-epoch",
+            registry::UseProgress::Closed,
+        )
+        .unwrap();
+        let body = line.strip_prefix("OK codex-auth member-use ").unwrap();
+        let value: aterm_json::Value = aterm_json::from_str(body).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 7);
+        assert_eq!(
+            object.get("state").and_then(aterm_json::Value::as_str),
+            Some("closed")
+        );
+        assert!(object.get("capability").unwrap().is_null());
+        assert!(
+            !object.contains_key("registration")
+                && !object.contains_key("generation")
+                && !object.contains_key("digest")
+        );
+    }
+    #[test]
+    fn full_begin_pending_table_still_accepts_release_without_partitioning_rpc_replay() {
+        let caller = caller();
+        let mut jobs = Jobs::default();
+        for counter in 1..=MAX_PENDING as u64 {
+            assert!(
+                !jobs
+                    .admit(1, &caller, &use_request(counter, "member-use-begin"))
+                    .unwrap()
+                    .1
+            );
+        }
+        assert!(matches!(
+            jobs.admit(
+                1,
+                &caller,
+                &use_request(MAX_PENDING as u64 + 1, "member-use-begin")
+            ),
+            Err(AdmissionError::Capacity)
+        ));
+        let counter = MAX_PENDING as u64 + 2;
+        let request = use_request(counter, "member-use-close");
+        let (release, _) = jobs.admit(1, &caller, &request).unwrap();
+        use_control::prepare_before_waiting(&release, || {
+            Ok(registry::UseCommand::Settled(registry::UseProgress::Closed))
+        })
+        .unwrap();
+        assert!(jobs.reserve_ready(Arc::clone(&release)).1);
+        assert!(matches!(
+            jobs.admit(1, &caller, &use_request(counter, "member-use-end")),
+            Err(AdmissionError::Changed)
+        ));
+        assert!(matches!(
+            jobs.admit(
+                1,
+                &caller,
+                &use_request(MAX_PENDING as u64 + 1, "member-use-begin")
+            ),
+            Err(AdmissionError::Stale)
+        ));
+    }
+    #[test]
+    fn actual_direct_socket_cleanup_reaches_retained_identity_without_foreground_or_enter() {
+        use std::os::fd::AsRawFd;
+        let (server, _client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let _fd = aterm_control::hangup::ServingFd::enter(server.as_raw_fd());
+        assert!(matches!(
+            identify_for_session("source-kernel-negative"),
+            Err(registry::Error::Denied)
+        ));
+        let _direct = crate::control::DirectPeer::enter();
+        let actual = identify_for_session("source-kernel-negative").unwrap();
+        assert_eq!(actual.caller.pid, std::process::id());
+        let lifetime = account_work::Lifetime::default();
+        let registry = Arc::new(registry::Registry::for_app(&lifetime));
+        let drained = lifetime.pause().unwrap().wait();
+        assert!(lifetime.enter().is_none());
+        let id = u64::MAX - 88001;
+        let line =
+            use_control::serve_identified(use_request(1, "member-use-end"), &registry, id, || {
+                identify_for_session("source-kernel-negative")
+            });
+        // The real test binary has NO admitted source member/image. Reaching
+        // retained-member Stale proves cleanup skipped generic foreground and
+        // ordinary enter; it grants no positive Source/Peer authority.
+        assert_eq!(line, "ERR codex-auth stale\n");
+        registry.connection_closed(id);
+        connection_closed(id);
+        drained.resume().unwrap();
     }
 }

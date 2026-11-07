@@ -76,9 +76,13 @@ fn collect(pid: u32, options: i32) -> io::Result<Option<Rusage>> {
         }
         crate::deaths::note(got, status);
         let rss = u64::try_from(usage.maxrss).unwrap_or(0);
+        let user = span(&usage.user);
+        let system = span(&usage.system);
         return Ok(Some(Rusage {
             status: std::process::ExitStatus::from_raw(status),
-            cpu: span(&usage.user) + span(&usage.system),
+            user,
+            system,
+            cpu: user + system,
             maxrss: if cfg!(target_vendor = "apple") {
                 rss
             } else {

@@ -577,6 +577,18 @@ impl Drop for ProfileLock {
 }
 
 impl ProfileLock {
+    /// The same actual owned profile lock, never a path-only readiness claim.
+    pub(super) fn current(&self, profile: &Path) -> bool {
+        astream_sys::file_matches_path(&self.0, &profile.join(PROFILE_LOCK_FILE)).unwrap_or(false)
+    }
+    /// Metadata of the actual held descriptor, not a path or a lock grant.
+    #[cfg(unix)]
+    pub(super) fn file_identity(&self) -> std::io::Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = self.0.metadata()?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+
     fn try_take(file: std::fs::File) -> std::io::Result<Result<ProfileLock, std::fs::File>> {
         if !file.metadata()?.is_file() {
             return Err(std::io::Error::new(

@@ -89,10 +89,6 @@ pub use renderer::{
     PresentCrop, SurfacePresentFailure, TrayDelta, TrayLayer, TrayQuad, TrayScrim, UnormAblation,
     UnormRoute, WindowGpu, tray_rows_to_upload,
 };
-/// Demand-built effect pipeline identifiers and names (`renderer::EffectPipelines`).
-pub use renderer::{
-    EFFECT_PIPELINE_COUNT, EFFECT_PIPELINE_NAMES, EFFECT_PIPELINES, EffectPipeline,
-};
 /// A window's own presenter.
 #[cfg(target_os = "linux")]
 pub use renderer::{FrameDraw, FrameSink};
@@ -352,7 +348,7 @@ impl GpuContext {
             device_lost: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             device_loss_msg: std::sync::Arc::default(),
             visual_swapchain: false,
-            gl_max_texture_dim: caps.max_texture_dim,
+            gl_max_texture_dim: caps.max_texture_dim.get(),
         })
     }
 

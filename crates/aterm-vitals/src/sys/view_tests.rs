@@ -1726,7 +1726,7 @@ fn sys_jobs_reads_the_engines_rows_of_the_scope_in_both_shapes() {
     let first = text.lines().next().unwrap();
     assert_eq!(
         first,
-        "jobs  tab 1 · 2 jobs · 1 running · 1 stuck · worst: silent 19m12s, about 19× its usual 60 s gap, φ 8.34"
+        "jobs  tab 1 · 2 jobs · 1 running · 1 stuck · worst: silent 19m12s, about 19× the assumed 60 s gap, φ 8.34"
     );
     assert!(
         text.contains("job id=a40977 kind=agent-call consumer=agent-bg task=bq7f2k1za pgid=40977 exe=curl class=waiting wait=tcp remote=127.0.0.1:47811 state=ESTABLISHED queued=0 quiet_ms=1152000 phi=8.34 mu_ms=60000 mu_from=prior verdict=stuck"),

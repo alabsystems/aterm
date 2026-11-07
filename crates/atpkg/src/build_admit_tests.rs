@@ -525,6 +525,7 @@ fn proc(pid: u32, ppid: u32) -> Proc {
         whole: 0,
         written: 0,
         cpu_ns: 0,
+        runnable_ns: 0,
     }
 }
 
@@ -800,12 +801,86 @@ fn a_succeeded_build_keeps_its_peak_and_a_failed_one_keeps_none() {
     };
     let failed = claimed(&s);
     assert_eq!(failed.claim().record().need.mem, 12 * GIB, "cold");
-    assert_eq!(failed.end(false, 5 * GIB, &mut |_| {}), None);
+    assert_eq!(
+        failed.end(BuildEnd::Success(false), 5 * GIB, &mut |_| {}),
+        None
+    );
     let ok = claimed(&s);
     assert_eq!(ok.claim().record().need.mem, 12 * GIB, "still cold");
-    assert_eq!(ok.end(true, 5 * GIB, &mut |_| {}), Some(5 * GIB));
+    assert_eq!(
+        ok.end(BuildEnd::Success(true), 5 * GIB, &mut |_| {}),
+        Some(5 * GIB)
+    );
     let next = claimed(&s);
     assert_eq!(next.claim().record().need.mem, 6 * GIB, "5 GiB and a fifth");
+}
+
+/// THE BUILD ROW READS THE RECORD (Continuum TM-1): a real claim's run names the checkout its
+/// record holds (a laid record takes its need's, leaving the need's own field empty), so its row's
+/// `dir=` is that checkout's digest, and finds the claim held in its ledger: a holder's claim's
+/// file in the ledger's folder, a cohort claim's (the host job's) in a subfolder of it.
+/// NEGATIVE CONTROL: another ledger's folder holds neither, and writes no row.
+#[test]
+fn a_claims_row_names_its_checkout_and_its_own_ledger_holds_it_whatever_its_kind() {
+    let m = machine();
+    let other = aterm_tempfile::tempdir().expect("scratch");
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let s = seat(dir.path(), &m, std::process::id().wrapping_add(53));
+    let held = match admit(&test_build(), dir.path(), &s, &mut |_| {}) {
+        Admission::Claimed(h) => h,
+        other => panic!("expected a claim, got {other:?}"),
+    };
+    let checkout = held.claim().record().checkout.clone();
+    assert!(!checkout.is_empty(), "a record names its checkout");
+    assert_eq!(
+        held.claim().record().need.checkout,
+        None,
+        "the record took it"
+    );
+    let run = telemetry::Run::of(held.claim());
+    assert_eq!(run.checkout(), Some(checkout.as_str()));
+    let ledger = s.ledger.as_ref().expect("a ledger").dir().to_path_buf();
+    let mut rows = Vec::new();
+    let end = BuildEnd::Success(true);
+    assert!(telemetry::ended_in(
+        &run,
+        "targo test",
+        &end,
+        1,
+        &ledger,
+        |row| {
+            rows.push(row.clone());
+            true
+        }
+    ));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].dir, Some(aterm_telemetry::Digest::dir(&checkout)));
+    assert!(
+        !telemetry::ended_in(&run, "targo test", &end, 1, other.path(), |_| true),
+        "another ledger's folder"
+    );
+    drop(held);
+
+    #[cfg(target_os = "macos")]
+    {
+        let world = aterm_tempfile::tempdir().expect("scratch");
+        let seat = cohort_seat(world.path(), &m);
+        let cohort = host_table::held(world.path(), &seat);
+        let run = telemetry::Run::of(cohort.claim());
+        let ledger = seat.ledger.as_ref().expect("a ledger").dir();
+        assert_ne!(
+            cohort.claim().path().parent(),
+            Some(ledger),
+            "a cohort claim lies in a subfolder"
+        );
+        assert!(
+            run.held_in(ledger),
+            "{:?} in {ledger:?}",
+            cohort.claim().path()
+        );
+        assert!(!run.held_in(other.path()));
+        assert!(run.checkout().is_some_and(|c| !c.is_empty()));
+    }
 }
 
 /// A failed build keeps its peak when it would claim more than its claim did, since its peak is
@@ -824,7 +899,10 @@ fn a_failed_build_keeps_a_peak_that_raises_its_claim() {
     };
     let cold = claimed();
     assert_eq!(cold.claim().record().need.mem, 12 * GIB, "cold");
-    assert_eq!(cold.end(false, 14 * GIB, &mut |_| {}), Some(14 * GIB));
+    assert_eq!(
+        cold.end(BuildEnd::Success(false), 14 * GIB, &mut |_| {}),
+        Some(14 * GIB)
+    );
     let raised = claimed();
     assert_eq!(raised.claim().record().need.mem, 14 * GIB + 14 * GIB / 5);
     drop(raised);
@@ -835,15 +913,21 @@ fn a_failed_build_keeps_a_peak_that_raises_its_claim() {
         other => panic!("expected a claim, got {other:?}"),
     };
     let records = || Records::load(&other.path().join("targo-memory.json"));
-    assert_eq!(claimed().end(true, 2 * GIB, &mut |_| {}), Some(2 * GIB));
+    assert_eq!(
+        claimed().end(BuildEnd::Success(true), 2 * GIB, &mut |_| {}),
+        Some(2 * GIB)
+    );
     let red = claimed();
     assert_eq!(red.claim().record().need.mem, 3 * GIB);
-    assert_eq!(red.end(false, 5 * GIB, &mut |_| {}), Some(5 * GIB));
+    assert_eq!(
+        red.end(BuildEnd::Success(false), 5 * GIB, &mut |_| {}),
+        Some(5 * GIB)
+    );
     let next = claimed();
     assert_eq!(next.claim().record().need.mem, 6 * GIB);
     let before = records();
     assert_eq!(
-        next.end(false, 4 * GIB, &mut |_| {}),
+        next.end(BuildEnd::Success(false), 4 * GIB, &mut |_| {}),
         None,
         "below its claim"
     );
@@ -877,7 +961,7 @@ fn an_ended_builds_claim_goes_before_its_peak_is_kept() {
     };
     let mut said = Vec::new();
     assert_eq!(
-        held.end(true, 5 * GIB, &mut |line| {
+        held.end(BuildEnd::Success(true), 5 * GIB, &mut |line| {
             said.push((line.to_owned(), ledger.list().expect("listed").len()));
         }),
         None
@@ -888,7 +972,10 @@ fn an_ended_builds_claim_goes_before_its_peak_is_kept() {
 
     let ended = claimed().let_go();
     assert!(ledger.list().expect("listed").is_empty(), "let go");
-    assert_eq!(ended.keep(true, 5 * GIB, &mut |_| {}), Some(5 * GIB));
+    assert_eq!(
+        ended.keep(BuildEnd::Success(true), 5 * GIB, &mut |_| {}),
+        Some(5 * GIB)
+    );
 }
 
 /// A fresh build that compiled nothing keeps no peak while its key's heavy one is young, so
@@ -904,17 +991,27 @@ fn a_fresh_builds_light_peak_never_lowers_its_claim() {
         Admission::Claimed(h) => h,
         other => panic!("expected a claim, got {other:?}"),
     };
-    assert_eq!(claimed().end(true, 10 * GIB, &mut |_| {}), Some(10 * GIB));
+    assert_eq!(
+        claimed().end(BuildEnd::Success(true), 10 * GIB, &mut |_| {}),
+        Some(10 * GIB)
+    );
     for _ in 0..8 {
-        assert_eq!(claimed().end(true, 50 << 20, &mut |_| {}), None, "light");
+        assert_eq!(
+            claimed().end(BuildEnd::Success(true), 50 << 20, &mut |_| {}),
+            None,
+            "light"
+        );
     }
     assert_eq!(claimed().claim().record().need.mem, 12 * GIB);
-    assert_eq!(claimed().end(true, 3 * GIB, &mut |_| {}), Some(3 * GIB));
+    assert_eq!(
+        claimed().end(BuildEnd::Success(true), 3 * GIB, &mut |_| {}),
+        Some(3 * GIB)
+    );
 }
 
-/// A supervised build's status is its own and its peak (here the floor it is handed) is kept
-/// only when it succeeded; its claim is gone once it ends. NEGATIVE CONTROL: a build that exits
-/// 1 keeps nothing.
+/// A supervised build's status is its own and its peak (here the floor it is handed, which rose
+/// to 3 GiB while it ran) is kept only when it succeeded; its claim is gone once it ends.
+/// NEGATIVE CONTROL: a build that exits 1 keeps nothing.
 #[cfg(unix)]
 #[test]
 fn a_supervised_build_keeps_its_peak_only_when_it_succeeds() {
@@ -929,7 +1026,12 @@ fn a_supervised_build_keeps_its_peak_only_when_it_succeeds() {
         };
         let mut cmd = aterm_uds::spawnfd::transparent("/bin/sh").into_command();
         cmd.args(["-c", script]);
-        supervise(Some(*held), &mut cmd, &|| 3 * GIB, &mut |_| {}).expect("ran")
+        let reads = std::cell::Cell::new(0u32);
+        let rising = || {
+            reads.set(reads.get() + 1);
+            if reads.get() == 1 { 0 } else { 3 * GIB }
+        };
+        supervise(Some(*held), &mut cmd, &rising, &mut |_| {}).expect("ran")
     };
     let records = || Records::load(&dir.path().join("targo-memory.json"));
     let failed = run("exit 1");
@@ -949,6 +1051,55 @@ fn a_supervised_build_keeps_its_peak_only_when_it_succeeds() {
     );
     let killed = run("kill -TERM $$");
     assert_eq!(killed.signal(), Some(libc::SIGTERM));
+}
+
+/// A front that reaped an earlier child (another tool's run, as `atpkg-publish adopt` reaps
+/// `verify test` before its build) holds that child's peak in its children's accounting: no
+/// floor of this build. NEGATIVE CONTROL: the same floor, risen to 9 GiB while the build ran, is
+/// kept.
+#[cfg(unix)]
+#[test]
+fn an_earlier_childs_peak_is_no_floor_of_the_build() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let m = machine();
+    let s = seat(dir.path(), &m, std::process::id().wrapping_add(17));
+    let b = test_build();
+    let records = || Records::load(&dir.path().join("targo-memory.json"));
+    let peaks = || {
+        records()
+            .rows()
+            .iter()
+            .flat_map(|r| r.peaks.iter().map(|p| p.bytes))
+            .collect::<Vec<_>>()
+    };
+    let run = |floor: &dyn Fn() -> u64| {
+        let Admission::Claimed(held) = admit(&b, dir.path(), &s, &mut |_| {}) else {
+            panic!("expected a claim");
+        };
+        let mut cmd = aterm_uds::spawnfd::transparent("/bin/sh").into_command();
+        cmd.args(["-c", "exit 0"]);
+        assert!(
+            supervise(Some(*held), &mut cmd, floor, &mut |_| {})
+                .expect("ran")
+                .success()
+        );
+    };
+    run(&|| 9 * GIB);
+    assert!(
+        peaks().iter().all(|&p| p < 9 * GIB),
+        "an earlier child's 9 GiB is not this build's: {:?}",
+        peaks()
+    );
+    let reads = std::cell::Cell::new(0u32);
+    run(&|| {
+        reads.set(reads.get() + 1);
+        if reads.get() == 1 { 0 } else { 9 * GIB }
+    });
+    assert!(
+        peaks().contains(&(9 * GIB)),
+        "the floor risen while it ran is kept: {:?}",
+        peaks()
+    );
 }
 
 /// The descriptor that holds `path` open in this process, found by what it opens (`fstat`'s

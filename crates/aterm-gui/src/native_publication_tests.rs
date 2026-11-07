@@ -3,6 +3,18 @@
 
 use super::*;
 use aterm_agent::harness::native_receipts::testing::{Append, Journal, State as Stored};
+use aterm_spec::xref::StepEvidence;
+
+fn witness<T>(
+    evidence: &mut Option<&mut StepEvidence>,
+    action: &'static str,
+    drive: impl FnOnce() -> T,
+) -> T {
+    match evidence.as_deref_mut() {
+        Some(evidence) => evidence.step(action, drive),
+        None => drive(),
+    }
+}
 
 fn stored_number(state: Stored) -> i64 {
     match state {
@@ -11,6 +23,7 @@ fn stored_number(state: Stored) -> i64 {
         Stored::NoExec => 2,
         Stored::Sealed { may_execute: false } => 3,
         Stored::Sealed { may_execute: true } => 4,
+        Stored::Fenced => 5,
     }
 }
 
@@ -18,14 +31,15 @@ pub(crate) fn transition(
     state: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
-    transition_by(state, action, false, false)
+    transition_by(state, action, 0, false, None)
 }
 
 fn transition_by(
     state: &aterm_spec::interp::State,
     action: &str,
-    reply_selects_record: bool,
+    fault: u8,
     detached_custody: bool,
+    mut evidence: Option<&mut StepEvidence>,
 ) -> aterm_spec::interp::State {
     let home = aterm_tempfile::tempdir().unwrap();
     let journal = Journal::new(home.path());
@@ -33,6 +47,7 @@ fn transition_by(
     let ctx = &handle.ctx;
     let binding = admitted_binding(&run(ctx, &facts, Request::prepare(prepare.clone()), actor));
     let operation = lookup(ctx, &binding).unwrap();
+    operation.lock().unwrap().resume_phase = (state["active"] == 1).then_some(ImagePhase::Rollback);
     journal.record(&prepare, &binding, Append::Prepare).unwrap();
     if state["may"] == 1 {
         journal
@@ -42,7 +57,14 @@ fn transition_by(
     }
     match state["journal"] {
         2 => {
-            journal.record(&prepare, &binding, Append::NoExec).unwrap();
+            let phase = if state["journal_phase"] == 1 {
+                ImagePhase::Rollback
+            } else {
+                ImagePhase::Forward
+            };
+            journal
+                .record(&prepare, &binding, Append::NoExecInPhase(phase))
+                .unwrap();
         }
         3 | 4 => {
             journal.record(&prepare, &binding, Append::Seal).unwrap();
@@ -102,6 +124,10 @@ fn transition_by(
 
     let mut next = state.clone();
     match action {
+        "StartRollback" => {
+            operation.lock().unwrap().resume_phase = Some(ImagePhase::Rollback);
+            next.insert("active", 1);
+        }
         "MayExecute" => {
             journal
                 .record(&prepare, &binding, Append::MayExecute)
@@ -119,7 +145,7 @@ fn transition_by(
         }
         "Capture" | "CaptureUnknown" => {
             let reply = if action == "Capture" {
-                completed_reply(&operation)
+                witness(&mut evidence, "Capture", || completed_reply(&operation))
             } else {
                 UNKNOWN.into()
             };
@@ -129,25 +155,36 @@ fn transition_by(
         "PublishAck" | "PublishLostAck" | "PublishFailed" => {
             let reply = if state["reply"] == 1 { NOEXEC } else { UNKNOWN };
             let mut record = terminal_record(&operation.lock().unwrap(), reply);
-            if reply_selects_record && record.is_some() {
+            if fault == 1 && record.is_some() {
                 // The former bug: Unknown text hid a settled NoExec fact,
                 // permanently closing its real journal entry as an opaque seal.
                 record = Some(if reply == NOEXEC {
-                    TerminalRecord::NoExec
+                    TerminalRecord::NoExec(ImagePhase::Forward)
                 } else {
                     TerminalRecord::Sealed
                 });
             }
-            let output = publish_terminal(reply.into(), record, |record| {
-                if action == "PublishFailed" {
-                    return false;
-                }
-                let event = match record {
-                    TerminalRecord::NoExec => Append::NoExec,
-                    TerminalRecord::Sealed => Append::Seal,
-                };
-                let committed = journal.record(&prepare, &binding, event).is_ok();
-                committed && action != "PublishLostAck"
+            if fault == 6 && matches!(record, Some(TerminalRecord::NoExec(_))) {
+                record = Some(TerminalRecord::NoExec(ImagePhase::Forward));
+            }
+            let publication = match action {
+                "PublishAck" => "PublishAck",
+                "PublishLostAck" => "PublishLostAck",
+                "PublishFailed" => "PublishFailed",
+                _ => unreachable!(),
+            };
+            let output = witness(&mut evidence, publication, || {
+                publish_terminal(reply.into(), record, |record| {
+                    if action == "PublishFailed" {
+                        return false;
+                    }
+                    let event = match record {
+                        TerminalRecord::NoExec(phase) => Append::NoExecInPhase(phase),
+                        TerminalRecord::Sealed => Append::Seal,
+                    };
+                    let committed = journal.record(&prepare, &binding, event).is_ok();
+                    committed && action != "PublishLostAck"
+                })
             });
             if output == NOEXEC {
                 next.insert("published", 1);
@@ -155,8 +192,13 @@ fn transition_by(
             next.insert("captured", 0);
         }
         "Observe" => {
-            if journal.observe(&binding).unwrap().is_some() {
+            let observation = witness(&mut evidence, "Observe", || {
+                journal.observe_phase(&prepare, &binding).unwrap()
+            });
+            if let Some(observation) = observation {
                 next.insert("observed", 1);
+                let phase = i64::from(observation.phase == ImagePhase::Rollback);
+                next.insert("observed_phase", if fault == 7 { 1 - phase } else { phase });
             }
         }
         _ => panic!("unknown terminal publication action {action}"),
@@ -185,7 +227,16 @@ fn transition_by(
         "journal",
         stored_number(journal.state(&binding).unwrap().unwrap()),
     );
-    if reply_selects_record && next["journal"] == 3 {
+    next.insert(
+        "journal_phase",
+        journal
+            .observe_phase(&prepare, &binding)
+            .unwrap()
+            .map_or(2, |observation| {
+                i64::from(observation.phase == ImagePhase::Rollback)
+            }),
+    );
+    if fault == 1 && next["journal"] == 3 {
         assert!(
             journal.record(&prepare, &binding, Append::NoExec).is_err(),
             "an opaque terminal seal cannot be upgraded by a later retry"
@@ -198,15 +249,19 @@ fn transition_by(
 fn terminal_publication_refines_host_drain_and_real_astream_journal() {
     let model = aterm_models_harness::terminal_publication_model();
     aterm_spec::interp::prove_and_catch(&model);
+    assert!(aterm_spec::verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
+    let mut evidence = StepEvidence::new("TerminalPublication");
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
                 for detached_custody in [false, true] {
-                    let next = if detached_custody {
-                        transition_by(&state, action.name, false, true)
-                    } else {
-                        transition(&state, action.name)
-                    };
+                    let next = transition_by(
+                        &state,
+                        action.name,
+                        0,
+                        detached_custody,
+                        Some(&mut evidence),
+                    );
                     assert!(
                         model.successors(action.name, &state).contains(&next),
                         "{} (detached {detached_custody}): {state:?} -> {next:?}",
@@ -216,13 +271,15 @@ fn terminal_publication_refines_host_drain_and_real_astream_journal() {
             }
         }
     }
+    let audit = evidence.audit();
+    assert!(audit.is_complete(), "{audit:?}");
 
     let mut settled = model.init_state();
     settled.insert("kind", 1);
     settled.insert("drained", 1);
     settled.insert("captured", 1);
     assert!(aterm_spec::interp::reachable_states(&model).contains(&settled));
-    let bad = transition_by(&settled, "PublishAck", true, false);
+    let bad = transition_by(&settled, "PublishAck", 1, false, None);
     assert_eq!(
         bad["journal"], 3,
         "negative control must really seal the journal"
@@ -230,4 +287,32 @@ fn terminal_publication_refines_host_drain_and_real_astream_journal() {
     assert!(!model.check_invariant("NoExecRemainsRecoverable", &bad));
     // Real storage refuses to change that opaque seal into a NoExec receipt.
     // This is precisely the liveness loss a permissive test map would hide.
+}
+
+#[test]
+fn dropping_or_misreporting_the_closed_phase_breaks_production_conformance() {
+    let model = aterm_models_harness::terminal_publication_model();
+    let mut state = model.init_state();
+    for action in ["StartRollback", "CloseNoExec", "Drain", "Capture"] {
+        state = transition(&state, action);
+    }
+    assert!(aterm_spec::interp::reachable_states(&model).contains(&state));
+    let wrong_write = transition_by(&state, "PublishAck", 6, false, None);
+    assert_eq!(wrong_write["journal"], 2);
+    assert_eq!(wrong_write["journal_phase"], 0);
+    assert!(!model.check_invariant("JournalCarriesClosedPhase", &wrong_write));
+    assert!(
+        !model
+            .successors("PublishAck", &state)
+            .contains(&wrong_write)
+    );
+
+    let committed = transition(&state, "PublishAck");
+    let wrong_read = transition_by(&committed, "Observe", 7, false, None);
+    assert!(!model.check_invariant("ObservationCarriesClosedPhase", &wrong_read));
+    assert!(
+        !model
+            .successors("Observe", &committed)
+            .contains(&wrong_read)
+    );
 }

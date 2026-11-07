@@ -35,7 +35,7 @@ fn verifys_schema_2_file_reads_as_its_serde_derive_wrote_it() {
         r#"{"schema":2,"rows":[{"key":{"stage":"TestCompile","checkout":"/ck","crates":["#,
         r#""aterm-gui"]},"peaks":[{"bytes":16106127360,"at_ms":1793278342337},"#,
         r#"{"bytes":18897856102,"at_ms":1793279342337}]},{"key":{"stage":"Test","#,
-        r#""checkout":"/ck","crates":["aterm-gui"],"variant":"jobs 8"},"peaks":[{"bytes":"#,
+        r#""checkout":"/ck","crates":["aterm-gui"],"variant":"cells linux-arm"},"peaks":[{"bytes":"#,
         r#"1610612736,"at_ms":1793278342408}]},{"key":{"stage":"Export","checkout":"/ck"},"#,
         r#""peaks":[]}]}"#
     );
@@ -57,7 +57,7 @@ fn verifys_schema_2_file_reads_as_its_serde_derive_wrote_it() {
         ]
     );
     gui.stage = "Test".to_owned();
-    gui.variant = Some("jobs 8".to_owned());
+    gui.variant = Some("cells linux-arm".to_owned());
     assert_eq!(r.rows()[1].key, gui);
     assert_eq!(r.rows()[2].key.crates, None);
     assert_eq!(r.rows()[2].key.variant, None);
@@ -306,8 +306,9 @@ fn a_light_record_never_hides_a_heavy_one_of_the_same_work() {
 }
 
 /// Where nothing of the same work is kept, the most of a wider selection's records in the same
-/// checkout answers. NEGATIVE CONTROL: a wider selection in another checkout, a narrower one, or
-/// the key in another variant or another selection elsewhere is no rule.
+/// checkout answers. NEGATIVE CONTROL: a narrower selection, or the key in another variant or
+/// another selection elsewhere, is no rule (a wider selection in another checkout answers after
+/// it: [`a_wider_selection_elsewhere_answers_last_and_claims_at_most_the_cold_figure`]).
 #[test]
 fn a_wider_selection_in_the_checkout_answers_only_for_work_never_kept() {
     let own = key("targo test", "/ck", &["a"]);
@@ -328,10 +329,99 @@ fn a_wider_selection_in_the_checkout_answers_only_for_work_never_kept() {
         ..key("targo test", "/one", &["a"])
     };
     let apart = with(&[
-        (key("targo test", "/other", &["a", "b"]), 9),
         (key("targo test", "/ck", &[]), 3),
         (release, 6),
-        (key("targo test", "/one", &["a", "b"]), 6),
+        (key("targo test", "/one", &["b"]), 6),
+    ]);
+    assert_eq!(chain(&apart, &own, None), None);
+}
+
+/// A NEW WORKTREE'S BUILD READS A WIDER SELECTION ELSEWHERE: where nothing of the same work is
+/// kept, nor a wider selection's in its checkout, the most of a wider selection's records of the
+/// same work and variant in another checkout answers ([`Via::WiderElsewhere`]). On this 48 GiB
+/// Mac, `targo test -p aterm-sysprobe` in /vwider, with `-p aterm-release -p aterm-sysprobe` kept
+/// at 3 and then 4.55 GiB in /sw-trust and `-p aterm-sysprobe -p aterm-time` at 2 GiB in /far,
+/// claims 4.55 GiB and a fifth more, and says so: the most of the two wider selections, the
+/// heavy one over the light one. A wider selection's in its own checkout wins over it, however
+/// light. A wider peak elsewhere whose claim passes the cold figure claims the cold figure, and
+/// says so; another variant's, another work's, a narrower selection's or the workspace's record
+/// elsewhere (another repository's root build, perhaps) is no rule. NEGATIVE CONTROLS, by hand:
+/// with the rule taken out of [`chain`], it found nothing for the first build (`None`), which
+/// claims the cold figure; with the workspace let in ([`Key::wider_elsewhere`] without its
+/// `crates.is_some()`), the last `chain` found the workspace's 9 GiB.
+#[test]
+fn a_wider_selection_elsewhere_answers_last_and_claims_at_most_the_cold_figure() {
+    let own = key("targo test", "/vwider", &["aterm-sysprobe"]);
+    let pair = key(
+        "targo test",
+        "/sw-trust",
+        &["aterm-release", "aterm-sysprobe"],
+    );
+    let measured = 4_885_525_299; // 4.55 GiB.
+    let mut records = Records::default();
+    records.push(pair.clone(), 3 * GIB, 1);
+    records.push(pair.clone(), measured, 2);
+    records.push(
+        key("targo test", "/far", &["aterm-sysprobe", "aterm-time"]),
+        2 * GIB,
+        3,
+    );
+    assert_eq!(
+        chain(&records, &own, None),
+        Some(Found {
+            peak: measured,
+            runs: 2,
+            via: Via::WiderElsewhere(pair.clone())
+        })
+    );
+    let n = need(&records, &own, None, Some(48 * GIB));
+    assert_eq!(n.bytes, crate::peak_claim(measured), "{n}");
+    assert!(
+        n.to_string().contains(&format!(
+            "the most a build of a wider selection (-p aterm-release -p aterm-sysprobe) in \
+             /sw-trust used ({}) and a fifth more, at least 1 GiB",
+            crate::size(measured)
+        )),
+        "{n}"
+    );
+    let mut here = records.clone();
+    let near = key("targo test", "/vwider", &["aterm-sysprobe", "aterm-time"]);
+    here.push(near.clone(), GIB, 4);
+    assert_eq!(
+        chain(&here, &own, None).map(|f| (f.peak, f.via)),
+        Some((GIB, Via::Wider(near))),
+        "a wider selection's in its own checkout"
+    );
+    let heavy = with(&[(pair.clone(), 20)]);
+    let n = need(&heavy, &own, None, Some(48 * GIB));
+    assert_eq!(n.bytes, crate::cold_claim(Some(48 * GIB)), "{n}");
+    assert!(n.to_string().contains("at most the cold figure"), "{n}");
+    let n = need(&heavy, &own, None, Some(24 * GIB));
+    assert_eq!(n.bytes, 12 * GIB, "half of physical memory");
+    let apart = with(&[
+        (
+            Key {
+                variant: Some("release".to_owned()),
+                ..pair.clone()
+            },
+            9,
+        ),
+        (
+            key(
+                "targo check",
+                "/sw-trust",
+                &["aterm-release", "aterm-sysprobe"],
+            ),
+            9,
+        ),
+        (key("targo test", "/sw-trust", &[]), 9),
+        (
+            Key {
+                crates: None,
+                ..key("targo test", "/astream", &[])
+            },
+            9,
+        ),
     ]);
     assert_eq!(chain(&apart, &own, None), None);
 }
@@ -492,4 +582,222 @@ fn a_writer_holds_the_records_lock_from_its_read_to_its_write() {
     drop(free);
     Records::keep(&path, key("TestCompile", "/b", &["x"]), 2 * GIB, 2).expect("kept");
     assert_eq!(Records::load(&path).rows().len(), 2);
+}
+
+/// A NEW WORKTREE'S BUILD READS VERIFY'S WIDER SELECTION ELSEWHERE: `targo test -p
+/// aterm-sysprobe` in /vwider, with no plain build of a selection that holds it kept anywhere,
+/// and verify's test compile of `-p aterm-release -p aterm-sysprobe` kept at 4.55 GiB in
+/// /sw-trust (the measured case), claims that and a fifth more, and says so
+/// ([`Via::AnalogueWiderElsewhere`]). Beside a plain build's wider record elsewhere, the more of
+/// the two answers, a tie the build's own; a heavy one claims at most the cold figure. Verify's
+/// wider record in its own checkout is read before it, as verify reads it. NEGATIVE CONTROL, by
+/// hand: with the analogue's wider record elsewhere unread, `chain` found nothing (`None`), the
+/// cold figure.
+#[test]
+fn a_new_worktrees_build_reads_verifys_wider_selection_elsewhere() {
+    let own = key("targo test", "/vwider", &["aterm-sysprobe"]);
+    let like = key("TestCompile", "/vwider", &["aterm-sysprobe"]);
+    let pair = key(
+        "TestCompile",
+        "/sw-trust",
+        &["aterm-release", "aterm-sysprobe"],
+    );
+    let measured = 4_885_525_299; // 4.55 GiB.
+    let mut verify = Records::default();
+    verify.push(pair.clone(), measured, 1);
+    let none = Records::default();
+    assert_eq!(
+        chain(&none, &own, Some((&verify, &like))),
+        Some(Found {
+            peak: measured,
+            runs: 1,
+            via: Via::AnalogueWiderElsewhere(pair.clone())
+        })
+    );
+    let n = need(&none, &own, Some((&verify, &like)), Some(48 * GIB));
+    assert_eq!(n.bytes, crate::peak_claim(measured), "{n}");
+    assert!(
+        n.to_string().contains(&format!(
+            "the most verify's TestCompile of a wider selection (-p aterm-release -p \
+             aterm-sysprobe) in /sw-trust used ({}) and a fifth more, at least 1 GiB",
+            crate::size(measured)
+        )),
+        "{n}"
+    );
+    let plain_pair = key("targo test", "/far", &["aterm-sysprobe", "aterm-time"]);
+    for (gib, want) in [
+        (6, Via::WiderElsewhere(plain_pair.clone())),
+        (2, Via::AnalogueWiderElsewhere(pair.clone())),
+    ] {
+        let plain = with(&[(plain_pair.clone(), gib)]);
+        assert_eq!(
+            chain(&plain, &own, Some((&verify, &like))).map(|f| f.via),
+            Some(want),
+            "{gib} GiB"
+        );
+    }
+    let mut tie = Records::default();
+    tie.push(plain_pair.clone(), measured, 2);
+    assert_eq!(
+        chain(&tie, &own, Some((&verify, &like))).map(|f| f.via),
+        Some(Via::WiderElsewhere(plain_pair)),
+        "a tie is the build's own"
+    );
+    let heavy = with(&[(pair.clone(), 20)]);
+    let n = need(&none, &own, Some((&heavy, &like)), Some(48 * GIB));
+    assert_eq!(n.bytes, crate::cold_claim(Some(48 * GIB)), "{n}");
+    let mut near = verify.clone();
+    let here = key("TestCompile", "/vwider", &["aterm-sysprobe", "aterm-time"]);
+    near.push(here.clone(), GIB, 2);
+    assert_eq!(
+        chain(&none, &own, Some((&near, &like))).map(|f| (f.peak, f.via)),
+        Some((GIB, Via::Analogue(here))),
+        "verify's wider record in its own checkout"
+    );
+}
+
+/// A PLAIN BUILD REFUSES THE WIDER RECORD ELSEWHERE VERIFY REFUSES: verify keeps its test compile
+/// of `-p a` at 10 GiB in /one and of `-p a -p b -p c` at 0.5 GiB in /far. A `targo test -p a -p
+/// b` in /new, with nothing of its own kept, reads the wider record by verify's one rule
+/// ([`Records::wider_elsewhere`]): `-p a`, inside its selection, kept more, so that wider run was
+/// warm, and the build claims the cold figure, as verify's own test compile there would. The
+/// same holds for its own book's records of the same work, and for its own book's wider record
+/// where only verify kept the narrower one: a wider `targo test` of no variant built all that
+/// verify's test compile of `-p a` did. NEGATIVE CONTROL, by hand: with the narrower records'
+/// refusal taken out of [`Records::wider_elsewhere`] (the unfiltered read this rule had before),
+/// the first two builds claimed 1.5 GiB; with [`chain`]'s own floor left at the unit floor (verify's
+/// narrower records not read for the build's own wider record), the third claimed 2 GiB.
+#[test]
+fn a_plain_build_refuses_the_wider_record_elsewhere_verify_refuses() {
+    let own = key("targo test", "/new", &["a", "b"]);
+    let like = key("TestCompile", "/new", &["a", "b"]);
+    let mut verify = with(&[(key("TestCompile", "/one", &["a"]), 10)]);
+    verify.push(key("TestCompile", "/far", &["a", "b", "c"]), GIB / 2, 2);
+    assert!(key("TestCompile", "/far", &["a", "b", "c"]).wider_elsewhere(&like));
+    let none = Records::default();
+    let cold = crate::cold_claim(Some(48 * GIB));
+    let n = need(&none, &own, Some((&verify, &like)), Some(48 * GIB));
+    assert_eq!((n.bytes, n.found), (cold, None), "verify's records");
+    let mut plain = with(&[(key("targo test", "/one", &["a"]), 10)]);
+    plain.push(key("targo test", "/far", &["a", "b", "c"]), GIB / 2, 2);
+    let n = need(&plain, &own, None, Some(48 * GIB));
+    assert_eq!((n.bytes, n.found), (cold, None), "its own book's records");
+    let narrow = with(&[(key("TestCompile", "/one", &["a"]), 10)]);
+    let wide = with(&[(key("targo test", "/far", &["a", "b", "c"]), 1)]);
+    let n = need(&wide, &own, Some((&narrow, &like)), Some(48 * GIB));
+    assert_eq!(
+        (n.bytes, n.found),
+        (cold, None),
+        "verify's narrower, its own wider"
+    );
+    let lib = |k: Key| Key {
+        variant: Some("--lib".to_owned()),
+        ..k
+    };
+    let wide_lib = with(&[(lib(key("targo test", "/far", &["a", "b", "c"])), 1)]);
+    let n = need(&wide_lib, &lib(own), Some((&narrow, &like)), Some(48 * GIB));
+    assert_eq!(
+        n.bytes,
+        crate::peak_claim(GIB),
+        "a --lib build's wider --lib record: {n}"
+    );
+}
+
+/// A TEST BUILD REFUSES A WIDER RECORD ELSEWHERE LIGHTER THAN A UNIT OF ITS CRATES: verify keeps
+/// its test compile of `-p a -p b` at 2 GiB in /far and the lib-test unit of `a` at 5 GiB in /old
+/// ([`UNIT_STAGE`]). A cold test compile of `-p a` compiles that unit, so the wider run was warm:
+/// `targo test -p a` in /new claims the cold figure, whether the wider record is verify's
+/// analogue's or its own book's `targo test` of no variant. Where the unit floor does not hold,
+/// the wider record still answers: a `targo test --lib` reads its own book's wider `--lib` record
+/// (its run built no test target), and a lint reads verify's lint, which keeps no unit's peak.
+/// NEGATIVE CONTROL, by hand: with [`Records::unit_floor`] answering 0, the first build claimed
+/// 3 GiB, the wider record's 2 GiB and 1 GiB more.
+#[test]
+fn a_test_build_refuses_a_wider_record_elsewhere_lighter_than_a_unit_of_its_crates() {
+    let unit = Key {
+        variant: Some("a lib".to_owned()),
+        ..key(UNIT_STAGE, "/old", &["a"])
+    };
+    let mut verify = with(&[(unit, 5)]);
+    verify.push(key(TEST_COMPILE, "/far", &["a", "b"]), 2 * GIB, 2);
+    verify.push(key("Tippy", "/far", &["a", "b"]), 2 * GIB, 3);
+    let none = Records::default();
+    let own = key("targo test", "/new", &["a"]);
+    let like = key(TEST_COMPILE, "/new", &["a"]);
+    let cold = crate::cold_claim(Some(48 * GIB));
+    assert_eq!(verify.unit_floor(&like), 5 * GIB);
+    let n = need(&none, &own, Some((&verify, &like)), Some(48 * GIB));
+    assert_eq!((n.bytes, &n.found), (cold, &None), "verify's analogue: {n}");
+    let plain = with(&[(key("targo test", "/far", &["a", "b"]), 2)]);
+    let n = need(&plain, &own, Some((&verify, &like)), Some(48 * GIB));
+    assert_eq!((n.bytes, &n.found), (cold, &None), "its own book's: {n}");
+    let lib = |k: Key| Key {
+        variant: Some("--lib".to_owned()),
+        ..k
+    };
+    let plain_lib = with(&[(lib(key("targo test", "/far", &["a", "b"])), 2)]);
+    let n = need(
+        &plain_lib,
+        &lib(own),
+        Some((&verify, &like)),
+        Some(48 * GIB),
+    );
+    assert_eq!(n.bytes, crate::peak_claim(2 * GIB), "a --lib build: {n}");
+    let lint = key("Tippy", "/new", &["a"]);
+    let n = need(
+        &none,
+        &key("targo tippy", "/new", &["a"]),
+        Some((&verify, &lint)),
+        Some(48 * GIB),
+    );
+    assert_eq!(n.bytes, crate::peak_claim(2 * GIB), "a lint: {n}");
+}
+
+/// EACH RULE SAYS WHERE ITS FIGURE WAS READ: a wider selection in the build's own checkout names
+/// the selection and no checkout; its key in another checkout names that checkout; and verify's
+/// analogue's wider record elsewhere, past the cold figure, names it and says its claim is at most
+/// the cold figure. NEGATIVE CONTROL: the found figure's own rule's text is not another's (the
+/// wider selection's text names no checkout, ` in /`).
+#[test]
+fn each_rule_says_where_its_figure_was_read() {
+    let own = key("targo test", "/ck", &["a"]);
+    let wider = need(
+        &with(&[(key("targo test", "/ck", &["a", "b"]), 3)]),
+        &own,
+        None,
+        Some(48 * GIB),
+    );
+    let text = wider.to_string();
+    assert!(
+        text.contains("the most a build of a wider selection (-p a -p b) used (3 GiB)"),
+        "{text}"
+    );
+    assert!(!text.contains(" in /"), "{text}");
+    let far = need(
+        &with(&[(key("targo test", "/other", &["a"]), 3)]),
+        &own,
+        None,
+        Some(48 * GIB),
+    );
+    assert!(
+        far.to_string()
+            .contains("the most a build of it in /other used (3 GiB) and a fifth more"),
+        "{far}"
+    );
+    let verify = with(&[(key(TEST_COMPILE, "/far", &["a", "b"]), 20)]);
+    let like = key(TEST_COMPILE, "/ck", &["a"]);
+    let capped = need(
+        &Records::default(),
+        &own,
+        Some((&verify, &like)),
+        Some(48 * GIB),
+    );
+    assert_eq!(capped.bytes, crate::cold_claim(Some(48 * GIB)), "{capped}");
+    assert!(
+        capped.to_string().contains(
+            "the most verify's TestCompile of a wider selection (-p a -p b) in /far used (20 GiB) \
+             and a fifth more, at most the cold figure (16 GiB, at most half of physical memory)"
+        ),
+        "{capped}"
+    );
 }

@@ -5711,7 +5711,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · true: Option/Alt acts as Meta in shells and editors · false: it types your keyboard layout's characters (é, ü, …)"
         }
         crate::prefs::EDIT_ALLOW_NOTIFICATIONS => {
-            " · desktop delivery is implemented on macOS and Windows; parsed but inert on other platforms"
+            " · desktop delivery is implemented on macOS, Windows and Linux; parsed but inert on other platforms · on macOS, a person turning this on with its Settings row asks macOS to allow aterm's notices: a line written here does not ask, and they stay held until a person turns that row off and on"
         }
         crate::prefs::EDIT_ALLOW_OSC52_QUERY => {
             if cfg!(target_os = "linux") {

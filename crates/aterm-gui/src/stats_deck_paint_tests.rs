@@ -672,6 +672,7 @@ pub(crate) fn scene_input(snap: &Snapshot, form: DeckForm) -> DeckInput<'_> {
         network_place: None,
         network_target: crate::network_deck::Target::Overview,
         lab: None,
+        fleet: None,
         snap: Some(snap),
         prev_snap: None,
         tab_panes: vec![FRONT],
@@ -3021,16 +3022,22 @@ fn an_events_keyline_never_cuts_another_events_line() {
 /// header word or tick holds. The header is drawn after the strip, so a px the words' ink covers
 /// wholly keeps it, and a glyph's edge px blends over the pip instead of the ground (the second
 /// review's own review, 2026-11-06). A pip keeps a px of its own, over the rail or its foot on the
-/// rail, except at 1× where the rail breaks under it and the words take its one row over the rail,
-/// as the descenders of Worst's "Disk emergency" do over Folded's first strip: there it has none
-/// and reads as part of the words. Calm's header and Worst's, events of every kind, at ages across
-/// every band, over boxes two of three of which are over (half or wholly) and the third not, Full
-/// and Folded at four widths, at 1× and 2×; judged by raster against the same deck laid with no
-/// events. NEGATIVE CONTROLS: the pip centred on the rail, as main drew it, inks the rail's break
-/// over a cap at 1× (and the caps' row under it), and laid so at 2× alone, the ground row under the
-/// rail; the pip standing on the rail but drawn whole inks the rail's break at 1×; Folded's header
-/// drawn before its strips lets a pip ink a px the words cover wholly (`words2` at Calm Folded
-/// 700 pt 1×'s (276, 11)).
+/// rail, except at 1×, where the words' descenders can take its one row over the rail and, on the
+/// rail's row, either the rail breaks under it, as under Worst's "Disk emergency" over Folded
+/// 1119 pt's first strip, or a descender's edge reaches its foot, as at Full 420 pt and Folded
+/// 700 pt (the third review, 2026-11-06): there it has none and reads as part of the words. Calm's
+/// header and Worst's, events of every kind, at ages across every band and, at 1×, at every place
+/// along each strip where the header's ink stands over both of a pip's columns on the row over the
+/// rail, over boxes two of three of which are over (half or wholly) and the third not, Full and
+/// Folded at four widths, at 1× and 2×; judged by raster against the same deck laid with no events.
+/// NEGATIVE CONTROLS: the pip centred on the rail, as main drew it, inks the rail's break over a cap
+/// at 1× (and the caps' row under it), and laid so at 2× alone, the ground row under the rail; the
+/// pip standing on the rail but drawn whole inks the rail's break at 1×; Folded's header drawn
+/// before its strips lets a pip ink a px the words cover wholly (`words2` at Calm Folded 700 pt
+/// 1×'s (276, 11)); the second review's own review's ages without the places under the header (four
+/// of them 1000 times too large) lay none there and leave no pip hidden at the record's place; a pip
+/// allowed none of its own only over the rail's break fails at Worst Full 420 pt 1×'s pip at 185,
+/// under a descender's edge.
 #[test]
 fn an_events_pip_stands_on_the_rail_clear_of_row_0s_caps() {
     use aterm_vitals::StripEventKind::{Crash, PressureSpike, Restart, SleepWake};
@@ -3044,19 +3051,25 @@ fn an_events_pip_stands_on_the_rail_clear_of_row_0s_caps() {
             .all(|(_, snap)| snap.time_gaps.is_empty() && snap.strip_events.is_empty()),
         "CONTROL: the scenes have no gaps or events of their own"
     );
-    // Ages in ms, from the 1 s band to the 1 h band, laid four at a time, one of each kind; the
-    // last four put a pip where Worst's words stand over the rail at 1×.
-    let ages: [i64; 24] = [
+    // Ages in ms, from the 1 s band to the 1 h band, laid four at a time, one of each kind. At 1×
+    // each deck also lays a pip at every place along each strip where the header's ink stands over
+    // both of its columns on the row over the rail, its age found from the strip's geometry
+    // (`located`): Worst's words over Folded 1119 pt's first strip among them.
+    let ages: [i64; 20] = [
         2_000, 5_000, 8_000, 14_000, 22_000, 35_000, 50_000, 75_000, 110_000, 160_000, 240_000,
         330_000, 450_000, 700_000, 1_000_000, 1_500_000, 2_400_000, 3_300_000, 5_000_000,
-        8_000_000, 8_600_000, 10_400_000, 12_000_000, 26_000_000,
+        8_000_000,
     ];
     let kinds = [Crash, Restart, PressureSpike, SleepWake];
     // Pips drawn at 1× and 2×: over a cap, over none, and (1×) over the rail's break at a cap.
     let (mut over_cap, mut clear, mut over_break) = ([0_usize; 2], [0_usize; 2], 0_usize);
     // The header's px under a pip: wholly its ink, a glyph's edge blended over the pip, and pips
-    // left with no px of their own.
+    // left with no px of their own: in all, over the rail's break along Worst's Folded 1119 pt first
+    // strip at 1×, where the record found them (`docs/measured/stats-deck-review2-fixes-look-2026-11-06.md`),
+    // and on the rail under a descender's edge.
     let (mut wholly, mut tinted, mut hidden) = (0_usize, 0_usize, 0_usize);
+    let (mut hidden_named, mut hidden_edged) = (0_usize, 0_usize);
+    let mut located = 0_usize;
     for (sc, snap) in &scenes {
         for form in [DeckForm::Full, DeckForm::Folded] {
             for w in [1119.0, 700.0, 420.0, 250.0] {
@@ -3103,7 +3116,63 @@ fn an_events_pip_stands_on_the_rail_clear_of_row_0s_caps() {
                         .collect();
                     let (over, grid) = (rgba(input.inks.over, 0xFF), rgba(input.inks.grid, 0xFF));
                     let ground = rgba(input.inks.ground, 0xFF);
-                    for batch in ages.chunks(4) {
+                    let at = |px: &[u8], x: f32, y: f32| {
+                        let i = (y as usize * pw + x as usize) * 4;
+                        [px[i], px[i + 1], px[i + 2], px[i + 3]]
+                    };
+                    let mut batches: Vec<Vec<i64>> = ages.chunks(4).map(<[i64]>::to_vec).collect();
+                    for (strip, rows, _) in strips(w, form, &m).into_iter().filter(|_| s == 1.0) {
+                        let (sx0, sx1) = (px(strip.x, s), px(strip.end(), s));
+                        let y_row0 = px(rows.top(0), s);
+                        let rail = rail_pieces(&bare.prims, grid, (sx0, sx1), y_row0);
+                        let Some(&(_, _, rail_y)) = rail.first() else {
+                            continue;
+                        };
+                        let pip = (2.2 * s).round().max(2.0) as f32;
+                        let horizon = strip.spec.horizon_ms();
+                        let left = |age: i64| {
+                            let x = strip.x_at_age_ms(age)?;
+                            Some(((x * s) as f32 - pip / 2.0).round().clamp(sx0, sx1 - pip))
+                        };
+                        let inked = |x: f32| at(&bare_px, x, rail_y - 1.0) != ground;
+                        // Each place under the header's ink, `(pip's left px, age)`: the first age
+                        // whose pip stands there (the pip's x grows with age).
+                        let mut found: Vec<(f32, i64)> = Vec::new();
+                        for k in sx0 as i32..=(sx1 - pip) as i32 {
+                            let x = k as f32;
+                            if !(inked(x) && inked(x + 1.0)) {
+                                continue;
+                            }
+                            let (mut lo, mut hi) = (0_i64, horizon);
+                            while lo < hi {
+                                let mid = lo + (hi - lo) / 2;
+                                if left(mid).is_some_and(|l| l >= x) {
+                                    hi = mid;
+                                } else {
+                                    lo = mid + 1;
+                                }
+                            }
+                            if left(lo) == Some(x) {
+                                found.push((x, lo));
+                            }
+                        }
+                        // Four to a batch, a pip and two px of ground apart, so each is its own.
+                        while !found.is_empty() {
+                            let mut batch: Vec<i64> = Vec::new();
+                            let mut last = f32::NEG_INFINITY;
+                            found.retain(|&(x, age)| {
+                                let take = batch.len() < 4 && x >= last + pip + 2.0;
+                                if take {
+                                    batch.push(age);
+                                    last = x;
+                                }
+                                !take
+                            });
+                            located += batch.len();
+                            batches.push(batch);
+                        }
+                    }
+                    for batch in &batches {
                         let mut with = snap.clone();
                         with.strip_events = batch
                             .iter()
@@ -3115,12 +3184,13 @@ fn an_events_pip_stands_on_the_rail_clear_of_row_0s_caps() {
                             })
                             .collect();
                         let (_, with_px, _) = raster(&with);
-                        let at = |px: &[u8], x: f32, y: f32| {
-                            let i = (y as usize * pw + x as usize) * 4;
-                            [px[i], px[i + 1], px[i + 2], px[i + 3]]
-                        };
                         let moved = |x: f32, y: f32| at(&with_px, x, y) != at(&bare_px, x, y);
-                        for (strip, rows, _) in strips(w, form, &m) {
+                        for (si, (strip, rows, _)) in strips(w, form, &m).into_iter().enumerate() {
+                            let named = matches!(sc, Scene::Worst)
+                                && form == DeckForm::Folded
+                                && w == 1119.0
+                                && s == 1.0
+                                && si == 0;
                             let tag = format!(
                                 "{sc:?} {form:?} {w} pt at {s}×, over {share}, strip at {}, events \
                              {batch:?} ms ago",
@@ -3231,13 +3301,30 @@ fn an_events_pip_stands_on_the_rail_clear_of_row_0s_caps() {
                                 }
                                 let n = usize::from(s > 1.0);
                                 let over = |a: f32, b: f32| x < b && a < x + qw;
-                                // Only at 1×, where the rail breaks under it, can the header's ink take
-                                // every px a pip has over the rail.
+                                // Only at 1× can the header's ink touch every px a pip has: the
+                                // descenders take its one row over the rail, and on the rail's row
+                                // either the rail breaks under it or the header's ink, a descender's
+                                // edge, reaches its foot.
                                 assert!(
-                                    own > 0 || (n == 0 && breaks.iter().any(|b| over(b.0, b.1))),
+                                    own > 0 || n == 0,
                                     "{tag}: the pip at {x} px has no px of its own"
                                 );
-                                hidden += usize::from(own == 0);
+                                if own == 0 {
+                                    let on_break = breaks.iter().any(|b| over(b.0, b.1));
+                                    let edged = (x as i32..(x + qw) as i32).all(|c| {
+                                        let c = c as f32;
+                                        on(c) && ![grid, ground].contains(&at(&bare_px, c, rail_y))
+                                    });
+                                    assert!(
+                                        on_break || edged,
+                                        "{tag}: the pip at {x} px has no px of its own, with neither \
+                                         the rail's break nor the header's ink on the rail's row \
+                                         under it"
+                                    );
+                                    hidden += 1;
+                                    hidden_named += usize::from(named && on_break);
+                                    hidden_edged += usize::from(!on_break);
+                                }
                                 if caps.iter().any(|c| over(c.0, c.1)) {
                                     over_cap[n] += 1;
                                 } else {
@@ -3257,26 +3344,47 @@ fn an_events_pip_stands_on_the_rail_clear_of_row_0s_caps() {
          the rail's break at a cap at 1× ({over_break})"
     );
     assert!(
-        wholly > 10 && tinted > 10 && hidden > 0,
+        wholly > 10 && tinted > 10 && located > 100 && hidden_named > 0 && hidden_edged > 0,
         "CONTROL: the words' px under a pip, wholly their ink ({wholly}) and edges blended over it \
-         ({tinted}), and pips with no px of their own ({hidden})"
+         ({tinted}), pips laid where the header's ink stands over the rail at 1× ({located}), and \
+         pips with no px of their own ({hidden}): over the rail's break under Worst's words over \
+         Folded 1119 pt's first strip at 1× ({hidden_named}), and on the rail under a descender's \
+         edge ({hidden_edged})"
     );
 }
 
-/// A1 §3, a time gap's notch where an event stands on its end (the second review's own review,
-/// 2026-11-06). Vitals sets an aterm crash and its restart at a crash gap's two ends and a wake at a
-/// sleep gap's newer end, and an event's pip stands up from the rail as tall as a notch, so a notch
-/// drawn on that end stood under the pip and was lost. A notch stands on its end where no pip
-/// stands within a device px of it, and else on the first column inward, toward its span's other
-/// end, with a device px of ground between it and every pip; only inside its span. Judged by raster
-/// on every row above the rail, against the same deck laid with the events alone: on each notch's
-/// px, where the events' frame holds ground, the gap's ink; on every other px, exactly what the
-/// events' frame holds, so the pips keep every px and nothing else of a gap stands there. Crash,
-/// sleep and paused gaps (a paused gap has no event, so its notches stand on its ends), each with
-/// its events as vitals records them, at ages across the bands and with a restart at now; Full and
-/// Folded at three widths, at 1× and 2×, every box over and none. NEGATIVE CONTROLS: the notch on
-/// its end, as the second review drew it, stands under the pip and leaves the inward column bare; a
-/// notch stepped flush against the pip, with no px of ground between, stands a column short.
+/// A1 §3, a time gap's notches where events stand on its ends (the second review's own review,
+/// 2026-11-06, and the third review). Vitals sets an aterm crash and its restart at a crash gap's
+/// two ends and a wake at a sleep gap's newer end, and an event's pip stands up from the rail as
+/// tall as a notch, so a notch on that end stood under the pip and was lost. A notch stands only on
+/// a column of its span with a device px of ground between it and every pip: the newer end's on the
+/// first such column from its end, the older end's on the last, each on its end where no pip stands
+/// within a device px of it. The two keep a device px of ground between them unless both stand on
+/// their ends (a span 2 px wide): where one has stepped and they would stand side by side, only the
+/// one nearer its own end stands, the newer where they are as near. A span with no such column
+/// draws no notch, and one with such a column always draws one. A notch stepped past its own end's
+/// event stands 2 px inside its end at 1× and 3 px at 2×, and 3 and 5 px where that event is at now
+/// and its pip is held inside the strip's newest edge. Judged by raster against the same deck laid
+/// with the events alone, on every row above the rail and on the rail's row. Over the rail: on each
+/// notch's px, where the events' frame holds ground, the gap's ink; on every other px exactly what
+/// the events' frame holds, so the pips keep every px there and nothing else of a gap stands there.
+/// On the rail's row: each px of a pip's foot the pip covers wholly keeps its ink, a gap's rail
+/// under it included; off the feet, inside a span, the gap's rail where the rail stands; elsewhere
+/// the events' frame's px, or the grid's rail where a gap's box took the cap the rail broke over.
+/// The rows under the rail are the caps' (`an_events_pip_stands_on_the_rail_clear_of_row_0s_caps`
+/// and `a_time_gaps_rail_breaks_where_the_axis_rail_does` judge them). Crash, sleep and paused gaps
+/// (a paused gap has no event, so its notches stand on its ends), each with its events as vitals
+/// records them, at ages across the bands, with a restart at now, and narrow ones, from 1 px to a
+/// few, where no column is clear or the two notches would meet; Full and Folded at three widths,
+/// at 1× and 2×, every box over and none. NEGATIVE CONTROLS, each failing at Full 1119 pt 1×: the
+/// notch on its end, as the second review drew it, stands under the pip and leaves the inward
+/// column bare (the crash gap's beside the restart's pip, (379, 13)); a notch stepped flush against
+/// the pip stands a column short ((378, 13)); the two notches kept side by side, as the second
+/// review's own review drew them, put the stepped one beside the one on its end (the sleep gap 106
+/// to 90 s ago, (381, 13)); a notch kept on its end where no column is clear stands flush beside the
+/// pip (the sleep gap 32.2 to 31 s ago, (338, 13)); the gaps drawn after the pips cover a restart's
+/// foot with its crash gap's rail ((544, 14)); and every stepped notch held 2 px inside its end, as
+/// the second review's own review said, misses the restart at now's, 3 px inside.
 #[test]
 fn a_gaps_notch_steps_clear_of_an_events_pip_on_its_end() {
     use aterm_vitals::StripEventKind::{Crash, Restart, SleepWake};
@@ -3286,22 +3394,43 @@ fn a_gaps_notch_steps_clear_of_an_events_pip_on_its_end() {
         base.time_gaps.is_empty() && base.strip_events.is_empty(),
         "CONTROL: the scene has no gaps or events of its own"
     );
-    // Gaps `(from s ago, to s ago, kind)`, at most four to a strip and six events.
-    let batches: [&[(i64, i64, GapKind)]; 4] = [
-        &[
-            (150, 80, GapKind::Crash),
-            (320, 260, GapKind::Sleep),
-            (36, 30, GapKind::Paused),
+    // Gaps `(from ms ago, to ms ago, kind)`, at most four to a strip and six events.
+    let mut batches: Vec<Vec<(i64, i64, GapKind)>> = vec![
+        vec![
+            (150_000, 80_000, GapKind::Crash),
+            (320_000, 260_000, GapKind::Sleep),
+            (36_000, 30_000, GapKind::Paused),
         ],
-        &[(40, 0, GapKind::Crash), (1_500, 900, GapKind::Sleep)],
-        &[
-            (12, 9, GapKind::Crash),
-            (3_000, 2_400, GapKind::Crash),
-            (9_000, 6_000, GapKind::Sleep),
+        vec![
+            (40_000, 0, GapKind::Crash),
+            (1_500_000, 900_000, GapKind::Sleep),
         ],
-        &[(700, 450, GapKind::Crash), (110, 75, GapKind::Sleep)],
+        vec![
+            (12_000, 9_000, GapKind::Crash),
+            (3_000_000, 2_400_000, GapKind::Crash),
+            (9_000_000, 6_000_000, GapKind::Sleep),
+        ],
+        vec![
+            (700_000, 450_000, GapKind::Crash),
+            (110_000, 75_000, GapKind::Sleep),
+        ],
     ];
+    // Narrow gaps, a growing length each batch: from a px or two, where no column is clear of the
+    // pips, through the widths where the two notches would stand side by side.
+    for k in 1..=8 {
+        batches.push(vec![
+            (20_000 + 900 * k, 20_000, GapKind::Crash),
+            (31_000 + 600 * k, 31_000, GapKind::Sleep),
+            (40_000 + 700 * k, 40_000, GapKind::Crash),
+            (90_000 + 4_000 * k, 90_000, GapKind::Sleep),
+        ]);
+    }
     let (mut stepped, mut on_end, mut over_break, mut notch_px) = (0_usize, 0_usize, 0_usize, 0);
+    // Per scale (1×, 2×): spans with no clear column, spans whose two notches would stand side by
+    // side, a pip's foot judged on a gap's rail, and steps past the end's own pip, centred on its
+    // end and held inside the strip's newest edge.
+    let (mut none, mut met, mut feet_on_gaps) = ([0_usize; 2], [0_usize; 2], [0_usize; 2]);
+    let (mut centred, mut held) = ([0_usize; 2], [0_usize; 2]);
     for form in [DeckForm::Full, DeckForm::Folded] {
         for w in [1119.0, 700.0, 420.0] {
             if ground_only(w, form, &m) {
@@ -3311,6 +3440,7 @@ fn a_gaps_notch_steps_clear_of_an_events_pip_on_its_end() {
                 .into_iter()
                 .flat_map(|s| [(s, 1.0_f32), (s, 0.0)])
             {
+                let n = usize::from(s > 1.0);
                 let g = geom(w, s, form);
                 let raster = |snap: &Snapshot| {
                     let input = scene_input(snap, form);
@@ -3343,13 +3473,19 @@ fn a_gaps_notch_steps_clear_of_an_events_pip_on_its_end() {
                     };
                     rgba(i, 0xFF)
                 };
-                for batch in batches {
+                let event_inks = [
+                    input.inks.critical_text,
+                    input.inks.warn_text,
+                    input.inks.hollow,
+                ]
+                .map(|i| rgba(i, 0xFF));
+                for batch in &batches {
                     let mut events = base.clone();
                     events.strip_events = batch
                         .iter()
                         .flat_map(|&(from, to, kind)| {
                             let ev = |age: i64, kind| aterm_vitals::StripEvent {
-                                at_unix_ms: AT - age * 1000,
+                                at_unix_ms: AT - age,
                                 kind,
                                 label: format!("{kind:?}"),
                             };
@@ -3364,13 +3500,13 @@ fn a_gaps_notch_steps_clear_of_an_events_pip_on_its_end() {
                     both.time_gaps = batch
                         .iter()
                         .map(|&(from, to, kind)| aterm_vitals::TimeGap {
-                            start_ms: AT - from * 1000,
-                            end_ms: AT - to * 1000,
+                            start_ms: AT - from,
+                            end_ms: AT - to,
                             kind,
                         })
                         .collect();
-                    let (laid, ev_px, pw) = raster(&events);
-                    let (_, both_px, _) = raster(&both);
+                    let (_, ev_px, pw) = raster(&events);
+                    let (both_laid, both_px, _) = raster(&both);
                     let at = |px: &[u8], x: f32, y: f32| {
                         let i = (y as usize * pw + x as usize) * 4;
                         [px[i], px[i + 1], px[i + 2], px[i + 3]]
@@ -3382,12 +3518,16 @@ fn a_gaps_notch_steps_clear_of_an_events_pip_on_its_end() {
                         );
                         let (sx0, sx1) = (px(strip.x, s), px(strip.end(), s));
                         let y_row0 = px(rows.top(0), s);
-                        let rail = rail_pieces(&laid.prims, grid, (sx0, sx1), y_row0);
+                        // The both frame's own rail: a gap's box keeps no cap, so the rail can
+                        // stand there where the events' frame broke it.
+                        let rail = rail_pieces(&both_laid.prims, grid, (sx0, sx1), y_row0);
                         let Some(&(_, _, rail_y)) = rail.first() else {
                             panic!("CONTROL {tag}: the strip's axis rail");
                         };
+                        let on = |x: f32| rail.iter().any(|p| p.2 == rail_y && p.0 <= x && x < p.1);
                         let horizon = strip.spec.horizon_ms();
-                        // The pips the deck draws, by its rule (as the pip law reads it), by left px.
+                        // The pips the deck draws, by its rule (as the pip law reads it), as
+                        // `(left px, event's unix ms)`.
                         let mut kept: Vec<_> = both
                             .strip_events
                             .iter()
@@ -3399,7 +3539,7 @@ fn a_gaps_notch_steps_clear_of_an_events_pip_on_its_end() {
                                 .then_with(|| b.at_unix_ms.cmp(&a.at_unix_ms))
                         });
                         let pip = (2.2 * s).round().max(2.0) as f32;
-                        let (mut keys, mut pips) = (Vec::<i32>::new(), Vec::<f32>::new());
+                        let (mut keys, mut pips) = (Vec::<i32>::new(), Vec::<(f32, i64)>::new());
                         for ev in kept {
                             let Some(x_pt) = strip.x_at_age_ms(AT - ev.at_unix_ms) else {
                                 continue;
@@ -3410,23 +3550,19 @@ fn a_gaps_notch_steps_clear_of_an_events_pip_on_its_end() {
                                 continue;
                             }
                             keys.push(key);
-                            pips.push((ex - pip / 2.0).round().clamp(sx0, (sx1 - pip).max(sx0)));
+                            let left = (ex - pip / 2.0).round().clamp(sx0, (sx1 - pip).max(sx0));
+                            pips.push((left, ev.at_unix_ms));
                         }
                         // A column with a device px of ground between it and every pip.
                         let clear =
-                            |c: f32| pips.iter().all(|&a| c < a - 1.0 || c >= a + pip + 1.0);
-                        let walk = |end: f32, step: f32| {
-                            let mut c = end;
-                            while !clear(c) {
-                                c += step;
-                            }
-                            c
-                        };
-                        // Each gap's notches, `(column, kind)`, as the gap law places its span.
+                            |c: f32| pips.iter().all(|&(a, _)| c < a - 1.0 || c >= a + pip + 1.0);
+                        // Each gap's span, as the gap law places it, and its notches,
+                        // `(column, kind)`.
                         let x_at = |at_ms: i64| {
                             let x = strip.x_at_age_ms((AT - at_ms).clamp(0, horizon))?;
                             Some(((x * s) as f32).round().clamp(sx0, sx1))
                         };
+                        let mut spans: Vec<(f32, f32, GapKind)> = Vec::new();
                         let mut notches: Vec<(f32, GapKind)> = Vec::new();
                         for g in both.time_gaps.iter().rev().take(4) {
                             if g.end_ms <= AT - horizon || g.start_ms >= AT {
@@ -3439,19 +3575,64 @@ fn a_gaps_notch_steps_clear_of_an_events_pip_on_its_end() {
                             if gx1 <= gx0 {
                                 continue;
                             }
-                            let mut ends = vec![(gx0, 1.0)];
-                            if gx1 - gx0 >= 2.0 {
-                                ends.push((gx1 - 1.0, -1.0));
-                            }
-                            for (end, step) in ends {
-                                let c = walk(end, step);
-                                if !(gx0..gx1).contains(&c) {
-                                    continue;
+                            spans.push((gx0, gx1, g.kind));
+                            let cols: Vec<f32> = (gx0 as i32..gx1 as i32)
+                                .map(|k| k as f32)
+                                .filter(|&c| clear(c))
+                                .collect();
+                            // Each notch with its end and the unix ms of the event on that end.
+                            let newer = (gx0, g.end_ms);
+                            let older = (gx1 - 1.0, g.start_ms);
+                            let drawn: Vec<(f32, (f32, i64))> = match (cols.first(), cols.last()) {
+                                (Some(&c), Some(&o)) if c == o => vec![(c, newer)],
+                                (Some(&c), Some(&o))
+                                    if o - c >= 2.0 || (c, o) == (gx0, gx1 - 1.0) =>
+                                {
+                                    vec![(c, newer), (o, older)]
                                 }
+                                (Some(&c), Some(&o)) => {
+                                    met[n] += 1;
+                                    if gx1 - 1.0 - o < c - gx0 {
+                                        vec![(o, older)]
+                                    } else {
+                                        vec![(c, newer)]
+                                    }
+                                }
+                                _ => Vec::new(),
+                            };
+                            none[n] += usize::from(cols.is_empty());
+                            assert_eq!(
+                                drawn.is_empty(),
+                                cols.is_empty(),
+                                "CONTROL {tag}: a span with a clear column keeps a notch"
+                            );
+                            for &(c, (end, end_ms)) in &drawn {
                                 if c == end {
                                     on_end += 1;
                                 } else {
                                     stepped += 1;
+                                    // Past the pip of its own end's event alone: how far inside.
+                                    let own = pips.iter().find(|p| p.1 == end_ms);
+                                    if let Some(&(a, _)) = own {
+                                        let past = if end == gx0 { a + pip + 1.0 } else { a - 2.0 };
+                                        if c == past {
+                                            let is_held = end == gx0 && a == sx0 && end_ms == AT;
+                                            let want =
+                                                if is_held { pip + 1.0 } else { pip / 2.0 + 1.0 };
+                                            assert_eq!(
+                                                (c - end).abs(),
+                                                want,
+                                                "{tag}: the {:?} gap's notch at {c} px from its end \
+                                                 at {end}, its event's pip at {a}",
+                                                g.kind
+                                            );
+                                            if is_held {
+                                                held[n] += 1;
+                                            } else {
+                                                centred[n] += 1;
+                                            }
+                                        }
+                                    }
                                 }
                                 // Over the rail's break the notch's foot, the gap's rail, is ground.
                                 over_break += usize::from(at(&both_px, c, rail_y) == ground);
@@ -3488,6 +3669,42 @@ fn a_gaps_notch_steps_clear_of_an_events_pip_on_its_end() {
                                 }
                             }
                         }
+                        // The rail's row: the pips' feet over the gaps' rails.
+                        for k in sx0 as i32..sx1 as i32 {
+                            let x = k as f32;
+                            let (e, b) = (at(&ev_px, x, rail_y), at(&both_px, x, rail_y));
+                            let span = spans.iter().find(|g| g.0 <= x && x < g.1);
+                            if pips.iter().any(|&(a, _)| a <= x && x < a + pip) {
+                                // A foot the pip covers wholly; a 2× corner blends over its rail.
+                                if on(x) && event_inks.contains(&e) {
+                                    assert_eq!(
+                                        b, e,
+                                        "{tag}: a pip's foot at ({k}, {rail_y}) px, spans {spans:?}, \
+                                         pips at {pips:?}"
+                                    );
+                                    feet_on_gaps[n] += usize::from(span.is_some());
+                                }
+                            } else if let (Some(&(_, _, kind)), true) = (span, on(x)) {
+                                // A header tick stands over the rail in both frames.
+                                let want = if e == grid || e == ground {
+                                    ink(kind)
+                                } else {
+                                    e
+                                };
+                                assert_eq!(
+                                    b, want,
+                                    "{tag}: the {kind:?} gap's rail at ({k}, {rail_y}) px, spans \
+                                     {spans:?}"
+                                );
+                            } else {
+                                let want = if on(x) && e == ground { grid } else { e };
+                                assert_eq!(
+                                    b, want,
+                                    "{tag}: the rail at ({k}, {rail_y}) px off the gaps' spans \
+                                     {spans:?}"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -3497,6 +3714,14 @@ fn a_gaps_notch_steps_clear_of_an_events_pip_on_its_end() {
         stepped > 100 && on_end > 100 && over_break > 10 && notch_px > 1000,
         "CONTROL: notches stepped clear of a pip ({stepped}), on their ends ({on_end}), over the \
          rail's break ({over_break}), notch px judged ({notch_px})"
+    );
+    assert!(
+        [none, met, feet_on_gaps, centred, held]
+            .iter()
+            .all(|per_scale| per_scale.iter().all(|&c| c > 0)),
+        "CONTROL at 1× and 2×: spans with no clear column ({none:?}), spans whose notches would \
+         meet ({met:?}), pips' feet judged on a gap's rail ({feet_on_gaps:?}), notches stepped past \
+         their end's pip centred on it ({centred:?}) and held inside the strip's edge ({held:?})"
     );
 }
 

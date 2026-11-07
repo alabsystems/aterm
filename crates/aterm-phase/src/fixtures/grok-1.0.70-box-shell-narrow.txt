@@ -1,0 +1,41 @@
+# grok 1.0.70 · MEASURED 2026-11-06, `aterm ctl text` of an `aterm-lab grok` instance (a private headless aterm, a debug build of this branch) running the real Grok Build 1.0.70, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME` and the lab's local stub of xAI's API (crates/aterm-lab) · the stub's `tool` mode asks for `run_terminal_command` `rm -rf build-output` with a 153-character description, and the grid was resized from 144x50 to 70x40 (`aterm ctl resize 40 70`) before this second turn: the card's title is cut to one row ending `…`, an option's words are cut at the edge with no mark, and its key row is cut short of `Esc:scrollback` (`1/5:select  │  Tab:next option  │  ←/→:scope  │  e:edit pattern`) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  /p/t/at.lab0/proj                         11K / 256K │ [Dashboard]
+
+
+     ❯ toolstart clean again                               6:11 PM
+
+
+     ◆ Running remove the generated build artifacts and the stale…
+
+
+
+
+                                                                     █
+                                                                     █
+                                                                     █
+                                                                     █
+                                                                     █
+                                                                     █
+                                                                     █
+                                                                     █
+                                                                     █
+                                                                     █
+                                                                     █
+
+    ◆ Remove the generated build artif… 1.0s   1.0s ⇣12.0k [↓][stop]
+
+  ┃
+  ┃  ›  Remove the generated build artifacts and the stale interm…
+  ┃  │ rm -rf build-output
+  ┃  ← → narrow scope  ·  e edit pattern
+  ┃
+  ┃  1 (○) Yes, and don't ask again for anything (always-approve m
+  ┃  2 (○) Always allow: rm -rf build-output
+  ┃  3 (●) Yes, proceed
+  ┃  4 (○) No, reject (type to add feedback)
+  ┃  5 (○) Never allow: rm -rf
+  ┃
+
+  1/5:select  │  Tab:next option  │  ←/→:scope  │  e:edit pattern
+

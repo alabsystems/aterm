@@ -1785,7 +1785,7 @@ pub(crate) fn spawn_session(
             &mut env_add,
             &|key| std::env::var(key).ok(),
             crate::clt_shim::wanted_dir().as_deref(),
-            aterm_types::clt_shim::developer_git(),
+            crate::clt_install::developer_tools_ready(),
         );
     }
 

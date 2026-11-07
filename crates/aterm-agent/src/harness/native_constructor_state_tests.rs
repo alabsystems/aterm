@@ -9,7 +9,7 @@ fn native_coordination_survives_terminal_restore_and_old_record_migration() {
         native_coordination: true,
         ..St::default()
     };
-    let back = st.signalled(400, 300, "s-coordination", "fixed".into(), 2);
+    let back = st.signalled(400, "", 300, "s-coordination", "fixed".into(), 2);
     st.unsent(back);
     assert!(St::from_json(&st.to_json()).unwrap().native_coordination);
     let legacy = St::default().to_json();

@@ -18,6 +18,8 @@ struct Fake {
     nodes: BTreeMap<PathBuf, (Kind, SystemTime, Vec<u8>, Option<PathBuf>)>,
     /// Paths whose metadata cannot be read (a listing shows them with none).
     unreadable: Vec<PathBuf>,
+    /// Regular files whose contents cannot be read despite readable metadata.
+    unreadable_heads: Vec<PathBuf>,
     /// Folders whose metadata reads but which cannot be listed.
     blind: Vec<PathBuf>,
     looked: std::cell::RefCell<Vec<PathBuf>>,
@@ -87,6 +89,9 @@ impl Fs for Fake {
 
     fn head(&self, file: &Path, max: usize) -> Option<Vec<u8>> {
         self.looked.borrow_mut().push(file.to_path_buf());
+        if self.unreadable_heads.iter().any(|path| path == file) {
+            return None;
+        }
         let (kind, _, bytes, _) = self.nodes.get(file)?;
         (*kind == Kind::File).then(|| bytes.iter().take(max).copied().collect())
     }
@@ -120,6 +125,33 @@ fn rustc_info(sysroots: &[&str]) -> Vec<u8> {
 fn fingerprint(rustc: u64) -> Vec<u8> {
     format!(r#"{{"rustc":{rustc},"features":"[]","target":1,"profile":2,"path":3,"deps":[]}}"#)
         .into_bytes()
+}
+
+/// Metadata only: the action hash differs from its compiler key, and digest
+/// strings name no file the survey may read.
+fn output_metadata(schema: u64, rustc: u64) -> aterm_json::Value {
+    let mut value = aterm_json::json!({
+        "schema": schema,
+        "fingerprint": 91,
+        "outputs": [{
+            "path_sha256": "a".repeat(64),
+            "size": 17,
+            "sha256": "b".repeat(64)
+        }]
+    });
+    if schema == 2 {
+        value.as_object_mut().unwrap().insert(
+            "compiler".into(),
+            aterm_json::json!({
+                "rustc_key": rustc,
+                "content_blake3": vec![7u8; 32],
+                "workspace": true,
+                "mode": "build",
+                "build_script": false
+            }),
+        );
+    }
+    value
 }
 
 /// A build directory the store's current compiler last built.
@@ -208,6 +240,110 @@ fn paths(doomed: &[Doomed]) -> Vec<(Part, Vec<String>)> {
         .collect()
 }
 
+#[cfg(unix)]
+#[test]
+fn observations_separate_quiet_units_from_missing_compiler_evidence_without_more_reads() {
+    let fs = world(now() - 2 * DAY, 4 * DAY);
+    let mut s = surveyed(&fs);
+    s.profiles[0].crates.clear();
+    s.profiles[0].units.retain(|u| u.hash == NEW);
+    fs.looked.borrow_mut().clear();
+    let before = decide(&s, now(), RECLAIM_STALE_UNDER_PRESSURE);
+    assert!(
+        before.is_empty(),
+        "a quiet unit built by the current compiler stays"
+    );
+    let seen = observations(&s, now(), RECLAIM_STALE_UNDER_PRESSURE);
+    assert_eq!(
+        seen.units,
+        Ages {
+            quiet: 1,
+            not_quiet: 0,
+            unknown: 0
+        }
+    );
+    assert_eq!(seen.last_build_current, Some(true));
+    assert_eq!(seen.profiles_with_compiler_references, 1);
+    assert_eq!(seen.units_without_compiler, 0);
+    assert!(!seen.release_record);
+
+    let mut missing = s.clone();
+    missing.last_built = None;
+    let unavailable = observations(&missing, now(), RECLAIM_STALE_UNDER_PRESSURE);
+    assert_eq!(unavailable.units, seen.units);
+    assert_eq!(unavailable.last_build_current, None);
+    assert_eq!(unavailable.profiles_with_compiler_references, 0);
+    assert!(decide(&missing, now(), RECLAIM_STALE_UNDER_PRESSURE).is_empty());
+
+    let mut no_references = s.clone();
+    no_references.last_built.as_mut().unwrap().since = now() + DAY;
+    let absent = observations(&no_references, now(), RECLAIM_STALE_UNDER_PRESSURE);
+    assert_eq!(absent.last_build_current, Some(true));
+    assert_eq!(absent.profiles_with_compiler_references, 0);
+    assert!(decide(&no_references, now(), RECLAIM_STALE_UNDER_PRESSURE).is_empty());
+
+    no_references.profiles[0].units[0].rustc = None;
+    assert_eq!(
+        observations(&no_references, now(), RECLAIM_STALE_UNDER_PRESSURE).units_without_compiler,
+        1
+    );
+    let mut future = s.clone();
+    let unit = &mut future.profiles[0].units[0];
+    unit.fingerprint.newest = Some(now() + DAY);
+    for artifact in &mut unit.artifacts {
+        artifact.newest = Some(now() + DAY);
+    }
+    assert_eq!(
+        observations(&future, now(), RECLAIM_STALE_UNDER_PRESSURE).units,
+        Ages {
+            quiet: 0,
+            not_quiet: 1,
+            unknown: 0
+        }
+    );
+    future.profiles[0].units[0].fingerprint.newest = None;
+    assert_eq!(
+        observations(&future, now(), RECLAIM_STALE_UNDER_PRESSURE).units,
+        Ages {
+            quiet: 0,
+            not_quiet: 0,
+            unknown: 1
+        }
+    );
+    assert!(decide(&future, now(), RECLAIM_STALE_UNDER_PRESSURE).is_empty());
+    assert_eq!(decide(&s, now(), RECLAIM_STALE_UNDER_PRESSURE), before);
+    assert!(
+        fs.looked.borrow().is_empty(),
+        "explanation performs no filesystem reads"
+    );
+}
+
+#[test]
+fn observations_distinguish_release_records_and_do_not_count_omitted_layouts() {
+    let mut fs = release_clone();
+    let s = clone_survey(&fs);
+    let seen = observations(&s, now(), RECLAIM_STALE);
+    assert!(seen.release_record);
+    assert_eq!(seen.profiles_naming_used_units, 1);
+    assert_eq!(
+        seen.units.quiet + seen.units.not_quiet + seen.units.unknown,
+        s.profiles[0].units.len()
+    );
+    fs.file(&format!("{LEAF}/{USED}"), now(), b"malformed record");
+    let missing = observations(&clone_survey(&fs), now(), RECLAIM_STALE);
+    assert!(!missing.release_record);
+    assert_eq!(missing.profiles_naming_used_units, 0);
+    fs.blind.push(PathBuf::from(format!("{PROFILE}/build")));
+    let omitted = observations(&clone_survey(&fs), now(), RECLAIM_STALE);
+    assert_eq!(omitted.units, Ages::default());
+    assert!(
+        fs.nodes
+            .keys()
+            .any(|p| p.starts_with(format!("{PROFILE}/build"))),
+        "zero recognized units is not an empty cache"
+    );
+}
+
 /// Unix only: the fixture's sysroot (`/store/trust/…`) is read only when it is
 /// absolute, which a path with no drive is not on Windows.
 #[test]
@@ -257,6 +393,269 @@ fn a_survey_ticks_for_each_stamp_and_fingerprint_it_reads() {
     let before = ticks();
     assert!(compiler(&fs, Path::new(&folder)).is_some());
     assert_eq!(ticks() - before, 1, "a fingerprint folder");
+}
+
+#[test]
+fn native_output_metadata_preserves_named_layout_compiler_evidence() {
+    let folder = format!("{PROFILE}/.fingerprint/aterm-grid-{OLD}");
+    for schema in [1, 2] {
+        let mut fs = world(now() - 2 * DAY, 4 * DAY);
+        fs.file(
+            &format!("{folder}/outputs-lib-aterm_grid.json"),
+            now() - 4 * DAY,
+            &aterm_json::to_vec(&output_metadata(schema, 1)).unwrap(),
+        );
+        assert_eq!(compiler(&fs, Path::new(&folder)), Some(1));
+        let survey = surveyed(&fs);
+        assert_eq!(survey.profiles[0].units[0].rustc, Some(1));
+        assert!(
+            decide(&survey, now(), RECLAIM_STALE)
+                .iter()
+                .any(|doomed| doomed.part == Part::Unit)
+        );
+
+        // Recognition repairs only the compiler-record classification. It
+        // does not admit a private SDK as an installed store generation.
+        fs.file(
+            &format!("{LEAF}/.rustc_info.json"),
+            now(),
+            &rustc_info(&["/private/sdk"]),
+        );
+        let private = surveyed(&fs);
+        assert_eq!(private.last_built, None);
+        assert!(
+            decide(&private, now(), RECLAIM_STALE)
+                .iter()
+                .all(|doomed| doomed.part != Part::Unit)
+        );
+    }
+}
+
+#[test]
+fn native_output_metadata_preserves_folder_layout_compiler_evidence() {
+    for schema in [1, 2] {
+        for mode in ["build", "check", "check-test", "test"] {
+            let mut fs = Fake::default();
+            folder_unit(
+                &mut fs,
+                "aterm-grid",
+                OLD,
+                "test-lib-aterm_grid",
+                7,
+                &["libaterm_grid-{h}.rmeta"],
+                now() - 4 * DAY,
+            );
+            let mut metadata = output_metadata(schema, 7);
+            if schema == 2 {
+                metadata
+                    .as_object_mut()
+                    .unwrap()
+                    .get_mut("compiler")
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("mode".into(), mode.into());
+            }
+            let folder = format!("{PROFILE}/build/aterm-grid/{OLD}/fingerprint");
+            fs.file(
+                &format!("{folder}/outputs-test-lib-aterm_grid.json"),
+                now() - 4 * DAY,
+                &aterm_json::to_vec(&metadata).unwrap(),
+            );
+            assert_eq!(compiler(&fs, Path::new(&folder)), Some(7));
+            let units = folder_units(&fs, Path::new(PROFILE));
+            assert_eq!(units.len(), 1);
+            assert_eq!(units[0].rustc, Some(7));
+        }
+    }
+}
+
+#[test]
+fn output_metadata_does_not_hide_bad_or_conflicting_compiler_records() {
+    let folder = format!("{PROFILE}/.fingerprint/aterm-grid-{OLD}");
+    let actual = format!("{folder}/lib-aterm_grid.json");
+    let other = format!("{folder}/test-lib-aterm_grid.json");
+    for schema in [1, 2] {
+        for fault in 0..4 {
+            let mut fs = world(now() - 2 * DAY, 4 * DAY);
+            fs.file(
+                &format!("{folder}/outputs-lib-aterm_grid.json"),
+                now(),
+                &aterm_json::to_vec(&output_metadata(schema, 1)).unwrap(),
+            );
+            match fault {
+                0 => {
+                    fs.file(&other, now(), &fingerprint(2));
+                }
+                1 => {
+                    fs.file(&actual, now(), b"{\"features\":\"[]\"}");
+                }
+                2 => fs.unreadable_heads.push(actual.clone().into()),
+                _ => fs.unreadable.push(actual.clone().into()),
+            }
+            assert_eq!(compiler(&fs, Path::new(&folder)), None, "{schema}/{fault}");
+        }
+    }
+}
+
+#[test]
+fn output_metadata_requires_an_exact_readable_regular_companion_and_receipt() {
+    let folder = format!("{PROFILE}/.fingerprint/aterm-grid-{OLD}");
+    let receipt = format!("{folder}/outputs-lib-aterm_grid.json");
+    let bytes = aterm_json::to_vec(&output_metadata(1, 1)).unwrap();
+    for fault in 0..8 {
+        let mut fs = world(now() - 2 * DAY, 4 * DAY);
+        fs.file(&receipt, now(), &bytes);
+        match fault {
+            0 => {
+                fs.nodes
+                    .remove(Path::new(&format!("{folder}/lib-aterm_grid.json")));
+            }
+            1 => {
+                fs.file(&format!("{folder}/unknown.json"), now(), &bytes);
+            }
+            2 => {
+                fs.file(&format!("{folder}/outputs-bin-orphan.json"), now(), &bytes);
+            }
+            3 => fs.unreadable_heads.push(receipt.clone().into()),
+            4 => fs.unreadable.push(receipt.clone().into()),
+            5 => {
+                fs.link(&receipt, now(), "/outside/metadata.json");
+            }
+            6 => {
+                fs.dir(&receipt, now());
+            }
+            _ => {
+                fs.put(&receipt, Kind::Other, now(), b"");
+            }
+        }
+        assert_eq!(compiler(&fs, Path::new(&folder)), None, "{fault}");
+        assert!(
+            !fs.looked
+                .borrow()
+                .contains(&PathBuf::from("/outside/metadata.json"))
+        );
+    }
+}
+
+#[test]
+fn malformed_or_unsupported_native_output_metadata_keeps_compiler_unknown() {
+    let mut bad = vec![b"{".to_vec()];
+    let duplicate = String::from_utf8(aterm_json::to_vec(&output_metadata(1, 1)).unwrap())
+        .unwrap()
+        .replace("\"schema\":1", "\"schema\":1,\"schema\":1");
+    bad.push(duplicate.into_bytes());
+    for schema in [0, 3] {
+        bad.push(aterm_json::to_vec(&output_metadata(schema, 1)).unwrap());
+    }
+    for fault in 0..10 {
+        let mut value = output_metadata(2, 1);
+        match fault {
+            0 => {
+                value.as_object_mut().unwrap().remove("compiler");
+            }
+            1 => {
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("extra".into(), true.into());
+            }
+            2 => {
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("outputs".into(), aterm_json::json!([]));
+            }
+            3 => {
+                value.as_object_mut().unwrap().insert(
+                    "outputs".into(),
+                    aterm_json::json!([{"path_sha256":"bad", "size":0, "sha256":"b".repeat(64)}]),
+                );
+            }
+            4 => {
+                value.as_object_mut().unwrap().insert(
+                    "outputs".into(),
+                    aterm_json::json!([{"path_sha256":"a".repeat(64), "size":8_589_934_593u64, "sha256":"b".repeat(64)}]),
+                );
+            }
+            _ => {
+                let compiler = value
+                    .as_object_mut()
+                    .unwrap()
+                    .get_mut("compiler")
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap();
+                match fault {
+                    5 => {
+                        compiler.insert("rustc_key".into(), 2u64.into());
+                    }
+                    6 => {
+                        compiler.insert("mode".into(), "doc".into());
+                    }
+                    7 => {
+                        compiler.insert("content_blake3".into(), aterm_json::json!(vec![7u8; 31]));
+                    }
+                    8 => {
+                        compiler
+                            .insert("content_blake3".into(), aterm_json::json!(vec![256u64; 32]));
+                    }
+                    _ => {
+                        compiler.remove("workspace");
+                    }
+                }
+            }
+        }
+        bad.push(aterm_json::to_vec(&value).unwrap());
+    }
+    let mut trailing = aterm_json::to_vec(&output_metadata(1, 1)).unwrap();
+    trailing.extend_from_slice(b"false");
+    bad.push(trailing);
+    let folder = format!("{PROFILE}/.fingerprint/aterm-grid-{OLD}");
+    for (index, bytes) in bad.iter().enumerate() {
+        let mut fs = world(now() - 2 * DAY, 4 * DAY);
+        fs.file(
+            &format!("{folder}/outputs-lib-aterm_grid.json"),
+            now(),
+            bytes,
+        );
+        assert_eq!(compiler(&fs, Path::new(&folder)), None, "{index}");
+    }
+}
+
+#[test]
+fn native_output_metadata_reads_have_one_conservative_directory_budget() {
+    let folder = format!("{PROFILE}/.fingerprint/aterm-grid-{OLD}");
+    let receipt = format!("{folder}/outputs-lib-aterm_grid.json");
+    let mut bytes = aterm_json::to_vec(&output_metadata(1, 1)).unwrap();
+    bytes.resize(OUTPUT_METADATA_BUDGET - 1, b' ');
+    let mut fs = world(now() - 2 * DAY, 4 * DAY);
+    fs.file(&receipt, now(), &bytes);
+    assert_eq!(compiler(&fs, Path::new(&folder)), Some(1));
+    bytes.push(b' ');
+    fs.file(&receipt, now(), &bytes);
+    assert_eq!(compiler(&fs, Path::new(&folder)), None);
+    bytes.push(b' ');
+    fs.file(&receipt, now(), &bytes);
+    assert_eq!(compiler(&fs, Path::new(&folder)), None);
+
+    bytes.truncate(OUTPUT_METADATA_BUDGET / 2 + 1);
+    fs.file(&receipt, now(), &bytes);
+    fs.file(
+        &format!("{folder}/test-lib-aterm_grid.json"),
+        now(),
+        &fingerprint(1),
+    );
+    fs.file(
+        &format!("{folder}/outputs-test-lib-aterm_grid.json"),
+        now(),
+        &bytes,
+    );
+    assert_eq!(
+        compiler(&fs, Path::new(&folder)),
+        None,
+        "budget is shared across receipts"
+    );
 }
 
 /// THE WINDOW IS THE PASS'S: parts written four hours ago stay for a pass with room and go for
@@ -341,6 +740,155 @@ fn a_sysroot_laid_aside_is_the_build_its_link_names() {
         }),
         "the previous compiler, laid aside, is still named as the previous one"
     );
+}
+
+/// A failed probe's stdout is cached too, but is never compiler-generation evidence.
+#[cfg(unix)]
+#[test]
+fn a_failed_probe_cannot_classify_recognized_units_as_old_compiler_outputs() {
+    let mut fs = world(now() - 2 * DAY, 4 * DAY);
+    fs.file(
+        &format!("{LEAF}/.rustc_info.json"),
+        now(),
+        br#"{"outputs":{"failed":{"success":false,"status":"exit status: 101","code":101,"stdout":"/store/trust/9192\n","stderr":"probe failed"}}}"#,
+    );
+    fs.looked.borrow_mut().clear();
+    let s = surveyed(&fs);
+    assert_eq!(
+        s.last_built, None,
+        "failed stdout cannot name a previous compiler"
+    );
+    assert_eq!(
+        decide(&s, now(), RECLAIM_STALE)
+            .iter()
+            .map(|d| d.part)
+            .collect::<Vec<_>>(),
+        vec![Part::Incremental]
+    );
+    assert!(
+        fs.looked.borrow().iter().all(|p| p.starts_with(LEAF)),
+        "a failed probe cannot authorize external store reads"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn only_successful_typed_probe_records_contribute_sysroots_without_hiding_ambiguity() {
+    let record = |success: &str, code: &str, status: &str, stdout: &str, stderr: &str| {
+        format!(
+            r#"{{"success":{success},"code":{code},"status":{status},"stdout":{stdout},"stderr":{stderr}}}"#
+        )
+    };
+    let empty = r#""""#;
+    let current = r#""/store/trust/15698\n""#;
+    let former = r#""/store/trust/9192\n""#;
+    let good = record("true", "0", empty, current, r#""a warning""#);
+    let info = |outputs: &str| format!(r#"{{"outputs":{{{outputs}}}}}"#).into_bytes();
+    let expected = Some(PathBuf::from("/store/trust/15698"));
+    assert_eq!(sysroot_named(&info(&format!(r#""good":{good}"#))), expected);
+    for bad in [
+        record("false", "101", r#""exit status: 101""#, former, empty),
+        record("false", "0", empty, former, empty),
+        record(r#""true""#, "0", empty, former, empty),
+        record("null", "0", empty, former, empty),
+        record("true", "101", empty, former, empty),
+        record("true", "null", empty, former, empty),
+        record("true", "0.0", empty, former, empty),
+        record("true", r#""0""#, empty, former, empty),
+        record("true", "0", r#""exit status: 101""#, former, empty),
+        record("true", "0", "null", former, empty),
+        record("true", "0", empty, "null", empty),
+        record("true", "0", empty, former, "null"),
+        format!(r#"{{"stdout":{former}}}"#),
+        "17".into(),
+    ] {
+        assert_eq!(
+            sysroot_named(&info(&format!(r#""bad":{bad}"#))),
+            None,
+            "{bad}"
+        );
+        assert_eq!(
+            sysroot_named(&info(&format!(r#""good":{good},"bad":{bad}"#))),
+            expected,
+            "an ineligible record cannot obscure a successful probe: {bad}"
+        );
+    }
+    let other = record("true", "0", empty, former, empty);
+    assert_eq!(
+        sysroot_named(&info(&format!(r#""good":{good},"other":{other}"#))),
+        None,
+        "distinct eligible sysroots remain ambiguous"
+    );
+    assert_eq!(
+        sysroot_named(&info(&format!(r#""good":{good},"same":{good}"#))),
+        expected,
+        "several successful probes may name the same sysroot"
+    );
+}
+
+/// Unix only: the fixture's sysroot (`/store/trust/…`) is read only when it is
+/// absolute, which a path with no drive is not on Windows.
+#[test]
+#[cfg(unix)]
+fn unix_ambiguous_probe_paths_never_normalize_into_compiler_evidence() {
+    let record = |stdout: &str, success: bool| {
+        aterm_json::json!({
+            "success": success,
+            "code": if success { 0 } else { 101 },
+            "status": if success { "" } else { "exit status: 101" },
+            "stdout": stdout,
+            "stderr": ""
+        })
+    };
+    let info = |outputs| aterm_json::to_vec(&aterm_json::json!({"outputs": outputs})).unwrap();
+    let clean = record("/store/trust/15698\n", true);
+    let expected = Some(PathBuf::from("/store/trust/15698"));
+    assert_eq!(
+        sysroot_named(&rustc_info(&["/store/trust/15698"])),
+        expected
+    );
+    for control in ['\r', '\t', '\0', '\u{b}', '\u{c}', '\u{7f}'] {
+        let stdout = format!("/store/trust/9192{control}\n");
+        let ambiguous = record(&stdout, true);
+        for outputs in [
+            aterm_json::json!({"ambiguous": ambiguous}),
+            aterm_json::json!({"clean": clean, "ambiguous": ambiguous}),
+            aterm_json::json!({"same": record("/store/trust/9192\n", true), "ambiguous": ambiguous}),
+        ] {
+            assert_eq!(
+                sysroot_named(&info(outputs)),
+                None,
+                "eligible control-bearing stdout must keep all inference unknown: {stdout:?}"
+            );
+        }
+        assert_eq!(
+            sysroot_named(&info(aterm_json::json!({
+                "clean": clean, "failed": record(&stdout, false)
+            }))),
+            expected,
+            "failed output stays ineligible before pathname validation"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn unix_ambiguous_sysroot_cannot_classify_units_or_authorize_store_reads() {
+    let mut fs = world(now() - 2 * DAY, 4 * DAY);
+    let info = br#"{"outputs":{"successful":{"success":true,"status":"","code":0,"stdout":"/store/trust/9192\r\n","stderr":""}}}"#;
+    assert!(aterm_json::from_slice::<aterm_json::Value>(info).is_ok());
+    fs.file(&format!("{LEAF}/.rustc_info.json"), now(), info);
+    fs.looked.borrow_mut().clear();
+    let s = surveyed(&fs);
+    assert_eq!(s.last_built, None);
+    assert_eq!(
+        decide(&s, now(), RECLAIM_STALE)
+            .iter()
+            .map(|d| d.part)
+            .collect::<Vec<_>>(),
+        vec![Part::Incremental]
+    );
+    assert!(fs.looked.borrow().iter().all(|p| p.starts_with(LEAF)));
 }
 
 /// Unix only: the fixture's sysroot (`/store/trust/…`) is read only when it is

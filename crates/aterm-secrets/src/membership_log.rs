@@ -1425,6 +1425,33 @@ pub struct Log {
     /// `hold` lets it go only when it holds an `Epoch`, a `Wrap` or a weighed record, since
     /// nothing it read changes otherwise. Clones share it until one holds such a record.
     epochs: Arc<OnceLock<epochs::Epochs>>,
+    /// The Macs it let back in after a removal, as the roster overlay names them
+    /// ([`Restored`]): `hold` lets it go with the evaluation. Clones share it until one holds a
+    /// record.
+    restored: Arc<OnceLock<Restored>>,
+}
+
+/// The Macs a log let back in after a removal, named as a roster names them: canonical `m<N>`
+/// labels, node keys (lowercase hex) and age recipients (bech32). The roster overlay derives it
+/// from the records alone (`client::roster::restored_by_log`), and the log keeps it with its
+/// evaluations ([`Log::restored`]), so a read that asks again of the same records derives nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Restored {
+    /// Their canonical `m<N>` labels.
+    pub labels: BTreeSet<String>,
+    /// Their node keys, lowercase hex.
+    pub nodes: BTreeSet<String>,
+    /// Their age recipients, bech32.
+    pub recipients: BTreeSet<String>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The [`Membership`] snapshots [`Log::membership`] cloned on this thread, counted (never
+    /// timed).
+    pub(crate) static MEMBERSHIP_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The records [`Log::ancestor_closure`] copied out on this thread, counted (never timed).
+    pub(crate) static CLOSURE_RECORDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// What seats one Mac in a log: the genesis binding it as a founder, the held `Admit`s another Mac
@@ -1487,6 +1514,7 @@ impl Log {
             effective: Arc::default(),
             weighing: Arc::default(),
             epochs: Arc::default(),
+            restored: Arc::default(),
         })
     }
 
@@ -1524,10 +1552,34 @@ impl Log {
     }
 
     /// Whether the held record `target` is one of the held records `from` or lies in one's past.
-    fn reaches(&self, from: &[RecordId], target: &RecordId) -> bool {
+    pub(crate) fn reaches(&self, from: &[RecordId], target: &RecordId) -> bool {
         self.held
             .get(target)
             .is_some_and(|&t| self.reach.in_past_of(t, &self.indexes(from)))
+    }
+
+    /// The held `Remove` records that are the held record `from` or lie in its causal past, in
+    /// order: those [`Log::ancestor_closure`] of `from` holds, read by a bit test each rather than
+    /// a copy of every record in that past. None where `from` is not held.
+    #[cfg(unix)]
+    pub(crate) fn removes_upto(&self, from: &RecordId) -> impl Iterator<Item = &Record> {
+        let at = self.held.get(from).copied();
+        self.order
+            .iter()
+            .enumerate()
+            .take(at.map_or(0, |at| at + 1))
+            .filter(move |(i, record)| {
+                record.kind() == Kind::Remove && at.is_some_and(|at| self.reach.upto(*i, at))
+            })
+            .map(|(_, record)| record)
+    }
+
+    /// Whether a held `Remove` of `member` is the held record `from` or lies in its causal past.
+    #[cfg(unix)]
+    pub(crate) fn removal_upto(&self, from: &RecordId, member: &MemberId) -> bool {
+        self.removes_upto(from).any(
+            |record| matches!(record.body(), Body::Remove { member: out, .. } if out == member),
+        )
     }
 
     /// Refuse records whose signer has no founding or admitted seat in their causal past.
@@ -1876,13 +1928,24 @@ impl Log {
         )
     )]
     pub fn membership(&self) -> Membership {
+        #[cfg(test)]
+        MEMBERSHIP_CLONES.set(MEMBERSHIP_CLONES.get() + 1);
         self.membership_ref().clone()
     }
 
     /// Borrow this immutable prefix's evaluation for graph queries that retain no snapshot.
-    fn membership_ref(&self) -> &Membership {
+    pub fn membership_ref(&self) -> &Membership {
         self.membership
             .get_or_init(|| eval::evaluate_with(self.history(), self.weighing()))
+    }
+
+    /// The [`Restored`] seats `derive` reads from these records, derived once while no record
+    /// arrives and shared by this log's clones. `derive` is the roster overlay's one derivation
+    /// (`client::roster`), a pure function of the records, so what is kept is what it would
+    /// derive again.
+    #[cfg(unix)]
+    pub(crate) fn restored(&self, derive: impl FnOnce(&Self) -> Restored) -> &Restored {
+        self.restored.get_or_init(|| derive(self))
     }
 
     /// Whether this log takes the Mac of `binding` out ([`Membership::seat_removed`]): the one
@@ -1897,6 +1960,7 @@ impl Log {
     #[cfg(all(test, unix))]
     pub(crate) fn with_membership(mut self, membership: Membership) -> Self {
         self.membership = Arc::new(OnceLock::from(membership));
+        self.restored = Arc::default();
         self
     }
 
@@ -1969,7 +2033,11 @@ impl Log {
             .iter()
             .enumerate()
             .filter(|(i, _)| (keep[i / 64] >> (i % 64)) & 1 == 1)
-            .map(|(_, r)| r.clone())
+            .map(|(_, r)| {
+                #[cfg(test)]
+                CLOSURE_RECORDS.set(CLOSURE_RECORDS.get() + 1);
+                r.clone()
+            })
             .collect()
     }
 
@@ -2155,6 +2223,7 @@ impl Log {
         // whose cache let go of it extends its last chunk in place.
         self.membership = Arc::default();
         self.effective = Arc::default();
+        self.restored = Arc::default();
         #[cfg(test)]
         let carried = eval::MUTANT.get() == Some(eval::Mutant::CarryAcross(record.kind()));
         #[cfg(not(test))]

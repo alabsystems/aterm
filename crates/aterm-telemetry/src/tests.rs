@@ -33,6 +33,7 @@ fn row(at_ms: u64, kind: Kind, wall: u64) -> Row {
         dir: Some(Digest::dir("/w/aterm")),
         label: row::label("/usr/local/bin/targo"),
         sid: Some("s-1a2b".to_owned()),
+        on: None,
         host: "m14".to_owned(),
         facts: facts().digest(),
         wall_ms: Fig::Known(wall),
@@ -66,6 +67,42 @@ fn a_row_reads_back_as_written() {
     r.key = None;
     assert!(r.line().contains(" key=- "), "{}", r.line());
     assert_eq!(parse_line(&r.line()), Some(Line::Row(r)));
+}
+
+#[test]
+fn a_fleet_row_names_the_mac_it_ran_on_and_a_reader_before_it_keeps_the_row() {
+    for kind in [Kind::Build, Kind::Test, Kind::Task] {
+        let mut r = row(9, kind.clone(), 3);
+        assert_eq!(
+            parse_line(&r.line()),
+            Some(Line::Row(r.clone())),
+            "{kind:?}"
+        );
+        assert!(!r.line().contains(" on="), "no on= unless known");
+        r.on = Some("0123456789abcdef0123456789abcdef".to_owned());
+        let line = r.line();
+        assert!(
+            line.contains(" on=0123456789abcdef0123456789abcdef host=m14 "),
+            "{line}"
+        );
+        assert_eq!(parse_line(&line), Some(Line::Row(r.clone())));
+    }
+    // What a reader that predates a kind or a key does with them, as one before TM-1 did with
+    // `build`, `test`, `task` and `on=`: it keeps the row under the kind's word and skips the key.
+    let newer = row(9, Kind::Other("probe".to_owned()), 3);
+    let body = newer.body().replace(" host=", " later=word host=");
+    assert_eq!(
+        parse_line(&crate::row::seal(body)),
+        Some(Line::Row(newer)),
+        "a newer writer's row reads as its kind's word, its unknown key skipped"
+    );
+    let mut bad = row(9, Kind::Task, 3).body();
+    bad = bad.replace(" host=", " on=a/b host=");
+    assert_eq!(
+        parse_line(&crate::row::seal(bad)),
+        None,
+        "an on= no word spells"
+    );
 }
 
 #[test]

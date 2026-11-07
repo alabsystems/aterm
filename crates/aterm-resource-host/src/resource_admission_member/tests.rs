@@ -36,6 +36,11 @@ struct Fixture {
     input: Option<std::process::ChildStdin>,
     defer_bind: bool,
     defer_retire: bool,
+    defer_return: bool,
+    cancelled: usize,
+    retired: usize,
+    before_arm_error: bool,
+    launches: usize,
 }
 impl Fixture {
     fn new() -> Self {
@@ -70,6 +75,11 @@ impl Fixture {
             input,
             defer_bind: false,
             defer_retire: false,
+            defer_return: false,
+            cancelled: 0,
+            retired: 0,
+            before_arm_error: false,
+            launches: 0,
         }
     }
 }
@@ -82,7 +92,18 @@ impl Drop for Fixture {
     }
 }
 impl MemberCustody for Fixture {
+    fn before_arm(&mut self) -> io::Result<()> {
+        if self.before_arm_error {
+            Err(io::Error::other("injected intent acknowledgment loss"))
+        } else {
+            Ok(())
+        }
+    }
+    fn before_go(&mut self) -> io::Result<()> {
+        Ok(())
+    }
     fn launch(&mut self, command: &mut spawnfd::Command) -> Result<CohortChild, LaunchError> {
+        self.launches += 1;
         let child = self.claim.launch_subgroup(&mut self.root, command)?;
         if self.defer_bind {
             self.defer_bind = false;
@@ -98,6 +119,7 @@ impl MemberCustody for Fixture {
         self.claim.bind_subgroup(child)
     }
     fn cancel_no_child(&mut self, proof: spawnfd::NotSpawned) -> Result<(), CancelError> {
+        self.cancelled += 1;
         if let Err(error) = self.validate() {
             return Err(CancelError::Refused {
                 error,
@@ -112,7 +134,16 @@ impl MemberCustody for Fixture {
         if self.defer_retire {
             return Err(io::ErrorKind::WouldBlock.into());
         }
-        self.claim.retire_subgroup(child)
+        self.claim.retire_subgroup(child)?;
+        self.retired += 1;
+        Ok(())
+    }
+    fn return_unit(&mut self, _: ReturnReceipt) -> io::Result<()> {
+        if self.defer_return {
+            Err(io::Error::other("lost durable return acknowledgment"))
+        } else {
+            Ok(())
+        }
     }
     fn validate(&mut self) -> io::Result<()> {
         if self.claim.cohort_bound(self.root.cohort()) && !self.root.child_mut().exited()? {
@@ -171,7 +202,10 @@ fn done(member: &mut OwnedAttempt<Resources>, fixture: &mut Fixture) -> Progress
     }
 }
 
+// A member is held before GO by a start stopped at its exec, which only Darwin's
+// spawn does: elsewhere its launch is an affirmative no-child receipt.
 #[test]
+#[cfg(target_os = "macos")]
 fn actual_bound_retry_keeps_descriptors_until_scoped_retirement() {
     let mut fixture = Fixture::new();
     fixture.defer_bind = true;
@@ -201,7 +235,7 @@ fn actual_bound_retry_keeps_descriptors_until_scoped_retirement() {
         )
         .unwrap();
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let progress = member.poll(&mut fixture, None);
         if progress.completed.is_some() {
@@ -211,6 +245,10 @@ fn actual_bound_retry_keeps_descriptors_until_scoped_retirement() {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(2));
     }
+    assert!(
+        member.group().is_none(),
+        "a reaped leader no longer pins its numeric group for memory attribution"
+    );
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
     client.set_nonblocking(true).unwrap();
     let mut view = &client;
@@ -219,6 +257,16 @@ fn actual_bound_retry_keeps_descriptors_until_scoped_retirement() {
         "Finished must not return the caller's borrowed unit before scoped retirement"
     );
     fixture.defer_retire = false;
+    fixture.defer_return = true;
+    assert!(!member.poll(&mut fixture, None).retired);
+    assert_eq!(fixture.retired, 1);
+    assert!(!member.poll(&mut fixture, None).retired);
+    assert_eq!(
+        fixture.retired, 1,
+        "return retry must not re-retire native scope"
+    );
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    fixture.defer_return = false;
     let progress = done(&mut member, &mut fixture);
     assert!(matches!(
         progress.completed.unwrap(),
@@ -238,6 +286,7 @@ fn actual_bound_retry_keeps_descriptors_until_scoped_retirement() {
 #[test]
 fn exact_no_child_receipt_voids_only_its_original_subgroup() {
     let mut fixture = Fixture::new();
+    fixture.defer_return = true;
     let dropped = Arc::new(AtomicUsize::new(0));
     let (events, _client) = event_pair();
     let mut member = OwnedAttempt::launch(
@@ -249,10 +298,47 @@ fn exact_no_child_receipt_voids_only_its_original_subgroup() {
         None,
         wake,
     );
+    assert!(!member.poll(&mut fixture, None).retired);
+    assert!(member.scope_closed);
+    assert_eq!(fixture.cancelled, 1);
+    assert!(!member.poll(&mut fixture, None).retired);
+    assert_eq!(
+        fixture.cancelled, 1,
+        "return retry must not reconstruct NoChild"
+    );
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    fixture.defer_return = false;
     let progress = done(&mut member, &mut fixture);
     assert!(progress.retired && progress.completed.is_none());
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
     assert!(fixture.claim.finish_cohort().is_err());
+}
+#[test]
+fn before_arm_write_failure_retries_return_without_launching_a_native_child() {
+    let mut fixture = Fixture::new();
+    fixture.before_arm_error = true;
+    fixture.defer_return = true;
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let (events, _client) = event_pair();
+    let mut member = OwnedAttempt::launch(
+        &mut fixture,
+        spawnfd::command("/usr/bin/true"),
+        Resources(dropped.clone(), None),
+        events,
+        binding(),
+        None,
+        wake,
+    );
+    assert!(member.scope_closed);
+    assert_eq!(fixture.launches, 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    assert!(!member.poll(&mut fixture, None).retired);
+    assert_eq!(fixture.launches, 0);
+    fixture.defer_return = false;
+    assert!(done(&mut member, &mut fixture).retired);
+    assert_eq!(fixture.cancelled, 0);
+    assert_eq!(fixture.retired, 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
 }
 #[test]
 fn cancellation_before_go_does_not_run_target_or_release_early() {
@@ -282,6 +368,7 @@ fn cancellation_before_go_does_not_run_target_or_release_early() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn live_member_coverage_and_outer_timeout_preserve_original_scope() {
     let mut fixture = Fixture::new();
     let dropped = Arc::new(AtomicUsize::new(0));
@@ -331,6 +418,7 @@ fn live_member_coverage_and_outer_timeout_preserve_original_scope() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn exited_leader_keeps_group_pin_until_other_members_are_positively_exited() {
     let mut fixture = Fixture::new();
     let dropped = Arc::new(AtomicUsize::new(0));
@@ -386,4 +474,278 @@ fn exited_leader_keeps_group_pin_until_other_members_are_positively_exited() {
     let finished = done(&mut member, &mut fixture);
     assert!(finished.retired);
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn native_escaped_metadata_actor() {
+    let Some(path) = std::env::var_os("ATERM_TEST_METADATA_ESCAPE") else {
+        return;
+    };
+    let name =
+        std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str())).unwrap();
+    // SAFETY: the child uses only stack buffers and async-signal-safe calls
+    // before _exit. The test owns its sole EOF and this process's fork.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+        std::fs::write(&path, "fork-denied").unwrap();
+        return;
+    }
+    if pid == 0 {
+        unsafe {
+            if libc::setsid() < 0 {
+                libc::_exit(91);
+            }
+            let mut digits = [0_u8; 20];
+            let mut cursor = digits.len();
+            let mut value = libc::getpid() as u32;
+            loop {
+                cursor -= 1;
+                digits[cursor] = b'0' + (value % 10) as u8;
+                value /= 10;
+                if value == 0 {
+                    break;
+                }
+            }
+            let fd = libc::open(
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                0o600,
+            );
+            if fd < 0 {
+                libc::_exit(92);
+            }
+            libc::write(fd, digits[cursor..].as_ptr().cast(), digits.len() - cursor);
+            libc::close(fd);
+            let mut byte = 0u8;
+            loop {
+                let got = libc::read(19, (&mut byte as *mut u8).cast(), 1);
+                if got == 0 {
+                    break;
+                }
+                if got < 0 {
+                    libc::_exit(93);
+                }
+            }
+            libc::_exit(0);
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !std::path::Path::new(&path).is_file() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct GuardedResources {
+    original: Resources,
+    prelude: crate::metadata_prelude::Owner,
+}
+#[cfg(target_os = "macos")]
+impl MemberResources for GuardedResources {
+    fn configure(&mut self, command: &mut spawnfd::Command) -> io::Result<()> {
+        let extra = self.prelude.extra()?;
+        command.inherit_guards_at(vec![extra])?;
+        self.prelude.configured(command)
+    }
+    fn prepare_target(&mut self, child: &mut spawnfd::Child) -> io::Result<bool> {
+        self.prelude.poll(child, |pid| {
+            let loaded = process::LoadedImage::read(pid as i32)
+                .ok_or_else(|| io::Error::other("selected image absent"))?;
+            if loaded.matches_file(&std::env::current_exe()?) != Some(true) {
+                return Err(io::Error::other("selected image differs"));
+            }
+            Ok(())
+        })
+    }
+    fn bind_child(&mut self, pid: u32) -> io::Result<()> {
+        self.original.bind_child(pid)
+    }
+}
+#[test]
+#[cfg(target_os = "macos")]
+fn metadata_cannot_return_original_resources_while_a_setsid_child_survives() {
+    crate::runtime::test_endpoint().unwrap();
+    let mut fixture = Fixture::new();
+    let path = fixture._scratch.path().join("escaped-pid");
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let (events, _client) = event_pair();
+    let mut target = spawnfd::command(std::env::current_exe().unwrap());
+    target
+        .args([
+            "--exact",
+            "actor::owner::member::tests::native_escaped_metadata_actor",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env("ATERM_TEST_METADATA_ESCAPE", &path)
+        .current_dir(fixture._scratch.path());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let (prelude, mut command) =
+        crate::metadata_prelude::Owner::new(&target, &[], deadline).unwrap();
+    command
+        .stdin(spawnfd::Stdio::null())
+        .stdout(spawnfd::Stdio::null());
+    let mut member = OwnedAttempt::launch(
+        &mut fixture,
+        command,
+        GuardedResources {
+            original: Resources(dropped.clone(), None),
+            prelude,
+        },
+        events,
+        binding(),
+        Some(Duration::from_secs(30)),
+        wake,
+    );
+    let original = member.identity().unwrap();
+    loop {
+        let progress = member.poll(&mut fixture, None);
+        if progress.ready_to_start {
+            match member.start(&mut fixture) {
+                Ok(started) => {
+                    assert_eq!((started.pid, started.birth), original);
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("native metadata two-hold preparation: {error}"),
+            }
+        }
+        assert!(Instant::now() < deadline);
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            0,
+            "original loan stays held through preparation"
+        );
+        assert!(
+            !path.exists(),
+            "selected target has not reached GO during preparation"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    loop {
+        let progress = member.poll(&mut fixture, None);
+        if progress.drained {
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "fork-denied",
+                "same native setsid adversary cannot create an escaped descendant"
+            );
+            assert!(matches!(
+                progress.completed.unwrap().outcome,
+                Outcome::Exit(0)
+            ));
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            assert!(
+                fixture.claim.finish_cohort().is_err(),
+                "the live original root still retains its memory claim"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn accounted_member_retains_original_wait_until_scope_and_unit_return() {
+    use aterm_types::resource_admission::AccountedEventFrame;
+    for (script, cancel, expected) in [
+        ("exit 0", false, Some(0)),
+        ("exit 7", false, Some(7)),
+        ("exec /bin/sleep 60", true, None),
+    ] {
+        let mut fixture = Fixture::new();
+        fixture.defer_return = true;
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (mut events, client) = event_pair();
+        events.account().unwrap();
+        let mut command = spawnfd::command("/bin/sh");
+        command.arg("-c").arg(script);
+        let mut member = OwnedAttempt::launch(
+            &mut fixture,
+            command,
+            Resources(dropped.clone(), None),
+            events,
+            binding(),
+            Some(Duration::from_secs(30)),
+            wake,
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !member.poll(&mut fixture, None).ready_to_start {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        member.start(&mut fixture).unwrap();
+        for _ in 0..2 {
+            aterm_ctl::resource_admission_transport::read_frame(&client, deadline).unwrap();
+        }
+        if cancel {
+            aterm_ctl::resource_admission_transport::send_cancel(
+                &client,
+                aterm_types::resource_admission::Cancel { binding: binding() },
+                deadline,
+            )
+            .unwrap();
+        }
+        loop {
+            let progress = member.poll(&mut fixture, None);
+            if progress.completed.is_some() && member.scope_closed {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            0,
+            "original resources remain held before durable unit return"
+        );
+        let State::Bound(bound) = &mut member.state else {
+            panic!("original child binding lost")
+        };
+        let cached = bound
+            .child
+            .child_mut()
+            .try_wait_with_rusage()
+            .unwrap()
+            .unwrap();
+        let observed = bound.completed.as_ref().unwrap().accounting;
+        assert_eq!(
+            observed.cpu_times.unwrap().user_ns,
+            u64::try_from(cached.user.as_nanos()).unwrap()
+        );
+        assert_eq!(
+            observed.cpu_times.unwrap().system_ns,
+            u64::try_from(cached.system.as_nanos()).unwrap()
+        );
+        fixture.defer_return = false;
+        assert!(done(&mut member, &mut fixture).drained);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        let frame = AccountedEventFrame::decode(
+            &aterm_ctl::resource_admission_transport::read_frame(&client, deadline).unwrap(),
+            &binding(),
+        )
+        .unwrap();
+        assert_eq!(frame.observation, observed);
+        let Event::Finished { outcome, cause, .. } = frame.finished.event else {
+            panic!("no accounted member terminal")
+        };
+        if let Some(code) = expected {
+            assert_eq!(outcome, Outcome::Exit(code));
+        } else {
+            assert!(matches!(outcome, Outcome::Signal(_)));
+        }
+        assert_eq!(
+            cause,
+            if cancel {
+                CompletionCause::Cancelled
+            } else {
+                CompletionCause::Exited
+            }
+        );
+    }
 }

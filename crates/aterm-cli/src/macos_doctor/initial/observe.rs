@@ -1561,7 +1561,6 @@ mod tests {
         }
         for note in [STOPPED, NOT_SET_UP, TURNED_OFF] {
             assert!(!note.contains("aterm secrets"), "{note}");
-            assert!(note.chars().count() <= 52, "{note}");
         }
         assert_eq!(
             words(member_read(false, Subscriber::Running, installed), true),

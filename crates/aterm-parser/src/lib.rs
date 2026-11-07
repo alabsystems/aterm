@@ -56,7 +56,7 @@ mod tmux;
 mod utf8;
 mod utf8_simd;
 
-pub use action::{Action, ActionSink, NullSink};
+pub use action::{Action, ActionSink, NullSink, deliver_lines, printable_len};
 pub use carry::{
     CarryRefusal, HOOKED_STRING_CARRY, HookedDcsCarry, OSC_CARRY_CAP, ParserCarry, UTF8_TAIL_MAX,
 };

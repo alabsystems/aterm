@@ -115,7 +115,7 @@ impl Log {
             unreachable!("a log starts at a genesis");
         };
         let binding = request.binding();
-        let membership = self.membership();
+        let membership = self.membership_ref();
         let founder = membership
             .unproved()
             .iter()
@@ -163,7 +163,7 @@ impl Proof {
         authored_ms: u64,
     ) -> Result<Draft> {
         let possession = self.pending.verify(answer)?;
-        let membership = log.membership();
+        let membership = log.membership_ref();
         if !membership.contains(by) {
             return Err(Error::new("only a member lets a listed founder in"));
         }

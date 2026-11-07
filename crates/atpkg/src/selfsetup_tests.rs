@@ -191,6 +191,29 @@ fn uninstall_removes_only_what_it_placed() {
     bundle(&apps.join("aterm.app"), Some("#!/bin/sh\nexit 75\n"));
     a.places.install_dir = Some(apps.clone());
     a.places.store_dir = store.clone();
+    let command = store.join("aterm");
+    let setup = Setup {
+        installed_command: Some(command.clone()),
+        ..Setup::default()
+    };
+    let env = zsh("/usr/bin:/bin");
+    let (ok, out, err) = a.setup(&env, &command, &setup);
+    assert!(ok, "{out}{err}");
+    assert!(!a.home().join(".zshrc").exists());
+    let declaration = aterm_types::installed_command::path(a.home());
+    let recorded = std::fs::read(&declaration).unwrap();
+    assert_eq!(
+        aterm_types::installed_command::Selection::decode(&recorded)
+            .unwrap()
+            .executable(),
+        command
+    );
+    let (ok, _, _) = a.setup(&env, &store.join("backup.sh"), &setup);
+    assert!(!ok, "another executable cannot declare this command");
+    assert_eq!(std::fs::read(&declaration).unwrap(), recorded);
+    a.sweep(None, true);
+    assert!(command.exists());
+    assert_eq!(std::fs::read(&declaration).unwrap(), recorded);
     let (ok, out, err) = a.sweep(None, false);
     let mut left: Vec<String> = std::fs::read_dir(&store)
         .expect("the store dir")
@@ -208,6 +231,10 @@ fn uninstall_removes_only_what_it_placed() {
         "{err}"
     );
     assert!(!ok, "a SKIPPED item is the non-zero exit");
+    assert!(
+        !declaration.exists(),
+        "the removed command's declaration is cleared despite the kept bundle"
+    );
 }
 
 #[test]
@@ -235,12 +262,22 @@ fn a_scoped_uninstall_leaves_what_another_aterm_uses() {
         )
         .expect("link");
     }
+    let kept_command = home.join("Applications/aterm.app/Contents/MacOS/aterm");
+    exe(&kept_command, "#!/bin/sh\necho 'aterm 0.0.0'\n");
+    aterm_types::installed_command::record(a.home(), &kept_command, &kept_command).unwrap();
+    let declaration = aterm_types::installed_command::path(a.home());
+    let recorded = std::fs::read(&declaration).unwrap();
     bundle(&home.join("aterm.app"), Some(&atpkg));
     // The sweep asks this atpkg `--version` (no sweep of it runs), under a minute's wait.
     aterm_spec::wait::first_exec(&home.join("aterm.app/Contents/MacOS/atpkg"), &["--version"]);
     a.places.install_dir = Some(home.clone());
     let (ok, out, err) = a.sweep(None, false);
     assert!(ok, "{out}{err}");
+    assert_eq!(
+        std::fs::read(&declaration).unwrap(),
+        recorded,
+        "another retained installation keeps its declaration"
+    );
     assert!(
         !swept.exists(),
         "the other aterm's store was not swept: {out}"
@@ -325,12 +362,9 @@ fn an_uninstall_keeps_what_a_damaged_aterm_may_use() {
 
 #[test]
 fn shell_setup_selects_the_cli_before_an_inherited_bundle_and_preserves_the_profile() {
+    let zsh = aterm_spec::host::need_tool("zsh");
     let fish = aterm_spec::host::need_tool("fish");
-    for shell in [
-        Path::new("/bin/zsh"),
-        Path::new("/bin/bash"),
-        fish.as_path(),
-    ] {
+    for shell in [zsh.as_path(), Path::new("/bin/bash"), fish.as_path()] {
         let is_fish = shell.file_name().is_some_and(|name| name == "fish");
         let mut account = Account::new("selected-cli");
         account.places.bin_dir = account.home().join("CLI $selected `app` 'links'");

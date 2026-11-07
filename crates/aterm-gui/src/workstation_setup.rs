@@ -66,6 +66,12 @@ pub(crate) fn send_setup_wake(wake: Wake) -> bool {
         .is_some_and(|proxy| proxy.send_event(wake).is_ok())
 }
 
+/// Wake nonblocking maintenance after its worker ends, including while unwinding.
+/// A closed or not-yet-registered window simply has no receiver.
+pub fn wake_host_maintenance() {
+    let _ = send_setup_wake(Wake::HostMaintenance);
+}
+
 /// The window's wake once no macOS dialog of this process is up
 /// ([`aterm_types::macos_setup::on_no_macos_dialog_for_window`]): it runs in the last dialog's
 /// drop, on whichever thread let it go, so it only posts [`Wake::NoMacosDialog`].
@@ -312,6 +318,8 @@ pub(crate) enum PagePress {
 pub(crate) struct Host {
     startup: Option<fn() -> bool>,
     startup_retry: Option<Instant>,
+    maintenance: Option<crate::HostMaintenance>,
+    maintenance_due: Option<Instant>,
     request: Option<Request>,
     unified: bool,
     permissions: PermissionGate,
@@ -408,6 +416,10 @@ pub(crate) struct Host {
 }
 
 impl Host {
+    pub(crate) fn with_maintenance(mut self, maintenance: Option<crate::HostMaintenance>) -> Self {
+        self.maintenance = maintenance;
+        self
+    }
     /// Whether the elevation's other steps are to be read now
     /// ([`crate::clt_install::read_root_steps`]), once: only when the window's wake proxy is
     /// registered (`registered`), as the reading's answer is a wake that a window without its
@@ -480,6 +492,8 @@ impl Host {
             unified: startup.is_some(),
             startup,
             startup_retry: None,
+            maintenance: None,
+            maintenance_due: None,
             request: None,
             permissions: PermissionGate::default(),
             proxy_registered: false,
@@ -532,6 +546,7 @@ impl Host {
             .map(|_| now + Duration::from_millis(250))
             .into_iter()
             .chain(self.startup_retry)
+            .chain(self.maintenance_due)
             .min()
     }
 
@@ -557,6 +572,7 @@ impl Host {
     }
 
     fn start(&mut self, now: Instant) {
+        self.maintenance_due = self.maintenance.as_mut().and_then(|maintain| maintain());
         if self.startup_retry.is_some_and(|retry| retry > now) {
             return;
         }
@@ -1257,6 +1273,30 @@ mod tests {
         assert_eq!(ATTEMPTS.get(), 2);
         assert!(host.startup.is_none());
         assert_eq!(host.deadline(now), None);
+    }
+
+    #[test]
+    fn host_maintenance_survives_startup_and_keeps_only_its_owed_deadline() {
+        let now = Instant::now();
+        let due = now + Duration::from_secs(5);
+        let mut first = true;
+        let mut host = Host::default().with_maintenance(Some(Box::new(move || {
+            std::mem::take(&mut first).then_some(due)
+        })));
+        host.startup = Some(|| true);
+        host.start(now);
+        assert!(host.startup.is_none());
+        assert_eq!(host.deadline(now), Some(due));
+        host.start(due);
+        assert_eq!(
+            host.deadline(due),
+            None,
+            "a healthy keeper adds no idle clock"
+        );
+        assert!(
+            host.maintenance.is_some(),
+            "setup completion retains the host's owner"
+        );
     }
 
     #[test]

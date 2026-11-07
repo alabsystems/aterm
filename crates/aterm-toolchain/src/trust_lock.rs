@@ -691,13 +691,7 @@ mod tests {
         std::fs::create_dir_all(&bin).expect("mkdir");
         std::fs::write(ready_marker(prefix, build), "ok\n").expect("ready");
         let targo = bin.join(tool_file("targo"));
-        std::fs::write(&targo, b"#!/bin/sh\nexit 0\n").expect("write");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&targo, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-        }
+        crate::test_script::script(&targo, "#!/bin/sh\nexit 0\n");
         if let Some(root) = root {
             write_tree_root_record(&build_dir(prefix, build), root).expect("record");
         }
@@ -804,18 +798,12 @@ mod tests {
         let bin = scratch("trust-lock-commit").join("bin");
         std::fs::create_dir_all(&bin).expect("mkdir");
         let trustc = bin.join("trustc");
-        std::fs::write(
+        crate::test_script::script(
             &trustc,
-            format!("#!/bin/sh\necho 'rustc 1.101.0-dev'\necho 'commit-hash: {COMMIT}'\n"),
-        )
-        .expect("write");
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&trustc, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-        }
+            &format!("#!/bin/sh\necho 'rustc 1.101.0-dev'\necho 'commit-hash: {COMMIT}'\n"),
+        );
         assert_eq!(compiler_commit(&bin).as_deref(), Some(COMMIT));
-        std::fs::write(&trustc, "#!/bin/sh\necho 'commit-hash: unknown'\n").expect("write");
+        crate::test_script::script(&trustc, "#!/bin/sh\necho 'commit-hash: unknown'\n");
         assert_eq!(compiler_commit(&bin), None);
     }
 }

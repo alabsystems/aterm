@@ -140,7 +140,7 @@ fn measure(json_out: Option<&Path>, sustained: bool, catalog: bool) -> Result<St
         "measurement": measurement,
     });
     if let Some(path) = json_out {
-        crate::write_fresh(path, format!("{report}\n"))
+        super::publication::publish_named(path, format!("{report}\n"))
             .map_err(|error| format!("could not write {}: {error}", path.display()))?;
         Ok(format!("{summary}; report in {}", path.display()))
     } else {

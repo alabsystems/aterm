@@ -470,6 +470,26 @@ fn digest(sha256: &str) -> String {
     )
 }
 
+/// The PowerShell that sets `$arguments`, the Build Tools bootstrapper's argument list: the
+/// bootstrapper's `modify` first where the Build Tools are installed (a plan that adds a
+/// component), then the install's words and every one of [`VS_COMPONENTS`]. `$verb` is made an
+/// array whatever the branch: an `if` statement's lone `@('modify')` unrolls to a string, and a
+/// string plus an array is one string ("modify--quiet --wait …"), which the bootstrapper does not
+/// read as its verb.
+#[must_use]
+pub fn vs_arguments() -> String {
+    let adds: Vec<String> = VS_COMPONENTS
+        .iter()
+        .flat_map(|c| ["'--add'".to_string(), ps_quote(c)])
+        .collect();
+    format!(
+        "$verb = @(if (Test-Path (Join-Path {path} 'Common7\\Tools\\VsDevCmd.bat')) {{ 'modify' }})\n\
+         $arguments = $verb + @('--quiet','--wait','--norestart','--nocache','--installPath',{path},{adds})\n",
+        path = ps_quote(VS_PATH),
+        adds = adds.join(","),
+    )
+}
+
 /// Where the guest keeps Webster's Second (`web2`), the word list aterm-lexicon's dictionary
 /// gates are curated against: Windows ships none, so the lane lays this Mac's copy
 /// ([`crate::linux_guest::WEB2`]) at the Windows place aterm_uds's `web2` row names.
@@ -568,10 +588,6 @@ pub fn provision_plan(web2: Option<&str>) -> Vec<Step> {
         digest(wsl_sha),
         want = ps_quote(&format!("{wsl_version}.0")),
     );
-    let adds: Vec<String> = VS_COMPONENTS
-        .iter()
-        .flat_map(|c| ["'--add'".to_string(), ps_quote(c)])
-        .collect();
     let requires: Vec<String> = VS_COMPONENTS[1..].iter().map(|c| ps_quote(c)).collect();
     let vs = format!(
         "{PREAMBLE}$vswhere = Join-Path ${{env:ProgramFiles(x86)}} 'Microsoft Visual Studio\\Installer\\vswhere.exe'\n\
@@ -579,8 +595,8 @@ pub fn provision_plan(web2: Option<&str>) -> Vec<Step> {
          if (-not (Have)) {{\n{dl}\
          $sig = Get-AuthenticodeSignature $f\n\
          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {{ throw \"$f is not signed by Microsoft: $($sig.Status)\" }}\n\
-         $verb = if (Test-Path (Join-Path {path} 'Common7\\Tools\\VsDevCmd.bat')) {{ @('modify') }} else {{ @() }}\n\
-         $p = Start-Process -FilePath $f -ArgumentList ($verb + @('--quiet','--wait','--norestart','--nocache','--installPath',{path},{adds})) -Wait -PassThru\n\
+         {arguments}\
+         $p = Start-Process -FilePath $f -ArgumentList $arguments -Wait -PassThru\n\
          if ($p.ExitCode -notin 0, 3010) {{ throw \"the Build Tools installer exited $($p.ExitCode)\" }}\n\
          if (-not (Have)) {{ throw 'the Build Tools installed without every component the plan names' }}\n}}\n\
          if (-not (Test-Path {clang})) {{ throw 'no arm64 clang.exe at {llvm}' }}\n\
@@ -588,8 +604,7 @@ pub fn provision_plan(web2: Option<&str>) -> Vec<Step> {
          & {clang} --version\n",
         req = requires.join(" "),
         dl = download(VS_BOOTSTRAPPER, "vs_BuildTools.exe"),
-        path = ps_quote(VS_PATH),
-        adds = adds.join(","),
+        arguments = vs_arguments(),
         clang = ps_quote(&format!("{LLVM_BIN}\\clang.exe")),
         llvm = LLVM_BIN.replace('\'', "''"),
     );
@@ -704,6 +719,7 @@ pub fn provision_plan(web2: Option<&str>) -> Vec<Step> {
         desktop_step(),
         japanese_installed_step(),
         wsl_distro_step(),
+        symlink_step(),
     ];
     if let Some(sha) = web2 {
         steps.push(Step {
@@ -718,6 +734,31 @@ pub fn provision_plan(web2: Option<&str>) -> Vec<Step> {
         });
     }
     steps
+}
+
+/// [`RUNNER`] makes a file symbolic link, as `cmd`'s `mklink` makes it unprivileged, once the
+/// plan's Developer Mode step ([`DEVELOPER_MODE_KEY`]) and the restart after it are done: the
+/// tests that plant one then run in the lane rather than end COULD NOT RUN.
+#[must_use]
+pub fn symlink_step() -> Step {
+    let script = format!(
+        "{PREAMBLE}$d = Join-Path $env:TEMP ('aterm-lane-link-' + $PID)\n\
+         New-Item -ItemType Directory -Force -Path $d | Out-Null\n\
+         try {{\n\
+         Set-Content -Path (Join-Path $d 'target') -Value 'lane'\n\
+         $made = cmd /d /c mklink (Join-Path $d 'link') (Join-Path $d 'target') 2>&1\n\
+         if ($LASTEXITCODE -ne 0) {{ throw \"{RUNNER} made no symbolic link (mklink exited $($LASTEXITCODE): $made)\" }}\n\
+         if (-not ((Get-Item (Join-Path $d 'link')).Attributes -band [IO.FileAttributes]::ReparsePoint)) {{ throw 'mklink made no reparse point' }}\n\
+         \"{RUNNER} makes symbolic links: $made\"\n\
+         }} finally {{\n\
+         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $d\n}}\n",
+    );
+    Step {
+        label: "the runner makes a symbolic link",
+        script,
+        runner: true,
+        reboot: false,
+    }
 }
 
 /// The Japanese IME made usable ([`JA_CAPABILITY`]). On a new install Windows leaves the
@@ -1422,9 +1463,15 @@ mod tests {
         assert!(desktop.reboot && !desktop.runner);
         assert_eq!(steps.iter().filter(|s| s.reboot).count(), 1);
         assert_eq!(
-            steps.get(at + 1..at + 3),
-            Some(&[japanese_installed_step(), wsl_distro_step()][..])
+            steps.get(at + 1..at + 4),
+            Some(&[japanese_installed_step(), wsl_distro_step(), symlink_step()][..])
         );
+        let developer = steps
+            .iter()
+            .position(|s| s.script.contains(&ps_quote(DEVELOPER_MODE_KEY)))
+            .unwrap_or_else(|| unreachable!());
+        assert!(developer < at && !steps[developer].runner);
+        assert!(symlink_step().runner);
         assert!(desktop.script.contains("AutoAdminLogon -Value '1'"));
         assert!(
             desktop
@@ -1448,6 +1495,146 @@ mod tests {
             distro
                 .script
                 .contains(&format!("--import '{}' $dir $f --version 1", WSL_DISTRO.0))
+        );
+    }
+
+    /// Every provisioning step parses as PowerShell, read by the pinned pwsh's parser (Windows
+    /// PowerShell 5.1's grammar for these scripts), so a step whose script does not parse fails
+    /// here rather than in the guest, where it fails provisioning and reverts the VM. Negative
+    /// control: the link step's first throw, `"… exited $LASTEXITCODE: $made"`, which provisioning
+    /// met on 2026-10-29 (`$name:` reads as a scope or drive qualifier), does not parse.
+    #[test]
+    fn every_provisioning_step_parses_as_powershell() {
+        let pwsh = aterm_uds::host::need_tool("pwsh");
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let steps = provision_steps();
+        for (i, s) in steps.iter().enumerate() {
+            std::fs::write(dir.path().join(format!("{i:02}.ps1")), &s.script).expect("a step");
+        }
+        let unparsed = symlink_step().script.replace(
+            "exited $($LASTEXITCODE): $made",
+            "exited $LASTEXITCODE: $made",
+        );
+        assert_ne!(
+            unparsed,
+            symlink_step().script,
+            "the control replaced the line"
+        );
+        std::fs::write(dir.path().join("control.ps1"), unparsed).expect("the control");
+        let check = format!(
+            "Get-ChildItem -Path {} -Filter *.ps1 | Sort-Object Name | ForEach-Object {{ \
+             $errors = $null; \
+             [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors); \
+             $_.BaseName + ' ' + @($errors).Count }}",
+            ps_quote(&dir.path().to_string_lossy())
+        );
+        // A hang detector: the pinned pwsh's first exec on a Mac may wait on its assessment.
+        let out = aterm_uds::deadline::output_within(
+            aterm_uds::spawnfd::command(&pwsh).args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &check,
+            ]),
+            aterm_uds::deadline::FIRST_EXEC_HANG,
+        )
+        .expect("pwsh runs");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut errors: Vec<(String, usize)> = text
+            .lines()
+            .filter_map(|l| l.trim().split_once(' '))
+            .map(|(name, n)| (name.to_owned(), n.parse().expect("a count")))
+            .collect();
+        let control = errors.pop().expect("the control's line");
+        assert_eq!(control.0, "control");
+        assert!(control.1 > 0, "the control parsed: {text}");
+        let want: Vec<(String, usize)> = (0..steps.len()).map(|i| (format!("{i:02}"), 0)).collect();
+        assert_eq!(
+            errors, want,
+            "a step that does not parse (by its index in the plan)"
+        );
+    }
+
+    /// The Build Tools step's argument list as Windows PowerShell builds it, read by the pinned
+    /// pwsh (the same unrolling rules) with `Test-Path` answering whether the Build Tools are
+    /// installed: `modify` comes first, a word of its own, only where they are (a plan that adds
+    /// a component to them), and every component follows `--add`. Negative control: the step's
+    /// line before this fix, `if (…) { @('modify') } else { @() }`, makes the installed list one
+    /// string, `modify--quiet --wait …`, the bootstrapper's verb lost.
+    #[test]
+    fn the_build_tools_take_modify_as_a_word_of_its_own_where_they_are_installed() {
+        let pwsh = aterm_uds::host::need_tool("pwsh");
+        let built = |installed: bool, arguments: &str| {
+            let script = format!(
+                "function Test-Path {{ ${installed} }}\n{arguments}\
+                 $arguments.GetType().Name + ' ' + ($arguments -join '|')\n"
+            );
+            let out = aterm_uds::deadline::output_within(
+                aterm_uds::spawnfd::command(&pwsh).args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &script,
+                ]),
+                aterm_uds::deadline::FIRST_EXEC_HANG,
+            )
+            .expect("pwsh runs");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        let words: Vec<String> = [
+            "--quiet",
+            "--wait",
+            "--norestart",
+            "--nocache",
+            "--installPath",
+            VS_PATH,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(
+            VS_COMPONENTS
+                .iter()
+                .flat_map(|c| ["--add".to_owned(), (*c).to_owned()]),
+        )
+        .collect();
+        assert_eq!(
+            built(true, &vs_arguments()),
+            format!("Object[] modify|{}", words.join("|"))
+        );
+        assert_eq!(
+            built(false, &vs_arguments()),
+            format!("Object[] {}", words.join("|"))
+        );
+        let step = provision_steps()
+            .into_iter()
+            .find(|s| s.script.contains("vs_BuildTools.exe"))
+            .unwrap_or_else(|| unreachable!());
+        assert!(step.script.contains(&vs_arguments()));
+        assert!(
+            step.script
+                .contains("Start-Process -FilePath $f -ArgumentList $arguments -Wait -PassThru")
+        );
+        let before = vs_arguments().replacen(
+            "$verb = @(if (Test-Path (Join-Path 'C:\\BuildTools' 'Common7\\Tools\\VsDevCmd.bat')) { 'modify' })",
+            "$verb = if (Test-Path (Join-Path 'C:\\BuildTools' 'Common7\\Tools\\VsDevCmd.bat')) { @('modify') } else { @() }",
+            1,
+        );
+        assert_ne!(before, vs_arguments(), "the control replaced the line");
+        assert_eq!(
+            built(true, &before),
+            format!("String modify{}", words.join(" "))
         );
     }
 

@@ -8,7 +8,7 @@ use crate::harness::accounts_sync::{self, FleetRoster};
 fn default_adoption_is_kept_in_the_local_fleet_source() {
     let tmp = tmp_dir("adopt-source");
     let env = env_at(&tmp);
-    std::fs::write(env.config.as_ref().unwrap(), "[fleet]\nmachine='m3'\n").unwrap();
+    crate::test_config::write(env.config.as_ref().unwrap(), "[fleet]\nmachine='m3'\n").unwrap();
     let fleet = tmp.path().join(accounts_sync::FLEET_ROSTER_FILE);
     std::fs::write(&fleet, "opt_in='named'\n[[account]]\nlabel='work'\nemail='work@example.test'\nclass='dedicated'\nmachines=['m3']\n").unwrap();
     let (code, out, err) = acc_quiet(
@@ -43,7 +43,7 @@ fn source_case(case: i64) -> (i64, i64, i64) {
     let tmp = tmp_dir("adopt-source-policy");
     let env = env_at(&tmp);
     let config = env.config.as_ref().unwrap();
-    std::fs::write(config, "[fleet]\nmachine='m3'\n").unwrap();
+    crate::test_config::write(config, "[fleet]\nmachine='m3'\n").unwrap();
     let beside = tmp.path().join(accounts_sync::FLEET_ROSTER_FILE);
     let vault = env
         .home
@@ -60,7 +60,7 @@ fn source_case(case: i64) -> (i64, i64, i64) {
     let mut sources = Vec::new();
     match case {
         1 | 9 => {}
-        4 => std::fs::write(
+        4 => crate::test_config::write(
             config,
             "[fleet]\nmachine='m3'\naccounts_source='key:fixture'\n",
         )
@@ -132,7 +132,7 @@ fn source_case(case: i64) -> (i64, i64, i64) {
         assert!(matches!(case, 9 | 11), "unexpected probe");
         assert!(login.is_empty());
         if case == 9 {
-            std::fs::write(
+            crate::test_config::write(
                 config,
                 "[fleet]\nmachine='m3'\naccounts_source='key:changed-during-probe'\n",
             )

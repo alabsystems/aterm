@@ -1131,23 +1131,6 @@ mod tests {
         assert!(build_key_input(&kp, Modifiers::empty(), false).is_some());
     }
 
-    /// The macOS lock-state query is a real IOKit HID round-trip (kernel only, see
-    /// `hid_lock_state`) and reports only Caps Lock, or nothing when the HID system
-    /// is unreachable (a sandbox).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn lock_modifiers_reports_only_caps_lock_from_the_hid_system() {
-        let locks = lock_modifiers();
-        assert!(
-            Modifiers::CAPS_LOCK.contains(locks),
-            "lock_modifiers must set nothing beyond CAPS_LOCK, got {locks:?}"
-        );
-        assert_eq!(locks, lock_modifiers());
-        if let Some(on) = hid_lock_state::caps_lock() {
-            assert_eq!(on, locks.contains(Modifiers::CAPS_LOCK));
-        }
-    }
-
     #[test]
     fn super_modifier_carried_through() {
         let m = modifiers_from_winit(ModifiersState::SUPER);

@@ -13,6 +13,7 @@ fn machine() -> Fixed {
         whole: 30 * crate::floor::GIB,
         written: 0,
         cpu_ns: 0,
+        runnable_ns: 0,
     }])));
     machine
 }
@@ -49,6 +50,7 @@ fn independent_same_custodian_budgets_reserve_before_arm_and_reopen() {
                     whole: 30 * crate::floor::GIB,
                     written: 0,
                     cpu_ns: 0,
+                    runnable_ns: 0,
                 }])
                 .trees(&[std::process::id()])
             ),

@@ -8,17 +8,27 @@ use aterm_types::network_state::{RepairObservation, RepairOutcome, RepairStage};
 #[cfg(test)]
 mod tests;
 
+/// A repair outcome in a person's words, for the lens and the Local lens's observed rows.
+pub(super) const fn outcome_words(outcome: RepairOutcome) -> &'static str {
+    match outcome {
+        RepairOutcome::Failed(_) => "Failed",
+        RepairOutcome::Cancelled => "Stopped before completion",
+        RepairOutcome::Deferred(_) => "Work deferred",
+        RepairOutcome::NotObserved => "Application exchange not observed",
+        RepairOutcome::NoCommonTable => "No common table selected",
+        RepairOutcome::Exchanged => "One application exchange completed",
+    }
+}
+
 pub(super) fn details(observation: Option<&RepairObservation>) -> Vec<(String, String)> {
     let Some(observation) = observation else {
         return vec![("Last repair".into(), "Not reported by this observer".into())];
     };
-    let outcome = match observation.outcome {
-        RepairOutcome::Failed => "Failed",
-        RepairOutcome::Cancelled => "Stopped before completion",
-        RepairOutcome::Deferred => "Work deferred",
-        RepairOutcome::NotObserved => "Application exchange not observed",
-        RepairOutcome::NoCommonTable => "No common table selected",
-        RepairOutcome::Exchanged => "One application exchange completed",
+    let outcome = outcome_words(observation.outcome);
+    // The cause in the same word `aterm db commons-status` and its JSON use.
+    let outcome = match observation.cause() {
+        Some(cause) => format!("{outcome} ({})", cause.word()),
+        None => outcome.to_owned(),
     };
     let stage = observation
         .stage

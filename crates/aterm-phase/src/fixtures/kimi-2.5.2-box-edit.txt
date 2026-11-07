@@ -1,0 +1,51 @@
+# kimi 2.5.2 · MEASURED 2026-11-06, `aterm ctl text` of an `aterm-lab kimi` instance (a private headless aterm, 144x50, aterm 0.161.0, a debug build of main) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login, in a project folder that is no git work tree (so Kimi asks before writing) · after that write was approved, the stub's `tool` mode asks for `Edit` `{path: <proj>/notes-for-the-lab.txt, old_string: "a line", new_string: "an edited line"}`: the approval panel `▶ Apply these edits?`, its diff block headed `+1 -1 <path>` (`renderDiffLinesClustered`), the removed and added rows, four numbered choices and the same key row · the lab's random project dir is spelled /private/tmp/at.H2aa here
+
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                                                            │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                                                            │
+ │  ▐█████▌  Send /help for help information.                                                                                                 │
+ │                                                                                                                                            │
+ │  Directory: /private/tmp/at.H2aa/proj                                                                                                      │
+ │  Session:   session_0d138b75-1ec2-4237-87e7-a9f71e396dfd                                                                                   │
+ │  Model:     lab-model                                                                                                                      │
+ │  Version:   2.5.2                                                                                                                          │
+ │                                                                                                                                            │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+   No session yet — one will be created on your first message.
+
+ ❯ toolstart write the notes
+
+ ● Used Write (/private/tmp/at.H2aa/proj/notes-for-the-lab.txt) · 1 line
+      1  a line
+      2
+
+   Approved: Writing /private/tmp/at.H2aa/proj/notes-for-the-lab.txt
+
+ ● Tool call done. Result: Wrote 7 bytes to /private/tmp/at.H2aa/proj/notes-for-the-lab.txt <system>The change is applied; there is no need to
+   Read the file back to check it.</system>
+
+ ❯ toolstart edit the notes
+
+ ● Using Edit (/private/tmp/at.H2aa/proj/notes-for-the-lab.txt)
+   Preparing changes for /private/tmp/at.H2aa/proj/notes-for-the-lab.txt... 110 B · 0s elapsed
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ▶ Apply these edits?
+
+   +1 -1 /private/tmp/at.H2aa/proj/notes-for-the-lab.txt
+      1 - a line
+      1 + an edited line
+
+   ▶ 1. Approve once
+     2. Approve for this session
+     3. Reject
+     4. Reject with feedback
+
+   ↑/↓ select · 1/2/3/4 choose · ↵ confirm · ctrl+e preview
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ lab-model  …/tmp/at.H2aa/proj                                          /goal next to queue follow-up work while the current goal keeps running
+                                                                                                                        context: 1% (185/97.7k)
+
+
+
+

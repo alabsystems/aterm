@@ -43,6 +43,7 @@ pub(super) fn update(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
     };
     let Some(index) = node
         .strip_prefix("R_")
+        .filter(|digits| !digits.starts_with('0') || *digits == "0")
         .and_then(crate::parse_uint::<u64>)
         .and_then(|id| state.repo_by_id(id))
     else {

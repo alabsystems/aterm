@@ -9,8 +9,9 @@
 //! ground. Each is read in the frame against its ring: the median, channel by channel, of the
 //! frame's pixels on the nearest Chebyshev ring (1 px out, else 2) that are the cell's ground in
 //! the clean frame. A pixel row reads the lower median of its pixels' ratios, and the letter its
-//! worst row. A letter on a dim page keeps [`OWN_SHARE`] of its own reading, the same judge read
-//! on the clean frame.
+//! worst row. A letter on a dim page, its own reading (the same judge read on the clean frame)
+//! under AA, keeps [`OWN_SHARE`] of that reading with a level in hand, and one at AA or over and
+//! under the floor keeps AA with the level ([`super::raster_bar`]).
 //!
 //! [`RingCell`] holds that reading for one cell from the glyph's own pixels (the face's raster,
 //! [`aterm_render::GlyphInk::raster`], laid as the renderer lays text, [`TextLevel`]) and its
@@ -20,9 +21,19 @@
 //! the grounds' luminance alone missed it (round 25, Nyan's `p` at 96.6% of its own reading on
 //! Solarized Dark's wrapped line).
 //!
+//! The judges' law takes the lower of that reading and the cell's whole reading
+//! (`trail-contrast`'s `contrast`, [`RingCell::whole`]): the median of its core ink (each pixel of
+//! the clean glyph [`CORE_SHARE`] of the way from the ground to its extreme, in luminance) against
+//! the median of its bed (each pixel the clean frame shows the ground), channel by channel on the
+//! frame. The ring reads a stroke against what lies beside it, so a tiny glyph's few solid pixels
+//! keep their whole ratio whatever burns elsewhere in the cell: a `.` on paper, a flame standing
+//! over it, read 14.03 round its strokes and 2.49 of its own 3.90 by its core against its bed (the
+//! Cursor card's `README.md` after its Tab).
+//!
 //! [`SOLID_SHARE`]: super::SOLID_SHARE
 //! [`OWN_SHARE`]: super::OWN_SHARE
 
+use aterm_render::glyph_ink::CORE_SHARE;
 use aterm_render::{GlyphRaster, TextLevel};
 use std::sync::Arc;
 
@@ -53,8 +64,11 @@ pub(super) trait FramePx {
     fn at(&self, k: usize) -> u32;
 }
 
-/// How many `(fg, ground)` pairs [`Levels`] keeps.
-const LEVEL_WAYS: usize = 8;
+/// How many `(fg, ground)` pairs [`Levels`] keeps: a frame's lit rows of words, each word in its
+/// own ink. At eight, a flood of the gallery's words, every one a colour of its own, evicted a way
+/// a read: the profile of a GitHub Light flood held 435 of the 2308 main-thread samples the guard
+/// took in finding and filling ways (after-land round 3, whole(c)).
+const LEVEL_WAYS: usize = 64;
 
 /// One `(fg, ground, corrected)` pair's text levels, each worked out when first read.
 type LevelWay = ((u32, u32, bool), Box<[Option<TextLevel>; 256]>);
@@ -92,7 +106,8 @@ impl Levels {
     }
 }
 
-/// The most pixels one solid pixel's ring reads: the Chebyshev ring [`super::RING`] px out.
+/// The most pixels one solid pixel's ring reads: the Chebyshev ring [`super::RING`] px out. The
+/// longest list [`median_of`] orders; a longer one (a core or a bed) it counts.
 const RING_MOST: usize = 8 * super::RING as usize;
 
 /// Everything [`RingCell::read`] reads a neighbourhood from, and so all a [`RingRead`] depends on
@@ -171,6 +186,14 @@ struct RingRead {
     /// Whether some box pixel's colour on the clean frame is not what the frame lays there under
     /// every light: a cursor trail's fill, or a glyph's ink.
     filled: bool,
+    /// The cell's core ink and its bed, as box pixels ([`RingCell::whole`]).
+    core: Box<[u32]>,
+    bed: Box<[u32]>,
+    /// The lower of the whole reading on the clean frame and [`Self::own`], the judges' own
+    /// reading, whose [`super::raster_bar`] the whole reading keeps ([`RingCell::whole_holds`]);
+    /// and the luminance of the clean core's median ink.
+    whole_own: f32,
+    l_core: f32,
 }
 
 impl RingRead {
@@ -187,6 +210,10 @@ impl RingRead {
             l_min: f32::INFINITY,
             ring_text: false,
             filled: false,
+            core: Box::default(),
+            bed: Box::default(),
+            whole_own: f32::INFINITY,
+            l_core: f32::INFINITY,
         }
     }
 }
@@ -218,6 +245,10 @@ pub(super) struct RingCell {
     /// Scratch: a row's ratios.
     ratios: Vec<f32>,
     levels: Levels,
+    /// A test's negative control: the whole reading keeps no bar, each letter read by its ring
+    /// alone, as before after-land's A1 ([`super::CursorGlow::set_letter_guard_whole`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(super) whole_off: bool,
     /// A test's count of the neighbourhoods read anew, not taken from [`Self::reads`].
     #[cfg(test)]
     pub(super) anew: usize,
@@ -240,6 +271,8 @@ impl RingCell {
             ways: Vec::new(),
             next: 0,
         },
+        #[cfg(any(test, debug_assertions))]
+        whole_off: false,
         #[cfg(test)]
         anew: 0,
     };
@@ -386,17 +419,22 @@ impl RingCell {
         // (into `ratios`, which [`Self::read_until`] clears before it reads its own).
         let (x_end, y_end) = ((ring + cw).min(w), (ring + ch).min(h));
         self.ratios.clear();
-        let mut extreme = 1.0f32;
+        let (mut extreme, mut l_extreme) = (1.0f32, l_g);
         for y in ring..y_end {
             for k in y * w + ring..y * w + x_end {
                 if !self.opaque[k] {
                     let lk = lum(self.clean[k]);
                     self.ratios.push(lk);
-                    extreme = extreme.max(ratio(lk, l_g));
+                    let r = ratio(lk, l_g);
+                    if r > extreme {
+                        (extreme, l_extreme) = (r, lk);
+                    }
                 }
             }
         }
         let solid_at = super::SOLID_SHARE * extreme;
+        let core_reach = CORE_SHARE * (l_extreme - l_g).abs();
+        let (mut core, mut bed) = (Vec::new(), Vec::new());
         let (mut solid, mut ring_at, mut rings) = (Vec::new(), Vec::new(), Vec::<u32>::new());
         let mut ring_text = false;
         let mut l_min = f32::INFINITY;
@@ -409,6 +447,11 @@ impl RingCell {
                 }
                 let lk = self.ratios[li];
                 li += 1;
+                if self.ground[k] {
+                    bed.push(k as u32);
+                } else if (lk - l_g).abs() >= core_reach {
+                    core.push(k as u32);
+                }
                 if ratio(lk, l_g) < solid_at {
                     continue;
                 }
@@ -456,14 +499,28 @@ impl RingCell {
             f32::NEG_INFINITY,
             &mut self.ratios,
         );
+        // Its whole reading on the clean frame: the bed is the pixels that frame shows the ground.
+        let l_core = lum(median_of(&core, &Clean(&self.clean)));
+        let whole = if core.is_empty() || bed.is_empty() {
+            f32::INFINITY
+        } else {
+            ratio(l_core, l_g)
+        };
         let filled = base
             .iter()
             .zip(&self.clean)
             .zip(&self.opaque)
             .any(|((b, c), o)| !o && b != c);
-        // What a reading reads: the solid ink and its rings, each pixel once.
+        // What a reading reads: the solid ink and its rings, and the core and its bed, each pixel
+        // once.
         let mut is_read = vec![false; n];
-        for &k in solid.iter().map(|(k, _)| k).chain(&rings) {
+        for &k in solid
+            .iter()
+            .map(|(k, _)| k)
+            .chain(&rings)
+            .chain(&core)
+            .chain(&bed)
+        {
             is_read[k as usize] = true;
         }
         text.retain(|&(k, _)| is_read[k as usize]);
@@ -491,10 +548,15 @@ impl RingCell {
             l_min,
             ring_text,
             filled,
+            core: core.into_boxed_slice(),
+            bed: bed.into_boxed_slice(),
+            whole_own: whole.min(own),
+            l_core,
         }
     }
 
-    /// A test's list of the pixels a reading reads: the solid ink, then each ring.
+    /// A test's list of the pixels a reading reads: the solid ink, then each ring, then the core
+    /// and its bed ([`Self::whole`]).
     #[cfg(test)]
     pub(super) fn read_pixels(&self) -> Vec<usize> {
         let read = self.current();
@@ -502,6 +564,8 @@ impl RingCell {
             .iter()
             .map(|&(k, _)| k)
             .chain(read.rings.iter().copied())
+            .chain(read.core.iter().copied())
+            .chain(read.bed.iter().copied())
             .map(|k| k as usize)
             .collect()
     }
@@ -579,7 +643,7 @@ impl RingCell {
             ratios.clear();
             while i < solid.len() && solid[i].1 == row {
                 let ring = &rings[ring_at[i] as usize..ring_at[i + 1] as usize];
-                let g = ring_median(ring, px);
+                let g = median_of(ring, px);
                 let p = px.at(solid[i].0 as usize) & 0x00FF_FFFF;
                 if (p, g) != (last.0, last.1) {
                     let (li, lg) = (lum(p), lum(g));
@@ -596,6 +660,49 @@ impl RingCell {
         }
         worst
     }
+
+    /// The cell's whole reading on frame `px`: its core ink's median against its bed's (infinite
+    /// with neither). It is the judge's `contrast`, the higher reading of an ordinary letter's two
+    /// and the lower of a glyph so small that its core is mostly antialiased rim.
+    pub(super) fn whole(&self, px: &impl FramePx) -> f32 {
+        let read = self.current();
+        if read.core.is_empty() || read.bed.is_empty() {
+            return f32::INFINITY;
+        }
+        let table = crate::color_math::relative_luminance_table();
+        let lum = |c: u32| crate::color_math::relative_luminance_with(table, c);
+        let (li, lg) = (
+            lum(median_of(&read.core, px)),
+            lum(median_of(&read.bed, px)),
+        );
+        (li.max(lg) + 0.05) / (li.min(lg) + 0.05)
+    }
+
+    /// The bar [`Self::whole`] keeps: [`super::raster_bar`] of the lower of its reading on the
+    /// clean frame and [`Self::own`], the judges' own reading; none under the test's control
+    /// ([`Self::whole_off`]). Worked out at each use, not kept with the read, so the bar's own
+    /// controls (`with_share_over_aa`, `with_aa_unrounded`) reach a neighbourhood read before.
+    fn whole_bar(&self) -> f32 {
+        #[cfg(any(test, debug_assertions))]
+        if self.whole_off {
+            return 0.0;
+        }
+        super::raster_bar(self.current().whole_own)
+    }
+
+    /// Whether frame `px` keeps the letter's whole reading at its bar.
+    pub(super) fn whole_holds(&self, px: &impl FramePx) -> bool {
+        self.whole(px) >= self.whole_bar()
+    }
+
+    /// Whether the whole reading keeps its bar on any frame whose lights add, lifting each pixel
+    /// and no channel of the bed's median past luminance `lg`: the core's ink can only rise.
+    pub(super) fn whole_clears(&self, lg: f32) -> bool {
+        let read = self.current();
+        read.core.is_empty()
+            || read.bed.is_empty()
+            || (lg < read.l_core && (read.l_core + 0.05) / (lg + 0.05) >= self.whole_bar())
+    }
 }
 
 /// A clean frame's pixels, for a neighbourhood's own reading.
@@ -607,28 +714,61 @@ impl FramePx for Clean<'_> {
     }
 }
 
-/// Each channel's median, the upper one of an even count (the judges'), of a ring's pixels on
-/// frame `px`; a ring of one colour is that colour.
+/// Each channel's median of frame `px` over the box pixels `at`, the upper one of an even count
+/// (the judges'); `0` over none. A guarded letter reads one per solid pixel on each share it tries,
+/// the heart of a typed key's emission, so pixels all alike read at once, a ring orders three short
+/// lists on the stack in the pass that reads it, and a core or bed, hundreds of pixels, counts each
+/// channel's values in one pass.
 #[inline]
-fn ring_median(ring: &[u32], px: &impl FramePx) -> u32 {
-    let first = px.at(ring[0] as usize) & 0x00FF_FFFF;
-    let mut chan = [[0u8; RING_MOST]; 3];
-    let mut uniform = true;
-    for (i, &k) in ring.iter().enumerate() {
-        let v = px.at(k as usize);
-        uniform &= v & 0x00FF_FFFF == first;
-        chan[0][i] = (v >> 16) as u8;
-        chan[1][i] = (v >> 8) as u8;
-        chan[2][i] = v as u8;
+fn median_of(at: &[u32], px: &impl FramePx) -> u32 {
+    let Some(&head) = at.first() else {
+        return 0;
+    };
+    let first = px.at(head as usize) & 0x00FF_FFFF;
+    let mid = at.len() / 2;
+    let mut out = 0u32;
+    if at.len() <= RING_MOST {
+        let mut chan = [[0u8; RING_MOST]; 3];
+        let mut uniform = true;
+        for (i, &k) in at.iter().enumerate() {
+            let v = px.at(k as usize);
+            uniform &= v & 0x00FF_FFFF == first;
+            chan[0][i] = (v >> 16) as u8;
+            chan[1][i] = (v >> 8) as u8;
+            chan[2][i] = v as u8;
+        }
+        if uniform {
+            return first;
+        }
+        for (c, sh) in chan.iter_mut().zip([16u32, 8, 0]) {
+            out |= u32::from(*c[..at.len()].select_nth_unstable(mid).1) << sh;
+        }
+        return out;
     }
-    if uniform {
+    if at[1..]
+        .iter()
+        .all(|&k| px.at(k as usize) & 0x00FF_FFFF == first)
+    {
         return first;
     }
-    let (n, mut g) = (ring.len(), 0u32);
-    for (c, sh) in chan.iter_mut().zip([16u32, 8, 0]) {
-        g |= u32::from(*c[..n].select_nth_unstable(n / 2).1) << sh;
+    let mut counts = [[0u32; 256]; 3];
+    for &k in at {
+        let v = px.at(k as usize);
+        counts[0][((v >> 16) & 0xFF) as usize] += 1;
+        counts[1][((v >> 8) & 0xFF) as usize] += 1;
+        counts[2][(v & 0xFF) as usize] += 1;
     }
-    g
+    for (channel, sh) in counts.iter().zip([16u32, 8, 0]) {
+        let mut seen = 0;
+        for (value, &n) in channel.iter().enumerate() {
+            seen += n as usize;
+            if seen > mid {
+                out |= (value as u32) << sh;
+                break;
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -706,9 +846,13 @@ mod tests {
         assert_eq!(k.ring_at, f.ring_at, "{what}: its rings' starts");
         assert_eq!(k.rings, f.rings, "{what}: its rings");
         assert_eq!(k.filled, f.filled, "{what}: whether it is filled");
+        assert_eq!(k.core, f.core, "{what}: its core");
+        assert_eq!(k.bed, f.bed, "{what}: its bed");
         for (a, b, part) in [
             (k.own, f.own, "own reading"),
             (k.l_min, f.l_min, "least ink"),
+            (k.whole_own, f.whole_own, "whole reading's own"),
+            (k.l_core, f.l_core, "core's ink"),
             (kept.own, f.own, "own reading kept"),
             (kept.l_min, f.l_min, "least ink kept"),
         ] {
@@ -729,6 +873,16 @@ mod tests {
         ] {
             assert_eq!(kept.holds(&Px(frame), bar), holds, "{what}: holds {bar}");
         }
+        assert_eq!(
+            kept.whole(&Px(frame)).to_bits(),
+            fresh.whole(&Px(frame)).to_bits(),
+            "{what}: its whole reading"
+        );
+        assert_eq!(
+            kept.whole_holds(&Px(frame)),
+            fresh.whole_holds(&Px(frame)),
+            "{what}: whether its whole reading holds"
+        );
     }
 
     /// A NEIGHBOURHOOD READ BEFORE IS TAKEN AS IT WAS READ, AND ONLY THEN. Over neighbourhoods
@@ -929,6 +1083,136 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// EACH CHANNEL'S MEDIAN IS THE ONE A SORTED LIST READS: the upper one of an even count, each
+    /// channel its own, on both sides of the length where the reader stops ordering and counts,
+    /// with values from all alike to all different.
+    #[test]
+    fn each_channel_s_median_is_the_one_a_sorted_list_reads() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as u32
+        };
+        let lens = (1..=RING_MOST + 2).chain([255, 256, 257, 720, 2880]);
+        for len in lens {
+            for spread in [1u32, 2, 7, 256] {
+                for _ in 0..8 {
+                    let frame: Vec<u32> = (0..len)
+                        .map(|_| {
+                            let (a, b, c) = (next() % spread, next() % spread, next() % spread);
+                            (next() & 0xFF00_0000) | a << 16 | b << 8 | c
+                        })
+                        .collect();
+                    let at: Vec<u32> = (0..len as u32).rev().collect();
+                    let mut want = 0;
+                    for sh in [16u32, 8, 0] {
+                        let mut channel: Vec<u32> =
+                            frame.iter().map(|v| (v >> sh) & 0xFF).collect();
+                        channel.sort_unstable();
+                        want |= channel[len / 2] << sh;
+                    }
+                    assert_eq!(
+                        median_of(&at, &Px(&frame)),
+                        want,
+                        "{len} pixels of {spread} values"
+                    );
+                }
+            }
+        }
+        assert_eq!(median_of(&[], &Px(&[])), 0, "over none");
+    }
+
+    /// A TINY GLYPH'S WHOLE READING IS ITS CORE AGAINST ITS BED, AS THE JUDGES READ IT: a `.` on
+    /// paper. Its solid ink keeps its ring on a frame that lights the cell's upper rows, so the
+    /// ring's reading stays its own; the whole reading (the core's channel medians against the
+    /// bed's) falls to what `trail-contrast`'s `contrast` computes, under its bar, and the frame
+    /// fails [`RingCell::whole_holds`]. Its bar is its own share, the dot's core reading under
+    /// the floor though its solid ink reads far over it.
+    #[test]
+    fn a_tiny_glyph_reads_its_core_against_its_bed() {
+        const PAPER: u32 = 0x00FF_FFFF;
+        const DOT: u32 = 0x001F_2328;
+        const FLAME: u32 = 0x00FF_C080;
+        let (cw, ch, r) = (6usize, 10usize, 2usize);
+        let (w, h) = (cw + 2 * r, ch + 2 * r);
+        let mut dot = vec![0u8; cw * ch];
+        // The real `.` of the Cursor card's `README.md`, its coverage read off the clean frame.
+        dot[7 * cw + 2..7 * cw + 4].copy_from_slice(&[195, 30]);
+        dot[8 * cw + 1..8 * cw + 4].copy_from_slice(&[243, 255, 188]);
+        dot[9 * cw + 1..9 * cw + 4].copy_from_slice(&[205, 252, 100]);
+        let table: RasterTable =
+            vec![Some(GlyphRaster::placed(&dot, cw, (0, 0)).expect("ink"))].into();
+        let blank = Neighbour::Known {
+            ground: PAPER,
+            base: PAPER,
+            glyph: None,
+        };
+        let mut cells = [blank; 9];
+        cells[4] = Neighbour::Known {
+            ground: PAPER,
+            base: PAPER,
+            glyph: Some((0, DOT)),
+        };
+        let mut cell = RingCell::EMPTY;
+        cell.read((w, h), (cw, ch), r, &cells, (&table, false));
+        let clean = cell.clean.clone();
+        assert_eq!(
+            cell.whole_bar(),
+            super::super::raster_bar(cell.whole(&Px(&clean)).min(cell.own)),
+            "the bar is what the whole reading reads on the clean frame"
+        );
+        let own = cell.reading(&Px(&clean));
+        assert!(
+            own > 4.6 && cell.whole_bar() < 4.6,
+            "fixture: the ring reads {own}, the core's bar is {}",
+            cell.whole_bar()
+        );
+        assert!(
+            cell.whole_holds(&Px(&clean)),
+            "the clean frame keeps its bar"
+        );
+        // The upper half of the cell burns; the row over the dot and everything lower does not.
+        let mut frame = clean.clone();
+        for (k, px) in frame.iter_mut().enumerate() {
+            if cell.ground[k] && k / w < r + 6 {
+                *px = FLAME;
+            }
+        }
+        assert_eq!(cell.reading(&Px(&frame)), own, "its ring is untouched");
+        let core: Vec<u32> = cell
+            .current()
+            .core
+            .iter()
+            .map(|&k| frame[k as usize])
+            .collect();
+        let bed: Vec<u32> = cell
+            .current()
+            .bed
+            .iter()
+            .map(|&k| frame[k as usize])
+            .collect();
+        let med = |px: &[u32]| {
+            [16u32, 8, 0].iter().fold(0, |out, &sh| {
+                let mut c: Vec<u32> = px.iter().map(|p| (p >> sh) & 0xff).collect();
+                c.sort_unstable();
+                out | c[c.len() / 2] << sh
+            })
+        };
+        let want = ratio(med(&core), med(&bed));
+        let read = cell.whole(&Px(&frame));
+        assert!(
+            (read - want).abs() < 1e-5,
+            "the cell's whole reading {read}, the judges' {want}"
+        );
+        assert!(
+            !cell.whole_holds(&Px(&frame)),
+            "a flame over the cell takes its bed: the whole reading {read} against its bar {}",
+            cell.whole_bar()
+        );
     }
 
     /// A STROKE READS AGAINST ITS RING'S CHANNEL MEDIANS, AS THE JUDGES READ IT: a cell read from

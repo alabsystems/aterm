@@ -13,8 +13,8 @@ use aterm_net::fleet::{DriveGrant, NodeKey};
 use aterm_uds::CtlStream;
 
 use super::super::{
-    NodeOpenTable, WindowRelays, merge_window_surveys, relay_names, relay_to_window,
-    spawn_node_drive, spawn_node_survey,
+    NodeOpenTable, WindowRelays, activity_of_windows, merge_window_surveys, relay_names,
+    relay_to_window, spawn_node_drive, spawn_node_survey,
 };
 use super::*;
 
@@ -782,4 +782,80 @@ fn a_merged_survey_counts_the_cut_rows_it_sends() {
         "{fitted}"
     );
     assert!(fitted.contains(" instances_read=2\n"), "{fitted}");
+}
+
+/// THE NODE COUNTS EVERY WINDOW'S AGENTS (Fleet Field §11, §14): a survey of each window here,
+/// merged, counts the agents of both windows by their words, listing the one whose sid is a
+/// minted one; with no window here the count is a reading of no agents.
+/// NEGATIVE CONTROL: a window that takes no survey hand-over is no reading: nothing is counted,
+/// so nothing is published and the last count ages out.
+#[test]
+fn the_node_counts_the_agents_of_every_window() {
+    let stand_in = StandIn::start();
+    let (older, newer) = two_pids(&stand_in);
+    let relay = crate::test_scratch::short_dir("activity-two");
+    let minted = "s-00000000000000000001";
+    let _old = TestWindow::open(
+        relay.path(),
+        older,
+        Holds::live(&["s-busy1", minted]),
+        false,
+    );
+    let _new = TestWindow::open(relay.path(), newer, Holds::live(&["s-busy2"]), false);
+    let windows = WindowRelays::new(relay.path().to_path_buf(), Arc::new(Apps { app: None }));
+    let row = activity_of_windows(&windows, 1_793_160_000).expect("both windows answered");
+    assert_eq!(
+        (
+            row.at,
+            row.busy,
+            row.idle,
+            row.waiting,
+            row.walled,
+            row.unknown
+        ),
+        (1_793_160_000, 2, 1, 0, 0, 0)
+    );
+    assert_eq!(
+        row.sessions
+            .iter()
+            .map(|e| (e.sid.to_string(), e.word.to_string()))
+            .collect::<Vec<_>>(),
+        [(minted.to_owned(), "idle".to_owned())]
+    );
+
+    let empty = crate::test_scratch::short_dir("activity-none");
+    let none = WindowRelays::new(empty.path().to_path_buf(), Arc::new(Apps { app: None }));
+    assert_eq!(
+        activity_of_windows(&none, 7).map(|row| (row.at, row.agents())),
+        Some((7, 0)),
+        "no window runs no agent"
+    );
+
+    let refusing = crate::test_scratch::short_dir("activity-refused");
+    let stop = Arc::new(AtomicBool::new(false));
+    let relay_thread = {
+        let (dir, stop) = (refusing.path().to_path_buf(), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            let _ = serve_window_relay_at(
+                &dir,
+                std::process::id(),
+                Some(&stop),
+                hosts_every,
+                |_, _| false,
+            );
+        })
+    };
+    let socket = relay_socket_path(refusing.path(), std::process::id());
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the window's relay", || {
+        super::super::relay_answers(&socket).then_some(())
+    });
+    let refused = WindowRelays::new(refusing.path().to_path_buf(), Arc::new(Apps { app: None }));
+    assert_eq!(
+        activity_of_windows(&refused, 7),
+        None,
+        "a window that took no survey"
+    );
+    stop.store(true, Ordering::Release);
+    let _ = aterm_uds::connect::until(&socket, Instant::now() + Duration::from_millis(100));
+    let _ = relay_thread.join();
 }

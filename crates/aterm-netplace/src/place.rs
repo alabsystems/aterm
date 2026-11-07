@@ -36,6 +36,8 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
+use crate::time::Clock;
+
 /// Distinct authenticated members that must answer within one stay before a network is
 /// remembered as the ALab LAN, and that the fleet book must know: a fleet of one or two Macs, or
 /// two Macs on a café LAN, never makes a network "home".
@@ -54,9 +56,6 @@ pub const SETTLE_MS: u64 = 22_000;
 /// Fleet rounds in one stay that dialled members and heard none before a remembered network,
 /// or a seeded first stay, stops reading as the ALab LAN.
 pub const SILENT_ROUNDS: usize = 2;
-
-/// How recent a member's last answer in this stay must be to count it reachable now.
-pub const REACH_FRESH_MS: u64 = 15 * 60_000;
 
 /// How long a measured internet answer in this stay stands, `ok` or `down`, before the place says
 /// what the path says again (`path-up`, `down`): an `ok` from a turn long ago says nothing of an
@@ -85,7 +84,7 @@ pub const LONE_ARRIVAL_MS: u64 = 2 * 60_000;
 
 /// How stale a remembered network's `confirmed_ms` must be before members answering on it
 /// write it again: the keeper writes its record only when it changed, and a confirmation at
-/// every look (every 10 s at home with no member reachable now) would rewrite it at every look.
+/// every look (every 10 s at home with no member heard yet) would rewrite it at every look.
 /// The time orders which remembered network goes first past [`REMEMBERED_MAX`], which an hour
 /// does not change.
 pub const CONFIRM_EVERY_MS: u64 = 60 * 60_000;
@@ -704,8 +703,6 @@ pub struct Record {
     pub stays: Vec<Stay>,
     /// Networks remembered as the ALab LAN; at most [`REMEMBERED_MAX`].
     pub remembered: Vec<Known>,
-    /// The path monitor's last reading, for a reader that runs none.
-    pub path: Option<PathFacts>,
 }
 
 impl Record {
@@ -878,9 +875,11 @@ pub struct Place {
     pub internet: Internet,
     /// The ALab LAN axis.
     pub alab: Alab,
-    /// Distinct members reachable now (answered in this stay, within [`REACH_FRESH_MS`]).
-    pub reachable: usize,
-    /// Members the fleet book knows, this Mac aside; `None` with no book.
+    /// Distinct members heard in this stay: the evidence [`LEARN_AT`] counts. It counts answers,
+    /// not members up, and no reporter words it: presence says who is up (one-mesh §4.12).
+    pub heard: usize,
+    /// Members the fleet book knows, this Mac aside; `None` with no book. The learning rule
+    /// reads it; no reporter words it.
     pub known: Option<usize>,
     /// The newest member answer on any network: when and on which lane.
     pub last_answer: Option<(u64, Lane)>,
@@ -894,47 +893,44 @@ pub struct Place {
 /// reached through this network's gateway passes too. An answer whose route was not read counts
 /// where its address lies on this subnet. A tunnel's answer took the tunnel's address and counts
 /// for no network.
-fn counts(answer: &Answer, stay: &Stay, route: &RouteFacts, now: u64) -> bool {
+fn counts<const TRACK: bool>(
+    answer: &Answer,
+    stay: &Stay,
+    route: &RouteFacts,
+    clock: &Clock<TRACK>,
+) -> bool {
     answer.began_ms >= stay.start_ms
-        && answer.at_ms <= now.saturating_add(AHEAD_MAX_MS)
+        && clock.admits(answer.at_ms, AHEAD_MAX_MS)
         && match answer.via {
             Some(via) => via == route.address,
             None => answer.addr.is_some_and(|addr| route.on_link(addr)),
         }
 }
 
-/// The distinct members answering in `stay` on `route`, the larger of the two lanes' counts
-/// (their ids are separate spaces), and the same within `REACH_FRESH_MS` of `now`.
-fn members_and_reachable_in(
+/// The distinct members answering in `stay` on `route`: the larger of the two lanes' counts
+/// (their ids are separate spaces).
+fn members_in<const TRACK: bool>(
     evidence: &Evidence,
     stay: &Stay,
     route: &RouteFacts,
-    now: u64,
-) -> (usize, usize) {
-    let mut all_max = 0;
-    let mut fresh_max = 0;
-    let mut all_members: Vec<&str> = Vec::new();
-    let mut fresh_members: Vec<&str> = Vec::new();
+    clock: &Clock<TRACK>,
+) -> usize {
+    let mut most = 0;
+    let mut members: Vec<&str> = Vec::new();
     for lane in [Lane::Fleet, Lane::Commons] {
-        all_members.clear();
-        fresh_members.clear();
-        for answer in &evidence.answers {
-            if answer.lane == lane && counts(answer, stay, route, now) {
-                let m = answer.member.as_str();
-                all_members.push(m);
-                if now.saturating_sub(answer.at_ms) <= REACH_FRESH_MS {
-                    fresh_members.push(m);
-                }
-            }
-        }
-        all_members.sort_unstable();
-        all_members.dedup();
-        fresh_members.sort_unstable();
-        fresh_members.dedup();
-        all_max = all_max.max(all_members.len());
-        fresh_max = fresh_max.max(fresh_members.len());
+        members.clear();
+        members.extend(
+            evidence
+                .answers
+                .iter()
+                .filter(|answer| answer.lane == lane && counts(answer, stay, route, clock))
+                .map(|answer| answer.member.as_str()),
+        );
+        members.sort_unstable();
+        members.dedup();
+        most = most.max(members.len());
     }
-    (all_max, fresh_max)
+    most
 }
 
 /// Fleet rounds in `stay` that heard no member and met only silence ([`Round::blocked`] none):
@@ -942,7 +938,11 @@ fn members_and_reachable_in(
 /// refused, or that a host answered and refused, is no evidence that the members are elsewhere:
 /// at home behind such a refusal, or with members refusing this Mac's key, the remembered network
 /// stays the ALab LAN.
-fn silent_rounds(evidence: &Evidence, stay: &Stay, now: u64) -> usize {
+fn silent_rounds<const TRACK: bool>(
+    evidence: &Evidence,
+    stay: &Stay,
+    clock: &Clock<TRACK>,
+) -> usize {
     evidence
         .rounds
         .iter()
@@ -951,7 +951,7 @@ fn silent_rounds(evidence: &Evidence, stay: &Stay, now: u64) -> usize {
                 && round.answered == 0
                 && round.blocked == 0
                 && round.began_ms >= stay.start_ms
-                && round.at_ms <= now.saturating_add(AHEAD_MAX_MS)
+                && clock.admits(round.at_ms, AHEAD_MAX_MS)
         })
         .count()
 }
@@ -960,10 +960,10 @@ fn silent_rounds(evidence: &Evidence, stay: &Stay, now: u64) -> usize {
 /// [`LEARN_AT`] members answered this Mac within [`SEED_WITHIN_MS`] from addresses on this
 /// subnet while this Mac was on this very network ([`BookMember::network`]), so a network
 /// numbered like home behind another router seeds nothing.
-fn seeded(
+fn seeded<const TRACK: bool>(
     book: Option<&Book>,
     (route, network): (&RouteFacts, Option<&NetworkId>),
-    now: u64,
+    clock: &Clock<TRACK>,
 ) -> bool {
     let Some(network) = network.filter(|network| network.is_strong()) else {
         return false;
@@ -975,8 +975,7 @@ fn seeded(
             .filter(|member| member.addr.is_some_and(|addr| route.on_link(addr)))
             .filter(|member| {
                 member.answered_ms.is_some_and(|at| {
-                    at <= now.saturating_add(AHEAD_MAX_MS)
-                        && now.saturating_sub(at) <= SEED_WITHIN_MS
+                    clock.admits(at, AHEAD_MAX_MS) && !clock.older_than(at, SEED_WITHIN_MS)
                 })
             })
             .count()
@@ -986,23 +985,21 @@ fn seeded(
 
 /// The internet axis in `stay`: the newest measured note in it while [`INTERNET_FRESH_MS`] old,
 /// else what the path says.
-fn internet_in(
+fn internet_in<const TRACK: bool>(
     evidence: &Evidence,
     stay: Option<&Stay>,
     path: Option<PathFacts>,
-    now: u64,
+    clock: &Clock<TRACK>,
 ) -> Internet {
     let measured = stay.and_then(|stay| {
         evidence
             .internet
             .iter()
-            .filter(|note| {
-                note.at_ms >= stay.start_ms && note.at_ms <= now.saturating_add(AHEAD_MAX_MS)
-            })
+            .filter(|note| note.at_ms >= stay.start_ms && clock.admits(note.at_ms, AHEAD_MAX_MS))
             .max_by_key(|note| note.at_ms)
     });
     match measured {
-        Some(note) if now.saturating_sub(note.at_ms) <= INTERNET_FRESH_MS => Internet {
+        Some(note) if !clock.older_than(note.at_ms, INTERNET_FRESH_MS) => Internet {
             state: if note.ok {
                 InternetState::Ok
             } else {
@@ -1040,7 +1037,12 @@ fn internet_in(
 /// and nothing came between, as a wake on the same network), a pending one past [`SETTLE_MS`]
 /// given a weak id, or a new stay opened. `keeper_start` is when the keeper reading began: a new
 /// stay with no earlier record starts there and says "since before".
-fn observe(mut record: Record, facts: &Facts, now: u64, keeper_start: Option<u64>) -> Record {
+fn observe<const TRACK: bool>(
+    mut record: Record,
+    facts: &Facts,
+    clock: &Clock<TRACK>,
+    keeper_start: Option<u64>,
+) -> Record {
     let fresh = |start_ms: u64, from_start: bool| Stay {
         start_ms,
         end_ms: None,
@@ -1057,24 +1059,23 @@ fn observe(mut record: Record, facts: &Facts, now: u64, keeper_start: Option<u64
             {
                 if let Some(id) = NetworkId::of(route) {
                     stay.network = Some(id);
-                } else if stay.network.is_none() && now.saturating_sub(stay.start_ms) > SETTLE_MS {
+                } else if stay.network.is_none() && clock.older_than(stay.start_ms, SETTLE_MS) {
                     stay.network = Some(NetworkId::weak(route));
                 }
             }
         }
         Some(stay) => {
             if stay.end_ms.is_none() {
-                stay.end_ms = Some(now);
+                stay.end_ms = Some(clock.now);
             }
             // The keeper's first look, or a reader's on a record the keeper has not brought up
             // to these facts: when this Mac came onto this network is not known, only that it
             // was here by now.
-            let from_start =
-                keeper_start.is_none_or(|start| now.saturating_sub(start) < FIRST_LOOK_MS);
-            record.stays.push(fresh(now, from_start));
+            let from_start = keeper_start.is_none_or(|start| !clock.at_least(start, FIRST_LOOK_MS));
+            record.stays.push(fresh(clock.now, from_start));
         }
         None => {
-            let start = keeper_start.unwrap_or(now).min(now);
+            let start = keeper_start.unwrap_or(clock.now).min(clock.now);
             record.stays.push(fresh(start, true));
         }
     }
@@ -1098,6 +1099,21 @@ fn observe(mut record: Record, facts: &Facts, now: u64, keeper_start: Option<u64
     record
 }
 
+/// Observe owned history with current reader facts, then transfer its current
+/// stay fields. Report classification changes neither field and is not admission.
+#[cfg(unix)]
+pub(crate) fn observed_stay(
+    record: Record,
+    facts: &Facts,
+    now: u64,
+) -> (Option<u64>, Option<NetworkId>) {
+    let mut record = observe(record, facts, &Clock::<false>::at(now), None);
+    match record.stays.last_mut().filter(|stay| stay.end_ms.is_none()) {
+        Some(stay) => (Some(stay.start_ms), stay.network.take()),
+        None => (None, None),
+    }
+}
+
 /// Since when this Mac has been away from the ALab LAN: the end of the newest ALab LAN stay the
 /// record keeps; `None` (unknown) where it keeps none, as after days away whose wakes and moves
 /// pushed the last home stay out of the [`STAYS_MAX`] kept, rather than an invented time such as
@@ -1113,9 +1129,9 @@ fn away_since(record: &Record) -> Option<u64> {
 
 /// `known` confirmed by members answering at `now`: its time moved on once it is
 /// [`CONFIRM_EVERY_MS`] old, so the record does not change at every look.
-fn confirm(known: &mut Known, now: u64) {
-    if now.saturating_sub(known.confirmed_ms) >= CONFIRM_EVERY_MS {
-        known.confirmed_ms = now;
+fn confirm<const TRACK: bool>(known: &mut Known, clock: &Clock<TRACK>) {
+    if clock.at_least(known.confirmed_ms, CONFIRM_EVERY_MS) {
+        known.confirmed_ms = clock.now;
     }
 }
 
@@ -1133,31 +1149,56 @@ pub fn step(
     now: u64,
     keeper_start: Option<u64>,
 ) -> (Record, Place) {
-    let mut record = observe(record.clone(), facts, now, keeper_start);
-    if let Some(path) = facts.path {
-        record.path = Some(path);
-    }
+    step_owned(record.clone(), facts, evidence, book, now, keeper_start)
+}
+
+/// Step a record the caller already owns without first cloning its history.
+/// Readers consume parsed memory; the borrowed public entry preserves its input.
+pub(crate) fn step_owned(
+    record: Record,
+    facts: &Facts,
+    evidence: &Evidence,
+    book: Option<&Book>,
+    now: u64,
+    keeper_start: Option<u64>,
+) -> (Record, Place) {
+    step_at(
+        record,
+        facts,
+        evidence,
+        book,
+        &Clock::<false>::at(now),
+        keeper_start,
+    )
+}
+
+fn step_at<const TRACK: bool>(
+    record: Record,
+    facts: &Facts,
+    evidence: &Evidence,
+    book: Option<&Book>,
+    clock: &Clock<TRACK>,
+    keeper_start: Option<u64>,
+) -> (Record, Place) {
+    let now = clock.now;
+    let mut record = observe(record, facts, clock, keeper_start);
     let stay = record.current();
     let path = facts.path;
-    let internet = internet_in(evidence, stay, path, now);
+    let internet = internet_in(evidence, stay, path, clock);
     let known = book.map(|book| book.members.len());
     let last_answer = evidence
         .answers
         .iter()
-        .filter(|answer| answer.at_ms <= now.saturating_add(AHEAD_MAX_MS))
+        .filter(|answer| clock.admits(answer.at_ms, AHEAD_MAX_MS))
         .max_by_key(|answer| answer.at_ms)
         .map(|answer| (answer.at_ms, answer.lane));
     let kind = facts.route.as_ref().map(|_| facts.kind());
-    let (members_here, reachable, silent) = match (stay, facts.route.as_ref()) {
-        (Some(stay), Some(route)) => {
-            let (all, reach) = members_and_reachable_in(evidence, stay, route, now);
-            (
-                all,
-                reach,
-                silent_rounds(evidence, stay, now) >= SILENT_ROUNDS,
-            )
-        }
-        _ => (0, 0, false),
+    let (members_here, silent) = match (stay, facts.route.as_ref()) {
+        (Some(stay), Some(route)) => (
+            members_in(evidence, stay, route, clock),
+            silent_rounds(evidence, stay, clock) >= SILENT_ROUNDS,
+        ),
+        _ => (0, false),
     };
     let (has_stay, since_ms, since_before, network) = match stay {
         Some(stay) => (
@@ -1191,7 +1232,9 @@ pub fn step(
             } else if remembered {
                 once_alab = true;
                 Where::Remote(facts.kind())
-            } else if record.remembered.is_empty() && !silent && seeded(book, (route, network), now)
+            } else if record.remembered.is_empty()
+                && !silent
+                && seeded(book, (route, network), clock)
             {
                 recognised = Some(Recognised::Seeded);
                 Where::AlabLan
@@ -1206,6 +1249,9 @@ pub fn step(
             }
         }
     };
+    // A newly learned key is stamped at the clock now. Its ordering against an
+    // older key can change with time if pruning initially discards the new key.
+    let mut learned_now = None;
     // Learn: members proved this network in this stay.
     if recognised == Some(Recognised::Members)
         && known.is_some_and(|known| known >= LEARN_AT)
@@ -1216,12 +1262,15 @@ pub fn step(
             .iter_mut()
             .find(|known| known.network == *network)
         {
-            Some(known) => confirm(known, now),
-            None => record.remembered.push(Known {
-                network: network.clone(),
-                learned_ms: now,
-                confirmed_ms: now,
-            }),
+            Some(known) => confirm(known, clock),
+            None => {
+                record.remembered.push(Known {
+                    network: network.clone(),
+                    learned_ms: now,
+                    confirmed_ms: now,
+                });
+                learned_now = Some(network);
+            }
         }
     } else if recognised == Some(Recognised::Remembered)
         && members_here > 0
@@ -1230,12 +1279,19 @@ pub fn step(
             .iter_mut()
             .find(|known| Some(&known.network) == network.as_ref())
     {
-        confirm(known, now);
+        confirm(known, clock);
     }
     if record.remembered.len() > REMEMBERED_MAX {
-        record
-            .remembered
-            .sort_by_key(|known| std::cmp::Reverse(known.confirmed_ms));
+        record.remembered.sort_by(|a, b| {
+            match (
+                learned_now == Some(&a.network),
+                learned_now == Some(&b.network),
+            ) {
+                (true, false) => clock.cmp_now(b.confirmed_ms).reverse(),
+                (false, true) => clock.cmp_now(a.confirmed_ms),
+                _ => b.confirmed_ms.cmp(&a.confirmed_ms),
+            }
+        });
         record.remembered.truncate(REMEMBERED_MAX);
     }
     if let Some(current) = record.stays.last_mut().filter(|stay| stay.end_ms.is_none()) {
@@ -1265,7 +1321,7 @@ pub fn step(
         since_before,
         internet,
         alab,
-        reachable,
+        heard: members_here,
         known,
         last_answer,
         computed_by: if keeper_start.is_some() {
@@ -1275,6 +1331,65 @@ pub fn step(
         },
     };
     (record, place)
+}
+
+/// The current step and its next time-only change with all other inputs fixed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Projection {
+    /// The updated record, which subsequent comparisons must use.
+    pub record: Record,
+    /// The place at the supplied time.
+    pub place: Place,
+    /// The first different forward millisecond, or the supplied time if the updated
+    /// record needs immediate normalization. `None` means no representable forward change.
+    /// External facts, presentation clocks and wall-clock rollback still invalidate this query.
+    pub next_change_ms: Option<u64>,
+}
+
+/// Step once, then find the earliest time-only change of either returned value.
+/// Future comparisons use the returned record and the same facts, evidence, book and
+/// keeper start. Candidates come from the production predicates; a predicate flip that
+/// leaves both values equal is skipped. No clock, I/O, live wait or LAN proof is cached.
+#[must_use]
+pub fn step_with_deadline(
+    record: &Record,
+    facts: &Facts,
+    evidence: &Evidence,
+    book: Option<&Book>,
+    now: u64,
+    keeper_start: Option<u64>,
+) -> Projection {
+    step_with_deadline_owned(record.clone(), facts, evidence, book, now, keeper_start)
+}
+
+/// Project an owned intermediate record without copying it into the first step.
+/// Future probes still copy the returned record they must preserve for comparison.
+pub(crate) fn step_with_deadline_owned(
+    record: Record,
+    facts: &Facts,
+    evidence: &Evidence,
+    book: Option<&Book>,
+    now: u64,
+    keeper_start: Option<u64>,
+) -> Projection {
+    let (record, place) = step_owned(record, facts, evidence, book, now, keeper_start);
+    let mut cursor = now;
+    let next_change_ms = loop {
+        let clock = Clock::<true>::at(cursor);
+        let projected = step_at(record.clone(), facts, evidence, book, &clock, keeper_start);
+        if projected.0 != record || projected.1 != place {
+            break Some(cursor);
+        }
+        match clock.next() {
+            Some(next) => cursor = next,
+            None => break None,
+        }
+    };
+    Projection {
+        record,
+        place,
+        next_change_ms,
+    }
 }
 
 impl Place {

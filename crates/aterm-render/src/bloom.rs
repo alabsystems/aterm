@@ -11,10 +11,49 @@ pub const BLOOM_DOWNSCALE: u32 = 2;
 pub const BLOOM_STRENGTH: f32 = 0.85;
 /// The default blur radius in half-res texels: how far the halo spreads.
 pub const BLOOM_RADIUS: f32 = 2.2;
-/// The chroma radius of the same 25-tap kernel (half-res texels).
+/// The chroma radius of the same kernel (half-res texels).
 pub const BLOOM_CHROMA_RADIUS: f32 = 1.2;
 /// The chroma radius as a share of the white one.
 pub const BLOOM_CHROMA_SHARE: f32 = BLOOM_CHROMA_RADIUS / BLOOM_RADIUS;
+
+/// The most taps the bloom's kernel lays each side of its centre ([`taps_per_side`]).
+pub const BLOOM_TAPS_MAX: i32 = 3;
+
+/// The taps the kernel's scratch holds at most: `(2 * TAPS_SIDE_CAP + 1)^2`.
+const TAPS_CAP: usize = TAPS_ROWS_CAP * TAPS_ROWS_CAP;
+/// The tap rows (and the taps a row) the kernel's scratch holds at most: `2 * TAPS_SIDE_CAP + 1`.
+const TAPS_ROWS_CAP: usize = (2 * TAPS_SIDE_CAP + 1) as usize;
+/// The most taps a side the kernel's scratch holds (a test may force more than
+/// [`BLOOM_TAPS_MAX`]).
+const TAPS_SIDE_CAP: i32 = 8;
+
+#[cfg(test)]
+thread_local! {
+    /// A test's kernel, taps each side (`0`: [`taps_per_side`]'s); `2` is the negative
+    /// control's 25-tap kernel at every radius.
+    static FORCE_TAPS: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// The bloom kernel's taps each side of its centre for a white blur `radius` (half-res
+/// texels): the kernel spans `2 * radius` either way in `2 * n + 1` taps a side, weighted
+/// `exp(-d^2 / n^2)` by the tap's distance `d` in taps (the one Gaussian at every `n`). Two
+/// (a 25-tap kernel) to a radius of 6, its taps up to 6 texels apart; three (49 taps) past
+/// it. At the knob's top, 8, the 25-tap kernel's taps stood 16 px apart, wider than the
+/// caret's cell, and its bloom lay as vertical bands right of the caret (composed r3's
+/// access judge; the after-land lows' W5). Every arm reads it so: `fs_bloom` in
+/// `bloom.metal`, `bloom.glsl` and `bloom.hlsl` computes `ceil(radius / 3)` the same way.
+#[inline]
+#[must_use]
+pub fn taps_per_side(radius: f32) -> i32 {
+    #[cfg(test)]
+    {
+        let forced = FORCE_TAPS.with(std::cell::Cell::get);
+        if forced > 0 {
+            return forced;
+        }
+    }
+    ((radius / 3.0).ceil() as i32).clamp(2, BLOOM_TAPS_MAX)
+}
 
 /// The chroma radius paired with a white blur `radius`.
 #[inline]
@@ -502,8 +541,8 @@ pub fn apply_kept_off(
 }
 
 /// [`apply_kept_off`], passing over a pixel no lit half-res texel lies within `quiet` of the
-/// taps' reach of and each tap on four dark texels (`None`: none passed over, every pixel its 50
-/// samples). Only a share below 1 can change a pixel: the negative control of
+/// taps' reach of and each tap on four dark texels (`None`: none passed over, every pixel its two
+/// samples a tap). Only a share below 1 can change a pixel: the negative control of
 /// `a_quiet_pixel_passed_over_takes_no_light`.
 fn bloom_kept_off(
     frame: &mut Frame,
@@ -616,47 +655,40 @@ fn bloom_kept_off(
     let sy0 = (y0 as usize).saturating_sub(d);
     let sx1 = (x1 as usize).saturating_add(d).min(w);
     let sy1 = (y1 as usize).saturating_add(d).min(h);
-    struct BloomKernel {
-        taps: [(f32, f32, f32); 25],
-        wsum: f32,
-    }
-    static KERNEL: std::sync::OnceLock<BloomKernel> = std::sync::OnceLock::new();
-    let BloomKernel {
-        taps: ref kernel,
-        wsum,
-    } = *KERNEL.get_or_init(|| {
-        let mut taps = [(0.0f32, 0.0f32, 0.0f32); 25];
-        let mut wsum = 0.0f32;
-        let mut idx = 0usize;
-        for j in -2i32..=2 {
-            for i in -2i32..=2 {
-                let weight = (-((i * i + j * j) as f32) / 4.0).exp();
-                taps[idx] = (i as f32, j as f32, weight);
-                wsum += weight;
-                idx += 1;
-            }
+    // The kernel's taps each side ([`taps_per_side`]): a 25-tap kernel to a radius of 6, a
+    // 49-tap one past it, the same Gaussian spread over the same reach either way.
+    let n = taps_per_side(params.radius);
+    let side = (2 * n + 1) as usize;
+    let step = 2.0 / n as f32;
+    let inv_n2 = 1.0 / (n * n) as f32;
+    let mut taps = [(0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32); TAPS_CAP];
+    let mut count = 0usize;
+    let mut wsum = 0.0f32;
+    for j in -n..=n {
+        for i in -n..=n {
+            let weight = (-((i * i + j * j) as f32) * inv_n2).exp();
+            let (oi, oj) = (i as f32 * step * tu, j as f32 * step * tv);
+            taps[count] = (oi * rw, oj * rw, oi * rc, oj * rc, weight);
+            wsum += weight;
+            count += 1;
         }
-        BloomKernel { taps, wsum }
-    });
-    let mut taps = [(0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32); 25];
-    for (tap, &(fi, fj, weight)) in taps.iter_mut().zip(kernel.iter()) {
-        let (oi, oj) = (fi * tu, fj * tv);
-        *tap = (oi * rw, oj * rw, oi * rc, oj * rc, weight);
     }
-    // A pixel's taps read the half-res texels within twice the wider radius of its own centre
-    // and each one's bilinear neighbour (a texel more of slack covers rounding). Where none of
-    // those is lit, every sample is zero and so is the pixel's light: it is passed over without
-    // its 50 samples, as is a pixel its mask keeps whole off. Most of a trail's box is such.
+    let taps = &taps[..count];
+    // A pixel's taps read the half-res texels within twice the wider radius of its own centre,
+    // the kernel's reach at any tap count ([`taps_per_side`]), and each one's bilinear neighbour
+    // (a texel more of slack covers rounding). Where none of those is lit, every sample is zero
+    // and so is the pixel's light: it is passed over without its two samples a tap, as is a
+    // pixel its mask keeps whole off. Most of a trail's box is such.
     let lit = quiet
         .map(|share| lit_table(&half, bw, bh).map(|t| (t, 2.0 * rw.max(rc) * share + 1.0)))
         .transpose()?;
-    let span = |c: f32, reach: f32, n: usize| {
-        let clamp = |x: f32| (x.max(0.0) as usize).min(n - 1);
+    let span = |c: f32, reach: f32, len: usize| {
+        let clamp = |x: f32| (x.max(0.0) as usize).min(len - 1);
         (clamp((c - reach).floor()), clamp((c + reach).floor() + 1.0))
     };
-    // The half-res rows that hold a lit texel. The taps stand in five rows, each row's five on
-    // the same two texel rows at a given pixel row: a tap row on two dark rows reads nothing
-    // across, and a thin light leaves most of a pixel's tap rows so.
+    // The half-res rows that hold a lit texel. The taps stand in `2 * n + 1` rows, each row's
+    // `2 * n + 1` on the same two texel rows at a given pixel row: a tap row on two dark rows
+    // reads nothing across, and a thin light leaves most of a pixel's tap rows so.
     let row_lit: Vec<bool> = half
         .chunks_exact(bw)
         .map(|r| r.iter().any(|&t| t != 0))
@@ -673,8 +705,10 @@ fn bloom_kept_off(
             let clampy = |y: f32| (y.max(0.0) as usize).min(bh - 1);
             !pass_dark_taps || row_lit[clampy(iy)] || row_lit[clampy(iy + 1.0)]
         };
-        let tap_rows: [(bool, bool); 5] =
-            std::array::from_fn(|j| (row_reads(taps[j * 5].1), row_reads(taps[j * 5].3)));
+        let mut tap_rows = [(false, false); TAPS_ROWS_CAP];
+        for (reads, row) in tap_rows.iter_mut().zip(taps.chunks_exact(side)) {
+            *reads = (row_reads(row[0].1), row_reads(row[0].3));
+        }
         for px in sx0..sx1 {
             let u = (px as f32 + 0.5) / w as f32;
             if let (Some((table, reach)), Some(ys)) = (&lit, ys)
@@ -688,7 +722,7 @@ fn bloom_kept_off(
             }
             let mut white = 0.0f32;
             let mut chroma = [0.0f32; 3];
-            for (row, &(reads_w, reads_c)) in taps.as_chunks::<5>().0.iter().zip(&tap_rows) {
+            for (row, &(reads_w, reads_c)) in taps.chunks_exact(side).zip(&tap_rows) {
                 for &(du_w, dv_w, du_c, dv_c, weight) in row {
                     if reads_w && let Some(sw) = sample(u + du_w, v + dv_w) {
                         white += white_part(sw) * weight;
@@ -1230,6 +1264,68 @@ mod tests {
         }
     }
 
+    /// After-land lows W5: a bloom lays no dark gap between the copies of its light at any
+    /// radius the Bloom size knob reaches. The kernel lays its light as shifted copies, one a
+    /// tap; at the knob's top, 8, the 25-tap kernel's taps stood 16 px apart, wider than a
+    /// caret's cell, and the copies of one bright cell stood apart as vertical bands right of
+    /// the caret (composed r3's access judge: `bloomwide/comet-dark.t0.png` x395-430), where
+    /// at 6, its taps 12 px apart, they overlap (the judge read it smooth). Read along the
+    /// light's middle row from its edge out, the bloom never dips under half the light it
+    /// climbs back to. The control keeps the 25-tap kernel at 8.
+    #[test]
+    fn a_wide_bloom_lays_no_gap_between_its_copies() {
+        let profile = |radius: f32, forced: i32| -> Vec<i32> {
+            FORCE_TAPS.with(|c| c.set(forced));
+            let (w, h) = (320usize, 96usize);
+            let mut f = frame(w, h, 0);
+            let light = [GlowQuad::flat(0, 100, 34, 14, 26, 0x00E0_F0FF, 0)];
+            let params = BloomParams {
+                strength: BLOOM_STRENGTH,
+                radius,
+            };
+            apply(&mut f, &light, 1, params).unwrap();
+            FORCE_TAPS.with(|c| c.set(0));
+            let y = 47;
+            (114..220)
+                .map(|x| {
+                    let p = f.pixels[y * w + x];
+                    (((p >> 16) & 0xff).max((p >> 8) & 0xff).max(p & 0xff)) as i32
+                })
+                .collect()
+        };
+        // The deepest gap: the most a pixel lies under half the light the row climbs back to.
+        let gap = |p: &[i32]| {
+            (0..p.len())
+                .map(|j| {
+                    let ahead = p[j..].iter().copied().max().unwrap_or(0);
+                    if ahead < 4 { 0 } else { ahead / 2 - p[j] }
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        for radius in [BLOOM_RADIUS, 4.0, 6.0, 6.5, 7.0, 7.5, 8.0] {
+            let p = profile(radius, 0);
+            assert!(
+                p[0] > 8,
+                "radius {radius}: the bloom shows past its light ({p:?})"
+            );
+            assert!(
+                gap(&p) <= 0,
+                "radius {radius}: the bloom's copies stand apart: {p:?}"
+            );
+        }
+        let control = profile(8.0, 2);
+        assert!(
+            gap(&control) > 0,
+            "control: the 25-tap kernel at radius 8 bands: {control:?}"
+        );
+        assert_eq!(
+            profile(6.0, 0),
+            profile(6.0, 2),
+            "to a radius of 6 the kernel is the 25-tap one"
+        );
+    }
+
     /// The bloom spreads the glow's light past its own rect, falls off with
     /// distance, and leaves the frame untouched beyond its reach; the halo of
     /// a red quad is red. NEGATIVE CONTROL: no glow, no change.
@@ -1252,11 +1348,12 @@ mod tests {
 
     /// A pixel passed over for no lit texel within its taps' reach, and a tap passed over for four
     /// dark texels or a tap row for two dark rows, take no light: over lights apart, in both modes,
-    /// at every radius, the frame is the one each pixel's 50 samples make. NEGATIVE CONTROL: judged
-    /// over a quarter of the reach, a pixel the light reaches is passed over, so the comparison
-    /// sees a reach too short. NEGATIVE CONTROLS (2026-11-05): a dark tap read from three of its
-    /// texels, and a dark tap row read from the first of its two rows, each fail it ("a passed-over
-    /// pixel took light").
+    /// at every radius, on both sides of the kernel's widening past 6 ([`taps_per_side`]), the
+    /// frame is the one each pixel's samples make, two a tap. NEGATIVE CONTROL: judged over a
+    /// quarter of the reach, a pixel the light reaches is passed over, so the comparison sees a
+    /// reach too short. NEGATIVE CONTROLS (2026-11-05): a dark tap read from three of its
+    /// texels, and a dark tap row read from the first of its two rows, each fail it ("a
+    /// passed-over pixel took light").
     #[test]
     fn a_quiet_pixel_passed_over_takes_no_light() {
         let mut seed = 0x9E37_79B9_7F4A_7C15u64;
@@ -1286,7 +1383,7 @@ mod tests {
                 })
                 .collect();
             let params = BloomParams {
-                radius: [0.0, 0.6, 1.7, 3.0, 6.0, 12.0][case % 6],
+                radius: [0.0, 0.6, 1.7, 3.0, 6.0, 6.5, 8.0, 12.0][case % 8],
                 strength: [0.4, 1.0, 1.8][case % 3],
             };
             let ground = u32::from(next(0xFFFF)) * 0x101;
@@ -1306,6 +1403,32 @@ mod tests {
         assert!(
             short_differs,
             "a quarter of the reach passed over no lit pixel"
+        );
+    }
+
+    /// The 49-tap kernel past a radius of 6 reaches as far as the 25-tap one, twice the radius, so
+    /// at the Bloom size knob's top the pass over quiet pixels keeps every pixel its outermost
+    /// taps light, and the smooth bloom W5's kernel lays is the frame it leaves. NEGATIVE CONTROL:
+    /// judged over seven eighths of the reach, a pixel only those taps light is passed over.
+    #[test]
+    fn the_pass_keeps_what_a_wide_kernels_outer_taps_light() {
+        assert_eq!(taps_per_side(8.0), 3);
+        let light = [GlowQuad::flat(0, 140, 60, 14, 26, 0x00E0_F0FF, 0)];
+        let params = BloomParams {
+            strength: BLOOM_STRENGTH,
+            radius: 8.0,
+        };
+        let run = |quiet| {
+            let mut f = frame(320, 160, 0);
+            bloom_kept_off(&mut f, &light, 1, params, None, quiet).unwrap();
+            f.pixels
+        };
+        let all = run(None);
+        assert_eq!(run(Some(1.0)), all, "a passed-over pixel took light");
+        assert_ne!(
+            run(Some(0.875)),
+            all,
+            "seven eighths of the reach passed over no lit pixel"
         );
     }
 

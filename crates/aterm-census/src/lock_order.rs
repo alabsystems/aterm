@@ -844,8 +844,8 @@ fn top_level_words(s: &str, word: &str) -> Vec<usize> {
             continue;
         }
         match bytes[i] {
-            b'<' | b'(' | b'[' => depth += 1,
-            b'>' | b')' | b']' => depth -= 1,
+            b'<' | b'(' | b'[' | b'{' => depth += 1,
+            b'>' | b')' | b']' | b'}' => depth -= 1,
             _ => {}
         }
         if depth == 0
@@ -1303,6 +1303,119 @@ fn binding_eq(line: &str) -> Option<usize> {
     Some(at)
 }
 
+/// Names bound by ordinary let patterns and complete if/while-let headers. Constructors,
+/// paths, type annotations and struct field labels are not bindings. Unsupported syntax
+/// retains the conservative call lookup instead of suppressing an edge.
+fn local_pattern_bindings(line: &str) -> BTreeSet<String> {
+    let text = line.trim_start_matches(['}', ' ']);
+    let text = text.strip_prefix("else ").unwrap_or(text).trim_start();
+    let pattern = text.strip_prefix("let ").or_else(|| {
+        text.ends_with('{').then(|| {
+            text.strip_prefix("if let ")
+                .or_else(|| text.strip_prefix("while let "))
+        })?
+    });
+    let Some(pattern) = pattern.and_then(|rest| binding_eq(rest).map(|eq| &rest[..eq])) else {
+        return BTreeSet::new();
+    };
+    let mut pending = vec![pattern];
+    let mut names = BTreeSet::new();
+    while let Some(pattern) = pending.pop() {
+        let mut pattern = pattern.trim();
+        // A type annotation belongs to the declaration, not its pattern. Ignore :: paths.
+        let mut depth = 0;
+        for (at, byte) in pattern.bytes().enumerate() {
+            match byte {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                b':' if depth == 0
+                    && !pattern[..at].ends_with(':')
+                    && !pattern[at + 1..].starts_with(':') =>
+                {
+                    pattern = pattern[..at].trim_end();
+                    break;
+                }
+                _ => {}
+            }
+        }
+        loop {
+            let next = pattern
+                .strip_prefix('&')
+                .or_else(|| pattern.strip_prefix("ref "))
+                .or_else(|| pattern.strip_prefix("mut "));
+            match next {
+                Some(rest) => pattern = rest.trim_start(),
+                None => break,
+            }
+        }
+        if matches!(pattern, "" | "_" | ".." | "true" | "false") {
+            continue;
+        }
+        if ident_prefix(pattern) == Some(pattern) {
+            // Capitalized constants/unit variants are not evidence of a callback binding.
+            // Retain the ordinary lower-case binding posture used by local call lookup.
+            if pattern.starts_with(|c: char| c.is_lowercase() || c == '_') {
+                names.insert(pattern.to_owned());
+            }
+            continue;
+        }
+        let Some(open) = pattern.find(['(', '[', '{']) else {
+            return BTreeSet::new();
+        };
+        let prefix = pattern[..open].trim();
+        if prefix == "const"
+            || (pattern[open..].starts_with('[') && !prefix.is_empty())
+            || (pattern[open..].starts_with('{') && prefix.is_empty())
+        {
+            return BTreeSet::new();
+        }
+        if !prefix.is_empty()
+            && !prefix
+                .trim_start_matches("::")
+                .split("::")
+                .all(|part| !part.is_empty() && ident_prefix(part) == Some(part))
+        {
+            return BTreeSet::new();
+        }
+        let group = &pattern[open..];
+        let mut closers = Vec::new();
+        for (at, byte) in group.bytes().enumerate() {
+            match byte {
+                b'(' => closers.push(b')'),
+                b'[' => closers.push(b']'),
+                b'{' => closers.push(b'}'),
+                b')' | b']' | b'}' => {
+                    if closers.pop() != Some(byte) || (closers.is_empty() && at + 1 != group.len())
+                    {
+                        return BTreeSet::new();
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !closers.is_empty() {
+            return BTreeSet::new();
+        }
+        for field in split_top_level(&group[1..group.len() - 1]) {
+            let field = field.trim();
+            let payload = if group.starts_with('{') {
+                field.split_once(':').map_or(field, |(label, payload)| {
+                    if ident_prefix(label.trim()) == Some(label.trim()) && !payload.starts_with(':')
+                    {
+                        payload
+                    } else {
+                        field
+                    }
+                })
+            } else {
+                field
+            };
+            pending.push(payload);
+        }
+    }
+    names
+}
+
 /// The identity a `let` binding aliases when its RHS is a pure path.
 fn alias_target(line: &str, ctx: &SiteCtx<'_>) -> Option<String> {
     let eq = binding_eq(line)?;
@@ -1743,6 +1856,15 @@ fn scan_fn(
     let mut depth: i32 = 0;
     for ll in &lines {
         let line = &ll.text;
+        let leading_closes = line
+            .chars()
+            .take_while(|c| c.is_whitespace() || *c == '}')
+            .filter(|c| *c == '}')
+            .count();
+        // `} else {` has no net depth change, but the previous branch's locals have ended
+        // before its condition or body can call an unshadowed corpus function.
+        let entry_depth = depth - i32::try_from(leading_closes).unwrap_or(0);
+        local_bindings.retain(|binding| entry_depth >= binding.binding_depth);
         let opens = i32::try_from(line.matches('{').count()).unwrap_or(0);
         let closes = i32::try_from(line.matches('}').count()).unwrap_or(0);
         let depth_end = depth + opens - closes;
@@ -1906,12 +2028,19 @@ fn scan_fn(
                 });
             }
         }
-        if let LineKind::Let(Some(var)) = &kind {
+        let names = local_pattern_bindings(line);
+        for name in names {
             local_bindings.push(LocalBinding {
-                name: var.clone(),
-                binding_depth: depth,
-                active: false,
+                name,
+                binding_depth: if matches!(kind, LineKind::MatchLike) {
+                    depth_end.max(depth)
+                } else {
+                    depth
+                },
+                active: matches!(kind, LineKind::MatchLike),
             });
+        }
+        if let LineKind::Let(Some(var)) = &kind {
             if is_file_binding_rhs(line) {
                 file_vars.insert(var.clone(), (depth, format!("{}:{}", file.rel, ll.lineno)));
             } else {
@@ -3725,6 +3854,20 @@ fn shipped() {
 
     #[test]
     fn local_bindings_shadow_only_live_bare_one_hop_targets() {
+        for (call, ok) in [("maintain()", true), ("self.maintain()", false)] {
+            let projection = run_synth(
+                "projection-callback",
+                &format!(
+                    "impl Projection {{\n    fn maintain(&self) {{\n        let mut inputs = self.inputs.lock().unwrap();\n        if let Some(maintain) = &mut inputs.maintenance {{\n            {call};\n        }}\n    }}\n}}\n"
+                ),
+            );
+            assert_eq!(projection.ok, ok, "{}", projection.log);
+            if ok {
+                assert!(projection.log.contains("local `maintain`"));
+            } else {
+                assert!(projection.log.contains("RE-ENTRANCY SUSPECT"));
+            }
+        }
         for (label, body) in [
             (
                 "local-pointer",
@@ -3738,6 +3881,22 @@ fn shipped() {
             (
                 "local-multiline",
                 "let post = {\n        || ()\n    };\n    post();",
+            ),
+            (
+                "conditional-local",
+                "if let Some(post) = callback {\n        post();\n    }",
+            ),
+            (
+                "conditional-ref-mut-local",
+                "while let Some(ref mut post) = callback {\n        post();\n    }",
+            ),
+            (
+                "destructured-local",
+                "let (_, post) = callbacks;\n    post();",
+            ),
+            (
+                "conditional-field-local",
+                "if let Callback { run: post, .. } = callback {\n        post();\n    }",
             ),
         ] {
             let out = run_synth(
@@ -3779,6 +3938,42 @@ fn shipped() {
             ),
             ("local-qualified", "let post = || ();\n    crate :: post();"),
             ("local-method", "let post = || ();\n    self.post();"),
+            (
+                "conditional-initializer",
+                "if let Some(post) = post() {\n        post();\n    }",
+            ),
+            (
+                "conditional-else",
+                "if let Some(post) = callback {\n        post();\n    } else {\n        post();\n    }",
+            ),
+            (
+                "conditional-expired",
+                "if let Some(post) = callback {\n        post();\n    }\n    post();",
+            ),
+            (
+                "conditional-method",
+                "if let Some(post) = callback {\n        self.post();\n    }",
+            ),
+            (
+                "conditional-qualified",
+                "if let Some(post) = callback {\n        crate::post();\n    }",
+            ),
+            (
+                "conditional-field-label",
+                "if let Callback { post: other } = callback {\n        post();\n    }",
+            ),
+            (
+                "conditional-path-variant",
+                "if let Callback::post = callback {\n        post();\n    }",
+            ),
+            (
+                "conditional-path-constructor",
+                "if let module::post(other) = callback {\n        post();\n    }",
+            ),
+            (
+                "local-type-name",
+                "let other: post = callback;\n    post();",
+            ),
         ] {
             let out = run_synth(
                 label,

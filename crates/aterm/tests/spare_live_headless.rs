@@ -27,13 +27,35 @@ fn t_ready_file(tmp: &Path) -> PathBuf {
     tmp.join("spare-t-ready-ms")
 }
 
-/// [`t_ready_file`] under `tmp` holds `ms`, put in place whole: the aterm reads it whenever a
-/// spare starts warming, so it never finds it empty or cut short.
+/// [`t_ready_file`] under `tmp` holds `ms`.
 fn set_t_ready(tmp: &Path, ms: u128) {
-    let file = t_ready_file(tmp);
-    let next = tmp.join("spare-t-ready-ms.next");
-    std::fs::write(&next, ms.to_string()).expect("write T_READY");
-    std::fs::rename(&next, &file).expect("put T_READY in place");
+    put_ms(&t_ready_file(tmp), ms);
+}
+
+/// The file whose milliseconds the aterm [`boot_spare`] starts under `tmp` gives each visible
+/// run as it is queued, the longest rc the gate counts clean (`SAMPLE_WINDOW`): the hang
+/// detector, as a one-line rc here reaches its prompt within it however loaded the machine is,
+/// until a case whose rc it holds past any window lowers it.
+fn window_file(tmp: &Path) -> PathBuf {
+    tmp.join("spare-window-ms")
+}
+
+/// [`window_file`] under `tmp` holds `ms`.
+fn set_window(tmp: &Path, ms: u128) {
+    put_ms(&window_file(tmp), ms);
+}
+
+/// The window a run is judged under when its rc is held until its verdict: any under the hang
+/// detector would do, as `read` and `exec` never reach their prompt and `slow` waits at least that
+/// long for the test's release, which comes only after the verdict.
+const HELD_RC_WINDOW_MS: u128 = 500;
+
+/// `file` holds `ms`, put in place whole: the aterm reads a seam's file whenever it consults the
+/// seam, so it never finds it empty or cut short.
+fn put_ms(file: &Path, ms: u128) {
+    let next = file.with_extension("next");
+    std::fs::write(&next, ms.to_string()).expect("write a seam's milliseconds");
+    std::fs::rename(&next, file).expect("put a seam's milliseconds in place");
 }
 
 fn boot_spare(prefix: &str, rc: &str, config: &str, seams: &[(&str, &str)]) -> Instance {
@@ -61,6 +83,8 @@ fn boot_spare(prefix: &str, rc: &str, config: &str, seams: &[(&str, &str)]) -> I
             );
             set_t_ready(tmp, aterm_spec::wait::MUST_HAPPEN.as_millis());
             cmd.env("ATERM_DEBUG_SPARE_TREADY_MS", t_ready_file(tmp));
+            set_window(tmp, aterm_spec::wait::MUST_HAPPEN.as_millis());
+            cmd.env("ATERM_DEBUG_SPARE_WINDOW_MS", window_file(tmp));
             for (k, v) in &seams {
                 cmd.env(k, v);
             }
@@ -130,18 +154,7 @@ fn await_spare(inst: &Instance, state: &str) {
     }
 }
 
-fn a_budget_decided_it(inst: &Instance, missed: &str) -> ! {
-    let log = gate_log(inst);
-    if let Some(load) = aterm_spec::host::oversubscribed() {
-        aterm_spec::host::could_not_run(format!(
-            "{missed}, on an oversubscribed host ({load}), where one-line rcs \
-             miss the product's time budgets on load alone:\n{log}"
-        ));
-    }
-    panic!("{missed}, on a host with CPU to spare:\n{log}");
-}
-
-fn fold_failed(log: &str) -> Option<(Vec<String>, String)> {
+fn fold_failed(log: &str) -> Option<Vec<String>> {
     let lines: Vec<&str> = log.lines().collect();
     let verdict = lines
         .iter()
@@ -154,7 +167,7 @@ fn fold_failed(log: &str) -> Option<(Vec<String>, String)> {
         .find(|l| {
             l.contains("spare gate: unclean run: failed=") || l.contains("spare gate: escape:")
         })?;
-    let rules = match named.split("failed=").nth(1) {
+    Some(match named.split("failed=").nth(1) {
         Some(rest) => rest
             .split([':', ' '])
             .next()?
@@ -162,16 +175,7 @@ fn fold_failed(log: &str) -> Option<(Vec<String>, String)> {
             .map(str::to_owned)
             .collect(),
         None => vec!["escape".to_owned()],
-    };
-    Some((rules, (*named).to_owned()))
-}
-
-fn a_budget_fold(log: &str) -> Option<String> {
-    let (rules, line) = fold_failed(log)?;
-    rules
-        .iter()
-        .all(|rule| matches!(rule.as_str(), "start" | "slow"))
-        .then_some(line)
+    })
 }
 
 fn log_through(inst: &Instance, verdict: &str, n: usize) -> String {
@@ -451,12 +455,6 @@ fn expect_streak(inst: &Instance, streak: u32, expected: u32) {
         if let Some(line) = an_unsettled_scan(&log) {
             an_unsettled_scan_decided_it(&line, &log);
         }
-        if let Some(fold) = a_budget_fold(&log) {
-            a_budget_decided_it(
-                inst,
-                &format!("a one-line rc's run missed the gate's window ({fold})"),
-            );
-        }
     }
     assert_eq!(
         streak,
@@ -662,13 +660,68 @@ fn three_clean_visible_runs_make_the_next_spare_warm() {
     assert_eq!(born(&inst, &sid), "spare-ready");
 }
 
+/// Seconds the armed rc of [`a_clean_rc_past_the_products_window_counts_clean`] sleeps before its
+/// prompt: past the product's 2 s `SAMPLE_WINDOW`.
+const PAST_THE_PRODUCTS_WINDOW_S: u64 = 3;
+
+/// The suite's premise, held: an rc that reaches its prompt cleanly after the product's window
+/// counts clean, as each run here is judged under the window [`boot_spare`] gives it
+/// ([`window_file`]) and a loaded machine can make any rc that slow. Without that seam, or with a
+/// gate that judges a run by `SAMPLE_WINDOW` rather than the window it was queued with, this run
+/// folds `start` (or `slow`) and resets the streak, on any machine.
+#[test]
+fn a_clean_rc_past_the_products_window_counts_clean() {
+    let inst = boot_spare(
+        "aterm-spare-l3w",
+        &format!("[[ -e $HOME/armed ]] && /bin/sleep {PAST_THE_PRODUCTS_WINDOW_S}\n{PROMPT_RC}"),
+        "spare_shell_needs_person = false",
+        &[("ATERM_DEBUG_SPARE_IDLE_MS", "100")],
+    );
+    boot_run_is_clean(&inst);
+    std::fs::write(inst.tmp.join("home/armed"), b"").expect("arm");
+    let tier = await_visible_run_tier(&inst);
+    let before = gate_snapshot(&inst).expect("one settled generation");
+    let sid = spawn(&inst, &[]);
+    assert_eq!(born(&inst, &sid), tier);
+    await_text(&inst, &sid, "SPARE%");
+    let after = await_sample_after(&inst, &before);
+    expect_streak(&inst, after.streak, 2);
+    await_gate(&inst, "learning_2/3");
+    let log = log_through(&inst, "saw a visible run:", 2);
+    let rc_ms = log
+        .lines()
+        .last()
+        .and_then(|verdict| {
+            verdict
+                .split("saw a visible run: Clean { rc_ms: ")
+                .nth(1)?
+                .strip_suffix(" }")?
+                .parse::<u64>()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("the held run is counted clean with its rc's time:\n{log}"));
+    assert!(
+        rc_ms >= PAST_THE_PRODUCTS_WINDOW_S * 1000,
+        "the rc was held past the product's window (rc_ms={rc_ms}):\n{log}"
+    );
+}
+
 #[test]
 fn an_unclean_rc_never_opens_the_gate() {
     let aterm = crate::launch_isolation::aterm_executable();
     let aterm = aterm.display();
+    // A rc whose `start` rule is asked never reaches its prompt before its verdict: `read` and
+    // `exec` never do, and `slow` waits for the test's release, so each is judged under a window
+    // it is held past. The others' one-line rcs are judged under the hang detector.
     let cases: [(&str, &[&str], String); 6] = [
         ("read", &["start"], "read -r x".to_owned()),
-        ("slow", &["start", "slow"], "sleep 3".to_owned()),
+        (
+            "slow",
+            &["start"],
+            "n=0; while [[ ! -e $HOME/rc-release && $n -lt 1200 ]]; do /bin/sleep 0.05; \
+             n=$((n + 1)); done"
+                .to_owned(),
+        ),
         ("exec", &["start"], "exec /bin/cat".to_owned()),
         ("bell", &["host"], "printf '\\a'".to_owned()),
         (
@@ -679,7 +732,7 @@ fn an_unclean_rc_never_opens_the_gate() {
         (
             "daemon",
             &["escape"],
-            "( { n=0; while [[ ! -e $HOME/daemon-release && $n -lt 1200 ]]; do /bin/sleep 0.05; \
+            "( { n=0; while [[ ! -e $HOME/rc-release && $n -lt 1200 ]]; do /bin/sleep 0.05; \
              n=$((n + 1)); done; : > \"$HOME/daemon-finished\"; } & )"
                 .to_owned(),
         ),
@@ -754,8 +807,11 @@ fn an_unclean_run(name: &str, rules: &[&str], misbehave: &str) {
         "spare_shell_needs_person = false",
         &[("ATERM_DEBUG_SPARE_IDLE_MS", "100")],
     );
-    let daemon = RcRelease(inst.tmp.join("home/daemon-release"));
+    let held = RcRelease(inst.tmp.join("home/rc-release"));
     boot_run_is_clean(&inst);
+    if rules.contains(&"start") {
+        set_window(&inst.tmp, HELD_RC_WINDOW_MS);
+    }
     std::fs::write(inst.tmp.join("home/armed"), b"").expect("arm");
     let tier = await_visible_run_tier(&inst);
     let before = gate_snapshot(&inst).expect("one settled generation");
@@ -772,23 +828,23 @@ fn an_unclean_run(name: &str, rules: &[&str], misbehave: &str) {
         after.streak, 0,
         "{name}: the actual negative fold reset the streak"
     );
-    let (failed, line) = fold_failed(&log)
+    let failed = fold_failed(&log)
         .unwrap_or_else(|| panic!("{name}: an unclean fold names what it failed:\n{log}"));
-    if !failed.iter().any(|rule| rules.contains(&rule.as_str())) {
-        if a_budget_fold(&log).is_some() {
-            a_budget_decided_it(
-                &inst,
-                &format!(
-                    "{name}: the run missed the gate's window before {rules:?} was asked ({line})"
-                ),
-            );
-        }
-        panic!("{name}: the fold failed {failed:?}, not {rules:?}:\n{log}");
-    }
+    assert!(
+        failed.iter().any(|rule| rules.contains(&rule.as_str())),
+        "{name}: the fold failed {failed:?}, not {rules:?}:\n{log}"
+    );
     await_gate(&inst, "learning_0/3");
-    if name == "daemon" {
-        daemon.release().expect("release the daemon");
-        await_private_file(&inst, &inst.tmp.join("home/daemon-finished"));
+    match name {
+        "daemon" => {
+            held.release().expect("release the daemon");
+            await_private_file(&inst, &inst.tmp.join("home/daemon-finished"));
+        }
+        "slow" => {
+            held.release().expect("release the slow rc");
+            await_text(&inst, &sid, "SPARE%");
+        }
+        _ => {}
     }
     ctl_ok(&inst, &[&format!("@{sid}"), "close"]);
     assert_eq!(adopted(&inst, "ready"), 0, "{name}");

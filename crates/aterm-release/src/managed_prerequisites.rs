@@ -62,7 +62,10 @@ impl Tools {
     /// The engine is a Python script with a shell launcher. Running the held
     /// interpreter directly prevents that launcher's PATH fallback from
     /// selecting another Python when its first probe fails. Isolated imports
-    /// ignore inherited PYTHONHOME/PYTHONPATH and the working directory.
+    /// ignore inherited PYTHONHOME/PYTHONPATH and the working directory. Unbuffered output
+    /// (`-u`, which isolation keeps where `PYTHONUNBUFFERED` would be ignored) delivers each of
+    /// the engine's phase lines as it prints it: the release reads when an export's staging push
+    /// began (B4), and when each publish line came (A1).
     pub(crate) fn engine_command(&self, script: &Path) -> Result<Command, String> {
         match self {
             Self::Store(held) => {
@@ -71,7 +74,7 @@ impl Tools {
                     .ok_or("the operation did not acquire its publication interpreter")?;
                 require_engine_pin(script)?;
                 let mut command = python.command()?;
-                command.arg("-I").arg(script);
+                command.args(["-I", "-u"]).arg(script);
                 Ok(command)
             }
             #[cfg(test)]
@@ -79,10 +82,10 @@ impl Tools {
         }
     }
 
-    /// The interpreter's `-I <script>` precedes the engine operation.
+    /// The interpreter's `-I -u <script>` precedes the engine operation.
     pub(crate) const fn engine_prefix_len(&self) -> usize {
         match self {
-            Self::Store(_) => 2,
+            Self::Store(_) => 3,
             #[cfg(test)]
             Self::Simulated => 0,
         }

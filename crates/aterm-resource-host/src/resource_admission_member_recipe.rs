@@ -8,7 +8,11 @@ use super::*;
 use aterm_types::resource_subgroup::{GnuTransport, Request};
 use std::os::unix::ffi::OsStrExt as _;
 
-pub(super) fn command(job: &Job, input: &Request) -> io::Result<spawnfd::Command> {
+pub(super) fn command(
+    job: &Job,
+    input: &Request,
+    timeout: Option<Duration>,
+) -> io::Result<spawnfd::Command> {
     let request = &input.member;
     compiler::no_loader_overrides(&request.env)?;
     if !job.native_targo {
@@ -35,7 +39,8 @@ pub(super) fn command(job: &Job, input: &Request) -> io::Result<spawnfd::Command
         }
         words => words,
     };
-    let metadata = matches!(words, [word] if word == b"-vV" || word == b"--version");
+    no_early_execution(words)?;
+    let metadata = metadata(words, &input.gnu, timeout)?;
     if !metadata && matches!(input.gnu, GnuTransport::None) {
         return Err(refused(
             "native compilation requires the original shared GNU context",
@@ -79,4 +84,39 @@ pub(super) fn command(job: &Job, input: &Request) -> io::Result<spawnfd::Command
         .current_dir(std::ffi::OsStr::from_bytes(&request.cwd))
         .start_suspended(true);
     Ok(command)
+}
+
+/// These probes consume an already borrowed CPU credit; they create no grant.
+fn metadata(words: &[Vec<u8>], gnu: &GnuTransport, timeout: Option<Duration>) -> io::Result<bool> {
+    if matches!(words, [word] if word == b"-vV" || word == b"--version") {
+        return Ok(true);
+    }
+    let probe =
+        matches!(words, [word] if word == b"--print=sysroot" || word == b"--print=target-list");
+    if probe
+        && (!matches!(gnu, GnuTransport::None)
+            || timeout.is_none_or(|limit| limit.is_zero() || limit > Duration::from_secs(8)))
+    {
+        return Err(refused(
+            "compiler metadata probe requires a bounded isolated request",
+        ));
+    }
+    Ok(probe)
+}
+
+#[cfg(test)]
+#[path = "resource_admission_member_recipe_tests.rs"]
+mod tests;
+
+/// The compiler handles explanation before entering its authenticated Session.
+/// Its PAGER and opaque argument-file expansion are outside this native recipe.
+fn no_early_execution(words: &[Vec<u8>]) -> io::Result<()> {
+    if words.iter().any(|word| {
+        word == b"--explain" || word.starts_with(b"--explain=") || word.first() == Some(&b'@')
+    }) {
+        return Err(refused(
+            "native compiler member cannot execute an early pager or opaque argfile",
+        ));
+    }
+    Ok(())
 }

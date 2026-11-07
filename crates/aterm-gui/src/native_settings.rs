@@ -9824,6 +9824,8 @@ fn listed_cursor_styles(state: &SettingsViewState) -> Vec<ListedCursorStyle> {
     };
     let default_style = crate::app_config::default_cursor_trail_style();
     let before_off = cursor_style_before_off(state);
+    // A bar caret is a glowing rod in every style: a row says what that caret draws.
+    let bar = !configured_cursor_is_block(state);
     let builtin = |row: &aterm_effects::cursor_glow::spellings::TrailStyleRow| {
         let group = cursor_style_group(row);
         ListedCursorStyle {
@@ -9834,7 +9836,8 @@ fn listed_cursor_styles(state: &SettingsViewState) -> Vec<ListedCursorStyle> {
                 let description = if group == CursorStyleGroup::Off {
                     off_description
                 } else {
-                    row.blurb
+                    aterm_effects::cursor_glow::spellings::blurb_for(row.name, bar)
+                        .unwrap_or(row.blurb)
                 };
                 match before_off.as_deref() {
                     Some(style) if row.name.eq_ignore_ascii_case(style) => {

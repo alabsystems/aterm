@@ -13,7 +13,10 @@
 //! LOCK-WAIT). An interrupt ends the wait ([`crate::interrupt`]). Each time it names the holder,
 //! the wait reads the holder's process tree, and once that has made no progress for its bound
 //! ([`crate::stall`]) it says so, in its line and in its mark, which a ceiling over it may end it
-//! on (CW-WAIT-UNBOUNDED).
+//! on (CW-WAIT-UNBOUNDED). A holder whose work runs in processes outside its tree (a lane run's
+//! VM, which launchd parents) names them in its record ([`NamedLock::credit`]), and the wait
+//! reads them with its tree. The wait is marked in this user's waits too
+//! ([`crate::waits::user_dir`]), so a waiter behind this process reads that it waits in its turn.
 
 use std::fs::File;
 use std::io::{self, Read as _, Seek as _, Write as _};
@@ -45,6 +48,9 @@ pub struct Holder {
     pub verb: String,
     /// The checkout it runs from; empty when the record does not say.
     pub checkout: String,
+    /// The processes outside its tree its work runs in ([`NamedLock::credit`]: its lane's VM's),
+    /// which its waiter reads with its tree; empty when the record names none.
+    pub credit: Vec<u32>,
     /// How long its process tree has made no progress, once that reached its waiter's bound
     /// ([`Pace::stalled_after`]): what its waiter read, never part of the record.
     pub stalled: Option<Duration>,
@@ -60,11 +66,37 @@ impl Holder {
             since: now_secs(),
             verb: verb.to_string(),
             checkout: checkout.to_string_lossy().into_owned(),
+            credit: Vec::new(),
             stalled: None,
         }
     }
 
-    /// The record: pid, since, verb and checkout on one tab-separated line, cut short of
+    /// The record: [`Holder::line`], then, where it is credited with processes, a second line,
+    /// `credit` and their pids, tab-separated, as many as fit in [`RECORD`] (an older reader
+    /// reads the first line alone).
+    #[must_use]
+    pub fn record(&self) -> String {
+        let mut record = self.line();
+        if self.credit.is_empty() {
+            return record;
+        }
+        let limit = usize::try_from(RECORD).map_or(0, |r| r.saturating_sub(1));
+        let mut credit = String::from("credit");
+        for pid in &self.credit {
+            let next = format!("\t{pid}");
+            if record.len() + credit.len() + next.len() + 1 > limit {
+                break;
+            }
+            credit.push_str(&next);
+        }
+        if credit.len() > "credit".len() {
+            record.push_str(&credit);
+            record.push('\n');
+        }
+        record
+    }
+
+    /// The record's first line: pid, since, verb and checkout, tab-separated, cut short of
     /// [`RECORD`] on a character boundary.
     #[must_use]
     pub fn line(&self) -> String {
@@ -88,11 +120,24 @@ impl Holder {
         line
     }
 
-    /// The holder `text` names: a [`Holder::line`], or a bare pid (the trust lane's run lock wrote
-    /// only that before it wrote this record).
+    /// The holder `text` names: a [`Holder::record`], or a bare pid (the trust lane's run lock
+    /// wrote only that before it wrote this record). A credit line is read only whole, its
+    /// newline written: a record being rewritten in place credits nothing it has not finished.
     #[must_use]
     pub fn parse(text: &str) -> Option<Holder> {
         let uint = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        let credit = text
+            .split_inclusive('\n')
+            .nth(1)
+            .and_then(|l| l.strip_suffix('\n')?.strip_prefix("credit\t"))
+            .map(|pids| {
+                pids.split('\t')
+                    .filter(|p| uint(p))
+                    .filter_map(|p| p.parse().ok())
+                    .filter(|p| *p != 0)
+                    .collect()
+            })
+            .unwrap_or_default();
         let line = text.lines().next()?;
         let mut fields = line.splitn(4, '\t');
         let pid = fields
@@ -111,6 +156,7 @@ impl Holder {
             since,
             verb: fields.next().unwrap_or_default().to_string(),
             checkout: fields.next().unwrap_or_default().to_string(),
+            credit,
             stalled: None,
         })
     }
@@ -185,7 +231,9 @@ pub fn name(
 pub struct Pace {
     /// Between two lines naming the holder, after the first.
     pub say_every: Duration,
-    /// How long the holder's process tree may make no progress before the wait calls it stuck.
+    /// How long the holder's process tree may make no progress before the wait calls it stuck;
+    /// its reads judge the tree busy over [`crate::stall::BUSY_OVER`], or over this where it is
+    /// shorter (a test's compressed pace): a tree is never judged over more than it may stall.
     pub stalled_after: Duration,
 }
 
@@ -266,6 +314,34 @@ impl NamedLock {
     pub fn waited(&self) -> Duration {
         self.waited
     }
+
+    /// Name `pids` in the record as the processes outside this process's tree its work runs in
+    /// (a lane run's VM, which launchd parents), in place of any named before, so a waiter
+    /// behind it reads them with its tree ([`Holder::credit`]): this process left out, each pid
+    /// once. The record is rewritten in place, its first line unchanged, so a waiter's read
+    /// never finds it unnamed.
+    ///
+    /// # Errors
+    /// The record could not be written; the lock is held all the same.
+    pub fn credit(&mut self, pids: &[u32]) -> io::Result<()> {
+        let me = self.holder.pid;
+        let mut credit: Vec<u32> = pids
+            .iter()
+            .copied()
+            .filter(|p| *p != me && *p != 0)
+            .collect();
+        credit.sort_unstable();
+        credit.dedup();
+        self.holder.credit = credit;
+        let record = self.holder.record();
+        let lock = self
+            .lock
+            .as_mut()
+            .expect("a named lock owns its guard until consuming transfer");
+        lock.seek(io::SeekFrom::Start(0))?;
+        lock.write_all(record.as_bytes())?;
+        lock.set_len(u64::try_from(record.len()).unwrap_or(RECORD))
+    }
 }
 
 impl std::ops::Deref for NamedLock {
@@ -293,11 +369,12 @@ impl Drop for NamedLock {
 /// waits ([`crate::interrupt::Watch`]), or `stop`, asked every tick, saying `true`, ends the wait
 /// ([`Refused::Stopped`]). A stopped wait leaves a thread blocked on the lock with a handle of its
 /// own until the holder lets go; the lock it then has goes back at once.
-/// While it blocks, the wait is marked where a ceiling over this process's tree reads it
-/// ([`crate::waits`]), naming the holder afresh each time `say` does. Each time, it reads the
-/// holder's process tree ([`crate::stall::tree_work`]): once that has used no CPU time and
-/// written nothing for [`crate::stall::STALLED_AFTER`], the holder `say` hears says so
-/// ([`Holder::stalled`]), and so does the mark ([`crate::waits::Stuck`]). Nobody signals it.
+/// While it blocks, the wait is marked where a ceiling over this process's tree reads it and in
+/// this user's waits ([`crate::waits::Mark::dirs`]), naming the holder afresh each time `say`
+/// does. Each time, it reads the holder's process tree with the processes its record credits it
+/// with ([`crate::stall::tree_work`], [`Holder::credit`]): once those have made no progress for
+/// [`crate::stall::STALLED_AFTER`], the holder `say` hears says so ([`Holder::stalled`]), and so
+/// does the mark ([`crate::waits::Stuck`]). Nobody signals it.
 ///
 /// # Errors
 /// [`Refused`]: [`Refused::Io`] when the file cannot be opened or locked, never for its record.
@@ -314,7 +391,7 @@ pub fn take(
         wait,
         say,
         stop,
-        crate::waits::dir().as_deref(),
+        &crate::waits::Mark::dirs,
         Pace::default(),
         &crate::stall::tree_work,
     )
@@ -339,14 +416,14 @@ pub fn take_paced(
         wait,
         say,
         stop,
-        crate::waits::dir().as_deref(),
+        &crate::waits::Mark::dirs,
         pace,
         &crate::stall::tree_work,
     )
 }
 
-/// [`take`], its wait marked in `marks` (none: unmarked), paced by `pace`, its holder's tree
-/// read by `work`.
+/// [`take`], its wait marked in each directory `marks` names once it blocks (none: unmarked),
+/// paced by `pace`, its holder's tree, with the processes its record credits, read by `work`.
 #[expect(
     clippy::too_many_arguments,
     reason = "take's own five, and the mark, pace and tree reader its tests set"
@@ -357,9 +434,9 @@ fn take_marked(
     wait: Wait,
     say: &mut dyn FnMut(Option<&Holder>, Duration),
     stop: &dyn Fn() -> bool,
-    marks: Option<&Path>,
+    marks: &dyn Fn() -> Vec<std::path::PathBuf>,
     pace: Pace,
-    work: &dyn Fn(u32) -> Option<Work>,
+    work: &dyn Fn(u32, &[u32]) -> Option<Work>,
 ) -> Result<NamedLock, Refused> {
     match RecordLock::try_lock(open(path)?, RECORD) {
         Ok(lock) => return Ok(named(lock, me, Duration::ZERO)),
@@ -371,8 +448,7 @@ fn take_marked(
     }
     let watch = crate::interrupt::Watch::enter();
     let file = open(path)?;
-    let mut mark = marks
-        .and_then(|d| crate::waits::Mark::at(d, &waits_for(path, me, read(path).as_ref())).ok());
+    let mut mark = crate::waits::Mark::in_each(&marks(), &waits_for(path, me, read(path).as_ref()));
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("named-lock wait".into())
@@ -383,7 +459,7 @@ fn take_marked(
         })?;
     let started = Instant::now();
     let mut next = TICK;
-    let mut stall = Stall::default();
+    let mut stall = Stall::over(crate::stall::BUSY_OVER.min(pace.stalled_after));
     loop {
         match rx.recv_timeout(TICK) {
             Ok(taken) => return Ok(named(taken?, me, started.elapsed())),
@@ -403,7 +479,12 @@ fn take_marked(
         if waited >= next {
             let mut holder = read(path);
             if let Some(h) = &mut holder {
-                h.stalled = stall.stuck(h.pid, work(h.pid), Instant::now(), pace.stalled_after);
+                h.stalled = stall.stuck(
+                    h.pid,
+                    work(h.pid, &h.credit),
+                    Instant::now(),
+                    pace.stalled_after,
+                );
             }
             say(holder.as_ref(), waited);
             if let Some(mark) = &mut mark {
@@ -437,6 +518,7 @@ fn waits_for(path: &Path, me: &Holder, holder: Option<&Holder>) -> String {
         Some(h) => {
             let named = Holder {
                 since: 0,
+                credit: Vec::new(),
                 stalled: None,
                 ..h.clone()
             }
@@ -469,7 +551,7 @@ fn named(mut lock: RecordLock, me: &Holder, waited: Duration) -> NamedLock {
         since: now_secs(),
         ..me.clone()
     };
-    let line = holder.line();
+    let line = holder.record();
     let written = lock
         .set_len(0)
         .and_then(|()| lock.seek(io::SeekFrom::Start(0)))
@@ -563,6 +645,7 @@ mod tests {
             since: 1_792_000_000,
             verb: "lab linux\tproof".into(),
             checkout: "/a b/c".into(),
+            credit: Vec::new(),
             stalled: None,
         };
         let back = Holder::parse(&h.line()).expect("a record");
@@ -585,6 +668,42 @@ mod tests {
         assert_eq!(
             Holder::parse("4242").map(|h| h.describe(0)),
             Some("pid 4242".to_string())
+        );
+    }
+
+    /// A record names the processes its holder is credited with on a second line, which reads
+    /// back only whole: a record cut before its newline, as one rewritten in place may be read,
+    /// credits nothing, and a record of one line, an older run's, credits nothing either.
+    #[test]
+    fn a_records_credit_reads_back_only_whole() {
+        let h = Holder {
+            credit: vec![501, 77_000],
+            ..holder("lab linux exec")
+        };
+        let record = h.record();
+        assert_eq!(record.lines().nth(1), Some("credit\t501\t77000"));
+        assert_eq!(Holder::parse(&record), Some(h.clone()));
+        let torn = record.trim_end_matches('\n');
+        assert_eq!(
+            Holder::parse(torn).map(|h| h.credit),
+            Some(Vec::new()),
+            "{torn:?}"
+        );
+        assert_eq!(Holder::parse(&h.line()).map(|h| h.credit), Some(Vec::new()));
+        let many = Holder {
+            credit: (1..2000).collect(),
+            ..h
+        };
+        let record = many.record();
+        assert!(
+            record.len() < usize::try_from(RECORD).expect("fits"),
+            "{}",
+            record.len()
+        );
+        let back = Holder::parse(&record).expect("a record").credit;
+        assert!(
+            !back.is_empty() && many.credit.starts_with(&back),
+            "{back:?}"
         );
     }
 
@@ -877,68 +996,214 @@ mod tests {
         }
     }
 
-    /// A holder that is itself a waiter in a chain reads as working, so a stuck holder's own
-    /// waiters are never called stuck behind it: a process blocked on a held lock wakes every
-    /// [`TICK`] to look for an interrupt, and its tree's CPU time, as the live sweep reads it,
-    /// moves between reads (the reads and the time it took are reported). Where no sweep reads
-    /// processes, it says so and checks nothing.
+    /// Set, the test binary is [`standin_waits_in_the_chain`], on the lock at this path.
+    #[cfg(unix)]
+    const LINK: &str = "ATERM_TOOLCHAIN_NAMED_LOCK_LINK";
+
+    /// Run by [`a_holder_waiting_in_a_chain_is_as_stuck_as_its_head`] as a link of a chain: waits
+    /// for the lock [`LINK`] names at a test's pace (its holder named every quarter of a second,
+    /// judged busy over a second, and stuck after one), writing
+    /// its pid to `waiting` beside it once it waits, for at most the hang detector.
     #[cfg(unix)]
     #[test]
-    fn a_holder_waiting_in_a_chain_reads_as_working() {
-        if aterm_sysprobe::processes().is_none() {
-            eprintln!("no process sweep here: nothing to read");
+    fn standin_waits_in_the_chain() {
+        let Some(path) = std::env::var_os(LINK).map(std::path::PathBuf::from) else {
+            return;
+        };
+        let waiting = path.with_file_name("waiting");
+        let started = Instant::now();
+        let _ = take_paced(
+            &path,
+            &holder("lab linux exec"),
+            Wait::Block,
+            &mut |_, _| {
+                let _ = std::fs::write(&waiting, std::process::id().to_string());
+            },
+            &|| started.elapsed() > aterm_spec::wait::MUST_HAPPEN,
+            Pace {
+                say_every: Duration::from_millis(250),
+                stalled_after: Duration::from_secs(1),
+            },
+        );
+    }
+
+    /// Set, the test binary is [`standin_heads_the_chain`], its work going on while the file this
+    /// names is there.
+    #[cfg(unix)]
+    const HEAD: &str = "ATERM_TOOLCHAIN_NAMED_LOCK_HEAD";
+
+    /// Set with [`HEAD`], the stand-in is the head's working child.
+    #[cfg(unix)]
+    const HEAD_WORKS: &str = "ATERM_TOOLCHAIN_NAMED_LOCK_HEAD_WORKS";
+
+    /// The head [`standin_heads_the_chain`] is, or with [`HEAD_WORKS`] its working child.
+    #[cfg(unix)]
+    fn head(works: &Path, child: bool) -> Standin {
+        let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"));
+        if child {
+            cmd.env(HEAD_WORKS, "1");
+        }
+        Standin(
+            cmd.args([
+                "--exact",
+                "named_lock::tests::standin_heads_the_chain",
+                "--test-threads=1",
+            ])
+            .env(HEAD, works)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .spawn()
+            .expect("the head"),
+        )
+    }
+
+    /// Run by [`a_holder_waiting_in_a_chain_is_as_stuck_as_its_head`] as the head of a chain: its
+    /// child keeps a core busy while the file [`HEAD`] names is there and the head lives; once
+    /// that child ends, the head does nothing, for twice the hang detector at most.
+    #[cfg(unix)]
+    #[test]
+    fn standin_heads_the_chain() {
+        let Some(works) = std::env::var_os(HEAD).map(std::path::PathBuf::from) else {
+            return;
+        };
+        let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN * 2;
+        if std::env::var_os(HEAD_WORKS).is_some() {
+            let parent = std::os::unix::process::parent_id();
+            let mut n = 0u64;
+            while works.exists()
+                && std::os::unix::process::parent_id() == parent
+                && Instant::now() < until
+            {
+                for i in 0..1_000_000u64 {
+                    n = std::hint::black_box(n.wrapping_mul(31).wrapping_add(i));
+                }
+            }
+            return;
+        }
+        let mut child = head(&works, true);
+        let _ = child.0.wait();
+        std::thread::sleep(until.saturating_duration_since(Instant::now()));
+    }
+
+    /// A HOLDER THAT WAITS IN ITS TURN IS AS STUCK AS WHAT IT WAITS BEHIND (CW-WAIT-UNBOUNDED): a
+    /// link waits, through the real wait and its mark in this user's waits, for a lock whose
+    /// record names a head whose child works while a file is there. While that child works, the
+    /// link's tree reads as waiting behind it and is never stuck, though it does nothing of its
+    /// own for thirty minutes of the stall's clock (its own CPU time, a lock wait's looks and its
+    /// sweeps, is reported and is no busy process's; the link names its holder every quarter of
+    /// a second where a wait names it every minute, so its reads are judged on the stall's
+    /// clock, each sweep standing for a minute's, as each read does); once the file goes, the
+    /// child ends, the head idles, and once the link's own waiter calls it stuck, the link's tree
+    /// reads stuck behind it for as long as the link's mark says. NEGATIVE CONTROL: the same reads
+    /// with the mark left out call the link stuck at the bound while its head still works.
+    #[cfg(unix)]
+    #[test]
+    fn a_holder_waiting_in_a_chain_is_as_stuck_as_its_head() {
+        use crate::stall::{STALLED_AFTER, Stall, Waits, busy};
+        if aterm_sysprobe::processes().is_none() || crate::waits::user_dir().is_none() {
+            eprintln!("no process sweep or no home here: nothing to read");
             return;
         }
         let dir = scratch("chain");
         let path = dir.path().join("lane.lock");
+        let works = dir.path().join("head-works");
+        std::fs::write(&works, "").expect("the head's work");
+        let head = head(&works, false);
         let held = take(
             &path,
-            &holder("lab linux proof"),
+            &Holder {
+                pid: head.0.id(),
+                ..holder("lab linux proof")
+            },
             Wait::No,
             &mut quiet,
             &|| false,
         )
         .expect("free");
-        let child = Standin(
+        let link = Standin(
             aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
                 .args([
                     "--exact",
-                    "named_lock::tests::standin_waits_for_the_lock",
+                    "named_lock::tests::standin_waits_in_the_chain",
                     "--test-threads=1",
                     "--nocapture",
                 ])
-                .env(STANDIN, &path)
+                .env(LINK, &path)
+                .env(
+                    crate::waits::TEST_USER_VAR,
+                    crate::waits::user_dir().expect("a waits directory"),
+                )
                 .stdin(aterm_uds::spawnfd::Stdio::null())
                 .stdout(aterm_uds::spawnfd::Stdio::null())
                 .stderr(aterm_uds::spawnfd::Stdio::null())
                 .spawn()
-                .expect("the stand-in"),
+                .expect("the link"),
         );
-        let waiting = dir.path().join("waiting");
         let pid: u32 = aterm_spec::wait::until_within(
             aterm_spec::wait::MUST_HAPPEN,
-            "the stand-in to wait for the lock",
-            || std::fs::read_to_string(&waiting).ok()?.trim().parse().ok(),
-        );
-        let first = crate::stall::tree_work(pid).expect("the waiter is swept");
-        let started = Instant::now();
-        let mut reads = 1;
-        let moved = aterm_spec::wait::until_within(
-            aterm_spec::wait::MUST_HAPPEN,
-            "the waiting holder's CPU time to move",
+            "the link to wait for the lock",
             || {
-                std::thread::sleep(TICK);
-                reads += 1;
-                crate::stall::tree_work(pid).filter(|w| *w != first)
+                std::fs::read_to_string(dir.path().join("waiting"))
+                    .ok()?
+                    .trim()
+                    .parse()
+                    .ok()
             },
         );
-        eprintln!(
-            "a waiter's tree moved from {first:?} to {moved:?} in {:?}, {reads} reads",
-            started.elapsed()
+        let t0 = Instant::now();
+        let minute = |m: u32| t0 + Duration::from_secs(60) * m;
+        let (mut stall, mut unmarked) = (Stall::default(), Stall::default());
+        let read = || Work {
+            at: None,
+            ..crate::stall::tree_work(pid, &[]).expect("the link is swept")
+        };
+        let first = read();
+        let real = Instant::now();
+        let mut last = first;
+        for m in 0..=30 {
+            last = read();
+            assert_eq!(last.waits, Waits::Behind, "minute {m}: {last:?}");
+            assert_eq!(stall.read(pid, Some(last), minute(m)), Some(Duration::ZERO));
+            let alone = Work {
+                waits: Waits::No,
+                ..last
+            };
+            let span = unmarked.stuck(pid, Some(alone), minute(m), STALLED_AFTER);
+            assert_eq!(span.is_some(), m >= 15, "minute {m} unmarked: {span:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (ran, over) = (last.cpu_ns.saturating_sub(first.cpu_ns), real.elapsed());
+        eprintln!("the link's own CPU time while it waited: {ran} ns in {over:?}");
+        assert!(
+            !busy(ran, over),
+            "a lock wait's looks read busy: {ran} ns in {over:?}"
         );
-        assert!(moved.cpu_ns > first.cpu_ns, "{first:?} -> {moved:?}");
-        drop(child);
+        std::fs::remove_file(&works).expect("the head idles");
+        let (behind, span) = aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the link's waiter to call its head stuck",
+            || {
+                let now = read();
+                match now.waits {
+                    Waits::Stuck(span) => Some((now, span)),
+                    Waits::No | Waits::Behind => None,
+                }
+            },
+        );
+        assert!(span >= Duration::from_secs(1), "{span:?}");
+        assert_eq!(stall.read(pid, Some(behind), minute(30)), Some(span));
+        // The lock let go, the link has it and ends, its marks gone with its wait.
         drop(held);
+        let mut link = link;
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the link's end", || {
+            link.0.try_wait().ok().flatten()
+        });
+        assert!(
+            !crate::waits::user_waiting().iter().any(|w| w.pid == pid),
+            "the link's mark outlived its wait"
+        );
+        drop(head);
     }
 
     /// A blocked wait is marked for a ceiling to read, naming the holder, and the mark goes once
@@ -968,7 +1233,7 @@ mod tests {
                     Wait::Block,
                     &mut quiet,
                     &|| started.elapsed() > Duration::from_secs(60),
-                    Some(&marks),
+                    &|| vec![marks.clone()],
                     Pace::default(),
                     &crate::stall::tree_work,
                 )
@@ -1000,16 +1265,17 @@ mod tests {
 
     /// A holder whose process tree does no work is called stuck once it has done none for the
     /// wait's bound: the holder `say` hears names how long, and the mark says so for a ceiling,
-    /// naming its pid; the wait goes on, and the holder keeps its lock. Negative control: a tree
-    /// whose work moves between reads is never called stuck.
+    /// naming its pid; the wait goes on, and the holder keeps its lock. Each read is handed the
+    /// processes the holder's record credits it with ([`NamedLock::credit`]), this process left
+    /// out. Negative control: a tree that runs a core between reads is never called stuck.
     #[test]
     fn a_holder_that_makes_no_progress_is_named_stuck() {
-        use std::cell::{Cell, RefCell};
+        use std::cell::RefCell;
         let dir = scratch("stuck");
         let path = dir.path().join("lane.lock");
         let marks = dir.path().join("waits");
         std::fs::create_dir(&marks).expect("the marks' dir");
-        let held = take(
+        let mut held = take(
             &path,
             &holder("lab linux proof"),
             Wait::No,
@@ -1017,22 +1283,29 @@ mod tests {
             &|| false,
         )
         .expect("free");
+        let me = held.holder().pid;
+        held.credit(&[77_000, me, 501, 77_000]).expect("credited");
+        assert_eq!(read(&path).map(|h| h.credit), Some(vec![501, 77_000]));
         let pace = Pace {
             say_every: Duration::from_millis(100),
             stalled_after: Duration::from_millis(500),
         };
         let idle = Work {
             cpu_ns: 7,
-            written: 0,
             members: 1,
+            ..Work::default()
         };
         for moves in [false, true] {
-            let reads = Cell::new(0u64);
-            let work = |_: u32| {
-                reads.set(reads.get() + 1);
+            let handed = RefCell::new(Vec::new());
+            let ran = Instant::now();
+            let work = |_: u32, credited: &[u32]| {
+                handed.borrow_mut().push(credited.to_vec());
                 Some(if moves {
+                    // A core since the wait began.
+                    let core = u64::try_from(ran.elapsed().as_nanos()).unwrap_or(u64::MAX);
                     Work {
-                        cpu_ns: reads.get(),
+                        cpu_ns: core,
+                        runnable_ns: core,
                         ..idle
                     }
                 } else {
@@ -1056,11 +1329,16 @@ mod tests {
                 },
                 // Fifteen lines, a tenth of a second apart: three times the bound.
                 &|| lines.borrow().len() >= 15 || started.elapsed() > Duration::from_secs(60),
-                Some(&marks),
+                &|| vec![marks.clone()],
                 pace,
                 &work,
             );
             assert!(matches!(got, Err(Refused::Stopped { .. })), "{got:?}");
+            let handed = handed.into_inner();
+            assert!(
+                !handed.is_empty() && handed.iter().all(|c| c == &[501, 77_000]),
+                "{handed:?}"
+            );
             let (lines, marked) = (lines.into_inner(), marked.into_inner());
             let said = |l: &String| l.contains(", which has made no progress for ");
             let stuck: Vec<_> = marked.iter().filter_map(|w| w.stuck.clone()).collect();

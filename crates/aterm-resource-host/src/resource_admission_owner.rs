@@ -44,6 +44,13 @@ mod member_queue;
 mod member_recipe;
 #[path = "resource_admission_members.rs"]
 pub(super) mod members;
+#[path = "resource_admission_metadata.rs"]
+pub(super) mod metadata;
+#[path = "resource_admission_parent_loan.rs"]
+mod parent_loan;
+
+#[path = "resource_admission_preparation.rs"]
+mod preparation;
 #[path = "resource_admission_proxy.rs"]
 mod proxy;
 #[path = "resource_admission_queue.rs"]
@@ -52,6 +59,10 @@ mod queue;
 mod recipe;
 #[path = "resource_admission_recovery.rs"]
 mod recovery;
+#[path = "resource_admission_resolver_root.rs"]
+mod resolver_root;
+#[path = "resource_admission_sdk.rs"]
+mod sdk;
 #[path = "resource_admission_start.rs"]
 mod start;
 #[cfg(test)]
@@ -71,15 +82,25 @@ pub(super) struct Owner {
     faulted: bool,
     recovered_at: Instant,
     failed: Vec<Failed>,
+    #[cfg(test)]
+    recipe_layout: Option<atpkg::store::Layout>,
+    #[cfg(all(test, target_os = "macos"))]
+    metadata_pause: Option<preparation::Pause>,
 }
 struct Pending {
     submission: AuthorizedSubmission,
     events: job::Events,
     recipe: Option<recipe::Recipe>,
-    probe: Option<std::sync::mpsc::Receiver<io::Result<Option<recipe::Recipe>>>>,
+    probe: Option<recipe::Probe>,
+    sdk: Option<trust_resource_controller::SdkCustody>,
     waiter: Option<Waiter>,
     claim: Option<Claim>,
     recovery: Option<PreparedRecovery>,
+    admitted: Option<Custody>,
+    // Captured only from this pending item's actual Claim before custody moves.
+    scope_reference: Option<aterm_capacity::CohortClosureRef>,
+    cancelled: bool,
+    resolver: Option<resolver_root::Preparation>,
 }
 enum Custody {
     Fixed(RetainedCohort),
@@ -88,18 +109,32 @@ enum Custody {
 struct Failed {
     _compiler: Option<compiler::Selection>,
     binding: Binding,
-    custody: Custody,
+    custody: Option<Custody>,
     spawned: Option<Box<spawnfd::Spawned>>,
     no_child: Option<Box<spawnfd::NotSpawned>>,
     checked_at: Option<Instant>,
+    _sdk: Option<std::sync::Arc<sdk::Keeper>>,
+    refusal: Option<(job::Events, String)>,
+    settled: bool,
 }
 struct Job {
     binding: Binding,
     delegation: aterm_types::resource_subgroup::JobContext,
     program: PathBuf,
     native_targo: bool,
-    compiler: Option<compiler::Selection>,
+    metadata_root: bool,
+    metadata_ready: bool,
+    resolver_ready: bool,
+    resolver_queries: usize,
+    sdk: Option<trust_resource_controller::SdkCustody>,
     members: BTreeMap<[u8; 16], member_queue::Slot>,
+    loans: BTreeMap<[u8; 16], parent_loan::RunState>,
+    // Preparing members join on drop. Keep the original transport and SDK
+    // owners until every member has joined or retained uncertain custody.
+    metadata_gnu: Option<metadata::RootGnu>,
+    metadata_sdk: Option<std::sync::Arc<sdk::Keeper>>,
+    resolver: Option<resolver_root::Preparation>,
+    compiler: Option<compiler::Selection>,
     events: job::Events,
     custody: Custody,
     child: aterm_capacity::cohort::launch::CohortChild,
@@ -116,6 +151,10 @@ struct Job {
     cleanup_at: Option<Instant>,
     reaped: bool,
     terminal_sent: bool,
+    completion: Option<(
+        aterm_types::resource_admission::Event,
+        aterm_types::resource_admission::AccountingObservation,
+    )>,
     launched: bool,
     settled: bool,
     settlement_at: Option<Instant>,
@@ -191,6 +230,10 @@ impl Owner {
             faulted: false,
             recovered_at: Instant::now(),
             failed: Vec::new(),
+            #[cfg(test)]
+            recipe_layout: None,
+            #[cfg(all(test, target_os = "macos"))]
+            metadata_pause: None,
         };
         owner.recover()?;
         Ok(owner)
@@ -199,7 +242,7 @@ impl Owner {
         let ready = !self.faulted
             && self.fence.check_current().is_ok()
             && self.ledger.cohort_aware().is_ok_and(|ready| ready);
-        aterm_json::json!({"version":3,"ready":ready,"recipes":["ay-campaign-v3","targo-native-v3"],"unqualified":"refused","inspection":"resource-inspect-v3","status":"json-lines-v3","timeout":"actual-start"})
+        aterm_json::json!({"version":3,"ready":ready,"recipes":["ay-campaign-v3","targo-native-v3"],"unqualified":"refused","inspection":"resource-inspect-v3","status":"json-lines-v3","timeout":"actual-start","accounting":crate::resource_accounting::supported().then_some(trust_resource_controller::accounting::CAPABILITY)})
     }
     pub(super) fn accepts(&self, binding: &Binding) -> bool {
         !self.faulted
@@ -215,9 +258,12 @@ impl Owner {
             && self.journal.fresh(binding).unwrap_or(false)
     }
     pub(super) fn submit(&mut self, submission: AuthorizedSubmission) {
-        if let Err(failure) = self.enqueue(submission) {
+        self.submit_mode(submission, false);
+    }
+    pub(super) fn submit_mode(&mut self, submission: AuthorizedSubmission, accounted: bool) {
+        if let Err(failure) = self.enqueue(submission, accounted) {
             let (submission, _) = *failure;
-            super::refuse(submission);
+            super::refuse_mode(submission, accounted);
         }
     }
     pub(super) fn tick(&mut self) {
@@ -250,9 +296,14 @@ impl Owner {
                 self.faulted = true;
             }
         }
-        if !self.faulted {
-            self.tick_queue();
+        if self.faulted {
+            for pending in &mut self.pending {
+                pending.cancelled = true;
+            }
         }
+        // Paid preparation must still join on a failed owner. This branch can
+        // only cancel; it never admits another job or releases uncertain debt.
+        self.tick_queue();
     }
     pub(super) fn inspect(&mut self, peer: Peer, session: &str) -> io::Result<Inspection> {
         self.fence.check_current()?;
@@ -320,6 +371,14 @@ impl Owner {
 }
 
 #[cfg(all(test, target_os = "macos"))]
-pub(super) fn member_fixture(args: &[std::ffi::OsString]) -> std::process::ExitCode {
-    tests::member_fixture(args)
+pub(super) fn metadata_native_role() {
+    tests::metadata_native_role();
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(super) fn member_fixture(
+    args: &[std::ffi::OsString],
+    gnu: Option<[std::os::fd::OwnedFd; 2]>,
+) -> std::process::ExitCode {
+    tests::member_fixture(args, gnu)
 }

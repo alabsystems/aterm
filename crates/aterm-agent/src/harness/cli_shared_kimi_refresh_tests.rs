@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use std::os::unix::fs::DirBuilderExt as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const EMAIL: &str = "person@example.com";
@@ -981,7 +982,11 @@ fn coordinated_renewal_rereads_peers_and_fences_response_publication() {
                 assert!(lock_path.is_dir());
                 if case == 3 {
                     std::fs::rename(&lock_path, lock_path.with_extension("retained")).unwrap();
-                    std::fs::create_dir(&lock_path).unwrap();
+                    // A peer's lock is 0700 too: the lease, not a mode check, must tell it apart.
+                    std::fs::DirBuilder::new()
+                        .mode(0o700)
+                        .create(&lock_path)
+                        .unwrap();
                 }
                 if case == 4 {
                     authority.0.store(false, Ordering::SeqCst);

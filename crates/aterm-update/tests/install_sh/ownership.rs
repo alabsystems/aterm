@@ -190,7 +190,14 @@ fn bin_entry_verdict(scratch: &Scratch, held: Option<&Path>) {
 #[test]
 fn the_source_lane_links_its_bin_entry_only_where_it_may() {
     let scratch = Scratch::new();
-    let built = scratch.stand_in("lane/built/aterm", ATERM);
+    let built = scratch.stand_in("lane/built/aterm", r#"#!/bin/sh
+if [ "$1" = pkg ]; then
+    [ "$#" = 4 ] && [ "$2" = shell-setup ] && [ "$3" = --installed-command ] && [ "$4" = "$0" ] || exit 98
+    printf '%s\n' "$0" >>"${DECLARED:?}"
+    exit "${RECORD_STATUS:?}"
+fi
+echo 'aterm 0.99.0'
+"#);
     scratch.program(
         "lane/pre-store/bin/aterm",
         "#!/bin/sh\necho \"aterm 0.4.0\"\n",
@@ -198,17 +205,22 @@ fn the_source_lane_links_its_bin_entry_only_where_it_may() {
     let elsewhere = Path::new("/usr/local/Cellar/other/bin/aterm");
     symlink(elsewhere, &scratch.mkdir("lane/foreign/bin").join("aterm"));
     let mut lib = Lib::new();
-    let lanes: Vec<(&str, usize, PathBuf, PathBuf)> = ["pre-store", "foreign"]
+    let lanes: Vec<(&str, usize, PathBuf, PathBuf)> = ["pre-store", "foreign", "record-refused"]
         .into_iter()
         .map(|name| {
             let store = scratch.mkdir(&format!("lane/{name}/store"));
-            let bin = scratch.join(&format!("lane/{name}/bin"));
+            let bin = scratch.mkdir(&format!("lane/{name}/bin"));
             let at = lib.call(
-                source_lane(
-                    &q(s(&scratch.mkdir(&format!("lane/{name}/source")))),
-                    &q(s(&store)),
-                    &q(s(&bin)),
-                    &q(s(&built)),
+                format!(
+                    "(export DECLARED={} RECORD_STATUS={}; {})",
+                    q(s(&scratch.join(&format!("lane/{name}/declared")))),
+                    if name == "record-refused" { 37 } else { 0 },
+                    source_lane(
+                        &q(s(&scratch.mkdir(&format!("lane/{name}/source")))),
+                        &q(s(&store)),
+                        &q(s(&bin)),
+                        &q(s(&built)),
+                    )
                 ),
                 &[],
             );
@@ -230,7 +242,12 @@ fn the_source_lane_links_its_bin_entry_only_where_it_may() {
         );
         let entry = bin.join("aterm");
         let now = std::fs::read_link(&entry).expect("a link at the bin entry");
-        if name == "pre-store" {
+        assert_eq!(
+            read(&scratch.join(&format!("lane/{name}/declared"))),
+            format!("{}\n", s(&store.join("aterm"))),
+            "the just-placed runtime is invoked once, independently of PATH"
+        );
+        if name != "foreign" {
             assert_eq!(now, store.join("aterm"), "{name}: {}", rec.err);
             assert!(line("  ONE command on PATH: "), "{name}: {}", rec.out);
         } else {
@@ -241,6 +258,16 @@ fn the_source_lane_links_its_bin_entry_only_where_it_may() {
                     .starts_with(&format!("install.sh: SKIPPED {}", s(&entry))),
                 "{name}: {}",
                 rec.err
+            );
+        }
+        if name == "record-refused" {
+            assert!(
+                rec.err
+                    .contains("installed command declaration was not recorded")
+            );
+            assert!(
+                store.join("aterm").exists(),
+                "a recording refusal keeps the installed image"
             );
         }
     }
@@ -552,6 +579,18 @@ fn a_binary_that_never_finishes_is_cut_off_and_answers_nothing() {
         ),
         "install.sh: installed ",
     );
+    // The source lane asks the binary it placed twice, each ask bounded: once to record it
+    // (`pkg shell-setup --installed-command`), then its version. Each case parks one of them.
+    let record_store = scratch.mkdir("stall/record-store");
+    let record = kept(
+        &source_lane(
+            &q(s(&scratch.mkdir("stall/record"))),
+            &q(s(&record_store)),
+            &q(s(&scratch.mkdir("stall/record-bin"))),
+            &q(s(&scratch.stand_in("stall/record-built/aterm", &stall))),
+        ),
+        "install.sh: installed ",
+    );
     let linked_bin = scratch.mkdir("stall/linked-bin");
     let linked = kept(
         &bundle_lane(
@@ -657,11 +696,21 @@ fn a_binary_that_never_finishes_is_cut_off_and_answers_nothing() {
         (
             "source",
             "aterm 0.99.0",
-            "",
+            "pkg",
             source,
             format!(
                 "install.sh: installed aterm (it did not say its version) -> {}\nstatus 0",
                 s(&source_store)
+            ),
+        ),
+        (
+            "record",
+            "aterm 0.99.0",
+            "--version",
+            record,
+            format!(
+                "install.sh: installed aterm 0.99.0 -> {}\nstatus 0",
+                s(&record_store)
             ),
         ),
         (
@@ -1602,7 +1651,7 @@ fn a_previous_generations_wedged_front_door_is_not_asked_again() {
 
 /// find_bundle_cli asks each folder once, whatever names it: DEST and ATERM_INSTALL_DIR spelled
 /// alike or with a trailing slash, a link to the folder, or /Applications and ~/Applications
-/// themselves.
+/// themselves. It asks only on a Mac, so `uname` says Darwin here on every host.
 #[test]
 fn each_folder_a_bundle_may_be_in_is_asked_once() {
     let scratch = Scratch::new();
@@ -1620,6 +1669,7 @@ fn each_folder_a_bundle_may_be_in_is_asked_once() {
     let mut lib = Lib::new();
     lib.env("STUB_LOG", s(&log));
     lib.step("may_run() { [[ \"$1\" != /Applications/* ]]; }");
+    lib.step("uname() { echo Darwin; }");
     let slashed = lib.call(
         format!("DEST={0} ATERM_INSTALL_DIR={0}/ bundle_dirs", q(s(&dest))),
         &[],

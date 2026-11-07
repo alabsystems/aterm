@@ -13,6 +13,7 @@ mod index_plan;
 mod index_publish;
 mod index_render;
 mod mirror;
+mod native_seed;
 mod producer_to_client;
 mod rest;
 mod scratch;

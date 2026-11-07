@@ -97,7 +97,7 @@ pub(in crate::membership_log) fn audience_left_out_recipient(
     audience: &EpochAudience,
     recipient: &Recipient,
 ) -> bool {
-    let membership = log.membership();
+    let membership = log.membership_ref();
     let entry_at = membership
         .members()
         .values()
@@ -146,7 +146,7 @@ pub(in crate::membership_log) fn audience_left_out(
     audience: &EpochAudience,
     member: &MemberId,
 ) -> bool {
-    let membership = log.membership();
+    let membership = log.membership_ref();
     let Some(seat) = membership.get(member) else {
         return true;
     };

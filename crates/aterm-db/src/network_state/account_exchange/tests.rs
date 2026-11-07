@@ -264,7 +264,6 @@ fn completed(report: Report, peer: [u8; 48]) -> RepairRound {
         membership_error: None,
         application: Some(report),
         application_error: None,
-        application_cause: None,
         application_interrupted: None,
         application_deferral: None,
         application_batch_deferral: None,
@@ -273,6 +272,13 @@ fn completed(report: Report, peer: [u8; 48]) -> RepairRound {
         completed_at_ms: 500,
         dropped_before: 0,
     }
+}
+
+fn fixture_failure() -> crate::control::Failure {
+    crate::control::Failure::new(
+        aterm_types::network_state::RepairCause::Other,
+        "fixed fixture failure",
+    )
 }
 
 fn admitted(
@@ -324,10 +330,10 @@ fn admitted(
         "ForeignActor" => round.actor = Some([9; 48]),
         "NotStarted" => round.exchange_started = false,
         "Cancelled" => round.cancelled = true,
-        "ControlError" => round.control = Err("fixed fixture failure".into()),
-        "MembershipError" => round.membership_error = Some("fixed fixture failure".into()),
+        "ControlError" => round.control = Err(fixture_failure()),
+        "MembershipError" => round.membership_error = Some(fixture_failure()),
         "MissingApplication" => round.application = None,
-        "ApplicationError" => round.application_error = Some("fixed fixture failure".into()),
+        "ApplicationError" => round.application_error = Some(fixture_failure()),
         "Interrupted" => round.application_interrupted = Some(Report::default()),
         "InventoryDeferral" => {
             round.application_deferral = Some(crate::replica::InventoryDeferral {
@@ -346,7 +352,7 @@ fn admitted(
                 reason: "fixed fixture failure".into(),
             })
         }
-        "HandoffError" => round.handoff = Some(Err("fixed fixture failure".into())),
+        "HandoffError" => round.handoff = Some(Err(fixture_failure())),
         "MissingWitness" => round.application.as_mut().unwrap().matching_inventory = None,
         "CompletedScopeChanged" => round.application.as_mut().unwrap().table = Some([9; 32]),
         "CompletedInventoryChanged" => {

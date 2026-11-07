@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
+use super::land_receipt::Statement;
+
 /// How long each read of [`probe`] may take, the one-minute hang detector: a
 /// read that ends gives the next this long, and a read cut by it makes the
 /// probe [`RepoRead::Unread`].
@@ -242,6 +244,37 @@ pub struct CleanAt {
     /// empty only in a reading taped before the branch was read (slice 9b's). A landing's receipt
     /// names it (slice 9c: `no stash on main`).
     pub branch: String,
+    /// What `head`'s trailers state of how it was judged (design B10: the receipt
+    /// `targo --unverified verify land` writes on a landing merge), read last, only where `head`
+    /// was counted against a remote main ([`statement_of`]); [`Statement::Unread`] elsewhere,
+    /// where that read failed, and in a reading taped before it was read.
+    pub statement: Statement,
+}
+
+/// What commit `head` (lowercase hex, [`CleanAt::head`]) states of how it was judged
+/// ([`Statement`], design B10): its trailer lines, read offline. The read only adds a record to a
+/// clean reading: one git refused, cut or answered with no text states [`Statement::Unread`], and
+/// the reading's cut stays as it was.
+fn statement_of(root: &Path, head: &str, reads: &Reads<'_>) -> Statement {
+    let cut = reads.cut.get();
+    let text = git_offline(
+        root,
+        &[
+            "log",
+            "-1",
+            "--no-show-signature",
+            "--format=%(trailers:only,unfold)",
+            head,
+            "--",
+        ],
+        reads,
+        None,
+    );
+    let read_cut = reads.cut.replace(cut);
+    match text {
+        Some(text) if !read_cut => Statement::of_trailers(&text),
+        _ => Statement::Unread,
+    }
 }
 
 /// A detached `HEAD`'s branch word: git's own, which its stash lines name (`On (no branch): …`,
@@ -1080,7 +1113,7 @@ fn probe_reads(dir: &Path, used: &Used, reads: &Reads<'_>) -> Option<RepoRead> {
     let (outer_top, outer_root) = outermost(&top, &root, &table, reads)?;
     let outer = repo_reads(&outer_top, &outer_root, used, &table, reads);
     if outer_root == root || matches!(outer, Some(RepoRead::Found(_))) {
-        return outer;
+        return stated(outer, &outer_root, reads);
     }
     // A session inside a submodule: its own commits that remote's main lacks are work the
     // project around it never counts. Either read cut is no clean reading.
@@ -1095,7 +1128,20 @@ fn probe_reads(dir: &Path, used: &Used, reads: &Reads<'_>) -> Option<RepoRead> {
     if reads.cut.get() {
         return None;
     }
-    inner.and(outer)
+    stated(inner.and(outer), &outer_root, reads)
+}
+
+/// `read`, where it checked the repository at `root` against a remote main, with what its head
+/// states of how it was judged ([`statement_of`]): the probe's last read, so a cut there starves
+/// none after it.
+fn stated(read: Option<RepoRead>, root: &Path, reads: &Reads<'_>) -> Option<RepoRead> {
+    match read {
+        Some(RepoRead::Checked(mut at)) if at.remote && !at.main_ref.is_empty() => {
+            at.statement = statement_of(root, &at.head, reads);
+            Some(RepoRead::Checked(at))
+        }
+        other => other,
+    }
 }
 
 /// [`probe_reads`] of the repository at top level `top`, the folder `root`.
@@ -1229,6 +1275,7 @@ fn repo_reads(
             return None;
         }
         let head = head?;
+        // What `head` states is read last of all ([`stated`]), so a cut there starves no read.
         return Some(RepoRead::Checked(CleanAt {
             repo: printable(&top),
             head: head.to_ascii_lowercase(),
@@ -1237,6 +1284,7 @@ fn repo_reads(
             branch: branch
                 .as_deref()
                 .map_or_else(|| DETACHED.to_owned(), printable),
+            statement: Statement::Unread,
         }));
     };
     // Offline and with no rename found, as [`work_status`] reads: nothing is fetched.

@@ -80,7 +80,12 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
             Some(aterm_phase::Program::Claude),
             stamp,
         );
-        let _ = tl.mark_task(&TaskMark::new(TaskState::Working), false, Instant::now(), 1);
+        let _ = tl.mark_task(
+            &TaskMark::new(TaskState::Working),
+            &Default::default(),
+            Instant::now(),
+            1,
+        );
         let failed = crate::session_status::Status {
             phase: crate::session_status::Phase::Idle,
             last_outcome: crate::session_status::Outcome::Failure { exit_code: 1 },

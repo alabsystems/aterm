@@ -58,21 +58,83 @@ pub fn parse(args: &[String]) -> Result<BrowserArgs, Fail> {
     Ok(p)
 }
 
-/// Returns the `browser-drive` session names for `arch` and whether they require an X display.
-#[must_use]
-pub const fn sessions(arch: Arch) -> (&'static [&'static str], bool) {
-    match arch {
-        Arch::X86_64 => (&["swiftshader"], false),
-        Arch::Aarch64 => (&["firefox"], true),
+/// What `browser-drive` runs for one arch.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Sessions {
+    /// Its sessions, as `--engine` names them.
+    pub engines: &'static [&'static str],
+    /// The sessions whose worker row the set leaves out (`--no-worker`).
+    pub no_worker: &'static [&'static str],
+    /// Whether they need an X display (Firefox's; WebKit's WPE draws headless).
+    pub display: bool,
+}
+
+impl Sessions {
+    /// `browser-drive`'s flags for the set: each `--engine`, then each `--no-worker`.
+    #[must_use]
+    pub fn flags(&self) -> Vec<String> {
+        let flag = |name: &str, list: &[&str]| -> Vec<String> {
+            list.iter()
+                .flat_map(|e| [name.to_string(), (*e).to_string()])
+                .collect()
+        };
+        let mut flags = flag("--engine", self.engines);
+        flags.extend(flag("--no-worker", self.no_worker));
+        flags
     }
 }
 
-/// The row's name for `arch`.
+/// What `browser-drive` runs for `arch` on the lane's VM or, `gpu`, on the GPU instance
+/// (`docs/measured/linux-gpu-fixes-2026-10-30.md`). WPE gives a worker no WebGL2 on either: the
+/// lane's VM has no DRM render node, and beside the GPU instance's virtio-gpu one it made none
+/// either, so WebKit's worker row is out of the VM's set. The GPU instance drives Firefox alone:
+/// under its client environment (Venus alone, zink) WPE aborts at start, finding no CPU Vulkan
+/// device for its surfaceless EGL display, and without those overrides it draws on llvmpipe, as on
+/// the lane's VM.
 #[must_use]
-pub fn row_name(arch: Arch) -> String {
-    let what = match arch {
-        Arch::X86_64 => "chrome-headless-shell linux64, WebGL2 on SwiftShader",
-        Arch::Aarch64 => "Firefox (Playwright, Ubuntu 24.04) under Xvfb",
+pub const fn sessions(arch: Arch, gpu: bool) -> Sessions {
+    match (arch, gpu) {
+        (Arch::X86_64, _) => Sessions {
+            engines: &["swiftshader"],
+            no_worker: &[],
+            display: false,
+        },
+        (Arch::Aarch64, false) => Sessions {
+            engines: &["firefox", "webkit"],
+            no_worker: &["webkit"],
+            display: true,
+        },
+        (Arch::Aarch64, true) => Sessions {
+            engines: &["firefox"],
+            no_worker: &[],
+            display: true,
+        },
+    }
+}
+
+/// The browsers `verify provision` places in the guest for `arch`'s sessions: Playwright's
+/// WebKit is pinned for Linux on arm64 alone.
+#[must_use]
+pub const fn provisioned(arch: Arch) -> &'static [&'static str] {
+    match arch {
+        Arch::X86_64 => &["chrome-headless-shell", "firefox"],
+        Arch::Aarch64 => &["chrome-headless-shell", "firefox", "webkit"],
+    }
+}
+
+/// The row's name for `arch` on the lane's VM or, `gpu`, on the GPU instance ([`sessions`]).
+#[must_use]
+pub fn row_name(arch: Arch, gpu: bool) -> String {
+    let what = match (arch, gpu) {
+        (Arch::X86_64, _) => "chrome-headless-shell linux64, WebGL2 on SwiftShader",
+        (Arch::Aarch64, false) => {
+            "Firefox under Xvfb and WebKit's WPE, headless (Playwright, Ubuntu 24.04); WPE's \
+             worker row is out, as WPE gives a worker no WebGL2 here"
+        }
+        (Arch::Aarch64, true) => {
+            "Firefox under Xvfb (Playwright, Ubuntu 24.04), on the GPU instance's virtio-gpu; WPE \
+             runs on the lane's VM, as it aborts under zink on Venus"
+        }
     };
     format!("{} ({}) browser: {what}", arch.name(), arch.runs())
 }
@@ -98,6 +160,7 @@ pub fn detail_of(text: &str) -> String {
                 || t.starts_with("NOT RUN ")
                 || l.starts_with("browser: ")
                 || l.starts_with("firefox: ")
+                || l.starts_with("webkit: ")
                 || [
                     "GPU adapter",
                     "against the recording",
@@ -133,9 +196,9 @@ pub fn cmd_browser(args: &[String]) -> Res {
     let ok = laid.verdict == Verdict::Pass;
     rows.push(laid);
     if ok {
-        let lock = linux::LaneLock::boot()?;
+        let mut lock = linux::LaneLock::boot()?;
         waited = lock.waited();
-        let up = linux::bring_up()?;
+        let up = linux::bring_up(&mut lock)?;
         rows.extend(up.timings.iter().map(|step| Row {
             name: format!("vm {}", step.name),
             verdict: if step.failed.is_some() {
@@ -240,7 +303,8 @@ fn drive(
         return Ok(());
     }
     for &arch in &ask.arches {
-        let name = row_name(arch);
+        let gpu = crate::linux_gpu::on();
+        let name = row_name(arch, gpu);
         println!("\n=== {name} ===");
         let started = Instant::now();
         let row = |verdict: Verdict, detail: String| Row {
@@ -284,19 +348,11 @@ fn drive(
             continue;
         }
         let verify = format!("{}/aterm-verify", arch.bin_dir(&format!("{lane}/target")));
-        let fetched = up.guest.shell_streamed(
-            &up.home,
-            &guest::with_env(
-                &env,
-                &[
-                    verify.clone(),
-                    "provision".into(),
-                    "chrome-headless-shell".into(),
-                    "firefox".into(),
-                ],
-            ),
-            "  | ",
-        );
+        let mut provision = vec![verify.clone(), "provision".into()];
+        provision.extend(provisioned(arch).iter().map(|b| (*b).to_string()));
+        let fetched = up
+            .guest
+            .shell_streamed(&up.home, &guest::with_env(&env, &provision), "  | ");
         if !fetched.ok() {
             rows.push(row(
                 Verdict::NotRun,
@@ -304,8 +360,8 @@ fn drive(
             ));
             continue;
         }
-        let (engines, display) = sessions(arch);
-        if display {
+        let set = sessions(arch, gpu);
+        if set.display {
             if let Err(why) = linux::start_display(up, Display::Xvfb) {
                 rows.push(row(Verdict::NotRun, why));
                 continue;
@@ -324,11 +380,7 @@ fn drive(
                 out_dir.clone(),
             ],
         ));
-        argv.extend(
-            engines
-                .iter()
-                .flat_map(|e| ["--engine".to_string(), (*e).to_string()]),
-        );
+        argv.extend(set.flags());
         let out = up.guest.shell_streamed(&up.home, &argv, "  | ");
         up.stop_units();
         let kept = keep(up, &out_dir, &results.join(arch.name()));
@@ -387,12 +439,42 @@ mod tests {
     }
 
     /// x86_64 runs Chromium's SwiftShader with no display; aarch64 runs
-    /// Firefox, which needs one.
+    /// Firefox, which needs one, and WebKit, each provisioned only where pinned.
+    /// WebKit's worker row is out of the lane's VM's set alone, and every
+    /// session the set names reaches browser-drive.
     #[test]
     fn each_arch_runs_its_pinned_browser() {
-        assert_eq!(sessions(Arch::X86_64), (&["swiftshader"][..], false));
-        assert_eq!(sessions(Arch::Aarch64), (&["firefox"][..], true));
-        assert!(row_name(Arch::X86_64).starts_with("x86_64 (Rosetta) browser"));
+        let x86 = sessions(Arch::X86_64, false);
+        assert_eq!((x86.engines, x86.display), (&["swiftshader"][..], false));
+        assert!(x86.no_worker.is_empty());
+        let vm = sessions(Arch::Aarch64, false);
+        assert_eq!((vm.engines, vm.display), (&["firefox", "webkit"][..], true));
+        assert_eq!(vm.no_worker, ["webkit"]);
+        let gpu = sessions(Arch::Aarch64, true);
+        assert_eq!((gpu.engines, gpu.display), (&["firefox"][..], true));
+        assert!(gpu.no_worker.is_empty());
+        assert_eq!(
+            sessions(Arch::Aarch64, false).flags(),
+            [
+                "--engine",
+                "firefox",
+                "--engine",
+                "webkit",
+                "--no-worker",
+                "webkit"
+            ]
+        );
+        assert_eq!(
+            sessions(Arch::Aarch64, true).flags(),
+            ["--engine", "firefox"]
+        );
+        assert!(!provisioned(Arch::X86_64).contains(&"webkit"));
+        assert!(provisioned(Arch::Aarch64).contains(&"webkit"));
+        assert!(row_name(Arch::X86_64, false).starts_with("x86_64 (Rosetta) browser"));
+        assert_ne!(
+            row_name(Arch::Aarch64, false),
+            row_name(Arch::Aarch64, true)
+        );
     }
 
     /// A partial drive never passes: NOT RUN stays NOT RUN, and a kill or a

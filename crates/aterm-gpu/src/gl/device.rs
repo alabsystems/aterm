@@ -24,8 +24,8 @@ pub(crate) struct GlCaps {
     pub(crate) renderer: String,
     /// `GL_VERSION` string reported by the driver.
     pub(crate) version: String,
-    /// `GL_MAX_TEXTURE_SIZE`.
-    pub(crate) max_texture_dim: u32,
+    /// `GL_MAX_TEXTURE_SIZE`, held to `device_layer::GL_MAX_TEXTURE_DIM`.
+    pub(crate) max_texture_dim: crate::device_layer::GlMaxTexture,
     /// Whether both `EXT_sRGB_write_control` and `EXT_texture_sRGB_decode` are supported.
     pub(crate) srgb_views: bool,
     /// Symbol name of the context's `glGetGraphicsResetStatus` entry point.
@@ -1004,7 +1004,7 @@ impl GlDevice {
             bgra_read: has("GL_EXT_read_format_bgra"),
             renderer,
             version,
-            max_texture_dim: u32::try_from(max_tex).unwrap_or(0),
+            max_texture_dim: crate::device_layer::GlMaxTexture::from_driver(max_tex),
             srgb_views: has("GL_EXT_sRGB_write_control") && has("GL_EXT_texture_sRGB_decode"),
         };
         Ok((gl, caps))
@@ -1097,7 +1097,7 @@ impl GlDevice {
         Ok(GlCaps {
             renderer,
             version,
-            max_texture_dim: u32::try_from(max_tex).unwrap_or(0),
+            max_texture_dim: crate::device_layer::GlMaxTexture::from_driver(max_tex),
             srgb_views: false,
         })
     }
@@ -1255,7 +1255,7 @@ mod tests {
         .join()
         .expect("the other thread");
         assert!(
-            dev.caps().max_texture_dim >= 2048,
+            dev.caps().max_texture_dim.get() >= 2048,
             "GLES 3.0 guarantees 2048"
         );
     }

@@ -790,29 +790,40 @@ fn resolve_machine_label_checked(env: &Env) -> Result<Option<String>, String> {
         let canon = candidate.trim().to_ascii_lowercase();
         deny_labels.iter().any(|d| d.eq_ignore_ascii_case(&canon))
     };
-    if let Some(config_path) = env.config.as_deref()
-        && let Ok(Some(text)) = crate::harness::accounts::read_bounded(config_path, 1024 * 1024)
-        && let Ok(table) = aterm_toml::from_str::<aterm_toml::Value>(&text)
+    if let Some(label) = env
+        .config
+        .as_deref()
+        .and_then(|config| config_label(config, &is_denied_label))
     {
-        for (section, key) in [
-            ("swarm", "label"),
-            ("ai", "machine"),
-            ("fleet", "machine"),
-            ("harness", "machine"),
-        ] {
-            if let Some(machine) = table
-                .get(section)
-                .and_then(aterm_toml::Value::as_table)
-                .and_then(|t| t.get(key))
-                .and_then(aterm_toml::Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty() && !is_denied_label(s))
-            {
-                return Ok(Some(machine.to_owned()));
-            }
-        }
+        return Ok(Some(label));
     }
     Ok(vault_label.filter(|h| !is_denied_label(h)))
+}
+
+/// The first of `[swarm] label`, `[ai] machine`, `[fleet] machine` and `[harness] machine` the
+/// `aterm.toml` at `config` sets to a name `denied` does not deny, read by the rule every reader
+/// of the file holds ([`aterm_types::dirs::read_aterm_config_text`]): a file group or others can
+/// write names none.
+fn config_label(config: &Path, denied: &dyn Fn(&str) -> bool) -> Option<String> {
+    let text = aterm_types::dirs::read_aterm_config_text(config).ok()??;
+    let table = aterm_toml::from_str::<aterm_toml::Value>(&text).ok()?;
+    [
+        ("swarm", "label"),
+        ("ai", "machine"),
+        ("fleet", "machine"),
+        ("harness", "machine"),
+    ]
+    .into_iter()
+    .find_map(|(section, key)| {
+        table
+            .get(section)
+            .and_then(aterm_toml::Value::as_table)
+            .and_then(|t| t.get(key))
+            .and_then(aterm_toml::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !denied(s))
+            .map(str::to_owned)
+    })
 }
 
 /// Each pooled CLI's rows, the pools that could not be read, the row each session runs on, as
@@ -1559,6 +1570,40 @@ mod tests {
         assert!(line("soon").is_err(), "CONTROL: a bad figure is no figure");
     }
 
+    /// THE MACHINE LABEL IS READ FROM `aterm.toml` BY THE RULE EVERY READER OF IT HOLDS
+    /// ([`config_label`]): a file group or others can write names none, so a machine with no
+    /// vault has no label. CONTROL: the same file, private or only readable by others, names it.
+    #[cfg(unix)]
+    #[test]
+    fn a_machine_label_is_not_read_from_an_aterm_toml_others_may_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("state");
+        let config = dir.path().join("aterm.toml");
+        std::fs::create_dir_all(&state).unwrap();
+        crate::test_config::write(&config, "[ai]\nmachine = \"m7\"\n").unwrap();
+        for (mode, label) in [
+            (0o600, Some("m7")),
+            (0o644, Some("m7")),
+            (0o620, None),
+            (0o602, None),
+            (0o664, None),
+        ] {
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(mode)).unwrap();
+            let facts = SwarmSurveyFacts::collect_at(
+                &state,
+                None,
+                Some(&config),
+                0,
+                false,
+                None,
+                1_793_160_000,
+            );
+            assert_eq!(facts.label.as_deref(), label, "{mode:o}");
+            assert!(!facts.roster_unread, "{mode:o}");
+        }
+    }
+
     /// Which row a launch there would start on crosses the wire as one field, on every row of a
     /// pool, and an older member, which sends no such field, still parses as saying nothing.
     #[test]
@@ -1687,7 +1732,7 @@ mod tests {
         aterm_secrets::client::admin_publish(&paths, &adm, &doc).expect("publish roster");
         aterm_secrets::client::sync(&paths, None).expect("sync local copy");
 
-        std::fs::write(&config, "[swarm]\nlabel = \"m4\"\n").unwrap();
+        crate::test_config::write(&config, "[swarm]\nlabel = \"m4\"\n").unwrap();
         let facts_denied = SwarmSurveyFacts::collect_at(
             &state,
             Some(&home),
@@ -1728,7 +1773,7 @@ mod tests {
         .expect("set roster");
         aterm_secrets::client::admin_publish(&paths, &adm2, &doc2).expect("publish roster");
         aterm_secrets::client::sync(&paths, None).expect("sync local copy");
-        std::fs::write(&config, "[swarm]\nlabel = \"m100\"\n").unwrap();
+        crate::test_config::write(&config, "[swarm]\nlabel = \"m100\"\n").unwrap();
         let facts_denied_node = SwarmSurveyFacts::collect_at(
             &state,
             Some(&home),

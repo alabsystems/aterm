@@ -14,18 +14,41 @@ use std::io;
 use std::os::unix::process::ExitStatusExt as _;
 use std::time::{Duration, Instant};
 
+#[path = "resource_admission_member/sampling_decision.rs"]
+mod sampling_decision;
+
 /// Borrowed original claim/fence/root access, never a second memory claim.
 pub(super) trait MemberCustody {
+    fn before_arm(&mut self) -> io::Result<()>;
+    fn before_go(&mut self) -> io::Result<()>;
     fn launch(&mut self, command: &mut spawnfd::Command) -> Result<CohortChild, LaunchError>;
     fn bind(&mut self, child: spawnfd::Spawned) -> Result<CohortChild, LaunchError>;
     fn cancel_no_child(&mut self, proof: spawnfd::NotSpawned) -> Result<(), CancelError>;
     fn retire(&mut self, child: &CohortChild) -> io::Result<()>;
+    /// Called only after lexical NoLaunch, authenticated NoChild cancellation,
+    /// or successful actual scope retirement. Retry bookkeeping without
+    /// repeating or reconstructing the consumed native closure proof.
+    fn return_unit(&mut self, receipt: ReturnReceipt) -> io::Result<()>;
     fn validate(&mut self) -> io::Result<()>;
+}
+/// Constructed only at this owned attempt's lexical no-ARM boundary or after
+/// its native cancellation/retirement receipt. No wire value creates one.
+pub(super) enum ReturnReceipt {
+    NoArm,
+    ScopeClosed,
 }
 /// The actual prepared CPU/GNU descriptors and one-use handoff binding.
 pub(super) trait MemberResources {
     fn configure(&mut self, command: &mut spawnfd::Command) -> io::Result<()>;
     fn bind_child(&mut self, pid: u32) -> io::Result<()>;
+    fn finish_inputs(&mut self) -> Option<Result<(), String>> {
+        None
+    }
+    /// A trusted same-process prelude may prepare a second stopped-at-exec
+    /// image. False is preparation only, never target Started or a new grant.
+    fn prepare_target(&mut self, _: &mut spawnfd::Child) -> io::Result<bool> {
+        Ok(true)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -40,6 +63,7 @@ pub(super) struct Completed {
     pub outcome: Outcome,
     pub cause: CompletionCause,
     pub runtime_ns: u64,
+    pub accounting: aterm_types::resource_admission::AccountingObservation,
 }
 pub(super) struct Progress {
     pub go_attempted: bool,
@@ -122,6 +146,7 @@ pub(super) struct OwnedAttempt<D> {
     timeout: Option<Duration>,
     wake: fn(),
     retired: bool,
+    scope_closed: bool,
     uncertain: bool,
 }
 impl<D: MemberResources> OwnedAttempt<D> {
@@ -146,15 +171,17 @@ impl<D: MemberResources> OwnedAttempt<D> {
             timeout,
             wake,
             retired: false,
+            scope_closed: false,
             uncertain: false,
         };
-        if prepared.is_err() || timeout == Some(Duration::ZERO) || this.events.cancelled() {
+        if prepared.is_err()
+            || timeout == Some(Duration::ZERO)
+            || this.events.cancelled()
+            || custody.before_arm().is_err()
+        {
             this.state = State::NotAttempted;
-            this.retired = true; // No ARM or native launch was called.
-            this.resources.take();
-            let _ = this.events.emit(Event::Refused {
-                reason: "member preparation refused before ARM".into(),
-            });
+            this.scope_closed = true; // No ARM or native launch was called.
+            this.finish_return(custody);
             return this;
         }
         this.accept_launch(custody.launch(&mut command));
@@ -186,11 +213,16 @@ impl<D: MemberResources> OwnedAttempt<D> {
             _ => None,
         }
     }
-    /// Retain the registered group in aggregate accounting through retirement,
-    /// including after its leader has been reaped. This grants no signal control.
+    /// Stop attributing the numeric group after its owning reap, independently
+    /// of scope retirement. Original resources remain held until retirement.
+    /// This observation supplies neither signal nor release authority.
     pub fn group(&self) -> Option<i32> {
         match &self.state {
-            State::Bound(bound) if !self.retired => Some(bound.child.cohort().group()),
+            State::Bound(bound)
+                if sampling_decision::may_attribute_group(bound.reaped, self.retired) =>
+            {
+                Some(bound.child.cohort().group())
+            }
             _ => None,
         }
     }
@@ -208,12 +240,27 @@ impl<D: MemberResources> OwnedAttempt<D> {
             bound.stop(CompletionCause::Cancelled);
             return Err(refused("member identity or exit witness unavailable"));
         }
+        let prepared = self
+            .resources
+            .as_mut()
+            .ok_or_else(|| refused("member descriptors missing"))?
+            .prepare_target(bound.child.child_mut());
+        match prepared {
+            Ok(false) => return Err(io::ErrorKind::WouldBlock.into()),
+            Ok(true) => {}
+            Err(error) => {
+                self.events.abandon();
+                bound.stop(CompletionCause::Cancelled);
+                return Err(error);
+            }
+        }
         let prepare = (|| {
             self.resources
                 .as_mut()
                 .ok_or_else(|| refused("member descriptors missing"))?
                 .bind_child(bound.pid)?;
             custody.validate()?;
+            custody.before_go()?;
             let (monotonic_ns, unix_ns) = clocks()?;
             if self.events.cancelled() || bound.child.child_mut().exited()? {
                 return Err(refused("member cancelled or exited before GO"));
@@ -303,12 +350,8 @@ impl<D: MemberResources> OwnedAttempt<D> {
             // this caller cannot turn that uncertainty into free capacity.
             match custody.cancel_no_child(*proof) {
                 Ok(()) => {
-                    self.retired = true;
+                    self.scope_closed = true;
                     self.uncertain = false;
-                    self.resources.take();
-                    let _ = self.events.emit(Event::Refused {
-                        reason: "member target did not start".into(),
-                    });
                 }
                 Err(error) => {
                     let (_, proof) = error.into_parts();
@@ -323,22 +366,21 @@ impl<D: MemberResources> OwnedAttempt<D> {
         }
         if let State::Bound(bound) = &mut self.state {
             self.uncertain = poll_bound(bound, &mut self.events, self.timeout, cause);
-            if bound.reaped && !self.retired && custody.retire(&bound.child).is_ok() {
-                self.retired = true;
-                self.resources.take();
-                // Returning Finished lets the native caller reuse its borrowed
-                // unit for another member. Never publish that handoff before
-                // this exact scope retired and its host descriptor loan ended.
-                // Runtime still ends at primary exit, excluding cleanup time.
-                if let Some(complete) = &bound.completed {
-                    let _ = self.events.emit(Event::Finished {
-                        outcome: complete.outcome.clone(),
-                        cause: complete.cause,
-                        runtime_ns: complete.runtime_ns,
-                    });
+            if bound.reaped && !self.scope_closed {
+                // Retain actual CPU and original memory until input recheck.
+                if let Some(result) = self
+                    .resources
+                    .as_mut()
+                    .and_then(MemberResources::finish_inputs)
+                {
+                    self.events.inputs_unchanged(result);
                 }
             }
+            if bound.reaped && !self.scope_closed && custody.retire(&bound.child).is_ok() {
+                self.scope_closed = true;
+            }
         }
+        self.finish_return(custody);
         let (ready, completed) = match &self.state {
             State::Bound(bound) => (
                 !bound.go_attempted && bound.cleanup_at.is_none(),
@@ -358,6 +400,42 @@ impl<D: MemberResources> OwnedAttempt<D> {
             retired: self.retired,
             uncertain: self.uncertain,
             drained: self.retired && self.events.drained(),
+        }
+    }
+    fn finish_return(&mut self, custody: &mut impl MemberCustody) {
+        if !self.scope_closed || self.retired {
+            return;
+        }
+        let receipt = if matches!(self.state, State::NotAttempted) {
+            ReturnReceipt::NoArm
+        } else {
+            ReturnReceipt::ScopeClosed
+        };
+        if custody.return_unit(receipt).is_err() {
+            return;
+        }
+        self.retired = true;
+        self.resources.take();
+        // Native closure and the durable logical return are separate receipts.
+        // Never re-consume a NoChild proof or re-retire a scope on write retry.
+        let event = match &self.state {
+            State::Bound(bound) => bound.completed.as_ref().map(|complete| Event::Finished {
+                outcome: complete.outcome.clone(),
+                cause: complete.cause,
+                runtime_ns: complete.runtime_ns,
+            }),
+            State::NotAttempted | State::NoChild(None) => Some(Event::Refused {
+                reason: "member target did not start".into(),
+            }),
+            _ => None,
+        };
+        if let Some(event) = event {
+            let accounting = match &self.state {
+                State::Bound(bound) => bound.completed.as_ref().map(|complete| complete.accounting),
+                _ => None,
+            }
+            .unwrap_or_else(aterm_types::resource_admission::AccountingObservation::uncollected);
+            let _ = self.events.emit_terminal(event, accounting);
         }
     }
 }
@@ -447,8 +525,11 @@ fn poll_bound(
     if bound.cleanup_at.is_none() || !others_exited || (bound.launched && bound.ended.is_none()) {
         return false;
     }
-    let status = match bound.child.child_mut().try_wait() {
-        Ok(Some(status)) => status,
+    let (status, accounting) = match crate::resource_accounting::try_reap(
+        bound.child.child_mut(),
+        events.requires_accounting(),
+    ) {
+        Ok(Some(value)) => value,
         Ok(None) => return false,
         Err(_) => {
             events.abandon();
@@ -468,6 +549,7 @@ fn poll_bound(
                 cause: bound.cause,
                 runtime_ns: u64::try_from(end.saturating_duration_since(start).as_nanos())
                     .unwrap_or(u64::MAX),
+                accounting,
             };
             bound.completed = Some(complete);
         } else {

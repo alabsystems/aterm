@@ -580,6 +580,39 @@ pub fn prune_links(root: &Path) -> Result<Vec<String>> {
     Ok(pruned)
 }
 
+/// A canonical MC install links the seal used to build it as `toolchain`.
+/// Its compiler has already been admitted against `hello`; only that same
+/// explicitly declared donor can replace the link during relocation.
+fn prune_mc_toolchain(root: &Path, hello: &Path, donors: &[PathBuf]) -> Result<bool> {
+    let link = root.join("toolchain");
+    match std::fs::symlink_metadata(&link) {
+        Ok(meta) if meta.is_symlink() => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(Error::io("inspect MC toolchain link", &error)),
+    }
+    if !donors
+        .iter()
+        .any(|donor| std::fs::canonicalize(donor).is_ok_and(|donor| donor.as_path() == hello))
+    {
+        return Err(Error::refused(
+            "trust-mc's toolchain link requires its admitted --hello-sysroot as an explicit \
+             --donor-root; the signed payload must contain the relocated libraries",
+        ));
+    }
+    let target = std::fs::canonicalize(&link)
+        .map_err(|error| Error::io("resolve MC toolchain link", &error))?;
+    if target.as_path() != hello {
+        return Err(Error::refused(format!(
+            "trust-mc's toolchain link names {}, not its admitted hello sysroot {}",
+            target.display(),
+            hello.display()
+        )));
+    }
+    std::fs::remove_file(&link).map_err(|error| Error::io("prune MC toolchain link", &error))?;
+    Ok(true)
+}
+
 /// Prune every triple-shaped `lib/rustlib/<dir>` that is not `triple` or kept.
 ///
 /// # Errors
@@ -887,6 +920,15 @@ impl<'a> Staged<'a> {
     pub fn mutate(self) -> Result<Mutated<'a>> {
         let Staged { b, stage } = self;
         let root = root_of(&stage);
+        if b.req.program == "trust-mc"
+            && let HelloPlan::Trust { sysroot, compiler } = &b.hello
+            && compiler == "trust-mc-compiler"
+            && prune_mc_toolchain(&root, sysroot, &b.req.donor_roots)?
+        {
+            eprintln!(
+                "atpkg-publish: pruned admitted MC toolchain link; relocation uses its explicit donor"
+            );
+        }
         for p in prune_links(&root)? {
             eprintln!("atpkg-publish: pruned dev-source symlink {p}");
         }

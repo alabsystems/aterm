@@ -30,6 +30,10 @@ aterm-netplace = { workspace = true }
 aterm-theme-pack = { workspace = true }
 # `aterm help rust` calls `atpkg::toolchain` discovery rather than restating it.
 atpkg = { workspace = true }
+# `aterm doctor`'s `spotlight:` row knows an x.py checkout's build tree, and whether its
+# bootstrap moves it to `build.noindex`, by the rule disk discovery reads it by
+# (`aterm_toolchain::xpy`). Workspace crate; no cycle, and atpkg already links it.
+aterm-toolchain = { workspace = true }
 # `aterm doctor`'s `services:` row: whether plain targo's cache root sits in a quiet folder
 # (`aterm_tempfile::is_quiet`); the tests' scratch directories too.
 aterm-tempfile = { workspace = true }
@@ -58,12 +62,13 @@ aterm-acaffeine = { workspace = true }
 # own services' footprints (`services`) that `aterm doctor`'s `services:` row reports.
 aterm-uds = { workspace = true }
 # The bar past which a service holds too much memory, the restarts aterm knows, and the byte
-# words the `services:` row prints (`services`, `words::mem`). A pure model crate with no
-# dependencies.
+# words the `services:` row prints (`services`, `words::mem`); and the tables `aterm help sys`
+# lists from (`sys::View::ALL`, `sys::UNAVAILABLE_WORDS`, the jobs engine's classes and
+# verdicts). A pure model crate with no dependencies.
 aterm-vitals = { workspace = true }
 # `aterm.toml` parser for `aterm doctor` and `show-config`.
 aterm-toml = { workspace = true }
-# `aterm help sys` reads THIS machine at the moment of the call (its OS and CPU
+# `aterm help sys machine` reads THIS machine at the moment of the call (its OS and CPU
 # words, the cluster layout, memory and swap, the GPU, the load and the home
 # volume) through the readers the window's sampler calls, so the page never
 # states a remembered fact. First-party, std plus libc, and already in this

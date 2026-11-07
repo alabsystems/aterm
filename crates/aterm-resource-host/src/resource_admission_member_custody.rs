@@ -13,8 +13,27 @@ pub(super) struct Borrowed<'a> {
     pub debt: &'a ExternalDebt,
     pub peer: Peer,
     pub proof: Option<&'a crate::resource_producer::TransportProof>,
+    pub member: [u8; 16],
+    pub loan: Option<parent_loan::Edge>,
+    pub journal: &'a journal::Journal,
 }
 impl member::MemberCustody for Borrowed<'_> {
+    fn before_arm(&mut self) -> io::Result<()> {
+        if let Some(edge) = self.loan {
+            self.validate()?;
+            parent_loan::intent(self.job, self.peer, edge, self.journal)?;
+        }
+        Ok(())
+    }
+    fn before_go(&mut self) -> io::Result<()> {
+        if let Some(edge) = self.loan {
+            parent_loan::lend(self.job, edge, self.journal)?;
+            // The durable write may block. Recheck the actual producer/root
+            // afterward, before the caller stamps GO and checks cancellation.
+            self.validate()?;
+        }
+        Ok(())
+    }
     fn launch(&mut self, command: &mut spawnfd::Command) -> Result<CohortChild, LaunchError> {
         self.validate().map_err(LaunchError::Refused)?;
         match &mut self.job.custody {
@@ -83,6 +102,16 @@ impl member::MemberCustody for Borrowed<'_> {
             ));
         }
         job::inspection(self.fence, self.debt, self.job)?;
+        Ok(())
+    }
+    fn return_unit(&mut self, receipt: member::ReturnReceipt) -> io::Result<()> {
+        if parent_loan::outgoing(self.job, self.member).is_some() {
+            return Err(refused("member still owns an outgoing CPU continuation"));
+        }
+        if let Some(edge) = self.loan {
+            self.fence.check_current()?;
+            parent_loan::returned(self.job, edge, receipt, self.journal)?;
+        }
         Ok(())
     }
 }

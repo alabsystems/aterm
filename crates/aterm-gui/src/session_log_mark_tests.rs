@@ -202,7 +202,7 @@ fn a_flood_of_acted_keys_keeps_the_sessions_records() {
     assert!(reply.starts_with("OK"), "{reply}");
     let _ = h.ctx.timeline.lock().unwrap().mark_task(
         &TaskMark::new(TaskState::Working),
-        false,
+        &Default::default(),
         std::time::Instant::now(),
         1,
     );

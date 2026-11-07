@@ -187,6 +187,9 @@ pub(super) struct TransientState {
     pub(super) print_anchor: Option<(u16, u16)>,
     /// Monotonic count of print actions, paired with [`Self::print_anchor`] so an unchanged end position still reads as new output.
     pub(super) print_anchor_seq: u64,
+    /// Test seam: take every run of text lines one action at a time, never coalescing its line feeds ([`Terminal::set_reference_line_runs`](super::Terminal::set_reference_line_runs)).
+    #[cfg(any(test, debug_assertions))]
+    pub(super) reference_line_runs: bool,
     /// Monotonic count of kitty-graphics APC strings that ended (complete or cut short by CAN/SUB), every one counted whatever it did.
     pub(super) kitty_commands: u64,
     /// Monotonic count of Kitty unscrolls (`CSI n + T`) run on the main screen, where they pull history onto it; never reset.
@@ -287,6 +290,8 @@ impl TransientState {
             osc_events: OscEventQueue::default(),
             print_anchor: None,
             print_anchor_seq: 0,
+            #[cfg(any(test, debug_assertions))]
+            reference_line_runs: false,
             kitty_commands: 0,
             kitty_unscrolls: 0,
             host_io_ordinal: 0,

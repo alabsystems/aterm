@@ -61,7 +61,7 @@ use aterm_digest::Sha256;
 use aterm_metrics::subject::{Node, Now, Subject};
 use aterm_net::fleet::link::Bell;
 use aterm_types::MutexExt as _;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
@@ -122,6 +122,11 @@ const READ_RETRY_MAX: Duration = Duration::from_secs(60);
 /// The refusals the journal names, at most, in one run: each `(subject, reason)` once.
 const SAID_MAX: usize = 64;
 
+/// How many of this Mac's own holdings the board remembers ([`Behind`]): each time a row of its
+/// own says it holds other records than its row before, one more. At one change a period it
+/// spans 32 minutes; a seat that lags further reads [`Behind::Apart`].
+pub const OWN_KEPT: usize = 64;
+
 #[cfg(any(test, debug_assertions))]
 thread_local! {
     /// The negative control of the freshness rule (`stale-rows-up`): a board made on a thread
@@ -171,6 +176,41 @@ impl Build {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Its release, `(major, minor)` of `MAJOR.MINOR.PATCH` with optional `+<build metadata>`
+    /// (`0.147.0+g1a2b3c4d` is `(0, 147)`); `None` for a build this cannot read as one.
+    #[must_use]
+    pub fn release(&self) -> Option<(u64, u64)> {
+        let core = match self.0.split_once('+') {
+            Some((core, meta))
+                if !meta.is_empty()
+                    && meta
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-')) =>
+            {
+                core
+            }
+            Some(_) => return None,
+            None => &self.0,
+        };
+        let number = |part: &str| {
+            (!part.is_empty()
+                && (part.len() == 1 || !part.starts_with('0'))
+                && part.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| part.parse::<u64>().ok())
+            .flatten()
+        };
+        let mut parts = core.split('.');
+        match (
+            parts.next().and_then(number),
+            parts.next().and_then(number),
+            parts.next().and_then(number),
+            parts.next(),
+        ) {
+            (Some(major), Some(minor), Some(_), None) => Some((major, minor)),
+            _ => None,
+        }
     }
 }
 
@@ -643,6 +683,67 @@ pub enum Standing {
     },
 }
 
+/// How far a seat's newest row says it is from what this Mac holds (§4.12, "In step" and
+/// "slowest"): read from the two digests alone, against the holdings of this Mac's own rows the
+/// board remembers ([`OWN_KEPT`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Behind {
+    /// It holds the membership log and the lab tables this Mac's newest row holds.
+    InStep,
+    /// Of each store it holds what this Mac held at some point the board remembers, so it lacks
+    /// only records that reached this Mac since: the oldest of them reached it at least
+    /// `at_least` ago, by this Mac's clock (it came no later than the first row of this Mac's
+    /// that held it).
+    Behind {
+        /// The least age, on this Mac's clock, of the oldest record it lacks.
+        at_least: Duration,
+    },
+    /// Of some store it holds what none of this Mac's remembered rows held: records this Mac
+    /// lacks, or a lag older than the board remembers.
+    Apart,
+    /// Its row or this Mac's does not name a digest (no row yet, a store that did not read).
+    Unknown,
+}
+
+/// What [`Behind`] reads of one store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lag {
+    Same,
+    Behind(Duration),
+    Apart,
+    Unknown,
+}
+
+/// `theirs` against this Mac's remembered holdings `own` of one store (`pick`), at `now`.
+fn lag_of(
+    own: &VecDeque<(Holds, Duration)>,
+    pick: fn(&Holds) -> Option<Held>,
+    theirs: Option<Held>,
+    now: Duration,
+) -> Lag {
+    let (Some(theirs), Some(mine)) = (theirs, own.back().and_then(|(holds, _)| pick(holds))) else {
+        return Lag::Unknown;
+    };
+    if theirs == mine {
+        return Lag::Same;
+    }
+    // The latest point this Mac held what they hold, then the first row after it that held
+    // more: the records they lack reached this Mac no later than that row.
+    let Some(held_at) = own
+        .iter()
+        .rposition(|(holds, _)| pick(holds) == Some(theirs))
+    else {
+        return Lag::Apart;
+    };
+    // A remembered row whose store did not read says nothing of what it held.
+    own.iter()
+        .skip(held_at + 1)
+        .find(|(holds, _)| pick(holds).is_some_and(|held| held != theirs))
+        .map_or(Lag::Apart, |(_, since)| {
+            Lag::Behind(now.saturating_sub(*since))
+        })
+}
+
 /// What this Mac holds of one seat.
 #[derive(Clone, Debug)]
 struct Mark {
@@ -664,6 +765,9 @@ pub struct Board {
     written: BTreeMap<String, u64>,
     /// When it was last written, on the links' clock.
     wrote_at: Option<Duration>,
+    /// This Mac's own holdings, oldest first, each with when a row of its own first held it (the
+    /// links' clock): at most [`OWN_KEPT`].
+    own: VecDeque<(Holds, Duration)>,
     #[cfg(any(test, debug_assertions))]
     stale_rows_up: bool,
 }
@@ -678,9 +782,48 @@ impl Board {
             written: seen.clone(),
             seen,
             wrote_at: None,
+            own: VecDeque::new(),
             #[cfg(any(test, debug_assertions))]
             stale_rows_up: stale_rows_up(),
         }
+    }
+
+    /// A row of this Mac's own, taken at `now`, holds `holds`: remembered where it differs from
+    /// what the last one held.
+    fn note_own(&mut self, holds: Holds, now: Duration) {
+        if self.own.back().is_some_and(|(last, _)| *last == holds) {
+            return;
+        }
+        if self.own.len() == OWN_KEPT {
+            self.own.pop_front();
+        }
+        self.own.push_back((holds, now));
+    }
+
+    /// How far `principal`'s newest row is from what this Mac holds, at `now`: in step where both
+    /// stores are, apart or unknown where either store is, else behind by the larger lag.
+    #[must_use]
+    pub fn behind(&self, principal: &str, now: Duration) -> Behind {
+        let Some(theirs) = self.marks.get(principal).map(|mark| mark.row.holds()) else {
+            return Behind::Unknown;
+        };
+        let lags = [
+            lag_of(&self.own, |holds| holds.membership, theirs.membership, now),
+            lag_of(&self.own, |holds| holds.tables, theirs.tables, now),
+        ];
+        if lags.contains(&Lag::Unknown) {
+            return Behind::Unknown;
+        }
+        if lags.contains(&Lag::Apart) {
+            return Behind::Apart;
+        }
+        lags.iter()
+            .filter_map(|lag| match lag {
+                Lag::Behind(at_least) => Some(*at_least),
+                _ => None,
+            })
+            .max()
+            .map_or(Behind::InStep, |at_least| Behind::Behind { at_least })
     }
 
     /// Whether `row` is no backlog at `wall_ms`: its origin wrote it within [`FRESH`].
@@ -1006,6 +1149,8 @@ pub struct Seat {
     pub me: bool,
     /// Up, or silent since when.
     pub standing: Standing,
+    /// How far its newest row is from what this Mac holds.
+    pub behind: Behind,
     /// Its newest row and that row's sequence number, where this Mac holds one.
     pub row: Option<(u64, PresenceRow)>,
 }
@@ -1100,22 +1245,7 @@ impl Shared {
             return Err(Refusal::Subject);
         };
         let principal = &subject[3..21];
-        let (pid, seq) = origin.ok_or(Refusal::Unstamped)?;
-        if pid != astream_broker::producer_id_of(principal) {
-            return Err(Refusal::Producer);
-        }
-        let me = &self.mesh.me;
-        if principal == me.principal {
-            if !astream_broker::origin::verify(&me.key, subject, seq, body) {
-                return Err(Refusal::Signature);
-            }
-        } else {
-            let key = self.mesh.seat_key(principal).ok_or(Refusal::NotSeated)?;
-            if !astream_broker::origin::verify(&key, subject, seq, body) {
-                return Err(Refusal::Signature);
-            }
-        }
-        let payload = astream_broker::origin::payload(body).ok_or(Refusal::Signature)?;
+        let (seq, payload) = signed_by(&self.mesh, principal, subject, origin, body)?;
         let row = PresenceRow::decode(payload).map_err(Refusal::Row)?;
         Ok((principal, seq, row))
     }
@@ -1145,6 +1275,9 @@ impl Shared {
         let (took, mine) = {
             let mut board = self.board.lock_or_recover();
             let took = board.offer(principal, seq, row, live, now, wall);
+            if took != Took::Kept && principal == self.mesh.me.principal {
+                board.note_own(theirs, now);
+            }
             let mine = board
                 .row(&self.mesh.me.principal)
                 .map(|(_, row)| row.holds())
@@ -1218,11 +1351,39 @@ impl Shared {
     }
 }
 
-/// Presence running in the node service: the publisher of this Mac's row and the tail that reads
-/// every Mac's. Dropping it stops both.
+/// The sequence number and payload of `body`, delivered on `principal`'s `subject` with `origin`,
+/// where its origin stamp carries `principal`'s producer id and its envelope verifies under
+/// `principal`'s node key: this Mac's own, or a current seat's.
+pub(crate) fn signed_by<'b>(
+    mesh: &Mesh,
+    principal: &str,
+    subject: &str,
+    origin: Option<(u64, u64)>,
+    body: &'b [u8],
+) -> Result<(u64, &'b [u8]), Refusal> {
+    let (pid, seq) = origin.ok_or(Refusal::Unstamped)?;
+    if pid != astream_broker::producer_id_of(principal) {
+        return Err(Refusal::Producer);
+    }
+    let key = if principal == mesh.me.principal {
+        mesh.me.key
+    } else {
+        mesh.seat_key(principal).ok_or(Refusal::NotSeated)?
+    };
+    if !astream_broker::origin::verify(&key, subject, seq, body) {
+        return Err(Refusal::Signature);
+    }
+    let payload = astream_broker::origin::payload(body).ok_or(Refusal::Signature)?;
+    Ok((seq, payload))
+}
+
+/// Presence running in the node service: the publisher of this Mac's row, the tail that reads
+/// every Mac's, and the view's server ([`crate::view`]) that answers a reader on this Mac what
+/// they hold. Dropping it stops all three.
 pub struct Presence {
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
+    view: Option<Arc<crate::view::Server>>,
 }
 
 impl fmt::Debug for Presence {
@@ -1269,6 +1430,13 @@ impl Presence {
         let mut presence = Self {
             shared: Arc::clone(&shared),
             threads: Vec::new(),
+            view: match crate::view::Server::bind(&shared.dir) {
+                Ok(server) => server.map(Arc::new),
+                Err(e) => {
+                    aterm_log::warn!("mesh: presence: the view is not served: {e}");
+                    None
+                }
+            },
         };
         let reader = Arc::clone(&shared);
         presence.threads.push(
@@ -1282,6 +1450,14 @@ impl Presence {
                 .name("aterm-mesh-presence".to_owned())
                 .spawn(move || publish(&publisher))?,
         );
+        if let Some(server) = &presence.view {
+            let (server, answering) = (Arc::clone(server), Arc::clone(&shared));
+            presence.threads.push(
+                std::thread::Builder::new()
+                    .name("aterm-mesh-view".to_owned())
+                    .spawn(move || server.run(&|| answering.stopped(), &|| answering.view()))?,
+            );
+        }
         aterm_log::info!(
             "mesh: presence: {} writes its row every {} s",
             mesh.me.principal,
@@ -1310,6 +1486,7 @@ impl Presence {
         Some(Seat {
             me: key == mesh.me.key,
             standing: board.standing(principal, now),
+            behind: board.behind(principal, now),
             row: board.row(principal).map(|(seq, row)| (seq, row.clone())),
             principal: principal.to_owned(),
             key,
@@ -1324,9 +1501,13 @@ impl Presence {
         if let Some(closer) = self.shared.closer.lock_or_recover().as_ref() {
             closer.close();
         }
+        if let Some(server) = &self.view {
+            server.nudge();
+        }
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
+        self.view = None;
     }
 }
 
@@ -1342,11 +1523,48 @@ impl Shared {
             .map(|(principal, key)| Seat {
                 me: key == mesh.me.key,
                 standing: board.standing(&principal, now),
+                behind: board.behind(&principal, now),
                 row: board.row(&principal).map(|(seq, row)| (seq, row.clone())),
                 principal,
                 key,
             })
             .collect()
+    }
+
+    /// The view a reader on this Mac is answered ([`crate::view`]): every seat as the board reads
+    /// it now, and every seat's newest needs row and activity row, each read on its own under one
+    /// deadline both share, so one that fails leaves the other and the two together stay within
+    /// the bound a reader waits ([`crate::view::WITHIN`]).
+    pub(crate) fn view(&self) -> crate::view::View {
+        let deadline = crate::view::rows_deadline();
+        let needs = match crate::view::needs_rows(&self.mesh, deadline) {
+            Ok(needs) => Some(needs),
+            Err(e) => {
+                self.say_once(
+                    format_args!("needs:{e}"),
+                    format_args!("the view holds no needs rows: {e}"),
+                );
+                None
+            }
+        };
+        let activity = match crate::view::activity_rows(&self.mesh, deadline) {
+            Ok(activity) => Some(activity),
+            Err(e) => {
+                self.say_once(
+                    format_args!("activity:{e}"),
+                    format_args!("the view holds no activity rows: {e}"),
+                );
+                None
+            }
+        };
+        crate::view::View {
+            me: self.mesh.me.principal.clone(),
+            at_ms: relay::wall_ms(&self.mesh.wall),
+            standings: self.mesh.seats_by_principal().is_some(),
+            seats: self.seats(),
+            needs,
+            activity,
+        }
     }
 
     /// [`Mesh::holders`].
@@ -2074,6 +2292,130 @@ mod tests {
         }
         for no in ["127.0.0.1", "::1", "fe80::1", "8.8.8.8", "2001:db8::1"] {
             assert!(!dialable(ip(no)), "{no} is not");
+        }
+    }
+
+    /// Holdings that differ by `n`: a membership log of `n` records and no tables.
+    fn holds(n: u8) -> Holds {
+        Holds {
+            membership: Some(Held::membership(&(0..n).map(|i| [i; 32]).collect())),
+            tables: Some(Held::tables(&BTreeMap::new(), &BTreeMap::new())),
+        }
+    }
+
+    /// A row of `who`'s that holds `held`, offered live now.
+    fn holding(at: &mut At, who: &str, seq: u64, held: Holds) {
+        let wall = at.wall();
+        let row = PresenceRow {
+            membership: held.membership,
+            tables: held.tables,
+            ..row(wall)
+        };
+        at.board.offer(who, seq, row, true, at.now, wall);
+    }
+
+    /// §4.12 "slowest": a seat whose row holds what this Mac held before it moved on reads
+    /// behind by at least how long ago this Mac's own rows first held more; one that holds what
+    /// this Mac holds now reads in step; one that holds what none of this Mac's remembered rows
+    /// held reads apart, and one whose row names no digest reads unknown. A repeat of this Mac's
+    /// holdings is no change, and only the last [`OWN_KEPT`] changes are remembered.
+    /// NEGATIVE CONTROL: the same seat read before this Mac moved on is in step.
+    #[test]
+    fn a_seat_reads_behind_by_when_this_mac_moved_past_what_it_holds() {
+        const Y: &str = "n-00000000000000bb";
+        let mut at = At::new();
+        at.board.note_own(holds(1), at.now);
+        holding(&mut at, X, 1, holds(1));
+        assert_eq!(at.board.behind(X, at.now), Behind::InStep, "the control");
+        at.pass(30 * S);
+        at.board.note_own(holds(2), at.now);
+        at.pass(30 * S);
+        at.board.note_own(holds(2), at.now);
+        at.board.note_own(holds(3), at.now);
+        at.pass(30 * S);
+        assert_eq!(
+            at.board.behind(X, at.now),
+            Behind::Behind { at_least: 60 * S },
+            "this Mac first held more 60 s ago"
+        );
+        holding(&mut at, Y, 1, holds(2));
+        assert_eq!(
+            at.board.behind(Y, at.now),
+            Behind::Behind { at_least: 30 * S },
+            "a repeat of the same holdings did not move the time"
+        );
+        holding(&mut at, Y, 2, holds(3));
+        assert_eq!(at.board.behind(Y, at.now), Behind::InStep);
+        // A row of this Mac's whose membership did not read, between holding 3 and holding
+        // more, is no row that held more: the lag runs from the one that did.
+        let gap = Holds {
+            membership: None,
+            ..holds(3)
+        };
+        at.pass(10 * S);
+        at.board.note_own(gap, at.now);
+        at.pass(10 * S);
+        at.board.note_own(holds(4), at.now);
+        at.pass(10 * S);
+        assert_eq!(
+            at.board.behind(Y, at.now),
+            Behind::Behind { at_least: 10 * S },
+            "an unread store's row is not where this Mac first held more"
+        );
+        at.board.note_own(holds(3), at.now);
+        holding(&mut at, Y, 3, holds(9));
+        assert_eq!(
+            at.board.behind(Y, at.now),
+            Behind::Apart,
+            "records this Mac lacks"
+        );
+        holding(
+            &mut at,
+            Y,
+            4,
+            Holds {
+                tables: None,
+                ..holds(3)
+            },
+        );
+        assert_eq!(
+            at.board.behind(Y, at.now),
+            Behind::Unknown,
+            "no tables digest"
+        );
+        assert_eq!(
+            at.board.behind("n-00000000000000cc", at.now),
+            Behind::Unknown,
+            "no row"
+        );
+        for n in 4..4 + u8::try_from(OWN_KEPT).expect("a small bound") {
+            at.pass(S);
+            at.board.note_own(holds(n), at.now);
+        }
+        assert_eq!(
+            at.board.behind(X, at.now),
+            Behind::Apart,
+            "a lag older than the board remembers"
+        );
+    }
+
+    /// A build's release is the major and minor of its version, build metadata or none; any
+    /// other text is no release.
+    #[test]
+    fn a_builds_release_is_its_major_and_minor() {
+        let release = |text: &str| Build::new(text).and_then(|build| build.release());
+        assert_eq!(release("0.147.0+g1a2b3c4d"), Some((0, 147)));
+        assert_eq!(release("0.159.0"), Some((0, 159)));
+        assert_eq!(release("1.2.3+dev.4-x"), Some((1, 2)));
+        for no in [
+            "0.147",
+            "0.147.0.1",
+            "00.147.0",
+            "0.147.0+",
+            "v0.147.0",
+            "dev-build",
+        ] {
+            assert_eq!(release(no), None, "{no}");
         }
     }
 

@@ -95,10 +95,9 @@ fn incremental_reader_keeps_old_snapshots_and_publishes_only_valid_suffixes() {
         RetainedHistoryReadCounts {
             same_directory: RetainedHistoryReadOutcomes {
                 lookups: 1,
-                unchanged: 1,
+                unmoved: 1,
                 ..Default::default()
             },
-            journal_read_attempts: 1,
             ..Default::default()
         }
     );
@@ -340,11 +339,12 @@ fn concurrent_read_counts_conserve_joined_work_without_assuming_cache_order() {
         counts.other_directory,
         counts.unavailable,
     ];
-    assert_eq!(counts.journal_read_attempts, 16);
+    let unmoved = rows.iter().map(|row| row.unmoved).sum::<u64>();
+    assert_eq!(counts.journal_read_attempts, 16 - unmoved);
     assert_eq!(rows.iter().map(|row| row.lookups).sum::<u64>(), 16);
     assert_eq!(
         rows.iter()
-            .map(|row| row.unchanged + row.rebuilt)
+            .map(|row| row.unmoved + row.unchanged + row.rebuilt)
             .sum::<u64>(),
         16
     );
@@ -355,6 +355,51 @@ fn concurrent_read_counts_conserve_joined_work_without_assuming_cache_order() {
     assert_eq!(counts.replay_records_accepted, rebuilt);
     assert_eq!(counts.replay_failures, 0);
     assert!(counts.replacements >= 1 && counts.replacements < counts.publications);
+}
+
+/// A reader that asks again and again of a journal nobody wrote (the Commons control session's
+/// peer checks, a policy check per table) validates it once: at the owner's size, a long history
+/// of 2,000 receipts, a hundred reads read the journal's acknowledged bytes once. A file written
+/// with the same bytes (the claim saved again) moves its stamps, so the next read validates the
+/// journal again, finds it unchanged, and the read after it reads nothing again; an append is
+/// read at the next read.
+///
+/// NEGATIVE CONTROL (2026-11-06): with the stamps never compared (every read validated, as
+/// before), the hundred reads read the journal a hundred times (`left: 100, right: 1`).
+#[test]
+fn a_journal_nobody_wrote_is_validated_once() {
+    let mut fixture = Receipts::new();
+    for n in 1..=2000 {
+        fixture.append(n);
+    }
+    let cache = ReadCache::new();
+    let before = cache.1.snapshot();
+    let first = cache.read(&fixture.paths).unwrap();
+    assert_eq!(first.1, 2000);
+    for _ in 1..100 {
+        assert!(Arc::ptr_eq(&first, &cache.read(&fixture.paths).unwrap()));
+    }
+    let counts = counted(&cache, before);
+    assert_eq!(counts.journal_read_attempts, 1);
+    assert_eq!(counts.same_directory.unmoved, 99);
+
+    aterm_journal::write_private_durable(&fixture.paths.dir, "records.frontiers", READY).unwrap();
+    let before = cache.1.snapshot();
+    for _ in 0..2 {
+        assert!(Arc::ptr_eq(&first, &cache.read(&fixture.paths).unwrap()));
+    }
+    let counts = counted(&cache, before);
+    assert_eq!(
+        (
+            counts.same_directory.unchanged,
+            counts.same_directory.unmoved
+        ),
+        (1, 1),
+        "validated again once a stamp moved, and not again after"
+    );
+
+    fixture.append(2001);
+    assert_eq!(cache.read(&fixture.paths).unwrap().1, 2001);
 }
 
 pub(crate) fn writer_replay_transition(

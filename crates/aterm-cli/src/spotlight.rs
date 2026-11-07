@@ -20,6 +20,9 @@ const INIT_SPOTLIGHT: &str = "init.spotlight";
 pub(crate) struct Spotlit {
     /// Each folder holding indexed crate files, `~`-relative, with its count, most first.
     pub builds: Vec<(String, usize)>,
+    /// The folders of [`Spotlit::builds`] that are an x.py checkout's `build/`, in its order,
+    /// each with what its checkout's bootstrap does with it ([`Bootstrap`]).
+    pub xpy: Vec<(String, Bootstrap)>,
     /// rustup's home, `~`-relative, and the `*.html` indexed in it.
     pub rustup: Option<(String, Pages)>,
     /// Why bare doctor leaves the indexed `rust-docs` pages where they are, when it does
@@ -99,6 +102,29 @@ fn kept_by_choice() -> Option<String> {
 #[cfg(not(target_os = "macos"))]
 const fn kept_by_choice() -> Option<String> {
     None
+}
+
+/// What becomes of the indexed `build/` an x.py checkout's bootstrap writes ([`bootstrap_of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Bootstrap {
+    /// The checkout holds Trust's noindex-layout module (`aterm_toolchain::xpy::NOINDEX_LAYOUT`):
+    /// its next x.py build moves `build/` to `build.noindex`, which Spotlight skips.
+    Moves,
+    /// Its bootstrap does not make that move, and the checkout supports the layout made by
+    /// hand (`aterm_toolchain::xpy::supports_noindex_layout`: Trust since 2026-09-25):
+    /// [`BY_HAND`], which first checks the checkout's build lock is free, takes `build/` out of
+    /// the index.
+    ByHand,
+    /// Something named `build.noindex` (a folder, a file, a link, one that leads nowhere) is
+    /// already beside the indexed `build/`: a move there would fail, or nest one tree in the
+    /// other, and which of the two the checkout keeps (a `bootstrap.toml` `build-dir` can name
+    /// either) is not read here, so the row says what it saw and gives no command.
+    Blocked,
+    /// Its checkout does not support the layout (an upstream rustc checkout, Trust before
+    /// 2026-09-25), where a move by hand leaves `build.noindex` untracked by git and
+    /// `x.py clean --all` removing only the link; so the row gives none, and `build/` stays
+    /// indexed while it is there.
+    Stays,
 }
 
 /// The `*.html` Spotlight indexes in rustup's home, each list most first.
@@ -263,6 +289,7 @@ fn decode(kept: &str) -> Option<Spotlit> {
     Some(Spotlit {
         docs_kept: None,
         builds: Vec::new(),
+        xpy: Vec::new(),
         rustup,
     })
 }
@@ -285,10 +312,34 @@ fn measure(home: &Path, rustup: &Path, query: &Query<'_>) -> Result<Spotlit, Str
         (crates, listed)
     });
     let crates = crates?;
+    // `mdfind` prints each path as the volume spells it, which a home reached through a link
+    // spells otherwise: both spellings are the home's.
+    let homes: Vec<PathBuf> = std::iter::once(home.to_path_buf())
+        .chain(std::fs::canonicalize(home).ok().filter(|real| real != home))
+        .collect();
     let mut builds = Tally::default();
+    // Keyed by each crate file's own folder: a build root is read off the path, which stops at
+    // the first folder named `target` or `build`, and so above a checkout that lies under one.
+    let mut placed: HashMap<String, String> = HashMap::new();
+    let mut bootstraps: HashMap<String, Bootstrap> = HashMap::new();
     for path in crates.split('\0').filter(|p| !p.is_empty()) {
-        builds.add(tilde(home, &build_root(path)));
+        let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+        let folder = placed.entry(dir.to_owned()).or_insert_with_key(|dir| {
+            let (folder, repo) = counted_under(&homes, dir, path);
+            if let Some(repo) = repo {
+                bootstraps
+                    .entry(folder.clone())
+                    .or_insert_with(|| bootstrap_of(&repo));
+            }
+            folder
+        });
+        builds.add(folder.clone());
     }
+    let builds = builds.most_first();
+    let xpy = builds
+        .iter()
+        .filter_map(|(folder, _)| Some((folder.clone(), *bootstraps.get(folder)?)))
+        .collect();
     let rustup_home = match (real_rustup, listed) {
         (Some(real), Some(listed)) => {
             let listed = listed?;
@@ -312,9 +363,54 @@ fn measure(home: &Path, rustup: &Path, query: &Query<'_>) -> Result<Spotlit, Str
     };
     Ok(Spotlit {
         docs_kept: None,
-        builds: builds.most_first(),
+        builds,
+        xpy,
         rustup: rustup_home,
     })
+}
+
+/// The folder the crate file `path`, in the folder `dir`, is counted under, `~`-relative, and,
+/// for an x.py checkout's `build/`, the checkout: a file inside that `build/` (in a stage tree,
+/// a stage sysroot) is counted under the `build/` itself, which is what a move would take
+/// (`aterm_toolchain::xpy`), found from the file's own folder up, so a checkout under a folder
+/// named `build` or `target` is still met. Any other file is counted under its [`build_root`],
+/// and so is one under no spelling of the home or in a folder of it aterm never looks into
+/// (`aterm_toolchain::checkout::never_looked_at`: on macOS the privacy-guarded folders, where
+/// even a look can put a dialog on the person's screen), where nothing is read.
+fn counted_under(homes: &[PathBuf], dir: &str, path: &str) -> (String, Option<PathBuf>) {
+    use aterm_toolchain::{checkout, xpy};
+    let root = || tilde_in(homes, &build_root(path));
+    let dir = Path::new(dir);
+    let Some(home) = homes.iter().find(|home| dir.starts_with(home)) else {
+        return (root(), None);
+    };
+    if checkout::never_looked_at(dir, Some(home)).is_some() {
+        return (root(), None);
+    }
+    match xpy::build_holding(dir) {
+        Some((build, xpy::BUILD)) => (
+            tilde_in(homes, &build.to_string_lossy()),
+            build.parent().map(Path::to_path_buf),
+        ),
+        _ => (root(), None),
+    }
+}
+
+/// What becomes of the x.py checkout `repo`'s indexed `build/`, read once per checkout. Only a
+/// clean "not found" for `build.noindex` leaves the way clear: anything there, or a look that
+/// fails, is [`Bootstrap::Blocked`].
+fn bootstrap_of(repo: &Path) -> Bootstrap {
+    use aterm_toolchain::xpy;
+    let beside = std::fs::symlink_metadata(repo.join(xpy::BUILD_NOINDEX));
+    if !beside.is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+        Bootstrap::Blocked
+    } else if xpy::moves_build_aside(repo) {
+        Bootstrap::Moves
+    } else if xpy::supports_noindex_layout(repo) {
+        Bootstrap::ByHand
+    } else {
+        Bootstrap::Stays
+    }
 }
 
 /// Counts per name, in first-seen order until [`Tally::most_first`].
@@ -423,15 +519,27 @@ fn mdfind(dir: &Path, pattern: &str) -> Result<String, String> {
     )
 }
 
-/// `list`'s answer, or nothing when `count` says there is nothing to list.
+/// `list`'s answer, or nothing when `count` says there is nothing to list; a count that reads
+/// as no number is refused, never taken for one, and so is an empty list after a count of some:
+/// `mdfind` prints nothing and exits 0 when its server cannot be reached, and that is no
+/// measurement of the index.
 fn count_then_list(
     count: impl FnOnce() -> Result<String, String>,
     list: impl FnOnce() -> Result<String, String>,
 ) -> Result<String, String> {
-    if count()?.trim() == "0" {
+    let said = count()?;
+    let said = said.trim_matches(|c: char| c.is_whitespace() || c == '\0');
+    let n: u64 = said
+        .parse()
+        .map_err(|_| format!("mdfind gave no count ({said:?})"))?;
+    if n == 0 {
         return Ok(String::new());
     }
-    list()
+    let listed = list()?;
+    if listed.is_empty() {
+        return Err(format!("mdfind counted {n} but listed none"));
+    }
+    Ok(listed)
 }
 
 fn mdfind_run(dir: &Path, pattern: &str, count: bool) -> Result<String, String> {
@@ -445,15 +553,64 @@ fn mdfind_run(dir: &Path, pattern: &str, count: bool) -> Result<String, String> 
     let deadline = now
         .checked_add(QUERY)
         .unwrap_or_else(|| now + Duration::from_secs(365 * 86_400));
-    let out = aterm_uds::deadline::output_until(&mut cmd, deadline)
-        .map_err(|e| format!("mdfind did not answer: {e}"))?;
+    let listed = listing(&mut cmd, deadline, LISTING)?;
+    if count {
+        Ok(listed)
+    } else {
+        whole_list(listed)
+    }
+}
+
+/// The most a Spotlight listing is read to: the listing reader's hard maximum, 64 MiB, some
+/// 450,000 paths.
+const LISTING: usize = aterm_uds::deadline::MAX_COMPLETE_LISTING_BYTES;
+
+/// `listed`, a `-0` list, when it ends as one does: `mdfind -0` ends every path with a NUL, so
+/// one that does not was cut short, and is refused rather than counted with a cut path. An
+/// empty one is [`count_then_list`]'s to judge against its count.
+fn whole_list(listed: String) -> Result<String, String> {
+    if listed.is_empty() || listed.ends_with('\0') {
+        Ok(listed)
+    } else {
+        Err("mdfind's list ended mid-path".to_owned())
+    }
+}
+
+/// What `cmd` (an `mdfind`) printed by `deadline`, every byte of it, read through a pipe to its
+/// end (`aterm_uds::deadline::output_until_complete_listing`). A listing of every crate
+/// file, or of every page of a few toolchains' docs, runs to tens of MiB: a reader that kept a
+/// bounded tail would count part of the index, and one that had it written to a file would
+/// count what a full disk let through, since `mdfind` does not check its writes and still
+/// exits 0. One past `most` bytes is refused rather than counted short; past `deadline` the
+/// reader kills `cmd`'s process group and refuses.
+fn listing(
+    cmd: &mut aterm_uds::spawnfd::Command,
+    deadline: Instant,
+    most: usize,
+) -> Result<String, String> {
+    use aterm_uds::deadline::{CompleteOutputError, RunError};
+    let out = aterm_uds::deadline::output_until_complete_listing(cmd, deadline, most).map_err(
+        |e| match e {
+            CompleteOutputError::StdoutTooLarge { limit } => format!(
+                "Spotlight lists more than {} MiB of paths, more than is read",
+                limit >> 20
+            ),
+            CompleteOutputError::Run(RunError::TimedOut) => {
+                format!("mdfind did not answer within {}s", QUERY.as_secs())
+            }
+            CompleteOutputError::Run(RunError::Spawn(e)) => format!("mdfind did not start: {e}"),
+            e => format!("mdfind did not answer: {e}"),
+        },
+    )?;
     if !out.status.success() {
+        let why = &out.stderr[..out.stderr.len().min(4096)];
         return Err(format!(
             "mdfind failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            String::from_utf8_lossy(why).trim()
         ));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(String::from_utf8(out.stdout)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
 }
 
 /// The folder a crate file's build lives in, as a person would delete or rename it.
@@ -492,6 +649,15 @@ fn tilde(home: &Path, path: &str) -> String {
     }
 }
 
+/// `path` `~`-relative by the first spelling of the home it lies under ([`tilde`]).
+fn tilde_in(homes: &[PathBuf], path: &str) -> String {
+    homes
+        .iter()
+        .map(|home| tilde(home, path))
+        .find(|shown| shown != path)
+        .unwrap_or_else(|| path.to_owned())
+}
+
 fn largest(counts: &[(String, usize)], more: &str) -> String {
     let mut top: Vec<String> = counts
         .iter()
@@ -508,6 +674,123 @@ fn total(counts: &[(String, usize)]) -> usize {
     counts
         .iter()
         .fold(0usize, |acc, (_, n)| acc.saturating_add(*n))
+}
+
+/// `folders` named, at most three and how many more: `a`, `a and b`, `a, b and c`,
+/// `a, b, c and 2 more`.
+fn named(folders: &[&str]) -> String {
+    match folders {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [head @ .., last] if folders.len() <= 3 => format!("{} and {last}", head.join(", ")),
+        _ => format!("{} and {} more", folders[..3].join(", "), folders.len() - 3),
+    }
+}
+
+/// The move by hand that takes an x.py checkout's `build/` out of Spotlight, run in the checkout
+/// (Trust's `docs/BUILD_AND_INSTALL.md`, "Keeping Spotlight out of build/"). It moves nothing
+/// unless Trust's build lock says free (`status` exits 0 only then: 3 for held, and for free
+/// with something running outside the lock) and nothing named `build.noindex` is there, not
+/// even a link that leads nowhere, which `test -e` alone would miss.
+const BY_HAND: &str = "scripts/trust_build_lock.sh status && test ! -e build.noindex && test ! -L \
+                       build.noindex && mv build build.noindex && ln -s build.noindex build";
+
+/// One line of [`xpy_lines`]: `one` of a single folder, `many` of the folders named.
+fn said(
+    folders: &[&str],
+    one: impl Fn(&str) -> String,
+    many: impl Fn(&str) -> String,
+) -> Option<String> {
+    match folders {
+        [] => None,
+        [folder] => Some(one(folder)),
+        _ => Some(many(&named(folders))),
+    }
+}
+
+/// What the row says of the indexed x.py `build/` folders, a line for each [`Bootstrap`] they
+/// are: whose checkout's next x.py build moves them out of Spotlight's way, which the move by
+/// hand ([`BY_HAND`]) takes out, which have a `build.noindex` beside them already, and which
+/// stay.
+fn xpy_lines(lit: &Spotlit) -> Vec<String> {
+    let of = |kind: Bootstrap| -> Vec<&str> {
+        lit.xpy
+            .iter()
+            .filter(|(_, k)| *k == kind)
+            .map(|(folder, _)| folder.as_str())
+            .collect()
+    };
+    [
+        said(
+            &of(Bootstrap::Moves),
+            |one| {
+                format!(
+                    "{one} is an x.py checkout's build tree; its next x.py build moves it to \
+                     build.noindex, which Spotlight skips"
+                )
+            },
+            |many| {
+                format!(
+                    "{many} are x.py checkouts' build trees; each checkout's next x.py build \
+                     moves its tree to build.noindex, which Spotlight skips"
+                )
+            },
+        ),
+        said(
+            &of(Bootstrap::ByHand),
+            |one| {
+                format!(
+                    "{one} is an x.py checkout's build tree, and its bootstrap does not move it \
+                     to build.noindex; `{BY_HAND}` in the checkout takes it out of the index, \
+                     and moves nothing while its build lock is held"
+                )
+            },
+            |many| {
+                format!(
+                    "{many} are x.py checkouts' build trees, and their bootstraps do not move \
+                     them to build.noindex; `{BY_HAND}` in a checkout takes its tree out of the \
+                     index, and moves nothing while its build lock is held"
+                )
+            },
+        ),
+        said(
+            &of(Bootstrap::Blocked),
+            |one| {
+                format!(
+                    "{one} is an x.py checkout's build tree, and {one}.noindex is already there \
+                     beside it; a move there would fail or nest one in the other, so {one} stays \
+                     indexed while both are there"
+                )
+            },
+            |many| {
+                format!(
+                    "{many} are x.py checkouts' build trees, each with a build.noindex already \
+                     there beside it; a move there would fail or nest one in the other, so each \
+                     stays indexed while both are there"
+                )
+            },
+        ),
+        said(
+            &of(Bootstrap::Stays),
+            |one| {
+                format!(
+                    "{one} is an x.py checkout's build tree, and its checkout does not support \
+                     Trust's build.noindex layout (an upstream rustc checkout, or Trust before \
+                     2026-09-25), so it stays indexed while it is there"
+                )
+            },
+            |many| {
+                format!(
+                    "{many} are x.py checkouts' build trees, and their checkouts do not support \
+                     Trust's build.noindex layout (an upstream rustc checkout, or Trust before \
+                     2026-09-25), so each stays indexed while it is there"
+                )
+            },
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// The row's fact and whether it is clean, pure over the count.
@@ -532,12 +815,24 @@ pub(crate) fn row(measured: &Result<Spotlit, String>) -> (bool, String) {
             total(&lit.builds),
             largest(&lit.builds, "folders")
         ));
-        lines.push(
-            "written where the shims' rule did not place them (a direct targo, another \
-             repository's build, an installed toolchain); a folder leaves the index when \
-             it is deleted or named *.noindex"
-                .into(),
-        );
+        lines.extend(xpy_lines(lit));
+        let others = lit
+            .builds
+            .iter()
+            .filter(|(folder, _)| !lit.xpy.iter().any(|(x, _)| x == folder))
+            .count();
+        if others > 0 {
+            let (written, them) = match (lit.xpy.is_empty(), others) {
+                (true, _) => ("written", "them"),
+                (false, 1) => ("the other folder was written", "it"),
+                (false, _) => ("the other folders were written", "them"),
+            };
+            lines.push(format!(
+                "{written} where the shims' rule did not place {them} (a direct targo, another \
+                 repository's build, an installed toolchain); a folder leaves the index when \
+                 it is deleted or named *.noindex"
+            ));
+        }
     }
     if !pages.docs.is_empty() {
         lines.push(format!(
@@ -657,6 +952,7 @@ mod tests {
     fn a_person_who_left_rust_in_spotlight_unchecked_keeps_the_docs() {
         let docs = Spotlit {
             builds: Vec::new(),
+            xpy: Vec::new(),
             rustup: Some((
                 "~/.rustup".to_owned(),
                 Pages {
@@ -704,6 +1000,7 @@ mod tests {
         );
         let clean = Spotlit {
             builds: Vec::new(),
+            xpy: Vec::new(),
             rustup: None,
             docs_kept: None,
         }
@@ -725,7 +1022,9 @@ mod tests {
         assert!(!declines(false, false, true), "the person's plan checks it");
     }
 
-    /// A zero count lists nothing. NEGATIVE CONTROL: a nonzero count lists.
+    /// A zero count lists nothing. NEGATIVE CONTROLS: a nonzero count lists; an answer that is no
+    /// number (an empty one, as a write `mdfind` did not check leaves) is refused, never taken
+    /// for a count, and lists nothing.
     #[test]
     fn a_zero_count_lists_nothing() {
         let listed = std::cell::Cell::new(0);
@@ -748,6 +1047,18 @@ mod tests {
             Err("mdfind did not answer".into())
         );
         assert_eq!(listed.get(), 1, "an unanswered count lists nothing");
+        for said in ["", "\n", "nine"] {
+            assert!(
+                count_then_list(|| Ok(said.into()), list).is_err(),
+                "{said:?} is no count"
+            );
+        }
+        assert_eq!(listed.get(), 1, "no count lists nothing");
+        assert_eq!(
+            count_then_list(|| Ok("3\n".into()), || Ok(String::new())),
+            Err("mdfind counted 3 but listed none".into()),
+            "a count of some, then an empty list, is no measurement"
+        );
     }
 
     /// A clean verdict is kept for its key: the next run under that key measures nothing. A
@@ -767,6 +1078,7 @@ mod tests {
             Ok(Spotlit {
                 docs_kept: None,
                 builds: Vec::new(),
+                xpy: Vec::new(),
                 rustup: Some((
                     "~/.rustup".to_owned(),
                     Pages {
@@ -797,6 +1109,7 @@ mod tests {
             Ok(Spotlit {
                 docs_kept: None,
                 builds: vec![("~/w/target".to_owned(), 3)],
+                xpy: Vec::new(),
                 rustup: None,
             })
         };
@@ -814,6 +1127,7 @@ mod tests {
         let unframeable = Spotlit {
             docs_kept: None,
             builds: Vec::new(),
+            xpy: Vec::new(),
             rustup: Some((
                 "~/.rustup".to_owned(),
                 Pages {
@@ -981,6 +1295,7 @@ mod tests {
         let clean = Spotlit {
             docs_kept: None,
             builds: vec![],
+            xpy: Vec::new(),
             rustup: None,
         };
         assert_eq!(
@@ -993,6 +1308,7 @@ mod tests {
         let licenses = Spotlit {
             docs_kept: None,
             builds: vec![],
+            xpy: Vec::new(),
             rustup: Some((
                 "~/.rustup".into(),
                 Pages {
@@ -1020,6 +1336,7 @@ mod tests {
                 ("~/y/target".into(), 2),
                 ("~/z/target".into(), 1),
             ],
+            xpy: Vec::new(),
             rustup: Some((
                 "~/.rustup".into(),
                 Pages {
@@ -1050,6 +1367,7 @@ mod tests {
         let docs_only = Spotlit {
             docs_kept: None,
             builds: vec![],
+            xpy: Vec::new(),
             rustup: Some((
                 "~/.rustup".into(),
                 Pages {
@@ -1063,6 +1381,411 @@ mod tests {
         assert_eq!(
             row(&Err("a test binary".into())),
             (false, "not measured (a test binary)".into())
+        );
+    }
+
+    /// AN X.PY CHECKOUT'S `build/` IS COUNTED WHOLE AND SAYS WHAT BECOMES OF IT: its stage trees
+    /// and stage sysroots count under the `build/` itself, and so do those of a checkout under a
+    /// folder named `build`. A checkout holding Trust's noindex-layout module moves it at its
+    /// next x.py build; one whose clean step keeps the link takes the move by hand; one with a
+    /// stray `build.noindex` beside it is blocked, module or not; any other stays. NEGATIVE
+    /// CONTROLS: a `build/` whose parent holds no `x.py`, a `target/`, another folder under that
+    /// `build` folder, and an x.py checkout's `build/` in a folder aterm never looks into (where
+    /// nothing is read) are other folders, counted as they are; and removing the module makes
+    /// the same tree one moved by hand.
+    #[test]
+    fn an_xpy_build_is_counted_whole_with_what_its_bootstrap_does() {
+        use aterm_toolchain::xpy;
+        let home = aterm_tempfile::tempdir().expect("home");
+        let h = home.path();
+        let guarded = format!("{}/guarded", aterm_toolchain::checkout::HOME_SKIP[0]);
+        for repo in ["trust", "old", "build/rust", "blocked", guarded.as_str()] {
+            std::fs::create_dir_all(h.join(repo)).unwrap();
+            std::fs::write(h.join(repo).join(xpy::XPY), b"").unwrap();
+        }
+        let lay = |repo: &str, file: &str, text: &[u8]| {
+            let path = h.join(repo).join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let keeps = b"fn is_sanctioned_build_link(out: &Path) -> bool {}\n";
+        let module = lay("trust", xpy::NOINDEX_LAYOUT, b"");
+        lay("trust", xpy::CLEAN_STEP, keeps);
+        lay("build/rust", xpy::CLEAN_STEP, keeps);
+        lay("old", xpy::CLEAN_STEP, b"fn rm_rf(path: &Path) {}\n");
+        lay("blocked", xpy::NOINDEX_LAYOUT, b"");
+        std::fs::create_dir(h.join("blocked").join(xpy::BUILD_NOINDEX)).unwrap();
+        let listed = [
+            "trust/build/aarch64-apple-darwin/stage1-rustc/aarch64-apple-darwin/release/deps/librustc_driver-1.rmeta",
+            "trust/build/aarch64-apple-darwin/stage1/lib/rustlib/aarch64-apple-darwin/lib/libstd-1.rmeta",
+            "trust/build/aarch64-apple-darwin/stage1-tools/aarch64-apple-darwin/release/deps/libclippy-1.rmeta",
+            "old/build/aarch64-apple-darwin/stage1-std/aarch64-apple-darwin/release/deps/libcore-1.rmeta",
+            "blocked/build/aarch64-apple-darwin/stage1-std/aarch64-apple-darwin/release/deps/libcore-2.rmeta",
+            "build/rust/build/aarch64-apple-darwin/stage1-rustc/aarch64-apple-darwin/release/deps/librustc_driver-1.rmeta",
+            "build/notes/debug/deps/libn-1.rmeta",
+            "build/rust/build/aarch64-apple-darwin/stage1/lib/rustlib/aarch64-apple-darwin/lib/libstd-1.rmeta",
+            "proj/build/debug/deps/libx-1.rmeta",
+            "w/target/debug/deps/liby-1.rmeta",
+            &format!("{guarded}/build/debug/deps/libg-1.rmeta"),
+        ]
+        .map(|rel| format!("{}/{rel}\0", h.display()))
+        .concat();
+        let query = |_: &Path, pattern: &str| -> Result<String, String> {
+            Ok(if pattern == "*.rmeta" {
+                listed.clone()
+            } else {
+                String::new()
+            })
+        };
+        let lit = measure(h, &h.join("no-rustup"), &query).unwrap();
+        assert_eq!(
+            lit.builds,
+            vec![
+                ("$HOME/trust/build".to_owned(), 3),
+                ("~/build/rust/build".to_owned(), 2),
+                (format!("~/{guarded}/build"), 1),
+                ("~/blocked/build".to_owned(), 1),
+                ("~/build".to_owned(), 1),
+                ("~/old/build".to_owned(), 1),
+                ("~/proj/build".to_owned(), 1),
+                ("~/w/target".to_owned(), 1),
+            ],
+            "the stage sysroot counts under its build/"
+        );
+        assert_eq!(
+            lit.xpy,
+            vec![
+                ("$HOME/trust/build".to_owned(), Bootstrap::Moves),
+                ("~/build/rust/build".to_owned(), Bootstrap::ByHand),
+                ("~/blocked/build".to_owned(), Bootstrap::Blocked),
+                ("~/old/build".to_owned(), Bootstrap::Stays),
+            ]
+        );
+        std::fs::remove_file(&module).unwrap();
+        let lit = measure(h, &h.join("no-rustup"), &query).unwrap();
+        assert_eq!(
+            lit.xpy,
+            vec![
+                ("$HOME/trust/build".to_owned(), Bootstrap::ByHand),
+                ("~/build/rust/build".to_owned(), Bootstrap::ByHand),
+                ("~/blocked/build".to_owned(), Bootstrap::Blocked),
+                ("~/old/build".to_owned(), Bootstrap::Stays),
+            ]
+        );
+        // Anything named build.noindex blocks the move: a file, and a link that leads nowhere
+        // (which `test -e` alone takes for nothing there).
+        let beside = h.join("build/rust").join(xpy::BUILD_NOINDEX);
+        std::fs::write(&beside, b"").unwrap();
+        let rust = |lit: Spotlit| lit.xpy.into_iter().find(|(f, _)| f == "~/build/rust/build");
+        let kind = || rust(measure(h, &h.join("no-rustup"), &query).unwrap()).map(|(_, k)| k);
+        assert_eq!(kind(), Some(Bootstrap::Blocked), "a file");
+        std::fs::remove_file(&beside).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("gone", &beside).unwrap();
+            assert_eq!(
+                kind(),
+                Some(Bootstrap::Blocked),
+                "a link that leads nowhere"
+            );
+            std::fs::remove_file(&beside).unwrap();
+        }
+        assert_eq!(kind(), Some(Bootstrap::ByHand), "nothing there");
+    }
+
+    /// A `Build/` IS AN X.PY CHECKOUT'S BUILD TREE ONLY WHERE THE VOLUME TAKES IT FOR `build`: on a
+    /// Mac's case-blind volume it is counted whole as the tree. NEGATIVE CONTROL: on a
+    /// case-sensitive volume it is another folder, counted as it is and given no line.
+    #[test]
+    fn a_build_in_another_case_is_the_tree_only_where_the_volume_says_so() {
+        use aterm_toolchain::xpy;
+        let home = aterm_tempfile::tempdir().expect("home");
+        let h = home.path();
+        std::fs::create_dir_all(h.join("upper/Build")).unwrap();
+        std::fs::write(h.join("upper").join(xpy::XPY), b"").unwrap();
+        let blind = std::fs::symlink_metadata(h.join("upper/build")).is_ok();
+        let listed = format!(
+            "{}/upper/Build/aarch64-apple-darwin/stage1-std/aarch64-apple-darwin/release/deps/\
+             libcore-3.rmeta\0",
+            h.display()
+        );
+        let query = |_: &Path, pattern: &str| -> Result<String, String> {
+            Ok(if pattern == "*.rmeta" {
+                listed.clone()
+            } else {
+                String::new()
+            })
+        };
+        let lit = measure(h, &h.join("no-rustup"), &query).unwrap();
+        if blind {
+            assert_eq!(lit.builds, vec![("~/upper/Build".to_owned(), 1)]);
+            assert_eq!(
+                lit.xpy,
+                vec![("~/upper/Build".to_owned(), Bootstrap::Stays)]
+            );
+        } else {
+            assert_eq!(lit.xpy, vec![], "a case-sensitive volume: {:?}", lit.builds);
+        }
+    }
+
+    /// A HOME REACHED THROUGH A LINK IS THE HOME BY BOTH SPELLINGS: `mdfind` prints the paths
+    /// under the real folder, an x.py `build/` there is counted whole and `~`-relative, and one
+    /// in a folder of the home aterm never looks into is read as such by that spelling too.
+    /// NEGATIVE CONTROL: a path under neither spelling is counted as it is, nothing read.
+    #[cfg(unix)]
+    #[test]
+    fn a_home_reached_through_a_link_guards_its_folders_by_either_spelling() {
+        use aterm_toolchain::xpy;
+        let tmp = aterm_tempfile::tempdir().expect("tmp");
+        let real = std::fs::canonicalize(tmp.path()).unwrap().join("real");
+        let link = tmp.path().join("link");
+        let guarded = format!("{}/guarded", aterm_toolchain::checkout::HOME_SKIP[0]);
+        let away = tmp.path().join("away");
+        for repo in [real.join("trust"), real.join(&guarded), away.clone()] {
+            std::fs::create_dir_all(&repo).unwrap();
+            std::fs::write(repo.join(xpy::XPY), b"").unwrap();
+        }
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let listed = [
+            real.join("trust/build/aarch64-apple-darwin/stage1-std/release/deps/libcore-1.rmeta"),
+            real.join(format!("{guarded}/build/debug/deps/libg-1.rmeta")),
+            away.join("build/debug/deps/liba-1.rmeta"),
+        ]
+        .map(|path| format!("{}\0", path.display()))
+        .concat();
+        let query = |_: &Path, pattern: &str| -> Result<String, String> {
+            Ok(if pattern == "*.rmeta" {
+                listed.clone()
+            } else {
+                String::new()
+            })
+        };
+        let lit = measure(&link, &link.join("no-rustup"), &query).unwrap();
+        assert_eq!(
+            lit.xpy,
+            vec![("$HOME/trust/build".to_owned(), Bootstrap::Stays)],
+            "{:?}",
+            lit.builds
+        );
+        assert!(
+            lit.builds
+                .iter()
+                .any(|(folder, _)| *folder == format!("~/{guarded}/build")),
+            "{:?}",
+            lit.builds
+        );
+        assert!(
+            lit.builds
+                .iter()
+                .any(|(folder, _)| *folder == away.join("build").display().to_string()),
+            "{:?}",
+            lit.builds
+        );
+    }
+
+    /// The row says of an indexed x.py `build/` what becomes of it, the move by hand only where
+    /// the checkout supports it, and keeps the shims' sentence for the other folders, in the
+    /// number they are. NEGATIVE CONTROLS: with no x.py tree the shims' sentence reads as it
+    /// always has; with only x.py trees it is not said; a blocked or unsupported tree is given
+    /// no move.
+    #[test]
+    fn the_row_says_what_an_xpy_checkouts_bootstrap_does_with_its_build() {
+        let lit = |xpy: Vec<(&str, Bootstrap)>, builds: Vec<(&str, usize)>| Spotlit {
+            docs_kept: None,
+            builds: builds.into_iter().map(|(f, n)| (f.to_owned(), n)).collect(),
+            xpy: xpy.into_iter().map(|(f, k)| (f.to_owned(), k)).collect(),
+            rustup: None,
+        };
+        let shims = |them: &str| {
+            format!(
+                "where the shims' rule did not place {them} (a direct targo, another \
+                 repository's build, an installed toolchain); a folder leaves the index when \
+                 it is deleted or named *.noindex"
+            )
+        };
+        let (clean, fact) = row(&Ok(lit(
+            vec![("$HOME/trust/build", Bootstrap::Moves)],
+            vec![("$HOME/trust/build", 7900), ("~/w/target", 9)],
+        )));
+        assert!(!clean, "an indexed tree is no clean row, whoever moves it");
+        let lines: Vec<&str> = fact.lines().collect();
+        assert_eq!(
+            lines[1..],
+            [
+                "$HOME/trust/build is an x.py checkout's build tree; its next x.py build moves it to \
+                 build.noindex, which Spotlight skips",
+                format!("the other folder was written {}", shims("it")).as_str(),
+            ]
+        );
+        let (_, fact) = row(&Ok(lit(
+            vec![("$HOME/trust/build", Bootstrap::Moves)],
+            vec![
+                ("$HOME/trust/build", 7900),
+                ("~/w/target", 9),
+                ("~/v/target", 8),
+            ],
+        )));
+        assert_eq!(
+            fact.lines().last(),
+            Some(format!("the other folders were written {}", shims("them")).as_str())
+        );
+        let by_hand = "`scripts/trust_build_lock.sh status && test ! -e build.noindex && test ! -L \
+                       build.noindex && mv build build.noindex && ln -s build.noindex build`";
+        let (_, fact) = row(&Ok(lit(
+            vec![("$HOME/trust/build", Bootstrap::ByHand)],
+            vec![("$HOME/trust/build", 30)],
+        )));
+        assert_eq!(
+            fact.lines().skip(1).collect::<Vec<_>>(),
+            [format!(
+                "$HOME/trust/build is an x.py checkout's build tree, and its bootstrap does not \
+                 move it to build.noindex; {by_hand} in the checkout takes it out of the index, \
+                 and moves nothing while its build lock is held"
+            )
+            .as_str()],
+            "only x.py trees: no shims' sentence"
+        );
+        let (_, fact) = row(&Ok(lit(
+            vec![
+                ("~/x/build", Bootstrap::Blocked),
+                ("~/rust/build", Bootstrap::Stays),
+            ],
+            vec![("~/x/build", 30), ("~/rust/build", 20)],
+        )));
+        assert_eq!(
+            fact.lines().skip(1).collect::<Vec<_>>(),
+            [
+                "~/x/build is an x.py checkout's build tree, and ~/x/build.noindex is already \
+                 there beside it; a move there would fail or nest one in the other, so \
+                 ~/x/build stays indexed while both are there",
+                "~/rust/build is an x.py checkout's build tree, and its checkout does not \
+                 support Trust's build.noindex layout (an upstream rustc checkout, or Trust \
+                 before 2026-09-25), so it stays indexed while it is there",
+            ]
+        );
+        assert!(!fact.contains("mv build"), "no move for either: {fact}");
+        assert!(
+            !fact.contains(" gone"),
+            "no tree is called for removal: {fact}"
+        );
+        let (_, fact) = row(&Ok(lit(
+            vec![
+                ("~/a/build", Bootstrap::Moves),
+                ("~/b/build", Bootstrap::Moves),
+                ("~/c/build", Bootstrap::ByHand),
+                ("~/d/build", Bootstrap::Moves),
+                ("~/e/build", Bootstrap::Moves),
+                ("~/f/build", Bootstrap::Moves),
+                ("~/g/build", Bootstrap::ByHand),
+            ],
+            vec![
+                ("~/a/build", 7),
+                ("~/b/build", 6),
+                ("~/c/build", 5),
+                ("~/d/build", 4),
+                ("~/e/build", 3),
+                ("~/f/build", 2),
+                ("~/g/build", 1),
+            ],
+        )));
+        assert_eq!(
+            fact.lines().skip(1).collect::<Vec<_>>(),
+            [
+                "~/a/build, ~/b/build, ~/d/build and 2 more are x.py checkouts' build trees; \
+                 each checkout's next x.py build moves its tree to build.noindex, which \
+                 Spotlight skips",
+                format!(
+                    "~/c/build and ~/g/build are x.py checkouts' build trees, and their \
+                     bootstraps do not move them to build.noindex; {by_hand} in a checkout \
+                     takes its tree out of the index, and moves nothing while its build lock is \
+                     held"
+                )
+                .as_str(),
+            ]
+        );
+        let (_, fact) = row(&Ok(lit(vec![], vec![("~/w/target", 9)])));
+        assert_eq!(
+            fact.lines().nth(1),
+            Some(format!("written {}", shims("them")).as_str())
+        );
+        assert_eq!(named(&["a", "b", "c"]), "a, b and c");
+    }
+
+    /// A LISTING LONGER THAN A MIB IS READ WHOLE, THROUGH A PIPE TO ITS END: `mdfind` lists every
+    /// indexed crate file, and a reader that kept a tail would count part of them. NEGATIVE
+    /// CONTROLS: a listing exactly at the bound is read and one byte past it refused, never
+    /// counted short; a run that fails is refused with what it said on stderr, one that cannot
+    /// start as not started, and one still running at its deadline as unanswered; a `-0` list
+    /// that does not end in a NUL is refused as cut short.
+    #[cfg(unix)]
+    #[test]
+    fn a_listing_longer_than_a_mib_is_read_whole_and_one_past_the_bound_refused() {
+        const HANG: Duration = Duration::from_secs(60);
+        let dd = aterm_uds::deadline::stand_in(Path::new("/bin/dd"));
+        let mib = 1024 * 1024;
+        let run = |bs: usize, count: usize, most: usize| {
+            listing(
+                aterm_uds::spawnfd::command(&dd).args([
+                    "if=/dev/zero".to_owned(),
+                    format!("bs={bs}"),
+                    format!("count={count}"),
+                ]),
+                Instant::now() + HANG,
+                most,
+            )
+        };
+        assert_eq!(run(mib, 3, LISTING).map(|listed| listed.len()), Ok(3 * mib));
+        assert_eq!(
+            run(mib, 1, mib).map(|listed| listed.len()),
+            Ok(mib),
+            "exactly at the bound"
+        );
+        let refused = run(mib + 1, 1, mib);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|why| why.contains("more than 1 MiB")),
+            "{refused:?}"
+        );
+        let failed = listing(
+            aterm_uds::spawnfd::command(&dd).arg("if=/nonexistent/w22-spotlight"),
+            Instant::now() + HANG,
+            LISTING,
+        );
+        assert!(
+            failed
+                .as_ref()
+                .is_err_and(|why| why.starts_with("mdfind failed: ")
+                    && why.contains("/nonexistent/w22-spotlight")),
+            "{failed:?}"
+        );
+        let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
+        let late = listing(
+            aterm_uds::spawnfd::command(&sleep).arg("60"),
+            Instant::now(),
+            LISTING,
+        );
+        assert_eq!(
+            late,
+            Err(format!("mdfind did not answer within {}s", QUERY.as_secs()))
+        );
+        let absent = listing(
+            &mut aterm_uds::spawnfd::command("/nonexistent/w22-mdfind"),
+            Instant::now() + HANG,
+            LISTING,
+        );
+        assert!(
+            absent
+                .as_ref()
+                .is_err_and(|why| why.starts_with("mdfind did not start: ")),
+            "{absent:?}"
+        );
+        assert_eq!(whole_list(String::new()), Ok(String::new()));
+        assert_eq!(whole_list("/a\0/b\0".into()), Ok("/a\0/b\0".into()));
+        assert!(
+            whole_list("/a\0/Users//ayat".into()).is_err(),
+            "cut mid-path"
         );
     }
 

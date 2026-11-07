@@ -1,5 +1,5 @@
-# The trust lane's cost-history SEED: the fallback a clone with no history of its own reads (a library's newer row of this file and its git directory's aterm-release/trust-costs.tsv is the one read). `targo --unverified ship trust run -p <crate>… --update-ratchet` rewrites it with floors.tsv and memory.tsv. A library in neither file runs first, claiming 16 GiB or half the RAM, whichever is less.
-# trust lane cost history: <name> <CPU s> <wall s> <largest process's peak RSS bytes> <when>; the slots take the longest first, a library with no row first of all, and each check claims its peak and a margin before it starts (a claim not below what can ever be available, the RAM less what is wired, is refused up front)
+# The trust lane's cost-history SEED: the fallback a clone with no history of its own reads (of a library's rows under one prover in this file and its git directory's aterm-release/trust-costs.tsv, the newer is the one read). `targo --unverified ship trust run -p <crate>… --update-ratchet` rewrites it with floors.tsv and memory.tsv. A library with no row a run can read, or one with no check under its prover that finished, runs first, claiming at least 16 GiB or half the RAM, whichever is less, and at least what another prover's newest row of it claims, unless its own row's peak is refused by itself.
+# trust lane cost history: <name> <CPU s> <wall s> <peak memory bytes: the larger of the largest process's resident high-water mark and the largest footprint its processes were read with> <when> <prover> <cut> <raised>, one row per library and prover (its `targo --version`; a row with none predates rows that name one); <cut>, where a check did not finish, says how it ended (over-budget, interrupted or failed), and its figures are then each the least it would have taken, which its row raises and never lowers, and <raised> is `raised` where it raised the row of a check that finished; a run reads its prover's row, else a library's newest row where that names no prover, and a library with neither is unmeasured; the slots take the longest first, a library with no row or none of a check that finished first of all, and each check claims its peak and a margin (at least what a library with no row claims, where no check of it finished) before it starts, and where no check under its prover has finished, at least what another prover's newest row of it claims, unless its own row's peak is refused by itself (a claim not below what can ever be available, the RAM less what is wired, is refused up front)
 amacs	723	759	8131362816	2026-10-20T22:24:50Z
 amacs-files	240	220	2146713600	2026-10-20T22:21:37Z
 amacs-term	279	260	3841851392	2026-10-21T00:55:28Z
@@ -46,7 +46,8 @@ aterm-gpu	1809	2619	7515947008	2026-10-28T08:13:43Z
 aterm-gpu-web	319	291	2126888960	2026-10-27T02:26:00Z
 aterm-grapheme	372	366	4319100928	2026-10-29T17:28:29Z
 aterm-grid	1772	1781	9226731520	2026-10-27T04:05:03Z
-aterm-gui	16972	17245	62450089984	2026-10-20T17:45:18Z
+aterm-gui	16972	17245	62450089984	2026-10-20T17:45:18Z	targo 1.101.0-dev (targo 0.10.0)
+aterm-gui	5862	7547	47198031152	2026-10-31T01:00:39Z	targo 1.99.0-dev (20565c325 2026-10-19) (targo 0.11.0+g20565c325)	interrupted
 aterm-gui-consent	277	249	2337423360	2026-10-27T02:38:41Z
 aterm-gui-documents	296	299	5025562624	2026-10-21T16:40:31Z
 aterm-gui-fabric	806	797	7934361600	2026-10-27T05:23:27Z

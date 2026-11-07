@@ -248,7 +248,7 @@ fn native_google_worker_keeps_exact_profile_and_rechecks_before_admission() {
         let admitted = worker::Admitted::assumed(starter.clone());
         guard.check_admitted(&admitted).unwrap();
         let config = world.config.join("native-policy.toml");
-        std::fs::write(&config, "").unwrap();
+        crate::test_config::write(&config, "").unwrap();
         super::super::native_keys::with_test_launcher(
             |_, _| panic!("verified profile reached shared-key selection"),
             || {

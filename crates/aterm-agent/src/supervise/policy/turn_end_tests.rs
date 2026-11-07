@@ -335,7 +335,7 @@ fn a_question_in_prose_is_answered_by_the_priority_word() {
     use super::super::approval::{RULE_PROSE_LONG_TERM, RULE_PROSE_SHORT_TERM};
     use super::super::question::{LONG_TERM_TEXT, SHORT_TERM_TEXT};
     let now = t0();
-    let under = |p: QuestionPriority| SupervisorConfig {
+    let under = |p: PriorityWord| SupervisorConfig {
         question_priority: p,
         ..cfg()
     };
@@ -347,20 +347,16 @@ fn a_question_in_prose_is_answered_by_the_priority_word() {
     let offer = idle("Shall I carry on with stage 2?", Some(3 * MIN));
     for (p, text, rule) in [
         (
-            QuestionPriority::LongTerm,
+            PriorityWord::LongTerm,
             LONG_TERM_TEXT.to_string(),
             RULE_PROSE_LONG_TERM,
         ),
         (
-            QuestionPriority::ShortTerm,
+            PriorityWord::ShortTerm,
             SHORT_TERM_TEXT.to_string(),
             RULE_PROSE_SHORT_TERM,
         ),
-        (
-            QuestionPriority::Recommended,
-            cfg().answer_text,
-            RULE_ANSWER,
-        ),
+        (PriorityWord::Recommended, cfg().answer_text, RULE_ANSWER),
     ] {
         assert_eq!(
             at_under(&mut TurnEndState::default(), &asks, now, &under(p)),
@@ -2368,11 +2364,7 @@ fn a_limits_end_answers_a_question_naming_an_irreversible_act_as_continue_does()
             st.wall_attempts(WallKind::UsageSession)
         ));
     }
-    for priority in [
-        QuestionPriority::Recommended,
-        QuestionPriority::LongTerm,
-        QuestionPriority::ShortTerm,
-    ] {
+    for priority in PriorityWord::ALL {
         let cfg = SupervisorConfig {
             question_priority: priority,
             ..cfg()
@@ -16081,6 +16073,7 @@ fn a_checked_reading_decides_as_clean() {
             main_ref: if remote { "origin/main" } else { "" }.to_string(),
             remote,
             branch: "main".to_string(),
+            ..CleanAt::default()
         })
     };
     let land_yield = |repo: RepoRead| {
@@ -16316,17 +16309,15 @@ fn a_done_report_under_land_gets_the_instruction_not_the_check() {
 /// the text it writes (`question::LAND_TEXT`, which opens `Decide yourself:`) reads as no land
 /// act to any reader of a typed Land act (the loop's `is_land_words`, the ledger's
 /// `approvals::delivers_land`, the upgrade's record and the stats' journal reader), so no yield
-/// after a dialog's key is judged a landing; Land's priority's prose rule is no land rule either.
-/// NEGATIVE CONTROL: Land's prose answer reads as a land act to every one of them. MUTANT: a Land
-/// text that opens with `LAND_ANSWER`'s words.
+/// after a dialog's key is judged a landing. NEGATIVE CONTROL: Land's prose answer reads as a land
+/// act to every one of them. MUTANT: a Land text that opens with `LAND_ANSWER`'s words.
 #[test]
 fn the_land_dialog_text_is_no_land_act() {
     use super::super::question::LAND_TEXT;
     use crate::harness::{stats::opens_with_land_words, upgrade::is_land_act};
     use crate::supervise::approvals::delivers_land;
-    let land = QuestionPriority::Land;
+    let land = super::super::approval::QuestionPriority::Land;
     assert!(!is_land_rule(land.rule_id()) && !is_continue_rule(land.rule_id()));
-    assert!(!is_land_rule(land.prose_rule_id()));
     assert!(!is_land_words(LAND_TEXT), "{LAND_TEXT}");
     assert!(!is_land_act(LAND_TEXT), "{LAND_TEXT}");
     assert!(!delivers_land(Some(LAND_TEXT)), "{LAND_TEXT}");
@@ -16340,7 +16331,7 @@ fn a_question_under_land_gets_the_land_answer() {
     let now = t0();
     let asked = "Did the suite pass on your machine?";
     let long_term = SupervisorConfig {
-        question_priority: QuestionPriority::LongTerm,
+        question_priority: PriorityWord::LongTerm,
         ..cfg()
     };
     for policy in [cfg(), long_term] {

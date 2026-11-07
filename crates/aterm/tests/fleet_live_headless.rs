@@ -2023,6 +2023,19 @@ fn board_workers(out: &Output) -> Vec<std::collections::BTreeMap<String, String>
         .collect()
 }
 
+/// The rows of `kind` naming `sid` that `aterm ctl telemetry rows` answers on `inst`, each as the
+/// log spells it.
+fn telemetry_rows(inst: &Instance, kind: &str, sid: &str) -> Vec<String> {
+    ctl_ok(
+        inst,
+        &["telemetry", "rows", "--kind", kind, "--limit", "500"],
+    )
+    .lines()
+    .filter(|row| field(row, "kind") == Some(kind) && field(row, "sid") == Some(sid))
+    .map(str::to_owned)
+    .collect()
+}
+
 /// The fleet task board (`docs/DESIGN-fleet-task-board-2026-11-04.md`): a dispatcher spawns two
 /// labelled workers onto a member over the fleet and its session closes; its Mac's board keeps
 /// each one's member, label and brief digest, never the brief; a dispatcher started on a third
@@ -2426,6 +2439,51 @@ fn a_dispatcher_on_another_mac_resumes_every_worker_from_the_boards_open_rows() 
             && String::from_utf8_lossy(&none.stderr).contains("OK board: no open worker"),
         "{none:?}"
     );
+
+    // The dispatching Mac's telemetry (Continuum TM-1): each worker's spawn, on the Mac it runs
+    // on, and one task row once its row closed, the board having heard (above) the conclusion
+    // that Mac reported, whichever close the keeper read; the member's own spawn row names the
+    // worker and no other Mac.
+    for (sid, outcome) in [(&sids[0], "ok"), (&sids[1], "fail")] {
+        let spawns = telemetry_rows(&issuer, "spawn", sid);
+        assert_eq!(spawns.len(), 1, "one spawn row of {sid}: {spawns:?}");
+        assert_eq!(
+            field(&spawns[0], "on"),
+            Some(member_node.as_str()),
+            "{spawns:?}"
+        );
+        assert_eq!(field(&spawns[0], "outcome"), Some("ok"), "{spawns:?}");
+        let mut tasks = Vec::new();
+        let told = aterm_spec::wait::within(HANG, POLL_GAP, || {
+            tasks = telemetry_rows(&issuer, "task", sid);
+            (!tasks.is_empty()).then_some(())
+        });
+        assert!(told.is_some(), "the close of {sid} wrote a task row");
+        assert_eq!(tasks.len(), 1, "one task row of {sid}: {tasks:?}");
+        assert_eq!(
+            field(&tasks[0], "on"),
+            Some(member_node.as_str()),
+            "{tasks:?}"
+        );
+        assert_eq!(field(&tasks[0], "outcome"), Some(outcome), "{tasks:?}");
+        assert_eq!(field(&tasks[0], "label"), Some("claude"), "{tasks:?}");
+        let mut received = Vec::new();
+        let written = aterm_spec::wait::within(HANG, POLL_GAP, || {
+            received = telemetry_rows(&member, "spawn", sid);
+            (!received.is_empty()).then_some(())
+        });
+        assert!(written.is_some(), "the member wrote its spawn row of {sid}");
+        assert_eq!(
+            received.len(),
+            1,
+            "the member's spawn row of {sid}: {received:?}"
+        );
+        assert_eq!(field(&received[0], "on"), None, "{received:?}");
+        eprintln!(
+            "sender:\n{}\n{}\nmember:\n{}",
+            spawns[0], tasks[0], received[0]
+        );
+    }
 }
 
 const NEVER_MS: &str = "600000";
@@ -2835,7 +2893,7 @@ mod any_host_walled {
     /// refresh token, so nothing here can ask the provider for one; its usage read at `base`, the
     /// test's [`UsageStub`]; and a rollout of its own sessions, opened by that login half a minute
     /// ago, that read `five_hour` and `week`: with no record of the row yet, those are the figures
-    /// a survey of it has (`codex_limits::login_sample`).
+    /// a survey of it has (`codex_limits::login_look`).
     fn lay_codex_row(root: &Path, label: &str, base: &str, five_hour: Window, week: Window) {
         const ACCOUNT: &str = "acct-any-1";
         const USER: &str = "user-any";

@@ -1619,6 +1619,8 @@ mod tests {
     #[cfg(unix)]
     impl Bench {
         fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+
             let dir = aterm_tempfile::tempdir().unwrap();
             let root = dir.path().join("inputs");
             for (name, bytes) in [
@@ -1628,7 +1630,8 @@ mod tests {
             ] {
                 let path = root.join(name);
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                std::fs::write(path, bytes).unwrap();
+                std::fs::write(&path, bytes).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
             }
             std::os::unix::fs::symlink("trustc", root.join("bin/rustc")).unwrap();
             Self {

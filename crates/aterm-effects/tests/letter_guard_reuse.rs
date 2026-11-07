@@ -282,6 +282,51 @@ fn a_share_lowered_on_its_frame_is_that_frame_s_alone() {
     }
 }
 
+/// A PASS THAT LOWERS NO SHARE IS THE LAST. A cell the guard weighed to none of its light, whose
+/// ring box still holds light the guard does not cut (Fire's flames lay night grounds on Solarized
+/// Dark), can read under its bar on the frame its cuts make on every pass (`verify_cuts`), and
+/// lowered again it lays the same cuts. So a pass whose cells under their bars have no light left
+/// to give is the last. Fire, the pet and Comet on Solarized Dark, typing among two lettered rows,
+/// and Fire in the guarded fold's scene, read their cut frames again in no pass that changed no
+/// share and asked for another. Before (the land review's A-A3), each such cell called for another
+/// pass up to the last: 323 of Fire's 536 passes typing were such, and 96 of its 413 in the fold's
+/// scene, which now take 261 and 335; the published streams are the same (the fold below).
+#[test]
+fn a_pass_that_lowers_no_share_is_the_last() {
+    let mut typing = vec![(
+        200,
+        Ev::Out(
+            b"\x1b[2J\x1b[2Hthe quick brown fox jumps over\r\nlazy dogs sleep in the sun\x1b[5H$ "
+                .to_vec(),
+        ),
+    )];
+    typing.extend(typed("echo poppy guppy foggy soggy", 1_000, 50));
+    let mut fold = vec![(
+        200,
+        Ev::Out(b"\x1b[2J\x1b[3H\x1b[31mred\x1b[0m \x1b[34mblue\x1b[0m plain\x1b[5H$ ".to_vec()),
+    )];
+    fold.extend(typed("echo hello world", 1_000, 50));
+    for (style, scene, ev) in [
+        ("fire", "typing", &typing),
+        ("rainbow kitty pet", "typing", &typing),
+        ("comet", "typing", &typing),
+        ("fire", "the fold's scene", &fold),
+    ] {
+        let mut r = Replay::new(style, DIM, true);
+        let _ = run(&mut r, ev, 1_500);
+        let (passes, idle) = r.fx.cursor_mut().glow.letter_guard_passes();
+        assert!(
+            passes > 0,
+            "premise: {style} on Solarized Dark, {scene}, read no cut frame again"
+        );
+        assert_eq!(
+            idle, 0,
+            "{style} on Solarized Dark, {scene}: passes that changed no share and asked for \
+             another, of {passes}"
+        );
+    }
+}
+
 /// Over randomized typing (style, theme, text, cadence), the guard that
 /// keeps frames and verdicts publishes every frame's streams exactly as
 /// the guard that judges every cell of every frame afresh. The negative
@@ -368,8 +413,39 @@ fn kept_frames_and_verdicts_publish_what_judging_afresh_does() {
 /// read by its solid ink alone; replayed without the frame's glyph ink, as they were until then
 /// (every letter read by its solid ink), the guarded streams still fold to that value. Its review
 /// has the replays observe the frame's glyph ink as the GUI does, from the render suite's bundled
-/// face at its own cells, so they judge the guard that ships: the value below.
-const GUARDED_FOLD_AT_THE_PARENT: u64 = 0x651f_3de5_5468_2007;
+/// face at its own cells, so they judge the guard that ships: `0x651f_3de5_5468_2007`.
+/// trail/leaders' after-land pass runs paper Comet's tail at the letters' foot (L1), burns the
+/// paper flame deep (L3) and lays paper Phaser as a crisp neon tube whose spectrum runs one way
+/// round (L4); on its own parent, whose replays read no glyph ink, it folded to
+/// `0x9310_bc61_da20_61f0` and, with that one-way spectrum, `0xa055_4d46_3c89_6c12`. Merged onto
+/// main f54c0d3933 and folded style by style there and on that main, 21 of the 24 fold alike, and
+/// the three that differ are Phaser, Comet and Fire on the light ground: `0x41a1_2d10_a9eb_9f80`.
+/// trail/lows' after-land pass springs Laser's crackle from the bolt's own cell, narrows Sparkle's
+/// paper body and its Solarized rail to their tails, and gives Lumen a quiet dark tracer and a
+/// soft paper end; on its own parent, whose replays read no glyph ink, it folded to
+/// `0xc8bf_042d_830d_21cb` and, with that tracer at half its light (was two fifths),
+/// `0xf5fb_ff10_5c1a_df95`. Merged onto trail/leaders' merge and folded style by style there and
+/// here, 17 of the 24 fold alike, and the seven that differ are Laser on all three grounds,
+/// Sparkle on the light and dim ones and Lumen on the dark and light ones:
+/// `0xbfd3_64f7_a2ec_fa7a`. The after-land review's repair holds paper Lumen's typed leg through
+/// a Backspace and walks its end in; folded style by style there and on its parent d8161deaca, 23
+/// of the 24 fold alike, and the one that differs is Lumen on the light ground:
+/// `0xb7ca_2008_2ee6_eafa`. The guard keeping each letter's whole reading as well as its ring's
+/// (after-land A1, `letter_guard::ring`) changes one stream: with the whole reading off
+/// (`set_letter_guard_whole(false)`) the fold is that value, and folded style by style 23 of the 24
+/// fold alike, and the one that differs is Fire on the dim ground, a flame foot whose letter read
+/// under its bar by its core against its bed: `0x2d33_01c0_9206_fb2c`. The paper Phaser's tube
+/// turning through yellow and holding its colour over a wide glyph (after-land B7) changes one more:
+/// folded style by style 23 of the 24 fold alike, and the one that differs is Phaser on the light
+/// ground: `0x4d3c_6974_83e6_d426`. A letter on a dim page keeping a level in hand over its share
+/// (`LEVEL_ROOM`) lowers every dim stream's light a little and no other's: the 16 dark and light
+/// streams fold alike and the eight dim ones differ, `0x98ff_5d2d_14c5_1c75`. After-land round 3's
+/// paper stream holds a letter that reads AA as the judges read it, and under the floor, at AA with
+/// a level in hand (`letter_bar`, c5f12a057c), where it kept 97% of its reading: such a letter on
+/// Solarized Dark now takes no light that lowers it. Folded style by style there and on its parent
+/// fac1b631f5, the 16 dark and light streams fold alike and the eight dim ones differ; the round's
+/// later commits move none of the 24: the value below.
+const GUARDED_FOLD_AT_THE_PARENT: u64 = 0x9969_6521_89e5_f31b;
 
 /// FNV-1a over `words`, from `h`.
 fn fold_words(h: u64, words: impl IntoIterator<Item = u64>) -> u64 {

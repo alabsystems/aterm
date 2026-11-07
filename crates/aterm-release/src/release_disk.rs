@@ -147,8 +147,9 @@ pub fn claim(
 ///
 /// # Errors
 /// The refusal that stops the release: the claim can never fit on the clone's volume; or, with
-/// nothing about the code decided (resumable), an interrupt ended its wait, or it gave up behind
-/// holders that made no progress.
+/// nothing about the code decided (resumable), it is more than the volume has free above its
+/// floor once its relief ran, which no wait admits, an interrupt ended its wait, or it gave up
+/// behind holders that made no progress.
 pub fn answer(
     admitted: Result<Whole, Error>,
     say: &mut dyn FnMut(&str),
@@ -159,6 +160,12 @@ pub fn answer(
             format!("the release's disk claim: {e}"),
             "free space on the clone's volume, or cut from a clone on a larger one, then re-run",
         )),
+        Err(e @ Error::Unmet { .. }) => Err(Refusal::new(
+            format!("the release's disk claim was refused, nothing decided: {e}"),
+            "free what the claim names on the clone's volume, or cut from a clone on a larger \
+             one, then re-run",
+        )
+        .could_not_run()),
         Err(e @ (Error::Stopped { .. } | Error::Stuck { .. })) => Err(Refusal::new(
             format!("the release's disk claim {e}; nothing was decided"),
             "re-run once the volume has room",

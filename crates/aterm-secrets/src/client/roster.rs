@@ -331,14 +331,25 @@ fn swarm_roster_with_base(
 pub(super) fn restored_by_log(
     log: &crate::membership_log::Log,
 ) -> (BTreeSet<String>, BTreeSet<String>) {
-    let (labels, nodes, _) = restored_by_log_parts(log);
-    (labels, nodes)
+    let restored = log.restored(derive_restored);
+    (restored.labels.clone(), restored.nodes.clone())
 }
 
-fn restored_by_log_parts(
-    log: &crate::membership_log::Log,
-) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
-    let membership = log.membership();
+#[cfg(test)]
+thread_local! {
+    /// The [`derive_restored`] runs on this thread, counted (never timed).
+    pub(super) static RESTORED_DERIVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// What [`restored_by_log`] reads of `log`, with the restored Macs' recipients: derived once for
+/// each set of held records, which [`Log::restored`] keeps with the log's evaluations, since every
+/// roster read and denial check of an unchanged log asks it again. Whether a removal lies in a
+/// seat's past is a bit test of the log's reach index ([`Log::removes_upto`]), not a copy of the
+/// seat's whole causal past.
+fn derive_restored(log: &crate::membership_log::Log) -> crate::membership_log::Restored {
+    #[cfg(test)]
+    RESTORED_DERIVED.set(RESTORED_DERIVED.get() + 1);
+    let membership = log.membership_ref();
     let voided = membership.voided();
     let mut seat_recipients: BTreeMap<crate::membership_log::MemberId, Recipient> = BTreeMap::new();
     let mut seat_labels: BTreeMap<crate::membership_log::MemberId, Vec<String>> = BTreeMap::new();
@@ -392,15 +403,9 @@ fn restored_by_log_parts(
             crate::membership_log::NodeStanding::Member(active)
             | crate::membership_log::NodeStanding::Retired(active) => {
                 active == *actor
-                    || membership.get(&active).is_some_and(|m| {
-                        log.ancestor_closure(&[m.entry]).iter().any(|r| {
-                            matches!(
-                                r.body(),
-                                crate::membership_log::Body::Remove { member, .. }
-                                    if member == actor
-                            )
-                        })
-                    })
+                    || membership
+                        .get(&active)
+                        .is_some_and(|m| log.removal_upto(&m.entry, actor))
             }
             _ => false,
         }
@@ -477,7 +482,7 @@ fn restored_by_log_parts(
             })
             .collect();
         if member.entry != *log.network() {
-            for r in log.ancestor_closure(&[member.entry]) {
+            for r in log.removes_upto(&member.entry) {
                 if !voided.contains(r.id())
                     && let crate::membership_log::Body::Remove { member: rem, .. } = r.body()
                     && r.actor() != rem
@@ -529,18 +534,27 @@ fn restored_by_log_parts(
             }
         }
     }
-    (labels, nodes, recipients)
+    crate::membership_log::Restored {
+        labels,
+        nodes,
+        recipients,
+    }
 }
 
 pub(super) fn lift_restored_from_roster(
     log: &crate::membership_log::Log,
     roster: &mut SwarmRoster,
 ) -> Vec<String> {
-    let (mut labels, mut nodes, recipients) = restored_by_log_parts(log);
-    if labels.is_empty() && nodes.is_empty() && recipients.is_empty() {
+    let restored = log.restored(derive_restored);
+    if restored.labels.is_empty() && restored.nodes.is_empty() && restored.recipients.is_empty() {
         return Vec::new();
     }
-    let membership = log.membership();
+    let (mut labels, mut nodes, recipients) = (
+        restored.labels.clone(),
+        restored.nodes.clone(),
+        &restored.recipients,
+    );
+    let membership = log.membership_ref();
     for m in &roster.members {
         let same_node = m
             .node_key
@@ -627,7 +641,7 @@ pub(super) fn overlay_log_membership(
     roster: &mut SwarmRoster,
 ) {
     let _ = lift_restored_from_roster(log, roster);
-    let membership = log.membership();
+    let membership = log.membership_ref();
     let flight = reader
         .map(|mine| log.in_flight(&crate::membership_log::EpochAudience::Everyone, mine))
         .unwrap_or_default();
@@ -1189,7 +1203,7 @@ pub fn resolve_local_swarm_label(
             return Ok(None);
         }
         if let Some((_, member)) = log
-            .membership()
+            .membership_ref()
             .members()
             .iter()
             .filter(|(_, m)| m.binding.recipient() == identity.recipient())
@@ -1208,7 +1222,7 @@ pub fn resolve_local_swarm_label(
             }
         }
         if let Some(founder) = log
-            .membership()
+            .membership_ref()
             .unproved()
             .iter()
             .find(|f| f.recipient == identity.recipient())

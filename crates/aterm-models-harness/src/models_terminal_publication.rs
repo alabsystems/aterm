@@ -18,6 +18,9 @@ pub fn terminal_publication_model() -> Model {
             var kind = 0; var may = 0; var drained = 0;
             var journal = 0; var captured = 0; var reply = 0;
             var published = 0; var observed = 0;
+            // 0 forward, 1 rollback, 2 no phase-bearing receipt/observation.
+            var active = 0; var journal_phase = 2; var observed_phase = 2;
+            action StartRollback when (kind == 0 && active == 0) { active = 1; }
             action MayExecute when (kind == 0 && may == 0) {
                 may = 1; journal = 1;
             }
@@ -37,6 +40,12 @@ pub fn terminal_publication_model() -> Model {
                 journal = if drained == 1 || Buggy == 3 {
                     if kind == 1 {if reply == 0 && Buggy == 1 {3} else {2}} else {if Buggy == 5 {2} else {if may == 1 {4} else {3}}}
                 } else {journal};
+                // Updates read the pre-state, so select the phase from the
+                // publication conditions rather than the newly written journal.
+                journal_phase = if drained == 1 || Buggy == 3 {
+                    if kind == 1 {if reply == 0 && Buggy == 1 {journal_phase} else {if Buggy == 6 {0} else {active}}}
+                    else {if Buggy == 5 {active} else {journal_phase}}
+                } else {journal_phase};
                 published = if reply == 1 && drained == 1 {1} else {published};
                 captured = 0;
             }
@@ -46,6 +55,10 @@ pub fn terminal_publication_model() -> Model {
                 journal = if drained == 1 {
                     if kind == 1 {if reply == 0 && Buggy == 1 {3} else {2}} else {if Buggy == 5 {2} else {if may == 1 {4} else {3}}}
                 } else {journal};
+                journal_phase = if drained == 1 {
+                    if kind == 1 {if reply == 0 && Buggy == 1 {journal_phase} else {if Buggy == 6 {0} else {active}}}
+                    else {if Buggy == 5 {active} else {journal_phase}}
+                } else {journal_phase};
                 captured = 0;
             }
             action PublishFailed when (captured == 1) {
@@ -54,16 +67,21 @@ pub fn terminal_publication_model() -> Model {
             }
             action Observe {
                 observed = if journal == 2 || Buggy == 4 {1} else {observed};
+                observed_phase = if journal == 2 {if Buggy == 7 {1 - journal_phase} else {journal_phase}} else {observed_phase};
             }
             invariant NoExecRemainsRecoverable: kind == 0 || kind == 2 || journal == 0 || journal == 2;
             invariant PublishedOnlyAfterCommit: published == 0 || journal == 2;
             invariant TerminalWriteAfterDrain: journal <= 1 || drained == 1;
             invariant ObservationNeedsPositiveEvidence: observed == 0 || (journal == 2 && kind == 1 && may == 0 && drained == 1);
             invariant PossibleExecutionStaysOpaque: may == 0 || journal == 1 || journal == 4;
+            invariant JournalCarriesClosedPhase: journal <= 1 || journal > 2 || journal_phase == active;
+            invariant ObservationCarriesClosedPhase: observed == 0 || observed_phase == active;
             bound Finite: 0 <= kind && kind <= 2 && 0 <= may && may <= 1
                 && 0 <= drained && drained <= 1 && 0 <= journal && journal <= 4
                 && 0 <= captured && captured <= 1 && 0 <= reply && reply <= 1
-                && 0 <= published && published <= 1 && 0 <= observed && observed <= 1;
+                && 0 <= published && published <= 1 && 0 <= observed && observed <= 1
+                && 0 <= active && active <= 1 && 0 <= journal_phase && journal_phase <= 2
+                && 0 <= observed_phase && observed_phase <= 2;
         }
     }
 }

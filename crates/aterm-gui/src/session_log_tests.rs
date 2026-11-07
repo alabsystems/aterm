@@ -1742,8 +1742,8 @@ fn every_producer_runs_under_the_timeline_lock_alone() {
             let _ = g.slog_take_wake();
             let _ = g.note_harness_act("approve-all@v1", "codex-alab@1", Actor::Ctl);
             let working = crate::task_record::TaskMark::new(crate::task_record::TaskState::Working);
-            let _ = g.mark_task(&working, false, std::time::Instant::now(), 1);
-            let _ = g.note_task_attention(true);
+            let _ = g.mark_task(&working, &Default::default(), std::time::Instant::now(), 1);
+            let _ = g.note_task_attention(crate::task_record::Asks::of_owners([1]));
             let _ = g.slog_take_wake();
         }
         let report = crate::manual_reset::ResetReport {

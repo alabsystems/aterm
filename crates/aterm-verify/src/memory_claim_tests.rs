@@ -1364,26 +1364,35 @@ static STUCK: Scratch = Scratch::new();
 /// How long [`stuck_admit`]'s claims let the holders they wait behind make no progress.
 const STUCK_AFTER: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// This process, the holder of the claim [`STUCK`]'s ledger holds, having used `cpu_ns` of CPU
-/// time, as [`stuck_machine`] reads it.
+/// This process, the holder of the claim [`STUCK`]'s ledger holds, with a child that has used
+/// `cpu_ns` of CPU time, as [`stuck_machine`] reads it.
 fn this_process_at(cpu_ns: u64) -> aterm_capacity::Procs {
-    aterm_capacity::Procs::of(vec![aterm_capacity::Proc {
-        pid: std::process::id(),
-        ppid: 1,
-        cpu_ns,
-        ..aterm_capacity::Proc::default()
-    }])
+    aterm_capacity::Procs::of(vec![
+        aterm_capacity::Proc {
+            pid: std::process::id(),
+            ppid: 1,
+            cpu_ns: 5,
+            ..aterm_capacity::Proc::default()
+        },
+        aterm_capacity::Proc {
+            pid: 99_992,
+            ppid: std::process::id(),
+            cpu_ns,
+            ..aterm_capacity::Proc::default()
+        },
+    ])
 }
 
 /// The machine [`stuck_admit`] admits on: [`machine`], its processes this one alone
 /// ([`this_process_at`]). Its holder has made no progress, at 5 ns of CPU time, until
-/// [`StuckMachine::work`]; from then on each read of its processes finds 1 ns more than the read
-/// before, so the holder has worked between any two looks, however late either comes.
+/// [`StuckMachine::work`]; from then on each read of its processes finds that its child has used
+/// a core since the machine was made, so the holder has worked busy between any two looks,
+/// however late either comes, the first run's last look and the second's first among them.
 struct StuckMachine {
     at: Fixed,
     working: atomic::AtomicBool,
-    /// The CPU time the next read finds once the holder works.
-    cpu_ns: atomic::AtomicU64,
+    /// When it was made: a working child has used a core since.
+    made: std::time::Instant,
     /// When the first read found the holder working.
     first: OnceLock<std::time::Instant>,
     /// How many reads have found it working three bounds ([`STUCK_AFTER`]) or more after
@@ -1419,8 +1428,8 @@ impl Machine for StuckMachine {
             self.past_three_bounds
                 .fetch_add(1, atomic::Ordering::SeqCst);
         }
-        let cpu_ns = self.cpu_ns.fetch_add(1, atomic::Ordering::SeqCst);
-        Some(this_process_at(cpu_ns))
+        let cpu_ns = u64::try_from(self.made.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        Some(this_process_at(cpu_ns.max(6)))
     }
 }
 
@@ -1430,7 +1439,7 @@ fn stuck_machine() -> &'static StuckMachine {
     AT.get_or_init(|| StuckMachine {
         at: machine(),
         working: atomic::AtomicBool::new(false),
-        cpu_ns: atomic::AtomicU64::new(6),
+        made: std::time::Instant::now(),
         first: OnceLock::new(),
         past_three_bounds: atomic::AtomicUsize::new(0),
     })
@@ -1468,9 +1477,10 @@ fn stuck_stage(_: &Ctx, spec: &StageSpec) -> Report {
 /// bound, and the run ends within the hang detector, COULD NOT RUN: the lint's row is NOT RUN,
 /// naming the holder and how long it made no progress, and the formatter passes; the holder's
 /// claim stays held, and the lint's has left the queue. NEGATIVE CONTROL: behind the same holder
-/// working (its CPU time grown at each look), the lint waits on past three bounds (the holder
-/// lets go only once two of the lint's looks have found it working three bounds after its first)
-/// and runs once the holder has let go, with its own claim alone held, and the run passes.
+/// working (its child's CPU time moving at a core's pace), the lint waits on past three bounds
+/// (the holder lets go only once two of the lint's looks have found it working three bounds after
+/// its first) and runs once the holder has let go, with its own claim alone held, and the run
+/// passes.
 #[test]
 fn a_stage_waiting_behind_a_stuck_holder_is_not_run() {
     let dir = aterm_tempfile::tempdir().expect("scratch");

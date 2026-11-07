@@ -7,7 +7,8 @@
 //! ([`log_entries::trusted_seeded_store`]), and the log seats this Mac's device key, a person's
 //! act removes any member with no admin:
 //!
-//! - [`remove_member`] signs `Remove{member, cutoff}` (the cutoff is the removed Mac's last record
+//! - [`remove_member`] (by a person's word; [`remove_seat`] by the seat a person's front end
+//!   resolved) signs `Remove{member, cutoff}` (the cutoff is the removed Mac's last record
 //!   this log holds, else the record that let it in), mints a new epoch for every audience the Mac
 //!   was in that this Mac opens (`[everyone]`, Commons, and each host list whose newest epoch
 //!   wraps it), wraps each to the members who remain and reseals the current entries under it.
@@ -45,7 +46,7 @@ use crate::membership_log::{
     audience_tag, entries::OpenedAudienceEntries,
 };
 
-/// What [`remove_member`] did.
+/// What [`remove_member`] or [`remove_seat`] did.
 #[derive(Debug)]
 pub struct MemberRemoval {
     /// The removed Mac's label in the log.
@@ -261,8 +262,7 @@ pub(super) fn earliest_admit_of<'a>(
     log: &'a Log,
     actor: &MemberId,
 ) -> Option<(&'a RecordId, &'a crate::membership_log::Entrant)> {
-    let membership = log.membership();
-    let voided = membership.voided();
+    let voided = log.membership_ref().voided();
     let collect = |skip_voided: bool| -> Vec<(&'a RecordId, &'a crate::membership_log::Entrant)> {
         log.records()
             .filter_map(|r| match r.body() {
@@ -281,15 +281,17 @@ pub(super) fn earliest_admit_of<'a>(
     if admits.is_empty() {
         admits = collect(false);
     }
-    let ids: BTreeSet<RecordId> = admits.iter().map(|(id, _)| **id).collect();
+    // The earliest are those with no other of them in their past: a bit test of the log's reach
+    // index for each other `Admit`, not a copy of each one's causal past.
     admits
-        .into_iter()
+        .iter()
         .filter(|(id, _)| {
-            !log.ancestor_closure(&[**id])
+            !admits
                 .iter()
-                .any(|anc| anc.id() != *id && ids.contains(anc.id()))
+                .any(|(other, _)| other != id && log.reaches(&[**id], other))
         })
         .min_by_key(|(id, _)| **id)
+        .copied()
 }
 
 /// What a founder or `Admit` says of the Mac `actor`: its age recipient, label and name, from
@@ -300,7 +302,7 @@ fn seat_of(log: &Log, actor: &MemberId) -> Option<(Recipient, String, String)> {
     {
         return Some((f.recipient, f.label.clone(), f.name.clone()));
     }
-    if let Some(m) = log.membership().get(actor)
+    if let Some(m) = log.membership_ref().get(actor)
         && let Some(r) = log.get(&m.entry)
         && let Body::Admit { entrant, .. } = r.body()
     {
@@ -342,11 +344,9 @@ fn seat_nodes_of(
             crate::membership_log::NodeStanding::Member(active)
             | crate::membership_log::NodeStanding::Retired(active) => {
                 active == *actor
-                    || membership.get(&active).is_some_and(|m| {
-                        log.ancestor_closure(&[m.entry]).iter().any(
-                            |r| matches!(r.body(), Body::Remove { member, .. } if member == actor),
-                        )
-                    })
+                    || membership
+                        .get(&active)
+                        .is_some_and(|m| log.removal_upto(&m.entry, actor))
             }
             _ => false,
         }
@@ -560,8 +560,27 @@ pub fn revoke_by_log(paths: &Paths, who: &str) -> bool {
 pub fn vault_admin_named(paths: &Paths, who: &str) -> Option<String> {
     let admin = admin_cached(paths).ok()?;
     let name = machine_named_in_vault(paths, &admin, who).ok()?;
-    let mine = read_identity(paths).ok()??.recipient().to_bech32();
+    other_vault_admin(paths, &admin.published_doc, name)
+}
+
+/// [`vault_admin_named`] of the Mac holding `recipient`: the envelope machine bound to that age
+/// recipient, matched exactly, never through a word a machine could also be named.
+fn vault_admin_holding(paths: &Paths, recipient: &Recipient) -> Option<String> {
+    let admin = admin_cached(paths).ok()?;
     let doc = &admin.published_doc;
+    let recipient = recipient.to_bech32();
+    let name = doc
+        .machines()
+        .iter()
+        .find(|machine| machine.recipient == recipient)?
+        .name
+        .clone();
+    other_vault_admin(paths, doc, name)
+}
+
+/// `name` where `doc`'s `[admins]` lists it and its machine is not this Mac.
+fn other_vault_admin(paths: &Paths, doc: &Document, name: String) -> Option<String> {
+    let mine = read_identity(paths).ok()??.recipient().to_bech32();
     let is_me = doc
         .machines()
         .iter()
@@ -577,9 +596,11 @@ pub fn vault_admin_named(paths: &Paths, who: &str) -> Option<String> {
 /// line (C25). It runs under this Mac's state lock, never inside the `ask` exchange.
 ///
 /// # Errors
-/// This Mac's vault has no trusted log, the log seats no device key of this Mac as a member, `who`
-/// names no member, more than one, this Mac itself or a founder that has proved no key, or a
-/// record fails to sign or keep.
+/// This Mac's vault has no trusted log or this Mac no secrets identity; the log seats no device
+/// key of this Mac as a member, or this Mac cannot open its epochs; `who` names no member, more
+/// than one, this Mac itself or a seat holding this Mac's age recipient, a Mac removed already or
+/// a founder that has proved no key; the removal would pass the log's keyed budget or byte
+/// bound, or strand an audience; or a record fails to sign or keep.
 #[cfg_attr(
     all(unix, any(test, debug_assertions)),
     aterm_spec_anchor::refines(
@@ -597,6 +618,29 @@ pub fn vault_admin_named(paths: &Paths, who: &str) -> Option<String> {
     )
 )]
 pub fn remove_member(paths: &Paths, who: &str, stolen: bool) -> crate::Result<MemberRemoval> {
+    remove_person(paths, Target::Word(who), stolen)
+}
+
+/// [`remove_member`] of the one seat `seat`, which a person's front end resolved
+/// (`aterm fleet remove` and `aterm members remove` of a node id or a registry label, through
+/// B2's registry resolver; docs/DECISION-b2-registry-binding-2026-11-06.md): this crate receives
+/// the actor and never resolves a label by itself. It is the same person's act as the word's:
+/// the trusted-log gate, `--stolen`, the other seats of the Mac's age recipient removed with it,
+/// the posts and the admin's mirror, and the note where the Mac is another admin of the envelope
+/// 0.145 Macs read, found by its recipient.
+///
+/// # Errors
+/// This Mac's vault has no trusted log or this Mac no secrets identity; the log seats no device
+/// key of this Mac as a member, or this Mac cannot open its epochs; `seat` is this Mac's own or
+/// holds this Mac's age recipient, a seat removed already or no member's; the removal would pass
+/// the log's keyed budget or byte bound, or strand an audience; or a record fails to sign or
+/// keep.
+pub fn remove_seat(paths: &Paths, seat: MemberId, stolen: bool) -> crate::Result<MemberRemoval> {
+    remove_person(paths, Target::Seat(seat), stolen)
+}
+
+/// A person's removal of `target`, a [`Target::Word`] or a [`Target::Seat`]: [`remove_member`].
+fn remove_person(paths: &Paths, target: Target<'_>, stolen: bool) -> crate::Result<MemberRemoval> {
     if trusted_store(paths)?.is_none() {
         return Err(Error::new(
             "this Mac's vault has no membership log yet: an admin removes a Mac with `aterm secrets revoke`",
@@ -606,11 +650,17 @@ pub fn remove_member(paths: &Paths, who: &str, stolen: bool) -> crate::Result<Me
         read_identity(paths)?.ok_or_else(|| Error::new("this Mac has no secrets identity"))?;
     // Read under the draft's observation: a pass that held the state when the person asked
     // delays this with the draft, rather than hiding the admin behind a busy read.
-    cut_tables_first(paths, Target::Word(who));
+    cut_tables_first(paths, target);
     let mut vault_admin = None;
     let (minted, _, report) = log_entries::author_and_commit_records(paths, |store| {
-        vault_admin = vault_admin_named(paths, who);
-        draft_removal(paths, store, &identity, Target::Word(who), stolen)
+        vault_admin = match target {
+            Target::Word(who) => vault_admin_named(paths, who),
+            Target::Seat(seat) | Target::Actor(seat) => store
+                .log()
+                .and_then(|log| log.membership().get(&seat).map(|m| m.binding.recipient()))
+                .and_then(|recipient| vault_admin_holding(paths, &recipient)),
+        };
+        draft_removal(paths, store, &identity, target, stolen)
     })?;
     let report = report?;
     let mut envelope_notes = Vec::new();
@@ -640,9 +690,9 @@ pub fn remove_member(paths: &Paths, who: &str, stolen: bool) -> crate::Result<Me
 }
 
 /// [`remove_member`] of the member `target`, with no `--stolen` and no trusted-log gate, posting
-/// to the vault's source alone: [`super::remove_member_in_log`], which the Commons runtime and
-/// the tests call by actor. Where another member's removal of `target` is here already, this
-/// Mac's share at that removal's cutoff instead. Returns the records it signed.
+/// to the vault's source alone: [`super::remove_member_in_log`], which tests call by actor.
+/// Where another member's removal of `target` is here already, this Mac's share at that
+/// removal's cutoff instead. Returns the records it signed.
 ///
 /// # Errors
 /// As [`remove_member`], for a member named by its actor; for a share, as
@@ -717,11 +767,11 @@ fn cut_tables_first(paths: &Paths, target: Target<'_>) {
     };
     let target = match target {
         Target::Actor(actor) => actor,
-        Target::Word(who) => {
+        Target::Word(_) | Target::Seat(_) => {
             let Ok(Some((me, _, _))) = log_entries::open_local_member_signer(paths, &log) else {
                 return;
             };
-            let Ok((target, _, _)) = removal_target(&log, who, &me) else {
+            let Ok((target, _, _)) = named_target(&log, target, &me) else {
                 return;
             };
             target
@@ -792,11 +842,61 @@ pub fn cut_own_removals(paths: &Paths) -> usize {
 /// What a draft signed, beside what it reports to the person (its refusal, where it refused).
 type Drafted<T> = crate::Result<(Vec<Record>, crate::Result<T>)>;
 
-/// Who a removal names: the word a person typed, or a member's actor.
+/// Who a removal names.
 #[derive(Clone, Copy)]
 enum Target<'a> {
+    /// The word a person typed, which [`removal_target`] resolves.
     Word(&'a str),
+    /// The seat a person's front end resolved ([`remove_seat`]): a person's act, refused and
+    /// swept as the word's is.
+    Seat(MemberId),
+    /// A member's actor, by [`remove_actor`].
     Actor(MemberId),
+}
+
+/// The member `target` names in `log`, as the Mac `me` removes it (its actor, age recipient and
+/// label): never `me`, and for a person's removal ([`Target::Word`], [`Target::Seat`]) never
+/// another seat of `me`'s age recipient either: a person's removal takes out every seat of the
+/// recipient and revokes it, so removing this Mac's twin seat would take this Mac out too. A seat
+/// removed already is refused by its label, as the word's [`removal_target`] refuses it.
+fn named_target(
+    log: &Log,
+    target: Target<'_>,
+    me: &MemberId,
+) -> crate::Result<(MemberId, Recipient, String)> {
+    let membership = log.membership();
+    let named = match target {
+        Target::Word(who) => removal_target(log, who, me)?,
+        Target::Seat(seat) | Target::Actor(seat) if seat == *me => {
+            return Err(Error::new("a Mac does not remove itself"));
+        }
+        Target::Seat(seat) | Target::Actor(seat) => match membership.get(&seat) {
+            Some(member) => (seat, member.binding.recipient(), member.label.clone()),
+            None => {
+                return Err(Error::new(match target {
+                    Target::Seat(_) if membership.removal(&seat).is_some() => {
+                        format!("{} is removed already", label_of(log, &membership, &seat))
+                    }
+                    Target::Seat(_) => {
+                        "that seat is no member of this Mac's membership log".to_owned()
+                    }
+                    _ => "target member is not active in the membership log".to_owned(),
+                }));
+            }
+        },
+    };
+    if !matches!(target, Target::Actor(_))
+        && membership
+            .get(me)
+            .is_some_and(|mine| mine.binding.recipient() == named.1)
+    {
+        return Err(Error::new(format!(
+            "{} holds this Mac's own age recipient, and a person's removal takes out every seat \
+             of it: a Mac does not remove itself",
+            named.2
+        )));
+    }
+    Ok(named)
 }
 
 fn draft_removal(
@@ -816,16 +916,10 @@ fn draft_removal(
             "the membership log seats no device key of this Mac as a member",
         ));
     };
-    let is_word_target = matches!(target, Target::Word(_));
-    let named = match target {
-        Target::Word(who) => removal_target(&log, who, &actor),
-        Target::Actor(target) if target == actor => Err(Error::new("a Mac does not remove itself")),
-        Target::Actor(target) => log
-            .membership()
-            .get(&target)
-            .map(|m| (target, m.binding.recipient(), m.label.clone()))
-            .ok_or_else(|| Error::new("target member is not active in the membership log")),
-    };
+    // A person's removal takes the Mac out, every seat of its age recipient; the runtime's
+    // removal of an actor takes that one seat.
+    let by_person = !matches!(target, Target::Actor(_));
+    let named = named_target(&log, target, &actor);
     let (target, recipient, label) = match named {
         Ok(target) => target,
         Err(error) => return refuse(error),
@@ -1063,7 +1157,7 @@ fn draft_removal(
     }
 
     let mut seats_to_remove = vec![(target, cutoff)];
-    if is_word_target {
+    if by_person {
         for (&seat_actor, seat_member) in membership.members() {
             if seat_actor != target
                 && seat_actor != actor
@@ -1514,7 +1608,7 @@ pub fn undo_offers(paths: &Paths) -> crate::Result<Vec<UndoOffer>> {
     let Some((me, _, _)) = open_local_seat_signer(paths, log)? else {
         return Ok(Vec::new());
     };
-    let membership = log.membership();
+    let membership = log.membership_ref();
     let Some(removal) = membership.removal(&me) else {
         return Ok(Vec::new());
     };
@@ -1540,7 +1634,7 @@ pub fn undo_offers(paths: &Paths) -> crate::Result<Vec<UndoOffer>> {
             .count();
         offers.push(UndoOffer {
             remover: *remover,
-            label: label_of(log, &membership, remover),
+            label: label_of(log, membership, remover),
             code: seat_of(log, remover)
                 .map(|(recipient, _, _)| join_code(&recipient))
                 .unwrap_or_default(),
@@ -2341,7 +2435,8 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     /// The negative control of the bounded settle grace: while set, the grace does not let an
     /// audience go while [`Log::undecided`] names a Mac there, as before, so a whole batch that
-    /// ends in `Wrap`s holds the audience until its minter signs again.
+    /// ends in `Wrap`s and could still wrap that Mac above its last one holds the audience until
+    /// its minter signs again.
     pub(super) static UNDECIDED_HOLDS: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     /// The negative control of `[everyone]`'s hold on other audiences: while set, a re-key waits
@@ -2563,10 +2658,10 @@ fn turn_of(
 /// - an epoch another Mac minted whose batch this Mac may hold only a prefix of
 ///   ([`Log::unsettled`]) holds the audience, until it settles or
 ///   [`log_entries::SETTLE_GRACE_MS`] after this Mac first saw it (a minter whose batch ends in
-///   `Wrap`s and falls silent: no record marks a batch's end, so a whole one reads as a prefix
-///   until its minter signs again); a rank's steps then count from when it let the audience go,
-///   so a head that settles late does not put every rank past due at once. A head that arrives
-///   settled moves no rank;
+///   `Wrap`s and falls silent: no record marks a batch's end, so a whole one that could still
+///   wrap a Mac above its last `Wrap` reads as a prefix until its minter signs again); a rank's
+///   steps then count from when it let the audience go, so a head that settles late does not put
+///   every rank past due at once. A head that arrives settled moves no rank;
 /// - every audience but `[everyone]` is held the same way by `[everyone]`'s newest epochs while
 ///   their batch may still decide a Mac with no seat ([`Log::undecided`]): a re-key reads
 ///   `[everyone]`'s leave-out for each audience and would drop that Mac for good. Past the grace
@@ -3382,6 +3477,14 @@ pub fn epoch_convergence_environment() {}
         machine = "GapHeal",
         action = "OldMintOmitsB",
         reason = "Environment: a pre-R1 Mac (C) mints by the intersection carry, leaving out a current seat it knows"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "GapHeal",
+        action = "OldMintUnder",
+        reason = "Environment: a pre-R1 Mac (C) mints as in OldMint, the Mac it leaves out sorting below its last Wrap"
     )
 )]
 #[cfg_attr(

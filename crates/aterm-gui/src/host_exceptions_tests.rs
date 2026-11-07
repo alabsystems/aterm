@@ -5164,7 +5164,7 @@ fn an_off_by_a_manager_is_told_and_a_worker_with_its_own_report_has_only_that() 
     let ctx = app.pool.get(local).expect("its session").ctx.clone();
     let sid = ctx.self_id.as_str().to_string();
     let mut working: TaskRecord = TaskMark::new(TaskState::Working)
-        .apply(None, false, std::time::Instant::now(), 1_000)
+        .apply(None, &Default::default(), std::time::Instant::now(), 1_000)
         .0;
     working.trusted_cwd = Some(format!(
         "/state/aterm/{}/{}",
@@ -5209,7 +5209,7 @@ fn a_claim_workers_end_is_its_own_record_once_either_way() {
         let local = app.focused_session_id(crate::WindowId(0)).expect("front");
         let ctx = app.pool.get(local).expect("its session").ctx.clone();
         let mut working: TaskRecord = TaskMark::new(TaskState::Working)
-            .apply(None, false, std::time::Instant::now(), 1_000)
+            .apply(None, &Default::default(), std::time::Instant::now(), 1_000)
             .0;
         working.trusted_cwd = Some(claim.clone());
         seed_carried(&ctx, Some(&working.carry_row(std::time::Instant::now())));
@@ -5285,6 +5285,7 @@ fn a_claim_workers_end_is_its_own_record_once_either_way() {
                 check: false,
                 said: reply.to_owned(),
                 at_ms: 0,
+                statement: aterm_agent::harness::land_receipt::Statement::Unread,
             },
         )));
     app.note_worker_conclusion(local);

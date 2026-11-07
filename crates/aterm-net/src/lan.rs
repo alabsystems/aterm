@@ -374,17 +374,149 @@ fn attachments(
         .collect())
 }
 
+/// This machine's attachments as [`local_attachments_from`] reads them, kept while the kernel's
+/// interface generation ([`native::interface_generation`]) stands still. Every listener and
+/// multicast recheck (each link's, every 100 ms tick of the Commons runtime, before and after
+/// each receive) asked the OS for every interface again, a `getifaddrs` with an index and a link
+/// type lookup each, to find its attachment unchanged: about 4% of a core on an idle Mac
+/// (2026-11-06).
 fn local_attachments(
     local: Option<SocketAddr>,
     selected: Option<u32>,
 ) -> io::Result<Vec<Attachment>> {
-    local_attachments_from(
-        aterm_uds::network::interfaces()?,
-        local,
-        selected,
-        native::index,
-        native::physical,
-    )
+    kept_attachments(|memo| {
+        memo.read(
+            native::interface_generation(),
+            attachments_clock(),
+            local,
+            selected,
+            || {
+                #[cfg(test)]
+                ENUMERATIONS.set(ENUMERATIONS.get() + 1);
+                local_attachments_from(
+                    aterm_uds::network::interfaces()?,
+                    local,
+                    selected,
+                    native::index,
+                    native::physical,
+                )
+            },
+        )
+    })
+}
+
+/// The attachments [`local_attachments`] keeps: the process's, and in a test each thread's own,
+/// so one test's generations never meet another's.
+fn kept_attachments<R>(read: impl FnOnce(&AttachmentMemo) -> R) -> R {
+    #[cfg(not(test))]
+    {
+        static MEMO: AttachmentMemo = AttachmentMemo::new();
+        read(&MEMO)
+    }
+    #[cfg(test)]
+    {
+        thread_local! {
+            static MEMO: AttachmentMemo = const { AttachmentMemo::new() };
+        }
+        MEMO.with(read)
+    }
+}
+
+/// The instant [`local_attachments`] keeps a read by: now, or in a test the instant its thread
+/// fixed ([`FIXED_NOW`]).
+fn attachments_clock() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = FIXED_NOW.get() {
+        return now;
+    }
+    Instant::now()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The enumerations [`local_attachments`] made on this thread, counted (never timed).
+    static ENUMERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The instant [`local_attachments`] keeps reads by on this thread, where a test fixed one.
+    static FIXED_NOW: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// How long a kept read of the attachments may stand even while the generation does: a bound on
+/// what a message the kernel dropped from a full routing socket, which says nothing, could leave
+/// unseen.
+const ATTACHMENTS_REREAD: Duration = Duration::from_secs(10);
+
+/// The attachments read under one interface generation, for each `(local, selected)` asked.
+struct AttachmentMemo {
+    held: std::sync::Mutex<Vec<HeldAttachments>>,
+}
+
+struct HeldAttachments {
+    generation: u64,
+    read_at: Instant,
+    local: Option<SocketAddr>,
+    selected: Option<u32>,
+    attachments: Vec<Attachment>,
+}
+
+impl AttachmentMemo {
+    /// The most `(local, selected)` reads kept: a Mac's links, and a test's.
+    const MAX: usize = 16;
+
+    const fn new() -> Self {
+        Self {
+            held: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The attachments `read` gives for `local` and `selected`, kept under `generation` (taken
+    /// before the read, so a change after it moves the next one) for [`ATTACHMENTS_REREAD`]
+    /// from `now`. With no generation every call reads; a failed read is never kept.
+    fn read(
+        &self,
+        generation: Option<u64>,
+        now: Instant,
+        local: Option<SocketAddr>,
+        selected: Option<u32>,
+        read: impl FnOnce() -> io::Result<Vec<Attachment>>,
+    ) -> io::Result<Vec<Attachment>> {
+        let Some(generation) = generation else {
+            return read();
+        };
+        let kept = |held: &HeldAttachments| {
+            held.generation == generation
+                && held.local == local
+                && held.selected == selected
+                && now.saturating_duration_since(held.read_at) < ATTACHMENTS_REREAD
+        };
+        if let Some(held) = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|held| kept(held))
+        {
+            return Ok(held.attachments.clone());
+        }
+        let attachments = read()?;
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.retain(|held| {
+            held.generation == generation && (held.local, held.selected) != (local, selected)
+        });
+        if held.len() >= Self::MAX {
+            held.remove(0);
+        }
+        held.push(HeldAttachments {
+            generation,
+            read_at: now,
+            local,
+            selected,
+            attachments: attachments.clone(),
+        });
+        Ok(attachments)
+    }
 }
 
 fn local_attachments_from(

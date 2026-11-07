@@ -370,7 +370,7 @@ pub fn tally(output: &str) -> Tally {
     t
 }
 
-/// A test run's row: PASS on cargo's exit 0 when a test passed, NOT RUN when none did (a selection that matched nothing decided nothing), else FAIL naming what failed.
+/// A test run's row: PASS on cargo's exit 0 when a test passed, NOT RUN when none did (a selection that matched nothing decided nothing) or the guest was lost under it (what then failed decided nothing), else FAIL naming what failed.
 #[must_use]
 pub fn test_verdict(name: &str, out: &Out) -> Row {
     let t = tally(&out.text);
@@ -378,7 +378,12 @@ pub fn test_verdict(name: &str, out: &Out) -> Row {
         "{} passed, {} failed, {} ignored",
         t.passed, t.failed, t.ignored
     );
-    let (verdict, detail) = if out.ok() && t.passed > 0 {
+    let (verdict, detail) = if let Some(why) = &out.lost {
+        (
+            Verdict::NotRun,
+            format!("the guest was lost under the tests ({counts} before it): {why}"),
+        )
+    } else if out.ok() && t.passed > 0 {
         (Verdict::Pass, counts)
     } else if out.ok() {
         (
@@ -1995,14 +2000,14 @@ pub fn cmd_a11y(args: &[String]) -> Res {
 
 fn run(ask: &ProofArgs, kind: &str) -> Res {
     crate::stop::install();
-    let _lock = linux::LaneLock::boot()?;
+    let mut lane = linux::LaneLock::boot()?;
     let prefix = format!(
         "{kind}-{}-",
         crate::util::compact_stamp(crate::util::now_secs())
     );
     let results = fresh_results(&linux::state_dir()?, &prefix)?;
     let t0 = Instant::now();
-    let mut up = match linux::bring_up() {
+    let mut up = match linux::bring_up(&mut lane) {
         Ok(up) => up,
         Err(f) => {
             let _ = std::fs::remove_dir(&results);
@@ -3068,6 +3073,21 @@ error: 1 target failed:
             lost: None,
         };
         assert_eq!(test_verdict("t", &nothing).verdict, Verdict::NotRun);
+        let cut = Out {
+            code: Some(255),
+            text: "test a ... ok\ntest b ... FAILED\n".into(),
+            secs: 1.0,
+            signal: None,
+            not_started: None,
+            lost: Some("krunkit aborted: SIGABRT in f (lib)".into()),
+        };
+        let r = test_verdict("t", &cut);
+        assert_eq!(r.verdict, Verdict::NotRun, "{}", r.detail);
+        assert!(
+            r.detail.ends_with("krunkit aborted: SIGABRT in f (lib)"),
+            "{}",
+            r.detail
+        );
     }
 
     #[test]

@@ -2547,6 +2547,7 @@ fn the_approver_opens_nothing_on_a_profile_another_launch_holds() {
     use super::super::accounts::Cli;
     use super::super::browser_window::ProfileLock;
     use super::super::login_drive::{Approval, Approver as _, Handoff};
+    use std::os::unix::fs::DirBuilderExt as _;
     let tmp = aterm_tempfile::tempdir().expect("tmp");
     let shared = tmp.path().join("state/accounts");
     let home = tmp.path().join("home");
@@ -2554,7 +2555,12 @@ fn the_approver_opens_nothing_on_a_profile_another_launch_holds() {
     let mut approver =
         VendorApprover::new(Cli::Kimi, "kimi-one", Some(email), &shared, Some(&home));
     let profile = approver.profile_dir(Some(email));
-    std::fs::create_dir_all(&profile).expect("profile");
+    // Private, as aterm keeps its state: its readers refuse any other directory.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&profile)
+        .expect("profile");
     let held = ProfileLock::claim(&profile).expect("free");
     let handoff = Handoff {
         url: KIMI_CARD_URL,

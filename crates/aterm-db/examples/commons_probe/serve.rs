@@ -363,12 +363,17 @@ pub(super) fn application_value(report: Option<aterm_db::replica::Report>) -> Va
     }))
 }
 
+/// A round's failure: its local words and its published cause.
+fn failure_value(failure: &aterm_db::control::Failure) -> Value {
+    json!({"error":failure.text,"cause":failure.cause.word()})
+}
+
 fn round_value(round: &RepairRound, baseline: Option<&LocalProbe>) -> Value {
     let control = match &round.control {
         Ok(report) => {
             json!({"sent":report.sent,"received":report.received,"deferred":report.deferred})
         }
-        Err(error) => json!({"error":error}),
+        Err(error) => failure_value(error),
     };
     let application = application_value(round.application);
     let membership = round.membership.map_or(Value::Null, |report| {
@@ -379,7 +384,7 @@ fn round_value(round: &RepairRound, baseline: Option<&LocalProbe>) -> Value {
     let handoff = match &round.handoff {
         None => Value::Null,
         Some(Ok(published)) => json!({"published":published}),
-        Some(Err(error)) => json!({"error":error}),
+        Some(Err(error)) => failure_value(error),
     };
     json!({
         "target":round.target.map(|address|address.to_string()),
@@ -388,8 +393,10 @@ fn round_value(round: &RepairRound, baseline: Option<&LocalProbe>) -> Value {
         "phase":round.phase.map(aterm_db::control::Phase::label),
         "completed_at_ms":round.completed_at_ms,"dropped_before":round.dropped_before,
         "classification":classification(round,baseline),"control":control,
-        "membership":membership,"membership_error":round.membership_error,
-        "application":application,"application_error":round.application_error,
+        "membership":membership,
+        "membership_error":round.membership_error.as_ref().map_or(Value::Null, failure_value),
+        "application":application,
+        "application_error":round.application_error.as_ref().map_or(Value::Null, failure_value),
         "application_interrupted":application_value(round.application_interrupted),
         "application_deferral":deferral_value(round.application_deferral.as_ref()),
         "application_batch_deferral":batch_deferral_value(round.application_batch_deferral.as_ref()),

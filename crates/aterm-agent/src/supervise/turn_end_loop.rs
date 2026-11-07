@@ -7664,7 +7664,7 @@ impl<C: Ctl> Session<'_, C> {
 #[derive(Debug, Default)]
 pub(super) struct ShadowPoint {
     reading: Option<TurnEndReading>,
-    prose: Option<super::super::policy::approval::QuestionPriority>,
+    prose: Option<super::super::policy::approval::PriorityWord>,
     withheld: bool,
 }
 

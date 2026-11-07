@@ -965,3 +965,55 @@ fn out_of_maps_each_end_once() {
         (None, None, Some("gone"))
     );
 }
+
+/// VZ-BAKE-CLAIM: the boot on a bake's sealed disk goes on under the claim the bake was
+/// admitted with and asks for no other; a session on a VM already up lets that claim go before
+/// it asks for its vCPUs, and a session with none asks with whether it boots.
+#[test]
+fn the_sealed_disk_boots_under_the_bake_s_claim() {
+    struct Claim(&'static str, Arc<Mutex<Vec<String>>>);
+    impl Drop for Claim {
+        fn drop(&mut self) {
+            self.1
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(format!("let go {}", self.0));
+        }
+    }
+    let log: Log = Arc::default();
+    let said = |log: &Log| {
+        std::mem::take(
+            &mut *log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    };
+    let admit = |log: &Log| {
+        let log = Arc::clone(log);
+        move |booting: bool| -> Result<Claim, Fail> {
+            log.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(format!("admit booting={booting}"));
+            Ok(Claim("fresh", Arc::clone(&log)))
+        }
+    };
+    let held = |log: &Log| Some(Claim("bake's", Arc::clone(log)));
+
+    let kept = boot_claim(held(&log), true, |_| -> Result<Claim, Fail> {
+        panic!("the sealed disk's boot asks for no other claim")
+    })
+    .expect("kept");
+    assert_eq!(kept.0, "bake's");
+    drop(kept);
+    assert_eq!(said(&log), ["let go bake's"]);
+
+    let fresh = boot_claim(held(&log), false, admit(&log)).expect("admitted");
+    assert_eq!(fresh.0, "fresh");
+    assert_eq!(said(&log), ["let go bake's", "admit booting=false"]);
+    drop(fresh);
+    let _ = said(&log);
+
+    let fresh = boot_claim(None, true, admit(&log)).expect("admitted");
+    assert_eq!(said(&log), ["admit booting=true"]);
+    drop(fresh);
+}

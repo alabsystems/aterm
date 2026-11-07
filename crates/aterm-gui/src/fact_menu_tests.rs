@@ -1689,7 +1689,7 @@ fn a_grok_pools_menu_offers_no_automatic_sign_in() {
         std::fs::create_dir_all(d).unwrap();
     }
     let aterm_toml = config.join("aterm.toml");
-    std::fs::write(&aterm_toml, "[fleet]\nmachine = \"m16\"\n").unwrap();
+    crate::test_scratch::write_config(&aterm_toml, "[fleet]\nmachine = \"m16\"\n");
     for (cli, extra) in [(Cli::Grok, ""), (Cli::Kimi, "region = \"global\"\n")] {
         let id = cli.id();
         let login = home.join(format!(".aterm/logins/{id}/{id}-1"));
@@ -1732,7 +1732,7 @@ fn a_default_rows_menu_entry_follows_its_login_file() {
         std::fs::create_dir_all(d).unwrap();
     }
     let aterm_toml = config.join("aterm.toml");
-    std::fs::write(&aterm_toml, "[fleet]\nmachine = \"m16\"\n").unwrap();
+    crate::test_scratch::write_config(&aterm_toml, "[fleet]\nmachine = \"m16\"\n");
     let work = home.join(".aterm/logins/codex/work");
     std::fs::create_dir_all(&work).unwrap();
     std::fs::write(work.join("auth.json"), "{}").unwrap();
@@ -1803,7 +1803,7 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
         std::fs::create_dir_all(d).unwrap();
     }
     let aterm_toml = config.join("aterm.toml");
-    std::fs::write(&aterm_toml, "[fleet]\nmachine = \"m16\"\n").unwrap();
+    crate::test_scratch::write_config(&aterm_toml, "[fleet]\nmachine = \"m16\"\n");
     std::fs::write(
         config.join("accounts.toml"),
         "[[account]]\nlabel = \"m16\"\nemail = \"claude-one@example.com\"\n",

@@ -129,6 +129,83 @@ pub fn could_not_run_as_root(fixture: &str) {
     let _ = fixture;
 }
 
+/// End the calling test COULD NOT RUN in a process under sshd's Redirection Guard. OpenSSH for
+/// Windows enforces `ProcessRedirectionTrustPolicy` on itself, and every process of an SSH
+/// session inherits it: such a process follows no junction a non-administrator made ("File Not
+/// Found", or os error 448, an untrusted mount point), so a test that makes one and goes through
+/// it, or holds aterm's code to not going through it, decides nothing there. `fixture` says what
+/// the test makes.
+///
+/// # Panics
+/// Under the guard: that is the COULD NOT RUN.
+#[cfg(all(windows, any(test, debug_assertions)))]
+#[track_caller]
+pub fn could_not_run_under_redirection_guard(fixture: &str) {
+    if session::redirection_guarded() {
+        could_not_run(format!(
+            "{fixture}, and this process inherits sshd's Redirection Guard \
+             (ProcessRedirectionTrustPolicy: EnforceRedirectionTrust), under which no junction a \
+             non-administrator made is followed; run it outside sshd's processes, in a desktop \
+             session (`lab windows exec --desktop`)"
+        ));
+    }
+}
+
+/// End the calling test COULD NOT RUN in session 0, the services' session, where an SSH
+/// session's processes run too: it has no interactive window station (an unnamed
+/// `CreateWindowStationW` answers "Access is denied" there) and no display. `fixture` says what
+/// the test needs of a desktop.
+///
+/// # Panics
+/// In session 0: that is the COULD NOT RUN.
+#[cfg(all(windows, any(test, debug_assertions)))]
+#[track_caller]
+pub fn could_not_run_in_session_zero(fixture: &str) {
+    if session::id() == Some(0) {
+        could_not_run(format!(
+            "{fixture}, and this process runs in session 0 (where an SSH session's processes \
+             run), which has no interactive window station or display; run it in a desktop \
+             session (`lab windows exec --desktop`)"
+        ));
+    }
+}
+
+/// What a Windows test reads of the session it runs in.
+#[cfg(all(windows, any(test, debug_assertions)))]
+mod session {
+    use crate::win::ffi;
+
+    /// `PROCESS_MITIGATION_POLICY::ProcessRedirectionTrustPolicy`.
+    const REDIRECTION_TRUST: i32 = 16;
+    /// `PROCESS_MITIGATION_REDIRECTION_TRUST_POLICY`'s `EnforceRedirectionTrust` bit.
+    const ENFORCE: u32 = 1;
+
+    /// The session this process runs in; `None` where Windows does not say.
+    pub(super) fn id() -> Option<u32> {
+        let mut session = 0;
+        // SAFETY: this process's own id and a live out pointer.
+        let ok = unsafe { ffi::ProcessIdToSessionId(ffi::GetCurrentProcessId(), &mut session) };
+        (ok != 0).then_some(session)
+    }
+
+    /// Whether this process enforces Redirection Trust; `false` where Windows has no such
+    /// policy to read.
+    pub(super) fn redirection_guarded() -> bool {
+        let mut flags: u32 = 0;
+        // SAFETY: the current-process pseudo-handle, and a live buffer of exactly the policy's
+        // size, one `DWORD` of flags.
+        let ok = unsafe {
+            ffi::GetProcessMitigationPolicy(
+                ffi::GetCurrentProcess(),
+                REDIRECTION_TRUST,
+                (&raw mut flags).cast(),
+                std::mem::size_of::<u32>(),
+            )
+        };
+        ok != 0 && flags & ENFORCE != 0
+    }
+}
+
 /// Who provides a [`Tool`], and so the one command a COULD NOT RUN for it names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
@@ -259,6 +336,10 @@ pub struct Tool {
     /// macOS ships. On a Linux host without it (for a pin, one the pin does not cover), the
     /// guest is its provider ([`Tool::remedy_on`]).
     pub in_guest: bool,
+    /// The package a Linux distribution adds this [`Provider::Os`] row by, where its base
+    /// install has none (Debian's and Ubuntu's `zsh`): a Linux host without it is sent to its
+    /// package manager ([`Tool::remedy_on`]).
+    pub linux_package: Option<&'static str>,
 }
 
 /// How a refusal sends a test to the Linux lane's guest.
@@ -532,6 +613,11 @@ impl Tool {
             Provider::Os if self.in_guest && os == "linux" => format!(
                 "the Linux guest lays a Mac's copy at {}: {GUEST_RUNS}",
                 self.places_on(os).next().unwrap_or(self.name)
+            ),
+            Provider::Os if os == "linux" && self.linux_package.is_some() => format!(
+                "the Linux distribution's package manager adds it, as `sudo apt install {}` does \
+                 on Debian and Ubuntu",
+                self.linux_package.unwrap_or(self.name)
             ),
             Provider::OsAndWindows | Provider::Windows if windows => {
                 "it comes with Windows, and no command adds it".into()

@@ -290,7 +290,8 @@ struct JobMeter {
     /// The most CPU a pass read its members other than the block's shell to have spent, their
     /// own plus the children each reaped, ns.
     cpu_ns: Option<u64>,
-    /// The verdict of its last pass was `stuck`.
+    /// The verdict of the last pass that read it live was `stuck` (the pass that finds it gone
+    /// judges it `exited`, never stuck).
     stuck: bool,
 }
 
@@ -2795,7 +2796,11 @@ impl Jobs {
             }
             job.last_name.clone_from(&leader_name);
             job.meter.read(&now, job.shell);
-            job.meter.stuck = out.verdict == Verdict::Stuck;
+            // The pass that finds the job gone judges it `exited`, never stuck: what its row keeps
+            // is the judgement of the last pass that read it live.
+            if !exited {
+                job.meter.stuck = out.verdict == Verdict::Stuck;
+            }
             let last_read = job.last_tick_ms;
             job.members = now;
             job.last_tick_ms = Some(at);

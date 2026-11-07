@@ -405,7 +405,7 @@ fn serve(
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let mut routes = (network.scope == Scope::Lan)
         .then(aterm_uds::network::RouteChanges::open)
-        .flatten();
+        .and_then(Result::ok);
     let mut sockets = Vec::new();
     let mut refresh = Instant::now();
     let mut replies = ReplyWindow::new(Instant::now());

@@ -19,6 +19,14 @@
 mod models_account_adopt_identity;
 mod models_account_continuation;
 pub use models_account_continuation::account_continuation_model;
+mod models_account_claim_publication;
+mod models_account_claim_readiness;
+pub use models_account_claim_readiness::account_claim_readiness_model;
+mod models_account_host_observation;
+pub use models_account_claim_publication::{
+    account_claim_publication_model, account_noeffect_closure_model,
+};
+pub use models_account_host_observation::account_host_observation_model;
 mod models_account_lineage_budget;
 pub use models_account_lineage_budget::account_lineage_budget_model;
 mod models_native_account_client_slot;
@@ -29,6 +37,12 @@ mod models_native_write_identity;
 pub use models_native_write_identity::native_write_identity_model;
 mod models_noexec_phase;
 pub use models_noexec_phase::noexec_phase_model;
+mod models_account_journal;
+pub use models_account_journal::account_journal_model;
+mod models_account_closure_phase;
+pub use models_account_closure_phase::account_closure_phase_model;
+mod models_account_wire_reply;
+pub use models_account_wire_reply::account_wire_reply_model;
 mod models_native_observation_continuity;
 mod models_scoped_input;
 mod models_scoped_native;
@@ -318,7 +332,7 @@ pub use models_account_sheet_columns::account_sheet_columns_model;
 pub use models_account_signback_receipt::account_signback_receipt_model;
 pub use models_account_signin::account_signin_admission_model;
 pub use models_account_signin_epoch::account_signin_epoch_model;
-pub use models_account_signin_lock::account_signin_lock_model;
+pub use models_account_signin_lock::{account_signin_lock_model, native_signin_phase_model};
 pub use models_account_signin_observation_commit::account_signin_observation_commit_model;
 pub use models_account_signin_policy::account_signin_policy_model;
 pub use models_account_signin_publication::signin_publication_model;

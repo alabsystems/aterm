@@ -57,7 +57,8 @@ pub const MINUTE_FILTER: &str = "/m/*/shared/1m/*";
 pub const HOUR_FILTER: &str = "/m/*/shared/1h/*";
 /// Each account's and each agy home's current row: `/m/n-<id>/shared/quota/<cli>/<key>`.
 pub const QUOTA_FILTER: &str = "/m/*/shared/quota/>";
-/// Presence, needs, place and the pools a Mac could not read: `/m/n-<id>/shared/now/…`.
+/// Presence, needs, agent activity, place and the pools a Mac could not read:
+/// `/m/n-<id>/shared/now/…`.
 pub const NOW_FILTER: &str = "/m/*/shared/now/>";
 
 const HOUR_S: u64 = 60 * 60;

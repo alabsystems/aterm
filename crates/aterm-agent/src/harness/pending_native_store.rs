@@ -8,6 +8,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[path = "pending_native_store_identity.rs"]
+mod physical;
+pub(super) use physical::Identity as PhysicalIdentity;
+
 const UNAVAILABLE: &str = "Protected native completion is unavailable";
 
 pub(super) struct Store {
@@ -61,6 +65,16 @@ impl Store {
 
     /// An immutable issuance checkpoint can bind this exact encrypted revision.
     /// Encryption alone is not producer-origin authentication.
+    /// Descriptive physical namespace captured from this real claimed store.
+    /// The caller must separately authenticate its envelope and current role.
+    pub(super) fn physical_identity(&self) -> Result<PhysicalIdentity, &'static str> {
+        self.unchanged()?;
+        let directory = self.path.parent().ok_or(UNAVAILABLE)?;
+        let observed = PhysicalIdentity::capture(directory, &self._claim)?;
+        self.unchanged()?;
+        Ok(observed)
+    }
+
     pub(super) fn sealed_digest(&self) -> Option<[u8; 32]> {
         self.expected
     }
@@ -316,5 +330,42 @@ mod tests {
                 .is_err()
         );
         assert!(!store.path.exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn physical_store_identity_joins_aliases_without_reacquiring_or_granting_a_lock() {
+        let (root, _identity, mut store) = fixture();
+        store.save(b"namespace-fixture").unwrap();
+        let observed = store.physical_identity().unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(store.path.parent().unwrap(), &alias).unwrap();
+        let through_alias = PhysicalIdentity::capture(&alias, &store._claim).unwrap();
+        assert_eq!(observed, through_alias);
+        assert!(observed.current());
+        let directory = store.path.parent().unwrap().to_path_buf();
+        drop(store);
+        let _exclusive = super::super::browser_window::ProfileLock::claim(&directory).unwrap();
+        assert!(
+            observed.current(),
+            "identity observation acquires no competing lock and grants no exclusion"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn physical_store_identity_refuses_replaced_directory_or_claim_descriptor() {
+        let (root, _identity, mut store) = fixture();
+        store.save(b"namespace-fixture").unwrap();
+        let observed = store.physical_identity().unwrap();
+        let directory = store.path.parent().unwrap().to_path_buf();
+        std::fs::rename(&directory, root.path().join("retired-custody")).unwrap();
+        aterm_secrets::fsx::ensure_private_dir(&directory).unwrap();
+        let _replacement = super::super::browser_window::ProfileLock::claim(&directory).unwrap();
+        assert!(!observed.current());
+        assert!(store.physical_identity().is_err());
+        assert!(
+            PhysicalIdentity::capture(&directory, &store._claim).is_err(),
+            "different actual held fd cannot adopt a replacement path"
+        );
     }
 }

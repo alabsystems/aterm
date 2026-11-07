@@ -1,5 +1,15 @@
-Exact Rust source from Trust b3046392072d1303de77d0ee99d98639a6cb883c, crates/trust-resource-controller. Only manifest libc redirects to maintained aterm-libc. Private codec and canonical native client; no allocation authority. Manifest redirects remain limited to maintained first-party dependencies.
+# Maintained native resource sources
 
-The host selects the optional native client in its normal dependency so dev and test builds
-share one library unit. Only development fixtures call it until the actual custody RPC is
-qualified; selecting the feature activates no caller. The vendor's default remains std/libc.
+Rust source, build script, upstream README and licenses are exact Trust
+`782983f10ebf8d8c352219dc01ce301ff4d7aab6`, `crates/trust-resource-controller`.
+The manifest redirects dependencies to maintained local crates.
+
+Resolver query role 5 is distinct from metadata role 3 and Mach-O linker role 4.
+Protocol data and the resolver support marker create no admission, SDK,
+CPU, memory, execution, retirement or proof authority. Actual custody remains
+with the native host and the original retained client owner.
+
+The default native channel remains enabled upstream; the workspace's data-only
+edge disables defaults. Native host/client consumers explicitly select client,
+which implies channel. Data-only builds have no native runtime dependency or
+compiler identity probe. Accounting observations grant no authority.

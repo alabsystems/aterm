@@ -8,6 +8,76 @@ use aterm_types::resource_inspection as observed;
 use trust_resource_controller as wire;
 
 impl Owner {
+    pub(in super::super) fn resolver_ready(
+        &mut self,
+        peer: Peer,
+        query: &wire::ContextQuery,
+    ) -> io::Result<wire::ContextReply> {
+        let reply = self.context(peer, query)?;
+        let job = self
+            .jobs
+            .get_mut(&(query.binding.session.clone(), query.binding.root_attempt))
+            .ok_or_else(|| refused("resolver root is unavailable"))?;
+        if job.metadata_root
+            || !job
+                .resolver
+                .as_ref()
+                .is_some_and(resolver_root::Preparation::prepared)
+            || job.resolver_ready
+            || job.cpu_ceiling != 1
+            || job.metadata_gnu.is_none()
+            || reply.context.sdk.is_none()
+            || reply.context.original_root.pid != peer.pid
+            || reply.context.original_root.birth != peer.birth
+            || !crate::metadata_prelude::no_fork(peer.pid)?
+        {
+            return Err(refused(
+                "resolver readiness requires its original confined unnegotiated root",
+            ));
+        }
+        let sdk = job
+            .metadata_sdk
+            .as_ref()
+            .ok_or_else(|| refused("resolver SDK missing"))?;
+        // Preparation checked the marker on this same retained SDK before GO.
+        // Fresh loaded/runtime validation below rejects any changed input;
+        // repeating the marker parser cannot establish another fact here.
+        sdk.validate_loaded(peer.pid)?;
+        job.resolver_ready = true;
+        Ok(reply)
+    }
+
+    pub(in super::super) fn metadata_ready(
+        &mut self,
+        peer: Peer,
+        query: &wire::ContextQuery,
+    ) -> io::Result<wire::ContextReply> {
+        let reply = self.context(peer, query)?;
+        let job = self
+            .jobs
+            .get_mut(&(query.binding.session.clone(), query.binding.root_attempt))
+            .ok_or_else(|| refused("metadata root is unavailable"))?;
+        if !job.metadata_root
+            || job.metadata_ready
+            || job.cpu_ceiling != 1
+            || job.metadata_gnu.is_none()
+            || reply.context.sdk.is_none()
+            || reply.context.original_root.pid != peer.pid
+            || reply.context.original_root.birth != peer.birth
+        {
+            return Err(refused(
+                "metadata readiness requires its original live unnegotiated root",
+            ));
+        }
+        job.metadata_sdk
+            .as_ref()
+            .ok_or_else(|| refused("metadata root SDK missing"))?
+            .validate_loaded(peer.pid)?;
+        // Readiness creates no new grant. It enables only the closed metadata
+        // member protocol inside this already registered original root.
+        job.metadata_ready = true;
+        Ok(reply)
+    }
     pub(in super::super) fn context(
         &mut self,
         peer: Peer,
@@ -60,9 +130,27 @@ impl Owner {
                 })
                 .ok_or_else(|| refused("native peer is outside this original job"))?;
         }
+        let sdk = match value.subject {
+            observed::Subject::Root { .. } => job.sdk.clone(),
+            observed::Subject::RegisteredMember { attempt, .. } => {
+                job.members.get(&attempt).and_then(member_queue::Slot::sdk)
+            }
+        };
+        let mut context = convert(value)?;
+        context.sdk = sdk;
+        if peer.pid == context.original_root.pid
+            && peer.birth == context.original_root.birth
+            && (job.metadata_root || job.resolver.is_some())
+        {
+            context.sdk = job
+                .metadata_sdk
+                .as_ref()
+                .map(|sdk| sdk.context())
+                .transpose()?;
+        }
         let reply = wire::ContextReply {
             call_attempt: query.call_attempt,
-            context: convert(value)?,
+            context,
         };
         reply.encode()?;
         Ok(reply)
@@ -138,5 +226,6 @@ fn convert(value: Inspection) -> io::Result<wire::Context> {
                 inode: value.memory.guard_inode,
             },
         },
+        sdk: None,
     })
 }

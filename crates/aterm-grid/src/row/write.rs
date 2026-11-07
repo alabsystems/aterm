@@ -35,10 +35,37 @@ impl Row {
         }
 
         self.cells[col_usize].set_char(c);
+        self.note_span(col, col + 1);
         self.note_write_through(col_usize + 1);
         self.settle_len_after_write(old_len, col_usize + 1, end_half_blanked);
         self.flags |= RowFlags::DIRTY;
         true
+    }
+
+    /// Write `text` (printable ASCII) in the default pen from `col` on a row that holds no wide
+    /// glyph, ending at or before the row's end: what [`Self::cells_mut_with_fixup`] with a cell
+    /// per byte and then [`Self::update_len`] leave, without the wide-glyph fixup such a row
+    /// cannot need.
+    #[inline]
+    pub(crate) fn write_plain_ascii(&mut self, col: u16, text: &[u8]) {
+        let start = usize::from(col);
+        let end = start + text.len();
+        debug_assert!(
+            end <= self.cells.len() && !self.flags.contains(RowFlags::HAS_WIDE_CHARS),
+            "write_plain_ascii: {start}..{end} does not fit a row of {} cells without wide glyphs",
+            self.cells.len()
+        );
+        if end == start {
+            return;
+        }
+        for (cell, &byte) in self.cells[start..end].iter_mut().zip(text) {
+            *cell = Cell::from_ascii_fast(byte);
+        }
+        let end_u16 = u16_from_usize(end);
+        self.note_span(col, end_u16);
+        self.flags |= RowFlags::DIRTY;
+        self.note_write_through(end);
+        self.update_len(end_u16);
     }
 
     /// Updated `len` after writing `[.., end)`.
@@ -117,6 +144,7 @@ impl Row {
             *self.cells.get_unchecked_mut(col_usize) =
                 Cell::from_raw_parts(char_data, colors, flags);
         }
+        self.note_span(col, col + 1);
         self.note_write_through(col_usize + 1);
         self.settle_len_after_write(old_len, col_usize + 1, end_half_blanked);
         self.flags |= RowFlags::DIRTY;
@@ -137,11 +165,14 @@ impl Row {
         cells_len: usize,
         orphan: Cell,
     ) -> bool {
-        if self.is_cell_wide_continuation(col_usize as u16) {
+        let col = u16_from_usize(col_usize);
+        if self.is_cell_wide_continuation(col) {
             self.cells[col_usize - 1] = orphan;
+            self.note_span(col - 1, col);
         }
         if current_flags.contains(CellFlags::WIDE) && col_usize + 1 < cells_len {
             self.cells[col_usize + 1] = orphan;
+            self.note_span(col + 1, col + 2);
             return orphan.is_empty();
         }
         false
@@ -168,6 +199,7 @@ impl Row {
         let actual = end - start;
 
         self.cells[start..end].fill(template);
+        self.note_cells_written(start, end);
         self.note_write_through(end);
 
         self.settle_len_after_write(old_len, end, end_half_blanked);
@@ -194,6 +226,7 @@ impl Row {
         let halves = self.orphaned_wide_halves(start_col, start_col.saturating_add(count));
         for col in halves.into_iter().flatten() {
             self.cells[usize::from(col)] = orphan;
+            self.note_span(col, col + 1);
         }
         halves[1].is_some() && orphan.is_empty()
     }
@@ -287,6 +320,7 @@ impl Row {
             *self.cells.get_unchecked_mut(col_usize + 1) =
                 Cell::from_raw_parts(' ' as u16, colors, flags.wide_continuation_of());
         }
+        self.note_span(col, col + 2);
 
         self.note_write_through(col_usize + 2);
         self.settle_len_after_write(old_len, col_usize + 2, end_half_blanked);
@@ -304,6 +338,9 @@ impl Row {
     ///
     /// (c) Writes are sequential and non-overlapping, so nothing in the row conflicts with the
     ///     skipped orphan fixup.
+    ///
+    /// The write leaves the row's written window alone: the run's
+    /// [`Self::settle_len_after_wide_run`] widens it over the whole run once.
     #[inline]
     pub unsafe fn write_wide_char_packed_no_fixup(
         &mut self,
@@ -348,11 +385,14 @@ impl Row {
         cells_len: usize,
         orphan: Cell,
     ) -> bool {
-        if self.is_cell_wide_continuation(col_usize as u16) {
+        let col = u16_from_usize(col_usize);
+        if self.is_cell_wide_continuation(col) {
             self.cells[col_usize - 1] = orphan;
+            self.note_span(col - 1, col);
         }
         if second_flags.contains(CellFlags::WIDE) && col_usize + 2 < cells_len {
             self.cells[col_usize + 2] = orphan;
+            self.note_span(col + 2, col + 3);
             return orphan.is_empty();
         }
         false

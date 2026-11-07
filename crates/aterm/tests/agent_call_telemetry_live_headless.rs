@@ -20,14 +20,34 @@ use crate::standin;
 const ENTRY: &str = "agent_call_telemetry_live_headless::agent_standin";
 
 /// The four ends of the package's measurement, each a call of its own, and what its row says:
-/// `(command, outcome, code, sig)`.
-const ENDS: [(&str, &str, &str, &str); 4] = [
-    ("sleep 4; true", "ok", "0", "-"),
-    ("sleep 4; exit 3", "fail", "3", "-"),
-    ("sleep 4; kill -TERM $$", "fail", "-", "15"),
+/// `(command, label, outcome, code, sig)`. Each end of its own runs a program of its own, so a
+/// row that took another call's status fails by its label.
+const ENDS: [(&str, &str, &str, &str, &str); 4] = [
+    ("sleep 4; true", "sleep", "ok", "0", "-"),
+    ("caffeinate -t 4; exit 3", "caffeinate", "fail", "3", "-"),
+    // The wrapper's own child is the label: `time`, which runs `sleep`.
+    (
+        "/usr/bin/time sleep 4; kill -TERM $$",
+        "time",
+        "fail",
+        "-",
+        "15",
+    ),
     // zsh execs a lone command: the leader is `sleep` itself.
-    ("sleep 4", "ok", "0", "-"),
+    ("sleep 4", "sleep", "ok", "0", "-"),
 ];
+
+/// Each call's end as the stand-in reaped it, from its `status <i> <code|-> <sig|->` lines.
+fn reaped(screen: &str) -> std::collections::BTreeMap<usize, (String, String)> {
+    screen
+        .lines()
+        .filter_map(|l| {
+            let mut w = l.trim().strip_prefix("status ")?.split(' ');
+            let i = w.next()?.parse().ok()?;
+            Some((i, (w.next()?.to_owned(), w.next()?.to_owned())))
+        })
+        .collect()
+}
 
 /// A wait for something that must happen: a hang detector, never a latency budget.
 const HANG: Duration = Duration::from_secs(60);
@@ -348,29 +368,37 @@ fn each_calls_row_says_how_its_leader_ended_and_what_it_ran() {
     let calls: Vec<(u64, &str)> = ENDS.iter().map(|(cmd, ..)| (0, *cmd)).collect();
     let (rows, screen) = run("atct4", &calls);
     assert_eq!(rows.len(), ENDS.len(), "one row per call: {rows:#?}");
-    let mut seen: Vec<(String, String, String)> = rows
+    // The ground truth: the stand-in, the calls' parent, reaped each as the table says.
+    let reaped = reaped(&screen);
+    assert_eq!(
+        reaped.len(),
+        ENDS.len(),
+        "the stand-in's statuses: {screen}"
+    );
+    for (i, (_, label, _, code, sig)) in ENDS.iter().enumerate() {
+        assert_eq!(
+            reaped.get(&i),
+            Some(&((*code).to_owned(), (*sig).to_owned())),
+            "call {i} ({label}) as its parent reaped it: {screen}"
+        );
+    }
+    let mut seen: Vec<[String; 4]> = rows
         .iter()
         .map(|r| {
-            assert_eq!(
-                word(r, "label"),
-                "sleep",
-                "the program, never the wrapper: {r}"
-            );
             assert_ne!(word(r, "stop"), "unknown", "{r}");
-            (
-                word(r, "outcome").to_owned(),
-                word(r, "code").to_owned(),
-                word(r, "sig").to_owned(),
-            )
+            ["label", "outcome", "code", "sig"].map(|k| word(r, k).to_owned())
         })
         .collect();
     seen.sort();
-    let mut want: Vec<(String, String, String)> = ENDS
+    let mut want: Vec<[String; 4]> = ENDS
         .iter()
-        .map(|(_, o, c, s)| ((*o).to_owned(), (*c).to_owned(), (*s).to_owned()))
+        .map(|(_, l, o, c, s)| [*l, *o, *c, *s].map(str::to_owned))
         .collect();
     want.sort();
-    assert_eq!(seen, want, "rows:\n{rows:#?}\nscreen:\n{screen}");
+    assert_eq!(
+        seen, want,
+        "each call's row says its own program and end, never the wrapper's: rows:\n{rows:#?}\nscreen:\n{screen}"
+    );
 }
 
 #[test]
@@ -381,21 +409,21 @@ fn fifty_mixed_calls_end_known_and_none_wrongly() {
         calls.push((i * 100, cmd));
     }
     let (rows, screen) = run("atct50", &calls);
-    let mut want: std::collections::BTreeMap<(&str, &str, &str), usize> = Default::default();
+    let mut want: std::collections::BTreeMap<(&str, &str, &str, &str), usize> = Default::default();
     for (i, _) in calls.iter().enumerate() {
-        let (_, o, c, s) = ENDS[i % ENDS.len()];
-        *want.entry((o, c, s)).or_default() += 1;
+        let (_, l, o, c, s) = ENDS[i % ENDS.len()];
+        *want.entry((l, o, c, s)).or_default() += 1;
     }
-    let mut got: std::collections::BTreeMap<(&str, &str, &str), usize> = Default::default();
+    let mut got: std::collections::BTreeMap<(&str, &str, &str, &str), usize> = Default::default();
     let mut known = 0;
     for r in &rows {
-        assert_eq!(
-            word(r, "label"),
-            "sleep",
+        let label = word(r, "label");
+        assert!(
+            ENDS.iter().any(|(_, l, ..)| *l == label),
             "the program, never the wrapper: {r}"
         );
-        let end = (word(r, "outcome"), word(r, "code"), word(r, "sig"));
-        if end.0 != "unknown" {
+        let end = (label, word(r, "outcome"), word(r, "code"), word(r, "sig"));
+        if end.1 != "unknown" {
             known += 1;
             *got.entry(end).or_default() += 1;
         }

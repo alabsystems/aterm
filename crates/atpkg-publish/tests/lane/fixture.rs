@@ -279,6 +279,7 @@ impl Fx {
         Self {
             packer: FakePacker {
                 requests: Mutex::new(packs),
+                reused: Mutex::new(Vec::new()),
                 fail: Mutex::new(held.pack_fail.clone()),
                 unproven: AtomicBool::new(held.unproven),
                 lacks: Mutex::new(held.lacks.clone()),
@@ -524,6 +525,8 @@ impl Release {
 pub struct FakePacker {
     /// Every request, in order.
     pub requests: Mutex<Vec<PackRequest>>,
+    /// Existing archives admitted by the retained-package route, not pack/build requests.
+    pub reused: Mutex<Vec<atpkg_publish::artifact::bottle::reuse::Request>>,
     /// (program, target) packs that fail.
     pub fail: Mutex<BTreeSet<(String, Triple)>>,
     /// Rows are packed by a compiler with no lineage receipt.
@@ -564,6 +567,59 @@ impl FakePacker {
 }
 
 impl Packer for FakePacker {
+    fn reuse_bottle(
+        &self,
+        _ctx: &Ctx,
+        req: &atpkg_publish::artifact::bottle::reuse::Request,
+    ) -> Result<atpkg_publish::artifact::bottle::BottleOutcome> {
+        use atpkg_publish::artifact::pkgdoc::{self, BottleRow, Header, Kind};
+        self.reused.lock().unwrap().push(req.clone());
+        let input = atpkg_publish::lane::rows::local(&req.manifest)?;
+        let artifact = input.artifact_for(req.triple.as_str()).unwrap();
+        let header = Header {
+            program: input.program.clone(),
+            version: input.version.clone(),
+            build: input.build_number,
+            exposes: input.exposes.clone(),
+            shim_env: input.shim_env.clone(),
+        };
+        let row = BottleRow {
+            triple: req.triple,
+            kind: Kind::ElfBinary,
+            asset: artifact.asset.clone(),
+            sha256: artifact.sha256.clone(),
+            tree_root: artifact.tree_root.clone(),
+            size: artifact.size,
+            disk_installed: artifact.cost.disk_installed,
+        };
+        let base = std::fs::read(&req.merge_from).unwrap();
+        let parsed: atpkg::PkgManifest =
+            aterm_toml::from_str(std::str::from_utf8(&base).unwrap()).unwrap();
+        let bytes = if parsed.artifact_for(req.triple.as_str()).is_some() {
+            pkgdoc::check_parsed_bottle(&parsed, &header, &row)?;
+            base
+        } else {
+            pkgdoc::merge_bottle(base, &header, &row)?.bytes().to_vec()
+        };
+        std::fs::create_dir_all(&req.out).unwrap();
+        let asset = req.out.join(&row.asset);
+        std::fs::copy(req.manifest.parent().unwrap().join(&row.asset), &asset).unwrap();
+        let manifest = req
+            .out
+            .join(pkgdoc::manifest_name(&input.program, input.build_number));
+        std::fs::write(&manifest, bytes).unwrap();
+        Ok(atpkg_publish::artifact::bottle::BottleOutcome {
+            program: input.program,
+            build: input.build_number,
+            version: input.version,
+            triple: req.triple,
+            asset,
+            manifest,
+            signature: None,
+            uploaded: false,
+        })
+    }
+
     fn can_pack_bottle(&self, program: &str, _triple: Triple) -> std::result::Result<(), String> {
         if self.upstream.load(Ordering::SeqCst)
             || self

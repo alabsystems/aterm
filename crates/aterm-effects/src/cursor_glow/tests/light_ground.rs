@@ -335,8 +335,9 @@ fn the_light_comet_head_stays_in_the_caret_cell_and_wears_a_nucleus() {
             "comet ink past the caret's leading edge ({lead}) and its coma ({coma}): {q:?}"
         );
     }
-    // Each trail's ink is read along its spine: Comet's at the row's middle, Lumen's paper
-    // tracer at the foot of the letters ([`CursorGlow::LUMEN_PAPER_TRACER`]).
+    // Each trail's ink is read along its spine: Comet's nucleus at the row's middle and its tail
+    // at the letters' foot ([`CursorGlow::COMET_LIGHT_SPINE`]), Lumen's paper tracer at the foot
+    // of the letters ([`CursorGlow::LUMEN_PAPER_TRACER`]).
     let depth_at = |ink: &[GlowQuad], col: u16, drop: f32| -> f32 {
         let mut glass = Glass::new(g, 0x00FF_FFFF);
         glass.add_quads(ink);
@@ -347,7 +348,10 @@ fn the_light_comet_head_stays_in_the_caret_cell_and_wears_a_nucleus() {
             .fold(0.0f32, f32::max)
     };
     let depth = |ink: &[GlowQuad], col: u16| depth_at(ink, col, 0.0);
-    let (head, tail) = (depth(&ink, caret - 1), depth(&ink, caret - 3));
+    let (head, tail) = (
+        depth(&ink, caret - 1),
+        depth_at(&ink, caret - 3, CursorGlow::COMET_LIGHT_SPINE),
+    );
     assert!(
         head >= 1.3 * tail && head > 0.2,
         "a nucleus: the head's ink {head:.3} against the tail's {tail:.3}"
@@ -550,7 +554,12 @@ fn light_bands_over_wide_glyphs_keep_their_shape_and_hue_lighter() {
     for style in [GlowStyle::Beam, GlowStyle::Phaser, GlowStyle::Sparkle] {
         let (c, under, halos) = run(style, true);
         let clean = crate::color_math::contrast_ratio(c.theme_fg, c.theme_bg);
-        let keep = clean * LIGHT_WIDE_BED_KEEP;
+        let keep = clean
+            * if style == GlowStyle::Phaser {
+                CursorGlow::PHASER_PAPER_WIDE_KEEP
+            } else {
+                LIGHT_WIDE_BED_KEEP
+            };
         assert!(
             under.iter().any(inside),
             "{style:?}: no band lies under the wide glyphs"
@@ -732,6 +741,62 @@ fn sparkles_paper_body_is_gold() {
     );
 }
 
+/// AFTER-LAND LOWS W9: SPARKLE'S PAPER BODY IS A COMET, NOT A HIGHLIGHTER
+/// ([`CursorGlow::SPARKLE_PAPER_TAIL_REACH`]). Its gold band narrows from its
+/// head to its tail: two cells behind the caret it stands (at half its own
+/// strength) no more than four fifths as tall as one cell behind it. Composed
+/// r3 laid an even band the whole word long, a highlighter stroke across what
+/// was typed. Control: `sparkle_paper_even`, the band as composed r3 laid it.
+#[test]
+fn sparkle_s_paper_body_narrows_to_its_tail() {
+    let g = tall_geom();
+    let mut c = light(GlowStyle::Sparkle);
+    c.theme_fg = 0x001F_2328;
+    c.color = SPARKLE_DEFAULT_COLOR;
+    let tall = |even: bool| {
+        let mut glow = CursorGlow {
+            sparkle_paper_even: even,
+            ..CursorGlow::default()
+        };
+        let mut out = Vec::new();
+        let mut t = Instant::now();
+        glow.tick(Some((2, 4)), t, &c, g, &mut out);
+        for col in 5..13 {
+            t += Duration::from_millis(60);
+            glow.note_synthetic_typed(t, 1);
+            glow.tick(Some((2, col)), t, &c, g, &mut out);
+        }
+        let under = body(&mut glow, &c, g, t, (2, 12));
+        let cw = g.cw as u16;
+        let at = |cells_behind: u16| {
+            let x = (12 - cells_behind) * cw + cw / 2;
+            let column: Vec<&GlowQuad> =
+                under.iter().filter(|q| q.x <= x && x < q.x + q.w).collect();
+            let strongest = column.iter().map(|q| u32::from(q.alpha)).max().unwrap_or(0);
+            column
+                .iter()
+                .filter(|q| strongest > 0 && 2 * u32::from(q.alpha) >= strongest)
+                .map(|q| u32::from(q.h))
+                .sum::<u32>() as f32
+        };
+        (at(1), at(2))
+    };
+    let (head, back) = tall(false);
+    assert!(
+        head > 0.0,
+        "fixture: the body lies one cell behind the caret"
+    );
+    assert!(
+        back <= 0.8 * head,
+        "two cells behind the caret the body stands {back} px against {head} px one behind"
+    );
+    let (head, back) = tall(true);
+    assert!(
+        back > 0.8 * head,
+        "control: the even band stands {back} px two cells back against {head} px one back"
+    );
+}
+
 /// A COLOUR THE USER CHOSE KEEPS ITS HUE AND CHROMA IN CLASSIC'S PAPER WAKE
 /// ([`crate::classic_wake::WakeInk::chosen`]): a trail pinned to `#b0b0c8`
 /// draws Classic's one-colour face, and on white every pixel its paper crown
@@ -856,4 +921,256 @@ fn a_pinned_classic_s_paper_wake_keeps_the_pin_s_hue_and_chroma() {
         control_over > 0,
         "control: solved from the hue's vivid ink, the paper wake keeps within the pins' chroma"
     );
+}
+
+/// The after-land review of W4: paper Lumen's tracer holds through a Backspace. Its run turns
+/// back at the first Backspace, and kept to the side of its head that its newest move lies on,
+/// every typed sample went out in that frame: the rail under the typed text was cut to the
+/// caret's halo and ink grew back only over the erased cells, 300 to 400 ms later (a presence
+/// that drops and returns reads as blinking). Typed at the gallery's 60 ms a key, then three
+/// Backspaces 50 ms apart, read along its spine each 16 ms frame: the cells behind the first
+/// Backspace's caret keep their ink through it, and no frame takes more than a third of the
+/// tracer's ink. The control keeps the run to one side
+/// ([`CursorGlow::lumen_paper_one_side`]): the same frame takes most of it.
+#[test]
+fn paper_lumen_s_tracer_holds_through_a_backspace() {
+    let g = tall_geom();
+    let c = light(GlowStyle::Lumen);
+    let row = 4u16;
+    let spine = CursorGlow::LUMEN_PAPER_TRACER.0;
+    const KEY: u64 = 60;
+    const BACK: u64 = 50;
+    let typed_end = 1_000 + KEY * 23;
+    let first_back = typed_end + KEY;
+    // Each frame from the last key on: its time, the ink behind the first Backspace's caret,
+    // and all its ink.
+    let series = |one_side: bool| -> Vec<(u64, f32, f32)> {
+        let mut glow = CursorGlow {
+            lumen_paper_one_side: one_side,
+            ..CursorGlow::default()
+        };
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        let mut col = 2u16;
+        let mut events: Vec<(u64, bool)> = (0..24).map(|i| (1_000 + KEY * i, false)).collect();
+        events.extend((0..3).map(|k| (first_back + BACK * k, true)));
+        let behind_col = 2 + 24 - 1;
+        let mut read = Vec::new();
+        let (mut next, mut frame) = (0, 0u64);
+        while frame <= first_back + 400 {
+            while let Some(&(at, backspace)) = events.get(next)
+                && at <= frame
+            {
+                let t = t0 + ms(at);
+                if backspace {
+                    arm_exact_backspace(&mut glow, t, (row, col), (row, col - 1));
+                    col -= 1;
+                } else {
+                    col += 1;
+                    glow.note_synthetic_typed(t, 1);
+                }
+                glow.tick(Some((row, col)), t, &c, g, &mut out);
+                next += 1;
+            }
+            let t = t0 + ms(frame);
+            glow.tick(Some((row, col)), t, &c, g, &mut out);
+            if frame >= typed_end {
+                let ink = body(&mut glow, &c, g, t, (row, col));
+                let mut glass = Glass::new(g, 0x00FF_FFFF);
+                glass.add_quads(&ink);
+                let depth = |cc: u16| {
+                    let (x0, y0, x1, _) = glass.cell_rect(row, cc);
+                    let y = y0 + (g.ch as f32 * (0.5 + spine)) as i32;
+                    (x0..x1)
+                        .map(|x| {
+                            1.0 - crate::color_math::relative_luminance(
+                                glass.at(y, x) & 0x00FF_FFFF,
+                            )
+                        })
+                        .fold(0.0f32, f32::max)
+                };
+                let behind = (0..behind_col).map(depth).sum();
+                let whole = (0..g.cols as u16).map(depth).sum();
+                read.push((frame, behind, whole));
+            }
+            frame += 16;
+        }
+        read
+    };
+    let at_back = |read: &[(u64, f32, f32)]| {
+        let k = read
+            .iter()
+            .position(|r| r.0 >= first_back)
+            .expect("a frame reads the first Backspace");
+        (read[k - 1], read[k])
+    };
+    let read = series(false);
+    let (before, after) = at_back(&read);
+    assert!(
+        before.1 > 1.0,
+        "fixture: the typed tracer lies behind the caret ({:.3})",
+        before.1
+    );
+    assert!(
+        after.1 >= 0.8 * before.1,
+        "the first Backspace cut the typed tracer from {:.3} to {:.3} at {} ms",
+        before.1,
+        after.1,
+        after.0
+    );
+    for w in read.windows(2) {
+        assert!(
+            w[1].0 > first_back + 300 || w[1].2 >= w[0].2 * 2.0 / 3.0,
+            "at {} ms the tracer fell from {:.3} to {:.3}",
+            w[1].0,
+            w[0].2,
+            w[1].2
+        );
+    }
+    let (before, after) = at_back(&series(true));
+    assert!(
+        after.1 < 0.5 * before.1,
+        "control: kept to one side, the first Backspace keeps the typed tracer ({:.3} of {:.3})",
+        after.1,
+        before.1
+    );
+}
+
+/// Paper Lumen's tracer's end walks in as its far spark goes dark: a run with
+/// that spark nearly out lays what the run without it lays, so the end of the
+/// spark's life moves no cell. The control counts each stretch of the fade
+/// whole, and the end steps a cell inward in that frame.
+#[test]
+fn paper_lumen_s_tracer_end_walks_in_as_its_far_spark_goes_dark() {
+    use super::super::emit::LUMEN_END_STEPS;
+    let sample = |x: f32, cov: u8| aterm_render::CometSample {
+        x,
+        y: 0.0,
+        cov,
+        pos: 0.0,
+    };
+    let laid = |far: Option<u8>| {
+        let mut run: Vec<_> = far
+            .map(|cov| sample(0.0, cov))
+            .into_iter()
+            .chain([18.0, 36.0, 54.0, 72.0].map(|x| sample(x, 120)))
+            .collect();
+        CursorGlow::lumen_paper_taper(&mut run, 36.0);
+        run.retain(|s| s.x > 0.0);
+        run.iter().map(|s| s.cov).collect::<Vec<_>>()
+    };
+    let moved = || {
+        let (dying, gone) = (laid(Some(1)), laid(None));
+        assert_eq!(dying.len(), gone.len());
+        dying
+            .iter()
+            .zip(&gone)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .expect("the run's other samples")
+    };
+    assert!(moved() <= 2, "the spark's end moved a cell by {}", moved());
+    LUMEN_END_STEPS.set(true);
+    let control = moved();
+    LUMEN_END_STEPS.set(false);
+    assert!(control > 30, "control: counted whole, {control}");
+}
+
+/// After-land lows W4: paper Lumen's tracer ends as softly after Backspaces
+/// as after typing. Its run keeps each spark at its own light, and in the
+/// trail gallery's `steam.bs06` the typed burst's last letters outlived the
+/// Backspaces' quick moves, so the tracer past the caret rose toward its far
+/// end and stopped there in a blunt, brighter bar (composed r3): the run
+/// turned back on itself, its typed leg and its Backspaces' leg stacked
+/// over the erased cells. Played on the gallery's schedule (a key every
+/// 60 ms, then a Backspace every 50 ms, read 20 ms after the sixth, a frame
+/// every 16 ms) and with slower Backspaces, read along its spine from the
+/// caret out, its ink never deepens, and its far end has faded to under half
+/// its deepest. The control lays each spark at its own light.
+#[test]
+fn paper_lumen_s_tracer_ends_softly_after_backspaces() {
+    let g = tall_geom();
+    let c = light(GlowStyle::Lumen);
+    let row = 4u16;
+    let spine = CursorGlow::LUMEN_PAPER_TRACER.0;
+    // (key gap, Backspace gap) in ms.
+    let profile = |blunt: bool, (key, back): (u64, u64)| -> Vec<f32> {
+        let mut glow = CursorGlow {
+            lumen_paper_blunt: blunt,
+            ..CursorGlow::default()
+        };
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        let mut col = 2u16;
+        // Each event's time and whether it is a Backspace.
+        let mut events: Vec<(u64, bool)> = (0..24).map(|i| (1_000 + key * i, false)).collect();
+        let typed_end = 1_000 + key * 23;
+        events.extend((0..6).map(|k| (typed_end + key + back * k, true)));
+        let read_at = typed_end + key + back * 5 + 20;
+        let (mut next, mut frame) = (0, 0u64);
+        while frame <= read_at {
+            while let Some(&(at, backspace)) = events.get(next)
+                && at <= frame
+            {
+                let t = t0 + ms(at);
+                if backspace {
+                    arm_exact_backspace(&mut glow, t, (row, col), (row, col - 1));
+                    col -= 1;
+                } else {
+                    col += 1;
+                    glow.note_synthetic_typed(t, 1);
+                }
+                glow.tick(Some((row, col)), t, &c, g, &mut out);
+                next += 1;
+            }
+            glow.tick(Some((row, col)), t0 + ms(frame), &c, g, &mut out);
+            frame += 16;
+        }
+        let t = t0 + ms(read_at);
+        let ink = body(&mut glow, &c, g, t, (row, col));
+        let mut glass = Glass::new(g, 0x00FF_FFFF);
+        glass.add_quads(&ink);
+        (col + 1..g.cols as u16)
+            .map(|cc| {
+                let (x0, y0, x1, _) = glass.cell_rect(row, cc);
+                let y = y0 + (g.ch as f32 * (0.5 + spine)) as i32;
+                (x0..x1)
+                    .map(|x| {
+                        1.0 - crate::color_math::relative_luminance(glass.at(y, x) & 0x00FF_FFFF)
+                    })
+                    .fold(0.0f32, f32::max)
+            })
+            .collect()
+    };
+    let reads = |p: &[f32]| -> (f32, f32, f32) {
+        let deepest = p.iter().copied().fold(0.0f32, f32::max);
+        let lit: Vec<f32> = p.iter().copied().filter(|&d| d > 0.002).collect();
+        let far = lit.last().copied().unwrap_or(0.0);
+        let mut rise = 0.0f32;
+        for w in lit.windows(2) {
+            rise = rise.max(w[1] - w[0]);
+        }
+        (deepest, far, rise)
+    };
+    for pace in [(60, 50), (70, 150)] {
+        let (deepest, far, rise) = reads(&profile(false, pace));
+        assert!(
+            deepest > 0.02,
+            "{pace:?}: the tracer shows past the caret ({deepest:.3})"
+        );
+        assert!(
+            rise <= 0.01,
+            "{pace:?}: the tracer's ink deepens by {rise:.3} away from the caret"
+        );
+        assert!(
+            far < 0.5 * deepest,
+            "{pace:?}: its far end fades: {far:.3} against its deepest {deepest:.3}"
+        );
+        let (b_deepest, b_far, b_rise) = reads(&profile(true, pace));
+        assert!(
+            b_rise > 0.01 || b_far >= 0.5 * b_deepest,
+            "{pace:?}: control: each spark at its own light ends blunt ({b_far:.3} of \
+             {b_deepest:.3}, rise {b_rise:.3})"
+        );
+    }
 }

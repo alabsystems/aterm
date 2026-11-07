@@ -20,15 +20,16 @@ struct NotificationCenter {
 
 /// Real setup admission, withheld records and the real follow-up worker over
 /// the selected Notification Center item and an entirely inert system port.
-pub struct InitialSetupWithheldStopTest<'a> {
-    root: &'a Path,
+#[derive(Clone)]
+pub struct InitialSetupWithheldStopTest {
+    root: PathBuf,
     notification_center: Arc<Mutex<NotificationCenter>>,
 }
 
-impl<'a> InitialSetupWithheldStopTest<'a> {
+impl InitialSetupWithheldStopTest {
     /// A whole-profile init interrupted after recording its withheld item,
     /// before its verification or any effect: admitted, with no completed stage.
-    pub fn unfinished(root: &'a Path) -> Result<Self, String> {
+    pub fn unfinished(root: &Path) -> Result<Self, String> {
         let held = init_hold_at(
             root,
             aterm_machines::init::Pass::Whole { clones: true },
@@ -38,7 +39,7 @@ impl<'a> InitialSetupWithheldStopTest<'a> {
         aterm_machines::init::Held::withheld(&held, &[WIDGETS.to_owned()])?;
         drop(held);
         Ok(Self {
-            root,
+            root: root.to_path_buf(),
             notification_center: Arc::new(Mutex::new(NotificationCenter {
                 value: Some(PValue::Dict(vec![
                     ("vers".into(), PValue::Int(1)),
@@ -54,39 +55,61 @@ impl<'a> InitialSetupWithheldStopTest<'a> {
 
     /// Clear the real item once, then Restore without FDA so the original
     /// remains backed up and its exact put-back waits for the grant.
-    pub fn waiting_restore(root: &'a Path) -> Result<Self, String> {
+    pub fn waiting_restore(root: &Path) -> Result<Self, String> {
         let mut setup = Self::unfinished(root)?;
-        let (observed, _reserved) = setup.follow_up(|| (), |_| false);
-        observed.result?;
-        let _lock = HeldLock::take(root)?;
-        run_mutation(&mut setup.host(false), root, Action::Restore)?;
+        setup.prepare_restore()?()?;
         Ok(setup)
     }
 
+    /// A real Restore has taken its profile lease and captured FDA off, but has not
+    /// published its waiting debt. Calling the continuation finishes that same Restore.
+    pub fn prepare_restore(&mut self) -> Result<Box<dyn FnOnce() -> Result<(), String>>, String> {
+        let (observed, _) = self.follow_up(|| Some(()), |_| false);
+        observed.result?;
+        let lock = HeldLock::take(&self.root)?;
+        let root = self.root.clone();
+        let mut host = self.host(false);
+        Ok(Box::new(move || {
+            let _lock = lock;
+            run_mutation(&mut host, &root, Action::Restore).map(|_| ())
+        }))
+    }
+
     pub fn revision(&self) -> Result<u64, String> {
-        initial::revision_at(self.root)
+        initial::revision_at(&self.root)
     }
 
     /// A later real manual group choice, preserving the current whole-profile
     /// selection while admitting a run not covered by its predecessor's Stop.
     pub fn choose(&mut self) -> Result<u64, String> {
-        InitialSetupAdmissionStopTest::restart(self.root)?
+        InitialSetupAdmissionStopTest::restart(&self.root)?
             .choose_group(&[Setting::Widgets])?
             .ok_or_else(|| "the later widget choice was refused".into())
     }
 
     pub fn follow_up<S>(
         &mut self,
-        reserve: impl FnMut() -> S,
+        reserve: impl FnMut() -> Option<S>,
         stopped: impl Fn(u64) -> bool,
     ) -> (InitialSetupObserved<Option<Report>>, Option<S>) {
-        follow_up_finished_waiting_observed_unless_stopped(
-            self.root,
+        match self.attempt(reserve, stopped) {
+            WithheldFollowUp::Held => (InitialSetupObserved::new(Ok(None), None), None),
+            WithheldFollowUp::Finished(finished) => *finished,
+        }
+    }
+
+    /// One real nonblocking backend attempt, including its typed lease refusal.
+    pub fn attempt<S>(
+        &mut self,
+        reserve: impl FnMut() -> Option<S>,
+        stopped: impl Fn(u64) -> bool,
+    ) -> WithheldFollowUp<S> {
+        follow_up_attempt_at(
+            &self.root,
             reserve,
             || Ok(self.host(true)),
             BUILD,
-            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000),
-            || false,
+            || std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000),
             stopped,
         )
     }
@@ -96,10 +119,13 @@ impl<'a> InitialSetupWithheldStopTest<'a> {
     }
 
     pub fn owed(&self) -> Result<bool, String> {
-        Ok(!load_withheld(self.root)?.items.is_empty() || !restore_waiting(self.root)?.is_empty())
+        Ok(
+            !load_withheld(&self.root)?.items.is_empty()
+                || !restore_waiting(&self.root)?.is_empty(),
+        )
     }
 
-    fn host(&self, granted: bool) -> NativeHost {
+    pub(super) fn host(&self, granted: bool) -> NativeHost {
         let state = Arc::clone(&self.notification_center);
         let mut sys = Fake::root();
         sys.euid = 501;

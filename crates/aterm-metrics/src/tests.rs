@@ -9,9 +9,9 @@ use astream_wire::summary::{MetricName, Summary, Window, WindowLen};
 
 use crate::merge::{Counters, OfferError, Offered, Replica, Snapshots, Usage};
 use crate::row::{
-    AGY_GROUPS_MAX, AgyGroup, AgyRow, HeldEntry, Label, ManagerEntry, NEEDS_MAX, NeedEntry,
-    NeedsRow, PCT_MAX, PlaceRow, QuotaRow, REMAINING_MAX, Row, RowError, Sid, SignIn, UNREAD_MAX,
-    UnreadRow, WindowRecord, Word,
+    AGENTS_LISTED_MAX, AGY_GROUPS_MAX, ActivityRow, AgentEntry, AgyGroup, AgyRow, HeldEntry, Label,
+    ManagerEntry, NEEDS_MAX, NeedEntry, NeedsRow, PCT_MAX, PlaceRow, QuotaRow, REMAINING_MAX, Row,
+    RowError, Sid, SignIn, UNREAD_MAX, UnreadRow, WindowRecord, Word,
 };
 use crate::rules;
 use crate::subject::{
@@ -66,6 +66,7 @@ fn every_subject(n: Node) -> Vec<Subject> {
         Now::Presence,
         Now::Needs,
         Now::Unread,
+        Now::Activity,
         Now::Place(account(2)),
     ] {
         all.push(Subject::Now { node: n, now });
@@ -108,7 +109,7 @@ fn quota_row(at: u64, pct7: Option<u16>, week_reset: Option<u64>) -> QuotaRow {
 fn every_subject_reads_back_as_itself() {
     let n = node(0xa7);
     let all = every_subject(n);
-    assert_eq!(all.len(), 2 * METRIC_COUNT + 1 + 8 + 2 + 4);
+    assert_eq!(all.len(), 2 * METRIC_COUNT + 1 + 8 + 2 + 5);
     for s in &all {
         let text = s.to_string();
         assert!(
@@ -183,6 +184,11 @@ fn the_grammar_refuses_each_malformed_segment() {
             SubjectError::Home,
         ),
         (&format!("/m/{id}/shared/now/weather"), SubjectError::Now),
+        (&format!("/m/{id}/shared/now/activityx"), SubjectError::Now),
+        (
+            &format!("/m/{id}/shared/now/activity/x"),
+            SubjectError::Shape,
+        ),
         (
             &format!("/m/{id}/shared/now/place/someone@example.com"),
             SubjectError::Account,
@@ -395,6 +401,35 @@ fn each_subject_falls_under_the_rule_its_class_names() {
 // Rows
 // ---------------------------------------------------------------------------
 
+/// Three agents: one busy, one at its weekly wall, one at rest, each listed.
+fn activity_row() -> ActivityRow {
+    ActivityRow {
+        at: 1_793_000_200,
+        busy: 1,
+        idle: 1,
+        waiting: 0,
+        walled: 1,
+        unknown: 0,
+        sessions: vec![
+            AgentEntry {
+                sid: sid(4),
+                word: word("busy"),
+                detail: None,
+            },
+            AgentEntry {
+                sid: sid(5),
+                word: word("walled"),
+                detail: Some(word("usage-weekly")),
+            },
+            AgentEntry {
+                sid: sid(6),
+                word: word("idle"),
+                detail: None,
+            },
+        ],
+    }
+}
+
 fn every_row() -> Vec<(Subject, Row)> {
     let n = node(9);
     let mut quota = quota_row(1_793_000_000, Some(64), Some(1_793_300_000));
@@ -456,6 +491,7 @@ fn every_row() -> Vec<(Subject, Row)> {
         at: 3,
         pools: vec![word("grok"), word("kimi")],
     };
+    let activity = activity_row();
     let window = WindowRecord::new(
         n,
         Metric::Class(Cli::Claude, Family::Opus, TokenClass::Output),
@@ -472,6 +508,11 @@ fn every_row() -> Vec<(Subject, Row)> {
         (NeedsRow::subject(n), Row::Needs(needs)),
         (NeedsRow::subject(n), Row::Needs(NeedsRow::default())),
         (UnreadRow::subject(n), Row::Unread(unread)),
+        (ActivityRow::subject(n), Row::Activity(activity)),
+        (
+            ActivityRow::subject(n),
+            Row::Activity(ActivityRow::default()),
+        ),
         (window.subject(), Row::Window(window)),
     ];
     // One window record of every metric, on a start both widths align to.
@@ -703,6 +744,165 @@ fn the_decoder_refuses_everything_the_encoder_does_not_write() {
         Row::decode_at(&wide.subject(), &wide.encode()),
         Err(RowError::Mismatch("window width"))
     );
+}
+
+/// THE ACTIVITY ROW (the Fleet field on this Mac's copy): one golden spelling; a strict reader
+/// that refuses a trailing byte, a longer varint, a flag of 2, a count past 32 bits, more listed
+/// sessions than [`AGENTS_LISTED_MAX`] or than its counts sum to, and another kind either way;
+/// a word a later build adds reads as itself; and a writer lists no more than its counts or the
+/// bound allow, so every reader takes it.
+/// NEGATIVE CONTROL: the same list under counts that sum to its length reads.
+#[test]
+fn the_activity_row_counts_and_lists_and_reads_nothing_else() {
+    let row = ActivityRow {
+        at: 300,
+        busy: 1,
+        idle: 0,
+        waiting: 2,
+        walled: 1,
+        unknown: 0,
+        sessions: vec![
+            AgentEntry {
+                sid: sid(1),
+                word: word("busy"),
+                detail: None,
+            },
+            AgentEntry {
+                sid: sid(2),
+                word: word("walled"),
+                detail: Some(word("auth")),
+            },
+        ],
+    };
+    let bytes = row.encode();
+    let mut golden = vec![b'T', 1, 0xac, 0x02, 1, 0, 2, 1, 0, 2];
+    golden.push(22);
+    golden.extend_from_slice(b"s-01000000000000000000");
+    golden.push(4);
+    golden.extend_from_slice(b"busy");
+    golden.push(0);
+    golden.push(22);
+    golden.extend_from_slice(b"s-02000000000000000000");
+    golden.push(6);
+    golden.extend_from_slice(b"walled");
+    golden.extend_from_slice(&[1, 4]);
+    golden.extend_from_slice(b"auth");
+    assert_eq!(bytes, golden, "the one spelling");
+    assert_eq!(ActivityRow::decode(&bytes), Ok(row.clone()));
+    assert_eq!(row.agents(), 4);
+    let subject = ActivityRow::subject(node(1));
+    assert_eq!(
+        subject.to_string(),
+        "/m/n-0100000000000000/shared/now/activity"
+    );
+    assert_eq!(
+        (
+            subject.class(),
+            subject.class().travels(),
+            subject.class().keeps_last()
+        ),
+        (Class::Now, true, true)
+    );
+    assert!(rules::rules().keeps_last(&subject.to_string()));
+
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert_eq!(ActivityRow::decode(&trailing), Err(RowError::Trailing));
+    let mut overlong = bytes.clone();
+    overlong.splice(2..4, [0xac, 0x82, 0x00]);
+    assert_eq!(ActivityRow::decode(&overlong), Err(RowError::Varint));
+    // The first entry's detail flag follows its sid and its word.
+    let mut flag = bytes.clone();
+    let at = 10 + 1 + 22 + 1 + 4;
+    assert_eq!(flag[at], 0, "the first entry's detail flag");
+    flag[at] = 2;
+    assert_eq!(ActivityRow::decode(&flag), Err(RowError::Tag));
+    assert!(matches!(
+        NeedsRow::decode(&bytes),
+        Err(RowError::Kind {
+            expected: b'N',
+            found: b'T'
+        })
+    ));
+    assert!(matches!(
+        ActivityRow::decode(&NeedsRow::default().encode()),
+        Err(RowError::Kind {
+            expected: b'T',
+            found: b'N'
+        })
+    ));
+    assert!(
+        Row::decode_at(&NeedsRow::subject(node(1)), &bytes).is_err(),
+        "an activity body at the needs subject"
+    );
+    assert!(
+        Row::decode_at(&subject, &NeedsRow::default().encode()).is_err(),
+        "a needs body at the activity subject"
+    );
+
+    let sid_text = sid(1).to_string();
+    let listed = |busy: u64, n: usize| {
+        ActivityRow::decode(
+            &Body::new(b'T')
+                .varint(1)
+                .varint(busy)
+                .varint(0)
+                .varint(0)
+                .varint(0)
+                .varint(0)
+                .count(n)
+                .repeat(n, |b| b.text(&sid_text).text("busy").byte(0))
+                .0,
+        )
+    };
+    assert_eq!(
+        listed(40, AGENTS_LISTED_MAX + 1),
+        Err(RowError::TooMany("agent sessions"))
+    );
+    assert_eq!(
+        listed(40, AGENTS_LISTED_MAX).map(|r| r.sessions.len()),
+        Ok(AGENTS_LISTED_MAX)
+    );
+    assert_eq!(
+        listed(1, 2),
+        Err(RowError::TooMany("agent sessions for the tally"))
+    );
+    assert_eq!(listed(2, 2).map(|r| r.sessions.len()), Ok(2), "the control");
+    assert_eq!(listed(1 << 32, 0), Err(RowError::Bound("the busy agents")));
+
+    let later = ActivityRow {
+        at: 1,
+        unknown: 1,
+        sessions: vec![AgentEntry {
+            sid: sid(3),
+            word: word("napping"),
+            detail: Some(word("deep")),
+        }],
+        ..ActivityRow::default()
+    };
+    assert_eq!(ActivityRow::decode(&later.encode()), Ok(later));
+
+    let entry = AgentEntry {
+        sid: sid(7),
+        word: word("idle"),
+        detail: None,
+    };
+    let crowded = ActivityRow {
+        at: 1,
+        idle: 40,
+        sessions: vec![entry.clone(); 40],
+        ..ActivityRow::default()
+    };
+    let back = ActivityRow::decode(&crowded.encode()).expect("it reads");
+    assert_eq!(back.sessions.len(), AGENTS_LISTED_MAX, "to the bound");
+    let overlisted = ActivityRow {
+        at: 1,
+        idle: 1,
+        sessions: vec![entry; 3],
+        ..ActivityRow::default()
+    };
+    let back = ActivityRow::decode(&overlisted.encode()).expect("it reads");
+    assert_eq!(back.sessions.len(), 1, "to the tally");
 }
 
 /// A WRITER WRITES WHAT EVERY READER TAKES: a list past its bound is written to its bound, its
@@ -1470,6 +1670,13 @@ fn the_other_snapshot_views_show_each_macs_row_with_its_age() {
     );
     assert_eq!(s.needs(100)[0].row.managers.len(), 1);
     assert_eq!(s.unread(3)[0].row.pools.len(), 2);
+    let activity = s.activity(1_793_000_260);
+    assert_eq!(activity.len(), 1);
+    assert_eq!(
+        (activity[0].age_s, activity[0].row.agents()),
+        (60, 3),
+        "the activity row the first offer made"
+    );
     assert_eq!(s.places(500).len(), 1, "borrowed until 1000");
     assert_eq!(s.places(1_000).len(), 0, "the placement ended");
     assert_eq!(s.accounts(0).len(), 2, "claude and kimi");

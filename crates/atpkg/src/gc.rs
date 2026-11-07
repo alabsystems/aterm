@@ -93,6 +93,8 @@ impl LiveSet {
 pub enum Retained {
     /// The build is the live one.
     IsLive { program: String, build: u64 },
+    /// A native lease, unknown custody, or removal failure prevented reclamation.
+    NotCleared { program: String, build: u64 },
 }
 
 /// Resolve one `current` symlink into the `(program, build)` it proves live, or `None`.
@@ -250,7 +252,47 @@ pub fn discard_superseded(layout: &Layout, live: &LiveBuild, build: u64) -> Resu
             build,
         });
     }
-    crate::store::discard_build(&layout.build_dir(&live.program, build));
+    let dir = layout.build_dir(&live.program, build);
+    let guard =
+        crate::compat::sdk_mutation_guard_for_build(&dir).map_err(|_| Retained::NotCleared {
+            program: live.program.clone(),
+            build,
+        })?;
+    if let Some(guard) = guard {
+        discard_superseded_reclaimed(layout, live, build, &guard)
+    } else {
+        crate::store::discard_build(&dir);
+        if is_gone(&dir) {
+            Ok(())
+        } else {
+            Err(Retained::NotCleared {
+                program: live.program.clone(),
+                build,
+            })
+        }
+    }
+}
+
+fn discard_superseded_reclaimed(
+    layout: &Layout,
+    live: &LiveBuild,
+    build: u64,
+    guard: &crate::lease::ReclaimGuard,
+) -> Result<(), Retained> {
+    if build == live.build {
+        return Err(Retained::IsLive {
+            program: live.program.clone(),
+            build,
+        });
+    }
+    let dir = layout.build_dir(&live.program, build);
+    crate::store::discard_build_reclaimed(&dir, guard);
+    if !is_gone(&dir) {
+        return Err(Retained::NotCleared {
+            program: live.program.clone(),
+            build,
+        });
+    }
     Ok(())
 }
 
@@ -568,7 +610,7 @@ fn run_in(
         let mut gone = Vec::new();
         let now = std::time::SystemTime::now();
         for b in reclaimable(&installed, witness, &lands_on) {
-            let Some(_gate) = lease_clear(layout, &program, b, &mut leased) else {
+            let Some(native_gate) = lease_clear(layout, &program, b, &mut leased) else {
                 continue;
             };
             // A build a tree's trust.lock resolved lately is that tree's compiler, current or not:
@@ -580,9 +622,11 @@ fn run_in(
             if in_use.holds(&program, &layout.build_dir(&program, b), Some(b)) {
                 continue;
             }
-            if discard_superseded(layout, witness, b).is_ok()
-                && is_gone(&layout.build_dir(&program, b))
-            {
+            let discarded = match native_gate.as_ref() {
+                Some(guard) => discard_superseded_reclaimed(layout, witness, b, guard),
+                None => discard_superseded(layout, witness, b),
+            };
+            if discarded.is_ok() && is_gone(&layout.build_dir(&program, b)) {
                 gone.push(b);
             }
         }
@@ -594,7 +638,7 @@ fn run_in(
     let debris = interrupted_debris(layout, &claimed, &parked, &in_scope);
     let mut swept_partial: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     for (program, build, path) in debris.partial {
-        let Some(_gate) = lease_clear(layout, &program, build, &mut leased) else {
+        let Some(native_gate) = lease_clear(layout, &program, build, &mut leased) else {
             continue;
         };
         if in_use.holds(&program, &path, Some(build)) {
@@ -602,7 +646,11 @@ fn run_in(
         }
         // A tree that never completed carries no verdict on its pack: the memo of a stage or
         // resolve check that refused it stays, so the next install does not download it again.
-        crate::store::discard_build_keeping_memo(&path);
+        if let Some(guard) = native_gate.as_ref() {
+            crate::store::discard_build_keeping_memo_reclaimed(&path, guard);
+        } else {
+            crate::store::discard_build_keeping_memo(&path);
+        }
         if is_gone(&path) {
             swept_partial.entry(program).or_default().push(build);
         }

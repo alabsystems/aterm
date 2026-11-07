@@ -750,8 +750,15 @@ pub(crate) fn cluster_kind(bytes: &[u8]) -> Option<u8> {
     bytes.first().copied().filter(u8::is_ascii_uppercase)
 }
 
-/// A borrowed CF value as text: a CFString, or a CFData's bytes up to the first NUL.
+/// Nonempty registry label text, with surrounding whitespace removed.
 pub(crate) fn cf_text(value: CFTypeRef) -> Option<String> {
+    let text = cf_text_verbatim(value)?.trim().to_owned();
+    (!text.is_empty()).then_some(text)
+}
+
+/// A borrowed CF value as text: a CFString, or a CFData's bytes up to the first NUL.
+/// Whitespace is part of the value, including a GPU client's creator name.
+fn cf_text_verbatim(value: CFTypeRef) -> Option<String> {
     if value.is_null() {
         return None;
     }
@@ -776,8 +783,7 @@ pub(crate) fn cf_text(value: CFTypeRef) -> Option<String> {
             data[..end.min(127)].to_vec()
         }
     };
-    let text = String::from_utf8_lossy(&bytes).trim().to_owned();
-    (!text.is_empty()).then_some(text)
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// An IOKit object, released on drop.
@@ -1379,7 +1385,7 @@ pub(crate) fn gpu_clients() -> Option<GpuClients> {
             identified = false;
             continue;
         }
-        let creator = Cf::property(child.0, a.keys.creator.0).and_then(|v| cf_text(v.0));
+        let creator = Cf::property(child.0, a.keys.creator.0).and_then(|v| cf_text_verbatim(v.0));
         let usage = Cf::property(child.0, a.keys.app_usage.0);
         let usage = usage
             .as_ref()
@@ -1749,6 +1755,17 @@ pub(crate) fn caps() -> crate::Caps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_creator_text_preserves_name_whitespace() {
+        let value = Cf::string(c"pid 77, Install Command ").expect("a CFString");
+        let text = cf_text_verbatim(value.0).expect("the registry text");
+        assert_eq!(
+            crate::machine::creator_of(&text),
+            Some((77, "Install Command "))
+        );
+        assert_eq!(cf_text(value.0).as_deref(), Some("pid 77, Install Command"));
+    }
 
     /// Missing registry properties return NULL and adopt as `None` without
     /// calling `CFRelease(NULL)`.

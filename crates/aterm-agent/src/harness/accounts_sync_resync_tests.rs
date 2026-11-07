@@ -328,7 +328,7 @@ fn a_row_added_under_a_source_this_machine_does_not_write_is_refused_by_name() {
 
     let keyed = Desk::new("m27");
     let source = "https://fleet.example.test/fleet-accounts.toml";
-    fs::write(
+    crate::test_config::write(
         keyed.config.join("aterm.toml"),
         format!("[fleet]\nmachine = \"m27\"\naccounts_source = \"{source}\"\n"),
     )
@@ -399,7 +399,7 @@ fn a_local_accounts_source_is_synced_again_each_time_it_changes() {
             .unwrap();
     };
     write(&[("m27", "sol-m27@example.test")], 1_000);
-    fs::write(
+    crate::test_config::write(
         desk.config.join("aterm.toml"),
         format!(
             "[fleet]\nmachine = \"m27\"\naccounts_source = {}\n",
@@ -483,7 +483,7 @@ fn the_converge_read_is_due_where_the_resync_syncs_a_missing_roster() {
     assert_eq!(due(NOW + 4), None);
 
     fs::remove_file(desk.roster()).unwrap();
-    fs::write(
+    crate::test_config::write(
         desk.config.join("aterm.toml"),
         "[fleet]\nmachine = \"m27\"\n[harness]\naccounts = \"off\"\n",
     )

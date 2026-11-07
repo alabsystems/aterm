@@ -34,8 +34,9 @@ use std::time::Duration;
 /// joins or leaves the pass (3: `sync.identity`; 4: the ALab steward's fleet item; 5:
 /// `sync.steward.revoke`; 6: `sync.node`; 7: `sync.steward.lease` and
 /// `sync.steward.server.standby`; 8: the steward's fleet item retired; 9: automatic signing;
-/// 10: the vault GitHub helper; 11: `sync.clone`).
-pub const SPEC: u32 = 11;
+/// 10: the vault GitHub helper; 11: `sync.clone`; 12: `sync.clone-tuning`;
+/// 13: admitted repository prerequisites).
+pub const SPEC: u32 = 13;
 
 /// The pass's record, in `<state_dir>/converge` ([`FileJournal::DIR`]).
 pub const RECORD: &str = "aligned.json";
@@ -73,6 +74,9 @@ pub const GITHUB: &str = "sync.github";
 /// `sync.clone`: the GitHub step an `aterm init` owes, run once the vault's token lands
 /// ([`crate::init::owed_clone`]).
 pub const CLONE: &str = "sync.clone";
+/// `sync.clone-tuning`: each vault clone's git tuning, as its repository declares it
+/// ([`crate::clone_tuning`]).
+pub const CLONE_TUNING: &str = "sync.clone-tuning";
 /// `sync.identity`: this Mac's swarm label in `[ai] machine` and `[fleet] machine`.
 pub const IDENTITY: &str = "sync.identity";
 /// `sync.base`: the row that stands for the base layer a pass leaves to `aterm doctor`.
@@ -615,6 +619,11 @@ pub trait Ports: Sync {
     fn swarm_enabled(&self) -> Result<bool, String>;
     /// The base layer's repair items, the store lock as `lock` says.
     fn base(&self, lock: BaseLock) -> Base;
+    /// An account-scoped prerequisite item for automatic repository acquisition. The
+    /// factory performs no effects; its item captures current authority when probed.
+    fn repository_prerequisites(&self) -> Option<Box<dyn Item + '_>> {
+        None
+    }
     /// `sync.vault`'s read.
     ///
     /// # Errors
@@ -720,16 +729,18 @@ pub trait Ports: Sync {
     /// # Errors
     /// The Commons setting or the vault's copy cannot be read.
     fn shared_data(&self) -> Result<SharedRead, String>;
-    /// `sync.requests`'s read: the need ledger and whether this Mac is a Commons Writer.
+    /// `sync.requests`'s read: the need ledger and whether this Mac is a Commons Writer. A
+    /// ledger that cannot be read is said in the line, so the apply still runs.
     ///
     /// # Errors
-    /// The Commons setting or the need ledger cannot be read.
+    /// This Mac has no config or vault path, or the Commons setting cannot be read.
     fn requests(&self) -> Result<RequestsRead, String>;
     /// `sync.requests`'s apply: this Mac's pass over the lab's table, and the custodian's on a
-    /// Mac that can sign with the vault's key.
+    /// Mac that can sign with the vault's key, which runs whatever the first did.
     ///
     /// # Errors
-    /// The table or the ledger cannot be read or written.
+    /// Either pass failed (the table or the ledger cannot be read or written), or a request's
+    /// copy or publication failed: the error says both passes.
     fn pass_requests(&self) -> Result<String, String>;
     /// `sync.shared-data`'s apply: the founding of the vault's Commons by its only admin, under
     /// the authority the admin already holds; what it did, naming each Mac it approved.
@@ -784,7 +795,7 @@ pub trait Ports: Sync {
     ///
     /// # Errors
     /// A repository row of the step did not end in place.
-    fn clone_owed(&self) -> Result<String, String> {
+    fn clone_owed(&self, _work: aterm_secrets::converge::RepositoryWork) -> Result<String, String> {
         Err("this build runs no clone aterm init owes".into())
     }
     /// Forget the clone an `aterm init` owes ([`crate::init::forget_owed_clone`]): its step was
@@ -794,6 +805,30 @@ pub trait Ports: Sync {
     /// Its record cannot be removed.
     fn forget_owed_clone(&self) -> Result<(), String> {
         Ok(())
+    }
+    /// `sync.clone-tuning`'s read: how each vault clone differs from the git tuning its
+    /// repository declares ([`crate::clone_tuning::read`], under System State's holds now).
+    ///
+    /// # Errors
+    /// This login's context, its init.toml, the inventory or the tuning record cannot be read.
+    fn clone_tuning(&self) -> Result<crate::clone_tuning::Reading, String> {
+        Ok(crate::clone_tuning::Reading::NotApplicable(
+            "this build tunes no clone".into(),
+        ))
+    }
+    /// `sync.clone-tuning`'s apply ([`crate::clone_tuning::apply`]): what it tuned, and why it
+    /// stood aside where it did.
+    ///
+    /// # Errors
+    /// A write failed, or the record or self-test could not be had.
+    fn tune_clones(&self) -> Result<crate::clone_tuning::Tuned, String> {
+        Err("this build tunes no clone".into())
+    }
+    /// Whether the fabric is hosted by the node service and must follow `sync.node`.
+    /// Independent local brokers run before the vault and fleet rows. This is a pure placement
+    /// query; unknown hosts retain the node-dependent order.
+    fn fabric_needs_node(&self) -> bool {
+        true
     }
     /// `sync.fabric`'s read.
     ///
@@ -874,6 +909,7 @@ enum Kind {
     Vault,
     Github,
     OwedClone,
+    CloneTuning,
     Identity,
     StewardRevoke,
     StewardLease,
@@ -904,6 +940,8 @@ struct Synced<'a> {
     trigger: Trigger,
     /// Whether this pass applies: a plan (`--check`) writes nothing, so it does not look.
     mode: Mode,
+    /// A repair wake does not requery remote heads of already acquired worktrees.
+    repository_work: aterm_secrets::converge::RepositoryWork,
     /// Why System State holds the vault out, read as the row starts ([`Ports::vault_held`]): a
     /// Stop pressed while an earlier row ran holds this one.
     held: std::sync::OnceLock<Option<String>>,
@@ -930,6 +968,7 @@ impl<'a> Synced<'a> {
             ports,
             trigger,
             mode,
+            repository_work: aterm_secrets::converge::RepositoryWork::Refresh,
             held: std::sync::OnceLock::new(),
             said: Mutex::new(None),
             aside: Mutex::new(None),
@@ -1070,6 +1109,7 @@ impl Item for Synced<'_> {
             Kind::Vault => VAULT,
             Kind::Github => GITHUB,
             Kind::OwedClone => CLONE,
+            Kind::CloneTuning => CLONE_TUNING,
             Kind::Identity => IDENTITY,
             Kind::StewardRevoke => STEWARD_REVOKE,
             Kind::StewardLease => STEWARD_LEASE,
@@ -1098,6 +1138,7 @@ impl Item for Synced<'_> {
         match self.kind {
             Kind::Vault
             | Kind::Github
+            | Kind::CloneTuning
             | Kind::Identity
             | Kind::StewardRevoke
             | Kind::StewardLease
@@ -1119,6 +1160,7 @@ impl Item for Synced<'_> {
             Kind::Vault => "the vault's subscriber",
             Kind::Github => "the vault GitHub credential helper",
             Kind::OwedClone => "the repositories aterm init owes",
+            Kind::CloneTuning => "git tuning of the vault's clones",
             Kind::Identity => "this Mac's swarm label",
             Kind::StewardRevoke => "the revoke cascade, finished by the ALab steward",
             Kind::StewardLease => "the ALab steward lease",
@@ -1209,6 +1251,10 @@ impl Item for Synced<'_> {
                     },
                 }
             }),
+            Kind::CloneTuning => read(
+                self.ports.clone_tuning(),
+                crate::clone_tuning::Reading::probe,
+            ),
             Kind::Github => read(self.ports.github(), |github| {
                 let replaced = self
                     .replaced_github
@@ -1396,6 +1442,15 @@ impl Item for Synced<'_> {
             .clone()
     }
 
+    fn refresh_changes(&self) -> bool {
+        self.kind == Kind::OwedClone
+            && self.repository_work == aterm_secrets::converge::RepositoryWork::Refresh
+    }
+
+    fn refresh(&self) -> Option<Result<(), String>> {
+        self.refresh_changes().then(|| self.apply())
+    }
+
     fn apply(&self) -> Result<(), String> {
         let said = match self.kind {
             Kind::Peers => match self.ports.join_peers()? {
@@ -1425,7 +1480,7 @@ impl Item for Synced<'_> {
                     self.stand_aside(StoodAside::Waiting(why));
                     return Ok(());
                 }
-                None => match self.ports.clone_owed() {
+                None => match self.ports.clone_owed(self.repository_work) {
                     Ok(said) => said,
                     // A step only a person can finish waits for them: no pass runs it again
                     // until the token or init.toml changes.
@@ -1438,6 +1493,25 @@ impl Item for Synced<'_> {
                     }
                 },
             },
+            Kind::CloneTuning => {
+                // A Stop pressed since the row read the clones holds them, as it holds the
+                // owed clone ([`Self::owed_clone_held`]); the apply reads System State's
+                // repositories hold again itself.
+                if let Some(why) = self.ports.vault_held() {
+                    self.stand_aside(StoodAside::Waiting(why));
+                    return Ok(());
+                }
+                let tuned = self
+                    .ports
+                    .tune_clones()
+                    .map_err(|why| format!("{why}; the next pass tries again"))?;
+                if let Some(why) = tuned.aside {
+                    self.say(tuned.said);
+                    self.stand_aside(StoodAside::Waiting(why));
+                    return Ok(());
+                }
+                tuned.said
+            }
             Kind::StewardRevoke => self
                 .ports
                 .apply_steward_revoke()
@@ -1522,6 +1596,11 @@ impl Item for Synced<'_> {
             Kind::OwedClone => Remedy::Command(
                 crate::init::naming(aterm_types::macos_setup::Setting::Repositories).to_owned(),
             ),
+            // Only macOS's doctor carries the tuning; elsewhere the pass alone applies it.
+            Kind::CloneTuning if cfg!(target_os = "macos") => {
+                Remedy::Command(format!("aterm doctor --only {}", crate::clone_tuning::ID))
+            }
+            Kind::CloneTuning => Remedy::Command("aterm init --converge".to_owned()),
             Kind::Identity => Remedy::Command("aterm init --converge".to_owned()),
             Kind::StewardRevoke => Remedy::Command("aterm init --converge".to_owned()),
             Kind::StewardLease => Remedy::Command("aterm init --converge".to_owned()),
@@ -1734,10 +1813,18 @@ fn builds_after(record: Option<&Record>, build: &str) -> Vec<String> {
     builds
 }
 
-/// The sync kinds, in run order: the vault before what it brings, and potentially long
-/// repository clones after the fleet, node and account setup they must not delay.
-fn sync_items<'a>(ports: &'a dyn Ports, trigger: Trigger, mode: Mode) -> Items<'a> {
-    [
+/// The sync kinds, in run order: an independent local fabric before remote work, the vault
+/// before what it brings, and a node-hosted fabric after the node. The optional repository
+/// prerequisite and potentially long clones follow fleet, node and account work.
+/// The prerequisite owns its unattended package attempt after the base store lock is gone.
+/// Clone tuning runs last, over every clone the pass leaves in place.
+fn sync_items<'a>(
+    ports: &'a dyn Ports,
+    trigger: Trigger,
+    mode: Mode,
+    work: aterm_secrets::converge::RepositoryWork,
+) -> Items<'a> {
+    let mut items: Items<'a> = [
         Kind::Peers,
         Kind::Vault,
         Kind::Github,
@@ -1751,13 +1838,30 @@ fn sync_items<'a>(ports: &'a dyn Ports, trigger: Trigger, mode: Mode) -> Items<'
         Kind::Requests,
         Kind::Accounts,
         Kind::Release,
-        Kind::Fabric,
-        Kind::Awake,
-        Kind::OwedClone,
     ]
     .into_iter()
     .map(|kind| Box::new(Synced::new(kind, ports, trigger, mode)) as Box<dyn Item + 'a>)
-    .collect()
+    .collect();
+    let fabric = Box::new(Synced::new(Kind::Fabric, ports, trigger, mode));
+    if ports.fabric_needs_node() {
+        items.push(fabric);
+    } else {
+        items.insert(0, fabric);
+    }
+    items.push(Box::new(Synced::new(Kind::Awake, ports, trigger, mode)));
+    if let Some(prerequisites) = ports.repository_prerequisites() {
+        items.push(prerequisites);
+    }
+    let mut repositories = Synced::new(Kind::OwedClone, ports, trigger, mode);
+    repositories.repository_work = work;
+    items.push(Box::new(repositories));
+    items.push(Box::new(Synced::new(
+        Kind::CloneTuning,
+        ports,
+        trigger,
+        mode,
+    )));
+    items
 }
 
 /// Why a pass did not run ([`converge`]).
@@ -1804,9 +1908,10 @@ pub fn converge(
     ports: &dyn Ports,
     trigger: Trigger,
     mode: Mode,
+    work: aterm_secrets::converge::RepositoryWork,
     on_row: &mut dyn FnMut(&ItemReport),
 ) -> Result<Pass, Stop> {
-    let pass = run_pass(ports, trigger, mode, on_row);
+    let pass = run_pass(ports, trigger, mode, work, on_row);
     if mode == Mode::Apply
         && let Err(Stop::Refused(why)) = &pass
     {
@@ -1828,6 +1933,7 @@ fn run_pass(
     ports: &dyn Ports,
     trigger: Trigger,
     mode: Mode,
+    work: aterm_secrets::converge::RepositoryWork,
     on_row: &mut dyn FnMut(&ItemReport),
 ) -> Result<Pass, Stop> {
     if !ports.own_account() {
@@ -1884,7 +1990,7 @@ fn run_pass(
     {
         ports.log(&format!("converge vault subscriber: {line}"));
     }
-    let items = sync_items(ports, trigger, mode);
+    let items = sync_items(ports, trigger, mode, work);
     rows.extend(aterm_converge::run_scoped(&items, mode, scope, journal, on_row).map_err(refused)?);
     if mode == Mode::Plan {
         return Ok(Pass {

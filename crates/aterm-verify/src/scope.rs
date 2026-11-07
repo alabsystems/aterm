@@ -230,16 +230,9 @@ impl Scope {
     }
 }
 
-/// The package name a `-p` spec names: what follows a path spec's `#`, up to
-/// its `@<version>`. `None` for a spec whose `@` has no version after it
-/// (`name@`), which names no package.
-pub fn spec_name(spec: &str) -> Option<&str> {
-    let tail = spec.rsplit_once('#').map_or(spec, |(_, t)| t);
-    match tail.split_once('@') {
-        None => Some(tail),
-        Some((name, version)) => (!version.is_empty()).then_some(name),
-    }
-}
+/// The package name a `-p` spec names, read as the memory book reads a selection's crates for
+/// their units' peaks ([`aterm_capacity::book::Records::unit_floor`]).
+pub use aterm_capacity::book::spec_name;
 
 #[cfg(test)]
 mod tests {

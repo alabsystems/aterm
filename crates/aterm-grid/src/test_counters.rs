@@ -271,6 +271,251 @@ pub(crate) fn take_rgb_harvest_cells() -> usize {
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    static REFERENCE_PATHS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread runs the scroll paths' reference implementations (the row-by-row forms
+/// the fast paths replaced), which the differential tests hold the fast paths to.
+#[cfg(test)]
+pub(crate) fn reference_paths() -> bool {
+    REFERENCE_PATHS.with(std::cell::Cell::get)
+}
+
+/// Run `f` on this thread's reference paths ([`reference_paths`]), restoring the fast paths after.
+#[cfg(test)]
+pub(crate) fn on_reference_paths<T>(f: impl FnOnce() -> T) -> T {
+    REFERENCE_PATHS.with(|c| c.set(true));
+    let out = f();
+    REFERENCE_PATHS.with(|c| c.set(false));
+    out
+}
+
+thread_local! {
+    static SHORT_LINE_RUN_SHIFT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread's coalesced line feeds ([`crate::Grid::line_feeds_at_region_bottom`])
+/// shift the region one line short of their count: the planted fault a line-run differential
+/// test's negative control arms ([`with_short_line_run_shift`]).
+pub(crate) fn short_line_run_shift() -> bool {
+    SHORT_LINE_RUN_SHIFT.with(std::cell::Cell::get)
+}
+
+/// Run `f` with [`short_line_run_shift`] armed on this thread, disarmed again after.
+pub fn with_short_line_run_shift<T>(f: impl FnOnce() -> T) -> T {
+    SHORT_LINE_RUN_SHIFT.with(|c| c.set(true));
+    let out = f();
+    SHORT_LINE_RUN_SHIFT.with(|c| c.set(false));
+    out
+}
+
+thread_local! {
+    static COALESCED_SHIFTS: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+
+/// Count one coalesced shift ([`crate::Grid::line_feeds_at_region_bottom`]) of `feeds` line
+/// feeds in a region of `height` rows.
+pub(crate) fn count_coalesced_shift(feeds: usize, height: usize) {
+    COALESCED_SHIFTS.with(|c| {
+        let [shifts, multi, deep] = c.get();
+        c.set([
+            shifts + 1,
+            multi + usize::from(feeds > 1),
+            deep + usize::from(feeds > height),
+        ]);
+    });
+}
+
+/// Take (read and reset) this thread's coalesced shifts: how many, how many coalesced more
+/// than one line feed, and how many more line feeds than the region has rows (so some of
+/// their lines were never written).
+pub fn take_coalesced_shifts() -> [usize; 3] {
+    COALESCED_SHIFTS.with(|c| c.replace([0; 3]))
+}
+
+thread_local! {
+    static SHORT_SCREEN_SETTLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SCREEN_SETTLES: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+
+/// Whether this thread's settled screen line feeds ([`crate::Grid::settle_screen_line_feeds`])
+/// record a scroll delta one short of their count: the planted fault a screen line-run
+/// differential's negative control arms ([`with_short_screen_settle`]).
+pub(crate) fn short_screen_settle() -> bool {
+    SHORT_SCREEN_SETTLE.with(std::cell::Cell::get)
+}
+
+/// Run `f` with [`short_screen_settle`] armed on this thread, disarmed again after.
+pub fn with_short_screen_settle<T>(f: impl FnOnce() -> T) -> T {
+    SHORT_SCREEN_SETTLE.with(|c| c.set(true));
+    let out = f();
+    SHORT_SCREEN_SETTLE.with(|c| c.set(false));
+    out
+}
+
+thread_local! {
+    static SCREEN_TEXT_SLOT_ONE_UP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread's screen text lines ([`crate::Grid::screen_text_line`]) write their text
+/// into the ring slot one before the row their line feed brought in: the planted off-by-one a
+/// screen text-line differential's negative control arms ([`with_screen_text_slot_one_up`]).
+pub(crate) fn screen_text_slot_one_up() -> bool {
+    SCREEN_TEXT_SLOT_ONE_UP.with(std::cell::Cell::get)
+}
+
+/// Run `f` with [`screen_text_slot_one_up`] armed on this thread, disarmed again after.
+pub fn with_screen_text_slot_one_up<T>(f: impl FnOnce() -> T) -> T {
+    SCREEN_TEXT_SLOT_ONE_UP.with(|c| c.set(true));
+    let out = f();
+    SCREEN_TEXT_SLOT_ONE_UP.with(|c| c.set(false));
+    out
+}
+
+thread_local! {
+    static SCREEN_TEXT_RUNS: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+
+/// Count one run of `lines` screen text lines ([`crate::Grid::settle_screen_text_lines`]).
+pub(crate) fn count_screen_text_run(lines: usize) {
+    SCREEN_TEXT_RUNS.with(|c| {
+        let [runs, total] = c.get();
+        c.set([runs + 1, total + lines]);
+    });
+}
+
+/// Take (read and reset) this thread's screen text-line runs: how many, and how many lines they
+/// took in all.
+pub fn take_screen_text_runs() -> [usize; 2] {
+    SCREEN_TEXT_RUNS.with(|c| c.replace([0; 2]))
+}
+
+/// Count one settle of `feeds` screen line feeds ([`crate::Grid::settle_screen_line_feeds`]).
+pub(crate) fn count_screen_settle(feeds: usize) {
+    SCREEN_SETTLES.with(|c| {
+        let [settles, multi] = c.get();
+        c.set([settles + 1, multi + usize::from(feeds > 1)]);
+    });
+}
+
+/// Take (read and reset) this thread's screen line-feed settles: how many, and how many settled
+/// more than one line feed.
+pub fn take_screen_settles() -> [usize; 2] {
+    SCREEN_SETTLES.with(|c| c.replace([0; 2]))
+}
+
+#[cfg(test)]
+thread_local! {
+    static SHORT_STRADDLE_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread reads a staged row whose cells straddle the arena's ring one cell short:
+/// the planted fault the staged-row model's negative control arms ([`with_short_straddle_read`]).
+#[cfg(test)]
+pub(crate) fn short_straddle_read() -> bool {
+    SHORT_STRADDLE_READ.with(std::cell::Cell::get)
+}
+
+/// Run `f` with [`short_straddle_read`] armed on this thread, disarmed again after.
+#[cfg(test)]
+pub(crate) fn with_short_straddle_read<T>(f: impl FnOnce() -> T) -> T {
+    SHORT_STRADDLE_READ.with(|c| c.set(true));
+    let out = f();
+    SHORT_STRADDLE_READ.with(|c| c.set(false));
+    out
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCREEN_TEXT_FLUSHES: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) };
+    static SCREEN_TEXT_BATCH_IGNORES_HEADROOM: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Count one flush of `feeds` deferred screen text line feeds (`Grid::flush_screen_text_lines`),
+/// whose shed found `stored` lines in the store and left `kept`.
+#[cfg(test)]
+pub(crate) fn count_screen_text_flush(feeds: usize, stored: usize, kept: usize) {
+    SCREEN_TEXT_FLUSHES.with(|c| {
+        let [batched, lines, over_store, emptied] = c.get();
+        if feeds > 1 {
+            c.set([
+                batched + 1,
+                lines + feeds,
+                over_store + usize::from(stored != 0),
+                emptied + usize::from(stored != 0 && kept == 0),
+            ]);
+        }
+    });
+}
+
+/// Take (read and reset) this thread's flushes of more than one deferred screen text line feed:
+/// how many, how many line feeds they flushed in all, how many found lines in the store, and how
+/// many of those emptied it.
+#[cfg(test)]
+pub(crate) fn take_screen_text_flushes() -> [usize; 4] {
+    SCREEN_TEXT_FLUSHES.with(|c| c.replace([0; 4]))
+}
+
+/// Whether this thread's screen text runs defer their line feeds' shed wherever the rest of
+/// what [`crate::Grid::screen_text_shed_batch`] asks holds, with no regard to the store's memory
+/// headroom: the planted fault the flood differential's negative control arms
+/// ([`with_screen_text_batch_ignoring_headroom`]).
+#[cfg(test)]
+pub(crate) fn screen_text_batch_ignores_headroom() -> bool {
+    SCREEN_TEXT_BATCH_IGNORES_HEADROOM.with(std::cell::Cell::get)
+}
+
+/// Run `f` with [`screen_text_batch_ignores_headroom`] armed on this thread, disarmed again
+/// after.
+#[cfg(test)]
+pub(crate) fn with_screen_text_batch_ignoring_headroom<T>(f: impl FnOnce() -> T) -> T {
+    SCREEN_TEXT_BATCH_IGNORES_HEADROOM.with(|c| c.set(true));
+    let out = f();
+    SCREEN_TEXT_BATCH_IGNORES_HEADROOM.with(|c| c.set(false));
+    out
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCREEN_TEXT_CUT_REFUSALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SCREEN_TEXT_BATCH_IGNORES_CUT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Count one screen text run's deferral that an open flood cut alone refused
+/// ([`crate::Grid::screen_text_shed_batch`]): staging was within the store's memory headroom.
+#[cfg(test)]
+pub(crate) fn count_screen_text_cut_refusal() {
+    SCREEN_TEXT_CUT_REFUSALS.with(|c| c.set(c.get() + 1));
+}
+
+/// Take (read and reset) this thread's count of deferrals an open flood cut alone refused.
+#[cfg(test)]
+pub(crate) fn take_screen_text_cut_refusals() -> usize {
+    SCREEN_TEXT_CUT_REFUSALS.with(|c| c.replace(0))
+}
+
+/// Whether this thread's screen text runs defer their line feeds' shed though a flood cut is
+/// open, wherever the rest of what [`crate::Grid::screen_text_shed_batch`] asks holds: the
+/// planted fault the wide-row flood differential's negative control arms
+/// ([`with_screen_text_batch_ignoring_cut`]).
+#[cfg(test)]
+pub(crate) fn screen_text_batch_ignores_cut() -> bool {
+    SCREEN_TEXT_BATCH_IGNORES_CUT.with(std::cell::Cell::get)
+}
+
+/// Run `f` with [`screen_text_batch_ignores_cut`] armed on this thread, disarmed again after.
+#[cfg(test)]
+pub(crate) fn with_screen_text_batch_ignoring_cut<T>(f: impl FnOnce() -> T) -> T {
+    SCREEN_TEXT_BATCH_IGNORES_CUT.with(|c| c.set(true));
+    let out = f();
+    SCREEN_TEXT_BATCH_IGNORES_CUT.with(|c| c.set(false));
+    out
+}
+
 thread_local! {
     static ROW_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

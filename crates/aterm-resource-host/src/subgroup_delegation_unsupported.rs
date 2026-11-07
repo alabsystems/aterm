@@ -21,7 +21,17 @@ impl Prepared {
     ) -> io::Result<Option<Self>> {
         Err(unavailable())
     }
+    pub(crate) fn retain_guard(&mut self, _: std::os::fd::OwnedFd) -> io::Result<u32> {
+        Err(unavailable())
+    }
     pub(crate) fn configure(&mut self, _: &mut aterm_uds::spawnfd::Command) -> io::Result<()> {
+        Err(unavailable())
+    }
+    pub(crate) fn configure_with_extra(
+        &mut self,
+        _: &mut aterm_uds::spawnfd::Command,
+        _: Vec<(std::os::fd::OwnedFd, i32)>,
+    ) -> io::Result<()> {
         Err(unavailable())
     }
     pub(crate) fn bind_child(&mut self, _: u32) -> io::Result<()> {

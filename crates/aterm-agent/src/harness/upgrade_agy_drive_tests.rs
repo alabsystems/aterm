@@ -316,6 +316,10 @@ impl Kernel for Script {
             _ => None,
         }
     }
+
+    fn restart_background(&self, _: u32) -> Vec<String> {
+        crate::harness::upgrade_drive::tests::unstated("background")
+    }
 }
 
 impl AgyKernel for Script {

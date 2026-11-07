@@ -384,7 +384,7 @@ pub fn agents_dir_refusal_line(dir: &Path, error: &str, system: bool, reach: &st
 }
 
 /// The ready record beside this named build, shared by install and publication admission.
-pub(crate) fn ready_marker_path(build_dir: &Path) -> Option<PathBuf> {
+pub fn ready_marker_path(build_dir: &Path) -> Option<PathBuf> {
     let name = build_dir.file_name()?.to_str()?;
     Some(build_dir.with_file_name(format!("{name}{}", aterm_toolchain::layout::READY_SUFFIX)))
 }
@@ -531,9 +531,13 @@ pub(crate) fn build_is_complete_on(
     if is_provably_absent(build_dir) {
         return false;
     }
-    if host
-        .is_some_and(|host| aterm_toolchain::gnu_runtime::admit_tree_on(build_dir, host).is_err())
-    {
+    // A runtime this process cannot read, or one past the inspector's entry bound, is no
+    // verdict: the marker, written only after a whole admission, answers for it as it does where
+    // no admission runs, and gc never sweeps a marked build for it.
+    if host.is_some_and(|host| {
+        aterm_toolchain::gnu_runtime::admit_tree_on(build_dir, host)
+            .is_err_and(|why| why.is_refusal())
+    }) {
         return false;
     }
     match crate::metadata_io::read_bounded_regular_utf8(&marker, 4 * 1024 * 1024) {
@@ -1816,6 +1820,34 @@ enum Memo {
 }
 
 fn discard_build_as(build_dir: &Path, memo: Memo) {
+    let Ok(sdk) = crate::compat::sdk_mutation_guard_for_build(build_dir) else {
+        return;
+    };
+    match sdk {
+        Some(guard) => discard_build_as_reclaimed(build_dir, memo, &guard),
+        None => discard_build_after_sdk_admission(build_dir, memo),
+    }
+}
+
+pub(crate) fn discard_build_reclaimed(build_dir: &Path, guard: &crate::lease::ReclaimGuard) {
+    discard_build_as_reclaimed(build_dir, Memo::Clear, guard);
+}
+
+pub(crate) fn discard_build_keeping_memo_reclaimed(
+    build_dir: &Path,
+    guard: &crate::lease::ReclaimGuard,
+) {
+    discard_build_as_reclaimed(build_dir, Memo::Keep, guard);
+}
+
+fn discard_build_as_reclaimed(build_dir: &Path, memo: Memo, guard: &crate::lease::ReclaimGuard) {
+    if crate::compat::check_sdk_reclaim(build_dir, guard).is_err() {
+        return;
+    }
+    discard_build_after_sdk_admission(build_dir, memo);
+}
+
+fn discard_build_after_sdk_admission(build_dir: &Path, memo: Memo) {
     let Ok(first_exec) = first_exec_removal(build_dir) else {
         return;
     };

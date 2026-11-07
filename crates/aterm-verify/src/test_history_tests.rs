@@ -3,6 +3,8 @@
 
 //! The test binaries' history: its bounds, its file, and what it does with a file it cannot read.
 
+use std::time::Duration;
+
 use super::{History, ROWS_KEPT, SAMPLES_KEPT, Sample, keep, load};
 
 fn sample(at_ms: u64) -> Sample {
@@ -173,4 +175,108 @@ fn a_history_that_cannot_be_read_is_left_as_it_is() {
             }
         }
     }
+}
+
+/// A run of `wall_ms` that used `cpu_ms` at `width`, libtest having said it runs `tests`.
+fn run(wall_ms: u64, cpu_ms: u64, width: u32, tests: Option<u64>, outcome: &str) -> Sample {
+    Sample {
+        outcome: outcome.to_owned(),
+        wall_ms,
+        cpu_ms: Some(cpu_ms),
+        peak_bytes: None,
+        width,
+        tests,
+        ..sample(1)
+    }
+}
+
+/// The planner reads a binary's last timed run (a FAIL that ran its tests is one; a NOT RUN, and
+/// a FAIL in which libtest said it runs no test, are not), the most CPU per thread and the most
+/// memory any kept run showed, and whether its last run was a FAIL. NEGATIVE CONTROL: the
+/// untimed runs' walls (99 s, 0.2 s) are never read, and a NOT RUN last run is no FAIL.
+#[test]
+fn the_planner_reads_the_last_timed_run_and_the_most_any_run_used() {
+    let mut h = History::default();
+    h.push(
+        "-p a --lib",
+        Sample {
+            peak_bytes: Some(900),
+            ..run(10_000, 30_000, 1, Some(4), "ok")
+        },
+    );
+    h.push(
+        "-p a --lib",
+        Sample {
+            peak_bytes: Some(100),
+            ..run(4000, 8000, 4, Some(8), "FAIL")
+        },
+    );
+    h.push("-p a --lib", run(99_000, 1000, 4, Some(8), "NOT RUN"));
+    let seen = h.seen("-p a --lib").expect("seen");
+    assert_eq!(seen.wall, Duration::from_secs(4));
+    assert_eq!(seen.width, 4);
+    assert_eq!(seen.tests, 8);
+    // 30 s of CPU over 10 s on one thread: three cores per thread, the most any run showed.
+    assert!((seen.per_thread - 3.0).abs() < 1e-9, "{seen:?}");
+    assert_eq!(seen.peak, 900);
+    assert!(!seen.failed, "the last run was NOT RUN, not a FAIL");
+    assert_eq!(h.seen("-p b --lib"), None);
+    h.push("-p c --lib", run(200, 200, 4, None, "FAIL"));
+    assert_eq!(h.seen("-p c --lib"), None, "it crashed before any test");
+    h.push("-p d --lib", run(200, 200, 4, Some(1), "FAIL"));
+    assert!(h.seen("-p d --lib").is_some_and(|s| s.failed));
+}
+
+/// A decisive red keeps only its outcome after a timed pass: the planner retains the pass's
+/// timing and width, but sees the newest FAIL and starts that binary before prior passes.
+/// NEGATIVE CONTROL: dropping the outcome-only sample, or taking its zero wall as the latest
+/// timing, makes one of these assertions fail.
+#[test]
+fn a_stopped_red_keeps_the_prior_timing_and_marks_the_binary_failed() {
+    let mut h = History::default();
+    h.push("-p a --lib", run(4000, 8000, 4, Some(8), "ok"));
+    h.push(
+        "-p a --lib",
+        Sample {
+            at_ms: 2,
+            outcome: "FAIL".to_owned(),
+            wall_ms: 0,
+            cpu_ms: None,
+            starved_ms: None,
+            peak_bytes: None,
+            width: 2,
+            tests: Some(3),
+        },
+    );
+
+    let seen = h.seen("-p a --lib").expect("the timed pass remains");
+    assert_eq!(seen.wall, Duration::from_secs(4));
+    assert_eq!((seen.width, seen.tests), (4, 8));
+    assert!(seen.failed, "the latest decisive outcome is failed");
+}
+
+/// The heaviest run is read over the selection's crates' binaries, every binary's for the whole
+/// workspace. NEGATIVE CONTROL: a crate the selection does not name, and one whose name only
+/// begins with a selected one's, are not read.
+#[test]
+fn the_heaviest_run_is_read_for_the_selections_crates() {
+    let mut h = History::default();
+    for (binary, peak) in [
+        ("-p a --lib", 100),
+        ("-p a --test t", 300),
+        ("-p ab --lib", 900),
+        ("-p b --lib", 500),
+    ] {
+        h.push(
+            binary,
+            Sample {
+                peak_bytes: Some(peak),
+                ..sample(1)
+            },
+        );
+    }
+    assert_eq!(h.heaviest(&["a".to_owned()]), 300);
+    assert_eq!(h.heaviest(&["a".to_owned(), "b".to_owned()]), 500);
+    assert_eq!(h.heaviest(&[]), 900);
+    assert_eq!(h.heaviest(&["c".to_owned()]), 0);
 }

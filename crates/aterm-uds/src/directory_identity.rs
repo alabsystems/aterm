@@ -36,7 +36,18 @@ pub fn read(path: &Path) -> io::Result<Identity> {
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)?;
+    of_file(&file)
+}
+
+/// Identity of an already opened directory, without resolving its path again.
+pub(crate) fn of_file(file: &std::fs::File) -> io::Result<Identity> {
     let metadata = file.metadata()?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a directory",
+        ));
+    }
     Ok(Identity {
         dev: metadata.dev(),
         ino: metadata.ino(),

@@ -16,20 +16,92 @@ const WORKER_RETRY: Duration = Duration::from_secs(1);
 /// lifetimes. Keep retrying off the event loop: a previously admitted launch
 /// worker can insert its reservation after an earlier sweep.
 fn drain_account_sources(
+    pause: Pause,
+    sources: Option<&aterm_agent::harness::codex_source_registry::Registry>,
+    lifetime: &aterm_agent::harness::account_work::Lifetime,
+) -> Drained {
+    drain_account_sources_inner(
+        pause,
+        sources,
+        lifetime,
+        #[cfg(all(test, unix))]
+        None,
+    )
+}
+
+#[cfg(all(test, unix))]
+pub(crate) struct CustodySweepCheckpoint {
+    pub(crate) swept: std::sync::mpsc::Sender<()>,
+    pub(crate) resume: std::sync::mpsc::Receiver<()>,
+}
+
+fn drain_account_sources_inner(
     mut pause: Pause,
     sources: Option<&aterm_agent::harness::codex_source_registry::Registry>,
+    lifetime: &aterm_agent::harness::account_work::Lifetime,
+    #[cfg(all(test, unix))] mut checkpoint: Option<CustodySweepCheckpoint>,
 ) -> Drained {
-    let Some(sources) = sources else {
+    #[cfg(not(unix))]
+    if sources.is_none() {
         return pause.wait();
-    };
+    }
+    const FIRST_CUSTODY_RETRY: Duration = Duration::from_millis(100);
+    const MAX_CUSTODY_RETRY: Duration = Duration::from_secs(1);
+    const CONSTRUCTOR_SWEEP: Duration = Duration::from_millis(10);
+    let mut next_custody = Instant::now();
+    let mut custody_retry = FIRST_CUSTODY_RETRY;
     loop {
-        let _ = sources.revoke_cancelled_unclaimed();
+        if let Some(sources) = sources {
+            let _ = sources.revoke_cancelled_unclaimed();
+        }
+        if Instant::now() >= next_custody {
+            #[cfg(unix)]
+            let pending = App::settle_enrollment_custody(lifetime);
+            #[cfg(not(unix))]
+            let pending = {
+                let _ = lifetime;
+                false
+            };
+            let delay = if pending {
+                custody_retry
+            } else {
+                FIRST_CUSTODY_RETRY
+            };
+            next_custody = Instant::now() + delay;
+            custody_retry = if pending {
+                delay.saturating_mul(2).min(MAX_CUSTODY_RETRY)
+            } else {
+                FIRST_CUSTODY_RETRY
+            };
+            #[cfg(all(test, unix))]
+            if let Some(checkpoint) = checkpoint.take() {
+                let _ = checkpoint.swept.send(());
+                let _ = checkpoint
+                    .resume
+                    .recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+            }
+        }
         pause = match pause.try_wait() {
             Ok(drained) => return drained,
             Err(pause) => pause,
         };
-        std::thread::park_timeout(std::time::Duration::from_millis(10));
+        // This clock only paces owned storage retries, never proves retirement.
+        let wait = next_custody.saturating_duration_since(Instant::now());
+        std::thread::park_timeout(if sources.is_some() {
+            wait.min(CONSTRUCTOR_SWEEP)
+        } else {
+            wait
+        });
     }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn drain_custody_for_test(
+    pause: Pause,
+    lifetime: &aterm_agent::harness::account_work::Lifetime,
+    checkpoint: Option<CustodySweepCheckpoint>,
+) -> Drained {
+    drain_account_sources_inner(pause, None, lifetime, checkpoint)
 }
 
 #[derive(Debug)]
@@ -66,7 +138,7 @@ pub(crate) fn settle_accounts(
     let drained = match input {
         DrainInput::Wait(pause) => {
             let sources = crate::control::source_registry();
-            drain_account_sources(pause, sources.as_deref())
+            drain_account_sources(pause, sources.as_deref(), lifetime)
         }
         DrainInput::Ready(drained) => drained,
     };
@@ -208,11 +280,23 @@ impl App {
             }
             Err(pause) => pause,
         };
+        self.wake_parked_launchers();
         self.account_drain.pending = Some(continuation);
         self.account_drain.pause = Some(pause);
         self.dispatch_account_drain(serial);
 
         false
+    }
+
+    /// Rings every session's watchers, so a launcher parked on its session's list reads the
+    /// cancellation now. A pause only sets a flag, which that launcher otherwise reads at its next
+    /// look, up to a minute later for a launch held on a wall, while the quit or update waits for it
+    /// and a stop's own clock can run out first and lose the launch's `why=cancelled`.
+    fn wake_parked_launchers(&self) {
+        let store = self.store.read().unwrap_or_else(|e| e.into_inner());
+        for handle in store.live_handles() {
+            handle.ctx.watchers.ring_watchers();
+        }
     }
 
     fn dispatch_account_drain(&mut self, serial: u64) {
@@ -618,9 +702,14 @@ mod tests {
             .expect_err("the real constructor still owns its App scope");
         let (send, receive) = std::sync::mpsc::sync_channel(1);
         let worker_sources = sources.clone();
+        let worker_lifetime = lifetime.clone();
         let worker = std::thread::spawn(move || {
-            send.send(drain_account_sources(pause, Some(&worker_sources)))
-                .unwrap();
+            send.send(drain_account_sources(
+                pause,
+                Some(&worker_sources),
+                &worker_lifetime,
+            ))
+            .unwrap();
         });
         let drained = receive
             .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
@@ -644,10 +733,11 @@ mod tests {
             let pause = lifetime.pause().unwrap();
             assert!(work.cancelled());
             let (send, receive) = std::sync::mpsc::sync_channel(1);
+            let worker_lifetime = lifetime.clone();
             let worker = std::thread::spawn(move || {
                 let sources =
                     registered.then(aterm_agent::harness::codex_source_registry::Registry::default);
-                let drained = drain_account_sources(pause, sources.as_ref());
+                let drained = drain_account_sources(pause, sources.as_ref(), &worker_lifetime);
                 send.send(drained).unwrap();
             });
             assert!(matches!(

@@ -7604,34 +7604,39 @@ mod tests {
 
     #[test]
     fn a_cat_at_the_panes_edge_cheers_facing_into_the_pane() {
-        let mut p = AgentPane::narrow(60, (15, 28));
-        assert!(p.parks_within(10.0), "fixture: the cat parks");
         let w = art_cols(15, 28);
         let edge = 60.0 - w - 0.2;
-        (p.0.pet.col, p.0.pet.row) = (edge, 2.85);
-        p.0.pet.facing_left = false;
-        let (frames, air) = p.landing();
-        assert_eq!(air, Some(CheerAir::Lanes(true)), "the air is to its left");
-        let frolic = frames
-            .iter()
-            .position(|f| f.action == PetAction::Frolic)
-            .expect("the landing frolics");
-        assert!(
-            frames[..=frolic]
+        // As it ships, and with a fit by the wall off: there a frame's `col` is where it stands,
+        // and not where the fit draws it in its box, so the frames read its stand exactly.
+        for (centred, reach) in [(false, w * 0.5), (true, 0.0)] {
+            let mut p = AgentPane::narrow(60, (15, 28));
+            assert!(p.parks_within(10.0), "fixture: the cat parks");
+            (p.0.pet.col, p.0.pet.row) = (edge, 2.85);
+            p.0.pet.facing_left = false;
+            p.0.pet.set_old_path(OldPath::FitCentredAtTheWall, centred);
+            let (frames, air) = p.landing();
+            assert_eq!(air, Some(CheerAir::Lanes(true)), "the air is to its left");
+            let frolic = frames
                 .iter()
-                .all(|f| f.action != PetAction::Leap && (f.col - edge).abs() < 0.5),
-            "it cheers where it stands, against the edge"
-        );
-        assert!(
-            frames[frolic..]
-                .iter()
-                .take_while(|f| f.action == PetAction::Frolic)
-                .all(|f| f.facing_left),
-            "it frolics facing into the pane"
-        );
-        let (most, meets) = p.notes_on_glass(&frames[frolic..]);
-        assert_eq!(most, 3, "its three ♪/♥ on glass together");
-        assert_eq!(meets, 0, "no two ♪/♥ tiles meet");
+                .position(|f| f.action == PetAction::Frolic)
+                .expect("the landing frolics");
+            assert!(
+                frames[..=frolic].iter().all(|f| {
+                    f.action != PetAction::Leap && f.col - edge > -0.5 && f.col - edge < reach + 0.5
+                }),
+                "it cheers where it stands, against the edge (fit centred: {centred})"
+            );
+            assert!(
+                frames[frolic..]
+                    .iter()
+                    .take_while(|f| f.action == PetAction::Frolic)
+                    .all(|f| f.facing_left),
+                "it frolics facing into the pane (fit centred: {centred})"
+            );
+            let (most, meets) = p.notes_on_glass(&frames[frolic..]);
+            assert_eq!(most, 3, "its three ♪/♥ on glass together");
+            assert_eq!(meets, 0, "no two ♪/♥ tiles meet");
+        }
     }
 
     #[test]

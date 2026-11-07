@@ -5640,16 +5640,14 @@ fn oauth_recoverable_bot_read_and_semantic_failures_are_not_browser_control() {
     }
 }
 
-/// A Claude sign-in that meets Cloudflare's bot check waits on it, its reads not counted against
-/// the drive's steps, and one that has not cleared within its stall ends naming it, never
-/// "exceeded maximum steps", however it reloads (a `loading` read on its host between two); its
-/// block page ends it at once; and each end is noted for the opener's outcome file. CONTROLS: a
-/// check that clears after three reads, or after more reads than the drive's steps, goes on to
-/// the callback; a page that only loads, or loads on another host between two reads of a check,
+/// A Claude sign-in waits on Cloudflare's bot check without charging its reads to the step cap.
+/// A failed central handoff has its own outcome, never a fabricated provider block. CONTROLS: a
+/// check that clears after three reads, or after more reads than the drive's steps, reaches the
+/// callback; a page that only loads, or loads on another host between two reads of a check,
 /// counts its steps and ends `stall`.
 #[test]
-fn a_claude_sign_in_on_a_bot_check_ends_naming_it_and_one_that_clears_goes_on() {
-    use super::super::headless_oauth::{BLOCK_PAGE_MET, BOT_CHECK_UNCLEARED};
+fn a_claude_bot_check_waits_and_a_failed_central_handoff_is_distinct() {
+    use super::super::headless_oauth::{BOT_CHECK_UNCLEARED, CHALLENGE_FAILED};
     let at = |state: &str, url: &str| aterm_json::json!({"state": state, "url": url});
     let short = Duration::from_millis(500);
     let tick = Duration::from_millis(20);
@@ -5670,11 +5668,11 @@ fn a_claude_sign_in_on_a_bot_check_ends_naming_it_and_one_that_clears_goes_on() 
         ("reloading", Box::new(reloading)),
     ] {
         let (res, delivered, _, met) = drive_bot_check(state, short, tick);
-        assert_eq!(res, Err(BOT_CHECK_UNCLEARED), "{what}");
+        assert_eq!(res, Err(CHALLENGE_FAILED), "{what}");
         assert!(delivered.is_empty(), "{what}");
         assert_eq!(
             met,
-            Some(Met::new(MetWord::BotCheck, Some("claude.ai"))),
+            Some(Met::new(MetWord::ChallengeFailed, None)),
             "{what}"
         );
     }
@@ -5713,9 +5711,9 @@ fn a_claude_sign_in_on_a_bot_check_ends_naming_it_and_one_that_clears_goes_on() 
     let blocked = move |_: usize| at("block_page", "https://claude.ai/login");
     let (res, _, reads, met) =
         drive_bot_check(blocked, aterm_spec::wait::MUST_HAPPEN, Duration::ZERO);
-    assert_eq!(res, Err(BLOCK_PAGE_MET));
+    assert_eq!(res, Err(CHALLENGE_FAILED));
     assert_eq!(reads, 1, "a block page ends the drive at once");
-    assert_eq!(met, Some(Met::new(MetWord::BlockPage, Some("claude.ai"))));
+    assert_eq!(met, Some(Met::new(MetWord::ChallengeFailed, None)));
 
     let loading = move |_: usize| at("loading", "https://claude.com/cai/oauth/authorize?x=1");
     let elsewhere = move |n: usize| {

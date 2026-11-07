@@ -617,11 +617,7 @@ pub(crate) struct Launch {
 /// Start the worker's launcher.
 pub(crate) fn launch_worker(work: Launch) {
     if account_preparation_cancelled(&work) {
-        stall_why(
-            &work,
-            "held",
-            "account preparation stopped for shutdown or update",
-        );
+        stall_cancelled(&work);
         return;
     }
     let (ctx, local, agent) = (Arc::clone(&work.ctx), work.local, work.agent);
@@ -787,12 +783,23 @@ fn pooled_starter_held(
     starter: aterm_agent::harness::worker::Starter,
     cli: &aterm_agent::harness::worker::WorkerCli,
 ) -> Result<aterm_agent::harness::worker::Starter, String> {
-    pool_attempts(
-        || pooled_starter(starter.clone(), cli, work.local),
+    pool_launch_attempts(
+        |pick| pooled_starter(starter.clone(), cli, work.local, pick),
         || pool_opening(&PoolSeat::here()?.seat(), &starter, cli),
         PoolSeat::unix_now,
         pool_wait_for(work, "no account of its pool can take it now"),
     )
+}
+
+/// One worker invocation keeps its read allowance across every retry and hold.
+fn pool_launch_attempts<T>(
+    mut attempt: impl FnMut(&mut aterm_agent::harness::accounts_pool::LaunchPick) -> Result<T, String>,
+    opening: impl FnMut() -> Option<i64>,
+    now: impl Fn() -> Option<i64>,
+    wait: impl FnMut(&PoolWait) -> bool,
+) -> Result<T, String> {
+    let mut pick = aterm_agent::harness::accounts_pool::LaunchPick::for_worker_launch();
+    pool_attempts(|| attempt(&mut pick), opening, now, wait)
 }
 
 /// Where a pooled launch reads its pool ([`aterm_agent::harness::accounts_pool::Seat`]): this
@@ -896,11 +903,7 @@ impl NativeGoogleAdmission {
 
 fn run_worker_launch(work: &Launch) {
     if account_preparation_cancelled(work) {
-        stall_why(
-            work,
-            "held",
-            "account preparation stopped for shutdown or update",
-        );
+        stall_cancelled(work);
         return;
     }
     if let Some(run) = &work.program {
@@ -953,18 +956,14 @@ fn run_worker_launch(work: &Launch) {
                 let _google_mark =
                     native_google_agent(work.agent).then(|| InstallingMark::of(&work.ctx));
                 if account_preparation_cancelled(work) {
-                    return Err("account preparation stopped for shutdown or update".into());
+                    return Err(PREPARATION_CANCELLED.into());
                 }
                 NativeGoogleAdmission::prepare(work.agent, starter, work.account_scope.clone())
             })
         },
     );
     if admission.is_err() && account_preparation_cancelled(work) {
-        stall_why(
-            work,
-            "held",
-            "account preparation stopped for shutdown or update",
-        );
+        stall_cancelled(work);
         return;
     }
     let Some((admitted, google)) = take_admission(
@@ -976,17 +975,13 @@ fn run_worker_launch(work: &Launch) {
     ) else {
         return;
     };
-    let admitted = if found == (Found::Parent { lent: false }) {
+    let admitted = if matches!(found, Found::Parent { lent: false } | Found::Unread) {
         admitted.past_the_twin(cli, work.model.as_deref())
     } else {
         admitted
     };
     if account_preparation_cancelled(work) {
-        stall_why(
-            work,
-            "held",
-            "account preparation stopped for shutdown or update",
-        );
+        stall_cancelled(work);
         return;
     }
     let caller = admitted.starter();
@@ -1035,9 +1030,7 @@ fn run_worker_launch(work: &Launch) {
             };
             let typed = type_at_prompt(work, prompt, |prompt| {
                 if account_preparation_cancelled(work) {
-                    return Ok(Err(Untyped::Blocked(
-                        "account preparation stopped for shutdown or update".into(),
-                    )));
+                    return Ok(Err(Untyped::Blocked(PREPARATION_CANCELLED.into())));
                 }
                 #[cfg(unix)]
                 if let Some(source) = codex_source.as_ref()
@@ -1117,7 +1110,7 @@ fn run_program_launch(work: &Launch, run: &crate::program_worker::ProgramRun) {
     let prompt = match await_prompt(work, Duration::ZERO) {
         Ok(prompt) => prompt,
         Err(why) => {
-            stall_unprompted(work, &why);
+            stall(work, &why);
             return;
         }
     };
@@ -1594,7 +1587,7 @@ pub(crate) fn await_prompt(work: &Launch, settle: Duration) -> Result<PromptFenc
     let mut held = Held::default();
     loop {
         if account_preparation_cancelled(work) {
-            return Err("account preparation stopped for shutdown or update".to_string());
+            return Err(PREPARATION_CANCELLED.to_string());
         }
         if !session_alive(work) {
             return Err(SHELL_ENDED.to_string());
@@ -1684,7 +1677,8 @@ pub(crate) enum Untyped {
     /// why=shell` where the record still says `working`.
     Refused(String),
     /// Nothing in the shell or from a person stopped it, and the line could not be typed: `stalled
-    /// why=startup`, naming why ([`stall_refused`]).
+    /// why=startup`, naming why ([`stall_refused`]), or `why=cancelled` where a shutdown or update
+    /// stopped its launch ([`stall_cancelled`]).
     Blocked(String),
 }
 
@@ -1735,7 +1729,7 @@ pub(crate) fn type_at_prompt<E: std::fmt::Display>(
             }
             Ok(Err(Untyped::Blocked(why))) => {
                 if account_preparation_cancelled(work) {
-                    stall_why(work, "held", &why);
+                    stall_cancelled(work);
                 } else {
                     stall_refused(work, &why);
                 }
@@ -1767,9 +1761,7 @@ pub(crate) fn type_scoped_launch_line(
     scope: Option<&aterm_agent::harness::account_work::Scope>,
 ) -> Result<&'static str, Untyped> {
     if scope.is_some_and(|scope| scope.cancelled()) {
-        return Err(Untyped::Blocked(
-            "account preparation stopped for shutdown or update".into(),
-        ));
+        return Err(Untyped::Blocked(PREPARATION_CANCELLED.into()));
     }
     type_launch_line(store, sid, nonce, prompt, line)
 }
@@ -1968,19 +1960,29 @@ fn stall(work: &Launch, why: &str) {
     stall_task_shell(&work.ctx, work.local, why);
 }
 
-/// [`stall`] with the task record's `why=` word `word`, for a launch no shell or person stopped:
-/// it keeps the record's attention, as a closed account epoch asks nothing of anyone.
-fn stall_why(work: &Launch, word: &'static str, why: &str) {
-    note_launch(&work.ctx, format!("never typed ({why})"));
-    stall_task_why(&work.ctx, work.local, word, why);
+/// Stall a launch whose account preparation a shutdown or update cancelled: `why=cancelled`. No
+/// shell or person stopped it, so it raises no attention. The word is its own because no agent ran,
+/// and only a launch that holds an account scope can get it: the deadlines read `why=held` as a
+/// started worker's stall and reopen it when its screen moves
+/// ([`crate::harness_host`]'s `startups_of`), which would leave `working` a task nothing will type.
+fn stall_cancelled(work: &Launch) {
+    note_launch(&work.ctx, format!("never typed ({PREPARATION_CANCELLED})"));
+    stall_task_why(
+        &work.ctx,
+        work.local,
+        crate::task_record::WHY_CANCELLED,
+        PREPARATION_CANCELLED,
+    );
 }
 
 /// A launcher's wait for its prompt ([`await_prompt`]) ended with `why`. A shutdown or update that
-/// cancelled its account preparation says `why=held` and blames no shell; anything else ended the
-/// wait from the shell, a person or the task's own record ([`stall`]).
+/// cancelled its account preparation is [`stall_cancelled`] and blames no shell, whatever `why`
+/// says, since [`session_alive`] reads that cancellation as a shell's end; anything else ended the
+/// wait from the shell, a person or the task's own record ([`stall`]). A pool's wait ends here too
+/// where its shell went first ([`stall_gave_up`]).
 fn stall_unprompted(work: &Launch, why: &str) {
     if account_preparation_cancelled(work) {
-        stall_why(work, "held", why);
+        stall_cancelled(work);
     } else {
         stall(work, why);
     }
@@ -2037,6 +2039,9 @@ fn stall_refused(work: &Launch, why: &str) {
     stall_refused_task(&work.ctx, work.local, work.agent, why);
 }
 
+/// What a launcher says of a launch a shutdown or update stopped ([`stall_cancelled`]).
+const PREPARATION_CANCELLED: &str = "account preparation stopped for shutdown or update";
+
 /// Why a worker's launch never typed where its shell went first.
 const SHELL_ENDED: &str = "its shell ended before its line was typed";
 
@@ -2058,19 +2063,14 @@ pub(crate) fn session_alive(work: &Launch) -> bool {
             .is_some_and(|h| !matches!(h.state, SessionState::Exited))
 }
 
-/// A launcher that gave up waiting on a pool: its shell's end ends that wait too, and then the
-/// pool's refusal is not why ([`stall`]); otherwise it is ([`stall_refused`]).
+/// A launcher that gave up waiting on a pool. A live session means the pool's refusal is why
+/// ([`stall_refused`]). Otherwise its shell's end or a shutdown ended that wait, and the refusal is
+/// not why ([`stall_unprompted`]).
 pub(crate) fn stall_gave_up(work: &Launch, why: &str) {
-    if account_preparation_cancelled(work) {
-        stall_why(
-            work,
-            "held",
-            "account preparation stopped for shutdown or update",
-        );
-    } else if session_alive(work) {
+    if session_alive(work) {
         stall_refused(work, why);
     } else {
-        stall(work, SHELL_ENDED);
+        stall_unprompted(work, SHELL_ENDED);
     }
 }
 
@@ -2198,6 +2198,10 @@ enum Found {
     Front,
     /// None: the plain word under the shell's own.
     Plain,
+    /// Not known: the session it was asked of could not be read, or its status names the agent and
+    /// its process reads as none. The line lends nothing and keeps out of the twin's yolo
+    /// ([`aterm_agent::harness::worker::Admitted::past_the_twin`]).
+    Unread,
     /// None, in a worker no session started: `lent`, whether the session `ls` names as its parent
     /// lent it flags.
     Parent { lent: bool },
@@ -2213,6 +2217,7 @@ impl Found {
                  it yet"
             ),
             Self::Plain => format!("no {product} of a starter's: plain `{}`", agent.name()),
+            Self::Unread => format!("its starter's {product} could not be read: no flags lent"),
             Self::Parent { lent: true } => {
                 format!("no {product} of a starter's: its parent's flags")
             }
@@ -2230,9 +2235,12 @@ fn worker_starter_of(
     let found = work
         .caller
         .as_deref()
-        .and_then(|ctx| agent_of_session(work, ctx, cli));
-    let mut how = found.as_ref().map_or(Found::Plain, |(_, how)| *how);
-    let mut starter = line_starter(cli, found.map(|(s, _)| s));
+        .map_or(SessionAgent::None, |ctx| agent_of_session(work, ctx, cli));
+    let (mut starter, mut how) = match found {
+        SessionAgent::Read(starter, how) => (line_starter(cli, Some(starter)), how),
+        SessionAgent::None => (line_starter(cli, None), Found::Plain),
+        SessionAgent::Unread => (line_starter(cli, None), Found::Unread),
+    };
     // A worker no session started (the harness's own, or a spawn from outside a session) has as
     // its parent the session `ls` names: its program and login stay the worker's own, and its
     // permissions are that session's (owner ruling 2026-11-02), held to its CLI's floor as
@@ -2241,13 +2249,18 @@ fn worker_starter_of(
     // (`WorkerCli::unstarted`). A claim worker names its own mode and tools ([`worker_fresh`]).
     if work.caller.is_none()
         && !work.chrome
-        && let Some((parent, _)) =
-            parent_ctx(work).and_then(|ctx| agent_of_session(work, &ctx, cli))
+        && let Some(ctx) = parent_ctx(work)
     {
-        how = Found::Parent {
-            lent: parent.args.as_ref().is_ok_and(|args| !args.is_empty()),
-        };
-        starter.args = parent.args;
+        match agent_of_session(work, &ctx, cli) {
+            SessionAgent::Read(parent, _) => {
+                how = Found::Parent {
+                    lent: parent.args.as_ref().is_ok_and(|args| !args.is_empty()),
+                };
+                starter.args = parent.args;
+            }
+            SessionAgent::None => {}
+            SessionAgent::Unread => how = Found::Unread,
+        }
     }
     (starter, how)
 }
@@ -2259,6 +2272,19 @@ fn parent_ctx(work: &Launch) -> Option<Arc<SessionCtx>> {
     Some(store.by_sid(&parent)?.ctx.clone())
 }
 
+/// What reading a session for its agent of a worker's kind came to ([`agent_of_session`]).
+enum SessionAgent {
+    /// It runs one, which lends this, found so.
+    Read(aterm_agent::harness::worker::Starter, Found),
+    /// It runs none, as far as is read: another agent is named, no group is in front
+    /// ([`starter_front`]: a session that is gone, or one none can be read of), or what is in front
+    /// has ended, or was read and is no agent of the kind.
+    None,
+    /// What it runs is not known: a read failed, or its status names the agent and the group that
+    /// names reads as none.
+    Unread,
+}
+
 /// What session `ctx`'s agent of `cli`'s kind lends a worker's line, and how it was found, with
 /// the mode its permission pill shows now where it shows one, a Claude Code starter's route read
 /// at its folder and at the worker's own (the spawn's `cwd=`, else where the worker's shell
@@ -2267,36 +2293,45 @@ fn agent_of_session(
     work: &Launch,
     ctx: &SessionCtx,
     cli: &aterm_agent::harness::worker::WorkerCli,
-) -> Option<(aterm_agent::harness::worker::Starter, Found)> {
+) -> SessionAgent {
+    use aterm_agent::harness::worker::StarterRead;
     let (reader, named) = {
         let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         let agent = timeline.agent();
         (agent.reader, agent.program_pgid)
     };
-    let group = starter_group(reader, named, || starter_front(&work.store, ctx), cli.agent)?;
-    let pgid = match group {
-        StarterGroup::Named(g) | StarterGroup::Front(g) => g,
+    let Some(group) = starter_group(reader, named, || starter_front(&work.store, ctx), cli.agent)
+    else {
+        return SessionAgent::None;
     };
-    let pid = u32::try_from(pgid).ok().filter(|p| *p > 0)?;
-    let starter = aterm_agent::harness::worker::starter(
+    let (pgid, found) = match group {
+        StarterGroup::Named(g) => (g, Found::Named),
+        StarterGroup::Front(g) => (g, Found::Front),
+    };
+    let Some(pid) = u32::try_from(pgid).ok().filter(|p| *p > 0) else {
+        return SessionAgent::Unread;
+    };
+    let Some(home) = aterm_types::dirs::home_dir() else {
+        return SessionAgent::Unread;
+    };
+    let read = aterm_agent::harness::worker::starter(
         cli,
         pid,
-        &aterm_types::dirs::home_dir()?,
-        || crate::harness_host::screen_rows(&work.store, ctx.self_id.as_str()),
+        &home,
+        || crate::harness_host::live_screen_rows(&work.store, ctx.self_id.as_str()),
         || {
             work.trusted_cwd
                 .as_deref()
                 .map(PathBuf::from)
                 .or_else(|| shell_cwd(&work.store, &work.ctx))
         },
-    )?;
-    Some((
-        starter,
-        match group {
-            StarterGroup::Named(_) => Found::Named,
-            StarterGroup::Front(_) => Found::Front,
-        },
-    ))
+    );
+    match read {
+        StarterRead::Read(starter) => SessionAgent::Read(starter, found),
+        StarterRead::Unread => SessionAgent::Unread,
+        StarterRead::Other if found == Found::Named => SessionAgent::Unread,
+        StarterRead::Other => SessionAgent::None,
+    }
 }
 
 /// `starter` under the login its CLI's pool picks for a launch
@@ -2317,6 +2352,7 @@ fn pooled_starter(
     starter: aterm_agent::harness::worker::Starter,
     cli: &aterm_agent::harness::worker::WorkerCli,
     local: u64,
+    pick: &mut aterm_agent::harness::accounts_pool::LaunchPick,
 ) -> Result<aterm_agent::harness::worker::Starter, String> {
     use aterm_agent::harness::{accounts, accounts_pool};
     let Some(pool) = accounts::Cli::of(cli.agent) else {
@@ -2329,7 +2365,7 @@ fn pooled_starter(
     if pool == accounts::Cli::Claude {
         return Ok(claude_starter_in(starter, &seat, local));
     }
-    pooled_starter_in(starter, pool, &seat, &accounts_pool::LiveUsage, local)
+    pooled_starter_reading(starter, pool, &seat, &accounts_pool::LiveUsage, local, pick)
 }
 
 /// A Claude Code worker's `starter` onto the row of the Claude roster the host would move the
@@ -2443,6 +2479,7 @@ pub(crate) fn claude_worker_wall(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn pooled_starter_in(
     starter: aterm_agent::harness::worker::Starter,
     pool: aterm_agent::harness::accounts::Cli,
@@ -2450,7 +2487,25 @@ pub(crate) fn pooled_starter_in(
     read: aterm_agent::harness::accounts_pool::ReadUsage<'_>,
     local: u64,
 ) -> Result<aterm_agent::harness::worker::Starter, String> {
-    use aterm_agent::harness::{accounts, accounts_pool};
+    pooled_starter_reading(
+        starter,
+        pool,
+        seat,
+        read,
+        local,
+        &mut aterm_agent::harness::accounts_pool::LaunchPick::for_worker_launch(),
+    )
+}
+
+fn pooled_starter_reading(
+    starter: aterm_agent::harness::worker::Starter,
+    pool: aterm_agent::harness::accounts::Cli,
+    seat: &aterm_agent::harness::accounts_pool::Seat<'_>,
+    read: aterm_agent::harness::accounts_pool::ReadUsage<'_>,
+    local: u64,
+    pick: &mut aterm_agent::harness::accounts_pool::LaunchPick,
+) -> Result<aterm_agent::harness::worker::Starter, String> {
+    use aterm_agent::harness::accounts;
     let pairs: Vec<(&str, &str)> = starter
         .env
         .iter()
@@ -2486,7 +2541,7 @@ pub(crate) fn pooled_starter_in(
         };
         carried_row = Some(label.to_string());
     }
-    if let Some(pick) = accounts_pool::launch_env_for(seat, pool, read, Some(&starter.exe))? {
+    if let Some(pick) = pick.pick(seat, pool, read, Some(&starter.exe))? {
         let onto = pool_onto(starter, pool, &pick, seat.home)?;
         aterm_log::info!(
             "worker session {local}: starts under {} account {}",

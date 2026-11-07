@@ -78,6 +78,7 @@ impl Bench {
             },
             mailbox: &ladder_mailbox_files,
             log: Arc::new(move |line: &str| logged.lock().unwrap().push(line.to_owned())),
+            save_oauth: |_, _| Ok("inert".into()),
             shared: shared_renewal::Effects::default(),
             run_attempt: Some(Arc::new(move |browser: &RenewBrowser, _headless: bool| {
                 handed.lock().unwrap().push(browser.clone());

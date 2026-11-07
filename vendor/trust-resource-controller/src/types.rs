@@ -58,10 +58,38 @@ pub struct Delegations {
     pub fences: Vec<Descriptor>,
 }
 
+/// Request-role discriminator. Role 3 belongs to the maintained sealed
+/// metadata envelope; never reinterpret it as a linker continuation.
+pub const MACHO_LINKER_REQUEST_ROLE: u64 = 4;
+
+/// Syntax-only binding to an existing member's unit, not a quiescence proof,
+/// recovery capability, or permission to acquire another CPU credit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Loan {
+    /// Existing compiler member, never the original root or new child attempt.
+    pub parent_attempt: [u8; 16],
+    /// One non-replayable loan identity; not a recovery or allocation capability.
+    pub nonce: [u8; 16],
+    /// Observation to match against the parent's actual held primary lease.
+    pub cpu_slot: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     MetadataVersion,
     Compile,
+    /// Exact bounded paired-compiler sysroot or built-in target inventory query.
+    MetadataProbe,
+    /// Separately negotiated sealed native metadata member. The envelope is
+    /// `SealedMetadataRequest`; neither this tag nor decoding grants admission.
+    SealedMetadata,
+    /// One charged CPU unit lent by an independently quiescent compiler member.
+    /// Host authentication, durable custody and strict paired linker validation
+    /// remain mandatory; these syntax fields grant no execution authority.
+    MachOLinker(Loan),
+    /// Closed compiler queries under a separately ready resolver root. The
+    /// SealedResolverQueryRequest envelope is mandatory; data grants nothing.
+    ResolverQuery,
 }
 
 /// One attempt. Unknown delivery must never cause this request to be replayed.

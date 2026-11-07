@@ -32,7 +32,7 @@ pub const VERBS: &[Verb] = &[
     Verb {
         name: "canary",
         synopsis: crate::canary::SYNOPSIS,
-        does: "install and execute the signed staged Trust pack; sign integrity evidence and consumer reports without publishing",
+        does: "install and execute the signed staged Trust pack, or stage its existing signed receipt without changing the index",
     },
     Verb {
         name: "pack",
@@ -102,8 +102,8 @@ pub const VERBS: &[Verb] = &[
     },
     Verb {
         name: "lane",
-        synopsis: "lane run <alab|linux> [--dry-run] [--sha256 HEX] [--log FILE] [--triple T]… | lane install <alab|linux> [--allow-dirty] [--no-arm] [--keyless] [--host gh|agh-staging|agh] | lane disarm <alab|linux>",
-        does: "run, install or disarm an unattended lane (--triple and --keyless: linux only; a run without --dry-run needs its installed unit's --sha256)",
+        synopsis: "lane stage linux --reuse-package PKG… | lane run <alab|linux> [--dry-run] [--sha256 HEX] [--log FILE] [--triple T]… | lane install <alab|linux> [--allow-dirty] [--no-arm] [--keyless] [--host gh|agh-staging|agh] | lane disarm <alab|linux>",
+        does: "stage retained GNU bottles unsigned, or run/install/disarm a lane (a run without --dry-run needs its installed unit's --sha256)",
     },
     Verb {
         name: "hosts",

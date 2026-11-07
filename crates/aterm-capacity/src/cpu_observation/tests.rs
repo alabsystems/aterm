@@ -24,6 +24,32 @@ fn eventually<T>(what: &str, mut step: impl FnMut() -> Option<T>) -> T {
     }
 }
 
+/// A pool's folder, inside a private one of the test's own. A pool's reader resolves the
+/// account selector beside the pool, and that selector's parent must be a folder of this
+/// user's that no one else may write: Linux's `/tmp` is root's and world-writable.
+struct PoolDir {
+    dir: aterm_tempfile::TempDir,
+    _parent: aterm_tempfile::TempDir,
+}
+
+impl PoolDir {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+fn pool_dir() -> PoolDir {
+    let parent = aterm_tempfile::Builder::new()
+        .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+        .unwrap();
+    PoolDir {
+        dir: aterm_tempfile::Builder::new()
+            .tempdir_in(parent.path())
+            .unwrap(),
+        _parent: parent,
+    }
+}
+
 fn pool(dir: &Path, slots: u32) -> Pool {
     eventually(
         "the pool opener's inherited initialization lock to close",
@@ -36,9 +62,7 @@ fn pool(dir: &Path, slots: u32) -> Pool {
 
 #[test]
 fn an_absent_pool_is_reported_without_creating_files() {
-    let dir = aterm_tempfile::Builder::new()
-        .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
-        .unwrap();
+    let dir = pool_dir();
     let missing = dir.path().join("missing");
     assert_eq!(CpuObservation::read(Some(&missing)), CpuObservation::Absent);
     assert!(!missing.exists());
@@ -55,9 +79,7 @@ fn an_absent_pool_is_reported_without_creating_files() {
 
 #[test]
 fn held_slots_follow_kernel_locks_and_not_stale_owner_records() {
-    let dir = aterm_tempfile::Builder::new()
-        .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
-        .unwrap();
+    let dir = pool_dir();
     let pool = pool(dir.path(), 2);
     let owner = Owner::current(Some(7));
     let lease = eventually("a lease after the opener's last copy closes", || match pool
@@ -98,9 +120,7 @@ fn held_slots_follow_kernel_locks_and_not_stale_owner_records() {
 
 #[test]
 fn an_initializer_is_reported_without_waiting_for_its_lock() {
-    let dir = aterm_tempfile::Builder::new()
-        .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
-        .unwrap();
+    let dir = pool_dir();
     let pool = pool(dir.path(), 1);
     let _initializer = eventually("the initializer's last inherited copy to close", || {
         let file = std::fs::OpenOptions::new()
@@ -126,9 +146,7 @@ fn an_initializer_is_reported_without_waiting_for_its_lock() {
 
 #[test]
 fn a_corrupt_pool_is_unreadable_and_is_not_repaired() {
-    let dir = aterm_tempfile::Builder::new()
-        .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
-        .unwrap();
+    let dir = pool_dir();
     let pool = pool(dir.path(), 1);
     let manifest = pool.path().join("pool");
     std::fs::write(&manifest, "invalid").unwrap();
@@ -165,9 +183,7 @@ fn retirement(dir: &Path) -> Option<(RetiredDirectory, crate::build_cpu::LegacyR
 #[test]
 fn retained_external_units_are_not_reported_free_after_owner_close() {
     use crate::build_cpu::ExternalDebt;
-    let dir = aterm_tempfile::Builder::new()
-        .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
-        .unwrap();
+    let dir = pool_dir();
     let Some((_restore, retired)) = retirement(dir.path()) else {
         return;
     };
@@ -201,9 +217,7 @@ fn retained_external_units_are_not_reported_free_after_owner_close() {
 #[test]
 fn adopted_scope_refuses_absent_partial_or_unvalidated_debt() {
     use crate::build_cpu::ExternalDebt;
-    let dir = aterm_tempfile::Builder::new()
-        .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
-        .unwrap();
+    let dir = pool_dir();
     let Some((_restore, retired)) = retirement(dir.path()) else {
         return;
     };
@@ -235,9 +249,7 @@ fn adopted_scope_refuses_absent_partial_or_unvalidated_debt() {
 
 #[test]
 fn admission_transaction_busy_has_no_capacity_counts() {
-    let dir = aterm_tempfile::Builder::new()
-        .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
-        .unwrap();
+    let dir = pool_dir();
     let pool = pool(dir.path(), 2);
     let _lock = aterm_uds::file_lock::LockFile::take_existing(
         &pool.path().join("pool"),
@@ -253,9 +265,7 @@ fn admission_transaction_busy_has_no_capacity_counts() {
 #[test]
 fn activated_debt_refuses_raw_new_clients_and_remains_fully_reserved() {
     use crate::build_cpu::ExternalDebt;
-    let dir = aterm_tempfile::Builder::new()
-        .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
-        .unwrap();
+    let dir = pool_dir();
     let Some((_restore, retired)) = retirement(dir.path()) else {
         return;
     };

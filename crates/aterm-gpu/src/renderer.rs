@@ -4856,59 +4856,6 @@ struct ShimmerRegion {
     heat: [f32; SHIMMER_BANDS],
 }
 
-/// One of the effect-only cell pipelines, ordered by [`EFFECT_PIPELINE_NAMES`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[repr(usize)]
-pub enum EffectPipeline {
-    CursorBlend = 0,
-    GlowAdd = 1,
-    RainGlow = 2,
-    RainGlowOver = 3,
-    FireAdd = 4,
-    FireOver = 5,
-    DecoOver = 6,
-    DecoAdd = 7,
-    SpriteOver = 8,
-    Fx = 9,
-    FxLinear = 10,
-    FxStore = 11,
-}
-
-/// How many effect pipelines exist.
-pub const EFFECT_PIPELINE_COUNT: usize = 12;
-
-/// Names of the [`EFFECT_PIPELINE_COUNT`] slots, in [`EffectPipeline`] order.
-pub const EFFECT_PIPELINE_NAMES: [&str; EFFECT_PIPELINE_COUNT] = [
-    "cursor_blend",
-    "glow_add",
-    "rain_glow",
-    "rain_glow_over",
-    "fire_add",
-    "fire_over",
-    "deco_over",
-    "deco_add",
-    "sprite_over",
-    "fx",
-    "fx_linear",
-    "fx_store",
-];
-
-/// Every [`EffectPipeline`], in slot order.
-pub const EFFECT_PIPELINES: [EffectPipeline; EFFECT_PIPELINE_COUNT] = [
-    EffectPipeline::CursorBlend,
-    EffectPipeline::GlowAdd,
-    EffectPipeline::RainGlow,
-    EffectPipeline::RainGlowOver,
-    EffectPipeline::FireAdd,
-    EffectPipeline::FireOver,
-    EffectPipeline::DecoOver,
-    EffectPipeline::DecoAdd,
-    EffectPipeline::SpriteOver,
-    EffectPipeline::Fx,
-    EffectPipeline::FxLinear,
-    EffectPipeline::FxStore,
-];
-
 impl GpuRenderer {
     /// Acquire a GPU and a CPU font face.
     #[cfg(not(target_arch = "wasm32"))]
@@ -4971,7 +4918,12 @@ impl GpuRenderer {
             );
             cpu
         });
+        let context_started = aterm_time::Instant::now();
         let ctx = GpuContext::new_with_policy(device_policy)?;
+        crate::startup_probe::record(
+            crate::startup_probe::Leg::Context,
+            context_started.elapsed(),
+        );
         let font_join_started = aterm_time::Instant::now();
         let cpu = font_handle
             .join()
@@ -4999,14 +4951,6 @@ impl GpuRenderer {
             crate::DevicePolicy::Windowed => &crate::metal::warm::FIRST_FRAME,
             crate::DevicePolicy::Headless => &crate::metal::warm::HEADLESS_FIRST_FRAME,
         };
-
-        let uniform_atlas_started = aterm_time::Instant::now();
-        crate::startup_probe::record(
-            crate::startup_probe::Leg::PipeUniformAtlas,
-            uniform_atlas_started.elapsed(),
-        );
-
-        let pipe_tail_started = aterm_time::Instant::now();
         let renderer = Self {
             ctx,
             cpu,
@@ -5135,11 +5079,7 @@ impl GpuRenderer {
             last_frame_scissor: None,
         };
         crate::startup_probe::record(
-            crate::startup_probe::Leg::PipeTail,
-            pipe_tail_started.elapsed(),
-        );
-        crate::startup_probe::record(
-            crate::startup_probe::Leg::PipeTotal,
+            crate::startup_probe::Leg::Assemble,
             from_parts_started.elapsed(),
         );
         Ok(renderer)
@@ -6517,18 +6457,19 @@ impl GpuRenderer {
 
     #[must_use]
     fn pack_image_plane(items: &[(u32, u32, u32, &[u8])], tw: u32, th: u32) -> Vec<u8> {
-        let mut data = vec![0u8; (tw * th * 4) as usize];
+        // In usize: a u32 `tw * th * 4` wraps at 2^32 bytes.
+        let stride = tw as usize * 4;
+        let mut data = vec![0u8; stride * th as usize];
         for &(y0, dw, dh, rgba) in items {
-            if dw == tw {
-                let dst = (y0 * tw) as usize * 4;
-                let len = (dw * dh * 4) as usize;
+            let (y0, row, dh) = (y0 as usize, dw as usize * 4, dh as usize);
+            if row == stride {
+                let dst = y0 * stride;
+                let len = row * dh;
                 data[dst..dst + len].copy_from_slice(&rgba[..len]);
             } else {
                 for y in 0..dh {
-                    let src = (y * dw * 4) as usize;
-                    let dst = ((y0 + y) * tw) as usize * 4;
-                    data[dst..dst + (dw * 4) as usize]
-                        .copy_from_slice(&rgba[src..src + (dw * 4) as usize]);
+                    let (src, dst) = (y * row, (y0 + y) * stride);
+                    data[dst..dst + row].copy_from_slice(&rgba[src..src + row]);
                 }
             }
         }
@@ -13699,6 +13640,27 @@ mod tests {
     use aterm_render::{FaceId, GlowQuad, GlyphClass, StyleBits};
 
     use super::{FRAME_GROUPS, GROUP_SRGB, WindowGpu};
+
+    /// A cold build through `new_loading`, which every native constructor runs, records every
+    /// startup leg, so no leg the GUI reads (`startup_gpu_*`) is a 0 nothing timed. A host with
+    /// no GPU or no system monospace font could not run it.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_cold_build_records_every_startup_leg() {
+        use super::{GpuContext, GpuRenderer, Renderer, Theme};
+        use crate::startup_probe::{Leg, leg_ns};
+        if let Err(e) = GpuContext::new_headless() {
+            aterm_spec::host::could_not_run(format!("no GPU: {e}"));
+        }
+        if Renderer::from_system(16.0, Theme::default()).is_none() {
+            aterm_spec::host::could_not_run("no system monospace font");
+        }
+        let _gpu = GpuRenderer::new_headless(16.0, Theme::default())
+            .expect("a host with a GPU and a font builds a renderer");
+        for leg in [Leg::Context, Leg::FontThread, Leg::FontJoin, Leg::Assemble] {
+            assert_ne!(leg_ns(leg), 0, "{leg:?} was not recorded");
+        }
+    }
 
     /// A MOTION FRAME'S ROWS UPLOAD WITHOUT A COMPARE (MOT-1): rows a card names as all it
     /// changed since the card held upload as named, clamped to the card, and none where they

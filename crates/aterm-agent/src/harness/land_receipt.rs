@@ -16,11 +16,17 @@
 //! (limit 5): the journal, and, from slice 9c, the window's surfaces
 //! (`crate::supervise::mode_words::checked_words`), `status` and the task record's `checked=`
 //! ([`LandReceipt::checked_word`]).
+//!
+//! On main, the receipt also records what the commit it names states of how it was judged
+//! ([`Statement`]; design B10, `docs/DESIGN-fast-build-release-2026-11-05.md` §4.6): the trailers
+//! `targo --unverified verify land` writes on the merge it pushes. A commit that states none is
+//! recorded as [`Statement::Missing`] and lands as any other.
 
 use super::acts::FACT_SEPARATOR;
 use super::repo_work::RepoRead;
 use crate::supervise::policy::land_check::RULE_LAND_CHECK;
 use crate::supervise::policy::turn_end::RULE_LAND;
+use aterm_types::land_trailer;
 
 /// How many hex digits of `HEAD` a receipt names, on every surface.
 pub const HEAD_DIGITS: usize = 12;
@@ -107,6 +113,121 @@ impl ReceiptLeg {
     }
 }
 
+/// What the commit a receipt names states of how it was judged (design B10): the trailers
+/// `targo --unverified verify land` writes on the merge it pushes ([`land_trailer`]), as one
+/// record. It states what ran; nothing the loop decides reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Statement {
+    /// Not read: a leg other than [`ReceiptLeg::OnMain`], a trailer read git refused or the
+    /// probe's deadline cut, or a reading taped (a receipt journaled) before the probe read one.
+    #[default]
+    Unread,
+    /// Read, and the commit states no whole receipt: it did not land through `verify land` (a
+    /// malformed trailer states none, [`land_trailer::Stated::of_trailers`]).
+    Missing,
+    /// Read: what the commit states.
+    Stated(Judgment),
+}
+
+/// A stated receipt as a landing records it ([`Statement::Stated`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Judgment {
+    /// The tree the last judgment ran on, as [`HEAD_DIGITS`] lowercase hex digits.
+    pub tree: String,
+    /// How often a moved main was merged and the branch judged again
+    /// ([`land_trailer::Stated::rejudges`]).
+    pub rejudges: u32,
+    /// The main commit the last judgment was composed onto, as [`HEAD_DIGITS`] lowercase hex
+    /// digits; empty where it landed as judged.
+    pub onto: String,
+    /// How many red items main already had outside the branch the landing inherited.
+    pub inherited: u32,
+    /// Every judgment's wall seconds, summed.
+    pub secs: u64,
+}
+
+impl Statement {
+    /// What git's `%(trailers:only,unfold)` output `text` (a commit's trailer lines) states:
+    /// [`Self::Missing`] unless it holds a whole receipt.
+    #[must_use]
+    pub fn of_trailers(text: &str) -> Self {
+        let Some(stated) = land_trailer::Stated::of_trailers(text) else {
+            return Self::Missing;
+        };
+        let Some(last) = stated.checked.last() else {
+            return Self::Missing;
+        };
+        let digits = |id: &str| id.get(..HEAD_DIGITS).unwrap_or(id).to_owned();
+        Self::Stated(Judgment {
+            tree: digits(&last.tree),
+            rejudges: u32::try_from(stated.rejudges()).unwrap_or(u32::MAX),
+            onto: stated
+                .composed_onto
+                .as_deref()
+                .map(digits)
+                .unwrap_or_default(),
+            inherited: u32::try_from(stated.inherited.len()).unwrap_or(u32::MAX),
+            secs: stated
+                .checked
+                .iter()
+                .fold(0u64, |sum, checked| sum.saturating_add(checked.secs)),
+        })
+    }
+
+    /// Its word in the journal's `stated=` and a tape's: `none` for [`Self::Missing`],
+    /// `<tree>/<rejudges>/<onto|->/<inherited>/<secs>` for [`Self::Stated`]; `None` for
+    /// [`Self::Unread`], which writes no token.
+    #[must_use]
+    pub fn word(&self) -> Option<String> {
+        match self {
+            Self::Unread => None,
+            Self::Missing => Some(STATED_NONE.to_owned()),
+            Self::Stated(j) => Some(format!(
+                "{}/{}/{}/{}/{}",
+                j.tree,
+                j.rejudges,
+                if j.onto.is_empty() { "-" } else { &j.onto },
+                j.inherited,
+                j.secs
+            )),
+        }
+    }
+
+    /// The statement whose [`Self::word`] `word` is, written exactly so; `None` for any other.
+    #[must_use]
+    pub fn of_word(word: &str) -> Option<Self> {
+        if word == STATED_NONE {
+            return Some(Self::Missing);
+        }
+        let mut parts = word.split('/');
+        let mut part = || parts.next();
+        let head12 = |s: &str| s.len() == HEAD_DIGITS && is_head(s);
+        let tree = part().filter(|s| head12(s))?.to_owned();
+        let rejudges = part()?.parse().ok()?;
+        let onto = match part()? {
+            "-" => String::new(),
+            onto if head12(onto) => onto.to_owned(),
+            _ => return None,
+        };
+        let inherited = part()?.parse().ok()?;
+        let secs = part()?.parse().ok()?;
+        if part().is_some() {
+            return None;
+        }
+        let read = Self::Stated(Judgment {
+            tree,
+            rejudges,
+            onto,
+            inherited,
+            secs,
+        });
+        (read.word().as_deref() == Some(word)).then_some(read)
+    }
+}
+
+/// [`Statement::Missing`]'s word.
+const STATED_NONE: &str = "none";
+
 /// What aterm checked at one landing, and what the agent said of it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct LandReceipt {
@@ -140,6 +261,9 @@ pub struct LandReceipt {
     /// When the landing was read, unix ms: the wall its `DONE` note was made at (a landing a
     /// loop before this one noted keeps that one's first time).
     pub at_ms: i64,
+    /// What `HEAD` states of how it was judged, on [`ReceiptLeg::OnMain`] (design B10);
+    /// [`Statement::Unread`] on every other leg and on a receipt journaled before it was read.
+    pub statement: Statement,
 }
 
 impl LandReceipt {
@@ -176,6 +300,11 @@ impl LandReceipt {
                     check: false,
                     said,
                     at_ms,
+                    statement: if leg == ReceiptLeg::OnMain {
+                        at.statement.clone()
+                    } else {
+                        Statement::Unread
+                    },
                 })
             }
             RepoRead::Clean => Some(Self {
@@ -209,8 +338,10 @@ impl LandReceipt {
 
     /// Its line in the journal, under the landing's `DONE` note of point `seq`:
     /// `RECEIPT seq=<n> rule=land@v1 head=<12 hex|-> on=<ref|-> leg=<word>
-    /// check=<land-check@v1|-> repo=<pct|-> [branch=<pct>] <said>`, `branch=` only where a branch
-    /// is named (slice 9c; a line written before it has none, and reads back with none).
+    /// check=<land-check@v1|-> repo=<pct|-> [branch=<pct>] [stated=<word>] <said>`, `branch=`
+    /// only where a branch is named (slice 9c; a line written before it has none, and reads back
+    /// with none), `stated=` only where the statement was read ([`Statement::word`]; a line
+    /// written before it has none, and reads back unread).
     #[must_use]
     pub fn line(&self, seq: u64) -> String {
         let or_dash = |s: &str| {
@@ -232,6 +363,10 @@ impl LandReceipt {
             line
         } else {
             format!("{line} branch={}", aterm_codec::pct::encode(&self.branch))
+        };
+        let line = match self.statement.word() {
+            Some(word) => format!("{line} stated={word}"),
+            None => line,
         };
         if self.said.is_empty() {
             line
@@ -272,20 +407,31 @@ impl LandReceipt {
             Some(_) => return None,
         };
         let repo = undash(field("repo")?);
-        let (branch, said) = match rest.strip_prefix("branch=") {
+        let branch = match rest.strip_prefix("branch=") {
             Some(named) => {
-                let (branch, said) = named.split_once(' ').unwrap_or((named, ""));
-                (aterm_codec::pct::decode(branch), said.to_owned())
+                let (branch, after) = named.split_once(' ').unwrap_or((named, ""));
+                rest = after;
+                aterm_codec::pct::decode(branch)
             }
-            None => (String::new(), rest.to_owned()),
+            None => String::new(),
         };
+        let statement = match rest.strip_prefix("stated=") {
+            Some(named) => {
+                let (word, after) = named.split_once(' ').unwrap_or((named, ""));
+                rest = after;
+                Statement::of_word(word)?
+            }
+            None => Statement::Unread,
+        };
+        let said = rest.to_owned();
         let named = !head.is_empty() && !repo.is_empty();
         let shaped = match leg {
             ReceiptLeg::NoRepo => head.is_empty() && main_ref.is_empty() && repo.is_empty(),
             ReceiptLeg::OnMain => named && !main_ref.is_empty(),
             ReceiptLeg::Pushed | ReceiptLeg::NoRemote => named && main_ref.is_empty(),
             ReceiptLeg::Gone => head.is_empty() && main_ref.is_empty() && !repo.is_empty(),
-        } && (branch.is_empty() || leg == ReceiptLeg::OnMain);
+        } && (branch.is_empty() || leg == ReceiptLeg::OnMain)
+            && (statement == Statement::Unread || leg == ReceiptLeg::OnMain);
         let head_ok = matches!(leg, ReceiptLeg::NoRepo | ReceiptLeg::Gone)
             || (head.len() == HEAD_DIGITS && is_head(&head));
         let kept = said_of_line(&said) == said;
@@ -300,6 +446,7 @@ impl LandReceipt {
                 check,
                 said,
                 at_ms,
+                statement,
             },
         ))
     }

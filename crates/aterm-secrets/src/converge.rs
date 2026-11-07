@@ -35,6 +35,28 @@ pub const WINDOW: &str = "window";
 /// The first-launch Secrets stage's `--trigger` word (`aterm_machines::sync::Trigger::Setup`).
 pub const SETUP: &str = "setup";
 
+/// Requested repository work, never authority over a source, checkout or effect.
+/// Coalescing keeps the stronger request while one runner owns the job.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RepositoryWork {
+    /// Repair local readiness and missing work without forcing a remote refresh.
+    #[default]
+    Repair,
+    /// Also refresh eligible clean checkouts against their admitted origins.
+    Refresh,
+}
+
+impl RepositoryWork {
+    /// The runner's `--repository-work` argument.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Repair => "repair",
+            Self::Refresh => "refresh",
+        }
+    }
+}
+
 /// How long after it started a runner the subscriber starts another on the same routes: the
 /// pass's own recheck (`aterm_machines::sync::RECHECK`).
 pub const RECHECK_MS: u64 = 30 * 60 * 1000;
@@ -45,7 +67,7 @@ pub const FIRST_RETRY_MS: u64 = 5 * 1000;
 pub const LONGEST_RETRY_MS: u64 = 5 * 60 * 1000;
 
 /// The runner for `trigger` (`subscriber`, `window` or `setup`): `exe init --converge --trigger
-/// <trigger>`, reading and writing nothing of its starter's (stdio null), in a session of its
+/// <trigger> --repository-work <work>`, reading and writing nothing of its starter's (stdio null), in a session of its
 /// own (`setsid`), so a launchd job's restart, which ends its process group, or a terminal's
 /// hangup does not end a pass midway. The [`SUBSCRIBER`]'s runner starts out of its starter's
 /// background band ([`aterm_uds::spawnfd::Command::leave_background_band`]): the vault
@@ -57,10 +79,17 @@ pub const LONGEST_RETRY_MS: u64 = 5 * 60 * 1000;
 /// starts with its starter's process type, in no band, and holds its threads at utility.
 /// Responsibility is never disclaimed: the runner's privacy-gated acts stay the starting app's.
 #[must_use]
-pub fn runner(exe: &Path, trigger: &str) -> Command {
+pub fn runner(exe: &Path, trigger: &str, work: RepositoryWork) -> Command {
     let mut command = aterm_uds::spawnfd::command(exe);
     command
-        .args(["init", "--converge", "--trigger", trigger])
+        .args([
+            "init",
+            "--converge",
+            "--trigger",
+            trigger,
+            "--repository-work",
+            work.word(),
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -74,8 +103,8 @@ pub fn runner(exe: &Path, trigger: &str) -> Command {
 ///
 /// # Errors
 /// The runner could not be started.
-pub fn start(exe: &Path, trigger: &str) -> std::io::Result<Child> {
-    runner(exe, trigger).spawn()
+pub fn start(exe: &Path, trigger: &str, work: RepositoryWork) -> std::io::Result<Child> {
+    runner(exe, trigger, work).spawn()
 }
 
 /// This Mac's routes as the subscriber compares them (`crate::server::route_sources`).
@@ -174,10 +203,15 @@ impl RunnerRetry {
 /// bounded backoff; every time here is elapsed milliseconds on the subscriber's monotonic clock.
 #[derive(Debug, Default)]
 pub struct Due {
-    /// When the last runner started on the subscriber's monotonic clock, and the routes then.
+    /// When the last Refresh runner started, and the routes then. Repair attempts
+    /// never postpone the ordinary remote refresh.
     started: Option<(u64, Routes)>,
     /// A start came due while the last runner ran, or the last one found the lock held.
-    owed: bool,
+    pending: Option<RepositoryWork>,
+    /// The last chosen run, retained until its terminal result and used by the starter.
+    repository_work: RepositoryWork,
+    /// Failed work waits for RunnerRetry, unless new work starts a stronger combined run.
+    retry_work: Option<RepositoryWork>,
     /// A pass failed since the last healthy one ([`Due::failed`]).
     failing: bool,
     retry: RunnerRetry,
@@ -186,18 +220,24 @@ pub struct Due {
 impl Due {
     /// Service the same job while another subscriber lane is waiting on HTTP.
     pub(crate) fn poll(&mut self, now_ms: u64, routes: Routes, last: Last) -> bool {
-        self.start(false, now_ms, routes, last)
+        self.start(None, now_ms, routes, last)
     }
 
     /// Verified local member admission may have delivered work independently of HTTP.
-    pub(crate) fn after_local_progress(&mut self, now_ms: u64, routes: Routes, last: Last) -> bool {
-        self.start(true, now_ms, routes, last)
+    pub(crate) fn after_local_progress(
+        &mut self,
+        work: RepositoryWork,
+        now_ms: u64,
+        routes: Routes,
+        last: Last,
+    ) -> bool {
+        self.start(Some(work), now_ms, routes, last)
     }
 
     /// Whether the subscriber starts a runner as it starts: always, unless one it started still
     /// runs (none can yet), at `now_ms` with `routes`.
     pub fn at_start(&mut self, now_ms: u64, routes: Routes, last: Last) -> bool {
-        self.start(true, now_ms, routes, last)
+        self.start(Some(RepositoryWork::Refresh), now_ms, routes, last)
     }
 
     /// Whether the subscriber starts a runner after a healthy pass that ended with `outcome`, at
@@ -211,7 +251,12 @@ impl Due {
     ) -> bool {
         let applied = matches!(outcome, SyncOutcome::Applied { .. });
         let back = std::mem::take(&mut self.failing);
-        self.start(applied || back, now_ms, routes, last)
+        self.start(
+            (applied || back).then_some(RepositoryWork::Repair),
+            now_ms,
+            routes,
+            last,
+        )
     }
 
     /// Local progress while the source remains unavailable can need a runner,
@@ -225,7 +270,7 @@ impl Due {
     ) -> bool {
         self.failed();
         self.start(
-            matches!(outcome, SyncOutcome::Applied { .. }),
+            matches!(outcome, SyncOutcome::Applied { .. }).then_some(RepositoryWork::Repair),
             now_ms,
             routes,
             last,
@@ -238,30 +283,75 @@ impl Due {
     }
 
     /// Keep one reaped runner's outcome even while the vault source is unavailable. Successful
-    /// completion ends the failure streak; a held lock stays owed without consuming backoff.
+    /// completion ends its failure streak; a held lock stays owed without consuming backoff.
+    /// A Repair that ran beside deferred Refresh debt cannot retire or reschedule that debt.
     pub fn reaped(&mut self, last: Last, now_ms: u64) {
+        if self.repository_work == RepositoryWork::Repair
+            && self.retry_work == Some(RepositoryWork::Refresh)
+        {
+            if last == Last::Held {
+                self.pending = self.pending.max(Some(RepositoryWork::Repair));
+            }
+            return;
+        }
         self.retry.reaped(last, now_ms);
-        self.owed |= last == Last::Held;
+        match last {
+            Last::Failed | Last::Unfinished => {
+                self.retry_work = self.retry_work.max(Some(self.repository_work));
+            }
+            Last::Held => {
+                self.pending = self.pending.max(Some(self.repository_work));
+            }
+            Last::Ended => self.retry_work = None,
+            Last::None | Last::Running => {}
+        }
     }
 
-    fn start(&mut self, called: bool, now_ms: u64, routes: Routes, last: Last) -> bool {
+    /// The work selected by the latest pacing method that returned true.
+    #[must_use]
+    pub fn repository_work(&self) -> RepositoryWork {
+        self.repository_work
+    }
+
+    fn start(
+        &mut self,
+        called: Option<RepositoryWork>,
+        now_ms: u64,
+        routes: Routes,
+        last: Last,
+    ) -> bool {
         self.reaped(last, now_ms);
-        let due = called
-            || self.owed
-            || self.retry.due(now_ms)
-            || self
-                .started
-                .is_none_or(|(at, was)| was != routes || now_ms < at || now_ms - at >= RECHECK_MS);
-        if !due {
+        let refresh_due = self
+            .started
+            .is_none_or(|(at, was)| was != routes || now_ms < at || now_ms - at >= RECHECK_MS);
+        self.pending = self
+            .pending
+            .max(called)
+            .max(refresh_due.then_some(RepositoryWork::Refresh));
+        if self.pending.is_none() && !self.retry.due(now_ms) {
             return false;
         }
         if last == Last::Running {
-            self.owed = true;
             return false;
         }
-        self.owed = false;
-        self.retry.started();
-        self.started = Some((now_ms, routes));
+        let pending = self.pending.take();
+        // A checkout wake can be repaired now without repeating a failed remote refresh.
+        // Only its own deadline, or a new Refresh request, consumes that stronger debt.
+        let consume_retry = self.retry.due(now_ms)
+            || pending == Some(RepositoryWork::Refresh)
+            || self.retry_work != Some(RepositoryWork::Refresh);
+        let retry_work = if consume_retry {
+            self.retry_work.take()
+        } else {
+            None
+        };
+        self.repository_work = pending.max(retry_work).unwrap_or_default();
+        if consume_retry {
+            self.retry.started();
+        }
+        if self.repository_work == RepositoryWork::Refresh {
+            self.started = Some((now_ms, routes));
+        }
         true
     }
 }
@@ -440,6 +530,92 @@ mod tests {
         assert!(!due.after_pass(&unchanged(), 15_007, HOME, Last::Ended));
     }
 
+    #[test]
+    fn local_repairs_and_unrelated_versions_do_not_postpone_the_remote_recheck() {
+        let mut due = Due::default();
+        assert!(due.at_start(0, HOME, Last::None));
+        assert_eq!(due.repository_work(), RepositoryWork::Refresh);
+        assert!(due.after_pass(&applied(), 1, HOME, Last::Ended));
+        assert_eq!(due.repository_work(), RepositoryWork::Repair);
+        due.failed();
+        assert!(due.after_pass(&unchanged(), 2, HOME, Last::Ended));
+        assert_eq!(due.repository_work(), RepositoryWork::Repair);
+        assert!(due.after_local_progress(
+            RepositoryWork::Repair,
+            RECHECK_MS - 1,
+            HOME,
+            Last::Ended
+        ));
+        assert_eq!(due.repository_work(), RepositoryWork::Repair);
+        assert!(due.poll(RECHECK_MS, HOME, Last::Ended));
+        assert_eq!(due.repository_work(), RepositoryWork::Refresh);
+    }
+
+    #[test]
+    fn pending_and_held_work_keeps_the_strongest_refresh_request() {
+        let mut due = Due::default();
+        assert!(due.at_start(0, HOME, Last::None));
+        assert!(due.after_local_progress(RepositoryWork::Repair, 1, HOME, Last::Ended));
+        assert_eq!(due.repository_work(), RepositoryWork::Repair);
+        assert!(!due.after_local_progress(RepositoryWork::Refresh, 2, HOME, Last::Running));
+        assert!(!due.after_local_progress(RepositoryWork::Repair, 3, HOME, Last::Running));
+        assert!(due.poll(4, HOME, Last::Ended));
+        assert_eq!(due.repository_work(), RepositoryWork::Refresh);
+        assert!(!due.poll(5, HOME, Last::Ended));
+        due.reaped(Last::Held, 6);
+        assert!(due.after_local_progress(RepositoryWork::Repair, 7, HOME, Last::None));
+        assert_eq!(due.repository_work(), RepositoryWork::Refresh);
+    }
+
+    #[test]
+    fn checkout_repairs_preserve_a_failed_refresh_deadline_and_backoff() {
+        for refresh_end in [Last::Failed, Last::Unfinished] {
+            for repair_end in [Last::Ended, Last::Failed, Last::Unfinished] {
+                let mut due = Due::default();
+                assert!(due.at_start(0, HOME, Last::None));
+                due.reaped(refresh_end, 1_000);
+                assert!(due.after_local_progress(RepositoryWork::Repair, 1_001, HOME, Last::None));
+                assert_eq!(due.repository_work(), RepositoryWork::Repair);
+                due.reaped(repair_end, 1_002);
+                assert!(!due.poll(5_999, HOME, Last::None));
+                assert!(due.poll(6_000, HOME, Last::None));
+                assert_eq!(due.repository_work(), RepositoryWork::Refresh);
+                due.reaped(Last::Failed, 6_001);
+                assert!(!due.poll(16_000, HOME, Last::None));
+                assert!(due.poll(16_001, HOME, Last::None));
+                assert_eq!(due.repository_work(), RepositoryWork::Refresh);
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_source_refresh_starts_before_retained_refresh_retry_is_due() {
+        let mut due = Due::default();
+        assert!(due.at_start(0, HOME, Last::None));
+        due.reaped(Last::Failed, 1_000);
+        assert!(due.after_local_progress(RepositoryWork::Repair, 1_001, HOME, Last::None));
+        assert_eq!(due.repository_work(), RepositoryWork::Repair);
+        assert!(!due.after_local_progress(RepositoryWork::Refresh, 1_002, HOME, Last::Running));
+        assert!(!due.after_local_progress(RepositoryWork::Repair, 1_003, HOME, Last::Running));
+        assert!(due.poll(1_004, HOME, Last::Ended));
+        assert_eq!(due.repository_work(), RepositoryWork::Refresh);
+        assert!(!due.poll(6_000, HOME, Last::Ended));
+    }
+
+    #[test]
+    fn a_failed_repair_retries_locally_until_routes_request_a_refresh() {
+        let mut due = Due::default();
+        assert!(due.at_start(0, HOME, Last::None));
+        assert!(due.after_local_progress(RepositoryWork::Repair, 1, HOME, Last::Ended));
+        due.reaped(Last::Unfinished, 2);
+        assert!(!due.poll(1 + FIRST_RETRY_MS, HOME, Last::None));
+        assert!(due.poll(2 + FIRST_RETRY_MS, HOME, Last::None));
+        assert_eq!(due.repository_work(), RepositoryWork::Repair);
+        assert!(!due.poll(3 + FIRST_RETRY_MS, AWAY, Last::Running));
+        assert!(due.poll(4 + FIRST_RETRY_MS, AWAY, Last::Ended));
+        assert_eq!(due.repository_work(), RepositoryWork::Refresh);
+    }
+
     /// The runner is `aterm init --converge --trigger <who>` of the program given, never
     /// disclaims responsibility (macOS then keeps the runner's privacy-gated acts the starting
     /// app's), and the subscriber's leaves its starter's background band, so the fleet book's
@@ -454,19 +630,31 @@ mod tests {
     fn the_runner_is_init_converge_the_subscribers_out_of_the_band_never_disclaiming() {
         let exe = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
         for trigger in [SUBSCRIBER, WINDOW, SETUP] {
-            let command = runner(exe, trigger);
-            assert_eq!(command.get_program(), exe);
-            let args: Vec<_> = command.get_args().collect();
-            assert_eq!(args, ["init", "--converge", "--trigger", trigger]);
-            assert!(
-                !command.get_disclaim_responsibility(),
-                "the runner's privacy-gated acts stay the starting app's"
-            );
-            assert_eq!(
-                command.leaves_background_band(),
-                trigger == SUBSCRIBER,
-                "only the subscriber's runner leaves its starter's background band ({trigger})"
-            );
+            for work in [RepositoryWork::Repair, RepositoryWork::Refresh] {
+                let command = runner(exe, trigger, work);
+                assert_eq!(command.get_program(), exe);
+                let args: Vec<_> = command.get_args().collect();
+                assert_eq!(
+                    args,
+                    [
+                        "init",
+                        "--converge",
+                        "--trigger",
+                        trigger,
+                        "--repository-work",
+                        work.word()
+                    ]
+                );
+                assert!(
+                    !command.get_disclaim_responsibility(),
+                    "the runner's privacy-gated acts stay the starting app's"
+                );
+                assert_eq!(
+                    command.leaves_background_band(),
+                    trigger == SUBSCRIBER,
+                    "only the subscriber's runner leaves its starter's background band ({trigger})"
+                );
+            }
         }
     }
 
@@ -489,7 +677,8 @@ mod tests {
             path
         };
         let endless = script("endless", format!("exec {} 600", sleep.display()));
-        let mut runner = Some(start(&endless, "subscriber").expect("start a runner"));
+        let mut runner =
+            Some(start(&endless, "subscriber", RepositoryWork::Refresh).expect("start a runner"));
         assert_eq!(Last::of(&mut runner), Last::Running);
         let child = runner.as_mut().unwrap();
         let pid = i32::try_from(child.id()).expect("a pid");
@@ -515,7 +704,8 @@ mod tests {
             (UNFINISHED, Last::Unfinished),
         ] {
             let exe = script(&format!("exit-{code}"), format!("exit {code}"));
-            let mut runner = Some(start(&exe, "subscriber").expect("start a runner"));
+            let mut runner =
+                Some(start(&exe, "subscriber", RepositoryWork::Refresh).expect("start a runner"));
             runner.as_mut().unwrap().wait().expect("reap it");
             assert_eq!(Last::of(&mut runner), expected);
             assert_eq!(

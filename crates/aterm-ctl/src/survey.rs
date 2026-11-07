@@ -26,6 +26,9 @@ pub const UNANSWERED_REASON_CHARS: usize = UNANSWERED_ROOM - LABEL_KEPT;
 const UNANSWERED_FRAME: &str = "== ";
 const UNANSWERED_JOIN: &str = " did not answer: ";
 const TRUST_LABEL: &str = " trust=screen";
+/// The `"reason"` of the one row a survey writes where the read of the whole fleet was refused
+/// (no peer was dialled): a reader keeps it out of the fleet's seats, since it names no Mac.
+pub const FLEET_UNREAD: &str = "fleet-unread";
 /// Marker on a session line whose excerpts the budget left out.
 pub const EXCERPTS_CUT: &str = "(excerpts cut)";
 /// Default per-peer deadline for fleet survey queries.
@@ -87,6 +90,11 @@ pub struct PeerSurvey {
     /// The address it answered at, where it answered; else the address its failed dial went to,
     /// where the dial went to one (the on-link rule's, [`fleet_note_at`]).
     pub addr: Option<String>,
+    /// The kind of failure where there is no answer, one token of
+    /// `aterm_net::fleet_member::REASONS` (or [`FLEET_UNREAD`] for the row that stands for a
+    /// refused read of the whole fleet), for a reader to group by where `answer`'s words name the
+    /// address; `None` for an answer, or a failure of no known kind.
+    pub reason: Option<&'static str>,
 }
 
 /// Failure category for a fleet peer query ([`fleet_note`]).
@@ -246,6 +254,9 @@ pub(crate) struct HostReply {
     pub(crate) node: Option<String>,
     /// The survey, or why there is none.
     pub(crate) answer: Result<Survey, String>,
+    /// The kind of failure where a fleet peer did not answer ([`PeerSurvey::reason`]): the
+    /// error row's `"reason"`.
+    pub(crate) reason: Option<&'static str>,
 }
 
 /// One `survey` reply, parsed.
@@ -1895,7 +1906,7 @@ pub(crate) fn render_json(replies: &[HostReply]) -> String {
                         .join(",")
                 ),
                 Err(why) => format!(
-                    "{{{head}{},\"error\":\"{}\"}}",
+                    "{{{head}{},\"error\":\"{}\"{}}}",
                     reply
                         .node
                         .as_deref()
@@ -1903,12 +1914,29 @@ pub(crate) fn render_json(replies: &[HostReply]) -> String {
                             ",\"node\":\"{}\"",
                             aterm_codec::json::escape(node)
                         )),
-                    aterm_codec::json::escape(why)
+                    aterm_codec::json::escape(why),
+                    reply.reason.map_or_else(String::new, |reason| format!(
+                        ",\"reason\":\"{}\"",
+                        aterm_codec::json::escape(reason)
+                    )),
                 ),
             }
         })
         .collect();
     format!("[{}]\n", hosts.join(","))
+}
+
+/// The reply row of a fleet peer's read: its survey parsed, or why there is none and, for a
+/// failed read, the kind of failure (an answer carries none).
+pub(crate) fn peer_reply(peer: PeerSurvey) -> HostReply {
+    HostReply {
+        label: peer.label,
+        remote: true,
+        unproven: peer.unproven,
+        node: peer.node,
+        reason: peer.reason.filter(|_| peer.answer.is_err()),
+        answer: peer.answer.and_then(|lines| parse_reply(&lines)),
+    }
 }
 
 /// Entry point for `aterm ctl survey`, each fleet peer's read cut to ctl's own `--timeout`
@@ -2026,6 +2054,7 @@ pub(crate) fn read_survey(
             unproven: false,
             node: None,
             answer: Err(report.lines().next().unwrap_or_default().to_string()),
+            reason: None,
         }],
     };
     let mut notes: Vec<String> = Vec::new();
@@ -2053,6 +2082,7 @@ pub(crate) fn read_survey(
                 unproven: false,
                 node: None,
                 addr: None,
+                reason: Some(FLEET_UNREAD),
             }],
         };
         notes.extend(fleet_note_at(
@@ -2063,13 +2093,7 @@ pub(crate) fn read_survey(
         unserved = replies.is_empty()
             && !peers.is_empty()
             && peers.iter().all(|peer| peer.fault == PeerFault::Unserved);
-        replies.extend(peers.into_iter().map(|peer| HostReply {
-            label: peer.label,
-            remote: true,
-            unproven: peer.unproven,
-            node: peer.node,
-            answer: peer.answer.and_then(|lines| parse_reply(&lines)),
-        }));
+        replies.extend(peers.into_iter().map(peer_reply));
     }
     notes.extend(facts_note(&replies));
     let answered = !remote || replies.iter().any(|reply| reply.answer.is_ok());
@@ -2264,6 +2288,7 @@ fn local_replies(sock: Option<&str>, pid: Option<u32>) -> Result<Vec<HostReply>,
                     unproven: false,
                     node: None,
                     answer: parse_reply(lines),
+                    reason: None,
                 }),
                 crate::Probe::Refused {
                     pid_running: Some(false),
@@ -2274,6 +2299,7 @@ fn local_replies(sock: Option<&str>, pid: Option<u32>) -> Result<Vec<HostReply>,
                     unproven: false,
                     node: None,
                     answer: Err(crate::probe_cause(*pid, other)),
+                    reason: None,
                 }),
             }
         })

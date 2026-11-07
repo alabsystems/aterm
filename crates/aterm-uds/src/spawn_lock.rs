@@ -48,6 +48,7 @@ macro_rules! descriptor {
 descriptor!(
     std::os::fd::OwnedFd,
     std::fs::File,
+    aterm_dirfd::Dir,
     std::io::PipeReader,
     std::io::PipeWriter,
     std::net::TcpListener,

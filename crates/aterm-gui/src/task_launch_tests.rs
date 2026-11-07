@@ -1596,13 +1596,13 @@ fn a_claude_worker_of_a_walled_tab_starts_on_the_row_a_wall_moves_to() {
         vec![(var.to_string(), work.display().to_string())],
         "\"early\" leaves a low row ahead of its wall"
     );
-    std::fs::write(cfg.join("aterm.toml"), "[harness]\naccounts = \"wall\"\n").expect("cfg");
+    crate::test_scratch::write_config(&cfg.join("aterm.toml"), "[harness]\naccounts = \"wall\"\n");
     assert_eq!(
         super::claude_starter_in(plain.clone(), &seat, 6),
         plain,
         "under \"wall\" a row that still runs keeps its worker"
     );
-    std::fs::write(cfg.join("aterm.toml"), "[harness]\naccounts = \"off\"\n").expect("cfg");
+    crate::test_scratch::write_config(&cfg.join("aterm.toml"), "[harness]\naccounts = \"off\"\n");
     assert_eq!(
         super::claude_starter_in(plain.clone(), &seat, 4),
         plain,
@@ -1688,7 +1688,7 @@ fn a_claim_workers_wall_is_the_wall_of_the_row_it_would_start_on() {
         None,
         "CONTROL: the launch moves the worker to `work`, which runs"
     );
-    std::fs::write(cfg.join("aterm.toml"), "[harness]\naccounts = \"off\"\n").expect("cfg");
+    crate::test_scratch::write_config(&cfg.join("aterm.toml"), "[harness]\naccounts = \"off\"\n");
     assert_eq!(
         super::claude_worker_wall(&plain, &seat),
         Some(until + accounts::RESET_GRACE_S),
@@ -2004,7 +2004,7 @@ fn a_codex_row_of_its_own_is_refused_on_a_program_that_ignores_codex_auth_path()
 
     // With rotation off and no pin the pool picks nothing, and a starter that carries the bound
     // row's variable hands it on as it is: that too needs a program that keeps its login.
-    std::fs::write(cfg.join("aterm.toml"), "[harness]\naccounts = \"off\"\n").expect("aterm.toml");
+    crate::test_scratch::write_config(&cfg.join("aterm.toml"), "[harness]\naccounts = \"off\"\n");
     let carrying = |exe: PathBuf| Starter {
         env: vec![("CODEX_AUTH_PATH".to_string(), work_auth.clone())],
         ..on(exe)
@@ -2071,7 +2071,7 @@ fn a_carried_codex_row_under_rotation_off_is_told_a_way_back_that_works_there() 
         ),
     )
     .expect("roster");
-    std::fs::write(cfg.join("aterm.toml"), "[harness]\naccounts = \"off\"\n").expect("aterm.toml");
+    crate::test_scratch::write_config(&cfg.join("aterm.toml"), "[harness]\naccounts = \"off\"\n");
     let seat = Seat {
         config_dir: &cfg,
         state: &state,
@@ -2127,7 +2127,7 @@ fn a_carried_codex_row_under_rotation_off_is_told_a_way_back_that_works_there() 
         Ok(plain.clone()),
         "the way back it names starts"
     );
-    std::fs::write(cfg.join("aterm.toml"), "").expect("rotation on");
+    crate::test_scratch::write_config(&cfg.join("aterm.toml"), "");
     std::fs::write(
         home.join(".codex/config.toml"),
         "cli_auth_credentials_store = \"auto\"\n",
@@ -2156,7 +2156,7 @@ fn a_carried_codex_row_under_rotation_off_is_told_a_way_back_that_works_there() 
         Ok(plain.clone()),
         "the way back it names starts"
     );
-    std::fs::write(cfg.join("aterm.toml"), "[harness]\naccounts = \"off\"\n").expect("aterm.toml");
+    crate::test_scratch::write_config(&cfg.join("aterm.toml"), "[harness]\naccounts = \"off\"\n");
     seat.store(Cli::Codex)
         .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |s| {
             s.active = Some("work".to_string());
@@ -2214,6 +2214,51 @@ enum MainReads {
     Unread,
 }
 const POOL_RESET: i64 = POOL_NOW + 4 * 3600;
+
+struct RejectedUsage<'a> {
+    user_home: &'a Path,
+    homes: Vec<PathBuf>,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl aterm_agent::harness::accounts_pool::UsageReader for RejectedUsage<'_> {
+    fn read(
+        &self,
+        _: aterm_agent::harness::accounts::Cli,
+        at: &Path,
+        _: Option<&str>,
+        now: i64,
+        use_token: aterm_agent::harness::provider_read::Use,
+    ) -> aterm_agent::harness::accounts_pool::Reading {
+        use aterm_agent::harness::{accounts_pool::Reading, provider_read::Read};
+        if use_token.begin_home(Read::CodexEndpoint, at, now).is_err() {
+            return Reading::Unread;
+        }
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.homes.iter().any(|home| home == at) {
+            Reading::SignedOut
+        } else {
+            Reading::Unread
+        }
+    }
+
+    fn read_observed(
+        &self,
+        cli: aterm_agent::harness::accounts::Cli,
+        at: &Path,
+        expected: Option<&str>,
+        now: i64,
+        use_token: aterm_agent::harness::provider_read::Use,
+    ) -> aterm_agent::harness::accounts_pool::UsageObservation {
+        aterm_agent::harness::accounts_pool::UsageObservation::from_fixture(
+            self.read(cli, at, expected, now, use_token),
+            at,
+            self.user_home,
+        )
+        .expect("owned fixture credentials")
+    }
+}
 
 impl CodexPool {
     fn new() -> Self {
@@ -2377,7 +2422,6 @@ fn a_walled_default_on_a_program_that_ignores_codex_auth_path_refuses_alike_acro
 #[test]
 fn a_signed_out_default_on_a_program_that_ignores_codex_auth_path_names_its_sign_in() {
     use aterm_agent::harness::accounts::{self, Cli};
-    use aterm_agent::harness::accounts_pool::{Reading, UsageObservation, UsageReader};
     let pool = CodexPool::new();
     let old = aterm_agent::harness::codex_alab::lay_package(&pool.root.join("store/old"), false);
     let native =
@@ -2388,54 +2432,10 @@ fn a_signed_out_default_on_a_program_that_ignores_codex_auth_path_names_its_sign
         r#"{"tokens":{"access_token":"synthetic-rejected-token"}}"#,
     )
     .unwrap();
-    struct Rejected<'a> {
-        default: &'a Path,
-        user_home: &'a Path,
-    }
-    impl UsageReader for Rejected<'_> {
-        fn read(
-            &self,
-            _: Cli,
-            at: &Path,
-            _: Option<&str>,
-            now: i64,
-            use_token: aterm_agent::harness::provider_read::Use,
-        ) -> Reading {
-            if use_token
-                .begin_home(
-                    aterm_agent::harness::provider_read::Read::CodexEndpoint,
-                    at,
-                    now,
-                )
-                .is_err()
-            {
-                return Reading::Unread;
-            }
-            if at == self.default {
-                Reading::SignedOut
-            } else {
-                Reading::Unread
-            }
-        }
-        fn read_observed(
-            &self,
-            cli: Cli,
-            at: &Path,
-            expected: Option<&str>,
-            now: i64,
-            use_token: aterm_agent::harness::provider_read::Use,
-        ) -> UsageObservation {
-            UsageObservation::from_fixture(
-                self.read(cli, at, expected, now, use_token),
-                at,
-                self.user_home,
-            )
-            .expect("owned fixture credentials")
-        }
-    }
-    let reader = Rejected {
-        default: &default,
+    let reader = RejectedUsage {
+        homes: vec![default],
         user_home: &pool.home,
+        reads: std::sync::atomic::AtomicUsize::new(0),
     };
     // Seed through the real poll writer on a program that can use either row.
     let seeded = aterm_agent::harness::accounts_pool::launch_env_for(
@@ -2659,6 +2659,48 @@ fn a_relative_login_file_is_not_rotated_as_the_default_worker() {
                 before
             );
         }
+    }
+}
+
+#[test]
+fn worker_pool_retries_keep_one_provider_read_allowance() {
+    use aterm_agent::harness::accounts::Cli;
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let pool = CodexPool::new();
+    let read = RejectedUsage {
+        user_home: &pool.home,
+        homes: vec![
+            pool.home.join(".codex"),
+            Path::new(&pool.work_auth).parent().unwrap().to_path_buf(),
+        ],
+        reads: AtomicUsize::new(0),
+    };
+    for home in &read.homes {
+        std::fs::write(
+            home.join("auth.json"),
+            r#"{"tokens":{"access_token":"synthetic-rejected-token"}}"#,
+        )
+        .unwrap();
+    }
+    for invocation in 1..=2 {
+        let attempts = Cell::new(0);
+        let got = pool_launch_attempts(
+            |pick| {
+                attempts.set(attempts.get() + 1);
+                pick.pick(&pool.seat(POOL_NOW), Cli::Codex, &read, None)
+            },
+            || None,
+            || Some(POOL_NOW),
+            |_| true,
+        );
+        assert!(got.is_err(), "every enrolled row is signed out: {got:?}");
+        assert_eq!(attempts.get(), POOL_RETRIES + 1);
+        assert_eq!(
+            read.reads.load(Ordering::Relaxed),
+            2 * invocation,
+            "one read of each row per invocation"
+        );
     }
 }
 

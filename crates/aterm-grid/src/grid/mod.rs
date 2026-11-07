@@ -14,7 +14,9 @@ mod cursor_ops;
 mod erase;
 mod history_carry;
 mod invariants;
+mod lazy_buffer;
 mod line_ops;
+mod line_run;
 mod pin_methods;
 pub mod reflow;
 mod reflow_pullback;
@@ -77,6 +79,7 @@ pub use checkpoint_lines::GridImageCarry;
 pub use history_carry::{
     HistoryFence, HistoryFenceBroken, OlderHistory, OlderHistoryClaim, OlderHistoryRefusal,
 };
+pub use line_run::ScreenTextLines;
 pub use resize_handback::{CanonicalHandbackCarry, GridHandbackCarry, ResizeLaw};
 pub(crate) use scroll_convert::ScrolledRowExtras;
 pub use scroll_materialize::{MaterializedRow, materialize_from_line, stored_line_cells};

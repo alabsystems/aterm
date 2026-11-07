@@ -46,7 +46,7 @@ pub use aterm_types::HyperlinkData;
 pub use aterm_types::{ImageData, ImageFormat, ImageScaling, KittyPlacementTag, SourceRect};
 
 /// A single cell's reference into a placed [`ImageData`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ImageRef {
     /// The shared image this cell belongs to.
     pub image: Arc<ImageData>,
@@ -56,6 +56,26 @@ pub struct ImageRef {
     pub cell_col: u16,
     /// Which Kitty placement stamped this cell, or `None` for non-Kitty placements.
     pub kitty: Option<KittyPlacementTag>,
+}
+
+impl Clone for ImageRef {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            image: self.image.clone(),
+            cell_row: self.cell_row,
+            cell_col: self.cell_col,
+            kitty: self.kitty,
+        }
+    }
+
+    #[inline]
+    fn clone_from(&mut self, source: &Self) {
+        self.image.clone_from(&source.image);
+        self.cell_row = source.cell_row;
+        self.cell_col = source.cell_col;
+        self.kitty = source.kitty;
+    }
 }
 
 impl ImageRef {

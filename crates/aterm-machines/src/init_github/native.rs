@@ -15,6 +15,7 @@ use crate::items::{Ctx, Item};
 use crate::model::{ItemReport, Mode, Probe, User};
 use crate::port::{GithubError, GithubFailure, Secret, System};
 use aterm_converge::{Class, Layer, Remedy, Requires};
+use aterm_secrets::converge::RepositoryWork;
 use aterm_types::macos_setup::FailureKind;
 use std::io;
 use std::path::Path;
@@ -32,28 +33,94 @@ const GITHUB_STEP: &str = "github.sign-in";
 /// Preserved checkout work is separate from the credential's sign-in remedy.
 const REPOSITORIES_STEP: &str = "github.repositories";
 
+/// The automatic lane can publish a complete count only after the captured default
+/// source's pinned credential route also works. Missing work is left to the native
+/// batch's ordinary route check, rather than invoking the helper twice before cloning.
+/// # Errors
+/// The account, source, checkouts or credential route cannot be read safely, the route
+/// does not return the captured token, or the captured source is no longer ready.
+pub(crate) fn automatic_inventory_counts(
+    sys: &dyn System,
+    ctx: &Ctx,
+) -> Result<Option<(usize, usize)>, String> {
+    if !super::uses_vault_inventory(sys, ctx)? {
+        return Ok(None);
+    }
+    let captured = InitialRepositoryInputs::capture_ready(sys, ctx)?;
+    automatic_inventory_counts_captured(sys, ctx, &captured)
+}
+
+/// Reuse an existing captured default source. A caller's materialization fence is
+/// still its responsibility; this checks the capture's own source before returning.
+pub(crate) fn automatic_inventory_counts_captured(
+    sys: &dyn System,
+    ctx: &Ctx,
+    captured: &InitialRepositoryInputs,
+) -> Result<Option<(usize, usize)>, String> {
+    captured.validate_default_context(sys, ctx)?;
+    let local = captured.local.as_ref().map_err(|block| block.why.clone())?;
+    let inventory = local
+        .inventory
+        .as_ref()
+        .ok_or("the default repository source changed while its inputs were captured")?;
+    let listed = inventory.repositories();
+    let standing = repos::partition(sys, &captured.user, listed)?;
+    let counts = (standing.present.len(), listed.len());
+    // capture_ready released the shared materialization lock before any helper runs.
+    let lookups = if counts.0 == counts.1 {
+        let helper = super::helper(sys, &captured.user);
+        Some(Git::for_user(sys, &captured.user).lookups(
+            sys,
+            &captured.user,
+            helper.as_ref(),
+            &local.token,
+        )?)
+    } else {
+        None
+    };
+    if !captured.is_current_now(sys)? {
+        return Err(
+            "repository inputs changed or are still syncing; waiting for a new ready snapshot"
+                .into(),
+        );
+    }
+    if let Some(Lookups::Not(why)) = lookups {
+        return Err(format!(
+            "matching worktrees are preserved, but aterm's GitHub route does not hand back the synced token: {why}"
+        ));
+    }
+    Ok(Some(counts))
+}
+
 pub(super) fn run(sys: &dyn System, ctx: &Ctx, mode: Mode) -> Result<Vec<ItemReport>, String> {
-    run_with(sys, ctx, mode, None)
+    run_with(sys, ctx, mode, RepositoryWork::Refresh, None)
 }
 
 pub(super) fn run_captured(
     sys: &dyn System,
     ctx: &Ctx,
     mode: Mode,
+    work: RepositoryWork,
     inputs: InitialRepositoryInputs,
     current: Box<dyn Fn() -> Result<bool, String> + Send + Sync>,
 ) -> Result<Vec<ItemReport>, String> {
-    run_with(sys, ctx, mode, Some(Captured { inputs, current }))
+    run_with(sys, ctx, mode, work, Some(Captured { inputs, current }))
 }
 
 /// `aterm init`'s repository item for `user` with no `[github]` token source in init.toml: the
 /// same stage the first launch runs, after the secrets item `after` names when one does (the
 /// vault writes the token it reads). With no `[github]` table at all (`unasked`), a Mac with no
 /// token is no stage of this run.
-pub(super) fn item(user: &User, after: Option<String>, unasked: bool) -> Box<dyn Item> {
+pub(super) fn item(
+    user: &User,
+    after: Option<String>,
+    unasked: bool,
+    work: RepositoryWork,
+) -> Box<dyn Item> {
     Box::new(NativeRepositories {
         after,
         unasked,
+        work,
         ..NativeRepositories::new(user.clone(), None)
     })
 }
@@ -62,6 +129,7 @@ fn run_with(
     sys: &dyn System,
     ctx: &Ctx,
     mode: Mode,
+    work: RepositoryWork,
     captured: Option<Captured>,
 ) -> Result<Vec<ItemReport>, String> {
     let [user] = ctx.users.as_slice() else {
@@ -73,7 +141,10 @@ fn run_with(
     }
     // The keychain block goes first, whatever GitHub says below.
     let keychain = keychain::Keychain::new(user.clone());
-    let item = NativeRepositories::new(user.clone(), captured);
+    let item = NativeRepositories {
+        work,
+        ..NativeRepositories::new(user.clone(), captured)
+    };
     let place = || Place {
         layer: Layer::Workstation,
         class: Class::Install,
@@ -99,6 +170,8 @@ fn run_with(
 
 struct NativeRepositories {
     user: User,
+    /// The caller's scheduling intent; it grants no authority over the captured source.
+    work: RepositoryWork,
     /// How many repositories the last probe found and whether it signed in, for
     /// System State.
     reading: LastReading,
@@ -294,6 +367,55 @@ impl InitialRepositoryInputs {
     /// # Errors
     /// The current local source or vault state cannot be safely read.
     pub fn is_current(&self, sys: &dyn System) -> Result<bool, String> {
+        self.current_with(
+            sys,
+            aterm_secrets::client::MaterializationSnapshot::is_current,
+        )
+    }
+
+    pub(crate) fn is_current_now(&self, sys: &dyn System) -> Result<bool, String> {
+        self.current_with(
+            sys,
+            aterm_secrets::client::MaterializationSnapshot::is_current_now,
+        )
+    }
+
+    /// A captured local failure is a blocker, not evidence that the vault changed.
+    /// It can explain unfinished readback but cannot authorize acquisition or readiness.
+    pub(crate) fn local_blocker(&self) -> Option<&str> {
+        self.local.as_ref().err().map(|block| block.why.as_str())
+    }
+
+    pub(crate) fn validate_default_context(
+        &self,
+        sys: &dyn System,
+        ctx: &Ctx,
+    ) -> Result<(), String> {
+        if ctx.users.as_slice() != std::slice::from_ref(&self.user)
+            || self.user.uid != sys.euid()
+            || self.user.uid == 0
+        {
+            return Err("the captured repository account changed".into());
+        }
+        if !super::uses_vault_inventory(sys, ctx)?
+            || self
+                .local
+                .as_ref()
+                .is_ok_and(|local| local.configured.is_some())
+        {
+            return Err("the captured default repository source changed".into());
+        }
+        Ok(())
+    }
+
+    fn current_with(
+        &self,
+        sys: &dyn System,
+        materialization_current: fn(
+            &aterm_secrets::client::MaterializationSnapshot,
+            &aterm_secrets::client::Paths,
+        ) -> aterm_secrets::Result<bool>,
+    ) -> Result<bool, String> {
         if self.local.is_err() {
             return Ok(false);
         }
@@ -308,7 +430,7 @@ impl InitialRepositoryInputs {
                 }
             }
             InputAuthority::Vault(paths, snapshot) => {
-                if !snapshot.is_current(paths).map_err(|why| why.to_string())? {
+                if !materialization_current(snapshot, paths).map_err(|why| why.to_string())? {
                     return Ok(false);
                 }
             }
@@ -355,6 +477,7 @@ impl NativeRepositories {
     fn new(user: User, captured: Option<Captured>) -> Self {
         Self {
             user,
+            work: RepositoryWork::Refresh,
             reading: LastReading::default(),
             captured,
             prepared: OnceLock::new(),
@@ -513,6 +636,33 @@ impl Item for NativeRepositories {
         self.apply_guarded(sys, ctx, &|| Ok(()))
     }
 
+    fn refresh(&self, sys: &dyn System, ctx: &Ctx) -> Option<Result<(), String>> {
+        self.refresh_guarded(sys, ctx, &|| Ok(()))
+    }
+
+    fn refresh_guarded(
+        &self,
+        sys: &dyn System,
+        ctx: &Ctx,
+        current: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Option<Result<(), String>> {
+        if self.work != RepositoryWork::Refresh {
+            return None;
+        }
+        if let Err(why) = current().and_then(|()| self.ensure_current(sys)) {
+            return Some(Err(why));
+        }
+        match configuration(sys, &self.user) {
+            Ok(None) => Some(self.apply_guarded(sys, ctx, current)),
+            Ok(Some(_)) => None,
+            Err(why) => Some(Err(why)),
+        }
+    }
+
+    fn refresh_changes(&self, sys: &dyn System, _ctx: &Ctx) -> bool {
+        self.work == RepositoryWork::Refresh && matches!(configuration(sys, &self.user), Ok(None))
+    }
+
     fn apply_guarded(
         &self,
         sys: &dyn System,
@@ -524,7 +674,7 @@ impl Item for NativeRepositories {
         if !super::settings_managed(sys, &self.user)? {
             return Ok(());
         }
-        let (plan, standing) = match self.take() {
+        let (plan, mut standing) = match self.take() {
             Some(Carried::Probed(plan, standing)) => (plan, standing),
             _ => {
                 let plan = self.plan(sys).map_err(|block| {
@@ -540,21 +690,32 @@ impl Item for NativeRepositories {
                 (plan, standing)
             }
         };
+        let recorded =
+            if self.work == RepositoryWork::Refresh && configuration(sys, &self.user)?.is_none() {
+                Some(super::develop_checkouts(sys, &self.user)?)
+            } else {
+                None
+            };
         let current = || {
             authorized()?;
             if !super::settings_managed(sys, &self.user)? {
                 return Err("repository setup was disabled in init.toml while cloning".into());
             }
-            self.ensure_current(sys)
+            self.ensure_current(sys)?;
+            if let Some(recorded) = &recorded
+                && *recorded != super::develop_checkouts(sys, &self.user)?
+            {
+                return Err(
+                    "develop checkout selection changed while repositories were being refreshed"
+                        .into(),
+                );
+            }
+            Ok(())
         };
         current()?;
         if let Some(why) = repos::named(&standing.git_waits) {
             self.reading.set(Some(Reading::Waits(Wait::GitReadiness)));
             return Err(why);
-        }
-        if standing.missing.is_empty() && standing.dependencies.is_empty() {
-            self.carry(Carried::Applied(plan));
-            return Ok(());
         }
         if let Lookups::Not(why) = self.lookups(sys, &plan)? {
             return Err(format!(
@@ -562,8 +723,32 @@ impl Item for NativeRepositories {
                  was cloned"
             ));
         }
+        let mut failed = Vec::new();
+        if let Some(recorded) = &recorded {
+            let refreshed =
+                repos::refresh_existing(sys, &self.user, &standing, recorded, &current)?;
+            failed.extend(refreshed.failed);
+            // A refreshed parent may declare different gitlinks. Never hydrate
+            // dependencies from the pre-refresh parent's cached verdict.
+            if refreshed.moved {
+                standing = repos::partition(sys, &self.user, &plan.repositories)?;
+                if let Some(why) = repos::named(&standing.git_waits) {
+                    self.reading.set(Some(Reading::Waits(Wait::GitReadiness)));
+                    failed.push(why);
+                }
+            }
+        }
+        if standing.missing.is_empty() && standing.dependencies.is_empty() {
+            self.carry(Carried::Applied(plan));
+            return if failed.is_empty() {
+                Ok(())
+            } else {
+                Err(failed.join("; "))
+            };
+        }
         let guard = repos::CloneGuard::new(&current);
         let mut cloned = repos::clone_all(sys, &self.user, &standing.missing, Some(&guard));
+        cloned.failed.extend(failed);
         let home = Path::new(&self.user.home);
         // Read once the clones and dependencies have taken their room.
         let room =
@@ -713,7 +898,7 @@ impl NativeRepositories {
             .map(|captured| &captured.inputs)
             .or_else(|| self.prepared.get());
         if let Some(inputs) = inputs.filter(|inputs| inputs.local.is_ok())
-            && !inputs.is_current(sys)?
+            && !inputs.is_current_now(sys)?
         {
             return Err(
                 "repository input source changed; waiting for a new coherent version".into(),
@@ -762,14 +947,12 @@ impl NativeRepositories {
             inventory,
         } = inputs;
         if let Some(inventory) = inventory {
-            let listed = inventory
-                .repositories()
-                .map_err(Block::of(Wait::RepositoryInventory))?;
+            let repositories = inventory.into_repositories();
             self.ensure_current(sys).map_err(Block::from)?;
             return Ok(Plan {
                 token,
-                repositories: listed.repositories,
-                notes: listed.notes,
+                repositories,
+                notes: Vec::new(),
             });
         }
         let account = identity(sys, &self.user, &token).map_err(Block::github)?;
@@ -966,7 +1149,15 @@ pub(super) mod tests {
             &format!("{ACCESSIBLE}&page=1"),
             aterm_json::json!([]),
         );
-        let rows = run_captured(&sys, &ctx, Mode::Plan, captured, Box::new(|| Ok(true))).unwrap();
+        let rows = run_captured(
+            &sys,
+            &ctx,
+            Mode::Plan,
+            RepositoryWork::Refresh,
+            captured,
+            Box::new(|| Ok(true)),
+        )
+        .unwrap();
         assert_eq!(Reading::of(stage(&rows)), Some(Reading::Waits(Wait::Token)));
         // The vault this Mac reads holds no GitHub token: only a person puts one there.
         assert_eq!(stage(&rows).outcome, crate::model::Outcome::Person);
@@ -1182,7 +1373,7 @@ pub(super) mod tests {
             );
             let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
             assert_eq!(
-                super::super::inventory_counts(&sys, &ctx).unwrap(),
+                super::super::automatic_inventory_counts(&sys, &ctx).unwrap(),
                 Some((0, 1))
             );
             let rows = run(&sys, &ctx, Mode::Apply).unwrap();
@@ -1200,7 +1391,7 @@ pub(super) mod tests {
                 })
             );
             assert_eq!(
-                super::super::inventory_counts(&sys, &ctx).unwrap(),
+                super::super::automatic_inventory_counts(&sys, &ctx).unwrap(),
                 Some((1, 1))
             );
             assert_eq!(
@@ -1244,7 +1435,7 @@ pub(super) mod tests {
             "{rows:?}"
         );
         assert_eq!(
-            super::super::inventory_counts(&sys, &ctx).unwrap(),
+            super::super::automatic_inventory_counts(&sys, &ctx).unwrap(),
             Some((0, 1))
         );
         assert!(sys.stat(&parent).is_ok());
@@ -1256,7 +1447,7 @@ pub(super) mod tests {
             "{rows:?}"
         );
         assert_eq!(
-            super::super::inventory_counts(&sys, &ctx).unwrap(),
+            super::super::automatic_inventory_counts(&sys, &ctx).unwrap(),
             Some((1, 1))
         );
         assert_eq!(
@@ -1325,7 +1516,7 @@ pub(super) mod tests {
         let source = super::super::token_read(&sys, &ctx).unwrap().unwrap().mark;
         let state = aterm_tempfile::tempdir().unwrap();
         crate::init::owe_clone(state.path(), &Holds::NONE).unwrap();
-        assert!(crate::init::clone_owed(&sys, state.path()).is_err());
+        assert!(crate::init::clone_owed(&sys, state.path(), RepositoryWork::Refresh).is_err());
         // The persisted marker is the old untyped format, and must not be treated as an
         // eternal prohibition after the owner corrects only the local dependency path.
         let record = state
@@ -1334,12 +1525,17 @@ pub(super) mod tests {
             .join("clone-owed");
         let cached = std::fs::read(&record).unwrap();
         assert!(String::from_utf8_lossy(&cached).contains("\nmark "));
-        for _ in 0..2 {
-            assert!(matches!(
-                crate::init::owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
-                OwedClone::Person(_)
-            ));
-        }
+        assert!(matches!(
+            crate::init::owed_clone_captured(
+                &sys,
+                state.path(),
+                &Holds::NONE,
+                InitialRepositoryInputs::capture(&sys, &ctx).unwrap(),
+                || Ok(true),
+            )
+            .unwrap(),
+            OwedClone::Person(_)
+        ));
         assert!(
             !sys.calls()
                 .iter()
@@ -1356,20 +1552,34 @@ pub(super) mod tests {
             source
         );
         assert!(matches!(
-            crate::init::owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
+            crate::init::owed_clone_captured(
+                &sys,
+                state.path(),
+                &Holds::NONE,
+                InitialRepositoryInputs::capture(&sys, &ctx).unwrap(),
+                || Ok(true),
+            )
+            .unwrap(),
             OwedClone::Due(_)
         ));
         assert!(
             sys.stat(&path).is_err(),
             "a due read still changes no worktree"
         );
-        crate::init::clone_owed(&sys, state.path()).unwrap();
+        crate::init::clone_owed(&sys, state.path(), RepositoryWork::Refresh).unwrap();
         assert_eq!(
             super::super::token_read(&sys, &ctx).unwrap().unwrap().mark,
             source
         );
         assert_eq!(
-            crate::init::owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
+            crate::init::owed_clone_captured(
+                &sys,
+                state.path(),
+                &Holds::NONE,
+                InitialRepositoryInputs::capture(&sys, &ctx).unwrap(),
+                || Ok(true),
+            )
+            .unwrap(),
             OwedClone::Verified {
                 present: 1,
                 total: 1
@@ -1383,6 +1593,444 @@ pub(super) mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn preseeded_checkouts_do_not_verify_an_unusable_preserved_credential_helper() {
+        use crate::init::{Holds, OwedClone};
+        let names = ["parent".to_owned()];
+        let (sys, item) = listing(&names, &names);
+        sys.logged_in(&item.user);
+        let launcher =
+            aterm_types::installed_command::legacy(Path::new(&item.user.home))[0].clone();
+        let preserved = b"preserved older command";
+        sys.file(launcher.to_str().unwrap(), preserved);
+        let missing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let route_missing = Arc::clone(&missing);
+        sys.simulate(move |_, command| {
+            (command.display().contains("credential fill")
+                && route_missing.load(std::sync::atomic::Ordering::SeqCst))
+            .then(|| {
+                Ran::exit(
+                    128,
+                    "fatal: could not read Password: terminal prompts disabled",
+                )
+            })
+        });
+        assert!(matches!(
+            super::super::vault_git_credentials(&sys).unwrap(),
+            crate::sync::GithubRead::NotApplicable(_)
+        ));
+        let state = aterm_tempfile::tempdir().unwrap();
+        let owed = crate::init::owed_clone(&sys, state.path(), &Holds::NONE).unwrap();
+        assert_eq!(sys.read_file(&launcher).unwrap(), preserved);
+        assert!(!sys.calls().iter().any(|call| {
+            call.contains(" clone ") || call.contains("agh GET") || call.contains("--unset")
+        }));
+        assert!(
+            matches!(owed, OwedClone::Waiting(_)),
+            "matching checkouts cannot verify the unusable preserved route: {owed:?}"
+        );
+        missing.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            crate::init::owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
+            OwedClone::Verified {
+                present: 1,
+                total: 1
+            },
+            "repair of only the preserved route can now verify the same checkouts"
+        );
+        assert_eq!(sys.read_file(&launcher).unwrap(), preserved);
+    }
+
+    #[test]
+    fn automatic_readiness_runs_no_helper_for_missing_work_or_ineligible_sources() {
+        use crate::init::{Holds, OwedClone};
+        use aterm_types::macos_setup::Setting;
+        for choice in ["missing", "dependency", "stop", "off", "custom"] {
+            let names = ["parent".to_owned()];
+            let present = if choice == "missing" {
+                &[][..]
+            } else {
+                &names[..]
+            };
+            let (sys, item) = listing(&names, present);
+            sys.logged_in(&item.user);
+            let mut holds = Holds::NONE;
+            match choice {
+                "dependency" => {
+                    required_repository(&sys, &item.user, "parent", &["vendor/library"])
+                }
+                "stop" => holds.stopped = Some("setup stopped".into()),
+                "off" => holds.off.set(Setting::Repositories, true),
+                "custom" => scope(&sys, &item.user),
+                _ => {}
+            }
+            sys.simulate(|_, command| {
+                assert!(
+                    !command.display().contains("credential fill"),
+                    "no route claim is needed"
+                );
+                None
+            });
+            let state = aterm_tempfile::tempdir().unwrap();
+            let owed = crate::init::owed_clone(&sys, state.path(), &holds).unwrap();
+            assert!(
+                match choice {
+                    "missing" | "dependency" => matches!(owed, OwedClone::Due(_)),
+                    "stop" | "off" => matches!(owed, OwedClone::Held(_)),
+                    "custom" => matches!(owed, OwedClone::Nothing(_)),
+                    _ => unreachable!(),
+                },
+                "{choice}: {owed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn captured_readback_refuses_another_login_before_using_its_inputs() {
+        let names = ["parent".to_owned()];
+        let (mut sys, item) = listing(&names, &names);
+        sys.logged_in(&item.user);
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        let inputs = InitialRepositoryInputs::capture(&sys, &ctx).unwrap();
+        let other = user("other", 502);
+        sys.euid = other.uid;
+        sys.logged_in(&other);
+        sys.simulate(|_, command| {
+            assert!(!command.display().contains("credential fill"));
+            None
+        });
+        let state = aterm_tempfile::tempdir().unwrap();
+        let read = crate::init::owed_clone_captured(
+            &sys,
+            state.path(),
+            &crate::init::Holds::NONE,
+            inputs,
+            || panic!("another account cannot reach the captured vault fence"),
+        )
+        .unwrap();
+        assert!(matches!(read, crate::init::OwedClone::Waiting(_)));
+    }
+
+    struct ReadbackFixture {
+        paths: aterm_secrets::client::Paths,
+        source: std::path::PathBuf,
+        source_text: String,
+        sys: Fake,
+        who: User,
+        ctx: Ctx,
+        token: std::path::PathBuf,
+        _root: aterm_tempfile::TempDir,
+    }
+
+    fn readback_fixture(git: bool) -> ReadbackFixture {
+        use aterm_secrets::client::{self, JoinOptions, JoinPassword, Paths};
+        let root = aterm_tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let source = root.path().join("team.secrets");
+        let paths = Paths::for_home(&home);
+        let inventory = aterm_json::json!({
+            "schema":2,"account":"alice","repositories":[repository("alice", "parent", 1)]
+        });
+        let source_text = format!(
+            "gh_access_token={TOKEN}\ngithub-repositories.json={inventory}\nunrelated=before\n"
+        );
+        aterm_uds::atomic_file::write(&source, source_text.as_bytes(), 0o600).unwrap();
+        client::join(
+            &paths,
+            &JoinOptions {
+                source: source.to_string_lossy().into_owned(),
+                host: Some("fixture".into()),
+                interactive: false,
+                wait: std::time::Duration::ZERO,
+                confirm: &|_| false,
+                password: JoinPassword::Given(None),
+                fetched: None,
+                requested: &|| {},
+                say: &|_| {},
+            },
+        )
+        .unwrap();
+        let who = User {
+            home: home.to_string_lossy().into_owned(),
+            ..user("alice", 501)
+        };
+        let mut sys = Fake::root();
+        sys.euid = who.uid;
+        sys.logged_in(&who);
+        sys.stat_of(home.to_str().unwrap(), stat(true, 0o700));
+        if git {
+            sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+        }
+        let token = home.join(super::super::TOKEN_FILE);
+        sys.file(token.to_str().unwrap(), TOKEN.as_bytes())
+            .stat_of(token.to_str().unwrap(), stat(false, 0o600));
+        metadata(&sys, &who, inventory["repositories"].clone());
+        script::launcher(&sys, &who);
+        script::lookups_hold(&sys, &who, GITHUB, "alice", TOKEN);
+        let parent = home.join("parent");
+        sys.stat_of(parent.to_str().unwrap(), stat(true, 0o700));
+        repos::tests::script_existing(&sys, &who, &parent, "parent");
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&who));
+        ReadbackFixture {
+            paths,
+            source,
+            source_text,
+            sys,
+            who,
+            ctx,
+            token,
+            _root: root,
+        }
+    }
+
+    #[test]
+    fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readback() {
+        use crate::init::{Holds, OwedClone};
+        use aterm_secrets::client;
+        use aterm_types::macos_setup::Setting;
+        for changed in ["no-git", "held-no-git", "stale-no-git"] {
+            let fixture = readback_fixture(false);
+            let config = client::config(&fixture.paths).unwrap().unwrap();
+            let captured = client::with_materialization_ready_for_entries(
+                &fixture.paths,
+                &config,
+                &super::super::VAULT_INPUT_ENTRIES,
+                || {
+                    InitialRepositoryInputs::capture(&fixture.sys, &fixture.ctx)
+                        .map_err(aterm_secrets::Error::new)
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert!(matches!(
+                captured.inputs.local,
+                Err(Block {
+                    wait: Some(Wait::GitReadiness),
+                    ..
+                })
+            ));
+            let state = aterm_tempfile::tempdir().unwrap();
+            let mut holds = Holds::NONE;
+            holds
+                .off
+                .set(Setting::Repositories, changed == "held-no-git");
+            let expected = crate::init::owed_clone(&fixture.sys, state.path(), &holds).unwrap();
+            assert!(matches!(
+                expected,
+                OwedClone::Waiting(_) | OwedClone::Held(_)
+            ));
+            if changed == "stale-no-git" {
+                aterm_uds::atomic_file::write(
+                    &fixture.source,
+                    fixture
+                        .source_text
+                        .replace(TOKEN, "fixture-rotated-token")
+                        .as_bytes(),
+                    0o600,
+                )
+                .unwrap();
+                client::sync(&fixture.paths, None).unwrap();
+            }
+            let checked = std::cell::Cell::new(None);
+            let actual = crate::init::owed_clone_captured(
+                &fixture.sys,
+                state.path(),
+                &holds,
+                captured.inputs,
+                || {
+                    let current = captured
+                        .snapshot
+                        .is_current_now(&fixture.paths)
+                        .map_err(|why| why.to_string())?;
+                    checked.set(Some(current));
+                    Ok(current)
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                checked.get(),
+                Some(changed != "stale-no-git"),
+                "the full fence always runs"
+            );
+            if changed == "stale-no-git" {
+                assert!(matches!(actual, OwedClone::Waiting(_)));
+                assert_ne!(
+                    actual, expected,
+                    "a stale vault still replaces the old disposition"
+                );
+            } else {
+                assert_eq!(actual, expected, "a current vault retains {changed}");
+            }
+            assert!(
+                !fixture
+                    .sys
+                    .calls()
+                    .iter()
+                    .any(|call| call.contains("credential fill") || call.contains(" clone "))
+            );
+        }
+    }
+
+    #[test]
+    fn captured_repository_readback_at_the_console_reads_no_workstation_census() {
+        use aterm_secrets::client;
+        let fixture = readback_fixture(true);
+        fixture.sys.stat_of("/dev/console", stat(false, 0o600));
+        assert!(!crate::console::remote(&fixture.sys));
+        fixture.sys.on(
+            &crate::facts::hidutil_keyboards().display(),
+            Ran::ok("Services:\n"),
+        );
+        let config = client::config(&fixture.paths).unwrap().unwrap();
+        let captured = client::with_materialization_ready_for_entries(
+            &fixture.paths,
+            &config,
+            &super::super::VAULT_INPUT_ENTRIES,
+            || {
+                InitialRepositoryInputs::capture(&fixture.sys, &fixture.ctx)
+                    .map_err(aterm_secrets::Error::new)
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let state = aterm_tempfile::tempdir().unwrap();
+        let reading = crate::init::owed_clone_captured(
+            &fixture.sys,
+            state.path(),
+            &crate::init::Holds::NONE,
+            captured.inputs,
+            || {
+                captured
+                    .snapshot
+                    .is_current_now(&fixture.paths)
+                    .map_err(|why| why.to_string())
+            },
+        )
+        .unwrap();
+        assert!(matches!(reading, crate::init::OwedClone::Verified { .. }));
+        assert!(
+            fixture
+                .sys
+                .calls()
+                .iter()
+                .all(|call| { !call.contains("hidutil") && call != "keyboard-service-ids" }),
+            "repository readback collected workstation facts: {:?}",
+            fixture.sys.calls()
+        );
+    }
+
+    #[test]
+    fn captured_automatic_readiness_fences_unlocked_helper_work_with_one_scoped_vault() {
+        use crate::init::{Holds, OwedClone};
+        use aterm_secrets::client;
+        for changed in [
+            "none",
+            "unrelated",
+            "token",
+            "writer",
+            "profile",
+            "capture-profile",
+        ] {
+            let ReadbackFixture {
+                paths,
+                source,
+                source_text,
+                sys,
+                who,
+                ctx,
+                token,
+                _root,
+            } = readback_fixture(true);
+            if changed == "capture-profile" {
+                let selected = who.clone();
+                let token_path = token.clone();
+                sys.on_owned_read(move |sys, path| {
+                    if path == token_path {
+                        scope(sys, &selected);
+                    }
+                });
+            }
+            let config = client::config(&paths).unwrap().unwrap();
+            let captured = client::with_materialization_ready_for_entries(
+                &paths,
+                &config,
+                &super::super::VAULT_INPUT_ENTRIES,
+                || InitialRepositoryInputs::capture(&sys, &ctx).map_err(aterm_secrets::Error::new),
+            )
+            .unwrap()
+            .unwrap();
+            let final_paths = paths.clone();
+            let selected = who.clone();
+            let held = Arc::new(Mutex::new(None));
+            let retain = Arc::clone(&held);
+            sys.simulate(move |sys, command| {
+                if command.display().contains("credential fill") {
+                    // Acquiring the actual writer lock proves the helper runs outside it.
+                    let writer = client::test_hold_state_lock(&paths).unwrap();
+                    if changed == "writer" {
+                        *retain.lock().unwrap() = Some(writer);
+                    } else {
+                        drop(writer);
+                        if changed == "profile" {
+                            scope(sys, &selected);
+                        }
+                        if matches!(changed, "token" | "unrelated") {
+                            aterm_uds::atomic_file::write(
+                                &source,
+                                if changed == "token" {
+                                    source_text.replace(TOKEN, "fixture-rotated-token")
+                                } else {
+                                    source_text.replace("unrelated=before", "unrelated=after")
+                                }
+                                .as_bytes(),
+                                0o600,
+                            )
+                            .unwrap();
+                            client::sync(&paths, None).unwrap();
+                        }
+                    }
+                }
+                None
+            });
+            let state = aterm_tempfile::tempdir().unwrap();
+            let owed = crate::init::owed_clone_captured(
+                &sys,
+                state.path(),
+                &Holds::NONE,
+                captured.inputs,
+                || {
+                    captured
+                        .snapshot
+                        .is_current_now(&final_paths)
+                        .map_err(|why| why.to_string())
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                matches!(owed, OwedClone::Verified { .. }),
+                matches!(changed, "none" | "unrelated"),
+                "{changed}: {owed:?}"
+            );
+            assert!(
+                matches!(changed, "none" | "unrelated") || matches!(owed, OwedClone::Waiting(_))
+            );
+            // A held writer remains held until after the nonwaiting final observation.
+            drop(held.lock().unwrap().take());
+            assert_eq!(
+                sys.calls()
+                    .iter()
+                    .filter(|call| call.contains("credential fill"))
+                    .count(),
+                usize::from(changed != "capture-profile")
+            );
+            assert!(
+                !sys.calls()
+                    .iter()
+                    .any(|call| call.contains(" clone ") || call.contains("agh GET"))
+            );
+        }
     }
 
     #[test]
@@ -1548,9 +2196,7 @@ pub(super) mod tests {
                 .inventory
                 .as_ref()
                 .unwrap()
-                .repositories()
-                .unwrap()
-                .repositories[0]
+                .repositories()[0]
                 .name,
             "first"
         );
@@ -1572,8 +2218,15 @@ pub(super) mod tests {
         let mut context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
         context.console = None;
         let captured = InitialRepositoryInputs::capture(&sys, &context).unwrap();
-        let rows =
-            run_captured(&sys, &context, Mode::Apply, captured, Box::new(|| Ok(true))).unwrap();
+        let rows = run_captured(
+            &sys,
+            &context,
+            Mode::Apply,
+            RepositoryWork::Refresh,
+            captured,
+            Box::new(|| Ok(true)),
+        )
+        .unwrap();
         assert_eq!(
             stage(&rows).outcome,
             crate::model::Outcome::Changed,
@@ -1750,6 +2403,7 @@ pub(super) mod tests {
                         &sys,
                         &ctx,
                         Mode::Apply,
+                        RepositoryWork::Refresh,
                         captured.inputs,
                         Box::new(move || {
                             captured
@@ -2776,6 +3430,402 @@ pub(super) mod tests {
             .collect()
     }
 
+    /// Default setup must refresh a clean acquired checkout, even when its local
+    /// origin refs still describe the old commit. Only the transport port substitutes
+    /// this private bare origin; the item admits the normal private GitHub identity.
+    /// Independent stores overlap within four lanes, while source withdrawal,
+    /// storage replacement and offline failures stop queued work without moving it.
+    #[test]
+    fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
+        use crate::port::Live;
+        for case in [
+            "clean",
+            "dirty",
+            "topic",
+            "recorded",
+            "shallow",
+            "partial",
+            "retargeted",
+            "late retargeted",
+            "changed source",
+            "late recorded",
+            "unchanged develop",
+            "parallel",
+            "parallel stopped",
+            "parallel rebound",
+            "parallel offline",
+            "serial unknown",
+            "serial shared",
+        ] {
+            let live = Live::new();
+            let repos = crate::checkout::tests::Repos::new(&live, "native-refresh");
+            let before = repos.head(&repos.work);
+            let mut works = vec![repos.work.clone()];
+            let parallel = case.starts_with("parallel");
+            let multiple = parallel || case.starts_with("serial");
+            if multiple {
+                for index in 1..6 {
+                    let path = Path::new(&repos.who.home).join(format!("work{index}"));
+                    repos.clone_into(&repos.origin, &path);
+                    works.push(path);
+                }
+            }
+            for path in &works {
+                let name = path.file_name().unwrap().to_str().unwrap();
+                let origin = format!("https://github.com/{}/{name}.git", repos.who.name);
+                repos.g(path, &["remote", "set-url", "origin", &origin]);
+            }
+            let tip = repos.advance("new-source.txt", "newly published source\n");
+            match case {
+                "dirty" => std::fs::write(repos.work.join("README"), b"preserved edits\n").unwrap(),
+                "topic" => {
+                    repos.g(&repos.work, &["switch", "--quiet", "-c", "topic"]);
+                }
+                "shallow" => {
+                    std::fs::write(repos.work.join(".git/shallow"), format!("{before}\n")).unwrap()
+                }
+                "partial" => {
+                    repos.g(
+                        &repos.work,
+                        &["config", "extensions.partialClone", "origin"],
+                    );
+                }
+                "retargeted" => {
+                    repos.g(&repos.work, &["config", "branch.main.remote", "other"]);
+                }
+                _ => {}
+            }
+            assert_eq!(repos.head(&repos.work), before);
+            assert_eq!(
+                repos.g(&repos.work, &["rev-parse", "refs/remotes/origin/main"]),
+                before
+            );
+
+            let mut sys = Fake::root();
+            sys.euid = repos.who.uid;
+            sys.logged_in(&repos.who)
+                .stat_of(
+                    &repos.who.home,
+                    Stat {
+                        uid: repos.who.uid,
+                        gid: repos.who.gid,
+                        ..stat(true, 0o700)
+                    },
+                )
+                .file(crate::items::github::CLT_GIT, b"selected fixture git")
+                .stat_of(
+                    repos.work.to_str().unwrap(),
+                    Stat {
+                        uid: repos.who.uid,
+                        gid: repos.who.gid,
+                        ..stat(true, 0o700)
+                    },
+                );
+            for work in &works {
+                for path in [work.clone(), work.join(".git"), work.join(".git/objects")] {
+                    sys.stat_of(path.to_str().unwrap(), live.stat(&path).unwrap());
+                    if case != "serial unknown" {
+                        let subject = if case == "serial shared" && path.ends_with(".git/objects") {
+                            repos.work.join(".git/objects")
+                        } else {
+                            path.clone()
+                        };
+                        sys.file_id_of(&path, live.file_id(&subject).unwrap());
+                    }
+                }
+            }
+            script::launcher(&sys, &repos.who);
+            source(
+                &sys,
+                Path::new(&repos.who.home)
+                    .join(super::super::TOKEN_FILE)
+                    .to_str()
+                    .unwrap(),
+            );
+            metadata(
+                &sys,
+                &repos.who,
+                aterm_json::Value::Array(
+                    works
+                        .iter()
+                        .enumerate()
+                        .map(|(index, path)| {
+                            repository(
+                                &repos.who.name,
+                                path.file_name().unwrap().to_str().unwrap(),
+                                index as u64 + 1,
+                            )
+                        })
+                        .collect(),
+                ),
+            );
+            if case == "recorded" {
+                let path = Path::new(&repos.who.home).join(".config/aterm/init.toml");
+                let bytes = b"[develop]\ncheckouts=['~/work']\n";
+                sys.file(path.to_str().unwrap(), bytes).stat_of(
+                    path.to_str().unwrap(),
+                    Stat {
+                        uid: repos.who.uid,
+                        gid: repos.who.gid,
+                        len: bytes.len() as u64,
+                        ..stat(false, 0o600)
+                    },
+                );
+            }
+            script::lookups_hold(&sys, &repos.who, GITHUB, &repos.who.name, TOKEN);
+            script::alike(&sys, &repos.who);
+            let paths = works.clone();
+            let bare = repos.origin.clone();
+            let inventory = Path::new(&repos.who.home).join(super::super::inventory::FILE);
+            let profile = Path::new(&repos.who.home).join(".config/aterm/init.toml");
+            let (uid, gid) = (repos.who.uid, repos.who.gid);
+            let who = repos.who.clone();
+            let gate = Arc::new((Mutex::new((0_usize, 0_usize)), std::sync::Condvar::new()));
+            let seen = Arc::clone(&gate);
+            sys.simulate(move |sys, command| {
+                let work = paths
+                    .iter()
+                    .find(|path| command.args.iter().any(|arg| arg == path.as_os_str()))?;
+                let mut command = command.clone();
+                let remote = command.args.iter().any(|arg| arg == "--symref");
+                if remote {
+                    if multiple {
+                        let (lock, turn) = &*seen;
+                        let mut state = lock.lock().unwrap();
+                        state.0 += 1;
+                        state.1 = state.1.max(state.0);
+                        turn.notify_all();
+                        if parallel {
+                            let (state, waited) = turn
+                                .wait_timeout_while(
+                                    state,
+                                    std::time::Duration::from_secs(60),
+                                    |state| state.1 < LANES_SEEN,
+                                )
+                                .unwrap();
+                            assert!(
+                                !waited.timed_out(),
+                                "four repository refreshes never ran at once"
+                            );
+                            drop(state);
+                        }
+                    }
+                    for arg in &mut command.args {
+                        if arg == "origin" {
+                            *arg = bare.as_os_str().to_owned();
+                        }
+                    }
+                } else if command.args.iter().any(|arg| arg == "fetch") {
+                    for arg in &mut command.args {
+                        if arg == "origin" {
+                            *arg = bare.as_os_str().to_owned();
+                        }
+                    }
+                    command
+                        .args
+                        .push("+refs/heads/*:refs/remotes/origin/*".into());
+                }
+                let ran = if remote && case == "parallel offline" {
+                    let mut ran = Ran::exit(128, "");
+                    ran.stderr = b"Could not resolve host: fixture.invalid".to_vec();
+                    ran
+                } else {
+                    Live::new().run_complete_stdout(&command).unwrap()
+                };
+                if remote && multiple {
+                    seen.0.lock().unwrap().0 -= 1;
+                }
+                if remote && case == "parallel stopped" {
+                    sys.file(
+                        inventory.to_str().unwrap(),
+                        b"source withdrawn during remote read",
+                    );
+                }
+                if remote && case == "parallel rebound" {
+                    let subject = work.join(".git/objects");
+                    let mut identity = Live::new().file_id(&subject).unwrap();
+                    identity.ino = identity.ino.wrapping_add(1);
+                    sys.file_id_of(&subject, identity);
+                }
+                if case == "late retargeted" && command.args.iter().any(|arg| arg == "--symref") {
+                    let live = Live::new();
+                    let changed = live
+                        .run_complete_stdout(&crate::checkout::git(&live, &who, Some(work)).args([
+                            "config",
+                            "branch.main.remote",
+                            "other",
+                        ]))
+                        .unwrap();
+                    assert!(changed.success());
+                }
+                if case == "changed source" && command.args.iter().any(|arg| arg == "--symref") {
+                    sys.file(
+                        inventory.to_str().unwrap(),
+                        b"source withdrawn during remote read",
+                    );
+                }
+                if matches!(case, "late recorded" | "unchanged develop")
+                    && command.args.iter().any(|arg| arg == "--symref")
+                {
+                    let bytes = if case == "late recorded" {
+                        b"[develop]\ncheckouts=['~/work']\n".as_slice()
+                    } else {
+                        b"[develop]\ncheckouts=[]\n".as_slice()
+                    };
+                    sys.file(profile.to_str().unwrap(), bytes).stat_of(
+                        profile.to_str().unwrap(),
+                        Stat {
+                            uid,
+                            gid,
+                            len: bytes.len() as u64,
+                            ..stat(false, 0o600)
+                        },
+                    );
+                }
+                Some(ran)
+            });
+            let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&repos.who));
+            let inputs = InitialRepositoryInputs::capture(&sys, &ctx).unwrap();
+            let check = run_captured(
+                &sys,
+                &ctx,
+                Mode::Plan,
+                RepositoryWork::Refresh,
+                inputs.clone(),
+                Box::new(|| Ok(true)),
+            )
+            .unwrap();
+            assert_eq!(
+                stage(&check).outcome,
+                crate::model::Outcome::Ok,
+                "{check:?}"
+            );
+            assert_eq!(repos.head(&repos.work), before);
+            assert!(
+                sys.calls()
+                    .iter()
+                    .all(|call| !call.contains("--symref") && !call.contains(" fetch "))
+            );
+
+            // A checkout-only repair wake uses the same real runner but never forces
+            // fresh remote heads of already acquired parents.
+            let repaired = run_captured(
+                &sys,
+                &ctx,
+                Mode::Apply,
+                RepositoryWork::Repair,
+                inputs.clone(),
+                Box::new(|| Ok(true)),
+            )
+            .unwrap();
+            assert_eq!(
+                stage(&repaired).outcome,
+                crate::model::Outcome::Ok,
+                "{case}: {repaired:?}"
+            );
+            assert_eq!(repos.head(&repos.work), before);
+            assert!(
+                sys.calls()
+                    .iter()
+                    .all(|call| !call.contains("--symref") && !call.contains(" fetch "))
+            );
+
+            let applied = run_captured(
+                &sys,
+                &ctx,
+                Mode::Apply,
+                RepositoryWork::Refresh,
+                inputs,
+                Box::new(|| Ok(true)),
+            )
+            .unwrap();
+            if matches!(
+                case,
+                "parallel stopped" | "parallel rebound" | "parallel offline"
+            ) {
+                assert_eq!(
+                    stage(&applied).outcome,
+                    crate::model::Outcome::Failed,
+                    "{case}: {applied:?}"
+                );
+                assert_eq!(gate.0.lock().unwrap().1, LANES_SEEN);
+                assert_eq!(
+                    sys.calls()
+                        .iter()
+                        .filter(|call| call.contains("--symref"))
+                        .count(),
+                    LANES_SEEN,
+                    "no queued repository starts after the batch stops"
+                );
+                assert!(
+                    sys.calls()
+                        .iter()
+                        .all(|call| !call.contains(" fetch ") && !call.contains(" merge "))
+                );
+                for path in &works {
+                    assert_eq!(repos.head(path), before);
+                }
+                continue;
+            }
+            if matches!(case, "changed source" | "late recorded" | "late retargeted") {
+                assert_eq!(
+                    stage(&applied).outcome,
+                    crate::model::Outcome::Failed,
+                    "{applied:?}"
+                );
+                assert!(sys.calls().iter().any(|call| call.contains("--symref")));
+                assert!(
+                    sys.calls()
+                        .iter()
+                        .all(|call| !call.contains(" fetch ") && !call.contains(" merge "))
+                );
+                assert_eq!(repos.head(&repos.work), before);
+                continue;
+            }
+            assert_eq!(
+                stage(&applied).outcome,
+                crate::model::Outcome::Ok,
+                "{applied:?}"
+            );
+            assert_eq!(
+                repos.head(&repos.work),
+                if matches!(case, "clean" | "unchanged develop") || multiple {
+                    tip.clone()
+                } else {
+                    before.clone()
+                },
+                "default Apply must refresh acquired clean code"
+            );
+            if multiple {
+                assert_eq!(
+                    gate.0.lock().unwrap().1,
+                    if parallel { LANES_SEEN } else { 1 }
+                );
+                for path in &works {
+                    assert_eq!(repos.head(path), tip);
+                    assert!(repos.status(path).is_empty());
+                }
+            }
+            if !matches!(case, "clean" | "unchanged develop") && !multiple {
+                assert!(
+                    sys.calls().iter().all(|call| !call.contains("--symref")
+                        && !call.contains(" fetch ")
+                        && !call.contains(" merge ")),
+                    "{case}: {:?}",
+                    sys.calls()
+                );
+            }
+            if case == "dirty" {
+                assert_eq!(
+                    std::fs::read(repos.work.join("README")).unwrap(),
+                    b"preserved edits\n"
+                );
+            } else {
+                assert!(repos.status(&repos.work).is_empty());
+            }
+        }
+    }
+
     #[test]
     fn private_inventory_branch_history_does_not_strand_new_checkouts() {
         for cached in [aterm_json::json!("old-default"), aterm_json::Value::Null] {
@@ -3256,7 +4306,7 @@ pub(super) mod tests {
     fn init_s_default_stage_without_a_token_is_not_applicable_and_asks_nothing() {
         let (sys, bare) = bare();
         let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&bare.user));
-        match item(&bare.user, None, true).probe(&sys, &context) {
+        match item(&bare.user, None, true, RepositoryWork::Refresh).probe(&sys, &context) {
             Probe::NotApplicable { why } => {
                 assert!(why.contains("~/.secrets/gh_access_token"), "{why}");
                 assert!(why.contains("on this Mac yet"), "{why}");
@@ -3272,20 +4322,20 @@ pub(super) mod tests {
             sys.calls()
         );
         assert!(matches!(
-            item(&bare.user, None, false).probe(&sys, &context),
+            item(&bare.user, None, false, RepositoryWork::Refresh).probe(&sys, &context),
             Probe::Blocked { .. }
         ));
         // On Linux the row names the machine, not a Mac.
         let (mut linux, _) = self::bare();
         linux.linux = true;
-        match item(&bare.user, None, true).probe(&linux, &context) {
+        match item(&bare.user, None, true, RepositoryWork::Refresh).probe(&linux, &context) {
             Probe::NotApplicable { why } => assert!(why.contains("on this machine yet"), "{why}"),
             other => panic!("{other:?}"),
         }
         // So does an init.toml `[github]` account's step, whose token file is not there yet
         // (with the distribution's git there, so the step reaches the token).
         linux.file(crate::items::github::SYSTEM_GIT, b"synthetic git");
-        match item(&bare.user, None, false).probe(&linux, &context) {
+        match item(&bare.user, None, false, RepositoryWork::Refresh).probe(&linux, &context) {
             Probe::Person { how, .. } => {
                 assert!(how.contains("is not on this machine yet"), "{how}");
             }

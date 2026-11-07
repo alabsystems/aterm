@@ -71,6 +71,14 @@
 //!    ([`PREFIX_HELD`]).
 //! 9. The remover returns.
 //!
+//! **The `--whole-wraps` arm** (one-mesh §11 H2) cuts the remover's batch after every `Wrap` of
+//! its `[everyone]` epoch rather than half of them ([`whole_wraps_len`]): island A holds each
+//! `Wrap` the batch signed, the admin's included, and none of its `Put`s, so no record says the
+//! batch is whole. Its last `Wrap` sorts above every seat the remover knew, so the epoch reads
+//! settled as it arrives, and the newcomer, a seat the remover never knew, is a gap below that
+//! frontier: it heals as soon as the islands do, not after the settle grace
+//! ([`FRONTIER_SETTLED`], judged in place of [`PREFIX_HELD`]).
+//!
 //! **Waits and timings.** A wait fails only once nothing it watches moved for one minute (the
 //! hang detector, [`HANG`]) past the longest timer the product's own rules may still be running
 //! when it starts, which each wait names ([`Schedule`]): a removal's coalesce waits out the
@@ -117,7 +125,7 @@ pub const HANG: Duration = Duration::from_secs(60);
 pub const LIVELOCK: Duration = Duration::from_secs(600);
 
 /// The usage line.
-pub const USAGE: &str = "mesh churn [--n N] [--seed S] [--minutes M] [--negative-control NAME] [--aterm PATH] [--keep] [--record] [--label WORD]";
+pub const USAGE: &str = "mesh churn [--n N] [--seed S] [--minutes M] [--whole-wraps] [--negative-control NAME] [--aterm PATH] [--keep] [--record] [--label WORD]";
 
 /// This lab's verb for a Mac's subscriber ([`member_main`]).
 pub const MEMBER_VERB: &str = "mesh-churn-member";
@@ -205,6 +213,11 @@ pub struct Control {
     pub switch: &'static str,
     /// The check that must fail under it.
     pub breaks: &'static str,
+    /// The arm in which it can break that check: the `--whole-wraps` one (else the plain lane).
+    /// `frontier-settled` is judged only there; `unsettled-ok`'s `prefix-held` only outside it;
+    /// and there `old-gap-rule` leaves `newest-key` held, for that arm's only gap is a seat the
+    /// remover never knew, which the old rule heals too.
+    pub whole_wraps: bool,
 }
 
 /// The controls of §10 whose scenario this lab runs. `no-inventory-on-gap` and
@@ -215,16 +228,27 @@ pub struct Control {
 /// own `Wrap`s land once it returns, so a heal from its prefix leaves at most two `Wrap`s to one
 /// recipient (the heal's and the remover's), as a heal after the settle grace does. Only when
 /// the heal signed tells the two apart.
+///
+/// `frontier-blind` (one-mesh §11 H2) breaks [`FRONTIER_SETTLED`] in the `--whole-wraps` arm:
+/// it reads a whole batch that ends in `Wrap`s as a prefix until the settle grace, as before H2.
 pub const CONTROLS: &[Control] = &[
     Control {
         name: "old-gap-rule",
         switch: "OLD_GAP_RULE",
         breaks: NEWEST_KEY,
+        whole_wraps: false,
     },
     Control {
         name: "unsettled-ok",
         switch: "UNSETTLED_OK",
         breaks: PREFIX_HELD,
+        whole_wraps: false,
+    },
+    Control {
+        name: "frontier-blind",
+        switch: "FRONTIER_BLIND",
+        breaks: FRONTIER_SETTLED,
+        whole_wraps: true,
     },
 ];
 
@@ -260,6 +284,8 @@ pub struct Args {
     pub seed: u64,
     /// How long the sleepers stay stopped.
     pub minutes: u64,
+    /// The `--whole-wraps` arm: island A takes every `Wrap` of the remover's `[everyone]` epoch.
+    pub whole_wraps: bool,
     /// The negative control set in every Mac's world.
     pub control: Option<Control>,
     /// The aterm under test.
@@ -286,12 +312,14 @@ fn label_word(word: &str) -> bool {
 /// takes.
 ///
 /// # Errors
-/// An unknown flag, a missing or bad value, or a control this lab does not run (exit 2).
+/// An unknown flag, a missing or bad value, a control this lab does not run, or one whose check
+/// the arm does not judge (exit 2).
 pub fn parse(args: &[String], seed: u64) -> Result<Args, Fail> {
     let mut out = Args {
         n: DEFAULT_N,
         seed,
         minutes: DEFAULT_MINUTES,
+        whole_wraps: false,
         control: None,
         aterm: None,
         keep: false,
@@ -347,6 +375,7 @@ pub fn parse(args: &[String], seed: u64) -> Result<Args, Fail> {
                 );
             }
             "--aterm" => out.aterm = Some(value("--aterm")?),
+            "--whole-wraps" => out.whole_wraps = true,
             "--keep" => out.keep = true,
             "--record" => out.record = true,
             "--label" => {
@@ -364,6 +393,18 @@ pub fn parse(args: &[String], seed: u64) -> Result<Args, Fail> {
                 )));
             }
         }
+    }
+    if let Some(control) = out.control.filter(|c| c.whole_wraps != out.whole_wraps) {
+        return Err(Fail::usage(format!(
+            "mesh churn: {} can break {} only {} --whole-wraps",
+            control.name,
+            control.breaks,
+            if control.whole_wraps {
+                "with"
+            } else {
+                "without"
+            }
+        )));
     }
     Ok(out)
 }
@@ -622,6 +663,8 @@ pub struct Partial {
     pub delivered: BTreeSet<Recipient>,
     /// When the lab began posting the prefix to island A's servers (Unix milliseconds).
     pub reached_ms: u64,
+    /// When the islands began to heal (Unix milliseconds; 0 before).
+    pub heal_ms: u64,
     /// The `Wrap`s of the epoch that seats other than its minter's signed, read once the heal's
     /// wait ended: each by the Mac whose seat signed it, to its recipient, with its authored
     /// time (Unix milliseconds).
@@ -678,6 +721,8 @@ pub struct Evidence {
     pub split: Split,
     /// The killed remover's partial epoch and the heal's `Wrap`s of it.
     pub partial: Partial,
+    /// The run is the `--whole-wraps` arm.
+    pub whole_wraps: bool,
     /// The negative control the run set.
     pub control: Option<Control>,
 }
@@ -724,8 +769,16 @@ pub const WRAP_BOUND: &str = "wrap-bound";
 /// No Mac healed the partial epoch from its prefix: every `Wrap` of it that a Mac but its minter
 /// signed before the remover returned came at least the product's settle grace
 /// ([`client::SETTLE_GRACE_MS`]) after the lab began posting the prefix to island A, before
-/// which no Mac could have seen the epoch.
+/// which no Mac could have seen the epoch. Judged outside the `--whole-wraps` arm.
 pub const PREFIX_HELD: &str = "prefix-held";
+/// The `--whole-wraps` arm's: the heal's first `Wrap` of the partial epoch came inside the settle
+/// grace ([`client::SETTLE_GRACE_MS`]) after the lab began posting its batch's `Wrap`s to island
+/// A, where the islands began to heal in the first half of it: a batch whose last `Wrap` sorts
+/// above every seat its minter knew settles as it arrives, so a gap below it (the newcomer) heals
+/// once the islands' records cross (one-mesh §11 H2), and before H2 nothing could heal it until
+/// the grace ran out. The newcomer reaches island A only after the heal, so a heal begun later
+/// leaves the crossing too little of the grace to tell the two apart.
+pub const FRONTIER_SETTLED: &str = "frontier-settled";
 /// No removed Mac is wrapped by a current member's newest epoch or seated by its log, and none
 /// reads itself a current member.
 pub const REMOVED_NO_KEY: &str = "removed-no-key";
@@ -1046,45 +1099,90 @@ pub fn judge(ev: &Evidence) -> Vec<Check> {
 
     let grace = client::SETTLE_GRACE_MS;
     let after = |at: u64| at.saturating_sub(partial.reached_ms);
-    let early: Vec<String> = partial
-        .heal_wraps
-        .iter()
-        .filter(|(_, _, at)| after(*at) < grace)
-        .map(|(by, _, at)| format!("{by} {:.1}s", after(*at) as f64 / 1000.0))
-        .collect();
-    let judged = partial.read && partial.epoch.is_some() && !partial.heal_wraps.is_empty();
-    push(
-        PREFIX_HELD,
-        judged,
-        early.is_empty(),
-        if !judged {
-            "no heal Wrap of a partial [everyone] epoch was read, so none says when the heal signed"
-                .to_owned()
-        } else if early.is_empty() {
-            format!(
-                "every one of {} heal Wraps of the partial epoch came {:.1}s or more after its \
-                 prefix reached island A (the settle grace is {}s)",
-                partial.heal_wraps.len(),
-                partial
-                    .heal_wraps
-                    .iter()
-                    .map(|(_, _, at)| after(*at))
-                    .min()
-                    .unwrap_or(0) as f64
-                    / 1000.0,
-                grace / 1000
-            )
-        } else {
-            format!(
-                "{} of {} heal Wraps of the partial epoch came inside the {}s settle grace after \
-                 its prefix reached island A, signed from the prefix: {}",
-                early.len(),
-                partial.heal_wraps.len(),
-                grace / 1000,
-                early.join(", ")
-            )
-        },
-    );
+    if ev.whole_wraps {
+        let first = partial.heal_wraps.iter().map(|(_, _, at)| *at).min();
+        // Before H2 no Mac heals before the grace from the batch's posting, the first any Mac
+        // could see it. Under H2 the gap (the newcomer) reaches island A only once the islands
+        // heal, so the first heal comes then plus the records' crossing: a run tells the two
+        // apart only where the heal begins with half the grace left for that.
+        let inside = partial.heal_ms > 0 && after(partial.heal_ms) < grace / 2;
+        let judged = partial.read && partial.epoch.is_some() && first.is_some() && inside;
+        push(
+            FRONTIER_SETTLED,
+            judged,
+            first.is_some_and(|at| after(at) < grace),
+            match first {
+                _ if !partial.read || partial.epoch.is_none() => {
+                    "no partial [everyone] epoch was read once the heal's wait ended".to_owned()
+                }
+                None => "no Mac but the remover signed a Wrap of the partial epoch, so none says \
+                         when the heal signed"
+                    .to_owned(),
+                Some(at) if !inside => format!(
+                    "the islands began to heal {:.1}s after the batch's Wraps reached island A, \
+                     past half the {}s settle grace, which leaves the records too little of it to \
+                     cross, so this run cannot tell a frontier from the grace (the first heal Wrap \
+                     came {:.1}s after)",
+                    after(partial.heal_ms) as f64 / 1000.0,
+                    grace / 1000,
+                    after(at) as f64 / 1000.0
+                ),
+                Some(at) => format!(
+                    "the heal's first Wrap of the partial epoch came {:.1}s after its batch's \
+                     Wraps reached island A and {:.1}s after the islands began to heal ({}; the \
+                     settle grace is {}s)",
+                    after(at) as f64 / 1000.0,
+                    at.saturating_sub(partial.heal_ms) as f64 / 1000.0,
+                    if after(at) < grace {
+                        "inside the grace: the frontier settled the batch"
+                    } else {
+                        "past the grace: the heal waited it out"
+                    },
+                    grace / 1000
+                ),
+            },
+        );
+    } else {
+        let early: Vec<String> = partial
+            .heal_wraps
+            .iter()
+            .filter(|(_, _, at)| after(*at) < grace)
+            .map(|(by, _, at)| format!("{by} {:.1}s", after(*at) as f64 / 1000.0))
+            .collect();
+        let judged = partial.read && partial.epoch.is_some() && !partial.heal_wraps.is_empty();
+        push(
+            PREFIX_HELD,
+            judged,
+            early.is_empty(),
+            if !judged {
+                "no heal Wrap of a partial [everyone] epoch was read, so none says when the heal signed"
+                    .to_owned()
+            } else if early.is_empty() {
+                format!(
+                    "every one of {} heal Wraps of the partial epoch came {:.1}s or more after its \
+                     prefix reached island A (the settle grace is {}s)",
+                    partial.heal_wraps.len(),
+                    partial
+                        .heal_wraps
+                        .iter()
+                        .map(|(_, _, at)| after(*at))
+                        .min()
+                        .unwrap_or(0) as f64
+                        / 1000.0,
+                    grace / 1000
+                )
+            } else {
+                format!(
+                    "{} of {} heal Wraps of the partial epoch came inside the {}s settle grace after \
+                     its prefix reached island A, signed from the prefix: {}",
+                    early.len(),
+                    partial.heal_wraps.len(),
+                    grace / 1000,
+                    early.join(", ")
+                )
+            },
+        );
+    }
 
     let mut kept_in = Vec::new();
     for (name, recipient) in &ev.removed {
@@ -2757,6 +2855,7 @@ impl Timed {
 #[allow(clippy::too_many_lines)]
 fn run(lab: &mut Lab) -> Result<Evidence, Fail> {
     let mut ev = Evidence {
+        whole_wraps: lab.args.whole_wraps,
         control: lab.args.control,
         ..Evidence::default()
     };
@@ -2938,6 +3037,7 @@ fn run(lab: &mut Lab) -> Result<Evidence, Fail> {
     let all: Vec<usize> = (0..lab.macs.len()).collect();
     let before_heal = held_by(lab, &all);
     let heal_ms = unix_ms();
+    ev.partial.heal_ms = heal_ms;
     lab.cut(false)?;
     lab.say("the islands heal (the cut files emptied)");
     let watch = lab.current_up(&ev.current);
@@ -3237,7 +3337,15 @@ fn split_steps(
         .collect();
     batch.sort_by_key(|rec| rec.sequence());
     let admin = see(&name(0), &lab.macs[0].paths(), true).recipient;
-    let prefix = partial(&batch, admin.as_ref());
+    let prefix = if lab.args.whole_wraps {
+        let parts: Vec<(Kind, bool)> = batch
+            .iter()
+            .map(|r| (r.kind(), everyone_epoch(r)))
+            .collect();
+        batch[..whole_wraps_len(&parts)].to_vec()
+    } else {
+        partial(&batch, admin.as_ref())
+    };
     let epoch = prefix
         .iter()
         .find(|rec| everyone_epoch(rec))
@@ -3302,8 +3410,7 @@ fn split_steps(
     lab.down(r);
     lab.say(&format!(
         "{} removed {} ({c_label}): signed {} records ({}), {} reached {} of island A's {} \
-         servers, through its [everyone] epoch {} and short of its Wrap to m00, the vault's \
-         admin; then it was killed",
+         servers, through its [everyone] epoch {} and {}; then it was killed",
         name(r),
         name(c),
         batch.len(),
@@ -3314,7 +3421,12 @@ fn split_steps(
         ev.partial
             .epoch
             .as_ref()
-            .map_or_else(|| "(none)".to_owned(), short)
+            .map_or_else(|| "(none)".to_owned(), short),
+        if lab.args.whole_wraps {
+            "every Wrap of it, short of its first Put (--whole-wraps)"
+        } else {
+            "short of its Wrap to m00, the vault's admin"
+        }
     ));
     ev.current.remove(&name(c));
     if let Some(recipient) = see(&name(c), &lab.macs[c].paths(), true).recipient {
@@ -3635,6 +3747,26 @@ pub fn partial<'a>(batch: &[&'a Record], admin: Option<&Recipient>) -> Vec<&'a R
     batch[..prefix_len(&parts, to_admin)].to_vec()
 }
 
+/// How many of a batch's records the `--whole-wraps` arm delivers, by each one's kind in signing
+/// order and whether it mints the `[everyone]` epoch: through that `Epoch` and every `Wrap` right
+/// after it, short of the first record that is not one; half the batch where none mints it, as
+/// [`prefix_len`].
+#[must_use]
+pub fn whole_wraps_len(parts: &[(Kind, bool)]) -> usize {
+    let Some(epoch) = parts
+        .iter()
+        .position(|(kind, everyone)| *everyone && *kind == Kind::Epoch)
+    else {
+        return parts.len() / 2;
+    };
+    epoch
+        + 1
+        + parts[epoch + 1..]
+            .iter()
+            .take_while(|(kind, _)| *kind == Kind::Wrap)
+            .count()
+}
+
 /// `record` mints an `[everyone]` epoch.
 fn everyone_epoch(record: &Record) -> bool {
     matches!(
@@ -3832,6 +3964,10 @@ pub fn record_arm(args: &Args) -> (String, String) {
     if args.n != DEFAULT_N {
         let _ = write!(arm, "-n{}", args.n);
         let _ = write!(flags, " --n {}", args.n);
+    }
+    if args.whole_wraps {
+        arm.push_str("-whole-wraps");
+        flags.push_str(" --whole-wraps");
     }
     if let Some(control) = args.control {
         let _ = write!(arm, "-nc-{}", control.name);

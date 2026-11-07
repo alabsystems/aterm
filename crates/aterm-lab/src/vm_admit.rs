@@ -159,7 +159,7 @@ pub fn admit(guest: &Guest, booting: bool) -> Result<Admitted, Fail> {
     let need = guest.need(&verb, booting).checkout(crate::linux::repo());
     let mode = crate::linux::run_admit();
     let say = &mut |line: &str| println!("{}: {line}", guest.lane);
-    match Ledger::user() {
+    let admitted = match Ledger::user() {
         Some(ledger) => admit_in(
             &ledger,
             &aterm_capacity::Live,
@@ -174,7 +174,23 @@ pub fn admit(guest: &Guest, booting: bool) -> Result<Admitted, Fail> {
             guest,
             "no home to keep the capacity ledger under",
         )),
+    };
+    if admitted.is_ok() {
+        GRANTED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    admitted
+}
+
+/// Whether this run's VM was admitted ([`admit`]): set once it was, so the boot's disk claim
+/// keeps what the VM's directory took only for a run that went on to its VM
+/// (`crate::linux::LaneLock`).
+static GRANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this run's VM was admitted: false for a run whose admission an interrupt or a NOT
+/// RUN ended, or that never asked, and which therefore booted nothing and ran nothing on it.
+#[must_use]
+pub fn granted() -> bool {
+    GRANTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// [`admit`] in `ledger` on `machine`, at `pace`, its wait ended when `stopped` says an
@@ -214,6 +230,16 @@ pub fn admit_in(
         }
         Err(Error::Never(why)) => Err(crate::linux::not_run(format!(
             "{why}; the VM can never boot here"
+        ))),
+        Err(e @ Error::Unmet { .. }) => Err(crate::linux::not_run(format!(
+            "its claim for {} was refused: {e}, {}; this run {}",
+            guest.vm,
+            crate::linux::AT_ONCE,
+            if booting {
+                "booted nothing"
+            } else {
+                "ran nothing on it"
+            }
         ))),
         Err(Error::Ledger(e)) => Ok(unclaimed(guest, &e.to_string())),
         Err(Error::Timing(why)) => Err(crate::linux::not_run(format!(
@@ -405,6 +431,7 @@ impl Booter {
             since: self.since,
             verb: self.verb.clone(),
             checkout: self.checkout.clone(),
+            credit: Vec::new(),
             stalled: None,
         };
         let offset = i64::try_from(self.since)
@@ -720,6 +747,7 @@ mod tests {
             whole: 14 << 30,
             written: 0,
             cpu_ns: 0,
+            runnable_ns: 0,
         }])));
 
         let stop = Arc::new(AtomicBool::new(false));

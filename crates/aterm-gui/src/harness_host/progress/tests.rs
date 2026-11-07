@@ -106,6 +106,7 @@ pub(in crate::harness_host) fn host_for(
         login_latches: Arc::default(),
         restored: Mutex::default(),
         restored_wake: Condvar::new(),
+        landing_look_out: Arc::default(),
         inbox_lane: 0,
         restart_panics: AtomicBool::new(false),
         passes_panic: AtomicBool::new(false),

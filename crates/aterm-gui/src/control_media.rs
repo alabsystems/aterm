@@ -5544,7 +5544,7 @@ mod worker_start_app_tests {
             let record = ctx.timeline.lock().unwrap().task().cloned().unwrap();
             assert_eq!(
                 (record.state, record.why),
-                (TaskState::Stalled, Some("held"))
+                (TaskState::Stalled, Some(crate::task_record::WHY_CANCELLED))
             );
             assert!(
                 !record.attention,
@@ -5560,7 +5560,8 @@ mod worker_start_app_tests {
 
     /// A SHUTDOWN WHILE A REDRAWN PROMPT SETTLES BLAMES NO SHELL. The look again after a redraw
     /// ends on the same cancellation as the launcher's first look, so it says the same word: a
-    /// dispatcher reading `why=shell` would hold a working member's shell at fault.
+    /// dispatcher reading `why=shell` would hold a working member's shell at fault, and one reading
+    /// `why=held` would wait for a worker that never started.
     #[cfg(unix)]
     #[test]
     fn a_shutdown_while_a_redrawn_prompt_settles_blames_no_shell() {
@@ -5587,11 +5588,114 @@ mod worker_start_app_tests {
             let record = ctx.timeline.lock().unwrap().task().cloned().unwrap();
             assert_eq!(
                 (record.state, record.why),
-                (TaskState::Stalled, Some("held"))
+                (TaskState::Stalled, Some(crate::task_record::WHY_CANCELLED))
             );
-            assert!(!record.attention, "a shutdown asks nothing of anyone");
+            assert!(!record.attention, "a shutdown raises no attention");
             drop(launch);
             pause.try_wait().unwrap().resume().unwrap();
+        });
+    }
+
+    /// A SHUTDOWN STOPS A LAUNCH THE SAME AT EVERY STEP: before its launcher ran, and at a pool's
+    /// wait, whose gave-up word would otherwise be read as the shell's end ([`session_alive`] reads
+    /// the cancellation as one). Each says `why=cancelled` and raises nothing. CONTROL: at the same
+    /// wait with nothing cancelled, the pool's refusal is why.
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_a_shutdown_stops_says_so_at_every_step() {
+        let cancelled = |stop: &dyn Fn(crate::task_launch::Launch)| {
+            let state = aterm_tempfile::TempDir::new().unwrap();
+            crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+                let app = App::headless_for_test();
+                let sid = sid_of(&app, 0);
+                let ctx = ctx_of(&app, 0);
+                let mut ask = worker();
+                ask.order.agent = aterm_phase::Program::Agy;
+                let launch = app.start_worker(&sid, ask).unwrap();
+                let pause = app.account_work.pause().unwrap();
+                assert!(launch.account_scope.as_ref().unwrap().cancelled());
+                let pause = pause.try_wait().unwrap_err();
+                stop(launch);
+                let record = ctx.timeline.lock().unwrap().task().cloned().unwrap();
+                assert_eq!(
+                    (record.state, record.why),
+                    (TaskState::Stalled, Some(crate::task_record::WHY_CANCELLED))
+                );
+                assert!(!record.attention, "a shutdown raises no attention");
+                pause.try_wait().unwrap().resume().unwrap();
+            });
+        };
+        cancelled(&crate::task_launch::launch_worker);
+        cancelled(&|launch| crate::task_launch::stall_gave_up(&launch, "no account of its pool"));
+
+        let state = aterm_tempfile::TempDir::new().unwrap();
+        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+            let app = App::headless_for_test();
+            let sid = sid_of(&app, 0);
+            let ctx = ctx_of(&app, 0);
+            let mut ask = worker();
+            ask.order.agent = aterm_phase::Program::Agy;
+            let launch = app.start_worker(&sid, ask).unwrap();
+            crate::task_launch::stall_gave_up(&launch, "no account of its pool");
+            let record = ctx.timeline.lock().unwrap().task().cloned().unwrap();
+            assert_eq!(
+                (record.state, record.why),
+                (TaskState::Stalled, Some("startup"))
+            );
+            assert!(record.attention, "CONTROL: the pool's refusal is why");
+        });
+    }
+
+    /// A QUIT DOES NOT WAIT OUT A HELD LAUNCH'S LOOK. The launch is parked on a look far longer than
+    /// this test may take, so only the quit's ring can end it, and it then says `why=cancelled` and
+    /// raises nothing. NEGATIVE CONTROL: a pause alone left it parked: a live quit took 50 s, until
+    /// the look ended, and a stop's 30 s clock could have killed it before its mark.
+    #[cfg(unix)]
+    #[test]
+    fn a_quit_wakes_a_launch_held_on_its_pool_and_it_says_why_cancelled() {
+        const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
+        let state = aterm_tempfile::TempDir::new().unwrap();
+        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+            let mut app = App::headless_for_test();
+            let sid = sid_of(&app, 0);
+            let ctx = ctx_of(&app, 0);
+            let mut ask = worker();
+            ask.order.agent = aterm_phase::Program::Agy;
+            let launch = app.start_worker(&sid, ask).unwrap();
+            let watchers = launch.ctx.watchers.clone();
+            let watching = watchers.count();
+            let (ended, heard) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut wait = crate::task_launch::pool_wait_for(&launch, "no account can take it");
+                let went_on = wait(&crate::task_launch::PoolWait::Hold {
+                    until: 1_794_170_393,
+                    why: "no account can take it".to_string(),
+                    look: std::time::Duration::from_secs(3600),
+                });
+                drop(wait);
+                crate::task_launch::stall_gave_up(&launch, "no account can take it");
+                drop(launch);
+                let _ = ended.send(went_on);
+            });
+            let started = std::time::Instant::now();
+            while watchers.count() == watching {
+                assert!(started.elapsed() < HANG_DETECTOR, "the launch never parked");
+                aterm_uds::deadline::poll_yield();
+            }
+            // Time for it to park rather than read the quit at its first look, which would prove
+            // nothing. A launch not yet parked passes as well, so this budgets nothing.
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            assert!(!app.accounts_drained_before(crate::app_account_work::Continuation::Quit));
+            let went_on = heard
+                .recv_timeout(HANG_DETECTOR)
+                .expect("the quit woke the launch");
+            assert!(!went_on, "the quit ended its wait");
+            let record = ctx.timeline.lock().unwrap().task().cloned().unwrap();
+            assert_eq!(
+                (record.state, record.why),
+                (TaskState::Stalled, Some(crate::task_record::WHY_CANCELLED))
+            );
+            assert!(!record.attention, "a shutdown raises no attention");
         });
     }
 

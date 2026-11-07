@@ -5,10 +5,10 @@
 use super::super::policy::WorkerEnv;
 use super::super::policy::approval::RULE_RM_BREAKER_WARN;
 use super::super::policy::approval::{
-    AnswerTarget, ApprovalCtx, Choice, DeclineStep, QuestionPriority, RULE_ANSWER_LAND,
-    RULE_ANSWER_LONG_TERM, RULE_ANSWER_SHORT_TERM, RULE_AUTO_MODE_SETUP, RULE_AUTOCOMPACT_OFFER,
-    RULE_CHROME_INTRO, RULE_LIMIT_RESET, RULE_LIMIT_WAIT, RULE_TRUST_ANY, RULE_TRUST_DIALOG,
-    decide, proof_would_lift, reads_from_stand, unvoiced_tools,
+    AnswerTarget, ApprovalCtx, Choice, DeclineStep, PriorityWord, QuestionPriority,
+    RULE_ANSWER_LAND, RULE_ANSWER_LONG_TERM, RULE_ANSWER_SHORT_TERM, RULE_AUTO_MODE_SETUP,
+    RULE_AUTOCOMPACT_OFFER, RULE_CHROME_INTRO, RULE_LIMIT_RESET, RULE_LIMIT_WAIT, RULE_TRUST_ANY,
+    RULE_TRUST_DIALOG, decide, proof_would_lift, reads_from_stand, unvoiced_tools,
 };
 use super::super::policy::box_call;
 use super::super::policy::box_facts::{BoxFacts, QuestionFacts};
@@ -275,7 +275,7 @@ fn text_unfenced(caps: &Caps, screen: &Screen) -> Option<String> {
 /// How a session's question is answered ([`Session::question_policy`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct QuestionPolicy {
-    pub(super) answer: Option<QuestionPriority>,
+    pub(super) answer: Option<PriorityWord>,
     pub(super) by_session: bool,
     pub(super) why: Option<String>,
 }
@@ -312,7 +312,7 @@ fn session_word(word: &str) -> QuestionPolicy {
             why: None,
         };
     }
-    match QuestionPriority::parse(word) {
+    match PriorityWord::parse(word) {
         Some(p) => QuestionPolicy {
             answer: Some(p),
             by_session: true,
@@ -1505,15 +1505,15 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// THE PRIORITY THIS SESSION'S DIALOG IS ANSWERED UNDER: Land's ([`QuestionPriority::Land`])
-    /// over every answering word where the session's Autopilot is Land, else `word`. A switch of
-    /// the Autopilot alone mid-dialog finishes the dialog under its first key's priority, so it is
-    /// never handed to a person; a person's change of a word under Cruise still is.
-    fn dialog_priority(&self, word: QuestionPriority, opts: &SuperviseOpts) -> QuestionPriority {
+    /// over every answering word where the session's Autopilot is Land, else `word`'s. A switch
+    /// of the Autopilot alone mid-dialog finishes the dialog under its first key's priority, so it
+    /// is never handed to a person; a person's change of a word under Cruise still is.
+    fn dialog_priority(&self, word: PriorityWord, opts: &SuperviseOpts) -> QuestionPriority {
         let land = QuestionPriority::Land;
         let now = if self.autopilot(opts) == Autopilot::Land {
             land
         } else {
-            word
+            word.into()
         };
         match self.question.mode {
             Some(first) if (first == land) != (now == land) => first,
@@ -3414,5 +3414,47 @@ mod act_tests {
         let bare = crate::supervise::ScratchDir::new("acts", "bare");
         assert_eq!(write_rows(&bare, None).len(), ROWS.len());
         assert_eq!(host.acts.lock().unwrap().len(), told.len());
+    }
+}
+
+#[cfg(test)]
+mod session_word_tests {
+    use super::*;
+    use crate::supervise::policy::question::LAND_TEXT;
+    use crate::supervise::policy::turn_end::is_land_rule;
+
+    /// A SESSION WORD NEVER YIELDS LAND'S PRIORITY: each word a person sets answers by itself, a
+    /// priority other than Land's whose text is not Land's and whose prose rule is no land rule,
+    /// and `land`, in any case, is a word this supervisor does not know, so the question is the
+    /// person's: Land's priority is the session's Autopilot's alone (`dialog_priority`). NEGATIVE
+    /// CONTROL: Land's own priority writes Land's text. MUTANT: `From<PriorityWord>` taking
+    /// `short-term` to Land, or a `land` word added to `PriorityWord`.
+    #[test]
+    fn a_session_word_never_yields_lands_priority() {
+        let land = QuestionPriority::Land;
+        assert_eq!(land.text(), Some(LAND_TEXT), "NEGATIVE CONTROL");
+        for p in PriorityWord::ALL {
+            let policy = session_word(p.word());
+            assert_eq!(
+                (policy.answer, policy.by_session, policy.session_reason()),
+                (Some(p), true, None),
+                "{p:?}"
+            );
+            let priority = QuestionPriority::from(p);
+            assert_ne!(priority, land, "{p:?}");
+            assert_eq!(priority.word(), p.word(), "{p:?}");
+            assert_ne!(p.text(), land.text(), "{p:?}");
+            assert!(!is_land_rule(p.prose_rule_id()), "{p:?}");
+        }
+        for word in ["land", "Land", " LAND "] {
+            let policy = session_word(word);
+            assert_eq!(policy.answer, None, "{word:?}");
+            assert!(
+                policy
+                    .session_reason()
+                    .is_some_and(|why| why.contains("is not one this supervisor knows")),
+                "{word:?}: {policy:?}"
+            );
+        }
     }
 }

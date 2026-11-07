@@ -227,7 +227,7 @@ impl AccountsHost for Host {
             self.approval.live.store(false, Ordering::SeqCst);
         }
         if self.mode == 4 {
-            fs::write(
+            crate::test_config::write(
                 config_beside_for_test(&self.roster),
                 "[harness]\nlogins = 'off'\n",
             )
@@ -781,7 +781,7 @@ impl shared_provider::LoginProof for ChangedProof {
         if let Some(work) = &self.change.cancel {
             drop(work.pause().unwrap());
         } else if let Some(off) = self.change.off {
-            fs::write(&self.change.config, off).unwrap();
+            crate::test_config::write(&self.change.config, off).unwrap();
         } else {
             self.change.approval.live.store(false, Ordering::SeqCst);
         }

@@ -13,7 +13,10 @@ use crate::stats_deck::DeckGeom;
 use crate::stats_paint::{Hit, HitKind, Painter, panel};
 use crate::widget::{DrawPrim, rgba};
 
+pub(crate) mod field;
 mod repair;
+
+pub(crate) use field::{SeatClass, SeatKey};
 
 /// Fixed headroom, independent of the number or state of peers.
 pub(crate) const HEIGHT_PT: f64 = 30.0;
@@ -180,9 +183,20 @@ pub(crate) fn snapshot_after_read(
 }
 
 impl crate::App {
+    /// The width (device px) and scale of the Network State band window `wid` draws, as its
+    /// deck and lens frames lay it out: what its keys and meters lay the Fleet Field out on.
+    pub(crate) fn network_band_px(&self, wid: crate::WindowId) -> (f32, f32) {
+        let Some(ws) = self.windows.get(&wid) else {
+            return (0.0, 1.0);
+        };
+        let (cw, _) = self.win_cell_size(wid);
+        let pad = self.win_pad(wid);
+        ((ws.cols as usize * cw + 2 * pad) as f32, ws.scale as f32)
+    }
+
     /// Whether a visible window draws the Network State band (the deck) or its lens: what the
     /// lab's account rows are for.
-    fn network_band_drawn(&self) -> bool {
+    pub(crate) fn network_band_drawn(&self) -> bool {
         let deck_shown = self.stats_bars_form() == crate::stats_deck::StatsBars::Deck;
         self.windows.values().any(|window| {
             !window.occluded
@@ -200,25 +214,69 @@ impl crate::App {
         };
         if self.network_source.is_none() {
             // With no network source the band still carries the lab's account cells, which
-            // the feed reprojects once a minute ([`crate::lab_deck::Feed::EVERY`]); the Lab
-            // page draws none of them.
-            return (self.lab_deck_feed.live && self.network_band_drawn()).then(due);
+            // the feed reprojects once a minute ([`crate::lab_deck::Feed::EVERY`]), and the
+            // Fleet Field, which follows the fleet glance's slot; the Lab page draws neither.
+            return ((self.lab_deck_feed.live || self.fleet_glance.is_some())
+                && self.network_band_drawn())
+            .then(due);
         }
         (self.lab_page_shown() || self.network_band_drawn()).then(due)
+    }
+
+    /// Project the Fleet Field again where what it stands on moved: the glance's generation,
+    /// its error and fleet flags, the observer's words it leads with, or a freshness edge
+    /// ([`crate::fleet_glance::FleetSnapshot::next_freshness_change`]) passed at `now_ms`.
+    /// Whether the field's key moved. Only a drawn band calls it.
+    pub(crate) fn reproject_fleet_field(&mut self, now_ms: u64) -> bool {
+        use std::hash::{Hash, Hasher};
+        let Some(glance) = self.fleet_glance.as_ref() else {
+            self.fleet_field_gen = None;
+            self.fleet_field_due = None;
+            return self.fleet_field.take().is_some();
+        };
+        let generation = glance.generation();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let network = &self.network_snapshot.network;
+        std::mem::discriminant(&network.visibility).hash(&mut h);
+        network.via_local_process.hash(&mut h);
+        let stamp = (generation, h.finish());
+        let due = self.fleet_field_due.is_some_and(|due| now_ms >= due);
+        if self.fleet_field_gen == Some(stamp) && !due {
+            return false;
+        }
+        let slot = glance.copy();
+        let field = slot
+            .book
+            .in_fleet
+            .then(|| field::project(Some(&slot), &self.network_snapshot.network, now_ms));
+        self.fleet_field_gen = Some(stamp);
+        self.fleet_field_due = match field.as_ref().map(|f| f.source) {
+            // A stale read's age moves each minute.
+            Some(field::Source::Stale { .. }) => Some(now_ms.saturating_add(60_000)),
+            _ => slot
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.next_freshness_change(now_ms)),
+        };
+        let moved = self.fleet_field.as_ref().map(|f| f.key) != field.as_ref().map(|f| f.key);
+        self.fleet_field = field.map(std::sync::Arc::new);
+        moved
     }
 
     pub(crate) fn service_network_state(&mut self, now: std::time::Instant) {
         if self.network_next_poll.is_some_and(|due| now < due) {
             return;
         }
+        let band = self.network_band_drawn();
         // The lab's account rows, as the feed's own thread last projected them: never waited
         // on, and asked only while drawn, since the ask is what starts and keeps the feed.
-        let drawn = self.lab_deck_feed.live && self.network_band_drawn();
+        let drawn = self.lab_deck_feed.live && band;
         let lab = if drawn {
             self.lab_deck_feed.latest(&self.lab_deck)
         } else {
             None
         };
+        let fleet = band && self.fleet_glance.is_some();
         let snapshot = if let Some(read) = self.network_source.as_ref() {
             self.network_next_poll = Some(now + std::time::Duration::from_secs(1));
             snapshot_after_read(
@@ -227,13 +285,14 @@ impl crate::App {
                 &mut self.network_source_busy,
                 aterm_time::unix_millis(),
             )
-        } else if drawn {
-            // The first look comes back soon, since the feed's thread starts on it; then once a
-            // projection.
-            let next = if self.lab_deck_feed.held_any() {
-                crate::lab_deck::Feed::EVERY
-            } else {
+        } else if drawn || fleet {
+            // The lab feed's first look comes back soon, since its thread starts on it; then
+            // once a projection. The fleet's field needs no tick of its own: a new read clears
+            // the due (`on_fleet_read`), and its next freshness edge sets it below.
+            let next = if drawn && !self.lab_deck_feed.held_any() {
                 std::time::Duration::from_secs(1)
+            } else {
+                crate::lab_deck::Feed::EVERY
             };
             self.network_next_poll = Some(now + next);
             self.network_snapshot.clone()
@@ -242,14 +301,26 @@ impl crate::App {
             self.network_next_poll = None;
             return;
         };
-        if snapshot.as_ref() == self.network_snapshot.as_ref() && lab.is_none() {
-            return;
+        let changed = snapshot.as_ref() != self.network_snapshot.as_ref() || lab.is_some();
+        if changed {
+            self.network_snapshot = snapshot;
         }
-        self.network_snapshot = snapshot;
         if let Some(lab) = lab {
             self.lab_deck = lab;
         }
-        if self.lab_page_shown() {
+        let now_ms = aterm_time::unix_millis();
+        let field_moved = band && now_ms.is_some_and(|now_ms| self.reproject_fleet_field(now_ms));
+        if fleet
+            && self.network_source.is_none()
+            && let (Some(due), Some(now_ms)) = (self.fleet_field_due, now_ms)
+        {
+            let edge = now + std::time::Duration::from_millis(due.saturating_sub(now_ms));
+            self.network_next_poll = Some(self.network_next_poll.map_or(edge, |p| p.min(edge)));
+        }
+        if !changed && !field_moved {
+            return;
+        }
+        if changed && self.lab_page_shown() {
             self.publish_native_lab_state();
         }
         let deck_shown = self.stats_bars_form() == crate::stats_deck::StatsBars::Deck;
@@ -270,14 +341,18 @@ impl crate::App {
     }
 }
 
-/// A stable cell selection; a slot is never the peer's current vector index.
+/// A stable cell selection; a seat is never its current vector index.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) enum Target {
     #[default]
     Overview,
     Local,
-    Peer(u64),
-    Unverified,
+    /// The Fleet Field's words: the fleet as a whole.
+    Fleet,
+    /// One seat of the Fleet Field: a fleet seat, or an observed peer by its slot.
+    Seat(SeatKey),
+    /// A Tier C tally group.
+    Group(SeatClass),
     Accounts,
     Secrets,
     /// One lab account's row ([`crate::lab_deck::DeckAccount::id`]), on the Shared State line.
@@ -330,7 +405,7 @@ pub(crate) fn place_caption(place: Option<&aterm_netplace::Place>) -> Option<Pla
 
 /// Capture place words and status together; paint never reads the changing place cache.
 pub(crate) fn capture_place_caption() -> Option<PlaceCaption> {
-    place_caption(crate::net_place::cached().as_ref())
+    place_caption(crate::net_place::cached().as_deref())
 }
 
 /// A test summary with the place as last read, without starting a read.
@@ -385,7 +460,10 @@ fn place_only(status: NetworkStatus, caption: &PlaceCaption) -> bool {
 }
 
 fn network_status(snapshot: &NetworkStateSnapshot) -> NetworkStatus {
-    let network = &snapshot.network;
+    network_status_of(&snapshot.network)
+}
+
+fn network_status_of(network: &aterm_types::network_state::NetworkObservation) -> NetworkStatus {
     if network.visibility == Visibility::Unavailable {
         NetworkStatus::Visibility(Visibility::Unavailable)
     } else {
@@ -428,18 +506,26 @@ fn status_summary(snapshot: &NetworkStateSnapshot) -> String {
     }
 }
 
-/// Every selectable cell, the lab's account rows after Secrets in the band's order.
+/// Every selectable cell, the lab's account rows after Secrets in the band's order: the Fleet
+/// Field's words and, as a band `band` = (width px, scale) lays it out, its attention seats or
+/// its tally's groups where a fleet is read ([`field::targets`]), else every observed peer.
 pub(crate) fn targets_with(
     snapshot: &NetworkStateSnapshot,
     lab: &crate::lab_deck::LabDeck,
+    fleet: Option<&field::Field>,
+    (w, scale): (f32, f32),
 ) -> Vec<Target> {
     let mut targets = vec![Target::Overview, Target::Local];
-    let mut peers: Vec<_> = snapshot.network.peers.iter().collect();
-    peers.sort_by_key(|p| p.slot);
-    targets.extend(peers.into_iter().map(|p| Target::Peer(p.slot)));
-    if snapshot.network.unverified_endpoints > 0 {
-        targets.push(Target::Unverified);
-    }
+    let observed;
+    let line1 = match fleet {
+        Some(fleet) => fleet,
+        None => {
+            observed = field::observer(&snapshot.network);
+            &observed
+        }
+    };
+    let layout = field::layout(line1, &snapshot.network, w, scale.max(0.5));
+    targets.extend(field::targets(line1, &layout));
     targets.extend([Target::Accounts, Target::Secrets]);
     targets.extend(lab.rows.iter().map(|row| Target::LabAccount(row.id)));
     targets
@@ -448,16 +534,61 @@ pub(crate) fn targets_with(
 pub(crate) fn step(
     snapshot: &NetworkStateSnapshot,
     lab: &crate::lab_deck::LabDeck,
+    fleet: Option<&field::Field>,
+    band: (f32, f32),
     target: Target,
     forward: bool,
 ) -> Target {
-    let all = targets_with(snapshot, lab);
+    let all = targets_with(snapshot, lab, fleet, band);
     let index = all.iter().position(|value| *value == target).unwrap_or(0);
     all[if forward {
         (index + 1) % all.len()
     } else {
         (index + all.len() - 1) % all.len()
     }]
+}
+
+/// The band's accessibility meters on a band `band` = (width px, scale), `(name, words)`: one a
+/// target ([`targets_with`]), and after
+/// the Fleet's one for the strip, its seats by class ([`field::strip_words`]), so their count is
+/// bounded by attention, never by the fleet's size.
+pub(crate) fn meters(
+    snapshot: &NetworkStateSnapshot,
+    lab: &crate::lab_deck::LabDeck,
+    fleet: Option<&field::Field>,
+    band: (f32, f32),
+) -> Vec<(String, String)> {
+    let mut meters = Vec::new();
+    for target in targets_with(snapshot, lab, fleet, band) {
+        let words = details_lab(snapshot, lab, fleet, target);
+        // A lab account's and a fleet target's first row names it; the others' second row says
+        // what they are.
+        let named = usize::from(!matches!(
+            target,
+            Target::LabAccount(_)
+                | Target::Fleet
+                | Target::Seat(SeatKey::Fleet(_))
+                | Target::Group(_)
+        ));
+        let name = words.get(named).map_or_else(
+            || "Network State".to_owned(),
+            |(name, value)| format!("{name}: {value}"),
+        );
+        meters.push((
+            name,
+            words
+                .into_iter()
+                .map(|(name, value)| format!("{name}: {value}"))
+                .collect::<Vec<_>>()
+                .join(". "),
+        ));
+        if target == Target::Fleet
+            && let Some(fleet) = fleet
+        {
+            meters.push(("Fleet strip".to_owned(), field::strip_words(fleet)));
+        }
+    }
+    meters
 }
 
 fn observed_reachability(visibility: Visibility, reachability: Reachability) -> Reachability {
@@ -472,19 +603,28 @@ pub(crate) fn details(snapshot: &NetworkStateSnapshot, target: Target) -> Vec<(S
     details_with_caption(snapshot, target, capture_place_caption().as_ref())
 }
 
-/// [`details`] with the lab's account rows: a lab account's own rows, and the overview's count.
+/// [`details`] with the lab's account rows (a lab account's own rows, and the overview's count)
+/// and the Fleet Field `fleet` (its words, seats and groups, and the overview's first rows).
 pub(crate) fn details_lab(
     snapshot: &NetworkStateSnapshot,
     lab: &crate::lab_deck::LabDeck,
+    fleet: Option<&field::Field>,
     target: Target,
 ) -> Vec<(String, String)> {
-    details_lab_with_caption(snapshot, lab, target, capture_place_caption().as_ref())
+    details_lab_with_caption(
+        snapshot,
+        lab,
+        fleet,
+        target,
+        capture_place_caption().as_ref(),
+    )
 }
 
 /// [`details_lab`] with the frame's captured place words.
 pub(crate) fn details_lab_with_caption(
     snapshot: &NetworkStateSnapshot,
     lab: &crate::lab_deck::LabDeck,
+    fleet: Option<&field::Field>,
     target: Target,
     caption: Option<&PlaceCaption>,
 ) -> Vec<(String, String)> {
@@ -496,6 +636,14 @@ pub(crate) fn details_lab_with_caption(
         ));
         return rows;
     }
+    if let Some(fleet) = fleet
+        && matches!(
+            target,
+            Target::Fleet | Target::Seat(SeatKey::Fleet(_)) | Target::Group(_)
+        )
+    {
+        return field::details(fleet, target);
+    }
     let mut rows = details_with_caption(snapshot, target, caption);
     if target == Target::Overview
         && let Some(line) = lab.overview()
@@ -505,6 +653,20 @@ pub(crate) fn details_lab_with_caption(
             .position(|(name, _)| name == "History")
             .map_or(rows.len(), |i| i + 1);
         rows.insert(at, line);
+    }
+    if target == Target::Overview
+        && let Some(fleet) = fleet
+        && fleet.snapshot.is_some()
+    {
+        // A read fleet comes first: its words, then its Now line.
+        rows.insert(0, ("Now".into(), field::now_line(fleet)));
+        rows.insert(
+            0,
+            (
+                "Fleet".into(),
+                fleet.words.first().cloned().unwrap_or_default(),
+            ),
+        );
     }
     rows
 }
@@ -542,7 +704,7 @@ pub(crate) fn details_with_caption(
     }
     let context_rows = rows.len();
     match target {
-        Target::Peer(slot) => {
+        Target::Seat(SeatKey::Observed(slot)) => {
             if let Some(peer) = network.peers.iter().find(|p| p.slot == slot) {
                 rows.push(("Machine".into(), machine_name(&peer.identity)));
                 rows.push((
@@ -596,19 +758,19 @@ pub(crate) fn details_with_caption(
                 ));
             }
         }
-        Target::Local => rows.push((
-            "This machine".into(),
-            network
-                .observer
-                .as_ref()
-                .map_or_else(|| "Identity not established".into(), machine_name),
-        )),
-        Target::Unverified => rows.push((
-            "Discovered".into(),
-            format!(
-                "{} unverified endpoints; no machine identity or data access proved",
-                network.unverified_endpoints
-            ),
+        Target::Local => {
+            rows.push((
+                "This machine".into(),
+                network
+                    .observer
+                    .as_ref()
+                    .map_or_else(|| "Identity not established".into(), machine_name),
+            ));
+            rows.extend(field::observed_rows(network));
+        }
+        Target::Fleet | Target::Seat(SeatKey::Fleet(_)) | Target::Group(_) => rows.push((
+            "Fleet".into(),
+            "Not read: this Mac's fleet glance holds no read".into(),
         )),
         Target::Accounts => rows.extend(account_service_details(snapshot)),
         Target::LabAccount(_) => rows.push((
@@ -631,7 +793,10 @@ pub(crate) fn details_with_caption(
     }
     if matches!(
         target,
-        Target::Peer(_) | Target::Accounts | Target::Secrets | Target::LabAccount(_)
+        Target::Seat(SeatKey::Observed(_))
+            | Target::Accounts
+            | Target::Secrets
+            | Target::LabAccount(_)
     ) {
         // Keep the selected peer's evidence or service status before general
         // network context when the lens has limited height.
@@ -794,12 +959,18 @@ fn service_details(name: &str, service: &ServiceState) -> Vec<(String, String)> 
     rows
 }
 
-/// Append two fixed rows with the existing resource painter and theme inks.
+/// Append two fixed rows with the existing resource painter and theme inks: line 1 the label,
+/// the Local cell and the Fleet Field (`fleet`, else the observer's peers), line 2 Shared State.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the band's geometry, its sources and its inks, each read by one line"
+)]
 pub(crate) fn paint_with_inks(
     g: &DeckGeom,
     top: f32,
     snapshot: &NetworkStateSnapshot,
     lab: &crate::lab_deck::LabDeck,
+    fleet: Option<&field::Field>,
     caption: Option<&PlaceCaption>,
     inks: &aterm_vitals::ink::VitalsInks,
     dwc: bool,
@@ -847,35 +1018,15 @@ pub(crate) fn paint_with_inks(
                     target: Target,
                     warning: bool| {
         let side = 8.0 * scale;
-        if target == Target::Unverified {
-            let points = [
-                (x, y),
-                (x + side / 2.0, y - side / 2.0),
-                (x + side, y),
-                (x + side / 2.0, y + side / 2.0),
-                (x, y),
-            ];
-            for pair in points.windows(2) {
-                p.prims.push(DrawPrim::Line {
-                    x1: pair[0].0,
-                    y1: pair[0].1,
-                    x2: pair[1].0,
-                    y2: pair[1].1,
-                    width: scale.max(1.0),
-                    color: rgba(color, 255),
-                });
-            }
-        } else {
-            p.prims.push(DrawPrim::Stroke {
-                x,
-                y: y - side / 2.0,
-                w: side,
-                h: side,
-                radius: 0.0,
-                width: scale.max(1.0),
-                color: rgba(color, 255),
-            });
-        }
+        p.prims.push(DrawPrim::Stroke {
+            x,
+            y: y - side / 2.0,
+            w: side,
+            h: side,
+            radius: 0.0,
+            width: scale.max(1.0),
+            color: rgba(color, 255),
+        });
         if target == Target::Local {
             if state != ServiceAvailability::Unknown {
                 p.prims.push(panel(
@@ -938,122 +1089,6 @@ pub(crate) fn paint_with_inks(
         Target::Local,
         snapshot.network.retention_limited || snapshot.network.history == HistoryState::Unavailable,
     );
-    let available = (g.w - cell_x - 95.0 * scale).max(0.0);
-    let slots = (available / (14.0 * scale)) as usize;
-    let mut peers: Vec<_> = snapshot.network.peers.iter().collect();
-    peers.sort_by_key(|peer| peer.slot);
-    for (index, peer) in peers.iter().take(slots).enumerate() {
-        let reachability = observed_reachability(snapshot.network.visibility, peer.reachability);
-        let state = match reachability {
-            Reachability::Reachable => ServiceAvailability::Current,
-            Reachability::LastSeen | Reachability::Unknown => ServiceAvailability::Unknown,
-        };
-        draw(
-            &mut p,
-            cell_x + (24.0 + index as f32 * 14.0) * scale,
-            first_y,
-            state,
-            inks.machine,
-            Target::Peer(peer.slot),
-            reachability == Reachability::Unknown,
-        );
-    }
-    let next_x = cell_x + (24.0 + peers.len().min(slots) as f32 * 14.0) * scale;
-    if peers.len() > slots {
-        p.ui_text(
-            next_x,
-            first_y + 3.0 * scale,
-            format!("+{}", peers.len() - slots),
-            inks.words2,
-            false,
-        );
-    } else if snapshot.network.unverified_endpoints > 0 {
-        draw(
-            &mut p,
-            next_x,
-            first_y,
-            ServiceAvailability::Unknown,
-            inks.hollow,
-            Target::Unverified,
-            true,
-        );
-    }
-    if next_x + 90.0 * scale < g.w {
-        let status = network_status(snapshot);
-        let room = g.w - next_x - 20.0 * scale;
-        let mut text = match status {
-            NetworkStatus::HistoryUnavailable => "History unavailable".into(),
-            NetworkStatus::HistoryRestoring => "Restoring history".into(),
-            NetworkStatus::Visibility(Visibility::Active) => format!(
-                "{} reachable",
-                snapshot
-                    .network
-                    .peers
-                    .iter()
-                    .filter(|p| p.reachability == Reachability::Reachable)
-                    .count()
-            ),
-            NetworkStatus::Visibility(Visibility::Checking) => "Checking".into(),
-            NetworkStatus::Visibility(Visibility::Offline) => "Offline".into(),
-            NetworkStatus::Visibility(Visibility::Disabled) => "Off".into(),
-            NetworkStatus::Visibility(Visibility::Waiting) => "Waiting".into(),
-            NetworkStatus::Visibility(Visibility::Unavailable) => "Unavailable".into(),
-        };
-        if p.ui_text_w(&text, false) > room {
-            text = match status {
-                NetworkStatus::HistoryUnavailable => "History error".into(),
-                NetworkStatus::HistoryRestoring => "Restoring".into(),
-                _ => text,
-            };
-        }
-        if status == NetworkStatus::Visibility(Visibility::Active)
-            && snapshot.network.via_local_process.is_some()
-        {
-            let full = format!("{text} · via local aterm");
-            text = if p.ui_text_w(&full, false) <= room {
-                full
-            } else {
-                "via aterm".into()
-            };
-        }
-        if status != NetworkStatus::Visibility(Visibility::Active) && !peers.is_empty() {
-            let known = format!("{text} · {} known", peers.len());
-            if p.ui_text_w(&known, false) <= room {
-                text = known;
-            }
-        }
-        // Place does not establish observer or history health. Keep their status first,
-        // dropping optional place words before the status when the strip is constrained.
-        if let Some(caption) = caption {
-            if place_only(status, caption) {
-                text = if p.ui_text_w(&caption.long, false) <= room {
-                    caption.long.clone()
-                } else {
-                    caption.short.clone()
-                };
-            } else {
-                let composed = format!("{text} · {}", caption.short);
-                if p.ui_text_w(&composed, false) <= room {
-                    text = composed;
-                }
-            }
-        }
-        if snapshot.network.retention_limited {
-            let partial = format!("{text} · partial history");
-            if p.ui_text_w(&partial, false) <= room {
-                text = partial;
-            }
-        }
-        if p.ui_text_w(&text, false) <= room {
-            p.ui_text(
-                next_x + 20.0 * scale,
-                first_y + 3.0 * scale,
-                text,
-                inks.words2,
-                false,
-            );
-        }
-    }
     let gap = 7.0 * scale;
     let accounts_cell_x = cell_x + p.ui_text_w("Accounts", false) + gap;
     let secrets_x = accounts_cell_x + 8.0 * scale + 2.0 * gap;
@@ -1089,6 +1124,24 @@ pub(crate) fn paint_with_inks(
         inks.aterm,
         Target::Secrets,
         snapshot.services.secrets.refresh_failed,
+    );
+    // Line 1's field after the cells: the cells' hits close over `hits` until here.
+    let observed;
+    let line1 = match fleet {
+        Some(fleet) => fleet,
+        None => {
+            observed = field::observer(&snapshot.network);
+            &observed
+        }
+    };
+    field::paint(
+        &mut p,
+        line1,
+        &snapshot.network,
+        caption,
+        top,
+        g.w,
+        &mut hits,
     );
     let lab_x = secrets_cell_x + 8.0 * scale + 2.0 * gap;
     paint_lab_accounts(&mut p, &mut hits, lab, (lab_x, second_y), g.w, scale, dwc);
@@ -1462,6 +1515,7 @@ mod tests {
                                 170.0 * scale,
                                 snapshot,
                                 &crate::lab_deck::LabDeck::default(),
+                                None,
                                 caption,
                                 &inks,
                                 false,
@@ -1517,6 +1571,7 @@ mod tests {
             170.0,
             &snapshot,
             &crate::lab_deck::LabDeck::default(),
+            None,
             None,
             &inks,
             false,
@@ -1685,6 +1740,7 @@ mod tests {
             &snapshot,
             &crate::lab_deck::LabDeck::default(),
             None,
+            None,
             &inks,
             false,
         );
@@ -1696,6 +1752,7 @@ mod tests {
             170.0,
             &snapshot,
             &crate::lab_deck::LabDeck::default(),
+            None,
             None,
             &inks,
             false,
@@ -1754,6 +1811,7 @@ mod tests {
             &snapshot,
             &crate::lab_deck::LabDeck::default(),
             None,
+            None,
             &inks,
             false,
         )
@@ -1765,6 +1823,7 @@ mod tests {
             170.0,
             &snapshot,
             &crate::lab_deck::LabDeck::default(),
+            None,
             None,
             &inks,
             false,
@@ -1778,6 +1837,7 @@ mod tests {
             &snapshot,
             &crate::lab_deck::LabDeck::default(),
             None,
+            None,
             &inks,
             false,
         );
@@ -1790,10 +1850,12 @@ mod tests {
             step(
                 &snapshot,
                 &crate::lab_deck::LabDeck::default(),
+                None,
+                (700.0, 1.0),
                 Target::Local,
                 true
             ),
-            Target::Peer(2)
+            Target::Seat(SeatKey::Observed(2))
         );
     }
 
@@ -1814,6 +1876,7 @@ mod tests {
                 170.0 * scale,
                 &inactive_snapshot(),
                 &crate::lab_deck::LabDeck::default(),
+                None,
                 None,
                 &inks,
                 false,
@@ -1849,7 +1912,7 @@ mod tests {
         snapshot.network.peers.push(peer(2, Reachability::LastSeen));
         snapshot.services.secrets.observed_at_ms = 3000;
         snapshot.services.secrets.last_success_ms = Some(2000);
-        let contact = details(&snapshot, Target::Peer(2));
+        let contact = details(&snapshot, Target::Seat(SeatKey::Observed(2)));
         let service = details(&snapshot, Target::Secrets);
         assert!(
             contact
@@ -1868,7 +1931,10 @@ mod tests {
         );
         for observer_time in [1000, 10_000, 1_000_000] {
             snapshot.network.observed_at_ms = observer_time;
-            assert_eq!(details(&snapshot, Target::Peer(2)), contact);
+            assert_eq!(
+                details(&snapshot, Target::Seat(SeatKey::Observed(2))),
+                contact
+            );
             assert_eq!(details(&snapshot, Target::Secrets), service);
         }
         assert_eq!(observation_time(0), "Unknown");
@@ -1902,7 +1968,7 @@ mod tests {
         ] {
             snapshot.network.visibility = visibility;
             snapshot.network.observed_at_ms = observer_time;
-            let rows = details(&snapshot, Target::Peer(2));
+            let rows = details(&snapshot, Target::Seat(SeatKey::Observed(2)));
             assert_eq!(rows[0].0, "Machine");
             let at = |key| rows.iter().position(|(name, _)| name == key).unwrap();
             assert!(at("Observation") < at("Last repair"));
@@ -1933,7 +1999,7 @@ mod tests {
             .network
             .peers
             .push(peer(2, Reachability::Reachable));
-        let absent = details(&snapshot, Target::Peer(2))
+        let absent = details(&snapshot, Target::Seat(SeatKey::Observed(2)))
             .into_iter()
             .find(|(name, _)| name == "Last outbound")
             .unwrap();
@@ -1942,7 +2008,7 @@ mod tests {
             observed_at_ms: 2000,
         });
         assert!(
-            details(&snapshot, Target::Peer(2))
+            details(&snapshot, Target::Seat(SeatKey::Observed(2)))
                 .iter()
                 .any(|(_, value)| value.contains("192.0.2.12:7414"))
         );
@@ -1950,7 +2016,7 @@ mod tests {
         // The observer clears endpoint evidence when a new verified incarnation replaces it.
         snapshot.network.peers[0].identity.incarnation = [0x3a; 16];
         snapshot.network.peers[0].last_authenticated_endpoint = None;
-        let replaced = details(&snapshot, Target::Peer(2));
+        let replaced = details(&snapshot, Target::Seat(SeatKey::Observed(2)));
         assert!(replaced.contains(&absent));
         assert!(
             replaced
@@ -1979,9 +2045,14 @@ mod tests {
             ServiceAvailability::Cached
         );
         assert!(
-            !targets_with(&snapshot, &crate::lab_deck::LabDeck::default())
-                .iter()
-                .any(|t| matches!(t, Target::Peer(_)))
+            !targets_with(
+                &snapshot,
+                &crate::lab_deck::LabDeck::default(),
+                None,
+                (700.0, 1.0)
+            )
+            .iter()
+            .any(|t| matches!(t, Target::Seat(_)))
         );
     }
     #[test]
@@ -2000,18 +2071,16 @@ mod tests {
             let painter = Painter::new(&inks, scale, 14.0 * scale, false);
             let full_width = painter.ui_text_w("History unavailable", false);
             let short_width = painter.ui_text_w("History error", false);
-            let caption_x = 158.0 * scale;
-            // Caption admission leaves 70 points after the retained peer and offset.
+            // The words start 12 pt after the one retained peer's column and end 12 pt short
+            // of the edge.
+            let caption_x = (field::SEATS_X_PT + field::PITCH_PT + field::GAP_PT) * scale;
             let constrained_room = short_width.max(70.0 * scale + 1.0);
             assert!(constrained_room < full_width);
-            let constrained_width = caption_x + constrained_room;
-            let no_caption_width = (caption_x + 70.0 * scale - 1.0).floor();
-            assert!(no_caption_width < constrained_width);
-            for (width, expect_caption, expect_short) in [
-                (no_caption_width, false, false),
-                (constrained_width, true, true),
-                (360.0 * scale, true, false),
-                (700.0 * scale, true, false),
+            let constrained_width = caption_x + constrained_room + field::GAP_PT * scale;
+            for (width, expect_short) in [
+                (constrained_width, true),
+                (360.0 * scale, false),
+                (700.0 * scale, false),
             ] {
                 let g = DeckGeom {
                     w: width,
@@ -2030,6 +2099,7 @@ mod tests {
                         &snapshot,
                         &crate::lab_deck::LabDeck::default(),
                         None,
+                        None,
                         &inks,
                         false,
                     );
@@ -2042,29 +2112,30 @@ mod tests {
                         &snapshot,
                         &crate::lab_deck::LabDeck::default(),
                         None,
+                        None,
                         &inks,
                         false,
                     );
                     assert!(local_warning(&failed.0, &failed.1, scale, inks.over));
                     assert_eq!(failed.1, ready.1);
                     assert_ne!(summary(&snapshot), ready_summary);
-                    for target in [Target::Peer(2), Target::Accounts, Target::Secrets] {
+                    for target in [
+                        Target::Seat(SeatKey::Observed(2)),
+                        Target::Accounts,
+                        Target::Secrets,
+                    ] {
                         assert_eq!(
                             crate::stats_deck::prims_fp(&cell_prims(&failed.0, &failed.1, target)),
                             crate::stats_deck::prims_fp(&cell_prims(&ready.0, &ready.1, target)),
                         );
                     }
-                    if expect_caption {
-                        let caption =
-                            compact_caption(&failed.0, top, scale).expect("history caption");
-                        assert!(caption.contains("History"));
-                        assert!(!caption.contains("reachable") && !caption.contains("via"));
-                        if expect_short {
-                            assert!(painter.ui_text_w(caption, false) < full_width);
-                            assert!(painter.ui_text_w(caption, false) <= constrained_room);
-                        }
-                    } else {
-                        assert!(compact_caption(&failed.0, top, scale).is_none());
+                    // No draw-or-drop rule: the status is always drawn, shortened to fit.
+                    let caption = compact_caption(&failed.0, top, scale).expect("history caption");
+                    assert!(caption.contains("History"));
+                    assert!(!caption.contains("reachable") && !caption.contains("via"));
+                    if expect_short {
+                        assert!(painter.ui_text_w(caption, false) < full_width);
+                        assert!(painter.ui_text_w(caption, false) <= constrained_room);
                     }
                     for prim in &failed.0 {
                         if let DrawPrim::Text {
@@ -2122,6 +2193,7 @@ mod tests {
                 &snapshot,
                 &crate::lab_deck::LabDeck::default(),
                 None,
+                None,
                 &inks,
                 false,
             );
@@ -2134,6 +2206,7 @@ mod tests {
                         170.0,
                         &snapshot,
                         &crate::lab_deck::LabDeck::default(),
+                        None,
                         None,
                         &inks,
                         false,
@@ -2159,7 +2232,11 @@ mod tests {
                             history == HistoryState::Restoring
                         );
                     }
-                    for target in [Target::Peer(2), Target::Accounts, Target::Secrets] {
+                    for target in [
+                        Target::Seat(SeatKey::Observed(2)),
+                        Target::Accounts,
+                        Target::Secrets,
+                    ] {
                         assert_eq!(
                             crate::stats_deck::prims_fp(&cell_prims(
                                 &painted.0, &painted.1, target

@@ -9,8 +9,8 @@ use aterm_phase::prompt::fixtures::{self as f, rewrap_free_text, screen};
 use aterm_phase::{QuestionFocus, QuestionForm, parse_prompt_v2};
 
 use super::super::approval::{
-    Answer, AnswerTarget, ApprovalCtx, Choice, Decision, QuestionPriority, RULE_ALLOW_ONCE,
-    RULE_ANSWER_LONG_TERM, RULE_PROSE_LONG_TERM, decide,
+    Answer, AnswerTarget, ApprovalCtx, Choice, Decision, PriorityWord, QuestionPriority,
+    RULE_ALLOW_ONCE, RULE_ANSWER_LONG_TERM, RULE_PROSE_LONG_TERM, decide,
 };
 use super::super::guard::row_guard;
 use super::tests::{row_of, with_focus};
@@ -161,15 +161,18 @@ fn the_policy_texts_keep_their_rules() {
             }
         }
     }
-    for p in QuestionPriority::ALL {
-        assert_eq!(QuestionPriority::parse(p.word()), Some(p));
-        assert!(is_question_rule(p.rule_id()), "{p:?}");
+    for p in PriorityWord::ALL {
+        assert_eq!(PriorityWord::parse(p.word()), Some(p));
+        assert!(
+            is_question_rule(QuestionPriority::from(p).rule_id()),
+            "{p:?}"
+        );
     }
     for p in QuestionPriority::EVERY {
         assert_eq!(QuestionPriority::of_fact(p.word()), Some(p));
     }
     assert_eq!(
-        QuestionPriority::parse("land"),
+        PriorityWord::parse("land"),
         None,
         "no person sets Land's priority"
     );
@@ -185,7 +188,7 @@ fn the_policy_texts_keep_their_rules() {
         assert!(!is_question_rule(rule), "{rule}");
     }
     for bad in ["long_term", "ask", "LONGTERM", "short term", ""] {
-        assert_eq!(QuestionPriority::parse(bad), None, "{bad:?}");
+        assert_eq!(PriorityWord::parse(bad), None, "{bad:?}");
     }
 }
 

@@ -138,6 +138,7 @@ fn a_receipt() -> LandReceipt {
         check: true,
         said: "Nothing left: pushed.".into(),
         at_ms: 1_771_000_000_000,
+        statement: aterm_agent::harness::land_receipt::Statement::Unread,
     }
 }
 

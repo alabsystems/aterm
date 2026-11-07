@@ -602,6 +602,12 @@ pub enum Resume {
 
 /// Approves a sign-in's page ([`drive`]): the headless browser, or a test's stand-in.
 pub trait Approver {
+    /// Actual native browser resources; absence preserves the global path.
+    fn native_enrollment_scope(
+        &self,
+    ) -> Option<std::sync::Arc<super::native_enrollment_admission::NativeBrowserTurn>> {
+        None
+    }
     /// The admitted automatic operation, retained by actual pipe-reader work.
     fn work_scope(&self) -> Option<super::account_work::Scope> {
         None
@@ -1793,7 +1799,8 @@ pub(in crate::harness) fn sign_in_live_scoped_custody(
         &req.store.shared_dir(),
         Some(home),
     )
-    .with_work(work);
+    .with_work(work)
+    .with_native_scope(capture.native_scope());
     sign_in_until_custody(
         req,
         (&program, &[]),

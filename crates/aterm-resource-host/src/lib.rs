@@ -17,6 +17,14 @@ mod forward;
 #[cfg(unix)]
 mod inspection;
 #[cfg(unix)]
+mod metadata_prelude;
+#[cfg(unix)]
+mod metadata_transport;
+#[cfg(unix)]
+mod resolver_transport;
+#[cfg(unix)]
+mod resource_accounting;
+#[cfg(unix)]
 mod resource_context;
 #[cfg(unix)]
 mod resource_machine;
@@ -40,7 +48,7 @@ mod subgroup_delegation;
 #[path = "subgroup_delegation_unsupported.rs"]
 mod subgroup_delegation;
 #[cfg(unix)]
-pub use client::{authorize, capabilities_at, inspect_at, submit};
+pub use client::{authorize, capabilities_at, inspect_at, submit, submit_accounted};
 #[cfg(unix)]
 pub use enrollment::answer as answer_enrollment;
 #[cfg(unix)]
@@ -61,3 +69,6 @@ pub fn entry(args: &[std::ffi::OsString]) -> Option<std::process::ExitCode> {
 mod native_fixture;
 #[cfg(all(test, target_os = "macos"))]
 pub use native_fixture::entry as native_member_fixture;
+
+#[cfg(all(test, target_os = "macos"))]
+mod metadata_native_test_entry;

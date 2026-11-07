@@ -7,6 +7,8 @@ use super::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+mod repository_prerequisites;
+
 /// A base item of `class` that plans one change, reads right once applied, and counts each
 /// apply under its id; one whose id `fails` names fails its apply.
 struct Fake {
@@ -91,6 +93,7 @@ const NO_STEWARD: &str = "this Mac holds no admin key of the ALab vault";
 /// Ports that read from fields and record every call: each read kind reads due until its apply,
 /// then right. `aterm init --converge`'s tests run the runner over them.
 pub(crate) struct Inert {
+    prerequisites: Option<Arc<repository_prerequisites::Packages>>,
     state: PathBuf,
     own: bool,
     console: bool,
@@ -115,6 +118,7 @@ pub(crate) struct Inert {
     base_applied: Arc<Mutex<Vec<String>>>,
     released: Arc<AtomicU32>,
     applies: Mutex<Vec<&'static str>>,
+    dispatches: Mutex<Vec<&'static str>>,
     vault: Mutex<VaultRead>,
     identity: Mutex<IdentityRead>,
     fleet: Mutex<FleetRead>,
@@ -134,7 +138,16 @@ pub(crate) struct Inert {
     github_after: Mutex<Option<GithubRead>>,
     /// What `sync.clone` reads ([`Ports::owed_clone`]).
     owed: Mutex<crate::init::OwedClone>,
+    /// What `sync.clone-tuning` reads ([`Ports::clone_tuning`]): every clone as it declares by
+    /// default, so the other kinds' tests count none of it.
+    tuning: Mutex<crate::clone_tuning::Reading>,
+    /// What `sync.clone-tuning`'s apply answers; an `Ok` that stood nowhere aside makes the
+    /// read current.
+    tuned: Mutex<Result<crate::clone_tuning::Tuned, String>>,
+    /// Set once `sync.clone-tuning` is read, where a test watches for it.
+    tuning_read: Mutex<Option<Arc<AtomicBool>>>,
     fabric: Mutex<FabricRead>,
+    fabric_needs_node: bool,
     /// `sync.awake`'s read: right by default, so the other kinds' tests count none of it.
     awake: Mutex<AwakeRead>,
     /// What `sync.awake`'s apply answers; an `Ok` makes the read right.
@@ -175,6 +188,7 @@ pub(crate) struct Inert {
 impl Inert {
     pub(crate) fn new(state: &Path) -> Self {
         Self {
+            prerequisites: None,
             state: state.to_path_buf(),
             own: true,
             console: true,
@@ -196,12 +210,21 @@ impl Inert {
             base_applied: Arc::new(Mutex::new(Vec::new())),
             released: Arc::new(AtomicU32::new(0)),
             applies: Mutex::new(Vec::new()),
+            dispatches: Mutex::new(Vec::new()),
             vault: Mutex::new(VaultRead::Runs("runs (pid 7)".to_owned())),
             github: Mutex::new(GithubRead::NotApplicable("no vault helper".into())),
             github_after: Mutex::new(None),
             owed: Mutex::new(crate::init::OwedClone::Nothing(
                 "aterm init owes no clone".into(),
             )),
+            tuning: Mutex::new(crate::clone_tuning::Reading::Current(
+                "1 vault clone on this Mac, each as it declares".into(),
+            )),
+            tuned: Mutex::new(Ok(crate::clone_tuning::Tuned {
+                said: "tuned $HOME/trust (index format 2 -> 4)".into(),
+                aside: None,
+            })),
+            tuning_read: Mutex::new(None),
             identity: Mutex::new(IdentityRead::Current(
                 "label m15 in [ai] and [fleet] machine".to_owned(),
             )),
@@ -225,6 +248,7 @@ impl Inert {
             fabric: Mutex::new(FabricRead::Due(
                 "the broker runs a replaced build".to_owned(),
             )),
+            fabric_needs_node: true,
             awake: Mutex::new(AwakeRead::Current("the mug (pid 9) holds".to_owned())),
             awake_done: Mutex::new(Ok("launchd was asked to start the mug".to_owned())),
             awake_startup_off: AtomicBool::new(false),
@@ -264,6 +288,7 @@ impl Inert {
 
     fn applied(&self, kind: &'static str) {
         self.applies.lock().unwrap().push(kind);
+        self.dispatches.lock().unwrap().push(kind);
     }
 
     pub(crate) fn applies(&self) -> Vec<&'static str> {
@@ -289,7 +314,13 @@ impl Inert {
     }
 
     fn pass(&self, trigger: Trigger, mode: Mode) -> Result<Pass, Stop> {
-        converge(self, trigger, mode, &mut |_| {})
+        converge(
+            self,
+            trigger,
+            mode,
+            aterm_secrets::converge::RepositoryWork::Refresh,
+            &mut |_| {},
+        )
     }
 }
 
@@ -322,6 +353,7 @@ impl Ports for Inert {
         }
     }
     fn sleep(&self, duration: Duration) {
+        self.dispatches.lock().unwrap().push("sleep");
         self.sleeps.lock().unwrap().push(duration);
     }
     fn holds_fleet_key(&self) -> bool {
@@ -371,6 +403,11 @@ impl Ports for Inert {
             held: Some(Box::new(Released(Arc::clone(&self.released)))),
             ..Base::none()
         }
+    }
+    fn repository_prerequisites(&self) -> Option<Box<dyn Item + '_>> {
+        self.prerequisites
+            .as_ref()
+            .map(|packages| repository_prerequisites::item(packages, &self.released))
     }
     fn vault(&self) -> Result<VaultRead, String> {
         self.read(&self.vault)
@@ -482,9 +519,24 @@ impl Ports for Inert {
         Ok("vault helper verified".into())
     }
     fn owed_clone(&self) -> Result<crate::init::OwedClone, String> {
+        if self
+            .prerequisites
+            .as_ref()
+            .is_some_and(|packages| !packages.git.load(Ordering::SeqCst))
+        {
+            return Ok(crate::init::OwedClone::Waiting("Git is missing".into()));
+        }
         self.read(&self.owed)
     }
-    fn clone_owed(&self) -> Result<String, String> {
+    fn clone_owed(&self, work: aterm_secrets::converge::RepositoryWork) -> Result<String, String> {
+        if matches!(
+            *self.owed.lock().unwrap(),
+            crate::init::OwedClone::Verified { .. }
+        ) {
+            assert_eq!(work, aterm_secrets::converge::RepositoryWork::Refresh);
+            self.applied("refresh checkouts");
+            return Ok("refreshed".into());
+        }
         self.applied("clone");
         *self.owed.lock().unwrap() = crate::init::OwedClone::Verified {
             present: 1,
@@ -497,6 +549,25 @@ impl Ports for Inert {
         *self.owed.lock().unwrap() =
             crate::init::OwedClone::Nothing("aterm init owes no clone".into());
         Ok(())
+    }
+    fn clone_tuning(&self) -> Result<crate::clone_tuning::Reading, String> {
+        if let Some(read) = self.tuning_read.lock().unwrap().as_ref() {
+            read.store(true, Ordering::SeqCst);
+        }
+        self.read(&self.tuning)
+    }
+    fn tune_clones(&self) -> Result<crate::clone_tuning::Tuned, String> {
+        self.applied("tune clones");
+        let tuned = self.tuned.lock().unwrap().clone();
+        if matches!(&tuned, Ok(tuned) if tuned.aside.is_none()) {
+            *self.tuning.lock().unwrap() = crate::clone_tuning::Reading::Current(
+                "1 vault clone on this Mac, each as it declares".into(),
+            );
+        }
+        tuned
+    }
+    fn fabric_needs_node(&self) -> bool {
+        self.fabric_needs_node
     }
     fn fabric(&self) -> Result<FabricRead, String> {
         self.read(&self.fabric)
@@ -541,6 +612,7 @@ impl Ports for Inert {
         done
     }
     fn peers(&self, look: bool) -> Result<PeersRead, String> {
+        self.dispatches.lock().unwrap().push("peers-read");
         self.peer_looks.lock().unwrap().push(look);
         self.read(&self.peers)
     }
@@ -772,7 +844,8 @@ fn signing_files_stay_pending_until_the_automatic_pass_proves_a_signature() {
 }
 
 /// The clone an `aterm init` owes waits for the vault's GitHub token, then runs in the
-/// subscriber's pass once, and never again; a plan only plans it.
+/// subscriber's pass once; later refresh work checks the acquired checkout without cloning it
+/// again. A plan only plans it.
 #[test]
 fn the_subscribers_pass_runs_the_clone_init_owes_once_its_token_lands() {
     let scratch = aterm_tempfile::tempdir().unwrap();
@@ -799,6 +872,119 @@ fn the_subscribers_pass_runs_the_clone_init_owes_once_its_token_lands() {
     let again = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
     assert_eq!(row(&again.rows, CLONE).outcome, Outcome::Ok);
     assert_eq!(clones(&ports), 1, "once");
+    assert_eq!(
+        ports
+            .applies()
+            .iter()
+            .filter(|kind| **kind == "refresh checkouts")
+            .count(),
+        1
+    );
+}
+
+/// Clones that differ from what their repositories declare are tuned by the pass through the
+/// port, once: a plan only plans it, the apply runs it, and the next pass reads them as they
+/// declare. A clone another git holds, as the row reads or as it applies, is left for the next
+/// pass (the row stands aside, never failing a read-back), and a failed apply says the next
+/// pass tries again.
+#[test]
+fn the_pass_tunes_differing_clones_once_and_a_plan_only_plans_it() {
+    use crate::clone_tuning::{Reading, Tuned};
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    let tunes = |ports: &Inert| {
+        ports
+            .applies()
+            .iter()
+            .filter(|kind| **kind == "tune clones")
+            .count()
+    };
+    *ports.tuning.lock().unwrap() = Reading::Deferred(
+        "$HOME/trust: its index.lock is there (another git holds it, or one that stopped left it); \
+         the next pass tunes it"
+            .into(),
+    );
+    let held = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    assert_eq!(row(&held.rows, CLONE_TUNING).outcome, Outcome::Deferred);
+    assert_eq!(tunes(&ports), 0);
+    *ports.tuning.lock().unwrap() = Reading::Due {
+        from: "$HOME/trust: core.untrackedCache and feature.manyFiles unset, index format 2".into(),
+        to: "tuned as each declares in its scripts/git-clone.gitconfig".into(),
+    };
+    let planned = ran(ports.pass(Trigger::Init, Mode::Plan));
+    let plan = row(&planned.rows, CLONE_TUNING);
+    assert_eq!(plan.outcome, Outcome::Planned);
+    assert!(
+        plan.from
+            .as_deref()
+            .is_some_and(|from| from.contains("$HOME/trust")),
+        "the row names the clone: {plan:?}"
+    );
+    assert_eq!(tunes(&ports), 0, "a plan writes nothing");
+    *ports.tuned.lock().unwrap() = Err("$HOME/trust: core.untrackedCache: could not lock".into());
+    let failed = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    let failed = row(&failed.rows, CLONE_TUNING);
+    assert_eq!(failed.outcome, Outcome::Failed, "{failed:?}");
+    assert!(
+        failed
+            .why
+            .as_deref()
+            .is_some_and(|why| why.contains("could not lock; the next pass tries again")),
+        "{failed:?}"
+    );
+    *ports.tuned.lock().unwrap() = Ok(Tuned {
+        said: "nothing tuned".into(),
+        aside: Some(
+            "$HOME/trust: its config.lock is there (another git holds it, or one that stopped left \
+             it); the next pass tunes it"
+                .into(),
+        ),
+    });
+    let raced = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    let raced = row(&raced.rows, CLONE_TUNING);
+    assert_eq!(raced.outcome, Outcome::Blocked, "{raced:?}");
+    assert!(
+        raced
+            .why
+            .as_deref()
+            .is_some_and(|why| why.contains("its config.lock is there")),
+        "{raced:?}"
+    );
+    *ports.tuned.lock().unwrap() = Ok(Tuned {
+        said: "tuned $HOME/trust (index format 2 -> 4)".into(),
+        aside: None,
+    });
+    let applied = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    assert_eq!(row(&applied.rows, CLONE_TUNING).outcome, Outcome::Changed);
+    let again = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    assert_eq!(row(&again.rows, CLONE_TUNING).outcome, Outcome::Ok);
+    assert_eq!(
+        tunes(&ports),
+        3,
+        "the failed, the raced and the tuning apply, then none"
+    );
+}
+
+/// The clones' tuning runs after the clone `aterm init` owes, over what that clone left.
+#[test]
+fn clone_tuning_runs_after_the_owed_clone() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    *ports.owed.lock().unwrap() = crate::init::OwedClone::Due("1 repository missing".into());
+    *ports.tuning.lock().unwrap() = crate::clone_tuning::Reading::Due {
+        from: "$HOME/trust: feature.manyFiles unset".into(),
+        to: "tuned".into(),
+    };
+    let pass = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    let at = |id: &str| pass.rows.iter().position(|row| row.id == id).unwrap();
+    assert!(at(CLONE) < at(CLONE_TUNING), "{:?}", pass.rows);
+    let applied = ports.applies();
+    let cloned = applied.iter().position(|kind| *kind == "clone").unwrap();
+    let tuned = applied
+        .iter()
+        .position(|kind| *kind == "tune clones")
+        .unwrap();
+    assert!(cloned < tuned, "{applied:?}");
 }
 
 /// Missing Git and an older Git's missing capability both leave an admitted clone unfinished.
@@ -958,6 +1144,9 @@ fn each_off_switch_reads_not_applicable_and_applies_nothing() {
     *ports.fabric.lock().unwrap() = FabricRead::NotApplicable("the fabric is off".to_owned());
     *ports.awake.lock().unwrap() =
         AwakeRead::NotApplicable("aCaffeine is off by your choice".to_owned());
+    *ports.tuning.lock().unwrap() = crate::clone_tuning::Reading::NotApplicable(
+        "off: init.toml's [github] enabled = false".to_owned(),
+    );
     let pass = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
     for (id, says) in [
         (VAULT, "agent on"),
@@ -968,6 +1157,7 @@ fn each_off_switch_reads_not_applicable_and_applies_nothing() {
         (ACCOUNTS, "[harness] accounts = \"off\""),
         (FABRIC, "the fabric is off"),
         (AWAKE, "off by your choice"),
+        (CLONE_TUNING, "[github] enabled = false"),
     ] {
         let left = row(&pass.rows, id);
         assert_eq!(left.outcome, Outcome::NotApplicable, "{left:?}");
@@ -1000,6 +1190,7 @@ fn the_fabric_is_turned_on_beside_a_window_and_a_persons_off_stands() {
         let scratch = aterm_tempfile::tempdir().unwrap();
         let ports = Inert {
             window,
+            fabric_needs_node: false,
             ..Inert::new(scratch.path())
         };
         *ports.fabric.lock().unwrap() = unset();
@@ -1029,6 +1220,7 @@ fn the_fabric_is_turned_on_beside_a_window_and_a_persons_off_stands() {
         let scratch = aterm_tempfile::tempdir().unwrap();
         let checked = Inert {
             window,
+            fabric_needs_node: false,
             ..Inert::new(scratch.path())
         };
         *checked.fabric.lock().unwrap() = unset();
@@ -1045,6 +1237,7 @@ fn the_fabric_is_turned_on_beside_a_window_and_a_persons_off_stands() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let ports = Inert {
         window: true,
+        fabric_needs_node: false,
         ..Inert::new(scratch.path())
     };
     *ports.fabric.lock().unwrap() =
@@ -2034,11 +2227,18 @@ fn sync_identity_applies_before_fleet_and_accounts_and_skips_personal_vaults() {
 #[test]
 fn swarm_enabled_false_marks_every_sync_item_not_applicable_and_reads_nothing() {
     let scratch = aterm_tempfile::tempdir().unwrap();
-    let ports = Inert::new(scratch.path());
+    let ports = Inert {
+        fabric_needs_node: false,
+        ..Inert::new(scratch.path())
+    };
     *ports.peers.lock().unwrap() = PeersRead::Joinable("open vault alab".to_owned());
     *ports.shared.lock().unwrap() =
         SharedRead::Foundable("vault alab has no Commons control".to_owned());
     *ports.awake.lock().unwrap() = AwakeRead::Due("no aCaffeine mug runs".to_owned());
+    *ports.tuning.lock().unwrap() = crate::clone_tuning::Reading::Due {
+        from: "$HOME/trust: feature.manyFiles unset".to_owned(),
+        to: "tuned".to_owned(),
+    };
     *ports.swarm.lock().unwrap() = Ok(false);
 
     for trigger in [
@@ -2058,6 +2258,7 @@ fn swarm_enabled_false_marks_every_sync_item_not_applicable_and_reads_nothing() 
             ACCOUNTS,
             FABRIC,
             AWAKE,
+            CLONE_TUNING,
         ] {
             let left = row(&pass.rows, id);
             assert_eq!(
@@ -2091,6 +2292,7 @@ fn swarm_enabled_false_marks_every_sync_item_not_applicable_and_reads_nothing() 
         ACCOUNTS,
         FABRIC,
         AWAKE,
+        CLONE_TUNING,
     ] {
         let failed = row(&broken.rows, id);
         assert_eq!(failed.outcome, Outcome::Unknown, "{id}: {failed:?}");
@@ -2103,6 +2305,45 @@ fn swarm_enabled_false_marks_every_sync_item_not_applicable_and_reads_nothing() 
     assert!(ports.reads.load(Ordering::SeqCst) > 0);
     assert!(!ports.applies().is_empty(), "{active:?}");
 }
+#[test]
+fn independent_fabric_runs_before_remote_work_and_node_hosting_waits_for_node() {
+    for needs_node in [false, true] {
+        for (before, effect) in [
+            (FabricRead::Due("replaced broker".into()), "fabric"),
+            (FabricRead::Unset("never turned off".into()), "fabric-on"),
+        ] {
+            let scratch = aterm_tempfile::tempdir().unwrap();
+            let ports = Inert {
+                fabric_needs_node: needs_node,
+                window: true,
+                fleet_key_held: false,
+                ..Inert::new(scratch.path())
+            };
+            *ports.fabric.lock().unwrap() = before;
+            *ports.node.lock().unwrap() = NodeRead::Due {
+                from: "no node runs".into(),
+                to: "node running".into(),
+            };
+            *ports.fleet_done.lock().unwrap() =
+                Ok(FleetDone::AtCapacity("issuer at capacity".into()));
+            let pass = ran(ports.pass(Trigger::Window, Mode::Apply));
+            assert_eq!(row(&pass.rows, FABRIC).outcome, Outcome::Changed);
+            assert_eq!(row(&pass.rows, FLEET).outcome, Outcome::Failed);
+            assert_eq!(row(&pass.rows, NODE).outcome, Outcome::Changed);
+            let calls = ports.dispatches.lock().unwrap();
+            let at = |kind| calls.iter().position(|call| *call == kind).unwrap();
+            if needs_node {
+                assert!(at("node") < at(effect), "{calls:?}");
+                assert!(at("sleep") < at(effect), "{calls:?}");
+            } else {
+                assert!(at(effect) < at("peers-read"), "{calls:?}");
+                assert!(at(effect) < at("fleet"), "{calls:?}");
+                assert!(at(effect) < at("sleep"), "{calls:?}");
+            }
+        }
+    }
+}
+
 #[test]
 fn init_skips_join_jitter_and_non_capacity_failures_do_not_retry() {
     // 1. Trigger::Init skips initial 0..=120 s join jitter, while Trigger::Subscriber waits it.
@@ -2454,6 +2695,7 @@ fn thirty_five_joins_against_sixteen_connections_all_land_within_ten_minutes() {
                         &ports,
                         Trigger::Subscriber,
                         Mode::Apply,
+                        aterm_secrets::converge::RepositoryWork::Refresh,
                         &mut |_| {},
                     ));
                     if !ports.cluster.simultaneous_burst {
@@ -2601,7 +2843,10 @@ fn no_sync_row_acts_on_the_vault_while_system_state_holds_it_out() {
         (Trigger::Init, Mode::Plan),
     ] {
         let scratch = aterm_tempfile::tempdir().unwrap();
-        let ports = Inert::new(scratch.path());
+        let ports = Inert {
+            fabric_needs_node: false,
+            ..Inert::new(scratch.path())
+        };
         *ports.held.lock().unwrap() = Some(HELD.to_owned());
         *ports.peers.lock().unwrap() =
             PeersRead::Joinable("the open ALab vault answers".to_owned());
@@ -2749,11 +2994,20 @@ pub(crate) mod owed_clone {
         fn owed_clone(&self) -> Result<OwedClone, String> {
             (self.owed)()
         }
-        fn clone_owed(&self) -> Result<String, String> {
+        fn clone_owed(
+            &self,
+            _work: aterm_secrets::converge::RepositoryWork,
+        ) -> Result<String, String> {
             (self.clone)()
         }
         fn forget_owed_clone(&self) -> Result<(), String> {
             (self.forget)()
+        }
+        fn clone_tuning(&self) -> Result<crate::clone_tuning::Reading, String> {
+            self.inner.clone_tuning()
+        }
+        fn tune_clones(&self) -> Result<crate::clone_tuning::Tuned, String> {
+            self.inner.tune_clones()
         }
         fn fabric(&self) -> Result<FabricRead, String> {
             self.inner.fabric()
@@ -2822,6 +3076,7 @@ pub(crate) mod owed_clone {
             &ports,
             Trigger::Subscriber,
             Mode::Apply,
+            aterm_secrets::converge::RepositoryWork::Refresh,
             &mut |row| {
                 if row.id == FLEET {
                     stopped.store(true, Ordering::SeqCst);
@@ -2834,7 +3089,7 @@ pub(crate) mod owed_clone {
             pass.rows
         );
         assert_eq!(row(&pass.rows, FLEET).outcome, Outcome::Changed);
-        for id in [NODE, ACCOUNTS, CLONE] {
+        for id in [NODE, ACCOUNTS, CLONE, CLONE_TUNING] {
             let held = row(&pass.rows, id);
             assert_eq!(
                 (held.outcome, held.why.as_deref()),
@@ -2851,6 +3106,49 @@ pub(crate) mod owed_clone {
         assert!(
             after_the_stop.is_empty(),
             "after the person's Stop the pass still applied {after_the_stop:?} on the vault"
+        );
+    }
+
+    /// A Stop pressed after `sync.clone-tuning` read the clones and before it applies holds the
+    /// tuning: the apply reads System State's hold on the vault again, as `sync.clone`'s does,
+    /// and stands aside with no clone written.
+    #[test]
+    fn a_stop_pressed_after_the_tuning_row_read_holds_its_apply() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let read = Arc::new(AtomicBool::new(false));
+        let held = || {
+            read.load(Ordering::SeqCst)
+                .then(|| "a Stop holds it".to_owned())
+        };
+        let ports = Hooked {
+            inner: Inert::new(scratch.path()),
+            held: &held,
+            owed: &|| Ok(OwedClone::Nothing("aterm init owes no clone".into())),
+            clone: &|| panic!("nothing is owed"),
+            forget: &|| Ok(()),
+        };
+        *ports.inner.tuning_read.lock().unwrap() = Some(Arc::clone(&read));
+        *ports.inner.tuning.lock().unwrap() = crate::clone_tuning::Reading::Due {
+            from: "$HOME/trust: feature.manyFiles unset".into(),
+            to: "tuned".into(),
+        };
+        let pass = ran(converge(
+            &ports,
+            Trigger::Subscriber,
+            Mode::Apply,
+            aterm_secrets::converge::RepositoryWork::Refresh,
+            &mut |_| {},
+        ));
+        let tuning = row(&pass.rows, CLONE_TUNING);
+        assert_eq!(
+            (tuning.outcome, tuning.why.as_deref()),
+            (Outcome::Blocked, Some("a Stop holds it")),
+            "{tuning:?}"
+        );
+        assert!(
+            !ports.inner.applies().contains(&"tune clones"),
+            "{:?}",
+            ports.inner.applies()
         );
     }
 
@@ -2980,7 +3278,13 @@ pub(crate) mod owed_clone {
         let state = scratch.path().to_path_buf();
         let held = || None;
         let owed = || crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE);
-        let clone = || crate::init::clone_owed(&sys, &state);
+        let clone = || {
+            crate::init::clone_owed(
+                &sys,
+                &state,
+                aterm_secrets::converge::RepositoryWork::Refresh,
+            )
+        };
         let ports = Hooked {
             inner: Inert::new(scratch.path()),
             held: &held,
@@ -2994,6 +3298,7 @@ pub(crate) mod owed_clone {
                 &ports,
                 Trigger::Subscriber,
                 Mode::Apply,
+                aterm_secrets::converge::RepositoryWork::Refresh,
                 &mut |_| {},
             ));
             let clone_row = row(&pass.rows, CLONE);
@@ -3022,6 +3327,7 @@ pub(crate) mod owed_clone {
             &ports,
             Trigger::Subscriber,
             Mode::Apply,
+            aterm_secrets::converge::RepositoryWork::Refresh,
             &mut |_| {},
         ));
         let asked = sys
@@ -3058,7 +3364,13 @@ pub(crate) mod owed_clone {
         assert!(matches!(read, OwedClone::Off(_)), "{read:?}");
         let held = || None;
         let owed = || crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE);
-        let clone = || crate::init::clone_owed(&sys, &state);
+        let clone = || {
+            crate::init::clone_owed(
+                &sys,
+                &state,
+                aterm_secrets::converge::RepositoryWork::Refresh,
+            )
+        };
         let ports = Hooked {
             inner: Inert::new(scratch.path()),
             held: &held,
@@ -3070,6 +3382,7 @@ pub(crate) mod owed_clone {
             &ports,
             Trigger::Subscriber,
             Mode::Apply,
+            aterm_secrets::converge::RepositoryWork::Refresh,
             &mut |_| {},
         ));
         assert!(
@@ -3142,6 +3455,7 @@ pub(crate) mod owed_clone {
                 &ports,
                 Trigger::Subscriber,
                 Mode::Apply,
+                aterm_secrets::converge::RepositoryWork::Refresh,
                 &mut |_| {},
             ));
             let row = row(&pass.rows, CLONE);
@@ -3222,7 +3536,13 @@ pub(crate) mod owed_clone {
         crate::git_credential::script::alike(&sys, &alice);
         let held = || None;
         let owed = || crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE);
-        let clone = || crate::init::clone_owed(&sys, &state);
+        let clone = || {
+            crate::init::clone_owed(
+                &sys,
+                &state,
+                aterm_secrets::converge::RepositoryWork::Refresh,
+            )
+        };
         let forget = || crate::init::forget_owed_clone(&state);
         let ports = Hooked {
             inner: Inert::new(&state),
@@ -3235,6 +3555,7 @@ pub(crate) mod owed_clone {
             &ports,
             Trigger::Subscriber,
             Mode::Apply,
+            aterm_secrets::converge::RepositoryWork::Refresh,
             &mut |_| {},
         ));
         let waiting = row(&first.rows, CLONE);
@@ -3253,6 +3574,7 @@ pub(crate) mod owed_clone {
             &ports,
             Trigger::Subscriber,
             Mode::Apply,
+            aterm_secrets::converge::RepositoryWork::Refresh,
             &mut |_| {},
         ));
         assert_eq!(
@@ -3334,6 +3656,7 @@ pub(crate) mod owed_clone {
             &ports,
             Trigger::Subscriber,
             Mode::Apply,
+            aterm_secrets::converge::RepositoryWork::Refresh,
             &mut |_| {},
         ));
         assert!(

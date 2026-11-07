@@ -920,6 +920,7 @@ pub const WHY_WORDS: &[&str] = &[
     "log-replaced",
     "signin",
     "install",
+    "cancelled",
     "restored",
     "could-not-finish",
     "off",

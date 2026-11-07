@@ -79,17 +79,20 @@ impl Backend for NativeBackend {
         producer: OwnedFd,
         stdio: StdioConfig,
         delegated: Delegations,
+        accounted: bool,
     ) -> Result<RemoteChild, SubmitError> {
         let deadline = Instant::now() + Duration::from_secs(8);
         let (events, host_events) =
             aterm_uds::kept_out(CtlStream::pair).map_err(SubmitError::NotSubmitted)?;
-        let child = RemoteChild::from_private_events(
-            Binding {
-                session: request.binding.session.clone(),
-                attempt: request.member_attempt,
-            },
-            events.into(),
-        )
+        let binding = Binding {
+            session: request.binding.session.clone(),
+            attempt: request.member_attempt,
+        };
+        let child = (if accounted {
+            RemoteChild::from_private_events_accounted(binding, events.into())
+        } else {
+            RemoteChild::from_private_events(binding, events.into())
+        })
         .map_err(SubmitError::NotSubmitted)?;
         let mut offered = false;
         let prepare = || -> io::Result<_> {
@@ -108,11 +111,17 @@ impl Backend for NativeBackend {
             }
             let host = self.connect(deadline)?;
             let stream = host.stream();
-            let hello = aterm_json::to_vec(&aterm_json::json!({
-                "version": 3, "role": "proxy-member", "session": request.binding.session,
+            let mut hello = aterm_json::json!({
+                "version": 3, "role": if accounted { trust_resource_controller::accounting::PROXY_ROLE } else { "proxy-member" }, "session": request.binding.session,
                 "attempt": aterm_codec::hex::encode_lower(&request.binding.root_attempt),
-            }))
-            .map_err(io::Error::other)?;
+            });
+            if accounted {
+                hello.as_object_mut().ok_or_else(invalid)?.insert(
+                    "accounting".into(),
+                    trust_resource_controller::accounting::CAPABILITY.into(),
+                );
+            }
+            let hello = aterm_json::to_vec(&hello).map_err(io::Error::other)?;
             transport::write_frame(stream, &hello, deadline)?;
             if transport::read_frame(stream, deadline)? != subgroup::PREPARE {
                 return Err(invalid());

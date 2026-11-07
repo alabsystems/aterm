@@ -1100,7 +1100,7 @@ pub(crate) fn await_task(
     await_tasks(store, &awaited, combine, timeout_ms)
 }
 
-/// `await task`: park until the task records of `awaited` have news — a target whose record's rev is past its `since` with a state to read (`done`, `exited`, `stalled`) or an ask raised under a task owner, never a `kind=wait` entry ([`crate::task_record::TaskRecord::has_news`]), a `facts=1` target whose fact word was noted past its fact edge (a clear is none), whose session closed, or a retired worker's row ([`Awaited::Retired`]), news from the start — at the first such target (`any`) or once every target is one (`all`). A fact edit never moves `rev`, so a wait without `facts=1` never wakes on one. Rows answer in `awaited`'s order.
+/// `await task`: park until the task records of `awaited` have news — a target whose record's rev is past its `since` with a state to read (`done`, `exited`, `stalled`) or an ask raised under a task owner (one beside a standing ask too), never a `kind=wait` entry ([`crate::task_record::TaskRecord::has_news`]), a `facts=1` target whose fact word was noted past its fact edge (a clear is none), whose session closed, or a retired worker's row ([`Awaited::Retired`]), news from the start — at the first such target (`any`) or once every target is one (`all`). A fact edit never moves `rev`, so a wait without `facts=1` never wakes on one. Rows answer in `awaited`'s order.
 pub(crate) fn await_tasks(
     store: &Store,
     awaited: &[Awaited<'_>],
@@ -7740,6 +7740,254 @@ mod tests {
         );
     }
 
+    /// A SECOND ASK IS NEWS: while a worker's `NEEDS YOU:` stands, a lead parked in `await task`
+    /// past the record's rev wakes when another ask joins it (a box the harness escalates under
+    /// `owner=supervisor`, a new needs set written over the old), though the attention flag never
+    /// fell, and again when an ask taken down is raised once more. NEGATIVE CONTROL: the same
+    /// needs set written again, a `kind=wait` entry under a task owner and one of two standing
+    /// asks cleared leave the rev where it stood, so a wait past it times out with no news.
+    #[test]
+    fn a_second_ask_under_a_standing_one_wakes_await_task() {
+        use crate::task_record::Combine;
+        let store = crate::session_store::new_store();
+        let workers = three_workers(&store);
+        let w = &workers[0];
+        let meta = |rest: &str| cmd_meta(&w.term, &store, w.local_id, &w.ctx, rest).0;
+        let rev = || task_record_of(&w.ctx).expect("a record").rev;
+        let wait = |since: u64, timeout_ms| {
+            await_task(
+                &store,
+                &[TaskTarget {
+                    local_id: w.local_id,
+                    ctx: &w.ctx,
+                    since: Some(since),
+                    facts: false,
+                    fact_since: None,
+                }],
+                Combine::Any,
+                timeout_ms,
+            )
+        };
+        let news = |reply: &str| {
+            reply
+                .lines()
+                .nth(1)
+                .and_then(|row| row.rsplit_once(" task_news="))
+                .map(|(_, bit)| bit.to_string())
+        };
+        let first = "set attention owner=needs kind=ask claude needs you: a release credential";
+        let again = "set attention owner=needs kind=ask claude needs you: the org admin role";
+        let the_box = "set attention owner=supervisor box: Allow this command?";
+        assert_eq!(meta(first), "OK\n");
+        let parked_wakes_on = |write: &str| {
+            let since = rev();
+            std::thread::scope(|s| {
+                let waiter = s.spawn(|| wait(since, 60_000));
+                let parked = std::time::Instant::now();
+                while w.ctx.watchers.count() == 0 {
+                    assert!(
+                        parked.elapsed() < std::time::Duration::from_secs(60),
+                        "the waiter never parked"
+                    );
+                    aterm_uds::deadline::poll_yield();
+                }
+                assert_eq!(meta(write), "OK\n");
+                let reply = waiter.join().expect("the waiter");
+                assert_eq!(
+                    task_reply(&reply),
+                    ("OK 1", vec!["working"]),
+                    "{write}: {reply}"
+                );
+                assert_eq!(news(&reply).as_deref(), Some("1"), "{write}: {reply}");
+            });
+            assert_eq!(rev(), since + 1, "{write}");
+        };
+        parked_wakes_on(the_box);
+        parked_wakes_on(again);
+
+        let since = rev();
+        for quiet in [
+            again,
+            "set attention owner=codex-alab kind=wait waiting out the outage",
+            "unset attention owner=supervisor",
+        ] {
+            assert_eq!(meta(quiet), "OK\n", "{quiet}");
+            assert_eq!(rev(), since, "{quiet} is no news");
+        }
+        let quiet = wait(since, 20);
+        assert_eq!(task_reply(&quiet).0, "OK 1 status=timeout", "{quiet}");
+        assert_eq!(news(&quiet).as_deref(), Some("0"), "{quiet}");
+        parked_wakes_on(the_box);
+    }
+
+    /// A NEED IS AN ASK, NOT THE ENTRY'S WORDS: the needs entry names only a set's first need and a
+    /// count, so a lead parked past the rev sleeps when one need of the set its loop told the
+    /// window is taken down though the words change, and wakes when a need joins the set though
+    /// they hold (its first need and count unchanged). NEGATIVE CONTROL: the same set told and
+    /// written again moves nothing, and the need taken down raised once more wakes it.
+    #[test]
+    fn a_need_joining_a_told_set_wakes_await_task_and_one_taken_down_does_not() {
+        use crate::task_record::Combine;
+        let store = crate::session_store::new_store();
+        let workers = three_workers(&store);
+        let w = &workers[0];
+        let sid = w.sid.as_str().to_string();
+        let rev = || task_record_of(&w.ctx).expect("a record").rev;
+        let wait = |since: u64, timeout_ms| {
+            await_task(
+                &store,
+                &[TaskTarget {
+                    local_id: w.local_id,
+                    ctx: &w.ctx,
+                    since: Some(since),
+                    facts: false,
+                    fact_since: None,
+                }],
+                Combine::Any,
+                timeout_ms,
+            )
+        };
+        // The loop tells the window the set, then writes its entry (`Session::request_needs`).
+        let publish = |needs: &[&str], entry: &str| {
+            let needs: Vec<String> = needs.iter().map(|need| (*need).to_string()).collect();
+            crate::harness_host::store_needs(&store, &sid, &needs, entry);
+            let write = format!("set attention owner=needs kind=ask {entry}");
+            assert_eq!(
+                cmd_meta(&w.term, &store, w.local_id, &w.ctx, &write).0,
+                "OK\n",
+                "{entry}"
+            );
+        };
+        let two = "claude needs you: sign 0.48.0 (+1 more) — carrying on";
+        let one = "claude needs you: sign 0.48.0 — carrying on";
+        let parked_wakes_on = |what: &str, needs: &[&str], entry: &str| {
+            let since = rev();
+            std::thread::scope(|s| {
+                let waiter = s.spawn(|| wait(since, 60_000));
+                let parked = std::time::Instant::now();
+                while w.ctx.watchers.count() == 0 {
+                    assert!(
+                        parked.elapsed() < std::time::Duration::from_secs(60),
+                        "the waiter never parked"
+                    );
+                    aterm_uds::deadline::poll_yield();
+                }
+                publish(needs, entry);
+                let reply = waiter.join().expect("the waiter");
+                assert!(
+                    reply.starts_with("OK 1\n") && reply.ends_with(" task_news=1\n"),
+                    "{what}: {reply}"
+                );
+            });
+            assert_eq!(rev(), since + 1, "{what}");
+        };
+        publish(&["sign 0.48.0", "grant Full Disk Access"], two);
+        let since = rev();
+        publish(&["sign 0.48.0"], one);
+        assert_eq!(rev(), since, "a need taken down is no news");
+        publish(&["sign 0.48.0"], one);
+        assert_eq!(rev(), since, "CONTROL: the same set again is no news");
+        let quiet = wait(since, 20);
+        assert_eq!(task_reply(&quiet).0, "OK 1 status=timeout", "{quiet}");
+        parked_wakes_on(
+            "CONTROL: a need taken down raised again",
+            &["sign 0.48.0", "grant Full Disk Access"],
+            two,
+        );
+        parked_wakes_on(
+            "a need joins under the same words",
+            &["sign 0.48.0", "restart the Mac"],
+            two,
+        );
+    }
+
+    /// A SEAMLESS UPDATE CARRIES THE NEEDS ENTRY, NOT THE SET ITS LOOP TOLD: the successor's loop
+    /// telling the same set and writing the same entry again at its first point (its `reconcile`
+    /// reads the entry a loop before it left) is no news to a lead parked past the carried
+    /// record's rev, though the window knew only the entry's words before and knows its needs
+    /// now. NEGATIVE CONTROL: a need joining the set after that wakes the lead.
+    #[test]
+    fn the_same_needs_told_again_after_a_seamless_update_are_no_news() {
+        use crate::task_record::Combine;
+        let store = crate::session_store::new_store();
+        let workers = three_workers(&store);
+        let one = "claude needs you: sign 0.48.0 — carrying on";
+        let two = "claude needs you: sign 0.48.0 (+1 more) — carrying on";
+        // The loop tells the window the set, then writes its entry (`Session::request_needs`).
+        let publish = |w: &SessionHandle, needs: &[&str], entry: &str| {
+            let needs: Vec<String> = needs.iter().map(|need| (*need).to_string()).collect();
+            crate::harness_host::store_needs(&store, w.sid.as_str(), &needs, entry);
+            let write = format!("set attention owner=needs kind=ask {entry}");
+            assert_eq!(
+                cmd_meta(&w.term, &store, w.local_id, &w.ctx, &write).0,
+                "OK\n",
+                "{entry}"
+            );
+        };
+        publish(&workers[0], &["sign 0.48.0"], one);
+        let row = task_record_of(&workers[0].ctx)
+            .expect("a record")
+            .carry_row(std::time::Instant::now());
+        let escalations = workers[0]
+            .ctx
+            .meta
+            .lock()
+            .unwrap()
+            .handoff_attention_owners();
+        // The successor adopts the session as `spawn` does: the escalations, then the record.
+        let w = crate::session_store::test_handle(4);
+        crate::session_timeline::seed_carried_claims(
+            &w.ctx.meta,
+            &w.ctx.timeline,
+            None,
+            &escalations,
+            crate::metrics::now_us(),
+        );
+        crate::task_record::seed_carried(&w.ctx, Some(&row));
+        store.write().unwrap().register(w.clone());
+        let rev = || task_record_of(&w.ctx).expect("a record").rev;
+        let carried = task_record_of(&w.ctx).expect("a carried record");
+        assert!(carried.attention, "the carried need stands");
+        let wait = |since: u64, timeout_ms| {
+            await_task(
+                &store,
+                &[TaskTarget {
+                    local_id: w.local_id,
+                    ctx: &w.ctx,
+                    since: Some(since),
+                    facts: false,
+                    fact_since: None,
+                }],
+                Combine::Any,
+                timeout_ms,
+            )
+        };
+        let since = carried.rev;
+        publish(&w, &["sign 0.48.0"], one);
+        assert_eq!(rev(), since, "the same needs told again are no news");
+        let quiet = wait(since, 20);
+        assert_eq!(task_reply(&quiet).0, "OK 1 status=timeout", "{quiet}");
+
+        std::thread::scope(|s| {
+            let waiter = s.spawn(|| wait(since, 60_000));
+            let parked = std::time::Instant::now();
+            while w.ctx.watchers.count() == 0 {
+                assert!(
+                    parked.elapsed() < std::time::Duration::from_secs(60),
+                    "the waiter never parked"
+                );
+                aterm_uds::deadline::poll_yield();
+            }
+            publish(&w, &["sign 0.48.0", "grant Full Disk Access"], two);
+            let reply = waiter.join().expect("the waiter");
+            assert!(
+                reply.starts_with("OK 1\n") && reply.ends_with(" task_news=1\n"),
+                "CONTROL: a need joins: {reply}"
+            );
+        });
+        assert_eq!(rev(), since + 1, "CONTROL: a need joins");
+    }
+
     /// THE FACT WORD IS NO NEWS TO A DEFAULT WAIT (the occupancy design's manager door): a
     /// worker whose supervisor attention stands, waited on past its rev, is not woken by a fact
     /// edit, which never moves `rev`. NEGATIVE CONTROL: `NoteBumpsNews` (the edit moves `rev`
@@ -11145,7 +11393,7 @@ mod needs_tests {
         };
         let _ = worker.ctx.timeline.lock().unwrap().mark_task(
             &mark,
-            false,
+            &Default::default(),
             Instant::now(),
             TASKS_AT_MS,
         );

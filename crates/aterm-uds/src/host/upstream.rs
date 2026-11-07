@@ -70,6 +70,8 @@ pub enum Build {
     Prebuilt,
     /// Build the signing executable with statically linked OpenSSL libraries.
     OpenSsl,
+    /// Build pkgconf with its static library and no implicit package search paths.
+    Pkgconf,
 }
 
 /// One locally built reference artifact qualified for a particular cohort and host.
@@ -327,6 +329,37 @@ pub const OPENSSL_SIGNING: PinnedTool = PinnedTool {
     darwin_omit: &[],
     hosts: &["macos-aarch64", "macos-x86_64"],
     archives: &[OPENSSL_SIGNING_SOURCE],
+};
+
+/// The package metadata helper's source and native configuration, shared by producers.
+pub const PKGCONF_CONFIGURE_OPTIONS: &[&str] = &[
+    "--prefix=/atpkg/pkgconf/3.0.10",
+    "--disable-shared",
+    "--enable-static",
+    "--with-pkg-config-dir=",
+    "--with-system-libdir=",
+    "--with-system-includedir=",
+];
+
+/// An immutable upstream release; the qualified package currently serves native ARM Macs.
+pub const PKGCONF: PinnedTool = PinnedTool {
+    name: "pkgconf",
+    version: "3.0.10",
+    executable: "pkgconf",
+    layout: Layout::Executable,
+    build: Build::Pkgconf,
+    strip: 1,
+    max_extract_bytes: 32 * 1024 * 1024,
+    licenses: &["COPYING"],
+    shim_env: &[],
+    darwin_omit: &[],
+    hosts: &["macos-aarch64"],
+    archives: &[Archive {
+        platform: "source",
+        url: "https://distfiles.ariadne.space/pkgconf/pkgconf-{v}.tar.xz",
+        sha256: "9371b2f6372da574d4c6dc96fe9b1463037bcf6afcb6671c1555afde7b17e2de",
+        bytes: 429_268,
+    }],
 };
 
 /// Official self-contained Node runtime for JavaScript/WebAssembly reference checks.

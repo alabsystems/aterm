@@ -165,3 +165,152 @@ fn live_link_local_route_uses_the_kernel_embedded_zone() {
         assert!(!route.direct);
     }
 }
+
+/// The routing messages that can change an attachment move the interface generation, and the
+/// route-table ones, which an idle Mac's ARP and route lookups send all the time, do not.
+#[test]
+fn interface_and_address_messages_move_the_interface_generation() {
+    // RTM_NEWADDR, RTM_DELADDR, RTM_IFINFO, RTM_NEWMADDR, RTM_DELMADDR, RTM_IFINFO2, and a type
+    // this build does not know.
+    for kind in [0xc, 0xd, 0xe, 0xf, 0x10, 0x12, 0x13, 0x40] {
+        assert!(moves_interfaces(kind), "{kind:#x}");
+    }
+    // RTM_ADD through RTM_RESOLVE, and RTM_GET2.
+    for kind in (0x1..=0xb).chain([0x14]) {
+        assert!(!moves_interfaces(kind), "{kind:#x}");
+    }
+}
+
+/// The routing socket opens with no privilege, so a Mac's rechecks get a generation.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_interface_generation_is_read_from_a_routing_socket() {
+    assert!(interface_generation().is_some());
+}
+
+/// A routing message header of type `kind`: an `rt_msghdr` with its length, version and type,
+/// the rest zero.
+fn routing_message(kind: u8) -> Vec<u8> {
+    let mut bytes = vec![0; HEADER];
+    bytes[0..2].copy_from_slice(&u16::try_from(HEADER).unwrap().to_ne_bytes());
+    bytes[2] = 5;
+    bytes[3] = kind;
+    bytes
+}
+
+/// Whether delivering `messages` on `kernel` and then draining `watch` (at most `most` messages)
+/// moved its generation.
+fn moves(
+    kernel: &std::os::unix::net::UnixDatagram,
+    watch: &mut Watch,
+    messages: &[Vec<u8>],
+    most: usize,
+) -> bool {
+    for message in messages {
+        assert_eq!(kernel.send(message).unwrap(), message.len());
+    }
+    let before = watch.generation;
+    watch.drain(most) != before
+}
+
+/// A drain moves the interface generation for each message that can change an attachment and for
+/// whatever the socket cannot vouch for, and for nothing else: crafted `rt_msghdr` headers on a
+/// datagram socket pair. `RTM_NEWADDR`, `RTM_DELADDR`, `RTM_IFINFO` and `RTM_IFINFO2` move it, the
+/// route-table types (`RTM_ADD` through `RTM_RESOLVE`, `RTM_GET2`) do not, alone or together; a
+/// read too short to name its type moves it, as does a read that fails, a drain that reaches its
+/// bound and one that finds half the receive room queued.
+///
+/// NEGATIVE CONTROLS (2026-11-06), each planted in [`Watch::drain`]: with the type left unread
+/// (`moved |= received < 4`) `RTM_NEWADDR` moves nothing; with a failed read ending the drain
+/// unmoved, the read on `/dev/null` moves nothing (`left: 0, right: 0`); with the queued bytes
+/// unweighed, half the room queued moves nothing.
+#[test]
+fn a_drain_moves_the_generation_for_interface_messages_and_what_it_cannot_vouch_for() {
+    let (kernel, socket) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    let mut watch = Watch::over(socket.into(), 64 * 1024);
+    assert!(!moves(&kernel, &mut watch, &[], DRAIN), "nothing heard");
+    let table: Vec<Vec<u8>> = (0x1..=0xb).chain([0x14]).map(routing_message).collect();
+    for message in &table {
+        assert!(
+            !moves(&kernel, &mut watch, std::slice::from_ref(message), DRAIN),
+            "{:#x}",
+            message[3]
+        );
+    }
+    assert!(
+        !moves(&kernel, &mut watch, &table, DRAIN),
+        "the route table"
+    );
+    for kind in [0xc, 0xd, 0xe, 0x12] {
+        assert!(
+            moves(&kernel, &mut watch, &[routing_message(kind)], DRAIN),
+            "{kind:#x}"
+        );
+    }
+    assert!(
+        moves(
+            &kernel,
+            &mut watch,
+            &[routing_message(0xe)[..3].to_vec()],
+            DRAIN
+        ),
+        "a short read"
+    );
+    assert!(
+        !moves(&kernel, &mut watch, &table[..2], 3),
+        "within its bound"
+    );
+    assert!(moves(&kernel, &mut watch, &table[..4], 3), "past its bound");
+    assert!(!moves(&kernel, &mut watch, &[], DRAIN), "the rest was read");
+
+    let (kernel, socket) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    let mut watch = Watch::over(socket.into(), 2 * HEADER + 1);
+    assert!(
+        !moves(&kernel, &mut watch, &table[..1], DRAIN),
+        "under half"
+    );
+    assert!(
+        moves(&kernel, &mut watch, &table[..2], DRAIN),
+        "half the room"
+    );
+
+    let not_a_socket = std::fs::File::open("/dev/null").unwrap();
+    let mut watch = Watch::over(not_a_socket.into(), 64 * 1024);
+    let before = watch.generation;
+    assert_ne!(watch.drain(DRAIN), before, "a failed read");
+}
+
+/// The attachments a recheck reads (`crate::lan::local_attachments`, which every listener and
+/// multicast recheck reads through) are kept while the routing socket hears nothing that moves an
+/// interface, and read again once it does: its generation drained from a stand-in socket this
+/// test delivers the kernel's messages to, on a clock the test holds still. 50 rechecks read once;
+/// a route-table message reads nothing; `RTM_IFINFO` and then `RTM_NEWADDR` read once each.
+///
+/// NEGATIVE CONTROL (2026-11-06): with `local_attachments` reading under a constant generation
+/// (`Some(0)` for `native::interface_generation()`), the `RTM_IFINFO` leaves the kept read
+/// standing (`left: 1, right: 2`).
+#[cfg(target_os = "macos")]
+#[test]
+fn local_attachments_are_read_again_once_the_routing_socket_moves() {
+    let (kernel, socket) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    STAND_IN.set(Some(Watch::over(socket.into(), 64 * 1024)));
+    crate::lan::FIXED_NOW.set(Some(std::time::Instant::now()));
+    let lo0 = Some(crate::lan::native::index("lo0").unwrap());
+    let enumerations = crate::lan::ENUMERATIONS.get();
+    let recheck = |message: Option<u8>| {
+        if let Some(kind) = message {
+            kernel.send(&routing_message(kind)).unwrap();
+        }
+        crate::lan::local_attachments(None, lo0).unwrap();
+        crate::lan::ENUMERATIONS.get() - enumerations
+    };
+    for _ in 0..50 {
+        assert_eq!(recheck(None), 1, "one generation");
+    }
+    assert_eq!(recheck(Some(0x4)), 1, "RTM_GET");
+    assert_eq!(recheck(Some(0xe)), 2, "RTM_IFINFO");
+    assert_eq!(recheck(None), 2, "after RTM_IFINFO");
+    assert_eq!(recheck(Some(0xc)), 3, "RTM_NEWADDR");
+    STAND_IN.set(None);
+    crate::lan::FIXED_NOW.set(None);
+}

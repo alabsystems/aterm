@@ -58,8 +58,13 @@ impl<'a> Fence<'a> {
     }
 
     pub(super) fn note(&self, path: &Path, reason: KeepReason) {
+        self.note_with(path, || reason);
+    }
+
+    /// Build diagnostic-only evidence only when this pass collects reports.
+    pub(super) fn note_with(&self, path: &Path, reason: impl FnOnce() -> KeepReason) {
         if let Some(kept) = &self.kept {
-            super::report::add(&mut kept.borrow_mut(), path, reason);
+            super::report::add(&mut kept.borrow_mut(), path, reason());
         }
     }
 
@@ -198,6 +203,28 @@ mod tests {
                 observed: PathBuf::from("/cache/program")
             })
         );
+    }
+
+    #[test]
+    fn diagnostic_evidence_is_built_only_for_a_reporting_pass() {
+        let calls = Cell::new(0);
+        let reason = || {
+            calls.set(calls.get() + 1);
+            KeepReason::InventoryUnavailable
+        };
+        let path = Path::new("/cache");
+        Fence::default().note_with(path, reason);
+        assert_eq!(calls.get(), 0);
+        let reporting = Fence::default().with_reporting();
+        reporting.note_with(path, reason);
+        assert_eq!(calls.get(), 1);
+        assert!(matches!(
+            reporting.retained().as_slice(),
+            [RetainedCheck {
+                reason: KeepReason::InventoryUnavailable,
+                ..
+            }]
+        ));
     }
 
     #[test]
@@ -378,13 +405,23 @@ mod tests {
         let mut custody = KeptUntilRan::new(directory);
         let home = custody.path().canonicalize().unwrap().join("home");
         let owner = home.join("workspace");
-        std::fs::create_dir_all(&owner).unwrap();
+        // Private whatever the umask: a registered target is laid only through folders no
+        // group or other user can write, from the home down.
+        let private = |at: &Path| {
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(at)
+                .unwrap();
+        };
+        private(&owner);
         std::fs::write(owner.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
         // The registrar deliberately excludes Library. Use an admitted private mirror
         // outside it so this same real image can exercise registered and mirrored targets.
         let root = home.join("cache.noindex");
         let leaf = super::super::build_dir(&root, &owner);
-        std::fs::create_dir_all(leaf.parent().unwrap()).unwrap();
+        private(leaf.parent().unwrap());
         assert!(super::super::registered::create_checked(&home, &leaf, &owner).unwrap());
         let tooling = leaf.join("debug/deps/tooling.noindex");
         let row = tooling.join("fish-7");

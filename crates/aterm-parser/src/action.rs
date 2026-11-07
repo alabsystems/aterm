@@ -3,7 +3,7 @@
 
 //! Parser actions and the sink trait.
 
-use aterm_provenance::{Provenance, Pty};
+use aterm_provenance::{Provenance, Pty, pty_wrap_ref};
 
 /// Action produced by the parser.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +88,21 @@ pub trait ActionSink {
     /// Execute a C0 control function (0x00-0x1F) or C1 (0x80-0x9F).
     fn execute(&mut self, byte: u8);
 
+    /// Whether this sink takes a run of text lines whole ([`ActionSink::print_lines`]). The
+    /// parser hands a run over only to a sink that says so; any other sink gets the run's prints
+    /// and line controls one call at a time, as it always has.
+    const TAKES_LINES: bool = false;
+
+    /// A run of text lines in the ground state, from a line feed on: `lines` starts with LF and
+    /// holds only printable ASCII (`0x20..=0x7E`), CR and LF. It stands for exactly what
+    /// [`deliver_lines`] makes of it, which is what the parser delivers for those bytes one at a
+    /// time: each maximal printable run as one `print_ascii_bulk` and each CR and LF as an
+    /// `execute`, in order. A sink overrides it to take the run in fewer steps.
+    #[inline]
+    fn print_lines(&mut self, lines: &Provenance<[u8], Pty>) {
+        deliver_lines(self, lines.as_ref());
+    }
+
     /// A CSI sequence has been parsed.
     fn csi_dispatch(
         &mut self,
@@ -171,6 +186,41 @@ pub trait ActionSink {
     /// End of an APC sequence.
     #[inline]
     fn apc_end(&mut self, _canceled: bool) {}
+}
+
+/// Deliver a run of text lines (`lines` holds only printable ASCII, CR and LF) to `sink` one
+/// action at a time: each maximal printable run as one `print_ascii_bulk`, each CR and LF as an
+/// `execute`. [`ActionSink::print_lines`] means this, and a sink that cannot take a run whole
+/// at the moment falls back on it.
+pub fn deliver_lines<S: ActionSink + ?Sized>(sink: &mut S, lines: &[u8]) {
+    let mut rest = lines;
+    while !rest.is_empty() {
+        let (text, tail) = rest.split_at(printable_len(rest));
+        if !text.is_empty() {
+            sink.print_ascii_bulk(pty_wrap_ref(text));
+        }
+        let Some((&control, after)) = tail.split_first() else {
+            return;
+        };
+        sink.execute(control);
+        rest = after;
+    }
+}
+
+/// The length of `bytes`' printable-ASCII (`0x20..=0x7E`) prefix, found with the parser's own
+/// scanner: in a run of text lines, the text before the next CR or LF. The first two bytes are
+/// read one at a time first, so a line of at most one glyph (`yes`, a region's scroll) is
+/// measured without the chunked scanner, whose setup costs more than such a line.
+#[must_use]
+#[inline]
+pub fn printable_len(bytes: &[u8]) -> usize {
+    match bytes {
+        [b0, ..] if !(0x20..=0x7E).contains(b0) => 0,
+        [_, b1, ..] if !(0x20..=0x7E).contains(b1) => 1,
+        _ => bytes
+            .get(2..)
+            .map_or(bytes.len(), |rest| 2 + crate::simd::count_printable(rest)),
+    }
 }
 
 /// A sink that discards all actions.

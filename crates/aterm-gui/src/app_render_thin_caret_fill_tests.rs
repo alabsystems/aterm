@@ -6,7 +6,10 @@
 //! lifted colour over the block's) through [`presented_caret_fill`], as the pipeline's own
 //! publish and the Settings preview do. Found by composed r2's gallery: the replay read the
 //! lifted bar at 4.5 or more, while the app, taking the block's fill alone, drew GitHub Light's
-//! #0969da on Comet's disc at 2.4.
+//! #0969da on Comet's disc at 2.4. Since after-land L2 the paper Comet's head seats on a bar and
+//! lays no light past it, so a bar's own cell under Comet stays the page and is read against
+//! nothing; the fixture types Classic, the style whose streak still lights a bar's cell on
+//! paper (its block fill alone reads 3.4-3.7:1 there).
 
 use super::*;
 use aterm_effects::color_math::contrast_ratio;
@@ -34,7 +37,7 @@ fn theme_bar() -> u32 {
         })
 }
 
-/// Comet typing a line on GitHub Light behind a bar caret down `path`, one key every 80 ms on
+/// Classic typing a line on GitHub Light behind a bar caret down `path`, one key every 80 ms on
 /// a 16 ms frame grid: each frame that read its bar against a ground, with the colour that
 /// path's present drew the bar in (the theme's where it drew no override).
 fn typed_on_paper(path: Path) -> Vec<(u32, u32)> {
@@ -44,7 +47,7 @@ fn typed_on_paper(path: Path) -> Vec<(u32, u32)> {
     app.config.cursor_style = Some("bar".into());
     app.config.cursor_blink = Some(false);
     app.config.cursor_trail = Some(true);
-    app.config.cursor_trail_style = Some("comet".into());
+    app.config.cursor_trail_style = Some("classic".into());
     app.config.motion = Some("full".into());
     app.config.trail_sounds = Some(false);
     let _ = app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);

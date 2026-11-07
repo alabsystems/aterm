@@ -158,18 +158,59 @@ pub(crate) fn same_candidate(left: Option<&Candidate>, right: Option<&Candidate>
 }
 
 /// Refuse a changed effective pair rather than reporting an earlier authorization.
+///
+/// A pair whose lock exists is read under it. A pair no roster-protocol writer has locked
+/// (the vault places the kept pair as two plain files, outside the protocol) is read
+/// without it, and nothing is created. Every protocol writer
+/// ([`atpkg_keys::provision::lock_roster`]) creates the lock before it writes either half or
+/// a transaction, so a lock still absent after the read shows that none of them touched the
+/// pair while it was read, and the read stands. One that appeared sends the read back under
+/// that lock. A write outside the protocol is caught here as it is under the lock: by the
+/// master signature, the half-pair check and the comparison with `selected`.
 #[cfg(unix)]
 pub(crate) fn require_public_pair(
     path: &Path,
     selected: &Candidate,
     masters: &[&str],
 ) -> Result<()> {
-    let _guard =
-        atpkg_keys::provision::lock_roster_read_only(&utf8_path(path)?).map_err(Error::new)?;
+    require_public_pair_around(path, selected, masters, || {})
+}
+
+/// [`require_public_pair`], with `between` run after an unlocked pair is read and before its
+/// lock is looked at again.
+#[cfg(unix)]
+fn require_public_pair_around(
+    path: &Path,
+    selected: &Candidate,
+    masters: &[&str],
+    between: impl FnOnce(),
+) -> Result<()> {
+    let body = utf8_path(path)?;
+    let lock = atpkg_keys::provision::roster_lock_path(&body);
+    if never_locked(&lock)? {
+        let unlocked = require_public_pair_held(path, selected, masters);
+        between();
+        if never_locked(&lock)? {
+            return unlocked;
+        }
+    }
+    let _guard = atpkg_keys::provision::lock_roster_read_only(&body).map_err(Error::new)?;
     require_public_pair_held(path, selected, masters)
 }
 
-/// Read under the caller's existing roster writer or read-only lock.
+/// Whether the roster lock at `lock` is absent: no roster-protocol writer has taken it.
+#[cfg(unix)]
+fn never_locked(lock: &str) -> Result<bool> {
+    match std::fs::symlink_metadata(lock) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Ok(_) => Ok(false),
+        Err(error) => Err(Error::new(format!("inspect roster lock {lock}: {error}"))),
+    }
+}
+
+/// Read under the caller's roster writer or read-only lock, or by [`require_public_pair`] for
+/// a pair no protocol writer has locked, which keeps the result only while the lock stays
+/// absent.
 #[cfg(unix)]
 pub(crate) fn require_public_pair_held(
     path: &Path,

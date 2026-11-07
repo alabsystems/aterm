@@ -398,11 +398,11 @@ fn parse_args(args: &[String]) -> Result<Ask, Fail> {
 pub fn cmd_uia(args: &[String]) -> Res {
     let ask = parse_args(args)?;
     let l = windows::Layout::find()?;
-    let _lock = windows::boot_lane(&l)?;
+    let mut lane = windows::boot_lane(&l)?;
     let results = paths().need_state()?.join("windows");
     std::fs::create_dir_all(&results)
         .map_err(|e| Fail::die(format!("{}: {e}", results.display())))?;
-    let up = windows::bring_up(false)?;
+    let up = windows::bring_up(&mut lane, false)?;
     let repo = crate::paths::physical(&paths().repo);
     if let Err(e) = windows::copy_tree(&up.layout, &up.ssh, &repo) {
         up.release().map_err(Fail::die)?;

@@ -210,13 +210,10 @@ fn held_of(s: &Settings, ai_dir: Option<&Path>) -> Option<Held> {
     fleet::held_state(ai_dir?).filter(|h| h.of(url, key))
 }
 
-/// Fetches the fleet document from the URL `[ai] fleet` names.
+/// Fetches the fleet document from the URL `[ai] fleet` names, in an `aterm.toml`
+/// [`config::read_config`] admits: one that is there and is not read names none.
 pub fn fleet_fetch(env: &Env, fetcher: &dyn Fetcher, force: bool) -> Option<Fetched> {
-    let text = env.config.as_deref().and_then(|p| {
-        crate::harness::accounts::read_bounded(p, config::CONFIG_MAX_BYTES)
-            .ok()
-            .flatten()
-    });
+    let text = config::read_config(env.config.as_deref()).ok().flatten();
     let (local, _) = config::read(text.as_deref().unwrap_or_default());
     let Some(FleetSource::Url(url)) = local.fleet else {
         return None;
@@ -234,13 +231,9 @@ pub fn fleet_fetch(env: &Env, fetcher: &dyn Fetcher, force: bool) -> Option<Fetc
 #[must_use]
 pub fn look(env: &Env) -> Look {
     let ai_dir = env.ai_dir();
-    let config_text = env.config.as_deref().and_then(|p| {
-        crate::harness::accounts::read_bounded(p, config::CONFIG_MAX_BYTES)
-            .ok()
-            .flatten()
-    });
-    let (settings, parsed_doc) = config::load_from_text(
-        config_text.as_deref(),
+    let config_read = config::read_config(env.config.as_deref());
+    let (settings, parsed_doc) = config::load_read(
+        &config_read,
         env.config.as_deref(),
         ai_dir.as_deref(),
         env.now,
@@ -286,21 +279,35 @@ pub fn look(env: &Env) -> Look {
         });
     // One mode for every pool, read once, unless a switch turns one pool off and not another:
     // each pool then reads its own ([`crate::supervise::config::SupervisorConfig::accounts_for`]).
-    let accounts_mode = match (has_other_pool, config_text.as_deref()) {
-        (true, Some(text)) => {
-            let policy = crate::supervise::config::SupervisorConfig::from_parsed_aterm_toml(
+    let pooled = |policy: crate::supervise::config::SupervisorConfig| {
+        [
+            crate::harness::accounts::Cli::Codex,
+            crate::harness::accounts::Cli::Grok,
+            crate::harness::accounts::Cli::Kimi,
+        ]
+        .into_iter()
+        .all(|cli| policy.on_for(cli.program()))
+        .then_some(policy.accounts)
+    };
+    let accounts_mode = match (has_other_pool, &config_read) {
+        (true, Ok(Some(text))) => pooled(
+            crate::supervise::config::SupervisorConfig::from_parsed_aterm_toml(
                 parsed_doc.as_ref(),
                 text,
             )
-            .0;
-            [
-                crate::harness::accounts::Cli::Codex,
-                crate::harness::accounts::Cli::Grok,
-                crate::harness::accounts::Cli::Kimi,
-            ]
-            .into_iter()
-            .all(|cli| policy.on_for(cli.program()))
-            .then_some(policy.accounts)
+            .0,
+        ),
+        // An aterm.toml these settings do not read is judged by the supervisor's own read: one
+        // it refuses or cannot read too turns the harness off
+        // ([`crate::supervise::config::SupervisorConfig::unread_config`]), for every pool's
+        // launch, so none rotates; one only these settings refuse (over [`config::CONFIG_MAX_BYTES`]
+        // or not UTF-8) rotates as the supervisor reads it.
+        (_, Err(_)) => {
+            match crate::supervise::config::SupervisorConfig::read_path(env.config.as_deref()) {
+                Err(_) => Some(crate::harness::accounts::Mode::Off),
+                Ok((policy, _)) if has_other_pool => pooled(policy),
+                Ok(_) => Some(crate::supervise::config::SupervisorConfig::default().accounts),
+            }
         }
         _ => Some(crate::supervise::config::SupervisorConfig::default().accounts),
     };
@@ -2049,10 +2056,11 @@ fn fleet_verb(
         (None | Some("status"), _, _, _, 0 | 1) => fleet_status(env, out),
         (Some("fetch"), _, _, _, 1) => match fleet_fetch(env, fetcher, true) {
             None => {
-                let _ = writeln!(
-                    err,
-                    "aterm ai fleet fetch: [ai] fleet names no https:// URL; nothing to fetch"
-                );
+                let why = match config::read_config(env.config.as_deref()) {
+                    Err(why) => format!("aterm.toml cannot be read ({why}), so no [ai] fleet"),
+                    Ok(_) => "[ai] fleet names no https:// URL".to_string(),
+                };
+                let _ = writeln!(err, "aterm ai fleet fetch: {why}; nothing to fetch");
                 ExitCode::from(2)
             }
             Some(got) => {

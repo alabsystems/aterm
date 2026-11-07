@@ -12,7 +12,7 @@ impl Row {
     /// Clears the entire row.
     #[inline]
     pub fn clear(&mut self) {
-        self.cells.fill(Cell::EMPTY);
+        self.fill_cells(Cell::EMPTY);
         self.len = 0;
         self.flags = RowFlags::DIRTY;
     }
@@ -20,7 +20,7 @@ impl Row {
     /// Fills the row with `fill` (BCE) while preserving DEC line attributes.
     #[inline]
     pub fn erase_with(&mut self, fill: Cell) {
-        self.cells.fill(fill);
+        self.fill_cells(fill);
         if fill.colors() == Cell::EMPTY.colors() {
             self.len = 0;
         } else {
@@ -32,7 +32,7 @@ impl Row {
     /// Resets the row to `fill` and clears DEC line attributes in a single pass.
     #[inline]
     pub fn reset_with(&mut self, fill: Cell) {
-        self.cells.fill(fill);
+        self.fill_cells(fill);
         if fill.colors() == Cell::EMPTY.colors() {
             self.len = 0;
         } else {
@@ -47,7 +47,7 @@ impl Row {
     /// turn after [`Self::clear`] leaves it.
     #[inline]
     pub(crate) fn fill_written(&mut self, glyph: Cell) {
-        self.cells.fill(glyph);
+        self.fill_cells(glyph);
         self.len = super::u16_from_usize(self.cells.len());
         self.flags = RowFlags::DIRTY;
     }
@@ -80,6 +80,9 @@ impl Row {
         let end = (end as usize).min(cols);
         if start >= end {
             return super::u16_from_usize(start)..super::u16_from_usize(start);
+        }
+        if fill != Cell::EMPTY || orphan != Cell::EMPTY {
+            self.note_cells_written(start.saturating_sub(1), end + 1);
         }
         let old_len = self.len as usize;
         let mut written_start = start;
@@ -149,6 +152,7 @@ impl Row {
     /// lead's `PROTECTED` bit, which its role bit stood in for. The lead's combining marks live
     /// in the grid's extras map, which this row cannot reach: the caller drops them.
     fn unpair_wide_at(&mut self, lead: usize) {
+        self.note_cells_written(lead, lead + 2);
         let mut lead_flags = self.cells[lead].flags();
         lead_flags.remove(CellFlags::WIDE);
         lead_flags.remove(CellFlags::COMPLEX);
@@ -255,6 +259,7 @@ impl Row {
         end: u16,
         fill: Cell,
     ) -> core::ops::Range<u16> {
+        self.note_all_cells_written();
         debug_assert!(
             (self.len as usize) <= self.cells.len(),
             "Row::selective_clear_range: self.len ({}) > cells.len() ({})",
@@ -324,6 +329,7 @@ impl Row {
     /// Selectively wipes characters in `start..end` while preserving visual attributes (DECSERA).
     #[inline]
     pub(crate) fn selective_wipe_range(&mut self, start: u16, end: u16, wiped: &mut Vec<u16>) {
+        self.note_all_cells_written();
         debug_assert!(
             (self.len as usize) <= self.cells.len(),
             "Row::selective_wipe_range: self.len ({}) > cells.len() ({})",
@@ -378,6 +384,7 @@ impl Row {
     /// Selectively clears unprotected cells across the entire row to `fill`.
     #[inline]
     pub(crate) fn selective_clear(&mut self, fill: Cell) {
+        self.note_all_cells_written();
         debug_assert!(
             (self.len as usize) <= self.cells.len(),
             "Row::selective_clear: self.len ({}) > cells.len() ({})",

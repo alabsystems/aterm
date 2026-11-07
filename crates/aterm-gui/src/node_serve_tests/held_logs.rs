@@ -22,6 +22,7 @@ fn mesh_on(state: &Path) -> NodeServeConfig {
         members: None,
         alab_browse: None,
         prebound_listener: None,
+        on_generation: None,
         tick_every: Duration::from_millis(40),
         wake_timeout: Duration::from_secs(1),
         lan_unavailable: || None,

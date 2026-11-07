@@ -18,10 +18,105 @@ pub(crate) fn serve(
     deadline: Instant,
     observe: impl FnOnce(Peer, ContextQuery) -> io::Result<ContextReply>,
 ) -> io::Result<()> {
+    serve_role(
+        stream,
+        peer,
+        hello,
+        deadline,
+        "native-context",
+        false,
+        observe,
+    )
+}
+pub(crate) fn serve_sdk(
+    stream: &CtlStream,
+    peer: Peer,
+    hello: &aterm_json::Value,
+    deadline: Instant,
+    observe: impl FnOnce(Peer, ContextQuery) -> io::Result<ContextReply>,
+) -> io::Result<()> {
+    serve_role(
+        stream,
+        peer,
+        hello,
+        deadline,
+        "native-context-sdk-v1",
+        true,
+        observe,
+    )
+}
+
+pub(crate) fn serve_metadata_ready(
+    stream: &CtlStream,
+    peer: Peer,
+    hello: &aterm_json::Value,
+    deadline: Instant,
+    observe: impl FnOnce(Peer, ContextQuery) -> io::Result<ContextReply>,
+) -> io::Result<()> {
+    let capabilities: aterm_json::Value =
+        aterm_json::from_str(trust_resource_controller::METADATA_CAPABILITIES_JSON)
+            .map_err(|_| refused())?;
+    if hello["capabilities"] != capabilities || capabilities["metadata_role"].as_u64() != Some(3) {
+        return Err(refused());
+    }
+    serve_role(
+        stream,
+        peer,
+        hello,
+        deadline,
+        "native-metadata-ready-v1",
+        true,
+        observe,
+    )
+}
+pub(crate) fn serve_resolver_ready(
+    stream: &CtlStream,
+    peer: Peer,
+    hello: &aterm_json::Value,
+    deadline: Instant,
+    observe: impl FnOnce(Peer, ContextQuery) -> io::Result<ContextReply>,
+) -> io::Result<()> {
+    use trust_resource_controller::resolver;
+    let capabilities: aterm_json::Value =
+        aterm_json::from_str(resolver::RESOLVER_CAPABILITIES_JSON).map_err(|_| refused())?;
+    if hello["capabilities"] != capabilities
+        || capabilities["query_role"].as_u64() != Some(resolver::RESOLVER_REQUEST_ROLE)
+    {
+        return Err(refused());
+    }
+    serve_role(
+        stream,
+        peer,
+        hello,
+        deadline,
+        resolver::RESOLVER_READY_ROLE,
+        true,
+        observe,
+    )
+}
+fn serve_role(
+    stream: &CtlStream,
+    peer: Peer,
+    hello: &aterm_json::Value,
+    deadline: Instant,
+    role: &str,
+    require_sdk: bool,
+    observe: impl FnOnce(Peer, ContextQuery) -> io::Result<ContextReply>,
+) -> io::Result<()> {
     let session = hello["session"].as_str().ok_or_else(refused)?;
     if hello["version"].as_u64() != Some(3)
-        || hello["role"].as_str() != Some("native-context")
-        || hello.as_object().is_none_or(|object| object.len() != 3)
+        || hello["role"].as_str() != Some(role)
+        || hello.as_object().is_none_or(|object| {
+            object.len()
+                != if matches!(
+                    role,
+                    "native-metadata-ready-v1" | "native-resolver-ready-v1"
+                ) {
+                    4
+                } else {
+                    3
+                }
+        })
     {
         return Err(refused());
     }
@@ -30,7 +125,11 @@ pub(crate) fn serve(
         return Err(refused());
     }
     let response = match observe(peer, query.clone()) {
-        Ok(reply) => ContextResponse::Ready(reply),
+        Ok(reply) if !require_sdk || reply.context.sdk.is_some() => ContextResponse::Ready(reply),
+        Ok(_) => ContextResponse::Unavailable(ContextUnavailable::for_query(
+            &query,
+            "original inherited SDK keeper unavailable".into(),
+        )?),
         Err(_) => ContextResponse::Unavailable(ContextUnavailable::for_query(
             &query,
             "no authenticated live native context".into(),

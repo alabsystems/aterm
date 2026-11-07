@@ -7,7 +7,7 @@ use std::ffi::OsString;
 use std::io;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: aterm resource-run [--sock PATH] [--session @self|@<sid>|@<local-id>] [--ai WORD] --job LABEL [--cpu-units N --memory-bytes M [--timeout-ms N] [--status-fd N]] -- PROGRAM [ARGS...]\n       aterm resource-run [--sock PATH] [--session @self|@<sid>] --capabilities";
+const USAGE: &str = "usage: aterm resource-run [--sock PATH] [--session @self|@<sid>|@<local-id>] [--ai WORD] --job LABEL [--cpu-units N --memory-bytes M [--timeout-ms N] [--status-fd N] [--accounted]] -- PROGRAM [ARGS...]\n       aterm resource-run [--sock PATH] [--session @self|@<sid>] --capabilities";
 
 #[cfg(unix)]
 #[path = "resource_run_admission.rs"]
@@ -61,6 +61,7 @@ struct Args {
     command: Vec<OsString>,
     resources: Option<Resources>,
     capabilities: bool,
+    accounted: bool,
 }
 
 fn parse(argv: Vec<OsString>) -> io::Result<Option<Args>> {
@@ -68,12 +69,20 @@ fn parse(argv: Vec<OsString>) -> io::Result<Option<Args>> {
     let (mut sock, mut session, mut ai, mut job) = (None, None, None, None);
     let (mut cpus, mut memory, mut timeout, mut status) = (None, None, None, None);
     let mut capabilities = false;
+    let mut accounted = false;
     while let Some(arg) = args.next() {
         let Some(word) = arg.to_str() else {
             return Err(super::usage(USAGE));
         };
         if word == "--help" || word == "-h" {
             return Ok(None);
+        }
+        if word == "--accounted" {
+            if accounted {
+                return Err(super::usage(USAGE));
+            }
+            accounted = true;
+            continue;
         }
         if word == "--capabilities" {
             if capabilities {
@@ -85,7 +94,11 @@ fn parse(argv: Vec<OsString>) -> io::Result<Option<Args>> {
         if word == "--" {
             let resources = resources(cpus, memory, timeout, status)?;
             let command: Vec<_> = args.collect();
-            if command.is_empty() || capabilities || (resources.is_some() && ai.is_some()) {
+            if command.is_empty()
+                || capabilities
+                || (accounted && resources.is_none())
+                || (resources.is_some() && ai.is_some())
+            {
                 return Err(super::usage(USAGE));
             }
             return Ok(Some(Args {
@@ -100,6 +113,7 @@ fn parse(argv: Vec<OsString>) -> io::Result<Option<Args>> {
                 command,
                 resources,
                 capabilities: false,
+                accounted,
             }));
         }
         let slot = match word {
@@ -123,6 +137,7 @@ fn parse(argv: Vec<OsString>) -> io::Result<Option<Args>> {
         );
     }
     if capabilities
+        && !accounted
         && ai.is_none()
         && job.is_none()
         && cpus.is_none()
@@ -138,6 +153,7 @@ fn parse(argv: Vec<OsString>) -> io::Result<Option<Args>> {
             command: Vec::new(),
             resources: None,
             capabilities: true,
+            accounted: false,
         }));
     }
     Err(super::usage(USAGE))
@@ -230,7 +246,7 @@ fn run_registered_command(argv: Vec<OsString>) -> io::Result<ExitCode> {
         self_sid.as_deref(),
         &mut super::LazySessions::new(&wire),
     )?;
-    if args.capabilities || args.resources.is_some() {
+    if args.capabilities || args.resources.is_some() || args.accounted {
         #[cfg(unix)]
         return admission::run(&wire, &sid, &args);
         #[cfg(not(unix))]

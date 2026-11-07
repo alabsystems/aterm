@@ -14517,19 +14517,14 @@ pub(super) fn cmd_bundle(
                         std::path::PathBuf::from,
                     )
             });
-            if path.as_os_str() == "-" {
-                print!("{}", bundle::brewfile_dump(prefix, api, &sel));
-                return ExitCode::SUCCESS;
-            }
-            // brew expands the dump path against the cwd.
-            let path = if path.is_absolute() {
-                path
-            } else {
-                std::env::current_dir().map_or(path.clone(), |cwd| cwd.join(&path))
+            let path = match bundle_dump_target(path, force) {
+                Ok(BundleDumpTarget::Stdout) => {
+                    print!("{}", bundle::brewfile_dump(prefix, api, &sel));
+                    return ExitCode::SUCCESS;
+                }
+                Ok(BundleDumpTarget::File(path)) => path,
+                Err(e) => return failed(&e),
             };
-            if path.exists() && !force {
-                return failed(&format!("Error: {} already exists", path.display()));
-            }
             let text = bundle::brewfile_dump(prefix, api, &sel);
             match write_bundle_dump(&path, text.as_bytes(), force) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -14550,6 +14545,50 @@ pub(super) fn cmd_bundle(
     }
 }
 
+/// Where `bundle dump` writes.
+#[derive(Debug, PartialEq, Eq)]
+enum BundleDumpTarget {
+    /// Print to the process's stdout; nothing is opened.
+    Stdout,
+    /// Write this (cwd-absolute) file.
+    File(std::path::PathBuf),
+}
+
+/// Whether a Brewfile write path names this process's stdout: `-`, or
+/// brew's exempt `/dev/stdout` (and its `/dev/fd/1` spelling). Such a
+/// target is printed to, never opened, so no open flag reaches the shared
+/// stdout file description.
+fn bundle_stdout_path(path: &std::path::Path) -> bool {
+    matches!(path.to_str(), Some("-" | "/dev/stdout" | "/dev/fd/1"))
+}
+
+/// The Brewfile `bundle add`/`remove` edit: stdin for `-`, nothing for an
+/// output stream (`/dev/stdout` holds no Brewfile to read), else the file.
+fn bundle_edit_read(file: Option<&std::path::Path>) -> Result<String, String> {
+    match file {
+        Some(path) if path.as_os_str() != "-" && bundle_stdout_path(path) => Ok(String::new()),
+        _ => bundle::read_brewfile(file),
+    }
+}
+
+/// Decide `bundle dump`'s destination: stdout for [`bundle_stdout_path`],
+/// else the cwd-expanded path, refused when it exists and `force` is off.
+fn bundle_dump_target(path: std::path::PathBuf, force: bool) -> Result<BundleDumpTarget, String> {
+    if bundle_stdout_path(&path) {
+        return Ok(BundleDumpTarget::Stdout);
+    }
+    // brew expands the dump path against the cwd.
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().map_or(path.clone(), |cwd| cwd.join(&path))
+    };
+    if path.exists() && !force {
+        return Err(format!("Error: {} already exists", path.display()));
+    }
+    Ok(BundleDumpTarget::File(path))
+}
+
 fn write_bundle_dump(path: &std::path::Path, text: &[u8], force: bool) -> std::io::Result<()> {
     use std::io::Write as _;
     let mut options = std::fs::OpenOptions::new();
@@ -14564,7 +14603,21 @@ fn write_bundle_dump(path: &std::path::Path, text: &[u8], force: bool) -> std::i
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
+    // A device or FIFO already there is refused before any open, so no open
+    // flag lands on a description another process (a terminal) shares.
+    match std::fs::metadata(path) {
+        Ok(meta) if !meta.is_file() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     let mut file = options.open(path)?;
+    // Recheck what was opened: the path may have changed since the stat.
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -14896,7 +14949,7 @@ fn bundle_add_entries(api: &Api, rest: &[String]) -> ExitCode {
         return super::unsupported("bundle arguments or Brewfile rows are not native");
     }
     let path = bundle_edit_path(edit.file.as_deref());
-    let to_stdout = path.as_os_str() == "-";
+    let to_stdout = bundle_stdout_path(&path);
     // brew creates an empty Brewfile before resolving names.
     if !to_stdout
         && !path.exists()
@@ -14934,7 +14987,7 @@ fn bundle_add_entries(api: &Api, rest: &[String]) -> ExitCode {
         entries.push(entry);
     }
     let mut content = if to_stdout {
-        match bundle::read_brewfile(edit.file.as_deref()) {
+        match bundle_edit_read(edit.file.as_deref()) {
             Ok(text) => text,
             Err(e) => return failed(&e),
         }
@@ -15037,7 +15090,7 @@ fn bundle_remove_match(line: &str, kind: Option<&str>, names: &[String]) -> Opti
 /// entry popped when it matches the package's desc.
 fn bundle_remove_entries(api: &Api, rest: &[String]) -> ExitCode {
     let edit = bundle_edit(rest, "remove");
-    let content = match bundle::read_brewfile(edit.file.as_deref()) {
+    let content = match bundle_edit_read(edit.file.as_deref()) {
         Ok(text) => text,
         Err(e) => return failed(&e),
     };
@@ -15100,7 +15153,7 @@ fn bundle_remove_entries(api: &Api, rest: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let path = bundle_edit_path(edit.file.as_deref());
-    if path.as_os_str() == "-" {
+    if bundle_stdout_path(&path) {
         print!("{new_content}");
         return ExitCode::SUCCESS;
     }
@@ -16348,6 +16401,55 @@ mod tests {
         assert!(line.contains(" -> "), "{line}");
         let line = lister.line(&file);
         assert!(line.contains("       5 "), "{line}");
+    }
+
+    #[test]
+    fn bundle_dump_to_dev_stdout_prints_instead_of_opening() {
+        for name in ["-", "/dev/stdout", "/dev/fd/1"] {
+            for force in [false, true] {
+                assert_eq!(
+                    bundle_dump_target(std::path::PathBuf::from(name), force),
+                    Ok(BundleDumpTarget::Stdout),
+                    "{name} force={force}"
+                );
+            }
+            assert!(bundle_stdout_path(std::path::Path::new(name)), "{name}");
+        }
+        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("Brewfile");
+        assert_eq!(
+            bundle_dump_target(file.clone(), false),
+            Ok(BundleDumpTarget::File(file.clone()))
+        );
+        std::fs::write(&file, b"keep").unwrap();
+        assert!(bundle_dump_target(file.clone(), false).is_err());
+        assert_eq!(
+            bundle_dump_target(file.clone(), true),
+            Ok(BundleDumpTarget::File(file))
+        );
+        assert!(!bundle_stdout_path(std::path::Path::new("/dev/stderr")));
+        assert_eq!(
+            bundle_edit_read(Some(std::path::Path::new("/dev/stdout"))),
+            Ok(String::new())
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bundle_dump_refuses_a_device_without_opening_it() {
+        // A FIFO no reader holds tells an open from none: an `O_NONBLOCK` write open of it fails
+        // ENXIO, while the refusal before any open says "not a regular file". NEGATIVE CONTROL:
+        // without the stat before the open, this failed ENXIO.
+        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let fifo = tmp.path().join("Brewfile");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `mkfifo` reads the NUL-terminated path `c` owns, alive for the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "the FIFO");
+        let err = write_bundle_dump(&fifo, b"x", true).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(err.to_string(), "not a regular file");
+        let err = write_bundle_dump(std::path::Path::new("/dev/null"), b"x", true).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
     }
 
     #[test]

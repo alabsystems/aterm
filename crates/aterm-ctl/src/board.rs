@@ -56,7 +56,7 @@ const HEARD_WRITTEN_EVERY: Duration = Duration::from_secs(300);
 const WORD_MAX: usize = 64;
 
 /// The row's keys, in the order a row is written.
-const KEYS: [&str; 25] = [
+const KEYS: [&str; 26] = [
     "sid",
     "label",
     "node",
@@ -82,6 +82,7 @@ const KEYS: [&str; 25] = [
     "heard_ms",
     "after",
     "area",
+    "told",
 ];
 
 /// One worker this Mac started.
@@ -138,6 +139,10 @@ pub struct Row {
     pub after: Option<String>,
     /// The file areas its package claims (DX-3's; nothing schedules by them yet).
     pub area: Option<String>,
+    /// The end its last `kind=task` telemetry row told (`<outcome>.<stop>`,
+    /// [`crate::fleet_telemetry::task_end`]): a close that comes to the same end writes no second
+    /// row. Kept under the board's lock with the row, so no read of the log decides it.
+    pub told: Option<String>,
     /// Words of keys this aterm does not know (a later aterm's), as read: written back unchanged.
     pub extra: Vec<(String, String)>,
 }
@@ -184,7 +189,7 @@ impl Row {
         let num = |n: u64| n.to_string();
         let opt_num = |n: Option<u64>| n.map_or_else(|| "-".to_owned(), |n| n.to_string());
         let word = |s: &Option<String>| s.as_deref().map_or_else(|| "-".to_owned(), encode);
-        let values: [String; 25] = [
+        let values: [String; 26] = [
             encode(&self.sid),
             word(&self.label),
             word(&self.node),
@@ -210,6 +215,7 @@ impl Row {
             opt_num(self.heard_ms),
             word(&self.after),
             word(&self.area),
+            word(&self.told),
         ];
         KEYS.iter()
             .zip(values)
@@ -281,6 +287,7 @@ impl Row {
                 "heard_ms" => row.heard_ms = opt_number()?,
                 "after" => row.after = text(),
                 "area" => row.area = text(),
+                "told" => row.told = text(),
                 // Kept in the board's own encoding, so no byte a peer sent reaches a terminal.
                 _ => row.extra.push((key.to_owned(), encode(&decode(value)))),
             }
@@ -495,20 +502,155 @@ impl Board {
     /// Every row, oldest first; none where the folder is missing or is no private folder.
     #[must_use]
     pub fn scan(&self) -> Scan {
+        self.bind(false)
+            .map(|board| board.scan())
+            .unwrap_or_default()
+    }
+
+    /// The row of `sid`, where the board holds one it can read.
+    #[must_use]
+    pub fn row(&self, sid: &str) -> Option<Row> {
+        self.bind(false).ok()?.row(sid)
+    }
+
+    /// Record a newly started worker, then prune old rows, under one directory-bound lock.
+    /// # Errors
+    /// Directory admission, lock acquisition or publication fails.
+    pub fn record(&self, row: &Row) -> io::Result<()> {
+        self.bind(true)?.record(row)
+    }
+
+    /// Merge live answers into existing rows under one directory-bound writer lock.
+    /// # Errors
+    /// Lock acquisition or publication fails.
+    pub fn apply(&self, seen: &[String], now_ms: u64) -> io::Result<usize> {
+        let Ok(board) = self.bind(false) else {
+            return Ok(0);
+        };
+        board.apply(seen, now_ms)
+    }
+
+    /// Record an accept word for `@<sid>` or the newest worker with a label.
+    /// # Errors
+    /// Invalid input, no matching row, or directory admission, locking or publication fails.
+    pub fn accept(&self, who: &str, word: &str, now_ms: u64) -> io::Result<Row> {
+        self.bind(true)?.accept(who, word, now_ms)
+    }
+
+    /// Remove rows older than the board's closed and unheard retention periods.
+    pub fn prune(&self) {
+        if let Ok(board) = self.bind(true) {
+            board.prune();
+        }
+    }
+
+    fn bind(&self, ensure: bool) -> io::Result<BoundBoard> {
+        #[cfg(unix)]
+        {
+            if ensure {
+                self.ensure()?;
+            }
+            Ok(BoundBoard {
+                dir: self.dir.clone(),
+                root: aterm_uds::private_file::PrivateDirectory::open(&self.dir)?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = ensure;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this platform keeps no board",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    fn ensure(&self) -> io::Result<()> {
+        if let Some(state) = self.dir.parent()
+            && !state.as_os_str().is_empty()
+            && !state.exists()
+        {
+            aterm_uds::private_file::ensure_private_dir(state)?;
+        }
+        aterm_uds::private_file::ensure_private_dir(&self.dir).map(|_| ())
+    }
+
+    /// Acquire a keeper lease without waiting. Its lock and all row I/O share one directory.
+    #[cfg(all(unix, test))]
+    fn keeper_lock(&self) -> Option<KeeperBoard> {
+        let board = self.bind(true).ok()?;
+        let lock = board
+            .root
+            .lock(
+                KEEPER_LOCK,
+                Duration::ZERO,
+                "another aterm keeps this board",
+            )
+            .ok()?;
+        board
+            .is_current()
+            .then_some(KeeperBoard { board, _lock: lock })
+    }
+
+    /// Kernel-blocking handoff, retrying if the directory was replaced during acquisition.
+    /// `held` runs at most once across retries. Repeated path churn is refused so the caller
+    /// can use its existing admission backoff rather than spin.
+    #[cfg(unix)]
+    fn wait_keeper_lock(&self, held: impl FnOnce()) -> io::Result<KeeperBoard> {
+        let mut held = Some(held);
+        for _ in 0..8 {
+            let board = self.bind(true)?;
+            let lock = board.root.wait_lock(KEEPER_LOCK, || {
+                if let Some(held) = held.take() {
+                    held();
+                }
+            })?;
+            if board.is_current() {
+                return Ok(KeeperBoard { board, _lock: lock });
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "the board directory kept changing during keeper acquisition",
+        ))
+    }
+}
+
+/// A physical board, used for one transaction or retained by a keeper lease.
+struct BoundBoard {
+    // Only retarget detection and advisory telemetry use this path. Row I/O never does.
+    dir: PathBuf,
+    #[cfg(unix)]
+    root: aterm_uds::private_file::PrivateDirectory,
+}
+
+impl BoundBoard {
+    fn is_current(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.root.is_at(&self.dir).unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    /// Every row, oldest first; none where the folder is missing or is no private folder.
+    #[must_use]
+    pub fn scan(&self) -> Scan {
         let mut scan = Scan::default();
         #[cfg(unix)]
         {
-            let Ok(judged) = aterm_uds::private_file::JudgedDir::judge(&self.dir) else {
+            let Ok(judged) = self.root.view() else {
                 return scan;
             };
-            if !judged.is_private() {
-                return scan;
-            }
-            let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            let Ok(entries) = judged.names() else {
                 return scan;
             };
             for entry in entries.flatten() {
-                let name = entry.file_name();
+                let name = entry;
                 let Some(name) = name.to_str().filter(|name| is_sid(name)) else {
                     continue;
                 };
@@ -534,12 +676,12 @@ impl Board {
 
     #[cfg(unix)]
     fn read(&self, name: &str) -> Option<Row> {
-        let bytes = aterm_uds::private_file::read_private(&self.dir, name, ROW_MAX_BYTES).ok()?;
+        let bytes = self.root.view().ok()?.read(name, ROW_MAX_BYTES).ok()?;
         Self::parse_row(name, bytes)
     }
 
     #[cfg(unix)]
-    fn read_in(judged: &aterm_uds::private_file::JudgedDir<'_>, name: &str) -> Option<Row> {
+    fn read_in(judged: &aterm_uds::private_file::DirectoryView<'_>, name: &str) -> Option<Row> {
         let bytes = judged.read(name, ROW_MAX_BYTES).ok()?;
         Self::parse_row(name, bytes)
     }
@@ -588,8 +730,20 @@ impl Board {
                 continue;
             };
             let heard = row.heard_ms;
+            let was = row.clone();
             if row.merge(seen, now_ms) {
                 changed += 1;
+                // A close's task row goes to the log before the board keeps the end it told: an
+                // exit between the two leaves the close unkept, which the next answer merges and
+                // tells again (a second row of one end, never none). Only a board still at its
+                // path names the state folder whose log it is.
+                if self.is_current()
+                    && let Some(end) =
+                        crate::fleet_telemetry::task_end(&self.dir, &was, &row, seen, now_ms)
+                    && end.write()
+                {
+                    row.told = Some(end.told);
+                }
                 self.write(&row)?;
             } else if row.heard_ms != heard
                 && heard
@@ -666,7 +820,9 @@ impl Board {
 
     #[cfg(unix)]
     fn remove(&self, sid: &str) {
-        let _ = aterm_uds::private_file::remove_private(&self.dir, sid);
+        if let Ok(view) = self.root.view() {
+            let _ = view.remove(sid);
+        }
     }
 
     #[cfg(not(unix))]
@@ -674,13 +830,8 @@ impl Board {
 
     #[cfg(unix)]
     fn lock(&self) -> io::Result<aterm_uds::private_file::PrivateLock> {
-        self.ensure()?;
-        aterm_uds::private_file::PrivateLock::take(
-            &self.dir,
-            LOCK,
-            LOCK_WITHIN,
-            "another writer held the board's lock",
-        )
+        self.root
+            .lock(LOCK, LOCK_WITHIN, "another writer held the board's lock")
     }
 
     #[cfg(not(unix))]
@@ -692,70 +843,33 @@ impl Board {
     }
 
     #[cfg(unix)]
-    fn ensure(&self) -> io::Result<()> {
-        if let Some(state) = self.dir.parent()
-            && !state.as_os_str().is_empty()
-            && !state.exists()
-        {
-            aterm_uds::private_file::ensure_private_dir(state)?;
-        }
-        aterm_uds::private_file::ensure_private_dir(&self.dir).map(|_| ())
-    }
-
-    #[cfg(unix)]
     fn write(&self, row: &Row) -> io::Result<()> {
-        aterm_uds::private_file::write_private(
-            &self.dir,
-            &row.sid,
-            format!("{}\n", row.line()).as_bytes(),
-        )
+        self.root
+            .view()?
+            .write(&row.sid, format!("{}\n", row.line()).as_bytes())
     }
 
     #[cfg(not(unix))]
     fn write(&self, _row: &Row) -> io::Result<()> {
         self.lock()
     }
+}
 
-    /// Take the keeper's lock without waiting: `None` where another keeper of this board holds
-    /// it, or the board's folder cannot be made private.
-    #[cfg(unix)]
-    #[must_use]
-    pub fn keeper_lock(&self) -> Option<aterm_uds::private_file::PrivateLock> {
-        self.ensure().ok()?;
-        aterm_uds::private_file::PrivateLock::take(
-            &self.dir,
-            KEEPER_LOCK,
-            Duration::ZERO,
-            "another aterm keeps this board",
-        )
-        .ok()
-    }
-
-    /// Take the keeper's lock whenever the keeper that holds it lets it go: a thread asleep in
-    /// the kernel meanwhile, on no clock ([`aterm_uds::private_file::PrivateLock::wait_for`]).
-    /// `held` runs once, before that wait, when the first try finds the lock held.
-    /// # Errors
-    /// The board's folder cannot be made private, or its lock file cannot be opened or locked.
-    #[cfg(unix)]
-    pub fn wait_keeper_lock(
-        &self,
-        held: impl FnOnce(),
-    ) -> io::Result<aterm_uds::private_file::PrivateLock> {
-        self.ensure()?;
-        aterm_uds::private_file::PrivateLock::wait_for(&self.dir, KEEPER_LOCK, held)
-    }
+#[cfg(unix)]
+struct KeeperBoard {
+    board: BoundBoard,
+    _lock: aterm_uds::private_file::PrivateLock,
 }
 
 /// What a keeper with nothing to ask waits on ([`keep`]): its board's folder changing (a row
 /// written, rewritten or removed, by any process), or the instant its next row comes due
-/// ([`next_due`]). On macOS the folder is a kqueue vnode watch, so at rest the thread sleeps
-/// until one of the two; where no watch can be made (another platform, a folder gone) it reads
-/// the board again every [`KEEP_IDLE`] at most.
+/// ([`next_due`]). Native directory events on macOS and Linux cover the folder and its lookup
+/// ancestry, so at rest the thread sleeps until one of the two; where the platform or path refuses an arm it
+/// reads the board again every [`KEEP_IDLE`] at most.
 #[cfg(unix)]
 pub(crate) struct Rest {
     dir: PathBuf,
-    #[cfg(target_os = "macos")]
-    watch: Option<(aterm_uds::nofollow::Watcher, std::os::fd::OwnedFd)>,
+    watch: Option<Box<dyn aterm_uds::file_watch::FileEvents>>,
 }
 
 #[cfg(unix)]
@@ -765,48 +879,48 @@ impl Rest {
     pub(crate) fn new(dir: &Path) -> Self {
         let mut rest = Self {
             dir: dir.to_path_buf(),
-            #[cfg(target_os = "macos")]
             watch: None,
         };
         rest.rewatch();
         rest
     }
 
-    #[cfg(target_os = "macos")]
-    fn rewatch(&mut self) {
-        use aterm_uds::nofollow::{Kind, Watcher, open_evtonly};
+    fn rewatch(&mut self) -> bool {
         if self.watch.is_some() {
-            return;
+            return false;
         }
-        self.watch = Watcher::new().ok().and_then(|watcher| {
-            // The folder's real path: the watch opens with no link anywhere on its path, and a
-            // state folder may sit under one (`/var` → `/private/var`). A watch reads nothing,
-            // so where it resolves only decides which folder's changes wake the keeper.
-            let real = std::fs::canonicalize(&self.dir).ok()?;
-            let fd = open_evtonly(&real, Kind::Dir).ok()?;
-            watcher.add(std::os::fd::AsFd::as_fd(&fd), 0).ok()?;
-            Some((watcher, fd))
-        });
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn rewatch(&mut self) {
-        let _ = &self.dir;
+        self.watch = aterm_uds::file_watch::platform_events()
+            .ok()
+            .and_then(|mut watcher| {
+                // Rows publish by rename. Watch every entry, including updates after the lock
+                // already exists; a named lock listener on Linux would filter the rows out.
+                watcher.arm_directory(0, &self.dir).ok()?;
+                Some(watcher)
+            });
+        self.watch.is_some()
     }
 
     /// Sleeps until the board's folder changes or `due`, whichever comes first (or
-    /// [`KEEP_IDLE`] at most, where no watch is made). Answers whether the folder changed.
+    /// [`KEEP_IDLE`] at most, where no watch is made). Returns true for a folder event or a new
+    /// registration. A new watch cannot account for writes before its registration, so it
+    /// returns immediately for a fresh read before any wait.
     pub(crate) fn until(&mut self, due: std::time::Instant) -> bool {
-        self.rewatch();
+        if self.rewatch() {
+            return true;
+        }
         let left = due.saturating_duration_since(std::time::Instant::now());
-        #[cfg(target_os = "macos")]
-        if let Some((watcher, _)) = &self.watch {
-            match watcher.wait(left) {
-                Ok(fired) => {
-                    if fired.iter().any(|fired| fired.gone) {
+        if let Some(watcher) = &mut self.watch {
+            let mut fired = Vec::new();
+            match watcher.wait(Some(left), &mut fired) {
+                Ok(()) => {
+                    if !fired.is_empty() {
                         self.watch = None;
+                        // Arm the current path before the caller's next snapshot. A queue on
+                        // the retired inode cannot establish that the replacement is current.
+                        self.rewatch();
+                        return true;
                     }
-                    return !fired.is_empty();
+                    return false;
                 }
                 Err(_) => self.watch = None,
             }
@@ -917,7 +1031,7 @@ impl Backoff {
 }
 
 /// Keep the board of the state folder `state` current for the life of the process: while it holds the board's keeper lock (one keeper per board, whichever aterm took it first; the
-/// others wait for it in the kernel, [`Board::wait_keeper_lock`]), wait on every open row its Macs were
+/// others wait for it in the kernel, `Board::wait_keeper_lock`), wait on every open row its Macs were
 /// heard of within [`UNHEARD_ASKED`] and every row closed within [`CLOSED_ASKED`] (every
 /// [`CLOSED_ASKED_EVERY`]), one round of legs ([`crate::await_task`]'s keeper round) after
 /// another, and merge what they read. Each row's leg starts from the newest revision read of
@@ -932,91 +1046,96 @@ pub fn keep(state: &Path, keeper: &Keeper<'_>) {
         use std::collections::HashMap;
         use std::time::Instant;
         let board = Board::in_state(state);
-        let mut held = None;
-        let mut backoff = Backoff::default();
-        let mut edges: HashMap<String, u64> = HashMap::new();
-        let mut closed_asked: HashMap<String, Instant> = HashMap::new();
-        let mut pruned: Option<Instant> = None;
-        let mut rest: Option<Rest> = None;
         loop {
-            if held.is_none() {
-                match board.wait_keeper_lock(|| {}) {
-                    Ok(lock) => held = Some(lock),
-                    Err(_) => {
-                        std::thread::sleep(KEEP_REFUSED);
-                        continue;
+            let held = match board.wait_keeper_lock(|| {}) {
+                Ok(held) => held,
+                Err(_) => {
+                    std::thread::sleep(KEEP_REFUSED);
+                    continue;
+                }
+            };
+            // Arm before checking identity: replacement before the arm is caught by the
+            // check; replacement afterward is queued by the watcher. All I/O stays bound.
+            let mut rest = Rest::new(board.dir());
+            let mut backoff = Backoff::default();
+            let mut edges: HashMap<String, u64> = HashMap::new();
+            let mut closed_asked: HashMap<String, Instant> = HashMap::new();
+            let mut pruned: Option<Instant> = None;
+            let board = &held.board;
+            while board.is_current() {
+                if pruned.is_none_or(|at| at.elapsed() >= KEEP_PRUNE_EVERY) {
+                    board.prune();
+                    pruned = Some(Instant::now());
+                }
+                let now = now_ms();
+                let at = Instant::now();
+                closed_asked.retain(|_, next| *next > at);
+                let rows = board.scan().rows;
+                edges.retain(|sid, _| rows.iter().any(|row| row.sid == *sid));
+                backoff.keep(|node| rows.iter().any(|row| row.node.as_deref() == Some(node)));
+                let mut asked: Vec<Row> = rows
+                    .into_iter()
+                    .filter(|row| {
+                        let heard = row.heard_ms.unwrap_or(0).max(row.started_ms);
+                        let since = now.saturating_sub(heard);
+                        if row.is_open() {
+                            since < millis(UNHEARD_ASKED)
+                        } else {
+                            since < millis(CLOSED_ASKED) && !closed_asked.contains_key(&row.sid)
+                        }
+                    })
+                    .filter(|row| {
+                        row.node
+                            .as_deref()
+                            .is_none_or(|node| backoff.asks(node, at))
+                    })
+                    .collect();
+                if asked.is_empty() {
+                    if !board.is_current() {
+                        break;
+                    }
+                    rest.until(next_due(at, pruned, &closed_asked, &backoff));
+                    continue;
+                }
+                for row in &mut asked {
+                    if !row.is_open() {
+                        closed_asked.insert(row.sid.clone(), at + CLOSED_ASKED_EVERY);
+                    }
+                    if let Some(&edge) = edges.get(&row.sid) {
+                        row.rev = row.rev.max(edge);
                     }
                 }
-            }
-            let rest = rest.get_or_insert_with(|| Rest::new(board.dir()));
-            if pruned.is_none_or(|at| at.elapsed() >= KEEP_PRUNE_EVERY) {
-                board.prune();
-                pruned = Some(Instant::now());
-            }
-            let now = now_ms();
-            let at = Instant::now();
-            closed_asked.retain(|_, next| *next > at);
-            let rows = board.scan().rows;
-            edges.retain(|sid, _| rows.iter().any(|row| row.sid == *sid));
-            backoff.keep(|node| rows.iter().any(|row| row.node.as_deref() == Some(node)));
-            let mut asked: Vec<Row> = rows
-                .into_iter()
-                .filter(|row| {
-                    let heard = row.heard_ms.unwrap_or(0).max(row.started_ms);
-                    let since = now.saturating_sub(heard);
-                    if row.is_open() {
-                        since < millis(UNHEARD_ASKED)
-                    } else {
-                        since < millis(CLOSED_ASKED) && !closed_asked.contains_key(&row.sid)
+                let own = (keeper.own_node)();
+                let round = crate::await_task::keep_round(
+                    &asked,
+                    keeper.drive,
+                    ((keeper.here)().as_deref(), own.as_deref()),
+                    KEEP_LEG,
+                );
+                let changed = board.apply(&round.seen, now_ms()).unwrap_or(0);
+                for row in &round.seen {
+                    let Some(sid) = seen_sid(row) else { continue };
+                    if let Some(rev) = crate::await_task::row_field(row, "rev").and_then(parse_u64)
+                    {
+                        let edge = edges.entry(sid.to_owned()).or_insert(0);
+                        *edge = (*edge).max(rev);
                     }
-                })
-                .filter(|row| {
-                    row.node
-                        .as_deref()
-                        .is_none_or(|node| backoff.asks(node, at))
-                })
-                .collect();
-            if asked.is_empty() {
-                rest.until(next_due(at, pruned, &closed_asked, &backoff));
-                continue;
-            }
-            for row in &mut asked {
-                if !row.is_open() {
-                    closed_asked.insert(row.sid.clone(), at + CLOSED_ASKED_EVERY);
+                    if let Some(node) = asked
+                        .iter()
+                        .find(|r| r.sid == sid)
+                        .and_then(|row| row.node.as_ref())
+                    {
+                        backoff.answered(node);
+                    }
                 }
-                if let Some(&edge) = edges.get(&row.sid) {
-                    row.rev = row.rev.max(edge);
+                for node in round.unanswered {
+                    backoff.unanswered(node, Instant::now());
                 }
-            }
-            let own = (keeper.own_node)();
-            let round = crate::await_task::keep_round(
-                &asked,
-                keeper.drive,
-                ((keeper.here)().as_deref(), own.as_deref()),
-                KEEP_LEG,
-            );
-            let changed = board.apply(&round.seen, now_ms()).unwrap_or(0);
-            for row in &round.seen {
-                let Some(sid) = seen_sid(row) else { continue };
-                if let Some(rev) = crate::await_task::row_field(row, "rev").and_then(parse_u64) {
-                    let edge = edges.entry(sid.to_owned()).or_insert(0);
-                    *edge = (*edge).max(rev);
+                // A round no Mac waited in (every leg answered or refused at once) waits before the
+                // next.
+                if changed == 0 && at.elapsed() < Duration::from_secs(1) {
+                    std::thread::sleep(KEEP_IDLE);
                 }
-                if let Some(node) = asked
-                    .iter()
-                    .find(|r| r.sid == sid)
-                    .and_then(|row| row.node.as_ref())
-                {
-                    backoff.answered(node);
-                }
-            }
-            for node in round.unanswered {
-                backoff.unanswered(node, Instant::now());
-            }
-            // A round no Mac waited in (every leg answered or refused at once) waits before the
-            // next.
-            if changed == 0 && at.elapsed() < Duration::from_secs(1) {
-                std::thread::sleep(KEEP_IDLE);
             }
         }
     }

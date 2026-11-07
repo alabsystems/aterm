@@ -33,7 +33,9 @@ use std::ops::Range;
 
 use astream_wire::summary::{Offered as RollupOffered, Rollup, Summary, Window};
 
-use crate::row::{AgyRow, NeedsRow, PlaceRow, QuotaRow, Row, RowError, UnreadRow, WindowRecord};
+use crate::row::{
+    ActivityRow, AgyRow, NeedsRow, PlaceRow, QuotaRow, Row, RowError, UnreadRow, WindowRecord,
+};
 use crate::subject::{
     AccountKey, Class, Cli, Family, Metric, Node, Subject, SubjectError, TokenClass, Width,
 };
@@ -498,6 +500,21 @@ impl Snapshots {
         self.rows()
             .filter_map(|(s, row)| match row {
                 Row::Needs(r) => Some(MacRow {
+                    node: s.node(),
+                    row: r,
+                    age_s: age(r.at, now),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Each Mac's agent activity, with its age.
+    #[must_use]
+    pub fn activity(&self, now: u64) -> Vec<MacRow<'_, ActivityRow>> {
+        self.rows()
+            .filter_map(|(s, row)| match row {
+                Row::Activity(r) => Some(MacRow {
                     node: s.node(),
                     row: r,
                     age_s: age(r.at, now),

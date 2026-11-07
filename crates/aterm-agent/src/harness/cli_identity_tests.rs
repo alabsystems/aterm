@@ -1090,6 +1090,7 @@ fn publication_case(
         cli,
         &store,
         SignInPolicy {
+            native_enrollment: None,
             host: &LiveAccounts::default(),
             row,
             logins: &records.logins,
@@ -1135,6 +1136,7 @@ fn publication_case(
         cli,
         env.now,
         &host,
+        None,
         &store,
         (row, &path),
         None,

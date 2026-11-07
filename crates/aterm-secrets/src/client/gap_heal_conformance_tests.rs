@@ -17,7 +17,7 @@ use crate::client::log_entries::{GAP_STEP_MS, REMOVER_GRACE_MS, SETTLE_GRACE_MS}
 use crate::client::log_entries_tests::{fresh_two_macs, newcomer};
 use crate::client::readmit::{Book, Proven, Readmit};
 use crate::membership_log::admission::OLD_GAP_RULE;
-use crate::membership_log::rekey::UNSETTLED_OK;
+use crate::membership_log::rekey::{FRONTIER_BLIND, UNSETTLED_OK};
 use crate::membership_log::{Body, EpochAudience, MemberId, Record, RecordId, RekeyDue, Turn};
 use aterm_spec::interp::State;
 
@@ -196,7 +196,8 @@ fn before_wrap_to<'a>(batch: &'a [Record], to: &Recipient) -> &'a [Record] {
 }
 
 /// C's mint by the old intersection carry: an `[everyone]` epoch wrapped to `to` in ascending
-/// recipient order, and nothing after its last `Wrap`, so it settles only by the grace.
+/// recipient order, and nothing after its last `Wrap`, so it settles once whole only where that
+/// `Wrap` tops every seat C knew (one-mesh §11 H2), and else by the grace.
 fn old_batch(c: &Paths, to: &BTreeSet<Recipient>) -> Vec<Record> {
     let identity = read_identity(c).unwrap().unwrap();
     let (bootstrap, actor, incarnation) = member_key(c);
@@ -278,13 +279,17 @@ struct Churn {
     roster: String,
 }
 
-/// The three shapes, each built once, and the injected clock's start.
+/// The shapes, each built once, and the injected clock's start.
 struct GapShapes {
     /// `OldMint`: D let in, C mints wrapping A, B and itself; A holds the prefix through its own
-    /// `Wrap` first.
+    /// `Wrap` first. D's recipient sorts above C's.
     one: Lab,
     one_batch: Vec<Record>,
+    /// How many records of `one_batch` (and of `under_batch`) A's prefix holds.
     one_prefix: usize,
+    /// `OldMintUnder`: as `OldMint`, with D's recipient below C's.
+    under: Lab,
+    under_batch: Vec<Record>,
     /// `OldMintOmitsB`: C mints wrapping A and itself; A ranks first among every member.
     two: Lab,
     two_batch: Vec<Record>,
@@ -296,7 +301,9 @@ struct GapShapes {
 
 impl GapShapes {
     fn build() -> Self {
-        let (one, one_batch, one_prefix) = Self::old_mint();
+        let (one, one_batch, one_prefix) = Self::old_mint(false);
+        let (under, under_batch, under_prefix) = Self::old_mint(true);
+        assert_eq!(one_prefix, under_prefix);
         let (two, two_batch) = Self::omits_b();
         let (three, churn) = Self::churn();
         let t0 = aterm_time::unix_millis().unwrap();
@@ -304,6 +311,8 @@ impl GapShapes {
             one,
             one_batch,
             one_prefix,
+            under,
+            under_batch,
             two,
             two_batch,
             three,
@@ -312,25 +321,50 @@ impl GapShapes {
         }
     }
 
-    /// `OldMint`'s lab: of m22, m7 and m40, A the lowest recipient (so its `Wrap` leads C's
-    /// batch), and D the admitted m41; C's batch ranks A, B, C for D's gap.
-    fn old_mint() -> (Lab, Vec<Record>, usize) {
-        let (macs, homes) = lab_homes(&["m40", "m41"]);
-        let mut three = ["m22", "m7", "m40"];
-        three.sort_by_key(|home| seat(&homes[*home]).recipient);
-        let d = seat(&homes["m41"]);
-        let lab = Lab::new(macs, &homes, three, Some(d));
-        let to: BTreeSet<Recipient> = lab.seats.iter().map(|s| s.recipient).collect();
-        let order = lab.seats.map(|s| s.actor);
-        let c = lab.home(three[2]);
-        let a = lab.home(lab.a);
-        let batch = (0..SEARCH)
-            .map(|_| old_batch(&c, &to))
-            .find(|batch| ranks_in_order(&a, batch, &d.actor, &order, 1))
-            .expect("an epoch that ranks A, B, C for D's gap");
-        let prefix = before_wrap_to(&batch, &lab.seats[0].recipient).len() + 1;
-        assert_eq!(prefix, 2, "CONTROL: A's `Wrap` leads C's batch");
-        (lab, batch, prefix)
+    /// `OldMint`'s lab, or `OldMintUnder`'s (`under`): D is m41 or m40, admitted, whose recipient
+    /// sorts above the other three's, or below the highest of them under `under` (a lab's keys
+    /// are fresh, so one is tried until it has that order); of the other three, A is the lowest
+    /// recipient (so its `Wrap` leads C's batch) and C the highest. C's batch ranks A, B, C for
+    /// D's gap.
+    fn old_mint(under: bool) -> (Lab, Vec<Record>, usize) {
+        for _ in 0..SEARCH {
+            let (macs, homes) = lab_homes(&["m40", "m41"]);
+            let top = |d: &str| {
+                homes
+                    .iter()
+                    .filter(|(home, _)| **home != d)
+                    .map(|(_, paths)| seat(paths).recipient)
+                    .max()
+                    .expect("three other seats")
+            };
+            let Some(d_home) = ["m41", "m40"]
+                .into_iter()
+                .find(|d| (seat(&homes[d]).recipient < top(d)) == under)
+            else {
+                macs.server.stop();
+                continue;
+            };
+            let mut three: Vec<&'static str> = ["m22", "m7", "m40", "m41"]
+                .into_iter()
+                .filter(|home| *home != d_home)
+                .collect();
+            three.sort_by_key(|home| seat(&homes[*home]).recipient);
+            let three: [&'static str; 3] = three.try_into().expect("three seats");
+            let d = seat(&homes[d_home]);
+            let lab = Lab::new(macs, &homes, three, Some(d));
+            let to: BTreeSet<Recipient> = lab.seats.iter().map(|s| s.recipient).collect();
+            let order = lab.seats.map(|s| s.actor);
+            let c = lab.home(three[2]);
+            let a = lab.home(lab.a);
+            let batch = (0..SEARCH)
+                .map(|_| old_batch(&c, &to))
+                .find(|batch| ranks_in_order(&a, batch, &d.actor, &order, 1))
+                .expect("an epoch that ranks A, B, C for D's gap");
+            let prefix = before_wrap_to(&batch, &lab.seats[0].recipient).len() + 1;
+            assert_eq!(prefix, 2, "CONTROL: A's `Wrap` leads C's batch");
+            return (lab, batch, prefix);
+        }
+        panic!("no lab puts D's recipient where the shape fixes it");
     }
 
     /// `OldMintOmitsB`'s lab: A is m7, ranked first among all three members for a re-key a
@@ -493,6 +527,7 @@ impl GapShapes {
 
     fn stop(self) {
         self.one.macs.server.stop();
+        self.under.macs.server.stop();
         self.two.macs.server.stop();
         self.three.macs.server.stop();
     }
@@ -508,6 +543,8 @@ struct GapRun<'a> {
     shapes: &'a GapShapes,
     dir: PathBuf,
     sc: i64,
+    /// `OldMintUnder`: `OldMint` on the lab whose D sorts below C (the model's `dl`).
+    under: bool,
     k: u64,
     late: bool,
     asleep: bool,
@@ -539,16 +576,18 @@ enum Who {
 impl<'a> GapRun<'a> {
     /// The shape `selector` picks, A's and B's homes copied into `dir`.
     fn start(shapes: &'a GapShapes, selector: &str, dir: &Path) -> Self {
-        let sc = match selector {
-            "OldMint" => 1,
-            "OldMintOmitsB" => 2,
-            "Churn" => 3,
+        let (sc, under) = match selector {
+            "OldMint" => (1, false),
+            "OldMintUnder" => (1, true),
+            "OldMintOmitsB" => (2, false),
+            "Churn" => (3, false),
             other => panic!("not a GapHeal shape: {other}"),
         };
         let mut run = Self {
             shapes,
             dir: dir.to_path_buf(),
             sc,
+            under,
             k: 0,
             late: false,
             asleep: false,
@@ -573,14 +612,18 @@ impl<'a> GapRun<'a> {
             copy_private_tree(&lab.macs.root.path().join(home), &dir.join(home));
         }
         if sc != 3 {
-            let batch = if sc == 1 {
-                &shapes.one_batch
-            } else {
-                &shapes.two_batch
-            };
-            run.minted(batch);
+            run.minted(run.c_batch());
         }
         run
+    }
+
+    /// C's batch in `OldMint`, `OldMintUnder` and `OldMintOmitsB`.
+    fn c_batch(&self) -> &'a [Record] {
+        match (self.sc, self.under) {
+            (1, false) => &self.shapes.one_batch,
+            (1, true) => &self.shapes.under_batch,
+            _ => &self.shapes.two_batch,
+        }
     }
 
     /// This run as it stands, its homes copied into `dir`.
@@ -596,9 +639,10 @@ impl<'a> GapRun<'a> {
     }
 
     fn lab(&self) -> &'a Lab {
-        match self.sc {
-            1 => &self.shapes.one,
-            2 => &self.shapes.two,
+        match (self.sc, self.under) {
+            (1, false) => &self.shapes.one,
+            (1, true) => &self.shapes.under,
+            (2, _) => &self.shapes.two,
             _ => &self.shapes.three,
         }
     }
@@ -816,26 +860,17 @@ impl<'a> GapRun<'a> {
             }
             "DeliverToA" => {
                 let a = self.a();
-                let batch = if self.sc == 1 {
-                    &shapes.one_batch
-                } else {
-                    &shapes.two_batch
-                };
+                let batch = self.c_batch();
                 let part = if self.sc == 1 && !held(&a).contains(batch[0].id()) {
                     &batch[..shapes.one_prefix]
                 } else {
-                    &batch[..]
+                    batch
                 };
                 give(&a, part);
                 self.pa = false;
             }
             "DeliverToB" => {
-                let batch = if self.sc == 1 {
-                    &shapes.one_batch
-                } else {
-                    &shapes.two_batch
-                };
-                give(&self.b(), batch);
+                give(&self.b(), self.c_batch());
                 self.pb = false;
             }
             "ToA" => {
@@ -971,10 +1006,11 @@ impl<'a> GapRun<'a> {
 
     /// What `log`, a Mac's, holds of the batch that minted `e` (one batch for every audience it
     /// mints), as `va` and `vb` count it: 3 for the start's epoch and the Mac's own; else 0 none,
-    /// 1 a prefix, and whole 3 where a record
-    /// the minter signed after `e` settles it, else by the settle grace from the Mac's first
-    /// sight (`first`, or this pass): 3 run, 2 runs out at the next `Tick`, 5 at the one after.
-    /// A that slept across a `Tick` reads 6 for none and 4 for a prefix.
+    /// 3 where its minter's `Wrap`s here top every seat it could wrap
+    /// ([`Self::frontier_settles`]), 1 another prefix, and whole 3 where a record the minter
+    /// signed after `e`'s own settles it, else by the settle grace from the Mac's first sight
+    /// (`first`, or this pass): 3 run, 2 runs out at the next `Tick`, 5 at the one after. A that
+    /// slept across a `Tick` reads 6 for none and 4 for a prefix.
     fn view(
         &self,
         log: &Log,
@@ -997,17 +1033,20 @@ impl<'a> GapRun<'a> {
         if have == 0 {
             return if slept { 6 } else { 0 };
         }
-        if have < batch.len() {
-            return if slept { 4 } else { 1 };
-        }
         let at = batch
             .iter()
             .position(|r| r.id() == e)
             .expect("the batch mints it");
+        if self.frontier_settles(log, batch, at) {
+            return 3;
+        }
+        if have < batch.len() {
+            return if slept { 4 } else { 1 };
+        }
         let minter = batch[at].actor();
         if batch[at + 1..]
             .iter()
-            .any(|r| r.actor() == minter && wrap_of(r).is_none())
+            .any(|r| r.actor() == minter && wrap_of(r).is_none_or(|(of, _)| of != *e))
         {
             return 3;
         }
@@ -1019,6 +1058,79 @@ impl<'a> GapRun<'a> {
         } else {
             5
         }
+    }
+
+    /// Whether what `log` holds of `batch`, which minted its record at `at`, tops every seat its
+    /// minter could wrap (`Log::batch_whole`, one-mesh §11 H2), read off the lab's seats by hand.
+    /// The epoch is of a seat audience, and each seat is wrapped here, sorts below the highest
+    /// recipient the batch's `Wrap`s here reach, or is none its minter could wrap: its binding
+    /// (the genesis, or its `Admit`) is not in the past of the batch's last `Wrap` here (of the
+    /// epoch, where it holds none) or C's `Remove` is, and no causally newest other epoch of the
+    /// audience there, not after it, wraps it there, or C's `Remove` lies there too.
+    fn frontier_settles(&self, log: &Log, batch: &[Record], at: usize) -> bool {
+        let e = batch[at].id();
+        let Body::Epoch { audience, .. } = batch[at].body() else {
+            return false;
+        };
+        if matches!(audience, EpochAudience::Hosts(_)) {
+            return false;
+        }
+        let wrapped: BTreeSet<Recipient> = log
+            .records()
+            .filter_map(wrap_of)
+            .filter(|(of, _)| of == e)
+            .map(|(_, to)| to)
+            .collect();
+        let (frontier, last) = batch
+            .iter()
+            .filter(|r| log.get(r.id()).is_some())
+            .filter_map(|r| {
+                wrap_of(r)
+                    .filter(|(of, _)| of == e)
+                    .map(|(_, to)| (to, *r.id()))
+            })
+            .max()
+            .map_or((None, *e), |(to, id)| (Some(to), id));
+        let Some(Body::Genesis { founders, .. }) = log.records().next().map(Record::body) else {
+            panic!("a log starts at its genesis");
+        };
+        let earlier: Vec<RecordId> = log
+            .records()
+            .filter(|r| {
+                matches!(r.body(), Body::Epoch { audience: of, .. } if of == audience)
+                    && r.id() != e
+                    && in_past(log, r.id(), &last)
+                    && !in_past(log, e, r.id())
+            })
+            .map(|r| *r.id())
+            .collect();
+        let newest: Vec<RecordId> = earlier
+            .iter()
+            .filter(|x| !earlier.iter().any(|y| in_past(log, x, y)))
+            .copied()
+            .collect();
+        let c = self.lab().seats[2];
+        let removed_by = |of: &RecordId| {
+            self.remove_of_c(log)
+                .is_some_and(|remove| in_past(log, &remove, of))
+        };
+        let lab = self.lab();
+        lab.seats.iter().chain(&lab.d).all(|seat| {
+            let gone = |of: &RecordId| seat.actor == c.actor && removed_by(of);
+            let bound = founders.iter().any(|f| f.recipient == seat.recipient)
+                || log.records().any(|r| {
+                    matches!(r.body(), Body::Admit { entrant, .. } if entrant.member() == seat.actor)
+                        && in_past(log, r.id(), &last)
+                });
+            let carried = log.records().any(|r| {
+                wrap_of(r).is_some_and(|(of, to)| newest.contains(&of) && to == seat.recipient)
+                    && in_past(log, r.id(), &last)
+            });
+            let could = (bound || carried) && !gone(&last);
+            !could
+                || wrapped.contains(&seat.recipient)
+                || frontier.is_some_and(|top| seat.recipient < top)
+        })
     }
 
     /// The model's variables of the newest epoch of `audience`.
@@ -1157,6 +1269,7 @@ fn gap_heal_transition(run: &GapRun<'_>) -> State {
     });
     for (name, value) in [
         ("sc", run.sc),
+        ("dl", i64::from(run.under)),
         ("ad", i64::from(run.admit_of_d(&union).is_some())),
         ("dk", i64::from(run.admit_of_d(&a).is_some())),
         ("dy", i64::from(run.deny.is_some())),
@@ -1203,7 +1316,7 @@ fn gap_states(model: &aterm_spec::derive::Model, path: &[&str]) -> Vec<State> {
 }
 
 /// `OldMint` to the step where both Macs hold C's batch settled and A has healed D: the prefix
-/// path every gap-closer control runs.
+/// path most gap-closer controls run.
 const SETTLED: [&str; 8] = [
     "OldMint",
     "DeliverToB",
@@ -1235,6 +1348,9 @@ const SETTLED: [&str; 8] = [
 ///   once A heals too `NoStorm` breaks.
 /// - `log_entries::GAPS_FROM_FIRST_SIGHT`: B's rank counts from its first sight of the unsettled
 ///   batch, so it is due in the step A's is, which is no successor; `NoStorm` breaks the same.
+/// - `rekey::FRONTIER_BLIND`: in `OldMintUnder` A, ranked first, holds C's whole batch, whose
+///   last `Wrap` tops D, and heals nothing, as before H2, which is no successor;
+///   `FrontierHealsAtOnce` breaks.
 #[test]
 fn the_gap_closer_conforms_to_the_gap_heal_model() {
     use aterm_spec::interp::{violated_invariants, with_buggy};
@@ -1254,6 +1370,7 @@ fn the_gap_closer_conforms_to_the_gap_heal_model() {
         (6, "NoStorm"),
         (7, "RemovalIsFinal"),
         (8, "NoStorm"),
+        (9, "FrontierHealsAtOnce"),
     ] {
         assert!(
             violated_invariants(&with_buggy(&model, buggy)).contains(law),
@@ -1357,6 +1474,18 @@ fn the_gap_closer_conforms_to_the_gap_heal_model() {
         assert!(!model.check_invariant("NoStorm", last), "{name}");
     }
 
+    let path = [
+        "OldMintUnder",
+        "DeliverToB",
+        "DeliverToA",
+        "DeliverToA",
+        "HealA",
+    ];
+    let seen = control(&FRONTIER_BLIND, "frontier-blind", &path, "HealA");
+    let last = seen.last().unwrap();
+    assert_eq!((last["va"], last["had"]), (3, 0), "A holds D's gap");
+    assert!(!model.check_invariant("FrontierHealsAtOnce", last));
+
     shapes.stop();
 }
 
@@ -1382,7 +1511,8 @@ fn wrapped_to(paths: &Paths, epoch: &RecordId) -> BTreeSet<Recipient> {
 /// A3: a duplicate heal, which `GapHeal`'s `NoStorm` rules out only under its timing
 /// assumptions, is admitted wherever it lands, changes no recipient set, and costs one keyed
 /// record (the design's `AtMostTwoHeals` bound). On `OldMint`'s lab both A and B hold C's batch
-/// whole; once it settles A, ranked first, heals D. Breaking the first assumption, A's heal has
+/// whole, whose last `Wrap` sorts below D, so it settles only by the grace; once it does A,
+/// ranked first, heals D. Breaking the first assumption, A's heal has
 /// not reached B when B's rank falls due a step later, so B heals D too. Each Mac then takes the
 /// other's `Wrap`: both are in its log, epoch 2's recipients are what its own heal made them,
 /// its keyed count rises by exactly the one record, and no pass on either Mac signs a third.
@@ -1392,7 +1522,7 @@ fn wrapped_to(paths: &Paths, epoch: &RecordId) -> BTreeSet<Recipient> {
 /// (a list, not a set) fails the recipient assert.
 #[test]
 fn a_duplicate_heal_is_admitted_changes_no_recipient_set_and_is_counted() {
-    let (lab, batch, _) = GapShapes::old_mint();
+    let (lab, batch, _) = GapShapes::old_mint(false);
     let (a, b) = (lab.home(lab.a), lab.home(lab.b));
     let d = lab.d.expect("OldMint seats D").recipient;
     let e2 = *batch[0].id();
@@ -1461,8 +1591,10 @@ fn a_duplicate_heal_is_admitted_changes_no_recipient_set_and_is_counted() {
 /// itself, a batch that ends in `Wrap`s. Every home's own closer
 /// ([`log_entries::close_wrap_gaps`], with its own roster reads) runs at each step of an injected
 /// clock, and every record reaches every home before the next step: nothing heals before the
-/// batch settles, then each of the 85 gaps (the 84 and m41) gets one `Wrap`, signed by the holder
-/// its rank puts first, and later steps sign nothing. m41 cannot open epoch 2 until healed, so it
+/// batch settles, which is at once where its last `Wrap` sorts above every gap (one-mesh §11 H2;
+/// the homes' keys are fresh, so a run meets that about once in 30) and else at the settle
+/// grace, then each of the 85 gaps (the 84 and m41) gets one `Wrap`, signed by the holder its
+/// rank puts first, and later steps sign nothing. m41 cannot open epoch 2 until healed, so it
 /// heals nothing; the 84 seats have no home, so they never look.
 ///
 /// NEGATIVE CONTROL: with `OLD_GAP_RULE` on (0.154.0 read an omission the minter knew as a
@@ -1542,6 +1674,9 @@ fn the_eighty_eight_to_three_drop_heals_on_real_homes() {
         "every current seat epoch 2 omits is a gap, its minter's too"
     );
     assert!(first.contains_key(&seats["m41"].recipient));
+    // The step the batch settles in: 0 where its last `Wrap` tops every gap, else the grace's.
+    let frontier = to.last().copied();
+    let settles = usize::from(!first.keys().all(|gap| Some(*gap) < frontier));
 
     // Each step: every home's pass at `now`, then every record to every home.
     let heal = |root: &Path, old: bool| -> (Vec<Record>, BTreeMap<&str, Paths>) {
@@ -1569,10 +1704,10 @@ fn the_eighty_eight_to_three_drop_heals_on_real_homes() {
             for paths in copies.values() {
                 new.extend(log_entries::close_wrap_gaps(paths, now).unwrap());
             }
-            if step != 1 {
+            if step != settles {
                 assert!(
                     new.is_empty(),
-                    "step {step}: heals come only at the settle, all of them"
+                    "step {step}: heals come only at the settle (step {settles}), all of them"
                 );
             }
             for paths in copies.values() {

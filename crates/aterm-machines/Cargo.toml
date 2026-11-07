@@ -10,6 +10,8 @@ repository.workspace = true
 description = "aterm — `aterm machines`: configure and manage a lab of Macs from one controller over SSH (docs/DESIGN-machines-2026-10-16.md). The controller (inventory, signed envelopes, SSH fan-out, Screen Sharing person steps) and the host agent (a probe/plan/apply/verify engine over macOS's own tools)."
 
 [dependencies]
+# Bounded read-only local Git pack planning, independent of controller setup.
+aterm-repo-storage = { workspace = true }
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 # Exclusive owned ephemeral staging; shared by controller and agent writers.
 aterm-tempfile = { workspace = true }

@@ -15,6 +15,7 @@ pub mod baseline;
 pub(crate) mod checkout;
 pub use checkout::github_writer_origin;
 pub mod cli;
+pub mod clone_tuning;
 pub mod console;
 pub mod controller;
 pub mod engine;

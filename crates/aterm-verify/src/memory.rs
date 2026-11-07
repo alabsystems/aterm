@@ -14,23 +14,29 @@
 //! the checkout it ran in (each checkout builds into a cache of its own, and a warm cache compiles
 //! less than a cold one), the run's sorted crate selection for a stage that reads it (the test
 //! compile and run, the doctests, the lint, and the cells a selection pulled; every other stage
-//! does the same work whatever is selected), and what else changes its work: the cells asked for,
-//! the test binaries run at once ([`Key`]). It keeps the last [`KEPT`] peaks, so a light run never
-//! hides the heavy one before it. The next run of that stage over that key claims the most of
-//! them and a fifth more, at least 1 GiB more ([`aterm_capacity::peak_claim`]); where none is
-//! kept, the most any record of a wider selection in the same checkout keeps (a superset's build
-//! compiles the subset's crates too; the most of them, not the least, since a wider run over a
-//! warmer cache can have taken less than this one will); then the most its stage, selection and
+//! does the same work whatever is selected), and what else changes its work: the cells asked for
+//! ([`Key`]). It keeps the last [`KEPT`] peaks, so a light run never hides the heavy one before
+//! it. The next run of that stage over that key claims the most of them and a fifth more, at
+//! least 1 GiB more ([`aterm_capacity::peak_claim`]); where none is kept, the most any record of
+//! a wider selection in the same checkout keeps (a superset's build compiles the subset's crates
+//! too; the most of them, not the least, since a wider run over a warmer cache can have taken
+//! less than this one will); then the most its stage, selection and
 //! variant kept in another checkout; then the most a plain `targo` build of the same selection
 //! whose work holds the stage's kept ([`plain_like`], BUILD-ADMIT's book); and where none of those
-//! either, a stage that compiles ([`compiles`]) claims what records of narrower selections of its
-//! stage and variant, in any checkout, kept, where together they name every crate of its own:
-//! the sum of what each part of that cover weighs, the most any record of it, or of a selection
-//! inside it, kept; the cover whose sum is least; at least the most any narrower record kept;
-//! and a fifth more, at least 1 GiB more, never more than the cold figure ([`composed`]). The sum
-//! bounds the union's peak on a premise, the one a wider selection's bound rests on too: one
-//! cargo run of the union compiles no unit its parts' runs did not, with as many jobs at once, so
-//! the compilers it holds together at its peak split among the parts, and each part's share is
+//! either, a stage that compiles ([`compiles`]) claims the lesser of two upper bounds, or the one
+//! kept, each at least the most any record of a selection inside its own kept, in any checkout,
+//! and a fifth more, at least 1 GiB more, never more than the cold figure: the most any record of
+//! a WIDER named selection of its stage and variant kept in another checkout ([`wider_elsewhere`]:
+//! a superset's build compiles the subset's crates too, the premise its checkout's wider record
+//! rests on, over a cache not this checkout's), read only where no record of a selection inside
+//! its own kept more and, for the test compile, no unit of its crates kept more (either shows the
+//! wider run warm, its figure no bound); and what records of narrower selections of its stage and
+//! variant, in any checkout, kept, where together they name every crate of its own: the sum of
+//! what each part of that cover weighs, the most any record of it, or of a selection inside it,
+//! kept; the cover whose sum is least; at least the most any narrower record kept ([`composed`]).
+//! The sum bounds the union's peak on a premise, the one a wider selection's bound rests on too:
+//! one cargo run of the union compiles no unit its parts' runs did not, with as many jobs at once,
+//! so the compilers it holds together at its peak split among the parts, and each part's share is
 //! units that part's own run compiled, which its peak bounds only where that run compiled them.
 //! A run over a warm cache compiles little and keeps a light peak, so a part weighs at least what
 //! a selection inside it kept, which its own run compiles too, and the union at least what any
@@ -38,10 +44,13 @@
 //! warm still weighs light, and nothing here can tell. The margin is for the premise's other
 //! gaps: the union's run can hold together two of a part's units its own run never overlapped,
 //! and a dependency two parts build with different features builds once with both, a unit no
-//! part's run built. A selection that names a crate no narrower record holds claims the cold
-//! figure, 16 GiB and at most half of physical memory ([`aterm_capacity::cold_claim`]); and any
-//! other stage claims nothing ([`need`]). A stage that touches no target directory
-//! ([`Lane::Pure`]: the formatter, the censuses) is never measured and never claims.
+//! part's run built. A selection that no wider record elsewhere bounds and that names a crate no
+//! narrower record holds claims the cold figure, 16 GiB and at most half of physical memory
+//! ([`aterm_capacity::cold_claim`]); and any other stage claims nothing ([`need`]). A stage that
+//! touches no target directory ([`Lane::Pure`]: the formatter, the censuses) is never measured
+//! and never claims. A stage that runs test binaries ([`dispatched`]) claims nothing here and
+//! keeps nothing: its dispatch claims the most its plan's binaries hold together, from each one's
+//! history, once it knows which binaries run ([`crate::testrun::run_tests`]).
 
 use std::cell::RefCell;
 use std::fmt;
@@ -55,7 +64,7 @@ use crate::scope::Scope;
 /// The record's peaks, schema and size, and the record itself, lifted into `aterm_capacity`'s
 /// book so a plain build reads verify's records as its analogue
 /// ([`aterm_capacity::book::chain`]): what verify keeps and reads is unchanged.
-pub use aterm_capacity::book::{KEPT, Learned, Peak, ROWS_KEPT, Records, Row, SCHEMA};
+pub use aterm_capacity::book::{KEPT, Learned, Peak, ROWS_KEPT, Records, Row, SCHEMA, Wider};
 
 /// What a record is kept for ([`StageKey::of_run`]): a stage, the checkout it ran in, the run's
 /// crate selection, sorted, where the stage reads it, and what else of the run changes its work.
@@ -119,7 +128,8 @@ pub enum Kept {
     /// Below a quarter of the peak a shaped call's claim was planned by, bytes
     /// ([`crate::shape::Part::planned`]): it compiled almost none of its work.
     LightBeside(u64),
-    /// There is no record to keep it in, or the stage is not [`metered`].
+    /// There is no record to keep it in, the stage is not [`metered`], or its binaries' dispatch
+    /// claims for it ([`dispatched`]).
     Nowhere,
 }
 
@@ -166,19 +176,20 @@ pub const fn compiles(id: StageId) -> bool {
     }
 }
 
-/// Whether stage `id` runs test binaries side by side ([`crate::test_plan::dispatch`]), as many at
-/// once as their charges fit in its share, and so claims [`aterm_capacity::cold_claim`] until a
-/// run of it is measured, as a compile does: the test run and the checkers run.
-#[must_use]
-pub const fn runs_binaries_together(id: StageId) -> bool {
-    matches!(id, StageId::Test | StageId::SpecCheckers)
-}
-
 /// Whether `spec` is measured and claims memory: every stage but one that touches no target
 /// directory ([`Lane::Pure`]), which builds nothing.
 #[must_use]
 pub fn metered(spec: &StageSpec) -> bool {
     spec.lane != Lane::Pure
+}
+
+/// Whether stage `id` runs test binaries through [`crate::testrun::run_tests`], whose dispatch
+/// claims the memory its plan's binaries hold at once, from each one's history, once it knows
+/// which run (`docs/DESIGN-fast-build-release-2026-11-05.md` §4.4): the stage claims nothing of
+/// its own ([`How::Dispatched`]) and keeps no peak.
+#[must_use]
+pub const fn dispatched(id: StageId) -> bool {
+    matches!(id, StageId::Test | StageId::SpecCheckers)
 }
 
 /// What one live process group of a stage holds, and what the stage held at most.
@@ -535,8 +546,8 @@ pub trait StageKey {
     fn of(id: StageId, scope: &Scope) -> Key;
 
     /// The key of stage `id` in the run `ctx`: its checkout ([`crate::Ctx::root`]), its
-    /// selection where the stage reads it ([`reads_selection`]), and its variant: the requested
-    /// test binaries at once for the test run, the cells for the cells lane's stages.
+    /// selection where the stage reads it ([`reads_selection`]), and its variant: the cells for
+    /// the cells lane's stages.
     fn of_run(id: StageId, ctx: &crate::Ctx) -> Key;
 
     /// The key of planned stage `spec` in the run `ctx`: a call of a shaped test compile
@@ -573,7 +584,6 @@ impl StageKey for Key {
         };
         key.checkout = ctx.root.display().to_string();
         key.variant = match id {
-            StageId::Test | StageId::SpecCheckers => Some(format!("jobs {}", ctx.test_jobs())),
             StageId::ForeignCells
             | StageId::WasmSmoke
             | StageId::WasmGlue
@@ -617,16 +627,21 @@ pub enum How {
     /// From the peaks a plain `targo` build of its selection kept ([`plain_like`]), with none of
     /// its own kept anywhere.
     Plain(Learned),
+    /// From the most a wider named selection of its stage and variant kept in another checkout
+    /// ([`wider_elsewhere`]), no narrower record or unit's peak outweighing it, with none of its
+    /// own kept anywhere, nor a plain build's, and it compiles: less than a cover's claim, or with
+    /// no cover.
+    WiderElsewhere(Wider),
     /// From records of narrower selections that name every crate of its own ([`composed`]),
-    /// with none of its own kept anywhere, nor a plain build's, and it compiles.
+    /// with none of its own kept anywhere, nor a plain build's, and it compiles: at most a wider
+    /// record elsewhere's claim, or with none.
     Composed(Cover),
     /// No peak kept, and it compiles: the cold figure ([`aterm_capacity::cold_claim`]).
     Cold,
-    /// No peak kept, and it runs test binaries side by side ([`runs_binaries_together`]): the
-    /// cold figure too.
-    Together,
     /// No peak kept, and it compiles nothing.
     Light,
+    /// It runs test binaries ([`dispatched`]): their dispatch claims what its plan holds at once.
+    Dispatched,
     /// It touches no target directory ([`metered`]): never measured, never claimed.
     Unmetered,
 }
@@ -679,6 +694,21 @@ impl fmt::Display for StageNeed {
                     aterm_capacity::size(l.peak)
                 )
             }
+            How::WiderElsewhere(w) => {
+                let bound = if aterm_capacity::peak_claim(w.peak) > self.bytes {
+                    "at most the cold figure (16 GiB, at most half of physical memory)"
+                } else {
+                    "at least 1 GiB"
+                };
+                write!(
+                    f,
+                    "{bytes}, the most a run over a wider selection ({}) in {} used ({}) and a \
+                     fifth more, {bound}: no run of it is kept",
+                    w.key.selection(),
+                    w.key.checkout,
+                    aterm_capacity::size(w.peak)
+                )
+            }
             How::Composed(c) => {
                 let parts: Vec<String> = c
                     .parts
@@ -724,12 +754,11 @@ impl fmt::Display for StageNeed {
                 "{bytes} cold: no run of it is kept, and it compiles (16 GiB, at most half of \
                  physical memory)"
             ),
-            How::Together => write!(
-                f,
-                "{bytes} cold: no run of it is kept, and it runs test binaries side by side (16 \
-                 GiB, at most half of physical memory)"
-            ),
             How::Light => f.write_str("nothing: no run of it is kept, and it compiles nothing"),
+            How::Dispatched => f.write_str(
+                "nothing here: its binaries' dispatch claims the most they hold together, from \
+                 their history",
+            ),
             How::Unmetered => f.write_str("nothing: it touches no target directory"),
         }
     }
@@ -807,6 +836,24 @@ fn and_list(items: &[String]) -> String {
         [one] => one.clone(),
         [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
+}
+
+/// WHAT A WIDER SELECTION KEPT IN ANOTHER CHECKOUT, for a stage whose record `key` is kept
+/// nowhere: the book's one reading of it ([`Records::wider_elsewhere`], which a plain build's
+/// [`aterm_capacity::book::chain`] reads too), the most any record of its stage and variant over a
+/// named selection that holds its own, in another checkout, kept, an upper bound on the premise
+/// its own checkout's wider record rests on ([`Records::learned`]: a superset's build compiles the
+/// subset's crates too). It is refused (`None`, as where none is kept) where it is lighter than
+/// what a record of a selection inside its own, in any checkout, kept, or, for the test compile,
+/// than the heaviest unit of its crates any checkout kept ([`Records::unit_floor`]): either shows
+/// the wider run warm. LIMIT: a warm wider run neither outweighs answers, and nothing here can
+/// tell. A one-crate selection has no narrower named selection inside it, so where it has no unit
+/// floor its most wider record elsewhere always answers: for the lint, the doctests and the
+/// cells, which keep no unit's peak, and for a test compile none of whose crates kept a unit
+/// (one is kept only at [`UNIT_FLOOR`] or more).
+#[must_use]
+pub fn wider_elsewhere(records: &Records, key: &Key) -> Option<Wider> {
+    records.wider_elsewhere(key, records.unit_floor(key))
 }
 
 /// A COVER OF NARROWER SELECTIONS ([`composed`]): records of a stage's narrower selections, of its
@@ -997,10 +1044,28 @@ pub fn composed(records: &Records, key: &Key) -> Option<Cover> {
 /// stage and selection kept in another ([`Records::elsewhere`]: a new worktree's first run, the
 /// common case, would otherwise claim the cold figure for a compile some other worktree measured);
 /// with none of those, the most a plain build of the same work kept in `plain`
-/// ([`plain_like`]); with none kept anywhere, for a stage that compiles, the sum of what narrower
-/// selections that cover its own weigh and a fifth more, at most the cold figure ([`composed`]),
-/// else the cold figure ([`aterm_capacity::cold_claim`]), and nothing for any other stage;
-/// nothing for a stage that touches no target directory ([`metered`]).
+/// ([`plain_like`]); with none kept anywhere, for a stage that compiles, the LESSER of two bounds,
+/// each and a fifth more, at most the cold figure: the most a wider selection kept in another
+/// checkout ([`wider_elsewhere`]), and the sum of what narrower selections that cover its own
+/// weigh ([`composed`]); else the cold figure ([`aterm_capacity::cold_claim`]), and nothing for
+/// any other stage; nothing for a stage that touches no target directory ([`metered`]), and
+/// nothing for one whose binaries' dispatch claims for them ([`dispatched`]). The two
+/// are upper bounds read from records on either side of the selection, each on its premise: a
+/// wider run compiled every unit this one will (the premise its checkout's wider record rests on
+/// too), and the narrower runs' units together are this one's, their peaks summed
+/// ([`composed`]'s). Where both premises hold, the lesser bound holds. Each is at least the most
+/// any record of a selection inside its own kept: the cover is raised to it, and a wider record
+/// below it, or below the test compile's heaviest unit ([`Records::unit_floor`]), is refused, not
+/// raised ([`wider_elsewhere`]: that run was warm, so its figure bounds nothing, and a raised one
+/// would bound only the narrower record's crates), so the lesser never answers with a light
+/// record either side's floor contradicts; a light record no floor contradicts (a warm run, which
+/// nothing here can tell) either can read alike, and the margin and the cold figure bound both. A
+/// tie is the cover's. Only a stage that compiles reads them, so no other stage claims more than
+/// before. The plan raises the unshaped test compile to at least its estimate besides
+/// ([`crate::shape::shape`]), which, where narrower records are kept, is at least the heaviest
+/// disjoint narrower records summed: the lesser decides the test compile's claim only where it
+/// exceeds that estimate, and always decides the lint's, the doctests' and the pulled cells',
+/// which no estimate raises.
 #[must_use]
 pub fn need(
     records: &Records,
@@ -1013,6 +1078,12 @@ pub fn need(
         return StageNeed {
             bytes: 0,
             how: How::Unmetered,
+        };
+    }
+    if dispatched(spec.id) {
+        return StageNeed {
+            bytes: 0,
+            how: How::Dispatched,
         };
     }
     if let Some(l) = records.learned(key) {
@@ -1034,21 +1105,24 @@ pub fn need(
         },
         None if compiles(spec.id) => {
             let cold = aterm_capacity::cold_claim(physical);
-            match composed(records, key) {
-                Some(c) => StageNeed {
-                    bytes: aterm_capacity::peak_claim(c.peak).min(cold),
-                    how: How::Composed(c),
-                },
-                None => StageNeed {
+            let wider = wider_elsewhere(records, key).map(|w| StageNeed {
+                bytes: aterm_capacity::peak_claim(w.peak).min(cold),
+                how: How::WiderElsewhere(w),
+            });
+            let cover = composed(records, key).map(|c| StageNeed {
+                bytes: aterm_capacity::peak_claim(c.peak).min(cold),
+                how: How::Composed(c),
+            });
+            match (wider, cover) {
+                (Some(w), Some(c)) if w.bytes < c.bytes => w,
+                (_, Some(c)) => c,
+                (Some(w), None) => w,
+                (None, None) => StageNeed {
                     bytes: cold,
                     how: How::Cold,
                 },
             }
         }
-        None if runs_binaries_together(spec.id) => StageNeed {
-            bytes: aterm_capacity::cold_claim(physical),
-            how: How::Together,
-        },
         None => StageNeed {
             bytes: 0,
             how: How::Light,
@@ -1190,7 +1264,8 @@ impl Book {
     }
 
     /// Keep `peak`, measured for `spec`, under `key` ([`Records::push`]); nothing for a stage
-    /// that is not [`metered`], and nothing with no file. A stage that compiles ([`compiles`])
+    /// that is not [`metered`], whose binaries' dispatch claims for it ([`dispatched`]), or with
+    /// no file. A stage that compiles ([`compiles`])
     /// keeps nothing for a run light beside the heaviest peak its key kept in the last two weeks
     /// ([`Records::keep_unless_light`]): a compile whose units were fresh (the run after a cut
     /// built them, or after a plain build) did none of the work its claim is for, and eight of
@@ -1205,7 +1280,7 @@ impl Book {
         let Some(path) = &self.path else {
             return Ok(Kept::Nowhere);
         };
-        if !metered(spec) {
+        if !metered(spec) || dispatched(spec.id) {
             return Ok(Kept::Nowhere);
         }
         if compiles(spec.id)

@@ -99,7 +99,7 @@ impl Bed {
         let home = root.path().join("home");
         let config = home.join(".config/aterm/aterm.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
-        fs::write(&config, "[fleet]\nmachine='m1'\n").unwrap();
+        crate::test_config::write(&config, "[fleet]\nmachine='m1'\n").unwrap();
         let env = Env {
             state: root.path().join("state"),
             aterm_state: None,

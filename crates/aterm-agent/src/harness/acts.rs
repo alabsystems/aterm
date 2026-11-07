@@ -5,7 +5,7 @@
 
 use crate::supervise::approvals::Outcome;
 use crate::supervise::policy::approval::{
-    QuestionPriority, RULE_ANSWER_LAND, RULE_ANSWER_LONG_TERM, RULE_ANSWER_SHORT_TERM, RULE_PLAN,
+    PriorityWord, RULE_ANSWER_LAND, RULE_ANSWER_LONG_TERM, RULE_ANSWER_SHORT_TERM, RULE_PLAN,
     RULE_PROSE_LONG_TERM, RULE_PROSE_SHORT_TERM,
 };
 use crate::supervise::policy::go_ahead::RULE_GO_AHEAD;
@@ -169,7 +169,7 @@ fn is_dialog_key(rule: &str) -> bool {
 fn is_prose_answer(rule: &str) -> bool {
     rule == RULE_LAND_ANSWER
         || rule == RULE_GO_AHEAD
-        || QuestionPriority::ALL
+        || PriorityWord::ALL
             .into_iter()
             .any(|p| p.prose_rule_id() == rule)
 }

@@ -4430,7 +4430,12 @@ impl crate::App {
         let fleet = crate::fleet_listen::fleet_status_word();
         let units = crate::fleet_listen::units_status_word();
         let setup = crate::system_state_access::setup_field(self.system_state_host.latest_status());
-        let net = crate::net_place::status_fields();
+        let net = crate::net_place::status_fields(
+            self.fleet_glance
+                .as_ref()
+                .and_then(|glance| glance.seats(aterm_time::unix_millis().unwrap_or(0)))
+                .as_ref(),
+        );
         let pin = {
             let meta = pooled.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             meta.presentation_value("title")

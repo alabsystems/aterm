@@ -43,8 +43,10 @@ const MANIFEST: &str = "Cargo.toml";
 /// The pushes [`record`] tries before it stops: the first one plus four rebuilds on a moved tip.
 pub const MAX_RECORD_ATTEMPTS: u32 = 5;
 
-/// The oldest git whose `merge-tree` a line runs: `--merge-base` came in 2.40, `-X` in 2.43.
-pub const MIN_GIT: (u32, u32) = (2, 43);
+/// The oldest git whose `merge-tree` a line runs: `--merge-base` came in 2.40, `-X` in 2.43, and
+/// its merge (merge-ort) honours `-X no-renames` from 2.50; an older one takes the option and
+/// detects renames anyway.
+pub const MIN_GIT: (u32, u32) = (2, 50);
 
 /// How many of one merge side's commits a refusal lists before it gives only their count.
 const LISTED: usize = 20;
@@ -428,9 +430,12 @@ pub fn order(git: &dyn GitRunner, fixes: Vec<Fix>) -> Result<Vec<Fix>, Stop> {
 /// gitattributes give such a path a `merge` attribute.
 ///
 /// # Errors
-/// COULD NOT RUN when one of those sources picks a driver ([`Reason::Steered`]), when git refuses
-/// a call (a git older than [`MIN_GIT`] does, exit 129) or cannot read the commits.
+/// COULD NOT RUN for a git older than [`MIN_GIT`] ([`git_ready`]), read before any merge: one
+/// from 2.43 to 2.49 runs the merge without refusing and detects renames. COULD NOT RUN too when
+/// one of those sources picks a driver ([`Reason::Steered`]), when git refuses a call or cannot
+/// read the commits.
 pub fn hop_tree(git: &dyn GitRunner, prev: &str, c: &str) -> Result<Merged, Stop> {
+    git_ready(git)?;
     let base = format!("{c}^");
     let empty = plumb(git, &["hash-object", "-w", "-t", "tree", "/dev/null"])?;
     let source = format!("--attr-source={}", empty.stdout_utf8().trim());
@@ -1109,8 +1114,9 @@ fn too_old(words: &str) -> Stop {
     Stop::new(
         Reason::OldGit,
         format!(
-            "a release line needs git ≥ {}.{} (`git merge-tree --merge-base` came in 2.40, its \
-             `-X no-renames` in 2.43), and this git is {:?}",
+            "a release line needs git ≥ {}.{} (`git merge-tree --merge-base` came in 2.40, and \
+             its `-X no-renames` holds from 2.50: an older git takes it and detects renames \
+             anyway), and this git is {:?}",
             MIN_GIT.0,
             MIN_GIT.1,
             words.trim()

@@ -38,6 +38,38 @@ pub struct Memory {
     pub epoch: [u8; 16],
     pub guard: FileIdentity,
 }
+/// Observation of the original managed SDK GC lease actually copied by the
+/// custodian into this subject. Paths/numbers never reconstruct lease authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SdkCustody {
+    pub execution: Vec<u8>,
+    pub build: u64,
+    pub lease_path: Vec<u8>,
+    pub lease: FileIdentity,
+    pub inherited_fd: u32,
+}
+impl SdkCustody {
+    fn validate(&self) -> io::Result<()> {
+        let path = |path: &[u8]| {
+            !path.is_empty()
+                && path.len() <= MAX_FIELD
+                && path.starts_with(b"/")
+                && !path.contains(&0)
+                && !path.split(|b| *b == b'/').any(|part| part == b"." || part == b"..")
+        };
+        if self.build == 0
+            || self.lease.inode == 0
+            || self.inherited_fd < 3
+            || self.inherited_fd > i32::MAX as u32
+            || !path(&self.execution)
+            || !path(&self.lease_path)
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+}
+
 /// Authenticated host code converts its actual current Inspection to this
 /// shape. Decoding does not authenticate that code or establish custody.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,6 +82,7 @@ pub struct Context {
     pub subject: Subject,
     pub cpu: Cpu,
     pub memory: Memory,
+    pub sdk: Option<SdkCustody>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextReply {
@@ -135,6 +168,9 @@ impl Context {
             && producer == self.original_root
     }
     fn validate(&self) -> io::Result<()> {
+        if let Some(sdk) = &self.sdk {
+            sdk.validate()?;
+        }
         let marker: Vec<_> = self.memory.marker.split('-').collect();
         if self.host.is_empty()
             || self.host.len() > 256
@@ -218,20 +254,40 @@ impl ContextReply {
         e.bytes(c.memory.marker.as_bytes())?;
         e.0.extend(c.memory.epoch);
         file_encode(&mut e, c.memory.guard)?;
+        // Always append the optional marker: older unpublished generations
+        // reject trailing data rather than silently dropping SDK custody.
+        match &c.sdk {
+            None => e.number(0),
+            Some(sdk) => {
+                e.number(1);
+                e.bytes(&sdk.execution)?;
+                e.number(sdk.build);
+                e.bytes(&sdk.lease_path)?;
+                file_encode(&mut e, sdk.lease)?;
+                e.number(sdk.inherited_fd.into());
+            }
+        }
         e.finish()
     }
     pub fn decode(bytes: &[u8], query: &ContextQuery) -> io::Result<Self> {
         query.validate()?;
+        let reply = Self::decode_observation(bytes)?;
+        if reply.call_attempt != query.call_attempt
+            || reply.context.session != query.binding.session
+            || reply.context.root_attempt != query.binding.root_attempt
+        {
+            return Err(invalid());
+        }
+        Ok(reply)
+    }
+    /// Parse bounded saved/native reply DATA without constructing a resource
+    /// binding/capability. No peer, original transfer, SDK keeper, CPU, memory,
+    /// release or execution authority follows from decoding this observation.
+    pub fn decode_observation(bytes: &[u8]) -> io::Result<Self> {
         let mut d = header(bytes, 7)?;
         let call_attempt = d.array()?;
         let session = d.text()?;
         let root_attempt = d.array()?;
-        if call_attempt != query.call_attempt
-            || session != query.binding.session
-            || root_attempt != query.binding.root_attempt
-        {
-            return Err(invalid());
-        }
         let host = d.text()?;
         let boot = d.text()?;
         let original_root = identity_decode(&mut d)?;
@@ -258,6 +314,17 @@ impl ContextReply {
             epoch: d.array()?,
             guard: file_decode(&mut d)?,
         };
+        let sdk = match d.number()? {
+            0 => None,
+            1 => Some(SdkCustody {
+                execution: d.bytes()?,
+                build: d.number()?,
+                lease_path: d.bytes()?,
+                lease: file_decode(&mut d)?,
+                inherited_fd: d.narrow()?,
+            }),
+            _ => return Err(invalid()),
+        };
         d.done()?;
         let reply = Self {
             call_attempt,
@@ -270,6 +337,7 @@ impl ContextReply {
                 subject,
                 cpu,
                 memory,
+                sdk,
             },
         };
         reply.encode()?;
@@ -288,14 +356,23 @@ pub enum Call {
 impl Call {
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
         if header(bytes, 1).is_ok() {
-            Request::decode(bytes).map(Self::Member)
+            let request = Request::decode(bytes)?;
+            if matches!(request.role, Role::SealedMetadata | Role::ResolverQuery) {
+                return Err(invalid());
+            }
+            Ok(Self::Member(request))
         } else {
             ContextQuery::decode(bytes).map(Self::Context)
         }
     }
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         match self {
-            Self::Member(request) => request.encode(),
+            Self::Member(request)
+                if !matches!(request.role, Role::SealedMetadata | Role::ResolverQuery) =>
+            {
+                request.encode()
+            }
+            Self::Member(_) => Err(invalid()),
             Self::Context(query) => query.encode(),
         }
     }

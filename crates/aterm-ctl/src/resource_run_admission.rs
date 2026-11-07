@@ -5,7 +5,8 @@
 use super::Args;
 use crate::resource_admission_transport as transport;
 use aterm_types::resource_admission::{
-    Binding, CompletionCause, Event, EventFrame, Outcome, Submission,
+    AccountedEventFrame, AccountingObservation, AccountingScope, Binding, CompletionCause, Event,
+    EventFrame, Outcome, Submission,
 };
 use aterm_uds::{
     CtlStream,
@@ -13,7 +14,7 @@ use aterm_uds::{
 };
 use std::{
     fs::File,
-    io::{self, Write as _},
+    io::{self, Read as _, Write as _},
     os::{
         fd::{AsFd as _, BorrowedFd},
         unix::{ffi::OsStrExt as _, fs::FileTypeExt as _},
@@ -68,7 +69,11 @@ pub(super) fn run(wire: &super::super::ConnWire, sid: &str, args: &Args) -> io::
         timeout_ms: resources.timeout_ms,
     };
     request.validate()?;
-    if !capability_value(wire).is_ok_and(|value| value["ready"].as_bool() == Some(true)) {
+    if !capability_value(wire).is_ok_and(|value| {
+        value["ready"].as_bool() == Some(true)
+            && (!args.accounted
+                || value["accounting"].as_str() == Some("owning-wait-accounting-v1"))
+    }) {
         emit(
             &mut status,
             &EventFrame {
@@ -90,14 +95,20 @@ pub(super) fn run(wire: &super::super::ConnWire, sid: &str, args: &Args) -> io::
         stderr: std::io::stderr().as_fd().try_clone_to_owned()?,
         events: host_events.into(),
     };
-    let attached = transport::attach(&wire.path, &request, fds, Instant::now() + HANDOFF).is_ok();
+    let attached = if args.accounted {
+        transport::attach_accounted(&wire.path, &request, fds, Instant::now() + HANDOFF)
+    } else {
+        transport::attach(&wire.path, &request, fds, Instant::now() + HANDOFF)
+    }
+    .is_ok();
     // A failed ATTACHED exchange can follow real descriptor delivery and
     // actual launch. The private lifecycle stream remains authoritative.
-    match receive(
+    match receive_mode(
         &events,
         &request.binding,
         &mut status,
         (!attached).then(|| Instant::now() + HANDOFF),
+        args.accounted,
     ) {
         Ok(code) => Ok(code),
         Err(error) => {
@@ -160,11 +171,12 @@ fn status_file(fd: i32) -> io::Result<File> {
     Ok(File::from(owned))
 }
 
-fn receive(
+fn receive_mode(
     events: &CtlStream,
     binding: &Binding,
     status: &mut Option<File>,
     mut first_event_deadline: Option<Instant>,
+    accounted: bool,
 ) -> io::Result<ExitCode> {
     let mut started = false;
     let mut queued = false;
@@ -186,7 +198,23 @@ fn receive(
             Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
             Err(error) => return Err(error),
         }
-        let frame = transport::read_event(events, binding, Instant::now() + HANDOFF)?;
+        let bytes = transport::read_frame(events, Instant::now() + HANDOFF)?;
+        let (frame, observation) = if accounted {
+            match AccountedEventFrame::decode(&bytes, binding) {
+                Ok(frame) => (frame.finished, Some(frame.observation)),
+                Err(_) => {
+                    let frame = EventFrame::decode(&bytes, binding)?;
+                    if matches!(frame.event, Event::Finished { .. } | Event::Refused { .. }) {
+                        return Err(io::Error::other(
+                            "accounted root requires an accounted terminal",
+                        ));
+                    }
+                    (frame, None)
+                }
+            }
+        } else {
+            (EventFrame::decode(&bytes, binding)?, None)
+        };
         first_event_deadline = None;
         match &frame.event {
             Event::Queued if !started && !queued => {
@@ -198,7 +226,10 @@ fn receive(
                 emit(status, &frame)?;
             }
             Event::Finished { outcome, .. } if started => {
-                emit(status, &frame)?;
+                if accounted {
+                    clean_eof(events, Instant::now() + HANDOFF)?;
+                }
+                emit_mode(status, &frame, observation)?;
                 return Ok(match outcome {
                     Outcome::Exit(code) if (0..=255).contains(code) => ExitCode::from(*code as u8),
                     Outcome::Signal(signal) if (1..=127).contains(signal) => {
@@ -208,7 +239,10 @@ fn receive(
                 });
             }
             Event::Refused { .. } if !started => {
-                emit(status, &frame)?;
+                if accounted {
+                    clean_eof(events, Instant::now() + HANDOFF)?;
+                }
+                emit_mode(status, &frame, observation)?;
                 return Ok(ExitCode::from(75));
             }
             _ => return Err(io::Error::other("invalid host lifecycle sequence")),
@@ -216,7 +250,27 @@ fn receive(
     }
 }
 
+fn clean_eof(mut events: &CtlStream, deadline: Instant) -> io::Result<()> {
+    loop {
+        match events.read(&mut [0]) {
+            Ok(0) => return Ok(()),
+            Ok(_) => return Err(io::Error::other("bytes after accounted root terminal")),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                ready::until(events.as_fd(), Interest::Read, deadline)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 fn emit(output: &mut Option<File>, frame: &EventFrame) -> io::Result<()> {
+    emit_mode(output, frame, None)
+}
+fn emit_mode(
+    output: &mut Option<File>,
+    frame: &EventFrame,
+    observation: Option<AccountingObservation>,
+) -> io::Result<()> {
     let Some(output) = output else { return Ok(()) };
     let mut value = aterm_json::json!({"version":3,"session":frame.binding.session,"attempt":aterm_uds::rand::hex_encode(&frame.binding.attempt)});
     let object = value
@@ -256,6 +310,16 @@ fn emit(output: &mut Option<File>, frame: &EventFrame) -> io::Result<()> {
         .ok_or_else(|| io::Error::other("invalid status facts"))?
     {
         object.insert(key.clone(), value.clone());
+    }
+    if let Some(observation) = observation {
+        let scope = match observation.scope {
+            AccountingScope::ChildAndWaitedDescendantsV1 => "child-and-waited-descendants-v1",
+        };
+        object.insert("accounting".into(), aterm_json::json!({
+            "scope":scope,
+            "cpu_times":observation.cpu_times.map(|cpu| aterm_json::json!({"user_ns":cpu.user_ns,"system_ns":cpu.system_ns})),
+            "peak_rss_bytes":observation.peak_rss_bytes
+        }));
     }
     let text = value.to_string();
     if text.len() + 1 > STATUS_MAX {

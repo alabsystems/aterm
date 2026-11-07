@@ -290,8 +290,9 @@ fn spawn_detached(exe: &Path, args: &[OsString]) -> io::Result<Box<dyn RunningPa
     Ok(Box::new(Owned(child)))
 }
 
-/// A detached pass, followed by its pid ([`crate::progress::pid_alive`]). Its exit status
-/// is launchd's to read, not ours, so an end reads as `true` and the store decides.
+/// A detached pass, followed by kernel process presence. Its exit status
+/// is its reaper's to read, not ours, so an end reads as `true` and the store decides.
+/// An exited, unreaped process is complete; an unreadable presence remains pending.
 #[cfg(unix)]
 struct Detached {
     pid: u32,
@@ -300,7 +301,13 @@ struct Detached {
 #[cfg(unix)]
 impl RunningPass for Detached {
     fn ended(&mut self) -> Option<bool> {
-        (!crate::progress::pid_alive(self.pid)).then_some(true)
+        use aterm_uds::process::{ProcessPresence, process_presence};
+        let pid = i32::try_from(self.pid).ok()?;
+        matches!(
+            process_presence(pid),
+            ProcessPresence::Absent | ProcessPresence::Exited
+        )
+        .then_some(true)
     }
 }
 
@@ -2471,6 +2478,38 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .status();
         exe
+    }
+
+    /// An exit is complete before a parent reaps the pid: signal-zero alone still finds it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn an_unreaped_exit_ends_the_followed_pass() {
+        use aterm_uds::process::{ProcessPresence, process_presence};
+        let mut child = aterm_uds::spawnfd::command("/bin/sh")
+            .args(["-c", "read _"])
+            .stdin(aterm_uds::spawnfd::Stdio::piped())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut pass = Detached { pid };
+        assert_eq!(pass.ended(), None, "the live pass is still followed");
+        drop(child.stdin.take());
+        let deadline = Instant::now() + HANG;
+        while process_presence(pid as i32) != ProcessPresence::Exited {
+            assert!(Instant::now() < deadline, "the child exited before reap");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let still_has_pid = crate::progress::pid_alive(pid);
+        let ended = pass.ended();
+        child.wait().unwrap();
+        assert!(
+            still_has_pid,
+            "negative control: signal-zero finds the zombie"
+        );
+        assert_eq!(ended, Some(true), "an unreaped exit completed the pass");
+        assert_eq!(pass.ended(), Some(true), "reaping keeps the pass complete");
     }
 
     /// A detached pass is not this process's child (a session reaping its shell never takes

@@ -75,7 +75,8 @@ pub struct Part {
     /// Why it claims what it does, or why the stage was not shaped, for its time line.
     pub said: String,
     /// The measured peak its claim was planned by: a cut's estimate, at least its heaviest unit;
-    /// the closing call's record after the cuts, at least its heaviest unit. A run of it below a
+    /// the closing call's record after the cuts, at least its heaviest unit, or with none, the
+    /// peaks of the units no call before it builds summed. A run of it below a
     /// quarter of this compiled almost none of its work and keeps no record
     /// ([`crate::memory::Book::keep`]), even under a key that holds none. `None` where it claims
     /// the whole estimate, which a closing call after cuts does much less than, and unshaped.
@@ -132,8 +133,9 @@ impl Part {
     }
 }
 
-/// The stage a test compile's per-unit peaks are kept under ([`unit_key`]).
-pub const UNIT_STAGE: &str = "TestCompile unit";
+/// The stage a test compile's per-unit peaks are kept under ([`unit_key`]): the book's, which
+/// weighs a wider record elsewhere by them too ([`aterm_capacity::book::Records::unit_floor`]).
+pub use aterm_capacity::book::UNIT_STAGE;
 
 /// What a refusal row's variant starts with ([`refusal_key`]).
 pub const REFUSED: &str = "shape refused ";
@@ -660,9 +662,11 @@ impl Planner<'_, '_> {
 /// ([`refusal_key`]), and its estimate claims less than the budget. Every call claims at least
 /// the heaviest unit no call before it builds ([`heaviest_unit`]), whatever its own record says.
 /// The closing call is the whole selection after every cut, claiming by the larger of its record
-/// after them and that unit; where either is not kept, by the whole estimate (at least the
-/// budget, so it runs with no other stage that claims memory). With no cut that holds, one call,
-/// saying why.
+/// after them and that unit; with no record after them, by the peaks of the units no call before
+/// it builds summed ([`unit_sum`]'s bound over its own work, which the units the cuts built,
+/// fresh for it, do not swell), where that claims less than the whole estimate; otherwise by the
+/// whole estimate (at least the budget, so it runs with no other stage that claims memory). With
+/// no cut that holds, one call, saying why.
 #[must_use]
 pub fn shape(
     selection: &[String],
@@ -791,6 +795,17 @@ pub fn shape(
         built.extend(graph.ids());
     }
     let closing_floor = heaviest_unit(book, &whole_graph, &built);
+    let closing_units = named_unit_sum(
+        book,
+        whole_graph
+            .units
+            .iter()
+            .filter(|u| !built.contains(&u.id))
+            .filter_map(|u| u.name.as_ref())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter(),
+    )
+    .filter(|e| aterm_capacity::peak_claim(e.peak) < whole_claim);
     let calls = in_order(&pieces)
         .into_iter()
         .map(|mut part| {
@@ -834,11 +849,23 @@ pub fn shape(
                             Some(peak),
                         )
                     }
-                    (None, _) => (
-                        whole_claim,
-                        whole_said("no run of it after them is kept"),
-                        None,
-                    ),
+                    (None, _) => match &closing_units {
+                        Some(e) => (
+                            aterm_capacity::peak_claim(e.peak),
+                            format!(
+                                "call {n} of {n}, the whole selection after the cuts, by the \
+                                 units no call before it builds, {} and a fifth more: no run of \
+                                 it after them is kept",
+                                e.from
+                            ),
+                            Some(e.peak),
+                        ),
+                        None => (
+                            whole_claim,
+                            whole_said("no run of it after them is kept"),
+                            None,
+                        ),
+                    },
                     (Some(e), None) => (
                         whole_claim,
                         whole_said(&format!(

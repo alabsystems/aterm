@@ -332,8 +332,9 @@ fn every_fleet_db_column_is_carried() {
     ] {
         assert_eq!(machine_value(column), Some(x), "{column}");
     }
-    // A placeholder minted from the dump stays planned: fleet_db called every row active.
-    assert_eq!(machine_value("status"), Some(json!("planned")));
+    // A word other than the `active` fleet_db wrote for every row is a statement: carried on a
+    // birth too.
+    assert_eq!(machine_value("status"), Some(json!("parked")));
     let preference = keys::preference_pk(&m, &account).unwrap();
     assert!(
         plan.planned
@@ -1305,14 +1306,19 @@ fn a_receiving_mailbox_nothing_holds_is_reported() {
 
 /// A placeholder stays `planned` when the same bytes are read again: fleet_db called every row
 /// `active`, so an import of an unknown machine settles at once. Any other word moves it.
-/// NEGATIVE CONTROL: with `held_planned` always false, the second read writes `active`, which the
-/// panic lists.
+/// NEGATIVE CONTROL: with `says_nothing` always false, the row is born `active`: `left:
+/// Some(String("active")) right: Some(String("planned"))`.
 #[test]
 fn a_placeholder_stays_planned_when_read_again() {
     let computer = |status: &str| computers(json!({"label": "m3", "status": status}));
     let read = sheets(&computer("active"), Mode::Authoritative);
     let mut book = Book::new();
-    let cells = apply(&mut book, &planned(&read, &Cells::new()));
+    let first = planned(&read, &Cells::new());
+    assert_eq!(
+        value(&first, "machine", &keys::machine_pk("m3"), "status"),
+        Some(&json!("planned"))
+    );
+    let cells = apply(&mut book, &first);
     let again = planned(&read, &cells);
     assert!(again.rows.is_empty(), "{:?}", again.planned);
     let moved = planned(&sheets(&computer("parked"), Mode::Authoritative), &cells);

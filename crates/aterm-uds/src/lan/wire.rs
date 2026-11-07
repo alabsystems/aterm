@@ -245,28 +245,44 @@ fn invalid(what: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what.into())
 }
 
-/// A frame's body being written.
-struct Out(Vec<u8>);
+trait WireBuffer {
+    fn put(&mut self, bytes: &[u8]);
+}
 
-impl Out {
+impl WireBuffer for Vec<u8> {
+    fn put(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+}
+
+impl WireBuffer for usize {
+    fn put(&mut self, bytes: &[u8]) {
+        *self = self.saturating_add(bytes.len());
+    }
+}
+
+/// The same encoding walk counts bytes or writes them, with no separate size grammar.
+struct Out<B>(B);
+
+impl<B: WireBuffer> Out<B> {
     fn u8(&mut self, value: u8) {
-        self.0.push(value);
+        self.0.put(&[value]);
     }
     fn u16(&mut self, value: u16) {
-        self.0.extend_from_slice(&value.to_be_bytes());
+        self.0.put(&value.to_be_bytes());
     }
     fn u32(&mut self, value: u32) {
-        self.0.extend_from_slice(&value.to_be_bytes());
+        self.0.put(&value.to_be_bytes());
     }
     fn i32(&mut self, value: i32) {
-        self.0.extend_from_slice(&value.to_be_bytes());
+        self.0.put(&value.to_be_bytes());
     }
     fn bool(&mut self, value: bool) {
         self.u8(u8::from(value));
     }
     fn bytes(&mut self, value: &[u8]) {
         self.u32(u32::try_from(value.len()).unwrap_or(u32::MAX));
-        self.0.extend_from_slice(value);
+        self.0.put(value);
     }
     fn text(&mut self, value: &str) {
         self.bytes(value.as_bytes());
@@ -278,11 +294,11 @@ impl Out {
         match value {
             IpAddr::V4(v4) => {
                 self.u8(4);
-                self.0.extend_from_slice(&v4.octets());
+                self.0.put(&v4.octets());
             }
             IpAddr::V6(v6) => {
                 self.u8(6);
-                self.0.extend_from_slice(&v6.octets());
+                self.0.put(&v6.octets());
             }
         }
     }
@@ -333,9 +349,9 @@ impl Out {
 }
 
 /// A frame's body being read: every read checks what is left first.
-struct In<'a>(&'a [u8]);
+struct In<'a, const OWN: bool>(&'a [u8]);
 
-impl<'a> In<'a> {
+impl<'a, const OWN: bool> In<'a, OWN> {
     fn take(&mut self, n: usize) -> io::Result<&'a [u8]> {
         if n > self.0.len() {
             return Err(invalid("a broker frame ends inside a field"));
@@ -368,18 +384,24 @@ impl<'a> In<'a> {
             other => Err(invalid(format!("a broker flag reads {other}"))),
         }
     }
-    fn bytes(&mut self, max: usize) -> io::Result<Vec<u8>> {
+    fn borrowed_bytes(&mut self, max: usize) -> io::Result<&'a [u8]> {
         let len = usize::try_from(self.u32()?).unwrap_or(usize::MAX);
         if len > max {
             return Err(invalid(format!(
                 "a broker field of {len} bytes is over its {max}-byte bound"
             )));
         }
-        Ok(self.take(len)?.to_vec())
+        self.take(len)
+    }
+    fn bytes(&mut self, max: usize) -> io::Result<Vec<u8>> {
+        let bytes = self.borrowed_bytes(max)?;
+        Ok(if OWN { bytes.to_vec() } else { Vec::new() })
     }
     fn text(&mut self) -> io::Result<String> {
-        String::from_utf8(self.bytes(MAX_TEXT)?)
-            .map_err(|_| invalid("a broker text field is not UTF-8"))
+        let bytes = self.borrowed_bytes(MAX_TEXT)?;
+        let value =
+            std::str::from_utf8(bytes).map_err(|_| invalid("a broker text field is not UTF-8"))?;
+        Ok(if OWN { value.to_owned() } else { String::new() })
     }
     /// A list's count, at most `max` and at most one item per byte left (each item is at least
     /// one byte), so the count alone allocates nothing.
@@ -423,11 +445,29 @@ impl<'a> In<'a> {
     }
     fn txt(&mut self) -> io::Result<Vec<Vec<u8>>> {
         let n = self.count(MAX_ITEMS)?;
-        (0..n).map(|_| self.bytes(MAX_TXT_ITEM)).collect()
+        self.items(n, |at| at.bytes(MAX_TXT_ITEM))
     }
     fn ips(&mut self) -> io::Result<Vec<IpAddr>> {
         let n = self.count(MAX_ITEMS)?;
-        (0..n).map(|_| self.ip()).collect()
+        self.items(n, Self::ip)
+    }
+    fn items<T>(
+        &mut self,
+        n: usize,
+        mut read: impl FnMut(&mut Self) -> io::Result<T>,
+    ) -> io::Result<Vec<T>> {
+        let mut items = if OWN {
+            Vec::with_capacity(n)
+        } else {
+            Vec::new()
+        };
+        for _ in 0..n {
+            let item = read(self)?;
+            if OWN {
+                items.push(item);
+            }
+        }
+        Ok(items)
     }
     fn instance(&mut self) -> io::Result<Instance> {
         Ok(Instance {
@@ -452,7 +492,25 @@ impl<'a> In<'a> {
 /// A body over [`MAX_FRAME`], or a field over its bound (`InvalidInput`): nothing is sent that the
 /// other side would refuse.
 pub fn encode(frame: &Frame) -> io::Result<Vec<u8>> {
-    let mut out = Out(vec![0; 4]);
+    let mut size = Out(0_usize);
+    frame_body(&mut size, frame);
+    let body = size.0;
+    if body > MAX_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("a broker frame of {body} bytes is over the {MAX_FRAME}-byte bound"),
+        ));
+    }
+    let mut out = Out(Vec::with_capacity(body + 4));
+    out.u32(u32::try_from(body).unwrap_or(u32::MAX));
+    frame_body(&mut out, frame);
+    // The receiver's own checks, run before a byte goes: nothing is sent it would refuse.
+    decode_by::<false>(&out.0[4..])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    Ok(out.0)
+}
+
+fn frame_body<B: WireBuffer>(out: &mut Out<B>, frame: &Frame) {
     match frame {
         Frame::Hello { protocol, build } => {
             out.u8(HELLO);
@@ -463,7 +521,7 @@ pub fn encode(frame: &Frame) -> io::Result<Vec<u8>> {
             out.u8(REFUSED);
             out.text(words);
         }
-        Frame::Request(request) => request_body(&mut out, request),
+        Frame::Request(request) => request_body(out, request),
         Frame::Socket { reached } => {
             out.u8(SOCKET);
             out.bool(reached.is_some());
@@ -478,28 +536,16 @@ pub fn encode(frame: &Frame) -> io::Result<Vec<u8>> {
                 out.ip(*addr);
             }
         }
-        Frame::Event(event) => event_body(&mut out, event),
+        Frame::Event(event) => event_body(out, event),
         Frame::Error { code, words } => {
             out.u8(ERROR);
             out.i32(*code);
             out.text(words);
         }
     }
-    let body = out.0.len() - 4;
-    if body > MAX_FRAME {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("a broker frame of {body} bytes is over the {MAX_FRAME}-byte bound"),
-        ));
-    }
-    // The receiver's own checks, run before a byte goes: nothing is sent it would refuse.
-    decode(&out.0[4..]).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    let length = u32::try_from(body).unwrap_or(u32::MAX).to_be_bytes();
-    out.0[..4].copy_from_slice(&length);
-    Ok(out.0)
 }
 
-fn request_body(out: &mut Out, request: &Request) {
+fn request_body<B: WireBuffer>(out: &mut Out<B>, request: &Request) {
     match request {
         Request::Connect {
             target,
@@ -586,7 +632,7 @@ fn request_body(out: &mut Out, request: &Request) {
     }
 }
 
-fn event_body(out: &mut Out, event: &Event) {
+fn event_body<B: WireBuffer>(out: &mut Out<B>, event: &Event) {
     out.u8(EVENT);
     match event {
         Event::Added(instance) => {
@@ -642,7 +688,14 @@ fn event_body(out: &mut Out, event: &Event) {
 /// `InvalidData`: an unknown tag, a field past the body's end or over its bound, text that is not
 /// UTF-8, or bytes past the last field.
 pub fn decode(body: &[u8]) -> io::Result<Frame> {
-    let mut at = In(body);
+    decode_by::<true>(body)
+}
+
+/// The same wire walk validates outgoing bytes without owning fields, or
+/// materializes an incoming frame. Both modes read and check every field.
+/// With `OWN = false`, only success/error is meaningful; owned fields are empty.
+fn decode_by<const OWN: bool>(body: &[u8]) -> io::Result<Frame> {
+    let mut at = In::<OWN>(body);
     let frame = match at.u8()? {
         HELLO => Frame::Hello {
             protocol: at.u32()?,
@@ -668,9 +721,7 @@ pub fn decode(body: &[u8]) -> io::Result<Frame> {
             let bind = at.sockaddr()?;
             let reuse = at.bool()?;
             let n = at.count(MAX_ITEMS)?;
-            let groups = (0..n)
-                .map(|_| Ok((at.ip()?, at.opt_u32()?)))
-                .collect::<io::Result<_>>()?;
+            let groups = at.items(n, |at| Ok((at.ip()?, at.opt_u32()?)))?;
             Frame::Request(Request::Udp {
                 bind,
                 reuse,
@@ -838,6 +889,7 @@ impl crate::spawn_lock::Descriptors for Took {
 #[derive(Debug)]
 pub struct Reader {
     buf: Vec<u8>,
+    start: usize,
     fds: Vec<OwnedFd>,
     max_fds: usize,
 }
@@ -849,6 +901,7 @@ impl Reader {
     pub const fn new(max_fds: usize) -> Self {
         Self {
             buf: Vec::new(),
+            start: 0,
             fds: Vec::new(),
             max_fds,
         }
@@ -857,7 +910,7 @@ impl Reader {
     /// Whether bytes past the last frame are waiting here.
     #[must_use]
     pub fn buffered(&self) -> bool {
-        !self.buf.is_empty()
+        self.start != self.buf.len()
     }
 
     /// The first descriptor passed so far, taken.
@@ -909,7 +962,7 @@ impl Reader {
             };
             self.fds.extend(took.fds);
             if took.bytes == 0 {
-                return if self.buf.is_empty() {
+                return if !self.buffered() {
                     Ok(None)
                 } else {
                     Err(io::Error::new(
@@ -918,13 +971,25 @@ impl Reader {
                     ))
                 };
             }
-            self.buf.extend_from_slice(&chunk[..took.bytes]);
+            self.append(&chunk[..took.bytes]);
         }
+    }
+
+    /// Compact an incomplete tail only when more bytes arrive. Complete frames
+    /// from the same receive advance an offset instead of moving that tail each time.
+    fn append(&mut self, bytes: &[u8]) {
+        if self.start != 0 {
+            self.buf.copy_within(self.start.., 0);
+            self.buf.truncate(self.buf.len() - self.start);
+            self.start = 0;
+        }
+        self.buf.extend_from_slice(bytes);
     }
 
     /// The frame at the head of the buffer, if it is all here.
     fn complete(&mut self) -> io::Result<Option<Frame>> {
-        let Some(prefix) = self.buf.first_chunk::<4>() else {
+        let waiting = &self.buf[self.start..];
+        let Some(prefix) = waiting.first_chunk::<4>() else {
             return Ok(None);
         };
         let len = usize::try_from(u32::from_be_bytes(*prefix)).unwrap_or(usize::MAX);
@@ -933,11 +998,15 @@ impl Reader {
                 "a broker frame of {len} bytes is over the {MAX_FRAME}-byte bound"
             )));
         }
-        let Some(body) = self.buf.get(4..4 + len) else {
+        let Some(body) = waiting.get(4..4 + len) else {
             return Ok(None);
         };
         let frame = decode(body)?;
-        self.buf.drain(..4 + len);
+        self.start += 4 + len;
+        if self.start == self.buf.len() {
+            self.buf.clear();
+            self.start = 0;
+        }
         Ok(Some(frame))
     }
 }
@@ -948,9 +1017,34 @@ mod tests {
 
     fn round(frame: &Frame) {
         let bytes = encode(frame).unwrap();
+        assert_eq!(
+            bytes.capacity(),
+            bytes.len(),
+            "encoded output retains only its wire size"
+        );
         assert_eq!(&decode(&bytes[4..]).unwrap(), frame);
         let len = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
         assert_eq!(len, bytes.len() - 4);
+        let body = &bytes[4..];
+        let parity = |body: &[u8]| {
+            let owned = decode(body)
+                .map(|_| ())
+                .map_err(|error| (error.kind(), error.to_string()));
+            let checked = decode_by::<false>(body)
+                .map(|_| ())
+                .map_err(|error| (error.kind(), error.to_string()));
+            assert_eq!(checked, owned, "ownership must not change wire validation");
+        };
+        for end in 0..=body.len() {
+            parity(&body[..end]);
+        }
+        for index in 0..body.len() {
+            for replacement in [0, 0x80, 0xff] {
+                let mut changed = body.to_vec();
+                changed[index] = replacement;
+                parity(&changed);
+            }
+        }
     }
 
     #[test]
@@ -1110,6 +1204,116 @@ mod tests {
         let refused = reader.frame(&ours, Some(deadline)).unwrap_err();
         assert_eq!(refused.kind(), io::ErrorKind::InvalidData, "{refused}");
         assert!(refused.to_string().contains("bound"), "{refused}");
+    }
+
+    #[test]
+    fn coalesced_frames_survive_every_partial_tail_and_refuse_a_bad_next_length() {
+        let frames = [
+            Frame::Socket { reached: None },
+            Frame::Hello {
+                protocol: 7,
+                build: "split".into(),
+            },
+            Frame::Refused {
+                words: "end".into(),
+            },
+        ];
+        let wire: Vec<_> = frames
+            .iter()
+            .flat_map(|frame| encode(frame).unwrap())
+            .collect();
+        for split in 0..=wire.len() {
+            let mut reader = Reader::new(0);
+            let mut found = Vec::new();
+            reader.append(&wire[..split]);
+            while let Some(frame) = reader.complete().unwrap() {
+                found.push(frame);
+            }
+            reader.append(&wire[split..]);
+            while let Some(frame) = reader.complete().unwrap() {
+                found.push(frame);
+            }
+            assert_eq!(found, frames, "split at {split}");
+            assert!(!reader.buffered());
+        }
+        let mut reader = Reader::new(0);
+        reader.append(&encode(&frames[0]).unwrap());
+        reader.append(&u32::try_from(MAX_FRAME + 1).unwrap().to_be_bytes());
+        assert_eq!(reader.complete().unwrap(), Some(frames[0].clone()));
+        assert_eq!(
+            reader.complete().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn a_consumed_frame_keeps_its_partial_successor_through_timeout_or_eof() {
+        let first = Frame::Socket { reached: None };
+        let second = Frame::Hello {
+            protocol: 7,
+            build: "tail".into(),
+        };
+        let encoded = encode(&second).unwrap();
+        for finish in [false, true] {
+            let (ours, mut theirs) = CtlStream::pair().unwrap();
+            let mut prefix = encode(&first).unwrap();
+            prefix.extend_from_slice(&encoded[..2]);
+            theirs.write_all(&prefix).unwrap();
+            let mut reader = Reader::new(0);
+            let deadline = Some(Instant::now() + std::time::Duration::from_secs(60));
+            assert_eq!(reader.frame(&ours, deadline).unwrap(), Some(first.clone()));
+            if finish {
+                assert_eq!(
+                    reader
+                        .frame(&ours, Some(Instant::now()))
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::TimedOut
+                );
+                theirs.write_all(&encoded[2..]).unwrap();
+                drop(theirs);
+                assert_eq!(reader.frame(&ours, deadline).unwrap(), Some(second.clone()));
+                assert!(!reader.buffered());
+                assert_eq!(reader.frame(&ours, deadline).unwrap(), None);
+            } else {
+                drop(theirs);
+                assert_eq!(
+                    reader.frame(&ours, deadline).unwrap_err().kind(),
+                    io::ErrorKind::UnexpectedEof
+                );
+                assert!(reader.buffered());
+            }
+        }
+    }
+
+    #[test]
+    fn a_large_successor_survives_compaction_and_multiple_receive_quanta() {
+        let frames = [
+            Frame::Socket { reached: None },
+            Frame::Event(Event::Record {
+                rrtype: 16,
+                rdata: vec![0x5a; 65_535],
+                ttl: 60,
+                interface: 7,
+                added: true,
+            }),
+        ];
+        let wire: Vec<_> = frames
+            .iter()
+            .flat_map(|frame| encode(frame).unwrap())
+            .collect();
+        for quantum in [3, 16 * 1024, 65_536] {
+            let mut reader = Reader::new(0);
+            let mut found = Vec::new();
+            for bytes in wire.chunks(quantum) {
+                reader.append(bytes);
+                while let Some(frame) = reader.complete().unwrap() {
+                    found.push(frame);
+                }
+            }
+            assert_eq!(found, frames, "receive quantum {quantum}");
+            assert!(!reader.buffered());
+        }
     }
 
     #[test]

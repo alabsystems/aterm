@@ -628,7 +628,9 @@ fn codex_reassignment_rechecks_policy_auth_and_record_custody_before_publication
                 "cli_auth_credentials_store='keyring'\n",
             )
             .unwrap(),
-            "config" => fs::write(&world.config, "[fleet]\nmachine='m22'\n").unwrap(),
+            "config" => {
+                crate::test_config::write(&world.config, "[fleet]\nmachine='m22'\n").unwrap()
+            }
             "source" => fs::write(
                 world.home.join(".secrets").join(cli_fleet_file(Cli::Codex)),
                 "",

@@ -530,25 +530,78 @@ fn vacuity(ty: &Path, _: &Options) -> Verdict {
     ))
 }
 
-fn dead_actions(transcript: &str) -> Vec<String> {
-    const MARKER: &str = "dead action(s) (never fired): ";
-    transcript
-        .lines()
-        .find_map(|l| l.find(MARKER).map(|i| &l[i + MARKER.len()..]))
-        .map(|names| {
-            // `ty` (store build 14383 on) also quotes the list inside a sentence, as in
-            // `…: A, B. It is not reflected in this run's verdict or exit code.`; a TLA+
-            // action name holds no `.`, so the list ends at the first one.
-            names
-                .split('.')
-                .next()
-                .unwrap_or_default()
-                .split(',')
-                .map(|n| n.trim().to_string())
-                .filter(|n| !n.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+struct TyCoverage {
+    states: u64,
+    actions: Vec<(String, u64)>,
+}
+
+fn action_coverage(bytes: &[u8]) -> Result<TyCoverage, String> {
+    let report: aterm_json::Value =
+        aterm_json::from_slice(bytes).map_err(|e| format!("invalid ty coverage JSON: {e}"))?;
+    if report.get("tool").and_then(aterm_json::Value::as_str) != Some("ty") {
+        return Err("coverage JSON does not identify ty".into());
+    }
+    let capabilities = report
+        .get("capabilities")
+        .and_then(aterm_json::Value::as_array)
+        .ok_or("ty coverage JSON has no capabilities")?;
+    if capabilities.iter().any(|value| value.as_str().is_none()) {
+        return Err("ty coverage JSON has malformed capabilities".into());
+    }
+    for required in ["check-json-contract-v2", "check-exact-source-v2"] {
+        if !capabilities.iter().any(|v| v.as_str() == Some(required)) {
+            return Err(format!("ty coverage JSON lacks {required}"));
+        }
+    }
+    if report
+        .get("completeness")
+        .and_then(aterm_json::Value::as_str)
+        != Some("exhaustive")
+        || report
+            .get("result")
+            .and_then(|v| v.get("status"))
+            .and_then(aterm_json::Value::as_str)
+            != Some("ok")
+    {
+        return Err("ty coverage JSON is not an exhaustive clean verdict".into());
+    }
+    let statistics = report
+        .get("statistics")
+        .ok_or("ty coverage JSON has no statistics")?;
+    let states = statistics
+        .get("states_found")
+        .and_then(aterm_json::Value::as_u64)
+        .filter(|states| *states > 0)
+        .ok_or("ty coverage JSON has no positive state count")?;
+    if statistics
+        .get("suppressed_guard_errors")
+        .and_then(aterm_json::Value::as_u64)
+        != Some(0)
+    {
+        return Err("ty coverage JSON does not establish zero suppressed guard errors".into());
+    }
+    let mut actions = Vec::new();
+    if let Some(rows) = report.get("actions_detected") {
+        for row in rows
+            .as_array()
+            .ok_or("ty action coverage is not an array")?
+        {
+            let name = row
+                .get("name")
+                .and_then(aterm_json::Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or("ty action coverage has no action name")?;
+            let occurrences = row
+                .get("occurrences")
+                .and_then(aterm_json::Value::as_u64)
+                .ok_or("ty action coverage has no occurrence count")?;
+            if actions.iter().any(|(seen, _)| seen == name) {
+                return Err(format!("ty action coverage repeats {name}"));
+            }
+            actions.push((name.to_owned(), occurrences));
+        }
+    }
+    Ok(TyCoverage { states, actions })
 }
 
 fn vacuity_of(ty: &Path, all: &[Model]) -> Result<usize, String> {
@@ -562,7 +615,12 @@ fn vacuity_of(ty: &Path, all: &[Model]) -> Result<usize, String> {
         verify::write_scratch(&tla, config.to_tla()).map_err(|e| e.to_string())?;
         verify::write_scratch(&cfg, config.to_cfg()).map_err(|e| e.to_string())?;
         let mut cmd = verify::TyCommand::check(ty, &tla, &cfg);
-        cmd.arg("--strict-vacuity").arg("--coverage");
+        cmd.arg("--strict-vacuity")
+            .arg("--coverage")
+            .arg("--output")
+            .arg("json")
+            .arg("--no-cache")
+            .arg("--no-gpu");
         if auditable {
             cmd.arg("--allow-vacuous=dead-action");
         }
@@ -585,12 +643,26 @@ fn vacuity_of(ty: &Path, all: &[Model]) -> Result<usize, String> {
                 }
             ));
         }
+        let coverage =
+            action_coverage(&out.stdout).map_err(|why| format!("{label}: {why}\n{text}"))?;
+        if coverage.actions.is_empty() && !config.actions.is_empty() {
+            return Err(format!("{label}: ty reported no action coverage\n{text}"));
+        }
+        let reported: Vec<&str> = coverage
+            .actions
+            .iter()
+            .filter(|(_, count)| *count == 0)
+            .map(|(name, _)| name.as_str())
+            .collect();
         if !auditable {
+            if !reported.is_empty() {
+                return Err(format!(
+                    "{label}: strict ty verdict retained dead actions\n{text}"
+                ));
+            }
             continue;
         }
-        verify::assert_ty_saw_whole_space(config, &text, LABEL);
-        let reported = dead_actions(&text);
-        let reported: Vec<&str> = reported.iter().map(String::as_str).collect();
+        verify::assert_ty_saw_whole_space_count(config, coverage.states, &text, LABEL);
         verify::dead_actions_agree(config, &reported).map_err(|why| format!("{label}: {why}"))?;
     }
     if !auditable {
@@ -953,29 +1025,82 @@ mod tests {
         );
     }
 
+    fn coverage_fixture() -> aterm_json::Value {
+        aterm_json::json!({
+            "tool": "ty",
+            "capabilities": ["check-json-contract-v2", "check-exact-source-v2"],
+            "completeness": "exhaustive",
+            "result": {"status": "ok"},
+            "statistics": {"states_found": 2, "suppressed_guard_errors": 0},
+            "actions_detected": [
+                {"name": "Live", "occurrences": 1},
+                {"name": "Dead", "occurrences": 0}
+            ],
+            "diagnostics": {"notes": ["dead action(s) (never fired): wrong prose. Additional text."]}
+        })
+    }
+
     #[test]
-    fn the_dead_action_report_is_read_in_both_forms() {
+    fn action_coverage_uses_structured_counts_instead_of_diagnostic_prose() {
+        let report = action_coverage(&aterm_json::to_vec(&coverage_fixture()).unwrap()).unwrap();
+        assert_eq!(report.states, 2);
         assert_eq!(
-            dead_actions("Warning: vacuous: 2 dead action(s) (never fired): A, B\n"),
-            ["A", "B"]
+            report.actions,
+            [("Live".to_owned(), 1), ("Dead".to_owned(), 0)]
         );
-        assert_eq!(
-            dead_actions(
-                "note: vacuity warning downgraded by --allow-vacuous=dead-action: 1 dead \
-                 action(s) (never fired): Slip\n"
+    }
+
+    #[test]
+    fn action_coverage_refuses_incomplete_or_malformed_evidence() {
+        use aterm_json::json;
+        let mutations = [
+            ("tool", json!("other")),
+            ("capabilities", json!([])),
+            (
+                "capabilities",
+                json!([false, "check-json-contract-v2", "check-exact-source-v2"]),
             ),
-            ["Slip"]
-        );
-        // ty store build 14383's first such line, on stdout before the note on stderr.
-        assert_eq!(
-            dead_actions(
-                "  SOUNDNESS_DEVIATION: a vacuity warning was suppressed by \
-                 --allow-vacuous=dead-action: 2 dead action(s) (never fired): Never, Never2. It \
-                 is not reflected in this run's verdict or exit code.\n"
+            ("completeness", json!("bounded")),
+            ("result", json!({"status": "error"})),
+            (
+                "statistics",
+                json!({"states_found": 0, "suppressed_guard_errors": 0}),
             ),
-            ["Never", "Never2"]
-        );
-        assert!(dead_actions("No errors found (exhaustive).\n").is_empty());
+            (
+                "statistics",
+                json!({"states_found": -1, "suppressed_guard_errors": 0}),
+            ),
+            (
+                "statistics",
+                json!({"states_found": 2, "suppressed_guard_errors": 1}),
+            ),
+            ("statistics", json!({})),
+            ("actions_detected", json!(null)),
+            ("actions_detected", json!([{"name": "", "occurrences": 1}])),
+            (
+                "actions_detected",
+                json!([{"name": "Live", "occurrences": -1}]),
+            ),
+            (
+                "actions_detected",
+                json!([
+                    {"name": "Repeated", "occurrences": 0},
+                    {"name": "Repeated", "occurrences": 1}
+                ]),
+            ),
+        ];
+        for (index, (field, replacement)) in mutations.into_iter().enumerate() {
+            let mut report = coverage_fixture();
+            report
+                .as_object_mut()
+                .unwrap()
+                .insert(field.into(), replacement);
+            assert!(
+                action_coverage(&aterm_json::to_vec(&report).unwrap()).is_err(),
+                "invalid evidence {index} was accepted: {report}"
+            );
+        }
+        assert!(action_coverage(b"not JSON").is_err());
     }
 
     #[test]

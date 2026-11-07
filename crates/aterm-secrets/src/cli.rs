@@ -99,7 +99,8 @@ admin (a machine in [admins]):
   aterm secrets revoke <host|code> [--drop-sections] [--stolen]
                                          remove it from the vault: where this Mac is seated in
                                          the vault's membership log, as `aterm members remove`
-                                         (any member, no admin key); else, as an admin (first
+                                         of a name (any member, no admin key; a label is the
+                                         log's, never the registry's); else, as an admin (first
                                          retiring its Commons membership, denying its swarm
                                          label/node, and releasing its pool slots); either way
                                          it rotates aterm-fleet-code; --stolen also prints a
@@ -4322,23 +4323,38 @@ mod unix {
             }
             return Ok(ExitCode::SUCCESS);
         }
-        if let Some(name) = vault_admin.as_deref().filter(|_| !drop_sections) {
-            println!(
-                "{name} is an admin of the vault 0.145 Macs read: revoking with the admin key, \
-                 which rotates the signing key it holds (`aterm members remove {name}` removes it \
-                 from the membership log alone, leaving it that key)"
-            );
-        } else if !drop_sections && by_log {
+        if vault_admin.is_none() && !drop_sections && by_log {
             println!(
                 "{host} has no seat in this Mac's membership log (a founder that proved no device \
                  key, or a Mac only the vault's machine list names): revoking with the admin key"
             );
-        } else if !drop_sections {
+        } else if vault_admin.is_none() && !drop_sections {
             println!(
                 "this Mac removes no Mac through a membership log here: revoking with the admin key"
             );
         }
         let admin = client::admin_open(paths)?;
+        if let Some(name) = vault_admin.as_deref().filter(|_| !drop_sections) {
+            // The advice names the Mac by its age recipient, which `aterm members remove` reads
+            // from the log alone: a label there is the registry's, which can name another Mac.
+            let recipient = admin
+                .doc
+                .machines()
+                .iter()
+                .find(|machine| machine.name == name)
+                .map(|machine| machine.recipient.clone());
+            match recipient {
+                Some(recipient) => println!(
+                    "{name} is an admin of the vault 0.145 Macs read: revoking with the admin \
+                     key, which rotates the signing key it holds (`aterm members remove \
+                     {recipient}` removes it from the membership log alone, leaving it that key)"
+                ),
+                None => println!(
+                    "{name} is an admin of the vault 0.145 Macs read: revoking with the admin \
+                     key, which rotates the signing key it holds"
+                ),
+            }
+        }
         let host = &client::machine_named_in_vault(paths, &admin, host)?;
         let held = exposure(&admin.doc, host);
         if stolen {

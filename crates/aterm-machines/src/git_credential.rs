@@ -58,29 +58,90 @@ const SETTINGS: &str = r"^(credential\..*|includeif\..*\.path)$";
 const INCLUDE_DEPTH: usize = 10;
 
 /// aterm's own GitHub HTTPS credential helper: `aterm secrets git-credential`, run by the
-/// launcher aterm's install puts at `~/.local/bin/aterm`, over the vault's token or the token
-/// file init.toml's `[github]` names. It reads files and never the login keychain, and answers
-/// `get` alone.
+/// installed command selected for this account, over the vault's token or the token file
+/// init.toml's `[github]` names. It reads files and never the login keychain, and answers `get`
+/// alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Helper {
     value: String,
 }
 
 impl Helper {
-    /// The launcher aterm's install puts in `user`'s `~/.local/bin` (`atpkg repair` puts it
-    /// back), which runs the installed aterm wherever its app is.
-    pub(crate) fn launcher(user: &User) -> PathBuf {
-        Path::new(&user.home).join(".local/bin/aterm")
+    /// This account's declared command, or the ordered legacy locations only when no
+    /// declaration exists. A refused or malformed declaration never selects another command.
+    pub(crate) fn locations(sys: &dyn System, user: &User) -> std::io::Result<Vec<PathBuf>> {
+        use aterm_types::installed_command as command;
+        let read = sys.read_owned_file(
+            &command::path(Path::new(&user.home)),
+            user.uid,
+            command::MAX_BYTES,
+            false,
+        );
+        Self::locations_from(user, read.as_deref().map_err(std::io::Error::kind))
+    }
+
+    /// Decode the same selection from an observer's bounded owned-file reading. The result
+    /// names locations only and grants no permission to use or execute them.
+    pub(crate) fn locations_from(
+        user: &User,
+        read: Result<&[u8], std::io::ErrorKind>,
+    ) -> std::io::Result<Vec<PathBuf>> {
+        use aterm_types::installed_command as command;
+        match read {
+            Ok(bytes) => command::Selection::decode(bytes)
+                .map(|selection| vec![selection.executable().to_path_buf()])
+                .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidData, why)),
+            Err(std::io::ErrorKind::NotFound) => Ok(command::legacy(Path::new(&user.home)).into()),
+            Err(kind) => Err(kind.into()),
+        }
+    }
+
+    /// The selected executable spelling and its current regular-file target. The declaration
+    /// is read afresh, including when a root caller acts for another account.
+    pub(crate) fn target(sys: &dyn System, user: &User) -> std::io::Result<(PathBuf, PathBuf)> {
+        let mut missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        for path in Self::locations(sys, user)? {
+            let target = sys.canonicalize(&path).and_then(|target| {
+                let stat = sys.stat(&target)?;
+                if stat.dir {
+                    return Err(std::io::ErrorKind::InvalidInput.into());
+                }
+                Ok(target)
+            });
+            match target {
+                Ok(target) => return Ok((path, target)),
+                Err(why) => missing = why,
+            }
+        }
+        Err(missing)
+    }
+
+    /// Why this account currently has no usable installed helper, naming no credential.
+    pub(crate) fn unavailable(sys: &dyn System, user: &User) -> String {
+        match Self::locations(sys, user) {
+            Ok(paths) => format!(
+                "aterm's GitHub helper has no regular installed command at {}; repair its installation",
+                paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            ),
+            Err(_) => format!(
+                "aterm's installed-command declaration at {} is unreadable or invalid; its helper waits for that account's installation",
+                aterm_types::installed_command::path(Path::new(&user.home)).display()
+            ),
+        }
     }
 
     /// The helper over the vault's `~/.secrets/gh_access_token`; `None` while `user` has no
-    /// launcher ([`Self::launcher`]) or it is a link to nothing.
+    /// installed command or it is a link to nothing.
     pub(crate) fn vault(sys: &dyn System, user: &User) -> Option<Self> {
         Self::run(sys, user, String::new())
     }
 
     /// The helper over `token_file` (the line of it `token_key` names, when one does), answering
-    /// as `account`; `None` while `user` has no launcher.
+    /// as `account`; `None` while `user` has no usable installed command.
     pub(crate) fn token_file(
         sys: &dyn System,
         user: &User,
@@ -101,11 +162,7 @@ impl Helper {
     }
 
     fn run(sys: &dyn System, user: &User, options: String) -> Option<Self> {
-        let launcher = Self::launcher(user);
-        // The launcher is a link into the installed app, so the file behind it decides: a
-        // dangling link is no launcher, and a helper written over one fails every lookup.
-        let installed = sys.canonicalize(&launcher).ok()?;
-        sys.stat(&installed).ok().filter(|stat| !stat.dir)?;
+        let (launcher, _) = Self::target(sys, user).ok()?;
         Some(Self {
             value: format!(
                 "!{} secrets git-credential{options}",
@@ -260,11 +317,7 @@ impl Git {
         token: &Secret,
     ) -> Result<Lookups, String> {
         let Some(helper) = helper else {
-            return Ok(Lookups::Not(format!(
-                "aterm's GitHub helper runs {}, which is not there (aterm's install puts it \
-                 there; atpkg repair puts it back)",
-                Helper::launcher(user).display()
-            )));
+            return Ok(Lookups::Not(Helper::unavailable(sys, user)));
         };
         Ok(match self.fill(sys, user, helper)? {
             Some(held) if held.bytes() == token.bytes() => Lookups::Ready,
@@ -1019,7 +1072,10 @@ pub(crate) mod script {
 
     /// `user`'s launcher in place on `sys`, so aterm's helper ([`Helper::vault`]) is there.
     pub(crate) fn launcher(sys: &Fake, user: &User) {
-        sys.file(&Helper::launcher(user).to_string_lossy(), b"launcher");
+        sys.file(
+            &aterm_types::installed_command::legacy(Path::new(&user.home))[0].to_string_lossy(),
+            b"launcher",
+        );
     }
 
     /// aterm's helper over the vault's token, as it reads for `user` with the launcher there.
@@ -2016,7 +2072,8 @@ mod tests {
             panic!("no route is not ready");
         };
         assert!(
-            why.contains("/Users//alice/.local/bin/aterm") && why.contains("atpkg repair"),
+            why.contains("/Users//alice/.local/bin/aterm")
+                && why.contains("repair its installation"),
             "{why}"
         );
         assert!(sys.calls().is_empty(), "nothing ran");
@@ -2051,6 +2108,32 @@ mod tests {
                 .is_err(),
             "two passwords are no answer"
         );
+        let declared = PathBuf::from("/custom store/aterm");
+        let record = aterm_types::installed_command::path(Path::new(&who.home));
+        let bytes = aterm_types::installed_command::Selection::new(declared.clone())
+            .unwrap()
+            .encode()
+            .unwrap();
+        sys.file(record.to_str().unwrap(), &bytes).stat_of(
+            record.to_str().unwrap(),
+            crate::port::Stat {
+                uid: who.uid,
+                gid: who.gid,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: bytes.len() as u64,
+            },
+        );
+        sys.file(declared.to_str().unwrap(), b"declared command");
+        let helper = Helper::vault(&sys, &who).unwrap();
+        script::hands_back(&sys, &who, &helper, TOKEN);
+        assert!(
+            git.lookups(&sys, &who, Some(&helper), &token)
+                .unwrap()
+                .ready()
+        );
+        assert!(sys.calls().last().unwrap().contains("/custom store/aterm"));
     }
 
     /// A network git carries aterm's route last on the command line: the helper list
@@ -2098,6 +2181,31 @@ mod tests {
             Helper::vault(&sys, &dir).unwrap().value(),
             "!'/Users//alice/a dir/.local/bin/aterm' secrets git-credential"
         );
+        let custom = PathBuf::from("/custom store/aterm");
+        let custom_bin = "/custom bin/aterm";
+        sys.link(custom_bin, custom.to_str().unwrap());
+        sys.file(custom.to_str().unwrap(), b"installed command");
+        let record = aterm_types::installed_command::path(Path::new(&who.home));
+        let bytes = aterm_types::installed_command::Selection::new(custom)
+            .unwrap()
+            .encode()
+            .unwrap();
+        sys.file(record.to_str().unwrap(), &bytes).stat_of(
+            record.to_str().unwrap(),
+            crate::port::Stat {
+                uid: who.uid,
+                gid: who.gid,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: bytes.len() as u64,
+            },
+        );
+        assert_eq!(
+            Helper::vault(&sys, &who).unwrap().value(),
+            "!'/custom store/aterm' secrets git-credential",
+            "the stable declaration wins over an existing legacy launcher and custom BIN link"
+        );
     }
 
     /// The launcher is a link into the installed app, so the file behind it decides. Negative
@@ -2107,7 +2215,7 @@ mod tests {
     fn a_launcher_link_to_nothing_is_no_launcher() {
         let who = alice();
         let app = "/Applications/aterm.app/Contents/MacOS/aterm";
-        let launcher = Helper::launcher(&who);
+        let [launcher, store] = aterm_types::installed_command::legacy(Path::new(&who.home));
         let launcher = launcher.to_str().unwrap();
         let sys = Fake::default();
         sys.link(launcher, app);
@@ -2133,6 +2241,92 @@ mod tests {
         let sys = Fake::default();
         script::launcher(&sys, &who);
         assert!(Helper::vault(&sys, &who).is_some(), "a plain file");
+
+        let sys = Fake::root();
+        sys.file(store.to_str().unwrap(), b"legacy store command");
+        assert!(
+            Helper::vault(&sys, &who)
+                .unwrap()
+                .value()
+                .contains(store.to_str().unwrap()),
+            "an absent declaration can use the legacy store when BIN is absent"
+        );
+        script::launcher(&sys, &who);
+        let record = aterm_types::installed_command::path(Path::new(&who.home));
+        let declared = PathBuf::from("/custom store/aterm");
+        let bytes = aterm_types::installed_command::Selection::new(declared.clone())
+            .unwrap()
+            .encode()
+            .unwrap();
+        let policy = crate::port::Stat {
+            uid: who.uid,
+            gid: who.gid,
+            mode: 0o600,
+            dir: false,
+            symlink: false,
+            len: bytes.len() as u64,
+        };
+        sys.file(record.to_str().unwrap(), &bytes)
+            .stat_of(record.to_str().unwrap(), policy);
+        assert_eq!(
+            Helper::vault(&sys, &who),
+            None,
+            "declared missing target does not fall back"
+        );
+        sys.file(declared.to_str().unwrap(), b"repaired command");
+        assert!(
+            Helper::vault(&sys, &who)
+                .unwrap()
+                .value()
+                .contains("/custom store/aterm")
+        );
+        sys.stat_of(
+            declared.to_str().unwrap(),
+            crate::port::Stat {
+                dir: true,
+                ..policy
+            },
+        );
+        assert_eq!(
+            Helper::vault(&sys, &who),
+            None,
+            "a declared directory does not fall back"
+        );
+        sys.stat_of(
+            declared.to_str().unwrap(),
+            crate::port::Stat {
+                dir: false,
+                ..policy
+            },
+        );
+        sys.stat_of(
+            record.to_str().unwrap(),
+            crate::port::Stat { uid: 0, ..policy },
+        );
+        assert_eq!(
+            Helper::vault(&sys, &who),
+            None,
+            "root cannot borrow a foreign-owned Alice declaration"
+        );
+        sys.stat_of(record.to_str().unwrap(), policy);
+        sys.file(
+            "/var/root/.config/aterm/installed-command.json",
+            b"unrelated root record",
+        );
+        assert!(
+            Helper::vault(&sys, &who).is_some(),
+            "root acting for Alice uses Alice's owned record"
+        );
+        sys.file(record.to_str().unwrap(), b"malformed");
+        assert_eq!(
+            Helper::vault(&sys, &who),
+            None,
+            "malformed never falls back"
+        );
+        assert!(
+            sys.calls().is_empty(),
+            "no arbitrary current executable or PATH program is probed"
+        );
     }
 
     /// git tries askpass before it looks at `GIT_TERMINAL_PROMPT`, so a person's `core.askPass`

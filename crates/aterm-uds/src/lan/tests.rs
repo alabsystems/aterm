@@ -214,6 +214,13 @@ fn no_broker_is_not_installed_and_says_what_installs_it() {
     let io = missing.into_io();
     assert_eq!(io.kind(), std::io::ErrorKind::NotConnected);
     assert!(io.to_string().contains("not installed"), "{io}");
+    // The io error keeps the typed refusal, so a caller above it names a held LAN, not a failed
+    // dial; a plain NotConnected carries none.
+    assert_eq!(Unavailable::of(&io), Some(&Unavailable::NotInstalled));
+    assert_eq!(
+        Unavailable::of(&std::io::Error::from(std::io::ErrorKind::NotConnected)),
+        None
+    );
     // A socket file nobody listens on refuses the connect: also not installed.
     let stale = root.path().join("stale.sock");
     drop(crate::CtlListener::bind(&stale).unwrap());
@@ -420,4 +427,20 @@ fn events_wait_within_a_bound_and_end_when_the_broker_closes() {
 #[test]
 fn a_build_id_is_named_in_each_hello() {
     assert!(!hello_build().is_empty());
+}
+
+/// A dial that reached no peer reads as one whether it went through the broker or not, the
+/// host-down errno std leaves uncategorized included; a held LAN or a local refusal is not one.
+#[test]
+fn a_dial_that_reached_no_peer_reads_as_one_through_the_broker_too() {
+    assert!(reached_no_peer(&std::io::Error::from_raw_os_error(
+        libc::EHOSTDOWN
+    )));
+    for code in [libc::EHOSTDOWN, libc::ECONNREFUSED, libc::ETIMEDOUT] {
+        assert!(reached_no_peer(&broker::failed(code, "fixture")), "{code}");
+    }
+    assert!(!reached_no_peer(&broker::failed(libc::EACCES, "fixture")));
+    assert!(!reached_no_peer(
+        &LanError::Unavailable(Unavailable::NotInstalled).into_io()
+    ));
 }

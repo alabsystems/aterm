@@ -206,20 +206,20 @@ mod tests {
         // The probe preserves the interpreter prefix and replaces only the
         // engine operation, never asking Python to execute scanner-preflight.
         let mut interpreted = command("/held/python3.14");
-        interpreted.args(["-I", "/engine/bin/pub", "stage", "aterm"]);
+        interpreted.args(["-I", "-u", "/engine/bin/pub", "stage", "aterm"]);
         interpreted
             .current_dir(&candidate)
             .env("PATH", "/held:/usr/bin");
         prepare(
             &interpreted,
-            2,
+            3,
             &dir.path().join("interpreted.json"),
             &[&candidate],
             |probe| {
                 assert_eq!(probe.get_program(), interpreted.get_program());
                 assert_eq!(
                     probe.get_args().collect::<Vec<_>>(),
-                    ["-I", "/engine/bin/pub", "scanner-preflight"]
+                    ["-I", "-u", "/engine/bin/pub", "scanner-preflight"]
                 );
                 assert_eq!(probe.get_current_dir(), interpreted.get_current_dir());
                 assert_eq!(

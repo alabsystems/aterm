@@ -199,6 +199,7 @@ fn run_as(
             not_own_account: not_own,
             develop: None,
             docs: None,
+            tuning: None,
             wait: None,
         },
     );
@@ -237,6 +238,7 @@ fn run_beside(
             not_own_account: None,
             develop: None,
             docs: None,
+            tuning: None,
             wait,
         },
     )
@@ -956,6 +958,7 @@ fn readiness_distinguishes_confirmed_state_from_plans_manual_steps_and_unknowns(
             not_own_account: None,
             develop: None,
             docs: None,
+            tuning: None,
             wait: None,
         },
     );
@@ -978,6 +981,7 @@ fn shell_and(scratch: &Scratch, words: &[&str], rows: &[ItemReport]) -> Ran {
             not_own_account: None,
             develop: None,
             docs: None,
+            tuning: None,
             wait: None,
         },
     )
@@ -994,6 +998,7 @@ fn injected(shell: Mark, words: &[&str], rows: &[ItemReport]) -> Ran {
             not_own_account: None,
             develop: None,
             docs: None,
+            tuning: None,
             wait: None,
         },
     )
@@ -1303,6 +1308,7 @@ fn reads(scratch: &Scratch, words: &[&str]) -> (Ran, Vec<Vec<String>>, usize) {
             not_own_account: None,
             develop: None,
             docs: None,
+            tuning: None,
             wait: None,
         },
     );
@@ -1379,6 +1385,7 @@ fn the_packages_are_read_beside_the_gather() {
                 not_own_account: None,
                 develop: None,
                 docs: None,
+                tuning: None,
                 wait: None,
             },
         );
@@ -1763,6 +1770,39 @@ fn base_clt_waits_out_a_first_compile_slower_than_a_status_read() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn base_clt_checks_the_installed_sdk_without_a_builds_sdkroot_override() {
+    use atpkg::prereq::{CcHost, CcVerdict};
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let cc = root.path().join("cc");
+    std::fs::write(
+        &cc,
+        "#!/bin/sh\n[ \"$1\" = --version ] && { echo cc; exit 0; }\nif [ -n \"$SDKROOT\" ]; then echo 'build SDK unavailable' >&2; exit 1; fi\nprintf x > \"$2\"\n",
+    ).unwrap();
+    std::fs::set_permissions(&cc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let host = CcHost {
+        shim_dir: None,
+        xcode_select_link: root.path().join("no-selection"),
+        default_developer_dir: root.path().join("developer"),
+        xcode_developer_dir: None,
+        developer_dir_override: None,
+        sdkroot_override: Some(root.path().join("unavailable-build-sdk")),
+        bound: std::time::Duration::from_secs(60),
+        tmp_root: root.path().to_owned(),
+    };
+    let path = Some(root.path().as_os_str());
+    assert!(matches!(
+        atpkg::prereq::probe_with(path, &host),
+        CcVerdict::Broken { why, .. } if why == "build SDK unavailable"
+    ));
+    assert_eq!(
+        super::base_clt_probe_on(path, host),
+        CcVerdict::Ready { driver: cc }
+    );
+}
+
 /// A develop layer stand-in (macOS's is `aterm_machines::init::Doctor`): the rows its items
 /// read, whether its profile could not be read, and what doctor asked of it.
 #[derive(Default)]
@@ -1887,6 +1927,7 @@ fn run_developing(
                 compose: &compose,
             }),
             docs: None,
+            tuning: None,
             wait: None,
         },
     );
@@ -2863,6 +2904,7 @@ fn bare_doctor_sets_indexed_rust_docs_aside_and_builds_nothing_otherwise() {
                 not_own_account: not_own,
                 develop: None,
                 docs: Some(&repair),
+                tuning: None,
                 wait: None,
             },
         )
@@ -2914,6 +2956,209 @@ fn bare_doctor_sets_indexed_rust_docs_aside_and_builds_nothing_otherwise() {
         (built.get(), Docs::count(&docs.probes)),
         before,
         "nothing built or read without indexed docs, or outside the account's own shell"
+    );
+}
+
+/// The clones' tuning stand-in: the workstation item bare doctor binds, `$HOME/trust` differing from
+/// its declaration until its apply tunes it; each probe and apply counted.
+struct Tuning {
+    due: std::sync::atomic::AtomicBool,
+    probes: std::sync::atomic::AtomicUsize,
+    applies: std::sync::atomic::AtomicUsize,
+}
+
+impl aterm_converge::Item for &Tuning {
+    fn id(&self) -> String {
+        "init.github.tuning@alice".into()
+    }
+
+    fn family(&self) -> &'static str {
+        "github"
+    }
+
+    fn layer(&self) -> aterm_converge::Layer {
+        aterm_converge::Layer::Workstation
+    }
+
+    fn class(&self) -> aterm_converge::Class {
+        aterm_converge::Class::Relay
+    }
+
+    fn title(&self) -> String {
+        "git tuning of the vault's clones".into()
+    }
+
+    fn probe(&self) -> aterm_converge::Probe {
+        self.probes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.due.load(std::sync::atomic::Ordering::SeqCst) {
+            aterm_converge::Probe::Change {
+                from: "$HOME/trust: core.untrackedCache and feature.manyFiles unset, index format 2"
+                    .into(),
+                to: "tuned as each declares in its scripts/git-clone.gitconfig".into(),
+            }
+        } else {
+            aterm_converge::Probe::Ok {
+                now: "1 vault clone on this Mac, each as it declares".into(),
+            }
+        }
+    }
+
+    fn apply(&self) -> Result<(), String> {
+        self.applies
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.due.store(false, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn explain(&self, _: &aterm_converge::Probe) -> aterm_converge::Explain {
+        aterm_converge::Explain {
+            why: "a vault clone differs from its declaration".into(),
+            remedy: aterm_converge::Remedy::Command(
+                "aterm doctor --only init.github.tuning".into(),
+            ),
+        }
+    }
+
+    fn detail(&self) -> Option<String> {
+        (self.applies.load(std::sync::atomic::Ordering::SeqCst) > 0)
+            .then(|| "tuned $HOME/trust (index format 2 -> 4)".into())
+    }
+}
+
+/// BARE DOCTOR TUNES THE VAULT'S CLONES: the workstation item is built over the account's state
+/// root and applied as a relay-class repair, journaled, with what it tuned on the verdict line;
+/// `--read-only --only init.github.tuning` names the differing clone in a row whose fix is bare
+/// doctor and applies nothing, and `--only init.github.tuning` applies it. A second run changes
+/// nothing. The row's full id (`@alice`) names it too, and another login's names nothing of it.
+/// NEGATIVE CONTROLS: a word that names something else, a shell that is not the account's own,
+/// and a run with no state root never build it.
+#[test]
+fn bare_doctor_tunes_the_vault_clones_and_read_only_names_them() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let scratch = broken("clone-tuning");
+    run(&scratch, Mark::Ok, &[], true);
+    let tuning = Tuning {
+        due: AtomicBool::new(true),
+        probes: AtomicUsize::new(0),
+        applies: AtomicUsize::new(0),
+    };
+    let built = std::cell::Cell::new(0);
+    let state = scratch.root.join("state");
+    let repair = |at: &Path| -> Result<Vec<Box<dyn aterm_converge::Item + '_>>, String> {
+        assert_eq!(at, state.as_path(), "built over the account's state root");
+        built.set(built.get() + 1);
+        Ok(vec![Box::new(&tuning)])
+    };
+    let ground = scratch.ground();
+    let gather =
+        |_, _: &[String]| Gathered::of_facts(&[("shell:", Mark::Ok, "/bin/sh (executable)")]);
+    let doctor = |words: &[&str], journaled: bool, not_own: Option<&'static str>| {
+        super::run(
+            &args(words),
+            &Ports {
+                gather: &gather,
+                ground: Some(&ground),
+                packages: &Vec::new,
+                state: journaled.then_some(state.as_path()),
+                not_own_account: not_own,
+                develop: None,
+                docs: None,
+                tuning: Some(super::TuningRepair {
+                    id: "init.github.tuning",
+                    family: "github",
+                    build: &repair,
+                }),
+                wait: None,
+            },
+        )
+    };
+    let applies = || tuning.applies.load(Ordering::SeqCst);
+
+    let ran = doctor(&["--read-only", "--only", "init.github.tuning"], true, None);
+    assert_eq!(built.get(), 1);
+    assert_eq!(applies(), 0, "read-only applies nothing");
+    assert_eq!(ran.code, 1, "{}", ran.text);
+    let rows = rows_of(&ran.text, "clones:");
+    assert!(
+        rows.len() == 1
+            && mark(rows[0]) == "warn"
+            && rows[0].contains("$HOME/trust: core.untrackedCache and feature.manyFiles unset")
+            && rows[0].ends_with("fix: bare `aterm doctor` tunes them as each declares"),
+        "{}",
+        ran.text
+    );
+    let json = report(&doctor(
+        &["--read-only", "--json", "--only", "init.github.tuning"],
+        true,
+        None,
+    ));
+    let row = json
+        .items
+        .iter()
+        .find(|row| row.id == "init.github.tuning@alice")
+        .expect("the tuning row");
+    assert_eq!(row.outcome, Outcome::Planned);
+    assert_eq!(row.layer, Some(aterm_converge::Layer::Workstation));
+    // The row's own id, its login's name included, names it; another login's names none of it.
+    let ran = doctor(
+        &["--read-only", "--only", "init.github.tuning@alice"],
+        true,
+        None,
+    );
+    assert_eq!(rows_of(&ran.text, "clones:").len(), 1, "{}", ran.text);
+    let ran = doctor(&["--only", "init.github.tuning@bob"], true, None);
+    assert!(
+        ran.text
+            .contains("--only init.github.tuning@bob: names another login's clones"),
+        "{}",
+        ran.text
+    );
+    assert_eq!(applies(), 0, "nothing applied for either: {}", ran.text);
+
+    let ran = doctor(&["--only", "init.github.tuning"], true, None);
+    assert_eq!(applies(), 1, "{}", ran.text);
+    assert!(
+        ran.text
+            .lines()
+            .next()
+            .unwrap()
+            .contains("tuned $HOME/trust (index format 2 -> 4)"),
+        "{}",
+        ran.text
+    );
+    let journal = std::fs::read_to_string(state.join("converge/journal.ndjson")).unwrap();
+    assert!(
+        journal.contains("init.github.tuning@alice"),
+        "journaled: {journal}"
+    );
+    let ran = doctor(&[], true, None);
+    assert_eq!(ran.code, 0, "{}", ran.text);
+    assert_eq!(applies(), 1, "a second run changes nothing");
+    assert!(rows_of(&ran.text, "clones:").is_empty(), "{}", ran.text);
+
+    let before = (built.get(), tuning.probes.load(Ordering::SeqCst));
+    doctor(&["--only", "shell"], true, None);
+    let ran = doctor(&[], true, Some("it runs as root"));
+    assert!(!ran.text.contains("clones:"), "{}", ran.text);
+    doctor(&[], false, None);
+    // Named where it cannot be built, it says why rather than nothing.
+    for (journaled, not_own, why) in [
+        (
+            true,
+            Some("it runs as root"),
+            "aterm tunes them only from the account's own shell, and it runs as root",
+        ),
+        (false, None, "no state root records what aterm sets in them"),
+    ] {
+        let ran = doctor(&["--only", "init.github.tuning@alice"], journaled, not_own);
+        assert!(ran.text.contains(why), "{why:?}: {}", ran.text);
+    }
+    assert_eq!(
+        (built.get(), tuning.probes.load(Ordering::SeqCst)),
+        before,
+        "nothing built or read for another word, outside the account's own shell, or with no \
+         state root"
     );
 }
 

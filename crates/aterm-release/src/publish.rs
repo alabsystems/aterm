@@ -33,6 +33,9 @@ pub struct CutOptions {
     pub linux_targets: Vec<String>,
     pub linux_workers: Vec<String>,
     pub mac_only: bool,
+    /// `--sign`: sign, notarize and package a byte copy of the release's verified bundle under
+    /// its reserved number, privately, and keep the record the claim adopts ([`run_cut_sign`]).
+    pub sign: bool,
 }
 
 /// Which cut flavor is running — decided once, checked per step.
@@ -4741,6 +4744,9 @@ pub struct CutCtx {
     pub fence: Option<PublisherFenceGuard>,
     pub notes_section: String,
     pub journal: Option<Journal>,
+    /// The sign step adopted the copy `cut --sign` signed of these bytes ([`SignedRecord`]): the
+    /// self-check's executions of it and its signing checks ran there, on the same bytes.
+    pub adopted: bool,
 }
 
 impl CutCtx {
@@ -6044,6 +6050,7 @@ fn recover_published_cut(
         fence: Some(fence),
         notes_section: version.to_string(),
         journal: Some(journal),
+        adopted: false,
     };
     run_pipeline(&mut ctx, Instant::now())
 }
@@ -6665,7 +6672,8 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             let rolls = |source: &str, main: &str| {
                 changelog::claim_changelogs(source, main, &version, &date)
             };
-            let claim = ledger::claim(&git, &tree, &plan, &verified.reserved, &rolls)?;
+            let claim = ledger::claim(&git, &tree, &plan, &verified.reserved, &rolls)
+                .map_err(|error| discard_on_lost_race(&git, &dist, &version, reserved, error))?;
             step(
                 "",
                 &format!(
@@ -6735,6 +6743,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         lease: None,
         fence: None,
         journal: None,
+        adopted: false,
     };
     if kind == CutKind::Real {
         let j = Journal {
@@ -6761,6 +6770,192 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     }
 
     run_pipeline(&mut ctx, t0)
+}
+
+/// Whether origin's ledger `ledger_text` was claimed at or past `build` (by another release):
+/// the race [`ledger::claim`] refuses, after which build `build` can never be published.
+pub(crate) fn lost_the_race(ledger_text: &str, build: u64) -> bool {
+    ledger::tail(ledger_text).is_ok_and(|tail| tail.build >= build)
+}
+
+/// A claim's `error`, and when it lost the ledger's race ([`lost_the_race`]) the discard of the
+/// copy `cut --sign` signed of build `build`: that number is spent elsewhere, so the copy is
+/// never adopted and never made public.
+fn discard_on_lost_race(
+    git: &dyn GitRunner,
+    dist: &Path,
+    version: &str,
+    build: u64,
+    error: Error,
+) -> Error {
+    let lost = ledger::show_origin_ledger(git).is_ok_and(|text| lost_the_race(&text, build));
+    if !lost {
+        return error;
+    }
+    let left = discard_signed(dist, version, build);
+    Error::new(format!(
+        "{error}. The copy signed, notarized and packaged privately as build {build} was \
+         discarded{}; nothing of it was made public",
+        if left.is_empty() {
+            String::new()
+        } else {
+            format!(" (still there: {})", left.join("; "))
+        }
+    ))
+}
+
+/// Whether `cut --sign` may sign beside the cut journaled at `path`: never beside an unfinished
+/// one, which signs its own bundle as it finishes; a finished one is an earlier release's, which
+/// the next fresh cut clears ([`fresh_cut_journal_triage`]).
+fn sign_beside_journal(existing: Option<&JournalHeader>, path: &Path) -> Result<()> {
+    match existing {
+        Some(header) if !header.finished() => Err(Error::new(format!(
+            "a claimed cut of v{} (build {}) is journaled in this checkout ({}): it signs \
+             its own bundle as it finishes (`{CUT_COMMAND} --resume`), and nothing is signed \
+             beside it. Nothing was signed",
+            header.version,
+            header.build_number,
+            path.display()
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// `cut --sign`: copy this clone's verified release bundle byte for byte, sign it, notarize and
+/// staple it, package and notarize its DMG, zip it, and run the self-check's local half on it,
+/// all under the reserved number and commit and all private, then keep the record the claim
+/// adopts ([`SignedRecord`], [`adopted_copy`]). It reads its release from this clone's release
+/// journal (R, the reservation, the bundle), never from the publication engine, so it runs
+/// beside `pub publish`: it claims nothing, pushes nothing, uploads nothing, takes no release
+/// lock and no publisher fence, and leaves the Linux workers to the claim. A standing record of
+/// these bytes is adopted as it is.
+pub fn run_cut_sign(repo: &Path, opts: &CutOptions) -> Result<()> {
+    gates::arm_toolchain_lease();
+    let credentials = sign::ReleaseCredentials::resolve(opts.release_credentials.as_deref(), repo)
+        .map_err(Error::new)?;
+    let credentials = credentials.as_ref();
+    let t0 = Instant::now();
+    let dist = repo.join("dist");
+    let journal_path = dist.join("cut-state.toml");
+    let operator = GitCli::new(repo);
+    assert_origin_repo_binding(&operator, &workspace_repo_slug(repo)?)?;
+    sign_beside_journal(JournalHeader::read(&journal_path)?.as_ref(), &journal_path)?;
+    let release = crate::release::Journal::load(
+        &crate::release::release_dir(&operator)
+            .map_err(Error::new)?
+            .join(crate::release::JOURNAL_FILE),
+    )
+    .map_err(Error::new)?
+    .ok_or_else(|| {
+        Error::new(format!(
+            "this clone has no release journal: `cut --sign` signs the bundle its release \
+             built and verified (`{}`). Nothing was signed",
+            crate::release::RELEASE_COMMAND
+        ))
+    })?;
+    let (source, version) = (release.commit.clone(), release.version.clone());
+    ledger::check_version_shape(&version)?;
+    let tree = gates::place_cut_tree(&operator, repo, &source)?.path;
+    let git = GitCli::new(&tree);
+    gates::own_cutter_gate(&git, &source, false)?;
+    let slug = workspace_channel_slug(&tree)?;
+    println!(
+        "aterm-release · cut --sign v{version} ({}) — private: nothing is claimed or published",
+        &source[..8.min(source.len())]
+    );
+    let toolchain = gates::cut_toolchain()
+        .map_err(|e| Error::new(format!("the cut cannot name its prover: {e}")))?;
+    let verified = verified_release_bundle(&operator, repo, &source, &version, &toolchain)?;
+    step("gate", &verified.line);
+    let parent = rev_parse(&git, &format!("{}^1", verified.reserved.commit))?;
+    if parent != source {
+        return Err(Error::new(format!(
+            "the reserved release commit {} is built on {parent}, not on R {source}: it is \
+             never signed. Nothing was signed",
+            verified.reserved.commit
+        )));
+    }
+    let fixtures = gates::handoff_fixture_gate_at(&git, &source, &version)?;
+    step("gate", &gates::handoff_fixtures_line(fixtures.as_ref()));
+    let policy = gates::handoff_policy_gate_at(&git, &source, &version)?;
+    step(
+        "gate",
+        &format!("handoff policy sealed into the bundle: {policy}"),
+    );
+    let apple = resolve_apple_tier(aterm_update_core::pins::APPLE_TEAM_ID, credentials)?;
+    let signature_verdict = preflight_signature_policy(credentials, RosterDuty::Sign)
+        .map_err(|e| Error::new(format!("{}; nothing was signed", e.0)))?;
+    let signature_policy = signature_verdict.policy.clone();
+    step(
+        "signature",
+        &signature_transcript_line(
+            signature_policy.pubkey.as_deref(),
+            signature_verdict.machine_id().as_deref(),
+        ),
+    );
+    // A dry run's context: no ledger claim, no journal, no release lock and no publisher fence;
+    // the claim that adopts this copy holds all four.
+    let ctx = CutCtx {
+        credentials: credentials.cloned(),
+        apple,
+        repo: repo.to_path_buf(),
+        tree,
+        dist,
+        journal_path,
+        slug,
+        tag: format!("v{version}"),
+        notes_section: version.clone(),
+        version,
+        build: verified.reserved.build,
+        commit: verified.reserved.commit.clone(),
+        min_build: None,
+        artifact: Some(verified.complete.key.clone()),
+        macho_sha256: Some(verified.complete.macho_sha256.clone()),
+        linux: None,
+        manifest_signed: false,
+        signature_required: signature_policy.required,
+        signature_pubkey: signature_policy.pubkey,
+        verify_pubkey: None,
+        signature_machine_id: None,
+        attribution: None,
+        roster: None,
+        release_id: None,
+        release_intent: false,
+        upload_intents: Vec::new(),
+        kind: CutKind::DryRun,
+        lease: None,
+        fence: None,
+        journal: None,
+        adopted: false,
+    };
+    let source = signing_source(&ctx)?;
+    if adopted_copy(&ctx, &source)?.is_none() {
+        let signed = sign_copy(&ctx, &source)?;
+        prove_bundle_on_disk(&ctx)?;
+        let apple_note = selfcheck_local(&ctx, aterm_update_core::pins::APPLE_TEAM_ID)?;
+        step(
+            "selfcheck",
+            &format!(
+                "binary == plist == {} · codesign --verify --deep --strict ok{apple_note}",
+                ctx.build
+            ),
+        );
+        let record = SignedRecord {
+            format: SIGNED_FORMAT,
+            key: signed_key(&ctx, &source.complete)?,
+            outputs: signed_outputs(&ctx.dist, &ctx.version, ctx.build).map_err(Error::new)?,
+        };
+        outputs_as_signed(&record.outputs, &signed)?;
+        write_signed_record(&ctx.dist, &record)?;
+    }
+    println!(
+        "\nDONE cut --sign v{} (build {}) in {}s — signed privately; the claim adopts it ({})",
+        ctx.version,
+        ctx.build,
+        t0.elapsed().as_secs(),
+        signed_record_path(&ctx.dist, ctx.build).display()
+    );
+    Ok(())
 }
 
 struct ResumePaths<'a> {
@@ -6880,6 +7075,7 @@ fn resume_cut(
         lease,
         fence,
         journal: Some(journal),
+        adopted: false,
     };
     run_pipeline(&mut ctx, t0)
 }
@@ -7284,6 +7480,105 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
             }
         }
     }
+    let source = signing_source(ctx)?;
+    let copy = match adopted_copy(ctx, &source)? {
+        Some(copy) => {
+            ctx.adopted = true;
+            copy
+        }
+        None => sign_copy(ctx, &source)?,
+    };
+    let SigningSource {
+        published,
+        macho_sha256,
+        ..
+    } = source;
+    let cl_text = gates::read_bounded_string(&ctx.tree.join(changelog::CHANGELOG_FILE), 64 << 20)
+        .map_err(|e| Error::new(format!("read {}: {e}", changelog::CHANGELOG_FILE)))?;
+    let body = changelog::rolled_body(&cl_text, &ctx.notes_section)?;
+    crate::durable::write_fresh(
+        &ctx.notes_path(),
+        changelog::release_notes_document(&ctx.version, &body),
+    )
+    .map_err(|e| Error::new(format!("write {}: {e}", ctx.notes_path().display())))?;
+
+    let plist_text = gates::read_bounded_string(&copy.app.join("Contents/Info.plist"), 16 << 20)
+        .map_err(|e| Error::new(format!("read stamped Info.plist: {e}")))?;
+    let min_os = manifest_out::plist_string(&plist_text, "LSMinimumSystemVersion")
+        .unwrap_or_else(|| "11.0".to_string());
+    let inputs = manifest_out::ManifestInputs {
+        version: &ctx.version,
+        build_number: ctx.build,
+        commit: &ctx.commit,
+        dmg_name: &channel::dmg_asset_name(&ctx.version),
+        dmg_sha256: &copy.dmg_sha256,
+        zip_name: &channel::zip_asset_name(&ctx.version),
+        zip_sha256: &copy.zip_sha256,
+        repo_slug: &ctx.slug,
+        min_os: &min_os,
+        team_id: aterm_update_core::pins::APPLE_TEAM_ID,
+        pub_date: &bundle::epoch_to_rfc3339(unix_now()),
+        min_build: ctx.min_build,
+        changelog: &body,
+    };
+    let mpath = stage_ctx_signing_inputs(ctx, &inputs, revalidate_ctx_signature_policy)?;
+    crate::service_qualification::produce(
+        &ctx.repo,
+        &published,
+        &macho_sha256,
+        &copy.app,
+        &copy.dmg,
+        ctx.build,
+        &ctx.commit,
+        &mpath,
+    )?;
+    let sig_path = mpath.with_extension("toml.sig");
+    match fs::remove_file(&sig_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(Error::new(format!(
+                "remove stale manifest signature {}: {error}",
+                sig_path.display()
+            )));
+        }
+    }
+    if ctx.signature_required {
+        let produced = sign_ctx_manifest(ctx, &mpath, revalidate_ctx_signature_policy)?;
+        if produced != sig_path || !sig_path.is_file() {
+            return Err(Error::new(
+                "signature-required build did not produce the exact manifest signature asset",
+            ));
+        }
+        ctx.manifest_signed = true;
+    } else {
+        ctx.manifest_signed = false;
+    }
+    if let Some(journal) = &mut ctx.journal {
+        journal.manifest_signed = ctx.manifest_signed;
+        journal.signature_required = ctx.signature_required;
+        journal.signature_pubkey.clone_from(&ctx.signature_pubkey);
+        journal.verify_pubkey.clone_from(&ctx.verify_pubkey);
+        journal
+            .signature_machine_id
+            .clone_from(&ctx.signature_machine_id);
+    }
+    Ok(())
+}
+
+/// The verified bundle a cut signs a copy of: its COMPLETE record in the release cache, that
+/// cache, its executable's digest, and R, the commit its `verify release` records are of.
+struct SigningSource {
+    complete: artifact::Complete,
+    store: PathBuf,
+    macho_sha256: String,
+    published: String,
+}
+
+/// The cut's verified bundle, re-proved: the cache still holds the COMPLETE bundle the cut names,
+/// built as this cut's version, number and commit, and every check's record of R stands for its
+/// executable (NOTHING SHIPS UNVERIFIED).
+fn signing_source(ctx: &CutCtx) -> Result<SigningSource> {
     let (Some(key), Some(macho_sha256)) = (ctx.artifact.clone(), ctx.macho_sha256.clone()) else {
         return Err(Error::new(
             "internal: this cut names no verified bundle to sign — a cut signs only the \
@@ -7332,15 +7627,44 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
         )));
     }
     step("gate", &line);
+    Ok(SigningSource {
+        complete,
+        store,
+        macho_sha256,
+        published,
+    })
+}
+
+/// A signed, notarized and packaged copy of the verified bundle in `dist/`: the staged bundle,
+/// both containers and their digests.
+struct SignedCopy {
+    app: PathBuf,
+    dmg: PathBuf,
+    dmg_sha256: String,
+    zip_sha256: String,
+}
+
+/// Copy the verified bundle byte for byte into this cut's staging, sign it, notarize and staple
+/// it, package and notarize its DMG, zip it, and stage the stable twins, the provenance and the
+/// `.sha256` sidecars: everything of the cut that is private and keyed by the bundle's bytes. A
+/// record of an earlier copy of this build goes first, so none outlives the bytes it names.
+fn sign_copy(ctx: &CutCtx, source: &SigningSource) -> Result<SignedCopy> {
+    forget_signed_record(&ctx.dist, ctx.build)?;
+    let SigningSource {
+        complete,
+        store,
+        macho_sha256,
+        ..
+    } = source;
     let app = bundle::prepare_staging(&ctx.dist, ctx.build).map_err(Error::new)?;
-    artifact::copy_bundle(&complete, &complete.app(&store), &app).map_err(Error::new)?;
-    artifact::place_records(&complete.dir(&store), &ctx.dist, &ctx.version).map_err(Error::new)?;
+    artifact::copy_bundle(complete, &complete.app(store), &app).map_err(Error::new)?;
+    artifact::place_records(&complete.dir(store), &ctx.dist, &ctx.version).map_err(Error::new)?;
     step(
         "bundle",
         &format!(
             "the VERIFIED bundle, byte for byte: {} → {} — executable sha256 {}… (archs [{}] · \
              {}) · Short={} CFBundleVersion={}",
-            complete.app(&store).display(),
+            complete.app(store).display(),
             app.display(),
             &macho_sha256[..12],
             complete.archs,
@@ -7397,19 +7721,7 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
     )?;
     validate_release_asset_download_size(dmg_size)?;
     validate_lean_dmg_size(&ctx.version, dmg_size)?;
-    for (source, twin) in [
-        (&dout.path, ctx.stable_dmg_path()),
-        (&zout.path, ctx.stable_zip_path()),
-    ] {
-        crate::durable::copy_regular_fresh(source, &twin).map_err(|e| {
-            Error::new(format!(
-                "copy {} -> {}: {e}",
-                source.display(),
-                twin.display()
-            ))
-        })?;
-    }
-    let provenance_path = bundle::write_provenance(&spec, &app, &signed_by, &macho_sha256)?;
+    let provenance_path = bundle::write_provenance(&spec, &app, &signed_by, macho_sha256)?;
     if ctx.signature_required {
         let fingerprint = ctx
             .expected_embedded_pin()?
@@ -7448,25 +7760,52 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
             &zout.sha256[..12.min(zout.sha256.len())]
         ),
     );
+    stage_twins_and_sidecars(ctx, &dout.path, &dmg_sha, &zout.path, &zout.sha256)?;
+    Ok(SignedCopy {
+        app,
+        dmg: dout.path,
+        dmg_sha256: dmg_sha,
+        zip_sha256: zout.sha256,
+    })
+}
+
+/// The stable twins of both containers (the evergreen `releases/latest/download` names) and the
+/// `.sha256` sidecar of every container and twin: copies and digests of the containers alone.
+fn stage_twins_and_sidecars(
+    ctx: &CutCtx,
+    dmg: &Path,
+    dmg_sha: &str,
+    zip: &Path,
+    zip_sha: &str,
+) -> Result<()> {
+    for (source, twin) in [(dmg, ctx.stable_dmg_path()), (zip, ctx.stable_zip_path())] {
+        crate::durable::copy_regular_fresh(source, &twin).map_err(|e| {
+            Error::new(format!(
+                "copy {} -> {}: {e}",
+                source.display(),
+                twin.display()
+            ))
+        })?;
+    }
     let sidecars = [
         (
             ctx.dmg_sha256_path(),
-            dmg_sha.as_str(),
+            dmg_sha,
             channel::dmg_asset_name(&ctx.version),
         ),
         (
             ctx.zip_sha256_path(),
-            zout.sha256.as_str(),
+            zip_sha,
             channel::zip_asset_name(&ctx.version),
         ),
         (
             ctx.stable_dmg_sha256_path(),
-            dmg_sha.as_str(),
+            dmg_sha,
             channel::stable_dmg_asset_name(),
         ),
         (
             ctx.stable_zip_sha256_path(),
-            zout.sha256.as_str(),
+            zip_sha,
             channel::stable_zip_asset_name(),
         ),
     ];
@@ -7479,78 +7818,378 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
         "`.sha256` sidecars staged for every container and every stable twin \
          (shasum -a 256 -c)",
     );
-    let cl_text = gates::read_bounded_string(&ctx.tree.join(changelog::CHANGELOG_FILE), 64 << 20)
-        .map_err(|e| Error::new(format!("read {}: {e}", changelog::CHANGELOG_FILE)))?;
-    let body = changelog::rolled_body(&cl_text, &ctx.notes_section)?;
-    crate::durable::write_fresh(
-        &ctx.notes_path(),
-        changelog::release_notes_document(&ctx.version, &body),
-    )
-    .map_err(|e| Error::new(format!("write {}: {e}", ctx.notes_path().display())))?;
+    Ok(())
+}
 
-    let plist_text = gates::read_bounded_string(&app.join("Contents/Info.plist"), 16 << 20)
-        .map_err(|e| Error::new(format!("read stamped Info.plist: {e}")))?;
-    let min_os = manifest_out::plist_string(&plist_text, "LSMinimumSystemVersion")
-        .unwrap_or_else(|| "11.0".to_string());
-    let inputs = manifest_out::ManifestInputs {
-        version: &ctx.version,
-        build_number: ctx.build,
-        commit: &ctx.commit,
-        dmg_name: &channel::dmg_asset_name(&ctx.version),
-        dmg_sha256: &dmg_sha,
-        zip_name: &channel::zip_asset_name(&ctx.version),
-        zip_sha256: &zout.sha256,
-        repo_slug: &ctx.slug,
-        min_os: &min_os,
-        team_id: aterm_update_core::pins::APPLE_TEAM_ID,
-        pub_date: &bundle::epoch_to_rfc3339(unix_now()),
-        min_build: ctx.min_build,
-        changelog: &body,
+/// The copy `cut --sign` signed of `source` for this cut, when its record is this cut's
+/// ([`signed_key`]) and `dist/` still holds every output it names byte for byte
+/// ([`signed_copy_stands`]): the build's records are placed from the cache again and the twins and
+/// sidecars staged from the containers, and nothing is signed or notarized again. A record that
+/// does not stand is removed, and `None` has the copy signed again.
+fn adopted_copy(ctx: &CutCtx, source: &SigningSource) -> Result<Option<SignedCopy>> {
+    let Some(record) = read_signed_record(&ctx.dist, ctx.build).transpose() else {
+        return Ok(None);
     };
-    let mpath = stage_ctx_signing_inputs(ctx, &inputs, revalidate_ctx_signature_policy)?;
-    crate::service_qualification::produce(
-        &ctx.repo,
-        &published,
-        &macho_sha256,
-        &app,
-        &dout.path,
-        ctx.build,
-        &ctx.commit,
-        &mpath,
-    )?;
-    let sig_path = mpath.with_extension("toml.sig");
-    match fs::remove_file(&sig_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
+    let key = signed_key(ctx, &source.complete)?;
+    let Some(record) = standing_record(record, &key, &ctx.dist)? else {
+        return Ok(None);
+    };
+    artifact::place_records(&source.complete.dir(&source.store), &ctx.dist, &ctx.version)
+        .map_err(Error::new)?;
+    let app = ctx.app_path();
+    let (dmg, zip) = (ctx.dmg_path(), ctx.zip_path());
+    let outputs = &record.outputs;
+    step(
+        "adopt",
+        &format!(
+            "the copy `cut --sign` signed{} of these verified bytes, every digest re-proved: \
+             {} (bundle {}…) · DMG sha256 {}… · zip sha256 {}… — nothing is signed or notarized \
+             again",
+            if key.identity.is_some() {
+                ", notarized and stapled"
+            } else {
+                ""
+            },
+            app.display(),
+            &outputs.app_digest[..12.min(outputs.app_digest.len())],
+            &outputs.dmg_sha256[..12.min(outputs.dmg_sha256.len())],
+            &outputs.zip_sha256[..12.min(outputs.zip_sha256.len())]
+        ),
+    );
+    stage_twins_and_sidecars(ctx, &dmg, &outputs.dmg_sha256, &zip, &outputs.zip_sha256)?;
+    Ok(Some(SignedCopy {
+        app,
+        dmg,
+        dmg_sha256: outputs.dmg_sha256.clone(),
+        zip_sha256: outputs.zip_sha256.clone(),
+    }))
+}
+
+/// The record `cut --sign` keeps of the copy it signed, in that copy's staging directory
+/// (`dist/cut-<n>.noindex/signed.toml`): it goes wherever the staged bundle goes, and the claim
+/// adopts it ([`adopted_copy`]).
+pub const SIGNED_RECORD: &str = "signed.toml";
+
+/// [`SignedRecord::format`] this cutter writes and adopts.
+pub const SIGNED_FORMAT: u32 = 1;
+
+/// A signed copy of a verified bundle: what it is a copy of and under what ([`SignedKey`]), and
+/// the digest of everything it left in `dist/` ([`SignedOutputs`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedRecord {
+    pub format: u32,
+    pub key: SignedKey,
+    pub outputs: SignedOutputs,
+}
+
+/// What a signed copy is a copy of, and under what identity: a claim adopts the copy only when
+/// every field is its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedKey {
+    /// The verified bundle's [`artifact::Complete::key`].
+    pub artifact: String,
+    /// Its [`artifact::Complete::bundle_digest`]: the bytes copied, before they were signed.
+    pub bundle_digest: String,
+    /// SHA-256 of its executable, the record `verify release` passed.
+    pub macho_sha256: String,
+    pub version: String,
+    /// The reserved number n the bytes carry.
+    pub build: u64,
+    /// The reserved release commit C.
+    pub commit: String,
+    /// The team the copy was signed for (`pins::APPLE_TEAM_ID`; empty ad hoc).
+    pub team: String,
+    /// The Developer ID's SHA-1; `None` signed ad hoc.
+    pub identity: Option<String>,
+    /// The build requires a signed manifest, and its provenance carries the update pin then.
+    pub signature_required: bool,
+    /// That pin's fingerprint.
+    pub update_pin: Option<String>,
+}
+
+/// The digests of what a signed copy left in `dist/`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedOutputs {
+    /// [`artifact::bundle_digest`] of the signed, stapled bundle in its staging directory.
+    pub app_digest: String,
+    pub dmg_sha256: String,
+    pub dmg_size: u64,
+    pub zip_sha256: String,
+    pub zip_size: u64,
+    /// SHA-256 of the provenance record.
+    pub provenance_sha256: String,
+}
+
+fn signed_record_path(dist: &Path, build: u64) -> PathBuf {
+    dist.join(bundle::staging_dir_name(build))
+        .join(SIGNED_RECORD)
+}
+
+/// Build `build`'s signed record in `dist/`: `Ok(None)` without one, `Err` naming why one is
+/// there and unreadable.
+fn read_signed_record(
+    dist: &Path,
+    build: u64,
+) -> std::result::Result<Option<SignedRecord>, String> {
+    let path = signed_record_path(dist, build);
+    match crate::durable::read_regular_text(&path, 1 << 20) {
+        Ok(text) => aterm_toml::from_str(&text)
+            .map(Some)
+            .map_err(|e| format!("{} does not parse: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("read {}: {e}", path.display())),
+    }
+}
+
+fn write_signed_record(dist: &Path, record: &SignedRecord) -> Result<()> {
+    let path = signed_record_path(dist, record.key.build);
+    let text = aterm_toml::to_string(record)
+        .map_err(|e| Error::new(format!("serialize the signed record: {e}")))?;
+    crate::durable::write_atomic_durable(&path, text.as_bytes(), 0o644)
+        .map_err(|e| Error::new(format!("write {}: {e}", path.display())))
+}
+
+/// `record`, as [`read_signed_record`] read build `key.build`'s, when it stands for `key` over
+/// `dist`; else its record is removed and the copy is signed again. A record that cannot be read
+/// is no record of these bytes.
+fn standing_record(
+    record: std::result::Result<SignedRecord, String>,
+    key: &SignedKey,
+    dist: &Path,
+) -> Result<Option<SignedRecord>> {
+    let why = match record.and_then(|r| signed_copy_stands(&r, key, dist).map(|()| r)) {
+        Ok(record) => return Ok(Some(record)),
+        Err(why) => why,
+    };
+    step(
+        "adopt",
+        &format!(
+            "the signed copy of build {} is not adopted: {why} — its record is removed and the \
+             copy signed again",
+            key.build
+        ),
+    );
+    forget_signed_record(dist, key.build)?;
+    Ok(None)
+}
+
+/// The outputs `cut --sign` records are the ones it signed and packaged: `dist/` changed under
+/// it otherwise, and nothing is recorded.
+fn outputs_as_signed(outputs: &SignedOutputs, signed: &SignedCopy) -> Result<()> {
+    for (what, recorded, made) in [
+        ("DMG", &outputs.dmg_sha256, &signed.dmg_sha256),
+        ("zip", &outputs.zip_sha256, &signed.zip_sha256),
+    ] {
+        if recorded != made {
             return Err(Error::new(format!(
-                "remove stale manifest signature {}: {error}",
-                sig_path.display()
+                "the {what} in dist/ is {recorded}, and `cut --sign` made {made}: dist/ changed \
+                 while it signed, so nothing is recorded and the claim signs again"
             )));
         }
     }
-    if ctx.signature_required {
-        let produced = sign_ctx_manifest(ctx, &mpath, revalidate_ctx_signature_policy)?;
-        if produced != sig_path || !sig_path.is_file() {
-            return Err(Error::new(
-                "signature-required build did not produce the exact manifest signature asset",
-            ));
-        }
-        ctx.manifest_signed = true;
-    } else {
-        ctx.manifest_signed = false;
+    Ok(())
+}
+
+fn forget_signed_record(dist: &Path, build: u64) -> Result<()> {
+    let path = signed_record_path(dist, build);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::new(format!("remove {}: {e}", path.display()))),
     }
-    if let Some(journal) = &mut ctx.journal {
-        journal.manifest_signed = ctx.manifest_signed;
-        journal.signature_required = ctx.signature_required;
-        journal.signature_pubkey.clone_from(&ctx.signature_pubkey);
-        journal.verify_pubkey.clone_from(&ctx.verify_pubkey);
-        journal
-            .signature_machine_id
-            .clone_from(&ctx.signature_machine_id);
+}
+
+/// The key of the copy this cut signs of `complete`.
+fn signed_key(ctx: &CutCtx, complete: &artifact::Complete) -> Result<SignedKey> {
+    Ok(SignedKey {
+        artifact: complete.key.clone(),
+        bundle_digest: complete.bundle_digest.clone(),
+        macho_sha256: complete.macho_sha256.clone(),
+        version: ctx.version.clone(),
+        build: ctx.build,
+        commit: ctx.commit.clone(),
+        team: aterm_update_core::pins::APPLE_TEAM_ID.to_string(),
+        identity: ctx.apple.identity().map(|id| id.sha1.clone()),
+        signature_required: ctx.signature_required,
+        update_pin: if ctx.signature_required {
+            ctx.expected_embedded_pin()?
+        } else {
+            None
+        },
+    })
+}
+
+/// What `dist/` holds now as the signed copy of build `build` of `version`, by digest.
+fn signed_outputs(
+    dist: &Path,
+    version: &str,
+    build: u64,
+) -> std::result::Result<SignedOutputs, String> {
+    let sized = |path: PathBuf| -> std::result::Result<(String, u64), String> {
+        let size = fs::symlink_metadata(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .len();
+        Ok((artifact::file_sha256(&path)?, size))
+    };
+    let (dmg_sha256, dmg_size) = sized(dist.join(channel::dmg_asset_name(version)))?;
+    let (zip_sha256, zip_size) = sized(dist.join(channel::zip_asset_name(version)))?;
+    Ok(SignedOutputs {
+        app_digest: artifact::bundle_digest(&bundle::staged_app_path(dist, build))?,
+        dmg_sha256,
+        dmg_size,
+        zip_sha256,
+        zip_size,
+        provenance_sha256: artifact::file_sha256(
+            &dist.join(channel::provenance_asset_name(version)),
+        )?,
+    })
+}
+
+/// Whether `record` is the record of the copy `key` names and `dist/` still holds that copy
+/// byte for byte; `Err` names the first field that differs.
+pub(crate) fn signed_copy_stands(
+    record: &SignedRecord,
+    key: &SignedKey,
+    dist: &Path,
+) -> std::result::Result<(), String> {
+    if record.format != SIGNED_FORMAT {
+        return Err(format!(
+            "its record is format {}, and this cutter adopts format {SIGNED_FORMAT}",
+            record.format
+        ));
+    }
+    let (was, is) = (&record.key, key);
+    let keys = [
+        ("bundle", was.artifact.clone(), is.artifact.clone()),
+        (
+            "bundle digest",
+            was.bundle_digest.clone(),
+            is.bundle_digest.clone(),
+        ),
+        (
+            "executable",
+            was.macho_sha256.clone(),
+            is.macho_sha256.clone(),
+        ),
+        ("version", was.version.clone(), is.version.clone()),
+        ("build", was.build.to_string(), is.build.to_string()),
+        ("release commit", was.commit.clone(), is.commit.clone()),
+        ("team", was.team.clone(), is.team.clone()),
+        (
+            "Developer ID",
+            format!("{:?}", was.identity),
+            format!("{:?}", is.identity),
+        ),
+        (
+            "manifest signature requirement",
+            was.signature_required.to_string(),
+            is.signature_required.to_string(),
+        ),
+        (
+            "update pin",
+            format!("{:?}", was.update_pin),
+            format!("{:?}", is.update_pin),
+        ),
+    ];
+    if let Some((field, was, is)) = keys.iter().find(|(_, was, is)| was != is) {
+        return Err(format!(
+            "it was signed as {field} {was}, and this cut's is {is}"
+        ));
+    }
+    let now = signed_outputs(dist, &key.version, key.build)
+        .map_err(|why| format!("its outputs cannot be read again ({why})"))?;
+    let (was, is) = (&record.outputs, &now);
+    let outputs = [
+        (
+            "the signed bundle",
+            was.app_digest.clone(),
+            is.app_digest.clone(),
+        ),
+        ("the DMG", was.dmg_sha256.clone(), is.dmg_sha256.clone()),
+        (
+            "the DMG's size",
+            was.dmg_size.to_string(),
+            is.dmg_size.to_string(),
+        ),
+        ("the zip", was.zip_sha256.clone(), is.zip_sha256.clone()),
+        (
+            "the zip's size",
+            was.zip_size.to_string(),
+            is.zip_size.to_string(),
+        ),
+        (
+            "the provenance",
+            was.provenance_sha256.clone(),
+            is.provenance_sha256.clone(),
+        ),
+    ];
+    if let Some((what, was, is)) = outputs.iter().find(|(_, was, is)| was != is) {
+        return Err(format!(
+            "{what} is {is} on disk, and the record names {was}"
+        ));
     }
     Ok(())
 }
+
+/// Discard build `build`'s privately signed copy of `version` from `dist/`: its record, its
+/// staging directory, both containers, their stable twins and sidecars, and its provenance.
+/// Nothing of it was public. Returns what could not be removed (the next cut's staging prunes a
+/// staging directory a live process held).
+pub(crate) fn discard_signed(dist: &Path, version: &str, build: u64) -> Vec<String> {
+    let mut left = Vec::new();
+    if let Err(error) = forget_signed_record(dist, build) {
+        left.push(error.to_string());
+    }
+    if let Err(why) = bundle::discard_staged_app(dist, build) {
+        left.push(why);
+    }
+    let dmg = channel::dmg_asset_name(version);
+    let zip = channel::zip_asset_name(version);
+    let stable_dmg = channel::stable_dmg_asset_name();
+    let stable_zip = channel::stable_zip_asset_name();
+    let files = [
+        channel::sha256_sidecar_name(&dmg),
+        channel::sha256_sidecar_name(&zip),
+        channel::sha256_sidecar_name(&stable_dmg),
+        channel::sha256_sidecar_name(&stable_zip),
+        dmg,
+        zip,
+        stable_dmg,
+        stable_zip,
+        channel::provenance_asset_name(version),
+    ];
+    for name in files {
+        let path = dist.join(name);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => left.push(format!("remove {}: {e}", path.display())),
+        }
+    }
+    left
+}
+
+/// The self-check of a copy `cut --sign` signed and the claim adopted: the manifest's `team` is
+/// the one the copy was signed for (`pinned`), and its signing half is asked again, now, since a
+/// ticket or a certificate can be revoked between the sign and the claim.
+/// # Errors
+/// Another team, and what [`selfcheck_signing`] refuses.
+pub fn adopted_selfcheck(
+    team: &str,
+    pinned: &str,
+    app: &Path,
+    dmg: &Path,
+    tools: &dyn sign::AppleTools,
+) -> Result<&'static str> {
+    if team != pinned {
+        return Err(Error::new(format!(
+            "self-check failed: the manifest names team {team:?}, and the adopted copy was \
+             signed for {pinned:?}"
+        )));
+    }
+    selfcheck_signing(team, app, dmg, tools)
+}
+
 /// The signing half of the self-check.
 pub fn selfcheck_signing(
     team: &str,
@@ -7819,6 +8458,51 @@ fn prove_publication_on_disk(ctx: &CutCtx) -> Result<Manifest> {
 
 fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
     let manifest = prove_artifacts_on_disk(ctx)?;
+    let team = manifest.team_id.clone().unwrap_or_default();
+    if ctx.adopted {
+        let apple_note = adopted_selfcheck(
+            &team,
+            aterm_update_core::pins::APPLE_TEAM_ID,
+            &ctx.app_path(),
+            &ctx.dmg_path(),
+            &sign::RealAppleTools,
+        )?;
+        step(
+            "selfcheck",
+            &format!(
+                "binary == plist == manifest == {} · the copy's executions and its GPU session \
+                 passed in `cut --sign` on these bytes, re-proved by digest at the sign step · \
+                 codesign --verify --deep --strict ok{apple_note}",
+                ctx.build
+            ),
+        );
+    } else {
+        let apple_note = selfcheck_local(ctx, &team)?;
+        step(
+            "selfcheck",
+            &format!(
+                "binary == plist == manifest == {} · codesign --verify --deep --strict \
+                 ok{apple_note}",
+                ctx.build
+            ),
+        );
+    }
+
+    let best = best_published(ctx)?;
+    step(
+        "",
+        &format!(
+            "manifest bytes parse (shared type + vendored v0.25 fixture) · > published {}",
+            best.map_or("none".to_string(), |b| b.to_string())
+        ),
+    );
+    Ok(())
+}
+
+/// The self-check's half that runs the staged copy and asks only this Mac: its first exec's
+/// build stamp, each tool's `--version`, the update pin it reports, a session on the GPU, and
+/// its signature, ticket and Gatekeeper verdicts for `team`. Returns the signing note.
+fn selfcheck_local(ctx: &CutCtx, team: &str) -> Result<&'static str> {
     let app = ctx.app_path();
 
     // The staged copy's first exec, stamped in its staging directory before it: only an exit
@@ -7901,25 +8585,7 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
         "the signed arm64 slice drove a headless session (`uname -m` answered arm64) and \
          drew its first frame on the GPU renderer (`ctl metrics` backend=gpu)",
     );
-    let team = manifest.team_id.clone().unwrap_or_default();
-    let apple_note = selfcheck_signing(&team, &app, &ctx.dmg_path(), &sign::RealAppleTools)?;
-    step(
-        "selfcheck",
-        &format!(
-            "binary == plist == manifest == {} · codesign --verify --deep --strict ok{apple_note}",
-            ctx.build
-        ),
-    );
-
-    let best = best_published(ctx)?;
-    step(
-        "",
-        &format!(
-            "manifest bytes parse (shared type + vendored v0.25 fixture) · > published {}",
-            best.map_or("none".to_string(), |b| b.to_string())
-        ),
-    );
-    Ok(())
+    selfcheck_signing(team, &app, &ctx.dmg_path(), &sign::RealAppleTools)
 }
 
 fn published_roster_seq(newest: Option<&verify::Published>) -> Result<Option<u64>> {
@@ -9558,6 +10224,7 @@ mod roster_wiring_tests {
             lease: None,
             fence: None,
             journal: None,
+            adopted: false,
             notes_section: "0.5.0".to_string(),
         }
     }
@@ -10701,6 +11368,7 @@ mod artifact_proof_tests {
             fence: None,
             notes_section: VERSION.to_string(),
             journal: None,
+            adopted: false,
             linux: None,
         };
         (dir, ctx)
@@ -10836,5 +11504,298 @@ mod local_probe_tests {
         let group = child.id();
         child.wait().expect("reap it");
         assert_eq!(LocalProbe::members_of(group), GroupState::Empty);
+    }
+}
+
+#[cfg(test)]
+mod signed_copy_tests {
+
+    use super::*;
+
+    const VERSION: &str = "0.5.0";
+    const BUILD: u64 = 500;
+
+    fn key() -> SignedKey {
+        SignedKey {
+            artifact: "k".repeat(64),
+            bundle_digest: "d".repeat(64),
+            macho_sha256: "m".repeat(64),
+            version: VERSION.into(),
+            build: BUILD,
+            commit: "c".repeat(40),
+            team: "TEAMID1234".into(),
+            identity: Some("F".repeat(40)),
+            signature_required: true,
+            update_pin: Some("p".repeat(64)),
+        }
+    }
+
+    /// A `dist/` holding a signed copy of build [`BUILD`]: its staged bundle, both containers,
+    /// their twins and sidecars, and its provenance; and the record `cut --sign` keeps of it.
+    fn signed_dist() -> (aterm_tempfile::TempDir, PathBuf, SignedRecord) {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-signed-copy-")
+            .tempdir()
+            .unwrap();
+        let dist = dir.path().join("dist");
+        let app = bundle::staged_app_path(&dist, BUILD);
+        fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        fs::write(app.join("Contents/MacOS/aterm"), b"signed executable").unwrap();
+        fs::write(app.join("Contents/Info.plist"), b"<plist/>").unwrap();
+        for (name, bytes) in [
+            (channel::dmg_asset_name(VERSION), &b"the notarized dmg"[..]),
+            (channel::zip_asset_name(VERSION), b"the stapled zip"),
+            (channel::provenance_asset_name(VERSION), b"version=0.5.0\n"),
+            (channel::stable_dmg_asset_name(), b"the notarized dmg"),
+            (channel::stable_zip_asset_name(), b"the stapled zip"),
+            (
+                channel::sha256_sidecar_name(&channel::dmg_asset_name(VERSION)),
+                b"sum",
+            ),
+        ] {
+            fs::write(dist.join(name), bytes).unwrap();
+        }
+        let record = SignedRecord {
+            format: SIGNED_FORMAT,
+            key: key(),
+            outputs: signed_outputs(&dist, VERSION, BUILD).unwrap(),
+        };
+        write_signed_record(&dist, &record).unwrap();
+        (dir, dist, record)
+    }
+
+    #[test]
+    fn a_record_adopts_only_its_own_bytes_under_its_own_key() {
+        let (_dir, dist, record) = signed_dist();
+        assert_eq!(
+            read_signed_record(&dist, BUILD).unwrap().as_ref(),
+            Some(&record),
+            "the record reads back as written"
+        );
+        assert_eq!(signed_copy_stands(&record, &key(), &dist), Ok(()));
+
+        // NEGATIVE CONTROLS: one changed byte of any output, or any field of the key, signs again.
+        let dmg = dist.join(channel::dmg_asset_name(VERSION));
+        fs::write(&dmg, b"the notarized dmG").unwrap();
+        let why = signed_copy_stands(&record, &key(), &dist).unwrap_err();
+        assert!(why.starts_with("the DMG is "), "{why}");
+        fs::write(&dmg, b"the notarized dmg").unwrap();
+        assert_eq!(signed_copy_stands(&record, &key(), &dist), Ok(()));
+
+        let exe = bundle::staged_app_path(&dist, BUILD).join("Contents/MacOS/aterm");
+        fs::write(&exe, b"signed executablE").unwrap();
+        let why = signed_copy_stands(&record, &key(), &dist).unwrap_err();
+        assert!(why.starts_with("the signed bundle is "), "{why}");
+        fs::write(&exe, b"signed executable").unwrap();
+
+        let zip = dist.join(channel::zip_asset_name(VERSION));
+        fs::write(&zip, b"the stapled ziP").unwrap();
+        let why = signed_copy_stands(&record, &key(), &dist).unwrap_err();
+        assert!(why.starts_with("the zip is "), "{why}");
+        fs::write(&zip, b"the stapled zip").unwrap();
+        let provenance = dist.join(channel::provenance_asset_name(VERSION));
+        fs::write(&provenance, b"version=0.5.1\n").unwrap();
+        let why = signed_copy_stands(&record, &key(), &dist).unwrap_err();
+        assert!(why.starts_with("the provenance is "), "{why}");
+        fs::write(&provenance, b"version=0.5.0\n").unwrap();
+        assert_eq!(signed_copy_stands(&record, &key(), &dist), Ok(()));
+        type Size = fn(&mut SignedOutputs);
+        let sizes: [(&str, Size); 2] = [
+            ("the DMG's size", |o| o.dmg_size += 1),
+            ("the zip's size", |o| o.zip_size += 1),
+        ];
+        for (what, change) in sizes {
+            let mut other = record.clone();
+            change(&mut other.outputs);
+            let why = signed_copy_stands(&other, &key(), &dist).unwrap_err();
+            assert!(why.starts_with(&format!("{what} is ")), "{what}: {why}");
+        }
+
+        type Change = fn(&mut SignedKey);
+        let changes: [(&str, Change); 10] = [
+            ("bundle", |k| k.artifact = "a".repeat(64)),
+            ("bundle digest", |k| k.bundle_digest = "e".repeat(64)),
+            ("executable", |k| k.macho_sha256 = "n".repeat(64)),
+            ("version", |k| k.version = "0.5.1".into()),
+            ("build", |k| k.build += 1),
+            ("release commit", |k| k.commit = "b".repeat(40)),
+            ("team", |k| k.team = "OTHERTEAM1".into()),
+            ("Developer ID", |k| k.identity = None),
+            ("manifest signature requirement", |k| {
+                k.signature_required = false
+            }),
+            ("update pin", |k| k.update_pin = None),
+        ];
+        for (field, change) in changes {
+            let mut other = key();
+            change(&mut other);
+            let why = signed_copy_stands(&record, &other, &dist).unwrap_err();
+            assert!(
+                why.contains(&format!("signed as {field} ")),
+                "{field}: {why}"
+            );
+        }
+        let mut old = record.clone();
+        old.format = SIGNED_FORMAT + 1;
+        assert!(signed_copy_stands(&old, &key(), &dist).is_err());
+    }
+
+    /// A RECORD THAT CANNOT BE READ IS NO RECORD OF THESE BYTES: the claim removes it and signs
+    /// again, rather than refusing on every resume. NEGATIVE CONTROL: passing the read's error on
+    /// leaves the cut stuck behind the file.
+    #[test]
+    fn an_unreadable_record_is_removed_and_the_copy_signed_again() {
+        let (_dir, dist, record) = signed_dist();
+        let read = |dist: &Path| read_signed_record(dist, BUILD).transpose().unwrap();
+        assert_eq!(
+            standing_record(read(&dist), &key(), &dist).unwrap(),
+            Some(record)
+        );
+        fs::write(signed_record_path(&dist, BUILD), b"format = \"two\"\n").unwrap();
+        assert_eq!(standing_record(read(&dist), &key(), &dist).unwrap(), None);
+        assert_eq!(
+            read_signed_record(&dist, BUILD),
+            Ok(None),
+            "its record is removed"
+        );
+    }
+
+    /// `CUT --SIGN` RECORDS ONLY THE OUTPUTS IT MADE: a DMG or zip in `dist/` other than the one
+    /// it signed and packaged is never recorded for a claim to adopt. NEGATIVE CONTROL: recording
+    /// what `dist/` holds at the end records the other zip.
+    #[test]
+    fn cut_sign_records_only_the_outputs_it_made() {
+        let (_dir, _dist, record) = signed_dist();
+        let made = SignedCopy {
+            app: PathBuf::new(),
+            dmg: PathBuf::new(),
+            dmg_sha256: record.outputs.dmg_sha256.clone(),
+            zip_sha256: record.outputs.zip_sha256.clone(),
+        };
+        assert!(outputs_as_signed(&record.outputs, &made).is_ok());
+        let other = SignedCopy {
+            zip_sha256: "0".repeat(64),
+            ..made
+        };
+        let why = outputs_as_signed(&record.outputs, &other)
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("the zip in dist/"), "{why}");
+    }
+
+    /// `CUT --SIGN` STANDS ASIDE ONLY FROM AN UNFINISHED CUT: an earlier release's finished cut
+    /// journal is the next fresh cut's to clear, so a clone signs its next release beside it.
+    /// NEGATIVE CONTROL: refusing beside any journal stops every release after a clone's first.
+    #[test]
+    fn cut_sign_stands_aside_only_from_an_unfinished_cut() {
+        let header = |done: &[&str]| JournalHeader {
+            format: 1,
+            version: VERSION.into(),
+            build_number: BUILD,
+            commit: "c".repeat(40),
+            done: done.iter().map(|s| (*s).to_string()).collect(),
+        };
+        let path = Path::new("dist/cut-state.toml");
+        assert!(sign_beside_journal(None, path).is_ok());
+        assert!(
+            sign_beside_journal(Some(&header(&["claim", "unlock"])), path).is_ok(),
+            "an earlier release's finished cut stands aside"
+        );
+        let why = sign_beside_journal(Some(&header(&["claim"])), path)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            why.contains("--resume") && why.contains("Nothing was signed"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn a_discarded_copy_leaves_nothing_of_itself_in_dist() {
+        let (_dir, dist, _) = signed_dist();
+        let kept = dist.join("notes-0.5.0.md");
+        fs::write(&kept, b"notes").unwrap();
+        assert_eq!(discard_signed(&dist, VERSION, BUILD), Vec::<String>::new());
+        assert_eq!(read_signed_record(&dist, BUILD), Ok(None));
+        assert!(!dist.join(bundle::staging_dir_name(BUILD)).exists());
+        for name in [
+            channel::dmg_asset_name(VERSION),
+            channel::zip_asset_name(VERSION),
+            channel::provenance_asset_name(VERSION),
+            channel::stable_dmg_asset_name(),
+            channel::stable_zip_asset_name(),
+            channel::sha256_sidecar_name(&channel::dmg_asset_name(VERSION)),
+        ] {
+            assert!(!dist.join(&name).exists(), "{name} is left");
+        }
+        assert!(kept.exists(), "what is not the copy's stays");
+        assert_eq!(
+            discard_signed(&dist, VERSION, BUILD),
+            Vec::<String>::new(),
+            "a second discard finds nothing"
+        );
+    }
+
+    #[test]
+    fn only_a_tail_at_or_past_the_reservation_lost_the_race() {
+        let ledger = "1791500000 0.5.0\n";
+        assert!(lost_the_race(ledger, 1_791_500_000));
+        assert!(lost_the_race(ledger, 1_791_499_999));
+        assert!(!lost_the_race(ledger, 1_791_500_001));
+        assert!(
+            !lost_the_race("not a ledger", 1),
+            "an unread ledger is no lost race"
+        );
+    }
+
+    /// Origin's ledger, as `git show origin/main:RELEASES.ledger` answers it.
+    struct Origin(&'static str);
+
+    impl GitRunner for Origin {
+        fn git(&self, args: &[&str]) -> Result<RunOut> {
+            assert_eq!(args, ["show", "origin/main:RELEASES.ledger"]);
+            Ok(RunOut {
+                status: 0,
+                stdout: self.0.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    /// A claim refused because origin's tail reached the reservation discards the copy and
+    /// says so; a claim refused for any other cause keeps it for the next run to adopt.
+    #[test]
+    fn only_a_claim_that_lost_the_race_discards_the_copy() {
+        let (_dir, dist, record) = signed_dist();
+        let kept = discard_on_lost_race(
+            &Origin("499 0.4.0\n"),
+            &dist,
+            VERSION,
+            BUILD,
+            Error::new("the claim's push was refused"),
+        );
+        assert_eq!(kept.to_string(), "the claim's push was refused");
+        assert_eq!(read_signed_record(&dist, BUILD), Ok(Some(record)));
+        assert!(dist.join(channel::dmg_asset_name(VERSION)).exists());
+
+        let lost = discard_on_lost_race(
+            &Origin("500 0.5.0\n"),
+            &dist,
+            VERSION,
+            BUILD,
+            Error::new("origin's ledger reached build 500"),
+        )
+        .to_string();
+        assert!(
+            lost.starts_with(
+                "origin's ledger reached build 500. The copy signed, notarized and \
+                              packaged privately as build 500 was discarded; nothing of it was \
+                              made public"
+            ),
+            "{lost}"
+        );
+        assert_eq!(read_signed_record(&dist, BUILD), Ok(None));
+        assert!(!dist.join(channel::dmg_asset_name(VERSION)).exists());
+        assert!(!dist.join(bundle::staging_dir_name(BUILD)).exists());
     }
 }

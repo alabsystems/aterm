@@ -3767,7 +3767,7 @@ fn a_roster_discovered_by_the_cli_respects_the_configured_rotation_mode() {
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
         let pool = ReviewPool::with_scope(cli, (cli == Cli::Codex).then_some(true), false);
         let config = pool.config.join("review-policy.toml");
-        std::fs::write(&config, "[harness]\naccounts = \"off\"\n").unwrap();
+        crate::test_config::write(&config, "[harness]\naccounts = \"off\"\n").unwrap();
         let env = crate::ai::cli::Env {
             now: ReviewPool::NOW,
             home: Some(pool.b.home.clone()),
@@ -4150,7 +4150,7 @@ fn a_prepared_credential_needs_execution_authority_before_review_or_launch() {
             let pool = ReviewPool::new(cli, reads);
             pool.main_alone();
             if off {
-                std::fs::write(
+                crate::test_config::write(
                     pool.config.join("aterm.toml"),
                     "[harness]\naccounts = \"off\"\n",
                 )
@@ -4590,7 +4590,8 @@ fn a_pooled_review_takes_what_a_launch_takes() {
                 let at = format!("{} on {reads:?}, {switch:?}, {case}", cli.id());
                 let ready = || {
                     let pool = ReviewPool::new(cli, reads);
-                    std::fs::write(pool.config.join("aterm.toml"), switch).expect("aterm.toml");
+                    crate::test_config::write(pool.config.join("aterm.toml"), switch)
+                        .expect("aterm.toml");
                     set(&pool);
                     pool
                 };

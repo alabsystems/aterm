@@ -241,7 +241,7 @@ fn a_tasked_workers_prompt_is_its_task() {
     {
         let mut tl = worker.ctx.timeline.lock().unwrap();
         let mark = crate::task_record::TaskMark::new(crate::task_record::TaskState::Working);
-        tl.mark_task(&mark, false, std::time::Instant::now(), 1);
+        tl.mark_task(&mark, &Default::default(), std::time::Instant::now(), 1);
     }
     assert_eq!(prompt_now(), "Fix the flaky test in crates/aterm-ctl");
     let row = survey_rows(&store, SurveyLevel::Facts, usize::MAX, &here());
@@ -270,7 +270,7 @@ fn a_finished_turns_said_is_sent_keeping_its_end() {
             }),
         );
         let working = crate::task_record::TaskMark::new(crate::task_record::TaskState::Working);
-        tl.mark_task(&working, false, std::time::Instant::now(), 1);
+        tl.mark_task(&working, &Default::default(), std::time::Instant::now(), 1);
     }
     store.write().unwrap().register(claude.clone());
     let said = || {
@@ -285,7 +285,7 @@ fn a_finished_turns_said_is_sent_keeping_its_end() {
     {
         let mut tl = claude.ctx.timeline.lock().unwrap();
         let done = crate::task_record::TaskMark::new(crate::task_record::TaskState::Done);
-        tl.mark_task(&done, false, std::time::Instant::now(), 2);
+        tl.mark_task(&done, &Default::default(), std::time::Instant::now(), 2);
     }
     assert_eq!(said(), "…`wc -w notes.md` printed 142.", "its task done");
 

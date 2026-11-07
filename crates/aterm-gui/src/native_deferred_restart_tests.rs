@@ -84,8 +84,8 @@ impl Kernel for DeferredFacts {
     fn recorded_operation(&self, id: &str) -> Result<bool, ()> {
         self.base.recorded_operation(id)
     }
-    fn record_noexec(&self, prepare: &Prepare, binding: &Binding) -> bool {
-        self.base.record_noexec(prepare, binding)
+    fn record_noexec(&self, prepare: &Prepare, binding: &Binding, phase: ImagePhase) -> bool {
+        self.base.record_noexec(prepare, binding, phase)
     }
     fn historical_noexec(&self, request: &Request) -> bool {
         self.base.historical_noexec(request)

@@ -27,6 +27,8 @@ const MAX_ANCESTORS: usize = 32;
 
 pub use aterm_toolchain::checkout;
 
+use aterm_toolchain::xpy;
+
 pub use checkout::HOME_SKIP;
 
 pub use aterm_uds::holders::Exe;
@@ -1168,13 +1170,27 @@ pub fn bootstrap_cargo_dir(name: &str) -> bool {
 }
 
 fn is_xpy(dir: &Path) -> bool {
-    std::fs::symlink_metadata(dir.join("x.py")).is_ok_and(|m| m.is_file())
+    xpy::is_checkout(dir)
 }
 
+/// Whether `dir` lies in an x.py checkout's build tree: under either of its names (`build`, or
+/// `build.noindex`, where a canonical path through the sanctioned link leads), in another case
+/// where the volume takes it for that name, or under the folder inside the checkout that its
+/// `build` link names (`build -> build.local`, `build -> out/tree`, where a working directory
+/// spelled through the link canonicalizes), which bootstrap builds in.
 fn inside_xpy_build(dir: &Path) -> bool {
-    dir.ancestors()
-        .take(MAX_ANCESTORS)
-        .any(|a| a.file_name().is_some_and(|n| n == "build") && a.parent().is_some_and(is_xpy))
+    xpy::build_holding(dir).is_some()
+        || dir.ancestors().take(MAX_ANCESTORS).any(|a| {
+            a.parent()
+                .is_some_and(|repo| is_xpy(repo) && xpy::linked_tree(repo).as_deref() == Some(a))
+        })
+        || dir.ancestors().take(MAX_ANCESTORS).any(|repo| {
+            is_xpy(repo)
+                && [xpy::named_folder(repo), xpy::named_tree(repo)]
+                    .into_iter()
+                    .flatten()
+                    .any(|named| dir.starts_with(named))
+        })
 }
 
 /// Resolves the main repository root for a linked `git worktree` directory.
@@ -1405,6 +1421,10 @@ struct Walk {
     foreign: Vec<PathBuf>,
     notes: Vec<String>,
     dangling: Vec<Dangling>,
+    /// The folders x.py checkouts met so far name with their `build` links, by the links' words
+    /// and as the volume spells them ([`Walk::name_trees`]): bootstrap's, never walked as
+    /// anything's build directories.
+    named: Vec<PathBuf>,
     _exposed: Exposed,
 }
 
@@ -1446,6 +1466,7 @@ impl Walk {
                 .collect(),
             notes: Vec::new(),
             dangling: Vec::new(),
+            named: Vec::new(),
             _exposed: exposed,
         })
     }
@@ -1666,6 +1687,14 @@ impl Walk {
         if !self.outside_sync_root(root) {
             return;
         }
+        // A root between an x.py checkout and the folder its `build` link names (a working
+        // directory in `out/`, of `build -> out/tree`) meets that folder before any walk of the
+        // checkout itself: each x.py checkout above it names its folder first.
+        for repo in root.ancestors().skip(1).take(MAX_ANCESTORS) {
+            if is_xpy(repo) {
+                self.name_trees(repo);
+            }
+        }
         if is_xpy(root) {
             self.bootstrap(root);
         }
@@ -1682,15 +1711,50 @@ impl Walk {
         self.marked_walk(root, CHECKOUT_DEPTH, dev, &origin);
     }
 
+    /// Records the folder the x.py checkout `repo`'s `build` link names, by its words
+    /// ([`xpy::named_folder`]) and as the volume spells its names ([`xpy::named_tree`]), for
+    /// every walk to leave to bootstrap.
+    fn name_trees(&mut self, repo: &Path) {
+        for named in [xpy::named_folder(repo), xpy::named_tree(repo)]
+            .into_iter()
+            .flatten()
+        {
+            if !self.named.contains(&named) {
+                self.named.push(named);
+            }
+        }
+    }
+
     fn marked_walk(&mut self, dir: &Path, depth: usize, dev: u64, origin: &Origin) {
         let xpy = is_xpy(dir);
+        // An x.py checkout met inside the walk (one in a session's scratchpad, one nested in a
+        // checkout) has its build tree read as a checkout root's is ([`Walk::checkout`] reads
+        // that one before the walk), as bootstrap's: skipped below, it is never the walk's, and
+        // it is never left unseen. A scratchpad's too: a session holding a Trust clone (some
+        // 250,000 files) is never dated as ended (`session_owner`'s entry bound), so its stage
+        // trees would stay a row each; as bootstrap's they are one, with `./x.py clean`.
+        if xpy && !matches!(origin, Origin::Checkout { root } if root == dir) {
+            self.bootstrap(dir);
+        }
+        // The folder inside an x.py checkout its `build` link leads to, sanctioned or not
+        // (`build -> build.local`, `build -> out/tree`), is where bootstrap builds through it:
+        // read by the link's words, and skipped wherever the walk meets it.
+        let linked = if xpy { xpy::linked_tree(dir) } else { None };
+        if xpy {
+            self.name_trees(dir);
+        }
         for (name, path, ty) in self.children(dir) {
             if self.spent() {
                 return;
             }
             let n = name.to_string_lossy();
+            // An x.py checkout's build tree, by either name (in another case where the volume
+            // takes it for that name) or wherever its `build` link leads, is bootstrap's
+            // ([`Walk::bootstrap`]): never a checkout's build directory.
             if n.starts_with('.')
-                || (xpy && n == "build")
+                || (xpy && xpy::tree_name(dir, &name).is_some())
+                || linked.as_ref() == Some(&path)
+                || self.named.contains(&path)
                 || home_skipped(&name)
                 || self.fenced(&path)
             {
@@ -1759,11 +1823,37 @@ impl Walk {
         });
     }
 
+    /// The x.py checkout `repo`'s stage build directories: those of its build tree, a real
+    /// `build/` or exactly Trust's sanctioned `build -> build.noindex` link, read where the link
+    /// leads ([`xpy::build_tree`]), as bootstrap's. Any other link is never followed: one whose
+    /// words name no entry directly inside the checkout ([`xpy::unread_link`]) is named in a
+    /// note, which says nothing of where it leads (a deeper folder they name inside it is still
+    /// left to bootstrap, [`Walk::name_trees`]). A real `build.noindex` its `build` does not lead
+    /// to ([`xpy::stray_noindex`]) is named in a note and not walked, and nothing here removes it.
     fn bootstrap(&mut self, repo: &Path) {
-        let build = repo.join("build");
-        if !std::fs::symlink_metadata(&build).is_ok_and(|m| m.is_dir()) {
-            return;
+        let note = if xpy::unread_link(repo) {
+            Some(format!(
+                "cargo-targets: {} is a link of an x.py checkout that is not followed here: only \
+                 a link whose words name build.noindex directly inside the checkout is read as \
+                 its build tree",
+                repo.join(xpy::BUILD).display()
+            ))
+        } else {
+            xpy::stray_noindex(repo).map(|stray| {
+                format!(
+                    "cargo-targets: {} is a build.noindex of an x.py checkout that its `build` \
+                     does not lead to: it is not read as the checkout's build tree, and nothing \
+                     here removes it",
+                    stray.display()
+                )
+            })
+        };
+        if let Some(note) = note.filter(|note| !self.notes.contains(note)) {
+            self.notes.push(note);
         }
+        let Some(build) = xpy::build_tree(repo) else {
+            return;
+        };
         let origin = Origin::Bootstrap {
             repo: repo.to_path_buf(),
             slim: std::fs::symlink_metadata(repo.join("scripts").join("slim_build.py"))

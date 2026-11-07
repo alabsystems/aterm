@@ -120,7 +120,26 @@ fn every_host_answer_reads_back_as_written() {
             .expect("an older tape's clean probe"),
         crate::harness::repo_work::RepoRead::Clean
     );
-    for (main_ref, remote) in [("origin/main", true), ("", false)] {
+    // Design B10: a reading on main carries what its head states (a judgment, or the word `none`
+    // where it states nothing), and an unread statement writes no `stated` key, reading back
+    // unread.
+    let judged =
+        crate::harness::land_receipt::Statement::Stated(crate::harness::land_receipt::Judgment {
+            tree: "0a1b2c3d4e5f".to_string(),
+            rejudges: 2,
+            onto: "f5e4d3c2b1a0".to_string(),
+            inherited: 1,
+            secs: 2712,
+        });
+    for (main_ref, remote, statement) in [
+        ("origin/main", true, judged.clone()),
+        (
+            "origin/main",
+            true,
+            crate::harness::land_receipt::Statement::Missing,
+        ),
+        ("", false, crate::harness::land_receipt::Statement::Unread),
+    ] {
         let checked =
             crate::harness::repo_work::RepoRead::Checked(crate::harness::repo_work::CleanAt {
                 repo: "/Users//a/Developer/r".to_string(),
@@ -128,6 +147,7 @@ fn every_host_answer_reads_back_as_written() {
                 main_ref: main_ref.to_string(),
                 remote,
                 branch: if remote { "main" } else { "" }.to_string(),
+                statement: statement.clone(),
             });
         let bytes = checked.to_tape();
         assert!(
@@ -135,9 +155,21 @@ fn every_host_answer_reads_back_as_written() {
             "a checked reading is taped under `at`: {}",
             String::from_utf8_lossy(&bytes)
         );
+        assert_eq!(
+            String::from_utf8_lossy(&bytes).contains(r#""stated":"#),
+            statement != crate::harness::land_receipt::Statement::Unread,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
         same(Some(checked.clone()));
         same(checked);
     }
+    // NEGATIVE CONTROL: a statement word the receipt would not write is no tape value.
+    let bad = br#"{"at":{"repo":"/r","head":"3f9a1c2e4b7d","main_ref":"origin/main","remote":true,"stated":"0a1b2c3d4e5f/x/-/0/1"}}"#;
+    assert!(
+        <crate::harness::repo_work::RepoRead as TapeValue>::from_tape(bad).is_err(),
+        "a malformed statement word"
+    );
     // Slice 9c: a gone folder is taped under `gone`, and a checked reading taped before the
     // branch was read reads back naming none.
     let gone = crate::harness::repo_work::RepoRead::Gone("/Users//a/Developer/gone".to_string());
@@ -158,6 +190,7 @@ fn every_host_answer_reads_back_as_written() {
             main_ref: "origin/main".to_string(),
             remote: true,
             branch: String::new(),
+            statement: crate::harness::land_receipt::Statement::Unread,
         })
     );
     same(None::<crate::harness::repo_work::RepoRead>);
@@ -1272,6 +1305,7 @@ fn land_receipt_is_a_taped_notification() {
         check: true,
         said: "Nothing left: pushed.".into(),
         at_ms: 1_771_000_000_000,
+        statement: crate::harness::land_receipt::Statement::Missing,
     };
     let tape = MemoryTape::over(&Fx::over(ClockSource::Scripted(Arc::default())));
     let inner = Arc::new(HearsReceipt::default());

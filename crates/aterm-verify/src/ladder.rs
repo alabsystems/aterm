@@ -5,8 +5,6 @@
 //! `=== stage ===` header. A skip names what was absent and is never a silent
 //! pass; a stage that could not run is never mistaken for a finding.
 
-use std::ffi::OsString;
-
 use crate::exec::Run;
 use crate::findings;
 
@@ -131,7 +129,7 @@ impl Report {
         }
     }
 
-    /// [`Report::fail_child`] for a `targo test` child that ran under `env`:
+    /// [`Report::fail_child`] for a `targo test` child whose failures `rerun` reruns:
     /// one finding per failed test when the log accounts for every one
     /// ([`findings::test_findings`]), and a COULD NOT RUN row for the tests
     /// beside them that refused the machine ([`findings::split_test_findings`]):
@@ -140,11 +138,11 @@ impl Report {
         &mut self,
         run: &Run,
         label: impl Into<String>,
-        env: &[(OsString, OsString)],
+        rerun: &findings::Rerun,
     ) {
         let label = label.into();
         if !self.child_could_not_run(run, &label) {
-            let (found, refused) = findings::split_test_findings(&label, &run.output, env);
+            let (found, refused) = findings::split_test_findings(&label, &run.output, rerun);
             if !refused.is_empty() {
                 let who = format!("{} of its failing tests", refused.len());
                 self.cannot_run(format!(
@@ -156,15 +154,15 @@ impl Report {
         }
     }
 
-    /// [`Report::decide_child`] for a `targo test` child that ran under `env`
-    /// ([`findings::rerun_env`]). A pass that ran no test is no pass: a runner
+    /// [`Report::decide_child`] for a `targo test` child whose failures `rerun`
+    /// reruns ([`findings::Rerun`]). A pass that ran no test is no pass: a runner
     /// from the caller's cargo config can outrank the recording one and run
     /// nothing, exiting 0 ([`crate::libtest::ran_no_test`]).
     pub fn decide_test_child(
         &mut self,
         run: &Run,
         label: impl Into<String>,
-        env: &[(OsString, OsString)],
+        rerun: &findings::Rerun,
     ) {
         let label = label.into();
         if run.ok && crate::libtest::ran_no_test(&run.output) {
@@ -172,7 +170,7 @@ impl Report {
         } else if run.ok {
             self.pass(label);
         } else {
-            self.fail_test_child(run, label, env);
+            self.fail_test_child(run, label, rerun);
         }
     }
 
@@ -516,7 +514,11 @@ mod tests {
         };
         let mut r = Report::new("test (--workspace)");
         r.decide_child(&run(log(&format!("{sentinel} — strays alive"))), "refused");
-        r.decide_test_child(&run(log("assertion failed: a finding")), "found", &[]);
+        r.decide_test_child(
+            &run(log("assertion failed: a finding")),
+            "found",
+            &findings::Rerun::default(),
+        );
         let t = tally(std::slice::from_ref(&r));
         assert_eq!(t.gate_failures, ["found"]);
         assert_eq!(t.could_not_run.len(), 2, "{t:?}");

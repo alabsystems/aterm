@@ -609,6 +609,60 @@ fn the_doctor_fetches_a_signed_document_and_the_look_applies_it() {
     assert!(status.contains("held:       seq 1"), "{status}");
 }
 
+/// THE LOOK AND THE FETCH READ NOTHING FROM AN `aterm.toml` GROUP OR OTHERS MAY WRITE
+/// ([`config::read_config`], the rule every reader of it holds): the look runs `[ai]` at its
+/// defaults and says why, and the fleet URL the file names is not fetched, which the fetch says.
+/// CONTROL: the same file, private again, is read and its URL fetched.
+#[cfg(unix)]
+#[test]
+fn the_look_and_the_fetch_read_nothing_from_an_aterm_toml_others_may_write() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let b = machine(&["codex"]);
+    let (env, secret, _) = fleet_machine(&b);
+    let net = FakeFetcher::default();
+    let (doc, sig) = signed(&b, &env, &secret, "schema = 1\nseq = 1\n");
+    net.serve(FLEET_URL, &doc);
+    net.serve(&format!("{FLEET_URL}.sig"), &sig);
+    let config = env.config.clone().expect("config");
+    let chmod = |mode: u32| {
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    };
+    chmod(0o664);
+    assert_eq!(fleet_fetch(&env, &net, true), None);
+    let (code, _, err) = run_net(&env, &FakeRunner::quiet(), &net, &["fleet", "fetch"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(
+        err.contains("cannot be read (config refused: mode 664 lets other users write it"),
+        "{err}"
+    );
+    assert!(net.asked().is_empty(), "{:?}", net.asked());
+    let refused = look(&env).settings;
+    assert_eq!(
+        (refused.preferred.1, refused.fleet_source),
+        (config::From::Default, None)
+    );
+    assert!(
+        refused
+            .notes
+            .iter()
+            .any(|note| note.contains("lets other users write it")),
+        "{:?}",
+        refused.notes
+    );
+    chmod(0o600);
+    assert!(matches!(
+        fleet_fetch(&env, &net, true),
+        Some(Fetched::Fresh(1))
+    ));
+    assert_eq!(net.asked().len(), 2, "{:?}", net.asked());
+    let read = look(&env).settings;
+    assert_eq!(
+        (read.preferred.0.id, read.preferred.1),
+        ("codex", config::From::Local)
+    );
+    assert_eq!(read.fleet_source.as_deref(), Some(FLEET_URL));
+}
+
 #[test]
 fn unreadable_ancestry_never_becomes_a_persons_yolo_review() {
     struct Tree {
@@ -1042,7 +1096,7 @@ fn look_honours_harness_accounts_off_from_a_custom_config_file_name() {
         .expect("init codex store");
 
     let make_env = |body: &str| {
-        std::fs::write(&custom_cfg, body).expect("write custom config");
+        crate::test_config::write(&custom_cfg, body).expect("write custom config");
         let mut env = env_of(&b, "", &[], true);
         env.config = Some(custom_cfg.clone());
         env.harness_state = Some(harness_state.clone());
@@ -1065,6 +1119,65 @@ fn look_honours_harness_accounts_off_from_a_custom_config_file_name() {
             .and_then(|p| p.serving_label.as_deref()),
         Some("work-1")
     );
+
+    // The same file, group-writable, is not read ([`config::read_config`]): the harness reads it
+    // as off (`SupervisorConfig::unread_config`), as every pool's launch does, so unpinned work-1
+    // does not serve whatever the file says, and the look says why.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let env = make_env("[harness]\naccounts = \"early\"\n[ai]\npreferred = \"codex\"\n");
+        std::fs::set_permissions(&custom_cfg, std::fs::Permissions::from_mode(0o664))
+            .expect("chmod");
+        let refused = look(&env);
+        let codex_refused = refused
+            .facts
+            .iter()
+            .find(|f| f.connector.id == "codex")
+            .expect("codex facts");
+        assert_eq!(
+            codex_refused
+                .pool
+                .as_ref()
+                .expect("codex pool")
+                .serving_label
+                .as_deref(),
+            None,
+            "a refused config turns rotation off"
+        );
+        assert!(
+            refused
+                .settings
+                .notes
+                .iter()
+                .any(|note| note.contains("lets other users write it")),
+            "{:?}",
+            refused.settings.notes
+        );
+        // A file only the AI settings refuse, a comment's byte not UTF-8: the supervisor reads
+        // it (lossily), so its `accounts = "early"` rotates as every pool's launch does, and
+        // unpinned work-1 serves.
+        let env = make_env("");
+        std::fs::write(
+            &custom_cfg,
+            b"# caf\xe9\n[harness]\naccounts = \"early\"\n[ai]\npreferred = \"codex\"\n",
+        )
+        .expect("write the config");
+        std::fs::set_permissions(&custom_cfg, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod");
+        let lossy = look(&env);
+        assert_eq!(
+            lossy
+                .facts
+                .iter()
+                .find(|f| f.connector.id == "codex")
+                .and_then(|f| f.pool.as_ref())
+                .and_then(|p| p.serving_label.as_deref()),
+            Some("work-1"),
+            "a config the supervisor reads rotates as it says: {:?}",
+            lossy.settings.notes
+        );
+    }
 
     // With accounts = "off" in custom-profile.toml (no aterm.toml present), unpinned work-1 does
     // not serve; pinning work-1 serves it even under Mode::Off.

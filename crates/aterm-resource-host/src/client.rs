@@ -184,3 +184,8 @@ pub fn authorize(request: &Submission, peer: Peer) -> bool {
 pub fn submit(submission: AuthorizedSubmission) -> io::Result<()> {
     existing()?.submit(submission)
 }
+/// Submit only through the explicitly negotiated owning-wait accounting route.
+/// Delivery failure is ambiguous and never permits a second attempt.
+pub fn submit_accounted(submission: AuthorizedSubmission) -> io::Result<()> {
+    existing()?.submit_accounted(submission)
+}

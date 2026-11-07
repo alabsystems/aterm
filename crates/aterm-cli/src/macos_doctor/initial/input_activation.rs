@@ -120,17 +120,6 @@ pub(super) fn revision_at(root: &Path) -> Result<Option<u64>, String> {
     ))
 }
 
-/// The exact accepted Caps-setting revision, after Caps applied or was carried from an earlier run. No
-/// profile is inferred or widened; Off, Stop, Restore and unreadable records grant nothing.
-/// A selection-only older setup's applied workstation pass retains its original revision zero.
-///
-/// # Errors
-/// This account's scope or its setup records cannot be read.
-pub fn input_activation_revision() -> Result<Option<u64>, String> {
-    ensure_person_scope()?;
-    revision_at(&state_root()?)
-}
-
 /// Activate only newly attached services under their original accepted Caps setting. The
 /// profile lock orders the operation against choices and Restore, while both the durable and
 /// this process's immediate Stop are checked before each whole item.

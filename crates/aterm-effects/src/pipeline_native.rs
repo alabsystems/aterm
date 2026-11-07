@@ -700,6 +700,7 @@ impl EffectsPipeline {
         self.companions.drain_serious();
         self.decos.hard_reset();
         self.flying_sky_row = None;
+        self.flying_fit = crate::rainbow_kitty::companion::HeadFit::WHOLE;
         self.rain = None;
         self.cursor.glow_scratch.clear();
         self.cursor.glow.clear_out_ramps();
@@ -847,6 +848,7 @@ impl EffectsPipeline {
         self.cursor.trail.reset();
         self.decos.rebase_kitty_cursor_placement();
         self.flying_sky_row = None;
+        self.flying_fit = crate::rainbow_kitty::companion::HeadFit::WHOLE;
         self.companion.resight_owner();
         self.cursor_scroll_state = None;
         self.cursor_owner_space = None;
@@ -895,6 +897,7 @@ impl EffectsPipeline {
         self.cursor.retire_body_geometry();
         self.decos.rebase_kitty_cursor_placement();
         self.flying_sky_row = None;
+        self.flying_fit = crate::rainbow_kitty::companion::HeadFit::WHOLE;
         self.free_scratch.clear();
     }
 
@@ -1422,6 +1425,8 @@ impl EffectsPipeline {
         }
         let Body::Flying { cell } = body else {
             self.flying_sky_row = None;
+            self.flying_fit = companion::HeadFit::WHOLE;
+            self.flying_fit_goal = None;
             return FlyingSeat::default();
         };
         let look = cat_frame.render_look();
@@ -1459,6 +1464,60 @@ impl EffectsPipeline {
             },
             ink,
         );
+        // The head fitted to its row while no whole seat clears with air to spare: its size for
+        // this frame ([`companion::HeadFit`]), its goal read here, entered from
+        // [`Self::prepare_flying_head`], once the placement's letter law has had its say.
+        let (cw, ch) = (i32::from(geom.cell_w), i32::from(geom.cell_h));
+        let gap = (WordDecorations::kitty_cursor_lead_px(geom.cell_w)
+            / crate::word_decorations::HEAD_CARET_GAP_DEN)
+            .max(1);
+        let fit_seat = companion::head_fit_seat(cell, rest, (cw, ch, geom.cols), gap, &ink);
+        let whole_clear = !seat.over_ink
+            && companion::box_clear(
+                (seat.x, seat.y, i32::from(seat.w), i32::from(seat.h)),
+                cell,
+                (cw, ch, geom.rows, geom.cols),
+                gap,
+                &ink,
+            );
+        self.flying_fit_goal = fit_seat.map(|(goal, _)| (goal, now, animate));
+        match fit_seat {
+            Some((goal, _)) if self.flying_fit.fitted() && !whole_clear => {
+                self.flying_fit.aim(goal, now, animate);
+            }
+            _ if self.flying_fit.fitted() => self.flying_fit.aim(1.0, now, animate),
+            _ => {}
+        }
+        let fit = self.flying_fit.at(now);
+        if fit < 1.0 {
+            // At the size it stands at now, on the caret's row: the layout's lift takes the
+            // margin's rise back off, and the pose's lead carries it from its whole box's middle
+            // to its place.
+            let (rest_w, rest_h) = (f32::from(rest.w), f32::from(rest.h));
+            let (w, h) = ((rest_w * fit).round() as i32, (rest_h * fit).round() as i32);
+            let grid_w = i32::from(geom.cols).saturating_mul(cw);
+            let caret_right = (i32::from(cell.1) + 1).saturating_mul(cw);
+            let x = (caret_right + gap).min(grid_w - w).max(0);
+            let y = i32::from(cell.0) * ch + (ch - h) / 2;
+            let row_top = i32::from(cell.0) * ch + ch / 2 - i32::from(rest.h) / 2;
+            let bob_px = (cat_frame.bob * f32::from(geom.cell_h)).round() as i32;
+            let lift = (rest.y - (row_top + bob_px)) as f32 / f32::from(geom.cell_h);
+            let lead_px = x - (rest.x + i32::from(rest.w) / 2 - w / 2);
+            if geom.cell_w > 0 {
+                let facing_left = self.companions.cursor_cat.placement_frame(now).facing_left;
+                let lead_cells = lead_px as f32 / f32::from(geom.cell_w);
+                cat_frame.pose.lead += if facing_left { -lead_cells } else { lead_cells };
+            }
+            cat_frame.pose.scale_x *= fit;
+            cat_frame.pose.scale_y *= fit;
+            // No hover: a box with a pixel to spare in its row would bob out of it.
+            cat_frame.bob = 0.0;
+            self.flying_sky_row = None;
+            return FlyingSeat {
+                lift,
+                px: Some((x, x + w, y, y + h)),
+            };
+        }
         self.flying_sky_row = if seat.lift_rows > 0 && !seat.over_ink {
             Some(cell.0)
         } else {
@@ -1517,9 +1576,33 @@ impl EffectsPipeline {
             .decos
             .prepare_kitty_cursor_placement(layout, motion, pose)?;
         let cols = layout.geom.cols;
-        placement.keep_off_letters(layout.geom, layout.cursor, |row, col| {
-            crate::rainbow_kitty::companion::cell_ink(cells, row, col, cols)
-        });
+        let ink =
+            |row: u16, col: u16| crate::rainbow_kitty::companion::cell_ink(cells, row, col, cols);
+        if self.flying_fit.fitted() {
+            placement.keep_fitted_off_letters(layout.geom, layout.cursor, ink);
+        } else {
+            placement.keep_off_letters(layout.geom, layout.cursor, ink);
+            // The whole head nothing cleared: fit it, from the next frame. Not for its way across
+            // a wrap, which passes over letters on its way to a seat that may well clear.
+            if !placement.in_motion()
+                && let (Some(rect), Some((goal, now, animate))) =
+                    (placement.drawn_footprint(), self.flying_fit_goal)
+                && !crate::rainbow_kitty::companion::box_clear(
+                    (rect.x, rect.y, i32::from(rect.w), i32::from(rect.h)),
+                    layout.cursor,
+                    (
+                        i32::from(layout.geom.cell_w),
+                        i32::from(layout.geom.cell_h),
+                        layout.geom.rows,
+                        cols,
+                    ),
+                    0,
+                    &ink,
+                )
+            {
+                self.flying_fit.aim(goal, now, animate);
+            }
+        }
         Some(placement)
     }
 
@@ -2120,6 +2203,211 @@ mod flying_head_tests {
 
     fn blank() -> Vec<Vec<RenderCell>> {
         vec![vec![RenderCell::default(); 120]; 24]
+    }
+
+    /// A frame of [`head_walk`]: its caret, its drawn box `(x0, x1, y0, y1)`, if any, and its fit.
+    type HeadFrame = ((u16, u16), Option<(i32, i32, i32, i32)>, f32);
+
+    /// The caret taken along `path` on the page `cells`, one key each `key_ms`, each cell it leaves
+    /// lettered, for `frames`, 16 ms apart, the head routed and placed each frame as the host does:
+    /// each frame's caret, drawn box `(x0, x1, y0, y1)`, if any, and fit.
+    fn head_walk(
+        mut cells: Vec<Vec<RenderCell>>,
+        path: &[(u16, u16)],
+        key_ms: u64,
+        frames: u64,
+    ) -> Vec<HeadFrame> {
+        let t0 = Instant::now();
+        let mut fx = EffectsPipeline::default();
+        let cfg = rainbow_kitty();
+        let mut sprites = Vec::new();
+        fx.cursor_mut()
+            .glow
+            .tick(Some(path[0]), t0, &cfg, glow_geom(), &mut sprites);
+        let cat = &mut fx.companions_mut().cursor_cat;
+        cat.on_collect(t0, KittyLook::for_app("claude"));
+        cat.set_collection_presentable(t0, true);
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        let mut fold = None;
+        for f in 0..frames {
+            let now = t0 + Duration::from_millis(16 * f);
+            if f * 16 >= (at as u64 + 1) * key_ms && at + 1 < path.len() {
+                let (r, c) = path[at];
+                cells[usize::from(r)][usize::from(c)].ch = 'x';
+                at += 1;
+                if path[at].0 != r {
+                    fold = Some(now);
+                }
+            }
+            let cell = path[at];
+            let mut frame = fx.companions_mut().cursor_cat.frame(now);
+            let seat = fx.route_flying_head(
+                CompanionDuty::FlyingHead { cell },
+                &cells,
+                now,
+                GEOM,
+                &mut frame,
+                true,
+            );
+            let mut motion = fx.companions().cursor_cat.placement_frame(now);
+            // The line fold as the glow classifies a wrap and the cat clocks it.
+            motion.fold = fold.and_then(|started| {
+                let progress = now.saturating_duration_since(started).as_secs_f32()
+                    / crate::kitty_cursor::CURSOR_FOLD_DURATION.as_secs_f32();
+                (progress < 1.0).then_some(crate::kitty_cursor::CatFoldFrame {
+                    started,
+                    direction: crate::kitty_cursor::CatFoldDirection::Forward,
+                    progress,
+                })
+            });
+            let placed = fx.prepare_flying_head(
+                KittyCursorLayout {
+                    lift: seat.lift,
+                    ..layout(cell, &frame)
+                },
+                motion,
+                frame.pose,
+                &cells,
+            );
+            let drawn = placed
+                .and_then(|p| p.drawn_footprint())
+                .map(|r| (r.x, r.x + i32::from(r.w), r.y, r.y + i32::from(r.h)));
+            // Drawn as the host draws it: the placement's fold reads the last frame it emitted.
+            if let Some(placed) = placed {
+                let _ = fx.draw_flying_head(
+                    CanvasInk::Window,
+                    crate::word_decorations::KittyCursorFrame {
+                        geom: GEOM,
+                        cursor: cell,
+                        look: frame.render_look(),
+                        colors: crate::cat_baker::CatColorKey::default(),
+                        bob: frame.bob,
+                        lift: seat.lift,
+                        alpha: 255,
+                        pose: frame.pose,
+                        sing: 0.0,
+                        notes: [None; crate::kitty_sing::MAX_NOTES],
+                    },
+                    placed,
+                );
+            }
+            out.push((cell, drawn, fx.flying_fit.at(now)));
+        }
+        out
+    }
+
+    /// The caret walked along the grid's last row under a page whose every other row holds a
+    /// letter in every cell, the one over the caret among them: each frame's caret, drawn box and
+    /// fit, `(row, col, x0, x1, y0, y1, fit)`.
+    fn last_row_walk(
+        from: u16,
+        to: u16,
+        key_ms: u64,
+        frames: u64,
+    ) -> Vec<(u16, u16, i32, i32, i32, i32, f32)> {
+        let mut cells = blank();
+        for row in (0..=22).step_by(2) {
+            for c in &mut cells[row] {
+                c.ch = 'x';
+            }
+        }
+        for c in &mut cells[23][..usize::from(from)] {
+            c.ch = 'x';
+        }
+        let path: Vec<(u16, u16)> = (from..=to).map(|col| (23, col)).collect();
+        head_walk(cells, &path, key_ms, frames)
+            .into_iter()
+            .map(|((row, col), drawn, fit)| {
+                let (x0, x1, y0, y1) = drawn.expect("the head is drawn in every frame");
+                (row, col, x0, x1, y0, y1, fit)
+            })
+            .collect()
+    }
+
+    /// A HEAD ON ITS WAY ACROSS A WRAP IS NOT FITTED FOR IT. The fold takes it off the right edge
+    /// and in from the left, over the letters of the row it comes to, to a whole seat clear over
+    /// the line: fitted from a frame of that way, it stayed fitted, and ran on along the new row's
+    /// letters (the trail gallery's `focus-wrap`, tail06-e, on every page).
+    #[test]
+    fn a_head_crossing_a_wrap_is_not_fitted_for_its_way_across() {
+        let mut cells = blank();
+        for c in &mut cells[8] {
+            c.ch = 'x';
+        }
+        for c in &mut cells[9][..112] {
+            c.ch = 'x';
+        }
+        for c in &mut cells[11][..8] {
+            c.ch = 'x';
+        }
+        let mut path: Vec<(u16, u16)> = (112..120).map(|col| (9, col)).collect();
+        path.extend((0..8).map(|col| (10, col)));
+        let walk = head_walk(cells, &path, 60, 300);
+        assert!(
+            walk.iter().any(|f| f.0.0 == 10),
+            "fixture: the caret reached the row the wrap brings it to"
+        );
+        let fitted: Vec<_> = walk.iter().filter(|f| f.2 < 1.0).collect();
+        assert!(
+            fitted.is_empty(),
+            "{} frames fitted for a way with a whole seat at its end, the first {:?}",
+            fitted.len(),
+            fitted.first()
+        );
+    }
+
+    /// THE HEAD FITS ITS ROW WHERE NO SEAT HOLDS IT WHOLE ([`companion::HeadFit`]): typed along a
+    /// full page's last row, under a row of letters in every cell, up to and past where its
+    /// whole seat runs out at the margin, the head is drawn in every frame, and from its ease's
+    /// end its box lies inside the caret's row and off the caret's cell and every letter, to the
+    /// last column it has room past the caret. Its fit only falls with the room, so it does not
+    /// pulse. Negative control: without the fit the head lies on the row above.
+    #[test]
+    fn the_head_fits_its_row_where_no_seat_holds_it_whole() {
+        const LAST_ROOM: u16 = 116;
+        let ch = i32::from(GEOM.cell_h);
+        let cw = i32::from(GEOM.cell_w);
+        let walk = last_row_walk(60, LAST_ROOM, 50, 1_200);
+        let settled = (0.3 * 1000.0 / 16.0) as usize;
+        let mut least = 1.0f32;
+        for &(row, col, x0, x1, y0, y1, fit) in &walk[settled..] {
+            assert!(
+                y0 >= i32::from(row) * ch && y1 <= (i32::from(row) + 1) * ch,
+                "caret ({row}, {col}): the head's box {x0}..{x1} x {y0}..{y1} leaves its row"
+            );
+            assert!(
+                x0 >= (i32::from(col) + 1) * cw,
+                "caret ({row}, {col}): the head's box {x0}..{x1} x {y0}..{y1} meets the caret or \
+                 the letters behind it"
+            );
+            assert!(
+                fit <= least,
+                "caret ({row}, {col}): the head's fit grew back from {least} to {fit}"
+            );
+            least = fit;
+        }
+        assert!(
+            least >= crate::rainbow_kitty::companion::HEAD_FIT_FLOOR,
+            "the head stayed big enough to read: fit {least}"
+        );
+        crate::rainbow_kitty::companion::set_head_fit_unread(true);
+        let whole = last_row_walk(60, LAST_ROOM, 50, 1_200);
+        crate::rainbow_kitty::companion::set_head_fit_unread(false);
+        let &(row, _, _, _, y0, ..) = whole.last().expect("frames");
+        assert!(
+            y0 < i32::from(row) * ch,
+            "negative control: without the fit the head still kept off the row above"
+        );
+        // To the last column, where no room is left past the caret: still fitted to its row, at
+        // the grid's end, and not back over the row above.
+        let to_the_end = last_row_walk(60, 119, 50, 1_400);
+        let &(row, col, x0, x1, y0, y1, _) = to_the_end.last().expect("frames");
+        assert_eq!(col, 119, "the caret reached the last column");
+        assert!(
+            y0 >= i32::from(row) * ch && y1 <= (i32::from(row) + 1) * ch,
+            "at the last column the head's box {x0}..{x1} x {y0}..{y1} left its row"
+        );
     }
 
     /// §7.2(a): on the teleport frame the placement snaps to the landing, the spine is floored

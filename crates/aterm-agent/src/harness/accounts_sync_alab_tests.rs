@@ -180,7 +180,7 @@ fn a_cli_sync_from_a_settled_lab_migrates_the_label_and_keeps_the_login() {
     fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(&config).unwrap();
     let toml = config.join("aterm.toml");
-    fs::write(&toml, "").unwrap();
+    crate::test_config::write(&toml, "").unwrap();
     let cli = Cli::Kimi;
     let roster_path = accounts::roster_beside_for(&toml, cli).unwrap();
     let store = accounts::Store::at_for(&state_dir, cli, &home);
@@ -296,7 +296,7 @@ fn a_cli_sync_from_a_lab_that_prefers_nothing_here_keeps_every_row_and_clears_ho
     fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(&config).unwrap();
     let toml = config.join("aterm.toml");
-    fs::write(&toml, "").unwrap();
+    crate::test_config::write(&toml, "").unwrap();
     let cli = Cli::Kimi;
     let region = accounts::Vendor {
         region: Some(crate::ai::connector::Region::Global),
@@ -378,7 +378,7 @@ impl Bed {
         let home = root.path().join("home");
         let config = home.join(".config/aterm/aterm.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
-        fs::write(&config, "").unwrap();
+        crate::test_config::write(&config, "").unwrap();
         if let Some(local) = default {
             fs::write(
                 home.join(".claude.json"),
@@ -767,7 +767,7 @@ fn a_mac_the_lab_names_reads_no_sheet_in_its_upkeep() {
     fs::create_dir_all(&config_dir).unwrap();
     fs::create_dir_all(home.join(".secrets")).unwrap();
     let toml = config_dir.join("aterm.toml");
-    fs::write(&toml, "").unwrap();
+    crate::test_config::write(&toml, "").unwrap();
     let roster_path = config_dir.join(accounts::ACCOUNTS_FILE);
     fs::write(
         &roster_path,
@@ -927,7 +927,7 @@ fn a_first_lab_sync_lists_the_default_login_under_its_lab_label() {
         fs::create_dir_all(&config).unwrap();
         fs::create_dir_all(&state).unwrap();
         let toml = config.join("aterm.toml");
-        fs::write(&toml, "").unwrap();
+        crate::test_config::write(&toml, "").unwrap();
         if keyring {
             fs::write(
                 home.join(".codex/config.toml"),

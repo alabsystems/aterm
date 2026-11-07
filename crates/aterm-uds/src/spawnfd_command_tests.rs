@@ -100,6 +100,8 @@ fn resource_accounting_reaps_once_and_keeps_the_childs_status() {
     assert_eq!(usage.status.code(), Some(7));
     assert!(usage.maxrss >= ALLOCATED as u64, "{usage:?}");
     assert!(usage.cpu > Duration::ZERO, "{usage:?}");
+    assert!(usage.user > Duration::ZERO, "{usage:?}");
+    assert_eq!(usage.cpu, usage.user + usage.system);
     assert_eq!(child.try_wait_with_rusage().unwrap(), Some(usage));
     assert_eq!(child.wait_with_rusage().unwrap(), usage);
     assert_eq!(child.wait().unwrap(), usage.status);

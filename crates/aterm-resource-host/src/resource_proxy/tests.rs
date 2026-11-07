@@ -10,6 +10,7 @@ impl Backend for Never {
         _: OwnedFd,
         _: StdioConfig,
         _: Delegations,
+        _: bool,
     ) -> Result<RemoteChild, SubmitError> {
         panic!("non-entry must not touch backend")
     }
@@ -41,6 +42,7 @@ fn actual_terminal_mapping_keeps_target_outcome_separate_from_helper_health() {
             outcome: admission::Outcome::Signal(9),
             cause: admission::CompletionCause::ResourceLimit,
             runtime_ns: 11,
+            accounting: None,
         },
     ));
     assert_eq!(
@@ -198,6 +200,7 @@ fn lost_attachment_ack_forwards_actual_lifecycle_without_fabricated_attached() {
     let context = Context {
         root: [1; 16],
         member: [2; 16],
+        accounted: false,
     };
     let reader = std::thread::spawn(move || {
         let mut channel = wire::Channel::new(parent).unwrap();

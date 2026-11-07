@@ -198,7 +198,7 @@ impl CaseInsensitiveMatcher {
     }
 
     #[inline]
-    const fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.lower_query.is_empty()
     }
 

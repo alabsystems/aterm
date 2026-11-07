@@ -1600,6 +1600,10 @@ mod sys {
         /// it: a folder of a hundred thousand entries is never held whole); `state` is the
         /// folder's [`Folder::fixed`] and [`Folder::locked`].
         fn empty(&mut self, listing: &mut Dir, state: &mut (bool, bool), depth: usize) -> Emptied {
+            if depth >= DEPTH && !self.unkept_to_move(listing) {
+                self.permit.stopped = true;
+                return Emptied::Below;
+            }
             let (mut went_any, mut all) = (false, true);
             loop {
                 aterm_uds::progress::tick();
@@ -1651,6 +1655,49 @@ mod sys {
             } else {
                 Emptied::Below
             }
+        }
+
+        /// WHETHER NO FOLDER `listing` HOLDS, each as deep as a walk goes and so moved up rather
+        /// than walked ([`Walk::move_up`]), holds a keep, read before any of them moves: a pass
+        /// stops at the first folder it meets holding one, and a sibling met before it would
+        /// already stand moved up under `top`, outside every folder held above it, by the order
+        /// the folder happens to list them in. Each folder of this user's on this volume is read
+        /// by its name, never through a link, and its custody read in the folder held, as
+        /// [`Walk::admit_directory`] reads it: one denying its search whose names show no
+        /// custody marker is no keep (its own turn lets it be searched and reads it again).
+        /// One that cannot be opened is left to its own turn. `listing` is rewound either way.
+        fn unkept_to_move(&mut self, listing: &mut Dir) -> bool {
+            let mut unkept = self.permit.allows();
+            while unkept {
+                let child = match listing.next() {
+                    None => break,
+                    Some(Ok(child)) => child,
+                    Some(Err(_)) => break,
+                };
+                let name = OsStr::from_bytes(child.file_name().to_bytes());
+                if name == "." || name == ".." || seams::omit_listing(name) {
+                    continue;
+                }
+                let read = dirfd::fstatat(listing.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW);
+                let Judged::Ours(stat) = verdict(read, self.device, self.uid) else {
+                    continue;
+                };
+                if !is_dir(&stat) {
+                    continue;
+                }
+                let Ok(fd) = dirfd::openat(listing.as_fd(), name, dir_flags(), Mode::empty())
+                else {
+                    continue;
+                };
+                if !dirfd::fstat(&fd).is_ok_and(|held| same(&held, &stat)) {
+                    continue;
+                }
+                unkept = self.permit.allows_at(&fd)
+                    || (dirfd::fstatat(&fd, ".", AtFlags::SYMLINK_NOFOLLOW).is_err_and(denied)
+                        && unmarked_fresh_directory(&fd));
+            }
+            listing.rewind();
+            unkept
         }
     }
 

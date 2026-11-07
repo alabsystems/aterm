@@ -14,13 +14,13 @@ use aterm_digest::Sha256;
 use crate::ledger::{Error, GitRunner, Result, git_ok, rev_parse};
 use crate::release::shell_word;
 
-pub const FACTS_MAGIC: &str = "aterm-trust facts 10";
+pub const FACTS_MAGIC: &str = "aterm-trust facts 14";
 
 pub const FACTS_END: &str = "end";
 
 pub const FACTS_PREFIX: &str = "trust-facts-";
 
-pub const PLAN_MAGIC: &str = "aterm-trust plan 1";
+pub const PLAN_MAGIC: &str = "aterm-trust plan 2";
 
 pub const RATCHET: &str = "crates/aterm-release/trust/floors.tsv";
 
@@ -161,16 +161,54 @@ pub struct Pace {
 /// How long a check's threads ran and how long they were runnable (running or waiting for a
 /// core), summed over its processes: the work each of the prover's clocks timed got
 /// `ran_ms / runnable_ms` of the time that clock counted, whatever kept its threads waiting,
-/// the host's other work or the check's own threads beyond the cores.
+/// the host's other work or the check's own threads beyond the cores. On a host with two kinds
+/// of core, `cores` says which ran them ([`Threads::worked_ms`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Threads {
     pub ran_ms: u64,
     pub runnable_ms: u64,
+    /// Where they ran, summed over the same processes; `None` where the host has one kind of
+    /// core, or any of them was read without it.
+    pub cores: Option<Cores>,
+}
+
+/// Of a check's threads' CPU time, what ran on the host's performance cores, and the
+/// instructions they retired in all and on those cores (aterm-sysprobe's `CoreSplit`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cores {
+    pub p_ms: u64,
+    pub instructions: u64,
+    pub p_instructions: u64,
+}
+
+impl Threads {
+    /// THE MODEL (FONT-ECORE-SHARE): the time they ran, an efficiency core's counted at the speed
+    /// the check's own instructions ran there against its performance cores'
+    /// (`(e_instructions / e_ms) / (p_instructions / p_ms)`), so a millisecond on an efficiency
+    /// core that retired half a performance core's instructions counts half. That is the time
+    /// their instructions would have taken on its performance cores at the rate they ran there:
+    /// `p_ms * instructions / p_instructions`, at most `ran_ms`. Live verifier threads on this
+    /// M4 Pro ran 0.44 to 0.57 of the performance cores' rate on its efficiency cores
+    /// (2026-10-27). The ratio is the run's own, so a performance core slowed itself (heat, the
+    /// GPU's share of the memory) counts as full speed. With no split, or no time or
+    /// instructions on a performance core to compare against, it is `ran_ms`.
+    #[must_use]
+    pub fn worked_ms(&self) -> u64 {
+        match self.cores {
+            Some(c) if c.p_ms > 0 && c.p_instructions > 0 => {
+                let at_p =
+                    u128::from(c.p_ms) * u128::from(c.instructions) / u128::from(c.p_instructions);
+                u64::try_from(at_p).unwrap_or(u64::MAX).min(self.ran_ms)
+            }
+            _ => self.ran_ms,
+        }
+    }
 }
 
 impl Pace {
     /// `<cpu ms> <wall ms> <load in hundredths, or -> <cores>`, then `<ran ms> <runnable ms>`
-    /// when its threads were read: the lane's `.pace` mark and the facts' field.
+    /// when its threads were read, then `<p-core ms> <instructions> <p-core instructions>` when
+    /// where they ran was too ([`Threads::cores`]): the lane's `.pace` mark and the facts' field.
     #[must_use]
     pub fn text(&self) -> String {
         let mut t = String::new();
@@ -185,6 +223,9 @@ impl Pace {
         }
         if let Some(th) = self.threads {
             let _ = write!(t, " {} {}", th.ran_ms, th.runnable_ms);
+            if let Some(c) = th.cores {
+                let _ = write!(t, " {} {} {}", c.p_ms, c.instructions, c.p_instructions);
+            }
         }
         t
     }
@@ -194,12 +235,34 @@ impl Pace {
     pub fn parse(s: &str) -> Option<Pace> {
         let mut parts = s.split(' ');
         let (cpu, wall, load, cores) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
-        let threads = match (parts.next(), parts.next(), parts.next()) {
-            (None, None, None) => None,
-            (Some(ran), Some(runnable), None) => Some(Threads {
+        let threads = |ran: &str, runnable: &str, cores: Option<Cores>| {
+            Some(Threads {
                 ran_ms: parse_uint(ran)?,
                 runnable_ms: parse_uint(runnable)?,
-            }),
+                cores,
+            })
+        };
+        let rest: [Option<&str>; 6] = std::array::from_fn(|_| parts.next());
+        let threads = match rest {
+            [None, None, None, None, None, None] => None,
+            [Some(ran), Some(runnable), None, None, None, None] => {
+                Some(threads(ran, runnable, None)?)
+            }
+            [
+                Some(ran),
+                Some(runnable),
+                Some(p),
+                Some(all),
+                Some(p_all),
+                None,
+            ] => {
+                let split = Cores {
+                    p_ms: parse_uint(p)?,
+                    instructions: parse_uint(all)?,
+                    p_instructions: parse_uint(p_all)?,
+                };
+                Some(threads(ran, runnable, Some(split))?)
+            }
             _ => return None,
         };
         Some(Pace {
@@ -219,14 +282,15 @@ impl Pace {
         self.threads.as_ref().filter(|t| t.runnable_ms > 0)
     }
 
-    /// Starved: its threads ran under 0.8 of the time they were runnable; where they were not
-    /// read, its CPU was under 0.8 of its wall time or the load was above the cores. The load
-    /// counts the check's own threads and work that yields to them, so it stands in only for
-    /// the share it cannot see.
+    /// Starved: its threads ran under 0.8 of the time they were runnable, an efficiency core's
+    /// time counted at its speed ([`Threads::worked_ms`]); where they were not read, its CPU
+    /// was under 0.8 of its wall time or the load was above the cores. The load counts the
+    /// check's own threads and work that yields to them, so it stands in only for the share it
+    /// cannot see.
     #[must_use]
     pub fn starved(&self) -> bool {
         if let Some(t) = self.share() {
-            return t.ran_ms.saturating_mul(10) < t.runnable_ms.saturating_mul(8);
+            return t.worked_ms().saturating_mul(10) < t.runnable_ms.saturating_mul(8);
         }
         (self.wall_ms > 0 && self.cpu_ms.saturating_mul(10) < self.wall_ms.saturating_mul(8))
             || self
@@ -237,8 +301,13 @@ impl Pace {
     /// What a run on the same host needs to be decided ([`Pace::starved`]).
     #[must_use]
     pub fn unstarved(&self) -> String {
-        if self.share().is_some() {
-            "threads that run at least 0.80 of the time they are runnable".to_string()
+        if let Some(t) = self.share() {
+            let speed = if t.cores.is_some() {
+                ", counting an efficiency core's time at its speed"
+            } else {
+                ""
+            };
+            format!("threads that run at least 0.80 of the time they are runnable{speed}")
         } else {
             format!(
                 "CPU/wall at least 0.80 and a mean load of at most {} (its cores)",
@@ -248,8 +317,10 @@ impl Pace {
     }
 
     /// `CPU/wall 0.40, load 30.00 on 14 cores`, then `, threads ran 0.57 of their runnable
-    /// time, 11.86 of them runnable on average` when they were read; an average above the cores
-    /// says the check's own threads kept each other waiting.
+    /// time, 11.86 of them runnable on average` when they were read, with `(0.49 at a
+    /// performance core's speed: 0.26 of it on efficiency cores, at 0.50 of that speed)` after
+    /// the share where some of it ran on efficiency cores ([`Threads::worked_ms`]); an average
+    /// above the cores says the check's own threads kept each other waiting.
     #[must_use]
     pub fn said(&self) -> String {
         let hundredths = |n: u64| format!("{}.{:02}", n / 100, n % 100);
@@ -266,9 +337,29 @@ impl Pace {
             self.cores
         );
         if let Some(t) = self.share() {
+            let mut speed = String::new();
+            if let Some(c) = t.cores.filter(|c| c.p_ms < t.ran_ms) {
+                let e_ms = t.ran_ms - c.p_ms;
+                let rate = if c.p_ms > 0 && c.p_instructions > 0 {
+                    // (e_instructions / e_ms) / (p_instructions / p_ms), in hundredths.
+                    let e = u128::from(c.instructions.saturating_sub(c.p_instructions))
+                        * u128::from(c.p_ms);
+                    let p = u128::from(c.p_instructions) * u128::from(e_ms);
+                    let of = (e * 100 + p / 2) / p;
+                    let of = hundredths(u64::try_from(of).unwrap_or(u64::MAX));
+                    format!("at {of} of that speed")
+                } else {
+                    "counted at full speed, with no performance core's rate to compare".to_string()
+                };
+                speed = format!(
+                    " ({} at a performance core's speed: {} of it on efficiency cores, {rate})",
+                    ratio(t.worked_ms(), t.runnable_ms),
+                    ratio(e_ms, t.ran_ms)
+                );
+            }
             let _ = write!(
                 said,
-                ", threads ran {} of their runnable time, {} of them runnable on average",
+                ", threads ran {} of their runnable time{speed}, {} of them runnable on average",
                 ratio(t.ran_ms, t.runnable_ms),
                 ratio(t.runnable_ms, self.wall_ms)
             );
@@ -1493,6 +1584,7 @@ impl HostObs {
             ceil: self.ceil.clone(),
             peak: self.peak.clone(),
             when: self.when.clone(),
+            prover: String::new(),
         }
     }
 }
@@ -1507,21 +1599,33 @@ pub struct Seen {
     pub ceil: String,
     pub peak: String,
     pub when: String,
+    /// The prover whose cost row an [`OTHER_PEAK`] or [`OTHER_LEAST`] refusal read (its
+    /// `targo --version`), empty for any other ([`Peak::of`]).
+    pub prover: String,
 }
+
+/// What a plan or a facts record says of a library no [`Seen`] refused.
+const NO_SEEN: &str = "-\t-\t-\t-\t-";
 
 impl Seen {
     fn fields(&self) -> String {
+        let prover = if self.prover.is_empty() {
+            "-"
+        } else {
+            &self.prover
+        };
         format!(
-            "{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}",
             one_line_cow(&self.outcome),
             one_line_cow(&self.ceil),
             one_line_cow(&self.peak),
             one_line_cow(&self.when),
+            one_line_cow(prover),
         )
     }
 
     fn from_fields(f: &[&str]) -> Option<Option<Seen>> {
-        let [outcome, ceil, peak, when] = f else {
+        let [outcome, ceil, peak, when, prover] = f else {
             return None;
         };
         Some((*outcome != "-").then(|| Seen {
@@ -1529,6 +1633,11 @@ impl Seen {
             ceil: (*ceil).into(),
             peak: (*peak).into(),
             when: (*when).into(),
+            prover: if *prover == "-" {
+                String::new()
+            } else {
+                (*prover).into()
+            },
         }))
     }
 }
@@ -1654,8 +1763,52 @@ pub(crate) fn memory_refusal(
 
 /// The [`Seen::outcome`] of a library refused because its last recorded check's peak, with
 /// the margin its check claims, is not below what this host can ever have available
-/// ([`peak_seen`]): its `peak` is that peak in bytes, its `when` the cost history's stamp.
+/// ([`peak_seen`]): its `peak` is that peak in bytes, its `when` the cost history's stamp. The
+/// peak's cost row names no prover: it was recorded before rows named one, and is read under
+/// any prover until one records its own.
 pub const PEAK: &str = "peak";
+
+/// A [`PEAK`] refusal whose cost row names the prover that runs: that prover's own peak.
+pub const OWN_PEAK: &str = "own-peak";
+
+/// A [`PEAK`] refusal whose row's check was cut short (over budget, interrupted, or ended
+/// without a whole summary): its peak is the least the check needs.
+pub const LEAST: &str = "least";
+
+/// An [`OWN_PEAK`] refusal whose row's check was cut short, as [`LEAST`].
+pub const OWN_LEAST: &str = "own-least";
+
+/// A [`PEAK`] refusal whose cost row another prover recorded ([`Seen::prover`]): no check of
+/// the library under the prover that runs has finished, and the other prover's peak of the
+/// same library is the best estimate there is of what its check needs ([`Peak::of`]).
+pub const OTHER_PEAK: &str = "other-peak";
+
+/// An [`OTHER_PEAK`] refusal whose row's check was cut short, as [`LEAST`].
+pub const OTHER_LEAST: &str = "other-least";
+
+/// A library's last recorded check, as the cost history holds it for the prover that runs
+/// ([`Plan::admit`]): a row that prover recorded, or one that names no prover; or, where no
+/// check under that prover has finished and its own row's peak is not refused by itself,
+/// another prover's row whose peak is larger ([`Peak::of`]), which sizes the claim and refuses
+/// up front but decides nothing else.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Peak {
+    /// Its largest process's peak RSS, in bytes.
+    pub rss: u64,
+    /// When it was recorded (RFC 3339).
+    pub when: String,
+    /// Whether its row names the prover that runs; one that names none predates rows that do.
+    pub own: bool,
+    /// Whether its check was cut short, so that `rss` is the least it needs.
+    pub least: bool,
+    /// The prover that recorded it (its `targo --version`) where that is another prover than
+    /// the one that runs, empty otherwise. aterm-gui's check under 29ebb403d starts with no row
+    /// of its own; claiming what an unmeasured library claims (16 GiB) let one under 20565c325
+    /// reach a 33 GB footprint while the capacity queue held the other steps' claims for two
+    /// hours on 2026-10-30, so another prover's peak of the same library stands until one of
+    /// its own decides: a finished check, or a peak refused by itself.
+    pub of: String,
+}
 
 /// A library whose last recorded check peaked at `maxrss` bytes (the cost history's largest
 /// process, stamped `when`) so near this host's memory that its claim
@@ -1666,12 +1819,24 @@ pub const PEAK: &str = "peak";
 /// reaches that, so the launch gate could never admit it
 /// ([`aterm_capacity::never`]), and a peak above the RAM cannot fit at all. It is refused up
 /// front whatever the prover's ceiling, its row's ceiling the reach it was held to (`-` where
-/// that was the RAM). `None` when its claim is below that, or the RAM is unread.
+/// that was the RAM), its outcome [`OWN_PEAK`] where the row names the prover that runs,
+/// [`OTHER_PEAK`] where it names another ([`Peak::of`]) and [`PEAK`] where it names none
+/// ([`OWN_LEAST`], [`OTHER_LEAST`] and [`LEAST`] where its check was cut short, so that the
+/// peak is the least it needs). `None` when its claim is below that, or the RAM is unread.
 #[must_use]
-pub fn peak_seen(host: &Host, maxrss: u64, when: &str) -> Option<Seen> {
+pub fn peak_seen(host: &Host, peak: &Peak) -> Option<Seen> {
+    let (maxrss, when) = (peak.rss, peak.when.as_str());
     let below = host.admits_below();
     (host.mem > 0 && aterm_capacity::peak_claim(maxrss) >= below).then(|| Seen {
-        outcome: PEAK.into(),
+        outcome: match (peak.own, !peak.of.is_empty(), peak.least) {
+            (_, true, false) => OTHER_PEAK,
+            (_, true, true) => OTHER_LEAST,
+            (true, false, false) => OWN_PEAK,
+            (false, false, false) => PEAK,
+            (true, false, true) => OWN_LEAST,
+            (false, false, true) => LEAST,
+        }
+        .into(),
         ceil: if below < host.mem {
             below.to_string()
         } else {
@@ -1683,40 +1848,64 @@ pub fn peak_seen(host: &Host, maxrss: u64, when: &str) -> Option<Seen> {
         } else {
             when.into()
         },
+        prover: peak.of.clone(),
     })
 }
 
-/// The one line a [`PEAK`] refusal says: the peak, its date and this host's RAM, and the
-/// claim when the peak itself is below the RAM, with the memory that can ever be available
-/// where the row holds it ([`peak_seen`]). Its token is the claim, the memory a host must be
-/// able to make available to admit it. `None` for any other [`Seen`].
+/// The one line a [`PEAK`], [`OWN_PEAK`], [`OTHER_PEAK`], [`LEAST`], [`OWN_LEAST`] or
+/// [`OTHER_LEAST`] refusal says: whose peak it is (this prover's, another named prover's with
+/// none finished under this one, or a row's that names none), the peak, and where its check was
+/// cut short that it is the least the check needs, its date and this host's RAM, and the claim
+/// when the peak itself is below the RAM, with the memory that can ever be available where the
+/// row holds it ([`peak_seen`]). Its token is the claim, the memory a host must be able to make
+/// available to admit it. `None` for any other [`Seen`].
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn peak_refusal(host: &Host, name: &str, seen: &Seen) -> Option<Refusal> {
-    let peak: u64 = parse_uint(&seen.peak).filter(|_| seen.outcome == PEAK)?;
+    let (own, least) = match seen.outcome.as_str() {
+        PEAK | OTHER_PEAK => (false, false),
+        OWN_PEAK => (true, false),
+        LEAST | OTHER_LEAST => (false, true),
+        OWN_LEAST => (true, true),
+        _ => return None,
+    };
+    let peak: u64 = parse_uint(&seen.peak)?;
     let claim = aterm_capacity::peak_claim(peak);
     let gb = |b: u64| b as f64 / 1e9;
     let on = match seen.when.get(..10) {
         Some(day) if seen.when != "-" => format!(" on {day}"),
         _ => String::new(),
     };
+    let check = if own {
+        "its last check under this prover".to_string()
+    } else if matches!(seen.outcome.as_str(), OTHER_PEAK | OTHER_LEAST) {
+        format!(
+            "no check of it under this prover has finished, and its last check under {}",
+            seen.prover
+        )
+    } else {
+        "its last check, on a cost row that names no prover,".to_string()
+    };
+    let peaked = if least {
+        format!(
+            "was cut short after reaching {:.2} GB{on}, the least it needs",
+            gb(peak)
+        )
+    } else {
+        format!("peaked at {:.2} GB{on}", gb(peak))
+    };
     let ram = format!("{:.1} GB ({} GiB) of RAM", gb(host.mem), host.ram_gib());
     let reach = parse_uint::<u64>(&seen.ceil).filter(|r| *r < host.mem);
     let why = if peak > host.mem {
-        format!(
-            "its last check peaked at {:.2} GB{on}, above this host's {ram}",
-            gb(peak)
-        )
+        format!("{check} {peaked}, above this host's {ram}")
     } else if let Some(reach) = reach {
         format!(
-            "its last check peaked at {:.2} GB{on}, and with its margin it claims {:.2} GB, not below the {:.1} GB of this host's {ram} that can ever be available, the rest being wired",
-            gb(peak),
+            "{check} {peaked}, and with its margin it claims {:.2} GB, not below the {:.1} GB of this host's {ram} that can ever be available, the rest being wired",
             gb(claim),
             gb(reach)
         )
     } else {
         format!(
-            "its last check peaked at {:.2} GB{on}, and with its margin it claims {:.2} GB, not below this host's {ram}, which the launch gate never has available",
-            gb(peak),
+            "{check} {peaked}, and with its margin it claims {:.2} GB, not below this host's {ram}, which the launch gate never has available",
             gb(claim)
         )
     };
@@ -2033,7 +2222,7 @@ impl Facts {
                     out.push('\t');
                     match seen {
                         Some(seen) => out.push_str(&seen.fields()),
-                        None => out.push_str("-\t-\t-\t-"),
+                        None => out.push_str(NO_SEEN),
                     }
                 }
                 _ => {}
@@ -3974,14 +4163,14 @@ impl Plan {
     }
 
     /// Evaluates up-front memory admission for all crates and returns the rewritten plan text.
-    /// `peaks` is each library's last recorded check from the cost history: its largest
-    /// process's peak RSS in bytes and when it was recorded. A peak whose claim is not below
-    /// what can ever be available on this host (the RAM less what is wired, else the RAM) is
-    /// refused whatever the prover ([`peak_seen`]); the RAM / 8 model refuses only under a
-    /// prover that takes a ceiling ([`Host::uncapped`]).
+    /// `peaks` is each library's last recorded check from the cost history under the prover
+    /// that runs ([`Peak`]). A peak whose claim is not below what can ever be available on this
+    /// host (the RAM less what is wired, else the RAM) is refused whatever the prover's ceiling
+    /// ([`peak_seen`]); the RAM / 8 model refuses only under a prover that takes a ceiling
+    /// ([`Host::uncapped`]).
     pub fn admit(
         &self,
-        peaks: &BTreeMap<String, (u64, String)>,
+        peaks: &BTreeMap<String, Peak>,
     ) -> std::result::Result<(String, Vec<(String, String)>), String> {
         let shown = self.memory.display().to_string();
         let text = crate::durable::read_text(&self.memory)
@@ -4010,7 +4199,7 @@ impl Plan {
             }
             if let Some(seen) = peaks
                 .get(&c.name)
-                .and_then(|(rss, when)| peak_seen(&self.facts.host, *rss, when))
+                .and_then(|peak| peak_seen(&self.facts.host, peak))
                 && let Some(r) = peak_refusal(&self.facts.host, &c.name, &seen)
             {
                 let _ = writeln!(lines, "refused {}\t{}", one_line(&c.name), seen.fields());
@@ -4038,7 +4227,7 @@ impl Plan {
             ) {
                 let seen_fields = seen
                     .as_ref()
-                    .map_or(std::borrow::Cow::Borrowed("-\t-\t-\t-"), |s| {
+                    .map_or(std::borrow::Cow::Borrowed(NO_SEEN), |s| {
                         std::borrow::Cow::Owned(s.fields())
                     });
                 let _ = writeln!(lines, "refused {}\t{seen_fields}", one_line(&c.name));
@@ -7324,6 +7513,7 @@ mod tests {
             Some(Threads {
                 ran_ms,
                 runnable_ms,
+                cores: None,
             })
         };
         let ran = at(4143, th(800, 1000));
@@ -7353,6 +7543,77 @@ mod tests {
             lane.said(),
             "CPU/wall 6.81, load 41.95 on 14 cores, threads ran 0.57 of their runnable time, 11.86 of them runnable on average"
         );
+    }
+
+    /// FONT-ECORE-SHARE: a thread on an efficiency core runs slower than on a performance core,
+    /// so the share counts its time there at the speed the check's instructions ran there. The
+    /// probe run of 2026-10-27 on this M4 Pro (6 threads at a load of about 23): threads ran
+    /// 0.907 of their runnable time, 0.742 of it on performance cores, and an efficiency core
+    /// retired 0.5 of a performance core's instructions a millisecond; 11.1% of its tasks lapsed
+    /// a deadline that none lapsed on performance cores alone. Weighed, it ran 0.79 of its
+    /// runnable time at a performance core's speed: starved. NEGATIVE CONTROL: the same pace with
+    /// no split read is unstarved, as the share alone judged it. Threads that ran on performance
+    /// cores alone keep their share; with no time on a performance core to compare against, an
+    /// efficiency core's time counts in full and the note says so.
+    #[test]
+    fn an_efficiency_cores_time_counts_at_its_speed() {
+        let at = |cores| Pace {
+            cpu_ms: 5_442,
+            wall_ms: 1_000,
+            load: Some(2300),
+            cores: 14,
+            threads: Some(Threads {
+                ran_ms: 907,
+                runnable_ms: 1000,
+                cores,
+            }),
+        };
+        let split = |p_ms, instructions, p_instructions| {
+            Some(Cores {
+                p_ms,
+                instructions,
+                p_instructions,
+            })
+        };
+        // 673 ms on performance cores at 1000 instructions a ms, 234 on efficiency cores at 500.
+        let probe = at(split(673, 673_000 + 117_000, 673_000));
+        assert_eq!(probe.threads.unwrap().worked_ms(), 790);
+        assert!(probe.starved(), "{}", probe.said());
+        assert_eq!(
+            probe.said(),
+            "CPU/wall 5.44, load 23.00 on 14 cores, threads ran 0.91 of their runnable time (0.79 at a performance core's speed: 0.26 of it on efficiency cores, at 0.50 of that speed), 1.00 of them runnable on average"
+        );
+        assert!(probe.unstarved().contains("efficiency core"));
+        assert!(!at(None).starved(), "the share alone: {}", at(None).said());
+        let p_only = at(split(907, 907_000, 907_000));
+        assert!(!p_only.starved(), "{}", p_only.said());
+        assert!(!p_only.said().contains("efficiency"), "{}", p_only.said());
+        let e_only = at(split(0, 450_000, 0));
+        assert!(!e_only.starved(), "{}", e_only.said());
+        assert!(
+            e_only.said().contains("counted at full speed"),
+            "{}",
+            e_only.said()
+        );
+        // Faster on an efficiency core than the performance cores' rate counts no more than ran.
+        assert_eq!(
+            at(split(673, 5_000_000, 673_000))
+                .threads
+                .unwrap()
+                .worked_ms(),
+            907
+        );
+        for p in [probe, at(None), p_only] {
+            assert_eq!(Pace::parse(&p.text()), Some(p), "{}", p.text());
+        }
+        assert_eq!(probe.text(), "5442 1000 2300 14 907 1000 673 790000 673000");
+        for bad in [
+            "1 2 3 4 5 6 7 8",
+            "1 2 3 4 5 6 7 8 x",
+            "1 2 3 4 5 6 7 8 9 10",
+        ] {
+            assert_eq!(Pace::parse(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
@@ -7946,7 +8207,7 @@ mod tests {
         f.host = host(24);
         let text = f.to_record();
         assert!(
-            text.contains("\ncrate aterm-cli\tmemory\t16.0\t24\t4.0\t3.0\t=\tm\t-\t-\t-\t-\n"),
+            text.contains("\ncrate aterm-cli\tmemory\t16.0\t24\t4.0\t3.0\t=\tm\t-\t-\t-\t-\t-\n"),
             "{text}"
         );
         assert_eq!(Facts::parse(&text), Some(f.clone()));

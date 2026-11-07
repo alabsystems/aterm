@@ -17,9 +17,11 @@
 //! (the build cache's pass under pressure, and inside aterm the window's disk watch), then waited
 //! for with a line a minute naming the need, the free space and the largest holders, after one
 //! saying why it needs that (`atpkg::admit_disk`).
-//! `--admit now` starts at once and says what it lacks. Only a need above what the volume holds
-//! over its floor is refused. A need above what it has free over its floor now waits for space
-//! freed, which no other run's end gives, and reserves nothing against the runs behind it.
+//! `--admit now` starts at once and says what it lacks. A need above what the volume holds over
+//! its floor is refused, and so is one still above what it has free over its floor once the
+//! relief ran (UNMET, `aterm_capacity::Error::Unmet`): no other run's end gives that space, so a
+//! wait could never end, and the run COULD NOT RUN, naming how much to free on which volume, what
+//! holds the most there, and that `--admit now` starts it.
 //!
 //! Those directories are each checkout's own (the shared cache keeps one build directory per
 //! workspace path), so a fresh worktree's hold no run of anything and its record beside them none:
@@ -69,30 +71,14 @@ pub const FOOTPRINT: &str = "footprint.json";
 pub const MACHINE_FOOTPRINT: &str = "verify/disk-footprint.json";
 
 /// Whether `check` builds into the run's directories: every check but those that only read the
-/// tree (fmt, census, forge) or the network (export), or write only the run's own temporary
-/// directory, which no footprint measures (export-scan, whose export of the change lands there).
+/// tree (fmt, census, forge, and export-scan, whose one write is a copy of the export in the
+/// run's scratch, outside them) or the network (export).
 #[must_use]
 pub const fn builds(check: Check) -> bool {
     !matches!(
         check,
-        Check::Fmt | Check::Census | Check::Forge | Check::Export | Check::ExportScan
+        Check::Fmt | Check::Census | Check::Forge | Check::ExportScan | Check::Export
     )
-}
-
-/// The words of a run's work ([`selection_of`]) each of which adds work to its directories, or
-/// none, and takes none away, so a run the machine's record keeps that did a run's work and more of
-/// them bounds what that run writes (`aterm_capacity::MachineFootprints::cover_by`): each check,
-/// spelled as when it reads the selection and as when it does not (`:tree`). A check that builds
-/// nothing is among them for the runs kept before it left the work (export-scan's, before
-/// 2026-11-06). The work's other words (the cells chosen, pulled cells, `--compile-only`,
-/// `--no-windows`, `measure`'s flags) change what its checks write, so a run that bounds it has
-/// the same of them.
-#[must_use]
-pub fn more_work() -> Vec<String> {
-    crate::checks::CHECKS
-        .iter()
-        .flat_map(|spec| [spec.name.to_owned(), format!("{}:tree", spec.name)])
-        .collect()
 }
 
 /// The directory a `build.build-dir='…'` value names for the checkout at `root`.
@@ -143,22 +129,29 @@ pub fn scope_of(ctx: &Ctx) -> String {
     scope
 }
 
-/// What a run builds as the machine's record keeps it (`atpkg::admit_disk::Machinewide`), so a
-/// run in another checkout bounds it only where it did the same work: its work is the checks it
-/// runs that build, sorted, each that does not read the selection marked `:tree` (what it builds
-/// does not follow `-p`'s crates: `cells` named under the change cone lints every cell's whole
-/// graph, and cells the cone pulled lint the cone closed over its dependents in each cell's
-/// graph, more than a `-p` run of the same crates does), then whatever else changes what they
-/// write, as a rerun's command says it: the cells `--cell` chose, cells the
-/// selection pulled, `--compile-only`, `--no-windows` where a check opens windows, and
-/// `--cursor-pacing` and `--app` for `measure`. Its crates are the selection's, sorted and each
-/// once (none for the empty cone); `None` for the whole workspace, or where no check that builds
-/// reads the selection.
+/// What a run builds as the machine's record keeps it (`atpkg::admit_disk::Machinewide`), in the
+/// record's words (`aterm_capacity::Selection::work`), sorted, so a run in another checkout
+/// bounds it only where it did all of its work: the checks it runs that build, each that does
+/// not read the selection marked `:tree` (what it builds does not follow `-p`'s crates: `cells`
+/// named under the change cone lints every cell's whole graph, more than a `-p` run of the same
+/// crates does); `as-release` where its `test` or `doc` carries the checkers (`--as-release`,
+/// [`Ctx::checkers_in_tests`]), which they then build too; and what narrows a check, as
+/// `<check>--<how>`, each a run that does less than one without it: the cells `--cell` chose
+/// (`cells--cell=linux,win`), cells the selection pulled (`cells--pulled`: the cone closed over
+/// its dependents in each cell's graph, not the whole graph), `--no-windows` for each check that
+/// opens windows (its windowed stages are named skips), and `measure` with no `--app`
+/// (`measure--no-app`: its measuring stages are named skips and its prebuild is not planned, so
+/// it builds nothing, where `--app` builds the measuring benches). `--compile-only` and
+/// `--cursor-pacing` keep one stage of the whole plan, whatever check holds the rest (a pulled
+/// `wasm-smoke` too: [`crate::plan`]'s `wanted`), so each narrows all of the work
+/// (`--compile-only`, `--cursor-pacing`). Its crates are the selection's, sorted and each once
+/// (none for the empty cone); `None` for the whole workspace, or where no check that builds reads
+/// the selection.
 #[must_use]
 pub fn selection_of(ctx: &Ctx) -> atpkg::admit_disk::Selection {
     let building: Vec<Check> = ctx.checks.iter().copied().filter(|c| builds(*c)).collect();
     let has = |check: Check| building.contains(&check);
-    let mut checks: Vec<String> = building
+    let mut words: Vec<String> = building
         .iter()
         .map(|c| {
             if c.reads(&ctx.scope) {
@@ -168,35 +161,37 @@ pub fn selection_of(ctx: &Ctx) -> atpkg::admit_disk::Selection {
             }
         })
         .collect();
-    checks.sort_unstable();
-    checks.dedup();
-    let mut work = checks.join(" ");
+    if ctx.checkers_in_tests && (has(Check::Test) || has(Check::Doc)) {
+        words.push("as-release".to_owned());
+    }
     if has(Check::Cells) && !ctx.cells.is_empty() {
         let mut cells = ctx.cells.clone();
         cells.sort_unstable();
         cells.dedup();
-        work.push_str(" --cell ");
-        work.push_str(&cells.join(","));
+        words.push(format!("cells--cell={}", cells.join(",")));
     }
     if has(Check::Cells) && ctx.cells_pulled {
-        work.push_str(" pulled-cells");
+        words.push("cells--pulled".to_owned());
     }
-    if ctx.compile_only && (has(Check::Test) || has(Check::Checkers) || has(Check::Measure)) {
-        work.push_str(" --compile-only");
+    for c in &building {
+        if ctx.no_windows && c.spec().stages.iter().any(|id| id.opens_windows()) {
+            words.push(format!("{}--no-windows", c.name()));
+        }
     }
-    if ctx.no_windows
-        && building
-            .iter()
-            .any(|c| c.spec().stages.iter().any(|id| id.opens_windows()))
-    {
-        work.push_str(" --no-windows");
+    if has(Check::Measure) && ctx.measure_artifact.is_none() {
+        words.push("measure--no-app".to_owned());
     }
-    if has(Check::Measure) && ctx.cursor_pacing {
-        work.push_str(" --cursor-pacing");
+    for (narrowed, how) in [
+        (ctx.compile_only, "--compile-only"),
+        (ctx.cursor_pacing, "--cursor-pacing"),
+    ] {
+        if narrowed {
+            words.push(how.to_owned());
+        }
     }
-    if has(Check::Measure) && ctx.measure_artifact.is_some() {
-        work.push_str(" --app");
-    }
+    words.sort_unstable();
+    words.dedup();
+    let work = words.join(" ");
     let crates =
         (building.iter().any(|c| c.reads(&ctx.scope)) && !ctx.scope.is_workspace()).then(|| {
             let mut crates = ctx.scope.crates().to_vec();
@@ -240,12 +235,12 @@ pub fn run_of(ctx: &Ctx) -> Option<atpkg::admit_disk::Run> {
         cold: COLD_BYTES,
         on: ctx.target_dir.clone(),
         stuck_ends: Some(crate::STUCK_ENDS),
+        scratch: false,
         machine: aterm_types::dirs::account_state_dir()
             .filter(|_| measured)
             .map(|state| atpkg::admit_disk::Machinewide {
                 record: state.join(MACHINE_FOOTPRINT),
                 selection: selection_of(ctx),
-                more: more_work(),
             }),
     })
 }
@@ -481,8 +476,10 @@ pub fn keep_used(ctx: &Ctx, passed: bool) -> Option<String> {
 ///
 /// # Errors
 /// Why the run COULD NOT RUN, no check started: the need is more than the target's volume holds
-/// above its floor, so the run can never fit there; an interrupt ended the wait; or the wait gave
-/// up behind holders that made no progress for [`crate::STUCK_ENDS`], named, and left alone.
+/// above its floor, so the run can never fit there; it is more than the volume has free above
+/// its floor once the relief ran, which no wait admits (UNMET), named with what to free and
+/// `--admit now`; an interrupt ended the wait; or the wait gave up behind holders that made no
+/// progress for [`crate::STUCK_ENDS`], named, and left alone.
 fn answer(
     admitted: Result<atpkg::admit_disk::Admitted, atpkg::admit_disk::Error>,
 ) -> Result<Disk, String> {
@@ -490,6 +487,10 @@ fn answer(
         Ok(held) => Ok(Disk::Held(held)),
         Err(atpkg::admit_disk::Error::Never(why)) => Err(format!(
             "{why}; it can never be admitted there. Fix: point CARGO_TARGET_DIR at a larger volume"
+        )),
+        Err(e @ atpkg::admit_disk::Error::Unmet { .. }) => Err(format!(
+            "the run's disk claim was refused, no check started: {e}, or start it at once with \
+             `--admit now`"
         )),
         Err(e @ atpkg::admit_disk::Error::Stopped { .. }) => Err(format!(
             "the run's disk claim was {e}; no check started, so nothing was decided"
@@ -585,7 +586,8 @@ mod tests {
             PathBuf::from("/Volumes/s/target/verify/footprint.json")
         );
         assert!(run.what.contains("lint") && run.what.contains("aterm-capacity"));
-        let reads = ctx().with_checks(&[Check::Fmt, Check::Census, Check::Forge]);
+        let reads =
+            ctx().with_checks(&[Check::Fmt, Check::Census, Check::Forge, Check::ExportScan]);
         assert_eq!(run_of(&reads), None);
     }
 
@@ -635,6 +637,7 @@ mod tests {
                     above_floor: 90 * GIB,
                     floor: 65 * GIB,
                     reserved: 35 * GIB,
+                    held: Vec::new(),
                 }],
                 holders: vec![holder],
             },
@@ -651,6 +654,51 @@ mod tests {
         }
         let unusable = atpkg::admit_disk::Error::Ledger(std::io::Error::other("read-only"));
         assert!(matches!(answer(Err(unusable)), Ok(Disk::Unclaimed)));
+    }
+
+    /// A disk claim more than the volume has free above its floor once its relief ran (UNMET) is
+    /// the run's COULD NOT RUN at once, naming the need, how much to free on which volume, what
+    /// holds the most there and `--admit now`. NEGATIVE CONTROL: the same shortfall as a stuck
+    /// wait's says that wait gave up, not what to free.
+    #[test]
+    fn a_disk_claim_no_wait_can_admit_could_not_run_naming_its_remedy() {
+        let short = aterm_capacity::Shortfall {
+            shorts: vec![aterm_capacity::Short::Disk {
+                need: 68 * GIB,
+                mount: PathBuf::from("/System/Volumes/Data"),
+                above_floor: 24 * GIB,
+                floor: 47 * GIB,
+                reserved: 0,
+                held: Vec::new(),
+            }],
+            holders: Vec::new(),
+        };
+        let unmet = atpkg::admit_disk::Error::Unmet {
+            what: "verify lint test -p aterm-capacity".to_owned(),
+            short: short.clone(),
+            holders: Some("largest on /System/Volumes/Data: /Users//u/aterm-wt 30 GiB".to_owned()),
+            relieved: true,
+        };
+        let why = answer(Err(unmet)).expect_err("could not run");
+        for said in [
+            "no check started",
+            "verify lint test -p aterm-capacity",
+            "needs 68 GiB on /System/Volumes/Data, 24 GiB free above its 47 GiB floor",
+            "largest on /System/Volumes/Data: /Users//u/aterm-wt 30 GiB",
+            "Free at least 44 GiB on /System/Volumes/Data",
+            "--admit now",
+        ] {
+            assert!(why.contains(said), "{said:?} in {why}");
+        }
+        let stuck = atpkg::admit_disk::Error::Stuck {
+            stuck: aterm_toolchain::waits::Stuck {
+                holders: vec![4242],
+                span: std::time::Duration::from_secs(60),
+            },
+            short,
+        };
+        let why = answer(Err(stuck)).expect_err("could not run");
+        assert!(!why.contains("Free at least"), "{why}");
     }
 
     /// A run's footprints are kept by what it builds: its checks that build, sorted, and the
@@ -770,7 +818,7 @@ mod tests {
         );
         assert_eq!(
             selection_of(&at(p(&["a"]), &[Check::Test]).with_compile_only(true)),
-            sel("test --compile-only", Some(&["a"]))
+            sel("--compile-only test", Some(&["a"]))
         );
         assert_eq!(
             selection_of(&at(p(&["a"]), &[Check::Lint]).with_no_windows(true)),
@@ -779,14 +827,30 @@ mod tests {
         );
         assert_eq!(
             selection_of(&at(p(&["a"]), &[Check::Appkit]).with_no_windows(true)),
-            sel("appkit:tree --no-windows", None)
+            sel("appkit--no-windows appkit:tree", None)
         );
         assert_eq!(
             selection_of(
                 &at(crate::Scope::workspace(), &[Check::Cells])
                     .with_cells(vec!["win".to_owned(), "linux".to_owned()])
             ),
-            sel("cells:tree --cell linux,win", None)
+            sel("cells--cell=linux,win cells:tree", None)
+        );
+        assert_eq!(
+            selection_of(&at(cone(), &[Check::Cells, Check::Lint]).with_cells_pulled(true)),
+            sel("cells--pulled cells:tree lint", Some(&["a"]))
+        );
+        assert_eq!(
+            selection_of(
+                &at(p(&["a"]), &[Check::Test, Check::Doc, Check::Lint])
+                    .with_checkers_in_tests(true)
+            ),
+            sel("as-release doc lint test", Some(&["a"]))
+        );
+        assert_eq!(
+            selection_of(&at(p(&["a"]), &[Check::Lint]).with_checkers_in_tests(true)),
+            sel("lint", Some(&["a"])),
+            "lint builds no checkers"
         );
         // export-scan writes its export into the run's temporary directory, which no footprint
         // measures, so it is not in the work: a run with it and one without write the same.
@@ -804,9 +868,10 @@ mod tests {
     }
 
     /// A run the machine's record keeps that did a run's work and more checks over its crates
-    /// bounds it ([`more_work`]): a fresh worktree's bare `verify -p a` claims what a kept
-    /// `verify cells doc lint test -p a -p b` wrote, not the cold budget. NEGATIVE CONTROL: read by
-    /// the same work alone, nothing covers it; and a kept run with other cells does not.
+    /// bounds it: a fresh worktree's bare `verify -p a` claims what a kept `verify cells doc lint
+    /// test -p a -p b` wrote, not the cold budget. NEGATIVE CONTROL: a run whose test was narrowed
+    /// to compile-only supplies no cover by itself. Once wider work supplies the cover, the full
+    /// test still claims no less than that compile-only run grew: it necessarily does that work.
     #[test]
     fn a_kept_run_of_more_checks_bounds_a_run_of_fewer() {
         let at = |checks: &[Check]| {
@@ -831,32 +896,84 @@ mod tests {
             scope: None,
         };
         let mut m = aterm_capacity::MachineFootprints::default();
-        m.push(kept("cells doc lint test --cell win"), wrote(9));
+        m.push(kept("doc lint test--compile-only"), wrote(9));
         assert_eq!(
-            m.cover_by(&asked, 0, COLD_BYTES, &more_work()),
+            m.cover(&asked, 0, COLD_BYTES),
             None,
-            "a cell chosen changes what the run writes"
+            "a compile-only test did less"
         );
-        m.push(kept("cells doc lint test"), wrote(3));
-        assert_eq!(m.cover(&asked, 0, COLD_BYTES), None, "the same work alone");
+        m.push(kept("cells:tree doc lint test"), wrote(3));
+        let cover = m
+            .cover(&asked, 0, COLD_BYTES)
+            .expect("the wider run covers it");
         assert_eq!(
-            m.cover_by(&asked, 0, COLD_BYTES, &more_work())
-                .map(|c| c.bytes),
-            Some(3 << 30)
+            cover.bytes,
+            9 << 30,
+            "no less than its compile-only work grew"
         );
-        m.push(kept("doc export-scan lint test"), wrote(1));
-        assert_eq!(
-            m.cover_by(&asked, 0, COLD_BYTES, &more_work())
-                .map(|c| c.bytes),
-            Some(1 << 30),
-            "a run kept while export-scan was in the work still bounds"
+        assert!(cover.bounded, "the narrower run raises the wider figure");
+    }
+
+    /// EACH NARROWING WORD IS A RUN THAT DOES LESS, so a run with it bounds no run without it
+    /// ([`atpkg::admit_disk::Selection::does`]), and a run without it bounds one with it. `measure`
+    /// with no `--app` builds nothing (its measuring stages are named skips, its prebuild is not
+    /// planned), and with `--app` builds the measuring benches, so the absent app is the narrowing
+    /// (`measure--no-app`). `--compile-only` keeps the test compile alone of the whole plan, so it
+    /// narrows a pulled `wasm-smoke` too, and `--cursor-pacing` keeps the burst alone.
+    /// NEGATIVE CONTROLS, each the direction that would under-claim: a no-app `measure` run does
+    /// not bound one with `--app`; a compile-only `test` run that pulled `wasm-smoke` (which then
+    /// did not run) does not bound a `wasm-smoke` run; a cursor-pacing run does not bound a whole
+    /// `measure` run.
+    #[test]
+    fn a_narrowing_word_is_a_run_that_does_less() {
+        let at = |scope: crate::Scope, checks: &[Check]| {
+            Ctx::new(
+                PathBuf::from("/w/aterm"),
+                scope,
+                crate::EnvSnapshot::default(),
+                PathBuf::from("/tmp/x"),
+            )
+            .with_checks(checks)
+        };
+        let app = || Some(crate::MeasureArtifact::unnamed("/release/aterm.app"));
+        let sel = |work: &str| atpkg::admit_disk::Selection {
+            work: work.to_owned(),
+            crates: None,
+        };
+        let whole = crate::Scope::workspace;
+
+        let no_app = selection_of(&at(whole(), &[Check::Measure]));
+        let with_app = selection_of(&at(whole(), &[Check::Measure]).with_measure_artifact(app()));
+        assert_eq!(no_app, sel("measure--no-app measure:tree"));
+        assert_eq!(with_app, sel("measure:tree"));
+        assert!(!no_app.does(&with_app), "a run that built nothing");
+        assert!(with_app.does(&no_app));
+
+        let pacing = selection_of(
+            &at(whole(), &[Check::Measure])
+                .with_measure_artifact(app())
+                .with_cursor_pacing(true),
         );
-        assert!(more_work().iter().any(|w| w == "cells:tree"));
+        assert_eq!(pacing, sel("--cursor-pacing measure:tree"));
+        assert!(!pacing.does(&with_app));
+        assert!(with_app.does(&pacing));
+
+        let compiled =
+            selection_of(&at(whole(), &[Check::Test, Check::WasmSmoke]).with_compile_only(true));
+        assert_eq!(compiled, sel("--compile-only test wasm-smoke:tree"));
         assert!(
-            !more_work()
-                .iter()
-                .any(|w| w.starts_with('-') || w == "pulled-cells")
+            !compiled.does(&sel("wasm-smoke:tree")),
+            "it ran no wasm smoke"
         );
+        assert!(!compiled.does(&sel("test wasm-smoke:tree")));
+        assert!(compiled.does(&sel("--compile-only test")));
+        let ran = selection_of(&at(whole(), &[Check::Test, Check::WasmSmoke]));
+        assert!(ran.does(&compiled), "a run of both did more");
+
+        let windowless = selection_of(&at(whole(), &[Check::Appkit]).with_no_windows(true));
+        let windowed = selection_of(&at(whole(), &[Check::Appkit]));
+        assert!(!windowless.does(&windowed));
+        assert!(windowed.does(&windowless));
     }
 
     /// A run that builds names the machine's record under this user's aterm state directory (a
@@ -910,13 +1027,13 @@ mod tests {
                 cold: 1 << 30,
                 on: dir.path().to_path_buf(),
                 stuck_ends: None,
+                scratch: false,
                 machine: Some(atpkg::admit_disk::Machinewide {
                     record: record.clone(),
                     selection: atpkg::admit_disk::Selection {
                         work: "lint".to_owned(),
                         crates: Some(vec!["a".to_owned()]),
                     },
-                    more: more_work(),
                 }),
             };
             let held = atpkg::admit_disk::admit_on(

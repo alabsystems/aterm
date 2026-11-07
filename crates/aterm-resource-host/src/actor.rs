@@ -42,7 +42,12 @@ enum Message {
         peer: Peer,
         reply: SyncSender<bool>,
     },
-    Submit(Box<AuthorizedSubmission>),
+    Submit {
+        submission: Box<AuthorizedSubmission>,
+        accounted: bool,
+    },
+    SubmitMetadata(Box<crate::metadata_transport::Incoming>),
+    SubmitResolverQuery(Box<crate::resolver_transport::Incoming>),
     SubmitMember(Box<aterm_ctl::resource_subgroup_client::AuthorizedSubgroup>),
     SubmitProxy(Box<crate::resource_proxy_intake::Incoming>),
     ProvisionalProxy {
@@ -55,6 +60,16 @@ enum Message {
         reply: SyncSender<bool>,
     },
     Context {
+        peer: Peer,
+        query: trust_resource_controller::ContextQuery,
+        reply: SyncSender<io::Result<trust_resource_controller::ContextReply>>,
+    },
+    MetadataReady {
+        peer: Peer,
+        query: trust_resource_controller::ContextQuery,
+        reply: SyncSender<io::Result<trust_resource_controller::ContextReply>>,
+    },
+    ResolverReady {
         peer: Peer,
         query: trust_resource_controller::ContextQuery,
         reply: SyncSender<io::Result<trust_resource_controller::ContextReply>>,
@@ -126,7 +141,19 @@ pub fn authorize(request: &Submission, peer: Peer) -> bool {
 /// Accept four privately delegated descriptors after caller authorization.
 /// Acceptance alone supplies no launch or allocation fact.
 pub fn submit(submission: AuthorizedSubmission) -> io::Result<()> {
-    send(Message::Submit(Box::new(submission)))
+    submit_mode(submission, false)
+}
+pub(crate) fn submit_accounted(submission: AuthorizedSubmission) -> io::Result<()> {
+    if !crate::resource_accounting::supported() {
+        return Err(unavailable());
+    }
+    submit_mode(submission, true)
+}
+fn submit_mode(submission: AuthorizedSubmission, accounted: bool) -> io::Result<()> {
+    send(Message::Submit {
+        submission: Box::new(submission),
+        accounted,
+    })
 }
 pub(super) fn authorize_member(
     request: &aterm_types::resource_subgroup::Request,
@@ -138,6 +165,42 @@ pub(super) fn authorize_member(
     let (reply, read) = mpsc::sync_channel(1);
     send(Message::AuthorizeMember { request, reply }).is_ok()
         && read.recv_timeout(RPC).unwrap_or(false)
+}
+pub(super) fn authorize_metadata(
+    request: &aterm_types::resource_subgroup::Request,
+    peer: Peer,
+) -> bool {
+    let Ok(mut request) = owner::members::Authorization::of(request, peer) else {
+        return false;
+    };
+    request.metadata = true;
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::AuthorizeMember { request, reply }).is_ok()
+        && read.recv_timeout(RPC).unwrap_or(false)
+}
+pub(super) fn submit_metadata(member: crate::metadata_transport::Incoming) -> io::Result<()> {
+    send(Message::SubmitMetadata(Box::new(member)))
+}
+pub(super) fn authorize_resolver_query(
+    request: &aterm_types::resource_subgroup::Request,
+    peer: Peer,
+) -> bool {
+    let Ok(mut request) = owner::members::Authorization::of(request, peer) else {
+        return false;
+    };
+    request.resolver = true;
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::AuthorizeMember { request, reply }).is_ok()
+        && read.recv_timeout(RPC).unwrap_or(false)
+}
+pub(super) fn submit_resolver_query(member: crate::resolver_transport::Incoming) -> io::Result<()> {
+    send(Message::SubmitResolverQuery(Box::new(member)))
+}
+pub(super) fn resolver_binding(value: &aterm_json::Value) -> io::Result<Binding> {
+    owner::members::binding_role(value, "sealed-resolver-query-v1")
+}
+pub(super) fn metadata_binding(value: &aterm_json::Value) -> io::Result<Binding> {
+    owner::members::binding_role(value, "sealed-metadata-v1")
 }
 pub(super) fn member_binding(value: &aterm_json::Value) -> io::Result<Binding> {
     owner::members::binding(value)
@@ -163,6 +226,22 @@ pub(super) fn provisional_proxy(
 pub(super) fn proxy_binding(value: &aterm_json::Value) -> io::Result<Binding> {
     owner::members::binding_role(value, "proxy-member")
 }
+pub(super) fn proxy_binding_accounted(value: &aterm_json::Value) -> io::Result<Binding> {
+    if !crate::resource_accounting::supported()
+        || value.as_object().is_none_or(|object| object.len() != 5)
+        || value["accounting"].as_str() != Some(trust_resource_controller::accounting::CAPABILITY)
+    {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    // The five-field negotiation was checked above. The unchanged original
+    // four-field binding parser still validates every routing field exactly.
+    let mut routing = value.clone();
+    routing
+        .as_object_mut()
+        .ok_or_else(unavailable)?
+        .remove("accounting");
+    owner::members::binding_role(&routing, trust_resource_controller::accounting::PROXY_ROLE)
+}
 pub(super) fn submit_proxy(incoming: crate::resource_proxy_intake::Incoming) -> io::Result<()> {
     send(Message::SubmitProxy(Box::new(incoming)))
 }
@@ -183,6 +262,24 @@ pub(super) fn context(
 ) -> io::Result<trust_resource_controller::ContextReply> {
     let (reply, read) = mpsc::sync_channel(1);
     send(Message::Context { peer, query, reply })?;
+    read.recv_timeout(RPC).map_err(|_| unavailable())?
+}
+
+pub(super) fn metadata_ready(
+    peer: Peer,
+    query: trust_resource_controller::ContextQuery,
+) -> io::Result<trust_resource_controller::ContextReply> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::MetadataReady { peer, query, reply })?;
+    read.recv_timeout(RPC).map_err(|_| unavailable())?
+}
+
+pub(super) fn resolver_ready(
+    peer: Peer,
+    query: trust_resource_controller::ContextQuery,
+) -> io::Result<trust_resource_controller::ContextReply> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::ResolverReady { peer, query, reply })?;
     read.recv_timeout(RPC).map_err(|_| unavailable())?
 }
 
@@ -220,20 +317,30 @@ fn run(receiver: mpsc::Receiver<Message>, mut owner: owner::Owner) {
                     }
                     let _ = reply.try_send(accepted);
                 }
-                Message::Submit(submission) => {
+                Message::Submit {
+                    submission,
+                    accounted,
+                } => {
                     let actual = authorized
                         .remove(&key(&submission.request.binding))
                         .map(|entry| entry.0);
                     if actual == Some(submission.peer) {
-                        owner.submit(*submission);
+                        if accounted {
+                            owner.submit_mode(*submission, true);
+                        } else {
+                            owner.submit(*submission);
+                        }
                     } else {
-                        refuse(*submission);
+                        refuse_mode(*submission, accounted);
                     }
                 }
                 Message::AuthorizeMember { request, reply } => {
                     let _ = reply.try_send(owner.authorize_member(&request));
                 }
                 Message::SubmitMember(member) => owner.submit_member(*member),
+                Message::SubmitMetadata(member) => owner.submit_metadata(*member),
+                Message::SubmitResolverQuery(member) => owner.submit_resolver_query(*member),
+
                 Message::SubmitProxy(incoming) => owner.submit_proxy(*incoming),
                 Message::ProvisionalProxy {
                     request,
@@ -244,6 +351,12 @@ fn run(receiver: mpsc::Receiver<Message>, mut owner: owner::Owner) {
                 }
                 Message::Context { peer, query, reply } => {
                     let _ = reply.try_send(owner.context(peer, &query));
+                }
+                Message::MetadataReady { peer, query, reply } => {
+                    let _ = reply.try_send(owner.metadata_ready(peer, &query));
+                }
+                Message::ResolverReady { peer, query, reply } => {
+                    let _ = reply.try_send(owner.resolver_ready(peer, &query));
                 }
                 Message::Inspect {
                     peer,
@@ -258,7 +371,7 @@ fn run(receiver: mpsc::Receiver<Message>, mut owner: owner::Owner) {
         owner.tick();
     }
 }
-fn refuse(submission: AuthorizedSubmission) {
+fn refuse_mode(submission: AuthorizedSubmission, accounted: bool) {
     let stream = aterm_uds::CtlStream::from(submission.fds.events);
     let event = EventFrame {
         binding: submission.request.binding,
@@ -266,11 +379,22 @@ fn refuse(submission: AuthorizedSubmission) {
             reason: "host admission refused before launch".into(),
         },
     };
-    let _ = aterm_ctl::resource_admission_transport::send_event(
-        &stream,
-        &event,
-        Instant::now() + Duration::from_millis(100),
-    );
+    let bytes = if accounted {
+        aterm_types::resource_admission::AccountedEventFrame {
+            finished: event,
+            observation: aterm_types::resource_admission::AccountingObservation::uncollected(),
+        }
+        .encode()
+    } else {
+        event.encode()
+    };
+    if let Ok(bytes) = bytes {
+        let _ = aterm_ctl::resource_admission_transport::write_frame(
+            &stream,
+            &bytes,
+            Instant::now() + Duration::from_millis(100),
+        );
+    }
 }
 
 pub(super) fn wake() {
@@ -280,6 +404,46 @@ pub(super) fn wake() {
 }
 
 #[cfg(all(test, target_os = "macos"))]
-pub(crate) fn member_fixture(args: &[std::ffi::OsString]) -> std::process::ExitCode {
-    owner::member_fixture(args)
+pub(crate) fn metadata_native_role() {
+    owner::metadata_native_role();
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn member_fixture(
+    args: &[std::ffi::OsString],
+    gnu: Option<[std::os::fd::OwnedFd; 2]>,
+) -> std::process::ExitCode {
+    owner::member_fixture(args, gnu)
+}
+
+#[cfg(all(
+    test,
+    target_pointer_width = "64",
+    any(target_os = "macos", target_os = "linux")
+))]
+mod accounting_routing_tests {
+    use super::*;
+    #[test]
+    fn accounted_routing_is_exact_and_does_not_relax_legacy_handshake() {
+        let hello = aterm_json::json!({"version":3,"role":trust_resource_controller::accounting::PROXY_ROLE,"session":"s-a","attempt":"12121212121212121212121212121212","accounting":trust_resource_controller::accounting::CAPABILITY});
+        assert!(proxy_binding_accounted(&hello).is_ok());
+        assert!(proxy_binding(&hello).is_err());
+        for key in ["version", "role", "session", "attempt", "accounting"] {
+            let mut missing = hello.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(proxy_binding_accounted(&missing).is_err());
+        }
+        let mut wrong = hello.clone();
+        wrong
+            .as_object_mut()
+            .unwrap()
+            .insert("accounting".into(), "unknown".into());
+        assert!(proxy_binding_accounted(&wrong).is_err());
+        let mut extra = hello;
+        extra
+            .as_object_mut()
+            .unwrap()
+            .insert("extra".into(), 1.into());
+        assert!(proxy_binding_accounted(&extra).is_err());
+    }
 }

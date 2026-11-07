@@ -339,7 +339,7 @@ fn run_arm(
         json_path.display()
     );
     if let Some(out) = &args.json_out {
-        crate::write_fresh(out, &json)
+        super::publication::publish_named(out, &json)
             .map_err(|e| format!("could not write {}: {e}", out.display()))?;
         eprintln!("json written: {}", out.display());
     }

@@ -5540,6 +5540,7 @@ fn the_landed_state_line_says_what_aterm_checked_whole() {
             check: false,
             said: said.into(),
             at_ms: 0,
+            statement: aterm_agent::harness::land_receipt::Statement::Unread,
         };
         let checked = checked_words(Some(&r));
         assert_eq!(

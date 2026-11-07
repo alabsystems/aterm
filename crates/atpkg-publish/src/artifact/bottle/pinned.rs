@@ -18,6 +18,7 @@ use crate::triple::{Arch, Os, Triple};
 mod lean;
 mod node;
 mod openssl;
+mod pkgconf;
 
 fn platform(triple: Triple) -> &'static str {
     match (triple.os(), triple.arch()) {
@@ -33,7 +34,7 @@ fn platform(triple: Triple) -> &'static str {
 pub(super) fn can_pack(recipe: &PinnedTool, triple: Triple) -> Result<()> {
     if !matches!(
         recipe.name,
-        "gitleaks" | "cpython" | "openssl-signing" | "lean4" | "node"
+        "gitleaks" | "cpython" | "openssl-signing" | "lean4" | "node" | "pkgconf"
     ) {
         return Err(Error::cannot_run(format!(
             "{} has no pinned runtime qualifier",
@@ -60,7 +61,12 @@ pub(super) fn can_pack(recipe: &PinnedTool, triple: Triple) -> Result<()> {
         }
     }
     let url = archive.url_at(recipe.version);
-    super::archive_container(archive_file(&url)?)?;
+    let archive_path = archive_file(&url)?;
+    if recipe.build == Build::Pkgconf && url.ends_with(".tar.xz") {
+        pkgconf::source_decoder()?;
+    } else {
+        super::archive_container(archive_path)?;
+    }
     let (_, bottle) = super::bottle_row(recipe.name, triple)?;
     crate::artifact::pkgdoc::check_exposes(
         recipe.name,
@@ -190,7 +196,12 @@ fn prepare(
         })?;
     let url = archive.url_at(recipe.version);
     let input = work.join(archive_file(&url)?);
-    let container = super::archive_container(&input)?;
+    let source_xz = recipe.build == Build::Pkgconf && url.ends_with(".tar.xz");
+    let container = if source_xz {
+        atpkg::extract::Container::Tar
+    } else {
+        super::archive_container(&input)?
+    };
     download(&url, &input, archive.bytes)?;
     let (file, metadata) = crate::identity::open_regular_nonblock(&input)
         .map_err(|error| Error::io("open pinned upstream archive", &error))?;
@@ -208,6 +219,13 @@ fn prepare(
             "upstream archive differs from its pinned SHA-256",
         ));
     }
+    // Only this closed source recipe needs xz. Authenticate the original bytes
+    // first, then feed its bounded tar to the existing vetted extractor.
+    let input = if source_xz {
+        pkgconf::unpack_source(&input, work, recipe.max_extract_bytes)?
+    } else {
+        input
+    };
     let unpacked = work.join("unpacked");
     atpkg::extract::extract_tree(
         &input,
@@ -224,6 +242,7 @@ fn prepare(
     let build = match recipe.build {
         Build::Prebuilt => None,
         Build::OpenSsl => Some(openssl::build(&unpacked, work)?),
+        Build::Pkgconf => Some(pkgconf::build(&unpacked, work)?),
     };
     let stage = work.join("install");
     let executable = stage.join(installed_executable(recipe)?);
@@ -390,6 +409,15 @@ fn qualify(result: &BottleOutcome, recipe: &PinnedTool) -> Result<()> {
         "gitleaks" => qualify_tree(&program, &result.version, work.path(), &run),
         "cpython" => qualify_python(&program, &result.version, &stage, work.path(), &run),
         "openssl-signing" => openssl::qualify(&program, &result.version, work.path(), &run),
+        "pkgconf" => {
+            pkgconf::qualify(&program, &result.version, work.path(), &run)?;
+            pkgconf::qualify(
+                &stage.join("bin/pkg-config"),
+                &result.version,
+                work.path(),
+                &run,
+            )
+        }
         "lean4" => lean::qualify(&program, &result.version, work.path(), &invoke),
         "node" => {
             node::qualify(&program, &result.version, work.path(), &run)?;

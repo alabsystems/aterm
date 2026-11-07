@@ -546,7 +546,9 @@ fn no_autopilot_word_moves_a_program_workers_task() {
     };
     const LATER: u64 = 60_000;
     let of = |state: TaskState, agent: Program| {
-        let mut record = TaskMark::new(state).apply(None, false, t0, 1_000).0;
+        let mut record = TaskMark::new(state)
+            .apply(None, &Default::default(), t0, 1_000)
+            .0;
         record.agent = Some(agent);
         record
     };

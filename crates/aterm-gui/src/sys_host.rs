@@ -84,6 +84,8 @@ struct ReplyKey {
     caller_panes: Option<Vec<u64>>,
     /// Whether machine-wide rows may print.
     owner_class: bool,
+    /// `--json`: a JSON reply is kept with no lines to fold, so its own cursor answers no gap.
+    json: bool,
 }
 
 struct Kept {
@@ -533,6 +535,11 @@ impl Shared {
             .rev()
             .find(|k| k.key == *key)
             .map(|k| k.prints.clone())
+    }
+
+    /// Whether a reply of any request at snapshot `seq` is still kept.
+    fn kept_at(&self, seq: u64) -> bool {
+        self.lock().replies.iter().any(|k| k.key.seq == seq)
     }
 
     fn remember(&self, key: ReplyKey, prints: Fingerprints) {
@@ -1181,7 +1188,13 @@ fn plan_since(
         seq: c.seq,
         ..key.clone()
     });
-    let gap = base.is_none().then_some(Gap::Evicted);
+    let gap = base.is_none().then(|| {
+        if shared.kept_at(c.seq) {
+            Gap::OtherRequest
+        } else {
+            Gap::Evicted
+        }
+    });
     Ok(Since { base, events, gap })
 }
 
@@ -1285,6 +1298,7 @@ fn answer(
         subject: q.subject,
         caller_panes: g.caller_panes.clone(),
         owner_class,
+        json: q.json,
     };
     let since = match plan_since(shared, q, head, &key) {
         Ok(s) => s,
@@ -1323,6 +1337,9 @@ fn answer(
             && let Some(j) = reply.json.as_mut()
         {
             j.set("instances", aterm_vitals::sys::json::Jv::s("this"));
+        }
+        if held.is_some() {
+            shared.remember(key, Fingerprints::default());
         }
         let body = reply
             .json

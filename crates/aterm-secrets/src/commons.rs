@@ -211,11 +211,49 @@ pub fn observe_until(
     observe_until_with(paths, deadline, || {})
 }
 
+/// [`observe`] for a reader that asks again every few seconds whatever it found (the Commons
+/// runtime's presence poll, the members desk): where every file the observation reads, and the
+/// vault folder, are as they were at the last settled observation, it takes that observation's
+/// answer instead of reading, decrypting and evaluating them again (`client::vault_memo`). A
+/// changed file reads again at once, so a revocation is seen at the next call; a vault a writer
+/// holds and an error are never kept.
+///
+/// # Errors
+/// As [`observe`].
+#[cfg(unix)]
+pub fn observe_settled(paths: &crate::client::Paths) -> crate::Result<Observation> {
+    crate::client::observe_commons_now(paths)
+}
+
+/// [`observe_until`] by [`observe_settled`]: a busy vault is waited for until `deadline`, and
+/// each attempt reads again whatever moved since the last settled observation.
+///
+/// # Errors
+/// As [`observe_until`].
+#[cfg(unix)]
+pub fn observe_until_settled(
+    paths: &crate::client::Paths,
+    deadline: std::time::Instant,
+) -> crate::Result<Observation> {
+    observe_until_by(paths, deadline, || {}, observe_settled)
+}
+
 #[cfg(unix)]
 pub(crate) fn observe_until_with(
     paths: &crate::client::Paths,
     deadline: std::time::Instant,
+    held: impl FnMut(),
+) -> crate::Result<Observation> {
+    observe_until_by(paths, deadline, held, observe)
+}
+
+/// [`observe_until`]'s busy-vault wait around `observe`.
+#[cfg(unix)]
+fn observe_until_by(
+    paths: &crate::client::Paths,
+    deadline: std::time::Instant,
     mut held: impl FnMut(),
+    observe: impl Fn(&crate::client::Paths) -> crate::Result<Observation>,
 ) -> crate::Result<Observation> {
     let mut backoff = std::time::Duration::from_millis(1);
     loop {

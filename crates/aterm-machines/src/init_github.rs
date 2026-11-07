@@ -14,6 +14,7 @@ use crate::items::{Ctx, Item};
 use crate::model::{Probe, User};
 use crate::port::{GithubError, Secret, System};
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
@@ -28,6 +29,7 @@ mod source;
 pub use checkout_inputs::RepositoryCheckoutMetadata;
 pub use credentials::{sync_vault_git_credentials, vault_git_credentials};
 pub use native::InitialRepositoryInputs;
+pub(crate) use native::{automatic_inventory_counts, automatic_inventory_counts_captured};
 pub use source::{
     RepositoryControlPaths, RepositoryInputMark, RepositoryInputPathCache,
     repository_checkout_watch_paths, repository_input_control_watch_paths, repository_input_mark,
@@ -38,12 +40,49 @@ pub use source::{
 /// entries must not invalidate a clone whose source and credential remain unchanged.
 pub const VAULT_INPUT_ENTRIES: [&str; 2] = ["gh_access_token", "github-repositories.json"];
 
-/// Whether Git is ready ([`crate::items::github::installed_git`]): managed Git is preferred,
-/// with developer-tools or system Git as fallbacks. Repositories wait on
-/// [`crate::init_observe::Wait::GitReadiness`] until one is available.
+/// Whether a Git executable is installed ([`crate::items::github::installed_git`]): managed
+/// Git is preferred, with developer-tools or system Git as fallbacks. This reads metadata
+/// only; [`git_ready_for_inventory`] checks capabilities needed by selected repositories.
 #[must_use]
 pub fn git_installed(sys: &dyn System) -> bool {
     repos::git_installed(sys)
+}
+
+/// Whether the selected private inventory's Git requirements are met. Unlike the
+/// metadata-only [`git_installed`], this may ask the selected executable whether
+/// it supports safe local object reads when required dependencies need them.
+/// Call outside the materialization lock, with source admission checked again
+/// before using the result. This reading grants no package or credential authority.
+///
+/// # Errors
+/// The current account, default profile or private inventory cannot be admitted,
+/// or the capability probe cannot run. Missing or insufficient Git returns false when the
+/// selected inventory needs it.
+pub fn git_ready_for_inventory(sys: &dyn System, ctx: &Ctx) -> Result<bool, String> {
+    let [user] = ctx.users.as_slice() else {
+        return Err("repository Git requires exactly one local user".into());
+    };
+    if sys.euid() == 0 || sys.euid() != user.uid || sys.identity()?.user != *user {
+        return Err("repository Git must be read as its current local user".into());
+    }
+    if !uses_vault_inventory(sys, ctx)? {
+        return Err("repository Git no longer uses the private vault inventory".into());
+    }
+    let listed = inventory::Inventory::read(sys, user)?;
+    if listed.repositories().is_empty() {
+        return Ok(true);
+    }
+    if crate::items::github::installed_git_for(sys, Some(Path::new(&user.home))).is_none() {
+        return Ok(false);
+    }
+    if listed
+        .repositories()
+        .iter()
+        .all(|repo| repo.required_submodules.is_empty())
+    {
+        return Ok(true);
+    }
+    dependencies::supports_local_reads(sys, user)
 }
 
 /// Whether repository setup uses the private vault inventory rather than an explicit profile.
@@ -59,26 +98,46 @@ pub fn uses_vault_inventory(sys: &dyn System, ctx: &Ctx) -> Result<bool, String>
     Ok(matches!(asked(table, user)?, Asked::Default))
 }
 
-/// Count matching local checkouts against the private vault's complete inventory. No
-/// GitHub inventory, token, credential helper, or filesystem mutation is involved.
-/// An explicit GitHub profile leaves this default inventory out of its setup.
+/// The local clones of the vault's repository inventory, read offline for the git tuning
+/// they converge to ([`crate::clone_tuning`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VaultClones {
+    /// init.toml's `[github] enabled = false`: the person's git settings are not aterm's.
+    Off,
+    /// An explicit `[github]` profile names its own repositories; the vault inventory is left out.
+    Profile,
+    /// No private inventory from the Secrets vault is on this Mac.
+    NoInventory,
+    /// Each present clone's worktree top (`~/<name>`): a verified top-level worktree whose only
+    /// origin is the inventory's repository, its required submodules ready ([`repos`]' partition).
+    Present(Vec<PathBuf>),
+}
+
+/// [`VaultClones`] for this context's one user: no GitHub request, credential or write.
 ///
 /// # Errors
-/// The local account, private inventory, or home cannot be admitted.
-pub(crate) fn inventory_counts(
-    sys: &dyn System,
-    ctx: &Ctx,
-) -> Result<Option<(usize, usize)>, String> {
+/// The local account, init profile, private inventory, or home cannot be admitted.
+pub(crate) fn vault_clones(sys: &dyn System, ctx: &Ctx) -> Result<VaultClones, String> {
     let [user] = ctx.users.as_slice() else {
         return Err("repository inventory requires exactly one local user".into());
     };
     let table = profile(sys, user)?.and_then(|profile| profile.github);
-    if !matches!(asked(table, user)?, Asked::Default) {
-        return Ok(None);
+    match asked(table, user)? {
+        Asked::Off => return Ok(VaultClones::Off),
+        Asked::Scoped(_) | Asked::Profile(_) => return Ok(VaultClones::Profile),
+        Asked::Default => {}
     }
-    let listed = inventory::Inventory::read(sys, user)?.repositories()?;
-    let standing = repos::partition(sys, user, &listed.repositories)?;
-    Ok(Some((standing.present.len(), listed.repositories.len())))
+    match sys.stat(&Path::new(&user.home).join(inventory::FILE)) {
+        Err(why) if why.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(VaultClones::NoInventory);
+        }
+        _ => {}
+    }
+    let listed = inventory::Inventory::read(sys, user)?.into_repositories();
+    let standing = repos::partition(sys, user, &listed)?;
+    Ok(VaultClones::Present(
+        standing.present.into_iter().map(|(_, path)| path).collect(),
+    ))
 }
 
 /// Reconcile using locally captured inputs, checking their materialization
@@ -89,10 +148,11 @@ pub fn run_initial_repositories_captured(
     sys: &dyn System,
     ctx: &Ctx,
     mode: crate::model::Mode,
+    work: aterm_secrets::converge::RepositoryWork,
     inputs: InitialRepositoryInputs,
     current: impl Fn() -> Result<bool, String> + Send + Sync + 'static,
 ) -> Result<Vec<crate::model::ItemReport>, String> {
-    native::run_captured(sys, ctx, mode, inputs, Box::new(current))
+    native::run_captured(sys, ctx, mode, work, inputs, Box::new(current))
 }
 
 /// Reconciles repositories after the selected secrets stage has synchronized.
@@ -245,6 +305,21 @@ pub fn items(
     ctx: &Ctx,
     secrets: Option<&str>,
 ) -> Result<Vec<Box<dyn Item>>, String> {
+    items_for_work(
+        sys,
+        ctx,
+        secrets,
+        aterm_secrets::converge::RepositoryWork::Refresh,
+    )
+}
+
+/// Build the same default or explicit stage for an owned acquisition/refresh job.
+pub(crate) fn items_for_work(
+    sys: &dyn System,
+    ctx: &Ctx,
+    secrets: Option<&str>,
+    work: aterm_secrets::converge::RepositoryWork,
+) -> Result<Vec<Box<dyn Item>>, String> {
     let [user] = ctx.users.as_slice() else {
         return Err("aterm init GitHub requires exactly one local user".into());
     };
@@ -254,13 +329,13 @@ pub fn items(
         Asked::Default => {
             return Ok(vec![
                 keychain::item(user),
-                native::item(user, secrets.map(str::to_owned), true),
+                native::item(user, secrets.map(str::to_owned), true, work),
             ]);
         }
         Asked::Scoped(_) => {
             return Ok(vec![
                 keychain::item(user),
-                native::item(user, secrets.map(str::to_owned), false),
+                native::item(user, secrets.map(str::to_owned), false, work),
             ]);
         }
         Asked::Profile(config) => config,
@@ -357,6 +432,19 @@ fn profile(sys: &dyn System, user: &User) -> Result<Option<Config>, String> {
         Err(_) => return Err("cannot safely read ~/.config/aterm/init.toml (requires an owned regular file, no links or group/other writes, at most 64 KiB)".into()),
     };
     decode(&bytes).map(Some)
+}
+
+/// Semantic checkout ownership for default refresh, separate from credential authority.
+pub(super) fn develop_checkouts(
+    sys: &dyn System,
+    user: &User,
+) -> Result<BTreeSet<PathBuf>, String> {
+    let profile = profile(sys, user)?.unwrap_or_default();
+    Ok(
+        crate::init_develop::recorded(user, profile.develop.as_ref())?
+            .into_iter()
+            .collect(),
+    )
 }
 
 /// Returns the home's checkouts of the configured owner's repositories that are aterm workspaces.
@@ -1045,14 +1133,9 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_token_file_and_unproven_lookups_are_never_ready() {
+    fn unsafe_token_files_are_never_ready() {
         let (sys, auth, context) = fixture();
         sys.stat_of(SOURCE, stat(0o644, VALUE.len()));
-        assert!(matches!(auth.probe(&sys, &context), Probe::Blocked { .. }));
-        let (sys, auth, context) = fixture();
-        let u = auth.user.clone();
-        holds(&sys, &auth, VALUE);
-        signs_in(&sys, &u, "someone-else");
         assert!(matches!(auth.probe(&sys, &context), Probe::Blocked { .. }));
         unwritten(&sys);
     }

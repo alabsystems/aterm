@@ -17,7 +17,8 @@
 //! store from this Mac, the ingest consumer ([`ingest`]) hands each record another Mac originated
 //! to its store's own checks, and the `Inventory` exchange ([`inventory`]) fills what the relay
 //! cannot, each over the stores the node service hands it ([`stores`]).
-//! [`presence`] supplies the origin-signed presence rows and their per-seat reading (B7c).
+//! [`presence`] supplies the origin-signed presence rows and their per-seat reading (B7c), and
+//! [`view`] hands that reading, with every seat's needs row, to a reader on this Mac (B9).
 //! [`mail`] runs the fabric's mail pushes over the same links, one hop to the addressed Mac (C3).
 //! [`push`] answers the claims push a window or a session lane asks of the node service (B7b).
 //!
@@ -45,6 +46,7 @@ pub mod presence;
 pub mod push;
 pub mod relay;
 pub mod stores;
+pub mod view;
 
 pub use flow::{Pushed, current};
 pub use logs::{Mesh, MeshConfig, MeshLog, Standings};

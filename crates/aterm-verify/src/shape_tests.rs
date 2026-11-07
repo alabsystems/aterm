@@ -515,7 +515,8 @@ fn a_refused_cut_is_not_taken_again() {
 /// A ONE-CRATE SELECTION SPLITS ITS LIB-TEST OFF: `-p aterm-gui`, whose kept units (its lib-test
 /// 12.7 GiB, its lib 7.7 GiB) sum past the budget's claim, is `-p aterm-gui --lib` (its lib-test
 /// and what it needs, not its lib) and then `-p aterm-gui`, after it. The lib-test call claims by
-/// its units' peaks (12.7 GiB and a fifth more) and keeps its record under `targets --lib`.
+/// its units' peaks (12.7 GiB and a fifth more) and keeps its record under `targets --lib`; the
+/// closing call, with no record after it, by the one kept unit only it builds (its lib, 7.7 GiB).
 /// aterm-models' lib is not tested, and the graph says so. NEGATIVE CONTROL: with the split off by
 /// hand, `-p aterm-gui` was one call.
 #[test]
@@ -538,7 +539,7 @@ fn a_one_crate_selection_splits_its_lib_test_off() {
         calls[1].part.variant().as_deref(),
         Some("after -p aterm-gui --lib")
     );
-    assert!(calls[1].mem >= BUDGET);
+    assert_eq!(calls[1].mem, aterm_capacity::peak_claim(77 * GIB / 10));
     assert!(asked.contains(&"-p aterm-gui --lib".to_owned()));
     let mut i = Interner::default();
     let s1_graph = Graph::read(
@@ -551,6 +552,53 @@ fn a_one_crate_selection_splits_its_lib_test_off() {
     )
     .expect("reads");
     assert!(!s1_graph.tests_lib_of("aterm-models") && s1_graph.tests_lib_of("aterm-gui"));
+}
+
+/// A CLOSING CALL WITH NO RECORD AFTER THE CUTS CLAIMS BY ITS OWN UNITS, NOT THE WHOLE: `-p
+/// aterm-gui` (its lib-test 12.7 GiB, its lib 7.7 GiB, its smoke suite 1.5 GiB, summing past the
+/// budget's claim) closes after its lib-test call, which built the lib-test, so the closing call
+/// claims by the lib and the smoke suite summed (9.2 GiB and a fifth more), planned by that, where
+/// the whole estimate (21.9 GiB) would claim past the budget and, on a Mac that cannot hold it,
+/// run alone with every other session's memory claim waiting (measured 2026-11-06: 51.2 GiB
+/// asked on a 48 GiB Mac, for a closing call whose heaviest unit held 21.3 GiB). With no unit it
+/// builds kept, the whole estimate (its own record, 20 GiB). NEGATIVE CONTROL: with the closing call's units unread
+/// by hand, it claimed the whole estimate, 26.3 GiB.
+#[test]
+fn a_closing_call_with_no_record_claims_by_its_own_units() {
+    let mut r = Records::default();
+    unit(&mut r, "aterm-gui", "aterm_gui test", 12.7);
+    unit(&mut r, "aterm-gui", "aterm_gui lib", 7.7);
+    unit(&mut r, "aterm-gui", "smoke test", 1.5);
+    let graphs = Graphs {
+        peel_differs: false,
+    };
+    let (calls, _) = plan(&names(&["aterm-gui"]), &r, &graphs);
+    let calls = calls.expect("shaped");
+    assert_eq!(labels(&calls), ["-p aterm-gui --lib", "-p aterm-gui"]);
+    let closing = &calls[1];
+    assert_eq!(closing.mem, aterm_capacity::peak_claim(92 * GIB / 10));
+    assert!(closing.mem < BUDGET, "{}", closing.mem);
+    assert_eq!(closing.part.planned, Some(92 * GIB / 10));
+    assert!(
+        closing
+            .part
+            .said
+            .contains("by the units no call before it builds, its 2 heaviest units' peaks summed"),
+        "{}",
+        closing.part.said
+    );
+
+    let mut lib_test_only = Records::default();
+    row(&mut lib_test_only, VMEM, &["aterm-gui"], None, 20.0);
+    unit(&mut lib_test_only, "aterm-gui", "aterm_gui test", 12.7);
+    let (calls, _) = plan(&names(&["aterm-gui"]), &lib_test_only, &graphs);
+    let calls = calls.expect("shaped");
+    assert_eq!(labels(&calls), ["-p aterm-gui --lib", "-p aterm-gui"]);
+    assert_eq!(calls[1].mem, aterm_capacity::peak_claim(20 * GIB));
+    assert_eq!(
+        calls[1].part.planned, None,
+        "the whole estimate plans no run"
+    );
 }
 
 /// A CUT OVER ONE CRATE SPLITS ITS LIB-TEST OFF TOO: `-p aterm-effects -p aterm-gui` (21.56 GiB,

@@ -8,6 +8,7 @@
 use super::{Asked, Github, INPUT_MAX, TOKEN_FILE, asked, decode, inventory, profile, read_token};
 use crate::model::User;
 use crate::port::{OwnedFileMetadata, Stat, System};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 type FileVersion = Result<[u8; 32], std::io::ErrorKind>;
@@ -17,20 +18,20 @@ type PrefixFacts = Vec<(PathBuf, Result<Stat, std::io::ErrorKind>)>;
 struct PrefixPolicy(u32, u32, u32, bool, bool);
 
 #[derive(Clone, PartialEq, Eq)]
-struct ProfileKey {
+struct PathKey {
     uid: u32,
     home: PathBuf,
     file: Result<OwnedFileMetadata, std::io::ErrorKind>,
     prefix: Vec<(PathBuf, Result<PrefixPolicy, std::io::ErrorKind>)>,
 }
 
-struct ProfileFrame {
-    key: ProfileKey,
+struct PathFrame {
+    key: PathKey,
     facts: PrefixFacts,
 }
 
-impl ProfileFrame {
-    fn read(sys: &dyn System, user: &User, path: &Path) -> Self {
+impl PathFrame {
+    fn read(sys: &dyn System, user: &User, path: &Path, max: usize) -> Self {
         let facts: PrefixFacts = path
             .ancestors()
             .skip(1)
@@ -46,10 +47,10 @@ impl ProfileFrame {
             })
             .collect();
         let file = sys
-            .owned_file_metadata(path, user.uid, INPUT_MAX, false)
+            .owned_file_metadata(path, user.uid, max, false)
             .map_err(|e| e.kind());
         Self {
-            key: ProfileKey {
+            key: PathKey {
                 uid: user.uid,
                 home: PathBuf::from(&user.home),
                 file,
@@ -85,18 +86,19 @@ impl ProfileFrame {
     }
 }
 
-/// Per-observer memo of profile-derived paths alone. No credential bytes,
-/// executable choice, source authority or permission to use a file is cached.
+/// Per-observer memo of declared locations alone. No credential bytes, executable
+/// readiness, source authority or permission to use a file is cached.
 #[derive(Default)]
 pub struct RepositoryInputPathCache {
-    profile: Option<(ProfileKey, Vec<PathBuf>)>,
+    profile: Option<(PathKey, Vec<PathBuf>)>,
+    command: Option<(PathKey, Vec<PathBuf>)>,
 }
 
 /// Declared paths and the fresh prefix facts already read while deriving them.
 pub struct RepositoryControlPaths {
     pub paths: Vec<PathBuf>,
     pub prefix_facts: PrefixFacts,
-    /// Only a coherent settled profile permits the observer's metadata fast path.
+    /// Only coherent settled declarations permit the observer's metadata fast path.
     pub reusable: bool,
 }
 
@@ -117,15 +119,15 @@ impl std::fmt::Debug for RepositoryControlPaths {
 }
 
 impl RepositoryInputPathCache {
-    /// Observe current paths, resolving Git and launcher links every time. Only
-    /// unchanged settled profile selection avoids another owned content read.
+    /// Observe current paths, resolving Git and command links every time. Only
+    /// unchanged settled declarations avoid another owned content read.
     /// # Errors
     /// This process's own account cannot be identified.
     pub fn observe(&mut self, sys: &dyn System) -> Result<RepositoryControlPaths, String> {
         let user = account(sys)?;
         let path = Path::new(&user.home).join(".config/aterm/init.toml");
         let started = sys.now();
-        let before = ProfileFrame::read(sys, &user, &path);
+        let before = PathFrame::read(sys, &user, &path, INPUT_MAX);
         let (selected, reusable) = if let Some((_, selected)) = self
             .profile
             .as_ref()
@@ -145,20 +147,59 @@ impl RepositoryInputPathCache {
                 // reading behavior. They cannot populate the memo or skip a retry.
                 Err(_) => selected_paths(profile(sys, &user), &user),
             };
-            let after = ProfileFrame::read(sys, &user, &path);
+            let after = PathFrame::read(sys, &user, &path, INPUT_MAX);
             let reusable = before.accepts(&read, &after, started);
             self.profile = reusable.then(|| (before.key.clone(), selected.clone()));
             (selected, reusable)
         };
-        let mut paths = dynamic_paths(sys, &user);
+        let (commands, command_facts, command_reusable) = self.commands(sys, &user, started);
+        let mut paths = dynamic_paths(sys, &user, &commands);
         paths.extend(selected);
         paths.sort();
         paths.dedup();
         Ok(RepositoryControlPaths {
             paths,
-            prefix_facts: before.facts,
-            reusable,
+            prefix_facts: before.facts.into_iter().chain(command_facts).collect(),
+            reusable: reusable && command_reusable,
         })
+    }
+
+    fn commands(
+        &mut self,
+        sys: &dyn System,
+        user: &User,
+        started: u64,
+    ) -> (Vec<PathBuf>, PrefixFacts, bool) {
+        use crate::git_credential::Helper;
+        use aterm_types::installed_command as command;
+        let path = command::path(Path::new(&user.home));
+        let before = PathFrame::read(sys, user, &path, command::MAX_BYTES);
+        if let Some((_, locations)) = self
+            .command
+            .as_ref()
+            .filter(|(key, _)| *key == before.key && before.settled(started))
+        {
+            return (locations.clone(), before.facts, true);
+        }
+        let read = sys.read_owned_file_observed(&path, user.uid, command::MAX_BYTES, false);
+        let locations = if read
+            .as_ref()
+            .is_err_and(|why| why.kind() == std::io::ErrorKind::Unsupported)
+        {
+            Helper::locations(sys, user)
+        } else {
+            Helper::locations_from(
+                user,
+                read.as_ref()
+                    .map(|read| read.bytes.as_slice())
+                    .map_err(std::io::Error::kind),
+            )
+        }
+        .unwrap_or_default();
+        let after = PathFrame::read(sys, user, &path, command::MAX_BYTES);
+        let reusable = before.accepts(&read, &after, started);
+        self.command = reusable.then(|| (before.key.clone(), locations.clone()));
+        (locations, before.facts, reusable)
     }
 }
 
@@ -167,13 +208,26 @@ impl RepositoryInputPathCache {
 #[derive(Clone, PartialEq, Eq)]
 pub struct RepositoryInputMark {
     source: Result<Stamp, String>,
-    helper: Result<(PathBuf, [u8; 32]), std::io::ErrorKind>,
+    /// Refresh eligibility only; never part of the credential/source authority stamp.
+    develop: Result<BTreeSet<PathBuf>, String>,
+    helper: Result<(PathBuf, PathBuf, [u8; 32]), std::io::ErrorKind>,
     git: Vec<(PathBuf, FileVersion)>,
     paths: Vec<PathBuf>,
     checkouts: super::checkout_inputs::Checkouts,
 }
 
 impl RepositoryInputMark {
+    /// Whether only checkout facts could differ. These source, helper and Git
+    /// inputs determine when a refresh is requested; the request grants no authority.
+    #[must_use]
+    pub fn same_source(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.develop == other.develop
+            && self.helper == other.helper
+            && self.git == other.git
+            && self.paths == other.paths
+    }
+
     /// Resample the previously derived private-inventory scope using metadata alone.
     /// This reads no private inventory, credential or worktree content and starts no program.
     #[must_use]
@@ -204,7 +258,7 @@ fn account(sys: &dyn System) -> Result<User, String> {
     Ok(user)
 }
 
-/// Observe this login's selected repository inputs, fixed credential helper and admitted Git
+/// Observe this login's selected repository inputs, installed credential helper and admitted Git
 /// command/payload. Missing or refused inputs remain stable observations, so removal and
 /// later repair each move it.
 ///
@@ -213,13 +267,14 @@ fn account(sys: &dyn System) -> Result<User, String> {
 pub fn repository_input_mark(sys: &dyn System) -> Result<RepositoryInputMark, String> {
     let user = account(sys)?;
     let helper = (|| {
-        let path = sys.canonicalize(&crate::git_credential::Helper::launcher(&user))?;
-        let version = sys.file_version(&path)?;
-        Ok::<_, std::io::Error>((path, version))
+        let (program, payload) = crate::git_credential::Helper::target(sys, &user)?;
+        let version = sys.file_version(&payload)?;
+        Ok::<_, std::io::Error>((program, payload, version))
     })()
     .map_err(|why| why.kind());
     Ok(RepositoryInputMark {
         source: Stamp::read(sys, &user),
+        develop: super::develop_checkouts(sys, &user),
         helper,
         git: git_paths(sys)
             .into_iter()
@@ -270,46 +325,51 @@ pub fn repository_checkout_watch_paths(sys: &dyn System) -> Result<Vec<PathBuf>,
 }
 
 fn watch_paths(sys: &dyn System, user: &User) -> Vec<PathBuf> {
-    let mut paths = dynamic_paths(sys, user);
+    let commands = crate::git_credential::Helper::locations(sys, user).unwrap_or_default();
+    let mut paths = dynamic_paths(sys, user, &commands);
     paths.extend(selected_paths(profile(sys, user), user));
     paths.sort();
     paths.dedup();
     paths
 }
 
-fn dynamic_paths(sys: &dyn System, user: &User) -> Vec<PathBuf> {
+fn dynamic_paths(sys: &dyn System, user: &User, commands: &[PathBuf]) -> Vec<PathBuf> {
     let home = Path::new(&user.home);
-    let launcher = crate::git_credential::Helper::launcher(user);
-    let mut paths = vec![home.join(".config/aterm/init.toml"), launcher.clone()];
-    if let Ok(resolved) = sys.canonicalize(&launcher) {
-        paths.push(resolved);
-    }
+    let mut paths = vec![
+        home.join(".config/aterm/init.toml"),
+        aterm_types::installed_command::path(home),
+    ];
     // A launcher can precede its installed target. Keep each declared target observable even
     // when canonicalization cannot reach it yet, including a dangling link in a parent. This
     // reads link metadata only and grants no permission to execute or read the target.
-    let mut link = launcher;
-    let mut seen = std::collections::BTreeSet::new();
-    for _ in 0..64 {
-        if !seen.insert(link.clone()) {
-            break;
+    for command in commands {
+        if let Ok(resolved) = sys.canonicalize(command) {
+            paths.push(resolved);
         }
-        paths.push(link.clone());
-        let next = link.ancestors().find_map(|ancestor| {
-            let target = sys.read_link(ancestor).ok()?;
-            let target = if target.is_absolute() {
-                target
-            } else {
-                ancestor.parent()?.join(target)
-            };
-            let tail = link.strip_prefix(ancestor).ok()?;
-            Some(if tail.as_os_str().is_empty() {
-                target
-            } else {
-                target.join(tail)
-            })
-        });
-        let Some(next) = next else { break };
-        link = next;
+        let mut link = command.clone();
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            if !seen.insert(link.clone()) {
+                break;
+            }
+            paths.push(link.clone());
+            let next = link.ancestors().find_map(|ancestor| {
+                let target = sys.read_link(ancestor).ok()?;
+                let target = if target.is_absolute() {
+                    target
+                } else {
+                    ancestor.parent()?.join(target)
+                };
+                let tail = link.strip_prefix(ancestor).ok()?;
+                Some(if tail.as_os_str().is_empty() {
+                    target
+                } else {
+                    target.join(tail)
+                })
+            });
+            let Some(next) = next else { break };
+            link = next;
+        }
     }
     paths.extend(git_paths(sys));
     paths
@@ -369,9 +429,9 @@ mod tests {
             admin: false,
         };
         let sys = crate::port::Live::new();
-        let before = ProfileFrame::read(&sys, &user, &path);
+        let before = PathFrame::read(&sys, &user, &path, INPUT_MAX);
         let read = sys.read_owned_file_observed(&path, user.uid, INPUT_MAX, false);
-        let after = ProfileFrame::read(&sys, &user, &path);
+        let after = PathFrame::read(&sys, &user, &path, INPUT_MAX);
         let settled = sys.now().saturating_add(3);
         assert!(
             before.accepts(&read, &after, settled),
@@ -386,7 +446,7 @@ mod tests {
         let substituted = sys.read_owned_file_observed(&other, user.uid, INPUT_MAX, false);
         assert!(!before.accepts(&substituted, &after, settled));
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o750)).unwrap();
-        let changed = ProfileFrame::read(&sys, &user, &path);
+        let changed = PathFrame::read(&sys, &user, &path, INPUT_MAX);
         assert!(
             !before.accepts(&read, &changed, settled),
             "prefix admission is part of the key"
@@ -407,7 +467,7 @@ mod tests {
             shell: String::new(),
             admin: false,
         };
-        let launcher = crate::git_credential::Helper::launcher(&user);
+        let [launcher, store] = aterm_types::installed_command::legacy(Path::new(&user.home));
         std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
         std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&alias, &launcher).unwrap();
@@ -421,6 +481,10 @@ mod tests {
             assert!(sys.canonicalize(&launcher).is_err(), "the target is absent");
             let paths = watch_paths(&sys, &user);
             assert!(paths.contains(&launcher));
+            assert!(
+                paths.contains(&store),
+                "both absent-declaration locations are watched"
+            );
             assert!(paths.contains(&alias));
             assert!(
                 paths.contains(&alias.parent().unwrap().join(relative)),
@@ -435,6 +499,48 @@ mod tests {
         std::os::unix::fs::symlink(&package, launcher.parent().unwrap()).unwrap();
         assert!(sys.canonicalize(&launcher).is_err());
         assert!(watch_paths(&sys, &user).contains(&package.join("aterm")));
+
+        use aterm_types::installed_command as command;
+        use std::os::unix::fs::PermissionsExt as _;
+        let declaration = command::path(&home);
+        std::fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+        let custom = root_path.join("custom bin/aterm");
+        let payload = root_path.join("custom store/aterm");
+        std::fs::create_dir_all(custom.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&payload, &custom).unwrap();
+        let select = |target: &Path| {
+            std::fs::write(
+                &declaration,
+                command::Selection::new(target.to_path_buf())
+                    .unwrap()
+                    .encode()
+                    .unwrap(),
+            )
+            .unwrap();
+            std::fs::set_permissions(&declaration, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        select(&custom);
+        let paths = watch_paths(&sys, &user);
+        assert!(paths.contains(&declaration));
+        assert!(paths.contains(&custom));
+        assert!(
+            paths.contains(&payload),
+            "a custom dangling target can arrive"
+        );
+        assert!(
+            !paths.contains(&launcher),
+            "a declaration retires legacy locations"
+        );
+        let replacement = root_path.join("replacement store/aterm");
+        select(&replacement);
+        let paths = watch_paths(&sys, &user);
+        assert!(paths.contains(&replacement));
+        assert!(!paths.contains(&custom));
+        assert!(!paths.contains(&payload), "the old selection retires");
+        std::fs::write(&declaration, b"not a declaration").unwrap();
+        let paths = watch_paths(&sys, &user);
+        assert!(paths.contains(&declaration));
+        assert!(!paths.contains(&launcher), "malformed does not fall back");
     }
 }
 

@@ -730,6 +730,27 @@ impl Instance {
     }
 }
 
+/// Test seam: takes group and other write off this process's own image, once, before a test
+/// caches it. [`Store::cache_current`] refuses an image others may write, and a linker writes a
+/// test binary with the umask's mode: group-writable under a user-private-group login's 002,
+/// where an installed image is 0755. The cache stamps the image with its mode and change time,
+/// so this runs before any cache in the process and leaves an image already narrow untouched.
+///
+/// # Panics
+/// Panics if this process's image cannot be read or narrowed.
+#[cfg(any(test, debug_assertions))]
+pub fn narrow_test_image() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let exe = std::env::current_exe().expect("this test binary's path");
+        let mode = fs::metadata(&exe).expect("this test binary's mode").mode();
+        if mode & 0o022 != 0 {
+            fs::set_permissions(&exe, fs::Permissions::from_mode(mode & 0o7777 & !0o022))
+                .expect("narrow this test binary's mode");
+        }
+    });
+}
+
 #[cfg(test)]
 #[path = "host_executable/tests.rs"]
 mod tests;

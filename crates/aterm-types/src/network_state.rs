@@ -112,14 +112,32 @@ pub enum RepairStage {
 }
 
 /// Historical outcome of one local attempt, never a network convergence claim.
+///
+/// A failure carries its local cause:
+///
+/// ```
+/// use aterm_types::network_state::{RepairCause, RepairOutcome};
+/// assert_eq!(RepairOutcome::Failed(RepairCause::Io).cause(), Some(RepairCause::Io));
+/// ```
+///
+/// and there is no failed outcome without one:
+///
+/// ```compile_fail,E0308
+/// use aterm_types::network_state::RepairOutcome;
+/// let outcome: RepairOutcome = RepairOutcome::Failed;
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepairOutcome {
-    /// This local attempt failed; the remote cause is not established.
-    Failed,
+    /// This local attempt failed, for the local cause it names; the remote cause is not
+    /// established. A failure always has a cause: there is no failed attempt without one.
+    Failed(RepairCause),
     /// The owner stopped this attempt before completion.
     Cancelled,
-    /// Some inventory or offered records could not be processed in this round.
-    Deferred,
+    /// Some inventory or offered records could not be processed in this round: an
+    /// application-stage local refusal names its cause; `None` where no category was recorded (a
+    /// peer's unexplained deferral, or control or membership records left unacknowledged, which
+    /// can include this Mac's own refusals).
+    Deferred(Option<RepairCause>),
     /// No application exchange completed, including with older peers.
     NotObserved,
     /// The application exchange selected no common table.
@@ -128,19 +146,31 @@ pub enum RepairOutcome {
     Exchanged,
 }
 
+impl RepairOutcome {
+    /// The local refusal this outcome names: a failure's, or a local deferral's.
+    #[must_use]
+    pub const fn cause(self) -> Option<RepairCause> {
+        match self {
+            Self::Failed(cause) => Some(cause),
+            Self::Deferred(cause) => cause,
+            Self::Cancelled | Self::NotObserved | Self::NoCommonTable | Self::Exchanged => None,
+        }
+    }
+}
+
 /// Sanitized metadata from the most recent attempt with an authenticated peer.
 /// Reads retain its original timestamp and never make it current or authorize access.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepairObservation {
-    /// Value-free local refusal category. No diagnostic text is published.
-    pub cause: Option<RepairCause>,
     /// Original worker completion time, milliseconds since Unix epoch.
     pub completed_at_ms: u64,
     /// True when this owner dialled the peer; false for an incoming connection.
     pub outbound: bool,
     /// The local failure/defer boundary, or the last entered boundary if unknown.
     pub stage: Option<RepairStage>,
-    /// What this one attempt established, independently of current reachability.
+    /// What this one attempt established, independently of current reachability, with its
+    /// value-free local refusal category ([`RepairOutcome::cause`]). No diagnostic text is
+    /// published.
     pub outcome: RepairOutcome,
     /// Selected application table, when reported by this attempt.
     pub table: Option<[u8; 32]>,
@@ -152,6 +182,14 @@ pub struct RepairObservation {
     pub deferred: Option<u64>,
 }
 
+impl RepairObservation {
+    /// This attempt's value-free local refusal category ([`RepairOutcome::cause`]).
+    #[must_use]
+    pub const fn cause(&self) -> Option<RepairCause> {
+        self.outcome.cause()
+    }
+}
+
 /// Closed vocabulary for repair refusals; never contains wire or filesystem data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepairCause {
@@ -159,10 +197,16 @@ pub enum RepairCause {
     LegacyPastCrossing,
     /// The selected application table was not provisioned here.
     TableUndeclared,
-    /// A bounded record or byte budget is exhausted.
+    /// A bounded record, byte or time budget is exhausted.
     Quota,
     /// A filesystem or stream operation failed.
     Io,
+    /// This Mac's LAN use waits for its LAN broker: none answers (setup's Mac password installs
+    /// it) and no direct path macOS allowed serves this aterm, or the broker speaks another
+    /// protocol or refuses this aterm.
+    LanHeld,
+    /// A dial reached no peer: refused, timed out, or no route to the address.
+    Unreachable,
     /// A frame or stored record could not be decoded.
     Decode,
     /// Membership or local custody is not ready for table access.
@@ -175,17 +219,38 @@ pub enum RepairCause {
 
 impl RepairCause {
     /// Stable diagnostic word shared by persisted and command observations.
-    pub fn word(self) -> &'static str {
+    #[must_use]
+    pub const fn word(self) -> &'static str {
         match self {
             Self::LegacyPastCrossing => "legacy-past-crossing",
             Self::TableUndeclared => "table-undeclared",
             Self::Quota => "quota",
             Self::Io => "io",
+            Self::LanHeld => "lan-held",
+            Self::Unreachable => "unreachable",
             Self::Decode => "decode",
             Self::NotReady => "not-ready",
             Self::NeedsUpdate => "needs-update",
             Self::Other => "other",
         }
+    }
+
+    /// The cause whose [`Self::word`] is `word`, if any.
+    #[must_use]
+    pub fn from_word(word: &str) -> Option<Self> {
+        Some(match word {
+            "legacy-past-crossing" => Self::LegacyPastCrossing,
+            "table-undeclared" => Self::TableUndeclared,
+            "quota" => Self::Quota,
+            "io" => Self::Io,
+            "lan-held" => Self::LanHeld,
+            "unreachable" => Self::Unreachable,
+            "decode" => Self::Decode,
+            "not-ready" => Self::NotReady,
+            "needs-update" => Self::NeedsUpdate,
+            "other" => Self::Other,
+            _ => return None,
+        })
     }
 }
 

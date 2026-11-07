@@ -168,6 +168,57 @@ pub(super) fn fixture() -> Fixture {
 }
 
 #[test]
+fn canonical_maintenance_refuses_a_physical_auth_alias_without_changing_custody() {
+    let fixture = fixture();
+    let store = fixture
+        .env
+        .accounts_store_for(accounts::Cli::Codex)
+        .unwrap();
+    let lifetime = account_work::Lifetime::default();
+    let scope = lifetime.enter().unwrap();
+    let cancellation = scope.cancellation();
+    let entered = std::cell::Cell::new(0);
+    let admit = || {
+        with_maintenance_owner(&fixture.env, &fixture.binding, &scope, |_| {
+            entered.set(entered.get() + 1);
+            Ok(())
+        })
+    };
+    let first = admit();
+    let first_entered = entered.get();
+    let records = std::fs::read(store.logins_file()).unwrap();
+    let credential = std::fs::read(&fixture.auth).unwrap();
+    let alias = fixture.auth.with_extension("fixture-alias");
+    std::fs::hard_link(&fixture.auth, &alias).unwrap();
+    let refused = admit();
+    let refused_entered = entered.get();
+    let records_unchanged = std::fs::read(store.logins_file()).unwrap() == records;
+    let auth_unchanged = std::fs::read(&fixture.auth).unwrap() == credential;
+    // Remove the actual alias before checking the refusal, including on regression.
+    let removed = std::fs::remove_file(&alias);
+    let restored = admit();
+    let restored_entered = entered.get();
+    drop(scope);
+    let drained = lifetime.pause().unwrap().try_wait();
+    first.unwrap();
+    removed.unwrap();
+    restored.unwrap();
+    assert_eq!(
+        first_entered, 1,
+        "the genuine canonical reader admitted the original file"
+    );
+    assert!(refused.is_err());
+    assert_eq!(
+        refused_entered, first_entered,
+        "an alias must refuse before the maintenance callback"
+    );
+    assert!(records_unchanged && auth_unchanged);
+    assert_eq!(restored_entered, first_entered + 1);
+    assert!(cancellation.retired());
+    drained.expect("the original maintenance scope retired");
+}
+
+#[test]
 fn cancelled_app_scope_can_admit_canonical_maintenance_without_consumer_delivery() {
     let fixture = fixture();
     let env = &fixture.env;

@@ -239,7 +239,7 @@ mod tests {
         let scratch = aterm_tempfile::tempdir().unwrap();
         let config = scratch.path().join("aterm.toml");
         assert_eq!(enabled_at(&config), Ok(true), "missing file defaults on");
-        std::fs::write(&config, "[swarm]\nenabled = false\n").unwrap();
+        crate::fsx::write_owned_in_place(&config, "[swarm]\nenabled = false\n");
         assert_eq!(enabled_at(&config), Ok(false));
         let link = scratch.path().join("linked.toml");
         std::os::unix::fs::symlink(&config, &link).unwrap();
@@ -265,11 +265,11 @@ mod tests {
         let dotfiles = scratch.path().join("dotfiles");
         std::fs::create_dir_all(&dotfiles).unwrap();
         let target = dotfiles.join("aterm.toml");
-        std::fs::write(&target, "[swarm]\nenabled = true\n").unwrap();
+        crate::fsx::write_owned_in_place(&target, "[swarm]\nenabled = true\n");
         std::os::unix::fs::symlink(&target, dir.join("aterm.toml")).unwrap();
         let mut switch = Switch::new(&home);
         assert_eq!(switch.enabled(), Ok(true), "the window reads sharing on");
-        std::fs::write(&target, "[swarm]\nenabled = false # turned off\n").unwrap();
+        crate::fsx::write_owned_in_place(&target, "[swarm]\nenabled = false # turned off\n");
         assert_eq!(
             switch.enabled(),
             Ok(false),
@@ -290,15 +290,15 @@ mod tests {
         let said = std::cell::RefCell::new(Vec::<String>::new());
         let log = |line: &str| said.borrow_mut().push(line.to_owned());
         let mut switch = Switch::new(&home);
-        std::fs::write(&config, "[swarm]\nenabled = 1\n").unwrap();
+        crate::fsx::write_owned_in_place(&config, "[swarm]\nenabled = 1\n");
         for _ in 0..5 {
             assert!(switch.enabled_saying(&log).is_err());
         }
-        std::fs::write(&config, "[swarm]\nother = true\n").unwrap();
+        crate::fsx::write_owned_in_place(&config, "[swarm]\nother = true\n");
         for _ in 0..5 {
             assert!(switch.enabled_saying(&log).is_err());
         }
-        std::fs::write(&config, "[swarm]\nenabled = true\n").unwrap();
+        crate::fsx::write_owned_in_place(&config, "[swarm]\nenabled = true\n");
         assert_eq!(switch.enabled_saying(&log), Ok(true));
         let said = said.into_inner();
         assert_eq!(said.len(), 2, "once per change: {said:?}");
@@ -322,14 +322,14 @@ mod tests {
         let config = dir.join("aterm.toml");
         let mut switch = Switch::new(&home);
         assert_eq!(switch.enabled(), Ok(true), "no file: on");
-        std::fs::write(&config, "[swarm]\nenabled = false\n").unwrap();
+        crate::fsx::write_owned_in_place(&config, "[swarm]\nenabled = false\n");
         assert_eq!(switch.enabled(), Ok(false), "written off");
         assert_eq!(switch.enabled(), Ok(false), "unchanged");
         let replaced = dir.join("aterm.toml.new");
-        std::fs::write(&replaced, "[swarm]\nenabled = true\n").unwrap();
+        crate::fsx::write_owned_in_place(&replaced, "[swarm]\nenabled = true\n");
         std::fs::rename(&replaced, &config).unwrap();
         assert_eq!(switch.enabled(), Ok(true), "replaced on");
-        std::fs::write(&config, "[swarm]\nenabled = 1\n").unwrap();
+        crate::fsx::write_owned_in_place(&config, "[swarm]\nenabled = 1\n");
         assert!(switch.enabled().is_err(), "unreadable says so");
         std::fs::remove_file(&config).unwrap();
         assert_eq!(switch.enabled(), Ok(true), "removed: on");
@@ -391,7 +391,7 @@ mod tests {
         let cfg_dir = home.join(".config").join("aterm");
         std::fs::create_dir_all(&cfg_dir).unwrap();
         assert_eq!(enabled_in_home(&home), Ok(true));
-        std::fs::write(cfg_dir.join("aterm.toml"), "[swarm]\nenabled = false\n").unwrap();
+        crate::fsx::write_owned_in_place(cfg_dir.join("aterm.toml"), "[swarm]\nenabled = false\n");
         assert_eq!(enabled_in_home(&home), Ok(false));
     }
 }

@@ -322,6 +322,48 @@ fn explicit_stdout_limit_accepts_the_native_boundary_without_changing_the_defaul
     ));
 }
 
+/// A LISTING IS READ WHOLE PAST THE SHARED HARD MAXIMUM, UP TO ITS OWN: one byte past
+/// [`MAX_COMPLETE_STDOUT_BYTES`] comes back whole. NEGATIVE CONTROLS: the shared entry point
+/// refuses that limit before dispatch, and the listing's refuses one past its own maximum.
+#[cfg(unix)]
+#[test]
+fn a_listing_reads_past_the_shared_hard_maximum_up_to_its_own() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let mut missing = crate::spawnfd::command(world.path().join("absent"));
+    for refused in [
+        output_until_complete_listing(
+            &mut missing,
+            Instant::now() + HANG,
+            MAX_COMPLETE_LISTING_BYTES + 1,
+        ),
+        output_until_complete_stdout_with_limit(
+            &mut missing,
+            Instant::now() + HANG,
+            MAX_COMPLETE_STDOUT_BYTES + 1,
+        ),
+    ] {
+        assert!(matches!(
+            refused,
+            Err(CompleteOutputError::Run(RunError::Spawn(error)))
+                if error.kind() == io::ErrorKind::InvalidInput
+        ));
+    }
+    let past = MAX_COMPLETE_STDOUT_BYTES + 1;
+    let dd = crate::deadline::stand_in(std::path::Path::new("/bin/dd"));
+    let out = output_until_complete_listing(
+        crate::spawnfd::command(&dd).args([
+            "if=/dev/zero".to_owned(),
+            format!("bs={past}"),
+            "count=1".to_owned(),
+        ]),
+        Instant::now() + HANG,
+        past,
+    )
+    .unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout.len(), past);
+}
+
 #[test]
 fn explicit_stdout_limit_has_a_hard_maximum_and_supports_empty_output() {
     let world = aterm_tempfile::tempdir().unwrap();
@@ -510,4 +552,84 @@ fn complete_stdout_reads_a_pipe_held_outside_a_group_left_only_a_zombie_until_it
     let read = drain.collect(&grace);
     drop(zombie);
     assert_eq!(read.unwrap(), b"one two");
+}
+
+#[test]
+fn record_capture_reads_past_its_limit_keeping_only_the_records_it_accepts() {
+    let mut long = Vec::new();
+    for i in 0..10_000 {
+        long.extend_from_slice(format!("skip {i}\0").as_bytes());
+    }
+    long.extend_from_slice(b"keep a\0skip\0keep b");
+    let kept = read_records(Cursor::new(long.clone()), 0, 16, |r| r.starts_with(b"keep"))
+        .expect("the whole stream, little of it kept");
+    assert_eq!(kept, b"keep a\0keep b");
+    // NEGATIVE CONTROL: the same stream kept whole passes the limit and is refused.
+    assert!(matches!(
+        read_records(Cursor::new(long), 0, 16, |_| true),
+        Err(CompleteOutputError::StdoutTooLarge { limit: 16 })
+    ));
+    // One record longer than the limit is refused even unkept: a runaway holds no memory.
+    assert!(matches!(
+        read_records(Cursor::new(vec![b'x'; 17]), 0, 16, |_| false),
+        Err(CompleteOutputError::StdoutTooLarge { limit: 16 })
+    ));
+    assert_eq!(
+        read_records(Cursor::new(vec![b'x'; 16]), 0, 16, |_| false).expect("within"),
+        b""
+    );
+    // The limit bounds a record's body: an ended one of exactly `limit` bytes is within it too.
+    let mut ended = vec![b'x'; 16];
+    ended.push(0);
+    assert_eq!(
+        read_records(Cursor::new(ended), 0, 16, |_| false).expect("an ended record within"),
+        b""
+    );
+}
+
+/// A CHILD STILL RUNNING AT ITS DEADLINE IS ENDED, NOT LEFT RUNNING: the complete reader refuses
+/// it as timed out, and once the call has returned no process has the child's pid. The child
+/// writes its own pid on a pipe it holds as its stdin before it becomes `sleep 600`, so the check
+/// is of that child alone, not of the pipe, whose write end a sibling test's child parked between
+/// fork and exec can hold a moment too ([`crate::fork_window`]); no timing decides it.
+/// NEGATIVE CONTROL: with `capture`'s `end_bounded` removed, the `sleep 600` is still there when
+/// the call returns.
+#[cfg(unix)]
+#[test]
+fn a_child_past_its_deadline_is_ended_not_left_running() {
+    let (read, write) = std::io::pipe().expect("a pipe");
+    let mut command =
+        crate::spawnfd::command(crate::deadline::stand_in(std::path::Path::new("/bin/sh")));
+    command
+        .args(["-c", "printf '%s\\n' \"$$\" >&0 && exec \"$1\" 600", "sh"])
+        .arg(crate::deadline::stand_in(std::path::Path::new(
+            "/bin/sleep",
+        )));
+    let (said, heard) = std::sync::mpsc::channel();
+    let mut named = None;
+    let got = capture(
+        &mut command,
+        Stdio::from(write),
+        Instant::now(),
+        || {
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                let read = io::BufRead::read_line(&mut io::BufReader::new(read), &mut line);
+                let _ = said.send(read.map(|_| line));
+            });
+            named = Some(heard.recv_timeout(HANG).expect("the child writes its pid"));
+        },
+        |pipe, stream| drain_stdout_with_limit(pipe, stream, 1024),
+    );
+    assert!(
+        matches!(got, Err(CompleteOutputError::Run(RunError::TimedOut))),
+        "{got:?}"
+    );
+    let line = named.expect("the child started").expect("its pid line");
+    let pid = line.trim().parse::<i32>().expect("a pid");
+    assert_eq!(
+        crate::process::process_presence(pid),
+        crate::process::ProcessPresence::Absent,
+        "the timed-out child {pid} when the call returned"
+    );
 }

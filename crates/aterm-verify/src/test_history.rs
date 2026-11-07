@@ -13,8 +13,11 @@
 //! ([`aterm_capacity::book::TEST_HISTORY`]) and is written as they are: under its lock from the
 //! read to the write, staged and renamed whole ([`aterm_capacity::book::update_text`]). A run
 //! adds the sample of every binary whose run measured it in one write once its binaries have run
-//! ([`keep`]): none for a binary its ceiling left no time to start, one its environment ended or
-//! one an interrupt cut short, whose wall would say nothing of it. A file that
+//! ([`keep`]): none for a binary its ceiling left no time to start, its environment ended, or an
+//! interrupt cut short, whose wall would say nothing of it. A binary stopped at its first
+//! decisive red adds an outcome-only sample: its zero wall changes no timing but makes its latest
+//! FAIL available to failed-first order. The width planner reads the history ([`History::seen`])
+//! before a run plans its binaries. A file that
 //! cannot be decoded (another schema, a torn row) reads as empty and is replaced; one that cannot
 //! be read at all (a symlink, a directory, past its bound) is left as it is.
 
@@ -71,6 +74,41 @@ impl Row {
     }
 }
 
+impl Sample {
+    /// The test threads it had: its width, no more than its tests, at least one.
+    fn threads(&self) -> u64 {
+        u64::from(self.width).min(self.tests.unwrap_or(1)).max(1)
+    }
+
+    /// Its CPU per thread it had (`cpu / wall / threads`), where both were read.
+    fn per_thread(&self) -> Option<f64> {
+        let cpu = self.cpu_ms?;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "milliseconds and thread counts far below 2^52"
+        )]
+        let per = cpu as f64 / self.wall_ms as f64 / self.threads() as f64;
+        (self.wall_ms > 0 && per.is_finite()).then_some(per)
+    }
+
+    /// Whether its wall says what the binary takes: a run outside the tree's control (NOT RUN),
+    /// one with no wall, and a FAIL in which libtest never said it runs a test (it crashed before
+    /// it began) do not. A FAIL that ran its tests, or one the run's ceiling ended, is a lower
+    /// bound of what it takes, which plans it no shorter than it is.
+    fn timed(&self) -> bool {
+        use crate::ladder::{Outcome, Severity};
+        self.outcome != crate::report::word(Outcome::Fail(Severity::CouldNotRun))
+            && self.wall_ms > 0
+            && (self.outcome == crate::report::word(Outcome::Ok) || self.tests.is_some())
+    }
+
+    /// Whether it was a FAIL: a proven red of the binary's own.
+    fn failed(&self) -> bool {
+        use crate::ladder::{Outcome, Severity};
+        self.outcome == crate::report::word(Outcome::Fail(Severity::GateFailed))
+    }
+}
+
 /// The history the file holds.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct History {
@@ -119,6 +157,54 @@ impl History {
                 at -= 1;
             }
         }
+    }
+
+    /// What the width planner reads of the binary `test` ([`crate::test_plan`]): its last timed
+    /// sample's wall, width and tests, the most CPU per thread (at least one) and the most memory
+    /// any kept sample showed, and whether its last sample was a FAIL. `None` with no timed
+    /// sample.
+    #[must_use]
+    pub fn seen(&self, test: &str) -> Option<crate::test_plan::Seen> {
+        let row = self.row(test)?;
+        let last = row.samples.iter().rev().find(|s| s.timed())?;
+        let per_thread = row
+            .samples
+            .iter()
+            .filter(|s| s.timed())
+            .filter_map(Sample::per_thread)
+            .fold(1.0_f64, f64::max);
+        Some(crate::test_plan::Seen {
+            wall: std::time::Duration::from_millis(last.wall_ms),
+            width: last.width.max(1),
+            tests: u32::try_from(last.tests.unwrap_or(0)).unwrap_or(u32::MAX),
+            per_thread,
+            peak: row
+                .samples
+                .iter()
+                .filter_map(|s| s.peak_bytes)
+                .max()
+                .unwrap_or(0),
+            failed: row.samples.last().is_some_and(Sample::failed),
+        })
+    }
+
+    /// The most memory any kept run of a binary of `crates` held at once (every binary's where
+    /// `crates` is empty: the whole workspace), bytes; 0 with none read.
+    #[must_use]
+    pub fn heaviest(&self, crates: &[String]) -> u64 {
+        self.rows
+            .iter()
+            .filter(|r| {
+                crates.is_empty()
+                    || r.test
+                        .strip_prefix("-p ")
+                        .and_then(|rest| rest.split(' ').next())
+                        .is_some_and(|c| crates.iter().any(|k| k == c))
+            })
+            .flat_map(|r| &r.samples)
+            .filter_map(|s| s.peak_bytes)
+            .max()
+            .unwrap_or(0)
     }
 
     /// The history as its file holds it.

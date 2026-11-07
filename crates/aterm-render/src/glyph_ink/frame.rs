@@ -119,8 +119,40 @@ impl RowStamp {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RowInk {
     stamp: RowStamp,
-    glyphs: Vec<Option<(GlyphKey, Arc<GlyphCoverage>)>>,
+    glyphs: Vec<Option<(GlyphKey, Arc<GlyphCoverage>, InkRows)>>,
 }
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static NARROW_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A test's negative control: `f` run with a wide glyph holding no evidence, as before
+/// after-land F2 (each of its cells `None`). Debug and test builds only.
+#[cfg(any(test, debug_assertions))]
+pub fn with_narrow_evidence_only<R>(f: impl FnOnce() -> R) -> R {
+    let was = NARROW_ONLY.with(|c| c.replace(true));
+    let out = f();
+    NARROW_ONLY.with(|c| c.set(was));
+    out
+}
+
+/// The widest glyph, in cells, the frame's evidence reads.
+#[inline]
+fn wide_span() -> u8 {
+    #[cfg(any(test, debug_assertions))]
+    if NARROW_ONLY.with(std::cell::Cell::get) {
+        return 1;
+    }
+    2
+}
+
+/// Where a raster lays ink in each pixel row of its cell ([`FrameGlyphInk::ink_rows`]): one
+/// `[y, x0, x1]` a row that holds ink, from the cell's top left, `x1` end exclusive, top to
+/// bottom. A row's span runs from its first inked pixel to its last, so a letter's counters and
+/// the gaps between its strokes lie inside it: the letter's silhouette, row by row. A wide
+/// glyph's cell is both its cells, from its lead's top left.
+pub type InkRows = Arc<[[i16; 3]]>;
 
 /// The actual mono rasters resolved for one input, including styled and fallback glyphs.
 /// Missing evidence never means full coverage. This view is valid only for its exact text,
@@ -153,11 +185,21 @@ impl FrameGlyphInk {
     }
 
     /// The current cell's actual raster key and coverage. Unknown, colour and unsupported
-    /// composite glyphs return None so a light can yield that word conservatively.
+    /// composite glyphs return None so a light can yield that word conservatively. A wide
+    /// glyph's is its lead cell's, read over both its cells where its raster is fitted to them;
+    /// its right half returns None.
     #[must_use]
     pub fn coverage(&self, row: usize, col: usize) -> Option<(GlyphKey, &GlyphCoverage)> {
-        let (key, coverage) = self.rows.get(row)?.glyphs.get(col)?.as_ref()?;
+        let (key, coverage, _) = self.rows.get(row)?.glyphs.get(col)?.as_ref()?;
         Some((*key, coverage))
+    }
+
+    /// Where the current cell's actual raster lays its ink, row by row in its cell ([`InkRows`]);
+    /// `None` exactly where [`Self::coverage`] is.
+    #[must_use]
+    pub fn ink_rows(&self, row: usize, col: usize) -> Option<&InkRows> {
+        let (_, _, rows) = self.rows.get(row)?.glyphs.get(col)?.as_ref()?;
+        Some(rows)
     }
 
     fn matches(&self, input: &RenderInput, cell: (usize, usize)) -> bool {
@@ -248,6 +290,9 @@ impl Renderer {
             let stamp = RowStamp::new(input, row, breaks.clone());
             let mut glyphs = Vec::with_capacity(stamp.cells.len().min(input.cols));
             for (col, cell) in stamp.cells.iter().take(input.cols).enumerate() {
+                // A wide glyph's evidence is its lead's, over both its cells; its right half
+                // holds none of its own.
+                let span = materialized_cell_span(&stamp.cells, col);
                 let unsupported = cell.wide
                     || cell.ch.is_control()
                     || cell.ch == ' '
@@ -256,7 +301,7 @@ impl Renderer {
                     || input.line_size_run_at(row, col).0 != LineSize::SingleWidth
                     || stamp.combining.iter().any(|(at, _)| *at == col)
                     || crate::procedural::covers(cell.ch)
-                    || materialized_cell_span(&stamp.cells, col) != 1;
+                    || span > wide_span();
                 if unsupported {
                     glyphs.push(None);
                     continue;
@@ -287,7 +332,9 @@ impl Renderer {
                     }
                     _ => false,
                 };
-                if notdef {
+                // A wide glyph is read only where its raster is fitted to its two cells (the
+                // key's span), the box its evidence is read in.
+                if notdef || (span == 2 && key.cell_span != 2) {
                     glyphs.push(None);
                     continue;
                 }
@@ -300,6 +347,8 @@ impl Renderer {
                     continue;
                 }
                 let (cw, ch, baseline) = (self.cell_w, self.cell_h, self.baseline);
+                // The box the raster is read in: its cell, or both cells of a wide glyph's.
+                let cw = if key.cell_span == 2 { 2 * cw } else { cw };
                 let entry = self.cached_glyph(key);
                 let coverage = entry
                     .coverage
@@ -318,27 +367,41 @@ impl Renderer {
                                 .saturating_sub(*height as i32)
                                 .saturating_sub(*ymin);
                             let mut visible = Vec::new();
+                            let mut spans: Vec<[i16; 3]> = Vec::new();
                             if *width > 0 {
                                 for (y, row) in bytes.chunks_exact(*width).enumerate() {
                                     let py = top.saturating_add(y as i32);
                                     if py < 0 || py >= ch as i32 {
                                         continue;
                                     }
+                                    let mut span = (i32::MAX, i32::MIN);
                                     for (x, &alpha) in row.iter().enumerate() {
                                         let px = xmin.saturating_add(x as i32);
                                         if px >= 0 && px < cw as i32 {
                                             visible.push(alpha);
+                                            if alpha > 0 {
+                                                span = (span.0.min(px), span.1.max(px + 1));
+                                            }
                                         }
+                                    }
+                                    if span.0 < span.1
+                                        && let (Ok(y), Ok(x0), Ok(x1)) = (
+                                            i16::try_from(py),
+                                            i16::try_from(span.0),
+                                            i16::try_from(span.1),
+                                        )
+                                    {
+                                        spans.push([y, x0, x1]);
                                     }
                                 }
                             }
-                            Some(Arc::new(GlyphCoverage::of(&visible)))
+                            Some((Arc::new(GlyphCoverage::of(&visible)), InkRows::from(spans)))
                         }
                         GlyphImage::Rgba { .. } => None,
                     })
                     .as_ref()
-                    .map(Arc::clone);
-                glyphs.push(coverage.map(|coverage| (key, coverage)));
+                    .map(|(coverage, rows)| (Arc::clone(coverage), Arc::clone(rows)));
+                glyphs.push(coverage.map(|(coverage, rows)| (key, coverage, rows)));
             }
             rows.push(Arc::new(RowInk { stamp, glyphs }));
         }
@@ -662,10 +725,11 @@ mod tests {
             "the actual italic raster replaces regular evidence"
         );
         assert!(coverage.max > 0);
-        let (_, again) = renderer.glyph_ink_for(&italic).frame.as_ref().unwrap().rows[0].glyphs[0]
-            .as_ref()
-            .unwrap()
-            .clone();
+        let (_, again, _) = renderer.glyph_ink_for(&italic).frame.as_ref().unwrap().rows[0].glyphs
+            [0]
+        .as_ref()
+        .unwrap()
+        .clone();
         let original = &styled.frame.as_ref().unwrap().rows[0].glyphs[0]
             .as_ref()
             .unwrap()
@@ -685,6 +749,69 @@ mod tests {
         let blended = renderer.glyph_ink_for(&italic);
         assert_ne!(before, blended.frame.as_ref().unwrap().epoch());
         assert!(!blended.frame.as_ref().unwrap().corrected());
+    }
+
+    /// After-land F2: a wide glyph's evidence is its lead cell's, read over both its cells: its
+    /// ink rows are exactly the pixels the renderer inks there (each row's first to last), and
+    /// its right half holds none of its own. Negative control: [`with_narrow_evidence_only`]
+    /// holds none for either cell, as before.
+    #[test]
+    fn a_wide_glyph_s_evidence_spans_both_its_cells() {
+        let mut renderer = Renderer::from_system(24.0, Theme::default()).unwrap();
+        renderer.debug_block_on_lazy_fallbacks();
+        let mut text = input("\u{4f60}\u{597d}".as_bytes());
+        text.cursor_visible = false;
+        let (cw, ch) = renderer.cell_size();
+        let page = renderer.render_input(&text);
+        // The cells' ground: the commonest pixel of the glyphs' boxes.
+        let mut counts = std::collections::HashMap::new();
+        for y in 0..ch {
+            for &px in &page.pixels[y * page.width..y * page.width + 4 * cw] {
+                *counts.entry(px).or_insert(0_usize) += 1;
+            }
+        }
+        let bg = counts.into_iter().max_by_key(|&(_, n)| n).unwrap().0;
+        let observed = renderer.glyph_ink_for(&text);
+        let frame = observed.for_frame(&text, (cw, ch)).expect("stable keys");
+        for lead in [0, 2] {
+            let (key, coverage) = frame.coverage(0, lead).expect("a wide glyph's evidence");
+            assert_eq!(key.cell_span, 2, "fitted to its two cells");
+            assert!(coverage.max > 0);
+            assert!(
+                frame.coverage(0, lead + 1).is_none(),
+                "its right half holds none"
+            );
+            let rows = frame.ink_rows(0, lead).expect("its ink rows");
+            assert!(
+                rows.iter().any(|&[_, _, x1]| x1 as usize > cw),
+                "its ink reaches its right half"
+            );
+            let x0 = lead * cw;
+            for y in 0..ch {
+                let inked: Vec<usize> = (0..2 * cw)
+                    .filter(|&x| page.pixels[y * page.width + x0 + x] != bg)
+                    .collect();
+                let span = rows
+                    .iter()
+                    .find(|&&[ry, _, _]| ry as usize == y)
+                    .map(|&[_, a, z]| (a as usize, z as usize));
+                match (inked.first(), inked.last(), span) {
+                    (None, None, None) => {}
+                    (Some(&a), Some(&z), Some(span)) => {
+                        assert_eq!((a, z + 1), span, "row {y} of the glyph at {lead}");
+                    }
+                    other => panic!("row {y} of the glyph at {lead}: {other:?}"),
+                }
+            }
+        }
+        let mut narrow = Renderer::from_system(24.0, Theme::default()).unwrap();
+        narrow.debug_block_on_lazy_fallbacks();
+        let none = with_narrow_evidence_only(|| narrow.glyph_ink_for(&text));
+        let frame = none.for_frame(&text, (cw, ch)).expect("stable keys");
+        assert!(
+            (0..4).all(|col| frame.coverage(0, col).is_none()),
+            "control: narrow evidence only holds none for a wide glyph"
+        );
     }
 
     #[test]

@@ -127,7 +127,15 @@ fn a_fleet_read_parses_to_its_peers() {
         m17.needs[0].worker_of.as_deref(),
         Some(crate::presence::short_sid("s-1e91aaaa").as_str())
     );
-    assert_eq!((m17.agents, m17.working), (2, 1));
+    assert_eq!(
+        m17.activity,
+        Some(AgentTally {
+            agents: 2,
+            busy: 1,
+            idle: 1,
+            ..AgentTally::default()
+        })
+    );
     assert_eq!(m17.managers.len(), 1);
     assert_eq!(m17.managers[0].workers, 1);
     assert_eq!(m17.host.as_deref(), Some("mac.local"));
@@ -146,7 +154,14 @@ fn a_fleet_read_parses_to_its_peers() {
     );
     let cut = snap.macs.iter().find(|m| m.dial == "mac-cut").expect("cut");
     assert_eq!(cut.left_out, 3);
-    assert_eq!(snap.agents(), 4);
+    // Only the Macs whose activity counts: mac-17's two; the older Macs' agents are not read.
+    assert!(
+        snap.macs
+            .iter()
+            .filter(|m| m.older)
+            .all(|m| m.activity.is_none())
+    );
+    assert_eq!(snap.agents(), Some(2));
     let with_self = parse(&json, None, 1_000).expect("a survey");
     assert_eq!(with_self.macs.len(), snap.macs.len() + 1);
     assert!(parse("not json", None, 0).is_err());
@@ -631,13 +646,17 @@ struct Nobody {
 }
 
 impl FleetRunner for Nobody {
-    fn run(&mut self) -> ReadAnswer {
+    fn read(
+        &mut self,
+        own_node: Option<&str>,
+        now_ms: &dyn Fn() -> u64,
+    ) -> Result<FleetSnapshot, String> {
         let _ = self.runs.send(());
-        Ok((
-            r#"[{"fleet":true,"label":"m7.local at 192.168.1.7:7100","error":"did not answer in time"}]"#
-                .to_string(),
-            String::new(),
-        ))
+        parse(
+            r#"[{"fleet":true,"label":"m7.local at 192.168.1.7:7100","error":"did not answer in time"}]"#,
+            own_node,
+            now_ms(),
+        )
     }
 }
 
@@ -843,11 +862,15 @@ struct Gated {
 }
 
 impl FleetRunner for Gated {
-    fn run(&mut self) -> ReadAnswer {
+    fn read(
+        &mut self,
+        own_node: Option<&str>,
+        now_ms: &dyn Fn() -> u64,
+    ) -> Result<FleetSnapshot, String> {
         self.runs.fetch_add(1, Ordering::SeqCst);
         let _ = self.started.send(());
         let _ = self.gate.recv();
-        Ok(("[]".to_string(), String::new()))
+        parse("[]", own_node, now_ms())
     }
 }
 
@@ -1013,8 +1036,12 @@ fn a_move_while_a_read_runs_reads_again_once_it_is_over() {
 struct Empty;
 
 impl FleetRunner for Empty {
-    fn run(&mut self) -> ReadAnswer {
-        Ok(("[]".to_string(), String::new()))
+    fn read(
+        &mut self,
+        own_node: Option<&str>,
+        now_ms: &dyn Fn() -> u64,
+    ) -> Result<FleetSnapshot, String> {
+        parse("[]", own_node, now_ms())
     }
 }
 
@@ -1227,6 +1254,7 @@ fn read_slot(read_at_ms: u64, dark: bool) -> FleetSlot {
                 .into_iter()
                 .collect(),
             unanswered: Vec::new(),
+            seats: None,
         })),
         book: BookFacts {
             in_fleet: true,
@@ -1464,6 +1492,7 @@ fn silent(dial: &str) -> Unanswered {
         name: short_name(dial),
         dial: dial.to_string(),
         why: "no connection in 3 s".to_string(),
+        ..Unanswered::default()
     }
 }
 
@@ -1474,6 +1503,7 @@ fn slot_of(read_at_ms: u64, macs: Vec<FleetMac>, unanswered: Vec<Unanswered>) ->
             read_at_ms,
             macs,
             unanswered,
+            seats: None,
         })),
         book: BookFacts {
             in_fleet: true,
@@ -1498,6 +1528,7 @@ fn a_read_carries_a_silent_mac_while_its_rows_count() {
             ..busy.clone()
         }],
         unanswered: vec![silent("mac-17.local")],
+        seats: None,
     };
     let first = FleetSnapshot {
         read_at_ms: t0,
@@ -1806,5 +1837,1102 @@ fn the_glance_asks_the_lan_door_only_for_a_read_it_makes() {
     assert!(
         asked <= made,
         "the glance went through the LAN door {asked} times for {made} reads"
+    );
+}
+
+/// Every text a menu's rows show, submenus' rows after their label.
+#[cfg(unix)]
+fn menu_texts(rows: &[crate::status_item::StatusRow]) -> Vec<String> {
+    use crate::status_item::StatusRow;
+    let mut texts = Vec::new();
+    for row in rows {
+        match row {
+            StatusRow::Info(text) => texts.push(text.clone()),
+            StatusRow::Action { label, .. } | StatusRow::FleetSubmenu { label, .. } => {
+                texts.push(label.clone());
+            }
+            StatusRow::Submenu { label, rows } => {
+                texts.push(label.clone());
+                texts.extend(menu_texts(rows));
+            }
+            _ => {}
+        }
+    }
+    texts
+}
+
+/// THE GLANCE READS THIS MAC'S COPY AND STARTS NOTHING (one-mesh §4.12, §4.14, §11 B9): with the
+/// mesh on, the glance asks the node service's view socket for each seat's standing, presence
+/// row and now/needs row. An up seat's row names a stalled worker of a manager and a session this
+/// Mac holds, and the Fleet menu lists them under the seat's build; a silent seat (whose stale
+/// row asks something) is listed as not answering, its need never shown; and no child starts
+/// while the glance reads. The survey's read, counted the same way, starts one: the count is no
+/// count of nothing.
+#[cfg(unix)]
+#[test]
+fn the_glance_spawns_no_child_process_and_shows_a_fixtures_now_needs_rows() {
+    use aterm_mesh::presence::{Behind, Build, PresenceRow, Seat, Standing};
+    use aterm_mesh::view::View;
+    use aterm_metrics::row::{HeldEntry, ManagerEntry, NeedEntry, NeedsRow, Sid, Word};
+    use aterm_metrics::subject::Node;
+    const NOW: u64 = 1_800_000_000_000;
+    let state = aterm_tempfile::Builder::new()
+        .prefix("ag")
+        .tempdir_in("/tmp")
+        .expect("a scratch state dir");
+    let mesh = state.path().join(aterm_mesh::logs::MESH_DIR);
+    std::fs::create_dir_all(&mesh).expect("the mesh folder");
+    let principal = |n: u8| format!("n-{}", aterm_codec::hex::encode_lower(&[n; 8]));
+    let seat = |n: u8, standing: Standing| Seat {
+        principal: principal(n),
+        key: [n; 32],
+        me: n == 1,
+        standing,
+        behind: Behind::InStep,
+        row: Some((
+            3,
+            PresenceRow {
+                at_ms: NOW - 1_000,
+                build: Build::new("0.159.0+g4ef9cd6144").expect("a build"),
+                addresses: vec!["192.0.2.7:7100".parse().expect("an address")],
+                membership: None,
+                tables: None,
+                topics: Vec::new(),
+            },
+        )),
+    };
+    let sid = |text: &str| Sid::parse(text).expect("a sid");
+    let (worker, manager, held) = (
+        sid("s-0123456789abcdef0123"),
+        sid("s-aaaaaaaaaaaaaaaaaaaa"),
+        sid("s-bbbbbbbbbbbbbbbbbbbb"),
+    );
+    let up_needs = NeedsRow {
+        at: NOW / 1000 - 120,
+        needs: vec![NeedEntry {
+            sid: worker,
+            word: Word::new("stalled").expect("a word"),
+            harness: false,
+            worker_of: Some(manager),
+            since: Some(NOW / 1000 - 120),
+        }],
+        held: vec![HeldEntry {
+            sid: held,
+            hold: Word::new("drive").expect("a word"),
+            by: Some(Node::parse(&principal(1)).expect("this Mac's node")),
+            since: None,
+        }],
+        managers: vec![ManagerEntry {
+            sid: manager,
+            workers: 1,
+        }],
+    };
+    let silent_needs = NeedsRow {
+        at: NOW / 1000 - 4 * 3_600,
+        needs: vec![NeedEntry {
+            sid: sid("s-cccccccccccccccccccc"),
+            word: Word::new("ask").expect("a word"),
+            harness: false,
+            worker_of: None,
+            since: None,
+        }],
+        held: Vec::new(),
+        managers: Vec::new(),
+    };
+    let view = View {
+        me: principal(1),
+        at_ms: NOW,
+        standings: true,
+        seats: vec![
+            seat(1, Standing::Up),
+            seat(2, Standing::Up),
+            seat(
+                3,
+                Standing::Silent {
+                    last_seen_ms: Some(NOW - 3 * 3_600_000),
+                },
+            ),
+        ],
+        needs: Some(
+            [(principal(2), up_needs), (principal(3), silent_needs)]
+                .into_iter()
+                .collect(),
+        ),
+        activity: None,
+    };
+    let served =
+        aterm_mesh::view::serve_fixture(&mesh, view.clone()).expect("the node's view served");
+
+    // No vault: the copy reads no membership log, so every seat is the view's, unlabelled.
+    let mut copy = runner(true, Some(state.path().to_path_buf()), None);
+    assert!(!copy.dials(), "a read of this Mac's copy dials no Mac");
+    let (read, spawned) = aterm_uds::spawnfd::spawns_during(|| copy.read(None, &|| NOW));
+    drop(served);
+    assert_eq!(spawned, 0, "the glance's read started a child");
+    let snapshot = read.expect("the copy reads");
+    let up = principal(2);
+    assert_eq!(snapshot.macs.len(), 1, "{snapshot:?}");
+    let mac = &snapshot.macs[0];
+    assert_eq!(
+        (mac.name.as_str(), mac.node.as_deref(), mac.host.as_deref()),
+        (up.as_str(), Some(up.as_str()), Some("192.0.2.7"))
+    );
+    assert_eq!(mac.build.as_deref(), Some("0.159.0+g4ef9cd6144"));
+    assert_eq!(
+        mac.needs,
+        vec![FleetNeed {
+            sid: worker.to_string(),
+            word: NeedWord::Stalled,
+            who: crate::presence::short_sid(&worker.to_string()),
+            worker_of: Some(crate::presence::short_sid(&manager.to_string())),
+            age_ms: Some(120_000),
+            what: None,
+            claim: None,
+            carries_on: false,
+            ids: Vec::new(),
+        }]
+    );
+    assert_eq!(
+        mac.held_here
+            .iter()
+            .map(|h| h.sid.as_str())
+            .collect::<Vec<_>>(),
+        vec![held.to_string().as_str()]
+    );
+    assert_eq!(
+        mac.managers
+            .iter()
+            .map(|m| (m.sid.as_str(), m.workers))
+            .collect::<Vec<_>>(),
+        vec![(manager.to_string().as_str(), 1)]
+    );
+    assert_eq!(
+        snapshot
+            .unanswered
+            .iter()
+            .map(|u| (u.name.as_str(), u.why.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(principal(3).as_str(), "silent for 3 h")]
+    );
+    assert_eq!(
+        snapshot.seats.as_ref().map(|s| (s.members, s.up)),
+        Some((3, Some(2)))
+    );
+    assert_eq!(snapshot.agents(), None, "a copy's rows count no agents");
+
+    // A view whose node has not read the standings, or could not read the needs rows, is a
+    // read that failed: the last good one stands, and no up seat reads as needing nothing.
+    for (unready, why) in [
+        (
+            View {
+                standings: false,
+                ..view.clone()
+            },
+            "standings",
+        ),
+        (
+            View {
+                needs: None,
+                ..view.clone()
+            },
+            "needs rows",
+        ),
+    ] {
+        let served = aterm_mesh::view::serve_fixture(&mesh, unready).expect("served");
+        let read = copy.read(None, &|| NOW);
+        drop(served);
+        assert!(
+            read.as_ref().is_err_and(|e| e.contains(why)),
+            "{why}: {read:?}"
+        );
+    }
+
+    let slot = FleetSlot {
+        generation: 1,
+        snapshot: Some(Arc::new(snapshot)),
+        book: BookFacts {
+            in_fleet: true,
+            ..BookFacts::default()
+        },
+        ..FleetSlot::default()
+    };
+    let texts = menu_texts(&crate::status_item::compose_fleet_menu(
+        &slot,
+        i64::try_from(NOW / 1000).expect("seconds"),
+    ));
+    // `status`'s members= reads the copy's seats while the read stands, never once it failed or
+    // went stale.
+    let glance = glance_over(slot.clone());
+    assert_eq!(
+        glance.seats(NOW).map(|s| (s.members, s.up)),
+        Some((3, Some(2)))
+    );
+    assert_eq!(
+        glance.seats(NOW + millis(COUNT_FRESH) + 1),
+        None,
+        "a stale read"
+    );
+    let failed = glance_over(FleetSlot {
+        error: Some("the node could not read the needs rows".to_owned()),
+        ..slot.clone()
+    });
+    assert_eq!(failed.seats(NOW), None, "a failed last read");
+    for want in [
+        "at 0.159.0+g4ef9cd6144",
+        "agents not read",
+        "1 not answering",
+    ] {
+        assert!(texts.iter().any(|t| t == want), "{want}: {texts:?}");
+    }
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains(&crate::presence::short_sid(&worker.to_string()))),
+        "the stalled worker is listed: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("silent for 3 h")),
+        "{texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("cccc")),
+        "a silent seat's need is never shown: {texts:?}"
+    );
+
+    let mut survey = ChildRunner {
+        program: PathBuf::from("/bin/echo"),
+        args: vec!["[]".to_string()],
+        cap: Duration::from_secs(60),
+    };
+    assert!(survey.dials());
+    let (surveyed, spawned) = aterm_uds::spawnfd::spawns_during(|| survey.read(None, &|| NOW));
+    assert!(surveyed.is_ok(), "{surveyed:?}");
+    assert_eq!(spawned, 1, "the survey's read starts its child");
+}
+
+/// AN AGENT'S OWN WORD IS KEPT (Fleet Field §6, B2 #7): a Mac's agents tally by their rows'
+/// `agent=` words, so an agent that asks or sits at a wall is never counted at work, a prompt its
+/// harness answers (`needs=-`) is at work as `aterm ctl survey` classes it, and a shell is a
+/// session and no agent.
+#[test]
+fn tally_keeps_agent_words() {
+    fn agent<'a>(sid: &'a str, word: &'a str) -> Vec<(&'a str, &'a str)> {
+        vec![
+            ("sid", sid),
+            ("state", "alive"),
+            ("program", "claude"),
+            ("program_kind", "agent"),
+            ("agent", word),
+            ("needs", "-"),
+        ]
+    }
+    let words = [
+        "busy",
+        "prompt",
+        "question",
+        "idle",
+        "wall:usage-weekly",
+        "wall:auth",
+        "unknown",
+        "zzz",
+        "prompt",
+    ];
+    let sids = [
+        "s-a", "s-b", "s-c", "s-d", "s-e", "s-f", "s-g", "s-h", "s-i",
+    ];
+    let mut rows: Vec<Vec<(&str, &str)>> =
+        sids.iter().zip(words).map(|(s, w)| agent(s, w)).collect();
+    rows[0].extend([
+        ("task", "exited"),
+        ("task_conclusion", "failed"),
+        ("ctx_left_pct", "42"),
+        ("usage_7d_pct", "97"),
+    ]);
+    // The first prompt and the question name their need for a person; the last prompt's row
+    // read its needs and found none (`needs=-`).
+    rows[1][5].1 = "approval";
+    rows[2][5].1 = "question";
+    rows[3].push(("task", "done"));
+    rows.push(QUIET.to_vec());
+    let read = |rows: &[Vec<(&str, &str)>]| {
+        let refs: Vec<&[(&str, &str)]> = rows.iter().map(Vec::as_slice).collect();
+        let json = format!("[{}]", peer("m7", &pairs(&header("n7")), &refs));
+        parse(&json, None, 1_000).expect("a survey")
+    };
+    let snap = read(&rows);
+    let mac = &snap.macs[0];
+    let tally = mac.activity.expect("its agents were read");
+    assert_eq!(
+        tally,
+        AgentTally {
+            agents: 9,
+            busy: 2,
+            idle: 1,
+            waiting: 2,
+            walled: 2,
+            unknown: 2,
+        }
+    );
+    assert_eq!(mac.agent_sessions[8].agent, AgentWord::Busy);
+    // Negative control: the same prompt once its row names a need waits on a person.
+    let mut asked = rows.clone();
+    asked[8][5].1 = "approval";
+    let asked = read(&asked).macs[0].activity.expect("read");
+    assert_eq!((asked.busy, asked.waiting), (1, 3));
+    assert_eq!(snap.agents(), Some(9));
+    // The shell row is a session and no agent.
+    assert_eq!((mac.sessions, mac.agent_sessions.len()), (Some(10), 9));
+    assert!(mac.agent_sessions.iter().all(|s| s.sid != "s-q"));
+    let first = &mac.agent_sessions[0];
+    assert_eq!(
+        (
+            first.agent.clone(),
+            first.task,
+            first.ctx_left_pct,
+            first.usage_5h_pct,
+            first.usage_7d_pct
+        ),
+        (
+            AgentWord::Busy,
+            Some(TaskWord::Failed),
+            Some(42),
+            None,
+            Some(97)
+        )
+    );
+    assert_eq!(mac.agent_sessions[3].task, Some(TaskWord::Done));
+    assert_eq!(
+        mac.agent_sessions[4].agent,
+        AgentWord::Walled("usage-weekly".to_owned())
+    );
+    assert_eq!(mac.agent_sessions[7].agent, AgentWord::Unknown);
+    assert_eq!(mac.sessions_more, 0);
+
+    // Past the per-Mac cap the rest are counted, never kept; the tally holds every one.
+    let many: Vec<String> = (0..SESSIONS_MAX + 3).map(|n| format!("s-{n}")).collect();
+    let rows: Vec<Vec<(&str, &str)>> = many.iter().map(|sid| agent(sid, "busy")).collect();
+    let refs: Vec<&[(&str, &str)]> = rows.iter().map(Vec::as_slice).collect();
+    let json = format!("[{}]", peer("m8", &pairs(&header("n8")), &refs));
+    let snap = parse(&json, None, 1_000).expect("a survey");
+    let mac = &snap.macs[0];
+    assert_eq!(
+        (mac.agent_sessions.len(), mac.sessions_more),
+        (SESSIONS_MAX, 3)
+    );
+    assert_eq!(
+        mac.activity.map(|t| usize::from(t.busy)),
+        Some(SESSIONS_MAX + 3)
+    );
+
+    // An older aterm's agents are not read: absent, never zero.
+    let older: &[(&str, &str)] = &[
+        ("sid", "s-o"),
+        ("state", "alive"),
+        ("program", "claude"),
+        ("program_kind", "agent"),
+        ("agent", "busy"),
+    ];
+    let json = format!("[{}]", peer("m9", &pairs(&header("n9")), &[older]));
+    let snap = parse(&json, None, 1_000).expect("a survey");
+    assert_eq!(snap.macs[0].activity, None);
+    assert_eq!(snap.agents(), None, "no Mac's agents were read");
+}
+
+/// THE GLANCE READS THE PRODUCER'S REASON TOKEN (Fleet Field §10, B2 #11, the GUI half): every
+/// token aterm-net types round-trips through [`Reach::parse`]; a token this build does not know,
+/// or none, is [`Reach::Unread`] with the client's words kept; and two Macs that did not answer
+/// in time at different addresses share one reason, whatever their words.
+#[cfg(unix)]
+#[test]
+fn reasons_typed_by_producer() {
+    for token in aterm_net::fleet_member::REASONS {
+        assert_eq!(Reach::parse(token).token(), Some(*token), "{token}");
+    }
+    let row = |label: &str, why: &str, reason: Option<&str>| {
+        reason.map_or_else(
+            || unanswered(label, why),
+            |reason| {
+                format!(
+                    "{{\"label\":\"{label}\",\"fleet\":true,\"error\":\"{why}\",\
+                     \"reason\":\"{reason}\"}}"
+                )
+            },
+        )
+    };
+    let json = format!(
+        "[{}]",
+        [
+            row(
+                "m1",
+                "192.0.2.1:7100 did not answer in 3 s",
+                Some("no-answer")
+            ),
+            row(
+                "m2",
+                "192.0.2.2:7100 did not answer in 3 s",
+                Some("no-answer")
+            ),
+            row("m3", "a reason from a later build", Some("zzz-later")),
+            row("m4", "an older peer's words", None),
+            row(
+                "m5",
+                "192.0.2.5:7100 refused the connection",
+                Some("nothing-listens")
+            ),
+        ]
+        .join(",")
+    );
+    let snap = parse(&json, None, 1_000).expect("a survey");
+    let reasons: Vec<(&str, Reach, &str)> = snap
+        .unanswered
+        .iter()
+        .map(|u| (u.name.as_str(), u.reason, u.why.as_str()))
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![
+            (
+                "m1",
+                Reach::NoAnswer,
+                "192.0.2.1:7100 did not answer in 3 s"
+            ),
+            (
+                "m2",
+                Reach::NoAnswer,
+                "192.0.2.2:7100 did not answer in 3 s"
+            ),
+            ("m3", Reach::Unread, "a reason from a later build"),
+            ("m4", Reach::Unread, "an older peer's words"),
+            (
+                "m5",
+                Reach::NothingListens,
+                "192.0.2.5:7100 refused the connection"
+            ),
+        ]
+    );
+    // The two that did not answer group as one: their reason is one, their words are not.
+    assert_ne!(snap.unanswered[0].why, snap.unanswered[1].why);
+    let groups: std::collections::BTreeSet<Option<&str>> =
+        snap.unanswered.iter().map(|u| u.reason.token()).collect();
+    assert_eq!(groups.len(), 3, "{groups:?}");
+    // The glance's own reasons name no producer token.
+    for own in [
+        Reach::Silent { since_ms: 1 },
+        Reach::NeverUp,
+        Reach::PastCap,
+        Reach::NoHeader,
+        Reach::Unread,
+    ] {
+        assert_eq!(own.token(), None, "{own:?}");
+    }
+    let headless = "[{\"label\":\"m6\",\"fleet\":true}]";
+    let snap = parse(headless, None, 1_000).expect("a survey");
+    assert_eq!(snap.unanswered[0].reason, Reach::NoHeader);
+}
+
+/// THIS MAC'S COPY JOINS `aterm fleet`'S ROWS (Fleet Field §11, B2 #13): each seat of the view
+/// takes its row's log label, build (the book's where it has no presence row), update and tables,
+/// and the snapshot's seats are the composition's whole; a seat whose node no row names keeps
+/// its book host's name and no label, and a seat of the log the view does not hold is counted as
+/// never up.
+#[cfg(unix)]
+#[test]
+fn snapshot_of_joins_seat_rows() {
+    use aterm_agent::fleet_view::{Fleet, SeatRow};
+    use aterm_mesh::presence::{Behind, Build, PresenceRow, Seat, Standing};
+    use aterm_mesh::view::View;
+    use aterm_netplace::words::{InStep, Seats};
+    const NOW: u64 = 1_800_000_000_000;
+    let principal = |n: u8| format!("n-{}", aterm_codec::hex::encode_lower(&[n; 8]));
+    let presence = |build: &str| PresenceRow {
+        at_ms: NOW - 1_000,
+        build: Build::new(build).expect("a build"),
+        addresses: vec!["192.0.2.7:7100".parse().expect("an address")],
+        membership: None,
+        tables: None,
+        topics: Vec::new(),
+    };
+    let lag = Behind::Behind {
+        at_least: Duration::from_secs(240),
+    };
+    let seat = |n: u8, standing: Standing, row: Option<PresenceRow>| Seat {
+        principal: principal(n),
+        key: [n; 32],
+        me: n == 1,
+        standing,
+        behind: Behind::InStep,
+        row: row.map(|row| (3, row)),
+    };
+    let view = View {
+        me: principal(1),
+        at_ms: NOW,
+        standings: true,
+        seats: vec![
+            seat(1, Standing::Up, Some(presence("0.160.0"))),
+            seat(2, Standing::Up, Some(presence("0.156.0"))),
+            seat(
+                3,
+                Standing::Silent {
+                    last_seen_ms: Some(NOW - 3_600_000),
+                },
+                None,
+            ),
+            seat(4, Standing::Up, Some(presence("0.160.0"))),
+        ],
+        needs: Some(std::collections::BTreeMap::new().into_iter().collect()),
+        activity: None,
+    };
+    let seat_row = |label: &str, n: Option<u8>, build: Option<&str>| SeatRow {
+        label: label.to_owned(),
+        name: format!("{label}.local"),
+        node: n.map(principal),
+        me: n == Some(1),
+        presence: None,
+        build: build.map(str::to_owned),
+        needs_update: false,
+        behind: None,
+    };
+    let seats = Seats {
+        members: 5,
+        up: Some(3),
+        needs_update: vec![("m4".to_owned(), "0.147.0".to_owned())],
+        in_step: Some(InStep {
+            with: 1,
+            of: 2,
+            slowest_ms: Some(240_000),
+            apart: 0,
+        }),
+        log: Some((5000, 65536)),
+    };
+    let fleet = Fleet {
+        seats: seats.clone(),
+        rows: vec![
+            seat_row("m1", Some(1), Some("0.160.0")),
+            SeatRow {
+                needs_update: true,
+                behind: Some(lag),
+                ..seat_row("m22", Some(2), Some("0.156.0"))
+            },
+            // No presence row: its build is its signed book entry's, as the composition gave it.
+            SeatRow {
+                needs_update: true,
+                ..seat_row("m4", Some(3), Some("0.147.0"))
+            },
+            seat_row("m9", None, Some("0.150.0")),
+        ],
+        unserved: None,
+    };
+    let book_peer = |n: u8, host: &str| aterm_net::fleet_member::Peer {
+        node: None,
+        key: Some(aterm_net::fleet::NodeKey::from_bytes([n; 32])),
+        key_from: None,
+        host: host.to_owned(),
+        addr: None,
+        port: 7100,
+        version: None,
+        seen_ms: None,
+        via: aterm_net::fleet_member::Via::Joined,
+        fleet: None,
+        signed: None,
+    };
+    let book = [
+        book_peer(2, "mac-22.local"),
+        book_peer(3, "mac-4.local"),
+        book_peer(4, "studio.local"),
+    ];
+    let snap = snapshot_of(&view, &fleet, &book, NOW);
+    assert_eq!(
+        snap.seats.as_ref(),
+        Some(&seats),
+        "the composition's seats, whole"
+    );
+
+    let m22 = snap
+        .macs
+        .iter()
+        .find(|m| m.node.as_deref() == Some(principal(2).as_str()))
+        .expect("m22 is up");
+    assert_eq!(
+        (
+            m22.name.as_str(),
+            m22.label.as_deref(),
+            m22.build.as_deref(),
+            m22.needs_update,
+            m22.tables
+        ),
+        ("mac-22", Some("m22"), Some("0.156.0"), true, Some(lag))
+    );
+    assert_eq!(m22.activity, None, "a view of no activity rows reads none");
+
+    // Negative control: a seat whose node no row names keeps its book host's name, no label.
+    let studio = snap
+        .macs
+        .iter()
+        .find(|m| m.node.as_deref() == Some(principal(4).as_str()))
+        .expect("studio is up");
+    assert_eq!(
+        (
+            studio.name.as_str(),
+            studio.label.as_deref(),
+            studio.build.as_deref(),
+            studio.needs_update,
+            studio.tables
+        ),
+        ("studio", None, Some("0.160.0"), false, None)
+    );
+    assert_eq!(snap.macs.len(), 2, "this Mac is no seat: {:?}", snap.macs);
+
+    let silent: Vec<_> = snap
+        .unanswered
+        .iter()
+        .map(|u| {
+            (
+                u.name.as_str(),
+                u.label.as_deref(),
+                u.reason,
+                u.build.as_deref(),
+                u.silent_since_ms,
+                u.why.as_str(),
+                u.needs_update,
+            )
+        })
+        .collect();
+    assert_eq!(
+        silent,
+        vec![
+            (
+                "mac-4",
+                Some("m4"),
+                Reach::Silent {
+                    since_ms: NOW - 3_600_000
+                },
+                Some("0.147.0"),
+                Some(NOW - 3_600_000),
+                "silent for 1 h",
+                true,
+            ),
+            (
+                "m9",
+                Some("m9"),
+                Reach::NeverUp,
+                Some("0.150.0"),
+                None,
+                "silent, never seen up here",
+                false,
+            ),
+        ]
+    );
+}
+
+/// THE GLANCE'S GENERATION IS READ WITHOUT A COPY (Fleet Field §12): the band's service turn
+/// sees a new read, a failure and the fleet's book move by three words under the slot's lock.
+#[test]
+fn the_generation_moves_with_the_slot() {
+    let slot = slot_of(1_000, vec![mac17(1_000, false)], Vec::new());
+    let glance = glance_over(slot.clone());
+    assert_eq!(glance.generation(), (1, false, true));
+    {
+        let mut held = glance.slot.lock().expect("the slot");
+        held.generation = 2;
+        held.error = Some("the read failed".to_owned());
+    }
+    assert_eq!(glance.generation(), (2, true, true));
+    let outside = glance_over(FleetSlot {
+        book: BookFacts::default(),
+        ..slot
+    });
+    assert_eq!(outside.generation(), (1, false, false));
+}
+
+/// A survey that refused the whole fleet's read writes one row for it, which names no Mac: the
+/// read failed, and no seat is silent. Negative control: a Mac's own `not-dialled` row is a
+/// silent seat.
+#[test]
+fn a_refused_fleet_read_is_no_seat() {
+    let row = |reason: &str| {
+        format!(
+            "[{{\"label\":\"the fleet\",\"fleet\":true,\"error\":\"the book cannot be read\",\
+             \"reason\":\"{reason}\"}}]"
+        )
+    };
+    let refused = parse(&row(aterm_ctl::FLEET_UNREAD), None, 1_000);
+    assert_eq!(
+        refused,
+        Err("fleet not read: the book cannot be read".to_owned())
+    );
+    let one = parse(&row("not-dialled"), None, 1_000).expect("a read");
+    assert_eq!(one.unanswered.len(), 1);
+    assert_eq!(one.unanswered[0].reason, Reach::NotDialled);
+}
+
+/// The survey rows of `rows` (each its `key=value` fields) as a window's survey answer, and as the
+/// fleet read's JSON of one peer: the two forms one count reads.
+#[cfg(unix)]
+fn survey_forms(rows: &[Vec<(&str, &str)>]) -> (String, String) {
+    let mut wire = format!(
+        "OK {}\ninstance pid=77 host=mac.local sessions={} level=facts cut=0 node=n7\n",
+        rows.len() + 1,
+        rows.len()
+    );
+    for row in rows {
+        let fields: Vec<String> = row
+            .iter()
+            .map(|(k, v)| format!("{k}={}", aterm_codec::pct::encode(v)))
+            .collect();
+        wire.push_str(&format!("session {}\n", fields.join(" ")));
+    }
+    let refs: Vec<&[(&str, &str)]> = rows.iter().map(Vec::as_slice).collect();
+    let json = format!("[{}]", peer("m7", &pairs(&header("n7")), &refs));
+    (wire, json)
+}
+
+/// One agent session's survey row.
+#[cfg(unix)]
+fn agent_row<'a>(sid: &'a str, word: &'a str, needs: Option<&'a str>) -> Vec<(&'a str, &'a str)> {
+    let mut row = vec![
+        ("sid", sid),
+        ("state", "running"),
+        ("program", "claude"),
+        ("program_kind", "agent"),
+        ("agent", word),
+    ];
+    row.extend(needs.map(|needs| ("needs", needs)));
+    row
+}
+
+/// THE NODE COUNTS ITS WINDOWS' AGENTS AS A PEER'S SURVEY IS COUNTED (Fleet Field §11, §14): from
+/// a window's survey answer, a `prompt` whose row read no need for a person (`needs=-`) is busy,
+/// one naming a need (`needs=ask`) waits, as does a `question` whose `needs` names one; a wall is
+/// walled with its kind; an exited agent and a shell are not counted; and the sessions are listed
+/// by their minted sids and words. The fleet read's JSON of the same rows counts the same tally.
+/// An answer that is no survey, and one a row of which sends no `needs` (an older window), count
+/// nothing, as an older peer's rows do; so does a partial answer, which the row cannot mark as a
+/// lower bound: a window left unread (`instances_read=1` of `instances=2`) or rows the reply cap
+/// cut (`sessions=` past the rows sent). Every window read, the merged answer counts.
+/// NEGATIVE CONTROL: flipping one prompt's `needs=-` to `ask` moves it from busy to waiting in
+/// both counts alike.
+#[cfg(unix)]
+#[test]
+fn the_nodes_count_of_its_windows_is_the_surveys_count() {
+    use aterm_metrics::row::{AgentEntry, Sid, Word};
+    let sids = [
+        "s-00000000000000000001",
+        "s-00000000000000000002",
+        "s-00000000000000000003",
+        "s-00000000000000000004",
+        "s-00000000000000000005",
+        "s-00000000000000000006",
+    ];
+    let mut rows = vec![
+        agent_row(sids[0], "prompt", Some("-")),
+        agent_row(sids[1], "prompt", Some("ask")),
+        agent_row(sids[2], "question", Some("question")),
+        agent_row(sids[3], "wall:usage-weekly", Some("wall")),
+        agent_row(sids[4], "idle", Some("-")),
+        agent_row("s-short", "busy", Some("-")),
+        QUIET.to_vec(),
+    ];
+    let mut exited = agent_row(sids[5], "busy", Some("-"));
+    exited[1].1 = "exited";
+    rows.push(exited);
+    let count = |rows: &[Vec<(&str, &str)>]| {
+        let (wire, json) = survey_forms(rows);
+        let row = activity_of_survey(&wire, 1_793_160_000).expect("a survey counts");
+        let read = parse(&json, None, 1_000).expect("a fleet read");
+        (row, read.macs[0].activity.expect("its agents were read"))
+    };
+    let (row, tally) = count(&rows);
+    assert_eq!(row.at, 1_793_160_000);
+    assert_eq!(
+        (row.busy, row.idle, row.waiting, row.walled, row.unknown),
+        (2, 1, 2, 1, 0)
+    );
+    assert_eq!(AgentTally::of_row(&row), tally, "the survey's own count");
+    let entry = |n: usize, word: &str, detail: Option<&str>| AgentEntry {
+        sid: Sid::parse(sids[n]).expect("a sid"),
+        word: Word::new(word).expect("a word"),
+        detail: detail.and_then(Word::new),
+    };
+    assert_eq!(
+        row.sessions,
+        vec![
+            entry(0, "busy", None),
+            entry(1, "waiting", None),
+            entry(2, "waiting", None),
+            entry(3, "walled", Some("usage-weekly")),
+            entry(4, "idle", None),
+        ],
+        "a sid that is no minted one is counted, not listed"
+    );
+    let mut asked = rows.clone();
+    asked[0][5].1 = "ask";
+    let (row, tally) = count(&asked);
+    assert_eq!((row.busy, row.waiting), (1, 3));
+    assert_eq!(AgentTally::of_row(&row), tally);
+
+    assert_eq!(activity_of_survey("ERR busy: ask again\n", 1), None);
+    let mut older = rows.clone();
+    older[4].truncate(5);
+    let (wire, json) = survey_forms(&older);
+    assert_eq!(activity_of_survey(&wire, 1), None, "an older window's rows");
+    assert_eq!(
+        parse(&json, None, 1_000).expect("read").macs[0].activity,
+        None
+    );
+    let (wire, _) = survey_forms(&[]);
+    assert_eq!(
+        activity_of_survey(&wire, 5).map(|row| row.agents()),
+        Some(0),
+        "a window of no agents"
+    );
+    let (wire, _) = survey_forms(&rows);
+    let marked = |from: &str, to: &str| wire.replacen(from, to, 1);
+    assert_eq!(
+        activity_of_survey(
+            &marked(" node=n7", " node=n7 instances=2 instances_read=1"),
+            1
+        ),
+        None,
+        "a window left unread"
+    );
+    assert_eq!(
+        activity_of_survey(&marked(" node=n7", " node=n7 instances=2"), 1),
+        None,
+        "a window that answered alone of two"
+    );
+    let claimed = format!(" sessions={} ", rows.len() + 1);
+    assert_eq!(
+        activity_of_survey(&marked(&format!(" sessions={} ", rows.len()), &claimed), 1),
+        None,
+        "rows the reply cap cut"
+    );
+    assert_eq!(
+        activity_of_survey(
+            &marked(" node=n7", " node=n7 instances=2 instances_read=2"),
+            1
+        )
+        .map(|row| row.agents()),
+        Some(6),
+        "every window read"
+    );
+}
+
+/// ON THIS MAC'S COPY, A SEAT'S ACTIVITY IS ITS FRESH `now/activity` ROW (Fleet Field §11, §14):
+/// an up seat whose row trails its presence row by no more than `ACTIVITY_FRESH_MS` reads its
+/// tally and its sessions by sid and word (none of their program, task or context), the agents
+/// past those listed counted; the field draws its mark (busy, or a wall over busy). A seat with no
+/// row, and one whose row trails its presence row a second past the bound, read no activity, and
+/// draw no activity mark; each says why (unpublished, stale by how much), as a view whose node
+/// read no activity rows does. The menu's row of a read seat counts its agents and no sessions,
+/// which no copy reads.
+/// NEGATIVE CONTROL: the survey path, which reads its sessions, still counts them on that row.
+#[cfg(unix)]
+#[test]
+fn a_seats_fresh_activity_row_is_its_activity_on_the_copy() {
+    use aterm_mesh::presence::{Behind, Build, PresenceRow, Seat, Standing};
+    use aterm_mesh::view::View;
+    use aterm_metrics::row::{ACTIVITY_FRESH_MS, ActivityRow, AgentEntry, Sid, Word};
+    const NOW: u64 = 1_800_000_000_000;
+    let principal = |n: u8| format!("n-{}", aterm_codec::hex::encode_lower(&[n; 8]));
+    let seat = |n: u8| Seat {
+        principal: principal(n),
+        key: [n; 32],
+        me: n == 1,
+        standing: Standing::Up,
+        behind: Behind::InStep,
+        row: Some((
+            3,
+            PresenceRow {
+                at_ms: NOW - 1_000,
+                build: Build::new("0.160.0").expect("a build"),
+                addresses: Vec::new(),
+                membership: None,
+                tables: None,
+                topics: Vec::new(),
+            },
+        )),
+    };
+    let sid = Sid::parse("s-0123456789abcdef0123").expect("a sid");
+    let fresh = ActivityRow {
+        at: (NOW - 1_000 - ACTIVITY_FRESH_MS) / 1000,
+        busy: 3,
+        walled: 1,
+        idle: 1,
+        sessions: vec![
+            AgentEntry {
+                sid,
+                word: Word::new("busy").expect("a word"),
+                detail: None,
+            },
+            AgentEntry {
+                sid,
+                word: Word::new("walled").expect("a word"),
+                detail: Word::new("auth"),
+            },
+        ],
+        ..ActivityRow::default()
+    };
+    let stale = ActivityRow {
+        at: fresh.at - 1,
+        ..fresh.clone()
+    };
+    let view = View {
+        me: principal(1),
+        at_ms: NOW,
+        standings: true,
+        seats: vec![seat(1), seat(2), seat(3), seat(4), seat(5)],
+        needs: Some(std::collections::BTreeMap::new()),
+        activity: Some(
+            [
+                (principal(2), fresh.clone()),
+                (principal(4), stale),
+                (
+                    principal(5),
+                    ActivityRow {
+                        at: fresh.at,
+                        busy: 2,
+                        ..ActivityRow::default()
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+    };
+    let fleet = aterm_agent::fleet_view::Fleet {
+        seats: aterm_netplace::words::Seats::default(),
+        rows: Vec::new(),
+        unserved: None,
+    };
+    let mut snapshot = snapshot_of(&view, &fleet, &[], NOW);
+    let mac = |snapshot: &FleetSnapshot, n: u8| {
+        snapshot
+            .macs
+            .iter()
+            .find(|m| m.node.as_deref() == Some(principal(n).as_str()))
+            .cloned()
+            .expect("an up seat")
+    };
+    let read = mac(&snapshot, 2);
+    assert_eq!(
+        read.activity,
+        Some(AgentTally {
+            agents: 5,
+            busy: 3,
+            idle: 1,
+            waiting: 0,
+            walled: 1,
+            unknown: 0,
+        })
+    );
+    assert_eq!(
+        read.agent_sessions
+            .iter()
+            .map(|s| (s.sid.as_str(), s.agent.clone(), s.program.is_none(), s.task))
+            .collect::<Vec<_>>(),
+        vec![
+            (sid.to_string().as_str(), AgentWord::Busy, true, None),
+            (
+                sid.to_string().as_str(),
+                AgentWord::Walled("auth".to_owned()),
+                true,
+                None
+            ),
+        ]
+    );
+    assert_eq!(read.sessions_more, 3, "the agents past those listed");
+    assert_eq!(snapshot.agents(), Some(7));
+    assert_eq!(mac(&snapshot, 3).activity, None, "no activity row");
+    assert_eq!(mac(&snapshot, 4).activity, None, "a row past the bound");
+    assert_eq!(
+        [2, 3, 4].map(|n| mac(&snapshot, n).activity_absent),
+        [
+            None,
+            Some(ActivityAbsent::Unpublished),
+            Some(ActivityAbsent::Stale {
+                behind_ms: Some(ACTIVITY_FRESH_MS + 1_000)
+            }),
+        ]
+    );
+    assert_eq!(read.sessions, None, "the copy reads no session count");
+    let unread = View {
+        activity: None,
+        ..view.clone()
+    };
+    assert_eq!(
+        mac(&snapshot_of(&unread, &fleet, &[], NOW), 2).activity_absent,
+        Some(ActivityAbsent::Unread)
+    );
+
+    // The field draws the read seat's mark, and none for the seats not read.
+    snapshot.read_at_ms = NOW;
+    let slot = FleetSlot {
+        generation: 1,
+        snapshot: Some(Arc::new(snapshot.clone())),
+        book: BookFacts {
+            in_fleet: true,
+            ..BookFacts::default()
+        },
+        ..FleetSlot::default()
+    };
+    let observed = aterm_types::network_state::NetworkObservation {
+        visibility: aterm_types::network_state::Visibility::Active,
+        history: aterm_types::network_state::HistoryState::Ready,
+        ..aterm_types::network_state::NetworkObservation::default()
+    };
+    let field = crate::network_deck::field::project(Some(&slot), &observed, NOW);
+    let mark = |n: u8| {
+        let i = snapshot
+            .macs
+            .iter()
+            .position(|m| m.node.as_deref() == Some(principal(n).as_str()))
+            .expect("listed");
+        field
+            .seats
+            .iter()
+            .find(|seat| seat.src == crate::network_deck::field::SeatSrc::Mac(i))
+            .expect("a seat")
+            .activity
+    };
+    assert_eq!(
+        mark(2),
+        Some(crate::network_deck::field::Activity::Walled),
+        "a wall outranks the busy agents"
+    );
+    assert_eq!(mark(5), Some(crate::network_deck::field::Activity::Busy(2)));
+    assert_eq!(mark(3), None);
+    assert_eq!(mark(4), None);
+
+    let texts = menu_texts(&crate::status_item::compose_fleet_menu(
+        &slot,
+        i64::try_from(NOW / 1000).expect("seconds"),
+    ));
+    assert!(
+        texts
+            .iter()
+            .any(|t| t == "5 agents: 3 busy, 0 waiting, 1 walled"),
+        "{texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("0 sessions")),
+        "no session count the copy did not read: {texts:?}"
+    );
+    let (_, json) = survey_forms(&[
+        agent_row("s-00000000000000000001", "prompt", Some("-")),
+        QUIET.to_vec(),
+    ]);
+    let surveyed = FleetSlot {
+        snapshot: Some(Arc::new(parse(&json, None, NOW).expect("a fleet read"))),
+        ..slot
+    };
+    let texts = menu_texts(&crate::status_item::compose_fleet_menu(
+        &surveyed,
+        i64::try_from(NOW / 1000).expect("seconds"),
+    ));
+    assert!(
+        texts
+            .iter()
+            .any(|t| t == "2 sessions \u{b7} 1 agent: 1 busy, 0 waiting, 0 walled"),
+        "{texts:?}"
     );
 }

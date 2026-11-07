@@ -443,6 +443,8 @@ fn state(coordinated: bool) -> St {
         agent: upgrade::Agent::Claude,
         phase: upgrade::Phase::Exiting { at_s: now_s() },
         pid: std::process::id(),
+        pid_start: super::super::upgrade_drive::kernel_start(std::process::id())
+            .expect("the test process's kernel start"),
         shell: std::process::id(),
         tab: TAB.into(),
         line: "fixed legacy fixture".into(),
@@ -522,14 +524,28 @@ fn retained_account_attribution_round_trips_but_legacy_or_missing_namespace_is_n
         Some(command)
     );
     let mut next_round = st.clone();
-    next_round.signalled(st.pid, st.shell, TAB, "new command".into(), now_s());
+    next_round.signalled(
+        st.pid,
+        &st.pid_start,
+        st.shell,
+        TAB,
+        "new command".into(),
+        now_s(),
+    );
     assert_eq!(
         next_round.account_intent, None,
         "a new line never inherits old authority"
     );
     assert_eq!(next_round.back_account_intent, None);
     let mut cancelled = st.clone();
-    let undo = cancelled.signalled(st.pid, st.shell, TAB, "new command".into(), now_s());
+    let undo = cancelled.signalled(
+        st.pid,
+        &st.pid_start,
+        st.shell,
+        TAB,
+        "new command".into(),
+        now_s(),
+    );
     cancelled.account_intent = Some(intent.clone());
     cancelled.unsent(undo);
     assert_eq!(
@@ -728,7 +744,7 @@ fn exit_input(world: &Path, st: &St) -> (Snapshot, Plan) {
         tab: TAB.into(),
         pid: std::process::id(),
         // This process's own kernel start: the snapshot names the live process itself, so
-        // the exit guard sees the same agent, never a reused pid ([`gone_by_identity`]).
+        // the exit guard sees the same agent, never a reused pid ([`agent_exit`]).
         start: kernel_start(std::process::id()).expect("this process's kernel start"),
         shell: std::process::id(),
         program: std::env::current_exe().unwrap(),
@@ -1124,14 +1140,56 @@ fn a_reused_pid_after_a_reboot_is_not_the_agent_the_relaunch_waits_for() {
 }
 
 #[test]
-fn identity_proves_an_exit_only_from_a_recorded_start() {
-    assert!(gone_by_identity("a", false, None));
-    assert!(gone_by_identity("a", true, Some("b")));
-    assert!(!gone_by_identity("a", true, Some("a")));
-    // A live pid whose start is unreadable is not proven gone, nor is an unrecorded start.
-    assert!(!gone_by_identity("a", true, None));
-    assert!(!gone_by_identity("", false, None));
-    assert!(!gone_by_identity("", true, Some("b")));
+fn identity_proves_an_exit_only_by_a_free_pid_or_another_start() {
+    assert_eq!(agent_exit("a", false, None), AgentExit::Gone);
+    assert_eq!(agent_exit("a", true, Some("b")), AgentExit::Gone);
+    assert_eq!(agent_exit("a", true, Some("a")), AgentExit::Runs);
+    // A free pid proves its process's exit whatever the record knows of its start.
+    assert_eq!(agent_exit("", false, None), AgentExit::Gone);
+    // A live pid whose start is unreadable, or one a record with no start names, is neither
+    // waited on nor proven gone.
+    assert_eq!(agent_exit("a", true, None), AgentExit::Unproven);
+    assert_eq!(agent_exit("", true, Some("b")), AgentExit::Unproven);
+}
+
+/// RS2: A RELAUNCH'S WAIT ON ITS RUNNING AGENT ENDS ONLY ON A PROOF ([`exit_wait`]): a start
+/// that one read cannot see mid-wait (a slow kernel read under memory pressure) while the agent
+/// runs on is no exit, so the wait runs out and the step is `wait:exiting`, never a relaunch
+/// over the running agent. CONTROLS: the agent gone mid-wait is proven and the relaunch goes on;
+/// an unproven one is never waited on; one gone already is not waited on either.
+#[test]
+fn a_relaunchs_wait_on_its_running_agent_ends_only_on_a_proof() {
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+    // Each read of the agent answers the next scripted judgment, then the last one for good;
+    // `wait` polls its condition a fixed number of times, as `wait_until` does within a limit.
+    let run = |reads: &[AgentExit]| {
+        let script = RefCell::new(reads.iter().copied().collect::<VecDeque<_>>());
+        let last = Cell::new(*reads.last().expect("a read"));
+        let exit = || {
+            let next = script.borrow_mut().pop_front();
+            next.inspect(|e| last.set(*e)).unwrap_or_else(|| last.get())
+        };
+        exit_wait(exit, |done| (0..8).any(|_| done()))
+    };
+    use AgentExit::{Gone, Runs, Unproven};
+    assert_eq!(
+        run(&[Runs, Unproven, Runs]),
+        Some("wait:exiting"),
+        "an unread start mid-wait is no exit"
+    );
+    assert_eq!(run(&[Runs, Runs, Gone]), None, "gone mid-wait: proven");
+    assert_eq!(
+        run(&[Unproven]),
+        Some(WAIT_EXIT_UNPROVEN),
+        "never waited on"
+    );
+    assert_eq!(run(&[Gone]), None, "gone already");
+    assert_eq!(
+        run(&[Runs, Unproven]),
+        Some(WAIT_EXIT_UNPROVEN),
+        "unread to the end: unproven, not gone"
+    );
 }
 
 /// RS1: A COORDINATED RECORD'S AGENT, ENDED UNDER AN EARLIER ATERM PROCESS, STILL RESUMES. A
@@ -1270,70 +1328,132 @@ fn a_native_act_is_this_hosts_only_by_its_epoch() {
     assert!(native_of_this_host(&st, || None), "an unread epoch");
 }
 
-/// RS1: A RESTART IN FLIGHT WHEN ATERM ENDED IS PROVEN EXITED BY ITS AGENT'S KERNEL START, so
-/// its carry never waits on a pid a reboot gave another process. NEGATIVE CONTROLS: the same
-/// live process, another pid, a record already stamped, or one past its exit is not touched.
+/// RS1, RS2: A RESTART IN FLIGHT WHEN ATERM ENDED IS PROVEN EXITED BY ITS AGENT'S KERNEL START,
+/// so its carry never waits on a pid a reboot gave another process. A record an earlier build
+/// wrote, which names its agent by pid alone, takes the start of the snapshot of that pid and
+/// no other's. NEGATIVE CONTROLS: the same live process, another pid's snapshot, a record
+/// already stamped, or one past its exit is not touched; a record that recorded its own start
+/// keeps it over a snapshot's.
 #[test]
 fn an_in_flight_exit_is_proven_only_for_its_own_agent_by_identity() {
     let world = aterm_tempfile::tempdir().unwrap();
-    let st = state(false);
+    // A record as an earlier build wrote it: its agent by pid alone.
+    let legacy = || St {
+        pid_start: String::new(),
+        ..state(false)
+    };
+    let mut st = legacy();
     let (snap, _) = exit_input(world.path(), &st);
-    assert!(in_flight_exit_proven(
-        &st,
-        &snap,
-        true,
-        Some("another birth")
-    ));
-    assert!(in_flight_exit_proven(&st, &snap, false, None));
+    assert!(
+        !in_flight_exit_proven(&st, true, Some("another birth")),
+        "no start: unproven"
+    );
+    st.adopt_start(snap.pid, &snap.start);
+    assert_eq!(
+        st.pid_start,
+        super::super::upgrade_drive::squash(&snap.start),
+        "an earlier build's record takes its snapshot's start"
+    );
+    assert!(in_flight_exit_proven(&st, true, Some("another birth")));
+    assert!(in_flight_exit_proven(&st, false, None));
     assert!(!in_flight_exit_proven(
         &st,
-        &snap,
         true,
-        Some(snap.start.as_str())
+        Some(st.pid_start.as_str())
     ));
-    let mut other = st.clone();
-    other.pid += 1;
-    assert!(!in_flight_exit_proven(&other, &snap, false, None));
+    let mut other = legacy();
+    other.adopt_start(snap.pid + 1, &snap.start);
+    assert!(
+        other.pid_start.is_empty(),
+        "another pid's snapshot names another agent"
+    );
+    let mut own = legacy();
+    own.pid_start = "Sat Jan 3 04:05:06 2026".into();
+    own.adopt_start(snap.pid, &snap.start);
+    assert_eq!(
+        own.pid_start, "Sat Jan 3 04:05:06 2026",
+        "its own start is kept"
+    );
     let mut stamped = st.clone();
     stamped.exited_at = 1;
-    assert!(!in_flight_exit_proven(&stamped, &snap, false, None));
+    assert!(!in_flight_exit_proven(&stamped, false, None));
     let mut relaunched = st;
     relaunched.phase = upgrade::Phase::Relaunched { at_s: 1 };
-    assert!(!in_flight_exit_proven(&relaunched, &snap, false, None));
+    assert!(!in_flight_exit_proven(&relaunched, false, None));
 }
 
-/// The `HostEndedRelaunch` step [`host_ended_fresh`] takes from `state` under `action`: an input
-/// action sets its input; `Decide` asks the code over a record built from those inputs.
+/// The `HostEndedRelaunch` step the code takes from `state` under `action`: an input action
+/// sets its input; `Judge` asks the record's identity ([`St::adopt_start`], [`St::agent_exit_by`],
+/// [`agent_exit`]) over a record built from those inputs and a kernel that answers `cur`;
+/// `Decide` asks [`host_ended_fresh`] over a record whose exit `Judge` proved or not.
 pub(crate) fn host_ended_transition(
     model: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
+    const BORN: &str = "Thu Sep 24 01:02:03 2026";
     let mut next = model.clone();
     let input = match action {
-        "Own" => Some("own"),
-        "Earlier" => Some("ea"),
-        "Coordinated" => Some("co"),
-        "Deferred" => Some("de"),
-        "Proven" => Some("pr"),
-        "Unresolved" => Some("un"),
+        "Own" => Some(("own", 1)),
+        "Earlier" => Some(("ea", 1)),
+        "Coordinated" => Some(("co", 1)),
+        "Deferred" => Some(("de", 1)),
+        "Unresolved" => Some(("un", 1)),
+        "Recorded" => Some(("rec", 1)),
+        "Snapshot" => Some(("sn", 1)),
+        "Same" => Some(("cur", 1)),
+        "Reborn" => Some(("cur", 2)),
+        "Unread" => Some(("cur", 3)),
         _ => None,
     };
-    if let Some(var) = input {
-        next.insert(var, 1);
+    if let Some((var, value)) = input {
+        next.insert(var, value);
         return next;
     }
     let mut st = state(model["co"] == 1);
+    if action == "Judge" {
+        st.pid_start = if model["rec"] == 1 {
+            BORN.into()
+        } else {
+            String::new()
+        };
+        let pid = st.pid;
+        st.adopt_start(pid, if model["sn"] == 1 { BORN } else { "" });
+        let cur = model["cur"];
+        let exit = st.agent_exit_by(
+            |_| cur != 0,
+            |_| match cur {
+                1 => Some(BORN.to_string()),
+                2 => Some("Sat Jan  3 04:05:06 2026".to_string()),
+                _ => None,
+            },
+        );
+        next.insert("pr", i64::from(exit == AgentExit::Gone));
+        next.insert("wt", i64::from(exit == AgentExit::Runs));
+        next.insert("phase", 1);
+        return next;
+    }
     st.exited_at = if model["pr"] == 1 { 1 } else { 0 };
     st.native_retired_unissued = model["un"] == 1;
     let fresh = host_ended_fresh(model["ea"] == 1, model["de"] == 1, model["own"] == 1, &st);
     next.insert("fresh", i64::from(fresh));
-    next.insert("phase", 1);
+    next.insert("phase", 2);
     next
 }
 
-/// RS1: THE CODE'S HOST-ENDED DECISION REFINES `HostEndedRelaunch` over every reachable input,
-/// so a coordinated worker that ended under an earlier host comes back and nothing else is let
-/// past its gates. NEGATIVE CONTROL: a decision flipped either way breaks an invariant.
+/// The model state the code reaches from `inputs` (each an input action) through `Judge`.
+fn judged(model: &aterm_spec::derive::Model, inputs: &[&str]) -> aterm_spec::interp::State {
+    let mut state = model.init_state();
+    for action in inputs {
+        state = host_ended_transition(&state, action);
+    }
+    host_ended_transition(&state, "Judge")
+}
+
+/// RS1, RS2: THE CODE'S EXIT JUDGMENT AND HOST-ENDED DECISION REFINE `HostEndedRelaunch` over
+/// every reachable input, so a relaunch waits only on the process its record names by pid and
+/// kernel start, an earlier build's record takes its snapshot's start, and a coordinated worker
+/// that ended under an earlier host comes back with nothing else let past its gates. NEGATIVE
+/// CONTROLS: a judgment or decision flipped breaks the law it would violate.
 #[test]
 fn host_ended_relaunch_conforms_to_its_model() {
     let model = aterm_models_harness::host_ended_relaunch_model();
@@ -1350,22 +1470,43 @@ fn host_ended_relaunch_conforms_to_its_model() {
             }
         }
     }
-    let mut back = model.init_state();
-    for var in ["ea", "co", "pr"] {
-        back.insert(var, 1);
-    }
+    let mut back = judged(&model, &["Earlier", "Coordinated", "Recorded"]);
+    assert_eq!(back["pr"], 1, "a free pid: {back:?}");
     back = host_ended_transition(&back, "Decide");
     assert_eq!(back["fresh"], 1, "{back:?}");
     back.insert("fresh", 0);
     assert!(!model.check_invariant("ComesBack", &back));
-    let mut this_host = model.init_state();
-    for var in ["co", "pr"] {
-        this_host.insert(var, 1);
-    }
-    this_host = host_ended_transition(&this_host, "Decide");
+    let mut this_host = host_ended_transition(&judged(&model, &["Coordinated"]), "Decide");
     assert_eq!(this_host["fresh"], 0, "{this_host:?}");
     this_host.insert("fresh", 1);
     assert!(!model.check_invariant("OnlyAnEarlierHost", &this_host));
+    let mut reused = judged(&model, &["Recorded", "Reborn"]);
+    assert_eq!(
+        (reused["pr"], reused["wt"]),
+        (1, 0),
+        "a reused pid: {reused:?}"
+    );
+    reused.insert("wt", 1);
+    assert!(!model.check_invariant("WaitsOnlyOnItsAgent", &reused));
+    let mut runs = judged(&model, &["Recorded", "Same"]);
+    assert_eq!((runs["pr"], runs["wt"]), (0, 1), "its agent runs: {runs:?}");
+    runs.insert("pr", 1);
+    assert!(!model.check_invariant("ProvenByIdentity", &runs));
+    let mut bare = judged(&model, &["Reborn"]);
+    assert_eq!(
+        (bare["pr"], bare["wt"]),
+        (0, 0),
+        "a bare live pid: {bare:?}"
+    );
+    bare.insert("pr", 1);
+    assert!(!model.check_invariant("ProvenByIdentity", &bare));
+    let mut adopted = judged(&model, &["Snapshot", "Reborn"]);
+    assert_eq!(
+        adopted["pr"], 1,
+        "an earlier build's record by its snapshot: {adopted:?}"
+    );
+    adopted.insert("pr", 0);
+    assert!(!model.check_invariant("NeverHeldPastItsProof", &adopted));
 }
 
 /// RS1: A STAMPED AGENT THAT ENDED UNDER AN EARLIER HOST KEEPS ITS FAILED RESTART'S REFUSAL, as
@@ -1402,4 +1543,96 @@ fn an_earlier_hosts_failed_restart_keeps_its_refusal() {
         "{}",
         unstamped.step
     );
+}
+
+/// A cold plan past the managed twin commands the build its line types: the cold constructor refuses
+/// a command whose line differs from the plan's (`native-command-changed`), and the tab would stay
+/// at its shell.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_cold_line_past_the_twin_commands_the_build_it_types() {
+    use super::super::native_act::{ColdBilling, ColdIntent};
+    use std::os::unix::fs::PermissionsExt as _;
+    let world = aterm_tempfile::tempdir().unwrap();
+    let agents = world.path().join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    let store = world.path().join("store/claude");
+    let build = store.join("1000002000001000318/bin/claude");
+    std::fs::create_dir_all(build.parent().unwrap()).unwrap();
+    std::fs::write(&build, "a build").unwrap();
+    std::fs::write(
+        store.join("1000002000001000318.shim-env"),
+        "DISABLE_AUTOUPDATER=1\n",
+    )
+    .unwrap();
+    let twin = agents.join("claude");
+    std::fs::write(
+        &twin,
+        format!("#!/bin/sh\nexec '{}' \"$@\"\n", build.display()),
+    )
+    .unwrap();
+    for file in [&twin, &build] {
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    super::super::upgrade_drive::AGENTS_DIR.with(|d| *d.borrow_mut() = Some(agents.clone()));
+    let opts = options(world.path());
+    let argv = vec!["claude".to_string()];
+    let launch = |resume| Launch {
+        session: SESSION,
+        resume,
+        cwd: world.path().to_str().unwrap(),
+        agent: std::process::id(),
+        argv: &argv,
+        exe: &twin,
+        model: None,
+        mode: None,
+        home: None,
+        homedir: None,
+        login: None,
+        stored_login: true,
+        auth_observed: true,
+        launch_env: None,
+        billing: ModelBilling::Keep,
+    };
+    let intent = || ColdIntent {
+        login: None,
+        home: None,
+        auth_observed: true,
+        stored_login: true,
+        conversation: Some(SESSION.into()),
+        profile: None,
+        mode: super::super::accounts::Mode::Wall,
+        billing: ColdBilling::Keep,
+    };
+    let mut shell = aterm_uds::spawnfd::command(crate::test_program::kept("/bin/bash"))
+        .args([
+            "--noprofile",
+            "--norc",
+            "-c",
+            "printf 'ready\\n'; read -r line",
+        ])
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
+        .stdout(aterm_uds::spawnfd::Stdio::piped())
+        .spawn()
+        .unwrap();
+    aterm_uds::deadline::prints(&mut shell, "ready", aterm_spec::wait::MUST_HAPPEN);
+    // Fresh, the twin would add yolo; with `--resume` it would run as typed. A cold plan execs
+    // the build in both, since the constructor holds the child to the image it was told to run.
+    let planned = [false, true]
+        .map(|resume| plan_with_cold(&opts, &launch(resume), shell.id(), &[], Some(intent())));
+    drop(shell.stdin.take());
+    aterm_uds::deadline::kill_within(&mut shell, aterm_spec::wait::MUST_HAPPEN);
+    super::super::upgrade_drive::AGENTS_DIR.with(|d| *d.borrow_mut() = None);
+    for (resume, planned) in [false, true].into_iter().zip(planned) {
+        let Ok(plan) = planned else {
+            panic!("no plan, resume={resume}");
+        };
+        let forward = plan
+            .command
+            .as_ref()
+            .and_then(PlannedCommand::capture)
+            .unwrap();
+        assert_eq!(forward.program, build.to_str().unwrap(), "resume={resume}");
+        assert_eq!(forward.legacy_line().as_deref(), Some(plan.line.as_str()));
+    }
 }

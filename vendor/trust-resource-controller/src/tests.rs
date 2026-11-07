@@ -2,6 +2,34 @@
 // Copyright 2026 Andrew Yates
 
 use crate::*;
+
+/// Darwin's F_GETFL exposes FMARK/FDEFER while Unix-socket GC marks original
+/// SCM_RIGHTS fileglobs. These are kernel GC state, not caller status flags:
+/// XNU kern_descrip.c F_GETFL returns OFLAGS(f_flag), and uipc_usrreq.c unp_gc
+/// toggles 0x1000/0x2000 independently. Exclude only those two bits on Darwin;
+/// retain every caller-controlled/unknown bit and all independent FD checks.
+#[cfg(feature = "channel")]
+pub(crate) fn caller_status_flags(flags: i32) -> i32 {
+    #[cfg(target_os = "macos")]
+    {
+        flags & !(0x1000 | 0x2000)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        flags
+    }
+}
+
+#[cfg(all(unix, feature = "channel"))]
+#[test]
+fn status_flag_comparison_never_hides_a_nonblocking_change() {
+    assert_ne!(caller_status_flags(0), caller_status_flags(libc::O_NONBLOCK));
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(caller_status_flags(0), caller_status_flags(0x1000 | 0x2000));
+        assert_ne!(caller_status_flags(0), caller_status_flags(0x1000 | 0x2000 | libc::O_NONBLOCK));
+    }
+}
 fn request() -> Request {
     Request {
         binding: JobBinding {
@@ -57,6 +85,40 @@ fn request_preserves_os_bytes_named_transport_and_refuses_ambiguous_input() {
     assert!(invalid.encode().is_err());
     let mut invalid = request();
     invalid.member_attempt = invalid.binding.root_attempt;
+    assert!(invalid.encode().is_err());
+}
+#[test]
+fn metadata_probes_require_exact_bounded_queries_and_existing_cpu_only() {
+    let mut probe = request();
+    probe.role = Role::MetadataProbe;
+    probe.delegations.gnu = GnuTransport::None;
+    probe.timeout_ns = Some(8_000_000_000);
+    for query in [b"--print=sysroot".as_slice(), b"--print=target-list"] {
+        probe.command.args = vec![query.to_vec()];
+        assert!(Request::decode(&probe.encode().unwrap()).unwrap() == probe);
+    }
+    for args in [
+        vec![b"--print=cfg".to_vec()],
+        vec![b"--print=sysroot".to_vec(), b"--emit=link".to_vec()],
+        vec![b"@/private/response".to_vec()],
+    ] {
+        let mut invalid = probe.clone();
+        invalid.command.args = args;
+        assert!(invalid.encode().is_err());
+    }
+    for timeout in [None, Some(0), Some(8_000_000_001)] {
+        let mut invalid = probe.clone();
+        invalid.timeout_ns = timeout;
+        assert!(invalid.encode().is_err());
+    }
+    let mut invalid = probe.clone();
+    invalid.delegations.cpu = None;
+    assert!(invalid.encode().is_err());
+    let mut invalid = probe.clone();
+    invalid.delegations.fences.push(Descriptor { source: 8, target: 8 });
+    assert!(invalid.encode().is_err());
+    let mut invalid = probe;
+    invalid.delegations.gnu = request().delegations.gnu;
     assert!(invalid.encode().is_err());
 }
 fn started() -> Started {
@@ -120,7 +182,7 @@ fn producer_answer_matches_one_pending_call_and_actual_helper_identity() {
     other.member_attempt = [4; 16];
     assert!(proof.verify_answer(&other.answer().unwrap()).is_err());
 }
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(feature = "channel", any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn framed_channel_bounds_partial_input_and_poisoning() {
     use std::io::Write;
@@ -147,7 +209,7 @@ fn framed_channel_bounds_partial_input_and_poisoning() {
     assert!(a.poisoned());
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(feature = "channel", any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn closed_peer_is_safe_with_default_sigpipe() {
     const CHILD: &str = "TRUST_CONTROLLER_SIGPIPE_FIXTURE";
@@ -193,10 +255,24 @@ fn context_uses_one_original_claim_and_only_exact_root_can_request_initial_cpu()
             epoch: [2; 16],
             guard: FileIdentity { device: 1, inode: 11 },
         },
+        sdk: None,
     };
     let mut reply = ContextReply { call_attempt: query.call_attempt, context };
     let bytes = reply.encode().unwrap();
     assert_eq!(ContextReply::decode(&bytes, &query).unwrap(), reply);
+    assert!(ContextReply::decode(&bytes[..bytes.len() - 8], &query).is_err());
+    reply.context.sdk = Some(SdkCustody {
+        execution: b"/private/sdk".to_vec(),
+        build: 42,
+        lease_path: b"/private/leases/42".to_vec(),
+        lease: FileIdentity { device: 1, inode: 90 },
+        inherited_fd: 19,
+    });
+    let sdk_bytes = reply.encode().unwrap();
+    assert_eq!(ContextReply::decode(&sdk_bytes, &query).unwrap(), reply);
+    reply.context.sdk.as_mut().unwrap().inherited_fd = 1;
+    assert!(reply.encode().is_err());
+    reply.context.sdk = None;
     assert!(reply.context.may_acquire_initial_cpu(original_root));
     let mut nested = original_root;
     nested.pid += 1;
@@ -310,6 +386,7 @@ fn telemetry_preserves_unknown_zero_and_original_age_and_rejects_cross_call_or_r
                 epoch: [2; 16],
                 guard: FileIdentity { device: 1, inode: 11 },
             },
+            sdk: None,
         },
     };
     let mut reply = TelemetryReply {
@@ -352,3 +429,5 @@ fn telemetry_preserves_unknown_zero_and_original_age_and_rejects_cross_call_or_r
     );
     assert_eq!(TelemetryResponse::decode(&denied.encode().unwrap(), &query).unwrap(), denied);
 }
+
+mod loan;

@@ -31,6 +31,8 @@ use super::fixture::{
     put, put_exe, ran, scratch, seed_mint, toolchain as fixture_toolchain, trust_repo,
 };
 
+#[path = "pack_build_diagnostics.rs"]
+mod build_diagnostics;
 #[path = "pack_upload_race.rs"]
 mod upload_race;
 
@@ -107,7 +109,7 @@ fn metadata_json(
 ) -> String {
     let list = |v: &[&str]| {
         v.iter()
-            .map(|s| format!("\"{s}\""))
+            .map(|s| aterm_json::to_string(s).expect("metadata string"))
             .collect::<Vec<_>>()
             .join(",")
     };
@@ -132,6 +134,9 @@ fn cargo(checkout: &Path, meta: String, bins: Vec<(&'static str, Vec<u8>)>, fail
         let argv = run.argv();
         if argv.first().map(String::as_str) == Some("metadata") {
             return Some(ran(0, &meta, ""));
+        }
+        if argv.windows(2).any(|args| args == ["config", "get"]) {
+            return Some(ran(0, "{}", ""));
         }
         if !argv.iter().any(|a| a == "build") {
             return None;
@@ -196,6 +201,26 @@ fn tools(w: &World, host: &str, meta: String, bins: Vec<(&'static str, Vec<u8>)>
 
 fn declared(w: &World) -> String {
     metadata_json(&w.checkout, &["ay"], &[], &[], false)
+}
+
+fn config_answer(t: &mut FakeTools, json: &str, exit: i32) {
+    let answer = std::mem::replace(&mut t.answer, Box::new(|_| None));
+    let json = json.to_string();
+    t.answer = Box::new(move |run| {
+        if run.argv().windows(2).any(|args| args == ["config", "get"]) {
+            Some(ran(exit, &json, "configuration error"))
+        } else {
+            answer(run)
+        }
+    });
+}
+
+fn build_configs(run: &atpkg_publish::artifact::tools::Run) -> Vec<String> {
+    run.argv()
+        .windows(2)
+        .filter(|pair| pair[0] == "--config")
+        .map(|pair| pair[1].clone())
+        .collect()
 }
 
 #[test]
@@ -265,6 +290,164 @@ fn a_signed_pack_is_one_the_client_verifies_and_extracts_to_its_signed_root() {
         "{:?}",
         t.log()
     );
+}
+
+#[test]
+fn native_pack_preserves_repository_policy_and_appends_its_distribution_floor() {
+    let w = world("pack-native-policy");
+    let mut t = tools(
+        &w,
+        "aarch64-apple-darwin",
+        metadata_json(
+            &w.checkout,
+            &["ay"],
+            &[],
+            &[
+                "--config",
+                "target.aarch64-apple-darwin.rustflags=[\"--cfg\",\"declared_policy\",\"-C\",\"target-cpu=native\"]",
+            ],
+            false,
+        ),
+        vec![("ay", bin_bytes(macho(CPU_ARM64), "ay arm64"))],
+    );
+    config_answer(
+        &mut t,
+        r#"{"target":{"aarch64-apple-darwin":{"rustflags":["--cfg","declared_policy","-C","target-cpu=native"]},"cfg(all())":{"rustflags":["--cfg","cfg_policy","-C","target-cpu=native"]}},"host":{"rustflags":["--cfg","host_policy"]}}"#,
+        0,
+    );
+    let out = pack::pack_with(&w.ctx, &w.request(AARCH64_APPLE_DARWIN), &t).expect("packed");
+    client_verifies(
+        &w.ctx,
+        &out.manifest,
+        out.signature.as_ref().expect("signature"),
+    )
+    .expect("native manifest and artifact pair");
+    let build = &t.runs_of("build")[0];
+    assert!(!build.argv().iter().any(|arg| arg == "--target"));
+    assert!(build.env_of("RUSTFLAGS").is_none());
+    for key in [
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS",
+        "CARGO_BUILD_TARGET",
+    ] {
+        assert!(build.env_remove.iter().any(|removed| removed == key));
+    }
+    let configs = build_configs(build);
+    assert_eq!(
+        configs.len(),
+        5,
+        "declared policy, two target segments, fallback and host"
+    );
+    assert!(configs[0].contains("declared_policy"));
+    for config in &configs[1..] {
+        let (_, array) = config.split_once('=').expect("Cargo configuration");
+        let flags: aterm_json::Value = aterm_json::from_str(array).expect("TOML-compatible array");
+        assert_eq!(
+            flags,
+            aterm_json::json!(["-C", "target-cpu=apple-m1"]),
+            "append only the suffix, never duplicate resolved policy"
+        );
+    }
+    assert!(
+        configs
+            .iter()
+            .any(|c| c.starts_with("target.\"cfg(all())\"."))
+    );
+    let query = t.runs_of("config");
+    assert_eq!(query.len(), 1);
+    assert_eq!(build_configs(&query[0]), configs[..1]);
+    assert_eq!(query[0].cwd, build.cwd);
+    assert_eq!(query[0].env_remove, build.env_remove);
+}
+
+#[test]
+fn native_pack_keeps_build_fallback_and_selected_host_policy() {
+    for (label, config, expected) in [
+        (
+            "fallback",
+            r#"{"build":{"rustflags":["--cfg","build_policy"]},"target":{"aarch64-apple-darwin":{"rustflags":[]},"cfg(all())":{"rustflags":""}},"host":{"rustflags":["--cfg","shadowed_default"],"aarch64-apple-darwin":{"linker":"cc"}}}"#,
+            vec![
+                "build.rustflags=[\"-C\",\"target-cpu=apple-m1\"]",
+                "host.\"aarch64-apple-darwin\".rustflags=[\"-C\",\"target-cpu=apple-m1\"]",
+            ],
+        ),
+        (
+            "scalar",
+            r#"{"build":{"rustflags":"--cfg build_policy"},"host":{"rustflags":"--cfg host_policy"}}"#,
+            vec![
+                "build.rustflags=\"--cfg build_policy -C target-cpu=apple-m1\"",
+                "host.rustflags=\"--cfg host_policy -C target-cpu=apple-m1\"",
+            ],
+        ),
+    ] {
+        let w = world(label);
+        let mut t = tools(
+            &w,
+            "aarch64-apple-darwin",
+            declared(&w),
+            vec![("ay", bin_bytes(macho(CPU_ARM64), "ay arm64"))],
+        );
+        config_answer(&mut t, config, 0);
+        let out = pack::pack_with(&w.ctx, &w.request(AARCH64_APPLE_DARWIN), &t).expect("packed");
+        client_verifies(
+            &w.ctx,
+            &out.manifest,
+            out.signature.as_ref().expect("signature"),
+        )
+        .expect("client accepts native artifact");
+        assert_eq!(build_configs(&t.runs_of("build")[0]), expected);
+    }
+}
+
+#[test]
+fn native_pack_refuses_unreadable_or_malformed_policy_before_building() {
+    for (json, exit) in [
+        ("{}", 1),
+        ("not JSON", 0),
+        ("[]", 0),
+        (r#"{"build":{"rustflags":[1]}}"#, 0),
+        (r#"{"build":{"target":"x86_64-unknown-linux-gnu"}}"#, 0),
+        (
+            r#"{"build":{"target":["aarch64-apple-darwin","x86_64-unknown-linux-gnu"]}}"#,
+            0,
+        ),
+    ] {
+        let w = world("pack-bad-native-policy");
+        let mut t = tools(
+            &w,
+            "aarch64-apple-darwin",
+            declared(&w),
+            vec![("ay", bin_bytes(macho(CPU_ARM64), "ay arm64"))],
+        );
+        config_answer(&mut t, json, exit);
+        pack::pack_with(&w.ctx, &w.request(AARCH64_APPLE_DARWIN), &t)
+            .expect_err("policy cannot be silently replaced");
+        assert!(t.runs_of("build").is_empty());
+        assert!(w.written(".toml").is_empty());
+        assert!(w.written(".tar.zst").is_empty());
+    }
+}
+
+#[test]
+fn native_pack_refuses_metadata_that_reroutes_the_requested_target() {
+    for args in [
+        vec!["--target", "x86_64-unknown-linux-gnu"],
+        vec!["--target=x86_64-unknown-linux-gnu"],
+    ] {
+        let w = world("pack-native-target-policy");
+        let t = tools(
+            &w,
+            "aarch64-apple-darwin",
+            metadata_json(&w.checkout, &["ay"], &[], &args, false),
+            vec![("ay", bin_bytes(macho(CPU_ARM64), "ay arm64"))],
+        );
+        let error = pack::pack_with(&w.ctx, &w.request(AARCH64_APPLE_DARWIN), &t)
+            .expect_err("native metadata must match the request");
+        assert!(error.to_string().contains("different target"));
+        assert!(t.runs_of("build").is_empty());
+        assert!(w.written(".toml").is_empty());
+    }
 }
 
 #[test]

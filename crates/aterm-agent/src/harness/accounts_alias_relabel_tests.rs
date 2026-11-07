@@ -83,7 +83,7 @@ fn fixture(case: i64) -> (Option<Roster>, FleetRoster, Option<&'static str>) {
 fn default_unlisted(built: &Roster, observed: Option<&str>) -> bool {
     let desk = super::login_tests::Desk::new("m1");
     let config = desk.config.join("aterm.toml");
-    fs::write(
+    crate::test_config::write(
         &config,
         "[fleet]\nmachine = \"m1\"\naccounts_source = \"https://example.test/fleet.csv\"\n",
     )

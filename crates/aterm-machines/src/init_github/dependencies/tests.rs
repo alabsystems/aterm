@@ -41,8 +41,10 @@ pub(in crate::init_github) fn declarations(sys: &Fake, who: &User, parent: &Path
             .display(),
         Ran::ok(&format!("100644 blob {OLD}\t.gitmodules\0")),
     );
+    nothing_named(sys, git());
     sys.on(
-        &git()
+        &checkout::Programs::default()
+            .off(git())
             .args([
                 "diff",
                 "--no-ext-diff",
@@ -111,6 +113,14 @@ pub(in crate::init_github) fn declarations(sys: &Fake, who: &User, parent: &Path
             ])
             .display(),
         Ran::ok(&declarations),
+    );
+}
+
+/// The repository `git` runs in names no hook or filter driver ([`checkout::Programs::named`]).
+fn nothing_named(sys: &Fake, git: Cmd) {
+    sys.on(
+        &checkout::Programs::listing(git).display(),
+        Ran::exit(1, ""),
     );
 }
 
@@ -469,6 +479,153 @@ fn real_tracked_metadata_and_a_branch_at_the_pin_are_ready_without_moving_user_w
     ));
     assert!(repair(&sys, &who, &parent, &repo, &|| Ok(())).is_err());
     assert_eq!(run(&child, &["rev-parse", "HEAD"]).trim(), pin);
+}
+
+/// Reading whether a dependency is ready runs no filter driver the parent or the dependency
+/// names: not on the parent's `.gitmodules` (its `diff`), nor on a dependency's file (its
+/// `status`), each stat-dirty, so git would hash it again through the driver; a plain git runs
+/// both.
+#[test]
+fn readiness_runs_no_filter_driver_a_parent_or_a_dependency_names() {
+    use crate::port::Live;
+    use std::os::unix::fs::PermissionsExt as _;
+    crate::items::github::need_clt_git();
+    let sys = Live::new();
+    let scratch = Scratch::new(&sys, "required-no-filter").unwrap();
+    let mut who = user("fixture", sys.euid());
+    who.home = scratch.path().to_string_lossy().into_owned();
+    let parent = scratch.path().join("parent");
+    let child = parent.join("vendor/library");
+    sys.create_dir_all(&child, 0o700).unwrap();
+    let marker = scratch.path().join("ran");
+    let driver = scratch.path().join("driver");
+    std::fs::write(
+        &driver,
+        format!("#!/bin/sh\necho ran >> '{}'\ncat\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let run = |path: &Path, args: &[&str]| {
+        let command = local(&sys, &who, Some(path))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(checkout::NO_SIDE_RUNS)
+            .args([
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(args.iter().copied());
+        text(&sys, command, "synthetic local git fixture failed").unwrap()
+    };
+    // Stamped later than any index, so each read hashes the file again.
+    let stat_dirty = |path: &Path| {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(86_400))
+            .unwrap();
+    };
+    run(
+        &child,
+        &["init", "--template=", "--initial-branch=owner-work"],
+    );
+    run(
+        &child,
+        &["config", "filter.probe.clean", driver.to_str().unwrap()],
+    );
+    sys.write_file(
+        &child.join(".gitattributes"),
+        b"*.dat filter=probe\n",
+        0o600,
+    )
+    .unwrap();
+    sys.write_file(&child.join("library.dat"), b"data\n", 0o600)
+        .unwrap();
+    run(&child, &["add", "--", ".gitattributes", "library.dat"]);
+    run(&child, &["commit", "-m", "fixture dependency"]);
+    run(
+        &child,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/alice/library.git",
+        ],
+    );
+    let pin = run(&child, &["rev-parse", "HEAD"]).trim().to_owned();
+    run(&parent, &["init", "--template=", "--initial-branch=main"]);
+    run(
+        &parent,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/alice/parent.git",
+        ],
+    );
+    run(
+        &parent,
+        &["config", "filter.probe.clean", driver.to_str().unwrap()],
+    );
+    sys.write_file(
+        &parent.join(".gitattributes"),
+        b".gitmodules filter=probe\n",
+        0o600,
+    )
+    .unwrap();
+    sys.write_file(&parent.join(".gitmodules"), b"[submodule \"vendor/library\"]\npath = vendor/library\nurl = https://github.com/alice/library.git\n", 0o600).unwrap();
+    run(&parent, &["add", "--", ".gitattributes", ".gitmodules"]);
+    run(
+        &parent,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{pin},vendor/library"),
+        ],
+    );
+    run(&parent, &["commit", "-m", "fixture parent"]);
+    // The dependency moves past its pin, so its readiness reads its status.
+    sys.write_file(&child.join("later.txt"), b"later\n", 0o600)
+        .unwrap();
+    run(&child, &["add", "--", "later.txt"]);
+    run(&child, &["commit", "-m", "fixture later"]);
+    stat_dirty(&parent.join(".gitmodules"));
+    stat_dirty(&child.join("library.dat"));
+    let _ = std::fs::remove_file(&marker);
+    let repo = Repo {
+        owner: "alice".into(),
+        name: "parent".into(),
+        default_branch: Some("main".into()),
+        size_kib: 0,
+        fork: false,
+        archived: false,
+        required_submodules: vec!["vendor/library".into()],
+    };
+    // Its status read, the dependency stops at its branch, the person's.
+    assert!(matches!(
+        ready(&sys, &who, &parent, &repo),
+        Err(Unready::Preserved(why)) if why.contains("branch")
+    ));
+    assert!(
+        !marker.exists(),
+        "a driver ran: {}",
+        std::fs::read_to_string(&marker).unwrap_or_default()
+    );
+    // The control: plain reads run the driver, once for each file.
+    run(&parent, &["diff", "--quiet", "HEAD", "--", ".gitmodules"]);
+    run(&child, &["status", "--porcelain"]);
+    assert!(
+        std::fs::read_to_string(&marker)
+            .unwrap_or_default()
+            .lines()
+            .count()
+            >= 2,
+        "the driver is live"
+    );
 }
 
 #[test]
@@ -1014,8 +1171,10 @@ fn dirty_branched_partial_unknown_and_linked_dependencies_stay_unfinished_and_un
             });
         }
         let git = || local(&sys, &who, Some(&path));
+        nothing_named(&sys, git());
         sys.on(
-            &git()
+            &checkout::Programs::default()
+                .off(git())
                 .args([
                     "status",
                     "--porcelain=v1",
@@ -1098,8 +1257,10 @@ fn an_existing_clean_detached_recorded_pin_is_fetched_then_aligned_without_recur
     );
     existing(&sys, &who, &path, "library", OLD);
     let git = || local(&sys, &who, Some(&path));
+    nothing_named(&sys, git());
     sys.on(
-        &git()
+        &checkout::Programs::default()
+            .off(git())
             .args([
                 "status",
                 "--porcelain=v1",

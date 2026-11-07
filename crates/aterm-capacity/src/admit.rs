@@ -4,23 +4,31 @@
 //! ADMISSION: a [`Waiter`] enters the ledger, and each [`Waiter::poll`] reads the machine and
 //! the claims ahead of it and either admits it (a [`Claim`]) or names what it is short of
 //! ([`Shortfall`]). [`admit_with`] polls until it is admitted, saying once a minute what it
-//! waits for; it never gives up, unless its need asks to end behind holders that make no
-//! progress ([`Need::ends_when_stuck`], [`Error::Stuck`]). Memory, cores and the quiet machine
-//! come back as the claims ahead end, so a need of them fits once its holders end. Disk does
-//! not: what a claim wrote
-//! stays on its volume once it ends (a build's caches), so a claim's end gives back only the
-//! part of its reservation it never wrote, and only space freed (the build cache's relief, the
-//! window's disk watch, a person) raises what is free. A waiter whose disk need is more than its
-//! volume holds above the floor now is one no claim's end can admit (UNSERVABLE,
-//! [`Short::unservable`]): it reserves no disk against the waiters behind it, which are admitted
-//! around it while it waits for space, and it reserves again in its turn once its need fits
-//! (`reservations`). That is the trade: such a waiter is overtaken by every claim that fits
-//! while it cannot, and those claims' writes take room that space freed for it gave, so it is
-//! admitted only once space freed reaches its need beside what they still hold. The look at
-//! which it fits the room again but is short asks the relief once more, sized for them, where a
-//! claim reserves that disk that did not at the look its last relief was sized for
-//! ([`Relief::relieve`]); where nothing more can be freed it waits for a person, as it did when
-//! it held every claim behind it. A relief, or any pass that runs while it waits, can remove what
+//! waits for; it gives up only on a disk need nothing it waits for can meet (UNMET, below), or
+//! where its need asks to end behind holders that make no progress ([`Need::ends_when_stuck`],
+//! [`Error::Stuck`]). Memory, cores and the quiet machine
+//! come back as the claims ahead end, so a need of them fits once its holders end. Disk mostly
+//! does not: what a claim wrote stays on its volume once it ends (a build's caches), so a
+//! claim's end gives back only the part of its reservation it never wrote, unless its disk is
+//! scratch ([`Need::scratch`]: a pilot's cold build), whose writes may be removed by then; only
+//! space freed (the build cache's relief, the window's disk watch, a person)
+//! raises what is free beyond that. A waiter whose disk need is more than its volume holds above
+//! the floor now is beyond the room (UNSERVABLE, [`Short::unservable`]): its relief runs at once
+//! ([`Relief::relieve`]); it waits while another process holds scratch claims there whose
+//! writes could bring it within the room if returned, and is relieved again once one it saw held
+//! has ended; the next look observes what was actually returned. A look still UNSERVABLE after
+//! its relief, with no such claim held, ends the
+//! wait (UNMET, [`Error::Unmet`]): nothing it would wait for frees disk, so the wait could never
+//! end, and its caller says what to free and how to start it at once where it can. While it is
+//! beyond the room it reserves no disk against the waiters behind it, and it reserves again once
+//! its need fits (`reservations`). A need its relief brought
+//! within the room waits, short only of what claims reserve: every claim that fits is admitted
+//! around it meanwhile, and their writes can take room the relief gave, so the look at which it
+//! fits the room but is short asks the relief once more, sized for them, where a claim reserves
+//! disk that did not at the look its last relief was sized for; a look that finds it
+//! UNSERVABLE again is relieved again, and refused if that relief leaves it UNSERVABLE too
+//! with no scratch claim held that could meet it.
+//! A relief, or any pass that runs while it waits, can remove what
 //! a need was sized on (a run's own build directory, which the run then writes again from
 //! empty): the need sized again after each relief and at the look that admits a claim that
 //! waited ([`Relief::resized`]) re-enters the wait when it grew. SIGINT, SIGTERM or SIGHUP ends the wait within a nap,
@@ -123,12 +131,22 @@ impl Pace {
 #[must_use]
 pub fn gib(bytes: u64) -> String {
     let g = u128::from(GIB);
-    let tenths = (u128::from(bytes) * 10 + g / 2) / g;
+    tenths_of_gib((u128::from(bytes) * 10 + g / 2) / g)
+}
+
+/// `tenths` tenths of a GiB, as [`gib`] writes them.
+fn tenths_of_gib(tenths: u128) -> String {
     if tenths % 10 == 0 {
         format!("{} GiB", tenths / 10)
     } else {
         format!("{}.{} GiB", tenths / 10, tenths % 10)
     }
+}
+
+/// [`gib`] rounded up to the tenth: an amount to free, never below what is short, and never
+/// `0 GiB` for a shortfall of a byte.
+fn gib_up(bytes: u64) -> String {
+    tenths_of_gib((u128::from(bytes) * 10).div_ceil(u128::from(GIB)))
 }
 
 /// A span as a person reads it: `45s`, `3m05s`, `2h10m`.
@@ -258,6 +276,13 @@ pub enum Short {
         /// What the claims ahead on that volume still reserve: never an unservable waiter's
         /// need ([`Short::unservable`]).
         reserved: u64,
+        /// For a need [`Short::unservable`], the scratch claims other processes hold on that
+        /// volume ([`Need::scratch`]: a pilot's cold build), each by its place in the queue
+        /// ([`Record::order`]), where what they may give back by their end would bring it within
+        /// the room: it waits while any is held, then rechecks what actually returned, and is
+        /// refused ([`Error::Unmet`]) once none is held. Empty where their upper bound could not
+        /// meet it (or there are none): no wait would meet it.
+        held: Vec<(u64, u32, u64)>,
     },
     /// The machine is not quiet: the 1-minute load is above what the claim allows.
     Load {
@@ -348,10 +373,14 @@ impl Short {
         self.held_by_claims() && !matches!(self, Short::Reserved { .. })
     }
 
-    /// Whether this is a disk need no claim's end can meet (UNSERVABLE): more than its volume
-    /// holds above the floor now, before any reservation. What a claim wrote stays on the volume
-    /// once it ends, so only space freed admits it; while it waits it reserves no disk against
-    /// the waiters behind it (`reservations`, by the same test, `beyond_room`).
+    /// Whether this is a disk need beyond the room (UNSERVABLE): more than its volume holds
+    /// above the floor now, before any reservation. What a claim wrote stays on the volume once
+    /// it ends unless its disk is scratch ([`Need::scratch`]), so only space freed, or what such
+    /// a claim may give back, can admit it: its relief runs, it waits while scratch claims are
+    /// held there whose upper bound could meet it (`held`), then rechecks what actually returned;
+    /// a look still UNSERVABLE after its relief with none held is refused ([`Error::Unmet`]).
+    /// Meanwhile it reserves no disk against the waiters
+    /// behind it (`reservations`, by the same test, `beyond_room`).
     #[must_use]
     pub const fn unservable(&self) -> bool {
         matches!(self, Short::Disk { need, above_floor, .. } if beyond_room(*need, *above_floor))
@@ -359,18 +388,11 @@ impl Short {
 }
 
 /// Whether a disk need of `need` bytes is more than `above_floor`, what its volume holds above
-/// the floor now (UNSERVABLE): the one test [`Short::unservable`], which words a wait line, and
-/// `unservable`, which decides what a waiter reserves, share.
+/// the floor now (UNSERVABLE): the one test [`Short::unservable`], which relieves or refuses a
+/// wait, and `unservable`, which decides what a waiter reserves, share.
 const fn beyond_room(need: u64, above_floor: u64) -> bool {
     need > above_floor
 }
-
-/// What a waiter's line ([`Waiter::line`]), and no other line, says of a need that is
-/// [`Short::unservable`]: what admits it and how to start it now. A claim `--admit now` started
-/// holds its whole need, and one an interrupt ended waits no more, so neither says it.
-pub(crate) const UNSERVABLE: &str = "; no claim's end can make room for its disk, which is more \
-     than is free above the floor (what a claim wrote stays on the volume): it waits for space to \
-     be freed, holding back no claim behind it, and `--admit now` starts it at once";
 
 impl fmt::Display for Short {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -400,6 +422,7 @@ impl fmt::Display for Short {
                 above_floor,
                 floor,
                 reserved,
+                ..
             } => {
                 let room = above_floor.saturating_sub(*reserved);
                 write!(
@@ -586,6 +609,20 @@ fn disk_reservers(short: &Shortfall) -> Vec<(u64, u32, u64)> {
         .collect()
 }
 
+/// The claims held on a volume a disk need of `short` is beyond the room of, which it waits for
+/// ([`Short::Disk`]'s `held`); none where it is short of no such need.
+fn held_disk(short: &Shortfall) -> Vec<(u64, u32, u64)> {
+    short
+        .shorts
+        .iter()
+        .filter_map(|s| match s {
+            Short::Disk { held, .. } if s.unservable() => Some(held.iter().copied()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
 impl fmt::Display for Shortfall {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (i, s) in self.shorts.iter().enumerate() {
@@ -630,9 +667,9 @@ pub struct Reserve {
     /// was read).
     pub disk: Option<u64>,
     /// Whether it is a waiter whose disk need is more than the volume it is reckoned on holds
-    /// above the floor now (UNSERVABLE, the test [`Short::unservable`] words a wait line by): no
-    /// claim's end can make room for it, only space freed, so it reserves no disk against the
-    /// claims behind it.
+    /// above the floor now (UNSERVABLE, the test [`Short::unservable`] relieves or refuses a wait
+    /// by): no claim's end can make room for it, only space freed, so it reserves no disk against
+    /// the claims behind it.
     pub unservable: bool,
 }
 
@@ -784,6 +821,26 @@ fn reservations(ahead: &[&Other<'_>], volume: Option<&Volume>) -> Vec<Reserve> {
 #[cfg(test)]
 #[path = "admit_detached_tests.rs"]
 mod detached_accounting_tests;
+
+/// Whether `other` is a scratch claim ([`Need::scratch`]) held on `volume` by a process other
+/// than `pid` (the waiter's): one whose end may give back what it wrote there, which a disk need
+/// beyond the room can wait for ([`Short::Disk`]). The waiter's own process lets its claims go
+/// only once its wait is over, so a wait for them would never end.
+fn scratch_on(other: &Other<'_>, pid: u32, volume: &Volume) -> bool {
+    let r = other.record;
+    r.held.is_some()
+        && r.pid != pid
+        && r.need.scratch
+        && r.need.disk > 0
+        && r.need.path.as_deref() == Some(volume.mount.as_path())
+}
+
+/// What `other`, a scratch claim ([`scratch_on`]), could give back by its end: what it has
+/// written, as its holder measures it ([`Record::wrote`]), or, unmeasured, its whole need, the
+/// most it says it writes. The look after its end reads what actually returned.
+fn could_give_back(other: &Other<'_>) -> u64 {
+    other.record.wrote.unwrap_or(other.record.need.disk)
+}
 
 /// Whether `record` waits for more disk than `volume` holds above the floor now (UNSERVABLE,
 /// [`Short::unservable`]): its own look holds its whole need to that room, so it is admitted
@@ -1106,6 +1163,9 @@ pub(crate) fn decide(
         shorts.push(Short::Foreground);
     }
     let (mut want_mem, mut want_disk, mut want_quiet) = (false, false, false);
+    // The scratch claims held on the volume a disk need beyond the room waits for
+    // ([`Short::Disk`]).
+    let mut held_disk: Vec<(u64, u32, u64)> = Vec::new();
     let mut want_alone = None;
     let mut alone = None;
     if need.mem > 0 && reading.pressure == Some(aterm_sysprobe::MemoryLevel::Critical) {
@@ -1162,12 +1222,24 @@ pub(crate) fn decide(
             .fold(0, u64::saturating_add);
         if v.above_floor().saturating_sub(reserved) < need.disk {
             want_disk = true;
+            let scratch: Vec<&&Other<'_>> =
+                ahead.iter().filter(|o| scratch_on(o, mine.1, v)).collect();
+            let back = scratch
+                .iter()
+                .map(|o| could_give_back(o))
+                .fold(0, u64::saturating_add);
+            if beyond_room(need.disk, v.above_floor())
+                && !beyond_room(need.disk, v.above_floor().saturating_add(back))
+            {
+                held_disk = scratch.iter().map(|o| o.record.order()).collect();
+            }
             shorts.push(Short::Disk {
                 need: need.disk,
                 mount: v.mount.clone(),
                 above_floor: v.above_floor(),
                 floor: v.floor,
                 reserved,
+                held: held_disk.clone(),
             });
         }
     }
@@ -1198,6 +1270,7 @@ pub(crate) fn decide(
             .filter(|(o, r)| {
                 (want_mem && o.record.need.mem > 0 && !sibling(o))
                     || (want_disk && r.disk.unwrap_or(0) > 0)
+                    || held_disk.contains(&o.record.order())
                     || (want_quiet && o.record.need.quiet.is_some())
                     || want_alone == Some(o.record.order())
             })
@@ -2172,10 +2245,11 @@ pub struct Waiter {
 }
 
 /// WHAT THIS PROCESS'S WAITERS HAVE READ OF THE HOLDERS THEY WAIT BEHIND, by ledger and holder
-/// pid ([`Waiter::read_holders`]): a process's CPU time and the bytes it wrote only grow, so a tree
-/// read alike twice did nothing between the reads, and a waiter that comes later counts a holder's
-/// stall from the first read of it that found its work as it is now, not from its own first look
-/// (a verify run's later stage behind the holder its earlier stage waited behind). An entry no
+/// pid ([`Waiter::read_holders`]): a process's runnable time and the bytes it wrote only grow, so
+/// the reads say at what rate a tree worked between them ([`aterm_toolchain::stall::Stall`]), and
+/// a waiter that comes later counts a holder's stall from the last read of it that found it
+/// working, not from its own first look (a verify run's later stage behind the holder its earlier
+/// stage waited behind), judging it over the window the first waiter to read it set. An entry no
 /// waiter has read for [`STALL_KEPT`] goes.
 type StallsByPid = std::collections::BTreeMap<u32, (aterm_toolchain::stall::Stall, Instant)>;
 
@@ -2304,9 +2378,8 @@ impl Waiter {
         forced_now: bool,
         stopped: &dyn Fn() -> bool,
     ) -> Polled {
-        if std::fs::symlink_metadata(self.laid.path())
-            .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
-        {
+        // `try_exists` follows a link: one to nothing is no claim file either.
+        if matches!(self.laid.path().try_exists(), Ok(false)) {
             return Polled::Gone(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!(
@@ -2355,7 +2428,7 @@ impl Waiter {
         let polled = match found.decided {
             Ok((granted, quiet)) => waiter.grant(granted, quiet, timed, forced_now),
             Err(mut short) => {
-                let stuck = waiter.read_holders(&mut short, found.procs.as_ref());
+                let stuck = waiter.read_holders(&mut short, found.procs.as_ref(), &found.waits);
                 waiter.stuck_looks = if stuck.is_some() {
                     waiter.stuck_looks.saturating_add(1)
                 } else {
@@ -2374,13 +2447,15 @@ impl Waiter {
     }
 
     /// Read in `procs` the process tree of each held claim's holder `short` names, with the
-    /// processes that claim is credited with ([`Holder::credit`]), book it in [`STALLS`], and name
-    /// on it how long that has made no progress once it reaches [`Waiter::stalled_after`]; then
-    /// whether the wait is [`stuck`] behind them.
+    /// processes that claim is credited with ([`Holder::credit`]) and whether one of them waits
+    /// in its turn (its mark among `waits`), book it in [`STALLS`], and name on it how long that
+    /// has made no progress once it reaches [`Waiter::stalled_after`]; then whether the wait is
+    /// [`stuck`] behind them.
     fn read_holders(
         &self,
         short: &mut Shortfall,
         procs: Option<&Procs>,
+        waits: &[aterm_toolchain::waits::Waiting],
     ) -> Option<aterm_toolchain::waits::Stuck> {
         let now = Instant::now();
         let dir = self.ledger.dir();
@@ -2391,10 +2466,13 @@ impl Waiter {
                 None => stalls.entry(dir.to_path_buf()).or_default(),
             };
             for h in short.holders.iter_mut().filter(|h| h.held) {
-                let work = procs.and_then(|p| p.work(h.pid, &h.credit));
+                let work = procs.and_then(|p| p.work(h.pid, &h.credit, waits));
+                // Judged busy over a minute, or over the bound where that is shorter (a test's
+                // compressed one): a tree is never judged over more than it may stall.
+                let over = aterm_toolchain::stall::BUSY_OVER.min(self.stalled_after);
                 let (stall, read) = dir_stalls
                     .entry(h.pid)
-                    .or_insert_with(|| (aterm_toolchain::stall::Stall::default(), now));
+                    .or_insert_with(|| (aterm_toolchain::stall::Stall::over(over), now));
                 *read = now;
                 h.stalled = stall.stuck(h.pid, work, now, self.stalled_after);
             }
@@ -2456,6 +2534,11 @@ impl Waiter {
                 procs
             })
             .flatten();
+        let waits = if procs.is_some() {
+            machine.waits()
+        } else {
+            Vec::new()
+        };
         // Coverage reads the claims before `counted` leaves out the ancestors': an ancestor's held
         // quiet claim is what covers this one.
         let mut need = std::borrow::Cow::Borrowed(&self.record.need);
@@ -2657,6 +2740,7 @@ impl Waiter {
             next,
             now,
             procs,
+            waits,
         })
     }
 
@@ -2830,9 +2914,8 @@ impl Waiter {
         }
     }
 
-    /// Its wait line: for a disk need no claim's end can meet, that only space freed admits it
-    /// and `--admit now` starts it ([`UNSERVABLE`]); for a quiet claim next for the quiet
-    /// machine, when its patience reserves the machine and when its wait reaches the bound.
+    /// Its wait line: for a quiet claim next for the quiet machine, when its patience reserves the
+    /// machine and when its wait reaches the bound.
     /// A measured need that runs loaded starts there on a busy machine and says so, a strict one
     /// is refused; load-only admission starts whatever the load, and a wait the GPU alone holds
     /// back starts whatever the GPU.
@@ -2843,9 +2926,6 @@ impl Waiter {
             self.record.need.what,
             span(self.since.elapsed())
         );
-        if short.shorts.iter().any(Short::unservable) {
-            line.push_str(UNSERVABLE);
-        }
         let waits_machine = short.shorts.iter().any(Short::machine_busy);
         if let (true, Some(p), Some(next)) = (
             waits_machine,
@@ -2948,6 +3028,8 @@ struct Found {
     now: u64,
     /// The processes it read: `None` where it read none (no claim ahead, or no sweep).
     procs: Option<Procs>,
+    /// The waits it read in this user's waits, with the processes ([`Machine::waits`]).
+    waits: Vec<aterm_toolchain::waits::Waiting>,
 }
 
 /// What a look found of a measured need's CPU and load, for its grant.
@@ -2989,6 +3071,23 @@ pub enum Error {
     Timing(crate::TimingIssue),
     /// The need can never fit on this machine ([`never`]).
     Never(String),
+    /// A disk need still more than its volume has free above the floor once its relief freed
+    /// what it could ([`Short::unservable`] at the look that followed that relief), with no
+    /// scratch claim held there whose end could meet it ([`Short::Disk`]'s `held`): what other
+    /// claims wrote stays once they end, and the relief has nothing left to free toward it, so
+    /// only space freed by hand would admit it and its wait would never end. The claim has left
+    /// the queue. Its caller adds the remedy it takes (verify's `--admit now`), if it has one.
+    Unmet {
+        /// What it is ([`Need::what`]).
+        what: String,
+        /// What it was short of at that look.
+        short: Shortfall,
+        /// What holds the most of the short volume, as its relief names it
+        /// ([`Relief::holders`]).
+        holders: Option<String>,
+        /// Whether a relief ran ([`admit_relieved`]); [`admit_with`] has none.
+        relieved: bool,
+    },
     /// The ledger could not be used.
     Ledger(io::Error),
     /// An interrupt, or the caller ([`admit_until`]), ended the wait. The claim has left the
@@ -3016,6 +3115,54 @@ impl fmt::Display for Error {
         match self {
             Error::Timing(why) => write!(f, "timing not qualified: {why}"),
             Error::Never(why) => write!(f, "{why}; it can never be admitted here"),
+            Error::Unmet {
+                what,
+                short,
+                holders,
+                relieved,
+            } => {
+                let beyond = || short.shorts.iter().filter(|s| s.unservable());
+                write!(f, "{what}: ")?;
+                for (i, s) in beyond().enumerate() {
+                    if i > 0 {
+                        f.write_str("; ")?;
+                    }
+                    write!(f, "{s}")?;
+                }
+                f.write_str(if *relieved {
+                    ", once its relief freed what it could"
+                } else {
+                    ", with no relief to free it"
+                })?;
+                f.write_str(
+                    ": what other claims wrote stays once they end, and no held scratch claim \
+                     can return enough of what it wrote, so a wait would never end",
+                )?;
+                if let Some(holders) = holders {
+                    write!(f, "; {holders}")?;
+                }
+                f.write_str(". Free ")?;
+                for (i, s) in beyond().enumerate() {
+                    if let Short::Disk {
+                        need,
+                        mount,
+                        above_floor,
+                        ..
+                    } = s
+                    {
+                        if i > 0 {
+                            f.write_str(" and ")?;
+                        }
+                        write!(
+                            f,
+                            "at least {} on {}",
+                            gib_up(need.saturating_sub(*above_floor)),
+                            mount.display()
+                        )?;
+                    }
+                }
+                Ok(())
+            }
             Error::Ledger(e) => write!(f, "the capacity ledger could not be used: {e}"),
             Error::Stopped { signal, short } => {
                 match signal {
@@ -3052,7 +3199,12 @@ impl std::error::Error for Error {}
 /// start another that claims for itself.
 ///
 /// # Errors
-/// [`Error::Never`] for a need that can never fit; [`Error::Ledger`] when there is no home, the ledger cannot be written, or the claim's file is removed while it waits; [`Error::Stuck`] for a need that asks to end its wait behind holders that make no progress ([`Need::ends_when_stuck`]) once it is.
+/// [`Error::Never`] for a need that can never fit; [`Error::Unmet`] for a disk need still more
+/// than its volume holds above the floor once its relief ran (here none), with no scratch
+/// claim held there that could meet it, which no wait can admit;
+/// [`Error::Ledger`] when there is no home, the ledger cannot be written, or the claim's file is
+/// removed while it waits; [`Error::Stuck`] for a need that asks to end its wait behind holders
+/// that make no progress ([`Need::ends_when_stuck`]) once it is.
 /// [`Error::Timing`] when requested Timing lacks qualifying CPU/load/provenance or uses an override.
 pub fn admit(need: Need, mode: Admit) -> Result<Claim, Error> {
     let ledger = crate::Ledger::user().ok_or_else(|| {
@@ -3081,17 +3233,28 @@ pub fn admit(need: Need, mode: Admit) -> Result<Claim, Error> {
 pub trait Relief {
     /// Called at the first look that finds the need short of something a claim can hold, before
     /// any wait line: free what can be freed toward it, saying through `say` what was done. The
-    /// next look follows at once, so a need the relief met is admitted with no wait. Called again
+    /// next look follows at once, so a need the relief met is admitted with no wait, and a disk
+    /// need it left [`Short::unservable`] is refused ([`Error::Unmet`]) unless scratch claims
+    /// held on its volume could meet it, which it waits for. Called again
     /// at a look at which a disk need no claim's end could meet ([`Short::unservable`]) fits the
     /// room once more but is still short, where a claim reserves that disk that did not at the
     /// look the last call was sized for: a claim admitted around it while it could not fit holds
     /// the rest, which no earlier call was sized for. Where every claim that reserves it was
     /// counted by the last call, that call was sized for them, and it waits. Called afresh, as at
-    /// a first look, once its need sized again ([`Self::resized`]) has re-entered the wait.
+    /// a first look, once its need sized again ([`Self::resized`]) has re-entered the wait, at
+    /// a look that finds a disk need [`Short::unservable`] once more after one that found it within
+    /// the room, and at a look that finds it still [`Short::unservable`] once a scratch claim it
+    /// waited for since the last call has ended.
     fn relieve(&mut self, short: &Shortfall, say: &mut dyn FnMut(&str), stopped: &dyn Fn() -> bool);
 
     /// Words a wait line ends with: what holds the rest (the largest users of a short volume).
     fn holders(&mut self, short: &Shortfall, stopped: &dyn Fn() -> bool) -> Option<String>;
+
+    /// Whether [`Self::relieve`] can free anything, which [`Error::Unmet`] says: `true`, as by
+    /// default; [`admit_with`]'s relief is none.
+    fn relieves(&self) -> bool {
+        true
+    }
 
     /// Asked at each look that waits short of something a relief can free once a relief has run:
     /// whether what it may take grew since its last call (a workspace removed meanwhile, whose
@@ -3132,6 +3295,10 @@ impl Relief for NoRelief {
 
     fn holders(&mut self, _short: &Shortfall, _stopped: &dyn Fn() -> bool) -> Option<String> {
         None
+    }
+
+    fn relieves(&self) -> bool {
+        false
     }
 }
 
@@ -3370,6 +3537,17 @@ fn admit_deciding(
     // asking again would only repeat it, whatever they reserve now (a figure alone can fall as
     // one claim ends while another is admitted).
     let mut unservable = false;
+    // Whether the last relief ran at a look that found the disk need unservable, with no look
+    // since that found it within the room: that relief freed what it could toward it, so a look
+    // still unservable with no scratch claim held that could meet it ends the wait ([`Error::Unmet`])
+    // rather than waiting for space that no claim's end and no relief frees. A look unservable
+    // after one within the room is relieved first, as at a first look.
+    let mut spent = false;
+    // The scratch claims it waited for at any look since the last relief ([`Short::Disk`]'s
+    // `held`): one may have returned what it wrote by the time it ends, and the relief may free
+    // more once it has, so a look that finds one of them gone rechecks the room and, if the need
+    // is still unservable, relieves again as at a first look before it can refuse.
+    let mut held_at: Vec<(u64, u32, u64)> = Vec::new();
     let relieve_now =
         |sized_for: Option<&[(u64, u32, u64)]>, unservable: bool, short: &Shortfall| {
             sized_for.is_none_or(|before| {
@@ -3438,6 +3616,8 @@ fn admit_deciding(
                     waiter = enter_again(&entered)?;
                     sized_for = None;
                     unservable = false;
+                    spent = false;
+                    held_at.clear();
                     continue;
                 }
                 if said.is_some() {
@@ -3469,11 +3649,16 @@ fn admit_deciding(
             Polled::Waiting(w, short)
                 if short.shorts.iter().any(Short::relievable)
                     && (relieve_now(sized_for.as_deref(), unservable, &short)
+                        || (short.shorts.iter().any(Short::unservable)
+                            && (!spent
+                                || held_at.iter().any(|c| !held_disk(&short).contains(c))))
                         || relief.renewed(&interrupted)) =>
             {
                 waited = true;
                 sized_for = Some(disk_reservers(&short));
                 unservable = short.shorts.iter().any(Short::unservable);
+                spent = unservable;
+                held_at = held_disk(&short);
                 relief.relieve(&short, say, &interrupted);
                 waiter = match relief.resized(say, &interrupted) {
                     Some(disk) if disk > entered.disk => {
@@ -3484,6 +3669,8 @@ fn admit_deciding(
                         drop(w);
                         sized_for = None;
                         unservable = false;
+                        spent = false;
+                        held_at.clear();
                         enter_again(&entered)?
                     }
                     _ => w,
@@ -3494,6 +3681,29 @@ fn admit_deciding(
                 waited = true;
                 turn_since = None;
                 unservable = short.shorts.iter().any(Short::unservable);
+                if unservable && spent && held_disk(&short).is_empty() {
+                    let holders = relief.holders(&short, &interrupted);
+                    if let Some(signal) = ended() {
+                        drop(w);
+                        return Err(Error::Stopped {
+                            signal,
+                            short: Some(short),
+                        });
+                    }
+                    drop(w);
+                    return Err(Error::Unmet {
+                        what,
+                        short,
+                        holders,
+                        relieved: relief.relieves(),
+                    });
+                }
+                for claim in held_disk(&short) {
+                    if !held_at.contains(&claim) {
+                        held_at.push(claim);
+                    }
+                }
+                spent &= unservable;
                 if said.is_none_or(|t| t.elapsed() >= pace.line_every) {
                     let mut line = w.line(&short);
                     if let Some(more) = relief.holders(&short, &interrupted) {
@@ -3508,6 +3718,73 @@ fn admit_deciding(
                 nap(pace.poll);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod waiting_completion_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    /// A caller stop observed by an interruptible holder scan wins over the refusal that scan
+    /// was preparing. Negative control: without the check after `holders`, this is `Unmet`.
+    #[test]
+    fn a_stop_during_unmet_holder_discovery_is_reported_as_stopped() {
+        struct StopsInHolders<'a>(&'a AtomicBool);
+
+        impl Relief for StopsInHolders<'_> {
+            fn relieve(
+                &mut self,
+                _short: &Shortfall,
+                _say: &mut dyn FnMut(&str),
+                _stopped: &dyn Fn() -> bool,
+            ) {
+            }
+
+            fn holders(
+                &mut self,
+                _short: &Shortfall,
+                _stopped: &dyn Fn() -> bool,
+            ) -> Option<String> {
+                self.0.store(true, Ordering::SeqCst);
+                Some("holder scan stopped".to_owned())
+            }
+        }
+
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(scratch.path().join("ledger"));
+        let mut reading = Reading::of_gib(48, 40, 14);
+        reading.volume = Some(Volume {
+            mount: PathBuf::from("/vol"),
+            total: 40 * GIB,
+            free: 20 * GIB,
+            floor: 4 * GIB,
+            room: 2 * GIB,
+        });
+        let machine = crate::Fixed::new(reading);
+        let stopped = AtomicBool::new(false);
+        let mut relief = StopsInHolders(&stopped);
+        let got = admit_waiting(
+            &ledger,
+            &machine,
+            Need::new("verify").disk(27 * GIB, "/vol"),
+            Admit::Wait,
+            Pace::default(),
+            &mut relief,
+            &mut |_| {},
+            &|| stopped.load(Ordering::SeqCst),
+        );
+
+        let Err(Error::Stopped {
+            signal: None,
+            short: Some(short),
+        }) = &got
+        else {
+            panic!("the stop during holder discovery wins, got {got:?}");
+        };
+        assert!(short.shorts.iter().any(Short::unservable), "{short}");
+        assert!(ledger.list().unwrap().is_empty(), "the stopped claim left");
     }
 }
 

@@ -238,9 +238,11 @@ pub use fleet_listen::judge_mesh_dials;
 #[cfg(unix)]
 pub use fleet_listen::node_serve::dial_units;
 #[cfg(unix)]
-pub use fleet_listen::node_serve::{WindowLauncher, run_node_serve_owning};
+pub use fleet_listen::node_serve::{NodeMaintenance, WindowLauncher, run_node_serve_owning};
 #[cfg(unix)]
-pub use fleet_listen::node_serve::{WindowNeeds, install_window_needs};
+pub use fleet_listen::node_serve::{
+    WindowActivity, WindowNeeds, install_window_activity, install_window_needs,
+};
 #[cfg(unix)]
 pub use fleet_listen::vault_here;
 #[cfg(all(unix, any(test, debug_assertions)))]
@@ -525,7 +527,7 @@ pub use system_state_host::{
 };
 pub use workstation_setup::{
     SetupAnswer, WorkstationSetupDecision, await_initial_setup_answer_while,
-    on_window_focus_gained, window_focus_gains,
+    on_window_focus_gained, wake_host_maintenance, window_focus_gains,
 };
 #[cfg(any(test, debug_assertions))]
 pub use workstation_setup::{drive_initial_setup_answer_for_test, gain_window_focus_for_test};
@@ -3393,6 +3395,8 @@ enum Wake {
         drained: app_account_work::Settlement,
     },
     MailChanged,
+    #[cfg(all(unix, not(test)))]
+    NetworkPlaceChanged,
     #[cfg(target_os = "macos")]
     AllocationMonitorChanged,
     HeldAgentMessages(Vec<aterm_messages::Message>),
@@ -3451,6 +3455,8 @@ enum Wake {
         session: u64,
     },
     CrashJournalOwed,
+    /// A host-owned setup observer ended; its maintenance reaps it before parking.
+    HostMaintenance,
     InputWatch {
         session: u64,
     },
@@ -10568,6 +10574,15 @@ struct App {
     person_look: Option<WindowId>,
     siblings: Vec<status_item::SiblingInstance>,
     fleet_glance: Option<fleet_glance::FleetGlance>,
+    /// The Network State band's Fleet Field as last projected from the glance's slot
+    /// ([`App::reproject_fleet_field`]); `None` with no glance or no fleet, where the band draws
+    /// the observer's peers.
+    fleet_field: Option<Arc<network_deck::field::Field>>,
+    /// What the field was projected from: the glance's generation, error and fleet flags, and
+    /// the observer words it leads with.
+    fleet_field_gen: Option<((u16, bool, bool), u64)>,
+    /// The next freshness edge (unix ms) at which the field projects again without a read.
+    fleet_field_due: Option<u64>,
     fleet_heralded: std::collections::HashMap<u64, (String, aterm_types::needs::NeedWord)>,
     status_carry: std::collections::HashMap<String, status_item::StatusCarry>,
     end_carry: std::collections::HashMap<String, harness_end_carry::EndCarry>,
@@ -15625,6 +15640,9 @@ impl App {
             person_look: None,
             siblings: Vec::new(),
             fleet_glance: None,
+            fleet_field: None,
+            fleet_field_gen: None,
+            fleet_field_due: None,
             fleet_heralded: std::collections::HashMap::new(),
             status_carry: std::collections::HashMap::new(),
             end_carry: std::collections::HashMap::new(),
@@ -19494,6 +19512,8 @@ impl App {
             }
             Wake::AccountMenuRead(completion) => self.on_account_menu_read(completion),
             Wake::MailChanged => self.on_mail_changed(),
+            #[cfg(all(unix, not(test)))]
+            Wake::NetworkPlaceChanged => self.follow_network_place(),
             #[cfg(target_os = "macos")]
             Wake::AllocationMonitorChanged => self.publish_allocation(),
             Wake::SessionLogMoved { session } => {
@@ -19507,7 +19527,7 @@ impl App {
             }
             Wake::MetaChanged { session } => self.on_meta_changed(session),
             Wake::TaskChanged { session } => self.on_task_changed(session),
-            Wake::CrashJournalOwed => {}
+            Wake::CrashJournalOwed | Wake::HostMaintenance => {}
             Wake::LeaseChanged { session } => self.on_presence_wake(&session),
             Wake::FabricChanged { session } => self.on_fabric_changed(&session),
             Wake::Typed { session } => self.on_typed(&session),
@@ -24207,6 +24227,11 @@ mod headless_pkg_lane_tests {
             &scratch
         ));
         let out = scratch.join("out");
+        #[cfg(windows)]
+        aterm_uds::host::could_not_run_under_redirection_guard(
+            "the test makes a link leading out of the scratch home (a junction, atpkg's link on \
+             Windows) and reads where it leads",
+        );
         atpkg::platform::atomic_symlink(&real, &out).expect("a link leading out");
         assert!(!store_is_under(&pkg(&out), &scratch));
         assert!(!store_is_under(&pkg(&scratch), &dir.path().join("missing")));
@@ -26147,7 +26172,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         clippy::disallowed_methods,
         reason = "compatibility entry delegates to the same window door"
     )]
-    main_entry_with_network(argv, first_run, None);
+    main_entry_with_network(argv, first_run, None, None);
 }
 
 /// A nonblocking read of a host-owned immutable network/service snapshot.
@@ -26155,11 +26180,16 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
 pub type NetworkSnapshotSource =
     Arc<dyn Fn() -> Option<Arc<aterm_types::network_state::NetworkStateSnapshot>> + Send + Sync>;
 
+/// A host-owned worker's nonblocking maintenance. A deadline is returned only
+/// while its next start is owed; a live worker wakes the window when it ends.
+pub type HostMaintenance = Box<dyn FnMut() -> Option<Instant> + Send>;
+
 /// Window entry with an injected network observer; no provider runs in painting.
 pub fn main_entry_with_network(
     argv: Vec<std::ffi::OsString>,
     first_run: Option<fn() -> bool>,
     network_source: Option<NetworkSnapshotSource>,
+    maintenance: Option<HostMaintenance>,
 ) {
     metrics::mark_process_start();
     #[cfg(target_os = "macos")]
@@ -27247,7 +27277,7 @@ pub fn main_entry_with_network(
 
     if !headless && aterm_update::enabled() {
         aterm_update::set_required_team_id(crate::app_config::update_required_team_id(&config));
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         crate::network_moved::observe_for_updater();
         let health_proxy = event_loop.create_proxy();
         let staged_proxy = event_loop.create_proxy();
@@ -27962,7 +27992,8 @@ pub fn main_entry_with_network(
             first_run.filter(|_| first_run_eligible),
             headless,
             developer_tools_shim,
-        ),
+        )
+        .with_maintenance(if headless { None } else { maintenance }),
         system_state_host: system_state_host::Host::for_launch(headless),
         apprt,
         system_reduce_motion: native_appearance::dev_accessibility().reduce_motion,
@@ -28322,6 +28353,9 @@ pub fn main_entry_with_network(
         person_look: None,
         siblings: Vec::new(),
         fleet_glance: None,
+        fleet_field: None,
+        fleet_field_gen: None,
+        fleet_field_due: None,
         fleet_heralded: std::collections::HashMap::new(),
         status_carry: seamless_status_seen
             .iter()
@@ -28684,6 +28718,8 @@ pub fn main_entry_with_network(
         .run_app(&mut app)
         .err()
         .map(|error| event_loop_failed(&mut app, &error));
+    #[cfg(all(unix, not(test)))]
+    crate::net_place::stop();
     crate::watchdog::beat(crate::watchdog::Breadcrumb::ShutdownWait);
     // The permission helper's panel is aterm's own window, not winit's, so winit's exit close
     // leaves it: it goes with the terminal windows, before the shutdown waits (macOS's Quit &

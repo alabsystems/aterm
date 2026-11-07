@@ -213,6 +213,10 @@ aterm-update = { workspace = true }
 # a new edge in the shipped graph — aterm-gui already links it — and unix-only,
 # as the key file's reader is.
 aterm-net = { workspace = true }
+# `aterm fleet`'s view (`fleet_view`, one-mesh §4.12, B9): the node service's per-seat view of
+# presence and each seat's needs row, asked over its local socket. Not a new edge in the shipped
+# graph (aterm and aterm-gui link it); unix-only, as the crate is.
+aterm-mesh = { workspace = true }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }

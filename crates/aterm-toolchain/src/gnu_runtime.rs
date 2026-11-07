@@ -40,6 +40,64 @@ impl std::fmt::Display for Version {
     }
 }
 
+/// Why a runtime input was not admitted. A refusal is a verdict on what was read: the root's
+/// type, the tree's size or bytes read whole; an input this process could not read is no verdict
+/// either way, and a caller keeps the two apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unadmitted {
+    /// Read and refused: a root that is a link or no directory, another machine, a newer GNU
+    /// libc, or ELF metadata that is malformed, ambiguous or unrecognized.
+    Refused(String),
+    /// Not judged: an I/O error, a special file below the root, an input that changed while it
+    /// was read, or a tree of more than [`ENTRY_BOUND`] entries (the inspector's own limit, no
+    /// verdict on the tree).
+    CannotJudge(String),
+}
+
+impl Unadmitted {
+    /// True for a verdict that the input does not fit the host.
+    #[must_use]
+    pub const fn is_refusal(&self) -> bool {
+        matches!(self, Self::Refused(_))
+    }
+
+    fn cannot_judge(why: impl std::fmt::Display) -> Self {
+        Self::CannotJudge(why.to_string())
+    }
+
+    /// The same answer, naming the file it is about.
+    fn at(self, path: &Path) -> Self {
+        match self {
+            Self::Refused(why) => Self::Refused(format!("{}: {why}", path.display())),
+            Self::CannotJudge(why) => Self::CannotJudge(format!("{}: {why}", path.display())),
+        }
+    }
+}
+
+impl std::fmt::Display for Unadmitted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(why) | Self::CannotJudge(why) => f.write_str(why),
+        }
+    }
+}
+
+impl std::error::Error for Unadmitted {}
+
+/// A bare message is a refusal: the metadata was read and does not fit.
+impl From<&str> for Unadmitted {
+    fn from(why: &str) -> Self {
+        Self::Refused(why.to_owned())
+    }
+}
+
+/// A bare message is a refusal: the metadata was read and does not fit.
+impl From<String> for Unadmitted {
+    fn from(why: String) -> Self {
+        Self::Refused(why)
+    }
+}
+
 /// The native GNU host whose runtime a ready build must be able to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Host {
@@ -127,7 +185,7 @@ struct Reader<'a, R> {
 }
 
 impl<R: Read + Seek> Reader<'_, R> {
-    fn bytes(&mut self, at: u64, count: usize) -> Result<Vec<u8>, String> {
+    fn bytes(&mut self, at: u64, count: usize) -> Result<Vec<u8>, Unadmitted> {
         if at
             .checked_add(count as u64)
             .is_none_or(|end| end > self.size)
@@ -137,10 +195,10 @@ impl<R: Read + Seek> Reader<'_, R> {
         let mut bytes = vec![0; count];
         self.input
             .seek(SeekFrom::Start(at))
-            .map_err(|_| "cannot seek ELF metadata")?;
+            .map_err(|_| Unadmitted::cannot_judge("cannot seek ELF metadata"))?;
         self.input
             .read_exact(&mut bytes)
-            .map_err(|_| "cannot read complete ELF metadata")?;
+            .map_err(|_| Unadmitted::cannot_judge("cannot read complete ELF metadata"))?;
         Ok(bytes)
     }
 }
@@ -220,8 +278,12 @@ fn unique(slot: &mut Option<u64>, value: u64) -> Result<(), String> {
 /// Runtime ELF64 little-endian objects are read through PT_DYNAMIC, including without sections.
 ///
 /// # Errors
-/// A runtime ELF has malformed, ambiguous, oversized or unrecognized requirement metadata.
-pub fn inspect(input: &mut (impl Read + Seek), size: u64) -> Result<Option<Requirements>, String> {
+/// [`Unadmitted::Refused`]: a runtime ELF has malformed, ambiguous, oversized or unrecognized
+/// requirement metadata. [`Unadmitted::CannotJudge`]: the input cannot be sought or read.
+pub fn inspect(
+    input: &mut (impl Read + Seek),
+    size: u64,
+) -> Result<Option<Requirements>, Unadmitted> {
     let mut reader = Reader { input, size };
     if size < 4 || reader.bytes(0, 4)? != b"\x7fELF" {
         return Ok(None);
@@ -421,94 +483,173 @@ pub struct Tree {
 /// This is publication inspection, not permission to write a host's ready marker.
 ///
 /// # Errors
-/// The tree or an ELF file cannot be read consistently, has another machine, or is malformed.
-pub fn inspect_tree(root: &Path, machine: u16) -> Result<Tree, String> {
-    let before = walk(root)?;
-    let tree = inspect_files(&before.files, machine)?;
-    if walk(root)?.digest != before.digest {
-        return Err("runtime tree changed while reading".into());
+/// [`Unadmitted::Refused`]: the root is a link or no directory, or an ELF file has another
+/// machine or is malformed. [`Unadmitted::CannotJudge`]: the tree or a file in it cannot be read
+/// consistently, or the tree holds more than [`ENTRY_BOUND`] entries.
+pub fn inspect_tree(root: &Path, machine: u16) -> Result<Tree, Unadmitted> {
+    let before = walk(root, &LIMITS)?;
+    let (tree, unjudged) = inspect_files(&before.files, machine)?;
+    if let Some(why) = before.unjudged.or(unjudged) {
+        return Err(why);
+    }
+    if walk(root, &LIMITS)?.digest != before.digest {
+        return Err(Unadmitted::cannot_judge(
+            "runtime tree changed while reading",
+        ));
     }
     Ok(tree)
 }
 
-fn inspect_files(files: &[PathBuf], machine: u16) -> Result<Tree, String> {
+/// Inspect every file, reading on past one it cannot judge so a refusal anywhere still wins.
+/// The first file not judged comes back beside the tree of those that were.
+fn inspect_files(
+    files: &[PathBuf],
+    machine: u16,
+) -> Result<(Tree, Option<Unadmitted>), Unadmitted> {
     let mut tree = Tree::default();
+    let mut unjudged = None;
     for path in files {
-        if let Some(required) = inspect_file(path)? {
-            if required.machine != machine {
-                return Err(format!(
-                    "{} is for another ELF architecture",
-                    path.display()
-                ));
+        let required = match inspect_file(path) {
+            Ok(Some(required)) => required,
+            Ok(None) => continue,
+            Err(why @ Unadmitted::CannotJudge(_)) => {
+                unjudged.get_or_insert(why);
+                continue;
             }
-            tree.objects += 1;
-            tree.glibc = match (tree.glibc, required.glibc) {
-                (Some(old), Some(new)) => Some(old.max(new)),
-                (old, new) => old.or(new),
-            };
+            Err(refused) => return Err(refused),
+        };
+        if required.machine != machine {
+            return Err(Unadmitted::Refused(format!(
+                "{} is for another ELF architecture",
+                path.display()
+            )));
         }
+        tree.objects += 1;
+        tree.glibc = match (tree.glibc, required.glibc) {
+            (Some(old), Some(new)) => Some(old.max(new)),
+            (old, new) => old.or(new),
+        };
     }
-    Ok(tree)
+    Ok((tree, unjudged))
 }
 
 struct Walk {
     files: Vec<PathBuf>,
     digest: [u8; 32],
     settled: bool,
+    /// The first entry below the root the walk could not judge; it walks on past it.
+    unjudged: Option<Unadmitted>,
 }
 
-fn walk(root: &Path) -> Result<Walk, String> {
-    use crate::stat_digest::{StatDigest, StatKey};
-    let begun = std::time::SystemTime::now()
+/// The most entries a runtime tree is read to, its root included; a larger tree is not judged.
+pub const ENTRY_BOUND: u64 = 4_000_000;
+
+/// What a walk is held to: the most entries it reads, and the wall clock, in nanoseconds since
+/// the Unix epoch (none when it cannot be read), that says whether what it read has settled.
+#[derive(Clone, Copy)]
+struct Limits {
+    entries: u64,
+    now: fn() -> Option<i128>,
+}
+
+const LIMITS: Limits = Limits {
+    entries: ENTRY_BOUND,
+    now: wall_clock_ns,
+};
+
+fn wall_clock_ns() -> Option<i128> {
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| "runtime status clock is before the Unix epoch")?;
-    let begun = i128::try_from(begun.as_nanos()).map_err(|_| "runtime status clock overflow")?;
+        .ok()?;
+    i128::try_from(now.as_nanos()).ok()
+}
+
+/// Read the tree at `root`, a directory, following no link. A root that is a link or no
+/// directory is a refusal, and a tree of more than `limits.entries` entries is not judged: the
+/// walk answers both itself, so no recalled admission answers for them. An entry below the root
+/// that it cannot read, or that is special, is not judged, and the walk reads on past it.
+fn walk(root: &Path, limits: &Limits) -> Result<Walk, Unadmitted> {
+    use crate::stat_digest::{StatDigest, StatKey};
+    let begun = (limits.now)();
     let mut digest = StatDigest::new(root.as_os_str().as_encoded_bytes());
     let mut files = Vec::new();
-    let mut pending = vec![root.to_owned()];
+    let mut pending = vec![(root.to_owned(), PathBuf::new())];
     let mut count = 0_u64;
-    while let Some(path) = pending.pop() {
-        count += 1;
-        if count > 4_000_000 {
-            return Err("runtime inspection has too many entries".into());
+    let mut unjudged = None;
+    let mut skip = |path: &Path, why: &dyn std::fmt::Display| {
+        if path == root {
+            return Err(Unadmitted::cannot_judge(why));
         }
-        let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|_| "runtime path escaped its root")?;
+        unjudged.get_or_insert_with(|| Unadmitted::cannot_judge(why).at(path));
+        Ok(())
+    };
+    while let Some((path, relative)) = pending.pop() {
+        count += 1;
+        if count > limits.entries {
+            return Err(Unadmitted::cannot_judge(format_args!(
+                "runtime inspection has more than {} entries",
+                limits.entries
+            )));
+        }
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) => {
+                skip(&path, &e)?;
+                continue;
+            }
+        };
+        if path == root && !meta.is_dir() {
+            return Err(Unadmitted::Refused(
+                if meta.file_type().is_symlink() {
+                    "runtime inspection root is a symlink"
+                } else {
+                    "runtime inspection root is no directory"
+                }
+                .into(),
+            ));
+        }
         digest.entry(relative.as_os_str().as_encoded_bytes(), &StatKey::of(&meta));
         if meta.file_type().is_symlink() {
-            if path == root {
-                return Err("runtime inspection root is a symlink".into());
+            match std::fs::read_link(&path) {
+                Ok(target) => digest.link(target.as_os_str().as_encoded_bytes(), None),
+                Err(e) => skip(&path, &e)?,
             }
-            let target = std::fs::read_link(&path).map_err(|e| e.to_string())?;
-            digest.link(target.as_os_str().as_encoded_bytes(), None);
         } else if meta.is_dir() {
-            let mut names = std::fs::read_dir(&path)
-                .map_err(|e| e.to_string())?
-                .map(|entry| entry.map(|entry| entry.file_name()))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?;
-            names.sort();
-            digest.names(names.iter().map(|name| name.as_encoded_bytes()));
-            pending.extend(names.into_iter().rev().map(|name| path.join(name)));
-        } else if meta.is_file() {
-            if path == root {
-                return Err("runtime inspection root is no directory".into());
+            let names = std::fs::read_dir(&path).and_then(|entries| {
+                entries
+                    .map(|entry| entry.map(|entry| entry.file_name()))
+                    .collect::<Result<Vec<_>, _>>()
+            });
+            match names {
+                Ok(mut names) => {
+                    names.sort();
+                    digest.names(names.iter().map(|name| name.as_encoded_bytes()));
+                    pending.extend(
+                        names
+                            .into_iter()
+                            .rev()
+                            .map(|name| (path.join(&name), relative.join(name))),
+                    );
+                }
+                Err(e) => skip(&path, &e)?,
             }
+        } else if meta.is_file() {
             files.push(path);
         } else {
-            return Err("runtime tree contains a special file".into());
+            skip(&path, &"runtime tree contains a special file")?;
         }
     }
     let settled = cfg!(unix)
-        && digest
-            .newest_change_ns()
-            .is_some_and(|newest| begun.saturating_sub(newest) >= crate::stat_digest::SETTLE_NS);
+        && begun
+            .zip(digest.newest_change_ns())
+            .is_some_and(|(begun, newest)| {
+                begun.saturating_sub(newest) >= crate::stat_digest::SETTLE_NS
+            });
     Ok(Walk {
         files,
         digest: digest.finish().0,
         settled,
+        unjudged,
     })
 }
 
@@ -527,7 +668,7 @@ fn admissions() -> &'static std::sync::Mutex<Vec<Cached>> {
     CACHE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
-fn inspect_file(path: &Path) -> Result<Option<Requirements>, String> {
+fn inspect_file(path: &Path) -> Result<Option<Requirements>, Unadmitted> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -537,23 +678,26 @@ fn inspect_file(path: &Path) -> Result<Option<Requirements>, String> {
     }
     let file = options
         .open(path)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    inspect_open_file(&file).map_err(|why| format!("{}: {why}", path.display()))
+        .map_err(|e| Unadmitted::cannot_judge(e).at(path))?;
+    inspect_open_file(&file).map_err(|why| why.at(path))
 }
 
-fn inspect_open_file(file: &std::fs::File) -> Result<Option<Requirements>, String> {
-    let before = file.metadata().map_err(|e| e.to_string())?;
+/// A refusal of bytes that changed while they were read is no verdict: the change is the answer.
+fn inspect_open_file(file: &std::fs::File) -> Result<Option<Requirements>, Unadmitted> {
+    let before = file.metadata().map_err(Unadmitted::cannot_judge)?;
     if !before.is_file() {
-        return Err("runtime input is no regular file".into());
+        return Err(Unadmitted::cannot_judge("runtime input is no regular file"));
     }
     let mut input = Positioned { file, at: 0 };
-    let inspected = inspect(&mut input, before.len())?;
-    let after = file.metadata().map_err(|e| e.to_string())?;
+    let inspected = inspect(&mut input, before.len());
+    let after = file.metadata().map_err(Unadmitted::cannot_judge)?;
     if !crate::stat_digest::StatKey::of(&before).unchanged(&crate::stat_digest::StatKey::of(&after))
     {
-        return Err("runtime input changed while reading".into());
+        return Err(Unadmitted::cannot_judge(
+            "runtime input changed while reading",
+        ));
     }
-    Ok(inspected)
+    inspected
 }
 
 struct Positioned<'a> {
@@ -604,7 +748,7 @@ impl Seek for Positioned<'_> {
 ///
 /// # Errors
 /// [`inspect`]'s failures, a changing file, a different machine or a newer GNU libc.
-pub fn admit_open_file(file: &std::fs::File, host: Host) -> Result<(), String> {
+pub fn admit_open_file(file: &std::fs::File, host: Host) -> Result<(), Unadmitted> {
     if let Some(required) = inspect_open_file(file)? {
         required.admit(host)?;
     }
@@ -612,7 +756,8 @@ pub fn admit_open_file(file: &std::fs::File, host: Host) -> Result<(), String> {
 }
 
 /// Admit a package tree to this GNU host; other runtimes have no GNU libc requirement.
-/// No executable or dynamic loader is started.
+/// No executable or dynamic loader is started. Any failure refuses here, judged or not;
+/// [`admit_tree_on`] keeps the two apart.
 ///
 /// # Errors
 /// An ELF requirement is unavailable, malformed, for another machine, or newer than this host.
@@ -620,16 +765,25 @@ pub fn admit_tree(root: &Path) -> Result<(), String> {
     let Some(host) = host()? else {
         return Ok(());
     };
-    admit_tree_on(root, host)
+    admit_tree_on(root, host).map_err(|why| why.to_string())
 }
 
-/// The same admission for an explicitly observed GNU host, also used by inert fixtures.
+/// The same admission for an explicitly observed GNU host, also used by inert fixtures. A tree
+/// is read whole before it answers, so a refusal anywhere in it outranks an entry it cannot read.
 ///
 /// # Errors
-/// [`admit_tree`]'s failures for the supplied host.
-pub fn admit_tree_on(root: &Path, host: Host) -> Result<(), String> {
-    let before = walk(root)?;
+/// [`Unadmitted::Refused`]: the root is a link or no directory, or an ELF requirement is
+/// malformed, for another machine, or newer than `host`. [`Unadmitted::CannotJudge`]: an entry
+/// cannot be read or is special, the tree changed while it was read, or it holds more than
+/// [`ENTRY_BOUND`] entries.
+pub fn admit_tree_on(root: &Path, host: Host) -> Result<(), Unadmitted> {
+    admit_tree_within(root, host, &LIMITS)
+}
+
+fn admit_tree_within(root: &Path, host: Host, limits: &Limits) -> Result<(), Unadmitted> {
+    let before = walk(root, limits)?;
     if before.settled
+        && before.unjudged.is_none()
         && admissions()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -640,16 +794,21 @@ pub fn admit_tree_on(root: &Path, host: Host) -> Result<(), String> {
     {
         return Ok(());
     }
-    let tree = inspect_files(&before.files, host.machine)?;
+    let (tree, unjudged) = inspect_files(&before.files, host.machine)?;
     if let Some(required) = tree.glibc.filter(|required| *required > host.glibc) {
-        return Err(format!(
+        return Err(Unadmitted::Refused(format!(
             "requires GNU libc {required}; this host has {}",
             host.glibc
-        ));
+        )));
     }
-    let after = walk(root)?;
+    if let Some(why) = before.unjudged.or(unjudged) {
+        return Err(why);
+    }
+    let after = walk(root, limits)?;
     if after.digest != before.digest {
-        return Err("runtime tree changed while reading".into());
+        return Err(Unadmitted::cannot_judge(
+            "runtime tree changed while reading",
+        ));
     }
     if before.settled && after.settled {
         let mut cache = admissions()
@@ -729,7 +888,7 @@ mod tests {
         put32(&mut bytes, 664, 11);
         bytes
     }
-    fn parsed(bytes: &[u8]) -> Result<Option<Requirements>, String> {
+    fn parsed(bytes: &[u8]) -> Result<Option<Requirements>, Unadmitted> {
         inspect(&mut Cursor::new(bytes), bytes.len() as u64)
     }
     fn host(version: &str) -> Host {
@@ -883,6 +1042,134 @@ mod tests {
             file.stream_position().unwrap(),
             5,
             "inspection preserves the retained descriptor's cursor"
+        );
+    }
+
+    /// NEGATIVE CONTROL: stop `walk` or `inspect_files` at the first entry it cannot judge and
+    /// the refusals behind it read as no verdict.
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_it_cannot_read_is_no_verdict_and_never_hides_a_refusal() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let unjudged = |judged: Result<(), Unadmitted>, what: &str| {
+            assert!(
+                matches!(&judged, Err(Unadmitted::CannotJudge(why)) if why.contains(what)),
+                "{judged:?}"
+            );
+        };
+        let refused = |judged: Result<(), Unadmitted>| {
+            assert!(matches!(judged, Err(Unadmitted::Refused(_))), "{judged:?}");
+        };
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let root = scratch.path();
+        std::fs::create_dir(root.join("lib")).unwrap();
+        std::fs::write(root.join("lib/runtime.so"), dynamic("GLIBC_2.39")).unwrap();
+        let fifo = root.join("a-pipe");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c_fifo` is a valid NUL-terminated path in our scratch directory.
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        unjudged(admit_tree_on(root, host("2.39")), "special file");
+        refused(admit_tree_on(root, host("2.35")));
+        refused(admit_tree_on(
+            root,
+            Host {
+                machine: 183,
+                ..host("2.39")
+            },
+        ));
+        assert!(!inspect_tree(root, 62).unwrap_err().is_refusal());
+        std::fs::remove_file(&fifo).unwrap();
+        assert_eq!(admit_tree_on(root, host("2.39")), Ok(()));
+        // SAFETY: geteuid reads this process's effective uid and has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads a mode-0 file and folder alike.
+        }
+        let sealed = root.join("lib/a-sealed.so");
+        std::fs::write(&sealed, dynamic("GLIBC_2.17")).unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        unjudged(admit_tree_on(root, host("2.39")), "a-sealed.so");
+        refused(admit_tree_on(root, host("2.35")));
+        std::fs::remove_file(&sealed).unwrap();
+        let shut = root.join("a-shut");
+        std::fs::create_dir(&shut).unwrap();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+        unjudged(admit_tree_on(root, host("2.39")), "a-shut");
+        refused(admit_tree_on(root, host("2.35")));
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(admit_tree_on(root, host("2.39")), Ok(()));
+    }
+
+    /// A root that is a link or no directory is a refusal, a verdict on what the walk read, and
+    /// a tree past the entry bound is not judged, the inspector's own limit and no verdict (a
+    /// marked build's completion stands on its marker there, and is never swept for it); no
+    /// recalled admission answers for either. CONTROL: the same tree at its own folder, within
+    /// the bound, is admitted, settled and recalled. NEGATIVE CONTROL: class a root
+    /// [`Unadmitted::CannotJudge`] and its `refused` fails, or the bound a refusal and its
+    /// `unjudged` does.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_is_no_folder_is_refused_and_a_tree_past_the_bound_is_not_judged() {
+        let refused = |judged: Result<(), Unadmitted>, what: &str| {
+            assert!(
+                matches!(&judged, Err(Unadmitted::Refused(why)) if why.contains(what)),
+                "{judged:?}"
+            );
+        };
+        let unjudged = |judged: Result<(), Unadmitted>, what: &str| {
+            assert!(
+                matches!(&judged, Err(Unadmitted::CannotJudge(why)) if why.contains(what)),
+                "{judged:?}"
+            );
+        };
+        // A clock long past every status the walk records: each read has settled.
+        let settled = Limits {
+            now: || Some(i128::MAX / 2),
+            ..LIMITS
+        };
+        let recalled = |root: &Path| {
+            admissions()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|cached| cached.root == root)
+        };
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let build = scratch.path().join("build");
+        std::fs::create_dir_all(build.join("lib")).unwrap();
+        std::fs::write(build.join("lib/runtime.so"), dynamic("GLIBC_2.17")).unwrap();
+        assert_eq!(admit_tree_within(&build, host("2.39"), &settled), Ok(()));
+        assert!(recalled(&build), "a settled admission is recalled");
+        let aside = scratch.path().join("aside");
+        std::fs::rename(&build, &aside).unwrap();
+        std::os::unix::fs::symlink(&aside, &build).unwrap();
+        refused(admit_tree_within(&build, host("2.39"), &settled), "symlink");
+        refused(admit_tree_on(&build, host("2.39")), "symlink");
+        assert!(inspect_tree(&build, 62).unwrap_err().is_refusal());
+        assert_eq!(admit_tree_on(&aside, host("2.39")), Ok(()));
+        std::fs::remove_file(&build).unwrap();
+        std::fs::write(&build, dynamic("GLIBC_2.17")).unwrap();
+        refused(admit_tree_on(&build, host("2.39")), "no directory");
+        assert!(inspect_tree(&build, 62).unwrap_err().is_refusal());
+        std::fs::remove_file(&build).unwrap();
+        let c_fifo = std::ffi::CString::new(build.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c_fifo` is a valid NUL-terminated path in our scratch directory.
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        refused(admit_tree_on(&build, host("2.39")), "no directory");
+        // `aside`, `lib` and `lib/runtime.so`: three entries.
+        assert_eq!(admit_tree_within(&aside, host("2.39"), &settled), Ok(()));
+        assert!(recalled(&aside));
+        let bounded = Limits {
+            entries: 3,
+            ..settled
+        };
+        assert_eq!(admit_tree_within(&aside, host("2.39"), &bounded), Ok(()));
+        let bounded = Limits {
+            entries: 2,
+            ..settled
+        };
+        unjudged(
+            admit_tree_within(&aside, host("2.39"), &bounded),
+            "more than 2 entries",
         );
     }
 }

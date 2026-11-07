@@ -3,8 +3,8 @@
 // Copyright 2026 Andrew Yates
 //
 // GLSL ES 3.00 twin of renderer.rs BLOOM_SHADER and shaders/bloom.metal: the
-// cursor-comet bloom composite, a 25-tap gaussian over the half-res comet
-// target with two radii (white part and chroma). Compiled per stage by src/gl
+// cursor-comet bloom composite, a 25- or 49-tap gaussian over the half-res
+// comet target with two radii (white part and chroma). Compiled per stage by src/gl
 // as shaders/cell.glsl describes. Bindings: `BloomU` is `aterm_b2`, the
 // half-res source `aterm_t0`.
 precision highp float;
@@ -108,17 +108,23 @@ float letter_mask(vec2 p) {
     return m;
 }
 
-// One 25-tap kernel, two radii: the white part spreads at `radius`, the chroma
-// at the shorter `chroma_radius`, summed back into one halo.
+// One kernel, two radii: the white part spreads at `radius`, the chroma at the
+// shorter `chroma_radius`, summed back into one halo. 25 taps to a radius of 6,
+// 49 past it.
 void fs_bloom() {
     float white = 0.0;
     vec3 chroma = vec3(0.0, 0.0, 0.0);
     float wsum = 0.0;
-    for (int j = -2; j <= 2; j = j + 1) {
-        for (int i = -2; i <= 2; i = i + 1) {
-            vec2 tap = vec2(float(i), float(j)) * bu_texel;
+    // `taps_per_side` (aterm-render's bloom.rs): two taps a side to a radius of 6, three
+    // past it, so no two taps stand wider apart than 6 texels.
+    int n = clamp(int(ceil(bu_radius / 3.0)), 2, 3);
+    float step = 2.0 / float(n);
+    float spread = float(n * n);
+    for (int j = -n; j <= n; j = j + 1) {
+        for (int i = -n; i <= n; i = i + 1) {
+            vec2 tap = vec2(float(i), float(j)) * step * bu_texel;
             float d2 = float(i * i + j * j);
-            float w = exp(-d2 / 4.0);
+            float w = exp(-d2 / spread);
             vec3 sw = half_rgb(v_uv + tap * bu_radius);
             white = white + white_part(sw) * w;
             vec3 sc = half_rgb(v_uv + tap * bu_chroma_radius);

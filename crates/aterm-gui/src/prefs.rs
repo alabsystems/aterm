@@ -664,7 +664,7 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
         key: EDIT_HARNESS_QUESTION_PRIORITY,
         label: "Question priority",
         kind: EditKind::Enum {
-            options: &aterm_agent::supervise::QuestionPriority::WORDS,
+            options: &aterm_agent::supervise::PriorityWord::WORDS,
         },
     },
     NestedLeaf {
@@ -2718,7 +2718,7 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
         EDIT_HARNESS_QUESTION_PRIORITY => {
             let word = cfg.harness.policy.question_priority;
             (
-                (word != aterm_agent::supervise::QuestionPriority::Recommended)
+                (word != aterm_agent::supervise::PriorityWord::Recommended)
                     .then(|| word.word().to_string()),
                 "recommended (default)".to_string(),
             )
@@ -3161,7 +3161,11 @@ fn permission_note(key: &str) -> Option<&'static str> {
             }
         }
         EDIT_ALLOW_NOTIFICATIONS => {
-            "Off, a program's notifications are dropped; aterm's own alerts still show."
+            if cfg!(target_os = "macos") {
+                "Off, a program's notifications are dropped. Turning this on asks macOS to allow them."
+            } else {
+                "Off, a program's notifications are dropped."
+            }
         }
         EDIT_ALLOW_PALETTE_RECONFIGURE => {
             "A program's colors last for its session and are never saved; off refuses them."
@@ -6214,7 +6218,7 @@ mod edit_tests {
     #[test]
     fn the_harness_rows_round_trip_through_set_and_unset() {
         use aterm_agent::supervise::config::Approve;
-        use aterm_agent::supervise::{Autopilot, QuestionPriority, SupervisorConfig};
+        use aterm_agent::supervise::{Autopilot, PriorityWord, SupervisorConfig};
         let seed = |cfg: &Config, key: &str| {
             editable_fields(cfg)
                 .into_iter()
@@ -6256,7 +6260,7 @@ mod edit_tests {
                 None,
                 "Short-Term",
                 "short-term",
-                |p| p.question_priority == QuestionPriority::ShortTerm && p.answer_questions,
+                |p| p.question_priority == PriorityWord::ShortTerm && p.answer_questions,
             ),
         ];
         for (key, absent, typed, stored, took) in rows {

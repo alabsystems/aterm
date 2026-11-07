@@ -473,10 +473,8 @@ fn zshenv_checks_allow_clear_links_and_refuse_unknown_or_nonregular_paths() {
 #[cfg(unix)]
 #[test]
 fn zsh_reports_the_zdotdir_its_zshenv_sets() {
-    let zsh = Path::new("/bin/zsh");
-    if !zsh.is_file() {
-        aterm_uds::host::could_not_run("no /bin/zsh to run");
-    }
+    let zsh = aterm_uds::host::need_tool("zsh");
+    let zsh = zsh.as_path();
     let scratch = crate::testdir::dir("atpkg-zdotdir-zsh-");
     let home = scratch.as_path();
     std::fs::write(
@@ -528,10 +526,8 @@ fn zsh_answers_preserve_path_bytes_when_wiring_the_rc() {
     use crate::hooks::{RcHome, RcOutcome, RcWiring, ensure_rc_sources_hooks};
     use std::os::unix::ffi::OsStringExt as _;
 
-    let zsh = Path::new("/bin/zsh");
-    if !zsh.is_file() {
-        aterm_uds::host::could_not_run("no /bin/zsh to run");
-    }
+    let zsh = aterm_uds::host::need_tool("zsh");
+    let zsh = zsh.as_path();
     let scratch = crate::testdir::dir("atpkg-zdotdir-bytes-");
     let cases: [(&str, &[u8], &[u8], &str); 5] = [
         ("ordinary", b"dots", b"wrong-dots", "'dots'"),
@@ -606,10 +602,8 @@ fn zsh_answers_preserve_path_bytes_when_wiring_the_rc() {
 fn zsh_answers_refuse_embedded_nul_before_wiring_an_rc() {
     use crate::hooks::{RcHome, RcWiring, ensure_rc_sources_hooks};
 
-    let zsh = Path::new("/bin/zsh");
-    if !zsh.is_file() {
-        aterm_uds::host::could_not_run("no /bin/zsh to run");
-    }
+    let zsh = aterm_uds::host::need_tool("zsh");
+    let zsh = zsh.as_path();
     let home = crate::testdir::dir("atpkg-zdotdir-nul-");
     let prefix = home.join("dots");
     std::fs::create_dir(&prefix).unwrap();

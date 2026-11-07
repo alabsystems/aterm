@@ -20,7 +20,10 @@ pub const USAGE: &str =
                 ATERM_RELEASE_CUTTER (the running release's) when set, else one built
                 in a throwaway worktree of it. Exit 0 yes, 1 a gate refuses (named),
                 2 it could not be asked, 3 a gate could not run; any other code is the
-                cutter's own (its failed build's, or 128+N for signal N)
+                cutter's own (its failed build's, or 128+N for signal N). Under a
+                release's step 7 (ATERM_RELEASE_PUBLISH_GATE set), a pass then takes the
+                release's gate: 1 when its private sign went red first, 2 when the gate
+                cannot be taken; nothing is pushed then
   post-promote  `ship site`; its promote-time run (PUB_STAGING_COMMIT set, no --latest)
                 does nothing
   transforms    rewrite the export at EXPORT by CAPTURED_COMMIT's own rules (default
@@ -121,6 +124,9 @@ pub struct PrePromote {
     pub target: Option<PathBuf>,
     /// `ATERM_RELEASE_CUTTER`.
     pub cutter: Option<PathBuf>,
+    /// `ATERM_RELEASE_PUBLISH_GATE`: step 7's gate ([`crate::release::PublishGate`]), which a
+    /// check that passed must take before the engine pushes.
+    pub gate: Option<PathBuf>,
     /// Environment for every git child (a test isolates git from this machine's).
     pub git_env: Vec<(String, String)>,
 }
@@ -135,6 +141,7 @@ impl PrePromote {
             version: var("PUB_VERSION"),
             target: var("CARGO_TARGET_DIR").map(PathBuf::from),
             cutter: var(crate::release_steps::RELEASE_CUTTER_ENV).map(PathBuf::from),
+            gate: var(crate::release::PUBLISH_GATE_ENV).map(PathBuf::from),
             git_env: Vec::new(),
         }
     }
@@ -422,7 +429,7 @@ pub fn pre_promote(
             },
             &full,
         ) {
-            Ok(code) => code,
+            Ok(code) => gated(facts, code, out, err),
             Err(e) => refuse(e),
         };
     }
@@ -450,8 +457,45 @@ pub fn pre_promote(
         },
         &full,
     ) {
-        Ok(code) => code,
+        Ok(code) => gated(facts, code, out, err),
         Err(e) => refuse(e),
+    }
+}
+
+/// A check's `code`, and where it passed under a release's step 7 ([`PrePromote::gate`]), the
+/// gate taken for the push: 0 when the push may begin, 1 when the release's private sign went
+/// red first, 2 when the gate could not be taken. Nothing pushes unless this returns 0.
+fn gated(facts: &PrePromote, code: i32, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let Some(path) = facts.gate.as_deref().filter(|_| code == 0) else {
+        return code;
+    };
+    match crate::release::PublishGate::at(path.to_path_buf()).push() {
+        Ok(true) => {
+            let _ = writeln!(
+                out,
+                "publish/pre-promote: the release's gate {} is taken: the push begins",
+                path.display()
+            );
+            0
+        }
+        Ok(false) => {
+            let _ = writeln!(
+                err,
+                "publish/pre-promote: the release's private sign went red before this push \
+                 ({}): nothing is pushed",
+                path.display()
+            );
+            1
+        }
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "publish/pre-promote: the release's gate {} could not be taken ({e}): nothing \
+                 is pushed",
+                path.display()
+            );
+            2
+        }
     }
 }
 

@@ -26,8 +26,13 @@ impl World {
             .mode(0o700)
             .create(&home)
             .unwrap();
+        // A workspace as umask 022 makes it, whatever this process's: a target created under
+        // it is laid through private folders alone.
         let owner = home.join("source");
-        std::fs::create_dir(&owner).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&owner)
+            .unwrap();
         std::fs::write(owner.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
         Self {
             target: home.join("target.noindex"),
@@ -277,7 +282,11 @@ fn a_target_that_appears_before_publish_is_never_overwritten() {
     let seen = std::sync::Arc::clone(&captured);
     faults::set(move |point| {
         if point == Point::Publishing {
-            std::fs::create_dir(&target).unwrap();
+            // Writable by no group whatever the umask: custody names only such a folder.
+            std::fs::DirBuilder::new()
+                .mode(0o755)
+                .create(&target)
+                .unwrap();
             *seen.lock().unwrap() = identity(&target);
         }
         Some(())
@@ -404,15 +413,22 @@ fn an_explicit_managed_producer_refuses_unknown_output_but_queries_and_defaults_
     );
     assert!(nested_fresh.join(MARKER).is_file());
 
-    let protected_home_target = world.home.join("Documents/unindexed.noindex");
-    let mut protected_args = words("build");
-    *protected_args.last_mut().unwrap() =
-        format!("--target-dir={}", protected_home_target.display());
-    assert!(
-        super::super::observe_for_producer(&protected_args, tool, &world.home, &machine, true)
-            .is_err(),
-        "an unindexable explicit target inside HOME is refused"
-    );
+    // Each folder of HOME this platform never looks into (`~/Documents` among them on macOS),
+    // but `~/Library`, whose caches hold the shared cache.
+    for skipped in super::super::super::checkout::HOME_SKIP
+        .iter()
+        .filter(|name| **name != "Library")
+    {
+        let protected_home_target = world.home.join(skipped).join("unindexed.noindex");
+        let mut protected_args = words("build");
+        *protected_args.last_mut().unwrap() =
+            format!("--target-dir={}", protected_home_target.display());
+        assert!(
+            super::super::observe_for_producer(&protected_args, tool, &world.home, &machine, true)
+                .is_err(),
+            "an unindexable explicit target inside HOME is refused: ~/{skipped}"
+        );
+    }
 
     let outside_cwd = world.home.parent().unwrap();
     let outside_machine = super::super::super::Machine {
@@ -558,14 +574,31 @@ const CARGO_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
                          # For information about cache directory tags see https://bford.info/cachedir/\n";
 
 /// `root` as a build left it before any registration: the folder cargo made, its tag, the
-/// rustc facts it keeps, and one profile with its lock and an artifact.
+/// rustc facts it keeps, and one profile with its lock and an artifact, each with the mode
+/// cargo gives it under umask 022, whatever this process's: adoption proves custody only of a
+/// folder and a tag no group or other user can write.
 fn cargo_laid(root: &Path) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let put = |at: &Path, bytes: &[u8]| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(at)
+            .and_then(|mut file| file.write_all(bytes))
+            .unwrap();
+    };
     std::fs::DirBuilder::new().mode(0o755).create(root).unwrap();
-    std::fs::write(root.join("CACHEDIR.TAG"), CARGO_TAG).unwrap();
-    std::fs::write(root.join(".rustc_info.json"), b"{}").unwrap();
-    std::fs::create_dir_all(root.join("debug/deps")).unwrap();
-    std::fs::write(root.join("debug/.cargo-lock"), b"").unwrap();
-    std::fs::write(root.join("debug/deps/libprobe.rlib"), b"reusable output").unwrap();
+    put(&root.join("CACHEDIR.TAG"), CARGO_TAG.as_bytes());
+    put(&root.join(".rustc_info.json"), b"{}");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(root.join("debug/deps"))
+        .unwrap();
+    put(&root.join("debug/.cargo-lock"), b"");
+    put(&root.join("debug/deps/libprobe.rlib"), b"reusable output");
 }
 
 fn producer_machine(world: &World) -> super::super::super::Machine<'_> {
@@ -645,6 +678,76 @@ fn a_target_cargo_made_before_registration_is_adopted_where_it_stands() {
             "{facts}: the next build is admitted from the record"
         );
         assert_eq!(std::fs::read(world.record()).unwrap(), recorded);
+    }
+}
+
+/// `root` as cargo lays it under this process's own umask: its folders 0777 and its files 0666
+/// less the umask, as cargo 1.96 lays a target (Ubuntu's umask 002 leaves the target 0775 and
+/// its tag 0664).
+fn cargo_laid_by_umask(root: &Path) {
+    std::fs::create_dir(root).unwrap();
+    std::fs::write(root.join("CACHEDIR.TAG"), CARGO_TAG).unwrap();
+    std::fs::write(root.join(".rustc_info.json"), b"{}").unwrap();
+    std::fs::create_dir_all(root.join("debug/deps")).unwrap();
+    std::fs::write(root.join("debug/.cargo-lock"), b"").unwrap();
+    std::fs::write(root.join("debug/deps/libprobe.rlib"), b"reusable output").unwrap();
+}
+
+/// Custody as a build under this process's real umask meets it, the workspace, the target cargo
+/// laid and its tag each made with that umask's modes (the fixtures above lay umask 022's). A
+/// umask with no group or other write (022, macOS's) has the target adopted where it stands and
+/// a fresh one made in the workspace. One with it (002, the user-private-group default Ubuntu
+/// sets) leaves both writable by the group, which custody never binds: a
+/// producer that requires managed output is refused, and nothing is written into either. (Only
+/// macOS's shim asks custody of a build: `observation_with`.)
+#[test]
+fn custody_under_this_process_umask_adopts_only_what_no_group_can_write() {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut world = World::new();
+    world.owner = world.home.join("workspace");
+    std::fs::create_dir(&world.owner).unwrap();
+    std::fs::write(
+        world.owner.join("Cargo.toml"),
+        "[workspace]\nmembers = []\n",
+    )
+    .unwrap();
+    cargo_laid_by_umask(&world.target);
+    let shared = |at: &Path| std::fs::symlink_metadata(at).unwrap().mode() & 0o022;
+    let umask_shares = shared(&world.owner);
+    for laid in [world.target.clone(), world.target.join("CACHEDIR.TAG")] {
+        assert_eq!(shared(&laid), umask_shares, "{}", laid.display());
+    }
+    let machine = producer_machine(&world);
+    let tool = super::super::super::Tool::Targo;
+    let fresh = world.owner.join("target");
+    for (target, what) in [
+        (&world.target, "the target cargo laid"),
+        (&fresh, "a fresh target in the workspace"),
+    ] {
+        let args = build_into(&world, target);
+        let admitted = super::super::observe_for_producer(&args, tool, &world.home, &machine, true);
+        if umask_shares == 0 {
+            assert!(admitted.unwrap(), "{what}: in custody");
+            assert!(target.join(MARKER).is_file(), "{what}: custody declared");
+            continue;
+        }
+        assert!(
+            admitted.is_err(),
+            "{what}: a folder the group or others can write is refused: {admitted:?}"
+        );
+        assert!(!target.join(MARKER).exists(), "{what}: no custody declared");
+    }
+    if umask_shares != 0 {
+        assert!(roots(&world.home).is_empty(), "nothing registered");
+        assert!(
+            !fresh.exists(),
+            "no target made in a folder the group can write"
+        );
+        assert_eq!(
+            std::fs::read(world.target.join("debug/deps/libprobe.rlib")).unwrap(),
+            b"reusable output",
+            "cargo's output stands"
+        );
     }
 }
 

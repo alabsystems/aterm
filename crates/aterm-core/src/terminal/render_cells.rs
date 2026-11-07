@@ -6,6 +6,7 @@
 use super::Terminal;
 use super::color_resolve::{StyleResolveOpts, resolve_colors_raw_opts};
 use crate::grid::{Cell, CellFlags, Grid};
+use crate::render::reuse_frame_extra;
 
 #[cfg(clean_islands)]
 macro_rules! trust_island {
@@ -91,25 +92,6 @@ type ExtrasOut<'a> = (
     &'a mut Vec<(usize, Box<str>)>,
     &'a mut Vec<(usize, Box<[char]>)>,
 );
-
-/// Replace one resolved extra only when its payload changed, then advance the live prefix.
-fn reuse_frame_extra<T: ?Sized>(
-    out: &mut Vec<(usize, Box<T>)>,
-    written: &mut usize,
-    col: usize,
-    same: impl FnOnce(&T) -> bool,
-    make: impl FnOnce() -> Box<T>,
-) {
-    if let Some((old_col, payload)) = out.get_mut(*written) {
-        if !same(payload.as_ref()) {
-            *payload = make();
-        }
-        *old_col = col;
-    } else {
-        out.push((col, make()));
-    }
-    *written += 1;
-}
 
 /// The line-decoration style under a cell (SGR 4 / 4:n / 21).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -769,15 +751,13 @@ impl Terminal {
                 images[r].push((usize::from(coord.col), iref));
             }
         }
+        let floating = !self.transient.kitty_floating.is_empty();
         for row in images.iter_mut() {
             if row.len() > 1 {
-                row.sort_by_key(|&(col, _)| col);
-            }
-        }
-        if !self.transient.kitty_floating.is_empty() {
-            for row in images.iter_mut() {
-                if row.len() > 1 {
+                if floating {
                     order_image_layers(row);
+                } else {
+                    row.sort_by_key(|&(col, _)| col);
                 }
             }
         }
@@ -1683,6 +1663,42 @@ mod tests {
             total += got.len();
         }
         total
+    }
+
+    #[test]
+    fn floating_frame_keeps_latest_layers_in_arrival_order() {
+        let mut term = Terminal::new(3, 4);
+        term.set_cell_pixel_size(1, 1);
+        term.process(b"\x1b_Ga=t,f=32,s=1,v=1,i=1,q=2;/wAA/w==\x1b\\\x1b_Ga=t,f=32,s=1,v=1,i=2,q=2;/wAA/w==\x1b\\");
+        term.process("\x1b_Ga=p,U=1,i=1,p=7,c=1,r=1,q=2\x1b\\\x1b[1;1H\x1b[38;5;1m\x1b[58;5;7m\u{10EEEE}\u{0305}\u{0305}\x1b[0m".as_bytes());
+        assert_eq!(term.images_frame(3)[0].len(), 1);
+        for placement in (1..=16).rev() {
+            term.process(
+                format!("\x1b_Ga=p,i=2,p={placement},P=1,Q=7,c=2,r=2,z=1,q=2\x1b\\").as_bytes(),
+            );
+        }
+        let frame = term.images_frame(3);
+        for (row, images) in frame.iter().enumerate().take(2) {
+            assert_eq!(images.len(), 2 * aterm_grid::MAX_IMAGE_LAYERS);
+            for col in 0..2 {
+                let placements: Vec<_> = images
+                    .iter()
+                    .filter(|(c, _)| *c == col)
+                    .map(|(_, image)| {
+                        assert_eq!(
+                            (usize::from(image.cell_row), usize::from(image.cell_col)),
+                            (row, col)
+                        );
+                        let tag = image.kitty.unwrap();
+                        assert_eq!(tag.image_id, 2);
+                        tag.placement_id
+                    })
+                    .collect();
+                assert_eq!(placements, (1..=16).rev().collect::<Vec<_>>());
+            }
+        }
+        assert!(frame[2].is_empty());
+        assert_images_parity(&term, 3, "overlapping floating layers");
     }
 
     #[test]

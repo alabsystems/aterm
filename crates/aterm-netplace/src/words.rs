@@ -6,10 +6,16 @@
 //! can say different things about where this Mac is (the window's away entry, [`away_entry`],
 //! included). The machine fields ([`status_fields`], [`json_fields`]) are an interface; the
 //! sentences are for a person and may be reworded here, once, for every reporter.
+//!
+//! **Who is up is not the place's to say.** The place counts the members that answered in a stay
+//! only as evidence for where this Mac is ([`Place::heard`]); no reporter words that count. The
+//! lab's seats, up and in step, are presence's (one-mesh §4.12): a reporter that read the node
+//! service's view hands them in as [`Seats`], and [`status_line`] and [`seats_short`] word them.
 
 use crate::place::{
     Alab, Checking, InternetSource, InternetState, Kind, Lane, Place, Recognised, Where,
 };
+use crate::time::Clock;
 
 /// What the words need besides the place: the clock now and the local zone.
 #[derive(Clone, Copy)]
@@ -159,29 +165,149 @@ pub fn internet_long(place: &Place, words: &Words<'_>) -> String {
     }
 }
 
-/// The members reachable: `12 of 41 members reachable`, or with no book `12 members reachable`.
+/// The lab's seats as presence reads them (one-mesh §4.12): plain data that a reporter that read
+/// the node service's view hands in, since this crate sits below the mesh.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Seats {
+    /// The members, counted as seats, this Mac included.
+    pub members: usize,
+    /// Of them, those up: their presence row advanced within 90 seconds. `None` where no
+    /// presence was read; the reader says why beside the line.
+    pub up: Option<usize>,
+    /// The members whose build is below what the lab needs now, `(label, build)`, in label order.
+    pub needs_update: Vec<(String, String)>,
+    /// How the up members' tables stand against this Mac's; `None` where no presence was read.
+    pub in_step: Option<InStep>,
+    /// The membership log's records this Mac holds, and their bound; `None` where the log was not
+    /// read.
+    pub log: Option<(u64, u64)>,
+}
+
+/// How the other up members' presence rows stand against this Mac's own (§4.12 "in step").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InStep {
+    /// Those whose rows hold the membership log and the tables this Mac's row holds.
+    pub with: usize,
+    /// The up members, this Mac aside.
+    pub of: usize,
+    /// How long ago, at least, the oldest record the slowest of those behind lacks reached this
+    /// Mac (ms); `None` where none is behind.
+    pub slowest_ms: Option<u64>,
+    /// Those whose rows hold what none of this Mac's recent rows held: records this Mac lacks, or
+    /// a lag older than it remembers.
+    pub apart: usize,
+}
+
+/// `ms` as an age for a person: `40 s`, `12 min`, `3 h`, `2 d`.
 #[must_use]
-pub fn members_words(place: &Place) -> String {
-    match place.known {
-        Some(known) => format!("{} of {known} members reachable", place.reachable),
-        None => format!("{} members reachable (no fleet book here)", place.reachable),
+pub fn age_words(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..60 => format!("{s} s"),
+        60..3_600 => format!("{} min", s / 60),
+        3_600..86_400 => format!("{} h", s / 3_600),
+        _ => format!("{} d", s / 86_400),
     }
 }
 
-/// The ALab LAN in a few words.
+/// `n` with its thousands grouped: `16,384`.
 #[must_use]
-pub fn alab_short(place: &Place, words: &Words<'_>) -> String {
+pub fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A build's release for a person: `0.147` of `0.147.0+g1a2b3c4d`; a build this cannot read as
+/// itself.
+fn release_words(build: &str) -> &str {
+    let core = build.split_once('+').map_or(build, |(core, _)| core);
+    let mut dots = core.match_indices('.');
+    match (dots.next(), dots.next()) {
+        (Some(_), Some((second, _))) => &core[..second],
+        _ => build,
+    }
+}
+
+/// `52 members`, `1 member`.
+fn members_count(n: usize) -> String {
+    format!("{n} member{}", if n == 1 { "" } else { "s" })
+}
+
+/// THE STATUS LINE of the lab (§4.12): `52 members · 47 up · 3 need update (m11 0.147, m12 0.146,
+/// m106 0.148) · tables in step with 46 of 47, slowest 40 s behind · log 4,169 of 16,384`.
+#[must_use]
+pub fn status_line(seats: &Seats) -> String {
+    use std::fmt::Write as _;
+    let mut out = members_count(seats.members);
+    match seats.up {
+        Some(up) => {
+            let _ = write!(out, " · {up} up");
+        }
+        None => out.push_str(" · up not read"),
+    }
+    if !seats.needs_update.is_empty() {
+        let n = seats.needs_update.len();
+        let _ = write!(out, " · {n} need{} update (", if n == 1 { "s" } else { "" });
+        for (i, (label, build)) in seats.needs_update.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            let _ = write!(out, "{label} {}", release_words(build));
+        }
+        out.push(')');
+    }
+    if let Some(step) = seats.in_step {
+        if step.of == 0 {
+            out.push_str(" · no other member up");
+        } else {
+            let _ = write!(out, " · tables in step with {} of {}", step.with, step.of);
+            if let Some(ms) = step.slowest_ms {
+                let _ = write!(out, ", slowest {} behind", age_words(ms));
+            }
+            if step.apart > 0 {
+                let _ = write!(out, ", {} apart", step.apart);
+            }
+        }
+    }
+    if let Some((held, bound)) = seats.log {
+        let _ = write!(out, " · log {} of {}", grouped(held), grouped(bound));
+    }
+    out
+}
+
+/// The seats in a few words: `47 up of 52 members`, or `52 members` where no presence was read.
+#[must_use]
+pub fn seats_short(seats: &Seats) -> String {
+    let members = members_count(seats.members);
+    match seats.up {
+        Some(up) => format!("{up} up of {members}"),
+        None => members,
+    }
+}
+
+/// The ALab LAN in a few words where the place has more to say of it than its own word: nothing
+/// at home.
+#[must_use]
+pub fn alab_short(place: &Place, words: &Words<'_>) -> Option<String> {
     match place.alab {
-        Alab::Here if place.reachable == 0 => "members not heard yet".to_owned(),
-        Alab::Here => members_words(place),
-        Alab::Away { since_ms: Some(ms) } => format!("ALab LAN: away since {}", words.clock(ms)),
-        Alab::Away { since_ms: None } => "ALab LAN: away".to_owned(),
-        Alab::Learning => "ALab LAN not learned yet".to_owned(),
-        Alab::Unknown => "ALab LAN: not known while checking".to_owned(),
-        Alab::NoFleet => format!(
+        Alab::Here => None,
+        Alab::Away { since_ms: Some(ms) } => {
+            Some(format!("ALab LAN: away since {}", words.clock(ms)))
+        }
+        Alab::Away { since_ms: None } => Some("ALab LAN: away".to_owned()),
+        Alab::Learning => Some("ALab LAN not learned yet".to_owned()),
+        Alab::Unknown => Some("ALab LAN: not known while checking".to_owned()),
+        Alab::NoFleet => Some(format!(
             "no ALab LAN to learn (the fleet book knows fewer than {} members)",
             crate::place::LEARN_AT
-        ),
+        )),
     }
 }
 
@@ -200,8 +326,7 @@ fn last_answer_words(place: &Place, words: &Words<'_>) -> Option<String> {
 }
 
 /// THE HEADER every command's report opens with: `network: remote (phone hotspot) since 11:14 ·
-/// internet ok · ALab LAN: away since 11:14`, or at home `network: ALab LAN · internet ok · 12
-/// of 41 members reachable`.
+/// internet ok · ALab LAN: away since 11:14`, or at home `network: ALab LAN · internet ok`.
 #[must_use]
 pub fn header(place: &Place, words: &Words<'_>) -> String {
     format!("network: {}", summary(place, words))
@@ -217,20 +342,12 @@ pub fn summary(place: &Place, words: &Words<'_>) -> String {
         since_words(place, words)
     };
     let mut out = format!(
-        "{}{since} · {} · {}",
+        "{}{since} · {}",
         where_words_cow(place),
-        internet_short(place),
-        alab_short(place, words)
+        internet_short(place)
     );
-    if matches!(place.alab, Alab::Away { .. }) && place.reachable > 0 {
-        match place.known {
-            Some(known) => {
-                let _ = write!(out, " · {} of {known} members here", place.reachable);
-            }
-            None => {
-                let _ = write!(out, " · {} of ? members here", place.reachable);
-            }
-        }
+    if let Some(alab) = alab_short(place, words) {
+        let _ = write!(out, " · {alab}");
     }
     out
 }
@@ -294,26 +411,22 @@ pub fn line(place: &Place, words: &Words<'_>) -> String {
     }
     out.push_str(" · ");
     out.push_str(&internet_long(place, words));
-    out.push_str(" · ");
-    if matches!(place.alab, Alab::Here) {
-        out.push_str("ALab LAN: ");
-    }
-    out.push_str(&alab_short(place, words));
-    if !matches!(place.alab, Alab::Here) {
+    if let Some(alab) = alab_short(place, words) {
+        out.push_str(" · ");
+        out.push_str(&alab);
         if let Some(last) = last_answer_words(place, words) {
             let _ = write!(out, " ({last})");
         }
-        out.push_str(" · ");
-        out.push_str(&members_words(place));
     }
     out
 }
 
 /// THE `status` FIELDS: `net=<alab-lan|remote|offline|checking> net_kind=<hotspot|lan|cellular|
 /// vpn|-> net_since_ms=<unix ms|-> internet=<ok|down|path-up|unknown> internet_ms=<unix ms|->
-/// members=<reachable>/<known>|- away_since_ms=<unix ms|->`, in this order.
+/// members=<up>/<members>|- away_since_ms=<unix ms|->`, in this order: `members=` is the seats
+/// presence reads up of the lab's members, `-` where the reporter read no presence.
 #[must_use]
-pub fn status_fields(place: &Place) -> String {
+pub fn status_fields(place: &Place, seats: Option<&Seats>) -> String {
     use std::fmt::Write as _;
     let push_opt = |out: &mut String, ms: Option<u64>| match ms {
         Some(ms) => {
@@ -336,11 +449,11 @@ pub fn status_fields(place: &Place) -> String {
     );
     push_opt(&mut out, place.internet.at_ms);
     out.push_str(" members=");
-    match (place.at, place.known) {
-        (Where::Offline, _) | (_, None) => out.push('-'),
-        (_, Some(known)) => {
-            let _ = write!(out, "{}/{known}", place.reachable);
+    match seats.and_then(|seats| Some((seats.up?, seats.members))) {
+        Some((up, members)) => {
+            let _ = write!(out, "{up}/{members}");
         }
+        None => out.push('-'),
     }
     out.push_str(" away_since_ms=");
     match place.alab {
@@ -437,8 +550,6 @@ pub fn json_fields(place: &Place) -> Vec<(&'static str, Field)> {
             Field::Object(vec![
                 ("state", Field::Text(place.alab.word().to_owned())),
                 ("since_ms", alab),
-                ("reachable", Field::Count(place.reachable as u64)),
-                ("known", count(place.known.map(|k| k as u64))),
                 ("last_answer_ms", count(place.last_answer.map(|(ms, _)| ms))),
                 (
                     "last_answer_lane",
@@ -454,39 +565,23 @@ pub fn json_fields(place: &Place) -> Vec<(&'static str, Field)> {
     ]
 }
 
-/// The band's summary and its short form: `Away from ALab LAN · phone hotspot · 41 known` and
-/// `Away · hotspot`, or at home `12 reachable · 41 known` and `ALab LAN`.
+/// The band's summary and its short form: `Away from ALab LAN · phone hotspot` and
+/// `Away · hotspot`, or at home `ALab LAN` and `ALab LAN`.
 #[must_use]
 pub fn band(place: &Place) -> (String, String) {
-    let known = place
-        .known
-        .map_or_else(String::new, |known| format!(" · {known} known"));
     match place.at {
-        Where::AlabLan if place.reachable == 0 => (
-            format!("ALab LAN · checking members{known}"),
-            "ALab LAN".to_owned(),
-        ),
-        Where::AlabLan => (
-            format!("{} reachable{known}", place.reachable),
-            "ALab LAN".to_owned(),
-        ),
+        Where::AlabLan => ("ALab LAN".to_owned(), "ALab LAN".to_owned()),
         Where::Remote(kind) if matches!(place.alab, Alab::Away { .. }) => (
-            format!("Away from ALab LAN · {}{known}", kind_words(kind)),
+            format!("Away from ALab LAN · {}", kind_words(kind)),
             format!("Away · {}", kind.word()),
         ),
         Where::Remote(kind) => (
-            format!("Remote · {}{known}", kind_words(kind)),
+            format!("Remote · {}", kind_words(kind)),
             format!("Remote · {}", kind.word()),
         ),
-        Where::Offline => (format!("Offline{known}"), "Offline".to_owned()),
-        Where::Network(kind) => (
-            format!("{}{known}", where_words_cow(place)),
-            kind.word().to_owned(),
-        ),
-        Where::Checking(_) => (
-            format!("Checking the network{known}"),
-            "Checking".to_owned(),
-        ),
+        Where::Offline => ("Offline".to_owned(), "Offline".to_owned()),
+        Where::Network(kind) => (where_words(place), kind.word().to_owned()),
+        Where::Checking(_) => ("Checking the network".to_owned(), "Checking".to_owned()),
     }
 }
 
@@ -633,14 +728,26 @@ pub struct AwayEntry {
 /// Wi-Fi blip at home (offline for seconds, then the same network) raises nothing.
 pub const AWAY_ENTRY_AFTER_MS: u64 = 2 * 60_000;
 
-/// The away entry for `place`: `Some` only while this Mac is on another network (remote) with
-/// the ALab LAN reading away (learned, and this is not it), and has been there for
-/// [`AWAY_ENTRY_AFTER_MS`], so a first run that has learned nothing, a place still checking, a
-/// blip, home, offline (a router reboot longer than the dwell puts every Mac at home there, and
-/// no person need move anything), and a remembered network that fell silent (it may be home
-/// with every member asleep or off: "rejoin" would be wrong there) raise nothing.
-#[must_use]
-pub fn away_entry(place: &Place, words: &Words<'_>) -> Option<AwayEntry> {
+/// The away-entry fact the follower compares, independent of formatted detail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AwayKey {
+    /// The existing log's kind word, or `-` when unknown. Both hotspot variants say `hotspot`.
+    pub kind_word: &'static str,
+    /// When the ALab axis says this Mac went away, which can precede its current stay.
+    pub since_ms: Option<u64>,
+}
+
+/// The away-entry key and its next time-only dwell change with the place held fixed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AwayProjection {
+    /// The key at the supplied time.
+    pub key: Option<AwayKey>,
+    /// The first future change of this key; `None` when no forward change is representable.
+    /// External place changes and clock rollback invalidate the projection.
+    pub next_change_ms: Option<u64>,
+}
+
+fn away_at<const TRACK: bool>(place: &Place, clock: &Clock<TRACK>) -> Option<(AwayKey, Kind)> {
     let (Alab::Away { since_ms }, Where::Remote(kind)) = (place.alab, place.at) else {
         return None;
     };
@@ -650,12 +757,51 @@ pub fn away_entry(place: &Place, words: &Words<'_>) -> Option<AwayEntry> {
     let settled = place.since_before
         || place
             .since_ms
-            .is_some_and(|ms| words.now_ms.saturating_sub(ms) >= AWAY_ENTRY_AFTER_MS);
+            .is_some_and(|ms| clock.at_least(ms, AWAY_ENTRY_AFTER_MS));
     if !settled {
         return None;
     }
+    Some((
+        AwayKey {
+            kind_word: place.kind.map_or("-", Kind::word),
+            since_ms,
+        },
+        kind,
+    ))
+}
+
+/// The follower's away fact, using the same eligibility decision as [`away_entry`].
+/// No detailed wording or local-zone callback is evaluated.
+#[must_use]
+pub fn away_key(place: &Place, now_ms: u64) -> Option<AwayKey> {
+    away_at(place, &Clock::<false>::at(now_ms)).map(|(key, _)| key)
+}
+
+/// Project the follower key's dwell change, independently of [`crate::step_with_deadline`].
+/// This reads no clock and leaves detailed wording's day/zone invalidation separate.
+#[must_use]
+pub fn away_key_with_deadline(place: &Place, now_ms: u64) -> AwayProjection {
+    let clock = Clock::<true>::at(now_ms);
+    let key = away_at(place, &clock).map(|(key, _)| key);
+    AwayProjection {
+        key,
+        next_change_ms: clock.next(),
+    }
+}
+
+/// The away entry for `place`: `Some` only while this Mac is on another network (remote) with
+/// the ALab LAN reading away (learned, and this is not it), and has been there for
+/// [`AWAY_ENTRY_AFTER_MS`], so a first run that has learned nothing, a place still checking, a
+/// blip, home, offline (a router reboot longer than the dwell puts every Mac at home there, and
+/// no person need move anything), and a remembered network that fell silent (it may be home
+/// with every member asleep or off: "rejoin" would be wrong there) raise nothing.
+#[must_use]
+pub fn away_entry(place: &Place, words: &Words<'_>) -> Option<AwayEntry> {
+    let (key, kind) = away_at(place, &Clock::<false>::at(words.now_ms))?;
     let kind = kind_words(kind);
-    let since = since_ms.map_or_else(String::new, |ms| format!(" since {}", words.clock(ms)));
+    let since = key
+        .since_ms
+        .map_or_else(String::new, |ms| format!(" since {}", words.clock(ms)));
     Some(AwayEntry {
         what: "Away from the ALab LAN",
         why: "this Mac is on another network, and only a person moves it back",
@@ -665,7 +811,7 @@ pub fn away_entry(place: &Place, words: &Words<'_>) -> Option<AwayEntry> {
             "secrets, fleet and Commons work from what this Mac holds and catch up when it is back"
                 .to_owned(),
         ],
-        log: format!("network away kind={}", place.kind.map_or("-", Kind::word)),
+        log: format!("network away kind={}", key.kind_word),
     })
 }
 
@@ -685,6 +831,10 @@ pub fn back_line(away_since_ms: Option<u64>, kind: Option<Kind>, now_ms: u64) ->
     let kind = kind.map_or_else(String::new, |kind| format!(" ({})", kind_words(kind)));
     format!("network: back on the ALab LAN{after}{kind}")
 }
+
+#[cfg(test)]
+#[path = "words_away_tests.rs"]
+mod away_deadline_tests;
 
 #[cfg(test)]
 mod tests {
@@ -723,17 +873,19 @@ mod tests {
                 endpoint: None,
             },
             alab,
-            reachable: 0,
+            heard: 0,
             known: Some(41),
             last_answer: None,
             computed_by: ComputedBy::Keeper,
         }
     }
 
-    /// The `status` fields are `key=value` words in one order, each value from the place:
-    /// a script reads the place, its kind, its stay, the internet, the members and away-since.
-    /// NEGATIVE CONTROL: printing `members=` as the reachable count alone (no `/<known>`) fails
-    /// the members field.
+    /// The `status` fields are `key=value` words in one order, each value from the place, but
+    /// `members=` from the seats presence read: a script reads the place, its kind, its stay, the
+    /// internet, the seats up of the members and away-since. A reporter that read no presence
+    /// prints `members=-`, whatever the place heard.
+    /// NEGATIVE CONTROL: printing `members=` as the up count alone (no `/<members>`) fails the
+    /// members field.
     #[test]
     fn the_status_fields_carry_the_place_in_order() {
         let away = place(
@@ -742,7 +894,12 @@ mod tests {
                 since_ms: Some(1_799_999_000_000),
             },
         );
-        let fields: Vec<(String, String)> = status_fields(&away)
+        let seats = Seats {
+            members: 52,
+            up: Some(47),
+            ..Seats::default()
+        };
+        let fields: Vec<(String, String)> = status_fields(&away, Some(&seats))
             .split(' ')
             .map(|kv| {
                 let (k, v) = kv.split_once('=').expect("key=value");
@@ -773,15 +930,106 @@ mod tests {
         assert_eq!(value("net_since_ms"), Some("1800000000000"));
         assert_eq!(value("internet"), Some("path-up"));
         assert_eq!(value("internet_ms"), Some("-"));
-        assert_eq!(value("members"), Some("0/41"));
+        assert_eq!(value("members"), Some("47/52"));
         assert_eq!(value("away_since_ms"), Some("1799999000000"));
         let unknown_keys: Vec<&str> = STATUS_UNKNOWN
             .split(' ')
             .map(|kv| kv.split_once('=').expect("key=value").0)
             .collect();
         assert_eq!(unknown_keys, keys, "the unknown line has the same keys");
-        let home = place(Where::AlabLan, Alab::Here);
-        assert!(status_fields(&home).contains("away_since_ms=-"));
+        let home = Place {
+            heard: 12,
+            ..place(Where::AlabLan, Alab::Here)
+        };
+        assert!(status_fields(&home, Some(&seats)).contains("away_since_ms=-"));
+        assert!(
+            status_fields(&home, None).contains(" members=- "),
+            "no presence read, no count"
+        );
+        assert!(
+            status_fields(
+                &home,
+                Some(&Seats {
+                    members: 52,
+                    ..Seats::default()
+                })
+            )
+            .contains(" members=- "),
+            "seats with no presence read count no one up"
+        );
+    }
+
+    /// THE STATUS LINE against a presence fixture with old builds (one-mesh §11 B9): members,
+    /// up, each member that needs an update with its release, the tables in step with the
+    /// slowest's lag and those apart, and the log's fill, in that order; with no presence read it
+    /// says so and counts no one up or in step.
+    #[test]
+    fn the_status_line_words_a_presence_fixture_with_old_builds() {
+        let seats = Seats {
+            members: 52,
+            up: Some(47),
+            needs_update: vec![
+                ("m11".to_owned(), "0.147.0+g1a2b3c4d".to_owned()),
+                ("m12".to_owned(), "0.146.0".to_owned()),
+                ("m106".to_owned(), "0.148.2+gdeadbeef".to_owned()),
+            ],
+            in_step: Some(InStep {
+                with: 46,
+                of: 47,
+                slowest_ms: Some(40_000),
+                apart: 0,
+            }),
+            log: Some((4_169, 16_384)),
+        };
+        assert_eq!(
+            status_line(&seats),
+            "52 members · 47 up · 3 need update (m11 0.147, m12 0.146, m106 0.148) · tables in \
+             step with 46 of 47, slowest 40 s behind · log 4,169 of 16,384"
+        );
+        assert_eq!(seats_short(&seats), "47 up of 52 members");
+        let one_old = Seats {
+            members: 2,
+            up: Some(1),
+            needs_update: vec![("m3".to_owned(), "odd-build".to_owned())],
+            in_step: Some(InStep {
+                with: 0,
+                of: 0,
+                slowest_ms: None,
+                apart: 0,
+            }),
+            log: None,
+        };
+        assert_eq!(
+            status_line(&one_old),
+            "2 members · 1 up · 1 needs update (m3 odd-build) · no other member up"
+        );
+        let apart = Seats {
+            in_step: Some(InStep {
+                with: 3,
+                of: 5,
+                slowest_ms: Some(2 * 3_600_000),
+                apart: 1,
+            }),
+            needs_update: Vec::new(),
+            ..seats.clone()
+        };
+        assert!(
+            status_line(&apart).contains("tables in step with 3 of 5, slowest 2 h behind, 1 apart"),
+            "{}",
+            status_line(&apart)
+        );
+        let unread = Seats {
+            members: 1,
+            up: None,
+            needs_update: Vec::new(),
+            in_step: None,
+            log: Some((12, 16_384)),
+        };
+        assert_eq!(
+            status_line(&unread),
+            "1 member · up not read · log 12 of 16,384"
+        );
+        assert_eq!(seats_short(&unread), "1 member");
     }
 
     /// The JSON object carries the axes apart: where, kind, the internet with its source, and
@@ -812,7 +1060,12 @@ mod tests {
         };
         assert!(alab.contains(&("state", Field::Text("away".to_owned()))));
         assert!(alab.contains(&("since_ms", Field::Count(7))));
-        assert!(alab.contains(&("known", Field::Count(41))));
+        assert!(
+            !alab
+                .iter()
+                .any(|(key, _)| matches!(*key, "known" | "reachable")),
+            "the place counts no members for a reader: presence does"
+        );
     }
 
     /// The away entry stands only while this Mac is on a remote network with the ALab LAN

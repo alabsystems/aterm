@@ -35,7 +35,14 @@ impl HelperFds {
     /// Recognize only this private entry. Invalid recognized shapes refuse,
     /// while unrelated CLI entries return None without changing their routing.
     pub fn parse(args: &[OsString]) -> io::Result<Option<Self>> {
-        if args.first().map(OsString::as_os_str) != Some(OsStr::new("__resource-member-v3")) {
+        Self::parse_entry(args, "__resource-member-v3")
+    }
+    /// The explicit owning-wait route never silently uses a legacy helper.
+    pub fn parse_accounted(args: &[OsString]) -> io::Result<Option<Self>> {
+        Self::parse_entry(args, crate::accounting::HELPER_ENTRY)
+    }
+    fn parse_entry(args: &[OsString], entry: &str) -> io::Result<Option<Self>> {
+        if args.first().map(OsString::as_os_str) != Some(OsStr::new(entry)) {
             return Ok(None);
         }
         if args.len() != 4 || args[1] != "--protocol=3" {
@@ -57,9 +64,15 @@ impl HelperFds {
         Ok(Some(fds))
     }
     pub fn arguments(self) -> io::Result<Vec<OsString>> {
+        self.arguments_entry("__resource-member-v3")
+    }
+    pub fn accounted_arguments(self) -> io::Result<Vec<OsString>> {
+        self.arguments_entry(crate::accounting::HELPER_ENTRY)
+    }
+    fn arguments_entry(self, entry: &str) -> io::Result<Vec<OsString>> {
         self.validate()?;
         Ok(vec![
-            "__resource-member-v3".into(),
+            entry.into(),
             "--protocol=3".into(),
             format!("--control-fd={}", self.control).into(),
             format!("--producer-fd={}", self.producer).into(),

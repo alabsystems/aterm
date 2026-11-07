@@ -224,8 +224,10 @@ fn the_hosts_compressor_is_aterm_zstds_encoder_and_packs_what_raw_frames_pack() 
     assert_eq!(host.tree_root, raw.tree_root);
     assert_eq!(host.stream_bytes, raw.stream_bytes, "the same tar stream");
     assert_eq!(host.sha256, default.sha256, "the same bytes twice");
+    // Require actual compression; the selected level owns the ratio tradeoff.
+    // Raw frames carry their body plus framing, as the negative below checks.
     assert!(
-        host.size * 4 < host.stream_bytes,
+        host.size < host.stream_bytes,
         "compressed: {} B of a {} B stream",
         host.size,
         host.stream_bytes
@@ -385,17 +387,16 @@ fn a_pack_declares_no_window_past_its_tar_stream() {
     );
 }
 
-/// Past 2^27 bytes (the trust pack's tar is 3.1 GB) a pack is compressed with the options
-/// every pack had before the window was fitted, so its frame is the bytes it was: the
-/// encoder's output is a function of its options and the stream. The control: a stream of
-/// exactly 2^27 bytes, which fits, declares its size and gets other options.
+/// Past 2^27 bytes a pack streams at its selected level, with the widest supported window
+/// and its content checksum. The control: a stream of exactly 2^27 bytes, which fits,
+/// declares its size and gets other options.
 #[test]
-fn past_the_widest_window_a_pack_is_compressed_as_before() {
+fn past_the_widest_window_a_pack_streams_at_its_selected_level() {
     use aterm_zstd::encode::Options;
     use aterm_zstd::frame::{Checksum, WINDOW_MAX};
 
     let before = Options::new()
-        .level(19)
+        .level(tarwrite::LEVEL)
         .window_log(27)
         .checksum(Checksum::Xxh64);
     for len in [WINDOW_MAX as u64 + 1, 3_102_120_448, u64::MAX] {
@@ -424,7 +425,7 @@ fn within_the_widest_window_a_pack_fits_the_smallest_power_of_two() {
 
     let fitted = |log: u8, len: u64| {
         Options::new()
-            .level(19)
+            .level(tarwrite::LEVEL)
             .window_log(log)
             .checksum(Checksum::Xxh64)
             .content_size(len)

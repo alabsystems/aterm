@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// The local account a single provider operation is allowed to read.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
     read: Read,
     home: PathBuf,
@@ -33,6 +33,8 @@ impl Account {
 /// One launch's allowance. Moving the allowance preserves its spent reads.
 pub struct Launch {
     left: usize,
+    /// The accounts it has read.
+    read: Vec<Account>,
 }
 
 mod sealed {
@@ -86,7 +88,15 @@ impl Launch {
     pub(super) fn launch_use(_door: impl LaunchDoor) -> Self {
         Self {
             left: super::accounts_pool::LAUNCH_READS,
+            read: Vec::new(),
         }
+    }
+
+    /// Whether this launch has already read `account`: an answer with no figure leaves it due
+    /// again on its records, and one launch reads a row once.
+    #[must_use]
+    pub(super) fn has_read(&self, account: &Account) -> bool {
+        self.read.contains(account)
     }
 }
 
@@ -134,6 +144,7 @@ impl Use {
     /// A pick made by this launch, sharing its finite allowance with earlier picks.
     pub(super) fn launch_read_use(launch: &mut Launch, account: Account) -> Option<Self> {
         launch.left = launch.left.checked_sub(1)?;
+        launch.read.push(account.clone());
         Some(Self {
             account,
             why: InUse::Launching,

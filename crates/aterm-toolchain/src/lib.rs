@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! THE TOOLCHAIN, ONE SOURCE, STD ONLY BUT FOR THE SIGNAL DECLARATIONS A WAIT'S INTERRUPT USES,
-//! THE PROCESS SWEEP THAT TELLS A WAIT'S HOLDER AT WORK FROM ONE STUCK, AND THE SHA-256 OF THE
-//! STATUS DIGEST A SEALED TOOLCHAIN IS RECHECKED BY.
+//! THE PROCESS SWEEP THAT TELLS A WAIT'S HOLDER AT WORK FROM ONE STUCK, THE ACCOUNT'S HOME WHERE
+//! EVERY WAIT IS MARKED, AND THE SHA-256 OF THE STATUS DIGEST A SEALED TOOLCHAIN IS RECHECKED BY.
 
 pub mod build_cache;
 pub mod cargo_cache;
@@ -21,7 +21,10 @@ pub mod rustc_movers;
 pub mod rustup;
 pub mod stall;
 pub mod stat_digest;
+#[cfg(test)]
+mod test_script;
 pub mod trust_lock;
 pub mod waits;
+pub mod xpy;
 
 pub use discovery::*;

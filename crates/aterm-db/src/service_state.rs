@@ -409,7 +409,8 @@ pub(crate) fn accounts_until(
         }
     };
     let paths = &selected;
-    match commons::observe(paths) {
+    // Sampled every 10 s whatever it finds: unchanged vault files keep the last observation.
+    match commons::observe_settled(paths) {
         Ok(commons::Observation::Unavailable(reason)) => {
             let availability = if matches!(reason, commons::Unavailable::Busy) {
                 ServiceAvailability::Unknown

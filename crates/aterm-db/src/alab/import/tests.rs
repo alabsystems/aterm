@@ -584,9 +584,8 @@ fn a_re_import_never_overwrites_the_owner_and_writes_nothing_when_unchanged() {
 /// (a relabelled Mac keeps its row), then a Mac the roster knows by label or alias, whose row is
 /// found by its fleet node; only then a planned placeholder keyed by the label. Spellings fold
 /// (`M109` is m109, `m27-2` is number 2 on m27) and are reported.
-/// NEGATIVE CONTROL: with `machine_for` skipping the live rows (`let found: Vec<String> =
-/// Vec::new();`), the relabelled Mac's old label mints a second machine and its preference lands on
-/// it: `` left: "mc-ee08c551e4729096" right: "mc-3dd96e6460b76735" `` (the placeholder m40's
+/// NEGATIVE CONTROL: with `rows_named` reading only the label (its alias arm `false`), the
+/// relabelled Mac's old label mints a second machine and its preference lands on it: `` left: "mc-ee08c551e4729096" right: "mc-3dd96e6460b76735" `` (the placeholder m40's
 /// key, then the relabelled row's).
 #[test]
 fn labels_resolve_through_live_rows_and_known_macs_before_a_placeholder() {
@@ -620,6 +619,7 @@ fn labels_resolve_through_live_rows_and_known_macs_before_a_placeholder() {
         label: Some(Label::plain(100)),
         aliases: vec![Label::plain(32)],
         node: Some("0123456789abcdef".to_owned()),
+        fleet_node: None,
         hosts: Vec::new(),
     }];
     let sheet = vault(&[
@@ -751,6 +751,7 @@ fn a_retired_node_born_row_leaves_the_mac_a_row_of_its_own() {
         label: Some(Label::plain(77)),
         aliases: Vec::new(),
         node: Some(node.to_owned()),
+        fleet_node: None,
         hosts: Vec::new(),
     }];
     let first = plan(&input(&[], &macs), &cells).unwrap();
@@ -1182,9 +1183,9 @@ fn a_harness_file_adds_below_the_sheets() {
 /// Two live rows naming one fleet node (any writer can set the cell) adopt neither: the known
 /// Mac's label, status and aliases are written nowhere, the clash is a finding, and the generic
 /// check reports `fleet_node` as a unique clash.
-/// NEGATIVE CONTROL: with `known_found` taking the first row that names the node (`[pk, ..] =>`
-/// in place of `[pk] =>`), the roster's label lands on that row: `` assertion failed:
-/// plan.planned.iter().all(|p| p.pk != first && p.pk != second) ``.
+/// NEGATIVE CONTROL: with `sole` taking the first candidate (no `len() > 1` test), the roster's
+/// label lands on that row: `` assertion failed: plan.planned.iter().all(|p| p.pk != first &&
+/// p.pk != second) ``.
 #[test]
 fn two_rows_naming_one_fleet_node_adopt_neither() {
     let node = "0011223344556677";
@@ -1206,6 +1207,7 @@ fn two_rows_naming_one_fleet_node_adopt_neither() {
         label: Some(Label::plain(12)),
         aliases: vec![Label::plain(70)],
         node: Some(node.to_owned()),
+        fleet_node: None,
         hosts: Vec::new(),
     }];
     let adopt = Input {
@@ -1261,12 +1263,14 @@ fn adopt_binds_known_macs_by_node_and_births_none() {
             label: Some(Label::plain(12)),
             aliases: vec![Label::plain(70)],
             node: Some(node.to_owned()),
+            fleet_node: None,
             hosts: Vec::new(),
         },
         KnownMac {
             label: Some(Label::plain(13)),
             aliases: Vec::new(),
             node: Some("ffeeddccbbaa9988".to_owned()),
+            fleet_node: None,
             hosts: Vec::new(),
         },
     ];
@@ -1601,12 +1605,14 @@ fn per_cell_provenance_preserves_cross_sheet_cells_and_empty_sheet_preference_en
             label: None,
             aliases: Vec::new(),
             node: Some("not-a-32-hex-node".to_owned()),
+            fleet_node: None,
             hosts: vec!["bad\nhost".to_owned()],
         },
         KnownMac {
             label: Some(Label::plain(77)),
             aliases: Vec::new(),
             node: Some("0123456789ABCDEF".to_owned()),
+            fleet_node: None,
             hosts: vec![
                 "m77.local".to_owned(),
                 "m77.local".to_owned(),

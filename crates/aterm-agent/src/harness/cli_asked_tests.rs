@@ -60,7 +60,7 @@ fn add(env: &Env, label: &str) -> (ExitCode, String, String) {
 fn an_account_asked_for_by_name_joins_this_roster_and_writes_no_preference() {
     let tmp = tmp_dir("accounts-asked");
     let env = env_at(&tmp);
-    std::fs::write(env.config.as_ref().unwrap(), "").unwrap();
+    crate::test_config::write(env.config.as_ref().unwrap(), "").unwrap();
     let roster_path = env.accounts_roster().unwrap();
     with_lab(lab(), || {
         let (code, out, err) = add(&env, "claude-aaaaaa");

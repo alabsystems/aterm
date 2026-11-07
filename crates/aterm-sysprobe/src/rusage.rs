@@ -63,13 +63,17 @@ pub(crate) struct RusageV6 {
     _billed_serviced: [u64; 2],
     pub(crate) ri_logical_writes: u64,
     pub(crate) ri_lifetime_max_phys_footprint: u64,
-    /// `ri_instructions` through `ri_interval_max_phys_footprint`.
-    _instructions_to_interval_max: [u64; 5],
+    pub(crate) ri_instructions: u64,
+    /// `ri_cycles` through `ri_interval_max_phys_footprint`.
+    _cycles_to_interval_max: [u64; 4],
     pub(crate) ri_runnable_time: u64,
     /// `ri_flags` (V5).
     _flags: u64,
-    /// `ri_user_ptime` through `ri_pcycles`.
-    _ptime_to_pcycles: [u64; 4],
+    pub(crate) ri_user_ptime: u64,
+    pub(crate) ri_system_ptime: u64,
+    pub(crate) ri_pinstructions: u64,
+    /// `ri_pcycles`.
+    _pcycles: u64,
     pub(crate) ri_energy_nj: u64,
     /// `ri_penergy_nj` through `ri_page_cache_hits`, then `ri_reserved`.
     _after_energy: [u64; 15],
@@ -97,6 +101,21 @@ impl Usage {
     /// V4 read.
     pub(crate) fn energy_nj(&self) -> Option<u64> {
         self.v6.then_some(self.ri.ri_energy_nj)
+    }
+
+    /// Its user plus system time on performance cores in ticks (`ri_user_ptime +
+    /// ri_system_ptime`), the instructions it retired (`ri_instructions`) and those it retired
+    /// there (`ri_pinstructions`); `None` from a V4 read.
+    pub(crate) fn performance_cores(&self) -> Option<(u64, u64, u64)> {
+        self.v6.then(|| {
+            (
+                self.ri
+                    .ri_user_ptime
+                    .saturating_add(self.ri.ri_system_ptime),
+                self.ri.ri_instructions,
+                self.ri.ri_pinstructions,
+            )
+        })
     }
 }
 
@@ -242,12 +261,28 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
         std::mem::offset_of!(RusageV6, ri_lifetime_max_phys_footprint) as i64,
     ),
     (
+        "offsetof(struct rusage_info_v6, ri_instructions)",
+        std::mem::offset_of!(RusageV6, ri_instructions) as i64,
+    ),
+    (
         "offsetof(struct rusage_info_v6, ri_runnable_time)",
         std::mem::offset_of!(RusageV6, ri_runnable_time) as i64,
     ),
     (
         "offsetof(struct rusage_info_v6, ri_flags)",
         std::mem::offset_of!(RusageV6, _flags) as i64,
+    ),
+    (
+        "offsetof(struct rusage_info_v6, ri_user_ptime)",
+        std::mem::offset_of!(RusageV6, ri_user_ptime) as i64,
+    ),
+    (
+        "offsetof(struct rusage_info_v6, ri_system_ptime)",
+        std::mem::offset_of!(RusageV6, ri_system_ptime) as i64,
+    ),
+    (
+        "offsetof(struct rusage_info_v6, ri_pinstructions)",
+        std::mem::offset_of!(RusageV6, ri_pinstructions) as i64,
     ),
     (
         "offsetof(struct rusage_info_v6, ri_energy_nj)",

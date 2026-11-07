@@ -193,7 +193,7 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     }
     match run(&words) {
         Ok(value) => match if words[0] == "commons-status" && words.len() == 1 {
-            Ok(commons_status_text(&value))
+            Ok(commons_status_text(&value, aterm_time::unix_millis()))
         } else {
             aterm_json::to_string(&value)
         } {
@@ -705,7 +705,10 @@ pub fn run(words: &[String]) -> Result<Value> {
     Ok(value)
 }
 
-fn commons_status_text(value: &Value) -> String {
+/// `commons-status`'s text: the Commons state, why it is not ready, what repairs wait for while
+/// they are not active, and each peer's last attempt with its age at `now_ms` (the reader's
+/// clock) and its cause, identical lines folded into one that names their slots.
+fn commons_status_text(value: &Value, now_ms: Option<u64>) -> String {
     let mut lines = vec![format!(
         "Commons: {}{}",
         value["state"].as_str().unwrap_or("unknown"),
@@ -714,32 +717,98 @@ fn commons_status_text(value: &Value) -> String {
             .map(|role| format!(" ({role})"))
             .unwrap_or_default()
     )];
-    if let Some(peers) = value["repairs"]["peers"].as_array() {
-        for peer in peers {
-            let repair = &peer["last_repair"];
-            if repair.is_null() {
-                continue;
-            }
-            lines.push(format!(
-                "peer {}: {}{}",
-                peer["slot"],
-                if repair["needs_update"].as_bool() == Some(true) {
-                    "needs-update"
-                } else {
-                    repair["outcome"].as_str().unwrap_or("unknown")
-                },
-                repair["cause"]
-                    .as_str()
-                    .map(|cause| format!(" ({cause})"))
-                    .unwrap_or_else(|| if repair["outcome"].as_str() == Some("failed") {
-                        " (cause unavailable)".into()
-                    } else {
-                        String::new()
-                    })
-            ));
+    if value["ready"].as_bool() != Some(true)
+        && let Some(detail) = value["detail"].as_str()
+    {
+        lines.push(format!("  {detail}"));
+    }
+    let repairs = &value["repairs"];
+    if let Some(visibility) = repairs["visibility"].as_str()
+        && visibility != "Active"
+    {
+        let detail = repairs["detail"].as_str().map(str::to_owned).or_else(|| {
+            repairs["cause"]
+                .as_str()
+                .map(|cause| format!("repair history unreadable ({cause})"))
+        });
+        lines.push(format!(
+            "Repairs ({}){}",
+            visibility.to_ascii_lowercase(),
+            detail
+                .map(|detail| format!(": {detail}"))
+                .unwrap_or_default()
+        ));
+    }
+    // Each distinct attempt line, in first-slot order, with the slots that share it.
+    let mut attempts: Vec<(String, Vec<u64>)> = Vec::new();
+    for peer in repairs["peers"].as_array().into_iter().flatten() {
+        let repair = &peer["last_repair"];
+        if repair.is_null() {
+            continue;
+        }
+        let outcome = if repair["needs_update"].as_bool() == Some(true) {
+            "needs-update"
+        } else {
+            repair["outcome"].as_str().unwrap_or("unknown")
+        };
+        let ago = repair["completed_at_ms"]
+            .as_u64()
+            .zip(now_ms)
+            .and_then(|(at, now)| now.checked_sub(at))
+            .map(|ms| format!(" {} ago", age(ms)))
+            .unwrap_or_default();
+        let cause = repair["cause"]
+            .as_str()
+            .map(|cause| format!(" ({cause})"))
+            .unwrap_or_default();
+        let line = format!("{outcome}{ago}{cause}");
+        let slot = peer["slot"].as_u64().unwrap_or_default();
+        match attempts.iter_mut().find(|(seen, _)| *seen == line) {
+            Some((_, slots)) => slots.push(slot),
+            None => attempts.push((line, vec![slot])),
         }
     }
+    for (line, slots) in attempts {
+        lines.push(format!(
+            "{} {}: {line}",
+            if slots.len() == 1 { "peer" } else { "peers" },
+            slot_ranges(&slots)
+        ));
+    }
     lines.join("\n")
+}
+
+/// `ms` as one coarse unit: seconds under a minute, minutes under an hour, hours under two days,
+/// then days.
+fn age(ms: u64) -> String {
+    let seconds = ms / 1000;
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m", seconds / 60),
+        3600..172_800 => format!("{}h", seconds / 3600),
+        _ => format!("{}d", seconds / 86_400),
+    }
+}
+
+/// Ascending `slots` as comma-separated runs, each consecutive run as `first-last`.
+fn slot_ranges(slots: &[u64]) -> String {
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for &slot in slots {
+        match runs.last_mut() {
+            Some((_, last)) if last.checked_add(1) == Some(slot) => *last = slot,
+            _ => runs.push((slot, slot)),
+        }
+    }
+    runs.iter()
+        .map(|&(first, last)| {
+            if first == last {
+                first.to_string()
+            } else {
+                format!("{first}-{last}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[derive(Clone, Copy)]
@@ -1073,13 +1142,95 @@ mod network_state_tests {
     use super::*;
     #[test]
     fn commons_status_text_shows_the_same_cause_as_json() {
-        let value = json!({"state":"ready","repairs":{"peers":[
+        let value = json!({"state":"ready","ready":true,"repairs":{"visibility":"Active","peers":[
             {"slot":1,"last_repair":{"outcome":"failed","cause":"legacy-past-crossing","needs_update":true}},
             {"slot":2,"last_repair":{"outcome":"failed","cause":"not-ready","needs_update":false}}
         ]}});
-        let text = commons_status_text(&value);
-        assert!(text.contains("needs-update (legacy-past-crossing)"));
-        assert!(text.contains("failed (not-ready)"));
+        assert_eq!(
+            commons_status_text(&value, None),
+            "Commons: ready\n\
+             peer 1: needs-update (legacy-past-crossing)\n\
+             peer 2: failed (not-ready)"
+        );
+    }
+
+    /// A Mac whose LAN waits for its broker, with day-old failed attempts (shaped like m22's
+    /// status: busy custody, 43 failures from about 21 hours before): the text says what the Mac
+    /// waits for and why Commons is not ready, and each attempt says how old it is, identical ones
+    /// folded into one line that names their slots.
+    #[test]
+    fn commons_status_text_names_what_it_waits_for_and_how_old_each_attempt_is() {
+        const NOW: u64 = 1_793_988_193_881;
+        const DAY_AGO: u64 = 1_793_912_949_398;
+        let failed = |slot: u64, at: u64, cause: &str| {
+            json!({"slot":slot,"last_repair":{"completed_at_ms":at,"outbound":true,
+                "stage":if cause == "lan-held" {"transport"} else {"application"},
+                "outcome":"failed","cause":cause,"needs_update":false,
+                "sent":0,"received":0,"deferred":0}})
+        };
+        let mut peers: Vec<Value> = (1..=43)
+            .map(|slot| failed(slot, DAY_AGO, "lan-held"))
+            .collect();
+        peers[4] = failed(5, DAY_AGO, "not-ready");
+        peers.push(failed(45, DAY_AGO - 3 * 86_400_000, "lan-held"));
+        peers.push(json!({"slot":44,"last_repair":Value::Null}));
+        peers.push(
+            json!({"slot":46,"last_repair":{"completed_at_ms":NOW - 90_000,
+            "outbound":false,"stage":"application","outcome":"exchanged","cause":null,
+            "needs_update":null,"sent":1,"received":2,"deferred":0}}),
+        );
+        let value = json!({"state":"writer-recovery-pending","ready":false,
+            "detail":"Local Commons custody or control journal is busy; membership has not been checked",
+            "repairs":{"visibility":"Waiting","observed_at_ms":NOW,
+                "detail":"Waits for the LAN broker, which setup's Mac password installs",
+                "peers":peers}});
+        assert_eq!(
+            commons_status_text(&value, Some(NOW)),
+            "Commons: writer-recovery-pending\n\
+             \x20 Local Commons custody or control journal is busy; membership has not been checked\n\
+             Repairs (waiting): Waits for the LAN broker, which setup's Mac password installs\n\
+             peers 1-4, 6-43: failed 20h ago (lan-held)\n\
+             peer 5: failed 20h ago (not-ready)\n\
+             peer 45: failed 3d ago (lan-held)\n\
+             peer 46: exchanged 1m ago"
+        );
+        // A reader whose clock is behind a record, or that has none, prints no age.
+        let text = commons_status_text(&value, Some(DAY_AGO - 1));
+        assert!(
+            text.contains("peers 1-4, 6-43: failed (lan-held)\n"),
+            "{text}"
+        );
+        assert!(text.ends_with("peer 46: exchanged"), "{text}");
+        assert!(!commons_status_text(&value, None).contains(" ago"));
+    }
+
+    #[test]
+    fn commons_status_text_names_an_unreadable_repair_history() {
+        let value = json!({"state":"ready","ready":true,
+            "repairs":{"visibility":"Unavailable","peers":[],"cause":"io"}});
+        assert_eq!(
+            commons_status_text(&value, None),
+            "Commons: ready\nRepairs (unavailable): repair history unreadable (io)"
+        );
+    }
+
+    #[test]
+    fn ages_are_one_coarse_unit_and_slots_fold_into_runs() {
+        assert_eq!(
+            [
+                0,
+                59_999,
+                60_000,
+                3_599_999,
+                3_600_000,
+                172_799_999,
+                172_800_000
+            ]
+            .map(age),
+            ["0s", "59s", "1m", "59m", "1h", "47h", "2d"]
+        );
+        assert_eq!(slot_ranges(&[1, 2, 3, 5, 7, 8]), "1-3, 5, 7-8");
+        assert_eq!(slot_ranges(&[4]), "4");
     }
     use aterm_types::network_state::{
         HistoryState, NetworkObservation, ServiceAvailability, ServiceState, ServiceStates,
@@ -1158,8 +1309,8 @@ mod network_state_tests {
             json!({"why":"not_sampled"})
         );
         assert_eq!(place["alab"]["state"], json!("away"));
-        assert_eq!(place["alab"]["known"], json!(41));
-        assert_eq!(place["alab"]["reachable"], json!(0));
+        assert_eq!(place["alab"]["known"], Value::Null, "no member count");
+        assert_eq!(place["alab"]["reachable"], Value::Null, "no member count");
         assert_eq!(place["alab"]["since_ms"], json!(90_000));
         assert_eq!(value["live_network"], json!(true));
         assert_eq!(
@@ -1187,7 +1338,7 @@ mod network_state_tests {
             || (at, Some(100_000)),
         );
         assert_eq!(value["place"]["state"], json!("alab-lan"));
-        assert_eq!(value["place"]["alab"]["reachable"], json!(12));
+        assert_eq!(value["place"]["alab"]["state"], json!("here"));
         assert_eq!(value["live_observation"], json!(false));
         assert_eq!(value["live_network"], json!(false));
         for service in ["accounts", "secrets"] {

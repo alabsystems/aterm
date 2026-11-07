@@ -3,6 +3,10 @@
 //! Private local resource-admission v3 wire. Byte strings preserve Unix arguments.
 use std::io;
 
+#[path = "resource_admission_accounting.rs"]
+mod accounting;
+pub use accounting::{AccountedEventFrame, AccountingObservation, AccountingScope, CpuTimes};
+
 /// Exact protocol version; older encodings are refused.
 pub const VERSION: u8 = 3;
 /// Maximum frame size, excluding the four-byte big-endian length prefix.
@@ -22,6 +26,14 @@ pub const REQUEST: &str = "resource-admission-v3 attach\n";
 /// Owner endpoint is ready to receive the submission frame. Prevents control
 /// line readers from prefetching binary payload before the raw socket handoff.
 pub const PREPARE: &str = "OK resource-admission-v3 request";
+/// Explicit accounted root negotiation; legacy attachment is never retried.
+pub const ACCOUNTED_REQUEST: &str = "resource-admission-v3 attach-accounted-v1\n";
+/// Explicit permission to send the accounted request, before rights transfer.
+pub const ACCOUNTED_PREPARE: &str = "OK resource-admission-v3 accounted-v1 request";
+/// Accounting-capable owner accepted the authenticated request.
+pub const ACCOUNTED_ADMISSION: &str = "OK resource-admission-v3 accounted-v1 fds=4";
+/// Accounted attachment ownership accepted; no execution or settlement fact.
+pub const ACCOUNTED_ATTACHED: &str = "OK resource-admission-v3 accounted-v1 attached";
 
 /// Exact session and unique submission-attempt binding, never a credential.
 #[derive(Clone, Debug, PartialEq, Eq)]

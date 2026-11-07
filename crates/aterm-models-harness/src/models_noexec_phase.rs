@@ -13,6 +13,7 @@ pub fn noexec_phase_model() -> Model {
             var disk = 0; var ack = 0; var attempted = 0; var retried = 0;
             var failed = 0; var conflict = 0; var read = 0;
             var accepted_conflict = 0; var inferred_legacy = 0; var blocked = 0;
+            var other = 0; var wrong_position = 0;
             action Close when (disk == 0 && attempted == 0) { disk = 1; ack = 1; }
             action Legacy when (disk == 0 && attempted == 0) { disk = 2; }
             action Refused when (disk == 0 && attempted == 0) {
@@ -32,19 +33,23 @@ pub fn noexec_phase_model() -> Model {
                 conflict = 1;
                 accepted_conflict = if Buggy == 1 {1} else {0};
             }
+            action AppendOther when (disk == 1 && other == 0) { other = 1; }
             action Read when (disk > 0 && read == 0) {
                 read = 1;
                 inferred_legacy = if disk == 2 && Buggy == 2 {1} else {0};
+                wrong_position = if disk == 1 && other == 1 && Buggy == 5 {1} else {0};
             }
             invariant ExactPhase: accepted_conflict == 0;
             invariant LegacyUnknown: inferred_legacy == 0;
             invariant NoFailedAcknowledgement: failed == 0 || ack == 0;
             invariant RetryProgress: blocked == 0;
+            invariant OriginalPosition: wrong_position == 0;
             bound Finite: 0 <= disk && disk <= 2 && 0 <= ack && ack <= 1
                 && 0 <= attempted && attempted <= 1 && 0 <= retried && retried <= 1
                 && 0 <= failed && failed <= 1 && 0 <= conflict && conflict <= 1
                 && 0 <= read && read <= 1 && 0 <= accepted_conflict && accepted_conflict <= 1
-                && 0 <= inferred_legacy && inferred_legacy <= 1 && 0 <= blocked && blocked <= 1;
+                && 0 <= inferred_legacy && inferred_legacy <= 1 && 0 <= blocked && blocked <= 1
+                && 0 <= other && other <= 1 && 0 <= wrong_position && wrong_position <= 1;
         }
     }
 }

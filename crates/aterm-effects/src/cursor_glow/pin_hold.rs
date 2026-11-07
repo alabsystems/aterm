@@ -90,6 +90,23 @@ impl PinHold {
         self.memo[slot] = (light, worn);
         worn
     }
+
+    /// `light` (`0x00RRGGBB`) as the pin's own light laying the page as bright
+    /// ([`pin_light_at`]): a grey light too, which [`Self::wear`] leaves grey.
+    fn ray(&mut self, light: u32) -> u32 {
+        let light = light & 0x00FF_FFFF;
+        let slot = (light.wrapping_mul(0x9E37_79B1) >> 26) as usize % MEMO;
+        if self.memo[slot].0 == light {
+            return self.memo[slot].1;
+        }
+        let worn = if light == 0 {
+            0
+        } else {
+            pin_light_at(self.pin, self.page, light)
+        };
+        self.memo[slot] = (light, worn);
+        worn
+    }
 }
 
 /// A colour's chroma: its largest channel less its least.
@@ -257,6 +274,32 @@ fn kept_chroma(pin_chroma: u32, own: u32, most: u32, top: u32, one_sided: bool) 
 }
 
 impl CursorGlow {
+    /// The momentum glow's lights (`momentum`, laid on a dark page) as Classic's pinned
+    /// colour's own light, each laying the page as bright as it did ([`pin_light_at`]).
+    /// Classic's one-colour face draws its pin through its own wake and takes no
+    /// [`Self::hold_pinned_lights`], and beside a chosen colour the glow lays a neutral white
+    /// (it never recolours the pin), which that hold would keep white. Unheld, that white lay
+    /// on the pin's neutral ground ([`Self::classic_pin_grounded`]), which takes the page's own
+    /// tint out from under the pin's lights, as a grey disc in and left of the caret on
+    /// Solarized Dark's teal after an Enter (`classic-pink/solarized-dark/
+    /// classic-dark-enter-bottom.e470`, the after-land lows' W10), where every other style's
+    /// glow lifts the teal. Nothing for any other style or page, or where a test keeps composed
+    /// r3's glow.
+    pub(crate) fn hold_classic_momentum(&self, cfg: &GlowConfig, momentum: &mut [GlowQuad]) {
+        #[cfg(test)]
+        if self.classic_momentum_unheld {
+            return;
+        }
+        if !cfg.dark_theme || !self.classic_pin_grounded(cfg) || self.pin_chroma_free() {
+            return;
+        }
+        let mut hold = PinHold::new(cfg.color & 0x00FF_FFFF, cfg.theme_bg);
+        for q in momentum.iter_mut() {
+            q.color = hold.ray(q.color);
+            q.color2 = hold.ray(q.color2);
+        }
+    }
+
     /// Every light of the frame worn in the pinned trail colour on a dark page ([`self`]): `out`
     /// (the frame's over quads) and the glow's own halos, under quads and ramps. Nothing where
     /// the trail wears no pinned colour, on a light page (whose inks the light ground's chosen

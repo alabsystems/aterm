@@ -658,7 +658,7 @@ fn route_get<T>(
             events: libc::POLLIN,
             revents: 0,
         };
-        let millis = libc::c_int::try_from(left.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
+        let millis = crate::deadline::poll_timeout_ms(left);
         // SAFETY: `poll` is one live pollfd and the count passed is 1.
         let ready = unsafe { libc::poll(&raw mut poll, 1, millis) };
         if ready < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
@@ -965,18 +965,40 @@ mod tests {
 }
 
 /// A socket the kernel writes to on each change to this machine's addresses and links (and, on
-/// Linux, routes): `PF_ROUTE` on macOS, `NETLINK_ROUTE` joined to those groups on Linux. A retry
+/// Linux, routes): filtered `PF_SYSTEM` network events on macOS, `NETLINK_ROUTE` joined to
+/// those groups on Linux. A retry
 /// that waits on it starts at the change (another Wi-Fi, a VPN, a wake), not at its next look.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub struct RouteChanges(std::os::fd::OwnedFd);
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl std::os::fd::AsFd for RouteChanges {
-    /// Borrow readiness so a network owner can wait on route changes and its
-    /// sockets together. [`RouteChanges::wait`] still filters and drains events.
+    /// Borrow readiness so a network owner can poll route changes beside its own sockets. Its
+    /// readiness is any message, a change or not, or an error: Linux reports a netlink overflow
+    /// as POLLERR until a read takes it. Such an owner reads any readiness, an error included,
+    /// with [`RouteChanges::read_waiting`] (an overflow reads as a change, and only a read that
+    /// fails says `None`) and goes on waiting when that says no change came, as
+    /// [`RouteChanges::wait_beside`] does for one other descriptor.
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         std::os::fd::AsFd::as_fd(&self.0)
     }
+}
+
+/// What ended a [`RouteChanges::wait_beside`].
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteWake {
+    /// A change of network came ([`names_a_change`], or an overflow), and the rest of its burst
+    /// was read.
+    Change,
+    /// The other descriptor was readable, at its end or in error, before any change came. The
+    /// caller reads it: nothing of it was consumed.
+    Also,
+    /// The deadline came with neither.
+    Timeout,
+    /// The route socket, or poll(2) itself, failed. A failed socket polls ready again at once,
+    /// so the caller stops polling it rather than wait on it again.
+    Failed,
 }
 
 /// The netlink groups [`RouteChanges`] joins (`linux/rtnetlink.h`): links, and IPv4 and IPv6
@@ -989,23 +1011,44 @@ const RTMGRP_CHANGES: u32 = 0x1 | 0x10 | 0x40 | 0x100 | 0x400;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const BURST: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// The `PF_ROUTE` message types (`net/route.h`) that name a change of network: `RTM_NEWADDR`,
-/// `RTM_DELADDR`, `RTM_IFINFO` and `RTM_IFINFO2`.
-#[cfg(target_os = "macos")]
-const NETWORK_CHANGES: [u8; 4] = [0xc, 0xd, 0xe, 0x12];
+/// Bound one drain even if notifications arrive faster than this thread can consume them.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const MAX_DRAIN_MESSAGES: usize = 256;
 
-/// Whether one message a [`RouteChanges`] socket read names a change of network. On macOS
-/// `PF_ROUTE` carries every routing-table message, the ARP and neighbour entries that come and
-/// go with LAN traffic and each lookup's miss included: only an address added or removed, or a
-/// link's state, counts (`rtm_type`, the fourth byte of every header). On Linux the groups
-/// joined carry only changes. A read that overflowed (`ENOBUFS`) lost messages, so it counts.
+/// `sys/kern_event.h`: `_IOW('e', 2, struct kev_request)`, whose three fields are u32.
+#[cfg(target_os = "macos")]
+const SET_KERNEL_EVENT_FILTER: libc::c_ulong = 0x800c_6502;
+
+/// `sys/sys_domain.h`'s SYSPROTO_EVENT (not present in the pinned libc surface).
+#[cfg(target_os = "macos")]
+const KERNEL_EVENT_PROTOCOL: libc::c_int = 1;
+
+/// Whether a kernel notification names an address, router, attachment or link-state change.
+/// macOS `net/net_kev.h` supplies the subclasses and event codes; the kernel filters the
+/// vendor and class before delivery. Route lookups and misses never enter this socket.
+/// On Linux the groups joined carry only changes. An overflow (`ENOBUFS`) counts as a change.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn names_a_change(message: &[u8]) -> bool {
     #[cfg(target_os = "macos")]
     {
-        message
-            .get(3)
-            .is_some_and(|kind| NETWORK_CHANGES.contains(kind))
+        let Some(header) = message.get(..24) else {
+            return false;
+        };
+        let word =
+            |at: usize| u32::from_ne_bytes(header[at..at + 4].try_into().expect("header word"));
+        let size = usize::try_from(word(0)).unwrap_or(usize::MAX);
+        if !(24..=message.len()).contains(&size) || word(4) != 1 || word(8) != 1 {
+            return false;
+        }
+        match word(12) {
+            // IPv4 address, subnet, destination, and router resolution changes.
+            1 => matches!(word(20), 1..=7 | 9 | 10),
+            // Link flags/media/attachment, protocol, address, capabilities and delegation.
+            2 => matches!(word(20), 1..=6 | 9..=17 | 19 | 23 | 25 | 30),
+            // IPv6 addresses and the default router; not requests for a NAT64 prefix.
+            6 => matches!(word(20), 1..=6),
+            _ => false,
+        }
     }
     #[cfg(target_os = "linux")]
     {
@@ -1015,11 +1058,16 @@ fn names_a_change(message: &[u8]) -> bool {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl RouteChanges {
-    /// A socket that hears each change from now on; `None` where the kernel refuses one.
-    pub fn open() -> Option<RouteChanges> {
+    /// A socket that hears each change from now on.
+    ///
+    /// # Errors
+    /// The errno of the step the kernel refused, so a caller that does without the socket can
+    /// say why: `socket(2)` (`EMFILE` with no descriptor free), its close-on-exec flag or its
+    /// event filter on macOS, `bind(2)` on Linux, or its mark ([`crate::kept_out`]).
+    pub fn open() -> std::io::Result<RouteChanges> {
         use std::os::fd::FromRawFd as _;
         #[cfg(target_os = "macos")]
-        let (domain, kind, protocol) = (libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC);
+        let (domain, kind, protocol) = (libc::AF_SYSTEM, libc::SOCK_RAW, KERNEL_EVENT_PROTOCOL);
         #[cfg(target_os = "linux")]
         let (domain, kind, protocol) = (
             libc::AF_NETLINK,
@@ -1040,9 +1088,19 @@ impl RouteChanges {
             if unsafe { libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            #[cfg(target_os = "macos")]
+            {
+                // KEV_VENDOR_APPLE, KEV_NETWORK_CLASS, KEV_ANY_SUBCLASS. kern_event.h's
+                // kev_request is exactly these three consecutive u32 fields.
+                let filter = [1_u32, 1, 0];
+                // SAFETY: ioctl reads the live twelve-byte filter in the declared C layout;
+                // raw is this owned SYSPROTO_EVENT socket and the request is SIOCSKEVFILT.
+                if unsafe { libc::ioctl(raw, SET_KERNEL_EVENT_FILTER, filter.as_ptr()) } < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
             Ok(fd)
-        })
-        .ok()?;
+        })?;
         #[cfg(target_os = "linux")]
         let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
         #[cfg(target_os = "linux")]
@@ -1060,10 +1118,17 @@ impl RouteChanges {
                 )
             };
             if bound < 0 {
-                return None;
+                return Err(std::io::Error::last_os_error());
             }
         }
-        Some(RouteChanges(fd))
+        Ok(RouteChanges(fd))
+    }
+
+    /// A stand-in whose messages a test writes in the kernel's format to `socket`'s peer.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn over(socket: std::os::fd::OwnedFd) -> RouteChanges {
+        RouteChanges(socket)
     }
 
     /// Wait at most `most` for a change of network ([`names_a_change`]), then read the rest of
@@ -1071,24 +1136,102 @@ impl RouteChanges {
     /// that fails otherwise waits out `most` and says none came, so a retry that waits on it
     /// keeps its own pace.
     pub fn wait(&self, most: std::time::Duration) -> bool {
-        let now = std::time::Instant::now();
-        let deadline = now
-            .checked_add(most)
-            .unwrap_or_else(|| now + std::time::Duration::from_secs(365 * 24 * 3600));
-        let wait_out = || {
-            std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
-            false
-        };
-        loop {
-            match self.readable(deadline) {
-                Some(true) => {}
-                Some(false) => return false,
-                None => return wait_out(),
+        let deadline = Self::deadline(most);
+        match self.until(deadline, None) {
+            RouteWake::Change => true,
+            RouteWake::Also | RouteWake::Timeout => false,
+            RouteWake::Failed => {
+                std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+                false
             }
-            match self.read_waiting() {
-                Some(true) => return true,
-                Some(false) => {}
-                None => return wait_out(),
+        }
+    }
+
+    /// Wait at most `most` for a change of network or for `also` (a descriptor the caller reads
+    /// itself) to be ready, whichever comes first, and say which ended the wait. Messages that
+    /// name no change are read and passed over and the wait goes on for the rest of its time, so
+    /// a busy routing table or kernel event stream never ends it early. A zero `most` looks once.
+    pub fn wait_beside(
+        &self,
+        most: std::time::Duration,
+        also: Option<std::os::fd::BorrowedFd<'_>>,
+    ) -> RouteWake {
+        self.until(Self::deadline(most), also)
+    }
+
+    fn deadline(most: std::time::Duration) -> std::time::Instant {
+        let now = std::time::Instant::now();
+        now.checked_add(most)
+            .unwrap_or_else(|| now + std::time::Duration::from_secs(365 * 24 * 3600))
+    }
+
+    /// [`Self::wait_beside`] to an absolute `deadline`.
+    fn until(
+        &self,
+        deadline: std::time::Instant,
+        also: Option<std::os::fd::BorrowedFd<'_>>,
+    ) -> RouteWake {
+        self.until_by(deadline, also, |fds, millis| {
+            // SAFETY: `fds` is two live pollfds, each a descriptor borrowed for this call or -1,
+            // which poll(2) passes over and reports nothing of.
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, millis) };
+            if ready < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    /// [`Self::until`] over `poll`, which fills in what poll(2) reports of the route socket and
+    /// of `also` (or -1). Every report of a descriptor, an error or a hangup alone included, ends
+    /// this pass's look at it: Linux reports a netlink overflow as POLLERR, and macOS a
+    /// descriptor kqueue cannot watch as POLLNVAL, without POLLIN, and poll(2) reports either
+    /// again at once until something takes it, so a report passed over would poll again at once
+    /// to the deadline.
+    fn until_by(
+        &self,
+        deadline: std::time::Instant,
+        also: Option<std::os::fd::BorrowedFd<'_>>,
+        mut poll: impl FnMut(&mut [libc::pollfd; 2], libc::c_int) -> std::io::Result<()>,
+    ) -> RouteWake {
+        use std::os::fd::AsRawFd as _;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let mut fds = [
+                libc::pollfd {
+                    fd: self.0.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: also.map_or(-1, |fd| fd.as_raw_fd()),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let millis = crate::deadline::poll_timeout_ms(left);
+            if let Err(error) = poll(&mut fds, millis) {
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return RouteWake::Failed;
+            }
+            // The route socket first: what it holds is read now, a change or not, so a message
+            // that names none never stays to end the next wait, and the read decides what an
+            // error means (an overflow is a change; only a read that fails is a failure).
+            if fds[0].revents != 0 {
+                match self.read_waiting() {
+                    Some(true) => return RouteWake::Change,
+                    Some(false) => {}
+                    None => return RouteWake::Failed,
+                }
+            }
+            if fds[1].revents != 0 {
+                return RouteWake::Also;
+            }
+            if left.is_zero() {
+                return RouteWake::Timeout;
             }
         }
     }
@@ -1108,34 +1251,50 @@ impl RouteChanges {
     /// Whether a message is waiting by `deadline`; `None` when poll(2) failed otherwise than
     /// by a signal's interruption (which looks again).
     fn readable(&self, deadline: std::time::Instant) -> Option<bool> {
+        self.readable_by(deadline, std::time::Instant::now, |poll, millis| {
+            // SAFETY: `poll` is one live pollfd, initialized by `readable_by`.
+            let ready = unsafe { libc::poll(poll, 1, millis) };
+            if ready < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(ready > 0)
+            }
+        })
+    }
+
+    fn readable_by(
+        &self,
+        deadline: std::time::Instant,
+        now: impl Fn() -> std::time::Instant,
+        mut poll: impl FnMut(&mut libc::pollfd, libc::c_int) -> std::io::Result<bool>,
+    ) -> Option<bool> {
         use std::os::fd::AsRawFd as _;
         loop {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            let mut poll = libc::pollfd {
+            let left = deadline.saturating_duration_since(now());
+            if left.is_zero() {
+                return Some(false);
+            }
+            let mut descriptor = libc::pollfd {
                 fd: self.0.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             };
-            let millis = libc::c_int::try_from(left.as_millis()).unwrap_or(libc::c_int::MAX);
-            // SAFETY: `poll` is one live pollfd and the count passed is 1.
-            let ready = unsafe { libc::poll(&raw mut poll, 1, millis) };
-            if ready >= 0 {
-                return Some(ready > 0);
-            }
-            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-                return None;
+            let millis = crate::deadline::poll_timeout_ms(left);
+            match poll(&mut descriptor, millis) {
+                Ok(ready) => return Some(ready),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return None,
             }
         }
     }
 
-    /// Read every message waiting: whether one named a change of network; `None` when the
+    /// Read a bounded batch of waiting messages: whether one named a change; `None` when the
     /// socket failed (an overflow, which lost messages, counts as a change).
     fn drain(&self) -> Option<bool> {
         use std::os::fd::AsRawFd as _;
-        let mut buf = [0u8; 8192];
-        let mut changed = false;
-        loop {
-            // SAFETY: `buf` is live and writable for its whole length.
+        Self::drain_by(|buf| {
+            // SAFETY: `buf` is live and writable for its whole length. The socket stays
+            // borrowed, and MSG_DONTWAIT keeps an empty receive from blocking.
             let read = unsafe {
                 libc::recv(
                     self.0.as_raw_fd(),
@@ -1144,56 +1303,398 @@ impl RouteChanges {
                     libc::MSG_DONTWAIT,
                 )
             };
-            if let Ok(read) = usize::try_from(read)
-                && read > 0
-            {
-                changed |= names_a_change(&buf[..read]);
-                continue;
+            usize::try_from(read).map_err(|_| std::io::Error::last_os_error())
+        })
+    }
+
+    fn drain_by(mut recv: impl FnMut(&mut [u8]) -> std::io::Result<usize>) -> Option<bool> {
+        let mut buf = [0u8; 8192];
+        let mut changed = false;
+        for _ in 0..MAX_DRAIN_MESSAGES {
+            match recv(&mut buf) {
+                Ok(0) => return changed.then_some(true),
+                Ok(read) => changed |= names_a_change(&buf[..read]),
+                Err(error) => {
+                    return match error.raw_os_error() {
+                        Some(libc::EAGAIN | libc::EINTR) => Some(changed),
+                        Some(libc::ENOBUFS) => Some(true),
+                        _ => changed.then_some(true),
+                    };
+                }
             }
-            let error = std::io::Error::last_os_error();
-            return match error.raw_os_error() {
-                _ if read == 0 => changed.then_some(true),
-                Some(libc::EAGAIN | libc::EINTR) => Some(changed),
-                Some(libc::ENOBUFS) => Some(true),
-                _ => changed.then_some(true),
-            };
         }
+        Some(changed)
     }
 }
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[path = "network_drain_tests.rs"]
+mod drain_tests;
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod route_change_tests {
     use super::*;
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
 
-    /// The kernel gives a process its route-change socket, and a wait on it ends by its bound
-    /// whether or not a change came meanwhile.
     #[test]
-    fn a_route_change_socket_opens_and_its_wait_ends() {
+    fn poll_rounding_does_not_report_timeout_before_the_budget() {
+        let routes = RouteChanges::open().expect("route socket");
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let budget = Duration::from_micros(500);
+        let ready = routes.readable_by(
+            start + budget,
+            || clock.get(),
+            |_fd, millis| {
+                let millis = u64::try_from(millis).expect("finite nonnegative poll timeout");
+                clock.set(clock.get() + Duration::from_millis(millis));
+                Ok(false)
+            },
+        );
+        assert_eq!(ready, Some(false));
+        assert!(clock.get().duration_since(start) >= budget);
+    }
+
+    #[test]
+    fn poll_rounding_expired_budget_does_not_poll_again() {
+        let routes = RouteChanges::open().expect("network event socket");
+        let start = Instant::now();
+        for now in [start, start + Duration::from_nanos(1)] {
+            assert_eq!(
+                routes.readable_by(
+                    start,
+                    || now,
+                    |_fd, _millis| {
+                        panic!("expired readiness must end even when messages remain queued")
+                    }
+                ),
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn poll_rounding_interruption_at_the_deadline_stops_retrying() {
+        let routes = RouteChanges::open().expect("network event socket");
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let calls = Cell::new(0);
+        let budget = Duration::from_millis(1);
+        let ready = routes.readable_by(
+            start + budget,
+            || clock.get(),
+            |_fd, _millis| {
+                calls.set(calls.get() + 1);
+                assert_eq!(calls.get(), 1, "no interrupted poll after expiry");
+                clock.set(start + budget);
+                Err(std::io::ErrorKind::Interrupted.into())
+            },
+        );
+        assert_eq!(ready, Some(false));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn poll_rounding_interruption_does_not_restart_the_budget() {
+        let routes = RouteChanges::open().expect("route socket");
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let calls = Cell::new(0);
+        let budget = Duration::from_micros(2500);
+        let ready = routes.readable_by(
+            start + budget,
+            || clock.get(),
+            |_fd, millis| {
+                calls.set(calls.get() + 1);
+                match calls.get() {
+                    1 => {
+                        clock.set(clock.get() + Duration::from_micros(1500));
+                        Err(std::io::ErrorKind::Interrupted.into())
+                    }
+                    2 => {
+                        let millis =
+                            u64::try_from(millis).expect("finite nonnegative poll timeout");
+                        clock.set(clock.get() + Duration::from_millis(millis));
+                        Ok(false)
+                    }
+                    _ => panic!("unexpected extra poll"),
+                }
+            },
+        );
+        assert_eq!(ready, Some(false));
+        assert_eq!(calls.get(), 2);
+        assert_eq!(clock.get().duration_since(start), budget);
+    }
+
+    /// The kernel gives a process its route-change socket, close-on-exec, and a wait on it ends
+    /// by its bound whether or not a change came meanwhile.
+    #[test]
+    fn a_route_change_socket_opens_close_on_exec_and_its_wait_ends() {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
         let changes = RouteChanges::open().expect("the kernel's route socket");
+        // SAFETY: F_GETFD reads the live descriptor's flags and touches no memory.
+        let flags = unsafe { libc::fcntl(changes.as_fd().as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0, "{}", std::io::Error::last_os_error());
+        assert_ne!(flags & libc::FD_CLOEXEC, 0, "a child would inherit it");
         let _came = changes.wait(std::time::Duration::from_millis(50));
     }
 
-    /// An address added or removed, or a link's state, is a change of network; the ARP and
-    /// neighbour entries LAN traffic adds and drops, and a lookup's miss, are not (macOS's
-    /// `PF_ROUTE` carries them all).
+    /// Address, router and link-state events wake a reader; unrelated network activity does not.
     #[cfg(target_os = "macos")]
     #[test]
-    fn only_an_address_or_a_link_is_a_change_of_network() {
-        let message = |kind: u8| {
-            let mut header = vec![0u8; 92];
-            header[2] = 5; // RTM_VERSION
-            header[3] = kind;
-            header
+    fn network_notifications_ignore_unrelated_activity() {
+        let message = |subclass: u32, code: u32| {
+            [24_u32, 1, 1, subclass, 37, code]
+                .into_iter()
+                .flat_map(u32::to_ne_bytes)
+                .collect::<Vec<_>>()
         };
-        // RTM_NEWADDR, RTM_DELADDR, RTM_IFINFO, RTM_IFINFO2.
-        for kind in [0xc, 0xd, 0xe, 0x12] {
-            assert!(names_a_change(&message(kind)), "type {kind:#x}");
+        for (subclass, code) in [
+            (1, 1),
+            (1, 3),
+            (1, 6),
+            (1, 9),
+            (1, 10),
+            (2, 1),
+            (2, 9),
+            (2, 11),
+            (2, 12),
+            (2, 13),
+            (2, 16),
+            (2, 25),
+            (6, 1),
+            (6, 3),
+            (6, 6),
+        ] {
+            assert!(
+                names_a_change(&message(subclass, code)),
+                "subclass={subclass} code={code}"
+            );
         }
-        // RTM_ADD, RTM_DELETE, RTM_CHANGE, RTM_GET, RTM_MISS, RTM_RESOLVE, RTM_NEWMADDR.
-        for kind in [0x1, 0x2, 0x3, 0x4, 0x7, 0xb, 0xf] {
-            assert!(!names_a_change(&message(kind)), "type {kind:#x}");
+        for (subclass, code) in [
+            (1, 8),
+            (2, 7),
+            (2, 8),
+            (2, 18),
+            (2, 20),
+            (2, 21),
+            (2, 22),
+            (6, 7),
+            (3, 1),
+        ] {
+            assert!(
+                !names_a_change(&message(subclass, code)),
+                "subclass={subclass} code={code}"
+            );
         }
         assert!(!names_a_change(&[]));
+        for at in [0, 4, 8] {
+            let mut invalid = message(1, 1);
+            invalid[at..at + 4].copy_from_slice(&99_u32.to_ne_bytes());
+            assert!(!names_a_change(&invalid));
+        }
+        assert!(!names_a_change(&message(1, 1)[..23]));
+    }
+
+    /// A wait's length beside a flood: long against a poll's millisecond, short for a test.
+    #[cfg(target_os = "macos")]
+    const FLOODED: std::time::Duration = std::time::Duration::from_millis(300);
+
+    /// A wait for something that must happen: a hang detector, never a latency budget.
+    const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Whether a stand-in's send found its peer's queue full: macOS answers `ENOBUFS` for a
+    /// local datagram socket, blocking or not, where a stream says it would block.
+    #[cfg(target_os = "macos")]
+    fn queue_full(error: &std::io::Error) -> bool {
+        error.kind() == std::io::ErrorKind::WouldBlock
+            || error.raw_os_error() == Some(libc::ENOBUFS)
+    }
+
+    /// One kernel event message as `PF_SYSTEM` delivers it: Apple's, the network class's. On
+    /// Linux any message of the groups joined is a change, so each stands for one there.
+    fn kernel_event(subclass: u32, code: u32) -> Vec<u8> {
+        [24_u32, 1, 1, subclass, 37, code]
+            .into_iter()
+            .flat_map(u32::to_ne_bytes)
+            .collect()
+    }
+
+    /// The wait's contract over a socket a test writes: a flood of messages that name no change
+    /// is read and passed over to the deadline; a change ends the wait as one, the other
+    /// descriptor as itself, and a socket whose peer is gone as a failure, never a busy poll.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_route_wait_ends_on_a_change_the_other_descriptor_or_its_deadline() {
+        use std::io::Write as _;
+        use std::os::fd::AsFd as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (heard, kernel) = std::os::unix::net::UnixDatagram::pair().expect("a socket pair");
+        kernel
+            .set_nonblocking(true)
+            .expect("a writer that never blocks");
+        let changes = RouteChanges::over(heard.into());
+        let (quiet, mut ring) = std::io::pipe().expect("the other descriptor");
+        let flooding = std::sync::Arc::new(AtomicBool::new(true));
+        let (flooded, floods) = std::sync::mpsc::channel();
+        let (begun, beginning) = std::sync::mpsc::channel();
+        let flood = {
+            let flooding = std::sync::Arc::clone(&flooding);
+            let kernel = kernel.try_clone().expect("the flood's end");
+            std::thread::spawn(move || {
+                let unrelated = kernel_event(3, 1);
+                let mut sent = 0_u64;
+                while flooding.load(Ordering::Acquire) {
+                    match kernel.send(&unrelated) {
+                        Ok(_) => {
+                            if sent == 0 {
+                                let _ = begun.send(());
+                            }
+                            sent += 1;
+                        }
+                        Err(error) if queue_full(&error) => crate::deadline::poll_yield(),
+                        Err(error) => panic!("the flood's send: {error}"),
+                    }
+                }
+                let _ = flooded.send(sent);
+            })
+        };
+        beginning.recv_timeout(HANG).expect("the flood begins");
+        let began = std::time::Instant::now();
+        let woke = changes.wait_beside(FLOODED, Some(quiet.as_fd()));
+        let waited = began.elapsed();
+        flooding.store(false, Ordering::Release);
+        let sent = floods.recv_timeout(HANG).expect("the flood ends");
+        flood.join().expect("the flood ends cleanly");
+        assert_eq!(woke, RouteWake::Timeout, "{sent} unrelated messages");
+        assert!(
+            waited >= FLOODED,
+            "{sent} unrelated messages ended a {FLOODED:?} wait after {waited:?}"
+        );
+        // The flood may have filled the queue: the change waits for the room the wait's reads
+        // make.
+        let (told, tells) = std::sync::mpsc::channel();
+        let teller = std::thread::spawn(move || {
+            let change = kernel_event(1, 1);
+            let sent = loop {
+                match kernel.send(&change) {
+                    Err(error) if queue_full(&error) => crate::deadline::poll_yield(),
+                    sent => break sent,
+                }
+            };
+            let _ = told.send(sent.map(|_| kernel));
+        });
+        assert_eq!(
+            changes.wait_beside(HANG, Some(quiet.as_fd())),
+            RouteWake::Change
+        );
+        let kernel = tells
+            .recv_timeout(HANG)
+            .expect("the change is told")
+            .expect("an address change");
+        teller.join().expect("the teller ends cleanly");
+        ring.write_all(&[1]).expect("ring the other descriptor");
+        assert_eq!(
+            changes.wait_beside(HANG, Some(quiet.as_fd())),
+            RouteWake::Also
+        );
+        // A zero wait looks once: at nothing waiting, then at a change already queued.
+        assert_eq!(
+            changes.wait_beside(std::time::Duration::ZERO, None),
+            RouteWake::Timeout
+        );
+        kernel.send(&kernel_event(2, 13)).expect("a link coming up");
+        assert_eq!(
+            changes.wait_beside(std::time::Duration::ZERO, None),
+            RouteWake::Change
+        );
+        let (heard, peer) = std::os::unix::net::UnixStream::pair().expect("a stream pair");
+        drop(peer);
+        let failed = RouteChanges::over(heard.into());
+        assert_eq!(failed.wait_beside(HANG, None), RouteWake::Failed);
+        let began = std::time::Instant::now();
+        assert!(!failed.wait(FLOODED), "a failed socket tells no change");
+        assert!(
+            began.elapsed() >= FLOODED,
+            "a failed socket's wait is waited out"
+        );
+    }
+
+    /// Whatever poll(2) reports of either descriptor, an error, a hangup or an invalid
+    /// descriptor with no POLLIN included, the wait takes at the poll that reported it, and never
+    /// polls again at once with it untaken, which would spin to the deadline: the route socket is
+    /// read and the read decides (a change queued is `Change`, its peer gone is `Failed`), and
+    /// the other descriptor ends the wait as `Also`.
+    #[test]
+    fn a_wait_takes_any_report_of_either_descriptor_at_once() {
+        use std::os::fd::AsFd as _;
+        // One poll that reports `route` and `also`; a second means the first was passed over.
+        let once = |route: libc::c_short, also: libc::c_short| {
+            let polls = Cell::new(0);
+            move |fds: &mut [libc::pollfd; 2], _millis: libc::c_int| -> std::io::Result<()> {
+                polls.set(polls.get() + 1);
+                assert_eq!(
+                    polls.get(),
+                    1,
+                    "polled again at once after reports {route:#x} and {also:#x}"
+                );
+                fds[0].revents = route;
+                fds[1].revents = also;
+                Ok(())
+            }
+        };
+        let (quiet, _writer) = std::io::pipe().expect("the other descriptor");
+        for report in [libc::POLLERR, libc::POLLHUP, libc::POLLNVAL] {
+            let (heard, kernel) = std::os::unix::net::UnixDatagram::pair().expect("a socket pair");
+            let witness = heard.try_clone().expect("a second handle");
+            witness
+                .set_nonblocking(true)
+                .expect("a witness that never blocks");
+            let changes = RouteChanges::over(heard.into());
+            kernel.send(&kernel_event(1, 1)).expect("an address change");
+            assert_eq!(
+                changes.until_by(Instant::now() + HANG, None, once(report, 0)),
+                RouteWake::Change,
+                "a route socket that reported {report:#x} beside a change queued"
+            );
+            assert_eq!(
+                witness.recv(&mut [0; 64]).map_err(|error| error.kind()),
+                Err(std::io::ErrorKind::WouldBlock),
+                "the read took what the socket held"
+            );
+            let (heard, peer) = std::os::unix::net::UnixStream::pair().expect("a stream pair");
+            drop(peer);
+            let gone = RouteChanges::over(heard.into());
+            assert_eq!(
+                gone.until_by(Instant::now() + HANG, None, once(report, 0)),
+                RouteWake::Failed,
+                "a route socket that reported {report:#x} and whose read fails"
+            );
+            assert_eq!(
+                changes.until_by(Instant::now() + HANG, Some(quiet.as_fd()), once(0, report)),
+                RouteWake::Also,
+                "the other descriptor that reported {report:#x}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kernel_notification_socket_filters_before_delivery() {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        let changes = RouteChanges::open().expect("kernel network notification socket");
+        let mut filter = [0_u32; 3];
+        // SAFETY: SIOCGKEVFILT writes kern_event.h's three-u32 kev_request to this live buffer.
+        let read = unsafe {
+            libc::ioctl(
+                changes.as_fd().as_raw_fd(),
+                0x400c_6503 as libc::c_ulong,
+                filter.as_mut_ptr(),
+            )
+        };
+        assert_eq!(read, 0, "{}", std::io::Error::last_os_error());
+        assert_eq!(filter, [1, 1, 0]);
     }
 }
 

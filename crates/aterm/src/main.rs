@@ -30,6 +30,8 @@ mod service_repair;
 mod service_repair_remote;
 #[cfg(target_os = "macos")]
 mod subscriber_scheduling;
+#[cfg(target_os = "macos")]
+mod withheld_preferences;
 
 use aterm_cli::{AliasRoute, alias_route};
 
@@ -450,7 +452,10 @@ fn dispatch_node(forwarded: &[OsString]) -> ExitCode {
         #[cfg(target_os = "macos")]
         return input_attachments::node_serve(startup);
         #[cfg(not(target_os = "macos"))]
-        return aterm_gui::run_node_serve_owning(startup);
+        return aterm_gui::run_node_serve_owning(|| {
+            startup();
+            None
+        });
     }
     let Some(home) = aterm_types::dirs::home_dir() else {
         eprintln!("aterm node: HOME is not set");
@@ -733,8 +738,10 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
     aterm_secrets::client::on_native_bootstrap(|paths, current| {
         aterm_agent::members_cli::bootstrap_from_members(paths, current)
     });
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     aterm_secrets::client::on_subscriber_inputs(converge_inputs::observe);
+    #[cfg(target_os = "macos")]
+    aterm_secrets::client::on_subscriber_inputs(input_attachments::subscriber_inputs);
     #[cfg(target_os = "macos")]
     aterm_secrets::client::on_bootstrap_allowed(|_| {
         aterm_cli::macos_doctor::automatic_vault_bootstrap_allowed()
@@ -772,7 +779,14 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
         if sys.euid() == 0 || aterm_machines::console::remote(&sys) {
             return Err("macOS naming waits for this Mac's console account".into());
         }
-        aterm_machines::root_steps::name_by_rule(&sys, &number.to_string())
+        let state = aterm_types::dirs::state_dir().ok_or("this machine's state is unavailable")?;
+        let config = aterm_types::dirs::aterm_config_path()
+            .ok_or("this machine's naming policy is unavailable")?;
+        let current = || {
+            aterm_agent::machine_name::publish::check_current(&state, &config, number)
+                .map_err(|why| why.phrase())
+        };
+        aterm_machines::root_steps::name_by_rule(&sys, &number.to_string(), &current)
             .map(|_| ())
             .map_err(|why| {
                 aterm_log::info!("machine name: existing macOS authorization did not apply: {why}");
@@ -916,7 +930,9 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
         if !rest.is_empty() {
             rest.remove(0);
         }
-        let mut forwarded = rest;
+        let forwarded = rest;
+        #[cfg(unix)]
+        let mut forwarded = forwarded;
         return match verb {
             aterm_cli::Verb::Ctl => aterm_ctl::main_entry_with(forwarded, CTL_LOCAL),
             aterm_cli::Verb::Conn => aterm_ctl::conn_main_entry(forwarded),
@@ -1031,9 +1047,6 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
                     first,
                     Some("join" | "sync" | "set" | "init" | "create" | "edit")
                 );
-                #[cfg(target_os = "macos")]
-                let code = input_attachments::secrets_entry(forwarded);
-                #[cfg(not(target_os = "macos"))]
                 let code = aterm_secrets::cli::main_entry(forwarded);
                 if code == ExitCode::SUCCESS
                     && sync_after
@@ -1594,8 +1607,11 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
     #[cfg(target_os = "macos")]
     if ordinary {
         spawn_acaffeine_watch();
-        input_attachments::spawn();
     }
+    #[cfg(target_os = "macos")]
+    let input_maintenance = ordinary.then(input_attachments::spawn).flatten();
+    #[cfg(not(target_os = "macos"))]
+    let input_maintenance = None;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let network_source = ordinary.then(network_state_source).flatten();
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -1604,7 +1620,7 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
         clippy::disallowed_methods,
         reason = "the one window door: every window route reaches the GUI here"
     )]
-    aterm_gui::main_entry_with_network(args, first_run, network_source);
+    aterm_gui::main_entry_with_network(args, first_run, network_source, input_maintenance);
     ExitCode::SUCCESS
 }
 
@@ -3951,7 +3967,7 @@ fn run_prepared_setup(
             (setup_io().mend_subscriber)();
             // The converge pass's window lane, as the mend: a finished setup runs no Secrets stage.
             (setup_io().converge_lane)();
-            // On a thread of its own: its wait for the profile lock another pass holds must not
+            // The existing keeper owns this request; a busy profile cannot consume it or
             // hold up the watch for the ALab vault that starts once this returns.
             (setup_io().start_follow_up)();
         }
@@ -4011,20 +4027,44 @@ fn while_vault_sync_kept_with(
 /// widgets). It logs, and a Restore it finished says so on the page. While it may hold the
 /// profile lock it holds System State's busy slot, so the page offers no Apply, Check or Restore
 /// that would fail on that lock; a launch with nothing owed reads only aterm's records and takes
-/// no slot. Without the grant it changes and asks nothing; a try that did not verify is retried
-/// at a later launch once it is due.
+/// no slot. Each finite attempt acquires both leases before capturing the grant and time;
+/// the existing keeper retains contention and failed starts without another app launch.
 #[cfg(target_os = "macos")]
-fn finish_withheld_preferences() {
-    report_withheld_preferences(
+fn finish_withheld_preferences() -> aterm_secrets::converge::Last {
+    publish_withheld_attempt(
         finish_withheld_preferences_with(
-            aterm_cli::macos_doctor::finish_withheld_preferences_observed_unless_stopped,
+            aterm_cli::macos_doctor::try_finish_withheld_preferences_unless_stopped,
         ),
         |report, observation| {
             remember_initial_setup_rows(report, None, observation);
             aterm_gui::publish_initial_setup_status(initial_setup_status());
         },
         restore_initial_setup_error,
-    );
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn publish_withheld_attempt<S>(
+    finished: aterm_cli::macos_doctor::WithheldFollowUp<S>,
+    restored: impl FnOnce(
+        &aterm_cli::macos_doctor::Report,
+        Option<aterm_cli::macos_doctor::InitialSetupObservation>,
+    ),
+    failed: impl FnOnce(String, Option<aterm_cli::macos_doctor::InitialSetupObservation>),
+) -> aterm_secrets::converge::Last {
+    use aterm_cli::macos_doctor::WithheldFollowUp;
+    use aterm_secrets::converge::Last;
+    let WithheldFollowUp::Finished(finished) = finished else {
+        return Last::Held;
+    };
+    let (observed, reservation) = *finished;
+    let last = match &observed.result {
+        Ok(Some(report)) if report.needs_attention() => Last::Unfinished,
+        Ok(_) => Last::Ended,
+        Err(_) => Last::Failed,
+    };
+    report_withheld_preferences((observed, reservation), restored, failed);
+    last
 }
 
 /// Keep the follow-up's setup slot until its result has been published: a later choice cannot
@@ -4076,19 +4116,19 @@ type WithheldReservation = (PreferenceReadings, InitialSetupBusy);
 
 #[cfg(target_os = "macos")]
 fn finish_withheld_preferences_with<T>(
-    follow_up: impl FnOnce(fn() -> WithheldReservation, fn(u64) -> bool) -> T,
+    follow_up: impl FnOnce(fn() -> Option<WithheldReservation>, fn(u64) -> bool) -> T,
 ) -> T {
     follow_up(
         || {
-            let busy = wait_for_initial_setup_slot();
+            let busy = take_initial_setup_slot()?;
             // Tuple fields drop in order: retire and refresh the widget reading
             // before another operation can take the setup slot.
-            (
+            Some((
                 PreferenceReadings::begin(vec![aterm_types::macos_setup::Subject::Setting(
                     aterm_types::macos_setup::Setting::Widgets,
                 )]),
                 busy,
-            )
+            ))
         },
         setup_stop_requested,
     )
@@ -7098,8 +7138,7 @@ struct SetupIo {
     /// Put back the plan a watch widened when a Stop held its run
     /// (`aterm_cli::macos_doctor::put_back_held_initial_setup`).
     put_back: fn(u64) -> Result<bool, String>,
-    /// Start the follow-up with Full Disk Access on a thread of its own, as the window records
-    /// the grant ([`start_withheld_follow_up`]).
+    /// Retain a follow-up request for the existing keeper, as the window records the grant.
     start_follow_up: fn(),
     /// Bring forward a setup a Restore left with no admitted run to carry aterm's own
     /// permissions (`aterm_cli::macos_doctor::bring_forward_restored_setup`): a run that waits
@@ -7313,16 +7352,10 @@ fn access_fact_observed(
     }
 }
 
-/// The live [`SetupIo::start_follow_up`]: [`finish_withheld_preferences`] on a thread of its
-/// own, which reads aterm's records and, with nothing owed, takes no slot and changes nothing.
+/// Retain the grant's follow-up intent before the existing keeper tries a finite worker.
 #[cfg(target_os = "macos")]
 fn start_withheld_follow_up() {
-    if let Err(why) = std::thread::Builder::new()
-        .name("aterm-setup-follow-up".into())
-        .spawn(finish_withheld_preferences)
-    {
-        aterm_log::warn!("setup follow-up with Full Disk Access did not start: {why}");
-    }
+    withheld_preferences::request();
 }
 
 #[cfg(target_os = "macos")]

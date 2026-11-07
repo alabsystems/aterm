@@ -300,6 +300,10 @@ pub struct Proc {
     /// The CPU time it and the children it reaped have used, nanoseconds
     /// (`ProcessReading::cpu_ns` with `child_cpu_ns`): 0 where unread.
     pub cpu_ns: u64,
+    /// The time its threads were runnable, on a core or waiting for one, with the CPU time of
+    /// the children it reaped, nanoseconds (`ProcessReading::runnable_ns` with `child_cpu_ns`):
+    /// 0 where unread (off macOS), its CPU time then standing for it.
+    pub runnable_ns: u64,
 }
 
 /// A process tree's use: what a claimant already takes, so its claims' reservations count only the rest.
@@ -357,10 +361,16 @@ impl Procs {
 
     /// What `pid` and every process descended from it have done ([`aterm_toolchain::stall`]),
     /// a claimant's included, with the trees of `credited` (the processes a claim of `pid`'s is
-    /// credited with, [`crate::Record::credit`]: its VM's, outside its tree); `None` where the
+    /// credited with, [`crate::Record::credit`]: its VM's, outside its tree), and whether one of
+    /// them waits in its turn, by its mark among `waits` ([`Machine::waits`]); `None` where the
     /// sweep does not hold `pid`.
     #[must_use]
-    pub fn work(&self, pid: u32, credited: &[u32]) -> Option<aterm_toolchain::stall::Work> {
+    pub fn work(
+        &self,
+        pid: u32,
+        credited: &[u32],
+        waits: &[aterm_toolchain::waits::Waiting],
+    ) -> Option<aterm_toolchain::stall::Work> {
         if !self.procs.iter().any(|p| p.pid == pid) {
             return None;
         }
@@ -371,10 +381,11 @@ impl Procs {
                 pid: p.pid,
                 ppid: p.ppid,
                 cpu_ns: p.cpu_ns,
+                runnable_ns: p.runnable_ns,
                 written: p.written,
             })
             .collect();
-        aterm_toolchain::stall::work_with(pid, credited, &procs)
+        aterm_toolchain::stall::work_with(pid, credited, &procs, waits)
     }
 
     /// The use of `pid` and every process descended from it.
@@ -454,6 +465,12 @@ pub trait Machine {
         let _ = stopped;
         self.read(None).gpu_busy
     }
+
+    /// The waits marked in this user's waits now, but this process's own: what tells a holder
+    /// that waits in its turn ([`aterm_toolchain::stall::Waits`]). By default none.
+    fn waits(&self) -> Vec<aterm_toolchain::waits::Waiting> {
+        Vec::new()
+    }
 }
 
 /// How long [`Live`]'s [`Machine::gpu_busy`] reads the GPU for: longer than the pause between
@@ -509,6 +526,31 @@ pub fn volume_of(path: &Path, table: &Table) -> Result<volumes::Reading, Unread>
     volumes::read_path(&placed, table)
 }
 
+/// The volume holding `path`, with the same mount/privacy policy and kept
+/// floor and room as [`Live::read`]. A nonexistent path is placed by its nearest
+/// existing ancestor. `None` means the volume could not be read.
+///
+/// This entry reads no CPU, GPU, memory, load or process observations.
+#[must_use]
+pub fn read_volume(path: &Path) -> Option<Volume> {
+    let v = volume_of(path, &volumes::table()).ok()?;
+    let now_s = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
+    let watch = crate::floor::Watch::kept();
+    let key = v.key.spelled();
+    let room = watch.room(&key, v.total, now_s);
+    Some(Volume {
+        floor: crate::floor::admission_floor(&crate::floor::lines(
+            watch.knobs,
+            Some(v.total),
+            Some(room),
+        )),
+        room,
+        mount: v.mount,
+        total: v.total,
+        free: v.free,
+    })
+}
+
 #[cfg(test)]
 thread_local! {
     /// Whether the platform's error boxes were off while [`volume_of`] placed a local volume.
@@ -543,26 +585,7 @@ impl Machine for Live {
             .as_ref()
             .and_then(claimable)
             .or_else(|| aterm_sysprobe::machine_memory().map(|m| m.available_mib << 20));
-        let volume = path
-            .and_then(|p| volume_of(p, &volumes::table()).ok())
-            .map(|v| {
-                let now_s =
-                    aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
-                let watch = crate::floor::Watch::kept();
-                let key = v.key.spelled();
-                let room = watch.room(&key, v.total, now_s);
-                Volume {
-                    floor: crate::floor::admission_floor(&crate::floor::lines(
-                        watch.knobs,
-                        Some(v.total),
-                        Some(room),
-                    )),
-                    room,
-                    mount: v.mount,
-                    total: v.total,
-                    free: v.free,
-                }
-            });
+        let volume = path.and_then(read_volume);
         Reading {
             cores,
             load1: load.map(|l| l[0]),
@@ -593,6 +616,10 @@ impl Machine for Live {
         ))
     }
 
+    fn waits(&self) -> Vec<aterm_toolchain::waits::Waiting> {
+        aterm_toolchain::waits::user_waiting()
+    }
+
     /// On macOS a walk up `pid`'s parents, one kernel record each (`kproc::record`), not a whole
     /// sweep: a build's admission reads it on every call.
     #[cfg(target_os = "macos")]
@@ -606,10 +633,7 @@ impl Machine for Live {
             line.push(Proc {
                 pid: r.pid,
                 ppid: r.ppid,
-                footprint: 0,
-                whole: 0,
-                written: 0,
-                cpu_ns: 0,
+                ..Proc::default()
             });
             if r.ppid <= 1 || r.ppid == at {
                 break;
@@ -637,16 +661,15 @@ impl Proc {
     #[must_use]
     pub fn of_reading(p: &aterm_sysprobe::ProcessReading) -> Proc {
         let footprint = p.footprint.unwrap_or(0);
+        let reaped = p.child_cpu_ns.unwrap_or(0);
         Proc {
             pid: p.pid,
             ppid: p.ppid,
             footprint: p.resident.map_or(footprint, |r| r.min(footprint)),
             whole: footprint,
             written: p.disk_written.unwrap_or(0),
-            cpu_ns: p
-                .cpu_ns
-                .unwrap_or(0)
-                .saturating_add(p.child_cpu_ns.unwrap_or(0)),
+            cpu_ns: p.cpu_ns.unwrap_or(0).saturating_add(reaped),
+            runnable_ns: p.runnable_ns.map_or(0, |r| r.saturating_add(reaped)),
         }
     }
 }
@@ -657,6 +680,7 @@ impl Proc {
 pub struct Fixed {
     reading: Mutex<Reading>,
     procs: Mutex<Option<Procs>>,
+    waits: Mutex<Vec<aterm_toolchain::waits::Waiting>>,
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -667,6 +691,7 @@ impl Fixed {
         Fixed {
             reading: Mutex::new(reading),
             procs: Mutex::new(None),
+            waits: Mutex::new(Vec::new()),
         }
     }
 
@@ -678,6 +703,11 @@ impl Fixed {
     /// Answer `procs` from now on.
     pub fn set_procs(&self, procs: Option<Procs>) {
         *self.procs.lock().unwrap_or_else(PoisonError::into_inner) = procs;
+    }
+
+    /// Answer `waits` as the user's marked waits from now on.
+    pub fn set_waits(&self, waits: Vec<aterm_toolchain::waits::Waiting>) {
+        *self.waits.lock().unwrap_or_else(PoisonError::into_inner) = waits;
     }
 }
 
@@ -692,6 +722,13 @@ impl Machine for Fixed {
 
     fn procs(&self) -> Option<Procs> {
         self.procs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn waits(&self) -> Vec<aterm_toolchain::waits::Waiting> {
+        self.waits
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()

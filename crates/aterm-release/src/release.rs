@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::check_record::{Half, VerifyRun};
 use crate::provision::{AskWords, Audited, Finding};
 
 /// How an operator runs a release: the one spelling every remedy names.
@@ -105,9 +106,10 @@ pub enum Step {
     Checks,
     Sync,
     Commit,
-    Stage,
-    Build,
-    Verify,
+    /// R's tree judged, its bundle built and its export checked, at once ([`Branch`]).
+    Qualify,
+    /// The bundle half of `verify release`, once the build passed and the tree branch ended.
+    Bundle,
     Ready,
     Publish,
     Cut,
@@ -117,13 +119,12 @@ pub enum Step {
 
 impl Step {
     /// Every step, in the order a release runs them.
-    pub const ALL: [Step; 11] = [
+    pub const ALL: [Step; 10] = [
         Step::Checks,
         Step::Sync,
         Step::Commit,
-        Step::Stage,
-        Step::Build,
-        Step::Verify,
+        Step::Qualify,
+        Step::Bundle,
         Step::Ready,
         Step::Publish,
         Step::Cut,
@@ -138,9 +139,8 @@ impl Step {
             Step::Checks => "checks",
             Step::Sync => "sync",
             Step::Commit => "commit",
-            Step::Stage => "stage",
-            Step::Build => "build",
-            Step::Verify => "verify",
+            Step::Qualify => "qualify",
+            Step::Bundle => "bundle",
             Step::Ready => "ready",
             Step::Publish => "publish",
             Step::Cut => "cut",
@@ -168,11 +168,10 @@ impl Step {
         match self {
             Step::Sync | Step::Ready => 15,
             Step::Checks | Step::Commit | Step::AfterCut => 60,
-            Step::Stage => 330,
-            Step::Build => 600,
-            Step::Verify => 3_600,
-            Step::Publish => 180,
-            Step::Cut => 900,
+            Step::Qualify => 1_800,
+            Step::Bundle => 600,
+            Step::Publish => Side::Sign.default_secs(),
+            Step::Cut => 300,
             Step::Check => 5,
         }
     }
@@ -892,10 +891,11 @@ pub struct Ran {
     pub detail: Vec<String>,
 }
 
-/// What the build step's child answered, and the release's own handoff fixtures staged beside it (`None`: not asked for).
+/// What the build branch answered: the bundle its `ship build` child made, then the release's
+/// own handoff fixtures staged after it (each `None`: not asked for).
 #[derive(Debug)]
 pub struct Built {
-    pub artifact: Result<Artifact, Refusal>,
+    pub artifact: Option<Result<Artifact, Refusal>>,
     pub fixtures: Option<Result<String, Refusal>>,
 }
 
@@ -905,6 +905,372 @@ pub enum StageTarget {
     Remote,
     Local,
 }
+
+/// One branch of step 4's qualify graph ([`Run::qualify`]): R's tree judged by `verify release
+/// --tree`, its bundle built by `ship build`, its export checked by `pub stage`, at once, each
+/// in a child of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Branch {
+    Tree,
+    Build,
+    Export,
+}
+
+impl Branch {
+    /// Every branch, in the order the graph starts them.
+    pub const ALL: [Branch; 3] = [Branch::Tree, Branch::Build, Branch::Export];
+
+    /// Its name on the transcript and in its log's file name (`04-qualify-<name>.log`).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Branch::Tree => "tree",
+            Branch::Build => "build",
+            Branch::Export => "export",
+        }
+    }
+
+    /// Its row in `steps.tsv`.
+    #[must_use]
+    pub fn row(self) -> String {
+        format!("{}-{}", Step::Qualify.name(), self.name())
+    }
+
+    const fn default_secs(self) -> u64 {
+        match self {
+            Branch::Tree => 1_560,
+            Branch::Build => 840,
+            Branch::Export => 460,
+        }
+    }
+}
+
+/// How a branch of the qualify graph ended, as the graph acts on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ended {
+    Passed,
+    /// The candidate failed: every other branch is stopped, and the release refuses R.
+    Red,
+    /// Nothing about the code was decided: the other branches finish, so their records survive.
+    CouldNotRun,
+    /// Another branch's red stopped it.
+    Stopped,
+}
+
+impl Ended {
+    /// Its word in a branch line and its `qualify-branch` event.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Ended::Passed => "passed",
+            Ended::Red => "red",
+            Ended::CouldNotRun => "could-not-run",
+            Ended::Stopped => "stopped",
+        }
+    }
+}
+
+/// One branch of step 7 ([`Run::publish`]): R's source published by `pub publish`, and R's
+/// verified bundle signed, notarized and packaged privately by `ship cut --sign`, at once, each
+/// in a child of its own. Neither claims; the cut (step 8) claims once both passed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Side {
+    Source,
+    Sign,
+}
+
+impl Side {
+    /// Every side, in the order step 7 starts them.
+    pub const ALL: [Side; 2] = [Side::Source, Side::Sign];
+
+    /// Its name on the transcript, in its `publish-branch` events and in its log's file name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Side::Source => "source",
+            Side::Sign => "sign",
+        }
+    }
+
+    /// Its row in `steps.tsv`.
+    #[must_use]
+    pub fn row(self) -> String {
+        format!("{}-{}", Step::Publish.name(), self.name())
+    }
+
+    const fn default_secs(self) -> u64 {
+        match self {
+            Side::Source => 180,
+            Side::Sign => 600,
+        }
+    }
+}
+
+/// The variable naming [`PublishGate`]'s file to the pre-promote hook `pub publish` runs.
+pub const PUBLISH_GATE_ENV: &str = "ATERM_RELEASE_PUBLISH_GATE";
+
+/// Step 7's gate between the source's push and the sign's red: one word, written once and
+/// whole by whichever comes first. The pre-promote hook, run by `pub publish` after every
+/// engine gate and right before its push, takes [`PublishGate::push`]; the release, as the
+/// private sign goes red, takes [`PublishGate::stop`]. Each then knows the other's word: a
+/// push that won finishes, and a stop that won leaves the hook refusing, so nothing is pushed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishGate {
+    path: PathBuf,
+}
+
+impl PublishGate {
+    const PUSH: &'static str = "push";
+    const STOP: &'static str = "stop";
+
+    /// The gate at `path`.
+    #[must_use]
+    pub fn at(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Where it is.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Open it again: neither word stands. Step 7 does this before its branches start.
+    /// # Errors
+    /// The file cannot be removed.
+    pub fn reset(&self) -> std::io::Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    /// The word that stands, if one does.
+    /// # Errors
+    /// The file cannot be read.
+    pub fn word(&self) -> std::io::Result<Option<String>> {
+        match crate::durable::read_regular_text(&self.path, 64) {
+            Ok(text) => Ok(Some(text.trim().to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The push is about to begin: true when it may (this took the gate, or the gate said push
+    /// already), false when the release's stop came first.
+    /// # Errors
+    /// The gate cannot be written or read: then nothing may push.
+    pub fn push(&self) -> std::io::Result<bool> {
+        Ok(self.take(Self::PUSH)? == Self::PUSH)
+    }
+
+    /// The sign went red: true when this stopped the push before it began, false when the push
+    /// began first (it finishes).
+    /// # Errors
+    /// The gate cannot be written or read: then nothing says the push did not begin.
+    pub fn stop(&self) -> std::io::Result<bool> {
+        Ok(self.take(Self::STOP)? == Self::STOP)
+    }
+
+    /// Write `word` unless a word stands, created whole (a hard link of a flushed temporary,
+    /// which fails where the gate exists): the word that stands afterwards. Each take writes a
+    /// temporary of its own (this process's id and a count of its takes), so no two takers, in
+    /// one process or two, ever share or remove each other's.
+    fn take(&self, word: &str) -> std::io::Result<String> {
+        static TAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(dir)?;
+        let take = TAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = self
+            .path
+            .file_name()
+            .map_or_else(|| "gate".into(), |n| n.to_string_lossy().into_owned());
+        let temp = dir.join(format!(".{name}.{}-{take}.{word}", std::process::id()));
+        crate::durable::write_atomic_durable(&temp, word.as_bytes(), 0o644)?;
+        let linked = std::fs::hard_link(&temp, &self.path);
+        let _ = std::fs::remove_file(&temp);
+        match linked {
+            Ok(()) => Ok(word.to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => self
+                .word()?
+                .ok_or_else(|| std::io::Error::other("the gate went away while it was read")),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// A branch's stop, fired by the qualify graph once another branch goes red: its child's group
+/// is then sent the branch's signal and, [`BranchStop::GRACE`] later, `SIGKILL`
+/// ([`crate::interrupt::Running::enter_stoppable`]), and a branch not started yet never starts.
+/// An export whose staging push began ([`BranchStop::push`]) is never stopped: the push finishes.
+/// Copies share one stop.
+#[derive(Clone, Debug, Default)]
+pub struct BranchStop {
+    state: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The order the graph's decisions are told in, shared by its branches' stops
+    /// ([`BranchStop::beside`]): a start, a staging push begun and a branch's end are each
+    /// decided and said under it ([`BranchStop::in_order`]), so their events read in the order
+    /// they were decided.
+    told: std::sync::Arc<std::sync::Mutex<()>>,
+}
+
+/// [`BranchStop`]'s word while its staging push runs; 0 while it runs, else the unix ms it fired.
+const PUSHING: u64 = 1;
+
+impl BranchStop {
+    /// How long a stopped branch's group has between its signal and `SIGKILL`.
+    pub const GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Another branch's stop in the same graph: its own state, decided and told in one order
+    /// with this one.
+    #[must_use]
+    pub fn beside(&self) -> Self {
+        Self {
+            state: std::sync::Arc::default(),
+            told: std::sync::Arc::clone(&self.told),
+        }
+    }
+
+    /// Run `decide` (a decision and the event that tells it) in the graph's one order.
+    pub fn in_order<T>(&self, decide: impl FnOnce() -> T) -> T {
+        let _told = self
+            .told
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        decide()
+    }
+
+    /// Stop the branch: true when this stopped it; false when its push began (it finishes) or
+    /// it was stopped already.
+    pub fn fire(&self) -> bool {
+        let at = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX)
+        .max(PUSHING + 1);
+        self.state
+            .compare_exchange(
+                0,
+                at,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// Whether the branch was stopped.
+    #[must_use]
+    pub fn fired(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::SeqCst) > PUSHING
+    }
+
+    /// How long ago it was stopped, by the wall clock; `None` while it was not.
+    #[must_use]
+    pub fn fired_for(&self) -> Option<std::time::Duration> {
+        let at = self.state.load(std::sync::atomic::Ordering::SeqCst);
+        (at > PUSHING).then(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH + std::time::Duration::from_millis(at))
+                .unwrap_or_default()
+        })
+    }
+
+    /// The export's staging push begins: false when the branch was stopped first, and the push
+    /// must not begin. Once it began, [`BranchStop::fire`] leaves the branch to finish.
+    pub fn push(&self) -> bool {
+        self.state
+            .compare_exchange(
+                0,
+                PUSHING,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// Whether its staging push began.
+    #[must_use]
+    pub fn pushing(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::SeqCst) == PUSHING
+    }
+}
+
+/// The part of the backend the qualify graph's branches run on, each from a thread of its own
+/// ([`Run::qualify`]); `&self` throughout, so they run at once. Each branch's work is a child
+/// process its stop reaches ([`BranchStop`]).
+pub trait Branches: Sync {
+    fn say(&self, line: &str);
+    fn now(&self) -> u64;
+    /// Whether a person's signal reached the release ([`Backend::interrupted`]): it reaches
+    /// every branch's group by itself, so the graph adds no stop of its own to it.
+    fn interrupted(&self) -> bool;
+    /// The log a branch's child writes.
+    fn branch_log(&self, branch: Branch) -> PathBuf;
+    /// Return once the tree branch holds an admitted memory claim, or `ended` says it ended
+    /// (or was stopped), or [`TREE_HEAD_START`] after the call: the tree, the longest chain,
+    /// takes the machine's memory first, and the build then claims beside it (Q7).
+    fn tree_admitted(&self, ended: &dyn Fn() -> bool);
+    /// The export check of R: `pub stage` to the staging tier (`Remote`) or without its push
+    /// (`Local`); its push begun is [`BranchStop::push`].
+    fn export(
+        &self,
+        c: &Candidate,
+        prover: &Prover,
+        target: StageTarget,
+        stop: &BranchStop,
+    ) -> Result<Ran, Refusal>;
+    /// Build R's bundle under `reserved` (when `bundle`), then stage its handoff fixtures (when
+    /// `fixtures`).
+    fn build(
+        &self,
+        c: &Candidate,
+        reserved: &Reservation,
+        prover: &Prover,
+        work: BuildWork,
+        stop: &BranchStop,
+    ) -> Built;
+    /// Run `verify release` of `run`'s half in the clone at R — the checks it names, with the
+    /// test binaries that passed — on `artifact` for the bundle half, then keep one record per
+    /// check it finished ([`crate::check_record::write_run`]).
+    fn verify(
+        &self,
+        c: &Candidate,
+        prover: &Prover,
+        run: &crate::check_record::VerifyRun,
+        artifact: Option<&Artifact>,
+        stop: &BranchStop,
+    ) -> Result<Ran, Refusal>;
+    /// The log step 7's `side` writes.
+    fn side_log(&self, side: Side) -> PathBuf;
+    /// Step 7's gate between the source's push and the sign's red.
+    fn publish_gate(&self) -> PublishGate;
+    /// `pub publish` of R ([`Backend::publish_begin`] readied it), its pre-promote hook pushing
+    /// only once it took `gate` ([`PublishGate::push`]).
+    fn source(
+        &self,
+        prover: &Prover,
+        gate: &PublishGate,
+        stop: &BranchStop,
+    ) -> Result<Ran, Refusal>;
+    /// `ship cut --sign` and the rest of `args`, in the clone: R's verified bundle signed,
+    /// notarized and packaged privately under its reservation ([`crate::publish::run_cut_sign`]).
+    fn sign(&self, args: &[String], prover: &Prover, stop: &BranchStop) -> Ran;
+}
+
+/// What the build branch makes: R's bundle, its handoff fixtures, or both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuildWork {
+    pub bundle: bool,
+    pub fixtures: bool,
+}
+
+/// How long the build waits for the tree branch's first admitted memory claim before it claims
+/// anyway ([`Branches::tree_admitted`]): a tree that claims nothing soon (a short resume, or
+/// `aterm-verify`'s own compile) keeps the build waiting no longer.
+pub const TREE_HEAD_START: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Everything the release asks of the world — git, the engine, the records, the children, the clock, the owner's aterm.
 pub trait Backend {
@@ -949,7 +1315,8 @@ pub trait Backend {
     fn ancestors(&mut self) -> Vec<u32>;
     fn release_dir(&mut self) -> PathBuf;
     fn times(&mut self) -> String;
-    fn record_time(&mut self, version: &str, step: Step, secs: u64);
+    /// Keep `row`'s time (a step's name, or a qualify branch's [`Branch::row`]) in `steps.tsv`.
+    fn record_time(&mut self, version: &str, row: &str, secs: u64);
 
     fn prover(&mut self, journaled: Option<&str>) -> Result<Prover, String>;
     fn lease(&mut self, prover: &Prover) -> Result<(), String>;
@@ -1025,12 +1392,6 @@ pub trait Backend {
     ) -> Vec<Refusal>;
     /// The cut's pre-claim gates of R's own tree: its handoff fixtures and handoff policy.
     fn head_gates(&mut self, c: &Candidate) -> Vec<Refusal>;
-    fn stage_fixtures(
-        &mut self,
-        c: &Candidate,
-        reserved: &Reservation,
-        prover: &Prover,
-    ) -> Result<String, Refusal>;
     fn land_fixtures(
         &mut self,
         c: &Candidate,
@@ -1047,32 +1408,30 @@ pub trait Backend {
     fn withdraw(&mut self, key: &str) -> Result<String, String>;
     fn origin_tail(&mut self) -> Option<u64>;
     fn reserve(&mut self, c: &Candidate) -> Result<Reservation, Refusal>;
-    fn build(
-        &mut self,
-        c: &Candidate,
-        reserved: &Reservation,
-        prover: &Prover,
-        fixtures: bool,
-    ) -> Built;
-    /// Run `verify release` on `artifact` in the clone at R: the checks `run` names (every one,
-    /// or a resume's missing ones, with the test binaries that passed), then keep one record per
-    /// check it finished ([`crate::check_record::write_run`]).
-    fn verify(
-        &mut self,
-        c: &Candidate,
-        prover: &Prover,
-        artifact: &Artifact,
-        run: &crate::check_record::VerifyRun,
-    ) -> Result<Ran, Refusal>;
+    /// Before the qualify graph starts: admit its one core claim and make the pool every branch
+    /// draws from, holding the export's share of it when `export` runs, and ready the export's
+    /// engine and scanner tools; its words.
+    fn qualify_begin(&mut self, prover: &Prover, export: bool) -> Result<String, Refusal>;
+    /// The qualify graph ended: its pool and its core claim go.
+    fn qualify_end(&mut self);
+    /// What the qualify graph's branches run on.
+    fn branches(&mut self) -> Box<dyn Branches + '_>;
+    /// A stage of R outside the graph (again, right before the publish): the export, then the
+    /// engine synced.
     fn stage(
         &mut self,
         c: &Candidate,
         prover: &Prover,
         target: StageTarget,
     ) -> Result<Ran, Refusal>;
-    fn publish(&mut self, prover: &Prover) -> Result<Ran, Refusal>;
+    /// Ready step 7's `pub publish` before its branches start: the engine synced, its scanner
+    /// tools and the source's signing tools prepared. The sign branch needs none of them.
+    fn publish_begin(&mut self, prover: &Prover) -> Result<(), Refusal>;
     fn source_publication(&mut self, c: &Candidate) -> Result<(), Refusal>;
     fn cut(&mut self, args: &[String], prover: &Prover) -> Ran;
+    /// Discard the copy step 7 signed of build `build` of `version` from the clone's `dist/`
+    /// ([`crate::publish::discard_signed`]); what could not be removed.
+    fn discard_signed(&mut self, version: &str, build: u64) -> Vec<String>;
     fn after_cut(&mut self, version: &str) -> Result<AfterCut, Refusal>;
     fn latest(&mut self) -> Result<String, String>;
 }
@@ -1159,6 +1518,9 @@ struct Run<'b> {
     /// Whether this run holds a disk claim ([`Run::claim_disk`]), step 4's or a stage's, or in a
     /// dry run has said it would.
     disk_held: bool,
+    /// `--qualify`'s local export check passed in this run, so a second round of step 4 (a
+    /// spent reservation) does not check it again.
+    exported_locally: bool,
     /// Owner asks the checks delivered before this run had a journal (a first run): journaled with the candidate at step 3, so they are not raised again.
     early_asks: Vec<String>,
     /// Seconds the current step waited for the owner (not its own time).
@@ -1204,6 +1566,7 @@ pub fn run_with(b: &mut dyn Backend, opts: &ReleaseOptions, home: &Path) -> Outc
         later_secs: 0,
         restage: None,
         disk_held: false,
+        exported_locally: false,
         early_asks: Vec::new(),
         waited: 0,
         dry_audit: None,
@@ -1297,43 +1660,10 @@ impl Run<'_> {
         }
         self.plan_print();
 
-        self.begin(Step::Stage)?;
-        if let Some(why) = self.claimed_words() {
-            self.skip(&why);
-        } else {
-            // The FAIL rule (A19) comes first: a FAILed tree is refused at once, exit 1, before
-            // the live world is asked again or room is sought for work it can never pass.
-            self.verification_answer()?;
-            self.fail_rule()?;
-            // a PREPARED release asks the live world again before anything else.
-            if let Some(prep) = self.pending_reask() {
-                self.reask_prepared(&prep)?;
-            }
-            self.disk_still_needed("the stage, the build and `verify release`")?;
-            self.stage()?;
-        }
-
-        // A stage's refresh can find R's reservation spent (another release claimed past it
-        // while it staged), so its build and checks run again: they claim where nothing does.
-        self.begin(Step::Build)?;
-        if let Some(why) = self.skip_build() {
-            self.skip(&why);
-        } else {
-            self.disk_still_needed("the build and `verify release`")?;
-            self.build()?;
-        }
-
-        self.begin(Step::Verify)?;
-        let verified = if let Some(why) = self.skip_verify() {
-            self.skip(&why);
-            Ok(false)
-        } else {
-            self.disk_still_needed("`verify release`")
-                .and_then(|()| self.verify())
-                .map(|()| true)
-        };
-        // The stage, the build and `verify release` are all the release writes under its claim; a
-        // stage after it claims for itself ([`Run::stage_claimed`]).
+        // The qualify graph and the bundle half are all the release writes under its claim; a
+        // stage after it claims for itself ([`Run::stage_claimed`]). Either step's refusal ends
+        // the claim unpassed.
+        let verified = self.qualify_and_bundle();
         self.let_disk_go(matches!(verified, Ok(true)));
         verified?;
 
@@ -1367,11 +1697,10 @@ impl Run<'_> {
 
         self.begin(Step::Publish)?;
         match self.skip_publish() {
-            Some(why) if matches!(self.cut_mode(), CutMode::Fresh) => {
-                self.audit_before_cut(&why)?;
-            }
+            // Published earlier and nothing claimed: the sign runs alone before the claim.
+            Some(why) if matches!(self.cut_mode(), CutMode::Fresh) => self.publish(Some(why))?,
             Some(why) => self.skip(&why),
-            None => self.publish()?,
+            None => self.publish(None)?,
         }
 
         self.begin(Step::Cut)?;
@@ -1570,7 +1899,7 @@ impl Run<'_> {
         ));
         let v = self.version();
         self.b
-            .record_time(&v, step, secs.saturating_sub(self.waited));
+            .record_time(&v, step.name(), secs.saturating_sub(self.waited));
     }
 
     fn skip(&mut self, why: &str) {
@@ -1721,11 +2050,51 @@ impl Run<'_> {
         )
     }
 
+    /// A step's estimate from this machine's `steps.tsv`, else the plan's default. Step 4's is
+    /// its longest branch's (the branches run at once): each branch's own row, else its default.
     fn est_secs(&self, step: Step) -> u64 {
+        if step == Step::Publish {
+            return self
+                .publish_sides()
+                .into_iter()
+                .map(|side| {
+                    self.est
+                        .get(&side.row())
+                        .copied()
+                        .unwrap_or_else(|| side.default_secs())
+                })
+                .max()
+                .unwrap_or(0);
+        }
+        if step == Step::Qualify {
+            let (plan, _) = self.qualify_plan();
+            return plan
+                .branches()
+                .into_iter()
+                .map(|b| self.est_branch(b))
+                .max()
+                .unwrap_or(0);
+        }
         self.est
             .get(step.name())
             .copied()
             .unwrap_or_else(|| step.default_secs())
+    }
+
+    /// The sides step 7 runs: the sign alone where the source was published earlier.
+    fn publish_sides(&self) -> Vec<Side> {
+        if self.skip_publish().is_some() {
+            vec![Side::Sign]
+        } else {
+            Side::ALL.to_vec()
+        }
+    }
+
+    fn est_branch(&self, branch: Branch) -> u64 {
+        self.est
+            .get(&branch.row())
+            .copied()
+            .unwrap_or_else(|| branch.default_secs())
     }
 
     /// The journal, when it is R's: its facts (the done list, the reservation, the artifact, a
@@ -1819,18 +2188,47 @@ impl Run<'_> {
         p.bin.display().to_string() == prep.prover && p.commit == prep.trustc
     }
 
+    /// Steps 4 and 5: whether the bundle half ran and passed.
+    fn qualify_and_bundle(&mut self) -> Result<bool, Halt> {
+        self.begin(Step::Qualify)?;
+        if let Some(why) = self.claimed_words() {
+            self.skip(&why);
+        } else {
+            // The FAIL rule (A19) comes first: a FAILed tree is refused at once, exit 1, before
+            // the live world is asked again or room is sought for work it can never pass.
+            self.verification_answer()?;
+            self.fail_rule()?;
+            // a PREPARED release asks the live world again before anything else.
+            if let Some(prep) = self.pending_reask() {
+                self.reask_prepared(&prep)?;
+            }
+            self.disk_still_needed("the qualify graph and the bundle half")?;
+            self.qualify()?;
+        }
+
+        self.begin(Step::Bundle)?;
+        if let Some(why) = self.skip_bundle() {
+            self.skip(&why);
+            return Ok(false);
+        }
+        self.disk_still_needed("the bundle half")?;
+        self.bundle()?;
+        Ok(true)
+    }
+
     fn let_go(&mut self) {
         self.claim = None;
     }
 
+    /// Stage R again in step 4: its export branch runs, and the plan's time grows by it.
     fn stage_again(&mut self, old: Option<String>, why: String) {
-        if !self.planned.contains(&Step::Stage) {
-            let secs = self.est_secs(Step::Stage);
-            self.planned.push(Step::Stage);
+        self.restage = Some((old, why));
+        if !self.planned.contains(&Step::Qualify) {
+            let secs = self.est_branch(Branch::Export);
+            self.planned.push(Step::Qualify);
             self.planned.sort_unstable();
             self.plan_secs += secs;
         }
-        self.restage = Some((old, why));
     }
 
     fn reask_prepared(&mut self, prep: &Prepared) -> Flow {
@@ -2330,7 +2728,11 @@ impl Run<'_> {
                     short(&prep.trustc)
                 ));
             } else {
-                let again = self.est_or_default(Step::Build) + self.est_or_default(Step::Verify);
+                let bundle = self.est_or_default(Step::Bundle);
+                let again = self
+                    .est_branch(Branch::Tree)
+                    .max(self.est_branch(Branch::Build))
+                    + bundle;
                 let v = self.version();
                 self.refuse(Refusal::new(
                     format!(
@@ -3107,7 +3509,7 @@ impl Run<'_> {
         if facts.cut.is_none()
             && let Some(spent) = self.spent()
         {
-            let stale = format!("{}; step 5 reserves anew and builds again", spent.words());
+            let stale = format!("{}; step 4 reserves anew and builds again", spent.words());
             facts.built = Answer::no(stale.clone());
             facts.checks = facts.checks.bundle_stale(stale);
         }
@@ -3125,26 +3527,68 @@ impl Run<'_> {
         ))
     }
 
-    fn skip_build(&self) -> Option<String> {
+    /// What step 4's graph runs, by the records that stand, and what it skips, in words: the
+    /// export unless R is staged (and always under `--qualify`, which checks it without a push),
+    /// the build unless its bundle is built and its handoff fixtures staged, the tree half unless
+    /// every tree check's record stands.
+    fn qualify_plan(&self) -> (Plan, Vec<String>) {
+        let mut plan = Plan::default();
+        let mut done = Vec::new();
+        if self.opts.qualify && self.exported_locally {
+            done.push("R's export checked locally in this run".to_string());
+        } else if self.opts.qualify {
+            plan.export = Some(StageTarget::Local);
+        } else if let Some(why) = self.skip_stage() {
+            done.push(why);
+        } else {
+            plan.export = Some(StageTarget::Remote);
+        }
+        let bundle = !self.facts.built.yes;
+        let fixtures = !self.facts.fixtures.yes && !self.journal_has(FIXTURES_STAGED);
+        if bundle || fixtures {
+            plan.build = Some(BuildWork { bundle, fixtures });
+        }
+        if !bundle {
+            done.push(self.facts.built.words.clone());
+        }
+        if self.facts.fixtures.yes {
+            done.push(self.facts.fixtures.words.clone());
+        } else if !fixtures {
+            done.push("its handoff fixtures staged after it (this release's journal)".to_string());
+        }
+        let tree = self.facts.checks.run(Half::Tree);
+        if tree.checks.is_empty() {
+            done.push("every tree check's record of R stands under this seal".to_string());
+        } else {
+            plan.tree = Some(tree);
+        }
+        (plan, done)
+    }
+
+    /// Why the plan counts step 4 done: the cut is claimed, or R's preflight passed and every
+    /// branch's record stands. Unless the cut is claimed, step 4 still runs its preflight: the
+    /// FAIL rule, a PREPARED release's second look, the disk.
+    fn skip_qualify(&self) -> Option<String> {
         self.claimed_words().or_else(|| {
-            let fixtures = if self.facts.fixtures.yes {
-                self.facts.fixtures.words.clone()
-            } else if self.journal_has(FIXTURES_STAGED) {
-                "its handoff fixtures staged beside it (this release's journal)".to_string()
-            } else {
-                return None;
-            };
-            self.facts
-                .built
-                .yes
-                .then(|| format!("{}; {fixtures}", self.facts.built.words))
+            let (plan, done) = self.qualify_plan();
+            (plan.branches().is_empty() && self.journal_has(COMMIT_GATES)).then(|| {
+                format!(
+                    "{}; its preflight passed for it (this release's journal)",
+                    done.join("; ")
+                )
+            })
         })
     }
 
-    fn skip_verify(&self) -> Option<String> {
+    /// Why step 5 runs nothing: the cut is claimed, or every bundle check's record stands.
+    fn skip_bundle(&self) -> Option<String> {
         self.claimed_words().or_else(|| {
             let checks = &self.facts.checks;
-            checks.complete().then(|| checks.line().to_owned())
+            checks
+                .run(Half::Bundle)
+                .checks
+                .is_empty()
+                .then(|| checks.line().to_owned())
         })
     }
 
@@ -3193,18 +3637,6 @@ impl Run<'_> {
         })
     }
 
-    fn stage_done(&self) -> Option<String> {
-        if self.opts.qualify {
-            return None;
-        }
-        if let Some(why) = self.claimed_words() {
-            return Some(why);
-        }
-        let staged = self.skip_stage()?;
-        self.journal_has(COMMIT_GATES)
-            .then(|| format!("{staged}; its preflight passed for it (this release's journal)"))
-    }
-
     fn skip_publish(&self) -> Option<String> {
         let r = self.commit_r();
         if let Some(cut) = &self.facts.cut {
@@ -3238,11 +3670,12 @@ impl Run<'_> {
         let mut done = Vec::new();
         for step in &Step::ALL[3..] {
             let skipped = match step {
-                Step::Stage => self.stage_done().is_some(),
+                Step::Qualify => self.skip_qualify().is_some(),
+                Step::Bundle => self.skip_bundle().is_some(),
                 Step::Ready => self.claimed_words().is_some(),
-                Step::Build => self.skip_build().is_some(),
-                Step::Verify => self.skip_verify().is_some(),
-                Step::Publish => self.skip_publish().is_some(),
+                Step::Publish => {
+                    self.skip_publish().is_some() && !matches!(self.cut_mode(), CutMode::Fresh)
+                }
                 Step::Cut => matches!(self.cut_mode(), CutMode::Done(_)),
                 Step::AfterCut => self.after_cut_complete() && self.facts.fixtures.yes,
                 _ => false,
@@ -3297,6 +3730,31 @@ impl Run<'_> {
                 done.join(" ")
             }
         ));
+        if run.contains(&Step::Qualify) {
+            let (plan, _) = self.qualify_plan();
+            let branches: Vec<&str> = plan.branches().into_iter().map(Branch::name).collect();
+            self.say(&format!(
+                "release: {} runs at once: {} (about {})",
+                Step::Qualify.at(),
+                if branches.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    branches.join(" ")
+                },
+                fmt_dur(self.est_secs(Step::Qualify))
+            ));
+        }
+        if run.contains(&Step::Publish) {
+            let sides: Vec<&str> = self.publish_sides().into_iter().map(Side::name).collect();
+            self.say(&format!(
+                "release: {} runs {}: {} (about {}); the cut claims once {} passed",
+                Step::Publish.at(),
+                if sides.len() > 1 { "at once" } else { "alone" },
+                sides.join(" "),
+                fmt_dur(self.est_secs(Step::Publish)),
+                if sides.len() > 1 { "both" } else { "it" }
+            ));
+        }
         if self.opts.qualify {
             self.say("release: --qualify stops after ready; the export is checked with pub stage --dry-run, without pushing its snapshot");
         } else if self.opts.prepare {
@@ -3328,9 +3786,10 @@ impl Run<'_> {
     }
 
     /// The release's disk claim, for what `covers` names, where this run holds none and the
-    /// candidate's checks are not all recorded: step 4 takes it before its gates, its stage, its
-    /// build and its `verify release`, and a build or verify that a stage's refresh brought on
-    /// takes it before it runs. It ends as verify does ([`Run::let_disk_go`]). It is as much as
+    /// candidate's checks are not all recorded: step 4 takes it before its gates and its graph
+    /// (the export, the build and the tree half of `verify release`), and a bundle half that runs
+    /// without step 4 takes it before it runs. It ends as step 5 does ([`Run::let_disk_go`]). It
+    /// is as much as
     /// the most any of this machine's recorded releases wrote, and never less than
     /// [`crate::release_disk::WARM`] where the clone's build is warm, or
     /// [`crate::release_disk::COLD`]. Nothing is walked to size it.
@@ -3410,30 +3869,290 @@ impl Run<'_> {
         }
     }
 
-    fn stage(&mut self) -> Flow {
+    /// Step 4: R's preflight, then its reservation where the build needs one, then the qualify
+    /// graph — the tree half of `verify release`, the bundle's build and the export check, at once
+    /// ([`run_graph`]) — and the verdict of each branch it ran. A red refuses R at once, every
+    /// other branch stopped (an export whose staging push began finishes it); a COULD NOT RUN lets
+    /// the others finish, so their records survive for the next run. A peer's cut that reaches the
+    /// reservation while the graph runs sets its bundle aside: one more round reserves anew and
+    /// builds again, the tree's records and the staging kept.
+    fn qualify(&mut self) -> Flow {
         let (Some(c), Some(p)) = (self.cand.clone(), self.prover.clone()) else {
             return Ok(());
         };
-        if let Some(why) = self.stage_done() {
-            self.skip(&why);
+        let mut words = vec![self.commit_gates(&c)?];
+        let (plan, _) = self.qualify_plan();
+        if plan.export.is_some() {
+            words.extend(self.line_holds(&c)?);
+        }
+        if self.dry {
+            if self.export_alone(&plan) {
+                self.stage_claimed(|_| ())?;
+            }
+            words.push(self.qualify_dry(&c, &plan));
+            self.finish(&words.join("; "));
             return Ok(());
         }
-        let mut words = vec![self.commit_gates(&c)?];
-        if self.opts.qualify {
-            words.extend(self.line_holds(&c)?);
-            if self.dry {
-                self.stage_claimed(|_| ())?;
-                words.push("would check the compat slice and full export with pub stage --dry-run, without a staging push".into());
+        words.extend(self.qualify_round(&c, &p)?);
+        if self.facts.cut.is_none()
+            && let Some(spent) = self.spent()
+        {
+            self.say(&format!(
+                "        {} while R qualified — step 4 reserves anew and builds again",
+                spent.words()
+            ));
+            words.extend(self.qualify_round(&c, &p)?);
+        }
+        self.finish(&words.join("; "));
+        Ok(())
+    }
+
+    /// One run of the qualify graph over what still needs it, under the release's disk claim
+    /// where it builds or runs the tree, else (the export alone) under a stage's own; its words.
+    fn qualify_round(&mut self, c: &Candidate, p: &Prover) -> Result<Vec<String>, Halt> {
+        let (plan, _) = self.qualify_plan();
+        let reserved = match plan.build {
+            Some(_) => {
+                self.disk_still_needed("the qualify graph and the bundle half")?;
+                Some(self.reserved_for_build(c)?)
+            }
+            None => self.reservation(),
+        };
+        // A new reservation sets the old bundle aside, so the plan is asked again.
+        let (plan, done) = self.qualify_plan();
+        if plan.branches().is_empty() {
+            return Ok(done);
+        }
+        let graph = if self.export_alone(&plan) {
+            self.stage_claimed(|run| run.qualify_graph(c, p, reserved.as_ref(), &plan))?
+        } else {
+            self.qualify_graph(c, p, reserved.as_ref(), &plan)
+        };
+        self.qualified(c, graph?, done)
+    }
+
+    /// `plan` runs the export alone, with no disk claim held: it takes a stage's own.
+    fn export_alone(&self, plan: &Plan) -> bool {
+        !self.disk_held && plan.export.is_some() && plan.build.is_none() && plan.tree.is_none()
+    }
+
+    /// The graph of `plan`, drawing from one pool of this Mac's cores, and each passed branch's
+    /// time kept in `steps.tsv`.
+    fn qualify_graph(
+        &mut self,
+        c: &Candidate,
+        p: &Prover,
+        reserved: Option<&Reservation>,
+        plan: &Plan,
+    ) -> Result<Graph, Halt> {
+        let pool = match self.b.qualify_begin(p, plan.export.is_some()) {
+            Ok(pool) => pool,
+            Err(refusal) => return Err(self.halt(refusal)),
+        };
+        self.say(&format!("        pool: {pool}"));
+        let graph = {
+            let br = self.b.branches();
+            for branch in plan.branches() {
+                br.say(&format!(
+                    "        {}: {}; log: {}",
+                    branch.name(),
+                    plan.what(branch),
+                    br.branch_log(branch).display()
+                ));
+            }
+            run_graph(&*br, c, p, reserved, plan)
+        };
+        self.b.qualify_end();
+        let v = self.version();
+        for (branch, ended, secs) in &graph.ended {
+            if *ended == Ended::Passed {
+                self.b.record_time(&v, &branch.row(), *secs);
+            }
+        }
+        Ok(graph)
+    }
+
+    /// The journal's reservation while origin's ledger is below it, else a new one, journaled
+    /// with no bundle and no fixtures staged under it.
+    fn reserved_for_build(&mut self, c: &Candidate) -> Result<Reservation, Halt> {
+        if let Some(r) = self.reservation()
+            && self.b.origin_tail().is_some_and(|tail| r.build > tail)
+        {
+            return Ok(r);
+        }
+        if let Some(spent) = self.spent() {
+            self.say(&format!("        {} — reserving anew", spent.words()));
+        }
+        let reserved = match self.b.reserve(c) {
+            Ok(r) => r,
+            Err(refusal) => return Err(self.halt(refusal)),
+        };
+        if let Some(j) = self.journal.as_mut() {
+            j.reserved = Some(reserved.clone());
+            j.artifact = None;
+            j.done.retain(|fact| fact != FIXTURES_STAGED);
+        }
+        self.save_journal()?;
+        self.say(&format!(
+            "        reserved build {} as {} (`{}`), claimed nowhere until the cut",
+            reserved.build,
+            short(&reserved.commit),
+            reserved.line
+        ));
+        self.refresh();
+        Ok(reserved)
+    }
+
+    /// A real run's refusal as the halt it is.
+    fn halt(&mut self, refusal: Refusal) -> Halt {
+        match self.refuse(refusal) {
+            Err(halt) => halt,
+            Ok(()) => Halt::Said(1),
+        }
+    }
+
+    /// What a dry run's step 4 would run, branch by branch.
+    fn qualify_dry(&mut self, c: &Candidate, plan: &Plan) -> String {
+        let mut said = Vec::new();
+        if let Some(run) = &plan.tree {
+            said.push(format!(
+                "the tree — `{}` ({})",
+                half_command(run, None),
+                self.facts.checks.line()
+            ));
+        }
+        if let Some(work) = plan.build {
+            let held = match (self.reservation(), self.b.origin_tail()) {
+                (Some(r), Some(tail)) if r.build > tail => Some(r),
+                _ => None,
+            };
+            let mut build = vec![match &held {
+                Some(r) => format!(
+                    "build {} reserved as {} (this release's journal)",
+                    r.build,
+                    short(&r.commit)
+                ),
+                None => "would reserve build n = max(origin's ledger tail + 1, now) and the \
+                         release commit (R + the ledger line + the rolled changelog), claimed \
+                         nowhere"
+                    .to_string(),
+            }];
+            if work.bundle {
+                build.push(format!(
+                    "both slices at once from its snapshot into the release cache, the unsigned \
+                     bundle kept by what it is built as ({})",
+                    self.facts.built.words
+                ));
+            }
+            if work.fixtures {
+                let identity = held.map_or_else(
+                    || "the build it reserves".to_string(),
+                    |r| format!("build {} ({})", r.build, short(&r.commit)),
+                );
+                build.push(format!(
+                    "then v{}'s handoff fixtures for {identity} with {} into the release cache, \
+                     refusing here if it refuses; step 9 lands them on main",
+                    c.version,
+                    fixture_generator()
+                ));
+            }
+            said.push(format!("the build — {}", build.join(", ")));
+        }
+        if let Some(target) = plan.export {
+            let commit = if c.bump_from.is_some() {
+                "<the bump commit>"
+            } else if !c.carry.is_empty() {
+                "<the line's new head>"
             } else {
-                let log = self.b.log_path(Step::Stage);
-                self.say(&format!("        log: {}", log.display()));
-                let ran = match self.stage_claimed(|run| run.b.stage(&c, &p, StageTarget::Local))? {
-                    Ok(ran) => ran,
-                    Err(refusal) => return self.refuse(refusal),
-                };
-                self.refresh();
-                if ran.code != 0 {
-                    return self.refuse(
+                c.commit.as_str()
+            };
+            said.push(format!(
+                "the export — pub stage aterm --commit {commit} --repo-path <this clone>{}",
+                if target == StageTarget::Local {
+                    " --dry-run, without a staging push"
+                } else {
+                    ""
+                }
+            ));
+        }
+        if said.is_empty() {
+            return "would run nothing: every branch's record stands".to_string();
+        }
+        format!(
+            "would run at once, drawing from one pool of this Mac's cores: {}; a red stops the \
+             rest",
+            said.join("; ")
+        )
+    }
+
+    /// Each branch's verdict after the graph ended: the build's bundle and fixtures journaled
+    /// whatever else ended, so a resume reuses them; then the export's and the tree's. The first
+    /// red to come refuses R, the branches it stopped named under it; with none, a COULD NOT RUN
+    /// or a refusal no branch's exit showed; else step 4 passed.
+    fn qualified(
+        &mut self,
+        c: &Candidate,
+        graph: Graph,
+        done: Vec<String>,
+    ) -> Result<Vec<String>, Halt> {
+        let mut words = Vec::new();
+        let mut refused: BTreeMap<Branch, Refusal> = BTreeMap::new();
+        if let Some(built) = graph.built {
+            match built.artifact {
+                Some(Ok(artifact)) => {
+                    if let Some(j) = self.journal.as_mut() {
+                        j.artifact = Some(artifact.clone());
+                    }
+                    self.save_journal()?;
+                    self.refresh();
+                    if self.facts.built.yes {
+                        words.push(format!(
+                            "built ONCE: {} — executable sha256 {}",
+                            artifact.app.display(),
+                            artifact.macho_sha256
+                        ));
+                    } else if self.facts.cut.is_some() || self.spent().is_none() {
+                        // A peer's cut that reached the reservation sets the bundle aside
+                        // instead: step 4's next round reserves anew and builds again.
+                        let built = self.facts.built.words.clone();
+                        refused.insert(
+                            Branch::Build,
+                            Refusal::new(
+                                format!(
+                                    "the build ended, and its bundle is not the journal's: {built}"
+                                ),
+                                format!("read its log, then {RELEASE_COMMAND} (it builds again)"),
+                            ),
+                        );
+                    }
+                }
+                Some(Err(refusal)) => {
+                    refused.insert(Branch::Build, refusal);
+                }
+                None => {}
+            }
+            match built.fixtures {
+                Some(Ok(note)) => {
+                    self.journal_add(FIXTURES_STAGED)?;
+                    words.push(note);
+                }
+                Some(Err(refusal)) => {
+                    refused.entry(Branch::Build).or_insert(refusal);
+                }
+                None => {}
+            }
+        }
+        self.refresh();
+        match graph.export {
+            Some(Ok(ran)) if self.opts.qualify => {
+                if ran.code == 0 {
+                    self.exported_locally = true;
+                    words.push(
+                        "the full export qualified locally; no staging snapshot pushed".into(),
+                    );
+                } else {
+                    refused.insert(
+                        Branch::Export,
                         Refusal::new(
                             format!("private export qualification failed (exit {})", ran.code),
                             "read its log and fix the candidate before qualifying it again",
@@ -3441,42 +4160,142 @@ impl Run<'_> {
                         .detail(ran.detail),
                     );
                 }
-                words.push("the full export qualified locally; no staging snapshot pushed".into());
             }
-            self.finish(&words.join("; "));
-            return Ok(());
+            Some(ran) => match self.stage_verdict(c, ran) {
+                Ok(note) => words.push(note),
+                Err(refusal) => {
+                    refused.insert(Branch::Export, refusal);
+                }
+            },
+            None => {}
         }
-        match self.skip_stage() {
-            Some(why) => words.push(why),
-            None if self.dry => {
-                words.extend(self.line_holds(&c)?);
-                self.stage_claimed(|_| ())?;
-                words.push(format!(
-                    "would check its x86_64 compat slice with stable (cargo check), then run pub \
-                     stage aterm --commit {} --repo-path <this clone>",
-                    if c.bump_from.is_some() {
-                        "<the bump commit>"
-                    } else if !c.carry.is_empty() {
-                        "<the line's new head>"
-                    } else {
-                        c.commit.as_str()
-                    }
-                ));
-            }
-            None => {
-                words.extend(self.line_holds(&c)?);
-                let log = self.b.log_path(Step::Stage);
-                self.say(&format!("        log: {}", log.display()));
-                let ran = self.stage_claimed(|run| run.b.stage(&c, &p, StageTarget::Remote))?;
-                self.refresh();
-                match self.stage_verdict(&c, ran) {
-                    Ok(note) => words.push(note),
-                    Err(refusal) => return self.refuse(refusal),
+        if let Some(ran) = graph.tree {
+            match self.tree_verdict(c, ran) {
+                Ok(note) => words.push(note),
+                Err(refusal) => {
+                    refused.insert(Branch::Tree, refusal);
                 }
             }
         }
-        self.finish(&words.join("; "));
-        Ok(())
+        // What the branches made is journaled above; a person's signal ends the step with no
+        // verdict, whatever its branches answered.
+        self.halt_if_interrupted()?;
+        let stopped: Vec<Branch> = graph
+            .ended
+            .iter()
+            .filter(|(_, e, _)| *e == Ended::Stopped)
+            .map(|(b, ..)| *b)
+            .collect();
+        for branch in &stopped {
+            refused.remove(branch);
+        }
+        let red = graph
+            .ended
+            .iter()
+            .find(|(_, e, _)| *e == Ended::Red)
+            .map(|(b, ..)| *b);
+        let first = red
+            .into_iter()
+            .chain(graph.ended.iter().map(|(b, ..)| *b))
+            .chain(Branch::ALL)
+            .find(|b| refused.contains_key(b));
+        if let Some(branch) = first {
+            let mut refusal = refused.remove(&branch).expect("found");
+            for other in &stopped {
+                refusal.detail.push(format!(
+                    "the {} branch was stopped by the {} branch's red",
+                    other.name(),
+                    branch.name()
+                ));
+            }
+            for (other, also) in refused {
+                refusal
+                    .detail
+                    .push(format!("the {} branch also: {}", other.name(), also.why));
+                refusal.could_not_run &= also.could_not_run;
+            }
+            if red.is_some() {
+                refusal.could_not_run = false;
+            }
+            return Err(self.halt(refusal));
+        }
+        words.extend(done);
+        Ok(words)
+    }
+
+    /// The tree half's verdict from its records: every tree check's record ok, else its FAIL,
+    /// else why its records are missing.
+    fn tree_verdict(
+        &mut self,
+        c: &Candidate,
+        ran: Result<Ran, Refusal>,
+    ) -> Result<String, Refusal> {
+        let ran = ran?;
+        if let Some(refusal) = self.facts.checks.fail_refusal(&c.commit) {
+            return Err(refusal.detail(ran.detail));
+        }
+        let run = self.facts.checks.run(Half::Tree);
+        if run.checks.is_empty() {
+            return Ok(format!(
+                "`verify release --tree` passed: every tree check's record of {} is ok under \
+                 this seal",
+                short(&c.commit)
+            ));
+        }
+        Err(self.unrecorded(c, &run, None, ran))
+    }
+
+    /// Why `run` of `verify release` left records missing though no FAIL reads: its exit
+    /// code's refusal.
+    fn unrecorded(
+        &self,
+        c: &Candidate,
+        run: &crate::check_record::VerifyRun,
+        app: Option<&str>,
+        ran: Ran,
+    ) -> Refusal {
+        let words = self.facts.checks.line().to_owned();
+        let missing = run.checks.join(", ");
+        let rerun = half_command(run, app);
+        let r = short(&c.commit).to_string();
+        let refusal = match ran.code {
+            0 => Refusal::new(
+                format!(
+                    "`verify release` passed for {r}, and the records of {missing} cannot be \
+                     read: {words}"
+                ),
+                format!("run {RELEASE_COMMAND} again once they read (the candidate is kept)"),
+            )
+            .could_not_run(),
+            1 => Refusal::new(
+                format!(
+                    "`verify release` failed for {r} (exit 1), and no FAIL record of it reads: \
+                     {words}"
+                ),
+                format!(
+                    "`{rerun}` in the clone runs it again; {}",
+                    fix_remedy(&c.commit)
+                ),
+            ),
+            code => Refusal::new(
+                format!(
+                    "`verify release` could not run every check for {r} (exit {code}: {}) — \
+                     a release needs every check, and {missing} have no passing record; the \
+                     next run resumes only those",
+                    match code {
+                        3 => "a check could not run or was skipped",
+                        2 => "its command line was refused",
+                        _ => "it did not finish",
+                    }
+                ),
+                format!(
+                    "remove the cause it names (above, and in its log), then {RELEASE_COMMAND}; \
+                     `{rerun}` in the clone runs it alone"
+                ),
+            )
+            .could_not_run(),
+        };
+        refusal.detail(ran.detail)
     }
 
     /// The meaning check before the export: [`Backend::verify_line`] on the journaled line when
@@ -3594,20 +4413,6 @@ impl Run<'_> {
             format!("read its log; {}", fix_remedy(&c.commit)),
         )
         .detail(ran.detail))
-    }
-
-    fn refuse_all(&mut self, what: &str, mut found: Vec<Refusal>) -> Flow {
-        match found.len() {
-            0 => Ok(()),
-            1 => self.refuse(found.remove(0)),
-            n => {
-                let could_not_run = found.iter().all(|r| r.could_not_run);
-                let head = self.commit_r();
-                let mut r = blocked(format!("{what} refused ({n} finding(s))"), &found, &head);
-                r.could_not_run = could_not_run;
-                self.refuse(r)
-            }
-        }
     }
 
     fn cut_still_possible(&mut self, c: &Candidate, gates: bool) -> Vec<Refusal> {
@@ -4012,126 +4817,6 @@ impl Run<'_> {
         Ok(())
     }
 
-    fn build(&mut self) -> Flow {
-        let (Some(c), Some(p)) = (self.cand.clone(), self.prover.clone()) else {
-            return Ok(());
-        };
-        if self.dry {
-            let held = match (self.reservation(), self.b.origin_tail()) {
-                (Some(r), Some(tail)) if r.build > tail => Some(r),
-                _ => None,
-            };
-            let reserved = match &held {
-                Some(r) => format!(
-                    "build {} reserved as {} (this release's journal)",
-                    r.build,
-                    short(&r.commit)
-                ),
-                None => "would reserve build n = max(origin's ledger tail + 1, now) and the \
-                         release commit (R + the ledger line + the rolled changelog), claimed \
-                         nowhere"
-                    .to_string(),
-            };
-            let fixtures = if self.facts.fixtures.yes {
-                self.facts.fixtures.words.clone()
-            } else {
-                let identity = held.map_or_else(
-                    || "the build it reserves".to_string(),
-                    |r| format!("build {} ({})", r.build, short(&r.commit)),
-                );
-                format!(
-                    "beside it, would write v{}'s handoff fixtures for {identity} with {} into \
-                     the release cache, refusing here if it refuses; step 10 lands them on main",
-                    c.version,
-                    fixture_generator()
-                )
-            };
-            self.finish(&format!(
-                "{reserved}; would build both slices at once from its snapshot into the \
-                 release cache, the unsigned bundle kept by what it is built as ({}); {fixtures}",
-                self.facts.built.words
-            ));
-            return Ok(());
-        }
-        let reserved = match self.reservation() {
-            Some(r) if self.b.origin_tail().is_some_and(|tail| r.build > tail) => r,
-            _ => {
-                if let Some(spent) = self.spent() {
-                    self.say(&format!("        {} — reserving anew", spent.words()));
-                }
-                let reserved = match self.b.reserve(&c) {
-                    Ok(r) => r,
-                    Err(r) => return self.refuse(r),
-                };
-                if let Some(j) = self.journal.as_mut() {
-                    j.reserved = Some(reserved.clone());
-                    j.artifact = None;
-                    j.done.retain(|fact| fact != FIXTURES_STAGED);
-                }
-                self.save_journal()?;
-                self.say(&format!(
-                    "        reserved build {} as {} (`{}`), claimed nowhere until the cut",
-                    reserved.build,
-                    short(&reserved.commit),
-                    reserved.line
-                ));
-                self.refresh();
-                reserved
-            }
-        };
-        let fixtures = !self.facts.fixtures.yes && !self.journal_has(FIXTURES_STAGED);
-        let mut words = Vec::new();
-        let mut refused: Vec<Refusal> = Vec::new();
-        let staged = if self.facts.built.yes {
-            words.push(self.facts.built.words.clone());
-            fixtures.then(|| self.b.stage_fixtures(&c, &reserved, &p))
-        } else {
-            let log = self.b.log_path(Step::Build);
-            self.say(&format!("        log: {}", log.display()));
-            let built = self.b.build(&c, &reserved, &p, fixtures);
-            match built.artifact {
-                Ok(artifact) => {
-                    if let Some(j) = self.journal.as_mut() {
-                        j.artifact = Some(artifact.clone());
-                    }
-                    self.save_journal()?;
-                    self.refresh();
-                    if self.facts.built.yes {
-                        words.push(format!(
-                            "built ONCE: {} — executable sha256 {}",
-                            artifact.app.display(),
-                            artifact.macho_sha256
-                        ));
-                    } else {
-                        let words = self.facts.built.words.clone();
-                        refused.push(Refusal::new(
-                            format!(
-                                "the build ended, and its bundle is not the journal's: {words}"
-                            ),
-                            format!("read its log, then {RELEASE_COMMAND} (it builds again)"),
-                        ));
-                    }
-                }
-                Err(r) => refused.push(r),
-            }
-            built.fixtures
-        };
-        match staged {
-            Some(Ok(note)) => {
-                self.journal_add(FIXTURES_STAGED)?;
-                words.push(note);
-            }
-            Some(Err(r)) => refused.push(r),
-            None => {}
-        }
-        if self.facts.fixtures.yes {
-            words.push(self.facts.fixtures.words.clone());
-        }
-        self.refuse_all("the build step", refused)?;
-        self.finish(&words.join("; "));
-        Ok(())
-    }
-
     fn save_journal(&mut self) -> Flow {
         let Some(j) = &self.journal else {
             return Ok(());
@@ -4145,79 +4830,57 @@ impl Run<'_> {
         Ok(())
     }
 
-    fn verify(&mut self) -> Flow {
+    /// Step 5: the bundle half of `verify release` on the bundle step 4 built — appkit and
+    /// measure, both timed, so never beside the release's own load — then its records' verdict.
+    fn bundle(&mut self) -> Flow {
         let (Some(c), Some(p)) = (self.cand.clone(), self.prover.clone()) else {
             return Ok(());
         };
         self.fail_rule()?;
-        // A resume runs only the checks with no passing record, carrying the test binaries that
-        // passed (A19); a FAIL refused above, so none of them failed in this tree.
-        let run = self.facts.checks.run();
+        let run = self.facts.checks.run(Half::Bundle);
         let words = self.facts.checks.line().to_owned();
-        let only = if run.strict_subset() {
-            format!(" --checks {}", run.checks.join(","))
-        } else {
-            String::new()
-        };
         if self.dry {
-            let app = if run.reads_the_bundle() {
-                " --app <the bundle step 5 built>"
-            } else {
-                ""
-            };
             self.finish(&format!(
-                "would run `targo {}{only}{app}` in the clone ({words})",
-                VERIFY_ARGS.join(" ")
+                "would run `{}` in the clone ({words})",
+                half_command(&run, Some("<the bundle step 4 built>"))
             ));
             return Ok(());
         }
-        let Some(artifact) = self.artifact() else {
-            return self.refuse(Refusal::new(
-                "no bundle is built for this release — `verify release` judges the bytes that \
-                 ship",
-                format!("{RELEASE_COMMAND} (step 5 builds it)"),
-            ));
-        };
-        let app = artifact.app.display().to_string();
-        let rerun = verify_command(&app);
-        let log = self.b.log_path(Step::Verify);
-        if run.strict_subset() {
-            let carried = match run.passed_binaries.len() {
-                0 => String::new(),
-                1 => ", carrying the 1 test binary that passed (--passed-binaries)".into(),
-                n => format!(", carrying the {n} test binaries that passed (--passed-binaries)"),
-            };
-            let app = if run.reads_the_bundle() {
-                format!(" --app {}", shell_word(&app))
-            } else {
-                String::new()
-            };
-            self.say(&format!(
-                "        runs: targo {}{only}{app} — the checks with no passing record of this \
-                 tree under this seal{carried}",
-                VERIFY_ARGS.join(" "),
-            ));
-        } else {
-            self.say(&format!("        runs: {rerun}"));
-        }
-        self.say(&format!("        log: {}", log.display()));
-        let ran = self.b.verify(&c, &p, &artifact, &run);
-        self.refresh();
         if let Some(spent) = self.spent() {
             return self.refuse(
                 Refusal::new(
                     format!(
-                        "origin's ledger reached the reservation while it was verified: {}; \
-                         these bytes can never ship",
+                        "origin's ledger reached the reservation while R qualified: {}; its \
+                         bundle can never ship",
                         spent.words()
                     ),
                     format!(
-                        "run {RELEASE_COMMAND} again — it reserves anew, then builds and verifies"
+                        "run {RELEASE_COMMAND} again — it reserves anew, then builds and verifies \
+                         the bundle (the tree's records stand)"
                     ),
                 )
                 .could_not_run(),
             );
         }
+        let Some(artifact) = self.artifact().filter(|_| self.facts.built.yes) else {
+            return self.refuse(Refusal::new(
+                format!(
+                    "no bundle is built for this release ({}) — `verify release` judges the \
+                     bytes that ship",
+                    self.facts.built.words
+                ),
+                format!("{RELEASE_COMMAND} (step 4 builds it)"),
+            ));
+        };
+        let app = artifact.app.display().to_string();
+        let log = self.b.log_path(Step::Bundle);
+        self.say(&format!("        runs: {}", half_command(&run, Some(&app))));
+        self.say(&format!("        log: {}", log.display()));
+        let ran = self
+            .b
+            .branches()
+            .verify(&c, &p, &run, Some(&artifact), &BranchStop::default());
+        self.refresh();
         let ran = match ran {
             Ok(ran) => ran,
             Err(refusal) => return self.refuse(refusal),
@@ -4230,47 +4893,8 @@ impl Run<'_> {
         if let Some(refusal) = self.facts.checks.fail_refusal(&c.commit) {
             return self.refuse(refusal.detail(ran.detail));
         }
-        let words = self.facts.checks.line().to_owned();
-        let missing = self.facts.checks.missing.join(", ");
-        let r = short(&c.commit).to_string();
-        let refusal = match ran.code {
-            0 => Refusal::new(
-                format!(
-                    "`verify release` passed for {r}, and the records of {missing} cannot be \
-                     read: {words}"
-                ),
-                format!("run {RELEASE_COMMAND} again once they read (the candidate is kept)"),
-            )
-            .could_not_run(),
-            1 => Refusal::new(
-                format!(
-                    "`verify release` failed for {r} (exit 1), and no FAIL record of it reads: \
-                     {words}"
-                ),
-                format!(
-                    "`{rerun}` in the clone runs it again; {}",
-                    fix_remedy(&c.commit)
-                ),
-            ),
-            code => Refusal::new(
-                format!(
-                    "`verify release` could not run every check for {r} (exit {code}: {}) — \
-                     a release needs every check, and {missing} have no passing record; the \
-                     next run resumes only those",
-                    match code {
-                        3 => "a check could not run or was skipped",
-                        2 => "its command line was refused",
-                        _ => "it did not finish",
-                    }
-                ),
-                format!(
-                    "remove the cause it names (above, and in its log), then {RELEASE_COMMAND}; \
-                     `{rerun}` in the clone runs it alone"
-                ),
-            )
-            .could_not_run(),
-        };
-        self.refuse(refusal.detail(ran.detail))
+        let refusal = self.unrecorded(&c, &run, Some(&app), ran);
+        self.refuse(refusal)
     }
 
     fn records_stand(&mut self, what_refuses: &str) -> Flow {
@@ -4282,7 +4906,7 @@ impl Run<'_> {
                     "`verify release` has not passed for the bundle of {r} ({words}) — \
                      {what_refuses}"
                 ),
-                format!("{RELEASE_COMMAND} (steps 5-6 build and verify it)"),
+                format!("{RELEASE_COMMAND} (steps 4-5 build and verify it)"),
             ))?;
         }
         Ok(())
@@ -4311,18 +4935,51 @@ impl Run<'_> {
         Ok(())
     }
 
-    fn publish(&mut self) -> Flow {
+    /// `cut --sign` with the signing profile: step 7's sign side.
+    fn sign_args(&self) -> Vec<String> {
+        vec![
+            "cut".to_string(),
+            "--sign".to_string(),
+            "--release-credentials".to_string(),
+            self.creds.display().to_string(),
+        ]
+    }
+
+    /// Step 7: R's source published by `pub publish` and R's verified bundle signed, notarized
+    /// and packaged privately by `cut --sign`, at once ([`run_sides`]); neither claims, and the
+    /// cut claims once both passed. `published` says why the source is skipped (published
+    /// earlier, no build claimed): the sign then runs alone, and adopts the copy an earlier run
+    /// signed of the same bytes. Everything the cut would refuse is asked again before either
+    /// side starts, and the engine readied for the source; the sign reads only the release's
+    /// own journal.
+    fn publish(&mut self, published: Option<String>) -> Flow {
         let (Some(c), Some(p)) = (self.cand.clone(), self.prover.clone()) else {
+            if let Some(why) = published {
+                self.skip(&why);
+            }
             return Ok(());
         };
+        let source = published.is_none();
+        let sign = self.sign_args();
         if self.dry {
             let line = self.provision(true)?;
-            self.finish(&format!(
-                "{line}; would ask again what the cut would refuse and that the engine is the \
-                 one that staged R (else stage again, under a stage's disk claim of {} GiB), \
-                 then run: pub publish aterm --repo-path <this clone>",
-                crate::release_disk::STAGE >> 30
-            ));
+            let then = format!(
+                "targo --unverified ship {} (R's verified bundle copied, signed, notarized and \
+                 packaged privately under its reservation; nothing claimed)",
+                sign.join(" ")
+            );
+            self.finish(&match &published {
+                None => format!(
+                    "{line}; would ask again what the cut would refuse and that the engine is \
+                     the one that staged R (else stage again, under a stage's disk claim of {} \
+                     GiB), then run at once: pub publish aterm --repo-path <this clone>, and \
+                     {then}",
+                    crate::release_disk::STAGE >> 30
+                ),
+                Some(why) => format!(
+                    "{why}; {line}; would ask again what the cut would refuse, then run: {then}"
+                ),
+            });
             return Ok(());
         }
         self.records_stand("the cut would refuse after the publish")?;
@@ -4332,25 +4989,137 @@ impl Run<'_> {
             );
         }
         self.provision(true)?;
-        self.still_possible(&c, Some("publish"))?;
-        self.engine_still_staged(&c, &p)?;
-        let ran = match self.b.publish(&p) {
-            Ok(ran) => ran,
+        self.still_possible(&c, Some(if source { "publish" } else { "cut" }))?;
+        if source {
+            self.engine_still_staged(&c, &p)?;
+            if let Err(r) = self.b.publish_begin(&p) {
+                return self.refuse(r);
+            }
+        } else if let Err(r) = self.b.source_publication(&c) {
+            return self.refuse(r);
+        }
+        let sides = {
+            let br = self.b.branches();
+            let gate = br.publish_gate();
+            match gate.reset() {
+                Ok(()) => {
+                    br.say(&match &published {
+                        None => format!(
+                            "        source: pub publish aterm, its push behind {}; log: {}",
+                            gate.path().display(),
+                            br.side_log(Side::Source).display()
+                        ),
+                        Some(why) => format!("        source: skipped — {why}"),
+                    });
+                    br.say(&format!(
+                        "        sign: targo --unverified ship {}; log: {}",
+                        sign.join(" "),
+                        br.side_log(Side::Sign).display()
+                    ));
+                    Ok(run_sides(&*br, &p, source, &sign))
+                }
+                Err(e) => Err(Refusal::new(
+                    format!("cannot open step 7's gate {}: {e}", gate.path().display()),
+                    format!("fix what that names, then {RELEASE_COMMAND}"),
+                )
+                .could_not_run()),
+            }
+        };
+        let mut sides = match sides {
+            Ok(sides) => sides,
             Err(r) => return self.refuse(r),
         };
+        let v = self.version();
+        for (side, ended, secs) in &sides.ended {
+            if *ended == Ended::Passed {
+                self.b.record_time(&v, &side.row(), *secs);
+            }
+        }
         self.refresh();
-        let r = short(&c.commit).to_string();
-        if !self.facts.engine.has {
+        match sides
+            .ended
+            .iter()
+            .find(|(_, ended, _)| *ended == Ended::Red)
+            .map(|(side, ..)| *side)
+        {
+            Some(Side::Source) => return self.source_verdict(&c, sides.source),
+            Some(Side::Sign) => return self.sign_refused(&c, sides),
+            None => {}
+        }
+        if source {
+            self.source_verdict(&c, sides.source.take())?;
+        }
+        if sides.of(Side::Sign) != Some(Ended::Passed) {
+            let ran = sides.sign.unwrap_or(Ran {
+                code: -1,
+                detail: vec!["not started".into()],
+            });
             return self.refuse(
                 Refusal::new(
                     format!(
-                        "pub publish did not record {r} in the engine's ledger (exit {})",
-                        ran.code
+                        "cut --sign could not run (exit {}): {}",
+                        ran.code,
+                        ran.detail.last().cloned().unwrap_or_default()
                     ),
-                    format!("read its log; pub publish is resumable: {RELEASE_COMMAND}"),
+                    format!(
+                        "{RELEASE_COMMAND} — step 7 signs again{}",
+                        if self.facts.engine.has {
+                            ", the source published already"
+                        } else {
+                            ""
+                        }
+                    ),
                 )
+                .could_not_run()
                 .detail(ran.detail),
             );
+        }
+        let n = self.reservation().map_or(0, |r| r.build);
+        let r = short(&c.commit).to_string();
+        let rev = self.facts.engine.rev.clone().unwrap_or_default();
+        self.finish(&format!(
+            "{} {r} -> alabsystems {}; signed build {n} privately",
+            if source {
+                "published"
+            } else {
+                "published earlier:"
+            },
+            short(&rev)
+        ));
+        Ok(())
+    }
+
+    /// The source side's verdict, the engine read again: `pub publish` recorded R as the
+    /// engine's newest aterm row, exited 0, and R's source release carries its attestation.
+    fn source_verdict(&mut self, c: &Candidate, ran: Option<Result<Ran, Refusal>>) -> Flow {
+        let ran = match ran {
+            Some(Ok(ran)) => ran,
+            Some(Err(r)) => return self.refuse(r),
+            None => {
+                return self.refuse(
+                    Refusal::new(
+                        "pub publish never started",
+                        format!("{RELEASE_COMMAND} — pub publish is resumable"),
+                    )
+                    .could_not_run(),
+                );
+            }
+        };
+        let r = short(&c.commit).to_string();
+        if !self.facts.engine.has {
+            let refusal = Refusal::new(
+                format!(
+                    "pub publish did not record {r} in the engine's ledger (exit {})",
+                    ran.code
+                ),
+                format!("read its log; pub publish is resumable: {RELEASE_COMMAND}"),
+            )
+            .detail(ran.detail);
+            return self.refuse(if ran.code == 130 {
+                refusal.could_not_run()
+            } else {
+                refusal
+            });
         }
         if self.facts.engine.newest.as_deref() != Some(c.commit.as_str()) {
             let newest = self.facts.engine.newest.clone().unwrap_or_default();
@@ -4378,40 +5147,73 @@ impl Run<'_> {
                 .detail(ran.detail),
             );
         }
-        if let Err(r) = self.b.source_publication(&c) {
+        if let Err(r) = self.b.source_publication(c) {
             return self.refuse(r);
         }
-        let rev = self.facts.engine.rev.clone().unwrap_or_default();
-        self.finish(&format!("published {r} -> alabsystems {}", short(&rev)));
         Ok(())
     }
 
-    fn audit_before_cut(&mut self, why: &str) -> Flow {
-        let Some(c) = self.cand.clone() else {
-            self.skip(why);
-            return Ok(());
+    /// The sign side went red: nothing is claimed. Where the source's push had begun first (or
+    /// an earlier run published it), R's source is public ahead of its binary, as after a cut
+    /// that fails past the publish; else nothing is public.
+    /// Step 7's verdict on the sign's first red. What is public follows from the engine's rows,
+    /// else from this run's gate: a push the source's hook took the gate for may have reached
+    /// public main though `pub publish` recorded no row. A red of the source after it is named.
+    fn sign_refused(&mut self, c: &Candidate, sides: Sides) -> Flow {
+        let source_red = match (sides.of(Side::Source), &sides.source) {
+            (Some(Ended::Red), Some(Ok(ran))) => Some(format!(
+                "exit {}: {}",
+                ran.code,
+                ran.detail.last().cloned().unwrap_or_default()
+            )),
+            (Some(Ended::Red), Some(Err(refusal))) => Some(refusal.why.clone()),
+            _ => None,
         };
-        let line = self.provision(true)?;
-        if self.dry {
-            self.skip(&format!(
-                "{why}; {line}; would ask again what the cut would refuse, then go on to the cut"
-            ));
-            return Ok(());
-        }
-        if let Err(why) = self.b.fleet_audit() {
-            return self.refuse(
-                Refusal::new(why, "resume the line on its current holder").could_not_run(),
+        let ran = sides.sign.unwrap_or(Ran {
+            code: 1,
+            detail: Vec::new(),
+        });
+        let r = short(&c.commit).to_string();
+        let public = if self.facts.engine.has {
+            format!(
+                "the source of {r} is public (alabsystems {}) ahead of its binary, as after a \
+                 cut that fails past the publish; no build is claimed",
+                short(self.facts.engine.rev.as_deref().unwrap_or("?"))
+            )
+        } else if sides.pushed {
+            self.public = format!(
+                "the source of v{} may be public (its push began), no build claimed",
+                self.version()
             );
+            format!(
+                "the source's push began (its pre-promote hook took the gate) and the engine \
+                 records no row of {r}: its source may be public ahead of its binary, and no \
+                 build is claimed"
+            )
+        } else {
+            "the source's push never began in this run (the release took the gate first): \
+             nothing was pushed or claimed"
+                .to_string()
+        };
+        let last = ran.detail.last().cloned().unwrap_or_default();
+        let mut detail = ran.detail;
+        if let Some(why) = source_red {
+            detail.push(format!("the source failed after it: {why}"));
         }
-        self.still_possible(&c, Some("cut"))?;
-        if let Err(r) = self.b.source_publication(&c) {
-            return self.refuse(r);
-        }
-        self.skip(&format!(
-            "{why}; asked again before the cut it does not publish for: {line}, and what the \
-             cut would refuse"
-        ));
-        Ok(())
+        self.refuse(
+            Refusal::new(
+                format!(
+                    "cut --sign refused to sign R's verified bundle (exit {}: {last}) — {public}",
+                    ran.code,
+                ),
+                format!(
+                    "read its log (`{}`), fix what it names, then {RELEASE_COMMAND} (step 7 signs \
+                     again before any claim)",
+                    self.sign_args().join(" ")
+                ),
+            )
+            .detail(detail),
+        )
     }
 
     fn cut_args(&self, mode: &CutMode) -> Vec<String> {
@@ -4454,7 +5256,7 @@ impl Run<'_> {
             if !self.facts.engine.has {
                 return self.refuse(Refusal::new(
                     format!("the engine's ledger does not record {r} — the cut signs only a published commit's build"),
-                    format!("{RELEASE_COMMAND} (step 8 publishes it)"),
+                    format!("{RELEASE_COMMAND} (step 7 publishes it)"),
                 ));
             }
             if let Some(refusal) = self.newest_row_refusal() {
@@ -4478,6 +5280,32 @@ impl Run<'_> {
         {
             self.finish(&format!("cut v{}, build {}", cut.version, cut.build));
             return Ok(());
+        }
+        if self.facts.cut.is_none()
+            && let Some(spent) = self.spent()
+            && !spent.claimed_here
+        {
+            // The number is spent elsewhere, so the copy can never ship: discarded here whether
+            // the cut reached its claim (which discards it too) or refused before it.
+            let build = spent.reservation.build;
+            let left = self.b.discard_signed(&self.version(), build);
+            let discarded = if left.is_empty() {
+                "was discarded".to_string()
+            } else {
+                format!("was discarded but for {}", left.join("; "))
+            };
+            return self.refuse(
+                Refusal::new(
+                    format!(
+                        "the cut's claim lost the ledger's race: {} — the copy step 7 signed, \
+                         notarized and packaged privately as build {build} {discarded}, and \
+                         nothing of it was public",
+                        spent.words(),
+                    ),
+                    format!("{RELEASE_COMMAND} — it reserves anew, then builds and verifies again"),
+                )
+                .detail(ran.detail),
+            );
         }
         let remedy = match &self.facts.cut {
             Some(cut) => format!("{RELEASE_COMMAND} — it resumes build {}", cut.build),
@@ -4651,6 +5479,651 @@ fn blocked(why: String, found: &[Refusal], head: &str) -> Refusal {
         ),
     )
     .detail(detail)
+}
+
+/// What step 4's graph runs ([`Run::qualify_plan`]): each branch's work, `None` where its
+/// record stands.
+#[derive(Debug, Clone, Default)]
+struct Plan {
+    export: Option<StageTarget>,
+    build: Option<BuildWork>,
+    tree: Option<VerifyRun>,
+}
+
+impl Plan {
+    /// The branches it runs, in the order the graph starts them.
+    fn branches(&self) -> Vec<Branch> {
+        Branch::ALL
+            .into_iter()
+            .filter(|b| match b {
+                Branch::Tree => self.tree.is_some(),
+                Branch::Build => self.build.is_some(),
+                Branch::Export => self.export.is_some(),
+            })
+            .collect()
+    }
+
+    /// What `branch` runs, in words.
+    fn what(&self, branch: Branch) -> String {
+        match branch {
+            Branch::Tree => self
+                .tree
+                .as_ref()
+                .map(|run| format!("runs {}", half_command(run, None)))
+                .unwrap_or_default(),
+            Branch::Build => match self.build {
+                Some(BuildWork {
+                    bundle: true,
+                    fixtures: true,
+                }) => "builds the bundle, then stages its handoff fixtures".into(),
+                Some(BuildWork { bundle: true, .. }) => "builds the bundle".into(),
+                Some(_) => "stages the bundle's handoff fixtures".into(),
+                None => String::new(),
+            },
+            Branch::Export => match self.export {
+                Some(StageTarget::Local) => "checks the export without a staging push".into(),
+                Some(StageTarget::Remote) => "stages the export".into(),
+                None => String::new(),
+            },
+        }
+    }
+}
+
+/// What step 4's graph answered: each branch's result (`None`: it never ran), and each branch's
+/// end in the order they came, with the seconds it ran.
+#[derive(Debug, Default)]
+struct Graph {
+    export: Option<Result<Ran, Refusal>>,
+    built: Option<Built>,
+    tree: Option<Result<Ran, Refusal>>,
+    ended: Vec<(Branch, Ended, u64)>,
+}
+
+/// What a branch's thread tells the graph.
+enum Note {
+    /// It started at this unix second (its `started` event told already).
+    Started(Branch, u64),
+    /// It never started: another branch's red, or a person's signal, came first.
+    Unstarted(Branch),
+    Export(Result<Ran, Refusal>),
+    Built(Built),
+    Tree(Result<Ran, Refusal>),
+}
+
+/// How a child's result ends its branch: `verify release` exits 1 on a FAIL (A3 halts it at the
+/// first), and `pub stage` on any refusal of its export; another exit is no verdict.
+fn ran_ended(branch: Branch, ran: &Result<Ran, Refusal>) -> Ended {
+    match ran {
+        Ok(ran) if ran.code == 0 => Ended::Passed,
+        Ok(ran) if ran.code == 1 => Ended::Red,
+        Ok(ran) if branch == Branch::Export && ran.code > 1 && ran.code != 130 => Ended::Red,
+        Ok(_) => Ended::CouldNotRun,
+        Err(refusal) if refusal.could_not_run => Ended::CouldNotRun,
+        Err(_) => Ended::Red,
+    }
+}
+
+/// How the build's answer ends its branch: red on a refusal of the bundle or its fixtures.
+fn built_ended(built: &Built) -> Ended {
+    let refused = built
+        .artifact
+        .iter()
+        .filter_map(|a| a.as_ref().err())
+        .chain(built.fixtures.iter().filter_map(|f| f.as_ref().err()));
+    let mut ended = Ended::Passed;
+    for refusal in refused {
+        if !refusal.could_not_run {
+            return Ended::Red;
+        }
+        ended = Ended::CouldNotRun;
+    }
+    ended
+}
+
+/// A branch's first line of why, for its red line.
+fn first_why(note: &Note) -> String {
+    let of = |r: &Result<Ran, Refusal>| match r {
+        Ok(ran) => {
+            let exit = format!("exit {}", ran.code);
+            match ran.detail.last().filter(|l| **l != exit) {
+                Some(line) => format!("{exit}: {line}"),
+                None => exit,
+            }
+        }
+        Err(refusal) => refusal.why.clone(),
+    };
+    match note {
+        Note::Export(r) | Note::Tree(r) => of(r),
+        Note::Built(built) => built
+            .artifact
+            .iter()
+            .filter_map(|a| a.as_ref().err())
+            .chain(built.fixtures.iter().filter_map(|f| f.as_ref().err()))
+            .map(|r| r.why.clone())
+            .next()
+            .unwrap_or_default(),
+        Note::Started(..) | Note::Unstarted(_) => String::new(),
+    }
+}
+
+/// The command a branch's red names to run it again.
+fn rerun_of(branch: Branch, plan: &Plan, c: &Candidate) -> String {
+    match branch {
+        Branch::Tree => plan
+            .tree
+            .as_ref()
+            .map(|run| format!("`{}`", half_command(run, None)))
+            .unwrap_or_default(),
+        Branch::Build => format!("`{} build`", crate::publish::SHIP_COMMAND),
+        Branch::Export => format!(
+            "`pub stage aterm --commit {}{}`",
+            c.commit,
+            if plan.export == Some(StageTarget::Local) {
+                " --dry-run"
+            } else {
+                ""
+            }
+        ),
+    }
+}
+
+/// A `qualify-branch` event: one branch's start or end, and the file name of its log
+/// ([`Branches::branch_log`]), for the timeline's readers ([`crate::release_timeline`]) and the
+/// `ReleaseQualify` model's conformance.
+fn branch_event(br: &dyn Branches, branch: Branch, phase: &str, at: u64, seconds: u64) {
+    let log = br.branch_log(branch);
+    let log = log.file_name().map(|n| n.to_string_lossy().into_owned());
+    let event = aterm_json::Value::Object(aterm_json::Map::from([
+        ("schema".to_string(), 1.into()),
+        ("event".to_string(), "qualify-branch".into()),
+        ("branch".to_string(), branch.name().into()),
+        ("log".to_string(), log.into()),
+        ("phase".to_string(), phase.into()),
+        ("at_unix_s".to_string(), at.into()),
+        ("seconds".to_string(), seconds.into()),
+    ]));
+    br.say(&format!("release-event: {event}"));
+}
+
+/// Run step 4's graph on `br`: the tree first; the build once the tree holds an admitted memory
+/// claim ([`Branches::tree_admitted`]), the export as the build starts, each in a thread of its
+/// own; the ledger's memory claims decide what runs together, and every branch draws from the
+/// one pool [`Backend::qualify_begin`] made. A branch's red stops every other branch at once
+/// ([`BranchStop::fire`]: an export whose staging push began finishes it, and a branch not
+/// started never starts), and says so in a branch line with its rerun; a COULD NOT RUN stops
+/// nothing. Returns once every branch it started ended.
+fn run_graph(
+    br: &dyn Branches,
+    c: &Candidate,
+    p: &Prover,
+    reserved: Option<&Reservation>,
+    plan: &Plan,
+) -> Graph {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let first = BranchStop::default();
+    let stops: [BranchStop; 3] = [first.beside(), first.beside(), first.beside()];
+    let stop_of = |b: Branch| &stops[b as usize];
+    // The tree ended or a red came, told once the receiver fired every stop that end fires, so
+    // a branch the starter starts after it sees them.
+    let settled = AtomicBool::new(false);
+    let red = AtomicBool::new(false);
+    let mut graph = Graph::default();
+    let t0 = br.now();
+    std::thread::scope(|s| {
+        let (tx, rx) = std::sync::mpsc::channel::<Note>();
+        let (settled, stops) = (&settled, &stops);
+        let starter = tx.clone();
+        s.spawn(move || {
+            let stop_of = |b: Branch| &stops[b as usize];
+            if let Some(run) = &plan.tree {
+                start_branch(
+                    s,
+                    br,
+                    &starter,
+                    Branch::Tree,
+                    stop_of(Branch::Tree),
+                    move |stop| Note::Tree(br.verify(c, p, run, None, stop)),
+                );
+                if plan.build.is_some() || plan.export.is_some() {
+                    br.tree_admitted(&|| settled.load(Ordering::SeqCst));
+                }
+            }
+            if let (Some(work), Some(reserved)) = (plan.build, reserved) {
+                start_branch(
+                    s,
+                    br,
+                    &starter,
+                    Branch::Build,
+                    stop_of(Branch::Build),
+                    move |stop| Note::Built(br.build(c, reserved, p, work, stop)),
+                );
+            }
+            if let Some(target) = plan.export {
+                start_branch(
+                    s,
+                    br,
+                    &starter,
+                    Branch::Export,
+                    stop_of(Branch::Export),
+                    move |stop| Note::Export(br.export(c, p, target, stop)),
+                );
+            }
+        });
+        drop(tx);
+        let mut started: BTreeMap<Branch, u64> = BTreeMap::new();
+        // Each end is decided and told in the graph's one order, so a red's event and the stops
+        // it fires read before any start or push that came after it.
+        for note in rx {
+            first.in_order(|| {
+                let now = br.now();
+                let (branch, ended) = match &note {
+                    Note::Started(branch, at) => {
+                        started.insert(*branch, *at);
+                        return;
+                    }
+                    Note::Unstarted(branch) => (*branch, Ended::Stopped),
+                    Note::Export(ran) => (Branch::Export, ran_ended(Branch::Export, ran)),
+                    Note::Tree(ran) => (Branch::Tree, ran_ended(Branch::Tree, ran)),
+                    Note::Built(built) => (Branch::Build, built_ended(built)),
+                };
+                // A branch ends stopped, with no verdict of its own, when a person's signal cut
+                // it short (neither a red that stops the others, since the signal reaches them by
+                // itself and a stop on top of it would count as a second signal, nor a pass), or
+                // when another's stop reached it: unless it was red first, since a red after
+                // another's is no verdict, the first red is.
+                let stopped = (ended != Ended::Passed && br.interrupted())
+                    || (stop_of(branch).fired()
+                        && (ended != Ended::Red || red.load(Ordering::SeqCst)));
+                let ended = if stopped { Ended::Stopped } else { ended };
+                let secs = started.get(&branch).map_or(0, |at| now.saturating_sub(*at));
+                branch_event(br, branch, ended.word(), now, secs);
+                graph.ended.push((branch, ended, secs));
+                let why = first_why(&note);
+                match note {
+                    Note::Export(ran) => graph.export = Some(ran),
+                    Note::Tree(ran) => graph.tree = Some(ran),
+                    Note::Built(built) => graph.built = Some(built),
+                    Note::Started(..) | Note::Unstarted(_) => {}
+                }
+                let at = fmt_dur(now.saturating_sub(t0));
+                if ended == Ended::Red && !red.swap(true, Ordering::SeqCst) {
+                    let done: Vec<Branch> = graph.ended.iter().map(|(b, ..)| *b).collect();
+                    let halted: Vec<&str> = plan
+                        .branches()
+                        .into_iter()
+                        .filter(|b| !done.contains(b) && stop_of(*b).fire())
+                        .map(Branch::name)
+                        .collect();
+                    // A branch outside the plan never starts; its stop fires all the same.
+                    for b in Branch::ALL {
+                        stop_of(b).fire();
+                    }
+                    let pushing =
+                        stop_of(Branch::Export).pushing() && !done.contains(&Branch::Export);
+                    br.say(&format!(
+                        "        {}: RED at {at} — {why}; rerun: {}; stopping {}{}",
+                        branch.name(),
+                        rerun_of(branch, plan, c),
+                        if halted.is_empty() {
+                            "nothing".to_string()
+                        } else {
+                            halted.join(", ")
+                        },
+                        if pushing {
+                            " (the export's staging push began, so it finishes)"
+                        } else {
+                            ""
+                        }
+                    ));
+                } else {
+                    br.say(&format!(
+                        "        {}: {} at {at} after {}{}",
+                        branch.name(),
+                        ended.word().replace('-', " "),
+                        fmt_dur(secs),
+                        if ended == Ended::CouldNotRun {
+                            format!(" — {why}; the other branches finish")
+                        } else {
+                            String::new()
+                        }
+                    ));
+                }
+                if branch == Branch::Tree || ended == Ended::Red {
+                    settled.store(true, Ordering::SeqCst);
+                }
+            });
+        }
+    });
+    graph
+}
+
+/// Start `branch`'s thread in `s`: unstarted when a red stopped it first or a person's signal
+/// came, else told started (from the starter, so the graph hears the starts in their order), its
+/// `work` run, and its end told to the graph. A branch that panics (a bug in the release) ends
+/// red, so the others stop as they would for any red.
+fn start_branch<'scope>(
+    s: &'scope std::thread::Scope<'scope, '_>,
+    br: &'scope dyn Branches,
+    tx: &std::sync::mpsc::Sender<Note>,
+    branch: Branch,
+    stop: &'scope BranchStop,
+    work: impl FnOnce(&BranchStop) -> Note + Send + 'scope,
+) {
+    let started = stop.in_order(|| {
+        if stop.fired() || br.interrupted() {
+            let _ = tx.send(Note::Unstarted(branch));
+            return false;
+        }
+        let at = br.now();
+        branch_event(br, branch, "started", at, 0);
+        let _ = tx.send(Note::Started(branch, at));
+        true
+    });
+    if !started {
+        return;
+    }
+    let tx = tx.clone();
+    s.spawn(move || {
+        let note = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(stop)))
+            .unwrap_or_else(|_| {
+                let refusal = Refusal::new(
+                    format!(
+                        "the {} branch stopped unexpectedly (a bug in {RELEASE_COMMAND})",
+                        branch.name()
+                    ),
+                    format!("read its log, then run {RELEASE_COMMAND} again to resume"),
+                );
+                match branch {
+                    Branch::Tree => Note::Tree(Err(refusal)),
+                    Branch::Export => Note::Export(Err(refusal)),
+                    Branch::Build => Note::Built(Built {
+                        artifact: Some(Err(refusal)),
+                        fixtures: None,
+                    }),
+                }
+            });
+        let _ = tx.send(note);
+    });
+}
+
+/// What step 7's sides answered ([`run_sides`]): each side's result (`None`: it never ran), and
+/// each side's end in the order they came, with the seconds it ran.
+#[derive(Debug, Default)]
+struct Sides {
+    source: Option<Result<Ran, Refusal>>,
+    sign: Option<Ran>,
+    ended: Vec<(Side, Ended, u64)>,
+    /// The source's pre-promote hook took this run's gate for its push.
+    pushed: bool,
+}
+
+impl Sides {
+    /// How `side` ended; `None` when it was not run.
+    fn of(&self, side: Side) -> Option<Ended> {
+        self.ended
+            .iter()
+            .find(|(s, ..)| *s == side)
+            .map(|(_, ended, _)| *ended)
+    }
+}
+
+/// What a side's thread tells step 7.
+enum SideNote {
+    Started(Side, u64),
+    Unstarted(Side),
+    Source(Result<Ran, Refusal>),
+    Sign(Ran),
+}
+
+/// How `pub publish`'s answer ends the source: any refusal of the publish is red; an interrupted
+/// or unstarted child, and a refusal that could not run, decide nothing.
+fn source_ended(ran: &Result<Ran, Refusal>) -> Ended {
+    match ran {
+        Ok(ran) if ran.code == 0 => Ended::Passed,
+        Ok(ran) if ran.code == 130 => Ended::CouldNotRun,
+        Ok(_) => Ended::Red,
+        Err(refusal) if refusal.could_not_run => Ended::CouldNotRun,
+        Err(_) => Ended::Red,
+    }
+}
+
+/// How `cut --sign`'s exit ends the sign: the cutter exits 1 on any refusal; another exit (an
+/// interrupt, a signal, a child that never started) decides nothing.
+fn sign_ended(ran: &Ran) -> Ended {
+    match ran.code {
+        0 => Ended::Passed,
+        1 => Ended::Red,
+        _ => Ended::CouldNotRun,
+    }
+}
+
+/// A side's first line of why, for its red line.
+fn side_why(note: &SideNote) -> String {
+    let of = |ran: &Ran| {
+        let exit = format!("exit {}", ran.code);
+        match ran.detail.last().filter(|l| **l != exit) {
+            Some(line) => format!("{exit}: {line}"),
+            None => exit,
+        }
+    };
+    match note {
+        SideNote::Source(Ok(ran)) | SideNote::Sign(ran) => of(ran),
+        SideNote::Source(Err(refusal)) => refusal.why.clone(),
+        SideNote::Started(..) | SideNote::Unstarted(_) => String::new(),
+    }
+}
+
+/// A `publish-branch` event: one side's start, its push begun, or its end, and the file name of
+/// its log ([`Branches::side_log`]), for the timeline's readers and the `ReleaseSignBesidePublish`
+/// model's conformance.
+fn side_event(br: &dyn Branches, side: Side, phase: &str, at: u64, seconds: u64) {
+    let log = br.side_log(side);
+    let log = log.file_name().map(|n| n.to_string_lossy().into_owned());
+    let event = aterm_json::Value::Object(aterm_json::Map::from([
+        ("schema".to_string(), 1.into()),
+        ("event".to_string(), "publish-branch".into()),
+        ("branch".to_string(), side.name().into()),
+        ("log".to_string(), log.into()),
+        ("phase".to_string(), phase.into()),
+        ("at_unix_s".to_string(), at.into()),
+        ("seconds".to_string(), seconds.into()),
+    ]));
+    br.say(&format!("release-event: {event}"));
+}
+
+/// Run step 7 on `br`: the source (when `source`) and the sign (`sign`'s arguments) at once, each
+/// in a thread of its own. A source red stops the sign. A sign red takes the gate's stop
+/// ([`PublishGate::stop`]): where it wins, the source is stopped and its hook never pushes, so
+/// nothing is public; where the source's push began first, the source finishes, public ahead of
+/// its binary. A COULD NOT RUN stops nothing. Every start, push and end is decided and told in
+/// one order ([`BranchStop::in_order`]). Returns once every side it started ended.
+fn run_sides(br: &dyn Branches, p: &Prover, source: bool, sign: &[String]) -> Sides {
+    let first = BranchStop::default();
+    let stops: [BranchStop; 2] = [first.beside(), first.beside()];
+    let stop_of = |s: Side| &stops[s as usize];
+    let gate = br.publish_gate();
+    let mut sides = Sides::default();
+    let (mut red, mut push_told) = (false, false);
+    let t0 = br.now();
+    std::thread::scope(|s| {
+        let (tx, rx) = std::sync::mpsc::channel::<SideNote>();
+        let gate = &gate;
+        if source {
+            start_side(
+                s,
+                br,
+                &tx,
+                Side::Source,
+                stop_of(Side::Source),
+                move |stop| SideNote::Source(br.source(p, gate, stop)),
+            );
+        }
+        start_side(s, br, &tx, Side::Sign, stop_of(Side::Sign), move |stop| {
+            SideNote::Sign(br.sign(sign, p, stop))
+        });
+        drop(tx);
+        let mut started: BTreeMap<Side, u64> = BTreeMap::new();
+        for note in rx {
+            first.in_order(|| {
+                let now = br.now();
+                let (side, ended) = match &note {
+                    SideNote::Started(side, at) => {
+                        started.insert(*side, *at);
+                        return;
+                    }
+                    SideNote::Unstarted(side) => (*side, Ended::Stopped),
+                    SideNote::Source(ran) => (Side::Source, source_ended(ran)),
+                    SideNote::Sign(ran) => (Side::Sign, sign_ended(ran)),
+                };
+                // As in step 4's graph: a person's signal ends a side stopped, no red that takes
+                // the gate or stops the other (the signal reaches it by itself); another's stop
+                // ends it stopped unless its own red came first.
+                let stopped = (ended != Ended::Passed && br.interrupted())
+                    || (stop_of(side).fired() && (ended != Ended::Red || red));
+                let ended = if stopped { Ended::Stopped } else { ended };
+                // The first red's gate is taken before its end is told: a push that began first is
+                // told before it, as it came.
+                let taken =
+                    (side == Side::Sign && ended == Ended::Red && !red).then(|| gate.stop());
+                let pushed = match side {
+                    Side::Source => {
+                        gate.word().ok().flatten().as_deref() == Some(PublishGate::PUSH)
+                    }
+                    Side::Sign => matches!(taken, Some(Ok(false))),
+                };
+                if pushed && !push_told {
+                    push_told = true;
+                    side_event(br, Side::Source, "push-began", now, 0);
+                }
+                let secs = started.get(&side).map_or(0, |at| now.saturating_sub(*at));
+                side_event(br, side, ended.word(), now, secs);
+                sides.ended.push((side, ended, secs));
+                let why = side_why(&note);
+                match note {
+                    SideNote::Source(ran) => sides.source = Some(ran),
+                    SideNote::Sign(ran) => sides.sign = Some(ran),
+                    SideNote::Started(..) | SideNote::Unstarted(_) => {}
+                }
+                let at = fmt_dur(now.saturating_sub(t0));
+                if ended != Ended::Red || red {
+                    br.say(&format!(
+                        "        {}: {} at {at} after {}{}",
+                        side.name(),
+                        ended.word().replace('-', " "),
+                        fmt_dur(secs),
+                        match ended {
+                            Ended::CouldNotRun => format!(" — {why}; the other side finishes"),
+                            Ended::Red => format!(" — {why}"),
+                            Ended::Passed | Ended::Stopped => String::new(),
+                        }
+                    ));
+                    return;
+                }
+                red = true;
+                let other = match side {
+                    Side::Source => Side::Sign,
+                    Side::Sign => Side::Source,
+                };
+                let running = started.contains_key(&other) && sides.of(other).is_none();
+                let stopping = match side {
+                    Side::Source => {
+                        let halted = stop_of(Side::Sign).fire() && running;
+                        if halted { "the sign" } else { "nothing" }.to_string()
+                    }
+                    Side::Sign => match taken.unwrap_or(Ok(true)) {
+                        Ok(true) => {
+                            let halted = stop_of(Side::Source).fire() && running;
+                            if halted {
+                                "the source, whose hook can no longer push"
+                            } else {
+                                "nothing (no source push can begin)"
+                            }
+                            .to_string()
+                        }
+                        Ok(false) => {
+                            "nothing: the source's push began, so it finishes, public ahead of \
+                             its binary"
+                                .to_string()
+                        }
+                        Err(e) => format!(
+                            "nothing: the gate {} could not be taken ({e}), and the source \
+                             finishes",
+                            gate.path().display()
+                        ),
+                    },
+                };
+                br.say(&format!(
+                    "        {}: RED at {at} — {why}; stopping {stopping}",
+                    side.name()
+                ));
+            });
+        }
+    });
+    sides.pushed = gate.word().ok().flatten().as_deref() == Some(PublishGate::PUSH);
+    sides
+}
+
+/// Start `side`'s thread in `s`: unstarted when a red stopped it first or a person's signal came,
+/// else told started, its `work` run, and its end told to step 7. A side that panics (a bug in the
+/// release) ends red.
+fn start_side<'scope>(
+    s: &'scope std::thread::Scope<'scope, '_>,
+    br: &'scope dyn Branches,
+    tx: &std::sync::mpsc::Sender<SideNote>,
+    side: Side,
+    stop: &'scope BranchStop,
+    work: impl FnOnce(&BranchStop) -> SideNote + Send + 'scope,
+) {
+    let started = stop.in_order(|| {
+        if stop.fired() || br.interrupted() {
+            let _ = tx.send(SideNote::Unstarted(side));
+            return false;
+        }
+        let at = br.now();
+        side_event(br, side, "started", at, 0);
+        let _ = tx.send(SideNote::Started(side, at));
+        true
+    });
+    if !started {
+        return;
+    }
+    let tx = tx.clone();
+    s.spawn(move || {
+        let note = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(stop)))
+            .unwrap_or_else(|_| {
+                let why = format!(
+                    "step 7's {} side stopped unexpectedly (a bug in {RELEASE_COMMAND})",
+                    side.name()
+                );
+                match side {
+                    Side::Source => SideNote::Source(Err(Refusal::new(
+                        why,
+                        format!("read its log, then run {RELEASE_COMMAND} again to resume"),
+                    ))),
+                    Side::Sign => SideNote::Sign(Ran {
+                        code: 1,
+                        detail: vec![why],
+                    }),
+                }
+            });
+        let _ = tx.send(note);
+    });
+}
+
+/// `verify release` of `run`'s half as an operator runs it: `--tree` or `--bundle`, `--checks`
+/// where it is fewer than its half, and `--app` with the check that reads it.
+#[must_use]
+pub fn half_command(run: &VerifyRun, app: Option<&str>) -> String {
+    let mut words = format!("targo {} {}", VERIFY_ARGS.join(" "), run.half.flag());
+    if run.strict_subset() {
+        words.push_str(&format!(" --checks {}", run.checks.join(",")));
+    }
+    if run.reads_the_bundle()
+        && let Some(app) = app
+    {
+        words.push_str(&format!(" --app {}", shell_word(app)));
+    }
+    words
 }
 
 fn fixture_generator() -> String {

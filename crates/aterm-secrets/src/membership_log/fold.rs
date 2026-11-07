@@ -65,7 +65,7 @@ impl Log {
     /// which it opens fold keys at all, as [`Log::commons_epoch_view`] asks of Commons.
     fn fold_reader(&self, identity: &Identity) -> bool {
         let recipient = identity.recipient();
-        let membership = self.membership();
+        let membership = self.membership_ref();
         !self.recipient_is_removed(&recipient)
             && !self.audience_left_out_recipient(&EpochAudience::Everyone, &recipient)
             && membership.members().iter().any(|(actor, m)| {

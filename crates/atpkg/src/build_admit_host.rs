@@ -826,8 +826,14 @@ impl NativeJob {
             settlement: Some(settlement),
         };
         let peak = self.meter.take().expect("owned meter").stop(usage.maxrss);
-        held.let_go()
-            .keep(self.failure.is_none() && outcome.succeeded(), peak, say);
+        let whole = self.failure.is_none()
+            && !outcome.cancelled
+            && outcome.settlement == Some(CohortSettlement::Drained);
+        held.let_go().keep(
+            super::BuildEnd::judged(Some(usage.status), whole),
+            peak,
+            say,
+        );
         self.failure.map_or(Ok(outcome), Err)
     }
 }

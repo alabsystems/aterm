@@ -88,12 +88,25 @@ pub(crate) struct FleetMac {
     pub(crate) older: bool,
     /// Answered without proving a node key this Mac binds (`"unproven":true`, [`BookFacts::unbound_issuer`]).
     pub(crate) unproven: bool,
-    /// The sessions its reply holds rows for.
-    pub(crate) sessions: usize,
-    /// Of them, the agents.
-    pub(crate) agents: usize,
-    /// Of them, the agents at work.
-    pub(crate) working: usize,
+    /// The sessions its reply holds rows for; `None` on this Mac's copy, where no session count
+    /// leaves a Mac (its `now/activity` row counts agents, not sessions).
+    pub(crate) sessions: Option<usize>,
+    /// What its agents are doing, by their own words ([`AgentWord::of`]): counted from its survey
+    /// rows, or on this Mac's copy from its `now/activity` row ([`AgentTally::of_row`]). `None`
+    /// where it was not read: an older aterm's rows, and on the copy a Mac that publishes no
+    /// activity row, or whose row trails its presence row past
+    /// `aterm_metrics::row::ACTIVITY_FRESH_MS` ([`Self::activity_absent`] says which). Absent,
+    /// never zero.
+    pub(crate) activity: Option<AgentTally>,
+    /// Why this Mac's copy holds no activity for it; `None` where it does, and on a survey,
+    /// whose rows say themselves why ([`Self::older`], [`Self::unproven`]).
+    #[cfg(unix)]
+    pub(crate) activity_absent: Option<ActivityAbsent>,
+    /// Its agent sessions, the first [`SESSIONS_MAX`] of them in the reply's order; on the copy,
+    /// each by its sid and word alone (no program, task or context leaves a Mac there).
+    pub(crate) agent_sessions: Vec<FleetSession>,
+    /// The agent sessions past [`SESSIONS_MAX`], counted and not kept.
+    pub(crate) sessions_more: usize,
     /// Rows its reply cap left out (`sessions=` past every session row sent, exited ones included: the header counts them too).
     pub(crate) left_out: usize,
     /// Live instances the peer reports whose sessions this reply read (`instances_read=`, 1 where
@@ -111,6 +124,405 @@ pub(crate) struct FleetMac {
     pub(crate) read_at_ms: u64,
     /// It did not answer this read: its rows are its last answer's, kept while they still count ([`carry`]).
     pub(crate) carried: bool,
+    /// Its build: the survey header's `version=`, or, on this Mac's copy ([`CopyRunner`]), its
+    /// presence row's, else its signed book entry's ([`aterm_agent::fleet_view::SeatRow::build`]).
+    pub(crate) build: Option<String>,
+    /// Its membership log label (`m<N>`), where this Mac's copy read it and the log seats it.
+    pub(crate) label: Option<String>,
+    /// It needs an update, as `aterm fleet` judges it
+    /// ([`aterm_agent::fleet_view::SeatRow::needs_update`]); read on this Mac's copy only, never
+    /// inferred from a build.
+    pub(crate) needs_update: bool,
+    /// How far its tables are from this Mac's, where this Mac's copy read it.
+    #[cfg(unix)]
+    pub(crate) tables: Option<aterm_mesh::presence::Behind>,
+}
+
+/// Why this Mac's copy holds no activity for a Mac ([`FleetMac::activity_absent`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActivityAbsent {
+    /// The node read no activity rows for its answer (`View::activity` is `None`).
+    Unread,
+    /// The Mac publishes no activity row: an older aterm, or one whose windows were never counted.
+    Unpublished,
+    /// Its newest row trails its presence row past `aterm_metrics::row::ACTIVITY_FRESH_MS`: by
+    /// `behind_ms`, both of its own clock, or `None` where the seat has no presence row.
+    Stale {
+        /// How far the row trails the seat's presence row.
+        behind_ms: Option<u64>,
+    },
+}
+
+/// What one Mac's agents are doing, counted from their rows' `agent=` words.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct AgentTally {
+    /// Its agent sessions.
+    pub(crate) agents: u16,
+    /// Of them, at work (`busy`, or a `prompt` or `question` its harness answers).
+    pub(crate) busy: u16,
+    /// At rest (`idle`).
+    pub(crate) idle: u16,
+    /// Waiting on a person ([`AgentWord::Waiting`]).
+    pub(crate) waiting: u16,
+    /// At a limit (`wall:*`).
+    pub(crate) walled: u16,
+    /// Any other word (`unknown`, `survey`, `-`, one this build does not know).
+    pub(crate) unknown: u16,
+}
+
+impl AgentTally {
+    /// The tally a Mac's `now/activity` row counts, each count at most `u16::MAX`.
+    #[cfg(unix)]
+    pub(crate) fn of_row(row: &aterm_metrics::row::ActivityRow) -> Self {
+        let n = |count: u32| u16::try_from(count).unwrap_or(u16::MAX);
+        Self {
+            agents: n(row.agents()),
+            busy: n(row.busy),
+            idle: n(row.idle),
+            waiting: n(row.waiting),
+            walled: n(row.walled),
+            unknown: n(row.unknown),
+        }
+    }
+
+    /// Count one agent whose word is `word`.
+    fn add(&mut self, word: &AgentWord) {
+        self.agents = self.agents.saturating_add(1);
+        let slot = match word {
+            AgentWord::Busy => &mut self.busy,
+            AgentWord::Idle => &mut self.idle,
+            AgentWord::Waiting => &mut self.waiting,
+            AgentWord::Walled(_) => &mut self.walled,
+            AgentWord::Unknown => &mut self.unknown,
+        };
+        *slot = slot.saturating_add(1);
+    }
+}
+
+/// An agent's own word for what it is doing (its row's `agent=`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum AgentWord {
+    /// `busy`.
+    Busy,
+    /// `idle`.
+    Idle,
+    /// `prompt` or `question` that its row does not say is answered (`needs=-`): it waits on a
+    /// person.
+    Waiting,
+    /// `wall:<kind>`, its kind kept (`usage-weekly`, `auth`).
+    Walled(String),
+    /// Any other word, or none.
+    Unknown,
+}
+
+impl AgentWord {
+    /// The word a row's `agent=` says, beside its raw `needs=`. A `prompt` or `question` whose
+    /// row read its needs and found none for a person (`needs=-`: its harness answers it) is at
+    /// work, as `aterm ctl survey` classes it; one whose row names a need, or sends no `needs`
+    /// (an older peer), waits on a person.
+    pub(crate) fn of(word: Option<&str>, needs: Option<&str>) -> Self {
+        match word {
+            Some("busy") => Self::Busy,
+            Some("idle") => Self::Idle,
+            Some("prompt" | "question") if needs == Some("-") => Self::Busy,
+            Some("prompt" | "question") => Self::Waiting,
+            Some(word) => word
+                .strip_prefix("wall:")
+                .map_or(Self::Unknown, |kind| Self::Walled(kind.to_owned())),
+            None => Self::Unknown,
+        }
+    }
+
+    /// The word a session row counts under in its Mac's [`AgentTally`], from its
+    /// `program_kind=`, `agent=` and raw `needs=`: `None` for a row that is no agent's. The
+    /// survey's read ([`mac_of`]) and the node's own count of its windows
+    /// ([`activity_of_survey`]) both count by it.
+    pub(crate) fn of_row(
+        kind: Option<&str>,
+        word: Option<&str>,
+        needs: Option<&str>,
+    ) -> Option<Self> {
+        (kind == Some("agent")).then(|| Self::of(word, needs))
+    }
+
+    /// Its word on a `now/activity` row (`aterm_metrics::row::AgentEntry::word`).
+    #[cfg(unix)]
+    pub(crate) const fn wire_word(&self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::Idle => "idle",
+            Self::Waiting => "waiting",
+            Self::Walled(_) => "walled",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Its detail on a `now/activity` row: a wall's kind.
+    #[cfg(unix)]
+    pub(crate) fn wire_detail(&self) -> Option<&str> {
+        match self {
+            Self::Walled(kind) => Some(kind),
+            _ => None,
+        }
+    }
+
+    /// The word a `now/activity` row's entry says ([`Self::wire_word`], [`Self::wire_detail`]);
+    /// a word this build does not know is [`Self::Unknown`].
+    #[cfg(unix)]
+    pub(crate) fn of_wire(word: &str, detail: Option<&str>) -> Self {
+        match word {
+            "busy" => Self::Busy,
+            "idle" => Self::Idle,
+            "waiting" => Self::Waiting,
+            "walled" => Self::Walled(detail.unwrap_or_default().to_owned()),
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// This Mac's agents as its windows' merged survey answer `wire` (`OK <n>`, the `instance` line,
+/// the `session` rows) says at `at` (Unix seconds), counted as a peer's survey rows are
+/// ([`mac_of`]): an exited session is not counted, a session row counts by
+/// [`AgentWord::of_row`], and the first [`aterm_metrics::row::AGENTS_LISTED_MAX`] agents whose
+/// sid is a minted one are listed by sid and word. `None` for an answer that is no survey, as
+/// for an older peer where a live row sends no `needs`, and for a partial answer, which a row
+/// has no way to mark as a lower bound: one whose `instance` line says some window went unread
+/// (`instances_read=` below `instances=`, each 1 where it is absent, as [`mac_of`] reads them),
+/// or whose `sessions=` counts rows the reply cap left out. Nothing is published for it, so the
+/// last whole count stands until it ages out at its readers.
+#[cfg(unix)]
+pub(crate) fn activity_of_survey(wire: &str, at: u64) -> Option<aterm_metrics::row::ActivityRow> {
+    use aterm_metrics::row::{AGENTS_LISTED_MAX, ActivityRow, AgentEntry, Sid, Word};
+    let mut lines = wire.lines();
+    lines.next().filter(|head| head.starts_with("OK "))?;
+    let lines: Vec<&str> = lines.map(|line| line.trim_end_matches('\r')).collect();
+    let instance = lines.iter().find_map(|line| line.strip_prefix("instance "));
+    let number = |key: &str| {
+        instance?
+            .split_ascii_whitespace()
+            .find_map(|token| token.strip_prefix(key)?.strip_prefix('='))
+            .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|n| n.parse::<usize>().ok())
+    };
+    let sent = lines
+        .iter()
+        .filter(|line| line.starts_with("session "))
+        .count();
+    if number("instances_read").unwrap_or(1) < number("instances").unwrap_or(1)
+        || number("sessions").is_some_and(|claimed| claimed > sent)
+    {
+        return None;
+    }
+    let mut row = ActivityRow {
+        at,
+        ..ActivityRow::default()
+    };
+    for line in lines
+        .iter()
+        .filter_map(|line| line.strip_prefix("session "))
+    {
+        let fields: Vec<(&str, String)> = line
+            .split(' ')
+            .filter_map(|kv| kv.split_once('='))
+            .map(|(k, v)| (k, aterm_codec::pct::decode(v)))
+            .collect();
+        let raw = |key: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        let field = |key: &str| raw(key).filter(|v| !v.is_empty() && *v != "-");
+        if field("state") == Some("exited") {
+            continue;
+        }
+        let needs = raw("needs")?;
+        let Some(word) = AgentWord::of_row(field("program_kind"), field("agent"), Some(needs))
+        else {
+            continue;
+        };
+        let count = match word {
+            AgentWord::Busy => &mut row.busy,
+            AgentWord::Idle => &mut row.idle,
+            AgentWord::Waiting => &mut row.waiting,
+            AgentWord::Walled(_) => &mut row.walled,
+            AgentWord::Unknown => &mut row.unknown,
+        };
+        *count = count.saturating_add(1);
+        if row.sessions.len() < AGENTS_LISTED_MAX
+            && let Some(sid) = field("sid").and_then(Sid::parse)
+            && let Some(word_on_row) = Word::new(word.wire_word())
+        {
+            row.sessions.push(AgentEntry {
+                sid,
+                word: word_on_row,
+                detail: word.wire_detail().and_then(Word::new),
+            });
+        }
+    }
+    Some(row)
+}
+
+/// A session's task, as its row's `task=` says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum TaskWord {
+    /// `working`.
+    Working,
+    /// `done`.
+    Done,
+    /// `failed`, or `exited` with `task_conclusion=failed`.
+    Failed,
+    /// `exited`, unfinished but not failed.
+    Exited,
+    /// `stalled`.
+    Stalled,
+}
+
+impl TaskWord {
+    /// The task a row's `task=` and `task_conclusion=` say; `None` for no task or a word this
+    /// build does not know.
+    pub(crate) fn of(task: Option<&str>, conclusion: Option<&str>) -> Option<Self> {
+        Some(match task? {
+            "working" => Self::Working,
+            "done" => Self::Done,
+            "failed" => Self::Failed,
+            "exited" if conclusion == Some("failed") => Self::Failed,
+            "exited" => Self::Exited,
+            "stalled" => Self::Stalled,
+            _ => return None,
+        })
+    }
+}
+
+/// The most agent sessions one Mac's read keeps ([`FleetMac::agent_sessions`]).
+pub(crate) const SESSIONS_MAX: usize = 32;
+
+/// One agent session on a fleet peer, as its survey row says it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct FleetSession {
+    /// Its sid there.
+    pub(crate) sid: String,
+    /// Its program (`claude`, `codex-alab`), where the row names one.
+    pub(crate) program: Option<String>,
+    /// What it is doing.
+    pub(crate) agent: AgentWord,
+    /// Its task, where it has one.
+    pub(crate) task: Option<TaskWord>,
+    /// Its context left, percent.
+    pub(crate) ctx_left_pct: Option<u8>,
+    /// Its account's 5-hour usage, percent.
+    pub(crate) usage_5h_pct: Option<u8>,
+    /// Its account's weekly usage, percent.
+    pub(crate) usage_7d_pct: Option<u8>,
+}
+
+/// Why a fleet peer did not answer: the reason token the survey's producer typed
+/// (`aterm_net::fleet_member::Unreached::reason`), or what the glance itself knows. The glance
+/// reads the token and never the prose, which names an address or an age.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) enum Reach {
+    /// `no-name`: its name did not resolve.
+    NoName,
+    /// `nothing-listens`: the connection was refused.
+    NothingListens,
+    /// `no-answer`: it did not answer in time.
+    NoAnswer,
+    /// `no-route`: no route to it from this network.
+    NoRoute,
+    /// `refused-here`: this Mac refused the connection.
+    RefusedHere,
+    /// `reset`: the connection was reset.
+    Reset,
+    /// `connect`: another connect failure.
+    Connect,
+    /// `no-handshake`: it hung up or ran out of time in the handshake.
+    NoHandshake,
+    /// `handshake`: another handshake failure.
+    Handshake,
+    /// `no-reply`: it shook hands and sent no reply in time.
+    NoReply,
+    /// `identity`: it is not the node it should be.
+    Identity,
+    /// `not-dialled`: the survey did not dial it.
+    NotDialled,
+    /// `gone`: it is gone off the link.
+    Gone,
+    /// This Mac's copy reads it silent, last up here at `since_ms` (unix ms).
+    #[cfg_attr(
+        not(any(unix, test)),
+        expect(
+            dead_code,
+            reason = "only the copy read, which is unix only, reads a seat silent"
+        )
+    )]
+    Silent {
+        /// When it was last read up here.
+        since_ms: u64,
+    },
+    /// This Mac's copy has never read it up.
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "only the copy read, which is unix only, reads a seat never up"
+        )
+    )]
+    NeverUp,
+    /// Past the peers one read keeps ([`MACS_MAX`]).
+    PastCap,
+    /// Its answer had no header.
+    NoHeader,
+    /// No token this build knows (an older peer sends none): its words stand alone.
+    #[default]
+    Unread,
+}
+
+impl Reach {
+    /// The reason a survey row's `reason` token names; [`Self::Unread`] for one this build does
+    /// not know.
+    pub(crate) fn parse(token: &str) -> Self {
+        match token {
+            "no-name" => Self::NoName,
+            "nothing-listens" => Self::NothingListens,
+            "no-answer" => Self::NoAnswer,
+            "no-route" => Self::NoRoute,
+            "refused-here" => Self::RefusedHere,
+            "reset" => Self::Reset,
+            "connect" => Self::Connect,
+            "no-handshake" => Self::NoHandshake,
+            "handshake" => Self::Handshake,
+            "no-reply" => Self::NoReply,
+            "identity" => Self::Identity,
+            "not-dialled" => Self::NotDialled,
+            "gone" => Self::Gone,
+            _ => Self::Unread,
+        }
+    }
+
+    /// The producer's token for it; `None` for a reason the glance itself gives: the round trip
+    /// [`Self::parse`] keeps, which only a test of the unix producer's tokens reads.
+    #[cfg(all(test, unix))]
+    pub(crate) const fn token(self) -> Option<&'static str> {
+        Some(match self {
+            Self::NoName => "no-name",
+            Self::NothingListens => "nothing-listens",
+            Self::NoAnswer => "no-answer",
+            Self::NoRoute => "no-route",
+            Self::RefusedHere => "refused-here",
+            Self::Reset => "reset",
+            Self::Connect => "connect",
+            Self::NoHandshake => "no-handshake",
+            Self::Handshake => "handshake",
+            Self::NoReply => "no-reply",
+            Self::Identity => "identity",
+            Self::NotDialled => "not-dialled",
+            Self::Gone => "gone",
+            Self::Silent { .. } | Self::NeverUp | Self::PastCap | Self::NoHeader | Self::Unread => {
+                return None;
+            }
+        })
+    }
 }
 
 impl FleetMac {
@@ -142,6 +554,17 @@ pub(crate) struct Unanswered {
     pub(crate) dial: String,
     /// Why, in the fleet client's words.
     pub(crate) why: String,
+    /// Why, as a reason the glance reads ([`Reach`]).
+    pub(crate) reason: Reach,
+    /// Its build, where this Mac's copy read one.
+    pub(crate) build: Option<String>,
+    /// When it was last read up (unix ms), where this Mac's copy knows.
+    pub(crate) silent_since_ms: Option<u64>,
+    /// Its membership log label (`m<N>`), where this Mac's copy read it.
+    pub(crate) label: Option<String>,
+    /// `aterm fleet` says it needs an update
+    /// ([`aterm_agent::fleet_view::SeatRow::needs_update`]); read on this Mac's copy only.
+    pub(crate) needs_update: bool,
 }
 
 /// One fleet read.
@@ -153,6 +576,10 @@ pub(crate) struct FleetSnapshot {
     pub(crate) macs: Vec<FleetMac>,
     /// The peers that did not, and why.
     pub(crate) unanswered: Vec<Unanswered>,
+    /// The lab's members and how many are up, this Mac's seat among them, where the read was
+    /// this Mac's copy ([`snapshot_of`]): `status`'s `members=`. It names no update and no log
+    /// fill (`aterm fleet` reads those).
+    pub(crate) seats: Option<aterm_netplace::words::Seats>,
 }
 
 impl FleetSnapshot {
@@ -169,13 +596,16 @@ impl FleetSnapshot {
         self.macs.iter().filter(|m| !m.carried).count()
     }
 
-    /// The agents it read, on every Mac that answered it.
-    pub(crate) fn agents(&self) -> usize {
+    /// The agents it read on the Macs that answered it and count ([`FleetMac::counts`]); `None`
+    /// where no such Mac's activity was read (an older fleet; on this Mac's copy, no Mac's fresh
+    /// `now/activity` row).
+    pub(crate) fn agents(&self) -> Option<usize> {
         self.macs
             .iter()
-            .filter(|m| !m.carried)
-            .map(|m| m.agents)
-            .sum()
+            .filter(|m| !m.carried && m.counts())
+            .filter_map(|m| m.activity)
+            .map(|tally| usize::from(tally.agents))
+            .reduce(|a, b| a + b)
     }
 
     /// The first instant after `now_ms` (unix ms) at which the read, or one Mac's rows in it,
@@ -375,7 +805,8 @@ fn mac_of(
         drive: proven("drive") == Some("1"),
         older,
         unproven,
-        sessions: rows.len(),
+        sessions: Some(rows.len()),
+        build: field(instance, "version").map(str::to_owned),
         // A node service answers for every window it reaches (`instances_read=`); a window that
         // answered alone read itself.
         instances_read: count("instances_read"),
@@ -386,11 +817,29 @@ fn mac_of(
         .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|n| n.parse::<usize>().ok());
     mac.left_out = claimed.map_or(0, |n| n.saturating_sub(sent.len()));
+    let mut tally = AgentTally::default();
     for row in &rows {
         let agent = field(row, "program_kind") == Some("agent");
-        mac.agents += usize::from(agent);
-        let word = field(row, "agent").unwrap_or("-");
-        mac.working += usize::from(agent && word != "idle");
+        let needs = row.get("needs").and_then(aterm_json::Value::as_str);
+        if let Some(word) =
+            AgentWord::of_row(field(row, "program_kind"), field(row, "agent"), needs)
+        {
+            tally.add(&word);
+            if mac.agent_sessions.len() < SESSIONS_MAX {
+                let pct = |key: &str| field(row, key).and_then(|n| n.parse::<u8>().ok());
+                mac.agent_sessions.push(FleetSession {
+                    sid: field(row, "sid").unwrap_or("").to_owned(),
+                    program: field(row, "program").map(str::to_owned),
+                    agent: word,
+                    task: TaskWord::of(field(row, "task"), field(row, "task_conclusion")),
+                    ctx_left_pct: pct("ctx_left_pct"),
+                    usage_5h_pct: pct("usage_5h_pct"),
+                    usage_7d_pct: pct("usage_7d_pct"),
+                });
+            } else {
+                mac.sessions_more += 1;
+            }
+        }
         if let Some(from) = field(row, "task_from").filter(|f| f.starts_with("s-")) {
             match mac.managers.iter_mut().find(|m| m.sid == from) {
                 Some(manager) => manager.workers += 1,
@@ -461,6 +910,7 @@ fn mac_of(
                 .unwrap_or_default(),
         });
     }
+    mac.activity = (!older).then_some(tally);
     mac
 }
 
@@ -516,19 +966,30 @@ pub(crate) fn parse(
             continue;
         }
         let label = field(host, "label").unwrap_or("a peer").to_string();
-        let unanswered = |why: &str| Unanswered {
+        let unanswered = |why: &str, reason: Reach| Unanswered {
             name: short_name(dial_of(&label)),
             dial: dial_of(&label).to_string(),
             why: why.to_string(),
+            reason,
+            ..Unanswered::default()
         };
         if let Some(why) = field(host, "error") {
-            snapshot.unanswered.push(unanswered(why));
+            // The row that stands for a refused read of the whole fleet names no Mac: the read
+            // failed, and no seat is silent.
+            if field(host, "reason") == Some(aterm_ctl::FLEET_UNREAD) {
+                return Err(crate::needs::fold_clip(
+                    &format!("fleet not read: {why}"),
+                    120,
+                ));
+            }
+            let reason = field(host, "reason").map_or(Reach::Unread, Reach::parse);
+            snapshot.unanswered.push(unanswered(why, reason));
             continue;
         }
         let Some(instance) = host.get("instance").and_then(aterm_json::Value::as_object) else {
             snapshot
                 .unanswered
-                .push(unanswered("its answer had no header"));
+                .push(unanswered("its answer had no header", Reach::NoHeader));
             continue;
         };
         let unproven = host.get("unproven").and_then(aterm_json::Value::as_bool) == Some(true);
@@ -538,7 +999,7 @@ pub(crate) fn parse(
         if snapshot.macs.len() >= MACS_MAX {
             snapshot
                 .unanswered
-                .push(unanswered("past the peers one read keeps"));
+                .push(unanswered("past the peers one read keeps", Reach::PastCap));
             continue;
         }
         let sessions = host
@@ -748,13 +1209,23 @@ impl FleetSlot {
     }
 }
 
-/// What a read answered: the child's JSON and stderr, or why there is none.
-pub(crate) type ReadAnswer = Result<(String, String), String>;
-
 /// The read itself, injected so a test drives the thread with no child.
 pub(crate) trait FleetRunner: Send {
-    /// Read the fleet once.
-    fn run(&mut self) -> ReadAnswer;
+    /// Read the fleet once: every Mac but this one (`own_node`, the survey's), its rows as of
+    /// `now_ms()` once the answer is in.
+    fn read(
+        &mut self,
+        own_node: Option<&str>,
+        now_ms: &dyn Fn() -> u64,
+    ) -> Result<FleetSnapshot, String>;
+
+    /// Whether a read dials the fleet's Macs (the survey), so the LAN door
+    /// ([`ReaderSeams::lan`]), the backoff ([`Quiet`]) and `[fleet] watch` govern it. A read of
+    /// this Mac's own copy ([`CopyRunner`]) dials nothing, so it reads on the minute whatever
+    /// they say.
+    fn dials(&self) -> bool {
+        true
+    }
 }
 
 /// THE REAL READ: `<program> <args>` as a child, SIGKILLed at `cap`.
@@ -781,14 +1252,318 @@ impl ChildRunner {
 }
 
 impl FleetRunner for ChildRunner {
-    fn run(&mut self) -> ReadAnswer {
+    fn read(
+        &mut self,
+        own_node: Option<&str>,
+        now_ms: &dyn Fn() -> u64,
+    ) -> Result<FleetSnapshot, String> {
         let ran = crate::bounded_child::run_bounded(&self.program, &self.args, Some(self.cap))?;
         if ran.stdout.trim().is_empty() {
             let why = ran.stderr.lines().next().unwrap_or("no answer").to_string();
             return Err(crate::needs::fold_clip(&why, 120));
         }
-        Ok((ran.stdout, ran.stderr))
+        parse(&ran.stdout, own_node, now_ms())
     }
+}
+
+/// THE MESH READ (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.12, §4.14, §11 B9): this Mac's
+/// own copy as its node service holds it, each current seat's standing, presence row and
+/// now/needs row from the node's view socket ([`aterm_mesh::view::ask`]), each named by this
+/// Mac's book, and composed with this Mac's membership log as `aterm fleet` composes it
+/// ([`aterm_agent::fleet_view::compose_here`]). It dials no Mac and starts no child.
+#[cfg(unix)]
+pub(crate) struct CopyRunner {
+    /// The state directory: `<state>/mesh/` holds the node's socket, `<state>` the book.
+    pub(crate) state: PathBuf,
+    /// This Mac's vault, whose membership log labels the seats and whose records say who needs
+    /// an update; `None` reads no log (every seat unlabelled, none needing an update by it).
+    pub(crate) paths: Option<aterm_secrets::client::Paths>,
+}
+
+#[cfg(unix)]
+impl FleetRunner for CopyRunner {
+    fn read(
+        &mut self,
+        _own_node: Option<&str>,
+        now_ms: &dyn Fn() -> u64,
+    ) -> Result<FleetSnapshot, String> {
+        let view = aterm_mesh::view::ask(
+            &self.state.join(aterm_mesh::logs::MESH_DIR),
+            aterm_mesh::view::WITHIN,
+        )
+        .map_err(|e| e.to_string())?;
+        // Before its node read the standings a view holds this Mac's seat alone; without its
+        // needs rows every up seat would read as having none, and the herald would retire what
+        // they still need. Either is a read that failed, which keeps the last good one.
+        if !view.standings {
+            return Err("the node has not read the lab's membership standings yet".to_owned());
+        }
+        if view.needs.is_none() {
+            return Err("the node could not read the needs rows".to_owned());
+        }
+        let fleet =
+            aterm_agent::fleet_view::compose_here(&self.state, self.paths.as_ref(), Ok(&view));
+        let book = aterm_net::fleet_member::read_peers(&self.state).unwrap_or_default();
+        Ok(snapshot_of(&view, &fleet, &book, now_ms()))
+    }
+
+    fn dials(&self) -> bool {
+        false
+    }
+}
+
+/// The glance's read of a node's `view` at `now_ms`, each seat named by the host its node key's
+/// entry in `book` gives (else its node id) and joined to its row of `fleet` (`aterm fleet`'s
+/// composition of the same view) by its node id: its log label, build, update and tables. An up
+/// seat is a Mac with its now/needs row's needs, holds this Mac placed and managers (no titles
+/// leave a Mac, so a session is its short sid), and its agents' tally and sessions by sid and word
+/// where its now/activity row is fresh; a silent one, and a seat of the log the view does
+/// not hold, a Mac that did not answer, with how long it has been silent. This Mac's own seat is
+/// left out, as the survey leaves out its own answer.
+#[cfg(unix)]
+pub(crate) fn snapshot_of(
+    view: &aterm_mesh::view::View,
+    fleet: &aterm_agent::fleet_view::Fleet,
+    book: &[aterm_net::fleet_member::Peer],
+    now_ms: u64,
+) -> FleetSnapshot {
+    use aterm_mesh::presence::Standing;
+    let booked = |key: &[u8; 32]| {
+        book.iter()
+            .find(|peer| peer.key.is_some_and(|k| k.bytes() == key))
+            .map(|peer| peer.host.as_str())
+    };
+    let row_of = |principal: &str| {
+        fleet
+            .rows
+            .iter()
+            .find(|row| row.node.as_deref() == Some(principal))
+    };
+    let label_of =
+        |row: &aterm_agent::fleet_view::SeatRow| (row.label != "-").then(|| row.label.clone());
+    let mut snapshot = FleetSnapshot {
+        read_at_ms: now_ms,
+        seats: Some(fleet.seats.clone()),
+        ..FleetSnapshot::default()
+    };
+    for seat in view.seats.iter().filter(|seat| !seat.me) {
+        let host = booked(&seat.key);
+        let dial = host.map_or_else(|| seat.principal.clone(), str::to_owned);
+        let name = host.map_or_else(|| seat.principal.clone(), short_name);
+        let seat_row = row_of(&seat.principal);
+        let label = seat_row.and_then(label_of);
+        let presence = seat.row.as_ref().map(|(_, row)| row);
+        let build = seat_row
+            .and_then(|row| row.build.clone())
+            .or_else(|| presence.map(|row| row.build.as_str().to_owned()));
+        let Standing::Up = seat.standing else {
+            let (why, reason, since) = match seat.standing {
+                Standing::Silent {
+                    last_seen_ms: Some(seen),
+                } => (
+                    format!(
+                        "silent for {}",
+                        aterm_netplace::words::age_words(now_ms.saturating_sub(seen))
+                    ),
+                    Reach::Silent { since_ms: seen },
+                    Some(seen),
+                ),
+                _ => (
+                    "silent, never seen up here".to_owned(),
+                    Reach::NeverUp,
+                    None,
+                ),
+            };
+            snapshot.unanswered.push(Unanswered {
+                name,
+                dial,
+                why,
+                reason,
+                build,
+                silent_since_ms: since,
+                label,
+                needs_update: seat_row.is_some_and(|row| row.needs_update),
+            });
+            continue;
+        };
+        if snapshot.macs.len() >= MACS_MAX {
+            snapshot.unanswered.push(Unanswered {
+                name,
+                dial,
+                why: "past the peers one read keeps".to_owned(),
+                reason: Reach::PastCap,
+                build,
+                silent_since_ms: None,
+                label,
+                needs_update: seat_row.is_some_and(|row| row.needs_update),
+            });
+            continue;
+        }
+        let needs = view
+            .needs
+            .as_ref()
+            .and_then(|needs| needs.get(&seat.principal));
+        let mut mac = FleetMac {
+            name,
+            dial,
+            node: Some(seat.principal.clone()),
+            host: host.and_then(host_word).or_else(|| {
+                presence
+                    .and_then(|row| row.addresses.iter().find(|at| at.is_ipv4()))
+                    .map(|at| at.ip().to_string())
+            }),
+            instances_read: 1,
+            read_at_ms: now_ms,
+            build,
+            label,
+            needs_update: seat_row.is_some_and(|row| row.needs_update),
+            tables: seat_row.and_then(|row| row.behind),
+            ..FleetMac::default()
+        };
+        if let Some(needs) = needs {
+            let age_ms =
+                |since: Option<u64>| since.map(|s| now_ms.saturating_sub(s.saturating_mul(1000)));
+            mac.needs = needs
+                .needs
+                .iter()
+                .filter_map(|need| {
+                    let sid = need.sid.to_string();
+                    Some(FleetNeed {
+                        word: NeedWord::parse(need.word.as_str())?,
+                        who: crate::presence::short_sid(&sid),
+                        worker_of: need
+                            .worker_of
+                            .as_ref()
+                            .map(|from| crate::presence::short_sid(&from.to_string())),
+                        age_ms: age_ms(need.since),
+                        what: None,
+                        claim: None,
+                        carries_on: need.harness,
+                        ids: Vec::new(),
+                        sid,
+                    })
+                })
+                .collect();
+            mac.held_here = needs
+                .held
+                .iter()
+                .filter(|held| held.by.is_some_and(|by| by.to_string() == view.me))
+                .map(|held| {
+                    let sid = held.sid.to_string();
+                    FleetHeld {
+                        who: crate::presence::short_sid(&sid),
+                        sid,
+                    }
+                })
+                .collect();
+            mac.managers = needs
+                .managers
+                .iter()
+                .map(|manager| {
+                    let sid = manager.sid.to_string();
+                    FleetManager {
+                        label: crate::presence::short_sid(&sid),
+                        workers: usize::try_from(manager.workers).unwrap_or(usize::MAX),
+                        sid,
+                    }
+                })
+                .collect();
+        }
+        // Its activity row counts where it is fresh against the seat's own presence row, both
+        // of its clock: a Mac whose windows went unread, or that runs a build that publishes
+        // none any more, is not read rather than shown as its last count.
+        let behind_ms = |row: &aterm_metrics::row::ActivityRow| {
+            presence.map(|at| at.at_ms.saturating_sub(row.at.saturating_mul(1000)))
+        };
+        let activity = match view.activity.as_ref() {
+            None => Err(ActivityAbsent::Unread),
+            Some(activity) => match activity.get(&seat.principal) {
+                None => Err(ActivityAbsent::Unpublished),
+                Some(row) => match behind_ms(row) {
+                    Some(behind) if behind <= aterm_metrics::row::ACTIVITY_FRESH_MS => Ok(row),
+                    behind_ms => Err(ActivityAbsent::Stale { behind_ms }),
+                },
+            },
+        };
+        mac.activity_absent = activity.err();
+        if let Ok(row) = activity {
+            mac.activity = Some(AgentTally::of_row(row));
+            mac.agent_sessions = row
+                .sessions
+                .iter()
+                .take(SESSIONS_MAX)
+                .map(|entry| FleetSession {
+                    sid: entry.sid.to_string(),
+                    program: None,
+                    agent: AgentWord::of_wire(
+                        entry.word.as_str(),
+                        entry.detail.as_ref().map(aterm_metrics::row::Word::as_str),
+                    ),
+                    task: None,
+                    ctx_left_pct: None,
+                    usage_5h_pct: None,
+                    usage_7d_pct: None,
+                })
+                .collect();
+            mac.sessions_more = usize::try_from(row.agents())
+                .unwrap_or(usize::MAX)
+                .saturating_sub(mac.agent_sessions.len());
+        }
+        snapshot.macs.push(mac);
+    }
+    // A seat of this Mac's log that the view does not hold (it bound no node key, or the node
+    // has not read it): never read up here, and counted, so every seat is a Mac.
+    for row in fleet.rows.iter().filter(|row| !row.me) {
+        let held = row
+            .node
+            .as_deref()
+            .is_some_and(|node| view.seats.iter().any(|seat| seat.principal == node));
+        if held {
+            continue;
+        }
+        let dial = if row.name == "-" {
+            row.node.clone().unwrap_or_else(|| row.label.clone())
+        } else {
+            row.name.clone()
+        };
+        snapshot.unanswered.push(Unanswered {
+            name: short_name(&dial),
+            dial,
+            why: "silent, never seen up here".to_owned(),
+            reason: Reach::NeverUp,
+            build: row.build.clone(),
+            silent_since_ms: None,
+            label: label_of(row),
+            needs_update: row.needs_update,
+        });
+    }
+    snapshot
+}
+
+/// The vault a copy read composes with; the vault client, and with it the copy path, is unix
+/// only, so elsewhere there is no vault to hand over.
+#[cfg(unix)]
+pub(crate) type VaultPaths = aterm_secrets::client::Paths;
+/// Off unix the glance only surveys, and no vault is read.
+#[cfg(not(unix))]
+pub(crate) type VaultPaths = std::convert::Infallible;
+
+/// The glance's read where `mesh` (`aterm_types::mesh_switch::MESH`) says whether this Mac's
+/// node holds the lab's copy: this Mac's own copy under the state directory `state`
+/// ([`CopyRunner`], composed with the vault at `paths`), else the survey that dials every Mac in
+/// the book ([`ChildRunner::fleet`]), until wave D removes it.
+pub(crate) fn runner(
+    mesh: bool,
+    state: Option<PathBuf>,
+    paths: Option<VaultPaths>,
+) -> Box<dyn FleetRunner> {
+    #[cfg(unix)]
+    if let (true, Some(state)) = (mesh, state) {
+        return Box::new(CopyRunner { state, paths });
+    }
+    #[cfg(not(unix))]
+    let _ = (mesh, state, paths);
+    Box::new(ChildRunner::fleet())
 }
 
 /// What the reader thread is asked.
@@ -869,6 +1644,12 @@ pub(crate) struct ReaderSeams {
     pub(crate) away: Box<dyn Fn() -> bool + Send>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread read [`FleetGlance::generation`]: the Fleet Field's idle tax.
+    pub(crate) static GENERATION_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The fleet glance's handle: the slot and the kick channel.
 pub(crate) struct FleetGlance {
     /// The shared slot.
@@ -892,6 +1673,40 @@ impl FleetGlance {
     /// Follow `[fleet] watch`.
     pub(crate) fn set_watch(&self, on: bool) {
         self.watch.store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The seats the last read of this Mac's copy holds ([`FleetSnapshot::seats`]) while it
+    /// stands at `now_ms`: this Mac is in the fleet, the last read did not fail, and the read is
+    /// fresh ([`FleetSnapshot::fresh`]). `None` otherwise, and for a survey's read.
+    pub(crate) fn seats(&self, now_ms: u64) -> Option<aterm_netplace::words::Seats> {
+        let slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        if !slot.book.in_fleet || slot.error.is_some() {
+            return None;
+        }
+        slot.snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.fresh(now_ms))
+            .and_then(|snapshot| snapshot.seats.clone())
+    }
+
+    /// What moves when the slot does, read under its lock without copying it: the generation,
+    /// whether the last read failed, and whether this Mac is in a fleet.
+    pub(crate) fn generation(&self) -> (u16, bool, bool) {
+        #[cfg(test)]
+        GENERATION_READS.with(|n| n.set(n.get() + 1));
+        let slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        (slot.generation, slot.error.is_some(), slot.book.in_fleet)
+    }
+
+    /// A glance over `slot` with no reader thread, for a test.
+    #[cfg(test)]
+    pub(crate) fn over(slot: FleetSlot) -> Self {
+        let (kick, _) = std::sync::mpsc::channel();
+        Self {
+            slot: Arc::new(Mutex::new(slot)),
+            kick,
+            watch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
     }
 
     /// The slot as it stands, copied out under its lock (poison recovered: the slot is plain data, its snapshots shared, so a copy is cheap).
@@ -961,13 +1776,14 @@ fn reader_loop(
             quiet.moved();
         }
         let tried = lock().tried_ms.filter(|_| !asked.moved);
-        let watch = seams.watch.load(std::sync::atomic::Ordering::Acquire);
+        let dials = runner.dials();
+        let watch = !dials || seams.watch.load(std::sync::atomic::Ordering::Acquire);
         // The broker is asked last, only for a read this tick makes: a tick that reads nothing
-        // dials nothing.
+        // dials nothing, and a read of this Mac's own copy dials no Mac.
         let read = book.in_fleet
             && (asked.now
                 || (should_poll(&book, watch, tried, now, asked.menu, quiet.every())
-                    && (seams.lan)()));
+                    && (!dials || (seams.lan)())));
         // A move of the network that came while a read ran: that read went out on the old one.
         let mut moved_since = false;
         let book_moved = {
@@ -987,17 +1803,19 @@ fn reader_loop(
             told_ms = now;
         }
         if read {
-            let answer = runner.run();
+            let parsed = runner.read(seams.own_node.as_deref(), &*seams.now_ms);
             // The kicks that came while it ran are answered by it, but a move of the network,
             // which asks for a read on the new one; one sent once its result is in the slot asks
             // for another.
             moved_since = Asked::with_queued(None, rx).moved;
             let now = (seams.now_ms)();
-            let parsed = answer.and_then(|(json, _)| parse(&json, seams.own_node.as_deref(), now));
-            // Whom a read on the old network reached says nothing of the new one.
-            let away = (seams.away)();
-            if !moved_since && quiet.after(&parsed, away) {
-                aterm_log::info!("{}", quiet_line(quiet, away));
+            // Whom a read on the old network reached says nothing of the new one; a read that
+            // dials nobody backs off from nobody.
+            if dials && !moved_since {
+                let away = (seams.away)();
+                if quiet.after(&parsed, away) {
+                    aterm_log::info!("{}", quiet_line(quiet, away));
+                }
             }
             {
                 let mut slot = lock();
@@ -1005,7 +1823,13 @@ fn reader_loop(
                 slot.tried_ms = Some(now);
                 match parsed {
                     Ok(snapshot) => {
-                        let snapshot = carry(slot.snapshot.as_deref(), snapshot, now);
+                        // A silent seat on this Mac's copy is the node's judgment over a row
+                        // that stopped advancing: no last rows of its are carried.
+                        let snapshot = if dials {
+                            carry(slot.snapshot.as_deref(), snapshot, now)
+                        } else {
+                            snapshot
+                        };
                         if let Some(old) = slot.snapshot.take() {
                             slot.previous = Some((slot.generation, old));
                         }
@@ -1155,6 +1979,7 @@ impl crate::App {
         ));
         #[cfg(unix)]
         let place_state = state.clone();
+        let mesh_state = state.clone();
         let seams = ReaderSeams {
             book: Box::new(move || state.as_deref().map(read_book).unwrap_or_default()),
             watch,
@@ -1173,7 +1998,17 @@ impl crate::App {
             #[cfg(not(unix))]
             away: Box::new(|| false),
         };
-        self.start_fleet_glance_with(Box::new(ChildRunner::fleet()), seams);
+        // The vault is read only for this Mac's copy, which composes with its membership log.
+        #[cfg(unix)]
+        let paths = aterm_types::mesh_switch::MESH
+            .then(|| aterm_secrets::client::Paths::live().ok())
+            .flatten();
+        #[cfg(not(unix))]
+        let paths = None;
+        self.start_fleet_glance_with(
+            runner(aterm_types::mesh_switch::MESH, mesh_state, paths),
+            seams,
+        );
     }
 
     /// Whether a fleet glance may start here: never headless (no child, no
@@ -1207,6 +2042,11 @@ impl crate::App {
 
     /// The `Wake::FleetRead` arm: the fleet glance wrote its slot.
     pub(crate) fn on_fleet_read(&mut self) {
+        // The Network State band draws the fleet: its service turn runs at once, not at its
+        // next poll, so the new read shows on the next turn.
+        if self.network_band_drawn() {
+            self.network_next_poll = None;
+        }
         self.mark_status_dirty();
         self.herald_fleet();
     }

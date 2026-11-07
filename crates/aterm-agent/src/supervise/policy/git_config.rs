@@ -542,6 +542,22 @@ pub(crate) fn claude_dir_at(
     Ok(normalise(&cwd.join(dir)))
 }
 
+/// One `git ls-files -z --stage -v` entry: whether it is marked assume-unchanged (a lowercase
+/// tag), whether it is a gitlink (mode `160000`), and its path; `None` for no entry.
+fn index_entry(entry: &[u8]) -> Option<(bool, bool, &[u8])> {
+    let tab = entry.iter().position(|b| *b == b'\t')?;
+    let (meta, path) = (&entry[..tab], &entry[tab + 1..]);
+    let (tag, stage) = match meta.iter().position(|b| *b == b' ') {
+        Some(space) => (&meta[..space], &meta[space + 1..]),
+        None => (&meta[..0], meta),
+    };
+    Some((
+        tag.iter().any(u8::is_ascii_lowercase),
+        stage.starts_with(b"160000 "),
+        path,
+    ))
+}
+
 fn git_relevant(key: &str) -> bool {
     matches!(key, "PATH" | "HOME" | "XDG_CONFIG_HOME")
         || (key.starts_with("GIT_") && !matches!(key, "GIT_PAGER" | "GIT_EDITOR"))
@@ -666,12 +682,29 @@ impl Probe<'_> {
     /// The index's gitlinks (the paths of its submodules), and whether it marks any entry
     /// assume-unchanged: `git ls-files -v` tags such an entry with a lowercase letter, beside the
     /// stage line `--stage` writes (MEASURED 2026-11-05 with git 2.56.0: `h 100644 <oid> 0\tx.rs`
-    /// after `git update-index --assume-unchanged x.rs`).
+    /// after `git update-index --assume-unchanged x.rs`). The listing is read whole, however
+    /// large the index (aterm's own checkout's wrote 4878197 bytes, MEASURED 2026-11-06), and
+    /// only the entries this reads are held: the gitlinks and the first marked entry, within
+    /// [`aterm_uds::deadline::OUTPUT_KEEP`] bytes.
     fn index_entries(&self, top: &Path) -> Result<(Vec<String>, bool), String> {
         let mut cmd = self.git(top);
         cmd.args(["ls-files", "-z", "--stage", "-v"]);
-        let out = aterm_uds::deadline::output_within(&mut cmd, GIT_READ_WAIT)
-            .map_err(|e| format!("cannot list the index in {}: {e}", top.display()))?;
+        let mut marked = false;
+        let out = aterm_uds::deadline::output_within_complete_stdout_records(
+            &mut cmd,
+            GIT_READ_WAIT,
+            0,
+            aterm_uds::deadline::OUTPUT_KEEP,
+            move |entry| match index_entry(entry) {
+                Some((true, _, _)) if !marked => {
+                    marked = true;
+                    true
+                }
+                Some((_, gitlink, _)) => gitlink,
+                None => false,
+            },
+        )
+        .map_err(|e| format!("cannot list the whole index in {}: {e}", top.display()))?;
         if !out.status.success() {
             return Err(git_failed(
                 "cannot list the index in",
@@ -680,24 +713,12 @@ impl Probe<'_> {
                 "git ls-files --stage -v",
             ));
         }
-        if out.stdout.len() >= aterm_uds::deadline::OUTPUT_KEEP {
-            return Err(format!(
-                "cannot list the whole index in {}: over {} bytes",
-                top.display(),
-                aterm_uds::deadline::OUTPUT_KEEP
-            ));
-        }
-        let listed = String::from_utf8_lossy(&out.stdout);
         let mut gitlinks = Vec::new();
         let mut assume_unchanged = false;
-        for entry in listed.split('\0') {
-            let Some((meta, path)) = entry.split_once('\t') else {
-                continue;
-            };
-            let (tag, stage) = meta.split_once(' ').unwrap_or(("", meta));
-            assume_unchanged |= tag.chars().any(|c| c.is_ascii_lowercase());
-            if stage.starts_with("160000 ") {
-                gitlinks.push(path.to_string());
+        for (marked, gitlink, path) in out.stdout.split(|b| *b == 0).filter_map(index_entry) {
+            assume_unchanged |= marked;
+            if gitlink {
+                gitlinks.push(String::from_utf8_lossy(path).into_owned());
             }
         }
         Ok((gitlinks, assume_unchanged))
@@ -706,13 +727,16 @@ impl Probe<'_> {
     fn filters_selected(&self, top: &Path) -> Option<Vec<String>> {
         let mut cmd = self.git(top);
         cmd.args(["ls-files", "-z"]);
-        let paths = aterm_uds::deadline::output_within(&mut cmd, GIT_READ_WAIT)
-            .ok()
-            .filter(|o| o.status.success())?
-            .stdout;
-        if paths.len() >= aterm_uds::deadline::OUTPUT_KEEP {
-            return None;
-        }
+        // The whole path list, to its proven end: a large checkout's runs to megabytes, and one
+        // past the hard bound is unread (`None`), never judged from a cut list.
+        let paths = aterm_uds::deadline::output_within_complete_listing(
+            &mut cmd,
+            GIT_READ_WAIT,
+            aterm_uds::deadline::MAX_COMPLETE_LISTING_BYTES,
+        )
+        .ok()
+        .filter(|o| o.status.success())?
+        .stdout;
         self.drivers_selected(top, paths, GIT_READ_WAIT)
     }
 
@@ -732,29 +756,41 @@ impl Probe<'_> {
         // The command holds this process's copy of the pipe's read end until it drops, at the
         // block's end: then a git that exited, or was killed, without reading all of `paths`
         // fails the writer's write instead of leaving it blocked.
+        // `check-attr -z` answers `path NUL attribute NUL value NUL` for every path; the read
+        // goes to its end and holds only each driver value's first appearance.
         let out = {
             let mut cmd = self.git(top);
             cmd.args(["check-attr", "--stdin", "-z", "filter"]);
-            aterm_uds::deadline::output_within_from(&mut cmd, Stdio::from(reader), wait).ok()
+            let mut field = 0_usize;
+            let mut seen: Vec<Vec<u8>> = Vec::new();
+            aterm_uds::deadline::output_within_complete_stdout_records_from(
+                &mut cmd,
+                Stdio::from(reader),
+                wait,
+                0,
+                aterm_uds::deadline::OUTPUT_KEEP,
+                move |value| {
+                    field += 1;
+                    if field % 3 != 0
+                        || matches!(value, b"unspecified" | b"unset" | b"set" | b"")
+                        || seen.iter().any(|d| d == value)
+                    {
+                        return false;
+                    }
+                    seen.push(value.to_vec());
+                    true
+                },
+            )
+            .ok()
         };
         let wrote = wrote.join().ok()?;
         let out = out?;
         wrote.ok()?;
-        if !out.status.success() || out.stdout.len() >= aterm_uds::deadline::OUTPUT_KEEP {
+        if !out.status.success() {
             return None;
         }
         let text = String::from_utf8_lossy(&out.stdout);
-        let fields: Vec<&str> = text.split('\0').collect();
-        let mut drivers: Vec<String> = Vec::new();
-        for record in fields.chunks(3) {
-            if let [_, _, value] = record
-                && !matches!(*value, "unspecified" | "unset" | "set" | "")
-                && !drivers.iter().any(|d| d == value)
-            {
-                drivers.push((*value).to_string());
-            }
-        }
-        Some(drivers)
+        Some(text.split_terminator('\0').map(str::to_owned).collect())
     }
 }
 

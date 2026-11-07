@@ -37,8 +37,12 @@ fn retained_case(cold: bool) {
     h.pause = Arc::new(|_| Duration::from_millis(1));
     let admitted = Arc::clone(&allowed);
     let seen = Arc::clone(&observations);
-    h.acts.codex_cold = Arc::new(move |_| {
+    let cold_reads = Arc::new(Mutex::new(Vec::new()));
+    let saw_reads = Arc::clone(&cold_reads);
+    h.acts.codex_cold = Arc::new(move |_, used| {
         seen.fetch_add(1, Ordering::SeqCst);
+        saw_reads.lock().unwrap().push(used.has_read());
+        used.note_read();
         if admitted.load(Ordering::SeqCst) {
             Ok(None)
         } else {
@@ -68,6 +72,10 @@ fn retained_case(cold: bool) {
         !launched.lock().unwrap().is_empty()
     });
     host.shutdown_and_join();
+    // A timer retries the admission, and each attempt is of one use of the account.
+    let cold_reads = cold_reads.lock().unwrap();
+    assert_eq!(cold_reads.first(), Some(&false), "{cold_reads:?}");
+    assert!(cold_reads[1..].iter().all(|read| *read), "{cold_reads:?}");
     let launched = launched.lock().unwrap();
     assert_eq!(launched.len(), 1);
     let resume = |snapshot: &Snapshot| snapshot.codex().unwrap().self_claimed.clone().unwrap();

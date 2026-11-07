@@ -170,7 +170,75 @@ pub const RULE_PROSE_LONG_TERM: &str = "prose-long-term@v1";
 /// The same under `short-term`.
 pub const RULE_PROSE_SHORT_TERM: &str = "prose-short-term@v1";
 
-/// How a question is answered once [`ApprovalCtx::answer_questions`] says it is.
+/// A priority a person sets: what the `[harness] question_priority` key and a session's
+/// `questions` word spell. It is [`QuestionPriority`] less Land's, which no person sets, so no
+/// configuration carries Land's priority: a dialog takes Land's from the approval loop (the
+/// session's Autopilot) or from a box's facts ([`QuestionPriority::of_fact`]), and a prose
+/// question under Land gets the turn-end policy's own Land answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum PriorityWord {
+    #[default]
+    Recommended,
+    LongTerm,
+    ShortTerm,
+}
+
+impl PriorityWord {
+    /// Every word, in [`Self::WORDS`]' order.
+    pub const ALL: [Self; 3] = [Self::Recommended, Self::LongTerm, Self::ShortTerm];
+    /// How the config key and the session word spell them, in [`Self::ALL`]'s order.
+    pub const WORDS: [&'static str; 3] = ["recommended", "long-term", "short-term"];
+
+    /// The word `word` names, trimmed and with its ASCII case folded, or `None` for any other
+    /// text (`land` included: no person sets it).
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        let word = word.trim();
+        Self::ALL
+            .into_iter()
+            .find(|p| p.word().eq_ignore_ascii_case(word))
+    }
+
+    /// Its word: `recommended`, `long-term`, `short-term`.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Recommended => Self::WORDS[0],
+            Self::LongTerm => Self::WORDS[1],
+            Self::ShortTerm => Self::WORDS[2],
+        }
+    }
+
+    /// The rule a prose question answered under it is ledgered as.
+    #[must_use]
+    pub const fn prose_rule_id(self) -> &'static str {
+        match self {
+            Self::Recommended => super::turn_end::RULE_ANSWER,
+            Self::LongTerm => RULE_PROSE_LONG_TERM,
+            Self::ShortTerm => RULE_PROSE_SHORT_TERM,
+        }
+    }
+
+    /// Its policy text, which a prose question is answered with and a dialog's free-text row is
+    /// written with: its [`QuestionPriority`]'s.
+    #[must_use]
+    pub fn text(self) -> Option<&'static str> {
+        QuestionPriority::from(self).text()
+    }
+}
+
+impl From<PriorityWord> for QuestionPriority {
+    fn from(word: PriorityWord) -> Self {
+        match word {
+            PriorityWord::Recommended => Self::Recommended,
+            PriorityWord::LongTerm => Self::LongTerm,
+            PriorityWord::ShortTerm => Self::ShortTerm,
+        }
+    }
+}
+
+/// How a question dialog is answered once [`ApprovalCtx::answer_questions`] says it is: under a
+/// person's [`PriorityWord`] or under Land's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum QuestionPriority {
     #[default]
@@ -183,11 +251,8 @@ pub enum QuestionPriority {
 }
 
 impl QuestionPriority {
-    /// The three a person sets, in [`Self::WORDS`]' order.
-    pub const ALL: [Self; 3] = [Self::Recommended, Self::LongTerm, Self::ShortTerm];
-    /// The words the config key and the session word spell them with, in [`Self::ALL`]'s order.
-    pub const WORDS: [&'static str; 3] = ["recommended", "long-term", "short-term"];
-    /// Every priority: [`Self::ALL`] and [`Self::Land`].
+    /// Every priority: each [`PriorityWord`]'s, in [`PriorityWord::ALL`]'s order, and
+    /// [`Self::Land`].
     pub const EVERY: [Self; 4] = [
         Self::Recommended,
         Self::LongTerm,
@@ -195,29 +260,19 @@ impl QuestionPriority {
         Self::Land,
     ];
 
-    /// The priority `word` names, or `None` for any other text (`land` included: no person
-    /// sets it).
-    #[must_use]
-    pub fn parse(word: &str) -> Option<Self> {
-        let word = word.trim();
-        Self::ALL
-            .into_iter()
-            .find(|p| p.word().eq_ignore_ascii_case(word))
-    }
-
     /// The priority a box's facts or a tape name by its [`Self::word`], `land` included.
     #[must_use]
     pub fn of_fact(word: &str) -> Option<Self> {
         Self::EVERY.into_iter().find(|p| p.word() == word)
     }
 
-    /// Its word: `recommended`, `long-term`, `short-term`, `land`.
+    /// Its word: its [`PriorityWord`]'s, or `land`.
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
-            Self::Recommended => Self::WORDS[0],
-            Self::LongTerm => Self::WORDS[1],
-            Self::ShortTerm => Self::WORDS[2],
+            Self::Recommended => PriorityWord::Recommended.word(),
+            Self::LongTerm => PriorityWord::LongTerm.word(),
+            Self::ShortTerm => PriorityWord::ShortTerm.word(),
             Self::Land => "land",
         }
     }
@@ -233,19 +288,8 @@ impl QuestionPriority {
         }
     }
 
-    /// The rule a prose question answered under it is ledgered as. Land's prose is
-    /// [`super::turn_end::LAND_ANSWER`], which `words_act` types without this priority; its
-    /// arm is the plain answer, no land act.
-    #[must_use]
-    pub const fn prose_rule_id(self) -> &'static str {
-        match self {
-            Self::Recommended | Self::Land => super::turn_end::RULE_ANSWER,
-            Self::LongTerm => RULE_PROSE_LONG_TERM,
-            Self::ShortTerm => RULE_PROSE_SHORT_TERM,
-        }
-    }
-
-    /// The fixed policy text written into a free-text row (and used for prose).
+    /// The fixed policy text written into a free-text row; a [`PriorityWord`]'s answers a prose
+    /// question too ([`PriorityWord::text`]).
     #[must_use]
     pub const fn text(self) -> Option<&'static str> {
         match self {
@@ -586,7 +630,7 @@ impl ApprovalCtx {
             scratch_roots,
             rm_breaker_warn: !defaults.rm_breaker_ask,
             python_allow: Vec::new(),
-            question_priority: defaults.question_priority,
+            question_priority: defaults.question_priority.into(),
             question_own: None,
             question_person: false,
             screen_cols: 0,

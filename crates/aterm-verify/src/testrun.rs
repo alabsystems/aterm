@@ -1,21 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Running test binaries concurrently.
+//! Running test binaries concurrently: each at the width its runs call for, as many at once as
+//! their charges fit in the run's CPU share ([`crate::test_plan`]).
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::exec::{self, Cmd, Run};
 use crate::ladder::{Outcome, Report, Severity};
+use crate::test_plan::{self, Dispatcher, Plan, Planned};
 
 /// The flag cargo's runner config hands this binary.
 pub const RECORD_FLAG: &str = "--record-test-binary";
+
+/// How long a binary the live-rate backstop holds back waits before it looks again, unless a
+/// binary ends first: the stage meter's read cadence, which moves the rate.
+const LOOK_AGAIN: Duration = exec::READ_USAGE_EVERY;
 
 /// Environment variable naming the shared subprocess slot directory created by [`run_tests`].
 pub const SUBPROCESS_SLOTS_ENV: &str = "ATERM_TEST_SUBPROCESS_SLOTS";
@@ -630,51 +636,249 @@ pub fn plan(records: Vec<Record>, log: &str, exes: &[TestExe]) -> Result<Vec<Bin
         .collect()
 }
 
-/// Run every binary through [`crate::test_plan::dispatch`] in `plan`'s order, each at its
-/// planned width, at most `workers` at once and their charges within its share: each one's run
-/// and its own wall time, in declared order whatever order they ran in. Call `completed` with
-/// its width as each finishes, before waiting for other binaries; its durations separate queue
-/// time from execution time.
-pub fn run_all<F, E>(
+/// One binary's run ([`dispatch`]).
+#[derive(Clone, Debug)]
+pub struct Ran {
+    /// How it ended, with what its tree used ([`Run::usage`]).
+    pub run: Run,
+    /// Its width and charge.
+    pub planned: Planned,
+    /// From the dispatch's start to its own.
+    pub waiting: Duration,
+    /// Its own wall.
+    pub execution: Duration,
+}
+
+impl Ran {
+    /// The cores it used on average, where it was read.
+    #[must_use]
+    pub fn cores(&self) -> Option<f64> {
+        let wall = self.execution.as_secs_f64();
+        let used = self.run.usage?.cpu.as_secs_f64() / wall;
+        (wall > 0.0 && used.is_finite()).then_some(used)
+    }
+
+    /// The cores it used on average beyond its charge, where it used more: its charge rises by
+    /// as much next run ([`crate::test_history::History::seen`]).
+    #[must_use]
+    pub fn overran(&self) -> Option<f64> {
+        self.cores()
+            .filter(|&used| used > f64::from(self.planned.charge))
+    }
+}
+
+/// Run every binary of `plan` at its width, starting each as [`Dispatcher`] admits it: in the
+/// plan's order, once its charge fits in what the running binaries leave of the plan's share and
+/// its peak in what they leave of `memory`, with the running binaries using `live()` cores at
+/// their last reads. Once `stop()` (the run's wall-clock ceiling is spent, or its run-wide halt is
+/// armed) it halts and starts nothing more; `completed` is handed a local halt that takes the
+/// same lock as admission, so a decisive red can close dispatch before it writes its event. A
+/// binary `run_one` answers `None` for did not start (the run stopped as its turn came) is answered
+/// as one the halt left. Each worker books
+/// its children into the calling stage's memory meter ([`crate::memory::current`]), hands them
+/// its cover marker ([`crate::memory::cover`]) and retains the calling thread's memory
+/// reservation, so nothing the stage claimed is released while a binary runs. `completed` hears
+/// each binary as it ends, before its charge goes back. A binary's charge goes back however its
+/// turn ends ([`Charged`]): one whose `run_one` or `completed` panicked halts the dispatch, and
+/// the panic reaches the caller once the running binaries end. The answers are in `bins`' order;
+/// `None` for a binary the halt left unstarted.
+pub fn dispatch<F, E>(
     bins: &[Binary],
-    plan: &crate::test_plan::Plan,
-    workers: usize,
+    plan: &Plan,
+    memory: Option<u64>,
+    live: &(dyn Fn() -> f64 + Sync),
+    stop: &(dyn Fn() -> bool + Sync),
     run_one: F,
     completed: E,
-) -> Vec<(Run, Duration)>
+) -> Vec<Option<Ran>>
 where
-    F: Fn(&Binary, u32) -> Run + Sync,
-    E: Fn(&Binary, &Run, Duration, Duration, u32) + Sync,
+    F: Fn(&Binary, &Planned) -> Option<Run> + Sync,
+    E: Fn(&Binary, &Ran, &dyn Fn()) + Sync,
 {
+    dispatch_pooled(bins, plan, memory, None, live, stop, run_one, completed)
+}
+
+/// [`dispatch`], each started binary also holding its charge in the release's `pool`
+/// ([`aterm_capacity::POOL_ENV`], [`crate::Ctx::pool`]) while it runs, where one was handed.
+///
+/// THE CHARGE IN TOKENS. The plan's share is the pool's slots, so the charges the dispatcher
+/// admits never pass them; the pool's other holders (the release's build and export) are not in
+/// the dispatcher's books, so a binary the share admits also takes its charge's tokens
+/// ([`aterm_capacity::Jobserver::acquire_many`], one partial holder at a time) before its clock
+/// starts, its wait queue time ([`Ran::waiting`]), and gives them back as its process ends,
+/// before `completed` and before its share. The tokens the running binaries hold are thus their
+/// charges, and with the pool's other holders never more than its slots. A wait `stop()` ends
+/// leaves the binary unstarted, as the stop leaves every other; one an interrupt or the FIFO
+/// ends answers it as a binary verify could not start ([`Run::spawn_error`]), never run.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "dispatch's own seven inputs and the release's pool, which only a run under a \
+              release hands"
+)]
+pub fn dispatch_pooled<F, E>(
+    bins: &[Binary],
+    plan: &Plan,
+    memory: Option<u64>,
+    pool: Option<&aterm_capacity::Jobserver>,
+    live: &(dyn Fn() -> f64 + Sync),
+    stop: &(dyn Fn() -> bool + Sync),
+    run_one: F,
+    completed: E,
+) -> Vec<Option<Ran>>
+where
+    F: Fn(&Binary, &Planned) -> Option<Run> + Sync,
+    E: Fn(&Binary, &Ran, &dyn Fn()) + Sync,
+{
+    let unpaid = || stop() || exec::ending();
+    let answers: Vec<Mutex<Option<Ran>>> = bins.iter().map(|_| Mutex::new(None)).collect();
+    let state = Mutex::new(Dispatcher::new(plan, memory));
+    let turn = Condvar::new();
+    let halt = || halt_dispatch(&state, &turn);
+    let meter = crate::memory::current();
+    let cover = crate::memory::cover();
+    let reservation = crate::current_memory_claim();
     let queued = Instant::now();
-    crate::test_plan::dispatch(plan, workers, |i, width| {
-        let started = Instant::now();
-        let run = run_one(&bins[i], width);
-        let elapsed = started.elapsed();
-        completed(
-            &bins[i],
-            &run,
-            started.duration_since(queued),
-            elapsed,
-            width,
-        );
-        (run, elapsed)
-    })
-    .into_iter()
-    .map(|pooled| {
-        pooled.unwrap_or_else(|| {
-            let run = Run {
-                stopped_at: None,
-                ok: false,
-                output: "aterm-verify: this test binary was never run (a gate defect)\n".into(),
-                code: None,
-                spawn_error: None,
-                usage: None,
-            };
-            (run, Duration::ZERO)
-        })
-    })
-    .collect()
+    // Each running binary holds at least one core of the share, so no more run at once.
+    let workers = usize::try_from(plan.share)
+        .unwrap_or(usize::MAX)
+        .min(plan.order.len())
+        .max(1);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                let _metering = crate::memory::metering(meter.clone());
+                let _covering = crate::memory::covering(cover.clone());
+                let _reservation = crate::holding_memory_claim(reservation.clone());
+                while let Some(b) = admitted(&state, &turn, live, stop) {
+                    let _charged = Charged {
+                        state: &state,
+                        turn: &turn,
+                        index: b.index,
+                    };
+                    // The next may fit beside it.
+                    turn.notify_all();
+                    if let Some(binary) = bins.get(b.index) {
+                        let tokens = pool.map(|pool| pool.acquire_many(b.charge, &unpaid));
+                        let (tokens, refused) = match tokens {
+                            None => (None, None),
+                            Some(Ok(tokens)) => (Some(tokens), None),
+                            // The stop leaves it unstarted, as it leaves the rest.
+                            Some(Err(_)) if stop() => continue,
+                            Some(Err(why)) => (None, Some(unpaid_run(&why))),
+                        };
+                        let started = Instant::now();
+                        let answered = refused.or_else(|| run_one(binary, &b));
+                        drop(tokens);
+                        if let Some(run) = answered {
+                            let ran = Ran {
+                                run,
+                                planned: b,
+                                waiting: started.duration_since(queued),
+                                execution: started.elapsed(),
+                            };
+                            completed(binary, &ran, &halt);
+                            *answers[b.index]
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner) = Some(ran);
+                        }
+                    }
+                }
+            });
+        }
+    });
+    answers
+        .into_iter()
+        .map(|a| a.into_inner().unwrap_or_else(PoisonError::into_inner))
+        .collect()
+}
+
+/// A binary whose wait for the release's pool's tokens an interrupt or the FIFO ended: verify
+/// could not start it, and it never ran.
+fn unpaid_run(why: &std::io::Error) -> Run {
+    let why = if exec::ending() {
+        "the run was interrupted before this child started".to_owned()
+    } else {
+        format!("the release's pool gave it no tokens: {why}")
+    };
+    Run {
+        stopped_at: None,
+        ok: false,
+        output: String::new(),
+        code: None,
+        spawn_error: Some(why),
+        usage: None,
+    }
+}
+
+/// Close a dispatch and wake every admission waiter. This takes the same mutex as a start, so a
+/// halt that returns is ordered before every later start attempt.
+fn halt_dispatch(state: &Mutex<Dispatcher>, turn: &Condvar) {
+    state.lock().unwrap_or_else(PoisonError::into_inner).halt();
+    turn.notify_all();
+}
+
+/// A started binary's charge, held until its turn ends, however it ends: dropped, it gives the
+/// charge and the peak back and wakes the workers waiting for them. A turn a panic ended halts
+/// the dispatch first, so no worker waits on a share the panicking one never gives back, and the
+/// scope's join hands the panic to the caller once the running binaries end.
+struct Charged<'a> {
+    state: &'a Mutex<Dispatcher>,
+    turn: &'a Condvar,
+    index: usize,
+}
+
+impl Drop for Charged<'_> {
+    fn drop(&mut self) {
+        let mut d = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if std::thread::panicking() {
+            d.halt();
+        }
+        // It was started, so it ends once: nothing refuses this.
+        d.finish(self.index).ok();
+        drop(d);
+        self.turn.notify_all();
+    }
+}
+
+/// The next binary the dispatcher admits, waiting for one to end or the live rate to move;
+/// `None` once none is left to start or the run halted.
+fn admitted(
+    state: &Mutex<Dispatcher>,
+    turn: &Condvar,
+    live: &(dyn Fn() -> f64 + Sync),
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Option<Planned> {
+    admitted_after_stop(state, turn, live, stop, &|| {})
+}
+
+/// [`admitted`], with a test seam after its first stop read and before it takes the dispatcher's
+/// mutex. A local red takes that mutex through [`halt_dispatch`], so a stop committed in this gap
+/// is visible before the start attempt.
+fn admitted_after_stop(
+    state: &Mutex<Dispatcher>,
+    turn: &Condvar,
+    live: &(dyn Fn() -> f64 + Sync),
+    stop: &(dyn Fn() -> bool + Sync),
+    after_stop: &(impl Fn() + Sync),
+) -> Option<Planned> {
+    loop {
+        let stopping = stop();
+        after_stop();
+        let mut d = state.lock().unwrap_or_else(PoisonError::into_inner);
+        if stopping || stop() {
+            d.halt();
+        }
+        if !d.waiting() {
+            return None;
+        }
+        if let Some(b) = d.next(live()) {
+            return Some(b);
+        }
+        drop(match turn.wait_timeout(d, LOOK_AGAIN) {
+            Ok((d, _)) => d,
+            Err(poisoned) => poisoned.into_inner().0,
+        });
+    }
 }
 
 /// The most bytes a `test-binary-finished` event spends on each failed case's output: with at
@@ -811,18 +1015,17 @@ fn emit(ctx: &crate::Ctx, event: &str) {
 /// A finished binary's outcome (ok, NOT RUN when its machine or the run's end kept it from
 /// running, else FAIL, the proven red that ends a halted run), its `test-binary-finished` event,
 /// and the sample of it its history keeps ([`crate::test_history`]) when its run measured what it
-/// takes ([`measured`]; `started`: the run's ceiling left it time to start): its outcome, its
-/// waits, its tree's usage (`null` where unread), the test threads it ran at (`width`) and the
-/// tests libtest said it runs.
+/// takes ([`measured`]; `started`: the run left it time to start): its outcome, its waits, its
+/// tree's usage (`null` where unread), the test threads it ran at (`width`) and the cores of the
+/// share it was charged (`charge`, [`crate::test_plan`]), and the tests libtest said it runs.
 fn binary_event(
     binary: &Binary,
-    run: &Run,
+    ran: &Ran,
     started: bool,
-    waiting: Duration,
-    execution: Duration,
-    width: u32,
     exe_sha256: Option<&str>,
 ) -> (Outcome, String, Option<crate::test_history::Sample>) {
+    let run = &ran.run;
+    let width = ran.planned.width;
     // The child has no cargo rerun footer. Classify it with the same known-binary
     // context as the final report, so passing fixture output cannot own a failure.
     let combined =
@@ -863,11 +1066,11 @@ fn binary_event(
         aterm_json::json!({
             "schema": 1, "event": "test-binary-finished", "test": binary.spec,
             "outcome": crate::report::word(outcome), "exit_code": run.code,
-            "waiting_s": waiting.as_secs_f64(), "execution_s": execution.as_secs_f64(),
+            "waiting_s": ran.waiting.as_secs_f64(), "execution_s": ran.execution.as_secs_f64(),
             "cpu_s": usage.map(|u| u.cpu.as_secs_f64()),
             "starved_s": usage.map(|u| u.starved.as_secs_f64()),
             "peak_bytes": usage.map(|u| u.peak_bytes),
-            "width": width, "tests": tests,
+            "width": width, "charge": ran.planned.charge, "tests": tests,
             "failures": failures,
             "detail": if run.ok {
                 String::new()
@@ -881,17 +1084,42 @@ fn binary_event(
         })
     );
     let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-    let sample = measured(run, started).then(|| crate::test_history::Sample {
+    let stopped = started && run.stopped_at.is_some() && run.spawn_error.is_none();
+    let sample = (measured(run, started) || stopped).then(|| crate::test_history::Sample {
         at_ms: aterm_time::unix_millis().unwrap_or(0),
         outcome: crate::report::word(outcome).to_owned(),
-        wall_ms: ms(execution),
-        cpu_ms: usage.map(|u| ms(u.cpu)),
-        starved_ms: usage.map(|u| ms(u.starved)),
-        peak_bytes: usage.map(|u| u.peak_bytes),
+        wall_ms: if stopped { 0 } else { ms(ran.execution) },
+        cpu_ms: if stopped {
+            None
+        } else {
+            usage.map(|u| ms(u.cpu))
+        },
+        starved_ms: if stopped {
+            None
+        } else {
+            usage.map(|u| ms(u.starved))
+        },
+        peak_bytes: if stopped {
+            None
+        } else {
+            usage.map(|u| u.peak_bytes)
+        },
         width,
         tests,
     });
     (outcome, event, sample)
+}
+
+/// Classify a binary's outcome before its event is written. A decisive red stops the local
+/// dispatcher through `halt`, where one is still running; that halt takes the admission mutex, so
+/// once it returns no queued binary can start. The caller writes its FAIL event before arming the
+/// run-wide halt, so the event still precedes the NOT RUN events of peers that halt ends.
+fn mark_red_decided(outcome: Outcome, stops_at_red: bool, halt: Option<&dyn Fn()>) -> bool {
+    let red = stops_at_red && outcome == Outcome::Fail(Severity::GateFailed);
+    if red && let Some(halt) = halt {
+        halt();
+    }
+    red
 }
 
 /// A stopped binary's detail: its red case and the first line of what its block says panicked
@@ -927,9 +1155,9 @@ fn stopped_detail(stopped: &crate::libtest_json::Stopped, log: &str) -> String {
 /// ended ([`crate::exec::ending`]), which cuts a binary short at a point that says nothing of it.
 /// A binary the run's ceiling ended keeps its sample, a lower bound of what it takes; one that
 /// never ran would keep a wall of about 0 ms, and push a measured sample out of its row. A binary
-/// verify stopped at its first red case ([`Run::stopped_at`]) keeps none either: its wall is where
-/// verify ended it, and a sample with no wall is one the history's schema-1 readers (an older
-/// checkout's verify, sharing the per-user file) cannot decode, so they would empty the file.
+/// verify stopped at its first red case ([`Run::stopped_at`]) is deliberately not measured: its
+/// caller keeps an outcome-only schema-1 sample with a zero wall, so the latest FAIL orders it
+/// first without replacing its last timed wall.
 fn measured(run: &Run, started: bool) -> bool {
     started && run.stopped_at.is_none() && run.spawn_error.is_none() && !crate::exec::ending()
 }
@@ -1092,24 +1320,81 @@ pub fn combined(bins: &[Binary], runs: &[Run]) -> Run {
     }
 }
 
-/// The ladder's one line about how the binaries ran: the share their charges were drawn from,
-/// the most at once, and how many the history placed.
+/// The ladder's one line about how the binaries ran: on what share, the most that ran at once,
+/// their widths, and how many had no runs kept to plan by.
 #[must_use]
-pub fn summary(plan: &crate::test_plan::Plan, workers: usize) -> String {
-    use crate::test_plan::Class;
-    let n = plan.width.len();
-    let count = |c: Class| plan.class.iter().filter(|&&k| k == c).count();
-    let target = plan.target_s.map_or_else(String::new, |t| {
-        format!(", target {}", crate::report::duration(t))
-    });
+pub fn summary(plan: &Plan, ran: &[Option<Ran>]) -> String {
+    let n = plan.order.len();
+    let widths = plan.order.iter().map(|b| b.width);
+    let (lo, hi) = (widths.clone().min().unwrap_or(0), widths.max().unwrap_or(0));
+    let widths = if lo == hi {
+        format!("RUST_TEST_THREADS={lo} each")
+    } else {
+        format!("RUST_TEST_THREADS={lo} to {hi}")
+    };
+    let unseen = plan.order.iter().filter(|b| b.predicted.is_none()).count();
+    let unseen = match unseen {
+        0 => String::new(),
+        k if k == n => "; none had runs kept to plan by".to_owned(),
+        k => format!("; {k} had no runs kept to plan by"),
+    };
     format!(
-        "  test binaries: {n} — widths planned within a share of {} cores, at most {} at once; \
-         {} new, {} that failed last time, {} by history{target}",
+        "  test binaries: {n} on a share of {} cores — {widths}, at most {} at once{unseen}",
         plan.share,
-        workers.min(n.max(1)),
-        count(Class::New),
-        count(Class::FailedLast),
-        count(Class::Known),
+        most_at_once(ran)
+    )
+}
+
+/// The most binaries that ran at once: the most `[waiting, waiting + execution]` spans that
+/// overlap. A binary the run left unstarted ran for no time and holds no span.
+fn most_at_once(ran: &[Option<Ran>]) -> usize {
+    let mut edges: Vec<(Duration, bool)> = ran
+        .iter()
+        .flatten()
+        .filter(|r| !r.execution.is_zero())
+        .flat_map(|r| {
+            [
+                (r.waiting, true),
+                (r.waiting.saturating_add(r.execution), false),
+            ]
+        })
+        .collect();
+    // An end before a start at the same instant: one that ended as the next began ran alone.
+    edges.sort_by_key(|&(at, start)| (at, start));
+    let (mut now, mut most) = (0_usize, 0_usize);
+    for (_, start) in edges {
+        if start {
+            now += 1;
+            most = most.max(now);
+        } else {
+            now = now.saturating_sub(1);
+        }
+    }
+    most
+}
+
+/// The ladder's line naming the binaries that used more cores than they were charged, with what
+/// each used: each is charged that much next run. Empty where none did.
+#[must_use]
+pub fn overruns(bins: &[Binary], ran: &[Option<Ran>]) -> String {
+    let over: Vec<String> = bins
+        .iter()
+        .zip(ran)
+        .filter_map(|(b, r)| {
+            let r = r.as_ref()?;
+            let used = r.overran()?;
+            Some(format!(
+                "{} used {used:.1} cores of {} charged",
+                b.spec, r.planned.charge
+            ))
+        })
+        .collect();
+    if over.is_empty() {
+        return String::new();
+    }
+    format!(
+        "  test binaries over their charge (charged what they used next run): {}",
+        over.join(", ")
     )
 }
 
@@ -1152,7 +1437,13 @@ fn first_error(log: &str) -> String {
 /// row says so through [`crate::libtest::environment_refusals`]. Under `release`, and under the
 /// `--as-release` its red row prints, a passing run that did not pass
 /// [`crate::checks::GOLDEN`]'s test is COULD NOT RUN too, whichever way its binaries were run.
-fn decide(ctx: &crate::Ctx, r: &mut Report, run: &Run, label: &str, env: &[(OsString, OsString)]) {
+fn decide(
+    ctx: &crate::Ctx,
+    r: &mut Report,
+    run: &Run,
+    label: &str,
+    rerun: &crate::findings::Rerun,
+) {
     if ctx.checkers_in_tests && crate::stages::compared_no_frame(run) {
         r.cannot_run(format!(
             "{label} — {} did not run, so no frame was held to its twin",
@@ -1160,7 +1451,7 @@ fn decide(ctx: &crate::Ctx, r: &mut Report, run: &Run, label: &str, env: &[(OsSt
         ));
         return;
     }
-    r.decide_test_child(run, label, env);
+    r.decide_test_child(run, label, rerun);
 }
 
 /// The binaries whose runs carry a `spawn_error`, each with it, apart from the rest with their
@@ -1206,18 +1497,114 @@ fn decide_runs(
     }
 }
 
-/// Record Cargo's current test invocations and run them with the admitted parallelism
-/// ([`run_planned`]). Each binary that runs libtest's harness runs in libtest's JSON format where
-/// libtest takes it ([`probe_json`]), so each failed case's block is read as the case ends. The
-/// first proven red ends the run when its halt is armed ([`crate::Ctx::halt`], named for
-/// `check`): a failed case whose block, with those before it, makes its binary a FAIL
-/// (`libtest::decisive`) ends that binary there, its log rendered as libtest's report of the cases
-/// that finished ([`crate::libtest_json::render`]); a case that refused its machine or hit a full
-/// disk ends nothing. A binary run in the human format (no harness, a refused probe, its own
-/// output flags) is decided at its end. No binary starts after the red, and those it stopped are
-/// one NOT RUN row with the halt's words. A binary verify could not start or ended unrun
-/// otherwise is a NOT RUN row of its own, and the binaries that ran decide the run's row
-/// ([`decide_runs`]).
+/// Hold `claim` on this thread until the answer drops: its reservation retained, and its cover
+/// marker handed to each child the thread starts ([`crate::memory::cover`]); nothing more with no
+/// claim.
+fn holding(
+    claim: Option<&crate::MemoryClaim>,
+) -> (crate::ReservationScope, Option<crate::memory::Covering>) {
+    (
+        crate::holding_memory_claim(claim.map(|c| std::sync::Arc::clone(&c.claim))),
+        claim.map(|c| crate::memory::covering(Some(c.cover()))),
+    )
+}
+
+/// The ladder's line saying what `claim` claimed for the test binaries; none with no claim.
+fn claimed_said(r: &mut Report, claim: Option<&crate::MemoryClaim>) {
+    if let Some(claim) = claim {
+        r.raw(format!("  test binaries' {}", claim.said));
+    }
+}
+
+/// A test run's claims in its capacity ledger: memory for its binaries and cores for their
+/// subprocesses ([`claim_both`]).
+pub(crate) struct Claims {
+    /// The memory claim; none for nothing to claim, or a run with no book.
+    pub(crate) memory: Option<crate::MemoryClaim>,
+    /// The cores claim, held until the claims go back; none in a run with no book.
+    _cores: Option<aterm_capacity::Claim>,
+    /// The cores granted: at least one, at most those asked.
+    pub(crate) granted: u32,
+}
+
+/// Claim `bytes` of memory for `label`'s test binaries (`what` says for what), then `asked`
+/// cores, each admitted by `admit`, once the run's claims before (`held`) have gone back: memory
+/// before cores, the order every claim of both is made in (a stage's memory, then its
+/// subprocesses' cores, or both in one claim), so a test run never waits for memory while it
+/// holds cores, and never waits on a run that holds memory and waits for cores.
+///
+/// # Errors
+/// The NOT RUN row's words: why the memory was not claimed ([`crate::claim_test_memory`]), or
+/// the cores ([`claim_cores`]).
+pub(crate) fn claim_both(
+    ctx: &crate::Ctx,
+    label: &str,
+    held: Option<Claims>,
+    bytes: u64,
+    what: &str,
+    asked: u32,
+    admit: crate::Admitter,
+) -> Result<Claims, String> {
+    drop(held);
+    let memory = crate::claim_test_memory(ctx, label, bytes, what, admit)
+        .map_err(|why| format!("{label} — {why}"))?;
+    let (cores, granted) = claim_cores(ctx, label, asked, admit)?;
+    Ok(Claims {
+        memory,
+        _cores: cores,
+        granted,
+    })
+}
+
+/// Claim `asked` cores for `label`'s test binaries in the run's capacity ledger, waiting for them
+/// (`admit`): the claim, none in a run with no book, and the cores it granted, at least one and
+/// at most `asked`.
+///
+/// # Errors
+/// The NOT RUN row's words: the halt's, where it ended the wait; a refused admission; or a
+/// grant of no core.
+fn claim_cores(
+    ctx: &crate::Ctx,
+    label: &str,
+    asked: u32,
+    admit: crate::Admitter,
+) -> Result<(Option<aterm_capacity::Claim>, u32), String> {
+    // Under the release's pool the binaries' charges are its tokens ([`dispatch_pooled`]), which
+    // the release's own Release core claim bounds: a claim here would count its other branches'
+    // claims (the build's, the export's) and wait for them to end.
+    if ctx.memory.is_none() || ctx.pool.is_some() {
+        return Ok((None, asked));
+    }
+    match admit(
+        aterm_capacity::Need::new(format!("verify {label} subprocesses")).cores(asked),
+        aterm_capacity::Admit::Wait,
+    ) {
+        Ok(claim) => match claim.cores() {
+            0 => Err("subprocess CPU admission granted no cores; no test was run".to_owned()),
+            cores => Ok((Some(claim), cores.min(asked))),
+        },
+        Err(aterm_capacity::Error::Stopped { .. }) if ctx.halted().is_some() => Err(format!(
+            "{label} — {}; no test was run",
+            ctx.halted().unwrap_or_default()
+        )),
+        Err(why) => Err(format!(
+            "subprocess CPU admission refused: {why}; no test was run"
+        )),
+    }
+}
+
+/// Record Cargo's current test invocations and run them on the run's CPU share: each binary at
+/// the width its kept runs call for and charged the cores they used, as many at once as their
+/// charges fit in the share, the binaries that failed last first ([`crate::test_plan`]); and keep
+/// what each took for the next run ([`crate::test_history`]). Each binary that runs libtest's
+/// harness runs in libtest's JSON format where libtest takes it ([`probe_json`]), so each failed
+/// case's block is read as the case ends. The first proven red ends the run when its halt is armed
+/// ([`crate::Ctx::halt`], named for `check`): a decisive failed case ends its binary there
+/// ([`crate::libtest_json::render`]), while a case that refused its machine or hit a full disk
+/// ends nothing. A human-format binary is decided at its end. No binary starts after the red,
+/// and those it stopped are one NOT RUN row with the halt's words. A binary verify could not
+/// start or ended unrun otherwise is a NOT RUN row of its own, and the binaries that ran decide
+/// the run's row ([`decide_runs`]).
 pub fn run_tests(
     ctx: &crate::Ctx,
     r: &mut Report,
@@ -1231,52 +1618,52 @@ pub fn run_tests(
         ));
         return;
     }
-    let mut cores = None;
-    let mut host_cores = || *cores.get_or_insert_with(|| ctx.cores());
-    let managed_share = match crate::test_workers::admitted_share(&ctx.env) {
-        Ok(share) => share,
+    let asked_cores = match crate::test_workers::share(&ctx.env, ctx.pool.as_ref()) {
+        Ok(crate::test_workers::Share::Pool(slots)) => slots,
+        Ok(crate::test_workers::Share::Claim(share)) => share.unwrap_or_else(|| ctx.cores()),
         Err(why) => {
             r.cannot_run(format!("{why}; no test was run"));
             return;
         }
-    };
-    let asked_cores = managed_share.unwrap_or_else(&mut host_cores).max(1);
-    let _subprocess_claim = if ctx.memory.is_some() {
-        match crate::admit_live(
-            aterm_capacity::Need::new(format!("verify {label} subprocesses")).cores(asked_cores),
-            aterm_capacity::Admit::Wait,
-        ) {
-            Ok(claim) => Some(claim),
-            Err(aterm_capacity::Error::Stopped { .. }) if ctx.halted().is_some() => {
-                r.cannot_run(format!(
-                    "{label} — {}; no test was run",
-                    ctx.halted().unwrap_or_default()
-                ));
-                return;
-            }
-            Err(why) => {
-                r.cannot_run(format!(
-                    "subprocess CPU admission refused: {why}; no test was run"
-                ));
-                return;
-            }
-        }
-    } else {
-        None
-    };
-    let granted_cores = match _subprocess_claim.as_ref().map(aterm_capacity::Claim::cores) {
-        Some(0) => {
-            r.cannot_run("subprocess CPU admission granted no cores; no test was run");
+    }
+    .max(1);
+    let history = ctx
+        .test_history
+        .as_deref()
+        .map(crate::test_history::load)
+        .unwrap_or_default();
+    // Cargo's own run of the binaries is one at a time: a serial fallback, and the recording pass
+    // itself where a runner the caller's cargo config names outranks the recorder. Its memory is
+    // claimed from the heaviest run the history kept of a binary of the selection, or the cold
+    // figure until one has a measured peak, then the run's cores ([`claim_both`]); both are held
+    // until the plan's own claims replace them.
+    let fallback_peak = fallback_peak(
+        &history,
+        ctx.scope.crates(),
+        ctx.memory.as_ref().and_then(|book| book.physical),
+    );
+    let claims = match claim_both(
+        ctx,
+        label,
+        None,
+        aterm_capacity::peak_claim(fallback_peak),
+        "for cargo's run of one test binary at a time, from the selection's kept or cold peak",
+        asked_cores,
+        crate::admit_live,
+    ) {
+        Ok(claims) => claims,
+        Err(why) => {
+            r.cannot_run(why);
             return;
         }
-        Some(cores) => cores.min(asked_cores),
-        None => asked_cores,
     };
-    let (jobs, threads) = ctx.test_workers_for(granted_cores);
+    let granted_cores = claims.granted;
+    let one_at_a_time = claims.memory.as_ref();
     let thread_override = (ctx.env.build_slot_held.is_some()
+        || ctx.pool.is_some()
         || ctx.test_threads.is_some()
         || granted_cores < asked_cores)
-        .then_some(threads);
+        .then(|| ctx.test_threads_within(granted_cores));
     let slots = match subprocess_pool(&ctx.scratch, subprocess_slots_for_cores(granted_cores)) {
         Ok(pool) => pool,
         Err(why) => {
@@ -1308,14 +1695,18 @@ pub fn run_tests(
         }
         Err(error) => r.raw(format!("  test descriptor room unavailable: {error}")),
     }
-    let env = crate::findings::rerun_env(serial, thread_override);
+    let rerun = crate::findings::Rerun::of(serial, thread_override);
     let serially = |r: &mut Report, why: &str| {
         r.raw(format!(
             "  test binaries: run by cargo, one at a time — {why}"
         ));
-        let out = exec::run(serial, ctx.exec_env());
+        let out = {
+            let _held = holding(one_at_a_time);
+            exec::run(serial, ctx.exec_env())
+        };
+        claimed_said(r, one_at_a_time);
         r.raw(out.output.as_str());
-        decide(ctx, r, &out, label, &env);
+        decide(ctx, r, &out, label, &rerun);
     };
     let dir = ctx.scratch.join(format!(
         "test-records.{}.{}",
@@ -1333,7 +1724,10 @@ pub fn run_tests(
         return;
     };
     let began = Instant::now();
-    let mut pass = exec::run(&recording_cmd(serial, &config), ctx.exec_env());
+    let mut pass = {
+        let _held = holding(one_at_a_time);
+        exec::run(&recording_cmd(serial, &config), ctx.exec_env())
+    };
     let pass_wall = began.elapsed();
     let records = read_records(&dir);
     std::fs::remove_dir_all(&dir).ok();
@@ -1365,9 +1759,10 @@ pub fn run_tests(
                 "  test binaries: run by cargo, one at a time — the recording runner was not \
                  used (a runner in the caller's cargo config outranks it)",
             );
+            claimed_said(r, one_at_a_time);
         }
         r.raw(pass.output.as_str());
-        decide(ctx, r, &pass, label, &env);
+        decide(ctx, r, &pass, label, &rerun);
         return;
     }
     let account = crate::compile_account::Account::of(
@@ -1403,32 +1798,108 @@ pub fn run_tests(
         .filter(|l| !l.trim_start().starts_with("Running "))
         .map(|l| format!("{l}\n"))
         .collect();
-    let planned = Planned {
+    let planned = RunPlan {
         bins,
-        jobs,
-        threads,
-        cores: usize::try_from(granted_cores).unwrap_or(1),
+        history,
+        fallback_peak,
+        claims,
+        asked_cores,
+        granted_cores,
         checkers,
         preface,
+        rerun: rerun.clone(),
     };
-    run_planned(ctx, r, label, planned, check, &env);
+    run_planned(ctx, r, label, planned, check);
 }
 
 /// What [`run_tests`] planned for its binaries' runs.
-pub(crate) struct Planned {
+pub(crate) struct RunPlan {
     /// The binaries, in declared order.
     pub(crate) bins: Vec<Binary>,
-    /// How many run at once.
-    pub(crate) jobs: usize,
-    /// The test threads each runs at.
-    pub(crate) threads: u32,
-    /// The cores the run was granted (a resume's hashing width, [`carry`]).
-    pub(crate) cores: usize,
+    /// The history that sizes and orders them.
+    pub(crate) history: crate::test_history::History,
+    /// The selection's heaviest kept peak, or its cold fallback, used where a binary has no peak.
+    pub(crate) fallback_peak: u64,
+    /// The recording pass's memory and core claims, replaced by the dispatch's claims.
+    pub(crate) claims: Claims,
+    /// The CPU share the run asked for.
+    pub(crate) asked_cores: u32,
+    /// The share the recording pass was granted (a resume's hashing width, [`carry`]).
+    pub(crate) granted_cores: u32,
     /// The run's checker policy ([`crate::stages::with_checkers`]).
     pub(crate) checkers: bool,
     /// The recording pass's log, its `Running` headers dropped, at the head of a whole run's
     /// report.
     pub(crate) preface: String,
+    /// The environment a failed test reruns under.
+    pub(crate) rerun: crate::findings::Rerun,
+}
+
+#[cfg(test)]
+impl RunPlan {
+    /// A test-only run over `bins` on `share`, with no capacity book or kept history.
+    pub(crate) fn fixture(bins: Vec<Binary>, share: u32) -> RunPlan {
+        let share = share.max(1);
+        RunPlan {
+            bins,
+            history: crate::test_history::History::default(),
+            fallback_peak: aterm_capacity::cold_claim(None),
+            claims: Claims {
+                memory: None,
+                _cores: None,
+                granted: share,
+            },
+            asked_cores: share,
+            granted_cores: share,
+            checkers: false,
+            preface: String::new(),
+            rerun: crate::findings::Rerun::default(),
+        }
+    }
+}
+
+/// The raw peak used where this selection has no measured test-binary peak: its heaviest kept
+/// peak, else the machine's cold figure. It is positive even if a corrupt machine reading said
+/// it had fewer than two bytes.
+fn fallback_peak(
+    history: &crate::test_history::History,
+    crates: &[String],
+    physical: Option<u64>,
+) -> u64 {
+    match history.heaviest(crates) {
+        0 => aterm_capacity::cold_claim(physical).max(1),
+        peak => peak,
+    }
+}
+
+/// Plan `bins` from their history, replacing every missing peak (an unseen binary or a timed
+/// sample whose tree usage was unread) with `fallback_peak`. Thus every dispatched binary has a
+/// positive memory cost until this machine has measured one for it.
+fn plan_from_history(
+    history: &crate::test_history::History,
+    bins: &[Binary],
+    share: u32,
+    ceiling: Option<u32>,
+    fallback_peak: u64,
+) -> Plan {
+    let seen: Vec<_> = bins
+        .iter()
+        .map(|b| {
+            history.seen(&b.spec).map(|mut seen| {
+                if seen.peak == 0 {
+                    seen.peak = fallback_peak;
+                }
+                seen
+            })
+        })
+        .collect();
+    test_plan::plan(&seen, share, ceiling, fallback_peak)
+}
+
+/// The memory claim for the binaries `plan` can run at once.
+fn plan_claim(plan: &Plan) -> Option<u64> {
+    let peak = test_plan::schedule(plan).peak;
+    (peak > 0).then(|| aterm_capacity::peak_claim(peak))
 }
 
 /// What [`probe_json`] learned of libtest's JSON format.
@@ -1571,17 +2042,19 @@ pub(crate) fn run_planned(
     ctx: &crate::Ctx,
     r: &mut Report,
     label: &str,
-    planned: Planned,
+    planned: RunPlan,
     check: crate::checks::Check,
-    env: &[(OsString, OsString)],
 ) {
-    let Planned {
+    let RunPlan {
         bins,
-        jobs,
-        threads,
-        cores,
+        history,
+        fallback_peak,
+        claims,
+        asked_cores,
+        granted_cores,
         checkers,
         preface,
+        rerun,
     } = planned;
     // A release hashes each binary's executable (its record's key for a resume, A19); a dev run
     // keeps none, so it pays nothing for it.
@@ -1597,7 +2070,12 @@ pub(crate) fn run_planned(
         carried,
         known,
     } = match &ctx.passed_binaries {
-        Some(passed) => carry(passed, bins, hash, cores),
+        Some(passed) => carry(
+            passed,
+            bins,
+            hash,
+            usize::try_from(granted_cores).unwrap_or(1),
+        ),
         None => Carried {
             run: bins,
             carried: Vec::new(),
@@ -1607,6 +2085,55 @@ pub(crate) fn run_planned(
     for (binary, sha) in &carried {
         emit(ctx, &carried_event(binary, sha));
     }
+    let plan = plan_from_history(
+        &history,
+        &bins,
+        granted_cores,
+        ctx.test_threads,
+        fallback_peak,
+    );
+    let claimed = plan_claim(&plan);
+    // The plan's claims replace the one-at-a-time ones, memory before cores as ever: a grant that
+    // moved meanwhile plans the run again, its binaries' peaks still held within this claim.
+    let claims = match claim_both(
+        ctx,
+        label,
+        Some(claims),
+        claimed.unwrap_or(0),
+        "for the test binaries its plan runs at once, by their runs",
+        asked_cores,
+        crate::admit_live,
+    ) {
+        Ok(claims) => claims,
+        Err(why) => {
+            r.cannot_run(why);
+            return;
+        }
+    };
+    let plan = if claims.granted == plan.share {
+        plan
+    } else {
+        plan_from_history(
+            &history,
+            &bins,
+            claims.granted,
+            ctx.test_threads,
+            fallback_peak,
+        )
+    };
+    // A failed test reruns at the width its binary runs at, which the plan sets, not the run's.
+    let rerun = rerun.at_widths(
+        plan.order
+            .iter()
+            .map(|p| (bins[p.index].spec.clone(), p.width)),
+    );
+    let claim = claims.memory.as_ref();
+    // The binaries' peaks are kept within the claim, and a claim past what can ever be available
+    // here, which runs alone, within what can.
+    let memory = claim
+        .and(claimed)
+        .map(|c| ctx.memory.as_ref().map_or(c, |book| c.min(book.budget())));
+    let _held = holding(claim);
     let probe = probe_json(ctx, &bins);
     if let Some(probe) = &probe {
         r.raw(json_ladder(probe));
@@ -1616,105 +2143,127 @@ pub(crate) fn run_planned(
         stop_at_red: ctx.halt.armed(),
     };
     let shas = Mutex::new(known);
+    let sha_of = |b: &Binary| {
+        shas.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&b.spec)
+            .cloned()
+    };
+    let meter = crate::memory::current();
+    let live = || meter.as_ref().and_then(|m| m.live_rate()).unwrap_or(0.0);
     let ceiling = ctx.exec_env().child_ceiling;
     let started = Instant::now();
+    let spent = || ceiling.is_some_and(|limit| started.elapsed() >= limit);
+    let stop = || spent() || ctx.halted().is_some();
     let samples = Mutex::new(Vec::with_capacity(bins.len()));
-    // The binaries the ceiling left no time to start, by spec: their samples are not kept.
-    let unstarted = Mutex::new(std::collections::BTreeSet::new());
-    let history = ctx
-        .test_history
-        .as_deref()
-        .map(crate::test_history::load)
-        .unwrap_or_default();
-    let specs: Vec<&str> = bins.iter().map(|b| b.spec.as_str()).collect();
-    let share = u32::try_from(cores).unwrap_or(u32::MAX);
-    let plan = crate::test_plan::plan(&specs, &crate::test_plan::seen(&history), share, threads);
-    let timed = run_all(
+    // Hear one binary's end: classify its red before event I/O can hold up the local stop, emit
+    // its FAIL before the halt's NOT RUN events, arm that run-wide halt, and keep its sample.
+    let ended = |binary: &Binary, ran: &Ran, started: bool, halt: Option<&dyn Fn()>| {
+        let sha = sha_of(binary);
+        let (outcome, event, sample) = binary_event(binary, ran, started, sha.as_deref());
+        let red = mark_red_decided(outcome, ctx.halt.armed(), halt);
+        emit(ctx, &event);
+        if red {
+            ctx.halt.red(check.name());
+        }
+        if let Some(sample) = sample {
+            samples
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((binary.spec.clone(), sample));
+        }
+    };
+    let ran = dispatch_pooled(
         &bins,
         &plan,
-        jobs,
-        |b, t| {
-            if let Some(words) = ctx.halted() {
-                return Run {
-                    ok: false,
-                    output: String::new(),
-                    code: None,
-                    spawn_error: Some(words.to_owned()),
-                    ..Run::default()
-                };
-            }
-            let known = shas
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains_key(&b.spec);
-            if !known && let Some(sha) = hash(b) {
-                shas.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(b.spec.clone(), sha);
+        memory,
+        ctx.pool.as_ref(),
+        &live,
+        &stop,
+        |b, planned| {
+            if ctx.halted().is_some() {
+                return None;
             }
             let mut env = ctx.exec_env();
             if let Some(limit) = ceiling {
                 let left = limit.saturating_sub(started.elapsed());
                 if left.is_zero() {
-                    unstarted
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(b.spec.clone());
-                    return not_started(b, limit);
+                    return None;
                 }
                 env.child_ceiling = Some(left);
             }
-            let cmd = crate::release_test_env::command(ctx, binary_cmd(b, t, checkers, watch));
+            if sha_of(b).is_none()
+                && let Some(sha) = hash(b)
+            {
+                shas.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(b.spec.clone(), sha);
+            }
+            let cmd = crate::release_test_env::command(
+                ctx,
+                binary_cmd(b, planned.width, checkers, watch),
+            );
             let mut run = exec::run(&cmd, env);
             if cmd.test_cases.as_ref().is_some_and(|w| w.json) {
                 // The raw events were the child's log; every reader takes libtest's report.
                 run.output = crate::libtest_json::render(&run.output, run.stopped_at.as_ref());
             }
-            run
+            Some(run)
         },
-        |binary, run, waiting, execution, width| {
-            let never_started = unstarted
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(&binary.spec);
-            let sha = shas
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&binary.spec)
-                .cloned();
-            let (outcome, event, sample) = binary_event(
-                binary,
-                run,
-                !never_started,
-                waiting,
-                execution,
-                width,
-                sha.as_deref(),
-            );
-            emit(ctx, &event);
-            if outcome == Outcome::Fail(Severity::GateFailed) {
-                ctx.halt.red(check.name());
-            }
-            if let Some(sample) = sample {
-                samples
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push((binary.spec.clone(), sample));
-            }
-        },
+        |binary, ran, halt| ended(binary, ran, true, Some(halt)),
     );
     let total = started.elapsed();
-    let samples = samples
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A binary the dispatch left unstarted: stopped by the run's first red, with the halt's words;
+    // or by its spent ceiling, a FAIL of its own, as it always was. Each is heard as the rest
+    // were, and keeps no sample.
+    let ran: Vec<Option<Ran>> = bins
+        .iter()
+        .zip(ran)
+        .enumerate()
+        .map(|(index, (b, ran))| {
+            if ran.is_some() {
+                return ran;
+            }
+            let run = match (ctx.halted(), ceiling) {
+                (Some(words), _) => Run {
+                    ok: false,
+                    output: String::new(),
+                    code: None,
+                    spawn_error: Some(words.to_owned()),
+                    ..Run::default()
+                },
+                (None, Some(limit)) => not_started(b, limit),
+                (None, None) => never_run(),
+            };
+            let planned = plan.order.iter().find(|p| p.index == index).copied()?;
+            let left = Ran {
+                run,
+                planned,
+                waiting: total,
+                execution: Duration::ZERO,
+            };
+            ended(b, &left, false, None);
+            Some(left)
+        })
+        .collect();
+    let samples = samples.into_inner().unwrap_or_else(PoisonError::into_inner);
     let kept = ctx
         .test_history
         .as_deref()
         .map(|path| crate::test_history::keep(path, samples));
-    let (runs, walls): (Vec<Run>, Vec<Duration>) = timed.into_iter().unzip();
-    // What a release's resume carried and what hashing the executables cost, in a halted run's
-    // report as in a whole one's.
+    let (runs, walls): (Vec<Run>, Vec<Duration>) = ran
+        .iter()
+        .map(|ran| match ran {
+            Some(ran) => (ran.run.clone(), ran.execution),
+            None => (never_run(), Duration::ZERO),
+        })
+        .unzip();
+    // What the binaries' memory claim was, what a release's resume carried and what hashing the
+    // executables cost, how the binaries used their charges and whether their history was kept,
+    // in a halted run's report as in a whole one's.
     let accounted = |r: &mut Report| {
+        r.raw(summary(&plan, &ran));
+        claimed_said(r, claim);
         if ctx.passed_binaries.is_some() {
             r.raw(format!(
                 "  test binaries: {} of {listed} carried (each passed before in this tree, its \
@@ -1727,12 +2276,22 @@ pub(crate) fn run_planned(
             r.raw(format!(
                 "  test binaries hashed (SHA-256 of each executable, a resume's key): {} in {} \
                  summed over workers",
-                shas.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .len(),
+                shas.lock().unwrap_or_else(PoisonError::into_inner).len(),
                 crate::report::duration(
                     Duration::from_nanos(hashed.load(Ordering::Relaxed)).as_secs_f64()
                 )
+            ));
+        }
+    };
+    let tail = |r: &mut Report| {
+        r.raw(poles(&bins, &walls, total));
+        let over = overruns(&bins, &ran);
+        if !over.is_empty() {
+            r.raw(over);
+        }
+        if let Some(Err(why)) = &kept {
+            r.raw(format!(
+                "  test binaries' history not kept (planning data only): {why}"
             ));
         }
     };
@@ -1745,14 +2304,8 @@ pub(crate) fn run_planned(
             .iter()
             .zip(&runs)
             .partition(|(_, run)| run.spawn_error.as_deref() == Some(words));
-        r.raw(summary(&plan, jobs));
         accounted(r);
-        r.raw(poles(&bins, &walls, total));
-        if let Some(Err(why)) = &kept {
-            r.raw(format!(
-                "  test binaries' history not kept (planning data only): {why}"
-            ));
-        }
+        tail(r);
         if !done.is_empty() {
             let (bins, runs): (Vec<Binary>, Vec<Run>) = done
                 .into_iter()
@@ -1761,7 +2314,7 @@ pub(crate) fn run_planned(
             r.raw(combined(&bins, &runs).output);
             // The golden test may be among those stopped, and the run is red already.
             decide_runs(r, &bins, &runs, label, |r, rest| {
-                r.decide_test_child(rest, label, env);
+                r.decide_test_child(rest, label, &rerun);
             });
         }
         r.cannot_run(format!(
@@ -1772,18 +2325,91 @@ pub(crate) fn run_planned(
         return;
     }
     r.raw(preface);
-    r.raw(summary(&plan, jobs));
     accounted(r);
     r.raw(combined(&bins, &runs).output);
-    r.raw(poles(&bins, &walls, total));
-    if let Some(Err(why)) = kept {
-        r.raw(format!(
-            "  test binaries' history not kept (planning data only): {why}"
-        ));
-    }
+    tail(r);
     decide_runs(r, &bins, &runs, label, |r, rest| {
-        decide(ctx, r, rest, label, env);
+        decide(ctx, r, rest, label, &rerun);
     });
+}
+
+#[cfg(test)]
+impl Ran {
+    /// `run`, at width and charge one with no reading, waiting `waiting` and taking `execution`.
+    fn of(run: Run, waiting: Duration, execution: Duration) -> Ran {
+        Ran {
+            run,
+            planned: Planned {
+                index: 0,
+                width: 1,
+                charge: 1,
+                peak: 0,
+                predicted: None,
+            },
+            waiting,
+            execution,
+        }
+    }
+}
+
+/// Run `run(i)` for each `i` below `n` through [`dispatch`], every binary unseen on a share of
+/// `n` cores, each answer in its place: for the tests of what a worker's children are handed.
+#[cfg(test)]
+pub(crate) fn dispatch_each<T: Send>(n: usize, run: impl Fn(usize) -> T + Sync) -> Vec<Option<T>> {
+    let bins: Vec<Binary> = (0..n)
+        .map(|i| Binary {
+            harness: false,
+            header: String::new(),
+            spec: format!("t{i}"),
+            record: Record {
+                cwd: PathBuf::new(),
+                argv: Vec::new(),
+                env: Vec::new(),
+            },
+        })
+        .collect();
+    let plan = test_plan::plan(
+        &vec![None; n],
+        u32::try_from(n).unwrap_or(u32::MAX),
+        None,
+        0,
+    );
+    let out: Vec<Mutex<Option<T>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    dispatch(
+        &bins,
+        &plan,
+        None,
+        &|| 0.0,
+        &|| false,
+        |_, p| {
+            *out[p.index].lock().unwrap_or_else(PoisonError::into_inner) = Some(run(p.index));
+            Some(Run {
+                stopped_at: None,
+                ok: true,
+                output: String::new(),
+                code: Some(0),
+                spawn_error: None,
+                usage: None,
+            })
+        },
+        |_, _, _| {},
+    );
+    out.into_iter()
+        .map(|m| m.into_inner().unwrap_or_else(PoisonError::into_inner))
+        .collect()
+}
+
+/// A binary the dispatch never started though no ceiling halted it: a defect of this gate, and
+/// a FAIL, never a pass.
+fn never_run() -> Run {
+    Run {
+        stopped_at: None,
+        ok: false,
+        output: "aterm-verify: this test binary was never run (a gate defect)\n".into(),
+        code: None,
+        spawn_error: None,
+        usage: None,
+    }
 }
 
 static RECORDING: AtomicUsize = AtomicUsize::new(0);
@@ -1799,6 +2425,263 @@ mod discovery_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scratch ledger and each claim asked of it: of memory or of cores, and whether this
+    /// process held a cores claim as it was asked.
+    type Scratch = Option<(aterm_capacity::Ledger, Vec<(&'static str, bool)>)>;
+
+    thread_local! {
+        /// The scratch ledger [`scratch_admit`] admits in, and the claims asked of it.
+        static SCRATCH: std::cell::RefCell<Scratch> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Admit `need` at once in the thread's scratch ledger, on a machine with room for it, noting
+    /// what it asked for and whether this process held cores as it asked.
+    fn scratch_admit(
+        need: aterm_capacity::Need,
+        mode: aterm_capacity::Admit,
+    ) -> Result<aterm_capacity::Claim, aterm_capacity::Error> {
+        SCRATCH.with_borrow_mut(|scratch| {
+            let (ledger, asked) = scratch.as_mut().expect("a scratch ledger");
+            let cores_held = ledger
+                .of_pid(std::process::id())
+                .expect("the scratch ledger reads")
+                .iter()
+                .any(|r| r.held.is_some_and(|h| h.cores > 0));
+            asked.push((if need.mem > 0 { "memory" } else { "cores" }, cores_held));
+            crate::admit_in(
+                ledger,
+                &crate::timing_test_machine::Measured::new(&aterm_capacity::Fixed::new(
+                    aterm_capacity::Reading::of_gib(48, 40, 14),
+                )),
+                aterm_capacity::Pace::default(),
+                need,
+                mode,
+                &mut |_| {},
+            )
+        })
+    }
+
+    /// A decisive red closes the dispatch under the same mutex as a start, before its event is
+    /// written: a worker that already read the external stop but has not taken that mutex finds
+    /// the head still queued. The run-wide halt is armed afterward. NEGATIVE CONTROL: removing
+    /// `mark_red_decided`'s synchronized halt starts that head; a non-red outcome, or a red in a
+    /// run that does not stop, leaves a fresh dispatcher live.
+    #[test]
+    fn a_decisive_red_stops_queued_binaries_before_its_event_is_written() {
+        let plan = test_plan::plan(&[None], 1, None, 1);
+        let state = Mutex::new(Dispatcher::new(&plan, Some(1)));
+        let turn = Condvar::new();
+        let (stop_read, read_stop) = std::sync::mpsc::channel();
+        let (may_lock, lock_now) = std::sync::mpsc::channel();
+        let lock_now = Mutex::new(lock_now);
+        let visits = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let after_stop = || {
+                if visits.fetch_add(1, Ordering::SeqCst) == 0 {
+                    stop_read.send(()).expect("the test hears the stop read");
+                    lock_now
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("the admission lock was not released within one minute");
+                }
+            };
+            let admission_state = &state;
+            let admission_turn = &turn;
+            let attempt = scope.spawn(move || {
+                admitted_after_stop(
+                    admission_state,
+                    admission_turn,
+                    &|| 0.0,
+                    &|| false,
+                    &after_stop,
+                )
+            });
+            read_stop
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the admission did not read stop within one minute");
+            let halt = || halt_dispatch(&state, &turn);
+            assert!(mark_red_decided(
+                Outcome::Fail(Severity::GateFailed),
+                true,
+                Some(&halt)
+            ));
+            may_lock
+                .send(())
+                .expect("the admission still waits to take the lock");
+            assert_eq!(attempt.join().unwrap(), None);
+        });
+        assert_eq!(
+            state.lock().unwrap().phase(0),
+            Some(crate::test_plan::Phase::Queued)
+        );
+
+        let halts = AtomicUsize::new(0);
+        let count_halt = || {
+            halts.fetch_add(1, Ordering::SeqCst);
+        };
+        assert!(!mark_red_decided(Outcome::Ok, true, Some(&count_halt)));
+        assert!(!mark_red_decided(
+            Outcome::Fail(Severity::GateFailed),
+            false,
+            Some(&count_halt)
+        ));
+        assert_eq!(halts.load(Ordering::SeqCst), 0);
+
+        let live = Mutex::new(Dispatcher::new(&plan, Some(1)));
+        assert_eq!(
+            admitted(&live, &turn, &|| 0.0, &|| false).map(|b| b.index),
+            Some(0),
+            "without a stopping red, the same queued binary starts"
+        );
+    }
+
+    /// Empty history and a timed sample whose tree peak was unread both plan a positive cold
+    /// peak and therefore a positive run claim. NEGATIVE CONTROL: leaving an unseen or zero-peak
+    /// Seen at zero makes its corresponding assertion fail and restores unclaimed concurrency.
+    #[test]
+    fn binaries_without_a_measured_peak_get_a_positive_plan_and_claim() {
+        let binary = Binary {
+            harness: false,
+            header: String::new(),
+            spec: "-p fixture --lib".to_owned(),
+            record: Record {
+                cwd: PathBuf::new(),
+                argv: Vec::new(),
+                env: Vec::new(),
+            },
+        };
+        let mut history = crate::test_history::History::default();
+        let physical = Some(48_u64 << 30);
+        for known_without_peak in [false, true] {
+            if known_without_peak {
+                history.push(
+                    &binary.spec,
+                    crate::test_history::Sample {
+                        at_ms: 1,
+                        outcome: "ok".to_owned(),
+                        wall_ms: 1000,
+                        cpu_ms: Some(1000),
+                        starved_ms: Some(0),
+                        peak_bytes: None,
+                        width: 1,
+                        tests: Some(1),
+                    },
+                );
+            }
+            let fallback = fallback_peak(&history, &[], physical);
+            assert!(fallback > 0);
+            let plan =
+                plan_from_history(&history, std::slice::from_ref(&binary), 4, None, fallback);
+            assert_eq!(plan.order[0].peak, fallback, "{plan:?}");
+            assert!(plan_claim(&plan).is_some(), "{plan:?}");
+            assert!(
+                aterm_capacity::peak_claim(fallback) > 0,
+                "cargo's serial fallback claim is positive"
+            );
+        }
+    }
+
+    /// A TEST RUN CLAIMS MEMORY BEFORE CORES, every time: cargo's one-at-a-time memory and then
+    /// its cores, and the plan's memory only once those went back, then its cores again; so it
+    /// never waits for memory while it holds cores, as a run that holds memory may wait for cores.
+    /// NEGATIVE CONTROL: claims taken while the plan's are still held ask for memory beside held
+    /// cores, and the admitter sees it.
+    #[test]
+    fn a_test_run_never_asks_for_memory_while_it_holds_cores() {
+        let tmp = aterm_tempfile::tempdir().expect("scratch");
+        SCRATCH.set(Some((
+            aterm_capacity::Ledger::at(tmp.path().join("ledger")),
+            Vec::new(),
+        )));
+        let asked =
+            || SCRATCH.with_borrow_mut(|s| std::mem::take(&mut s.as_mut().expect("scratch").1));
+        let mut ctx = crate::Ctx::new(
+            tmp.path().to_path_buf(),
+            crate::Scope::workspace(),
+            crate::EnvSnapshot::default(),
+            tmp.path().join("scratch"),
+        );
+        ctx.memory = Some(crate::memory::Book::at(
+            None,
+            Some(48 << 30),
+            Some(40 << 30),
+        ));
+        let gib = 1_u64 << 30;
+        let first =
+            claim_both(&ctx, "t", None, 2 * gib, "one", 6, scratch_admit).expect("admitted");
+        assert!(first.memory.is_some());
+        assert_eq!(first.granted, 6);
+        let plan = claim_both(&ctx, "t", Some(first), 4 * gib, "plan", 6, scratch_admit)
+            .expect("admitted");
+        assert_eq!(
+            asked(),
+            [
+                ("memory", false),
+                ("cores", false),
+                ("memory", false),
+                ("cores", false)
+            ]
+        );
+        let beside =
+            claim_both(&ctx, "t", None, 2 * gib, "beside", 6, scratch_admit).expect("admitted");
+        assert_eq!(asked(), [("memory", true), ("cores", true)]);
+        drop((plan, beside));
+        SCRATCH.set(None);
+    }
+
+    /// UNDER THE RELEASE'S POOL a test run claims its memory as ever and no cores: the pool's
+    /// slots are its grant, which the release's own core claim bounds, and a claim of its own
+    /// would count the release's other branches' and wait for them. NEGATIVE CONTROL: the same
+    /// run with no pool asks the ledger for its cores.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_under_the_releases_pool_claims_its_memory_and_no_cores() {
+        let tmp = aterm_tempfile::tempdir().expect("scratch");
+        SCRATCH.set(Some((
+            aterm_capacity::Ledger::at(tmp.path().join("ledger")),
+            Vec::new(),
+        )));
+        let asked =
+            || SCRATCH.with_borrow_mut(|s| std::mem::take(&mut s.as_mut().expect("scratch").1));
+        let release = aterm_capacity::Jobserver::new(&tmp.path().join("qualify.jobs"), 5)
+            .expect("the release's pool");
+        let ctx = |pool| {
+            let mut ctx = crate::Ctx::new(
+                tmp.path().to_path_buf(),
+                crate::Scope::workspace(),
+                crate::EnvSnapshot {
+                    release_pool: Some(release.handed()),
+                    ..crate::EnvSnapshot::default()
+                },
+                tmp.path().join("scratch"),
+            )
+            .with_pool(pool);
+            ctx.memory = Some(crate::memory::Book::at(
+                None,
+                Some(48 << 30),
+                Some(40 << 30),
+            ));
+            ctx
+        };
+        let pooled = ctx(Some(
+            aterm_capacity::Jobserver::adopt(&release.handed()).expect("adopted"),
+        ));
+        let gib = 1_u64 << 30;
+        let claims =
+            claim_both(&pooled, "t", None, 2 * gib, "one", 5, scratch_admit).expect("admitted");
+        assert!(claims.memory.is_some(), "its memory is claimed as ever");
+        assert_eq!(claims.granted, 5, "the pool's slots are its grant");
+        assert_eq!(asked(), [("memory", false)], "and no cores are asked for");
+        drop(claims);
+        let unpooled = ctx(None);
+        let claims =
+            claim_both(&unpooled, "t", None, 2 * gib, "one", 5, scratch_admit).expect("admitted");
+        assert_eq!(asked(), [("memory", false), ("cores", false)]);
+        drop(claims);
+        SCRATCH.set(None);
+    }
 
     #[test]
     fn broken_subprocess_pool_initialization_refuses_before_test_dispatch() {
@@ -1955,17 +2838,13 @@ mod tests {
             .collect();
         let released = (Mutex::new(false), std::sync::Condvar::new());
         let reported = Mutex::new(Vec::new());
-        let mut plan = crate::test_plan::plan(
-            &["slow", "failed"],
-            &std::collections::BTreeMap::new(),
-            2,
-            1,
-        );
-        plan.order = vec![0, 1];
-        let runs = run_all(
+        let plan = test_plan::plan(&[None, None], 2, Some(1), 0);
+        let runs = dispatch(
             &bins,
             &plan,
-            2,
+            None,
+            &|| 0.0,
+            &|| false,
             |binary, _| {
                 if binary.spec == "slow" {
                     let (guard, timeout) = released
@@ -1981,16 +2860,17 @@ mod tests {
                         "completed failure was buffered"
                     );
                 }
-                Run {
+                let run = Run {
                     stopped_at: None,
                     ok: binary.spec == "slow",
                     output: String::new(),
                     code: Some(i32::from(binary.spec != "slow")),
                     spawn_error: None,
                     usage: None,
-                }
+                };
+                Some(run)
             },
-            |binary, _, _, _, _| {
+            |binary, _, _| {
                 reported.lock().unwrap().push(binary.spec.clone());
                 if binary.spec == "failed" {
                     *released.0.lock().unwrap() = true;
@@ -1999,8 +2879,8 @@ mod tests {
             },
         );
         assert_eq!(*reported.lock().unwrap(), ["failed", "slow"]);
-        assert!(runs[0].0.ok);
-        assert!(!runs[1].0.ok);
+        let ok = |i: usize| runs[i].as_ref().map(|r| r.run.ok);
+        assert_eq!((ok(0), ok(1)), (Some(true), Some(false)));
     }
 
     #[test]
@@ -2020,8 +2900,12 @@ mod tests {
             usage: None,
         };
         let parse = |run: &Run| -> aterm_json::Value {
-            let (_, line, _) =
-                binary_event(&binary, run, true, Duration::ZERO, Duration::ZERO, 1, None);
+            let (_, line, _) = binary_event(
+                &binary,
+                &Ran::of(run.clone(), Duration::ZERO, Duration::ZERO),
+                true,
+                None,
+            );
             aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap()
         };
         assert_eq!(parse(&run)["outcome"].as_str(), Some("ok"));
@@ -2491,12 +3375,15 @@ mod tests {
         );
     }
 
-    /// THE DISPATCH: never more than `workers` at once, every binary once at the width its plan
-    /// gives it (reported to `completed` too), and the answers in declared order whatever order
-    /// they ran and finished in.
+    /// THE DISPATCH: a binary starts only while its charge fits in what the running ones leave of
+    /// the share, at its planned width, every binary once, and the answers in declared order
+    /// whatever order they ended in. Each of the first three waits until all three run (3 + 2 + 1
+    /// cores of 6), so the three ran at once, and no four fit. NEGATIVE CONTROL: had the fourth (3
+    /// more) not waited for room, the share would have been passed at its start.
     #[test]
-    fn binaries_run_at_their_planned_widths_and_answer_in_declared_order() {
-        let bins: Vec<Binary> = (0..9)
+    fn binaries_run_while_their_charges_fit_and_answer_in_declared_order() {
+        let charges = [3, 2, 1, 3, 2, 1, 3, 2, 1];
+        let bins: Vec<Binary> = (0..charges.len())
             .map(|i| Binary {
                 harness: false,
                 header: format!("     Running tests/t{i}.rs (target/debug/deps/t{i}-1)"),
@@ -2504,44 +3391,405 @@ mod tests {
                 record: rec(&format!("/r/t{i}"), "x"),
             })
             .collect();
-        let specs: Vec<&str> = bins.iter().map(|b| b.spec.as_str()).collect();
-        let mut plan = crate::test_plan::plan(&specs, &std::collections::BTreeMap::new(), 12, 12);
-        plan.order = (0..9).rev().collect();
-        plan.width = (1..=9).collect();
-        plan.charge = vec![1; 9];
-        let running = AtomicUsize::new(0);
-        let peak = AtomicUsize::new(0);
-        let index = |b: &Binary| -> u32 { b.spec.rsplit('t').next().unwrap().parse().unwrap() };
-        let runs = run_all(
+        let plan = Plan {
+            share: 6,
+            target: Duration::ZERO,
+            order: charges
+                .iter()
+                .enumerate()
+                .map(|(index, &charge)| Planned {
+                    index,
+                    width: charge,
+                    charge,
+                    peak: 0,
+                    predicted: Some(Duration::from_secs(1)),
+                })
+                .collect(),
+        };
+        let held = Mutex::new((0_u32, 0_u32));
+        let started = (Mutex::new(0_usize), Condvar::new());
+        let ran = dispatch(
             &bins,
             &plan,
-            3,
-            |b, width| {
-                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(now, Ordering::SeqCst);
-                assert_eq!(width, index(b) + 1, "each binary gets its planned width");
-                running.fetch_sub(1, Ordering::SeqCst);
-                Run {
-                    ok: true,
-                    output: format!("{}\nran {}\n", b.header, b.spec),
-                    code: Some(0),
-                    ..Run::default()
+            None,
+            &|| 0.0,
+            &|| false,
+            |b, planned| {
+                {
+                    let mut held = held.lock().unwrap();
+                    held.0 += planned.charge;
+                    held.1 = held.1.max(held.0);
+                    assert!(held.0 <= 6, "{} started past the share", b.spec);
                 }
+                *started.0.lock().unwrap() += 1;
+                started.1.notify_all();
+                if planned.index < 3 {
+                    let (count, waited) = started
+                        .1
+                        .wait_timeout_while(
+                            started.0.lock().unwrap(),
+                            aterm_spec::wait::MUST_HAPPEN,
+                            |n| *n < 3,
+                        )
+                        .unwrap();
+                    assert!(
+                        *count >= 3 && !waited.timed_out(),
+                        "the first three never ran together"
+                    );
+                }
+                held.lock().unwrap().0 -= planned.charge;
+                let run = Run {
+                    stopped_at: None,
+                    ok: true,
+                    output: format!("{}\nran {} at {}\n", b.header, b.spec, planned.width),
+                    code: Some(0),
+                    spawn_error: None,
+                    usage: None,
+                };
+                Some(run)
             },
-            |b, _, _, _, width| assert_eq!(width, index(b) + 1, "and its event the same"),
+            |_, _, _| {},
         );
-        assert!(peak.load(Ordering::SeqCst) <= 3, "never past the workers");
-        let said: Vec<String> = runs
+        assert_eq!(held.lock().unwrap().1, 6, "the first three ran at once");
+        let said: Vec<String> = ran
             .iter()
-            .map(|(r, _)| r.output.lines().nth(1).unwrap().to_string())
+            .map(|r| {
+                r.as_ref()
+                    .unwrap()
+                    .run
+                    .output
+                    .lines()
+                    .nth(1)
+                    .unwrap()
+                    .to_string()
+            })
             .collect();
         assert_eq!(
             said,
-            (0..9)
-                .map(|i| format!("ran -p x --test t{i}"))
+            (0..charges.len())
+                .map(|i| format!("ran -p x --test t{i} at {}", charges[i]))
                 .collect::<Vec<_>>(),
-            "declared order"
+            "declared order, each at its width"
         );
+        assert_eq!(most_at_once(&ran), 3, "the first three ran at once");
+    }
+
+    /// A RUN THAT PANICS (a gate defect) gives its binary's charge back and halts the dispatch:
+    /// the other worker, waiting for the share, starts nothing more, and the panic reaches the
+    /// caller instead of that worker waiting forever. NEGATIVE CONTROL: with no panic, every
+    /// binary runs, one at a time on two cores.
+    #[test]
+    fn a_run_that_panics_gives_its_charge_back_and_halts_the_dispatch() {
+        let bins: Vec<Binary> = (0..3)
+            .map(|i| Binary {
+                harness: false,
+                header: format!("t{i}"),
+                spec: format!("t{i}"),
+                record: rec(&format!("/r/t{i}"), "x"),
+            })
+            .collect();
+        // Three binaries two wide on two cores: one at a time, on two workers.
+        let plan = test_plan::plan(&[None, None, None], 2, None, 0);
+        let go = |panics: bool| {
+            let (bins, plan) = (bins.clone(), plan.clone());
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    dispatch(
+                        &bins,
+                        &plan,
+                        None,
+                        &|| 0.0,
+                        &|| false,
+                        |b, _| {
+                            assert!(!(panics && b.spec == "t0"), "a gate defect");
+                            Some(Run {
+                                stopped_at: None,
+                                ok: true,
+                                output: String::new(),
+                                code: Some(0),
+                                spawn_error: None,
+                                usage: None,
+                            })
+                        },
+                        |_, _, _| {},
+                    )
+                    .iter()
+                    .flatten()
+                    .count()
+                }));
+                tx.send(ran.ok()).ok();
+            });
+            rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("the dispatch ended")
+        };
+        assert_eq!(go(false), Some(3));
+        assert_eq!(go(true), None, "the panic reached the caller");
+    }
+
+    /// THE RUN'S READINGS: the most binaries that ran at once are the most whose spans overlap,
+    /// one ending as the next starts counted apart, and binaries left unstarted (no execution)
+    /// not at all; a binary whose CPU over its wall passed its charge is named with the cores it
+    /// used. NEGATIVE CONTROLS: a third binary starting before the second ends makes three at
+    /// once, and a binary within its charge is not named.
+    #[test]
+    fn the_most_at_once_and_the_overruns_are_read_from_the_runs() {
+        let s = Duration::from_secs;
+        let ran = |charge: u32, waiting: u64, execution: u64, cpu: u64| {
+            let mut ran = Ran::of(
+                Run {
+                    stopped_at: None,
+                    ok: true,
+                    output: String::new(),
+                    code: Some(0),
+                    spawn_error: None,
+                    usage: None,
+                },
+                s(waiting),
+                s(execution),
+            );
+            ran.planned.charge = charge;
+            ran.run.usage = Some(exec::TreeUsage {
+                cpu: s(cpu),
+                ..exec::TreeUsage::default()
+            });
+            Some(ran)
+        };
+        let apart = [ran(1, 0, 2, 2), ran(2, 1, 2, 12), ran(1, 3, 1, 1)];
+        assert_eq!(most_at_once(&apart), 2);
+        let overlapping = [ran(1, 0, 2, 2), ran(2, 1, 2, 12), ran(1, 1, 2, 1)];
+        assert_eq!(most_at_once(&overlapping), 3);
+        // Three a halt left unstarted, answered at the dispatch's end with no execution: none ran.
+        let halted = [
+            ran(1, 0, 2, 2),
+            ran(1, 2, 0, 0),
+            ran(1, 2, 0, 0),
+            ran(1, 2, 0, 0),
+        ];
+        assert_eq!(most_at_once(&halted), 1);
+        let bins: Vec<Binary> = (0..3)
+            .map(|i| Binary {
+                harness: false,
+                header: format!("t{i}"),
+                spec: format!("-p x --test t{i}"),
+                record: rec(&format!("/r/t{i}"), "x"),
+            })
+            .collect();
+        let over = overruns(&bins, &apart);
+        assert!(
+            over.contains("-p x --test t1 used 6.0 cores of 2 charged"),
+            "{over}"
+        );
+        assert!(!over.contains("t0") && !over.contains("t2"), "{over}");
+        assert_eq!(overruns(&bins[..1], &apart[..1]), "");
+    }
+
+    /// A RUN'S CEILING SPENT halts the dispatch: nothing more starts, and what it left is
+    /// unanswered (the run reports it as never started), as is one whose run answered that it did
+    /// not start. NEGATIVE CONTROL: unspent, every binary runs.
+    #[test]
+    fn a_spent_ceiling_starts_nothing_more() {
+        let bins: Vec<Binary> = (0..4)
+            .map(|i| Binary {
+                harness: false,
+                header: format!("t{i}"),
+                spec: format!("-p x --test t{i}"),
+                record: rec(&format!("/r/t{i}"), "x"),
+            })
+            .collect();
+        let plan = test_plan::plan(&[None, None, None, None], 1, None, 0);
+        let done = AtomicUsize::new(0);
+        let ok = || {
+            Some(Run {
+                stopped_at: None,
+                ok: true,
+                output: String::new(),
+                code: Some(0),
+                spawn_error: None,
+                usage: None,
+            })
+        };
+        let spent = || done.load(Ordering::SeqCst) >= 2;
+        let ran = dispatch(
+            &bins,
+            &plan,
+            None,
+            &|| 0.0,
+            &spent,
+            |_, _| ok(),
+            |_, _, _| {
+                done.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        assert_eq!(
+            ran.iter().map(Option::is_some).collect::<Vec<_>>(),
+            [true, true, false, false]
+        );
+        let late = dispatch(
+            &bins,
+            &plan,
+            None,
+            &|| 0.0,
+            &|| false,
+            |_, p| if p.index == 1 { None } else { ok() },
+            |_, _, _| {},
+        );
+        assert_eq!(
+            late.iter().map(Option::is_some).collect::<Vec<_>>(),
+            [true, false, true, true],
+            "one its ceiling met as its turn came is answered as unstarted, and the rest go on"
+        );
+        let all = dispatch(
+            &bins,
+            &plan,
+            None,
+            &|| 0.0,
+            &|| false,
+            |_, _| ok(),
+            |_, _, _| {},
+        );
+        assert!(all.iter().all(Option::is_some));
+    }
+
+    /// Binaries of `charges`, all unseen, each its charge wide, in a plan on `share` cores.
+    #[cfg(unix)]
+    fn charged(charges: &[u32], share: u32) -> (Vec<Binary>, Plan) {
+        let bins = (0..charges.len())
+            .map(|i| Binary {
+                harness: false,
+                header: format!("t{i}"),
+                spec: format!("-p x --test t{i}"),
+                record: rec(&format!("/r/t{i}"), "x"),
+            })
+            .collect();
+        let order = charges
+            .iter()
+            .enumerate()
+            .map(|(index, &charge)| Planned {
+                index,
+                width: charge,
+                charge,
+                peak: 0,
+                predicted: None,
+            })
+            .collect();
+        let plan = Plan {
+            share,
+            target: Duration::ZERO,
+            order,
+        };
+        (bins, plan)
+    }
+
+    /// UNDER THE RELEASE'S POOL a binary holds its charge in the pool's tokens while it runs. On
+    /// four slots with the release's build holding two, two binaries charged two each fit the
+    /// share together, yet run one at a time on the two tokens left: while each runs, no token
+    /// is free, and every token comes back. NEGATIVE CONTROL: a dispatch that takes no tokens
+    /// runs a binary with two free.
+    #[cfg(unix)]
+    #[test]
+    fn a_pooled_binary_holds_its_charge_in_the_releases_tokens_while_it_runs() {
+        let tmp = aterm_tempfile::tempdir().expect("scratch");
+        let pool = aterm_capacity::Jobserver::new(&tmp.path().join("jobs"), 4).expect("a pool");
+        let build: Vec<_> = (0..2)
+            .map(|_| pool.try_acquire().expect("reads").expect("a token"))
+            .collect();
+        let (bins, plan) = charged(&[2, 2], 4);
+        let running = AtomicUsize::new(0);
+        let most = AtomicUsize::new(0);
+        let ran = dispatch_pooled(
+            &bins,
+            &plan,
+            None,
+            Some(&pool),
+            &|| 0.0,
+            &|| false,
+            |_, _| {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
+                assert!(
+                    pool.try_acquire().expect("reads").is_none(),
+                    "the build's two and this binary's two hold every token"
+                );
+                running.fetch_sub(1, Ordering::SeqCst);
+                Some(Run {
+                    ok: true,
+                    code: Some(0),
+                    ..Run::default()
+                })
+            },
+            |_, _, _| {},
+        );
+        assert!(ran.iter().all(Option::is_some), "both ran");
+        assert_eq!(
+            most.load(Ordering::SeqCst),
+            1,
+            "on two tokens, one at a time"
+        );
+        drop(build);
+        let back: Vec<_> = std::iter::from_fn(|| pool.try_acquire().expect("reads")).collect();
+        assert_eq!(back.len(), 4, "every token came back");
+    }
+
+    /// A binary whose tokens the stop ends the wait for never runs and is left unstarted, as the
+    /// stop leaves every binary, and the part of its charge it took goes back. The build holds
+    /// one of two slots; the binary, charged both, is admitted (its `live` read), and the stop
+    /// comes while it waits for the second. NEGATIVE CONTROL: a dispatch that takes no tokens runs
+    /// it once the share admits it.
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_whose_tokens_never_come_is_left_unstarted_and_never_run() {
+        let tmp = aterm_tempfile::tempdir().expect("scratch");
+        let pool = aterm_capacity::Jobserver::new(&tmp.path().join("jobs"), 2).expect("a pool");
+        let build = pool.try_acquire().expect("reads").expect("a token");
+        let (bins, plan) = charged(&[2], 2);
+        let admitted = (Mutex::new(false), Condvar::new());
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let live = || {
+            *admitted.0.lock().unwrap() = true;
+            admitted.1.notify_all();
+            0.0
+        };
+        let started = AtomicUsize::new(0);
+        let ran = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let (seen, waited) = admitted
+                    .1
+                    .wait_timeout_while(
+                        admitted.0.lock().unwrap(),
+                        aterm_spec::wait::MUST_HAPPEN,
+                        |seen| !*seen,
+                    )
+                    .unwrap();
+                assert!(
+                    *seen && !waited.timed_out(),
+                    "the binary was never admitted"
+                );
+                stopped.store(true, Ordering::SeqCst);
+            });
+            dispatch_pooled(
+                &bins,
+                &plan,
+                None,
+                Some(&pool),
+                &live,
+                &|| stopped.load(Ordering::SeqCst),
+                |_, _| {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    Some(Run::default())
+                },
+                |_, _, _| {},
+            )
+        });
+        assert_eq!(started.load(Ordering::SeqCst), 0, "it never ran");
+        assert!(ran[0].is_none(), "the stop left it unstarted");
+        let free = pool.try_acquire().expect("reads");
+        assert!(free.is_some(), "the token it took went back");
+        assert!(
+            pool.try_acquire().expect("reads").is_none(),
+            "the build's is its own"
+        );
+        drop((free, build));
     }
 
     /// THE LONG POLES: the run's own wall, then its slowest binaries longest
@@ -2590,7 +3838,11 @@ mod tests {
         );
         let all = combined(std::slice::from_ref(&b), std::slice::from_ref(&run));
         assert!(!all.ok);
-        let found = crate::findings::test_findings("targo test --tests", &all.output, &[]);
+        let found = crate::findings::test_findings(
+            "targo test --tests",
+            &all.output,
+            &crate::findings::Rerun::default(),
+        );
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].rerun, None, "a whole-row finding: {found:?}");
         assert!(
@@ -2652,11 +3904,8 @@ mod tests {
         assert_eq!(tests[0].name, "t::broke");
         let (outcome, event, _) = binary_event(
             &bins[1],
-            &runs[1],
+            &Ran::of(runs[1].clone(), Duration::ZERO, Duration::ZERO),
             true,
-            Duration::ZERO,
-            Duration::ZERO,
-            1,
             None,
         );
         assert_eq!(outcome, Outcome::Fail(Severity::GateFailed), "a proven red");
@@ -2667,7 +3916,11 @@ mod tests {
             event["failures"][0]["output"].as_str(),
             Some(tests[0].block.as_str())
         );
-        let findings = crate::findings::test_findings("targo test --tests", &all.output, &[]);
+        let findings = crate::findings::test_findings(
+            "targo test --tests",
+            &all.output,
+            &crate::findings::Rerun::default(),
+        );
         assert_eq!(findings[0].id, "-p x --test b -- t::broke");
         assert!(
             all.output
@@ -2820,7 +4073,7 @@ mod tests {
             let mut r = Report::new("test");
             r.raw(combined(&bins, runs).output);
             decide_runs(&mut r, &bins, runs, label, |r, rest| {
-                r.decide_test_child(rest, label, &[]);
+                r.decide_test_child(rest, label, &crate::findings::Rerun::default());
             });
             r
         };
@@ -2868,7 +4121,7 @@ mod tests {
 
         let mut r = Report::new("test");
         decide_runs(&mut r, &[], &[], label, |r, rest| {
-            r.decide_test_child(rest, label, &[]);
+            r.decide_test_child(rest, label, &crate::findings::Rerun::default());
         });
         assert_eq!(r.outcomes().count(), 1, "{}", r.render());
     }

@@ -208,6 +208,27 @@ fn observe(
     )
 }
 
+fn progress_after_observation(
+    result: Result<Option<pool::Proposal>, &'static str>,
+    current: bool,
+    now: Instant,
+) -> Progress {
+    match result {
+        Ok(Some(proposal)) if current => Progress::Selected(Box::new(Selection {
+            proposal,
+            observed: now,
+            receipt: None,
+        })),
+        Err(why) if current && pool::prepare_refusal_stands(why).is_some() => {
+            if let Some(end) = pool::prepare_refusal_stands(why) {
+                aterm_log::info!("codex rotation: none is coming: {}", end.as_str());
+            }
+            Progress::NotNeeded
+        }
+        _ => Progress::Retry(now + Duration::from_millis(RETRY_MS)),
+    }
+}
+
 fn start(
     ctx: &Arc<crate::SessionCtx>,
     env: &Env,
@@ -227,15 +248,8 @@ fn start(
             }))
             .unwrap_or(Err("probe-panicked"));
             let current = weak.upgrade().is_some_and(|ctx| worker.current(&ctx));
-            *worker.progress.lock().unwrap_or_else(|p| p.into_inner()) = match result {
-                Ok(Some(proposal)) if current => Progress::Selected(Box::new(Selection {
-                    proposal,
-                    observed: Instant::now(),
-                    receipt: None,
-                })),
-                Err("not-weekly-exhausted") if current => Progress::NotNeeded,
-                _ => Progress::Retry(Instant::now() + Duration::from_millis(RETRY_MS)),
-            };
+            *worker.progress.lock().unwrap_or_else(|p| p.into_inner()) =
+                progress_after_observation(result, current, Instant::now());
         })
         .is_err()
     {
@@ -551,6 +565,34 @@ pub(in crate::native_act) fn observe_exec(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_current_terminal_refusal_ends_rotation_but_stale_and_transient_results_retry() {
+        let now = Instant::now();
+        for why in [
+            "source-unbound",
+            "source-missing",
+            "source-unmanaged",
+            "not-weekly-exhausted",
+        ] {
+            assert!(
+                matches!(
+                    progress_after_observation(Err(why), true, now),
+                    Progress::NotNeeded
+                ),
+                "{why}"
+            );
+            assert!(
+                matches!(progress_after_observation(Err(why), false, now), Progress::Retry(at) if at > now),
+                "stale {why}"
+            );
+        }
+        for result in [Err("roster-busy"), Err("probe-panicked"), Ok(None)] {
+            assert!(
+                matches!(progress_after_observation(result, true, now), Progress::Retry(at) if at > now)
+            );
+        }
+    }
 
     fn job(proof: &crate::self_claim::Proven) -> Preparation {
         Preparation {

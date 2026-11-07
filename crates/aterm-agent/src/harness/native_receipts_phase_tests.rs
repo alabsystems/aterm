@@ -46,6 +46,8 @@ fn exact_phase_survives_reopen_and_conflicting_retries_preserve_it() {
         assert!(!paths.dir.exists());
         record_event_at(&paths, &prepare, &binding, Some(Event::Prepare)).unwrap();
         let observed = close(&paths, &prepare, &binding, phase).unwrap();
+        assert_eq!(observed.sequence, 1);
+        append_other(&paths, &prepare, &binding);
         let before = std::fs::read(directory(&paths).join("noexec.astream")).unwrap();
         assert_eq!(close(&paths, &prepare, &binding, phase).unwrap(), observed);
         assert!(close(&paths, &prepare, &binding, opposite(phase)).is_err());
@@ -53,6 +55,7 @@ fn exact_phase_survives_reopen_and_conflicting_retries_preserve_it() {
             observe_phase_at(&paths, &prepare, &binding).unwrap(),
             Some(PhaseObserved {
                 phase,
+                sequence: observed.sequence,
                 recorded_ms: observed.recorded_ms,
             })
         );
@@ -144,6 +147,7 @@ fn a_failed_journal_barrier_withholds_typed_acknowledgement_and_retries() {
         observe_phase_at(&paths, &prepare, &binding).unwrap(),
         Some(PhaseObserved {
             phase: ImagePhase::Rollback,
+            sequence: observed.sequence,
             recorded_ms: observed.recorded_ms,
         })
     );
@@ -201,6 +205,9 @@ fn step(state: &State, action: &str, phase: ImagePhase, fault: u8) -> State {
         }
         _ => {}
     }
+    if state["other"] == 1 {
+        append_other(&paths, &prepare, &binding);
+    }
     let mut next = state.clone();
     match action {
         "Close" | "LostReply" => {
@@ -228,7 +235,10 @@ fn step(state: &State, action: &str, phase: ImagePhase, fault: u8) -> State {
             if fault == 4 {
                 next.insert("blocked", 1);
             } else {
-                close(&paths, &prepare, &binding, phase).unwrap();
+                assert_eq!(
+                    close(&paths, &prepare, &binding, phase).unwrap().sequence,
+                    1
+                );
                 next.insert("ack", 1);
             }
             next.insert("retried", 1);
@@ -245,6 +255,10 @@ fn step(state: &State, action: &str, phase: ImagePhase, fault: u8) -> State {
             next.insert("accepted_conflict", i64::from(accepted));
             next.insert("conflict", 1);
         }
+        "AppendOther" => {
+            append_other(&paths, &prepare, &binding);
+            next.insert("other", 1);
+        }
         "Read" => {
             let observed = if fault == 2 {
                 observe_at(&paths, &binding).unwrap().map(|_| phase)
@@ -257,6 +271,15 @@ fn step(state: &State, action: &str, phase: ImagePhase, fault: u8) -> State {
                 next.insert("inferred_legacy", i64::from(observed.is_some()));
             } else {
                 assert_eq!(observed, Some(phase));
+                let observed = observe_phase_at(&paths, &prepare, &binding)
+                    .unwrap()
+                    .unwrap();
+                let sequence = if fault == 5 {
+                    read(&paths).unwrap().unwrap().1.sequence - 1
+                } else {
+                    observed.sequence
+                };
+                next.insert("wrong_position", i64::from(sequence != 1));
             }
             next.insert("read", 1);
         }
@@ -274,6 +297,14 @@ fn step(state: &State, action: &str, phase: ImagePhase, fault: u8) -> State {
         },
     );
     next
+}
+
+fn append_other(paths: &Paths, prepare: &Prepare, binding: &Binding) {
+    let mut prepare = prepare.clone();
+    let mut binding = binding.clone();
+    prepare.id = "55".repeat(16);
+    binding.id = prepare.id.clone();
+    record_event_at(paths, &prepare, &binding, Some(Event::Prepare)).unwrap();
 }
 
 pub(crate) fn transition(state: &State, action: &str) -> State {
@@ -311,4 +342,6 @@ fn phase_observations_refine_exact_retries_and_legacy_unknowns() {
         &step(&model.init_state(), "Refused", phase, 3)
     ));
     assert!(!model.check_invariant("RetryProgress", &step(&refused, "Retry", phase, 4)));
+    let later = step(&closed, "AppendOther", phase, 0);
+    assert!(!model.check_invariant("OriginalPosition", &step(&later, "Read", phase, 5)));
 }

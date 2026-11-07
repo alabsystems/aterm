@@ -124,7 +124,8 @@ aterm-vz = { workspace = true }
 # Tier-1 of `EndByProof` (tests/conformance_end_by_proof.rs): the model and the interpreter
 # that drives it against the real `aterm_uds::process::end_proven`.
 aterm-models-misc = { workspace = true }
-# Tier-1 of `TestDispatch` (tests/conformance_test_dispatch.rs): the budget dispatcher's model.
+# Tier-1 of `TestDispatch` (tests/conformance_test_dispatch.rs): the model the real
+# `test_plan::Dispatcher` is replayed through.
 aterm-models-capacity = { workspace = true }
 aterm-spec = { workspace = true }
 

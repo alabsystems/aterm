@@ -17,6 +17,7 @@ impl Row {
 
     /// Insert `count` cells filled with `fill` at `col`, shifting existing cells right (ICH).
     pub fn insert_chars_fill(&mut self, col: u16, count: u16, fill: Cell) -> BlankedHalves {
+        self.note_all_cells_written();
         let mut blanked = BlankedHalves::default();
         if count == 0 || col >= self.cols() {
             return blanked;
@@ -90,6 +91,7 @@ impl Row {
 
     /// Delete `count` cells at `col`, shifting left and filling vacated cells with `fill` (DCH).
     pub fn delete_chars_fill(&mut self, col: u16, count: u16, fill: Cell) -> BlankedHalves {
+        self.note_all_cells_written();
         let mut blanked = BlankedHalves::default();
         if count == 0 || col >= self.cols() {
             return blanked;
@@ -156,6 +158,7 @@ impl Row {
         right_bound: u16,
         fill: Cell,
     ) -> BlankedHalves {
+        self.note_all_cells_written();
         let mut blanked = BlankedHalves::default();
         let right_bound = right_bound.min(self.cols());
         if count == 0 || col >= right_bound {
@@ -212,6 +215,7 @@ impl Row {
         right_bound: u16,
         fill: Cell,
     ) -> BlankedHalves {
+        self.note_all_cells_written();
         let mut blanked = BlankedHalves::default();
         let right_bound = right_bound.min(self.cols());
         if count == 0 || col >= right_bound {
@@ -272,6 +276,7 @@ impl Row {
 
     /// Erase `count` cells from `col` in place (ECH) with the BCE `fill` (VT420/xterm).
     pub fn erase_chars_with(&mut self, col: u16, count: u16, fill: Cell) -> BlankedHalves {
+        self.note_all_cells_written();
         let mut blanked = BlankedHalves::default();
         if count == 0 || col >= self.cols() {
             return blanked;
@@ -310,6 +315,7 @@ impl Row {
     /// [`erase_chars`](Self::erase_chars), skipping DECSCA-protected cells.
     #[cfg(test)]
     pub fn selective_erase_chars(&mut self, col: u16, count: u16, fill: Cell) {
+        self.note_all_cells_written();
         if count == 0 || col >= self.cols() {
             return;
         }

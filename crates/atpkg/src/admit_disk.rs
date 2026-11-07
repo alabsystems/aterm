@@ -10,15 +10,19 @@
 //! watch asked for the room (`await sys free>=`). Then the run waits, saying once a minute what
 //! it needs, what is free and what holds the most, instead of failing at `ENOSPC` hours in,
 //! having said first why it needs that ([`aterm_capacity::Estimate`]). A
-//! run needing more than the volume has free above its floor waits for space freed alone, since
-//! what other runs wrote stays once they end: it reserves nothing against the runs behind it,
-//! which go first when they fit, the watch is asked for no room on its behalf by them, and its
-//! line says `--admit now` starts it at once ([`aterm_capacity::Short::unservable`]). Once space
-//! freed brings its need within the room while the runs admitted around it hold the rest, it is
-//! relieved again, sized for them, where one of them reserves that disk that its last relief was
-//! not sized for ([`aterm_capacity::Relief::relieve`]). The cache's pass keeps the run's own
-//! directories, which the run is about to write into ([`recorder`]), trading the room a bloated
-//! one would free for a warm build. A relief whose pass removed anything, or that asked the
+//! run needing more than the volume has free above its floor once its relief ran waits while
+//! other runs hold scratch claims there ([`Run::scratch`]) whose writes, if returned by their
+//! end, would bring it within the room. It rechecks and is relieved again once one has ended;
+//! with none such held it is refused at once (UNMET, [`Error::Unmet`]), naming what holds
+//! the most and how much to free, its caller adding how to start it at once where it has a way
+//! (verify's `--admit now`): what other runs wrote stays once they end, so no wait could admit
+//! it. While it is beyond the room it reserves nothing against the runs behind it, and the watch is
+//! asked for no room on its behalf by them ([`aterm_capacity::Short::unservable`]). A run its
+//! relief brought within the room waits for what the runs ahead reserve; where runs admitted
+//! around it hold the rest, it is relieved again, sized for them, where one of them reserves
+//! disk that its last relief was not sized for ([`aterm_capacity::Relief::relieve`]). The
+//! cache's pass keeps the run's own directories, which the run is about to write into
+//! ([`recorder`]), trading the room a bloated one would free for a warm build. A relief whose pass removed anything, or that asked the
 //! window's watch (whose own passes know no run's directories), is followed by a new measure of
 //! them, and so is the look that admits a claim that waited (another run's pass or the watch's
 //! own may have emptied them meanwhile): the claim is sized again from it, re-entering the wait
@@ -77,6 +81,10 @@ pub struct Run {
     /// progress for this long ([`aterm_capacity::Need::ends_when_stuck`]): [`Error::Stuck`].
     /// `None`: it waits as long as they hold.
     pub stuck_ends: Option<Duration>,
+    /// Its writes are scratch ([`aterm_capacity::Need::scratch`]): its claim's end may return up
+    /// to what it writes, so a run beyond the room can wait for it and then recheck. A durable
+    /// run, including a Trust run whose held slots survive, is not scratch.
+    pub scratch: bool,
     /// Where a kind whose directories are each checkout's own keeps its runs of every checkout on
     /// this machine, and what this run builds; `None` for a kind whose directories are the
     /// machine's own (a VM's) or that keeps none.
@@ -86,7 +94,7 @@ pub struct Run {
 /// THE MACHINE'S RECORD OF A KIND WHOSE DIRECTORIES ARE EACH CHECKOUT'S OWN (verify's build
 /// directory and `<target>/verify`): a fresh worktree's hold no run of anything, so its record
 /// beside them ([`Run::record`]) has none to read, and a run of a scope run in another checkout
-/// claims what that run bounds ([`aterm_capacity::MachineFootprints::cover_by`]) instead of the
+/// claims what that run bounds ([`aterm_capacity::MachineFootprints::cover`]) instead of the
 /// cold budget. Kept only for a run that did all its work ([`Admitted::finish_whole`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Machinewide {
@@ -94,10 +102,6 @@ pub struct Machinewide {
     pub record: PathBuf,
     /// What the run builds, as the record keeps it.
     pub selection: Selection,
-    /// The words of the kind's work each of which adds work to the same directories and takes
-    /// none away (verify's checks that build), so a run kept that did the run's work and more of
-    /// them bounds it too.
-    pub more: Vec<String>,
 }
 
 /// WHAT A FINISHED RUN TOOK, AND WHICH RECORDS TOOK IT ([`Admitted::finish_here`],
@@ -135,9 +139,22 @@ impl Admitted {
         self.finish_here().run
     }
 
+    /// [`Self::finish`], running `empty` once what it took is measured and before its claim goes
+    /// ([`aterm_capacity::Meter::finish_emptying`]). A scratch run can use this to return its
+    /// ephemeral writes while the claim is still visible; a waiter rechecks actual space after
+    /// the claim ends.
+    pub fn finish_emptying(self, empty: impl FnOnce()) -> Footprint {
+        self.finish_here_emptying(empty).run
+    }
+
     /// [`Self::finish`], saying whether the record beside its directories took the run.
     pub fn finish_here(self) -> Finished {
-        let run = self.meter.finish();
+        self.finish_here_emptying(|| {})
+    }
+
+    /// [`Self::finish_here`], running `empty` before its claim goes ([`Self::finish_emptying`]).
+    fn finish_here_emptying(self, empty: impl FnOnce()) -> Finished {
+        let run = self.meter.finish_emptying(empty);
         let mut kept = Footprints::load(&self.record);
         kept.push(run);
         Finished {
@@ -172,7 +189,10 @@ impl Admitted {
 /// ([`Reclaim::live`]) before it waits and saying through `say` what it does and waits for.
 ///
 /// # Errors
-/// [`Error::Never`]: the need is more than the volume holds above its floor; [`Error::Ledger`]:
+/// [`Error::Never`]: the need is more than the volume holds above its floor; [`Error::Unmet`]:
+/// more than the volume has free above its floor once the relief ran, with no scratch claim
+/// held there that could meet it, which no wait admits (the caller runs nothing: COULD NOT RUN, or NOT RUN in the lab,
+/// naming what to free and the way it has to start at once, if it has one); [`Error::Ledger`]:
 /// no home, or the ledger could not be written (the caller runs without a claim, and says so);
 /// [`Error::Stopped`]: an interrupt ended the wait (the caller ends as NOT RUN);
 /// [`Error::Stuck`]: the wait gave up behind holders that made no progress
@@ -251,6 +271,9 @@ pub fn admit_on(
         if let Some(after) = run.stuck_ends {
             need = need.ends_when_stuck(after);
         }
+        if run.scratch {
+            need = need.scratch();
+        }
         let why = format!("disk: claims {estimate}");
         let mut told = false;
         let admitted = admit_relieved(
@@ -267,7 +290,7 @@ pub fn admit_on(
                 say(line);
             },
         );
-        if matches!(admitted, Err(Error::Never(_))) && !told {
+        if matches!(admitted, Err(Error::Never(_) | Error::Unmet { .. })) && !told {
             say(&why);
         }
         Some(admitted?)
@@ -351,7 +374,8 @@ impl Whole {
 /// largest holders its lines name, as every wait does ([`Reclaim::live`]).
 ///
 /// # Errors
-/// As [`admit`]: [`Error::Never`], [`Error::Ledger`], [`Error::Stopped`], [`Error::Stuck`].
+/// As [`admit`]: [`Error::Never`], [`Error::Unmet`], [`Error::Ledger`], [`Error::Stopped`],
+/// [`Error::Stuck`].
 pub fn admit_sized(
     run: SizedClaim,
     mode: Admit,
@@ -403,7 +427,7 @@ pub fn admit_sized_on(
         }
         say(line);
     });
-    if matches!(admitted, Err(Error::Never(_))) && !told {
+    if matches!(admitted, Err(Error::Never(_) | Error::Unmet { .. })) && !told {
         say(&why);
     }
     let claim = admitted?;
@@ -492,8 +516,8 @@ struct Sizing<'a> {
 
 /// What a run claims when its directories, tagged `tag`, hold `holds` and it builds `scope`: what
 /// its kind's runs on them (`kept`) bound ([`Footprints::need`]), or, with none of its scope, what
-/// the machine's runs (`across`: its record, and the run's selection and the words that add
-/// work) bound where lower ([`Estimate::or_machine`]).
+/// the machine's runs (`across`: its record and the run's selection) bound where lower
+/// ([`Estimate::or_machine`]).
 fn need_of(
     kept: &Footprints,
     across: Option<&(MachineFootprints, Machinewide)>,
@@ -503,7 +527,7 @@ fn need_of(
     scope: Option<u64>,
 ) -> Estimate {
     kept.need(holds, cold, tag, scope)
-        .or_machine(across.and_then(|(m, w)| m.cover_by(&w.selection, holds, cold, &w.more)))
+        .or_machine(across.and_then(|(m, w)| m.cover(&w.selection, holds, cold)))
 }
 
 impl Relief for Sizing<'_> {
@@ -860,6 +884,7 @@ fn disk_short(short: &Shortfall) -> Option<(u64, PathBuf, u64, u64, u64)> {
             floor,
             reserved,
             above_floor,
+            ..
         } => Some((*need, mount.clone(), *floor, *reserved, *above_floor)),
         _ => None,
     })

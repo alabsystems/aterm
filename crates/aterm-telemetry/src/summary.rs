@@ -345,6 +345,7 @@ pub fn render_json(reading: &Reading, since_ms: Option<u64>, dir: &str, rows: bo
                     "dir": r.dir.map(crate::row::Digest::hex),
                     "label": r.label,
                     "sid": r.sid,
+                    "on": r.on,
                     "host": r.host,
                     "facts": r.facts.hex(),
                     "wall_ms": fig_json(&r.wall_ms),

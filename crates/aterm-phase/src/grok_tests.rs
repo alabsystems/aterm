@@ -218,7 +218,19 @@ fn the_signed_out_screen_is_grok_s_own_and_its_sign_in_wall() {
     assert_eq!(identify(None, &rows).program(), Program::Grok);
     let r = read(Some("grok"), &rows, None);
     assert_eq!(r.program, Program::Grok);
-    assert!(!r.phase_authoritative, "no busy or idle screen is measured");
+    assert!(r.phase_authoritative, "its sign-in wall decides it");
+    // CONTROL: the same screen with no `Waiting for approval...` under the approval row draws no
+    // sign-in wall, and with no composer drawn nothing else decides its phase.
+    let unwalled: Vec<String> = rows
+        .iter()
+        .filter(|r| !r.contains("Waiting for approval"))
+        .cloned()
+        .collect();
+    assert_eq!(wall(&unwalled), None, "CONTROL: no sign-in wall");
+    assert!(
+        !read(Some("grok"), &unwalled, None).phase_authoritative,
+        "CONTROL: nothing decides it"
+    );
 
     // Negative: the same rows without its key row are not claimed by the sniff (the name still
     // reads them), and a shell screen stays the generic program's.
@@ -562,7 +574,7 @@ fn its_composer_box_claims_no_other_programs_screen() {
     }
     assert!(claimed > 30, "{claimed} box frames identify by screen");
     assert_eq!(
-        panel_only, 6,
+        panel_only, 8,
         "the upsell, question and approval cards with no composer"
     );
     assert!(unclaimed > 0, "frames with nothing to tell them by stand");
@@ -666,4 +678,480 @@ fn the_measured_walls_are_read_where_they_stand() {
         superseded.insert(at + 2 + n, format!("the reply went on, line {n} of it"));
     }
     assert_eq!(wall(&superseded), None, "CONTROL: superseded");
+}
+
+/// Every Grok Build fixture by name, with the phase its rows decide and whether they decide it
+/// (`phase`): the measured 1.0.70 frames, and the hand-built walls and replies. A new fixture
+/// needs its row here.
+const PHASES: &[(&str, Phase, bool)] = &[
+    ("box-shell", Phase::Prompt, true),
+    ("box-shell-approved", Phase::Idle, true),
+    ("box-shell-ctrl-c", Phase::Idle, true),
+    ("box-shell-denied", Phase::Idle, true),
+    ("box-shell-escape", Phase::Prompt, true),
+    ("box-shell-narrow", Phase::Prompt, true),
+    ("box-write", Phase::Prompt, true),
+    ("box-write-narrow", Phase::Prompt, true),
+    ("box-write-approved", Phase::Idle, true),
+    ("busy-ctrl-c-cancelled", Phase::Idle, true),
+    ("busy-ctrl-c-queued", Phase::Busy, true),
+    ("busy-ctrl-c-task", Phase::Idle, true),
+    ("busy-draft", Phase::Busy, true),
+    ("busy-escape", Phase::Busy, true),
+    ("busy-queued", Phase::Busy, true),
+    ("busy-streaming", Phase::Busy, true),
+    ("busy-waiting", Phase::Busy, true),
+    ("draft-ctrl-c", Phase::Idle, true),
+    ("draft-multiline-typed", Phase::Idle, true),
+    ("draft-paste-multiline", Phase::Idle, true),
+    ("hand-built-reply-quotes-login-ended", Phase::Idle, false),
+    ("hand-built-reply-quotes-rate-limit", Phase::Idle, false),
+    ("hand-built-reply-quotes-upsell", Phase::Idle, false),
+    ("hand-built-wall-auth-token-invalid", Phase::Idle, true),
+    ("hand-built-wall-credit-limit", Phase::Idle, true),
+    ("hand-built-wall-plan-rate-limit", Phase::Idle, true),
+    ("hand-built-wall-weekly-limit", Phase::Idle, true),
+    ("idle-background-task", Phase::Idle, true),
+    ("idle-ctrl-c", Phase::Idle, true),
+    ("idle-draft", Phase::Idle, true),
+    ("idle-empty", Phase::Idle, true),
+    ("plan-a-typed-approves", Phase::Idle, true),
+    ("plan-approval", Phase::Prompt, true),
+    ("plan-approval-empty", Phase::Prompt, true),
+    ("plan-approved", Phase::Idle, true),
+    ("plan-request-changes", Phase::Prompt, true),
+    ("question", Phase::Prompt, true),
+    ("question-answered", Phase::Idle, true),
+    ("question-dismissed", Phase::Idle, true),
+    ("quit-clean", Phase::Idle, false),
+    ("quit-press-again", Phase::Idle, true),
+    ("quit-sigkill", Phase::Idle, false),
+    ("quit-sigterm", Phase::Idle, false),
+    ("resume-id", Phase::Idle, true),
+    ("resume-last", Phase::Idle, true),
+    ("resume-unknown-id", Phase::Idle, false),
+    ("signed-out", Phase::Idle, true),
+    ("suggestion-accepted", Phase::Idle, true),
+    ("turn-ended-empty", Phase::Idle, true),
+    ("turn-ended-queued", Phase::Idle, true),
+    ("turn-ended-suggestion", Phase::Idle, true),
+    ("wall-401", Phase::Idle, true),
+    ("wall-429", Phase::Idle, true),
+    ("wall-429-retrying", Phase::Idle, true),
+    ("wall-free-usage", Phase::Idle, true),
+    ("wall-free-usage-dismissed", Phase::Idle, true),
+    ("wall-weekly-limit", Phase::Idle, true),
+];
+
+/// The screen of the Grok Build fixture `name` (`grok-1.0.70-<name>.txt`).
+fn frame(name: &str) -> Vec<String> {
+    let path = aterm_tempfile::manifest_dir().join(format!("src/fixtures/grok-1.0.70-{name}.txt"));
+    screen(&std::fs::read_to_string(&path).expect("the fixture"))
+}
+
+/// EVERY GROK BUILD FRAME READS THE PHASE ITS OWN ROWS DECIDE (measured on 1.0.70 at 144 columns,
+/// and two approval cards at 70):
+/// a running turn's frames (streaming, waiting for the first byte, a draft or a queued message
+/// under it, Esc pressed, a queued message started by a cancel) are busy by the status row over
+/// the composer's box ending `[stop]` and the key row under it offering `Ctrl+c:cancel`, and read
+/// no wall; every frame a turn ended on (a reply, a cancel, a denial, a background task left
+/// running, a resume, a 401's or a 429's failure) is idle; the sign-in screen and the upsells in
+/// the composer's place are decided by their walls. The cards a turn raises in the box's place
+/// (a permission, a question, also with the focus given to the scrollback) and a plan approval,
+/// in either focus, are prompts, each read as its box, and no other frame reads a box. The
+/// shell's frames after an exit, the hand-built replies that quote walls and the read with no
+/// screen decide nothing. Display only: neither program is supervised.
+#[test]
+fn every_grok_frame_reads_the_phase_its_own_rows_decide() {
+    let names: std::collections::BTreeSet<String> = crate::text::fixture_files()
+        .into_iter()
+        .filter_map(|(name, _)| {
+            name.strip_prefix("grok-1.0.70-")
+                .and_then(|n| n.strip_suffix(".txt"))
+                .map(str::to_string)
+        })
+        .collect();
+    let table: std::collections::BTreeSet<String> =
+        PHASES.iter().map(|(n, ..)| (*n).to_string()).collect();
+    assert_eq!(names, table, "every fixture has its decided phase");
+    for (name, want, decided) in PHASES {
+        let rows = frame(name);
+        assert_eq!(phase(&rows), (want.clone(), *decided), "{name}");
+        let r = read(Some("grok"), &rows, None);
+        assert_eq!(
+            (r.phase.clone(), r.phase_authoritative),
+            (want.clone(), *decided),
+            "{name}: the reading"
+        );
+        if *want == Phase::Busy {
+            assert_eq!(r.wall, None, "{name}: a running turn reads no wall");
+        }
+        if *want == Phase::Prompt {
+            assert!(r.prompt.is_some(), "{name}: the box");
+            assert_eq!(r.wall, None, "{name}: a box reads no wall");
+        } else {
+            assert_eq!(prompt(&rows), None, "{name}: no box");
+        }
+    }
+    assert!(
+        PHASES
+            .iter()
+            .filter(|(_, p, d)| *p == Phase::Busy && *d)
+            .count()
+            >= 6,
+        "the busy frames"
+    );
+    assert_eq!(
+        read(Some("grok"), &frame("wall-weekly-limit"), None)
+            .wall
+            .map(|w| w.kind),
+        Some(WallKind::UsageWeekly),
+        "an upsell decides by its wall"
+    );
+    assert_eq!(
+        phase(&[]),
+        (Phase::Idle, false),
+        "no screen decides nothing"
+    );
+    assert!(!Program::Grok.supervisable(), "display only (D23)");
+}
+
+/// THE BUSY ROWS COUNT ONLY WHERE THEY STAND AROUND THE BOX: a reply that quotes a running turn's
+/// status row and its key row, high in an ended turn's transcript, is no busy turn.
+/// NEGATIVE CONTROL for the mutant that reads `[stop]` or `Ctrl+c:cancel` off any row of the
+/// screen.
+#[test]
+fn busy_rows_quoted_in_a_reply_are_no_running_turn() {
+    let mut rows = frame("turn-ended-empty");
+    let at = rows
+        .iter()
+        .position(|r| r.contains("Worked for"))
+        .expect("the turn's end");
+    rows.splice(
+        at..at,
+        [
+            "     It drew this while the turn ran:".to_string(),
+            "    ⠋ Responding… 8.9s        10.0s ⇣11.6k [stop]".to_string(),
+            "  Shift+Tab:mode  │  Ctrl+c:cancel  │  Ctrl+x:shortcuts".to_string(),
+            String::new(),
+        ],
+    );
+    assert!(composer_rows(&rows).is_some(), "PRECONDITION: the box");
+    assert_eq!(phase(&rows), (Phase::Idle, true));
+    // CONTROL: the same status row right over the box, and that key row under it, are a turn's.
+    let (top, _, bottom) = composer_rows(&rows).expect("the box");
+    let mut running = rows.clone();
+    running[bottom + 2] = "  Shift+Tab:mode  │  Ctrl+c:cancel  │  Ctrl+x:shortcuts".to_string();
+    running[top - 2] = "    ⠋ Responding… 8.9s        10.0s ⇣11.6k [stop]".to_string();
+    assert_eq!(phase(&running), (Phase::Busy, true), "CONTROL");
+}
+
+/// A BUSY ROW THE BUILD NO LONGER DRAWS DECIDES NOTHING, NEVER A WRONG PHASE: a running turn's
+/// frame whose `[stop]`, whose `Ctrl+c:cancel`, or whose both are spelled otherwise reads no
+/// phase as evidence (the spinner still opens its status row). NEGATIVE CONTROL for the mutants
+/// that take either signal alone for a running turn or the absence of both for an idle one.
+#[test]
+fn a_busy_anchor_the_build_no_longer_draws_decides_nothing() {
+    let busy = frame("busy-streaming");
+    assert_eq!(phase(&busy), (Phase::Busy, true), "PRECONDITION");
+    let respelled = |from: &[&str], to: &[&str]| -> Vec<String> {
+        busy.iter()
+            .map(|r| {
+                from.iter()
+                    .zip(to)
+                    .fold(r.clone(), |row, (f, t)| row.replace(f, t))
+            })
+            .collect()
+    };
+    for (what, rows) in [
+        ("[stop] respelled", respelled(&["[stop]"], &["[halt]"])),
+        (
+            "Ctrl+c:cancel respelled",
+            respelled(&["Ctrl+c:cancel"], &["Ctrl+c:abort"]),
+        ),
+        (
+            "both respelled",
+            respelled(&["[stop]", "Ctrl+c:cancel"], &["[halt]", "Ctrl+c:abort"]),
+        ),
+    ] {
+        assert!(!phase(&rows).1, "{what}");
+        assert!(
+            !read(Some("grok"), &rows, None).phase_authoritative,
+            "{what}: the reading"
+        );
+    }
+}
+
+/// NO OTHER PROGRAM'S FRAME DECIDES A PHASE THROUGH GROK BUILD'S READING: over the whole fixture
+/// corpus, every frame of another program reads nothing as evidence by `phase`. CONTROL: Grok
+/// Build's own frames decide theirs (`every_grok_frame_reads_the_phase_its_own_rows_decide`).
+#[test]
+fn no_other_programs_frame_decides_a_grok_phase() {
+    let mut others = 0usize;
+    for (name, text) in crate::text::fixture_files() {
+        if name.starts_with("grok-") || !name.ends_with(".txt") {
+            continue;
+        }
+        others += 1;
+        assert!(!phase(&screen(&text)).1, "{name}");
+    }
+    assert!(others > 1000, "{others} other programs' frames");
+}
+
+/// A CARD A RUNNING TURN RAISED STANDS OVER AN EARLIER TURN'S WALL ROW AND IS A PROMPT WITH NO
+/// WALL: a question card whose live zone still holds a 401's failure from a turn before
+/// (HAND-BUILT from the measured question and 401 frames) is no wall to publish, since the card's
+/// turn runs (its status row ends `[stop]`) and waits on it. CONTROL: the upsell drawn in the
+/// composer's place, with no turn running, decides by its wall. NEGATIVE CONTROL for the mutant
+/// that lets any wall decide a screen with no composer.
+#[test]
+fn a_card_over_an_earlier_turns_wall_row_is_a_prompt_with_no_wall() {
+    let failure = frame("wall-401");
+    let failed: Vec<String> = failure
+        .iter()
+        .filter(|r| r.contains('┃'))
+        .cloned()
+        .collect();
+    assert!(!failed.is_empty(), "PRECONDITION: the 401's rows");
+    let mut rows = frame("question");
+    let status = rows
+        .iter()
+        .position(|r| r.contains("Waiting on answers"))
+        .expect("the card's status row");
+    rows.splice(status - 1..status - 1, failed);
+    assert_eq!(
+        wall(&rows).map(|w| w.kind),
+        Some(WallKind::Auth),
+        "PRECONDITION: the wall reader sees the earlier failure"
+    );
+    assert_eq!(phase(&rows), (Phase::Prompt, true));
+    let r = read(Some("grok"), &rows, None);
+    assert_eq!(r.wall, None);
+    assert_eq!(r.prompt.map(|p| p.kind), Some(PromptKind::Question));
+    assert_eq!(
+        Program::Grok.reader().wall(&rows),
+        None,
+        "nor by the reader's own wall"
+    );
+    assert_eq!(
+        phase(&frame("wall-free-usage")),
+        (Phase::Idle, true),
+        "CONTROL"
+    );
+}
+
+/// The options of `p` as `(number, label, focused)`.
+fn options(p: &PromptV2) -> Vec<(Option<u8>, &str, bool)> {
+    p.options
+        .iter()
+        .map(|o| (o.n, o.label.as_str(), o.focused))
+        .collect()
+}
+
+/// EACH CARD READS AS THE BOX IT DRAWS (measured on 1.0.70 at 144 columns): the shell command's
+/// approval is a Bash box whose command is its gutter rows (the read-only rule reads it), with
+/// the focus left in the scrollback too; the file's approval is an Edit box naming its path; the
+/// question's options are its radio rows up to each one's description, the write-in keyed by a
+/// letter, none taken; every card is picked by its digits and offers no Esc that cancels it. The
+/// plan approval, in either focus, is a plan's box that lists no option (its answers are letter
+/// keys). No option carries a role: nothing answers these boxes.
+#[test]
+fn each_card_reads_as_the_box_it_draws() {
+    let shell = prompt(&frame("box-shell")).expect("the shell card");
+    assert_eq!(shell.kind, PromptKind::Bash);
+    assert_eq!(shell.title, "Remove the lab file.");
+    assert_eq!(shell.command, "rm lab-made.txt");
+    assert_eq!(shell.command_rows, vec!["rm lab-made.txt"]);
+    assert!(shell.gutter);
+    assert_eq!(shell.readings(), vec!["rm lab-made.txt"]);
+    assert_eq!(
+        options(&shell),
+        vec![
+            (
+                Some(1),
+                "Yes, and don't ask again for anything (always-approve mode)",
+                false
+            ),
+            (Some(2), "Always allow: rm lab-made.txt", false),
+            (Some(3), "Yes, proceed", true),
+            (Some(4), "No, reject (type to add feedback)", false),
+            (Some(5), "Never allow: rm lab-made.txt", false),
+        ]
+    );
+    assert_eq!(shell.select, Select::Digits);
+    assert_eq!(shell.cancel, None);
+    assert!(
+        shell
+            .footer
+            .as_deref()
+            .is_some_and(|f| f.starts_with("1/5:select"))
+    );
+    assert!(shell.options.iter().all(|o| o.role == Role::Other));
+
+    let parked = prompt(&frame("box-shell-escape")).expect("the card, its focus parked");
+    assert_eq!(
+        (parked.kind, parked.command.as_str()),
+        (PromptKind::Bash, "rm -r cache-dir")
+    );
+    assert_eq!(
+        parked.focused().map(|o| o.n),
+        Some(Some(3)),
+        "the taken option stays"
+    );
+
+    // At 70 columns 1.0.70 cuts the card's key row short of `Esc:scrollback`, its title to one
+    // row and an option's words at the edge: the card reads by its key row's opening hints.
+    let narrow = prompt(&frame("box-shell-narrow")).expect("the shell card at 70 columns");
+    assert_eq!(
+        (narrow.kind, narrow.command.as_str()),
+        (PromptKind::Bash, "rm -rf build-output")
+    );
+    assert_eq!(narrow.options.len(), 5);
+    assert_eq!(narrow.focused().map(|o| o.n), Some(Some(3)));
+    assert!(narrow.title.ends_with('…'), "{}", narrow.title);
+    let narrow = prompt(&frame("box-write-narrow")).expect("the file card at 70 columns");
+    assert_eq!(
+        (narrow.kind, narrow.command.as_str(), narrow.path),
+        (
+            PromptKind::Edit,
+            "/private/tmp/at.lab0…/notes-for-the-lab.txt",
+            None
+        ),
+        "a path shortened in its middle names no file"
+    );
+
+    // An approval's option is read whole: what it names may hold two spaces of its own.
+    let spaced: Vec<String> = frame("box-shell")
+        .iter()
+        .map(|r| r.replace("rm lab-made.txt", "rm 'a  b.txt'"))
+        .collect();
+    let spaced = prompt(&spaced).expect("the shell card");
+    assert_eq!(spaced.command, "rm 'a  b.txt'");
+    assert_eq!(
+        options(&spaced)[1..],
+        [
+            (Some(2), "Always allow: rm 'a  b.txt'", false),
+            (Some(3), "Yes, proceed", true),
+            (Some(4), "No, reject (type to add feedback)", false),
+            (Some(5), "Never allow: rm 'a  b.txt'", false),
+        ]
+    );
+
+    let write = prompt(&frame("box-write")).expect("the file card");
+    assert_eq!(write.kind, PromptKind::Edit);
+    assert_eq!(
+        write.path.as_deref(),
+        Some("/private/tmp/at.lab0/proj/notes.txt")
+    );
+    assert_eq!(write.command, "/private/tmp/at.lab0/proj/notes.txt");
+    assert!(write.command_rows.is_empty());
+    assert_eq!(write.options.len(), 4);
+    assert_eq!(write.focused().map(|o| o.label.as_str()), Some("Yes"));
+
+    let question = prompt(&frame("question")).expect("the question card");
+    assert_eq!(question.kind, PromptKind::Question);
+    assert_eq!(question.title, "Which test runner should the lab use?");
+    assert_eq!(question.description, question.title);
+    assert_eq!(question.command, "");
+    assert_eq!(
+        options(&question),
+        vec![
+            (Some(1), "targo test", false),
+            (Some(2), "lab selftest", false),
+            (None, "Type your answer here", false),
+        ]
+    );
+
+    for (name, title) in [
+        ("plan-approval", "Waiting on plan approval"),
+        (
+            "plan-approval-empty",
+            "No plan written: approve or request changes",
+        ),
+        ("plan-request-changes", "Waiting on plan approval"),
+    ] {
+        let plan = prompt(&frame(name)).expect(name);
+        assert_eq!(plan.kind, PromptKind::PlanExit, "{name}");
+        assert_eq!(plan.title, title, "{name}");
+        assert!(plan.options.is_empty(), "{name}");
+        assert!(
+            plan.footer
+                .as_deref()
+                .is_some_and(|f| f.contains("a:approve")),
+            "{name}"
+        );
+    }
+}
+
+/// A CARD IS A PROMPT ONLY WITH ITS TURN RUNNING AND ITS KEY ROW UNDER IT: the measured shell
+/// card with its status row's `[stop]` taken away (as an upsell stands, its turn ended), with its
+/// key row taken away, or with a reply's row between the bar and the key row, reads no box; the
+/// plan approval's box whose key row offers no `a:approve` decides nothing. NEGATIVE CONTROL for
+/// the mutants that read a box off the bar's radio rows alone, or off the plan approval's edge
+/// alone.
+#[test]
+fn a_card_is_a_prompt_only_with_its_turn_running_and_its_key_row_under_it() {
+    let card = frame("box-shell");
+    assert_eq!(phase(&card), (Phase::Prompt, true), "PRECONDITION");
+    let stopped: Vec<String> = card.iter().map(|r| r.replace("[stop]", "")).collect();
+    assert_eq!(prompt(&stopped), None, "no turn running");
+    assert_ne!(phase(&stopped).0, Phase::Prompt);
+    let keys = card
+        .iter()
+        .rposition(|r| r.contains("Esc:scrollback"))
+        .expect("the key row");
+    let mut keyless = card.clone();
+    keyless[keys] = String::new();
+    assert_eq!(prompt(&keyless), None, "no key row");
+    let mut parted = card.clone();
+    parted.insert(keys, "     a reply's row".to_string());
+    assert_eq!(
+        prompt(&parted),
+        None,
+        "a row between the bar and the key row"
+    );
+
+    let plan = frame("plan-approval");
+    let mut unoffered = plan.clone();
+    let offer = unoffered
+        .iter()
+        .rposition(|r| r.contains("a:approve"))
+        .expect("the plan's key row");
+    unoffered[offer] = unoffered[offer].replace("a:approve", "v:select");
+    assert_eq!(phase(&unoffered), (Phase::Idle, false));
+    assert_eq!(prompt(&unoffered), None);
+}
+
+/// A RUNNING TURN READS NO WALL ITS LIVE ZONE STILL SHOWS FROM A TURN BEFORE: a 401's failure
+/// rows over a running turn's reply (HAND-BUILT from the measured 401 and streaming frames) are
+/// read by the wall reader, but the reading's wall is none and its phase busy. CONTROL: the same
+/// failure under an ended turn is the reading's wall. NEGATIVE CONTROL for the mutant that reads
+/// the wall whatever the phase.
+#[test]
+fn a_running_turn_reads_no_wall_from_a_turn_before() {
+    let failed: Vec<String> = frame("wall-401")
+        .into_iter()
+        .filter(|r| r.contains('┃'))
+        .collect();
+    let mut rows = frame("busy-streaming");
+    let reply = rows
+        .iter()
+        .position(|r| r.contains("tick 1 tick 2"))
+        .expect("the reply");
+    rows.splice(reply..reply, failed);
+    assert_eq!(
+        wall(&rows).map(|w| w.kind),
+        Some(WallKind::Auth),
+        "PRECONDITION: the wall reader sees it"
+    );
+    let r = read(Some("grok"), &rows, None);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Busy, true));
+    assert_eq!(r.wall, None);
+    assert_eq!(
+        read(Some("grok"), &frame("wall-401"), None)
+            .wall
+            .map(|w| w.kind),
+        Some(WallKind::Auth),
+        "CONTROL"
+    );
 }

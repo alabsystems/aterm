@@ -7,49 +7,245 @@
 //! this Mac is.
 //!
 //! The event loop reads no file for it: [`latest`] answers the place the last background read
-//! made, and a read older than [`aterm_netplace::keeper::CACHE_FOR`] starts the next on a thread
-//! of its own; paint, on the render thread, takes [`cached`], which starts nothing. [`start`]
-//! starts this process's keeper candidate, the first read, and the follow lane that reads the
-//! place every `FOLLOW_EVERY` and marks the away entry's change for the event loop
+//! made, and a read older than [`aterm_netplace::keeper::CACHE_FOR`] requests the next from its
+//! sole observation owner; paint takes [`cached`], which requests nothing. [`start`]
+//! starts this process's keeper candidate and registers the window with the owner that reads the
+//! place within `FOLLOW_EVERY` or at its earlier dwell deadline and wakes the event loop on
+//! an away-key transition
 //! ([`App::follow_network_place`]: one Info fact in the exceptions digest while this Mac is away
 //! from the ALab LAN, none once it is back; never an alert, never NEEDS YOU). A unit test reads
 //! nothing of the person's: it sees only the place it held ([`hold`]), on its own thread.
 
-#[cfg(all(unix, not(test)))]
-use std::sync::Mutex;
-#[cfg(all(unix, not(test)))]
+use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::{Condvar, Mutex};
+#[cfg(unix)]
 use std::time::Instant;
 
 use aterm_netplace::Place;
 use aterm_netplace::words::{self, Words};
-#[cfg(all(unix, not(test)))]
+#[cfg(unix)]
 use aterm_types::MutexExt as _;
 
-/// The last place read, when it was read, and whether a read is out.
-#[cfg(all(unix, not(test)))]
+/// The sole observer's accepted snapshot, pending request and notification state.
+#[cfg(unix)]
 struct Desk {
-    place: Option<Place>,
+    place: Option<Arc<Place>>,
     read_at: Option<Instant>,
-    out: bool,
+    retry_at: Option<Instant>,
+    running: bool,
+    requested: bool,
+    closed: bool,
+    changed: bool,
+    following: FollowState,
+    notice: Option<Arc<Notice>>,
+}
+
+#[cfg(unix)]
+enum Notice {
+    #[cfg(all(unix, not(test)))]
+    Window(aterm_window::event_loop::EventLoopProxy<crate::Wake>),
+    #[cfg(test)]
+    Test(std::sync::mpsc::Sender<()>),
+}
+
+#[cfg(unix)]
+impl Notice {
+    fn send(&self) -> bool {
+        match self {
+            #[cfg(all(unix, not(test)))]
+            Self::Window(proxy) => proxy.send_event(crate::Wake::NetworkPlaceChanged).is_ok(),
+            #[cfg(test)]
+            Self::Test(sender) => sender.send(()).is_ok(),
+        }
+    }
+}
+
+#[cfg(unix)]
+struct ObservationDesk {
+    state: Mutex<Desk>,
+    wake: Condvar,
+}
+
+#[cfg(unix)]
+impl ObservationDesk {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(Desk {
+                place: None,
+                read_at: None,
+                retry_at: None,
+                running: false,
+                requested: false,
+                closed: false,
+                changed: true,
+                following: FollowState {
+                    stated: None,
+                    next_change_ms: None,
+                },
+                notice: None,
+            }),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn register(&self, notice: Notice) {
+        let notice = Arc::new(notice);
+        let pending = {
+            let mut held = self.state.lock_or_recover();
+            if held.closed {
+                return;
+            }
+            held.notice = Some(Arc::clone(&notice));
+            self.wake.notify_one();
+            held.changed
+        };
+        if pending {
+            self.notify(&notice);
+        }
+    }
+
+    fn notify(&self, notice: &Arc<Notice>) {
+        if !notice.send() {
+            let mut held = self.state.lock_or_recover();
+            if held
+                .notice
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, notice))
+            {
+                held.notice = None;
+            }
+        }
+    }
+
+    fn close(&self) {
+        let mut held = self.state.lock_or_recover();
+        held.closed = true;
+        held.notice = None;
+        self.wake.notify_one();
+    }
+
+    fn take_change(&self) -> Option<Option<Arc<Place>>> {
+        let mut held = self.state.lock_or_recover();
+        if !std::mem::take(&mut held.changed) {
+            return None;
+        }
+        Some(held.place.clone())
+    }
+
+    fn request(&self) -> (Option<Arc<Place>>, bool) {
+        let mut held = self.state.lock_or_recover();
+        if held.closed {
+            return (held.place.clone(), false);
+        }
+        let now = Instant::now();
+        if held
+            .read_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= aterm_netplace::keeper::CACHE_FOR)
+        {
+            held.requested = true;
+            self.wake.notify_one();
+        }
+        let start = !held.running && held.retry_at.is_none_or(|at| now >= at);
+        if start {
+            held.running = true;
+        }
+        (held.place.clone(), start)
+    }
+
+    fn failed_start(&self) {
+        let mut held = self.state.lock_or_recover();
+        held.running = false;
+        held.retry_at = Some(Instant::now() + aterm_netplace::keeper::CACHE_FOR);
+    }
+
+    /// One owner alone performs reads. Requests arriving during I/O remain latched.
+    fn run(&self, mut read: impl FnMut() -> Arc<Place>) {
+        struct Running<'a>(&'a ObservationDesk);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                let mut held = self.0.state.lock_or_recover();
+                held.running = false;
+                held.retry_at = Some(Instant::now() + aterm_netplace::keeper::CACHE_FOR);
+                self.0.wake.notify_one();
+            }
+        }
+        let _running = Running(self);
+        loop {
+            let observed_at = {
+                let mut held = self.state.lock_or_recover();
+                loop {
+                    if held.closed {
+                        return;
+                    }
+                    if !held.requested && held.notice.is_none() {
+                        held = self
+                            .wake
+                            .wait(held)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        continue;
+                    }
+                    let now = Instant::now();
+                    let external = held.read_at.map_or(std::time::Duration::ZERO, |at| {
+                        FOLLOW_EVERY.saturating_sub(now.saturating_duration_since(at))
+                    });
+                    let wait = held
+                        .following
+                        .wait(aterm_netplace::unix_ms_now())
+                        .min(external);
+                    if held.requested || wait.is_zero() {
+                        held.requested = false;
+                        break now;
+                    }
+                    held = self
+                        .wake
+                        .wait_timeout(held, wait)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .0;
+                }
+            };
+            let place = read();
+            let mut held = self.state.lock_or_recover();
+            if held.closed {
+                return;
+            }
+            let changed = held
+                .following
+                .observe(&place, aterm_netplace::unix_ms_now());
+            held.place = Some(place);
+            held.read_at = Some(observed_at);
+            held.retry_at = None;
+            let notice = if changed {
+                held.changed = true;
+                held.notice.clone()
+            } else {
+                None
+            };
+            drop(held);
+            if let Some(notice) = notice {
+                self.notify(&notice);
+            }
+        }
+    }
 }
 
 #[cfg(all(unix, not(test)))]
-static DESK: Mutex<Desk> = Mutex::new(Desk {
-    place: None,
-    read_at: None,
-    out: false,
-});
+static DESK: ObservationDesk = ObservationDesk::new();
+
+/// No observer runs off Unix, but the first reconciliation must clear a restored old entry.
+#[cfg(all(not(unix), not(test)))]
+static UNKNOWN_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 #[cfg(test)]
 thread_local! {
     /// The place a test holds for its own thread ([`hold`]).
-    static HELD: std::cell::RefCell<Option<Place>> = const { std::cell::RefCell::new(None) };
+    static HELD: std::cell::RefCell<Option<Arc<Place>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// A test's place for the reporters on its own thread.
 #[cfg(test)]
 pub(crate) fn hold(place: Option<Place>) {
-    HELD.with(|held| *held.borrow_mut() = place);
+    HELD.with(|held| *held.borrow_mut() = place.map(Arc::new));
 }
 
 #[cfg(test)]
@@ -68,94 +264,83 @@ pub(crate) fn reads_asked() -> usize {
 
 /// Restore a test thread's prior place, including when its fixture unwinds.
 #[cfg(test)]
-pub(crate) struct HeldPlace(Option<Place>);
+pub(crate) struct HeldPlace(Option<Arc<Place>>);
 
 #[cfg(test)]
 impl Drop for HeldPlace {
     fn drop(&mut self) {
-        hold(self.0.take());
+        HELD.with(|held| *held.borrow_mut() = self.0.take());
     }
 }
 
 #[cfg(test)]
 pub(crate) fn hold_scoped(place: Option<Place>) -> HeldPlace {
-    HeldPlace(HELD.with(|held| held.replace(place)))
+    HeldPlace(HELD.with(|held| held.replace(place.map(Arc::new))))
 }
 
-/// STARTS THE PLACE as aterm starts: this process's keeper candidate over aterm's state root
-/// (`aterm_netplace::keeper::start`, once per process), the first read, and the follow lane
-/// ([`follow`]). A unit test starts none of them: the state root is the person's.
-pub(crate) fn start() {
-    #[cfg(unix)]
-    {
-        if cfg!(test) {
-            return;
-        }
-        let Some(state) = aterm_types::dirs::state_dir() else {
-            return;
-        };
-        let _ = aterm_netplace::keeper::start(&state);
-        let _ = latest();
-        #[cfg(not(test))]
-        follow(state);
+/// Register the window and start this process's keeper candidate. The observation owner may
+/// already serve on-demand reads; registration enables its capped follow schedule and flushes
+/// any accepted pending change. Unit tests compile no startup path: the root is the person's.
+#[cfg(all(unix, not(test)))]
+pub(crate) fn start(proxy: aterm_window::event_loop::EventLoopProxy<crate::Wake>) {
+    let Some(state) = aterm_types::dirs::state_dir() else {
+        return;
+    };
+    let _ = aterm_netplace::keeper::start(&state);
+    DESK.register(Notice::Window(proxy));
+    let _ = latest();
+}
+
+/// The maximum wait before resampling external facts; dwell deadlines can wake sooner.
+#[cfg(any(unix, test))]
+pub(crate) const FOLLOW_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[cfg(any(unix, test))]
+#[derive(Default)]
+struct FollowState {
+    stated: Option<Option<words::AwayKey>>,
+    next_change_ms: Option<u64>,
+}
+
+#[cfg(any(unix, test))]
+impl FollowState {
+    fn observe(&mut self, place: &Place, now_ms: u64) -> bool {
+        let projection = words::away_key_with_deadline(place, now_ms);
+        let changed = self.stated != Some(projection.key);
+        self.stated = Some(projection.key);
+        self.next_change_ms = projection.next_change_ms;
+        changed
+    }
+
+    /// Called with a fresh wall sample after publication and notification effects.
+    fn wait(&self, now_ms: u64) -> std::time::Duration {
+        self.next_change_ms.map_or(FOLLOW_EVERY, |at| {
+            std::time::Duration::from_millis(at.saturating_sub(now_ms)).min(FOLLOW_EVERY)
+        })
     }
 }
 
-/// How often the follow lane reads the place ([`follow`]).
-#[cfg(all(unix, not(test)))]
-pub(crate) const FOLLOW_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Set when the away entry's fact changed since the event loop last stated it.
-static AWAY_CHANGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-/// What the away entry states, as the follow lane compares it: where this Mac is away on, and
-/// since when; `None` while it states nothing.
-#[cfg_attr(
-    all(not(unix), not(test)),
-    expect(
-        dead_code,
-        reason = "the follow lane reads the place's Unix-only files"
-    )
-)]
-fn away_key(place: Option<&Place>, words: &Words<'_>) -> Option<(String, Option<u64>)> {
-    let place = place?;
-    let entry = words::away_entry(place, words)?;
-    let since = match place.alab {
-        aterm_netplace::Alab::Away { since_ms } => since_ms,
-        _ => None,
-    };
-    Some((entry.log, since))
-}
-
-/// THE FOLLOW LANE: a background thread that reads the place every `FOLLOW_EVERY` into the
-/// window's last read ([`latest`]) and marks [`AWAY_CHANGED`] when the away entry's fact moved, so
-/// the event loop restates the exceptions digest's entry at its next turn.
+/// Start the sole observer outside the desk lock. It serves on-demand reads without a window;
+/// a registered window also enables `FOLLOW_EVERY` and earlier dwell boundaries. Each actual
+/// away-key transition wakes that window; internet-only changes generate no notification.
 #[cfg(all(unix, not(test)))]
 fn follow(state: std::path::PathBuf) {
     let started = crate::qos::spawn_lane_thread(
         "aterm-netplace-follow",
         crate::qos::Role::Background,
-        move || {
-            let mut stated: Option<Option<(String, Option<u64>)>> = None;
-            loop {
-                let place = aterm_netplace::read(&state);
-                let key = away_key(Some(&place), &Words::now());
-                {
-                    let mut desk = DESK.lock_or_recover();
-                    desk.place = Some(place);
-                    desk.read_at = Some(Instant::now());
-                }
-                if stated.as_ref() != Some(&key) {
-                    stated = Some(key);
-                    AWAY_CHANGED.store(true, std::sync::atomic::Ordering::Release);
-                }
-                std::thread::sleep(FOLLOW_EVERY);
-            }
-        },
+        move || DESK.run(|| Arc::new(aterm_netplace::read(&state))),
     );
     if let Err(e) = started {
+        DESK.failed_start();
         aterm_log::warn!("network place: the window's follow lane did not start: {e}");
     }
+}
+
+/// Stop notification and further reads when the owning application exits. An in-flight
+/// filesystem read finishes before the worker can retire; this does not join on the GUI.
+#[cfg(all(unix, not(test)))]
+pub(crate) fn stop() {
+    DESK.close();
 }
 
 /// THE AWAY ENTRY (`Family::NetworkPlace`, a level family, Info): one while `place` reads away
@@ -187,11 +372,20 @@ pub(crate) fn away_entries(
 }
 
 impl crate::App {
-    /// The away entry restated when the follow lane marked its fact moved: the whole answer of
-    /// `Family::NetworkPlace` from the place as last read.
+    /// Consume the changed level and its accepted snapshot together, without starting a read.
     pub(crate) fn follow_network_place(&mut self) {
-        if AWAY_CHANGED.swap(false, std::sync::atomic::Ordering::AcqRel) {
-            self.state_network_place(latest().as_ref(), &Words::now());
+        #[cfg(all(unix, not(test)))]
+        self.follow_network_place_on(&DESK, &Words::now());
+        #[cfg(all(not(unix), not(test)))]
+        if UNKNOWN_PENDING.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            self.state_network_place(None, &Words::now());
+        }
+    }
+
+    #[cfg(unix)]
+    fn follow_network_place_on(&mut self, desk: &ObservationDesk, words: &Words<'_>) {
+        if let Some(place) = desk.take_change() {
+            self.state_network_place(place.as_deref(), words);
         }
     }
 
@@ -203,9 +397,10 @@ impl crate::App {
 }
 
 /// The place as last read; `None` until the first read lands, where no state root resolves, or
-/// off Unix. A read older than [`aterm_netplace::keeper::CACHE_FOR`] starts the next one, on a
-/// background thread, and this answers the last meanwhile.
-pub(crate) fn latest() -> Option<Place> {
+/// off Unix. A read older than [`aterm_netplace::keeper::CACHE_FOR`] requests the next one from
+/// the background owner, and this answers the last meanwhile. Readers share an immutable snapshot;
+/// cloning its handle copies no route payload and formatting happens after unlocking the desk.
+pub(crate) fn latest() -> Option<Arc<Place>> {
     #[cfg(test)]
     {
         ASKED.with(|asked| asked.set(asked.get() + 1));
@@ -213,30 +408,15 @@ pub(crate) fn latest() -> Option<Place> {
     }
     #[cfg(all(unix, not(test)))]
     {
-        let mut desk = DESK.lock_or_recover();
-        let due = !desk.out
-            && desk
-                .read_at
-                .is_none_or(|at| at.elapsed() >= aterm_netplace::keeper::CACHE_FOR);
-        if due && let Some(state) = aterm_types::dirs::state_dir() {
-            desk.out = true;
-            let started = crate::qos::spawn_lane_thread(
-                "aterm-netplace-read",
-                crate::qos::Role::Background,
-                move || {
-                    let place = aterm_netplace::read(&state);
-                    let mut desk = DESK.lock_or_recover();
-                    desk.place = Some(place);
-                    desk.read_at = Some(Instant::now());
-                    desk.out = false;
-                },
-            );
-            if started.is_err() {
-                desk.out = false;
-                desk.read_at = Some(Instant::now());
+        let (place, start) = DESK.request();
+        if start {
+            if let Some(state) = aterm_types::dirs::state_dir() {
+                follow(state);
+            } else {
+                DESK.failed_start();
             }
         }
-        desk.place.clone()
+        place
     }
     #[cfg(all(not(unix), not(test)))]
     {
@@ -245,18 +425,18 @@ pub(crate) fn latest() -> Option<Place> {
 }
 
 /// The place as last read, starting no read: what paint takes, which runs on the render thread
-/// and so never spawns a read of its own ([`latest`] does once its read is stale). The follow
+/// and so never requests a read ([`latest`] does once its read is stale). The follow
 /// lane's read every `FOLLOW_EVERY`, and every other caller's [`latest`], keep it current; `None`
 /// until the first read lands, or off Unix. A unit test sees the place it held, and its call is
 /// no read asked ([`reads_asked`]).
-pub(crate) fn cached() -> Option<Place> {
+pub(crate) fn cached() -> Option<Arc<Place>> {
     #[cfg(test)]
     {
         HELD.with(|held| held.borrow().clone())
     }
     #[cfg(all(unix, not(test)))]
     {
-        DESK.lock_or_recover().place.clone()
+        DESK.state.lock_or_recover().place.clone()
     }
     #[cfg(all(not(unix), not(test)))]
     {
@@ -264,14 +444,19 @@ pub(crate) fn cached() -> Option<Place> {
     }
 }
 
-/// `status`'s network fields for `place` ([`words::status_fields`]); every value `-` with none.
-pub(crate) fn status_fields_of(place: Option<&Place>) -> String {
-    place.map_or_else(|| words::STATUS_UNKNOWN.to_owned(), words::status_fields)
+/// `status`'s network fields for `place` and the lab's `seats` ([`words::status_fields`]); every
+/// value `-` with no place.
+pub(crate) fn status_fields_of(place: Option<&Place>, seats: Option<&words::Seats>) -> String {
+    place.map_or_else(
+        || words::STATUS_UNKNOWN.to_owned(),
+        |place| words::status_fields(place, seats),
+    )
 }
 
-/// `status`'s network fields now.
-pub(crate) fn status_fields() -> String {
-    status_fields_of(latest().as_ref())
+/// `status`'s network fields now, `seats` the fleet glance's last read of this Mac's copy
+/// (`fleet_glance::FleetGlance::seats`).
+pub(crate) fn status_fields(seats: Option<&words::Seats>) -> String {
+    status_fields_of(latest().as_deref(), seats)
 }
 
 /// One place JSON value as `sys` prints it.

@@ -232,6 +232,14 @@ pub enum Kind {
     Spawn,
     /// A claim on the machine's capacity (aterm-capacity's ledger).
     Admission,
+    /// A build a claim in this user's ledger held, from its admission to its end (atpkg's
+    /// build admission; every verb but `test`).
+    Build,
+    /// A test run a claim in this user's ledger held (the verb `test`), as for [`Self::Build`].
+    Test,
+    /// A worker a fleet spawn from this Mac started, from its spawn to the close of its board
+    /// row with its Mac's own record.
+    Task,
     /// A kind a newer writer knows: kept and counted under its word.
     Other(String),
 }
@@ -245,6 +253,9 @@ impl Kind {
             Self::AgentCall => "agent-call",
             Self::Spawn => "spawn",
             Self::Admission => "admission",
+            Self::Build => "build",
+            Self::Test => "test",
+            Self::Task => "task",
             Self::Other(w) => w,
         }
     }
@@ -256,6 +267,9 @@ enum KindRef<'a> {
     AgentCall,
     Spawn,
     Admission,
+    Build,
+    Test,
+    Task,
     Other(&'a str),
 }
 
@@ -266,6 +280,9 @@ impl<'a> KindRef<'a> {
             "agent-call" => Self::AgentCall,
             "spawn" => Self::Spawn,
             "admission" => Self::Admission,
+            "build" => Self::Build,
+            "test" => Self::Test,
+            "task" => Self::Task,
             // The log's own lines are no action.
             "host" | "gap" => return None,
             w if is_word(w) => Self::Other(w),
@@ -279,6 +296,9 @@ impl<'a> KindRef<'a> {
             Self::AgentCall => Kind::AgentCall,
             Self::Spawn => Kind::Spawn,
             Self::Admission => Kind::Admission,
+            Self::Build => Kind::Build,
+            Self::Test => Kind::Test,
+            Self::Task => Kind::Task,
             Self::Other(w) => Kind::Other(w.to_owned()),
         }
     }
@@ -358,7 +378,8 @@ pub enum Stop {
     Exit,
     /// A signal ended it (`sig=` the signal).
     Signal,
-    /// The jobs engine judged it stuck at its last reading before it ended.
+    /// The jobs engine judged it stuck at its last reading before it ended, or (a task) its
+    /// worker stalled.
     Stalled,
     /// Something killed it under memory pressure.
     Pressure,
@@ -453,6 +474,10 @@ pub struct Row {
     pub label: String,
     /// The aterm session it ran in, where one.
     pub sid: Option<String>,
+    /// The fleet node id of the Mac it ran on, where that is another Mac than the one writing
+    /// (a worker this Mac spawned over the fleet): `on=`, written only when known, which a
+    /// reader that predates it skips as it skips any key it does not know.
+    pub on: Option<String>,
     /// The host's name ([`host_word`]).
     pub host: String,
     /// The host-facts digest ([`crate::facts::HostFacts::digest`]).
@@ -637,6 +662,10 @@ impl Row {
             Some(s) if !s.is_empty() => push_word_of(b, s, 64),
             _ => b.push('-'),
         }
+        if let Some(on) = self.on.as_deref().filter(|on| !on.is_empty()) {
+            b.push_str(" on=");
+            push_word_of(b, on, 64);
+        }
         b.push_str(" host=");
         let first = self.host.trim().split('.').next().unwrap_or("");
         if first.is_empty() {
@@ -773,6 +802,7 @@ struct RowRef<'a> {
     dir: Option<Digest>,
     label: &'a str,
     sid: Option<&'a str>,
+    on: Option<&'a str>,
     host: &'a str,
     facts: Digest,
     wall_ms: FigRef<'a, u64>,
@@ -796,6 +826,7 @@ impl<'a> RowRef<'a> {
             dir: self.dir,
             label: self.label.to_owned(),
             sid: self.sid.map(str::to_owned),
+            on: self.on.map(str::to_owned),
             host: self.host.to_owned(),
             facts: self.facts,
             wall_ms: self.wall_ms.into_owned(),
@@ -825,6 +856,7 @@ fn parse_row_ref<'a>(
     let mut dir_w = None;
     let mut label_w = None;
     let mut sid_w = None;
+    let mut on_w = None;
     let mut host_w = None;
     let mut facts_w = None;
     let mut wall_ms_w = None;
@@ -850,6 +882,9 @@ fn parse_row_ref<'a>(
             }
             "sid" => {
                 sid_w.get_or_insert(v);
+            }
+            "on" => {
+                on_w.get_or_insert(v);
             }
             "host" => {
                 host_w.get_or_insert(v);
@@ -925,6 +960,12 @@ fn parse_row_ref<'a>(
         sid: match sid_w? {
             "-" => None,
             s => Some(s),
+        },
+        // Optional: a row written before `on=` existed has none.
+        on: match on_w {
+            None => None,
+            Some(on) if is_word(on) => Some(on),
+            Some(_) => return None,
         },
         host: host_w?,
         facts: Digest::parse(facts_w?)?,

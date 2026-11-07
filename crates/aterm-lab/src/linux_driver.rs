@@ -219,6 +219,19 @@ impl Driver {
         }
     }
 
+    /// Why the guest went down under a command of this run, when it did: lima's GPU instance
+    /// when krunkit died under one, the vz arm's first `Lost`. A session that sees it ends NOT
+    /// RUN naming it, never with what the cut-off work then failed.
+    #[must_use]
+    pub fn lost(&self) -> Option<String> {
+        match self {
+            Self::Lima(l) => l.lost().map(str::to_string),
+            Self::Vz(v) => v.lost().map(str::to_string),
+            #[cfg(test)]
+            Self::Fake(g) => g.lost(),
+        }
+    }
+
     /// The VM's disk on this Mac, where it reads.
     #[must_use]
     pub fn host_disk(&self) -> Option<HostDisk> {
@@ -341,6 +354,8 @@ pub mod fake {
         pub host_disk: Option<HostDisk>,
         /// Files `copy_out` writes, by guest path.
         pub files: BTreeMap<String, Vec<u8>>,
+        /// The first `Lost` answered.
+        lost: Arc<Mutex<Option<String>>>,
     }
 
     impl Guest {
@@ -356,6 +371,15 @@ pub mod fake {
             self.rules
                 .push((words.iter().map(|w| (*w).to_string()).collect(), answer));
             self
+        }
+
+        /// As [`super::Driver::lost`]: the first `Lost` answered.
+        #[must_use]
+        pub fn lost(&self) -> Option<String> {
+            self.lost
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
 
         /// The calls so far.
@@ -398,7 +422,13 @@ pub mod fake {
                     out.text = crate::linux_vz_driver::signal_words(signal);
                 }
                 Answer::NotStarted(why) => out.not_started = Some(why),
-                Answer::Lost(why) => out.lost = Some(why),
+                Answer::Lost(why) => {
+                    self.lost
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get_or_insert_with(|| why.clone());
+                    out.lost = Some(why);
+                }
             }
             out
         }

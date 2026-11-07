@@ -35,6 +35,7 @@ mod image_survives_column_reflow;
 mod image_survives_scrollback;
 mod kitty_chunked_load;
 mod kitty_graphics_delete;
+mod line_run_differential;
 mod osc_param_tail;
 mod palette_refusal_told_once;
 mod primary_flap_with_output;

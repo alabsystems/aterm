@@ -238,6 +238,9 @@ fn decode(payload: &[u8]) -> Result<Command> {
         return Err(Error::new("claim row exceeds payload limit"));
     }
     let command = Command::decode(payload)?;
+    if command.encode()? != payload {
+        return Err(Error::new("claim row encoding is not canonical"));
+    }
     row_of(&command)?;
     Ok(command)
 }

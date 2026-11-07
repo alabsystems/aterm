@@ -903,14 +903,15 @@ mod tests {
 
     #[test]
     fn live_relay_preserves_an_old_failed_attempt_without_renewing_its_time() {
-        use aterm_types::network_state::{RepairObservation, RepairOutcome, RepairStage};
+        use aterm_types::network_state::{
+            RepairCause, RepairObservation, RepairOutcome, RepairStage,
+        };
         let mut state = current();
         state.peers[0].last_repair = Some(RepairObservation {
-            cause: None,
             completed_at_ms: state.observed_at_ms - 60_000,
             outbound: false,
             stage: Some(RepairStage::Application),
-            outcome: RepairOutcome::Failed,
+            outcome: RepairOutcome::Failed(RepairCause::Io),
             table: Some([9; 32]),
             sent: Some(1),
             received: Some(2),

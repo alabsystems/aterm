@@ -244,11 +244,7 @@ fn every_act_with(rules_text: &str) -> Vec<(String, String)> {
         add("continue", continuation_text(&cfg(), rules));
         add("answer", answer_text(&cfg(), rules));
         add("reversible-answer", reversible_answer(rules));
-        for priority in [
-            QuestionPriority::Recommended,
-            QuestionPriority::LongTerm,
-            QuestionPriority::ShortTerm,
-        ] {
+        for priority in PriorityWord::ALL {
             let cfg = SupervisorConfig {
                 question_priority: priority,
                 ..cfg()

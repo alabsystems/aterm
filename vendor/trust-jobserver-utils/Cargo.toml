@@ -19,7 +19,7 @@ libc = "0.2"
 
 [package.metadata.aterm-origin]
 project = "Trust"
-commit = "263e40c542b1efd7e4464e9ef191cdea0b7add8f"
+commit = "a0c6b01024b0a63f61bff0684dcaa9751de5d637"
 path = "src/jobserver_utils"
 
 [workspace]

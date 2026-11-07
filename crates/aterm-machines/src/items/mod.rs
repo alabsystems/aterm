@@ -127,6 +127,22 @@ pub trait Item: Send + Sync {
         None
     }
 
+    /// Refresh with the same live authorization used by a guarded apply. Batches
+    /// override this to check again before each effect.
+    fn refresh_guarded(
+        &self,
+        sys: &dyn System,
+        ctx: &Ctx,
+        _current: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Option<Result<(), String>> {
+        self.refresh(sys, ctx)
+    }
+
+    /// Whether an apply-mode refresh must be journaled before it runs.
+    fn refresh_changes(&self, _sys: &dyn System, _ctx: &Ctx) -> bool {
+        false
+    }
+
     /// Command that undoes `apply`, if any.
     fn revert(&self) -> Option<String> {
         None

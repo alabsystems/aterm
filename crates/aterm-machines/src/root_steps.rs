@@ -294,12 +294,17 @@ fn run_ok(sys: &dyn System, cmd: &Cmd) -> Result<Ran, String> {
 /// Give this Mac `label` (a [`crate::init_clt::plain_name`]) as its three names through the rule,
 /// as the person's own account, with `sudo -n`, which never asks for a password: the step an
 /// admission after the elevation takes. The names already `label` are left; the ones set are
-/// returned.
+/// returned. `current` re-reads the caller's naming intent after each name read, before any
+/// write, so a newer choice retires this work without undoing an earlier name already set.
 ///
 /// # Errors
 /// A label that is no swarm label, no rule in place (the next elevation names the Mac), or a
-/// name `sudo` or `scutil` refused, in one line.
-pub fn name_by_rule(sys: &dyn System, label: &str) -> Result<Vec<&'static str>, String> {
+/// name `sudo` or `scutil` refused, or `current` no longer admits this intent, in one line.
+pub fn name_by_rule(
+    sys: &dyn System,
+    label: &str,
+    current: &dyn Fn() -> Result<(), String>,
+) -> Result<Vec<&'static str>, String> {
     let Some(label) = crate::init_clt::plain_name(label) else {
         return Err(format!("{label:?} is no swarm label"));
     };
@@ -317,6 +322,7 @@ pub fn name_by_rule(sys: &dyn System, label: &str) -> Result<Vec<&'static str>, 
             |e| Read::Unusable(e.to_string()),
             |ran| crate::items::names::read_scutil(&ran),
         );
+        current()?;
         if now == Read::Value(label.clone()) {
             continue;
         }
@@ -1013,17 +1019,17 @@ mod tests {
                 Ran::ok(""),
             );
         assert_eq!(
-            name_by_rule(&sys, "m42"),
+            name_by_rule(&sys, "m42", &|| Ok(())),
             Ok(vec!["ComputerName", "HostName"])
         );
 
         let none = Fake::root();
-        assert!(name_by_rule(&none, "m42").is_err());
+        assert!(name_by_rule(&none, "m42", &|| Ok(())).is_err());
         assert!(
             none.calls().iter().all(|c| !c.contains("sudo")),
             "{:?}",
             none.calls()
         );
-        assert!(name_by_rule(&sys, "Mac-mini").is_err());
+        assert!(name_by_rule(&sys, "Mac-mini", &|| Ok(())).is_err());
     }
 }

@@ -109,18 +109,19 @@ pub fn piece_compile_args(piece: &crate::shape::Piece) -> Vec<String> {
 pub const UNIT_GRAPH: [&str; 3] = ["--unit-graph", "-Z", "unstable-options"];
 
 /// The unit graph a test compile's call over `piece` would build ([`UNIT_GRAPH`]), resolved under
-/// the main lane's build directory and the test compile's environment ([`test_cmds`]): the one
+/// the main lane's build directory and the test compile's environment ([`test_compile_cmd`]): the one
 /// line of it on the child's output that is a version-1 graph. Why not otherwise: the child failed
 /// or printed none.
 ///
 /// # Errors
 /// As above.
 pub fn unit_graph(ctx: &Ctx, piece: &crate::shape::Piece) -> Result<String, String> {
+    crate::release_test_env::prepare(ctx)
+        .map_err(|why| format!("cannot prepare release test environment: {why}"))?;
     let mut args = piece_compile_args(piece);
     args.extend(UNIT_GRAPH.map(String::from));
     let (_, bind) = test_doc_binding(ctx);
-    let cmd = main_targo(ctx, args);
-    let cmd = if bind { with_trustdoc(ctx, cmd) } else { cmd }.demoted();
+    let cmd = test_compile_cmd(ctx, bind, args);
     let out = exec::run(&cmd, ctx.exec_env());
     let graph = out
         .output
@@ -712,10 +713,10 @@ fn run_tests_labeled(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) -> bool 
         ));
         return false;
     }
-    let env = crate::findings::rerun_env(cmd, ctx.test_thread_override());
+    let rerun = crate::findings::Rerun::of(cmd, ctx.test_thread_override());
     let cmd = &cmd.clone().counting_waits();
     run_child(ctx, r, label, cmd, |r, run, label| {
-        r.decide_test_child(run, label, &env);
+        r.decide_test_child(run, label, &rerun);
     })
 }
 
@@ -897,6 +898,16 @@ fn with_trustdoc(ctx: &Ctx, cmd: Cmd) -> Cmd {
     cmd.env("RUSTDOC", ctx.tools.trustdoc.as_os_str())
 }
 
+/// Bind the caller's captured doc driver explicitly, including after a release command clears
+/// its inherited environment. `EnvSnapshot` normalized `RUSTDOC` and `CARGO_BUILD_RUSTDOC` to
+/// this one Cargo-facing value before the disposable test HOME was selected.
+fn with_ambient_rustdoc(ctx: &Ctx, cmd: Cmd) -> Cmd {
+    match &ctx.env.rustdoc_override {
+        Some(rustdoc) => cmd.env("RUSTDOC", rustdoc),
+        None => cmd,
+    }
+}
+
 /// Which doc driver a doc-running stage gets.
 #[derive(Debug, PartialEq, Eq)]
 enum DocDriver {
@@ -992,12 +1003,17 @@ fn test_compile(ctx: &Ctx, spec: &StageSpec, r: &mut Report) {
     {
         keep_refusals(ctx, part);
     }
+    if let Err(why) = crate::release_test_env::prepare(ctx) {
+        r.cannot_run(format!(
+            "cannot prepare release test environment: {why}; no test was compiled"
+        ));
+        ctx.test_compile_failed
+            .store(true, std::sync::atomic::Ordering::Release);
+        return;
+    }
     let (suffix, bind) = test_doc_binding(ctx);
     let compile = match cut {
-        Some(piece) => {
-            let c = main_targo(ctx, piece_compile_args(piece));
-            if bind { with_trustdoc(ctx, c) } else { c }.demoted()
-        }
+        Some(piece) => test_compile_cmd(ctx, bind, piece_compile_args(piece)),
         None => {
             let [compile, _] = test_cmds(ctx, bind);
             compile
@@ -1160,21 +1176,32 @@ fn shape_after(
     }
 }
 
-fn test_cmds(ctx: &Ctx, bind: bool) -> [Cmd; 2] {
-    let cmd = |args: Vec<String>| {
-        let c = main_targo(ctx, args);
-        if bind { with_trustdoc(ctx, c) } else { c }
+fn test_compile_cmd(ctx: &Ctx, bind: bool, args: Vec<String>) -> Cmd {
+    let cmd = main_targo(ctx, args);
+    let cmd = if bind {
+        with_trustdoc(ctx, cmd)
+    } else if matches!(doc_driver(ctx), DocDriver::Ambient) {
+        with_ambient_rustdoc(ctx, cmd)
+    } else {
+        cmd
     };
+    crate::release_test_env::command(ctx, cmd.demoted())
+}
+
+fn test_cmds(ctx: &Ctx, bind: bool) -> [Cmd; 2] {
     let (k, v) = TRAIL_LAWS_FULL;
     let mut compile = test_compile_args(&ctx.scope);
     if crate::plan::folds_measuring(ctx) {
         compile.extend(measuring_bench_args());
     }
     [
-        cmd(compile).demoted(),
+        test_compile_cmd(ctx, bind, compile),
         crate::release_test_env::command(
             ctx,
-            with_checkers(cmd(test_run_args(&ctx.scope)), ctx.checkers_in_tests),
+            with_checkers(
+                main_targo(ctx, test_run_args(&ctx.scope)),
+                ctx.checkers_in_tests,
+            ),
         )
         .env(k, v)
         .counting_waits(),
@@ -1685,6 +1712,7 @@ fn doctest_cmd(ctx: &Ctx, driver: &DocDriver, skip: &[String]) -> Cmd {
     let Some((stand_in, real)) = stand_in else {
         return match driver {
             DocDriver::Stage2 => with_trustdoc(ctx, cmd),
+            DocDriver::Ambient => with_ambient_rustdoc(ctx, cmd),
             _ => cmd,
         };
     };
@@ -3509,12 +3537,29 @@ mod tests {
         let as_release = ctx(Scope::workspace()).with_checkers_in_tests(true);
         for context in [&c, &release, &as_release] {
             let [compile, run] = test_cmds(context, false);
+            let shaped_compile = test_compile_cmd(
+                context,
+                false,
+                vec![
+                    "--unverified".into(),
+                    "test".into(),
+                    "-p".into(),
+                    "x".into(),
+                ],
+            );
             assert_eq!(env_of(&compile, CHECKERS_ENV), None);
             let want = Some(if context.checkers_in_tests { "1" } else { "0" }.into());
             assert_eq!(env_of(&run, CHECKERS_ENV), want);
             let marker = context.checkers_in_tests.then(|| "1".into());
-            assert_eq!(env_of(&compile, aterm_capacity::RELEASE_RUN_ENV), None);
+            assert_eq!(env_of(&compile, aterm_capacity::RELEASE_RUN_ENV), marker);
+            assert_eq!(
+                env_of(&shaped_compile, aterm_capacity::RELEASE_RUN_ENV),
+                marker
+            );
             assert_eq!(env_of(&run, aterm_capacity::RELEASE_RUN_ENV), marker);
+            assert_eq!(compile.exact_env, context.checkers_in_tests);
+            assert_eq!(shaped_compile.exact_env, context.checkers_in_tests);
+            assert_eq!(run.exact_env, context.checkers_in_tests);
             assert_eq!(
                 env_of(
                     &doctest_cmd(context, &DocDriver::BarePath, &[]),
@@ -3536,6 +3581,54 @@ mod tests {
         assert_eq!(checker.args, test_cmds(&c, false)[1].args);
     }
 
+    /// RELEASE TEST PLANNING AND COMPILATION SEE THE PREPARED DISPOSABLE HOME: the unit-graph
+    /// resolver and the actual compile each start only after the fixed release history exists in
+    /// the exact HOME they receive. NEGATIVE CONTROL: removing that HOME between the two calls
+    /// requires the compile path to prepare it again.
+    #[cfg(unix)]
+    #[test]
+    fn release_test_planning_and_compilation_prepare_their_declared_home() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let scratch = temp.path().join("scratch");
+        let home = scratch.join("release-test-home");
+        let record = home.join(".local/state/aterm-release/disk-footprint.json");
+        let targo = temp.path().join("bin/targo");
+        crate::standin_body(
+            &targo,
+            &format!(
+                "test \"$HOME\" = '{}' || exit 17\n\
+                 test \"$ATERM_RELEASE_RUN\" = 1 || exit 18\n\
+                 case \"$*\" in *--unit-graph*) echo '{{\"version\":1}}';; esac",
+                home.display()
+            ),
+        );
+        let mut c = Ctx::new(
+            temp.path().to_owned(),
+            Scope::workspace(),
+            EnvSnapshot::default(),
+            scratch,
+        )
+        .with_checkers_in_tests(true);
+        c.tools.targo = targo;
+        assert!(!record.exists());
+
+        let piece = crate::shape::Piece::of(&["aterm-verify".to_string()], false);
+        assert!(unit_graph(&c, &piece).is_ok());
+        assert!(record.exists());
+
+        std::fs::remove_dir_all(&home).unwrap();
+        let spec = crate::plan::declared(&c.scope).remove(0);
+        let mut report = Report::new(spec.title.clone());
+        test_compile(&c, &spec, &mut report);
+        assert!(
+            !c.test_compile_failed
+                .load(std::sync::atomic::Ordering::Acquire),
+            "{}",
+            report.render()
+        );
+        assert!(record.exists());
+    }
+
     #[test]
     fn the_stand_in_drives_rustdoc_only_where_the_scan_cleared_a_library() {
         let (driver, skip_env) = (crate::docdriver::DRIVER_ENV, crate::docdriver::SKIP_ENV);
@@ -3546,6 +3639,7 @@ mod tests {
         c.tools.trustdoc = stage2.clone();
         c.test_recorder = Some(recorder.clone());
         c.env.rustdoc_override = Some(caller.clone().into_os_string());
+        c = c.with_checkers_in_tests(true);
         let skip = ["other".to_string(), "plain".to_string()];
         for (kind, real) in [(DocDriver::Stage2, &stage2), (DocDriver::Ambient, &caller)] {
             let cmd = doctest_cmd(&c, &kind, &skip);
@@ -3567,9 +3661,16 @@ mod tests {
             let cmd = doctest_cmd(&c, &kind, &[]);
             assert_eq!(env_of(&cmd, driver), None, "{kind:?}");
             assert_eq!(env_of(&cmd, skip_env), None, "{kind:?}");
-            let bound = (kind == DocDriver::Stage2).then(|| stage2.clone().into_os_string());
+            let bound = match kind {
+                DocDriver::Stage2 => Some(stage2.clone().into_os_string()),
+                DocDriver::Ambient => Some(caller.clone().into_os_string()),
+                _ => None,
+            };
             assert_eq!(env_of(&cmd, "RUSTDOC"), bound, "{kind:?}");
         }
+        let compile = test_compile_cmd(&c, false, test_compile_args(&c.scope));
+        assert!(compile.exact_env);
+        assert_eq!(env_of(&compile, "RUSTDOC"), Some(caller.into_os_string()));
     }
 
     /// THE STAND-IN RUNS THE FILE CARGO WOULD HAVE RUN, named absolutely. With
@@ -3805,8 +3906,10 @@ mod tests {
         };
         let mut interner = crate::unitgraph::Interner::default();
         let mut graph = |args: Vec<String>| {
+            // A cached compile need not retain registry archives. Keep resolution
+            // pinned while Cargo obtains any sources needed to inspect the graph.
             let out = exec::run(
-                &targo(&c, args).args(UNIT_GRAPH).arg("--offline"),
+                &targo(&c, args).args(UNIT_GRAPH).arg("--locked"),
                 c.exec_env(),
             );
             assert!(out.ok, "{}", out.output);

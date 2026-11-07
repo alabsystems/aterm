@@ -588,6 +588,7 @@ pub(super) fn claim_record(
         cwd: snap.cwd.clone(),
         twin: mv.twin.to_string_lossy().into_owned(),
         pid: snap.pid,
+        pid_start: super::super::squash(&snap.start),
         proc_start: snap.start.clone(),
         shell: snap.shell,
         tab: snap.tab.clone(),

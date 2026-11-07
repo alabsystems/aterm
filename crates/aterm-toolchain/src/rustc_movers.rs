@@ -312,19 +312,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_first_mover_is_held_to_the_lock() {
-        use std::os::unix::fs::PermissionsExt as _;
         crate::discovery::set_probe_bound_for_test(aterm_spec::wait::MUST_HAPPEN);
         let hold = aterm_tempfile::tempdir().expect("scratch");
         let root = hold.path().canonicalize().expect("canonical");
         let rustc = |dir: &Path, commit: &str| {
             std::fs::create_dir_all(dir).expect("mkdir");
             let path = dir.join("rustc");
-            std::fs::write(
+            crate::test_script::script(
                 &path,
-                format!("#!/bin/sh\nprintf 'commit-hash: {commit}\\n'\n"),
-            )
-            .expect("write");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+                &format!("#!/bin/sh\nprintf 'commit-hash: {commit}\\n'\n"),
+            );
             path
         };
         let locked = "a".repeat(40);

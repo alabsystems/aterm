@@ -644,15 +644,21 @@ impl ChipWord {
 }
 
 impl SessionLights {
-    /// The mode's name a click brought up, its ink's step at `now`, while its mode stands and no
-    /// click is in flight.
-    fn word_at(&self, now: Instant) -> Option<(&'static str, u32)> {
+    /// The mode's name a click brought up, while its mode stands and no click is in flight.
+    fn active_word(&self) -> Option<(&'static str, ChipWord)> {
         let word = self.word.filter(|_| self.autopilot_pending.is_none())?;
         let view = self.autopilot?;
         if view.mode() != Some(word.mode) || ChipFace::of(view, &self.glass).standing() {
             return None;
         }
-        Some((view.named()?, word.step(now)?))
+        Some((view.named()?, word))
+    }
+
+    /// The mode's name a click brought up, its ink's step at `now`, while its mode stands and no
+    /// click is in flight.
+    fn word_at(&self, now: Instant) -> Option<(&'static str, u32)> {
+        let (named, word) = self.active_word()?;
+        Some((named, word.step(now)?))
     }
 
     /// Whether the harness's chip, Autopilot, is drawn for this session.
@@ -1235,14 +1241,17 @@ struct LightsKey {
 impl SessionLights {
     /// This session's [`LightsKey`] at the instant `now` gives.
     fn block_key(&self, now: impl FnOnce() -> Instant) -> LightsKey {
+        let active_word = self.active_word();
         let now = (self.refused.is_some()
             || self.notice.is_some()
             || self.fact_notice.is_some()
-            || self.word.is_some())
+            || active_word.is_some())
         .then(now);
         let showing = |until: Instant| now.is_some_and(|now| until > now);
         LightsKey {
-            word: now.and_then(|now| self.word_at(now)),
+            word: active_word
+                .zip(now)
+                .and_then(|((named, word), now)| Some((named, word.step(now)?))),
             shown: self.shown,
             pending: self.pending.as_ref().map(|p| (p.light, p.goal)),
             refused: self
@@ -1383,11 +1392,11 @@ impl WindowLights {
             })
         };
         let shows = |until: Instant| until > at();
-        // A name whose click is still in flight is not drawn ([`SessionLights::word_at`]).
+        // A name that [`SessionLights::word_at`] does not draw (a click in flight, another mode,
+        // or a standing face) neither reads the clock nor moves the repaint key.
         let step = |s: &SessionLights| {
-            s.word
-                .filter(|_| s.autopilot_pending.is_none())
-                .and_then(|word| Some((word.mode, word.step(at())?)))
+            let (_, word) = s.active_word()?;
+            Some((word.mode, word.step(at())?))
         };
         let mut active: Vec<_> = self
             .sessions
@@ -1555,17 +1564,31 @@ impl WindowLights {
     }
 
     /// Whether `target` of `session` is on this frame's glass.
+    #[cfg(all(test, target_os = "macos"))]
     fn shows(&self, session: u64, target: Target) -> bool {
+        self.shows_uncovered(session, target, |_| false)
+    }
+
+    /// Whether `target` of `session` is on this frame's glass and not on a row `covered` owns.
+    fn shows_uncovered(
+        &self,
+        session: u64,
+        target: Target,
+        covered: impl Fn(usize) -> bool,
+    ) -> bool {
         match target {
             Target::Chip(chip) => self
                 .hits
                 .iter()
-                .any(|h| h.session == session && h.chip == Some(chip)),
+                .any(|h| h.session == session && h.chip == Some(chip) && !covered(h.term_row)),
             Target::Fact(fact) => self
                 .fact_hits
                 .iter()
-                .any(|h| h.session == session && h.fact == fact),
-            Target::Switch => self.switch_of(session).is_some(),
+                .any(|h| h.session == session && h.fact == fact && !covered(h.term_row)),
+            Target::Switch => self
+                .border_toggles
+                .iter()
+                .any(|b| b.session == session && !covered(b.term_row)),
         }
     }
 
@@ -1581,15 +1604,47 @@ impl WindowLights {
         session: u64,
         face: Option<crate::autopilot::HarnessSwitch>,
     ) {
-        if let Some(s) = self.sessions.get_mut(&session)
-            && let Some((on, _)) = s.switch_turning
-            && !matches!(
-                (on, face),
-                (true, Some(crate::autopilot::HarnessSwitch::Off(_)))
-                    | (false, Some(crate::autopilot::HarnessSwitch::On))
-            )
-        {
-            s.switch_turning = None;
+        if let Some(s) = self.sessions.get_mut(&session) {
+            if let Some((on, _)) = s.switch_turning
+                && !matches!(
+                    (on, face),
+                    (true, Some(crate::autopilot::HarnessSwitch::Off(_)))
+                        | (false, Some(crate::autopilot::HarnessSwitch::On))
+                )
+            {
+                s.switch_turning = None;
+            }
+            match face {
+                Some(
+                    crate::autopilot::HarnessSwitch::On
+                    | crate::autopilot::HarnessSwitch::TurningOff,
+                ) => {}
+                Some(crate::autopilot::HarnessSwitch::Off(crate::autopilot::SwitchOff::Master)) => {
+                    s.autopilot = Some(AutopilotView::MasterOff);
+                    s.autopilot_pending = None;
+                    s.rewritten = false;
+                    s.word = None;
+                }
+                Some(crate::autopilot::HarnessSwitch::Off(crate::autopilot::SwitchOff::Agent(
+                    agent,
+                ))) => {
+                    s.autopilot = Some(AutopilotView::AgentOff(agent));
+                    s.autopilot_pending = None;
+                    s.rewritten = false;
+                    s.word = None;
+                }
+                Some(crate::autopilot::HarnessSwitch::Turning) => {
+                    s.autopilot_pending = None;
+                    s.rewritten = false;
+                    s.word = None;
+                }
+                None => {
+                    s.autopilot = Some(AutopilotView::Unhosted);
+                    s.autopilot_pending = None;
+                    s.rewritten = false;
+                    s.word = None;
+                }
+            }
         }
     }
 
@@ -1628,18 +1683,22 @@ impl WindowLights {
     pub(crate) fn words_due(&mut self, now: Instant) -> bool {
         let mut due = false;
         for s in self.sessions.values_mut() {
-            let Some(named) = s.word.as_mut().filter(|_| s.autopilot_pending.is_none()) else {
+            if s.autopilot_pending.is_some() {
+                continue;
+            }
+            let drawn = s.active_word().is_some();
+            let Some(named) = s.word.as_mut() else {
                 continue;
             };
             match named.step(now) {
-                Some(step) if step == named.asked => {}
+                Some(step) if !drawn || step == named.asked => {}
                 Some(step) => {
                     named.asked = step;
                     due = true;
                 }
                 None => {
                     s.word = None;
-                    due = true;
+                    due |= drawn;
                 }
             }
         }
@@ -1653,8 +1712,10 @@ impl WindowLights {
     pub(crate) fn word_wake(&self, now: Instant) -> Option<Instant> {
         self.sessions
             .values()
-            .filter(|s| s.autopilot_pending.is_none())
-            .filter_map(|s| s.word.map(|word| word.next_at(now).unwrap_or(now)))
+            .filter_map(|s| {
+                let (_, word) = s.active_word()?;
+                Some(word.next_at(now).unwrap_or(now))
+            })
             .min()
     }
 
@@ -5065,7 +5126,10 @@ impl App {
             .map(|(_, room)| *room);
         let stale = ws.claude_lights.selected.is_some_and(|(id, target)| {
             id != session
-                || (ws.claude_lights.selection_painted && !ws.claude_lights.shows(id, target))
+                || (ws.claude_lights.selection_painted
+                    && !ws.claude_lights.shows_uncovered(id, target, |row| {
+                        ws.chrome_rows.iter().any(|band| band.contains(&row))
+                    }))
         });
         if stale {
             ws.claude_lights.select(None);
@@ -5073,6 +5137,8 @@ impl App {
         }
         let order = ws.claude_lights.revealable(session);
         let lights_ = &ws.claude_lights;
+        let chrome_rows = &ws.chrome_rows;
+        let covered = |row: usize| chrome_rows.iter().any(|band| band.contains(&row));
         let fits = |target: Target| match target {
             Target::Chip(chip) => room.is_some_and(|room| {
                 lights_
@@ -5087,7 +5153,7 @@ impl App {
                     )
                     .is_some_and(|block| block.shows(chip))
             }),
-            Target::Fact(_) | Target::Switch => lights_.shows(session, target),
+            Target::Fact(_) | Target::Switch => lights_.shows_uncovered(session, target, covered),
         };
         let step = |from: Option<Target>| -> Option<Target> {
             let n = order.len();
@@ -5125,7 +5191,15 @@ impl App {
         let chip = match target {
             Target::Chip(chip) => chip,
             Target::Switch => {
-                let face = ws.claude_lights.switch_of(session).map(|b| b.face);
+                let face = ws
+                    .claude_lights
+                    .border_toggles
+                    .iter()
+                    .find(|b| {
+                        b.session == session
+                            && !ws.chrome_rows.iter().any(|band| band.contains(&b.term_row))
+                    })
+                    .map(|b| b.face);
                 let clicks = matches!(
                     &ev.logical_key,
                     Key::Named(NamedKey::Enter | NamedKey::Space)
@@ -5146,7 +5220,11 @@ impl App {
                     .claude_lights
                     .fact_hits
                     .iter()
-                    .filter(|h| h.session == session && h.fact == fact)
+                    .filter(|h| {
+                        h.session == session
+                            && h.fact == fact
+                            && !ws.chrome_rows.iter().any(|band| band.contains(&h.term_row))
+                    })
                     .min_by_key(|h| (h.frame_row, h.cols.0))
                     .copied();
                 let clicks = matches!(
@@ -5158,7 +5236,7 @@ impl App {
                 redraw(ws);
                 return match hit {
                     Some(hit) if clicks => {
-                        self.press_claude_fact(wid, session, fact, hit.restores);
+                        self.press_visible_claude_fact(wid, session, fact, hit.restores);
                         true
                     }
                     Some(_) if menu_key => {

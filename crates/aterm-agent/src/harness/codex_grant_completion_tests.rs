@@ -143,6 +143,7 @@ fn capture_exchange_status(
         callback_ports: vec![],
     };
     let (email, output) = CodeExchange {
+        native_scope: None,
         publication: None,
         enrollment: None,
         home: &home,
@@ -267,6 +268,7 @@ fn malformed_http_200_response_is_retained_exactly_without_stage_publication() {
         callback_ports: vec![],
     };
     let (email, output) = CodeExchange {
+        native_scope: None,
         publication: None,
         enrollment: None,
         home: &home,
@@ -341,6 +343,7 @@ fn cancelled_after_durable_arm_returns_owned_no_dispatch_without_post_or_stage_c
     let scope = lifetime.enter().unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let (email, output) = CodeExchange {
+        native_scope: None,
         publication: None,
         enrollment: None,
         home: &home,
@@ -399,6 +402,7 @@ fn sent_code_request_with_no_response_never_mints_no_dispatch_evidence() {
     };
     let seen = Arc::new(Mutex::new(Vec::new()));
     let (email, output) = CodeExchange {
+        native_scope: None,
         publication: None,
         enrollment: None,
         home: &home,
@@ -557,6 +561,7 @@ fn actual_rejected_code_response_waits_for_exact_owned_scope_retirement() {
             };
             let capture = owner::prepare(env, request, auth, &"d".repeat(64)).unwrap();
             let (email, output) = CodeExchange {
+                native_scope: None,
                 publication: None,
                 enrollment: None,
                 home,
@@ -693,4 +698,168 @@ fn actual_rejected_code_response_waits_for_exact_owned_scope_retirement() {
             assert_eq!(std::fs::read(auth).unwrap(), before);
         });
     }
+}
+
+fn native_owner_exchange(storage_failure: bool) {
+    use crate::harness::{codex_grant_owner as owner, native_enrollment_admission as admission};
+    let _callback_turn = admission::tests::callback_test_turn();
+    let root = aterm_tempfile::tempdir().unwrap();
+    let machine = root.path().join("machine");
+    aterm_secrets::fsx::ensure_private_dir(&machine).unwrap();
+    aterm_secrets::client::machine_identity_as(
+        &aterm_secrets::client::Paths::locate_for_home(&machine),
+        aterm_secrets::Making {
+            test_binary: true,
+            ..aterm_secrets::Making::default()
+        },
+    )
+    .unwrap();
+    let env = admission::tests::environment(root.path(), &machine, "native-state");
+    let scope = admission::tests::reservation(&env, "native", "a");
+    let request = crate::harness::codex_enrollment::Request {
+        id: "a".repeat(32),
+        caller: "d".repeat(64),
+        label: "native".into(),
+        revision: "e".repeat(64),
+    };
+    let stage = root.path().join("stage");
+    let now = 1_790_000_000;
+    hour_login(&stage, now, Some("previous-native-test-refresh"));
+    let before = std::fs::read(stage.join(AUTH_FILE)).unwrap();
+    let mut wrong_request = request.clone();
+    wrong_request.id = "b".repeat(32);
+    assert!(
+        owner::prepare(
+            &env,
+            &wrong_request,
+            &stage.join(AUTH_FILE),
+            &"f".repeat(64)
+        )
+        .unwrap()
+        .with_native_scope(&env, Some(Arc::clone(&scope)))
+        .is_err(),
+        "a real reservation cannot authorize another operation"
+    );
+    let mut wrong_store = env.clone();
+    wrong_store.state = root.path().join("other-account-state");
+    assert!(
+        owner::prepare(
+            &wrong_store,
+            &request,
+            &stage.join(AUTH_FILE),
+            &"f".repeat(64)
+        )
+        .unwrap()
+        .with_native_scope(&wrong_store, Some(Arc::clone(&scope)))
+        .is_err(),
+        "equal operation metadata cannot cross account stores"
+    );
+    let prepared = owner::prepare(&env, &request, &stage.join(AUTH_FILE), &"f".repeat(64))
+        .unwrap()
+        .with_native_scope(&env, Some(Arc::clone(&scope)))
+        .unwrap();
+    let directory = env
+        .accounts_store_for(crate::harness::accounts::Cli::Codex)
+        .unwrap()
+        .dir
+        .join("credential-owners")
+        .join(&request.id);
+    let moved = directory.with_file_name("retained-owner");
+    let server_directory = directory.clone();
+    let server_moved = moved.clone();
+    let server_env = env.clone();
+    let server_stage = stage.clone();
+    let token = make_chatgpt_jwt(Some("owner@example.test"), "pro", now + 3600);
+    let (port, server) = provider(move |_, _| {
+        assert!(
+            admission::RefreshExchangeLease::for_env(&server_env).is_err(),
+            "actual code POST excludes native refresh"
+        );
+        assert!(
+            AuthLock::try_take(&server_stage.join(AUTH_FILE))
+                .unwrap()
+                .is_none(),
+            "stage lock spans actual HTTP"
+        );
+        if storage_failure {
+            std::fs::rename(&server_directory, &server_moved).unwrap();
+        }
+        (
+            "200 OK",
+            json!({"id_token":token,"access_token":token,"refresh_token":"native-fixture-new-refresh"}),
+        )
+    });
+    let endpoints = Endpoints {
+        issuer: format!("http://127.0.0.1:{port}"),
+        token_url: format!("http://127.0.0.1:{port}/oauth/token"),
+        callback_ports: vec![],
+    };
+    let (email, output) = CodeExchange {
+        native_scope: Some(&scope),
+        publication: None,
+        enrollment: None,
+        home: &stage,
+        endpoints: &endpoints,
+        redirect_uri: "http://127.0.0.1/callback",
+        code: "single-use-native-fixture",
+        code_verifier: "verifier",
+        deadline: WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
+        work: None,
+        now,
+    }
+    .persist_capturing(Some("actual-native-fixture-owner"), Some(prepared));
+    assert_eq!(provider_seen(port, server), ["POST /oauth/token"]);
+    let output = output.expect("actual completed response retains native ownership");
+    if storage_failure {
+        assert!(email.is_none());
+        assert_eq!(std::fs::read(stage.join(AUTH_FILE)).unwrap(), before);
+        let owner::CaptureOutcome::Pending(pending) = output else {
+            panic!("failed encrypted write must retain exact response")
+        };
+        drop(scope); // The carrier must now own the only remaining reservation.
+        assert!(admission::RefreshExchangeLease::for_env(&env).is_err());
+        std::fs::rename(&moved, &directory).unwrap();
+        let owner::CaptureOutcome::Verified(grant) = pending.retry() else {
+            panic!("exact retry must durably settle without another HTTP request")
+        };
+        owner::with_retained_response(&env, &request, &grant, |_, bytes, _, _, _| {
+            assert_ne!(bytes, before.as_slice());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read(stage.join(AUTH_FILE)).unwrap(),
+            before,
+            "storage retry alone cannot publish credentials"
+        );
+    } else {
+        assert_eq!(email, Some(Some("owner@example.test".into())));
+        let owner::CaptureOutcome::Verified(grant) = output else {
+            panic!("actual native response must settle")
+        };
+        owner::with_retained_response(&env, &request, &grant, |_, bytes, _, _, _| {
+            assert_eq!(bytes, std::fs::read(stage.join(AUTH_FILE)).unwrap());
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            scope.check_exchange().is_err(),
+            "durable settlement releases exchange before publication"
+        );
+        drop(scope);
+    }
+    admission::RefreshExchangeLease::for_env(&env)
+        .unwrap()
+        .current()
+        .unwrap();
+}
+
+#[test]
+fn actual_native_code_exchange_holds_gates_and_settles_before_releasing_them() {
+    native_owner_exchange(false);
+}
+
+#[test]
+fn actual_native_response_io_failure_keeps_gates_in_owned_carrier_until_exact_retry() {
+    native_owner_exchange(true);
 }

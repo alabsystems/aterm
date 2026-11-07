@@ -1342,6 +1342,7 @@ fn read_launch_rows(
         let next = picked.ok().or_else(|| {
             roster.rows.iter().find(|row| {
                 !asked.contains(&row.label)
+                    && !launch.has_read(&row_read_account(cli, row, seat.home))
                     && (row.dir.is_none() || (unread.is_none() && enrolled.contains(&row.label)))
                     && accounts::row_available_here(row, &snapshot.state, seat.now)
                     && snapshot
@@ -1356,7 +1357,10 @@ fn read_launch_rows(
         let Some(row) = next else {
             return Ok(());
         };
-        if !asked.insert(row.label.clone()) || !usage_due(seat, cli, snapshot, row) {
+        if !asked.insert(row.label.clone())
+            || launch.has_read(&row_read_account(cli, row, seat.home))
+            || !usage_due(seat, cli, snapshot, row)
+        {
             return Ok(());
         }
         let Some(use_token) =
@@ -1672,22 +1676,6 @@ pub(crate) fn record_usage(
 /// row is usable, a known stored login identity contradicts its row, the chosen login's overlay
 /// cannot be prepared, or its binding, routing or selection changes during preparation. A caller
 /// must hold the launch on these failures.
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::refines(
-        machine = "AccountPoolLaunch",
-        action = "Choose",
-        project = "aterm_agent::harness::accounts_pool::tests::launch_admission::launch_transition"
-    )
-)]
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::refines(
-        machine = "AccountPoolUsagePolicy",
-        action = "PollAndChoose",
-        project = "aterm_agent::harness::accounts_pool::tests::usage_policy::usage_transition"
-    )
-)]
 pub fn launch_env(
     seat: &Seat<'_>,
     cli: Cli,
@@ -1713,20 +1701,49 @@ pub fn launch_env_for(
     read: ReadUsage<'_>,
     program: Option<&Path>,
 ) -> Result<Option<LoginEnv>, String> {
-    let sync = seat.sync_here(cli);
-    launch_env_using(seat, cli, read, program, |row| {
-        // A refusal of the login a row names says what ends it, as every other surface does.
-        check_launch_login_identity(
-            cli,
-            &Roster::default(),
-            Some(row),
-            seat.home,
-            program,
-            Some(sync.here()),
-        )
-        .map_err(|why| io::Error::other(why.to_string()))?;
-        login_env(cli, row, seat.home)
-    })
+    LaunchPick::for_worker_launch().pick(seat, cli, read, program)
+}
+
+/// One worker launch's provider-read allowance, retained across local retries
+/// and pool holds. A retry never creates another launch or replenishes reads.
+pub struct LaunchPick {
+    reads: provider_read::Launch,
+}
+
+impl LaunchPick {
+    /// Begin one worker invocation, before its first attempt to choose a row.
+    #[must_use]
+    pub fn for_worker_launch() -> Self {
+        Self {
+            reads: provider_read::Launch::launch_use(LaunchUse(())),
+        }
+    }
+
+    /// Choose a row for this launch, preserving every read spent by earlier attempts.
+    /// # Errors
+    /// As [`launch_env_for`]. Refusals retain this launch's spent allowance.
+    pub fn pick(
+        &mut self,
+        seat: &Seat<'_>,
+        cli: Cli,
+        read: ReadUsage<'_>,
+        program: Option<&Path>,
+    ) -> Result<Option<LoginEnv>, String> {
+        let sync = seat.sync_here(cli);
+        launch_env_reading(seat, cli, read, program, &mut self.reads, |row| {
+            // A refusal of the login a row names says what ends it, as every other surface does.
+            check_launch_login_identity(
+                cli,
+                &Roster::default(),
+                Some(row),
+                seat.home,
+                program,
+                Some(sync.here()),
+            )
+            .map_err(|why| io::Error::other(why.to_string()))?;
+            login_env(cli, row, seat.home)
+        })
+    }
 }
 
 /// The roster's row on this machine's own login (the one with no `dir` once bound) as the only
@@ -2018,14 +2035,15 @@ pub fn launch_now<'a>(
 /// row, and for Codex only if a wall on it can show ([`codex_row_can_show_a_wall`]). `None` where
 /// the launch is refused, runs on a login no row lists, or is Codex's on one no read here can show a
 /// wall on. A launch also reads the row it picks and may leave it for a wall that read finds, which
-/// no record here can say.
+/// no record here can say. `home` is this user's home, which holds the rollouts of a row under
+/// rotation off ([`rollout_login`]).
 #[must_use]
 pub fn unstarted_launch_row<'a>(
     (cli, keyring, mode): (Cli, bool, Mode),
     roster: &'a Roster,
     state: &accounts::State,
     enrolled: &std::collections::BTreeSet<String>,
-    program: Option<&Path>,
+    (program, home): (Option<&Path>, Option<&Path>),
     now: i64,
 ) -> Option<&'a Row> {
     if cli == Cli::Claude {
@@ -2038,22 +2056,55 @@ pub fn unstarted_launch_row<'a>(
         Some(row) => row,
         None => roster.row_for_login(None)?,
     };
-    (cli != Cli::Codex || codex_row_can_show_a_wall(keyring, mode, roster, enrolled, row))
+    (cli != Cli::Codex || codex_row_can_show_a_wall((keyring, mode), roster, enrolled, row, home))
         .then_some(row)
+}
+
+/// The login a survey may read `row`'s own rollouts as, in `home`, and the Codex homes that hold
+/// them: the default home holds the rollouts of every row that shares it, and the row's own home
+/// those of a row with its own. A rollout says only which login opened it, so `None` where the
+/// default home's login is another one, for another pool, for a login kept in the keyring, and for
+/// a row whose login names no account.
+#[must_use]
+pub(crate) fn rollout_login(
+    cli: Cli,
+    row: &Row,
+    home: &Path,
+) -> Option<(super::profile::AccountKey, Vec<std::path::PathBuf>)> {
+    if cli != Cli::Codex || keyring_held_in(cli, home) {
+        return None;
+    }
+    let default_home = home.join(cli.accounts().default_home);
+    let row_home = row
+        .dir
+        .as_deref()
+        .filter(|dir| !dir.is_empty())
+        .map_or_else(|| default_home.clone(), std::path::PathBuf::from);
+    let key = super::codex_app_login::stored_login_key(&row_home)?;
+    if super::codex_app_login::stored_login_key(&default_home).is_some_and(|there| there != key) {
+        return None;
+    }
+    let homes = if row_home == default_home {
+        vec![default_home]
+    } else {
+        vec![default_home, row_home]
+    };
+    Some((key, homes))
 }
 
 /// Whether anything here can show a wall on `row`, the one a Codex launch would run on. Under
 /// rotation its launch reads it ([`read_launch_rows`], [`read_lone_wall`]). A launch under rotation
 /// off reads nothing, the owner's pin or not, so only the row's own rollouts can, and those speak for
-/// a row only where no other is enrolled here (`row_rollout_sample`). A login the OS keyring holds
-/// has neither: its launch reads nothing and a survey reads no rollout of it. A row with no login
-/// here has no wall to show, and a launch on it meets a sign-in, which that row names.
+/// a row only where no other is enrolled here and they can be read as its login ([`rollout_login`],
+/// the survey's own `row_rollout_look`). A login the OS keyring holds has neither: its launch reads
+/// nothing and a survey reads no rollout of it. A row with no login here has no wall to show, and a
+/// launch on it meets a sign-in, which that row names.
 fn codex_row_can_show_a_wall(
-    keyring: bool,
-    mode: Mode,
+    (keyring, mode): (bool, Mode),
     roster: &Roster,
     enrolled: &std::collections::BTreeSet<String>,
     row: &Row,
+    home: Option<&Path>,
 ) -> bool {
     if keyring {
         return false;
@@ -2061,10 +2112,11 @@ fn codex_row_can_show_a_wall(
     if mode != Mode::Off || !enrolled.contains(&row.label) {
         return true;
     }
-    !roster
+    let alone = !roster
         .rows
         .iter()
-        .any(|other| other.label != row.label && enrolled.contains(&other.label))
+        .any(|other| other.label != row.label && enrolled.contains(&other.label));
+    alone && home.is_some_and(|home| rollout_login(Cli::Codex, row, home).is_some())
 }
 
 /// Observe the login a launch would take after rejecting known stored identity contradictions.
@@ -2227,12 +2279,37 @@ fn lone_walled(
         })
 }
 
-/// Reads a lone row whose wall on record would refuse this launch, where its reading is due
-/// ([`usage_due`]): a wall can lift early (a limit reset redeemed in Codex, another account signed
-/// in), and [`poll_usage`] lifts one its read shows gone. It is still the row this launch starts
-/// on, so the owner's no-polling rule allows the read, and a row read a moment ago is not read
-/// again. The read spends the launch's own allowance ([`LAUNCH_READS`]); with none left the wall
-/// on record stands.
+/// The one row enrolled here, where it is not held for another machine: a launch has no other row
+/// to move to, however many the roster lists for other Macs.
+fn sole_enrolled<'a>(
+    roster: &'a Roster,
+    enrolled: &std::collections::BTreeSet<String>,
+) -> Option<&'a Row> {
+    let mut here = roster
+        .rows
+        .iter()
+        .filter(|row| enrolled.contains(&row.label));
+    let only = here.next()?;
+    (here.next().is_none() && only.held_by.is_none()).then_some(only)
+}
+
+/// [`sole_enrolled`], where a launch that picks a row could start on it ([`accounts::launch_row`]).
+fn sole_available<'a>(
+    roster: &'a Roster,
+    state: &accounts::State,
+    enrolled: &std::collections::BTreeSet<String>,
+    now: i64,
+) -> Option<&'a Row> {
+    sole_enrolled(roster, enrolled).filter(|row| accounts::row_available_here(row, state, now))
+}
+
+/// Reads the one row enrolled here ([`sole_enrolled`]) where a wall on record would refuse this
+/// launch and its reading is due ([`usage_due`]): a wall can lift early (a limit reset redeemed in
+/// Codex, another account signed in), and [`poll_usage`] lifts one its read shows gone. It is still
+/// the row this launch starts on, so the owner's no-polling rule allows the read, and a row read a
+/// moment ago, or already by this launch, is not read again. A row of its own is read as
+/// [`read_launch_rows`] reads one, only where its home can be read (`unread`). The read spends the
+/// launch's own allowance ([`LAUNCH_READS`]); with none left the wall on record stands.
 ///
 /// # Errors
 ///
@@ -2242,15 +2319,18 @@ fn read_lone_wall(
     cli: Cli,
     snapshot: &mut PoolSnapshot,
     enrolled: &std::collections::BTreeSet<String>,
+    unread: Option<&super::codex_alab::AuthPathUnread>,
     read: ReadUsage<'_>,
     launch: &mut provider_read::Launch,
 ) -> Result<(), String> {
     let roster = snapshot.roster.clone();
-    let [row] = roster.rows.as_slice() else {
+    let Some(row) = sole_enrolled(&roster, enrolled) else {
         return Ok(());
     };
-    if lone_walled(cli, &roster, &snapshot.state, enrolled, seat.now)
+    if (row.dir.is_none() || unread.is_none())
+        && lone_walled(cli, &roster, &snapshot.state, enrolled, seat.now)
         && usage_due(seat, cli, snapshot, row)
+        && !launch.has_read(&row_read_account(cli, row, seat.home))
     {
         let Some(use_token) =
             provider_read::Use::launch_read_use(launch, row_read_account(cli, row, seat.home))
@@ -2265,9 +2345,10 @@ fn read_lone_wall(
 /// Reads the row a person's command is about to start `cli` on, as a launch would ([`read_lone_wall`]),
 /// so a command that judges the records and reads no usage itself (`aterm ai review`) does not
 /// refuse for a wall the launch's own read would have lifted. Whether a wall lifted; `false` where
-/// the launch takes a row, is refused for anything a wall's end would not mend, or the read
-/// could not be recorded, which leaves the records as they stand. It mints the authority of one
-/// launch, since that row is the one the command starts on, and spends at most one read of it.
+/// another row is enrolled here, the launch could not start on that row, is refused for anything a
+/// wall's end would not mend, or the read could not be recorded, which leaves the records as they
+/// stand. It mints the authority of one launch, since that row is the one the command starts on, and
+/// spends at most one read of it.
 #[must_use]
 pub fn lift_lone_wall(
     seat: &Seat<'_>,
@@ -2283,13 +2364,20 @@ pub fn lift_lone_wall(
     };
     let roster = snapshot.roster.clone();
     let enrolled = accounts::enrolled_in(cli, &roster, seat.home);
+    let Some(row) = (if lone_default(&roster, None) {
+        sole_enrolled(&roster, &enrolled)
+    } else {
+        sole_available(&roster, &snapshot.state, &enrolled, seat.now)
+    }) else {
+        return false;
+    };
     if snapshot.state.pinned
-        || !lone_default(&roster, None)
         || !lone_walled(cli, &roster, &snapshot.state, &enrolled, seat.now)
-        || default_execution(cli, &roster, &snapshot.state).is_err()
-        || check_default_login_identity(
+        || snapshot.state.execution_verdict(&row.label).is_err()
+        || check_launch_login_identity(
             cli,
             &roster,
+            Some(row),
             seat.home,
             program,
             Some(seat.sync_here(cli).here()),
@@ -2298,8 +2386,18 @@ pub fn lift_lone_wall(
     {
         return false;
     }
+    let unread = default_only(cli, &roster, program);
     let mut launch = provider_read::Launch::launch_use(LaunchUse(()));
-    read_lone_wall(seat, cli, &mut snapshot, &enrolled, read, &mut launch).is_ok()
+    read_lone_wall(
+        seat,
+        cli,
+        &mut snapshot,
+        &enrolled,
+        unread.as_ref(),
+        read,
+        &mut launch,
+    )
+    .is_ok()
         && !lone_walled(cli, &roster, &snapshot.state, &enrolled, seat.now)
 }
 
@@ -2438,6 +2536,18 @@ fn refused_pin(
     )
 }
 
+#[cfg(test)]
+fn launch_env_using(
+    seat: &Seat<'_>,
+    cli: Cli,
+    read: ReadUsage<'_>,
+    program: Option<&Path>,
+    prepare: impl FnMut(&Row) -> io::Result<LoginEnv>,
+) -> Result<Option<LoginEnv>, String> {
+    let mut launch = provider_read::Launch::launch_use(LaunchUse(()));
+    launch_env_reading(seat, cli, read, program, &mut launch, prepare)
+}
+
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -2470,18 +2580,23 @@ fn refused_pin(
         project = "aterm_agent::harness::accounts_pool::tests::preparation::preparation_transition"
     )
 )]
-fn launch_env_using(
-    seat: &Seat<'_>,
-    cli: Cli,
-    read: ReadUsage<'_>,
-    program: Option<&Path>,
-    prepare: impl FnMut(&Row) -> io::Result<LoginEnv>,
-) -> Result<Option<LoginEnv>, String> {
-    let mut launch = provider_read::Launch::launch_use(LaunchUse(()));
-    launch_env_reading(seat, cli, read, program, &mut launch, prepare)
-}
-
-/// [`launch_env_using`] spending the same launch allowance through every pick.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountPoolLaunch",
+        action = "Choose",
+        project = "aterm_agent::harness::accounts_pool::tests::launch_admission::launch_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountPoolUsagePolicy",
+        action = "PollAndChoose",
+        project = "aterm_agent::harness::accounts_pool::tests::usage_policy::usage_transition"
+    )
+)]
+/// A launch spending the same allowance through every pick and preparation.
 fn launch_env_reading(
     seat: &Seat<'_>,
     cli: Cli,
@@ -2595,11 +2710,18 @@ fn launch_env_reading_capturing(
         // record but a read of it can show a wall that came up since its last session, since a
         // session that starts on a wall writes no figure for it.
         read_launch_rows(seat, cli, &mut snapshot, &enrolled, unread, read, launch)?;
-        read_lone_wall(seat, cli, &mut snapshot, &enrolled, read, launch)?;
+        read_lone_wall(seat, cli, &mut snapshot, &enrolled, unread, read, launch)?;
         lone_unwalled(cli, roster, &snapshot.state, &enrolled, seat.now)?;
         return Ok(None);
     }
     read_launch_rows(seat, cli, &mut snapshot, &enrolled, unread, read, launch)?;
+    // A roster that lists rows for other Macs is a lone row here all the same: no pick can leave a
+    // wall on the one row enrolled here, so only this read can show that wall gone. The owner's pin
+    // on it is the owner's to lift. A row this launch could not start on anyway (another Mac's lease,
+    // a clock off, a preparation) is not read, under the no-polling rule.
+    if pinned.is_none() && sole_available(roster, &snapshot.state, &enrolled, seat.now).is_some() {
+        read_lone_wall(seat, cli, &mut snapshot, &enrolled, unread, read, launch)?;
+    }
     let mut state = snapshot.state.clone();
     if let Some(why) = unread
         && let Some(pinned) = pinned_own(roster, &state)

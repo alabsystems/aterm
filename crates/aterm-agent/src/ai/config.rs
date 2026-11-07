@@ -683,18 +683,58 @@ pub fn default_ai_dir() -> Option<PathBuf> {
     aterm_types::dirs::state_dir().map(|root| root.join(super::store::DIR))
 }
 
-/// Reads `aterm.toml` at `config` (absent or unreadable: every default) and the fleet document.
-#[must_use]
-pub fn load_with(config: Option<&Path>, ai_dir: Option<&Path>, now: i64) -> Settings {
-    let text = config.and_then(|p| {
-        crate::harness::accounts::read_bounded(p, CONFIG_MAX_BYTES)
-            .ok()
-            .flatten()
-    });
-    load_from_text(text.as_deref(), config, ai_dir, now).0
+/// The text of the `aterm.toml` at `config`, admitted by the rule every reader of it holds
+/// ([`aterm_types::dirs::read_aterm_config_text`]: a file group or others can write is refused,
+/// as the window refuses it) and at most [`CONFIG_MAX_BYTES`]; `Ok(None)` where none is named or
+/// the file is absent.
+///
+/// # Errors
+///
+/// Why a file that is there is not read, in one line.
+pub fn read_config(config: Option<&Path>) -> Result<Option<String>, String> {
+    let Some(path) = config else {
+        return Ok(None);
+    };
+    match aterm_types::dirs::read_aterm_config_text(path) {
+        Ok(Some(text)) if text.len() as u64 > CONFIG_MAX_BYTES => {
+            Err(format!("larger than {CONFIG_MAX_BYTES} bytes"))
+        }
+        Ok(text) => Ok(text),
+        Err(e) => Err(one(&e.to_string())),
+    }
 }
 
-pub(crate) fn load_from_text(
+/// Reads `aterm.toml` at `config` ([`read_config`]; absent: every default) and the fleet
+/// document. A file that is there and is not read sets nothing and names no fleet document, as
+/// the window runs every setting at its default when it cannot read the file at launch; a note
+/// says why.
+#[must_use]
+pub fn load_with(config: Option<&Path>, ai_dir: Option<&Path>, now: i64) -> Settings {
+    load_read(&read_config(config), config, ai_dir, now).0
+}
+
+/// [`load_with`] of what [`read_config`] read of the `aterm.toml` at `config`, and that text
+/// parsed where it is TOML.
+pub(crate) fn load_read(
+    read: &Result<Option<String>, String>,
+    config: Option<&Path>,
+    ai_dir: Option<&Path>,
+    now: i64,
+) -> (Settings, Option<Value>) {
+    match read {
+        Ok(text) => load_from_text(text.as_deref(), config, ai_dir, now),
+        Err(why) => {
+            let shown = config.unwrap_or(Path::new("aterm.toml")).display();
+            let note = format!(
+                "{shown} cannot be read ({why}), so [ai] is at its defaults and reads no fleet \
+                 document"
+            );
+            (resolve(&Local::default(), None, None, vec![note]), None)
+        }
+    }
+}
+
+fn load_from_text(
     text: Option<&str>,
     config: Option<&Path>,
     ai_dir: Option<&Path>,

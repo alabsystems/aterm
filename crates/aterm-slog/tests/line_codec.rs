@@ -815,7 +815,13 @@ fn phase_6_ring_row_keys_are_appended_at_their_tiers() {
     }
     assert_eq!(CHANGE_WORDS, ["add", "drop"]);
     assert!(Fields::new().word(Key::Change, "rename").is_err(), "closed");
-    for w in ["not-carried", "log-replaced", "signin", "install"] {
+    for w in [
+        "not-carried",
+        "log-replaced",
+        "signin",
+        "install",
+        "cancelled",
+    ] {
         assert!(Fields::new().word(Key::Why, w).is_ok(), "why={w}");
     }
 

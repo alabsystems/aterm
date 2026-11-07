@@ -395,6 +395,15 @@ fn qualify(result: &BottleOutcome) -> Result<()> {
         &atpkg::install::StageHooks::NONE,
     )
     .map_err(|error| Error::refused(format!("GNU client staging: {error}")))?;
+    qualify_staged(result, &stage, row)
+}
+
+pub(crate) fn qualify_staged(
+    result: &BottleOutcome,
+    stage: &Path,
+    row: &atpkg::manifest::Artifact,
+) -> Result<()> {
+    let work = crate::channel::Scratch::new("gnu-git-qualification")?;
     let git = stage.join("bin/git");
     let global = work.path().join("global.gitconfig");
     std::fs::write(&global, b"")
@@ -480,7 +489,10 @@ fn qualify(result: &BottleOutcome) -> Result<()> {
     }
     run(&["ls-remote", "https://github.com/git/git.git", "HEAD"])?;
     if Triple::host() == Some(result.triple) {
-        let native = work.path().join("native-client-acceptance");
+        let layout = atpkg::store::Layout {
+            prefix: work.path().join("native-client-acceptance"),
+        };
+        let native = layout.build_dir(&result.program, result.build);
         atpkg::verify_and_stage(
             row,
             &result.asset,
@@ -488,7 +500,7 @@ fn qualify(result: &BottleOutcome) -> Result<()> {
             &atpkg::install::StageHooks::NONE,
         )
         .map_err(|error| Error::refused(format!("native GNU client admission: {error}")))?;
-        if !work.path().join("native-client-acceptance.ready").is_file() {
+        if !atpkg::store::ready_marker_path(&native).is_some_and(|marker| marker.is_file()) {
             return Err(Error::refused(
                 "native GNU client admission did not produce its ready marker",
             ));

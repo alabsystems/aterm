@@ -664,24 +664,12 @@ fn used(file: PathBuf) -> PathBuf {
 fn holds(me: u32, file: &Path, text: &str) -> bool {
     use std::io::Read as _;
     use std::os::unix::fs::MetadataExt as _;
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    use std::os::unix::fs::OpenOptionsExt as _;
     let want = text.len() as u64;
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    if !fs::symlink_metadata(file).is_ok_and(|m| m.is_file()) {
-        return false;
-    }
     let mut opts = fs::OpenOptions::new();
     opts.read(true);
-    #[cfg(target_os = "macos")]
-    opts.custom_flags(0x0004 | 0x0100);
-    #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
-    opts.custom_flags(0o100_000 | 0o4000);
-    #[cfg(all(
-        target_os = "linux",
-        not(any(target_arch = "aarch64", target_arch = "arm"))
-    ))]
-    opts.custom_flags(0o400_000 | 0o4000);
+    if !no_link_no_wait(&mut opts) && !fs::symlink_metadata(file).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
     let Ok(opened) = opts.open(file) else {
         return false;
     };
@@ -699,6 +687,28 @@ fn holds(me: u32, file: &Path, text: &str) -> bool {
         && read == text.as_bytes()
 }
 
+/// Set `opts` to open a file not through a link at its last name and without waiting on a FIFO
+/// for a writer (`O_NOFOLLOW | O_NONBLOCK`, by macOS's and Linux's values, this crate depending
+/// on nothing), and say whether it did: elsewhere a caller looks first that the name is a
+/// regular file, no link ([`holds`], `made_by_a_child`).
+#[cfg(unix)]
+fn no_link_no_wait(opts: &mut fs::OpenOptions) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use std::os::unix::fs::OpenOptionsExt as _;
+    #[cfg(target_os = "macos")]
+    opts.custom_flags(0x0004 | 0x0100);
+    #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
+    opts.custom_flags(0o100_000 | 0o4000);
+    #[cfg(all(
+        target_os = "linux",
+        not(any(target_arch = "aarch64", target_arch = "arm"))
+    ))]
+    opts.custom_flags(0o400_000 | 0o4000);
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = opts;
+    cfg!(any(target_os = "macos", target_os = "linux"))
+}
+
 /// The file holding `text` in user `me`'s stand-in cache in `tmp`'s quiet folder ([`quiet_in`]),
 /// made when none of its slots holds it yet; `None` when the cache cannot be used.
 /// [`shared_stand_in`]'s `me` is this process's effective uid. The cache folder is used only
@@ -706,20 +716,20 @@ fn holds(me: u32, file: &Path, text: &str) -> bool {
 /// others, so another user's folder of its name (in a shared `/tmp`, made before this user's) is
 /// refused.
 ///
-/// The cache holds one file per text (a slot more only where a writer died mid-write or two
-/// first writers raced), so it stays as small as the set of texts, and nothing here renames,
-/// links or removes a file in it (macOS's cleaners take a slot no call has marked [`used`] for
-/// 3 days). A file is made under its own name with no exec bit, written, closed, and only then
-/// made mode 0555. A slot is used only when it is a regular file of `me`'s, mode 0555, holding
-/// exactly `text`, so no process runs one still being written (an exec of a file open for
-/// writing is `ETXTBSY` on Linux), and a slot that is not becomes the next slot's turn.
+/// The cache holds one file per text (a slot more only where a write was cut short or two
+/// first writers raced), so it stays as small as the set of texts, and nothing here renames or
+/// links a slot, or removes one written whole (macOS's cleaners take a slot no call has marked
+/// [`used`] for 3 days; off Apple a write whose child fails removes what it made). A file is
+/// made under its own name with no exec bit, written whole, and only then made mode 0555,
+/// through a descriptor of the file made and never by path ([`slot_made`]; off Apple a child
+/// process writes it and has closed it first). A slot is used only when it is a
+/// regular file of `me`'s, mode 0555, holding exactly `text`, so no process runs one still
+/// being written (an exec of a file open for writing is `ETXTBSY` on Linux), and a slot that is
+/// not becomes the next slot's turn.
 #[cfg(unix)]
 #[cfg_attr(trust_verify, trust::skip)]
 fn cached_in(me: u32, tmp: &Path, text: &str) -> Option<PathBuf> {
-    use std::io::Write as _;
-    use std::os::unix::fs::{
-        DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
-    };
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
     let cache = quiet_in(tmp).join(format!("{STAND_IN_CACHE}{me}"));
     if let Err(e) = fs::DirBuilder::new().mode(0o700).create(&cache)
         && e.kind() != io::ErrorKind::AlreadyExists
@@ -735,19 +745,8 @@ fn cached_in(me: u32, tmp: &Path, text: &str) -> Option<PathBuf> {
     let hash = fnv1a(text.as_bytes());
     for slot in 0..4 {
         let file = cache.join(format!("{hash:016x}-{slot}"));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&file)
-        {
-            Ok(mut made) => {
-                let written = made.write_all(text.as_bytes());
-                drop(made);
-                return (written.is_ok()
-                    && fs::set_permissions(&file, fs::Permissions::from_mode(0o555)).is_ok())
-                .then_some(file);
-            }
+        match slot_made(&file, text) {
+            Ok(()) => return Some(file),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 if holds(me, &file, text) {
                     return Some(file);
@@ -759,14 +758,192 @@ fn cached_in(me: u32, tmp: &Path, text: &str) -> Option<PathBuf> {
     None
 }
 
+/// The slot `file` made, holding `text`, written and closed by this process, then mode 0555
+/// through the descriptor it made it with; an `AlreadyExists` error when `file` exists, and
+/// another when it cannot be written or its mode set (left 0600, which no use of the cache
+/// takes).
+#[cfg(target_vendor = "apple")]
+#[cfg_attr(trust_verify, trust::skip)]
+fn slot_made(file: &Path, text: &str) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let mut made = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(file)?;
+    made.write_all(text.as_bytes())?;
+    made.set_permissions(fs::Permissions::from_mode(0o555))
+}
+
+/// The slot `file` made, holding `text`, written by a child process, then mode 0555 through the
+/// descriptor it was checked by ([`written_by`]), never by path; an `AlreadyExists` error when a
+/// name is at `file` that this call did not make (one there before, or a first writer's that
+/// raced this one), and another error, with nothing this call made left at `file`, when the
+/// child fails or the mode cannot be set.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+#[cfg_attr(trust_verify, trust::skip)]
+fn slot_made(file: &Path, text: &str) -> io::Result<()> {
+    written_by(file, text.as_bytes(), 0o555, WRITES_ITS_INPUT)
+}
+
+/// The line [`made_by_a_child`]'s `sh` runs: `$1` opened on descriptor 3 under `set -C`, `made`
+/// said on stdout once it is open, then `cat` writing its stdin there, a file readable by this
+/// user alone (`umask 077`). `set -C` (POSIX's noclobber; dash, bash and BusyBox's `sh` alike)
+/// makes a new file, with `O_EXCL`, where `$1` names nothing, and refuses a regular file, a
+/// link to one and a link to nothing; a file of another type, or a link to one (a device, a
+/// FIFO), it opens as it is, with no `O_EXCL` and no truncation.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+const WRITES_ITS_INPUT: &str = "set -C; umask 077; { echo made; exec cat >&3; } 3>\"$1\"";
+
+/// Make `path` (it must not exist) holding `body`, then mode `mode`, with a child process
+/// writing it, so no descriptor of this process's ever has `path` open for writing: off Apple,
+/// the writer of a file a test runs (`stand_in`'s, the stand-in cache's, and aterm-verify's
+/// `standin` where that cache cannot be used).
+///
+/// Linux refuses to exec a file anything holds open for writing (`ETXTBSY`), and a child
+/// another thread forks while this process holds a file open keeps that descriptor until its
+/// own exec (close-on-exec closes it only then), tens to hundreds of milliseconds under load.
+/// A program refused so is not always told: a zsh runs the next match on `PATH` instead. The
+/// child here opens `path` after its fork and has exited before this returns, so once `path`
+/// is made no process holds a writer of it. Its mode is set through a descriptor this process
+/// opens to read, never to write, on the file the child made ([`made_by_a_child`]), so never
+/// through a link.
+///
+/// Test support that aterm-verify's `standin` reaches in every profile it builds in, so it is
+/// not gated by profile; no shipped code calls it.
+///
+/// # Errors
+/// `AlreadyExists` when a name is at `path` that this call did not make, which is left as it
+/// is: one there before, or one put there after this call looked (another writer's file, which
+/// `set -C` refuses, or another type of file or a link to one, which it opens and the child
+/// writes into). Another error when `path`'s directory refuses a file, the child does not start
+/// or fails, or the mode cannot be set; then nothing this call made is left at `path`.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+#[cfg_attr(trust_verify, trust::skip)]
+#[doc(hidden)]
+pub fn written_by_a_child(path: &Path, body: &[u8], mode: u32) -> io::Result<()> {
+    written_by(path, body, mode, WRITES_ITS_INPUT)
+}
+
+/// [`written_by_a_child`], its child's `sh` running `line` ([`WRITES_ITS_INPUT`]).
+#[cfg(all(unix, not(target_vendor = "apple")))]
+#[cfg_attr(trust_verify, trust::skip)]
+fn written_by(path: &Path, body: &[u8], mode: u32, line: &str) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let (made, meta) = made_by_a_child(path, body, line)?;
+    let set = made.set_permissions(fs::Permissions::from_mode(mode));
+    if set.is_err()
+        && fs::symlink_metadata(path).is_ok_and(|m| (m.dev(), m.ino()) == (meta.dev(), meta.ino()))
+    {
+        let _ = fs::remove_file(path);
+    }
+    set
+}
+
+/// Make `path` (it must not exist) holding `body`, mode 0600, with a child process's `sh`
+/// running `line` ([`WRITES_ITS_INPUT`]) on it; the file made, open to read, never to write, and
+/// its metadata.
+///
+/// `body` reaches the child as its stdin, a file this process writes under a hidden name of its
+/// own beside `path`, unnamed before the child starts (that file is never run, so a fork holding
+/// it open costs nothing); so an error of `path`'s directory (`PermissionDenied`, `NotFound`) is
+/// that file's. A look first refuses any name at `path`, a link whatever it leads to included,
+/// so the child's `set -C` opens a file there that it did not make only when one is put there
+/// after that look, by whoever may write `path`'s directory. What the child wrote is then
+/// opened without following a link ([`no_link_no_wait`]; on a Unix whose flags this crate does
+/// not know, after a look that it is a regular file) and taken only as a regular file of this
+/// user's, of one name, `body`'s length: what `set -C` opens and is not, or a link, is no file
+/// this call made.
+/// The child says it opened `path` (`made`) before it writes: when it then fails, a regular file
+/// at `path` is the one it made, since `set -C` opens a regular file only when it makes it, and
+/// is removed.
+///
+/// An `AlreadyExists` error when a name is at `path` that this call did not make, left as it
+/// is; another error, with nothing this call made left at `path`, when the child does not start
+/// or fails.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+#[cfg_attr(trust_verify, trust::skip)]
+fn made_by_a_child(path: &Path, body: &[u8], line: &str) -> io::Result<(fs::File, fs::Metadata)> {
+    use std::io::{Seek as _, Write as _};
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let not_made = |what: &str| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{}: {what}", path.display()),
+        )
+    };
+    if fs::symlink_metadata(path).is_ok() {
+        return Err(not_made("exists"));
+    }
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let staged_at = dir.join(unique_name(".stand-in-body."));
+    let mut staged = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&staged_at)?;
+    fs::remove_file(&staged_at)?;
+    staged.write_all(body)?;
+    staged.rewind()?;
+    #[expect(
+        clippy::disallowed_types,
+        reason = "aterm-tempfile depends on nothing, so not on spawnfd: one `sh` writing a \
+                  stand-in's bytes, its stdin a file of this process's and its stdout and \
+                  stderr pipes to this one"
+    )]
+    let mut sh = std::process::Command::new("/bin/sh");
+    let out = sh
+        .args(["-c", line, "sh"])
+        .arg(path)
+        .stdin(staged)
+        .output()?;
+    let named = fs::symlink_metadata(path);
+    if !out.status.success() {
+        let ended = format!(
+            "the `sh` writing it ended with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        if out.stdout == b"made\n" && named.as_ref().is_ok_and(fs::Metadata::is_file) {
+            let _ = fs::remove_file(path);
+        } else if named.is_ok() {
+            return Err(not_made(&ended));
+        }
+        return Err(io::Error::other(format!("{}: {ended}", path.display())));
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    if !no_link_no_wait(&mut opts) && !named.is_ok_and(|m| m.is_file()) {
+        return Err(not_made("not the file its writer made"));
+    }
+    let made = opts
+        .open(path)
+        .map_err(|e| not_made(&format!("not the file its writer made ({e})")))?;
+    let meta = made.metadata()?;
+    if !meta.is_file()
+        || meta.uid() != euid()
+        || meta.nlink() != 1
+        || meta.len() != body.len() as u64
+    {
+        return Err(not_made("not the file its writer made"));
+    }
+    Ok((made, meta))
+}
+
 /// Lay an executable stand-in at `path` holding `body`, mode 0555, replacing whatever is there by rename.
 ///
 /// On macOS `path` is a symlink to the one file of `body` this user's stand-ins share
 /// ([`shared_stand_in`]), made at a name of its own beside `path` and renamed over it. Off
-/// macOS, and where that cache cannot be used, `path` is a file of its own holding `body`.
-/// Either way `path` reads and runs as `body`, and `$0` in it is `path`. A caller that needs a
-/// regular file of its own at `path` (one a program judges by its type or by where it resolves)
-/// writes that file itself.
+/// macOS, and where that cache cannot be used, `path` is a file of its own holding `body`; off
+/// Apple a child process writes that file (`written_by_a_child`), so no fork of this process
+/// holds it open for writing when it runs. Either way `path` reads and runs as `body`, and `$0`
+/// in it is `path`. A caller that needs a regular file of its own at `path` (one a program
+/// judges by its type or by where it resolves) writes that file itself.
 /// # Errors
 /// Returns an error if `path` has no file name or the stand-in cannot be written or moved into place.
 #[cfg(all(unix, any(test, debug_assertions, feature = "test-support")))]
@@ -798,7 +975,11 @@ pub fn stand_in(path: &Path, body: &str) -> io::Result<()> {
 }
 
 /// Create `path` (it must not exist) holding `body`, then make it mode 0555.
-#[cfg(all(unix, any(test, debug_assertions, feature = "test-support")))]
+#[cfg(all(
+    unix,
+    target_vendor = "apple",
+    any(test, debug_assertions, feature = "test-support")
+))]
 #[allow(clippy::question_mark)]
 fn write_read_only(path: &Path, body: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
@@ -821,6 +1002,18 @@ fn write_read_only(path: &Path, body: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(path);
     }
     written
+}
+
+/// Create `path` (it must not exist) holding `body`, written by a child process, then make it
+/// mode 0555 ([`written_by_a_child`], which leaves nothing it made behind an error and nothing
+/// it did not make removed).
+#[cfg(all(
+    unix,
+    not(target_vendor = "apple"),
+    any(test, debug_assertions, feature = "test-support")
+))]
+fn write_read_only(path: &Path, body: &[u8]) -> io::Result<()> {
+    written_by_a_child(path, body, 0o555)
 }
 
 /// 64-bit FNV-1a, aterm-hash's `fnv1a_64` (this crate depends on nothing): names a text's slots
@@ -1444,6 +1637,99 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, cache(linked.path(), me)).expect("the link");
         assert_eq!(cached_in(me, linked.path(), text), None, "a symlink");
         assert_eq!(held(&elsewhere), Some(0), "nothing through the symlink");
+    }
+
+    /// OFF APPLE A CHILD WRITER REMOVES ONLY WHAT IT MADE. A file another writer makes at the
+    /// name after the writer looked (here the child's own line does, ahead of its open) is
+    /// refused by `set -C` and left whole, with `AlreadyExists` (`write_read_only` and the
+    /// stand-in cache both write through this). A file the child made and then failed to write
+    /// is removed, with the child's error. NEGATIVE CONTROL: a file the child makes and writes
+    /// whole is kept, holding the body, of one name, in the mode asked, and no writer leaves
+    /// the body it staged.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    #[test]
+    fn a_child_writer_removes_only_what_it_made() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempdir().expect("a fixture");
+        let theirs = dir.path().join("theirs");
+        let raced = format!("echo theirs >\"$1\"; {WRITES_ITS_INPUT}");
+        let refused = written_by(&theirs, b"mine\n", 0o555, &raced);
+        assert_eq!(
+            refused.map_err(|e| e.kind()),
+            Err(io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(
+            fs::read_to_string(&theirs).ok().as_deref(),
+            Some("theirs\n"),
+            "another writer's file is left whole"
+        );
+        let cut = dir.path().join("cut");
+        let fails = "set -C; umask 077; { echo made; echo part >&3; exit 1; } 3>\"$1\"";
+        let failed = written_by(&cut, b"whole\n", 0o555, fails)
+            .expect_err("the child failed")
+            .kind();
+        assert_ne!(failed, io::ErrorKind::AlreadyExists);
+        assert!(
+            fs::symlink_metadata(&cut).is_err(),
+            "{} is left part-written",
+            cut.display()
+        );
+        let made = dir.path().join("made");
+        written_by_a_child(&made, b"whole\n", 0o555).expect("written whole");
+        let meta = fs::symlink_metadata(&made).expect("made");
+        assert!(meta.is_file() && meta.nlink() == 1, "{meta:?}");
+        assert_eq!(meta.mode() & 0o7777, 0o555);
+        assert_eq!(fs::read(&made).ok().as_deref(), Some(&b"whole\n"[..]));
+        let mut names: Vec<String> = fs::read_dir(dir.path())
+            .expect("list")
+            .map(|e| e.expect("entry").file_name().into_string().expect("UTF-8"))
+            .collect();
+        names.sort();
+        assert_eq!(names, ["made", "theirs"]);
+    }
+
+    /// OFF APPLE A CHILD WRITER SETS A MODE ONLY ON THE FILE ITS CHILD MADE. A link to a FIFO
+    /// put at the name after the writer looked (here by the child's own line, ahead of its
+    /// open) is opened by `set -C`, and the child writes into the FIFO; the writer then refuses
+    /// the name as no file it made (`AlreadyExists`) and leaves the link, and the FIFO's mode,
+    /// as they were. NEGATIVE CONTROL: the bytes reached the FIFO, so the child did write
+    /// through the link.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_child_writers_mode_is_never_set_through_a_link() {
+        use std::io::Read as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempdir().expect("a fixture");
+        let mode = |path: &Path| fs::symlink_metadata(path).map(|m| m.mode() & 0o7777).ok();
+        let fifo = dir.path().join("fifo");
+        let made = aterm_uds::deadline::output_within(
+            aterm_uds::spawnfd::command("mkfifo")
+                .args(["-m", "600"])
+                .arg(&fifo),
+            MUST_HAPPEN,
+        )
+        .expect("mkfifo ran");
+        assert!(made.status.success(), "mkfifo: {made:?}");
+        assert_eq!(mode(&fifo), Some(0o600));
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true);
+        assert!(no_link_no_wait(&mut opts), "a reader waits for no writer");
+        let mut reader = opts.open(&fifo).expect("the FIFO's reader");
+        let tool = dir.path().join("tool");
+        let steered = format!("ln -s fifo \"$1\"; {WRITES_ITS_INPUT}");
+        let refused = written_by(&tool, b"body\n", 0o755, &steered);
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).expect("what the child wrote");
+        assert_eq!(got, b"body\n", "the child wrote through the link");
+        assert_eq!(mode(&fifo), Some(0o600), "the FIFO's mode was set");
+        assert!(
+            fs::symlink_metadata(&tool).is_ok_and(|m| m.file_type().is_symlink()),
+            "the link is left"
+        );
+        assert_eq!(
+            refused.map_err(|e| e.kind()),
+            Err(io::ErrorKind::AlreadyExists)
+        );
     }
 
     /// THE QUIET FOLDER'S SHAPE: a directory asked for in a shared root goes in that root's

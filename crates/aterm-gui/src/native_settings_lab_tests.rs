@@ -315,17 +315,16 @@ fn historical_peer_inventory_is_readable_at_both_widths_without_claiming_current
 
 #[test]
 fn retained_peer_repairs_survive_expiry_and_remain_readable_at_both_widths() {
-    use aterm_types::network_state::{RepairObservation, RepairOutcome, RepairStage};
+    use aterm_types::network_state::{RepairCause, RepairObservation, RepairOutcome, RepairStage};
 
     for (width, height) in [(1200.0, 820.0), (600.0, 620.0)] {
         for (outcome, word) in [
-            (RepairOutcome::Failed, "Failed"),
+            (RepairOutcome::Failed(RepairCause::Io), "Failed (io)"),
             (RepairOutcome::Exchanged, "One application exchange"),
         ] {
             let mut lab = fixture();
             Arc::make_mut(&mut lab.network).network.peers[0].last_repair =
                 Some(RepairObservation {
-                    cause: None,
                     completed_at_ms: 90_000,
                     outbound: true,
                     stage: Some(RepairStage::Application),

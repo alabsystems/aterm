@@ -744,7 +744,7 @@ usage: targo --unverified lab <command> [tag] [args]
 Outside any lab (no jail, no stub):
   instance [--window] [--band app|agent] [--aterm PATH] [--columns N] [--lines N] [--font-px N] [--scale N] [--scene band-icons|harness-layouts]
            [--env NAME=VALUE]... [--toml LINE]... [--toml-after LINE]... [--harness-key LINE]... [--home DIR] [--harness]
-           [--reroute-prefix DIR] [--pre VERB]... [--image PNG] [--post VERB]... [--pages cold] [--keep | --world DIR] [-- PROGRAM ARGS]
+           [--reroute-prefix DIR] [--pre VERB]... [--image PNG] [--post VERB]... [--pages cold] [--network-away-in-ms N] [--keep | --world DIR] [-- PROGRAM ARGS]
                                  run a private aterm in a scratch HOME/XDG world, print its socket and build and hold it until
                                  Ctrl-C or SIGTERM (--window: a real window; --band: app (the default) runs it as its own
                                  launchd job, in a coalition of its own as aterm.app is, a window under its keeper there, and agent
@@ -760,6 +760,9 @@ Outside any lab (no jail, no stub):
                                  --scene band-icons draws procedural chrome icons beside H (debug/dev-seams build)
                                  --scene harness-layouts draws labeled synthetic footer states through the real renderer
                                  (debug/dev-seams build; no live agent, upgrade candidate or account is read)
+                                 --network-away-in-ms N seeds a fresh private world's remembered home and scripted remote
+                                 route; its away entry becomes eligible in N ms (1..120000, debug Lab and checkout's default debug app
+                                 only, no --aterm or LAB_ATERM fallback; no LAN proof)
   abrew-admission [--json] [--indexes DIR] [--this-machine | --arch A --macos V --xcode V|none --no-clt]
                                  evaluate abrew admission of Homebrew's formula.json and cask.json (fetched from
                                  formulae.brew.sh unless --indexes DIR holds them) on the newest Mac, that Mac with the
@@ -837,15 +840,16 @@ Outside any lab (no jail, no stub):
                                  founders an admin approved by code (seatless, S1), one seated by its own proof under
                                  its own label and one by a person's Allow, then a rotation that carries both and drops
                                  the third, which nothing seated
-  mesh churn [--n N] [--seed S] [--minutes M] [--negative-control NAME] [--aterm PATH] [--keep] [--record] [--label WORD]
+  mesh churn [--n N] [--seed S] [--minutes M] [--whole-wraps] [--negative-control NAME] [--aterm PATH] [--keep] [--record] [--label WORD]
                                  found a membership log on N private Macs (default 30) on loopback, each its own vault
                                  server and subscriber on the run's genesis; let each in by Allow and the phrase, stop
                                  two for M minutes, remove two at once, restart two, split two islands (a remover killed
                                  mid-batch on one; a write, a newcomer and a rebuild on the other), heal, and judge the
                                  frontier, newest key, Wrap bound, removed seats and the per-seat view, every time a
-                                 measurement (--negative-control old-gap-rule|unsettled-ok: a run that holds only when
-                                 its check fails, refused until A3 lands their reader; --record: write docs/measured/,
-                                 its name carrying --label's WORD)
+                                 measurement (--whole-wraps: island A takes every Wrap of the remover's [everyone] epoch,
+                                 so the newcomer's gap heals at once; --negative-control old-gap-rule|unsettled-ok, or
+                                 frontier-blind with --whole-wraps: a run that holds only when its check fails;
+                                 --record: write docs/measured/, its name carrying --label's WORD)
   disk-lane [--aterm PATH] [--keep]
                                  mount an 8 GiB sparse APFS image and verify disk-pressure tier eviction and reserve order (~1 min)
   disk-ask [tag] [--keep] [--scenario clear|partial|unanswered|exhausted|worker]

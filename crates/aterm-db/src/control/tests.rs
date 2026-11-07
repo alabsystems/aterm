@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use aterm_types::network_state::RepairCause;
 
 #[test]
 fn a_previous_round_actor_is_not_a_new_authenticated_contact() {
@@ -15,7 +16,7 @@ fn a_previous_round_actor_is_not_a_new_authenticated_contact() {
     repair.prepare(trust, actor);
     assert_eq!(repair.authenticated_actor(), Some(actor));
     repair.application = Some(crate::replica::Report::default());
-    repair.application_error = Some("previous upgrade failed".into());
+    repair.application_error = Some(Failure::new(RepairCause::Other, "previous upgrade failed"));
     repair.data.interrupted = Some(crate::replica::Report {
         received: 1,
         ..Default::default()
@@ -35,7 +36,10 @@ fn a_previous_round_actor_is_not_a_new_authenticated_contact() {
         reason: "previous batch refused".into(),
     });
     repair.membership = Some(Report::default());
-    repair.membership_error = Some("previous membership exchange failed".into());
+    repair.membership_error = Some(Failure::new(
+        RepairCause::Other,
+        "previous membership exchange failed",
+    ));
     repair.data.retry_probe = true;
     repair.phase = Phase::Complete;
     repair.begin_round();
@@ -1544,7 +1548,7 @@ fn failed_pre_authentication_connected_round_clears_previous_round_state() {
     repair.prepare(lab.trust, peer.actor);
     repair.cursor = Some([7; 32]);
     repair.application = Some(crate::replica::Report::default());
-    repair.application_error = Some("previous upgrade failed".into());
+    repair.application_error = Some(Failure::new(RepairCause::Other, "previous upgrade failed"));
     repair.said = Said::Nothing;
     repair.phase = Phase::Complete;
     let mut stream = Script {

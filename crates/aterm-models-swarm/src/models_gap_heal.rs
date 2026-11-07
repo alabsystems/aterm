@@ -21,11 +21,14 @@ use aterm_spec::derive::*;
 /// remover's grace (`log_entries::REMOVER_GRACE_MS`). The model counts each as one step and
 /// keeps only their order, so a conformance run advances its injected clock at each `Tick` to
 /// the deadline that `Tick` stands for. A `Tick` waits until every Mac that is up has run its
-/// vault pass since its last record arrived (`pa`, `pb`). A batch that ends in `Wrap`s settles
-/// only by the settle grace: a whole batch an observer holds at a `Tick` is settled. A batch
-/// that ends in a non-`Wrap` record (a remover's re-`Put`s) is settled once whole. B's rank
-/// comes due one step after its clock for the gap starts (`bt`), and the clock is dropped once
-/// B sees no gap, as the gap mark keeps only open gaps.
+/// vault pass since its last record arrived (`pa`, `pb`). A batch that ends in a non-`Wrap`
+/// record (a remover's re-`Put`s) is settled once whole. One that ends in `Wrap`s is settled
+/// once whole where every recipient its batch could wrap holds a `Wrap` of it (its own, or a
+/// heal's) or sorts below its last `Wrap` (`Log::batch_whole`, one-mesh §11 H2): a batch wraps in
+/// ascending recipient order, so the rest of it could wrap no one. Otherwise it settles only by the settle grace: a whole batch
+/// an observer holds at a `Tick` is settled. B's rank comes due one step after its clock for
+/// the gap starts (`bt`), and the clock is dropped once B sees no gap, as the gap mark keeps
+/// only open gaps.
 ///
 /// The model rests on four timing assumptions, which a conformance run's clocks must meet:
 ///
@@ -51,10 +54,16 @@ use aterm_spec::derive::*;
 /// - `OldMint` (1): C mints epoch 2 by the intersection carry over a partial view, wrapping A, B
 ///   and itself and leaving D out though D's `Admit` lies in its past (the 88-to-3 drop). Its
 ///   batch reaches A as a prefix (`DeliverToA` twice) and B whole (`DeliverToB`). A may `Sleep`
-///   and `Wake`; while A is down, B heals at its rank.
-/// - `OldMintOmitsB` (2): as `OldMint`, but C leaves B out (and there is no D). A heals B. A
-///   person on B removes C (`RemoveByB`). A B that a heal has wrapped mints in its own batch; a B
-///   that cannot open the newest epoch signs the `Remove` alone. That leaves a re-key due, minted
+///   and `Wake`; while A is down, B heals at its rank. The model fixes A's recipient the lowest
+///   of A, B and C, so A's prefix (its `Epoch` and A's own `Wrap`) leaves B and C above it and
+///   never settles. D's recipient sorts above C's, the batch's last `Wrap`, so the whole batch
+///   settles only by the grace; `OldMintUnder` is the same mint with D's recipient below C's
+///   (`dl`), so the whole batch is settled as soon as it arrives.
+/// - `OldMintOmitsB` (2): as `OldMint`, but C leaves B out (and there is no D). C could not know
+///   B (B's `Admit` is not in its batch's past), so its batch could wrap only A and C, and it is
+///   settled as soon as it arrives whole. A heals B. A person on B removes C (`RemoveByB`). A B
+///   that a heal has wrapped mints in its own batch; a B that cannot open the newest epoch signs
+///   the `Remove` alone. That leaves a re-key due, minted
 ///   by whichever tender is ready first. B's (`RotateByB`) is the remover's and, once A's heal
 ///   reaches it, a carrier's, so it ranks 0, and it waits only the settle hold from its first
 ///   sight of the due (`rb`). A's (`Rotate`) is a carrier's but not the remover's, so it waits
@@ -68,9 +77,10 @@ use aterm_spec::derive::*;
 ///   D (`Deny`, a swarm-roster deny or a node removal) may follow.
 ///
 /// Delivery: `DeliverToA` and `DeliverToB` bring C's batch; `ToB` brings A's records to B (its
-/// batch as a prefix, then the rest, then its heals); `ToA` brings B's records to A (D's
-/// `Admit`, B's heals and, in `OldMintOmitsB`, B's `Remove` and whatever B minted). A heal is
-/// pushed: `qb` is a heal of A's not yet at B and `qa` one of B's not yet at A.
+/// batch as a prefix, then the rest, then its heals, and C's batch with a heal of it where B
+/// lacks that batch); `ToA` brings B's records to A (D's `Admit`, B's heals and, in
+/// `OldMintOmitsB`, B's `Remove` and whatever B minted). A heal is pushed: `qb` is a heal of A's
+/// not yet at B and `qa` one of B's not yet at A.
 ///
 /// The variables of the newest epoch `ep` (1 the genesis epoch wrapped to A, B and C; 2 the
 /// shape's mint; 3 the re-key after C's removal) are as follows:
@@ -92,7 +102,8 @@ use aterm_spec::derive::*;
 ///
 /// The other variables:
 ///
-/// - `ad` D is admitted, `dk` A holds D's `Admit`, `dy` D is denied;
+/// - `ad` D is admitted, `dk` A holds D's `Admit`, `dy` D is denied, `dl` D's recipient sorts
+///   below the last `Wrap` of C's batch (`OldMintUnder`);
 /// - `cx` C is removed, `kr` A holds C's `Remove`;
 /// - `gr` A's clock for the remover's grace (1 started, 2 run), and `rb` B's tender's settle hold
 ///   (1 started, 2 run);
@@ -112,7 +123,10 @@ use aterm_spec::derive::*;
 ///   holds it. Until wave D turns a deny into a `Remove`, a Mac the deny has not reached may
 ///   still wrap the seat;
 /// - `OnlyHoldersMintOrHeal`: a Mac that cannot open the newest epoch mints nothing and heals
-///   nothing (a heal is held to it by construction, since it wraps a key the healer opened).
+///   nothing (a heal is held to it by construction, since it wraps a key the healer opened);
+/// - `FrontierHealsAtOnce`: once A, up and ranked first, has run its pass over C's whole batch
+///   whose last `Wrap` leaves no recipient it could wrap above it, no gap of it is open: a gap
+///   below a settled frontier heals at once, not after the settle grace.
 ///
 /// The mutants:
 ///
@@ -125,7 +139,10 @@ use aterm_spec::derive::*;
 /// 6. the heal reads a prefix or an unsettled batch as final;
 /// 7. a mint counts a removed Mac as current and wraps it;
 /// 8. B's rank counts from its first sight of the gap, not from when the batch settled
-///    (`log_entries::GAPS_FROM_FIRST_SIGHT`), so it comes due in the step A's does.
+///    (`log_entries::GAPS_FROM_FIRST_SIGHT`), so it comes due in the step A's does;
+/// 9. a whole batch that ends in `Wrap`s reads as a prefix until the settle grace even where its
+///    last `Wrap` leaves no recipient it could wrap above it, as before H2
+///    (`rekey::FRONTIER_BLIND`), so A holds D's or B's gap a step.
 ///
 /// The old intersection carry (`carried_audience_recipients`' left-out filter) is no mutant here.
 /// In every shape it agrees with the current seats on each seat the minter knows. The closer runs
@@ -157,6 +174,7 @@ pub fn gap_heal_model() -> Model {
             var ad = 0;
             var dk = 0;
             var dy = 0;
+            var dl = 0;
             var cx = 0;
             var kr = 0;
             var sa = 0;
@@ -179,6 +197,18 @@ pub fn gap_heal_model() -> Model {
                 wd = 0;
                 ad = 1;
                 dk = 1;
+                va = 0;
+                vb = 0;
+            }
+            action OldMintUnder when (sc == 0) {
+                sc = 1;
+                ep = 2;
+                mm = 3;
+                mk = 1;
+                wd = 0;
+                ad = 1;
+                dk = 1;
+                dl = 1;
                 va = 0;
                 vb = 0;
             }
@@ -299,12 +329,27 @@ pub fn gap_heal_model() -> Model {
                 pb = 0;
             }
 
+            // C's batch is settled once whole where its last `Wrap` leaves no recipient it could
+            // wrap above it (`dl`, or B unknown to C); mutant 9 reads it as a prefix until the
+            // grace all the same.
             action DeliverToA when ((bt <= 1 || bt == 3) && mm == 3 && sa == 0 && (va == 0 || (va == 1 && sc == 1))) {
-                va = if sc == 1 && va == 0 { 1 } else { 2 };
+                va = if sc == 1 && va == 0 {
+                    1
+                } else {
+                    if (sc == 2 || dl == 1) && (if Buggy == 9 { 1 } else { 0 }) == 0 {
+                        3
+                    } else {
+                        2
+                    }
+                };
                 pa = 0;
             }
             action DeliverToB when ((bt <= 1 || bt == 3) && mm == 3 && vb == 0) {
-                vb = 2;
+                vb = if (sc == 2 || dl == 1) && (if Buggy == 9 { 1 } else { 0 }) == 0 {
+                    3
+                } else {
+                    2
+                };
                 pb = 0;
             }
             action ToA when ((bt <= 1 || bt == 3) && sa == 0 &&
@@ -313,18 +358,40 @@ pub fn gap_heal_model() -> Model {
                 dk = ad;
                 kr = cx;
                 gr = if kr == 0 && cx == 1 && ep == 2 { 1 } else { gr };
+                // B's records bring C's batch whole with B's `Remove` (`OldMintOmitsB`, where it
+                // settles once whole; mutant 9 reads it as a prefix until the grace), or B's heal
+                // of D to a whole batch A holds unsettled, which then leaves nothing its batch could
+                // wrap missing.
                 va = if mm == 2 && va == 0 {
                     if lost == 1 { 2 } else { 3 }
                 } else {
-                    if kr == 0 && cx == 1 && va == 0 { 2 } else { va }
+                    if kr == 0 && cx == 1 && va == 0 {
+                        if (if Buggy == 9 { 1 } else { 0 }) == 0 { 3 } else { 2 }
+                    } else {
+                        if mm == 3 && hbd == 1 && (va == 2 || va == 5) &&
+                            (if Buggy == 9 { 1 } else { 0 }) == 0 {
+                            3
+                        } else {
+                            va
+                        }
+                    }
                 };
                 pa = 0;
             }
+            // A heal A signed as soon as C's whole batch settled at A can precede that batch at B
+            // (`OldMintOmitsB`, `OldMintUnder`): A's records bring it whole with the heal. A's heal
+            // of D settles C's whole batch wherever it lands.
             action ToB when ((bt <= 1 || bt == 3) && ((mm == 1 && vb <= 1) || qb == 1)) {
                 vb = if mm == 1 && vb <= 1 {
                     if vb == 0 { 1 } else { 3 }
                 } else {
-                    vb
+                    if mm == 3 && (if Buggy == 9 { 1 } else { 0 }) == 0 &&
+                        ((vb == 0 && (va == 2 || va == 3 || va == 5) &&
+                            (sc == 2 || dl == 1 || had == 1)) || (vb == 2 && had == 1)) {
+                        3
+                    } else {
+                        if mm == 3 && vb == 0 && (va == 2 || va == 3 || va == 5) { 2 } else { vb }
+                    }
                 };
                 qb = if mm == 1 && vb <= 1 { qb } else { 0 };
                 rb = if sc == 2 && cx == 1 && ep == 2 && qb == 1 { 1 } else { rb };
@@ -335,13 +402,21 @@ pub fn gap_heal_model() -> Model {
             action Sleep when ((bt <= 1 || bt == 3) && sc == 1 && sa == 0 && qb == 0 && pa == 1) {
                 sa = 1;
             }
+            // A wakes to C's whole batch, and B's heal of D where B signed one: where D's `Wrap`
+            // (C's own below its last, or a heal) leaves nothing its batch could wrap missing,
+            // the batch is settled as it arrives.
             action Wake when ((bt <= 1 || bt == 3) && sa == 1) {
                 sa = 0;
                 qa = 0;
-                va = if va <= 1 {
-                    2
+                va = if (dl == 1 || hbd == 1) && (va <= 2 || va > 3) &&
+                    (if Buggy == 9 { 1 } else { 0 }) == 0 {
+                    3
                 } else {
-                    if va == 6 { 5 } else { if va == 4 { 3 } else { va } }
+                    if va <= 1 || va == 6 {
+                        if va == 6 { 5 } else { 2 }
+                    } else {
+                        if va == 4 { 3 } else { va }
+                    }
                 };
                 pa = 0;
             }
@@ -490,11 +565,20 @@ pub fn gap_heal_model() -> Model {
             invariant RemovalIsFinal: er == 0 || wc + hac + hbc == 0;
             invariant DeniedNeverWrapped: dw == 0;
             invariant OnlyHoldersMintOrHeal: lost == 0;
+            invariant FrontierHealsAtOnce:
+                if sa == 0 && pa == 1 && mm == 3 && (sc == 2 || dl == 1) && wa == 1 &&
+                    (va == 2 || va == 3 || va == 5) {
+                    (wb == 1 || hab == 1) &&
+                        (ad == 0 || dy == 1 || dk == 0 || wd == 1 || had == 1 || hbd == 1)
+                } else {
+                    1 == 1
+                };
             bound GapHealBox:
                 sc <= 3 && ep <= 3 && mm <= 3 && er <= 1 && mk <= 1 &&
                 wa <= 1 && wb <= 1 && wc <= 1 && wd <= 1 &&
                 hab <= 1 && hac <= 1 && had <= 1 && hbc <= 1 && hbd <= 1 &&
-                va <= 6 && vb <= 3 && ad <= 1 && dk <= 1 && dy <= 1 && cx <= 1 && kr <= 1 &&
+                va <= 6 && vb <= 3 && ad <= 1 && dk <= 1 && dy <= 1 && dl <= 1 && cx <= 1 &&
+                kr <= 1 &&
                 sa <= 1 && pa <= 1 && pb <= 1 && qa <= 1 && qb <= 1 && bt <= 3 && age <= 2 &&
                 dw <= 1 && lost <= 1 && gr <= 2 && rb <= 2;
         }

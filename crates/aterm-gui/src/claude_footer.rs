@@ -5657,6 +5657,7 @@ impl App {
                     texts.note_drift(leaf_index, session, version);
                 }
                 let on_glass = read
+                    .filter(|_| !agy_switch_off)
                     .map(|r| r.rule)
                     .filter(|&r| !self.chrome_owns_terminal_row(wid, row_off + r));
                 let rule = on_glass.and_then(|r| {
@@ -5830,8 +5831,7 @@ impl App {
                     lights: readings.lights,
                     switch: crate::autopilot::HarnessSwitch::of(view),
                 });
-                let Some((frame_row, term_row, run, rule)) = rule.filter(|_| !agy_switch_off)
-                else {
+                let Some((frame_row, term_row, run, rule)) = rule else {
                     continue;
                 };
                 lists.panes.push(FooterPane {

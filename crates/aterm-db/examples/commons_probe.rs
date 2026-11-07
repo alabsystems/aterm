@@ -558,7 +558,6 @@ mod probe {
                     ..Default::default()
                 }),
                 application_error: None,
-                application_cause: None,
                 application_interrupted: None,
                 application_deferral: None,
                 application_batch_deferral: None,
@@ -569,6 +568,9 @@ mod probe {
             };
             let observe = |current: Option<&LocalProbe>, round, dropped| {
                 crate::serve::source_evidence(&baseline, current, &[round], dropped)
+            };
+            let failure = |text: &str| {
+                control::Failure::new(aterm_types::network_state::RepairCause::Other, text)
             };
             let evidence = observe(Some(&current), round.clone(), 0);
             assert_eq!(evidence["outcome"], json!("automatic-owner-retention"));
@@ -584,14 +586,14 @@ mod probe {
                     0 => invalid.cancelled = true,
                     1 => invalid.exchange_started = false,
                     2 => invalid.actor = None,
-                    3 => invalid.control = Err("control failed".into()),
-                    4 => invalid.application_error = Some("application failed".into()),
+                    3 => invalid.control = Err(failure("control failed")),
+                    4 => invalid.application_error = Some(failure("application failed")),
                     5 => invalid.application = None,
                     6 => invalid.application.as_mut().unwrap().table = Some([99; 32]),
                     7 => invalid.application.as_mut().unwrap().local_known = Some(baseline.known),
                     8 => invalid.application.as_mut().unwrap().local_offered = Some(baseline.known),
                     9 => invalid.application.as_mut().unwrap().peer_known = Some(baseline.known),
-                    10 => invalid.membership_error = Some("membership failed".into()),
+                    10 => invalid.membership_error = Some(failure("membership failed")),
                     11 => {
                         invalid.application_deferral = Some(replica::InventoryDeferral {
                             inventory: "conflicts",
@@ -990,7 +992,10 @@ mod probe {
                 current.control(control);
             }
             if finished.exchange_started {
-                current.membership(membership, membership_error);
+                current.membership(
+                    membership,
+                    membership_error.map(|failure| failure.text.as_str()),
+                );
                 // The published count covers local changes only; a negotiated
                 // handoff can also have sent credentials to this peer.
                 current.credential_handoff = handoff.is_some();
@@ -1013,7 +1018,7 @@ mod probe {
             let handoff = match handoff {
                 None => Value::Null,
                 Some(Ok(published)) => json!({"published":published}),
-                Some(Err(error)) => json!({"error":error}),
+                Some(Err(error)) => json!({"error":error.text,"cause":error.cause.word()}),
             };
             let control = match &finished.result {
                 Ok(report) => json!({
@@ -1038,9 +1043,10 @@ mod probe {
                 "direct_inspector_assistance":direct_assistance,
                 "classification":classification(application,table,expected,assisted),
                 "control":control,"application":application_value,
-                "membership":membership,"membership_error":membership_error,
+                "membership":membership,
+                "membership_error":membership_error.map(|failure| json!({"error":failure.text,"cause":failure.cause.word()})),
                 "credential_handoff":handoff,
-                "application_error":application_error,
+                "application_error":application_error.map(|failure| json!({"error":failure.text,"cause":failure.cause.word()})),
                 "application_interrupted":crate::serve::application_value(interrupted),
                 "application_deferral":crate::serve::deferral_value(
                     finished.repair.application_deferral()

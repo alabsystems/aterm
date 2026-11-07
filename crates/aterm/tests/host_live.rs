@@ -8,13 +8,13 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use aterm_agent::supervise::QuestionPriority;
 use aterm_agent::supervise::prompt::fixtures::{
     QUESTION_283_FREE_TEXT_FOCUSED, QUESTION_283_MULTISELECT_FREE_TEXT_FOCUSED,
     QUESTION_283_MULTISELECT_REVIEW, QUESTION_283_MULTISELECT_TYPED_BUTTON,
     QUESTION_283_MULTISELECT_TYPED_LONG_TERM, QUESTION_283_TYPED_LONG_TERM,
     QUESTION_283_TYPED_PERSON, QUESTION_283_TYPED_SHORT_TERM, rewrap_free_text, screen,
 };
+use aterm_agent::supervise::{PriorityWord, QuestionPriority};
 
 use crate::{headless_boot, launch_isolation};
 
@@ -388,7 +388,7 @@ fn review_283(capture: &str, text: &str) -> Vec<String> {
     out
 }
 
-fn text_read(p: QuestionPriority) -> String {
+fn text_read(p: PriorityWord) -> String {
     format!("text:{}", p.text().expect("a policy text"))
 }
 
@@ -641,12 +641,8 @@ fn write_world(tmp: &Path) {
     for (name, text) in screens {
         std::fs::write(sc.join(name), text).expect("write a screen");
     }
-    let long = QuestionPriority::LongTerm
-        .text()
-        .expect("the long-term text");
-    let short = QuestionPriority::ShortTerm
-        .text()
-        .expect("the short-term text");
+    let long = PriorityWord::LongTerm.text().expect("the long-term text");
+    let short = PriorityWord::ShortTerm.text().expect("the short-term text");
     let c1_field = screen(QUESTION_283_FREE_TEXT_FOCUSED);
     let c3_field = screen(QUESTION_283_MULTISELECT_FREE_TEXT_FOCUSED);
     let c8_field = pristine_283(&screen(QUESTION_283_TYPED_SHORT_TERM));
@@ -1163,7 +1159,7 @@ fn under_long_term_the_worker_decides_a_single_select_question() {
             "done.look",
         ],
     );
-    let text = text_read(QuestionPriority::LongTerm);
+    let text = text_read(PriorityWord::LongTerm);
     keys_until(&inst, "k1", &["down", "down", &text, "enter"], HANG);
     told_by_the_worker(&inst, "answer-long-term@v1", "long-term", 2);
 }
@@ -1186,7 +1182,7 @@ fn under_long_term_the_worker_decides_a_multi_select_question() {
             "done.look",
         ],
     );
-    let text = text_read(QuestionPriority::LongTerm);
+    let text = text_read(PriorityWord::LongTerm);
     keys_until(
         &inst,
         "k1",
@@ -1221,7 +1217,7 @@ fn a_session_s_short_term_word_decides_over_the_global_recommended() {
             "done.look",
         ],
     );
-    let text = text_read(QuestionPriority::ShortTerm);
+    let text = text_read(PriorityWord::ShortTerm);
     keys_until(&inst, "k1", &["down", "down", &text, "enter"], HANG);
     told_by_the_worker(&inst, "answer-short-term@v1", "short-term", 2);
 }
@@ -1236,8 +1232,8 @@ fn under_long_term_a_person_s_text_is_handed_to_them_and_nothing_is_typed() {
 #[test]
 fn a_policy_text_the_dialog_does_not_take_is_written_once_then_recommended_is_taken() {
     for (tag, priority) in [
-        ("cl", QuestionPriority::LongTerm),
-        ("cs", QuestionPriority::ShortTerm),
+        ("cl", PriorityWord::LongTerm),
+        ("cs", PriorityWord::ShortTerm),
     ] {
         let config = format!("question_priority = \"{}\"\n", priority.word());
         let inst = boot(tag, &config);
@@ -1263,17 +1259,18 @@ fn a_policy_text_the_dialog_does_not_take_is_written_once_then_recommended_is_ta
             &["down", "down", &text, "up", "up", "enter"],
             HANG,
         );
-        told_by_the_worker(&inst, priority.rule_id(), priority.word(), 1);
-        let approved = ledger_rows(&inst, priority.rule_id(), "approved");
+        let rule = QuestionPriority::from(priority).rule_id();
+        told_by_the_worker(&inst, rule, priority.word(), 1);
+        let approved = ledger_rows(&inst, rule, "approved");
         assert!(approved[0].contains("recommended"), "{approved:?}");
         assert_eq!(
-            ledger_rows(&inst, priority.rule_id(), "skipped").len(),
+            ledger_rows(&inst, rule, "skipped").len(),
             1,
             "the unconfirmed text is not approved: {}",
             ledger(&inst)
         );
         assert!(
-            ledger_rows(&inst, priority.rule_id(), "escalated").is_empty(),
+            ledger_rows(&inst, rule, "escalated").is_empty(),
             "{}",
             ledger(&inst)
         );
@@ -2880,9 +2877,21 @@ fn worker_of_a_parent_on_the_twin(tag: &str, env: &str) -> String {
     let current = stage_yolo_fake(&inst, "2.1.281");
     install(&inst, &current);
     run_on_the_twin(&inst, "2.1.281", env, "--model opus");
+    worker_line_of(&inst, None)
+}
+
+/// What the build of the worker `aterm ctl spawn` starts in `inst` was given, with `from` the
+/// session that starts it, as `aterm ctl @self spawn` says in a lead's own tab (`None`: no session
+/// did).
+#[cfg(target_os = "macos")]
+fn worker_line_of(inst: &Instance, from: Option<&str>) -> String {
+    let before = launches(inst).len();
     let sel = format!("@{}", inst.sid);
-    let mut spawn =
-        headless_boot::client_command(&inst, &[&sel, "spawn", "agent=claude", "raise=false", "-"]);
+    let from = from.map(|sid| format!("from={sid}"));
+    let mut words = vec![sel.as_str(), "spawn", "agent=claude", "raise=false"];
+    words.extend(from.as_deref());
+    words.push("-");
+    let mut spawn = headless_boot::client_command(inst, &words);
     spawn.stdin(std::process::Stdio::piped());
     let out = headless_boot::until_served(|| {
         let mut child = spawn.spawn().expect("spawn aterm ctl");
@@ -2902,20 +2911,169 @@ fn worker_of_a_parent_on_the_twin(tag: &str, env: &str) -> String {
     );
     let deadline = Instant::now() + HANG;
     let got = loop {
-        let got = launches(&inst);
-        if got.len() >= 2 || Instant::now() >= deadline {
+        let got = launches(inst);
+        if got.len() > before || Instant::now() >= deadline {
             break got;
         }
         std::thread::sleep(Duration::from_millis(100));
     };
-    match got.get(1) {
+    match got.get(before) {
         Some((_, args)) => args.clone(),
         None => panic!(
             "no worker launched: {got:?}\nharness log:\n{}\ninstance log:\n{}",
-            harness_lines(&inst),
+            harness_lines(inst),
             std::fs::read_to_string(inst.tmp.join("state/logs/aterm.log")).unwrap_or_default()
         ),
     }
+}
+
+/// The lines of two workers of a tab running `line` under bash (the twin's quoted path in it as
+/// `{twin}`), once its tab's status says `ready`: one no session started, whose parent the tab is,
+/// and one the tab's own program starts.
+#[cfg(target_os = "macos")]
+fn worker_of_a_tab_running(tag: &str, line: &str, ready: impl Fn(&str) -> bool) -> [String; 2] {
+    let inst = boot_on(tag, "relaunch = false\n", 40, None, true, |tmp| {
+        let agents = fake_path(tmp);
+        let agents = agents.parent().expect("agents/").display().to_string();
+        vec![
+            ("PATH", format!("{agents}:/usr/bin:/bin:/usr/sbin:/sbin")),
+            ("SHELL", "/bin/bash".to_string()),
+        ]
+    });
+    let current = stage_yolo_fake(&inst, "2.1.281");
+    install(&inst, &current);
+    let sel = format!("@{}", inst.sid);
+    ctl_ok(&inst, &[&sel, "send", "/bin/bash --norc --noprofile -i"]);
+    ctl_ok(&inst, &[&sel, "key", "enter"]);
+    program_is(&inst, "bash", HANG);
+    if !line.is_empty() {
+        let twin = format!("'{}'", fake_path(&inst.tmp).display());
+        let line = format!(
+            "cd {}/work && {}",
+            inst.tmp.display(),
+            line.replace("{twin}", &twin)
+        );
+        ctl_ok(&inst, &[&sel, "send", &line]);
+        ctl_ok(&inst, &[&sel, "key", "enter"]);
+        // `program=` names the group's leader as soon as it runs, before the lead below it has
+        // logged its launch: `worker_line_of` would take that row for its worker's.
+        let lead = first_launch(&inst);
+        assert_eq!(lead.len(), 1, "the lead's launch alone: {lead:?}");
+    }
+    until(HANG, "the tab's status", || status(&inst), ready);
+    [
+        worker_line_of(&inst, None),
+        worker_line_of(&inst, Some(&inst.sid)),
+    ]
+}
+
+/// A lead behind a program that leads its process group runs Claude Code all the same, and its
+/// worker starts at the floor. Read off the group's leader alone, the worker is
+/// `--dangerously-skip-permissions`, the twin's rule on a bare `claude`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_worker_of_a_lead_behind_a_wrapper_starts_at_the_floor() {
+    assert_eq!(
+        worker_of_a_tab_running(
+            "ywt",
+            "/usr/bin/time -p {twin} --permission-mode default",
+            |s| field(s, "program") == Some("time"),
+        ),
+        ["2.1.281 --permission-mode auto -- the task"; 2]
+    );
+    assert_eq!(
+        worker_of_a_tab_running(
+            "yws",
+            "/bin/sh -c \"{twin} --permission-mode default; :\"",
+            |s| field(s, "program") == Some("sh"),
+        ),
+        ["2.1.281 --permission-mode auto -- the task"; 2]
+    );
+}
+
+/// A lead whose status says Claude Code and whose process no read names (`node <script>`): what it
+/// runs in is not known, so its worker types the build, in the person's settings.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_worker_of_a_lead_that_could_not_be_read_stays_out_of_the_twins_yolo() {
+    let mut image =
+        aterm_uds::deadline::KeptUntilRan::new(aterm_tempfile::tempdir().expect("scratch").keep());
+    let node = image.path().join("node");
+    aterm_uds::deadline::ad_hoc_copy(Path::new("/bin/bash"), &node);
+    // `status` names a copy once the kernel has, before macOS has assessed its first exec.
+    let mut proof = aterm_uds::spawnfd::command(&node)
+        .env_clear()
+        .args(["-c", "printf 'node-image-ran\\n'"])
+        .stdout(aterm_uds::spawnfd::Stdio::piped())
+        .spawn()
+        .expect("run the node image in place");
+    aterm_uds::deadline::prints(&mut proof, "node-image-ran", aterm_uds::deadline::ECHO_HANG);
+    aterm_uds::deadline::kill_within(&mut proof, aterm_uds::deadline::ECHO_HANG);
+    image.ran();
+    let line = format!(
+        "cp ../builds/2.1.281/claude ../cli.js && '{}' \"$PWD/../cli.js\"",
+        node.display()
+    );
+    assert_eq!(
+        worker_of_a_tab_running("ywn", &line, |s| {
+            field(s, "program") == Some("node") && field(s, "agent").is_some_and(|a| a != "-")
+        }),
+        ["2.1.281 -- the task"; 2]
+    );
+}
+
+/// A tab that runs no Claude Code gives no mode to keep, and its worker takes the launch default
+/// (design `docs/DESIGN-yolo-binary-2026-11-04.md` §5).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_worker_of_a_tab_with_no_claude_code_takes_the_launch_default() {
+    assert_eq!(
+        worker_of_a_tab_running("ywp", "", |s| field(s, "program") == Some("bash")),
+        ["2.1.281 --dangerously-skip-permissions -- the task"; 2]
+    );
+}
+
+/// `aterm ctl spawn` typed in a plain tab: the client stands in front of its own shell, and the
+/// pipeline's first stage, which leads that group, ends before the launcher reads it. An ended
+/// process holds no Claude Code, so the worker takes the launch default, as from outside the tab.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_worker_spawned_from_inside_a_plain_tab_takes_the_launch_default() {
+    let inst = boot_on("ywi", "relaunch = false\n", 40, None, true, |tmp| {
+        let agents = fake_path(tmp);
+        let agents = agents.parent().expect("agents/").display().to_string();
+        vec![
+            ("PATH", format!("{agents}:/usr/bin:/bin:/usr/sbin:/sbin")),
+            ("SHELL", "/bin/bash".to_string()),
+        ]
+    });
+    let current = stage_yolo_fake(&inst, "2.1.281");
+    install(&inst, &current);
+    let sel = format!("@{}", inst.sid);
+    ctl_ok(&inst, &[&sel, "send", "/bin/bash --norc --noprofile -i"]);
+    ctl_ok(&inst, &[&sel, "key", "enter"]);
+    program_is(&inst, "bash", HANG);
+    let line = format!(
+        "printf 'the task' | '{}' ctl --sock '{}' spawn agent=claude raise=false -",
+        launch_isolation::aterm_executable().display(),
+        inst.sock
+    );
+    ctl_ok(&inst, &[&sel, "send", &line]);
+    ctl_ok(&inst, &[&sel, "key", "enter"]);
+    let deadline = Instant::now() + HANG;
+    let got = loop {
+        let got = launches(&inst);
+        if !got.is_empty() || Instant::now() >= deadline {
+            break got;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(
+        got.first().map(|(_, args)| args.as_str()),
+        Some("2.1.281 --dangerously-skip-permissions -- the task"),
+        "harness log:\n{}",
+        harness_lines(&inst)
+    );
 }
 
 /// A worker whose parent names no mode starts at a Claude Code worker's floor (owner, 2026-11-04),

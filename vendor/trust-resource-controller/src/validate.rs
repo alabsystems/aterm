@@ -12,6 +12,24 @@ fn os_bytes(bytes: &[u8], nonempty: bool) -> bool {
 fn absolute(bytes: &[u8]) -> bool {
     os_bytes(bytes, true) && bytes.starts_with(b"/")
 }
+
+fn linker_loan_shape(request: &Request, loan: Loan) -> bool {
+    let args = &request.command.args;
+    loan.parent_attempt != [0; 16]
+        && loan.parent_attempt != request.binding.root_attempt
+        && loan.parent_attempt != request.member_attempt
+        && loan.nonce != [0; 16]
+        && request.delegations.cpu.is_some()
+        && matches!(request.delegations.gnu, GnuTransport::None)
+        && request.delegations.fences.is_empty()
+        && args.len() >= 5
+        && args[0] == b"-flavor"
+        && args[1] == b"darwin"
+        && args[args.len() - 3] == b"--threads=1"
+        && args[args.len() - 2] == b"--thinlto-jobs=1"
+        && args[args.len() - 1] == b"--read-workers=0"
+        && !args.iter().any(|arg| arg.starts_with(b"@"))
+}
 impl Request {
     /// Validate syntax only; every descriptor and producer still needs native authentication.
     pub fn validate(&self) -> io::Result<()> {
@@ -78,11 +96,29 @@ impl Request {
             }
         }
         match self.role {
+            Role::ResolverQuery => crate::resolver::validate_member(self)?,
+            Role::MachOLinker(loan) if !linker_loan_shape(self, loan) => {
+                return Err(invalid());
+            }
             Role::Compile if ds.cpu.is_none() || matches!(ds.gnu, GnuTransport::None) => {
                 return Err(invalid());
             }
             Role::MetadataVersion
                 if c.args.len() != 1 || !matches!(c.args[0].as_slice(), b"-vV" | b"--version") =>
+            {
+                return Err(invalid());
+            }
+            Role::SealedMetadata => crate::sealed_metadata::validate_member(self)?,
+            Role::MetadataProbe
+                if c.args.len() != 1
+                    || !matches!(
+                        c.args[0].as_slice(),
+                        b"--print=sysroot" | b"--print=target-list"
+                    )
+                    || ds.cpu.is_none()
+                    || !matches!(ds.gnu, GnuTransport::None)
+                    || !ds.fences.is_empty()
+                    || !self.timeout_ns.is_some_and(|value| value <= 8_000_000_000) =>
             {
                 return Err(invalid());
             }

@@ -13,6 +13,244 @@ fn words_at(now_ms: u64) -> Words<'static> {
     Words { now_ms, zone: &utc }
 }
 
+/// Requests made while an older observation is captured are serviced by the SAME owner.
+/// Reconciliation consumes its accepted snapshot, without another cache read.
+#[cfg(unix)]
+#[test]
+fn an_inflight_cache_read_cannot_overwrite_the_followers_newer_observation() {
+    use aterm_netplace::place::{Known, Stay, StayAt};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let hang = Duration::from_secs(60);
+    let root = aterm_tempfile::tempdir().unwrap();
+    let now = aterm_netplace::unix_ms_now();
+    let start = now - 2 * aterm_netplace::words::AWAY_ENTRY_AFTER_MS;
+    let home = aterm_netplace::sample::home(start - 60_000, 3);
+    let away = aterm_netplace::sample::hotspot(start, start);
+    let stay = |place: &Place, start_ms, end_ms, at| Stay {
+        start_ms,
+        end_ms,
+        at,
+        network: place.network.clone(),
+        subnet: None,
+        gateway: place.route.as_ref().and_then(|route| route.gateway),
+        from_start: false,
+    };
+    aterm_netplace::record::write(
+        &aterm_netplace::record::dir(root.path()),
+        &aterm_netplace::record::Written {
+            record: aterm_netplace::Record {
+                stays: vec![
+                    stay(&home, start - 60_000, Some(start), StayAt::AlabLan),
+                    stay(&away, start, None, StayAt::Remote),
+                ],
+                remembered: vec![Known {
+                    network: home.network.clone().unwrap(),
+                    learned_ms: start - 60_000,
+                    confirmed_ms: start,
+                }],
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let desk = Arc::new(ObservationDesk::new());
+    let (notice, notices) = mpsc::channel();
+    assert!(desk.request().1);
+    let (captured, capture) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let (new_captured, new_capture) = mpsc::channel();
+    let (new_release, new_released) = mpsc::channel();
+    let (done, finished) = mpsc::channel();
+    let worker_desk = Arc::clone(&desk);
+    let path = root.path().to_owned();
+    let mut reads = 0;
+    let worker = std::thread::spawn(move || {
+        let mut gates_ok = true;
+        worker_desk.run(|| {
+            reads += 1;
+            let place = aterm_netplace::keeper::read_with(
+                &path,
+                aterm_netplace::Facts {
+                    route: if reads == 1 {
+                        home.route.clone()
+                    } else {
+                        away.route.clone()
+                    },
+                    ..Default::default()
+                },
+                now,
+            );
+            if reads == 1 {
+                gates_ok &= captured.send(()).is_ok();
+                gates_ok &= released.recv_timeout(hang).is_ok();
+            } else if reads == 2 {
+                gates_ok &= new_captured.send(()).is_ok();
+                gates_ok &= new_released.recv_timeout(hang).is_ok();
+            }
+            Arc::new(place)
+        });
+        let _ = done.send((reads, gates_ok));
+    });
+    let captured = capture.recv_timeout(hang);
+    let (_, duplicate_owner) = desk.request();
+    let released = release.send(());
+    let new_captured = new_capture.recv_timeout(hang);
+    // The owner has accepted the first read without a window. A closed proxy must not
+    // kill cache service or consume that pending accepted change.
+    let (closed_notice, closed_notices) = mpsc::channel();
+    drop(closed_notices);
+    desk.register(Notice::Test(closed_notice));
+    let alive_without_proxy = desk.state.lock_or_recover().running;
+    desk.register(Notice::Test(notice));
+    let first = notices.recv_timeout(hang);
+    let new_released = new_release.send(());
+    let second = notices.recv_timeout(hang);
+    let snapshot = desk.state.lock_or_recover().place.clone();
+    let mut app = crate::App::headless_for_test();
+    app.follow_network_place_on(&desk, &words_at(now));
+    settle(&mut app);
+    let entries = away_entries_in(&app);
+    let consumed = desk.take_change();
+    desk.close();
+    let completion = finished
+        .recv_timeout(hang)
+        .expect("the closed owner finishes");
+    let joined = worker.join();
+    assert!(joined.is_ok());
+    let (read_count, gates_ok) = completion;
+    assert!(gates_ok && released.is_ok() && new_released.is_ok());
+    assert!(captured.is_ok());
+    assert!(new_captured.is_ok());
+    assert!(alive_without_proxy);
+    assert!(!duplicate_owner);
+    assert!(first.is_ok() && second.is_ok());
+    assert!(
+        read_count >= 2,
+        "the request during I/O is serviced before proxy registration"
+    );
+    assert!(matches!(
+        snapshot.unwrap().at,
+        aterm_netplace::Where::Remote(_)
+    ));
+    assert_eq!(
+        entries, 1,
+        "the actual reconciliation states the newer away observation"
+    );
+    assert!(
+        consumed.is_none(),
+        "snapshot and change are consumed together"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unknown_observation_clears_a_restored_away_entry_without_starting_io() {
+    let mut app = crate::App::headless_for_test();
+    let words = words_at(SINCE_MS + 10 * 60_000);
+    let away = aterm_netplace::sample::hotspot(SINCE_MS, SINCE_MS);
+    app.state_network_place(Some(&away), &words);
+    settle(&mut app);
+    assert_eq!(away_entries_in(&app), 1);
+    let desk = ObservationDesk::new();
+    app.follow_network_place_on(&desk, &words);
+    settle(&mut app);
+    assert_eq!(away_entries_in(&app), 0);
+    assert!(desk.take_change().is_none());
+    let held = desk.state.lock_or_recover();
+    assert!(!held.running && !held.requested && held.read_at.is_none());
+}
+
+#[test]
+#[cfg(unix)]
+fn cache_spawn_failure_keeps_observation_age_and_pending_request() {
+    let desk = ObservationDesk::new();
+    assert!(desk.request().1);
+    desk.failed_start();
+    let held = desk.state.lock_or_recover();
+    assert!(held.place.is_none() && held.read_at.is_none());
+    assert!(held.requested && !held.running);
+    drop(held);
+    assert!(
+        !desk.request().1,
+        "failed spawn has a separate bounded retry"
+    );
+    // Retiring the failed attempt's backoff permits one owner, never two.
+    desk.state.lock_or_recover().retry_at = Some(Instant::now());
+    assert!(desk.request().1);
+    assert!(!desk.request().1);
+    desk.failed_start();
+}
+
+#[test]
+fn cached_place_snapshots_do_not_copy_route_payloads() {
+    let away = aterm_netplace::sample::hotspot(SINCE_MS, SINCE_MS);
+    let (_, control) = crate::work_counts::allocations_in(|| away.clone());
+    assert!(control > 0, "the fixture must own heap payloads");
+    let _held = hold_scoped(Some(away));
+    let before = reads_asked();
+    let (_, allocations) = crate::work_counts::allocations_in(|| {
+        for _ in 0..64 {
+            std::hint::black_box(cached());
+        }
+    });
+    eprintln!("cached snapshot allocations: {allocations}; one deep clone: {control}");
+    assert_eq!(reads_asked(), before, "cached snapshots start no read");
+    assert_eq!(allocations, 0, "snapshot acquisition shares immutable data");
+}
+
+#[test]
+fn captured_place_words_allocate_only_the_words_themselves() {
+    let away = aterm_netplace::sample::hotspot(SINCE_MS, SINCE_MS);
+    let (_, words) = crate::work_counts::allocations_in(|| {
+        for _ in 0..64 {
+            std::hint::black_box(crate::network_deck::place_caption(Some(&away)));
+        }
+    });
+    let expected = crate::network_deck::place_caption(Some(&away));
+    let _held = hold_scoped(Some(away));
+    let (caption, captured) = crate::work_counts::allocations_in(|| {
+        for _ in 0..64 {
+            std::hint::black_box(crate::network_deck::capture_place_caption());
+        }
+        crate::network_deck::capture_place_caption()
+    });
+    let (_, one) = crate::work_counts::allocations_in(crate::network_deck::capture_place_caption);
+    assert_eq!(caption, expected);
+    eprintln!(
+        "64 direct captions: {words}; 65 cached captions: {captured}; one cached caption: {one}"
+    );
+    assert_eq!(captured - one, words, "cache access adds no heap copies");
+}
+
+#[test]
+fn cached_place_snapshot_survives_replacement_and_releases_after_its_readers() {
+    let away = aterm_netplace::sample::hotspot(SINCE_MS, SINCE_MS);
+    let home = aterm_netplace::sample::home(SINCE_MS + 60_000, 3);
+    let _held = hold_scoped(Some(away.clone()));
+    let old = cached().expect("published away snapshot");
+    let second = latest().expect("same published snapshot");
+    assert!(Arc::ptr_eq(&old, &second));
+    let weak = Arc::downgrade(&old);
+    hold(Some(home.clone()));
+    let current = cached().expect("replacement snapshot");
+    assert!(!Arc::ptr_eq(&old, &current));
+    assert_eq!(*old, away, "a reader retains its captured observation");
+    assert_eq!(*current, home);
+    hold(None);
+    assert_eq!(
+        *current, home,
+        "clearing the desk cannot invalidate a reader"
+    );
+    drop(old);
+    assert!(weak.upgrade().is_some(), "the second reader still owns it");
+    drop(second);
+    assert!(
+        weak.upgrade().is_none(),
+        "retired snapshots are not retained"
+    );
+}
+
 /// `sys`'s place is the place's own line and object, its unknown values `not_sampled` as every
 /// other `sys` value that was not read, nested objects kept nested.
 /// NEGATIVE CONTROL: mapping `Field::Absent` to `PlaceValue::Text("-")` gives the hotspot's
@@ -131,6 +369,7 @@ fn paint_reads_the_cached_place_and_asks_for_no_read() {
         170.0,
         &snapshot,
         &crate::lab_deck::LabDeck::default(),
+        None,
         caption.as_ref(),
         &inks,
         false,
@@ -326,13 +565,79 @@ fn the_follow_lane_marks_a_change_of_the_away_fact_alone() {
     let early = words_at(SINCE_MS + 1_000);
     let later = words_at(SINCE_MS + 10 * 60_000);
     let away = aterm_netplace::sample::hotspot(SINCE_MS, SINCE_MS);
-    assert_eq!(away_key(Some(&away), &early), None, "a blip states nothing");
-    let stated = away_key(Some(&away), &later);
-    assert!(stated.is_some());
+    let mut following = FollowState::default();
+    assert!(
+        following.observe(&away, early.now_ms),
+        "the first publication clears any old entry"
+    );
+    assert_eq!(following.stated, Some(None), "a blip states nothing");
+    assert!(!following.observe(&away, early.now_ms));
+    assert!(following.observe(&away, later.now_ms));
+    let stated = following.stated;
+    assert!(stated.flatten().is_some());
     let mut answering = away.clone();
     answering.internet.state = aterm_netplace::InternetState::Ok;
-    assert_eq!(away_key(Some(&answering), &later), stated);
+    assert!(!following.observe(&answering, later.now_ms));
+    assert_eq!(following.stated, stated);
     let home = aterm_netplace::sample::home(SINCE_MS, 3);
-    assert_eq!(away_key(Some(&home), &later), None);
-    assert_eq!(away_key(None, &later), None);
+    assert!(following.observe(&home, later.now_ms));
+    assert_eq!(following.stated, Some(None));
+    assert!(!following.observe(&home, later.now_ms));
+}
+
+#[test]
+fn the_follower_schedules_the_dwell_entry_without_repeating_a_due_wait() {
+    let away = aterm_netplace::sample::hotspot(SINCE_MS, SINCE_MS);
+    let due = SINCE_MS + aterm_netplace::words::AWAY_ENTRY_AFTER_MS;
+    let mut following = FollowState::default();
+    let mut app = crate::App::headless_for_test();
+    assert!(following.observe(&away, due - 1));
+    assert_eq!(following.wait(due - 1), std::time::Duration::from_millis(1));
+    app.state_network_place(Some(&away), &words_at(due - 1));
+    settle(&mut app);
+    assert_eq!(away_entries_in(&app), 0);
+    // Time spent publishing is not added back to the absolute deadline.
+    let mut delayed = FollowState::default();
+    delayed.observe(&away, due - 1);
+    assert_eq!(delayed.wait(due + 5), std::time::Duration::ZERO);
+    assert!(delayed.observe(&away, due + 5));
+    assert_eq!(delayed.wait(due + 5), FOLLOW_EVERY);
+    assert!(following.observe(&away, due));
+    app.state_network_place(Some(&away), &words_at(due));
+    settle(&mut app);
+    assert_eq!(away_entries_in(&app), 1);
+    assert_eq!(alerts_in(&app), 0);
+    assert_eq!(following.wait(due), FOLLOW_EVERY);
+    assert!(
+        !following.observe(&away, due + 1),
+        "no repeated key notification"
+    );
+}
+
+#[test]
+fn the_follower_keeps_its_external_fact_cap_at_clock_extremes_and_fixed_states() {
+    let mut away = aterm_netplace::sample::hotspot(SINCE_MS, SINCE_MS);
+    let mut following = FollowState::default();
+    following.observe(&away, SINCE_MS);
+    assert_eq!(following.wait(SINCE_MS), FOLLOW_EVERY);
+    assert_eq!(
+        following.wait(0),
+        FOLLOW_EVERY,
+        "rollback still resamples facts"
+    );
+    away.since_ms = Some(u64::MAX);
+    following.observe(&away, u64::MAX - 1);
+    assert_eq!(
+        following.wait(u64::MAX),
+        FOLLOW_EVERY,
+        "no representable dwell"
+    );
+    away.since_before = true;
+    following.observe(&away, u64::MAX);
+    assert!(following.stated.flatten().is_some());
+    assert_eq!(following.wait(u64::MAX), FOLLOW_EVERY);
+    away.once_alab = true;
+    following.observe(&away, u64::MAX);
+    assert_eq!(following.stated, Some(None));
+    assert_eq!(following.wait(u64::MAX), FOLLOW_EVERY);
 }

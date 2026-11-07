@@ -306,6 +306,54 @@ fn trust_tool_build(layout: &Layout, target: &Path) -> Option<u64> {
     .then_some(n)
 }
 
+/// Hold the existing native build gate across a destructive SDK mutation.
+pub(crate) fn sdk_mutation_guard(
+    prefix: &Path,
+    program: &str,
+    build: u64,
+) -> io::Result<crate::lease::ReclaimGuard> {
+    let subject = crate::lease::Subject::build(program, build)
+        .ok_or_else(|| io::Error::other("SDK mutation has no native build subject"))?;
+    match crate::lease::reclaim(prefix, &subject) {
+        crate::lease::Reclaim::Clear(guard) => Ok(guard),
+        crate::lease::Reclaim::Keep(holders) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("SDK {program} build {build} is held or unavailable: {holders:?}"),
+        )),
+    }
+}
+
+/// Exact managed store path only; no holder snapshot supplies mutation authority.
+pub(crate) fn sdk_mutation_guard_for_build(
+    build_dir: &Path,
+) -> io::Result<Option<crate::lease::ReclaimGuard>> {
+    let (prefix, program, build) = store_build_parts(build_dir)
+        .ok_or_else(|| io::Error::other("SDK mutation path is not a managed build"))?;
+    if crate::lease::Subject::build(program, build).is_none() {
+        // No native SDK lease can exist for an unrepresentable identifier.
+        return Ok(None);
+    }
+    sdk_mutation_guard(prefix, program, build).map(Some)
+}
+
+/// Validate an already-held original GC gate without recursively locking it.
+pub(crate) fn check_sdk_reclaim(
+    build_dir: &Path,
+    guard: &crate::lease::ReclaimGuard,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let (prefix, program, build) = store_build_parts(build_dir)
+            .ok_or_else(|| io::Error::other("SDK reclaim path is not a managed build"))?;
+        let subject = crate::lease::Subject::build(program, build)
+            .ok_or_else(|| io::Error::other("SDK reclaim has no subject"))?;
+        guard.check_subject(prefix, &subject)?;
+    }
+    #[cfg(not(unix))]
+    let _ = (build_dir, guard);
+    Ok(())
+}
+
 /// Make the exec root of the trust build at `build_dir` what the build needs, at `depth`.
 /// # Errors
 /// `build_dir` is not a trust build of this layout, [`needs_root`] could not read it, `compat` or `compat/trust` is not writable (a [`Blocked`] when not a real directory), or the root cannot be removed or laid.
@@ -338,7 +386,9 @@ pub fn ensure_root(layout: &Layout, build_dir: &Path, depth: Depth) -> io::Resul
                 ));
             }
             Ok(None) => {
-                if walkable_roots_dir(layout).is_some() {
+                if walkable_roots_dir(layout).is_some() && std::fs::symlink_metadata(&root).is_ok()
+                {
+                    let _sdk = sdk_mutation_guard(&layout.prefix, crate::seam::SEAM_PROGRAM, n)?;
                     retire(&root, &aside)?;
                 }
                 return Ok(Ensured::Plain);
@@ -348,11 +398,12 @@ pub fn ensure_root(layout: &Layout, build_dir: &Path, depth: Depth) -> io::Resul
         if let Some(blocked) = blocked(layout, n) {
             return Err(io::Error::other(blocked));
         }
-        layout.ensure_dir(&compat_dir(layout))?;
-        layout.ensure_dir(&dir)?;
         if root_matches(build_dir, &root, depth) {
             return Ok(Ensured::Present);
         }
+        let _sdk = sdk_mutation_guard(&layout.prefix, crate::seam::SEAM_PROGRAM, n)?;
+        layout.ensure_dir(&compat_dir(layout))?;
+        layout.ensure_dir(&dir)?;
         let tmp = dir.join(format!(".{n}.tmp-{pid}"));
         remove_entry(&tmp)?;
         remove_entry(&aside)?;
@@ -629,6 +680,24 @@ pub fn sweep(layout: &Layout) -> Report {
             let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
+            if matches!(
+                classify(layout, &name, &path),
+                None | Some(RootsEntry::Needed)
+            ) {
+                continue;
+            }
+            let _sdk = match entry_build(&name)
+                .map(|n| sdk_mutation_guard(&layout.prefix, crate::seam::SEAM_PROGRAM, n))
+                .transpose()
+            {
+                Ok(guard) => guard,
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("{} was not removed ({e})", path.display()));
+                    continue;
+                }
+            };
             let removed = match classify(layout, &name, &path) {
                 None | Some(RootsEntry::Needed) => continue,
                 Some(RootsEntry::Debris | RootsEntry::Stray(Stray::NotADirectory)) => {
@@ -660,7 +729,6 @@ pub fn sweep(layout: &Layout) -> Report {
 /// `<prefix>/store/<program>/<build>` — a canonical decimal build number, a program name
 /// that is a plain component — and `None` for every other path, a stage scratch sibling
 /// (`<n>.incoming-<pid>`, `<n>.superseded-<pid>`) included.
-#[cfg(unix)]
 fn store_build_parts(build_dir: &Path) -> Option<(&Path, &str, u64)> {
     let name = build_dir.file_name()?.to_str()?;
     let n = name.parse::<u64>().ok().filter(|n| n.to_string() == name)?;
@@ -697,32 +765,148 @@ pub(crate) fn discard_root_of(build_dir: &Path) {
     }
 }
 
-/// Remove `<prefix>/compat/<program>` whole.
-/// # Errors
-/// The directory could not be removed.
-pub fn remove_program(layout: &Layout, program: &str) -> io::Result<()> {
+/// Build identity carried by a root, staged tree, aside or sidecar name.
+fn entry_build(name: &str) -> Option<u64> {
+    let name = name.strip_prefix('.').unwrap_or(name);
+    crate::store::parse_build_name(name.split('.').next()?)
+}
+
+/// Original native gates held through an enumerated program mutation.
+pub(crate) struct SdkRemoval {
+    prefix: PathBuf,
+    program: String,
+    #[cfg(unix)]
+    entries: Vec<PathBuf>,
+    _guards: Vec<crate::lease::ReclaimGuard>,
+}
+
+/// Acquire every native subject BEFORE uninstall changes shims or payloads.
+/// The caller keeps its existing store publication/program gate as well.
+pub(crate) fn prepare_sdk_removal(
+    layout: &Layout,
+    program: &str,
+    store: bool,
+) -> io::Result<SdkRemoval> {
+    let compat = compat_dir(layout);
+    let dir = compat.join(program);
+    let mut entries = Vec::new();
+    if crate::seam::is_real_dir(&compat) {
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() => {
+                for entry in std::fs::read_dir(&dir)? {
+                    entries.push(entry?.path());
+                }
+            }
+            Ok(_) => entries.push(dir.clone()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let mut subjects = std::collections::BTreeSet::new();
+    for path in &entries {
+        if let Some(n) = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(entry_build)
+        {
+            subjects.insert(n);
+        }
+    }
+    if store {
+        match std::fs::read_dir(layout.prefix.join("store").join(program)) {
+            Ok(list) => {
+                for entry in list {
+                    if let Some(n) = entry?.file_name().to_str().and_then(entry_build) {
+                        subjects.insert(n);
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let mut guards = Vec::new();
+    for n in subjects {
+        if crate::lease::Subject::build(program, n).is_some() {
+            guards.push(sdk_mutation_guard(&layout.prefix, program, n)?);
+        }
+    }
+    Ok(SdkRemoval {
+        prefix: layout.prefix.clone(),
+        program: program.into(),
+        #[cfg(unix)]
+        entries,
+        _guards: guards,
+    })
+}
+
+/// Remove only the enumerated roots under their original native guards.
+/// New roots appearing concurrently are never recursively swept by a parent delete.
+pub(crate) fn remove_program_guarded(
+    layout: &Layout,
+    program: &str,
+    guard: &SdkRemoval,
+) -> io::Result<()> {
+    if guard.prefix != layout.prefix || guard.program != program {
+        return Err(io::Error::other(
+            "SDK removal guard belongs to another program",
+        ));
+    }
     #[cfg(unix)]
     {
         let compat = compat_dir(layout);
         if !crate::seam::is_real_dir(&compat) {
             return Ok(());
         }
-        remove_entry(&compat.join(program))
+        let dir = compat.join(program);
+        for path in &guard.entries {
+            remove_entry(path)?;
+        }
+        match std::fs::remove_dir(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (layout, program);
-        Ok(())
-    }
+    Ok(())
 }
 
-/// Remove `<prefix>/compat` whole — `uninstall --all`'s half, on both of its branches.
+/// Remove the program's exec roots only when all native SDK leases are clear.
 /// # Errors
-/// The directory could not be removed.
+/// A root is held, lease state is unknown, or removal fails.
+pub fn remove_program(layout: &Layout, program: &str) -> io::Result<()> {
+    let guard = prepare_sdk_removal(layout, program, false)?;
+    remove_program_guarded(layout, program, &guard)
+}
+
+/// Remove compat roots without deleting a leased or newly appearing root.
+/// # Errors
+/// A root is held, lease state is unknown, or removal fails.
 pub fn remove_all(layout: &Layout) -> io::Result<()> {
     #[cfg(unix)]
     {
-        remove_entry(&compat_dir(layout))
+        let dir = compat_dir(layout);
+        let meta = match std::fs::symlink_metadata(&dir) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        if !meta.is_dir() {
+            return remove_entry(&dir);
+        }
+        let mut guards = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| io::Error::other("nonUTF8 compat program"))?;
+            guards.push(prepare_sdk_removal(layout, name, false)?);
+        }
+        for guard in &guards {
+            remove_program_guarded(layout, &guard.program, guard)?;
+        }
+        std::fs::remove_dir(dir)
     }
     #[cfg(not(unix))]
     {
@@ -2528,5 +2712,53 @@ mod tests {
         );
         assert_ne!(ident(&root.join("bin")), root_bin);
         assert!(root_matches(&build, &root, Depth::Deep));
+    }
+    #[test]
+    fn sdk_custody_allows_reads_but_refuses_root_repair_and_removal() {
+        let fx = Fx::new("sdk-custody");
+        let build = fx.build(8595, Shape::Copy);
+        assert_eq!(
+            ensure_root(&fx.layout, &build, Depth::Shallow).unwrap(),
+            Ensured::Built
+        );
+        let subject = crate::lease::Subject::build("trust", 8595).unwrap();
+        let lease = crate::lease::take(
+            &fx.layout.prefix,
+            &subject,
+            "SDK reader",
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(
+            ensure_root(&fx.layout, &build, Depth::Shallow).unwrap(),
+            Ensured::Present
+        );
+        let child = lease.try_clone_descriptor().unwrap();
+        drop(lease);
+        let root = root_dir(&fx.layout, 8595);
+        std::fs::write(root.join("bin/stray"), b"needs repair").unwrap();
+        let before = stamps(&root);
+        assert_eq!(
+            ensure_root(&fx.layout, &build, Depth::Shallow)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            remove_program(&fx.layout, "trust").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            remove_all(&fx.layout).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(stamps(&root), before);
+        drop(child);
+        assert_eq!(
+            ensure_root(&fx.layout, &build, Depth::Shallow).unwrap(),
+            Ensured::Built
+        );
+        remove_program(&fx.layout, "trust").unwrap();
+        assert!(!root.exists());
     }
 }

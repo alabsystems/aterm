@@ -125,7 +125,7 @@ fn a_worker_with_its_own_report_lands_with_no_landing_record() {
         let sid = under(&mut app, "land");
         let ctx = app.pool.get(0).unwrap().ctx.clone();
         let mut working = TaskMark::new(TaskState::Working)
-            .apply(None, false, Instant::now(), 1_000)
+            .apply(None, &Default::default(), Instant::now(), 1_000)
             .0;
         working.trusted_cwd = Some(trusted.clone());
         seed_carried(&ctx, Some(&working.carry_row(Instant::now())));

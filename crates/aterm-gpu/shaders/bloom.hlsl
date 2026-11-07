@@ -3,7 +3,7 @@
 //
 // HLSL (Shader Model 5.0) twin of renderer.rs BLOOM_SHADER,
 // shaders/bloom.metal and shaders/bloom.glsl: the cursor-comet bloom
-// composite, a 25-tap gaussian over the half-res comet target with two radii
+// composite, a 25- or 49-tap gaussian over the half-res comet target with two radii
 // (white part and chroma). Compiled per entry point by src/d3d11 as
 // shaders/cell.hlsl describes. Bindings: `BloomU` is b2, the half-res source
 // t0 with its sampler s0.
@@ -106,20 +106,28 @@ float letter_mask(float2 p) {
     return m;
 }
 
-// One 25-tap kernel, two radii: the white part spreads at `radius`, the
-// chroma at the shorter `chroma_radius`, summed back into one halo.
+// One kernel, two radii: the white part spreads at `radius`, the chroma at
+// the shorter `chroma_radius`, summed back into one halo. 25 taps to a radius
+// of 6, 49 past it.
 float4 fs_bloom(VsOut i) : SV_Target0 {
     float white = 0.0;
     float3 chroma = float3(0.0, 0.0, 0.0);
     float wsum = 0.0;
-    for (int j = -2; j <= 2; j = j + 1) {
-        for (int k = -2; k <= 2; k = k + 1) {
-            float2 tap = float2(float(k), float(j)) * bu_texel;
+    // `taps_per_side` (aterm-render's bloom.rs): two taps a side to a radius of 6,
+    // three past it, so no two taps stand wider apart than 6 texels. The loop's
+    // bound is the uniform's, so its samples name their level (the half-res source
+    // has one): FXC takes no gradient in a loop it cannot unroll.
+    int n = clamp(int(ceil(bu_radius / 3.0)), 2, 3);
+    float step = 2.0 / float(n);
+    float spread = float(n * n);
+    for (int j = -n; j <= n; j = j + 1) {
+        for (int k = -n; k <= n; k = k + 1) {
+            float2 tap = float2(float(k), float(j)) * (step * bu_texel);
             float d2 = float((k * k) + (j * j));
-            float w = exp((-d2) / 4.0);
-            float3 sw = bloom_src.Sample(bloom_samp, i.uv + (tap * bu_radius)).xyz;
+            float w = exp((-d2) / spread);
+            float3 sw = bloom_src.SampleLevel(bloom_samp, i.uv + (tap * bu_radius), 0.0).xyz;
             white = white + (white_part(sw) * w);
-            float3 sc = bloom_src.Sample(bloom_samp, i.uv + (tap * bu_chroma_radius)).xyz;
+            float3 sc = bloom_src.SampleLevel(bloom_samp, i.uv + (tap * bu_chroma_radius), 0.0).xyz;
             chroma = chroma + ((sc - (white_part(sc)).xxx) * w);
             wsum = wsum + w;
         }

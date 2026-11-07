@@ -658,7 +658,7 @@ impl GpuRenderer {
         match GlArmLive::new(want, self.ctx.device_policy) {
             Ok(live) => {
                 let caps = live.dev.caps();
-                self.ctx.gl_max_texture_dim = caps.max_texture_dim;
+                self.ctx.gl_max_texture_dim = caps.max_texture_dim.get();
                 self.ctx.srgb_offscreen = caps.srgb_views;
                 self.ctx.adapter_name.clone_from(&caps.renderer);
                 // `GPU rendering on` named the headless probe's renderer; a window system's

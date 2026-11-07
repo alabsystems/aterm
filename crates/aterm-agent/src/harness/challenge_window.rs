@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The fleet challenge service's visible Claude OAuth browser. It automates navigation and
-//! loopback or hosted-code callback capture only: every sign-in, consent and human-verification
-//! control is the person's.
+//! The fleet challenge service's visible Claude OAuth browser. It automates navigation, exact
+//! ordinary OAuth buttons and callback capture. CAPTCHA and other human-verification controls
+//! are never driven by software.
 
 use super::headless_oauth::{BrowserChild, CdpClient};
-use aterm_json::json;
+use aterm_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -19,6 +19,87 @@ const CALLBACK_URL_JS: &str = r#"(() => {
     : "";
   return failed || raw;
 })()"#;
+
+const ADVANCE_JS: &str = r#"(() => {
+  const buttons = Array.from(document.querySelectorAll("button, input[type=submit]"));
+  const titled = (name) => buttons.find((button) => {
+    const title = String(button.innerText || button.value || "").replace(/\s+/g, " ").trim();
+    return title === name && !button.disabled && button.getAttribute("aria-disabled") !== "true";
+  });
+  const click = (button, action) => {
+    if (!button) return "";
+    button.click();
+    return action;
+  };
+  const authorize = titled("Authorize");
+  if (authorize) return click(authorize, "authorize");
+  const verify = titled("Verify email address");
+  const codeInputs = Array.from(document.querySelectorAll("input[autocomplete='one-time-code' i], input[name*='code' i], input[name*='otp' i], input[inputmode='numeric' i]"));
+  const code = codeInputs.some((input) => input.value.trim().length > 0);
+  if (verify && code) return click(verify, "verify");
+  if (verify && codeInputs.length > 0) return "needs_mailbox";
+  const continued = titled("Continue with email");
+  if (continued) return click(continued, "continue");
+  return "";
+})()"#;
+
+fn advance(
+    cdp: &mut CdpClient,
+    session: &str,
+    timeout: Duration,
+) -> Result<Option<&'static str>, String> {
+    let answer = cdp
+        .call(
+            Some(session),
+            "Runtime.evaluate",
+            json!({"expression":ADVANCE_JS,"returnByValue":true}),
+            timeout,
+        )
+        .map_err(|_| "the central challenge page could not be advanced")?;
+    match answer["result"]["value"].as_str().unwrap_or("") {
+        "" => Ok(None),
+        "authorize" => Ok(Some("authorize")),
+        "verify" => Ok(Some("verify")),
+        "continue" => Ok(Some("continue")),
+        "needs_mailbox" => Ok(Some("needs_mailbox")),
+        _ => Err("the central challenge returned an unknown page action".into()),
+    }
+}
+
+fn fill_code(
+    cdp: &mut CdpClient,
+    session: &str,
+    code: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let code =
+        aterm_json::to_string(&Value::from(code)).map_err(|_| "invalid verification code")?;
+    let expression = format!(
+        r#"(() => {{
+      const inputs = Array.from(document.querySelectorAll("input[autocomplete='one-time-code' i], input[name*='code' i], input[name*='otp' i], input[inputmode='numeric' i]"));
+      const input = inputs.find((candidate) => candidate.getClientRects().length > 0);
+      if (!input) return false;
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+      setter.call(input, {code});
+      input.dispatchEvent(new Event("input", {{ bubbles: true }}));
+      input.dispatchEvent(new Event("change", {{ bubbles: true }}));
+      return true;
+    }})()"#
+    );
+    let answer = cdp
+        .call(
+            Some(session),
+            "Runtime.evaluate",
+            json!({"expression":expression,"returnByValue":true}),
+            timeout,
+        )
+        .map_err(|_| "the central challenge code field could not be filled")?;
+    if answer["result"]["value"].as_bool() == Some(true) {
+        Ok(())
+    } else {
+        Err("the central challenge has no visible verification-code field".into())
+    }
+}
 
 pub(super) fn work_current(scope: Option<&super::account_work::Scope>) -> Result<(), String> {
     if scope.is_some_and(super::account_work::Scope::cancelled) {
@@ -90,6 +171,7 @@ fn drive(
     flow: &super::open_url::MailboxFlow,
     timeout: Duration,
     scope: Option<&super::account_work::Scope>,
+    mailbox: Option<(&super::headless_oauth::MailboxConfig, Option<&str>)>,
 ) -> Result<String, String> {
     work_current(scope)?;
     let end = Instant::now()
@@ -143,6 +225,11 @@ fn drive(
         left(),
     )
     .map_err(|_| "the central challenge page did not open".to_owned())?;
+    let mut authorized = false;
+    let mut continued = false;
+    let mut verified = false;
+    let mut last_mailbox_poll = None;
+    let mut seen_otps = std::collections::BTreeSet::new();
     loop {
         work_current(scope)?;
         if left().is_zero() {
@@ -150,6 +237,40 @@ fn drive(
         }
         if let Some(callback) = callback(cdp, session, flow, left())? {
             return Ok(callback);
+        }
+        match advance(cdp, session, left())? {
+            Some("authorize") if !authorized => authorized = true,
+            Some("continue") if !continued => continued = true,
+            Some("verify") if !verified => verified = true,
+            Some("needs_mailbox") => {
+                let due = last_mailbox_poll
+                    .is_none_or(|at: Instant| at.elapsed() >= Duration::from_secs(2));
+                if due
+                    && let Some((config, email)) =
+                        mailbox.filter(|(config, email)| config.is_configured_for(*email))
+                {
+                    last_mailbox_poll = Some(Instant::now());
+                    match super::headless_oauth::poll_mailbox_config_for_credential_with_seen_otps(
+                        config,
+                        email,
+                        left().min(Duration::from_secs(10)),
+                        &mut seen_otps,
+                    ) {
+                        Ok(super::headless_oauth::MailboxCredential::MagicLink(url)) => {
+                            if !flow.admits_provider_url(&url) {
+                                return Err("the mailbox returned an unrelated magic link".into());
+                            }
+                            cdp.call(Some(session), "Page.navigate", json!({"url":url}), left())
+                                .map_err(|_| "the central challenge magic link did not open")?;
+                        }
+                        Ok(super::headless_oauth::MailboxCredential::Otp(code)) => {
+                            fill_code(cdp, session, &code, left())?;
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+            _ => {}
         }
         std::thread::sleep(left().min(TICK));
     }
@@ -190,7 +311,7 @@ fn launch(
 }
 
 /// Open `authorize_url` in the central service's visible browser and return its exact callback.
-/// No OAuth form, CAPTCHA, anti-bot widget or consent button is clicked by software.
+/// Exact ordinary OAuth buttons are clicked once; CAPTCHA and anti-bot controls are never clicked.
 pub(super) fn authorize(
     authorize_url: &str,
     email: Option<&str>,
@@ -203,18 +324,33 @@ pub(super) fn authorize(
     }
     let flow = super::open_url::MailboxFlow::new(authorize_url)?;
     #[cfg(target_os = "macos")]
+    let started = Instant::now();
+    #[cfg(target_os = "macos")]
     if super::safari_window::available() {
-        return super::safari_window::authorize(authorize_url, &flow, timeout, Some(scope));
+        let safari = super::safari_window::authorize(authorize_url, &flow, timeout, Some(scope));
+        if safari.is_ok() || started.elapsed() >= Duration::from_secs(30) {
+            return safari;
+        }
     }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or("the central challenge has no home directory")?;
-    let browser = super::browser_window::find_window_browser(Some(&home))
-        .ok_or("the central challenge has no interactive Chromium installed")?;
+    let browser = match super::browser_window::find_window_browser(Some(&home)) {
+        Some(browser) => browser,
+        None => super::browser_window::fetch_window_browser(
+            Some(&home),
+            &mut super::headless_fetch::Curl,
+            &|| scope.cancelled(),
+        )
+        .map_err(|error| format!("the central challenge browser is unavailable: {error}"))?,
+    };
     let state =
         aterm_types::dirs::state_dir().ok_or("the central challenge has no state directory")?;
     let profile =
         super::headless_oauth::resolve_browser_profile_dir(&state.join("accounts"), None, email);
+    let mailbox =
+        super::headless_oauth::discover_mailbox_config(Some(&home), Some(&state.join("accounts")));
+    let mailbox = mailbox.as_ref().map(|config| (config, email));
     for dir in [profile.parent(), Some(profile.as_path())]
         .into_iter()
         .flatten()
@@ -232,7 +368,14 @@ pub(super) fn authorize(
 
     let result = (|| {
         let (mut child, mut cdp) = launch(&browser, &profile, scope)?;
-        let result = drive(&mut cdp, authorize_url, &flow, timeout, Some(scope));
+        let result = drive(
+            &mut cdp,
+            authorize_url,
+            &flow,
+            timeout,
+            Some(scope),
+            mailbox,
+        );
         let _ = cdp.call(None, "Browser.close", json!({}), Duration::from_secs(2));
         let _ = child.close();
         result
@@ -313,6 +456,11 @@ mod tests {
                     let result = match method {
                         "Target.createTarget" => json!({"targetId":"t1"}),
                         "Target.attachToTarget" => json!({"sessionId":"s1"}),
+                        "Runtime.evaluate"
+                            if message["params"]["expression"].as_str() == Some(ADVANCE_JS) =>
+                        {
+                            json!({"result":{"value":""}})
+                        }
                         "Runtime.evaluate" if url == CALLBACK => {
                             json!({"result":{"value":"https://example.invalid/not-the-callback"}})
                         }
@@ -333,7 +481,14 @@ mod tests {
         let flow = super::super::open_url::MailboxFlow::new(AUTHORIZE).unwrap();
         let (mut cdp, peer) = browser(CALLBACK);
         assert_eq!(
-            drive(&mut cdp, AUTHORIZE, &flow, Duration::from_secs(60), None),
+            drive(
+                &mut cdp,
+                AUTHORIZE,
+                &flow,
+                Duration::from_secs(60),
+                None,
+                None
+            ),
             Ok(CALLBACK.to_owned())
         );
         drop(cdp);
@@ -350,6 +505,7 @@ mod tests {
                 HOSTED_AUTHORIZE,
                 &flow,
                 Duration::from_secs(60),
+                None,
                 None
             ),
             Ok(HOSTED_CALLBACK.to_owned())
@@ -366,7 +522,17 @@ mod tests {
             "https://example.invalid/callback",
         ] {
             let (mut cdp, peer) = browser(url);
-            assert!(drive(&mut cdp, AUTHORIZE, &flow, Duration::from_secs(60), None).is_err());
+            assert!(
+                drive(
+                    &mut cdp,
+                    AUTHORIZE,
+                    &flow,
+                    Duration::from_secs(60),
+                    None,
+                    None
+                )
+                .is_err()
+            );
             drop(cdp);
             peer.join().unwrap();
         }

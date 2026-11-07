@@ -109,13 +109,9 @@ pub fn head(
     remote: &str,
     until: std::time::Instant,
 ) -> Result<Option<String>, String> {
-    let git = |root: &Path, args: &[&str]| git_until(root, args, until);
-    let named = git(root, &["ls-remote", remote, REF])?;
-    let Some(sha) = named.split_whitespace().next() else {
-        return Ok(None);
-    };
-    git(root, &["fetch", "--quiet", "--no-tags", remote, REF])?;
-    Ok(Some(sha.to_owned()))
+    let git = |root: &Path| command(root, &[]);
+    let run = |tool, args: &[std::ffi::OsString]| crate::remote::run(root, &git, tool, args, until);
+    crate::remote::Remote::open(root, remote, &run)?.fetch(REF)
 }
 
 pub fn records(

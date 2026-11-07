@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 impl TerminalHandler<'_> {
     #[inline]
-    fn stamp_print_anchor(&mut self) {
+    pub(super) fn stamp_print_anchor(&mut self) {
         let cursor = self.grid.cursor();
         let col = cursor
             .col
@@ -127,6 +127,12 @@ impl ActionSink for TerminalHandler<'_> {
         self.write_unicode_bulk(chars);
         self.grid.damage_selection_output(origin);
         self.stamp_print_anchor();
+    }
+
+    const TAKES_LINES: bool = true;
+
+    fn print_lines(&mut self, lines: &Provenance<[u8], Pty>) {
+        self.print_line_run(lines.as_ref());
     }
 
     fn execute(&mut self, byte: u8) {
@@ -2687,7 +2693,15 @@ fn has_run_of_4(data: &[u8]) -> bool {
 }
 
 impl TerminalHandler<'_> {
-    fn write_ascii_bulk_fast(&mut self, data: &[u8]) {
+    // Inlined into each caller, as is `write_ascii_segment`: a run of text lines writes through
+    // both too (handler_line_run.rs), and with those second callers left to the inliner every
+    // short print cost more (forcing both inline cut cursor_motion's instructions 4.5%).
+    #[expect(
+        clippy::inline_always,
+        reason = "measured: left to the inliner beside the line-run caller, every short print cost more"
+    )]
+    #[inline(always)]
+    pub(super) fn write_ascii_bulk_fast(&mut self, data: &[u8]) {
         let flags = if self.style.protected {
             self.style.flags.union(CellFlags::PROTECTED)
         } else {
@@ -2748,8 +2762,13 @@ impl TerminalHandler<'_> {
         }
     }
 
-    #[inline]
-    fn write_ascii_segment(
+    // Inlined into each caller: see `write_ascii_bulk_fast`.
+    #[expect(
+        clippy::inline_always,
+        reason = "measured: left to the inliner beside the line-run caller, every short print cost more"
+    )]
+    #[inline(always)]
+    pub(super) fn write_ascii_segment(
         &mut self,
         segment: &[u8],
         is_default: bool,

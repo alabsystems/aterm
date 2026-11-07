@@ -34,7 +34,7 @@ fn source_path_resolves_configured_files_beside_the_config() {
     )
     .unwrap();
     fs::write(desk.home.join("source.toml"), "wrong home source").unwrap();
-    fs::write(
+    crate::test_config::write(
         desk.config.join("aterm.toml"),
         "[fleet]\nmachine='m27'\naccounts_source='source.toml'\n",
     )
@@ -144,7 +144,7 @@ fn source_path_config_reader_and_refresh_probe_use_the_same_directory() {
         document("decoy", Cli::Claude),
     )
     .unwrap();
-    fs::write(
+    crate::test_config::write(
         desk.config.join("aterm.toml"),
         "[fleet]\nmachine='m27'\naccounts_source='source.toml'\n",
     )
@@ -187,7 +187,7 @@ fn source_path_relative_config_is_resolved_before_reading_or_publishing() {
         document("chosen", Cli::Claude),
     )
     .unwrap();
-    fs::write(
+    crate::test_config::write(
         desk.config.join("aterm.toml"),
         "[fleet]\nmachine='m27'\naccounts_source='source.toml'\n",
     )
@@ -314,7 +314,7 @@ fn source_path_configured_home_and_absolute_paths_keep_their_base() {
         ("~/source.toml", "home"),
         (absolute.to_str().unwrap(), "absolute"),
     ] {
-        fs::write(
+        crate::test_config::write(
             desk.config.join("aterm.toml"),
             format!(
                 "[fleet]\naccounts_source={}\n",
@@ -358,7 +358,7 @@ pub(crate) fn path_transition(state: &State, action: &str) -> State {
     let (case, result) = match action {
         "Explicit" => (1, fetch_source_text(&env, "source.toml")),
         "Configured" => {
-            fs::write(
+            crate::test_config::write(
                 desk.config.join("aterm.toml"),
                 "[fleet]\naccounts_source='source.toml'\n",
             )

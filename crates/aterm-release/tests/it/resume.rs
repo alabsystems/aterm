@@ -1431,12 +1431,39 @@ fn cli_refuses_invocations_that_would_drop_a_safety_answer() {
             "--mac-only",
         ],
         &["cut", "--resume", "--dry-run"],
+        &["cut", "--sign", "--dry-run"],
+        &["cut", "--sign", "--resume"],
+        &["cut", "--sign", "--mac-only"],
+        &["cut", "--sign", "--linux-artifacts", "/handoff"],
+        &["cut", "--sign", "--min-build", "7"],
+        &["cut", "--sign", "--abandon", "v0.55.0"],
         &["release", "--bump", "--commit", "a"],
         &["release", "--commit", "a", "--commit", "b"],
         &["release", "--fix", "a", "--commit", "b"],
     ] {
         assert!(parse(bad).is_err(), "{bad:?}");
     }
+}
+
+/// `cut --sign` needs no Linux declaration (the claim carries Linux) and keeps the credential
+/// profile it was handed: the parse the release's step 7 depends on.
+#[test]
+fn cut_sign_parses_with_its_credentials_and_no_linux_declaration() {
+    let Ok(cli::Cmd::Cut { opts, abandon }) =
+        parse(&["cut", "--sign", "--release-credentials", "/keys/m3.toml"])
+    else {
+        panic!("cut --sign parses");
+    };
+    assert!(opts.sign && !opts.dry_run && !opts.resume && !opts.mac_only);
+    assert_eq!(abandon, None);
+    assert_eq!(
+        opts.release_credentials.as_deref(),
+        Some(std::path::Path::new("/keys/m3.toml"))
+    );
+    let Ok(cli::Cmd::Cut { opts, .. }) = parse(&["cut", "--mac-only"]) else {
+        panic!("a real cut parses");
+    };
+    assert!(!opts.sign, "only --sign signs beside a publish");
 }
 
 #[test]

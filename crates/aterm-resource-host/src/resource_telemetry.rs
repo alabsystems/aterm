@@ -6,7 +6,11 @@
 use crate::resource_machine::{self as machine, CachedSampler};
 use aterm_ctl::resource_admission_transport::{self as wire, Peer};
 use aterm_uds::CtlStream;
-use std::{io, os::fd::AsFd as _, time::Instant};
+use std::{
+    io,
+    os::fd::{AsFd as _, AsRawFd as _},
+    time::Instant,
+};
 use trust_resource_controller::{
     Channel, ContextQuery, ContextReply, ContextUnavailable, Pressure, Snapshot, TelemetryQuery,
     TelemetryReply, TelemetryResponse, Thermal,
@@ -20,7 +24,7 @@ pub(crate) struct Telemetry {
 }
 impl Telemetry {
     pub(crate) fn new() -> io::Result<Self> {
-        let (reader, writer) = aterm_uds::kept_out(io::pipe)?;
+        let (reader, writer) = host_pipe()?;
         Ok(Self {
             sampler: CachedSampler::new()?,
             reader,
@@ -55,6 +59,27 @@ impl Telemetry {
         })
     }
 }
+/// Set the mode only while both fresh descriptions are private. Every receiver
+/// can then verify live-empty with EAGAIN without mutating a shared description.
+fn host_pipe() -> io::Result<(io::PipeReader, io::PipeWriter)> {
+    aterm_uds::kept_out(|| {
+        let (reader, writer) = io::pipe()?;
+        // SAFETY: this is the fresh owned read description, not a received slot.
+        let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: no copy has escaped; set nonblocking before any sharing.
+        if unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((reader, writer))
+    })
+}
+
+#[cfg(test)]
+#[path = "resource_telemetry/tests.rs"]
+mod tests;
 fn refused() -> io::Error {
     io::ErrorKind::PermissionDenied.into()
 }

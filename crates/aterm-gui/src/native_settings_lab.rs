@@ -243,7 +243,10 @@ pub(super) fn lab_page(
         ]));
     }
     for peer in &lab.network.network.peers {
-        let mut rows = crate::network_deck::details(&lab.network, Target::Peer(peer.slot));
+        let mut rows = crate::network_deck::details(
+            &lab.network,
+            Target::Seat(crate::network_deck::SeatKey::Observed(peer.slot)),
+        );
         rows.retain(|(label, _)| label != "Network");
         cards.extend(facts(
             &format!("lab/peer/{}", peer.slot),

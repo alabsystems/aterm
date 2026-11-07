@@ -36,7 +36,7 @@ default-members = [
     "crates/aterm-phase", "crates/aterm-png", "crates/aterm-policy", "crates/aterm-predict",
     "crates/aterm-primer", "crates/aterm-provenance",
     "crates/aterm-pty", "crates/aterm-regex", "crates/aterm-render", "crates/aterm-restore",
-    "crates/aterm-rle",
+    "crates/aterm-rle", "crates/aterm-repo-storage",
     "crates/aterm-sandbox", "crates/aterm-scene", "crates/aterm-scrollback",
     "crates/aterm-search", "crates/aterm-secrets", "crates/aterm-selection", "crates/aterm-serde", "crates/aterm-serde-derive",
     "crates/aterm-session", "crates/aterm-shell-integration", "crates/aterm-sixel", "crates/aterm-slog",
@@ -83,7 +83,7 @@ update_channel = "alabsystems/aterm"
 # record (crates/aterm-stamp); nothing depends on that package. Every library's own version is a
 # constant `0.0.0`, so a bump is an input of no library unit (census `identity-read`).
 [workspace.package]
-version = "0.161.0"
+version = "0.162.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -140,7 +140,7 @@ aterm-capacity = { path = "crates/aterm-capacity" }
 aterm-ctl = { path = "crates/aterm-ctl" }
 aterm-resource-host = { path = "crates/aterm-resource-host" }
 # Core Trust owns CPU lease identity and lifetime; aterm observes the same pool.
-trust-resource-controller = { path = "vendor/trust-resource-controller" }
+trust-resource-controller = { path = "vendor/trust-resource-controller", default-features = false }
 trust-resource-provenance = { path = "vendor/trust-resource-provenance" }
 trust-build-cpu = { version = "0.13.0", path = "vendor/trust-build-cpu" }
 jobserver_utils = { path = "vendor/trust-jobserver-utils", default-features = false }
@@ -161,6 +161,8 @@ aterm-dl = { path = "crates/aterm-dl" }
 # Fd-relative POSIX directory operations over `libc` for TOCTOU-safe traversal.
 aterm-dirfd = { path = "crates/aterm-dirfd" }
 aterm-diskwalk = { path = "crates/aterm-diskwalk" }
+# Read-only bounded Git pack storage observations, with no mutation authority.
+aterm-repo-storage = { path = "crates/aterm-repo-storage" }
 # File durability (F_FULLFSYNC on Apple) or ordering (F_BARRIERFSYNC via
 # astream-sys), with a counting seam for tests.
 aterm-durable = { path = "crates/aterm-durable" }

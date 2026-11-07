@@ -4023,6 +4023,7 @@ impl Pool {
             self.cli,
             &store,
             SignInPolicy {
+                native_enrollment: None,
                 host,
                 row,
                 logins: &records.logins,
@@ -4392,9 +4393,10 @@ fn a_harness_or_agent_switch_turns_rotation_off_in_the_report_as_in_a_launch() {
 /// `next:` IS WHAT A NEW LAUNCH TAKES; A LIVE SESSION'S WALL IS ITS OWN TO ANSWER: for each row a
 /// session of a Codex build that keeps a row's login can run on, the report says the row its weekly
 /// limit moves it to (`wall_moves`), with no session recorded (no writer records a Codex session's
-/// row on a real Mac), beside a `next:` that still names `main`. CONTROL: on a build that runs only
-/// `main`, with no build, under rotation off, in the OS keyring, or on a CLI no running session of
-/// which moves, nothing is said.
+/// row on a real Mac), beside a `next:` that still names `main`; on a host no handoff is qualified
+/// on ([`crate::harness::codex_rotation::QUOTA_ROTATION_QUALIFIED`]) none moves, and nothing is
+/// said. CONTROL: on a build that runs only `main`, with no build, under rotation off, in the OS
+/// keyring, or on a CLI no running session of which moves, nothing is said.
 #[test]
 fn the_report_says_where_a_wall_moves_a_running_session() {
     let moves = |doc: &Value| -> Vec<(String, String)> {
@@ -4414,19 +4416,27 @@ fn the_report_says_where_a_wall_moves_a_running_session() {
     };
     let pool = Pool::new("wall-moves");
     let (text, doc) = pool.report(Some(&pool.new));
-    assert_eq!(
-        moves(&doc),
-        vec![
-            ("main".to_string(), "work".to_string()),
-            ("work".to_string(), "main".to_string())
-        ],
-        "{doc}"
-    );
+    if crate::harness::codex_rotation::QUOTA_ROTATION_QUALIFIED {
+        assert_eq!(
+            moves(&doc),
+            vec![
+                ("main".to_string(), "work".to_string()),
+                ("work".to_string(), "main".to_string())
+            ],
+            "{doc}"
+        );
+        assert!(
+            text.contains("at a weekly limit: a session on `main` moves to `work`"),
+            "{text}"
+        );
+    } else {
+        assert!(moves(&doc).is_empty(), "an unqualified host: {doc}");
+        assert!(
+            !text.contains("at a weekly limit:"),
+            "an unqualified host: {text}"
+        );
+    }
     assert_eq!(doc["next"]["to"].as_str(), Some("main"), "{doc}");
-    assert!(
-        text.contains("at a weekly limit: a session on `main` moves to `work`"),
-        "{text}"
-    );
 
     let (text, doc) = pool.report(Some(&pool.old));
     assert!(
@@ -4731,8 +4741,8 @@ fn the_sign_in_aterm_runs_itself_is_said_to_be_aterms() {
 /// `accounts use` AND THE REPORT SAY ONE THING OF A RUNNING SESSION: where its weekly limit moves a
 /// session on `main` the words point at the report's `at a weekly limit:` line; where nothing moves
 /// one (a build that runs only `main`, rotation off, the OS keyring, a CLI none of whose running
-/// sessions moves) they do not, and the report has no such line. Each is read of a pin and of its
-/// end.
+/// sessions moves, a host no handoff is qualified on) they do not, and the report has no such line.
+/// Each is read of a pin and of its end.
 #[test]
 fn use_and_the_report_say_one_thing_of_a_running_session() {
     type World = (&'static str, Cli, LawBuild, fn(&Pool), bool);
@@ -4742,7 +4752,7 @@ fn use_and_the_report_say_one_thing_of_a_running_session() {
             Cli::Codex,
             LawBuild::CodexNew,
             |_| {},
-            true,
+            crate::harness::codex_rotation::QUOTA_ROTATION_QUALIFIED,
         ),
         (
             "a build that runs only `main`",

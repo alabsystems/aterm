@@ -572,20 +572,17 @@ fn meets_glyphs(input: &RenderInput, frame: &PetFrame) -> Option<(u16, u16)> {
 
 /// THE HEAD LAW AT THE MARGIN, end to end: the trail gallery's `burst` (a
 /// line typed at 50 ms a key to three cells short of the margin, then quiet).
-/// The cat waits at the wall, the line's last letters running over it, while
-/// the hand may still write on and wrap; it never leaves on a guess of a wrap
-/// that never comes. Once the hand has stopped (the cat sits, `SIT_AFTER`
-/// after the last key) it hops off the letters to the nearest seat by the
-/// caret that covers none, and rests there: every rest frame from then on
-/// stands off every glyph, on dark and on paper, the whole body on blank rows,
-/// and it is back on the ground within `SETTLED_BY` of the last key. The
+/// The cat waits at the wall off the line, on the blank row under it
+/// (`margin_seat_off_the_line`), while the hand may still write on and wrap; it
+/// never leaves on a guess of a wrap that never comes. Every rest frame stands
+/// off every glyph, on dark and on paper, the whole body on blank rows. The
 /// negative control (the letter reader blinded: the stand as it was) rests on
 /// the line among its letters.
 #[test]
 fn a_cat_waiting_on_a_wrap_that_never_comes_rests_off_the_line() {
     /// The cat's sit after the hand's last key (`kitty_pet::SIT_AFTER`).
     const SIT_AFTER: u64 = 1_400;
-    /// The sit, the hop off the letters, and its landing.
+    /// The sit, and time to settle on its seat after it.
     const SETTLED_BY: u64 = SIT_AFTER + 600;
     let text = "echo the quick brown fox jumps over the lazy dog as the kitty flies";
     let mut ev = vec![(300u64, Rec::Out(b"\x1b[2J\x1b[5H$ ".to_vec()), None)];
@@ -743,6 +740,126 @@ fn output_streaming_after_an_enter_never_blinks_the_veiled_cat() {
             "{}: the negative control (the step left armed) came back {a_back} times and fell \
              in one frame {a_falls} times",
             theme.name
+        );
+    }
+}
+
+/// `$ ` at the fifth row's start, a row under it lettered to column `under` (blank where 0), then
+/// a held key at `gap` ms running the line to the 69th column, with a Tab to column `leap`
+/// twenty keys in (a real Tab: the console reads it as navigation).
+fn run_into_the_margin(
+    under: usize,
+    gap: u64,
+    leap: Option<usize>,
+) -> Vec<(u64, Rec, Option<PetInputKind>)> {
+    let mut ev = vec![(
+        300u64,
+        Rec::Out(format!("\x1b[2J\x1b[6H{}\x1b[5H$ ", "x".repeat(under)).into_bytes()),
+        None,
+    )];
+    let (mut t, mut col, mut wrote) = (1_000u64, 2usize, 0);
+    while col < 69 {
+        if let Some(to) = leap
+            && wrote == 20
+        {
+            ev.push((t, Rec::In(vec![9]), Some(PetInputKind::Navigate)));
+            ev.push((
+                t + 2,
+                Rec::Out(format!("\x1b[5;{}H", to + 1).into_bytes()),
+                None,
+            ));
+            col = to;
+        } else {
+            ev.push((t, Rec::In(vec![b'a']), Some(PetInputKind::Text)));
+            ev.push((t + 2, Rec::Out(vec![b'a']), None));
+            col += 1;
+        }
+        t += gap;
+        wrote += 1;
+    }
+    ev
+}
+
+/// THE MARGIN'S SLIDE KEEPS OFF ANOTHER LINE'S LETTERS (`margin_seat_off_the_line`). The row under
+/// the line is blank over the body's whole way to the wall before the body slides onto it: judged
+/// over the wall's columns alone, a body a held key or a caret's leap had left far back dropped
+/// onto a row lettered up to just short of them, and ran along those letters to the wall (with
+/// that reading restored, 63 frames at a Tab and 21 at a key every 16 ms). It goes on along the
+/// line until it has passed them and slides then, so it still rests off the line.
+#[test]
+fn a_slide_off_the_line_keeps_off_the_letters_on_its_way_to_the_wall() {
+    let rest = |h: &Host| h.shots.last().expect("the replay presents").frame;
+    for (under, gap, leap) in [
+        (60, 16, None),
+        (50, 16, None),
+        (66, 16, None),
+        (60, 50, Some(64)),
+        (66, 50, Some(66)),
+    ] {
+        let mut h = Host::replay_with(DARK, &|_| {}, &run_into_the_margin(under, gap, leap), 3_000);
+        let input = h.term.cell_frame(usize::from(ROWS), usize::from(COLS));
+        let on_it: Vec<(u64, f32, f32)> = h
+            .shots
+            .iter()
+            .filter(|s| s.ms >= 1_000 && s.frame.alpha > 0)
+            .filter(|s| matches!(meets_glyphs(&input, &s.frame), Some((5, _))))
+            .map(|s| (s.ms, s.frame.col, s.frame.row))
+            .collect();
+        assert!(
+            on_it.is_empty(),
+            "lettered to {under}, {gap} ms a key, a leap to {leap:?}: {} frames on the row's \
+             letters, the first {:?}",
+            on_it.len(),
+            on_it.first()
+        );
+        let at = rest(&h);
+        assert!(
+            (at.row - 5.0).abs() < 0.01 && at.col > 60.0,
+            "lettered to {under}, {gap} ms a key, a leap to {leap:?}: it rests at ({}, {}), not \
+             off the line by the wall",
+            at.col,
+            at.row
+        );
+    }
+}
+
+/// THE MARGIN A HELD KEY TAKES STAYS TAKEN (`WrapAhead::OffTheLine`'s `kept`). A fast hand takes the
+/// margin early by the slide's lead, past the slack the margin was kept at: the next frame found
+/// the caret short of it and let go, so at 33 ms a key the body stepped down, up and down a row on
+/// consecutive frames, and from 25 ms a key the body was left on the row under with no margin, to
+/// fly on and walk back to a stand short of the wall. It steps down once, runs on its paws and
+/// stands at the wall.
+#[test]
+fn a_margin_a_held_key_takes_stays_taken() {
+    for gap in [40, 33, 25, 20, 16] {
+        let h = Host::replay_with(DARK, &|_| {}, &run_into_the_margin(0, gap, None), 1_500);
+        let frames: Vec<&Shot> = h.shots.iter().filter(|s| s.ms >= 1_000).collect();
+        let steps: Vec<(u64, f32)> = frames
+            .windows(2)
+            .filter(|w| (w[1].frame.row - w[0].frame.row).abs() > 0.5)
+            .map(|w| (w[1].ms, w[1].frame.row))
+            .collect();
+        assert_eq!(
+            steps.len(),
+            1,
+            "{gap} ms a key: the body stepped between rows at {steps:?}"
+        );
+        // Its way in from the prompt's flight past, nothing leaves the ground again.
+        let (slid, _) = steps[0];
+        let flew = frames
+            .iter()
+            .find(|s| s.ms >= slid && s.frame.action == PetAction::Leap);
+        assert!(
+            flew.is_none(),
+            "{gap} ms a key: it left the ground after its slide, at {:?}",
+            flew.map(|s| s.ms)
+        );
+        let at = frames.last().expect("frames").frame;
+        assert!(
+            (at.row - 5.0).abs() < 0.01 && at.col > 66.0,
+            "{gap} ms a key: it stands at ({}, {}), not at the wall off the line",
+            at.col,
+            at.row
         );
     }
 }

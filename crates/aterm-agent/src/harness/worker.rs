@@ -1224,14 +1224,17 @@ impl Admitted {
         ))
     }
 
-    /// This admission for a Claude Code worker whose parent lends it no flags, typed as the build
-    /// atpkg's managed twin execs where its line, with `model`, holds nothing the twin reads as
-    /// typed: the word would reach the twin, which adds yolo, and a worker off the floor runs with
-    /// its parent's permissions (owner ruling 2026-11-02). A parent lends none only where its route
-    /// keeps its worker off the floor ([`starter`]) and it names no mode: at the floor the line
-    /// names `auto`, which the twin runs as typed. Such a worker starts without the twin's usage
-    /// tap, as one typed by its starter's image does. Read after admission, because admission can
-    /// lay the twin. With no such twin the starter stays as it is.
+    /// This admission for a Claude Code worker whose parent lends it no flags, or whose starter
+    /// could not be read ([`StarterRead::Unread`]), typed as the build atpkg's managed twin execs
+    /// where its line, with `model`, holds nothing the twin reads as typed: the word would reach
+    /// the twin, which adds yolo. A worker off the floor runs with its parent's permissions (owner
+    /// ruling 2026-11-02), and a read that failed does not know those to be bypass, so that worker
+    /// starts in the person's settings. A parent lends none only where its route keeps its worker
+    /// off the floor ([`starter`]) and it names no mode: at the floor the line names `auto`, which
+    /// the twin runs as typed. An unread starter gets no floor, for the reason an unread route gets
+    /// none ([`claude_route_kept`]). Such a worker starts without the twin's usage tap, as one typed
+    /// by its starter's image does. Read after admission, because admission can lay the twin. With
+    /// no such twin the starter stays as it is.
     #[must_use]
     pub fn past_the_twin(self, cli: &WorkerCli, model: Option<&str>) -> Self {
         self.past_the_twin_by(cli, model, || {
@@ -1333,13 +1336,128 @@ pub fn admit(
     Ok(Admitted { starter, readiness })
 }
 
-/// Read process `pid` under `home` as a starter of `cli`'s kind, or `None`. A Claude Code
-/// starter's mode is read here, from `shown`'s rows (its tab's screen, whose pill shows the mode it
-/// runs in now; `None` where none was read) over its argv, and held to its worker's floor where
-/// its route is read ([`claude_starter_args`]): at the starter's own folder and at `worker_cwd`'s,
-/// the folder the worker's line runs in (the spawn's `cwd=`), whose project settings may name a
-/// route the starter's lack. Another agent's starter calls neither, so its caller never decides
-/// which kind of agent reads them.
+/// What reading a process as a starter of a row's kind came to ([`starter`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StarterRead {
+    /// It runs the row's CLI.
+    Read(Starter),
+    /// It runs no CLI of the row's kind: its argv and image were read, or it has ended.
+    Other,
+    /// Its argv or image could not be read, so what it runs is not known.
+    Unread,
+}
+
+/// Whether process `pid` has ended, gone or exited and not yet reaped: it holds no argv or image
+/// to read, which is no failed read (the client of a spawn typed in a plain tab, or that line's
+/// first pipeline stage, stands in front until it ends). A query with no answer is no end. Ask it
+/// after the read that failed: an end only moves forward, and one asked before can come too soon.
+fn ended(pid: u32) -> bool {
+    use aterm_uds::process::{ProcessPresence, process_presence};
+    i32::try_from(pid).is_ok_and(|pid| {
+        matches!(
+            process_presence(pid),
+            ProcessPresence::Exited | ProcessPresence::Absent
+        )
+    })
+}
+
+/// What one process of a group read as ([`group_claude`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemberRead {
+    /// Claude Code.
+    Claude,
+    /// No Claude Code: its argv and image were read, or it has ended.
+    Other,
+    /// Its argv or image could not be read.
+    Unread,
+}
+
+/// What a group's reading came to ([`claude_of_group`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupClaude {
+    /// This process is the group's Claude Code.
+    At(u32),
+    /// Every process of the group was read, and none is Claude Code.
+    None,
+    /// Not known: no table of its processes, a member that could not be read and no Claude Code
+    /// read beside it, or Claude Codes side by side, none inside another, with nothing to say
+    /// which one the terminal's person drives.
+    Unread,
+}
+
+/// How many parents [`group_claude`] follows from a member.
+const PARENTS_MAX: usize = 4096;
+
+/// [`GroupClaude`] of a group's `members`, with each process's parent by `parent`: the Claude Code
+/// no other Claude Code of the group runs. A pid says nothing here: a long-lived lead's child can
+/// hold the lower one, once the kernel has wrapped its pids.
+fn group_claude(members: &[(u32, MemberRead)], parent: impl Fn(u32) -> Option<u32>) -> GroupClaude {
+    let claudes: Vec<u32> = members
+        .iter()
+        .filter(|(_, read)| *read == MemberRead::Claude)
+        .map(|(pid, _)| *pid)
+        .collect();
+    let outer: Vec<u32> = claudes
+        .iter()
+        .copied()
+        .filter(|pid| {
+            !std::iter::successors(parent(*pid), |up| parent(*up))
+                .take(PARENTS_MAX)
+                .any(|up| claudes.contains(&up))
+        })
+        .collect();
+    match outer.as_slice() {
+        [one] => GroupClaude::At(*one),
+        [] if !members.iter().any(|(_, read)| *read == MemberRead::Unread) => GroupClaude::None,
+        _ => GroupClaude::Unread,
+    }
+}
+
+/// The process a Claude Code starter's line is read from, of the group `leader` leads: the leader
+/// where it is Claude Code, else the member of its group that is ([`group_claude`]), where another
+/// program leads the group (`time`, a script with no `exec`, a pipeline's first stage).
+fn claude_of_group(leader: u32, home: &Path) -> GroupClaude {
+    use super::{relaunch::caller_claude, upgrade_drive};
+    if caller_claude(leader, home).is_some() {
+        return GroupClaude::At(leader);
+    }
+    let table = upgrade_drive::table();
+    if table.is_empty() {
+        return GroupClaude::Unread;
+    }
+    let members: Vec<(u32, MemberRead)> = table
+        .iter()
+        .map(|(pid, ..)| *pid)
+        .filter(|pid| upgrade_drive::process_group(*pid) == Some(i64::from(leader)))
+        .map(|pid| {
+            let read = if caller_claude(pid, home).is_some() {
+                MemberRead::Claude
+            } else if (atpkg::caller_shell::process_args(pid).is_some()
+                && upgrade_drive::exe_of(pid).is_some())
+                || ended(pid)
+            {
+                MemberRead::Other
+            } else {
+                MemberRead::Unread
+            };
+            (pid, read)
+        })
+        .collect();
+    group_claude(&members, |pid| {
+        table
+            .iter()
+            .find(|(row, ..)| *row == pid)
+            .map(|(_, ppid, _)| *ppid)
+    })
+}
+
+/// Read process `pid` under `home` as a starter of `cli`'s kind, a Claude Code row reading the group
+/// it leads ([`claude_of_group`]). A Claude Code starter's mode is read here, from `shown`'s rows
+/// (its tab's screen, whose pill shows the mode it runs in now; `None` where none was read) over its
+/// argv, and held to its worker's floor where its route is read ([`claude_starter_args`]): at the
+/// starter's own folder and at `worker_cwd`'s, the folder the worker's line runs in (the spawn's
+/// `cwd=`), whose project settings may name a route the starter's lack. Another agent's starter
+/// calls neither, so its caller never decides which kind of agent reads them.
 #[must_use]
 pub fn starter(
     cli: &WorkerCli,
@@ -1347,10 +1465,19 @@ pub fn starter(
     home: &Path,
     shown: impl FnOnce() -> Option<Vec<String>>,
     worker_cwd: impl FnOnce() -> Option<PathBuf>,
-) -> Option<Starter> {
+) -> StarterRead {
     if let Launches::Claude = cli.launches {
-        let c = super::relaunch::caller_claude(pid, home)?;
-        let process = atpkg::caller_shell::process_args(pid)?;
+        let pid = match claude_of_group(pid, home) {
+            GroupClaude::At(claude) => claude,
+            GroupClaude::None => return StarterRead::Other,
+            GroupClaude::Unread => return StarterRead::Unread,
+        };
+        let Some(c) = super::relaunch::caller_claude(pid, home) else {
+            return StarterRead::Unread;
+        };
+        let Some(process) = atpkg::caller_shell::process_args(pid) else {
+            return StarterRead::Unread;
+        };
         let shown = shown();
         let worker_cwd = worker_cwd();
         let routes = {
@@ -1382,18 +1509,28 @@ pub fn starter(
         .into_iter()
         .map(|(n, v)| (n.to_string(), v.to_string()))
         .collect();
-        return Some(Starter {
+        return StarterRead::Read(Starter {
             exe: c.exe,
             env,
             args: claude_starter_args(cli, &process.argv, shown.as_deref(), &routes),
             unset: Vec::new(),
         });
     }
-    let args = atpkg::caller_shell::process_args(pid)?;
+    let Some(args) = atpkg::caller_shell::process_args(pid) else {
+        return if ended(pid) {
+            StarterRead::Other
+        } else {
+            StarterRead::Unread
+        };
+    };
     let image = super::upgrade_drive::exe_of(pid);
-    starter_of(cli, image.as_deref(), &args, home, || {
+    match starter_of(cli, image.as_deref(), &args, home, || {
         super::upgrade_drive::managed_agent_twin(cli.word)
-    })
+    }) {
+        Some(starter) => StarterRead::Read(starter),
+        None if image.is_none() && !ended(pid) => StarterRead::Unread,
+        None => StarterRead::Other,
+    }
 }
 
 /// Resolve `image` and `args` as a [`Starter`] for `cli`, or `None`, under the user's `home`: a

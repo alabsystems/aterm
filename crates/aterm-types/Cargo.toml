@@ -23,6 +23,9 @@ dev-seams = []
 # a crate of its own, as `aterm-winit-keymap` does.
 
 [dependencies]
+# Pure resource-accounting DTO/codec only; native channels and clients stay in
+# their owning host/client crates.
+trust-resource-controller = { workspace = true, default-features = false }
 # Versioned read-only resource custody JSON shared by native clients and host.
 aterm-json = { workspace = true }
 # Hex for the loaded-code subject attached to Local Network observations.

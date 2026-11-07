@@ -1414,8 +1414,41 @@ fn dense_row_marks(
     page: u32,
     seams: impl Fn(&mut CursorGlow),
 ) -> Vec<(i32, i32, i32, i32)> {
+    dense_row_marks_in(geom(), style, page, seams)
+}
+
+/// [`dense_row_marks`] on the grid `g`.
+fn dense_row_marks_in(
+    g: Geom,
+    style: GlowStyle,
+    page: u32,
+    seams: impl Fn(&mut CursorGlow),
+) -> Vec<(i32, i32, i32, i32)> {
+    let (out, halos, under) = dense_row_frame(g, style, page, seams, |k| seed_hue(k * 83 + 7));
+    let boxed = |x: u16, y: u16, w: u16, h: u16| {
+        (
+            i32::from(x),
+            i32::from(y),
+            i32::from(x) + i32::from(w),
+            i32::from(y) + i32::from(h),
+        )
+    };
+    let mut boxes: Vec<_> = out.iter().map(|q| boxed(q.x, q.y, q.w, q.h)).collect();
+    boxes.extend(halos.iter().map(|h| boxed(h.x, h.y, h.w, h.h)));
+    boxes.extend(under.iter().map(|q| boxed(q.x, q.y, q.w, q.h)));
+    boxes
+}
+
+/// The particles' frame [`dense_row_marks_in`] boxes: what they lay in `out`,
+/// as halos and under the letters.
+fn dense_row_frame(
+    g: Geom,
+    style: GlowStyle,
+    page: u32,
+    seams: impl Fn(&mut CursorGlow),
+    hue: impl Fn(u32) -> f32,
+) -> (Vec<GlowQuad>, Vec<RainHalo>, Vec<GlowQuad>) {
     use aterm_core::terminal::RenderCell;
-    let g = geom();
     let (row, caret_col) = (2u16, 20u16);
     let ch = g.ch as f32;
     let caret = CursorGlow::caret_box(g, row, caret_col);
@@ -1461,7 +1494,7 @@ fn dense_row_marks(
             vx: a.cos() * 1.5 * ch,
             vy: -2.0 * ch,
             life: 2.0,
-            ..grain(cx, cy, seed_hue(k * 83 + 7), at)
+            ..grain(cx, cy, hue(k), at)
         });
     }
     let (mut out, mut halos, mut under) = (Vec::new(), Vec::new(), Vec::new());
@@ -1478,18 +1511,7 @@ fn dense_row_marks(
         ),
         CursorGlow::MAX_QUADS,
     );
-    let boxed = |x: u16, y: u16, w: u16, h: u16| {
-        (
-            i32::from(x),
-            i32::from(y),
-            i32::from(x) + i32::from(w),
-            i32::from(y) + i32::from(h),
-        )
-    };
-    let mut boxes: Vec<_> = out.iter().map(|q| boxed(q.x, q.y, q.w, q.h)).collect();
-    boxes.extend(halos.iter().map(|h| boxed(h.x, h.y, h.w, h.h)));
-    boxes.extend(under.iter().map(|q| boxed(q.x, q.y, q.w, q.h)));
-    boxes
+    (out, halos, under)
 }
 
 /// looks10 L2, A DENSE ROW SEATS ITS STARS AND EMBERS IN ITS OWN AIR: with a
@@ -1582,6 +1604,145 @@ fn a_dense_row_s_embers_climb_away_from_the_caret() {
         assert!(
             level < 0.12 * ch,
             "control: on {page:06x} round 2's embers climb {level:.1} px away from the caret"
+        );
+    }
+}
+
+/// after-land L3, A DENSE ROW'S EMBERS RISE IN A PLUME: seated past the caret
+/// on one straight climb with an even scatter, Fire's embers stood on one
+/// line, a straight, evenly spaced dotted diagonal right of the caret on
+/// every theme (`fire-*-context.t0`, x468-505 y98-112). On the gallery's
+/// 26 px row, on the reference dark and on Solarized Dark (paper's beads take
+/// the same seats), with each particle's seed dealt as the engine deals one,
+/// the outer half of the seated embers (a halo each, by x) fans out: their
+/// heights scatter by a standard deviation of a twentieth of the row or
+/// more, and they still climb away from the caret (their mean 0.06 of the
+/// row or more above the inner half's). Negative control: seated on the
+/// composed land's straight climb (`dense_embers_line`), the outer half
+/// stands in one line along the band's top, scattering under 0.025 of the
+/// row. And they taper: the outer half's embers are drawn at most 0.85 of the
+/// inner half's mean size and light (after-land r1: of one size, the fanned
+/// embers still read as a nearly level dotted line). Negative control: drawn
+/// untapered (`dense_embers_untapered`), the outer half is 0.95 of the inner
+/// half's size or more.
+#[test]
+fn a_dense_row_s_embers_rise_in_a_plume() {
+    let g = tall_geom();
+    let ch = g.ch as f32;
+    // Each ember's centre: on a dark page an ember is one halo.
+    let embers = |page: u32, line: bool| {
+        // Each particle's seed as the engine deals one (`frand`), not a step:
+        // seeds a step apart seat their embers in lockstep.
+        let dealt = |k: u32| {
+            let mut h = k.wrapping_add(0x9E37_79B9);
+            h = (h ^ (h >> 16)).wrapping_mul(0x85EB_CA6B);
+            h = (h ^ (h >> 13)).wrapping_mul(0xC2B2_AE35);
+            (h ^ (h >> 16)) as f32 / u32::MAX as f32
+        };
+        let (_, halos, _) = dense_row_frame(
+            g,
+            GlowStyle::Fire,
+            page,
+            |glow| glow.dense_embers_line = line,
+            dealt,
+        );
+        let mut centres: Vec<(f32, f32)> = halos
+            .iter()
+            .map(|h| {
+                (
+                    f32::from(h.x) + 0.5 * f32::from(h.w),
+                    f32::from(h.y) + 0.5 * f32::from(h.h),
+                )
+            })
+            .collect();
+        centres.sort_by(|a, b| a.0.total_cmp(&b.0));
+        centres
+    };
+    // How widely the outer half's embers (by x) scatter in height (their
+    // standard deviation, px), and how far their mean centre sits above the
+    // inner half's.
+    let spread = |page: u32, line: bool| {
+        let marks = embers(page, line);
+        assert!(
+            marks.len() >= 8,
+            "fixture: {} seated embers on {page:06x}",
+            marks.len()
+        );
+        let (near, far) = marks.split_at(marks.len() / 2);
+        let mean = |h: &[(f32, f32)]| h.iter().map(|m| m.1).sum::<f32>() / h.len() as f32;
+        let m = mean(far);
+        let fan =
+            (far.iter().map(|f| (f.1 - m) * (f.1 - m)).sum::<f32>() / far.len() as f32).sqrt();
+        (fan, mean(near) - m)
+    };
+    // The outer half's mean halo size and light against the inner half's.
+    let taper = |page: u32, untapered: bool| {
+        let dealt = |k: u32| {
+            let mut h = k.wrapping_add(0x9E37_79B9);
+            h = (h ^ (h >> 16)).wrapping_mul(0x85EB_CA6B);
+            h = (h ^ (h >> 13)).wrapping_mul(0xC2B2_AE35);
+            (h ^ (h >> 16)) as f32 / u32::MAX as f32
+        };
+        let (_, halos, _) = dense_row_frame(
+            g,
+            GlowStyle::Fire,
+            page,
+            |glow| glow.dense_embers_untapered = untapered,
+            dealt,
+        );
+        let mut marks: Vec<(f32, f32, f32)> = halos
+            .iter()
+            .map(|h| {
+                let light = [16u32, 8, 0]
+                    .map(|sh| (h.color >> sh) & 0xff)
+                    .iter()
+                    .sum::<u32>();
+                (
+                    f32::from(h.x) + 0.5 * f32::from(h.w),
+                    f32::from(h.w),
+                    light as f32,
+                )
+            })
+            .collect();
+        marks.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let (near, far) = marks.split_at(marks.len() / 2);
+        let mean = |h: &[(f32, f32, f32)], f: fn(&(f32, f32, f32)) -> f32| {
+            h.iter().map(f).sum::<f32>() / h.len().max(1) as f32
+        };
+        (
+            mean(far, |m| m.1) / mean(near, |m| m.1),
+            mean(far, |m| m.2) / mean(near, |m| m.2),
+        )
+    };
+    for page in [0x0011_1318u32, 0x0000_2B36] {
+        let (size, light) = taper(page, false);
+        let (bare_size, bare_light) = taper(page, true);
+        eprintln!(
+            "on {page:06x}: the outer seated embers' size and light against the inner ones' {size:.2} {light:.2}, untapered {bare_size:.2} {bare_light:.2}"
+        );
+        assert!(
+            size <= 0.85 && light <= 0.85,
+            "on {page:06x}: the outer embers are {size:.2} of the inner ones' size and {light:.2} of their light"
+        );
+        assert!(
+            bare_size >= 0.95,
+            "control: on {page:06x} the untapered outer embers are {bare_size:.2} of the inner ones' size"
+        );
+    }
+    for page in [0x0011_1318u32, 0x0000_2B36] {
+        let (fan, up) = spread(page, false);
+        let (line_fan, _) = spread(page, true);
+        assert!(
+            fan >= 0.05 * ch,
+            "on {page:06x}: the outer embers scatter {fan:.2} px in height"
+        );
+        assert!(
+            up >= 0.06 * ch,
+            "on {page:06x}: the outer embers sit {up:.1} px above the inner ones"
+        );
+        assert!(
+            line_fan < 0.025 * ch,
+            "control: on {page:06x} the composed land's outer embers scatter {line_fan:.2} px"
         );
     }
 }
@@ -2060,6 +2221,306 @@ fn a_dense_row_s_seated_marks_do_not_flash_before_a_late_hint() {
             "control: {style:?}'s seats lit the frame the air turns clear flash {} times: {}",
             flashes(&unheld),
             shown(&unheld)
+        );
+    }
+}
+
+/// After-land lows W2: beside a bar or an underline caret, dark Water's drops keep off the
+/// caret's cell and the cell either side of it. A block hid the beads a splash lays in its own
+/// cell and hugged the rest; a bar stood among them, two or three bright beads about it that
+/// read as a `:` or a `·`, and a lone bead in the blank cell before it as a `·` of its own
+/// (shape-bar's `water-dark-enter-bottom.e120`). Drops in the caret's cell and seven tenths
+/// of a cell before it draw nothing with a thin caret, still bead with a block, and a drop
+/// past the reach beads either way. The control lays composed r3's beads about the bar.
+#[test]
+fn a_bar_caret_stands_among_no_water_beads() {
+    let g = geom();
+    let at = Instant::now();
+    let c = cfg(GlowStyle::Water, true);
+    let caret = CursorGlow::caret_box(g, 2, 30);
+    let mid = (
+        (caret.0 + caret.2) as f32 * 0.5,
+        (caret.1 + caret.3) as f32 * 0.5,
+    );
+    let lit = |thin: bool, control: bool, (x, y): (f32, f32)| -> usize {
+        let mut glow = probed_glow(&c, g, at);
+        glow.caret_thin = thin;
+        glow.water_drops_on_thin_caret = control;
+        glow.particles.push(grain(x, y, seed_hue(7), at));
+        let (mut out, mut halos) = (Vec::new(), Vec::new());
+        glow.emit_particles(
+            at + Duration::from_secs_f32(0.05),
+            &c,
+            g,
+            &mut out,
+            &mut halos,
+            &mut crate::cursor_glow::glow_sink(
+                &mut Vec::new(),
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+            CursorGlow::MAX_QUADS,
+        );
+        out.iter().filter(|q| q.color != 0).count()
+            + halos.iter().filter(|h| h.color & 0x00FF_FFFF != 0).count()
+    };
+    let (cw, ch) = (g.cw as f32, g.ch as f32);
+    for (dx, dy) in [
+        (0.0f32, 0.0f32),
+        (-3.0, -4.0),
+        (3.0, 5.0),
+        (caret.0 as f32 - 0.7 * cw - mid.0, -0.2 * ch),
+    ] {
+        let at_bar = (mid.0 + dx, mid.1 + dy);
+        assert_eq!(
+            lit(true, false, at_bar),
+            0,
+            "a bead beside the bar at {at_bar:?}"
+        );
+        assert!(
+            lit(false, false, at_bar) > 0,
+            "a block's cell keeps its beads"
+        );
+        assert!(
+            lit(true, true, at_bar) > 0,
+            "control: composed r3's bead beside the bar at {at_bar:?}"
+        );
+    }
+    let past = (caret.2 as f32 + 2.0 * g.cw as f32, mid.1 - g.ch as f32);
+    assert!(
+        lit(true, false, past) > 0,
+        "a drop past the caret's reach still beads"
+    );
+}
+
+/// The review of W2: A WATER BEAD BESIDE A BAR SHOWS ONCE ([`CaretBead`]). Judged afresh each
+/// frame, nearly every bead was born hidden in the caret's padded box and popped in whole
+/// mid-life as the caret stepped away, and a bead the caret came to dropped out and returned at
+/// the next key. A real run (a bar caret, typed at 70 ms a key, then Backspaced at 90 ms a
+/// key), each bead the run spawned replayed alone against the caret's own cells: no bead's
+/// marks go out and come back, and one that first shows late starts under half its next
+/// reading's light. A bead held still as the caret walks past and back goes out for good at
+/// the caret's first reach. The control (`water_beads_unlatched`) judges each frame alone.
+#[test]
+fn a_water_bead_beside_a_moving_bar_shows_once() {
+    let g = geom();
+    let c = cfg(GlowStyle::Water, true);
+    let t0 = Instant::now();
+    let (mut cols, mut born) = (Vec::new(), Vec::<Particle>::new());
+    let (mut glow, mut out) = (CursorGlow::default(), Vec::new());
+    glow.set_thin_caret(true);
+    let (mut col, mut key, mut typed) = (4u16, 200u64, 0);
+    for at in (0..3_000).step_by(16) {
+        let t = t0 + Duration::from_millis(at);
+        if at >= key && typed < 18 {
+            col += 1;
+            typed += 1;
+            glow.note_synthetic_typed(t, 1);
+            key += 70;
+        } else if at >= key && typed < 26 {
+            col -= 1;
+            typed += 1;
+            key += 90;
+        }
+        glow.tick(Some((2, col)), t, &c, g, &mut out);
+        for p in &glow.particles {
+            if !born
+                .iter()
+                .any(|b| b.born == p.born && b.hue.to_bits() == p.hue.to_bits())
+            {
+                born.push(*p);
+            }
+        }
+        cols.push((at, col));
+    }
+    assert!(born.len() > 40, "fixture: {} beads", born.len());
+    // Each frame of bead `p`'s life: its marks' light, against the caret at that frame's cell.
+    let lights = |p: &Particle, unlatched: bool| -> Vec<u32> {
+        let mut one = probed_glow(&c, g, t0);
+        one.caret_thin = true;
+        one.water_beads_unlatched = unlatched;
+        one.particles.push(Particle {
+            latch: ParticleLatch::FRESH,
+            ..*p
+        });
+        let mut read = Vec::new();
+        for &(at, col) in &cols {
+            let t = t0 + Duration::from_millis(at);
+            if t < p.born || t.duration_since(p.born).as_secs_f32() > p.life {
+                continue;
+            }
+            one.last = Some((2, col));
+            let (mut o, mut h) = (Vec::new(), Vec::new());
+            one.emit_particles(
+                t,
+                &c,
+                g,
+                &mut o,
+                &mut h,
+                &mut crate::cursor_glow::glow_sink(
+                    &mut Vec::new(),
+                    &mut aterm_render::GlowRamps::default(),
+                    true,
+                ),
+                CursorGlow::MAX_QUADS,
+            );
+            read.push(
+                o.iter()
+                    .filter(|q| q.color != 0)
+                    .map(|q| u32::from(q.alpha))
+                    .sum::<u32>()
+                    + h.iter()
+                        .map(|h| (h.color >> 16 & 0xff) + (h.color >> 8 & 0xff) + (h.color & 0xff))
+                        .sum::<u32>(),
+            );
+        }
+        read
+    };
+    // A bead's holes (lit, dark, lit again), and whether it first showed late at more than half
+    // its next reading.
+    let judge = |read: &[u32]| -> (usize, bool) {
+        let Some(first) = read.iter().position(|&l| l > 0) else {
+            return (0, false);
+        };
+        let holes = read[first..]
+            .windows(2)
+            .enumerate()
+            .filter(|(k, w)| w[0] > 0 && w[1] == 0 && read[first + k + 1..].iter().any(|&l| l > 0))
+            .count();
+        let next = read.get(first + 1).copied().unwrap_or(0);
+        (holes, first > 0 && read[first] * 2 > next && next > 0)
+    };
+    let (mut holes, mut pops, mut shown) = (0, 0, 0);
+    let (mut control_holes, mut control_pops) = (0, 0);
+    for p in &born {
+        let read = lights(p, false);
+        let (h, pop) = judge(&read);
+        holes += h;
+        pops += usize::from(pop);
+        shown += usize::from(read.iter().any(|&l| l > 0));
+        let (h, pop) = judge(&lights(p, true));
+        control_holes += h;
+        control_pops += usize::from(pop);
+    }
+    assert!(
+        shown * 2 > born.len(),
+        "the bar keeps its beads: {shown} of {} show",
+        born.len()
+    );
+    assert_eq!(holes, 0, "beads went dark and came back");
+    assert_eq!(pops, 0, "beads popped in whole as the caret left");
+    assert!(
+        control_holes > 0 && control_pops > 0,
+        "control: judged each frame alone, {control_holes} holes and {control_pops} pops"
+    );
+    // One bead held still, the caret walking past it and back.
+    let walk = |unlatched: bool| -> Vec<bool> {
+        let mut one = probed_glow(&c, g, t0);
+        one.caret_thin = true;
+        one.water_beads_unlatched = unlatched;
+        let at_bar = CursorGlow::caret_box(g, 2, 30);
+        let (x, y) = (
+            at_bar.0 as f32 + 3.5 * g.cw as f32,
+            (at_bar.1 + at_bar.3) as f32 * 0.5 - 0.2 * g.ch as f32,
+        );
+        one.particles.push(grain(x, y, seed_hue(7), t0));
+        [30u16, 31, 32, 33, 34, 35, 36, 37, 36, 35, 34, 33, 32]
+            .into_iter()
+            .enumerate()
+            .map(|(k, col)| {
+                one.last = Some((2, col));
+                let (mut o, mut h) = (Vec::new(), Vec::new());
+                one.emit_particles(
+                    t0 + Duration::from_millis(20 * k as u64),
+                    &c,
+                    g,
+                    &mut o,
+                    &mut h,
+                    &mut crate::cursor_glow::glow_sink(
+                        &mut Vec::new(),
+                        &mut aterm_render::GlowRamps::default(),
+                        true,
+                    ),
+                    CursorGlow::MAX_QUADS,
+                );
+                o.iter().any(|q| q.color != 0) || h.iter().any(|h| h.color & 0x00FF_FFFF != 0)
+            })
+            .collect()
+    };
+    let shown_lit = walk(false);
+    let out_at = shown_lit
+        .iter()
+        .position(|&lit| !lit)
+        .expect("the caret reaches the bead");
+    assert!(out_at > 0, "fixture: the bead shows until the caret comes");
+    assert!(
+        shown_lit[out_at..].iter().all(|&lit| !lit),
+        "once the caret came to it the bead stays out: {shown_lit:?}"
+    );
+    let control = walk(true);
+    let dark = control.iter().position(|&lit| !lit).expect("fixture");
+    assert!(
+        control[dark..].iter().any(|&lit| lit),
+        "control: judged each frame alone the bead returns: {control:?}"
+    );
+}
+
+/// AFTER-LAND LOWS W9: SPARKLE'S CRESCENT IS NO DOT ([`CursorGlow::MOON_MIN_R`]). At twice its
+/// grain's dust radius alone a low-seeded moon was 0.14 of a cell, about 6 px across at 1x, a
+/// gold dot (composed r3's judges). The lowest-seeded moon stands at least seven tenths of a
+/// half cell tall on paper and on a dark page. Control: composed r3's size (`moon_r3_size`).
+#[test]
+fn sparkle_s_least_moon_reads_as_a_crescent() {
+    let g = tall_geom();
+    let born = Instant::now();
+    let hue = seed_hue(6);
+    let tall = |dark: bool, r3: bool| {
+        let mut c = cfg(GlowStyle::Sparkle, true);
+        c.dark_theme = dark;
+        if !dark {
+            (c.theme_fg, c.theme_bg) = (0x001F_2328, 0x00FF_FFFF);
+        }
+        let mut glow = CursorGlow {
+            moon_r3_size: r3,
+            ..CursorGlow::default()
+        };
+        glow.particles.push(grain(100.0, 40.0, hue, born));
+        let (mut out, mut halos) = (Vec::new(), Vec::new());
+        glow.emit_particles(
+            born + Duration::from_secs_f32(peak_age(hue)),
+            &c,
+            g,
+            &mut out,
+            &mut halos,
+            &mut crate::cursor_glow::glow_sink(
+                &mut Vec::new(),
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+            CursorGlow::MAX_QUADS,
+        );
+        assert!(
+            !out.is_empty(),
+            "fixture: the moon (dark {dark}) lays its crescent"
+        );
+        let top = out.iter().map(|q| i32::from(q.y)).min().unwrap_or(0);
+        let bot = out
+            .iter()
+            .map(|q| i32::from(q.y) + i32::from(q.h))
+            .max()
+            .unwrap_or(0);
+        (bot - top) as f32 / g.ch as f32
+    };
+    for dark in [true, false] {
+        let h = tall(dark, false);
+        assert!(
+            h >= 0.35,
+            "dark {dark}: the least moon stands {h:.2} of a cell"
+        );
+        let control = tall(dark, true);
+        assert!(
+            control < 0.35,
+            "dark {dark}: control: composed r3's least moon stands {control:.2} of a cell"
         );
     }
 }

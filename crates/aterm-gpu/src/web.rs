@@ -47,7 +47,7 @@ impl GpuContext {
             device_lost: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             device_loss_msg: std::sync::Arc::default(),
             visual_swapchain: false,
-            gl_max_texture_dim: caps.max_texture_dim,
+            gl_max_texture_dim: caps.max_texture_dim.get(),
             gl_canvas: dev.clone(),
         };
         Ok((ctx, CanvasSurface(dev)))

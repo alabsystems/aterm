@@ -97,29 +97,18 @@ const WORKER_AFTER_JOIN: usize = 1;
 const WORKER_POST_JOIN: usize = 2;
 const WORKER_GPU_BUILD: usize = 4;
 
-/// GPU schema 1: the renderer build's exclusive legs.
-pub(crate) const GPU: [&str; 7] = [
-    "startup_gpu_instance_ms",
-    "startup_gpu_adapter_ms",
-    "startup_gpu_device_ms",
-    "startup_gpu_context_tail_ms",
+/// The GPU schema this lane reads. Schema 1 was wgpu's legs (instance,
+/// adapter, device, pipelines), which no binary has filled since GW.6.
+const GPU_SCHEMA: u64 = 2;
+/// GPU schema 2: the renderer build's exclusive legs.
+pub(crate) const GPU: [&str; 4] = [
+    "startup_gpu_context_ms",
     "startup_gpu_font_join_ms",
-    "startup_gpu_pipelines_ms",
+    "startup_gpu_assemble_ms",
     "startup_gpu_tail_ms",
 ];
-const GPU_PIPELINES: usize = 5;
 /// Reported beside the partition, never in it: the font thread overlaps GPU init.
 pub(crate) const GPU_PARALLEL: [&str; 1] = ["startup_gpu_font_thread_ms"];
-pub(crate) const GPU_PIPES: [&str; 8] = [
-    "startup_gpu_pipe_shader_ms",
-    "startup_gpu_pipe_uniform_atlas_ms",
-    "startup_gpu_pipe_cell_ms",
-    "startup_gpu_pipe_blit_ms",
-    "startup_gpu_pipe_tray_ms",
-    "startup_gpu_pipe_bloom_ms",
-    "startup_gpu_pipe_vbuf_ms",
-    "startup_gpu_pipe_tail_ms",
-];
 
 const DROP_REASONS: [&str; 10] = [
     "none",
@@ -173,8 +162,6 @@ pub(crate) struct Worker {
 pub(crate) struct Gpu {
     pub legs: Vec<f64>,
     pub parallel: Vec<f64>,
-    pub pipes: Vec<f64>,
-    pub cells: Vec<(String, f64)>,
 }
 
 /// One validated launch.
@@ -252,10 +239,15 @@ fn non_negative(m: &Value, keys: &[&str]) -> Result<Vec<f64>, String> {
 
 /// A schema field: the integer 1 (never `true`, never `1.0`).
 fn schema_one(m: &Value, key: &str) -> Result<(), String> {
+    schema_is(m, key, 1)
+}
+
+/// A schema field: the integer `want` (never `true`, never a float).
+fn schema_is(m: &Value, key: &str, want: u64) -> Result<(), String> {
     match m.get(key) {
-        Some(v @ Value::Number(_)) if v.as_u64() == Some(1) => Ok(()),
+        Some(v @ Value::Number(_)) if v.as_u64() == Some(want) => Ok(()),
         other => Err(format!(
-            "invalid sample: {key}={}; expected 1",
+            "invalid sample: {key}={}; expected {want}",
             shown(other)
         )),
     }
@@ -401,49 +393,16 @@ impl Sample {
         };
 
         let gpu = if m.get("startup_gpu_schema").is_some()
+            && m.get("startup_gpu_schema").and_then(Value::as_u64) != Some(1)
             && m.get("startup_gpu_valid") == Some(&Value::Bool(true))
         {
-            schema_one(m, "startup_gpu_schema")?;
+            schema_is(m, "startup_gpu_schema", GPU_SCHEMA)?;
             let legs = non_negative(m, &GPU)?;
             let parallel = non_negative(m, &GPU_PARALLEL)?;
-            let pipes = non_negative(m, &GPU_PIPES)?;
             if let Some(w) = &worker {
                 reconcile("gpu leg sum", legs.iter().sum(), w.legs[WORKER_GPU_BUILD])?;
             }
-            let pipe_sum: f64 = pipes.iter().sum();
-            if pipe_sum - legs[GPU_PIPELINES] > ROUNDING_MS {
-                return Err(format!(
-                    "gpu pipeline group sum {pipe_sum:.2}ms exceeds its parent {:.2}ms",
-                    legs[GPU_PIPELINES]
-                ));
-            }
-            let cells: Vec<(String, f64)> = m
-                .get("startup_gpu_cell_pipeline_ms")
-                .and_then(Value::as_object)
-                .filter(|o| !o.is_empty())
-                .ok_or_else(|| {
-                    format!(
-                        "invalid sample: startup_gpu_cell_pipeline_ms={}; expected a non-empty \
-                         object",
-                        shown(m.get("startup_gpu_cell_pipeline_ms"))
-                    )
-                })?
-                .iter()
-                .map(|(k, v)| {
-                    v.as_f64()
-                        .filter(|f| f.is_finite() && *f >= 0.0)
-                        .map(|f| (k.clone(), f))
-                        .ok_or_else(|| {
-                            format!("invalid sample: cell pipeline {k}={}", shown(Some(v)))
-                        })
-                })
-                .collect::<Result<_, _>>()?;
-            Some(Gpu {
-                legs,
-                parallel,
-                pipes,
-                cells,
-            })
+            Some(Gpu { legs, parallel })
         } else {
             None
         };
@@ -633,18 +592,11 @@ impl Sample {
         for (names, pick) in [
             (&GPU[..], (|g: &Gpu| g.legs.clone()) as fn(&Gpu) -> Vec<f64>),
             (&GPU_PARALLEL[..], |g: &Gpu| g.parallel.clone()),
-            (&GPU_PIPES[..], |g: &Gpu| g.pipes.clone()),
         ] {
             for (i, k) in names.iter().enumerate() {
                 put(k, json!(gpu.map(|g| pick(g)[i])));
             }
         }
-        put(
-            "startup_gpu_cell_pipeline_ms",
-            gpu.map_or(Value::Null, |g| {
-                Value::Object(g.cells.iter().map(|(k, v)| (k.clone(), json!(v))).collect())
-            }),
-        );
         put("external_observation_ms", json!(self.external_ms));
         put("frames", json!(self.frames));
         put("backend", json!(self.backend));
@@ -934,7 +886,8 @@ fn default_binary() -> Result<PathBuf, String> {
     })
 }
 
-/// Write `value` to `path` atomically (a temp file in the same directory, then a rename).
+/// Write `value` to the person's `path` (`--json-out`) by [`super::super::publication::publish_named`]:
+/// a file, or a link to one, is replaced whole; a FIFO or `/dev/stdout` is written where it is.
 pub(crate) fn write_json_atomic(path: &Path, value: &Value) -> Result<(), String> {
     let parent = path
         .parent()
@@ -944,25 +897,10 @@ pub(crate) fn write_json_atomic(path: &Path, value: &Value) -> Result<(), String
         .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
     let mut text = aterm_json::to_string(value).map_err(|e| format!("JSON: {e}"))?;
     text.push('\n');
-    let tmp_dir = aterm_tempfile::Builder::new()
-        .prefix(".json-")
-        .tempdir_in(parent)
-        .map_err(|e| format!("could not stage {}: {e}", path.display()))?;
-    let tmp = tmp_dir.path().join("out.json");
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
-    }
-    opts.open(&tmp)
-        .and_then(|mut f| {
-            use std::io::Write as _;
-            f.write_all(text.as_bytes())
-        })
-        .map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("could not place {}: {e}", path.display()))?;
+    // The person's `--json-out`: a FIFO or `/dev/stdout` is written where it is, a file (or a
+    // link to one) is replaced whole.
+    super::super::publication::publish_named(path, &text)
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
     eprintln!("json_result: {}", path.display());
     Ok(())
 }
@@ -1155,23 +1093,13 @@ fn print_summary(samples: &[Sample]) {
     if samples.iter().all(|s| s.gpu.is_some()) && !samples.is_empty() {
         let gpu = |pick: fn(&Gpu) -> Vec<f64>| move |s: &Sample| s.gpu.as_ref().map(pick);
         ranked(
-            "gpu renderer build (schema 1, exclusive)",
+            "gpu renderer build (schema 2, exclusive)",
             named(samples, &GPU, gpu(|g| g.legs.clone())),
             "",
         );
         ranked(
             "  PARALLEL (overlaps the legs above, not part of the sum)",
             named(samples, &GPU_PARALLEL, gpu(|g| g.parallel.clone())),
-            "",
-        );
-        ranked(
-            "  pipeline construction, by group",
-            named(samples, &GPU_PIPES, gpu(|g| g.pipes.clone())),
-            "",
-        );
-        ranked(
-            "  cell pipelines, one slot each",
-            Some(cell_pipelines(samples)),
             "",
         );
     } else {
@@ -1220,20 +1148,6 @@ fn named(
     )
 }
 
-/// The per-slot cell pipelines, each with its values across the samples that
-/// built it (the slots are the binary's, not this lane's).
-fn cell_pipelines(samples: &[Sample]) -> Vec<(String, Vec<f64>)> {
-    let mut slots: std::collections::BTreeMap<String, Vec<f64>> = Default::default();
-    for (slot, ms) in samples
-        .iter()
-        .filter_map(|s| s.gpu.as_ref())
-        .flat_map(|g| &g.cells)
-    {
-        slots.entry(slot.clone()).or_default().push(*ms);
-    }
-    slots.into_iter().collect()
-}
-
 fn summary_of(samples: &[Sample], pick: impl Fn(&Sample) -> Option<f64>) -> Value {
     column(samples, pick).map_or(Value::Null, |v| crate::perf::stats::distribution(&v))
 }
@@ -1254,13 +1168,12 @@ fn start_json(artifact: &Frozen, chip: &str, args: &Args, samples: &[Sample]) ->
     let gpu_groups = [
         named(samples, &GPU, gpu(|g| g.legs.clone())),
         named(samples, &GPU_PARALLEL, gpu(|g| g.parallel.clone())),
-        named(samples, &GPU_PIPES, gpu(|g| g.pipes.clone())),
     ]
     .into_iter()
     .collect::<Option<Vec<_>>>()
     .map(|groups| groups.concat());
     json!({
-        "schema": "aterm-start-v2",
+        "schema": "aterm-start-v3",
         "binary": artifact.source.display().to_string(),
         "version": artifact.version,
         "sha256": artifact.sha256,
@@ -1286,7 +1199,6 @@ fn start_json(artifact: &Frozen, chip: &str, args: &Args, samples: &[Sample]) ->
                 s.worker.as_ref().map(|w| w.legs.clone())
             })),
             "startup_gpu_ms": distributions(gpu_groups),
-            "startup_gpu_cell_pipeline_ms": distributions(Some(cell_pipelines(samples))),
             "external_observation_ms": summary_of(samples, |s| Some(s.external_ms)),
         },
     })
@@ -1599,8 +1511,7 @@ case \"$0\" in *-aterm) echo '{frozen_says}' ;; \
     }
 
     /// [`metrics`] plus a valid worker drill-down (gpu_build 4.0) and a GPU
-    /// drill-down whose legs close against it and whose pipeline groups
-    /// (0.1 each) fill their 0.8 parent.
+    /// drill-down whose legs close against it.
     fn drilled() -> Value {
         let mut m = metrics(0.0);
         let fields = [
@@ -1616,26 +1527,16 @@ case \"$0\" in *-aterm) echo '{frozen_says}' ;; \
             ("startup_worker_font_apply_ms", json!(0.5)),
             ("startup_worker_font_seal_ms", json!(0.5)),
             ("startup_worker_epilogue_ms", json!(0.5)),
-            ("startup_gpu_schema", json!(1)),
+            ("startup_gpu_schema", json!(2)),
             ("startup_gpu_valid", json!(true)),
-            ("startup_gpu_instance_ms", json!(0.5)),
-            ("startup_gpu_adapter_ms", json!(0.5)),
-            ("startup_gpu_device_ms", json!(1.0)),
-            ("startup_gpu_context_tail_ms", json!(0.5)),
+            ("startup_gpu_context_ms", json!(2.5)),
             ("startup_gpu_font_join_ms", json!(0.5)),
-            ("startup_gpu_pipelines_ms", json!(0.8)),
+            ("startup_gpu_assemble_ms", json!(0.8)),
             ("startup_gpu_tail_ms", json!(0.2)),
             ("startup_gpu_font_thread_ms", json!(2.5)),
-            (
-                "startup_gpu_cell_pipeline_ms",
-                json!({"plain": 0.2, "glyph": 0.1}),
-            ),
         ];
         for (k, v) in fields {
             m = with(m, k, v);
-        }
-        for k in GPU_PIPES {
-            m = with(m, k, json!(0.1));
         }
         m
     }
@@ -1651,7 +1552,6 @@ case \"$0\" in *-aterm) echo '{frozen_says}' ;; \
             vec![2.5],
             "the font thread rides beside the sum"
         );
-        assert_eq!(g.cells.len(), 2);
         for (key, v, why) in [
             ("startup_worker_total_ms", json!(9.0), "worker split"),
             (
@@ -1661,19 +1561,9 @@ case \"$0\" in *-aterm) echo '{frozen_says}' ;; \
             ),
             ("startup_gpu_tail_ms", json!(0.5), "gpu leg sum mismatch"),
             (
-                "startup_gpu_pipe_tail_ms",
-                json!(0.3),
-                "gpu pipeline group sum 1.00ms exceeds its parent 0.80ms",
-            ),
-            (
-                "startup_gpu_cell_pipeline_ms",
-                json!({}),
-                "expected a non-empty object",
-            ),
-            (
-                "startup_gpu_cell_pipeline_ms",
-                json!({"plain": -1.0}),
-                "cell pipeline plain=-1",
+                "startup_gpu_schema",
+                json!(3),
+                "startup_gpu_schema=3; expected 2",
             ),
             (
                 "startup_gpu_font_thread_ms",
@@ -1689,32 +1579,21 @@ case \"$0\" in *-aterm) echo '{frozen_says}' ;; \
         )
         .expect("invalid worker is skipped");
         assert!(s.worker.is_none());
-        let s = Sample::from_observation(&obs(with(m, "startup_gpu_valid", json!(false))), &LAWS)
-            .expect("invalid gpu is skipped");
+        let s = Sample::from_observation(
+            &obs(with(m.clone(), "startup_gpu_valid", json!(false))),
+            &LAWS,
+        )
+        .expect("invalid gpu is skipped");
+        assert!(s.gpu.is_none());
+        let s = Sample::from_observation(&obs(with(m, "startup_gpu_schema", json!(1))), &LAWS)
+            .expect("a wgpu-era schema is skipped");
         assert!(s.gpu.is_none());
     }
 
     #[test]
-    fn the_summary_carries_the_worker_total_the_parallel_leg_and_every_cell_slot() {
+    fn the_summary_carries_the_worker_total_and_the_parallel_leg() {
         let a = Sample::from_observation(&obs(drilled()), &LAWS).expect("valid");
-        let b = Sample::from_observation(
-            &obs(with(
-                drilled(),
-                "startup_gpu_cell_pipeline_ms",
-                json!({"plain": 0.3, "wide": 0.4}),
-            )),
-            &LAWS,
-        )
-        .expect("valid");
-        let samples = [a, b];
-        assert_eq!(
-            cell_pipelines(&samples),
-            vec![
-                ("glyph".to_string(), vec![0.1]),
-                ("plain".to_string(), vec![0.2, 0.3]),
-                ("wide".to_string(), vec![0.4]),
-            ]
-        );
+        let samples = [a.clone(), a];
         assert_eq!(
             named(&samples, &GPU_PARALLEL, |s| {
                 s.gpu.as_ref().map(|g| g.parallel.clone())
@@ -1854,7 +1733,7 @@ case \"$0\" in *-aterm) echo '{frozen_says}' ;; \
                 .and_then(Value::as_f64),
             Some(1.0)
         );
-        assert_eq!(j.get("startup_gpu_cell_pipeline_ms"), Some(&Value::Null));
+        assert_eq!(j.get("startup_gpu_context_ms"), Some(&Value::Null));
         assert_eq!(j.get(BIRTH), Some(&Value::Null));
         assert_eq!(j.get("startup_prepare_boot_ms"), Some(&Value::Null));
     }

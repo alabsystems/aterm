@@ -760,3 +760,136 @@ fn erase_poof_drive_grows_with_momentum_and_weight() {
         "a cold single-character erase still throws a visible few sparkles"
     );
 }
+
+/// AN ERASE THROWS NO SMOKE ON PAPER. Small and dark, a plain Backspace's two puffs read as a `¨`
+/// one cell right of the caret (the trail gallery's `steam.bs06`); wide and pale, they were discs
+/// that rose onto the letters of the row above and stood over the style's own body
+/// (`phaser-light-steam.t120`, x202-249 y96-116). Every delete shape on paper, on every style that
+/// throws the cloud on a dark page, lays none and keeps none alive past its frame. The same script
+/// on the dark page is the control: it does throw one, so the paper's none is the law and not a
+/// script that never reached the poof.
+#[test]
+fn an_erase_throws_no_smoke_on_paper() {
+    let g = retina_geom();
+    let row = |s: &str| -> Vec<char> {
+        let mut v: Vec<char> = s.chars().collect();
+        v.resize(g.cols, ' ');
+        v
+    };
+    let line = "$ echo hello world";
+    // The clouds one delete shape throws on this page: (vapor poofs, halos laid for them).
+    let clouds = |style: GlowStyle, dark: bool, erase: &dyn Fn(&mut CursorGlow, Instant)| {
+        let mut c = cfg(style, true);
+        if !dark {
+            c.dark_theme = false;
+            (c.theme_fg, c.theme_bg) = (0x001F_2328, 0x00FF_FFFF);
+        }
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        let at = line.len() as u16;
+        glow.observe_row(2, at, &row(line), t0);
+        glow.tick(Some((2, at)), t0, &c, g, &mut out);
+        erase(&mut glow, t0);
+        let puffs = glow
+            .vapor
+            .iter()
+            .filter(|v| v.kind == VaporKind::Poof)
+            .count();
+        let mut halos = Vec::new();
+        glow.emit_vapor(t0 + ms(60), &c, g, &mut halos);
+        (puffs, halos.len())
+    };
+    let shrink = |glow: &mut CursorGlow, c: &GlowConfig, text: &str, col: u16, t: Instant| {
+        glow.observe_row(2, col, &row(text), t);
+        glow.tick(Some((2, col)), t, c, g, &mut Vec::new());
+    };
+    for style in [
+        GlowStyle::RainbowKitty,
+        GlowStyle::Sparkle,
+        GlowStyle::Water,
+        GlowStyle::Comet,
+        GlowStyle::Lumen,
+        GlowStyle::Laser,
+        GlowStyle::Beam,
+        GlowStyle::Phaser,
+    ] {
+        for dark in [false, true] {
+            let mut c = cfg(style, true);
+            if !dark {
+                c.dark_theme = false;
+                (c.theme_fg, c.theme_bg) = (0x001F_2328, 0x00FF_FFFF);
+            }
+            let at = line.len() as u16;
+            let backspace = |glow: &mut CursorGlow, t0: Instant| {
+                arm_exact_backspace(glow, t0 + ms(30), (2, at), (2, at - 1));
+                shrink(glow, &c, &line[..line.len() - 1], at - 1, t0 + ms(46));
+            };
+            let word_kill = |glow: &mut CursorGlow, t0: Instant| {
+                glow.note_kill(t0 + ms(8), true);
+                shrink(glow, &c, "$ echo hello ", 13, t0 + ms(24));
+            };
+            let line_kill = |glow: &mut CursorGlow, t0: Instant| {
+                glow.note_kill(t0 + ms(8), true);
+                shrink(glow, &c, "$ ", 2, t0 + ms(24));
+            };
+            type Erase<'a> = &'a dyn Fn(&mut CursorGlow, Instant);
+            let shapes: [(&str, Erase<'_>); 3] = [
+                ("Backspace", &backspace),
+                ("word kill", &word_kill),
+                ("line kill", &line_kill),
+            ];
+            for (name, erase) in shapes {
+                let (puffs, halos) = clouds(style, dark, erase);
+                if dark {
+                    assert!(
+                        puffs > 0 && halos > 0,
+                        "control: {style:?}'s {name} throws its cloud on the dark page, {puffs} \
+                         puffs and {halos} halos"
+                    );
+                } else {
+                    assert_eq!(
+                        (puffs, halos),
+                        (0, 0),
+                        "{style:?}'s {name} threw smoke on paper"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A puff in the air when the page turns to paper ends there: read on paper it draws nothing and
+/// is gone, so it neither hangs on as a dark puff's colours on the white nor comes back on the
+/// next dark frame, a presence that dipped and returned.
+#[test]
+fn a_puff_a_theme_flip_carries_to_paper_ends_there() {
+    let g = retina_geom();
+    let dark = cfg(GlowStyle::Lumen, true);
+    let mut paper = cfg(GlowStyle::Lumen, true);
+    paper.dark_theme = false;
+    (paper.theme_fg, paper.theme_bg) = (0x001F_2328, 0x00FF_FFFF);
+    let mut glow = CursorGlow::default();
+    let t0 = Instant::now();
+    glow.spawn_poof_smoke(80.0, 8.0, 32.0, 16.0, 8.0, 1, t0);
+    let mut halos = Vec::new();
+    glow.emit_vapor(t0 + ms(20), &dark, g, &mut halos);
+    assert!(
+        !halos.is_empty(),
+        "precondition: the puff shows on the dark"
+    );
+    halos.clear();
+    glow.emit_vapor(t0 + ms(40), &paper, g, &mut halos);
+    assert!(
+        halos.is_empty(),
+        "the puff draws on paper: {} halos",
+        halos.len()
+    );
+    glow.emit_vapor(t0 + ms(60), &dark, g, &mut halos);
+    assert!(
+        halos.is_empty(),
+        "the puff came back on the dark: {} halos",
+        halos.len()
+    );
+    assert!(glow.vapor.is_empty(), "the puff lives on past the flip");
+}

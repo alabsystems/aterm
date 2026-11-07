@@ -1,0 +1,141 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+
+//! Shared updater wake signaling and connection-recovery classification.
+
+use std::time::{Duration, Instant, SystemTime};
+
+/// Wall-clock excess over a requested sleep slice that indicates the machine was asleep.
+pub(crate) const SLEEP_GAP: Duration = Duration::from_secs(90);
+
+/// Whether an update-check error `message` indicates an unreachable network.
+pub(crate) fn is_network_unreachable(message: &str) -> bool {
+    // Resolving the proxy is as necessary to reaching the channel as resolving its host.
+    const UNREACHABLE: [u32; 4] = [5, 6, 7, 28];
+    if !message.contains("curl") {
+        return false;
+    }
+    let code_after = |marker: &str| {
+        message.match_indices(marker).any(|(at, _)| {
+            let digits: String = message[at + marker.len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits
+                .parse::<u32>()
+                .is_ok_and(|code| UNREACHABLE.contains(&code))
+        })
+    };
+    code_after("curl: (") || code_after("exit status: ") || code_after("(exit ")
+}
+
+/// Outcome of a cadence sleep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Waited {
+    /// Full delay elapsed normally.
+    Elapsed,
+    /// A wake signal, network change, or system sleep gap was detected; the
+    /// duration is any observed wall-clock excess, zero when there was none.
+    Woke(Duration),
+}
+
+/// Whether `observed` wall-clock elapsed time exceeds `slice` by at least [`SLEEP_GAP`].
+pub(crate) fn is_wake_gap(slice: Duration, observed: Duration) -> bool {
+    observed.saturating_sub(slice) >= SLEEP_GAP
+}
+
+/// Cross-thread wake signal, also polling the host's settled network changes.
+pub(crate) struct WakeSignal {
+    posts: std::sync::Mutex<u64>,
+    posted: std::sync::Condvar,
+    network_changed: std::sync::OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
+}
+
+impl WakeSignal {
+    pub(crate) const fn new() -> Self {
+        Self {
+            posts: std::sync::Mutex::new(0),
+            posted: std::sync::Condvar::new(),
+            network_changed: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The host supplies a cheap, non-networking, consuming change probe.
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    pub(crate) fn set_network_probe(&self, probe: Box<dyn Fn() -> bool + Send + Sync>) {
+        let _ = self.network_changed.set(probe);
+    }
+
+    fn poll_network(&self) {
+        if self.network_changed.get().is_some_and(|probe| probe()) {
+            // Publish to every generation's waiter, even when a retiring
+            // checker was the one that consumed the host's change signal.
+            self.post();
+        }
+    }
+
+    /// Notify all waiters that the system woke.
+    pub(crate) fn post(&self) {
+        let mut posts = self
+            .posts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *posts = posts.wrapping_add(1);
+        self.posted.notify_all();
+    }
+
+    /// Total wake notifications posted so far.
+    pub(crate) fn posts(&self) -> u64 {
+        *self
+            .posts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Wait up to `timeout` for a post past the `seen`-th; whether one came.
+    pub(crate) fn wait_past(&self, seen: u64, timeout: Duration) -> bool {
+        self.poll_network();
+        let posts = self
+            .posts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (posts, _) = self
+            .posted
+            .wait_timeout_while(posts, timeout, |posts| *posts == seen)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *posts != seen {
+            return true;
+        }
+        drop(posts);
+        self.poll_network();
+        self.posts() != seen
+    }
+}
+
+/// Process-wide system wake and network-change signal.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) static SYSTEM_WOKE: WakeSignal = WakeSignal::new();
+
+/// Maximum sleep slice used by [`sleep_watching_for_wake`].
+pub(crate) const WAKE_SLICE: Duration = Duration::from_secs(5);
+
+/// Sleep for `total` in [`WAKE_SLICE`] increments, returning early on `signal` or a wall-clock jump.
+pub(crate) fn sleep_watching_for_wake(signal: &WakeSignal, seen: u64, total: Duration) -> Waited {
+    let mut remaining = total;
+    while !remaining.is_zero() {
+        let slice = remaining.min(WAKE_SLICE);
+        let before = SystemTime::now();
+        let ran = Instant::now();
+        let posted = signal.wait_past(seen, slice);
+        let observed = before.elapsed().unwrap_or(slice);
+        if posted {
+            // The wall clock's lead over this thread's own running time, for the log.
+            return Waited::Woke(observed.saturating_sub(ran.elapsed()));
+        }
+        if is_wake_gap(slice, observed) {
+            return Waited::Woke(observed.saturating_sub(slice));
+        }
+        remaining = remaining.saturating_sub(slice);
+    }
+    Waited::Elapsed
+}

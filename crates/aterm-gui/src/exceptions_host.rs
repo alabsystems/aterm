@@ -891,7 +891,10 @@ impl App {
             } => {
                 // The stop is said whatever its urgency (§14.3): `resume_standing` keeps only
                 // Later exceptions, so the glass reads the arm here, and loses it as the loop
-                // lifts the hold (`standing: None`) or ends (`end_notes`).
+                // lifts the hold (`standing: None`) or ends (`end_notes`). The session keeps the
+                // why of one the held deadline judges at any verdict (a point the loop's own
+                // tries are spent at, `held_judges_exception`), so a lead's `await task` hears
+                // the stall; one the loop recovers from, or another told in its place, clears it.
                 if let Some(session) = self.local_session_of(&aterm_session::SessionId::new(&sid)) {
                     self.show_stopped(
                         session,
@@ -900,6 +903,21 @@ impl App {
                             aterm_agent::supervise::policy::exception::Exception::lifted_by_switch,
                         ),
                     );
+                    if let Some(entry) = self.pool.get(session) {
+                        entry
+                            .ctx
+                            .timeline
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .set_loop_exception(
+                                standing
+                                    .as_ref()
+                                    .filter(|exception| {
+                                        crate::harness_host::held_judges_exception(exception)
+                                    })
+                                    .map(|exception| exception.why.clone()),
+                            );
+                    }
                 }
                 match standing
                     .as_ref()

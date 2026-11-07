@@ -74,9 +74,7 @@ fn stage(_: &crate::Ctx, spec: &crate::plan::StageSpec) -> crate::ladder::Report
     let mut work = std::mem::take(&mut *WORK.lock().unwrap()).into_iter();
     leave_running(work.next().unwrap());
     let nested = Mutex::new(Some(work.next().unwrap()));
-    crate::testrun::pool(1, &[0], 1, |_| {
-        leave_running(nested.lock().unwrap().take().unwrap())
-    });
+    crate::testrun::dispatch_each(1, |_| leave_running(nested.lock().unwrap().take().unwrap()));
     assert!(work.next().is_none());
     let mut report = crate::ladder::Report::new(&spec.title);
     report.cannot_run("the bounded workers did not finish");

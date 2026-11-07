@@ -2427,6 +2427,21 @@ fn automatic_check_due(state: &State, source: &Source, started: i64) -> bool {
         || started >= state.next_check_unix
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckTrigger {
+    Scheduled,
+    Manual,
+    NetworkMoved,
+}
+
+fn check_due(state: &State, source: &Source, started: i64, trigger: CheckTrigger) -> bool {
+    trigger == CheckTrigger::Manual
+        || automatic_check_due(state, source, started)
+        || (trigger == CheckTrigger::NetworkMoved
+            && state.failing_checks > 0
+            && crate::check_wake::is_network_unreachable(&state.outcome))
+}
+
 fn request_apply_provider(
     provider: &crate::CheckSettingsProvider,
     requested_auto_apply: bool,
@@ -2465,9 +2480,28 @@ fn check_recording_in(
     provider: &crate::CheckSettingsProvider,
     force: bool,
 ) -> (crate::UpdateStatus, crate::linux_notice::Record, bool) {
+    let trigger = if force {
+        CheckTrigger::Manual
+    } else {
+        CheckTrigger::Scheduled
+    };
+    check_recording_owned_in(context, current_build, provider, trigger, None)
+}
+
+fn check_recording_owned_in(
+    context: Result<&Context, String>,
+    current_build: u64,
+    provider: &crate::CheckSettingsProvider,
+    trigger: CheckTrigger,
+    owner: Option<(&crate::checker_watch::CheckerWatch, u64)>,
+) -> (crate::UpdateStatus, crate::linux_notice::Record, bool) {
     let mut recorded = false;
     let mut took_lock = false;
     let attempt = (|| -> Result<(), String> {
+        let current = || owner.is_none_or(|(watch, generation)| watch.is_current(generation));
+        if !current() {
+            return Err("update checker generation retired".into());
+        }
         let settings = provider().ok_or("current update settings could not be read")?;
         let source = &settings.source;
         let context = context.clone()?;
@@ -2477,9 +2511,13 @@ fn check_recording_in(
         }
         let _lock = context.lock()?;
         took_lock = true;
+        if !current() {
+            return Err("update checker generation retired".into());
+        }
+        let _owner = owner.map(|(watch, generation)| watch.hold_lane(generation));
         state = context.read_state()?.ok_or(MISSING_ENROLLMENT)?;
         let started = now()?;
-        if !force && !automatic_check_due(&state, source, started) {
+        if !check_due(&state, source, started, trigger) {
             return Ok(());
         }
         let checked_build = state.check_build;
@@ -2526,7 +2564,7 @@ fn check_recording_in(
     if let Err(error) = attempt {
         // A typed check's reason reaches the log its trouble line points at; the
         // background loop logs each changed outcome itself.
-        if force {
+        if trigger == CheckTrigger::Manual {
             aterm_log::warn!("aterm-update: manual update check failed: {error}");
         }
         status.outcome = error;
@@ -2691,33 +2729,13 @@ pub(crate) fn spawn_background_check_with_settings(
     notify: Option<crate::HealthNotify>,
     on_checked: Option<crate::CheckedNotify>,
 ) {
-    static STARTED: AtomicBool = AtomicBool::new(false);
-    if !crate::automatic()
-        || !context().is_ok_and(enrolled_in)
-        || STARTED.swap(true, Ordering::AcqRel)
-    {
-        return;
-    }
-    let _ = std::thread::Builder::new()
-        .name("aterm-linux-update".into())
-        .spawn(move || {
-            let started = now().map_or_else(
-                |_| String::new(),
-                |unix| aterm_types::rfc3339::format_rfc3339(unix as u64),
-            );
-            let mut reporter = crate::linux_notice::Reporter::new(started);
-            loop {
-                report_pass(
-                    &mut reporter,
-                    context(),
-                    check_recording(current_build, &provider, false),
-                    on_checked.as_ref(),
-                    notify.as_ref(),
-                );
-                std::thread::sleep(Duration::from_secs(crate::linux_notice::PASS_SECS));
-            }
-        });
+    checker::start(current_build, provider, notify, on_checked);
 }
+
+#[path = "linux/checker.rs"]
+mod checker;
+#[cfg(target_os = "linux")]
+pub(crate) use checker::respawn as respawn_stalled_checker;
 
 #[cfg(test)]
 mod tests;

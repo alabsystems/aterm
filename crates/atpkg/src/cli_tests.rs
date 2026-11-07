@@ -14398,7 +14398,7 @@ fn the_seed_reads_the_command_line_tools_without_running_anything() {
     );
     let clang = developer.join("usr/bin/clang");
     std::fs::create_dir_all(clang.parent().unwrap()).unwrap();
-    std::fs::write(&clang, "").unwrap();
+    std::fs::write(&clang, "compiler discovery fixture").unwrap();
     std::fs::set_permissions(&clang, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     for toolset in [true, false] {
         assert_eq!(
@@ -14437,7 +14437,7 @@ fn clt_install_aliases_are_recognized_by_atpkg_install() {
         let developer = root.join("CommandLineTools");
         std::fs::create_dir_all(&shim).unwrap();
         let cc = shim.join("cc");
-        std::fs::write(&cc, "#!/bin/sh\n[ \"$1\" = -o ] && printf x > \"$2\"\n").unwrap();
+        std::fs::write(&cc, "#!/bin/sh\nif [ -n \"$SDKROOT\" ]; then echo 'build SDK unavailable' >&2; exit 1; fi\n[ \"$1\" = -o ] && printf x > \"$2\"\n").unwrap();
         std::fs::set_permissions(&cc, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let xcrun = shim.join("xcrun");
         std::fs::write(
@@ -14447,7 +14447,7 @@ fn clt_install_aliases_are_recognized_by_atpkg_install() {
         .unwrap();
         std::fs::set_permissions(&xcrun, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
-        let host = crate::prereq::CcHost {
+        let mut host = crate::prereq::CcHost {
             shim_dir: Some(shim.clone()),
             xcode_select_link: root.join("no-link"),
             default_developer_dir: developer.clone(),
@@ -14457,10 +14457,11 @@ fn clt_install_aliases_are_recognized_by_atpkg_install() {
             bound: std::time::Duration::from_secs(60),
             tmp_root: root.to_path_buf(),
         };
-        assert!(super::clt_which_line("clt", Some(shim.as_os_str()), &host).is_err());
+        let missing = super::clt_which_line("clt", Some(shim.as_os_str()), &host).unwrap_err();
+        assert!(missing.contains(crate::prereq::act()), "{missing}");
         let clang = developer.join("usr/bin/clang");
         std::fs::create_dir_all(clang.parent().unwrap()).unwrap();
-        std::fs::write(&clang, "").unwrap();
+        std::fs::write(&clang, "compiler discovery fixture").unwrap();
         std::fs::set_permissions(&clang, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
         for alias in ["clt", "base.clt", "command-line-tools"] {
@@ -14468,6 +14469,80 @@ fn clt_install_aliases_are_recognized_by_atpkg_install() {
                 super::clt_which_line(alias, Some(shim.as_os_str()), &host).expect("ready clt");
             assert!(line.starts_with(&format!("{alias} → ")), "{line}");
         }
+        host.sdkroot_override = Some(root.join("unavailable-build-sdk"));
+        let refused = super::clt_which_line("clt", Some(shim.as_os_str()), &host).unwrap_err();
+        assert!(refused.contains("build SDK unavailable"), "{refused}");
+        assert!(!refused.contains("aterm pkg install clt"), "{refused}");
+        #[cfg(target_os = "macos")]
+        assert!(!refused.contains(crate::prereq::act()), "{refused}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn clt_install_never_runs_setup_for_a_failure_setup_cannot_fix() {
+    use crate::prereq::CcVerdict;
+    use std::os::unix::process::ExitStatusExt as _;
+    let installs = std::cell::Cell::new(0);
+    let install = |_: &std::path::Path| {
+        installs.set(installs.get() + 1);
+        Ok(std::process::ExitStatus::from_raw(0))
+    };
+    for verdict in [
+        CcVerdict::Broken {
+            driver: "/usr/bin/cc".into(),
+            why: "the build SDK is unavailable".into(),
+        },
+        CcVerdict::Unanswered {
+            driver: "/usr/bin/cc".into(),
+            bound: std::time::Duration::from_secs(60),
+        },
+        CcVerdict::Unproven {
+            driver: "/usr/bin/cc".into(),
+            why: "could not create the build probe".into(),
+        },
+    ] {
+        assert_eq!(
+            super::install_clt_with(
+                verdict,
+                Some(std::path::Path::new("/aterm")),
+                install,
+                || panic!("a refused install has no read-back")
+            ),
+            std::process::ExitCode::from(1)
+        );
+        assert_eq!(installs.get(), 0);
+    }
+    assert_eq!(
+        super::install_clt_with(
+            CcVerdict::NoDriver,
+            Some(std::path::Path::new("/aterm")),
+            install,
+            || CcVerdict::NoDriver
+        ),
+        std::process::ExitCode::from(1)
+    );
+    assert_eq!(
+        installs.get(),
+        1,
+        "setup success without a working compiler is not retried"
+    );
+    for (index, verdict) in [CcVerdict::NoDeveloperDir, CcVerdict::NoDriver]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            super::install_clt_with(
+                verdict,
+                Some(std::path::Path::new("/aterm")),
+                install,
+                || CcVerdict::Ready {
+                    driver: "/usr/bin/cc".into()
+                }
+            ),
+            std::process::ExitCode::SUCCESS
+        );
+        assert_eq!(installs.get(), index + 2);
     }
 }
 

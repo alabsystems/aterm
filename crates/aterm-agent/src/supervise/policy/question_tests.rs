@@ -10,7 +10,7 @@ use aterm_phase::{PromptKind, parse_prompt_v2};
 
 use super::super::super::config::Approve;
 use super::super::approval::{
-    Answer, AnswerTarget, ApprovalCtx, Choice, Decision, QuestionPriority, decide,
+    Answer, AnswerTarget, ApprovalCtx, Choice, Decision, PriorityWord, QuestionPriority, decide,
 };
 use super::super::guard::row_guard;
 use super::*;
@@ -585,7 +585,7 @@ fn a_destructive_word_in_one_options_description_never_holds_the_question() {
 fn the_reset_in_a_description_incident_is_answered_under_every_priority() {
     let rows = screen(f::QUESTION_RESET_IN_DESCRIPTION_2_1_310);
     let p = parse_prompt_v2(&rows).expect("the dialog");
-    for priority in QuestionPriority::ALL {
+    for priority in PriorityWord::ALL.map(QuestionPriority::from) {
         let d = answer_question(&p, &rows, priority, None, (false, false), Pane::of(&rows));
         let Decision::Approve {
             choice: Choice::Answer(Answer::FocusEnter { steps, target }),

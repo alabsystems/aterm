@@ -108,7 +108,14 @@ impl Keys {
     #[must_use]
     pub fn ctx(&self, home: &Path, host: Arc<FakeHost>) -> Ctx {
         let ctx = self.ctx_over(home, host);
-        std::fs::create_dir_all(home.join(atpkg_keys::provision::RELEASE_RING_REL))
+        let mut folders = std::fs::DirBuilder::new();
+        folders.recursive(true);
+        // Writable by its owner alone whatever the umask, as a person's home and its ring are: a
+        // producer lays its outputs under no folder the group or others can write.
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut folders, 0o700);
+        folders
+            .create(home.join(atpkg_keys::provision::RELEASE_RING_REL))
             .expect("mkdir ~/.aterm/release-ring");
         std::fs::write(&ctx.identity.key, &self.machine_key).expect("write machine key");
         std::fs::write(

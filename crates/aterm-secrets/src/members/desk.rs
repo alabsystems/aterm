@@ -220,6 +220,8 @@ pub struct Local {
     /// (`crate::home_lan::home_net`), the network a lab vault names in a debug build
     /// (`members::lab_lan::home`). Only a host on it is let in by its proof.
     home: Option<crate::home_lan::HomeNet>,
+    /// Where [`Self::home`] is read again from ([`Desk::home_from`]).
+    home_from: HomeFrom,
     /// Its vault is the live ALab's by its genesis ([`client::on_live_genesis`]): a lab identity's
     /// ask and run are refused here ([`LAB_REFUSED`]), and its proof is by the caller's decision.
     live_genesis: bool,
@@ -227,6 +229,21 @@ pub struct Local {
     /// ([`client::take_handover_hold`]) before it touches a phrase. `None` for a test's member
     /// ([`Local::with`]), whose runs hold nothing.
     paths: Option<Paths>,
+}
+
+/// Where a member's desk reads its home LAN again from ([`Desk::home_from`]), so its lane can
+/// follow a network move without reading the vault where the vault does not decide it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HomeFrom {
+    /// It has none: no Mac is let in by its proof alone.
+    None,
+    /// The pinned default ALab vault served at a URL: the home ALab LAN as this Mac reads its
+    /// place now (`crate::home_lan::home_net`), which a network move changes and the vault does
+    /// not ([`Desk::on_home`]).
+    Place,
+    /// A debug build's lab vault that names a home LAN (`super::lab_lan`): that file and this
+    /// Mac's route together, so it is read again only with the vault ([`Local::of`]).
+    Vault,
 }
 
 impl Local {
@@ -318,6 +335,19 @@ impl Local {
         } else {
             lab_home
         };
+        // A lab vault's home is its file and this Mac's route together (`super::lab_lan::home`),
+        // read again only with the vault.
+        #[cfg(any(test, debug_assertions))]
+        let lab = std::fs::symlink_metadata(paths.dir.join(super::lab_lan::FILE)).is_ok();
+        #[cfg(not(any(test, debug_assertions)))]
+        let lab = false;
+        let home_from = if alab_url {
+            HomeFrom::Place
+        } else if lab {
+            HomeFrom::Vault
+        } else {
+            HomeFrom::None
+        };
         Ok(Some(Self {
             device,
             request,
@@ -331,6 +361,7 @@ impl Local {
             automatic_lan,
             admitted_recipients,
             home,
+            home_from,
             live_genesis,
             paths: Some(paths.clone()),
         }))
@@ -357,6 +388,7 @@ impl Local {
             automatic_lan: false,
             admitted_recipients: Default::default(),
             home: None,
+            home_from: HomeFrom::None,
             live_genesis: false,
             paths: None,
         })
@@ -410,6 +442,7 @@ impl Local {
             automatic_lan: true,
             admitted_recipients: admitted_recipients.into_iter().collect(),
             home: Some(crate::home_lan::HomeNet::test()),
+            home_from: HomeFrom::Place,
             ..self
         }
     }
@@ -797,6 +830,22 @@ impl Desk {
             RowState::Ignored | RowState::Closed => true,
             RowState::Asking => false,
             RowState::Allowed(_) => !self.admits(heard, now),
+        }
+    }
+
+    /// Where this member's home LAN ([`Local::automatically_admits`]) is read again from.
+    #[must_use]
+    pub const fn home_from(&self) -> HomeFrom {
+        self.local.home_from
+    }
+
+    /// This member's home ALab LAN as read again now (`crate::home_lan::home_net`), the rest of
+    /// what [`Local::of`] read kept: a network move, or a day that made a LAN home, changes only
+    /// this, so the desk takes it without reading the vault again. Only a member whose home is
+    /// its place's ([`HomeFrom::Place`]) takes one; any other keeps what [`Local::of`] read.
+    pub fn on_home(&mut self, home: Option<crate::home_lan::HomeNet>) {
+        if self.local.home_from == HomeFrom::Place {
+            self.local.home = home;
         }
     }
 

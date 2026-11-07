@@ -128,6 +128,7 @@ fn a_checked_readings_leg_is_its_remote_and_main_ref() {
             main_ref: main_ref.into(),
             remote,
             branch: "main".into(),
+            statement: Statement::Missing,
         })
     };
     for (read, leg, on) in [
@@ -146,10 +147,202 @@ fn a_checked_readings_leg_is_its_remote_and_main_ref() {
             ""
         };
         assert_eq!(r.branch, branch, "a branch on main alone: {r:?}");
+        let statement = if leg == ReceiptLeg::OnMain {
+            Statement::Missing
+        } else {
+            Statement::Unread
+        };
+        assert_eq!(r.statement, statement, "a statement on main alone: {r:?}");
         assert_eq!((r.said.as_str(), r.at_ms), ("", 5));
     }
     let found = RepoRead::Found(RepoWork::default());
     assert_eq!(LandReceipt::of(&found, None, 5), None);
+}
+
+/// A LANDING MERGE'S TRAILERS ARE ITS STATED RECEIPT, FROM A REAL TEMPORARY REPOSITORY (design
+/// B10): a commit on `origin/main` carrying the trailers `verify land` writes records their
+/// judgment on the receipt (the last judged tree, the re-judges, the commit composed onto, the
+/// reds inherited, the seconds summed), and its journal line carries it as `stated=` and reads
+/// back whole. NEGATIVE CONTROLS: a plain commit on main and one whose receipt is malformed
+/// record [`Statement::Missing`] and still have a receipt; the same trailers on a branch pushed
+/// where no main is read record nothing read.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_landing_merges_trailers_are_its_stated_receipt_and_any_other_commit_states_none() {
+    use crate::harness::repo_work::tests::{repo, scratch_git};
+    use crate::harness::repo_work::{PROBE_LIMIT, probe};
+    use aterm_types::land_trailer::{Checked, Row, Stated};
+
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let receipt_of = |work: &std::path::Path| {
+        let read = probe(work, Some(work), PROBE_LIMIT);
+        LandReceipt::of(&read, None, 3)
+            .unwrap_or_else(|| panic!("a clean reading has a receipt: {read:?}"))
+    };
+    let land = |work: &std::path::Path, message: &str, to: &str| {
+        scratch_git(work, &["commit", "-q", "--allow-empty", "-m", message]);
+        scratch_git(work, &["push", "-q", "origin", &format!("HEAD:{to}")]);
+    };
+    let id = |c: char| c.to_string().repeat(40);
+    let row = |check: &str, word: &str| Row {
+        check: check.into(),
+        word: word.into(),
+    };
+    let stated = Stated {
+        checked: vec![
+            Checked {
+                tree: id('a'),
+                rows: vec![row("fmt", "ok"), row("test", "ok")],
+                base: id('b'),
+                secs: 1200,
+            },
+            Checked {
+                tree: id('c'),
+                rows: vec![row("test", "FAIL")],
+                base: id('d'),
+                secs: 300,
+            },
+        ],
+        composed_onto: Some(id('e')),
+        inherited: vec!["-p other --lib -- flaky_case".into()],
+    };
+    let merge = format!("Merge origin/main into feature\n\n{}", stated.trailers());
+
+    let work = repo(&tmp.path().join("landed"), true);
+    let plain = receipt_of(&work);
+    assert_eq!(
+        (plain.leg, &plain.statement),
+        (ReceiptLeg::OnMain, &Statement::Missing),
+        "{plain:?}"
+    );
+    let line = plain.line(1);
+    assert!(line.contains(" stated=none"), "{line}");
+    assert_eq!(LandReceipt::of_line(&line, 3), Some((1, plain)));
+
+    land(&work, &merge, "main");
+    let landed = receipt_of(&work);
+    assert_eq!(
+        landed.statement,
+        Statement::Stated(Judgment {
+            tree: "cccccccccccc".into(),
+            rejudges: 1,
+            onto: "eeeeeeeeeeee".into(),
+            inherited: 1,
+            secs: 1500,
+        }),
+        "{landed:?}"
+    );
+    let line = landed.line(2);
+    assert!(
+        line.contains(" branch=main stated=cccccccccccc/1/eeeeeeeeeeee/1/1500"),
+        "{line}"
+    );
+    assert_eq!(LandReceipt::of_line(&line, 3), Some((2, landed)));
+
+    land(
+        &work,
+        &format!("{merge}Aterm-Composed-Onto: {}\n", id('f')),
+        "main",
+    );
+    let malformed = receipt_of(&work);
+    assert_eq!(
+        (malformed.leg, &malformed.statement),
+        (ReceiptLeg::OnMain, &Statement::Missing),
+        "a receipt naming two commits composed onto states none: {malformed:?}"
+    );
+
+    let pushed = repo(&tmp.path().join("pushed"), false);
+    let bare = tmp.path().join("pushed").join("remote.git");
+    std::fs::create_dir_all(&bare).expect("bare");
+    scratch_git(&bare, &["init", "-q", "--bare", "."]);
+    scratch_git(
+        &pushed,
+        &["remote", "add", "origin", &bare.display().to_string()],
+    );
+    land(&pushed, &merge, "wip");
+    let elsewhere = receipt_of(&pushed);
+    assert_eq!(
+        (elsewhere.leg, &elsewhere.statement),
+        (ReceiptLeg::Pushed, &Statement::Unread),
+        "{elsewhere:?}"
+    );
+    assert!(!elsewhere.line(3).contains("stated="), "{elsewhere:?}");
+}
+
+/// THE `stated=` WORD READS BACK AS WRITTEN AND NO OTHER WORD DOES (design B10): a judgment is
+/// `<tree>/<rejudges>/<onto|->/<inherited>/<secs>`, a commit that states none `none`, and an
+/// unread statement writes no token. NEGATIVE CONTROLS: a word not written exactly so (a short or
+/// upper-case tree, a signed or zero-led count, a part too many or too few) is none, and a line
+/// naming a statement on any leg but on-main, or a word that is none, reads as no line; a line
+/// written before B10, with no `stated=`, reads back unread.
+#[test]
+fn a_statement_word_reads_back_and_no_other_does() {
+    let judged = Statement::Stated(Judgment {
+        tree: "0a1b2c3d4e5f".into(),
+        rejudges: 3,
+        onto: String::new(),
+        inherited: 0,
+        secs: 61,
+    });
+    assert_eq!(judged.word().as_deref(), Some("0a1b2c3d4e5f/3/-/0/61"));
+    assert_eq!(Statement::Missing.word().as_deref(), Some("none"));
+    assert_eq!(Statement::Unread.word(), None);
+    for statement in [judged.clone(), Statement::Missing] {
+        let word = statement.word().expect("a read statement has a word");
+        assert_eq!(Statement::of_word(&word), Some(statement));
+    }
+    for bad in [
+        "",
+        "None",
+        "0a1b2c3d4e5f/3/-/0",
+        "0a1b2c3d4e5f/3/-/0/61/9",
+        "0A1B2C3D4E5F/3/-/0/61",
+        "0a1b2c3d4e5/3/-/0/61",
+        "0a1b2c3d4e5f/03/-/0/61",
+        "0a1b2c3d4e5f/+3/-/0/61",
+        "0a1b2c3d4e5f/3//0/61",
+        "0a1b2c3d4e5f/3/abc/0/61",
+    ] {
+        assert_eq!(Statement::of_word(bad), None, "{bad}");
+    }
+    let on_main = LandReceipt {
+        head: "3f9a1c2e4b7d".into(),
+        main_ref: "origin/main".into(),
+        repo: "/src/proj".into(),
+        branch: "main".into(),
+        leg: ReceiptLeg::OnMain,
+        said: "Nothing left: pushed.".into(),
+        at_ms: 9,
+        statement: judged,
+        ..LandReceipt::default()
+    };
+    let line = on_main.line(4);
+    assert_eq!(
+        line,
+        "RECEIPT seq=4 rule=land@v1 head=3f9a1c2e4b7d on=origin/main leg=on-main check=- \
+         repo=/src/proj branch=main stated=0a1b2c3d4e5f/3/-/0/61 Nothing left: pushed."
+    );
+    assert_eq!(LandReceipt::of_line(&line, 9), Some((4, on_main.clone())));
+    let older = line.replace(" stated=0a1b2c3d4e5f/3/-/0/61", "");
+    assert_eq!(
+        LandReceipt::of_line(&older, 9),
+        Some((
+            4,
+            LandReceipt {
+                statement: Statement::Unread,
+                ..on_main
+            }
+        )),
+        "a line written before B10 states nothing read"
+    );
+    for bad in [
+        line.replace("stated=0a1b2c3d4e5f/3/-/0/61", "stated=green"),
+        line.replace("leg=on-main", "leg=pushed")
+            .replace("on=origin/main", "on=-")
+            .replace(" branch=main", ""),
+    ] {
+        assert_eq!(LandReceipt::of_line(&bad, 9), None, "{bad}");
+    }
 }
 
 /// THE AGENT'S WORDS ON A RECEIPT: its defense line and every line after it, one line, sanitized
@@ -204,6 +397,7 @@ fn a_receipt_line_reads_back_and_no_other_line_does() {
         check: true,
         said: "Nothing left: pushed.".into(),
         at_ms: 9,
+        statement: Statement::Unread,
     };
     let line = r.line(41);
     assert_eq!(
@@ -257,6 +451,7 @@ fn a_receipt_names_its_branch_and_a_folder_that_is_gone() {
         check: false,
         said: "Nothing left: pushed.".into(),
         at_ms: 9,
+        statement: Statement::Unread,
     };
     let line = on_main.line(7);
     assert_eq!(
@@ -393,6 +588,7 @@ fn the_receipt_says_whether_the_land_check_was_answered() {
         check: true,
         said: "Nothing left: pushed.".into(),
         at_ms: 9,
+        statement: Statement::Unread,
     };
     let unchecked = LandReceipt {
         check: false,

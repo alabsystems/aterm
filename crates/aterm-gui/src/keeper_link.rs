@@ -395,7 +395,7 @@ thread_local! {
 /// Send what an undischarged [`Claim`] dropped on this thread releases over `st` (a test's link
 /// state, over a keeper the test steps) in place of the process's, until it is set to `None`: the
 /// drop's own path, from the claim's fields to the op the link writes.
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_vendor = "apple"))]
 fn claims_release_to(st: Option<Arc<Mutex<State>>>) {
     CLAIMS_RELEASE_TO.with(|to| *to.borrow_mut() = st);
 }
@@ -3759,15 +3759,16 @@ mod tests {
     }
 
     /// A keeper in this process, stepped by the test: what a crash restore's boot connection,
-    /// link and old journal speak to.
-    #[cfg(unix)]
+    /// link and old journal speak to. Apple only, as the keeper is: it takes a journal companion
+    /// only once libproc reads its descriptor as POSIX shared memory (`companion_fault`).
+    #[cfg(target_vendor = "apple")]
     struct Keeper {
         _dir: aterm_tempfile::TempDir,
         sock: std::path::PathBuf,
         server: aterm_keeper::server::Server,
     }
 
-    #[cfg(unix)]
+    #[cfg(target_vendor = "apple")]
     impl Keeper {
         fn new(for_what: &str) -> Self {
             let dir = crate::test_scratch::short_dir(for_what);
@@ -3864,7 +3865,7 @@ mod tests {
     }
 
     /// A journal region a window would make: read-only custody of a fresh shared-memory object.
-    #[cfg(unix)]
+    #[cfg(target_vendor = "apple")]
     fn journal_region() -> (aterm_uds::shm::Region, std::os::fd::OwnedFd) {
         // SAFETY: nothing modifies, resizes or invalidates the object: the returned `Region` stays
         // inert (no test writes through it), the keeper only holds the custody descriptor, and
@@ -3873,13 +3874,13 @@ mod tests {
     }
 
     /// The region an offer of `rdev` would carry now.
-    #[cfg(unix)]
+    #[cfg(target_vendor = "apple")]
     fn old_journal(server: &aterm_keeper::server::Server, rdev: u64) -> Option<u64> {
         server.core().companion_view(rdev).and_then(|v| v.offered)
     }
 
     /// A duplicate of `fd`, a live descriptor the test holds.
-    #[cfg(unix)]
+    #[cfg(target_vendor = "apple")]
     fn owned_dup(fd: i32) -> std::os::fd::OwnedFd {
         // SAFETY: `fd` is a live descriptor the test holds for this call.
         unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }
@@ -3889,7 +3890,7 @@ mod tests {
 
     /// The boot HELLO's offer of `sh`'s master at `rdev`, its shell born at `birth`, with the old
     /// journal beside it.
-    #[cfg(unix)]
+    #[cfg(target_vendor = "apple")]
     fn offer_of(sh: &aterm_pty::SpawnedShell, rdev: u64, birth: u64) -> Offered {
         let (_region, custody) = journal_region();
         let mut t = Terminal::new(24, 80);
@@ -3913,7 +3914,7 @@ mod tests {
 
     /// A RELEASE written behind every op queued before it: what the keeper has unread when the
     /// test asserts the fence still holds.
-    #[cfg(unix)]
+    #[cfg(target_vendor = "apple")]
     fn written_behind(link: &KeeperLink) {
         assert!(
             link.send_and_wait(
@@ -3928,7 +3929,7 @@ mod tests {
     /// names another process) and releases it on the boot connection, and its fence, which no
     /// session's journal will ever lift, lifts once the keeper answers the SYNC behind that
     /// RELEASE, not while the keeper holds the connection unread.
-    #[cfg(unix)]
+    #[cfg(target_vendor = "apple")]
     #[test]
     fn a_refused_offer_lifts_the_fence_once_the_keeper_reads_its_release() {
         let mut keeper = Keeper::new("refused offer");
@@ -3967,7 +3968,7 @@ mod tests {
     /// F01, an adoption never placed: the window admits the offer, but its session never comes
     /// to be, so the adoption is dropped, and its armed claim's drop retires the old journal
     /// through the link; the fence lifts once the keeper answers the SYNC behind that RELEASE.
-    #[cfg(unix)]
+    #[cfg(target_vendor = "apple")]
     #[test]
     fn an_adoption_never_placed_lifts_the_fence_once_the_keeper_reads_its_release() {
         let mut keeper = Keeper::new("unplaced adoption");
@@ -4025,7 +4026,7 @@ mod tests {
     /// F01, an adopted session with no journal (`SessionJournal::create` failed, so the
     /// registration has no region's custody to send): its COMPANION_RELEASE tells the keeper to
     /// drop the old journal, and the fence lifts once the keeper answers the SYNC behind it.
-    #[cfg(unix)]
+    #[cfg(target_vendor = "apple")]
     #[test]
     fn a_session_with_no_journal_lifts_the_fence_once_the_keeper_drops_the_old_one() {
         let mut keeper = Keeper::new("journal-less adoption");
@@ -4103,7 +4104,7 @@ mod tests {
     /// the fence lifts once the keeper answers the SYNC behind that one. Every op is written
     /// before the keeper reads any, as when the keeper is slow or the link is between
     /// connections.
-    #[cfg(unix)]
+    #[cfg(target_vendor = "apple")]
     #[test]
     fn a_session_gone_before_the_keeper_read_its_journal_frame_still_lifts_the_fence() {
         for (case, journaled) in [

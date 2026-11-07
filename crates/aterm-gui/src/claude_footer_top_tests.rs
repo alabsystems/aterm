@@ -4332,16 +4332,11 @@ fn a_press_keeps_its_verb_where_the_rule_has_room() {
         up_said(&ready.up, "1 shell", ready.press),
         Some(said.clone())
     );
-    let still = |w| {
-        slot_top(
-            SwitchPaint {
-                hover: HoverAt::None,
-                ..ready
-            },
-            w,
-        )
-        .1
+    let still_paint = SwitchPaint {
+        hover: HoverAt::None,
+        ..ready
     };
+    let still = |w| slot_top(still_paint, w).1;
     let named = "update to v2.1.310";
     let mut grew = Vec::new();
     for w in [230, 144, 95, 80] {

@@ -45,20 +45,24 @@ pub mod board;
 mod drift;
 /// The `amacs` client's `edit` and `await edit` exchanges with the window hosting its tab, the wait re-armed past every bound and every update.
 pub mod edit;
+/// The telemetry rows a fleet spawn and a worker's board close write (Continuum TM-1).
+pub mod fleet_telemetry;
 mod graph_hygiene;
 pub use drift::{CastDriftFn, CastDriftJob, DriftCut, DriftPeer, LocalVerbs};
 mod redial;
 pub use redial::{EXIT_REPLACED, target_sid};
 mod any_host;
 mod remote;
-pub use remote::{DriveLink, DriveRefused, DriveStream, FleetDriveFn, Left, lifts_there};
+pub use remote::{
+    DriveLink, DriveRefused, DriveStream, FleetDriveFn, Left, lifts_there, spawned_sid_from_answer,
+};
 mod survey;
 mod verb_first;
 pub use survey::{
-    DEFAULT_BUDGET, EXCERPT_CHARS, EXCERPT_WIDE_CHARS, EXCERPTS_CUT, FLEET_WITHIN, FleetAsk,
-    FleetRead, FleetRefused, FleetSurveyFn, LEFT_OUT_LEAD, NO_ROUTE_NOTE, PeerFault, PeerSurvey,
-    UNANSWERED_REASON_CHARS, UNANSWERED_ROOM, agent_word_shown, masked_label, survey_rank,
-    survey_urgent,
+    DEFAULT_BUDGET, EXCERPT_CHARS, EXCERPT_WIDE_CHARS, EXCERPTS_CUT, FLEET_UNREAD, FLEET_WITHIN,
+    FleetAsk, FleetRead, FleetRefused, FleetSurveyFn, LEFT_OUT_LEAD, NO_ROUTE_NOTE, PeerFault,
+    PeerSurvey, UNANSWERED_REASON_CHARS, UNANSWERED_ROOM, agent_word_shown, masked_label,
+    survey_rank, survey_urgent,
 };
 
 const SYNOPSIS: &str =

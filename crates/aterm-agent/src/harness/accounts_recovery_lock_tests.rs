@@ -148,6 +148,7 @@ fn generic_recovery_preserves_native_enrollment_headers_and_bound_paths() {
                 .transact_logins(NOW, &mut None, |_, logins| {
                     let parent = accounts::RenewalParent::capture(logins, &request.label);
                     logins.enrollment.bind_staging(Staging {
+                        native_row: None,
                         request: request.clone(),
                         store: bed.store.dir.clone(),
                         directory: staging.clone(),
@@ -554,7 +555,7 @@ impl Bed {
         let staging = self.store.claim_staging_dir(label).unwrap();
         let login_file = staging.join(cli.connector().stores[0]);
         fs::create_dir_all(login_file.parent().unwrap()).unwrap();
-        fs::write(login_file, b"private checkpoint fixture").unwrap();
+        crate::test_config::write(login_file, b"private checkpoint fixture").unwrap();
         staging
     }
 

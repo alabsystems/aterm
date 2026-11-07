@@ -115,6 +115,7 @@ impl Fixture {
             mailbox: &|_, _, _| (crate::harness::sign_in_ladder::Mailbox::Ready, None),
             log: Arc::new(move |line| lines.lock().unwrap().push(line.to_owned())),
             run_attempt: Some(Arc::new(|_, _| panic!("no unguarded fallback"))),
+            save_oauth: |_, _| Ok("inert".into()),
             shared: shared_renewal::Effects {
                 authority: Some(&factory),
                 checkpoint_authority: Some(&factory),

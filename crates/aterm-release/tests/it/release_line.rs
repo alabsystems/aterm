@@ -80,6 +80,16 @@ impl Fixture {
         }
     }
 
+    /// [`Fixture::new`] for a test that makes a hop's tree ([`line::hop_tree`]), which needs a
+    /// git ≥ [`line::MIN_GIT`]: on an older one the test is COULD NOT RUN.
+    fn merging(name: &str) -> Fixture {
+        let fix = Fixture::new(name);
+        if let Err(stop) = line::git_ready(&fix.git()) {
+            aterm_spec::host::could_not_run(stop.why);
+        }
+        fix
+    }
+
     fn git(&self) -> Git {
         Git::new(&self.work)
     }
@@ -476,7 +486,7 @@ impl GitRunner for NoPush {
 
 #[test]
 fn a_clean_hop_is_the_landed_fixs_patch_on_the_base_and_verifies() {
-    let fix = Fixture::new("clean");
+    let fix = Fixture::merging("clean");
     let (git, s) = (fix.git(), &fix.shas);
     let start = Line::start(VERSION, &s.g, 1_790_000_000);
     let admitted = fix_of(&git, &start, &s.fix_b);
@@ -547,7 +557,7 @@ fn a_clean_hop_is_the_landed_fixs_patch_on_the_base_and_verifies() {
 
 #[test]
 fn a_fix_that_conflicts_with_the_head_is_refused_with_its_paths() {
-    let fix = Fixture::new("conflict");
+    let fix = Fixture::merging("conflict");
     let (git, s) = (fix.git(), &fix.shas);
     let start = Line::start(VERSION, &s.g, 0);
     let fix_c = fix_of(&git, &start, &s.fix_c);
@@ -579,7 +589,7 @@ fn a_fix_that_conflicts_with_the_head_is_refused_with_its_paths() {
 
 #[test]
 fn a_fix_whose_change_the_head_has_carries_nothing_and_is_refused() {
-    let fix = Fixture::new("empty");
+    let fix = Fixture::merging("empty");
     let (git, s) = (fix.git(), &fix.shas);
     let start = Line::start(VERSION, &s.g, 0);
     let fix_a = fix_of(&git, &start, &s.fix_a);
@@ -590,7 +600,7 @@ fn a_fix_whose_change_the_head_has_carries_nothing_and_is_refused() {
 
 #[test]
 fn carry_refuses_a_hand_built_fix_that_moves_a_frozen_path_or_the_version() {
-    let fix = Fixture::new("carry-guard");
+    let fix = Fixture::merging("carry-guard");
     let (git, s) = (fix.git(), &fix.shas);
     let start = Line::start(VERSION, &s.g, 0);
     let by_hand = |commit: &str| Fix {
@@ -660,7 +670,7 @@ fn a_frozen_path_or_a_version_bump_is_refused() {
 
 #[test]
 fn a_carried_fix_resumes_and_one_the_line_holds_is_refused() {
-    let fix = Fixture::new("carried");
+    let fix = Fixture::merging("carried");
     let (git, s) = (fix.git(), &fix.shas);
     let mut l = Line::start(VERSION, &s.g, 0);
     assert!(!l.carried(&s.fix_b));
@@ -678,7 +688,7 @@ fn a_carried_fix_resumes_and_one_the_line_holds_is_refused() {
 
 #[test]
 fn fixes_carry_in_ancestry_order_whatever_order_they_are_named_in() {
-    let fix = Fixture::new("order");
+    let fix = Fixture::merging("order");
     let (git, s) = (fix.git(), &fix.shas);
     let mut l = Line::start(VERSION, &s.g, 0);
     let (a, b) = (fix_of(&git, &l, &s.fix_a), fix_of(&git, &l, &s.fix_b));
@@ -764,7 +774,7 @@ fn unrelated_fixes_go_by_committer_time_then_sha_whatever_order_they_are_named_i
 
 #[test]
 fn a_hops_tree_is_the_commits_alone_whatever_this_clone_holds() {
-    let fix = Fixture::new("steered");
+    let fix = Fixture::merging("steered");
     let (git, s) = (fix.git(), &fix.shas);
     let conflict = Merged::Conflict(vec!["src/c.rs".to_string()]);
     assert_eq!(line::hop_tree(&git, &s.g, &s.fix_c).unwrap(), conflict);
@@ -817,7 +827,7 @@ fn a_hops_tree_is_the_commits_alone_whatever_this_clone_holds() {
 
 #[test]
 fn a_rename_carries_as_a_deletion_and_an_addition() {
-    let fix = Fixture::new("rename");
+    let fix = Fixture::merging("rename");
     let (git, s) = (fix.git(), &fix.shas);
     assert_eq!(
         line::hop_tree(&git, &s.g, &s.rename).unwrap(),
@@ -829,7 +839,7 @@ fn a_rename_carries_as_a_deletion_and_an_addition() {
 
 #[test]
 fn the_record_merge_rebuilds_on_a_rival_push_and_keeps_mains_tree() {
-    let fix = Fixture::new("record-race");
+    let fix = Fixture::merging("record-race");
     let s = fix.shas.clone();
     let mut l = Line::start(VERSION, &s.g, 0);
     l.hops = line::carry(&fix.git(), &l, &[fix_of(&fix.git(), &l, &s.fix_b)]).unwrap();
@@ -865,7 +875,7 @@ fn the_record_merge_rebuilds_on_a_rival_push_and_keeps_mains_tree() {
 
 #[test]
 fn the_record_stops_could_not_run_when_every_push_loses() {
-    let fix = Fixture::new("record-cap");
+    let fix = Fixture::merging("record-cap");
     let s = fix.shas.clone();
     let mut l = Line::start(VERSION, &s.g, 0);
     l.hops = line::carry(&fix.git(), &l, &[fix_of(&fix.git(), &l, &s.fix_b)]).unwrap();
@@ -879,7 +889,7 @@ fn the_record_stops_could_not_run_when_every_push_loses() {
 
 #[test]
 fn an_unreachable_origin_or_a_push_that_lands_nothing_could_not_run() {
-    let fix = Fixture::new("offline");
+    let fix = Fixture::merging("offline");
     let s = &fix.shas;
     let mut l = Line::start(VERSION, &s.g, 0);
     l.hops = line::carry(&fix.git(), &l, &[fix_of(&fix.git(), &l, &s.fix_b)]).unwrap();
@@ -905,7 +915,7 @@ fn an_unreachable_origin_or_a_push_that_lands_nothing_could_not_run() {
 
 #[test]
 fn verify_refuses_each_way_a_line_can_be_wrong_and_passes_the_honest_one() {
-    let fix = Fixture::new("verify");
+    let fix = Fixture::merging("verify");
     let (git, s) = (fix.git(), &fix.shas);
     let start = Line::start(VERSION, &s.g, 0);
     let honest = line::carry(&git, &start, &[fix_of(&git, &start, &s.fix_b)]).unwrap();
@@ -1052,7 +1062,7 @@ fn verify_refuses_each_way_a_line_can_be_wrong_and_passes_the_honest_one() {
 /// origin/main as landed, and both are admitted and verify.
 #[test]
 fn a_commit_main_holds_only_through_a_record_merge_never_landed() {
-    let fix = Fixture::new("record-only");
+    let fix = Fixture::merging("record-only");
     let (git, s) = (fix.git(), &fix.shas);
     let start = Line::start(VERSION, &s.g, 0);
     let mut rival = start.clone();
@@ -1136,7 +1146,7 @@ fn tree_has_reads_a_file_its_absence_or_could_not_run() {
 
 #[test]
 fn a_rebuilt_hop_is_the_same_commit() {
-    let fix = Fixture::new("rebuild");
+    let fix = Fixture::merging("rebuild");
     let (git, s) = (fix.git(), &fix.shas);
     let start = Line::start(VERSION, &s.g, 0);
     let first = line::carry(&git, &start, &[fix_of(&git, &start, &s.fix_b)]).unwrap();
@@ -1153,13 +1163,21 @@ fn a_rebuilt_hop_is_the_same_commit() {
 }
 
 #[test]
-fn this_git_runs_a_line_and_an_older_one_could_not_run() {
+fn this_git_runs_a_line() {
     let fix = Fixture::new("git-version");
-    let words = line::git_ready(&fix.git()).unwrap();
+    let words = line::git_ready(&fix.git())
+        .unwrap_or_else(|stop| aterm_spec::host::could_not_run(stop.why));
     assert!(
         line::parse_git_version(&words).is_some_and(|v| v >= line::MIN_GIT),
         "{words}"
     );
+}
+
+/// A git that refuses a hop's options (2.39) and one that takes them and still detects renames
+/// (2.43 to 2.49) are each COULD NOT RUN, read before any merge. NEGATIVE CONTROL: drop
+/// `hop_tree`'s version read, and the 2.49 git's merge gives a tree.
+#[test]
+fn an_older_git_could_not_run_a_line() {
     assert_eq!(
         line::parse_git_version("git version 2.39.5 (Apple Git-154)"),
         Some((2, 39))
@@ -1187,6 +1205,34 @@ fn this_git_runs_a_line_and_an_older_one_could_not_run() {
     let stop = stopped(line::hop_tree(&Old, "head", "fix"), Reason::OldGit);
     assert!(
         stop.why.contains("2.39.5"),
+        "it names the git found: {stop:?}"
+    );
+
+    /// Every call answers as a real 2.49 does for a clean merge: no `merge.default`, no path
+    /// moved that an attribute could steer, and the merged tree.
+    struct Detecting;
+    impl GitRunner for Detecting {
+        fn git(&self, args: &[&str]) -> ledger::Result<RunOut> {
+            let (status, stdout): (i32, &[u8]) = if args.first() == Some(&"version") {
+                (0, b"git version 2.49.0\n")
+            } else if args.contains(&"merge.default") {
+                (1, b"")
+            } else if args.contains(&"diff-tree") {
+                (0, b"")
+            } else {
+                (0, b"4b825dc642cb6eb9a060e54bf8d69288fbee4904\0")
+            };
+            Ok(RunOut {
+                status,
+                stdout: stdout.to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+    stopped(line::git_ready(&Detecting), Reason::OldGit);
+    let stop = stopped(line::hop_tree(&Detecting, "head", "fix"), Reason::OldGit);
+    assert!(
+        stop.why.contains("2.49.0"),
         "it names the git found: {stop:?}"
     );
 }
@@ -1288,7 +1334,7 @@ fn a_line_round_trips_through_the_journals_toml() {
 /// was swapped does too.
 #[test]
 fn the_cut_signs_only_the_head_of_a_line_that_verifies() {
-    let fix = Fixture::new("cut");
+    let fix = Fixture::merging("cut");
     let (git, s) = (fix.git(), &fix.shas);
     let start = Line::start(VERSION, &s.g, 1_790_000_000);
     let admitted = fix_of(&git, &start, &s.fix_b);

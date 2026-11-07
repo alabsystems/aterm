@@ -48,11 +48,9 @@ fn num(f: &std::collections::BTreeMap<&str, &str>, key: &str, line: &str) -> u64
 #[test]
 fn a_scripted_session_replays_as_the_pane_task_here_and_in_another_process() {
     let vim = std::path::Path::new("/usr/bin/vim");
-    assert!(
-        vim.exists(),
-        "fixture: the corpus runs vim ({})",
-        vim.display()
-    );
+    if !vim.exists() {
+        aterm_spec::host::could_not_run(format!("the corpus runs vim ({})", vim.display()));
+    }
     let inst = boot("atr3");
     let mut ctl = Ctl::connect(&inst.sock);
 
@@ -69,9 +67,10 @@ fn a_scripted_session_replays_as_the_pane_task_here_and_in_another_process() {
         quiet(&mut ctl);
     }
 
+    // POSIX sh (dash on Linux has no `${var:offset:length}`): the bar grows one `#` a step.
     ctl.type_line(
-        "bar='####################'; i=0; while [ $i -le 20 ]; do printf '\\r[%-20s] %3d%%' \
-         \"${bar:0:$i}\" $((i*5)); i=$((i+1)); sleep 0.15; done; echo; echo bar-done",
+        "bar=''; i=0; while [ $i -le 20 ]; do printf '\\r[%-20s] %3d%%' \"$bar\" $((i*5)); \
+         bar=\"$bar#\"; i=$((i+1)); sleep 0.15; done; echo; echo bar-done",
     );
     ctl.expect_on_screen("^bar-done");
     quiet(&mut ctl);

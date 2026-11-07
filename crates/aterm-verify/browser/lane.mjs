@@ -429,8 +429,13 @@ async function worker(spec, font, timings) {
     document.getElementById('screen').transferControlToOffscreen())
   const w = new Worker('./worker.mjs', { type: 'module' })
   const answer = await new Promise((resolve, reject) => {
-    w.onmessage = (e) =>
-      e.data && e.data.answer ? resolve(e.data.answer) : reject(new Error(`the worker: ${e.data && e.data.error}`))
+    w.onmessage = (e) => {
+      if (e.data && e.data.answer) return resolve(e.data.answer)
+      if (e.data && e.data.unsupported) {
+        return reject(Object.assign(new Error(`the worker: ${e.data.unsupported}`), { unsupported: true }))
+      }
+      reject(new Error(`the worker: ${e.data && e.data.error}`))
+    }
     w.onerror = (e) => reject(new Error(`the worker: ${e.message || 'failed to load'}`))
     w.postMessage({ spec, font, canvas: offscreen }, [offscreen])
   })
@@ -457,7 +462,8 @@ async function atermLane(kind, spec) {
 }
 
 /// The post-back run (`?post=1`): fetch the spec, run this page's lane, POST
-/// { answer } or { error } to /answer/<kind>, then open the next page.
+/// { answer } or { error } (with `unsupported` where the browser lacks what
+/// the lane needs, not aterm) to /answer/<kind>, then open the next page.
 async function postBack(kind, params) {
   let body
   try {
@@ -465,6 +471,7 @@ async function postBack(kind, params) {
     body = { answer: await atermLane(kind, spec) }
   } catch (e) {
     body = { error: e && e.message ? e.message : String(e) }
+    if (e && e.unsupported) body.unsupported = true
   }
   await fetch(`./answer/${kind}`, { method: 'POST', body: JSON.stringify(body) })
   const [next, ...rest] = (params.get('next') || '').split(',').filter((k) => k)

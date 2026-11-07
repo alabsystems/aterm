@@ -32,6 +32,7 @@ fn actual_native_context_rpc_uses_original_owner_and_pinned_host() {
         .unwrap();
     let path = scratch.path().join("store");
     let store = ImageStore::prepare_at(&path).unwrap();
+    aterm_capacity::host_executable::narrow_test_image();
     let program = store.cache_current().unwrap();
     let mut command = spawnfd::command(program.path());
     command
@@ -58,6 +59,7 @@ fn host() {
     crate::runtime::test_endpoint().unwrap();
     let path = PathBuf::from(std::env::var_os(STORE).unwrap());
     let store = ImageStore::open_at(&path).unwrap();
+    aterm_capacity::host_executable::narrow_test_image();
     let program = store.cache_current().unwrap();
     let socket = path.join("h.sock");
     let listener = aterm_uds::kept_out(|| CtlListener::bind(&socket)).unwrap();
@@ -89,6 +91,7 @@ fn host() {
         environment,
         cwd: world.scratch.path.clone(),
         width: 1,
+        metadata_sdk: None,
     });
     assert_eq!(read_event(&events, &binding), Event::Queued);
     world.owner.tick_queue();

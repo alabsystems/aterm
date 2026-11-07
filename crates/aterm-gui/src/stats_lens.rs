@@ -1810,6 +1810,7 @@ impl PresenceAxis {
 fn lab_network_doc(
     snapshot: Option<&aterm_types::network_state::NetworkStateSnapshot>,
     lab: Option<&crate::lab_deck::LabDeck>,
+    fleet: Option<&crate::network_deck::field::Field>,
     target: crate::network_deck::Target,
     caption: Option<&crate::network_deck::PlaceCaption>,
     metrics: &FaceMetrics,
@@ -1819,7 +1820,19 @@ fn lab_network_doc(
     let snapshot = snapshot.unwrap_or(&empty);
     let empty_lab = crate::lab_deck::LabDeck::default();
     let lab = lab.unwrap_or(&empty_lab);
-    let mut rows = crate::network_deck::details_lab_with_caption(snapshot, lab, target, caption);
+    let mut rows =
+        crate::network_deck::details_lab_with_caption(snapshot, lab, fleet, target, caption);
+    let fleet_target = fleet.is_some()
+        && matches!(
+            target,
+            crate::network_deck::Target::Fleet
+                | crate::network_deck::Target::Seat(crate::network_deck::SeatKey::Fleet(_))
+                | crate::network_deck::Target::Group(_)
+        );
+    let observed = matches!(
+        target,
+        crate::network_deck::Target::Seat(crate::network_deck::SeatKey::Observed(_))
+    );
     // A selected service needs its own scope before generic network guidance.
     // Keep Scope in the complete report, but present it once in the lens header.
     let scope = if target == crate::network_deck::Target::Accounts {
@@ -1844,8 +1857,9 @@ fn lab_network_doc(
             let lines = wrap(metrics, &value, width, BODY_PT);
             let label = name.clone();
             let compact = ((target == crate::network_deck::Target::Overview && name == "Observer")
-                || matches!(target, crate::network_deck::Target::Peer(_)))
-            .then(|| line_form(&name, vec![value.clone()]));
+                || observed
+                || fleet_target)
+                .then(|| line_form(&name, vec![value.clone()]));
             let mut forms = vec![form(rows_h(lines.len(), false), move |pen, p| {
                 heading(pen, p, &label, &[]);
                 let ink = pen.inks.words2;
@@ -1872,7 +1886,7 @@ fn lab_network_doc(
             }
         })
         .collect();
-    if let crate::network_deck::Target::Peer(slot) = target
+    if let crate::network_deck::Target::Seat(crate::network_deck::SeatKey::Observed(slot)) = target
         && let Some(peer) = snapshot.network.peers.iter().find(|peer| peer.slot == slot)
         && !peer.samples.is_empty()
     {
@@ -1934,11 +1948,21 @@ fn lab_network_doc(
             "Local observation of the Commons account catalog".into()
         } else if matches!(target, crate::network_deck::Target::LabAccount(_)) {
             "The lab registry and journal as this Mac last read them".into()
+        } else if fleet_target {
+            fleet.map_or_else(String::new, |fleet| {
+                if fleet.copy_path {
+                    "This Mac's node view of the lab's seats".into()
+                } else {
+                    "This Mac's survey of every fleet Mac".into()
+                }
+            })
         } else {
             "This machine's local observer and retained authenticated history".into()
         }],
         explainer: scope.unwrap_or_else(|| {
-            if matches!(target, crate::network_deck::Target::Peer(_)) {
+            if fleet_target {
+                "Seat: filled answered, half carried, hollow not answering, dotted not counted; hair under: another build; corner: needs an update. Below: bar busy, diamond waiting, capped bar at a limit, cross stuck; a hair quiet; nothing where not read. ↑/↓: the seats that need attention.".into()
+            } else if observed {
                 "↑/↓: machine or service. Outbound addresses are historical.".into()
             } else if matches!(target, crate::network_deck::Target::LabAccount(_)) {
                 "Account cell: the heat of its most used window; the over-max ink at its limit; hollow with no current reading; this Mac's rim where this Mac prefers it. ↑/↓: machine, service or account.".into()
@@ -1953,6 +1977,7 @@ fn lab_network_doc(
                     || "No longer among the lab's rows".into(),
                     |row| row.summary.clone(),
                 ),
+                _ if fleet_target => fleet.map_or_else(String::new, crate::network_deck::field::now_line),
                 _ => crate::network_deck::summary_with_caption(snapshot, caption),
             },
             InkKind::Words2,
@@ -2089,7 +2114,8 @@ mod network_tests {
         let doc = lab_network_doc(
             Some(&snapshot),
             None,
-            crate::network_deck::Target::Peer(1),
+            None,
+            crate::network_deck::Target::Seat(crate::network_deck::SeatKey::Observed(1)),
             None,
             metrics,
             width,
@@ -2290,8 +2316,8 @@ mod network_tests {
     fn retained_peer() -> aterm_types::network_state::NetworkStateSnapshot {
         use aterm_types::network_state::{
             AuthenticatedEndpoint, HistoryState, MachineIdentity, NetworkStateSnapshot,
-            PeerObservation, Reachability, RepairObservation, RepairOutcome, RepairStage,
-            Visibility,
+            PeerObservation, Reachability, RepairCause, RepairObservation, RepairOutcome,
+            RepairStage, Visibility,
         };
 
         let mut network = NetworkStateSnapshot::default();
@@ -2309,11 +2335,10 @@ mod network_tests {
             last_seen_ms: 1_793_040_000_000,
             last_checked_ms: None,
             last_repair: Some(RepairObservation {
-                cause: None,
                 completed_at_ms: 1_793_000_000_000,
                 outbound: true,
                 stage: Some(RepairStage::Application),
-                outcome: RepairOutcome::Failed,
+                outcome: RepairOutcome::Failed(RepairCause::Io),
                 table: Some([7; 32]),
                 sent: Some(7),
                 received: None,
@@ -2332,13 +2357,13 @@ mod network_tests {
 
     #[test]
     fn short_peer_lenses_keep_the_original_repair_time_with_every_recorded_outcome() {
-        use aterm_types::network_state::RepairOutcome;
+        use aterm_types::network_state::{RepairCause, RepairOutcome};
 
         let mut app = crate::App::headless_for_test();
         let wid = *app.windows.keys().next().unwrap();
         app.network_source = None;
         assert!(app.open_network_lens());
-        let target = crate::network_deck::Target::Peer(7);
+        let target = crate::network_deck::Target::Seat(crate::network_deck::SeatKey::Observed(7));
         app.windows.get_mut(&wid).unwrap().stats_lens.network_target = target;
         let resource = Snapshot::default();
         let lens = Lens {
@@ -2347,8 +2372,8 @@ mod network_tests {
             how: Opened::Keyboard,
         };
         for outcome in [
-            Some(RepairOutcome::Failed),
-            Some(RepairOutcome::Deferred),
+            Some(RepairOutcome::Failed(RepairCause::Io)),
+            Some(RepairOutcome::Deferred(None)),
             Some(RepairOutcome::Exchanged),
             Some(RepairOutcome::Cancelled),
             Some(RepairOutcome::NotObserved),
@@ -2440,7 +2465,8 @@ mod network_tests {
         let network = retained_peer();
         let mut input = crate::stats_deck::tests::input(&resource);
         input.network = Some(&network);
-        input.network_target = crate::network_deck::Target::Peer(7);
+        input.network_target =
+            crate::network_deck::Target::Seat(crate::network_deck::SeatKey::Observed(7));
         let lens = Lens {
             focus: Instrument::NetworkState,
             bar: Bar::Global,
@@ -2507,7 +2533,7 @@ mod network_tests {
         app.network_snapshot = std::sync::Arc::new(network);
         assert!(app.open_network_lens());
         app.windows.get_mut(&wid).unwrap().stats_lens.network_target =
-            crate::network_deck::Target::Peer(7);
+            crate::network_deck::Target::Seat(crate::network_deck::SeatKey::Observed(7));
         let copied = app.stats_lens_sentence(wid).unwrap();
         assert!(copied.contains("23232323232323232323232323232323"));
         assert!(copied.contains("42424242424242424242424242424242"));
@@ -5758,6 +5784,7 @@ pub(crate) fn lay_lens(
                 lab_network_doc(
                     input.network,
                     input.lab,
+                    input.fleet,
                     input.network_target,
                     input.network_place,
                     metrics,
@@ -5900,6 +5927,7 @@ impl crate::App {
             network: Some(self.network_snapshot.as_ref()),
             network_place: f.network_place.as_ref(),
             lab: Some(self.lab_deck.as_ref()),
+            fleet: self.fleet_field.as_deref(),
             network_target: self
                 .windows
                 .get(&wid)
@@ -5953,6 +5981,10 @@ impl crate::App {
         self.lab_deck_feed.revision().hash(&mut h);
         if lens.focus == Instrument::NetworkState {
             f.network_place.hash(&mut h);
+            self.fleet_field
+                .as_ref()
+                .map(|field| field.key)
+                .hash(&mut h);
         }
         self.windows
             .get(&wid)
@@ -6564,11 +6596,14 @@ impl crate::App {
             if open.focus == Instrument::NetworkState
                 && matches!(key, Key::Named(NamedKey::ArrowDown | NamedKey::ArrowUp))
             {
+                let band = self.network_band_px(wid);
                 if let Some(ws) = self.windows.get_mut(&wid) {
                     ws.stats_lens.retire_input();
                     ws.stats_lens.network_target = crate::network_deck::step(
                         &self.network_snapshot,
                         &self.lab_deck,
+                        self.fleet_field.as_deref(),
+                        band,
                         ws.stats_lens.network_target,
                         matches!(key, Key::Named(NamedKey::ArrowDown)),
                     );
@@ -6634,11 +6669,16 @@ impl crate::App {
         if open.focus == Instrument::NetworkState {
             let target = self.windows.get(&wid)?.stats_lens.network_target;
             return Some(
-                crate::network_deck::details_lab(&self.network_snapshot, &self.lab_deck, target)
-                    .into_iter()
-                    .map(|(name, value)| format!("{name}: {value}"))
-                    .collect::<Vec<_>>()
-                    .join(". "),
+                crate::network_deck::details_lab(
+                    &self.network_snapshot,
+                    &self.lab_deck,
+                    self.fleet_field.as_deref(),
+                    target,
+                )
+                .into_iter()
+                .map(|(name, value)| format!("{name}: {value}"))
+                .collect::<Vec<_>>()
+                .join(". "),
             );
         }
         let snap = self.vitals.snapshot.as_deref()?;

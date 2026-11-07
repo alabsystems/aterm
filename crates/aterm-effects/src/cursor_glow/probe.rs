@@ -512,6 +512,7 @@ fn read_text(
     ft.short.clear();
     ft.glyph.clear();
     ft.plain.clear();
+    ft.deep.clear();
     ft.cols = 0;
     ft.col0 = c0;
     ft.at = Some(now);
@@ -539,6 +540,7 @@ fn read_text(
     ft.short.reserve(n_rows * ft.cols);
     ft.glyph.reserve(n_rows * ft.cols);
     ft.plain.reserve(n_rows * ft.cols);
+    ft.deep.reserve(n_rows * ft.cols);
     let mut row = lo;
     while row <= hi {
         let line = cells[(row - r0) as usize].as_slice();
@@ -592,6 +594,11 @@ fn read_text(
                     && !cell.emoji_presentation
                     && matches!(cell.script, aterm_core::terminal::Script::Normal),
             );
+            ft.deep.push(
+                marked
+                    || !matches!(cell.underline, aterm_core::terminal::UnderlineStyle::None)
+                    || matches!(cell.script, aterm_core::terminal::Script::Sub { .. }),
+            );
             c += 1;
         }
         if n_cols < ft.cols {
@@ -602,6 +609,7 @@ fn read_text(
                 aterm_render::GlyphInk::OTHER,
             );
             ft.plain.resize(ft.plain.len() + (ft.cols - n_cols), false);
+            ft.deep.resize(ft.deep.len() + (ft.cols - n_cols), false);
         }
         ft.rows.push(first_glyph.map(|first| (first, last_glyph)));
         row += 1;

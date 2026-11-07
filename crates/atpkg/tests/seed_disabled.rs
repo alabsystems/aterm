@@ -5,7 +5,7 @@
 
 #![cfg(unix)]
 use aterm_uds::spawnfd::{Child, Command, Stdio};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 
 struct Fixture {
@@ -98,8 +98,8 @@ impl Fixture {
     }
 }
 
-fn in_hooked_zsh(fx: &Fixture, script: &str) -> std::io::Result<Output> {
-    Command::new("/bin/zsh")
+fn in_hooked_zsh(fx: &Fixture, zsh: &Path, script: &str) -> std::io::Result<Output> {
+    Command::new(zsh)
         .arg("-f")
         .arg("-c")
         .arg(format!(". '{}'; {script}", fx.zsh_hook().display()))
@@ -190,8 +190,11 @@ fn a_consenting_seed_puts_bin_on_path_and_answers_targo() {
 
     let bin = fx.layout.bin_dir();
     let mut not_run = None;
-    match in_hooked_zsh(&fx, "print -r -- $PATH; whence -p targo") {
-        Ok(shell) => {
+    // The zsh this host has, wherever it lives (no `/bin/zsh` on Debian or Ubuntu).
+    match aterm_uds::host::tool("zsh").locate() {
+        Ok(zsh) => {
+            let shell = in_hooked_zsh(&fx, &zsh, "print -r -- $PATH; whence -p targo")
+                .unwrap_or_else(|e| panic!("run zsh: {e}"));
             assert!(shell.status.success(), "{}", describe(&shell));
             let said = String::from_utf8_lossy(&shell.stdout);
             let mut lines = said.lines();
@@ -208,14 +211,11 @@ fn a_consenting_seed_puts_bin_on_path_and_answers_targo() {
                 describe(&shell)
             );
         }
-        Err(e)
-            if e.kind() == std::io::ErrorKind::NotFound
-                && std::fs::symlink_metadata("/bin/zsh")
-                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            not_run = Some("/bin/zsh is absent, so no hooked shell's PATH or `targo` was read");
+        Err(absent) => {
+            not_run = Some(format!(
+                "{absent}, so no hooked shell's PATH or `targo` was read"
+            ));
         }
-        Err(e) => panic!("run zsh: {e}"),
     }
 
     let ran = Command::new(bin.join("targo"))

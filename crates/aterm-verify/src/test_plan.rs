@@ -1,453 +1,472 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE TEST RUN'S WIDTH PLANNER AND BUDGET DISPATCHER
+//! THE WIDTH EACH TEST BINARY RUNS AT, WHAT IT IS CHARGED, AND THE ORDER THEY START IN
 //! (`docs/DESIGN-fast-build-release-2026-11-05.md` §4.4, A9).
 //!
-//! Each test binary `b` runs at a width `w_b`, its `RUST_TEST_THREADS`, and holds a charge `c_b` of
-//! the run's share `S` of cores while it runs. The charge is the larger of its width and the cores
-//! its last run used, descendants included, at that width, so a binary whose tests start busy
-//! child processes is charged for them. The dispatcher starts the next binary only when the free
-//! share covers its charge: the sum of the charges of the binaries running never exceeds `S`.
+//! A binary runs at a width `w`, its `RUST_TEST_THREADS`, and is charged `c` cores of the test
+//! stage's share `S`. [`Dispatcher`] starts a binary only while its charge fits in what the running
+//! binaries' charges leave of `S`, so it admits at most `S` of historically estimated demand and
+//! narrow binaries run side by side instead of one at a time. Descendant use contributes where
+//! history measured it; an overrun is logged and raises the next charge, and runs alone once that
+//! charge reaches `S`. This bounds charges, not unmeasured physical use (KI-1103-3).
 //!
-//! Widths come from what each binary took the last time it ran here ([`crate::test_history`],
-//! read as [`Seen`]): the target makespan is `T* = max(Σ held / S, max floor)`, where a binary
-//! holds `max(cpu, wall × threads)` core-seconds ([`Seen::held_s`]: a waiting thread holds its
-//! core). Each candidate plan gives every binary the least width whose predicted wall is within
-//! `T*` times one of [`TIGHTEN`], so a short binary runs narrow beside others instead of taking
-//! the whole share; the plan kept is the candidate whose simulated schedule ([`Plan::makespan`])
-//! ends soonest. Binaries with no history start first, at width `min(4, cap)`; then the ones
-//! that failed last time; then the rest, longest predicted first.
+//! What a binary's history ([`crate::test_history`]) says of its last run, `cpu` (its process
+//! group's CPU time, descendants included) and `wall` at width `w_o` over `n` tests, predicts it
+//! at another width `w` from the threads it had, `t_o = min(w_o, n)`:
+//! - its wall `wall(w) = wall · t_o / min(w, n)`. A thread busy waiting on a timer or a socket is
+//!   as busy as one computing, so the threads, not the CPU, scale the wall: a binary of a hundred
+//!   tests that each wait a second uses almost no CPU, and still takes a hundred times as long on
+//!   one thread as on a hundred;
+//! - its charge `c(w) = min(S, max(w, ⌈q · min(w, n)⌉))`, where `q` is the most CPU per thread
+//!   any kept run showed (`cpu / wall / t_o`): a test that spawns processes uses more than its
+//!   thread, and a binary whose run went over its charge is charged that much more next time.
 //!
-//! A charge comes from what a binary used last time; the stage's meter reads what the binaries
-//! running use now, every member of their process groups counted ([`crate::memory::Meter::live_rate`]),
-//! and a start also waits while that rate plus its charge would pass the share by more than a core.
+//! The plan has a target `T`: each binary runs at the narrowest width whose predicted wall is
+//! within `T` (its widest where none is), so the long poles get the width they need and the rest
+//! leave the share to each other. A binary's widest is `min(S, n, ceiling)`, and no wider than
+//! the width at which it uses `S` before the clamp (`max(w, ⌈q · min(w, n)⌉) ≤ S`; one where even
+//! one thread uses more): a binary whose tests each run a pool of their own, charged `S` at a
+//! wider width, would use more than the share with nothing beside it. No plan ends before its bound: the
+//! share's work `Σ wall · t_o / S` (a binary's threads times its wall, the same at every width it
+//! scales to, over the share, as every charge is at least its width) or the longest binary at
+//! its widest, whichever is later. The planner uses that bound as an empirical regularization
+//! floor: it tries as `T` the bound and each larger wall a binary would take at a width it can
+//! run at ([`TARGET_STEP`] apart at least), lays each plan out as the dispatcher starts it, every
+//! binary taking its predicted wall ([`schedule`]), and keeps the plan that ends first, and of
+//! those that end together the narrowest. This is deliberately not an exact search of the
+//! prediction. A target below the bound can widen a strict FIFO head and remove fragmentation;
+//! on two cores, binaries predicted at one and two seconds one thread wide have a 1.5 s bound,
+//! where the first starts narrow and the two-wide head waits (2 s), while target 0.5 s runs both
+//! two wide in series (1.5 s). But the measured every-wall variant packed about ninety binaries
+//! at the full share and replayed near one-at-a-time baseline wall; bound-up plans replayed at
+//! about 0.53 of it on ten cores, 0.74 with one loaded run's walls left out of the fit
+//! (`docs/measured/test-dispatch-qualification-2026-11-05.md`).
+//!
+//! Order: binaries with no history first (nothing says how long they take), at width
+//! `min(4, S, ceiling)` and planned to hold as much memory as the heaviest binary the history
+//! kept; then those whose last run was a FAIL, so a red shows early; then the rest; each group
+//! but the first longest predicted first, the first in cargo's order.
 
-use std::collections::BTreeMap;
-use std::sync::{Condvar, Mutex, PoisonError};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::time::Duration;
 
-use crate::test_history::{History, Row};
+/// The width a binary with no history runs at, at most.
+pub const UNSEEN_WIDTH: u32 = 4;
 
-/// The width a binary with no history starts at, within its cap.
-pub const NEW_WIDTH: u32 = 4;
+/// The least factor between two targets the planner tries ([`plan`]): plans whose targets are
+/// closer have schedules that differ by less than a prediction's own error, and a few hundred
+/// binaries are planned in a few hundred schedules.
+pub const TARGET_STEP: f64 = 1.05;
 
-/// What one binary did the last time it ran, as its history's samples say.
-#[derive(Clone, Debug, PartialEq)]
+/// What one binary's history says (the planner's input; [`crate::test_history::History::seen`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Seen {
-    /// Its `RUST_TEST_THREADS`.
+    /// Its last run's wall.
+    pub wall: Duration,
+    /// The `RUST_TEST_THREADS` its last run had.
     pub width: u32,
-    /// Its wall time, seconds.
-    pub wall_s: f64,
-    /// The CPU time its tree used, seconds (its wall times its width where unread).
-    pub cpu_s: f64,
-    /// The shortest wall of a run that started every one of its tests at once (its width at least
-    /// its test count), seconds: about its longest test, which no width can beat. 0 until such a
-    /// run; a narrower run's wall is how long its queue of tests took, not a floor.
-    pub floor_s: f64,
-    /// How many tests libtest said it runs, when it said.
-    pub tests: Option<u32>,
-    /// Whether that run failed.
+    /// The tests libtest ran in its last run (`running <n> tests`).
+    pub tests: u32,
+    /// The most CPU per thread any kept run showed (`cpu / wall / min(width, tests)`, at least
+    /// one: a run with no reading was busy on every thread).
+    pub per_thread: f64,
+    /// The most memory any kept run held at once, in bytes.
+    pub peak: u64,
+    /// Its last run was a FAIL.
     pub failed: bool,
 }
 
 impl Seen {
-    /// The cores it used last time: CPU over wall.
-    fn observed(&self) -> f64 {
-        (self.cpu_s / self.wall_s.max(1e-3)).max(1e-3)
-    }
-
-    /// The test threads it runs at width `w`: `w`, or fewer when it has fewer tests.
-    fn threads_at(&self, w: u32) -> u32 {
-        self.tests.map_or(w, |t| w.min(t)).max(1)
-    }
-
-    /// The test threads it ran last time.
+    /// The threads its last run had.
     fn threads(&self) -> u32 {
-        self.threads_at(self.width)
+        self.width.min(self.tests).max(1)
     }
 
-    /// The cores it uses at width `w`: each of its threads brings what each brought last time
-    /// (less than a core when its tests wait, more when its descendants work beside it). Its
-    /// tests are a queue its threads drain, so the rate scales with the threads that run, in
-    /// either direction: a run at width 1 does not pin it there, and the next run's measure at
-    /// the width planned corrects the scale.
+    /// The widest it runs at under `ceiling` on a share of `share` cores: no wider than its
+    /// tests, nor than the width at which it uses the share ([`Seen::uses`]), since tests that
+    /// each run processes or a pool of their own use more than their threads, and wider than that
+    /// it would use more than the share however it is charged; at least one.
+    fn widest(&self, ceiling: u32, share: u32) -> u32 {
+        let most = ceiling.min(self.tests.max(1)).max(1);
+        (1..=most)
+            .rev()
+            .find(|&w| self.uses(w) <= share)
+            .unwrap_or(1)
+    }
+
+    /// Its predicted wall at width `w` (at least one).
     #[must_use]
-    pub fn rate(&self, w: u32) -> f64 {
-        let per_thread = self.observed() / f64::from(self.threads());
-        f64::from(self.threads_at(w)) * per_thread
+    pub fn wall_at(&self, w: u32) -> Duration {
+        let usable = w.max(1).min(self.tests.max(1));
+        scale(self.wall, f64::from(self.threads()) / f64::from(usable))
     }
 
-    /// The core-seconds it holds of the share: its charge is at least its width, so a thread
-    /// that waits holds its core all the same, and its descendants' cores are charged too. Under
-    /// [`Self::rate`] this is the same at every width that runs no idle thread.
+    /// What it is charged at width `w` (at least one) of a share of `share` cores: what it uses
+    /// there, at most the share.
     #[must_use]
-    pub fn held_s(&self) -> f64 {
-        self.cpu_s.max(self.wall_s * f64::from(self.threads()))
+    pub fn charge_at(&self, w: u32, share: u32) -> u32 {
+        self.uses(w).clamp(1, share.max(1))
     }
 
-    /// Its predicted wall at width `w`, seconds: its CPU at [`Self::rate`], never below its
-    /// floor.
-    #[must_use]
-    pub fn predicted(&self, w: u32) -> f64 {
-        (self.cpu_s / self.rate(w)).max(self.floor_s)
-    }
-}
-
-impl Seen {
-    /// A binary's row read as its newest sample, with the floor its all-at-once runs set; `None`
-    /// for a row with no sample.
-    #[must_use]
-    pub fn of(row: &Row) -> Option<Seen> {
-        let last = row.samples.last()?;
-        let secs = |ms: u64| Duration::from_millis(ms).as_secs_f64();
-        let width = last.width.max(1);
-        let wall_s = secs(last.wall_ms).max(1e-3);
-        let tests = |t: Option<u64>| t.map(|t| u32::try_from(t).unwrap_or(u32::MAX));
-        let floor_s = row
-            .samples
-            .iter()
-            .filter(|s| tests(s.tests).is_some_and(|t| s.width >= t.max(1)))
-            .map(|s| secs(s.wall_ms))
-            .reduce(f64::min)
-            .unwrap_or(0.0);
-        Some(Seen {
-            width,
-            wall_s,
-            cpu_s: last
-                .cpu_ms
-                .map_or(wall_s * f64::from(width), |cpu| secs(cpu).max(1e-3)),
-            floor_s,
-            tests: tests(last.tests),
-            failed: last.outcome == "FAIL",
-        })
+    /// The cores it uses at width `w` (at least one): its width, or its CPU per thread times the
+    /// threads it has there, whichever is more.
+    fn uses(&self, w: u32) -> u32 {
+        let w = w.max(1);
+        let usable = w.min(self.tests.max(1));
+        let own = (self.per_thread.max(0.0) * f64::from(usable)).ceil();
+        let own = if own.is_finite() && own < f64::from(u32::MAX) {
+            // A finite, non-negative value below u32::MAX.
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "checked finite, non-negative and below u32::MAX"
+            )]
+            let own = own as u32;
+            own
+        } else {
+            u32::MAX
+        };
+        w.max(own)
     }
 }
 
-/// Every binary the history knows, read as [`Seen`], by its re-run spec.
-#[must_use]
-pub fn seen(history: &History) -> BTreeMap<String, Seen> {
-    history
-        .rows()
-        .iter()
-        .filter_map(|row| Some((row.test.clone(), Seen::of(row)?)))
-        .collect()
+/// `d · k`, saturating, for a finite non-negative `k`.
+fn scale(d: Duration, k: f64) -> Duration {
+    Duration::try_from_secs_f64(d.as_secs_f64() * k).unwrap_or(Duration::MAX)
 }
 
-/// Why a binary is where it is in the order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Class {
-    /// No history: it starts first, at [`NEW_WIDTH`].
-    New,
-    /// It failed last time: its verdict is the likeliest to be red, so it comes early.
-    FailedLast,
-    /// Known: longest predicted first.
-    Known,
-}
-
-/// The run's plan: an order over the binaries, each one's width and charge.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Plan {
-    /// The share `S` the charges are drawn from.
-    pub share: u32,
-    /// Binary indices in dispatch order.
-    pub order: Vec<usize>,
-    pub width: Vec<u32>,
-    pub charge: Vec<u32>,
-    pub class: Vec<Class>,
-    /// Each binary's predicted wall at its width, seconds; `None` for a new one.
-    pub predicted: Vec<Option<f64>>,
-    /// The makespan its schedule predicts ([`Plan::makespan`]), seconds; `None` with no history.
-    pub target_s: Option<f64>,
-}
-
-impl Plan {
-    /// When the dispatcher's schedule of this plan ends, predicted: binaries in order, the head
-    /// starting once the free share covers its charge, each ending after its predicted wall (a
-    /// new one, unknown, after none).
-    #[must_use]
-    pub fn makespan(&self) -> f64 {
-        let mut running: Vec<(f64, u32)> = Vec::new();
-        let (mut now, mut free, mut end) = (0.0_f64, self.share, 0.0_f64);
-        for &i in &self.order {
-            let charge = self.charge[i].clamp(1, self.share);
-            while free < charge {
-                let first = running
-                    .iter()
-                    .enumerate()
-                    .min_by(|a, b| a.1.0.total_cmp(&b.1.0))
-                    .map(|(k, _)| k)
-                    .expect("a charge short of the share has a binary running");
-                let (ends, returned) = running.swap_remove(first);
-                now = now.max(ends);
-                free += returned;
-            }
-            let ends = now + self.predicted[i].unwrap_or(0.0);
-            running.push((ends, charge));
-            free -= charge;
-            end = end.max(ends);
-        }
-        end
-    }
-
-    /// One binary, one thread, one core.
-    #[must_use]
-    pub fn one() -> Plan {
-        plan(&["one"], &BTreeMap::new(), 1, 1)
-    }
-}
-
-/// How far below `T*` a binary's predicted wall must come, tried in turn: at `T*` itself a long
-/// pole may take the whole target beside narrow binaries the share then cannot pack, and a
-/// tighter bound widens the poles. [`plan`] keeps the one whose schedule ends soonest.
-const TIGHTEN: [f64; 5] = [1.0, 0.75, 0.5, 1.0 / 3.0, 0.25];
-
-/// Plan `specs` within `share` cores, no binary wider than `cap` threads: of the plans whose
-/// widths come within `T*` × each of [`TIGHTEN`], the one whose schedule ([`Plan::makespan`])
-/// ends soonest, the looser on a tie.
-#[must_use]
-pub fn plan(specs: &[&str], history: &BTreeMap<String, Seen>, share: u32, cap: u32) -> Plan {
-    let share = share.max(1);
-    let seen: Vec<Option<&Seen>> = specs.iter().map(|s| history.get(*s)).collect();
-    let known = seen.iter().flatten();
-    let held: f64 = known.clone().map(|s| s.held_s()).sum();
-    let floor = known.clone().map(|s| s.floor_s).fold(0.0_f64, f64::max);
-    let Some(target) = seen
-        .iter()
-        .any(Option::is_some)
-        .then(|| (held / f64::from(share)).max(floor))
-    else {
-        return plan_within(&seen, share, cap, None);
-    };
-    TIGHTEN
-        .iter()
-        .map(|t| plan_within(&seen, share, cap, Some(target * t)))
-        .reduce(|best, p| {
-            if p.makespan() < best.makespan() {
-                p
-            } else {
-                best
-            }
-        })
-        .expect("TIGHTEN is not empty")
-}
-
-/// The plan whose known binaries each take the least width predicted to end within `bound`.
-fn plan_within(seen: &[Option<&Seen>], share: u32, cap: u32, bound: Option<f64>) -> Plan {
-    let cap = cap.clamp(1, share);
-    let cap_of = |s: Option<&Seen>| s.and_then(|s| s.tests).map_or(cap, |t| cap.min(t.max(1)));
-    let mut width = Vec::with_capacity(seen.len());
-    let mut charge = Vec::with_capacity(seen.len());
-    let mut class = Vec::with_capacity(seen.len());
-    let mut predicted = Vec::with_capacity(seen.len());
-    for s in seen {
-        let cap_b = cap_of(*s);
-        match (s, bound) {
-            (Some(s), Some(bound)) => {
-                let w = (1..=cap_b)
-                    .find(|&w| s.predicted(w) <= bound)
-                    .unwrap_or(cap_b);
-                width.push(w);
-                charge.push((s.rate(w).ceil() as u32).clamp(w, share));
-                class.push(if s.failed {
-                    Class::FailedLast
-                } else {
-                    Class::Known
-                });
-                predicted.push(Some(s.predicted(w)));
-            }
-            _ => {
-                let w = NEW_WIDTH.min(cap_b);
-                width.push(w);
-                charge.push(w);
-                class.push(Class::New);
-                predicted.push(None);
-            }
-        }
-    }
-    let mut order: Vec<usize> = (0..seen.len()).collect();
-    order.sort_by(|&a, &b| {
-        let wall = |i: usize| predicted[i].unwrap_or(f64::INFINITY);
-        class[a]
-            .cmp(&class[b])
-            .then_with(|| wall(b).total_cmp(&wall(a)))
-            .then_with(|| a.cmp(&b))
-    });
-    let mut plan = Plan {
-        share,
-        order,
-        width,
-        charge,
-        class,
-        predicted,
-        target_s: None,
-    };
-    plan.target_s = bound.map(|_| plan.makespan());
-    plan
-}
-
-/// The free share the dispatcher draws charges from, and the next place in its order.
-struct Budget {
-    free: Mutex<(u32, usize)>,
-    returned: Condvar,
-}
-
-/// A step of the dispatcher, as its observer sees it under the budget's lock
-/// ([`dispatch_observed`]): a binary has taken its charge, or is about to return it.
+/// One binary of the plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Step {
-    Start(usize),
-    End(usize),
+pub struct Planned {
+    /// Its index in the run's binaries (cargo's order).
+    pub index: usize,
+    /// Its `RUST_TEST_THREADS`.
+    pub width: u32,
+    /// The cores of the share it holds while it runs.
+    pub charge: u32,
+    /// The memory it holds while it runs, at most, in bytes (0: none known).
+    pub peak: u64,
+    /// Its predicted wall; `None` with no history.
+    pub predicted: Option<Duration>,
 }
 
-/// A started binary's charge, returned to its budget when dropped, so a binary whose callback
-/// panics does not keep it from the binaries still queued.
-struct Held<'a> {
-    budget: &'a Budget,
-    index: usize,
-    charge: u32,
-    observe: &'a (dyn Fn(Step) + Sync),
+/// The run's plan: every binary once, in the order they start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Plan {
+    /// The share `S` the charges are taken from.
+    pub share: u32,
+    /// The target `T` (zero with no history at all).
+    pub target: Duration,
+    /// Every binary, in the order the dispatcher starts them.
+    pub order: Vec<Planned>,
 }
 
-impl Drop for Held<'_> {
-    fn drop(&mut self) {
-        let mut free = self
-            .budget
-            .free
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        (self.observe)(Step::End(self.index));
-        free.0 += self.charge;
-        drop(free);
-        self.budget.returned.notify_all();
+/// Plan binaries whose histories are `seen` (cargo's order) on a share of `share` cores, each
+/// binary's width at most `ceiling` (`--test-threads`, or the caller's `RUST_TEST_THREADS`), a
+/// binary with no history planned to hold `unseen_peak` bytes.
+#[must_use]
+pub fn plan(seen: &[Option<Seen>], share: u32, ceiling: Option<u32>, unseen_peak: u64) -> Plan {
+    let share = share.max(1);
+    let ceiling = ceiling.unwrap_or(u32::MAX).clamp(1, share);
+    let known: Vec<(usize, Seen)> = seen
+        .iter()
+        .enumerate()
+        .filter_map(|(index, s)| Some((index, (*s)?)))
+        .collect();
+    let floor = bound(&known, share, ceiling);
+    let mut walls: Vec<Duration> = known
+        .iter()
+        .flat_map(|(_, s)| (1..=s.widest(ceiling, share)).map(|w| s.wall_at(w)))
+        .filter(|&wall| wall > floor)
+        .collect();
+    walls.sort_unstable();
+    let mut tried: Option<Duration> = None;
+    let mut best: Option<(Duration, Plan)> = None;
+    for target in std::iter::once(floor).chain(walls) {
+        if tried.is_some_and(|t| target.as_secs_f64() < t.as_secs_f64() * TARGET_STEP) {
+            continue;
+        }
+        tried = Some(target);
+        let candidate = Plan {
+            share,
+            target,
+            order: at_target(&known, target, share, ceiling),
+        };
+        let end = schedule(&candidate).end;
+        // The targets rise, so of plans that end together the last tried is the narrowest.
+        if best.as_ref().is_none_or(|(first, _)| end <= *first) {
+            best = Some((end, candidate));
+        }
+    }
+    let (target, seen_order) =
+        best.map_or((Duration::ZERO, Vec::new()), |(_, p)| (p.target, p.order));
+    let width = UNSEEN_WIDTH.min(ceiling);
+    let mut order: Vec<Planned> = seen
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.is_none())
+        .map(|(index, _)| Planned {
+            index,
+            width,
+            charge: width,
+            peak: unseen_peak,
+            predicted: None,
+        })
+        .collect();
+    order.extend(seen_order);
+    Plan {
+        share,
+        target,
+        order,
     }
 }
 
-/// Run `run(i, width)` for every binary of `plan`, in its order, on at most `workers` threads,
-/// each start waiting until the free share covers its charge (greedy list scheduling: the head of
-/// the queue waits, so a wide binary is never starved by narrow ones behind it). A finished
-/// binary returns its charge, one whose callback panics included (the panic is the dispatcher's
-/// once the others are done). Answers are by index. Each worker books its children into the
-/// calling stage's memory meter ([`crate::memory::current`]) and hands them its cover marker
-/// ([`crate::memory::cover`]); it also retains the actual stage reservation, so a nested bounded
-/// walk can outlive its callback without releasing memory still used by that walk.
-pub fn dispatch<T, F>(plan: &Plan, workers: usize, run: F) -> Vec<Option<T>>
-where
-    T: Send,
-    F: Fn(usize, u32) -> T + Sync,
-{
-    let meter = crate::memory::current();
-    let rate = || meter.as_ref().and_then(|m| m.live_rate());
-    dispatch_with(plan, workers, &|_| {}, &rate, run)
+/// The earliest any plan of the binaries `known` on a share of `share` cores, each at most
+/// `ceiling` wide, can end as predicted: their work over the share (each binary's threads times
+/// its wall, which its predicted wall keeps at every width up to its tests, over `share`, as each
+/// charge is at least its width), or the longest of them at its widest ([`Seen::widest`]),
+/// whichever is later. Zero
+/// with none known.
+fn bound(known: &[(usize, Seen)], share: u32, ceiling: u32) -> Duration {
+    let work: f64 = known
+        .iter()
+        .map(|(_, s)| s.wall.as_secs_f64() * f64::from(s.threads()))
+        .sum();
+    let work = Duration::try_from_secs_f64(work / f64::from(share.max(1))).unwrap_or(Duration::MAX);
+    let longest = known
+        .iter()
+        .map(|(_, s)| s.wall_at(s.widest(ceiling, share)))
+        .max()
+        .unwrap_or(Duration::ZERO);
+    work.max(longest)
 }
 
-/// [`dispatch`], telling `observe` each [`Step`] under the budget's lock, so the order it sees is
-/// the order the charges were taken and returned in: the seam the dispatcher's conformance to
-/// its model is judged through (`tests/conformance_test_dispatch.rs`).
-#[cfg(any(test, debug_assertions))]
-pub fn dispatch_observed<T, F>(
-    plan: &Plan,
-    workers: usize,
-    observe: &(dyn Fn(Step) + Sync),
-    run: F,
-) -> Vec<Option<T>>
-where
-    T: Send,
-    F: Fn(usize, u32) -> T + Sync,
-{
-    dispatch_with(plan, workers, observe, &|| None, run)
-}
-
-/// How long a start held back by the live rate ([`dispatch_with`]) waits before it looks again,
-/// when no charge comes back sooner: the rate moves with no charge returned.
-const RATE_LOOK_EVERY: Duration = Duration::from_millis(250);
-
-/// [`dispatch`] with `observe` told each [`Step`] and `rate` read for the cores the running
-/// binaries use now. THE BACKSTOP: a start whose charge the free share covers also waits while
-/// the live rate plus its charge would pass the share by more than one core, unless nothing
-/// runs; a binary whose descendants outran its charge then holds back the next start, which its
-/// history alone would not until its next run.
-fn dispatch_with<T, F>(
-    plan: &Plan,
-    workers: usize,
-    observe: &(dyn Fn(Step) + Sync),
-    rate: &(dyn Fn() -> Option<f64> + Sync),
-    run: F,
-) -> Vec<Option<T>>
-where
-    T: Send,
-    F: Fn(usize, u32) -> T + Sync,
-{
-    let n = plan.order.len();
-    let answers: Vec<Mutex<Option<T>>> = (0..plan.width.len()).map(|_| Mutex::new(None)).collect();
-    let budget = Budget {
-        free: Mutex::new((plan.share, 0)),
-        returned: Condvar::new(),
-    };
-    let meter = crate::memory::current();
-    let cover = crate::memory::cover();
-    let memory = crate::current_memory_claim();
-    std::thread::scope(|scope| {
-        for _ in 0..workers.clamp(1, n.max(1)) {
-            scope.spawn(|| {
-                let _metering = crate::memory::metering(meter.clone());
-                let _covering = crate::memory::covering(cover.clone());
-                let _reservation = crate::holding_memory_claim(memory.clone());
-                loop {
-                    let (i, held) = {
-                        let mut free = budget.free.lock().unwrap_or_else(PoisonError::into_inner);
-                        // The head is read again after every wait: another worker may have
-                        // started it meanwhile.
-                        loop {
-                            let Some(&i) = plan.order.get(free.1) else {
-                                return;
-                            };
-                            let charge = plan.charge[i].clamp(1, plan.share);
-                            let idle = free.0 == plan.share;
-                            let fits = free.0 >= charge;
-                            let cool = idle
-                                || rate().is_none_or(|r| {
-                                    r + f64::from(charge) <= f64::from(plan.share) + 1.0
-                                });
-                            if fits && cool {
-                                free.0 -= charge;
-                                free.1 += 1;
-                                observe(Step::Start(i));
-                                break (
-                                    i,
-                                    Held {
-                                        budget: &budget,
-                                        index: i,
-                                        charge,
-                                        observe,
-                                    },
-                                );
-                            }
-                            free = if fits {
-                                budget
-                                    .returned
-                                    .wait_timeout(free, RATE_LOOK_EVERY)
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .0
-                            } else {
-                                budget
-                                    .returned
-                                    .wait(free)
-                                    .unwrap_or_else(PoisonError::into_inner)
-                            };
-                        }
-                    };
-                    let out = run(i, plan.width[i]);
-                    *answers[i].lock().unwrap_or_else(PoisonError::into_inner) = Some(out);
-                    drop(held);
-                }
-            });
+/// The binaries `known` (by their indexes) at target `target`: each at the narrowest width whose
+/// predicted wall is within it, its widest where none is, in the order they start: those whose
+/// last run failed, then the rest, each longest predicted first.
+fn at_target(known: &[(usize, Seen)], target: Duration, share: u32, ceiling: u32) -> Vec<Planned> {
+    let mut failed = Vec::new();
+    let mut rest = Vec::new();
+    for &(index, s) in known {
+        let widest = s.widest(ceiling, share);
+        let width = (1..=widest)
+            .find(|&w| s.wall_at(w) <= target)
+            .unwrap_or(widest);
+        let planned = Planned {
+            index,
+            width,
+            charge: s.charge_at(width, share),
+            peak: s.peak,
+            predicted: Some(s.wall_at(width)),
+        };
+        if s.failed {
+            failed.push(planned);
+        } else {
+            rest.push(planned);
         }
-    });
-    answers
-        .into_iter()
-        .map(|s| s.into_inner().ok().flatten())
-        .collect()
+    }
+    let longest_first =
+        |a: &Planned, b: &Planned| b.predicted.cmp(&a.predicted).then(a.index.cmp(&b.index));
+    failed.sort_by(longest_first);
+    rest.sort_by(longest_first);
+    failed.extend(rest);
+    failed
+}
+
+/// Where a binary of the plan is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    /// Not started.
+    Queued,
+    /// Started and not ended.
+    Running,
+    /// Ended.
+    Done,
+}
+
+/// THE DISPATCHER'S ONE RULE, apart from its threads ([`crate::testrun::dispatch`]), so its
+/// conformance test drives exactly the code that runs
+/// (`aterm_models_capacity::test_dispatch_model`).
+///
+/// It starts the plan's binaries in the plan's order, the next one only once its charge fits in
+/// what the running binaries' charges leave of the share, its peak in what their peaks leave of
+/// the stage's memory, and the running binaries' live CPU rate plus its charge is within the
+/// share and one core. A binary that ends gives its charge and its peak back. Once halted it starts
+/// nothing more. Each charge is at most the share and the memory at least the largest peak, so
+/// the next binary always fits once nothing runs: every queued binary starts unless the run
+/// halts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Dispatcher {
+    share: u32,
+    memory: Option<u64>,
+    order: Vec<Planned>,
+    /// Each binary's place in `order`, by its index.
+    at: Vec<Option<usize>>,
+    phase: Vec<Phase>,
+    next: usize,
+    held: u32,
+    held_bytes: u64,
+    halted: bool,
+}
+
+impl Dispatcher {
+    /// A dispatcher of `plan` on its share and, where the stage claimed it, `memory` bytes, raised
+    /// to the largest peak of the plan (no binary runs on less than its own).
+    #[must_use]
+    pub fn new(plan: &Plan, memory: Option<u64>) -> Self {
+        let share = plan.share.max(1);
+        let largest = plan.order.iter().map(|b| b.peak).max().unwrap_or(0);
+        let order: Vec<Planned> = plan
+            .order
+            .iter()
+            .map(|b| Planned {
+                charge: b.charge.clamp(1, share),
+                ..*b
+            })
+            .collect();
+        let width = order.iter().map(|b| b.index + 1).max().unwrap_or(0);
+        let mut at = vec![None; width];
+        for (place, b) in order.iter().enumerate() {
+            at[b.index] = Some(place);
+        }
+        Dispatcher {
+            share,
+            memory: memory.map(|m| m.max(largest)),
+            phase: vec![Phase::Queued; width],
+            at,
+            order,
+            next: 0,
+            held: 0,
+            held_bytes: 0,
+            halted: false,
+        }
+    }
+
+    /// Whether the next binary may start now, the running binaries using `live` cores at their
+    /// last reads.
+    fn admits(&self, b: &Planned, live: f64) -> bool {
+        let running = self.held > 0;
+        !self.halted
+            && self.held.saturating_add(b.charge) <= self.share
+            && self
+                .memory
+                .is_none_or(|m| self.held_bytes.saturating_add(b.peak) <= m)
+            && (!running || live + f64::from(b.charge) <= f64::from(self.share) + 1.0)
+    }
+
+    /// Start the next binary of the plan, if it may start now: it then holds its charge and its
+    /// peak until [`Dispatcher::finish`].
+    pub fn next(&mut self, live: f64) -> Option<Planned> {
+        let b = *self.order.get(self.next)?;
+        if !self.admits(&b, live) {
+            return None;
+        }
+        self.next += 1;
+        self.phase[b.index] = Phase::Running;
+        self.held += b.charge;
+        self.held_bytes = self.held_bytes.saturating_add(b.peak);
+        Some(b)
+    }
+
+    /// Binary `index` ended: its charge and its peak go back.
+    ///
+    /// # Errors
+    /// It was not running: nothing goes back.
+    pub fn finish(&mut self, index: usize) -> Result<(), &'static str> {
+        if self.phase.get(index) != Some(&Phase::Running) {
+            return Err("that binary is not running");
+        }
+        let b = self
+            .at
+            .get(index)
+            .copied()
+            .flatten()
+            .and_then(|place| self.order.get(place))
+            .ok_or("that binary is not in the plan")?;
+        self.phase[index] = Phase::Done;
+        self.held -= b.charge;
+        self.held_bytes = self.held_bytes.saturating_sub(b.peak);
+        Ok(())
+    }
+
+    /// Start nothing more.
+    pub fn halt(&mut self) {
+        self.halted = true;
+    }
+
+    /// Whether a binary is left to start: one is queued and the run has not halted.
+    #[must_use]
+    pub fn waiting(&self) -> bool {
+        !self.halted && self.next < self.order.len()
+    }
+
+    /// Where binary `index` is.
+    #[must_use]
+    pub fn phase(&self, index: usize) -> Option<Phase> {
+        self.phase.get(index).copied()
+    }
+
+    /// The cores the running binaries hold.
+    #[must_use]
+    pub const fn held(&self) -> u32 {
+        self.held
+    }
+
+    /// The bytes the running binaries hold.
+    #[must_use]
+    pub const fn held_bytes(&self) -> u64 {
+        self.held_bytes
+    }
+
+    /// The memory the binaries' peaks are kept within, where the stage claimed it.
+    #[must_use]
+    pub const fn memory(&self) -> Option<u64> {
+        self.memory
+    }
+
+    /// Whether the run stopped starting binaries.
+    #[must_use]
+    pub const fn halted(&self) -> bool {
+        self.halted
+    }
+}
+
+/// What a plan's schedule does ([`schedule`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Schedule {
+    /// When its last binary ends.
+    pub end: Duration,
+    /// The most memory its binaries hold at once, bytes.
+    pub peak: u64,
+}
+
+/// The plan's schedule when each binary takes its predicted wall (one with no history: the
+/// plan's target), started as [`Dispatcher`] starts them on no memory bound and no live rate:
+/// when it ends, which the planner keeps the plan that ends first by ([`plan`]), and the most
+/// memory its binaries hold at once, which the test run claims for them, so the claim is the
+/// schedule's own concurrent peak rather than every binary's at once.
+#[must_use]
+pub fn schedule(plan: &Plan) -> Schedule {
+    let mut d = Dispatcher::new(plan, None);
+    let mut running = BinaryHeap::new();
+    let mut now = Duration::ZERO;
+    let mut peak = 0;
+    loop {
+        while let Some(b) = d.next(0.0) {
+            let took = b.predicted.unwrap_or(plan.target);
+            running.push(Reverse((now.saturating_add(took), b.index)));
+            peak = peak.max(d.held_bytes());
+        }
+        // Nothing runs, so the head started if one was left: every binary has ended.
+        let Some(Reverse((end, index))) = running.pop() else {
+            return Schedule { end: now, peak };
+        };
+        now = end;
+        // It was started, so it ends once: nothing refuses this.
+        d.finish(index).ok();
+    }
 }
 
 #[cfg(test)]

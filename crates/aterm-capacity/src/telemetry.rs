@@ -6,49 +6,26 @@
 //! process, the moment it is decided. An admitted claim's wait is its own clock
 //! ([`crate::Claim::waited`], `meter=exact`); a refused or ended one's is the call's stopwatch
 //! (`meter=stamped`). A scratch ledger (every test's) writes none, so only this Mac's real
-//! claims become rows.
+//! claims become rows. This user's ledger is [`Ledger::user`]'s folder: the capacity folder, or
+//! the backend of the memory namespace that account's ledger was adopted into.
 //!
 //! The row holds digests of what was asked and where, and its label is the first word of the
 //! need's description, which the claimant program wrote (`targo`, `lab`); never the rest of its
 //! words. Its CPU and peak memory are `na`: they are the work's, which its command row carries.
 //!
-//! The write never holds up the claim it reports for long: the host's facts are read once a
-//! process, and the append waits at most [`LOCK_WAIT`] for another writer's lock. A row that
-//! misses it is lost and counted, and the next row this process writes goes after a gap line
-//! that says how many, as the window's writer does. Telemetry never fails an admission.
+//! The write never holds up the claim it reports for long: it goes through the log's one direct
+//! writer ([`aterm_telemetry::direct`]), which reads the host's facts once a process and waits at
+//! most [`aterm_telemetry::direct::LOCK_WAIT`] for another writer's lock. A row that misses it is
+//! lost and counted in a loss record in the log's folder, which the next append of any writer
+//! says in a gap line ([`aterm_telemetry::log::mark_lost`]); where no record can be left, the next
+//! row this process writes says it. Telemetry never fails an admission.
 
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
-use aterm_telemetry::{Digest, Fig, HostFacts, Kind, Meter, Outcome, Row, Stop};
+use aterm_telemetry::{Digest, Fig, Kind, Meter, Outcome, Row, Stop};
 
 use crate::{Claim, Error, Ledger};
-
-/// How long an admission's row waits for another writer's lock on the log.
-pub(crate) const LOCK_WAIT: Duration = Duration::from_millis(50);
-
-/// This process's host facts and precomputed digest, read at its first admission.
-static FACTS: OnceLock<(HostFacts, Digest)> = OnceLock::new();
-
-/// The rows this process lost.
-static LOST: Lost = Lost::new();
-
-/// Rows a process lost (a missed lock, a failed write) and how many of them a gap line said.
-pub(crate) struct Lost {
-    lost: AtomicU64,
-    told: AtomicU64,
-}
-
-impl Lost {
-    pub(crate) const fn new() -> Self {
-        Self {
-            lost: AtomicU64::new(0),
-            told: AtomicU64::new(0),
-        }
-    }
-}
 
 /// What an admission asked, kept before its need moves into the wait.
 pub(crate) struct Asked {
@@ -68,111 +45,59 @@ impl Asked {
     }
 }
 
-/// Write `result`'s row where `ledger` is this user's own ledger.
+/// Write `result`'s row where `ledger` is this user's own ledger ([`Ledger::user`]).
 pub(crate) fn decided(ledger: &Ledger, asked: &Asked, result: &Result<Claim, Error>) {
     if cfg!(test) {
         return;
     }
-    let Some(user) = crate::ledger::user_dir() else {
+    let Some(source) = crate::ledger::user_dir() else {
         return;
     };
     let Some(dir) = aterm_telemetry::log::default_dir() else {
         return;
     };
-    let (facts, digest) = FACTS.get_or_init(|| {
-        let facts = HostFacts::read();
-        let digest = facts.digest();
-        (facts, digest)
+    let (facts, digest) = aterm_telemetry::direct::facts();
+    decided_from(ledger, source, &facts.host, *digest, asked, result, |row| {
+        aterm_telemetry::direct::write_now(dir, row)
     });
-    decided_in_digest(ledger, &user, &dir, facts, *digest, asked, result, &LOST);
 }
 
-/// [`decided`] with this user's ledger folder `user`, the log's folder `dir`, the host's
-/// `facts` and the process's `lost` given: nothing unless `ledger` is `user`'s.
-#[cfg(test)]
-pub(crate) fn decided_in(
+/// [`decided`] with this user's capacity folder `source` (`ledger::user_dir`): held to the folder
+/// of the ledger it opens ([`Ledger::user`]), the folder itself or the backend of the memory
+/// namespace its ledger was adopted into.
+pub(crate) fn decided_from(
     ledger: &Ledger,
-    user: &Path,
-    dir: &Path,
-    facts: &HostFacts,
-    asked: &Asked,
-    result: &Result<Claim, Error>,
-    lost: &Lost,
-) {
-    decided_in_digest(
-        ledger,
-        user,
-        dir,
-        facts,
-        facts.digest(),
-        asked,
-        result,
-        lost,
-    );
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "shares precomputed HostFacts digest with decided_in test entry"
-)]
-fn decided_in_digest(
-    ledger: &Ledger,
-    user: &Path,
-    dir: &Path,
-    facts: &HostFacts,
+    source: std::path::PathBuf,
+    host: &str,
     digest: Digest,
     asked: &Asked,
     result: &Result<Claim, Error>,
-    lost: &Lost,
+    write: impl FnOnce(&Row) -> bool,
 ) {
-    if !is_users(ledger, user) {
+    let user = Ledger::account_at(source);
+    decided_in(ledger, user.dir(), host, digest, asked, result, write);
+}
+
+/// [`decided`] with this user's ledger folder `user` (its [`Ledger::dir`]) and the host's name and
+/// facts digest, the row handed to `write`: nothing unless `ledger` is `user`'s.
+pub(crate) fn decided_in(
+    ledger: &Ledger,
+    user: &Path,
+    host: &str,
+    digest: Digest,
+    asked: &Asked,
+    result: &Result<Claim, Error>,
+    write: impl FnOnce(&Row) -> bool,
+) {
+    if !aterm_telemetry::direct::same_folder(ledger.dir(), user) {
         return;
     }
     let decision = match result {
         Ok(claim) => Decision::Admitted(claim.waited()),
         Err(e) => Decision::Not(e, asked.at.elapsed()),
     };
-    let row = row(
-        asked,
-        &decision,
-        aterm_telemetry::now_ms(),
-        &facts.host,
-        digest,
-    );
-    let _ = write(dir.to_path_buf(), facts, &row, lost);
-}
-
-/// Append `row` to the log in `dir` within [`LOCK_WAIT`], after a gap line for the rows `lost`
-/// holds that no line has said yet: `false` (and the row counted in `lost`) when it was not
-/// written.
-pub(crate) fn write(dir: PathBuf, facts: &HostFacts, row: &Row, lost: &Lost) -> bool {
-    let log = aterm_telemetry::Log::new(dir, aterm_telemetry::Limits::DEFAULT, facts.clone())
-        .waiting(LOCK_WAIT);
-    let had = lost.lost.load(Ordering::Acquire);
-    let told = lost.told.load(Ordering::Acquire);
-    let mut lines = Vec::with_capacity(2);
-    if had > told {
-        lines.push(aterm_telemetry::row::gap_line(
-            aterm_telemetry::now_ms(),
-            had - told,
-        ));
-    }
-    lines.push(row.line());
-    if log.append(&lines).is_ok() {
-        lost.told.fetch_max(had, Ordering::AcqRel);
-        true
-    } else {
-        lost.lost.fetch_add(1, Ordering::AcqRel);
-        false
-    }
-}
-
-fn is_users(ledger: &Ledger, user: &Path) -> bool {
-    user == ledger.dir()
-        || std::fs::canonicalize(user)
-            .ok()
-            .zip(std::fs::canonicalize(ledger.dir()).ok())
-            .is_some_and(|(a, b)| a == b)
+    let row = row(asked, &decision, aterm_telemetry::now_ms(), host, digest);
+    let _ = write(&row);
 }
 
 /// How an admission ended.
@@ -195,7 +120,9 @@ pub(crate) fn row(
         Decision::Admitted(w) => (Outcome::Ok, Stop::Exit, None, *w, Meter::Exact),
         Decision::Not(e, w) => {
             let (outcome, stop, sig) = match e {
-                Error::Never(_) | Error::Timing(_) => (Outcome::Refused, Stop::Exit, None),
+                Error::Never(_) | Error::Unmet { .. } | Error::Timing(_) => {
+                    (Outcome::Refused, Stop::Exit, None)
+                }
                 Error::Stopped {
                     signal: Some(s), ..
                 } => (Outcome::Fail, Stop::Signal, Some(*s)),
@@ -219,6 +146,7 @@ pub(crate) fn row(
         dir: asked.checkout.as_deref().map(Digest::dir),
         label: aterm_telemetry::row::label(program),
         sid: None,
+        on: None,
         host: aterm_telemetry::row::host_word(host_name),
         facts,
         wall_ms: Fig::Known(wait),
@@ -305,6 +233,15 @@ mod tests {
             (Outcome::Refused, Stop::Exit, None, Meter::Stamped)
         );
         assert_eq!(
+            at(&Error::Unmet {
+                what: "verify".to_owned(),
+                short: crate::Shortfall::default(),
+                holders: None,
+                relieved: true,
+            }),
+            (Outcome::Refused, Stop::Exit, None, Meter::Stamped)
+        );
+        assert_eq!(
             at(&Error::Stopped {
                 signal: Some(2),
                 short: None
@@ -317,8 +254,8 @@ mod tests {
         );
     }
 
-    fn host() -> HostFacts {
-        HostFacts {
+    fn host() -> aterm_telemetry::HostFacts {
+        aterm_telemetry::HostFacts {
             host: "m14".to_owned(),
             model: "Mac15,14".to_owned(),
             cpu: "Apple M3 Ultra".to_owned(),
@@ -341,16 +278,17 @@ mod tests {
         let scratch = tmp.path().join("scratch");
         std::fs::create_dir(&scratch).expect("scratch");
         let dir = tmp.path().join("telemetry");
-        let lost = Lost::new();
+        let lost = aterm_telemetry::direct::Lost::new();
         let at = |ledger: &Path| {
+            let facts = host();
             decided_in(
                 &Ledger::at(ledger.to_path_buf()),
                 &users,
-                &dir,
-                &host(),
+                &facts.host,
+                facts.digest(),
                 &asked(),
                 &refused(),
-                &lost,
+                |row| aterm_telemetry::direct::write(dir.clone(), &facts, row, &lost),
             );
         };
         at(&scratch);
@@ -363,49 +301,5 @@ mod tests {
             (&r.kind, r.outcome, r.label.as_str()),
             (&Kind::Admission, Outcome::Refused, "targo")
         );
-    }
-
-    #[test]
-    fn a_held_lock_costs_one_row_that_the_next_gap_line_says() {
-        let tmp = aterm_tempfile::tempdir().expect("tempdir");
-        let dir = tmp.path().join("telemetry");
-        std::fs::create_dir(&dir).expect("dir");
-        let held = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join(".lock"))
-            .expect("lock file");
-        aterm_uds::file_lock::lock_exclusive_until(
-            &held,
-            Instant::now() + Duration::from_secs(60),
-            "the test holds the telemetry lock",
-        )
-        .expect("hold the lock");
-        let lost = Lost::new();
-        let one = |at| {
-            let r = row(
-                &asked(),
-                &Decision::Admitted(Duration::from_millis(1)),
-                at,
-                "m14",
-                facts(),
-            );
-            write(dir.clone(), &host(), &r, &lost)
-        };
-        assert!(!one(1), "a row written past another writer's lock");
-        assert_eq!(lost.lost.load(Ordering::Acquire), 1);
-        drop(held);
-        assert!(one(2), "the row once the lock is free");
-        let read = aterm_telemetry::log::read(&dir, 4, None).expect("read");
-        assert_eq!(
-            read.rows.iter().map(|r| r.at_ms).collect::<Vec<_>>(),
-            vec![2]
-        );
-        assert_eq!(read.dropped, 1, "the lost row is said in a gap line");
-        assert!(one(3));
-        let again = aterm_telemetry::log::read(&dir, 4, None).expect("read");
-        assert_eq!(again.dropped, 1, "a lost row is said once");
     }
 }

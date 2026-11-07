@@ -43,6 +43,7 @@ fn line() -> Procs {
         whole: 0,
         written: 0,
         cpu_ns: 0,
+        runnable_ns: 0,
     };
     Procs::of(vec![
         p(300, 200),
@@ -116,6 +117,7 @@ fn a_held_claim_covers_and_frees_what_it_credits() {
         whole: 0,
         written: 0,
         cpu_ns: 0,
+        runnable_ns: 0,
     };
     let procs = Procs::of(vec![
         p(300, 200),
@@ -208,6 +210,7 @@ fn the_cover_marker_reads_its_holders_claims_and_the_ledger_answers_without_it()
         whole: 0,
         written: 0,
         cpu_ns: 0,
+        runnable_ns: 0,
     };
     let build = me.wrapping_add(7);
     m.set_procs(Some(Procs::of(vec![p(build, me), p(me, 1)])));
@@ -262,6 +265,7 @@ fn the_cover_marker_reads_its_holders_claims_alone() {
             whole: 0,
             written: 0,
             cpu_ns: 0,
+            runnable_ns: 0,
         },
         Proc {
             pid: me,
@@ -270,6 +274,7 @@ fn the_cover_marker_reads_its_holders_claims_alone() {
             whole: 0,
             written: 0,
             cpu_ns: 0,
+            runnable_ns: 0,
         },
     ])));
     let claim = admit_with(
@@ -316,6 +321,7 @@ fn a_marker_names_one_claim_of_its_holder() {
             whole: 0,
             written: 0,
             cpu_ns: 0,
+            runnable_ns: 0,
         },
         Proc {
             pid: me,
@@ -324,6 +330,7 @@ fn a_marker_names_one_claim_of_its_holder() {
             whole: 0,
             written: 0,
             cpu_ns: 0,
+            runnable_ns: 0,
         },
     ])));
     let take = |what: &str| {
@@ -405,6 +412,7 @@ fn a_disk_claim_covers_only_the_run_its_marker_names() {
         whole: 0,
         written: 0,
         cpu_ns: 0,
+        runnable_ns: 0,
     };
     let verify = me.wrapping_add(7);
     m.set_procs(Some(Procs::of(vec![p(verify, me), p(me, 1)])));

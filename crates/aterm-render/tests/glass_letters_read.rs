@@ -23,7 +23,7 @@ use aterm_effects::rainbow_kitty::prism_glass::colour::{BLANK_BELOW, RING_REACH}
 use aterm_effects::rainbow_kitty::prism_glass::{
     GLASS_BAR, Mode, SOLVE_GUARD, colour, glass_bar, tables,
 };
-use aterm_render::{Renderer, Theme};
+use aterm_render::{FaceRef, Renderer, Theme};
 
 mod live;
 
@@ -393,19 +393,23 @@ fn a_glass_solved_to_the_bare_fg_holds_a_letter_under_its_bar() {
     }
 }
 
-/// The window's face, loaded by the path [`Renderer::from_system`] takes it from: SF Mono on
-/// macOS, the bundled JetBrains Mono elsewhere.
-fn window_face() -> (String, Vec<u8>) {
-    #[cfg(target_os = "macos")]
-    let path = String::from("/System/Library/Fonts/SFNSMono.ttf");
-    #[cfg(not(target_os = "macos"))]
-    let path = aterm_tempfile::manifest_dir()
-        .join("assets/bundled/JetBrainsMono-Regular.ttf")
-        .into_os_string()
-        .into_string()
-        .expect("a UTF-8 package directory");
-    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    (path, bytes)
+/// The window's face, by the identity [`Renderer::from_system`] resolves
+/// ([`aterm_render::default_primary_identity`]: SF Mono's file on macOS, the bundled JetBrains
+/// Mono elsewhere) and its bytes.
+fn window_face() -> (FaceRef, Vec<u8>) {
+    let face = aterm_render::default_primary_identity().expect("the window's face resolves");
+    let bytes = aterm_render::read_resolved_font(&face.path)
+        .unwrap_or_else(|e| panic!("{}: {e}", face.path))
+        .into_owned();
+    (face, bytes)
+}
+
+/// The window's face at `px`, built as [`Renderer::from_system`] builds it: by its identity, so
+/// its bold comes from the face's own bold sibling where it has one (the bundled
+/// JetBrainsMono-Bold), not from a synthesized emboldening.
+fn window_renderer(face: &FaceRef, bytes: &[u8], px: f32) -> Renderer {
+    Renderer::from_resolved_font_file(face.clone(), bytes, px, Theme::default())
+        .expect("the window's face")
 }
 
 /// How many of a page's glass entries the size sweep judges: those whose seen reading
@@ -415,15 +419,14 @@ const SWEPT_ENTRIES: usize = 8;
 /// One face at one size and line height on each shipped glass page: the face's thin share in the
 /// page's fg on its page ([`aterm_render::GlyphInk::thin_share`]), the census's glyph minimum over
 /// the page's [`SWEPT_ENTRIES`] least-seen glass entries, and its glyph.
-fn swept(bytes: &[u8], px: f32, line_height: f32) -> Vec<(f32, f64, char)> {
+fn swept(face: &FaceRef, bytes: &[u8], px: f32, line_height: f32) -> Vec<(f32, f64, char)> {
     let pages: Vec<_> = glass_pages().collect();
     std::thread::scope(|s| {
         let runs: Vec<_> = pages
             .iter()
             .map(|p| {
                 s.spawn(move || {
-                    let mut rend = Renderer::from_bytes(bytes, px, Theme::default())
-                        .expect("the window's face");
+                    let mut rend = window_renderer(face, bytes, px);
                     rend.set_line_height(line_height);
                     let share = rend.glyph_ink().thin_share(
                         aterm_render::linear_luminance(p.fg),
@@ -449,26 +452,26 @@ fn swept(bytes: &[u8], px: f32, line_height: f32) -> Vec<(f32, f64, char)> {
 }
 
 /// **THE GLASS DRAWS WHERE THE WINDOW'S FACE LAYS ITS LETTERS' FULL INK** (§15.8 amendment 53,
-/// `host::PageFacts::glass`): the window's face loaded by path ([`window_face`]) at every whole
-/// px from 10 to 48 and at line heights 1.0, 1.1 and 1.2, on every shipped glass page. Where its
-/// thin share in the page's fg on its page is at most [`colour::THIN_INK_SHARE`], the page's glass
-/// draws, and the census's glyph minimum over its [`SWEPT_ENTRIES`] least-seen entries keeps
-/// [`GLASS_BAR`]; a 12 pt window at scale 1 (12 px) and the Settings card at scale 1 (14 px) are
-/// refused, and a 12 pt window at scale 2 (24 px) admitted on every page. The face loaded by path
-/// is the one `Renderer::from_system` draws (their glyph ink is one). Negative control: a size the
-/// rule refuses holds a glyph under [`GLASS_BAR`] on a page, though its cells are at least 24 px
-/// tall, which a rule keyed on the cells' height admitted (amendment 50's; SF Mono at 26 px,
-/// whose `_` lays no row near the full ink). Each size's shares and minima print with
-/// `--nocapture`.
+/// `host::PageFacts::glass`): the window's face built by its identity ([`window_face`],
+/// [`window_renderer`]) at every whole px from 10 to 48 and at line heights 1.0, 1.1 and 1.2, on
+/// every shipped glass page. Where its thin share in the page's fg on its page is at most
+/// [`colour::THIN_INK_SHARE`], the page's glass draws, and the census's glyph minimum over its
+/// [`SWEPT_ENTRIES`] least-seen entries keeps [`GLASS_BAR`]; a 12 pt window at scale 1 (12 px)
+/// and the Settings card at scale 1 (14 px) are refused, and a 12 pt window at scale 2 (24 px)
+/// admitted on every page. The face built by its identity is the one `Renderer::from_system`
+/// draws (their glyph ink, regular and bold, is one). Negative control: a size the rule refuses
+/// holds a glyph under [`GLASS_BAR`] on a page, though its cells are at least 24 px tall, which a
+/// rule keyed on the cells' height admitted (amendment 50's; SF Mono at 26 px, whose `_` lays no
+/// row near the full ink). Each size's shares and minima print with `--nocapture`.
 #[test]
 fn the_glass_draws_where_the_windows_face_lays_its_letters_full() {
-    let (path, bytes) = window_face();
+    let (face, bytes) = window_face();
+    let path = &face.path;
     let system = Renderer::from_system(WINDOW_PX, Theme::default())
         .expect("the window's face")
         .glyph_ink()
         .fingerprint();
-    let by_path = Renderer::from_bytes(&bytes, WINDOW_PX, Theme::default())
-        .expect("the window's face")
+    let by_path = window_renderer(&face, &bytes, WINDOW_PX)
         .glyph_ink()
         .fingerprint();
     assert_eq!(by_path, system, "{path} is the face from_system draws");
@@ -476,9 +479,8 @@ fn the_glass_draws_where_the_windows_face_lays_its_letters_full() {
     let mut refused_under = Vec::new();
     for px in 10..=48_u8 {
         for line_height in [1.0_f32, 1.1, 1.2] {
-            let pages = swept(&bytes, f32::from(px), line_height);
-            let mut rend = Renderer::from_bytes(&bytes, f32::from(px), Theme::default())
-                .expect("the window's face");
+            let pages = swept(&face, &bytes, f32::from(px), line_height);
+            let mut rend = window_renderer(&face, &bytes, f32::from(px));
             rend.set_line_height(line_height);
             let cells = rend.cell_size().1;
             for (k, &(thin, min, glyph)) in pages.iter().enumerate() {

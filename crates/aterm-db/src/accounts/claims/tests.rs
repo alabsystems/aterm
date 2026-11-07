@@ -252,6 +252,24 @@ fn a_row_at_another_macs_key_is_inert() {
     }
 }
 
+/// A claim record has one wire spelling: the same command with a space after its opening brace
+/// parses, and is refused.
+/// NEGATIVE CONTROL: a decoder without its canonical check (e1083090a5) takes the respelled
+/// payload: `a respelled claim decodes`.
+#[test]
+fn a_respelled_claim_record_is_refused() {
+    let canonical = encode(&command(&[7; 16], &row(1, at(D, 60))).unwrap()).unwrap();
+    assert!(decode(&canonical).is_ok());
+    assert_eq!(canonical.first(), Some(&b'{'));
+    let mut respelled = vec![b'{', b' '];
+    respelled.extend_from_slice(&canonical[1..]);
+    assert_eq!(
+        Command::decode(&respelled).unwrap(),
+        Command::decode(&canonical).unwrap()
+    );
+    assert!(decode(&respelled).is_err(), "a respelled claim decodes");
+}
+
 #[test]
 fn a_reader_reads_rows_and_writes_none() {
     let lab = Lab::new(&[Role::Writer, Role::Reader]);

@@ -30,7 +30,18 @@ fn use_real_journal(world: &mut World) -> aterm_tempfile::TempDir {
         .record(&world.original, &world.old, Append::Prepare)
         .unwrap();
     journal
-        .record(&world.original, &world.old, Append::NoExec)
+        .record(
+            &world.original,
+            &world.old,
+            Append::NoExecInPhase(
+                lookup(&world.handle.ctx, &world.old)
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .resume_phase
+                    .unwrap_or(ImagePhase::Forward),
+            ),
+        )
         .unwrap();
     world.facts.native_journal = Some(journal);
     home

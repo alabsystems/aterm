@@ -29,6 +29,9 @@ use super::fixture::{
     trust_repo, version_text,
 };
 
+#[path = "bundle_mc_toolchain.rs"]
+mod mc_toolchain;
+
 fn native(body: &str) -> Vec<u8> {
     let mut b = elf(EM_AARCH64, 2, 1);
     b.extend(body.as_bytes());

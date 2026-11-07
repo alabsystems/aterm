@@ -400,13 +400,24 @@ const WHOLE_FRAME_GATES: &[WholeFrameGate] = &[
     },
 ];
 
-const CONTROL_LANE_ENTRIES: &[WholeFrameGate] = &[WholeFrameGate {
-    symbol: "serve_here",
-    def_file: "crates/aterm-gui/src/control_lanes.rs",
-    justification: "A control connection is served here, by `Lanes::drive` on the lane thread \
-        `spawn_lane_thread` started for it (or the wait lane it was handed to); the event loop \
-        never serves a connection, it only posts to the lanes.",
-}];
+/// A fn the event loop only starts a thread for, which the lexical call graph reads as a call: what
+/// it reaches runs off the loop, so a whole-frame read there parks that thread alone.
+const OFF_LOOP_ENTRIES: &[WholeFrameGate] = &[
+    WholeFrameGate {
+        symbol: "serve_here",
+        def_file: "crates/aterm-gui/src/control_lanes.rs",
+        justification: "A control connection is served here, by `Lanes::drive` on the lane thread \
+            `spawn_lane_thread` started for it (or the wait lane it was handed to); the event loop \
+            never serves a connection, it only posts to the lanes.",
+    },
+    WholeFrameGate {
+        symbol: "run_worker_launch",
+        def_file: "crates/aterm-gui/src/task_launch.rs",
+        justification: "A worker's launch is prepared here, on the `aterm-worker-<local>` thread \
+            `launch_worker` spawns for it and nowhere else; the event loop only starts that \
+            thread.",
+    },
+];
 
 fn first_naming<'a>(
     body: &'a [String],
@@ -1374,11 +1385,11 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
             failures += 1;
         }
     }
-    for e in CONTROL_LANE_ENTRIES {
+    for e in OFF_LOOP_ENTRIES {
         if e.justification.trim().is_empty() || !fn_defined_in(root, e.def_file, e.symbol) {
             let _ = writeln!(
                 log,
-                "  ✗ FAIL [OB-23] control-lane entry `{}` is unjustified or no longer defined in \
+                "  ✗ FAIL [OB-23] off-loop entry `{}` is unjustified or no longer defined in \
                  {}: update def_file if it moved, or remove the entry.",
                 e.symbol, e.def_file
             );
@@ -1395,7 +1406,7 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
         .collect();
     while let Some(cur) = queue.pop_front() {
         for callee in &edges[cur] {
-            if CONTROL_LANE_ENTRIES.iter().any(|e| e.symbol == callee) {
+            if OFF_LOOP_ENTRIES.iter().any(|e| e.symbol == callee) {
                 continue;
             }
             for &cidx in by_name.get(callee).map(Vec::as_slice).unwrap_or(&[]) {
@@ -2021,6 +2032,10 @@ fn table() -> [f32; 256] {
                 "fn serve_here() {\n    cmd_text(term);\n}\n\
                  fn cmd_text() {\n    let t = crate::term_lock_whole(term);\n}\n"
                     .to_string(),
+            ),
+            (
+                "crates/aterm-gui/src/task_launch.rs".to_string(),
+                "fn run_worker_launch() {}\n".to_string(),
             ),
         ]
     }

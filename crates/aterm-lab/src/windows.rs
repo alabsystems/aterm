@@ -69,10 +69,79 @@ pub const VIRTIO: (&str, &str) = (
 pub const NETKVM_DIR: &str = "NetKVM/w11/ARM64";
 
 const INSTALL_WITHIN: Duration = Duration::from_secs(2 * 3600);
-const BOOT_WITHIN: Duration = Duration::from_secs(15 * 60);
+/// How long a boot (to SSH), or a shutdown whose state is kept, is waited for while the guest
+/// keeps working ([`Progress`]): a backstop for a guest that works and never answers. A hang is
+/// read sooner, at [`STALL_AFTER`]. At 15 minutes a boot on this Mac at a load average of
+/// 118-133 (each of the guest's six vCPUs given about a quarter of a core) was given up while it
+/// read and wrote its disk the whole time, and its Windows then shut down at the power button
+/// (2026-10-30).
+const BOOT_WITHIN: Duration = Duration::from_secs(60 * 60);
 const STOP_WITHIN: Duration = Duration::from_secs(5 * 60);
-const GONE_WITHIN: Duration = Duration::from_secs(5 * 60);
 const DESKTOP_WITHIN: Duration = Duration::from_secs(guest::DESKTOP_WITHIN_SECS);
+/// How long Windows is given to take a shutdown asked for over SSH (`shutdown /s` returns at
+/// once): a hang detector, past which ACPI's power button asks instead. A guest paused while
+/// the ask's SSH session was open held it over three minutes (2026-10-29).
+const ASK_WITHIN: Duration = Duration::from_secs(30);
+/// How long a boot or a shutdown may show no progress (no answer on SSH, and no operation on the
+/// VM's drives, [`Progress`]) before the guest is read as hung. A Windows that boots reads its
+/// drivers and hives and writes its logs, and one that shuts down flushes, even starved: a boot
+/// at a load average of 118-133 did about 50 operations a second (2026-10-30). Twice a restart
+/// hung in the firmware at "Start boot option", one vCPU at 100 %, for the whole 15-minute hang
+/// detector (2026-10-21, `docs/measured/windows-smoke-2026-10-21.md` and
+/// `windows-wb2-2026-10-21.md`).
+const STALL_AFTER: Duration = Duration::from_secs(3 * 60);
+/// How long `ssh` is given to connect and finish its handshake for a command that must run: a
+/// one-minute hang detector, not a latency budget. At 10 s a provisioning step failed on a loaded
+/// Mac ("Connection timed out during banner exchange", 2026-10-30) nine seconds after the step
+/// before it ran.
+const CONNECT_WITHIN: Duration = Duration::from_secs(60);
+/// The same for a poll that asks again ([`answers`] while a boot is waited for), so a guest whose
+/// network is not up yet holds one poll no longer than this.
+const POLL_CONNECT_WITHIN: Duration = Duration::from_secs(10);
+
+/// How a wait for the guest gives up: past `within`, or, where `stall` is set, once the guest
+/// has shown no progress for that long ([`Progress`]); it looks every `look`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Patience {
+    within: Duration,
+    stall: Option<Duration>,
+    look: Duration,
+}
+
+impl Patience {
+    /// Windows' install: no stall is read; Setup is given its two hours.
+    const INSTALL: Patience = Patience {
+        within: INSTALL_WITHIN,
+        stall: None,
+        look: Duration::from_secs(10),
+    };
+    /// A boot, to SSH.
+    const BOOT: Patience = Patience {
+        within: BOOT_WITHIN,
+        stall: Some(STALL_AFTER),
+        look: Duration::from_secs(10),
+    };
+    /// A shutdown that `down` or a run's end asks for.
+    const STOP: Patience = Patience {
+        within: STOP_WITHIN,
+        stall: Some(STALL_AFTER),
+        look: Duration::from_secs(2),
+    };
+    /// A shutdown whose state is kept: a restart's, on whose way down Windows may service a
+    /// pending install, as long as a restart takes, and the provisioned guest's before its
+    /// snapshot, which a stop by force would lose. It has a boot's time while it shows progress.
+    const KEEP: Patience = Patience {
+        within: BOOT_WITHIN,
+        stall: Some(STALL_AFTER),
+        look: Duration::from_secs(2),
+    };
+    /// A guest already read as hung: nothing is asked of it, and its QEMU is ended at once.
+    const NOW: Patience = Patience {
+        within: Duration::ZERO,
+        stall: None,
+        look: Duration::from_millis(200),
+    };
+}
 
 const BOOT_KEYS_FOR: Duration = Duration::from_secs(12);
 
@@ -81,7 +150,8 @@ pub const USAGE: &str = "\
 targo --unverified lab windows [--no-wait] [--admit wait|now] <verb> — the Windows runtime lane: a QEMU VM (hvf, Windows
 11 arm64, Prism for x86_64). One run holds the VM at a time: a verb that finds it held waits for that run to end, naming it
 (pid, verb, checkout, since when) as the wait starts and once a minute; --no-wait answers NOT RUN at once instead, naming
-it. A verb that boots the VM first claims the disk its boots write (what the last ones wrote, else 35 GiB less what the
+it. A verb that boots the VM first takes its turn to boot, waiting for a run that boots it to end (one run of the VM
+claims its disk at a time), then claims the disk its boots write (what the last ones wrote, else 35 GiB less what the
 VM's directory holds) and waits for room before it waits for the lane, a line a minute naming the need and the holders;
 once it holds the lane, the boot claims the guest's 8 GiB and 6 vCPUs in this Mac's capacity ledger (`aterm pkg capacity`)
 and waits while they do not fit with 8 GiB to spare beside them, naming the claims that hold the room once a minute (NOT
@@ -284,7 +354,14 @@ impl Layout {
     pub fn provisioned(&self) -> PathBuf {
         self.home.join("provisioned")
     }
-    /// One run at a time.
+    /// Present from a boot of the snapshot until the disk, the firmware variables and the TPM
+    /// state are reverted to it (or a new snapshot is taken): they may hold writes it does not.
+    #[must_use]
+    pub fn unreverted(&self) -> PathBuf {
+        self.home.join("unreverted")
+    }
+    /// One run at a time; a run that boots the VM takes its turn to boot beside it first
+    /// (`.boot.lock`, [`crate::linux::boot_turn_path`]).
     #[must_use]
     pub fn lock(&self) -> PathBuf {
         self.home.join(".lane.lock")
@@ -314,10 +391,17 @@ impl Layout {
     pub fn port(&self) -> PathBuf {
         self.run().join("ssh-port")
     }
-    /// The VM's screen, taken while the install runs and when a wait fails.
+    /// The VM's screen (ramfb's, the firmware's), taken while the install runs, while a boot or
+    /// a shutdown is waited for, and when a wait fails.
     #[must_use]
     pub fn screen(&self) -> PathBuf {
         self.run().join("screen.png")
+    }
+    /// The virtio-gpu's screen ([`GPU_ID`]), taken with [`Layout::screen`] while a boot or a
+    /// shutdown is waited for.
+    #[must_use]
+    pub fn screen_gpu(&self) -> PathBuf {
+        self.run().join("screen-gpu.png")
     }
     /// The run that booted the VM ([`crate::vm_admit::Booter`]).
     #[must_use]
@@ -1043,8 +1127,13 @@ fn start(l: &Layout, t: &Tools, boot: &Boot) -> Result<(), String> {
         l.tpm_pid(),
         l.port(),
         l.screen(),
+        l.screen_gpu(),
     ] {
         let _ = std::fs::remove_file(f);
+    }
+    if snapshot_plan(l).is_some() {
+        crate::util::atomic_write(&l.unreverted(), b"a boot of the snapshot\n")
+            .map_err(|e| format!("{}: {e}", l.unreverted().display()))?;
     }
     std::fs::create_dir_all(l.tpm()).map_err(|e| format!("{}: {e}", l.tpm().display()))?;
     let out = run(&t.swtpm, &swtpm_args(l), None);
@@ -1127,11 +1216,97 @@ pub fn qmp(l: &Layout, commands: &[String]) -> Result<Vec<aterm_json::Value>, St
 }
 
 fn screendump(l: &Layout) {
-    let cmd = format!(
-        "{{\"execute\":\"screendump\",\"arguments\":{{\"filename\":{},\"format\":\"png\"}}}}",
-        aterm_json::to_string(&aterm_json::Value::String(lossy(&l.screen()))).unwrap_or_default()
+    let _ = qmp(
+        l,
+        &[crate::windows_desk::screendump_command(
+            &lossy(&l.screen()),
+            None,
+        )],
     );
-    let _ = qmp(l, &[cmd]);
+}
+
+/// Both of the VM's screens written where [`screens_said`] names them ([`Layout::screen`],
+/// [`Layout::screen_gpu`]): what the guest shows as a wait says how it goes.
+fn screendumps(l: &Layout) {
+    let _ = qmp(
+        l,
+        &[
+            crate::windows_desk::screendump_command(&lossy(&l.screen()), None),
+            crate::windows_desk::screendump_command(&lossy(&l.screen_gpu()), Some(GPU_ID)),
+        ],
+    );
+}
+
+/// The operations the VM's drives have done since its QEMU started, as QMP's `query-blockstats`
+/// counts them: every drive's reads, writes and flushes (the disk's, the firmware variables'),
+/// summed. `None` where QMP did not answer.
+fn disk_operations(l: &Layout) -> Option<u64> {
+    let answers = qmp(l, &["{\"execute\":\"query-blockstats\"}".to_string()]).ok()?;
+    let drives = answers.first()?.get("return")?.as_array()?;
+    Some(
+        drives
+            .iter()
+            .filter_map(|d| d.get("stats"))
+            .flat_map(|s| {
+                ["rd_operations", "wr_operations", "flush_operations"]
+                    .map(|k| s.get(k).and_then(aterm_json::Value::as_u64).unwrap_or(0))
+            })
+            .sum(),
+    )
+}
+
+/// The guest's work as a wait last read it ([`disk_operations`]), and since when it has read so:
+/// a guest whose drives do nothing shows no progress. Its screens are no sign of it: at "Start
+/// boot option", where both hung restarts stood, Windows' boot spinner turns, and it turned
+/// through a boot that read and wrote its disk for 15 minutes (2026-10-30).
+#[derive(Debug)]
+struct Progress {
+    last: Option<u64>,
+    since: Instant,
+}
+
+impl Progress {
+    /// No look taken yet: the guest counts as idle from `now`.
+    fn from(now: Instant) -> Progress {
+        Progress {
+            last: None,
+            since: now,
+        }
+    }
+
+    /// The guest's drives had done `ops` operations at `now` (`None`: QMP did not say, read as
+    /// no change): how long they have done none.
+    fn saw(&mut self, ops: Option<u64>, now: Instant) -> Duration {
+        match (self.last, ops) {
+            (Some(last), Some(now_ops)) if now_ops != last => {
+                self.last = ops;
+                self.since = now;
+            }
+            (None, Some(_)) => self.last = ops,
+            _ => {}
+        }
+        now.saturating_duration_since(self.since)
+    }
+
+    /// [`Progress::saw`] the guest's drives as they read now ([`disk_operations`]).
+    fn look(&mut self, l: &Layout) -> Duration {
+        let ops = disk_operations(l);
+        self.saw(ops, Instant::now())
+    }
+
+    /// The operations the drives had done at the last look that read them.
+    fn done(&self) -> Option<u64> {
+        self.last
+    }
+}
+
+/// `its screens: <ramfb's>, <the virtio-gpu's>`.
+fn screens_said(l: &Layout) -> String {
+    format!(
+        "its screens: {}, {}",
+        l.screen().display(),
+        l.screen_gpu().display()
+    )
 }
 
 fn press_through_boot_prompt(l: &Layout) {
@@ -1151,6 +1326,8 @@ pub struct Ssh {
     pub port: u16,
     /// [`guest::USER`] (the administrator: install, provisioning, shutdown) or [`guest::RUNNER`].
     pub user: &'static str,
+    /// `ssh`'s `ConnectTimeout`: [`CONNECT_WITHIN`], or [`POLL_CONNECT_WITHIN`] for a poll.
+    pub connect_within: Duration,
 }
 
 impl Ssh {
@@ -1162,6 +1339,7 @@ impl Ssh {
             known_hosts: l.known_hosts(),
             port,
             user: guest::USER,
+            connect_within: CONNECT_WITHIN,
         }
     }
 
@@ -1170,6 +1348,15 @@ impl Ssh {
     pub fn runner(&self) -> Ssh {
         Ssh {
             user: guest::RUNNER,
+            ..self.clone()
+        }
+    }
+
+    /// The same connection for a poll that asks again: given [`POLL_CONNECT_WITHIN`] to connect.
+    #[must_use]
+    pub fn polling(&self) -> Ssh {
+        Ssh {
+            connect_within: POLL_CONNECT_WITHIN,
             ..self.clone()
         }
     }
@@ -1198,7 +1385,7 @@ impl Ssh {
             "-o".into(),
             "BatchMode=yes".into(),
             "-o".into(),
-            "ConnectTimeout=10".into(),
+            format!("ConnectTimeout={}", self.connect_within.as_secs()),
             "-o".into(),
             "ServerAliveInterval=15".into(),
             "-o".into(),
@@ -1234,6 +1421,16 @@ impl Ssh {
     #[must_use]
     pub fn run(&self, command: &str) -> Out {
         run(Path::new("/usr/bin/ssh"), &self.argv(command), None)
+    }
+
+    /// Whether `command` ran in the guest and exited 0 within `within`: ssh is ended at the
+    /// limit, so a guest that hangs while it is asked (its SSH session open, nothing answering)
+    /// holds the asker no longer than that.
+    #[must_use]
+    pub fn ran_within(&self, command: &str, within: Duration) -> bool {
+        let mut cmd = aterm_uds::spawnfd::command("/usr/bin/ssh");
+        cmd.args(self.argv(command));
+        aterm_uds::deadline::output_within(&mut cmd, within).is_ok_and(|o| o.status.success())
     }
 
     /// Run the PowerShell `script` in the guest, captured, with no progress records.
@@ -1341,68 +1538,212 @@ fn answers(ssh: &Ssh) -> bool {
     out.ok() && out.text.contains("lane-ok")
 }
 
-fn wait_ssh(l: &Layout, ssh: &Ssh, limit: Duration, what: &str) -> Result<f64, String> {
+/// `d` as the lane says a wait: whole minutes as `N min`, else seconds.
+fn span(d: Duration) -> String {
+    let s = d.as_secs();
+    if s >= 60 && s.is_multiple_of(60) {
+        format!("{} min", s / 60)
+    } else {
+        format!("{s} s")
+    }
+}
+
+/// Wait until `answered` (the guest answers on SSH) while `what`, within `p`. Where `p` reads a
+/// stall, a guest that shows no progress for it (no answer, and no operation on its drives) is
+/// hung, as twice in the firmware: it is started afresh through `relaunch` once, a step of the
+/// boot and not a retry of a check, and at a second stall its QEMU is ended at once. Once a
+/// minute it says how long it has waited and, reading a stall, how many operations the guest's
+/// drives did in that minute.
+/// # Errors
+/// QEMU exited, the guest did not answer within `p.within`, it stalled again after its relaunch
+/// (its QEMU then ended), or the relaunch failed.
+fn wait_answer(
+    l: &Layout,
+    p: Patience,
+    what: &str,
+    answered: &mut dyn FnMut() -> bool,
+    relaunch: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<f64, String> {
     let t0 = Instant::now();
+    let mut progress = Progress::from(t0);
+    let mut relaunched = false;
     let mut said = Duration::ZERO;
+    let mut said_done = None;
     loop {
-        if answers(ssh) {
+        if answered() {
             return Ok(t0.elapsed().as_secs_f64());
         }
         if running(l)?.is_none() {
             return Err(format!("QEMU exited while {what}"));
         }
         let waited = t0.elapsed();
-        if waited > limit {
-            screendump(l);
+        if waited > p.within {
+            screendumps(l);
             return Err(format!(
-                "the guest did not answer on SSH within {} min while {what}; its screen: {}",
-                limit.as_secs() / 60,
-                l.screen().display()
+                "the guest did not answer on SSH within {} while {what}; {}",
+                span(p.within),
+                screens_said(l)
             ));
+        }
+        if let Some(stall) = p.stall {
+            let still = progress.look(l);
+            if still >= stall {
+                screendumps(l);
+                let hung = format!(
+                    "no answer on SSH and no operation on the VM's drives for {} s while {what} \
+                     ({}): the guest is hung, as twice in its firmware",
+                    still.as_secs(),
+                    screens_said(l)
+                );
+                if relaunched {
+                    let ended = stop(l, None, Patience::NOW).map_or_else(
+                        |e| format!("its QEMU did not end: {e}"),
+                        |s| format!("the VM {s}"),
+                    );
+                    return Err(format!(
+                        "{hung}, again after it was started afresh; {ended}"
+                    ));
+                }
+                println!(
+                    "windows:   {hung}; it is ended and booted cold again, once (a step of the boot)"
+                );
+                relaunch().map_err(|e| format!("{hung}; started afresh, it did not start: {e}"))?;
+                relaunched = true;
+                progress = Progress::from(Instant::now());
+                said_done = None;
+                continue;
+            }
         }
         if waited >= said + Duration::from_secs(60) {
             said = waited;
+            let work = match (said_done, progress.done()) {
+                (Some(then), Some(now)) if p.stall.is_some() => {
+                    format!(
+                        "{} operations on its drives in the last minute; ",
+                        now.saturating_sub(then)
+                    )
+                }
+                _ => String::new(),
+            };
+            said_done = progress.done();
             screendump(l);
             println!(
-                "windows:   {what}: {} min (screen: {})",
+                "windows:   {what}: {} min ({work}screen: {})",
                 waited.as_secs() / 60,
                 l.screen().display()
             );
         }
-        std::thread::sleep(Duration::from_secs(10));
+        std::thread::sleep(p.look);
     }
 }
 
-fn stop(l: &Layout, ssh: Option<&Ssh>) -> Result<(), String> {
+/// How [`stop`] left the VM.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Stopped {
+    /// No QEMU of this VM's ran.
+    NotRunning,
+    /// Windows shut down as it was asked.
+    ShutDown,
+    /// Its captured QEMU was ended from outside (QMP's `quit`, then SIGKILL) and is gone: why.
+    Forced(String),
+}
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Stopped::NotRunning => f.write_str("was not running"),
+            Stopped::ShutDown => f.write_str("stopped (Windows shut down)"),
+            Stopped::Forced(why) => write!(f, "stopped by force ({why})"),
+        }
+    }
+}
+
+/// Stop the VM. Windows is asked to shut down (over SSH as its administrator when `ssh` answers,
+/// else by ACPI's power button through QMP) and given `p.within`, or less where it shows no
+/// progress for `p.stall` ([`Progress`]: a guest hung in its firmware ignores the button); with
+/// [`Patience::NOW`] nothing is asked. A guest that did not shut down is ended through QMP's
+/// `quit`, then SIGKILL of its captured QEMU, which must then be gone within a minute (a hang
+/// detector). swtpm ends with QEMU's connection.
+/// # Errors
+/// QEMU or swtpm does not read as this VM's, or QEMU outlived its SIGKILL: their state is
+/// preserved.
+fn stop(l: &Layout, ssh: Option<&Ssh>, p: Patience) -> Result<Stopped, String> {
     let Some(process) = daemon(l, Daemon::Qemu)? else {
-        return stop_swtpm(l);
+        stop_swtpm(l)?;
+        return Ok(Stopped::NotRunning);
     };
-    let asked = ssh.is_some_and(|s| s.run("shutdown /s /t 0 /f").ok());
-    if !asked {
-        let _ = qmp(l, &["{\"execute\":\"system_powerdown\"}".to_string()]);
-    }
-    let t0 = Instant::now();
-    // A QEMU that ends at once is seen to end at once; a guest that takes its time is looked
-    // at every 2 s.
-    let mut step = Duration::from_millis(25);
-    while process.still_here(l, Daemon::Qemu)? && t0.elapsed() < STOP_WITHIN {
-        std::thread::sleep(step);
-        step = step.saturating_mul(2).min(Duration::from_secs(2));
-    }
     let mut forced = None;
-    if process.still_here(l, Daemon::Qemu)? {
-        screendump(l);
-        let _ = qmp(l, &["{\"execute\":\"quit\"}".to_string()]);
-        std::thread::sleep(Duration::from_secs(5));
-        process.signal(l, Daemon::Qemu, libc::SIGKILL)?;
-        forced = Some(format!(
-            "Windows did not shut down within {} min; a stop was attempted only for its captured QEMU identity (screen: {}); state preserved",
-            STOP_WITHIN.as_secs() / 60,
-            l.screen().display()
-        ));
+    if p.within.is_zero() {
+        forced = Some("ended at once".to_string());
+    } else {
+        // The drives as they were before Windows was asked: a guest that shows no progress
+        // from here on, the ask's own time included, is hung.
+        let t0 = Instant::now();
+        let mut progress = Progress::from(t0);
+        if p.stall.is_some() {
+            progress.look(l);
+        }
+        let asked = ssh.is_some_and(|s| s.ran_within("shutdown /s /t 0 /f", ASK_WITHIN));
+        if !asked {
+            let _ = qmp(l, &["{\"execute\":\"system_powerdown\"}".to_string()]);
+        }
+        // A QEMU that ends at once is seen to end at once; a guest that takes its time is
+        // looked at every `p.look`.
+        let mut step = Duration::from_millis(25).min(p.look);
+        while process.still_here(l, Daemon::Qemu)? {
+            if t0.elapsed() >= p.within {
+                screendumps(l);
+                forced = Some(format!(
+                    "Windows did not shut down within {}; {}",
+                    span(p.within),
+                    screens_said(l)
+                ));
+                break;
+            }
+            if let Some(stall) = p.stall {
+                let still = progress.look(l);
+                if still >= stall {
+                    screendumps(l);
+                    forced = Some(format!(
+                        "Windows showed no sign of shutting down for {} s, no operation on its \
+                         drives; {}",
+                        still.as_secs(),
+                        screens_said(l)
+                    ));
+                    break;
+                }
+            }
+            std::thread::sleep(step);
+            step = step.saturating_mul(2).min(p.look);
+        }
+    }
+    if let Some(why) = &forced {
+        if process.still_here(l, Daemon::Qemu)? {
+            if p.within.is_zero() {
+                screendumps(l);
+            }
+            let _ = qmp(l, &["{\"execute\":\"quit\"}".to_string()]);
+            let t0 = Instant::now();
+            while process.still_here(l, Daemon::Qemu)? && t0.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            process.signal(l, Daemon::Qemu, libc::SIGKILL)?;
+            let t0 = Instant::now();
+            while process.still_here(l, Daemon::Qemu)? {
+                if t0.elapsed() >= Duration::from_secs(60) {
+                    return Err(format!(
+                        "{why}; its QEMU (pid {}) outlived its SIGKILL by a minute; state preserved",
+                        process.pid
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        } else if !p.within.is_zero() {
+            forced = None;
+        }
     }
     stop_swtpm(l)?;
-    forced.map_or(Ok(()), Err)
+    Ok(forced.map_or(Stopped::ShutDown, Stopped::Forced))
 }
 
 fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
@@ -1437,7 +1778,8 @@ fn snapshot(l: &Layout, t: &Tools, fingerprint: &str) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", l.vars().display()))?;
     copy_dir(&l.tpm(), &l.tpm_saved())?;
     crate::util::atomic_write(&l.provisioned(), format!("{fingerprint}\n").as_bytes())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    reverted(l)
 }
 
 fn revert(l: &Layout, t: &Tools) -> Result<(), String> {
@@ -1451,7 +1793,31 @@ fn revert(l: &Layout, t: &Tools) -> Result<(), String> {
     }
     crate::util::copy_regular_file(l.vars_saved(), l.vars())
         .map_err(|e| format!("{}: {e}", l.vars_saved().display()))?;
-    copy_dir(&l.tpm_saved(), &l.tpm())
+    copy_dir(&l.tpm_saved(), &l.tpm())?;
+    reverted(l)
+}
+
+/// The VM's state is its snapshot's: [`Layout::unreverted`] goes.
+fn reverted(l: &Layout) -> Result<(), String> {
+    match std::fs::remove_file(l.unreverted()) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(format!("{}: {e}", l.unreverted().display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Revert a stopped VM whose state may hold writes no run reverted ([`Layout::unreverted`]: a
+/// revert that failed after its stop, or a Mac that went down under a running VM) to its
+/// snapshot, so no run boots them. Whether it did.
+/// # Errors
+/// The revert's.
+fn revert_unreverted(l: &Layout, t: &Tools) -> Result<bool, String> {
+    if !l.unreverted().exists() || snapshot_plan(l).is_none() {
+        return Ok(false);
+    }
+    revert(l, t)?;
+    Ok(true)
 }
 
 fn snapshot_plan(l: &Layout) -> Option<String> {
@@ -1716,17 +2082,23 @@ fn install(l: &Layout, t: &Tools, timings: &mut Vec<(String, f64)>) -> Result<Ss
     .map_err(not_run)?;
     press_through_boot_prompt(l);
     let ssh = Ssh::new(l, port);
-    match wait_ssh(l, &ssh, INSTALL_WITHIN, "installing") {
+    match wait_answer(
+        l,
+        Patience::INSTALL,
+        "installing",
+        &mut || answers(&ssh.polling()),
+        &mut || Ok(()),
+    ) {
         Ok(secs) => timings.push(("install and first logon".into(), secs)),
         Err(e) => {
-            let _ = stop(l, None);
+            let _ = stop(l, None, Patience::STOP);
             return Err(not_run(e));
         }
     }
     let done = ssh.run(&format!("type {}", guest::FIRST_LOGON_DONE));
     if !done.ok() {
         let log = ssh.run(&format!("type {}", guest::FIRST_LOGON_LOG));
-        let _ = stop(l, Some(&ssh));
+        let _ = stop(l, Some(&ssh), Patience::STOP);
         return Err(not_run(format!(
             "the first logon did not finish:\n{}",
             log.tail(20)
@@ -1736,22 +2108,49 @@ fn install(l: &Layout, t: &Tools, timings: &mut Vec<(String, f64)>) -> Result<Ss
     Ok(ssh)
 }
 
-fn reboot(l: &Layout, ssh: &Ssh) -> Result<(), String> {
-    if !ssh.run("shutdown /r /t 0 /f").ok() {
-        return Err("`shutdown /r` failed".into());
-    }
-    let t0 = Instant::now();
-    while answers(ssh) {
-        if t0.elapsed() > GONE_WITHIN {
+/// Restart Windows cold: shut down from inside with a restart's patience ([`stop`],
+/// [`Patience::KEEP`]), its QEMU gone, then booted again on the same port ([`start`]) and
+/// waited for to SSH and to `lane`'s desktop. Both restarts that hung (2026-10-21) were warm, a
+/// `shutdown /r` that resets the machine inside QEMU; no cold boot recorded has hung. `booted`
+/// runs whenever a new QEMU runs (the run's claim and its lane's record credit it).
+/// # Errors
+/// Windows did not shut down, the VM did not start or answer ([`wait_answer`]), or `lane` had no
+/// desktop.
+fn reboot(l: &Layout, t: &Tools, ssh: &Ssh, booted: &mut dyn FnMut()) -> Result<(), String> {
+    match stop(l, Some(ssh), Patience::KEEP)? {
+        Stopped::ShutDown => {}
+        other => {
             return Err(format!(
-                "Windows still answered on SSH {} min after `shutdown /r`",
-                GONE_WITHIN.as_secs() / 60
+                "Windows did not shut down to restart: the VM {other}"
             ));
         }
-        std::thread::sleep(Duration::from_secs(1));
     }
-    wait_ssh(l, ssh, BOOT_WITHIN, "restarting")?;
+    let boot = Boot {
+        install: None,
+        port: ssh.port,
+        vnc: None,
+    };
+    start(l, t, &boot)?;
+    booted();
+    wait_answer(
+        l,
+        Patience::BOOT,
+        "restarting",
+        &mut || answers(&ssh.polling()),
+        &mut || relaunch(l, t, &boot, booted),
+    )?;
     wait_desktop(ssh)
+}
+
+/// Start the VM afresh on `boot`: its QEMU ended at once ([`Patience::NOW`]), swtpm with it, both
+/// started again cold, and `booted` run.
+/// # Errors
+/// The stop's or the start's.
+fn relaunch(l: &Layout, t: &Tools, boot: &Boot, booted: &mut dyn FnMut()) -> Result<(), String> {
+    stop(l, None, Patience::NOW)?;
+    start(l, t, boot)?;
+    booted();
+    Ok(())
 }
 
 fn wait_desktop(ssh: &Ssh) -> Result<(), String> {
@@ -1827,7 +2226,16 @@ fn stage_web2(ssh: &Ssh) -> Result<(), String> {
     if put.ok() { Ok(()) } else { Err(put.tail(3)) }
 }
 
-fn provision(l: &Layout, ssh: &Ssh) -> Result<Option<f64>, Fail> {
+/// Provision the guest with the plan ([`guest::provision_steps`]) unless it holds it already:
+/// how long it took. `booted` runs whenever a restart starts a new QEMU.
+/// # Errors
+/// A step failed, or a restart did.
+fn provision(
+    l: &Layout,
+    t: &Tools,
+    ssh: &Ssh,
+    booted: &mut dyn FnMut(),
+) -> Result<Option<f64>, String> {
     let steps = guest::provision_steps();
     let want = guest::fingerprint(&steps);
     let have = ssh.run(&format!("type {}", guest::STAMP));
@@ -1837,9 +2245,9 @@ fn provision(l: &Layout, ssh: &Ssh) -> Result<Option<f64>, Fail> {
     println!("windows: provisioning the guest (plan {want}) …");
     let t0 = Instant::now();
     stage_display_driver(l, ssh)
-        .map_err(|e| not_run(format!("virtio-win's display driver did not copy: {e}")))?;
+        .map_err(|e| format!("virtio-win's display driver did not copy: {e}"))?;
     if steps.iter().any(|s| s.label == "web2") {
-        stage_web2(ssh).map_err(|e| not_run(format!("web2 did not copy: {e}")))?;
+        stage_web2(ssh).map_err(|e| format!("web2 did not copy: {e}"))?;
     }
     let runner = ssh.runner();
     for s in &steps {
@@ -1847,15 +2255,15 @@ fn provision(l: &Layout, ssh: &Ssh) -> Result<Option<f64>, Fail> {
         let by = if s.runner { &runner } else { ssh };
         let out = by.streamed(&guest::powershell_command(&s.script), "windows:     ");
         if !out.ok() {
-            return Err(not_run(format!(
+            return Err(format!(
                 "provisioning step '{}' failed:\n{}",
                 s.label,
                 out.tail(15)
-            )));
+            ));
         }
         if s.reboot {
-            println!("windows:   restarting Windows …");
-            reboot(l, ssh).map_err(|e| not_run(format!("after '{}': {e}", s.label)))?;
+            println!("windows:   restarting Windows cold (shut down, then booted) …");
+            reboot(l, t, ssh, booted).map_err(|e| format!("after '{}': {e}", s.label))?;
         }
     }
     let wrote = ssh.ps(&format!(
@@ -1864,11 +2272,11 @@ fn provision(l: &Layout, ssh: &Ssh) -> Result<Option<f64>, Fail> {
         guest::ps_quote(&want)
     ));
     if !wrote.ok() {
-        return Err(not_run(format!(
+        return Err(format!(
             "could not write {}: {}",
             guest::STAMP,
             wrote.tail(5)
-        )));
+        ));
     }
     Ok(Some(t0.elapsed().as_secs_f64()))
 }
@@ -2178,8 +2586,9 @@ fn cmd_attach(args: &[String]) -> Res {
         return Err(not_run("held VM layout is absent; preserved"));
     }
     held.check(&l)?;
-    let _lock = lane_lock(&l)?;
+    let mut lane = lane_lock(&l)?;
     let up = attach_existing(l, &held)?;
+    lane.credit(&vm_procs(&up.layout));
     held.check(&up.layout)?;
     if verb == "exec" {
         exec_on(up, parse_exec(args)?)
@@ -2378,13 +2787,15 @@ impl Up {
         env
     }
 
-    /// Shut down and revert the VM when this run booted it.
+    /// Shut down and revert the VM when this run booted it, saying how.
+    /// # Errors
+    /// [`shut_and_revert`]'s.
     pub fn release(self) -> Result<(), String> {
         if self.booted_here {
-            let stopped = shut_and_revert(&self.layout, &self.tools, Some(&self.admin));
-            crate::vm_admit::settle(self.booter.as_deref(), false, stopped.is_ok());
-            stopped?;
-            println!("windows: VM stopped and reverted to its snapshot (this run booted it)");
+            let shut =
+                shut_and_revert(&self.layout, &self.tools, Some(&self.admin), Patience::STOP);
+            crate::vm_admit::settle(self.booter.as_deref(), false, shut.is_ok());
+            println!("windows: VM {} (this run booted it)", shut?);
         }
         Ok(())
     }
@@ -2395,16 +2806,17 @@ impl Up {
     }
 }
 
-/// `down` on a running VM: Windows shut down (over SSH as its administrator where the VM
-/// recorded its port, else ACPI's power button through QMP) and the disk put back to its
-/// snapshot; its booter record goes once it has stopped.
+/// `down` on a running VM: Windows shut down within `p` (over SSH as its administrator where
+/// the VM recorded its port, else ACPI's power button through QMP), or ended from outside, and
+/// the disk put back to its snapshot either way ([`shut_and_revert`]); its booter record goes
+/// once it has stopped. How it left the VM.
 /// # Errors
 /// The VM did not stop, or the disk did not revert.
-fn down(l: &Layout, t: &Tools) -> Result<(), String> {
-    let ssh = read_port(l).map(|p| Ssh::new(l, p));
-    shut_and_revert(l, t, ssh.as_ref())?;
+fn down(l: &Layout, t: &Tools, p: Patience) -> Result<Shut, String> {
+    let ssh = read_port(l).map(|port| Ssh::new(l, port));
+    let shut = shut_and_revert(l, t, ssh.as_ref(), p)?;
     crate::vm_admit::clear(&l.booter());
-    Ok(())
+    Ok(shut)
 }
 
 /// The running VM a run adopts, if any (its QEMU's pid). One whose one-shot booter has died is
@@ -2423,13 +2835,13 @@ fn adopted(l: &Layout, t: &Tools, say: &mut dyn FnMut(&str)) -> Result<Option<i3
         "stopping {VM} left by dead run {} (QEMU pid {pid})",
         gone.describe()
     ));
-    down(l, t).map_err(|e| {
+    let shut = down(l, t, Patience::STOP).map_err(|e| {
         not_run(format!(
             "{VM}, left by dead run pid {}, did not stop: {e}",
             gone.pid
         ))
     })?;
-    say(&format!("{VM} stopped and reverted to its snapshot"));
+    say(&format!("{VM} {shut}"));
     Ok(None)
 }
 
@@ -2452,12 +2864,47 @@ fn windows_boot_run(l: &Layout) -> atpkg::admit_disk::Run {
     )
 }
 
-fn shut_and_revert(l: &Layout, t: &Tools, ssh: Option<&Ssh>) -> Result<(), String> {
-    stop(l, ssh)?;
-    if snapshot_plan(l).is_some() {
-        revert(l, t)?;
+/// How [`shut_and_revert`] left the VM: stopped as [`Stopped`] says, and reverted to its snapshot
+/// unless it has none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Shut {
+    stopped: Stopped,
+    reverted: bool,
+}
+
+impl std::fmt::Display for Shut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.stopped)?;
+        if self.reverted {
+            f.write_str(" and reverted to its snapshot")
+        } else {
+            f.write_str("; it has no snapshot to revert to")
+        }
     }
-    Ok(())
+}
+
+/// Stop the VM within `p` ([`stop`]) and put its disk, firmware variables and TPM state back to
+/// their snapshot, a stop that had to end QEMU from outside included, once that QEMU is gone.
+/// # Errors
+/// The stop's, with nothing reverted, or the revert's: the VM is then stopped and not reverted,
+/// and the next run reverts it before it boots ([`revert_unreverted`]).
+fn shut_and_revert(l: &Layout, t: &Tools, ssh: Option<&Ssh>, p: Patience) -> Result<Shut, String> {
+    let stopped = stop(l, ssh, p)?;
+    let reverted = snapshot_plan(l).is_some();
+    if reverted {
+        revert(l, t).map_err(|e| {
+            format!("{stopped}, not reverted: {e}; the next run reverts it before it boots")
+        })?;
+    }
+    Ok(Shut { stopped, reverted })
+}
+
+/// What a failed boot or provisioning left: [`shut_and_revert`]'s outcome, said.
+fn left(shut: &Result<Shut, String>) -> String {
+    match shut {
+        Ok(shut) => format!("the VM {shut}"),
+        Err(e) => format!("the VM: {e}"),
+    }
 }
 
 fn boot(l: &Layout, t: &Tools, vnc: bool, timings: &mut Vec<(String, f64)>) -> Result<Ssh, Fail> {
@@ -2468,25 +2915,27 @@ fn boot(l: &Layout, t: &Tools, vnc: bool, timings: &mut Vec<(String, f64)>) -> R
         None
     };
     println!("windows: booting {VM} …");
-    start(
-        l,
-        t,
-        &Boot {
-            install: None,
-            port,
-            vnc,
-        },
-    )
-    .map_err(not_run)?;
+    let boot = Boot {
+        install: None,
+        port,
+        vnc,
+    };
+    start(l, t, &boot).map_err(not_run)?;
     if let Some(p) = vnc {
         println!("windows: VNC on 127.0.0.1:{p}");
     }
     let ssh = Ssh::new(l, port);
-    match wait_ssh(l, &ssh, BOOT_WITHIN, "booting") {
+    match wait_answer(
+        l,
+        Patience::BOOT,
+        "booting",
+        &mut || answers(&ssh.polling()),
+        &mut || relaunch(l, t, &boot, &mut || {}),
+    ) {
         Ok(secs) => timings.push(("boot".into(), secs)),
         Err(e) => {
-            let _ = shut_and_revert(l, t, None);
-            return Err(not_run(e));
+            let shut = shut_and_revert(l, t, None, Patience::STOP);
+            return Err(not_run(format!("{e}; {}", left(&shut))));
         }
     }
     Ok(ssh)
@@ -2510,10 +2959,12 @@ fn end_leftovers(admin: &Ssh) {
     }
 }
 
-/// Make the VM if there is none, boot it, and provision it when its snapshot is not the plan's.
+/// Make the VM if there is none, boot it, and provision it when its snapshot is not the plan's,
+/// under `lane`, which this run holds: each VM it finds or boots is named in the lane's record
+/// ([`LaneLock::credit`]), before any guest step.
 /// # Errors
 /// NOT RUN: a tool or an image missing, or the VM could not be made, booted or provisioned.
-pub fn bring_up(vnc: bool) -> Result<Up, Fail> {
+pub fn bring_up(lane: &mut LaneLock, vnc: bool) -> Result<Up, Fail> {
     let tools = Tools::find()?;
     let l = Layout::find()?;
     let mut timings = Vec::new();
@@ -2528,6 +2979,7 @@ pub fn bring_up(vnc: bool) -> Result<Up, Fail> {
                 guest::RUNNER
             )));
         }
+        lane.credit(&vm_procs(&l));
         end_leftovers(&admin);
         return Ok(Up {
             layout: l,
@@ -2543,6 +2995,12 @@ pub fn bring_up(vnc: bool) -> Result<Up, Fail> {
     let mut admitted = crate::vm_admit::admit(&crate::vm_admit::WINDOWS, true)?;
     let booter = crate::vm_admit::record_boot("windows", &l.booter());
     stop_swtpm(&l).map_err(not_run)?;
+    if revert_unreverted(&l, &tools).map_err(not_run)? {
+        println!(
+            "windows: {VM}'s disk held writes no run reverted (a revert that failed, or a Mac \
+             that went down under the VM): reverted to its snapshot before it boots"
+        );
+    }
     let want = guest::fingerprint(&guest::provision_steps());
     if snapshot_plan(&l).as_deref() != Some(want.as_str()) {
         let ssh = if l.installed().is_file() && l.disk().is_file() {
@@ -2550,32 +3008,55 @@ pub fn bring_up(vnc: bool) -> Result<Up, Fail> {
         } else {
             install(&l, &tools, &mut timings)?
         };
-        admitted.credit("windows", &vm_procs(&l));
-        match provision(&l, &ssh) {
+        let procs = vm_procs(&l);
+        admitted.credit("windows", &procs);
+        lane.credit(&procs);
+        match provision(&l, &tools, &ssh, &mut || {
+            let procs = vm_procs(&l);
+            admitted.credit("windows", &procs);
+            lane.credit(&procs);
+        }) {
             Ok(Some(secs)) => timings.push(("provision".into(), secs)),
             Ok(None) => {}
-            Err(f) => {
-                let _ = shut_and_revert(&l, &tools, Some(&ssh));
-                return Err(f);
+            Err(e) => {
+                let shut = shut_and_revert(&l, &tools, Some(&ssh), Patience::STOP);
+                return Err(not_run(format!("{e}; {}", left(&shut))));
             }
         }
         let t0 = Instant::now();
-        stop(&l, Some(&ssh)).map_err(not_run)?;
+        match stop(&l, Some(&ssh), Patience::KEEP).map_err(not_run)? {
+            Stopped::Forced(why) => {
+                // `start` marks the disk unreverted only when an earlier snapshot exists.
+                let next = if l.unreverted().exists() && snapshot_plan(&l).is_some() {
+                    "the next run reverts the disk to its earlier snapshot before it boots"
+                } else {
+                    "with no earlier snapshot to revert to, the next run provisions this disk again"
+                };
+                return Err(not_run(format!(
+                    "the provisioned guest did not shut down for its snapshot ({why}): no snapshot \
+                     was taken, and {next}"
+                )));
+            }
+            Stopped::NotRunning | Stopped::ShutDown => {}
+        }
         timings.push(("shut down".into(), t0.elapsed().as_secs_f64()));
         let t0 = Instant::now();
         snapshot(&l, &tools, &want).map_err(not_run)?;
         timings.push(("snapshot".into(), t0.elapsed().as_secs_f64()));
     }
     let admin = boot(&l, &tools, vnc, &mut timings)?;
-    admitted.credit("windows", &vm_procs(&l));
+    let procs = vm_procs(&l);
+    admitted.credit("windows", &procs);
+    lane.credit(&procs);
     crate::vm_admit::record_vm(booter.as_deref(), qemu(&l));
     let ssh = admin.runner();
     if !answers(&ssh) {
-        let _ = shut_and_revert(&l, &tools, Some(&admin));
+        let shut = shut_and_revert(&l, &tools, Some(&admin), Patience::STOP);
         return Err(not_run(format!(
             "the guest answers its administrator but not {} on SSH (made by the first logon: `{LAB} windows destroy` \
-             and `up` again)",
-            guest::RUNNER
+             and `up` again); {}",
+            guest::RUNNER,
+            left(&shut)
         )));
     }
     Ok(Up {
@@ -2604,16 +3085,19 @@ fn vm_procs(l: &Layout) -> Vec<u32> {
     crate::vm_admit::vm_procs(&l.disk(), qemu(l).as_slice())
 }
 
-/// [`lane_lock`] for a run that boots the VM: QEMU and swtpm found, then the boot's disk claimed
-/// ([`crate::linux::claim_boot_disk`]) before the lane is waited for, so no run holds the lane
-/// while it waits for disk. The claim is held, and the VM's directory measured, until the lock
-/// is let go at the run's end.
+/// [`lane_lock`] for a run that boots the VM: QEMU and swtpm found, the VM's turn to boot taken
+/// ([`LaneLock::turn`]), then the boot's disk claimed ([`crate::linux::claim_boot_disk`]) before
+/// the lane is waited for, so no run holds the lane while it waits for disk, and runs of the VM
+/// queued behind one that boots it claim no disk until it is over. The turn and the claim are
+/// held, and the VM's directory measured, until the lock is let go at the run's end.
 /// # Errors
-/// A tool missing, the claim's NOT RUN, or [`lane_lock`]'s.
+/// A tool missing, the turn's or the claim's NOT RUN, or [`lane_lock`]'s.
 pub fn boot_lane(l: &Layout) -> Result<LaneLock, Fail> {
     Tools::find()?;
+    home(l)?;
     LaneLock::boot_with(
         "windows",
+        || LaneLock::turn(&l.lock(), "windows"),
         || crate::linux::claim_boot_disk("windows", windows_boot_run(l)),
         || lane_lock(l),
     )
@@ -2624,9 +3108,14 @@ pub fn boot_lane(l: &Layout) -> Result<LaneLock, Fail> {
 /// `--no-wait` and another run holds it (NOT RUN, naming it), an interrupt while waiting, or the
 /// lock file cannot be made.
 pub fn lane_lock(l: &Layout) -> Result<LaneLock, Fail> {
-    crate::util::create_private_dir_all(&l.home)
-        .map_err(|e| Fail::die(format!("{}: {e}", l.home.display())))?;
+    home(l)?;
     LaneLock::at(&l.lock(), "windows")
+}
+
+/// The VM's directory, private, where its locks are.
+fn home(l: &Layout) -> Result<(), Fail> {
+    crate::util::create_private_dir_all(&l.home)
+        .map_err(|e| Fail::die(format!("{}: {e}", l.home.display())))
 }
 
 /// One file of the working tree: its path (forward slashes), size and modification time.
@@ -2919,7 +3408,7 @@ fn cmd_up(args: &[String]) -> Res {
         }
     };
     let l = Layout::find()?;
-    let _lock = boot_lane(&l)?;
+    let mut lane = boot_lane(&l)?;
     if vnc
         && running(&l).map_err(Fail::die)?.is_some()
         && crate::vm_admit::leftover(&l.booter()).is_none()
@@ -2928,7 +3417,7 @@ fn cmd_up(args: &[String]) -> Res {
             "windows up --vnc: the VM is already running without VNC; `windows down` first",
         ));
     }
-    let up = bring_up(vnc)?;
+    let up = bring_up(&mut lane, vnc)?;
     for (name, secs) in &up.timings {
         println!("windows: {name} {secs:.1} s");
     }
@@ -2946,11 +3435,19 @@ fn cmd_down() -> Res {
     let _lock = lane_lock(&l)?;
     if running(&l).map_err(Fail::die)?.is_none() {
         stop_swtpm(&l).map_err(Fail::die)?;
-        println!("windows: {VM} is not running");
+        if revert_unreverted(&l, &tools).map_err(Fail::die)? {
+            println!(
+                "windows: {VM} was not running; its disk held writes no run reverted: reverted to its snapshot"
+            );
+        } else if snapshot_plan(&l).is_some() {
+            println!("windows: {VM} is not running, and holds its snapshot");
+        } else {
+            println!("windows: {VM} is not running");
+        }
         return Ok(0);
     }
-    down(&l, &tools).map_err(Fail::die)?;
-    println!("windows: {VM} stopped and reverted to its snapshot");
+    let shut = down(&l, &tools, Patience::STOP).map_err(Fail::die)?;
+    println!("windows: {VM} {shut}");
     Ok(0)
 }
 
@@ -2958,7 +3455,7 @@ fn cmd_destroy() -> Res {
     let l = Layout::find()?;
     let _lock = lane_lock(&l)?;
     let ssh = read_port(&l).map(|p| Ssh::new(&l, p));
-    stop(&l, ssh.as_ref()).map_err(Fail::die)?;
+    stop(&l, ssh.as_ref(), Patience::STOP).map_err(Fail::die)?;
     for f in [
         l.disk(),
         l.vars(),
@@ -2970,6 +3467,7 @@ fn cmd_destroy() -> Res {
         l.media(),
         l.installed(),
         l.provisioned(),
+        l.unreverted(),
     ] {
         let _ = std::fs::remove_file(f);
     }
@@ -3033,6 +3531,9 @@ fn cmd_status() -> Res {
             None => "none: not installed (the next `up` installs)".into(),
         }
     );
+    if qemu.is_none() && l.unreverted().exists() && snapshot_plan(&l).is_some() {
+        println!("disk      holds writes no run reverted: `down` or the next run reverts them");
+    }
     if let Some(bytes) = allocated(&l.disk()) {
         println!(
             "host disk {} allocated in {}",
@@ -3173,8 +3674,8 @@ pub fn task_name(what: &str) -> String {
 fn cmd_exec(args: &[String]) -> Res {
     let ask = parse_exec(args)?;
     let l = Layout::find()?;
-    let _lock = boot_lane(&l)?;
-    let up = bring_up(false)?;
+    let mut lane = boot_lane(&l)?;
+    let up = bring_up(&mut lane, false)?;
     exec_on(up, ask)
 }
 
@@ -3616,8 +4117,19 @@ mod tests {
 
     /// The stand-in QEMU ([`a_qemu_stand_in`]).
     const QEMU_STAND_IN: &str = "windows::tests::a_qemu_stand_in";
-    /// Set for the stand-in QEMU.
+    /// Set for the stand-in QEMU: how its guest behaves ([`SHUTS_DOWN`], [`HUNG`], [`SPINNING`],
+    /// [`WORKING`]).
     const QEMU_ENV: &str = "ATERM_LAB_TEST_QEMU";
+    /// A guest that shuts down at ACPI's power button, its drives and screen still.
+    const SHUTS_DOWN: &str = "shuts-down";
+    /// A guest hung in its firmware: it ignores the power button, its drives and screens still.
+    const HUNG: &str = "hung";
+    /// A guest hung with Windows' boot spinner turning: it ignores the power button and its
+    /// drives are still, but its screens change at every look.
+    const SPINNING: &str = "spinning";
+    /// A guest at work that ignores the power button: its drives have done more at every look,
+    /// and its screens change.
+    const WORKING: &str = "working";
     /// The stand-in booter ([`a_booter_stand_in`]).
     const BOOTER_STAND_IN: &str = "windows::tests::a_booter_stand_in";
     /// The stand-in booter's layout home, verb and whether it records its boot, tabs between.
@@ -3629,14 +4141,17 @@ mod tests {
 
     /// Not a test alone: run as [`QEMU_STAND_IN`] with `argv[0]` a `qemu-system-aarch64` and the
     /// lane's own QEMU words ([`qemu_args`]) after libtest's `--`, it is the VM's QEMU as the
-    /// lane identifies one ([`daemon_words`]): its pid in `-pidfile`, QMP on `-qmp`'s socket,
-    /// gone with its pid file at `system_powerdown` or `quit`. Its one-minute hang detector
-    /// ends it when nobody stops it.
+    /// lane identifies one ([`daemon_words`]): its pid in `-pidfile`, QMP on `-qmp`'s socket, a
+    /// `screendump` written to the file it names (the same bytes each time, or new ones each
+    /// time for a [`SPINNING`] or [`WORKING`] guest), `query-blockstats` answered with its
+    /// drives' operations (one more at each ask for a [`WORKING`] guest), gone with its pid file
+    /// at `quit`, and at `system_powerdown` only for a guest that [`SHUTS_DOWN`]. Its one-minute
+    /// hang detector ends it when nobody stops it.
     #[test]
     fn a_qemu_stand_in() {
-        if std::env::var_os(QEMU_ENV).is_none() {
+        let Ok(guest) = std::env::var(QEMU_ENV) else {
             return;
-        }
+        };
         let words: Vec<String> = std::env::args().collect();
         let after = |key: &str| {
             words
@@ -3655,6 +4170,8 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&qmp).expect("QMP's socket");
         listener.set_nonblocking(true).expect("nonblocking");
         std::fs::write(&pid_file, format!("{}\n", std::process::id())).expect("the pid file");
+        let mut shots = 0u32;
+        let mut operations = 12u64;
         let end = Instant::now() + Duration::from_secs(60);
         while Instant::now() < end {
             let stream = match listener.accept() {
@@ -3670,8 +4187,38 @@ mod tests {
             let _ = reply.write_all(b"{\"QMP\": {\"version\": {}, \"capabilities\": []}}\n");
             let mut stopped = false;
             for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                if line.contains("\"screendump\"") {
+                    let asked: aterm_json::Value = aterm_json::from_str(&line).expect("QMP JSON");
+                    let file = asked
+                        .get("arguments")
+                        .and_then(|a| a.get("filename"))
+                        .and_then(aterm_json::Value::as_str)
+                        .expect("a screendump's file");
+                    shots += 1;
+                    let screen = if guest == SPINNING || guest == WORKING {
+                        format!("Start boot option, the spinner at frame {shots}")
+                    } else {
+                        "Start boot option".to_owned()
+                    };
+                    std::fs::write(file, screen).expect("the screen");
+                }
+                if line.contains("\"query-blockstats\"") {
+                    if guest == WORKING {
+                        operations += 1;
+                    }
+                    let stats = format!(
+                        "{{\"return\": [{{\"device\": \"disk\", \"stats\": {{\"rd_operations\": \
+                         {operations}, \"wr_operations\": 3, \"flush_operations\": 1}}}}, \
+                         {{\"device\": \"pflash1\", \"stats\": {{\"rd_operations\": 0, \
+                         \"wr_operations\": 0, \"flush_operations\": 0}}}}]}}\n"
+                    );
+                    let _ = reply.write_all(stats.as_bytes());
+                    continue;
+                }
                 let _ = reply.write_all(b"{\"return\": {}}\n");
-                if line.contains("system_powerdown") || line.contains("\"quit\"") {
+                if line.contains("\"quit\"")
+                    || (line.contains("system_powerdown") && guest == SHUTS_DOWN)
+                {
                     stopped = true;
                     break;
                 }
@@ -3734,9 +4281,15 @@ mod tests {
         aterm_uds::process::kill_self_now()
     }
 
-    /// [`a_qemu_stand_in`] as the QEMU of the VM in `l`, with the lane's own QEMU words: this
-    /// test's child, which nothing but this test reaps.
+    /// [`a_qemu_stand_in`] as the QEMU of the VM in `l`, its guest one that shuts down
+    /// ([`SHUTS_DOWN`]).
     fn qemu_stand_in(l: &Layout) -> aterm_uds::spawnfd::Child {
+        qemu_stand_in_as(l, SHUTS_DOWN)
+    }
+
+    /// [`a_qemu_stand_in`] as the QEMU of the VM in `l`, its guest as `guest` says, with the
+    /// lane's own QEMU words: this test's child, which nothing but this test reaps.
+    fn qemu_stand_in_as(l: &Layout, guest: &str) -> aterm_uds::spawnfd::Child {
         let words = qemu_args(
             l,
             &tools(),
@@ -3756,7 +4309,7 @@ mod tests {
                 "--",
             ])
             .args(&words)
-            .env(QEMU_ENV, "1")
+            .env(QEMU_ENV, guest)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -3877,7 +4430,7 @@ mod tests {
 
         let (_, status, mut vm, qemu) = boot_by(home.path(), "lab windows smoke", true);
         assert_eq!(status.signal(), Some(libc::SIGKILL), "{status}");
-        stop(&l, None).expect("stopped as a lab that keeps no records stops it");
+        stop(&l, None, Patience::STOP).expect("stopped as a lab that keeps no records stops it");
         std::fs::write(l.qemu_pid(), format!("{qemu}\n")).expect("the pid file");
         assert_eq!(
             running(&l),
@@ -3898,7 +4451,7 @@ mod tests {
             "a VM booted since outside the records is not the dead run's: {said:?}"
         );
         assert!(said.is_empty(), "{said:?}");
-        down(&l, &tools()).expect("down stops it");
+        down(&l, &tools(), Patience::STOP).expect("down stops it");
         reaped(&mut vm);
 
         let (_, status, mut vm, qemu) = boot_by(home.path(), "lab windows up", true);
@@ -3909,7 +4462,7 @@ mod tests {
         assert_eq!(adopted_pid, Ok(Some(qemu)), "{said:?}");
         assert!(said.is_empty(), "{said:?}");
         assert_eq!(vm.exited().ok(), Some(false), "the VM up left runs on");
-        down(&l, &tools()).expect("down stops it");
+        down(&l, &tools(), Patience::STOP).expect("down stops it");
         reaped(&mut vm);
     }
 
@@ -4021,5 +4574,240 @@ mod tests {
             .expect_err("cleanup is part of the command result");
         assert_eq!(failed.code, 1);
         assert_eq!(failed.msg.as_deref(), Some("snapshot restore failed"));
+    }
+
+    /// The VM's drives read as no progress only while their operations stay the same, counted
+    /// from the wait's start, and from their last operation once they did one; a look QMP did
+    /// not answer changes nothing.
+    #[test]
+    fn drives_that_do_nothing_are_no_progress_from_their_last_operation() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut progress = Progress::from(t0);
+        assert_eq!(progress.saw(None, at(5)), Duration::from_secs(5));
+        assert_eq!(progress.saw(Some(40), at(10)), Duration::from_secs(10));
+        assert_eq!(progress.saw(Some(40), at(70)), Duration::from_secs(70));
+        assert_eq!(progress.saw(Some(41), at(80)), Duration::ZERO);
+        assert_eq!(progress.saw(None, at(85)), Duration::from_secs(5));
+        assert_eq!(progress.saw(Some(41), at(90)), Duration::from_secs(10));
+        assert_eq!(progress.saw(Some(900), at(100)), Duration::ZERO);
+        assert_eq!(progress.done(), Some(900));
+    }
+
+    /// A scratch VM home under /tmp (QMP's socket path must fit a sockaddr_un), its layout, and
+    /// tools whose `qemu-img` does nothing (`/usr/bin/true`): a revert then puts back the
+    /// firmware variables and the TPM state, which these tests read, and no disk.
+    fn scratch_vm() -> (aterm_tempfile::TempDir, Layout, Tools) {
+        let home = aterm_tempfile::Builder::new()
+            .prefix("w")
+            .tempdir_in("/tmp")
+            .expect("a scratch home");
+        let l = Layout::under(home.path());
+        assert!(lossy(&l.qmp()).len() < 104, "{}", l.qmp().display());
+        std::fs::create_dir_all(l.run()).expect("the run directory");
+        let t = Tools {
+            qemu_img: "/usr/bin/true".into(),
+            ..tools()
+        };
+        (home, l, t)
+    }
+
+    /// Give the VM in `l` a snapshot whose firmware variables and TPM state read `clean`, and
+    /// live ones that read `dirty`, as a boot of the snapshot leaves them
+    /// ([`Layout::unreverted`]).
+    fn snapshotted_and_dirtied(l: &Layout) {
+        std::fs::write(l.provisioned(), "0123456789abcdef\n").expect("the snapshot's plan");
+        std::fs::write(l.vars_saved(), "clean").expect("the saved variables");
+        std::fs::write(l.vars(), "dirty").expect("the variables");
+        for (dir, text) in [(l.tpm_saved(), "clean"), (l.tpm(), "dirty")] {
+            std::fs::create_dir_all(&dir).expect("a TPM state");
+            std::fs::write(dir.join("tpm2-00.permall"), text).expect("its file");
+        }
+        std::fs::write(l.unreverted(), "a boot of the snapshot\n").expect("the mark");
+    }
+
+    /// What the VM in `l` holds: its firmware variables and TPM state, and whether it is marked
+    /// unreverted.
+    fn state_of(l: &Layout) -> (String, String, bool) {
+        (
+            std::fs::read_to_string(l.vars()).expect("the variables"),
+            std::fs::read_to_string(l.tpm().join("tpm2-00.permall")).expect("the TPM state"),
+            l.unreverted().exists(),
+        )
+    }
+
+    /// [`qemu_stand_in_as`], waited for until it holds its pid file and QMP's socket (a
+    /// one-minute hang detector).
+    fn up_as(l: &Layout, guest: &str) -> aterm_uds::spawnfd::Child {
+        let vm = qemu_stand_in_as(l, guest);
+        let end = Instant::now() + Duration::from_secs(60);
+        while !(matches!(running(l), Ok(Some(_))) && l.qmp().exists()) {
+            assert!(Instant::now() < end, "the stand-in QEMU did not come up");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        vm
+    }
+
+    /// Patience measured in seconds, for the stand-ins.
+    fn quick(within: u64, stall: Option<u64>) -> Patience {
+        Patience {
+            within: Duration::from_secs(within),
+            stall: stall.map(Duration::from_secs),
+            look: Duration::from_millis(100),
+        }
+    }
+
+    /// A boot whose guest shows no progress (no answer, its drives still: a firmware hang, as
+    /// two restarts hung at "Start boot option") is started afresh once, as a step of the boot,
+    /// and answers then; the hung QEMU is ended and its replacement runs. So is one whose screens
+    /// change while its drives are still (Windows' boot spinner turning over a hang). Negative
+    /// controls: a guest that hangs again after its relaunch is given up at its second stall,
+    /// not at the wait's limit (here a one-minute hang detector), and its QEMU ended; and one
+    /// whose drives work is no stall, so it is waited for to the limit and never relaunched.
+    #[test]
+    fn a_boot_that_shows_no_progress_is_started_afresh_once_and_given_up_at_a_second_stall() {
+        use std::cell::{Cell, RefCell};
+        let boot = |first: &str, then: &str, p: Patience| {
+            let (_home, l, _t) = scratch_vm();
+            let vms = RefCell::new(vec![up_as(&l, first)]);
+            let relaunched = Cell::new(0u32);
+            let t0 = Instant::now();
+            let waited = wait_answer(
+                &l,
+                p,
+                "booting",
+                &mut || then == "answers" && relaunched.get() > 0,
+                &mut || {
+                    stop(&l, None, Patience::NOW)?;
+                    let next = if then == "answers" { HUNG } else { then };
+                    vms.borrow_mut().push(up_as(&l, next));
+                    relaunched.set(relaunched.get() + 1);
+                    Ok(())
+                },
+            );
+            let took = t0.elapsed();
+            let still = running(&l);
+            let _ = stop(&l, None, Patience::NOW);
+            for vm in vms.borrow_mut().iter_mut() {
+                reaped(vm);
+            }
+            (waited, relaunched.get(), took, still)
+        };
+
+        for hung in [HUNG, SPINNING] {
+            let (waited, relaunched, _, still) = boot(hung, "answers", quick(60, Some(1)));
+            assert!(waited.is_ok(), "{hung}: {waited:?}");
+            assert_eq!(relaunched, 1, "{hung}");
+            assert!(
+                matches!(still, Ok(Some(_))),
+                "{hung}: the relaunched QEMU runs: {still:?}"
+            );
+        }
+
+        let (waited, relaunched, _, still) = boot(HUNG, HUNG, quick(60, Some(1)));
+        let why = waited.expect_err("a second stall gives up");
+        assert!(
+            why.starts_with("no answer on SSH and no operation on the VM's drives for ")
+                && why.contains(" s while booting (its screens: ")
+                && why.contains("again after it was started afresh")
+                && why.ends_with("the VM stopped by force (ended at once)"),
+            "{why}"
+        );
+        assert_eq!(relaunched, 1);
+        assert_eq!(still, Ok(None), "the hung QEMU was ended");
+
+        let (waited, relaunched, took, _) = boot(WORKING, WORKING, quick(3, Some(1)));
+        let why = waited.expect_err("no answer within the limit");
+        assert!(
+            why.starts_with("the guest did not answer on SSH within 3 s while booting"),
+            "{why}"
+        );
+        assert_eq!(relaunched, 0, "drives that work are progress");
+        assert!(took >= Duration::from_secs(3), "{took:?}");
+    }
+
+    /// `down` on a hung guest (it ignores ACPI's power button, its drives still, Windows' boot
+    /// spinner turning on its screen) ends its QEMU once it has shown no progress for the stall,
+    /// not at the shutdown's limit (here a one-minute hang detector), and reverts the VM to its
+    /// snapshot, saying so: a stop that had to end QEMU no longer leaves its state unreverted.
+    /// Negative controls: a guest whose drives work is waited for to the limit before it is
+    /// ended (and reverted); one that shuts down is reverted with no force; and a pid file that
+    /// names a process this VM's words do not describe is refused, its state preserved and still
+    /// marked unreverted.
+    #[test]
+    fn down_ends_a_hung_guest_and_reverts_it_to_its_snapshot() {
+        let down_on = |guest: &str, p: Patience| {
+            let (_home, l, t) = scratch_vm();
+            snapshotted_and_dirtied(&l);
+            let mut vm = up_as(&l, guest);
+            let t0 = Instant::now();
+            let shut = down(&l, &t, p);
+            let took = t0.elapsed();
+            assert_eq!(running(&l), Ok(None), "{guest}: QEMU is gone");
+            reaped(&mut vm);
+            (shut, took, state_of(&l))
+        };
+        let reverted = ("clean".to_owned(), "clean".to_owned(), false);
+
+        let (shut, _, state) = down_on(SPINNING, quick(60, Some(1)));
+        let shut = shut.expect("down");
+        assert!(
+            matches!(&shut.stopped, Stopped::Forced(why)
+                if why.starts_with("Windows showed no sign of shutting down for ")
+                    && why.contains(" s, no operation on its drives; its screens: ")),
+            "{shut}"
+        );
+        assert!(shut.reverted && shut.to_string().ends_with(") and reverted to its snapshot"));
+        assert_eq!(state, reverted);
+
+        let (shut, took, state) = down_on(WORKING, quick(3, Some(1)));
+        let shut = shut.expect("down");
+        assert!(
+            matches!(&shut.stopped, Stopped::Forced(why)
+                if why.starts_with("Windows did not shut down within 3 s")),
+            "{shut}"
+        );
+        assert!(took >= Duration::from_secs(3), "{took:?}");
+        assert_eq!(state, reverted);
+
+        let (shut, _, state) = down_on(SHUTS_DOWN, quick(30, Some(10)));
+        assert_eq!(
+            shut.map(|s| s.to_string()).as_deref(),
+            Ok("stopped (Windows shut down) and reverted to its snapshot")
+        );
+        assert_eq!(state, reverted);
+
+        let (_home, l, t) = scratch_vm();
+        snapshotted_and_dirtied(&l);
+        std::fs::write(l.qemu_pid(), format!("{}\n", std::process::id())).expect("the pid file");
+        let refused = down(&l, &t, quick(30, Some(1))).expect_err("not this VM's QEMU");
+        assert!(refused.ends_with("; preserved"), "{refused}");
+        assert_eq!(state_of(&l), ("dirty".to_owned(), "dirty".to_owned(), true));
+    }
+
+    /// A stopped VM still marked unreverted (a revert that failed after its stop, or a Mac that
+    /// went down under it) is reverted before anything boots it, once; a VM with no snapshot is
+    /// left as it is, the mark kept.
+    #[test]
+    fn a_stopped_vm_left_unreverted_is_reverted_before_it_boots() {
+        let (_home, l, t) = scratch_vm();
+        snapshotted_and_dirtied(&l);
+        assert_eq!(revert_unreverted(&l, &t), Ok(true));
+        assert_eq!(
+            state_of(&l),
+            ("clean".to_owned(), "clean".to_owned(), false)
+        );
+        std::fs::write(l.vars(), "dirty").expect("the variables");
+        std::fs::write(l.tpm().join("tpm2-00.permall"), "dirty").expect("the TPM state");
+        assert_eq!(revert_unreverted(&l, &t), Ok(false), "no mark, no revert");
+        assert_eq!(
+            state_of(&l),
+            ("dirty".to_owned(), "dirty".to_owned(), false)
+        );
+
+        std::fs::remove_file(l.provisioned()).expect("no snapshot");
+        std::fs::write(l.unreverted(), "a boot\n").expect("the mark");
+        assert_eq!(revert_unreverted(&l, &t), Ok(false));
+        assert_eq!(state_of(&l), ("dirty".to_owned(), "dirty".to_owned(), true));
     }
 }

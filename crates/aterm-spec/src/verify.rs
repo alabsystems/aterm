@@ -1314,6 +1314,17 @@ fn assert_same_space_explored(m: &Model, interp_states: usize, evidence: &str, l
             m.name
         )
     };
+    assert_same_space_count(m, interp_states, ty_states, evidence, label);
+}
+
+#[cfg_attr(trust_verify, trust::skip)]
+fn assert_same_space_count(
+    m: &Model,
+    interp_states: usize,
+    ty_states: u64,
+    evidence: &str,
+    label: &str,
+) {
     assert!(
         ty_states == interp_states as u64,
         "{label}: {} — TIER DISAGREEMENT ON THE EXPLORED SPACE: the interpreter walked \
@@ -1570,8 +1581,26 @@ fn assert_scalar(m: &Model, label: &str, caller: &str) {
 /// Refuse a `ty` dead set measured on a smaller space than the interpreter walked.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn assert_ty_saw_whole_space(m: &Model, evidence: &str, label: &str) {
+    let interp_states = committed_state_count(m, evidence, label);
+    assert_same_space_explored(m, interp_states, evidence, label);
+}
+
+/// Hold a structured `ty` state count to the same interpreter-space obligation.
+#[cfg_attr(trust_verify, trust::skip)]
+pub(crate) fn assert_ty_saw_whole_space_count(
+    m: &Model,
+    ty_states: u64,
+    evidence: &str,
+    label: &str,
+) {
+    let interp_states = committed_state_count(m, evidence, label);
+    assert_same_space_count(m, interp_states, ty_states, evidence, label);
+}
+
+#[cfg_attr(trust_verify, trust::skip)]
+fn committed_state_count(m: &Model, evidence: &str, label: &str) -> usize {
     let committed = interp::with_buggy(m, 0);
-    let interp_states = match interp::bmc(&committed) {
+    match interp::bmc(&committed) {
         Ok(n) => n,
         Err((state, invariant)) => panic!(
             "{label}: {} — the interpreter finds invariant `{invariant}` VIOLATED at {state:?} \
@@ -1579,8 +1608,7 @@ pub fn assert_ty_saw_whole_space(m: &Model, evidence: &str, label: &str) {
              violated model is a false proof, not a disagreement about coverage.\n{evidence}",
             m.name
         ),
-    };
-    assert_same_space_explored(m, interp_states, evidence, label);
+    }
 }
 
 /// `ty`'s dead-action report for one configuration, held to the interpreter's.

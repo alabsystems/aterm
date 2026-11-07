@@ -19,6 +19,8 @@
 //!   published by the Commons owner's flusher (`upkeep`) in its fixed share of each week.
 //! - [`mail`]: where an address's codes arrive, following an alias to the address it is linked
 //!   with.
+//! - [`merge`]: duplicate machine rows folded into the one row their Mac is bound to, with
+//!   `merged_into`.
 //! - [`register`]: what a Mac states about itself, and the adoption rule that binds its Commons
 //!   enrollment to a machine row.
 //! - [`view`]: LabView, what the harness reads of the registry: this Mac's preferences, the Macs
@@ -39,6 +41,7 @@ pub mod import;
 #[cfg(unix)]
 pub mod journal;
 pub mod mail;
+pub mod merge;
 pub mod register;
 pub mod registry;
 #[cfg(unix)]

@@ -153,6 +153,107 @@ impl Toolset {
         args
     }
 
+    /// Run the package passes with full admission at each boundary and a cancellation
+    /// check while the child runs. `continuing` must not wait for locks or repeat full
+    /// input-integrity proofs; it cannot replace `current` before or after either pass.
+    /// # Errors
+    /// Admission is withdrawn, a pass fails, or the run is stopped.
+    pub fn apply_with_guards(
+        &self,
+        sys: &dyn System,
+        current: &(dyn Fn() -> Result<(), String> + Sync),
+        continuing: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<(), String> {
+        current()?;
+        self.set_aside(None);
+        // Each pass runs in a process group of its own, which a Ctrl-C at the terminal or a
+        // closed tab never reaches: held while the passes run, a stop ends the running pass's
+        // group (the store keeps what it finished), starts no other, is said on standard error
+        // ([`Toolset::say_stopped`]), and is sent again as this returns, so the run stops as it
+        // would have and leaves no pass behind it writing to pipes nobody reads.
+        let _stops = sys.defer_stops();
+        let stopped = || sys.stopped().is_some() || continuing().is_err();
+        let waited = self.wait.unwrap_or_default();
+        let passes = [("seed", SEED_BUDGET), ("update", UPDATE_BUDGET)];
+        let named = |at: usize| {
+            passes
+                .get(at)
+                .map(|&(verb, _)| format!("aterm pkg {}", self.args(verb).join(" ")))
+        };
+        for (at, (verb, budget)) in passes.into_iter().enumerate() {
+            current()?;
+            let args = self.args(verb);
+            let shown = format!("aterm pkg {}", args.join(" "));
+            if let Some(sig) = sys.stopped() {
+                let when = at.checked_sub(1).and_then(named).map_or_else(
+                    || format!("before `{shown}`"),
+                    |done| after(&done, Some(&shown)),
+                );
+                return Err(self.say_stopped(sig, &when));
+            }
+            let ran = (self.pkg)(&args, budget.saturating_add(waited), &stopped);
+            if let Some(sig) = sys.stopped() {
+                // A pass that did not return its run was ended (the stop it read ends its group
+                // at once); one that returned it had finished before the stop was read.
+                let when = if matches!(ran, Err(RunFailed::TimedOut(_))) {
+                    format!("during `{shown}`, which was ended")
+                } else {
+                    after(&shown, named(at + 1).as_deref())
+                };
+                return Err(self.say_stopped(sig, &when));
+            }
+            current()?;
+            let ran = ran.map_err(|failed| {
+                format!("`{shown}`: {failed}; the store keeps what it finished")
+            })?;
+            match ran.status {
+                Some(0) if verb == "update" => {
+                    // No fault, but a program left for the next pass (its signature check did
+                    // not finish) is still missing: the next run installs it.
+                    let left =
+                        (self.atpkg.left_for_next_pass)(&format!("{}\n{}", ran.out(), ran.err()));
+                    if !left.is_empty() && matches!((self.found)(), Found::Missing(_)) {
+                        self.set_aside(Some(StoodAside::Lock(format!(
+                            "{}; the next `aterm init` installs the rest",
+                            left.join("; ")
+                        ))));
+                        return Ok(());
+                    }
+                }
+                Some(0) => {}
+                // The row read back says why nothing was installed.
+                Some(NOTHING_INSTALLED) if verb == "update" => {}
+                Some(CONTENDED) => {
+                    self.set_aside(Some(StoodAside::Lock(format!(
+                        "another atpkg run holds the store (`{shown}` exited {CONTENDED}: {}); \
+                         the next `aterm init` installs the toolset",
+                        said(&ran)
+                    ))));
+                    return Ok(());
+                }
+                Some(OFFLINE) => {
+                    self.set_aside(Some(StoodAside::Offline(format!(
+                        "the ALab index could not be reached (`{shown}` exited {OFFLINE}: {}); \
+                         the next `aterm init` installs the toolset",
+                        said(&ran)
+                    ))));
+                    return Ok(());
+                }
+                _ => {
+                    return Err(format!(
+                        "`{shown}` {}: {}",
+                        ran.status.map_or_else(
+                            || "ended on a signal".to_owned(),
+                            |code| format!("exited {code}")
+                        ),
+                        said(&ran)
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn set_aside(&self, aside: Option<StoodAside>) {
         *self
             .aside
@@ -252,92 +353,17 @@ impl Item for Toolset {
         }
     }
 
-    fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
-        self.set_aside(None);
-        // Each pass runs in a process group of its own, which a Ctrl-C at the terminal or a
-        // closed tab never reaches: held while the passes run, a stop ends the running pass's
-        // group (the store keeps what it finished), starts no other, is said on standard error
-        // ([`Toolset::say_stopped`]), and is sent again as this returns, so the run stops as it
-        // would have and leaves no pass behind it writing to pipes nobody reads.
-        let _stops = sys.defer_stops();
-        let stopped = || sys.stopped().is_some();
-        let waited = self.wait.unwrap_or_default();
-        let passes = [("seed", SEED_BUDGET), ("update", UPDATE_BUDGET)];
-        let named = |at: usize| {
-            passes
-                .get(at)
-                .map(|&(verb, _)| format!("aterm pkg {}", self.args(verb).join(" ")))
-        };
-        for (at, (verb, budget)) in passes.into_iter().enumerate() {
-            let args = self.args(verb);
-            let shown = format!("aterm pkg {}", args.join(" "));
-            if let Some(sig) = sys.stopped() {
-                let when = at.checked_sub(1).and_then(named).map_or_else(
-                    || format!("before `{shown}`"),
-                    |done| after(&done, Some(&shown)),
-                );
-                return Err(self.say_stopped(sig, &when));
-            }
-            let ran = (self.pkg)(&args, budget.saturating_add(waited), &stopped);
-            if let Some(sig) = sys.stopped() {
-                // A pass that did not return its run was ended (the stop it read ends its group
-                // at once); one that returned it had finished before the stop was read.
-                let when = if matches!(ran, Err(RunFailed::TimedOut(_))) {
-                    format!("during `{shown}`, which was ended")
-                } else {
-                    after(&shown, named(at + 1).as_deref())
-                };
-                return Err(self.say_stopped(sig, &when));
-            }
-            let ran = ran.map_err(|failed| {
-                format!("`{shown}`: {failed}; the store keeps what it finished")
-            })?;
-            match ran.status {
-                Some(0) if verb == "update" => {
-                    // No fault, but a program left for the next pass (its signature check did
-                    // not finish) is still missing: the next run installs it.
-                    let left =
-                        (self.atpkg.left_for_next_pass)(&format!("{}\n{}", ran.out(), ran.err()));
-                    if !left.is_empty() && matches!((self.found)(), Found::Missing(_)) {
-                        self.set_aside(Some(StoodAside::Lock(format!(
-                            "{}; the next `aterm init` installs the rest",
-                            left.join("; ")
-                        ))));
-                        return Ok(());
-                    }
-                }
-                Some(0) => {}
-                // The row read back says why nothing was installed.
-                Some(NOTHING_INSTALLED) if verb == "update" => {}
-                Some(CONTENDED) => {
-                    self.set_aside(Some(StoodAside::Lock(format!(
-                        "another atpkg run holds the store (`{shown}` exited {CONTENDED}: {}); \
-                         the next `aterm init` installs the toolset",
-                        said(&ran)
-                    ))));
-                    return Ok(());
-                }
-                Some(OFFLINE) => {
-                    self.set_aside(Some(StoodAside::Offline(format!(
-                        "the ALab index could not be reached (`{shown}` exited {OFFLINE}: {}); \
-                         the next `aterm init` installs the toolset",
-                        said(&ran)
-                    ))));
-                    return Ok(());
-                }
-                _ => {
-                    return Err(format!(
-                        "`{shown}` {}: {}",
-                        ran.status.map_or_else(
-                            || "ended on a signal".to_owned(),
-                            |code| format!("exited {code}")
-                        ),
-                        said(&ran)
-                    ));
-                }
-            }
-        }
-        Ok(())
+    fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
+        self.apply_guarded(sys, ctx, &|| Ok(()))
+    }
+
+    fn apply_guarded(
+        &self,
+        sys: &dyn System,
+        _ctx: &Ctx,
+        current: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<(), String> {
+        self.apply_with_guards(sys, current, current)
     }
 
     fn revert(&self) -> Option<String> {

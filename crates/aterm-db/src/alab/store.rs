@@ -149,7 +149,7 @@ fn me(
     let logged = aterm_secrets::client::trusted_commons_log(paths, trust)
         .ok()
         .flatten()
-        .and_then(|(log, _)| log.membership().label(&actor).map(str::to_owned));
+        .and_then(|(log, _)| log.membership_ref().label(&actor).map(str::to_owned));
     let recipient = binding.recipient().to_bech32();
     let roster = aterm_secrets::client::swarm_roster_until(paths, crate::admission::deadline())
         .map_err(crate::table::failure)?;

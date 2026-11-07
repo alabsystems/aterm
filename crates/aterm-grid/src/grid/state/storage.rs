@@ -10,8 +10,8 @@ use aterm_scrollback::ScrollbackStorage;
 
 use super::super::LineSize;
 use super::super::ScrolledRowExtras;
+use super::super::lazy_buffer::LazyBuffer;
 use super::super::ring_extras::RingExtras;
-use super::super::scroll_convert::LazyBuffer;
 use super::super::{CellCoord, CellExtra};
 use super::super::{HorizontalMargins, PageStore, Row, ScrollRegion};
 use super::GridCursorState;
@@ -121,6 +121,58 @@ pub struct GridStorage {
     pub has_horizontal_margins: bool,
     /// Cursor- and region-oriented state layered under storage state.
     pub cursor_state: GridCursorState,
+}
+
+/// `index % len` for a ring position. The sums the ring forms (a head below `len` plus an offset no
+/// larger than `len`) stay under `2 * len`, so one compare and a subtract stand in for the division
+/// every row lookup would otherwise pay; any larger sum still takes the division.
+#[inline]
+pub(crate) const fn wrap_ring_index(index: usize, len: usize) -> usize {
+    if index < len {
+        index
+    } else if index - len < len {
+        index - len
+    } else {
+        index % len
+    }
+}
+
+/// `band.rotate_left(1)` as one `memmove`: the slice rotation's general algorithm spends several
+/// times that on the one-row shift each line feed at the bottom of a scroll region asks for.
+#[inline]
+fn rotate_one_left<T>(band: &mut [T]) {
+    let span = band.len();
+    if span < 2 {
+        return;
+    }
+    let p = band.as_mut_ptr();
+    // SAFETY: `p..p + span` is `band`, borrowed uniquely. The first element is read out, the other
+    // `span - 1` slide down one slot (`copy` allows the overlap) and the read element goes into the
+    // slot the slide vacated, so each element ends in exactly one slot, none dropped or doubled,
+    // and nothing between the read and the write can panic.
+    unsafe {
+        let first = core::ptr::read(p);
+        core::ptr::copy(p.add(1), p, span - 1);
+        core::ptr::write(p.add(span - 1), first);
+    }
+}
+
+/// `band.rotate_right(1)` as one `memmove`, the mirror of [`rotate_one_left`] for a reverse index.
+#[inline]
+fn rotate_one_right<T>(band: &mut [T]) {
+    let span = band.len();
+    if span < 2 {
+        return;
+    }
+    let p = band.as_mut_ptr();
+    // SAFETY: as in `rotate_one_left`, mirrored: the last element is read out, the first `span - 1`
+    // slide up one slot and the read element fills slot 0; each element ends in exactly one slot
+    // and nothing between the read and the write can panic.
+    unsafe {
+        let last = core::ptr::read(p.add(span - 1));
+        core::ptr::copy(p, p.add(1), span - 1);
+        core::ptr::write(p, last);
+    }
 }
 
 impl Deref for GridStorage {
@@ -324,7 +376,7 @@ impl GridStorage {
         let base = ring_scrollback + usize::from(visible_row);
 
         if self.display_offset == 0 {
-            return Some((self.ring_head + base) % self.rows.len());
+            return Some(wrap_ring_index(self.ring_head + base, self.rows.len()));
         }
 
         if self.display_offset > base {
@@ -332,7 +384,10 @@ impl GridStorage {
         }
 
         let absolute_row = base - self.display_offset;
-        Some((self.ring_head + absolute_row) % self.rows.len())
+        Some(wrap_ring_index(
+            self.ring_head + absolute_row,
+            self.rows.len(),
+        ))
     }
 
     /// Pre-computed base ring index for visible rows when `display_offset == 0`.
@@ -343,11 +398,46 @@ impl GridStorage {
             "row_index_base requires display_offset == 0"
         );
         let ring_scrollback = self.total_lines.saturating_sub(self.visible_rows as usize);
-        (self.ring_head + ring_scrollback) % self.rows.len()
+        wrap_ring_index(self.ring_head + ring_scrollback, self.rows.len())
     }
 
-    /// Shift visible rows in `[top, bottom]` up by `n` by swapping `Row` slots.
+    /// Shift visible rows in `[top, bottom]` up by `n`: row `i` takes the `Row` slot of row `i + n`
+    /// for `top <= i <= bottom - n`, and the `n` slots that leave the top land at the bottom in the
+    /// order [`Self::shift_visible_rows_up_by_swaps`] leaves them. While the band is contiguous in the
+    /// ring that is one `rotate_left` of the band's slots (one move each, not a swap per row), then a
+    /// rotation of its bottom `n` slots by `(bottom - top + 1) % n`, a no-op for a line feed's
+    /// `n = 1`, whose rotation is one `memmove` ([`rotate_one_left`]); a band that wraps the ring's
+    /// end takes the swap chain.
     pub(crate) fn shift_visible_rows_up(&mut self, top: usize, bottom: usize, n: usize) {
+        if n == 0 || top + n > bottom {
+            return;
+        }
+        #[cfg(test)]
+        if crate::test_counters::reference_paths() {
+            self.shift_visible_rows_up_by_swaps(top, bottom, n);
+            return;
+        }
+        let span = bottom - top + 1;
+        let lo = wrap_ring_index(self.row_index_base() + top, self.rows.len());
+        let Some(band) = self.rows.get_mut(lo..lo + span) else {
+            self.shift_visible_rows_up_by_swaps(top, bottom, n);
+            return;
+        };
+        if n == 1 {
+            rotate_one_left(band);
+            return;
+        }
+        band.rotate_left(n);
+        let settle = span % n;
+        if settle != 0 {
+            band[span - n..].rotate_left(settle);
+        }
+    }
+
+    /// [`Self::shift_visible_rows_up`] as a chain of `Row` slot swaps, one per row of the band:
+    /// slot `i` swaps with slot `i + n` from the top down, which leaves the band's old first `n`
+    /// rows at its bottom with old row `top + (i - top) % n` at row `i`.
+    pub(crate) fn shift_visible_rows_up_by_swaps(&mut self, top: usize, bottom: usize, n: usize) {
         if n == 0 || top + n > bottom {
             return;
         }
@@ -370,8 +460,40 @@ impl GridStorage {
         }
     }
 
-    /// Shift visible rows in `[top, bottom]` down by `n` by swapping `Row` slots.
+    /// Shift visible rows in `[top, bottom]` down by `n`, the mirror of
+    /// [`Self::shift_visible_rows_up`]: row `i` takes the `Row` slot of row `i - n` for
+    /// `top + n <= i <= bottom`, and the `n` slots that leave the bottom land at the top in the order
+    /// [`Self::shift_visible_rows_down_by_swaps`] leaves them: one `rotate_right` of a contiguous
+    /// band, then a rotation of its top `n` slots, or the swap chain where the band wraps the ring.
     pub(crate) fn shift_visible_rows_down(&mut self, top: usize, bottom: usize, n: usize) {
+        if n == 0 || top + n > bottom {
+            return;
+        }
+        #[cfg(test)]
+        if crate::test_counters::reference_paths() {
+            self.shift_visible_rows_down_by_swaps(top, bottom, n);
+            return;
+        }
+        let span = bottom - top + 1;
+        let lo = wrap_ring_index(self.row_index_base() + top, self.rows.len());
+        let Some(band) = self.rows.get_mut(lo..lo + span) else {
+            self.shift_visible_rows_down_by_swaps(top, bottom, n);
+            return;
+        };
+        if n == 1 {
+            rotate_one_right(band);
+            return;
+        }
+        band.rotate_right(n);
+        let settle = n - 1 - (span - 1) % n;
+        if settle != 0 {
+            band[..n].rotate_left(settle);
+        }
+    }
+
+    /// [`Self::shift_visible_rows_down`] as a chain of `Row` slot swaps, one per row of the band:
+    /// slot `i` swaps with slot `i - n` from the bottom up.
+    pub(crate) fn shift_visible_rows_down_by_swaps(&mut self, top: usize, bottom: usize, n: usize) {
         if n == 0 || top + n > bottom {
             return;
         }
@@ -455,7 +577,8 @@ impl GridStorage {
         }
         let ring_scrollback = self.total_lines.saturating_sub(self.visible_rows as usize);
         let base = ring_scrollback + usize::from(screen_row);
-        self.rows.get((self.ring_head + base) % self.rows.len())
+        self.rows
+            .get(wrap_ring_index(self.ring_head + base, self.rows.len()))
     }
 
     /// Return the mutable live on-screen row at `screen_row`, ignoring `display_offset`.
@@ -892,6 +1015,105 @@ mod tests {
             }
         }
         assert!(shifts > 0);
+    }
+
+    /// Each ring slot's index in `origin`: where the row now in it started.
+    fn slot_origins(g: &Grid, origin: &[usize]) -> Vec<usize> {
+        g.storage
+            .rows
+            .iter()
+            .map(|r| {
+                let at = r.as_slice().as_ptr() as usize;
+                origin.iter().position(|&o| o == at).unwrap_or(usize::MAX)
+            })
+            .collect()
+    }
+
+    /// The ring index wrap is the remainder for every sum, inside the two-ring range it shortcuts
+    /// and past it.
+    #[test]
+    fn ring_index_wrap_is_the_remainder() {
+        for len in 1..40 {
+            for index in 0..5 * len {
+                assert_eq!(
+                    super::wrap_ring_index(index, len),
+                    index % len,
+                    "{index} % {len}"
+                );
+            }
+            let top = usize::MAX - 3;
+            assert_eq!(super::wrap_ring_index(top, len), top % len);
+        }
+    }
+
+    /// The rotations put every `Row` slot exactly where the swap chains do, slot for slot, for
+    /// every band and shift a 7-row screen admits, at every ring rotation (a ring of 7 rows and of
+    /// 7 + 3 with the head anywhere): bands that sit contiguously in the ring and bands that wrap
+    /// its end both occur.
+    #[test]
+    fn row_shift_rotations_place_every_slot_where_the_swap_chains_do() {
+        const ROWS: u16 = 7;
+        let mut seen = (0usize, 0usize);
+        for scrollback in [0usize, 3] {
+            let capacity = usize::from(ROWS) + scrollback;
+            let build = |rotate: usize| {
+                let mut g = Grid::with_scrollback(ROWS, 4, scrollback);
+                for _ in 0..(capacity + rotate) {
+                    g.write_char('a');
+                    g.carriage_return();
+                    g.line_feed();
+                }
+                g
+            };
+            for rotate in 0..capacity {
+                for top in 0..usize::from(ROWS) {
+                    for bottom in top..usize::from(ROWS) {
+                        for n in 0..=usize::from(ROWS) + 1 {
+                            for down in [false, true] {
+                                let (mut fast, mut chain) = (build(rotate), build(rotate));
+                                let fast_origin = ring_slice_identities_in_order(&fast);
+                                let chain_origin = ring_slice_identities_in_order(&chain);
+                                let lo = (fast.storage.row_index_base() + top) % capacity;
+                                if lo + bottom - top < capacity {
+                                    seen.0 += 1;
+                                } else {
+                                    seen.1 += 1;
+                                }
+                                if down {
+                                    fast.storage.shift_visible_rows_down(top, bottom, n);
+                                    chain
+                                        .storage
+                                        .shift_visible_rows_down_by_swaps(top, bottom, n);
+                                } else {
+                                    fast.storage.shift_visible_rows_up(top, bottom, n);
+                                    chain.storage.shift_visible_rows_up_by_swaps(top, bottom, n);
+                                }
+                                assert_eq!(
+                                    slot_origins(&fast, &fast_origin),
+                                    slot_origins(&chain, &chain_origin),
+                                    "ring {capacity} rotated {rotate}: shift {} ({top}, {bottom}, \
+                                     {n})",
+                                    if down { "down" } else { "up" }
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            seen.0 > 0 && seen.1 > 0,
+            "contiguous and wrapping bands: {seen:?}"
+        );
+    }
+
+    /// Every ring slot's cell pointer, in slot order.
+    fn ring_slice_identities_in_order(g: &Grid) -> Vec<usize> {
+        g.storage
+            .rows
+            .iter()
+            .map(|r| r.as_slice().as_ptr() as usize)
+            .collect()
     }
 
     #[test]

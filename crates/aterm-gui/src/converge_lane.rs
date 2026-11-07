@@ -140,7 +140,13 @@ pub(crate) fn start_after_secrets() {
     if runs(false, false, &env_set) {
         after_secrets(&mut |trigger| {
             std::env::current_exe()
-                .and_then(|exe| aterm_secrets::converge::start(&exe, trigger))
+                .and_then(|exe| {
+                    aterm_secrets::converge::start(
+                        &exe,
+                        trigger,
+                        aterm_secrets::converge::RepositoryWork::Refresh,
+                    )
+                })
                 .map(|child| hand_off_pass(child, pass_ended))
         });
     }
@@ -186,7 +192,16 @@ impl Ended {
 /// Run one pass for `trigger` from `exe` and wait for it.
 #[cfg(unix)]
 fn pass(exe: &std::path::Path, trigger: &str) -> Ended {
-    pass_starting(|| aterm_secrets::converge::start(exe, trigger), pass_ended)
+    pass_starting(
+        || {
+            aterm_secrets::converge::start(
+                exe,
+                trigger,
+                aterm_secrets::converge::RepositoryWork::Refresh,
+            )
+        },
+        pass_ended,
+    )
 }
 
 #[cfg(unix)]

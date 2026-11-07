@@ -1136,6 +1136,7 @@ fn an_await_over_a_drive_ends_within_ctls_own_timeout() {
 fn any_fleet(ask: &survey::FleetAsk<'_>) -> Result<survey::FleetRead, survey::FleetRefused> {
     assert_eq!(ask.host, None, "every member is read");
     let peer = |n: u8, drive: bool, week: u8| survey::PeerSurvey {
+        reason: None,
         label: format!("m{n}.local"),
         answer: Ok(vec![
             format!(
@@ -1384,6 +1385,7 @@ fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
             peers: vec![
                 // An unproven member's word for where a sid runs is never taken.
                 survey::PeerSurvey {
+                    reason: None,
                     label: "m-unproven".into(),
                     answer: Ok(vec![
                         "instance host=m-unproven drive=1 sessions=1".into(),
@@ -1396,6 +1398,7 @@ fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
                 },
                 // An entry with no node (a peer named by hand) cannot be driven.
                 survey::PeerSurvey {
+                    reason: None,
                     label: "m-by-hand at 192.168.1.9".into(),
                     answer: Ok(vec![
                         "instance host=m-by-hand drive=1 sessions=1".into(),
@@ -1407,6 +1410,7 @@ fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
                     addr: Some("192.168.1.9".into()),
                 },
                 survey::PeerSurvey {
+                    reason: None,
                     label: "m4.local at 192.168.1.4".into(),
                     answer: Ok(vec![
                         "instance host=m4 drive=1 sessions=1".into(),
@@ -1543,6 +1547,7 @@ fn host_any_follows_the_board_first_and_never_records_a_survey() {
         Ok(survey::FleetRead {
             peers: vec![
                 survey::PeerSurvey {
+                    reason: None,
                     label: "m-a".into(),
                     answer: Ok(vec![
                         "instance host=m-a drive=1 sessions=3".into(),
@@ -1556,6 +1561,7 @@ fn host_any_follows_the_board_first_and_never_records_a_survey() {
                     addr: None,
                 },
                 survey::PeerSurvey {
+                    reason: None,
                     label: "m-b".into(),
                     answer: Ok(vec![
                         "instance host=m-b drive=1 sessions=2".into(),

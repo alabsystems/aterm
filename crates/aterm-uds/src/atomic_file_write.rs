@@ -283,6 +283,18 @@ pub mod publication_seam {
 /// digits.
 const SALT_BYTES: usize = 4;
 
+fn temp_component(name: &str, salt: &str) -> String {
+    format!(".{name}.tmp.{}.{salt}", std::process::id())
+}
+
+#[cfg(unix)]
+pub(crate) fn fresh_temp_component(name: &str) -> io::Result<String> {
+    Ok(temp_component(
+        name,
+        &crate::rand::hex_token::<SALT_BYTES>()?,
+    ))
+}
+
 /// A NEW file beside `path` to write it through.
 /// # Errors
 /// No entropy for the name, a clash on every try, or the create's own error.
@@ -438,7 +450,7 @@ pub(super) fn create_temp_salted(
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
     for _ in 0..8 {
         let salt = salt()?;
-        let tmp = path.with_file_name(format!(".{name}.tmp.{}.{salt}", std::process::id()));
+        let tmp = path.with_file_name(temp_component(&name, &salt));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]

@@ -29,7 +29,7 @@ use super::{
     ACCOUNT, ADDRESS, Coord, Dump, Finding, Kind, MACHINE, MAILBOX, Mark, Mode, PHONE, Planner,
     SheetKind, coord, provider_realm,
 };
-use super::{Sheet, column_service};
+use super::{Sheet, column_service, names};
 use crate::{
     Error, Result,
     machines::Label,
@@ -400,6 +400,19 @@ fn column_named(header: &str) -> Option<String> {
         .filter(|h| !h.contains('@'))
 }
 
+/// The account realms a `service` of fleet_db's `assigned_accounts` means.
+fn assigned_realms(service: &str) -> &'static [&'static str] {
+    match service {
+        "claude" => &["claude"],
+        "codex" => &["codex"],
+        "gemini" => &["google"],
+        "meta" => &["meta"],
+        "grok" => &["grok"],
+        "kimi" => &["kimi:global", "kimi:mainland-cn"],
+        _ => &[],
+    }
+}
+
 /// The provider word fleet_db's `ai_accounts.provider` names.
 fn provider_word(raw: &str) -> Option<&'static str> {
     keys::PROVIDERS
@@ -454,7 +467,54 @@ impl Planner<'_> {
             };
             self.disagreements(collection, table, pk, &read);
         }
+        if table == Dump::Computers {
+            self.machine_statuses();
+        }
         Ok(())
+    }
+
+    /// Settle what the table's rows state of `status`. fleet_db wrote `active` for every row, so that
+    /// word says nothing about a row no Mac has joined: moved off `planned`, the row could no longer
+    /// be adopted by the Mac it waits for (`register`). Any other word is the owner's, on a birth as
+    /// on a later run, so one plan settles it; it is read first, so two rows on one machine settle on
+    /// the same word whichever the replica lists first.
+    fn machine_statuses(&mut self) {
+        let mut statuses = std::mem::take(&mut self.statuses);
+        statuses.sort_by_key(|(_, word, _)| word == "active");
+        for (pk, word, at) in statuses {
+            if word == "active" && self.status_planned(&pk) {
+                continue;
+            }
+            // A placeholder this run minted gives way to what the source states of it.
+            if self.status_planned(&pk)
+                && let Some(row) = self
+                    .rows
+                    .get_mut(MACHINE.name)
+                    .and_then(|table| table.get_mut(&pk))
+            {
+                row.values.remove("status");
+            }
+            self.want(&MACHINE, &pk, "status", json!(word), &at);
+        }
+    }
+
+    /// The accounts a machine row assigns stay unsettled when the row reaches no machine: it may be
+    /// what states their preferences, which must not end for that. A disputed row needs no such word,
+    /// since a run reading one takes nothing back (`ReadNow::settled`).
+    fn unsettle_assigned(&mut self, read: &Read<'_>) {
+        let Some((ids, _, _)) = read.get("assigned_accounts") else {
+            return;
+        };
+        for id in items(&ids).flat_map(str::split_whitespace) {
+            let Some((service, email)) = id.split_once(':') else {
+                continue;
+            };
+            self.unsettled.extend(
+                assigned_realms(service)
+                    .iter()
+                    .filter_map(|realm| keys::account_pk(realm, email).ok()),
+            );
+        }
     }
 
     /// A finding for every column of a row its concurrent values disagree on ([`dump_sheets`] marks
@@ -983,17 +1043,21 @@ impl Planner<'_> {
             self.find(Kind::FreeText, Some(MACHINE.name), None, vec![at]);
             return None;
         };
-        let pk = self.machine_for(label, &at)?;
+        let node = names::stated_node(read.get("node_id"));
+        let host = names::stated_host(read.get("hostname"), raw.trim());
+        // Nothing of a row the replica holds a concurrent delete for is imported, its name included.
+        let pk = if read.row_conflicted() {
+            self.machine_key_at(label, node.as_deref(), host.as_deref())
+        } else {
+            self.machine_at(label, node.as_deref(), host.as_deref(), &at)
+        };
+        let Some(pk) = pk else {
+            self.unsettle_assigned(read);
+            return None;
+        };
         if self.row_conflict(MACHINE.name, &pk, read) {
             return Some(pk);
         }
-        // A placeholder minted this run stays `planned`: fleet_db wrote `active` for every row.
-        let placeholder = self
-            .row_get(MACHINE.name, &pk)
-            .and_then(|row| row.values.get("status"))
-            .is_some_and(|want| want.x == json!("planned"));
-        // And that word says no more of one an earlier read minted.
-        let held_planned = self.held(&MACHINE, &pk, "status") == Some(&json!("planned"));
         for (column, cell, limit) in [
             ("make", "make", 32),
             ("arch", "arch", 16),
@@ -1022,16 +1086,13 @@ impl Planner<'_> {
         let mut nick_at = None;
         if let Some((value, at)) = self.agreed(MACHINE.name, &pk, "aliases", read.get("aliases")) {
             for part in items(&value) {
-                match Label::parse(part).or_else(|_| Label::parse(&part.replace('.', "-"))) {
-                    Ok(alias) if alias.canonical() != label.canonical() => {
-                        self.element(&MACHINE, &pk, "aliases", &alias.canonical(), &at);
-                    }
-                    Ok(_) => {}
-                    Err(_) if guard::text(part, 64).is_ok() && !part.contains('@') => {
+                match names::alias_name(part) {
+                    Some(alias) => self.alias_element(&pk, &alias, &at),
+                    None if guard::text(part, 64).is_ok() && !part.contains('@') => {
                         nick_aliases.push(part.to_owned());
                         nick_at.get_or_insert_with(|| at.clone());
                     }
-                    Err(_) => self.note(&MACHINE, &pk, &at),
+                    None => self.note(&MACHINE, &pk, &at),
                 }
             }
         }
@@ -1069,25 +1130,20 @@ impl Planner<'_> {
         // fleet_db wrote `<label>.local` for every row: a host name is carried only where the
         // owner gave another.
         if let Some((host, at)) = self.agreed(MACHINE.name, &pk, "hostname", read.get("hostname"))
-            && host.strip_suffix(".local").is_none_or(|stem| {
-                stem.bytes().any(|b| b.is_ascii_uppercase())
-                    || !stem.eq_ignore_ascii_case(raw.trim())
-            })
+            && names::host_given(&host, raw.trim())
         {
             if guard::text(&host, 64).is_ok() && !host.contains('@') {
-                self.want(&MACHINE, &pk, "hosts", json!([host]), &at);
+                if let Some(hosts) = self.hosts_cell(&pk, &host, &at) {
+                    self.want(&MACHINE, &pk, "hosts", hosts, &at);
+                }
             } else {
                 self.note(&MACHINE, &pk, &at);
             }
         }
-        if !placeholder
-            && let Some((status, at)) = self
-                .agreed(MACHINE.name, &pk, "status", read.get("status"))
-                .filter(|(status, _)| !(held_planned && status.eq_ignore_ascii_case("active")))
-        {
+        if let Some((status, at)) = self.agreed(MACHINE.name, &pk, "status", read.get("status")) {
             let word = status.to_ascii_lowercase();
             if super::super::registry::MACHINE_STATUS.contains(&word.as_str()) {
-                self.want(&MACHINE, &pk, "status", json!(word), &at);
+                self.statuses.push((pk.clone(), word, at));
             } else {
                 self.note(&MACHINE, &pk, &at);
             }
@@ -1112,16 +1168,7 @@ impl Planner<'_> {
                 if let Ok(address) = keys::address(email) {
                     accounted.insert(address);
                 }
-                let realms: &[&str] = match service {
-                    "claude" => &["claude"],
-                    "codex" => &["codex"],
-                    "gemini" => &["google"],
-                    "meta" => &["meta"],
-                    "grok" => &["grok"],
-                    "kimi" => &["kimi:global", "kimi:mainland-cn"],
-                    _ => &[],
-                };
-                let account = realms
+                let account = assigned_realms(service)
                     .iter()
                     .filter_map(|realm| keys::account_pk(realm, email).ok())
                     .find(|account| {

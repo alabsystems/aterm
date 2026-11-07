@@ -177,7 +177,8 @@ fn finish_case(
         })
         .unwrap();
     if route == 1 {
-        std::fs::write(world.cfg.join("aterm.toml"), "[harness]\naccounts='off'\n").unwrap();
+        crate::test_config::write(world.cfg.join("aterm.toml"), "[harness]\naccounts='off'\n")
+            .unwrap();
     }
     let files = [
         store.state_file(),
@@ -381,8 +382,11 @@ fn bad_claude_identity_uses_an_alternative_unless_pinned() {
                 })
                 .unwrap();
             if off {
-                std::fs::write(world.cfg.join("aterm.toml"), "[harness]\naccounts='off'\n")
-                    .unwrap();
+                crate::test_config::write(
+                    world.cfg.join("aterm.toml"),
+                    "[harness]\naccounts='off'\n",
+                )
+                .unwrap();
             }
             let result = super::super::launch_env(&world.seat(), Cli::Claude, &no_usage);
             if pinned {

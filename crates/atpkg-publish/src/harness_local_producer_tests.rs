@@ -62,7 +62,8 @@ impl World {
             "--unverified".into(),
         ])
         .expect("explicit local configuration");
-        fs::create_dir(&config.checkout).expect("owned source directory");
+        aterm_uds::private_file::create_private_dir(&config.checkout)
+            .expect("owned source directory");
         git(&config.checkout, &["init", "--initial-branch=main"]);
         git(
             &config.checkout,
@@ -196,8 +197,24 @@ impl World {
             .expect("private bin");
         #[cfg(target_os = "macos")]
         let mut payload = b"\xcf\xfa\xed\xfe".to_vec();
+        // A complete static ELF64 header for this host: a GNU host admits a payload by its
+        // header, and no machine code follows it.
         #[cfg(not(target_os = "macos"))]
-        let mut payload = b"\x7fELF".to_vec();
+        let mut payload = {
+            let machine: u16 = match std::env::consts::ARCH {
+                "aarch64" => 183,
+                "x86_64" => 62,
+                other => panic!("no ELF machine for {other}"),
+            };
+            let mut header = vec![0; 64];
+            header[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+            header[16..18].copy_from_slice(&2_u16.to_le_bytes());
+            header[18..20].copy_from_slice(&machine.to_le_bytes());
+            header[20..24].copy_from_slice(&1_u32.to_le_bytes());
+            header[52..54].copy_from_slice(&64_u16.to_le_bytes());
+            header[54..56].copy_from_slice(&56_u16.to_le_bytes());
+            header
+        };
         payload.extend_from_slice(b"inert admission fixture, never executed\n");
         payload.extend_from_slice(identity.source.as_bytes());
         let executable = artifact.join("bin").join(COMMAND);
@@ -219,11 +236,15 @@ impl World {
             "exposes":[COMMAND],"executables":[{"path":format!("bin/{COMMAND}"),
                 "size":payload.len(),"sha256":digest}]
         });
+        let recorded = artifact.join("local-build.json");
         fs::write(
-            artifact.join("local-build.json"),
+            &recorded,
             aterm_json::to_vec(&receipt).expect("fixture receipt"),
         )
         .expect("local artifact receipt");
+        // Private whatever the umask, as the producer records it.
+        fs::set_permissions(&recorded, fs::Permissions::from_mode(0o600))
+            .expect("private artifact receipt");
         (plan, artifact)
     }
 

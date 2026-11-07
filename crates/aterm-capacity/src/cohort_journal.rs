@@ -145,6 +145,28 @@ pub(crate) struct Journal {
 }
 
 impl Journal {
+    pub(crate) fn funded_scope(&self, claim: crate::CohortClosureRef) -> crate::FundedScope {
+        let mut unresolved = matches!(self.state, State::Armed(_))
+            || self.cohort_owned && matches!(self.state, State::Description)
+            || self.armed_once && self.policy == ClosurePolicy::BootOnly;
+        let mut groups = Vec::new();
+        if let State::Bound(_, group) = &self.state {
+            groups.push(group.clone());
+        }
+        for subgroup in &self.subgroups {
+            match &subgroup.captured {
+                Some(group) => groups.push(group.clone()),
+                None => unresolved = true,
+            }
+        }
+        crate::FundedScope {
+            claim,
+            scope: self.holder.scope.clone(),
+            holder: (!self.cohort_owned).then_some(self.holder.identity),
+            groups,
+            unresolved,
+        }
+    }
     #[cfg(test)]
     pub(crate) fn observation(&self) -> (i64, Lifetime, bool) {
         let phase = match self.state {

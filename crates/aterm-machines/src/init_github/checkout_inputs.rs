@@ -73,9 +73,9 @@ impl Checkouts {
             profile(sys, user).and_then(|p| asked(p.and_then(|p| p.github), user)),
             Ok(Asked::Default)
         ) && let Ok(listed) =
-            inventory::Inventory::read(sys, user).and_then(|i| i.repositories())
+            inventory::Inventory::read(sys, user).map(|i| i.into_repositories())
         {
-            for repo in listed.repositories {
+            for repo in listed {
                 if repos::HOME_FOLDERS
                     .iter()
                     .any(|name| name.eq_ignore_ascii_case(&repo.name))

@@ -2923,7 +2923,7 @@ fn a_verdict_kept_before_the_subscribers_long_poll_is_read_before_it() {
                 &|line| logged.lock().expect("log").push(line.to_owned()),
                 &|| stop.load(Ordering::SeqCst),
                 &Converging {
-                    start: &|_| None,
+                    start: &|_, _| None,
                     routes: &crate::server::route_sources,
                 },
                 &deaf(),
@@ -3220,7 +3220,7 @@ fn a_mac_waiting_for_alab_asks_its_members_from_its_subscriber() {
                 &|line| logged.lock().expect("log").push(line.to_owned()),
                 &|| stop.load(Ordering::SeqCst),
                 &Converging {
-                    start: &|_| None,
+                    start: &|_, _| None,
                     routes: &crate::server::route_sources,
                 },
                 &Hearing {
@@ -3297,16 +3297,17 @@ fn a_route_asks_pending_members_without_waiting_for_the_vault_long_poll() {
                     consumed = routes.recv_timeout(most).is_ok();
                     consumed
                 },
-                || {
-                    subscriber_loop_until(
+                |maintain| {
+                    subscriber_loop_projecting(
                         me,
                         &|_| {},
                         &|| stop.load(Ordering::SeqCst),
-                        &Converging {
-                            start: &|_| None,
-                            routes: &crate::server::route_sources,
-                        },
                         &hearing,
+                        &projection::Projection::new(&Converging {
+                            start: &|_, _| None,
+                            routes: &crate::server::route_sources,
+                        }),
+                        maintain,
                     )
                 },
             )
@@ -3400,16 +3401,17 @@ fn a_broker_arrival_asks_pending_members_without_a_route_change() {
                             consumed = ticks.recv_timeout(most).is_ok();
                             false // A broker's arrival changes no route.
                         },
-                        || {
-                            subscriber_loop_until(
+                        |maintain| {
+                            subscriber_loop_projecting(
                                 me,
                                 &|_| {},
                                 &|| stop.load(Ordering::SeqCst),
-                                &Converging {
-                                    start: &|_| None,
-                                    routes: &crate::server::route_sources,
-                                },
                                 &hearing,
+                                &projection::Projection::new(&Converging {
+                                    start: &|_, _| None,
+                                    routes: &crate::server::route_sources,
+                                }),
+                                maintain,
                             )
                         },
                     )
@@ -3483,8 +3485,10 @@ fn member_route_wakes_preserve_sharing_holds_and_revocation() {
         if off {
             let config = mb.home.join(".config/aterm");
             std::fs::create_dir_all(&config).expect("config directory");
-            std::fs::write(config.join("aterm.toml"), "[swarm]\nenabled = false\n")
-                .expect("sharing hold");
+            crate::fsx::write_owned_in_place(
+                config.join("aterm.toml"),
+                "[swarm]\nenabled = false\n",
+            );
         } else {
             let mut state = load_state(&mb).expect("state");
             state.membership = Stored::Revoked;
@@ -3492,27 +3496,59 @@ fn member_route_wakes_preserve_sharing_holds_and_revocation() {
         }
         let members = std::sync::Mutex::new(MembersAsked::default());
         let asks = std::sync::atomic::AtomicUsize::new(0);
+        let maintained = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let upkeep = std::sync::Arc::clone(&maintained);
+        let ports = Converging {
+            start: &|_, _| panic!("local maintenance admits no converge job"),
+            routes: &|| [None; 3],
+        };
+        let projection = projection::Projection::observing(
+            &ports,
+            SubscriberInputs::new(Box::new(|| panic!("maintenance reads no readiness")))
+                .with_maintenance(Box::new(move || {
+                    upkeep.fetch_add(1, Ordering::SeqCst);
+                })),
+        );
         let (route, routes) = std::sync::mpsc::channel();
         let (handled, handling) = std::sync::mpsc::channel();
+        let observations = std::sync::atomic::AtomicUsize::new(0);
         route.send(()).expect("route queued");
-        let mut consumed = false;
+        let mut failed = false;
         member_routes::while_hearing(
             &mb,
             &members,
             &|_: &Paths| Ok(asks.fetch_add(1, Ordering::SeqCst)),
             &|_| {},
-            &|_| {},
+            &|event| {
+                if matches!(event, member_routes::ProjectionEvent::Maintenance) {
+                    projection.maintain();
+                    let _ = handled.send(());
+                } else if matches!(
+                    event,
+                    member_routes::ProjectionEvent::Observe
+                        | member_routes::ProjectionEvent::Recovered
+                ) {
+                    observations.fetch_add(1, Ordering::SeqCst);
+                }
+            },
             move |most| {
                 crate::envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = Some(alab.clone()));
-                if std::mem::take(&mut consumed) {
-                    handled.send(()).expect("route handled");
+                let came = routes.recv_timeout(most).is_ok();
+                if off && came && !std::mem::replace(&mut failed, true) {
+                    panic!("injected listener failure while sharing is off");
                 }
-                consumed = routes.recv_timeout(most).is_ok();
-                consumed
+                came
             },
-            || handling.recv_timeout(HANG_DETECTOR).expect("route handled"),
+            |_| handling.recv_timeout(HANG_DETECTOR).expect("route handled"),
         );
         assert_eq!(asks.load(Ordering::SeqCst), 0, "off={off}");
+        if off {
+            assert_eq!(observations.load(Ordering::SeqCst), 0);
+        }
+        assert!(
+            maintained.load(Ordering::SeqCst) > 0,
+            "local upkeep survives sharing/permission holds"
+        );
         server.stop();
     }
 }
@@ -3532,7 +3568,7 @@ fn member_admission_projects_after_the_previous_runner_without_releasing_the_lon
         let input = std::sync::Mutex::new(Some(input));
         let starts = AtomicUsize::new(0);
         let pid = AtomicI32::new(0);
-        let start = |_: &Path| {
+        let start = |_: &Path, _: crate::converge::RepositoryWork| {
             starts.fetch_add(1, Ordering::SeqCst);
             input.lock().unwrap().take().map(|input| {
                 let sh = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
@@ -3582,12 +3618,13 @@ fn member_admission_projects_after_the_previous_runner_without_releasing_the_lon
                     &hearing.members,
                     &ask,
                     &|_| {},
-                    &|admitted| {
-                        if matches!(admitted, member_routes::ProjectionEvent::Admitted) {
-                            projection.admitted();
-                        } else {
-                            projection.poll();
-                        }
+                    &|admitted| match admitted {
+                        member_routes::ProjectionEvent::Admitted => projection.admitted(),
+                        member_routes::ProjectionEvent::Observe => projection.poll(),
+                        member_routes::ProjectionEvent::Recovered => projection.recovered(),
+                        member_routes::ProjectionEvent::Maintenance => projection.maintain(),
+                        member_routes::ProjectionEvent::BrokerReady
+                        | member_routes::ProjectionEvent::Ended => {}
                     },
                     move |most| {
                         crate::envelope::TEST_RETIRED
@@ -3598,13 +3635,14 @@ fn member_admission_projects_after_the_previous_runner_without_releasing_the_lon
                         consumed = routes.recv_timeout(most).is_ok();
                         consumed
                     },
-                    || {
+                    |maintain| {
                         subscriber_loop_projecting(
                             &mb,
                             &|_| {},
                             &|| stop.load(Ordering::SeqCst),
                             &hearing,
                             &projection,
+                            maintain,
                         )
                     },
                 )
@@ -3657,16 +3695,18 @@ fn local_inputs_restart_subscriber_projection_while_http_and_retry_time_stand_st
             let observed = ready.clone();
             let (polled, polling) = std::sync::mpsc::channel();
             let mut previous = false;
-            let inputs = Box::new(move || {
+            let inputs = SubscriberInputs::new(Box::new(move || {
                 let now = observed.is_file();
                 let moved = now != previous;
                 previous = now;
                 polled.send(()).unwrap();
-                moved
-            });
+                moved.then_some(crate::converge::RepositoryWork::Repair)
+            }));
             let starts = AtomicUsize::new(0);
+            let work_seen = std::sync::Mutex::new(Vec::new());
             let pid = AtomicI32::new(0);
-            let start = |_: &Path| {
+            let start = |_: &Path, work| {
+                work_seen.lock().unwrap().push(work);
                 if starts.fetch_add(1, Ordering::SeqCst) != 0 {
                     return None;
                 }
@@ -3693,24 +3733,26 @@ fn local_inputs_restart_subscriber_projection_while_http_and_retry_time_stand_st
                         &hearing.members,
                         &|_| Ok(0),
                         &|_| {},
-                        &|admitted| {
-                            if matches!(admitted, member_routes::ProjectionEvent::Admitted) {
-                                projection.admitted()
-                            } else {
-                                projection.poll()
-                            }
+                        &|admitted| match admitted {
+                            member_routes::ProjectionEvent::Admitted => projection.admitted(),
+                            member_routes::ProjectionEvent::Observe => projection.poll(),
+                            member_routes::ProjectionEvent::Recovered => projection.recovered(),
+                            member_routes::ProjectionEvent::Maintenance => projection.maintain(),
+                            member_routes::ProjectionEvent::BrokerReady
+                            | member_routes::ProjectionEvent::Ended => {}
                         },
                         |most| {
                             std::thread::sleep(most);
                             false
                         },
-                        || {
+                        |maintain| {
                             subscriber_loop_projecting(
                                 &mb,
                                 &|_| {},
                                 &|| stop.load(Ordering::SeqCst),
                                 &hearing,
                                 &projection,
+                                maintain,
                             )
                         },
                     )
@@ -3739,6 +3781,15 @@ fn local_inputs_restart_subscriber_projection_while_http_and_retry_time_stand_st
                         "unchanged input spends no retry"
                     );
                 }
+                let mut expected = vec![crate::converge::RepositoryWork::Refresh];
+                if changed {
+                    expected.push(crate::converge::RepositoryWork::Repair);
+                }
+                assert_eq!(
+                    *work_seen.lock().unwrap(),
+                    expected,
+                    "exit={exit}, changed={changed}"
+                );
                 assert_eq!(server.waiting(), 1, "no HTTP response or timer advanced");
                 stop.store(true, Ordering::SeqCst);
                 server.stop();
@@ -3746,6 +3797,108 @@ fn local_inputs_restart_subscriber_projection_while_http_and_retry_time_stand_st
             });
         }
     }
+}
+
+/// A failed readiness round must not retire local observation while HTTP still holds
+/// the subscriber and its ordinary converge retry clock has not advanced.
+#[cfg(unix)]
+#[test]
+fn a_failed_readiness_round_recovers_local_inputs_while_http_is_held() {
+    use std::sync::atomic::{AtomicI32, AtomicUsize};
+
+    let root = aterm_tempfile::tempdir().unwrap();
+    let server = serve_holding(&root.path().join("store"), Duration::from_secs(600));
+    let (_admin, mb, _alab) = waiting_for_alab(root.path(), &server);
+    let ready = root.path().join("input-ready");
+    let observed = ready.clone();
+    let (polled, polling) = mpsc::channel();
+    let mut previous = false;
+    let inputs = SubscriberInputs::new(Box::new(move || {
+        let now = observed.is_file();
+        let moved = now != previous;
+        previous = now;
+        polled.send(()).unwrap();
+        moved.then_some(crate::converge::RepositoryWork::Repair)
+    }));
+    let starts = AtomicUsize::new(0);
+    let pid = AtomicI32::new(0);
+    let start = |_: &Path, _: crate::converge::RepositoryWork| {
+        if starts.fetch_add(1, Ordering::SeqCst) != 0 {
+            return None;
+        }
+        let sh = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+        let child = aterm_uds::spawnfd::command(&sh)
+            .args(["-c", "exit 76"])
+            .spawn()
+            .unwrap();
+        pid.store(child.id().try_into().unwrap(), Ordering::SeqCst);
+        Some(child)
+    };
+    let ports = Converging {
+        start: &start,
+        routes: &|| [None; 3],
+    };
+    let projection = projection::Projection::observing(&ports, inputs).at_clock(|| 0);
+    let stop = AtomicBool::new(false);
+    let (fail, failing) = mpsc::channel();
+    let resumed = std::thread::scope(|scope| {
+        let _stops = StopsOnDrop(&stop);
+        let subscriber = scope.spawn(|| {
+            let hearing = deaf();
+            member_routes::while_hearing(
+                &mb,
+                &hearing.members,
+                &|_| Ok(0),
+                &|_| {},
+                &|event| match event {
+                    member_routes::ProjectionEvent::Admitted => projection.admitted(),
+                    member_routes::ProjectionEvent::Observe => projection.poll(),
+                    member_routes::ProjectionEvent::Recovered => projection.recovered(),
+                    member_routes::ProjectionEvent::Maintenance => projection.maintain(),
+                    member_routes::ProjectionEvent::BrokerReady
+                    | member_routes::ProjectionEvent::Ended => {}
+                },
+                move |most| {
+                    if failing.recv_timeout(most).is_ok() {
+                        panic!("injected readiness round failure");
+                    }
+                    false
+                },
+                |maintain| {
+                    subscriber_loop_projecting(
+                        &mb,
+                        &|_| {},
+                        &|| stop.load(Ordering::SeqCst),
+                        &hearing,
+                        &projection,
+                        maintain,
+                    )
+                },
+            )
+        });
+        until("the real vault long-poll is held", || server.waiting() == 1);
+        until("the first runner is reaped", || {
+            let pid = pid.load(Ordering::SeqCst);
+            pid != 0
+                && aterm_uds::process::process_presence(pid)
+                    == aterm_uds::process::ProcessPresence::Absent
+        });
+        polling.recv_timeout(HANG_DETECTOR).unwrap();
+        while polling.try_recv().is_ok() {}
+        std::fs::write(&ready, "installed").unwrap();
+        fail.send(()).unwrap();
+        let resumed = polling.recv_timeout(HANG_DETECTOR).is_ok();
+        let still_held = server.waiting() == 1;
+        stop.store(true, Ordering::SeqCst);
+        server.stop();
+        subscriber.join().unwrap().unwrap();
+        resumed && still_held
+    });
+    assert!(
+        resumed,
+        "local observation must resume without an HTTP answer"
+    );
+    assert_eq!(starts.load(Ordering::SeqCst), 2);
 }
 
 /// When a waiting Mac's subscriber asks ALab's members: at once as it starts waiting for the ALab
@@ -3865,7 +4018,7 @@ fn swarm_off_asks_no_alab_member_from_a_waiting_subscriber() {
         aterm_types::dirs::resolve_aterm_config_path(None, None, Some(mb.home.as_os_str()))
             .expect("a config path under the test home");
     std::fs::create_dir_all(config.parent().expect("its folder")).unwrap();
-    std::fs::write(&config, "[swarm]\nenabled = false\n").unwrap();
+    crate::fsx::write_owned_in_place(&config, "[swarm]\nenabled = false\n");
     assert_eq!(crate::swarm::enabled_in_home(&mb.home), Ok(false));
     let asks = std::sync::atomic::AtomicUsize::new(0);
     let ask = |_: &Paths| {
@@ -3873,7 +4026,7 @@ fn swarm_off_asks_no_alab_member_from_a_waiting_subscriber() {
         Ok(1)
     };
     let started = std::sync::atomic::AtomicUsize::new(0);
-    let start = |_: &Path| {
+    let start = |_: &Path, _: crate::converge::RepositoryWork| {
         started.fetch_add(1, Ordering::SeqCst);
         None
     };
@@ -3941,7 +4094,7 @@ fn swarm_off_asks_no_alab_member_from_a_waiting_subscriber() {
             1,
             "said once"
         );
-        std::fs::write(&config, "[swarm]\nenabled = true\n").unwrap();
+        crate::fsx::write_owned_in_place(&config, "[swarm]\nenabled = true\n");
         until("the subscriber asks once sharing is on", || {
             asks.load(Ordering::SeqCst) > 0
         });
@@ -4056,7 +4209,7 @@ fn the_subscriber_starts_the_converge_pass_as_it_starts_per_applied_version_and_
     assert!(matches!(sync(&mb, None), Ok(SyncOutcome::Applied { .. })));
     let (starts, reads) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let (away, stop) = (AtomicBool::new(false), AtomicBool::new(false));
-    let start = |_: &Path| {
+    let start = |_: &Path, _: crate::converge::RepositoryWork| {
         starts.fetch_add(1, Ordering::SeqCst);
         None
     };
@@ -4151,7 +4304,7 @@ fn a_failing_subscriber_ends_its_nap_on_a_browse_add() {
                 &log,
                 &|| stop.load(Ordering::SeqCst),
                 &Converging {
-                    start: &|_| None,
+                    start: &|_, _| None,
                     routes: &crate::server::route_sources,
                 },
                 &Hearing {
@@ -4206,7 +4359,7 @@ fn a_pass_healthy_after_errors_starts_a_runner() {
     let stop = AtomicBool::new(false);
     // The start this test waits for stops the loop as it is made, before the pause after its
     // pass begins.
-    let start = |_: &Path| {
+    let start = |_: &Path, _: crate::converge::RepositoryWork| {
         if starts.fetch_add(1, Ordering::SeqCst) == 1 {
             stop.store(true, Ordering::SeqCst);
         }
@@ -4323,7 +4476,7 @@ fn a_server_that_vanishes_and_returns_at_a_new_address_is_applied() {
                         || load_state(&mb).is_ok_and(|state| state.seq == newer)
                 },
                 &Converging {
-                    start: &|_| None,
+                    start: &|_, _| None,
                     routes: &crate::server::route_sources,
                 },
                 &Hearing {
@@ -4383,8 +4536,9 @@ fn a_runner_that_ended_while_the_vault_cannot_be_reached_is_reaped() {
     std::fs::set_permissions(&quick, std::fs::Permissions::from_mode(0o700)).expect("executable");
     let pid = AtomicI32::new(0);
     // The runner is handed to the loop once it exited, and before anything reaped it.
-    let start = |_: &Path| {
-        let child = RefCell::new(crate::converge::start(&quick, "subscriber").expect("a runner"));
+    let start = |_: &Path, work| {
+        let child =
+            RefCell::new(crate::converge::start(&quick, "subscriber", work).expect("a runner"));
         until("the runner exits", || {
             child.borrow_mut().exited().expect("its state")
         });

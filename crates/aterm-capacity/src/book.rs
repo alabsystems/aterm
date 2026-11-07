@@ -21,8 +21,11 @@
 //! record of the stage whose work holds its own (its analogue: verify's test compile for
 //! `targo test`, its lint for `tippy`, read as verify reads it, or in another checkout), so a
 //! light run (a fresh build that compiled nothing) never bounds it below a heavy one measured
-//! for the same work; only with none of those, a wider selection's in its checkout; and with
-//! nothing at all, the cold figure.
+//! for the same work; only with none of those, a wider selection's in its checkout; then the most
+//! of a wider named selection's in another checkout, its own or its analogue's, refused where a
+//! narrower record or a unit's peak shows that run warm ([`Records::wider_elsewhere`], as verify
+//! reads it), claimed at most at the cold figure ([`need`]); and with nothing at all, the cold
+//! figure.
 
 use std::fmt;
 use std::io::{self, Write as _};
@@ -59,6 +62,16 @@ pub const VERIFY_RECORD: &str = "verify/stage-memory.json";
 
 /// Plain `targo` builds' records, beside verify's ([`VERIFY_RECORD`]).
 pub const TARGO_RECORD: &str = "verify/targo-memory.json";
+
+/// The stage verify's test compile is kept under (`aterm_verify`'s `StageId::TestCompile`): a cold
+/// run of it over a named selection compiles every unit of the selection's crates, each of which
+/// its [`UNIT_STAGE`] records weigh.
+pub const TEST_COMPILE: &str = "TestCompile";
+
+/// The stage verify's test compile keeps each heavy unit's peak under (`aterm_verify::shape`'s
+/// `unit_key`): a key whose crates name the unit's package alone and whose variant names its kind
+/// (`aterm_gui lib`), in the checkout it compiled in.
+pub const UNIT_STAGE: &str = "TestCompile unit";
 
 /// Verify's test binaries' run history (`aterm_verify::test_history`), beside its stages' memory
 /// records ([`VERIFY_RECORD`]).
@@ -162,6 +175,17 @@ pub fn update_text(
     write_staged(path, next.as_bytes(), prefix, max).map(|()| true)
 }
 
+/// The package name a `-p` spec names: what follows a path spec's `#`, up to its `@<version>`.
+/// `None` for a spec whose `@` has no version after it (`name@`), which names no package.
+#[must_use]
+pub fn spec_name(spec: &str) -> Option<&str> {
+    let tail = spec.rsplit_once('#').map_or(spec, |(_, t)| t);
+    match tail.split_once('@') {
+        None => Some(tail),
+        Some((name, version)) => (!version.is_empty()).then_some(name),
+    }
+}
+
 /// WHAT A RECORD IS KEPT FOR: a kind of work, the checkout it ran in, its crate selection,
 /// sorted, where the work reads one, and what else of the run changes its work.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,8 +198,8 @@ pub struct Key {
     /// The selection's crates, sorted and without repeats; `None` for the whole workspace, which
     /// holds every selection, and for work that is the same whatever is selected.
     pub crates: Option<Vec<String>>,
-    /// What else of the run changes the work: the test binaries run at once for verify's test
-    /// run (`jobs 4`), the cells asked for, a plain build's profile and targets (`release`).
+    /// What else of the run changes the work: the cells asked for (`cells linux-arm`), a plain
+    /// build's profile and targets (`release`).
     pub variant: Option<String>,
 }
 
@@ -184,8 +208,26 @@ impl Key {
     /// the workspace holds every selection, and a list holds one whose every crate it names.
     #[must_use]
     pub fn holds(&self, other: &Key) -> bool {
+        self.checkout == other.checkout && self.holds_work(other)
+    }
+
+    /// Whether this key is a wider NAMED selection than `other`'s in another checkout: the same
+    /// work and variant, a crate list that holds `other`'s as [`Self::holds`] reads it, and not
+    /// the same selection, which [`Self::elsewhere`] reads. Never the workspace (`crates: None`):
+    /// another checkout's may be another repository's, whose build compiled none of this
+    /// selection's units, and a virtual manifest's bare build covers only its default members.
+    #[must_use]
+    pub fn wider_elsewhere(&self, other: &Key) -> bool {
+        self.checkout != other.checkout
+            && self.crates.is_some()
+            && self.crates != other.crates
+            && self.holds_work(other)
+    }
+
+    /// Whether this key's selection holds `other`'s, for the same work and variant, in any
+    /// checkout.
+    fn holds_work(&self, other: &Key) -> bool {
         self.stage == other.stage
-            && self.checkout == other.checkout
             && self.variant == other.variant
             && match (&self.crates, &other.crates) {
                 (None, _) => true,
@@ -322,6 +364,17 @@ pub struct Learned {
     pub wider: Option<Key>,
 }
 
+/// What a wider named selection kept in another checkout ([`Records::wider_elsewhere`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Wider {
+    /// Its record's key: the wider selection, in the checkout it ran in.
+    pub key: Key,
+    /// The most its record keeps, bytes.
+    pub peak: u64,
+    /// How many peaks its record keeps.
+    pub runs: usize,
+}
+
 /// EVERY KEPT PEAK OF ONE FILE ([`Row`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Records {
@@ -388,6 +441,91 @@ impl Records {
     #[must_use]
     pub fn elsewhere(&self, key: &Key) -> Option<Learned> {
         self.most_of(|k| k.elsewhere(key))
+    }
+
+    /// WHAT A WIDER SELECTION OF `key`'S WORK TOOK IN ANOTHER CHECKOUT, where it bounds anything:
+    /// the most any record of the same work and variant there, over a named selection that holds
+    /// `key`'s and is not it, keeps ([`Key::wider_elsewhere`]), with that record's key; an upper
+    /// bound on a premise, the one [`Self::learned`] reads a wider selection in its checkout on: a
+    /// superset's build compiles the subset's crates too. The most, not the least, so one heavy
+    /// superset kept anywhere holds the claim to its peak (the cold figure, for one with
+    /// `aterm-gui`) beside a lighter one: a light superset is as likely a warm run as a tighter
+    /// bound. Its cache was not this checkout's, and a warm run compiled little and keeps a light
+    /// peak, which bounds nothing. So it is REFUSED (`None`, as where none is kept) where it is
+    /// lighter than what a record of a selection inside `key`'s, of its work and variant, in any
+    /// checkout, kept, or than `floor`, the least a cold run of `key`'s work holds where the caller
+    /// knows it ([`Self::unit_floor`]; 0 where it does not): the wider run compiled all of that
+    /// work, so it was warm, and every wider record elsewhere with it, since this is the most of
+    /// them. It is refused, not raised: a raised figure would bound only the narrower record's
+    /// crates. LIMIT: a warm wider run that neither outweighs answers, and nothing here can tell;
+    /// a one-crate selection has no narrower named selection inside it, so where `floor` is 0 its
+    /// most wider record elsewhere answers however warm that run was. `floor` is 0 for every stage
+    /// but a test compile of no variant, for a test compile none of whose crates kept a unit (verify
+    /// keeps a unit's peak only at 1 GiB or more), and for every plain build but a `targo test` of
+    /// no variant whose analogue is verify's test compile.
+    #[must_use]
+    pub fn wider_elsewhere(&self, key: &Key, floor: u64) -> Option<Wider> {
+        let (peak, row) = self
+            .rows
+            .iter()
+            .filter(|r| r.key.wider_elsewhere(key))
+            .filter_map(|r| r.most().map(|m| (m, r)))
+            .max_by_key(|(m, _)| *m)?;
+        (peak >= floor.max(self.narrower(key))).then(|| Wider {
+            key: row.key.clone(),
+            peak,
+            runs: row.peaks.len(),
+        })
+    }
+
+    /// The most any record of `key`'s work and variant, in any checkout, over a named selection
+    /// inside `key`'s and not it, kept; 0 where none is, or `key` names no selection.
+    fn narrower(&self, key: &Key) -> u64 {
+        key.crates.as_deref().map_or(0, |crates| {
+            self.rows
+                .iter()
+                .filter(|r| r.key.stage == key.stage && r.key.variant == key.variant)
+                .filter(|r| {
+                    r.key.crates.as_deref().is_some_and(|theirs| {
+                        !theirs.is_empty()
+                            && theirs.len() < crates.len()
+                            && theirs.iter().all(|c| crates.contains(c))
+                    })
+                })
+                .filter_map(Row::most)
+                .max()
+                .unwrap_or(0)
+        })
+    }
+
+    /// THE LEAST A COLD TEST COMPILE OF `key` HOLDS: the most any [`UNIT_STAGE`] record, in any
+    /// checkout and of any kind, kept for a crate `key`'s selection names (a `-p` spec read by its
+    /// package name, [`spec_name`]), since a cold run of the selection compiles that unit, and a
+    /// stage's peak is never less than what one of its compilers held. 0 for any key but verify's
+    /// test compile ([`TEST_COMPILE`]) of a named selection with no variant (a shaped call's
+    /// variant compiles part of its work), and where no unit of its crates is kept. LIMIT: a unit
+    /// kept by a call that compiled more than the selection's tests is read the same way (a
+    /// release's workspace test compile folds in the measuring benches, and keeps their units
+    /// beside the rest); one heavier than every unit the tests compile refuses a wider record that
+    /// held, and the claim falls to the cover or the cold figure, never below what it was.
+    #[must_use]
+    pub fn unit_floor(&self, key: &Key) -> u64 {
+        let Some(crates) = key.crates.as_deref() else {
+            return 0;
+        };
+        if key.stage != TEST_COMPILE || key.variant.is_some() {
+            return 0;
+        }
+        self.rows
+            .iter()
+            .filter(|r| {
+                r.key.stage == UNIT_STAGE
+                    && matches!(r.key.crates.as_deref(), Some([package])
+                        if crates.iter().any(|c| spec_name(c).unwrap_or(c) == package.as_str()))
+            })
+            .filter_map(Row::most)
+            .max()
+            .unwrap_or(0)
     }
 
     /// The most any record whose key `pick` takes keeps, and that key.
@@ -570,6 +708,11 @@ pub enum Via {
     Wider(Key),
     /// Its key's record in another checkout.
     Elsewhere(Key),
+    /// A wider selection's record in another checkout, its claim at most the cold figure.
+    WiderElsewhere(Key),
+    /// Verify's record of the stage whose work holds its own over a wider selection in another
+    /// checkout, its claim at most the cold figure.
+    AnalogueWiderElsewhere(Key),
     /// Verify's record of the stage whose work holds its own: verify's own, a wider selection's
     /// in its checkout, or its key's in another checkout.
     Analogue(Key),
@@ -595,8 +738,18 @@ pub struct Found {
 /// can take. Only where none of those is kept, the most of a wider selection's in `own` in its
 /// checkout ([`Key::holds`]): that work holds this one's, but a light run of it would bound a
 /// heavy compile of this one, and a heavy one would hold a light build to a workspace's peak.
-/// `None` where nothing is kept: the build claims the cold figure. A tie is read as the build's
-/// own.
+/// Only where none of that is kept either, the more of two wider named selections' records in
+/// another checkout, each read by the one rule verify reads its own by
+/// ([`Records::wider_elsewhere`]), so each is refused where a narrower record of its book shows
+/// that wider run warm: where `analogue` names verify's records, the analogue's key there, with
+/// the floor of its heaviest unit ([`Records::unit_floor`]: verify's test compile's, 0 for its
+/// lint); and `key` in `own`, where `key` names no variant and the analogue is verify's test
+/// compile, with that same floor or the most verify kept for a selection inside the analogue's,
+/// whichever is more (a wider `targo test` of no variant built every test target of its crates,
+/// so all that verify's narrower run did), else none.
+/// Its claim is at most the cold figure ([`need`]), so it never claims more than a build with
+/// nothing kept would. `None` where nothing is kept: the build claims the cold figure. A tie is
+/// read as the build's own.
 #[must_use]
 pub fn chain(own: &Records, key: &Key, analogue: Option<(&Records, &Key)>) -> Option<Found> {
     let found = |peak: u64, runs: usize, via: Via| Found { peak, runs, via };
@@ -627,10 +780,29 @@ pub fn chain(own: &Records, key: &Key, analogue: Option<(&Records, &Key)>) -> Op
     {
         return Some(most);
     }
-    own.most_of(|k| k != key && k.holds(key)).map(|l| {
-        let from = l.wider.unwrap_or_else(|| key.clone());
-        found(l.peak, l.runs, Via::Wider(from))
-    })
+    if let Some(wide) = own.most_of(|k| k != key && k.holds(key)) {
+        let from = wide.wider.unwrap_or_else(|| key.clone());
+        return Some(found(wide.peak, wide.runs, Via::Wider(from)));
+    }
+    let floor = analogue.map_or(0, |(records, like)| records.unit_floor(like));
+    let like_wide = analogue.and_then(|(records, like)| {
+        records
+            .wider_elsewhere(like, floor)
+            .map(|w| found(w.peak, w.runs, Via::AnalogueWiderElsewhere(w.key)))
+    });
+    let own_floor = match analogue {
+        Some((records, like)) if key.variant.is_none() && like.stage == TEST_COMPILE => {
+            floor.max(records.narrower(like))
+        }
+        _ => 0,
+    };
+    let own_wide = own
+        .wider_elsewhere(key, own_floor)
+        .map(|w| found(w.peak, w.runs, Via::WiderElsewhere(w.key)));
+    [like_wide, own_wide]
+        .into_iter()
+        .flatten()
+        .max_by_key(|f| f.peak)
 }
 
 /// WHAT A PLAIN BUILD CLAIMS ([`need`]).
@@ -644,7 +816,10 @@ pub struct BuildNeed {
 
 /// What a plain build whose record is kept under `key` claims on a machine of `physical` bytes
 /// (`None`: unread): what [`chain`] finds in `own` and `analogue` and a fifth more, at least 1 GiB
-/// more ([`crate::peak_claim`]); with none found, the cold figure ([`crate::cold_claim`]).
+/// more ([`crate::peak_claim`]), never more than the cold figure where a wider selection's record
+/// in another checkout is what it found ([`Via::WiderElsewhere`], [`Via::AnalogueWiderElsewhere`]:
+/// that rule stands in for the cold figure, so it only ever lowers it); with none found, the cold
+/// figure ([`crate::cold_claim`]).
 #[must_use]
 pub fn need(
     own: &Records,
@@ -654,7 +829,14 @@ pub fn need(
 ) -> BuildNeed {
     match chain(own, key, analogue) {
         Some(found) => BuildNeed {
-            bytes: crate::peak_claim(found.peak),
+            bytes: match found.via {
+                Via::WiderElsewhere(_) | Via::AnalogueWiderElsewhere(_) => {
+                    crate::peak_claim(found.peak).min(crate::cold_claim(physical))
+                }
+                Via::Own | Via::Wider(_) | Via::Elsewhere(_) | Via::Analogue(_) => {
+                    crate::peak_claim(found.peak)
+                }
+            },
             found: Some(found),
         },
         None => BuildNeed {
@@ -681,6 +863,12 @@ impl fmt::Display for BuildNeed {
                 k.selection()
             )?,
             Via::Elsewhere(k) => write!(f, ", the most a build of it in {} used", k.checkout)?,
+            Via::WiderElsewhere(k) => write!(
+                f,
+                ", the most a build of a wider selection ({}) in {} used",
+                k.selection(),
+                k.checkout
+            )?,
             Via::Analogue(k) => write!(
                 f,
                 ", the most verify's {} of {} in {} used",
@@ -688,10 +876,22 @@ impl fmt::Display for BuildNeed {
                 k.selection(),
                 k.checkout
             )?,
+            Via::AnalogueWiderElsewhere(k) => write!(
+                f,
+                ", the most verify's {} of a wider selection ({}) in {} used",
+                k.stage,
+                k.selection(),
+                k.checkout
+            )?,
         }
+        let bound = if crate::peak_claim(found.peak) > self.bytes {
+            "at most the cold figure (16 GiB, at most half of physical memory)"
+        } else {
+            "at least 1 GiB"
+        };
         write!(
             f,
-            " ({}) and a fifth more, at least 1 GiB",
+            " ({}) and a fifth more, {bound}",
             crate::size(found.peak)
         )
     }

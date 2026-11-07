@@ -602,7 +602,7 @@ fn tiered_limit_equal_to_ring_cap_discards_evictions_without_store_churn() {
 
 #[test]
 fn flood_backpressure_drops_are_counted_and_marked() {
-    let scrollback = Scrollback::new(100, 1000, 2 * 1024 * 1024);
+    let scrollback = Scrollback::new(100, 1000, 1024 * 1024);
     let mut grid = Grid::with_tiered_scrollback(3, 20, 8, scrollback);
     grid.set_compress_offload_active(true);
     let over = 500;
@@ -614,7 +614,7 @@ fn flood_backpressure_drops_are_counted_and_marked() {
     );
     let oldest = history_text(&grid, 0);
     let marked: u64 = oldest
-        .strip_prefix(crate::grid::scroll_convert::FLOOD_MARKER_PREFIX)
+        .strip_prefix(crate::grid::lazy_buffer::FLOOD_MARKER_PREFIX)
         .and_then(|rest| rest.split(' ').next())
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| panic!("oldest retained row is the flood marker, got {oldest:?}"));
@@ -645,17 +645,19 @@ fn staged_lazy_buffer_bytes_count_toward_memory_used() {
     );
     let with_staged = grid.memory_used();
     let lazy_with = grid.storage.lazy_buffer.memory_used();
-    grid.storage.lazy_buffer.clear();
-    let lazy_cleared = grid.storage.lazy_buffer.memory_used();
-    assert!(
-        lazy_with > lazy_cleared,
-        "staged lines carry heap bytes beyond the retained backing capacity"
+    assert!(lazy_with > 0, "staged lines hold memory");
+    let staged = grid.storage.lazy_buffer.take_staged();
+    assert_eq!(
+        grid.storage.lazy_buffer.memory_used(),
+        0,
+        "the move takes every allocation with it"
     );
     assert_eq!(
         grid.memory_used(),
-        with_staged - (lazy_with - lazy_cleared),
+        with_staged - lazy_with,
         "memory_used must include exactly the staged lazy-buffer bytes"
     );
+    drop(staged);
 }
 
 #[test]

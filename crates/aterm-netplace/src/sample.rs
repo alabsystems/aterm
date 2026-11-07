@@ -22,7 +22,7 @@ fn route(address: [u8; 4], prefix: u8, gateway: [u8; 4]) -> RouteFacts {
 }
 
 /// On a phone's Personal Hotspot since `since_ms`, away from the ALab LAN since `away_ms`, the
-/// internet answering the path monitor only, no member reachable of the 41 the book knows.
+/// internet answering the path monitor only, no member heard of the 41 the book knows.
 #[must_use]
 pub fn hotspot(since_ms: u64, away_ms: u64) -> Place {
     let route = route([172, 20, 10, 2], 28, [172, 20, 10, 1]);
@@ -51,17 +51,17 @@ pub fn hotspot(since_ms: u64, away_ms: u64) -> Place {
         alab: Alab::Away {
             since_ms: Some(away_ms),
         },
-        reachable: 0,
+        heard: 0,
         known: Some(41),
         last_answer: None,
         computed_by: ComputedBy::Keeper,
     }
 }
 
-/// On the ALab LAN since `since_ms`, recognised by the members that answered there, `reachable`
-/// of the 41 the book knows answering.
+/// On the ALab LAN since `since_ms`, recognised by the members that answered there, `heard` of
+/// the 41 the book knows answering in this stay.
 #[must_use]
-pub fn home(since_ms: u64, reachable: usize) -> Place {
+pub fn home(since_ms: u64, heard: usize) -> Place {
     let route = route([192, 168, 4, 31], 22, [192, 168, 4, 1]);
     Place {
         at: Where::AlabLan,
@@ -76,7 +76,7 @@ pub fn home(since_ms: u64, reachable: usize) -> Place {
             link: Link::Wifi,
         }),
         alab: Alab::Here,
-        reachable,
+        heard,
         ..hotspot(since_ms, since_ms)
     }
 }

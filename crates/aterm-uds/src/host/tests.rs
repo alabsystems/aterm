@@ -795,6 +795,39 @@ fn a_linux_host_without_web2_is_sent_to_the_guest_that_lays_it() {
     );
 }
 
+/// AN `os` ROW MACOS SHIPS THAT A LINUX DISTRIBUTION PACKAGES APART SENDS A LINUX HOST TO ITS
+/// PACKAGE MANAGER, naming Debian's and Ubuntu's command, and is the operating system's on macOS.
+/// NEGATIVE CONTROL: without its package, zsh on Linux "comes with the operating system, and
+/// no command adds it", which `apt install zsh` belies on Debian and Ubuntu.
+#[test]
+fn a_linux_host_without_zsh_is_sent_to_its_package_manager() {
+    let zsh = tool("zsh");
+    assert_eq!(zsh.linux_package, Some("zsh"));
+    for linux in ["linux-aarch64", "linux-x86_64"] {
+        let refusal = zsh.refusal_on(linux);
+        assert_eq!(
+            refusal,
+            "no zsh here: the Linux distribution's package manager adds it, as `sudo apt install \
+             zsh` does on Debian and Ubuntu (or ATERM_TEST_ZSH=<path> names one)",
+            "{linux}"
+        );
+    }
+    assert_eq!(
+        zsh.remedy_on("macos-aarch64"),
+        "it comes with the operating system, and no command adds it",
+        "macOS ships it"
+    );
+    let unpackaged = Tool {
+        linux_package: None,
+        ..*zsh
+    };
+    assert_eq!(
+        unpackaged.remedy_on("linux-aarch64"),
+        "it comes with the operating system, and no command adds it",
+        "the control's row"
+    );
+}
+
 /// A HOST LOOKS ONLY AT ITS OWN FAMILY'S PLACES: off Windows a row's `/`-rooted ones, on Windows
 /// the rest, each absolute there, so neither is read, resolved or named as a relative name on
 /// the other. NEGATIVE CONTROLS: with `places_on` unfiltered off Windows, bash's `looked_in`

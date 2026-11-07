@@ -11209,19 +11209,24 @@ mod tests {
     /// files (the law under a power cut is `sim::tests`'
     /// `no_copy_of_the_dir_nor_restore_over_it_proves_anything_under_a_power_cut`). `cp -R` and
     /// `cp -a` keep the inode each name holds, as this test asserts first, and `cp -a` its
-    /// modification time, its own bytes included. Over a bridge that died with its OPEN and floor
-    /// proved, and over a clean stop with a backup of a lower floor than its last raise: the next
-    /// start and the next raise are in full, and a successor's reading of the floor admits nothing.
+    /// modification time, its own bytes included. GNU's `-a` also keeps hard links, so it replaces
+    /// a file that has another link (the control's proof is one); `--no-preserve=links` gives it
+    /// BSD's `-a` (`-pPR`). Over a bridge that died with its OPEN and floor proved, and over a
+    /// clean stop with a backup of a lower floor than its last raise: the next start and the next
+    /// raise are in full, and a successor's reading of the floor admits nothing.
     /// CONTROL: a proof named for the inode alone ([`ProofRule::ThisInode`]) vouches for both.
     #[test]
     fn a_restore_written_into_the_files_a_dir_holds_proves_nothing() {
         let cp_binary = aterm_uds::deadline::stand_in(Path::new("/bin/cp"));
         let cp = |flag: &str, from: &Path, to: &Path| {
+            let mut command = aterm_uds::spawnfd::command(&cp_binary);
+            command.arg(flag);
+            #[cfg(target_os = "linux")]
+            if flag == "-a" {
+                command.arg("--no-preserve=links");
+            }
             let out = aterm_uds::deadline::output_until(
-                aterm_uds::spawnfd::command(&cp_binary)
-                    .arg(flag)
-                    .arg(from.join("."))
-                    .arg(to),
+                command.arg(from.join(".")).arg(to),
                 std::time::Instant::now() + std::time::Duration::from_secs(60),
             )
             .expect("cp ran");

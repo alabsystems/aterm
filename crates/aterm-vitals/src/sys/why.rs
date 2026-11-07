@@ -28,7 +28,8 @@ const WHO_BEFORE_HARDWARE: usize = 3;
 /// The CPU-hardware line of a reply whose snapshot took no CPU Stats sample, in place of the
 /// clauses that need one: an unforced `sys why` pulls for none, and the deck's readings take
 /// none (A2 §6.4).
-const HARDWARE_NOT_SAMPLED: &str = "CPU hardware: not sampled; `sys cores` reads it";
+const HARDWARE_NOT_SAMPLED: &str =
+    "CPU hardware: not in this reading; `sys cores` or `sys why fresh=0` takes a sample";
 
 fn resolve(q: &SysQuery, snap: Option<&Snapshot>) -> Bare {
     match (q.subject, snap) {
@@ -266,6 +267,16 @@ impl<'a> Reading<'a> {
         words::cause_words(&base, context)
     }
 
+    /// The tab's clause: its part in the cause the sentence names, or, where it names none, its
+    /// share of the figure ([`crate::explain::You::share_clause`]).
+    fn you_clause(&self) -> &'static str {
+        if self.a.headline.is_some() {
+            self.a.you.clause()
+        } else {
+            self.a.you.share_clause()
+        }
+    }
+
     fn sentence(clauses: &[String]) -> Line {
         line("why", format!("{:<8}{}", "why", clauses.join("; ")))
     }
@@ -274,7 +285,7 @@ impl<'a> Reading<'a> {
         let mut clauses = vec![format!("global cpu: {}", self.busy_words())];
         clauses.extend(self.mostly());
         clauses.push(self.headline(WhySubject::Cpu));
-        clauses.push(self.a.you.clause().into());
+        clauses.push(self.you_clause().into());
         Self::sentence(&clauses)
     }
 
@@ -305,7 +316,7 @@ impl<'a> Reading<'a> {
             None => clauses.push(format!("global memory: {}", unavailable("unsupported"))),
         }
         clauses.push(self.headline(WhySubject::Mem));
-        clauses.push(self.a.you.clause().into());
+        clauses.push(self.you_clause().into());
         Self::sentence(&clauses)
     }
 

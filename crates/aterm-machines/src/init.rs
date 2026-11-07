@@ -76,6 +76,7 @@ pub fn usage() -> String {
 aterm init [--plan | --check] [--json] [--verbose] [--only <id,...>] [--vault <url|path>]
            [--[no-]profile] [--[no-]sign-out] [--[no-]clone] [--[no-]develop] [--no-wait]
 aterm init --converge [--check] [--json] [--verbose] [--trigger subscriber|window|setup]
+           [--repository-work repair|refresh]
   aterm.app's first launch does this setup by itself; init is for SSH and CLI-only Macs,
   and Linux (the base layer, the vault and --clone; each Mac row reads \"macOS only\").
   Run it as yourself, without sudo; safe to run again. Every Mac gets what `aterm doctor`
@@ -158,6 +159,8 @@ struct Options {
     converge: bool,
     /// `--trigger`: who started a `--converge` pass (a person's `aterm init` without it).
     trigger: Option<crate::sync::Trigger>,
+    /// Requested repository work for one owned converge job, never effect authority.
+    repository_work: Option<aterm_secrets::converge::RepositoryWork>,
 }
 
 impl Options {
@@ -304,6 +307,9 @@ struct Picked {
     /// each of its rows). [`converge`] reads the person's choices again once it holds System
     /// State's records, and leaves the items whose rows they hold by then.
     rows: Vec<(String, Setting)>,
+    /// Original selectors represented by the existing background workstation row, with
+    /// the precise private settings its cached observation must cover.
+    relayed: Option<RelayedSelection>,
     /// The person's choices as the run read them when it began: a group the run names (a flag's,
     /// or every one `--only` words name) runs over these holds alone, never over a Stop pressed
     /// or a group turned off since ([`Holds::later`]).
@@ -317,6 +323,7 @@ impl Picked {
         held: None,
         kept: Selection::none(),
         rows: Vec::new(),
+        relayed: None,
         start: Holds::NONE,
     };
 
@@ -326,6 +333,7 @@ impl Picked {
         held: None,
         kept: Selection::none(),
         rows: Vec::new(),
+        relayed: None,
         start: Holds::NONE,
     };
 
@@ -382,6 +390,7 @@ fn picked(
             held: None,
             kept,
             rows: Vec::new(),
+            relayed: None,
             start: holds.clone(),
         };
     }
@@ -402,6 +411,7 @@ fn picked(
         held: holds.line(&held, at_console),
         kept,
         rows: Vec::new(),
+        relayed: None,
         start: holds.clone(),
     }
 }
@@ -486,6 +496,21 @@ fn options(args: &[OsString]) -> Result<Options, String> {
             );
             continue;
         }
+        let work = match arg.to_str() {
+            Some("--repository-work") => {
+                Some(args.next().and_then(|word| word.to_str()).unwrap_or(""))
+            }
+            Some(arg) => arg.strip_prefix("--repository-work="),
+            None => None,
+        };
+        if let Some(word) = work {
+            options.repository_work = Some(match word {
+                "repair" => aterm_secrets::converge::RepositoryWork::Repair,
+                "refresh" => aterm_secrets::converge::RepositoryWork::Refresh,
+                _ => return Err("--repository-work takes repair or refresh".into()),
+            });
+            continue;
+        }
         if let Some(words) = only {
             let words: Vec<String> = words
                 .split(',')
@@ -549,6 +574,9 @@ fn options(args: &[OsString]) -> Result<Options, String> {
     if options.trigger.is_some() && !options.converge {
         return Err("--trigger names who started a --converge pass".into());
     }
+    if options.repository_work.is_some() && !options.converge {
+        return Err("--repository-work describes one --converge job".into());
+    }
     if options.converge
         && (options.action == Action::Plan
             || !options.only.is_empty()
@@ -557,7 +585,10 @@ fn options(args: &[OsString]) -> Result<Options, String> {
             || options.develop.is_some()
             || options.no_wait)
     {
-        return Err("--converge takes only --check, --json, --verbose and --trigger".into());
+        return Err(
+            "--converge takes only --check, --json, --verbose, --trigger and --repository-work"
+                .into(),
+        );
     }
     if options.develop.is_some() && options.only.iter().any(|word| word == "workstation") {
         return Err("--develop and --no-develop cannot be combined with --only workstation".into());
@@ -1118,6 +1149,7 @@ fn entry(
             workstation_observation: observed_workstation(
                 sys,
                 options.action,
+                reading.context_scope,
                 host.workstation_check,
             ),
         };
@@ -1132,13 +1164,7 @@ fn entry(
             host.grants,
         )
     };
-    let sys = Live::new()
-        .with_full_disk_access(if options.workstation() {
-            (host.full_disk_access)()
-        } else {
-            None
-        })
-        .with_presence(host.present);
+    let sys = Live::new().with_presence(host.present);
     let cwd = std::env::current_dir().ok();
     let printer = Printer::new(options.verbose, options.json);
     let result = sys
@@ -1156,6 +1182,7 @@ fn entry(
                             })
                     },
                     groups: &groups,
+                    full_disk_access: host.full_disk_access,
                     targo: composed.targo.clone(),
                     cwd: cwd.as_deref(),
                     records: host.records,
@@ -1318,6 +1345,7 @@ fn tab_entry(options: &Options, host: &Host<'_>) -> u8 {
                     &Front {
                         base: &in_tab,
                         groups: &groups,
+                        full_disk_access: host.full_disk_access,
                         targo: None,
                         cwd: cwd.as_deref(),
                         records: host.records,
@@ -1409,7 +1437,15 @@ fn converge_entry(options: &Options, ports: &dyn crate::sync::Ports) -> ExitCode
         (Mode::Apply, Action::Apply)
     };
     let printer = Printer::new(options.verbose, options.json);
-    let pass = crate::sync::converge(ports, trigger, mode, &mut |row| printer.row(row));
+    let pass = crate::sync::converge(
+        ports,
+        trigger,
+        mode,
+        options
+            .repository_work
+            .unwrap_or(aterm_secrets::converge::RepositoryWork::Refresh),
+        &mut |row| printer.row(row),
+    );
     printer.flush();
     let pass = match pass {
         Ok(pass) => pass,
@@ -1478,6 +1514,9 @@ fn hand_off(options: &Options, ports: &dyn crate::sync::Ports, program: &Path) -
         .map(str::to_owned)
         .to_vec();
     args.push(crate::sync::Trigger::Subscriber.word().to_owned());
+    if let Some(work) = options.repository_work {
+        args.extend(["--repository-work".to_owned(), work.word().to_owned()]);
+    }
     if options.action == Action::Check {
         args.push("--check".to_owned());
     }
@@ -1854,15 +1893,68 @@ const PERSON_MARK: &str = "mark ";
 /// # Errors
 /// The record, this login's context or its init.toml cannot be read.
 pub fn owed_clone(sys: &dyn System, state: &Path, now: &Holds) -> Result<OwedClone, String> {
+    owed_clone_with(sys, state, now, None)
+}
+
+/// Read default repository debt using inputs captured under the caller's ready vault.
+/// All Git work runs after that capture released its lock. `current` must fully
+/// validate the same materialization without waiting, immediately before publication.
+/// This reads only: no clone, source change, or debt-record write is admitted here.
+///
+/// # Errors
+/// As [`owed_clone`], or `current` fails. A changed account or default source waits.
+pub fn owed_clone_captured(
+    sys: &dyn System,
+    state: &Path,
+    now: &Holds,
+    inputs: crate::init_github::InitialRepositoryInputs,
+    current: impl FnOnce() -> Result<bool, String>,
+) -> Result<OwedClone, String> {
+    let ctx = repository_context(sys)?;
+    if let Err(why) = inputs.validate_default_context(sys, &ctx) {
+        return Ok(OwedClone::Waiting(why));
+    }
+    let value = owed_clone_with(sys, state, now, Some(&inputs))?;
+    let syncing = || {
+        OwedClone::Waiting(
+            "repository inputs changed or are still syncing; waiting for a new ready snapshot"
+                .into(),
+        )
+    };
+    if !current()? {
+        return Ok(syncing());
+    }
+    if let Err(why) = inputs.validate_default_context(sys, &ctx) {
+        return Ok(OwedClone::Waiting(why));
+    }
+    if let Some(why) = inputs.local_blocker() {
+        // The full vault fence is current, but the capture never admitted local
+        // repository work. Preserve holds and unfinished dispositions; never promote
+        // a later local observation through this blocked capture.
+        if matches!(&value, OwedClone::Due(_) | OwedClone::Verified { .. }) {
+            return Ok(OwedClone::Waiting(why.into()));
+        }
+    } else if !inputs.is_current_now(sys)? {
+        return Ok(syncing());
+    }
+    Ok(value)
+}
+
+fn owed_clone_with(
+    sys: &dyn System,
+    state: &Path,
+    now: &Holds,
+    inputs: Option<&crate::init_github::InitialRepositoryInputs>,
+) -> Result<OwedClone, String> {
     let dir = converge_state(state);
     let record = match aterm_uds::private_file::read_private(&dir, CLONE_OWED, 4096) {
         Ok(record) => String::from_utf8_lossy(&record).into_owned(),
         Err(aterm_uds::private_file::PrivateFileError::Missing) => {
-            return automatic_clone(sys, now);
+            return automatic_clone(sys, now, inputs);
         }
         Err(why) => return Err(format!("{}: {why}", dir.join(CLONE_OWED).display())),
     };
-    let (ctx, _) = local_context(sys)?;
+    let ctx = repository_context(sys)?;
     let Some(read) = crate::init_github::token_read(sys, &ctx)? else {
         return Ok(OwedClone::Off(
             "off: init.toml's [github] enabled = false".into(),
@@ -1905,7 +1997,17 @@ pub fn owed_clone(sys: &dyn System, state: &Path, now: &Holds) -> Result<OwedClo
             // the default inventory locally, without applying or enumerating GitHub, so a
             // corrected worktree can resume even with an untyped pre-upgrade Person mark.
             // Explicit profiles keep their auth cache and never repeat its network probe.
-            let rows = crate::init_github::run_initial_repositories(sys, &ctx, Mode::Plan)?;
+            let rows = match inputs {
+                Some(inputs) => crate::init_github::run_initial_repositories_captured(
+                    sys,
+                    &ctx,
+                    Mode::Plan,
+                    aterm_secrets::converge::RepositoryWork::Repair,
+                    inputs.clone(),
+                    || Ok(true),
+                )?,
+                None => crate::init_github::run_initial_repositories(sys, &ctx, Mode::Plan)?,
+            };
             for row in rows
                 .iter()
                 .filter(|row| !crate::init_github::keychain_row(row))
@@ -1953,18 +2055,35 @@ pub fn owed_clone(sys: &dyn System, state: &Path, now: &Holds) -> Result<OwedClo
     })
 }
 
+/// Repository work needs this process's own account, without workstation or HID facts.
+fn repository_context(sys: &dyn System) -> Result<Ctx, String> {
+    let identity = sys.identity()?;
+    if identity.user.uid != sys.euid() || sys.euid() == 0 {
+        return Err("repository setup belongs to this login alone".into());
+    }
+    Ok(Ctx {
+        facts: HostFacts::default(),
+        users: vec![identity.user],
+        console: None,
+        host_name: String::new(),
+        cache_dir: PathBuf::new(),
+        disrupt: false,
+    })
+}
+
 /// A vault member needs no earlier init debt to acquire its repositories. The subscriber
 /// reads the private inventory on every pass, so newly delivered entries and missing checkouts
 /// are reconciled too. A person's holds still win, and this path never inventories GitHub.
-fn automatic_clone(sys: &dyn System, now: &Holds) -> Result<OwedClone, String> {
+fn automatic_clone(
+    sys: &dyn System,
+    now: &Holds,
+    inputs: Option<&crate::init_github::InitialRepositoryInputs>,
+) -> Result<OwedClone, String> {
     let nothing = || OwedClone::Nothing("aterm init owes no clone".into());
-    let Ok(identity) = sys.identity() else {
+    let Ok(ctx) = repository_context(sys) else {
         return Ok(nothing());
     };
-    if identity.user.uid != sys.euid() || sys.euid() == 0 {
-        return Ok(nothing());
-    }
-    let token = Path::new(&identity.user.home).join(crate::init_github::TOKEN_FILE);
+    let token = Path::new(&ctx.users[0].home).join(crate::init_github::TOKEN_FILE);
     if sys
         .stat(&token)
         .is_err_and(|why| why.kind() == std::io::ErrorKind::NotFound)
@@ -1974,14 +2093,6 @@ fn automatic_clone(sys: &dyn System, now: &Holds) -> Result<OwedClone, String> {
     if now.holds(Setting::Repositories) {
         return Ok(OwedClone::Held(now.why(Setting::Repositories)));
     }
-    let ctx = Ctx {
-        facts: HostFacts::default(),
-        users: vec![identity.user],
-        console: None,
-        host_name: String::new(),
-        cache_dir: PathBuf::new(),
-        disrupt: false,
-    };
     let Some(read) = crate::init_github::token_read(sys, &ctx)? else {
         return Ok(OwedClone::Off(
             "off: init.toml's [github] enabled = false".into(),
@@ -2000,7 +2111,11 @@ fn automatic_clone(sys: &dyn System, now: &Holds) -> Result<OwedClone, String> {
             "waiting for an installed git to clone the vault's repositories".into(),
         ));
     }
-    match crate::init_github::inventory_counts(sys, &ctx) {
+    let counted = match inputs {
+        Some(inputs) => crate::init_github::automatic_inventory_counts_captured(sys, &ctx, inputs),
+        None => crate::init_github::automatic_inventory_counts(sys, &ctx),
+    };
+    match counted {
         Ok(Some((present, total))) if present == total => {
             Ok(OwedClone::Verified { present, total })
         }
@@ -2035,9 +2150,13 @@ pub fn forget_owed_clone(state: &Path) -> Result<(), String> {
 ///
 /// # Errors
 /// A repository row of the step did not end in place (its words), or the step could not run.
-pub fn clone_owed(sys: &dyn System, state: &Path) -> Result<String, String> {
-    let (ctx, _) = local_context(sys)?;
-    let items = crate::init_github::items(sys, &ctx, None)?;
+pub fn clone_owed(
+    sys: &dyn System,
+    state: &Path,
+    work: aterm_secrets::converge::RepositoryWork,
+) -> Result<String, String> {
+    let ctx = repository_context(sys)?;
+    let items = crate::init_github::items_for_work(sys, &ctx, None, work)?;
     let bound = crate::engine::bind(
         items
             .iter()
@@ -2059,14 +2178,16 @@ pub fn clone_owed(sys: &dyn System, state: &Path) -> Result<String, String> {
 pub fn clone_owed_captured(
     sys: &dyn System,
     state: &Path,
+    work: aterm_secrets::converge::RepositoryWork,
     inputs: crate::init_github::InitialRepositoryInputs,
     current: impl Fn() -> Result<bool, String> + Send + Sync + 'static,
 ) -> Result<String, String> {
-    let (ctx, _) = local_context(sys)?;
+    let ctx = repository_context(sys)?;
     let rows = crate::init_github::run_initial_repositories_captured(
         sys,
         &ctx,
         Mode::Apply,
+        work,
         inputs,
         current,
     )?;
@@ -2205,6 +2326,8 @@ pub struct Doctor<S: System = Live> {
     ctx: std::sync::OnceLock<Result<Ctx, String>>,
     /// This login's rust-docs item ([`Self::rust_docs`]), built once.
     docs: std::sync::OnceLock<Result<Box<dyn Item>, String>>,
+    /// This login's clone tuning item ([`Self::clone_tuning`]), built once.
+    tuning: std::sync::OnceLock<Result<Box<dyn Item>, String>>,
 }
 
 impl Doctor {
@@ -2224,6 +2347,7 @@ impl<S: System> Doctor<S> {
             targo,
             ctx: std::sync::OnceLock::new(),
             docs: std::sync::OnceLock::new(),
+            tuning: std::sync::OnceLock::new(),
         }
     }
 
@@ -2251,6 +2375,32 @@ impl<S: System> Doctor<S> {
                     remedy: Remedy::Command("aterm doctor".into()),
                 },
             )],
+            &self.sys,
+            ctx,
+        ))
+    }
+
+    /// This login's `init.github.tuning@<user>` item ([`crate::clone_tuning`]), its record under
+    /// `state` and System State's holds as `holds` reads them at each probe and apply, bound as
+    /// a relay-class repair of the account's own, for bare `aterm doctor` to apply to a vault
+    /// clone that differs from the git tuning its repository declares: the context and the item
+    /// are built only on this call, and the first call's `state` and `holds` are the item's.
+    ///
+    /// # Errors
+    /// This login's context cannot be read, or it resolves no one user.
+    pub fn clone_tuning(
+        &self,
+        state: &Path,
+        holds: crate::clone_tuning::HoldsNow,
+    ) -> Result<Vec<Box<dyn aterm_converge::Item + '_>>, String> {
+        let ctx = self.ctx().as_ref().map_err(Clone::clone)?;
+        let item = self
+            .tuning
+            .get_or_init(|| crate::clone_tuning::item(ctx, state, holds))
+            .as_ref()
+            .map_err(Clone::clone)?;
+        Ok(crate::engine::bind(
+            [(item.as_ref(), crate::clone_tuning::place())],
             &self.sys,
             ctx,
         ))
@@ -2409,6 +2559,8 @@ impl From<String> for Refused {
 struct Front<'a> {
     base: &'a dyn Fn(bool) -> Base,
     groups: &'a Prepare<'a>,
+    /// Read only when this run's selected local keys consume the FDA reading.
+    full_disk_access: &'a dyn Fn() -> Option<bool>,
     targo: Option<crate::init_develop::Targo>,
     cwd: Option<&'a Path>,
     /// This Mac's setup records, held over the Desktop lane of a pass that changes preferences.
@@ -2459,6 +2611,7 @@ pub fn converge_workstation_for_test(
         &Front {
             base: &|_| Base::none(),
             groups: &groups,
+            full_disk_access: &|| sys.full_disk_access(),
             targo: None,
             cwd: None,
             records,
@@ -2578,12 +2731,13 @@ fn converge(
     }
     let only = &options.only;
     let workstation = options.workstation();
-    let (ctx, keyboards) = if workstation {
-        local_context(sys)?
+    let (ctx, keyboards, context_scope) = if workstation {
+        scoped_context(sys, only, options.picks, front.full_disk_access)?
     } else {
         (
             context_for_selected(sys, WorkstationGroup::All, Selection::none())?,
             KeyboardRead::default(),
+            Selection::none(),
         )
     };
     let asked = only.iter().any(|word| crate::init_develop::names(word));
@@ -2637,6 +2791,7 @@ fn converge(
             mode,
             &Reading {
                 keyboards: &keyboards,
+                context_scope,
                 only,
                 picks: options.picks,
             },
@@ -2651,6 +2806,10 @@ fn converge(
         .iter()
         .filter(|word| {
             (ctx.console.is_some() || !sys.macos())
+                && !picked
+                    .relayed
+                    .as_ref()
+                    .is_some_and(|selection| selection.words.contains(word))
                 && !groups.iter().any(|(items, place)| {
                     items.iter().any(|item| {
                         aterm_converge::selects(word, &item.id(), item.family(), Some(place.layer))
@@ -2743,7 +2902,7 @@ fn converge(
     // starts: a Stop pressed, or the group turned off, since the run began holds it, as it holds
     // the Desktop lane's items (`--clone` runs over a hold on record when the run began alone).
     let held_late = |id: &str| {
-        if mode != Mode::Apply || !aterm_converge::selects(GITHUB, id, "", None) {
+        if mode != Mode::Apply || !aterm_converge::selects(GITHUB.id, id, "", None) {
             return None;
         }
         let now = records.holds();
@@ -2928,6 +3087,10 @@ fn converge(
         &Narrowing {
             only,
             record: options.develop.is_some() || develop.unreadable,
+            relayed: picked
+                .relayed
+                .as_ref()
+                .is_some_and(|selection| !selection.words.is_empty()),
         },
         mode,
         journal,
@@ -3972,7 +4135,29 @@ type Group = (Vec<Box<dyn Item>>, Place);
 const ACCOUNTS_GROUP: &str = "init.accounts";
 
 /// The id of GitHub's group, and the word that names each of its items ([`Setting::Repositories`]).
-const GITHUB: &str = "init.github";
+const GITHUB: SettingGroup = SettingGroup {
+    id: "init.github",
+    family: "github",
+    setting: Setting::Repositories,
+};
+
+/// The identity and setting of a composed group, shared by its failure row and fact scope.
+#[derive(Clone, Copy)]
+struct SettingGroup {
+    id: &'static str,
+    family: &'static str,
+    setting: Setting,
+}
+
+impl SettingGroup {
+    fn build(self, items: Result<Vec<Box<dyn Item>>, String>) -> Vec<Box<dyn Item>> {
+        built(self.id, self.family, self.setting.label(), items)
+    }
+
+    fn selects(self, word: &str) -> bool {
+        aterm_converge::selects(word, self.id, self.family, Some(Layer::Workstation))
+    }
+}
 
 /// Whether the item `id` is a Messages or FaceTime sign-out, or the row that stands for them
 /// when they could not be built.
@@ -3983,8 +4168,10 @@ fn signs_out(id: &str) -> bool {
 /// What [`converge`] read and was told before the workstation's groups are built.
 struct Reading<'a> {
     /// The captured native assignments, or why the keyboard census could not be read
-    /// ([`local_context`]): only the Caps Lock rows go unread.
+    /// ([`context_reading`]): only the Caps Lock rows go unread.
     keyboards: &'a KeyboardRead,
+    /// Optional local facts the real selectors required, not effect authority.
+    context_scope: Selection,
     /// The run's `--only` words.
     only: &'a [String],
     /// What `--profile`, `--sign-out`, `--clone` and their `--no-` forms said.
@@ -4080,7 +4267,19 @@ fn prepare_groups_with(
         flags_run,
     );
     let runs = picked.runs;
-    let observation = observation.map(|observation| observation.for_scope(runs.workstation()));
+    if sys.macos() && presence != Presence::AtConsole && !reading.only.is_empty() {
+        picked.relayed = Some(relayed_selection(
+            ctx,
+            reading.keyboards,
+            runs,
+            reading.only,
+        ));
+    }
+    let requested = picked
+        .relayed
+        .as_ref()
+        .map_or_else(|| runs.workstation(), |selection| selection.requested);
+    let observation = observation.map(|observation| observation.for_scope(requested));
     let decided = standing.decided;
     if !sys.macos() {
         return Ok((
@@ -4098,12 +4297,11 @@ fn prepare_groups_with(
     };
     let github = |secrets: &crate::init_secrets::Secrets| {
         if runs.contains(Setting::Repositories) {
-            built(
-                GITHUB,
-                "init",
-                Setting::Repositories.label(),
-                crate::init_github::items(sys, ctx, secrets.waited_on.as_deref()),
-            )
+            GITHUB.build(crate::init_github::items(
+                sys,
+                ctx,
+                secrets.waited_on.as_deref(),
+            ))
         } else {
             Vec::new()
         }
@@ -4257,12 +4455,11 @@ fn elsewhere(
             waited_on: None,
         }
     };
-    let github = built(
-        GITHUB,
-        "init",
-        Setting::Repositories.label(),
-        crate::init_github::items(sys, ctx, secrets.waited_on.as_deref()),
-    );
+    let github = GITHUB.build(crate::init_github::items(
+        sys,
+        ctx,
+        secrets.waited_on.as_deref(),
+    ));
     let mac_only: Vec<Box<dyn Item>> = [
         ("init.preferences", "init", "Workstation preferences"),
         (
@@ -4326,6 +4523,93 @@ impl Item for MacOnly {
 
 /// The aggregate workstation row when direct settings probes are withheld ([`AwayFromConsole`]).
 const AWAY: &str = "init.workstation";
+
+/// Selector provenance for a withheld local cohort, not permission to probe or apply it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelayedSelection {
+    words: Vec<String>,
+    requested: Selection,
+}
+
+/// Match the real local item identities without running them. The same constructors
+/// supply a person's pass, so device IDs, families and per-setting scope cannot drift
+/// into a separate alias catalog for the aggregate row.
+fn relayed_selection(
+    ctx: &Ctx,
+    keyboards: &KeyboardRead,
+    runs: Selection,
+    only: &[String],
+) -> RelayedSelection {
+    let (groups, rows) = local_groups(ctx, keyboards, runs.workstation());
+    selection_of_groups(&groups, &rows, runs, only)
+}
+
+fn selection_of_groups(
+    groups: &[Group],
+    rows: &[(String, Setting)],
+    runs: Selection,
+    only: &[String],
+) -> RelayedSelection {
+    let mut selection = RelayedSelection {
+        words: Vec::new(),
+        requested: Selection::none(),
+    };
+    for word in only {
+        let whole = aterm_converge::selects(word, AWAY, "init", Some(Layer::Workstation));
+        let mut matched = whole;
+        if whole {
+            selection.requested = selection.requested.union(runs.workstation());
+        }
+        for (items, place) in groups {
+            for item in items {
+                let id = item.id();
+                if aterm_converge::selects(word, &id, item.family(), Some(place.layer)) {
+                    matched = true;
+                    for (_, setting) in rows.iter().filter(|(each, _)| *each == id) {
+                        selection.requested.set(*setting, true);
+                    }
+                }
+            }
+        }
+        if matched && !selection.words.contains(word) {
+            selection.words.push(word.clone());
+        }
+    }
+    selection
+}
+
+/// Project the same item identities before optional local facts are collected. Selectors
+/// unresolved here, including model-specific keyboard ids not discovered yet, retain full facts;
+/// the normal built-item validation still decides whether those words name anything.
+fn context_selection(sys: &dyn System, ctx: &Ctx, only: &[String], picks: Picks) -> Selection {
+    if only.is_empty() {
+        return Choice::ALL.without(picks.left).selection();
+    }
+    let runs = Selection::all();
+    let (mut groups, mut rows) = local_groups(ctx, &KeyboardRead::default(), runs.workstation());
+    let local = selection_of_groups(&groups, &rows, runs, only);
+    if only.iter().all(|word| local.words.contains(word)) {
+        return local.requested;
+    }
+    // Reading the local profile builds the real default or custom repository identities,
+    // without probing their token, vault, checkout, helper or a preference. The group itself
+    // still identifies a disabled or unread source without borrowing unrelated local facts.
+    let github = GITHUB.build(crate::init_github::items(sys, ctx, None));
+    rows.extend(github.iter().map(|item| (item.id(), GITHUB.setting)));
+    groups.push((github, workstation_place(Class::Install)));
+    let mut projected = selection_of_groups(&groups, &rows, runs, only);
+    for word in only.iter().filter(|word| GITHUB.selects(word)) {
+        if !projected.words.contains(word) {
+            projected.words.push(word.clone());
+        }
+        projected.requested.set(GITHUB.setting, true);
+    }
+    if only.iter().all(|word| projected.words.contains(word)) {
+        projected.requested
+    } else {
+        runs
+    }
+}
 
 /// The existing coordinator's observation, without reading another app's settings or
 /// authorizing any change. Missing evidence is distinct from a genuine permission boundary.
@@ -4430,10 +4714,14 @@ fn observes_background(presence: Presence) -> bool {
 fn observed_workstation(
     sys: &dyn System,
     action: Action,
+    requested: Selection,
     check: &dyn Fn() -> WorkstationObservation,
 ) -> Option<WorkstationObservation> {
-    (action == Action::Check && sys.macos() && observes_background(crate::console::presence(sys)))
-        .then(check)
+    (action == Action::Check
+        && !requested.workstation().is_empty()
+        && sys.macos()
+        && observes_background(crate::console::presence(sys)))
+    .then(check)
 }
 
 /// Read in any shell of the account rather than blocked by the engine's console gate;
@@ -4530,8 +4818,54 @@ fn groups(
     signs_out: bool,
     observation: Option<WorkstationObservation>,
 ) -> (Vec<Group>, Vec<(String, Setting)>) {
-    let place = workstation_place;
     let person = presence == Presence::AtConsole;
+    let (mut groups, mut rows) = if person {
+        let mut preferences = runs;
+        for setting in SIGN_OUT {
+            preferences.set(setting, false);
+        }
+        local_groups(ctx, keyboards, preferences)
+    } else {
+        (vec![away_from_console(presence, observation)], Vec::new())
+    };
+    let place = workstation_place;
+    // Background cache/toolchain maintenance searches no project folder; only the person's
+    // console run may also discover and note their indexed projects.
+    if runs.contains(Setting::Spotlight) {
+        groups.push((spotlight(ctx, projects), place(Class::Asked)));
+    }
+    if person {
+        let named = only.iter().any(|word| word == crate::init_fseventsd::ID);
+        groups.push((
+            vec![Box::new(crate::init_fseventsd::Fseventsd::new(named))],
+            crate::init_fseventsd::place(),
+        ));
+    }
+    groups.push((secrets.items, place(Class::Install)));
+    if !github.is_empty() {
+        groups.push((github, place(Class::Install)));
+    }
+    if signs_out {
+        let mut accounts = Selection::none();
+        for setting in SIGN_OUT {
+            accounts.set(setting, runs.contains(setting));
+        }
+        let (account_groups, account_rows) = local_groups(ctx, keyboards, accounts);
+        groups.extend(account_groups);
+        rows.extend(account_rows);
+    }
+    (groups, rows)
+}
+
+/// Construct local preference and account items, tagged by their actual setting, without
+/// probing any preference or account. Both a person's pass and the background selector
+/// metadata use these same identities.
+fn local_groups(
+    ctx: &Ctx,
+    keyboards: &KeyboardRead,
+    runs: Selection,
+) -> (Vec<Group>, Vec<(String, Setting)>) {
+    let place = workstation_place;
     let mut groups = Vec::new();
     let mut rows: Vec<(String, Setting)> = Vec::new();
     // `items`, each tagged with every one of `settings`: a group's rows, or the one row that
@@ -4542,10 +4876,7 @@ fn groups(
         }
         items
     };
-    if !person {
-        groups.push(away_from_console(presence, observation));
-    }
-    if person {
+    {
         let mut preferences = Selection::none();
         for setting in [
             Setting::CapsLock,
@@ -4638,23 +4969,7 @@ fn groups(
             ));
         }
     }
-    // Background cache/toolchain maintenance searches no project folder; only the person's
-    // console run may also discover and note their indexed projects.
-    if runs.contains(Setting::Spotlight) {
-        groups.push((spotlight(ctx, projects), place(Class::Asked)));
-    }
-    if person {
-        let named = only.iter().any(|word| word == crate::init_fseventsd::ID);
-        groups.push((
-            vec![Box::new(crate::init_fseventsd::Fseventsd::new(named))],
-            crate::init_fseventsd::place(),
-        ));
-    }
-    groups.push((secrets.items, place(Class::Install)));
-    if !github.is_empty() {
-        groups.push((github, place(Class::Install)));
-    }
-    if signs_out {
+    if SIGN_OUT.into_iter().any(|setting| runs.contains(setting)) {
         let mut accounts = Selection::none();
         for setting in SIGN_OUT {
             accounts.set(setting, runs.contains(setting));
@@ -4794,6 +5109,7 @@ fn run(
         &Narrowing {
             only: &[],
             record: false,
+            relayed: false,
         },
         mode,
         journal,
@@ -4806,6 +5122,8 @@ fn run(
 struct Narrowing<'a> {
     only: &'a [String],
     record: bool,
+    /// Keep the already-prepared aggregate when its original selectors matched.
+    relayed: bool,
 }
 
 /// What a run's caller hears and wraps while its lanes go ([`run_layers`]).
@@ -5017,6 +5335,27 @@ impl HeldLate<'_> {
                 .as_ref()
         })
     }
+
+    fn current(&self) -> Result<(), String> {
+        if let Some(why) = self.held() {
+            return Err(why.clone());
+        }
+        match (self.held)(&self.inner.id()) {
+            Some(why) => Err(self.late.get_or_init(|| why).clone()),
+            None => Ok(()),
+        }
+    }
+
+    fn finished(&self, result: Result<(), String>) -> Result<(), String> {
+        match (self.late.get(), result) {
+            (Some(_), Err(said)) => {
+                let _ = self.said.set(said);
+                Ok(())
+            }
+            (Some(_), Ok(())) => Ok(()),
+            (None, result) => result,
+        }
+    }
 }
 
 impl Item for HeldLate<'_> {
@@ -5038,29 +5377,7 @@ impl Item for HeldLate<'_> {
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
         match self.held() {
             Some(why) => Err(why.clone()),
-            None => {
-                let current = || {
-                    if let Some(why) = self.late.get() {
-                        return Err(why.clone());
-                    }
-                    match (self.held)(&self.inner.id()) {
-                        Some(why) => {
-                            let why = self.late.get_or_init(|| why);
-                            Err(why.clone())
-                        }
-                        None => Ok(()),
-                    }
-                };
-                let result = self.inner.apply_guarded(sys, ctx, &current);
-                match (self.late.get(), result) {
-                    (Some(_), Err(said)) => {
-                        let _ = self.said.set(said);
-                        Ok(())
-                    }
-                    (Some(_), Ok(())) => Ok(()),
-                    (None, result) => result,
-                }
-            }
+            None => self.finished(self.inner.apply_guarded(sys, ctx, &|| self.current())),
         }
     }
     fn preference_changes(
@@ -5071,7 +5388,12 @@ impl Item for HeldLate<'_> {
         self.inner.preference_changes(sys, ctx)
     }
     fn refresh(&self, sys: &dyn System, ctx: &Ctx) -> Option<Result<(), String>> {
-        self.inner.refresh(sys, ctx)
+        self.inner
+            .refresh_guarded(sys, ctx, &|| self.current())
+            .map(|result| self.finished(result))
+    }
+    fn refresh_changes(&self, sys: &dyn System, ctx: &Ctx) -> bool {
+        self.inner.refresh_changes(sys, ctx)
     }
     fn revert(&self) -> Option<String> {
         self.inner.revert()
@@ -5344,6 +5666,9 @@ fn run_layers(
             if narrowing.record {
                 words.push(crate::init_develop::RECORD.to_owned());
             }
+            if narrowing.relayed {
+                words.push(AWAY.to_owned());
+            }
             words.push(AFTER_BASE.to_owned());
             aterm_converge::select(bound, &words).0
         };
@@ -5444,8 +5769,31 @@ fn run_layers(
 /// Collect only what this setup uses, avoiding fleet, TCC database and unrelated app probes,
 /// with why the keyboard list could not be read apart ([`context_reading`]): it leaves only
 /// the Caps Lock rows unread, never the run.
+#[cfg(test)]
 fn local_context(sys: &dyn System) -> Result<(Ctx, KeyboardRead), String> {
     context_reading(sys, WorkstationGroup::All, Selection::all())
+}
+
+/// Capture optional facts only after projecting the run's real selector identities.
+fn scoped_context(
+    sys: &dyn System,
+    only: &[String],
+    picks: Picks,
+    full_disk_access: &dyn Fn() -> Option<bool>,
+) -> Result<(Ctx, KeyboardRead, Selection), String> {
+    let mut ctx = context_identity(sys)?;
+    let selected = context_selection(sys, &ctx, only, picks);
+    if ctx.console.is_some() && !crate::init_preferences::withheld_settings(selected).is_empty() {
+        ctx.facts.full_disk_access = full_disk_access();
+    }
+    let (ctx, keyboards) = context_keyboards(
+        sys,
+        ctx,
+        WorkstationGroup::All,
+        selected,
+        KeyboardServices::Native,
+    )?;
+    Ok((ctx, keyboards, selected))
 }
 
 fn context_for_selected(
@@ -5493,6 +5841,12 @@ fn context_reading_with(
     selected: Selection,
     services: KeyboardServices,
 ) -> Result<(Ctx, KeyboardRead), String> {
+    let ctx = context_identity(sys)?;
+    context_keyboards(sys, ctx, group, selected, services)
+}
+
+/// The process's account and console identity; no optional HID or permission probe.
+fn context_identity(sys: &dyn System) -> Result<Ctx, String> {
     if sys.euid() == 0 {
         return Err("run as the logged-in user, without sudo".into());
     }
@@ -5523,18 +5877,25 @@ fn context_reading_with(
         full_disk_access: sys.full_disk_access(),
         ..HostFacts::default()
     };
-    if !at_console {
-        return Ok((
-            Ctx {
-                facts,
-                users: vec![user],
-                console: None,
-                host_name: String::new(),
-                cache_dir: PathBuf::new(),
-                disrupt: true,
-            },
-            KeyboardRead::default(),
-        ));
+    Ok(Ctx {
+        facts,
+        users: vec![user.clone()],
+        console: at_console.then_some(user),
+        host_name: String::new(),
+        cache_dir: PathBuf::new(),
+        disrupt: true,
+    })
+}
+
+fn context_keyboards(
+    sys: &dyn System,
+    mut ctx: Ctx,
+    group: WorkstationGroup,
+    selected: Selection,
+    services: KeyboardServices,
+) -> Result<(Ctx, KeyboardRead), String> {
+    if ctx.console.is_none() {
+        return Ok((ctx, KeyboardRead::default()));
     }
     let keyboards =
         if group == WorkstationGroup::Accounts || !selected.contains(Setting::CapsLock) {
@@ -5578,18 +5939,8 @@ fn context_reading_with(
             },
         ),
     };
-    let facts = HostFacts { keyboards, ..facts };
-    Ok((
-        Ctx {
-            facts,
-            users: vec![user.clone()],
-            console: Some(user),
-            host_name: String::new(),
-            cache_dir: PathBuf::new(),
-            disrupt: true,
-        },
-        read,
-    ))
+    ctx.facts.keyboards = keyboards;
+    Ok((ctx, read))
 }
 
 fn complete(rows: &[ItemReport], action: Action) -> bool {
@@ -5760,6 +6111,7 @@ mod tests {
         static KEYBOARDS: KeyboardRead = KeyboardRead::EMPTY;
         Reading {
             keyboards: &KEYBOARDS,
+            context_scope: Selection::all(),
             only,
             picks: Picks::default(),
         }
@@ -7128,6 +7480,7 @@ mod tests {
             &ports,
             crate::sync::Trigger::Subscriber,
             Mode::Plan,
+            aterm_secrets::converge::RepositoryWork::Refresh,
             &mut |_| {},
         )
         .unwrap();
@@ -7627,6 +7980,7 @@ mod tests {
                 &Narrowing {
                     only: &[],
                     record: false,
+                    relayed: false,
                 },
                 Mode::Apply,
                 &mut NoJournal,
@@ -7741,6 +8095,7 @@ mod tests {
                 None,
                 &Reading {
                     keyboards: &KeyboardRead::EMPTY,
+                    context_scope: Selection::all(),
                     only: &[],
                     picks: options.picks,
                 },
@@ -8146,21 +8501,23 @@ mod tests {
         );
         for action in [Action::Apply, Action::Plan] {
             assert!(
-                observed_workstation(&sys, action, &|| panic!("a non-check queried observations"))
-                    .is_none()
+                observed_workstation(&sys, action, Selection::all(), &|| panic!(
+                    "a non-check queried observations"
+                ))
+                .is_none()
             );
         }
         assert_eq!(
-            observed_workstation(&sys, Action::Check, &|| WorkstationObservation::Complete(
-                Selection::all().workstation()
-            )),
+            observed_workstation(&sys, Action::Check, Selection::all(), &|| {
+                WorkstationObservation::Complete(Selection::all().workstation())
+            }),
             Some(WorkstationObservation::Complete(
                 Selection::all().workstation()
             ))
         );
         let other = alice_at(502);
         assert!(
-            observed_workstation(&other, Action::Check, &|| panic!(
+            observed_workstation(&other, Action::Check, Selection::all(), &|| panic!(
                 "another login queried observations"
             ))
             .is_none()
@@ -8610,53 +8967,178 @@ mod tests {
     }
 
     #[test]
-    fn agent_checks_relay_workstation_evidence_without_becoming_person_checks() {
-        for terminal in [false, true] {
-            let mut sys = alice_at(501);
+    fn a_scoped_agent_check_reaches_its_advertised_workstation_selector() {
+        for (selector, console, terminal, agent, held, dock_verified, expected) in [
+            ("github", 501, true, Some("Codex"), false, false, Some(0)),
+            ("widgets", 501, true, Some("Codex"), false, false, Some(75)),
+            ("keyboard", 501, true, Some("Codex"), false, false, Some(0)),
+            (
+                "keyboard.caps-lock.seen@alice",
+                501,
+                false,
+                Some("Codex"),
+                false,
+                false,
+                Some(0),
+            ),
+            (
+                "keyboard,dock",
+                501,
+                true,
+                Some("Codex"),
+                false,
+                false,
+                Some(75),
+            ),
+            (
+                "keyboard,dock",
+                501,
+                true,
+                Some("Codex"),
+                false,
+                true,
+                Some(0),
+            ),
+            ("keybord", 501, true, Some("Codex"), false, false, None),
+            ("keyboard", 501, false, None, true, false, None),
+            ("keyboard", 502, true, Some("Codex"), false, false, Some(77)),
+        ] {
+            let mut sys = alice_at(console);
             sys.terminal = terminal;
-            sys.agent = Some("Codex");
-            let observation = observed_workstation(&sys, Action::Check, &|| {
-                WorkstationObservation::Complete(Selection::all().workstation())
-            });
-            assert_eq!(
-                observation,
-                Some(WorkstationObservation::Complete(
-                    Selection::all().workstation()
-                ))
-            );
-            let (ctx, _) = local_context(&sys).unwrap();
-            let standing = Standing {
-                workstation_observation: observation,
-                ..alab_standing()
+            sys.agent = agent;
+            let mut requested =
+                options(&["--check", "--only", selector].map(OsString::from)).unwrap();
+            requested.station = unnamed(&Base::none(), &requested.only);
+            let mut verified = Selection::none();
+            verified.set(Setting::CapsLock, true);
+            verified.set(Setting::Dock, dock_verified);
+            let mut standing = alab_standing();
+            standing.holds.off.set(Setting::CapsLock, held);
+            let fda_reads = std::cell::Cell::new(0);
+            let full_disk_access = || {
+                fda_reads.set(fda_reads.get() + 1);
+                Some(true)
             };
-            let vault = crate::init_secrets::tests::Scripted::new(vec![Ok(
-                crate::init_secrets::tests::unconfigured(),
-            )]);
-            let (groups, _) = prepare_groups_with(
+            let prepare = |sys: &dyn System, ctx: &Ctx, mode: Mode, reading: &Reading<'_>| {
+                let standing = Standing {
+                    workstation_observation: observed_workstation(
+                        sys,
+                        Action::Check,
+                        reading.context_scope,
+                        &|| {
+                            assert_ne!(
+                                selector, "github",
+                                "GitHub-only needs no window's cached preference observation"
+                            );
+                            WorkstationObservation::Complete(verified)
+                        },
+                    ),
+                    holds: standing.holds.clone(),
+                    ..standing
+                };
+                prepare_groups_with(sys, ctx, mode, None, reading, &standing, no_grants, |_| {
+                    Ok(crate::init_secrets::tests::Scripted::new(vec![Ok(
+                        crate::init_secrets::tests::unconfigured(),
+                    )])
+                        as Arc<dyn crate::init_secrets::SecretsOps>)
+                })
+                .inspect(|(_, picked)| {
+                    if held {
+                        assert!(picked.kept.contains(Setting::CapsLock));
+                        assert!(!picked.runs.contains(Setting::CapsLock));
+                    }
+                })
+            };
+            let result = converge(
                 &sys,
-                &ctx,
-                Mode::Plan,
-                None,
-                &reading(&[]),
-                &standing,
-                no_grants,
-                move |_| Ok(vault as Arc<dyn crate::init_secrets::SecretsOps>),
-            )
-            .unwrap();
-            assert!(
-                groups
-                    .iter()
-                    .all(|(_, place)| place.class != Class::Preference)
+                &requested,
+                &Front {
+                    base: &|_| Base::none(),
+                    groups: &prepare,
+                    full_disk_access: &full_disk_access,
+                    targo: None,
+                    cwd: None,
+                    records: &NoSetup,
+                    on_row: &|_| {},
+                    present: &|| {
+                        assert_ne!(
+                            selector, "github",
+                            "GitHub-only needs no WindowServer presence read"
+                        );
+                        true
+                    },
+                    on_held: &|_| {},
+                },
+                &mut NoJournal,
+                &mut Laps::start(),
             );
-            let away = groups
-                .into_iter()
-                .filter(|(items, _)| items.iter().any(|item| item.id() == AWAY))
-                .collect::<Vec<_>>();
-            assert_eq!(away.len(), 1, "the check relays coordinator evidence");
-            let before = sys.calls();
-            let rows = run(&sys, &ctx, Base::none(), &away, Mode::Plan, &mut NoJournal).unwrap();
-            assert_eq!(status(&rows, Action::Check), 0);
-            assert_eq!(sys.calls(), before, "no private preference reader ran");
+            match expected {
+                Some(code) => {
+                    let rows =
+                        result.expect("a real selector reaches the coordinator's observation");
+                    assert_eq!(status(&rows, Action::Check), code, "{selector}: {rows:?}");
+                    if selector == "github" {
+                        assert_eq!(fda_reads.get(), 0, "GitHub-only needs no FDA reading");
+                        assert_eq!(rows.len(), 2);
+                        assert!(rows.iter().all(|row| row.family == "github"));
+                        assert!(
+                            sys.calls()
+                                .iter()
+                                .all(|call| !call.contains("hidutil")
+                                    && call != "keyboard-service-ids"),
+                            "GitHub-only needs no keyboard census: {:?}",
+                            sys.calls()
+                        );
+                    } else {
+                        assert_eq!(
+                            rows.len(),
+                            1,
+                            "{selector}: only the selected aggregate runs"
+                        );
+                        assert_eq!(rows[0].id, AWAY);
+                        assert_eq!(
+                            rows[0].class,
+                            Some(if console == 501 {
+                                Class::Relay
+                            } else {
+                                Class::Person
+                            }),
+                            "another login cannot relay this account's cached evidence"
+                        );
+                    }
+                }
+                None => {
+                    let Refused::Usage(why) = result.expect_err("a typo or held group is refused")
+                    else {
+                        panic!("selector refusal must remain a usage error");
+                    };
+                    assert!(why.contains(selector), "{why}");
+                }
+            }
+            assert!(
+                sys.calls().iter().all(|call| {
+                    !call.contains("defaults")
+                        && !call.contains("dump services")
+                        && !call.contains("mdfind")
+                        && !call.contains("osascript")
+                }),
+                "{selector}: {:?}",
+                sys.calls()
+            );
+            assert!(sys.keyboard_changes().is_empty());
+            if selector == "widgets" {
+                assert_eq!(
+                    fda_reads.get(),
+                    1,
+                    "selected contained keys retain the FDA reading"
+                );
+            }
+            if selector.starts_with("keyboard") && console == 501 {
+                assert!(
+                    sys.calls().iter().any(|call| call.contains("hidutil list")),
+                    "keyboard selection still discovers its actual services"
+                );
+            }
         }
     }
 
@@ -8869,7 +9351,12 @@ mod tests {
         crate::init_github::scripted::converged(&sys, &user("alice", 501), "notes");
         let owed = owed_clone(&sys, state.path(), &Holds::NONE).unwrap();
         assert!(matches!(owed, OwedClone::Due(_)), "{owed:?}");
-        clone_owed(&sys, state.path()).unwrap();
+        clone_owed(
+            &sys,
+            state.path(),
+            aterm_secrets::converge::RepositoryWork::Refresh,
+        )
+        .unwrap();
         assert_eq!(
             owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
             OwedClone::Verified {
@@ -8877,6 +9364,13 @@ mod tests {
                 total: 1
             },
             "the next pass verifies the inventory instead of cloning again"
+        );
+        assert!(
+            sys.calls()
+                .iter()
+                .all(|call| !call.contains("hidutil") && call != "keyboard-service-ids"),
+            "repository retry needs no workstation census: {:?}",
+            sys.calls()
         );
     }
 
@@ -8898,7 +9392,12 @@ mod tests {
             crate::port::Ran::exit(128, "fatal: bad config line 1"),
         );
         crate::init_github::scripted::converged(&sys, &who, "notes");
-        clone_owed(&sys, state.path()).unwrap();
+        clone_owed(
+            &sys,
+            state.path(),
+            aterm_secrets::converge::RepositoryWork::Refresh,
+        )
+        .unwrap();
         assert_eq!(
             owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
             OwedClone::Verified {
@@ -9498,6 +9997,7 @@ mod tests {
                 &Front {
                     base: &base,
                     groups: &groups,
+                    full_disk_access: &|| sys.full_disk_access(),
                     targo: None,
                     cwd: Some(Path::new("/Users//alice/aterm")),
                     records: &NoRecords,
@@ -10069,6 +10569,73 @@ mod tests {
         );
     }
 
+    /// DOCTOR'S CLONE TUNING is the workstation item `init.github.tuning@alice` bound as a
+    /// relay-class repair of the account's own: nothing is read before the call, and under System
+    /// State's hold of GitHub repositories bare doctor's scope reads it not applicable, naming
+    /// the hold, and runs no git. NEGATIVE CONTROL: with no hold the same Mac's row names what it
+    /// read instead.
+    #[test]
+    fn doctor_s_clone_tuning_is_a_relay_item_of_the_account_s_own() {
+        let mac = || {
+            let sys = alice_with_checkout(501, None);
+            let setup = sys.calls().len();
+            (
+                Doctor::over(sys, Some(PathBuf::from("/Users//alice")), None),
+                setup,
+            )
+        };
+        let run = |doctor: &Doctor<Fake>, holds: Holds| {
+            let items = doctor
+                .clone_tuning(Path::new("/state"), Box::new(move || holds.clone()))
+                .expect("alice's context reads");
+            aterm_converge::run_scoped(
+                &items,
+                aterm_converge::Mode::Apply,
+                aterm_converge::Scope::REPAIR,
+                &mut aterm_converge::NoJournal,
+                &mut |_| {},
+            )
+            .unwrap()
+        };
+        let mut off = Selection::none();
+        off.set(Setting::Repositories, true);
+        let held = Holds { off, ..Holds::NONE };
+        let (doctor, setup) = mac();
+        assert_eq!(
+            doctor.sys.calls().len(),
+            setup,
+            "nothing read before the call"
+        );
+        let rows = run(&doctor, held);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].id, "init.github.tuning@alice");
+        assert_eq!(rows[0].class, Some(Class::Relay));
+        assert_eq!(rows[0].layer, Some(Layer::Workstation));
+        assert_eq!(rows[0].outcome, Outcome::NotApplicable, "{rows:?}");
+        assert_eq!(
+            rows[0].why.as_deref(),
+            Some("left as you set it in System State")
+        );
+        assert!(
+            !doctor
+                .sys
+                .calls()
+                .iter()
+                .any(|call| call.contains("rev-parse") || call.contains("config")),
+            "{:?}",
+            doctor.sys.calls()
+        );
+
+        let (doctor, _) = mac();
+        let rows = run(&doctor, Holds::NONE);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_ne!(
+            rows[0].why.as_deref(),
+            Some("left as you set it in System State"),
+            "{rows:?}"
+        );
+    }
+
     /// Lanes meeting in their probes: [`Meet::arrive`] returns once `count` lanes stand in it
     /// at the same time, and fails after a minute (a hang detector): lanes run one after
     /// another never all arrive.
@@ -10324,6 +10891,7 @@ mod tests {
             &Narrowing {
                 only: &[],
                 record: false,
+                relayed: false,
             },
             Mode::Apply,
             &mut NoJournal,
@@ -10497,7 +11065,6 @@ mod tests {
         for setting in Setting::ALL {
             assert!(usage.contains(setting.label()), "{setting:?}: {usage}");
         }
-        assert!(usage.contains("first launch"), "{usage}");
     }
 
     /// First-run setup is on by default (owner ruling 2026-10-25): a person at an ALab Mac's
@@ -10522,6 +11089,7 @@ mod tests {
                 None,
                 &Reading {
                     keyboards: &KeyboardRead::EMPTY,
+                    context_scope: Selection::all(),
                     only: &[],
                     picks,
                 },
@@ -10700,6 +11268,7 @@ mod tests {
             &Front {
                 base: &|_| Base::none(),
                 groups: &prepare,
+                full_disk_access: &|| sys.full_disk_access(),
                 targo: None,
                 cwd: None,
                 records,
@@ -10767,6 +11336,7 @@ mod tests {
             &Front {
                 base: &base,
                 groups: &prepare,
+                full_disk_access: &|| sys.full_disk_access(),
                 targo: None,
                 cwd: None,
                 records: &records,
@@ -11348,6 +11918,7 @@ mod tests {
                 &Front {
                     base: &base,
                     groups: &groups,
+                    full_disk_access: &|| sys.full_disk_access(),
                     targo: None,
                     cwd: Some(Path::new("/Users//alice/aterm")),
                     records: &NoRecords,
@@ -11782,6 +12353,7 @@ mod tests {
             &Front {
                 base: &|_| Base::none(),
                 groups: prepare,
+                full_disk_access: &|| sys.full_disk_access(),
                 targo: None,
                 cwd: None,
                 records,
@@ -11976,6 +12548,7 @@ mod tests {
             &Front {
                 base: &|_| Base::none(),
                 groups: &prepare,
+                full_disk_access: &|| sys.full_disk_access(),
                 targo: None,
                 cwd: None,
                 records: &records,
@@ -12184,6 +12757,7 @@ mod tests {
                 None,
                 &Reading {
                     keyboards: &KeyboardRead::EMPTY,
+                    context_scope: Selection::all(),
                     only: &[],
                     picks: Picks::default(),
                 },
@@ -13217,6 +13791,7 @@ mod tests {
             &ports,
             crate::sync::Trigger::Subscriber,
             Mode::Apply,
+            aterm_secrets::converge::RepositoryWork::Refresh,
             &mut |_| {},
         );
         assert!(

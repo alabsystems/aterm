@@ -86,7 +86,8 @@ fn split_frames_keep_state_and_cancel_is_exact_without_queue_timeout() {
         Some(Terminal::Finished(Completed {
             outcome: admission::Outcome::Exit(7),
             cause: admission::CompletionCause::Timeout,
-            runtime_ns: 90
+            runtime_ns: 90,
+            accounting: None,
         }))
     );
     server.write_all(&[0]).unwrap();

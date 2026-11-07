@@ -25,6 +25,32 @@ impl Channel {
     pub fn poisoned(&self) -> bool {
         self.poisoned
     }
+    /// Observe clean stream EOF between frames without consuming bytes. A
+    /// partial/trailing frame remains readable and must pass receive instead.
+    pub fn at_eof(&self) -> io::Result<bool> {
+        if self.poisoned {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        let mut byte = 0u8;
+        // SAFETY: held live socket and one initialized writable byte. Per-call
+        // flags neither consume data nor change the underlying description.
+        let result = unsafe {
+            libc::recv(
+                self.stream.as_raw_fd(),
+                (&mut byte as *mut u8).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if result >= 0 {
+            return Ok(result == 0);
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Ok(false),
+            _ => Err(error),
+        }
+    }
     /// Nonblocking readiness hint for an owner multiplexing target events and
     /// cancellation. HUP/error also count as ready so receive observes closure.
     /// No bytes are consumed and an idle channel is not poisoned.
@@ -62,15 +88,24 @@ impl Channel {
     }
     /// Receive exactly one frame; malformed/partial/late input poisons the stream.
     pub fn receive(&mut self, deadline: Instant) -> io::Result<Vec<u8>> {
+        self.receive_observed(deadline, |_| {})
+    }
+    /// Record only bytes actually received, including a malformed/partial
+    /// length frame. Observation never clears poison or grants lifecycle state.
+    pub(crate) fn receive_observed(
+        &mut self,
+        deadline: Instant,
+        mut observe: impl FnMut(&[u8]),
+    ) -> io::Result<Vec<u8>> {
         self.begin()?;
         let mut length = [0; 4];
-        self.transfer(&mut length, false, deadline)?;
+        self.transfer_observed(&mut length, false, deadline, &mut observe)?;
         let length = u32::from_be_bytes(length) as usize;
         if length == 0 || length > MAX_PAYLOAD {
             return Err(crate::wire::invalid());
         }
         let mut payload = vec![0; length];
-        self.transfer(&mut payload, false, deadline)?;
+        self.transfer_observed(&mut payload, false, deadline, &mut observe)?;
         self.poisoned = false;
         Ok(payload)
     }
@@ -85,6 +120,15 @@ impl Channel {
         Ok(())
     }
     fn transfer(&self, bytes: &mut [u8], sending: bool, deadline: Instant) -> io::Result<()> {
+        self.transfer_observed(bytes, sending, deadline, &mut |_| {})
+    }
+    fn transfer_observed(
+        &self,
+        bytes: &mut [u8],
+        sending: bool,
+        deadline: Instant,
+        observe: &mut impl FnMut(&[u8]),
+    ) -> io::Result<()> {
         let mut offset = 0;
         while offset < bytes.len() {
             if Instant::now() >= deadline {
@@ -112,6 +156,9 @@ impl Channel {
                 }
             };
             if count > 0 {
+                if !sending {
+                    observe(&bytes[offset..offset + count as usize]);
+                }
                 offset += count as usize;
                 continue;
             }

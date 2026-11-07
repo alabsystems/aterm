@@ -218,7 +218,7 @@ mod tests {
     fn row(local: u64, window: u64, closed_unix_ms: u64) -> Retired {
         let (record, _) = TaskMark::new(TaskState::Done).apply(
             None,
-            false,
+            &Default::default(),
             std::time::Instant::now(),
             closed_unix_ms,
         );

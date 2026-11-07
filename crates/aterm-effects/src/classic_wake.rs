@@ -154,6 +154,11 @@ pub struct ClassicWake {
     /// (`EffectsPipeline::set_classic_pin_own_chroma`).
     #[cfg(any(test, debug_assertions))]
     pub(crate) mono_pin_floored: bool,
+    /// A negative control's seam: the one-colour rail's raise reads the page's whole
+    /// brightness as grey, its tint along the pin's hue too, as before the after-land lows'
+    /// W10b (`EffectsPipeline::set_classic_rail_tint_read`).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) mono_rail_tint_blind: bool,
     /// Test-only: judge the one-colour landing ring whole or not afresh
     /// from each frame's text, as looks9 Q4 judged it, not once a landing
     /// ([`MonoRing`], looks9's review's negative control).
@@ -245,9 +250,13 @@ impl Default for ClassicWake {
 /// A probed row's foot: its box, `(x0, x1, y0, y1)` in window px.
 pub(crate) type WakeFoot = (i32, i32, i32, i32);
 
-/// The probed rows' feet, the caret's cell carved out, and their soles
-/// ([`WakeInk::feet`]).
-pub(crate) type WakeFeet<'a> = (&'a [WakeFoot], [Option<WakeFoot>; 2]);
+/// The probed rows' feet, the caret's cell carved out, what each foot cell
+/// leaves under its ink, and their soles ([`WakeInk::feet`]).
+pub(crate) type WakeFeet<'a> = (
+    &'a [WakeFoot],
+    &'a [crate::cursor_glow::FootInk],
+    [Option<WakeFoot>; 2],
+);
 
 /// Over-text state for the mono face's dark bed.
 pub(crate) struct WakeInk<'a> {
@@ -990,6 +999,8 @@ impl ClassicWake {
             typed_life_unscaled: false,
             #[cfg(any(test, debug_assertions))]
             mono_pin_floored: false,
+            #[cfg(any(test, debug_assertions))]
+            mono_rail_tint_blind: false,
             #[cfg(test)]
             ring_unlatched: false,
             #[cfg(test)]
@@ -1653,7 +1664,7 @@ impl ClassicWake {
         (out, under): (&mut RampSink<'_>, &mut RampSink<'_>),
         (text, chosen): (TextView<'_>, bool),
         ledger: &mut InkLedger,
-        ((feet, soles), bed_ground): (WakeFeet<'_>, Option<u32>),
+        ((feet, foot_ink, soles), bed_ground): (WakeFeet<'_>, Option<u32>),
     ) {
         let live = self.build_runs(now, cfg, geom, cur);
         if live == 0 {
@@ -1674,6 +1685,10 @@ impl ClassicWake {
             Self::MONO_BED
         };
         let air = crate::cursor_glow::AirLight::of(page, budget, shape);
+        #[cfg(any(test, debug_assertions))]
+        let tint_blind = self.mono_rail_tint_blind;
+        #[cfg(not(any(test, debug_assertions)))]
+        let tint_blind = false;
         let chf = geom.ch as f32;
         let lit_page = crate::cursor_glow::page_lit(page, budget);
         let shape = if lit_page { shape.on_lit_page() } else { shape };
@@ -1682,6 +1697,8 @@ impl ClassicWake {
         scratch.rails.clear();
         scratch.feet.clear();
         scratch.feet.extend_from_slice(feet);
+        scratch.foot_ink.clear();
+        scratch.foot_ink.extend_from_slice(foot_ink);
         scratch.soles = soles;
         scratch.rail_drop = if lit_page {
             crate::cursor_glow::lit_rail_drop(chf)
@@ -1748,7 +1765,7 @@ impl ClassicWake {
                             _ => crate::cursor_glow::dark_bed_ink(rgb, page, budget, bed_sat),
                         };
                         let r = if shape.pinned {
-                            Self::pinned_rail_ink(rgb & 0x00FF_FFFF, page)
+                            Self::pinned_rail_ink(rgb & 0x00FF_FFFF, page, tint_blind)
                         } else {
                             crate::rainbow_kitty::ribbon::rail_ink(rgb & 0x00FF_FFFF)
                         };
@@ -2028,22 +2045,48 @@ impl ClassicWake {
 
     /// The one-colour rail's ink for a colour the user chose, `rgb`, over the dark `page`: the
     /// pin's hue at full value, its saturation raised by the share the page's grey takes of the
-    /// rail's core (`page / PIN_RAIL_CORE`), so the rail composes on the page to the pin's own
+    /// rail's core (`grey / PIN_RAIL_CORE`), so the rail composes on the page to the pin's own
     /// chroma at its lightness. Laid at the pin's saturation itself (`bed_rail_ink`'s pinned
     /// ink), the page diluted the rail to 0.28-0.31 of OKLCH chroma per lightness under the pink
     /// pin's 0.337; floored to full saturation, as unpinned, it read up to 0.40 (composed
-    /// O10(a)).
+    /// O10(a)). The grey is [`Self::page_grey_under`]'s: a page tinted in the pin's own hue
+    /// lends the rail chroma where a grey one dilutes it, and raised by Solarized Dark's whole
+    /// brightness a blue pin's rail reads 14-21% over the pin there (the after-land lows' W10b;
+    /// `tint_blind`, a test's negative control, raises by the whole brightness again).
     #[inline]
     #[must_use]
-    const fn pinned_rail_ink(rgb: u32, page: u32) -> u32 {
+    const fn pinned_rail_ink(rgb: u32, page: u32, tint_blind: bool) -> u32 {
         let (h, s, _) = crate::color_math::rgb2hsv(rgb);
-        let grey = {
-            let (r, g, b) = ((page >> 16) & 0xff, (page >> 8) & 0xff, page & 0xff);
-            let m = if r > g { r } else { g };
-            (if m > b { m } else { b }) as f32
-        };
+        let grey = Self::page_grey_under(page, rgb, tint_blind);
         let raised = s * (1.0 + grey / Self::PIN_RAIL_CORE);
         crate::color_math::hsv2rgb(h, if raised < 1.0 { raised } else { 1.0 }, 1.0)
+    }
+
+    /// The grey `page` lays under a rail in `pin`'s hue, of 255: its brightest channel, less its
+    /// chroma (that channel less its least) by the share of its OKLab tint that runs along the
+    /// pin's hue (the cosine between the two, none where they part by a right angle or more).
+    /// A neutral page, or a pin across the page's tint (Classic pink on Solarized Dark's teal),
+    /// keeps the page's whole brightness; a blue pin on that teal, much less. `tint_blind`: the
+    /// brightest channel alone.
+    #[inline]
+    #[must_use]
+    const fn page_grey_under(page: u32, pin: u32, tint_blind: bool) -> f32 {
+        let (r, g, b) = ((page >> 16) & 0xff, (page >> 8) & 0xff, page & 0xff);
+        let hi = if r > g { r } else { g };
+        let hi = (if hi > b { hi } else { b }) as f32;
+        if tint_blind {
+            return hi;
+        }
+        let lo = if r < g { r } else { g };
+        let lo = (if lo < b { lo } else { b }) as f32;
+        let [_, pa, pb] = crate::color_math::oklab(page);
+        let [_, ia, ib] = crate::color_math::oklab(pin);
+        let tint = crate::color_math::hypot_f32(pa, pb) * crate::color_math::hypot_f32(ia, ib);
+        if tint <= 1e-9 {
+            return hi;
+        }
+        let along = (pa * ia + pb * ib) / tint;
+        hi - (hi - lo) * if along > 0.0 { along } else { 0.0 }
     }
 
     /// The one-colour face's bed on a dark page. Its rail lies in its own
@@ -3063,7 +3106,7 @@ mod tests {
                     text: crate::cursor_glow::TextView::new(self.spans, None),
                     ledger: &mut self.ledger,
                     chosen: false,
-                    feet: (&[], [None; 2]),
+                    feet: (&[], &[], [None; 2]),
                     bed_ground: self.bed_ground,
                 },
             )

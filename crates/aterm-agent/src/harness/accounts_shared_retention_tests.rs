@@ -50,7 +50,7 @@ fn a_non_home_warm_grant_wakes_a_sync_to_release_prepared_execution() {
         aterm_types::fs_restricted::ensure_private_dir(&home.join(".secrets")).unwrap();
         fs::create_dir_all(&config_dir).unwrap();
         let config = config_dir.join("aterm.toml");
-        fs::write(&config, "[fleet]\nmachine='m16'\n").unwrap();
+        crate::test_config::write(&config, "[fleet]\nmachine='m16'\n").unwrap();
         let source = format!(
             "version=1\n[[account]]\nprovider='{provider}'\nemail='owner@example.test'\n\
              warm=['m1','m16']\nsince=['2026-10-30T00:00:00Z','2026-10-30T00:00:00Z']\n\

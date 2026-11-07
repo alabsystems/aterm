@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::super::relaunch::{
-    Continued, ExitCause, NO_SHELL, NO_SHELL_DETAIL, WAIT_HAND_LIFTS, cannot_step, exit_clock,
-    first_idle, hand_waits_out,
+    AgentExit, Continued, ExitCause, NO_SHELL, NO_SHELL_DETAIL, WAIT_HAND_LIFTS, cannot_step,
+    exit_clock, exit_wait, first_idle, hand_waits_out,
 };
 use super::super::upgrade_muse::{self as mz, ExitKind};
 #[cfg(all(test, unix))]
@@ -150,7 +150,7 @@ fn child_dirs(p: &Path) -> Vec<PathBuf> {
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(crate::harness::entry_is_dir)
         .map(|e| e.path())
         .collect()
 }
@@ -463,19 +463,22 @@ pub(super) fn after_exit_onto(
     };
     let mut closed = None;
     if let Some(mut st) = prior.clone().filter(St::in_flight) {
-        let overtaken = (st.pid != snap.pid || st.relaunched_gone(|pid| k.alive(pid))).then(|| {
-            match st.phase {
-                Phase::Exiting { .. } => (
-                    "resumed-elsewhere",
-                    "the session was resumed in this tab outside aterm's relaunch, and that \
+        // A record an earlier build wrote names its agent by pid alone: it takes the start the
+        // snapshot of that pid carries, as RS1 carries an earlier host's restart by identity.
+        st.adopt_start(snap.pid, &snap.start);
+        let overtaken = (!st.names(snap.pid, &snap.start)
+            || st.relaunched_gone(|pid| k.alive(pid), |pid| k.process_start(pid)))
+        .then(|| match st.phase {
+            Phase::Exiting { .. } => (
+                "resumed-elsewhere",
+                "the session was resumed in this tab outside aterm's relaunch, and that \
                      process has exited"
-                        .to_owned(),
-                ),
-                _ => (
-                    "exited-before-continuing",
-                    "the relaunched Muse Code exited before its continuation was typed".to_owned(),
-                ),
-            }
+                    .to_owned(),
+            ),
+            _ => (
+                "exited-before-continuing",
+                "the relaunched Muse Code exited before its continuation was typed".to_owned(),
+            ),
         });
         let overtook = overtaken.is_some();
         if !overtook && hand_waits_out(opts, &mut st, &session_key, |pid| k.alive(pid)) {
@@ -634,6 +637,7 @@ pub(super) fn after_exit_onto(
         cwd: workspace,
         twin: program.to_string_lossy().into_owned(),
         pid: snap.pid,
+        pid_start: squash(&snap.start),
         shell: snap.shell,
         proc_start: snap.start.clone(),
         tab: tab.clone(),
@@ -799,9 +803,14 @@ fn relaunch_held(
     hand: &mut Hand,
     k: &dyn MuseKernel,
 ) -> Report {
-    let old = st.pid;
-    if !wait_until(opts.timings.exited, || !k.alive(old)) {
-        return said(r, "wait:exiting");
+    // The relaunch waits only on the agent the record names by pid and kernel start
+    // ([`St::pid_start`]), never on a pid alone (a reboot reuses them); a record that already
+    // saw it gone ([`St::exited_at`]) waits on none.
+    let exit = |st: &St| st.agent_exit_by(|pid| k.alive(pid), |pid| k.process_start(pid));
+    if st.exited_at == 0
+        && let Some(step) = exit_wait(|| exit(st), |done| wait_until(opts.timings.exited, done))
+    {
+        return said(r, step);
     }
     hand.keep(c);
     if st.exited_at == 0 {
@@ -1095,7 +1104,10 @@ fn carry_in_flight_with(
         return said(r, format!("would-resume:{}", st.phase.word()));
     }
     let see_gone = |st: &mut St| -> bool {
-        if st.exited_at != 0 || st.pid == 0 || k.alive(st.pid) {
+        if st.exited_at != 0
+            || st.pid == 0
+            || st.agent_exit_by(|pid| k.alive(pid), |pid| k.process_start(pid)) != AgentExit::Gone
+        {
             return false;
         }
         st.exited_at = now_s();

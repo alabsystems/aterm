@@ -298,9 +298,9 @@ fn acknowledged_log(
 ) -> (Reading, Option<Log>) {
     #[cfg(test)]
     let judged = super::faults::records_read()
-        .and_then(|()| aterm_secrets::client::acknowledged_commons_log(paths, trust));
+        .and_then(|()| aterm_secrets::client::acknowledged_commons_log_now(paths, trust));
     #[cfg(not(test))]
-    let judged = aterm_secrets::client::acknowledged_commons_log(paths, trust);
+    let judged = aterm_secrets::client::acknowledged_commons_log_now(paths, trust);
     match acknowledged_reading(judged) {
         Err(reading) => (reading, None),
         Ok(log) if denied_by(paths, &log, request, roster) => {
@@ -395,11 +395,11 @@ fn denied_by(
 ) -> bool {
     let binding = request.binding();
     let (actor, recipient) = (binding.actor(), binding.recipient());
-    let Ok(log_roster) = aterm_secrets::client::local_swarm_roster_for_log(paths, log) else {
+    let Ok(log_roster) = aterm_secrets::client::local_swarm_roster_for_log_now(paths, log) else {
         return true;
     };
     let log_roster = log_roster.as_ref().or(roster);
-    let membership = log.membership();
+    let membership = log.membership_ref();
     log.seat_removed(binding)
         || log.audience_left_out_recipient(&EpochAudience::Commons, &recipient)
         || log.audience_left_out_recipient(&EpochAudience::Everyone, &recipient)

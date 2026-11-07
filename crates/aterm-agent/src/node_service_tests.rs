@@ -373,12 +373,12 @@ fn sync_node_installs_respects_off_and_fleet_leave_removes_job() {
     ));
 
     // `[swarm] enabled = false` makes sync.node NotApplicable.
-    std::fs::write(&config, "[swarm]\nenabled = false\n").unwrap();
+    crate::test_config::write(&config, "[swarm]\nenabled = false\n").unwrap();
     assert!(matches!(
         read_for_sync_with(&home, &state, Some(&config), Some(&prog), false, &sup).unwrap(),
         SyncNodeState::NotApplicable(why) if why == aterm_secrets::swarm::SWARM_OFF
     ));
-    std::fs::write(&config, "[fleet]\nlisten = \"0.0.0.0:7100\"\n").unwrap();
+    crate::test_config::write(&config, "[fleet]\nlisten = \"0.0.0.0:7100\"\n").unwrap();
 
     // `aterm fleet leave` removes the unit without recording node-off.
     let unit_before = std::fs::read(plist_path(&home)).unwrap();

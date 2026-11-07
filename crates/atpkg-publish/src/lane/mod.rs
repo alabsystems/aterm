@@ -11,6 +11,7 @@ pub mod install;
 pub mod linux;
 pub mod report;
 pub mod resolve;
+pub mod reuse;
 pub mod rows;
 pub mod state;
 pub mod units;
@@ -113,18 +114,25 @@ impl RunFlags {
     }
 }
 
-/// `atpkg-publish lane <run|install|disarm> <alab|linux> …`.
+/// `atpkg-publish lane <run|stage|install|disarm> <alab|linux> …`.
 /// # Errors
 /// A usage error for an unknown subcommand or lane; otherwise what the subcommand answers.
 pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let (Some(sub), Some(kind)) = (args.first(), args.get(1)) else {
         return Err(Error::usage(
-            "lane <run|install|disarm> <alab|linux> [flags]",
+            "lane <run|stage|install|disarm> <alab|linux> [flags]",
         ));
     };
     let kind = LaneKind::parse(kind)?;
     let flags = &args[2..];
     match sub.as_str() {
+        "stage" if kind == LaneKind::Linux => {
+            let packages = reuse::parse(flags)?;
+            for manifest in reuse::stage(ctx, &packages, &crate::artifact::pack::Pack)? {
+                println!("staged unsigned retained package: {}", manifest.display());
+            }
+            Ok(())
+        }
         "run" => run_lane(ctx, kind, &RunFlags::parse(kind, flags)?),
         "install" => install::install(ctx, kind, &install::InstallFlags::parse(flags)?),
         "disarm" => {
@@ -134,7 +142,7 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
             install::disarm(ctx, kind, &install::Machine::production(ctx)?)
         }
         other => Err(Error::usage(format!(
-            "`lane {other}` is not a lane command (run | install | disarm)"
+            "`lane {other}` is not a lane command (run | stage linux | install | disarm)"
         ))),
     }
 }

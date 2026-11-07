@@ -212,22 +212,61 @@ fn cpu_bundle_transfers_the_exact_minimum_and_maximum_population() {
         .open(&fence_path)
         .unwrap()
         .into();
-    for count in [1, MAX_CPU_FILES] {
+    assert_eq!(MAX_CPU_FILES, 128);
+    for count in [1, 128] {
         let mut handles = vec![primary.try_clone().unwrap()];
         handles.extend((1..count).map(|_| fence.try_clone().unwrap()));
         let (left, right) = streams();
-        send_handles(&left, &handles, Instant::now() + TIMEOUT).unwrap();
-        let received =
-            receive_handles(&right, Instant::now() + TIMEOUT, Role::CpuBundle, count).unwrap();
-        assert_eq!(received.len(), count);
-        for fd in received {
-            // SAFETY: this descriptor was just received and remains owned here.
-            assert_ne!(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC, 0);
+        // Real handoffs cross process boundaries. Receiving all128 duplicates
+        // in this sender too can exhaust its ordinary descriptor budget before
+        // it tests transport. Keep both real process budgets unchanged.
+        struct Receiver(std::process::Child);
+        impl Drop for Receiver {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
         }
+        let mut child = Receiver(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "handoff::tests::cpu_bundle_population_receiver_actor",
+                    "--nocapture",
+                ])
+                .env("TJS_CPU_POPULATION_RECEIVER", count.to_string())
+                .stdin(std::process::Stdio::from(OwnedFd::from(right)))
+                .spawn()
+                .unwrap(),
+        );
+        send_handles(&left, &handles, Instant::now() + TIMEOUT).unwrap();
+        assert!(child.0.wait().unwrap().success());
     }
     drop((primary, fence));
     std::fs::remove_file(fence_path).unwrap();
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn cpu_bundle_population_receiver_actor() {
+    let Ok(count) = std::env::var("TJS_CPU_POPULATION_RECEIVER") else {
+        return;
+    };
+    let count = count.parse::<usize>().unwrap();
+    assert!(matches!(count, 1 | 128));
+    // SAFETY: this isolated actor receives its actual private socket atstdin.
+    // Duplicate it without claiming an environment-selected descriptor number.
+    let fd = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3) };
+    assert!(fd >= 3);
+    let stream = UnixStream::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    stream.set_nonblocking(true).unwrap();
+    let received =
+        receive_handles(&stream, Instant::now() + TIMEOUT, Role::CpuBundle, count).unwrap();
+    assert_eq!(received.len(), count);
+    for fd in received {
+        // SAFETY: this descriptor was just received and remains owned here.
+        assert_ne!(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC, 0);
+    }
 }
 
 pub(super) fn pipe() -> [OwnedFd; 2] {

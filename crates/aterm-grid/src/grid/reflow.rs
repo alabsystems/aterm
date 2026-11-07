@@ -532,10 +532,6 @@ impl Grid {
             self.storage.staged_width_stale = true;
         }
 
-        if new_cols != old_cols {
-            self.storage.lazy_buffer.clear_pool();
-        }
-
         let cursor_row = self.storage.cursor.row as usize;
         let mut landed = self.storage.cursor.col;
 

@@ -45,6 +45,13 @@ pub struct Row {
     len: u16,
     /// Row flags.
     flags: RowFlags,
+    /// Every cell outside `written_lo..written_hi` is bitwise [`Cell::EMPTY`]: a window each
+    /// method that writes cells widens to cover what it may have written, so an erase to empty
+    /// rewrites only the window ([`Self::erase_with`], [`Self::reset_with`], [`Self::clear`]).
+    /// `written_lo >= written_hi` is an empty window.
+    written_lo: u16,
+    /// The window's end (see `written_lo`).
+    written_hi: u16,
 }
 
 aterm_types::bitflags! {
@@ -119,6 +126,8 @@ impl Row {
             cells,
             len: 0,
             flags: RowFlags::DIRTY,
+            written_lo: u16::MAX,
+            written_hi: 0,
         }
     }
 
@@ -254,6 +263,95 @@ impl Row {
         }
     }
 
+    /// Record that cells in `start..end` may have been written: the written window only widens
+    /// here, and only an erase to empty empties it.
+    #[inline]
+    fn note_cells_written(&mut self, start: usize, end: usize) {
+        let end = u16_from_usize(end.min(self.cells.len()));
+        let start = u16_from_usize(start);
+        if start >= end {
+            return;
+        }
+        self.written_lo = self.written_lo.min(start);
+        self.written_hi = self.written_hi.max(end);
+    }
+
+    /// How many of the row's first cells are bitwise [`Cell::EMPTY`] by the written window's
+    /// record: those before the window, or every cell when the window is empty. Capped at
+    /// [`Self::len`]; a blank cell inside the window is not counted.
+    #[must_use]
+    #[inline]
+    pub(crate) fn blank_lead(&self) -> u16 {
+        #[cfg(test)]
+        if crate::test_counters::reference_paths() {
+            return 0;
+        }
+        let lead = if self.written_lo < self.written_hi {
+            self.written_lo
+        } else {
+            u16::MAX
+        };
+        lead.min(self.len)
+    }
+
+    /// [`Self::note_cells_written`] for cells `start..end` the caller has checked lie inside
+    /// the row: the per-glyph and per-run writers' form, with no clamp or conversion.
+    #[inline]
+    fn note_span(&mut self, start: u16, end: u16) {
+        debug_assert!(start <= end && usize::from(end) <= self.cells.len());
+        self.written_lo = self.written_lo.min(start);
+        self.written_hi = self.written_hi.max(end);
+    }
+
+    /// Record that any cell may have been written.
+    #[inline]
+    fn note_all_cells_written(&mut self) {
+        self.written_lo = 0;
+        self.written_hi = u16_from_usize(self.cells.len());
+    }
+
+    /// Record that every cell is empty.
+    #[inline]
+    const fn note_cells_blank(&mut self) {
+        self.written_lo = u16::MAX;
+        self.written_hi = 0;
+    }
+
+    /// Fill every cell with `fill`. An empty fill rewrites only the written window, every cell
+    /// outside it being empty already.
+    #[inline]
+    fn fill_cells(&mut self, fill: Cell) {
+        let fast = fill == Cell::EMPTY;
+        #[cfg(test)]
+        let fast = fast && !crate::test_counters::reference_paths();
+        if fast {
+            let hi = usize::from(self.written_hi).min(self.cells.len());
+            let lo = usize::from(self.written_lo).min(hi);
+            debug_assert!(
+                self.cells[..lo]
+                    .iter()
+                    .chain(&self.cells[hi..])
+                    .all(|cell| *cell == Cell::EMPTY),
+                "a cell outside the written window {lo}..{hi} is not empty"
+            );
+            // A one-cell window (a line of output's lone glyph) is one store; the slice fill of a
+            // constant compiles to a `memset_pattern16` call.
+            match hi.saturating_sub(lo) {
+                0 => {}
+                1 => self.cells[lo] = Cell::EMPTY,
+                _ => self.cells[lo..hi].fill(Cell::EMPTY),
+            }
+            self.note_cells_blank();
+        } else {
+            self.cells.fill(fill);
+            if fill == Cell::EMPTY {
+                self.note_cells_blank();
+            } else {
+                self.note_all_cells_written();
+            }
+        }
+    }
+
     /// The marks that say where a continued row's content ends, as a margined row move carries them from one row to another: a recorded early-wrap hole (only while the cell still holds the blank the wrap left) and [`RowFlags::ENDS_AT_LEN`].
     #[must_use]
     #[inline]
@@ -354,6 +452,9 @@ impl Row {
     #[must_use]
     #[inline]
     pub fn get_mut(&mut self, col: u16) -> Option<&mut Cell> {
+        if usize::from(col) < self.cells.len() {
+            self.note_span(col, col + 1);
+        }
         self.cells.get_mut(col as usize)
     }
 
@@ -375,6 +476,7 @@ impl Row {
     #[inline]
     pub unsafe fn get_unchecked_mut(&mut self, col: u16) -> &mut Cell {
         debug_assert!((col as usize) < self.cells.len());
+        self.note_span(col, col + 1);
         // SAFETY: Caller guarantees col < cols()
         unsafe { self.cells.get_unchecked_mut(col as usize) }
     }
@@ -400,6 +502,7 @@ impl Row {
         let end = start
             .saturating_add(usize::from(count))
             .min(self.cells.len());
+        self.note_cells_written(start, end);
         if end > start {
             self.flags |= RowFlags::DIRTY;
             self.note_write_through(end);
@@ -426,6 +529,7 @@ impl Row {
         };
         let n = cells.len().min(dst.len());
         dst[..n].copy_from_slice(&cells[..n]);
+        self.note_cells_written(left, left + n);
         let mut hints = RowFlags::DIRTY;
         if cells[..n]
             .iter()
@@ -441,6 +545,7 @@ impl Row {
     pub fn set(&mut self, col: u16, cell: Cell) -> bool {
         if let Some(c) = self.cells.get_mut(col as usize) {
             *c = cell;
+            self.note_span(col, col + 1);
             if col >= self.len && !cell.is_empty() {
                 self.len = col.saturating_add(1);
             }
@@ -456,8 +561,16 @@ impl Row {
         }
     }
 
-    /// Settle `len` after a bulk wide-char run written through [`Row::write_wide_char_packed_no_fixup`].
-    pub fn settle_len_after_wide_run(&mut self, end_col: u16, end_half_blanked: bool) {
+    /// Settle `len` after a bulk wide-char run written through
+    /// [`Row::write_wide_char_packed_no_fixup`] over `start_col..end_col`, and widen the written
+    /// window over the run.
+    pub fn settle_len_after_wide_run(
+        &mut self,
+        start_col: u16,
+        end_col: u16,
+        end_half_blanked: bool,
+    ) {
+        self.note_span(start_col, end_col);
         self.note_write_through(usize::from(end_col));
         let old_len = usize::from(self.len);
         self.settle_len_after_write(old_len, usize::from(end_col), end_half_blanked);
@@ -500,6 +613,10 @@ impl Row {
         if self.len > new_cols {
             self.len = new_cols;
         }
+        self.written_hi = self.written_hi.min(new_cols);
+        if self.written_lo >= self.written_hi {
+            self.note_cells_blank();
+        }
 
         if new_cols < old_cols {
             let mut cleared = false;
@@ -522,6 +639,7 @@ impl Row {
     #[inline]
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut Cell> {
         self.flags |= RowFlags::DIRTY;
+        self.note_all_cells_written();
         self.cells.iter_mut()
     }
 
@@ -537,6 +655,7 @@ impl Row {
         let copy_len = self.cols().min(other.cols()) as usize;
         self.cells[..copy_len].copy_from_slice(&other.cells[..copy_len]);
         self.len = other.len.min(self.cols());
+        self.note_all_cells_written();
         self.flags = other.flags | RowFlags::DIRTY;
     }
 
@@ -561,6 +680,7 @@ impl Row {
         let mut row = unsafe { Self::new(cols, pages) };
         let copy_len = row.cells.len().min(snapshot.cells.len());
         row.cells[..copy_len].copy_from_slice(&snapshot.cells[..copy_len]);
+        row.note_cells_written(0, copy_len);
         row.len = snapshot.len.min(row.cols());
         row.flags = snapshot.flags | RowFlags::DIRTY;
         row

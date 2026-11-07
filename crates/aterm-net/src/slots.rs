@@ -4,6 +4,8 @@
 //! Network listener slot admission ([`Slots`], [`pick_displaced`]) and unauthenticated
 //! [`HandshakeWatchdog`] deadline for [`crate::fleet`].
 
+#[cfg(any(unix, windows))]
+use aterm_uds::deadline::poll_timeout_ms;
 use std::io;
 use std::net::{IpAddr, Ipv6Addr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -12,17 +14,6 @@ use std::time::{Duration, Instant};
 
 /// How often a listener's accept loop wakes to re-check its `running` flag.
 pub(crate) const ACCEPT_POLL: Duration = Duration::from_millis(200);
-
-#[cfg(any(unix, windows, test))]
-fn poll_timeout_millis_parts(as_millis: u128, subsec_nanos: u32) -> i32 {
-    let millis = as_millis.saturating_add(u128::from(!subsec_nanos.is_multiple_of(1_000_000)));
-    i32::try_from(millis).unwrap_or(i32::MAX)
-}
-
-#[cfg(any(unix, windows, test))]
-pub(crate) fn poll_timeout_millis(timeout: Duration) -> i32 {
-    poll_timeout_millis_parts(timeout.as_millis(), timeout.subsec_nanos())
-}
 
 /// Wait until a non-blocking listener may accept, or until `timeout` expires.
 #[cfg(unix)]
@@ -46,7 +37,7 @@ pub(crate) fn wait_listener_readable(
             libc::poll(
                 std::ptr::from_mut(&mut descriptor),
                 1,
-                poll_timeout_millis(remaining),
+                poll_timeout_ms(remaining),
             )
         };
         if result >= 0 {
@@ -87,7 +78,7 @@ pub(crate) fn wait_listener_readable(
             WSAPoll(
                 std::ptr::from_mut(&mut descriptor),
                 1,
-                poll_timeout_millis(remaining),
+                poll_timeout_ms(remaining),
             )
         };
         if result != SOCKET_ERROR {
@@ -615,16 +606,6 @@ pub(crate) mod tests {
             .accept()
             .expect("the readiness event corresponds to an accept-ready connection");
         drop((accepted, client));
-    }
-
-    #[test]
-    fn poll_timeout_millis_rounds_up_and_saturates() {
-        assert_eq!(poll_timeout_millis(Duration::ZERO), 0);
-        assert_eq!(poll_timeout_millis(Duration::from_nanos(1)), 1);
-        assert_eq!(poll_timeout_millis(ACCEPT_POLL), 200);
-        assert_eq!(poll_timeout_millis(Duration::new(0, 200_000_001)), 201);
-        assert_eq!(poll_timeout_millis(Duration::MAX), i32::MAX);
-        assert_eq!(poll_timeout_millis_parts(u128::MAX, 999_999_999), i32::MAX);
     }
 
     #[test]

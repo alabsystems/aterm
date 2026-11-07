@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use aterm_phase::{Program, ResetKind};
 
-use super::policy::approval::QuestionPriority;
+use super::policy::approval::PriorityWord;
 
 use super::memory::MemoryCeiling;
 use super::occupancy::owner_rules::OwnerTables;
@@ -282,7 +282,7 @@ pub struct SupervisorConfig {
     /// Answer a question, a choice between options or a request for a decision with [`Self::answer_text`] instead of holding it for a person.
     pub answer_questions: bool,
     /// How a question is answered while [`Self::answer_questions`] answers it (`[harness] question_priority`).
-    pub question_priority: QuestionPriority,
+    pub question_priority: PriorityWord,
     /// What a question is answered with.
     pub answer_text: String,
     /// Dismiss Claude Code's rating surveys.
@@ -465,7 +465,7 @@ impl Default for SupervisorConfig {
             trust_roots: Vec::new(),
             rm_breaker_ask: false,
             answer_questions: true,
-            question_priority: QuestionPriority::Recommended,
+            question_priority: PriorityWord::Recommended,
             answer_text: "Nobody is here to answer. Decide for yourself with your best \
                           judgment: take the option you would recommend, prefer reversible \
                           steps, and keep going."
@@ -616,13 +616,13 @@ impl SupervisorConfig {
                     })
                     .collect();
             }
-            "question_priority" => match QuestionPriority::parse(value) {
+            "question_priority" => match PriorityWord::parse(value) {
                 Some(p) => self.question_priority = p,
                 None => {
                     return Err(format!(
                         "harness.question_priority: expected {}, got {:?} — no setting, so \
                          question_priority keeps its default",
-                        QuestionPriority::WORDS.join(", "),
+                        PriorityWord::WORDS.join(", "),
                         value.trim()
                     ));
                 }
@@ -4280,17 +4280,17 @@ trust_dialog = false
     #[test]
     fn question_priority_takes_its_three_words_and_a_refused_one_changes_nothing() {
         let full = SupervisorConfig::default();
-        assert_eq!(full.question_priority, QuestionPriority::Recommended);
+        assert_eq!(full.question_priority, PriorityWord::Recommended);
         assert_eq!(
             SupervisorConfig::default_shown("question_priority").as_deref(),
             Some("recommended")
         );
         for (value, want) in [
-            ("recommended", QuestionPriority::Recommended),
-            ("long-term", QuestionPriority::LongTerm),
-            ("short-term", QuestionPriority::ShortTerm),
-            ("  Long-Term ", QuestionPriority::LongTerm),
-            ("SHORT-TERM", QuestionPriority::ShortTerm),
+            ("recommended", PriorityWord::Recommended),
+            ("long-term", PriorityWord::LongTerm),
+            ("short-term", PriorityWord::ShortTerm),
+            ("  Long-Term ", PriorityWord::LongTerm),
+            ("SHORT-TERM", PriorityWord::ShortTerm),
         ] {
             let (c, notes) = SupervisorConfig::from_aterm_toml(&format!(
                 "[harness]\nquestion_priority = \"{value}\"\n"
@@ -4302,7 +4302,7 @@ trust_dialog = false
             assert!(w.limits.is_empty(), "{value:?}: HOW is no limit: {w:?}");
             assert_eq!(
                 w.own.contains(&"question_priority"),
-                want != QuestionPriority::Recommended,
+                want != PriorityWord::Recommended,
                 "{value:?}: the owner's own value"
             );
         }
@@ -4416,14 +4416,14 @@ trust_dialog = false
             let (c, notes) = SupervisorConfig::from_aterm_toml(text);
             assert!(notes.is_empty(), "{notes:?}");
             assert!(!c.answer_questions, "{text:?}");
-            assert_eq!(c.question_priority, QuestionPriority::LongTerm);
+            assert_eq!(c.question_priority, PriorityWord::LongTerm);
             let o = SuperviseOpts::hosted_with(&c);
             assert!(!o.policy.answer_questions, "{text:?}");
         }
         let on = read("[harness]\nquestion_priority = \"short-term\"\n");
         let o = SuperviseOpts::hosted_with(&on);
         assert!(o.policy.answer_questions);
-        assert_eq!(o.policy.question_priority, QuestionPriority::ShortTerm);
+        assert_eq!(o.policy.question_priority, PriorityWord::ShortTerm);
     }
 
     #[test]

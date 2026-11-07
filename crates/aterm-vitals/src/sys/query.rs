@@ -12,10 +12,11 @@ pub const USAGE: &str = "ERR usage: sys [overview|tab|aterm|global|jobs|cores|gp
                          jobs disk procs (cores gpu mem net take it, rows unchanged), \
                          scope=pane|tab|aterm on left, depth= on \
                          disk, instances=all on overview aterm global cores gpu mem net and procs \
-                         scope=aterm\n";
+                         scope=aterm; or sys name job=<id>|task=<id> [--json], sys policy \
+                         [status|collect|cancel] [--json] (aterm help sys)\n";
 /// The usage line for a word after `why` that is not its one subject or an option.
-pub const WHY_USAGE: &str =
-    "ERR usage: sys why [cpu|mem] [top=<1-64>] [fresh=<ms>] [since=<ep>.<seq>] [--json]\n";
+pub const WHY_USAGE: &str = "ERR usage: sys why [cpu|mem] [top=<1-64>] [fresh=<ms>] [since=<ep>.<seq>] [--json] \
+     (aterm help sys why)\n";
 
 /// The rows a view lists by default.
 pub const TOP_DEFAULT: usize = 8;

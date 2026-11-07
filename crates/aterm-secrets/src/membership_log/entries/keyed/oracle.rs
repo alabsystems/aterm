@@ -24,7 +24,7 @@ pub(in crate::membership_log) fn keyed_epochs_in(
     if keyed.is_empty() {
         return Vec::new();
     }
-    let membership = log.membership();
+    let membership = log.membership_ref();
     let member_of: BTreeMap<Recipient, MemberId> = membership
         .members()
         .iter()

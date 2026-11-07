@@ -4180,6 +4180,9 @@ struct SceneControls {
     /// A typed light lives its tuned life times the duration's share of the default
     /// (`CursorGlow::set_typed_life_scaled`); off, its tuned life whatever the duration.
     typed_life_scaled: bool,
+    /// The letter guard keeps each letter's whole reading as well as its ring's; off, the ring's
+    /// alone (`CursorGlow::set_letter_guard_whole`).
+    letter_whole: bool,
     /// The letter guard passes by a step the card does not keep
     /// (`CursorGlow::set_frame_unseen`); off, it judges every step, as a window's frames.
     unseen_steps_unguarded: bool,
@@ -4198,6 +4201,7 @@ thread_local! {
             thin_caret_fill: true,
             observe_body: false,
             typed_life_scaled: true,
+            letter_whole: true,
             unseen_steps_unguarded: true,
         })
     };
@@ -5120,6 +5124,8 @@ impl CursorScene {
         #[cfg(test)]
         fx.glow
             .set_typed_life_scaled(self.controls.typed_life_scaled);
+        #[cfg(test)]
+        fx.glow.set_letter_guard_whole(self.controls.letter_whole);
         #[cfg(test)]
         let unseen = !keep && self.controls.unseen_steps_unguarded;
         #[cfg(not(test))]
@@ -11998,8 +12004,9 @@ mod tests {
     ];
 
     /// Every letter a trail or companion lies on in the card keeps 4.5:1, judged as the
-    /// trail lab's `trail-contrast` judges one ([`judged_letters`]: by the ring round its
-    /// strokes, against the card's clean twin, no light and no companion drawn), in every style
+    /// trail lab's `trail-contrast` judges one ([`judged_letters`]: the lower of the ring round
+    /// its strokes and its core against its bed, on the card's clean twin's pixels, no light and
+    /// no companion drawn), in every style
     /// on dark and light at every frame of the scene's loop,
     /// and the companions in every look [`judged_looks`] names, in the embedded face and, on
     /// macOS, in the host's own system face at the card's 14 px (SF Mono, 9 x 16 cells: the
@@ -12012,7 +12019,9 @@ mod tests {
     /// leaves. The negative controls: without the frame's text, Laser's bolt on dark lay on
     /// letters at 1:1; with every glyph's ink read as its colour whole, SF Mono's one-column
     /// stems showed the light laid under them, and Sparkle's landing on GitHub Light left the
-    /// `m` of `README.md` at 4.30:1 (the gallery's 4.17, looks9's settings round 2). Under the
+    /// `m` of `README.md` at 4.30:1 (the gallery's 4.17, looks9's settings round 2); kept by the
+    /// ring alone, the `.` beside it read 3.43 of its own 3.90 under Fire's landing, whose flame
+    /// stands in the cell's upper rows clear of the dot's few solid pixels. Under the
     /// page law the card draws the glass where its face lays its letters full
     /// (`host::PageFacts::glass`, `docs/design/PRISM-GLASS.md` §15.8 amendment 54): on macOS the
     /// host's face at scale 2, so at `prism_glass::LIVE` Glass every frame of that card is judged
@@ -12273,6 +12282,14 @@ mod tests {
                 !solid.is_empty(),
                 "negative control: each glyph's ink read as its colour whole, Sparkle's landing \
                  leaves a letter of the host's face under its bar"
+            );
+            set(&|c| c.letter_whole = false);
+            let (ringed, _) = under("fire", ("light", light), None, (face, prepared, 1.0));
+            set(&|c| c.letter_whole = true);
+            assert!(
+                !ringed.is_empty(),
+                "negative control: kept by the ring round its strokes alone, the `.` of \
+                 `README.md` under Fire's landing keeps its reading on GitHub Light"
             );
         }
     }

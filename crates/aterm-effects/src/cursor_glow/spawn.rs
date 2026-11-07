@@ -255,6 +255,23 @@ impl CursorGlow {
         }
     }
 
+    /// Whether Fire's meteor also lays its landing: a forward leap along its
+    /// own row (a Tab's completion) burns, besides its meteor, the run a
+    /// shorter hop lays, which flames only where the air over it is blank
+    /// ([`Self::emit_flames`]). Flown alone, the meteor's streak lay over the
+    /// letters the Tab completed, where the letter guard holds it to a few
+    /// levels, and the card's frame after its Tab showed the ember caret alone
+    /// (after-land L3, `settings/fire-dark-settings.motion-0900`). A leap off
+    /// the row, back along it or by navigation lays none.
+    #[inline]
+    pub(super) const fn fire_meteor_lays_its_landing(&self, mv: &MoveCtx) -> bool {
+        #[cfg(test)]
+        if self.fire_meteor_lands_dark {
+            return false;
+        }
+        mv.dr_abs == 0 && mv.cc > mv.pc && !mv.navigation
+    }
+
     /// The per-move light.
     #[allow(
         clippy::too_many_arguments,
@@ -336,8 +353,14 @@ impl CursorGlow {
                     arrived: false,
                 });
             }
-        } else if navigation && (!water || dist < 2.0) {
+        }
+        let mut carries_typed = !echo_run && !typing && self.leap_carries_typed_run(mv);
+        let lays_path = if fire_meteor {
+            self.fire_meteor_lays_its_landing(mv)
         } else {
+            !(navigation && (!water || dist < 2.0))
+        };
+        if lays_path {
             let cap = Self::MAX_SPARKS;
             let max_len = if cfg
                 .style
@@ -349,6 +372,7 @@ impl CursorGlow {
             };
             self.path_scratch.clear();
             if shape_wrap {
+                carries_typed = false;
                 let pane_col1 = pane_col0.saturating_add(pane_cols) as i32;
                 let mut c = pc as i32;
                 while c < pane_col1 {
@@ -362,6 +386,7 @@ impl CursorGlow {
                     c += 1;
                 }
             } else if re_anchor {
+                carries_typed = false;
                 self.path_scratch.push((cr as i32, cc as i32));
             } else {
                 line_cells_tail(
@@ -376,6 +401,12 @@ impl CursorGlow {
                     && self.path_scratch.first() == Some(&(pr as i32, pc as i32))
                 {
                     self.path_scratch.remove(0);
+                }
+                // Only a path Trail length left whole reaches the run.
+                carries_typed =
+                    carries_typed && self.path_scratch.first() == Some(&(pr as i32, pc as i32 + 1));
+                if carries_typed {
+                    self.path_scratch.insert(0, (pr as i32, pc as i32));
                 }
             }
             let fire_back_leap = !typing && cc < pc && pr == cr;
@@ -444,6 +475,17 @@ impl CursorGlow {
                     let drop = self.sparks.len() - cap;
                     self.sparks.drain(0..drop);
                 }
+                if carries_typed {
+                    let mut si = 0;
+                    while si < self.sparks.len() {
+                        let s = &mut self.sparks[si];
+                        si += 1;
+                        if s.typing && s.row == pr && s.col < pc {
+                            let age = now.saturating_duration_since(s.born).as_secs_f32();
+                            s.life = s.life.min(age + spark_life);
+                        }
+                    }
+                }
                 if matches!(cfg.style, GlowStyle::Phaser | GlowStyle::Beam)
                     && typing
                     && gap <= Self::PHASER_CHAIN_GAP_MAX
@@ -463,6 +505,35 @@ impl CursorGlow {
             }
         }
         hue_advances
+    }
+
+    /// Whether this forward leap along the caret's row leaves the end of the hand's own run.
+    ///
+    /// A LEAP OUT OF A TYPED RUN CARRIES IT ON. A Tab typed after a word leaves from the cell the
+    /// caret stood on, which holds no typed spark yet and whose leap spark is dropped as a stray
+    /// mark, so one hole split the run: Beam's and Phaser's rail on the dark card broke at the
+    /// `E` of `README` (the after-land lows' A5, card row 5, x426-438). Next to a live typed
+    /// spark the cell is no stray: it is kept, and the typed sparks go out with the leap, whose
+    /// life is shorter than a typed chain's, so none stands past it apart from the caret. Styles
+    /// with no bed lay no rail to carry on.
+    #[inline]
+    fn leap_carries_typed_run(&self, mv: &MoveCtx) -> bool {
+        if mv.pr != mv.cr || mv.cc <= mv.pc || BedShape::of(mv.cfg.style, 1.0).is_none() {
+            return false;
+        }
+        let mut si = self.sparks.len();
+        while si > 0 {
+            si -= 1;
+            let s = &self.sparks[si];
+            if s.typing
+                && s.row == mv.pr
+                && s.col + 1 == mv.pc
+                && mv.now.saturating_duration_since(s.born).as_secs_f32() < s.life
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Admit one lightning onset at `now`.
@@ -521,13 +592,24 @@ impl CursorGlow {
                     self.keep_strike_in_grid(geom, cfg.theme_bg, (pr, cr), now);
                 }
             } else if self.heat > 0.30
-                && self.frand() < 0.18 + 0.55 * self.heat
+                && self.frand() < (0.18 + 0.55 * self.heat) * self.crackle_share(cfg)
                 && self.admit_bolt(now, true)
             {
                 let pick = self.frand();
                 let a = self.frand() * std::f32::consts::TAU;
                 let len = (1.6 + self.frand() * 2.8) * chf;
-                let (rr, rc) = {
+                // A crackle discharges from the bolt: it springs from the caret's own cell.
+                // Sprung from a typed cell picked among the trail's last twelve, it hung
+                // under a letter one or more cells behind the bolt, apart from it and from
+                // anything lit (composed r3's judges: `laser-dark.t0`, x345-360 y75-125; the
+                // after-land lows' W9).
+                #[cfg(test)]
+                let along_trail = self.crackle_along_trail;
+                #[cfg(not(test))]
+                let along_trail = false;
+                let (rr, rc) = if !along_trail {
+                    (cr, cc)
+                } else {
                     let mut cells = [(0u16, 0u16); Self::CRACKLE_TRAIL_CELLS];
                     let mut n = 0usize;
                     let spark_len = self.sparks.len();
@@ -618,6 +700,19 @@ impl CursorGlow {
                 }
             }
         }
+    }
+
+    /// The share of Laser's crackles a key forges at the trail's duration: all of them at the
+    /// default and longer, and at a shorter duration its share of the default
+    /// ([`super::typed_life_basis`]). A crackle springs from the bolt's own cell and outlives
+    /// a short trail's typed light: forged as often at 60 ms as at 260 ms, it held the trail
+    /// light behind the head within a tenth of the default's, a Trail-duration knob that
+    /// barely read (`trail_duration_shows_in_every_style_that_reads_it`).
+    #[inline]
+    fn crackle_share(&self, cfg: &GlowConfig) -> f32 {
+        super::typed_life_basis(cfg.duration, self.typed_life_unscaled())
+            .1
+            .min(1.0)
     }
 
     /// Landing ring on a real jump (fire meteors ring at arrival instead).

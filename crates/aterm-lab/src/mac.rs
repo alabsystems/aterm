@@ -997,8 +997,8 @@ impl Build {
             let ended = child.wait_with_rusage();
             if let Some(m) = metered {
                 match &ended {
-                    Ok(u) => m.end(u.status.success(), u.maxrss),
-                    Err(_) => m.end(false, 0),
+                    Ok(u) => m.end(atpkg::build_admit::BuildEnd::Status(u.status), u.maxrss),
+                    Err(_) => m.end(atpkg::build_admit::BuildEnd::Unknown, 0),
                 }
             }
             ended

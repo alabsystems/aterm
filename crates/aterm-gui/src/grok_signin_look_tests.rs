@@ -50,18 +50,18 @@ fn shown(app: &crate::App, sid: u64) -> Option<String> {
         })
 }
 
-/// The sign-in leader's record ([`RUNNING_FILE`]) a live sign-in writes, naming this process.
+/// The sign-in leader's record ([`RUNNING_FILE`]) a live sign-in writes, naming this process:
+/// its kernel start record, or `-` where the kernel keeps none (Linux), as the leader writes it.
 fn running_record(state: &std::path::Path) {
     let pid = std::process::id();
-    let birth = aterm_uds::process::read_process_birth(i32::try_from(pid).unwrap())
-        .expect("this process's start");
+    let birth = aterm_uds::process::read_process_birth(i32::try_from(pid).unwrap()).map_or_else(
+        || "-".to_owned(),
+        |b| format!("{}.{:06}", b.seconds, b.microseconds),
+    );
     let now = aterm_time::unix_secs().expect("the wall clock");
     std::fs::write(
         state.join(RUNNING_FILE),
-        format!(
-            "pid={pid} birth={}.{:06} t={now}\n",
-            birth.seconds, birth.microseconds
-        ),
+        format!("pid={pid} birth={birth} t={now}\n"),
     )
     .unwrap();
 }

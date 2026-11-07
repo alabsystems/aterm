@@ -1226,6 +1226,51 @@ fn a_worker_whose_agent_has_gone_keeps_its_agents_name() {
     assert_eq!(title(workers[3]), "release notes", "a pinned title wins");
 }
 
+/// A WORKER THAT NEVER STARTED KEEPS ITS AGENT'S NAME: its tab's title is its shell's, a folder
+/// that names no worker, whichever launch step stopped it. NEGATIVE CONTROL: a launch refused for a
+/// sign-in or an install, or stopped by a shutdown, read as a running agent and showed the folder.
+/// CONTROL: `why=held` has started and shows its tab's own title.
+#[test]
+fn a_worker_that_never_started_keeps_its_agents_name() {
+    let words = [
+        "startup",
+        "shell",
+        crate::task_record::WHY_SIGNIN,
+        crate::task_record::WHY_INSTALL,
+        crate::task_record::WHY_CANCELLED,
+        "held",
+    ];
+    let (app, _, workers) = app_with(1, words.len());
+    for (&worker, word) in workers.iter().zip(words) {
+        let term = app.pool.get(worker).expect("pooled").term.clone();
+        crate::term_lock(&term).process(b"\x1b]2;/private/tmp/lab/proj\x07");
+        let store = app.store.read().unwrap_or_else(|p| p.into_inner());
+        let handle = store.by_local(worker).expect("a live session");
+        let mut mark = TaskMark::new(TaskState::Stalled);
+        mark.why = Some(word);
+        mark_session_task(&handle.ctx, handle.local_id, &mark).expect("unfenced");
+        handle
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_task_worker(aterm_phase::Program::Claude, None);
+    }
+    let rows = rows(&app);
+    for (&worker, word) in workers.iter().zip(words) {
+        let row = rows
+            .iter()
+            .find(|row| row.session == worker)
+            .expect("a row");
+        if word == "held" {
+            assert_eq!(row.title, app.tab_label_of_session(worker), "{word}");
+            assert_ne!(row.title, "Claude Code", "{word}");
+        } else {
+            assert_eq!(row.title, "Claude Code", "{word}");
+        }
+    }
+}
+
 /// The strip line's pushed tooltips are what the strip was given: one tip per shown tab, never a
 /// parked worker's, so a reader that matches them to the chips (`count=` against
 /// `pushed_tooltips=`, the lab's hover read) reads every tip while a worker is parked. Before,
@@ -1255,8 +1300,12 @@ fn a_candidate_that_ends_before_its_commit_leaves_its_predecessors_results() {
         std::fs::create_dir_all(&dir).expect("the tasks directory");
         let result = dir.join(format!("{}-2.result.md", sid.as_str()));
         std::fs::write(&result, b"what it left").expect("the result file");
-        let (record, _) =
-            TaskMark::new(TaskState::Done).apply(None, false, std::time::Instant::now(), 1_000);
+        let (record, _) = TaskMark::new(TaskState::Done).apply(
+            None,
+            &Default::default(),
+            std::time::Instant::now(),
+            1_000,
+        );
         let row = crate::retired_workers::Retired {
             sid: sid.clone(),
             local: None,

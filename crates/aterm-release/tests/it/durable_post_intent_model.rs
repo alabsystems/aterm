@@ -66,6 +66,7 @@ fn context(root: &Path, with_journal: bool) -> CutCtx {
         fence: None,
         notes_section: "0.55.0".into(),
         journal: with_journal.then(journal),
+        adopted: false,
     }
 }
 

@@ -35,7 +35,7 @@ pub(super) struct Preparation {
 enum Progress {
     Reading,
     Retry(Instant),
-    NotNeeded(Instant),
+    NotNeeded,
     Selected(Box<codex_rotation::Proposal<ExecCommand>>, Instant),
 }
 
@@ -152,9 +152,7 @@ pub(crate) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
             start(ctx, env, job);
             WAITING.into()
         }
-        Progress::NotNeeded(observed) if observed.elapsed() < Duration::from_secs(5) => {
-            NOT_NEEDED.into()
-        }
+        Progress::NotNeeded => NOT_NEEDED.into(),
         Progress::Selected(proposal, observed) if observed.elapsed() < Duration::from_secs(60) => {
             format!(
                 "OK codex-exec-handoff state=selected thread={} turn={} source_account={} source_user={} target_account={} target_user={}\n",
@@ -166,7 +164,7 @@ pub(crate) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
                 proposal.destination_identity.user
             )
         }
-        Progress::Selected(_, _) | Progress::NotNeeded(_) => {
+        Progress::Selected(_, _) => {
             *progress = Progress::Retry(Instant::now());
             WAITING.into()
         }
@@ -212,7 +210,7 @@ fn start(ctx: &Arc<crate::SessionCtx>, env: Env, job: Arc<Preparation>) {
                     if let Some(end) = codex_rotation::prepare_refusal_stands(why) {
                         aterm_log::info!("codex exec handoff: none is coming: {}", end.as_str());
                     }
-                    Progress::NotNeeded(Instant::now())
+                    Progress::NotNeeded
                 }
                 _ => Progress::Retry(Instant::now() + Duration::from_secs(5)),
             };

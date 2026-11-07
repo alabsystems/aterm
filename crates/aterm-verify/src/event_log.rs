@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A release's own file of its events, apart from its output (`--events`, A19).
+//! A run's own file of its events, apart from its output (`--events`): what a release's cutter
+//! keeps its records from (A19) and `verify land` judges by (B10).
 //!
-//! The `check-finished` and `test-binary-finished` lines a release's cutter keeps its records
-//! from go to the run's output too, which its children share: there a child's unfinished line,
+//! The `check-finished` and `test-binary-finished` lines it keeps go to the run's output too, which its children share: there a child's unfinished line,
 //! or a line longer than a pipe writes at once, can land inside one. Here each line is one
 //! `write_all` under one lock, to a file opened close-on-exec, so no child inherits it and no two
 //! lines interleave.
@@ -14,7 +14,7 @@ use std::io::Write as _;
 use std::path::Path;
 use std::sync::Mutex;
 
-/// The events file a release writes.
+/// The events file a run writes (`--events`).
 #[derive(Debug)]
 pub struct EventLog {
     file: Mutex<File>,
@@ -40,8 +40,9 @@ impl EventLog {
     }
 
     /// Append `line` (a `verify-event: ` line; its newline added when it has none) whole. A
-    /// write that fails loses the line, which its reader takes as nothing said: a check with no
-    /// record runs again.
+    /// write that fails loses the line, which its reader takes as nothing said: a release's
+    /// cutter runs a check with no record again, and `verify land`, whose run's last line
+    /// (`run-finished`) then names a check no line holds, or is lost itself, pushes nothing.
     pub fn write(&self, line: &str) {
         let line = line.strip_suffix('\n').unwrap_or(line);
         let mut whole = String::with_capacity(line.len() + 1);

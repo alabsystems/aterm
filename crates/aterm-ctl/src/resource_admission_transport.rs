@@ -124,6 +124,25 @@ pub fn attach(
     fds: Attachments,
     deadline: Instant,
 ) -> io::Result<()> {
+    attach_mode(path, request, fds, deadline, false)
+}
+/// Require an explicitly accounted root; unsupported peers fail before rights.
+/// Lost attachment remains ambiguous and must not be retried.
+pub fn attach_accounted(
+    path: &str,
+    request: &wire::Submission,
+    fds: Attachments,
+    deadline: Instant,
+) -> io::Result<()> {
+    attach_mode(path, request, fds, deadline, true)
+}
+fn attach_mode(
+    path: &str,
+    request: &wire::Submission,
+    fds: Attachments,
+    deadline: Instant,
+    accounted: bool,
+) -> io::Result<()> {
     time(deadline)?;
     let bytes = request.encode()?;
     if !Path::new(path).is_absolute() {
@@ -145,16 +164,43 @@ pub fn attach(
     if !read_line(&stream, deadline)?.starts_with("OK ") {
         return Err(denied());
     }
-    write_all(&stream, wire::REQUEST.as_bytes(), deadline)?;
-    if read_line(&stream, deadline)? != wire::PREPARE {
+    write_all(
+        &stream,
+        if accounted {
+            wire::ACCOUNTED_REQUEST
+        } else {
+            wire::REQUEST
+        }
+        .as_bytes(),
+        deadline,
+    )?;
+    if read_line(&stream, deadline)?
+        != if accounted {
+            wire::ACCOUNTED_PREPARE
+        } else {
+            wire::PREPARE
+        }
+    {
         return Err(denied());
     }
     write_frame(&stream, &bytes, deadline)?;
-    if read_line(&stream, deadline)? != wire::ADMISSION {
+    if read_line(&stream, deadline)?
+        != if accounted {
+            wire::ACCOUNTED_ADMISSION
+        } else {
+            wire::ADMISSION
+        }
+    {
         return Err(denied());
     }
     send_attachments(&stream, &fds, deadline)?;
-    if read_line(&stream, deadline)? != wire::ATTACHED {
+    if read_line(&stream, deadline)?
+        != if accounted {
+            wire::ACCOUNTED_ATTACHED
+        } else {
+            wire::ATTACHED
+        }
+    {
         return Err(invalid());
     }
     Ok(())
@@ -228,12 +274,42 @@ pub fn receive(
     deadline: Instant,
     authorize: impl FnOnce(&wire::Submission, Peer) -> bool,
 ) -> io::Result<AuthorizedSubmission> {
+    receive_mode(stream, owner_authenticated, deadline, authorize, false)
+}
+/// Accounted attachment ingress after exact owner/session authentication.
+pub fn receive_accounted(
+    stream: &CtlStream,
+    owner_authenticated: bool,
+    deadline: Instant,
+    authorize: impl FnOnce(&wire::Submission, Peer) -> bool,
+) -> io::Result<AuthorizedSubmission> {
+    receive_mode(stream, owner_authenticated, deadline, authorize, true)
+}
+fn receive_mode(
+    stream: &CtlStream,
+    owner_authenticated: bool,
+    deadline: Instant,
+    authorize: impl FnOnce(&wire::Submission, Peer) -> bool,
+    accounted: bool,
+) -> io::Result<AuthorizedSubmission> {
     stream.set_nonblocking(true)?;
     if !owner_authenticated {
         return Err(denied());
     }
     let peer = local_peer(stream)?;
-    write_all(stream, format!("{}\n", wire::PREPARE).as_bytes(), deadline)?;
+    write_all(
+        stream,
+        format!(
+            "{}\n",
+            if accounted {
+                wire::ACCOUNTED_PREPARE
+            } else {
+                wire::PREPARE
+            }
+        )
+        .as_bytes(),
+        deadline,
+    )?;
     let request = wire::Submission::decode(&read_frame(stream, deadline)?)?;
     if request.peer_pid != peer.pid
         || request.peer_birth != peer.birth
@@ -246,7 +322,15 @@ pub fn receive(
     }
     write_all(
         stream,
-        format!("{}\n", wire::ADMISSION).as_bytes(),
+        format!(
+            "{}\n",
+            if accounted {
+                wire::ACCOUNTED_ADMISSION
+            } else {
+                wire::ADMISSION
+            }
+        )
+        .as_bytes(),
         deadline,
     )?;
     let fds = receive_attachments(stream, peer, deadline)?;
@@ -300,7 +384,26 @@ pub fn receive_attachments(
 }
 /// Acknowledge only after the callback took ownership of the authorized request.
 pub fn acknowledge(stream: &CtlStream, deadline: Instant) -> io::Result<()> {
-    write_all(stream, format!("{}\n", wire::ATTACHED).as_bytes(), deadline)
+    acknowledge_mode(stream, deadline, false)
+}
+/// Acknowledge an explicitly accounted attachment, never a launch.
+pub fn acknowledge_accounted(stream: &CtlStream, deadline: Instant) -> io::Result<()> {
+    acknowledge_mode(stream, deadline, true)
+}
+fn acknowledge_mode(stream: &CtlStream, deadline: Instant, accounted: bool) -> io::Result<()> {
+    write_all(
+        stream,
+        format!(
+            "{}\n",
+            if accounted {
+                wire::ACCOUNTED_ATTACHED
+            } else {
+                wire::ATTACHED
+            }
+        )
+        .as_bytes(),
+        deadline,
+    )
 }
 
 /// Write a versioned lifecycle fact on the private channel with an absolute deadline.

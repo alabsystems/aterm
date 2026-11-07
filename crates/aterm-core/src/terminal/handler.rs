@@ -23,6 +23,8 @@ mod handler_dcs;
 pub(super) mod handler_decrsps;
 #[path = "handler_esc.rs"]
 mod handler_esc;
+#[path = "handler_line_run.rs"]
+mod handler_line_run;
 #[path = "handler_write.rs"]
 mod handler_write;
 

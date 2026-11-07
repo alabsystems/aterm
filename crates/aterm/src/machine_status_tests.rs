@@ -192,7 +192,7 @@ fn a_step_is_there_exactly_when_one_is_due() {
         Ok(FleetCheck::Idle(aterm_agent::FleetSync::NoCode)),
         Err("no state".into()),
     ] {
-        areas.push(fleet_area(&check, &Ok(2)));
+        areas.push(fleet_area(&check, "m1 up at 0.159.0; 2 up of 2 members"));
     }
     for clt in [
         Clt::NotHere,
@@ -627,24 +627,82 @@ fn an_unasked_signed_out_cli_is_no_step() {
     assert_eq!(who(&doctor), Some(Who::Agent));
 }
 
-/// Fleet: current is ok, a blocked fleet is a person's decision, swarm off is off.
+/// Fleet: current is ok, a blocked fleet is a person's decision, swarm off is off; each says this
+/// Mac's own presence row.
 #[test]
 fn fleet_reads_the_sync_check() {
     assert_eq!(
-        fleet_area(&Ok(FleetCheck::Current), &Ok(1)).says,
-        "in the vault's fleet; 1 peer known"
+        who(&fleet_area(&Ok(FleetCheck::Blocked("x".into())), "-")),
+        Some(Who::Person)
     );
     assert_eq!(
-        who(&fleet_area(&Ok(FleetCheck::Blocked("x".into())), &Ok(0))),
-        Some(Who::Person)
+        fleet_area(&Ok(FleetCheck::Idle(aterm_agent::FleetSync::SwarmOff)), "-").level,
+        Level::Off
+    );
+}
+
+/// `aterm status`'s fleet line is this Mac's row of the presence view (one-mesh §4.16, B9): its
+/// label, node id, up and build, and the seats up of the members; where the view holds an old
+/// build of this Mac's, that it needs an update.
+///
+/// NEGATIVE CONTROL: have `fleet_area` say `in the vault's fleet` without `own`: neither line
+/// carries the row.
+#[test]
+fn the_fleet_line_is_this_macs_presence_row() {
+    use aterm_agent::fleet_view::{Fleet, SeatRow, own_line};
+    use aterm_mesh::presence::{Behind, Standing as Presence};
+    use aterm_netplace::words::{InStep, Seats};
+    let row = |label: &str, me: bool, build: &str, needs_update: bool| SeatRow {
+        label: label.to_owned(),
+        name: format!("{label}-mini"),
+        node: Some(format!("n-{label}00000000000000")),
+        me,
+        presence: Some(Presence::Up),
+        build: Some(build.to_owned()),
+        needs_update,
+        behind: Some(Behind::InStep),
+    };
+    let fleet = |own_build: &str, needs_update: bool| Fleet {
+        seats: Seats {
+            members: 3,
+            up: Some(2),
+            needs_update: if needs_update {
+                vec![("m1".to_owned(), own_build.to_owned())]
+            } else {
+                Vec::new()
+            },
+            in_step: Some(InStep {
+                with: 1,
+                of: 1,
+                slowest_ms: None,
+                apart: 0,
+            }),
+            log: Some((40, 16_384)),
+        },
+        rows: vec![
+            row("m1", true, own_build, needs_update),
+            row("m2", false, "0.159.0+g4ef9cd6144", false),
+        ],
+        unserved: None,
+    };
+    assert_eq!(
+        fleet_area(
+            &Ok(FleetCheck::Current),
+            &own_line(&fleet("0.159.0+g4ef9cd6144", false), Some(0))
+        )
+        .says,
+        "in the vault's fleet; m1 n-m100000000000000 up at 0.159.0+g4ef9cd6144; 2 up of 3 members"
     );
     assert_eq!(
         fleet_area(
             &Ok(FleetCheck::Idle(aterm_agent::FleetSync::SwarmOff)),
-            &Ok(0)
+            &own_line(&fleet("0.150.0", true), Some(0))
         )
-        .level,
-        Level::Off
+        .says,
+        format!(
+            "{}; m1 n-m100000000000000 up at 0.150.0, needs update; 2 up of 3 members",
+            aterm_agent::FleetSync::SwarmOff.report()
+        )
     );
 }
 

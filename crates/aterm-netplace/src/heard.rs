@@ -187,6 +187,10 @@ fn is_lower_hex16(s: &str) -> bool {
 /// gave no note (malformed, torn, unterminated by `'\n'`, or of a kind this build does not write).
 #[must_use]
 pub fn parse_counted(text: &str) -> (Evidence, usize) {
+    parse_projected::<true>(text)
+}
+
+fn parse_projected<const NOTES: bool>(text: &str) -> (Evidence, usize) {
     let mut evidence = Evidence::default();
     let mut passed = 0;
     for chunk in text.split_inclusive('\n') {
@@ -200,19 +204,15 @@ pub fn parse_counted(text: &str) -> (Evidence, usize) {
             passed += 1;
             continue;
         }
-        let notes = evidence.answers.len() + evidence.rounds.len() + evidence.internet.len();
-        parse_line(line, &mut evidence);
-        if !line.is_empty()
-            && evidence.answers.len() + evidence.rounds.len() + evidence.internet.len() == notes
-        {
+        if !parse_line::<NOTES>(line, &mut evidence) && !line.is_empty() {
             passed += 1;
         }
     }
     (evidence, passed)
 }
 
-/// Adds the note `line` holds to `evidence`; a line this build cannot read adds none.
-fn parse_line(line: &str, evidence: &mut Evidence) {
+/// Validates one line, retaining answers and, with `NOTES`, the other notes it holds.
+fn parse_line<const NOTES: bool>(line: &str, evidence: &mut Evidence) -> bool {
     let mut words = [""; 11];
     let mut len = 0;
     for w in line.split(' ') {
@@ -220,7 +220,7 @@ fn parse_line(line: &str, evidence: &mut Evidence) {
             words[len] = w;
             len += 1;
         } else {
-            return;
+            return false;
         }
     }
     match &words[..len] {
@@ -243,24 +243,24 @@ fn parse_line(line: &str, evidence: &mut Evidence) {
                 began.parse(),
                 at.parse(),
             ) else {
-                return;
+                return false;
             };
             let iface = match *iface {
                 "-" => None,
                 iface if valid_iface(iface) => Some(iface.to_owned()),
-                _ => return,
+                _ => return false,
             };
             let network = match *network {
                 "-" => None,
                 network => match NetworkId::parse(network) {
                     Some(network) => Some(network),
-                    None => return,
+                    None => return false,
                 },
             };
             let logged = match *logged {
                 LOGGED => true,
                 "-" => false,
-                _ => return,
+                _ => return false,
             };
             if is_lower_hex16(member) {
                 evidence.answers.push(Answer {
@@ -274,6 +274,7 @@ fn parse_line(line: &str, evidence: &mut Evidence) {
                     began_ms,
                     at_ms,
                 });
+                return true;
             }
         }
         ["r", lane, answered, began, at, rest @ ..] if rest.len() <= 1 => {
@@ -285,13 +286,16 @@ fn parse_line(line: &str, evidence: &mut Evidence) {
                 at.parse(),
                 rest.first().map_or(Some(0), |blocked| blocked.parse().ok()),
             ) {
-                evidence.rounds.push(Round {
-                    lane,
-                    answered,
-                    blocked,
-                    began_ms,
-                    at_ms,
-                });
+                if NOTES {
+                    evidence.rounds.push(Round {
+                        lane,
+                        answered,
+                        blocked,
+                        began_ms,
+                        at_ms,
+                    });
+                }
+                return true;
             }
         }
         ["i", verdict, source, at, endpoint] if valid_endpoint(endpoint) => {
@@ -304,16 +308,20 @@ fn parse_line(line: &str, evidence: &mut Evidence) {
                 InternetSource::from_word(source),
                 at.parse(),
             ) {
-                evidence.internet.push(InternetNote {
-                    ok,
-                    source,
-                    at_ms,
-                    endpoint: (*endpoint).to_owned(),
-                });
+                if NOTES {
+                    evidence.internet.push(InternetNote {
+                        ok,
+                        source,
+                        at_ms,
+                        endpoint: (*endpoint).to_owned(),
+                    });
+                }
+                return true;
             }
         }
         _ => {}
     }
+    false
 }
 
 /// `evidence` bounded: the newest answer per lane and member, the newest [`MAX_ROUNDS`] rounds
@@ -446,9 +454,25 @@ pub(crate) fn read_counted_in(
     dir: &Path,
     judged: &aterm_uds::private_file::JudgedDir<'_>,
 ) -> (Evidence, usize) {
+    read_projected_in::<true>(dir, judged)
+}
+
+/// Validate the complete admission ledger while retaining only its answers.
+#[cfg(unix)]
+pub(crate) fn read_answers_in(
+    dir: &Path,
+    judged: &aterm_uds::private_file::JudgedDir<'_>,
+) -> (Evidence, usize) {
+    read_projected_in::<false>(dir, judged)
+}
+
+fn read_projected_in<const NOTES: bool>(
+    dir: &Path,
+    judged: &aterm_uds::private_file::JudgedDir<'_>,
+) -> (Evidence, usize) {
     match judged.read(FILE, MAX_BYTES) {
         Ok(bytes) => match String::from_utf8(bytes) {
-            Ok(text) => parse_counted(&text),
+            Ok(text) => parse_projected::<NOTES>(&text),
             Err(_) => (Evidence::default(), 1),
         },
         Err(aterm_uds::private_file::PrivateFileError::Missing) => (Evidence::default(), 0),
@@ -474,29 +498,34 @@ pub(crate) fn refused(dir: &Path, name: &str) -> usize {
 /// # Errors
 /// The directory could not be made private, the lock was held past [`LOCK_WAIT`], or the file
 /// could not be written.
-pub fn add(dir: &Path, mut notes: Evidence) -> io::Result<()> {
-    add_inner(dir, &mut notes)
+pub fn add(dir: &Path, notes: Evidence) -> io::Result<()> {
+    add_or_hold(dir, notes, aterm_uds::private_file::write_private).map_err(|(e, _)| e)
 }
 
-fn add_inner(dir: &Path, notes: &mut Evidence) -> io::Result<()> {
-    aterm_uds::private_file::ensure_private_dir(dir)?;
-    let _lock = aterm_uds::private_file::PrivateLock::take(
+/// [`add`] by `write`, answering on failure `notes` alone to hold for the next: what the file
+/// holds stays there, and held with them it would be written a second time.
+fn add_or_hold(
+    dir: &Path,
+    notes: Evidence,
+    write: fn(&Path, &str, &[u8]) -> io::Result<()>,
+) -> Result<(), (io::Error, Evidence)> {
+    if let Err(e) = aterm_uds::private_file::ensure_private_dir(dir) {
+        return Err((e, notes));
+    }
+    let _lock = match aterm_uds::private_file::PrivateLock::take(
         dir,
         LOCK,
         LOCK_WAIT,
         "the network place's evidence is being written by another process",
-    )?;
+    ) {
+        Ok(lock) => lock,
+        Err(e) => return Err((e, notes)),
+    };
     let mut evidence = read(dir);
-    evidence.answers.append(&mut notes.answers);
-    evidence.rounds.append(&mut notes.rounds);
-    evidence.internet.append(&mut notes.internet);
-    let compacted = compact(evidence);
-    let formatted = format(&compacted);
-    if let Err(e) = aterm_uds::private_file::write_private(dir, FILE, formatted.as_bytes()) {
-        *notes = compacted;
-        return Err(e);
-    }
-    Ok(())
+    evidence.answers.extend_from_slice(&notes.answers);
+    evidence.rounds.extend_from_slice(&notes.rounds);
+    evidence.internet.extend_from_slice(&notes.internet);
+    write(dir, FILE, format(&compact(evidence)).as_bytes()).map_err(|e| (e, notes))
 }
 
 /// The fleet book snapshot's text.
@@ -674,7 +703,7 @@ fn flush(dir: &Path, mut notes: Evidence, keys: Vec<String>, now: u64) {
         }
     }
     drop(guard);
-    if let Err(e) = add_inner(dir, &mut notes) {
+    if let Err((e, notes)) = add_or_hold(dir, notes, aterm_uds::private_file::write_private) {
         aterm_log::debug!("network place: a note waits for the next ({e})");
         let mut guard = NOTED.lock().unwrap_or_else(PoisonError::into_inner);
         let pending = &mut guard.get_or_insert_with(Noted::default).pending;
@@ -1313,6 +1342,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn answer_projection_validates_discarded_notes_before_admission() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let dir = crate::record::dir(root.path());
+        aterm_uds::private_file::ensure_private_dir(&dir).unwrap();
+        let answer = "a fleet 0123456789abcdef - - - - log 900 1000\n";
+        let overlong = "x".repeat(MAX_ENDPOINT + 1);
+        for (note, passed) in [
+            ("".to_owned(), 0),
+            ("\n".to_owned(), 0),
+            ("r fleet 1 900 1000\n".to_owned(), 0),
+            ("r commons 0 900 1000 2\n".to_owned(), 0),
+            ("i ok api-probe 1000 example.com\n".to_owned(), 0),
+            ("i down path 1000 -\n".to_owned(), 0),
+            ("r unknown 1 900 1000 0\n".to_owned(), 1),
+            ("r fleet x 900 1000 0\n".to_owned(), 1),
+            ("r fleet 1 x 1000 0\n".to_owned(), 1),
+            ("r fleet 1 900 x 0\n".to_owned(), 1),
+            ("r fleet 1 900 1000 x\n".to_owned(), 1),
+            ("r fleet 1 900 1000 0 extra\n".to_owned(), 1),
+            ("i maybe api-probe 1000 host\n".to_owned(), 1),
+            ("i ok unknown 1000 host\n".to_owned(), 1),
+            ("i ok api-probe x host\n".to_owned(), 1),
+            ("i ok api-probe 1000 \n".to_owned(), 1),
+            ("i ok api-probe 1000 host\x07\n".to_owned(), 1),
+            (format!("i ok api-probe 1000 {overlong}\n"), 1),
+            ("i ok api-probe 1000 host extra\n".to_owned(), 1),
+            ("r fleet 1 900 1000 0".to_owned(), 1),
+            ("i ok api-probe 1000 host\r\n".to_owned(), 1),
+            ("unknown note\n".to_owned(), 1),
+            ("r fleet 1 900 1000 0\ni bad path 1000 host\n".to_owned(), 1),
+        ] {
+            let text = format!("{answer}{note}");
+            let (all, full_passed) = parse_counted(&text);
+            let (projected, projected_passed) = parse_projected::<false>(&text);
+            assert_eq!(full_passed, passed, "{note:?}");
+            assert_eq!(projected_passed, passed, "{note:?}");
+            assert_eq!(projected.answers, all.answers);
+            assert!(projected.rounds.is_empty() && projected.internet.is_empty());
+            aterm_uds::private_file::write_private(&dir, FILE, text.as_bytes()).unwrap();
+            let got = crate::proof::read_with(root.path(), Default::default(), 1000);
+            assert_eq!(
+                got.answers,
+                if passed == 0 { all.answers } else { Vec::new() }
+            );
+        }
+    }
+
+    #[test]
+    fn answer_projection_matches_full_parser_on_line_mutations() {
+        for seed in [
+            "a fleet 0123456789abcdef 192.168.4.7 192.168.4.31 en0 n0123456789abcdef log 900 1000\n",
+            "r fleet 1 900 1000 0\n",
+            "i ok api-probe 1000 example.com\n",
+        ] {
+            for index in 0..seed.len() {
+                for replacement in [b' ', b'\n', b'\r', b'\t', b'0', b'X', b'-', 0x7f] {
+                    let mut bytes = seed.as_bytes().to_vec();
+                    bytes[index] = replacement;
+                    let text = String::from_utf8(bytes).unwrap();
+                    let (all, passed) = parse_counted(&text);
+                    let (projected, projected_passed) = parse_projected::<false>(&text);
+                    assert_eq!(projected_passed, passed, "{text:?}");
+                    assert_eq!(projected.answers, all.answers, "{text:?}");
+                    assert!(projected.rounds.is_empty() && projected.internet.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn direct_observations_do_not_replace_or_delay_admission_evidence() {
         let root = aterm_tempfile::tempdir().expect("scratch state");
         let dir = root.path();
@@ -1338,6 +1437,38 @@ mod tests {
         note_answers(dir, vec![heartbeat.clone()]);
         assert_eq!(read_counted(dir).0.answers, [heartbeat]);
         assert_eq!(read_for_place(dir).answers[0].at_ms, 2_001);
+    }
+
+    /// A write that fails holds only the notes it was given for the next: what the file
+    /// already holds is not written a second time when the next write goes through.
+    /// NEGATIVE CONTROL: holding the whole compacted evidence on failure (0d9f794e84) holds the
+    /// file's round too, which the next write adds again: `assertion `left == right` failed`
+    /// with both rounds held.
+    #[test]
+    fn a_failed_write_holds_only_its_own_notes() {
+        let root = aterm_tempfile::tempdir().expect("scratch state");
+        let dir = root.path();
+        let round = |at_ms| Round {
+            lane: Lane::Fleet,
+            answered: 1,
+            blocked: 0,
+            began_ms: at_ms - 100,
+            at_ms,
+        };
+        let on_file = Evidence {
+            rounds: vec![round(1_000)],
+            ..Evidence::default()
+        };
+        add(dir, on_file).unwrap();
+        let new = Evidence {
+            rounds: vec![round(2_000)],
+            ..Evidence::default()
+        };
+        let (_, held) = add_or_hold(dir, new.clone(), |_, _, _| Err(io::Error::other("full")))
+            .expect_err("the write fails");
+        assert_eq!(held, new);
+        add(dir, held).unwrap();
+        assert_eq!(read_counted(dir).0.rounds.len(), 2);
     }
 
     fn answer(member: &str, at_ms: u64) -> Answer {

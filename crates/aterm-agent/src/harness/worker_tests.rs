@@ -428,7 +428,8 @@ fn a_settings_document_is_claude_codes_own_flag_and_the_tap_stands_aside() {
 /// A CLAIM WORKER'S WHOLE LINE FITS macOS's TERMINAL LINE with room to spare: Claude Code by its
 /// store path under a long home, a roster login's directory, auto mode, the browser, its one tool
 /// and its auto-mode rules ([`super::super::credit_offers::claim_settings`]). CONTROL: the same
-/// line with an 800-byte rule does not fit, so the budget is the one this reads.
+/// line with a rule as long as this host's whole line budget (`upgrade::MAX_LINE`) does not fit,
+/// so the budget is the one this reads.
 #[test]
 fn a_claim_workers_line_fits_the_terminal_with_its_rules() {
     let claude = row(Program::Claude);
@@ -454,7 +455,10 @@ fn a_claim_workers_line_fits_the_terminal_with_its_rules() {
     };
     let typed = line(claude, Dialect::Zsh, &starter, &claim(settings)).expect("a line");
     assert!(typed.len() + 150 <= 1000, "{} bytes: {typed}", typed.len());
-    let long = format!(r#"{{"autoMode":{{"hard_deny":["{}"]}}}}"#, "x".repeat(800));
+    let long = format!(
+        r#"{{"autoMode":{{"hard_deny":["{}"]}}}}"#,
+        "x".repeat(super::super::upgrade::MAX_LINE)
+    );
     let err = line(claude, Dialect::Zsh, &starter, &claim(&long)).expect_err("CONTROL: too long");
     assert!(err.contains("bytes (max"), "{err}");
 }
@@ -1935,6 +1939,8 @@ fn a_workers_typed_line_holds_its_floor_and_the_twin_runs_it_as_typed() {
     let file = tmp.path().join("task.txt");
     std::fs::write(&file, "the task").expect("write the task");
     let argv_out = tmp.path().join("argv");
+    // The lines are typed for zsh, so a host without one is COULD NOT RUN.
+    let zsh = crate::test_program::kept(aterm_uds::host::need_tool("zsh"));
     let alab_twin = codex_twin(
         tmp.path(),
         "twin-alab",
@@ -1960,7 +1966,7 @@ fn a_workers_typed_line_holds_its_floor_and_the_twin_runs_it_as_typed() {
             .unwrap_or_else(|e| panic!("{:?}: {e}", cli.agent));
         let _ = std::fs::remove_file(&argv_out);
         let out = aterm_uds::deadline::output_until(
-            aterm_uds::spawnfd::command(crate::test_program::kept("/bin/zsh"))
+            aterm_uds::spawnfd::command(&zsh)
                 .args(["-f", "-c", &line])
                 .env("ATERM_TASK_FILE", &file)
                 .env("ARGV_OUT", &argv_out),
@@ -2229,6 +2235,91 @@ fn a_program_with_a_harness_here_is_its_agent_forms_and_any_other_is_not() {
         assert!(
             harness_of_program(other).is_none(),
             "{other:?} has no harness that concludes it"
+        );
+    }
+}
+
+/// A group's Claude Code is the one no other of the group runs, wherever the pids fall, and a
+/// group read short of that says what it read: a member no read names, or two Claude Codes side by
+/// side, is no proof that the group runs none, and never lends one's flags or login as the lead's.
+#[test]
+fn a_group_lends_the_claude_code_no_other_of_it_runs() {
+    use {
+        GroupClaude as G,
+        MemberRead::{Claude, Other, Unread},
+    };
+    // A lead (90) behind `time` (5); its own child (7) took a lower pid: the kernel wrapped them.
+    let nested = |pid| match pid {
+        7 => Some(90),
+        90 => Some(5),
+        5 => Some(1),
+        1 => Some(0),
+        _ => None,
+    };
+    assert_eq!(
+        group_claude(&[(5, Other), (7, Claude), (90, Claude)], nested),
+        G::At(90)
+    );
+    assert_eq!(
+        group_claude(&[(5, Other), (90, Claude), (7, Unread)], nested),
+        G::At(90)
+    );
+    // Two beside each other, as a script's `claude -p ... &` and its lead.
+    let beside = |pid| match pid {
+        7 | 90 => Some(5),
+        5 => Some(1),
+        _ => None,
+    };
+    assert_eq!(
+        group_claude(&[(5, Other), (7, Claude), (90, Claude)], beside),
+        G::Unread
+    );
+    // A process of another user, or one that hid its argv.
+    assert_eq!(group_claude(&[(5, Other), (7, Unread)], beside), G::Unread);
+    assert_eq!(group_claude(&[(5, Other), (7, Other)], beside), G::None);
+    assert_eq!(group_claude(&[], beside), G::None);
+}
+
+/// A process that has ended left nothing to fail to read: it runs no agent, and its worker takes the
+/// launch default. Unreaped, a Codex starter is read by its own pid and meets the failed read. A
+/// Claude Code starter is read by its group, which a zombie leaves (`getpgid` fails for one), so only
+/// a member that ends between the group's read and its own reaches `ended`. A process that lives and
+/// hides its argv is the unread one.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_process_that_has_ended_is_no_failed_read() {
+    let claude = row(Program::Claude);
+    let codex = row(Program::Codex);
+    let home = aterm_tempfile::tempdir().unwrap();
+    let mut gone = aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new(
+        aterm_uds::os_path!("sh"),
+    )))
+    .args(["-c", ":"])
+    .spawn()
+    .expect("sh");
+    let pid = gone.id();
+    aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        std::time::Duration::from_millis(10),
+        || {
+            (aterm_uds::process::process_presence(i32::try_from(pid).unwrap())
+                == aterm_uds::process::ProcessPresence::Exited)
+                .then_some(())
+        },
+    )
+    .expect("it ended, unreaped");
+    let read_unreaped = [claude, codex].map(|cli| starter(cli, pid, home.path(), || None, || None));
+    gone.wait().expect("sh ends");
+    assert_eq!(read_unreaped, [StarterRead::Other, StarterRead::Other]);
+    for cli in [claude, codex] {
+        assert_eq!(
+            starter(cli, pid, home.path(), || None, || None),
+            StarterRead::Other
+        );
+        assert_eq!(
+            starter(cli, 1, home.path(), || None, || None),
+            StarterRead::Unread,
+            "launchd lives and is another user's"
         );
     }
 }

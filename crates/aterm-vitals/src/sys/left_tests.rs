@@ -227,6 +227,11 @@ fn a_left_row_prints_its_token_proof_and_tier() {
     );
     assert_eq!(
         lines[0],
+        "summary 2 left running · 3 to end (`aterm ctl end <token>`) · 1 held at macOS's program \
+         check"
+    );
+    assert_eq!(
+        lines[1],
         "left as_of=21:21:37.412 age_ms=120 complete=1 bounded=0 program_check=1 \
          program_check_oldest_ms=61120"
     );
@@ -297,6 +302,34 @@ fn an_exe_word_outside_the_pattern_prints_dash() {
     assert!(proc_line(&lines, 4001).unwrap().contains(" exe=- "));
 }
 
+/// THE SUMMARY NEVER SAYS NOTHING IS LEFT ON A PARTIAL READ: with no `state=left` row it says
+/// nothing is left only when the read is complete, and counts the rows a token ends.
+#[test]
+fn the_summary_says_nothing_is_left_only_on_a_complete_read() {
+    let v = view_fixture();
+    let rest: Vec<&LeftRow> = v.rows.iter().filter(|r| r.state != State::Left).collect();
+    let ends = rest.iter().filter(|r| r.token.is_some()).count();
+    let ending = match ends {
+        0 => "nothing to end".to_owned(),
+        n => format!("{n} to end (`aterm ctl end <token>`)"),
+    };
+    assert_eq!(
+        summary_words(&rest, true, 0),
+        format!("summary nothing left running · {ending}")
+    );
+    assert_eq!(
+        summary_words(&rest, false, 2),
+        format!(
+            "summary nothing left running found so far (a partial read) · {ending} · 2 held at \
+             macOS's program check"
+        )
+    );
+    assert_eq!(
+        summary_words(&[], true, 0),
+        "summary nothing left running · nothing to end"
+    );
+}
+
 #[test]
 fn a_bounded_reading_says_so() {
     let w = world();
@@ -305,7 +338,8 @@ fn a_bounded_reading_says_so() {
     v.complete = false;
     let s = snap(v);
     let c = ctx(&w, &s, None);
-    assert!(text("left", &c)[0].contains(" complete=0 bounded=1 "));
+    let lines = text("left", &c);
+    assert!(lines[1].contains(" complete=0 bounded=1 "), "{lines:?}");
     let j = json("left --json", &c);
     assert_eq!(
         j.get("left").and_then(|l| l.get("bounded")),

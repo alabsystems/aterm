@@ -115,6 +115,19 @@ fn artifact(root: &Path, binary: &Path) -> String {
     aterm_json::json!({"reason":"compiler-artifact", "package_id":"aterm-gui", "manifest_path":root.join("crates/aterm-gui/Cargo.toml"), "target":{"kind":["lib"],"name":"aterm_gui"}, "profile":{"test":true}, "executable":binary}).to_string()
 }
 
+/// The `targo` a cut drives, found as the cutter finds its own ([`crate::gates::resolve_targo`]):
+/// the index a seed writes and the staging that reads it name their compiler by the `trustc`
+/// beside it (`trustc -vV`). A host with no Trust toolchain could not run the test.
+fn targo() -> PathBuf {
+    crate::gates::resolve_targo().unwrap_or_else(|e| {
+        aterm_spec::host::could_not_run(format!(
+            "the index names its compiler by a Trust toolchain, and none resolves here: {e}\n\
+             get one: {}",
+            crate::gates::TRUST_TOOLCHAIN_REMEDIES
+        ))
+    })
+}
+
 fn seed_index(root: &Path, bytes: &[u8]) {
     seed_index_named(root, bytes, "aterm_gui-0123456789abcdef");
 }
@@ -123,7 +136,7 @@ fn seed_index_named(root: &Path, bytes: &[u8], name: &str) {
     let binary = root.join("target/debug/deps").join(name);
     fs::create_dir_all(binary.parent().unwrap()).unwrap();
     fs::write(&binary, bytes).unwrap();
-    let (tree, compiler) = aterm_verify::test_index::identities(root, Path::new("targo")).unwrap();
+    let (tree, compiler) = aterm_verify::test_index::identities(root, &targo()).unwrap();
     aterm_verify::test_index::Index::from_messages(tree, compiler, &artifact(root, &binary))
         .unwrap()
         .write(&root.join("target/verify/test-executables.json"))
@@ -223,12 +236,12 @@ fn the_indexed_generator_runs_once_per_reserved_identity() {
     let runs = Cell::new(0);
     let mut run = generator(&["history"], &runs);
     let root = o.stage_root();
-    let first = fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut run).unwrap();
+    let first = fixtures::stage(&targo(), &o.work, &root, &pins(7), &mut run).unwrap();
     assert!(first.fresh && first.rendezvous);
-    let again = fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut run).unwrap();
+    let again = fixtures::stage(&targo(), &o.work, &root, &pins(7), &mut run).unwrap();
     assert!(!again.fresh);
     assert_eq!(runs.get(), 1);
-    let next = fixtures::stage(Path::new("targo"), &o.work, &root, &pins(8), &mut run).unwrap();
+    let next = fixtures::stage(&targo(), &o.work, &root, &pins(8), &mut run).unwrap();
     assert!(next.fresh);
     assert_eq!(runs.get(), 2);
     assert!(!pins(7).staged_in(&root).exists());
@@ -268,14 +281,7 @@ fn a_missing_or_changed_binary_compiles_only_the_generator_before_running_it() {
             }
             generate(cmd)
         };
-        fixtures::stage(
-            Path::new("targo"),
-            &o.work,
-            &o.stage_root(),
-            &pins(7),
-            &mut run,
-        )
-        .unwrap();
+        fixtures::stage(&targo(), &o.work, &o.stage_root(), &pins(7), &mut run).unwrap();
         assert_eq!(compiles.get(), 1);
         assert_eq!(runs.get(), 1);
     }
@@ -292,24 +298,11 @@ fn an_interrupted_binary_holds_only_its_own_execution() {
             stderr: Vec::new(),
         })
     };
-    fixtures::stage(
-        Path::new("targo"),
-        &o.work,
-        &o.stage_root(),
-        &pins(7),
-        &mut killed,
-    )
-    .unwrap_err();
+    fixtures::stage(&targo(), &o.work, &o.stage_root(), &pins(7), &mut killed).unwrap_err();
     let runs = Cell::new(0);
     let mut run = generator(&["history"], &runs);
-    let error = fixtures::stage(
-        Path::new("targo"),
-        &o.work,
-        &o.stage_root(),
-        &pins(7),
-        &mut run,
-    )
-    .unwrap_err();
+    let error =
+        fixtures::stage(&targo(), &o.work, &o.stage_root(), &pins(7), &mut run).unwrap_err();
     assert!(error.to_string().contains("never showed it ran"));
     assert_eq!(runs.get(), 0);
     // A stale digest must not let a fallback compiler replace this held path.
@@ -318,28 +311,12 @@ fn an_interrupted_binary_holds_only_its_own_execution() {
         b"changed",
     )
     .unwrap();
-    assert!(
-        fixtures::stage(
-            Path::new("targo"),
-            &o.work,
-            &o.stage_root(),
-            &pins(7),
-            &mut run
-        )
-        .is_err()
-    );
+    assert!(fixtures::stage(&targo(), &o.work, &o.stage_root(), &pins(7), &mut run).is_err());
     assert_eq!(runs.get(), 0);
     // Another executable path has its own hold, even with identical bytes in the
     // same target directory.
     seed_index_named(&o.work, b"binary", "aterm_gui-fedcba9876543210");
-    fixtures::stage(
-        Path::new("targo"),
-        &o.work,
-        &o.stage_root(),
-        &pins(7),
-        &mut run,
-    )
-    .unwrap();
+    fixtures::stage(&targo(), &o.work, &o.stage_root(), &pins(7), &mut run).unwrap();
     assert_eq!(runs.get(), 1);
 }
 
@@ -356,12 +333,12 @@ fn a_generator_that_refuses_or_leaves_a_required_desk_out_stages_nothing() {
             stderr: Vec::new(),
         })
     };
-    fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut failing).unwrap_err();
+    fixtures::stage(&targo(), &o.work, &root, &pins(7), &mut failing).unwrap_err();
     assert!(fixtures::staged(&root, &pins(7)).is_none());
 
     let runs = Cell::new(0);
     let mut partial = generator(&["held-pane"], &runs);
-    fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut partial).unwrap_err();
+    fixtures::stage(&targo(), &o.work, &root, &pins(7), &mut partial).unwrap_err();
     assert!(fixtures::staged(&root, &pins(7)).is_none());
 
     let mut unanswered = |cmd: &mut Command| {
@@ -380,14 +357,7 @@ fn a_generator_that_refuses_or_leaves_a_required_desk_out_stages_nothing() {
         fs::write(answers, corpus()).unwrap();
         out
     };
-    let refused = fixtures::stage(
-        Path::new("targo"),
-        &o.work,
-        &root,
-        &pins(7),
-        &mut unanswered,
-    )
-    .unwrap_err();
+    let refused = fixtures::stage(&targo(), &o.work, &root, &pins(7), &mut unanswered).unwrap_err();
     assert!(
         refused
             .to_string()
@@ -403,7 +373,7 @@ fn a_landing_commits_the_staging_and_its_rows_on_main_once() {
     let runs = Cell::new(0);
     let mut run = generator(&["history", "twelve-panes"], &runs);
     let root = o.stage_root();
-    let staged = fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut run).unwrap();
+    let staged = fixtures::stage(&targo(), &o.work, &root, &pins(7), &mut run).unwrap();
     let work = Git::new(&o.work);
     let before = git(&o.work, &["rev-parse", "origin/main"])
         .trim()
@@ -513,14 +483,7 @@ fn a_landing_that_loses_the_race_lands_on_the_winners_tip() {
     let o = Origin::new();
     let runs = Cell::new(0);
     let mut run = generator(&["history"], &runs);
-    let staged = fixtures::stage(
-        Path::new("targo"),
-        &o.work,
-        &o.stage_root(),
-        &pins(7),
-        &mut run,
-    )
-    .unwrap();
+    let staged = fixtures::stage(&targo(), &o.work, &o.stage_root(), &pins(7), &mut run).unwrap();
     let raced = Raced {
         inner: Git::new(&o.work),
         rival: &o.rival,
@@ -569,14 +532,7 @@ fn a_fixture_directory_on_main_the_gate_refuses_is_never_overwritten() {
     git(&o.rival, &["push", "-q", "origin", "main"]);
     let runs = Cell::new(0);
     let mut run = generator(&["history"], &runs);
-    let staged = fixtures::stage(
-        Path::new("targo"),
-        &o.work,
-        &o.stage_root(),
-        &pins(7),
-        &mut run,
-    )
-    .unwrap();
+    let staged = fixtures::stage(&targo(), &o.work, &o.stage_root(), &pins(7), &mut run).unwrap();
     fixtures::land(&Git::new(&o.work), &staged, &pins(7), 5).unwrap_err();
     assert_eq!(
         o.on_main(&format!(
@@ -631,14 +587,7 @@ fn a_landing_whose_corpus_cannot_take_the_answers_lands_the_desks_and_says_so() 
     git(&o.rival, &["push", "-q", "origin", "main"]);
     let runs = Cell::new(0);
     let mut run = generator(&["history"], &runs);
-    let staged = fixtures::stage(
-        Path::new("targo"),
-        &o.work,
-        &o.stage_root(),
-        &pins(7),
-        &mut run,
-    )
-    .unwrap();
+    let staged = fixtures::stage(&targo(), &o.work, &o.stage_root(), &pins(7), &mut run).unwrap();
     let landed = fixtures::land(&Git::new(&o.work), &staged, &pins(7), 5).unwrap();
     let Landed::Pushed { answers, .. } = &landed else {
         panic!("{landed:?}");

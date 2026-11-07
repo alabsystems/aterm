@@ -1049,6 +1049,17 @@ pub(crate) fn reads_under(dir: &Path) -> std::collections::BTreeMap<std::path::P
         .collect()
 }
 
+/// Write `bytes` to `path` owner-only, as aterm writes its own files and a person keeps theirs, so
+/// the reads that refuse what group or others may write ([`read_owned`], [`read_aterm_config`])
+/// admit it under any umask, Ubuntu's user-private-group 002 among them. A rewrite keeps the
+/// file's inode, as an edit in place does; [`write_atomic`] is the replace.
+#[cfg(test)]
+pub(crate) fn write_owned_in_place(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) {
+    let path = path.as_ref();
+    std::fs::write(path, bytes).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
 #[cfg(test)]
 thread_local! {
     /// The uid [`euid`] answers on this thread while [`as_another_user`] runs.

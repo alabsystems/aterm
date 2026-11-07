@@ -707,7 +707,8 @@ fn flights_from(shots: &[Shot], from: u64) -> Vec<Aloft> {
 /// takes two cells, so the caret pauses at `n0 + 2` of 80: on the cells the cat stands on at the
 /// wall (77, 78, 79) or short of them (72, 74), for less and more than the cat's sit, by hand
 /// and held, typed on through the wrap after it or never; typed on just after the cat's sit
-/// (its hop off the letters in the air as the line wraps); and stopped at the margin of the
+/// (where the margin found it no row beside the line, its hop off the letters in the air as the
+/// line wraps); and stopped at the margin of the
 /// line's second row (`n0` past 78: the caret at `n0 + 2 - 80`, the line's first row over it).
 const MARGIN_PAUSES: [(usize, u64, u64, usize, u64); 19] = [
     (75, 150, 800, 9, 130),
@@ -1005,7 +1006,7 @@ fn typing_resumed_after_a_pause_takes_no_flight() {
 
 /// A SLOW HAND'S WRAP IS CROSSED TO THE CARET. A line typed briskly to 68 cells, then on
 /// through the wrap one key at a time, 0.35 to 1.3 s apart (a hand whose rhythm never opens
-/// past 0.6 s a key; under the cat's sit, whose hop off the line's last letters is the
+/// past 0.6 s a key; under the cat's sit, whose way off the line's last letters is the
 /// margin's own), on the top row, mid-screen and on the last row: the wrap's one crossing
 /// comes down by the caret on its new row, within [`WRAP_LANDING_SLACK`] cells of the stand
 /// beside it, and no other flight leaves from the line's end on.
@@ -1059,7 +1060,8 @@ const WRAP_LANDING_SLACK: f32 = 3.0;
 /// the law, and the nearest is the row over the line's first. Once the hand has stopped (the
 /// cat sits 1.4 s after the last key and hops off the line's last letters), every frame of its
 /// rest stands off every glyph on the screen, on that seat: four rows over the caret, within
-/// [`BY_THE_CARET`] cells of it. Mid-screen the seat under the caret is nearer and is taken.
+/// [`BY_THE_CARET`] cells of it. Mid-screen the row under the caret is blank and it has waited
+/// there since the margin (`margin_seat_off_the_line`), one row under the caret.
 ///
 /// NEGATIVE CONTROL (as run before the fix, on main 9a5399f8ed and on this branch): the margin's
 /// seat search stopped two rows from the caret, found none, and the wall held: the cat sat on
@@ -1092,7 +1094,7 @@ fn a_cat_at_the_margin_of_a_line_wrapped_three_times_rests_off_its_letters() {
             let (cr, cc) = s.caret;
             let met = body_meets_glyphs(&input, &s.frame);
             let rows_off = f32::from(cr) - s.frame.row;
-            let seat_rows = if row0 + 3 >= ROWS - 1 { 4.0 } else { -2.0 };
+            let seat_rows = if row0 + 3 >= ROWS - 1 { 4.0 } else { -1.0 };
             if !s.frame.action.settled()
                 || met.is_some()
                 || (rows_off - seat_rows).abs() > 0.01
@@ -1116,19 +1118,15 @@ fn a_cat_at_the_margin_of_a_line_wrapped_three_times_rests_off_its_letters() {
     assert!(faults.is_empty(), "{}", faults.join("\n"));
 }
 
-/// EACH WRAP'S CROSSING ARCS OVER THE LINE IT LEAVES. A line held or typed by hand through three
-/// wraps from a prompt mid-screen: each crossing back to the next line's start rises at its apex
-/// a row or more over the row it left (its feet, drawn), on the big bound's own arc for the span
-/// (THE WRITING'S WRAP IS A BRISK BOUND), so the body passes over the line, not through it. The
-/// head law judges the landing, and eases the body down into its row there, for the crossing's
-/// last `HEAD_EASE_S` only.
-///
-/// NEGATIVE CONTROL (as run on main 9a5399f8ed): the landing's sink (0.78 of a row: the next
-/// line's row has the line's letters over it) was judged at the take-off and came off the arc
-/// from the first frame, so every crossing flew 0.18 to 0.43 of a row over the row it left, its
-/// body through the line's letters for the whole bound (r24 K7-6).
+/// EACH WRAP'S CROSSING KEEPS OFF THE LINE IT LEAVES. A line held or typed by hand through three
+/// wraps from a prompt mid-screen: the body has slid under the line at the margin
+/// (`margin_seat_off_the_line`), so each crossing back to the next line's start runs along that
+/// next line, one flight, its box under the line it left in every frame. The negative control is
+/// `a_companion_crossing_a_wrap_keeps_off_the_line` in aterm-render, which reverts the law alone.
 #[test]
-fn each_wrap_s_crossing_arcs_over_the_line_it_leaves() {
+fn each_wrap_s_crossing_keeps_off_the_line_it_leaves() {
+    const CW: u16 = 15;
+    const CH: u16 = 28;
     let takes: [(&str, Vec<(u64, Key)>); 3] = [
         ("20 keys a second", typed(240, 50)),
         ("by hand", by_hand(240)),
@@ -1155,15 +1153,19 @@ fn each_wrap_s_crossing_arcs_over_the_line_it_leaves() {
                     continue;
                 }
                 crossings += 1;
-                let apex = h.shots[start..i]
+                let line_foot = before.row as i32 * i32::from(CH);
+                let top = h.shots[start..i]
                     .iter()
-                    .map(|s| s.frame.row - s.frame.lift)
-                    .fold(f32::INFINITY, f32::min);
-                if before.row - apex < 1.0 {
+                    .filter_map(|s| s.frame.body_px(CW, CH, COLS, ROWS))
+                    .map(|(_, _, y0, _)| y0)
+                    .min()
+                    .unwrap_or(i32::MAX);
+                if top < line_foot {
                     faults.push(format!(
-                        "{name}: the crossing at {} ms rose {:.2} of a row over row {}",
+                        "{name}: the crossing at {} ms took its box {} px into the line it left, \
+                         over row {}",
                         h.shots[start].ms,
-                        before.row - apex,
+                        line_foot - top,
                         before.row
                     ));
                 }

@@ -26,7 +26,7 @@ fn accounts_add_refuses_a_directory_retained_by_another_label() {
         for historical in [false, true] {
             let tmp = tmp_dir("add-retained-directory");
             let env = env_at(&tmp);
-            std::fs::write(env.config.as_ref().unwrap(), "").unwrap();
+            crate::test_config::write(env.config.as_ref().unwrap(), "").unwrap();
             let store = env.accounts_store_for(cli).unwrap();
             let dir = store.login_dir("work").unwrap();
             std::fs::create_dir_all(&dir).unwrap();
@@ -197,7 +197,7 @@ fn creation_case(case: i64, cli: Cli) -> (i64, i64, i64) {
     let fleet = tmp
         .path()
         .join(crate::harness::accounts_sync::FLEET_ROSTER_FILE);
-    std::fs::write(env.config.as_ref().unwrap(), "[fleet]\nmachine='m3'\n").unwrap();
+    crate::test_config::write(env.config.as_ref().unwrap(), "[fleet]\nmachine='m3'\n").unwrap();
     std::fs::write(&fleet, "opt_in='named'\n[[account]]\nlabel='old'\nemail='old@example.test'\nclass='dedicated'\nmachines=['m3']\n").unwrap();
     let adding = case >= 25;
     let (seed_case, label) = match case {

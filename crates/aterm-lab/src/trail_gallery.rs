@@ -37,7 +37,8 @@ dirs, a private control socket, a lifeline; ended by its process group, never by
                 60 ms cadence (`targo --unverified build --release -p aterm`, then --aterm target/release/aterm)
   --theme       dark (the default theme), light (\"GitHub Light\") or both (the default)
   --scenario    typing (default), burst, context, steam, enter-bottom, idle10, redraw-stall, fold-rest, cjk, bidi,
-                split, move-up, focus-roundtrip, focus-wrap, settings, or all; repeatable
+                split, move-up, last-row, coloured, flood, rail-g, focus-roundtrip, focus-wrap, settings, or all;
+                repeatable
   --extra       a top-level aterm.toml line for every instance, replacing the base line of its key (the base lines:
                 the style, motion = \"full\", trail_sounds = false, and on light the theme)
   --columns --lines --font-px   the grid (default 72x14 cells of 22 px; settings 110x40 of 16 px;
@@ -65,6 +66,21 @@ then photographs every key of ` state` across the right edge. Its focus acknowle
 admissions (`trail 32`) and final post-echo drain accompany the frames. These records describe
 custody and resident ribbon state; continuity still requires judging exposed pixels against the
 clean twins.
+
+The `last-row` scenario types on the grid's last row under lettered rows. The burst's line runs
+under a full row, a letter in every cell, with ragged rows over that, and is held (`mid`, `fly`,
+`t0`, `t120`, `t470`, `l1650`, `l3900`, `l6000`). Return scrolls it and a short answer up (`enter`,
+`e120`, `e470`), and the typing line runs under that ragged row and past its end, and is held
+(`rmid`, `r0`, `rt120`, `rt470`, `rl1650`, `rl3900`, `rl6000`).
+
+The `flood` scenario fills the screen with words, each in an SGR ink of its own, and types through
+them a key a cell, a flood of keys a frame, so a ribbon lies on more letters at once than a frame's
+lights hold (`key0145` to `key1008`, by the keys typed, then `t0`, `t120`, `t470`, `l1650`, `l3000`):
+the paper glass's word yield runs past `MAX_QUADS` and takes whole words.
+
+The `rail-g` scenario stops the caret just past the `g` of `lazy dog`, the burst's pace, so a trail's
+foot rail runs across that descender: on a row under letters with blank rows below it (`under-g`,
+`under-g120`, `under-g470`), then, Ctrl+L, on the grid's last row (`last-g`, `last-g120`, `last-g470`).
 
 exit: 0 every frame taken and every instance ended; 1 a frame or an instance failed, a redraw return was
 inconclusive, or an instance outlived the run;
@@ -133,12 +149,34 @@ pub enum Scenario {
     /// ([`MOVE_UP_ROWS`]): `typed`, then `up` on the frame that first draws
     /// the move, `u120` and `u470`.
     MoveUp,
+    /// A prompt on the grid's last row under lettered rows ([`last_row_page`]), typed through
+    /// and held: the burst's line under a full row, then, past a Return whose answer
+    /// ([`LAST_ROW_ANSWER`]) is the ragged row over the next prompt, the typing line along it
+    /// and past its end. `enter-bottom`'s prompt sits on that row too, under a command's short
+    /// numbers and then its echo, whose end leaves a companion a seat.
+    LastRow,
+    /// The burst's line as a shell's highlighter paints it, each word in an SGR ink of its own
+    /// ([`COLOURED_INKS`], [`COLOURED_THEME_INKS`] for the second line), so an app's coloured
+    /// words have frames with clean twins: `key10`, `fly`, `t0`, `t120`, `t470` and `l1650`, then
+    /// the line killed and typed in the theme's own inks (`a-fly`, `a-t0`, `a-t120`).
+    Coloured,
+    /// A screen full of words, each in an SGR ink of its own ([`FloodScreen`]), typed through a
+    /// key a cell, a frame's keys ([`flood_frames`]) per [`BURST_KEY_MS`]: on paper the ribbon lies
+    /// on so many descenders at once that the word yield's foot rails pass
+    /// `CursorGlow::MAX_QUADS` and it takes whole words. Frames during ([`FLOOD_KEPT_EVERY`]) and
+    /// after ([`FLOOD_AFTER_MS`]).
+    Flood,
+    /// A foot rail across a descender, which no other scene holds: the burst's line typed to the
+    /// `g` of `lazy dog` ([`RAIL_G_TEXT`]) and held with the caret just past it, on a row under
+    /// letters ([`RAIL_G_UNDER_ROW`]; `under-g`, `under-g120`, `under-g470`), then on the grid's
+    /// last row (`last-g`, `last-g120`, `last-g470`), where the descender reaches the row's foot.
+    RailG,
     Settings,
 }
 
 impl Scenario {
     /// Every scenario, in the order `all` runs them.
-    pub const ALL: [Scenario; 15] = [
+    pub const ALL: [Scenario; 19] = [
         Scenario::Typing,
         Scenario::Burst,
         Scenario::Context,
@@ -153,6 +191,10 @@ impl Scenario {
         Scenario::Bidi,
         Scenario::Split,
         Scenario::MoveUp,
+        Scenario::LastRow,
+        Scenario::Coloured,
+        Scenario::Flood,
+        Scenario::RailG,
         Scenario::Settings,
     ];
 
@@ -173,6 +215,10 @@ impl Scenario {
             Scenario::Bidi => "bidi",
             Scenario::Split => "split",
             Scenario::MoveUp => "move-up",
+            Scenario::LastRow => "last-row",
+            Scenario::Coloured => "coloured",
+            Scenario::Flood => "flood",
+            Scenario::RailG => "rail-g",
             Scenario::Settings => "settings",
         }
     }
@@ -457,6 +503,234 @@ pub const MOVE_UP_ROWS: u16 = 5;
 /// The mark `move-up`'s program writes with its move ([`PAINT_MOVE_UP`]).
 pub const MOVE_UP_MARK: &str = "NORMAL";
 
+/// The row [`last_row_page`] lays over the prompt, a letter in every cell: no gap to seat a
+/// companion in, and descenders and an underscore at the foot, next to the typed line.
+pub const LAST_ROW_FULL: &str = "Typography_jumps;quick_brown_gyps(qwerty)_pqgyj_{braces}[ok]|";
+
+/// The rows [`last_row_page`] lays between its full ones, each ending where its text does.
+pub const LAST_ROW_RAGGED: [&str; 4] = [
+    "fn main() {",
+    "    let fox = \"the quick brown fox\";",
+    "    // every glyph here must stay legible: pqgyj {braces} [ok]",
+    "}",
+];
+
+/// What a Return on `last-row` answers: the ragged row over the next prompt, reaching past the
+/// caret at the typing line's `rmid` and short of it at the line's end.
+pub const LAST_ROW_ANSWER: &str = "Below: pqgyj [ok]";
+
+/// The ms after a line's last key of `last-row`'s frames ([`burst_frame`]): the fade, the hop
+/// off the line's last letters, then the cat grounded by the momentum's decay and at rest.
+pub const LAST_ROW_HELD_MS: [u64; 5] = [120, 470, 1650, 3900, 6000];
+
+/// `last-row`'s page on a grid of `rows` by `cols`, the caret left on the last row, which it
+/// leaves blank: from the row over that up, a full row ([`LAST_ROW_FULL`], repeated to the
+/// grid's last column) and a ragged one ([`LAST_ROW_RAGGED`]) in turn.
+fn last_row_page(output: &mut impl std::io::Write, rows: u16, cols: u16) -> std::io::Result<()> {
+    let cols = usize::from(cols);
+    output.write_all(b"\x1b[H\x1b[2J")?;
+    for over in (1..usize::from(rows)).rev() {
+        let text: String = if over % 2 == 1 {
+            LAST_ROW_FULL.chars().cycle().take(cols).collect()
+        } else {
+            LAST_ROW_RAGGED[over / 2 % LAST_ROW_RAGGED.len()]
+                .chars()
+                .take(cols)
+                .collect()
+        };
+        write!(output, "{text}\r\n")?;
+    }
+    Ok(())
+}
+
+/// `coloured`'s first line's inks, one a word in turn: 256-colour reds, blues, greens, magentas,
+/// oranges and teals, as a shell's highlighter or `ls` lays them, none of them the theme's.
+pub const COLOURED_INKS: [&str; 6] = [
+    "38;5;160", "38;5;27", "38;5;28", "38;5;127", "38;5;166", "38;5;30",
+];
+
+/// `coloured`'s second line's inks, one a word in turn: the theme's own ANSI colours, each its
+/// palette's choice for its page.
+pub const COLOURED_THEME_INKS: [&str; 6] = ["31", "34", "32", "35", "33", "36"];
+
+/// `flood`'s words, in turn across its screen: five letters and a blank each, so a word stands where
+/// the word it replaces stood, nearly every letter reaching past the line's feet, and none of them
+/// one the word icons know.
+pub const FLOOD_WORDS: [&str; 12] = [
+    "gypsy", "pygmy", "jiggy", "foggy", "poppy", "guppy", "goopy", "pudgy", "soggy", "yuppy",
+    "gappy", "jumpy",
+];
+
+/// The cells one of [`FLOOD_WORDS`] stands in, its blank with it.
+const FLOOD_WORD_CELLS: usize = FLOOD_WORDS[0].len() + 1;
+
+/// The most keys `flood` presses a frame ([`flood_frames`]): a ribbon's letters are the cells its
+/// caret passes before the first of them fades, so the budget is out of a typist's reach, and a
+/// flood of keys, each paid for by its own echo, is what reaches it.
+pub const FLOOD_KEYS_A_FRAME: usize = 24;
+
+/// The keys that type `flood`'s default grid once, a cell each.
+pub const FLOOD_KEYS: usize = 72 * 14;
+
+/// `flood` keeps every so many of its frames during its run, as `key<nnnn>` by the keys typed.
+pub const FLOOD_KEPT_EVERY: usize = 8;
+
+/// The ms after `flood`'s last key of its frames ([`burst_frame`]): the ribbon going, a frame's
+/// lights fitting again once the whole words' hold ends, the ribbon gone and the page at rest.
+pub const FLOOD_AFTER_MS: [u64; 4] = [120, 470, 1650, 3000];
+
+/// Word `n`'s ink on `flood`: a hue no other of 360 words has (137 steps round the wheel, coprime
+/// with 360), mid-toned so it is an app's ink on both a dark page and paper, and the theme's on
+/// neither.
+#[must_use]
+pub const fn flood_ink(n: usize) -> [u8; 3] {
+    const LO: u32 = 40;
+    const HI: u32 = 190;
+    let hue = (n % 360 * 137) % 360;
+    let t = (hue % 60) as u32;
+    let up = (LO + (HI - LO) * t / 60) as u8;
+    let down = (HI - (HI - LO) * t / 60) as u8;
+    let (lo, hi) = (LO as u8, HI as u8);
+    match hue / 60 {
+        0 => [hi, up, lo],
+        1 => [down, hi, lo],
+        2 => [lo, hi, up],
+        3 => [lo, down, hi],
+        4 => [up, lo, hi],
+        _ => [hi, lo, down],
+    }
+}
+
+/// The line `flood` types: each of its screen's word places in turn, the word after the one standing
+/// there.
+#[must_use]
+pub fn flood_text() -> String {
+    (0..FLOOD_KEYS)
+        .map(|cell| {
+            let word = FLOOD_WORDS[(cell / FLOOD_WORD_CELLS + 1) % FLOOD_WORDS.len()];
+            word.as_bytes()
+                .get(cell % FLOOD_WORD_CELLS)
+                .map_or(' ', |&letter| char::from(letter))
+        })
+        .collect()
+}
+
+/// How many keys of `keys` each of `flood`'s frames presses on a grid `cols` wide: as many as its
+/// typed run keeps ([`FLOOD_KEYS_A_FRAME`]) up to the last two cells of a row, then the three that
+/// fold the caret over its wrap to the next row's second cell, the longest fold it reads as typed.
+#[must_use]
+pub fn flood_frames(cols: usize, keys: usize) -> Vec<usize> {
+    let mut frames = Vec::new();
+    let (mut typed, mut col) = (0, 0);
+    while typed < keys {
+        let run = cols.saturating_sub(2).saturating_sub(col);
+        let (n, to) = if run == 0 {
+            (3, 1)
+        } else {
+            let n = run.min(FLOOD_KEYS_A_FRAME);
+            (n, col + n)
+        };
+        let n = n.min(keys - typed);
+        frames.push(n);
+        typed += n;
+        col = to;
+    }
+    frames
+}
+
+/// `flood`'s screen on a grid: full of words, each in an ink of its own, the caret typing over them
+/// from the top.
+pub struct FloodScreen {
+    cells: usize,
+    typed: usize,
+}
+
+impl FloodScreen {
+    /// A grid's screen, none of it typed yet.
+    #[must_use]
+    pub fn new(rows: u16, cols: u16) -> Self {
+        Self {
+            cells: usize::from(rows).saturating_mul(usize::from(cols)).max(1),
+            typed: 0,
+        }
+    }
+
+    /// The screen, full, its caret home, nothing typed. Its last word's blank stays in the last
+    /// cell, its wrap pending, so the page does not scroll.
+    /// # Errors
+    /// The output's.
+    pub fn lay(&mut self, output: &mut impl std::io::Write) -> std::io::Result<()> {
+        self.typed = 0;
+        output.write_all(b"\x1b[H\x1b[2J")?;
+        for place in 0..self.cells / FLOOD_WORD_CELLS {
+            let [r, g, b] = flood_ink(place);
+            let word = FLOOD_WORDS[place % FLOOD_WORDS.len()];
+            write!(output, "\x1b[38;2;{r};{g};{b}m{word}\x1b[0m ")?;
+        }
+        output.write_all(b"\x1b[H")
+    }
+
+    /// A key's letter over the next cell, in its word's ink, a word's the screen has not held; from
+    /// the screen's top again past its end.
+    /// # Errors
+    /// The output's.
+    pub fn key(&mut self, output: &mut impl std::io::Write, letter: u8) -> std::io::Result<()> {
+        let cell = self.typed % self.cells;
+        if cell == 0 && self.typed > 0 {
+            output.write_all(b"\x1b[H")?;
+        }
+        let [r, g, b] = flood_ink(self.cells / FLOOD_WORD_CELLS + cell / FLOOD_WORD_CELLS);
+        write!(output, "\x1b[38;2;{r};{g};{b}m")?;
+        output.write_all(&[letter])?;
+        output.write_all(b"\x1b[0m")?;
+        self.typed += 1;
+        Ok(())
+    }
+}
+
+/// `flood`'s PTY child ([`FloodScreen`]): a printable key types on, Ctrl+C or Ctrl+D ends it.
+fn flood_fixture(
+    input: &mut impl std::io::Read,
+    output: &mut impl std::io::Write,
+    mut size: impl FnMut() -> Option<(u16, u16)>,
+) -> std::io::Result<()> {
+    let (mut rows, mut cols) = typing_size(size())?;
+    let mut screen = FloodScreen::new(rows, cols);
+    screen.lay(output)?;
+    output.flush()?;
+    let mut key = [0u8; 1];
+    loop {
+        match input.read_exact(&mut key) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
+        }
+        let now = typing_size(size())?;
+        if now != (rows, cols) {
+            (rows, cols) = now;
+            screen = FloodScreen::new(rows, cols);
+            screen.lay(output)?;
+        }
+        match key[0] {
+            3 | 4 => break,
+            0x20..=0x7e => screen.key(output, key[0])?,
+            _ => {}
+        }
+        output.flush()?;
+    }
+    Ok(())
+}
+
+/// The line `rail-g` types: [`BURST_TEXT`] up to the `g` of `lazy dog`, the caret left just past it.
+pub const RAIL_G_TEXT: &str = "echo the quick brown fox jumps over the lazy dog";
+
+/// The ms after the line's last key of `rail-g`'s held frames.
+pub const RAIL_G_HELD_MS: [u64; 2] = [120, 470];
+
+/// The row `rail-g`'s first line stands on, of a default grid's 14: under [`last_row_page`]'s rows,
+/// with the rows below it blank, so its rail runs clear of the grid's foot.
+pub const RAIL_G_UNDER_ROW: u16 = 7;
+
 /// The `split` scenario's panes: the window split top over bottom (`spawn
 /// split=h`), the focus moved back up to the caret's pane (`pane up`), so
 /// the burst's whole line still fits its row.
@@ -648,16 +922,22 @@ pub fn burst_keys() -> Vec<String> {
     keys_of(BURST_TEXT)
 }
 
-/// The gallery's private PTY child: typed data, a stalled redraw or a fold/focus probe.
+/// The gallery's private PTY child: typed data, on a blank page or under `last-row`'s lettered
+/// one, a stalled redraw or a fold/focus probe.
 pub fn cmd_redraw_fixture(args: &[String]) -> Res {
     use std::io::Read as _;
 
     let fold = args == ["fold"];
     let focus = args == ["focus"];
     let typing = args == ["typing"];
-    if !args.is_empty() && !fold && !focus && !typing {
+    let last_row = args == ["last-row"];
+    let coloured = args == ["coloured"];
+    let flood = args == ["flood"];
+    let rail_g = args == ["rail-g"];
+    if !args.is_empty() && !fold && !focus && !typing && !last_row && !coloured && !flood && !rail_g
+    {
         return Err(Fail::usage(
-            "the redraw fixture takes only an optional fold, focus or typing mode",
+            "the redraw fixture takes only an optional fold, focus, typing, last-row, coloured, flood or rail-g mode",
         ));
     }
     let _raw = crate::sys::RawMode::enter(0)
@@ -665,12 +945,20 @@ pub fn cmd_redraw_fixture(args: &[String]) -> Res {
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();
     let io_error = |e| Fail::usage(format!("redraw fixture: {e}"));
-    if typing || focus {
+    if typing || focus || last_row || coloured || flood || rail_g {
         let size = || crate::sys::winsize(0).map(|size| (size.ws_row, size.ws_col));
-        if typing {
+        if flood {
+            flood_fixture(&mut input, &mut output, size)
+        } else if typing {
             typing_fixture(&mut input, &mut output, size)
+        } else if focus {
+            line_fixture(&mut input, &mut output, LineMode::Focus, size)
+        } else if coloured {
+            line_fixture(&mut input, &mut output, LineMode::Coloured, size)
+        } else if rail_g {
+            line_fixture(&mut input, &mut output, LineMode::RailG, size)
         } else {
-            line_fixture(&mut input, &mut output, true, size)
+            line_fixture(&mut input, &mut output, LineMode::LastRow, size)
         }
         .map_err(io_error)?;
         return Ok(0);
@@ -742,15 +1030,34 @@ fn typing_fixture(
     output: &mut impl std::io::Write,
     size: impl FnMut() -> Option<(u16, u16)>,
 ) -> std::io::Result<()> {
-    line_fixture(input, output, false, size)
+    line_fixture(input, output, LineMode::Typing, size)
+}
+
+/// What a [`line_fixture`] keeps round its line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineMode {
+    /// The fifth row of a blank page.
+    Typing,
+    /// The same on the alternate screen, its prompt `> `, reporting focus
+    /// ([`TypingLine::focus_report`]).
+    Focus,
+    /// The grid's last row under [`last_row_page`]; a Return answers [`LAST_ROW_ANSWER`].
+    LastRow,
+    /// [`Self::Typing`], each word its own SGR ink ([`TypingLine::inks`]): [`COLOURED_INKS`], and
+    /// [`COLOURED_THEME_INKS`] once the line is killed.
+    Coloured,
+    /// [`Self::LastRow`]'s page down to [`RAIL_G_UNDER_ROW`], and on Ctrl+L the line cleared and
+    /// its whole page, on the grid's last row.
+    RailG,
 }
 
 fn line_fixture(
     input: &mut impl std::io::Read,
     output: &mut impl std::io::Write,
-    focus: bool,
+    mode: LineMode,
     mut size: impl FnMut() -> Option<(u16, u16)>,
 ) -> std::io::Result<()> {
+    let focus = mode == LineMode::Focus;
     let (rows, cols) = typing_size(size())?;
     let mut line = TypingLine {
         text: Vec::new(),
@@ -759,12 +1066,18 @@ fn line_fixture(
         row: 4.min(usize::from(rows) - 1),
         visible: true,
         prompt: if focus { "> " } else { "$ " },
+        inks: (mode == LineMode::Coloured).then_some(&COLOURED_INKS),
+        last_row: false,
     };
     if focus {
         output.write_all(b"\x1b[?1049h\x1b[?1004h")?;
     }
-    output.write_all(b"\x1b[2J")?;
-    line.repaint(output, false)?;
+    if matches!(mode, LineMode::LastRow | LineMode::RailG) {
+        line.fresh_view(output, mode)?;
+    } else {
+        output.write_all(b"\x1b[2J")?;
+        line.repaint(output, false)?;
+    }
     if focus {
         line.focus_report(output, "ready")?;
     }
@@ -780,7 +1093,7 @@ fn line_fixture(
         if (rows, cols) != (line.rows, line.cols) {
             line.rows = rows;
             line.cols = cols;
-            line.repaint(output, true)?;
+            line.fresh_view(output, mode)?;
         }
         if focus && key[0] == 27 {
             let mut report = [0u8; 2];
@@ -799,6 +1112,9 @@ fn line_fixture(
             b'\r' | b'\n' => {
                 let row = (line.cursor_row() + 1).min(usize::from(line.rows) - 1);
                 output.write_all(b"\r\n")?;
+                if mode == LineMode::LastRow {
+                    write!(output, "{LAST_ROW_ANSWER}\r\n")?;
+                }
                 line.text.clear();
                 line.row = row;
                 line.visible = true;
@@ -810,15 +1126,22 @@ fn line_fixture(
                 }
             }
             12 => {
-                line.repaint(output, true)?;
+                if mode == LineMode::RailG {
+                    line.text.clear();
+                    line.last_row = true;
+                }
+                line.fresh_view(output, mode)?;
             }
             21 => {
                 line.text.clear();
+                if line.inks.is_some() {
+                    line.inks = Some(&COLOURED_THEME_INKS);
+                }
                 line.repaint(output, false)?;
             }
             0x20..=0x7e if line.text.len() < 80 => {
                 line.text.push(key[0]);
-                output.write_all(&key)?;
+                line.write_letter(output, line.text.len() - 1)?;
                 line.note_wrap();
             }
             _ => {}
@@ -840,9 +1163,25 @@ struct TypingLine {
     row: usize,
     visible: bool,
     prompt: &'static str,
+    /// The SGR ink of each word in turn; `None`: the page's own.
+    inks: Option<&'static [&'static str; 6]>,
+    /// [`LineMode::RailG`]: past its Ctrl+L, on the grid's last row.
+    last_row: bool,
 }
 
 impl TypingLine {
+    /// Letter `at` of the text, in its word's ink.
+    fn write_letter(&self, output: &mut impl std::io::Write, at: usize) -> std::io::Result<()> {
+        let letter = self.text[at];
+        let Some(inks) = self.inks.filter(|_| letter != b' ') else {
+            return output.write_all(&[letter]);
+        };
+        let word = self.text[..at].iter().filter(|&&b| b == b' ').count();
+        write!(output, "\x1b[{}m", inks[word % inks.len()])?;
+        output.write_all(&[letter])?;
+        output.write_all(b"\x1b[0m")
+    }
+
     fn cursor_row(&self) -> usize {
         self.cursor().0
     }
@@ -881,6 +1220,25 @@ impl TypingLine {
         }
     }
 
+    /// A view with nothing of the last one to keep: the line from the page's top, or under
+    /// `last-row`'s whole page on the grid's last row.
+    fn fresh_view(
+        &mut self,
+        output: &mut impl std::io::Write,
+        mode: LineMode,
+    ) -> std::io::Result<()> {
+        let rows = match mode {
+            LineMode::LastRow => self.rows,
+            LineMode::RailG if self.last_row => self.rows,
+            LineMode::RailG => (RAIL_G_UNDER_ROW + 1).min(self.rows),
+            _ => return self.repaint(output, true),
+        };
+        last_row_page(output, rows, self.cols)?;
+        self.row = usize::from(rows) - 1;
+        self.visible = true;
+        self.repaint(output, false)
+    }
+
     fn repaint(&mut self, output: &mut impl std::io::Write, clear: bool) -> std::io::Result<()> {
         // An offscreen prompt means this line fills the viewport. Rebuild its visible tail;
         // a resize also starts a fresh view instead of guessing how the old rows reflowed.
@@ -890,7 +1248,9 @@ impl TypingLine {
             output.write_all(b"\x1b[H\x1b[2J")?;
         }
         write!(output, "\x1b[{};1H\x1b[J{}", self.row + 1, self.prompt)?;
-        output.write_all(&self.text)?;
+        for at in 0..self.text.len() {
+            self.write_letter(output, at)?;
+        }
         self.note_wrap();
         Ok(())
     }
@@ -1693,6 +2053,16 @@ impl Shot<'_> {
         Ok(())
     }
 
+    /// `last-row`'s frames of a line typed and held: `<prefix>t120` to `<prefix>l6000`
+    /// ([`LAST_ROW_HELD_MS`]), on the mark its last key left.
+    fn held(&mut self, prefix: &str) -> Result<(), Stopped> {
+        for ms in LAST_ROW_HELD_MS {
+            self.tick_until(ms, Duration::from_millis(40))?;
+            self.snap(&format!("{prefix}{}", burst_frame(ms)));
+        }
+        Ok(())
+    }
+
     /// Split the window ([`SPLIT_PANES`]) and give the caret's pane the focus
     /// back, keeping each reply and the layout (`<name>.panes.txt`); half a
     /// second of frames lets the new pane's shell come up.
@@ -1844,6 +2214,90 @@ impl Shot<'_> {
                 self.snap("u120");
                 self.tick_until(470, Duration::from_millis(60))?;
                 self.snap("u470");
+            }
+            Scenario::Coloured => {
+                let keep = [
+                    (10, "key10".to_string()),
+                    (BURST_FLY_KEY as u64, "fly".to_string()),
+                ];
+                self.paced(BURST_KEY_MS, &keep, &burst_keys())?;
+                self.snap("t0");
+                for ms in [120, 470, 1650] {
+                    self.tick_until(ms, Duration::from_millis(40))?;
+                    self.snap(&burst_frame(ms));
+                }
+                self.press("ctrl+u");
+                self.mark("killed");
+                self.tick_until(800, Duration::from_millis(60))?;
+                let keep = [(BURST_FLY_KEY as u64, "a-fly".to_string())];
+                self.paced(BURST_KEY_MS, &keep, &burst_keys())?;
+                self.snap("a-t0");
+                self.tick_until(120, Duration::from_millis(40))?;
+                self.snap("a-t120");
+            }
+            Scenario::Flood => {
+                self.mark("burst-start");
+                let start = self.mark;
+                let text = keys_of(&flood_text());
+                let mut typed = 0;
+                let frames = flood_frames(self.columns as usize, text.len());
+                for (frame, keys) in frames.into_iter().enumerate() {
+                    if frame > 0 {
+                        Shot::pace(start, frame as u64 * BURST_KEY_MS)?;
+                    }
+                    for key in &text[typed..typed + keys] {
+                        self.press(key);
+                    }
+                    typed += keys;
+                    sleep(BURST_KEY_MS / 2)?;
+                    if (frame + 1) % FLOOD_KEPT_EVERY == 0 {
+                        self.snap(&format!("key{typed:04}"));
+                    } else {
+                        self.tick();
+                    }
+                }
+                self.mark("burst-end");
+                self.snap("t0");
+                for ms in FLOOD_AFTER_MS {
+                    self.tick_until(ms, Duration::from_millis(40))?;
+                    self.snap(&burst_frame(ms));
+                }
+            }
+            Scenario::RailG => {
+                let keys = keys_of(RAIL_G_TEXT);
+                for (at, place) in [("under-g", "under"), ("last-g", "last")] {
+                    if place == "last" {
+                        self.press("ctrl+l");
+                        self.mark("relaid");
+                        self.tick_until(800, Duration::from_millis(60))?;
+                    }
+                    self.paced(BURST_KEY_MS, &[], &keys)?;
+                    self.snap(at);
+                    for ms in RAIL_G_HELD_MS {
+                        self.tick_until(ms, Duration::from_millis(40))?;
+                        self.snap(&format!("{at}{ms}"));
+                    }
+                }
+            }
+            Scenario::LastRow => {
+                let keep = [
+                    (12, "mid".to_string()),
+                    (BURST_FLY_KEY as u64, "fly".to_string()),
+                ];
+                self.paced(BURST_KEY_MS, &keep, &burst_keys())?;
+                self.snap("t0");
+                self.held("")?;
+                self.press("enter");
+                self.mark("enter");
+                sleep(30)?;
+                self.snap("enter");
+                self.tick_until(120, Duration::from_millis(40))?;
+                self.snap("e120");
+                self.tick_until(470, Duration::from_millis(60))?;
+                self.snap("e470");
+                self.paced(TYPING_KEY_MS, &[(12, "rmid".to_string())], &word)?;
+                self.snap("r0");
+                self.held("r")?;
             }
             Scenario::Steam => {
                 self.burst(None, &word)?;
@@ -2055,6 +2509,10 @@ fn gallery_program(
         Scenario::Settings | Scenario::RedrawStall => Some(""),
         Scenario::FoldRest => Some("fold"),
         Scenario::FocusRoundtrip | Scenario::FocusWrap => Some("focus"),
+        Scenario::LastRow => Some("last-row"),
+        Scenario::Coloured => Some("coloured"),
+        Scenario::Flood => Some("flood"),
+        Scenario::RailG => Some("rail-g"),
         _ => None,
     };
     if let Some(mode) = mode {

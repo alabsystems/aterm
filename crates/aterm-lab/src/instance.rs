@@ -21,6 +21,10 @@ use crate::{Fail, LAB, Res};
 mod cleanup;
 pub(crate) use cleanup::after_stop;
 
+#[cfg(any(test, debug_assertions))]
+#[path = "instance_network_away.rs"]
+mod network_away;
+
 /// The automatic lanes off.
 pub const CONFIG_OFF: &str = "agents_auto_prime = false\n\
                               [update]\nenabled = false\nauto_apply = false\n\
@@ -779,7 +783,7 @@ impl Instance {
     /// # Errors
     /// The log, the lifeline or the process could not be made.
     pub fn start(world: &World, l: Launch) -> Result<Instance, String> {
-        Self::start_on_socket(world, l, &world.sock, WindowWork::Timing)
+        Self::start_on_socket(world, l, &world.sock, WindowWork::Timing, |_| Ok(()))
     }
 
     /// Start a functional window with a nonzero memory reservation and the
@@ -840,6 +844,7 @@ impl Instance {
                 memory_bytes,
                 retain,
             },
+            |_| Ok(()),
         )
     }
 
@@ -857,8 +862,14 @@ impl Instance {
         }
         // Empty means the ordinary per-instance socket, rather than an explicit
         // socket that would suppress Commons startup in the executable.
-        let mut instance =
-            Self::start_in_on_socket(world, l, Band::App, Path::new(""), WindowWork::Timing)?;
+        let mut instance = Self::start_in_on_socket(
+            world,
+            l,
+            Band::App,
+            Path::new(""),
+            WindowWork::Timing,
+            |_| Ok(()),
+        )?;
         instance.sock = world
             .run
             .join("aterm")
@@ -868,9 +879,10 @@ impl Instance {
 
     fn start_on_socket(
         world: &World,
-        l: Launch,
+        mut l: Launch,
         socket: &Path,
         work: WindowWork,
+        prepare: impl FnOnce(&mut Vec<(String, String)>) -> Result<(), String>,
     ) -> Result<Instance, String> {
         let admission = windowed_admission(&l, work)?;
         let log = world.dir.join("aterm.log");
@@ -905,6 +917,10 @@ impl Instance {
             );
         }
         let (program, argv) = line.split_first().ok_or("an empty command line")?;
+        // Admission and inherited resource guards are settled before time-sensitive inputs
+        // are prepared. The callback can add environment inputs, not change the admitted
+        // executable, window mode or arguments.
+        prepare(&mut l.env)?;
         let child = command
             .env_clear()
             .envs(l.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
@@ -940,18 +956,19 @@ impl Instance {
     /// # Errors
     /// As [`Instance::start`]; a sandboxed `l` in the app band; the job could not start.
     pub fn start_in(world: &World, l: Launch, band: Band) -> Result<Instance, String> {
-        Self::start_in_on_socket(world, l, band, &world.sock, WindowWork::Timing)
+        Self::start_in_on_socket(world, l, band, &world.sock, WindowWork::Timing, |_| Ok(()))
     }
 
     fn start_in_on_socket(
         world: &World,
-        l: Launch,
+        mut l: Launch,
         band: Band,
         socket: &Path,
         work: WindowWork,
+        prepare: impl FnOnce(&mut Vec<(String, String)>) -> Result<(), String>,
     ) -> Result<Instance, String> {
         if Via::of(&l, band)? == Via::Child {
-            return Self::start_on_socket(world, l, socket, work);
+            return Self::start_on_socket(world, l, socket, work, prepare);
         }
         let admission = windowed_admission(&l, work)?;
         let log = world.dir.join("aterm.log");
@@ -959,6 +976,7 @@ impl Instance {
             .map_err(|e| format!("cannot create {}: {e}", log.display()))?;
         let line = line(&l, Via::Job, &paths().exe, socket);
         let job = if l.headless {
+            prepare(&mut l.env)?;
             Job::start(&world.dir, &line, &l.env, &l.cwd, &log)
                 .map_err(|error| world.retain_start_failure(error))?
         } else {
@@ -968,6 +986,7 @@ impl Instance {
                 lane,
                 admission.as_ref().and_then(WindowAdmission::memory),
             )?;
+            prepare(&mut l.env)?;
             Job::start_with_guards(&world.dir, &line, &l.env, &l.cwd, &log, guards)
                 .map_err(|error| world.retain_start_failure(error))?
         };
@@ -1614,6 +1633,26 @@ pub fn resolve_aterm(given: Option<String>) -> Result<PathBuf, String> {
     paths().need_aterm().map(Path::to_path_buf)
 }
 
+fn network_away_delay(args: &mut Vec<String>) -> Result<Option<u64>, Fail> {
+    let value = take_value(args, "--network-away-in-ms")?;
+    #[cfg(any(test, debug_assertions))]
+    {
+        value
+            .map(|value| network_away::delay(&value))
+            .transpose()
+            .map_err(Fail::usage)
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        if value.is_some() {
+            return Err(Fail::usage(
+                "instance: --network-away-in-ms requires a debug Lab build",
+            ));
+        }
+        Ok(None)
+    }
+}
+
 /// `instance`: a private aterm, headless unless `--window`, held until this command ends.
 /// # Errors
 /// Usage, or the instance could not start or answer.
@@ -1647,6 +1686,7 @@ pub fn cmd_instance(args: &[String]) -> Res {
     let harness_keys = take_values(&mut a, "--harness-key")?;
     let extra_env =
         crate::lab::instance_env(&take_values(&mut a, "--env")?.join(" ")).map_err(Fail::usage)?;
+    let network_away = network_away_delay(&mut a)?;
     let home = take_value(&mut a, "--home")?.map(|p| from_caller(&p));
     let reroute = take_value(&mut a, "--reroute-prefix")?.map(|p| from_caller(&p));
     let harness = take_flag(&mut a, "--harness");
@@ -1681,12 +1721,39 @@ pub fn cmd_instance(args: &[String]) -> Res {
              --reroute-prefix or --keep",
         ));
     }
+    #[cfg(any(test, debug_assertions))]
+    if network_away.is_some()
+        && (aterm.is_some()
+            || home.is_some()
+            || reroute.is_some()
+            || at.as_ref().is_some_and(|path| Path::new(path).exists())
+            || extra_env
+                .iter()
+                .any(|(key, _)| key == aterm_netplace::facts::SEAM))
+    {
+        return Err(Fail::usage(
+            "instance: --network-away-in-ms needs the checkout's default debug app, a fresh private world and its own network facts",
+        ));
+    }
     if !post.is_empty() && image.is_none() {
         return Err(Fail::usage(
             "instance: --post runs after --image's frame; drive a held instance with `aterm ctl` instead",
         ));
     }
-    let aterm = resolve_aterm(aterm).map_err(|e| Fail::exit(3, e))?;
+    // This fixture requires the original checkout debug artifact, never LAB_ATERM or a
+    // release fallback: only a debug app has both the scripted facts seam and A12 lab identity.
+    let aterm = resolve_aterm(if network_away.is_some() {
+        Some(
+            paths()
+                .repo
+                .join("target/debug/aterm")
+                .to_string_lossy()
+                .into_owned(),
+        )
+    } else {
+        aterm
+    })
+    .map_err(|e| Fail::exit(3, e))?;
     let config = config_after(&config_with(&toml), harness, &toml_after);
     let configured =
         !toml.is_empty() || !toml_after.is_empty() || harness || !harness_keys.is_empty();
@@ -1756,7 +1823,24 @@ pub fn cmd_instance(args: &[String]) -> Res {
     if let Some(scene) = scene {
         env.push(("ATERM_DEBUG_SCENE".to_string(), scene));
     }
-    let mut inst = Instance::start_in(
+    #[cfg(any(test, debug_assertions))]
+    let prepare = |env: &mut Vec<(String, String)>| -> Result<(), String> {
+        if let Some(delay) = network_away {
+            let fixture = network_away::prepare(&world, delay, aterm_netplace::unix_ms_now())?;
+            println!(
+                "instance: network away eligible at unix_ms={}",
+                fixture.due_ms
+            );
+            env.push((
+                aterm_netplace::facts::SEAM.into(),
+                fixture.facts.to_string_lossy().into_owned(),
+            ));
+        }
+        Ok(())
+    };
+    #[cfg(not(any(test, debug_assertions)))]
+    let prepare = |_: &mut Vec<(String, String)>| -> Result<(), String> { Ok(()) };
+    let mut inst = Instance::start_in_on_socket(
         &world,
         Launch {
             aterm,
@@ -1768,6 +1852,9 @@ pub fn cmd_instance(args: &[String]) -> Res {
             reroute: reroute.is_some(),
         },
         band,
+        &world.sock,
+        WindowWork::Timing,
+        prepare,
     )?;
     // From here the instance's end is this verb's to wait for and say: a second signal, even
     // one that comes with the first, cuts that wait short instead of ending the run unsaid.

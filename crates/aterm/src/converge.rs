@@ -17,6 +17,9 @@
 //! an open vault's Commons on its only admin ([`aterm_secrets::client::commons_foundable`]).
 //! `sync.requests` runs this Mac's pass over the lab's credential requests, and the custodian's
 //! on a Mac that can sign with the vault's key ([`aterm_db::credentials`]).
+//! `sync.clone-tuning` tunes each clone of the vault's inventory as its repository declares
+//! ([`aterm_machines::clone_tuning`]), reading the inventory on disk, under System State's holds
+//! as they stand when it reads and when it applies ([`setup_holds`]).
 //! `sync.shared-data`, `sync.steward.revoke` and `sync.steward.lease` publish to the vault, so for
 //! a vault on the LAN, which aterm reaches through the LAN broker on macOS, a pass waits while the
 //! broker does not answer ([`publish_waits`]).
@@ -36,6 +39,8 @@ use aterm_machines::sync::{
 use aterm_secrets::client::Foundable;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+mod repository_tools;
 
 /// This Mac, as the converge pass reads and changes it.
 pub(crate) struct Live {
@@ -62,11 +67,11 @@ const FABRIC_OFF: &str = "off: no [fabric] command (`aterm fabric on` turns it o
 
 /// `sync.awake`'s read of what macOS holds ([`aterm_acaffeine::held::Held`]): `installed` finds
 /// the installed app a mug starts from (in `/Applications` or `~/Applications`, with the
-/// `acaffeine` verb), asked only when keep-awake is on here.
+/// `acaffeine` verb), asked only when keep-awake is on and no mug runs here.
 ///
 /// # Errors
-/// The mug runs and the power manager gave no answer, or the installed app did not answer
-/// whether it has the verb.
+/// The mug runs and the power manager gave no answer, or no mug runs and the installed app
+/// did not answer whether it has the verb.
 fn awake_of(
     installed: impl FnOnce() -> aterm_acaffeine::launchd::Installed,
     held: aterm_acaffeine::held::Held,
@@ -79,16 +84,6 @@ fn awake_of(
             "aCaffeine is off by your choice (`aterm acaffeine on` turns it on)".to_owned(),
         )
     };
-    match held {
-        Held::NotHere(why) => return Ok(AwakeRead::NotApplicable(why)),
-        Held::Off => return Ok(off()),
-        _ => {}
-    }
-    match installed() {
-        Installed::At(_) => {}
-        Installed::Absent(why) => return Ok(AwakeRead::NotApplicable(why)),
-        Installed::Unanswered(why) => return Err(why),
-    }
     Ok(match held {
         Held::NotHere(why) => AwakeRead::NotApplicable(why),
         Held::Off => off(),
@@ -106,7 +101,11 @@ fn awake_of(
             "the mug (pid {pid}) runs and asks macOS again every minute{}",
             because(why)
         )),
-        Held::Stopped { why } => AwakeRead::Due(format!("no aCaffeine mug runs{}", because(why))),
+        Held::Stopped { why } => match installed() {
+            Installed::At(_) => AwakeRead::Due(format!("no aCaffeine mug runs{}", because(why))),
+            Installed::Absent(why) => AwakeRead::NotApplicable(why),
+            Installed::Unanswered(why) => return Err(why),
+        },
         Held::Unread { pid, why } => {
             return Err(format!("the mug (pid {pid}) runs; {why}"));
         }
@@ -197,29 +196,29 @@ fn repository_vault(
     vault_config(paths)
 }
 
-/// A local decision may run git's read-only probes, so it runs outside the materialization
-/// lock. Publish its result only if the complete source version is still the one admitted.
-fn repository_read<T>(
+/// Capture the default source once under full readiness. All later Git work runs
+/// outside this lock, and its caller fences publication with the retained snapshot.
+fn repository_inputs(
     paths: &aterm_secrets::client::Paths,
     config: &aterm_secrets::client::Config,
-    read: impl FnOnce() -> Result<T, String>,
-) -> Result<Option<T>, String> {
-    let Some(captured) = aterm_secrets::client::with_materialization_ready_for_entries(
+    sys: &dyn aterm_machines::port::System,
+    ctx: &aterm_machines::items::Ctx,
+) -> Result<
+    Option<
+        aterm_secrets::client::Materialized<aterm_machines::init_github::InitialRepositoryInputs>,
+    >,
+    String,
+> {
+    aterm_secrets::client::with_materialization_ready_for_entries(
         paths,
         config,
         &aterm_machines::init_github::VAULT_INPUT_ENTRIES,
-        || Ok(()),
+        || {
+            aterm_machines::init_github::InitialRepositoryInputs::capture(sys, ctx)
+                .map_err(aterm_secrets::Error::new)
+        },
     )
-    .map_err(|why| why.to_string())?
-    else {
-        return Ok(None);
-    };
-    let value = read()?;
-    Ok(captured
-        .snapshot
-        .is_current(paths)
-        .map_err(|why| why.to_string())?
-        .then_some(value))
+    .map_err(|why| why.to_string())
 }
 
 /// What stands before `sync.peers`' join besides the vault: System State's plan (the Secrets
@@ -850,19 +849,36 @@ fn projected_machine_label(
     if *choice == NameChoice::Off {
         return Ok(roster_label);
     }
+    Ok(projected_label(
+        choice,
+        chosen_machine_number(state)?,
+        roster_label,
+    ))
+}
+
+fn chosen_machine_number(
+    state: Option<&Path>,
+) -> Result<Option<aterm_types::machine_name::Number>, String> {
     let Some(state) = state else {
-        return Ok(roster_label);
+        return Ok(None);
     };
-    let chosen = aterm_agent::machine_name::file::read(state)
+    Ok(aterm_agent::machine_name::file::read(state)
         .map_err(|why| format!("this machine's name is unread: {why}"))?
         .filter(|name| name.class == aterm_types::machine_name::Class::Chosen)
-        .and_then(|name| name.num);
+        .and_then(|name| name.num))
+}
+
+fn projected_label(
+    choice: &mut NameChoice,
+    chosen: Option<aterm_types::machine_name::Number>,
+    roster_label: Option<String>,
+) -> Option<String> {
     if chosen.is_some() && *choice != NameChoice::Off {
         // Rename This Mac is the newer explicit naming act; the older identity string is a
         // projection source, while `false` remains an explicit hold on identity naming.
         *choice = NameChoice::Roster;
     }
-    Ok(chosen.map(|number| number.to_string()).or(roster_label))
+    chosen.map(|number| number.to_string()).or(roster_label)
 }
 
 fn identity_target_from(choice: &NameChoice, label: Option<String>) -> Option<IdentityTarget> {
@@ -873,14 +889,41 @@ fn identity_target_from(choice: &NameChoice, label: Option<String>) -> Option<Id
     }
 }
 
-/// Re-read the naming choice immediately before projecting it outside the config file. A
-/// concurrent off choice after the config write stops both fleet and OS naming; a newer
-/// chosen number is read at the same boundary.
+/// The naming source a pass may project. Comparing only its resolved target would miss a
+/// person's newer policy that happens to resolve to the same name. Nicknames and unrelated
+/// configuration are absent, so their edits leave this work admitted.
+#[derive(Debug, PartialEq, Eq)]
+struct IdentityProjection {
+    target: IdentityTarget,
+    choice: NameChoice,
+    machines: [Option<String>; 2],
+    chosen: Option<aterm_types::machine_name::Number>,
+}
+
+impl IdentityProjection {
+    /// Read the policy again, then the canonical source last, after any blocking projection
+    /// reads and immediately before a write. This read acquires no config, roster or book lock.
+    fn check_current(
+        &self,
+        config: &Path,
+        state: Option<&Path>,
+        roster_label: Option<String>,
+    ) -> Result<(), String> {
+        if projection_target_now(config, state, roster_label)?.as_ref() == Some(self) {
+            Ok(())
+        } else {
+            Err("this machine's naming choice changed during synchronization".to_owned())
+        }
+    }
+}
+
+/// Read the naming source after the config write, retaining its semantic policy and chosen
+/// number so every external writer can check it again under its existing effect boundary.
 fn projection_target_now(
     config_path: &Path,
     state: Option<&Path>,
     roster_label: Option<String>,
-) -> Result<Option<IdentityTarget>, String> {
+) -> Result<Option<IdentityProjection>, String> {
     let snapshot =
         aterm_uds::atomic_file::ConfigFile::open(config_path).map_err(|e| e.to_string())?;
     let Some(mut identity) = read_enabled_identity_snapshot(&snapshot)? else {
@@ -889,8 +932,17 @@ fn projection_target_now(
     if identity.name == NameChoice::Off {
         return Ok(None);
     }
-    let label = projected_machine_label(state, &mut identity.name, roster_label)?;
-    Ok(identity_target_from(&identity.name, label))
+    let choice = identity.name.clone();
+    let chosen = chosen_machine_number(state)?;
+    let label = projected_label(&mut identity.name, chosen, roster_label);
+    Ok(
+        identity_target_from(&identity.name, label).map(|target| IdentityProjection {
+            target,
+            choice,
+            machines: identity.machines,
+            chosen,
+        }),
+    )
 }
 
 fn name_label(
@@ -1061,13 +1113,16 @@ fn own_name_due(read: IdentityRead, label: Option<&str>, by_rule: bool) -> Ident
 /// Name this Mac `label` through the rule setup's elevation left
 /// ([`aterm_machines::root_steps::name_by_rule`]), as this account, never asking for a password:
 /// what the pass's row says of it, `None` where no rule is in place or nothing changed.
-#[cfg(target_os = "macos")]
-fn own_name_by_rule(label: &str) -> Option<String> {
-    let sys = aterm_machines::port::Live::new();
-    if aterm_machines::root_steps::rule_in_place(&sys) != Some(true) {
+#[cfg(any(target_os = "macos", test))]
+fn own_name_by_rule(
+    sys: &dyn aterm_machines::port::System,
+    label: &str,
+    current: &dyn Fn() -> Result<(), String>,
+) -> Option<String> {
+    if aterm_machines::root_steps::rule_in_place(sys) != Some(true) {
         return None;
     }
-    match aterm_machines::root_steps::name_by_rule(&sys, label) {
+    match aterm_machines::root_steps::name_by_rule(sys, label, current) {
         Ok(set) if set.is_empty() => None,
         Ok(set) => Some(format!("this Mac's {} now {label}", set.join(", "))),
         Err(why) => Some(format!("this Mac's own names left as they are: {why}")),
@@ -1609,6 +1664,10 @@ impl Ports for Live {
         crate::doctor::sync_base(lock)
     }
 
+    fn repository_prerequisites(&self) -> Option<Box<dyn aterm_converge::Item + '_>> {
+        Some(Box::new(repository_tools::Prerequisites::live()))
+    }
+
     fn vault(&self) -> Result<VaultRead, String> {
         use aterm_secrets::service::{Job, State};
         let paths = vault_paths()?;
@@ -1738,25 +1797,32 @@ impl Ports for Live {
         )?;
         // The fleet and OS projections follow the chosen machine number, or the roster while
         // no explicit number is held. The roster still identifies older writes as ours.
-        let Some((target, os_label)) =
-            projection_target_now(&config, self.state_dir().as_deref(), roster_label.clone())?
+        let state = self.state_dir();
+        let Some(projection) =
+            projection_target_now(&config, state.as_deref(), roster_label.clone())?
         else {
             return Ok(keys);
         };
+        let current = || projection.check_current(&config, state.as_deref(), roster_label.clone());
+        let (target, os_label) = &projection.target;
         #[cfg(not(target_os = "macos"))]
         let _ = (&mut names, os_label);
-        let fleet = aterm_agent::follow_fleet_name(&target, &|word| {
-            roster_gives(roster.as_ref(), roster_label.as_deref(), word)
-        })?;
+        let fleet = aterm_agent::follow_fleet_name(
+            target,
+            &|word| roster_gives(roster.as_ref(), roster_label.as_deref(), word),
+            &current,
+        )?;
+        current()?;
         #[cfg(target_os = "macos")]
         if let Some(label) = os_label
             .as_deref()
-            .filter(|label| *label == target)
+            .filter(|label| *label == target.as_str())
             .and_then(|label| {
-                own_name_pending(&target, Some(label), names.get_or_insert_with(own_names))
+                own_name_pending(target, Some(label), names.get_or_insert_with(own_names))
                     .and(Some(label))
             })
-            && let Some(named) = own_name_by_rule(label)
+            && let Some(named) =
+                own_name_by_rule(&aterm_machines::port::Live::new(), label, &current)
         {
             return Ok(format!("{keys}; {fleet}; {named}"));
         }
@@ -1959,43 +2025,19 @@ impl Ports for Live {
         let config = aterm_types::dirs::aterm_config_path()
             .ok_or("no config path: neither $XDG_CONFIG_HOME nor $HOME is set")?;
         let paths = vault_paths()?;
-        let needs = aterm_secrets::need::peek(&paths).map_err(|why| why.to_string())?;
-        let standing = aterm_secrets::need::status_line(&needs)
-            .unwrap_or_else(|| "no needs on this Mac".to_owned());
-        if !aterm_db::runtime::enabled(&config).map_err(|why| why.to_string())? {
-            return Ok(RequestsRead::Idle(format!(
-                "off: [commons] enabled = false ({standing})"
-            )));
-        }
-        if !aterm_secrets::commons::bootstrap::writer_here(&paths) {
-            return Ok(RequestsRead::Idle(format!(
-                "this Mac is not a Commons Writer, so the lab's table is not reached ({standing})"
-            )));
-        }
-        Ok(RequestsRead::Due(standing))
+        requests_read(
+            aterm_secrets::need::peek(&paths).map_err(|why| why.to_string()),
+            || aterm_db::runtime::enabled(&config).map_err(|why| why.to_string()),
+            || aterm_secrets::commons::bootstrap::writer_here(&paths),
+        )
     }
 
     fn pass_requests(&self) -> Result<String, String> {
-        use std::fmt::Write as _;
         let paths = vault_paths()?;
-        let pass = aterm_db::credentials::pass(&paths).map_err(|why| why.to_string())?;
-        let mut said = format!(
-            "{} posted, {} answered, {} decided here, {} offered, {} swept",
-            pass.posted, pass.answered, pass.decided, pass.offered, pass.swept
-        );
-        if let Some(custodian) =
-            aterm_db::credentials::custodian_pass(&paths).map_err(|why| why.to_string())?
-        {
-            let _ = write!(
-                said,
-                "; custodian: {} published, {} handed to a person, {} retired, {} waiting",
-                custodian.published.len(),
-                custodian.asked.len(),
-                custodian.retired.len(),
-                custodian.waiting.len()
-            );
-        }
-        Ok(said)
+        requests_pass(
+            || aterm_db::credentials::pass(&paths).map_err(|why| why.to_string()),
+            || aterm_db::credentials::custodian_pass(&paths).map_err(|why| why.to_string()),
+        )
     }
 
     fn found_commons(&self) -> Result<String, String> {
@@ -2048,16 +2090,31 @@ impl Ports for Live {
         let sys = aterm_machines::port::Live::new();
         let ctx = repository_context(&sys)?;
         let paths = vault_paths()?;
-        let read = || aterm_machines::init::owed_clone(&sys, &state, &setup_holds());
         match repository_vault(&paths, &sys, &ctx)? {
-            Some(config) => Ok(repository_read(&paths, &config, read)?.unwrap_or_else(|| {
-                aterm_machines::init::OwedClone::Waiting(REPOSITORIES_SYNCING.into())
-            })),
-            None => read(),
+            Some(config) => {
+                let Some(captured) = repository_inputs(&paths, &config, &sys, &ctx)? else {
+                    return Ok(aterm_machines::init::OwedClone::Waiting(
+                        REPOSITORIES_SYNCING.into(),
+                    ));
+                };
+                aterm_machines::init::owed_clone_captured(
+                    &sys,
+                    &state,
+                    &setup_holds(),
+                    captured.inputs,
+                    || {
+                        captured
+                            .snapshot
+                            .is_current_now(&paths)
+                            .map_err(|why| why.to_string())
+                    },
+                )
+            }
+            None => aterm_machines::init::owed_clone(&sys, &state, &setup_holds()),
         }
     }
 
-    fn clone_owed(&self) -> Result<String, String> {
+    fn clone_owed(&self, work: aterm_secrets::converge::RepositoryWork) -> Result<String, String> {
         let state = self
             .state_dir()
             .ok_or("no state directory holds the clone aterm init owes")?;
@@ -2065,20 +2122,11 @@ impl Ports for Live {
         let ctx = repository_context(&sys)?;
         let paths = vault_paths()?;
         let Some(config) = repository_vault(&paths, &sys, &ctx)? else {
-            return aterm_machines::init::clone_owed(&sys, &state);
+            return aterm_machines::init::clone_owed(&sys, &state, work);
         };
-        let captured = aterm_secrets::client::with_materialization_ready_for_entries(
-            &paths,
-            &config,
-            &aterm_machines::init_github::VAULT_INPUT_ENTRIES,
-            || {
-                aterm_machines::init_github::InitialRepositoryInputs::capture(&sys, &ctx)
-                    .map_err(aterm_secrets::Error::new)
-            },
-        )
-        .map_err(|why| why.to_string())?
-        .ok_or(REPOSITORIES_SYNCING)?;
-        aterm_machines::init::clone_owed_captured(&sys, &state, captured.inputs, move || {
+        let captured =
+            repository_inputs(&paths, &config, &sys, &ctx)?.ok_or(REPOSITORIES_SYNCING)?;
+        aterm_machines::init::clone_owed_captured(&sys, &state, work, captured.inputs, move || {
             // A first clone may take a long time. The person's Stop, repository switch or
             // profile change must hold every later effect, not just the next sync pass.
             if setup_holds().holds(aterm_types::macos_setup::Setting::Repositories)
@@ -2091,7 +2139,7 @@ impl Ports for Live {
             }
             captured
                 .snapshot
-                .is_current(&paths)
+                .is_current_now(&paths)
                 .map_err(|why| why.to_string())
         })
     }
@@ -2101,6 +2149,24 @@ impl Ports for Live {
             .state_dir()
             .ok_or("no state directory holds the clone aterm init owes")?;
         aterm_machines::init::forget_owed_clone(&state)
+    }
+
+    fn clone_tuning(&self) -> Result<aterm_machines::clone_tuning::Reading, String> {
+        let state = self
+            .state_dir()
+            .ok_or("no state directory holds the clones' tuning record")?;
+        let sys = aterm_machines::port::Live::new();
+        let ctx = repository_context(&sys)?;
+        aterm_machines::clone_tuning::read(&sys, &ctx, &state, &setup_holds())
+    }
+
+    fn tune_clones(&self) -> Result<aterm_machines::clone_tuning::Tuned, String> {
+        let state = self
+            .state_dir()
+            .ok_or("no state directory holds the clones' tuning record")?;
+        let sys = aterm_machines::port::Live::new();
+        let ctx = repository_context(&sys)?;
+        aterm_machines::clone_tuning::apply(&sys, &ctx, &state, &setup_holds())
     }
 
     fn accounts(&self) -> Result<AccountsRead, String> {
@@ -2136,6 +2202,10 @@ impl Ports for Live {
             (false, _) => "no sync was called for",
         }
         .to_owned())
+    }
+
+    fn fabric_needs_node(&self) -> bool {
+        self.fabric_service == aterm_link::enable::Service::Node
     }
 
     fn fabric(&self) -> Result<FabricRead, String> {
@@ -2291,78 +2361,70 @@ impl Ports for Live {
     }
 }
 
+/// `sync.requests`'s read: where this Mac's `needs` stand, and whether the pass is due (Commons
+/// on, this Mac a Writer). A ledger it cannot read is said, not the read's failure: the pass
+/// still runs, so the custodian's half decides for the lab and the member's half fails the item
+/// naming the ledger.
+fn requests_read(
+    needs: Result<Vec<aterm_secrets::need::Need>, String>,
+    enabled: impl FnOnce() -> Result<bool, String>,
+    writer: impl FnOnce() -> bool,
+) -> Result<RequestsRead, String> {
+    let standing = match needs {
+        Ok(needs) => aterm_secrets::need::status_line(&needs)
+            .unwrap_or_else(|| "no needs on this Mac".to_owned()),
+        Err(why) => format!("this Mac's need ledger cannot be read ({why})"),
+    };
+    if !enabled()? {
+        return Ok(RequestsRead::Idle(format!(
+            "off: [commons] enabled = false ({standing})"
+        )));
+    }
+    if !writer() {
+        return Ok(RequestsRead::Idle(format!(
+            "this Mac is not a Commons Writer, so the lab's table is not reached ({standing})"
+        )));
+    }
+    Ok(RequestsRead::Due(standing))
+}
+
+/// `sync.requests`'s apply: this Mac's `member` pass over the lab's table, then the
+/// `custodian`'s, which runs whatever the first did: it reads the table and the vault, not this
+/// Mac's ledger, so a member pass that fails on the vault's admin Mac does not hold up the lab's
+/// decisions. The line says both; a failure in either, or a request whose copy or publication
+/// failed, fails the item with it.
+fn requests_pass(
+    member: impl FnOnce() -> Result<aterm_db::credentials::Pass, String>,
+    custodian: impl FnOnce() -> Result<Option<aterm_db::credentials::Custodian>, String>,
+) -> Result<String, String> {
+    use std::fmt::Write as _;
+    let member = member();
+    let custodian = custodian();
+    let mut failed = member.is_err();
+    let mut said = match member {
+        Ok(pass) => format!(
+            "{} posted, {} answered, {} decided here, {} offered, {} swept",
+            pass.posted, pass.answered, pass.decided, pass.offered, pass.swept
+        ),
+        Err(why) => format!("this Mac's pass failed: {why}"),
+    };
+    match custodian {
+        Ok(None) => {}
+        Ok(Some(custodian)) => {
+            failed |= !custodian.failed.is_empty();
+            let _ = write!(said, "; {}", custodian.summary());
+        }
+        Err(why) => {
+            failed = true;
+            let _ = write!(said, "; the custodian's pass failed: {why}");
+        }
+    }
+    if failed { Err(said) } else { Ok(said) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn repository_read_rejects_incomplete_or_rotated_vault_materialization() {
-        use aterm_secrets::client::{self, JoinOptions, JoinPassword, Paths};
-        let scratch = aterm_tempfile::tempdir().unwrap();
-        let source = scratch.path().join("source");
-        let paths = Paths::for_home(&scratch.path().join("home"));
-        aterm_uds::atomic_file::write(
-            &source,
-            b"gh_access_token=before\ngithub-repositories.json=fixture\nunrelated=before\n",
-            0o600,
-        )
-        .unwrap();
-        client::join(
-            &paths,
-            &JoinOptions {
-                source: source.to_string_lossy().into_owned(),
-                host: Some("fixture".into()),
-                interactive: false,
-                wait: Duration::ZERO,
-                confirm: &|_| false,
-                password: JoinPassword::Given(None),
-                fetched: None,
-                requested: &|| {},
-                say: &|_| {},
-            },
-        )
-        .unwrap();
-        let config = client::config(&paths).unwrap().unwrap();
-        assert_eq!(repository_read(&paths, &config, || Ok(7)).unwrap(), Some(7));
-
-        let unrelated = repository_read(&paths, &config, || {
-            aterm_uds::atomic_file::write(
-                &source,
-                b"gh_access_token=before\ngithub-repositories.json=fixture\nunrelated=after\n",
-                0o600,
-            )
-            .map_err(|why| why.to_string())?;
-            client::sync(&paths, None).map_err(|why| why.to_string())?;
-            Ok(8)
-        })
-        .unwrap();
-        assert_eq!(unrelated, Some(8));
-
-        // This callback can finish a sync: no materialization lock spans read-only git work.
-        // Its earlier decision is discarded when that sync advances the captured version.
-        let rotated = repository_read(&paths, &config, || {
-            aterm_uds::atomic_file::write(
-                &source,
-                b"gh_access_token=after\ngithub-repositories.json=fixture\nunrelated=after\n",
-                0o600,
-            )
-            .map_err(|why| why.to_string())?;
-            client::sync(&paths, None).map_err(|why| why.to_string())?;
-            Ok(8)
-        })
-        .unwrap();
-        assert_eq!(rotated, None);
-        assert_eq!(repository_read(&paths, &config, || Ok(9)).unwrap(), Some(9));
-
-        std::fs::remove_file(paths.home.join(".secrets/gh_access_token")).unwrap();
-        assert_eq!(
-            repository_read(&paths, &config, || -> Result<(), String> {
-                panic!("incomplete materialization must not inspect repository inputs")
-            })
-            .unwrap(),
-            None
-        );
-    }
 
     /// `sync.identity` reads the fleet name beside the `aterm.toml` keys: a fleet name still due
     /// makes the row due even where the keys are current, and the Mac's own names that differ
@@ -2510,7 +2572,8 @@ mod tests {
     /// `sync.awake` plans a start only where one keeps the Mac awake: never over a person's off
     /// or without an installed app that has the verb (in `/Applications` or `~/Applications`),
     /// and never for a mug that runs and asks macOS again itself. The installed app is not asked
-    /// about over an off, and one that did not answer fails the read for the next pass.
+    /// about over an off or a running mug; a stopped mug's candidate that did not answer fails
+    /// the read for the next pass.
     #[test]
     fn the_awake_row_plans_a_start_only_where_one_helps() {
         use aterm_acaffeine::held::Held;
@@ -2524,13 +2587,13 @@ mod tests {
             ))
         };
         let absent = || Installed::Absent("aterm.app is not installed".to_owned());
-        let unasked = || -> Installed { panic!("nothing to start: the app is not asked") };
+        let unasked = || -> Installed { panic!("no start: the installed app is not asked") };
         assert!(matches!(
             awake_of(at, stopped()),
             Ok(AwakeRead::Due(why)) if why.contains("the menu bar refused the mug")
         ));
         assert!(matches!(
-            awake_of(at, Held::Held { pid: 7 }),
+            awake_of(unasked, Held::Held { pid: 7 }),
             Ok(AwakeRead::Current(_))
         ));
         assert!(matches!(
@@ -2553,12 +2616,12 @@ mod tests {
             .is_err()
         );
         assert!(matches!(
-            awake_of(at, Held::NotHeld { pid: 7, why: None }),
+            awake_of(unasked, Held::NotHeld { pid: 7, why: None }),
             Ok(AwakeRead::Asking(_))
         ));
         assert!(matches!(
             awake_of(
-                at,
+                unasked,
                 Held::Paused {
                     pid: 7,
                     why: aterm_acaffeine::model::Pause::LidClosed,
@@ -2569,13 +2632,80 @@ mod tests {
         ));
         assert!(
             awake_of(
-                at,
+                unasked,
                 Held::Unread {
                     pid: 7,
                     why: "hung".to_owned()
                 }
             )
             .is_err()
+        );
+    }
+
+    /// `sync.requests` runs the custodian's pass whatever this Mac's own pass did, and says
+    /// both: a member pass that fails (a damaged ledger on the vault's admin Mac) still lets the
+    /// custodian decide for the lab. A copy or publication that failed in the custodian's pass
+    /// fails the pass, naming the error, as the publish's own error did.
+    /// NEGATIVE CONTROL: a pass that returns on the member pass's error never runs the
+    /// custodian's; one that reads only the counts calls a failed publication a pass that went
+    /// through.
+    #[test]
+    fn a_failing_member_pass_still_runs_the_custodians_and_a_failed_copy_fails_the_pass() {
+        use aterm_db::credentials::{Custodian, Pass};
+        let ran = std::cell::Cell::new(false);
+        let lapsed = || {
+            ran.set(true);
+            Ok(Some(Custodian {
+                retired: vec![([1; 16], aterm_secrets::need::Reason::Lapsed)],
+                ..Custodian::default()
+            }))
+        };
+        let said = requests_pass(|| Err("needs.toml: damaged".to_owned()), lapsed).unwrap_err();
+        assert!(ran.get(), "{said}");
+        assert!(
+            said.contains("needs.toml: damaged") && said.contains("1 retired"),
+            "{said}"
+        );
+        let failed = Custodian {
+            failed: vec![([2; 16], "the vault's publication failed: refused".into())],
+            ..Custodian::default()
+        };
+        let said = requests_pass(|| Ok(Pass::default()), || Ok(Some(failed))).unwrap_err();
+        assert!(
+            said.contains("1 failed") && said.contains("publication failed: refused"),
+            "{said}"
+        );
+        assert_eq!(
+            requests_pass(|| Ok(Pass::default()), || Ok(None)),
+            Ok("0 posted, 0 answered, 0 decided here, 0 offered, 0 swept".to_owned())
+        );
+    }
+
+    /// A need ledger `sync.requests` cannot read (damaged, on the vault's admin Mac) leaves the
+    /// pass due, saying so, so its apply runs and the custodian's half still decides for the
+    /// lab; the probe failing instead would read as unusable and run nothing.
+    /// NEGATIVE CONTROL: the same ledger on a Mac that is no Writer, or with Commons off, stays
+    /// idle, and a config that cannot be read still fails the read.
+    #[test]
+    fn a_need_ledger_that_cannot_be_read_still_runs_the_requests_pass() {
+        let damaged = || Err("needs.toml: not a need ledger aterm wrote".to_owned());
+        let due = requests_read(damaged(), || Ok(true), || true);
+        assert!(
+            matches!(&due, Ok(RequestsRead::Due(said)) if said.contains("needs.toml: not a need ledger")),
+            "{due:?}"
+        );
+        assert!(matches!(
+            requests_read(damaged(), || Ok(true), || false),
+            Ok(RequestsRead::Idle(_))
+        ));
+        assert!(matches!(
+            requests_read(damaged(), || Ok(false), || true),
+            Ok(RequestsRead::Idle(_))
+        ));
+        assert!(requests_read(Ok(Vec::new()), || Err("aterm.toml".to_owned()), || true).is_err());
+        assert_eq!(
+            requests_read(Ok(Vec::new()), || Ok(true), || true),
+            Ok(RequestsRead::Due("no needs on this Mac".to_owned()))
         );
     }
 
@@ -3187,20 +3317,73 @@ mod tests {
     }
 
     #[test]
-    fn an_off_choice_after_identity_keys_are_written_stops_external_projections() {
+    fn automatic_system_names_keep_their_source_current_after_each_read() {
         use aterm_agent::machine_name::file::{self, MachineName};
         use aterm_types::machine_name::{Class, Nickname, Number};
 
+        #[derive(Clone, Copy)]
+        enum Change {
+            Config(&'static str),
+            Number,
+            UnreadName,
+            NicknameAndUnrelated,
+            None,
+        }
+
         let scratch = aterm_tempfile::tempdir().unwrap();
-        let state = scratch.path().join("state");
-        aterm_uds::private_file::create_private_dir(&state).unwrap();
-        let mut name = MachineName::unnumbered(Nickname::parse("MissBunny").unwrap(), 1);
-        name.num = Some(Number::parse("m86").unwrap());
-        name.class = Class::Chosen;
-        file::read_or_create(&state, || Ok(name)).unwrap();
-        let config = scratch.path().join("aterm.toml");
-        let record = state.join("converge/identity-written.toml");
-        for off in ["[identity]\nname = false\n", "[swarm]\nenabled = false\n"] {
+        for (case, field, change, completed) in [
+            (
+                "identity-off",
+                "ComputerName",
+                Change::Config("[identity]\nname = false\n"),
+                0,
+            ),
+            (
+                "swarm-off",
+                "LocalHostName",
+                Change::Config("[swarm]\nenabled = false\n"),
+                1,
+            ),
+            (
+                "same-target-new-policy",
+                "ComputerName",
+                Change::Config(
+                    "[identity]\nname = \"m86\"\n[ai]\nmachine = \"m86\"\n[fleet]\nmachine = \"m86\"\n",
+                ),
+                0,
+            ),
+            (
+                "new-machine-key",
+                "HostName",
+                Change::Config("[ai]\nmachine = \"studio\"\n[fleet]\nmachine = \"m86\"\n"),
+                2,
+            ),
+            ("new-number", "ComputerName", Change::Number, 0),
+            ("unread-name", "ComputerName", Change::UnreadName, 0),
+            (
+                "unread-policy",
+                "ComputerName",
+                Change::Config("[identity\n"),
+                0,
+            ),
+            (
+                "nickname-and-unrelated",
+                "LocalHostName",
+                Change::NicknameAndUnrelated,
+                3,
+            ),
+            ("unchanged", "ComputerName", Change::None, 3),
+        ] {
+            let dir = scratch.path().join(case);
+            aterm_uds::private_file::create_private_dir(&dir).unwrap();
+            let state = dir.join("state");
+            aterm_uds::private_file::create_private_dir(&state).unwrap();
+            let mut name = MachineName::unnumbered(Nickname::parse("MissBunny").unwrap(), 1);
+            name.num = Some(Number::parse("m86").unwrap());
+            name.class = Class::Chosen;
+            file::read_or_create(&state, || Ok(name)).unwrap();
+            let config = dir.join("aterm.toml");
+            let record = state.join("converge/identity-written.toml");
             aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
             write_identity_after_read(
                 &config,
@@ -3211,20 +3394,100 @@ mod tests {
                 || {},
             )
             .unwrap();
-            assert_eq!(
-                projection_target_now(&config, Some(&state), Some("m184".into()))
-                    .unwrap()
-                    .unwrap()
-                    .0,
-                "m86"
+            let projection = projection_target_now(&config, Some(&state), Some("m184".into()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(projection.target.0, "m86");
+            let sys = aterm_machines::port::Fake::root();
+            sys.stat_of(
+                aterm_machines::root_steps::ADMITTED_NAME_RULE,
+                aterm_machines::port::Stat {
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o440,
+                    dir: false,
+                    symlink: false,
+                    len: 1,
+                },
             );
-            // Deterministically place the person's off edit between the config write and the
-            // boundary that would otherwise proceed to fleet and OS calls with stale choices.
-            aterm_uds::atomic_file::write(&config, off.as_bytes(), 0o600).unwrap();
-            assert!(
-                projection_target_now(&config, Some(&state), Some("m184".into()))
-                    .unwrap()
-                    .is_none()
+            let config_to_change = config.clone();
+            let state_to_change = state.clone();
+            let read = format!("/usr/sbin/scutil --get {field}");
+            let changed_on = read.clone();
+            sys.simulate(move |_, cmd| {
+                let key = cmd.display();
+                if key == changed_on {
+                    // The read returns only after the real source changes; every effect is fake.
+                    match change {
+                        Change::Config(text) => {
+                            aterm_uds::atomic_file::write(
+                                &config_to_change,
+                                text.as_bytes(),
+                                0o600,
+                            )
+                            .unwrap();
+                        }
+                        Change::Number => {
+                            file::replace(&state_to_change, |held| {
+                                held.num = Some(Number::parse("m87").unwrap());
+                                Ok(())
+                            })
+                            .unwrap();
+                        }
+                        Change::UnreadName => {
+                            aterm_uds::private_file::write_private(
+                                &state_to_change,
+                                file::FILE,
+                                b"unread name",
+                            )
+                            .unwrap();
+                        }
+                        Change::NicknameAndUnrelated => {
+                            file::replace(&state_to_change, |held| {
+                                held.nick = Nickname::parse("Heron").unwrap();
+                                held.rev += 1;
+                                Ok(())
+                            })
+                            .unwrap();
+                            let mut text = std::fs::read_to_string(&config_to_change).unwrap();
+                            text.push_str(
+                                "\n[harness]\naccounts = \"wall\"\n[identity]\ngit = false\n",
+                            );
+                            aterm_uds::atomic_file::write(
+                                &config_to_change,
+                                text.as_bytes(),
+                                0o600,
+                            )
+                            .unwrap();
+                        }
+                        Change::None => {}
+                    }
+                }
+                if key.starts_with("/usr/sbin/scutil --get ") {
+                    Some(aterm_machines::port::Ran::ok("m184\n"))
+                } else if key.starts_with("/usr/bin/sudo -n /usr/sbin/scutil --set ") {
+                    Some(aterm_machines::port::Ran::ok(""))
+                } else {
+                    None
+                }
+            });
+            let current = || projection.check_current(&config, Some(&state), Some("m184".into()));
+            let said = own_name_by_rule(&sys, &projection.target.0, &current);
+            let calls = sys.calls();
+            assert!(calls.contains(&read), "{case}: the source change must run");
+            let writes: Vec<_> = calls
+                .iter()
+                .filter(|call| call.contains(" --set "))
+                .cloned()
+                .collect();
+            let expected: Vec<_> = aterm_machines::root_steps::NAME_PREFS
+                .into_iter()
+                .take(completed)
+                .map(|field| format!("/usr/bin/sudo -n /usr/sbin/scutil --set {field} m86"))
+                .collect();
+            assert_eq!(
+                writes, expected,
+                "{case}: {said:?}; no write may outlive its naming source"
             );
         }
     }

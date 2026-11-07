@@ -7,7 +7,7 @@ use aterm_time::Instant;
 
 use aterm_render::{GlowQuad, premul_rgb};
 
-use crate::cursor_fx::CARET_PAGE_MIN_CONTRAST;
+use crate::cursor_fx::{CARET_PAGE_MIN_CONTRAST, EFFECT_CARET_PAGE_GUARD};
 use crate::cursor_glow::{Geom, push_ripple_ring};
 use crate::effect_util::{push_soft_disc, water_ramp};
 
@@ -86,33 +86,41 @@ impl Default for DropletFrame {
     }
 }
 
-/// The band of water-ramp positions whose colour keeps
-/// [`CARET_PAGE_MIN_CONTRAST`] against `ground`, as `(lo, hi)`.
+/// The floor the liquid caret's band is solved to ([`ramp_band_on`]): every effect caret's margin
+/// past the page's (the after-land lows' W8). Solved to the floor itself, the band's edge laid
+/// Water's caret on Solarized Dark at 4.51:1.
+const DROPLET_CARET_FLOOR: f32 = CARET_PAGE_MIN_CONTRAST + EFFECT_CARET_PAGE_GUARD;
+
+/// The band of water-ramp positions whose colour keeps [`DROPLET_CARET_FLOOR`] against
+/// `ground`, as `(lo, hi)`.
 #[inline]
 const fn ramp_band_on(ground: u32, dark: bool) -> (f32, f32) {
-    const REF_DARK_BAND: (f32, f32) = ramp_band_solve(crate::cursor_glow::REF_DARK_PAGE, true);
-    const REF_WHITE_BAND: (f32, f32) = ramp_band_solve(0x00FF_FFFF, false);
+    const REF_DARK_BAND: (f32, f32) =
+        ramp_band_solve(crate::cursor_glow::REF_DARK_PAGE, true, DROPLET_CARET_FLOOR);
+    const REF_WHITE_BAND: (f32, f32) = ramp_band_solve(0x00FF_FFFF, false, DROPLET_CARET_FLOOR);
     let ground = ground & 0x00FF_FFFF;
     if ground == crate::cursor_glow::REF_DARK_PAGE {
         REF_DARK_BAND
     } else if ground == 0x00FF_FFFF {
         REF_WHITE_BAND
     } else {
-        ramp_band_solve(ground, dark)
+        ramp_band_solve(ground, dark, DROPLET_CARET_FLOOR)
     }
 }
 
+/// The band of water-ramp positions whose colour keeps `floor` against `ground`, as
+/// `(lo, hi)`.
 #[inline]
-const fn ramp_band_solve(ground: u32, dark: bool) -> (f32, f32) {
+const fn ramp_band_solve(ground: u32, dark: bool, floor: f32) -> (f32, f32) {
     let table = crate::color_math::relative_luminance_table();
     let lum_g = crate::color_math::relative_luminance_with(table, ground);
     let lum_g_plus = lum_g + 0.05;
     #[inline]
     const fn meets_rgb(
         table: &crate::color_math::RelativeLuminanceTable,
-        lum_g: f32,
-        lum_g_plus: f32,
+        (lum_g, lum_g_plus): (f32, f32),
         rgb: u32,
+        floor: f32,
     ) -> bool {
         let lum_w = crate::color_math::relative_luminance_with(table, rgb);
         let (hi_plus, lo_plus) = if lum_w > lum_g {
@@ -120,16 +128,16 @@ const fn ramp_band_solve(ground: u32, dark: bool) -> (f32, f32) {
         } else {
             (lum_g_plus, lum_w + 0.05)
         };
-        hi_plus / lo_plus >= CARET_PAGE_MIN_CONTRAST
+        hi_plus / lo_plus >= floor
     }
     let far = if dark { 1.0 } else { 0.0 };
     let far_rgb = water_ramp(far);
-    if !meets_rgb(table, lum_g, lum_g_plus, far_rgb) {
+    if !meets_rgb(table, (lum_g, lum_g_plus), far_rgb, floor) {
         return (far, far);
     }
     let near = 1.0 - far;
     let near_rgb = water_ramp(near);
-    if meets_rgb(table, lum_g, lum_g_plus, near_rgb) {
+    if meets_rgb(table, (lum_g, lum_g_plus), near_rgb, floor) {
         return (0.0, 1.0);
     }
     let (mut pass, mut fail) = (far, near);
@@ -143,7 +151,7 @@ const fn ramp_band_solve(ground: u32, dark: bool) -> (f32, f32) {
             pass = mid;
         } else if mid_rgb == fail_rgb {
             fail = mid;
-        } else if meets_rgb(table, lum_g, lum_g_plus, mid_rgb) {
+        } else if meets_rgb(table, (lum_g, lum_g_plus), mid_rgb, floor) {
             pass = mid;
             pass_rgb = mid_rgb;
         } else {
@@ -819,6 +827,39 @@ mod tests {
             fill,
             out.len(),
         )
+    }
+
+    /// THE LIQUID CARET KEEPS A MARGIN PAST THE PAGE FLOOR (the after-land lows' W8): solved to
+    /// the floor itself, the band's edge laid Water's caret on Solarized Dark at 4.51:1. On the
+    /// reference dark, Solarized Dark, white and Solarized Light, both ends of the band read at
+    /// least [`DROPLET_CARET_FLOOR`] against the page. Control: the band solved to
+    /// [`CARET_PAGE_MIN_CONTRAST`] has an end under it on Solarized Dark.
+    #[test]
+    fn the_liquid_caret_keeps_a_margin_past_the_page_floor() {
+        let ends = |band: (f32, f32), page: u32| {
+            let c = |p: f32| crate::color_math::contrast_ratio(water_ramp(p), page);
+            c(band.0).min(c(band.1))
+        };
+        for (page, dark) in [
+            (crate::cursor_glow::REF_DARK_PAGE, true),
+            (0x0000_2B36, true),
+            (0x00FF_FFFF, false),
+            (0x00FD_F6E3, false),
+        ] {
+            let worst = ends(ramp_band_on(page, dark), page);
+            assert!(
+                worst >= DROPLET_CARET_FLOOR,
+                "#{page:06x}: the caret's band reads down to {worst:.3}:1"
+            );
+        }
+        let control = ends(
+            ramp_band_solve(0x0000_2B36, true, CARET_PAGE_MIN_CONTRAST),
+            0x0000_2B36,
+        );
+        assert!(
+            control < DROPLET_CARET_FLOOR,
+            "control: the band solved to the floor itself keeps {control:.3}:1"
+        );
     }
 
     /// On a light page at full surge the droplet keeps its caret: the fill is

@@ -6558,18 +6558,23 @@ mod tests {
 
         // Installed and selected already: done, and nothing to print.
         let done = mac();
-        done.stat_of(
+        for executable in [
             crate::items::developer::CLT_GIT,
-            crate::port::Stat {
-                uid: 0,
-                gid: 0,
-                mode: 0o755,
-                dir: false,
-                symlink: false,
-                len: 1,
-            },
-        )
-        .on(
+            crate::items::developer::CLT_CLANG,
+        ] {
+            done.stat_of(
+                executable,
+                crate::port::Stat {
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o755,
+                    dir: false,
+                    symlink: false,
+                    len: 1,
+                },
+            );
+        }
+        done.on(
             "/usr/bin/xcode-select -p",
             Ran::ok("/Library/Developer/CommandLineTools\n"),
         );
@@ -6650,9 +6655,13 @@ mod tests {
         };
         let tools = || {
             let sys = Fake::root();
-            sys.stat_of("/dev/console", console)
-                .stat_of(
-                    crate::items::developer::CLT_GIT,
+            sys.stat_of("/dev/console", console);
+            for executable in [
+                crate::items::developer::CLT_GIT,
+                crate::items::developer::CLT_CLANG,
+            ] {
+                sys.stat_of(
+                    executable,
                     crate::port::Stat {
                         uid: 0,
                         gid: 0,
@@ -6661,11 +6670,12 @@ mod tests {
                         symlink: false,
                         len: 1,
                     },
-                )
-                .on(
-                    "/usr/bin/xcode-select -p",
-                    Ran::ok("/Library/Developer/CommandLineTools\n"),
                 );
+            }
+            sys.on(
+                "/usr/bin/xcode-select -p",
+                Ran::ok("/Library/Developer/CommandLineTools\n"),
+            );
             sys
         };
         let sets = |sys: &Fake| -> Vec<String> {

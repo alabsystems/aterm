@@ -881,6 +881,71 @@ fn a_session_inside_a_submodule_reads_the_project_around_it() {
     );
 }
 
+/// A STATEMENT READ CUT OR REFUSED NEVER UNREADS A CLEAN READING (design B10): what a head
+/// states of how it was judged is the probe's last read, so a probe whose last read is starved
+/// past its limit still reads checked, its statement unread, in a session inside a submodule too,
+/// whose inner repository is read after the project around it; and one git refuses reads checked,
+/// its statement unread. CONTROLS: unstarved, each states [`Statement::Missing`] (a plain commit
+/// on main). NEGATIVE CONTROL (run by hand): the statement read inside `repo_reads`, before the
+/// inner repository's reads, makes the submodule session's last read an inner one, and starving
+/// it reads unread.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_statement_read_cut_or_refused_never_unreads_a_clean_reading() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let (_lib, app) = app_with_lib(tmp.path());
+    let sub = app.join("vendor/lib");
+    let starved = u64::try_from(PROBE_LIMIT.as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1_000);
+    let statement = |read: &RepoRead| read.checked().map(|at| at.statement.clone());
+    for dir in [&app, &sub] {
+        let control = probe(dir, Some(dir), PROBE_LIMIT);
+        assert_eq!(statement(&control), Some(Statement::Missing), "{control:?}");
+        // How many reads the probe makes: the first `k` it never reaches (a binary search, as a
+        // probe that never reaches read `k` reaches no later one).
+        let never_reaches = |k: u32| {
+            read_stall::set_after(k, 1);
+            let _ = probe(dir, Some(dir), PROBE_LIMIT);
+            let never = read_stall::pending();
+            read_stall::set(0);
+            never
+        };
+        let (mut lo, mut hi) = (1, 128);
+        assert!(never_reaches(hi), "a probe reads fewer than {hi} times");
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if never_reaches(mid) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        let reads = lo;
+        read_stall::set_after(reads - 1, starved);
+        let cut = probe(dir, Some(dir), PROBE_LIMIT);
+        read_stall::set(0);
+        assert_eq!(
+            statement(&cut),
+            Some(Statement::Unread),
+            "{}: the last read cut: {cut:?}",
+            dir.display()
+        );
+    }
+    let refused = Reads {
+        deadline: Cell::new(Instant::now() + PROBE_LIMIT),
+        each: Some(PROBE_LIMIT),
+        home: &app,
+        xdg: None,
+        cut: Cell::new(false),
+        starts: Cell::new(0),
+        held: None,
+        refused: Some(&|args: &[&str]| args.iter().any(|a| a.starts_with("--format=%(trailers"))),
+    };
+    let read = probe_reading(&app, &Used::default(), &refused);
+    assert_eq!(statement(&read), Some(Statement::Unread), "{read:?}");
+}
+
 /// A SESSION INSIDE A SUBMODULE STILL READS THE SUBMODULE (D2-4): its commit pushed to a branch of
 /// the submodule's remote but not to that remote's main, recorded by a bump the superproject
 /// pushed, holds the landing as it did before the probe read the project around it, and a read of
