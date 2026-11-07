@@ -10,6 +10,7 @@ use std::cell::Cell;
 thread_local! {
     static ACTIVE: Cell<bool> = const { Cell::new(false) };
     static ALLOC_CALLS: Cell<u64> = const { Cell::new(0) };
+    static ALLOC_BYTES: Cell<u64> = const { Cell::new(0) };
 }
 
 struct Counting;
@@ -21,6 +22,7 @@ unsafe impl GlobalAlloc for Counting {
         let _ = ACTIVE.try_with(|active| {
             if active.get() {
                 let _ = ALLOC_CALLS.try_with(|n| n.set(n.get() + 1));
+                let _ = ALLOC_BYTES.try_with(|n| n.set(n.get() + l.size() as u64));
             }
         });
         // SAFETY: forwarding to System with the same layout.
@@ -30,6 +32,7 @@ unsafe impl GlobalAlloc for Counting {
         let _ = ACTIVE.try_with(|active| {
             if active.get() {
                 let _ = ALLOC_CALLS.try_with(|n| n.set(n.get() + 1));
+                let _ = ALLOC_BYTES.try_with(|n| n.set(n.get() + new_size as u64));
             }
         });
         // SAFETY: forwarding to System with the same ptr+layout.
@@ -46,6 +49,7 @@ static ALLOC: Counting = Counting;
 
 fn allocs_in<R>(f: impl FnOnce() -> R) -> (R, u64) {
     ALLOC_CALLS.with(|n| n.set(0));
+    ALLOC_BYTES.with(|n| n.set(0));
     ACTIVE.with(|a| a.set(true));
     let r = f();
     ACTIVE.with(|a| a.set(false));
@@ -59,6 +63,77 @@ fn echo(i: usize) -> &'static [u8] {
     } else {
         let k = i % 26;
         &LETTERS[k..=k]
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn instructions() -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
+    // SAFETY: the output has the size/alignment of RUSAGE_INFO_V4; only read on success.
+    let result = unsafe {
+        libc::proc_pid_rusage(
+            std::process::id() as i32,
+            libc::RUSAGE_INFO_V4,
+            info.as_mut_ptr().cast(),
+        )
+    };
+    // SAFETY: proc_pid_rusage initialized info when it returned success.
+    (result == 0).then(|| unsafe { info.assume_init() }.ri_instructions)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn instructions() -> Option<u64> {
+    None
+}
+
+#[test]
+#[ignore = "manual before/after live row extraction measurement; run alone"]
+fn live_row_extraction_cost() {
+    use aterm_core::terminal::{SearchRows, Terminal};
+    const REPEATS: usize = 256;
+    for cols in [80u16, 4096] {
+        for shape in ["empty", "short", "short-space", "ascii", "cjk", "combining"] {
+            let text = match shape {
+                "short" => "x".to_string(),
+                "short-space" => "x ".to_string(),
+                "ascii" => "x".repeat(usize::from(cols)),
+                "cjk" => "日".repeat(usize::from(cols) / 2),
+                "combining" => "e\u{301}".repeat(usize::from(cols)),
+                _ => String::new(),
+            };
+            let mut terminal = Terminal::new(24, cols);
+            terminal.process(text.as_bytes());
+            let expected = terminal.written_line_cells(0).unwrap();
+            assert_eq!(expected.0, text);
+            for trim in [false, true] {
+                let before = instructions();
+                let (_, calls) = allocs_in(|| {
+                    for _ in 0..REPEATS {
+                        if trim {
+                            std::hint::black_box(terminal.get_line_text(0, None).unwrap());
+                        } else {
+                            std::hint::black_box(terminal.written_line_cells(0).unwrap());
+                        }
+                    }
+                });
+                let bytes = ALLOC_BYTES.with(Cell::get);
+                let retired = before.zip(instructions()).map(|(a, b)| b - a);
+                assert_eq!(terminal.get_line_text(0, None).unwrap(), text.trim_end());
+                eprintln!(
+                    "live_row cols={cols} shape={shape} trim={trim} repeats={REPEATS} instructions={retired:?} allocation_calls={calls} allocated_bytes={bytes}"
+                );
+            }
+        }
+        let terminal = Terminal::new(24, cols);
+        let mut rows = SearchRows::with_capacity(24);
+        let before = instructions();
+        let (_, calls) = allocs_in(|| terminal.read_search_rows(0, 24, &mut rows));
+        let bytes = ALLOC_BYTES.with(Cell::get);
+        let retired = before.zip(instructions()).map(|(a, b)| b - a);
+        assert!(rows.text.iter().all(String::is_empty));
+        eprintln!(
+            "live_snapshot cols={cols} rows=24 instructions={retired:?} allocation_calls={calls} allocated_bytes={bytes}"
+        );
     }
 }
 
@@ -103,4 +178,22 @@ fn ten_thousand_one_row_echoes_extract_with_zero_allocations_after_warm_up() {
         "10,000 one-row echo extractions made {extraction_allocs} heap allocations after \
          warm-up — the damage-scoped refill must reuse its row mask and row buffers"
     );
+}
+
+#[test]
+fn empty_written_rows_and_snapshots_allocate_nothing() {
+    use aterm_core::terminal::{SearchRows, Terminal};
+    for cols in [80, 4096] {
+        let terminal = Terminal::new(24, cols);
+        let mut rows = SearchRows::with_capacity(24);
+        let (row, calls) = allocs_in(|| terminal.written_line_cells(0).unwrap());
+        assert!(row.0.is_empty());
+        assert_eq!(calls, 0, "empty row at width {cols}");
+        let (text, calls) = allocs_in(|| terminal.get_line_text(0, None).unwrap());
+        assert!(text.is_empty());
+        assert_eq!(calls, 0, "empty trimmed row at width {cols}");
+        let (_, calls) = allocs_in(|| terminal.read_search_rows(0, 24, &mut rows));
+        assert!(rows.text.iter().all(String::is_empty));
+        assert_eq!(calls, 0, "empty snapshot at width {cols}");
+    }
 }

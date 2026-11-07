@@ -19,7 +19,7 @@ use crate::artifact::upload;
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 use crate::host::{HostError, HostRole, gh_serves, preflight_each};
-use crate::programs::{self, PIN_TRIPLE, RUSTC_GROUP, TRUST_EXPOSES};
+use crate::programs::{self, RUSTC_GROUP, TRUST_EXPOSES};
 use crate::quad::{self, Freshness};
 use crate::triple::Triple;
 
@@ -146,7 +146,7 @@ pub struct Preflight {
     pub trust_build: Option<u64>,
     /// The verified head.
     pub floor: Option<Floor>,
-    /// The trust build the channel's `pin` carries.
+    /// The effective Trust build on the seal's target.
     pub public_trust_pin: Option<u64>,
     /// The siblings, judged.
     pub judged: BTreeMap<String, Judged>,
@@ -168,16 +168,12 @@ impl Preflight {
     pub fn floor_pin(&self, program: &str) -> Option<u64> {
         let floor = self.floor.as_ref()?;
         let triple = self.triple?;
-        if triple == PIN_TRIPLE {
-            floor.channel.pin.get(program).copied()
-        } else {
-            floor
-                .channel
-                .pin_by_target
-                .get(triple.as_str())
-                .and_then(|c| c.get(program))
-                .copied()
-        }
+        floor
+            .channel
+            .for_target(triple.as_str())
+            .pin
+            .get(program)
+            .copied()
     }
 
     fn label(&self) -> String {
@@ -189,7 +185,7 @@ impl Preflight {
 
     fn scope(&self) -> String {
         match self.triple {
-            Some(t) if t != PIN_TRIPLE => format!(" for {t}"),
+            Some(t) => format!(" for {t}"),
             _ => String::new(),
         }
     }
@@ -234,6 +230,34 @@ pub fn siblings() -> Vec<&'static str> {
         .map(|p| p.name)
         .filter(|n| *n != BUNDLE)
         .collect()
+}
+
+/// Select the complete compiler tuple only on targets this cohort carries.
+/// Global pins remain the fallback for targets this cut does not qualify.
+///
+/// # Errors
+/// The tuple is incomplete, includes another program, or selects no target.
+pub(crate) fn selection_delta(
+    builds: &BTreeMap<String, u64>,
+    targets: impl IntoIterator<Item = Triple>,
+) -> Result<Delta> {
+    let expected: BTreeSet<_> = programs::group_members(RUSTC_GROUP)
+        .map(|p| p.name)
+        .collect();
+    let actual: BTreeSet<_> = builds.keys().map(String::as_str).collect();
+    if actual != expected {
+        return Err(Error::refused(format!(
+            "staged rustc group must select exactly {expected:?}, found {actual:?}"
+        )));
+    }
+    let target_pins: BTreeMap<_, _> = targets.into_iter().map(|t| (t, builds.clone())).collect();
+    if target_pins.is_empty() {
+        return Err(Error::refused("staged rustc group has no qualified target"));
+    }
+    Ok(Delta {
+        target_pins,
+        ..Delta::default()
+    })
 }
 
 /// The repositories of every member of the group, the bundle's among them: each is packed,
@@ -526,7 +550,9 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
         Ok((n, q)) => {
             crate::artifact::sign::elect_from_head(ctx, &q);
             if let Some(c) = q.index.channels.first() {
-                pf.public_trust_pin = c.pin.get(BUNDLE).copied();
+                pf.public_trust_pin = pf
+                    .triple
+                    .and_then(|t| c.for_target(t.as_str()).pin.get(BUNDLE).copied());
                 pf.floor = Some(Floor {
                     index_build: n,
                     channel: c.clone(),
@@ -862,12 +888,8 @@ pub fn publish_group(
         ));
     }
     log.say(format!(
-        "  3. index {next} over the verified channel head: the four builds as {}{}",
-        if triple == PIN_TRIPLE {
-            "`pin` moves".to_string()
-        } else {
-            format!("a {triple} overlay (`pin` belongs to {PIN_TRIPLE})")
-        },
+        "  3. index {next} over the verified channel head: the four builds as a {triple} \
+         overlay (other targets keep their selections){}",
         if upload {
             "; the packs are made public first"
         } else {
@@ -960,12 +982,7 @@ pub fn publish_group(
             out,
         });
     }
-    let mut delta = Delta::default();
-    if triple == PIN_TRIPLE {
-        delta.pins = builds.clone();
-    } else {
-        delta.target_pins.insert(triple, builds.clone());
-    }
+    let delta = selection_delta(&builds, [triple])?;
     log.say(format!(
         "3/3 indexing over the verified channel head: {}",
         builds

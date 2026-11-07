@@ -32,6 +32,25 @@ pub struct NativePushTiming {
     pub success: bool,
 }
 
+/// One returning Git-door attempt on an explicitly observed simulated client.
+/// This is dispatch/result wall time, including existing test hooks, not Git CPU
+/// time or proof that a child execed. No command, input, environment or output is exposed.
+#[cfg(all(unix, any(test, debug_assertions)))]
+#[derive(Clone, Copy, Debug)]
+pub struct GitChildTiming {
+    /// Index in the shared accepted-child log returned by Fx::children_run.
+    /// Concurrent calls can complete (and notify) out of ordinal order.
+    pub ordinal: usize,
+    /// Real monotonic time before the Git action and its one-shot test hooks.
+    pub started: std::time::Instant,
+    /// Real monotonic time after the action/hooks return, before notification.
+    pub finished: std::time::Instant,
+    /// Returned ChildOut code, including any existing test-hook change.
+    pub code: Option<i32>,
+    /// Returned error kind, without its message, input or side-effect details.
+    pub error: Option<crate::error::Kind>,
+}
+
 use astream_effects::{
     EffectRecord, EffectSeam, EffectsLog, LiveSeam, OsEffects, RecordingSeam, ReplayDivergence,
     ReplaySeam,
@@ -1420,7 +1439,11 @@ impl Fx {
             #[cfg(any(test, debug_assertions))]
             Seam::Simulated(clock) => {
                 child::check(spec)?;
-                clock.log(spec);
+                let _ordinal = clock.log(spec);
+                #[cfg(unix)]
+                let observer = clock.git_child_observer();
+                #[cfg(unix)]
+                let started = observer.map(|_| std::time::Instant::now());
                 #[cfg(unix)]
                 let hook = clock.take_git_hook(spec);
                 #[cfg(unix)]
@@ -1435,6 +1458,16 @@ impl Fx {
                 #[cfg(unix)]
                 if let Some(after) = after {
                     after(&mut result);
+                }
+                #[cfg(unix)]
+                if let (Some(observer), Some(started)) = (observer, started) {
+                    observer(GitChildTiming {
+                        ordinal: _ordinal,
+                        started,
+                        finished: std::time::Instant::now(),
+                        code: result.as_ref().ok().and_then(|out| out.code),
+                        error: result.as_ref().err().map(|error| error.kind),
+                    });
                 }
                 result
             }
@@ -1506,6 +1539,27 @@ impl Fx {
             panic!("native push observation requires simulated Fx");
         };
         clock.set_native_push_observer(Arc::new(observer));
+        self
+    }
+
+    /// Observe every returning accepted Git-door attempt on this simulated client.
+    /// Normal and sanitized config-input paths retain the same execution/result handling.
+    /// Ordinals join privately to children_run; notifications contain no sensitive data.
+    /// An inactive observer reads no real clocks, and other modes never install one.
+    ///
+    /// # Panics
+    /// Unless simulated, or if an observer was already installed. A callback panic
+    /// propagates after child completion; this is not an unwind-completion observer.
+    #[cfg(all(unix, any(test, debug_assertions)))]
+    #[must_use]
+    pub fn with_git_child_observer_for_tests(
+        self,
+        observer: impl Fn(GitChildTiming) + Send + Sync + 'static,
+    ) -> Self {
+        let Seam::Simulated(clock) = &self.seam else {
+            panic!("Git child observation requires simulated Fx");
+        };
+        clock.set_git_child_observer(Arc::new(observer));
         self
     }
 

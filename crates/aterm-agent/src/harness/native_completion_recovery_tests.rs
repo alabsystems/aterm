@@ -90,6 +90,201 @@ pub(super) fn fixture(rollback: bool, wrapper: bool, future: bool) -> (St, Prepa
     (state, prepare)
 }
 
+fn rollback_pool_receipt(
+    options: &Opts,
+    state: &St,
+    expected: &Prepare,
+) -> (crate::harness::cli::Env, codex_renewal::Receipt) {
+    use crate::harness::{accounts, codex_rotation};
+    use codex_renewal::{Candidate, Identity, Intent, Receipt};
+    let mut env = crate::harness::cli::Env::from_process().unwrap();
+    env.home = Some(options.home.clone());
+    env.state = options.state.clone();
+    env.config = Some(options.home.join("aterm.toml"));
+    let NativePlan::Restart {
+        process, launcher, ..
+    } = &expected.plan
+    else {
+        unreachable!()
+    };
+    let vendor = &state
+        .native_observation
+        .as_ref()
+        .unwrap()
+        .registration
+        .vendor;
+    let mut attached = vendor.clone();
+    attached.image = launcher.clone();
+    let receipt = Receipt {
+        id: expected.id.clone(),
+        intent: Intent {
+            purpose: codex_renewal::Purpose::WeeklyQuota,
+            thread: "019a4b54-5fa1-7123-8123-123456789abc".into(),
+            wall: "019a4b54-5fa2-7123-8123-123456789abc".into(),
+            identity: Identity::from_native("original", "user"),
+        },
+        destination: Some(Identity::from_native("selected", "user")),
+        sid: SID.into(),
+        old_pid: process.pid,
+        old_birth: process.birth,
+        claim_revision: 1,
+        human_seq: 0,
+        old_auth: options.home.join("old/auth.json"),
+        new_auth: options.home.join("new/auth.json"),
+        generation: 1,
+        row_stamp: "selected-row".into(),
+        native_prepare: Request::prepare(expected.clone()).encode().unwrap(),
+        expires_ms: 120_000,
+        phase: codex_renewal::Phase::Retired,
+        successor_pid: Some(vendor.pid),
+        successor_birth: Some(vendor.birth),
+        accepted_turn: None,
+        launch_attempted: true,
+        candidate: Some(Candidate::of(&attached, false)),
+        current_attempt: None,
+        revoked: false,
+    };
+    codex_renewal::with_receipt_writer(&env, |_| codex_renewal::write_receipt(&env, &receipt))
+        .unwrap()
+        .unwrap();
+    let store = env.accounts_store_for(accounts::Cli::Codex).unwrap();
+    let mut logins = accounts::Logins::default();
+    logins.native_rotations.insert(
+        receipt.id.clone(),
+        codex_rotation::receipt_binding(&receipt).unwrap(),
+    );
+    crate::harness::upgrade_models::write_atomic_mode(
+        &store.logins_file(),
+        &logins.to_json(),
+        Some(0o600),
+    )
+    .unwrap();
+    (env, receipt)
+}
+
+#[test]
+fn rollback_pool_retirement_requires_exact_acknowledged_native_completion() {
+    use crate::harness::accounts;
+    for wrapper in [false, true] {
+        for fault in 0..3 {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let options = opts(root.path());
+            let (mut state, expected) = fixture(true, wrapper, false);
+            let (env, receipt) = rollback_pool_receipt(&options, &state, &expected);
+            if fault == 1 {
+                state.tab = "another-session".into();
+            }
+            let key = format!("renewal-{}", expected.id);
+            upgrade_drive::save_checked(&options, &key, &state).unwrap();
+            let lock = (fault == 2).then(|| {
+                aterm_uds::file_lock::LockFile::take(
+                    &options.state.join("upgrade").join(format!("{key}.lock")),
+                    std::time::Instant::now(),
+                    "completion fixture holds native acknowledgement",
+                )
+                .unwrap()
+            });
+            let retired = codex_renewal::with_receipt_writer(&env, |writer| {
+                writer.retire_rolled_back_pool_record(&receipt, &options)
+            });
+            if fault == 0 {
+                assert_eq!(retired, Ok(Some(true)));
+            } else {
+                assert!(retired.is_err(), "fault {fault}, wrapper {wrapper}");
+            }
+            let store = env.accounts_store_for(accounts::Cli::Codex).unwrap();
+            assert_eq!(
+                store
+                    .load_logins(env.now)
+                    .unwrap()
+                    .0
+                    .native_rotations
+                    .contains_key(&receipt.id),
+                fault != 0,
+                "fault {fault}, wrapper {wrapper}"
+            );
+            assert_eq!(
+                codex_renewal::read_receipt(&env, &receipt.id),
+                Some(receipt.clone())
+            );
+            drop(lock);
+            if fault == 2 {
+                assert_eq!(
+                    codex_renewal::with_receipt_writer(&env, |writer| {
+                        writer.retire_rolled_back_pool_record(&receipt, &options)
+                    }),
+                    Ok(Some(true))
+                );
+                assert!(
+                    !store
+                        .load_logins(env.now)
+                        .unwrap()
+                        .0
+                        .native_rotations
+                        .contains_key(&receipt.id)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn rejected_rollback_receipts_never_acknowledge_an_unrelated_native_record() {
+    use crate::harness::accounts;
+    for fault in 0..5 {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let options = opts(root.path());
+        let (state, prepare) = fixture(true, false, false);
+        let (env, mut expected) = rollback_pool_receipt(&options, &state, &prepare);
+        let key = format!("renewal-{}", prepare.id);
+        upgrade_drive::save_checked(&options, &key, &state).unwrap();
+        let native_path = options.state.join("upgrade").join(format!("{key}.json"));
+        let store = env.accounts_store_for(accounts::Cli::Codex).unwrap();
+        let native_before = std::fs::read(&native_path).unwrap();
+        let pool_before = std::fs::read(store.logins_file()).unwrap();
+        match fault {
+            0 => {
+                expected.intent.purpose = codex_renewal::Purpose::Login;
+                expected.destination = None;
+            }
+            1 => expected.row_stamp.push_str("-stale"),
+            2 => expected.id = "cd".repeat(16),
+            3 => expected.phase = codex_renewal::Phase::Committing,
+            _ => expected.candidate.as_mut().unwrap().forward = true,
+        }
+        if fault >= 2 {
+            codex_renewal::with_receipt_writer(&env, |_| {
+                codex_renewal::write_receipt(&env, &expected)
+            })
+            .unwrap()
+            .unwrap();
+        }
+        let receipt_before = codex_renewal::read_receipt(&env, &expected.id);
+        let result = codex_renewal::with_receipt_writer(&env, |writer| {
+            writer.retire_rolled_back_pool_record(&expected, &options)
+        });
+        if fault == 0 {
+            assert_eq!(result, Ok(Some(false)));
+        } else {
+            assert!(result.is_err(), "fault {fault}");
+        }
+        assert_eq!(
+            std::fs::read(&native_path).unwrap(),
+            native_before,
+            "fault {fault}"
+        );
+        assert_eq!(
+            std::fs::read(store.logins_file()).unwrap(),
+            pool_before,
+            "fault {fault}"
+        );
+        assert_eq!(
+            codex_renewal::read_receipt(&env, &expected.id),
+            receipt_before
+        );
+    }
+}
+
 fn corrupt(st: &mut St, expected: &mut Prepare, fault: i64) {
     match fault {
         0 | 1 => {}

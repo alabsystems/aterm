@@ -3,6 +3,7 @@
 
 //! Manual native publisher measurement using real loopback HTTP Git services.
 //! Build this and agh with --profile opt-test; pass the built agh executable.
+//! Optional second argument: children, for accepted Git-door timing and nested accounting.
 //! The interval includes permit construction, journal opening and push_atomic.
 
 #[cfg(all(unix, debug_assertions))]
@@ -13,12 +14,16 @@ mod git_provenance;
 mod journal_fixture;
 
 #[cfg(all(unix, debug_assertions))]
+#[path = "support/git_children.rs"]
+mod git_children;
+
+#[cfg(all(unix, debug_assertions))]
 mod native {
     use crate::journal_fixture::{
         git, object_kind, path, phase_observation, retained_history, same_tree_child,
     };
     use agh::config::{self, Dirs};
-    use agh::fx::NativePushTiming;
+    use agh::fx::{GitChildTiming, NativePushTiming};
     use agh::git::{GitRun, HelperCommand};
     use agh::github::refs::{AtomicRefBatch, RefUpdate};
     use agh::identity::MapEnv;
@@ -54,6 +59,7 @@ mod native {
         batch: AtomicRefBatch,
         before_objects: String,
         spans: Probe,
+        children: Arc<Mutex<Vec<GitChildTiming>>>,
         _root: aterm_tempfile::TempDir,
     }
 
@@ -63,6 +69,7 @@ mod native {
             source: &Path,
             seed: &Path,
             case: &Case,
+            observe_children: bool,
         ) -> Result<Self, Box<dyn Error>> {
             let root = aterm_tempfile::Builder::new()
                 .prefix("native-http-call-")
@@ -153,6 +160,18 @@ read = ["anonymous"]
                         .push(span);
                 },
             );
+            let children = Arc::new(Mutex::new(Vec::new()));
+            let fx = if observe_children {
+                let captured = Arc::clone(&children);
+                fx.with_git_child_observer_for_tests(move |span| {
+                    captured
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(span);
+                })
+            } else {
+                fx
+            };
             let ports = fake.ports();
             let client = GithubBuilder::new(Router::from_validated(validated))
                 .transport(Arc::new(agh::wire::http::HttpTransport::direct(Arc::new(
@@ -192,6 +211,7 @@ read = ["anonymous"]
                 batch,
                 before_objects,
                 spans,
+                children,
                 _root: root,
             })
         }
@@ -316,9 +336,10 @@ read = ["anonymous"]
             .skip(1)
             .filter(|a| a != "--bench")
             .collect();
-        if args.len() != 1 {
-            return Err("usage: native_http_publisher AGH_HELPER".into());
+        if !(args.len() == 1 || (args.len() == 2 && args[1] == "children")) {
+            return Err("usage: native_http_publisher AGH_HELPER [children]".into());
         }
+        let observe_children = args.len() == 2;
         let helper = std::fs::canonicalize(&args[0])?;
         let root = aterm_tempfile::Builder::new()
             .prefix("native-http-study-")
@@ -407,7 +428,7 @@ read = ["anonymous"]
         let seed_objects = git(&seed, &["count-objects", "-v"])?;
         emit(
             "metadata",
-            json!({"calls":12,"pairs":6,"cases":cases.iter().map(|c|json!({"case":c.name,"before":c.before,"after":c.after})).collect::<Vec<_>>(),"updates_per_call":2,"new_objects_each":1,"new_commit_bytes_each":bytes.parse::<u64>()?,
+            json!({"child_observation":observe_children,"calls":12,"pairs":6,"cases":cases.iter().map(|c|json!({"case":c.name,"before":c.before,"after":c.after})).collect::<Vec<_>>(),"updates_per_call":2,"new_objects_each":1,"new_commit_bytes_each":bytes.parse::<u64>()?,
             "same_current_tree":true,"current_tree":tree,"current_tree_entries":73,"current_toml_paths":72,
             "tiny_commits_after":2,"retained_commits_after":2573,"tiny_closure_objects":git(&source,&["rev-list","--objects",&cases[0].after])?.lines().count(),
             "retained_closure_objects":git(&source,&["rev-list","--objects",&cases[1].after])?.lines().count(),
@@ -417,7 +438,7 @@ read = ["anonymous"]
         )?;
 
         for control in ["known", "refused", "unknown"] {
-            let fixture = Fixture::new(&helper, &source, &seed, &cases[0])?;
+            let fixture = Fixture::new(&helper, &source, &seed, &cases[0], observe_children)?;
             if control == "refused" {
                 std::fs::write(
                     fixture.backend.repository().join("refs/heads/main.lock"),
@@ -499,21 +520,38 @@ read = ["anonymous"]
             let order = if pair % 2 == 0 { [0, 1] } else { [1, 0] };
             for (position, index) in order.into_iter().enumerate() {
                 let case = &cases[index];
-                let fixture = Fixture::new(&helper, &source, &seed, case)?;
+                let fixture = Fixture::new(&helper, &source, &seed, case, observe_children)?;
                 let began = Instant::now();
                 let result = fixture.publish();
                 let finished = Instant::now();
                 let spans = fixture.spans.lock().unwrap_or_else(PoisonError::into_inner);
                 let (phases, phases_valid) = phase_observation(&spans, began, finished);
+                let (children, children_valid) = if observe_children {
+                    let children = fixture
+                        .children
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .clone();
+                    crate::git_children::observation(
+                        &fixture.client,
+                        &children,
+                        &spans,
+                        began,
+                        finished,
+                    )
+                } else {
+                    (json!(null), true)
+                };
+
                 drop(spans);
                 let evidence = fixture.evidence(case, true, false);
                 emit(
                     "sample",
                     json!({"pair":pair,"position":position,"case":case.name,"wall_ns":finished.duration_since(began).as_nanos(),
-                    "ok":result.is_ok(),"error_kind":result.as_ref().err().map(|e|format!("{:?}",e.kind)),"native_phases":phases,"phases_valid":phases_valid,
+                    "ok":result.is_ok(),"error_kind":result.as_ref().err().map(|e|format!("{:?}",e.kind)),"native_phases":phases,"phases_valid":phases_valid,"git_children":children,"children_valid":children_valid,
                     "evidence":evidence.as_ref().ok().map(|(v,_)|v)}),
                 )?;
-                if result.is_err() || !phases_valid || !evidence?.1 {
+                if result.is_err() || !phases_valid || !children_valid || !evidence?.1 {
                     return Err("publisher sample failed; attempted row retained".into());
                 }
             }

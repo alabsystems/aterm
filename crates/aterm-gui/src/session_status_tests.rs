@@ -3798,16 +3798,6 @@ const BOX_BLOCKED: &[u8] = b"\x1b]7501;state=blocked:app=codex:kind=permission\x
 
 impl BoxRig {
     fn new() -> Self {
-        Self::build(false)
-    }
-
-    /// The rig with `desktop_alerts = true`, nobody looking at the session and the notifier's
-    /// queue taking the herald's notices.
-    fn alerting() -> Self {
-        Self::build(true)
-    }
-
-    fn build(alerts: bool) -> Self {
         use super::program::{LeaderFacts, ProgramResolver};
         let mut app = crate::App::headless_for_test();
         app.session_factory.fg_probe = |master| master;
@@ -3822,11 +3812,6 @@ impl BoxRig {
         let sid = app.next_session_id;
         app.push_stub_tab(crate::WindowId(0), crate::stub_session(sid));
         app.headless = false;
-        if alerts {
-            app.config.desktop_alerts = Some(true);
-            app.notify_suppress.lock().unwrap().clear();
-            crate::app_tabs::HERALD_REFUSAL.set(None);
-        }
         let (term, ctx) = {
             let pooled = app.pool.get(sid).expect("pooled");
             (Arc::clone(&pooled.term), pooled.ctx.clone())
@@ -3841,7 +3826,6 @@ impl BoxRig {
         rig.front(BOX_CODEX, "codex");
         rig.write(BOX_WORKING);
         rig.sweep();
-        let _ = Self::posts();
         rig
     }
 
@@ -3881,11 +3865,6 @@ impl BoxRig {
     fn need(&self) -> Option<crate::needs::Need> {
         self.ctx.timeline.lock().unwrap().need().need.clone()
     }
-
-    /// The herald's notices on this thread since the last call.
-    fn posts() -> Vec<crate::status_item::HeraldNotice> {
-        crate::app_tabs::HERALD_POSTS.with(|p| std::mem::take(&mut *p.borrow_mut()))
-    }
 }
 
 /// A SECOND BOX BETWEEN TWO SWEEPS IS A NEW BOX: codex goes `working` and then to a second box
@@ -3903,16 +3882,16 @@ fn a_second_box_between_two_sweeps_is_a_new_need() {
     assert_ne!(second.report, first.report, "and its own report");
 }
 
-/// A PROGRAM'S NOTIFICATION PASSES THE BOX THE HERALD TOLD: with `desktop_alerts = true` the
-/// herald posts its one notice for codex's box, and codex's own OSC 9, OSC 99 and OSC 777,
-/// written while that box stands into a terminal wired as a spawn wires it
+/// A PROGRAM'S NOTIFICATION PASSES A BOX THE SWEEP PUBLISHED: codex's box stands, its need is
+/// published (the glance lists it and the herald keeps its age), and codex's own OSC 9, OSC 99
+/// and OSC 777, written while that box stands into a terminal wired as a spawn wires it
 /// (`spawn::configure_notifications`), each reach the notifier's queue once, as the session's,
 /// with their words.
 #[test]
-fn a_program_notification_passes_the_box_the_herald_told() {
+fn a_program_notification_passes_a_box_the_sweep_published() {
     const WORDS: &str = "Approval requested: rm -rf build";
-    let mut rig = BoxRig::alerting();
-    let (tx, queued) = crate::notify::Notifier::channel();
+    let mut rig = BoxRig::new();
+    let (tx, queued) = std::sync::mpsc::sync_channel(16);
     let _ = crate::term_lock(&rig.term).apply_config(&aterm_core::config::TerminalConfig {
         allow_notifications: true,
         ..aterm_core::config::TerminalConfig::default()
@@ -3928,9 +3907,13 @@ fn a_program_notification_passes_the_box_the_herald_told() {
     rig.sweep();
     assert!(rig.need().is_some(), "PRECONDITION: the box stands");
     assert_eq!(
-        BoxRig::posts().len(),
+        rig.app.status_glance().need_count(),
         1,
-        "PRECONDITION: the herald told the box"
+        "PRECONDITION: the glance lists it"
+    );
+    assert!(
+        rig.app.presence.herald.need_since(rig.sid).is_some(),
+        "PRECONDITION: the herald keeps its age"
     );
     for notice in [
         format!("\x1b]9;{WORDS}\x07"),

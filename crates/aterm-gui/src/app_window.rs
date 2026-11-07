@@ -1795,7 +1795,7 @@ impl App {
         };
         let exits_app = self.exits_app_when_closing(wid);
         if self.config.restore_session_or_default() && exits_app {
-            self.quit_capture = Some(self.capture_desk_manifest());
+            self.quit_capture = Some(self.capture_restore_manifest());
         }
         let ids = self.window_terminal_sessions(wid);
         let view_ids: Vec<crate::tab_model::ViewId> = ws

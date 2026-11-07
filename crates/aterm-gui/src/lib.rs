@@ -10511,7 +10511,6 @@ struct App {
     present_observer: crate::metrics::PresentObserver,
     notify_suppress: Arc<Mutex<std::collections::HashSet<u64>>>,
     notify_silent: Arc<AtomicBool>,
-    notify_own_alerts: Arc<AtomicBool>,
     #[cfg(target_os = "macos")]
     notice_center: notice_center::NoticeCenter,
     font_family: Option<String>,
@@ -10872,32 +10871,6 @@ impl App {
             && self
                 .serious_mode_policy()
                 .allows(crate::motion::SeriousEffect::OutputStreak)
-    }
-
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "DesktopAlertDebt",
-            action = "Enable",
-            project = "aterm_gui::status_item::desktop_alert_debt_conformance::Rig::project"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "DesktopAlertDebt",
-            action = "Disable",
-            project = "aterm_gui::status_item::desktop_alert_debt_conformance::Rig::project"
-        )
-    )]
-    pub(crate) fn apply_desktop_alerts(&mut self, enabled: bool) {
-        let was = self.notify_own_alerts.swap(enabled, Ordering::AcqRel);
-        if !enabled {
-            self.presence.herald.suppress_pending_desktop_notices();
-        } else if !was {
-            // Turned on: what the herald marked told with alerts off was never posted (§14.18).
-            self.presence.herald.forget_told();
-        }
     }
 
     fn apply_serious_mode(&mut self, enabled: bool) -> bool {
@@ -15157,13 +15130,11 @@ impl App {
 
         let notify_suppress = Arc::new(Mutex::new(std::collections::HashSet::from([0u64])));
         let notify_silent = Arc::new(AtomicBool::new(false));
-        let notify_own_alerts = Arc::new(AtomicBool::new(false));
         let notice_center = notice_center::NoticeCenter::inert();
         let notify_tx = platform::headless_fixture_apprt(platform::platform_apprt())
             .send_notification_init(
                 notify_suppress.clone(),
                 notify_silent.clone(),
-                notify_own_alerts.clone(),
                 notice_center,
             );
 
@@ -15562,7 +15533,6 @@ impl App {
             present_observer: crate::metrics::PresentObserver::default(),
             notify_suppress,
             notify_silent,
-            notify_own_alerts,
             #[cfg(target_os = "macos")]
             notice_center,
             search_sticky_case: false,
@@ -21555,7 +21525,7 @@ const PKG_PROGRESS_TICKS: PkgProgressTicks = PkgProgressTicks {
 struct PkgProgressTailer {
     stop: Arc<AtomicBool>,
     holder_advanced: Arc<AtomicBool>,
-    handle: std::thread::JoinHandle<()>,
+    handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PkgProgressTailer {
@@ -21640,15 +21610,27 @@ impl PkgProgressTailer {
         Some(Self {
             stop,
             holder_advanced,
-            handle,
+            handle: Some(handle),
         })
     }
 
-    fn finish(self) -> bool {
-        self.stop.store(true, Ordering::Release);
-        self.handle.thread().unpark();
-        let _ = self.handle.join();
+    fn finish(mut self) -> bool {
+        self.stop_and_join();
         self.holder_advanced.load(Ordering::Acquire)
+    }
+
+    fn stop_and_join(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for PkgProgressTailer {
+    fn drop(&mut self) {
+        self.stop_and_join();
     }
 }
 
@@ -23079,44 +23061,130 @@ fn run_pass_child<P: Fn(Wake) + Clone + Send + 'static>(
     post: &P,
     spawned: &dyn Fn(u32),
 ) -> std::io::Result<(PassRun, std::io::Result<std::process::ExitStatus>)> {
+    #[cfg(unix)]
+    {
+        run_streamed_pass_child(cmd, layout, first_run, waiter, post, spawned)
+    }
+    #[cfg(not(unix))]
+    {
+        let pass_seq_before = layout.and_then(atpkg::status::read).map(|s| s.pass_seq);
+        let mut child = cmd.spawn()?;
+        spawned(child.id());
+        let tailer = layout.cloned().and_then(|l| {
+            let post = post.clone();
+            PkgProgressTailer::spawn(l, child.id(), waiter, move |snapshot| {
+                post(Wake::PkgProgress {
+                    snapshot,
+                    first_run,
+                });
+            })
+        });
+        let mut refusal = child.stderr.take();
+        let mut seen = SeedMarkers::default();
+        let said = std::thread::scope(|scope| {
+            let drain = refusal
+                .as_mut()
+                .map(|pipe| scope.spawn(move || read_pass_stderr(pipe)));
+            if let Some(out) = child.stdout.take() {
+                seen = read_seed_markers(std::io::BufReader::new(out), |event| {
+                    post(tag_first_run(event, first_run));
+                });
+            }
+            match drain {
+                Some(drain) => match drain.join() {
+                    Ok((said, unread)) => {
+                        seen.stderr_unread = unread;
+                        said
+                    }
+                    Err(_) => {
+                        seen.stderr_unread = true;
+                        String::new()
+                    }
+                },
+                None => String::new(),
+            }
+        });
+        let status = child.wait();
+        let holder_advanced = tailer.is_some_and(PkgProgressTailer::finish);
+        let run = PassRun {
+            seen,
+            code: status
+                .as_ref()
+                .ok()
+                .and_then(std::process::ExitStatus::code),
+            holder_advanced,
+            said,
+            pass_seq_before,
+        };
+        Ok((run, status))
+    }
+}
+
+#[cfg(unix)]
+fn run_streamed_pass_child<P: Fn(Wake) + Clone + Send + 'static>(
+    cmd: &mut aterm_uds::spawnfd::Command,
+    layout: Option<&atpkg::store::Layout>,
+    first_run: bool,
+    waiter: aterm_messages::Waiter,
+    post: &P,
+    spawned: &dyn Fn(u32),
+) -> std::io::Result<(PassRun, std::io::Result<std::process::ExitStatus>)> {
+    use aterm_uds::deadline::{ChildOutput, stream_until_stopped};
     let pass_seq_before = layout.and_then(atpkg::status::read).map(|s| s.pass_seq);
-    let mut child = cmd.spawn()?;
-    spawned(child.id());
-    let tailer = layout.cloned().and_then(|l| {
-        let post = post.clone();
-        PkgProgressTailer::spawn(l, child.id(), waiter, move |snapshot| {
-            post(Wake::PkgProgress {
-                snapshot,
-                first_run,
+    let mut started = false;
+    let mut tailer = None;
+    let mut frames = PassMarkerFrames::new(PASS_STDOUT_LINE_MAX);
+    let mut seen = SeedMarkers::default();
+    let mut stderr = PassStderrTail::default();
+    let mut emit = |event| post(tag_first_run(event, first_run));
+    let result = stream_until_stopped(
+        cmd,
+        None,
+        |pid| {
+            started = true;
+            spawned(pid);
+            tailer = layout.cloned().and_then(|layout| {
+                let post = post.clone();
+                PkgProgressTailer::spawn(layout, pid, waiter, move |snapshot| {
+                    post(Wake::PkgProgress {
+                        snapshot,
+                        first_run,
+                    });
+                })
             });
+        },
+        |stream, chunk| {
+            match stream {
+                ChildOutput::Stdout => {
+                    frames.push(chunk, |raw| record_seed_frame(raw, &mut seen, &mut emit))
+                }
+                ChildOutput::Stderr => stderr.push(chunk),
+            }
+            Ok(())
+        },
+        // Helpers may create independent process groups. Retiring this root alone is not
+        // sufficient cancellation authority for a package operation that still mutates.
+        || false,
+    );
+    let eof = matches!(&result, Ok(Some(_)));
+    seen.stdout_unread = frames.finish(eof, |raw| record_seed_frame(raw, &mut seen, &mut emit));
+    seen.stderr_unread = !eof;
+    if seen.saw_machine_change && !seen.saw_machine_state {
+        emit(Wake::PkgMachineRecordMissing);
+    }
+    let status = result.and_then(|status| {
+        status.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "atpkg output capture stopped",
+            )
         })
     });
-    let mut refusal = child.stderr.take();
-    let mut seen = SeedMarkers::default();
-    let said = std::thread::scope(|scope| {
-        let drain = refusal
-            .as_mut()
-            .map(|pipe| scope.spawn(move || read_pass_stderr(pipe)));
-        if let Some(out) = child.stdout.take() {
-            seen = read_seed_markers(std::io::BufReader::new(out), |event| {
-                post(tag_first_run(event, first_run));
-            });
-        }
-        match drain {
-            Some(drain) => match drain.join() {
-                Ok((said, unread)) => {
-                    seen.stderr_unread = unread;
-                    said
-                }
-                Err(_) => {
-                    seen.stderr_unread = true;
-                    String::new()
-                }
-            },
-            None => String::new(),
-        }
-    });
-    let status = child.wait();
+    if !started {
+        return Err(status
+            .err()
+            .unwrap_or_else(|| std::io::Error::other("atpkg did not start")));
+    }
     let holder_advanced = tailer.is_some_and(PkgProgressTailer::finish);
     let run = PassRun {
         seen,
@@ -23125,7 +23193,7 @@ fn run_pass_child<P: Fn(Wake) + Clone + Send + 'static>(
             .ok()
             .and_then(std::process::ExitStatus::code),
         holder_advanced,
-        said,
+        said: stderr.finish(),
         pass_seq_before,
     };
     Ok((run, status))
@@ -23158,24 +23226,47 @@ fn tag_first_run(event: Wake, first_run: bool) -> Wake {
 const PASS_STDERR_KEEP: usize = 64 * 1024;
 const PASS_STDERR_OMITTED: &str = "[earlier atpkg output omitted]\n";
 
+#[derive(Default)]
+struct PassStderrTail {
+    bytes: std::collections::VecDeque<u8>,
+    omitted: bool,
+}
+
+impl PassStderrTail {
+    fn push(&mut self, chunk: &[u8]) {
+        let skip = chunk.len().saturating_sub(PASS_STDERR_KEEP);
+        let chunk = &chunk[skip..];
+        let cut = self
+            .bytes
+            .len()
+            .saturating_add(chunk.len())
+            .saturating_sub(PASS_STDERR_KEEP);
+        self.omitted |= skip != 0 || cut != 0;
+        self.bytes.drain(..cut);
+        self.bytes.extend(chunk);
+    }
+
+    fn finish(mut self) -> String {
+        let mut said = String::from_utf8_lossy(self.bytes.make_contiguous()).into_owned();
+        if self.omitted {
+            said.insert_str(0, PASS_STDERR_OMITTED);
+        }
+        said
+    }
+}
+
 /// Drain the entire pipe while retaining only a bounded diagnostic tail. The omission
 /// marker distinguishes lost history from a child that said nothing.
+#[cfg(any(test, not(unix)))]
 fn read_pass_stderr<R: std::io::Read>(mut pipe: R) -> (String, bool) {
-    let mut bytes = std::collections::VecDeque::with_capacity(PASS_STDERR_KEEP);
+    let mut tail = PassStderrTail::default();
     let mut chunk = [0; 8192];
-    let mut omitted = false;
     let mut unread = false;
     loop {
         match pipe.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
-                let cut = bytes
-                    .len()
-                    .saturating_add(n)
-                    .saturating_sub(PASS_STDERR_KEEP);
-                omitted |= cut != 0;
-                bytes.drain(..cut);
-                bytes.extend(&chunk[..n]);
+                tail.push(&chunk[..n]);
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => {
@@ -23184,11 +23275,7 @@ fn read_pass_stderr<R: std::io::Read>(mut pipe: R) -> (String, bool) {
             }
         }
     }
-    let mut said = String::from_utf8_lossy(bytes.make_contiguous()).into_owned();
-    if omitted {
-        said.insert_str(0, PASS_STDERR_OMITTED);
-    }
-    (said, unread)
+    (tail.finish(), unread)
 }
 
 fn carry_wait_row(
@@ -24567,107 +24654,129 @@ const PASS_STDOUT_UNREAD: &str = "atpkg stdout contained an unreadable or oversi
 const PASS_STDERR_UNREAD: &str = "atpkg stderr could not be read completely";
 const PASS_OUTPUT_UNREAD: &str = "atpkg stdout and stderr could not be read completely";
 
-/// Read a complete frame, excluding LF. Discard oversized frames through their newline,
-/// never exposing a prefix or suffix as a marker, and keep reading the following frames.
-fn read_pass_marker_line<R: std::io::BufRead>(
-    out: &mut R,
+/// Incrementally frame stdout without turning a pipe chunk or a cancelled read into EOF.
+/// Oversized frames are discarded through LF, retaining no parseable prefix or suffix.
+struct PassMarkerFrames {
     max: usize,
-    oversized: &mut bool,
-) -> std::io::Result<Option<Vec<u8>>> {
-    loop {
-        let mut raw = Vec::new();
-        let n = {
-            let mut limited = std::io::Read::take(&mut *out, (max as u64).saturating_add(1));
-            std::io::BufRead::read_until(&mut limited, b'\n', &mut raw)?
-        };
-        if n == 0 {
-            return Ok(None);
+    raw: Vec<u8>,
+    discarding: bool,
+    oversized: bool,
+}
+
+impl PassMarkerFrames {
+    fn new(max: usize) -> Self {
+        Self {
+            max,
+            raw: Vec::new(),
+            discarding: false,
+            oversized: false,
         }
-        let newline = raw.last() == Some(&b'\n');
-        if newline {
-            raw.pop();
-        }
-        if raw.len() <= max {
-            return Ok(Some(raw));
-        }
-        if !*oversized {
-            aterm_log::info!("atpkg stdout: discarded a frame above {max} bytes");
-        }
-        *oversized = true;
-        if !newline {
-            loop {
-                let chunk = match out.fill_buf() {
-                    Ok(chunk) => chunk,
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(error) => return Err(error),
-                };
-                if chunk.is_empty() {
-                    return Ok(None);
-                }
-                let newline = chunk.iter().position(|byte| *byte == b'\n');
-                let consumed = newline.map_or(chunk.len(), |at| at + 1);
-                out.consume(consumed);
-                if newline.is_some() {
-                    break;
+    }
+
+    fn push(&mut self, mut chunk: &[u8], mut frame: impl FnMut(&[u8])) {
+        while !chunk.is_empty() {
+            let newline = chunk.iter().position(|byte| *byte == b'\n');
+            let end = newline.unwrap_or(chunk.len());
+            if !self.discarding {
+                if self.raw.len().saturating_add(end) > self.max {
+                    if !self.oversized {
+                        aterm_log::info!(
+                            "atpkg stdout: discarded a frame above {} bytes",
+                            self.max
+                        );
+                    }
+                    self.oversized = true;
+                    self.discarding = true;
+                    self.raw.clear();
+                } else {
+                    self.raw.extend_from_slice(&chunk[..end]);
                 }
             }
+            if newline.is_none() {
+                break;
+            }
+            if !self.discarding {
+                frame(&self.raw);
+            }
+            self.raw.clear();
+            self.discarding = false;
+            chunk = &chunk[end + 1..];
         }
+    }
+
+    /// Only a known EOF admits the final unterminated frame. Return whether output is unread.
+    fn finish(self, eof: bool, mut frame: impl FnMut(&[u8])) -> bool {
+        if eof && !self.discarding && !self.raw.is_empty() {
+            frame(&self.raw);
+        }
+        self.oversized || !eof
     }
 }
 
 fn read_seed_markers<R: std::io::BufRead>(mut out: R, mut post: impl FnMut(Wake)) -> SeedMarkers {
     let mut seen = SeedMarkers::default();
-    let mut oversized = false;
+    let mut frames = PassMarkerFrames::new(PASS_STDOUT_LINE_MAX);
+    let eof;
     loop {
-        let raw = match read_pass_marker_line(&mut out, PASS_STDOUT_LINE_MAX, &mut oversized) {
-            Ok(Some(raw)) => raw,
-            Ok(None) => break,
+        let chunk = match out.fill_buf() {
+            Ok([]) => {
+                eof = true;
+                break;
+            }
+            Ok(chunk) => chunk,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => {
-                seen.stdout_unread = true;
                 aterm_log::info!("atpkg stdout could not be read: {error}");
+                eof = false;
                 break;
             }
         };
-        let line = String::from_utf8_lossy(&raw);
-        let line = line.trim_end_matches('\r');
-        if line
-            .strip_prefix("atpkg: ")
-            .is_some_and(|rest| rest.starts_with(atpkg::cli::SEED_BUSY_MARKER))
-        {
-            seen.saw_terminal = true;
-            seen.saw_busy = true;
-            continue;
-        }
-        let Some(event) = parse_seed_line(line) else {
-            if let Some(said) = line.strip_prefix("atpkg: ") {
-                aterm_log::info!("atpkg said: {said}");
-            }
-            continue;
-        };
-        {
-            if matches!(event, Wake::PkgSeedStarted { .. }) {
-                // Only an opened announcement leaves a held card to retire.
-                seen.saw_start = true;
-            } else if matches!(event, Wake::PkgLockWaiting { .. }) {
-                // Its `lock-acquired:` touches neither flag; the wait stays seen for the
-                // lane's exit accounting.
-                seen.saw_lock_wait = true;
-            } else if seed_event_is_terminal(&event) {
-                seen.saw_terminal = true;
-                seen.saw_failure |= seed_event_is_failure(&event);
-            } else if matches!(event, Wake::PkgMachineSettings(_)) {
-                seen.saw_machine_change = true;
-            } else if matches!(event, Wake::PkgMachineState(_)) {
-                seen.saw_machine_state = true;
-            }
-            post(event);
-        }
+        let consumed = chunk.len();
+        frames.push(chunk, |raw| record_seed_frame(raw, &mut seen, &mut post));
+        out.consume(consumed);
     }
-    seen.stdout_unread |= oversized;
+    seen.stdout_unread = frames.finish(eof, |raw| record_seed_frame(raw, &mut seen, &mut post));
     if seen.saw_machine_change && !seen.saw_machine_state {
         post(Wake::PkgMachineRecordMissing);
     }
     seen
+}
+
+fn record_seed_frame(raw: &[u8], seen: &mut SeedMarkers, post: &mut impl FnMut(Wake)) {
+    let line = String::from_utf8_lossy(raw);
+    let line = line.trim_end_matches('\r');
+    if line
+        .strip_prefix("atpkg: ")
+        .is_some_and(|rest| rest.starts_with(atpkg::cli::SEED_BUSY_MARKER))
+    {
+        seen.saw_terminal = true;
+        seen.saw_busy = true;
+        return;
+    }
+    let Some(event) = parse_seed_line(line) else {
+        if let Some(said) = line.strip_prefix("atpkg: ") {
+            aterm_log::info!("atpkg said: {said}");
+        }
+        return;
+    };
+    {
+        if matches!(event, Wake::PkgSeedStarted { .. }) {
+            // Only an opened announcement leaves a held card to retire.
+            seen.saw_start = true;
+        } else if matches!(event, Wake::PkgLockWaiting { .. }) {
+            // Its `lock-acquired:` touches neither flag; the wait stays seen for the
+            // lane's exit accounting.
+            seen.saw_lock_wait = true;
+        } else if seed_event_is_terminal(&event) {
+            seen.saw_terminal = true;
+            seen.saw_failure |= seed_event_is_failure(&event);
+        } else if matches!(event, Wake::PkgMachineSettings(_)) {
+            seen.saw_machine_change = true;
+        } else if matches!(event, Wake::PkgMachineState(_)) {
+            seen.saw_machine_state = true;
+        }
+        post(event);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27083,12 +27192,10 @@ pub fn main_entry_with_network(
 
     let notify_suppress = Arc::new(Mutex::new(std::collections::HashSet::from([0u64])));
     let notify_silent = Arc::new(AtomicBool::new(config.serious_mode_or_default()));
-    let notify_own_alerts = Arc::new(AtomicBool::new(config.desktop_alerts_or_default()));
     let notice_center = notice_center::NoticeCenter::for_instance(headless);
     let notify_tx = platform::platform_apprt().send_notification_init(
         notify_suppress.clone(),
         notify_silent.clone(),
-        notify_own_alerts.clone(),
         notice_center,
     );
 
@@ -28454,7 +28561,6 @@ pub fn main_entry_with_network(
         present_observer: crate::metrics::PresentObserver::default(),
         notify_suppress,
         notify_silent,
-        notify_own_alerts,
         #[cfg(target_os = "macos")]
         notice_center,
         search_sticky_case: false,
@@ -28888,7 +28994,7 @@ pub fn main_entry_with_network(
         let mut manifest = app
             .quit_capture
             .take()
-            .unwrap_or_else(|| app.capture_desk_manifest());
+            .unwrap_or_else(|| app.capture_restore_manifest());
         let keeps = app.desk.quit_keeps_agents(system_quit::asked());
         app.quit_agents(&mut manifest, keeps);
         let run = app.crash_journal.run().map(crash_journal::JournalId::stem);

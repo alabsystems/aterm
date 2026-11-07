@@ -337,17 +337,14 @@ fn an_unterminated_stdout_marker_lost_to_io_error_cannot_prove_success() {
 #[test]
 fn pass_frame_boundaries_preserve_exact_limits_and_recover_after_interruption() {
     for data in [b"abc".as_slice(), b"abc\n".as_slice()] {
-        let mut input = std::io::Cursor::new(data);
-        let mut oversized = false;
-        assert_eq!(
-            super::read_pass_marker_line(&mut input, 3, &mut oversized).unwrap(),
-            Some(b"abc".to_vec())
-        );
-        assert_eq!(
-            super::read_pass_marker_line(&mut input, 3, &mut oversized).unwrap(),
-            None
-        );
-        assert!(!oversized);
+        for split in 0..=data.len() {
+            let mut frames = super::PassMarkerFrames::new(3);
+            let mut got = Vec::new();
+            frames.push(&data[..split], |raw| got.push(raw.to_vec()));
+            frames.push(&data[split..], |raw| got.push(raw.to_vec()));
+            assert!(!frames.finish(true, |raw| got.push(raw.to_vec())));
+            assert_eq!(got, [b"abc".to_vec()]);
+        }
     }
 
     struct InterruptedOnThird {
@@ -363,27 +360,75 @@ fn pass_frame_boundaries_preserve_exact_limits_and_recover_after_interruption() 
             std::io::Read::read(&mut self.data, buf)
         }
     }
-    let mut input = std::io::BufReader::with_capacity(
+    let input = std::io::BufReader::with_capacity(
         2,
         InterruptedOnThird {
-            data: std::io::Cursor::new(b"overlong\nok\r\nend"),
+            data: std::io::Cursor::new(b"atpkg: net-starting: ready\r\n"),
             reads: 0,
         },
     );
-    let mut oversized = false;
-    assert_eq!(
-        super::read_pass_marker_line(&mut input, 3, &mut oversized).unwrap(),
-        Some(b"ok\r".to_vec())
+    let expected = read_seed_markers(
+        std::io::Cursor::new(b"atpkg: net-starting: ready\r\n"),
+        |_| {},
     );
-    assert!(oversized);
-    assert_eq!(
-        super::read_pass_marker_line(&mut input, 3, &mut oversized).unwrap(),
-        Some(b"end".to_vec())
+    let seen = read_seed_markers(input, |_| {});
+    assert_eq!(seen, expected);
+    assert!(seen.saw_start);
+    assert!(!seen.stdout_unread);
+}
+
+#[test]
+fn incremental_pass_frames_discard_whole_oversize_and_unfinished_frames() {
+    let data = b"abcd\nok\r\nend";
+    for chunk_size in 1..=data.len() {
+        let mut frames = super::PassMarkerFrames::new(3);
+        let mut got = Vec::new();
+        for chunk in data.chunks(chunk_size) {
+            frames.push(chunk, |raw| got.push(raw.to_vec()));
+            assert!(frames.raw.len() <= 3);
+        }
+        assert!(frames.finish(true, |raw| got.push(raw.to_vec())));
+        assert_eq!(got, [b"ok\r".to_vec(), b"end".to_vec()]);
+    }
+    for eof in [false, true] {
+        let mut frames = super::PassMarkerFrames::new(3);
+        let mut got = Vec::new();
+        frames.push(b"ok\nend", |raw| got.push(raw.to_vec()));
+        assert_eq!(got, [b"ok".to_vec()], "a chunk boundary supplies no EOF");
+        assert_eq!(frames.finish(eof, |raw| got.push(raw.to_vec())), !eof);
+        assert_eq!(got.len(), if eof { 2 } else { 1 });
+    }
+}
+
+#[test]
+fn marker_events_and_utf8_do_not_depend_on_pipe_chunk_boundaries() {
+    let data = format!(
+        "atpkg: {}working 🙂\r\natpkg: {}complete",
+        atpkg::cli::NET_STARTING_MARKER,
+        atpkg::cli::SEED_DONE_MARKER
     );
-    assert_eq!(
-        super::read_pass_marker_line(&mut input, 3, &mut oversized).unwrap(),
-        None
-    );
+    let mut expected = Vec::new();
+    let expected_seen = read_seed_markers(std::io::Cursor::new(data.as_bytes()), |event| {
+        expected.push(format!("{event:?}"));
+    });
+    assert!(expected_seen.saw_start && expected_seen.saw_terminal);
+    for split in 0..=data.len() {
+        let mut frames = super::PassMarkerFrames::new(super::PASS_STDOUT_LINE_MAX);
+        let mut seen = SeedMarkers::default();
+        let mut events = Vec::new();
+        let mut post = |event| events.push(format!("{event:?}"));
+        frames.push(&data.as_bytes()[..split], |raw| {
+            super::record_seed_frame(raw, &mut seen, &mut post)
+        });
+        frames.push(&data.as_bytes()[split..], |raw| {
+            super::record_seed_frame(raw, &mut seen, &mut post)
+        });
+        seen.stdout_unread = frames.finish(true, |raw| {
+            super::record_seed_frame(raw, &mut seen, &mut post)
+        });
+        assert_eq!(seen, expected_seen, "split {split}");
+        assert_eq!(events, expected, "split {split}");
+    }
 }
 
 #[test]

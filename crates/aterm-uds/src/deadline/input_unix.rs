@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Owned input and complete bounded output on the deadline module's Unix poll loop.
+//! Owned input, bounded capture and streaming output on one Unix poll loop.
 
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
@@ -10,7 +10,7 @@ use std::process::Output;
 use std::time::{Duration, Instant};
 
 use super::children::{PollFd, poll};
-use super::{ExitWait, POLL_MAX, deadline_now};
+use super::{ChildOutput, ExitWait, POLL_MAX, deadline_now};
 use crate::secret::Secret;
 use crate::spawnfd::{Child, Command, Stdio};
 
@@ -20,22 +20,23 @@ const REAP_TICK: Duration = Duration::from_millis(20);
 
 struct Capture {
     pipe: Option<File>,
-    bytes: Vec<u8>,
-    name: &'static str,
+    stream: ChildOutput,
 }
 
 impl Capture {
-    fn of(fd: OwnedFd, name: &'static str) -> io::Result<Self> {
+    fn of(fd: OwnedFd, stream: ChildOutput) -> io::Result<Self> {
         let pipe = File::from(fd);
         nonblocking(&pipe)?;
         Ok(Self {
             pipe: Some(pipe),
-            bytes: Vec::new(),
-            name,
+            stream,
         })
     }
 
-    fn read_ready(&mut self, limit: usize) -> io::Result<()> {
+    fn read_ready(
+        &mut self,
+        output: &mut impl FnMut(ChildOutput, &[u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
         let Some(pipe) = self.pipe.as_mut() else {
             return Ok(());
         };
@@ -43,16 +44,7 @@ impl Capture {
         match pipe.read(&mut chunk) {
             Ok(0) => self.pipe = None,
             Ok(n) => {
-                if n > limit.saturating_sub(self.bytes.len()) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "{} exceeds its complete-output bound of {limit} bytes",
-                            self.name
-                        ),
-                    ));
-                }
-                self.bytes.extend_from_slice(&chunk[..n]);
+                output(self.stream, &chunk[..n])?;
             }
             Err(why)
                 if matches!(
@@ -180,15 +172,63 @@ pub(super) fn output_with_input_until_watching(
     input: Secret,
     deadline: Instant,
     max_output: usize,
-    mut stopped: impl FnMut() -> bool,
+    stopped: impl FnMut() -> bool,
 ) -> io::Result<Option<Output>> {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let status = run_with_input_until_watching(
+        cmd,
+        Some(input),
+        Some(deadline),
+        |_| {},
+        |stream, chunk| {
+            let (bytes, name) = match stream {
+                ChildOutput::Stdout => (&mut stdout, "stdout"),
+                ChildOutput::Stderr => (&mut stderr, "stderr"),
+            };
+            if chunk.len() > max_output.saturating_sub(bytes.len()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{name} exceeds its complete-output bound of {max_output} bytes"),
+                ));
+            }
+            bytes.extend_from_slice(chunk);
+            Ok(())
+        },
+        stopped,
+    )?;
+    Ok(status.map(|status| Output {
+        status,
+        stdout,
+        stderr,
+    }))
+}
+
+pub(super) fn stream_until_stopped(
+    cmd: &mut Command,
+    deadline: Option<Instant>,
+    spawned: impl FnOnce(u32),
+    output: impl FnMut(ChildOutput, &[u8]) -> io::Result<()>,
+    stopped: impl FnMut() -> bool,
+) -> io::Result<Option<std::process::ExitStatus>> {
+    run_with_input_until_watching(cmd, None, deadline, spawned, output, stopped)
+}
+
+fn run_with_input_until_watching(
+    cmd: &mut Command,
+    input: Option<Secret>,
+    deadline: Option<Instant>,
+    spawned: impl FnOnce(u32),
+    mut output: impl FnMut(ChildOutput, &[u8]) -> io::Result<()>,
+    mut stopped: impl FnMut() -> bool,
+) -> io::Result<Option<std::process::ExitStatus>> {
     if !cfg!(any(target_vendor = "apple", target_os = "linux")) {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "owned input requires an unreaped child exit reader on Darwin or Linux",
         ));
     }
-    if deadline_now() >= deadline {
+    if deadline.is_some_and(|deadline| deadline_now() >= deadline) {
         return Err(timed_out());
     }
     if stopped() {
@@ -196,26 +236,33 @@ pub(super) fn output_with_input_until_watching(
     }
     let child = cmd
         .process_group(0)
-        .stdin(Stdio::piped())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
     let mut run = Run {
         child,
-        input: Some(input),
+        input,
         to_child: None,
         sent: 0,
         reaped: false,
     };
-    let stdin = run.child.stdin.take().ok_or_else(missing_pipe)?;
-    let stdin = File::from(OwnedFd::from(stdin));
-    nonblocking(&stdin)?;
-    run.to_child = Some(stdin);
+    spawned(run.child.id());
+    if run.input.is_some() {
+        let stdin = run.child.stdin.take().ok_or_else(missing_pipe)?;
+        let stdin = File::from(OwnedFd::from(stdin));
+        nonblocking(&stdin)?;
+        run.to_child = Some(stdin);
+    }
     let stdout = run.child.stdout.take().ok_or_else(missing_pipe)?;
     let stderr = run.child.stderr.take().ok_or_else(missing_pipe)?;
     let mut streams = [
-        Capture::of(OwnedFd::from(stdout), "stdout")?,
-        Capture::of(OwnedFd::from(stderr), "stderr")?,
+        Capture::of(OwnedFd::from(stdout), ChildOutput::Stdout)?,
+        Capture::of(OwnedFd::from(stderr), ChildOutput::Stderr)?,
     ];
     if run.input.as_ref().is_some_and(Secret::is_empty) {
         run.close_input();
@@ -233,12 +280,7 @@ pub(super) fn output_with_input_until_watching(
         if exited && streams.iter().all(|stream| stream.pipe.is_none()) {
             let status = run.child.wait()?;
             run.reaped = true;
-            let [stdout, stderr] = streams;
-            return Ok(Some(Output {
-                status,
-                stdout: stdout.bytes,
-                stderr: stderr.bytes,
-            }));
+            return Ok(Some(status));
         }
         if stopped() {
             // No output-completion claim accompanies cancellation. Close our own pipes
@@ -249,7 +291,9 @@ pub(super) fn output_with_input_until_watching(
             run.settle();
             return Ok(None);
         }
-        let left = deadline.saturating_duration_since(deadline_now());
+        let left = deadline.map_or(POLL_MAX, |deadline| {
+            deadline.saturating_duration_since(deadline_now())
+        });
         if left.is_zero() {
             return Err(timed_out());
         }
@@ -288,7 +332,7 @@ pub(super) fn output_with_input_until_watching(
             }
             match owner {
                 0 => run.write_ready()?,
-                1 | 2 => streams[owner - 1].read_ready(max_output)?,
+                1 | 2 => streams[owner - 1].read_ready(&mut output)?,
                 _ => exit.reported(),
             }
         }

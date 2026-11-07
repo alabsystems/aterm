@@ -4,6 +4,62 @@
 use super::{PassRun, PassVerdict, SeedMarkers, classify_pass_exit};
 use std::time::Duration;
 
+#[cfg(unix)]
+#[test]
+fn streamed_package_pass_preserves_markers_tail_status_and_live_delivery() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let acknowledged = dir.path().join("marker-observed");
+    let shell = aterm_uds::deadline::stand_in(std::path::Path::new("/bin/sh"));
+    let mut cmd = aterm_uds::spawnfd::command(shell);
+    cmd.args(["-c", "printf '%s\\n' \"$1\"; i=0; while [ ! -f \"$4\" ] && [ $i -lt 60 ]; do \"$5\" 1; i=$((i+1)); done; [ -f \"$4\" ] || exit 91; i=0; while [ $i -lt 32 ]; do printf '%s' \"$2\" >&2; i=$((i+1)); done; printf '\\nfinal refusal\\n' >&2; printf '%s\\n' \"$3\"; exit 7", "package-stream"])
+        .arg(format!("atpkg: {}working", atpkg::cli::NET_STARTING_MARKER))
+        .arg("x".repeat(8192))
+        .arg(format!("atpkg: {}finished", atpkg::cli::SEED_DONE_MARKER))
+        .arg(&acknowledged)
+        .arg(aterm_uds::deadline::stand_in(std::path::Path::new("/bin/sleep")));
+    let spawned = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let observer = spawned.clone();
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let posted = events.clone();
+    let (run, status) = super::run_pass_child(
+        &mut cmd,
+        None,
+        true,
+        aterm_messages::Waiter::Nobody,
+        &move |event| {
+            assert_ne!(observer.load(std::sync::atomic::Ordering::Acquire), 0);
+            if matches!(event, super::Wake::PkgSeedStarted { .. }) {
+                std::fs::write(&acknowledged, b"observed before exit").unwrap();
+            }
+            posted.lock().unwrap().push(event);
+        },
+        &|pid| spawned.store(pid, std::sync::atomic::Ordering::Release),
+    )
+    .expect("owned pass");
+    assert_eq!(status.unwrap().code(), Some(7));
+    assert_eq!(run.code, Some(7));
+    assert!(run.seen.saw_start && run.seen.saw_terminal);
+    assert!(!run.seen.stdout_unread && !run.seen.stderr_unread);
+    assert!(run.said.starts_with(super::PASS_STDERR_OMITTED));
+    assert!(run.said.ends_with("final refusal\n"));
+    assert!(run.said.len() <= super::PASS_STDERR_KEEP + super::PASS_STDERR_OMITTED.len());
+    assert!(matches!(
+        events.lock().unwrap().first(),
+        Some(super::Wake::PkgSeedStarted {
+            first_run: true,
+            ..
+        })
+    ));
+    assert_eq!(
+        aterm_uds::process::process_presence(
+            spawned
+                .load(std::sync::atomic::Ordering::Acquire)
+                .cast_signed()
+        ),
+        aterm_uds::process::ProcessPresence::Absent
+    );
+}
+
 /// Verifies `classify_pass_exit` on labelled `(exit_code, card_opened, marker_seen)` rows that
 /// reach each of its verdicts.
 #[test]

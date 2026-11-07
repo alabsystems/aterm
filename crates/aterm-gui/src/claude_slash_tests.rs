@@ -1383,6 +1383,123 @@ fn a_background_agents_wait_is_no_live_turn() {
     }
 }
 
+/// Draws a 144-column Claude Code capture (`text`, its header line dropped) under window title
+/// `title`, the cursor on its composer's caret; returns the caret's row.
+fn draw_titled(app: &mut App, wid: WindowId, session: u64, rows: &[String], title: &str) -> usize {
+    assert!(app.apply_term_resize(wid, 40, 144));
+    let caret = aterm_phase::phase::composer_draft(rows)
+        .map(|(caret, _)| caret)
+        .expect("a caret");
+    let mut screen = format!("\x1b[?2004h\x1b]2;{title}\x07\x1b[2J");
+    for (i, row) in rows.iter().enumerate() {
+        screen.push_str(&format!("\x1b[{};1H{row}", i + 1));
+    }
+    screen.push_str(&format!("\x1b[{};3H", caret + 1));
+    feed(app, session, screen.as_bytes());
+    caret
+}
+
+/// A reply drawn under a status line shows no busy sign (2.1.311 lab `mr`, MEASURED): the window
+/// title's `◐`/`◑` is the turn a press waits out, before its probe and after it, and a background
+/// shell's pill (constructed beside the measured pill) excuses no reply the title runs. The done
+/// row ends the turn whatever the title says. NEGATIVE CONTROLS: the rest glyph and no title
+/// press as the screen alone reads it.
+#[test]
+fn a_reply_drawn_under_a_status_line_holds_the_press_while_its_title_runs() {
+    use aterm_phase::prompt::fixtures::{
+        STATUSLINE_MIDREPLY_2_1_311, STATUSLINE_REPLY_DONE_2_1_311, screen,
+    };
+    let mid = screen(STATUSLINE_MIDREPLY_2_1_311);
+    let shells: Vec<String> = mid
+        .iter()
+        .map(|r| {
+            r.replace(
+                "(shift+tab to cycle)",
+                "(shift+tab to cycle) \u{00B7} 2 shells",
+            )
+        })
+        .collect();
+    assert!(
+        aterm_phase::phase::background_only(&shells),
+        "fixture guard: the pill alone is background work"
+    );
+    let done = screen(STATUSLINE_REPLY_DONE_2_1_311);
+    let cases = [
+        ("mid-reply", &mid, "\u{25D0} Claude Code", true),
+        ("mid-reply", &mid, "\u{25D1} Claude Code", true),
+        (
+            "mid-reply beside shells",
+            &shells,
+            "\u{25D0} Claude Code",
+            true,
+        ),
+        (
+            "CONTROL: mid-reply at rest",
+            &mid,
+            "\u{2733} Claude Code",
+            false,
+        ),
+        ("CONTROL: mid-reply untitled", &mid, "", false),
+        (
+            "CONTROL: shells at rest",
+            &shells,
+            "\u{2733} Claude Code",
+            false,
+        ),
+        (
+            "done under a running title",
+            &done,
+            "\u{25D0} Claude Code",
+            false,
+        ),
+    ];
+    for (name, rows, title, held) in cases {
+        let (mut app, wid, session, mut reader) = rig();
+        draw_titled(&mut app, wid, session, rows, title);
+        assert_eq!(
+            app.claude_screen_now(session).expect(name).title_live,
+            held,
+            "{name}: the lights read the title with the rows"
+        );
+        let got = app.press_slash(wid, session, Slash::TopEffort(false));
+        if held {
+            assert_eq!(got, Err(SlashRefusal::Busy), "{name}");
+            assert!(pty(&mut reader, 0).is_empty(), "{name}: nothing typed");
+        } else {
+            assert_eq!(got, Ok(()), "{name}");
+            assert_eq!(pty(&mut reader, 1), b"/", "{name}: the probe");
+        }
+    }
+    let slash = Slash::TopEffort(true);
+    for runs in [true, false] {
+        let (mut app, wid, session, mut reader) = rig();
+        let caret = draw_titled(&mut app, wid, session, &mid, "\u{2733} Claude Code");
+        app.press_slash(wid, session, slash).expect("begun at rest");
+        assert_eq!(pty(&mut reader, 1), b"/");
+        if runs {
+            feed(&app, session, "\x1b]2;\u{25D0} Claude Code\x07".as_bytes());
+        }
+        echo(&app, session, caret, "/");
+        let at = Instant::now();
+        app.advance_slash_presses(at);
+        if !runs {
+            assert_eq!(pty(&mut reader, rest(slash).len()), rest(slash), "CONTROL");
+            continue;
+        }
+        assert!(
+            pty(&mut reader, 0).is_empty(),
+            "nothing while the title runs"
+        );
+        assert_eq!(stage(&app, session), Some(Stage::Probed));
+        app.advance_slash_presses(at + ECHO);
+        assert!(pty(&mut reader, 0).is_empty(), "nothing, ever");
+        assert_eq!(
+            ended(&app, session),
+            Some(SlashEnd::Stopped(SlashRefusal::Busy))
+        );
+    }
+}
+
 fn mode_row_after_probe(app: &App, session: u64, mode: &str) {
     feed(
         app,
@@ -1567,7 +1684,7 @@ fn vim_insert_is_refused_by_its_own_check_and_normal_is_not() {
         let (mut app, wid, session, mut reader) = rig();
         draw_measured(&mut app, wid, session, text, |_| {});
         let rows: Vec<String> = text.lines().skip(1).map(str::to_owned).collect();
-        let screen = lights::read_screen(&rows).expect(name);
+        let screen = lights::read_screen(&rows, None).expect(name);
         assert_eq!(
             (screen.mode, screen.vim_insert),
             (Some(lights::Mode::Auto), insert),
@@ -1696,12 +1813,14 @@ pub(super) fn project_slash_press(
         observed.insert("named", i64::from(end == Some(SlashEnd::Done) || words));
     }
     let read = app.slash_engine_read(session);
-    let screen = read.as_ref().and_then(|r| lights::read_screen(&r.rows));
+    let screen = read
+        .as_ref()
+        .and_then(|r| lights::read_screen(&r.rows, Some(&r.title)));
     observed.insert("boxed", i64::from(screen.is_none()));
     if let (Some(r), Some(screen)) = (&read, &screen) {
         observed.insert(
             "busy",
-            i64::from(screen.busy && !aterm_phase::phase::background_only(&r.rows)),
+            i64::from(crate::claude_slash::live_turn(Some(screen), &r.rows)),
         );
     }
     if let (Some(r), Some(p)) = (&read, press)

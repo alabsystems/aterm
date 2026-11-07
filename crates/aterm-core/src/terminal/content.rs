@@ -125,16 +125,15 @@ fn push_visible_row_text(
     let end_col = effective_end.min(last_col);
 
     let base = out.len();
-    out.reserve(usize::from(end_col.saturating_sub(effective_start)).saturating_add(1));
     if let Some(row_cells) = grid.row_at_screen(row) {
-        let end_col = match trailing {
-            TrailingBlanks::Trim => Some(end_col),
-            TrailingBlanks::Written => row_cells
-                .written_len()
-                .checked_sub(1)
-                .map(|last| end_col.min(last)),
-        };
-        if let Some(end_col) = end_col {
+        // Beyond the written extent every character is an unwritten blank;
+        // Trim would discard that suffix after constructing it.
+        let end_col = row_cells
+            .written_len()
+            .checked_sub(1)
+            .map(|last| end_col.min(last));
+        if let Some(end_col) = end_col.filter(|&end| effective_start <= end) {
+            out.reserve(usize::from(end_col - effective_start) + 1);
             for col in effective_start..=end_col {
                 let start = out.len();
                 push_row_cell_text(grid, row, row_cells, col, out);
@@ -329,6 +328,35 @@ impl Terminal {
 #[cfg(test)]
 mod tests {
     use crate::terminal::Terminal;
+
+    #[test]
+    fn trimmed_written_extent_matches_a_full_cell_scan() {
+        for text in [
+            "",
+            "a",
+            "a  ",
+            "日e\u{301}",
+            "\tZ",
+            "abc\r\x1b[K",
+            "\x1b[7Gx",
+            "👩🏽‍💻a",
+        ] {
+            let mut term = Terminal::new(4, 12);
+            term.process(text.as_bytes());
+            for row in 0..4 {
+                let cells = term.grid.row_at_screen(row).unwrap();
+                let mut expected = String::new();
+                for col in 0..12 {
+                    super::push_row_cell_text(&term.grid, row, cells, col, &mut expected);
+                }
+                assert_eq!(
+                    term.get_line_text(i32::from(row), None).unwrap(),
+                    expected.trim_end(),
+                    "{text:?} row={row}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn plain_overwrite_removes_stale_hyperlink_extras_entries() {

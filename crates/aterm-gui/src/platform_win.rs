@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 
 use aterm_window::event_loop::EventLoopProxy;
@@ -12,7 +13,7 @@ use aterm_window::window::Window;
 use core::ffi::c_void;
 
 use crate::app_config::{BackgroundMaterial, WindowTheme};
-use crate::notify::Notifier;
+use crate::notify::NotifyMsg;
 use crate::platform::{
     AppRt, ReduceMotionObserver, SurfaceColorspace, ToolbarTabsModel, window_theme_to_winit,
 };
@@ -1200,10 +1201,9 @@ impl AppRt for AppRtWindows {
         &self,
         suppress: Arc<Mutex<HashSet<u64>>>,
         silent: Arc<AtomicBool>,
-        own_alerts: Arc<AtomicBool>,
         center: crate::notice_center::NoticeCenter,
-    ) -> Notifier {
-        crate::notify::spawn_delivery(suppress, silent, own_alerts, center)
+    ) -> SyncSender<NotifyMsg> {
+        crate::notify::spawn_delivery(suppress, silent, center)
     }
 
     fn install_menu(&self, proxy: &EventLoopProxy<Wake>) -> Option<menu::MenuHandle> {

@@ -72,6 +72,9 @@ aterm-models-misc = { workspace = true }
 aterm-models-render = { workspace = true }
 aterm-models-session = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libc = { workspace = true }
+
 [lints]
 workspace = true
 

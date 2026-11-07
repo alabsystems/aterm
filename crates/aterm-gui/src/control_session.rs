@@ -5067,15 +5067,10 @@ pub(crate) fn cmd_meta_harness_needs(
         Err(usage) => return Some((usage.to_string(), false)),
     };
     let count = told.as_ref().map(|told| told.needs().len());
-    let unclaimed = told.clone();
     let Some((holder, moved)) = self_claim_write(ctx, conn, prove, |meta, proven| {
         meta.tell_self_needs(proven, told)
     }) else {
-        let lab = aterm_types::dev_seam!("ATERM_DEV_LAB_NEEDS").is_some_and(|v| v == "1");
-        return Some(lab_loop_tell(lab, ctx, unclaimed).map_or_else(
-            || ("ERR denied\n".to_string(), false),
-            |moved| ("OK\n".to_string(), moved),
-        ));
+        return Some(("ERR denied\n".to_string(), false));
     };
     if moved {
         aterm_log::info!(
@@ -5085,30 +5080,6 @@ pub(crate) fn cmd_meta_harness_needs(
         );
     }
     Some(("OK\n".to_string(), moved))
-}
-
-/// A `meta set|unset harness_needs` no self-claim admits, where the dev seam `ATERM_DEV_LAB_NEEDS=1` is on (`lab`; debug and dev-seams builds only): told into the timeline's own set beside the session's `owner=needs` entry as stored now, as aterm's own loop's tell is ([`crate::harness_host::store_needs`]), so a windowed lab raises a NEEDS YOU set with no agent in the tab (`aterm-lab told-once`). Whether it moved what a reader reads; `None` with the seam off, which the verb answers `ERR denied`.
-pub(crate) fn lab_loop_tell(
-    lab: bool,
-    ctx: &SessionCtx,
-    told: Option<Arc<crate::needs::HarnessNeeds>>,
-) -> Option<bool> {
-    if !lab {
-        return None;
-    }
-    let standing = ctx
-        .meta
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .attention_owners
-        .get(crate::harness_host::NEEDS_ATTENTION_OWNER)
-        .map(str::to_string);
-    Some(
-        ctx.timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .set_harness_needs(told, standing.as_deref()),
-    )
 }
 
 /// `meta set questions|autopilot …` / `meta unset questions|autopilot` from a connection that is not Owner-class: `ERR denied`.
@@ -11371,7 +11342,6 @@ mod needs_tests {
                     others: Vec::new(),
                     program: aterm_phase::Program::Claude,
                     tail: NeedTail::CarryingOn,
-                    entry_first: None,
                 }),
                 report: None,
             }),

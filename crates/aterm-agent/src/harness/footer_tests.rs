@@ -5434,7 +5434,7 @@ fn the_pill_after_vim_inserts_indicator_is_read_as_its_mode() {
         assert_eq!(pill_indicator(row), Some("mode.auto"), "{name}");
         assert!(opens_with_pill_glyph(row), "{name}");
         assert_eq!(live_repl_row(&rows), Some(at), "{name}");
-        let screen = crate::harness::lights::read_screen(&rows).expect(name);
+        let screen = crate::harness::lights::read_screen(&rows, None).expect(name);
         assert_eq!(
             (screen.mode, screen.pill, screen.vim_insert),
             (Some(crate::harness::lights::Mode::Auto), true, true),
@@ -5445,7 +5445,7 @@ fn the_pill_after_vim_inserts_indicator_is_read_as_its_mode() {
     let at = mode_row(&rows).expect("NORMAL's mode row");
     assert!(!vim_insert(&rows[at]), "CONTROL: NORMAL draws no indicator");
     assert_eq!(pill_indicator(&rows[at]), Some("mode.auto"));
-    let screen = crate::harness::lights::read_screen(&rows).unwrap();
+    let screen = crate::harness::lights::read_screen(&rows, None).unwrap();
     assert_eq!(
         (screen.mode, screen.vim_insert),
         (Some(crate::harness::lights::Mode::Auto), false)

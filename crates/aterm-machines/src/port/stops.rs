@@ -6,11 +6,61 @@
 //! ignored. [`say_on_stop`] says one line at such a stop and lets it end the process.
 
 use std::ffi::c_int;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
 
 const STOPS: [c_int; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
 
 static CAUGHT: AtomicI32 = AtomicI32::new(0);
+
+/// Only ordinary code owns this mutex. The signal handlers touch atomics, never this state.
+static OWNERS: Mutex<Owners> = Mutex::new(Owners {
+    catches: 0,
+    sayings: 0,
+    resend: false,
+    was: None,
+});
+
+struct Owners {
+    catches: usize,
+    sayings: usize,
+    /// A deferring owner may finish before the last catching owner.
+    resend: bool,
+    was: Option<[(c_int, Option<libc::sigaction>); 4]>,
+}
+
+impl Owners {
+    /// Select the process handler from the live owners, preserving the original ignored
+    /// signals. An owner changing underneath a catch never replaces the catch's handler.
+    fn select(&mut self) {
+        let handler = if self.catches != 0 {
+            note as extern "C" fn(c_int)
+        } else if self.sayings != 0 {
+            say_then_stop as extern "C" fn(c_int)
+        } else {
+            if let Some(was) = self.was.take() {
+                put_back(&was);
+            }
+            return;
+        };
+        // SAFETY: `sigaction` is plain data for which all-zero is a valid value (an empty
+        // mask, no flags).
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = handler as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        if let Some(was) = &self.was {
+            for (sig, previous) in was {
+                if previous.is_some() {
+                    // SAFETY: selects a valid handler for a signal this lifetime replaced;
+                    // the original action remains in `was` until its last owner is gone.
+                    unsafe { libc::sigaction(*sig, &action, std::ptr::null_mut()) };
+                }
+            }
+        } else {
+            self.was = Some(STOPS.map(|sig| replace_unless_ignored(sig, &action)));
+        }
+    }
+}
 
 /// The handler: keep the first signal, nothing else (async-signal-safe).
 extern "C" fn note(sig: c_int) {
@@ -43,7 +93,7 @@ extern "C" fn say_then_stop(sig: c_int) {
         // SAFETY: `_exit` takes an integer and ends the process at once.
         unsafe { libc::_exit(128 + sig) };
     }
-    // SAFETY: as in `arm`.
+    // SAFETY: as in `Owners::select`.
     let mut default: libc::sigaction = unsafe { std::mem::zeroed() };
     default.sa_sigaction = libc::SIG_DFL;
     // SAFETY: the default disposition for `sig`; nothing reads the one it replaces.
@@ -57,14 +107,18 @@ extern "C" fn say_then_stop(sig: c_int) {
     let _ = unsafe { libc::raise(sig) };
 }
 
-/// [`say_on_stop`]'s handle: the dispositions it replaced, put back as it drops.
-struct Saying {
-    was: [(c_int, Option<libc::sigaction>); 4],
-}
+/// [`say_on_stop`]'s logical owner, underneath any live catches.
+struct Saying;
 
 impl Drop for Saying {
     fn drop(&mut self) {
-        put_back(&self.was);
+        let mut owners = OWNERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        owners.sayings -= 1;
+        if owners.catches == 0 && owners.sayings == 0 {
+            owners.select();
+        }
     }
 }
 
@@ -74,17 +128,18 @@ impl Drop for Saying {
 /// ([`super::System::catch_stops`], [`super::System::defer_stops`]) replaces it while it lives
 /// and puts it back as it drops, so the stop a deferral sends again says the line too.
 pub fn say_on_stop(line: &'static str) -> Box<dyn std::any::Any> {
+    let mut owners = OWNERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // One leaked reference per arm (a process arms it once), so the handler reads the line
     // through one atomic pointer, never a pointer and a length a second arm could split.
     SAID.store(Box::into_raw(Box::new(line)), Ordering::SeqCst);
     SPOKEN.store(false, Ordering::SeqCst);
-    // SAFETY: as in `arm`.
-    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-    action.sa_sigaction = say_then_stop as extern "C" fn(c_int) as libc::sighandler_t;
-    action.sa_flags = libc::SA_RESTART;
-    Box::new(Saying {
-        was: STOPS.map(|sig| replace_unless_ignored(sig, &action)),
-    })
+    owners.sayings += 1;
+    if owners.catches == 0 && owners.sayings == 1 {
+        owners.select();
+    }
+    Box::new(Saying)
 }
 
 /// Set `sig`'s disposition to `action` unless this process ignores it: the one it replaced, or
@@ -93,7 +148,7 @@ fn replace_unless_ignored(
     sig: c_int,
     action: &libc::sigaction,
 ) -> (c_int, Option<libc::sigaction>) {
-    // SAFETY: as in `arm`.
+    // SAFETY: as in `Owners::select`.
     let mut was: libc::sigaction = unsafe { std::mem::zeroed() };
     // SAFETY: reads `sig`'s action only.
     if unsafe { libc::sigaction(sig, std::ptr::null(), &mut was) } != 0
@@ -116,34 +171,40 @@ fn put_back(was: &[(c_int, Option<libc::sigaction>)]) {
     }
 }
 
-struct Catching {
-    was: [(c_int, Option<libc::sigaction>); 4],
-    /// Send a noted stop again once every disposition is back ([`defer`]).
-    resend: bool,
-}
+struct Catching;
 
 impl Drop for Catching {
     fn drop(&mut self) {
-        put_back(&self.was);
+        let mut owners = OWNERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        owners.catches -= 1;
+        if owners.catches != 0 {
+            return;
+        }
+        owners.select();
         // Read once every disposition is back: a stop noted before its own came back is here,
         // and one after it met that disposition itself.
         let noted = CAUGHT.swap(0, Ordering::SeqCst);
-        if self.resend && noted != 0 {
+        if std::mem::take(&mut owners.resend) && noted != 0 {
+            // Keep lifecycle ownership through the resend: a new catch cannot clear the
+            // noted stop or intercept it between restoration and delivery. Neither signal
+            // handler accesses this mutex.
             resend(noted);
         }
     }
 }
 
-/// Catch [`STOPS`] until the handle drops, then forget them. A signal this process ignores already
-/// stays ignored: whoever started it asked it to outlive that signal (a hang-up under `nohup`), so
-/// it is no stop.
+/// Catch [`STOPS`] until the last overlapping handle drops, then forget them unless an owner
+/// deferred them. A signal this process ignores already stays ignored: whoever started it asked
+/// it to outlive that signal (a hang-up under `nohup`), so it is no stop.
 pub(super) fn catch() -> Box<dyn std::any::Any> {
     arm(false)
 }
 
-/// Catch [`STOPS`] as [`catch`] does, and once the handle drops and every disposition is back,
-/// send the one noted again: the run finishes its step and its cleanup, then stops as it would
-/// have.
+/// Catch [`STOPS`] as [`catch`] does, and once every overlapping catch has finished and the
+/// underlying dispositions are back, send the one noted again: the run finishes its steps and
+/// cleanup, then stops as it would have.
 pub(super) fn defer() -> Box<dyn std::any::Any> {
     arm(true)
 }
@@ -166,7 +227,7 @@ fn resend(sig: c_int) {
 
 /// `sig`'s disposition now (`SIG_DFL` when it cannot be read).
 fn disposition(sig: c_int) -> libc::sighandler_t {
-    // SAFETY: as in `arm`.
+    // SAFETY: as in `Owners::select`.
     let mut now: libc::sigaction = unsafe { std::mem::zeroed() };
     // SAFETY: reads the action only.
     if unsafe { libc::sigaction(sig, std::ptr::null(), &mut now) } != 0 {
@@ -176,26 +237,35 @@ fn disposition(sig: c_int) -> libc::sighandler_t {
 }
 
 fn arm(resend: bool) -> Box<dyn std::any::Any> {
-    CAUGHT.store(0, Ordering::SeqCst);
-    // SAFETY: `sigaction` is plain data for which all-zero is a valid value (an empty mask, no
-    // flags).
-    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-    action.sa_sigaction = note as extern "C" fn(c_int) as libc::sighandler_t;
-    action.sa_flags = libc::SA_RESTART;
-    Box::new(Catching {
-        was: STOPS.map(|sig| replace_unless_ignored(sig, &action)),
-        resend,
-    })
+    let mut owners = OWNERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    owners.catches += 1;
+    owners.resend |= resend;
+    if owners.catches == 1 {
+        CAUGHT.store(0, Ordering::SeqCst);
+        owners.select();
+    }
+    Box::new(Catching)
 }
 
 /// Set SIGHUP and SIGPIPE to `SIG_IGN` for good ([`super::System::ignore_hangups`]).
 pub(super) fn ignore_hangups() {
+    let mut owners = OWNERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for sig in [libc::SIGHUP, libc::SIGPIPE] {
-        // SAFETY: as in `catch`.
+        // SAFETY: as in `Owners::select`.
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
         action.sa_sigaction = libc::SIG_IGN;
         // SAFETY: a valid disposition for `sig`; the one it replaces is not wanted back.
-        unsafe { libc::sigaction(sig, &action, std::ptr::null_mut()) };
+        let ignored = unsafe { libc::sigaction(sig, &action, std::ptr::null_mut()) } == 0;
+        if ignored && let Some(was) = &mut owners.was {
+            // This is permanent, including after owners that predate detachment finish.
+            if let Some((_, previous)) = was.iter_mut().find(|(saved, _)| *saved == sig) {
+                *previous = None;
+            }
+        }
     }
 }
 
@@ -305,6 +375,20 @@ mod tests {
         assert_eq!(caught(), None);
         drop(held);
         assert_eq!(disposition(libc::SIGHUP), libc::SIG_IGN);
+
+        // Becoming a detached watch is permanent even if another step already owns a catch.
+        let _pipe = SetTo::new(libc::SIGPIPE, disposition(libc::SIGPIPE));
+        let _own = SetTo::new(
+            libc::SIGHUP,
+            heard as extern "C" fn(c_int) as libc::sighandler_t,
+        );
+        let held = catch();
+        let later = catch();
+        ignore_hangups();
+        drop(held);
+        drop(later);
+        let after = disposition(libc::SIGHUP);
+        assert_eq!(after, libc::SIG_IGN, "a later drop cannot undo detachment");
     }
 
     static HEARD: AtomicI32 = AtomicI32::new(0);
@@ -353,6 +437,42 @@ mod tests {
             0,
             "a deferral that noted nothing sends nothing"
         );
+
+        // Both lifetimes are real process catches. A later owner cannot erase the first
+        // stop, and the owner that requested deferral may finish before the other one.
+        for outer_defers in [true, false] {
+            for outer_drops_first in [true, false] {
+                let restore = STOPS.map(|sig| SetTo::new(sig, disposition(sig)));
+                HEARD.store(0, Ordering::SeqCst);
+                let outer = if outer_defers { defer() } else { catch() };
+                hang_up();
+                let inner = if outer_defers { catch() } else { defer() };
+                let after_arm = caught();
+                let before_last = if outer_drops_first {
+                    drop(outer);
+                    let observed = (caught(), HEARD.load(Ordering::SeqCst));
+                    drop(inner);
+                    observed
+                } else {
+                    drop(inner);
+                    let observed = (caught(), HEARD.load(Ordering::SeqCst));
+                    drop(outer);
+                    observed
+                };
+                let after_last = (caught(), HEARD.load(Ordering::SeqCst));
+                // Restore every disposition even on the old producer's out-of-order-drop
+                // path, before any assertion can unwind this test.
+                drop(catch());
+                drop(restore);
+                assert_eq!(
+                    after_arm,
+                    Some(libc::SIGHUP),
+                    "a new owner must retain the first stop"
+                );
+                assert_eq!(before_last, (Some(libc::SIGHUP), 0));
+                assert_eq!(after_last, (None, libc::SIGHUP));
+            }
+        }
     }
 
     /// While [`say_on_stop`]'s handle lives, every stop nobody ignores meets the handler that
@@ -384,6 +504,40 @@ mod tests {
         }
         drop(saying);
         assert_eq!(STOPS.map(disposition), before);
+
+        let saying = say_on_stop("stopped\n");
+        let first = catch();
+        let last = defer();
+        drop(first);
+        let while_held = caught.map(disposition);
+        drop(saying);
+        let without_saying = caught.map(disposition);
+        drop(last);
+        let after = STOPS.map(disposition);
+        assert!(while_held.iter().all(|action| *action != says));
+        assert_eq!(
+            without_saying, while_held,
+            "the catches still own the handler"
+        );
+        assert_eq!(
+            after, before,
+            "the final owner restores the original actions"
+        );
+
+        let held = catch();
+        let catching = caught.map(disposition);
+        let saying = say_on_stop("stopped\n");
+        let while_caught = caught.map(disposition);
+        drop(held);
+        let while_saying = caught.map(disposition);
+        drop(saying);
+        let after = STOPS.map(disposition);
+        assert_eq!(
+            while_caught, catching,
+            "a new line cannot replace the catch"
+        );
+        assert_eq!(while_saying, [says; 3]);
+        assert_eq!(after, before);
     }
 
     /// A stop that meets [`say_on_stop`]'s handler says its line on standard error and then

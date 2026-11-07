@@ -3081,3 +3081,52 @@ fn an_inotify_key_hears_every_writer_as_its_mount_says() {
     assert_eq!(events.hears_every_writer(1), !elsewhere, "{fstype}");
     events.disarm(1);
 }
+
+/// A lookup's chain of names: a path that is no link is its own; a link to a link to a file
+/// names each in turn, a relative target from its link's folder and an absolute one as it
+/// stands; a dangling link ends at the path it names; a loop ends after the kernel's count; a
+/// relative path is made absolute.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_link_chain_names_each_hop_a_lookup_takes() {
+    let dir = scratch("watch-link-chain");
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let conf = root.join("conf");
+    std::fs::create_dir(&conf).unwrap();
+    let file = conf.join("aterm.toml");
+    std::fs::write(&file, "one\n").unwrap();
+    assert_eq!(link_chain(&file), std::slice::from_ref(&file), "no link");
+
+    let middle = root.join("middle.toml");
+    std::os::unix::fs::symlink("conf/aterm.toml", &middle).unwrap();
+    let first = conf.join("first.toml");
+    std::os::unix::fs::symlink(&middle, &first).unwrap();
+    assert_eq!(
+        link_chain(&first),
+        [first.clone(), middle.clone(), root.join("conf/aterm.toml")],
+        "an absolute hop, then a relative one"
+    );
+
+    let dangling = root.join("dangling.toml");
+    std::os::unix::fs::symlink("gone/aterm.toml", &dangling).unwrap();
+    assert_eq!(
+        link_chain(&dangling),
+        [dangling.clone(), root.join("gone/aterm.toml")],
+        "a link to nothing ends where it points"
+    );
+
+    let a = root.join("a");
+    let b = root.join("b");
+    std::os::unix::fs::symlink("b", &a).unwrap();
+    std::os::unix::fs::symlink("a", &b).unwrap();
+    let chain = link_chain(&a);
+    assert_eq!(chain.len(), LOOKUP_LINKS + 1, "a loop ends");
+    assert!(chain.iter().all(|hop| *hop == a || *hop == b));
+
+    let relative = Path::new("relative-link-chain.toml");
+    assert_eq!(
+        link_chain(relative),
+        [std::env::current_dir().unwrap().join(relative)],
+        "made absolute where it names now"
+    );
+}

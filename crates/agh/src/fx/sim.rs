@@ -12,6 +12,8 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::OnceLock;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
@@ -24,6 +26,9 @@ type AfterGit = Box<dyn FnOnce(&mut crate::error::Result<ChildOut>) + Send>;
 
 #[cfg(unix)]
 pub(super) type NativePushObserver = Arc<dyn Fn(super::NativePushTiming) + Send + Sync>;
+
+#[cfg(unix)]
+pub(super) type GitChildObserver = Arc<dyn Fn(super::GitChildTiming) + Send + Sync>;
 
 /// One exact real Git child around which a fixture changes its local world or
 /// loses an acknowledgement. It is consumed before invoking either callback.
@@ -48,6 +53,8 @@ pub(super) struct SimClock {
     git_hook: Mutex<Option<GitHook>>,
     #[cfg(unix)]
     native_push_observer: Mutex<Option<NativePushObserver>>,
+    #[cfg(unix)]
+    git_child_observer: OnceLock<GitChildObserver>,
 }
 
 impl SimClock {
@@ -62,6 +69,8 @@ impl SimClock {
             git_hook: Mutex::new(None),
             #[cfg(unix)]
             native_push_observer: Mutex::new(None),
+            #[cfg(unix)]
+            git_child_observer: OnceLock::new(),
         }
     }
 
@@ -107,12 +116,12 @@ impl SimClock {
             .pop_front()
     }
 
-    /// Log `spec` as run.
-    pub(super) fn log(&self, spec: &ChildSpec) {
-        self.run
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(spec.clone());
+    /// Log the accepted spec and return its index under the same lock.
+    pub(super) fn log(&self, spec: &ChildSpec) -> usize {
+        let mut run = self.run.lock().unwrap_or_else(PoisonError::into_inner);
+        let ordinal = run.len();
+        run.push(spec.clone());
+        ordinal
     }
 
     /// Every spec logged so far, in call order.
@@ -159,5 +168,18 @@ impl SimClock {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    #[cfg(unix)]
+    pub(super) fn set_git_child_observer(&self, observer: GitChildObserver) {
+        assert!(
+            self.git_child_observer.set(observer).is_ok(),
+            "one Git child observer"
+        );
+    }
+
+    #[cfg(unix)]
+    pub(super) fn git_child_observer(&self) -> Option<&GitChildObserver> {
+        self.git_child_observer.get()
     }
 }

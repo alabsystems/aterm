@@ -703,6 +703,14 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
     if let Some(bound) = link_request.as_ref().and_then(|request| request.wait_lock) {
         configure_wait_lock(&args, bound);
     }
+    let update_request = if verb == Some("update") {
+        match UpdateRequest::parse(&args[1..]) {
+            Ok(request) => Some(request),
+            Err(refusal) => return refusal,
+        }
+    } else {
+        None
+    };
     let mut machine_edit = machine_edit_for_request(
         &args,
         install_request.as_ref(),
@@ -711,6 +719,10 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
         MachineEdit::start,
     );
     let machine_settings = machine_edit.is_some();
+    let prepared_update = update_request
+        .as_ref()
+        .filter(|request| request.whole())
+        .and_then(|_| WholePreparation::start());
     let mut store_lock = if verb.is_some_and(verb_mutates_store) {
         match mutator_store_lock(link_request.as_ref().and_then(|r| r.if_prefix)) {
             Ok(guard) => guard,
@@ -748,6 +760,12 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
         };
         return cmd_conditional_link(request, guard, &args);
     }
+    if manager_enabled()
+        && update_request.as_ref().is_some_and(UpdateRequest::whole)
+        && let Err(code) = current_whole_scope(prepared_update.as_ref())
+    {
+        return ExitCode::from(code);
+    }
     if let Some(guard) = store_lock.as_mut() {
         begin_store_mutation(guard);
     }
@@ -771,9 +789,10 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
         roll_forward_interrupted_activations(&layout, || cached_index(&layout));
     }
     let _meter = pass_layout.and_then(|layout| typed_pass_meter(verb.unwrap_or_default(), &layout));
-    let code = match install_request {
-        Some(request) => cmd_install_request(request),
-        None => run_verb(verb, &args),
+    let code = match (install_request, update_request) {
+        (Some(request), _) => cmd_install_request(request),
+        (None, Some(request)) => request.run(prepared_update),
+        (None, None) => run_verb(verb, &args),
     };
     #[cfg(target_os = "macos")]
     if let Some((layout, before)) = agents_before {
@@ -8944,68 +8963,102 @@ fn cmd_pin(program: Option<&String>, pinned: bool) -> ExitCode {
     }
 }
 
-fn cmd_update_argv(rest: &[String]) -> ExitCode {
-    let mut retry = false;
-    let mut selected = false;
-    let mut choice: Option<&str> = None;
-    let mut operands: Vec<&String> = Vec::new();
-    for arg in rest {
-        if arg == DEFAULT_SELECTED_FLAG {
-            selected = true;
-        } else if arg == RETRY_FLAG {
-            retry = true;
-        } else if arg == SOURCE_VENDOR_FLAG || arg == SOURCE_ALAB_FLAG {
-            if choice.is_some_and(|c| c != arg) {
-                return usage_error(
-                    "update",
-                    Some("--vendor and --alab are two answers to one question — pass one"),
-                );
+struct UpdateRequest<'a> {
+    retry: bool,
+    selected: bool,
+    choice: Option<&'a str>,
+    program: Option<&'a String>,
+}
+
+impl<'a> UpdateRequest<'a> {
+    fn parse(rest: &'a [String]) -> Result<Self, ExitCode> {
+        let mut retry = false;
+        let mut selected = false;
+        let mut choice: Option<&str> = None;
+        let mut operands: Vec<&String> = Vec::new();
+        for arg in rest {
+            if arg == DEFAULT_SELECTED_FLAG {
+                selected = true;
+            } else if arg == RETRY_FLAG {
+                retry = true;
+            } else if arg == SOURCE_VENDOR_FLAG || arg == SOURCE_ALAB_FLAG {
+                if choice.is_some_and(|c| c != arg) {
+                    return Err(usage_error(
+                        "update",
+                        Some("--vendor and --alab are two answers to one question — pass one"),
+                    ));
+                }
+                choice = Some(arg.as_str());
+            } else if arg.starts_with('-') {
+                let problem = format!("unknown option {arg:?} for `aterm pkg update`");
+                return Err(usage_error("update", Some(&problem)));
+            } else {
+                operands.push(arg);
             }
-            choice = Some(arg.as_str());
-        } else if arg.starts_with('-') {
-            let problem = format!("unknown option {arg:?} for `aterm pkg update`");
-            return usage_error("update", Some(&problem));
-        } else {
-            operands.push(arg);
         }
-    }
-    if let Some(refusal) = arity_refusal(rest, "update") {
-        return refusal;
-    }
-    let program = operands.first().copied();
-    if selected {
-        if retry || choice.is_some() || program.is_none() {
-            return usage_error(
+        if let Some(refusal) = arity_refusal(rest, "update") {
+            return Err(refusal);
+        }
+        let program = operands.first().copied();
+        if selected && (retry || choice.is_some() || program.is_none()) {
+            return Err(usage_error(
                 "update",
                 Some("--default-selected names one program and preserves its automatic policy"),
+            ));
+        }
+        if choice.is_none()
+            && retry
+            && let Some(refusal) = program.and_then(|p| refuse_retry_operand(p))
+        {
+            return Err(refusal);
+        }
+        Ok(Self {
+            retry,
+            selected,
+            choice,
+            program,
+        })
+    }
+
+    fn whole(&self) -> bool {
+        !self.selected && self.choice.is_none() && self.program.is_none()
+    }
+
+    fn run(self, prepared: Option<WholePreparation>) -> ExitCode {
+        let Self {
+            retry,
+            selected,
+            choice,
+            program,
+        } = self;
+        if selected {
+            return cmd_update_all(
+                UpdateScope::Selected(program.expect("parsed above")),
+                None,
+                false,
             );
         }
-        return cmd_update_all(UpdateScope::Selected(program.expect("checked above")));
-    }
-    if let Some(choice) = choice {
-        return cmd_update_source(program.map(String::as_str), choice);
-    }
-    if retry && let Some(refusal) = program.and_then(|p| refuse_retry_operand(p)) {
-        return refusal;
-    }
-    if retry && let Some(layout) = layout() {
-        let mut forgotten = match program {
-            Some(p) => crate::store::clear_stage_refusals(&layout, p),
-            None => crate::store::clear_all_stage_refusals(&layout),
-        };
-        let named = program.map(String::as_str);
-        for vendor in crate::vendor_direct::VENDORS
-            .iter()
-            .map(|spec| spec.program)
-            .filter(|v| named.is_none_or(|p| p == *v))
-        {
-            if forget_vendor_refusal(&layout, vendor) {
-                forgotten = forgotten.saturating_add(1);
-            }
+        if let Some(choice) = choice {
+            return cmd_update_source(program.map(String::as_str), choice);
         }
-        println!("{}", retry_line(forgotten));
+        if retry
+            && program.is_some()
+            && let Some(layout) = layout()
+        {
+            retry_update(&layout, program);
+        }
+        match program {
+            Some(program) => cmd_update_one(program),
+            None => cmd_update_all(UpdateScope::Whole, prepared, retry),
+        }
     }
-    cmd_update(program)
+}
+
+fn cmd_update_argv(rest: &[String]) -> ExitCode {
+    match UpdateRequest::parse(rest) {
+        Ok(request) => request.run(None),
+        Err(refusal) => refusal,
+    }
 }
 
 fn cmd_update_source(program: Option<&str>, choice: &str) -> ExitCode {
@@ -9073,15 +9126,29 @@ fn retry_line(forgotten: usize) -> String {
     }
 }
 
-fn cmd_update(program: Option<&String>) -> ExitCode {
-    match program {
-        Some(p) => cmd_update_one(p),
-        None => cmd_update_all(UpdateScope::Whole),
+fn retry_update(layout: &crate::store::Layout, program: Option<&String>) {
+    let mut forgotten = match program {
+        Some(p) => crate::store::clear_stage_refusals(layout, p),
+        None => crate::store::clear_all_stage_refusals(layout),
+    };
+    for vendor in crate::vendor_direct::VENDORS
+        .iter()
+        .map(|spec| spec.program)
+        .filter(|v| program.is_none_or(|p| p.as_str() == *v))
+    {
+        if forget_vendor_refusal(layout, vendor) {
+            forgotten = forgotten.saturating_add(1);
+        }
     }
+    println!("{}", retry_line(forgotten));
 }
 
-fn cmd_update_all(scope: UpdateScope<'_>) -> ExitCode {
-    let code = cmd_update_all_code(scope);
+fn cmd_update_all(
+    scope: UpdateScope<'_>,
+    prepared: Option<WholePreparation>,
+    retry: bool,
+) -> ExitCode {
+    let code = cmd_update_all_code(scope, prepared, retry);
     if matches!(scope, UpdateScope::Whole) {
         answer_announcement(code == 0);
     }
@@ -9258,20 +9325,120 @@ fn update_toolset_is_empty(
     managed.is_empty() && linked.is_empty()
 }
 
-fn cmd_update_all_code(scope: UpdateScope<'_>) -> u8 {
+#[derive(Clone, PartialEq, Eq)]
+struct WholeSource {
+    prefix: std::path::PathBuf,
+    account: Option<String>,
+    overrides: std::collections::BTreeMap<String, String>,
+    registry: Option<std::ffi::OsString>,
+    peers: Option<Vec<String>>,
+}
+
+impl WholeSource {
+    fn capture(layout: &crate::store::Layout, cfg: &crate::config::PackagesConfig) -> Self {
+        Self {
+            prefix: layout.prefix.clone(),
+            account: cfg.account().map(str::to_owned),
+            overrides: crate::repo_overrides(cfg),
+            registry: crate::source::registry_seam(),
+            peers: cfg.peers.clone(),
+        }
+    }
+}
+
+struct WholePreparation {
+    source: WholeSource,
+    fetcher: Box<dyn crate::flow::Fetcher>,
+}
+
+impl WholePreparation {
+    fn start() -> Option<Self> {
+        if !manager_enabled() {
+            return None;
+        }
+        // The resolver uses this invocation's source settings. The locked pass
+        // compares them with a fresh reading before using any prepared bytes.
+        let cfg = crate::config::cached();
+        let layout = crate::store::resolve_from(cfg)?;
+        let source = WholeSource::capture(&layout, cfg);
+        prepare_whole_in(&layout, || {
+            let fetcher = resolve_fetcher(&layout);
+            update_prepare::warm(
+                &layout,
+                cfg,
+                &*fetcher,
+                &effective_anchor(&layout),
+                build_floor(&layout),
+                now_unix(),
+            );
+            Self { source, fetcher }
+        })
+    }
+}
+
+fn prepare_whole_in<T>(layout: &crate::store::Layout, prepare: impl FnOnce() -> T) -> Option<T> {
+    // Preserve the ordinary early refusal/wait when another writer is present.
+    // This probe owns no status, progress, promise or mutation and drops before
+    // network preparation; the normal CLI acquisition still owns every effect.
+    let probe = crate::lock::try_lock_store(layout).ok()?;
+    drop(probe);
+    Some(prepare())
+}
+
+fn locked_update_config() -> Result<(crate::store::Layout, crate::config::PackagesConfig), u8> {
+    let cfg = match crate::config::config_path().map(|path| crate::config::load_live(&path)) {
+        None => crate::config::PackagesConfig::default(),
+        Some(Some(cfg)) => cfg,
+        Some(None) => {
+            eprintln!("atpkg: package choices cannot be read; update waits");
+            return Err(crate::lock::CONTENDED_EXIT);
+        }
+    };
+    let Some(layout) = crate::store::resolve_from(&cfg) else {
+        eprintln!("atpkg: HOME is unset — cannot locate the install prefix");
+        return Err(1);
+    };
+    if !crate::lock::held_by_this_process(&layout) {
+        eprintln!("atpkg: the configured store changed while taking its lock; update waits");
+        return Err(crate::lock::CONTENDED_EXIT);
+    }
+    Ok((layout, cfg))
+}
+
+fn current_whole_scope(
+    prepared: Option<&WholePreparation>,
+) -> Result<(crate::store::Layout, crate::config::PackagesConfig), u8> {
+    let (layout, cfg) = locked_update_config()?;
+    let captured_source = prepared.map_or_else(
+        || WholeSource::capture(&layout, crate::config::cached()),
+        |prepared| prepared.source.clone(),
+    );
+    if cfg.unreadable || captured_source != WholeSource::capture(&layout, &cfg) {
+        eprintln!("atpkg: the package source changed during preparation; update waits");
+        return Err(crate::lock::CONTENDED_EXIT);
+    }
+    Ok((layout, cfg))
+}
+
+fn cmd_update_all_code(
+    scope: UpdateScope<'_>,
+    prepared: Option<WholePreparation>,
+    retry: bool,
+) -> u8 {
     if !manager_enabled() {
         eprintln!("atpkg: disabled (no root key pinned) — nothing to update");
         return 1;
     }
-    let Some(layout) = layout() else {
-        return 1;
+    let current = match scope {
+        UpdateScope::Whole => current_whole_scope(prepared.as_ref()),
+        UpdateScope::Selected(_) => locked_update_config(),
+    };
+    let (layout, cfg) = match current {
+        Ok(current) => current,
+        Err(code) => return code,
     };
     if let UpdateScope::Selected(program) = scope {
-        if !crate::lock::held_by_this_process(&layout) {
-            eprintln!("atpkg: the configured store changed while taking its lock; update waits");
-            return crate::lock::CONTENDED_EXIT;
-        }
-        if let Err(why) = update_selected::allowed(&layout, crate::config::cached(), program) {
+        if let Err(why) = update_selected::allowed(&layout, &cfg, program) {
             println!("atpkg: {program} left unchanged: {why}");
             return 0;
         }
@@ -9287,6 +9454,9 @@ fn cmd_update_all_code(scope: UpdateScope<'_>) -> u8 {
             true,
             &seams,
         );
+    }
+    if retry {
+        retry_update(&layout, None);
     }
     let _promise = PromiseEnds(&layout);
     if let Some((outcome, ago)) = pass_ended_while_we_waited(&layout) {
@@ -9322,13 +9492,12 @@ fn cmd_update_all_code(scope: UpdateScope<'_>) -> u8 {
             }
         }
     }
-    let cfg = crate::config::cached();
-    reconcile_links(&layout, cfg);
+    reconcile_links(&layout, &cfg);
     let Ok(dev_linked) = update_link_inventory(&layout) else {
         return 1;
     };
     let installed: std::collections::BTreeMap<String, u64> = crate::active_builds(&layout);
-    let complete_the_set = completes_the_set(&layout, cfg);
+    let complete_the_set = completes_the_set(&layout, &cfg);
     if !has_work(&installed, &dev_linked, complete_the_set, &layout) {
         println!("{EMPTY_UPDATE}");
         let _ = crate::status::stamp_pass_end(
@@ -9349,10 +9518,12 @@ fn cmd_update_all_code(scope: UpdateScope<'_>) -> u8 {
             crate::progress::PASS_PROMISE_SECS,
         );
     }
-    let fetcher = resolve_fetcher(&layout);
+    let fetcher = prepared
+        .map(|prepared| prepared.fetcher)
+        .unwrap_or_else(|| resolve_fetcher(&layout));
     run_recorded_update_pass(
         &layout,
-        cfg,
+        &cfg,
         &*fetcher,
         &installed,
         complete_the_set,
@@ -9529,6 +9700,9 @@ enum UpdateScope<'a> {
 
 #[path = "cli_update_selected.rs"]
 mod update_selected;
+
+#[path = "cli_update_prepare.rs"]
+mod update_prepare;
 
 struct PassSeams<'a> {
     scope: UpdateScope<'a>,

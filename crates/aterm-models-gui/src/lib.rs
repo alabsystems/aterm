@@ -11,11 +11,9 @@ mod models_autopilot_timer;
 mod models_chrome_regrow;
 mod models_consent;
 mod models_crash_journal;
-mod models_desktop_alert_debt;
 mod models_engine_corpus;
 mod models_foreground_handback;
 mod models_gui;
-mod models_herald_told_once;
 mod models_lights;
 mod models_main_stall_refusal;
 mod models_menu_viewport;
@@ -31,13 +29,11 @@ pub use models_autopilot_timer::{autopilot_timer_liveness, autopilot_timer_model
 pub use models_chrome_regrow::{chrome_regrow_floor_liveness, chrome_regrow_floor_model};
 pub use models_consent::{debugger_access_change_liveness, debugger_access_change_model};
 pub use models_crash_journal::crash_journal_claim_model;
-pub use models_desktop_alert_debt::desktop_alert_debt_model;
 pub use models_engine_corpus::*;
 pub use models_foreground_handback::{
     foreground_handback_model, foreground_handback_ownership_model,
 };
 pub use models_gui::*;
-pub use models_herald_told_once::herald_told_once_model;
 pub use models_lights::*;
 pub use models_main_stall_refusal::main_thread_stall_refusal_model;
 pub use models_menu_viewport::menu_viewport_model;

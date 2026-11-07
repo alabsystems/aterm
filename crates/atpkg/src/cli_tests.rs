@@ -10241,6 +10241,7 @@ struct SetBesideVendors {
     payload_waits_for_row: Option<(&'static str, &'static str)>,
     prefetch_waits_for_floor: bool,
     prefetch_waits_for: Option<&'static str>,
+    prefetch_holds: Option<&'static str>,
 }
 
 impl SetBesideVendors {
@@ -10264,6 +10265,7 @@ impl SetBesideVendors {
             payload_waits_for_row: None,
             prefetch_waits_for_floor: false,
             prefetch_waits_for: None,
+            prefetch_holds: None,
         }
     }
 
@@ -10370,6 +10372,12 @@ impl crate::flow::Fetcher for SetBesideVendors {
         }
         for (_, program, _) in pins {
             self.note(format!("prefetch:{program}"));
+        }
+        if let Some(program) = self.prefetch_holds
+            && pins.iter().any(|(_, member, _)| member == program)
+        {
+            self.note(format!("manifest:holding:{program}"));
+            self.wait_until(&format!("manifest:released:{program}"));
         }
     }
 
@@ -11176,6 +11184,191 @@ fn a_first_run_asks_for_its_set_manifests_while_the_vendor_plan_waits() {
             .all(|p| active.contains_key(*p)),
         "{active:?}"
     );
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The whole pass and the repository prerequisite use the same writer lock.
+    // One unrelated manifest must not keep an otherwise available selected unit
+    // from becoming usable, either through the whole pass or its selected caller.
+    let dir = scratch("available-unit-beside-manifests-registry");
+    write_toolchain_registry_and(&dir, &[("git", 18)]);
+    let layout = temp_layout("available-unit-beside-manifests-store");
+    record_seed_adoption(&layout);
+    let mut f = SetBesideVendors::new(&dir, &layout, false);
+    f.prefetch_holds = Some("tb");
+    let cfg = crate::config::PackagesConfig {
+        exclude: Some(agents_except(&[])),
+        ..Default::default()
+    };
+    let index = crate::select::select_index(
+        &test_anchor(),
+        crate::flow::Fetcher::index_candidates(&f.registry).unwrap(),
+        build_floor(&layout),
+        None,
+        world_now(),
+    )
+    .selected
+    .unwrap()
+    .index;
+    let channel = index.channel_for("stable", current_triple()).unwrap();
+    assert!(crate::flow::verified_pkg(&f.registry, &index, &channel, "git").is_some());
+    assert!(dir.join("git-18.tar.zst").is_file());
+    let (selected_code, usable_during_hold, unpublished, whole_code) =
+        std::thread::scope(|scope| {
+            let whole = scope.spawn(|| {
+                assert!(
+                    prepare_whole_in(&layout, || update_prepare::warm(
+                        &layout,
+                        &cfg,
+                        &f,
+                        &test_anchor(),
+                        build_floor(&layout),
+                        world_now(),
+                    ))
+                    .is_some()
+                );
+                let _owner = crate::lock::try_lock_store(&layout).unwrap();
+                let mut seams = world_seams(&trust);
+                seams.path = Some(std::ffi::OsString::new());
+                run_recorded_update_pass(
+                    &layout,
+                    &cfg,
+                    &f,
+                    &crate::active_builds(&layout),
+                    true,
+                    &seams,
+                )
+            });
+            f.wait_until("manifest:holding:tb");
+            let unpublished = crate::status::read(&layout).is_none()
+                && !layout.floor().exists()
+                && !layout.roster_floor().exists();
+            let selected_code = match crate::lock::try_lock_store(&layout) {
+                Ok(_owner) => {
+                    let mut seams = world_seams(&trust);
+                    seams.scope = UpdateScope::Selected("git");
+                    seams.path = Some(std::ffi::OsString::new());
+                    let code = run_recorded_update_pass(
+                        &layout,
+                        &cfg,
+                        &f,
+                        &crate::active_builds(&layout),
+                        true,
+                        &seams,
+                    );
+                    std::fs::write(layout.removed(), "tb\n").unwrap();
+                    code
+                }
+                Err(crate::lock::StoreLockError::Contended(_)) => crate::lock::CONTENDED_EXIT,
+                Err(error) => {
+                    f.note("manifest:released:tb".into());
+                    let _ = whole.join();
+                    panic!("selected prerequisite lock: {error}");
+                }
+            };
+            let usable = crate::active_builds(&layout).get("git") == Some(&18)
+                && crate::which(&layout, "git").is_some();
+            f.note("manifest:released:tb".into());
+            (selected_code, usable, unpublished, whole.join().unwrap())
+        });
+    assert!(
+        unpublished,
+        "preparation cannot publish package or trust completion"
+    );
+    assert_eq!(whole_code, 0);
+    assert_eq!(selected_code, 0);
+    assert_eq!(crate::active_builds(&layout).get("git"), Some(&18));
+    assert!(
+        ["trust", "tb"]
+            .iter()
+            .all(|program| !crate::active_builds(&layout).contains_key(*program)),
+        "a removal made during preparation must preserve the whole coherent unit"
+    );
+    assert_eq!(
+        f.downloads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(program, _)| program == "git")
+            .count(),
+        1,
+        "the whole pass must read the selection that landed during its preparation"
+    );
+    assert!(
+        usable_during_hold,
+        "an unrelated held manifest delayed the available selected unit; selected exit={selected_code}"
+    );
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Preparation is not authority: a newly admitted floor still wins at the
+    // actual transaction boundary, even after preparation admitted the old bytes.
+    let dir = scratch("prepared-index-behind-new-floor-registry");
+    write_toolchain_registry_and(&dir, &[("git", 18)]);
+    let layout = temp_layout("prepared-index-behind-new-floor-store");
+    record_seed_adoption(&layout);
+    let mut f = SetBesideVendors::new(&dir, &layout, false);
+    f.prefetch_holds = Some("tb");
+    let code = std::thread::scope(|scope| {
+        let whole = scope.spawn(|| {
+            assert!(
+                prepare_whole_in(&layout, || update_prepare::warm(
+                    &layout,
+                    &cfg,
+                    &f,
+                    &test_anchor(),
+                    build_floor(&layout),
+                    world_now(),
+                ))
+                .is_some()
+            );
+            let _owner = crate::lock::try_lock_store(&layout).unwrap();
+            let mut seams = world_seams(&trust);
+            seams.path = Some(std::ffi::OsString::new());
+            run_recorded_update_pass(
+                &layout,
+                &cfg,
+                &f,
+                &crate::active_builds(&layout),
+                true,
+                &seams,
+            )
+        });
+        f.wait_until("manifest:holding:tb");
+        {
+            let _owner = crate::lock::try_lock_store(&layout).unwrap();
+            advance_floors(&layout, 52, testkit::SEQ);
+        }
+        f.note("manifest:released:tb".into());
+        whole.join().unwrap()
+    });
+    assert_eq!(code, 1);
+    assert_eq!(crate::sig::Floor::new(layout.floor()).current(), 52);
+    assert!(crate::active_builds(&layout).is_empty());
+    assert!(f.downloads.lock().unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+
+    // No candidate-controlled package origin may be used before verification.
+    let layout = temp_layout("unverified-preparation-store");
+    record_seed_adoption(&layout);
+    let index_path = dir.join("index.toml");
+    let mut tampered = std::fs::read(&index_path).unwrap();
+    tampered.extend_from_slice(b"\n# signature does not cover this change\n");
+    std::fs::write(index_path, tampered).unwrap();
+    let f = SetBesideVendors::new(&dir, &layout, false);
+    assert!(
+        prepare_whole_in(&layout, || update_prepare::warm(
+            &layout,
+            &cfg,
+            &f,
+            &test_anchor(),
+            build_floor(&layout),
+            world_now(),
+        ))
+        .is_some()
+    );
+    assert!(f.asked.0.lock().unwrap().is_empty());
+    assert!(!layout.roster_floor().exists());
     let _ = std::fs::remove_dir_all(&layout.prefix);
     let _ = std::fs::remove_dir_all(&dir);
 }

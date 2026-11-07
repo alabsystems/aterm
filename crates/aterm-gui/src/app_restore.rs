@@ -1198,7 +1198,6 @@ impl App {
                     not_claim_worker: false,
                     claim_worker: claim.map(|(folder, _)| folder),
                     task: None,
-                    told: None,
                 };
                 leaf.mark_claim_bystander();
                 Some(restore::RestoredView::Terminal(leaf))
@@ -1511,7 +1510,7 @@ impl App {
             return None;
         }
         let snapshot = self.config.restore_session_or_default().then(|| {
-            let mut manifest = self.capture_desk_manifest();
+            let mut manifest = self.capture_restore_manifest();
             self.fill_desk_agents(&mut manifest);
             manifest
         });
@@ -1535,58 +1534,6 @@ impl App {
             self.fill_desk_agents(manifest);
         } else {
             manifest.forget_agents_and_holds();
-        }
-    }
-
-    /// The layout a restart restores ([`Self::capture_restore_manifest`]) with each leaf's
-    /// told-once ids filled from the same live sessions ([`Self::fill_told`]): a quit's (taken
-    /// when the last window's close decides the quit, before its teardown retires each tab's
-    /// herald slot, or at the quit itself), the crash journal's and an end of session's.
-    pub(crate) fn capture_desk_manifest(&self) -> restore::RestoreManifest {
-        let mut manifest = self.capture_restore_manifest();
-        self.fill_told(&mut manifest);
-        manifest
-    }
-
-    /// Writes each leaf's told-once ids ([`restore::TerminalLeafRestore::told`]) from its session's
-    /// herald memory as it stands at the tab's owner turn now
-    /// ([`crate::status_item::Herald::told_ids`]), so whatever restores the manifest tells a need
-    /// its owner was told of once across the restart, and one their turn since made news again is
-    /// news after it too. A leaf whose session the pool does not hold names none.
-    fn fill_told(&self, manifest: &mut restore::RestoreManifest) {
-        let herald = &self.presence.herald;
-        manifest.fill_told(&|id| {
-            let turn = self.pool.get(id)?.ctx.human_input.last_plain_enter();
-            crate::status_item::told_ids_row(&herald.told_ids(id, turn))
-        });
-    }
-
-    /// A quit's leaf carried its session's told-once ids ([`restore::TerminalLeafRestore::told`]):
-    /// the session that fills it takes them as its herald's memory at its first publication
-    /// (`App::adopt_status_carry`, [`crate::status_item::Herald::adopt`]), so a need its owner was
-    /// told of before the quit is told once across the restart.
-    fn carry_restored_told(
-        &mut self,
-        leaf: &restore::TerminalLeafRestore,
-        filling: FillingShell<'_>,
-    ) {
-        let told_ids = leaf
-            .told
-            .as_deref()
-            .map(crate::status_item::parse_told_ids)
-            .unwrap_or_default();
-        if told_ids.is_empty() {
-            return;
-        }
-        let sid = match filling {
-            FillingShell::Registered(session) => self
-                .pool
-                .get(session)
-                .map(|live| live.ctx.self_id.as_str().to_string()),
-            FillingShell::Unregistered(session) => Some(session.ctx.self_id.as_str().to_string()),
-        };
-        if let Some(sid) = sid {
-            self.status_carry.entry(sid).or_default().told_ids = told_ids;
         }
     }
 
@@ -1653,7 +1600,7 @@ impl App {
             return;
         }
         self.crash_journal.begin_capture();
-        let mut manifest = self.capture_desk_manifest();
+        let mut manifest = self.capture_restore_manifest();
         self.fill_desk_agents(&mut manifest);
         let programs = self.crash_journal_programs(&manifest);
         let written = self.crash_journal.offer(manifest, programs, now);
@@ -3894,7 +3841,6 @@ impl App {
             if let Some(ctx) = ctx {
                 self.carry_restored_managers(leaf.sid.as_deref(), &ctx);
             }
-            self.carry_restored_told(leaf, filling);
         }
         // A claim worker's tab: the worker brought back, or still running in a shell the PTY
         // keeper hands back, or a tab whose worker is not coming back, its leaf with no agent to

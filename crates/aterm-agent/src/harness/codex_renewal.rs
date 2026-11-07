@@ -479,7 +479,8 @@ impl Candidate {
             let Some(back) = rollback else { return false };
             back
         };
-        target.image != *launcher
+        let settled = target.settled();
+        *settled != *launcher
             && self.pid == process.pid
             && self.birth == process.birth
             && self.parent == process.parent
@@ -488,7 +489,7 @@ impl Candidate {
             && self.launcher_device == launcher.device
             && self.launcher_inode == launcher.inode
             && self.launcher_path == launcher.path
-            && process.image == target.image
+            && process.image == *settled
     }
 }
 
@@ -561,6 +562,18 @@ impl Receipt {
             .then_some(candidate.forward)
     }
 
+    fn has_rollback_candidate(&self) -> bool {
+        self.phase == Phase::Retired
+            && self.launch_attempted
+            && self.accepted_turn.is_none()
+            && self.successor_pid.is_some()
+            && self.successor_birth.is_some()
+            && self
+                .candidate
+                .as_ref()
+                .is_some_and(|candidate| !candidate.forward)
+    }
+
     /// The completed native rollback must name this exact restored process,
     /// with no accepted recovery turn. This observes closure, not execution authority.
     fn matches_completed_rollback(
@@ -569,9 +582,7 @@ impl Receipt {
         observed: &super::native_observe::SavedObservation,
     ) -> bool {
         let restored = &observed.registration.vendor;
-        self.phase == Phase::Retired
-            && self.launch_attempted
-            && self.accepted_turn.is_none()
+        self.has_rollback_candidate()
             && self.successor_pid == Some(restored.pid)
             && self.successor_birth == Some(restored.birth)
             && self.exec_candidate(Some(restored), prepare) == Some(false)
@@ -609,7 +620,7 @@ impl Receipt {
         predecessor_gone
             && Some(process.pid) == self.successor_pid
             && Some(process.birth) == self.successor_birth
-            && process.image == previous.image
+            && process.image == *previous.settled()
             && &observed.registration.vendor == current
             && &observed.registration.shell == shell
             && current.parent == shell.pid
@@ -618,7 +629,7 @@ impl Receipt {
             && observed.registration.host_epoch == completed.host_epoch
             && observed.binding.host_epoch == completed.host_epoch
             && observed.binding.id == observed.registration.id
-            && current.image == forward.image
+            && current.image == *forward.settled()
             && forward
                 .env
                 .iter()
@@ -2220,6 +2231,50 @@ mod tests {
             receipt.exec_candidate(Some(&executed), &prepare),
             Some(true)
         );
+        let mut wrapped = prepare.clone();
+        if let NativePlan::Restart { forward, .. } = &mut wrapped.plan {
+            forward.settles = Some(executed.image.clone());
+            forward.image = launcher.clone();
+            forward.program = String::from_utf8(launcher.path.clone()).unwrap();
+        }
+        assert_eq!(
+            receipt.exec_candidate(Some(&executed), &wrapped),
+            Some(true),
+            "a wrapper must retain the exact attached process's settled identity"
+        );
+        assert_eq!(receipt.exec_candidate(Some(&attached), &wrapped), None);
+        let mut wrapped_to_launcher = wrapped.clone();
+        if let NativePlan::Restart { forward, .. } = &mut wrapped_to_launcher.plan {
+            forward.settles = Some(launcher.clone());
+        }
+        assert_eq!(
+            receipt.exec_candidate(Some(&attached), &wrapped_to_launcher),
+            None
+        );
+        for changed_field in 0..8 {
+            let mut changed = executed.clone();
+            match changed_field {
+                0 => changed.pid += 1,
+                1 => changed.birth += 1,
+                2 => changed.parent += 1,
+                3 => changed.group += 1,
+                4 => changed.session += 1,
+                5 => changed.image.device += 1,
+                6 => changed.image.inode += 1,
+                _ => changed.image.path.push(b'x'),
+            }
+            assert_eq!(receipt.exec_candidate(Some(&changed), &wrapped), None);
+        }
+        for changed_field in 0..3 {
+            let mut changed = receipt.clone();
+            let candidate = changed.candidate.as_mut().unwrap();
+            match changed_field {
+                0 => candidate.launcher_device += 1,
+                1 => candidate.launcher_inode += 1,
+                _ => candidate.launcher_path.push(b'x'),
+            }
+            assert_eq!(changed.exec_candidate(Some(&executed), &wrapped), None);
+        }
         // The next restart needs an independently completed native lineage,
         // not merely a fresh PID using this same thread and auth path.
         let mut original = prepare.clone();
@@ -2231,14 +2286,26 @@ mod tests {
             .unwrap();
         receipt.successor_pid = Some(executed.pid);
         receipt.successor_birth = Some(executed.birth);
-        let mut completed = original;
-        if let NativePlan::Restart { process, .. } = &mut completed.plan {
+        let mut completed = original.clone();
+        if let NativePlan::Restart {
+            process, forward, ..
+        } = &mut completed.plan
+        {
             *process = executed.clone();
+            forward.image = Image {
+                path: b"/codex-next".to_vec(),
+                device: 1,
+                inode: 3,
+            };
+            forward.program = "/codex-next".into();
         }
         let mut descendant = executed.clone();
         descendant.pid += 1;
         descendant.birth += 1;
         descendant.group = descendant.pid;
+        if let NativePlan::Restart { forward, .. } = &completed.plan {
+            descendant.image = forward.image.clone();
+        }
         let registration = super::super::native_observe::Registration {
             id: "ef".repeat(16),
             host_epoch: completed.host_epoch.clone(),
@@ -2255,13 +2322,57 @@ mod tests {
         };
         assert!(receipt.matches_descendant(&completed, &observed, &descendant, true));
         assert!(!receipt.matches_descendant(&completed, &observed, &descendant, false));
+        // Either generation may use a wrapper. Both lineage ends still name
+        // the exact provider image observed after exec, never the wrapper.
+        let wrap = |prepare: &mut Prepare| {
+            let NativePlan::Restart { forward, .. } = &mut prepare.plan else {
+                unreachable!()
+            };
+            forward.settles = Some(forward.image.clone());
+            forward.image = launcher.clone();
+            forward.program = String::from_utf8(launcher.path.clone()).unwrap();
+        };
+        for previous_wrapped in [false, true] {
+            let mut previous = original.clone();
+            if previous_wrapped {
+                wrap(&mut previous);
+            }
+            receipt.native_prepare = super::super::native_act::Request::prepare(previous)
+                .encode()
+                .unwrap();
+            for current_wrapped in [false, true] {
+                let mut current = completed.clone();
+                if current_wrapped {
+                    wrap(&mut current);
+                }
+                assert!(receipt.matches_descendant(&current, &observed, &descendant, true));
+                if current_wrapped {
+                    let mut unfinished = descendant.clone();
+                    unfinished.image = launcher.clone();
+                    let mut premature = observed.clone();
+                    premature.registration.vendor = unfinished.clone();
+                    assert!(!receipt.matches_descendant(&current, &premature, &unfinished, true));
+                }
+                if previous_wrapped {
+                    let NativePlan::Restart { process, .. } = &mut current.plan else {
+                        unreachable!()
+                    };
+                    process.image = launcher.clone();
+                    assert!(!receipt.matches_descendant(&current, &observed, &descendant, true));
+                }
+            }
+        }
         let mut back = completed.clone();
         if let NativePlan::Restart {
             forward, rollback, ..
         } = &mut back.plan
         {
             *rollback = Some(forward.clone());
+            rollback.as_mut().unwrap().image = executed.image.clone();
+            rollback.as_mut().unwrap().program = "/codex".into();
         }
+        let mut restored = observed.clone();
+        restored.registration.vendor.image = executed.image.clone();
         let mut restored_prefix = descendant.clone();
         restored_prefix.image = launcher.clone();
         let mut retired = receipt.clone();
@@ -2271,7 +2382,20 @@ mod tests {
         retired.successor_pid = Some(descendant.pid);
         retired.successor_birth = Some(descendant.birth);
         retired.candidate = Some(Candidate::of(&restored_prefix, false));
-        assert!(retired.matches_completed_rollback(&back, &observed));
+        assert!(retired.matches_completed_rollback(&back, &restored));
+        assert!(!retired.matches_completed_rollback(&back, &observed));
+        let mut wrapped_back = back.clone();
+        if let NativePlan::Restart { rollback, .. } = &mut wrapped_back.plan {
+            let rollback = rollback.as_mut().unwrap();
+            rollback.settles = Some(rollback.image.clone());
+            rollback.image = launcher.clone();
+            rollback.program = String::from_utf8(launcher.path.clone()).unwrap();
+        }
+        assert!(retired.matches_completed_rollback(&wrapped_back, &restored));
+        assert!(!retired.matches_completed_rollback(&wrapped_back, &observed));
+        let mut premature = restored.clone();
+        premature.registration.vendor.image = launcher.clone();
+        assert!(!retired.matches_completed_rollback(&wrapped_back, &premature));
         for change in 0..4 {
             let mut invalid = retired.clone();
             match change {
@@ -2280,7 +2404,7 @@ mod tests {
                 2 => invalid.accepted_turn = Some(invalid.intent.wall.clone()),
                 _ => invalid.phase = Phase::Committing,
             }
-            assert!(!invalid.matches_completed_rollback(&back, &observed));
+            assert!(!invalid.matches_completed_rollback(&back, &restored));
         }
         let mut forged = descendant.clone();
         forged.birth += 1;

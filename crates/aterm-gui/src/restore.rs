@@ -158,15 +158,6 @@ pub(crate) struct TerminalLeafRestore {
     pub lineage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_ep: Option<u32>,
-    /// The ids the herald's told-once memory held for this leaf's session when the layout was
-    /// captured ([`crate::status_item::told_ids_row`]), so a need its owner was told of before a
-    /// restart is told once across it ([`crate::status_item::Herald::adopt`]). A layout a cold
-    /// restore reads writes it (a quit's, the crash journal's image, an end of session's
-    /// snapshot: [`RestoreManifest::fill_told`] through `App::capture_desk_manifest`); a seamless
-    /// update's handoff layout does not, carrying the ids in the session's status row
-    /// (`SessionRecord::status_seen`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub told: Option<String>,
 }
 
 /// The word that a tab's agent cannot be brought back, as a seamless update's handoff leaf carries it ([`TerminalLeafRestore::lost`]).
@@ -1005,9 +996,6 @@ impl TerminalLeafRestore {
         self.lineage = self.lineage.take().filter(|sid| carried_sid(sid));
         self.log_ep = self.log_ep.and_then(crate::session_log::told_epoch);
         self.holds = crate::fabric::render_holds(&self.carried_holds());
-        self.told = self.told.take().and_then(|row| {
-            crate::status_item::told_ids_row(&crate::status_item::parse_told_ids(&row))
-        });
         self.sanitize_user_metadata();
     }
 
@@ -2125,7 +2113,6 @@ impl RestoredTab {
                         not_claim_worker: false,
                         claim_worker: None,
                         task: None,
-                        told: None,
                     }))
                 }
                 PaneLayout::Split {
@@ -2507,16 +2494,6 @@ impl RestoreManifest {
         });
     }
 
-    /// Put on every terminal leaf the told-once ids `told` says its session's herald holds
-    /// ([`TerminalLeafRestore::told`]), for a layout a cold restore reads.
-    pub(crate) fn fill_told(&mut self, told: &dyn Fn(u64) -> Option<String>) {
-        self.fill_terminals(&mut |terminal| {
-            if let Some(id) = terminal.local_id {
-                terminal.told = told(id);
-            }
-        });
-    }
-
     fn fill_terminals(&mut self, fill: &mut dyn FnMut(&mut TerminalLeafRestore)) {
         fn walk(node: &mut RestoredSplitTree, fill: &mut dyn FnMut(&mut TerminalLeafRestore)) {
             match node {
@@ -2671,7 +2648,6 @@ impl RestoreManifest {
                     not_claim_worker: false,
                     claim_worker: None,
                     task: None,
-                    told: None,
                 })),
                 focused_path: Vec::new(),
                 zoomed: false,
@@ -4639,7 +4615,6 @@ mod tests {
             not_claim_worker: false,
             claim_worker: None,
             task: None,
-            told: None,
         }))
     }
 
@@ -6226,7 +6201,6 @@ metadata = "opaque=copy-me"
                     not_claim_worker: false,
                     claim_worker: None,
                     task: None,
-                    told: None,
                 })),
                 focused_path: Vec::new(),
                 zoomed: false,
@@ -6258,7 +6232,7 @@ metadata = "opaque=copy-me"
         );
         let newer = wire.replace(
             "sid = \"s-0123abcd\"",
-            "sid = \"s-0123abcd\"\nfuture_field = \"from a newer peer\"\nidentity = \"worker\"",
+            "sid = \"s-0123abcd\"\nfuture_field = \"from a newer peer\"\nidentity = \"worker\"\ntold = \"1f\"",
         );
         assert_ne!(newer, wire, "PRECONDITION: the unknown field is in");
         assert_eq!(
@@ -6271,6 +6245,10 @@ metadata = "opaque=copy-me"
             .to_toml()
             .expect("serialize");
         assert!(!rewritten.contains("identity ="), "{rewritten}");
+        assert!(
+            !rewritten.contains("told ="),
+            "an older aterm's told-once ids are read past: {rewritten}"
+        );
         for (sid, lineage) in [
             ("s-ab\0cd".to_string(), format!("s-{}", "a".repeat(1 << 20))),
             (format!("s-{}", "0".repeat(48)), "s-xyz".to_string()),

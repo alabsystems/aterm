@@ -1993,8 +1993,8 @@ fn codex_blocked(
 
 /// THE PROGRAM-CLAIM NEED (`program_need`): a codex whose reader names no state reports a box,
 /// and no claim speaks for the tab: an approval, a question or a sign-in, each said as codex's
-/// own report, keyed by the shown report's episode and carrying the engine sequence the herald
-/// judges its banner by. A hold does not hide it (a box is a need under a hold, as Claude
+/// own report, keyed by the shown report's episode and carrying the engine sequence of the
+/// report it stands on. A hold does not hide it (a box is a need under a hold, as Claude
 /// Code's is); a host supervising the tab does not either (no harness presses a codex box).
 /// None while codex-alab's proven self-claim carries the tab (held or not), while another
 /// holder's unproven claim stands unheld, and while codex-alab's own attention entry stands,
@@ -2296,33 +2296,19 @@ fn two_grok_auth_walls_give_one_need() {
     );
 }
 
-/// A NEED'S ID READS ITS WORDS, NOT THE FRAME (§14.18): case, runs of white space, surrounding
-/// emphasis and a trailing stop give one id; two needs stay two, however much they share; and
-/// where the entry's count moves its key ([`ask_key`]), its first need's id does not.
+/// AN ASK'S KEY MOVES WITH ITS COUNT: two entries that name the same first need, one counting a
+/// further need, are two asks ([`ask_key`] reads the whole entry), though both name that first
+/// need.
 #[test]
-fn need_id_reads_the_words_not_the_frame() {
-    let id = need_id("grant Accessibility to aterm");
-    for same in [
-        "Grant accessibility to ATERM",
-        "  grant   Accessibility\tto aterm  ",
-        "**grant Accessibility to aterm**",
-        "`grant Accessibility to aterm`.",
-        "_grant Accessibility to aterm_!",
-        "grant Accessibility to aterm:",
-    ] {
-        assert_eq!(need_id(same), id, "{same:?}");
-    }
-    assert_ne!(need_id("grant Screen Recording to aterm"), id);
-    assert_ne!(need_id("grant Accessibility to aterm and Terminal"), id);
-    assert_ne!(need_id(""), 0, "never 0");
+fn an_asks_key_moves_with_its_count() {
     let one = "claude needs you: grant Accessibility to aterm \u{2014} carrying on";
     let two = "claude needs you: grant Accessibility to aterm (+1 more) \u{2014} carrying on";
     assert_ne!(
         ask_key(one),
         ask_key(two),
-        "control: the entry's key moves with its count"
+        "the entry's key moves with its count"
     );
-    let first = |text: &str| need_words(text).map(|w| need_id(w.first));
-    assert_eq!(first(one), first(two));
-    assert_eq!(first(one), Some(id));
+    let first = |text: &str| need_words(text).map(|w| w.first.to_string());
+    assert_eq!(first(one), first(two), "the same first need");
+    assert_eq!(first(one).as_deref(), Some("grant Accessibility to aterm"));
 }

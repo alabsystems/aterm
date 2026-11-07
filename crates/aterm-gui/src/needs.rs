@@ -350,11 +350,6 @@ pub(crate) struct HarnessAsk {
     /// What the entry says the harness does beside the need (` — carrying on`, or ` — waits on
     /// you` where Land rests on it or the work landed beside it).
     pub(crate) tail: NeedTail,
-    /// The first need as the needs entry beside a told set carries it, which the writer cuts to
-    /// the entry's cells where the need is longer: the words a read of that entry alone names the
-    /// first need by (`status_item::NeedRead`). `None` where the entry alone was read, whose
-    /// [`Self::first`] they are.
-    pub(crate) entry_first: Option<String>,
 }
 
 impl HarnessAsk {
@@ -366,7 +361,6 @@ impl HarnessAsk {
             others: Vec::new(),
             program: words.program,
             tail: words.tail,
-            entry_first: None,
         }
     }
 
@@ -385,7 +379,6 @@ impl HarnessAsk {
             others,
             program,
             tail: NeedTail::CarryingOn,
-            entry_first: None,
         })
     }
 
@@ -983,11 +976,7 @@ fn harness_ask(text: &str, told: Option<&[String]>) -> Option<HarnessAsk> {
         })
     });
     told.and_then(|needs| HarnessAsk::told_counted(needs, program, counted))
-        .map(|ask| HarnessAsk {
-            tail,
-            entry_first: alone.as_ref().map(|entry| entry.first.clone()),
-            ..ask
-        })
+        .map(|ask| HarnessAsk { tail, ..ask })
         .or(alone)
 }
 
@@ -1002,26 +991,6 @@ fn entry_words(text: &str) -> &str {
 /// An ask's [`Need::key`].
 pub(crate) fn ask_key(text: &str) -> u64 {
     aterm_hash::fnv1a_64(text.trim().as_bytes())
-}
-
-/// ONE NEED'S IDENTITY BY ITS OWN WORDS, never aterm's frame, a count or the set's order: the
-/// herald's told-once memory reads it (`status_item::NeedId`), while [`Need::key`] stays
-/// [`ask_key`] for the survey. Case, runs of white space, surrounding `*`, `_` and backticks, and
-/// trailing `.` `,` `;` `:` `!` do not change it; nothing is cut from the words, so two needs
-/// that share a long prefix stay apart. Never 0.
-pub(crate) fn need_id(words: &str) -> u64 {
-    let emphasis = |c: char| matches!(c, '*' | '_' | '`');
-    let words = words
-        .trim()
-        .trim_matches(|c: char| emphasis(c) || c.is_whitespace())
-        .trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!') || c.is_whitespace())
-        .trim_matches(|c: char| emphasis(c) || c.is_whitespace());
-    let folded = words
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
-    aterm_hash::fnv1a_64(folded.as_bytes()).max(1)
 }
 
 fn resolved_kind(entry: &AttentionFact, wall_answer: WallAnswer) -> AttentionKind {

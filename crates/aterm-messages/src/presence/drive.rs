@@ -114,15 +114,15 @@ pub trait Desk {
     fn sense(&self, session: u64) -> Option<Facts<Self::V>>;
     /// Returns when `session`'s `ttl=` supervisor claim lapses.
     fn supervisor_lapse(&self, session: u64, now: Instant) -> Option<Instant>;
-    /// Returns when the next rate-limited notification is due.
+    /// Returns when the host's next timed need work (a need recheck) is due.
     fn herald_deadline(&self, now: Instant) -> Option<Instant>;
     /// Tells the host a refresh reached window `w`.
     fn projecting(&mut self, w: Self::Win);
     /// Re-stamps tab chips for `windows`.
     fn restamp_chips(&mut self, windows: Vec<Self::Win>);
-    /// Publishes `session`'s need to the notification herald.
+    /// Publishes `session`'s need and folds it into the host's record of since when it stands.
     fn herald(&mut self, session: u64);
-    /// Posts any owed notifications permitted by the rate limit at `now`.
+    /// Runs the host's timed need work (its need rechecks) due at `now`.
     fn herald_owed(&mut self, now: Instant);
     /// Removes and records `session`'s lapsed supervisor claim.
     fn lapse_supervisor(&mut self, session: u64);

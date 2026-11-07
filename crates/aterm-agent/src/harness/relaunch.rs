@@ -1480,7 +1480,7 @@ fn tab_mode(opts: &Opts, tab: &str) -> Option<String> {
 
 /// The `--permission-mode` value of the pill under Claude's composer on `rows` ([`super::lights::read_screen`]).
 pub(crate) fn screen_mode(rows: &[String]) -> Option<String> {
-    super::lights::read_screen(rows)
+    super::lights::read_screen(rows, None)
         .and_then(|shown| shown.mode)
         .map(|mode| mode_flag(mode).to_string())
 }

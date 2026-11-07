@@ -3,8 +3,9 @@
 
 //! Live config hot-reload watcher.
 
+use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use aterm_window::event_loop::EventLoopProxy;
@@ -24,7 +25,8 @@ mod protocol_island;
 #[path = "config_watcher_binding_island.rs"]
 mod binding_island;
 
-/// How often the watcher observes the config file.
+/// How often a watcher that hears no file events looks at the config file, and how soon one that
+/// does looks again at a refusal no edit ends ([`Retry`]).
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A stable theme directory needs a bounded rescan, but not four directory
@@ -246,7 +248,7 @@ impl FailureLatch {
     }
 }
 
-/// Spawn the single, process-wide config-watcher thread.
+/// Spawn the single, process-wide config-watcher thread, `aterm-config-watch`.
 pub(crate) fn spawn(
     path: Option<std::path::PathBuf>,
     startup_config_baseline: Option<crate::native_document_host::AtomicFileBaseline>,
@@ -257,25 +259,361 @@ pub(crate) fn spawn(
     if path.is_none() && theme_dir.is_none() {
         return;
     }
-    std::thread::spawn(move || {
-        watch(
-            path,
-            startup_config_baseline,
-            initial_themes,
-            proxy,
-            theme_dir,
-        )
-    });
+    let started = std::thread::Builder::new()
+        .name("aterm-config-watch".to_owned())
+        .spawn(move || {
+            let (ring, tells) = mpsc::channel();
+            REPOST_AFTER_COMMIT.listen(ring.clone());
+            let mut ears = platform_ears(ring, tells);
+            watch(
+                path,
+                startup_config_baseline,
+                initial_themes,
+                theme_dir,
+                &mut |wake| proxy.send_event(wake).is_ok(),
+                ears.as_mut(),
+                &REPOST_AFTER_COMMIT,
+            );
+        });
+    if let Err(why) = started {
+        aterm_log::info!("config watcher: its thread did not start ({why}), so no edit reloads");
+    }
 }
 
-/// The config-watcher thread [`spawn`] starts.
+/// What wakes the watcher's rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tell {
+    /// A held key's path changed ([`Held`]).
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", test)),
+        expect(dead_code, reason = "only a file watch tells a change")
+    )]
+    Changed(u64),
+    /// A seamless successor reached Commit ([`Repost::raise`]).
+    #[cfg_attr(
+        not(any(unix, test)),
+        expect(dead_code, reason = "only a unix successor's Commit raises a repost")
+    )]
+    Repost,
+    /// The file watch's thread ended: from here on the watcher looks on its clock.
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", test)),
+        expect(dead_code, reason = "only a file watch's thread ends")
+    )]
+    EventsEnded,
+}
+
+/// How the watcher hears its paths change: a file watch ([`Heard`]), or nothing but its own
+/// clock ([`Deaf`]). The laws drive [`watch`] through a scripted one.
+trait Ears {
+    fn watch(&mut self, key: u64, path: std::path::PathBuf);
+    fn watch_directory(&mut self, key: u64, path: std::path::PathBuf);
+    fn unwatch(&mut self, key: u64);
+    /// Whether no change is heard, so every step runs on the clock.
+    fn deaf(&self) -> bool;
+    fn now(&self) -> Instant;
+    /// Rest until a tell or `until` (none: until a tell), pushing every tell queued; the time it
+    /// woke, or `None` once nothing can tell it again.
+    fn wait(&mut self, until: Option<Instant>, tells: &mut Vec<Tell>) -> Option<Instant>;
+}
+
+/// [`Ears::wait`] over a channel of tells.
+fn rest_on(
+    tells: &mpsc::Receiver<Tell>,
+    until: Option<Instant>,
+    into: &mut Vec<Tell>,
+) -> Option<Instant> {
+    let first = match until {
+        None => Some(tells.recv().ok()?),
+        Some(until) => match tells.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            Ok(tell) => Some(tell),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+        },
+    };
+    into.extend(first);
+    into.extend(tells.try_iter());
+    Some(Instant::now())
+}
+
+/// This platform's file events, on their own thread `aterm-config-events`; where they do not
+/// start, or off macOS and Linux, a clock alone ([`Deaf`]).
+fn platform_ears(ring: mpsc::Sender<Tell>, tells: mpsc::Receiver<Tell>) -> Box<dyn Ears> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let ended = Ended(ring);
+        let events = aterm_uds::file_watch::FileWatch::platform(
+            "aterm-config-events",
+            Box::new(move |key| {
+                let Ended(ring) = &ended;
+                let _ = ring.send(Tell::Changed(key));
+            }),
+        );
+        match events {
+            Ok(watch) => return Box::new(Heard { watch, tells }),
+            Err(why) => {
+                aterm_log::info!(
+                    "config watcher: no file events ({why}), so the config is looked at every {POLL_INTERVAL:?}"
+                );
+                // The notify never ran: its `Ended`, dropped with it, told of an end no
+                // watch had. A repost this takes too is still raised, and the loop takes it.
+                tells.try_iter().for_each(drop);
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    drop(ring);
+    Box::new(Deaf { tells })
+}
+
+/// Owned by the file watch's notify: dropped as that watch's thread ends, it tells the watcher
+/// so ([`Tell::EventsEnded`]).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct Ended(mpsc::Sender<Tell>);
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Drop for Ended {
+    fn drop(&mut self) {
+        let _ = self.0.send(Tell::EventsEnded);
+    }
+}
+
+/// The platform's file events ([`aterm_uds::file_watch::FileWatch`]).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct Heard {
+    watch: aterm_uds::file_watch::FileWatch,
+    tells: mpsc::Receiver<Tell>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Ears for Heard {
+    fn watch(&mut self, key: u64, path: std::path::PathBuf) {
+        self.watch.watch(key, path);
+    }
+
+    fn watch_directory(&mut self, key: u64, path: std::path::PathBuf) {
+        self.watch.watch_directory(key, path);
+    }
+
+    fn unwatch(&mut self, key: u64) {
+        self.watch.unwatch(key);
+    }
+
+    fn deaf(&self) -> bool {
+        false
+    }
+
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn wait(&mut self, until: Option<Instant>, tells: &mut Vec<Tell>) -> Option<Instant> {
+        rest_on(&self.tells, until, tells)
+    }
+}
+
+/// No file events (off macOS and Linux, or where they did not start): the config is looked at
+/// every [`POLL_INTERVAL`] and the themes on their [`ThemePollSchedule`], and only a
+/// [`Tell::Repost`] wakes the rest early.
+struct Deaf {
+    tells: mpsc::Receiver<Tell>,
+}
+
+impl Ears for Deaf {
+    fn watch(&mut self, _key: u64, _path: std::path::PathBuf) {}
+
+    fn watch_directory(&mut self, _key: u64, _path: std::path::PathBuf) {}
+
+    fn unwatch(&mut self, _key: u64) {}
+
+    fn deaf(&self) -> bool {
+        true
+    }
+
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn wait(&mut self, until: Option<Instant>, tells: &mut Vec<Tell>) -> Option<Instant> {
+        rest_on(&self.tells, until, tells)
+    }
+}
+
+/// The step a held key's change owes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Owes {
+    Config,
+    Themes,
+}
+
+/// A path the watcher holds a key on, and how.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Hold {
+    File(std::path::PathBuf),
+    Directory(std::path::PathBuf),
+}
+
+/// The keys the watcher holds, each for one step. A key is never used twice, so a tell queued
+/// before its path was let go cannot be taken for another path's.
+#[derive(Default)]
+struct Held {
+    next: u64,
+    keys: std::collections::BTreeMap<u64, (Owes, Hold)>,
+}
+
+impl Held {
+    /// Hold `wanted` for `owes`: let go each of its keys whose path left the set and watch each
+    /// path that came, keeping the rest (a path watched again would be told at its first look).
+    fn hold(&mut self, ears: &mut dyn Ears, owes: Owes, mut wanted: BTreeSet<Hold>) {
+        self.keys.retain(|key, (role, hold)| {
+            if *role != owes || wanted.remove(hold) {
+                return true;
+            }
+            ears.unwatch(*key);
+            false
+        });
+        for hold in wanted {
+            let key = self.next;
+            self.next += 1;
+            match &hold {
+                Hold::File(path) => ears.watch(key, path.clone()),
+                Hold::Directory(path) => ears.watch_directory(key, path.clone()),
+            }
+            self.keys.insert(key, (owes, hold));
+        }
+    }
+
+    fn owes(&self, key: u64) -> Option<Owes> {
+        self.keys.get(&key).map(|(owes, _)| *owes)
+    }
+}
+
+/// What the config step reads: the config file and each path feed, through every link a lookup
+/// of each takes ([`aterm_uds::file_watch::link_chain`]), so an edit of a file a link names in
+/// another folder is told too.
+fn config_holds(path: &std::path::Path, feeds: &[std::path::PathBuf]) -> BTreeSet<Hold> {
+    std::iter::once(path)
+        .chain(feeds.iter().map(std::path::PathBuf::as_path))
+        .flat_map(aterm_uds::file_watch::link_chain)
+        .map(Hold::File)
+        .collect()
+}
+
+/// What the theme step reads: the theme folder (its entries), the links a lookup of it takes,
+/// and each theme file discovery reads the bytes of, which can change with no entry changed: of
+/// the `candidates` the stamp read, in name order, the first
+/// [`crate::app_config::MAX_USER_THEME_FILES`] whose names discovery takes
+/// ([`crate::app_config::user_theme_file_read`]). Which files those are changes only with the
+/// folder's entries, which its key hears.
+fn theme_holds(directory: &std::path::Path, candidates: &[std::path::PathBuf]) -> BTreeSet<Hold> {
+    let mut chain = aterm_uds::file_watch::link_chain(directory);
+    let folder = chain.pop().map(Hold::Directory);
+    let read = candidates
+        .iter()
+        .filter(|candidate| crate::app_config::user_theme_file_read(candidate))
+        .take(crate::app_config::MAX_USER_THEME_FILES)
+        .cloned()
+        .map(Hold::File);
+    chain
+        .into_iter()
+        .map(Hold::File)
+        .chain(folder)
+        .chain(read)
+        .collect()
+}
+
+/// The longest a failure no edit ends waits for its next look ([`Retry`]).
+const RETRY_MOST: Duration = Duration::from_secs(10);
+
+/// When a step whose last failure no edit ends ([`ends_with_no_edit`]) looks again: after
+/// [`POLL_INTERVAL`], then twice as long each time it fails so, up to [`RETRY_MOST`]. A success,
+/// or a failure an edit ends, sets no clock.
+#[derive(Default)]
+struct Retry {
+    at: Option<Instant>,
+    every: Duration,
+}
+
+impl Retry {
+    fn due(&self, now: Instant) -> bool {
+        self.at.is_some_and(|at| now >= at)
+    }
+
+    fn after(&mut self, now: Instant, failure: Option<WatchFailureKind>) {
+        if failure.is_some_and(ends_with_no_edit) {
+            self.every = if self.at.is_some() {
+                self.every.saturating_mul(2).min(RETRY_MOST)
+            } else {
+                POLL_INTERVAL
+            };
+            self.at = Some(now + self.every);
+        } else {
+            self.at = None;
+        }
+    }
+}
+
+/// Whether a failure of `kind` can end with no event the watch hears, so the step looks again on
+/// a clock: a refusal or an I/O error (a privacy grant lifts one unseen). An edit ends the rest,
+/// and its event wakes the step: bytes that do not read, a file too large or not a file, a
+/// binding through an unsafe link, or a change made as it read.
+const fn ends_with_no_edit(kind: WatchFailureKind) -> bool {
+    match kind {
+        WatchFailureKind::ConfigUnreadable
+        | WatchFailureKind::ThemeDirectoryUnreadable
+        | WatchFailureKind::ThemeEntryUnreadable
+        | WatchFailureKind::ThemeFileUnavailable => true,
+        WatchFailureKind::ConfigInvalidUtf8
+        | WatchFailureKind::ConfigInvalidToml
+        | WatchFailureKind::ConfigTooLarge
+        | WatchFailureKind::ConfigNotRegular
+        | WatchFailureKind::ConfigChangedWhileReading
+        | WatchFailureKind::ConfigUnsafeBinding
+        | WatchFailureKind::ConfigPreparationFailed
+        | WatchFailureKind::ThemeChangedWhileScanning => false,
+    }
+}
+
+/// The clock of a watcher that hears nothing: the config every [`POLL_INTERVAL`], the themes on
+/// their schedule.
+struct DeafClock {
+    config_at: Instant,
+    themes: ThemePollSchedule,
+}
+
+impl DeafClock {
+    fn new(now: Instant) -> Self {
+        Self {
+            config_at: now,
+            themes: ThemePollSchedule::new(now, None),
+        }
+    }
+}
+
+/// The earliest of `clocks` that is set.
+fn earliest(clocks: impl IntoIterator<Item = Option<Instant>>) -> Option<Instant> {
+    clocks.into_iter().flatten().min()
+}
+
+/// The config-watcher thread [`spawn`] starts. It reads the config and the themes once, holds a
+/// key on each path those reads depend on, and then rests until one is told changed, a seamless
+/// successor's Commit asks for a repost, or a failure no edit ends is due a look; a step whose
+/// stamps did not move reads no bytes. Every post goes through `post`; one refused (the event
+/// loop is gone) ends the thread.
 fn watch(
     path: Option<std::path::PathBuf>,
     startup_config_baseline: Option<crate::native_document_host::AtomicFileBaseline>,
     initial_themes: Arc<crate::app_config::ThemeCatalog>,
-    proxy: EventLoopProxy<Wake>,
     theme_dir: Option<std::path::PathBuf>,
+    post: &mut dyn FnMut(Wake) -> bool,
+    ears: &mut dyn Ears,
+    repost: &Repost,
 ) {
+    let mut held = Held::default();
+    // Held before the first read, so an edit after the read is heard; the feeds come with it.
+    if let Some(path) = path.as_deref() {
+        held.hold(ears, Owes::Config, config_holds(path, &[]));
+    }
     let mut last_config_stamp = path
         .as_deref()
         .and_then(|path| config_path_stamp(path).ok());
@@ -292,7 +630,7 @@ fn watch(
     if let Some(initial) = initial_config.as_ref()
         && let Some(policy) = observed_harness(path.as_deref(), initial)
         && !post_harness(
-            send_harness(&proxy),
+            send_harness(post),
             &mut last_harness,
             &mut harness_stamps,
             policy,
@@ -302,7 +640,7 @@ fn watch(
     }
     if let Some(Err(error)) = initial_config.as_ref()
         && !post_status(
-            &proxy,
+            post,
             &mut config_failure,
             WatchTarget::Config,
             Some(config_failure_kind(error)),
@@ -310,50 +648,71 @@ fn watch(
     {
         return;
     }
+    let mut now = ears.now();
+    let mut config_retry = Retry::default();
+    if let Some(Err(error)) = initial_config.as_ref() {
+        config_retry.after(now, Some(config_failure_kind(error)));
+    }
     if let Some(Ok(observation)) = initial_config
         && initial_config_observation_changed(startup_config_baseline.as_ref(), &observation)
-        && proxy
-            .send_event(Wake::ConfigReloadObserved(observation))
-            .is_err()
+        && !post(Wake::ConfigReloadObserved(observation))
     {
         return;
+    }
+    if let Some(path) = path.as_deref() {
+        held.hold(ears, Owes::Config, config_holds(path, &feed_paths));
     }
 
     let initial_theme_stamp = theme_dir.as_deref().map(theme_directory_stamp);
-    let mut theme_poll = ThemePollSchedule::new(Instant::now(), initial_theme_stamp.clone());
     let mut last_theme_stamp = None;
     let mut theme_failure = FailureLatch::default();
     if let Some(Err(kind)) = initial_theme_stamp.as_ref()
-        && !post_status(&proxy, &mut theme_failure, WatchTarget::Themes, Some(*kind))
+        && !post_status(post, &mut theme_failure, WatchTarget::Themes, Some(*kind))
     {
         return;
     }
+    let mut deaf = ears.deaf().then(|| DeafClock {
+        config_at: now + POLL_INTERVAL,
+        themes: ThemePollSchedule::new(now, initial_theme_stamp.clone()),
+    });
     let mut themes = initial_themes;
     let mut theme_repost = false;
+    let mut theme_retry = Retry::default();
+    let mut theme_candidates = Vec::new();
+    // The first theme step reads the catalog as it stands and finds what to hold.
+    let mut themes_owed = deaf.is_none();
+    let mut config_owed = false;
+    let mut tells = Vec::new();
     loop {
-        std::thread::sleep(POLL_INTERVAL);
-        if REPOST_AFTER_COMMIT.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            last_harness = None;
+        if forget_after_commit(repost, &mut last_harness) {
             config_failure.forget();
             config_needs_retry = true;
             theme_failure.forget();
             last_theme_stamp = None;
             theme_repost = true;
+            config_owed = true;
+            themes_owed = true;
         }
-        if let Some(path) = path.as_deref() {
+        if let Some(path) = path.as_deref()
+            && (std::mem::take(&mut config_owed)
+                || config_retry.due(now)
+                || deaf.as_ref().is_some_and(|clock| now >= clock.config_at))
+        {
+            let mut failed = None;
             match config_path_stamp(path) {
                 Err(kind) => {
+                    failed = Some(kind);
                     config_needs_retry = true;
                     if !post_stamp_refusal(
-                        send_harness(&proxy),
+                        send_harness(post),
                         &mut last_harness,
                         &mut harness_stamps,
                         path,
                     ) {
-                        break;
+                        return;
                     }
-                    if !post_status(&proxy, &mut config_failure, WatchTarget::Config, Some(kind)) {
-                        break;
+                    if !post_status(post, &mut config_failure, WatchTarget::Config, Some(kind)) {
+                        return;
                     }
                 }
                 Ok(stamp) => {
@@ -370,62 +729,70 @@ fn watch(
                         // observation's admission reports under it.
                         if let Some(policy) = observed_harness(Some(path), &observation)
                             && !post_harness(
-                                send_harness(&proxy),
+                                send_harness(post),
                                 &mut last_harness,
                                 &mut harness_stamps,
                                 policy,
                             )
                         {
-                            break;
+                            return;
                         }
                         match observation {
                             Ok(observation) => {
                                 // Re-derive the feed set from this text and stamp it
                                 // before posting, so an edit racing the UI's read is
-                                // the next poll's edge. An unparseable config keeps
+                                // the next step's edge. An unparseable config keeps
                                 // the last known set (admission rejects the text).
                                 if let Some(paths) = feed_paths_of(&observation.text) {
                                     feed_paths = paths;
                                 }
                                 last_feed_stamp = path_feed_stamp(&feed_paths);
-                                if proxy
-                                    .send_event(Wake::ConfigReloadObserved(observation))
-                                    .is_err()
-                                {
-                                    break;
+                                if !post(Wake::ConfigReloadObserved(observation)) {
+                                    return;
                                 }
                                 config_failure.clear_silently();
                                 config_needs_retry = false;
                                 last_config_stamp = Some(stamp);
                             }
                             Err(error) => {
+                                let kind = config_failure_kind(&error);
+                                failed = Some(kind);
                                 config_needs_retry = true;
                                 if !post_status(
-                                    &proxy,
+                                    post,
                                     &mut config_failure,
                                     WatchTarget::Config,
-                                    Some(config_failure_kind(&error)),
+                                    Some(kind),
                                 ) {
-                                    break;
+                                    return;
                                 }
                             }
                         }
                     }
                 }
             }
+            config_retry.after(now, failed);
+            if let Some(clock) = deaf.as_mut() {
+                clock.config_at = now + POLL_INTERVAL;
+            }
+            held.hold(ears, Owes::Config, config_holds(path, &feed_paths));
         }
 
         if let Some(directory) = theme_dir.as_deref()
-            && theme_poll.due(Instant::now())
+            && (std::mem::take(&mut themes_owed)
+                || theme_retry.due(now)
+                || deaf.as_ref().is_some_and(|clock| clock.themes.due(now)))
         {
-            let sample = match theme_directory_stamp(directory) {
+            let sample = match theme_directory_read(directory) {
                 Err(kind) => {
-                    if !post_status(&proxy, &mut theme_failure, WatchTarget::Themes, Some(kind)) {
-                        break;
+                    if !post_status(post, &mut theme_failure, WatchTarget::Themes, Some(kind)) {
+                        return;
                     }
                     Err(kind)
                 }
-                Ok(stamp) => {
+                Ok((stamp, candidates)) => {
+                    // A read that fails keeps the files the last one held.
+                    theme_candidates = candidates;
                     let sampled_stamp = stamp.clone();
                     match prepare_theme_edge_with(
                         directory,
@@ -441,43 +808,79 @@ fn watch(
                             // A complete metadata scan also proves recovery from
                             // a transient stamp failure when the generation did
                             // not otherwise change. No theme bytes are reopened.
-                            if !post_status(&proxy, &mut theme_failure, WatchTarget::Themes, None) {
-                                break;
+                            if !post_status(post, &mut theme_failure, WatchTarget::Themes, None) {
+                                return;
                             }
                             Ok(sampled_stamp)
                         }
                         Some(Err(kind)) => {
                             if !post_status(
-                                &proxy,
+                                post,
                                 &mut theme_failure,
                                 WatchTarget::Themes,
                                 Some(kind),
                             ) {
-                                break;
+                                return;
                             }
                             Err(kind)
                         }
                         Some(Ok((stable_stamp, discovered))) => {
                             if theme_repost || *discovered != *themes {
-                                if proxy
-                                    .send_event(Wake::ThemeCatalogChanged(Arc::clone(&discovered)))
-                                    .is_err()
-                                {
-                                    break;
+                                if !post(Wake::ThemeCatalogChanged(Arc::clone(&discovered))) {
+                                    return;
                                 }
                                 themes = discovered;
                                 theme_repost = false;
                             }
                             last_theme_stamp = Some(stable_stamp.clone());
-                            if !post_status(&proxy, &mut theme_failure, WatchTarget::Themes, None) {
-                                break;
+                            if !post_status(post, &mut theme_failure, WatchTarget::Themes, None) {
+                                return;
                             }
                             Ok(stable_stamp)
                         }
                     }
                 }
             };
-            theme_poll.observed(Instant::now(), sample);
+            theme_retry.after(now, sample.as_ref().err().copied());
+            if let Some(clock) = deaf.as_mut() {
+                clock.themes.observed(now, sample);
+            }
+            held.hold(
+                ears,
+                Owes::Themes,
+                theme_holds(directory, &theme_candidates),
+            );
+        }
+
+        let until = earliest([
+            config_retry.at,
+            theme_retry.at,
+            deaf.as_ref()
+                .filter(|_| path.is_some())
+                .map(|clock| clock.config_at),
+            deaf.as_ref()
+                .filter(|_| theme_dir.is_some())
+                .map(|clock| clock.themes.next_poll),
+        ]);
+        let Some(woke) = ears.wait(until, &mut tells) else {
+            return;
+        };
+        now = woke;
+        for tell in tells.drain(..) {
+            match tell {
+                Tell::Changed(key) => match held.owes(key) {
+                    Some(Owes::Config) => config_owed = true,
+                    Some(Owes::Themes) => themes_owed = true,
+                    None => {}
+                },
+                // The flag it raised is taken at the loop's top.
+                Tell::Repost => {}
+                Tell::EventsEnded => {
+                    deaf.get_or_insert_with(|| DeafClock::new(now));
+                    config_owed = true;
+                    themes_owed = true;
+                }
+            }
         }
     }
 }
@@ -563,35 +966,94 @@ fn post_harness(
 
 /// The watcher's post of a policy to the window.
 fn send_harness(
-    proxy: &EventLoopProxy<Wake>,
+    post: &mut dyn FnMut(Wake) -> bool,
 ) -> impl FnOnce(crate::harness_policy_cell::StampedHarnessPolicy) -> bool + '_ {
-    move |policy| {
-        proxy
-            .send_event(Wake::HarnessPolicyObserved(policy))
-            .is_ok()
+    move |policy| post(Wake::HarnessPolicyObserved(policy))
+}
+
+/// A seamless successor's Commit, for the watcher: every config wake before it was dropped
+/// (`App::drops_wake_before_commit`), so the watcher's next step posts the file again. `raised`
+/// is the request, which [`forget_after_commit`] takes; `ring` wakes the watcher's rest for it.
+struct Repost {
+    raised: std::sync::atomic::AtomicBool,
+    ring: std::sync::Mutex<Option<mpsc::Sender<Tell>>>,
+}
+
+impl Repost {
+    const fn new() -> Self {
+        Self {
+            raised: std::sync::atomic::AtomicBool::new(false),
+            ring: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Wake the watcher resting on `ring` at each [`Self::raise`].
+    fn listen(&self, ring: mpsc::Sender<Tell>) {
+        *self
+            .ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ring);
+    }
+
+    #[cfg(any(unix, test))]
+    fn raise(&self) {
+        self.raised
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(ring) = self
+            .ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            let _ = ring.send(Tell::Repost);
+        }
+    }
+
+    fn take(&self) -> bool {
+        self.raised
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 }
 
-/// Set at a seamless successor's Commit ([`repost_after_commit`]); the
-/// watcher's next poll re-posts the config file as it stands.
-static REPOST_AFTER_COMMIT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// The running watcher's [`Repost`] ([`repost_after_commit`]).
+static REPOST_AFTER_COMMIT: Repost = Repost::new();
 
 /// The successor reached Commit: every config wake before it was dropped (`App::drops_wake_before_commit`), so the watcher posts the file again.
 #[cfg(unix)]
 pub(crate) fn repost_after_commit() {
-    REPOST_AFTER_COMMIT.store(true, std::sync::atomic::Ordering::Relaxed);
+    REPOST_AFTER_COMMIT.raise();
+}
+
+/// The protocol's Forget: once a seamless successor's Commit raised `repost`, the watcher
+/// forgets the policy it posted, so its next read posts again what the window dropped.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "HarnessPolicyOneWriter",
+        action = "Forget",
+        project = "aterm_gui::config_watcher::tests::project_harness_writer"
+    )
+)]
+fn forget_after_commit(
+    repost: &Repost,
+    last: &mut Option<crate::app_config::HarnessPolicy>,
+) -> bool {
+    if !repost.take() {
+        return false;
+    }
+    *last = None;
+    true
 }
 
 fn post_status(
-    proxy: &EventLoopProxy<Wake>,
+    post: &mut dyn FnMut(Wake) -> bool,
     latch: &mut FailureLatch,
     target: WatchTarget,
     failure: Option<WatchFailureKind>,
 ) -> bool {
     latch
         .transition(target, failure)
-        .is_none_or(|event| proxy.send_event(Wake::ConfigWatchStatus(event)).is_ok())
+        .is_none_or(|event| post(Wake::ConfigWatchStatus(event)))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -829,6 +1291,14 @@ fn theme_directory_stamp(path: &std::path::Path) -> Result<ThemeDirectoryStamp, 
     theme_directory_stamp_capped(path, crate::app_config::ThemeScanCaps::PRODUCTION)
 }
 
+/// [`theme_directory_stamp`], and the theme files it stamped, in name order: the watcher holds
+/// a key on those discovery reads ([`theme_holds`]).
+fn theme_directory_read(
+    path: &std::path::Path,
+) -> Result<(ThemeDirectoryStamp, Vec<std::path::PathBuf>), WatchFailureKind> {
+    theme_directory_read_capped(path, crate::app_config::ThemeScanCaps::PRODUCTION)
+}
+
 /// [`theme_directory_stamp`] reading at most `caps.entries` entries (`truncated`
 /// past it) and keeping the metadata of at most `caps.candidates` candidates —
 /// discovery's own bounds ([`crate::app_config::ThemeScanCaps`]).
@@ -836,6 +1306,14 @@ fn theme_directory_stamp_capped(
     path: &std::path::Path,
     caps: crate::app_config::ThemeScanCaps,
 ) -> Result<ThemeDirectoryStamp, WatchFailureKind> {
+    theme_directory_read_capped(path, caps).map(|(stamp, _)| stamp)
+}
+
+/// [`theme_directory_stamp_capped`], and the candidates whose metadata it stamped.
+fn theme_directory_read_capped(
+    path: &std::path::Path,
+    caps: crate::app_config::ThemeScanCaps,
+) -> Result<(ThemeDirectoryStamp, Vec<std::path::PathBuf>), WatchFailureKind> {
     let cap = caps.entries;
     let directory_metadata = match std::fs::metadata(path) {
         Ok(metadata) => Some(metadata),
@@ -885,17 +1363,22 @@ fn theme_directory_stamp_capped(
     inspected_entries.hash(&mut hasher);
     truncated.hash(&mut hasher);
     let candidate_metadata = candidates.len();
+    let mut stamped = Vec::with_capacity(candidate_metadata);
     for candidate in candidates {
         candidate.hash(&mut hasher);
         let metadata = std::fs::symlink_metadata(&candidate).map_err(theme_entry_failure_kind)?;
         hash_file_metadata(&metadata, &mut hasher);
+        stamped.push(candidate);
     }
-    Ok(ThemeDirectoryStamp {
-        fingerprint: hasher.finish(),
-        inspected_entries,
-        candidate_metadata,
-        truncated,
-    })
+    Ok((
+        ThemeDirectoryStamp {
+            fingerprint: hasher.finish(),
+            inspected_entries,
+            candidate_metadata,
+            truncated,
+        },
+        stamped,
+    ))
 }
 
 fn theme_entry_failure_kind(error: std::io::Error) -> WatchFailureKind {
@@ -1026,14 +1509,7 @@ impl crate::App {
     reason = "A seamless successor's Commit (Wake::ActivateCommittedHandoff), bound by the \
               native-update handoff machines. Its one effect here, repost_after_commit, \
               raises the process-wide REPOST_AFTER_COMMIT that a live watcher thread in \
-              the same test binary could consume, so the Tier-1 stands in for it."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "HarnessPolicyOneWriter",
-    action = "Forget",
-    reason = "An inline block of the watcher thread's loop (REPOST_AFTER_COMMIT's swap, \
-              then last_harness = None), which the Tier-1 transcribes: the loop polls \
-              forever and posts through a real event-loop proxy."
+              the same test binary could consume, so the Tier-1 raises a Repost of its own."
 )]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "HarnessPolicyOneWriter",
@@ -1413,7 +1889,8 @@ pub(crate) mod tests {
         /// The watcher's post in flight in the event loop's queue.
         queued: Option<crate::harness_policy_cell::StampedHarnessPolicy>,
         committed: bool,
-        forget_pending: bool,
+        /// The Commit's request to the watcher: raised, its forget is pending.
+        repost: super::Repost,
         disk: i64,
         edits: i64,
         model: aterm_spec::derive::Model,
@@ -1429,7 +1906,9 @@ pub(crate) mod tests {
                 self.queued.as_ref().map(|stamped| stamped.policy()),
                 self.app.harness_policy.get(),
                 self.committed,
-                self.forget_pending,
+                self.repost
+                    .raised
+                    .load(std::sync::atomic::Ordering::Relaxed),
             )
         }
 
@@ -1560,21 +2039,19 @@ pub(crate) mod tests {
         }
 
         /// A seamless successor's Commit: the window runs what it handles from
-        /// here on, and the handler raises `REPOST_AFTER_COMMIT`.
+        /// here on, and the handler raises the watcher's `Repost`.
         fn commit(&mut self) {
             self.step("Commit", |d| {
                 d.committed = true;
-                d.forget_pending = true;
+                d.repost.raise();
             });
         }
 
-        /// The watcher's next loop consumes the flag and forgets what it posted
-        /// (the `REPOST_AFTER_COMMIT` block's `last_harness = None`).
+        /// The watcher's next step takes the request and forgets what it posted: the real
+        /// `forget_after_commit`.
         fn forget(&mut self) {
             self.step("Forget", |d| {
-                if std::mem::take(&mut d.forget_pending) {
-                    d.last = None;
-                }
+                super::forget_after_commit(&d.repost, &mut d.last);
             });
         }
     }
@@ -1605,7 +2082,7 @@ pub(crate) mod tests {
             stamps: crate::harness_policy_cell::HarnessStampSource::new(),
             queued: None,
             committed: false,
-            forget_pending: false,
+            repost: super::Repost::new(),
             disk: 0,
             edits: 0,
             model: aterm_models_harness::harness_policy_one_writer_model(),
@@ -2380,6 +2857,731 @@ pub(crate) mod tests {
             "a later read failure invalidates the pending recovery ticket"
         );
         assert!(state.message().is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Rewrite the config at `path` as an editor would, once the filesystem's clock has moved
+    /// past its last change: two same-length writes inside one tick leave every stamp equal.
+    fn rewrite(path: &std::path::Path, text: impl AsRef<[u8]>) {
+        #[cfg(unix)]
+        after_ctime_tick(path);
+        crate::test_scratch::write_config(path, text);
+    }
+
+    /// The real watcher loop ([`super::watch`]) over scripted ears: a clock that moves only when
+    /// a rest runs out, every key held and let go (a key is never used twice), each rest's
+    /// deadline from the clock, and the script's turns, one at each rest. A turn may change
+    /// files and returns what it tells; one that tells nothing lets the rest run out. The watch
+    /// ends at the script's end.
+    struct Script {
+        now: std::time::Instant,
+        deaf: bool,
+        held: std::collections::BTreeMap<u64, super::Hold>,
+        keys: std::collections::BTreeSet<u64>,
+        let_go: Vec<u64>,
+        rests: Vec<Option<std::time::Duration>>,
+        turns: std::collections::VecDeque<Turn>,
+    }
+
+    type Turn = Box<dyn FnOnce(&mut Script) -> Vec<super::Tell>>;
+
+    impl Script {
+        fn new(deaf: bool, turns: Vec<Turn>) -> Self {
+            Self {
+                now: std::time::Instant::now(),
+                deaf,
+                held: std::collections::BTreeMap::new(),
+                keys: std::collections::BTreeSet::new(),
+                let_go: Vec::new(),
+                rests: Vec::new(),
+                turns: turns.into(),
+            }
+        }
+
+        /// A tell of each key held on `path`.
+        fn on(&self, path: &std::path::Path) -> Vec<super::Tell> {
+            let tells: Vec<_> = self
+                .held
+                .iter()
+                .filter(|(_, hold)| {
+                    matches!(hold, super::Hold::File(held) | super::Hold::Directory(held) if held == path)
+                })
+                .map(|(key, _)| super::Tell::Changed(*key))
+                .collect();
+            assert!(!tells.is_empty(), "{} is held", path.display());
+            tells
+        }
+
+        fn rest(&self) -> Option<std::time::Duration> {
+            *self.rests.last().expect("a rest")
+        }
+
+        fn holds(&self) -> std::collections::BTreeSet<super::Hold> {
+            self.held.values().cloned().collect()
+        }
+    }
+
+    impl super::Ears for Script {
+        fn watch(&mut self, key: u64, path: std::path::PathBuf) {
+            assert!(self.keys.insert(key), "key {key} used again");
+            self.held.insert(key, super::Hold::File(path));
+        }
+
+        fn watch_directory(&mut self, key: u64, path: std::path::PathBuf) {
+            assert!(self.keys.insert(key), "key {key} used again");
+            self.held.insert(key, super::Hold::Directory(path));
+        }
+
+        fn unwatch(&mut self, key: u64) {
+            assert!(self.held.remove(&key).is_some(), "key {key} let go twice");
+            self.let_go.push(key);
+        }
+
+        fn deaf(&self) -> bool {
+            self.deaf
+        }
+
+        fn now(&self) -> std::time::Instant {
+            self.now
+        }
+
+        fn wait(
+            &mut self,
+            until: Option<std::time::Instant>,
+            tells: &mut Vec<super::Tell>,
+        ) -> Option<std::time::Instant> {
+            self.rests
+                .push(until.map(|until| until.saturating_duration_since(self.now)));
+            let turn = self.turns.pop_front()?;
+            let told = turn(self);
+            if told.is_empty() {
+                self.now = until.expect("a rest no clock ends and nothing tells never ends");
+            }
+            tells.extend(told);
+            Some(self.now)
+        }
+    }
+
+    /// What the watcher posted, in order.
+    #[derive(Clone, Default)]
+    struct Posts(std::rc::Rc<std::cell::RefCell<Vec<crate::Wake>>>);
+
+    impl Posts {
+        /// The text of each config read posted.
+        fn reads(&self) -> Vec<String> {
+            self.0
+                .borrow()
+                .iter()
+                .filter_map(|wake| match wake {
+                    crate::Wake::ConfigReloadObserved(observation) => {
+                        Some(observation.text.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn statuses(&self) -> Vec<WatchStatusEvent> {
+            self.0
+                .borrow()
+                .iter()
+                .filter_map(|wake| match wake {
+                    crate::Wake::ConfigWatchStatus(event) => Some(*event),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn policies(&self) -> usize {
+            self.0
+                .borrow()
+                .iter()
+                .filter(|wake| matches!(wake, crate::Wake::HarnessPolicyObserved(_)))
+                .count()
+        }
+
+        fn catalogs(&self) -> usize {
+            self.0
+                .borrow()
+                .iter()
+                .filter(|wake| matches!(wake, crate::Wake::ThemeCatalogChanged(_)))
+                .count()
+        }
+    }
+
+    /// Run the real watcher on `config` and `themes` over `script`, every post into `posts`.
+    fn run_watch(
+        config: Option<&std::path::Path>,
+        themes: Option<&std::path::Path>,
+        script: &mut Script,
+        posts: &Posts,
+        repost: &super::Repost,
+    ) {
+        let initial = themes.map_or_else(
+            || std::sync::Arc::new(crate::app_config::ThemeCatalog::default()),
+            |dir| {
+                std::sync::Arc::new(crate::app_config::ThemeCatalog::try_discover_in(dir).unwrap())
+            },
+        );
+        let sink = posts.clone();
+        super::watch(
+            config.map(std::path::Path::to_path_buf),
+            None,
+            initial,
+            themes.map(std::path::Path::to_path_buf),
+            &mut move |wake| {
+                sink.0.borrow_mut().push(wake);
+                true
+            },
+            script,
+            repost,
+        );
+    }
+
+    fn watch_scratch(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-config-watch-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::canonicalize(&dir).unwrap()
+    }
+
+    /// At rest the watcher waits for a tell with no clock. A tell whose stamps did not move reads
+    /// nothing; a tell of an edit reads and posts it; a theme file's bytes rewritten in place,
+    /// which changes no entry of its folder, are held and told too.
+    #[test]
+    fn the_watcher_rests_untimed_and_reads_what_it_is_told() {
+        let dir = watch_scratch("rest");
+        let config = dir.join("aterm.toml");
+        crate::test_scratch::write_config(&config, "font_px = 14\n");
+        let themes = dir.join("themes");
+        std::fs::create_dir(&themes).unwrap();
+        let theme = themes.join("paper.conf");
+        std::fs::write(&theme, "foreground = #202020\nbackground = #fafafa\n").unwrap();
+        let posts = Posts::default();
+        let seen = posts.clone();
+        let (edited, conf, file) = (config.clone(), themes.clone(), theme.clone());
+        let mut script = Script::new(
+            false,
+            vec![
+                // The first theme step's holds: told at their first look, as a file watch does.
+                Box::new(move |s: &mut Script| {
+                    let mut tells = s.on(&conf);
+                    tells.extend(s.on(&file));
+                    tells
+                }),
+                Box::new(move |s: &mut Script| {
+                    assert_eq!(s.rest(), None, "nothing to look at on a clock");
+                    assert_eq!(seen.reads().len(), 1, "the first read");
+                    s.on(&edited)
+                }),
+                Box::new({
+                    let seen = posts.clone();
+                    let edited = config.clone();
+                    move |s: &mut Script| {
+                        assert_eq!(
+                            seen.reads().len(),
+                            1,
+                            "a tell that moved no stamp reads nothing"
+                        );
+                        rewrite(&edited, "font_px = 16\n");
+                        s.on(&edited)
+                    }
+                }),
+                Box::new({
+                    let seen = posts.clone();
+                    let file = theme.clone();
+                    move |s: &mut Script| {
+                        assert_eq!(
+                            seen.reads().last().map(String::as_str),
+                            Some("font_px = 16\n")
+                        );
+                        assert_eq!(s.rest(), None);
+                        #[cfg(unix)]
+                        after_ctime_tick(&file);
+                        std::fs::write(&file, "foreground = #101010\nbackground = #ffffff\n")
+                            .unwrap();
+                        s.on(&file)
+                    }
+                }),
+            ],
+        );
+        run_watch(
+            Some(&config),
+            Some(&themes),
+            &mut script,
+            &posts,
+            &super::Repost::new(),
+        );
+        assert_eq!(posts.reads().len(), 2);
+        assert_eq!(posts.catalogs(), 1, "the theme file's bytes, told");
+        assert_eq!(script.rest(), None);
+        assert_eq!(
+            script.holds(),
+            [
+                super::Hold::File(config.clone()),
+                super::Hold::File(theme.clone()),
+                super::Hold::Directory(themes.clone()),
+            ]
+            .into_iter()
+            .collect(),
+            "the config, the theme folder and the theme file it read"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A config reached through links holds each one and the file they end at, in another folder:
+    /// that file edited in place, which changes nothing the link's folder holds, is read.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_config_holds_each_hop_and_reads_the_file_it_names_edited() {
+        let dir = watch_scratch("links");
+        let dotfiles = dir.join("dotfiles");
+        let conf = dir.join("conf");
+        std::fs::create_dir(&dotfiles).unwrap();
+        std::fs::create_dir(&conf).unwrap();
+        let target = dotfiles.join("aterm.toml");
+        crate::test_scratch::write_config(&target, "font_px = 14\n");
+        let middle = conf.join("middle.toml");
+        std::os::unix::fs::symlink(&target, &middle).unwrap();
+        let config = conf.join("aterm.toml");
+        std::os::unix::fs::symlink("middle.toml", &config).unwrap();
+        let posts = Posts::default();
+        let edited = target.clone();
+        let mut script = Script::new(
+            false,
+            vec![Box::new(move |s: &mut Script| {
+                rewrite(&edited, "font_px = 18\n");
+                s.on(&edited)
+            })],
+        );
+        run_watch(
+            Some(&config),
+            None,
+            &mut script,
+            &posts,
+            &super::Repost::new(),
+        );
+        assert_eq!(
+            script.holds(),
+            [config.clone(), middle.clone(), target.clone()]
+                .into_iter()
+                .map(super::Hold::File)
+                .collect(),
+            "every hop"
+        );
+        assert_eq!(
+            posts.reads().last().map(String::as_str),
+            Some("font_px = 18\n")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A refusal no edit ends (a file its user cannot read) is looked at again on a clock that
+    /// backs off to its most; once readable, the config is read and the watcher rests untimed.
+    #[cfg(unix)]
+    #[test]
+    fn a_refusal_no_edit_ends_is_looked_at_again_backing_off() {
+        use std::os::unix::fs::PermissionsExt as _;
+        aterm_uds::host::could_not_run_as_root("a config of mode 000");
+        let dir = watch_scratch("refused");
+        let config = dir.join("aterm.toml");
+        crate::test_scratch::write_config(&config, "font_px = 14\n");
+        let posts = Posts::default();
+        let mode = |path: &std::path::Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let mut turns: Vec<Turn> = vec![Box::new({
+            let config = config.clone();
+            move |s: &mut Script| {
+                mode(&config, 0o000);
+                s.on(&config)
+            }
+        })];
+        for _ in 0..7 {
+            turns.push(Box::new(|_: &mut Script| Vec::new()));
+        }
+        turns.push(Box::new({
+            let config = config.clone();
+            move |_: &mut Script| {
+                mode(&config, 0o600);
+                Vec::new()
+            }
+        }));
+        let mut script = Script::new(false, turns);
+        run_watch(
+            Some(&config),
+            None,
+            &mut script,
+            &posts,
+            &super::Repost::new(),
+        );
+        let ms = |ms| Some(std::time::Duration::from_millis(ms));
+        assert_eq!(
+            script.rests,
+            [
+                None,
+                ms(500),
+                ms(1000),
+                ms(2000),
+                ms(4000),
+                ms(8000),
+                ms(10_000),
+                ms(10_000),
+                ms(10_000),
+                None,
+            ],
+            "no clock, then one that backs off from the refusal, then none again"
+        );
+        assert!(
+            posts
+                .statuses()
+                .contains(&WatchStatusEvent::Failed(WatchFailure {
+                    target: WatchTarget::Config,
+                    kind: WatchFailureKind::ConfigUnreadable,
+                }))
+        );
+        assert_eq!(
+            posts.reads().len(),
+            2,
+            "read at start and once readable again"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A failure an edit ends (bytes that are not UTF-8) sets no clock: the edit that ends it is
+    /// told, and read.
+    #[test]
+    fn a_failure_an_edit_ends_waits_for_the_edit() {
+        let dir = watch_scratch("edit-ends");
+        let config = dir.join("aterm.toml");
+        crate::test_scratch::write_config(&config, "font_px = 14\n");
+        let posts = Posts::default();
+        let mut script = Script::new(
+            false,
+            vec![
+                Box::new({
+                    let config = config.clone();
+                    move |s: &mut Script| {
+                        rewrite(&config, b"# caf\xe9\n");
+                        s.on(&config)
+                    }
+                }),
+                Box::new({
+                    let config = config.clone();
+                    move |s: &mut Script| {
+                        assert_eq!(s.rest(), None, "no clock for a failure an edit ends");
+                        rewrite(&config, "font_px = 15\n");
+                        s.on(&config)
+                    }
+                }),
+            ],
+        );
+        run_watch(
+            Some(&config),
+            None,
+            &mut script,
+            &posts,
+            &super::Repost::new(),
+        );
+        assert!(
+            posts
+                .statuses()
+                .contains(&WatchStatusEvent::Failed(WatchFailure {
+                    target: WatchTarget::Config,
+                    kind: WatchFailureKind::ConfigInvalidUtf8,
+                }))
+        );
+        assert_eq!(
+            posts.reads().last().map(String::as_str),
+            Some("font_px = 15\n")
+        );
+        assert_eq!(script.rest(), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A seamless successor's Commit wakes the resting watcher (its [`super::Repost`] tells the
+    /// ring it listens on), which posts the policy, the config and the theme catalog again, as
+    /// they stand: the window dropped every wake before it.
+    #[test]
+    fn a_commit_wakes_the_watcher_to_post_everything_again() {
+        let dir = watch_scratch("repost");
+        let config = dir.join("aterm.toml");
+        crate::test_scratch::write_config(&config, "font_px = 14\n");
+        let themes = dir.join("themes");
+        std::fs::create_dir(&themes).unwrap();
+        let posts = Posts::default();
+        let repost = std::sync::Arc::new(super::Repost::new());
+        let (ring, heard) = std::sync::mpsc::channel();
+        repost.listen(ring);
+        let raised = std::sync::Arc::clone(&repost);
+        let seen = posts.clone();
+        let mut script = Script::new(
+            false,
+            vec![Box::new(move |_: &mut Script| {
+                assert_eq!(
+                    (seen.policies(), seen.reads().len(), seen.catalogs()),
+                    (1, 1, 0),
+                    "control: one of each read at the start, and the catalog as it stood"
+                );
+                raised.raise();
+                heard.try_iter().collect()
+            })],
+        );
+        run_watch(Some(&config), Some(&themes), &mut script, &posts, &repost);
+        assert_eq!(
+            (posts.policies(), posts.reads().len(), posts.catalogs()),
+            (2, 2, 1),
+            "each posted again"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The file watch's thread ending turns the watcher to its clock: it looks every
+    /// [`POLL_INTERVAL`], so an edit no event tells is read at the next look.
+    #[test]
+    fn events_ended_turns_the_watcher_to_its_clock() {
+        let dir = watch_scratch("ended");
+        let config = dir.join("aterm.toml");
+        crate::test_scratch::write_config(&config, "font_px = 14\n");
+        let posts = Posts::default();
+        let mut script = Script::new(
+            false,
+            vec![
+                Box::new(|_: &mut Script| vec![super::Tell::EventsEnded]),
+                Box::new({
+                    let config = config.clone();
+                    move |s: &mut Script| {
+                        assert_eq!(s.rest(), Some(POLL_INTERVAL));
+                        rewrite(&config, "font_px = 17\n");
+                        Vec::new()
+                    }
+                }),
+            ],
+        );
+        run_watch(
+            Some(&config),
+            None,
+            &mut script,
+            &posts,
+            &super::Repost::new(),
+        );
+        assert_eq!(
+            posts.reads().last().map(String::as_str),
+            Some("font_px = 17\n")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A watcher that hears nothing looks on today's clock: the config every [`POLL_INTERVAL`]
+    /// from the start, and an edit is read at the next look.
+    #[test]
+    fn deaf_ears_look_every_poll_interval() {
+        let dir = watch_scratch("deaf");
+        let config = dir.join("aterm.toml");
+        crate::test_scratch::write_config(&config, "font_px = 14\n");
+        let posts = Posts::default();
+        let mut script = Script::new(
+            true,
+            vec![
+                Box::new({
+                    let config = config.clone();
+                    move |s: &mut Script| {
+                        assert_eq!(s.rest(), Some(POLL_INTERVAL));
+                        rewrite(&config, "font_px = 19\n");
+                        Vec::new()
+                    }
+                }),
+                Box::new(|s: &mut Script| {
+                    assert_eq!(s.rest(), Some(POLL_INTERVAL));
+                    Vec::new()
+                }),
+            ],
+        );
+        run_watch(
+            Some(&config),
+            None,
+            &mut script,
+            &posts,
+            &super::Repost::new(),
+        );
+        assert_eq!(
+            posts.reads().last().map(String::as_str),
+            Some("font_px = 19\n")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A key's hold changes only by what left its step's set and what came: a path still wanted
+    /// keeps its key, one let go is unwatched, and a path that comes again gets a new key, so a
+    /// tell queued for the old one cannot be taken for it.
+    #[test]
+    fn held_keys_change_by_the_difference_and_are_never_reused() {
+        use super::{Ears as _, Hold, Owes};
+        let file = |name: &str| Hold::File(std::path::PathBuf::from(format!("/scratch/{name}")));
+        let mut ears = Script::new(false, Vec::new());
+        let mut held = super::Held::default();
+        held.hold(&mut ears, Owes::Config, [file("a"), file("b")].into());
+        held.hold(&mut ears, Owes::Themes, [file("a")].into());
+        let first = ears.held.clone();
+        held.hold(&mut ears, Owes::Config, [file("b"), file("c")].into());
+        assert_eq!(ears.let_go, [0], "a let go");
+        assert_eq!(ears.held.get(&1), first.get(&1), "b kept its key");
+        assert_eq!(
+            ears.held.get(&2),
+            Some(&file("a")),
+            "the theme step's own a"
+        );
+        assert_eq!(held.owes(2), Some(Owes::Themes));
+        held.hold(
+            &mut ears,
+            Owes::Config,
+            [file("a"), file("b"), file("c")].into(),
+        );
+        assert_eq!(held.owes(0), None, "the old key is no one's");
+        assert_eq!(
+            held.owes(4),
+            Some(Owes::Config),
+            "a came again with a new key"
+        );
+        assert!(!ears.deaf());
+    }
+
+    /// The retry clock: none for a success or a failure an edit ends, and from
+    /// [`POLL_INTERVAL`] doubling to its most while the failure no edit ends goes on.
+    #[test]
+    fn the_retry_clock_backs_off_only_for_a_failure_no_edit_ends() {
+        let start = std::time::Instant::now();
+        let mut retry = super::Retry::default();
+        retry.after(start, Some(WatchFailureKind::ConfigInvalidUtf8));
+        assert_eq!(retry.at, None);
+        let mut waits = Vec::new();
+        let mut now = start;
+        for _ in 0..7 {
+            retry.after(now, Some(WatchFailureKind::ConfigUnreadable));
+            let at = retry.at.unwrap();
+            waits.push(at - now);
+            assert!(!retry.due(at - std::time::Duration::from_nanos(1)) && retry.due(at));
+            now = at;
+        }
+        let s = std::time::Duration::from_millis;
+        assert_eq!(
+            waits,
+            [
+                s(500),
+                s(1000),
+                s(2000),
+                s(4000),
+                s(8000),
+                super::RETRY_MOST,
+                super::RETRY_MOST
+            ]
+        );
+        retry.after(now, None);
+        assert_eq!(retry.at, None, "a success");
+        retry.after(now, Some(WatchFailureKind::ThemeEntryUnreadable));
+        assert_eq!(
+            retry.at,
+            Some(now + POLL_INTERVAL),
+            "a new failure starts again"
+        );
+    }
+
+    /// The watcher over this platform's file events reads an edit it hears, and ends once the
+    /// window refuses its posts.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_platform_watcher_reads_an_edit_it_hears_and_ends_with_the_window() {
+        let dir = watch_scratch("platform");
+        let config = dir.join("aterm.toml");
+        crate::test_scratch::write_config(&config, "font_px = 14\n");
+        let (posted, posts) = std::sync::mpsc::channel::<String>();
+        let path = config.clone();
+        let watcher = std::thread::spawn(move || {
+            let (ring, tells) = std::sync::mpsc::channel();
+            let repost = super::Repost::new();
+            repost.listen(ring.clone());
+            let mut ears = super::platform_ears(ring, tells);
+            assert!(!ears.deaf(), "this platform's file events started");
+            super::watch(
+                Some(path),
+                None,
+                std::sync::Arc::new(crate::app_config::ThemeCatalog::default()),
+                None,
+                &mut move |wake| match wake {
+                    crate::Wake::ConfigReloadObserved(observation) => {
+                        posted.send(observation.text).is_ok()
+                    }
+                    _ => true,
+                },
+                ears.as_mut(),
+                &repost,
+            );
+        });
+        let must = aterm_spec::wait::MUST_HAPPEN;
+        assert_eq!(
+            posts.recv_timeout(must).as_deref(),
+            Ok("font_px = 14\n"),
+            "the first read"
+        );
+        rewrite(&config, "font_px = 16\n");
+        assert_eq!(
+            posts.recv_timeout(must).as_deref(),
+            Ok("font_px = 16\n"),
+            "the edit, heard"
+        );
+        drop(posts);
+        rewrite(&config, "font_px = 18\n");
+        aterm_spec::wait::until_within(must, "the watcher ends with its posts refused", || {
+            watcher.is_finished().then_some(())
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A theme folder of more files than discovery reads holds a key on each file it reads, in
+    /// name order, and on none it never reads: past its count, or a name it does not take.
+    #[test]
+    fn a_theme_folder_holds_only_the_files_discovery_reads() {
+        let dir = watch_scratch("theme-cap");
+        let themes = dir.join("themes");
+        std::fs::create_dir(&themes).unwrap();
+        let most = crate::app_config::MAX_USER_THEME_FILES;
+        let shadowed = aterm_types::scheme::builtin_names()[0].to_owned();
+        for name in (0..most + 2)
+            .map(|n| format!("t{n:04}"))
+            .chain([shadowed.clone()])
+        {
+            std::fs::write(
+                themes.join(format!("{name}.conf")),
+                "foreground = #202020\nbackground = #fafafa\n",
+            )
+            .unwrap();
+        }
+        let posts = Posts::default();
+        // The first rest, with no turn, ends the run once the first theme step held its keys.
+        let mut script = Script::new(false, Vec::new());
+        run_watch(
+            None,
+            Some(&themes),
+            &mut script,
+            &posts,
+            &super::Repost::new(),
+        );
+        let files: Vec<_> = script
+            .holds()
+            .into_iter()
+            .filter_map(|hold| match hold {
+                super::Hold::File(path) => Some(path),
+                super::Hold::Directory(_) => None,
+            })
+            .collect();
+        let expected: Vec<_> = (0..most)
+            .map(|n| themes.join(format!("t{n:04}.conf")))
+            .collect();
+        assert_eq!(
+            files, expected,
+            "the first {most} it reads, and not {shadowed}.conf"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

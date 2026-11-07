@@ -163,60 +163,68 @@ fn a_routine_pass_posts_only_the_reads_that_could_paint() {
 
 #[test]
 fn child_exit_interrupts_a_parked_progress_tailer() {
-    let prefix = std::env::temp_dir().join(format!(
-        "aterm-pkg-progress-finish-wake-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&prefix).unwrap();
-    let layout = atpkg::store::Layout {
-        prefix: prefix.clone(),
-    };
-    let file = file_with(Some(std::process::id()), pkg_unix_now());
-    std::fs::write(layout.progress_file(), aterm_json::to_vec(&file).unwrap()).unwrap();
-    let (park_tx, park_rx) = std::sync::mpsc::channel::<()>();
-    let (post_tx, post_rx) = std::sync::mpsc::channel();
-    let tailer = PkgProgressTailer::spawn_with_ticks(
-        layout,
-        std::process::id(),
-        aterm_messages::Waiter::Nobody,
-        move |snapshot| {
-            let _ = post_tx.send(snapshot);
-        },
-        PkgProgressTicks {
-            visible: PKG_PROGRESS_VISIBLE_TICK,
-            quiet: Duration::from_secs(600),
-        },
-        move |_| {
-            let _ = park_tx.send(());
-        },
-        || {},
-    )
-    .expect("tailer spawns");
-    assert_eq!(
-        park_rx.recv_timeout(Duration::from_secs(60)),
-        Ok(()),
-        "the worker passed its stop check before finish"
-    );
-    let first = post_rx
-        .recv_timeout(Duration::from_secs(60))
-        .unwrap()
-        .unwrap();
-    assert!(first.running);
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let finisher = std::thread::spawn(move || {
-        let _ = done_tx.send(tailer.finish());
-    });
-    assert!(
-        done_rx.recv_timeout(Duration::from_secs(60)).is_ok(),
-        "finish must interrupt the ten-minute wait"
-    );
-    finisher.join().unwrap();
-    let last = post_rx
-        .recv_timeout(Duration::from_secs(60))
-        .unwrap()
-        .unwrap();
-    assert!(!last.running, "exit makes the final read immediately");
-    let _ = std::fs::remove_dir_all(&prefix);
+    for drop_only in [false, true] {
+        let prefix = std::env::temp_dir().join(format!(
+            "aterm-pkg-progress-finish-wake-{}-{drop_only}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&prefix).unwrap();
+        let layout = atpkg::store::Layout {
+            prefix: prefix.clone(),
+        };
+        let file = file_with(Some(std::process::id()), pkg_unix_now());
+        std::fs::write(layout.progress_file(), aterm_json::to_vec(&file).unwrap()).unwrap();
+        let (park_tx, park_rx) = std::sync::mpsc::channel::<()>();
+        let (post_tx, post_rx) = std::sync::mpsc::channel();
+        let tailer = PkgProgressTailer::spawn_with_ticks(
+            layout,
+            std::process::id(),
+            aterm_messages::Waiter::Nobody,
+            move |snapshot| {
+                let _ = post_tx.send(snapshot);
+            },
+            PkgProgressTicks {
+                visible: PKG_PROGRESS_VISIBLE_TICK,
+                quiet: Duration::from_secs(600),
+            },
+            move |_| {
+                let _ = park_tx.send(());
+            },
+            || {},
+        )
+        .expect("tailer spawns");
+        assert_eq!(
+            park_rx.recv_timeout(Duration::from_secs(60)),
+            Ok(()),
+            "the worker passed its stop check before finish"
+        );
+        let first = post_rx
+            .recv_timeout(Duration::from_secs(60))
+            .unwrap()
+            .unwrap();
+        assert!(first.running);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let finisher = std::thread::spawn(move || {
+            let advanced = if drop_only {
+                drop(tailer);
+                false
+            } else {
+                tailer.finish()
+            };
+            let _ = done_tx.send(advanced);
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(60)).is_ok(),
+            "finish must interrupt the ten-minute wait"
+        );
+        finisher.join().unwrap();
+        let last = post_rx
+            .recv_timeout(Duration::from_secs(60))
+            .unwrap()
+            .unwrap();
+        assert!(!last.running, "exit makes the final read immediately");
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
 }
 
 #[test]

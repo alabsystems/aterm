@@ -242,11 +242,6 @@ impl HumanInputStamp {
         self.count.load(Ordering::Acquire)
     }
 
-    /// The number of the person's last plain Enter ([`Gesture::PlainEnter`]), `0` for none: the owner's turn the herald's told-once memory is kept under (`status_item::SessionRow::owner_turn`).
-    pub(crate) fn last_plain_enter(&self) -> u64 {
-        self.last_plain_enter.load(Ordering::Acquire)
-    }
-
     /// [`Self::seq`] and whether its last gesture was a plain Enter: the count first, then the marker, both acquires.
     pub(crate) fn probe(&self) -> PersonProbe {
         let seq = self.count.load(Ordering::Acquire);

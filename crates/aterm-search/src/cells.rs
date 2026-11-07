@@ -177,10 +177,38 @@ impl LineCells {
         cells: &Self,
         row_start: usize,
     ) {
-        for col in self.end_col()..row_start {
+        let col = self.end_col();
+        let padding = row_start.saturating_sub(col);
+        if padding > 0 {
             let byte = line.len();
-            line.push(' ');
-            self.push(byte..line.len(), col, 1);
+            line.reserve(padding.saturating_add(text.len()));
+            const SPACES: &str = "                                                                ";
+            let mut written = padding.min(SPACES.len());
+            line.push_str(&SPACES[..written]);
+            while written < padding {
+                let count = written.min(padding - written);
+                line.extend_from_within(byte..byte + count);
+                written += count;
+            }
+            // Preserve push's overlap rejection even if retained cells extend
+            // beyond the supplied text: only the accepted suffix forms a run.
+            let skip = self.end_byte().saturating_sub(byte).min(padding);
+            let mut remaining = padding - skip;
+            let mut byte = byte + skip;
+            let mut col = col + skip;
+            while remaining > 0 {
+                let count = remaining.min(u32::MAX as usize);
+                self.push_run(CellRun {
+                    byte,
+                    col,
+                    count: count as u32,
+                    bytes: 1,
+                    width: 1,
+                });
+                byte += count;
+                col += count;
+                remaining -= count;
+            }
         }
         self.append_shifted(cells, line.len(), row_start);
         line.push_str(text);
@@ -531,6 +559,54 @@ mod tests {
             joined.append_wrapped_row(&mut line, "y", continuation, 4);
             assert!(joined.is_truncated(), "{head:?} + {continuation:?}");
             assert_eq!(line, "x   y", "the stride is unchanged");
+        }
+    }
+
+    #[test]
+    fn batched_wrapped_padding_matches_scalar_cells_and_text() {
+        for line_len in 0..10 {
+            for row_start in 0..14 {
+                for (byte, end, col, width) in [
+                    (0, 0, 0, 0),
+                    (0, 1, 0, 1),
+                    (0, 4, 0, 0),
+                    (4, 8, 2, 2),
+                    (8, 12, 0, 1),
+                    (0, 1, 9, 2),
+                    (usize::MAX - 1, usize::MAX, 0, 1),
+                    (0, 1, usize::MAX - 1, 2),
+                ] {
+                    for cut in [false, true] {
+                        let mut original = LineCells::new();
+                        original.push(byte..end, col, width);
+                        let mut next = LineCells::new();
+                        next.push(0..2, 0, 1);
+                        next.push(3..4, 4, 0);
+                        if cut {
+                            original.mark_truncated();
+                            next.mark_truncated();
+                        }
+                        let mut scalar = original.clone();
+                        let mut expected = "x".repeat(line_len);
+                        for at in scalar.end_col()..row_start {
+                            let byte = expected.len();
+                            expected.push(' ');
+                            scalar.push(byte..expected.len(), at, 1);
+                        }
+                        scalar.append_shifted(&next, expected.len(), row_start);
+                        expected.push_str("é z");
+                        let mut actual = "x".repeat(line_len);
+                        original.append_wrapped_row(&mut actual, "é z", &next, row_start);
+                        assert_eq!(actual, expected);
+                        assert_eq!(
+                            spans(&original),
+                            spans(&scalar),
+                            "line={line_len} row={row_start} head={byte}..{end} col={col} width={width}"
+                        );
+                        assert_eq!(original.is_truncated(), scalar.is_truncated());
+                    }
+                }
+            }
         }
     }
 

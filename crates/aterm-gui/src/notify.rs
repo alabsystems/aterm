@@ -6,32 +6,10 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
-
-/// Revocable permission to deliver a queued notice. Only its condition's owner
-/// keeps the strong reference; queue copies cannot keep an ended intent alive.
-#[derive(Clone, Debug)]
-pub(crate) struct NoticeValidity(std::sync::Weak<()>);
-
-impl NoticeValidity {
-    /// A ticket borrowing the current condition's lifetime.
-    pub(crate) fn new(owner: &Arc<()>) -> Self {
-        Self(Arc::downgrade(owner))
-    }
-
-    fn current(&self) -> bool {
-        self.0.strong_count() > 0
-    }
-}
-
-impl PartialEq for NoticeValidity {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.ptr_eq(&other.0)
-    }
-}
-
-impl Eq for NoticeValidity {}
+use std::sync::atomic::AtomicBool;
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::SyncSender;
 
 /// One pending notification handed from a tab's engine callback to the delivery thread.
 pub(crate) struct NotifyMsg {
@@ -43,128 +21,31 @@ pub(crate) struct NotifyMsg {
     pub title: Option<String>,
     /// Notification body.
     pub body: String,
-    /// `true` for aterm's own notice, governed by `desktop_alerts`; `false` for a program's ([`Self::program`]), which `allow_notifications` admitted.
-    pub own: bool,
-    /// A standing condition's permission; event notifications have none.
-    #[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
-    validity: Option<NoticeValidity>,
-    /// A program notice's slot in the queue ([`Notifier::try_send`]), given back when the delivery thread drops the notice.
-    slot: Option<ProgramSlot>,
 }
 
 impl NotifyMsg {
     /// One program notification (OSC 9/99/777), already admitted by `allow_notifications`.
     pub(crate) fn program(session: u64, title: Option<String>, body: String) -> Self {
-        Self::with_origin(session, title, body, false, None)
-    }
-
-    /// The escalation herald's notice.
-    pub(crate) fn herald(notice: &crate::status_item::HeraldNotice) -> Self {
-        Self::with_origin(
-            notice.session,
-            Some(notice.title.to_owned()),
-            notice.body.clone(),
-            true,
-            Some(notice.validity.clone()),
-        )
-    }
-
-    #[cfg(test)]
-    fn own(session: u64, title: Option<String>, body: String) -> Self {
-        Self::with_origin(session, title, body, true, None)
-    }
-
-    const fn with_origin(
-        session: u64,
-        title: Option<String>,
-        body: String,
-        own: bool,
-        validity: Option<NoticeValidity>,
-    ) -> Self {
         #[cfg(not(any(target_os = "macos", windows, target_os = "linux", test)))]
-        let _ = (session, title, validity);
+        let _ = (session, title);
         Self {
             #[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
             session,
             #[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
             title,
             body,
-            own,
-            #[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
-            validity,
-            slot: None,
         }
     }
 }
 
-/// Program notices the queue holds at once, counting the one being delivered.
-const PROGRAM_SLOTS: usize = 16;
+/// The notices the process-wide queue holds at once: a tab's `try_send` past them is refused as
+/// full and never blocks it.
+const NOTIFY_QUEUE_CAP: usize = 16;
 
-/// Queue slots no program notice may take: aterm's own (the herald's) always find room, whatever
-/// a tab floods.
-const OWN_SLOTS: usize = 8;
-
-const NOTIFY_QUEUE_CAP: usize = PROGRAM_SLOTS + OWN_SLOTS;
-
-/// The sending side of the process-wide notification queue: every tab's engine callbacks and
-/// aterm's own notices post through clones of it.
-#[derive(Clone)]
-pub(crate) struct Notifier {
-    tx: SyncSender<NotifyMsg>,
-    /// Program notices queued or being delivered ([`ProgramSlot`]).
-    program: Arc<AtomicUsize>,
-}
-
-impl Notifier {
-    /// A notifier and the receiving end its delivery thread drains.
-    pub(crate) fn channel() -> (Notifier, Receiver<NotifyMsg>) {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<NotifyMsg>(NOTIFY_QUEUE_CAP);
-        let notifier = Notifier {
-            tx,
-            program: Arc::default(),
-        };
-        (notifier, rx)
-    }
-
-    /// Queue `msg` without blocking. A program's notice is refused as `Full` once
-    /// [`PROGRAM_SLOTS`] are taken, so the last [`OWN_SLOTS`] are aterm's own.
-    pub(crate) fn try_send(&self, mut msg: NotifyMsg) -> Result<(), TrySendError<NotifyMsg>> {
-        if !msg.own {
-            match ProgramSlot::take(&self.program) {
-                Some(slot) => msg.slot = Some(slot),
-                None => return Err(TrySendError::Full(msg)),
-            }
-        }
-        self.tx.try_send(msg)
-    }
-}
-
-/// One of [`PROGRAM_SLOTS`], held by a program's notice from its queueing until the delivery
-/// thread (or a refused send) drops it.
-struct ProgramSlot(Arc<AtomicUsize>);
-
-impl ProgramSlot {
-    fn take(held: &Arc<AtomicUsize>) -> Option<ProgramSlot> {
-        held.try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            (n < PROGRAM_SLOTS).then_some(n + 1)
-        })
-        .ok()?;
-        Some(ProgramSlot(Arc::clone(held)))
-    }
-}
-
-impl Drop for ProgramSlot {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
+/// Whether `msg` is still wanted: not while the person is looking at its session's tab.
 #[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
-fn delivers(msg: &NotifyMsg, suppressed: &HashSet<u64>, _own_alerts: bool) -> bool {
-    if msg.own {
-        return false;
-    }
-    !suppressed.contains(&msg.session) && msg.validity.as_ref().is_none_or(NoticeValidity::current)
+fn delivers(msg: &NotifyMsg, suppressed: &HashSet<u64>) -> bool {
+    !suppressed.contains(&msg.session)
 }
 
 /// The shared settings read by the notification delivery thread.
@@ -173,7 +54,6 @@ fn delivers(msg: &NotifyMsg, suppressed: &HashSet<u64>, _own_alerts: bool) -> bo
 struct DeliveryPolicy {
     suppress: Arc<Mutex<HashSet<u64>>>,
     silent: Arc<AtomicBool>,
-    own_alerts: Arc<AtomicBool>,
 }
 
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
@@ -182,7 +62,6 @@ impl DeliveryPolicy {
         delivers(
             msg,
             &self.suppress.lock().unwrap_or_else(|p| p.into_inner()),
-            self.own_alerts.load(Ordering::Acquire),
         )
     }
 }
@@ -216,22 +95,17 @@ pub(crate) const fn delivery_available() -> bool {
     cfg!(any(target_os = "macos", windows, target_os = "linux"))
 }
 
-/// Spawn the single, process-wide notification delivery thread and return the [`Notifier`] each tab clones into its engine callbacks.
+/// Spawn the single, process-wide notification delivery thread and return the bounded `SyncSender` each tab clones into its engine callbacks.
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 pub(crate) fn spawn_delivery(
     suppress: Arc<Mutex<HashSet<u64>>>,
     silent: Arc<AtomicBool>,
-    own_alerts: Arc<AtomicBool>,
     center: crate::notice_center::NoticeCenter,
-) -> Notifier {
+) -> SyncSender<NotifyMsg> {
     #[cfg(not(target_os = "macos"))]
     let _ = center;
-    let (tx, rx) = Notifier::channel();
-    let policy = DeliveryPolicy {
-        suppress,
-        silent,
-        own_alerts,
-    };
+    let (tx, rx) = std::sync::mpsc::sync_channel::<NotifyMsg>(NOTIFY_QUEUE_CAP);
+    let policy = DeliveryPolicy { suppress, silent };
     std::thread::spawn(move || {
         while let Ok(msg) = rx.recv() {
             let Some(admitted) = admit_delivery(msg, &policy) else {
@@ -268,10 +142,9 @@ pub(crate) fn spawn_delivery(
 pub(crate) fn spawn_delivery(
     _suppress: Arc<Mutex<HashSet<u64>>>,
     _silent: Arc<AtomicBool>,
-    _own_alerts: Arc<AtomicBool>,
     _center: crate::notice_center::NoticeCenter,
-) -> Notifier {
-    let (tx, rx) = Notifier::channel();
+) -> SyncSender<NotifyMsg> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<NotifyMsg>(NOTIFY_QUEUE_CAP);
     std::thread::spawn(move || while rx.recv().is_ok() {});
     tx
 }
@@ -544,9 +417,6 @@ fn post_admitted(
     poster.admitted(admitted, bound);
 }
 
-#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
-const NO_SESSION: u64 = u64::MAX;
-
 #[cfg(all(test, target_os = "linux"))]
 fn post(
     poster: &freedesktop::Poster,
@@ -555,13 +425,9 @@ fn post(
     silent: bool,
     session: u64,
     bound: std::time::Duration,
-    validity: Option<NoticeValidity>,
 ) {
-    let session = (session != NO_SESSION).then_some(session);
-    if let Ok(call) =
-        freedesktop::notify_call(title.unwrap_or("aterm"), body, silent, session.is_some())
-    {
-        poster.post(call, session, bound, validity);
+    if let Ok(call) = freedesktop::notify_call(title.unwrap_or("aterm"), body, silent) {
+        poster.post(call, session, bound);
     }
 }
 
@@ -603,7 +469,6 @@ mod freedesktop {
         summary: &str,
         body: &str,
         silent: bool,
-        clickable: bool,
     ) -> aterm_dbus::Result<Message> {
         let mut hints = vec![
             (
@@ -618,11 +483,6 @@ mod freedesktop {
                 Value::variant(Value::Bool(true)),
             ));
         }
-        let actions: &[&str] = if clickable {
-            &[DEFAULT_ACTION, DEFAULT_LABEL]
-        } else {
-            &[]
-        };
         Ok(
             Message::method_call(Some(SERVER), OBJECT, Some(SERVER), "Notify")?.with_body(vec![
                 Value::from("aterm"),
@@ -630,7 +490,7 @@ mod freedesktop {
                 Value::from("aterm"),
                 Value::Str(super::fold_controls(summary)),
                 Value::Str(super::markup_escape(body)),
-                Value::strings(actions.iter().copied()),
+                Value::strings([DEFAULT_ACTION, DEFAULT_LABEL]),
                 Value::dict(Type::Str, Type::Variant, hints)?,
                 Value::I32(-1),
             ]),
@@ -654,25 +514,17 @@ mod freedesktop {
 
     enum Delivery {
         #[cfg(all(test, target_os = "linux"))]
-        Fixed {
-            call: Message,
-            validity: Option<super::NoticeValidity>,
-        },
+        Fixed(Message),
         Live(super::AdmittedDelivery),
     }
 
     impl Delivery {
         /// Build the call only after transport setup, again on a retry. Queued
-        /// events retain no condition owner and hold no settings lock over I/O.
+        /// events hold no settings lock over I/O.
         fn prepare(&self) -> Option<Message> {
             match self {
                 #[cfg(all(test, target_os = "linux"))]
-                Self::Fixed { call, validity } => {
-                    if validity.as_ref().is_some_and(|ticket| !ticket.current()) {
-                        return None;
-                    }
-                    Some(call.clone())
-                }
+                Self::Fixed(call) => Some(call.clone()),
                 Self::Live(admitted) => {
                     let super::AdmittedDelivery { msg, policy, .. } = admitted;
                     if !policy.wanted(msg) {
@@ -682,7 +534,6 @@ mod freedesktop {
                         msg.title.as_deref().unwrap_or("aterm"),
                         &msg.body,
                         policy.silent.load(super::Ordering::Acquire),
-                        msg.session != super::NO_SESSION,
                     )
                     .ok()
                 }
@@ -697,18 +548,9 @@ mod freedesktop {
             call: &Message,
             bound: Duration,
             open: &dyn Fn() -> aterm_dbus::Result<Connection>,
-            validity: Option<&super::NoticeValidity>,
             heard: &mut dyn FnMut(Observation<'_>),
         ) -> Option<Posted> {
-            self.notify_current(
-                &Delivery::Fixed {
-                    call: call.clone(),
-                    validity: validity.cloned(),
-                },
-                bound,
-                open,
-                heard,
-            )
+            self.notify_current(&Delivery::Fixed(call.clone()), bound, open, heard)
         }
 
         fn notify_current(
@@ -781,7 +623,7 @@ mod freedesktop {
         bound: Duration,
     ) -> Option<Posted> {
         let open = || Connection::open_within(addresses, bound);
-        Bus { conn: None }.notify(call, bound, &open, None, &mut |_| {})
+        Bus { conn: None }.notify(call, bound, &open, &mut |_| {})
     }
 
     struct Notice {
@@ -796,9 +638,8 @@ mod freedesktop {
     }
 
     impl Clicks {
-        pub(super) fn posted(&mut self, at: Posted, session: Option<u64>) {
+        pub(super) fn posted(&mut self, at: Posted, session: u64) {
             self.posted.retain(|notice| notice.at != at);
-            let Some(session) = session else { return };
             if self.posted.len() >= POSTED_CAP {
                 self.posted.pop_front();
             }
@@ -855,7 +696,7 @@ mod freedesktop {
 
     struct Post {
         delivery: Delivery,
-        session: Option<u64>,
+        session: u64,
         bound: Duration,
     }
 
@@ -898,15 +739,9 @@ mod freedesktop {
         }
 
         #[cfg(all(test, target_os = "linux"))]
-        pub(super) fn post(
-            &self,
-            call: Message,
-            session: Option<u64>,
-            bound: Duration,
-            validity: Option<super::NoticeValidity>,
-        ) {
+        pub(super) fn post(&self, call: Message, session: u64, bound: Duration) {
             self.enqueue(Post {
-                delivery: Delivery::Fixed { call, validity },
+                delivery: Delivery::Fixed(call),
                 session,
                 bound,
             });
@@ -914,8 +749,7 @@ mod freedesktop {
 
         pub(super) fn admitted(&self, admitted: super::AdmittedDelivery, bound: Duration) {
             self.enqueue(Post {
-                session: (admitted.msg.session != super::NO_SESSION)
-                    .then_some(admitted.msg.session),
+                session: admitted.msg.session,
                 delivery: Delivery::Live(admitted),
                 bound,
             });
@@ -1372,39 +1206,10 @@ mod live_policy_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        Notifier, NotifyMsg, OWN_SLOTS, PROGRAM_SLOTS, applescript_escape, balloon_clicked,
-        balloon_text, delivers, fold_controls, fold_to_utf16, markup_escape, windows_info_flags,
+        NotifyMsg, applescript_escape, balloon_clicked, balloon_text, delivers, fold_controls,
+        fold_to_utf16, markup_escape, windows_info_flags,
     };
     use std::collections::HashSet;
-
-    /// Programs' notices, from any number of tabs, take at most their slots; aterm's own find
-    /// the rest free, and a delivered program notice gives its slot back.
-    #[test]
-    fn a_program_flood_leaves_the_own_slots_free() {
-        let (notifier, queue) = Notifier::channel();
-        let program = |tab| NotifyMsg::program(tab, None, "flood".into());
-        let queued = (0..1_000)
-            .filter(|i| notifier.try_send(program(i % 3)).is_ok())
-            .count();
-        assert_eq!(queued, PROGRAM_SLOTS);
-        for _ in 0..OWN_SLOTS {
-            notifier
-                .try_send(NotifyMsg::own(0, Some("aterm".into()), "needs you".into()))
-                .expect("an own notice finds its slot");
-        }
-        assert!(
-            notifier.try_send(program(0)).is_err(),
-            "the program slots stay taken"
-        );
-        let delivered = queue.recv().expect("the first program notice");
-        assert!(!delivered.own);
-        assert!(
-            notifier.try_send(program(0)).is_err(),
-            "still held while it is delivered"
-        );
-        drop(delivered);
-        notifier.try_send(program(0)).expect("its slot came back");
-    }
 
     #[test]
     fn a_bundled_aterm_posts_only_as_itself() {
@@ -1550,32 +1355,19 @@ mod tests {
         assert_eq!(ASKS.with(Cell::get), 0, "no notice asked macOS");
     }
 
+    /// A program's notice is wanted unless the person is looking at its own tab: focus
+    /// suppression is the one thing that drops it on the way to the desktop.
     #[test]
-    fn automatic_notices_never_reach_the_desktop() {
-        let none = HashSet::new();
-        let own = NotifyMsg::own(7, Some("aterm".into()), "waiting".into());
+    fn a_program_notice_is_dropped_only_while_its_tab_is_looked_at() {
         let program = NotifyMsg::program(7, None, "build done".into());
-        assert!(own.own && !program.own, "the constructors carry the origin");
+        assert!(delivers(&program, &HashSet::new()), "nobody looking");
         assert!(
-            !delivers(&own, &none, false),
-            "switch off: aterm's own is dropped"
+            delivers(&program, &HashSet::from([3])),
+            "another tab looked at"
         );
         assert!(
-            !delivers(&own, &none, true),
-            "automatic notices are disabled even with an old opt-in"
-        );
-        assert!(
-            delivers(&program, &none, false),
-            "a program's notification is not the switch's to drop"
-        );
-        let looking = HashSet::from([7]);
-        assert!(
-            !delivers(&program, &looking, false),
-            "focus suppression holds"
-        );
-        assert!(
-            !delivers(&own, &looking, true),
-            "for aterm's own notices too"
+            !delivers(&program, &HashSet::from([7])),
+            "its own tab looked at: focus suppression holds"
         );
     }
 
@@ -1817,8 +1609,8 @@ mod tests {
 
         let mut bus = super::freedesktop::Bus { conn: None };
         let open = || Connection::open_within(&private.addresses, HANG);
-        let loud = super::freedesktop::notify_call("build", "done <b>&</b>", false, true).unwrap();
-        let posted = bus.notify(&loud, HANG, &open, None, &mut |_| {});
+        let loud = super::freedesktop::notify_call("build", "done <b>&</b>", false).unwrap();
+        let posted = bus.notify(&loud, HANG, &open, &mut |_| {});
         assert_eq!(
             posted,
             Some(super::freedesktop::Posted {
@@ -1827,9 +1619,9 @@ mod tests {
             }),
             "the server took the first one, and said where"
         );
-        let quiet = super::freedesktop::notify_call("aterm", "serious", true, false).unwrap();
+        let quiet = super::freedesktop::notify_call("aterm", "serious", true).unwrap();
         assert!(
-            bus.notify(&quiet, HANG, &open, None, &mut |_| {}).is_some(),
+            bus.notify(&quiet, HANG, &open, &mut |_| {}).is_some(),
             "and the second, on the cached connection"
         );
         let seen = served.join().unwrap();
@@ -1883,8 +1675,8 @@ mod tests {
         assert_eq!(seen[1].body[4], Value::from("serious"));
         assert_eq!(
             seen[1].body[5],
-            Value::strings(std::iter::empty::<String>()),
-            "a notice about no tab offers no action: the server's own activation answers it"
+            Value::strings(["default", "Go to tab"]),
+            "every notice is a tab's, and offers the default action"
         );
     }
 
@@ -1910,8 +1702,8 @@ mod tests {
         };
 
         let mut clicks = Clicks::default();
-        clicks.posted(at(41), Some(3));
-        clicks.posted(at(42), Some(5));
+        clicks.posted(at(41), 3);
+        clicks.posted(at(42), 5);
         assert_eq!(clicks.heard(&token(42)), None, "a token is no click");
         assert_eq!(
             clicks.heard(&click(42)),
@@ -1977,7 +1769,7 @@ mod tests {
         );
 
         for id in 100..100 + u32::try_from(POSTED_CAP).unwrap() {
-            clicks.posted(at(id), Some(u64::from(id)));
+            clicks.posted(at(id), u64::from(id));
         }
         assert_eq!(
             clicks.heard(&click(42)),
@@ -1991,30 +1783,24 @@ mod tests {
         );
 
         let mut epochs = Clicks::default();
-        epochs.posted(at(41), Some(3));
+        epochs.posted(at(41), 3);
         assert_eq!(epochs.observe(Observation::Message(&token(41))), None);
         assert_eq!(epochs.observe(Observation::ConnectionReset), None);
         assert_eq!(epochs.observe(Observation::Message(&click(41))), None);
-        epochs.posted(at(41), Some(5));
+        epochs.posted(at(41), 5);
         assert_eq!(
             epochs.observe(Observation::Message(&click(41))),
             Some((5, None)),
             "the replacement's notice routes to its own session, with no old token"
         );
         assert_eq!(epochs.observe(Observation::Message(&token(41))), None);
-        epochs.posted(at(41), Some(7));
+        epochs.posted(at(41), 7);
         assert_eq!(
             epochs.observe(Observation::Message(&click(41))),
             Some((7, None)),
             "a repeated key replaces its target and token within an epoch too"
         );
-        epochs.posted(at(42), Some(9));
-        epochs.posted(at(41), None);
-        assert_eq!(
-            epochs.observe(Observation::Message(&click(41))),
-            None,
-            "an instance-level replacement cannot route to an old session"
-        );
+        epochs.posted(at(42), 9);
         assert_eq!(
             epochs.observe(Observation::Message(&click(42))),
             Some((9, None)),
@@ -2094,24 +1880,8 @@ mod tests {
             },
         )
         .expect("the bus thread starts");
-        super::post(
-            &poster,
-            Some("tab A"),
-            "build done",
-            false,
-            tab_a,
-            HANG,
-            None,
-        );
-        super::post(
-            &poster,
-            Some("tab B"),
-            "tests done",
-            false,
-            tab_b,
-            HANG,
-            None,
-        );
+        super::post(&poster, Some("tab A"), "build done", false, tab_a, HANG);
+        super::post(&poster, Some("tab B"), "tests done", false, tab_b, HANG);
 
         let wake = wakes
             .recv_timeout(HANG)
@@ -2215,8 +1985,8 @@ mod tests {
             (tab_b, "tab B", super::freedesktop::CALL_TIMEOUT),
             (tab_c, "tab C", HANG),
         ] {
-            let call = super::freedesktop::notify_call(summary, "done", false, true).unwrap();
-            poster.post(call, Some(tab), bound, None);
+            let call = super::freedesktop::notify_call(summary, "done", false).unwrap();
+            poster.post(call, tab, bound);
         }
 
         let (_server, seen) = served.join().unwrap();
@@ -2252,7 +2022,7 @@ mod tests {
         let path = scratch.path().join("silent");
         let _silent = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let silent = aterm_dbus::address::parse(&format!("unix:path={}", path.display())).unwrap();
-        let call = super::freedesktop::notify_call("aterm", "cannot open", false, false).unwrap();
+        let call = super::freedesktop::notify_call("aterm", "cannot open", false).unwrap();
         let asked = std::time::Instant::now();
         let posted =
             super::freedesktop::notify_now(&call, &silent, super::freedesktop::CALL_TIMEOUT);

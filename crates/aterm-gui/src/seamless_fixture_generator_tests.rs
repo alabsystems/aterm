@@ -360,7 +360,6 @@ fn fx_leaf(local_id: u64, title: &str, cwd: Option<&str>) -> crate::restore::Res
         not_claim_worker: false,
         claim_worker: None,
         task: None,
-        told: None,
     }))
 }
 
@@ -3632,8 +3631,6 @@ fn fx_carried_state_desk() -> FxDesk {
     record.fabric = mailbox.fabric;
     record.status_seen = crate::status_item::StatusCarry {
         need: None,
-        told: false,
-        told_ids: Vec::new(),
         held: Some((
             aterm_types::needs::HoldWord::Local,
             release_ms / 1_000 + 3_600,
@@ -4675,11 +4672,6 @@ const NO_HANDOFF_WRITES: &[(&str, &str)] = &[
     ("layout", "TerminalLeafRestore.held"),
     ("layout", "TerminalLeafRestore.holds"),
     ("layout", "TerminalLeafRestore.profile"),
-    // Only a layout a cold restore reads writes a leaf's told-once ids
-    // (`App::capture_desk_manifest`: a quit's, the crash journal's, an end of session's); a
-    // seamless update carries them in the session's status row (`SessionRecord::status_seen`'s
-    // `told_ids=`).
-    ("layout", "TerminalLeafRestore.told"),
     ("layout", "CodexRestore.carried"),
     // v0.157.0 and older wrote the route as `stored_login`; the record now writes `route` and
     // reads the legacy bit where `route` is absent (restore_claude_auth.rs). The shipped desks

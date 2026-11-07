@@ -394,8 +394,6 @@ mod tab_gallery;
 #[cfg(target_os = "macos")]
 mod tape;
 #[cfg(target_os = "macos")]
-mod told_once;
-#[cfg(target_os = "macos")]
 mod trail_census;
 #[cfg(target_os = "macos")]
 mod trail_companion;
@@ -789,11 +787,6 @@ Outside any lab (no jail, no stub):
                                  evaluate abrew admission of Homebrew's formula.json and cask.json (fetched from
                                  formulae.brew.sh unless --indexes DIR holds them) on the newest Mac, that Mac with the
                                  named facts replaced, or this one (--this-machine)
-  told-once [--json] [ATERM]      design §14.18 on a private window (desktop_alerts = true): one NEEDS YOU set told in
-                                 a background tab, then re-ordered, re-counted and joined by a new need, 25 s apart; the
-                                 herald's aterm.log lines must say one post for the set, `not queued: told once` per
-                                 repeat and a post for the new need, and with told memory off (ATERM_DEV_HERALD_TOLD_OFF)
-                                 a post every step; aterm drops its own notices, so no banner (debug or dev-seams aterm)
   reveal-tab [--json] [--ax-helper HELPER] [--plain-publication] [ATERM]
                                  one-mesh A17 on a private window: synthetic logins sealed in a scratch Commons;
                                  `aterm db emails --show-passwords` prints outside aterm and, in a tab, opens a
@@ -1246,7 +1239,6 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "local-signins" => local_signins::cmd(args),
         "setup-token-lab" => setup_token_lab::cmd(args),
         "reveal-tab" => reveal_tab::cmd(args),
-        "told-once" => told_once::cmd(args),
         "commons-lan" => commons_lan::cmd(args),
         "commons-startup" => commons_startup::cmd(args),
         "swarm" => swarm::cmd_swarm(args),

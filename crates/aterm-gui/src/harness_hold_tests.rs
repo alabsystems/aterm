@@ -73,7 +73,6 @@ pub(crate) fn ask() -> crate::needs::HarnessAsk {
         others: Vec::new(),
         program: aterm_phase::Program::Claude,
         tail: crate::needs::NeedTail::CarryingOn,
-        entry_first: None,
     }
 }
 

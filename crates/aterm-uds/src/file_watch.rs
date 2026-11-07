@@ -949,6 +949,32 @@ struct Passed {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const LOOKUP_LINKS: usize = if cfg!(target_os = "linux") { 40 } else { 32 };
 
+/// The paths a lookup of `path` names in turn: `path` (made absolute), then, while the last is a
+/// link, what it names (a relative target from the link's folder), ending at the first that is
+/// no link: a file, a folder, or a path not there. It follows as many links as the kernel does
+/// and ends at a link it cannot read. A caller that must hear each of these change watches each
+/// one: a watch on `path` hears its own entry replaced, and links in the folders on the way
+/// ([`FileWatch::watch`]), but not the file a final link names changed in another folder.
+#[must_use]
+pub fn link_chain(path: &Path) -> Vec<PathBuf> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let (most, read) = (LOOKUP_LINKS, link_target);
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let (most, read) = (40, |link: &Path| std::fs::read_link(link));
+    let mut chain = vec![absolute(path.to_path_buf())];
+    while chain.len() <= most
+        && let Some(last) = chain.last()
+        && std::fs::symlink_metadata(last).is_ok_and(|there| there.file_type().is_symlink())
+        && let Ok(target) = read(last)
+    {
+        let next = last
+            .parent()
+            .map_or_else(|| target.clone(), |folder| folder.join(&target));
+        chain.push(next);
+    }
+    chain
+}
+
 /// Every folder and link that looking the folder `path` up passes through, from the root down to
 /// `path` itself, as the kernel walks it: a link's target is looked up in turn, from the root
 /// where it is absolute and from the link's folder otherwise, and `..` goes back to the folder

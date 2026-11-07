@@ -343,7 +343,7 @@ fn a_staged_cut_packs_the_bundle_then_the_siblings_with_the_seals_toolchain_then
     assert_eq!(indexes.len(), 1);
     let d = &indexes[0].delta;
     assert_eq!(
-        d.pins,
+        d.target_pins[&Triple::parse(MAC).unwrap()],
         BTreeMap::from([
             ("trust".to_string(), 5),
             ("trust-cg".to_string(), 5),
@@ -352,23 +352,40 @@ fn a_staged_cut_packs_the_bundle_then_the_siblings_with_the_seals_toolchain_then
         ])
     );
     assert!(
-        d.target_pins.is_empty(),
-        "every other pin is carried from the head"
+        d.pins.is_empty(),
+        "global pins and every other target selection are carried from the head"
     );
     assert!(!indexes[0].upload);
     assert_eq!(o.index_build, Some(35));
 }
 
 #[test]
-fn off_the_pin_triple_the_four_builds_ride_that_targets_overlay() {
+fn another_target_carries_the_same_complete_tuple_on_its_own_overlay() {
     let c = cut("group-linux", &FLOOR, &[("trust-ir", 1)]);
     *c.probe.vv.borrow_mut() = vv(&c.commit, LINUX);
     ok(&c, &request(&c, Mode::Stage));
     let indexes = c.packs.indexes.borrow();
     let d = &indexes[0].delta;
-    assert!(d.pins.is_empty(), "`pin` belongs to the Mac");
+    assert!(d.pins.is_empty(), "global fallbacks remain unchanged");
     let linux = Triple::parse(LINUX).expect("triple");
     assert_eq!(d.target_pins[&linux].len(), 4);
+}
+
+#[test]
+fn the_effective_arm_overlay_is_the_floor_before_anything_packs() {
+    let c = cut("group-arm-floor", &FLOOR, &[]);
+    c.rig
+        .publish_head(&Doc::new(34, &FLOOR).overlay(MAC, &[("trust", 6), ("trust-ir", 7)]));
+    let error = refused(&c, &request(&c, Mode::Stage));
+    assert!(
+        error.contains("the seal's trust build 5 is BELOW the 6"),
+        "{error}"
+    );
+    assert!(
+        error.contains("trust-ir: this cut would pack build 5, BELOW the 7"),
+        "{error}"
+    );
+    assert!(c.packs.bundles.borrow().is_empty() && c.packs.packs.borrow().is_empty());
 }
 
 #[test]
@@ -473,7 +490,7 @@ fn a_moved_compiler_skips_published_numbers_and_never_reuses_one() {
     forced.force_same_build = true;
     let e = refused(&c, &forced);
     assert!(
-        e.contains("trust-cg: this cut would pack build 5, the SAME build that the channel head atpkg-index-34 pins, from a NEW compiler (trust 5 over the published 3)"),
+        e.contains("trust-cg: this cut would pack build 5, the SAME build that the channel head atpkg-index-34 pins for aarch64-apple-darwin, from a NEW compiler (trust 5 over the published 3)"),
         "{e}"
     );
 }

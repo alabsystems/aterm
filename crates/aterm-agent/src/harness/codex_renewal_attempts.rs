@@ -211,36 +211,44 @@ impl<'a> ReceiptWriter<'a> {
         self.retire_terminal_pool_record(expected, proof.closed_without_successor(&prepare))
     }
 
-    /// A launched rollback retires only with the matching native completion
-    /// ledger. A retired receipt or a captured launcher alone is insufficient.
+    /// A launched rollback retires only after its exact native completion is
+    /// validated and durably acknowledged. A retired receipt or a captured
+    /// launcher alone is insufficient.
     pub fn retire_rolled_back_pool_record(
         &self,
         expected: &Receipt,
         opts: &super::super::upgrade_drive::Opts,
     ) -> Result<bool, &'static str> {
+        if expected.intent.purpose != super::Purpose::WeeklyQuota {
+            return Ok(false);
+        }
         if opts.state != self.env.state || self.env.home.as_ref() != Some(&opts.home) {
             return Err("rollback-store-mismatch");
         }
-        let recipe = match read_active_attempt(self.env, expected)? {
-            Some(attempt) => attempt.native_prepare,
-            None => expected.native_prepare.clone(),
-        };
+        if !expected.has_rollback_candidate()
+            || super::read_receipt(self.env, &expected.id).as_ref() != Some(expected)
+        {
+            return Err("rollback-receipt-changed");
+        }
+        let attempt = read_active_attempt(self.env, expected)?;
+        let recipe = attempt
+            .as_ref()
+            .map_or(expected.native_prepare.as_str(), |attempt| {
+                attempt.native_prepare.as_str()
+            });
         let Some(super::super::native_act::Request::Prepare(prepare)) =
-            super::super::native_act::Request::parse(&recipe)
+            super::super::native_act::Request::parse(recipe)
         else {
             return Err("rollback-recipe");
         };
-        let state =
-            super::super::upgrade_drive::load_record(opts, &format!("renewal-{}", prepare.id))
-                .map_err(|_| "rollback-completion-unreadable")?
-                .ok_or("rollback-completion-missing")?;
-        let terminal = state.native_coordination
-            && state.native_rollback
-            && state.native_completed_prepare.as_deref() == Some(&prepare)
-            && state
-                .native_observation
-                .as_ref()
-                .is_some_and(|observed| expected.matches_completed_rollback(&prepare, observed));
+        if attempt.is_none() && prepare.id != expected.id {
+            return Err("rollback-recipe");
+        }
+        let terminal = super::completed_restart(opts, &expected.sid, &prepare).is_some_and(
+            |(forward, observed)| {
+                !forward && expected.matches_completed_rollback(&prepare, &observed)
+            },
+        );
         self.retire_terminal_pool_record(expected, terminal)
     }
 

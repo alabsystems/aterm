@@ -117,6 +117,40 @@ struct World {
 
 #[test]
 #[cfg(target_os = "macos")]
+fn metadata_ancestry_admits_after_scheduling_delay_but_still_detects_a_hang() {
+    let mut world = World::new();
+    let (_, _, events) = world.queue_sleep(HANG);
+    let pending = world.owner.pending.front_mut().unwrap();
+    pending.scope_reference = Some(
+        pending
+            .claim
+            .as_ref()
+            .unwrap()
+            .cohort_closure_ref()
+            .unwrap(),
+    );
+    let pending = world.owner.pending.front().unwrap();
+    // Backdate the operation start instead of sleeping or demanding a latency.
+    // The real native walk and original ledger scan still run, including their
+    // final reread. Restoring the 250 ms budget fails this admission.
+    world
+        .owner
+        .check_fresh_metadata_ancestry_at(pending, Instant::now() - Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(
+        world
+            .owner
+            .check_fresh_metadata_ancestry_at(pending, Instant::now() - HANG)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    drop(events);
+    world.settle();
+}
+
+#[test]
+#[cfg(target_os = "macos")]
 fn fresh_metadata_refuses_funded_native_ancestor_but_admits_unrelated_original_capacity() {
     crate::runtime::test_endpoint().unwrap();
     let mut world = World::new();

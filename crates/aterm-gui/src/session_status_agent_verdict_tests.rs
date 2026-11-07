@@ -1816,11 +1816,6 @@ fn an_adopted_session_with_its_carried_nonce_reads_its_command() {
     );
 }
 
-/// The herald's posts on this thread since the last call, drained.
-fn take_posts() -> Vec<crate::status_item::HeraldNotice> {
-    crate::app_tabs::HERALD_POSTS.with(|p| std::mem::take(&mut *p.borrow_mut()))
-}
-
 /// One sweep plus the presence fan-out the event loop runs after it.
 fn sweep(app: &mut App, t: Instant) {
     for id in app.observe_session_statuses(t) {
@@ -1838,8 +1833,6 @@ fn looking_at(app: &App, sessions: &[u64]) {
 #[test]
 fn a_box_the_zone_cuts_is_read_whole_and_a_hosted_agent_raises_no_row() {
     let (mut app, sid) = app_with_stub();
-    app.headless = false;
-    app.config.desktop_alerts = Some(true);
     let fixture = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::TRUST);
     let dialog = &fixture[8..=23];
     assert!(dialog[1].contains("Accessing workspace"), "{dialog:?}");
@@ -1853,7 +1846,6 @@ fn a_box_the_zone_cuts_is_read_whole_and_a_hosted_agent_raises_no_row() {
         }
         t.process(bytes.as_bytes());
     }
-    let _ = take_posts();
     looking_at(&app, &[]);
     sweep(&mut app, Instant::now());
     let agent = published(&app, sid);
@@ -1898,7 +1890,6 @@ fn an_observed_agents_box_stays_the_persons() {
         }
         t.process(bytes.as_bytes());
     }
-    let _ = take_posts();
     looking_at(&app, &[]);
     sweep(&mut app, Instant::now());
     assert_eq!(published(&app, sid).word, "prompt");
@@ -2021,7 +2012,6 @@ fn a_grok_or_kimi_box_needs_the_person() {
     ] {
         let (mut app, sid) = app_with_stub();
         draw(&app, sid, idle, rows, cols);
-        let _ = take_posts();
         looking_at(&app, &[]);
         let t0 = Instant::now();
         sweep(&mut app, t0);
@@ -2058,7 +2048,6 @@ fn a_relaunch_and_upgrade_claim_leaves_the_boxes_to_the_person() {
         }
         t.process(bytes.as_bytes());
     }
-    let _ = take_posts();
     looking_at(&app, &[]);
     sweep(&mut app, Instant::now());
     assert_eq!(published(&app, sid).word, "prompt");
@@ -2137,12 +2126,22 @@ fn a_relaunch_and_upgrade_claim_leaves_the_boxes_to_the_person() {
     );
 }
 
-/// A prompt box raises one menu row and one notification per transition when not focused or headless.
+/// A prompt box raises one menu row per transition: the row names its tab and its command,
+/// the same box re-read keeps its row and its age, and a box the person is looking at or one in
+/// a headless app is listed all the same. The age is one a seamless update carried, so a re-read
+/// that started it again would show this second's, which no clock reading confuses with it.
 #[test]
-fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
+fn a_box_raises_one_menu_row_per_transition() {
     let (mut app, sid) = app_with_stub();
-    app.headless = false;
-    app.config.desktop_alerts = Some(true);
+    let now = i64::try_from(aterm_time::unix_secs().expect("the wall clock")).expect("i64");
+    app.presence.herald.adopt(
+        sid,
+        crate::status_item::StatusCarry {
+            need: Some((aterm_types::needs::NeedWord::Approval, 1_000)),
+            ..Default::default()
+        },
+        now,
+    );
     {
         use crate::session_timeline::{MetaEdit, MetaField, write_session_meta};
         let ctx = app.pool.get(sid).expect("pooled").ctx.clone();
@@ -2154,7 +2153,6 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
         )
         .expect("title");
     }
-    let _ = take_posts();
     looking_at(&app, &[]);
     let step = Duration::from_millis(300);
     let mut t = Instant::now();
@@ -2163,24 +2161,21 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
         sweep(&mut app, t);
         t += step;
     }
-    assert!(take_posts().is_empty(), "a busy agent needs nobody");
-    assert!(app.status_glance().needs.is_empty());
+    assert!(
+        app.status_glance().needs.is_empty(),
+        "a busy agent needs nobody"
+    );
 
     paint(&app, sid, &box_screen(1));
     sweep(&mut app, t);
     t += step;
-    let posts = take_posts();
-    assert_eq!(posts.len(), 1, "exactly one notification: {posts:?}");
-    assert_eq!(posts[0].session, sid);
-    assert!(
-        posts[0]
-            .body
-            .contains("bash S=$PWD/tmp; for p in a b; do set -- $p; rm -rf"),
-        "the body names the command: {}",
-        posts[0].body
-    );
     let glance = app.status_glance();
-    assert_eq!(glance.need_count(), 1, "{:?}", glance.needs);
+    assert_eq!(
+        glance.need_count(),
+        1,
+        "exactly one row: {:?}",
+        glance.needs
+    );
     assert_eq!(
         glance.local_need_sessions(),
         vec![sid],
@@ -2188,10 +2183,14 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
     );
     assert_eq!(glance.needs[0].label, "build", "the row names its tab");
     assert!(
-        posts[0].body.starts_with("build: bash "),
-        "{}",
-        posts[0].body
+        glance.needs[0]
+            .what
+            .contains("bash S=$PWD/tmp; for p in a b; do set -- $p; rm -rf"),
+        "the row names the command: {}",
+        glance.needs[0].what
     );
+    let since = glance.needs[0].since_unix;
+    assert_eq!(since, Some(1_000), "the row has the age the update carried");
     let rev = published(&app, sid).rev;
 
     paint(&app, sid, &box_screen(2));
@@ -2203,12 +2202,12 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
         "the same box is the same rev"
     );
     app.refresh_presence_session(sid);
-    assert!(take_posts().is_empty(), "no second notification");
+    let glance = app.status_glance();
+    assert_eq!(glance.need_count(), 1, "no second row: {:?}", glance.needs);
     assert_eq!(
-        app.presence.herald.last_quiet(),
-        Some(crate::status_item::HeraldQuiet::Same)
+        glance.needs[0].since_unix, since,
+        "the same box keeps its age"
     );
-    assert_eq!(app.status_glance().need_count(), 1);
 
     paint(&app, sid, &busy_screen(9));
     sweep(&mut app, t);
@@ -2218,12 +2217,11 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
     paint(&app, sid, &box_screen(3));
     sweep(&mut app, t);
     assert!(published(&app, sid).rev > rev, "a new transition");
-    assert!(take_posts().is_empty(), "the human is looking at it");
     assert_eq!(
-        app.presence.herald.last_quiet(),
-        Some(crate::status_item::HeraldQuiet::Looking)
+        app.status_glance().need_count(),
+        1,
+        "a box the person is looking at is listed too"
     );
-    assert_eq!(app.status_glance().need_count(), 1);
 
     let (mut headless, hsid) = app_with_stub();
     assert!(headless.headless);
@@ -2235,10 +2233,16 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
     paint(&headless, hsid, &box_screen(1));
     sweep(&mut headless, t);
     assert_eq!(published(&headless, hsid).word, "prompt");
-    assert!(take_posts().is_empty(), "headless never notifies");
+    assert_eq!(
+        headless.status_glance().local_need_sessions(),
+        vec![hsid],
+        "a headless app lists it too"
+    );
 }
 
-/// A lapsed `ttl=` supervisor claim notifies the user of a standing prompt box.
+/// A lapsed `ttl=` supervisor claim hands a standing prompt box to the person: no need while the
+/// claim stands, none short of its expiry, then the box's need on the glance, and the lapse
+/// recorded once.
 #[test]
 fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
     use crate::app_presence::set_presence_clock_for_test;
@@ -2250,10 +2254,7 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
         }
     }
     let (mut app, sid) = app_with_stub();
-    app.headless = false;
-    app.config.desktop_alerts = Some(true);
     let ctx = app.pool.get(sid).expect("pooled").ctx.clone();
-    let _ = take_posts();
     looking_at(&app, &[]);
     let now_us = crate::metrics::us_at(Instant::now());
     let t0 = crate::metrics::instant_at_us(now_us).expect("in range");
@@ -2276,7 +2277,11 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
     paint(&app, sid, &box_screen(1));
     sweep(&mut app, t);
     assert_eq!(published(&app, sid).word, "prompt");
-    assert!(take_posts().is_empty(), "NEGATIVE CONTROL: supervised");
+    assert_eq!(
+        app.status_glance().need_count(),
+        0,
+        "NEGATIVE CONTROL: supervised"
+    );
     let lapse =
         crate::metrics::instant_at_us(expiry_us).expect("in range") + Duration::from_millis(1);
     let deadline = app.presence_deadline(t).expect("armed");
@@ -2287,7 +2292,11 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
     let short = lapse - Duration::from_millis(2);
     at(short);
     app.presence_tick(short);
-    assert!(take_posts().is_empty(), "NEGATIVE CONTROL: not lapsed yet");
+    assert_eq!(
+        app.status_glance().need_count(),
+        0,
+        "NEGATIVE CONTROL: not lapsed yet"
+    );
     assert_eq!(
         ctx.meta.lock().unwrap().supervisor_expiry(),
         Some(expiry_us),
@@ -2296,9 +2305,24 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
 
     at(lapse);
     app.presence_tick(lapse);
-    let posts = take_posts();
-    assert_eq!(posts.len(), 1, "exactly one notice: {posts:?}");
-    assert_eq!(posts[0].session, sid);
+    let glance = app.status_glance();
+    assert_eq!(
+        glance.need_count(),
+        1,
+        "the box needs you: {:?}",
+        glance.needs
+    );
+    assert_eq!(glance.local_need_sessions(), vec![sid]);
+    let lapses = || {
+        ctx.timeline
+            .lock()
+            .unwrap()
+            .since(None)
+            .filter(|e| {
+                e.kind == "meta-change" && e.payload.to_string() == "field=supervisor value=-"
+            })
+            .count()
+    };
     let meta_events: Vec<String> = ctx
         .timeline
         .lock()
@@ -2313,8 +2337,14 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
         "{meta_events:?}"
     );
     assert!(ctx.meta.lock().unwrap().supervisor_expiry().is_none());
+    assert_eq!(lapses(), 1, "the lapse is recorded");
     app.presence_tick(lapse);
-    assert!(take_posts().is_empty(), "announced once");
+    assert_eq!(lapses(), 1, "and recorded once");
+    assert_eq!(
+        app.status_glance().need_count(),
+        1,
+        "the box still needs you"
+    );
 }
 
 /// Grid resizes and the program's subsequent repaint do not advance `text_moves` or `verdict_moves`.

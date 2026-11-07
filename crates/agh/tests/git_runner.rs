@@ -413,12 +413,21 @@ fn native_push_phase_observation_preserves_success_refusal_and_failure() {
     let source_config = std::fs::read(source.join(".git/config")).unwrap();
     let spans = Arc::new(Mutex::new(Vec::new()));
     let observed = Arc::clone(&spans);
-    let fx = Fx::simulated(live_start()).with_native_push_observer_for_tests(move |span| {
-        observed
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(span);
-    });
+    let git_spans = Arc::new(Mutex::new(Vec::new()));
+    let git_observed = Arc::clone(&git_spans);
+    let fx = Fx::simulated(live_start())
+        .with_git_child_observer_for_tests(move |span| {
+            git_observed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(span);
+        })
+        .with_native_push_observer_for_tests(move |span| {
+            observed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(span);
+        });
     let gh = world
         .client(git_env())
         .fx(Arc::new(fx))
@@ -427,10 +436,11 @@ fn native_push_phase_observation_preserves_success_refusal_and_failure() {
     let permit = common::permit(&gh, &RouteRequest::write(RouteTarget::Repo(slug.clone())));
     // The observer persists across calls, and each call has three distinct real spans.
     for call in 0..2 {
+        let first_ordinal = gh.fx().children_run().len();
         let began = Instant::now();
         gh.refs(&slug).check_push(&permit, &source, &batch).unwrap();
         let finished = Instant::now();
-        let spans = spans.lock().unwrap();
+        let spans = spans.lock().unwrap().clone();
         assert_eq!(spans.len(), (call + 1) * 3);
         let current = &spans[call * 3..];
         assert_eq!(
@@ -442,6 +452,36 @@ fn native_push_phase_observation_preserves_success_refusal_and_failure() {
             && s.started <= s.finished
             && s.finished <= finished));
         assert!(current.windows(2).all(|p| p[0].finished <= p[1].started));
+        let logged = gh.fx().children_run();
+        let children = git_spans.lock().unwrap().clone();
+        let children: Vec<_> = children
+            .iter()
+            .filter(|s| s.ordinal >= first_ordinal)
+            .collect();
+        assert_eq!(children.len(), logged.len() - first_ordinal);
+        assert!(
+            children
+                .iter()
+                .enumerate()
+                .all(|(i, s)| s.ordinal == first_ordinal + i
+                    && s.error.is_none()
+                    && began <= s.started
+                    && s.started <= s.finished
+                    && s.finished <= finished)
+        );
+        assert!(children.windows(2).all(|p| p[0].finished <= p[1].started));
+        for phase in current {
+            let nested: Vec<_> = children
+                .iter()
+                .filter(|s| s.started < phase.finished && phase.started < s.finished)
+                .collect();
+            assert!(!nested.is_empty());
+            assert!(
+                nested
+                    .iter()
+                    .all(|s| phase.started <= s.started && s.finished <= phase.finished)
+            );
+        }
     }
     let wrong_before = host_git(&source, &["rev-parse", &format!("{before}^")]);
     let error = gh
@@ -467,7 +507,15 @@ fn native_push_phase_observation_preserves_success_refusal_and_failure() {
         .unwrap();
     let failed_spans = Arc::new(Mutex::new(Vec::new()));
     let failed_observed = Arc::clone(&failed_spans);
+    let failed_children = Arc::new(Mutex::new(Vec::new()));
+    let failed_child_observed = Arc::clone(&failed_children);
     let failed = Fx::simulated(live_start())
+        .with_git_child_observer_for_tests(move |span| {
+            failed_child_observed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(span);
+        })
         .with_native_push_observer_for_tests(move |span| {
             failed_observed
                 .lock()
@@ -492,7 +540,7 @@ fn native_push_phase_observation_preserves_success_refusal_and_failure() {
         .check_push(&permit, &source, &batch)
         .unwrap_err();
     assert_eq!(error.side_effect, SideEffect::None);
-    let failed_spans = failed_spans.lock().unwrap();
+    let failed_spans = failed_spans.lock().unwrap().clone();
     assert_eq!(
         failed_spans
             .iter()
@@ -503,6 +551,15 @@ fn native_push_phase_observation_preserves_success_refusal_and_failure() {
             (MetadataVerify, true),
             (Connectivity, false)
         ]
+    );
+    let failed_children = failed_children.lock().unwrap().clone();
+    assert_eq!(failed_children.len(), failed.fx().children_run().len());
+    assert_eq!(
+        failed_children
+            .iter()
+            .filter(|s| s.code == Some(17) && s.error.is_none())
+            .count(),
+        1
     );
     assert_eq!(host_git(&source, &["rev-parse", "main"]), after);
     assert_eq!(host_git(&remote, &["rev-parse", "main"]), before);

@@ -274,6 +274,8 @@ pub(crate) struct EngineRead {
     dim: Vec<bool>,
     pub(crate) generation: ScreenGen,
     human: u64,
+    /// The program's window title, read in the hold the rows were.
+    pub(crate) title: std::sync::Arc<str>,
 }
 
 impl EngineRead {
@@ -378,14 +380,17 @@ fn view_of(read: &EngineRead, c: &Composer) -> u64 {
     h.finish()
 }
 
-fn live_turn(screen: Option<&lights::Screen>, rows: &[String]) -> bool {
-    screen.is_some_and(|s| s.busy && !aterm_phase::phase::background_only(rows))
+/// Whether `screen` shows a turn the press must wait out: a busy read, unless all it shows is
+/// work left in the background, which never excuses a turn only the title runs (a reply drawn
+/// under a status line beside a background shell's pill).
+pub(crate) fn live_turn(screen: Option<&lights::Screen>, rows: &[String]) -> bool {
+    screen.is_some_and(|s| s.busy && (s.title_live || !aterm_phase::phase::background_only(rows)))
 }
 
 /// THE CLICK'S CHECKS ON THE ENGINE, before the probe `/` is written.
 pub(crate) fn ready(read: &EngineRead) -> Result<usize, SlashRefusal> {
     let rows = &read.rows;
-    let screen = lights::read_screen(rows).ok_or(SlashRefusal::Covered)?;
+    let screen = lights::read_screen(rows, Some(&read.title)).ok_or(SlashRefusal::Covered)?;
     if screen.mode.is_none() || screen.vim_insert {
         return Err(SlashRefusal::NotReady);
     }
@@ -442,7 +447,7 @@ pub(crate) fn decide(press: &SlashPress, read: Option<&EngineRead>, now: Instant
             _ => stop(SlashRefusal::NoAnswer, &press.text),
         };
     };
-    let screen = lights::read_screen(&read.rows);
+    let screen = lights::read_screen(&read.rows, Some(&read.title));
     let composer = screen.as_ref().and_then(|_| composer_of(read));
     let busy = live_turn(screen.as_ref(), &read.rows);
     let survey = aterm_phase::survey_block(&read.rows).is_some();
@@ -607,6 +612,7 @@ impl App {
             dim,
             generation: crate::control::screen_gen(&t),
             human,
+            title: t.title_arc(),
         })
     }
 

@@ -1712,14 +1712,7 @@ impl Desk for App {
     }
 
     fn herald_deadline(&self, now: Instant) -> Option<Instant> {
-        let herald = match self.presence.herald.due(now) {
-            (ready, _) if !ready.is_empty() => Some(now),
-            (_, next) => next,
-        };
-        match (herald, self.need_recheck_deadline(now)) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        self.need_recheck_deadline(now)
     }
 
     fn projecting(&mut self, w: WindowId) {
@@ -1740,12 +1733,8 @@ impl Desk for App {
         self.herald_session(session);
     }
 
-    fn herald_owed(&mut self, now: Instant) {
+    fn herald_owed(&mut self, _now: Instant) {
         self.need_rechecks_due();
-        let (ready, _) = self.presence.herald.due(now);
-        for session in ready {
-            self.herald_session(session);
-        }
     }
 
     fn lapse_supervisor(&mut self, session: u64) {

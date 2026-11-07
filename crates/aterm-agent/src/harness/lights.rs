@@ -241,24 +241,30 @@ pub struct Screen {
     pub mode: Option<Mode>,
     /// A pill is drawn under the composer, known or not: a row opening with a pill glyph (`footer::opens_with_pill_glyph`), a cut one included.
     pub pill: bool,
-    /// Claude is mid-turn (`aterm_phase::phase::busy_signal`, hard).
+    /// Claude is mid-turn (`aterm_phase::phase::busy_seen`, hard): the screen shows the turn, or the window title runs one it does not show ([`Screen::title_live`]).
     pub busy: bool,
+    /// The window title runs a turn the screen does not show (`aterm_phase::phase::title_live`: a reply drawn under a status line, whose footer and spinner are gone), the one live turn no background pill excuses.
+    pub title_live: bool,
     /// The pill stands after vim INSERT's indicator (`footer::vim_insert`: `  -- INSERT -- ⏵⏵ auto mode on …`, MEASURED on 2.1.304): the pill names its mode as on any mode row, and the composer takes keys through vim.
     pub vim_insert: bool,
 }
 
-/// Read `rows` (one pane, top to bottom).
+/// Read `rows` (one pane, top to bottom) with the window title Claude Code set over them (`None` where the caller holds none: then the screen alone says whether a turn runs).
 #[must_use]
-pub fn read_screen(rows: &[String]) -> Option<Screen> {
+pub fn read_screen(rows: &[String], title: Option<&str>) -> Option<Screen> {
+    use aterm_phase::ScreenReader as _;
     let (_, bottom) = aterm_phase::phase::composer_rules(rows)?;
     let Reading { mode, pill } = reading_under(rows, bottom);
-    let busy = aterm_phase::phase::busy_signal(rows).is_some_and(|b| !b.soft);
+    let runs = aterm_phase::ClaudeReader.runs(title);
+    let busy = aterm_phase::phase::busy_seen(rows, runs).is_some_and(|b| !b.soft);
+    let title_live = aterm_phase::phase::title_live(rows, runs);
     let vim_insert =
         footer::pill_row_under(rows, bottom).is_some_and(|r| footer::vim_insert(&rows[r]));
     Some(Screen {
         mode,
         pill,
         busy,
+        title_live,
         vim_insert,
     })
 }
@@ -366,25 +372,25 @@ mod tests {
     #[test]
     fn a_drawn_pill_this_build_cannot_name_replaces_the_mode_shown() {
         let rule = "\u{2500}".repeat(60);
-        let bypass = read_screen(&screen(&rule, BYPASS)).unwrap();
+        let bypass = read_screen(&screen(&rule, BYPASS), None).unwrap();
         let fold_from_bypass = |newer: Option<&Screen>| {
             let mut shown = read(Some(&bypass));
             shown.fold(&read(newer));
             shown.state(Light::Mode)
         };
         assert_eq!(fold_from_bypass(None), LightState::On, "a box keeps it");
-        let menu = read_screen(&screen(&rule, "  /model   Set the AI model")).unwrap();
+        let menu = read_screen(&screen(&rule, "  /model   Set the AI model"), None).unwrap();
         assert_eq!(
             fold_from_bypass(Some(&menu)),
             LightState::On,
             "so does a menu"
         );
         for row in ["  \u{23F5}\u{23F5} turbo mode on", "  \u{23F8} plan mo"] {
-            let s = read_screen(&screen(&rule, row)).unwrap();
+            let s = read_screen(&screen(&rule, row), None).unwrap();
             assert!(s.pill && s.mode.is_none(), "{row:?}");
             assert_eq!(fold_from_bypass(Some(&s)), LightState::Unknown, "{row:?}");
         }
-        let plan = read_screen(&screen(&rule, "  \u{23F8} plan mode on")).unwrap();
+        let plan = read_screen(&screen(&rule, "  \u{23F8} plan mode on"), None).unwrap();
         assert_eq!(fold_from_bypass(Some(&plan)), LightState::Off);
     }
 
@@ -403,7 +409,7 @@ mod tests {
             ("  \u{23F5}\u{23F5} auto mode on (shif", Mode::Auto),
         ];
         for (row, mode) in cases {
-            let s = read_screen(&screen(&rule, row)).expect("a composer");
+            let s = read_screen(&screen(&rule, row), None).expect("a composer");
             assert_eq!(s.mode, Some(mode), "{row:?}");
             let r = read(Some(&s));
             assert_eq!(deviates(Light::Mode, &r), !mode.is_expected(), "{row:?}");
@@ -514,7 +520,7 @@ mod tests {
     /// A box over the composer: nothing is known, so nothing deviates.
     #[test]
     fn no_composer_no_lights_and_no_drive() {
-        assert_eq!(read_screen(&["$ ls".to_owned()]), None);
+        assert_eq!(read_screen(&["$ ls".to_owned()], None), None);
         assert_eq!(read(None), Reading::UNKNOWN);
         for light in Light::ALL {
             assert!(!deviates(light, &Reading::UNKNOWN));
@@ -547,7 +553,7 @@ mod tests {
             let path = entry.unwrap().path();
             let text = std::fs::read_to_string(&path).unwrap_or_default();
             let rows: Vec<String> = text.lines().map(str::to_owned).collect();
-            let Some(s) = read_screen(&rows) else {
+            let Some(s) = read_screen(&rows, None) else {
                 continue;
             };
             let got = read(Some(&s));
@@ -585,7 +591,7 @@ mod tests {
             let path = entry.expect("a fixture").path();
             let text = std::fs::read_to_string(&path).unwrap_or_default();
             let rows: Vec<String> = text.lines().map(str::to_owned).collect();
-            let screen = read_screen(&rows);
+            let screen = read_screen(&rows, None);
             let reading = read_lights(&rows);
             assert_eq!(
                 reading,
@@ -636,7 +642,7 @@ mod tests {
                 .skip_while(|line| line.starts_with('#'))
                 .map(str::to_owned)
                 .collect();
-            let screen = read_screen(&rows)
+            let screen = read_screen(&rows, None)
                 .unwrap_or_else(|| panic!("{name}: no composer this build's reader sees"));
             let row = footer::mode_row(&rows)
                 .unwrap_or_else(|| panic!("{name}: no mode row the lights read"));
@@ -702,7 +708,7 @@ mod tests {
         ];
         for (name, text, mode) in cases {
             let rows: Vec<String> = text.lines().skip(1).map(str::to_owned).collect();
-            let s = read_screen(&rows).unwrap_or_else(|| panic!("{name}: a composer"));
+            let s = read_screen(&rows, None).unwrap_or_else(|| panic!("{name}: a composer"));
             assert_eq!(s.mode, Some(mode), "{name}");
             assert!(!s.busy, "{name}: idle");
             let rule = aterm_phase::phase::composer_bottom(&rows)
@@ -741,7 +747,7 @@ mod tests {
                 let text = std::fs::read_to_string(dir.join(&file))
                     .unwrap_or_else(|e| panic!("{file}: {e}"));
                 let rows: Vec<String> = text.lines().skip(1).map(str::to_owned).collect();
-                let s = read_screen(&rows).unwrap_or_else(|| panic!("{file}: a composer"));
+                let s = read_screen(&rows, None).unwrap_or_else(|| panic!("{file}: a composer"));
                 assert_eq!(s.mode, Some(mode), "{file}");
                 assert_eq!(s.busy, busy, "{file}");
                 let rule = aterm_phase::phase::composer_bottom(&rows)
@@ -752,7 +758,7 @@ mod tests {
                 let mut blank = rows.clone();
                 blank[row].clear();
                 assert_eq!(
-                    read_screen(&blank).and_then(|s| s.mode),
+                    read_screen(&blank, None).and_then(|s| s.mode),
                     None,
                     "{file}: CONTROL"
                 );
@@ -826,7 +832,7 @@ mod tests {
         ];
         for (name, text, mode, busy) in cases {
             let rows: Vec<String> = text.lines().skip(1).map(str::to_owned).collect();
-            let s = read_screen(&rows).unwrap_or_else(|| panic!("{name}: a composer"));
+            let s = read_screen(&rows, None).unwrap_or_else(|| panic!("{name}: a composer"));
             assert_eq!(s.mode, Some(mode), "{name}");
             assert_eq!(s.busy, busy, "{name}");
             let rule = aterm_phase::phase::composer_bottom(&rows)
@@ -836,5 +842,42 @@ mod tests {
                 "{name}: the mode row is read under the rule the footer writes into"
             );
         }
+    }
+
+    /// A reply drawn under a status line shows no busy sign (2.1.311 lab `mr`, MEASURED): the
+    /// window title's `◐`/`◑` is the turn the light's next press waits out, while the pill still
+    /// names auto mode. A title at rest, one with no glyph, or none held reads the screen alone
+    /// (not busy), and the done row ends the turn whatever the title says.
+    #[test]
+    fn a_reply_drawn_under_a_status_line_is_busy_while_its_title_runs() {
+        use aterm_phase::prompt::fixtures::{
+            STATUSLINE_LAST_LINE_HELD_2_1_311, STATUSLINE_MIDREPLY_2_1_311,
+            STATUSLINE_REPLY_DONE_2_1_311, screen as rows_of,
+        };
+        let mid = rows_of(STATUSLINE_MIDREPLY_2_1_311);
+        let held = rows_of(STATUSLINE_LAST_LINE_HELD_2_1_311);
+        let done = rows_of(STATUSLINE_REPLY_DONE_2_1_311);
+        for (name, rows) in [("mid-reply", &mid), ("last line held", &held)] {
+            for title in ["\u{25D0} Claude Code", "\u{25D1} Claude Code"] {
+                let s = read_screen(rows, Some(title)).unwrap_or_else(|| panic!("{name}"));
+                assert!(s.busy && s.title_live, "{name} under {title:?}: {s:?}");
+                assert_eq!(s.mode, Some(Mode::Auto), "{name}");
+            }
+            for title in [
+                Some("\u{2733} Claude Code"),
+                Some("Claude Code"),
+                Some(""),
+                None,
+            ] {
+                let s = read_screen(rows, title).unwrap_or_else(|| panic!("{name}"));
+                assert!(!s.busy && !s.title_live, "{name} under {title:?}: {s:?}");
+                assert_eq!(s.mode, Some(Mode::Auto), "{name}");
+            }
+        }
+        let s = read_screen(&done, Some("\u{25D0} Claude Code")).expect("the done frame");
+        assert!(
+            !s.busy && !s.title_live,
+            "the done row ends the turn: {s:?}"
+        );
     }
 }

@@ -1156,7 +1156,7 @@ pub(crate) fn attention_now_local(
     )
 }
 
-/// The identity of one stall episode, for the menu herald's notification key.
+/// The identity of one stall episode: the key of the need it raises ([`crate::needs::Need::key`]).
 pub(crate) fn episode_key(fact: &InputStallFact) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();

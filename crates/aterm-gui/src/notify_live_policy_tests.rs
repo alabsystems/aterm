@@ -96,7 +96,6 @@ fn quiet(message: &Message) -> bool {
 enum Change {
     Unchanged,
     Focus,
-    DesktopOff,
     Serious,
 }
 
@@ -110,13 +109,10 @@ fn queued_case(change: Change) -> Vec<Message> {
     }
     app.switch_tab_in(wid, 0);
     app.switch_tab_in(wid, 2);
-    app.config.desktop_alerts = Some(true);
-    app.apply_desktop_alerts(true);
     app.apply_serious_mode(false);
     let policy = DeliveryPolicy {
         suppress: Arc::clone(&app.notify_suppress),
         silent: Arc::clone(&app.notify_silent),
-        own_alerts: Arc::clone(&app.notify_own_alerts),
     };
     assert_eq!(*policy.suppress.lock().unwrap(), HashSet::from([2]));
     assert!(!policy.silent.load(std::sync::atomic::Ordering::Acquire));
@@ -152,11 +148,6 @@ fn queued_case(change: Change) -> Vec<Message> {
             app.switch_tab_in(wid, 0);
             assert!(policy.suppress.lock().unwrap().contains(&0));
         }
-        Change::DesktopOff => {
-            app.config.desktop_alerts = Some(false);
-            app.apply_desktop_alerts(false);
-            assert!(!policy.own_alerts.load(std::sync::atomic::Ordering::Acquire));
-        }
         Change::Serious => {
             app.apply_serious_mode(true);
             assert!(policy.silent.load(std::sync::atomic::Ordering::Acquire));
@@ -189,16 +180,15 @@ fn queued_case(change: Change) -> Vec<Message> {
 }
 
 #[test]
-fn delayed_unix_delivery_obeys_the_current_focus_alert_and_sound_policy() {
+fn delayed_unix_delivery_obeys_the_current_focus_and_sound_policy() {
     let unchanged = queued_case(Change::Unchanged);
     assert_eq!(unchanged.len(), 2, "unchanged A and B both cross the wire");
     assert!(!quiet(&unchanged[0]));
     let mut stale = Vec::new();
-    for change in [Change::Focus, Change::DesktopOff, Change::Serious] {
+    for change in [Change::Focus, Change::Serious] {
         let seen = queued_case(change);
         let valid = match change {
             Change::Focus => seen.len() == 1,
-            Change::DesktopOff => seen.len() == 2,
             Change::Serious => seen.len() == 2 && quiet(&seen[0]),
             Change::Unchanged => unreachable!(),
         };

@@ -813,7 +813,6 @@ fn exact_legacy_layout(ids: &[u64]) -> RestoreManifest {
                     not_claim_worker: false,
                     claim_worker: None,
                     task: None,
-                    told: None,
                 })),
                 focused_path: Vec::new(),
                 zoomed: false,
@@ -3991,7 +3990,6 @@ fn an_older_producers_tab_takes_its_park_title_not_the_records_stale_copy() {
                 not_claim_worker: false,
                 claim_worker: None,
                 task: None,
-                told: None,
             },
         )))
     };

@@ -378,8 +378,8 @@ const ALAB_SERVICE: &str = "_alab-vault._tcp";
 const ALAB_MEMBER_SERVICE: &str = aterm_secrets::discover::MEMBER_SERVICE;
 
 /// The pty driver: `drive.exp <record> <limit_s> <cmd> [arg...]`. A known prompt is answered at
-/// once; any other partial line left 1.5 s is a prompt, answered with Enter (its default). Each
-/// prompt's record names when it came and how long the command was silent before it.
+/// once; unfinished output receives no input. Each prompt's record names when it came and how
+/// long the command was silent before it. One absolute deadline bounds the whole command.
 /// `$NUX_JOIN` answers a vault join password (default `none`), `$NUX_SUDO` a sudo password. With
 /// `$NUX_SHELL` (a shell session's run), the first [`SHELL_READY`] line is its shell's first
 /// prompt: recorded, then answered with `exit`; nothing unknown is answered.
@@ -394,7 +394,6 @@ set sudo admin
 if {[info exists env(NUX_SUDO)]} { set sudo $env(NUX_SUDO) }
 set shell [info exists env(NUX_SHELL)]
 set exited 0
-set quiet 1500
 log_user 1
 match_max 100000
 set t0 [clock milliseconds]
@@ -408,7 +407,6 @@ expect {
     timeout { rec hang first_byte; exit 3 }
 }
 set prompts 0
-set waited 0
 set last 0
 proc answer {text reply} {
     global prompts last
@@ -420,8 +418,9 @@ proc answer {text reply} {
     set last $now
 }
 while {1} {
-    if {[clock milliseconds] >= $deadline} { rec hang [ms]; exit 3 }
-    set timeout [expr {$quiet / 1000.0}]
+    set left [expr {$deadline - [clock milliseconds]}]
+    if {$left <= 0} { rec hang [ms]; exit 3 }
+    set timeout [expr {($left + 999) / 1000}]
     expect {
         -re {nux-shell-ready} {
             if {$shell && !$exited} { set exited 1; rec shell_prompt_ms [ms]; send -- "exit\r" }
@@ -434,21 +433,11 @@ while {1} {
         -re {[^\r\n]*[Pp]assword[^\r\n]*: $} { answer $expect_out(0,string) $sudo }
         -re {[^\r\n]*[\r\n]+} { set last [ms] }
         eof { break }
-        timeout {
-            set timeout 0
-            expect {
-                -re {[^\r\n]+$} {
-                    if {!$shell} { incr waited $quiet; answer $expect_out(0,string) "" }
-                }
-                eof { break }
-                timeout {}
-            }
-        }
+        timeout { rec hang [ms]; exit 3 }
     }
 }
 rec end_ms [ms]
 rec prompts $prompts
-rec quiet_waited_ms $waited
 set status [wait]
 rec exit [lindex $status 3]
 "#;
@@ -1034,6 +1023,7 @@ pub struct Drive {
     pub end_ms: Option<u64>,
     /// Each prompt: when it came, how long the command wrote nothing before it, its text.
     pub prompts: Vec<(u64, u64, String)>,
+    /// Older drivers' time spent treating unfinished output as a prompt.
     pub quiet_waited_ms: Option<u64>,
     pub exit: Option<i32>,
     /// The hang detector fired, at this point.
@@ -1106,8 +1096,7 @@ fn drive_cells_within(row: &mut Row, label: &str, d: &Drive, limit: Duration) {
         Value::Count(u64::try_from(d.prompts.len()).unwrap_or(u64::MAX)),
     );
     if !d.prompts.is_empty() {
-        // What each prompt said, so one the quiet-line rule answered (a line left open 1.5 s, a
-        // progress line among them) reads apart from a question.
+        // Keep the words too: older drivers also answered unfinished progress lines.
         row.cell(
             format!("{label}prompt words"),
             Value::Text(
@@ -8342,10 +8331,74 @@ mod tests {
 
     #[test]
     fn a_shell_session_ends_at_the_marker_its_prompt_prints() {
-        // The marker the account's prompt prints is the one the driver waits for.
-        assert!(PROMPT_MARKER.contains(&format!("print -r -- {SHELL_READY}")));
-        assert!(PROMPT_MARKER.contains(&format!(">> {GUEST_NUX}/prompts;")));
-        assert!(DRIVE.contains(&format!("-re {{{SHELL_READY}}}")));
+        use std::io::{BufRead as _, Write as _};
+
+        const CHILD: &str = "ATERM_NUX_DRIVER_TEST";
+        const NAME: &str = "mac_nux::tests::a_shell_session_ends_at_the_marker_its_prompt_prints";
+        if let Ok(mode) = std::env::var(CHILD) {
+            let mut input = std::io::stdin().lock();
+            let mut output = std::io::stdout().lock();
+            let mut reply = String::new();
+            if mode == "shell" {
+                writeln!(output, "\n{SHELL_READY}").unwrap();
+                output.flush().unwrap();
+                input.read_line(&mut reply).unwrap();
+                assert_eq!(reply.trim_end(), "exit");
+            } else {
+                write!(output, "\nMac password: ").unwrap();
+                output.flush().unwrap();
+                input.read_line(&mut reply).unwrap();
+                assert_eq!(reply.trim_end(), "driver-password");
+                write!(output, "{{\"schema\":1,\"mode\":\"apply\"").unwrap();
+                output.flush().unwrap();
+                // Cross the old 1.5 s heuristic; ordinary unfinished output asks nothing.
+                let mut fds = [crate::sys::pollfd(0)];
+                let unexpected = crate::sys::poll(&mut fds, 3000).unwrap() != 0;
+                writeln!(output).unwrap();
+                output.flush().unwrap();
+                std::process::exit(if unexpected { 42 } else { 0 });
+            }
+            std::process::exit(0);
+        }
+
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let script = scratch.path().join("drive.exp");
+        std::fs::write(&script, DRIVE).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let drive = |mode: &str| {
+            let record = scratch.path().join(format!("{mode}.rec"));
+            let mut command = aterm_uds::spawnfd::command("/usr/bin/expect");
+            command
+                .arg("-f")
+                .arg(&script)
+                .arg(&record)
+                .arg("60")
+                .arg(&exe)
+                .args([NAME, "--exact", "--nocapture"])
+                .env(CHILD, mode)
+                .env("NUX_SUDO", "driver-password")
+                .env_remove("NUX_SHELL");
+            if mode == "shell" {
+                command.env("NUX_SHELL", "1");
+            }
+            let out = aterm_uds::deadline::output_until(&mut command, deadline).unwrap();
+            assert!(out.status.success(), "{out:?}");
+            let d = read_drive(&std::fs::read_to_string(record).unwrap());
+            (d, String::from_utf8(out.stdout).unwrap())
+        };
+        let (quiet, _) = drive("json");
+        let (shell, shell_out) = drive("shell");
+        assert_eq!(quiet.exit, Some(0), "unsolicited input: {quiet:?}");
+        assert_eq!(quiet.prompts.len(), 1, "{quiet:?}");
+        assert_eq!(quiet.prompts[0].2, "Mac password:");
+        assert_eq!(shell.exit, Some(0), "{shell:?}");
+        assert!(shell.prompts.is_empty(), "{shell:?}");
+        assert!(shell.shell_prompt_ms.is_some(), "{shell:?}");
+        let mut actual = Row::new(Scenario::TerminalLaunch);
+        shell_cells(&mut actual, "", &shell, &shell_out);
+        assert_eq!(actual.outcome, Outcome::Measured);
+
         let record = "start_epoch_ms 10\nfirst_byte_ms 40\nshell_prompt_ms 812\nend_ms 900\n\
                       prompts 0\nquiet_waited_ms 0\nexit 0\n";
         let d = read_drive(record);

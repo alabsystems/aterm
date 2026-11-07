@@ -473,6 +473,135 @@ mod tests {
         assert!(fx.children_run().is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn git_child_observation_preserves_config_input_exits_and_errors() {
+        use super::ConfigQuery;
+        use std::sync::{Arc, Mutex};
+        use std::time::Instant;
+
+        let git = aterm_uds::fixture_git::git();
+        let mut base = ChildSpec::new(Path::new(git.get_program()));
+        base.env.extend(
+            git.get_envs()
+                .filter_map(|(k, v)| v.map(|v| (k.to_owned(), v.to_owned()))),
+        );
+        let query = |bytes: &[u8], query: ConfigQuery| {
+            let mut spec = base.clone().config_input(bytes, query);
+            spec.args = query.args().iter().map(|arg| (*arg).into()).collect();
+            spec
+        };
+        let specs = [
+            base.clone().arg("--version"),
+            query(
+                b"[user]\nname = private-config-marker\n",
+                ConfigQuery::Names { read_only: false },
+            ),
+            query(
+                b"[core]\nrepositoryformatversion = 0\n",
+                ConfigQuery::WorktreeFlag,
+            ),
+            query(
+                b"[broken\nprivate-config-marker\n",
+                ConfigQuery::Names { read_only: false },
+            ),
+        ];
+        let spans = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&spans);
+        let fx = Fx::simulated(1_760_000_000).with_git_child_observer_for_tests(move |span| {
+            captured.lock().unwrap().push(span);
+        });
+        for (ordinal, spec) in specs.iter().enumerate() {
+            let live = Fx::live().git(spec, b"").unwrap();
+            let inactive = Fx::simulated(1_760_000_000).git(spec, b"").unwrap();
+            let began = Instant::now();
+            let observed = fx.git(spec, b"").unwrap();
+            let finished = Instant::now();
+            assert_eq!(observed, live);
+            assert_eq!(observed, inactive);
+            assert_eq!(observed.code == Some(0), ordinal < 2);
+            assert!(!String::from_utf8_lossy(&observed.stdout).contains("private-config-marker"));
+            assert!(!String::from_utf8_lossy(&observed.stderr).contains("private-config-marker"));
+            let spans = spans.lock().unwrap();
+            assert_eq!(spans.len(), ordinal + 1);
+            let span = spans.last().unwrap();
+            assert_eq!(
+                (span.ordinal, span.code, span.error),
+                (ordinal, observed.code, None)
+            );
+            assert!(
+                began <= span.started && span.started <= span.finished && span.finished <= finished
+            );
+        }
+        let refused = ChildSpec::new(Path::new("git")).arg("status");
+        let error = fx.git(&refused, b"").unwrap_err();
+        assert_eq!(error.side_effect, SideEffect::None);
+        assert_eq!(spans.lock().unwrap().len(), 4);
+        assert_eq!(fx.children_run().len(), 4);
+        let root = aterm_tempfile::tempdir().unwrap();
+        let generic = ChildSpec::new(&root.path().join("scripted-child"));
+        let fx = fx.with_children(vec![ScriptedChild {
+            program: generic.program.clone(),
+            args: Vec::new(),
+            out: ChildOut {
+                code: Some(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+        }]);
+        fx.child(&generic).unwrap();
+        assert_eq!(
+            spans.lock().unwrap().len(),
+            4,
+            "other child door is not observed"
+        );
+        assert_eq!(fx.children_run().len(), 5);
+        let absent = ChildSpec::new(&root.path().join("absent-git"));
+        let live = Fx::live().git(&absent, b"").unwrap_err().into_data();
+        let observed = fx.git(&absent, b"").unwrap_err().into_data();
+        assert_eq!(observed, live);
+        let spans = spans.lock().unwrap();
+        assert_eq!(spans.len(), 5);
+        assert_eq!(
+            (spans[4].ordinal, spans[4].code, spans[4].error),
+            (5, None, Some(Kind::CouldNotRun))
+        );
+        assert!(spans.windows(2).all(|p| p[0].finished <= p[1].started));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_child_observation_refuses_other_modes_and_replacement() {
+        use crate::fx::tape::{TapeEndpoints, TapeHeader, TapeMode};
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let root = aterm_tempfile::tempdir().unwrap();
+        let path = root.path().join("record.atape");
+        let header = TapeHeader {
+            agh_version: crate::version().to_owned(),
+            api_version: crate::API_VERSION.to_owned(),
+            argv: vec!["fixture".into()],
+            mode: TapeMode::Anonymous,
+            endpoints: TapeEndpoints::Loopback,
+        };
+        let reject = |fx: Fx| {
+            assert!(
+                catch_unwind(AssertUnwindSafe(
+                    || fx.with_git_child_observer_for_tests(|_| {})
+                ))
+                .is_err()
+            )
+        };
+        reject(Fx::live());
+        reject(Fx::record_for_tests(&path, &header).unwrap());
+        reject(Fx::replay_for_tests(&path).unwrap().0);
+        reject(
+            Fx::rerecord_for_tests(&path, &root.path().join("new.atape"))
+                .unwrap()
+                .0,
+        );
+        reject(Fx::simulated(1).with_git_child_observer_for_tests(|_| {}));
+    }
+
     #[test]
     fn a_relative_program_is_refused_under_simulation_as_it_is_live() {
         let spec = ChildSpec::new(Path::new("gh")).arg("auth");

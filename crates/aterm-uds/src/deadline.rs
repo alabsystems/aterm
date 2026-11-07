@@ -653,6 +653,38 @@ pub fn output_with_input_until_watching(
     input_unix::output_with_input_until_watching(cmd, input, deadline, max_output, stopped)
 }
 
+/// Which output pipe supplied a chunk to [`stream_until_stopped`].
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildOutput {
+    /// The child's stdout.
+    Stdout,
+    /// The child's stderr.
+    Stderr,
+}
+
+/// Run with closed stdin, streaming borrowed output chunks without retaining or limiting totals.
+/// `spawned` observes the owned root before output is delivered. Callbacks run on this waiter;
+/// they must return promptly so it can poll cancellation and an optional absolute deadline.
+/// `None` means stopped and supplies no EOF claim; `Some(status)` requires both output EOFs.
+/// Every return or unwind after spawn retains the actual root until its owning wait succeeds.
+/// The deadline bounds work, not retirement. Normal root exit requests descendant termination
+/// while its group ID is still reserved. Escaped descendants supply no drain guarantee.
+///
+/// # Errors
+/// Unsupported ownership operations, spawn, read, wait or callback errors, or `TimedOut`
+/// when execution or output outlives the supplied deadline. Cleanup can outlive that deadline.
+#[cfg(unix)]
+pub fn stream_until_stopped(
+    cmd: &mut Command,
+    deadline: Option<Instant>,
+    spawned: impl FnOnce(u32),
+    output: impl FnMut(ChildOutput, &[u8]) -> io::Result<()>,
+    stopped: impl FnMut() -> bool,
+) -> io::Result<Option<std::process::ExitStatus>> {
+    input_unix::stream_until_stopped(cmd, deadline, spawned, output, stopped)
+}
+
 /// Runs `cmd` with closed stdin, draining stdout/stderr and killing its process group at
 /// `deadline`.
 ///

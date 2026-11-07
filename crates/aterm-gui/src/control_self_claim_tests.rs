@@ -4653,27 +4653,3 @@ fn a_renewal_wakes_meta_changed_when_it_changes_proven_identity_or_lapses_a_wait
         "-"
     );
 }
-
-/// THE LAB'S NEEDS SEAM (`ATERM_DEV_LAB_NEEDS=1`, `aterm-lab told-once`): a `meta set
-/// harness_needs` no claim admits is told into the timeline's own set beside the standing
-/// `owner=needs` entry, as aterm's own loop's tell is, so every reader reads it in a tab with no
-/// agent; the same set again moves nothing. NEGATIVE CONTROL: with the seam off nothing is told
-/// (the verb answers `ERR denied`).
-#[test]
-fn the_lab_seam_tells_an_unclaimed_set_as_aterms_own_loop_does() {
-    use super::control_session::lab_loop_tell;
-    let h = crate::session_store::test_handle_on(7553, -1);
-    let ctx = h.ctx.as_ref();
-    put_needs_entry(ctx, Some(NEEDS_ENTRY));
-    let set = crate::needs::HarnessNeeds::told(&strings(&["a", "b"]), NEEDS_ENTRY).map(Arc::new);
-    assert!(set.is_some(), "a set");
-    assert_eq!(
-        lab_loop_tell(false, ctx, set.clone()),
-        None,
-        "CONTROL: the seam off"
-    );
-    assert_eq!(needs_read(ctx), None, "CONTROL: nothing told");
-    assert_eq!(lab_loop_tell(true, ctx, set.clone()), Some(true));
-    assert_eq!(needs_read(ctx), Some(strings(&["a", "b"])));
-    assert_eq!(lab_loop_tell(true, ctx, set), Some(false), "told again");
-}

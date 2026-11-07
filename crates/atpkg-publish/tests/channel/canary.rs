@@ -7,12 +7,12 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use atpkg_publish::canary::{self, ConsumerReport, Installed, Runner};
-use atpkg_publish::channel::mirror;
+use atpkg_publish::channel::{index, mirror};
 use atpkg_publish::error::Result;
 use atpkg_publish::quad;
 use atpkg_publish::triple::Triple;
 
-use super::{Doc, Rig};
+use super::{Doc, Rig, sha256_hex};
 
 struct Runs {
     fail: bool,
@@ -208,6 +208,278 @@ fn lay(rig: &Rig, dir: &Path, public: bool) {
     }
 }
 
+fn cohort() -> BTreeMap<String, u64> {
+    BTreeMap::from([
+        ("trust".into(), 8),
+        ("trust-ir".into(), 18),
+        ("trust-cg".into(), 28),
+        ("trust-vc".into(), 38),
+    ])
+}
+
+fn staged_cohort(rig: &Rig, targets: &[&str]) {
+    std::fs::write(
+        rig.path("staged-builds.toml"),
+        aterm_toml::to_string(&cohort()).unwrap(),
+    )
+    .unwrap();
+    for (program, build) in cohort() {
+        if program == "trust" {
+            continue;
+        }
+        let mut pack = rig.pack(&program, build, targets);
+        let mf = format!("pkg-{program}-{build}.toml");
+        let text = String::from_utf8(pack.files.iter().find(|(n, _)| n == &mf).unwrap().1.clone())
+            .unwrap();
+        let mut bound = String::new();
+        for line in text.lines() {
+            bound.push_str(line);
+            bound.push('\n');
+            if line.starts_with("size = ") {
+                bound.push_str(&format!(
+                    "[artifact.provenance]\ncompiler_commit = {:?}\n",
+                    "a".repeat(40)
+                ));
+            }
+        }
+        for (name, bytes) in &mut pack.files {
+            if name == &mf {
+                *bytes = bound.as_bytes().to_vec();
+            } else if name == &format!("{mf}.sig") {
+                *bytes = rig.keys.sign(bound.as_bytes());
+            }
+        }
+        let slug = rig.ctx.staging_slug(&pack.repo);
+        for (name, bytes) in pack.files {
+            rig.host.put_asset(&slug, &pack.tag, &name, bytes);
+        }
+    }
+}
+
+// Signed inert train inputs exercise selection on any test host. Foreign-host
+// compiler execution is not claimed by this metadata fixture.
+fn train_targets(rig: &Rig, dir: &Path, targets: &[&str]) {
+    let mut receipt: canary::Receipt =
+        aterm_toml::from_str(&std::fs::read_to_string(dir.join(canary::RECEIPT)).unwrap()).unwrap();
+    let first = receipt.installed[0].clone();
+    let bytes = std::fs::read(dir.join(&first.asset)).unwrap();
+    let mut text = "schema = 1\nprogram = \"trust\"\nbuild_number = 8\nversion = \"0.1.0\"\nexposes = [\"trustc\"]\n".to_string();
+    receipt.installed.clear();
+    for target in targets {
+        let asset = format!("trust-8-{target}.tar.zst");
+        std::fs::write(dir.join(&asset), &bytes).unwrap();
+        text.push_str(&format!("\n[[artifact]]\ntarget = {target:?}\nkind = \"sysroot-bundle\"\nasset = {asset:?}\nsha256 = {:?}\ntree_root = {:?}\nsize = {}\nreloc = \"none\"\n", first.sha256, first.tree_root, bytes.len()));
+        receipt.installed.push(Installed {
+            target: (*target).into(),
+            asset,
+            ..first.clone()
+        });
+    }
+    if !receipt.installed.iter().any(|i| i.asset == first.asset) {
+        std::fs::remove_file(dir.join(&first.asset)).unwrap();
+    }
+    std::fs::write(dir.join("pkg-trust-8.toml"), &text).unwrap();
+    std::fs::write(
+        dir.join("pkg-trust-8.toml.sig"),
+        rig.keys.sign(text.as_bytes()),
+    )
+    .unwrap();
+    receipt.manifest_sha256 = sha256_hex(text.as_bytes());
+    let text = aterm_toml::to_string(&receipt).unwrap();
+    std::fs::write(dir.join(canary::RECEIPT), &text).unwrap();
+    std::fs::write(dir.join(canary::SIGNATURE), rig.keys.sign(text.as_bytes())).unwrap();
+}
+
+#[test]
+fn an_arm_only_staged_cohort_preserves_global_intel_and_unrelated_selections() {
+    let (rig, q, source) = setup();
+    let out = install(&rig, &q, &source);
+    let arm = Triple::parse("aarch64-apple-darwin").unwrap();
+    train_targets(&rig, &out, &[arm.as_str()]);
+    let intel = "x86_64-apple-darwin";
+    let linux = "x86_64-unknown-linux-gnu";
+    let globals = [
+        ("trust", 7),
+        ("trust-ir", 17),
+        ("trust-cg", 27),
+        ("trust-vc", 37),
+        ("ay", 21),
+        ("ny", 14),
+    ];
+    let intel_pins = [
+        ("trust", 6),
+        ("trust-ir", 16),
+        ("trust-cg", 26),
+        ("trust-vc", 36),
+        ("ay", 23),
+    ];
+    let base = Doc::new(7, &globals)
+        .overlay(intel, &intel_pins)
+        .overlay(arm.as_str(), &[("ay", 22), ("ny", 15)])
+        .overlay(linux, &[("ny", 16)]);
+    rig.publish_head(&base);
+    for (program, build) in globals {
+        rig.lay_pack(
+            &rig.ctx.accounts.public,
+            program,
+            build,
+            &[arm.as_str(), intel, linux],
+        );
+    }
+    for (program, build) in intel_pins {
+        rig.lay_pack(&rig.ctx.accounts.public, program, build, &[intel]);
+    }
+    for (program, build, target) in [
+        ("ay", 22, arm.as_str()),
+        ("ny", 15, arm.as_str()),
+        ("ny", 16, linux),
+    ] {
+        rig.lay_pack(&rig.ctx.accounts.public, program, build, &[target]);
+    }
+    lay(&rig, &out, false);
+    staged_cohort(&rig, &[arm.as_str()]);
+    canary::publish_staged(&rig.ctx, rig.tmp.path(), &index::Index, &mut Rig::log()).unwrap();
+    let (_, published) =
+        quad::fetch_head(&rig.ctx, &rig.ctx.index_slug(), &rig.path("result")).unwrap();
+    let channel = &published.index.channels[0];
+    assert_eq!(
+        channel.pin,
+        globals
+            .into_iter()
+            .map(|(p, b)| (p.to_string(), b))
+            .collect()
+    );
+    assert_eq!(
+        channel.pin_by_target[intel],
+        intel_pins
+            .into_iter()
+            .map(|(p, b)| (p.to_string(), b))
+            .collect()
+    );
+    assert_eq!(
+        channel.pin_by_target[linux],
+        BTreeMap::from([("ny".into(), 16)])
+    );
+    let mut expected = cohort();
+    expected.extend([("ay".into(), 22), ("ny".into(), 15)]);
+    assert_eq!(channel.pin_by_target[arm.as_str()], expected);
+}
+
+#[derive(Default)]
+struct Requests(std::cell::RefCell<Vec<atpkg_publish::api::IndexRequest>>);
+
+impl atpkg_publish::api::Indexer for Requests {
+    fn publish(
+        &self,
+        _: &atpkg_publish::ctx::Ctx,
+        request: &atpkg_publish::api::IndexRequest,
+    ) -> Result<atpkg_publish::api::Published> {
+        self.0.borrow_mut().push(request.clone());
+        Ok(atpkg_publish::api::Published {
+            index_build: 8,
+            dir: request.out.clone(),
+            uploaded: request.upload,
+        })
+    }
+}
+
+#[test]
+fn every_canaried_target_gets_the_same_complete_group_tuple() {
+    let (rig, q, source) = setup();
+    let out = install(&rig, &q, &source);
+    let targets = ["x86_64-apple-darwin", "aarch64-apple-darwin"];
+    train_targets(&rig, &out, &targets);
+    lay(&rig, &out, false);
+    staged_cohort(&rig, &targets);
+    rig.publish_head(&Doc::new(
+        7,
+        &[
+            ("trust", 7),
+            ("trust-ir", 17),
+            ("trust-cg", 27),
+            ("trust-vc", 37),
+        ],
+    ));
+    let requests = Requests::default();
+    canary::publish_staged(&rig.ctx, rig.tmp.path(), &requests, &mut Rig::log()).unwrap();
+    let requests = requests.0.borrow();
+    let delta = &requests[0].delta;
+    assert!(delta.pins.is_empty());
+    assert_eq!(delta.target_pins.len(), targets.len());
+    for target in targets {
+        assert_eq!(delta.target_pins[&Triple::parse(target).unwrap()], cohort());
+    }
+}
+
+#[test]
+fn an_incomplete_group_target_or_foreign_compiler_never_reaches_the_indexer() {
+    for wrong_compiler in [false, true] {
+        let (rig, q, source) = setup();
+        let out = install(&rig, &q, &source);
+        let targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"];
+        train_targets(&rig, &out, &targets);
+        lay(&rig, &out, false);
+        staged_cohort(
+            &rig,
+            if wrong_compiler {
+                &targets
+            } else {
+                &targets[..1]
+            },
+        );
+        rig.publish_head(&Doc::new(7, &[("trust", 7)]));
+        if wrong_compiler {
+            let slug = rig.ctx.staging_slug("trust-ir");
+            let name = "pkg-trust-ir-18.toml";
+            let text = String::from_utf8(rig.host.asset(&slug, "atpkg-trust-ir-18", name).unwrap())
+                .unwrap()
+                .replace(&"a".repeat(40), &"b".repeat(40));
+            rig.host
+                .put_asset(&slug, "atpkg-trust-ir-18", name, text.as_bytes());
+            rig.host.put_asset(
+                &slug,
+                "atpkg-trust-ir-18",
+                &format!("{name}.sig"),
+                rig.keys.sign(text.as_bytes()),
+            );
+        }
+        let requests = Requests::default();
+        let error = canary::publish_staged(&rig.ctx, rig.tmp.path(), &requests, &mut Rig::log())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(if wrong_compiler {
+                "canaried compiler"
+            } else {
+                "no unique artifact"
+            }),
+            "{error}"
+        );
+        assert!(requests.0.borrow().is_empty());
+    }
+}
+
+#[test]
+fn a_partial_or_foreign_staged_tuple_never_reaches_the_indexer() {
+    let (rig, q, source) = setup();
+    install(&rig, &q, &source);
+    lay(&rig, &source, false);
+    staged_cohort(&rig, &[Triple::host().unwrap().as_str()]);
+    let mut builds = cohort();
+    builds.remove("trust-vc");
+    builds.insert("ay".into(), 22);
+    std::fs::write(
+        rig.path("staged-builds.toml"),
+        aterm_toml::to_string(&builds).unwrap(),
+    )
+    .unwrap();
+    rig.publish_head(&Doc::new(7, &[("trust", 7)]));
+    let requests = Requests::default();
+    let error =
+        canary::publish_staged(&rig.ctx, rig.tmp.path(), &requests, &mut Rig::log()).unwrap_err();
+    assert!(error.to_string().contains("must select exactly"), "{error}");
+    assert!(requests.0.borrow().is_empty());
+}
+
 #[test]
 fn index_rechecks_even_an_already_public_pack_against_its_canary() {
     let (rig, q, source) = setup();
@@ -242,7 +514,11 @@ impl atpkg_publish::api::Indexer for Index {
         request: &atpkg_publish::api::IndexRequest,
     ) -> Result<atpkg_publish::api::Published> {
         assert!(request.upload);
-        assert_eq!(request.delta.pins.get("trust"), Some(&8));
+        assert!(request.delta.pins.is_empty());
+        assert_eq!(
+            request.delta.target_pins[&Triple::host().unwrap()],
+            cohort()
+        );
         self.0.set(self.0.get() + 1);
         Ok(atpkg_publish::api::Published {
             index_build: 8,
@@ -345,7 +621,7 @@ fn staged_resume_never_repacks_and_is_idempotent_but_refuses_changed_staging() {
     let out = install(&rig, &q, &source);
     lay(&rig, &source, false);
     rig.publish_head(&Doc::new(7, &[("trust", 7)]));
-    std::fs::write(rig.path("staged-builds.toml"), "trust = 8\n").unwrap();
+    staged_cohort(&rig, &[Triple::host().unwrap().as_str()]);
     let index = Index(std::cell::Cell::new(0));
     let mut log = Rig::log();
     canary::publish_staged(&rig.ctx, rig.tmp.path(), &index, &mut log).unwrap();

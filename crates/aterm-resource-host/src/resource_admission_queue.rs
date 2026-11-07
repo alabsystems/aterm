@@ -181,8 +181,18 @@ impl Owner {
         Ok(prepared)
     }
     fn check_fresh_metadata_ancestry(&self, pending: &Pending) -> io::Result<()> {
+        self.check_fresh_metadata_ancestry_at(pending, Instant::now())
+    }
+    pub(super) fn check_fresh_metadata_ancestry_at(
+        &self,
+        pending: &Pending,
+        started: Instant,
+    ) -> io::Result<()> {
         use aterm_capacity::FundedMembership;
-        let deadline = Instant::now() + Duration::from_millis(250);
+        // Inventory and native rereads establish membership; elapsed wall time
+        // is only a hang detector. A loaded host can spend over 250 ms reading
+        // an unchanged funded inventory before the final ancestry reread.
+        let deadline = started + Duration::from_secs(60);
         let peer = pending.submission.peer;
         let ancestry = aterm_uds::process::Ancestry::capture(
             peer.pid,

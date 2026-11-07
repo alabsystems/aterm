@@ -607,8 +607,8 @@ pub(crate) struct SessionFactory {
     /// The event loop's turn state ([`LoopIdle`]), stamped by the main thread and read by every
     /// tab's PTY reader ([`gated_output_wake`]).
     pub(crate) loop_idle: Arc<LoopIdle>,
-    /// Desktop-notification queue shared by every tab, with slots kept for aterm's own notices ([`notify::Notifier`]).
-    pub(crate) notify_tx: notify::Notifier,
+    /// Desktop-notification channel shared by every tab (bounded, `notify::NOTIFY_QUEUE_CAP`).
+    pub(crate) notify_tx: std::sync::mpsc::SyncSender<notify::NotifyMsg>,
     /// Config `allow_kitty_file_transfer` (default false).
     pub(crate) allow_kitty_file_transfer: bool,
     /// Config `temporal_recording` (default [`crate::app_config::DEFAULT_TEMPORAL_RECORDING`]).
@@ -5529,7 +5529,7 @@ fn install_clipboard(
 pub(crate) fn configure_notifications(
     term: &Arc<Mutex<Terminal>>,
     reach: HostReach,
-    notify_tx: &notify::Notifier,
+    notify_tx: &std::sync::mpsc::SyncSender<notify::NotifyMsg>,
     id: u64,
     witness: &Arc<crate::spare::Witness>,
 ) {
@@ -10278,7 +10278,7 @@ mod clipboard_coalesce_tests {
 
 #[cfg(test)]
 mod host_reach_tests {
-    use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+    use std::sync::mpsc::{Receiver, RecvTimeoutError, channel, sync_channel};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -10438,7 +10438,7 @@ mod host_reach_tests {
                 Some(&notifications_allowed()),
                 None,
             )));
-            let (tx, notices) = super::notify::Notifier::channel();
+            let (tx, notices) = sync_channel(8);
             configure_notifications(&term, host_reach(mode), &tx, 1, &Arc::default());
             term_lock(&term).apply_policy_engine(aterm_policy::engine::PolicyEngine::new(
                 aterm_policy::profiles::standard(),
@@ -10474,7 +10474,7 @@ mod host_reach_tests {
             Some(&notifications_allowed()),
             None,
         )));
-        let (tx, notices) = super::notify::Notifier::channel();
+        let (tx, notices) = sync_channel(8);
         configure_notifications(&term, host_reach(Cm::User), &tx, 1, &Arc::default());
         term_lock(&term).process(&[WORKING, BLOCKED].concat());
         assert!(

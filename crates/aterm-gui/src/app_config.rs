@@ -991,6 +991,10 @@ impl ThemeCatalog {
                 truncated = true;
                 break;
             }
+            debug_assert!(
+                user_theme_file_read(&path),
+                "the watcher holds each file discovery reads"
+            );
             kept += 1;
 
             let bytes = match read_bounded_theme_file(&path) {
@@ -1292,6 +1296,17 @@ fn builtin_theme_name(name: &str) -> Option<&'static str> {
 
 fn safe_user_theme_name(name: &str) -> Result<(), &'static str> {
     aterm_types::scheme::validate_user_theme_name(name)
+}
+
+/// Whether discovery reads the bytes of the regular `.conf` file at `path` once its turn in name
+/// order comes, within [`MAX_USER_THEME_FILES`]: its name is UTF-8, shadows no built-in theme,
+/// and is a safe theme name. The config watcher holds a key on each file it reads.
+pub(crate) fn user_theme_file_read(path: &std::path::Path) -> bool {
+    path.file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| {
+            builtin_theme_name(name).is_none() && safe_user_theme_name(name).is_ok()
+        })
 }
 
 enum ThemeFileReadError {
@@ -2404,11 +2419,6 @@ impl Config {
     /// Whether the connection role marks the tab.
     pub(crate) fn tab_connection_badge_or_default(&self) -> bool {
         self.tab_connection_badge.unwrap_or(true)
-    }
-
-    /// Whether aterm posts its own notices to the desktop.
-    pub(crate) fn desktop_alerts_or_default(&self) -> bool {
-        self.desktop_alerts.unwrap_or(false)
     }
 
     /// Whether new tabs keep Rewind's screen history (`temporal_recording`).
@@ -7707,7 +7717,6 @@ impl App {
         let windows: Vec<WindowId> = self.windows.keys().copied().collect();
         self.refresh_tab_chrome_windows(windows);
         self.reconfigure_session_status();
-        self.apply_desktop_alerts(config.desktop_alerts_or_default());
         if config.allow_palette_reconfigure_or_default() {
             self.except_clear(&crate::message_reporters::palette_refused_key());
         }

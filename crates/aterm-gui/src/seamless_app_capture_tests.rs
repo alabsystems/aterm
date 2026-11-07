@@ -2158,7 +2158,7 @@ fn a_held_panes_seen_failure_stays_seen_across_the_update() {
 }
 
 #[test]
-fn what_the_owner_was_told_and_has_seen_crosses_the_update() {
+fn a_standing_need_and_a_read_done_cross_the_update() {
     use crate::status_item::StatusCarry;
     use crate::task_record::TaskState;
     let Some(_env) = env_alone() else { return };
@@ -2192,11 +2192,9 @@ fn what_the_owner_was_told_and_has_seen_crosses_the_update() {
         .unwrap_or_else(PoisonError::into_inner)
         .set("attention", Some("wedged on CI".to_string()));
     app.publish_need(0);
-    app.headless = false;
-    app.config.desktop_alerts = Some(true);
-    crate::app_tabs::HERALD_REFUSAL.set(None);
     app.herald_session(0);
-    app.headless = true;
+    let need_since = app.presence.herald.need_since(0);
+    assert!(need_since.is_some(), "PRECONDITION: the herald saw the ask");
     let since_ms = ctx
         .timeline
         .lock()
@@ -2216,18 +2214,17 @@ fn what_the_owner_was_told_and_has_seen_crosses_the_update() {
     };
     let (asking, untouched) = (sid_of(&app, 0), sid_of(&app, quiet));
 
-    let at = "a told ask and a read done";
+    let at = "a standing ask and a read done";
     let (_parked, incoming, _nonce, _expected) =
         hand_over_held(&mut app, ReceiverShape::Current, HeldPlan::Export, at);
     let carried: std::collections::HashMap<String, String> =
         incoming.status_seen.iter().cloned().collect();
     let carry = StatusCarry::parse(carried.get(&asking).expect("the asking session's row"));
     assert_eq!(
-        carry.need.map(|(word, _)| word),
-        Some(aterm_types::needs::NeedWord::Ask),
-        "{at}"
+        carry.need,
+        need_since.map(|at| (aterm_types::needs::NeedWord::Ask, at)),
+        "{at}: the ask and its age"
     );
-    assert!(carry.told, "{at}: told");
     assert_eq!(carry.done, Some(since_ms), "{at}: the done read");
     assert!(!carried.contains_key(&untouched), "{at}: nothing known");
     drop(incoming);

@@ -192,8 +192,6 @@ pub(crate) struct SessionRow {
     pub need_alone: bool,
     /// Where its tab is (`in tab 3`, `in tab 3, left pane`; `App::session_place`), filled by the glance's first pass only where another row shares its label: every row that names the session says it after the label ([`Self::named`]).
     pub place: Option<String>,
-    /// The number of the person's last plain Enter in the tab (`HumanInputStamp::last_plain_enter`), `0` for none: the owner's turn, which lets a need they were told of be told again ([`Escalation::owner_turn`]). The menu never shows it, so a keypress moves no row.
-    pub owner_turn: u64,
 }
 
 impl SessionRow {
@@ -308,447 +306,29 @@ pub(crate) struct SiblingNeed {
 pub(crate) struct InputStallRow {
     /// The server's own attention words for the stall (`<prog> is frozen: not reading input since <HH:MM> (…) — restart it: …`), as its `meta attention=` entry carries them.
     pub text: String,
-    /// The episode's identity (a hash of when its oldest unread byte was accepted): one notification per stall, however its text moves.
+    /// The episode's identity (a hash of when its oldest unread byte was accepted): one need per stall, however its text moves.
     pub key: u64,
-    /// The job is stopped with input queued (`signal cont` resumes it), not frozen: the notification's title says which.
+    /// The job is stopped with input queued (`signal cont` resumes it), not frozen: the need's word says which.
     pub stopped: bool,
 }
 
-/// What an escalation row is about: the need's word in the herald's coarser vocabulary (its log word and key spelling), most severe first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum EscalationKind {
-    /// The program has left its input unread, or its job is stopped with input queued ([`NeedWord::Frozen`], [`NeedWord::Stopped`]).
-    Unresponsive,
-    /// The worker's task is stalled ([`NeedWord::Stalled`]).
-    Stalled,
-    /// Typed attention of kind ask ([`NeedWord::Ask`]).
-    Attention,
-    /// An approval box nobody presses ([`NeedWord::Approval`]).
-    Prompt,
-    /// A question nobody answers ([`NeedWord::Question`]).
-    Question,
-    /// A wall nobody answers: a lost login, the memory banner nobody restarts, any other wall ([`NeedWord::Login`], [`NeedWord::Memory`], [`NeedWord::Wall`]).
-    Wall,
-}
-
-impl EscalationKind {
-    /// The herald's kind for a need word.
-    pub(crate) const fn of(word: NeedWord) -> Self {
-        match word {
-            NeedWord::Frozen | NeedWord::Stopped => Self::Unresponsive,
-            NeedWord::Stalled => Self::Stalled,
-            NeedWord::Ask => Self::Attention,
-            NeedWord::Approval => Self::Prompt,
-            NeedWord::Question => Self::Question,
-            NeedWord::Login | NeedWord::Memory | NeedWord::Wall => Self::Wall,
-        }
-    }
-
-    const fn log_word(self) -> &'static str {
-        match self {
-            Self::Unresponsive => "unresponsive",
-            Self::Stalled => "stalled",
-            Self::Attention => "attention",
-            Self::Prompt => "prompt",
-            Self::Question => "question",
-            Self::Wall => "wall",
-        }
-    }
-}
-
-/// The notification's title for a need — aterm's own words, the word's: a stopped job is not frozen, and an agent under the memory banner has not stopped (Claude Code draws it while the agent still runs).
-pub(crate) const fn headline(word: NeedWord) -> &'static str {
-    match word {
-        NeedWord::Frozen => "aterm \u{00b7} program frozen",
-        NeedWord::Stopped => "aterm \u{00b7} program stopped",
-        NeedWord::Stalled => "aterm \u{00b7} worker stalled",
-        NeedWord::Login | NeedWord::Wall => "aterm \u{00b7} agent stopped",
-        NeedWord::Memory => "aterm \u{00b7} agent memory critical",
-        NeedWord::Ask => "aterm \u{00b7} needs you",
-        NeedWord::Approval => "aterm \u{00b7} approval waiting",
-        NeedWord::Question => "aterm \u{00b7} question waiting",
-    }
-}
-
-/// One session's escalation: its published need, as the menu row and the herald read it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Escalation {
-    /// Process-local session id.
-    pub session: u64,
-    /// What it is about.
-    pub kind: EscalationKind,
-    /// The need it is: what a seamless update's carry is matched by ([`Herald::note_spent`]) — a kind holds several words (a login, a memory wall and any other wall are all [`EscalationKind::Wall`]), and each is its own need.
-    pub word: NeedWord,
-    /// The transition's identity within `(session, kind)` ([`crate::needs::Need::key`]): the same need re-read is the same key; a new one is a new key.
-    pub key: u64,
-    /// The need row's words without its age: `<tab label> — <what>`.
-    pub label: String,
-    /// The notification body: `<tab title>: <what>`.
-    pub body: String,
-    /// The notification title ([`headline`]).
-    pub headline: &'static str,
-    /// The engine's sequence of the program's own `blocked` report a program-claim need stands
-    /// on ([`crate::needs::Need::report`]), which the herald's log line names it by ([`herald_log_line`]).
-    pub report: Option<u64>,
-    /// Each need an ask stands for, by its own words ([`need_ids`]); empty for every other kind, which keeps one notice per transition.
-    pub needs: Vec<NeedId>,
-    /// The owner's turn in the tab as the row read it ([`SessionRow::owner_turn`]).
-    pub owner_turn: u64,
-}
-
-/// One need an escalation stands for ([`Escalation::needs`]): its id ([`crate::needs::need_id`] of its words, or an ask's key where the window has no words for it), how the window read it, and the banner that names it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NeedId {
-    /// The need's identity: the same words are the same need, whatever frame, count or order they come in.
-    pub id: u64,
-    /// How the window read the need ([`NeedRead`]): what else names it in the told memory.
-    pub read: NeedRead,
-    /// The notification body that names it: `<tab title>: <its words> (+N more)`.
-    pub body: String,
-}
-
-/// HOW THE WINDOW READ A NEED (design §14.18.1): the needs entry carries a harness's first need cut to the entry's cells (`… needs you: <first, cut> (+N more)`), its told set carries every need whole, and a row reads the set where it has one and the entry alone where it has none (a seamless successor before its loop tells the set again, a self-claim that tells none). So a first need read whole and read cut from the same entry is one need, while two needs that share only the cut stay two when read whole.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NeedRead {
-    /// Read whole, where the entry carries it in the same words or never names it: its id alone names it.
-    Whole,
-    /// Read whole from a told set while the entry beside it carries it cut: the [`crate::needs::need_id`] of the entry's words, which a read of that entry alone names it by.
-    Cut(u64),
-    /// Read from the entry alone, whose words may be a cut: a need read whole beside an entry that cut it to these words is this need too.
-    Entry,
-}
-
-/// What telling a need read whole marks for the entry's cut of it ([`NeedRead::Cut`]): apart from every need id, so a read of the entry alone matches it ([`NeedRead::Entry`]) and another need read whole with the same cut does not.
-fn cut_mark(entry: u64) -> u64 {
-    let mut bytes = b"need-cut:".to_vec();
-    bytes.extend_from_slice(&entry.to_le_bytes());
-    aterm_hash::fnv1a_64(&bytes).max(1)
-}
-
-impl NeedId {
-    /// What telling this need marks ([`Told::mark`]): its id, and [`cut_mark`] of the entry's words where it was read whole beside an entry that cuts it.
-    fn marks(&self) -> impl Iterator<Item = u64> + use<> {
-        let cut = match self.read {
-            NeedRead::Cut(entry) => Some(cut_mark(entry)),
-            NeedRead::Whole | NeedRead::Entry => None,
-        };
-        std::iter::once(self.id).chain(cut)
-    }
-
-    /// Whether the marks `has` holds name this need: its id; read whole beside a cut, the cut's id a read of the entry alone marked; read from the entry alone, the [`cut_mark`] a whole read cut to these words left.
-    fn named_in(&self, has: impl Fn(u64) -> bool) -> bool {
-        has(self.id)
-            || match self.read {
-                NeedRead::Whole => false,
-                NeedRead::Cut(entry) => has(entry),
-                NeedRead::Entry => has(cut_mark(self.id)),
-            }
-    }
-}
-
-const ROW_TITLE_MAX: usize = 32;
-
 pub(crate) use crate::needs::{fold_clip, wall_words};
 
-/// A banner body about one tab: `<tab title>: <what>`, the title stripped of status glyphs and clipped like a menu row; `what` alone when the title is empty.
-pub(crate) fn tab_body(title: &str, what: &str) -> String {
-    let title = fold_clip(stripped_title(title), ROW_TITLE_MAX);
-    if title.is_empty() {
-        what.to_string()
-    } else {
-        format!("{title}: {what}")
-    }
-}
-
-fn body_words(need: &crate::needs::Need) -> String {
-    need.harness.as_ref().map_or_else(
-        || need.what.clone(),
-        |ask| ask.line(crate::needs::NEED_WHAT_MAX + ask.more_words().len()),
-    )
-}
-
-/// Adapter from a row's published need to the herald's escalation: every notice names its tab, attention included.
-pub(crate) fn escalation(row: &SessionRow) -> Option<Escalation> {
-    let need = row.need.as_ref()?;
-    let body = tab_body(&row.title, &body_words(need));
-    let label = need_label(&row.title, None, &need.what);
-    let needs = need_ids(&row.title, need, &body);
-    Some(Escalation {
-        session: row.id,
-        kind: EscalationKind::of(need.word),
-        word: need.word,
-        key: need.key,
-        label,
-        body,
-        headline: headline(need.word),
-        report: need.report,
-        needs,
-        owner_turn: row.owner_turn,
-    })
-}
-
-/// THE NEEDS AN ASK STANDS FOR, EACH BY ITS OWN WORDS (design §14.18): a harness's ask one per need it carries (its first, then its others, in the worker's order), each named by a body that leads with it, and its key besides where its entry counts needs no told set carries (`(+N more)` past the others: an entry read alone, or a self-claim past its told set's cap); any other ask its key alone, whose body is the escalation's. The first need is read from the entry alone where no told set came with it, else whole, beside the entry's cut of it where the entry's words differ ([`NeedRead`]); the others and the key are read whole. Every other word stands for none: its key is already one episode, and it keeps one notice per transition.
-fn need_ids(title: &str, need: &crate::needs::Need, body: &str) -> Vec<NeedId> {
-    if need.word != NeedWord::Ask {
-        return Vec::new();
-    }
-    let Some(ask) = &need.harness else {
-        return vec![NeedId {
-            id: need.key,
-            read: NeedRead::Whole,
-            body: body.to_string(),
-        }];
-    };
-    let more = ask.more_words();
-    let first_read = ask.entry_first.as_deref().map_or(NeedRead::Entry, |cut| {
-        let cut = crate::needs::need_id(cut);
-        if cut == crate::needs::need_id(&ask.first) {
-            NeedRead::Whole
-        } else {
-            NeedRead::Cut(cut)
-        }
-    });
-    let mut ids: Vec<NeedId> = std::iter::once((&ask.first, first_read))
-        .chain(ask.others.iter().map(|words| (words, NeedRead::Whole)))
-        .map(|(words, read)| NeedId {
-            id: crate::needs::need_id(words),
-            read,
-            body: tab_body(
-                title,
-                &format!("{}{more}", fold_clip(words, crate::needs::NEED_WHAT_MAX)),
-            ),
-        })
-        .collect();
-    if usize::from(ask.more) > ask.others.len() {
-        ids.push(NeedId {
-            id: need.key,
-            read: NeedRead::Whole,
-            body: body.to_string(),
-        });
-    }
-    ids
-}
-
-/// The shortest spacing between two notifications for one session: a flapping verdict costs one notification per floor, never one per flap.
-pub(crate) const NOTIFY_SESSION_FLOOR: std::time::Duration = std::time::Duration::from_secs(20);
-/// At most [`NOTIFY_BURST`] notifications per [`NOTIFY_BURST_WINDOW`] across the instance: ten agents hitting one usage limit page a few times, not ten.
-pub(crate) const NOTIFY_BURST: usize = 3;
-/// The window [`NOTIFY_BURST`] is counted over.
-pub(crate) const NOTIFY_BURST_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
-/// How long a session whose notice `notify.rs`'s queue refused ([`Herald::refused`]) waits before that notice is tried again; no other session waits on it.
-pub(crate) const NOTIFY_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// One native notification the herald decided to post.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct HeraldNotice {
-    /// The session it is about (the delivery thread's focus suppression).
-    pub session: u64,
-    /// aterm's own headline for the row ([`Escalation::headline`]).
-    pub title: &'static str,
-    /// `<tab title>: <what>`.
-    pub body: String,
-    /// Revoked when this escalation's delivery intent ends.
-    pub(crate) validity: crate::notify::NoticeValidity,
-    decided: (),
-}
-
-/// What one [`Herald::note_spent`] decided.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct HeraldOutcome {
-    /// The session's menu row appeared, changed or went away — re-render.
-    pub row_moved: bool,
-    /// Post exactly this notification.
-    pub notice: Option<HeraldNotice>,
-    /// This note met a new `(kind, key)`, or an ask under the same key carrying a need neither told nor noted last ([`Told`]): not a re-read of the one shown, and not the timer re-heralding an owed notice ([`Herald::due`]).
-    pub transition: bool,
-    /// The transitions awaiting a notice when this note decided, its own included: what a post pays (`aterm.log`'s `(+n-1 more)`), what [`HeraldQuiet::Limited`] still owes (`1` on the FIRST hold), what [`HeraldQuiet::Looking`] or [`HeraldQuiet::Disabled`] spent.
-    pub owed: u32,
-    /// This quiet decision — [`HeraldQuiet::Looking`], [`HeraldQuiet::Disabled`], [`HeraldQuiet::ToldOnce`], or [`HeraldQuiet::Limited`]'s FIRST hold (a transition leaving one notice owed) — is its session's first since the later of its last post and a [`NOTIFY_SESSION_FLOOR`] ago: the one `aterm.log` records at `info` ([`herald_log_line`]).
-    pub first_quiet: bool,
-}
-
-/// How the owner already heard of a session's need, so its transition owes no notice
-/// ([`Herald::note_spent`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Spent {
-    /// The human is looking at the tab in the active app.
-    Looking,
-}
-
-/// Why a transition into an escalation posted nothing (test-visible).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HeraldQuiet {
-    /// The same `(kind, key)` as the last note — the same box re-read.
-    Same,
-    /// The human is looking at the tab in the active app.
-    Looking,
-    /// Desktop alerts are off.
-    Disabled,
-    /// [`NOTIFY_SESSION_FLOOR`] or [`NOTIFY_BURST`] held it back, or the notifier's queue refused this session's notice less than [`NOTIFY_RETRY`] ago (another session's refusal holds nothing here): it is owed, and posted (coalesced) when the limit allows ([`Herald::due`]).
-    Limited,
-    /// Every need the transition stands for was told already ([`Told`]): the same need back, re-counted or re-ordered, or a set that lost a need. Decided before the look and the setting, so it is the same with alerts off.
-    ToldOnce,
-}
-
-#[derive(Debug, Default)]
-struct HeraldSlot {
-    shown: Option<(EscalationKind, u64)>,
-    label: Option<String>,
-    notified_at: Option<std::time::Instant>,
-    notified_before: Option<std::time::Instant>,
-    retry_at: Option<std::time::Instant>,
-    owed: u32,
-    quiet_logged_at: Option<std::time::Instant>,
-    notice_owner: Option<std::sync::Arc<()>>,
-    told: Told,
-}
-
-/// The most need ids one session's told memory keeps ([`Told`]); the oldest goes first, and its need can be told again.
-pub(crate) const TOLD_MAX: usize = 32;
-
-/// ONE SESSION'S TOLD-ONCE MEMORY (design §14.18): the ids ([`NeedId`]) of the asks its owner was told of — a notice queued, or spent on their look or alerts off — since their last turn in the tab ([`Escalation::owner_turn`]) and the agent's last take-down (the escalation gone), with each told escalation's key. A seamless update carries its ids in the session's status row ([`StatusCarry::told_ids`]) and a quit in the tab's restore leaf (`TerminalLeafRestore::told`), and the next process keeps them ([`Herald::adopt`]) until the owner's first turn there, or a take-down after the first need it notes.
-#[derive(Debug, Default)]
-struct Told {
-    /// The owner's turn the memory is kept under.
-    turn: u64,
-    /// The ids told, oldest first, at most [`TOLD_MAX`].
-    ids: std::collections::VecDeque<u64>,
-    /// The marks ([`NeedId::marks`]) of the escalation noted last, told or not: a re-read under the same key brings news only with a need neither these nor the memory name ([`NeedId::named_in`]).
-    noted: Vec<u64>,
-    /// The ids the last notice marked new, which [`Herald::refused`] takes back.
-    posted: Vec<u64>,
-    /// The key of an adopted told escalation that counts needs it does not name (an entry read alone, [`Herald::note_spent`]): the outgoing process told the set standing under it, so the first read under that key that names every need it counts marks them told.
-    adopted: Option<u64>,
-    /// These ids came from the process before this one ([`Herald::adopt`]) and no escalation has been noted here since: a note with nothing standing is the restart's gap, not the agent's take-down, so it keeps them, and the first need noted here judges them by the owner's turn (`0` here: no plain Enter in this process).
-    carried: bool,
-}
-
-impl Told {
-    fn has(&self, id: u64) -> bool {
-        self.ids.contains(&id)
-    }
-
-    /// Whether this memory names `need` ([`NeedId::named_in`]).
-    fn names(&self, need: &NeedId) -> bool {
-        need.named_in(|id| self.has(id))
-    }
-
-    /// Mark `ids` told, returning those that were not.
-    fn mark(&mut self, ids: impl IntoIterator<Item = u64>) -> Vec<u64> {
-        let mut new = Vec::new();
-        for id in ids {
-            if self.has(id) {
-                continue;
-            }
-            if self.ids.len() == TOLD_MAX {
-                self.ids.pop_front();
-            }
-            self.ids.push_back(id);
-            new.push(id);
-        }
-        new
-    }
-
-    /// Forget every id told and an adoption's set still to name, keeping what was noted last: a re-read of it is still no transition.
-    fn forget(&mut self) {
-        self.ids.clear();
-        self.posted.clear();
-        self.adopted = None;
-        self.carried = false;
-    }
-}
-
-/// A told memory's ids as a restart or an update carries them ([`Told`]): each id in hex, oldest first, comma-separated; `None` for none.
-#[must_use]
-pub(crate) fn told_ids_row(ids: &[u64]) -> Option<String> {
-    (!ids.is_empty()).then(|| {
-        ids.iter()
-            .map(|id| format!("{id:016x}"))
-            .collect::<Vec<_>>()
-            .join(",")
-    })
-}
-
-/// One id as [`told_ids_row`] spells it: one to sixteen hex digits naming an id other than `0`.
-fn hex_id(part: &str) -> Option<u64> {
-    if !(1..=16).contains(&part.len()) || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    u64::from_str_radix(part, 16).ok().filter(|id| *id != 0)
-}
-
-/// [`told_ids_row`]'s ids read back, in its order, a part that does not read ([`hex_id`]) dropped, at most [`TOLD_MAX`] of them, the newest kept.
-#[must_use]
-pub(crate) fn parse_told_ids(row: &str) -> Vec<u64> {
-    let ids: Vec<u64> = row.split(',').filter_map(hex_id).collect();
-    ids[ids.len().saturating_sub(TOLD_MAX)..].to_vec()
-}
-
-/// What a told escalation marks ([`Told::mark`]): each need it stands for ([`NeedId::marks`]), and its key.
-fn told_ids(esc: &Escalation) -> impl Iterator<Item = u64> + '_ {
-    esc.needs
-        .iter()
-        .flat_map(NeedId::marks)
-        .chain(std::iter::once(esc.key))
-}
-
-/// Whether `esc` counts needs it does not name: its key stands among its needs ([`need_ids`]).
-fn counts_unnamed(esc: &Escalation) -> bool {
-    esc.needs.iter().any(|need| need.id == esc.key)
-}
-
-impl HeraldSlot {
-    fn suppress_desktop_notice(&mut self) {
-        self.owed = 0;
-        self.retry_at = None;
-        self.notice_owner = None;
-    }
-
-    fn first_quiet(&mut self, now: std::time::Instant) -> bool {
-        let open = self
-            .quiet_logged_at
-            .is_none_or(|at| now.saturating_duration_since(at) >= NOTIFY_SESSION_FLOOR);
-        if open {
-            self.quiet_logged_at = Some(now);
-        }
-        open
-    }
-}
-
-/// The escalation herald: per session, folds the current [`escalation`] into "did the menu row move" and "post one notification".
+/// THE NEED-AGE KEEPER: per session, since when its published need and its hold have stood ([`Self::observe`]), which the glance's ages read, and what a seamless update carried of them ([`Self::adopt`]).
 #[derive(Debug, Default)]
 pub(crate) struct Herald {
-    slots: std::collections::HashMap<u64, HeraldSlot>,
-    recent: std::collections::VecDeque<std::time::Instant>,
-    last_quiet: Option<HeraldQuiet>,
     since: std::collections::HashMap<u64, Since>,
     adopted: std::collections::HashMap<u64, Adopted>,
-    /// Test seam: the herald before told once, one notice per transition (the negative controls).
-    #[cfg(test)]
-    told_off: bool,
 }
 
-/// Dev seam (`ATERM_DEV_HERALD_TOLD_OFF=1`, read once; debug and dev-seams builds only): the herald before told once, one notice per transition, so a windowed lab's negative control (`aterm-lab told-once`) sees the repeats told once keeps quiet. Tests set [`Herald::told_off`] instead.
-#[cfg(not(test))]
-fn told_off_seam() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| {
-        aterm_types::dev_seam!("ATERM_DEV_HERALD_TOLD_OFF").is_some_and(|v| v == "1")
-    })
-}
-
-/// How long a seamless successor takes what its outgoing process had told the owner as already told ([`Herald::adopt`]): room for every standing need to be published again, which the stall watch's re-detection (`input_backlog::STALL_AFTER`, stretched under load, then `input_stall::RECHECK`) bounds.
+/// How long a seamless successor's first sighting of a need or a hold takes the age its outgoing process carried ([`Herald::adopt`]): room for every standing need to be published again, which the stall watch's re-detection (`input_backlog::STALL_AFTER`, stretched under load, then `input_stall::RECHECK`) bounds.
 pub(crate) const ADOPT_SETTLE: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// What the status item knew of one session, carried across a seamless update as one row (`SessionRecord::status_seen`): the published need and since when it stood, whether the herald had told it (posted, or spent it on a looking owner or alerts off: nothing owed), the ids its told-once memory holds, the hold and since when, and the done the owner looked at, by when its task entered it. A quit's restore leaf carries the told ids alone (`TerminalLeafRestore::told`), read back as a carry with nothing else.
+/// What the status item knew of one session, carried across a seamless update as one row (`SessionRecord::status_seen`): the published need and since when it stood, the hold and since when, and the done the owner looked at, by when its task entered it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct StatusCarry {
     /// The need's word and since when it stood (unix seconds).
     pub need: Option<(NeedWord, i64)>,
-    /// The herald told that need: nothing is owed for it.
-    pub told: bool,
-    /// The ids the session's told-once memory holds, oldest first ([`Told`]): every need its owner was told of in the stretch, standing or not.
-    pub told_ids: Vec<u64>,
     /// The hold's word and since when it stood (unix seconds).
     pub held: Option<(HoldWord, i64)>,
     /// The done the owner looked at: its task's `since_unix_ms`, the wall-clock instant the record entered it (carried exactly, unlike its entry rev).
@@ -756,20 +336,13 @@ pub(crate) struct StatusCarry {
 }
 
 impl StatusCarry {
-    /// The row: `need=<word>@<unix s>`, `told=1`, `told_ids=<hex>[,<hex>…]` ([`told_ids_row`]),
-    /// `hold=<word>@<unix s>` and `done=<unix ms>`, each only when it holds; `None` for nothing
-    /// known.
+    /// The row: `need=<word>@<unix s>`, `hold=<word>@<unix s>` and `done=<unix ms>`, each only
+    /// when it holds; `None` for nothing known.
     #[cfg(any(unix, test))]
     pub(crate) fn row(&self) -> Option<String> {
         let mut parts = Vec::new();
         if let Some((word, at)) = self.need {
             parts.push(format!("need={}@{at}", word.word()));
-            if self.told {
-                parts.push("told=1".to_string());
-            }
-        }
-        if let Some(ids) = told_ids_row(&self.told_ids) {
-            parts.push(format!("told_ids={ids}"));
         }
         if let Some((word, at)) = self.held {
             parts.push(format!("hold={}@{at}", word.word()));
@@ -780,7 +353,8 @@ impl StatusCarry {
         (!parts.is_empty()).then(|| parts.join(" "))
     }
 
-    /// Read a carried row back.
+    /// Read a carried row back. A part it does not know (an older parent's `told=`, `told_ids=` or
+    /// `box=`) is read past.
     pub(crate) fn parse(row: &str) -> Self {
         let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
         let stamped = |value: &str| {
@@ -797,8 +371,6 @@ impl StatusCarry {
                     carry.need =
                         stamped(value).and_then(|(w, at)| Some((NeedWord::parse(&w)?, at)));
                 }
-                "told" => carry.told = value == "1",
-                "told_ids" => carry.told_ids = parse_told_ids(value),
                 "hold" => {
                     carry.held =
                         stamped(value).and_then(|(w, at)| Some((HoldWord::parse(&w)?, at)));
@@ -807,7 +379,6 @@ impl StatusCarry {
                 _ => {}
             }
         }
-        carry.told &= carry.need.is_some();
         carry
     }
 }
@@ -815,10 +386,8 @@ impl StatusCarry {
 #[derive(Clone, Copy, Debug)]
 struct Adopted {
     need: Option<(NeedWord, i64)>,
-    told: Option<NeedWord>,
     held: Option<(HoldWord, i64)>,
     until_unix: i64,
-    until: std::time::Instant,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -895,77 +464,28 @@ impl Herald {
         moved
     }
 
-    /// A seamless update adopted `session` with what its outgoing process knew of it (`carry`, `SessionRecord::status_seen`), or a restore after a quit brought it back with the told ids its leaf carried, at `now_unix` / `now`: for [`ADOPT_SETTLE`], its first need published here takes the carried age when it is the carried word ([`Self::observe`]), and is no transition when it is the need the herald had told ([`Self::note_spent`]), each need of it marked told (§14.18) — an update is no new need, and the owner was told once. The carried told ids are this session's memory here ([`Told::carried`]): kept until the owner's first plain Enter in this process, or a take-down after the first need noted here, so a need told before the restart is told once across it.
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "HeraldToldOnce",
-            action = "Restart",
-            project = "aterm_gui::status_item::herald_told_once_conformance::Rig::project"
-        )
-    )]
-    pub(crate) fn adopt(
-        &mut self,
-        session: u64,
-        carry: StatusCarry,
-        now_unix: i64,
-        now: std::time::Instant,
-    ) {
-        if !carry.told_ids.is_empty() {
-            let told = &mut self.slots.entry(session).or_default().told;
-            if told.ids.is_empty() {
-                told.turn = 0;
-                told.carried = true;
-            }
-            told.mark(carry.told_ids.iter().copied());
-        }
+    /// A seamless update adopted `session` with what its outgoing process knew of it (`carry`, `SessionRecord::status_seen`), at `now_unix`: for [`ADOPT_SETTLE`], its first need published here takes the carried age when it is the carried word, and its first hold the carried hold's when it is the carried word ([`Self::observe`]). An update is no new need.
+    pub(crate) fn adopt(&mut self, session: u64, carry: StatusCarry, now_unix: i64) {
         let settle = i64::try_from(ADOPT_SETTLE.as_secs()).unwrap_or(i64::MAX);
         self.adopted.insert(
             session,
             Adopted {
                 need: carry.need,
-                told: carry
-                    .told
-                    .then_some(carry.need.map(|(word, _)| word))
-                    .flatten(),
                 held: carry.held,
                 until_unix: now_unix.saturating_add(settle),
-                until: now + ADOPT_SETTLE,
             },
         );
     }
 
-    /// What this herald knows of `session` for the next process ([`StatusCarry`]; the done is the App's): the need and hold it last observed and since when, whether the need it shows is told — noted and nothing owed for it — and the told ids it would still keep at `owner_turn`, the tab's owner turn now ([`Self::told_ids`]).
+    /// What this herald knows of `session` for the next process ([`StatusCarry`]; the done is the App's): the need and hold it last observed and since when.
     #[cfg(any(unix, test))]
-    pub(crate) fn carry_of(&self, session: u64, owner_turn: u64) -> StatusCarry {
+    pub(crate) fn carry_of(&self, session: u64) -> StatusCarry {
         let since = self.since.get(&session).copied().unwrap_or_default();
-        let told = since
-            .need
-            .is_some_and(|(word, key, _)| self.told(session, EscalationKind::of(word), key));
         StatusCarry {
             need: since.need.map(|(word, _, at)| (word, at)),
-            told,
-            told_ids: self.told_ids(session, owner_turn),
             held: since.held,
             done: None,
         }
-    }
-
-    /// The ids `session`'s told-once memory holds, oldest first ([`Told`]), while the tab's owner turn is still `owner_turn` (`SessionRow::owner_turn`, the turn now): none once the owner has had a turn since the memory was kept, which its next note would forget (§14.18). What a restart's restore leaf and a seamless update's status row carry.
-    pub(crate) fn told_ids(&self, session: u64, owner_turn: u64) -> Vec<u64> {
-        self.slots
-            .get(&session)
-            .filter(|slot| slot.told.turn == owner_turn)
-            .map(|slot| slot.told.ids.iter().copied().collect())
-            .unwrap_or_default()
-    }
-
-    /// Whether `session`'s notice for the need `(kind, key)` is shown and owed nothing: told (or looked at, or held back by the setting, which owe nothing either) — what a seamless update's carry calls told.
-    #[cfg(any(unix, test))]
-    pub(crate) fn told(&self, session: u64, kind: EscalationKind, key: u64) -> bool {
-        self.slots
-            .get(&session)
-            .is_some_and(|slot| slot.shown == Some((kind, key)) && slot.owed == 0)
     }
 
     /// Since when `session`'s need has stood ([`Self::observe`]).
@@ -978,483 +498,10 @@ impl Herald {
         self.since.get(&session)?.held.map(|(_, at)| at)
     }
 
-    /// Fold `session`'s current escalation.
-    #[cfg(test)]
-    pub(crate) fn note(
-        &mut self,
-        session: u64,
-        current: Option<&Escalation>,
-        looking: bool,
-        desktop_alerts: bool,
-        now: std::time::Instant,
-    ) -> HeraldOutcome {
-        let spent = looking.then_some(Spent::Looking);
-        self.note_spent(session, current, spent, desktop_alerts, now)
-    }
-
-    /// Fold the current escalation, accounting for how the owner already heard
-    /// of the need (`spent`). A spent transition owes no desktop notice.
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "DesktopAlertDebt",
-            action = "ObserveNewLimited",
-            project = "aterm_gui::status_item::desktop_alert_debt_conformance::Rig::project"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "DesktopAlertDebt",
-            action = "ObserveNewFree",
-            project = "aterm_gui::status_item::desktop_alert_debt_conformance::Rig::project"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "DesktopAlertDebt",
-            action = "Reobserve",
-            project = "aterm_gui::status_item::desktop_alert_debt_conformance::Rig::project"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "DesktopAlertDebt",
-            action = "Tick",
-            project = "aterm_gui::status_item::desktop_alert_debt_conformance::Rig::project"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "HeraldToldOnce",
-            action = "ShowA",
-            project = "aterm_gui::status_item::herald_told_once_conformance::Rig::project"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "HeraldToldOnce",
-            action = "ShowB",
-            project = "aterm_gui::status_item::herald_told_once_conformance::Rig::project"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "HeraldToldOnce",
-            action = "ShowBoth",
-            project = "aterm_gui::status_item::herald_told_once_conformance::Rig::project"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "HeraldToldOnce",
-            action = "Swap",
-            project = "aterm_gui::status_item::herald_told_once_conformance::Rig::project"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "HeraldToldOnce",
-            action = "Displace",
-            project = "aterm_gui::status_item::herald_told_once_conformance::Rig::project"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "HeraldToldOnce",
-            action = "Clear",
-            project = "aterm_gui::status_item::herald_told_once_conformance::Rig::project"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "HeraldToldOnce",
-            action = "OwnerTurn",
-            project = "aterm_gui::status_item::herald_told_once_conformance::Rig::project"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "HeraldToldOnce",
-            action = "Restart",
-            project = "aterm_gui::status_item::herald_told_once_conformance::Rig::project"
-        )
-    )]
-    pub(crate) fn note_spent(
-        &mut self,
-        session: u64,
-        current: Option<&Escalation>,
-        spent: Option<Spent>,
-        desktop_alerts: bool,
-        now: std::time::Instant,
-    ) -> HeraldOutcome {
-        self.last_quiet = None;
-        if current.is_none() && !self.slots.contains_key(&session) {
-            // Nothing escalates and nothing did: keep no slot, so a retired session's late
-            // refresh cannot re-grow the map.
-            return HeraldOutcome::default();
-        }
-        let slot = self.slots.entry(session).or_default();
-        let ident = current.map(|e| (e.kind, e.key));
-        if slot.shown != ident {
-            slot.notice_owner = None;
-        }
-        let label = current.map(|e| e.label.clone());
-        let row_moved = slot.label != label;
-        slot.label = label;
-        let Some(esc) = current else {
-            slot.shown = None;
-            slot.owed = 0;
-            // No need stands: the agent took it down, so one raised again is news (§14.18). A
-            // memory the process before this one carried has met no need here yet: nothing here
-            // was taken down, so it waits for the first.
-            if !slot.told.carried {
-                slot.told = Told::default();
-            }
-            return HeraldOutcome {
-                row_moved,
-                ..HeraldOutcome::default()
-            };
-        };
-        // The carried memory meets its first need here: kept only if the owner has had no turn
-        // in this process (§14.18).
-        if std::mem::take(&mut slot.told.carried) && slot.told.turn != esc.owner_turn {
-            slot.told.forget();
-        }
-        if let Some(told) = self
-            .adopted
-            .get_mut(&session)
-            .filter(|a| now < a.until)
-            .and_then(|a| a.told.take())
-            && told == esc.word
-        {
-            slot.shown = ident;
-            // The outgoing process told these needs: told here too (§14.18). Where this read
-            // counts needs it does not name, the set it told names them.
-            slot.told.turn = esc.owner_turn;
-            slot.told.mark(told_ids(esc));
-            slot.told.adopted = counts_unnamed(esc).then_some(esc.key);
-        }
-        let mut transition = slot.shown != ident;
-        // TOLD ONCE (§14.18): an ask's needs are judged by their words. The owner's own turn
-        // forgets what they were told; a re-read under the same key that carries a need neither
-        // told nor noted last is a transition; a transition whose every need was told is none
-        // owed.
-        if slot.told.turn != esc.owner_turn {
-            slot.told.turn = esc.owner_turn;
-            slot.told.forget();
-        }
-        #[cfg(test)]
-        let told_off = self.told_off;
-        #[cfg(not(test))]
-        let told_off = told_off_seam();
-        let telling = !esc.needs.is_empty() && !told_off;
-        if let Some(key) = slot.told.adopted {
-            if key != esc.key {
-                slot.told.adopted = None;
-            } else if telling && !counts_unnamed(esc) {
-                // The adopted entry's set, named: what the outgoing process told.
-                slot.told.mark(told_ids(esc));
-                slot.told.adopted = None;
-            }
-        }
-        let mut news = None;
-        if telling {
-            let fresh = |need: &&NeedId| {
-                !slot.told.names(need) && !need.named_in(|id| slot.told.noted.contains(&id))
-            };
-            // The news a notice names: a need new to the slot first, then any not told.
-            news = esc
-                .needs
-                .iter()
-                .find(fresh)
-                .or_else(|| esc.needs.iter().find(|need| !slot.told.names(need)));
-            transition |= esc.needs.iter().any(|need| fresh(&need));
-        }
-        slot.told.noted = esc.needs.iter().flat_map(NeedId::marks).collect();
-        if transition {
-            slot.shown = ident;
-            if telling && news.is_none() {
-                slot.owed = 0;
-                slot.retry_at = None;
-                slot.told.mark(told_ids(esc));
-                let first_quiet = slot.first_quiet(now);
-                self.last_quiet = Some(HeraldQuiet::ToldOnce);
-                return HeraldOutcome {
-                    row_moved,
-                    notice: None,
-                    transition,
-                    owed: 0,
-                    first_quiet,
-                };
-            }
-            slot.owed += 1;
-        }
-        let owed = slot.owed;
-        if spent.is_some() || !desktop_alerts {
-            slot.notice_owner = None;
-        }
-        let quiet = |herald: &mut Self, why, first_quiet| {
-            herald.last_quiet = Some(why);
-            HeraldOutcome {
-                row_moved,
-                notice: None,
-                transition,
-                owed,
-                first_quiet,
-            }
-        };
-        if owed == 0 {
-            // The same box re-read, and nothing owed for it.
-            return quiet(self, HeraldQuiet::Same, false);
-        }
-        if telling && (spent.is_some() || !desktop_alerts) {
-            slot.told.mark(told_ids(esc));
-        }
-        if let Some(spent) = spent {
-            slot.owed = 0;
-            let first_quiet = slot.first_quiet(now);
-            let why = match spent {
-                Spent::Looking => HeraldQuiet::Looking,
-            };
-            return quiet(self, why, first_quiet);
-        }
-        if !desktop_alerts {
-            slot.suppress_desktop_notice();
-            let first_quiet = slot.first_quiet(now);
-            return quiet(self, HeraldQuiet::Disabled, first_quiet);
-        }
-        let (notified_at, retry_at) = (slot.notified_at, slot.retry_at);
-        while self
-            .recent
-            .front()
-            .is_some_and(|t| now.saturating_duration_since(*t) >= NOTIFY_BURST_WINDOW)
-        {
-            self.recent.pop_front();
-        }
-        if Self::free_at(&self.recent, notified_at, retry_at, now) > now {
-            let first_quiet = transition && owed == 1 && slot.first_quiet(now);
-            return quiet(self, HeraldQuiet::Limited, first_quiet);
-        }
-        let Some(slot) = self.slots.get_mut(&session) else {
-            return HeraldOutcome::default();
-        };
-        slot.owed = 0;
-        slot.notified_before = slot.notified_at;
-        slot.notified_at = Some(now);
-        slot.retry_at = None;
-        slot.quiet_logged_at = None;
-        slot.told.posted = if telling {
-            slot.told.mark(told_ids(esc))
-        } else {
-            Vec::new()
-        };
-        self.recent.push_back(now);
-        let validity = crate::notify::NoticeValidity::new(
-            slot.notice_owner
-                .get_or_insert_with(|| std::sync::Arc::new(())),
-        );
-        HeraldOutcome {
-            row_moved,
-            notice: Some(HeraldNotice {
-                session,
-                title: esc.headline,
-                body: news.map_or_else(|| esc.body.clone(), |need| need.body.clone()),
-                validity,
-                decided: (),
-            }),
-            transition,
-            owed,
-            first_quiet: false,
-        }
-    }
-
-    /// `notify.rs`'s queue refused the notice [`Self::note_spent`] just posted for `session`, which paid `owed` transitions ([`HeraldOutcome::owed`]): it was full — it is shared with program notifications — or its thread was gone (`App::post_herald_notice`).
-    pub(crate) fn refused(&mut self, session: u64, owed: u32, now: std::time::Instant) {
-        let Some(slot) = self.slots.get_mut(&session) else {
-            return;
-        };
-        slot.notice_owner = None;
-        slot.retry_at = Some(now + NOTIFY_RETRY);
-        // What the refused notice marked told was never told: its retry names it again (§14.18).
-        let untold = std::mem::take(&mut slot.told.posted);
-        slot.told.ids.retain(|id| !untold.contains(id));
-        let Some(posted) = slot.notified_at else {
-            return;
-        };
-        if let Some(at) = self.recent.iter().rposition(|t| *t == posted) {
-            self.recent.remove(at);
-        }
-        slot.notified_at = slot.notified_before.take();
-        slot.owed += owed;
-    }
-
-    /// Desktop alerts just turned on: what the herald marked told while they were off was never posted, so every session's told memory goes (§14.18), keeping what each noted last, so nothing standing is replayed.
-    pub(crate) fn forget_told(&mut self) {
-        for slot in self.slots.values_mut() {
-            slot.told.forget();
-        }
-    }
-
-    /// Turning desktop alerts off cancels pending rate-limit and refusal retries, keeping the labels and transition keys the menu uses.
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "DesktopAlertDebt",
-            action = "Disable",
-            project = "aterm_gui::status_item::desktop_alert_debt_conformance::Rig::project"
-        )
-    )]
-    pub(crate) fn suppress_pending_desktop_notices(&mut self) {
-        for slot in self.slots.values_mut() {
-            slot.suppress_desktop_notice();
-        }
-    }
-
-    fn free_at(
-        recent: &std::collections::VecDeque<std::time::Instant>,
-        notified_at: Option<std::time::Instant>,
-        retry_at: Option<std::time::Instant>,
-        now: std::time::Instant,
-    ) -> std::time::Instant {
-        let live: Vec<std::time::Instant> = recent
-            .iter()
-            .copied()
-            .filter(|t| now.saturating_duration_since(*t) < NOTIFY_BURST_WINDOW)
-            .collect();
-        let floor = notified_at.map_or(now, |t| t + NOTIFY_SESSION_FLOOR);
-        let burst = if live.len() >= NOTIFY_BURST {
-            live[live.len() - NOTIFY_BURST] + NOTIFY_BURST_WINDOW
-        } else {
-            now
-        };
-        let retry = retry_at.unwrap_or(now);
-        floor.max(burst).max(retry).max(now)
-    }
-
-    /// The sessions whose owed notice the limit now allows — the App's timer re-heralds each ([`Self::note_spent`] with its current escalation), and the earliest instant any other owed notice becomes allowed (its next wake).
-    pub fn due(&self, now: std::time::Instant) -> (Vec<u64>, Option<std::time::Instant>) {
-        let mut ready = Vec::new();
-        let mut next: Option<std::time::Instant> = None;
-        for (session, slot) in self.slots.iter().filter(|(_, slot)| slot.owed > 0) {
-            let (session, notified_at) = (*session, slot.notified_at);
-            let at = Self::free_at(&self.recent, notified_at, slot.retry_at, now);
-            if at <= now {
-                ready.push(session);
-            } else if next.is_none_or(|n| at < n) {
-                next = Some(at);
-            }
-        }
-        ready.sort_unstable();
-        (ready, next)
-    }
-
-    /// Why the last [`Self::note_spent`] posted nothing, when it had a transition or a re-read to judge; `None` after a post or a cleared escalation.
-    pub(crate) const fn last_quiet(&self) -> Option<HeraldQuiet> {
-        self.last_quiet
-    }
-
     /// Forget a retired session.
     pub(crate) fn retire(&mut self, session: u64) {
-        self.slots.remove(&session);
         self.since.remove(&session);
         self.adopted.remove(&session);
-    }
-}
-
-/// What became of a [`Herald::note_spent`]'s notice ([`herald_log_line`]'s `post`), decided before its line is written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HeraldPost {
-    /// `notify.rs`'s queue took it — or the note owed no notice at all.
-    Queued,
-    /// The queue refused it, and why (`App::post_herald_notice`'s `Err`).
-    Refused(&'static str),
-    /// `desktop_alerts` is off: nothing was offered to the queue.
-    Suppressed,
-}
-
-/// The one `aterm.log` line a [`Herald::note_spent`] earns, as `(level, text)`, or `None` when it decided nothing (nothing escalates, or the escalation cleared).
-pub(crate) fn herald_log_line(
-    session: u64,
-    current: Option<&Escalation>,
-    outcome: &HeraldOutcome,
-    quiet: Option<HeraldQuiet>,
-    post: HeraldPost,
-) -> Option<(aterm_log::Level, String)> {
-    use aterm_log::Level;
-    let esc = current?;
-    let (level, decision) = if outcome.notice.is_some() {
-        let held = if outcome.transition {
-            ""
-        } else {
-            " after the rate limit"
-        };
-        let more = match outcome.owed.saturating_sub(1) {
-            0 => String::new(),
-            more => format!(" (+{more} more)"),
-        };
-        match post {
-            HeraldPost::Queued => (Level::Info, format!("queued{held}{more}")),
-            HeraldPost::Refused(why) => (Level::Warn, format!("not queued{held}{more}: {why}")),
-            HeraldPost::Suppressed => (
-                Level::Info,
-                format!("not queued{held}{more}: suppressed by desktop_alerts = false"),
-            ),
-        }
-    } else {
-        let first = if outcome.first_quiet {
-            Level::Info
-        } else {
-            Level::Debug
-        };
-        match quiet? {
-            HeraldQuiet::Looking => (first, "not queued: looking".to_string()),
-            HeraldQuiet::Disabled => (
-                first,
-                "not queued: suppressed by desktop_alerts = false".to_string(),
-            ),
-            HeraldQuiet::ToldOnce => (first, "not queued: told once".to_string()),
-            HeraldQuiet::Limited if outcome.first_quiet => {
-                (Level::Info, "not queued: limited".to_string())
-            }
-            HeraldQuiet::Limited => (
-                Level::Debug,
-                format!("not queued: limited, {} owed", outcome.owed),
-            ),
-            HeraldQuiet::Same => (Level::Debug, "not queued: same".to_string()),
-        }
-    };
-    Some((
-        level,
-        format!(
-            "escalation notification for session {session} ({} {}): {decision}",
-            esc.kind.log_word(),
-            herald_key_words(esc.kind, esc.key, esc.report)
-        ),
-    ))
-}
-
-fn herald_key_words(kind: EscalationKind, key: u64, report: Option<u64>) -> String {
-    if report.is_some() {
-        return format!("report_episode={key}");
-    }
-    match kind {
-        EscalationKind::Prompt | EscalationKind::Question | EscalationKind::Wall => {
-            format!("agent_rev={key}")
-        }
-        EscalationKind::Attention => format!("text_key={key:#018x}"),
-        EscalationKind::Unresponsive => format!("episode_key={key:#018x}"),
-        EscalationKind::Stalled => format!("task_rev={key}"),
     }
 }
 
@@ -2342,12 +1389,6 @@ impl Glance {
 
 const fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
-}
-
-fn stripped_title(title: &str) -> &str {
-    title
-        .trim_start_matches(|c: char| !c.is_alphanumeric() && c != '⚠')
-        .trim_start()
 }
 
 /// A sibling's or a fleet peer's row names its session by what that row carries: its typed role, else the title its person gave it, else its OSC title without the status glyph an agent leads it with ([`crate::app_take_over::title_without_agent_glyph`], the one strip of a spinner frame or Claude Code's idle `✳`, so the animation moves neither a row nor [`Glance::fingerprint`]); `None` when all three are empty, and the row falls back to the peer's program (`fleet_glance::mac_of`).
@@ -4340,18 +3381,6 @@ mod macos {
 }
 
 #[cfg(test)]
-#[path = "desktop_alert_debt_conformance.rs"]
-mod desktop_alert_debt_conformance;
-
-#[cfg(test)]
-#[path = "herald_told_once_conformance.rs"]
-mod herald_told_once_conformance;
-
-#[cfg(test)]
-#[path = "status_item_told_tests.rs"]
-mod told_tests;
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use aterm_agent::harness::resume::AfterRestart;
@@ -4456,7 +3485,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stall_notifies_once_per_episode_while_its_text_moves() {
+    fn a_stall_is_one_need_per_episode_while_its_text_moves() {
         let fact = incident_stall();
         let row_at = |fact: &crate::input_stall::InputStallFact, secs: u64| {
             let row = stall_row(
@@ -4468,57 +3497,47 @@ mod tests {
             );
             row_of(5, "worker", &stalled_agent(fact, row, secs))
         };
-        let first = escalation(&row_at(&fact, 10)).unwrap();
-        let later = escalation(&row_at(
+        let need_of = |row: &SessionRow| row.need.clone().expect("a stall row");
+        let label = |row: &SessionRow| need_label(&row.title, None, &need_of(row).what);
+        let first_row = row_at(&fact, 10);
+        let later_row = row_at(
             &crate::input_stall::InputStallFact {
                 bytes: 7,
                 ..fact.clone()
             },
             95,
-        ))
-        .unwrap();
-        assert_ne!(first.label, later.label, "the text moved");
+        );
+        let (first, later) = (need_of(&first_row), need_of(&later_row));
+        assert_ne!(label(&first_row), label(&later_row), "the text moved");
         assert_eq!(first.key, later.key, "the episode did not");
         let turned = crate::input_stall::InputStallFact {
             word: aterm_session::input_backlog::InputWord::Stopped,
             stopped: true,
             ..fact.clone()
         };
-        let stopped = escalation(&row_at(&turned, 120)).unwrap();
+        let stopped = need_of(&row_at(&turned, 120));
         assert_eq!(stopped.key, first.key);
-        assert_eq!(stopped.headline, headline(NeedWord::Stopped));
+        assert_eq!(stopped.word, NeedWord::Stopped);
 
-        let now = std::time::Instant::now();
         let mut h = Herald::default();
-        let posted = h.note(5, Some(&first), false, true, now);
-        assert!(posted.notice.is_some());
-        let moved = h.note(5, Some(&later), false, true, now + NOTIFY_SESSION_FLOOR * 2);
-        assert!(moved.row_moved && moved.notice.is_none());
-        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Same));
-        let turned_note = h.note(
-            5,
-            Some(&stopped),
-            false,
-            true,
-            now + NOTIFY_SESSION_FLOOR * 5 / 2,
+        assert!(h.observe(5, Some(&first_row), 100));
+        assert!(
+            h.observe(5, Some(&later_row), 140),
+            "the moved text moves the row"
         );
-        assert!(turned_note.row_moved && turned_note.notice.is_none());
-        let _ = h.note(5, None, false, true, now + NOTIFY_SESSION_FLOOR * 3);
+        assert_eq!(
+            h.need_since(5),
+            Some(100),
+            "one episode, one need: its age stands"
+        );
         let next = crate::input_stall::InputStallFact {
             since: fact.since + std::time::Duration::from_secs(600),
             ..fact.clone()
         };
-        let again = escalation(&row_at(&next, 10)).unwrap();
-        assert_ne!(again.key, first.key);
-        assert!(
-            h.note(5, Some(&again), false, true, now + NOTIFY_SESSION_FLOOR * 4)
-                .notice
-                .is_some()
-        );
-        assert_ne!(
-            aterm_hash::fnv1a_64(first.label.as_bytes()),
-            aterm_hash::fnv1a_64(later.label.as_bytes())
-        );
+        let again_row = row_at(&next, 10);
+        assert_ne!(need_of(&again_row).key, first.key);
+        assert!(h.observe(5, Some(&again_row), 160));
+        assert_eq!(h.need_since(5), Some(160), "a new episode is a new need");
     }
 
     #[test]
@@ -4562,16 +3581,14 @@ mod tests {
             frozen_row.need.as_ref().map(|n| n.word),
             Some(NeedWord::Frozen)
         );
-        let frozen = escalation(&frozen_row).expect("a stall row");
-        assert_eq!(frozen.kind, EscalationKind::Unresponsive);
-        assert_eq!(frozen.headline, headline(NeedWord::Frozen));
+        let frozen = frozen_row.need.clone().expect("a stall row");
         assert_eq!(frozen.key, crate::input_stall::episode_key(&fact));
         assert!(
-            frozen.body.ends_with(
+            frozen.what.ends_with(
                 "claude is frozen: not reading input since 14:02 (1 B queued, rss 38.8 GB)"
             ),
             "{}",
-            frozen.body
+            frozen.what
         );
         let entry = worker(&hosted, &AfterRestart::Relaunch, 9)
             .stall
@@ -4581,7 +3598,7 @@ mod tests {
             entry.contains("restart if-stalled"),
             "the entry keeps it: {entry}"
         );
-        assert!(!frozen.body.contains("aterm ctl"), "{}", frozen.body);
+        assert!(!frozen.what.contains("aterm ctl"), "{}", frozen.what);
         let g = local_glance(
             &[
                 row(1, "zsh", Some("deploy needs a human")),
@@ -4609,114 +3626,25 @@ mod tests {
                 Some(NeedWord::Stopped),
                 "supervised={supervised}"
             );
-            let stopped = escalation(&stopped_row).expect("a stopped row");
-            assert_eq!(stopped.kind, EscalationKind::Unresponsive);
-            assert_eq!(stopped.headline, headline(NeedWord::Stopped));
+            let stopped = stopped_row.need.clone().expect("a stopped row");
             assert_eq!(stopped.key, frozen.key, "one episode");
             assert!(
                 stopped
-                    .body
+                    .what
                     .ends_with("claude is stopped with input queued since 14:02"),
                 "{}",
-                stopped.body
+                stopped.what
             );
-            assert!(!stopped.label.contains("signal cont"), "{}", stopped.label);
+            let label = need_label(&stopped_row.title, None, &stopped.what);
+            assert!(!label.contains("signal cont"), "{label}");
         }
         let mut facts = worker(&fact, &AfterRestart::Relaunch, 11);
         facts.stall = None;
         facts.agent.as_mut().unwrap().word = "prompt";
         assert_eq!(
-            escalation(&row_of(3, "worker", &facts)).unwrap().kind,
-            EscalationKind::Attention
+            row_of(3, "worker", &facts).need.map(|n| n.word),
+            Some(NeedWord::Ask)
         );
-    }
-
-    #[test]
-    fn a_refused_notice_spends_no_floor_and_no_burst_place() {
-        let t0 = std::time::Instant::now();
-        let t1 = t0 + NOTIFY_SESSION_FLOOR;
-        let retry = t1 + NOTIFY_RETRY;
-        let coalesced = Some("a: bash rm -rf build".to_string());
-        let run = |refuse: bool| {
-            let mut h = Herald::default();
-            for id in [1, 2] {
-                let row = agent_row(id, "a", "prompt", 1);
-                assert!(herald_note(&mut h, &row, false, t0).notice.is_some());
-            }
-            for rev in [3, 5] {
-                let row = agent_row(1, "a", "prompt", rev);
-                assert!(herald_note(&mut h, &row, false, t0).notice.is_none());
-            }
-            assert_eq!(h.due(t1).0, vec![1]);
-            let paid = herald_note(&mut h, &agent_row(1, "a", "prompt", 5), false, t1);
-            assert_eq!(paid.owed, 2, "one notice pays both held boxes");
-            assert_eq!(paid.notice.map(|n| n.body), coalesced);
-            if refuse {
-                h.refused(1, paid.owed, t1);
-            }
-            h
-        };
-
-        let mut h = run(true);
-        assert_eq!(h.slots[&1].notified_at, Some(t0));
-        assert_eq!(h.due(t1), (vec![], Some(retry)));
-        assert_eq!(h.due(retry).0, vec![1]);
-        let three = agent_row(3, "c", "prompt", 1);
-        assert!(herald_note(&mut h, &three, false, retry).notice.is_some());
-        let freed = t0 + NOTIFY_BURST_WINDOW;
-        assert_eq!(h.due(retry), (vec![], Some(freed)));
-        let paid = herald_note(&mut h, &agent_row(1, "a", "prompt", 5), false, freed);
-        assert_eq!(paid.owed, 2, "coalesced as it was");
-        assert_eq!(paid.notice.map(|n| n.body), coalesced);
-        assert_eq!(h.due(freed), (vec![], None));
-
-        let mut h = run(false);
-        assert_eq!(h.slots[&1].notified_at, Some(t1));
-        assert_eq!(h.due(retry), (vec![], None));
-        assert!(herald_note(&mut h, &three, false, retry).notice.is_none());
-        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Limited));
-    }
-
-    #[test]
-    fn a_refusal_holds_only_the_refused_session() {
-        let t = std::time::Instant::now();
-        let t1 = t + std::time::Duration::from_secs(1);
-        let (retry, retry_two) = (t + NOTIFY_RETRY, t1 + NOTIFY_RETRY);
-        let mut h = Herald::default();
-        let out = herald_note(&mut h, &agent_row(1, "a", "prompt", 1), false, t);
-        assert!(out.notice.is_some());
-        h.refused(1, out.owed, t);
-
-        let two = agent_row(2, "b", "prompt", 1);
-        let posted = herald_note(&mut h, &two, false, t1);
-        assert_eq!(h.last_quiet(), None, "held by another session's refusal");
-        assert_eq!(posted.notice.as_ref().map(|n| n.session), Some(2));
-        let line = herald_log_line(
-            2,
-            escalation(&two).as_ref(),
-            &posted,
-            None,
-            HeraldPost::Queued,
-        );
-        assert_eq!(line.map(|(_, text)| text.ends_with(": queued")), Some(true));
-
-        assert_eq!(h.due(t1), (vec![], Some(retry)));
-        let held = herald_note(&mut h, &agent_row(1, "a", "prompt", 3), false, t1);
-        assert!(held.notice.is_none());
-        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Limited));
-
-        h.refused(2, posted.owed, t1);
-        assert_eq!(h.due(t1), (vec![], Some(retry)));
-        assert_eq!(h.due(retry), (vec![1], Some(retry_two)));
-        let paid = herald_note(&mut h, &agent_row(1, "a", "prompt", 3), false, retry);
-        assert_eq!(paid.owed, 2, "the retry pays both, coalesced");
-        assert_eq!(
-            paid.notice.map(|n| n.body),
-            Some("a: bash rm -rf build".to_string())
-        );
-        assert_eq!(h.slots[&1].retry_at, None, "a post ends the wait");
-        assert_eq!(h.due(retry), (vec![], Some(retry_two)));
-        assert_eq!(h.due(retry_two), (vec![2], None));
     }
 
     #[test]
@@ -4737,8 +3665,8 @@ mod tests {
         );
         let mut spoof = agent_facts("prompt", 1);
         spoof.agent.as_mut().unwrap().subject = Some("ls \u{202e}fr- mr".to_string());
-        let esc = escalation(&row_of(1, "t", &spoof)).unwrap();
-        assert!(!esc.label.contains('\u{202e}') && !esc.body.contains('\u{202e}'));
+        let what = row_of(1, "t", &spoof).need.expect("a box").what;
+        assert!(!need_label("t", None, &what).contains('\u{202e}'), "{what}");
         assert_eq!(
             fold_clip("caf\u{00e9} \u{1f469}\u{200d}\u{1f4bb}", 64),
             "caf\u{00e9} \u{1f469}\u{200d}\u{1f4bb}"
@@ -4746,7 +3674,7 @@ mod tests {
         let mut bare = agent_facts("prompt", 1);
         bare.agent.as_mut().unwrap().subject = None;
         assert_eq!(
-            escalation(&row_of(1, "t", &bare)).unwrap().label,
+            need_label("t", None, &row_of(1, "t", &bare).need.expect("a box").what),
             "t \u{2014} bash approval"
         );
     }
@@ -4755,15 +3683,19 @@ mod tests {
     fn presence_band_and_menu_bar_say_a_box_and_a_wall_alike() {
         let mut bare = agent_facts("prompt", 1);
         bare.agent.as_mut().unwrap().subject = None;
-        for (detail, kind, label) in [
-            ("question", EscalationKind::Question, "question"),
-            ("other", EscalationKind::Prompt, "approval"),
-            ("plan-exit", EscalationKind::Prompt, "plan approval"),
+        for (detail, word, label) in [
+            ("question", NeedWord::Question, "question"),
+            ("other", NeedWord::Approval, "approval"),
+            ("plan-exit", NeedWord::Approval, "plan approval"),
         ] {
             bare.agent.as_mut().unwrap().detail = Some(detail.into());
-            let esc = escalation(&row_of(1, "t", &bare)).unwrap();
-            assert_eq!(esc.kind, kind, "{detail}");
-            assert_eq!(esc.label, format!("t \u{2014} {label}"), "{detail}");
+            let need = row_of(1, "t", &bare).need.expect("a box");
+            assert_eq!(need.word, word, "{detail}");
+            assert_eq!(
+                need_label("t", None, &need.what),
+                format!("t \u{2014} {label}"),
+                "{detail}"
+            );
             assert_eq!(
                 crate::presence::prompt_band_word(Some(detail)),
                 label,
@@ -4775,270 +3707,12 @@ mod tests {
             reset: None,
             until: None,
         };
+        let walled = agent_row(2, "w", "wall:overloaded", 1)
+            .need
+            .expect("a wall");
         assert_eq!(
-            escalation(&agent_row(2, "w", "wall:overloaded", 1))
-                .unwrap()
-                .label,
+            need_label("w", None, &walled.what),
             format!("w \u{2014} {}", overloaded.band_word())
-        );
-    }
-
-    fn herald_note(
-        h: &mut Herald,
-        row: &SessionRow,
-        looking: bool,
-        now: std::time::Instant,
-    ) -> HeraldOutcome {
-        h.note(row.id, escalation(row).as_ref(), looking, true, now)
-    }
-
-    #[test]
-    fn the_herald_posts_once_per_transition() {
-        let t0 = std::time::Instant::now();
-        let mut h = Herald::default();
-        let boxed = agent_row(4, "builder", "prompt", 5);
-        let first = herald_note(&mut h, &boxed, false, t0);
-        assert!(first.row_moved);
-        let notice = first.notice.expect("the first box posts");
-        assert_eq!(notice.session, 4);
-        let again = herald_note(&mut h, &boxed, false, t0);
-        assert_eq!(again, HeraldOutcome::default(), "same box, nothing");
-        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Same));
-        let busy = agent_row(4, "builder", "busy", 6);
-        assert!(herald_note(&mut h, &busy, false, t0).row_moved);
-        let later = t0 + NOTIFY_SESSION_FLOOR;
-        let next = herald_note(&mut h, &agent_row(4, "builder", "prompt", 7), false, later);
-        assert!(next.notice.is_some(), "a new box is a new transition");
-
-        let mut h = Herald::default();
-        let seen = herald_note(&mut h, &boxed, true, t0);
-        assert!(seen.row_moved && seen.notice.is_none());
-        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Looking));
-        assert!(herald_note(&mut h, &boxed, false, t0).notice.is_none());
-
-        let mut h = Herald::default();
-        let mut early = agent_facts("prompt", 5);
-        early.agent.as_mut().unwrap().subject = None;
-        assert!(
-            herald_note(&mut h, &row_of(4, "builder", &early), false, t0)
-                .notice
-                .is_some()
-        );
-        let late = herald_note(&mut h, &boxed, false, t0);
-        assert!(late.row_moved && late.notice.is_none());
-    }
-
-    #[test]
-    fn the_herald_is_rate_limited_per_session_and_per_instance() {
-        let t0 = std::time::Instant::now();
-        let mut h = Herald::default();
-        assert!(
-            herald_note(&mut h, &agent_row(1, "a", "prompt", 1), false, t0)
-                .notice
-                .is_some()
-        );
-        let _ = herald_note(&mut h, &agent_row(1, "a", "busy", 2), false, t0);
-        let flap = herald_note(&mut h, &agent_row(1, "a", "prompt", 3), false, t0);
-        assert!(flap.notice.is_none(), "inside the session floor");
-        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Limited));
-        let second = herald_note(&mut h, &agent_row(1, "a", "prompt", 4), false, t0);
-        assert!(second.notice.is_none());
-        assert_eq!(h.due(t0), (vec![], Some(t0 + NOTIFY_SESSION_FLOOR)));
-        let after = t0 + NOTIFY_SESSION_FLOOR;
-        assert_eq!(h.due(after), (vec![1], None));
-        let paid = herald_note(&mut h, &agent_row(1, "a", "prompt", 4), false, after);
-        assert_eq!(paid.owed, 2, "one notice pays both held boxes");
-        assert_eq!(
-            paid.notice.map(|n| n.body),
-            Some("a: bash rm -rf build".to_string()),
-            "it names the box shown now, never a count of boxes it replaced"
-        );
-        assert_eq!(h.due(after), (vec![], None));
-        assert!(
-            herald_note(&mut h, &agent_row(1, "a", "prompt", 4), false, after)
-                .notice
-                .is_none()
-        );
-        let _ = herald_note(&mut h, &agent_row(1, "a", "prompt", 5), false, after);
-        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Limited));
-        let _ = herald_note(&mut h, &agent_row(1, "a", "busy", 6), false, after);
-        assert_eq!(h.due(after + NOTIFY_SESSION_FLOOR), (vec![], None));
-
-        let mut h = Herald::default();
-        let posted = (10..20)
-            .filter(|id| {
-                herald_note(
-                    &mut h,
-                    &agent_row(*id, "w", "wall:usage-session", 1),
-                    false,
-                    t0,
-                )
-                .notice
-                .is_some()
-            })
-            .count();
-        assert_eq!(posted, NOTIFY_BURST);
-        let rows: Vec<SessionRow> = (10..20)
-            .map(|id| agent_row(id, "w", "wall:usage-session", 1))
-            .collect();
-        assert_eq!(local_glance(&rows, &[], 0, None).needs.len(), 10);
-        let later = t0 + NOTIFY_BURST_WINDOW;
-        assert_eq!(h.due(t0).1, Some(later));
-        let (ready, _) = h.due(later);
-        assert_eq!(ready.len(), 10 - NOTIFY_BURST);
-
-        h.retire(30);
-        assert_eq!(h.note(99, None, false, true, t0), HeraldOutcome::default());
-        assert!(!h.slots.contains_key(&99));
-    }
-
-    #[test]
-    fn each_herald_decision_is_one_log_line_without_its_text() {
-        use aterm_log::Level::{Debug, Info, Warn};
-        let t0 = std::time::Instant::now();
-        let s = |secs| t0 + std::time::Duration::from_secs(secs);
-        let level = |line: &Option<(aterm_log::Level, String)>| line.as_ref().map(|(l, _)| *l);
-        let note = |h: &mut Herald, row: &SessionRow, looking, now| {
-            let esc = escalation(row);
-            let out = h.note(row.id, esc.as_ref(), looking, true, now);
-            let line = herald_log_line(
-                row.id,
-                esc.as_ref(),
-                &out,
-                h.last_quiet(),
-                HeraldPost::Queued,
-            );
-            (esc, out, line)
-        };
-        let leaks = |line: &str, esc: &Escalation, secrets: &[&str]| {
-            [esc.body.as_str(), esc.label.as_str()]
-                .into_iter()
-                .chain(secrets.iter().copied())
-                .find(|s| line.contains(*s))
-                .map(str::to_string)
-        };
-        let secrets = ["builder", "rm -rf build", "hunter2", "approve me"];
-        let full = HeraldPost::Refused("the notifier's queue is full");
-        let mut h = Herald::default();
-        let mut log = Vec::new();
-        let mut step = |h: &mut Herald, word: &'static str, rev: u64, looking, at| {
-            let (_, out, line) = note(h, &agent_row(4, "builder", word, rev), looking, s(at));
-            log.extend(line.clone());
-            (out, line)
-        };
-
-        let (out, line) = step(&mut h, "prompt", 7, false, 0);
-        assert!(out.transition && out.owed == 1);
-        assert_eq!(level(&line), Some(Info));
-        let said = line.as_ref().map(|(_, l)| l.as_str()).unwrap_or_default();
-        assert!(
-            said.contains("session 4 ") && said.contains("agent_rev=7)"),
-            "{said}"
-        );
-        let esc = escalation(&agent_row(4, "builder", "prompt", 7)).expect("a row");
-        assert_eq!(
-            level(&herald_log_line(4, Some(&esc), &out, None, full)),
-            Some(Warn)
-        );
-        assert_eq!(
-            level(&herald_log_line(
-                4,
-                Some(&esc),
-                &out,
-                None,
-                HeraldPost::Suppressed
-            )),
-            Some(Info)
-        );
-        assert!(out.notice.unwrap().body.contains("rm -rf build"));
-
-        let (out, line) = step(&mut h, "prompt", 7, false, 0);
-        assert_eq!(out, HeraldOutcome::default());
-        assert_eq!(level(&line), Some(Debug));
-
-        assert_eq!(step(&mut h, "busy", 8, false, 15).1, None);
-        let (out, line) = step(&mut h, "prompt", 9, false, 15);
-        assert_eq!((out.transition, out.owed, out.first_quiet), (true, 1, true));
-        assert_eq!(level(&line), Some(Info));
-        assert_eq!(level(&step(&mut h, "prompt", 9, false, 15).1), Some(Debug));
-        for (answered, redrawn, at) in [(10, 11, 16), (12, 13, 17), (14, 15, 18)] {
-            assert_eq!(step(&mut h, "busy", answered, false, at).1, None);
-            let (out, line) = step(&mut h, "prompt", redrawn, false, at);
-            assert_eq!(h.last_quiet(), Some(HeraldQuiet::Limited));
-            assert_eq!(
-                (out.transition, out.owed, out.first_quiet),
-                (true, 1, false)
-            );
-            assert_eq!(level(&line), Some(Debug));
-        }
-        let (out, line) = step(&mut h, "prompt", 16, false, 19);
-        assert_eq!((out.transition, out.owed), (true, 2));
-        assert_eq!(level(&line), Some(Debug));
-        assert_eq!(h.due(s(20)).0, vec![4]);
-        let (out, line) = step(&mut h, "prompt", 16, false, 20);
-        assert!(!out.transition && out.notice.is_some());
-        assert_eq!(level(&line), Some(Info));
-
-        assert_eq!(step(&mut h, "busy", 17, false, 21).1, None);
-        let (out, line) = step(&mut h, "prompt", 18, true, 21);
-        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Looking));
-        assert!(out.transition && out.first_quiet && out.notice.is_none());
-        assert_eq!(level(&line), Some(Info));
-        assert_eq!(step(&mut h, "busy", 19, true, 22).1, None);
-        assert_eq!(level(&step(&mut h, "prompt", 20, true, 22).1), Some(Debug));
-        assert_eq!(step(&mut h, "busy", 21, true, 41).1, None);
-        let (out, line) = step(&mut h, "prompt", 22, true, 41);
-        assert!(out.first_quiet);
-        assert_eq!(level(&line), Some(Info));
-
-        assert_eq!(log.iter().filter(|(l, _)| *l == Info).count(), 5);
-        let boxed = escalation(&agent_row(4, "builder", "prompt", 7)).expect("a row");
-        for (_, line) in &log {
-            assert_eq!(leaks(line, &boxed, &secrets), None, "{line}");
-        }
-
-        let mut h = Herald::default();
-        let asked = row(5, "zsh", Some("deploy token hunter2 needs a human"));
-        let (esc, _, line) = note(&mut h, &asked, false, t0);
-        let esc = esc.expect("a row");
-        assert_eq!(
-            esc.key,
-            aterm_hash::fnv1a_64(b"deploy token hunter2 needs a human")
-        );
-        let (level, line) = line.expect("a post is logged");
-        assert_eq!(level, Info);
-        assert_eq!(
-            line,
-            format!(
-                "escalation notification for session 5 (attention text_key={:#018x}): queued",
-                esc.key
-            )
-        );
-        assert_eq!(leaks(&line, &esc, &secrets), None, "{line}");
-        let frozen = row_of(
-            6,
-            "builder",
-            &NeedFacts {
-                stall: Some(crate::needs::StallFact {
-                    text: "claude is frozen: not reading input".to_string(),
-                    key: 0xbeef,
-                    stopped: false,
-                    act: true,
-                    hand_back_frees: false,
-                }),
-                ..NeedFacts::default()
-            },
-        );
-        let (esc, _, line) = note(&mut h, &frozen, false, t0);
-        let (level_was, line) = line.expect("a post is logged");
-        assert_eq!(level_was, Info);
-        assert!(line.contains("0x000000000000beef"), "its episode: {line}");
-        assert_eq!(leaks(&line, &esc.unwrap(), &["frozen"]), None, "{line}");
-
-        let old = format!("escalation notification not delivered: {}", boxed.body);
-        assert_eq!(
-            leaks(&old, &boxed, &secrets).as_deref(),
-            Some("builder: bash rm -rf build")
         );
     }
 
@@ -6702,114 +5376,78 @@ mod tests {
     fn the_status_carry_row_reads_back_a_part_at_a_time() {
         let full = StatusCarry {
             need: Some((NeedWord::Frozen, 100)),
-            told: true,
-            told_ids: vec![0x1f, u64::MAX],
             held: Some((HoldWord::Local, 90)),
             done: Some(1_000_000),
         };
         assert_eq!(StatusCarry::parse(&full.row().expect("a row")), full);
-        let untold = StatusCarry {
-            told: false,
-            held: None,
-            ..full
-        };
-        assert_eq!(StatusCarry::parse(&untold.row().expect("a row")), untold);
+        let unheld = StatusCarry { held: None, ..full };
+        assert_eq!(StatusCarry::parse(&unheld.row().expect("a row")), unheld);
         assert_eq!(StatusCarry::default().row(), None);
         assert_eq!(
-            StatusCarry::parse("need=frozen@100 box=permission@7 done=5"),
+            StatusCarry::parse("need=frozen@100 told=1 told_ids=1f,a box=permission@7 done=5"),
             StatusCarry {
                 need: Some((NeedWord::Frozen, 100)),
                 done: Some(5),
                 ..StatusCarry::default()
             },
-            "an older parent's box= part is read past"
+            "an older parent's told=, told_ids= and box= parts are read past"
         );
         assert_eq!(
-            StatusCarry::parse("told=1 done=5"),
-            StatusCarry {
-                done: Some(5),
-                ..StatusCarry::default()
-            }
-        );
-        assert_eq!(
-            StatusCarry::parse("need=zapped@100 told=1 hold=local@x later=1 done=-3"),
+            StatusCarry::parse("need=zapped@100 hold=local@x later=1 done=-3"),
             StatusCarry::default()
-        );
-        assert_eq!(
-            StatusCarry::parse("told_ids=0,zz,00000000000000001f,a,").told_ids,
-            vec![0xa],
-            "an id of 0, not hex, or past 16 digits is dropped"
-        );
-        let many: Vec<u64> = (1..=u64::try_from(TOLD_MAX + 3).unwrap_or(u64::MAX)).collect();
-        assert_eq!(
-            parse_told_ids(&told_ids_row(&many).expect("a row")),
-            many[3..].to_vec(),
-            "at most the bound, the newest kept"
         );
     }
 
     #[test]
-    fn an_adopted_standing_need_posts_nothing_and_a_new_one_posts() {
-        let t0 = std::time::Instant::now();
+    fn an_adopted_standing_need_keeps_its_age() {
         let mut before = Herald::default();
         let boxed = agent_row(4, "builder", "prompt", 5);
         let _ = before.observe(4, Some(&boxed), 100);
-        assert!(herald_note(&mut before, &boxed, false, t0).notice.is_some());
-        let told = before.carry_of(4, 0);
-        assert!(told.told, "PRECONDITION: told and nothing owed");
-        let told = StatusCarry::parse(&told.row().expect("a row"));
+        let carry = StatusCarry::parse(&before.carry_of(4).row().expect("a row"));
         let reboxed = agent_row(9, "builder", "prompt", 1);
-        let successor = |carry: StatusCarry, at: std::time::Instant| {
+        let successor = |carry: StatusCarry, at: i64| {
             let mut h = Herald::default();
-            h.adopt(9, carry, 1_000, t0);
-            let _ = h.observe(9, Some(&reboxed), 1_010);
-            let out = herald_note(&mut h, &reboxed, false, at);
-            (h, out)
+            h.adopt(9, carry, 1_000);
+            let _ = h.observe(9, Some(&reboxed), at);
+            h
         };
-        let (mut h, adopted) = successor(told.clone(), t0);
-        assert!(
-            adopted.notice.is_none() && !adopted.transition,
-            "{adopted:?}"
-        );
+        let mut h = successor(carry.clone(), 1_010);
         assert_eq!(h.need_since(9), Some(100), "its age carried");
-        let next = herald_note(
-            &mut h,
-            &agent_row(9, "builder", "prompt", 2),
-            false,
-            t0 + NOTIFY_SESSION_FLOOR,
+        let _ = h.observe(9, Some(&agent_row(9, "builder", "prompt", 2)), 1_020);
+        assert_eq!(
+            h.need_since(9),
+            Some(1_020),
+            "a new box after it is a new need"
         );
-        assert!(next.notice.is_some(), "a new box after it posts");
 
-        let untold = StatusCarry {
-            told: false,
-            ..told.clone()
-        };
-        assert!(successor(untold, t0).1.notice.is_some(), "owed: told now");
         let other = StatusCarry {
             need: Some((NeedWord::Ask, 100)),
-            ..told.clone()
+            ..carry.clone()
         };
-        assert!(successor(other, t0).1.notice.is_some(), "another need");
-        assert!(
-            successor(told, t0 + ADOPT_SETTLE).1.notice.is_some(),
+        assert_eq!(
+            successor(other, 1_010).need_since(9),
+            Some(1_010),
+            "another need"
+        );
+        let settled = 1_000 + i64::try_from(ADOPT_SETTLE.as_secs()).expect("seconds");
+        assert_eq!(
+            successor(carry, settled).need_since(9),
+            Some(settled),
             "past the settle"
         );
     }
 
     #[test]
     fn a_carried_need_is_matched_by_its_word_not_its_kind() {
-        let t0 = std::time::Instant::now();
         let carried = |word: NeedWord| StatusCarry {
             need: Some((word, 100)),
-            told: true,
             ..StatusCarry::default()
         };
-        let first_note = |carry: StatusCarry, verdict: &'static str| {
+        let first_age = |carry: StatusCarry, verdict: &'static str| {
             let mut h = Herald::default();
-            h.adopt(9, carry, 1_000, t0);
-            let row = agent_row(9, "builder", verdict, 1);
-            let _ = h.observe(9, Some(&row), 1_010);
-            herald_note(&mut h, &row, false, t0)
+            h.adopt(9, carry, 1_000);
+            let _ = h.observe(9, Some(&agent_row(9, "builder", verdict, 1)), 1_010);
+            h.need_since(9)
         };
         assert_eq!(
             agent_row(9, "b", "wall:auth", 1).need.map(|n| n.word),
@@ -6821,23 +5459,20 @@ mod tests {
             Some(NeedWord::Memory),
             "PRECONDITION"
         );
-        assert!(
-            first_note(carried(NeedWord::Login), "wall:auth")
-                .notice
-                .is_none(),
-            "the carried word: told already"
+        assert_eq!(
+            first_age(carried(NeedWord::Login), "wall:auth"),
+            Some(100),
+            "the carried word: its age"
         );
-        assert!(
-            first_note(carried(NeedWord::Login), "wall:memory")
-                .notice
-                .is_some(),
-            "the same kind, another word: told"
+        assert_eq!(
+            first_age(carried(NeedWord::Login), "wall:memory"),
+            Some(1_010),
+            "the same kind, another word: a new need"
         );
-        assert!(
-            first_note(carried(NeedWord::Wall), "wall:auth")
-                .notice
-                .is_some(),
-            "a told wall says nothing of a login"
+        assert_eq!(
+            first_age(carried(NeedWord::Wall), "wall:auth"),
+            Some(1_010),
+            "a carried wall says nothing of a login"
         );
     }
 
@@ -7669,13 +6304,6 @@ mod tests {
     }
 
     #[test]
-    fn a_harness_need_reads_whole_on_the_banner() {
-        let row = harness_row(1, "proj-api refactor", NEED_A_CUT, 0);
-        let body = escalation(&row).expect("a need").body;
-        assert_eq!(body, format!("proj-api refactor: {NEED_A_CUT} (+1 more)"));
-    }
-
-    #[test]
     fn the_shown_key_folds_the_harness_words() {
         let a = harness_row(1, "t", NEED_A_CUT, 0);
         let mut b = a.clone();
@@ -8105,7 +6733,7 @@ mod tests {
     }
 
     #[test]
-    fn a_told_need_reads_whole_on_the_banner_and_the_menu() {
+    fn a_told_need_reads_whole_on_the_menu() {
         const NEED_A: &str = "grant Screen Recording to com.aterm.aterm in System Settings \
                               \u{25b8} Privacy & Security \u{25b8} Screen Recording, so the \
                               windowed check can capture the menu";
@@ -8127,8 +6755,6 @@ mod tests {
             need_since: Some(now - 180),
             ..row_of(1, "proj-api refactor", &facts)
         };
-        let body = escalation(&row).expect("a need").body;
-        assert_eq!(body, format!("proj-api refactor: {NEED_A} (+1 more)"));
         let g = local_glance(&[row], &[], now, None);
         let menu = compose_status_menu(&g, now);
         let section = needs_section(&menu);

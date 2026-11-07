@@ -1833,7 +1833,6 @@ fn a_landed_chip_speaks_its_needs_own_tail() {
             others: Vec::new(),
             program: aterm_phase::Program::Claude,
             tail,
-            entry_first: None,
         };
         let words = TitleWords {
             need: Some(&ask),
@@ -1863,7 +1862,6 @@ fn a_need_in_the_title_keeps_its_cut_marks() {
         others: Vec::new(),
         program: aterm_phase::Program::Claude,
         tail: crate::needs::NeedTail::CarryingOn,
-        entry_first: None,
     };
     let written = crate::needs::HarnessAsk {
         first: "sign 0.48.0, last: the release credential, on this Mac, click: approve".to_string(),

@@ -177,12 +177,6 @@ pub(crate) fn synchronize_captured_title_cache(
 
 #[cfg(test)]
 thread_local! {
-    /// The herald's notifications on this thread (test-only).
-    pub(crate) static HERALD_POSTS: std::cell::RefCell<Vec<crate::status_item::HeraldNotice>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-    /// Why the notifier's queue refuses this thread's next herald post (test-only).
-    pub(crate) static HERALD_REFUSAL: std::cell::Cell<Option<&'static str>> =
-        const { std::cell::Cell::new(None) };
     static RAISED_WINDOWS: std::cell::RefCell<Vec<WindowId>> =
         const { std::cell::RefCell::new(Vec::new()) };
     #[cfg(target_os = "linux")]
@@ -2936,7 +2930,6 @@ impl App {
             receipt,
             need_alone,
             place: None,
-            owner_turn: h.ctx.human_input.last_plain_enter(),
         }
     }
 
@@ -2974,7 +2967,7 @@ impl App {
         }
     }
 
-    /// Fold one session's PUBLISHED need into the herald ([`crate::status_item::Herald`], §9 S4: the herald is fed by the need): remember since when its need and hold stand (the glance's ages, headless too), dirty the menu-bar item where what it shows of the session moved, and post the one native notification a transition earns.
+    /// Fold one session's PUBLISHED need into the herald ([`crate::status_item::Herald`], §9 S4: the herald is fed by the need): remember since when its need and hold stand (the glance's ages), and dirty the menu-bar item where what it shows of the session moved.
     pub(crate) fn herald_session(&mut self, session: u64) {
         let handle = self
             .store
@@ -2997,17 +2990,6 @@ impl App {
             self.mark_status_dirty();
             crate::control::needs_moved();
         }
-        if self.headless {
-            return;
-        }
-        let current = row.as_ref().and_then(crate::status_item::escalation);
-        let looking = self
-            .notify_suppress
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains(&session);
-        let spent = looking.then_some(crate::status_item::Spent::Looking);
-        self.herald_deliver_spent(session, current.as_ref(), spent);
     }
 
     fn adopt_status_carry(
@@ -3028,9 +3010,7 @@ impl App {
         {
             self.mark_done_seen(session, task.entered);
         }
-        self.presence
-            .herald
-            .adopt(session, carry, now_unix, std::time::Instant::now());
+        self.presence.herald.adopt(session, carry, now_unix);
     }
 
     fn adopt_end_carry(&mut self, session: u64, sid: &str) {
@@ -3153,10 +3133,7 @@ impl App {
             .iter()
             .map(|session| {
                 let id = session.id;
-                let mut carry = self
-                    .presence
-                    .herald
-                    .carry_of(id, session.ctx.human_input.last_plain_enter());
+                let mut carry = self.presence.herald.carry_of(id);
                 carry.done = self.done_seen.get(&id).and_then(|entered| {
                     session
                         .ctx
@@ -3170,75 +3147,6 @@ impl App {
                 (id, carry)
             })
             .collect()
-    }
-
-    /// The herald's decision for the local session `session` at `current`, where the owner may
-    /// already have heard of the need (`spent`), and what it posts.
-    fn herald_deliver_spent(
-        &mut self,
-        session: u64,
-        current: Option<&crate::status_item::Escalation>,
-        spent: Option<crate::status_item::Spent>,
-    ) {
-        let now = std::time::Instant::now();
-        let alerts = self.config.desktop_alerts_or_default();
-        let outcome = self
-            .presence
-            .herald
-            .note_spent(session, current, spent, alerts, now);
-        let post = match outcome.notice.as_ref() {
-            Some(_) if !alerts => crate::status_item::HeraldPost::Suppressed,
-            Some(notice) => match self.post_herald_notice(notice) {
-                Ok(()) => crate::status_item::HeraldPost::Queued,
-                Err(why) => crate::status_item::HeraldPost::Refused(why),
-            },
-            None => crate::status_item::HeraldPost::Queued,
-        };
-        if matches!(post, crate::status_item::HeraldPost::Refused(_)) {
-            self.presence.herald.refused(session, outcome.owed, now);
-        }
-        if let Some((level, line)) = crate::status_item::herald_log_line(
-            session,
-            current,
-            &outcome,
-            self.presence.herald.last_quiet(),
-            post,
-        ) {
-            match level {
-                aterm_log::Level::Warn => aterm_log::warn!("{line}"),
-                aterm_log::Level::Info => aterm_log::info!("{line}"),
-                _ => aterm_log::debug!("{line}"),
-            }
-        }
-        if outcome.row_moved {
-            self.mark_status_dirty();
-        }
-    }
-
-    fn post_herald_notice(
-        &self,
-        notice: &crate::status_item::HeraldNotice,
-    ) -> Result<(), &'static str> {
-        let message = crate::notify::NotifyMsg::herald(notice);
-        #[cfg(test)]
-        {
-            let _ = message;
-            if let Some(why) = HERALD_REFUSAL.take() {
-                return Err(why);
-            }
-            HERALD_POSTS.with(|posts| posts.borrow_mut().push(notice.clone()));
-            Ok(())
-        }
-        #[cfg(not(test))]
-        {
-            self.session_factory
-                .notify_tx
-                .try_send(message)
-                .map_err(|refused| match refused {
-                    std::sync::mpsc::TrySendError::Full(_) => "the notifier's queue is full",
-                    std::sync::mpsc::TrySendError::Disconnected(_) => "the notifier is gone",
-                })
-        }
     }
 
     /// THE STATUS GLANCE (§3): the REGISTRY snapshot → one [`crate::status_item::SessionRow`] per live session ([`Self::status_session_row`], leaf locks only) → the pure [`crate::status_item::Glance::build`], with the last sibling scan, the digest's entries and the alerts switch.
@@ -10142,6 +10050,7 @@ mod status_glance_tests {
         app.on_meta_changed(session);
     }
 
+    #[cfg(unix)]
     fn publish_meta(app: &mut App, session: u64, field: &str, value: &str) {
         {
             let store = app.store.read().unwrap_or_else(|p| p.into_inner());
@@ -10522,9 +10431,8 @@ mod status_glance_tests {
 
     #[cfg(unix)]
     #[test]
-    fn an_adopted_standing_need_is_told_once() {
+    fn an_adopted_standing_need_keeps_its_age_and_its_read_done() {
         use crate::task_record::TaskState;
-        let take_posts = || HERALD_POSTS.with(|p| std::mem::take(&mut *p.borrow_mut()));
         let desk = |app: &mut App, task: Option<&str>| {
             app.push_stub_tab(WindowId(0), crate::stub_session(1));
             let ctx = app.pool.get(1).expect("pooled").ctx.clone();
@@ -10538,10 +10446,6 @@ mod status_glance_tests {
                 }
             }
             app.on_task_changed(1);
-            app.headless = false;
-            app.config.desktop_alerts = Some(true);
-            app.notify_suppress.lock().unwrap().clear();
-            HERALD_REFUSAL.set(None);
             publish_meta(app, 1, "attention", "wedged on CI");
             ctx
         };
@@ -10556,9 +10460,11 @@ mod status_glance_tests {
         on_screen(&mut parent, true);
         parent.note_done_seen_looking();
         on_screen(&mut parent, false);
-        let _ = take_posts();
         parent.herald_session(1);
-        assert_eq!(take_posts().len(), 1, "PRECONDITION: the parent told it");
+        assert!(
+            parent.presence.herald.need_since(1).is_some(),
+            "PRECONDITION: the parent saw the need"
+        );
         let row = parent
             .status_carry_rows()
             .into_iter()
@@ -10581,21 +10487,26 @@ mod status_glance_tests {
                 app.status_carry
                     .insert(ctx.self_id.as_str().to_string(), carry);
             }
-            let _ = take_posts();
             app.herald_session(1);
             app
         };
         let mut adopted = successor(true);
-        assert!(take_posts().is_empty(), "told before the update");
-        assert_eq!(adopted.presence.herald.need_since(1), Some(1_000));
+        assert_eq!(
+            adopted.presence.herald.need_since(1),
+            Some(1_000),
+            "the carried age"
+        );
         assert!(adopted.status_glance().done.is_empty(), "read before it");
         assert!(adopted.status_carry.is_empty(), "spent");
         publish_meta(&mut adopted, 1, "attention", "a new question");
         adopted.herald_session(1);
-        assert_eq!(take_posts().len(), 1, "a new ask after it");
+        assert_ne!(
+            adopted.presence.herald.need_since(1),
+            Some(1_000),
+            "a new ask after it ages from its own sight"
+        );
 
         let fresh = successor(false);
-        assert_eq!(take_posts().len(), 1, "no carry: told again");
         assert_ne!(fresh.presence.herald.need_since(1), Some(1_000));
         assert_eq!(fresh.status_glance().done.len(), 1, "no carry: unread");
     }
@@ -10697,108 +10608,6 @@ mod status_glance_tests {
         app.go_to_session(clicked.expect("the notice named session 0"));
         assert_eq!(state(&app), (0, Some(0)), "its tab, and its pane");
         assert_eq!(take_raised_windows(), vec![wid], "its window raised");
-    }
-
-    #[test]
-    fn a_refused_herald_notice_stays_owed() {
-        let take_posts = || HERALD_POSTS.with(|p| std::mem::take(&mut *p.borrow_mut()));
-        let herald = |refusal: Option<&'static str>| {
-            let mut app = App::headless_for_test();
-            app.headless = false;
-            app.config.desktop_alerts = Some(true);
-            app.notify_suppress
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .clear();
-            publish_meta(&mut app, 0, "attention", "wedged on CI");
-            let _ = take_posts();
-            HERALD_REFUSAL.set(refusal);
-            app.herald_session(0);
-            app
-        };
-
-        let app = herald(Some("the notifier's queue is full"));
-        assert!(take_posts().is_empty(), "the queue refused it");
-        let later = std::time::Instant::now() + crate::status_item::NOTIFY_BURST_WINDOW;
-        assert_eq!(app.presence.herald.due(later).0, vec![0], "owed again");
-
-        let app = herald(None);
-        assert_eq!(take_posts().len(), 1, "the queue took it");
-        let later = std::time::Instant::now() + crate::status_item::NOTIFY_BURST_WINDOW;
-        assert_eq!(app.presence.herald.due(later), (vec![], None));
-    }
-
-    #[test]
-    fn desktop_alerts_off_never_arms_rate_limited_herald_retries() {
-        let mut app = App::headless_for_test();
-        app.config.desktop_alerts = Some(false);
-        app.apply_desktop_alerts(false);
-        for _ in 0..crate::status_item::NOTIFY_BURST {
-            app.push_stub_tab(WindowId(0), crate::stub_session(app.next_session_id));
-        }
-        app.headless = false;
-        app.notify_suppress.lock().unwrap().clear();
-        HERALD_POSTS.with(|p| p.borrow_mut().clear());
-        HERALD_REFUSAL.set(None);
-        let sessions: Vec<_> = app.pool.iter().map(|s| s.id).collect();
-        for &session in &sessions {
-            set_meta(&mut app, session, "attention", "first request");
-            app.herald_session(session);
-            set_meta(&mut app, session, "attention", "second request");
-            app.herald_session(session);
-        }
-        let now = std::time::Instant::now();
-        for at in [now, now + crate::status_item::NOTIFY_BURST_WINDOW] {
-            assert_eq!(app.presence.herald.due(at), (vec![], None));
-        }
-        assert!(HERALD_POSTS.with(|p| p.borrow().is_empty()));
-        assert_eq!(app.status_glance().need_count(), sessions.len());
-    }
-
-    #[test]
-    fn disabling_desktop_alerts_cancels_owed_notices_without_replaying_them() {
-        for refused in [false, true] {
-            let mut app = App::headless_for_test();
-            app.push_stub_tab(WindowId(0), crate::stub_session(app.next_session_id));
-            app.headless = false;
-            app.config.desktop_alerts = Some(true);
-            app.apply_desktop_alerts(true);
-            app.notify_suppress.lock().unwrap().clear();
-            HERALD_POSTS.with(|p| p.borrow_mut().clear());
-            HERALD_REFUSAL.set(refused.then_some("the notifier's queue is full"));
-            set_meta(&mut app, 0, "attention", "first request");
-            app.herald_session(0);
-            if !refused {
-                set_meta(&mut app, 0, "attention", "second request");
-                app.herald_session(0);
-            }
-            let later = std::time::Instant::now() + crate::status_item::NOTIFY_BURST_WINDOW;
-            assert_eq!(app.presence.herald.due(later).0, vec![0], "debt exists");
-            let warnings = app.status_glance().needs;
-
-            app.config.desktop_alerts = Some(false);
-            app.apply_desktop_alerts(false);
-            assert_eq!(app.presence.herald.due(later), (vec![], None));
-            assert_eq!(app.status_glance().needs, warnings);
-            assert!(
-                !app.notify_own_alerts
-                    .load(std::sync::atomic::Ordering::Acquire)
-            );
-
-            HERALD_POSTS.with(|p| p.borrow_mut().clear());
-            app.config.desktop_alerts = Some(true);
-            app.apply_desktop_alerts(true);
-            app.herald_session(0);
-            assert!(HERALD_POSTS.with(|p| p.borrow().is_empty()), "no replay");
-            assert_eq!(app.presence.herald.due(later), (vec![], None));
-            set_meta(&mut app, 1, "attention", "new request after enabling");
-            app.herald_session(1);
-            HERALD_POSTS.with(|p| {
-                let posts = std::mem::take(&mut *p.borrow_mut());
-                assert_eq!(posts.len(), 1, "new transitions still notify");
-                assert_eq!(posts[0].session, 1);
-            });
-        }
     }
 }
 

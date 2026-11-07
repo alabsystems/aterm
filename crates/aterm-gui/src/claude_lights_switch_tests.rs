@@ -1792,13 +1792,35 @@ fn the_keyboard_walks_to_the_switch_and_return_presses_it() {
         "agy bare while off still draws the top-rule switch"
     );
     chord(&mut app, wid);
+    assert_eq!(
+        selected(&app, wid),
+        Some((session, Target::Switch)),
+        "ctrl+shift+tab walks directly to agy's bare off switch before the next paint"
+    );
+    let top_row = switch(&app, wid).expect("switch").term_row;
+    app.windows
+        .get_mut(&wid)
+        .expect("window")
+        .chrome_rows
+        .push(top_row..top_row + 1);
+    chord(&mut app, wid);
+    assert_eq!(
+        selected(&app, wid),
+        None,
+        "NEGATIVE CONTROL: ctrl+shift+tab clears an unpainted switch selection once chrome covers its row"
+    );
+    app.windows
+        .get_mut(&wid)
+        .expect("window")
+        .chrome_rows
+        .clear();
+    chord(&mut app, wid);
     frame(&mut app, wid);
     assert_eq!(
         selected(&app, wid),
         Some((session, Target::Switch)),
         "ctrl+shift+tab walks directly to agy's bare off switch"
     );
-    let top_row = switch(&app, wid).expect("switch").term_row;
     app.windows
         .get_mut(&wid)
         .expect("window")

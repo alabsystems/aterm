@@ -569,7 +569,6 @@ fn the_setter_is_carried_in_one_form_and_dropped_with_its_word() {
         not_claim_worker: false,
         claim_worker: None,
         task: None,
-        told: None,
     };
     assert_eq!(
         leaf(Some("off"), &format!("human:menu {since}"))

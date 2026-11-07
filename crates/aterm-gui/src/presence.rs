@@ -255,7 +255,7 @@ pub(crate) const API_REQUEST_REFUSED: &str = "request refused";
 /// … a reply past its output token maximum ([`aterm_phase::ApiCause::Overlong`]).
 pub(crate) const API_OVERLONG: &str = "reply too long";
 
-/// What an API error the network caused is called on the tab, in the menu and in the notification.
+/// What an API error the network caused is called on the tab and in the menu.
 pub(crate) const fn api_cause_words(kind: aterm_phase::WallKind) -> Option<&'static str> {
     match kind {
         aterm_phase::WallKind::ApiError { cause, .. } => match cause {

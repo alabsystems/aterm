@@ -48,6 +48,160 @@ fn scoped_input_capture_preserves_complete_natural_output() {
 }
 
 #[test]
+fn streaming_keeps_both_pipes_without_a_total_capture_bound_and_closes_input() {
+    let mut cmd = shell(
+        "if read value; then exit 91; fi; i=0; while [ $i -lt 256 ]; do printf '%s' \"$1\"; printf '%s' \"$2\" >&2; i=$((i+1)); done; exit 7",
+    );
+    cmd.arg("owned-stream")
+        .arg("x".repeat(8192))
+        .arg("y".repeat(8192));
+    let spawned = std::cell::Cell::new(None);
+    let mut counts = [0usize; 2];
+    let hang = Instant::now() + HANG;
+    let status = super::super::stream_until_stopped(
+        &mut cmd,
+        None,
+        |pid| spawned.set(Some(pid)),
+        |stream, chunk| {
+            assert!(
+                spawned.get().is_some(),
+                "spawn observer precedes every output callback"
+            );
+            let (index, byte) = match stream {
+                ChildOutput::Stdout => (0, b'x'),
+                ChildOutput::Stderr => (1, b'y'),
+            };
+            assert!(chunk.iter().all(|actual| *actual == byte));
+            counts[index] += chunk.len();
+            Ok(())
+        },
+        || {
+            assert!(Instant::now() < hang, "streaming hang detector");
+            false
+        },
+    )
+    .expect("complete streaming")
+    .expect("not stopped");
+    assert_eq!(status.code(), Some(7));
+    assert_eq!(counts, [2 * 1024 * 1024; 2]);
+    assert_eq!(
+        crate::process::process_presence(spawned.get().unwrap().cast_signed()),
+        crate::process::ProcessPresence::Absent
+    );
+}
+
+#[test]
+fn streaming_stop_callback_error_and_unwind_retire_the_actual_owned_root() {
+    for fault in 0..4 {
+        let pid = std::cell::Cell::new(None);
+        let bytes = std::cell::Cell::new(0usize);
+        let mut cmd = shell("printf ready; exec \"$1\" 600");
+        cmd.arg("owned-stream")
+            .arg(super::super::stand_in(std::path::Path::new("/bin/sleep")));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::super::stream_until_stopped(
+                &mut cmd,
+                Some(Instant::now() + HANG),
+                |child| {
+                    pid.set(Some(child));
+                    assert_ne!(fault, 3, "synthetic spawn observer unwind");
+                },
+                |stream, chunk| {
+                    assert_eq!(stream, ChildOutput::Stdout);
+                    bytes.set(bytes.get() + chunk.len());
+                    if fault == 1 {
+                        return Err(io::ErrorKind::InvalidData.into());
+                    }
+                    assert_ne!(fault, 2, "synthetic output observer unwind");
+                    Ok(())
+                },
+                || bytes.get() >= 5,
+            )
+        }));
+        assert_eq!(
+            crate::process::process_presence(
+                pid.get().expect("observed actual child").cast_signed()
+            ),
+            crate::process::ProcessPresence::Absent
+        );
+        match fault {
+            0 => assert!(result.unwrap().expect("cancelled").is_none()),
+            1 => assert_eq!(
+                result.unwrap().unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            ),
+            _ => assert!(result.is_err()),
+        }
+    }
+}
+
+#[test]
+fn stopped_or_expired_streaming_never_spawns_or_delivers_output() {
+    for expired in [false, true] {
+        let mut cmd = crate::spawnfd::command("/no-such-owned-stream-program");
+        let result = super::super::stream_until_stopped(
+            &mut cmd,
+            expired.then(Instant::now),
+            |_| panic!("no spawn"),
+            |_, _| panic!("no output"),
+            || true,
+        );
+        if expired {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        } else {
+            assert!(result.expect("stopped before spawn").is_none());
+        }
+    }
+}
+
+#[test]
+fn streaming_deadline_after_output_retires_its_owned_root() {
+    let began = Instant::now();
+    let deadline = began + HANG;
+    let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+    let clock_ran = ran.clone();
+    super::super::set_deadline_clock_for_test(Some(Box::new(move || {
+        if clock_ran.get() || began.elapsed() >= HANG {
+            deadline + Duration::from_secs(1)
+        } else {
+            began
+        }
+    })));
+    struct Clock;
+    impl Drop for Clock {
+        fn drop(&mut self) {
+            super::super::set_deadline_clock_for_test(None);
+        }
+    }
+    let _clock = Clock;
+    let pid = std::cell::Cell::new(None);
+    let mut cmd = shell("printf ready; exec \"$1\" 600");
+    cmd.arg("owned-stream")
+        .arg(super::super::stand_in(std::path::Path::new("/bin/sleep")));
+    let error = super::super::stream_until_stopped(
+        &mut cmd,
+        Some(deadline),
+        |child| pid.set(Some(child)),
+        |_, chunk| {
+            assert!(!chunk.is_empty());
+            ran.set(true);
+            Ok(())
+        },
+        || false,
+    )
+    .expect_err("deadline after actual execution");
+    assert!(
+        ran.get(),
+        "the clock expired only after the child supplied output"
+    );
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(
+        crate::process::process_presence(pid.get().unwrap().cast_signed()),
+        crate::process::ProcessPresence::Absent
+    );
+}
+
+#[test]
 fn scoped_input_capture_stops_or_unwinds_only_after_retiring_its_owned_root() {
     for panic in [false, true] {
         let dir = std::env::temp_dir().join(format!(

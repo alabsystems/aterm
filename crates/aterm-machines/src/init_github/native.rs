@@ -3338,6 +3338,8 @@ pub(super) mod tests {
         assert_eq!(rows[0].outcome, crate::model::Outcome::NotApplicable);
         assert_eq!(stage(&rows).outcome, crate::model::Outcome::Ok, "{rows:?}");
         let calls = sys.calls();
+        assert!(calls.contains(&script::helpers(&item.user)), "{calls:?}");
+        assert!(calls.contains(&script::fill(&item.user)), "{calls:?}");
         assert!(
             calls.iter().all(|call| !call.contains("--unset-all")
                 && !call.contains("--add")
@@ -3645,13 +3647,8 @@ pub(super) mod tests {
     fn a_ready_captured_run_without_clones_preserves_compatible_live_helpers() {
         let (sys, mut item) = fixture();
         let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        present_repository(&sys, &item.user, "kept");
         let inputs = InitialRepositoryInputs::capture(&sys, &ctx).unwrap();
-        answer(
-            &sys,
-            &item.user,
-            &format!("{ACCESSIBLE}&page=1"),
-            aterm_json::json!([]),
-        );
         script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
         script::alike(&sys, &item.user);
         item.captured = Some(Captured {
@@ -3659,8 +3656,10 @@ pub(super) mod tests {
             current: Box::new(|| Ok(true)),
         });
         item.apply(&sys, &ctx).unwrap();
+        let calls = sys.calls();
+        assert!(calls.contains(&script::fill(&item.user)), "{calls:?}");
         assert!(
-            sys.calls()
+            calls
                 .iter()
                 .all(|call| !call.contains("credential approve") && !call.contains("--global"))
         );

@@ -4932,25 +4932,29 @@ impl App {
         wake_after(session, MODE_POLL);
     }
 
-    /// `session`'s screen read straight from its engine (behind the reader's panic fence).
+    /// `session`'s screen read straight from its engine (behind the reader's panic fence), with
+    /// the window title Claude Code set over it: under a status line its `◐`/`◑` is the only sign
+    /// that a reply still being drawn is a turn running.
     fn claude_screen_now(&self, session: u64) -> Option<Screen> {
-        let rows = self.claude_rows_now(session)?;
-        fenced_screen_now(session, &rows, || lights::read_screen(&rows))
+        let (rows, title) = self.claude_rows_now(session)?;
+        fenced_screen_now(session, &rows, || lights::read_screen(&rows, Some(&title)))
     }
 
-    /// `session`'s live screen copied out of its engine, its rows as text.
+    /// `session`'s live screen copied out of its engine, its rows as text, and the program's
+    /// window title read in the same hold.
     /// `None` while Claude's DEC 2026 frame is unfinished: the event loop never waits for its close.
-    fn claude_rows_now(&self, session: u64) -> Option<Vec<String>> {
+    fn claude_rows_now(&self, session: u64) -> Option<(Vec<String>, std::sync::Arc<str>)> {
         let entry = self.pool.get(session)?;
         let t = crate::term_lock(&entry.term);
         if t.grid().display_offset() > 0 || crate::frame_unfinished_now(&t) {
             return None;
         }
-        Some(
+        Some((
             (0..usize::from(t.rows()))
                 .map(|r| row_text(&t, r))
                 .collect(),
-        )
+            t.title_arc(),
+        ))
     }
 
     /// The footer wake's lights half.
@@ -5126,7 +5130,7 @@ impl App {
             .map(|(_, room)| *room);
         let stale = ws.claude_lights.selected.is_some_and(|(id, target)| {
             id != session
-                || (ws.claude_lights.selection_painted
+                || ((ws.claude_lights.selection_painted || !matches!(target, Target::Chip(_)))
                     && !ws.claude_lights.shows_uncovered(id, target, |row| {
                         ws.chrome_rows.iter().any(|band| band.contains(&row))
                     }))
@@ -5255,7 +5259,11 @@ impl App {
                 .claude_lights
                 .hits
                 .iter()
-                .filter(|h| h.session == session && h.chip == Some(Chip::Autopilot))
+                .filter(|h| {
+                    h.session == session
+                        && h.chip == Some(Chip::Autopilot)
+                        && !ws.chrome_rows.iter().any(|band| band.contains(&h.term_row))
+                })
                 .map(|h| (h.frame_row, h.col))
                 .min_by_key(|&(_, col)| col);
             ws.claude_lights.select(None);
@@ -5269,6 +5277,10 @@ impl App {
             Key::Named(NamedKey::Enter | NamedKey::Space) if plain => {
                 ws.claude_lights.select(None);
                 redraw(ws);
+                if self.inline_rename_edit(wid).is_some() {
+                    self.clear_strip_press(wid);
+                    self.settle_rename_edit(wid);
+                }
                 self.press_claude_chip(wid, session, chip, Instant::now());
                 true
             }
@@ -5587,7 +5599,11 @@ impl App {
                     ws.claude_lights
                         .fact_hits
                         .iter()
-                        .find(|h| h.session == session && h.fact == fact)
+                        .find(|h| {
+                            h.session == session
+                                && h.fact == fact
+                                && !self.chrome_owns_terminal_row(wid, h.term_row)
+                        })
                         .map(|h| h.restores)
                 }) else {
                     return;
@@ -5809,7 +5825,7 @@ mod tests {
             .is_none()
         );
         assert!(
-            fenced_screen_now(7, &plan, || lights::read_screen(&plan)).is_some(),
+            fenced_screen_now(7, &plan, || lights::read_screen(&plan, None)).is_some(),
             "the real reader sees the composer"
         );
         assert!(observe(&mut w, &plan).wake);

@@ -369,7 +369,7 @@ fn a_content_peer_says_what_its_need_is_and_a_freeze_dates_only_an_agent() {
     assert_eq!(need_of("content", "approval", &boxed).what, Some(band));
     assert_eq!(need_of("facts", "approval", &boxed).what, None);
     // A need the row says is the program's own report says so at every level, in aterm's fixed
-    // words; the banner (`escalation`) reads them too.
+    // words.
     let claimed = [
         ("program_kind", "agent"),
         ("agent", "prompt"),

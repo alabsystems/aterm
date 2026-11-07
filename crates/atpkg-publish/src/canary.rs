@@ -88,20 +88,21 @@ fn hash(path: &Path) -> Result<String> {
 }
 
 fn manifest(quad: &VerifiedQuad, dir: &Path, build: u64) -> Result<atpkg::PkgManifest> {
-    manifest_with_digest(quad, dir, build).map(|(pkg, _)| pkg)
+    manifest_with_digest(quad, dir, "trust", build).map(|(pkg, _)| pkg)
 }
 
 fn manifest_with_digest(
     quad: &VerifiedQuad,
     dir: &Path,
+    program: &str,
     build: u64,
 ) -> Result<(atpkg::PkgManifest, String)> {
-    let bytes = read(&dir.join(pkgdoc::manifest_name("trust", build)))?;
-    let pkg = quad.verify_pkg(&bytes, &read(&dir.join(pkgdoc::sig_name("trust", build)))?)?;
-    if pkg.program != "trust" || pkg.build_number != build || pkg.artifacts.is_empty() {
-        return Err(Error::refused(
-            "canary: manifest does not bind the requested Trust build",
-        ));
+    let bytes = read(&dir.join(pkgdoc::manifest_name(program, build)))?;
+    let pkg = quad.verify_pkg(&bytes, &read(&dir.join(pkgdoc::sig_name(program, build)))?)?;
+    if pkg.program != program || pkg.build_number != build || pkg.artifacts.is_empty() {
+        return Err(Error::refused(format!(
+            "canary: manifest does not bind the requested {program} build"
+        )));
     }
     Ok((pkg, atpkg::abrew::fetch::sha256_bytes(&bytes)))
 }
@@ -122,7 +123,7 @@ pub fn check_receipt(ctx: &Ctx, quad: &VerifiedQuad, dir: &Path, build: u64) -> 
         aterm_toml::from_str(text).map_err(|e| Error::refused(format!("canary receipt: {e}")))?;
     who.bind(Some(&receipt.machine_id), Some(receipt.roster_seq))
         .map_err(|e| Error::refused(format!("canary receipt attribution: {e:?}")))?;
-    let (pkg, manifest_sha256) = manifest_with_digest(quad, dir, build)?;
+    let (pkg, manifest_sha256) = manifest_with_digest(quad, dir, "trust", build)?;
     if receipt.schema != 1
         || receipt.build != build
         || receipt.manifest_sha256 != manifest_sha256
@@ -345,7 +346,7 @@ pub fn install(
     let layout = atpkg::Layout {
         prefix: out.join("prefix"),
     };
-    let (pkg, manifest_sha256) = manifest_with_digest(quad, source, build)?;
+    let (pkg, manifest_sha256) = manifest_with_digest(quad, source, "trust", build)?;
     let mut installed = Vec::new();
     let rustup_home = out.join("rustup");
     std::fs::create_dir(&rustup_home).map_err(|e| Error::io("create scratch RUSTUP_HOME", &e))?;
@@ -531,14 +532,16 @@ pub fn publish_staged(
     let build = *builds
         .get("trust")
         .ok_or_else(|| Error::refused("staged group has no Trust build"))?;
-    let pkg = stage_receipt(ctx, &out.join("canary"), build)?;
-    let target = crate::triple::Triple::parse(&pkg.artifacts[0].target)?;
-    let mut delta = crate::api::Delta::default();
-    if target == crate::programs::PIN_TRIPLE {
-        delta.pins = builds.clone();
-    } else {
-        delta.target_pins.insert(target, builds.clone());
-    }
+    let scratch = Scratch::new("publish-staged")?;
+    let (_, head) = quad::fetch_head(ctx, &ctx.index_slug(), &scratch.path().join("head"))?;
+    let (pkg, receipt) = stage_receipt_with(ctx, &head, &out.join("canary"), build)?;
+    let targets = pkg
+        .artifacts
+        .iter()
+        .map(|a| crate::triple::Triple::parse(&a.target))
+        .collect::<Result<Vec<_>>>()?;
+    let delta = crate::channel::group::selection_delta(&builds, targets)?;
+    check_cohort(ctx, &head, &builds, &receipt, scratch.path())?;
     let published = indexer.publish(
         ctx,
         &crate::api::IndexRequest {
@@ -567,7 +570,17 @@ pub fn publish_staged(
 pub fn stage_receipt(ctx: &Ctx, evidence: &Path, build: u64) -> Result<atpkg::PkgManifest> {
     let scratch = Scratch::new("stage-canary")?;
     let (_, head) = quad::fetch_head(ctx, &ctx.index_slug(), &scratch.path().join("head"))?;
-    check_receipt(ctx, &head, evidence, build)?;
+    stage_receipt_with(ctx, &head, evidence, build).map(|(pkg, _)| pkg)
+}
+
+fn stage_receipt_with(
+    ctx: &Ctx,
+    head: &VerifiedQuad,
+    evidence: &Path,
+    build: u64,
+) -> Result<(atpkg::PkgManifest, Receipt)> {
+    let scratch = Scratch::new("stage-canary-pack")?;
+    check_receipt(ctx, head, evidence, build)?;
     let slug = ctx.staging_slug("trust");
     let tag = upload::tag("trust", build);
     let dir = scratch.path().join("pack");
@@ -603,14 +616,64 @@ pub fn stage_receipt(ctx: &Ctx, evidence: &Path, build: u64) -> Result<atpkg::Pk
         crate::identity::copy_regular_file(&evidence.join(name), &dir.join(name))
             .map_err(|e| Error::io("copy canary evidence", &e))?;
     }
-    check_receipt(ctx, &head, &dir, build)?;
+    let receipt = check_receipt(ctx, head, &dir, build)?;
     if !missing.is_empty() {
         ctx.hosts
             .staging
             .upload(&slug, &tag, &missing, crate::host::Replace::Never)
             .map_err(|e| host_error("stage canary evidence", &e))?;
     }
-    manifest(&head, &dir, build)
+    Ok((manifest(head, &dir, build)?, receipt))
+}
+
+/// Fetch each sibling's signed metadata once, then judge every canaried target
+/// against that same snapshot. Index/mirror still verify the complete asset set.
+fn check_cohort(
+    ctx: &Ctx,
+    head: &VerifiedQuad,
+    builds: &BTreeMap<String, u64>,
+    receipt: &Receipt,
+    work: &Path,
+) -> Result<()> {
+    for (program, &build) in builds {
+        if program == "trust" {
+            continue;
+        }
+        let def = crate::programs::get(program)
+            .ok_or_else(|| Error::refused(format!("unknown rustc group member {program}")))?;
+        let slug = ctx.staging_slug(def.repo);
+        let tag = upload::tag(program, build);
+        let dir = work.join(program);
+        let mf = pkgdoc::manifest_name(program, build);
+        let sig = pkgdoc::sig_name(program, build);
+        download_retried(&*ctx.hosts.staging, &slug, &tag, &[&mf, &sig], &dir)
+            .map_err(|e| host_error("read staged compiler-group manifest", &e))?;
+        let (pkg, _) = manifest_with_digest(head, &dir, program, build)?;
+        for installed in &receipt.installed {
+            let mut rows = pkg
+                .artifacts
+                .iter()
+                .filter(|a| a.target == installed.target);
+            let (Some(artifact), None) = (rows.next(), rows.next()) else {
+                return Err(Error::refused(format!(
+                    "staged {program}@{build} has no unique artifact for canaried target {}",
+                    installed.target
+                )));
+            };
+            if artifact
+                .provenance
+                .as_ref()
+                .map(|p| p.compiler_commit.as_str())
+                != Some(installed.compiler_commit.as_str())
+            {
+                return Err(Error::refused(format!(
+                    "staged {program}@{build} on {} does not bind canaried compiler commit {}",
+                    installed.target, installed.compiler_commit
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Verify a newly selected Trust build even when its public release already exists.
