@@ -5542,6 +5542,20 @@ placed_name() { # <exe>
 	printf '%s' "${said:-aterm (it did not say its version)}"
 }
 
+# Declare only the runtime this run just placed, never a PATH or discovery
+# fallback. The placed executable verifies its own identity before writing the
+# account's locator. Failure keeps the installed image and is reported without
+# blocking the installer's other work. Run once: unlike a capability query,
+# this action must not be retried by ask_bounded.
+record_placed_command() { # <just-placed executable>
+	PLACED_ATERM="$1"
+	local record_status=0
+	bounded "$VERIFY_WAIT_SECS" "$1" pkg shell-setup --installed-command "$1" || record_status=$?
+	if [[ "$record_status" -ne 0 ]]; then
+		echo "install.sh: installed command declaration was not recorded for $1 (exit $record_status); the placed runtime is kept" >&2
+	fi
+}
+
 install_cli() {
 	local target="" o
 	[[ "$LINUX_APP_INSTALLED" -eq 1 ]] || target="$(find_bundle_cli)"
@@ -5664,6 +5678,7 @@ place_store_binary() {
 		rm -f "$staged"
 		return 1
 	fi
+	record_placed_command "$STORE_DIR/aterm"
 	expose_store_binary
 }
 
@@ -5790,7 +5805,9 @@ zsh_rc_lexical() { # <output-variable> <path>
 # pathname. The stock interpreter's core modules operate only on stdin. Its empty
 # environment and taint mode exclude user Perl startup options and module paths.
 # Invalid UTF-8 components retain byte identity with ASCII case folding, as the
-# native guard does. A sentinel preserves every trailing LF in the result.
+# native guard does. A sentinel preserves every trailing LF in the result: a
+# printable one, which a `declare -f` copy keeps (bash 3.2 reprints a $'\001'
+# pattern as raw bytes that no longer match it).
 zsh_rc_fold_mac() { # <output-variable> <path>
 	local zm_value
 	[[ -x /usr/bin/perl ]] || return 1
@@ -5813,17 +5830,32 @@ for my $part (split m{/}, $raw, -1) {
     }
 }
 print join "/", @folded;
-' && printf '\001'
+' && printf x
 	)" || return 1
-	zm_value="${zm_value%$'\001'}"
+	zm_value="${zm_value%x}"
 	printf -v "$1" '%s' "$zm_value"
+}
+
+# A home as zsh_rc_protected compares paths against it: on macOS, folded
+# (zsh_rc_fold_mac) when a byte of it is past ASCII, else as it is. Folding is a
+# pure function of the bytes, so zsh_rc_dir folds each home once for its whole
+# ask rather than at every step of every walk: each fold is a Perl start, which
+# on a loaded machine takes seconds. Fails when the fold does.
+zsh_rc_fold_home() { # <output-variable> <home>
+	local LC_ALL=C
+	if [[ "$OSTYPE" == darwin* && "$2" == *[$'\200'-$'\377']* ]]; then
+		zsh_rc_fold_mac "$1" "$2"
+	else
+		printf -v "$1" '%s' "$2"
+	fi
 }
 
 # The same consent roots as atpkg/protected.rs. Call before querying a candidate,
 # including a link's target text; a lexical prefix must never request consent.
 # macOS conservatively reserves case/canonical aliases on case-sensitive volumes
-# too. The subshell keeps byte locale and nocasematch from changing its caller.
-zsh_rc_protected() ( # <normalized-path> <home>...
+# too. Each home is as zsh_rc_fold_home left it. The subshell keeps byte locale
+# and nocasematch from changing its caller.
+zsh_rc_protected() ( # <normalized-path> <folded-home>...
 	local zp_path="$1" zp_home zp_rest
 	shift
 	local LC_ALL=C
@@ -5836,9 +5868,6 @@ zsh_rc_protected() ( # <normalized-path> <home>...
 	fi
 	case "$zp_path" in /Volumes | /Volumes/*) return 0 ;; esac
 	for zp_home in "$@"; do
-		if [[ "$OSTYPE" == darwin* && "$zp_home" == *[$'\200'-$'\377']* ]]; then
-			zsh_rc_fold_mac zp_home "$zp_home" || return 0
-		fi
 		zp_home="${zp_home%/}"
 		case "$zp_path" in "$zp_home"/*) zp_rest="${zp_path:${#zp_home}+1}" ;; *) continue ;; esac
 		case "$zp_rest" in
@@ -5879,7 +5908,8 @@ zsh_rc_readlink() { # <output-variable> <admitted-link>
 # erase the link's meaning. Missing descendants are legitimate ZDOTDIRs.
 # Refusal is 3 for escape from a redirected HOME, 2 for a protected path, and
 # 1 for unknown or unusable paths. Only an inherited escape permits fallback.
-zsh_rc_walk() { # <path-output> <kind-output> <path> <confined-home-or-empty> <home>...
+# Each home is as zsh_rc_fold_home left it (zsh_rc_protected).
+zsh_rc_walk() { # <path-output> <kind-output> <path> <confined-home-or-empty> <folded-home>...
 	local zw_out="$1" zw_kind_out="$2" zw_rest="$3" zw_root="$4"
 	local zw_named zw_path=/ zw_next zw_part zw_kind=dir zw_link zw_links=0
 	shift 4
@@ -5954,21 +5984,26 @@ zsh_ask_secs() { # <output-variable>
 # before metadata, and a fresh nonce plus byte count binds the binary reply.
 zsh_rc_dir() { # <output-variable>
 	printf -v "$1" '%s' ''
-	local zrc_uid zrc_named zrc_home zrc_kind zrc_account zrc_physical zrc_own=0
+	local zrc_uid zrc_named zrc_home zrc_kind zrc_account zrc_physical zrc_own=0 zrc_root
 	local zrc_roots=() zrc_accounts=() zrc_file zrc_seen=0 zrc_zsh="" zrc_dir="" zrc_confine=""
 	local zrc_tmp zrc_nonce zrc_begin zrc_end zrc_field zrc_count zrc_finish zrc_status=0 zrc_wait
 	zrc_uid="$(installer_uid)"
 	[[ "$zrc_uid" != 0 ]] || return 0
+	# zrc_roots holds each home folded once (zsh_rc_fold_home), as every walk
+	# compares against it; a home whose fold fails refuses before any query.
 	zsh_rc_lexical zrc_named "$HOME" || return 0
-	zrc_roots+=("$zrc_named")
+	zsh_rc_fold_home zrc_root "$zrc_named" || return 0
+	zrc_roots+=("$zrc_root")
 	while IFS= read -r zrc_account; do
 		zsh_rc_lexical zrc_account "$zrc_account" || continue
-		zrc_roots+=("$zrc_account")
+		zsh_rc_fold_home zrc_root "$zrc_account" || return 0
+		zrc_roots+=("$zrc_root")
 		zrc_accounts+=("$zrc_account")
 	done <<<"$(account_homes "$zrc_uid")"
 	zsh_rc_walk zrc_home zrc_kind "$HOME" "" "${zrc_roots[@]}" || return 0
 	[[ "$zrc_kind" == dir || "$zrc_kind" == missing ]] || return 0
-	zrc_roots+=("$zrc_home")
+	zsh_rc_fold_home zrc_root "$zrc_home" || return 0
+	zrc_roots+=("$zrc_root")
 	for zrc_account in ${zrc_accounts[@]+"${zrc_accounts[@]}"}; do
 		if [[ "$zrc_account" == "$zrc_named" ]] ||
 			{ zsh_rc_walk zrc_physical zrc_kind "$zrc_account" "" "${zrc_roots[@]}" && [[ "$zrc_physical" == "$zrc_home" ]]; }; then
@@ -6952,6 +6987,7 @@ install_app() {
 	# the swap. Same rule for the set-aside path, and for the folder a root run
 	# stages in (stage_bundle).
 	place_bundle "$MNT/aterm.app" "$DEST"
+	record_placed_command "$DEST/aterm.app/Contents/MacOS/aterm"
 
 	# Nudge Spotlight (a run as the account staged a folder whose name is no
 	# bundle's, indexed as a plain directory until the rename made it an .app
@@ -7076,6 +7112,7 @@ install_linux_app() {
 		echo "install.sh: install refused by the updater — see: aterm update status" >&2
 		exit 1
 	}
+	record_placed_command "$STORE_DIR/aterm"
 	expose_store_binary
 	echo "install.sh: installed aterm ${TAG#v} -> $STORE_DIR/aterm"
 	say_store_command ""
