@@ -21,6 +21,71 @@ const DAY: u64 = EPOCH_S;
 /// Day 20,000 since the Unix epoch, a fixed clock for the tests that set one.
 const D: u64 = 20_000;
 
+#[test]
+#[cfg(unix)]
+fn an_actual_claims_read_waits_for_unchanged_native_custody() {
+    use std::os::unix::fs::MetadataExt as _;
+    let lab = Lab::new(&[Role::Writer]);
+    let expected = *lab.bootstrap(0).request().unwrap().binding().machine();
+    let held = aterm_uds::private_file::PrivateLock::take_with(
+        &lab.paths[0].dir,
+        "commons.lock",
+        Duration::ZERO,
+        "private custody held",
+        || {},
+    )
+    .unwrap();
+    let named = std::fs::metadata(lab.paths[0].dir.join("commons.lock")).unwrap();
+    let identity = (named.dev(), named.ino());
+    let mut held = Some(held);
+    let result = aterm_uds::file_lock::with_lock_wait_observer(
+        move |file| {
+            let actual = file.metadata().unwrap();
+            assert_eq!((actual.dev(), actual.ino()), identity);
+            if let Some(held) = held.take() {
+                drop(held);
+            }
+        },
+        || {
+            read_started(
+                &lab.paths[0],
+                at(D, 600),
+                Caps::default(),
+                Instant::now() - Duration::from_secs(3),
+            )
+        },
+    );
+    let read = result.unwrap();
+    assert_eq!(read.me, expected);
+    assert!(read.writable.is_ok());
+    let held = aterm_uds::private_file::PrivateLock::take_with(
+        &lab.paths[0].dir,
+        "commons.lock",
+        Duration::ZERO,
+        "private custody held",
+        || {},
+    )
+    .unwrap();
+    assert!(
+        read_started(
+            &lab.paths[0],
+            at(D, 600),
+            Caps::default(),
+            Instant::now() - Duration::from_secs(61)
+        )
+        .is_err()
+    );
+    let still_held = aterm_uds::private_file::PrivateLock::take_with(
+        &lab.paths[0].dir,
+        "commons.lock",
+        Duration::ZERO,
+        "private custody held",
+        || {},
+    );
+    assert!(still_held.is_err());
+    drop(held);
+}
+
 /// `secs` into day `day`.
 const fn at(day: u64, secs: u64) -> u64 {
     day * DAY + secs

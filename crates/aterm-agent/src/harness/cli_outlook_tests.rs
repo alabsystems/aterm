@@ -179,14 +179,16 @@ fn the_report_says_the_cards_numbers_and_writes_nothing() {
         "the text's outlook block is the card's:\n{text}"
     );
     let mut figures = 0;
-    for row in card.card_rows(Some("me"), 30, None) {
+    for row in card.card_rows("me", None, true, 30, None) {
+        // Words only at 30 cells: `me 58% ↺ Thu`, the figure used second.
         if let CardRow::Account {
             label, text: item, ..
         } = row
             && let Some(pct) = item
-                .split(" \u{b7} ")
-                .find(|part| part.ends_with("% left"))
-                .map(|part| part.trim_end_matches(" left"))
+                .split_whitespace()
+                .nth(1)
+                .filter(|part| part.ends_with('%'))
+                .map(|part| format!("{part} used"))
         {
             // The row's own line, then the lines indented under it.
             let lines: Vec<&str> = text.lines().collect();
@@ -204,7 +206,7 @@ fn the_report_says_the_cards_numbers_and_writes_nothing() {
                 .collect::<Vec<_>>()
                 .join("\n");
             assert!(
-                block.contains(pct),
+                block.contains(&pct),
                 "{label}: the card's {pct} in the report's lines:\n{block}\n---\n{text}"
             );
             figures += 1;

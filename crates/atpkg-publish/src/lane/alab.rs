@@ -1139,6 +1139,31 @@ fn signed_commit(
         .ok_or_else(|| "the signed SHA256SUMS names no commit".to_string())
 }
 
+/// The dev commits whose `repo` row in the engine's ledger `value` records `public_commit` as its
+/// release, every revoked row (`revoked.<repo>.<dev>`) left out, as the engine's own projection
+/// leaves them out (`bin/pub_projection.py`'s `live_rows`): a revoked row's release is not what it
+/// built.
+fn live_sources<'a>(value: &'a aterm_json::Value, repo: &str, public_commit: &str) -> Vec<&'a str> {
+    let revoked = value
+        .get("revoked")
+        .and_then(|r| r.get(repo))
+        .and_then(aterm_json::Value::as_object);
+    value
+        .get("mappings")
+        .and_then(|m| m.get(repo))
+        .and_then(aterm_json::Value::as_object)
+        .map_or_else(Vec::new, |rows| {
+            rows.iter()
+                .filter(|(dev, _)| !revoked.is_some_and(|r| r.contains_key(*dev)))
+                .filter(|(_, row)| {
+                    row.get("release_rev").and_then(aterm_json::Value::as_str)
+                        == Some(public_commit)
+                })
+                .map(|(dev, _)| dev.as_str())
+                .collect()
+        })
+}
+
 fn resolve_dev(
     ctx: &Ctx,
     ledger_path: &Path,
@@ -1158,23 +1183,28 @@ fn resolve_dev(
         CachedLedger::Invalid(err) => return Err(err.clone()),
         CachedLedger::Parsed(v) => v,
     };
-    let src = value
-        .get("mappings")
-        .and_then(|m| m.get(repo))
-        .and_then(aterm_json::Value::as_object)
-        .and_then(|rows| {
-            rows.iter().find_map(|(dev, row)| {
-                (row.get("release_rev").and_then(aterm_json::Value::as_str) == Some(public_commit))
-                    .then(|| dev.clone())
-            })
-        })
-        .ok_or_else(|| {
-            format!(
-                "{} has no {repo} row whose release_rev is the signed commit {short} — `git -C \
-                 ~/publication pull --ff-only`, or the promote ran elsewhere",
+    let src = match live_sources(value, repo, public_commit).as_slice() {
+        [one] => one.to_string(),
+        [] => {
+            return Err(format!(
+                "{} has no live {repo} row whose release_rev is the signed commit {short} — `git \
+                 -C ~/publication pull --ff-only`, or the promote ran elsewhere",
                 ctx.shown(ledger_path)
-            )
-        })?;
+            ));
+        }
+        many => {
+            return Err(format!(
+                "{} maps the signed commit {short} to {} live {repo} rows ({}), so which dev \
+                 commit it was cut from is not decided",
+                ctx.shown(ledger_path),
+                many.len(),
+                many.iter()
+                    .map(|dev| &dev[..dev.len().min(12)])
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    };
     if src.len() != 40 || !src.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!(
             "{} maps the signed commit {short} to `{src}`, which is not a 40-hex dev commit",
@@ -1699,4 +1729,36 @@ pub fn parse_vv(text: &str) -> Option<PinCommit> {
         commit: commit[..9].to_string(),
         date,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A REVOKED ROW NEVER NAMES THE DEV COMMIT A SIGNED RELEASE WAS CUT FROM, AND TWO LIVE ROWS
+    /// DECIDE NONE: ay's signed commit d766… is the release of two revoked rows and one live one,
+    /// as the ledger held it on 2026-11-07, and only the live one is its source. NEGATIVE
+    /// CONTROL: with the revocations dropped, the sorted first row (a revoked one) was taken.
+    #[test]
+    fn a_revoked_row_never_names_the_source_and_two_live_rows_decide_none() {
+        let (one, two, live) = ("0".repeat(40), "5".repeat(40), "6".repeat(40));
+        let ledger = |revoked: &str| {
+            aterm_json::from_str::<aterm_json::Value>(&format!(
+                "{{\"mappings\":{{\"ay\":{{\"{one}\":{{\"release_rev\":\"d766\"}},\
+                 \"{two}\":{{\"release_rev\":\"d766\"}},\"{live}\":{{\"release_rev\":\"d766\"}},\
+                 \"{}\":{{\"release_rev\":\"other\"}}}}}},\"revoked\":{{{revoked}}}}}",
+                "9".repeat(40)
+            ))
+            .unwrap()
+        };
+        let revoked = ledger(&format!("\"ay\":{{\"{one}\":{{}},\"{two}\":{{}}}}"));
+        assert_eq!(live_sources(&revoked, "ay", "d766"), vec![live.as_str()]);
+        assert!(live_sources(&revoked, "trust-ir", "d766").is_empty());
+        let unrevoked = ledger("");
+        assert_eq!(
+            live_sources(&unrevoked, "ay", "d766"),
+            vec![one.as_str(), two.as_str(), live.as_str()],
+            "NEGATIVE CONTROL: without the revocations every row is live, so none is decided"
+        );
+    }
 }

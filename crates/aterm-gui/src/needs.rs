@@ -255,6 +255,14 @@ impl ToldNeeds {
         self.reading(standing).map(|held| held.needs())
     }
 
+    /// The set a loop left standing beside `standing` for the loop after it: the one
+    /// [`Self::words_for`] reads, with the entry's text, unless the take-down was told last.
+    #[must_use]
+    pub(crate) fn left_for(&self, standing: Option<&str>) -> Option<&HarnessNeeds> {
+        self.current.as_ref()?;
+        self.reading(standing).map(|held| &**held)
+    }
+
     /// The set told last, whatever entry stands (`None`: none told, or the take-down).
     #[must_use]
     #[cfg_attr(
@@ -294,13 +302,6 @@ impl HarnessNeeds {
 
     /// The entry's text the set was told with, sanitized.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read by tests; slice 2d compares through `words_for`"
-        )
-    )]
     pub(crate) fn entry(&self) -> &str {
         &self.entry
     }

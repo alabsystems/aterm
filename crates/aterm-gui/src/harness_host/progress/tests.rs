@@ -356,7 +356,8 @@ fn recent_login_activity_keeps_the_blocker_and_filters_unrelated_or_invalid_time
     for cols in [60, 120] {
         let rect = crate::autopilot_menu::place(&rows, (25, 0), (0..26, 0..cols), (cols, 26), 0)
             .expect("account menu fits");
-        let painted = crate::autopilot_menu::paint(rect, &rows, Default::default(), None, theme);
+        let painted =
+            crate::autopilot_menu::paint(rect, &rows, Default::default(), None, theme, None);
         assert!(
             painted.iter().any(|row| {
                 row.iter()
@@ -711,7 +712,8 @@ fn completed_login_diagnostics_reach_the_menu_only_for_the_captured_account() {
     for cols in [60, 120] {
         let rect = crate::autopilot_menu::place(&menu, (25, 0), (0..26, 0..cols), (cols, 26), 0)
             .expect("account menu fits");
-        let painted = crate::autopilot_menu::paint(rect, &menu, Default::default(), None, theme);
+        let painted =
+            crate::autopilot_menu::paint(rect, &menu, Default::default(), None, theme, None);
         let text: String = painted
             .iter()
             .flat_map(|line| line.iter().map(|cell| cell.ch))

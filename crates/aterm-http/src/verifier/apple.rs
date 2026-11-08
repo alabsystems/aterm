@@ -206,13 +206,21 @@ fn sec_certificate(der: &[u8]) -> Option<CfOwned> {
     (!cert.is_null()).then(|| CfOwned(cert))
 }
 
-/// How long one certificate evaluation may take before it is refused.
-const EVALUATION_DEADLINE: Duration = Duration::from_secs(30);
+/// A minute hang detector for local certificate work. The gate refuses later
+/// evaluations once an existing helper has exhausted this same allowance.
+const CERTIFICATE_HANG: Duration = Duration::from_secs(60);
 
-/// How long an evaluation may run before `trustd` is taken to be not
-/// answering, and later evaluations are refused at once instead of each
-/// starting a thread that would stick behind it.
-const SUSPECT_AFTER: Duration = Duration::from_secs(5);
+fn run_evaluation_after<T: Send + 'static>(
+    gate: &'static aterm_uds::deadline::Gate,
+    elapsed: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Refused> {
+    let remaining = CERTIFICATE_HANG
+        .checked_sub(elapsed)
+        .filter(|left| !left.is_zero())
+        .ok_or(Refused::Unanswered)?;
+    gate.run(CERTIFICATE_HANG, remaining, work)
+}
 
 /// Apple-platform chain verification.
 #[derive(Debug)]
@@ -269,7 +277,7 @@ impl Verifier {
             now,
             extra_roots: Arc::clone(&self.extra_roots),
         };
-        match TRUST.run(SUSPECT_AFTER, EVALUATION_DEADLINE, move || evaluate(&job)) {
+        match run_evaluation_after(&TRUST, Duration::ZERO, move || evaluate(&job)) {
             Ok(verdict) => verdict,
             Err(Refused::Unanswered) => Err(service_unanswered()),
             Err(Refused::Failed(why)) => Err(rustls::Error::Other(rustls::OtherError(Arc::new(
@@ -443,4 +451,34 @@ fn evaluate(job: &Job) -> Result<(), rustls::Error> {
             None => format!("certificate rejected by the system: {other}"),
         }),
     })
+}
+
+#[cfg(test)]
+mod wait_policy_tests {
+    use super::*;
+    use aterm_uds::deadline::Gate;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn native_gate_waits_for_a_scheduled_evaluation() {
+        static GATE: Gate = Gate::new("certificate-wait-regression");
+        let ran = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&ran);
+        let result = run_evaluation_after(&GATE, Duration::from_secs(31), move || {
+            count.fetch_add(1, Ordering::Relaxed);
+            7
+        });
+        assert!(matches!(result, Ok(7)), "{result:?}");
+        assert_eq!(ran.load(Ordering::Relaxed), 1);
+        assert_eq!(GATE.running(), 0);
+
+        let count = Arc::clone(&ran);
+        let expired = run_evaluation_after(&GATE, Duration::from_secs(61), move || {
+            count.fetch_add(1, Ordering::Relaxed);
+            9
+        });
+        assert!(matches!(expired, Err(Refused::Unanswered)), "{expired:?}");
+        assert_eq!(ran.load(Ordering::Relaxed), 1, "expiry starts no helper");
+        assert_eq!(GATE.running(), 0);
+    }
 }

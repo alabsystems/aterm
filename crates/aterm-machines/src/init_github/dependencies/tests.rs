@@ -353,7 +353,10 @@ fn unsupported_git_refuses_dependency_work_without_an_ordinary_fallback() {
         Err(Unready::Git(_))
     ));
     let why = repair(&sys, &who, &parent, &repo, &|| Ok(())).unwrap_err();
-    assert!(why.contains("must support --no-lazy-fetch"), "{why}");
+    assert!(
+        why.to_string().contains("must support --no-lazy-fetch"),
+        "{why}"
+    );
     let calls = sys.calls();
     assert_eq!(
         calls.len(),
@@ -785,7 +788,10 @@ fn an_existing_complete_dependency_reaches_its_preloaded_pin_without_a_working_t
     sys.remove(&object_path).unwrap();
     assert!(!ready(&sys, &who, &parent, &repo).unwrap());
     let why = repair(&sys, &who, &parent, &repo, &|| Ok(())).unwrap_err();
-    assert!(why.starts_with("cannot fetch the required dependency's recorded commit"));
+    assert!(
+        why.to_string()
+            .starts_with("cannot fetch the required dependency's recorded commit")
+    );
     assert_eq!(
         run(&child, &["symbolic-ref", "HEAD"]).trim(),
         "refs/heads/owner-work"
@@ -837,7 +843,8 @@ fn an_existing_complete_dependency_reaches_its_preloaded_pin_without_a_working_t
     );
     let why = result.unwrap_err();
     assert!(
-        why.starts_with("cannot fetch the required dependency's recorded commit"),
+        why.to_string()
+            .starts_with("cannot fetch the required dependency's recorded commit"),
         "an incomplete local checkout must try the admitted transport: {why}"
     );
     assert_eq!(run(&child, &["rev-parse", "HEAD"]).trim(), old);

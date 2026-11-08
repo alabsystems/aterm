@@ -6,7 +6,6 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
@@ -307,7 +306,7 @@ pub fn read_records(dir: &Path) -> Result<Vec<Record>, String> {
 
 /// The `--config` value that makes cargo run `gate --record-test-binary dir` in place of every test binary.
 #[must_use]
-pub fn runner_config(gate: &Path, dir: &Path) -> Option<String> {
+pub fn runner_config(gate: &Path, dir: &Path, host: &str) -> Option<String> {
     let q = |s: &str| {
         let mut out = String::from("\"");
         for c in s.chars() {
@@ -321,22 +320,139 @@ pub fn runner_config(gate: &Path, dir: &Path) -> Option<String> {
         out.push('"');
         out
     };
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
     Some(format!(
-        "target.'cfg(all())'.runner=[{},{},{}]",
+        "target.{host}.runner=[{},{},{}]",
         q(gate.to_str()?),
         q(RECORD_FLAG),
         q(dir.to_str()?)
     ))
 }
 
-/// Build the serial `--tests` command with the recording runner and current target metadata.
+/// Build the serial `--tests` command with the exact-host recording runner. The inherited target
+/// and exact-host runner variables are removed after [`configured_build_targets`] proved Cargo
+/// has no configured target; otherwise Cargo could execute a runnable non-host binary outside
+/// [`exec::CaseWatch`].
 #[must_use]
-pub fn recording_cmd(serial: &Cmd, config: &str) -> Cmd {
-    let mut c = crate::compile_account::with_message_format(serial.clone());
+pub fn recording_cmd(serial: &Cmd, config: &str, host: &str) -> Cmd {
+    let runner_env = format!(
+        "CARGO_TARGET_{}_RUNNER",
+        host.to_ascii_uppercase().replace(['-', '.'], "_")
+    );
+    let mut c = crate::compile_account::with_message_format(
+        serial
+            .clone()
+            .remove_env("CARGO_BUILD_TARGET")
+            .remove_env(runner_env),
+    );
     c.args
         .splice(0..0, [OsString::from("--config"), OsString::from(config)]);
     c.args = aterm_toolchain::build_cache::configs_after_subcommand(&c.args);
     c
+}
+
+/// Cargo's effective `build.target`, read through Cargo itself so environment variables,
+/// hierarchical config and `$CARGO_HOME` have exactly Cargo's precedence. An explicitly selected
+/// target is refused by the native test dispatcher: it changes the artifact layout and could
+/// escape the exact-host recorder. `None` is Cargo's native default.
+fn configured_build_targets(ctx: &crate::Ctx, serial: &Cmd) -> Result<Option<Vec<String>>, String> {
+    let mut configs = Vec::new();
+    let mut explicit_target = None;
+    let mut args = serial.args.iter().peekable();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        if arg == "--config" {
+            let value = args
+                .next()
+                .ok_or_else(|| "Cargo's --config has no value".to_owned())?;
+            configs.extend([arg.clone(), value.clone()]);
+            continue;
+        }
+        let text = arg.to_string_lossy();
+        if text.starts_with("--config=") {
+            configs.push(arg.clone());
+        } else if text == "--target" {
+            explicit_target = Some(
+                args.next()
+                    .ok_or_else(|| "Cargo's --target has no value".to_owned())?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        } else if let Some(target) = text.strip_prefix("--target=") {
+            explicit_target = Some(target.to_owned());
+        }
+    }
+    if let Some(target) = explicit_target {
+        if target.trim().is_empty() {
+            return Err("Cargo's --target is empty".to_owned());
+        }
+        return Ok(Some(vec![target]));
+    }
+    let mut query = serial.clone();
+    query.args = [
+        "-Z",
+        "unstable-options",
+        "config",
+        "get",
+        "build.target",
+        "--format",
+        "json",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    query.args.extend(configs);
+    query.args = aterm_toolchain::build_cache::configs_after_subcommand(&query.args);
+    query.capture = exec::Capture::Emit;
+    query.preamble = None;
+    query.test_cases = None;
+    let exec::MachineRun { run, stdout } = exec::run_machine(&query, ctx.exec_env());
+    if !run.ok {
+        if run
+            .output
+            .contains("config value `build.target` is not set")
+        {
+            return Ok(None);
+        }
+        return Err(format!(
+            "cannot read Cargo's effective build.target: {}",
+            first_error(&run.output)
+        ));
+    }
+    let stdout = stdout.map_err(|why| format!("cannot read Cargo's build.target answer: {why}"))?;
+    let document: aterm_json::Value = aterm_json::from_str(&stdout)
+        .map_err(|error| format!("Cargo's build.target query did not print JSON: {error}"))?;
+    let value = document
+        .get("build")
+        .and_then(|build| build.get("target"))
+        .ok_or_else(|| "Cargo's build.target query omitted build.target".to_owned())?;
+    let targets = if let Some(target) = value.as_str() {
+        vec![target.to_owned()]
+    } else {
+        value
+            .as_array()
+            .ok_or_else(|| "Cargo's build.target is neither a string nor an array".to_owned())?
+            .iter()
+            .map(|target| {
+                target
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "Cargo's build.target array contains a non-string".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    if targets.is_empty() || targets.iter().any(|target| target.trim().is_empty()) {
+        return Err("Cargo's build.target query returned an empty target".to_owned());
+    }
+    Ok(Some(targets))
 }
 
 /// A test executable the compile built, with cargo's target flag for it (`--lib`, `--bin <name>`, `--test <name>`, …).
@@ -692,7 +808,7 @@ pub fn dispatch<F, E>(
     completed: E,
 ) -> Vec<Option<Ran>>
 where
-    F: Fn(&Binary, &Planned) -> Option<Run> + Sync,
+    F: Fn(&Binary, &Planned, &(dyn Fn() + Sync)) -> Option<Run> + Sync,
     E: Fn(&Binary, &Ran, &dyn Fn()) + Sync,
 {
     dispatch_pooled(bins, plan, memory, None, live, stop, run_one, completed)
@@ -726,7 +842,7 @@ pub fn dispatch_pooled<F, E>(
     completed: E,
 ) -> Vec<Option<Ran>>
 where
-    F: Fn(&Binary, &Planned) -> Option<Run> + Sync,
+    F: Fn(&Binary, &Planned, &(dyn Fn() + Sync)) -> Option<Run> + Sync,
     E: Fn(&Binary, &Ran, &dyn Fn()) + Sync,
 {
     let unpaid = || stop() || exec::ending();
@@ -767,7 +883,7 @@ where
                             Some(Err(why)) => (None, Some(unpaid_run(&why))),
                         };
                         let started = Instant::now();
-                        let answered = refused.or_else(|| run_one(binary, &b));
+                        let answered = refused.or_else(|| run_one(binary, &b, &halt));
                         drop(tokens);
                         if let Some(run) = answered {
                             let ran = Ran {
@@ -801,7 +917,9 @@ fn unpaid_run(why: &std::io::Error) -> Run {
         format!("the release's pool gave it no tokens: {why}")
     };
     Run {
+        case_observations: None,
         stopped_at: None,
+        hung: None,
         ok: false,
         output: String::new(),
         code: None,
@@ -885,6 +1003,9 @@ fn admitted_after_stop(
 /// most [`crate::report::FINDINGS_SHOWN`] cases the line stays far under the 64 KiB the release's
 /// reader holds a line to, so a FAIL is never lost to its own length.
 pub const FAILURE_OUTPUT_BYTES: usize = 2048;
+/// The most unfinished case names one hung-binary event carries. Eight leaves room under the
+/// release reader's 64 KiB line cap beside ten full failure blocks and the hang detail.
+const HUNG_CASES_SHOWN: usize = 8;
 
 /// The test binaries a release's resume may carry (A19): each binary that passed before in this
 /// tree, by its spec, with the SHA-256 its executable had then.
@@ -1005,11 +1126,7 @@ fn carried_event(binary: &Binary, sha256: &str) -> String {
 /// whatever else writes ([`Ctx::record_event`]): stderr is shared with every child, and a line
 /// longer than a pipe writes at once can be split there.
 fn emit(ctx: &crate::Ctx, event: &str) {
-    let mut line = String::with_capacity(event.len() + 1);
-    line.push_str(event);
-    line.push('\n');
-    let _ = std::io::stderr().lock().write_all(line.as_bytes());
-    ctx.record_event(&line);
+    crate::event_log::emit(ctx.events.as_ref(), event);
 }
 
 /// A finished binary's outcome (ok, NOT RUN when its machine or the run's end kept it from
@@ -1030,20 +1147,38 @@ fn binary_event(
     // context as the final report, so passing fixture output cannot own a failure.
     let combined =
         (!run.ok).then(|| combined(std::slice::from_ref(binary), std::slice::from_ref(run)));
-    let failures = combined
-        .as_ref()
-        .and_then(|all| crate::libtest::failed_tests(&all.output))
-        .unwrap_or_default()
-        .into_iter()
-        .take(crate::report::FINDINGS_SHOWN)
-        .map(|failed| {
-            aterm_json::json!({
-                "case": crate::report::clip_json(&failed.name, crate::report::EVENT_ROW_BYTES),
-                "output": crate::report::clip_json(&failed.block, FAILURE_OUTPUT_BYTES),
-                "refused": failed.refused,
+    let human_failures = || {
+        combined
+            .as_ref()
+            .and_then(|all| crate::libtest::failed_tests(&all.output))
+            .unwrap_or_default()
+            .into_iter()
+            .take(crate::report::FINDINGS_SHOWN)
+            .map(|failed| {
+                aterm_json::json!({
+                    "case": crate::report::clip_json(&failed.name, crate::report::EVENT_ROW_BYTES),
+                    "output": crate::report::clip_json(&failed.block, FAILURE_OUTPUT_BYTES),
+                    "refused": failed.refused,
+                })
             })
-        })
-        .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+    };
+    let failures = match &run.case_observations {
+        Some(observed) if observed.json => observed
+            .failures
+            .iter()
+            .map(|failed| {
+                aterm_json::json!({
+                    "case": crate::report::clip_json(&failed.case, crate::report::EVENT_ROW_BYTES),
+                    "output": failed.output, "omitted_bytes": failed.omitted_bytes,
+                    "refused": failed.marks.refused,
+                    "source_path": failed.source_path, "start_line": failed.start_line,
+                    "start_col": failed.start_col,
+                })
+            })
+            .collect::<Vec<_>>(),
+        _ => human_failures(),
+    };
     let unavailable = if run.ok || run.spawn_error.is_some() {
         run.environment_failure()
     } else {
@@ -1051,8 +1186,8 @@ fn binary_event(
     };
     let outcome = if run.ok {
         Outcome::Ok
-    } else if run.stopped_at.is_some() {
-        // Stopped at a decisive red case: a FAIL by construction (`libtest::decisive`).
+    } else if run.stopped_at.is_some() || run.hung.is_some() {
+        // A decisive red case or a proven hang is a FAIL by construction.
         Outcome::Fail(Severity::GateFailed)
     } else if unavailable.is_some() {
         Outcome::Fail(Severity::CouldNotRun)
@@ -1061,10 +1196,38 @@ fn binary_event(
     };
     let tests = crate::libtest::tests_run(&run.output);
     let usage = run.usage;
+    let hung_cases = run.hung.as_ref().map(|hung| {
+        hung.running
+            .iter()
+            .take(HUNG_CASES_SHOWN)
+            .map(|case| crate::report::clip_json(case, crate::report::EVENT_ROW_BYTES))
+            .collect::<Vec<_>>()
+    });
+    let hung_cases_omitted = run
+        .hung
+        .as_ref()
+        .map(|hung| hung.running.len().saturating_sub(HUNG_CASES_SHOWN));
+    let hung_binary = run
+        .hung
+        .as_ref()
+        .map(|hung| crate::report::clip_json(&hung.binary, crate::report::EVENT_ROW_BYTES));
+    let stack_sample = run
+        .hung
+        .as_ref()
+        .and_then(|hung| hung.sample.report.as_ref())
+        .map(|path| {
+            crate::report::clip_json(&path.display().to_string(), crate::report::EVENT_ROW_BYTES)
+        });
+    let stack_sample_error = run
+        .hung
+        .as_ref()
+        .and_then(|hung| hung.sample.error.as_ref())
+        .map(|error| crate::report::clip_json(error, crate::report::EVENT_DETAIL_BYTES));
     let event = format!(
         "verify-event: {}",
         aterm_json::json!({
-            "schema": 1, "event": "test-binary-finished", "test": binary.spec,
+            "schema": 1, "event": "test-binary-finished",
+            "test": crate::report::clip_json(&binary.spec, crate::report::EVENT_ROW_BYTES),
             "outcome": crate::report::word(outcome), "exit_code": run.code,
             "waiting_s": ran.waiting.as_secs_f64(), "execution_s": ran.execution.as_secs_f64(),
             "cpu_s": usage.map(|u| u.cpu.as_secs_f64()),
@@ -1072,19 +1235,32 @@ fn binary_event(
             "peak_bytes": usage.map(|u| u.peak_bytes),
             "width": width, "charge": ran.planned.charge, "tests": tests,
             "failures": failures,
+            "failures_complete": false,
+            "failure_observation_end": run.case_observations.as_ref().map(|o| o.read_end.name()),
             "detail": if run.ok {
                 String::new()
+            } else if let Some(hung) = &run.hung {
+                crate::report::clip_json(&hung.detail(), crate::report::EVENT_DETAIL_BYTES)
             } else if let Some(stopped) = &run.stopped_at {
                 stopped_detail(stopped, combined.as_ref().map_or("", |c| c.output.as_str()))
             } else {
                 unavailable.unwrap_or_else(|| first_error(&run.output))
             },
-            "stopped_at": run.stopped_at.as_ref().map(|s| s.case.as_str()),
+            "stopped_at": run.stopped_at.as_ref()
+                .map(|s| crate::report::clip_json(&s.case, crate::report::EVENT_ROW_BYTES)),
+            "hung": run.hung.is_some(),
+            "hung_binary": hung_binary,
+            "hung_cases": hung_cases,
+            "hung_cases_omitted": hung_cases_omitted,
+            "hang_window_s": run.hung.as_ref().map(|h| h.window.as_secs_f64()),
+            "stack_sample": stack_sample,
+            "stack_sample_error": stack_sample_error,
             "exe_sha256": exe_sha256, "carried": false,
         })
     );
     let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-    let stopped = started && run.stopped_at.is_some() && run.spawn_error.is_none();
+    let stopped =
+        started && (run.stopped_at.is_some() || run.hung.is_some()) && run.spawn_error.is_none();
     let sample = (measured(run, started) || stopped).then(|| crate::test_history::Sample {
         at_ms: aterm_time::unix_millis().unwrap_or(0),
         outcome: crate::report::word(outcome).to_owned(),
@@ -1162,7 +1338,11 @@ fn stopped_detail(stopped: &crate::libtest_json::Stopped, log: &str) -> String {
 /// sample with a zero wall, so the latest FAIL orders it first without replacing its last timed
 /// wall.
 fn measured(run: &Run, started: bool) -> bool {
-    started && run.stopped_at.is_none() && run.spawn_error.is_none() && !crate::exec::ending()
+    started
+        && run.stopped_at.is_none()
+        && run.hung.is_none()
+        && run.spawn_error.is_none()
+        && !crate::exec::ending()
 }
 
 /// The run's long poles: its own wall, then its slowest binaries by their own
@@ -1256,8 +1436,10 @@ pub fn binary_cmd(b: &Binary, threads: u32, checkers: bool, watch: Watch) -> Cmd
     }
     command.test_cases = Some(exec::CaseWatch {
         spec: b.spec.clone(),
+        binary: b.record.exe().display().to_string(),
         json,
         stop_at_red: watch.stop_at_red,
+        hang_after: exec::TEST_BINARY_HANG,
     });
     crate::stages::with_checkers(command, checkers)
 }
@@ -1270,6 +1452,7 @@ pub fn binary_cmd(b: &Binary, threads: u32, checkers: bool, watch: Watch) -> Cmd
 pub fn combined(bins: &[Binary], runs: &[Run]) -> Run {
     let mut output = String::new();
     let mut failed = Vec::new();
+    let hung = runs.iter().find_map(|run| run.hung.clone());
     for (b, r) in bins.iter().zip(runs) {
         output.push_str(&r.output);
         if !output.ends_with('\n') {
@@ -1279,7 +1462,12 @@ pub fn combined(bins: &[Binary], runs: &[Run]) -> Run {
             continue;
         }
         output.push_str(&format!("error: test failed, to rerun pass `{}`\n", b.spec));
-        if let Some(stopped) = &r.stopped_at {
+        if let Some(hung) = &r.hung {
+            output.push_str(&format!(
+                "note: verify ended this binary as {}\n",
+                hung.detail()
+            ));
+        } else if let Some(stopped) = &r.stopped_at {
             // Verify ended it, by design: no abnormal exit to say.
             output.push_str(&format!(
                 "note: verify ended this binary at its first red case `{}`\n",
@@ -1314,7 +1502,9 @@ pub fn combined(bins: &[Binary], runs: &[Run]) -> Run {
         }
     }
     Run {
+        case_observations: None,
         stopped_at: None,
+        hung,
         ok: failed.is_empty(),
         output,
         code: Some(if failed.is_empty() { 0 } else { 101 }),
@@ -1405,7 +1595,9 @@ pub fn overruns(bins: &[Binary], ran: &[Option<Ran>]) -> String {
 #[must_use]
 pub fn not_started(b: &Binary, limit: Duration) -> Run {
     Run {
+        case_observations: None,
         stopped_at: None,
+        hung: None,
         ok: false,
         output: format!(
             "{}\n{} — not started: the test run's {:.1}s wall-clock ceiling was spent before \
@@ -1652,11 +1844,10 @@ pub fn run_tests(
         .as_deref()
         .map(crate::test_history::load)
         .unwrap_or_default();
-    // Cargo's own run of the binaries is one at a time: a serial fallback, and the recording pass
-    // itself where a runner the caller's cargo config names outranks the recorder. Its memory is
-    // claimed from the heaviest run the history kept of a binary of the selection, or the cold
-    // figure until one has a measured peak, then the run's cores ([`claim_both`]); both are held
-    // until the plan's own claims replace them.
+    // The exact-host recording pass compiles what Cargo still finds stale and runs only the small
+    // recorder process in place of each test binary. Conservatively reserve the selection's
+    // heaviest kept peak, or its cold peak, then the run's cores ([`claim_both`]); both are held
+    // until the recorded binaries' plan replaces them.
     let fallback_peak = fallback_peak(
         &history,
         ctx.scope.crates(),
@@ -1667,7 +1858,7 @@ pub fn run_tests(
         label,
         None,
         aterm_capacity::peak_claim(fallback_peak),
-        "for cargo's run of one test binary at a time, from the selection's kept or cold peak",
+        "for the exact-host recording pass, at the selection's kept or cold peak",
         asked_cores,
         crate::admit_live,
     ) {
@@ -1678,7 +1869,7 @@ pub fn run_tests(
         }
     };
     let granted_cores = claims.granted;
-    let one_at_a_time = claims.resources.as_ref();
+    let recording_resources = claims.resources.as_ref();
     let thread_override = (ctx.env.build_slot_held.is_some()
         || ctx.pool.is_some()
         || ctx.test_threads.is_some()
@@ -1702,6 +1893,20 @@ pub fn run_tests(
     serial = crate::release_test_env::command(ctx, crate::stages::with_checkers(serial, checkers))
         .env(SUBPROCESS_SLOTS_ENV, slots.path());
     let serial = &serial;
+    match configured_build_targets(ctx, serial) {
+        Ok(None) => {}
+        Ok(Some(targets)) => {
+            r.cannot_run(format!(
+                "Cargo selects build.target={targets:?}; the native test dispatcher will not \
+                 enter explicit-target mode, so no test binary was run"
+            ));
+            return;
+        }
+        Err(why) => {
+            r.cannot_run(format!("{why}; no test binary was run"));
+            return;
+        }
+    }
     #[cfg(unix)]
     match aterm_uds::host::open_file_room(4096) {
         Ok(room) => {
@@ -1716,44 +1921,39 @@ pub fn run_tests(
         Err(error) => r.raw(format!("  test descriptor room unavailable: {error}")),
     }
     let rerun = crate::findings::Rerun::of(serial, thread_override);
-    let serially = |r: &mut Report, why: &str| {
-        r.raw(format!(
-            "  test binaries: run by cargo, one at a time — {why}"
-        ));
-        let out = {
-            let _held = holding(one_at_a_time);
-            exec::run(serial, ctx.exec_env())
-        };
-        claimed_said(r, one_at_a_time);
-        r.raw(out.output.as_str());
-        decide(ctx, r, &out, label, &rerun);
-    };
     let dir = ctx.scratch.join(format!(
         "test-records.{}.{}",
         std::process::id(),
         RECORDING.fetch_add(1, Ordering::SeqCst)
     ));
     let gate = ctx.test_recorder();
+    let host = match crate::cells::host_triple(ctx) {
+        Ok(host) => host,
+        Err(why) => {
+            r.cannot_run(format!("cannot select the test recording runner: {why}"));
+            return;
+        }
+    };
     let config = match (&gate, std::fs::create_dir_all(&dir)) {
-        (Some(gate), Ok(())) => runner_config(gate, &dir),
+        (Some(gate), Ok(())) => runner_config(gate, &dir, &host),
         _ => None,
     };
     let Some(config) = config else {
         std::fs::remove_dir_all(&dir).ok();
-        serially(r, "verify could not name itself as the recording runner");
+        r.cannot_run("verify could not name itself as the exact-host test recording runner");
         return;
     };
     let began = Instant::now();
     let mut pass = {
-        let _held = holding(one_at_a_time);
-        exec::run(&recording_cmd(serial, &config), ctx.exec_env())
+        let _held = holding(recording_resources);
+        exec::run(&recording_cmd(serial, &config, &host), ctx.exec_env())
     };
     let pass_wall = began.elapsed();
     let records = read_records(&dir);
     std::fs::remove_dir_all(&dir).ok();
 
     if let Err(why) = &records {
-        serially(r, &format!("the recording could not be read: {why}"));
+        r.cannot_run(format!("the test recording could not be read: {why}"));
         return;
     }
     let recorded = records.as_ref().is_ok_and(|v| !v.is_empty());
@@ -1764,22 +1964,17 @@ pub fn run_tests(
     let ran_nothing = !announced(&pass.output).is_empty()
         && !pass.output.lines().any(|l| l.starts_with("test result: "));
     if !recorded && !recorder_failed && ran_nothing {
-        serially(
-            r,
-            "cargo announced test binaries, and neither they nor the recorder left a result",
+        r.cannot_run(
+            "cargo announced test binaries, but the exact-host recording runner left no record; \
+             no test binary was run",
         );
         return;
     }
     if !recorded && !recorder_failed {
-        // The recorder never ran: no test binary at all, or a runner the
-        // caller's cargo config names outranked this one and cargo ran every
-        // binary itself — this pass WAS the serial run.
+        // No test binary was built, so no recorder invocation was expected.
         if !announced(&pass.output).is_empty() {
-            r.raw(
-                "  test binaries: run by cargo, one at a time — the recording runner was not \
-                 used (a runner in the caller's cargo config outranks it)",
-            );
-            claimed_said(r, one_at_a_time);
+            r.cannot_run("cargo announced a test binary but the recording runner did not run");
+            return;
         }
         r.raw(pass.output.as_str());
         decide(ctx, r, &pass, label, &rerun);
@@ -1793,7 +1988,7 @@ pub fn run_tests(
         pass_wall,
     );
     r.raw(format!("  {}", account.line()));
-    eprintln!("{}", account.event());
+    crate::event_log::emit(ctx.events.as_ref(), &account.event());
     let exes = take_recording_executables(&mut pass.output);
     let bins = if pass.ok {
         records
@@ -1808,7 +2003,7 @@ pub fn run_tests(
     let bins = match bins {
         Ok(bins) => bins,
         Err(why) => {
-            serially(r, &why);
+            r.cannot_run(format!("{why}; no test binary was run"));
             return;
         }
     };
@@ -1934,6 +2129,12 @@ enum Probe {
     Unanswered(String),
 }
 
+struct ProbeHung {
+    index: usize,
+    run: Box<Run>,
+    elapsed: Duration,
+}
+
 /// What a binary's run reads of libtest's JSON format, by [`probe_json`]: whether its binaries
 /// may run with it, and why not.
 fn json_ladder(probe: &Probe) -> String {
@@ -1962,7 +2163,11 @@ const PROBE_TRIES: usize = 3;
 /// line, what libtest said in refusing. One that verify could not start or ended
 /// ([`Run::spawn_error`]), that a signal ended, or that ended as the run was ending says nothing
 /// of libtest, so the next is asked; with none left, [`Probe::Unanswered`].
-fn probe_json(ctx: &crate::Ctx, bins: &[Binary]) -> Option<Probe> {
+fn probe_json(
+    ctx: &crate::Ctx,
+    bins: &[Binary],
+    hang_after: Duration,
+) -> Result<Option<Probe>, ProbeHung> {
     let first_line = |run: &Run| -> String {
         run.output
             .lines()
@@ -1974,13 +2179,34 @@ fn probe_json(ctx: &crate::Ctx, bins: &[Binary]) -> Option<Probe> {
             .collect()
     };
     let mut unanswered = None;
-    for b in bins.iter().filter(|b| b.harness).take(PROBE_TRIES) {
+    for (index, b) in bins
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.harness)
+        .take(PROBE_TRIES)
+    {
         let mut argv = vec![b.record.exe().as_os_str().to_owned()];
         argv.extend(JSON_FLAGS.iter().map(OsString::from));
         argv.push("--list".into());
         let mut cmd = Cmd::replayed(&argv, &b.record.cwd, b.record.env.clone());
         cmd.capture = exec::Capture::Emit;
+        cmd.test_cases = Some(exec::CaseWatch {
+            spec: b.spec.clone(),
+            binary: b.record.exe().display().to_string(),
+            json: true,
+            stop_at_red: false,
+            hang_after,
+        });
+        let begun = Instant::now();
         let run = exec::run(&cmd, ctx.exec_env());
+        let elapsed = begun.elapsed();
+        if run.hung.is_some() {
+            return Err(ProbeHung {
+                index,
+                run: Box::new(run),
+                elapsed,
+            });
+        }
         if let Some(why) = &run.spawn_error {
             unanswered = Some(format!("{}: {why}", b.spec));
             continue;
@@ -1994,13 +2220,13 @@ fn probe_json(ctx: &crate::Ctx, bins: &[Binary]) -> Option<Probe> {
                 ev.kind == crate::libtest_json::Kind::Suite && ev.event == "discovery"
             })
         });
-        return Some(if run.ok && discovered {
+        return Ok(Some(if run.ok && discovered {
             Probe::Took
         } else {
             Probe::Refused(first_line(&run))
-        });
+        }));
     }
-    unanswered.map(Probe::Unanswered)
+    Ok(unanswered.map(Probe::Unanswered))
 }
 
 /// Whether `b` may run with libtest's JSON flags: it runs libtest's harness, nothing its record
@@ -2065,6 +2291,18 @@ pub(crate) fn run_planned(
     planned: RunPlan,
     check: crate::checks::Check,
 ) {
+    run_planned_with_probe_window(ctx, r, label, planned, check, exec::TEST_BINARY_HANG);
+}
+
+/// [`run_planned`], with the JSON probe's no-progress window injected for deterministic tests.
+fn run_planned_with_probe_window(
+    ctx: &crate::Ctx,
+    r: &mut Report,
+    label: &str,
+    planned: RunPlan,
+    check: crate::checks::Check,
+    probe_hang_after: Duration,
+) {
     let RunPlan {
         bins,
         history,
@@ -2086,7 +2324,7 @@ pub(crate) fn run_planned(
     };
     let listed = bins.len();
     let Carried {
-        run: bins,
+        run: mut bins,
         carried,
         known,
     } = match &ctx.passed_binaries {
@@ -2130,7 +2368,7 @@ pub(crate) fn run_planned(
             return;
         }
     };
-    let plan = if claims.granted == plan.share {
+    let mut plan = if claims.granted == plan.share {
         plan
     } else {
         plan_from_history(
@@ -2142,11 +2380,9 @@ pub(crate) fn run_planned(
         )
     };
     // A failed test reruns at the width its binary runs at, which the plan sets, not the run's.
-    let rerun = rerun.at_widths(
-        plan.order
-            .iter()
-            .map(|p| (bins[p.index].spec.clone(), p.width)),
-    );
+    // A hung probe can remove a binary and make the remaining plan wider, so keep the common
+    // rerun environment and bind widths only to the plan that actually ran each binary.
+    let rerun_base = rerun;
     let claim = claims.resources.as_ref();
     // The binaries' peaks are kept within the claim, and a claim past what can ever be available
     // here, which runs alone, within what can.
@@ -2154,7 +2390,87 @@ pub(crate) fn run_planned(
         .and(claimed)
         .map(|c| ctx.memory.as_ref().map_or(c, |book| c.min(book.budget())));
     let _held = holding(claim);
-    let probe = probe_json(ctx, &bins);
+    let mut preface = preface;
+    let mut probe_hung_count = 0_usize;
+    let mut probe_samples = Vec::new();
+    let probe = loop {
+        match probe_json(ctx, &bins, probe_hang_after) {
+            Ok(probe) => break probe,
+            Err(hung) => {
+                let ProbeHung {
+                    index,
+                    run,
+                    elapsed,
+                } = hung;
+                let planned = plan
+                    .order
+                    .iter()
+                    .find(|planned| planned.index == index)
+                    .copied()
+                    .expect("every probed binary is in the test plan");
+                let binary = bins.remove(index);
+                let ran = Ran {
+                    run: *run,
+                    planned,
+                    waiting: Duration::ZERO,
+                    execution: elapsed,
+                };
+                let (outcome, event, sample) = binary_event(&binary, &ran, true, None);
+                let red = mark_red_decided(outcome, ctx.halt.armed(), None);
+                emit(ctx, &event);
+                if red {
+                    ctx.halt.red(check.name());
+                }
+                if let Some(sample) = sample {
+                    probe_samples.push((binary.spec.clone(), sample));
+                }
+                r.raw(std::mem::take(&mut preface));
+                r.raw("  test cases: the libtest JSON probe stopped at a hung binary");
+                r.raw(ran.run.output.as_str());
+                let hung_rerun = rerun_base
+                    .clone()
+                    .at_widths([(binary.spec.clone(), planned.width)]);
+                decide_runs(
+                    r,
+                    std::slice::from_ref(&binary),
+                    std::slice::from_ref(&ran.run),
+                    label,
+                    |r, run| decide(ctx, r, run, label, &hung_rerun),
+                );
+                probe_hung_count += 1;
+                if bins.is_empty() {
+                    if let Some(Err(why)) = ctx
+                        .test_history
+                        .as_deref()
+                        .map(|path| crate::test_history::keep(path, probe_samples))
+                    {
+                        r.raw(format!(
+                            "  test binaries' history not kept (planning data only): {why}"
+                        ));
+                    }
+                    claimed_said(r, claim);
+                    return;
+                }
+                plan = plan_from_history(
+                    &history,
+                    &bins,
+                    claims.granted,
+                    ctx.test_threads,
+                    fallback_peak,
+                );
+                if ctx.halt.armed() {
+                    break None;
+                }
+                // A halt-off sweep still owes every peer a run. Probe the remaining harnesses
+                // again: no hung binary is retried, and a later hang still has JSON case names.
+            }
+        }
+    };
+    let rerun = rerun_base.at_widths(
+        plan.order
+            .iter()
+            .map(|planned| (bins[planned.index].spec.clone(), planned.width)),
+    );
     if let Some(probe) = &probe {
         r.raw(json_ladder(probe));
     }
@@ -2175,7 +2491,7 @@ pub(crate) fn run_planned(
     let started = Instant::now();
     let spent = || ceiling.is_some_and(|limit| started.elapsed() >= limit);
     let stop = || spent() || ctx.halted().is_some();
-    let samples = Mutex::new(Vec::with_capacity(bins.len()));
+    let dispatch_samples = Mutex::new(Vec::with_capacity(bins.len()));
     // Hear one binary's end: classify its red before event I/O can hold up the local stop, emit
     // its FAIL before the halt's NOT RUN events, arm that run-wide halt, and keep its sample.
     let ended = |binary: &Binary, ran: &Ran, started: bool, halt: Option<&dyn Fn()>| {
@@ -2187,7 +2503,7 @@ pub(crate) fn run_planned(
             ctx.halt.red(check.name());
         }
         if let Some(sample) = sample {
-            samples
+            dispatch_samples
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push((binary.spec.clone(), sample));
@@ -2200,7 +2516,7 @@ pub(crate) fn run_planned(
         ctx.pool.as_ref(),
         &live,
         &stop,
-        |b, planned| {
+        |b, planned, local_halt| {
             if ctx.halted().is_some() {
                 return None;
             }
@@ -2223,7 +2539,7 @@ pub(crate) fn run_planned(
                 ctx,
                 binary_cmd(b, planned.width, checkers, watch),
             );
-            let mut run = exec::run(&cmd, env);
+            let mut run = exec::run_test(&cmd, env, local_halt);
             if cmd.test_cases.as_ref().is_some_and(|w| w.json) {
                 // The raw events were the child's log; every reader takes libtest's report.
                 run.output = crate::libtest_json::render(&run.output, run.stopped_at.as_ref());
@@ -2246,6 +2562,7 @@ pub(crate) fn run_planned(
             }
             let run = match (ctx.halted(), ceiling) {
                 (Some(words), _) => Run {
+                    case_observations: None,
                     ok: false,
                     output: String::new(),
                     code: None,
@@ -2266,7 +2583,12 @@ pub(crate) fn run_planned(
             Some(left)
         })
         .collect();
-    let samples = samples.into_inner().unwrap_or_else(PoisonError::into_inner);
+    let mut samples = probe_samples;
+    samples.extend(
+        dispatch_samples
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner),
+    );
     let kept = ctx
         .test_history
         .as_deref()
@@ -2289,7 +2611,7 @@ pub(crate) fn run_planned(
                 "  test binaries: {} of {listed} carried (each passed before in this tree, its \
                  executable unchanged); {} run",
                 carried.len(),
-                bins.len()
+                bins.len() + probe_hung_count
             ));
         }
         if ctx.release {
@@ -2401,10 +2723,12 @@ pub(crate) fn dispatch_each<T: Send>(n: usize, run: impl Fn(usize) -> T + Sync) 
         None,
         &|| 0.0,
         &|| false,
-        |_, p| {
+        |_, p, _| {
             *out[p.index].lock().unwrap_or_else(PoisonError::into_inner) = Some(run(p.index));
             Some(Run {
+                case_observations: None,
                 stopped_at: None,
+                hung: None,
                 ok: true,
                 output: String::new(),
                 code: Some(0),
@@ -2423,7 +2747,9 @@ pub(crate) fn dispatch_each<T: Send>(n: usize, run: impl Fn(usize) -> T + Sync) 
 /// a FAIL, never a pass.
 fn never_run() -> Run {
     Run {
+        case_observations: None,
         stopped_at: None,
+        hung: None,
         ok: false,
         output: "aterm-verify: this test binary was never run (a gate defect)\n".into(),
         code: None,
@@ -2441,6 +2767,10 @@ mod environment_tests;
 #[cfg(test)]
 #[path = "testrun_discovery_tests.rs"]
 mod discovery_tests;
+
+#[cfg(all(test, unix))]
+#[path = "testrun_probe_hang_tests.rs"]
+mod probe_hang_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2608,13 +2938,13 @@ mod tests {
             assert!(plan_claim(&plan).is_some(), "{plan:?}");
             assert!(
                 aterm_capacity::peak_claim(fallback) > 0,
-                "cargo's serial fallback claim is positive"
+                "an unseen binary's fallback peak is positive"
             );
         }
     }
 
-    /// A TEST RUN CLAIMS MEMORY BEFORE CORES, every time: cargo's one-at-a-time memory and then
-    /// its cores, and the plan's memory only once those went back, then its cores again; so it
+    /// A TEST RUN CLAIMS MEMORY BEFORE CORES, every time: the recording pass's memory and then its
+    /// cores, and the plan's memory only once those went back, then its cores again; so it
     /// never waits for memory while it holds cores, as a run that holds memory may wait for cores.
     /// NEGATIVE CONTROL: claims taken while the plan's are still held ask for memory beside held
     /// cores, and the admitter sees it.
@@ -2798,93 +3128,145 @@ mod tests {
         );
     }
 
-    /// A release holds its run to the golden test on the path cargo runs the binaries on, when the
-    /// recording left nothing: the serial fallback. CONTROL: the name that test really has passes,
-    /// and a run that is no release asks nothing of it.
+    /// Cargo itself resolves the effective target before the recorder is installed: the
+    /// environment, `CARGO_HOME`, command-local config and an explicit `--target` all refuse the
+    /// native dispatcher. Diagnostic stderr is not parsed as machine JSON, and no ordinary targo
+    /// command runs. NEGATIVE CONTROL: with none of those selections, Cargo's exact "not set"
+    /// answer is the native default.
     #[cfg(unix)]
     #[test]
-    fn a_release_refuses_a_serial_run_that_never_reached_the_golden_test() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let row_of = |test: &str, as_run: fn(crate::Ctx) -> crate::Ctx| {
-            let tmp = aterm_tempfile::tempdir().expect("scratch");
-            let targo = tmp.path().join("targo");
-            std::fs::write(
-                &targo,
-                format!(
-                    "#!/bin/sh\n\
-                     if [ \"$1\" = --config ]; then\n\
-                     printf '     Running unittests src/lib.rs (target/debug/deps/aterm_gpu-1)\\n'\n\
-                     exit 0\n\
-                     fi\n\
-                     printf 'running 1 test\\ntest {test} ... ok\\n\\n'\n\
-                     printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 \
-                     filtered out; finished in 0.00s\\n'\n"
-                ),
-            )
-            .expect("the stand-in");
-            std::fs::set_permissions(&targo, std::fs::Permissions::from_mode(0o755))
-                .expect("executable");
-            let ctx = as_run(crate::Ctx::new(
-                tmp.path().to_path_buf(),
-                crate::Scope::workspace(),
-                crate::EnvSnapshot::default(),
-                tmp.path().to_path_buf(),
-            ));
-            let mut report = Report::new("the test run");
-            run_tests(
+    fn every_effective_cargo_target_refuses_before_test_dispatch() {
+        let tmp = aterm_tempfile::tempdir().expect("scratch");
+        let targo = tmp.path().join("targo");
+        let dispatched = tmp.path().join("dispatched");
+        crate::standin_body(
+            &targo,
+            r#"case "$*" in
+  *"config get build.target"*)
+    echo 'targo: diagnostic belongs on stderr' >&2
+    if [ -n "$CARGO_BUILD_TARGET" ]; then
+      printf '{"build":{"target":"%s"}}\n' "$CARGO_BUILD_TARGET"
+    elif [ -f "$CARGO_HOME/config.toml" ]; then
+      printf '{"build":{"target":"home-target"}}\n'
+    else
+      case "$*" in
+        *command-target*) printf '{"build":{"target":"command-target"}}\n' ;;
+        *) echo 'error: config value `build.target` is not set' >&2; exit 101 ;;
+      esac
+    fi
+    exit 0 ;;
+esac
+printf ran > "$TARGET_DISPATCHED"
+exit 0"#,
+        );
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir(&scratch).expect("verifier scratch");
+        let ctx = crate::Ctx::new(
+            tmp.path().to_path_buf(),
+            crate::Scope::workspace(),
+            crate::EnvSnapshot::default(),
+            scratch,
+        );
+        let targets = |cmd: Cmd| {
+            configured_build_targets(
                 &ctx,
-                &mut report,
-                "fixture",
-                &Cmd::new(&targo),
-                crate::checks::Check::Test,
-            );
-            let raw: Vec<_> = report.entries.iter().map(|e| format!("{e:?}")).collect();
-            assert!(
-                raw.iter()
-                    .any(|e| e.contains("run by cargo, one at a time")),
-                "the fixture took the serial path: {raw:?}"
-            );
-            let mut rows = report.entries.iter().filter_map(|entry| match entry {
-                crate::ladder::Entry::Ladder { outcome, label, .. } => {
-                    Some((*outcome, label.clone()))
-                }
-                _ => None,
-            });
-            let row = rows.next().expect("a row");
-            assert!(rows.next().is_none(), "{raw:?}");
-            row
-        };
-        let row = |test: &str, release: bool| {
-            row_of(
-                test,
-                if release {
-                    |c| c.with_release(true)
-                } else {
-                    |c| c
-                },
+                &cmd.remove_env("CARGO_HOME")
+                    .remove_env("CARGO_BUILD_TARGET")
+                    .env("TARGET_DISPATCHED", dispatched.as_os_str()),
             )
         };
-        let golden = crate::checks::GOLDEN.1;
-        let renamed = "frame_record_tests::renamed";
-        let (refused, label) = row(renamed, true);
+
+        assert_eq!(targets(Cmd::new(&targo)), Ok(None));
         assert_eq!(
-            refused,
-            crate::ladder::Outcome::Fail(crate::ladder::Severity::CouldNotRun),
-            "{label}"
+            targets(Cmd::new(&targo).env("CARGO_BUILD_TARGET", "env-target")),
+            Ok(Some(vec!["env-target".to_owned()]))
+        );
+        let cargo_home = tmp.path().join("cargo-home");
+        std::fs::create_dir(&cargo_home).expect("CARGO_HOME");
+        std::fs::write(
+            cargo_home.join("config.toml"),
+            "[build]\ntarget = \"home-target\"\n",
+        )
+        .expect("target config");
+        assert_eq!(
+            targets(Cmd::new(&targo).env("CARGO_HOME", &cargo_home)),
+            Ok(Some(vec!["home-target".to_owned()]))
+        );
+        assert_eq!(
+            targets(Cmd::new(&targo).args([
+                "--unverified",
+                "test",
+                "--config",
+                "build.target=\"command-target\"",
+                "--tests",
+            ])),
+            Ok(Some(vec!["command-target".to_owned()]))
+        );
+        assert_eq!(
+            targets(Cmd::new(&targo).args(["--unverified", "test", "--target=cli-target"])),
+            Ok(Some(vec!["cli-target".to_owned()]))
         );
         assert!(
-            label.contains(golden) && label.contains("did not run"),
-            "{label}"
+            !dispatched.exists(),
+            "only the target query may run before refusal"
         );
-        assert_eq!(
-            row(&format!("renderer::{golden}"), true).0,
-            crate::ladder::Outcome::Ok
+    }
+
+    /// Cargo announcing a binary without invoking the exact-host recorder refuses the run. It is
+    /// never retried through Cargo, because that path would execute an un-watched test binary.
+    /// NEGATIVE CONTROL: the stand-in exits successfully, so treating Cargo's status alone as a
+    /// pass would fail this test.
+    #[cfg(unix)]
+    #[test]
+    fn an_announced_binary_that_bypasses_the_recorder_is_not_run_again() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = aterm_tempfile::tempdir().expect("scratch");
+        let targo = tmp.path().join("targo");
+        crate::standin_body(
+            &tmp.path().join("trustc"),
+            "printf 'rustc 1.93.0 (trust)\\nbinary: rustc\\nhost: aarch64-apple-darwin\\nrelease: \
+             1\\n'",
         );
-        assert_eq!(row(renamed, false).0, crate::ladder::Outcome::Ok);
-        assert_eq!(
-            row_of(renamed, |c| c.with_checkers_in_tests(true)).0,
-            crate::ladder::Outcome::Fail(crate::ladder::Severity::CouldNotRun),
-            "the command a release's red row prints refuses what the release did"
+        std::fs::write(
+            &targo,
+            "#!/bin/sh\ncase \"$*\" in\n  *config*get*build.target*)\n    echo 'error: \
+             config value `build.target` is not set' >&2\n    exit 101 ;;\nesac\nprintf '     \
+             Running unittests src/lib.rs \
+             (target/debug/deps/aterm_gpu-1)\\n'\nexit 0\n",
+        )
+        .expect("the stand-in");
+        std::fs::set_permissions(&targo, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        let mut ctx = crate::Ctx::new(
+            tmp.path().to_path_buf(),
+            crate::Scope::workspace(),
+            crate::EnvSnapshot::default(),
+            tmp.path().to_path_buf(),
+        );
+        ctx.tools.stage2_dir = tmp.path().to_path_buf();
+        let mut report = Report::new("the test run");
+        run_tests(
+            &ctx,
+            &mut report,
+            "fixture",
+            &Cmd::new(&targo),
+            crate::checks::Check::Test,
+        );
+        let rows: Vec<_> = report
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                crate::ladder::Entry::Ladder { outcome, label, .. } => {
+                    Some((*outcome, label.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(rows.as_slice(), [(crate::ladder::Outcome::Fail(
+                crate::ladder::Severity::CouldNotRun
+            ), label)] if label.contains("recording runner left no record")),
+            "{rows:?}"
         );
     }
 
@@ -2930,7 +3312,7 @@ mod tests {
             None,
             &|| 0.0,
             &|| false,
-            |binary, _| {
+            |binary, _, _| {
                 if binary.spec == "slow" {
                     let (guard, timeout) = released
                         .1
@@ -2946,7 +3328,9 @@ mod tests {
                     );
                 }
                 let run = Run {
+                    case_observations: None,
                     stopped_at: None,
+                    hung: None,
                     ok: binary.spec == "slow",
                     output: String::new(),
                     code: Some(i32::from(binary.spec != "slow")),
@@ -2977,7 +3361,9 @@ mod tests {
             record: rec("/r/test", "test"),
         };
         let mut run = Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok: true,
             output: "test counterfeit ... FAILED".into(),
             code: Some(0),
@@ -2998,6 +3384,94 @@ mod tests {
         run.ok = false;
         run.spawn_error = Some("test executable unavailable".into());
         assert_eq!(parse(&run)["outcome"].as_str(), Some("NOT RUN"));
+    }
+
+    /// A proven hang is a bounded structured FAIL, even when the sampler's error contains the
+    /// full-disk sentence that ordinarily makes a child NOT RUN. Its first-red decision invokes
+    /// the local halt once. NEGATIVE CONTROL: removing the structured hang restores the
+    /// environmental classification.
+    #[test]
+    fn a_hung_binary_is_a_bounded_named_gate_failure() {
+        let binary = Binary {
+            harness: true,
+            header: "test".into(),
+            spec: "-p test --lib".into(),
+            record: rec("/r/test", "test"),
+        };
+        let running = (0..HUNG_CASES_SHOWN + 5)
+            .map(|index| format!("case-{index}-{}", "x".repeat(1024)))
+            .collect();
+        let run = Run {
+            case_observations: None,
+            stopped_at: None,
+            hung: Some(crate::exec::Hung {
+                spec: binary.spec.clone(),
+                binary: format!("/r/{}", "binary".repeat(200)),
+                running,
+                window: Duration::from_secs(180),
+                sample: crate::exec::StackSample {
+                    report: Some(PathBuf::from("/private/hung.partial.sample.txt")),
+                    error: Some(format!(
+                        "{} while sampling: {}",
+                        crate::exec::ENOSPC_SENTENCE,
+                        "detail".repeat(2_000)
+                    )),
+                },
+                json: true,
+            }),
+            ok: false,
+            output: format!("{} (os error 28)\n", crate::exec::ENOSPC_SENTENCE),
+            code: None,
+            spawn_error: None,
+            usage: None,
+        };
+        assert_eq!(run.environment_failure(), None);
+        let all = combined(std::slice::from_ref(&binary), std::slice::from_ref(&run));
+        assert!(all.hung.is_some() && all.environment_failure().is_none());
+        let (outcome, line, _) = binary_event(
+            &binary,
+            &Ran::of(run.clone(), Duration::ZERO, Duration::ZERO),
+            true,
+            None,
+        );
+        assert_eq!(outcome, Outcome::Fail(Severity::GateFailed));
+        assert!(
+            line.len() < 64 * 1024,
+            "one atomic event line: {} bytes",
+            line.len()
+        );
+        let event: aterm_json::Value =
+            aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap();
+        assert_eq!(event["outcome"].as_str(), Some("FAIL"));
+        assert_eq!(event["hung"].as_bool(), Some(true));
+        assert_eq!(event["hang_window_s"].as_f64(), Some(180.0));
+        assert_eq!(
+            event["hung_cases"].as_array().unwrap().len(),
+            HUNG_CASES_SHOWN
+        );
+        assert_eq!(event["hung_cases_omitted"].as_u64(), Some(5));
+        assert_eq!(
+            event["stack_sample"].as_str(),
+            Some("/private/hung.partial.sample.txt")
+        );
+        assert!(
+            event["stack_sample_error"]
+                .as_str()
+                .is_some_and(|error| error.contains(crate::exec::ENOSPC_SENTENCE))
+        );
+        let halts = AtomicUsize::new(0);
+        assert!(mark_red_decided(
+            outcome,
+            true,
+            Some(&|| {
+                halts.fetch_add(1, Ordering::SeqCst);
+            })
+        ));
+        assert_eq!(halts.load(Ordering::SeqCst), 1);
+
+        let mut control = run;
+        control.hung = None;
+        assert!(control.environment_failure().is_some());
     }
 
     fn rec(exe: &str, pkg: &str) -> Record {
@@ -3139,8 +3613,13 @@ mod tests {
             },
         };
         let event = carried_event(&binary, &"aa".repeat(32));
+        let initial = std::fs::read_to_string(&at).unwrap();
+        let prepared = ctx.events.as_ref().unwrap().prepare(&event);
         emit(&ctx, &event);
-        assert_eq!(std::fs::read_to_string(&at).unwrap(), format!("{event}\n"));
+        assert_eq!(
+            std::fs::read_to_string(&at).unwrap(),
+            format!("{initial}{prepared}")
+        );
     }
 
     /// A RECORD IS THE PROCESS, BYTE FOR BYTE: every argument and variable
@@ -3228,11 +3707,21 @@ mod tests {
     #[test]
     fn the_runner_config_is_a_toml_array_so_no_path_splits() {
         assert_eq!(
-            runner_config(Path::new("/a b/aterm-verify"), Path::new("/tmp/q\"d")).as_deref(),
+            runner_config(
+                Path::new("/a b/aterm-verify"),
+                Path::new("/tmp/q\"d"),
+                "aarch64-apple-darwin",
+            )
+            .as_deref(),
             Some(
-                "target.'cfg(all())'.runner=[\"/a b/aterm-verify\",\"--record-test-binary\",\
+                "target.aarch64-apple-darwin.runner=[\"/a b/aterm-verify\",\"--record-test-binary\",\
                  \"/tmp/q\\\"d\"]"
             )
+        );
+        assert_eq!(
+            runner_config(Path::new("/gate"), Path::new("/tmp/r"), "bad target"),
+            None,
+            "an invalid target cannot broaden the runner to another target"
         );
         let serial = Cmd::new("targo").args([
             "--config",
@@ -3245,7 +3734,7 @@ mod tests {
             "x",
         ]);
         assert_eq!(
-            recording_cmd(&serial, "CFG").argv(),
+            recording_cmd(&serial, "CFG", "aarch64-apple-darwin").argv(),
             [
                 "targo",
                 "--config",
@@ -3263,6 +3752,9 @@ mod tests {
             "the runner before the subcommand, beside the build cache's --config (one after \
              it would replace the cache's); libtest's arguments untouched"
         );
+        let removed = &recording_cmd(&serial, "CFG", "aarch64-apple-darwin").remove_envs;
+        assert!(removed.contains(&OsString::from("CARGO_BUILD_TARGET")));
+        assert!(removed.contains(&OsString::from("CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER")));
     }
 
     #[test]
@@ -3277,7 +3769,7 @@ mod tests {
             "--skip",
             "x",
         ]);
-        let command = recording_cmd(&serial, "RUNNER");
+        let command = recording_cmd(&serial, "RUNNER", "aarch64-apple-darwin");
         let args = command.argv();
         assert_eq!(
             &args[1..7],
@@ -3499,7 +3991,7 @@ mod tests {
             None,
             &|| 0.0,
             &|| false,
-            |b, planned| {
+            |b, planned, _| {
                 {
                     let mut held = held.lock().unwrap();
                     held.0 += planned.charge;
@@ -3524,7 +4016,9 @@ mod tests {
                 }
                 held.lock().unwrap().0 -= planned.charge;
                 let run = Run {
+                    case_observations: None,
                     stopped_at: None,
+                    hung: None,
                     ok: true,
                     output: format!("{}\nran {} at {}\n", b.header, b.spec, planned.width),
                     code: Some(0),
@@ -3586,10 +4080,12 @@ mod tests {
                         None,
                         &|| 0.0,
                         &|| false,
-                        |b, _| {
+                        |b, _, _| {
                             assert!(!(panics && b.spec == "t0"), "a gate defect");
                             Some(Run {
+                                case_observations: None,
                                 stopped_at: None,
+                                hung: None,
                                 ok: true,
                                 output: String::new(),
                                 code: Some(0),
@@ -3623,7 +4119,9 @@ mod tests {
         let ran = |charge: u32, waiting: u64, execution: u64, cpu: u64| {
             let mut ran = Ran::of(
                 Run {
+                    case_observations: None,
                     stopped_at: None,
+                    hung: None,
                     ok: true,
                     output: String::new(),
                     code: Some(0),
@@ -3686,7 +4184,9 @@ mod tests {
         let done = AtomicUsize::new(0);
         let ok = || {
             Some(Run {
+                case_observations: None,
                 stopped_at: None,
+                hung: None,
                 ok: true,
                 output: String::new(),
                 code: Some(0),
@@ -3701,7 +4201,7 @@ mod tests {
             None,
             &|| 0.0,
             &spent,
-            |_, _| ok(),
+            |_, _, _| ok(),
             |_, _, _| {
                 done.fetch_add(1, Ordering::SeqCst);
             },
@@ -3716,7 +4216,7 @@ mod tests {
             None,
             &|| 0.0,
             &|| false,
-            |_, p| if p.index == 1 { None } else { ok() },
+            |_, p, _| if p.index == 1 { None } else { ok() },
             |_, _, _| {},
         );
         assert_eq!(
@@ -3730,7 +4230,7 @@ mod tests {
             None,
             &|| 0.0,
             &|| false,
-            |_, _| ok(),
+            |_, _, _| ok(),
             |_, _, _| {},
         );
         assert!(all.iter().all(Option::is_some));
@@ -3789,7 +4289,7 @@ mod tests {
             Some(&pool),
             &|| 0.0,
             &|| false,
-            |_, _| {
+            |_, _, _| {
                 let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                 most.fetch_max(now, Ordering::SeqCst);
                 assert!(
@@ -3798,6 +4298,7 @@ mod tests {
                 );
                 running.fetch_sub(1, Ordering::SeqCst);
                 Some(Run {
+                    case_observations: None,
                     ok: true,
                     code: Some(0),
                     ..Run::default()
@@ -3859,7 +4360,7 @@ mod tests {
                 Some(&pool),
                 &live,
                 &|| stopped.load(Ordering::SeqCst),
-                |_, _| {
+                |_, _, _| {
                     started.fetch_add(1, Ordering::SeqCst);
                     Some(Run::default())
                 },
@@ -3955,7 +4456,9 @@ mod tests {
             })
             .collect();
         let pass = |b: &Binary| Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok: true,
             output: format!(
                 "{}\n\nrunning 1 test\ntest ok_one ... ok\n\ntest result: ok. 1 passed; 0 \
@@ -3967,7 +4470,9 @@ mod tests {
             usage: None,
         };
         let fail = |b: &Binary| Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok: false,
             output: format!(
                 "{}\n\nrunning 1 test\ntest t::broke ... FAILED\n\nfailures:\n\n\
@@ -4017,7 +4522,9 @@ mod tests {
         assert!(a < b && b < c, "declared order");
 
         let crashed = Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok: false,
             output: format!("{}\n\nrunning 1 test\n", bins[1].header),
             code: None,
@@ -4037,7 +4544,9 @@ mod tests {
 
         let sentinel = crate::libtest::COULD_NOT_RUN_SENTINEL;
         let refused = Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok: false,
             output: fail(&bins[1])
                 .output
@@ -4119,7 +4628,9 @@ mod tests {
             })
             .collect();
         let pass = |b: &Binary| Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok: true,
             output: format!(
                 "{}\n\nrunning 1 test\ntest ok_one ... ok\n\ntest result: ok. 1 passed; 0 \
@@ -4131,7 +4642,9 @@ mod tests {
             usage: None,
         };
         let fail = |b: &Binary| Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok: false,
             output: format!(
                 "{}\n\nrunning 1 test\ntest t::broke ... FAILED\n\nfailures:\n\n\
@@ -4146,7 +4659,9 @@ mod tests {
         };
         let why = "the run was interrupted before this child started";
         let unrun = |b: &Binary| Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok: false,
             output: format!("{}\naterm-verify: cannot run {}: {why}", b.header, b.spec),
             code: None,
@@ -4180,7 +4695,9 @@ mod tests {
         );
 
         let crashed = Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok: false,
             output: format!("{}\n\nrunning 1 test\n", bins[1].header),
             code: None,
@@ -4334,8 +4851,10 @@ mod tests {
             json.test_cases,
             Some(crate::exec::CaseWatch {
                 spec: "-p x --test a".into(),
+                binary: "/r/target/debug/deps/a-1".into(),
                 json: true,
-                stop_at_red: true
+                stop_at_red: true,
+                hang_after: crate::exec::TEST_BINARY_HANG,
             })
         );
         b.harness = false;

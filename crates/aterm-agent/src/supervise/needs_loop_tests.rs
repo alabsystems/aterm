@@ -641,6 +641,9 @@ impl IdleHost for Hears {
             .unwrap_or_else(PoisonError::into_inner)
             .push((needs.to_vec(), entry.to_string()));
     }
+    fn needs_told(&self) -> Option<(Vec<String>, String)> {
+        self.told().pop().filter(|(needs, _)| !needs.is_empty())
+    }
     fn account_execution_hold(&self) -> Option<Instant> {
         let check = self
             .checks
@@ -1103,6 +1106,222 @@ fn ordinary_metadata_handover_keeps_the_prior_host_need_on_replacement() {
         before,
         "an observed handover preserves the last projection"
     );
+}
+
+/// What the loop before a handover did at turn A's point, after telling the window its need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Before {
+    /// It decided the point's act and was handed over before typing it.
+    Decided,
+    /// It typed the act, the need's ack in it, and its books hold the row.
+    Typed,
+}
+
+/// Claude Code's `screen` with the prompt its turn answers drawn above its first message.
+fn answering(prompt: &str, mut screen: Vec<String>) -> Vec<String> {
+    let head = screen
+        .iter()
+        .position(|r| r.starts_with('⏺'))
+        .expect("the turn's first message");
+    screen.splice(head..head, [format!("❯ {prompt}"), String::new()]);
+    screen
+}
+
+/// A handover's two loops over one worker and one set of books: the loop before reads turn A,
+/// whose need goes up and is told to the window's `host`, does what `before` says and is handed
+/// over; the loop after seeds from the books and starts at `screen` (turn B) beside the entry it
+/// left, `forgot` where the window heard the take-down since. What the loop after wrote of the
+/// needs entry, the entry standing, the `CLEARED` needs lines it noted and what it decided at its
+/// first point.
+fn needs_after_handover(
+    host: &Arc<Hears>,
+    screen: Vec<String>,
+    forgot: bool,
+    before: Before,
+) -> (Vec<String>, Option<String>, Vec<String>, TurnEndAction) {
+    let books = crate::supervise::ScratchDir::new("needs-handover", "books");
+    let ledger = books.join("s-1.jsonl");
+    let sid = || Some("@s-1".to_string());
+    let mut m = Mock::new(vec![screen]);
+    m.autopilot = Some("cruise");
+    let opts = SuperviseOpts {
+        policy: owners_policy(),
+        ..auto(30)
+    };
+    let mut notes = Notes::default();
+    {
+        let mut s = session(&mut m, sid());
+        s.set_clock(TEST_NOW, PDT);
+        s.set_zone_lookup(test_zones);
+        s.stall_host = Some(Arc::clone(host) as Arc<dyn IdleHost>);
+        s.set_approval_ledger(Some(ledger.clone()));
+        s.ledger =
+            crate::supervise::approvals::Ledger::open(Some(&ledger), Some("@s-1"), &mut Vec::new());
+        let screen = Screen {
+            seq: 101,
+            rows: needing("Carrying on with the permitted work."),
+            ..s.screen().expect("the point")
+        };
+        let point = s.turn_of(screen);
+        let act = s
+            .turn_end_at_point(&point, Some(Duration::from_secs(720)), &opts)
+            .expect("decided");
+        s.sync_needs(&point.screen, &opts, &mut notes).expect("set");
+        if before == Before::Typed {
+            assert!(typed_ack(&act), "turn A's act carries the ack: {act:?}");
+            s.last = Some(point.screen.clone());
+            s.turn_end_execute(&point, act, &opts, &[], &mut notes)
+                .expect("typed");
+        }
+        s.set_handover(Arc::new(AtomicBool::new(true)));
+    }
+    if forgot {
+        host.needs_standing(&[], "");
+    }
+    let calls_before = m.needs_calls.len();
+    let mut notes = Notes::default();
+    let act;
+    {
+        let mut s = session(&mut m, sid());
+        s.set_clock(TEST_NOW, PDT);
+        s.set_zone_lookup(test_zones);
+        s.stall_host = Some(Arc::clone(host) as Arc<dyn IdleHost>);
+        s.set_approval_ledger(Some(ledger.clone()));
+        let _ = s.seed_from_ledger(&ledger, TEST_NOW * 1000, false);
+        s.reconcile(&mut notes).expect("the loop's start");
+        let screen = s.screen().expect("the point");
+        let point = s.turn_of(screen);
+        act = s
+            .turn_end_at_point(&point, Some(Duration::from_secs(720)), &opts)
+            .expect("decided");
+        for _ in 0..2 {
+            s.task_edge(&point.screen, &opts, &mut notes)
+                .expect("the point's edge");
+        }
+    }
+    let cleared = notes
+        .noted
+        .iter()
+        .filter(|l| l.starts_with("CLEARED ") && l.contains(&format!(" {CLEARED_NEEDS} ")))
+        .cloned()
+        .collect();
+    (
+        m.needs_calls[calls_before..].to_vec(),
+        m.needs_attention.clone(),
+        cleared,
+        act,
+    )
+}
+
+fn typed_ack(act: &TurnEndAction) -> bool {
+    matches!(act, TurnEndAction::Type { text, .. }
+        if text.contains(crate::supervise::policy::needs::NEEDS_ACK))
+}
+
+#[test]
+fn a_handover_keeps_a_standing_need_and_types_no_second_ack() {
+    let entry = left_entry();
+    let told = || vec![(vec![NEED.to_string()], left_entry())];
+    let plain = || said(&["Pushed the parser fix; the release is next."]);
+    let host = Arc::new(Hears::default());
+    let (calls, standing, cleared, act) =
+        needs_after_handover(&host, plain(), false, Before::Typed);
+    assert!(calls.is_empty(), "no take-down, no second set: {calls:#?}");
+    assert_eq!(standing.as_deref(), Some(entry.as_str()));
+    assert!(cleared.is_empty(), "{cleared:#?}");
+    assert!(!typed_ack(&act), "{act:?}");
+    assert_eq!(
+        host.told(),
+        told(),
+        "the window still holds the set, told once"
+    );
+    // The need on screen again, read by the loop after: no second ack, no second set.
+    let host = Arc::new(Hears::default());
+    let (calls, standing, cleared, act) = needs_after_handover(
+        &host,
+        needing("Pushed the parser fix."),
+        false,
+        Before::Typed,
+    );
+    assert!(calls.is_empty(), "{calls:#?}");
+    assert_eq!(standing.as_deref(), Some(entry.as_str()));
+    assert!(cleared.is_empty(), "{cleared:#?}");
+    assert!(!typed_ack(&act), "the ack went with turn A: {act:?}");
+    assert_eq!(host.told(), told());
+    // The worker's own `NEEDS YOU: nothing` still takes the adopted set down.
+    let host = Arc::new(Hears::default());
+    let (calls, standing, cleared, _) = needs_after_handover(
+        &host,
+        said(&["Shipped the docs.", "NEEDS YOU: nothing"]),
+        false,
+        Before::Typed,
+    );
+    assert_eq!(calls, ["unset attention owner=needs"]);
+    assert_eq!(standing, None);
+    assert_eq!(cleared.len(), 1, "{cleared:#?}");
+    assert!(cleared[0].ends_with("none stands now"), "{cleared:#?}");
+    assert_eq!(host.told().last(), Some(&(Vec::new(), String::new())));
+    // A window that heard the take-down last holds no set: the entry left comes down.
+    let host = Arc::new(Hears::default());
+    let (calls, standing, cleared, _) = needs_after_handover(&host, plain(), true, Before::Typed);
+    assert_eq!(calls, ["unset attention owner=needs"]);
+    assert_eq!(standing, None);
+    assert_eq!(cleared.len(), 1, "{cleared:#?}");
+    assert!(
+        cleared[0].ends_with("no need stands at the loop's start"),
+        "{cleared:#?}"
+    );
+}
+
+/// THE TURN ON THE ACT THE LOOP BEFORE TYPED IS NO ONE ELSE'S: Claude Code draws that act's
+/// prompt (`❯ keep going …`) over turn B, which a loop that never typed it reads as answered
+/// anew, but the books name the act, so the adopted set stands.
+/// NEGATIVE CONTROL: the same turn with no act on the books (the loop before only decided) is a
+/// prompt someone else typed, which answers what stood: the set comes down.
+#[test]
+fn the_turn_on_the_act_a_handed_over_loop_typed_keeps_the_adopted_need() {
+    let turn = || {
+        answering(
+            "keep going",
+            said(&["Pushed the parser fix; the release is next."]),
+        )
+    };
+    let host = Arc::new(Hears::default());
+    let (calls, standing, cleared, _) = needs_after_handover(&host, turn(), false, Before::Typed);
+    assert!(calls.is_empty(), "the act's own turn: {calls:#?}");
+    assert_eq!(standing, Some(left_entry()));
+    assert!(cleared.is_empty(), "{cleared:#?}");
+    let host = Arc::new(Hears::default());
+    let (calls, standing, cleared, _) = needs_after_handover(&host, turn(), false, Before::Decided);
+    assert_eq!(
+        calls,
+        ["unset attention owner=needs"],
+        "someone else's turn"
+    );
+    assert_eq!(standing, None);
+    assert_eq!(cleared.len(), 1, "{cleared:#?}");
+    assert!(cleared[0].ends_with("none stands now"), "{cleared:#?}");
+}
+
+/// THE ACK A HANDED-OVER LOOP NEVER TYPED IS STILL OWED: the window holds the set it was told,
+/// which says nothing of the ack, so the loop after types the ack where the books show none went
+/// out with an act.
+/// NEGATIVE CONTROL: the act the loop before typed carried it, so none is typed again
+/// ([`a_handover_keeps_a_standing_need_and_types_no_second_ack`]).
+#[test]
+fn an_ack_the_loop_before_never_typed_goes_with_the_next_act() {
+    for screen in [
+        said(&["Pushed the parser fix; the release is next."]),
+        needing("Pushed the parser fix."),
+    ] {
+        let host = Arc::new(Hears::default());
+        let (calls, standing, cleared, act) =
+            needs_after_handover(&host, screen, false, Before::Decided);
+        assert!(calls.is_empty(), "the set stands as told: {calls:#?}");
+        assert_eq!(standing, Some(left_entry()));
+        assert!(cleared.is_empty(), "{cleared:#?}");
+        assert!(typed_ack(&act), "the ack owed goes out: {act:?}");
+    }
 }
 
 fn fresh_global_needs(global: Autopilot) {

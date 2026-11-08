@@ -598,7 +598,7 @@ fn what_is_built_is_what_was_signed() {
     );
     let (o, _) = ok(w.run(false));
     assert!(
-        matches!(&row(&o, "ay").decision, Decision::Unresolved(why) if why.contains("has no ay row whose release_rev is the signed commit")),
+        matches!(&row(&o, "ay").decision, Decision::Unresolved(why) if why.contains("has no live ay row whose release_rev is the signed commit")),
         "{:?}",
         row(&o, "ay").decision
     );

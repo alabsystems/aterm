@@ -2723,6 +2723,16 @@ pub fn uncaught_invariants(m: &Model) -> Vec<&'static str> {
         .collect()
 }
 
+// A successful check has exhausted the space, so its action coverage is complete.
+// A failure stops at the first law: retain the exhaustive diagnostic and coverage
+// walks in that case, including actions reachable only beyond a broken state.
+fn committed_report(m: &Model) -> (BTreeSet<&'static str>, BTreeSet<&'static str>) {
+    match interp::bmc_fired(m) {
+        (Ok(_), fired) => (BTreeSet::new(), fired),
+        (Err(_), _) => (interp::violated_invariants(m), interp::fired_actions(m)),
+    }
+}
+
 /// What the non-vacuity sweep finds wrong with one model, one line per fault, over every configuration it declares.
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
@@ -2747,8 +2757,12 @@ pub fn sweep_faults(configs: &[Model]) -> Vec<String> {
     if m.is_function_valued() {
         return faults;
     }
+    let mut dead: BTreeSet<_> = m.actions.iter().map(|action| action.name).collect();
     for (i, config) in configs.iter().enumerate() {
-        for law in interp::violated_invariants(&interp::with_buggy(config, 0)) {
+        let committed = interp::with_buggy(config, 0);
+        let (laws, fired) = committed_report(&committed);
+        dead.retain(|action| !fired.contains(action));
+        for law in laws {
             faults.push(format!(
                 "{}::{law}: broken with no mutant on, {}",
                 m.name,
@@ -2763,7 +2777,7 @@ pub fn sweep_faults(configs: &[Model]) -> Vec<String> {
     let mutants = mutants_of(configs);
     // One walk of each mutant answers both questions asked of it below: the laws it breaks and,
     // where the audit will read them, whether each dead action is a violation step.
-    let dead = committed_dead(configs);
+    let dead: Vec<_> = dead.into_iter().collect();
     let audited = audit_needs_no_walk(m, &dead);
     let watched: &[&'static str] = if audited.is_none() { &dead } else { &[] };
     let (caught, steps): (Vec<_>, Vec<_>) =

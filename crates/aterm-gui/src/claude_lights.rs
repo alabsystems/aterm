@@ -1350,9 +1350,11 @@ pub(crate) fn lights_now() -> Instant {
     Instant::now()
 }
 
-/// The pointer's hover on the glass: a chip or fact, a switch, a top line's part, a lockup.
+/// The pointer's hover on the glass: a chip or fact, a quota chart column, a switch, a top
+/// line's part, a lockup.
 type GlassHover = (
     Option<(u64, Target)>,
+    Option<(u64, u8, usize)>,
     Option<u64>,
     Option<(u64, crate::claude_footer::HoverAt)>,
     Option<u64>,
@@ -1363,6 +1365,7 @@ impl WindowLights {
     const fn glass_hover(&self) -> GlassHover {
         (
             self.hover,
+            self.quota_column,
             self.switch_hover,
             self.part_hover,
             self.mark_hover,
@@ -4097,15 +4100,22 @@ impl App {
 
     /// The pointer left the window.
     pub(crate) fn clear_claude_light_hover(&mut self, wid: WindowId) {
-        if let Some(ws) = self.windows.get_mut(&wid)
-            && (ws.claude_lights.hover.take().is_some()
+        let mut had_fact = false;
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            let prev_hover = ws.claude_lights.hover.take();
+            had_fact = prev_hover.is_some_and(|(_, t)| t.fact().is_some());
+            if prev_hover.is_some()
                 | ws.claude_lights.switch_hover.take().is_some()
                 | ws.claude_lights.part_hover.take().is_some()
                 | ws.claude_lights.mark_hover.take().is_some()
                 | ws.claude_lights.quota_column.take().is_some()
-                | ws.claude_lights.glass_hover_px.take().is_some())
-        {
-            redraw(ws);
+                | ws.claude_lights.glass_hover_px.take().is_some()
+            {
+                redraw(ws);
+            }
+        }
+        if had_fact {
+            self.note_fact_readings(wid);
         }
     }
 
@@ -4141,15 +4151,18 @@ impl App {
         let Some(lights) = self.windows.get(&wid).map(|ws| &ws.claude_lights) else {
             return;
         };
-        if lights.switch_hover.is_none()
-            && lights.part_hover.is_none()
-            && lights.mark_hover.is_none()
-        {
+        let Some((x, y)) = lights.glass_hover_px else {
             return;
-        }
-        let at = lights
-            .glass_hover_px
-            .and_then(|(x, y)| self.claude_glass_at(wid, x, y));
+        };
+        let at = self.claude_glass_at(wid, x, y);
+        let over = at.and_then(|(session, glass)| match glass {
+            GlassAt::Chip(chip) => Some((session, Target::Chip(chip?))),
+            GlassAt::Fact(fact, _) => Some((session, Target::Fact(fact))),
+            GlassAt::Switch(_) | GlassAt::Mark | GlassAt::Label | GlassAt::Upgrade => None,
+        });
+        let column = over
+            .filter(|(_, t)| *t == Target::Fact(Fact::Account))
+            .and_then(|_| self.quota_column_at(wid, x, y));
         let switch =
             at.and_then(|(session, glass)| matches!(glass, GlassAt::Switch(_)).then_some(session));
         let part = at.and_then(|(session, glass)| Some((session, part_of(glass)?)));
@@ -4159,6 +4172,17 @@ impl App {
         };
         let lights = &mut ws.claude_lights;
         let mut gone = false;
+        let mut fact_gone = false;
+        if lights.hover.is_some() && lights.hover != over {
+            fact_gone = lights.hover.is_some_and(|(_, t)| t.fact().is_some());
+            lights.hover = None;
+            lights.quota_column = None;
+            gone = true;
+        } else if lights.quota_column.is_some() && lights.quota_column != column {
+            fact_gone = true;
+            lights.quota_column = column;
+            gone = true;
+        }
         if lights.switch_hover.is_some() && lights.switch_hover != switch {
             lights.switch_hover = None;
             gone = true;
@@ -4171,14 +4195,19 @@ impl App {
             lights.mark_hover = None;
             gone = true;
         }
-        if lights.switch_hover.is_none()
+        if lights.hover.is_none()
+            && lights.switch_hover.is_none()
             && lights.part_hover.is_none()
             && lights.mark_hover.is_none()
         {
             lights.glass_hover_px = None;
         }
         if gone {
+            lights.cursor_owed = true;
             redraw(ws);
+            if fact_gone {
+                self.note_fact_readings(wid);
+            }
         }
     }
 
@@ -4197,6 +4226,8 @@ impl App {
     pub(crate) fn hover_claude_chip(&mut self, wid: WindowId, at: Option<(u64, Chip)>) {
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.claude_lights.hover = at.map(|(session, chip)| (session, Target::Chip(chip)));
+            ws.claude_lights.quota_column = None;
+            ws.claude_lights.glass_hover_px = None;
         }
     }
 
@@ -4205,16 +4236,23 @@ impl App {
     pub(crate) fn hover_claude_fact(&mut self, wid: WindowId, at: Option<(u64, Fact)>) {
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.claude_lights.hover = at.map(|(session, fact)| (session, Target::Fact(fact)));
+            ws.claude_lights.quota_column = None;
+            ws.claude_lights.glass_hover_px = None;
         }
         self.note_fact_readings(wid);
     }
 
     /// A mouse press anywhere lets a keyboard selection go.
     pub(crate) fn clear_claude_light_selection(&mut self, wid: WindowId) {
+        let mut had_fact = false;
         if let Some(ws) = self.windows.get_mut(&wid)
-            && ws.claude_lights.selected.take().is_some()
+            && let Some((_, target)) = ws.claude_lights.selected.take()
         {
+            had_fact = target.fact().is_some();
             redraw(ws);
+        }
+        if had_fact {
+            self.note_fact_readings(wid);
         }
     }
 
@@ -4240,20 +4278,25 @@ impl App {
             return OverChips::No;
         }
         ws.claude_lights.glass_hover_px =
-            (switch.is_some() || part.is_some() || mark.is_some()).then_some((x, y));
+            (over.is_some() || switch.is_some() || part.is_some() || mark.is_some())
+                .then_some((x, y));
         if ws.claude_lights.hover != over
             || ws.claude_lights.switch_hover != switch
             || ws.claude_lights.part_hover != part
             || ws.claude_lights.mark_hover != mark
             || ws.claude_lights.quota_column != column
         {
+            let had_fact = ws
+                .claude_lights
+                .hover
+                .is_some_and(|(_, t)| t.fact().is_some());
             ws.claude_lights.hover = over;
             ws.claude_lights.quota_column = column;
             ws.claude_lights.switch_hover = switch;
             ws.claude_lights.part_hover = part;
             ws.claude_lights.mark_hover = mark;
             redraw(ws);
-            if over.is_some_and(|(_, t)| t.fact().is_some()) {
+            if had_fact || over.is_some_and(|(_, t)| t.fact().is_some()) {
                 self.note_fact_readings(wid);
             }
         }
@@ -4323,7 +4366,11 @@ impl App {
             .claude_lights
             .fact_hits
             .iter()
-            .find(|h| h.frame_row == row && (h.cols.0..h.cols.1).contains(&col))
+            .find(|h| {
+                h.frame_row == row
+                    && (h.cols.0..h.cols.1).contains(&col)
+                    && !self.chrome_owns_terminal_row(wid, h.term_row)
+            })
             .and_then(|h| match h.part {
                 Some(RowPart::Chart(per_day)) => Some((h.session, per_day, col - h.cols.0)),
                 _ => None,
@@ -5228,6 +5275,11 @@ impl App {
                         ws.chrome_rows.iter().any(|band| band.contains(&row))
                     }))
         });
+        let stale_had_fact = stale
+            && ws
+                .claude_lights
+                .selected
+                .is_some_and(|(_, target)| target.fact().is_some());
         if stale {
             ws.claude_lights.select(None);
             redraw(ws);
@@ -5266,16 +5318,22 @@ impl App {
             .map(|(_, l)| l);
         let switched = ws.claude_lights.switch_of(session).is_some();
         if select_chord && (room.is_some() || switched) {
+            let had_fact = stale_had_fact || selected.is_some_and(|t| t.fact().is_some());
             if let Some(next) = step(selected) {
                 ws.claude_lights.select(Some((session, next)));
                 redraw(ws);
-                if next.fact().is_some() {
+                if had_fact || next.fact().is_some() {
                     self.note_fact_readings(wid);
                 }
+            } else if had_fact {
+                self.note_fact_readings(wid);
             }
             return true;
         }
         let Some(target) = selected else {
+            if stale_had_fact {
+                self.note_fact_readings(wid);
+            }
             return false;
         };
         let plain = !mods.control_key() && !mods.alt_key() && !mods.super_key();
@@ -5331,6 +5389,7 @@ impl App {
                 let escape = matches!(&ev.logical_key, Key::Named(NamedKey::Escape));
                 ws.claude_lights.select(None);
                 redraw(ws);
+                self.note_fact_readings(wid);
                 return match hit {
                     Some(hit) if clicks => {
                         self.press_visible_claude_fact(wid, session, fact, hit.restores);

@@ -597,50 +597,6 @@ mod tests {
         assert!(checkpoint_authority(&approved.paths.home, grant.source, &row).is_err());
     }
 
-    /// This test binary asks aterm-db for the hang detector (`admission_waits_in_tests!` in
-    /// main.rs), so an open whose caller names no deadline (`Proposals::at`) waits out a
-    /// holder of the Commons custody lock that keeps it past a product open's 2 s: every
-    /// holder a test races is its own and releases it, so a pass a loaded machine slows is
-    /// waited for, not refused as "application pass deadline expired". Without the ask the
-    /// write refuses while the lock is still held.
-    #[test]
-    fn an_open_naming_no_deadline_waits_out_a_holder_past_the_product_wait() {
-        use std::time::{Duration, Instant};
-        let (_home, approved, _) = fixture();
-        let (lock, _) =
-            aterm_uds::private_file::open_private(&approved.paths.dir, "commons.lock").unwrap();
-        aterm_uds::file_lock::lock_exclusive_until(
-            &lock,
-            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
-            "the test holds Commons custody",
-        )
-        .unwrap();
-        let (began, writing) = std::sync::mpsc::channel();
-        let paths = approved.paths.clone();
-        let write = std::thread::spawn(move || {
-            began.send(Instant::now()).unwrap();
-            Proposals::at(paths).write(
-                [5; 16],
-                vec![Change {
-                    collection: "accounts".into(),
-                    key: "held".into(),
-                    value: Some(json!({
-                        "provider":"anthropic", "method":"oauth",
-                        "email":"held@example.test"
-                    })),
-                }],
-            )
-        });
-        let began = writing.recv().unwrap();
-        // Held past the product's whole 2 s wait, with a second to spare.
-        std::thread::sleep(
-            (began + Duration::from_secs(3)).saturating_duration_since(Instant::now()),
-        );
-        lock.unlock().unwrap();
-        drop(lock);
-        write.join().unwrap().unwrap();
-    }
-
     #[test]
     fn first_adoption_discovers_only_current_root_decisions_without_a_local_roster() {
         let (_home, approved, _) = fixture();

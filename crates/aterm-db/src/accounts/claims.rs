@@ -490,9 +490,13 @@ pub fn read(paths: &Paths) -> Result<Read> {
 }
 
 pub(crate) fn read_at(paths: &Paths, now: u64, caps: Caps) -> Result<Read> {
+    read_started(paths, now, caps, Instant::now())
+}
+
+fn read_started(paths: &Paths, now: u64, caps: Caps, started: Instant) -> Result<Read> {
     let selected = crate::generation::selected(paths)?;
     let paths = &selected;
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::admission::deadline_at(started);
     let bootstrap = Bootstrap::required_until(paths, deadline).map_err(crate::table::failure)?;
     let session = Session::observe(&bootstrap)?;
     let directory = Directory::new(paths, bootstrap.trust());

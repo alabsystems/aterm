@@ -735,7 +735,9 @@ mod tests {
     #[test]
     fn a_full_disk_a_passing_test_simulated_does_not_hide_a_failed_test() {
         let run = |output: String| crate::exec::Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok: false,
             output,
             code: Some(101),
@@ -921,7 +923,9 @@ mod tests {
             );
             let log = failed_binary("render_suite", &[(name, &block)]);
             let run = crate::exec::Run {
+                case_observations: None,
                 stopped_at: None,
+                hung: None,
                 ok: false,
                 output: log.clone(),
                 code: Some(101),

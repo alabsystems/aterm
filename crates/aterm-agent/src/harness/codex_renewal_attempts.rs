@@ -515,6 +515,38 @@ impl<'a> ReceiptWriter<'a> {
     /// # Errors
     /// The logical intent changed, custody cannot be read, or durable tombstone
     /// and root projection publication failed. A completed tombstone is retained.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "CancellationAttemptHistory",
+            action = "StoredAttempt",
+            reason = "The retained compatible root supplies its prior attempt marker"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "CancellationAttemptHistory",
+            action = "CallerAttempt",
+            reason = "The caller may retain an attempted publication after its write failed"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "CancellationAttemptHistory",
+            action = "NextFault",
+            reason = "The filesystem can refuse each directory barrier during cancellation"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "CancellationAttemptHistory",
+            action = "Cancel",
+            project = "aterm_agent::harness::codex_renewal::attempts::tests::cancellation_history::transition"
+        )
+    )]
     pub fn cancel(
         &self,
         expected: &Receipt,
@@ -549,6 +581,10 @@ impl<'a> ReceiptWriter<'a> {
             cancellation
         };
         let mut retired = current;
+        // A prospective Committing write may have failed before rename. Keep
+        // that compatible caller's conservative attempt witness as well as
+        // the stored one; cancellation cannot turn it into an unattempted root.
+        retired.launch_attempted |= expected.launch_attempted;
         retired.revoked = true;
         retired.phase = Phase::Retired;
         write_receipt(self.env, &retired)?;

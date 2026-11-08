@@ -37,7 +37,7 @@ pub struct Index {
 
 /// Streaming digest of an executable.
 pub fn digest(path: &Path) -> std::io::Result<String> {
-    let mut input = std::fs::File::open(path)?;
+    let mut input = crate::open_regular(path)?;
     let mut hash = aterm_digest::Sha256::new();
     let mut buf = vec![0; 1 << 20];
     loop {

@@ -106,6 +106,7 @@ fn complete_entry(store: &Path, identity: &Identity, exe: &[u8]) -> Complete {
         compiler_line: "Trust 1.95.0".to_string(),
         macho_sha256: artifact::macho_sha256(&app).unwrap(),
         bundle_digest: artifact::bundle_digest(&app).unwrap(),
+        content: None,
         slices: Vec::new(),
         index_hint: None,
     };

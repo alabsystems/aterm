@@ -300,37 +300,52 @@ pub fn write_atomically(
     Ok(())
 }
 
-/// How many times [`again_while_refused`] tries the replace again.
-#[cfg(windows)]
-const REFUSED_TRIES: u64 = 30;
+/// A minute hang detector for a Windows file holder to release a required replace.
+#[cfg(any(windows, test))]
+const REPLACE_HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// `ERROR_SHARING_VIOLATION` and `ERROR_LOCK_VIOLATION` (unmapped in [`std::io::ErrorKind`]).
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const HELD_OS_ERRORS: [i32; 2] = [32, 33];
 
 /// `op`, tried again while Windows refuses it because another process holds one of its files.
-fn again_while_refused<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+fn again_while_refused<T>(op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
     #[cfg(windows)]
     {
-        let mut tries = 0;
-        loop {
-            match op() {
-                Err(e)
-                    if (e.kind() == std::io::ErrorKind::PermissionDenied
-                        || e.raw_os_error()
-                            .is_some_and(|c| HELD_OS_ERRORS.contains(&c)))
-                        && tries < REFUSED_TRIES =>
-                {
-                    tries += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(tries));
-                }
-                done => return done,
-            }
-        }
+        again_while_refused_windows_at(op, std::time::Instant::now(), std::thread::sleep)
     }
     #[cfg(not(windows))]
     {
+        let mut op = op;
         op()
+    }
+}
+
+#[cfg(any(windows, test))]
+fn again_while_refused_windows_at<T>(
+    mut op: impl FnMut() -> std::io::Result<T>,
+    started: std::time::Instant,
+    mut pause: impl FnMut(std::time::Duration),
+) -> std::io::Result<T> {
+    let mut backoff = std::time::Duration::from_millis(1);
+    loop {
+        match op() {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || e.raw_os_error()
+                        .is_some_and(|c| HELD_OS_ERRORS.contains(&c)) =>
+            {
+                let left = REPLACE_HANG.saturating_sub(started.elapsed());
+                if left.is_zero() {
+                    return Err(e);
+                }
+                pause(backoff.min(left));
+                backoff = backoff
+                    .saturating_add(std::time::Duration::from_millis(1))
+                    .min(std::time::Duration::from_millis(30));
+            }
+            done => return done,
+        }
     }
 }
 
@@ -358,6 +373,56 @@ mod tests {
 
     const KITTY: &str = "## name: Harbour\nforeground #c0caf5\nbackground #1a1b26\n";
 
+    #[test]
+    fn windows_replace_waits_for_a_scheduled_file_holder() {
+        let dir = scratch("scheduled-windows-replace");
+        let staged = dir.join("staged");
+        let target = dir.join("target");
+        std::fs::write(&staged, b"complete").unwrap();
+        std::fs::write(&target, b"before").unwrap();
+        let mut calls = 0;
+        let result = again_while_refused_windows_at(
+            || {
+                calls += 1;
+                if calls > 31 {
+                    std::fs::rename(&staged, &target)
+                } else {
+                    Err(std::io::Error::from_raw_os_error(32))
+                }
+            },
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+            |_| {},
+        );
+        result.expect("the Windows sharing refusal lifts before the hang detector");
+        assert_eq!(calls, 32);
+        assert_eq!(std::fs::read(&target).unwrap(), b"complete");
+        assert!(!staged.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn windows_replace_preserves_the_last_refusal_at_the_hang_detector() {
+        for code in HELD_OS_ERRORS {
+            let mut calls = 0;
+            let result: std::io::Result<()> = again_while_refused_windows_at(
+                || {
+                    calls += 1;
+                    Err(std::io::Error::from_raw_os_error(code))
+                },
+                std::time::Instant::now() - std::time::Duration::from_secs(61),
+                |_| panic!("an exhausted hang detector must not wait again"),
+            );
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(code));
+            assert_eq!(calls, 1);
+        }
+        let result: std::io::Result<()> = again_while_refused_windows_at(
+            || Err(std::io::ErrorKind::NotFound.into()),
+            std::time::Instant::now(),
+            |_| panic!("an unrelated error must return immediately"),
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+    }
+
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "aterm-types-install-{tag}-{}-{:?}",
@@ -370,8 +435,7 @@ mod tests {
     }
 
     /// A refused replace is tried again on Windows until it goes through,
-    /// and a refusal that never lifts is still the caller's error after a
-    /// bounded number of tries; any other error is returned at once.
+    /// and any other error is returned at once.
     #[test]
     fn a_refused_replace_is_tried_again_only_on_windows_and_only_so_often() {
         use std::io::{Error, ErrorKind};
@@ -390,17 +454,6 @@ mod tests {
             assert_eq!(out.unwrap_err().kind(), ErrorKind::PermissionDenied);
             assert_eq!(calls, 1);
         }
-
-        let mut calls = 0u64;
-        let out: std::io::Result<()> = again_while_refused(|| {
-            calls += 1;
-            Err(Error::from(ErrorKind::PermissionDenied))
-        });
-        assert_eq!(out.unwrap_err().kind(), ErrorKind::PermissionDenied);
-        #[cfg(windows)]
-        assert_eq!(calls, REFUSED_TRIES + 1, "bounded");
-        #[cfg(not(windows))]
-        assert_eq!(calls, 1);
 
         for code in [32, 33] {
             let mut calls = 0u64;

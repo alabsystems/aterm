@@ -120,6 +120,15 @@ pub(crate) struct InkLedger {
     /// The same lights' ramps, as `[from, to)` spans of the under stream's
     /// ramps.
     light_owned_ramps: Vec<OwnedSpan>,
+    /// The frame's page shades ([`Self::note_page_shade_laid`]), as `[from,
+    /// to)` spans of the under stream's quads, each a foot rail of
+    /// [`Self::rails`] too: the letter guard holds them by their own reading
+    /// alone (`CursorGlow::hold_page_shades`). Kept apart from the rails,
+    /// which the state words hash.
+    page_shades: Vec<OwnedSpan>,
+    /// The same shades' ramps, as `[from, to)` spans of the under stream's
+    /// ramps.
+    page_shade_ramps: Vec<OwnedSpan>,
     /// A test's negative control: the letter guard feathers its cuts into a
     /// rail laid clear of the ring as into any light (looks7 round 3).
     #[cfg(any(test, debug_assertions))]
@@ -196,6 +205,8 @@ impl InkLedger {
         rail_ramps: Vec::new(),
         light_owned: Vec::new(),
         light_owned_ramps: Vec::new(),
+        page_shades: Vec::new(),
+        page_shade_ramps: Vec::new(),
         #[cfg(any(test, debug_assertions))]
         rails_feathered: false,
         #[cfg(any(test, debug_assertions))]
@@ -406,13 +417,20 @@ impl InkLedger {
     /// Note a shade laid through an [`aterm_render::RampSink`] from the
     /// under stream's mark `from` to `to` under a dim page's light letters,
     /// in a colour at or under the page's own luminance
-    /// ([`crate::cursor_glow::page_lit_ink`]): kept whole, neither weighed
-    /// nor cut, as a foot rail is ([`Self::note_foot_rail_laid`]). It can
-    /// only darken the ground of a letter lighter than the page, so no share
-    /// of it ever lifts a letter's reading, and weighed with the lights in
-    /// its cells it was cut with them to a quarter of its hue, a trace
-    /// nothing showed at 1x (Classic pink's move up Solarized Dark, looks10
-    /// round 2).
+    /// ([`crate::cursor_glow::page_lit_ink`]): the letter guard neither
+    /// weighs it with the other lights nor cuts it to their dims, as a foot
+    /// rail ([`Self::note_foot_rail_laid`]). Weighed with the lights in its
+    /// cells it was cut with them to a quarter of its hue, a trace nothing
+    /// showed at 1x (Classic pink's move up Solarized Dark, looks10 round 2).
+    ///
+    /// The guard holds it to the letters it reaches by itself instead
+    /// (`CursorGlow::hold_page_shades`): kept whole, it lowered one. A hue off
+    /// the page's at the page's luminance lies over the page in some channel,
+    /// and the judges read a ring's ground by each channel's median, so where
+    /// a letter's ring lies on both, each channel's median may come from
+    /// either, a ground brighter than both (a ring half on each takes the
+    /// brighter of the two in every channel). Beam's body on Solarized Dark
+    /// read a `w` of its own 4.509 at 4.488 (Linux arm64, 2026-11-07).
     #[inline]
     pub(crate) fn note_page_shade_laid(
         &mut self,
@@ -420,6 +438,35 @@ impl InkLedger {
         to: (usize, aterm_render::RampMark),
     ) {
         self.push_rail_laid(from, to, true);
+        let span =
+            |a: usize, b: usize| (b > a && b <= u32::MAX as usize).then_some((a as u32, b as u32));
+        if let Some(q) = span(from.0, to.0) {
+            self.page_shades.push(q);
+        }
+        if let Some(r) = span(from.1.items(), to.1.items()) {
+            self.page_shade_ramps.push(r);
+        }
+    }
+
+    /// Whether the frame laid a page shade ([`Self::note_page_shade_laid`]).
+    #[inline]
+    pub(crate) const fn has_page_shades(&self) -> bool {
+        !self.page_shades.is_empty() || !self.page_shade_ramps.is_empty()
+    }
+
+    /// Whether under-stream quad `k` lies in a page shade
+    /// ([`Self::note_page_shade_laid`]), walking the ascending spans from
+    /// `*at` for ascending `k`.
+    #[inline]
+    pub(crate) const fn in_page_shade(&self, k: usize, at: &mut usize) -> bool {
+        Self::in_owned_span(self.page_shades.as_slice(), k, at)
+    }
+
+    /// Whether under-stream ramp `k` lies in a page shade, walking the
+    /// ascending spans from `*at` for ascending `k`.
+    #[inline]
+    pub(crate) const fn in_page_shade_ramp(&self, k: usize, at: &mut usize) -> bool {
+        Self::in_owned_span(self.page_shade_ramps.as_slice(), k, at)
     }
 
     #[inline]
@@ -518,7 +565,8 @@ impl InkLedger {
             || (self.rails.is_empty()
                 && self.rail_ramps.is_empty()
                 && self.light_owned.is_empty()
-                && self.light_owned_ramps.is_empty())
+                && self.light_owned_ramps.is_empty()
+                && !self.has_page_shades())
         {
             return;
         }
@@ -567,40 +615,46 @@ impl InkLedger {
         }
         self.rails = folded;
         self.rail_ramps.clear();
-        // The light-owned spans fold as the rails do, quads and ramps into
-        // the quads they unfold to, in draw order.
-        let mut owned: Vec<OwnedSpan> =
-            Vec::with_capacity(self.light_owned.len() + self.light_owned_ramps.len());
-        for &(from, to) in &self.light_owned {
-            let (from, to) = (from as usize, to as usize);
-            if to > from && to <= quad_at.len() {
-                owned.push((quad_at[from] as u32, (quad_at[to - 1] + 1) as u32));
+        // The light-owned spans and the page shades fold as the rails do,
+        // quads and ramps into the quads they unfold to, in draw order.
+        let fold = |quads: &[OwnedSpan], ramps: &[OwnedSpan]| {
+            let mut owned: Vec<OwnedSpan> = Vec::with_capacity(quads.len() + ramps.len());
+            for &(from, to) in quads {
+                let (from, to) = (from as usize, to as usize);
+                if to > from && to <= quad_at.len() {
+                    owned.push((quad_at[from] as u32, (quad_at[to - 1] + 1) as u32));
+                }
             }
-        }
-        for &(from, to) in &self.light_owned_ramps {
-            let (from, to) = (from as usize, to as usize);
-            if to > from && to <= ramp_at.len() && ramp_at[to - 1].1 > ramp_at[from].0 {
-                owned.push((ramp_at[from].0 as u32, ramp_at[to - 1].1 as u32));
+            for &(from, to) in ramps {
+                let (from, to) = (from as usize, to as usize);
+                if to > from && to <= ramp_at.len() && ramp_at[to - 1].1 > ramp_at[from].0 {
+                    owned.push((ramp_at[from].0 as u32, ramp_at[to - 1].1 as u32));
+                }
             }
-        }
-        owned.sort_unstable();
-        // Merged where they touch: a span of quads and the ramps among them.
-        let mut merged: Vec<OwnedSpan> = Vec::with_capacity(owned.len());
-        for span in owned {
-            match merged.last_mut() {
-                Some(last) if span.0 <= last.1 => last.1 = last.1.max(span.1),
-                _ => merged.push(span),
+            owned.sort_unstable();
+            // Merged where they touch: a span of quads and the ramps among them.
+            let mut merged: Vec<OwnedSpan> = Vec::with_capacity(owned.len());
+            for span in owned {
+                match merged.last_mut() {
+                    Some(last) if span.0 <= last.1 => last.1 = last.1.max(span.1),
+                    _ => merged.push(span),
+                }
             }
-        }
-        self.light_owned = merged;
+            merged
+        };
+        self.light_owned = fold(&self.light_owned, &self.light_owned_ramps);
         self.light_owned_ramps.clear();
+        self.page_shades = fold(&self.page_shades, &self.page_shade_ramps);
+        self.page_shade_ramps.clear();
     }
 
     /// Test-only: how many of the under stream's quads and ramps this frame
-    /// keeps whole, neither weighed nor cut (foot rails and page shades,
-    /// [`Self::note_foot_rail_laid`], [`Self::note_page_shade_laid`]).
+    /// keeps from the letter guard's weighing of its lights and the cuts it
+    /// lays for them: foot rails, which it never cuts
+    /// ([`Self::note_foot_rail_laid`]), and page shades, which it holds to the
+    /// letters they reach by themselves ([`Self::note_page_shade_laid`]).
     #[cfg(test)]
-    pub(crate) fn kept_whole(&self) -> usize {
+    pub(crate) fn kept_from_weighing(&self) -> usize {
         self.rails
             .iter()
             .chain(self.rail_ramps.iter())
@@ -609,15 +663,18 @@ impl InkLedger {
             .sum()
     }
 
-    /// Forget the frame's rails ([`Self::note_rail`], [`Self::note_rail_laid`])
-    /// and its light-owned spans ([`Self::note_light_owned_laid`]), and that
-    /// its guard judged ([`Self::guard_judged`]).
+    /// Forget the frame's rails ([`Self::note_rail`], [`Self::note_rail_laid`]),
+    /// its light-owned spans ([`Self::note_light_owned_laid`]) and its page
+    /// shades ([`Self::note_page_shade_laid`]), and that its guard judged
+    /// ([`Self::guard_judged`]).
     #[inline]
     pub(crate) fn clear_rails(&mut self) {
         self.rails.clear();
         self.rail_ramps.clear();
         self.light_owned.clear();
         self.light_owned_ramps.clear();
+        self.page_shades.clear();
+        self.page_shade_ramps.clear();
         #[cfg(any(test, debug_assertions))]
         {
             self.guard_judged = false;

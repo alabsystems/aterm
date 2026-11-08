@@ -286,9 +286,17 @@ pub fn with_ledger<T>(
 ) -> crate::Result<T> {
     let _lock = Lock::take(paths)?;
     let facts = super::facts(paths, now())?;
+    with_rows(paths, &facts, change)
+}
+
+fn with_rows<T>(
+    paths: &Paths,
+    facts: &Facts,
+    change: impl FnOnce(&mut Vec<Need>, &Facts) -> crate::Result<T>,
+) -> crate::Result<T> {
     let mut rows = load(paths)?;
     let before = rows.clone();
-    let out = change(&mut rows, &facts)?;
+    let out = change(&mut rows, facts)?;
     if rows != before {
         save(paths, &mut rows)?;
     }
@@ -323,6 +331,59 @@ pub fn raise_refused(paths: &Paths, want: Want, purpose: Purpose, seq: u64) -> c
     raise_with(paths, want, purpose, Some(seq))
 }
 
+/// Record a consumer refusal only while the captured paired materialization's exact
+/// source/version and the caller's local admission still hold. The need lock precedes
+/// the shared materialization guard; the existing policy settles the same canonical raise.
+/// `current` must perform local reads only, without subprocesses, network, ledger reentry
+/// or mutation. It runs before custody observation, then under both locks before mutation
+/// and before the atomic save.
+/// # Errors
+/// The ledger, captured source/version or current consumer admission cannot be read safely.
+pub fn raise_refused_from_snapshot(
+    paths: &Paths,
+    want: Want,
+    purpose: Purpose,
+    snapshot: &crate::client::MaterializationSnapshot,
+    current: impl Fn() -> crate::Result<()>,
+) -> crate::Result<Need> {
+    let entries = want.entries();
+    with_snapshot_ledger(paths, &entries, snapshot, true, current, |rows, facts| {
+        raise_in(rows, facts, want, purpose, Some(snapshot.sequence()))
+    })
+}
+
+fn with_snapshot_ledger<T>(
+    paths: &Paths,
+    entries: &[String],
+    snapshot: &crate::client::MaterializationSnapshot,
+    require_signed: bool,
+    current: impl Fn() -> crate::Result<()>,
+    change: impl FnOnce(&mut Vec<Need>, &Facts) -> crate::Result<T>,
+) -> crate::Result<T> {
+    let _lock = Lock::take(paths)?;
+    current()?;
+    let commons = super::observed_commons(paths);
+    snapshot.at_current_version(paths, entries, || {
+        let facts = super::facts_with_commons(paths, now(), || commons)?;
+        with_rows(paths, &facts, |rows, facts| {
+            current()?;
+            if require_signed
+                && facts
+                    .sight
+                    .as_ref()
+                    .is_none_or(|sight| sight.seq != snapshot.sequence())
+            {
+                return Err(Error::new(
+                    "the credential refusal has no matching signed version",
+                ));
+            }
+            let result = change(rows, facts)?;
+            current()?;
+            Ok(result)
+        })
+    })
+}
+
 fn raise_with(
     paths: &Paths,
     want: Want,
@@ -330,39 +391,54 @@ fn raise_with(
     refused: Option<u64>,
 ) -> crate::Result<Need> {
     with_ledger(paths, |rows, facts| {
-        let at = rows
-            .iter()
-            .position(|need| need.want == want && need.purpose == purpose);
-        let next = match at.map(|at| rows[at].clone()) {
-            None => {
-                let mut need = super::fresh(new_id()?, want, purpose, facts);
-                need.refused = refused;
-                settle(&need, facts)
-            }
-            Some(old) if old.state == State::Fulfilled || (refused.is_some() && old.got) => {
-                let mut need = super::fresh(new_id()?, want, purpose, facts);
-                need.raises = old.raises.saturating_add(1);
-                need.refused = refused.or(old.seq);
-                settle(&need, facts)
-            }
-            Some(old) if old.state.ended() => {
-                let again = act(&old, facts, &Act::NeedAgain).unwrap_or(old);
-                match reraise(&again, facts)? {
-                    Some(mut raised) => {
-                        raised.refused = refused.or(raised.refused);
-                        settle(&raised, facts)
-                    }
-                    None => again,
-                }
-            }
-            Some(old) => settle(&old, facts),
-        };
-        match at {
-            Some(at) => rows[at] = next.clone(),
-            None => rows.push(next.clone()),
-        }
-        Ok(next)
+        raise_in(rows, facts, want, purpose, refused)
     })
+}
+
+fn raise_in(
+    rows: &mut Vec<Need>,
+    facts: &Facts,
+    want: Want,
+    purpose: Purpose,
+    refused: Option<u64>,
+) -> crate::Result<Need> {
+    let at = rows
+        .iter()
+        .position(|need| need.want == want && need.purpose == purpose);
+    let next = match at.map(|at| rows[at].clone()) {
+        None => {
+            let mut need = super::fresh(new_id()?, want, purpose, facts);
+            need.refused = refused;
+            settle(&need, facts)
+        }
+        Some(old)
+            if old.state == State::Fulfilled
+                || (!old.state.ended()
+                    && refused
+                        .is_some_and(|next| old.refused.is_none_or(|before| next > before))) =>
+        {
+            let mut need = super::fresh(new_id()?, want, purpose, facts);
+            need.raises = old.raises.saturating_add(1);
+            need.refused = refused.or(old.seq).max(old.refused);
+            settle(&need, facts)
+        }
+        Some(old) if old.state.ended() => {
+            let again = act(&old, facts, &Act::NeedAgain).unwrap_or(old);
+            match reraise(&again, facts)? {
+                Some(mut raised) => {
+                    raised.refused = refused.max(raised.refused);
+                    settle(&raised, facts)
+                }
+                None => again,
+            }
+        }
+        Some(old) => settle(&old, facts),
+    };
+    match at {
+        Some(at) => rows[at] = next.clone(),
+        None => rows.push(next.clone()),
+    }
+    Ok(next)
 }
 
 /// `need` raised again under a new request id, when it ended for a reason whose condition has
@@ -384,20 +460,67 @@ fn reraise(need: &Need, facts: &Facts) -> crate::Result<Option<Need>> {
 /// # Errors
 /// The ledger or the vault state cannot be read or written.
 pub fn satisfied(paths: &Paths, want: &Want, purpose: Purpose) -> crate::Result<Option<Need>> {
-    with_ledger(paths, |rows, facts| {
-        let Some(at) = rows
-            .iter()
-            .position(|need| need.want == *want && need.purpose == purpose)
-        else {
-            return Ok(None);
-        };
-        let settled = settle(&rows[at], facts);
-        let next = act(&settled, facts, &Act::Apply)
-            .or_else(|| act(&settled, facts, &Act::Unneeded))
-            .unwrap_or(settled);
-        rows[at] = next.clone();
-        Ok(Some(next))
-    })
+    with_ledger(paths, |rows, facts| satisfy_in(rows, facts, want, purpose))
+}
+
+/// The consumer accepted its paired credential. An explicit refusal additionally requires
+/// prior provider acceptance at a later signed version; ordinary local consumption may
+/// retire an unneeded request without claiming signed or protocol delivery.
+/// A prior request's acceptance cannot settle a concurrent replacement or new refusal.
+/// `current` has the same local-read-only contract as [`raise_refused_from_snapshot`].
+/// # Errors
+/// The captured source/version, request ID/floor, policy or local admission no longer holds.
+pub fn acknowledge_from_snapshot(
+    paths: &Paths,
+    expected: &Need,
+    snapshot: &crate::client::MaterializationSnapshot,
+    current: impl Fn() -> crate::Result<()>,
+) -> crate::Result<Option<Need>> {
+    with_snapshot_ledger(
+        paths,
+        &expected.want.entries(),
+        snapshot,
+        expected.refused.is_some(),
+        current,
+        |rows, facts| {
+            let row = rows
+                .iter()
+                .find(|row| row.want == expected.want && row.purpose == expected.purpose)
+                .ok_or_else(|| Error::new("the credential request changed"))?;
+            if row.id != expected.id
+                || row.refused != expected.refused
+                || row.state.ended()
+                || row
+                    .refused
+                    .is_some_and(|floor| snapshot.sequence() <= floor)
+            {
+                return Err(Error::new(
+                    "the credential request or refusal changed during confirmation",
+                ));
+            }
+            satisfy_in(rows, facts, &expected.want, expected.purpose)
+        },
+    )
+}
+
+fn satisfy_in(
+    rows: &mut [Need],
+    facts: &Facts,
+    want: &Want,
+    purpose: Purpose,
+) -> crate::Result<Option<Need>> {
+    let Some(at) = rows
+        .iter()
+        .position(|need| need.want == *want && need.purpose == purpose)
+    else {
+        return Ok(None);
+    };
+    let settled = settle(&rows[at], facts);
+    let next = act(&settled, facts, &Act::Apply)
+        .or_else(|| act(&settled, facts, &Act::Unneeded))
+        .unwrap_or(settled);
+    rows[at] = next.clone();
+    Ok(Some(next))
 }
 
 /// Withdraw by hand this Mac's needs that `selector` names (a want key or a request id), or,

@@ -272,7 +272,7 @@ pub fn host_of(version: &str) -> Option<&str> {
 }
 
 /// This machine's triple, as the run's `trustc` reports it.
-fn host_triple(ctx: &Ctx) -> Result<String, String> {
+pub(crate) fn host_triple(ctx: &Ctx) -> Result<String, String> {
     let trustc = ctx.tools.stage2_dir.join("trustc");
     let out = aterm_uds::spawnfd::command(&trustc)
         .arg("-vV")
@@ -3061,7 +3061,9 @@ mod tests {
         assert!(!is_cell_warning(None));
         for (tests, status) in [(false, "WARNING(2)"), (true, "TEST-TARGET-WARNING(2)")] {
             let run = exec::Run {
+                case_observations: None,
                 stopped_at: None,
+                hung: None,
                 ok: true,
                 output: out.clone(),
                 code: Some(0),
@@ -3076,7 +3078,9 @@ mod tests {
             assert!(red.detail[0].contains("launchctl_list"), "{:?}", red.detail);
         }
         let run = exec::Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok: true,
             output: out.clone(),
             code: Some(0),
@@ -3099,7 +3103,9 @@ mod tests {
         // A pulled run names a Windows cell's test-target warnings and is not red on them. CONTROL:
         // the same warnings in its lint pass, a run naming `cells`, and a pulled Linux cell.
         let run = exec::Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok: true,
             output: out.clone(),
             code: Some(0),
@@ -3133,7 +3139,9 @@ mod tests {
             "warning: constructing a `Duration` using a smaller unit",
         );
         let run = exec::Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok: true,
             output: clippy_only,
             code: Some(0),
@@ -3152,7 +3160,9 @@ mod tests {
         let artifact = r#"{"reason":"compiler-artifact","package_id":"path+file:///r/app#app@1","profile":{"test":true},"filenames":["/t/x86_64-pc-windows-msvc/debug/app"]}"#;
         let graph = names(&["app"]);
         let run = |code| exec::Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok: code == Some(0),
             output: artifact.to_string(),
             code,
@@ -3199,7 +3209,9 @@ mod tests {
                 "error: no matching package named `missing` found",
             ] {
                 let run = exec::Run {
+                    case_observations: None,
                     stopped_at: None,
+                    hung: None,
                     ok: false,
                     output: diagnostic.to_string(),
                     code: Some(101),
@@ -3218,7 +3230,9 @@ mod tests {
                 (None, exec::ENOSPC_SENTENCE.to_string()),
             ] {
                 let run = exec::Run {
+                    case_observations: None,
                     stopped_at: None,
+                    hung: None,
                     ok: false,
                     output,
                     code: None,
@@ -3266,7 +3280,9 @@ mod tests {
         let finish = "{\"reason\":\"build-finished\",\"success\":true}";
         let evaluate = |ok: bool, path: &Path, tail: &str| {
             let run = exec::Run {
+                case_observations: None,
                 stopped_at: None,
+                hung: None,
                 ok,
                 code: Some(if ok { 0 } else { 101 }),
                 spawn_error: None,

@@ -37,8 +37,6 @@ use aterm_cli::{AliasRoute, alias_route};
 
 #[cfg(test)]
 aterm_durable::plain_durable_flushes_in_tests!();
-#[cfg(all(test, unix))]
-aterm_db::admission_waits_in_tests!(aterm_spec::wait::MUST_HAPPEN);
 
 /// `aterm pkg` and its `atpkg` alias: the package pass, then, after an install or update that
 /// ended settled and that a person typed at a terminal ([`a_person_at_their_own_account`],
@@ -2042,7 +2040,7 @@ fn network_state_source_with_readers(
         None::<aterm_db::network_state::Publication>,
         None::<aterm_db::service_state::Publication>,
     ));
-    Arc::new(move || {
+    Arc::new(move |read: aterm_gui::NetworkRead| {
         // Both the UI and the Commons beacon read this callback. A paused reader
         // must not pause drawing or masquerade as a new startup observation.
         let mut current = match current.try_lock() {
@@ -2053,7 +2051,11 @@ fn network_state_source_with_readers(
         if let Some(publication) = network() {
             current.1 = Some(publication);
         }
-        if let Some(publication) = services() {
+        // A services read asks their observer for its next sample, so only a reader that shows
+        // their states reads them; any other gets their last sample, aged below as it ages.
+        if read == aterm_gui::NetworkRead::WithServices
+            && let Some(publication) = services()
+        {
             current.2 = Some(publication);
         }
         let (now, wall) = clock();
@@ -17970,13 +17972,25 @@ mod tests {
                 move || *timer.lock().unwrap(),
             );
             if prefetch {
-                assert_eq!(read().unwrap().network.visibility, Visibility::Active);
+                assert_eq!(
+                    read(aterm_gui::NetworkRead::WithServices)
+                        .unwrap()
+                        .network
+                        .visibility,
+                    Visibility::Active
+                );
             }
             *clock.lock().unwrap() = (at + Duration::from_secs(20), Some(120_000));
-            assert_eq!(read().unwrap().network.visibility, Visibility::Unavailable);
+            assert_eq!(
+                read(aterm_gui::NetworkRead::WithServices)
+                    .unwrap()
+                    .network
+                    .visibility,
+                Visibility::Unavailable
+            );
             let mut held = publisher.lock().unwrap();
             *clock.lock().unwrap() = (at + Duration::from_secs(21), Some(113_000));
-            let during = read().unwrap();
+            let during = read(aterm_gui::NetworkRead::WithServices).unwrap();
             assert_eq!(during.network.visibility, Visibility::Unavailable);
             assert_eq!(during.network.observed_at_ms, 100_000);
             *held = Some(Publication::new(
@@ -17988,7 +18002,13 @@ mod tests {
                 at + Duration::from_secs(21),
             ));
             drop(held);
-            assert_eq!(read().unwrap().network.visibility, Visibility::Active);
+            assert_eq!(
+                read(aterm_gui::NetworkRead::WithServices)
+                    .unwrap()
+                    .network
+                    .visibility,
+                Visibility::Active
+            );
         }
     }
 
@@ -18014,19 +18034,22 @@ mod tests {
             None,
             move || (at, Some(2000)),
         );
-        let first = read().unwrap();
+        let first = read(aterm_gui::NetworkRead::WithServices).unwrap();
         assert_eq!(first.network.visibility, Visibility::Unavailable);
         assert_eq!(first.network.history, HistoryState::Unavailable);
         assert_eq!(
             first.services.secrets.availability,
             ServiceAvailability::Cached
         );
-        assert!(Arc::ptr_eq(&first, &read().unwrap()));
+        assert!(Arc::ptr_eq(
+            &first,
+            &read(aterm_gui::NetworkRead::WithServices).unwrap()
+        ));
 
         let mut changed = first.services.clone();
         changed.secrets.availability = ServiceAvailability::Unavailable;
         *services.lock().unwrap() = aterm_db::service_state::Publication::new(changed, at);
-        let second = read().unwrap();
+        let second = read(aterm_gui::NetworkRead::WithServices).unwrap();
         assert!(second.revision > first.revision);
         assert_eq!(
             second.services.secrets.availability,
@@ -18059,7 +18082,7 @@ mod tests {
                 None,
                 move || (at, Some(2000)),
             );
-            let first = prefetch.then(|| read().unwrap());
+            let first = prefetch.then(|| read(aterm_gui::NetworkRead::WithServices).unwrap());
             let mut publisher = services.lock().unwrap();
             let mut changed = ServiceStates::default();
             changed.secrets.availability = ServiceAvailability::Unavailable;
@@ -18067,7 +18090,10 @@ mod tests {
             *publisher = aterm_db::service_state::Publication::new(changed, at);
             let concurrent = read.clone();
             let (send, receive) = mpsc::channel();
-            let task = std::thread::spawn(move || send.send(concurrent()).unwrap());
+            let task = std::thread::spawn(move || {
+                send.send(concurrent(aterm_gui::NetworkRead::WithServices))
+                    .unwrap()
+            });
             let result = receive.recv_timeout(std::time::Duration::from_secs(60));
             drop(publisher);
             task.join().unwrap();
@@ -18084,7 +18110,7 @@ mod tests {
                     ServiceAvailability::Unknown
                 );
             }
-            let after = read().unwrap();
+            let after = read(aterm_gui::NetworkRead::WithServices).unwrap();
             assert_eq!(after.services.secrets.observed_at_ms, 2000);
             assert_eq!(
                 after.services.secrets.availability,
@@ -18148,18 +18174,23 @@ mod tests {
             None,
             move || *timer.lock().unwrap(),
         );
-        let first = read().unwrap();
+        let first = read(aterm_gui::NetworkRead::WithServices).unwrap();
         assert_eq!(first.network.history, HistoryState::Ready);
         assert_eq!(
             first.services.secrets.availability,
             ServiceAvailability::Cached
         );
         let background = read.clone();
-        let background = std::thread::spawn(move || background());
+        let background =
+            std::thread::spawn(move || background(aterm_gui::NetworkRead::WithServices));
         entering.recv_timeout(Duration::from_secs(60)).unwrap();
         let foreground = read.clone();
         let (finished, result) = mpsc::channel();
-        let foreground = std::thread::spawn(move || finished.send(foreground()).unwrap());
+        let foreground = std::thread::spawn(move || {
+            finished
+                .send(foreground(aterm_gui::NetworkRead::WithServices))
+                .unwrap()
+        });
         let busy = result.recv_timeout(Duration::from_secs(60));
         resume.send(()).unwrap();
         let resumed = background.join().unwrap().unwrap();
@@ -18171,12 +18202,15 @@ mod tests {
                 .is_none()
         );
         assert!(Arc::ptr_eq(&first, &resumed));
-        assert!(Arc::ptr_eq(&first, &read().unwrap()));
+        assert!(Arc::ptr_eq(
+            &first,
+            &read(aterm_gui::NetworkRead::WithServices).unwrap()
+        ));
 
         // Recovery still uses the producer's original monotonic sample: even a
         // wall-clock rollback that remains after observed_at cannot extend it.
         *clock.lock().unwrap() = (at + Duration::from_secs(61), Some(100_001));
-        let expired = read().unwrap();
+        let expired = read(aterm_gui::NetworkRead::WithServices).unwrap();
         assert_eq!(expired.network.visibility, Visibility::Unavailable);
         assert_eq!(expired.network.history, HistoryState::Ready);
         assert_eq!(expired.network.observed_at_ms, 100_000);
@@ -18220,17 +18254,25 @@ mod tests {
             move || *timer.lock().unwrap(),
         );
         assert_eq!(
-            read().unwrap().services.secrets.availability,
+            read(aterm_gui::NetworkRead::WithServices)
+                .unwrap()
+                .services
+                .secrets
+                .availability,
             ServiceAvailability::Cached
         );
         *clock.lock().unwrap() = (at + Duration::from_secs(61), Some(161_001));
         assert_eq!(
-            read().unwrap().services.secrets.availability,
+            read(aterm_gui::NetworkRead::WithServices)
+                .unwrap()
+                .services
+                .secrets
+                .availability,
             ServiceAvailability::Unknown
         );
         let mut held = publisher.lock().unwrap();
         *clock.lock().unwrap() = (at + Duration::from_secs(62), Some(130_000));
-        let stale = read().unwrap();
+        let stale = read(aterm_gui::NetworkRead::WithServices).unwrap();
         assert_eq!(stale.network.visibility, Visibility::Unavailable);
         assert_eq!(
             stale.services.secrets.availability,
@@ -18240,14 +18282,18 @@ mod tests {
         assert_eq!(stale.services.secrets.revision, states.secrets.revision);
         drop(held);
         assert_eq!(
-            read().unwrap().services.secrets.availability,
+            read(aterm_gui::NetworkRead::WithServices)
+                .unwrap()
+                .services
+                .secrets
+                .availability,
             ServiceAvailability::Unknown
         );
         held = publisher.lock().unwrap();
         states.secrets.observed_at_ms = 130_000;
         *held = aterm_db::service_state::Publication::new(states, at + Duration::from_secs(62));
         drop(held);
-        let restored = read().unwrap();
+        let restored = read(aterm_gui::NetworkRead::WithServices).unwrap();
         assert_eq!(
             restored.services.secrets.availability,
             ServiceAvailability::Cached
@@ -18272,10 +18318,21 @@ mod tests {
             move || (at + Duration::from_secs(120), Some(110_000)),
         );
         assert_eq!(
-            read().unwrap().services.accounts.availability,
+            read(aterm_gui::NetworkRead::WithServices)
+                .unwrap()
+                .services
+                .accounts
+                .availability,
             ServiceAvailability::Unknown
         );
-        assert_eq!(read().unwrap().services.accounts.observed_at_ms, 100_000);
+        assert_eq!(
+            read(aterm_gui::NetworkRead::WithServices)
+                .unwrap()
+                .services
+                .accounts
+                .observed_at_ms,
+            100_000
+        );
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -18285,7 +18342,7 @@ mod tests {
 
         let network = aterm_db::network_state::ObservationHandle::default();
         let read = super::network_state_source_from(move || Some(network.clone()), None, None);
-        let snapshot = read().unwrap();
+        let snapshot = read(aterm_gui::NetworkRead::WithServices).unwrap();
         assert_eq!(snapshot.network.visibility, Visibility::Checking);
         assert_eq!(
             snapshot.services.accounts.availability,
@@ -18295,6 +18352,64 @@ mod tests {
             snapshot.services.secrets.availability,
             ServiceAvailability::Unknown
         );
+    }
+
+    /// Only a reader that draws the services reads them, since a services read asks their
+    /// observer for its next sample; a network reader gets their last sample, which ages as it
+    /// would, keeping what it last observed.
+    /// NEGATIVE CONTROL: a composition that reads the services whatever was asked counts a
+    /// services read for each network read.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_network_read_reads_no_services_and_ages_their_last_sample() {
+        use aterm_gui::NetworkRead::{Network, WithServices};
+        use aterm_types::network_state::{ServiceAvailability, ServiceStates};
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::Duration;
+
+        let at = std::time::Instant::now();
+        let mut states = ServiceStates::default();
+        states.secrets.availability = ServiceAvailability::Cached;
+        states.secrets.observed_at_ms = 100_000;
+        let publication = aterm_db::service_state::Publication::new(states, at);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&reads);
+        let clock = Arc::new(Mutex::new((at, Some(100_000))));
+        let timer = Arc::clone(&clock);
+        let read = super::network_state_source_with_readers(
+            || None,
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Some(publication.clone())
+            },
+            None,
+            move || *timer.lock().unwrap(),
+        );
+        let read_with = |kind| read(kind).unwrap();
+        assert_eq!(
+            read_with(Network).services.secrets.availability,
+            ServiceAvailability::Unknown,
+            "nothing read the services yet"
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            read_with(WithServices).services.secrets.availability,
+            ServiceAvailability::Cached
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            read_with(Network).services.secrets.availability,
+            ServiceAvailability::Cached,
+            "the last sample, still current"
+        );
+        *clock.lock().unwrap() = (at + Duration::from_secs(61), Some(161_000));
+        let aged = read_with(Network).services.secrets.clone();
+        assert_eq!(aged.availability, ServiceAvailability::Unknown);
+        assert_eq!(aged.observed_at_ms, 100_000);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -18335,7 +18450,7 @@ mod tests {
             ..Default::default()
         };
         let read = super::network_state_source_from(|| None, None, Some(retained.clone()));
-        let snapshot = read().unwrap();
+        let snapshot = read(aterm_gui::NetworkRead::WithServices).unwrap();
         assert_eq!(snapshot.network.visibility, Visibility::Unavailable);
         assert!(snapshot.network.observer.is_none());
         assert_eq!(snapshot.network.history, HistoryState::Ready);
@@ -18347,7 +18462,10 @@ mod tests {
         assert_eq!((peer.first_seen_ms, peer.last_seen_ms), (1000, 2000));
         assert_eq!(peer.reachability, Reachability::Unknown);
         assert_eq!(peer.last_checked_ms, None);
-        assert!(Arc::ptr_eq(&snapshot, &read().unwrap()));
+        assert!(Arc::ptr_eq(
+            &snapshot,
+            &read(aterm_gui::NetworkRead::WithServices).unwrap()
+        ));
         assert_eq!(retained.peers[0].reachability, Reachability::Reachable);
     }
 

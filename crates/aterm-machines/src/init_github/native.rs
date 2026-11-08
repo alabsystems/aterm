@@ -897,7 +897,7 @@ impl Item for NativeRepositories {
                 return Err(why);
             }
             current()?;
-            self.acknowledge_credential(sys, &current)?;
+            self.acknowledge_credential(sys, &plan.token, &current)?;
             current()?;
             self.carry(Carried::Applied(plan));
             return Ok(());
@@ -926,6 +926,7 @@ impl NativeRepositories {
     fn acknowledge_credential(
         &self,
         sys: &dyn System,
+        token: &Secret,
         current: &(dyn Fn() -> Result<(), String> + Sync),
     ) -> Result<(), String> {
         current()?;
@@ -935,7 +936,7 @@ impl NativeRepositories {
         if let Some(selection) =
             super::RepositorySelection::for_user(sys, &self.user).map_err(|block| block.why)?
         {
-            selection.credential_satisfied(sys, current)?;
+            selection.credential_satisfied(sys, token, current)?;
         }
         Ok(())
     }
@@ -1006,9 +1007,11 @@ impl NativeRepositories {
             ));
         }
         let mut failed = Vec::new();
+        let mut network_failed = false;
         if let Some(recorded) = &recorded {
             let refreshed =
                 repos::refresh_existing(sys, &self.user, &standing, recorded, &current)?;
+            network_failed |= refreshed.network_failed;
             failed.extend(refreshed.failed);
             // A refreshed parent may declare different gitlinks. Never hydrate
             // dependencies from the pre-refresh parent's cached verdict.
@@ -1023,8 +1026,18 @@ impl NativeRepositories {
         if standing.missing.is_empty() && standing.dependencies.is_empty() {
             if failed.is_empty() {
                 current()?;
-                self.acknowledge_credential(sys, &current)?;
+                self.acknowledge_credential(sys, &plan.token, &current)?;
                 current()?;
+            }
+            if network_failed
+                && let Err(why) = super::RepositorySelection::recover_refused_credential(
+                    sys,
+                    &self.user,
+                    &plan.token,
+                    &current,
+                )
+            {
+                failed.push(format!("credential recovery is unfinished: {why}"));
             }
             self.carry(Carried::Applied(plan));
             return if failed.is_empty() {
@@ -1035,6 +1048,7 @@ impl NativeRepositories {
         }
         let guard = repos::CloneGuard::new(&current);
         let mut cloned = repos::clone_all(sys, &self.user, &standing.missing, Some(&guard));
+        network_failed |= cloned.network_failed;
         cloned.failed.extend(failed);
         let home = Path::new(&self.user.home);
         // Read once the clones and dependencies have taken their room.
@@ -1050,6 +1064,7 @@ impl NativeRepositories {
                 ));
             }
             if let Err(why) = super::dependencies::repair(sys, &self.user, path, repo, &current) {
+                network_failed |= why.is_network();
                 cloned.failed.push(format!("~/{}: {why}", repo.name));
             }
         }
@@ -1065,18 +1080,33 @@ impl NativeRepositories {
             ));
         }
         let mut failed = cloned.failed;
-        // A long batch can outlive changes to worktrees it did not touch. Completion reads
-        // every local destination and required dependency again against this same inventory.
-        self.carry(Carried::Applied(plan));
+        if network_failed
+            && let Err(why) = super::RepositorySelection::recover_refused_credential(
+                sys,
+                &self.user,
+                &plan.token,
+                &current,
+            )
+        {
+            failed.push(format!("credential recovery is unfinished: {why}"));
+        }
         if let Some(why) = room {
             // The failed row keeps the page's words for it (`init_observe::failure_note`).
             self.reading.set(Some(Reading::Waits(Wait::DiskSpace)));
             failed.push(why);
         }
+        let acknowledged = if failed.is_empty() {
+            current()
+                .and_then(|()| self.acknowledge_credential(sys, &plan.token, &current))
+                .and_then(|()| current())
+        } else {
+            Ok(())
+        };
+        // A long batch can outlive changes to worktrees it did not touch. Completion reads
+        // every local destination and required dependency again against this same inventory.
+        self.carry(Carried::Applied(plan));
+        acknowledged?;
         if failed.is_empty() {
-            current()?;
-            self.acknowledge_credential(sys, &current)?;
-            current()?;
             *self.hooks.lock().unwrap_or_else(PoisonError::into_inner) = cloned.hooks;
             Ok(())
         } else {
@@ -2606,6 +2636,524 @@ pub(super) mod tests {
             .unwrap(),
             OwedClone::Waiting(_)
         ));
+
+        // A present credential that the provider definitively rejects is different from
+        // missing materialization. Exercise the actual private clone failure before the
+        // canonical need is inspected; no live provider or credential is involved.
+        let root = aterm_tempfile::tempdir().unwrap();
+        let home = root.path().join("signed-home");
+        let paths = client::Paths::for_home(&home);
+        let signed_source = root.path().join("team.vault");
+        let repositories = aterm_json::json!([
+            repository("alice", "private-missing", 1),
+            repository("alice", "also-missing", 2),
+        ]);
+        let inventory = aterm_json::json!({
+            "schema":2,"account":"alice","repositories":repositories
+        });
+        // A fresh public create/publish producer supplies the actual signed version;
+        // the older Plain-file fixtures above retain their narrower contract.
+        let created = client::create(
+            &paths,
+            signed_source.to_str().unwrap(),
+            None,
+            Some("fixture"),
+        )
+        .unwrap();
+        assert!(created.local.is_none(), "the signed source was installed");
+        let admin = client::admin_open(&paths).unwrap();
+        let mut document = admin.doc.clone();
+        let audience = aterm_secrets::text::Audience::Hosts(vec!["fixture".into()]);
+        document
+            .set_entry(&audience, "gh_access_token", TOKEN.as_bytes())
+            .unwrap();
+        document
+            .set_entry(
+                &audience,
+                "github-repositories.json",
+                inventory.to_string().as_bytes(),
+            )
+            .unwrap();
+        let published = client::admin_publish(&paths, &admin, &document).unwrap();
+        client::sync(&paths, None).unwrap();
+        let who = User {
+            home: home.to_string_lossy().into_owned(),
+            ..user("alice", 501)
+        };
+        let mut sys = Fake::root();
+        sys.euid = who.uid;
+        sys.logged_in(&who);
+        sys.stat_of(home.to_str().unwrap(), stat(true, 0o700));
+        sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+        let token = home.join(super::super::TOKEN_FILE);
+        sys.file(token.to_str().unwrap(), TOKEN.as_bytes())
+            .stat_of(token.to_str().unwrap(), stat(false, 0o600));
+        script::launcher(&sys, &who);
+        script::lookups_hold(&sys, &who, GITHUB, "alice", TOKEN);
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&who));
+        let rejected = ReadbackFixture {
+            paths,
+            source: signed_source,
+            source_text: String::new(),
+            sys,
+            who,
+            ctx,
+            token,
+            _root: root,
+        };
+        metadata(&rejected.sys, &rejected.who, repositories);
+        for name in ["private-missing", "also-missing"] {
+            let endpoint = format!("https://github.com/alice/{name}.git");
+            rejected.sys.on(
+                &crate::checkout::git(&rejected.sys, &rejected.who, None)
+                    .args(["ls-remote", "--get-url", "--", &endpoint])
+                    .display(),
+                Ran::ok(&endpoint),
+            );
+        }
+        aterm_secrets::need::test_alab_policy(&rejected.paths);
+        let sequence = aterm_secrets::need::facts(&rejected.paths, 1)
+            .unwrap()
+            .sight
+            .unwrap()
+            .seq;
+        assert_eq!(
+            sequence, published.seq,
+            "the paired token has an actual signed version"
+        );
+        rejected.sys.simulate(|_, command| {
+            command
+                .display()
+                .contains("ls-remote --symref --")
+                .then(|| Ran::exit(128, "synthetic remote failure; no private output"))
+        });
+        for status in [401, 401, 401, 401, 401, 403, 429] {
+            rejected.sys.on_github_api(
+                &rejected.who,
+                "/user",
+                Ok(GithubResponse {
+                    status,
+                    headers: Vec::new(),
+                    body: br#"{"login":"alice"}"#.to_vec(),
+                }),
+            );
+        }
+        rejected.sys.fail_github_api(
+            &rejected.who,
+            "/user",
+            crate::port::GithubFailure::Unreached,
+        );
+        for status in [200, 200, 403, 429] {
+            rejected.sys.on_github_api(
+                &rejected.who,
+                "/user",
+                Ok(GithubResponse {
+                    status,
+                    headers: Vec::new(),
+                    body: br#"{"login":"alice"}"#.to_vec(),
+                }),
+            );
+        }
+        rejected.sys.fail_github_api(
+            &rejected.who,
+            "/user",
+            crate::port::GithubFailure::Unreached,
+        );
+        let want = aterm_secrets::need::Want::Gh(aterm_secrets::need::GhProfile::Dev);
+        let purpose = aterm_secrets::need::Purpose::AghDev;
+        let pending = aterm_secrets::need::raise(&rejected.paths, want.clone(), purpose).unwrap();
+        assert!(!pending.got && pending.refused.is_none() && !pending.state.ended());
+        let failed = run_with(
+            &rejected.sys,
+            &rejected.ctx,
+            Mode::Apply,
+            RepositoryWork::Repair,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            stage(&failed).outcome,
+            crate::model::Outcome::Failed,
+            "{failed:#?}"
+        );
+        assert_eq!(
+            rejected
+                .sys
+                .calls()
+                .iter()
+                .filter(|call| call.contains("ls-remote --symref --"))
+                .count(),
+            2,
+            "both failed workers complete before the one auth classification"
+        );
+        let requests = aterm_secrets::need::peek(&rejected.paths).unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the rejected present credential needs recovery"
+        );
+        assert_eq!(requests[0].refused, Some(sequence));
+        assert_ne!(
+            requests[0].id, pending.id,
+            "a posted request body cannot gain a new floor in place"
+        );
+        assert!(!requests[0].state.ended());
+        let config = client::config(&rejected.paths).unwrap().unwrap();
+        let paired = || {
+            client::with_materialization_ready_for_entries(
+                &rejected.paths,
+                &config,
+                &super::super::VAULT_INPUT_ENTRIES,
+                || Ok(()),
+            )
+            .unwrap()
+            .unwrap()
+            .snapshot
+        };
+        let ledger = rejected.paths.dir.join(aterm_secrets::need::LEDGER);
+        let refused_bytes = std::fs::read(&ledger).unwrap();
+        assert!(
+            aterm_secrets::need::acknowledge_from_snapshot(
+                &rejected.paths,
+                &pending,
+                &paired(),
+                || Ok(()),
+            )
+            .is_err(),
+            "a local acceptance observed before None became a refusal cannot retire it"
+        );
+        assert_eq!(std::fs::read(&ledger).unwrap(), refused_bytes);
+        assert_eq!(
+            rejected
+                .sys
+                .calls()
+                .iter()
+                .filter(|call| call.contains("agh GET /user"))
+                .count(),
+            1
+        );
+        let run_failed = || {
+            let rows = run_with(
+                &rejected.sys,
+                &rejected.ctx,
+                Mode::Apply,
+                RepositoryWork::Repair,
+                None,
+            )
+            .unwrap();
+            assert_eq!(stage(&rows).outcome, crate::model::Outcome::Failed);
+        };
+        run_failed();
+        assert_eq!(
+            aterm_secrets::need::peek(&rejected.paths).unwrap()[0].id,
+            requests[0].id,
+            "a repeated refusal at the same version keeps its ID"
+        );
+
+        let admin = client::admin_open(&rejected.paths).unwrap();
+        let mut later = admin.doc.clone();
+        later.set_entry(&audience, "unrelated", b"later").unwrap();
+        let later = client::admin_publish(&rejected.paths, &admin, &later).unwrap();
+        client::sync(&rejected.paths, None).unwrap();
+        assert!(later.seq > sequence);
+        run_failed();
+        let advanced = aterm_secrets::need::peek(&rejected.paths)
+            .unwrap()
+            .remove(0);
+        assert_ne!(
+            advanced.id, requests[0].id,
+            "an active undelivered request needs a fresh body for its newer floor"
+        );
+        assert_eq!(advanced.refused, Some(later.seq));
+        run_failed();
+        assert_eq!(
+            aterm_secrets::need::peek(&rejected.paths).unwrap()[0].id,
+            advanced.id
+        );
+        let lower =
+            aterm_secrets::need::raise_refused(&rejected.paths, want.clone(), purpose, sequence)
+                .unwrap();
+        assert_eq!((lower.id, lower.refused), (advanced.id, Some(later.seq)));
+
+        let api_calls = || {
+            rejected
+                .sys
+                .calls()
+                .iter()
+                .filter(|call| call.contains("agh GET /user"))
+                .count()
+        };
+        assert_eq!(
+            api_calls(),
+            4,
+            "one classification per failed network batch"
+        );
+        let paths: Vec<_> = ["private-missing", "also-missing"]
+            .map(|name| Path::new(&rejected.who.home).join(name))
+            .into();
+        for path in &paths {
+            rejected
+                .sys
+                .stat_of(path.to_str().unwrap(), stat(true, 0o700));
+            repos::tests::script_existing(
+                &rejected.sys,
+                &rejected.who,
+                path,
+                path.file_name().unwrap().to_str().unwrap(),
+            );
+        }
+        run_failed();
+        assert_eq!(
+            api_calls(),
+            4,
+            "local-only ack must not become a healthy authentication probe"
+        );
+        assert_eq!(
+            aterm_secrets::need::peek(&rejected.paths).unwrap()[0].id,
+            advanced.id,
+            "helper equality cannot erase this version's definitive refusal"
+        );
+        let state = aterm_tempfile::tempdir().unwrap();
+        assert!(matches!(
+            crate::init::owed_clone(&rejected.sys, state.path(), &Holds::NONE).unwrap(),
+            OwedClone::Due(_)
+        ));
+
+        // A newer unrelated version merely permits recovery. With all worktrees present,
+        // helper equality still cannot erase the provider's explicit refusal.
+        let admin = client::admin_open(&rejected.paths).unwrap();
+        let mut eligible = admin.doc.clone();
+        eligible
+            .set_entry(&audience, "unrelated", b"eligible")
+            .unwrap();
+        let eligible = client::admin_publish(&rejected.paths, &admin, &eligible).unwrap();
+        client::sync(&rejected.paths, None).unwrap();
+        run_failed();
+        let refused_again = aterm_secrets::need::peek(&rejected.paths)
+            .unwrap()
+            .remove(0);
+        assert_ne!(refused_again.id, advanced.id);
+        assert_eq!(refused_again.refused, Some(eligible.seq));
+        assert_eq!(api_calls(), 5);
+        run_failed();
+        assert_eq!(
+            api_calls(),
+            5,
+            "the same refused version does not repeat recovery auth"
+        );
+        let admin = client::admin_open(&rejected.paths).unwrap();
+        let mut eligible = admin.doc.clone();
+        eligible
+            .set_entry(&audience, "unrelated", b"eligible-again")
+            .unwrap();
+        client::admin_publish(&rejected.paths, &admin, &eligible).unwrap();
+        client::sync(&rejected.paths, None).unwrap();
+        for _ in [403, 429, 0] {
+            run_failed();
+            assert_eq!(
+                aterm_secrets::need::peek(&rejected.paths).unwrap()[0].id,
+                refused_again.id,
+                "an unverified response cannot acknowledge or reissue"
+            );
+        }
+        // Model a provider response arriving after another failed consumer has already
+        // advanced the durable refusal. Acceptance belongs to the observed request only.
+        let receipt = paired();
+        let concurrent = aterm_secrets::need::raise_refused_from_snapshot(
+            &rejected.paths,
+            want.clone(),
+            purpose,
+            &receipt,
+            || Ok(()),
+        )
+        .unwrap();
+        assert_ne!(concurrent.id, refused_again.id);
+        assert_eq!(concurrent.refused, Some(receipt.sequence()));
+        let refused_bytes = std::fs::read(&ledger).unwrap();
+        assert!(
+            aterm_secrets::need::acknowledge_from_snapshot(
+                &rejected.paths,
+                &refused_again,
+                &receipt,
+                || Ok(()),
+            )
+            .is_err(),
+            "stale acceptance cannot retire a concurrently replaced request"
+        );
+        assert_eq!(std::fs::read(&ledger).unwrap(), refused_bytes);
+        let admin = client::admin_open(&rejected.paths).unwrap();
+        let mut eligible = admin.doc.clone();
+        eligible
+            .set_entry(&audience, "unrelated", b"after-concurrent-refusal")
+            .unwrap();
+        client::admin_publish(&rejected.paths, &admin, &eligible).unwrap();
+        client::sync(&rejected.paths, None).unwrap();
+        let accepted = run_with(
+            &rejected.sys,
+            &rejected.ctx,
+            Mode::Apply,
+            RepositoryWork::Repair,
+            None,
+        )
+        .unwrap();
+        assert_eq!(stage(&accepted).outcome, crate::model::Outcome::Changed);
+        assert!(
+            aterm_secrets::need::peek(&rejected.paths).unwrap()[0]
+                .state
+                .ended()
+        );
+        assert_eq!(
+            api_calls(),
+            9,
+            "only the parsed provider success accepts recovery"
+        );
+
+        // Successful recovery leaves a stable ended ledger row: none of these
+        // ordinary remote outcomes may turn it into another credential request.
+        for path in &paths {
+            rejected.sys.remove(path).unwrap();
+        }
+        let ledger = rejected.paths.dir.join(aterm_secrets::need::LEDGER);
+        let before = std::fs::read(&ledger).unwrap();
+        for _ in [200, 403, 429, 0] {
+            run_failed();
+            assert_eq!(
+                std::fs::read(&ledger).unwrap(),
+                before,
+                "non-401 responses and an unreached provider do not rearm"
+            );
+        }
+        assert_eq!(api_calls(), 13);
+
+        for path in &paths {
+            rejected
+                .sys
+                .stat_of(path.to_str().unwrap(), stat(true, 0o700));
+        }
+        let ready = run_with(
+            &rejected.sys,
+            &rejected.ctx,
+            Mode::Apply,
+            RepositoryWork::Repair,
+            None,
+        )
+        .unwrap();
+        assert_eq!(stage(&ready).outcome, crate::model::Outcome::Ok);
+        assert_eq!(
+            api_calls(),
+            13,
+            "healthy preseeded work stays entirely local"
+        );
+
+        for path in &paths {
+            rejected.sys.remove(path).unwrap();
+        }
+        rejected.sys.simulate(|_, command| {
+            command
+                .display()
+                .contains("ls-remote --get-url --")
+                .then(|| Ran::exit(1, "synthetic local route inspection failure"))
+        });
+        run_failed();
+        assert_eq!(
+            api_calls(),
+            13,
+            "local failures never classify provider authentication"
+        );
+        assert_eq!(std::fs::read(&ledger).unwrap(), before);
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = Arc::clone(&stopped);
+        rejected.sys.simulate(move |_, command| {
+            command
+                .display()
+                .contains("ls-remote --symref --")
+                .then(|| {
+                    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ran::exit(128, "synthetic failed network step")
+                })
+        });
+        let mut item = NativeRepositories::new(rejected.who.clone(), None);
+        item.work = RepositoryWork::Repair;
+        assert!(matches!(
+            item.probe(&rejected.sys, &rejected.ctx),
+            Probe::Change { .. }
+        ));
+        assert!(
+            item.apply_guarded(&rejected.sys, &rejected.ctx, &|| {
+                if stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                    Err("late Stop".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err()
+        );
+        assert!(stopped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(api_calls(), 13, "Stop before recovery starts no auth read");
+        assert_eq!(std::fs::read(&ledger).unwrap(), before);
+
+        // The exact-version registration must reject a later unrelated publication even
+        // though the scoped token/inventory currency intentionally remains valid.
+        let config = client::config(&rejected.paths).unwrap().unwrap();
+        let captured = client::with_materialization_ready_for_entries(
+            &rejected.paths,
+            &config,
+            &super::super::VAULT_INPUT_ENTRIES,
+            || Ok(()),
+        )
+        .unwrap()
+        .unwrap();
+        let admin = client::admin_open(&rejected.paths).unwrap();
+        let mut changed = admin.doc.clone();
+        changed.set_entry(&audience, "unrelated", b"newer").unwrap();
+        client::admin_publish(&rejected.paths, &admin, &changed).unwrap();
+        client::sync(&rejected.paths, None).unwrap();
+        assert!(captured.snapshot.is_current_now(&rejected.paths).unwrap());
+        assert!(
+            aterm_secrets::need::raise_refused_from_snapshot(
+                &rejected.paths,
+                want.clone(),
+                purpose,
+                &captured.snapshot,
+                || Ok(())
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&ledger).unwrap(), before);
+        let captured = client::with_materialization_ready_for_entries(
+            &rejected.paths,
+            &config,
+            &super::super::VAULT_INPUT_ENTRIES,
+            || Ok(()),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            aterm_secrets::need::raise_refused_from_snapshot(
+                &rejected.paths,
+                want,
+                purpose,
+                &captured.snapshot,
+                || Err(aterm_secrets::Error::new("late Stop"))
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&ledger).unwrap(), before);
+        let whole = client::with_materialization_ready(&rejected.paths, &config, || Ok(()))
+            .unwrap()
+            .unwrap();
+        assert!(
+            aterm_secrets::need::raise_refused_from_snapshot(
+                &rejected.paths,
+                aterm_secrets::need::Want::Notary,
+                aterm_secrets::need::Purpose::ReleaseNotary,
+                &whole.snapshot,
+                || Ok(())
+            )
+            .is_err(),
+            "a whole snapshot without the requested credential is no receipt"
+        );
+        assert_eq!(std::fs::read(&ledger).unwrap(), before);
     }
 
     #[test]

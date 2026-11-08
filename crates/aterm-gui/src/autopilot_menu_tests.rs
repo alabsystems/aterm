@@ -373,7 +373,7 @@ fn the_card_keeps_to_its_panes_rows_and_gives_up_its_padding_first() {
     let tight = super::rows(&named(31));
     let rect = place(&tight, (28, 40), (1..30, 33..64), (64, 30), 1).unwrap();
     assert_eq!((rect.col, rect.w), (33, 31), "as wide as its pane");
-    let painted: Vec<String> = paint(rect, &tight, MenuViewport::default(), None, theme)
+    let painted: Vec<String> = paint(rect, &tight, MenuViewport::default(), None, theme, None)
         .iter()
         .map(|r| text(r))
         .collect();
@@ -402,7 +402,7 @@ fn the_card_keeps_to_its_panes_rows_and_gives_up_its_padding_first() {
         MenuRow::Header("Autopilot \u{b7} tab 1, right pane".to_string())
     );
     let rect = place(&wide, (28, 40), (1..30, 0..100), (100, 30), 1).unwrap();
-    let painted = paint(rect, &wide, MenuViewport::default(), None, theme);
+    let painted = paint(rect, &wide, MenuViewport::default(), None, theme, None);
     assert_eq!(text(&painted[1]).chars().nth(1), Some(' '), "padded");
 }
 
@@ -476,7 +476,7 @@ fn the_card_paints_its_rect_its_check_and_its_disabled_rows() {
     };
     let rows = rows(&facts(AutopilotView::Cruise));
     let rect = place(&rows, (30, 4), (0..40, 0..120), (120, 40), 1).unwrap();
-    let painted = paint(rect, &rows, MenuViewport::default(), Some(2), theme);
+    let painted = paint(rect, &rows, MenuViewport::default(), Some(2), theme, None);
     assert_eq!(painted.len(), rect.h);
     assert!(painted.iter().all(|r| r.len() == rect.w));
     let text = |r: &[RenderCell]| r.iter().map(|c| c.ch).collect::<String>();
@@ -493,7 +493,7 @@ fn the_card_paints_its_rect_its_check_and_its_disabled_rows() {
     assert_ne!(painted[3][3].bg, painted[2][3].bg, "the highlight's ground");
     let off = super::rows(&facts(AutopilotView::MasterOff));
     let rect = place(&off, (30, 4), (0..40, 0..120), (120, 40), 1).unwrap();
-    let painted = paint(rect, &off, MenuViewport::default(), None, theme);
+    let painted = paint(rect, &off, MenuViewport::default(), None, theme, None);
     let cruise = 1 + 2;
     let settings = off.len();
     assert_ne!(
@@ -3249,4 +3249,104 @@ fn a_regrid_between_a_double_clicks_presses_moves_no_pixel_of_it() {
             "on_card={on_card}: spent only where it fell on the card as laid"
         );
     }
+}
+
+/// THE CARD BORDER IS THE STATIC ARC (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4):
+/// a fact card under a palette paints each border cell, the corners and both sides included, in
+/// [`GlassInks::border`] at its place round the perimeter (the launch card's border, held
+/// still), and draws its rules inside the border so the arc runs whole; the same card painted
+/// again paints the same border. With no palette the border is the card's rule ink and a rule
+/// meets it (`├─┤`). Negative controls: a border in the card's rule ink (the card before S6) is
+/// one colour; a border hued by column alone paints each side one colour down its height.
+#[test]
+fn the_card_border_is_the_static_arc() {
+    let theme = aterm_render::Theme {
+        fg: 0x00E0_E0E0,
+        bg: 0x0018_1818,
+        cursor: 0x00FF_FFFF,
+        selection: 0x0044_4466,
+    };
+    let rows = vec![
+        MenuRow::Header("Accounts \u{b7} tab 1".to_string()),
+        MenuRow::note("continuous for the next 7 days"),
+        MenuRow::Rule,
+        MenuRow::note("main   75%  Max 20x"),
+        MenuRow::note("alt    40%  Max 20x"),
+        MenuRow::note("pool   12%  Max 5x"),
+        MenuRow::Rule,
+        MenuRow::note("No pinned account"),
+    ];
+    let rect = MenuRect {
+        row: 0,
+        col: 0,
+        w: 36,
+        h: rows.len() + 2,
+    };
+    let c = crate::tab_menu::glass_menu_colors(theme);
+    let (w, h) = (rect.w, rect.h);
+    let border = |r: usize, col: usize| r == 0 || r + 1 == h || col == 0 || col + 1 == w;
+    for palette in [CardPalette::Cruise, CardPalette::Land, CardPalette::Off] {
+        let glass = GlassInks::of(Some(palette), pack(c.card_bg), theme.fg, pack(c.rule));
+        let painted = paint(
+            rect,
+            &rows,
+            MenuViewport::default(),
+            None,
+            theme,
+            Some(palette),
+        );
+        assert_eq!(painted.len(), h);
+        let mut inks = std::collections::BTreeSet::new();
+        for (r, line) in painted.iter().enumerate() {
+            for (col, cell) in line.iter().enumerate().filter(|(col, _)| border(r, *col)) {
+                let want = unpack(glass.border(r, col, h, w));
+                assert_eq!(cell.fg, want, "{palette:?}: ({r}, {col}) {:?}", cell.ch);
+                inks.insert(cell.fg);
+            }
+        }
+        if palette != CardPalette::Off {
+            assert!(
+                inks.len() > 4,
+                "{palette:?}: the arc, not one ink: {inks:?}"
+            );
+            for col in [0, w - 1] {
+                let side: std::collections::BTreeSet<_> =
+                    (1..h - 1).map(|r| painted[r][col].fg).collect();
+                assert!(side.len() > 1, "{palette:?}: column {col} keeps one ink");
+            }
+        }
+        for r in [3, 7] {
+            assert_eq!(
+                painted[r][0].ch, '\u{2502}',
+                "{palette:?}: a rule inside the border"
+            );
+            assert_eq!(painted[r][w - 1].ch, '\u{2502}');
+            assert!(
+                painted[r][1..w - 1]
+                    .iter()
+                    .any(|cell| cell.ch == '\u{2500}' && cell.fg == c.rule),
+                "{palette:?}: the rule in the card's rule ink"
+            );
+        }
+        let again = paint(
+            rect,
+            &rows,
+            MenuViewport::default(),
+            None,
+            theme,
+            Some(palette),
+        );
+        assert_eq!(painted, again, "{palette:?}: a static border");
+    }
+    let plain = paint(rect, &rows, MenuViewport::default(), None, theme, None);
+    let rule = crate::tab_menu::menu_colors(theme).rule;
+    for (r, line) in plain.iter().enumerate() {
+        for (col, cell) in line.iter().enumerate().filter(|(col, _)| border(r, *col)) {
+            assert_eq!(cell.fg, rule, "no palette: ({r}, {col})");
+        }
+    }
+    assert_eq!(
+        plain[3][0].ch, '\u{251c}',
+        "no palette: a rule meets the border"
+    );
 }

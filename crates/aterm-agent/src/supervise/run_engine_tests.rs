@@ -14346,6 +14346,7 @@ fn a_retry_mark_with_any_signed_stamp_can_be_taken_up_by_the_session() {
             checks: 0,
             land: Default::default(),
             pass: Default::default(),
+            needs_acked: 0,
         };
         let body = Row {
             rule_id: RULE_POINT,

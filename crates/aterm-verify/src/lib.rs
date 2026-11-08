@@ -626,9 +626,12 @@ pub struct Ctx {
     /// The test binaries a release's resume carries ([`testrun::carry`], `--passed-binaries`).
     pub passed_binaries: Option<testrun::Passed>,
     /// Where a run writes each `check-finished` and `test-binary-finished` line whole, apart
-    /// from its output, and its `run-finished` line last (`--events`): a release's cutter keeps
+    /// from its output, and its check-terminal `run-finished` line (`--events`; later accounting may follow): a release's cutter keeps
     /// its records from it (A19), and `verify land` its judgment (B10).
     pub events: Option<event_log::EventLog>,
+    /// Owner-private directory beside the run log where a hung test binary's raw all-thread
+    /// sample is retained. It is created lazily only when the detector fires.
+    pub hang_samples: Option<PathBuf>,
     /// A call of the run's test compile did not pass: every later call of it, and the test
     /// run's own compile, are COULD NOT RUN behind it and start no cargo, since a recompile of
     /// what failed would run under a claim learned when it passed, or none.
@@ -718,6 +721,7 @@ impl Ctx {
         scratch: PathBuf,
         tools: Toolchain,
     ) -> Self {
+        let _ = report::running_driver();
         let path_env = native_package_path(
             &tools.path_with_stage2_first(&env.path),
             env.native_packages.as_deref(),
@@ -780,6 +784,7 @@ impl Ctx {
             test_history: None,
             passed_binaries: None,
             events: None,
+            hang_samples: None,
             test_compile_failed: std::sync::atomic::AtomicBool::new(false),
             halt: sched::Halt::off(),
             unit_graph: stages::unit_graph,
@@ -935,7 +940,7 @@ impl Ctx {
     }
 
     /// The `RUST_TEST_THREADS` every test child carries where a slot is held, a release's pool
-    /// was adopted or the caller pinned it: what cargo's own serial run, the doctests and a rerun
+    /// was adopted or the caller pinned it: what the recording pass, the doctests and a rerun
     /// give each binary.
     pub(crate) fn test_thread_override(&self) -> Option<u32> {
         (self.env.build_slot_held.is_some() || self.pool.is_some() || self.test_threads.is_some())
@@ -960,7 +965,7 @@ impl Ctx {
     }
 
     /// The release's pool this run adopted ([`Ctx::pool`]): the test run's share, so the widest
-    /// binary its builders and serial fallbacks are pinned to is drawn from it.
+    /// binary its builders and recording pass are pinned to is drawn from it.
     #[must_use]
     pub fn with_pool(mut self, pool: Option<aterm_capacity::Jobserver>) -> Self {
         self.pool = pool;
@@ -1041,7 +1046,7 @@ impl Ctx {
         self
     }
 
-    /// Write each `check-finished` and `test-binary-finished` line to `events` too
+    /// Write each check, binary and observed case event to `events` too
     /// ([`Ctx::events`]).
     #[must_use]
     pub fn with_events(mut self, events: Option<event_log::EventLog>) -> Self {
@@ -1050,9 +1055,13 @@ impl Ctx {
     }
 
     /// Write `line`, a `verify-event: ` line, to the run's events file, when it has one.
-    pub fn record_event(&self, line: &str) {
+    pub fn record_event(&self, line: &str) -> String {
         if let Some(events) = &self.events {
-            events.write(line);
+            let line = events.prepare(line);
+            events.write_prepared(&line);
+            line
+        } else {
+            line.to_owned()
         }
     }
 
@@ -1090,6 +1099,7 @@ impl Ctx {
     #[must_use]
     pub fn exec_env(&self) -> exec::ExecEnv<'_> {
         exec::ExecEnv {
+            events: self.events.as_ref(),
             cwd: &self.root,
             path: &self.path_env,
             scratch: &self.scratch,
@@ -1098,6 +1108,7 @@ impl Ctx {
             add_env: &self.child_env_add,
             stage_groups: self.runs.as_ref().map(|r| r as &dyn exec::StageGroupEnd),
             host: &exec::LIVE_HOST,
+            hang_samples: self.hang_samples.as_deref(),
         }
     }
 
@@ -1909,7 +1920,7 @@ fn claim_memory(
 }
 
 /// Claim `bytes` for a test run's binaries (`what` says which: the most its plan's hold at once,
-/// [`test_plan::schedule`], or cargo's run of one at a time), from their history, as a stage's
+/// [`test_plan::schedule`], or the recording pass), from their history, as a stage's
 /// memory is claimed ([`claim_memory`]), admitted by `admit`: the test run's stage claims none of
 /// its own ([`memory::dispatched`]). `Ok(None)` for nothing to claim, or a run with no book.
 ///
@@ -2202,6 +2213,10 @@ fn run_with(
     show: &Show<'_>,
     seams: Seams,
 ) -> std::io::Result<i32> {
+    ctx.record_event(&format!(
+        "verify-event: {}",
+        aterm_json::json!({"schema":1,"event":"measure-driver","sha256":report::running_driver()})
+    ));
     if let Err(why) = test_workers::admitted_share(&ctx.env)
         .and_then(|_| test_workers::share(&ctx.env, ctx.pool.as_ref()))
     {
@@ -2259,8 +2274,8 @@ fn run_with(
             let owner = owners[i].and_then(|c| ctx.checks.iter().position(|k| *k == c));
             let held = held_note(&stages, i, held, budget);
             let (report, begun_at, machine, cpu) = staged(ctx, &quiet, spec, held, seams, || {
+                let event = ctx.record_event(&report::stage_started(i, &spec.title));
                 if let Ok(mut o) = out.lock() {
-                    let event = report::stage_started(i, &spec.title);
                     let _ = o.write_all(event.as_bytes()).and_then(|()| o.flush());
                 }
             });
@@ -2268,8 +2283,8 @@ fn run_with(
             let execution = begun_at.elapsed();
             // The ordered log and aggregate check result can wait for other stages;
             // the completed stage's decisions must already be visible to the caller.
+            let event = ctx.record_event(&report::stage_event(i, &report, waiting, execution, cpu));
             if let Ok(mut o) = out.lock() {
-                let event = report::stage_event(i, &report, waiting, execution, cpu);
                 let _ = o.write_all(event.as_bytes()).and_then(|()| o.flush());
             }
             if let Some(k) = owner
@@ -2309,13 +2324,13 @@ fn run_with(
                         ctx.halted(),
                     );
                     // The check's record (A19) is read from this one line, written whole before
-                    // its rendered line, so the two are never split by another writer. The events
-                    // file takes it under the output's lock too, so both list checks in one order.
+                    // its rendered line, so the two are never split by another output writer.
+                    // Persist first: no output mutex is held during external file contention.
+                    // Concurrent sinks may order different checks differently, but keep identical records.
                     let event = report::check_event(&result, &mine);
                     let text = report::render(&result, width);
-                    let held = out.lock();
-                    ctx.record_event(&event);
-                    if let Ok(mut o) = held {
+                    let event = ctx.record_event(&event);
+                    if let Ok(mut o) = out.lock() {
                         let _ = o
                             .write_all(event.as_bytes())
                             .and_then(|()| o.write_all(text.as_bytes()))
@@ -2839,7 +2854,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         .with_quiet_tmpdir(&std::env::temp_dir())
         .with_head_at_start(head_at_start);
     ctx.background = parsed.background;
-    let ctx = match runs_dir
+    let mut ctx = match runs_dir
         .as_deref()
         .and_then(|dir| runs::Runs::open(&ctx, dir, exec::run))
         .map(|record| record.telling(Box::new(runs::ToInstance::from_env())))
@@ -2864,11 +2879,8 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
             return code;
         }
     };
-    let mut log = run_log::open(
-        parsed.log.as_deref(),
-        cwd,
-        &ctx.state_dir().join("logs.noindex"),
-    );
+    let mut log = open_run_log(&mut ctx, parsed.log.as_deref(), cwd);
+    ctx.hang_samples = log.as_ref().map(|log| run_log::sample_dir(&log.path));
     let log_shown = log.as_ref().map(|log| log.path.display().to_string());
     let mut sink = std::io::sink();
     let log_writer: &mut (dyn Write + Send) = match log.as_mut() {
@@ -2892,7 +2904,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         if let Some(line) = disk::keep_used(&ctx, code == exit::PASS) {
             let _ = log.as_mut().map(|f| writeln!(f, "{line}"));
         }
-        let_disk_go(disk, code == exit::PASS, log.as_mut());
+        let_disk_go(disk, code == exit::PASS, log.as_mut(), ctx.events.as_ref());
     }
     end_run(&ctx, &scratch);
     if parsed.background && stopping() && code != exit::FAILED {
@@ -2900,6 +2912,41 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     } else {
         code
     }
+}
+
+/// Admit paired diagnostics before stages begin, binding only captured context facts.
+fn open_run_log(ctx: &mut Ctx, chosen: Option<&Path>, cwd: &Path) -> Option<run_log::Log> {
+    let event_context = event_log::Context::captured(ctx);
+    ctx.events
+        .get_or_insert_with(event_log::EventLog::unrecorded)
+        .bind(event_context);
+    let invocation = ctx
+        .events
+        .as_ref()
+        .and_then(event_log::EventLog::id)
+        .map(str::to_owned);
+    let mut log = run_log::open(
+        chosen,
+        cwd,
+        &ctx.state_dir().join("logs.noindex"),
+        invocation.as_deref(),
+    );
+    if let Some(retained) = log.as_mut().and_then(run_log::Log::take_events) {
+        if let Some(events) = &mut ctx.events {
+            events.retain(retained);
+        }
+        if let Some(log) = &log {
+            eprintln!(
+                "verify: events: {}",
+                run_log::events_path(&log.path).display()
+            );
+        }
+    }
+    event_log::emit(
+        ctx.events.as_ref(),
+        "verify-event: {\"schema\":1,\"event\":\"invocation-started\"}",
+    );
+    log
 }
 
 /// Let the run's disk claim `held` go, saying in `log` what it claimed and what the run grew:
@@ -2914,17 +2961,22 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
 /// Then, whatever the run's disk, it says on stderr how it was held and how many walks of its
 /// directories it made ([`disk::event`]).
 #[cfg(unix)]
-fn let_disk_go(held: disk::Disk, passed: bool, log: Option<&mut impl Write>) {
+fn let_disk_go(
+    held: disk::Disk,
+    passed: bool,
+    log: Option<&mut impl Write>,
+    events: Option<&event_log::EventLog>,
+) {
     let mode = held.mode();
     let held = match held {
         disk::Disk::Held(held) => held,
         disk::Disk::Covered(by) => {
             let _ = log.map(|f| writeln!(f, "{}", disk::covered_line(&by)));
-            eprintln!("{}", disk::event(mode, aterm_capacity::walks()));
+            event_log::emit(events, &disk::event(mode, aterm_capacity::walks()));
             return;
         }
         disk::Disk::Unclaimed => {
-            eprintln!("{}", disk::event(mode, aterm_capacity::walks()));
+            event_log::emit(events, &disk::event(mode, aterm_capacity::walks()));
             return;
         }
     };
@@ -2954,7 +3006,7 @@ fn let_disk_go(held: disk::Disk, passed: bool, log: Option<&mut impl Write>) {
         atpkg::admit_disk::size(took.peak)
     );
     let _ = log.map(|f| writeln!(f, "{line}"));
-    eprintln!("{}", disk::event(mode, aterm_capacity::walks()));
+    event_log::emit(events, &disk::event(mode, aterm_capacity::walks()));
 }
 
 /// What a finished run's disk line says it kept (`let_disk_go`): which of the record beside its
@@ -4068,6 +4120,177 @@ mod tests {
         assert!(DEPENDENT_RAN.load(Ordering::SeqCst));
     }
 
+    #[test]
+    fn an_existing_pair_and_external_hardlink_receive_each_actual_event_once() {
+        fn stage(_: &Ctx, spec: &plan::StageSpec) -> Report {
+            let mut report = Report::new(spec.title.clone());
+            report.pass("ran");
+            report
+        }
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("chosen.log");
+        let context = || {
+            Ctx::new(
+                dir.path().to_path_buf(),
+                Scope::crate_only("aterm-verify"),
+                EnvSnapshot::default(),
+                dir.path().join("scratch"),
+            )
+            .with_checks(&[Check::Fmt])
+        };
+        let mut previous = context();
+        let log = open_run_log(&mut previous, Some(&path), dir.path()).unwrap();
+        drop(log);
+        drop(previous);
+        let alias = dir.path().join("external-alias.events");
+        std::fs::hard_link(run_log::events_path(&path), &alias).unwrap();
+        let mut ctx = context().with_events(Some(event_log::EventLog::open(&alias).unwrap()));
+        let mut log = open_run_log(&mut ctx, Some(&path), dir.path()).unwrap();
+        assert_eq!(
+            run_with(
+                &ctx,
+                &mut Vec::new(),
+                &mut log,
+                &Show::default(),
+                Seams { stage, ..LIVE }
+            )
+            .unwrap(),
+            exit::PASS
+        );
+        drop(log);
+        drop(ctx);
+        let text = std::fs::read_to_string(&alias).unwrap();
+        assert_eq!(
+            std::fs::read(&alias).unwrap(),
+            std::fs::read(run_log::events_path(&path)).unwrap()
+        );
+        let observed = status::observe(&text);
+        assert_eq!(observed.invocations.len(), 1);
+        assert_eq!(observed.invocations[0].observed.terminal_records, 1);
+        assert_eq!(observed.invocations[0].observed.checks[0].occurrences, 1);
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.contains("invocation-started"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn structured_records_survive_the_external_temp_directory_and_keep_actual_producer_bytes() {
+        fn stage(_: &Ctx, spec: &plan::StageSpec) -> Report {
+            let mut report = Report::new(spec.title.clone());
+            report.pass("ran the bounded fixture stage");
+            report
+        }
+        let retained = aterm_tempfile::tempdir().unwrap();
+        let transient = aterm_tempfile::tempdir().unwrap();
+        let external = transient.path().join("verify.events");
+        let mut ctx = Ctx::new(
+            retained.path().to_path_buf(),
+            Scope::crate_only("aterm-verify"),
+            EnvSnapshot::default(),
+            retained.path().join("scratch"),
+        )
+        .with_checks(&[Check::Fmt])
+        .with_events(Some(event_log::EventLog::open(&external).unwrap()));
+        let path = retained.path().join("kept.log");
+        let mut log = open_run_log(&mut ctx, Some(&path), retained.path()).unwrap();
+        let id = ctx.events.as_ref().unwrap().id().unwrap().to_owned();
+        let mut out = Vec::new();
+        let code = run_with(
+            &ctx,
+            &mut out,
+            &mut log,
+            &Show::default(),
+            Seams { stage, ..LIVE },
+        )
+        .unwrap();
+        assert_eq!(code, exit::PASS);
+        #[cfg(unix)]
+        let_disk_go(
+            disk::Disk::Unclaimed,
+            true,
+            Some(&mut log),
+            ctx.events.as_ref(),
+        );
+        drop(log);
+        drop(ctx);
+        let external_bytes = std::fs::read(&external).unwrap();
+        drop(transient);
+        assert!(!external.exists());
+        let at = run_log::events_path(&path);
+        assert_eq!(std::fs::read(&at).unwrap(), external_bytes);
+        let text = String::from_utf8(external_bytes).unwrap();
+        let observed = status::observe(&text);
+        assert_eq!(observed.invocations.len(), 1);
+        let run = &observed.invocations[0];
+        assert_eq!(run.id, id);
+        assert!(run.source_observation.is_some());
+        assert_eq!(run.observed.terminal_consistency, "matching-observed-rows");
+        let rows = text
+            .lines()
+            .filter_map(event_log::CheckRow::of_event)
+            .collect();
+        let finished = text
+            .lines()
+            .rev()
+            .find_map(event_log::Finished::of_event)
+            .unwrap();
+        assert!(
+            event_log::Judged {
+                code: finished.code,
+                checks: rows,
+                secs: 0,
+                finished: Some(finished)
+            }
+            .whole()
+        );
+        let output = String::from_utf8(out).unwrap();
+        for line in output
+            .lines()
+            .filter(|line| line.starts_with("verify-event: "))
+        {
+            assert!(
+                text.lines().any(|kept| kept == line),
+                "same prepared bytes in both sinks"
+            );
+        }
+        let kinds = text
+            .lines()
+            .map(|line| {
+                aterm_json::from_str::<aterm_json::Value>(
+                    line.strip_prefix("verify-event: ").unwrap(),
+                )
+                .unwrap()["event"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert!(kinds.iter().any(|kind| kind == "stage-started"));
+        assert!(kinds.iter().any(|kind| kind == "stage-finished"));
+        #[cfg(unix)]
+        assert!(
+            kinds
+                .iter()
+                .position(|kind| kind == "run-finished")
+                .unwrap()
+                < kinds.iter().position(|kind| kind == "disk").unwrap()
+        );
+        assert_eq!(
+            status::run(
+                &[
+                    "--events".into(),
+                    at.to_string_lossy().into_owned(),
+                    "--json".into()
+                ],
+                retained.path()
+            ),
+            exit::PASS
+        );
+    }
+
     /// Each check's `check-finished` event is written once, whole, right before its own line and
     /// before the verdict, with the word that line opens with, and the same line to the run's
     /// events file, which a release's cutter keeps one record per check from (A19); the file
@@ -4149,13 +4372,36 @@ mod tests {
             })
             .collect();
         let kept = std::fs::read_to_string(&at).unwrap();
+        let drivers = kept
+            .lines()
+            .filter_map(|line| line.strip_prefix("verify-event: "))
+            .filter_map(|json| aterm_json::from_str::<aterm_json::Value>(json).ok())
+            .filter(|event| event["event"].as_str() == Some("measure-driver"))
+            .collect::<Vec<_>>();
+        assert_eq!(drivers.len(), 1);
+        assert_eq!(drivers[0]["sha256"].as_str(), report::running_driver());
         let (last, checks) = kept
             .lines()
             .collect::<Vec<_>>()
             .split_last()
             .map(|(last, checks)| (last.to_string(), checks.to_vec()))
             .expect("the events file");
-        assert_eq!(checks, said, "{kept}");
+        let mut kept_checks = checks
+            .iter()
+            .copied()
+            .filter(|line| event_log::CheckRow::of_event(line).is_some())
+            .collect::<Vec<_>>();
+        let mut said = said;
+        kept_checks.sort_unstable();
+        said.sort_unstable();
+        assert_eq!(
+            kept_checks, said,
+            "exact records in both sinks, independent concurrent ordering: {kept}"
+        );
+        assert!(
+            checks.iter().any(|line| line.contains("stage-started")),
+            "actual stage records are retained too"
+        );
         let finished: aterm_json::Value =
             aterm_json::from_str(last.strip_prefix("verify-event: ").expect("an event")).unwrap();
         assert_eq!(finished["event"].as_str(), Some("run-finished"), "{last}");

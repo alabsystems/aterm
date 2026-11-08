@@ -483,36 +483,74 @@ fn a_green_branch_lands_as_one_merge_stating_its_judgment() {
 /// lands as one new merge of it.
 #[test]
 fn a_branch_that_merged_main_by_hand_lands_as_that_merge_restated() {
-    let world = world();
-    let feature = commit(&world.work, "a/x.txt", "a2\n");
-    let main = rival_moves(&world, "b/y.txt", "b2\n");
-    git(&world.work, &["fetch", "-q", "origin"]);
-    git(
-        &world.work,
-        &[
-            "merge",
-            "-q",
-            "--no-ff",
-            "-m",
-            "Merge main by hand",
-            "origin/main",
-        ],
-    );
-    let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
-    assert_eq!(code, exit::PASS, "{said:#?}");
-    assert_eq!(bases, std::slice::from_ref(&main));
-    let landing = origin_main(&world);
-    assert_eq!(
-        git(&world.work, &["rev-list", "--parents", "-n", "1", &landing]),
-        format!("{landing} {feature} {main}"),
-        "the hand merge's own parents: no second merge"
-    );
-    assert_eq!(
-        git(&world.work, &["log", "-1", "--format=%s", &landing]),
-        "Merge main by hand"
-    );
-    assert!(stated(&world, &landing).is_some(), "{said:#?}");
-    assert_eq!(git(&world.work, &["rev-parse", "HEAD"]), landing);
+    for branch in [Some("feature"), Some("feature\u{a0}"), None] {
+        let world = world();
+        let feature = commit(&world.work, "a/x.txt", "a2\n");
+        let main = rival_moves(&world, "b/y.txt", "b2\n");
+        git(&world.work, &["fetch", "-q", "origin"]);
+        git(
+            &world.work,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                "Merge main by hand",
+                "origin/main",
+            ],
+        );
+        let judged = git(&world.work, &["rev-parse", "HEAD"]);
+        match branch {
+            Some("feature") => {}
+            Some(name) => {
+                git(&world.work, &["checkout", "-q", "-b", name]);
+            }
+            None => {
+                git(&world.work, &["checkout", "-q", "--detach"]);
+            }
+        }
+        let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+        assert_eq!(code, exit::PASS, "{said:#?}");
+        assert_eq!(bases, std::slice::from_ref(&main));
+        let landing = origin_main(&world);
+        assert_eq!(
+            git(&world.work, &["rev-list", "--parents", "-n", "1", &landing]),
+            format!("{landing} {feature} {main}"),
+            "the hand merge's own parents: no second merge"
+        );
+        assert_eq!(
+            git(&world.work, &["log", "-1", "--format=%s", &landing]),
+            "Merge main by hand"
+        );
+        assert!(stated(&world, &landing).is_some(), "{said:#?}");
+        if branch != Some("feature") {
+            assert_eq!(
+                git(&world.work, &["rev-parse", "refs/heads/feature"]),
+                judged,
+                "adoption must not move the similarly named or detached checkout's other branch"
+            );
+        }
+        assert_eq!(git(&world.work, &["rev-parse", "HEAD"]), landing);
+        if let Some(name) = branch {
+            assert_eq!(
+                git(&world.work, &["rev-parse", &format!("refs/heads/{name}")]),
+                landing
+            );
+        } else {
+            let plumbing = Git {
+                root: &world.work,
+                make: &git_cmd,
+            };
+            assert_eq!(
+                plumbing
+                    .status(&["symbolic-ref", "--quiet", "HEAD"], LOCAL)
+                    .unwrap()
+                    .status
+                    .code(),
+                Some(1)
+            );
+        }
+    }
 }
 
 /// A CHECKOUT THAT MOVES OR CHANGES DURING THE RUN PUSHES NOTHING: the run judged files the
@@ -814,6 +852,7 @@ fn semantic_git_output_keeps_its_admission_prefix() {
     let world = world();
     let mut text = "-uninitialised prerequisite\n".to_owned();
     text.push_str(&"x".repeat(aterm_uds::deadline::OUTPUT_KEEP + 1));
+    text.push('\u{a0}');
     commit(&world.work, "large.txt", &text);
     let plumbing = Git {
         root: &world.work,

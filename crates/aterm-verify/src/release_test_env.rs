@@ -111,7 +111,7 @@ fn declared(ctx: &Ctx, mut cmd: Cmd) -> Cmd {
     cmd
 }
 
-/// Explicit release policy, shared by Cargo fallback, replayed binaries and doctests.
+/// Explicit release policy, shared by Cargo's recording pass, replayed binaries and doctests.
 /// Cache locations stay those selected before HOME is replaced; no credentials are copied.
 pub(crate) fn command(ctx: &Ctx, mut cmd: Cmd) -> Cmd {
     cmd.envs

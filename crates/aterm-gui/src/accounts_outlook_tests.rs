@@ -527,6 +527,8 @@ fn me_facts(quota: Option<QuotaView>) -> FooterFacts {
             ..SubscriptionDisplay::default()
         }),
         quota,
+        // A stored login: the rotation can move the tab, so its card projects.
+        route: Some(accounts::AuthRoute::Stored),
         ..facts()
     }
 }
@@ -1171,12 +1173,13 @@ fn watching_account_observations_gallery() {
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
-            // The card's week row says what is left (S6 moves it to the used words); the meter
-            // that stands for an unread state says the pane's own weekly words.
+            // The admitted figure: used on the outlook's card (never `% left`); the card without
+            // one says the pane's own weekly words.
             let figure = if unavailable {
                 weekly.clone()
             } else {
-                format!("{}%", 100 - admitted.used_x10 / 10)
+                assert!(!drawn.contains("% left"), "{cols}: {drawn}");
+                format!("\u{2265}{}%", admitted.used_x10 / 10)
             };
             assert!(drawn.contains(&figure), "{cols}: {figure:?} in {drawn}");
             if unavailable {
@@ -1199,14 +1202,20 @@ fn watching_account_observations_gallery() {
     set_dir(None);
 }
 
+/// The first box, block, braille or legacy-computing glyph in `s` (U+2500-259F, U+2800-28FF,
+/// U+1FB00-1FBFF): a drawing a reader would hear as noise.
 fn box_drawing(s: &str) -> Option<char> {
-    s.chars().find(|c| ('\u{2500}'..='\u{257f}').contains(c))
+    s.chars().find(|c| {
+        ('\u{2500}'..='\u{259f}').contains(c)
+            || ('\u{2800}'..='\u{28ff}').contains(c)
+            || ('\u{1fb00}'..='\u{1fbff}').contains(c)
+    })
 }
 
 /// T21 and §10: OPENING THE ACCOUNTS CARD READS NO FILE ON THIS THREAD. The resolver (here, the
 /// test's own stand-in) posts its snapshot, and the account reader answers off this thread (here,
 /// the test answers for it with the rows of the same state); the card opens on both, its items
-/// in roster order with the outlook's bars, and neither the store nor any file the outlook's
+/// in the quota view's order (here the roster's) with the outlook's drawn rows, and neither the store nor any file the outlook's
 /// memo looks at (the store's and the logins' stamps, a series' stamp or its read) is touched on
 /// this thread while it opens, refreshes and closes. Negative control: a card that runs the
 /// memo itself on open reads the store and stats its files.
@@ -1277,7 +1286,7 @@ fn the_card_opens_on_the_snapshot_and_reads_nothing() {
     );
     assert!(
         menu.rows.iter().any(|r| matches!(r, MenuRow::Plot { .. })),
-        "the outlook's bars are on the card"
+        "the outlook's work row and lanes are on the card"
     );
     app.close_autopilot_menu();
     assert_eq!(crate::work_counts::take_account_store_reads(), 0);
@@ -1288,8 +1297,9 @@ fn the_card_opens_on_the_snapshot_and_reads_nothing() {
 
 /// T22 and T23 on the card the window draws: at 60, 44 and 30 cells and with room for every row
 /// or a short pane, every drawn row fits, every `Plot` is captioned, no spoken word and no
-/// hover title is a box-drawing glyph, and the roster's items keep roster order and choose their
-/// own account. Negative controls: an uncaptioned plot; items in the outlook's order reversed.
+/// hover title holds a box, block, braille or legacy-computing glyph, and the items keep the
+/// quota view's order (here the roster's) and choose their own account. Negative controls: an
+/// uncaptioned plot; a lane's levels in its caption; items in the outlook's order reversed.
 #[test]
 fn the_cards_rows_fit_speak_and_keep_roster_order() {
     let dir = seeded_stop();
@@ -1329,6 +1339,7 @@ fn the_cards_rows_fit_speak_and_keep_roster_order() {
                 accounts: accounts.clone(),
                 outlook: Some(Arc::clone(&outlook)),
                 account_row: Some("me".into()),
+                movable: true,
                 height,
                 cli: Some(aterm_agent::harness::accounts::Cli::Claude),
                 ..crate::fact_menu::FactMenuFacts::default()
@@ -1357,7 +1368,7 @@ fn the_cards_rows_fit_speak_and_keep_roster_order() {
             }
         }
     }
-    assert!(plots > 0, "the card draws bars");
+    assert!(plots > 0, "the card draws its work row and lanes");
     let facts = me_facts(Some(outlook.quota("me", Some(Figure::Exact(580)), true)));
     let (title, _) = crate::claude_facts::fact_title(&facts, None, Fact::Account);
     let (spoken, _) = crate::claude_facts::fact_spoken_of(
@@ -1370,6 +1381,179 @@ fn the_cards_rows_fit_speak_and_keep_roster_order() {
         assert_eq!(box_drawing(words), None, "{words:?}");
     }
     assert!(title.starts_with("me \u{b7} "), "{title:?}");
+    drop(dir);
+    set_dir(None);
+}
+
+/// The card's rows for the store's `accounts` at `height`, on `me`'s pane, `movable` or not.
+fn card_menu(
+    outlook: &Arc<aterm_agent::harness::outlook::Outlook>,
+    accounts: &[crate::fact_menu::AccountMenuRow],
+    height: Option<usize>,
+    movable: bool,
+) -> Vec<MenuRow> {
+    let facts = crate::fact_menu::FactMenuFacts {
+        title: "Accounts \u{b7} tab 1".into(),
+        spoken: "Accounts, tab 1".into(),
+        room: 60,
+        accounts: accounts.to_vec(),
+        outlook: Some(Arc::clone(outlook)),
+        account_row: Some("me".into()),
+        movable,
+        height,
+        cli: Some(aterm_agent::harness::accounts::Cli::Claude),
+        ..crate::fact_menu::FactMenuFacts::default()
+    };
+    crate::fact_menu::rows(Fact::Account, &facts)
+}
+
+/// The seeded outlook over `roster` and the store's rows for it.
+fn seeded_card(
+    roster: &Roster,
+) -> (
+    aterm_tempfile::TempDir,
+    Arc<aterm_agent::harness::outlook::Outlook>,
+    Vec<crate::fact_menu::AccountMenuRow>,
+) {
+    let dir = seeded_stop();
+    let mut memo = OutlookMemo {
+        reads: Some(scratch_reads()),
+        ..OutlookMemo::default()
+    };
+    let outlook = Arc::new(
+        memo.at(Instant::now(), NOW, Some(roster), false)
+            .expect("an outlook")
+            .clone(),
+    );
+    let (state, enrolled) = memo
+        .held
+        .as_ref()
+        .and_then(|h| h.read.clone().ok())
+        .expect("read");
+    let (accounts, _) = crate::fact_menu::account_menu_rows_from(
+        roster,
+        &state,
+        &enrolled,
+        true,
+        Some("me"),
+        Some("me@example.test"),
+        crate::fact_menu::SessionWeek::default(),
+        NOW,
+    );
+    (dir, outlook, accounts)
+}
+
+/// A lane row's account: its caption names its week (`alt1's week, …`).
+fn lane_label(row: &MenuRow) -> Option<&str> {
+    match row {
+        MenuRow::Plot { spoken, .. } => spoken.split_once("'s week, ").map(|(label, _)| label),
+        _ => None,
+    }
+}
+
+fn is_legend(row: &MenuRow) -> bool {
+    matches!(row, MenuRow::Plot { spoken, .. } if spoken.starts_with("Legend:"))
+}
+
+/// AN ITEM AND ITS LANE ARE ONE UNIT, AND ONLY THE LEGEND CLOSES THE CARD'S DRAWN ROWS (§1.4):
+/// each lane follows its own account's item; a card account the store does not list draws
+/// neither its item nor its lane; the pin item follows the legend directly and a rule under
+/// anything else, a lane included, at every height. Negative controls: a mapping that skips an
+/// unlisted item but keeps its lane leaves `alt1`'s lane under `me`'s; a rule skipped whenever the
+/// card ends on any drawn row puts the pin item straight under `alt1`'s lane once the legend
+/// gives way.
+#[test]
+fn an_item_and_its_lane_are_one_unit_and_the_legend_closes_the_card() {
+    let (dir, outlook, accounts) = seeded_card(&roster());
+    let mut ended_on_a_lane = false;
+    let heights = std::iter::once(None).chain((0..=40).map(Some));
+    for height in heights {
+        let rows = card_menu(&outlook, &accounts, height, true);
+        for (i, row) in rows.iter().enumerate() {
+            if let Some(label) = lane_label(row) {
+                assert_eq!(
+                    item_labels(&rows[i - 1..i]),
+                    [label],
+                    "h{height:?}: {label}'s lane under its own item"
+                );
+            }
+        }
+        let pin = rows
+            .iter()
+            .position(|r| {
+                matches!(r, MenuRow::Item { glyph, label, .. }
+                if *glyph == crate::fact_menu::PIN_GLYPH && label.starts_with("No pinned"))
+            })
+            .expect("the pin item");
+        let before = &rows[pin - 1];
+        assert!(
+            is_legend(before) || matches!(before, MenuRow::Rule),
+            "h{height:?}: the pin item under {before:?}"
+        );
+        if pin >= 2 && matches!(before, MenuRow::Rule) && lane_label(&rows[pin - 2]).is_some() {
+            ended_on_a_lane = true;
+        }
+    }
+    assert!(
+        ended_on_a_lane,
+        "some height drops the legend and keeps the lanes"
+    );
+    drop(dir);
+    set_dir(None);
+
+    let (dir, outlook, accounts) = seeded_card(&pool_roster());
+    let listed: Vec<_> = accounts
+        .iter()
+        .filter(|a| a.label.split_whitespace().next() != Some("alt1"))
+        .cloned()
+        .collect();
+    let rows = card_menu(&outlook, &listed, None, true);
+    assert_eq!(item_labels(&rows), ["me", "pool1"]);
+    assert!(
+        rows.iter().all(|r| lane_label(r) != Some("alt1")),
+        "alt1's lane went with its item"
+    );
+    assert!(
+        rows.iter().any(|r| lane_label(r) == Some("me")),
+        "CONTROL: me's lane stands"
+    );
+    drop(dir);
+    set_dir(None);
+}
+
+/// A TAB THE ROTATION CANNOT MOVE IS PROJECTED NOWHERE ON THE CARD THE WINDOW DRAWS (§2.2): with
+/// the footer's route off the account ([`crate::fact_menu::FactMenuFacts::movable`] false) no
+/// drawn row outside the legend holds the projected line's ink and no note says `╳`.
+/// Negative control: the same card for a movable tab projects the seeded stop.
+#[test]
+fn a_card_for_a_tab_the_rotation_cannot_move_projects_nothing() {
+    let (dir, outlook, accounts) = seeded_card(&pool_roster());
+    let projects = |rows: &[MenuRow]| {
+        rows.iter().any(|r| match r {
+            MenuRow::Plot { cells, .. } if !is_legend(r) => cells
+                .iter()
+                .any(|c| c.ink == crate::autopilot_menu::PlotInk::Ahead),
+            _ => false,
+        })
+    };
+    let verdict_warns = |rows: &[MenuRow]| {
+        rows.iter()
+            .any(|r| matches!(r, MenuRow::Note { text, .. } if text.contains('\u{2573}')))
+    };
+    let moved = card_menu(&outlook, &accounts, None, true);
+    assert!(
+        projects(&moved) && verdict_warns(&moved),
+        "CONTROL: {moved:?}"
+    );
+    let still = card_menu(&outlook, &accounts, None, false);
+    assert!(!projects(&still), "{still:?}");
+    assert!(!verdict_warns(&still), "{still:?}");
+    assert!(
+        still
+            .iter()
+            .any(|r| matches!(r, MenuRow::Note { text, .. } if text.contains("not projected"))),
+        "{still:?}"
+    );
     drop(dir);
     set_dir(None);
 }

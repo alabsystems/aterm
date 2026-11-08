@@ -15,12 +15,18 @@ use aterm_types::network_state::{
 };
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex},
-    thread::{self, JoinHandle},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle, Thread},
     time::{Duration, Instant},
 };
 
 const CURRENT_FOR: Duration = Duration::from_secs(60);
+
+/// How long the worker rests after each sample, however often it is read meanwhile.
+const EVERY: Duration = Duration::from_secs(10);
 
 /// One service's facts and the process-local start of the read that produced them.
 #[derive(Clone, Debug)]
@@ -86,30 +92,62 @@ impl Publication {
     }
 }
 
+/// The publication, and what tells its worker that a reader wants another sample.
+struct Shared {
+    publication: Mutex<Publication>,
+    /// A reader took the publication since the worker last began a sample.
+    asked: AtomicBool,
+    /// The worker a read wakes: set before its runtime hands out a handle, never for a handle
+    /// no worker serves.
+    worker: OnceLock<Thread>,
+    stopped: AtomicBool,
+}
+
+impl Shared {
+    fn replace(&self, publication: Publication) {
+        *self
+            .publication
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = publication;
+    }
+}
+
 /// A read-only publication handle. Busy reads provide no new sample.
 #[derive(Clone)]
-pub struct ObservationHandle(Arc<Mutex<Publication>>);
+pub struct ObservationHandle(Arc<Shared>);
 
 impl Default for ObservationHandle {
     fn default() -> Self {
-        Self(Arc::new(Mutex::new(Publication::new(
-            ServiceStates::default(),
-            Instant::now(),
-        ))))
+        Self(Arc::new(Shared {
+            publication: Mutex::new(Publication::new(ServiceStates::default(), Instant::now())),
+            asked: AtomicBool::new(false),
+            worker: OnceLock::new(),
+            stopped: AtomicBool::new(false),
+        }))
     }
 }
 
 impl ObservationHandle {
+    /// The last publication, or none while its worker is replacing it. Each read, busy or not,
+    /// asks for the next sample: the worker samples only after a read, so services nobody reads
+    /// are not observed and their last sample just ages.
     pub fn try_publication(&self) -> Option<Publication> {
-        match self.0.try_lock() {
+        self.ask();
+        match self.0.publication.try_lock() {
             Ok(publication) => Some(publication.clone()),
             Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner().clone()),
             Err(std::sync::TryLockError::WouldBlock) => None,
         }
     }
 
-    fn replace(&self, publication: Publication) {
-        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = publication;
+    /// Ask for a sample, waking the worker only for the first ask since its last sample began.
+    /// The worker clears `asked` with a swap too, so of an ask and its check one sees the other.
+    fn ask(&self) {
+        if !self.0.asked.swap(true, Ordering::AcqRel)
+            && let Some(worker) = self.0.worker.get()
+        {
+            worker.unpark();
+        }
     }
 }
 
@@ -409,7 +447,8 @@ pub(crate) fn accounts_until(
         }
     };
     let paths = &selected;
-    // Sampled every 10 s whatever it finds: unchanged vault files keep the last observation.
+    // Sampled each 10 s while read, whatever it finds: unchanged vault files keep the last
+    // observation.
     match commons::observe_settled(paths) {
         Ok(commons::Observation::Unavailable(reason)) => {
             let availability = if matches!(reason, commons::Unavailable::Busy) {
@@ -596,45 +635,76 @@ fn account_counts(
     counts
 }
 
-#[derive(Default)]
-struct Stop {
-    requested: Mutex<bool>,
-    changed: Condvar,
+/// The worker's body. It waits for a read, samples, publishes, then rests a whole `every`
+/// whatever is read meanwhile (a read during a sample or a rest asks for the sample after it,
+/// not an earlier one), and goes round again: while something reads at least once a rest, it
+/// samples once each `every`; once nothing does, it parks until a read or a stop. `wait(None)`
+/// parks until either wakes it, `wait(Some(until))` until `until` at the latest; either may
+/// return early.
+fn serve(
+    shared: &Shared,
+    every: Duration,
+    mut observe: impl FnMut() -> Publication,
+    mut wait: impl FnMut(Option<Instant>),
+) {
+    loop {
+        while !shared.stopped.load(Ordering::Acquire) && !shared.asked.swap(false, Ordering::AcqRel)
+        {
+            wait(None);
+        }
+        if shared.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        shared.replace(observe());
+        let until = Instant::now() + every;
+        while !shared.stopped.load(Ordering::Acquire) && Instant::now() < until {
+            wait(Some(until));
+        }
+    }
 }
 
-/// A process-owned worker; window reads only its immutable metadata snapshots.
+/// The worker thread's wait: parked until a read or a stop unparks it, or until `until`.
+fn park_until(until: Option<Instant>) {
+    match until {
+        None => thread::park(),
+        Some(until) => thread::park_timeout(until.saturating_duration_since(Instant::now())),
+    }
+}
+
+/// A process-owned worker; window reads only its immutable metadata snapshots. It observes the
+/// services only for a reader ([`ObservationHandle::try_publication`]), at most once each
+/// [`EVERY`].
 pub struct Runtime {
     shared: ObservationHandle,
-    stop: Arc<Stop>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl Runtime {
     pub fn start(paths: Paths, config: PathBuf) -> crate::Result<Self> {
+        Self::start_with(
+            move || observe_publication(&paths, &config),
+            EVERY,
+            park_until,
+        )
+    }
+
+    /// The runtime over `observe`, resting `every`, its worker waiting with `wait` ([`serve`]):
+    /// [`park_until`], or a law's wrapper of it.
+    fn start_with(
+        observe: impl FnMut() -> Publication + Send + 'static,
+        every: Duration,
+        wait: impl FnMut(Option<Instant>) + Send + 'static,
+    ) -> crate::Result<Self> {
         let shared = ObservationHandle::default();
-        let stop = Arc::new(Stop::default());
-        let publish = shared.clone();
-        let stopping = stop.clone();
+        let serving = shared.clone();
         let worker = thread::Builder::new()
             .name("network-services".into())
-            .spawn(move || {
-                loop {
-                    if *stopping.requested.lock().unwrap_or_else(|p| p.into_inner()) {
-                        break;
-                    }
-                    let publication = observe_publication(&paths, &config);
-                    publish.replace(publication);
-                    let requested = stopping.requested.lock().unwrap_or_else(|p| p.into_inner());
-                    let _ = stopping.changed.wait_timeout_while(
-                        requested,
-                        Duration::from_secs(10),
-                        |stop| !*stop,
-                    );
-                }
-            })?;
+            .spawn(move || serve(&serving.0, every, observe, wait))?;
+        // Before any handle but the worker's exists, so no read can miss the worker: one before
+        // its first park leaves `asked` for it, and one after unparks it.
+        let _ = shared.0.worker.set(worker.thread().clone());
         Ok(Self {
             shared,
-            stop,
             worker: Some(worker),
         })
     }
@@ -646,13 +716,9 @@ impl Runtime {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        *self
-            .stop
-            .requested
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = true;
-        self.stop.changed.notify_all();
+        self.shared.0.stopped.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
             let _ = worker.join();
         }
     }
@@ -796,9 +862,11 @@ pub(crate) mod tests {
     fn busy_and_repeated_handle_reads_preserve_the_original_publication() {
         let at = Instant::now();
         let handle = ObservationHandle::default();
-        handle.replace(Publication::new(sampled_states(100_000), at));
+        handle
+            .0
+            .replace(Publication::new(sampled_states(100_000), at));
         let cached = handle.try_publication().unwrap();
-        let held = handle.0.lock().unwrap();
+        let held = handle.0.publication.lock().unwrap();
         assert!(handle.try_publication().is_none());
         assert_eq!(
             cached
@@ -809,7 +877,7 @@ pub(crate) mod tests {
         );
         drop(held);
         assert_eq!(handle.try_publication().unwrap().accounts.sampled_at, at);
-        handle.replace(Publication::new(
+        handle.0.replace(Publication::new(
             sampled_states(120_000),
             at + Duration::from_secs(61),
         ));
@@ -822,6 +890,140 @@ pub(crate) mod tests {
                 .availability,
             ServiceAvailability::Cached
         );
+    }
+
+    /// A sample a law counts, which stops a worker that keeps sampling with nothing to stop it.
+    fn counted(samples: &std::cell::Cell<u64>) -> Publication {
+        samples.set(samples.get() + 1);
+        assert!(
+            samples.get() < 5,
+            "the worker samples with no read to answer"
+        );
+        Publication::new(sampled_states(100_000 + samples.get()), Instant::now())
+    }
+
+    /// The worker, driven one wait at a time: it parks before any read, a read wakes it for one
+    /// sample, which it publishes, and reads during the rest after it end no rest.
+    /// Negative controls: a first sample taken before a read (the sample count at the first
+    /// wait); a rest a read cuts short (a second sample); a read that asks nothing (a second
+    /// park where the rest should be).
+    #[test]
+    fn a_worker_samples_only_for_a_read_and_rests_a_whole_period_whatever_is_read_meanwhile() {
+        let handle = ObservationHandle::default();
+        let samples = std::cell::Cell::new(0);
+        let mut waits = Vec::new();
+        serve(
+            &handle.0,
+            Duration::from_secs(3600),
+            || counted(&samples),
+            |until| {
+                assert!(waits.len() < 8, "the worker waits on after a stop");
+                waits.push((until.is_some(), samples.get()));
+                match waits.len() {
+                    1 => assert!(handle.try_publication().is_some()),
+                    2 => {
+                        for _ in 0..3 {
+                            assert!(handle.try_publication().is_some());
+                        }
+                    }
+                    _ => handle.0.stopped.store(true, Ordering::Release),
+                }
+            },
+        );
+        assert_eq!(samples.get(), 1);
+        assert_eq!(waits, [(false, 0), (true, 1), (true, 1)]);
+        let published = handle.try_publication().unwrap();
+        assert_eq!(published.accounts.state, sampled_states(100_001).accounts);
+    }
+
+    /// A read during a sample asks for the next one, and once a whole rest passes with no read
+    /// the worker parks. Negative controls: `asked` cleared after the sample, not before it
+    /// (one sample); a worker that samples after each rest unasked (the count's guard).
+    #[test]
+    fn a_read_during_a_sample_asks_for_the_next_and_an_unread_rest_parks_the_worker() {
+        let handle = ObservationHandle::default();
+        let samples = std::cell::Cell::new(0);
+        let mut waits = Vec::new();
+        serve(
+            &handle.0,
+            Duration::ZERO,
+            || {
+                if samples.get() == 0 {
+                    assert!(handle.try_publication().is_some());
+                }
+                counted(&samples)
+            },
+            |until| {
+                assert!(waits.len() < 8, "the worker waits on after a stop");
+                waits.push((until.is_some(), samples.get()));
+                if waits.len() == 1 {
+                    assert!(handle.try_publication().is_some());
+                } else {
+                    handle.0.stopped.store(true, Ordering::Release);
+                }
+            },
+        );
+        assert_eq!(samples.get(), 2);
+        assert_eq!(waits, [(false, 0), (false, 2)]);
+    }
+
+    /// The thread: a runtime nobody reads never samples, a read wakes its parked worker, and a
+    /// stop ends a worker parked or resting an hour. Each step waits until the worker says it
+    /// waits, so a read or a stop comes after the worker's check and only an unpark can end its
+    /// park. Negative controls: a runtime that never names its worker to its handle (the
+    /// sample's hang detector); a drop that does not wake the worker (the drop's).
+    #[test]
+    fn a_runtime_samples_only_after_a_read_and_a_stop_ends_it_parked_or_resting() {
+        use std::sync::mpsc;
+        let end = |runtime: Runtime| {
+            let (dropped, done) = mpsc::channel();
+            thread::spawn(move || {
+                drop(runtime);
+                let _ = dropped.send(());
+            });
+            done.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("a stop ends the worker");
+        };
+        let start = || {
+            let (sampled, samples) = mpsc::channel();
+            let (waiting, waits) = mpsc::channel();
+            let runtime = Runtime::start_with(
+                move || {
+                    let _ = sampled.send(());
+                    Publication::new(ServiceStates::default(), Instant::now())
+                },
+                Duration::from_secs(3600),
+                move |until: Option<Instant>| {
+                    let _ = waiting.send(until.is_some());
+                    park_until(until);
+                },
+            )
+            .unwrap();
+            (runtime, samples, waits)
+        };
+        // Whether the worker's next wait is a rest (a park, unasked, otherwise).
+        let next_wait = |waits: &mpsc::Receiver<bool>| {
+            waits
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("the worker waits")
+        };
+
+        let (runtime, samples, waits) = start();
+        assert!(!next_wait(&waits), "it parks before any read");
+        end(runtime);
+        assert_eq!(samples.try_iter().count(), 0, "nobody read: no sample");
+
+        let (runtime, samples, waits) = start();
+        assert!(!next_wait(&waits), "it parks before any read");
+        // Busy or not, a read asks; the worker may already be publishing.
+        let _ = runtime.observation().try_publication();
+        samples
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("a read wakes the parked worker");
+        // A spurious return from its park may first wait again unasked.
+        while !next_wait(&waits) {}
+        end(runtime);
+        assert_eq!(samples.try_iter().count(), 0, "one read: one sample");
     }
 
     #[test]

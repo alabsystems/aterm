@@ -428,6 +428,14 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         let _ = (needs, entry);
     }
 
+    /// The NEEDS YOU set this host holds for the needs entry standing ([`Self::needs_standing`])
+    /// and the entry's text it was told with; `None` where none was told, the take-down was told
+    /// last or the entry standing is no text it was told. A loop's start adopts it: the set a
+    /// loop before it left standing at a handover.
+    fn needs_told(&self) -> Option<(Vec<String>, String)> {
+        None
+    }
+
     /// THE HOLD'S OWN WORDS (§14.17 item 1, slice 4b): what the agent said is left, quoted, and
     /// the files git found, told before [`Self::land_held`] wherever either moved, and `None`
     /// where the hold reads no words or the loop ends; a notification nothing the loop decides

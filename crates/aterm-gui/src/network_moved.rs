@@ -958,6 +958,15 @@ impl Heard {
 /// How often the beacon source reads the Commons runtime's peers.
 const BEACON_LOOK: Duration = Duration::from_secs(2);
 
+/// The window's beacon reader: the peers of `read`'s network observation. It reads the network
+/// alone ([`crate::NetworkRead::Network`]), since it draws no service and a services read keeps
+/// their observer sampling.
+pub(crate) fn beacon_peers(
+    read: crate::NetworkSnapshotSource,
+) -> impl Fn() -> Option<Vec<aterm_types::network_state::PeerObservation>> + Send + 'static {
+    move || read(crate::NetworkRead::Network).map(|snapshot| snapshot.network.peers.clone())
+}
+
 /// Hear this process's Commons runtime (`read`: its peers as it observes them now, or no sample
 /// while unavailable): a peer heard after every peer's silence, or a new one, is a move
 /// ([`Heard`]). An unavailable
@@ -1780,6 +1789,25 @@ pub(crate) mod tests {
             !heard.look_at(&both, at + Duration::from_secs(back)),
             "peer 1 was heard all along"
         );
+    }
+
+    /// The beacon reads the network's peers and asks for no services read, which would keep the
+    /// services' observer sampling for a beacon that draws none of them.
+    /// NEGATIVE CONTROL: a beacon reading with services records `WithServices`.
+    #[test]
+    fn the_beacon_reads_the_network_alone() {
+        use aterm_types::network_state::{NetworkStateSnapshot, Reachability::Reachable};
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let mut snapshot = NetworkStateSnapshot::default();
+        snapshot.network.peers = vec![peer(7, Reachable)];
+        let snapshot = Arc::new(snapshot);
+        let reads = Arc::clone(&asked);
+        let peers = beacon_peers(Arc::new(move |read| {
+            reads.lock().unwrap().push(read);
+            Some(Arc::clone(&snapshot))
+        }));
+        assert_eq!(peers(), Some(vec![peer(7, Reachable)]));
+        assert_eq!(*asked.lock().unwrap(), [crate::NetworkRead::Network]);
     }
 
     /// A peer with one byte of machine id, as the Commons runtime observes it.

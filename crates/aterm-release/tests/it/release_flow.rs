@@ -214,6 +214,7 @@ struct World {
     /// The build and the export do their work once the tree's end is told, and not when their
     /// stop fired by then.
     after_tree: bool,
+    keep_build_on_test_red: bool,
     /// How `ship cut --sign` (step 7's sign side) exits.
     sign_code: i32,
     /// The build whose copy `cut --sign` signed privately and kept the record of.
@@ -351,6 +352,7 @@ impl World {
             export_pushes: false,
             tree_claims_late: false,
             after_tree: false,
+            keep_build_on_test_red: false,
             sign_code: 0,
             signed: None,
             sides: SideOrder::SourceFirst,
@@ -590,6 +592,9 @@ impl<'a> WorldBranches<'a> {
 }
 
 impl Branches for WorldBranches<'_> {
+    fn keep_build_on_test_red(&self, _c: &Candidate) -> bool {
+        self.world().keep_build_on_test_red
+    }
     fn say(&self, line: &str) {
         Backend::say(&mut **self.world(), line);
         if line.starts_with("        tree: ") && !line.contains("; log: ") {
@@ -5188,15 +5193,16 @@ fn relative_path_flags_are_anchored_once_where_the_release_started() {
     .iter()
     .map(Into::into)
     .collect();
-    let again = opts.anchored(&start).rerun_args(args);
+    let anchored = opts.anchored(&start);
+    assert_eq!(
+        anchored.engine,
+        Some(root.path().join("publication").canonicalize().unwrap())
+    );
+    // The re-run is handed no `--engine`: its engine is the release's own, handed it as
+    // PUBLICATION_ENGINE, which an older cutter would otherwise run in place of.
+    let again = anchored.rerun_args(args);
     let want: Vec<std::ffi::OsString> = vec![
         "release".into(),
-        "--engine".into(),
-        root.path()
-            .join("publication")
-            .canonicalize()
-            .unwrap()
-            .into_os_string(),
         "--release-credentials".into(),
         start.join("creds.toml").into_os_string(),
         "--linux-artifacts".into(),

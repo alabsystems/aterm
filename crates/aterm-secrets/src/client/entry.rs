@@ -42,7 +42,7 @@ pub enum PublicRosterRead {
 
 /// How long a read of the public roster waits while the vault's own writer (a sync or an
 /// apply in the running aterm) holds the state lock, before it calls the source busy.
-const PUBLIC_ROSTER_WAIT: Duration = Duration::from_secs(30);
+const PUBLIC_ROSTER_WAIT: Duration = Duration::from_secs(60);
 
 /// Read only the two canonical Everyone public roster entries under one shared state guard.
 /// Materialized files and their ownership do not participate. Absence is returned only after
@@ -50,14 +50,24 @@ const PUBLIC_ROSTER_WAIT: Duration = Duration::from_secs(30);
 /// available to other recipients. A partial pair is an error. This fetches no
 /// source, changes no state and grants no signing authority or lease across later effects.
 /// In particular, this does not filter out a newer expired or revoking release roster.
-/// A writer holding the vault state is waited for, up to 30 s.
+/// A writer holding the vault state is waited for, with a minute hang detector.
 /// # Errors
 /// Configured state is busy past that wait, pending, denied, untrusted or unreadable; the pair
 /// has a host audience or only one entry. Existing vault-entry size bounds apply; the caller
 /// must refuse malformed roster or signature bytes through its existing release admission
 /// policy.
 pub fn current_public_roster(paths: &Paths) -> crate::Result<PublicRosterRead> {
-    current_public_roster_until(paths, Instant::now() + PUBLIC_ROSTER_WAIT)
+    current_public_roster_after(paths, Duration::ZERO)
+}
+
+fn current_public_roster_after(
+    paths: &Paths,
+    elapsed: Duration,
+) -> crate::Result<PublicRosterRead> {
+    current_public_roster_until(
+        paths,
+        Instant::now() + PUBLIC_ROSTER_WAIT.saturating_sub(elapsed),
+    )
 }
 
 /// [`current_public_roster`], waiting for a writer holding the vault state only until `deadline`.

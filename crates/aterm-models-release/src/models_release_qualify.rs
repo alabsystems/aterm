@@ -17,7 +17,8 @@
 //!   bundle). 0 idle, 1 running, 2 passed, 3 red, 4 could not run, 6 skipped (its record stood).
 //! - `tree_cpu`, `build_cpu`, `export_cpu`: the Release jobserver tokens the branch holds; their
 //!   sum is the pool's charge, at most `S`. A branch's end returns every token it held.
-//! - `red`: 1 once a qualify branch ended red.
+//! - `red`: 1 once a qualify branch ended red. `kept_build`: 1 when an executing-test red
+//!   retains a build already running, so that build finishes and can serve a test-only hop.
 //! - `held`: 1 while R's tree and the build-inputs seal have held for the tree branch's run; 0 once
 //!   either moved before the tree branch ended (a move after its end changes nothing).
 //! - `tree_rec`: R's `RELEASE_TREE` records. 0 none written, 1 the records of the checks that
@@ -56,7 +57,8 @@
 //! 9 `BuildStartsBeforeTheTree` (`StartsInOrder`), 10 `StopOnACouldNotRun` (`StopOnlyOnARed`),
 //! 11 `StopAPushInFlight` (`PushInFlightFinishes`), 12 `RefuseBeforeTheBranchesEnd`
 //! (`NoBranchOutlivesTheStep`), 13 `PassOnACouldNotRun` (`QualifyPassesOnlyOnEveryPass`),
-//! 14 `BuildEndsHoldingTokens` (`NoTokenOutlivesItsBranch`).
+//! 14 `BuildEndsHoldingTokens` (`NoTokenOutlivesItsBranch`), 15 `StopKeptBuild`
+//! (`TestRedKeepsTheBuild`).
 
 use aterm_spec::derive::*;
 
@@ -77,6 +79,7 @@ pub fn release_qualify_model() -> Model {
             var build_cpu = 0;
             var export_cpu = 0;
             var red = 0;
+            var kept_build = 0;
             var held = 1;
             var tree_rec = 0;
             var bundle_rec = 0;
@@ -144,6 +147,13 @@ pub fn release_qualify_model() -> Model {
                 red = 1;
                 tree_rec = if held == 1 { 1 } else { 0 };
             }
+            action TreeTestRed when (tree == 1) {
+                tree = 3;
+                tree_cpu = 0;
+                red = 1;
+                kept_build = if build == 1 { 1 } else { 0 };
+                tree_rec = if held == 1 { 1 } else { 0 };
+            }
             action TreeCouldNotRun when (tree == 1) {
                 tree = 4;
                 tree_cpu = 0;
@@ -168,7 +178,7 @@ pub fn release_qualify_model() -> Model {
                 build = 4;
                 build_cpu = 0;
             }
-            action StopBuild when (build == 1 && red == 1) {
+            action StopBuild when (build == 1 && red == 1 && kept_build == 0) {
                 build = 5;
                 build_cpu = 0;
             }
@@ -314,6 +324,12 @@ pub fn release_qualify_model() -> Model {
             action BuildEndsHoldingTokens when (Buggy == 14 && build == 1 && build_cpu > 0) {
                 build = 2;
             }
+            action StopKeptBuild when (Buggy == 15 && build == 1 && red == 1 && kept_build == 1) {
+                build = 5;
+                build_cpu = 0;
+            }
+
+            invariant TestRedKeepsTheBuild: kept_build == 0 || build <= 4 || build > 5;
 
             invariant CutHoldsEveryRecord: cut == 0 || (tree_rec == 2 && bundle_rec == 1);
             invariant ReadyHoldsEveryRecord: ready == 0 || (tree_rec == 2 && bundle_rec == 1);
@@ -349,7 +365,7 @@ pub fn release_qualify_model() -> Model {
                     tree_cpu <= S && build_cpu <= S && export_cpu <= S && red <= 1 &&
                     held <= 1 && tree_rec <= 2 && bundle_rec <= 1 && pushed <= 1 &&
                     ready <= 1 && public <= 1 && cut <= 1 && started_after_red <= 1 &&
-                    pushed_after_red <= 1;
+                    pushed_after_red <= 1 && kept_build <= 1;
         }
     }
 }

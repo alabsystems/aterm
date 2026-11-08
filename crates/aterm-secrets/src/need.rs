@@ -23,7 +23,8 @@ pub mod transfer;
 
 pub use catalog::{Class, GhProfile, Purpose, Want};
 pub use ledger::{
-    FILE as LEDGER, absorb, list, peek, raise, raise_refused, retire, satisfied, with_ledger,
+    FILE as LEDGER, absorb, acknowledge_from_snapshot, list, peek, raise, raise_refused,
+    raise_refused_from_snapshot, retire, satisfied, with_ledger,
 };
 
 use crate::commons::Unavailable;
@@ -1045,7 +1046,13 @@ pub fn act(need: &Need, facts: &Facts, act: &Act) -> Option<Need> {
         Act::Give => {
             let guard = need.state == State::AwaitingPerson
                 && facts.holds(&need.want)
-                && facts.policy.allows(&need.want);
+                && facts.policy.allows(&need.want)
+                && need.refused.is_none_or(|refused| {
+                    facts
+                        .sight
+                        .as_ref()
+                        .is_some_and(|sight| sight.seq > refused)
+                });
             guard.then(|| {
                 let seq = facts.sight.as_ref().map_or(0, |sight| sight.seq);
                 Need {
@@ -1336,7 +1343,9 @@ pub fn decided(need: &Need, facts: &Facts, decision: &Decision) -> Option<Need> 
                 }
             })
         }
-        Decision::Published { seq } => facts.policy.allows(&need.want).then(|| Need {
+        Decision::Published { seq } => (facts.policy.allows(&need.want)
+            && need.refused.is_none_or(|refused| *seq > refused))
+        .then(|| Need {
             state: State::Published,
             wait: Wait::Requester,
             asking: false,
@@ -1784,8 +1793,13 @@ pub fn status_line(needs: &[Need]) -> Option<String> {
 /// This Mac's vault state cannot be read.
 #[cfg(unix)]
 pub fn facts(paths: &crate::client::Paths, now: u64) -> crate::Result<Facts> {
-    let sight = crate::client::sight(paths)?;
-    let commons = match crate::commons::observe(paths) {
+    facts_with_commons(paths, now, || observed_commons(paths))
+}
+
+/// Commons observation may establish local custody. Keep it outside any retained State guard.
+#[cfg(unix)]
+pub(crate) fn observed_commons(paths: &crate::client::Paths) -> Commons {
+    match crate::commons::observe(paths) {
         Ok(crate::commons::Observation::Visible(_)) => {
             if crate::commons::bootstrap::writer_here(paths) {
                 Commons::Writer
@@ -1795,7 +1809,19 @@ pub fn facts(paths: &crate::client::Paths, now: u64) -> crate::Result<Facts> {
         }
         Ok(crate::commons::Observation::Unavailable(reason)) => Commons::Unavailable(reason),
         Err(_) => Commons::Unavailable(Unavailable::Busy),
-    };
+    }
+}
+
+/// Reuse the ordinary sight/policy producer with a supplied availability observation.
+/// The supplied Commons value is scheduling, never authority to publish or release a value.
+#[cfg(unix)]
+pub(crate) fn facts_with_commons(
+    paths: &crate::client::Paths,
+    now: u64,
+    commons: impl FnOnce() -> Commons,
+) -> crate::Result<Facts> {
+    let sight = crate::client::sight(paths)?;
+    let commons = commons();
     // The configured vault decides the policy, not the applied version: a Mac mid-sync or
     // waiting on its membership has the same policy as once it applies. A Mac in no vault has
     // no policy against it yet, and its need waits on joining one.

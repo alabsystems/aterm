@@ -1361,12 +1361,11 @@ fn the_steps_moment_holds_no_step_while_macos_idle_time_cannot_be_read() {
 }
 
 /// Keys typed while no aterm window had keyboard focus (into another app before a click brought
-/// aterm's System State to the front) are not aterm's keys, and a focus change does not restart
-/// the steps' key rest: the step's moment stands at the return. A flick of focus (shorter than
-/// `FOCUS_AWAY_FOR`) is no return at all.
-/// NEGATIVE CONTROL: a key rest counted from the return holds the moment there.
+/// aterm's System State to the front) are not aterm's keys, and the steps' moment reads no focus
+/// ([`App::step_moment_is_quiet`]): neither aterm losing focus nor taking it back holds the steps.
+/// NEGATIVE CONTROL: a key typed in aterm restarts the steps' key rest.
 #[test]
-fn the_steps_key_rest_is_not_restarted_by_aterm_taking_focus_back() {
+fn the_steps_moment_reads_no_keyboard_focus() {
     use crate::devtools_helper::COLD_START_SETTLE;
     let mut app = App::headless_for_test();
     app.access_steps.set_reach(StepsReach {
@@ -1380,31 +1379,22 @@ fn the_steps_key_rest_is_not_restarted_by_aterm_taking_focus_back() {
     let wid = crate::WindowId(0);
     let settled = Instant::now() + COLD_START_SETTLE + Duration::from_secs(1);
 
-    // A flick on the test's own clock: focus gone 5 ms, then back.
-    let flick = settled - Duration::from_secs(2);
-    focus(&mut app, false);
-    app.note_keyboard_focus(true, flick);
-    focus(&mut app, true);
-    app.note_keyboard_focus(false, flick + Duration::from_millis(5));
-    assert_eq!(app.keyboard_focus_back_at, None, "a flick is no return");
-    assert!(
-        app.step_moment_is_quiet(settled),
-        "control: a flick of focus holds no typing"
-    );
-
-    // The window's own Focused events note the edges: the time each read is the edge's own.
     app.window_focus_event(wid, false);
     assert!(!app.any_os_window_focused(), "precondition: away");
-    let lost = app.keyboard_focus_lost_at.expect("the loss is noted");
-    // The person was in another app, typing, for 20 s.
-    app.keyboard_focus_lost_at = lost.checked_sub(Duration::from_secs(20));
-    app.window_focus_event(wid, true);
-    let back = app
-        .keyboard_focus_back_at
-        .expect("back after 20 s away: the return is noted");
     assert!(
-        app.access_step_moment(back.max(settled)),
+        app.access_step_moment(settled),
+        "aterm losing keyboard focus does not hold the steps"
+    );
+    app.window_focus_event(wid, true);
+    assert!(
+        app.access_step_moment(settled),
         "a focus change does not restart automatic setup's keyboard rest"
+    );
+
+    app.last_keystroke_at = Some(settled);
+    assert!(
+        !app.access_step_moment(settled + Duration::from_millis(1)),
+        "control: a key typed in aterm restarts the steps' key rest"
     );
 }
 

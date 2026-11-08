@@ -8,9 +8,30 @@ use std::{
     collections::BTreeMap,
     os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
+
+#[test]
+fn valid_local_custody_survives_scheduling_delay() {
+    let lab = Lab::new(&[Role::Writer]);
+    let binding = lab.bootstrap(0).request().unwrap().binding().clone();
+    let before = files(lab._home.path());
+    let actual = read_at(
+        &lab.paths[0],
+        crate::admission::deadline_at(Instant::now() - Duration::from_secs(3)),
+    );
+    assert_eq!(actual.unwrap()["current"], identity(&binding));
+    assert!(
+        read_at(
+            &lab.paths[0],
+            crate::admission::deadline_at(Instant::now() - Duration::from_secs(61))
+        )
+        .is_err()
+    );
+    assert_eq!(files(lab._home.path()), before);
+}
 
 fn files(root: &Path) -> BTreeMap<PathBuf, (u32, Vec<u8>)> {
     let mut result = BTreeMap::new();

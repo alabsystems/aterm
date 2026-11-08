@@ -31,6 +31,15 @@
 > `slots.rs::poll_timeout_millis`: 29350f128b moved that conversion to `aterm_uds`, and 6acb6aeb5f
 > folded it into `deadline::poll_timeout_ms`, the one poll timeout both listener arms call.
 
+> Status 2026-11-07, the qualified-path pass: §0's pure-core note named
+> `slots.rs::poll_timeout_millis_parts` and `poll_timeout_millis`, both gone from this crate since
+> 29350f128b, which dropped the parts core and moved the conversion to `aterm_uds` (6acb6aeb5f then
+> folded it into `deadline::poll_timeout_ms`); it now says the poll timeout is
+> `aterm_uds::deadline::poll_timeout_ms`, over a `Duration`, with no integer core here, and keeps its
+> `source_of` clause. §2 drops `slots::poll_timeout_millis_rounds_up_and_saturates`, which went with
+> the parts core (the row cites aterm-uds's two `poll_timeout_ms` tests), and §6's first step proves
+> `poll_timeout_ms` where it lives.
+
 Source: `crates/aterm-net` (read only). The pass read every `#[test]` (`src/lib.rs` 4, `src/tls.rs` 8,
 `src/drive.rs` 29 = 41), plus the production code each one reaches. Nothing was compiled or run.
 The claims below come from reading the code.
@@ -63,9 +72,10 @@ Result: **12 specs**, covering **26 mapped spec-sample tests** in §2 (plus **1 
 - Crypto and rustls are trusted axioms, never proof obligations: SHA-256 is collision-resistant, and
   rustls implements TLS 1.3 and RFC 5705 exporters correctly (equal on both ends of one session,
   distinct across sessions with overwhelming probability).
-- **Pure-core note**: `slots.rs::poll_timeout_millis_parts` already exposes the integer core for
-  `poll_timeout_millis` over `(as_millis: u128, subsec_nanos: u32)` (no `Duration` carrier); exposing an
-  integer core for `source_of` over `u128` as well drops its `IpAddr` carrier (gap 1).
+- **Pure-core note**: the listeners' poll timeout is `aterm_uds::deadline::poll_timeout_ms`, which
+  takes a `Duration` (`as_nanos().div_ceil(1_000_000)`, saturated at `i32::MAX`), so this crate holds no
+  integer core for it; exposing an integer core for `source_of` over `u128` drops its `IpAddr` carrier
+  (gap 1).
 
 ## 1. Specs (TSV)
 
@@ -145,7 +155,6 @@ src/tls.rs	relay_early_request_close_delivers_guarded_reply_but_not_late_ack	rel
 src/tls.rs	relay_round_trips_guarded_artifact_ack_before_request_half_close	relay-duplex-fidelity	
 src/tls.rs	a_wrong_fingerprint_pin_rejects_the_handshake	pinned-cert-verifier	
 src/tls.rs	relay_ingests_a_full_record_followed_by_small_ones_without_tearing_down	relay-duplex-fidelity	
-src/slots.rs	poll_timeout_millis_rounds_up_and_saturates	poll-timeout-ceil	
 src/slots.rs	real_listener_readiness_wakes_before_the_shutdown_interval	listener-readiness	poll-timeout-ceil
 src/slots.rs	idle_listener_readiness_wait_is_bounded_without_spinning	listener-readiness	poll-timeout-ceil
 src/slots.rs	finishing_an_early_handshake_wakes_the_watchdog_instead_of_waiting_out_its_deadline	(none: §4, keep)	watchdog-claim-exactly-once states its structural part
@@ -216,9 +225,9 @@ instance of one of the general specs above.
 
 No row is blocked by gap 0 alone; the order prefers the fewest and smallest gaps.
 
-1. **`poll-timeout-ceil`**, after factoring the integer core over `(u128, u32)`. Saturating arithmetic,
-   one `is_multiple_of`, one `try_from` clamp: an `omega`-class proof needing only gap 3. It retires no
-   test alone, but it is the "never a busy zero poll, never an infinite −1" half of `listener-readiness`.
+1. **`poll-timeout-ceil`**, in aterm-uds, where `deadline::poll_timeout_ms` is one `div_ceil` over
+   `Duration::as_nanos` and one `try_from` clamp: an `omega`-class proof needing only gap 3. It retires no
+   test here, but it is the "never a busy zero poll, never an infinite −1" half of `listener-readiness`.
 2. **`source-of-slash64`**, on a `u128` core plus the `to_canonical` case split. Bitwise `&`/`!` on
    `u128` and one enum match (gap 3; gap 12 only for citing std's `to_canonical`). It retires
    `slots::an_address_is_an_ipv4_address_or_an_ipv6_slash_64` and is the address lemma under

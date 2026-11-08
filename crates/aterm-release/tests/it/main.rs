@@ -109,6 +109,9 @@ mod machines;
 #[path = "../../src/manifest_out.rs"]
 #[allow(dead_code)]
 mod manifest_out;
+#[path = "../../src/postlink.rs"]
+#[allow(dead_code)]
+mod postlink;
 #[path = "../../src/profile_pilot.rs"]
 #[allow(dead_code)]
 mod profile_pilot;

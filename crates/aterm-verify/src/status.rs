@@ -1,9 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Read observed check completions without attributing them to a run or checkout.
-//! Existing event files have no run-start identity: two incomplete appended runs
-//! can be indistinguishable from one run. This reader grants no check or land verdict.
+//! Read observed check completions, partitioning exact per-event invocation identities.
+//! Legacy records remain unattributed; captured source facts never prove the checkout.
+//! This reader grants no check, resource-retirement or land verdict.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -24,9 +24,22 @@ pub struct ObservedCheck {
     pub occurrences: usize,
 }
 
+/// One diagnostic invocation's observed rows, not a qualification or checkout proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Invocation {
+    pub id: String,
+    pub source_observation: Option<String>,
+    pub source_conflict: bool,
+    pub observed: Box<Observed>,
+}
+
 /// File observations only. Missing run/source identity is never inferred from its contents.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Observed {
+    /// Exact per-event invocation partitions. Metadata conflicts retain unknown source.
+    pub invocations: Vec<Invocation>,
+    /// Records with absent or invalid attribution, never assigned by neighboring headers.
+    pub unattributed: Option<Box<Observed>>,
     /// Every successfully parsed finished check, ordered by check name.
     pub checks: Vec<ObservedCheck>,
     /// Number of complete parsed terminal records in the file.
@@ -48,7 +61,15 @@ fn outcome(word: &str) -> bool {
 /// Fold the entire supplied event text, never a bounded output tail.
 /// A newline is required before a record is considered complete.
 #[must_use]
-pub fn observe(text: &str) -> Observed {
+fn record_value(line: &str) -> Option<aterm_json::Value> {
+    let json = line
+        .strip_prefix("verify-event: ")
+        .filter(|json| json.len() <= MAX_RECORD_BYTES)?;
+    let value = aterm_json::from_str::<aterm_json::Value>(json).ok()?;
+    (value["schema"].as_u64() == Some(1)).then_some(value)
+}
+
+fn observe_one(text: &str) -> Observed {
     let mut checks = BTreeMap::<String, ObservedCheck>::new();
     let mut rows = Vec::new();
     let mut terminals = Vec::new();
@@ -61,11 +82,7 @@ pub fn observe(text: &str) -> Observed {
             break;
         };
         let line = line.strip_suffix('\r').unwrap_or(line);
-        let value = line
-            .strip_prefix("verify-event: ")
-            .filter(|json| json.len() <= MAX_RECORD_BYTES)
-            .and_then(|json| aterm_json::from_str::<aterm_json::Value>(json).ok());
-        let Some(value) = value.filter(|value| value["schema"].as_u64() == Some(1)) else {
+        let Some(value) = record_value(line) else {
             malformed += 1;
             continue;
         };
@@ -123,6 +140,8 @@ pub fn observe(text: &str) -> Observed {
         _ => "multiple-terminal-records",
     };
     Observed {
+        invocations: Vec::new(),
+        unattributed: None,
         checks: checks.into_values().collect(),
         terminal_records: terminals.len(),
         terminal_consistency,
@@ -132,12 +151,57 @@ pub fn observe(text: &str) -> Observed {
     }
 }
 
+/// Read exact event identities without inferring them from file order, checkout or headers.
+#[must_use]
+pub fn observe(text: &str) -> Observed {
+    let mut all = observe_one(text);
+    let mut groups = BTreeMap::<String, (String, Option<String>, bool)>::new();
+    let mut unknown = String::new();
+    for line in text.split_inclusive('\n') {
+        let value = line
+            .strip_suffix('\n')
+            .and_then(|line| record_value(line.strip_suffix('\r').unwrap_or(line)));
+        let binding = value
+            .as_ref()
+            .filter(|v| v["schema"].as_u64() == Some(1))
+            .and_then(|v| {
+                let attribution = crate::event_log::attribution(v)?;
+                Some((attribution.id, attribution.source_observation))
+            });
+        if let Some((id, source)) = binding {
+            let group = groups
+                .entry(id)
+                .or_insert_with(|| (String::new(), source.clone(), false));
+            if group.1 != source {
+                group.2 = true;
+            }
+            group.0.push_str(line);
+        } else {
+            unknown.push_str(line);
+        }
+    }
+    all.invocations = groups
+        .into_iter()
+        .map(|(id, (text, source, conflict))| Invocation {
+            id,
+            source_observation: if conflict { None } else { source },
+            source_conflict: conflict,
+            observed: Box::new(observe_one(&text)),
+        })
+        .collect();
+    if !unknown.is_empty() {
+        all.unattributed = Some(Box::new(observe_one(&unknown)));
+    }
+    all
+}
+
 impl Observed {
     /// Machine-readable observations, omitting failure bodies, paths and rerun arguments.
     #[must_use]
-    pub fn json(&self) -> aterm_json::Value {
+    fn summary_json(&self) -> aterm_json::Value {
         aterm_json::json!({
-            "schema": 1, "kind": "observed-check-completions",
+            "schema": 2, "kind": "observed-check-completions",
+            "aggregate_scope": "all-records",
             "run_identity": null, "source_identity": null,
             "appended_incomplete_runs": "indistinguishable",
             "checks": self.checks.iter().map(|check| aterm_json::json!({
@@ -152,9 +216,29 @@ impl Observed {
         })
     }
 
+    /// Global observations and explicit invocation groups; no qualification verdict.
+    #[must_use]
+    pub fn json(&self) -> aterm_json::Value {
+        let mut summary = self.summary_json();
+        let Some(object) = summary.as_object_mut() else {
+            return summary;
+        };
+        object.insert("invocations".into(), aterm_json::json!(self.invocations.iter().map(|run| aterm_json::json!({
+            "id":run.id, "source_observation":run.source_observation.as_ref().and_then(|s| aterm_json::from_str::<aterm_json::Value>(s).ok()),
+            "source_conflict":run.source_conflict, "observed":run.observed.summary_json(),
+        })).collect::<Vec<_>>()));
+        object.insert(
+            "unattributed".into(),
+            self.unattributed
+                .as_ref()
+                .map_or(aterm_json::Value::Null, |rows| rows.summary_json()),
+        );
+        summary
+    }
+
     fn render(&self) -> String {
         let mut out = String::from(
-            "Observed check completions; run and source identity unrecorded.\nIncomplete appended runs cannot be distinguished.\n",
+            "Aggregate observed completions across all records.\nUnattributed incomplete runs cannot be distinguished.\n",
         );
         for check in &self.checks {
             // JSON quoting prevents event data from injecting terminal controls or extra rows.
@@ -178,6 +262,32 @@ impl Observed {
         out.push_str(&format!("Terminal records: {}; consistency: {}.\nMalformed complete records: {}; unprojected events: {}; trailing partial: {}.\n",
             self.terminal_records, self.terminal_consistency, self.malformed_complete_records,
             self.unprojected_records, self.trailing_partial));
+        for run in &self.invocations {
+            out.push_str(&format!(
+                "Invocation {}: source observation {}\n",
+                aterm_json::Value::String(run.id.clone()),
+                if run.source_conflict {
+                    "conflicting"
+                } else if run.source_observation.is_some() {
+                    "recorded (not checkout proof)"
+                } else {
+                    "unknown"
+                }
+            ));
+            for check in &run.observed.checks {
+                out.push_str(&format!(
+                    "  {}: {} ({} observations)\n",
+                    aterm_json::Value::String(check.check.clone()),
+                    check
+                        .outcomes
+                        .iter()
+                        .map(|s| aterm_json::Value::String(s.clone()).to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    check.occurrences
+                ));
+            }
+        }
         out
     }
 }
@@ -199,7 +309,7 @@ fn arguments(args: &[String]) -> Option<(PathBuf, bool)> {
 /// Exit zero means the file was inspected, regardless of the checks' observed outcomes.
 #[must_use]
 pub fn run(args: &[String], cwd: &Path) -> i32 {
-    const USAGE: &str = "usage: verify status --events <path> [--json]\nRead observed finished checks only; no run/source or landing verdict.\nExit: 0 inspected, 2 usage, 3 file unavailable.\n";
+    const USAGE: &str = "usage: verify status --events <path> [--json]\nRead observed finished checks, invocation groups and captured source observations; no landing verdict.\nExit: 0 inspected, 2 usage, 3 file unavailable.\n";
     if matches!(args, [help] if help == "--help" || help == "-h") {
         print!("{USAGE}");
         return crate::exit::PASS;
@@ -228,6 +338,124 @@ pub fn run(args: &[String], cwd: &Path) -> i32 {
 mod tests {
     use super::*;
     use crate::{Check, Outcome};
+
+    fn writer(head: Option<String>) -> crate::event_log::EventLog {
+        let ctx = crate::Ctx::new(
+            PathBuf::from("/fixture"),
+            crate::Scope::crate_only("aterm-verify"),
+            crate::EnvSnapshot::default(),
+            PathBuf::from("/fixture/scratch"),
+        )
+        .with_checks(&[Check::Doc])
+        .with_head_at_start(head);
+        let mut writer = crate::event_log::EventLog::unrecorded();
+        writer.bind(crate::event_log::Context::captured(&ctx));
+        writer
+    }
+
+    #[test]
+    fn an_oversized_rejected_record_cannot_supply_attribution_and_crlf_uses_the_same_gate() {
+        let writer = writer(None);
+        let bound = writer.prepare(&event(Check::Doc));
+        let crlf = format!("{}\r\n", bound.trim_end_matches('\n'));
+        assert_eq!(observe(&crlf).invocations.len(), 1);
+        let mut value: aterm_json::Value =
+            aterm_json::from_str(bound.trim().strip_prefix("verify-event: ").unwrap()).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "pad".into(),
+            aterm_json::Value::String("x".repeat(MAX_RECORD_BYTES + 1)),
+        );
+        let observed = observe(&format!("verify-event: {value}\n"));
+        assert!(observed.invocations.is_empty());
+        assert_eq!(observed.malformed_complete_records, 1);
+        assert_eq!(observed.unattributed.unwrap().malformed_complete_records, 1);
+        assert!(observed.checks.is_empty());
+    }
+
+    #[test]
+    fn incomplete_overlapping_invocations_partition_by_each_event_and_leave_legacy_unknown() {
+        let first = writer(None);
+        let second = writer(None);
+        // Neither writer needs a header for its actual check record to retain attribution.
+        let text = format!(
+            "{}{}{}",
+            first.prepare(&event(Check::Doc)),
+            second.prepare(&event(Check::Doc)),
+            event(Check::Fmt)
+        );
+        let observed = observe(&text);
+        assert_eq!(observed.invocations.len(), 2);
+        assert!(
+            observed
+                .invocations
+                .iter()
+                .all(|run| run.observed.checks[0].occurrences == 1)
+        );
+        assert_eq!(
+            observed.unattributed.as_ref().unwrap().checks[0].check,
+            "fmt"
+        );
+        assert!(observed.json()["run_identity"].is_null());
+        assert!(observed.json()["source_identity"].is_null());
+        assert_eq!(
+            observed.json()["aggregate_scope"].as_str(),
+            Some("all-records")
+        );
+        // A preceding bound start record cannot claim an adjacent legacy record.
+        let header_only = format!(
+            "{}{}",
+            first.prepare("verify-event: {\"schema\":1,\"event\":\"invocation-started\"}"),
+            event(Check::Doc)
+        );
+        let observed = observe(&header_only);
+        assert!(observed.invocations[0].observed.checks.is_empty());
+        assert_eq!(observed.unattributed.unwrap().checks[0].check, "doc");
+    }
+
+    #[test]
+    fn conflicting_source_metadata_and_partial_invalid_ids_never_become_checkout_proof() {
+        let first = writer(Some("a".repeat(40)));
+        let other = writer(Some("b".repeat(40)));
+        let original = first.prepare(&event(Check::Doc));
+        let mut foreign: aterm_json::Value = aterm_json::from_str(
+            other
+                .prepare(&event(Check::Fmt))
+                .trim()
+                .strip_prefix("verify-event: ")
+                .unwrap(),
+        )
+        .unwrap();
+        foreign
+            .as_object_mut()
+            .unwrap()
+            .get_mut("invocation")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "id".into(),
+                aterm_json::Value::String(first.id().unwrap().to_owned()),
+            );
+        let mut invalid = foreign.clone();
+        invalid
+            .as_object_mut()
+            .unwrap()
+            .get_mut("invocation")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("id".into(), aterm_json::Value::String("not-an-id".into()));
+        let text =
+            format!("{original}verify-event: {foreign}\nverify-event: {invalid}\nverify-event: {{");
+        let observed = observe(&text);
+        assert_eq!(observed.invocations.len(), 1);
+        assert!(observed.invocations[0].source_conflict);
+        assert!(observed.invocations[0].source_observation.is_none());
+        assert!(observed.unattributed.is_some());
+        assert!(observed.trailing_partial);
+        assert!(observed.json()["source_identity"].is_null());
+        assert!(observed.json()["invocations"][0]["source_observation"].is_null());
+    }
 
     fn result(check: Check, value: Outcome) -> crate::report::CheckResult {
         crate::report::CheckResult {
@@ -281,25 +509,30 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_appended_runs_are_indistinguishable_from_one_run() {
+    fn legacy_incomplete_appended_runs_are_indistinguishable_from_one_run() {
+        use std::io::Write as _;
         let dir = aterm_tempfile::tempdir().unwrap();
         let one = dir.path().join("one.events");
         let two = dir.path().join("two.events");
-        let single = crate::event_log::EventLog::open(&one).unwrap();
-        single.write(&event(Check::Doc));
-        single.write(&event(Check::Lint));
-        // The real writer permits separate incomplete invocations to append the same file.
-        crate::event_log::EventLog::open(&two)
-            .unwrap()
-            .write(&event(Check::Doc));
-        crate::event_log::EventLog::open(&two)
-            .unwrap()
-            .write(&event(Check::Lint));
+        // Historical report bytes predate per-event attribution. Current EventLog writers
+        // deliberately cannot reproduce this ambiguity: each now supplies its own identity.
+        std::fs::write(&one, format!("{}{}", event(Check::Doc), event(Check::Lint))).unwrap();
+        for row in [event(Check::Doc), event(Check::Lint)] {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&two)
+                .unwrap()
+                .write_all(row.as_bytes())
+                .unwrap();
+        }
         let one_incomplete_run = std::fs::read_to_string(one).unwrap();
         let separate_incomplete_runs = std::fs::read_to_string(two).unwrap();
         assert_eq!(one_incomplete_run, separate_incomplete_runs);
         let observed = observe(&one_incomplete_run);
         assert_eq!(observed, observe(&separate_incomplete_runs));
+        assert!(observed.invocations.is_empty());
+        assert!(observed.unattributed.is_some());
         assert_eq!(observed.terminal_consistency, "not-observed");
         assert_eq!(observed.json()["run_identity"], aterm_json::Value::Null);
         assert_eq!(observed.json()["source_identity"], aterm_json::Value::Null);

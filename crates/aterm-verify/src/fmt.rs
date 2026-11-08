@@ -786,7 +786,9 @@ mod tests {
 
     fn run_of(ok: bool, output: &str) -> exec::Run {
         exec::Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok,
             output: output.to_string(),
             code: Some(i32::from(!ok)),

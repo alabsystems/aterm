@@ -9,7 +9,7 @@ use crate::jobs::RunState;
 use crate::linux::{self, Root, ThrottleReader, TripKind, Zone};
 use crate::{Cap, CapSource, MemoryLevel, ThrottleLevel, Why};
 
-type Row<'a> = (u32, u32, &'a str, Option<u64>, Option<u64>);
+type Row<'a> = (u32, u32, &'a str, Option<u64>, Option<u64>, Option<u64>);
 
 fn tree(files: &[(&str, &str)]) -> aterm_tempfile::TempDir {
     let root = aterm_tempfile::tempdir().expect("scratch root");
@@ -927,7 +927,7 @@ fn the_sweep_reads_a_fixture_proc() {
         ),
         (
             "proc/4242/stat",
-            "4242 (tmux: server (1)) S 1 4242 4242 0 -1 4194560 1209 0 0 0 37 12 0 0 20 0 1 0 12345 0 0\n",
+            "4242 (tmux: server (1)) S 1 4242 4242 0 -1 4194560 1209 0 0 0 37 12 4 6 20 0 1 0 12345 0 0\n",
         ),
         (
             "proc/4242/status",
@@ -955,22 +955,46 @@ fn the_sweep_reads_a_fixture_proc() {
     let got: Vec<Row<'_>> = sweep
         .procs
         .iter()
-        .map(|p| (p.pid, p.ppid, p.name.as_str(), p.cpu_ns, p.footprint))
+        .map(|p| {
+            (
+                p.pid,
+                p.ppid,
+                p.name.as_str(),
+                p.cpu_ns,
+                p.child_cpu_ns,
+                p.footprint,
+            )
+        })
         .collect();
     assert_eq!(
         got,
         [
-            (1, 0, "systemd", Some(5_000_000_000), Some(8000 * 1024)),
-            (2, 0, "kthreadd", Some(70_000_000), Some(0)),
+            (
+                1,
+                0,
+                "systemd",
+                Some(5_000_000_000),
+                Some(0),
+                Some(8000 * 1024)
+            ),
+            (2, 0, "kthreadd", Some(70_000_000), Some(0), Some(0)),
             (
                 4242,
                 1,
                 "tmux: server (1)",
                 Some(490_000_000),
+                Some(100_000_000),
                 Some(3072 * 1024)
             ),
-            (4300, 4242, "zsh", Some(100_000_000), Some(1000 * 1024)),
-            (4400, 1, "old", Some(50_000_000), Some(250 * 4096)),
+            (
+                4300,
+                4242,
+                "zsh",
+                Some(100_000_000),
+                Some(0),
+                Some(1000 * 1024)
+            ),
+            (4400, 1, "old", Some(50_000_000), Some(0), Some(250 * 4096)),
         ]
     );
     assert_eq!(

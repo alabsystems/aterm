@@ -218,7 +218,7 @@ pub fn universal_control_disable() -> bool {
                 .arg(key)
                 .arg("-bool")
                 .arg("true");
-            bounded_stdout(&mut cmd).is_some()
+            required_write_after(&mut cmd, std::time::Duration::ZERO).is_some()
         })
     }
     #[cfg(not(target_os = "macos"))]
@@ -295,18 +295,24 @@ pub fn rosetta_install(within: std::time::Duration) -> Result<(), String> {
     }
 }
 
-/// [`bounded_stdout`], keeping the child's success bit: `defaults read` exits 1 with empty
+/// The optional read keeps the child's success bit: `defaults read` exits 1 with empty
 /// output for "this key is not set", an answer to tell apart from a read that did not run.
 #[cfg(target_os = "macos")]
 fn bounded_exit_and_stdout(cmd: &mut aterm_uds::spawnfd::Command) -> Option<(bool, Vec<u8>)> {
     bounded_stdout_inner(cmd, BOUNDED_CEILING)
 }
 
-/// Run `cmd` with a bounded wall clock ([`BOUNDED_CEILING`]); its stdout on a zero exit,
+/// Run a required write with its hang detector; its stdout on a zero exit,
 /// `None` on a spawn failure, a non-zero exit or the deadline.
 #[cfg(target_os = "macos")]
-fn bounded_stdout(cmd: &mut aterm_uds::spawnfd::Command) -> Option<Vec<u8>> {
-    match bounded_stdout_inner(cmd, BOUNDED_CEILING)? {
+fn required_write_after(
+    cmd: &mut aterm_uds::spawnfd::Command,
+    elapsed: std::time::Duration,
+) -> Option<Vec<u8>> {
+    let left = REQUIRED_WRITE_HANG
+        .checked_sub(elapsed)
+        .filter(|left| !left.is_zero())?;
+    match bounded_stdout_inner(cmd, left)? {
         (true, out) => Some(out),
         (false, _) => None,
     }
@@ -316,7 +322,10 @@ fn bounded_stdout(cmd: &mut aterm_uds::spawnfd::Command) -> Option<Vec<u8>> {
 #[cfg(target_os = "macos")]
 const BOUNDED_CEILING: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The deadline behind [`bounded_stdout`]: `crate::doctor::output_bounded_within`, which
+#[cfg(target_os = "macos")]
+const REQUIRED_WRITE_HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The native child deadline: `crate::doctor::output_bounded_within`, which
 /// kills the child at `ceiling` (`aterm_uds::reaper` collects it once it ends) and reads its
 /// stdout while it runs, never waiting on a process the child left behind holding the pipe.
 #[cfg(target_os = "macos")]
@@ -1075,6 +1084,37 @@ mod take_name_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_required_setting_write_waits_for_its_scheduled_child() {
+        let mut child =
+            aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new("/bin/sh")));
+        child.args(["-c", "printf ready"]);
+        assert_eq!(
+            required_write_after(&mut child, std::time::Duration::from_secs(6)),
+            Some(b"ready".to_vec())
+        );
+
+        let root = crate::testdir::dir("expired-setting-write-");
+        let marker = root.join("must-not-run");
+        let mut late =
+            aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new("/bin/sh")));
+        late.args(["-c", "printf late > \"$1\"", "fixture"])
+            .arg(&marker);
+        assert_eq!(
+            required_write_after(&mut late, std::time::Duration::from_secs(61)),
+            None
+        );
+        assert!(!marker.exists());
+
+        let mut refused =
+            aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new("/bin/sh")));
+        refused.args(["-c", "printf refused; exit 7"]);
+        assert_eq!(
+            required_write_after(&mut refused, std::time::Duration::from_secs(6)),
+            None
+        );
+    }
 
     #[test]
     fn the_rosetta_probe_reads_a_file_and_never_guesses_an_unsearchable_one() {

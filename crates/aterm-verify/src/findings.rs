@@ -75,12 +75,16 @@ impl Rerun {
     /// `RUST_TEST_THREADS=test_threads` where the run pinned one, never `cmd`'s own.
     #[must_use]
     pub fn of(cmd: &Cmd, test_threads: Option<u32>) -> Rerun {
-        const PLACEMENT: [&str; 6] = [
+        const PLACEMENT: [&str; 10] = [
             "CARGO_TARGET_DIR",
             "CARGO_BUILD_JOBS",
             "RUSTDOC",
             crate::docdriver::DRIVER_ENV,
             crate::docdriver::SKIP_ENV,
+            crate::docdriver::RUNTOOL_ENV,
+            crate::docdriver::RUNTOOL_SCRATCH_ENV,
+            crate::docdriver::RUNTOOL_SAMPLES_ENV,
+            crate::docdriver::RUNTOOL_HALT_ENV,
             crate::testrun::SUBPROCESS_SLOTS_ENV,
         ];
         let mut env: Vec<(OsString, OsString)> = cmd

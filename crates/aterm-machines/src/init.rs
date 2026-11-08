@@ -8073,11 +8073,7 @@ mod tests {
             line(Layer::Workstation.name()),
             Remedy::Develop.command().unwrap(),
         ];
-        for text in [
-            crate::init_clt::NO_TTY,
-            crate::items::developer::LOW_DATA,
-            crate::init_github::NEEDS_GIT,
-        ] {
+        for text in [crate::init_clt::NO_TTY, crate::init_github::NEEDS_GIT] {
             let named = init_lines(text);
             assert!(!named.is_empty(), "{text}");
             lines.extend(named);

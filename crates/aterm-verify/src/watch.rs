@@ -680,11 +680,15 @@ fn verdict(rows: &[Row]) -> &'static str {
     }
 }
 
+fn inherited_build_env(name: &str) -> bool {
+    aterm_toolchain::release_env::clears(name)
+        || aterm_toolchain::release_env::launcher_env(name)
+        || name.starts_with("TRUST_TARGO_")
+}
+
 fn scrub(cmd: &mut aterm_uds::spawnfd::Command) {
     for (name, _) in std::env::vars_os() {
-        if name.to_str().is_some_and(|n| {
-            aterm_toolchain::release_env::clears(n) || aterm_toolchain::release_env::launcher_env(n)
-        }) {
+        if name.to_str().is_some_and(inherited_build_env) {
             cmd.env_remove(name);
         }
     }
@@ -787,6 +791,7 @@ fn run_candidate_build(
     let ran = crate::exec::run(
         &cmd,
         crate::exec::ExecEnv {
+            events: None,
             cwd: root,
             path: &env.path,
             scratch,
@@ -795,6 +800,7 @@ fn run_candidate_build(
             add_env: &[],
             stage_groups: None,
             host: &crate::exec::LiveHost,
+            hang_samples: None,
         },
     );
     drop(stage_claim);
@@ -825,10 +831,7 @@ fn tree_command(
 fn sample_removed_env() -> Vec<String> {
     let mut removed: Vec<String> = std::env::vars_os()
         .filter_map(|(name, _)| name.into_string().ok())
-        .filter(|name| {
-            aterm_toolchain::release_env::clears(name)
-                || aterm_toolchain::release_env::launcher_env(name)
-        })
+        .filter(|name| inherited_build_env(name))
         .collect();
     for name in [
         "BUILD_SLOT_HELD",
@@ -1091,6 +1094,7 @@ fn sample_ready(root: &Path, result: &Path) -> Result<bool, String> {
             let mut ran = crate::exec::run(
                 &direct,
                 crate::exec::ExecEnv {
+                    events: None,
                     cwd: root,
                     path: &env.path,
                     scratch: &scratch,
@@ -1099,6 +1103,7 @@ fn sample_ready(root: &Path, result: &Path) -> Result<bool, String> {
                     add_env: &[],
                     stage_groups: None,
                     host: &crate::exec::LiveHost,
+                    hang_samples: None,
                 },
             );
             if let Ok(build_output) = fs::read_to_string(root.join(".git/watch-candidate.log")) {
@@ -1131,6 +1136,7 @@ fn sample_ready(root: &Path, result: &Path) -> Result<bool, String> {
             crate::exec::run(
                 &cmd,
                 crate::exec::ExecEnv {
+                    events: None,
                     cwd: root,
                     path: &env.path,
                     scratch: &scratch,
@@ -1139,6 +1145,7 @@ fn sample_ready(root: &Path, result: &Path) -> Result<bool, String> {
                     add_env: &[],
                     stage_groups: None,
                     host: &crate::exec::LiveHost,
+                    hang_samples: None,
                 },
             )
         };
@@ -1822,6 +1829,51 @@ mod tests {
         assert_eq!(paths, BTreeSet::from(["crates/aterm-verify".into()]));
     }
     #[test]
+    fn sampled_verifier_and_attribution_drop_outer_targo_authority() {
+        const AUTHORITY: &str = "TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT";
+        const MODE: &str = "ATERM_VERIFY_WATCH_TARGO_AUTHORITY_TEST";
+        const TEST: &str =
+            "watch::tests::sampled_verifier_and_attribution_drop_outer_targo_authority";
+
+        match std::env::var(MODE).as_deref() {
+            Ok("after-scrub") => {
+                assert!(std::env::var_os(AUTHORITY).is_none());
+                return;
+            }
+            Ok("inherited") => {
+                assert!(std::env::var_os(AUTHORITY).is_some());
+                assert!(sample_removed_env().iter().any(|name| name == AUTHORITY));
+                assert!(!inherited_build_env("TRUST_STAGE2_BIN"));
+
+                let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(MODE, "after-scrub");
+                scrub(&mut command);
+                let output = aterm_uds::deadline::output_until(
+                    &mut command,
+                    Instant::now() + Duration::from_secs(60),
+                )
+                .expect("the scrubbed attribution child must finish before the hang detector");
+                assert!(output.status.success());
+                return;
+            }
+            _ => {}
+        }
+
+        let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", TEST, "--nocapture"])
+            .env(MODE, "inherited")
+            .env(AUTHORITY, "/outer/targo/unverified.sock");
+        let output = aterm_uds::deadline::output_until(
+            &mut command,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .expect("the inherited-authority probe must finish before the hang detector");
+        assert!(output.status.success());
+    }
+    #[test]
     fn attribution_preserves_a_nested_crate_at_its_git_pin() {
         let root = std::fs::canonicalize(aterm_tempfile::manifest_dir().join("../..")).unwrap();
         let links = git(&root, &["ls-tree", "-rz", "--full-tree", "HEAD"]).unwrap();
@@ -2393,6 +2445,7 @@ mod tests {
         git(root, &["commit", "-m", "fixture"]).unwrap();
 
         let mut evidence = candidate_failure_row(&crate::exec::Run {
+            case_observations: None,
             code: Some(101),
             output: "could not compile sampled verifier\nFAIL candidate".into(),
             ..crate::exec::Run::default()
@@ -2417,6 +2470,7 @@ mod tests {
         assert!(sample.rows[0].decisions.is_empty());
 
         let unavailable = candidate_failure_row(&crate::exec::Run {
+            case_observations: None,
             spawn_error: Some("candidate compiler vanished".into()),
             output: "could not compile sampled verifier".into(),
             code: Some(101),

@@ -537,6 +537,9 @@ pub struct Replay {
     pub keep: Vec<u64>,
     /// The frames [`Replay::keep`] names, in time order.
     pub kept: Vec<Kept>,
+    /// Where the frames [`Replay::keep`] names go instead of [`Replay::kept`], each as it is
+    /// drawn: a replay that reads every frame of a scene against another's holds two at a time.
+    pub keep_to: Option<std::sync::mpsc::SyncSender<Kept>>,
 }
 
 /// A frame a replay kept ([`Replay::keep`]): its time, its pixels (`0x00RRGGBB`) as the glass
@@ -594,6 +597,20 @@ pub fn gallery_row_px() -> f32 {
 /// scene measured on another face's cell where it does not, each required where it runs.
 pub fn lays_the_gallery_row() -> bool {
     gallery_row_px() == GALLERY_PX
+}
+
+/// The cell Linux's bundled JetBrains Mono lays at [`GALLERY_PX`], px ([`gallery_row_px`]).
+const BUNDLED_CELL: (usize, usize) = (13, 29);
+
+/// Whether the window's face lays [`BUNDLED_CELL`] at [`GALLERY_PX`]: Linux's bundled face, on
+/// which a control measured there is required as measured.
+fn lays_the_bundled_cell() -> bool {
+    static CELL: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        Renderer::from_system(GALLERY_PX, Theme::default())
+            .expect("no font: build with aterm-render's default embedded-font feature")
+            .cell_size()
+    }) == BUNDLED_CELL
 }
 
 impl Replay {
@@ -680,6 +697,7 @@ impl Replay {
             cols,
             keep: Vec::new(),
             kept: Vec::new(),
+            keep_to: None,
         }
     }
 
@@ -908,7 +926,7 @@ impl Replay {
             std::fs::write(&path, frame.to_png()).expect("dump");
         }
         if self.keep.contains(&self.ms) {
-            self.kept.push(Kept {
+            let kept = Kept {
                 ms: self.ms,
                 px: frame.pixels.clone(),
                 w: frame.width,
@@ -918,7 +936,11 @@ impl Replay {
                 caret,
                 cell: self.cell,
                 caret_ground: self.fx.thin_caret_ground(),
-            });
+            };
+            match &self.keep_to {
+                Some(to) => to.send(kept).expect("the kept frames' reader"),
+                None => self.kept.push(kept),
+            }
         }
         let w = frame.width;
         let CleanFrame {
@@ -2589,9 +2611,14 @@ const PAPER_AT_AA: Look = Look {
 };
 
 /// The one scene [`a_letter_at_aa_keeps_aa`] holds to what it reads, not to AA: Beam bursting on
-/// Solarized Dark, whose light there is drawn past the letter guard's reach (PRISM-GLASS amendment
-/// 65's "Left", fix-forward). It reads [`BEAM_BURST_LEFT_UNDER`] letters at AA under it, none under
-/// [`BEAM_BURST_LEFT_LEAST`].
+/// Solarized Dark, whose light there was drawn past the letter guard's reach (PRISM-GLASS amendment
+/// 65's "Left", fix-forward). It read [`BEAM_BURST_LEFT_UNDER`] letters at AA under it, none under
+/// [`BEAM_BURST_LEFT_LEAST`]. On Linux's face that light is its body, a page shade the guard kept
+/// whole: held by the guard (`CursorGlow::hold_page_shades`), none of the burst's 376 readings of
+/// a letter at AA there is under it, the least a `j` at its own 4.5086, and with the shade kept
+/// whole 2 of 377 are, the least 4.4963 (Linux arm64, 2026-11-07). Whether it is the light under
+/// the `d` a Mac read is unmeasured: no Mac has read the burst under the hold, so its bound
+/// stands.
 const BEAM_BURST_LEFT: (&str, Look, Scene) = ("beam", SOLARIZED_DARK, Scene::Burst);
 /// The letters at AA [`BEAM_BURST_LEFT`] reads under it, as it was left.
 const BEAM_BURST_LEFT_UNDER: usize = 2;
@@ -2607,19 +2634,31 @@ const BEAM_BURST_LEFT_LEAST: f64 = 4.489;
 /// and an Enter at the bottom row on a paper page whose text reads between AA and the floor, and
 /// every style but Classic on Solarized Dark, through the host's post passes: every letter whose
 /// own reading lies between AA and the floor reads AA or more on every frame, save Beam's burst on
-/// Solarized Dark ([`BEAM_BURST_LEFT`]), which is held to what it reads: its light there is drawn
-/// past the guard's reach, and bursting, two letters at AA read under it, the least a `d` of its
-/// own 4.509 at 4.490 (with the guard off, 18 do, the least 3.51). Negative control
-/// (`with_share_over_aa`): such a letter keeping 97% of its reading, some style buries one under AA
-/// on each page.
+/// Solarized Dark ([`BEAM_BURST_LEFT`]), which is held to what main read there: its light drawn
+/// past the guard's reach, two letters at AA under it, the least a `d` of its own 4.509 at 4.490
+/// (with the guard off, 18, the least 3.51). Negative control (`with_share_over_aa`): such a letter
+/// keeping 97% of its reading, some style buries one under AA on each page.
+///
+/// Beam's body on Solarized Dark is a page shade (`InkLedger::note_page_shade_laid`), which the
+/// guard holds to the letters it reaches by itself. Kept whole, a ring lying on it and on the page
+/// read, by each channel's median (the upper one of an even count), a ground brighter than either,
+/// and on Linux's face Beam's `w`, 4.509 on its page, read 4.488 typing and at an Enter on the
+/// bottom row (Linux arm64, 2026-11-07). Negative control (`set_letter_guard_shades`): each page
+/// shade kept whole, Beam on Solarized Dark reads more letters at AA under AA over its three scenes
+/// than held where the face lays Linux's cells ([`lays_the_bundled_cell`]), 4 against none there
+/// (Linux arm64, 2026-11-07), and on another face at least as many. No Mac has measured it: main
+/// read 2 there with the shade kept whole, in the burst ([`BEAM_BURST_LEFT`]), and whether the hold
+/// lowers them on a Mac is unread.
 #[test]
 fn a_letter_at_aa_keeps_aa() {
     const SCENES: [Scene; 3] = [Scene::Typing, Scene::Burst, Scene::EnterBottom];
-    // (letters read at AA or over and under the floor, of those the ones under AA, the least).
-    let read = |style: &'static str, look: Look, scene: Scene, share: bool| {
+    // (letters read at AA or over and under the floor, of those the ones under AA, the least),
+    // each page shade held by the guard where `shades`.
+    let read = |style: &'static str, look: Look, scene: Scene, share: bool, shades: bool| {
         let run = || {
             let (ev, tail) = scene.events_on(look);
             let mut r = Replay::sized(style, look, TrailColor::Automatic, scene.rows());
+            r.fx.set_letter_guard_shades(shades);
             r.letters = true;
             r.own = true;
             r.post = true;
@@ -2654,7 +2693,7 @@ fn a_letter_at_aa_keeps_aa() {
                     s.spawn(move || {
                         chunk
                             .iter()
-                            .map(|&(style, look, scene)| read(style, look, scene, share))
+                            .map(|&(style, look, scene)| read(style, look, scene, share, true))
                             .collect::<Vec<_>>()
                     })
                 })
@@ -2681,10 +2720,10 @@ fn a_letter_at_aa_keeps_aa() {
         }
     }
     let (style, look, scene) = BEAM_BURST_LEFT;
-    let (.., at, under, (least, ms, ch)) = read(style, look, scene, false);
+    let (.., at, burst_under, (least, ms, ch)) = read(style, look, scene, false, true);
     assert!(
-        at > 0 && under <= BEAM_BURST_LEFT_UNDER && least >= BEAM_BURST_LEFT_LEAST,
-        "{style} on {} {scene:?} reads worse than it was left: {under} of {at} under AA (left \
+        at > 0 && burst_under <= BEAM_BURST_LEFT_UNDER && least >= BEAM_BURST_LEFT_LEAST,
+        "{style} on {} {scene:?} reads worse than it was left: {burst_under} of {at} under AA (left \
          {BEAM_BURST_LEFT_UNDER}), `{ch}` {least:.4} at {ms} ms (left {BEAM_BURST_LEFT_LEAST})",
         look.name
     );
@@ -2712,6 +2751,29 @@ fn a_letter_at_aa_keeps_aa() {
         "letters at AA read under it:\n{}",
         fell.join("\n")
     );
+    let held = burst_under
+        + swept
+            .iter()
+            .filter(|v| (v.0, v.1) == ("beam", SOLARIZED_DARK.name))
+            .map(|v| v.4)
+            .sum::<usize>();
+    let whole: usize = SCENES
+        .into_iter()
+        .map(|scene| read("beam", SOLARIZED_DARK, scene, false, false).4)
+        .sum();
+    if lays_the_bundled_cell() {
+        assert!(
+            whole > held,
+            "control: each page shade kept whole, Beam on Solarized Dark reads {whole} letters at \
+             AA under AA over its scenes, held {held}"
+        );
+    } else {
+        assert!(
+            whole >= held,
+            "control: each page shade kept whole, Beam on Solarized Dark reads {whole} letters at \
+             AA under AA over its scenes, fewer than held ({held})"
+        );
+    }
     let control = sweep(&jobs, true);
     for look in [PAPER_AT_AA, SOLARIZED_DARK] {
         assert!(
@@ -2910,9 +2972,11 @@ fn a_dim_page_s_trails_lay_no_shade() {
 
 /// The after-land lows' W6 under the guard's ring model, BEAM'S BODY ON A DIM PAGE REACHES THE
 /// CARET: on Solarized Dark Beam's bed turns its body off the page's hue at the page's luminance
-/// (`bed::page_lit_body_ink`), and the letter guard keeps that shade whole, so the tube stands
-/// behind the letters right up to the caret and no letter falls under the dim bar. Replayed with
-/// the frame's glyph ink, on the frame just after the last key, each of the three cells behind the
+/// (`bed::page_lit_body_ink`), and the letter guard holds that shade by itself, apart from the
+/// caret's halo, cutting it only where it lowers a letter under the lower of its raster bar and its
+/// own reading ([`beam_s_held_body_reaches_the_caret_on_every_frame`]), so the tube stands behind
+/// the letters right up to the caret and no letter falls under the dim bar. Replayed with the
+/// frame's glyph ink, on the frame just after the last key, each of the three cells behind the
 /// caret lies at least 0.05 off the page in OKLab over its bare page. Negative control
 /// (`EffectsPipeline::set_lit_body_a_shade(false)`): weighed with the lights in its cells, the
 /// guard cuts the body under the last word, the navy box stopping short of the caret again.
@@ -2987,6 +3051,145 @@ fn beam_s_body_on_a_dim_page_reaches_the_caret() {
             cut < 0.03,
             "control: {scene:?}: weighed with the lights in its cells, Beam's body keeps {cut:.3} \
              off the page behind the caret"
+        );
+    }
+}
+
+/// W6 on every frame, BEAM'S HELD BODY REACHES THE CARET ON EVERY FRAME: the letter guard holds
+/// Beam's body on Solarized Dark to the letters it reaches (`CursorGlow::hold_page_shades`),
+/// cutting it only where it lowers a letter under the lower of its raster bar and its own reading,
+/// and W6's reading behind the caret falls nowhere. Every frame of Beam typing, bursting, typing
+/// CJK, at an Enter on the bottom row and typing past the margin there, through the host's post
+/// passes, is read against the same frame with the body kept whole
+/// (`set_letter_guard_shades(false)`): each of the three cells behind the caret that lies at least
+/// 0.05 off the page in OKLab over its bare page (W6's reading and bar) with the body whole does so
+/// held. Negative controls, each failing the law in some scene:
+/// - `EffectsPipeline::set_lit_body_a_shade(false)`: weighed with the lights in its cells, the body
+///   is cut with the caret's halo under the last word.
+/// - `EffectsPipeline::set_letter_guard_shades_to_own(false)`: each letter held to its raster bar,
+///   as the hold's second pass held it, the body is cut from under a letter of its own 4.5086,
+///   under AA's level in hand (4.563), where the whole body lifts it short of that bar. Typing,
+///   18 of the 227 cells fall, bursting 48 of 610, at the Enter 16 of 260 and past the margin 77
+///   of 879 (Linux arm64, 2026-11-07).
+///
+/// Both the law and the second control rest on the face: they need a letter of its own reading
+/// under AA's level in hand behind the caret, which the whole body lifts short of that bar. They
+/// were measured on Linux's bundled face ([`lays_the_bundled_cell`]), where none falls held and the
+/// second control is required. On any other face, which no Mac has measured, each scene lets no
+/// more fall held than held to the raster bar.
+#[test]
+fn beam_s_held_body_reaches_the_caret_on_every_frame() {
+    use std::sync::mpsc::sync_channel;
+    const SCENES: [Scene; 5] = [
+        Scene::Typing,
+        Scene::Burst,
+        Scene::Cjk,
+        Scene::EnterBottom,
+        Scene::Wrapped,
+    ];
+    let look = SOLARIZED_DARK;
+    let rgb = |c: u32| aterm_types::Rgb {
+        r: (c >> 16) as u8,
+        g: (c >> 8) as u8,
+        b: c as u8,
+    };
+    // W6's reading of the cell `(row, col)` on frame `px` over its clean twin: the mean OKLab
+    // distance off the page of its page pixels in the letters' rows; `None` with none.
+    let w6 = |k: &Kept, px: &[u32], (row, col): (usize, usize)| {
+        let (cw, ch) = k.cell;
+        let (x0, y0) = (k.left + col * cw, k.top + row * ch);
+        let (mut sum, mut n) = (0.0, 0usize);
+        for y in y0 + ch / 8..y0 + ch * 3 / 4 {
+            for x in x0..x0 + cw {
+                let i = y * k.w + x;
+                if k.clean[i] & 0x00FF_FFFF == look.bg {
+                    sum += aterm_types::scheme_signature::oklab_distance(rgb(px[i]), rgb(look.bg));
+                    n += 1;
+                }
+            }
+        }
+        (n > 0).then_some(sum / n as f64)
+    };
+    // Every frame of `scene` with the body as `set` lays it, against the body kept whole: the
+    // frames read, the cells behind the caret W6 reads at its bar whole, those of them that fall
+    // under it with the body as `set` lays it, and the first such `(ms, column, set, whole)`.
+    let read = |scene: Scene, set: fn(&mut EffectsPipeline)| {
+        let (ev, tail) = scene.events_on(look);
+        let end = ev.last().map_or(0, |e| e.0) + tail;
+        let frames: Vec<u64> = (1..=end / FRAME_MS).map(|k| k * FRAME_MS).collect();
+        let replay = |set: fn(&mut EffectsPipeline), to| {
+            let mut r = Replay::sized("beam", look, TrailColor::Automatic, scene.rows());
+            set(&mut r.fx);
+            r.post = true;
+            r.keep.clone_from(&frames);
+            r.keep_to = Some(to);
+            let _ = r.run(&ev, tail);
+        };
+        let (to_set, set_frames) = sync_channel::<Kept>(1);
+        let (to_whole, whole_frames) = sync_channel::<Kept>(1);
+        std::thread::scope(|s| {
+            // Owned here, the readers go with a failed read, and so the replays with them.
+            let (set_frames, whole_frames) = (set_frames, whole_frames);
+            s.spawn(|| replay(set, to_set));
+            s.spawn(|| replay(|fx| fx.set_letter_guard_shades(false), to_whole));
+            let (mut read, mut at_bar, mut fell, mut first) = (0usize, 0usize, 0usize, None);
+            for (a, b) in set_frames.iter().zip(whole_frames.iter()) {
+                assert_eq!(a.ms, b.ms, "fixture: the replays keep the same frames");
+                read += 1;
+                let (row, caret) = b.caret;
+                for back in 1..=3.min(caret) {
+                    let cell = (row, caret - back);
+                    let (Some(whole), Some(kept)) = (w6(&b, &b.px, cell), w6(&b, &a.px, cell))
+                    else {
+                        continue;
+                    };
+                    if whole >= 0.05 {
+                        at_bar += 1;
+                        if kept < 0.05 {
+                            fell += 1;
+                            first.get_or_insert((a.ms, cell.1, kept, whole));
+                        }
+                    }
+                }
+            }
+            (scene, read, at_bar, fell, first)
+        })
+    };
+    let bundled = lays_the_bundled_cell();
+    let held = SCENES.map(|scene| read(scene, |_| {}));
+    let to_bar = SCENES.map(|scene| read(scene, |fx| fx.set_letter_guard_shades_to_own(false)));
+    for ((scene, frames, at_bar, fell, first), bar) in held.into_iter().zip(&to_bar) {
+        assert!(
+            frames > 0 && at_bar > 0,
+            "premise: {scene:?}: {frames} frames, {at_bar} cells behind the caret at W6's bar"
+        );
+        if bundled {
+            assert_eq!(
+                fell, 0,
+                "{scene:?}: of {at_bar} cells behind the caret at W6's bar with Beam's body \
+                 whole, {fell} fall under it held, the first (ms, column, held, whole) {first:?}"
+            );
+        } else {
+            assert!(
+                fell <= bar.3,
+                "{scene:?}: of {at_bar} cells behind the caret at W6's bar with Beam's body \
+                 whole, {fell} fall under it held, more than the {} held to the raster bar, the \
+                 first (ms, column, held, whole) {first:?}",
+                bar.3
+            );
+        }
+    }
+    let weighed = SCENES.map(|scene| read(scene, |fx| fx.set_lit_body_a_shade(false)));
+    assert!(
+        weighed.iter().any(|v| v.3 > 0),
+        "control: weighed with the lights in its cells, Beam's body keeps W6's bar behind the \
+         caret: {weighed:?}"
+    );
+    if bundled {
+        assert!(
+            to_bar.iter().any(|v| v.3 > 0),
+            "control: each letter held to its raster bar, Beam's body keeps W6's bar behind the \
+             caret: {to_bar:?}"
         );
     }
 }

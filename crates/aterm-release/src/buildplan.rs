@@ -835,6 +835,48 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
     snapshot::private_dir(symbol_out, "release symbol stage")?;
 
     let (slices, slice_builds) = build_slices(plan, take, &take.stage)?;
+    // Keep Cargo's linked outputs untouched: a fresh hop copies, stamps and signs those same
+    // bytes again. Mutating a target output would invalidate its output-integrity evidence.
+    let mut stamped = Vec::new();
+    let mut unstamped = Vec::new();
+    let slice_store = take._hold.cache().artifacts();
+    let identity = aterm_stamp::Stamp {
+        app_version: plan.short_version.clone().leak(),
+        git_commit: take.short_commit.clone().leak(),
+        git_commit_full: take.snapshot.commit.clone().leak(),
+        build_number: plan.build_number.to_string().leak(),
+        build_time: crate::bundle::epoch_to_rfc3339(plan.build_number).leak(),
+        index_hint: plan.index_hint.clone().unwrap_or_default().leak(),
+        release_build: true,
+        ..aterm_stamp::Stamp::UNSTAMPED
+    };
+    let stamp = aterm_stamp::encode(&identity)?;
+    for (index, slice) in slices.iter().enumerate() {
+        let copy = take.stage.join(format!("stamped-{index}"));
+        crate::durable::copy_regular_fresh(slice, &copy)
+            .map_err(|e| format!("copy stamp slice: {e}"))?;
+        // x86 linkers need not emit an ad hoc signature. Establish the signature command
+        // before taking U, so both architectures use the same normalization.
+        crate::postlink::resign(&copy)?;
+        let kept = crate::postlink::keep_unstamped(&copy, &slice_store)?;
+        crate::durable::copy_regular_fresh(&kept, &copy)
+            .map_err(|e| format!("copy content-addressed slice: {e}"))?;
+        unstamped.push(kept);
+        let content = crate::postlink::normalized(
+            &crate::durable::read_regular_bytes(&copy, u64::MAX).map_err(|e| e.to_string())?,
+        )?;
+        crate::postlink::stamp(&copy, &stamp)?;
+        crate::postlink::resign(&copy)?;
+        if crate::postlink::normalized(
+            &crate::durable::read_regular_bytes(&copy, u64::MAX).map_err(|e| e.to_string())?,
+        )? != content
+        {
+            return Err("post-link stamping changed product content".into());
+        }
+        stamped.push(copy);
+    }
+    crate::postlink::prune_unstamped(&slice_store, &unstamped)?;
+    let slices = stamped;
 
     if let Some(expected) = &plan.expected_update_pin_sha256 {
         verify_built_slice_update_pins(&plan.repo_root, &slices, expected)?;
@@ -864,6 +906,7 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
         .arg(&shipped)
         .current_dir(&plan.repo_root)
         .output();
+    crate::postlink::resign(&shipped)?;
 
     if let Some(expected) = &plan.expected_update_pin_sha256 {
         verify_shipped_update_pin_slices(&shipped, &archs, expected)?;
@@ -890,6 +933,8 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
             );
         }
     };
+    crate::postlink::identity_report(&identity, &diagnose)?;
+    println!("    identity: running native image reports the post-link stamp");
     if let Some(expected) = &plan.expected_update_pin_sha256 {
         validate_slice_update_pin_reports(expected, &[("final universal binary", &diagnose)])?;
         println!("    updater pin: final universal runtime cross-check passed");
@@ -942,6 +987,7 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
             command.output()
         })?;
         let label = "x86_64 slice under Rosetta";
+        crate::postlink::identity_report(&identity, &report)?;
         if let Some(expected) = &plan.expected_update_pin_sha256 {
             validate_slice_update_pin_reports(expected, &[(label, &report)])?;
         }
@@ -1075,14 +1121,25 @@ fn release_env(e: &ReleaseEnv<'_>) -> Vec<(&'static str, OsString)> {
             "cargo::core::compiler::fingerprint=info,targo::core::compiler::fingerprint=info"
                 .into(),
         ),
-        // The identity record's inputs (`aterm_stamp::input`): only the `aterm` package's build
-        // script reads them, so the build number, commit and index hint are inputs of the leaf
-        // crate alone, never of a library unit.
-        (input::MODE, "commit".into()),
-        (input::EPOCH, e.build_number.to_string().into()),
-        (input::COMMIT, e.short_commit.into()),
-        (input::FULL_COMMIT, e.commit.into()),
-        (input::DEV_COMMITS, "0".into()),
+        // macOS links a constant placeholder: reservation and index identity are supplied
+        // only to the post-link writer. Other platforms still compile their leaf stamp.
+        (
+            input::MODE,
+            if cfg!(target_os = "macos") {
+                "postlink"
+            } else {
+                "commit"
+            }
+            .into(),
+        ),
+        (
+            input::EPOCH,
+            if cfg!(target_os = "macos") {
+                "0".into()
+            } else {
+                e.build_number.to_string().into()
+            },
+        ),
         ("CARGO_TARGET_DIR", e.target_dir.clone().into_os_string()),
         (
             "CARGO_PROFILE_RELEASE_DEBUG",
@@ -1092,11 +1149,18 @@ fn release_env(e: &ReleaseEnv<'_>) -> Vec<(&'static str, OsString)> {
             "CARGO_PROFILE_RELEASE_STRIP",
             release_profile_debug().1.into(),
         ),
-        (input::RELEASE, "1".into()),
         (aterm_capacity::RELEASE_RUN_ENV, "1".into()),
     ];
-    if let Some(hint) = e.index_hint {
-        env.push((input::INDEX_HINT, hint.into()));
+    if !cfg!(target_os = "macos") {
+        env.extend([
+            (input::COMMIT, e.short_commit.into()),
+            (input::FULL_COMMIT, e.commit.into()),
+            (input::DEV_COMMITS, "0".into()),
+            (input::RELEASE, "1".into()),
+        ]);
+        if let Some(hint) = e.index_hint {
+            env.push((input::INDEX_HINT, hint.into()));
+        }
     }
     if let Some(rustup_home) = &e.rustup_home {
         env.push(("RUSTUP_HOME", rustup_home.clone()));
@@ -3743,8 +3807,22 @@ mod tests {
             ] {
                 assert_eq!(get(steering), None, "{steering} reaches the release build");
             }
-            assert_eq!(get(aterm_stamp::input::MODE).as_deref(), Some("commit"));
-            assert_eq!(get(aterm_stamp::input::EPOCH).as_deref(), Some("4242"));
+            assert_eq!(
+                get(aterm_stamp::input::MODE).as_deref(),
+                Some(if cfg!(target_os = "macos") {
+                    "postlink"
+                } else {
+                    "commit"
+                })
+            );
+            assert_eq!(
+                get(aterm_stamp::input::EPOCH).as_deref(),
+                Some(if cfg!(target_os = "macos") {
+                    "0"
+                } else {
+                    "4242"
+                })
+            );
             let (debug, strip) = if cfg!(target_os = "linux") {
                 ("0", "debuginfo")
             } else {
@@ -3752,9 +3830,32 @@ mod tests {
             };
             assert_eq!(get("CARGO_PROFILE_RELEASE_DEBUG").as_deref(), Some(debug));
             assert_eq!(get("CARGO_PROFILE_RELEASE_STRIP").as_deref(), Some(strip));
-            assert_eq!(get(aterm_stamp::input::RELEASE).as_deref(), Some("1"));
+            assert_eq!(
+                get(aterm_stamp::input::RELEASE).as_deref(),
+                (!cfg!(target_os = "macos")).then_some("1")
+            );
             assert_eq!(get(aterm_capacity::RELEASE_RUN_ENV).as_deref(), Some("1"));
-            assert_eq!(get(aterm_stamp::input::INDEX_HINT).as_deref(), index_hint);
+            assert_eq!(
+                get(aterm_stamp::input::INDEX_HINT).as_deref(),
+                if cfg!(target_os = "macos") {
+                    None
+                } else {
+                    index_hint
+                }
+            );
+            if cfg!(target_os = "macos") {
+                for key in [
+                    aterm_stamp::input::COMMIT,
+                    aterm_stamp::input::FULL_COMMIT,
+                    aterm_stamp::input::DEV_COMMITS,
+                ] {
+                    assert_eq!(
+                        get(key),
+                        None,
+                        "identity pins never reach a postlink compile"
+                    );
+                }
+            }
             assert_eq!(
                 get("RUSTUP_TOOLCHAIN").as_deref(),
                 compat.then_some("stable"),

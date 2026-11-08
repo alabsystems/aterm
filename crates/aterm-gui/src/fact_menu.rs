@@ -123,26 +123,6 @@ pub(crate) struct AccountMenuRow {
     pub(crate) enabled: bool,
 }
 
-/// Format weekly words with a 5-cell meter bar of the share left (`▰▱▱▱▱  weekly 73% used`).
-#[must_use]
-pub(crate) fn weekly_meter_bar(text: &str) -> String {
-    let Some(pct) = weekly_pct(text) else {
-        return text.to_string();
-    };
-    let filled = if pct == 0 {
-        0
-    } else {
-        (pct.min(100) * 5).div_ceil(100).clamp(1, 5) as usize
-    };
-    let mut bar = String::with_capacity(15 + 2 + text.len());
-    for i in 0..5 {
-        bar.push(if i < filled { '\u{25b0}' } else { '\u{25b1}' });
-    }
-    bar.push_str("  ");
-    bar.push_str(text);
-    bar
-}
-
 /// The whole percent left of the share weekly words say used (`weekly 27% used`: 73; a bound,
 /// `weekly ≥27% used`, gives the most that can be left: 73), as [`whole_left`] says it; `None`
 /// for words with no figure (a wall's `weekly out`, a gap's).
@@ -274,8 +254,8 @@ pub(crate) enum RowWeek {
 }
 
 /// What the account menu takes from a footer's subscription `sub` at `now` (`walled`: a 7d wall
-/// in its transcript): the session's own row week (as [`row_figure`] gives it), the meter
-/// line, and the footer's gap where there is neither. A figure whose week has reset or whose
+/// in its transcript): the session's own row week (as [`row_figure`] gives it), the footer's
+/// weekly words, and the footer's gap where there is neither. A figure whose week has reset or whose
 /// observation clock is not admitted gives no row or meter; a screen's words, with no figure
 /// behind them, give their own percent, and a wall's ([`WEEKLY_OUT`]) [`RowWeek::Out`].
 pub(crate) fn weekly_facts(
@@ -297,7 +277,7 @@ pub(crate) fn weekly_facts(
                 None if weekly == WEEKLY_OUT => Some(RowWeek::Out),
                 None => weekly_pct(&weekly).map(|pct| RowWeek::Left(pct, String::new())),
             };
-            (row, Some(weekly_meter_bar(&weekly)), None)
+            (row, Some(weekly), None)
         }
         None => (None, None, sub.weekly_gap),
     }
@@ -358,9 +338,13 @@ pub(crate) struct FactMenuFacts {
     pub(crate) context: Option<String>,
     /// The active subscription summary (`sol-m27@example.test · max 20x`).
     pub(crate) subscription: Option<String>,
-    /// The weekly meter line (`▰▰▰▰▱  weekly 39% used`, its bar the share left; a wall's
-    /// `weekly out`, no meter).
-    pub(crate) weekly_meter: Option<String>,
+    /// The footer's weekly words (`weekly 39% used`; a wall's `weekly out`), which a card with
+    /// no outlook says.
+    pub(crate) weekly: Option<String>,
+    /// The session's own week figure while its week runs ([`session_figure`]): the work row's
+    /// lead on the Accounts card, as on line E (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
+    /// §2.2, one figure at now).
+    pub(crate) own: Option<aterm_agent::harness::outlook::Figure>,
     /// Why the footer has no weekly figure, where it says ([`weekly_gap_why`]).
     pub(crate) weekly_gap: Option<WeeklyGap>,
     /// The pooled CLI the session runs, whose roster [`Self::accounts`] lists (`None`: the
@@ -404,6 +388,10 @@ pub(crate) struct FactMenuFacts {
     pub(crate) outlook: Option<std::sync::Arc<aterm_agent::harness::outlook::Outlook>>,
     /// The roster label of this session's own account, the outlook's row for "this tab".
     pub(crate) account_row: Option<String>,
+    /// The rotation can move this tab ([`aterm_agent::harness::accounts::AuthRoute::on_account`]
+    /// of the footer's route, as its glance reads it): else the card projects nothing and says
+    /// no verdict (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4).
+    pub(crate) movable: bool,
     /// The pane's rows the card may take, where its height is known.
     pub(crate) height: Option<usize>,
     /// This tab's account's vault token, on a Claude Code card
@@ -452,10 +440,30 @@ fn account_item(fact: Fact, acct: &AccountMenuRow, label: String, spoken: String
     }
 }
 
+/// The account card's last item, on every path the card takes (§1.4): one label, so a
+/// selection kept across a refresh stays on it.
+fn settings_item(fact: Fact) -> MenuRow {
+    MenuRow::Item {
+        glyph: "\u{22ef}",
+        label: "Account settings\u{2026}".to_string(),
+        spoken: "Account settings: open the configuration folder".to_string(),
+        act: MenuAct::Fact(fact, FactAct::AccountSettings),
+        enabled: true,
+        checked: false,
+    }
+}
+
+/// The pin, rotation and usage refresh items' glyph
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §4.2): `⇄`, never `↻`, which reads as the
+/// reset's `↺`.
+pub(crate) const PIN_GLYPH: &str = "\u{21c4}";
+
 const fn plot_ink(ink: aterm_agent::harness::outlook::CardInk) -> PlotInk {
     use aterm_agent::harness::outlook::CardInk;
     match ink {
-        CardInk::Meter => PlotInk::Meter,
+        CardInk::Read => PlotInk::Read,
+        CardInk::Ahead => PlotInk::Ahead,
+        CardInk::Mark => PlotInk::Mark,
         CardInk::Track => PlotInk::Track,
         CardInk::Warn => PlotInk::Warn,
         CardInk::Value => PlotInk::Value,
@@ -464,42 +472,37 @@ const fn plot_ink(ink: aterm_agent::harness::outlook::CardInk) -> PlotInk {
 }
 
 /// The outlook's card rows ([`aterm_agent::harness::outlook::Outlook::card_rows`]) as menu
-/// rows: its notes, plots and rules as they come, and each roster row's item in roster order
-/// with the act, the check and the enabling of [`FactMenuFacts::accounts`], a row the outlook
-/// has no words for keeping the store's (`docs/DESIGN-accounts-outlook-2026-10-25.md` §8).
+/// rows, in the card's order (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4): its
+/// notes, plots and rules as they come, and each roster row's item where the card puts it (the
+/// named accounts with their lanes, then the folded ones under a rule) with the act, the check
+/// and the enabling of [`FactMenuFacts::accounts`]. An item and its lane are one unit: a card
+/// account the store does not list draws neither. A row the store lists and the outlook has no
+/// words for keeps the store's words, after the card's own items. With them, whether the rows
+/// end on the card's legend, which closes the drawn rows in place of a rule.
 fn outlook_rows(
     fact: Fact,
     outlook: &aterm_agent::harness::outlook::Outlook,
     facts: &FactMenuFacts,
     height: Option<usize>,
-) -> Vec<MenuRow> {
+) -> (Vec<MenuRow>, bool) {
     use aterm_agent::harness::outlook::CardRow;
-    let label = facts.account_row.as_deref();
-    let mut card = outlook.card_rows(label, facts.room, height);
+    let tab = facts.account_row.as_deref().unwrap_or_default();
+    let mut card = outlook.card_rows(tab, facts.own, facts.movable, facts.room, height);
     // The card is 60 cells wide only beside a drawn row (`autopilot_menu::max_content`).
     if facts.room > autopilot_menu::MAX_CONTENT
         && !card.iter().any(|row| matches!(row, CardRow::Plot { .. }))
     {
-        card = outlook.card_rows(label, autopilot_menu::MAX_CONTENT, height);
+        card = outlook.card_rows(
+            tab,
+            facts.own,
+            facts.movable,
+            autopilot_menu::MAX_CONTENT,
+            height,
+        );
     }
-    let map = |row: CardRow| match row {
-        CardRow::Note {
-            text,
-            spoken,
-            warn,
-            value,
-        } => MenuRow::Note {
-            spoken: spoken.unwrap_or_else(|| autopilot_menu::spoken_words(&text)),
-            text,
-            tone: if warn {
-                autopilot_menu::NoteTone::Warn
-            } else if value {
-                autopilot_menu::NoteTone::Value
-            } else {
-                autopilot_menu::NoteTone::Label
-            },
-        },
-        CardRow::Plot { cells, spoken } => MenuRow::plot(
+    let mut legend_last = card.last().is_some_and(CardRow::is_legend);
+    let plot = |cells: Vec<(char, aterm_agent::harness::outlook::CardInk)>, spoken: String| {
+        MenuRow::plot(
             cells
                 .into_iter()
                 .map(|(ch, ink)| PlotCell {
@@ -509,44 +512,72 @@ fn outlook_rows(
                 })
                 .collect::<Vec<_>>(),
             spoken,
-        ),
-        CardRow::Rule | CardRow::Account { .. } => MenuRow::Rule,
+        )
     };
-    let mut head = Vec::new();
-    let mut groups: Vec<(String, String, String, Vec<MenuRow>)> = Vec::new();
+    let mut out = Vec::with_capacity(card.len() + 1);
+    let mut placed: Vec<&str> = Vec::new();
     for row in card {
         match row {
+            CardRow::Note {
+                text,
+                spoken,
+                warn,
+                value,
+            } => out.push(MenuRow::Note {
+                spoken: spoken.unwrap_or_else(|| autopilot_menu::spoken_words(&text)),
+                text,
+                tone: if warn {
+                    autopilot_menu::NoteTone::Warn
+                } else if value {
+                    autopilot_menu::NoteTone::Value
+                } else {
+                    autopilot_menu::NoteTone::Label
+                },
+            }),
+            CardRow::Plot { cells, spoken } => out.push(plot(cells, spoken)),
+            CardRow::Rule => out.push(MenuRow::Rule),
             CardRow::Account {
                 label,
                 text,
                 spoken,
-            } => groups.push((label, text, spoken, Vec::new())),
-            row => match groups.last_mut() {
-                Some((.., under)) => under.push(map(row)),
-                None => head.push(map(row)),
-            },
+                lane,
+            } => {
+                let Some(acct) = facts
+                    .accounts
+                    .iter()
+                    .find(|acct| acct.account.as_str() == label)
+                else {
+                    continue;
+                };
+                placed.push(acct.account.as_str());
+                out.push(account_item(fact, acct, text, spoken));
+                if let Some(lane) = lane {
+                    out.push(plot(lane.cells, lane.spoken));
+                }
+            }
         }
     }
-    let mut out = head;
-    for acct in &facts.accounts {
-        match groups
-            .iter()
-            .position(|(label, ..)| label == acct.account.as_str())
-        {
-            Some(at) => {
-                let (_, text, spoken, under) = groups.remove(at);
-                out.push(account_item(fact, acct, text, spoken));
-                out.extend(under);
-            }
-            None => out.push(account_item(
+    let rest: Vec<&AccountMenuRow> = facts
+        .accounts
+        .iter()
+        .filter(|acct| !placed.contains(&acct.account.as_str()))
+        .collect();
+    if !rest.is_empty() {
+        legend_last = false;
+        // After the legend, the store's own rows sit under a rule of their own.
+        if !matches!(out.last(), Some(MenuRow::Rule)) {
+            out.push(MenuRow::Rule);
+        }
+        for acct in rest {
+            out.push(account_item(
                 fact,
                 acct,
                 acct.label.clone(),
                 acct.label.clone(),
-            )),
+            ));
         }
     }
-    out
+    (out, legend_last)
 }
 
 fn recovery_observed_line(at: i64) -> String {
@@ -825,7 +856,13 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 });
                 out.push(MenuRow::Rule);
             }
-            if let Some(sub) = &facts.subscription {
+            // Under the outlook each item says its plan, and the email leaves the glass
+            // (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.5).
+            if let Some(sub) = facts
+                .subscription
+                .as_ref()
+                .filter(|_| facts.outlook.is_none())
+            {
                 out.push(MenuRow::note(format!(
                     "{}  {sub}",
                     aterm_agent::harness::footer::ACCOUNT_MARK
@@ -834,15 +871,11 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
             if let Some(token) = &facts.token {
                 token_rows(&mut out, fact, token);
             }
-            // Under the outlook the week's bar row carries the meter (§8.1).
-            if let Some(meter) = facts
-                .weekly_meter
-                .as_ref()
-                .filter(|_| facts.outlook.is_none())
-            {
-                // The week's line leads with no mark of its own: `◷` left the glass (§4.2), and
-                // the card's rows are S6's to redraw.
-                out.push(MenuRow::note(format!("   {meter}")));
+            // Under the outlook the work row and the lanes say the week
+            // (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4); without one the week's
+            // words lead with no mark of their own: `◷` left the glass (§4.2).
+            if let Some(weekly) = facts.weekly.as_ref().filter(|_| facts.outlook.is_none()) {
+                out.push(MenuRow::note(format!("   {weekly}")));
             } else if let Some(gap) = facts.weekly_gap {
                 out.push(MenuRow::note_spoken(
                     format!("   {}", gap.words()),
@@ -864,7 +897,7 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 if facts.refresh_usage {
                     out.push(item(
                         fact,
-                        "\u{21bb}",
+                        PIN_GLYPH,
                         "Refresh usage",
                         FactAct::RefreshUsage,
                         true,
@@ -886,14 +919,7 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
             }
             if let Some(why) = &facts.accounts_refused {
                 out.push(MenuRow::note(format!("Account state unavailable: {why}")));
-                out.push(MenuRow::Item {
-                    glyph: "\u{22ef}",
-                    label: "Open configuration folder\u{2026}".to_string(),
-                    spoken: "Open configuration folder".to_string(),
-                    act: MenuAct::Fact(fact, FactAct::AccountSettings),
-                    enabled: true,
-                    checked: false,
-                });
+                out.push(settings_item(fact));
                 return out;
             }
             let other = (cli != aterm_agent::harness::accounts::Cli::Claude).then_some(cli);
@@ -909,14 +935,7 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                     cli.id()
                 )));
                 out.push(MenuRow::Rule);
-                out.push(MenuRow::Item {
-                    glyph: "\u{22ef}",
-                    label: "Open configuration folder\u{2026}".to_string(),
-                    spoken: "Open configuration folder".to_string(),
-                    act: MenuAct::Fact(fact, FactAct::AccountSettings),
-                    enabled: true,
-                    checked: false,
-                });
+                out.push(settings_item(fact));
                 return out;
             }
             if facts.accounts.is_empty() {
@@ -925,7 +944,7 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 ));
                 out.push(MenuRow::Rule);
                 out.push(MenuRow::Item {
-                    glyph: "\u{21bb}",
+                    glyph: PIN_GLYPH,
                     label: "Sync accounts & clear this machine’s pin".to_string(),
                     spoken: format!(
                         "Sync accounts and clear this machine's {} pool pin",
@@ -935,21 +954,17 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                     enabled: !facts.manual_signin_unavailable,
                     checked: false,
                 });
-                out.push(MenuRow::Item {
-                    glyph: "\u{22ef}",
-                    label: "Open configuration folder\u{2026}".to_string(),
-                    spoken: "Open configuration folder".to_string(),
-                    act: MenuAct::Fact(fact, FactAct::AccountSettings),
-                    enabled: true,
-                    checked: false,
-                });
+                out.push(settings_item(fact));
                 return out;
             }
+            let mut legend_last = false;
             match &facts.outlook {
                 Some(outlook) => {
                     // The rows below the head, the auto-rotate and the settings items.
                     let height = facts.height.map(|h| h.saturating_sub(out.len() + 3));
-                    out.extend(outlook_rows(fact, outlook, facts, height));
+                    let (card, legend) = outlook_rows(fact, outlook, facts, height);
+                    out.extend(card);
+                    legend_last = legend;
                 }
                 None => {
                     out.push(MenuRow::Rule);
@@ -963,9 +978,13 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                     }
                 }
             }
-            out.push(MenuRow::Rule);
+            // The card's legend closes its drawn rows; the pin and settings items follow it
+            // (§1.4), as they follow a rule under anything else, a lane included.
+            if !legend_last {
+                out.push(MenuRow::Rule);
+            }
             out.push(MenuRow::Item {
-                glyph: "\u{21bb}",
+                glyph: PIN_GLYPH,
                 label: "No pinned account · this machine".to_string(),
                 spoken: format!(
                     "No pinned account in this machine's {} pool",
@@ -975,14 +994,7 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 enabled: !facts.manual_signin_unavailable,
                 checked: facts.pool_unpinned,
             });
-            out.push(MenuRow::Item {
-                glyph: "\u{22ef}",
-                label: "Open configuration folder\u{2026}".to_string(),
-                spoken: "Open configuration folder".to_string(),
-                act: MenuAct::Fact(fact, FactAct::AccountSettings),
-                enabled: true,
-                checked: false,
-            });
+            out.push(settings_item(fact));
             return out;
         }
         Fact::Usage => return out,
@@ -1539,6 +1551,9 @@ impl App {
                         .as_deref()
                         .is_some_and(crate::claude_slash::takes_key_toggle);
                 let facts = facts.filled_from(timeline.claude_card());
+                out.movable = facts
+                    .route
+                    .is_some_and(aterm_agent::harness::accounts::AuthRoute::on_account);
                 // The roster row this tab's login is judged to, the outlook's "this tab".
                 out.account_row = facts
                     .subscription
@@ -1566,9 +1581,11 @@ impl App {
                     let now = aterm_time::unix_secs()
                         .and_then(|n| i64::try_from(n).ok())
                         .unwrap_or(0);
-                    let (_, weekly_meter, weekly_gap) = weekly_facts(sub, walled, now);
-                    out.weekly_meter = weekly_meter;
+                    let (_, weekly, weekly_gap) = weekly_facts(sub, walled, now);
+                    out.weekly = weekly;
                     out.weekly_gap = weekly_gap;
+                    out.own = session_figure(sub, now)
+                        .map(|f| aterm_agent::harness::outlook::Figure::of_weekly(&f, now));
                 }
                 (out.model, out.effort, out.path, out.branch, out.context) = (
                     facts.model,

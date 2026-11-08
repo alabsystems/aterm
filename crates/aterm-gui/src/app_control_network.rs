@@ -63,6 +63,37 @@ fn service(value: &ServiceState) -> Value {
     })
 }
 
+/// How long an inspection of the projection keeps the window reading the services: a minute,
+/// the time one of their samples stays current.
+pub(crate) const INSPECTED_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl crate::App {
+    /// An inspection of the projection reports the services' states, so after one the window
+    /// reads the services, drawn or not, each second for [`INSPECTED_FOR`]
+    /// ([`crate::App::network_state_deadline`]). The inspection itself still neither reads nor
+    /// ages them ([`inspect`]): its turn read before it, so the first after a minute uninspected
+    /// replies with the services' aged sample, and its next turn reads them at once, asking for
+    /// the sample a later inspection replies with.
+    pub(crate) fn note_inspection(
+        &mut self,
+        request: &super::InspectRequest,
+        now: std::time::Instant,
+    ) {
+        if matches!(request, super::InspectRequest::Network) {
+            if !self.network_inspected_at(now) {
+                self.network_next_poll = None;
+            }
+            self.network_inspected = Some(now);
+        }
+    }
+
+    /// Whether an inspection at most [`INSPECTED_FOR`] before `now` asks for the services.
+    pub(crate) fn network_inspected_at(&self, now: std::time::Instant) -> bool {
+        self.network_inspected
+            .is_some_and(|at| now.saturating_duration_since(at) <= INSPECTED_FOR)
+    }
+}
+
 pub(super) fn inspect(app: &crate::App) -> Result<Vec<String>, String> {
     let snapshot = &app.network_snapshot;
     let network = &snapshot.network;
@@ -178,7 +209,7 @@ mod tests {
         app.network_snapshot = Arc::clone(&retained);
         let reads = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&reads);
-        app.network_source = Some(Arc::new(move || {
+        app.network_source = Some(Arc::new(move |_| {
             counter.fetch_add(1, Ordering::SeqCst);
             Some(Arc::new(NetworkStateSnapshot {
                 revision: 99,

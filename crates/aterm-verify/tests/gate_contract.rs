@@ -86,7 +86,15 @@ impl FakeRepo {
     }
 
     fn with_stage2(&self, targo_body: &str) -> &Self {
-        for (name, body) in [("targo", targo_body), ("trustdoc", "exit 0")] {
+        for (name, body) in [
+            ("targo", targo_body),
+            ("trustdoc", "exit 0"),
+            (
+                "trustc",
+                "printf 'rustc 1.93.0 (trust)\\nbinary: rustc\\nhost: \
+                 aarch64-apple-darwin\\nrelease: 1\\n'",
+            ),
+        ] {
             common::standin(&self.stage2.join(name), body);
         }
         self
@@ -95,6 +103,11 @@ impl FakeRepo {
     fn with_stage2_body(&self, targo_body: &str) -> &Self {
         common::standin_body(&self.stage2.join("targo"), targo_body);
         common::standin(&self.stage2.join("trustdoc"), "exit 0");
+        common::standin(
+            &self.stage2.join("trustc"),
+            "printf 'rustc 1.93.0 (trust)\\nbinary: rustc\\nhost: \
+             aarch64-apple-darwin\\nrelease: 1\\n'",
+        );
         self
     }
 
@@ -352,7 +365,10 @@ fn a_failed_test_compile_starts_no_cargo_behind_it() {
 #[test]
 fn a_scoped_run_narrows_the_driver_where_the_check_reads_the_selection() {
     let repo = FakeRepo::new();
-    repo.with_stage2_body("echo \"argv: $*\"\nexit 0");
+    repo.with_stage2_body(
+        "case \"$*\" in\n  *config*get*build.target*)\n    echo 'error: config value \
+         `build.target` is not set' >&2\n    exit 101 ;;\nesac\necho \"argv: $*\"\nexit 0",
+    );
     let (ladder, code) = repo.run(&land(), Scope::crate_only("aterm-grid"));
 
     assert_eq!(code, exit::PASS, "{ladder}");
@@ -412,7 +428,8 @@ fn the_doctests_run_rustdoc_only_where_a_doctest_lives_over_the_test_compiles_se
     let ran = |code: i32| {
         format!(
             "echo \"trustdoc ran $CARGO_PKG_NAME with $*: RUSTDOC=$RUSTDOC \
-             driver=${{ATERM_VERIFY_DOC_DRIVER-unset}} skip=${{ATERM_VERIFY_DOC_SKIP-unset}}\"\n\
+             driver=${{ATERM_VERIFY_DOC_DRIVER-unset}} skip=${{ATERM_VERIFY_DOC_SKIP-unset}} \
+             runtool=${{ATERM_VERIFY_DOCTEST_RUNTOOL-unset}}\"\n\
              printf '\\nrunning 1 test\\ntest src/lib.rs - f (line 1) ... ok\\n\\ntest result: ok. 1 \
              passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\\n\\n'\n\
              exit {code}"
@@ -436,12 +453,15 @@ fn the_doctests_run_rustdoc_only_where_a_doctest_lives_over_the_test_compiles_se
         "{ladder}"
     );
     let want = format!(
-        "trustdoc ran documented with --crate-name documented --test crates/documented/src/lib.rs: \
-         RUSTDOC={} driver=unset skip=unset",
+        "trustdoc ran documented with --crate-name documented --test crates/documented/src/lib.rs \
+         --test-runtool {} --test-runtool-arg {}: RUSTDOC={} driver=unset skip=unset runtool={}",
+        aterm_tempfile::bin_exe("aterm-verify").display(),
+        aterm_verify::docdriver::RUNTOOL_FLAG,
         fs::canonicalize(&repo.stage2)
             .expect("canonical")
             .join("trustdoc")
-            .display()
+            .display(),
+        aterm_tempfile::bin_exe("aterm-verify").display(),
     );
     assert!(ladder.contains(&want), "missing {want:?} in:\n{ladder}");
     assert!(!ladder.contains("trustdoc ran plain"), "{ladder}");
@@ -609,9 +629,14 @@ fn with_recording_cargo_from(
         ));
     }
     repo.with_stage2_body(&format!(
-        r#"printf '%s\n' "$*" >> {trace}
+        r#"case "$*" in
+  *config*get*build.target*)
+    echo 'error: config value `build.target` is not set' >&2
+    exit 101 ;;
+esac
+printf '%s\n' "$*" >> {trace}
 status=0
-cfg=""; prev=""; seen=0; targs=""
+cfg=""; prev=""; seen=0; targs=""; skip_serial=""
 for a in "$@"; do
   if [ "$seen" = 1 ]; then targs="$targs $a"; fi
   [ "$a" = "--" ] && seen=1
@@ -633,7 +658,7 @@ case "$*" in
       arr=${{cfg#*=\[\"}}; arr=${{arr%\"\]}}
       runner=${{arr%%\",\"*}}; rest=${{arr#*\",\"}}
       flag=${{rest%%\",\"*}}; dir=${{rest#*\",\"}}
-{record}    else
+{record}    elif [ -z "$skip_serial" ]; then
 {serial}    fi
     exit $status ;;
 esac
@@ -790,7 +815,6 @@ fn recording_metadata_names_the_fresh_executable_and_target() {
     let report = stages::run_stage(&ctx, run);
     let block = report.render();
     assert_eq!(tags(&block), ["FAIL"], "{block}");
-    assert!(!block.contains("run by cargo, one at a time"), "{block}");
     assert_eq!(fs::read_to_string(ran).unwrap(), "fresh\n");
     assert_eq!(
         fs::read_to_string(repo.scratch.join("cargo-starts"))
@@ -811,17 +835,20 @@ fn recording_metadata_names_the_fresh_executable_and_target() {
 }
 
 #[test]
-fn an_overriding_runner_keeps_runtime_json_without_an_extra_compile() {
+fn an_overriding_runner_cannot_escape_the_exact_host_recorder() {
     let repo = FakeRepo::new();
-    with_recording_cargo(&repo, &[("fixture", "--test current", "current")], "cfg=''");
+    with_recording_cargo(
+        &repo,
+        &[("fixture", "--test current", "current")],
+        "cfg=''; skip_serial=1; echo '     Running tests/current.rs \
+         (target/debug/deps/current-1)' >&2",
+    );
     let ran = repo.scratch.join("ran");
-    let payload = "{\"reason\": this is runtime output, not cargo metadata}";
     common::standin_body(
         &repo.root.join("target/debug/deps/current-1"),
         &format!(
-            "echo current >> {}\nprintf '%s\\n' {}\nprintf '\\nrunning 1 test\\ntest current::fine ... ok\\n\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n'",
+            "echo current >> {}\nprintf '\\nrunning 1 test\\ntest current::fine ... ok\\n\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n'",
             sh_quote(&ran.display().to_string()),
-            sh_quote(payload),
         ),
     );
     let mut ctx = repo.ctx(&[Check::Test], Scope::crate_only("fixture"));
@@ -832,9 +859,12 @@ fn an_overriding_runner_keeps_runtime_json_without_an_extra_compile() {
         .unwrap();
     let report = stages::run_stage(&ctx, &spec);
     let block = report.render();
-    assert!(!tally(std::slice::from_ref(&report)).failed(), "{block}");
-    assert!(block.contains(payload), "{block}");
-    assert_eq!(fs::read_to_string(ran).unwrap(), "current\n");
+    assert_eq!(tags(&block), ["NOT RUN"], "{block}");
+    assert!(
+        block.contains("exact-host recording runner left no record"),
+        "{block}"
+    );
+    assert!(!ran.exists(), "an unrecorded binary ran: {block}");
     let calls = fs::read_to_string(repo.scratch.join("cargo-starts")).unwrap();
     assert_eq!(calls.lines().count(), 1, "{calls}");
     assert!(!calls.contains("--no-run"));
@@ -878,11 +908,11 @@ fn missing_recording_artifacts_cannot_reuse_the_previous_compile() {
         .unwrap();
     let report = stages::run_stage(&ctx, run);
     let block = report.render();
-    assert!(!tally(std::slice::from_ref(&report)).failed(), "{block}");
-    assert!(block.contains("run by cargo, one at a time"), "{block}");
-    assert_eq!(fs::read_to_string(ran).unwrap(), "current\n");
+    assert_eq!(tags(&block), ["NOT RUN"], "{block}");
+    assert!(block.contains("recording did not add up"), "{block}");
+    assert!(!ran.exists(), "an executable without metadata ran: {block}");
     let calls = fs::read_to_string(repo.scratch.join("cargo-starts")).unwrap();
-    assert_eq!(calls.lines().count(), 3, "{calls}");
+    assert_eq!(calls.lines().count(), 2, "{calls}");
     assert_eq!(
         calls
             .lines()
@@ -899,7 +929,6 @@ fn missing_recording_artifacts_cannot_reuse_the_previous_compile() {
         1,
         "{calls}"
     );
-    assert!(!calls.lines().last().unwrap().contains("--message-format"));
 }
 
 #[test]
@@ -942,48 +971,41 @@ fn a_failed_recording_build_is_not_replayed_after_valid_metadata() {
 }
 
 #[test]
-fn admitted_test_workers_keep_their_share_on_replay_and_serial_fallback() {
+fn admitted_test_workers_keep_their_share_on_replay() {
     use std::num::NonZeroU32;
-    for extra in ["", "cfg=''"] {
-        let repo = FakeRepo::new();
-        let bins = [
-            ("fixture", "--test a", "a"),
-            ("fixture", "--test b", "b"),
-            ("fixture", "--test c", "c"),
-            ("fixture", "--test d", "d"),
-        ];
-        with_recording_cargo(&repo, &bins, extra);
-        for (_, _, name) in bins {
-            common::standin_body(
-                &repo.root.join(format!("target/debug/deps/{name}-1")),
-                &format!(
-                    "[ \"$RUST_TEST_THREADS\" = 2 ] && [ \"$CARGO_BUILD_JOBS\" = 6 ] || exit 99\necho RAN-{name}-threads-$RUST_TEST_THREADS-build-$CARGO_BUILD_JOBS\nprintf '\\nrunning 1 test\\ntest {name}::fine ... ok\\n\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n\\n'"
-                ),
-            );
-        }
-        let mut ctx = repo.ctx(&[Check::Test], Scope::workspace());
-        ctx.env.build_slot_held = Some("1".into());
-        ctx.env.cargo_build_jobs = Some("6".into());
-        ctx.child_env_add
-            .push(("CARGO_BUILD_JOBS".into(), "6".into()));
-        ctx = ctx.with_test_threads(NonZeroU32::new(2));
-        ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
-        let spec = plan::plan(&ctx)
-            .into_iter()
-            .find(|s| s.id == StageId::Test)
-            .expect("test stage");
-        let report = stages::run_stage(&ctx, &spec);
-        let block = report.render();
-        assert!(!tally(std::slice::from_ref(&report)).failed(), "{block}");
-        for name in ["a", "b", "c", "d"] {
-            assert!(
-                block.contains(&format!("RAN-{name}-threads-2-build-6")),
-                "{block}"
-            );
-        }
-        assert_eq!(
-            block.contains("run by cargo, one at a time"),
-            !extra.is_empty(),
+    let repo = FakeRepo::new();
+    let bins = [
+        ("fixture", "--test a", "a"),
+        ("fixture", "--test b", "b"),
+        ("fixture", "--test c", "c"),
+        ("fixture", "--test d", "d"),
+    ];
+    with_recording_cargo(&repo, &bins, "");
+    for (_, _, name) in bins {
+        common::standin_body(
+            &repo.root.join(format!("target/debug/deps/{name}-1")),
+            &format!(
+                "[ \"$RUST_TEST_THREADS\" = 2 ] && [ \"$CARGO_BUILD_JOBS\" = 6 ] || exit 99\necho RAN-{name}-threads-$RUST_TEST_THREADS-build-$CARGO_BUILD_JOBS\nprintf '\\nrunning 1 test\\ntest {name}::fine ... ok\\n\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n\\n'"
+            ),
+        );
+    }
+    let mut ctx = repo.ctx(&[Check::Test], Scope::workspace());
+    ctx.env.build_slot_held = Some("1".into());
+    ctx.env.cargo_build_jobs = Some("6".into());
+    ctx.child_env_add
+        .push(("CARGO_BUILD_JOBS".into(), "6".into()));
+    ctx = ctx.with_test_threads(NonZeroU32::new(2));
+    ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::Test)
+        .expect("test stage");
+    let report = stages::run_stage(&ctx, &spec);
+    let block = report.render();
+    assert!(!tally(std::slice::from_ref(&report)).failed(), "{block}");
+    for name in ["a", "b", "c", "d"] {
+        assert!(
+            block.contains(&format!("RAN-{name}-threads-2-build-6")),
             "{block}"
         );
     }
@@ -1699,45 +1721,29 @@ fn a_binary_the_ceiling_left_no_time_to_start_keeps_no_history() {
 }
 
 #[test]
-fn a_recording_that_does_not_add_up_falls_back_to_cargos_serial_run() {
+fn a_recording_that_does_not_add_up_fails_closed_without_running_a_binary() {
     let bins = [("fixture", "--test b", "b"), ("fixture", "--test c", "c")];
     let cases = [
-        (
-            "echo '     Running tests/ghost.rs (target/debug/deps/ghost-1)' >&2",
-            2,
-        ),
-        (
-            "if [ -n \"$cfg\" ]; then cfg=$(printf '%s' \"$cfg\" | sed 's#\",\"/#\",\"/nonexistent/#'); fi",
-            2,
-        ),
-        ("cfg=''", 1),
-        (
-            "if [ -n \"$cfg\" ]; then echo '{\"reason\": malformed'; fi",
-            2,
-        ),
+        "echo '     Running tests/ghost.rs (target/debug/deps/ghost-1)' >&2",
+        "if [ -n \"$cfg\" ]; then cfg=$(printf '%s' \"$cfg\" | sed 's#\",\"/#\",\"/nonexistent/#'); fi",
+        "cfg=''; skip_serial=1; echo '     Running tests/b.rs (target/debug/deps/b-1)' >&2",
+        "if [ -n \"$cfg\" ]; then echo '{\"reason\": malformed'; fi",
     ];
     let repo = FakeRepo::new();
+    let ran = repo.scratch.join("ran");
     let deps = repo.root.join("target/debug/deps");
-    for (name, code, verdict) in [("b", 101, "FAILED"), ("c", 0, "ok")] {
-        let failed = if code == 0 {
-            String::new()
-        } else {
-            "\\nfailures:\\n\\n---- t::x stdout ----\\n\\nthread '\"'\"'t::x'\"'\"' panicked at \
-             src/x.rs:1:1:\\nno\\n\\nfailures:\\n    t::x\\n"
-                .to_string()
-        };
-        let (passed, nfailed) = if code == 0 { (1, 0) } else { (0, 1) };
+    for name in ["b", "c"] {
         common::standin_body(
             &deps.join(format!("{name}-1")),
             &format!(
-                "echo RAN-{name}\nprintf '\\nrunning 1 test\\ntest t::x ... \
-                 {verdict}\\n{failed}\\ntest result: {}. {passed} passed; {nfailed} failed; 0 \
-                 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n\\n'\nexit {code}\n",
-                if code == 0 { "ok" } else { "FAILED" }
+                "echo RAN-{name} >> {}\nprintf '\\nrunning 1 test\\ntest t::x ... ok\\n\\ntest \
+                 result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; \
+                 finished in 0.01s\\n\\n'",
+                sh_quote(&ran.display().to_string())
             ),
         );
     }
-    for (extra, calls) in cases {
+    for extra in cases {
         let trace = repo.scratch.join("cargo-starts");
         let _ = fs::remove_file(&trace);
         with_recording_cargo(&repo, &bins, extra);
@@ -1749,28 +1755,17 @@ fn a_recording_that_does_not_add_up_falls_back_to_cargos_serial_run() {
             .expect("the test stage");
         let report = stages::run_stage(&ctx, &spec);
         let block = report.render();
+        assert_eq!(tags(&block), ["NOT RUN"], "{extra}:\n{block}");
         assert!(
-            block.contains("RAN-b") && block.contains("RAN-c"),
-            "{block}"
+            !ran.exists(),
+            "an unrecorded binary ran for {extra}:\n{block}"
         );
-        assert_eq!(block.matches("RAN-b").count(), 1, "{block}");
-        assert_eq!(block.matches("RAN-c").count(), 1, "{block}");
-        assert_eq!(
-            fs::read_to_string(trace).unwrap().lines().count(),
-            calls,
-            "{block}"
-        );
+        let calls = fs::read_to_string(&trace)
+            .unwrap_or_else(|error| panic!("no targo trace ({error}) for {extra}:\n{block}"));
+        assert_eq!(calls.lines().count(), 1, "{block}");
         let t = tally(std::slice::from_ref(&report));
-        assert_eq!(t.gate_failures.len(), 1, "{extra}:\n{block}");
-        assert_eq!(
-            report
-                .findings()
-                .iter()
-                .map(|f| f.id.as_str())
-                .collect::<Vec<_>>(),
-            ["-p fixture --test b -- t::x"],
-            "{extra}:\n{block}"
-        );
+        assert!(t.gate_failures.is_empty(), "{extra}:\n{block}");
+        assert_eq!(t.could_not_run.len(), 1, "{extra}:\n{block}");
     }
 }
 
@@ -1778,7 +1773,7 @@ fn a_recording_that_does_not_add_up_falls_back_to_cargos_serial_run() {
 fn a_runner_that_ran_no_test_is_could_not_run_never_ok() {
     let repo = FakeRepo::new();
     let bins = [("fixture", "--test b", "b"), ("fixture", "--test c", "c")];
-    with_recording_cargo(&repo, &bins, "cfg=''");
+    with_recording_cargo(&repo, &bins, "");
     let deps = repo.root.join("target/debug/deps");
     for name in ["b", "c"] {
         common::standin_body(&deps.join(format!("{name}-1")), "exit 0");

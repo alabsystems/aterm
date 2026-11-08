@@ -311,6 +311,47 @@ fn a_told_set_is_read_only_while_its_entry_stands() {
     assert_eq!(crate::needs::NeedFacts::default().told_needs(), None);
 }
 
+/// THE LOOP AFTER A HANDOVER READS THE SET ITS ENTRY STANDS FOR ([`needs_told_of`]): the set
+/// told for the entry standing, the entry's text with it.
+/// NEGATIVE CONTROLS: a set told for an entry not standing yet, a later set whose request did not
+/// land (the standing entry keeps its own), an entry nobody told the window and a take-down told
+/// last read none.
+#[test]
+fn the_loop_after_a_handover_reads_the_set_its_entry_stands_for() {
+    let app = App::headless_for_test();
+    let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+    let sid = ctx.self_id.as_str().to_string();
+    let land = |text: Option<&str>| {
+        crate::session_timeline::write_attention_kind(
+            &ctx,
+            NEEDS_ATTENTION_OWNER,
+            text.map_or(MetaEdit::Clear, MetaEdit::Set),
+            text.map(|_| AttentionKind::Ask),
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("the needs owner's entry written");
+    };
+    let read = || needs_told_of(&app.store, &sid);
+    let (b, c) = (set(&[NEED_B]), set(&[NEED_C]));
+    store_needs(&app.store, &sid, &b, ENTRY_B);
+    assert_eq!(read(), None, "told, no entry standing yet");
+    land(Some(ENTRY_B));
+    let left_b = Some((b, ENTRY_B.to_string()));
+    assert_eq!(read(), left_b, "the set its entry stands for");
+    store_needs(&app.store, &sid, &c, ENTRY_C);
+    assert_eq!(read(), left_b, "a later set's request not landed");
+    land(Some(ENTRY_OTHER));
+    assert_eq!(read(), None, "an entry nobody told the window");
+    land(Some(ENTRY_C));
+    assert_eq!(read(), Some((c, ENTRY_C.to_string())));
+    store_needs(&app.store, &sid, &[], "");
+    assert_eq!(
+        read(),
+        None,
+        "the take-down told last, its `unset` not landed"
+    );
+}
+
 #[test]
 fn the_store_follows_the_tells_and_wakes_only_where_a_reading_moved() {
     let app = App::headless_for_test();

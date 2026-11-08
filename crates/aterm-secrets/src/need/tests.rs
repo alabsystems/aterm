@@ -641,6 +641,39 @@ fn decided_checks_policy_and_refuses_asking_when_already_held_and_absorb_settles
         )
         .is_none()
     );
+    for (floor, seq) in [(7, 6), (7, 7), (u64::MAX, u64::MAX)] {
+        let refused = Need {
+            refused: Some(floor),
+            ..open.clone()
+        };
+        assert!(decided(&refused, &facts, &Decision::Published { seq }).is_none());
+    }
+    let refused = Need {
+        refused: Some(7),
+        ..open.clone()
+    };
+    let newer = decided(&refused, &facts, &Decision::Published { seq: 8 }).unwrap();
+    assert_eq!((newer.state, newer.seq), (State::Published, Some(8)));
+
+    let asking = Need {
+        state: State::AwaitingPerson,
+        refused: Some(SEQ),
+        ..open.clone()
+    };
+    let mut given = facts.clone();
+    given
+        .sight
+        .as_mut()
+        .unwrap()
+        .held
+        .extend(asking.want.entry());
+    for seq in [SEQ - 1, SEQ] {
+        given.sight.as_mut().unwrap().seq = seq;
+        assert!(act(&asking, &given, &Act::Give).is_none());
+    }
+    given.sight.as_mut().unwrap().seq = SEQ + 1;
+    let newer = act(&asking, &given, &Act::Give).unwrap();
+    assert_eq!((newer.state, newer.seq), (State::Published, Some(SEQ + 1)));
 
     let mut held_facts = facts_of(&model_state(&[("kind", 3)]));
     if let Some(sight) = held_facts.sight.as_mut() {

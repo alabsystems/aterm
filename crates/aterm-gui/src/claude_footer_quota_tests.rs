@@ -745,6 +745,62 @@ fn hovering_a_chart_column_names_its_instant() {
     );
 }
 
+#[test]
+fn leaving_or_unclaiming_the_quota_chart_clears_its_reading_and_cursor() {
+    let view = case("b");
+    let (mut app, wid, session, _) = claimed("claude-2.1.318-tap-row-week", &view);
+    let chart = row_hits(&app, wid)
+        .into_iter()
+        .find(|h| matches!(h.part, Some(RowPart::Chart(_))))
+        .expect("the chart's hit");
+    let Some(RowPart::Chart(per_day)) = chart.part else {
+        unreachable!("found as a chart")
+    };
+    hover(&mut app, wid, (chart.frame_row, chart.cols.0));
+    assert_eq!(
+        app.windows[&wid].claude_lights.quota_column,
+        Some((session, per_day, 0))
+    );
+    assert!(
+        app.windows[&wid]
+            .claude_lights
+            .fact_reading(session, Fact::Account)
+            .is_some()
+    );
+
+    let (blank_x, blank_y) = px_of(&app, wid, (0, 0));
+    app.on_cursor_moved(wid, blank_x, blank_y);
+    assert_eq!(app.windows[&wid].claude_lights.lit_fact(session), None);
+    assert_eq!(app.windows[&wid].claude_lights.quota_column, None);
+    assert_eq!(
+        app.windows[&wid]
+            .claude_lights
+            .fact_reading(session, Fact::Account),
+        None
+    );
+
+    let (chart_x, chart_y) = px_of(&app, wid, (chart.frame_row, chart.cols.0 + 1));
+    app.on_cursor_moved(wid, chart_x, chart_y);
+    assert_eq!(
+        app.windows[&wid].claude_lights.quota_column,
+        Some((session, per_day, 1))
+    );
+    assert!(app.windows[&wid].hover_pointer);
+    probe::publish(&app, session, facts_with(Some(view), false));
+    frame(&mut app, wid);
+    app.refresh_glass_cursor_for_frame(wid);
+    assert_eq!(app.windows[&wid].claude_lights.lit_fact(session), None);
+    assert_eq!(app.windows[&wid].claude_lights.quota_column, None);
+    assert_eq!(
+        app.windows[&wid]
+            .claude_lights
+            .fact_reading(session, Fact::Account),
+        None
+    );
+    assert!(!app.windows[&wid].hover_pointer);
+    assert!(app.windows[&wid].native_text_cursor);
+}
+
 /// THE QUOTA ROW COSTS NOTHING AT REST (as `claude_footer_cost_tests`): once a claimed row is
 /// composed, a pass over the unchanged pane allocates nothing, composes nothing and reads no
 /// clock (as first written, every claimed frame read one), and so does one whose recovery is

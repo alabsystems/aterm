@@ -1555,8 +1555,8 @@ impl App {
     }
 
     /// Whether a person is at this Mac's screen: a keyboard, mouse or trackpad was used within
-    /// [`PERSON_PRESENT_WITHIN`] ([`Self::person_present_within`], read as the permission walk
-    /// and System State's access steps read it), and this login's screen is neither locked nor
+    /// [`PERSON_PRESENT_WITHIN`] ([`Self::person_present_within`], read as the time of a
+    /// permission walk's page reads it), and this login's screen is neither locked nor
     /// switched away for another login. A person stage starts only then, so a window that opened
     /// with nobody there (a launch from another Mac, a login with nobody at the screen, an update
     /// relaunched overnight) runs its background stages and puts nothing on screen until a

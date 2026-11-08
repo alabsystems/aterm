@@ -15,7 +15,7 @@ aterm_durable::plain_durable_flushes_in_tests!();
 
 pub mod accounts;
 #[cfg(unix)]
-pub mod admission;
+mod admission;
 pub mod alab;
 #[cfg(unix)]
 pub mod att;

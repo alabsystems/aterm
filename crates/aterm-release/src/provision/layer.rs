@@ -28,7 +28,9 @@ pub(crate) trait ReleaseHost: Send + Sync {
     /// `/usr/bin/openssl version`'s line; `None` off macOS, where no LibreSSL is wanted.
     fn openssl(&self) -> Option<Result<String, String>>;
 
-    /// The publication engine's checkout (`$PUBLICATION_ENGINE`, else `~/publication`).
+    /// The publication engine's checkout: `$PUBLICATION_ENGINE` (a release hands each child its
+    /// own engine), else the engine a release of this clone made and runs
+    /// ([`crate::gates::engine_copy`]), else `~/publication`, whose origin a first release clones.
     fn publication(&self) -> PathBuf;
 
     /// Whether the engine's launcher starts successfully on the publication PATH.
@@ -823,9 +825,15 @@ impl ReleaseHost for System {
     }
 
     fn publication(&self) -> PathBuf {
-        std::env::var_os("PUBLICATION_ENGINE")
-            .filter(|v| !v.is_empty())
-            .map_or_else(|| self.home.join("publication"), PathBuf::from)
+        if let Some(named) = std::env::var_os("PUBLICATION_ENGINE").filter(|v| !v.is_empty()) {
+            return PathBuf::from(named);
+        }
+        // What a release of this clone runs once it has made its own engine.
+        let copy = crate::gates::engine_copy(&crate::gates::release_dir(&self.repo));
+        if copy.join(".git").exists() {
+            return copy;
+        }
+        self.home.join("publication")
     }
 
     fn publication_bootstrap(&self) -> Result<(), Bootstrap> {

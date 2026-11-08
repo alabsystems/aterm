@@ -1876,7 +1876,8 @@ impl ClassicWake {
                     // looks10 round 2's L6). There it is laid under the
                     // letters as the ribbons' bed is, its colour at the
                     // page's own luminance (`page_lit_ink`): a hue, neither
-                    // light nor shade, that leaves every letter its reading.
+                    // light nor shade, which the letter guard holds to each
+                    // letter it reaches by itself.
                     if shade_too {
                         // Laid at the tracer's own share of its light, the
                         // shade was a quarter of its hue (`#102735` on
@@ -1885,11 +1886,11 @@ impl ClassicWake {
                         // (looks10 round 2's judges). It is laid whole where
                         // the tracer is brightest, at its head, tapering as
                         // its light does toward the old caret, and kept from
-                        // the letter guard, which weighed it with the lights
-                        // in its cells and cut it with them
-                        // (`InkLedger::note_page_shade_laid`): a hue at the
-                        // page's own luminance, it takes nothing from the
-                        // letters it lies under (`trail_letters_read`'s
+                        // the letter guard's weighing of the lights in its
+                        // cells, which cut it with them; the guard holds it
+                        // to the letters it lies under by itself
+                        // (`InkLedger::note_page_shade_laid`,
+                        // `trail_letters_read`'s
                         // `a_one_colour_move_up_a_dim_page_is_one_stroke`).
                         #[cfg(any(test, debug_assertions))]
                         let faint = self.tracer_up_faint_shade;

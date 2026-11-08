@@ -65,8 +65,11 @@ USAGE
         --release-credentials <profile.toml>
                            the cut's signing profile (default
                            ~/.aterm/release-ring/release-credentials.toml)
-        --engine DIRECTORY the publication engine (default
-                           $PUBLICATION_ENGINE, else ~/publication)
+        --engine DIRECTORY the publication engine whose origin the release
+                           clones its own engine from, into the clone's
+                           .git/aterm-release/engine, which it alone runs and
+                           moves (default $PUBLICATION_ENGINE, else
+                           ~/publication; nothing writes that checkout)
         --dry-run          the plan, the ETA, and every refusal a real run would
                            meet; nothing changes
         --verbose          stream every step's output, not only into its log
@@ -234,9 +237,10 @@ USAGE
         --export           the publication engine's export guards (forbidden
                            content, private references, gitleaks, cargo metadata,
                            README versions, dead links): its own `pub stage aterm
-                           --dry-run --no-check` over a scratch clone of REV,
-                           about a minute. Judges only a REV on origin/main; needs
-                           the network, the engine (--engine, else
+                           --dry-run --no-check`, at the main of the engine's
+                           origin, over a scratch clone of REV, about a minute.
+                           Judges only a REV on origin/main; needs the network,
+                           the engine whose origin it is (--engine, else
                            $PUBLICATION_ENGINE, else ~/publication), gitleaks,
                            and rustup's `trust` toolchain
         --wasm32           publish/config.sh's wasm32 clause, on its stock pin,

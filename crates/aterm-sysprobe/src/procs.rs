@@ -86,7 +86,8 @@ pub struct ProcessReading {
     /// User plus system CPU time of the children it has reaped, nanoseconds (macOS
     /// `ri_child_user_time + ri_child_system_time`): at each reap the kernel adds the child's own
     /// time and its reaped children's, so it holds every reaped descendant's work once, and an
-    /// unreaped zombie answers its final figure; `None` where refused, and off macOS.
+    /// unreaped zombie answers its final figure; Linux reads `cutime + cstime`; `None` where
+    /// refused and on Windows.
     pub child_cpu_ns: Option<u64>,
     /// Its memory in bytes: macOS `ri_phys_footprint`, Linux `RssAnon + VmSwap`, Windows its private commit; `None` where refused.
     pub footprint: Option<u64>,

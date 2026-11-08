@@ -44,7 +44,9 @@ fn failed(binary: &Binary, chatter: &str, failures: &[(&str, &str)]) -> Run {
     output.push_str(&format!("\ntest result: FAILED. 1 passed; {} failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n\n", failures.len()));
     assert!(!output.contains("to rerun pass"));
     Run {
+        case_observations: None,
         stopped_at: None,
+        hung: None,
         ok: false,
         output,
         code: Some(101),
@@ -59,6 +61,101 @@ fn event(binary: &Binary, run: &Run) -> aterm_json::Value {
         assert_eq!(event["outcome"].as_str(), Some(sample.outcome.as_str()));
     }
     event
+}
+
+#[test]
+fn a_json_binary_keeps_structured_failure_identity_and_never_falls_back_to_human_text() {
+    let binary = binary();
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("original");
+    let block = crate::libtest_json::NESTED_GUI_FAILURE;
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n{}\n",
+            aterm_json::json!({"type":"test", "event":"started", "name":"outer"}),
+            aterm_json::json!({"type":"test", "event":"failed", "name":"outer", "stdout":block})
+        ),
+    )
+    .unwrap();
+    let mut run = failed(&binary, "", &[("human-decoy", "ordinary assertion")]);
+    let control = event(&binary, &run);
+    assert_eq!(control["failures"][0]["case"].as_str(), Some("human-decoy"));
+    run.case_observations = Some(crate::exec::case_observations(&path, true));
+    let structured = event(&binary, &run);
+    assert_eq!(structured["failures"][0]["case"].as_str(), Some("outer"));
+    assert!(
+        structured["failures"][0]["output"]
+            .as_str()
+            .unwrap()
+            .contains("seamless_fixture_generator_tests.rs:4723:5")
+    );
+    assert_eq!(structured["failures_complete"].as_bool(), Some(false));
+    // Known JSON whose original log is unreadable must not manufacture a human case.
+    run.case_observations = Some(crate::exec::case_observations(
+        &dir.path().join("missing"),
+        true,
+    ));
+    let unread = event(&binary, &run);
+    assert!(unread["failures"].as_array().unwrap().is_empty());
+    assert_eq!(unread["outcome"], control["outcome"]);
+    assert_eq!(unread["failure_observation_end"].as_str(), Some("unread"));
+    for raw in [
+        "{\"type\":\"test\",\"event\":\"failed\"\n".to_owned(),
+        format!(
+            "{}\n{}\n",
+            aterm_json::json!({"type":"test", "event":"started", "name":"passing"}),
+            aterm_json::json!({"type":"test", "event":"ok", "name":"passing", "stdout":block})
+        ),
+    ] {
+        std::fs::write(&path, raw).unwrap();
+        run.case_observations = Some(crate::exec::case_observations(&path, true));
+        let observed = event(&binary, &run);
+        assert!(observed["failures"].as_array().unwrap().is_empty());
+        assert_eq!(observed["outcome"], control["outcome"]);
+    }
+}
+
+#[test]
+fn ten_escaped_failure_samples_fit_the_event_reader_and_count_exact_omissions() {
+    let binary = binary();
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("original");
+    let block = format!(
+        "{}{}{}",
+        "\0\n\r\t\\\"界".repeat(3000),
+        crate::libtest::COULD_NOT_RUN_SENTINEL,
+        "actionable tail 界\\\"\n".repeat(100)
+    );
+    let mut raw = String::new();
+    for at in 0..10 {
+        let name = format!("case-{at}");
+        raw.push_str(&format!("{}\n{}\n", aterm_json::json!({"type":"test", "event":"started", "name":name}), aterm_json::json!({"type":"test", "event":"failed", "name":name, "stdout":block, "source_path":"界\\\"".repeat(1024), "start_line":7, "start_col":9})));
+    }
+    std::fs::write(&path, raw).unwrap();
+    let mut run = failed(&binary, "", &[("human", "ordinary failure")]);
+    run.case_observations = Some(crate::exec::case_observations(&path, true));
+    let observed = event(&binary, &run);
+    assert!(aterm_json::to_string(&observed).unwrap().len() + "verify-event: \n".len() < 64 << 10);
+    let failures = observed["failures"].as_array().unwrap();
+    assert_eq!(failures.len(), 10);
+    for failure in failures {
+        let output = failure["output"].as_str().unwrap();
+        assert!(aterm_json::to_string(output).unwrap().len() <= FAILURE_OUTPUT_BYTES + 2);
+        let (head, tail) = output.split_once("\n…\n").unwrap();
+        assert!(block.starts_with(head));
+        assert!(block.ends_with(tail));
+        assert!(tail.contains("actionable tail"));
+        assert_eq!(
+            failure["omitted_bytes"].as_u64(),
+            Some((block.len() - head.len() - tail.len()) as u64)
+        );
+        assert_eq!(
+            failure["refused"].as_bool(),
+            Some(true),
+            "full block classifies before clipping"
+        );
+    }
 }
 
 /// The event of `run`, at a width of 3 charged 4 cores, with the fields every event has, and the history sample
@@ -159,7 +256,9 @@ fn only_a_measured_run_or_a_decisive_outcome_keeps_a_sample() {
     assert!(event_and_sample(&binary, &stopped, true).1.is_some());
 
     let ceiling = Run {
+        case_observations: None,
         stopped_at: None,
+        hung: None,
         ok: false,
         output: format!(
             "{}\n\nrunning 3 tests\ntest slow ... ok\n{} — killed at the ceiling\n",
@@ -344,7 +443,9 @@ fn a_direct_capability_refusal_keeps_its_scope_and_reason() {
 fn an_enospc_abort_retains_the_actual_missing_exit_code() {
     let binary = binary();
     let run = Run {
+        case_observations: None,
         stopped_at: None,
+        hung: None,
         ok: false,
         output: format!(
             "{}\n\nrunning 1 test\nfatal write error: {}\n",

@@ -11,8 +11,9 @@
 //! S the seal's digest ([`seal_dir`]):
 //! - a tree check's at `<check>.toml`, keyed by H(check, tree, seal);
 //! - the bundle check's, `measure` (the one check that reads `--app`), at `measure/<U>.toml`,
-//!   keyed by H(check, tree, seal, U), where U is the executable's SHA-256. The tree stays in its
-//!   key until verify can report the SHA-256 of the harness executables measure runs;
+//!   indexed by H(check, tree, seal, executable SHA-256). A separate content receipt under
+//!   `product-measure/` binds normalized bundle U, the linked measuring benches, the verifier
+//!   executable and the seal. Only that receipt can supply a measure verdict across trees;
 //! - the run-level record, `verify.toml`: `began` from before a run starts ([`begin_run`]) until
 //!   every FAIL the run showed is kept, and FAIL when the run exited 1 and no check's FAIL was
 //!   read. A `began` left behind (the cutter died mid-run, or what the run said could not be read
@@ -33,6 +34,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use aterm_verify::checks::{Check, RELEASE, RELEASE_BUNDLE, RELEASE_TREE};
+use aterm_verify::stages::MEASURING_TARGETS;
 
 use crate::ledger::GitRunner;
 use crate::release::{Answer, Refusal};
@@ -101,7 +103,7 @@ pub struct CheckRecord {
     pub commit: String,
     /// The run's build-inputs identity ([`crate::build_inputs::current`]).
     pub seal: String,
-    /// U, the executable's SHA-256, for a bundle check.
+    /// The stamped executable's SHA-256, for a bundle check's tree-local index.
     #[serde(default)]
     pub executable: Option<String>,
     pub outcome: String,
@@ -606,8 +608,38 @@ fn short(sha: &str) -> &str {
 }
 
 /// The tree of `commit`.
-fn tree_of(git: &dyn GitRunner, commit: &str) -> Result<String, String> {
+pub(crate) fn tree_of(git: &dyn GitRunner, commit: &str) -> Result<String, String> {
     crate::ledger::rev_parse(git, &format!("{commit}^{{tree}}")).map_err(|e| e.to_string())
+}
+
+/// A failed test executable proves the compile finished. Keep an already running product
+/// build only when that is the tree's sole kind of red; missing evidence keeps the stop.
+pub fn keep_build_on_test_failure(
+    git: &dyn GitRunner,
+    commit: &str,
+    seal: &str,
+) -> Result<bool, String> {
+    let root = root(git)?;
+    let tree = tree_of(git, commit)?;
+    keep_build_for_records(&root, commit, &tree, seal)
+}
+
+fn keep_build_for_records(
+    root: &Path,
+    commit: &str,
+    tree: &str,
+    seal: &str,
+) -> Result<bool, String> {
+    let checks = checks_in(root, commit, tree, None, || Ok(seal.to_owned()))?;
+    if checks.failed.is_empty() || checks.failed.iter().any(|f| f.check != "test") {
+        return Ok(false);
+    }
+    let Read::Record(record) = read(&path(root, tree, seal, "test", None))? else {
+        return Ok(false);
+    };
+    Ok(record.outcome == FAIL
+        && answers(&record, "test", tree, seal, None)
+        && record.binaries.iter().any(|b| b.outcome == FAIL))
 }
 
 /// The judge over `commit`'s tree on `executable` (None: no bundle built yet) under the seal
@@ -871,6 +903,10 @@ fn remove(at: &Path) -> Result<(), String> {
 /// What one `verify release` run said, read from its events file ([`events`]).
 #[derive(Debug, Default)]
 pub struct RunEvents {
+    /// The verifier image captured before compilation, distinct from the next on-disk image.
+    pub running_driver: Option<String>,
+    /// Linked measuring executables reported by the compiler, never inferred from source paths.
+    pub harnesses: BTreeMap<String, String>,
     /// Each `check-finished` event, in order.
     pub finished: Vec<aterm_json::Value>,
     /// Each test binary's last `test-binary-finished` event: its spec, digest and outcome.
@@ -916,6 +952,34 @@ pub fn events(at: &Path) -> std::io::Result<RunEvents> {
             return;
         }
         match event["event"].as_str() {
+            Some("measure-driver") => {
+                let digest = event["sha256"]
+                    .as_str()
+                    .filter(|d| aterm_codec::hex::is_lower(d, 64))
+                    .unwrap_or_default();
+                run.running_driver = Some(match run.running_driver.as_deref() {
+                    None => digest.to_owned(),
+                    Some(held) if held == digest => held.to_owned(),
+                    Some(_) => String::new(),
+                });
+            }
+            Some("compile-unit-finished") => {
+                if let Some(name) = event["target"]["name"].as_str()
+                    && MEASURING_TARGETS.contains(&name)
+                    && event["manifest_path"]
+                        .as_str()
+                        .is_some_and(|p| p.ends_with("/crates/aterm-conformance/Cargo.toml"))
+                    && event["target"]["kind"]
+                        .as_array()
+                        .is_some_and(|k| k.len() == 1 && k[0].as_str() == Some("bench"))
+                {
+                    let digest = event["measure_harness_sha256"]
+                        .as_str()
+                        .filter(|d| aterm_codec::hex::is_lower(d, 64))
+                        .unwrap_or_default();
+                    run.harnesses.insert(name.to_owned(), digest.to_owned());
+                }
+            }
             Some("check-finished") => run.finished.push(event),
             Some("test-binary-finished") => {
                 let (Some(spec), Some(outcome)) =
@@ -946,6 +1010,151 @@ pub fn events(at: &Path) -> std::io::Result<RunEvents> {
     run.partial = partial;
     run.binaries = binaries;
     Ok(run)
+}
+
+/// Keep the linked measuring harnesses under their tree and seal. Missing or partial evidence
+/// never supplies a cross-tree measure key; an existing same-tree receipt still stands.
+pub fn keep_harnesses(
+    root: &Path,
+    tree: &str,
+    seal: &str,
+    events: &RunEvents,
+) -> Result<(), String> {
+    let at = root
+        .join(tree)
+        .join(seal_dir(seal))
+        .join("measure-harnesses.toml");
+    if !events.whole() {
+        return remove(&at);
+    }
+    let mut harnesses = events.harnesses.clone();
+    if events
+        .finished
+        .iter()
+        .any(|e| e["check"].as_str() == Some("measure"))
+        && harnesses.keys().all(|name| name == "verify")
+    {
+        harnesses = match crate::durable::read_regular_text(&at, 4096) {
+            Ok(text) => aterm_toml::from_str(&text).unwrap_or_default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(e) => return Err(format!("read measuring harnesses: {e}")),
+        };
+    }
+    if !harnesses.is_empty() {
+        harnesses.insert(
+            "verify".into(),
+            events.running_driver.clone().unwrap_or_default(),
+        );
+        let text = aterm_toml::to_string(&harnesses).map_err(|e| e.to_string())?;
+        crate::durable::write_atomic_durable(&at, text.as_bytes(), 0o600)
+            .map_err(|e| format!("write harness evidence: {e}"))?;
+    }
+    Ok(())
+}
+
+/// The receipt namespace is H(U, four linked benches, verifier executable, seal). No tree check
+/// crosses trees, and historical check records and release journals retain their format.
+pub fn product_key(
+    root: &Path,
+    tree: &str,
+    seal: &str,
+    content: &str,
+) -> Result<Option<String>, String> {
+    let at = root
+        .join(tree)
+        .join(seal_dir(seal))
+        .join("measure-harnesses.toml");
+    let text = match crate::durable::read_regular_text(&at, 4096) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read harness evidence: {e}")),
+    };
+    let Ok(harnesses) = aterm_toml::from_str::<BTreeMap<String, String>>(&text) else {
+        return Ok(None);
+    };
+    if harnesses.len() != MEASURING_TARGETS.len() + 1
+        || MEASURING_TARGETS.into_iter().chain(["verify"]).any(|name| {
+            !harnesses
+                .get(name)
+                .is_some_and(|h| aterm_codec::hex::is_lower(h, 64))
+        })
+    {
+        return Ok(None);
+    }
+    let mut h = aterm_digest::Sha256::new();
+    for part in ["aterm-product-measure-v1", content, seal]
+        .into_iter()
+        .chain(harnesses.values().map(String::as_str))
+    {
+        h.update(part.as_bytes());
+        h.update(b"\0");
+    }
+    Ok(Some(aterm_codec::hex::encode_lower(&h.finalize())))
+}
+
+/// Archive a measure's verdict by product and harness content. A FAIL remains authoritative.
+pub fn remember_product(root: &Path, facts: &RunFacts<'_>, product: &str) -> Result<(), String> {
+    if !facts.asked.iter().any(|c| c == "measure") {
+        return Ok(());
+    }
+    let Some(executable) = facts.executable else {
+        return Ok(());
+    };
+    let Read::Record(mut record) = read(&path(
+        root,
+        facts.tree,
+        facts.seal,
+        "measure",
+        Some(executable),
+    ))?
+    else {
+        return Ok(());
+    };
+    if record.commit != facts.commit
+        || record.run != facts.run
+        || record.log != facts.log.display().to_string()
+        || !answers(&record, "measure", facts.tree, facts.seal, Some(executable))
+        || ![OK, FAIL].contains(&record.outcome.as_str())
+    {
+        return Ok(());
+    }
+    record.key = product.to_owned();
+    keep(
+        &root.join("product-measure").join(format!("{product}.toml")),
+        &record,
+    )?;
+    Ok(())
+}
+
+/// Install the exact product verdict as this tree's measure receipt; identity still has to
+/// pass on its newly stamped bundle. A same-tree FAIL can never be overwritten by a pass.
+pub fn reuse_product(root: &Path, facts: &RunFacts<'_>, product: &str) -> Result<bool, String> {
+    let Some(executable) = facts.executable else {
+        return Ok(false);
+    };
+    let Read::Record(mut record) =
+        read(&root.join("product-measure").join(format!("{product}.toml")))?
+    else {
+        return Ok(false);
+    };
+    if record.check != "measure"
+        || record.key != product
+        || record.seal != facts.seal
+        || ![OK, FAIL].contains(&record.outcome.as_str())
+    {
+        return Ok(false);
+    }
+    record.key = key("measure", facts.tree, facts.seal, Some(executable));
+    record.tree = facts.tree.to_owned();
+    record.executable = Some(executable.to_owned());
+    let at = path(root, facts.tree, facts.seal, "measure", Some(executable));
+    if let Read::Record(held) = read(&at)?
+        && held.key == record.key
+        && (held.outcome == record.outcome || [FAIL, ACCEPTED].contains(&held.outcome.as_str()))
+    {
+        return Ok(false);
+    }
+    keep(&at, &record)
 }
 
 /// One `verify release` run of R's tree under one seal: what every record it leaves states.
@@ -1364,6 +1573,209 @@ mod tests {
             finished: release_names().iter().map(|c| finished(c, OK)).collect(),
             ..RunEvents::default()
         }
+    }
+
+    /// Compilation may uplift the verifier path. Both halves use their captured running
+    /// image, independent of the later file. Missing driver evidence refuses
+    /// reuse, and a receipt that was merely carried cannot be archived as a new measurement.
+    #[test]
+    fn measure_receipts_bind_the_running_driver_after_an_uplift() {
+        let f = Fixture::new();
+        let executable = u(1);
+        f.begin("seal", &executable).unwrap();
+        let compiled = RunEvents {
+            harnesses: MEASURING_TARGETS
+                .into_iter()
+                .chain(["verify"])
+                .map(|n| (n.into(), u(2)))
+                .collect(),
+            running_driver: Some(u(2)),
+            ..RunEvents::default()
+        };
+        keep_harnesses(&f.root, TREE, "seal", &compiled).unwrap();
+        let predicted = product_key(&f.root, TREE, "seal", &u(3)).unwrap().unwrap();
+        let mut uplifted = RunEvents {
+            harnesses: compiled.harnesses.clone(),
+            running_driver: Some(u(2)),
+            ..RunEvents::default()
+        };
+        uplifted.harnesses.insert("verify".into(), u(9));
+        keep_harnesses(&f.root, TREE, "seal", &uplifted).unwrap();
+        assert_eq!(
+            product_key(&f.root, TREE, "seal", &u(3)).unwrap().unwrap(),
+            predicted,
+            "a later on-disk image does not replace the captured driver"
+        );
+        let mut measured = RunEvents {
+            running_driver: Some(u(5)),
+            finished: vec![finished("measure", OK)],
+            ..RunEvents::default()
+        };
+        keep_harnesses(&f.root, TREE, "seal", &measured).unwrap();
+        let actual = product_key(&f.root, TREE, "seal", &u(3)).unwrap().unwrap();
+        assert_ne!(actual, predicted);
+        let mut whole = all_ok();
+        whole.running_driver = Some(u(5));
+        f.end("seal", &executable, 0, Ok(&whole)).unwrap();
+        let facts = f.facts("seal", &executable);
+        remember_product(
+            &f.root,
+            &RunFacts {
+                asked: &[],
+                ..facts
+            },
+            &actual,
+        )
+        .unwrap();
+        let at = f
+            .root
+            .join("product-measure")
+            .join(format!("{actual}.toml"));
+        assert!(!at.exists(), "no measure was asked for");
+        remember_product(&f.root, &facts, &actual).unwrap();
+        assert!(at.exists());
+        let carried = RunFacts {
+            run: "another run",
+            ..facts
+        };
+        let other = u(8);
+        remember_product(&f.root, &carried, &other).unwrap();
+        assert!(
+            !f.root
+                .join("product-measure")
+                .join(format!("{other}.toml"))
+                .exists()
+        );
+        measured.running_driver = None;
+        keep_harnesses(&f.root, TREE, "seal", &measured).unwrap();
+        assert!(product_key(&f.root, TREE, "seal", &u(3)).unwrap().is_none());
+        let events_file = f._dir.path().join("driver.events");
+        let lines: String = [u(2), u(5)]
+            .into_iter()
+            .map(|sha| {
+                format!(
+                    "verify-event: {}\n",
+                    aterm_json::json!({"schema":1,"event":"measure-driver","sha256":sha})
+                )
+            })
+            .collect();
+        std::fs::write(&events_file, lines).unwrap();
+        assert_eq!(
+            events(&events_file).unwrap().running_driver.as_deref(),
+            Some("")
+        );
+    }
+
+    /// Runtime test failure keeps the product; a compile failure, another red, or another
+    /// seal cannot. Replacing this evidence check with `test == FAIL` fails the controls.
+    #[test]
+    fn only_a_proven_failed_test_executable_keeps_the_running_build() {
+        for (binaries, other_red, expected) in [
+            (true, false, true),
+            (false, false, false),
+            (true, true, false),
+        ] {
+            let f = Fixture::new();
+            let mut events = all_ok();
+            events
+                .finished
+                .retain(|e| e["check"].as_str() != Some("test"));
+            events.finished.push(finished("test", FAIL));
+            if binaries {
+                events.binaries.push(bin("p::lib", 1, FAIL));
+            }
+            if other_red {
+                events
+                    .finished
+                    .retain(|e| e["check"].as_str() != Some("lint"));
+                events.finished.push(finished("lint", FAIL));
+            }
+            f.write("seal", &u(1), 1, &events);
+            assert_eq!(
+                keep_build_for_records(&f.root, COMMIT, TREE, "seal").unwrap(),
+                expected
+            );
+            assert!(!keep_build_for_records(&f.root, COMMIT, TREE, "another seal").unwrap());
+        }
+    }
+
+    /// A test-only tree shares the product verdict, while a changed U, harness or seal does
+    /// not. No tree check is carried. The FAIL control prevents a receipt from being rerolled.
+    #[test]
+    fn product_receipts_cross_trees_only_with_equal_content_harnesses_and_seal() {
+        let f = Fixture::new();
+        let executable = u(1);
+        let mut events = all_ok();
+        events.harnesses = MEASURING_TARGETS
+            .into_iter()
+            .chain(["verify"])
+            .map(|name| (name.to_owned(), u(2)))
+            .collect();
+        events.running_driver = Some(u(2));
+        f.write("seal", &executable, 0, &events);
+        keep_harnesses(&f.root, TREE, "seal", &events).unwrap();
+        let content = u(3);
+        let product = product_key(&f.root, TREE, "seal", &content)
+            .unwrap()
+            .unwrap();
+        remember_product(&f.root, &f.facts("seal", &executable), &product).unwrap();
+        let other = "3333333333333333333333333333333333333333";
+        std::fs::create_dir_all(f.root.join(other).join(seal_dir("seal"))).unwrap();
+        keep_harnesses(&f.root, other, "seal", &events).unwrap();
+        assert_eq!(
+            product_key(&f.root, other, "seal", &content)
+                .unwrap()
+                .as_ref(),
+            Some(&product)
+        );
+        let new_executable = u(4);
+        let facts = RunFacts {
+            tree: other,
+            executable: Some(&new_executable),
+            ..f.facts("seal", &executable)
+        };
+        assert!(reuse_product(&f.root, &facts, &product).unwrap());
+        let judged = checks_in(&f.root, COMMIT, other, Some(&new_executable), || {
+            Ok("seal".to_owned())
+        })
+        .unwrap();
+        assert!(!judged.missing.iter().any(|name| name == "measure"));
+        assert!(judged.missing.iter().any(|name| name == "test"));
+        let changed = product_key(&f.root, other, "seal", &u(9)).unwrap().unwrap();
+        assert_ne!(changed, product);
+        assert!(!reuse_product(&f.root, &facts, &changed).unwrap());
+        events.harnesses.insert("paint".into(), u(8));
+        keep_harnesses(&f.root, other, "seal", &events).unwrap();
+        assert_ne!(
+            product_key(&f.root, other, "seal", &content)
+                .unwrap()
+                .as_ref(),
+            Some(&product)
+        );
+        assert!(
+            product_key(&f.root, other, "another seal", &content)
+                .unwrap()
+                .is_none()
+        );
+        let at = path(&f.root, other, "seal", "measure", Some(&new_executable));
+        let Read::Record(mut fail) = read(&at).unwrap() else {
+            panic!("measure receipt")
+        };
+        fail.outcome = FAIL.into();
+        write(&at, &fail).unwrap();
+        assert!(!reuse_product(&f.root, &facts, &product).unwrap());
+        assert!(matches!(read(&at).unwrap(), Read::Record(r) if r.outcome == FAIL));
+        fail.outcome = ACCEPTED.into();
+        fail.acceptance = Some(Acceptance {
+            reason: "owner accepted this measure".into(),
+            failed_log_sha256: u(9),
+        });
+        write(&at, &fail).unwrap();
+        assert!(!reuse_product(&f.root, &facts, &product).unwrap());
+        assert!(
+            matches!(read(&at).unwrap(), Read::Record(r) if r.outcome == ACCEPTED),
+            "content reuse must not revoke an owner's acceptance"
+        );
     }
 
     /// Every check ok on these bytes under this seal is complete; another seal, another

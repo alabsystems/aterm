@@ -150,6 +150,7 @@ fn normalised(log: &str) -> String {
 fn readings(log: &str) -> String {
     let log = format!("{log}{RERUN}");
     let run = crate::exec::Run {
+        hung: None,
         ok: false,
         output: log.clone(),
         code: Some(101),
@@ -300,6 +301,7 @@ fn a_decisive_prefix_is_always_the_binarys_fail() {
     };
     let environmental = |log: String| {
         crate::exec::Run {
+            hung: None,
             ok: false,
             output: format!("{log}{RERUN}"),
             code: Some(101),

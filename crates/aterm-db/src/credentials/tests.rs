@@ -451,6 +451,25 @@ fn a_publication_needs_the_vault_signers_attestation_on_this_network() {
         feed.book(0).threads[&id].published,
         Some(("alab".into(), 7))
     );
+
+    let mut refused = Feed::new();
+    let (id, mut request) = request_body(&A, 2, "notary", "release.notary");
+    request.body.insert("refused".into(), Value::from(7_u64));
+    refused.put(A, request);
+    for seq in [6_u64, 7] {
+        let mut stale = publication(&id);
+        stale.body.insert("seq".into(), Value::from(seq));
+        refused.put(B, attested(stale));
+        assert!(refused.book(0).threads[&id].published.is_none());
+    }
+    let mut newer = publication(&id);
+    newer.body.insert("seq".into(), Value::from(8_u64));
+    refused.put(B, attested(newer));
+    assert_eq!(
+        refused.book(0).threads[&id].published,
+        Some(("alab".into(), 8)),
+        "stale signed records cannot block a later valid publication"
+    );
 }
 
 #[test]
@@ -766,6 +785,8 @@ fn a_request_reaches_the_custodian_and_the_vault_gives_it_to_the_requester_alone
     let m1 = Audience::Hosts(vec!["m1".into()]);
     doc.set_entry(&m1, "release-notary", b"apple").unwrap();
     doc.set_entry(&m1, "m1-only", b"stays").unwrap();
+    doc.set_entry(&m1, "m29_password", b"fixture-mailbox")
+        .unwrap();
     client::admin_publish(&lab.paths[0], &admin, &doc).unwrap();
     for paths in &lab.paths {
         client::sync(paths, None).unwrap();
@@ -830,6 +851,76 @@ fn a_request_reaches_the_custodian_and_the_vault_gives_it_to_the_requester_alone
     );
     let book = pass_at(&lab.paths[1], now).unwrap();
     assert!(book.threads[0].fulfilled.is_some(), "{:?}", book.threads);
+
+    let floor = done.seq.unwrap();
+    let refused =
+        need::raise_refused(&lab.paths[1], Want::Notary, Purpose::ReleaseNotary, floor).unwrap();
+    assert_ne!(refused.id, done.id);
+    let requester = observe(&lab.paths[1]).unwrap().observer;
+    let refused_key = request_key(&requester, &refused.id);
+    pass_at(&lab.paths[1], now).unwrap();
+    repair_commons(&lab, 3);
+    let before = client::admin_open(&lab.paths[0]).unwrap();
+    let before_text = before.doc.render();
+    let same = custodian_pass_at(&lab.paths[0], now).unwrap().unwrap();
+    assert!(same.published.is_empty(), "{same:?}");
+    assert!(same.waiting.iter().any(|(id, _)| *id == refused_key));
+    let unchanged = client::admin_open(&lab.paths[0]).unwrap();
+    assert_eq!(unchanged.seq(), floor);
+    assert!(unchanged.doc.render().as_slice() == before_text.as_slice());
+    pass_at(&lab.paths[1], now).unwrap();
+    let waiting = need::peek(&lab.paths[1]).unwrap();
+    assert_eq!(waiting[0].id, refused.id);
+    assert!(!waiting[0].got && !waiting[0].state.ended());
+
+    // Another real copy may publish the batch, but must not launder this request's
+    // refused source through that new version.
+    let mailbox = need::raise(
+        &lab.paths[1],
+        Want::Mailbox("m29".into()),
+        Purpose::HarnessSignIn,
+    )
+    .unwrap();
+    let mailbox_key = request_key(&requester, &mailbox.id);
+    pass_at(&lab.paths[1], now).unwrap();
+    repair_commons(&lab, 3);
+    let mixed = custodian_pass_at(&lab.paths[0], now).unwrap().unwrap();
+    assert!(
+        mixed.published.iter().any(|(id, _)| *id == mailbox_key),
+        "{mixed:?}"
+    );
+    assert!(
+        !mixed.published.iter().any(|(id, _)| *id == refused_key),
+        "{mixed:?}"
+    );
+
+    // The admin really publishes a later value. That version permits a new consumer
+    // attempt; version ordering alone does not claim the credential authenticates.
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&m2, "release-notary", b"replacement")
+        .unwrap();
+    let later = client::admin_publish(&lab.paths[0], &admin, &doc).unwrap();
+    assert!(later.seq > floor);
+    let delivered = custodian_pass_at(&lab.paths[0], now).unwrap().unwrap();
+    assert!(
+        delivered
+            .published
+            .iter()
+            .any(|(id, seq)| *id == refused_key && *seq > floor),
+        "{delivered:?}"
+    );
+    repair_commons(&lab, 3);
+    client::sync(&lab.paths[1], None).unwrap();
+    pass_at(&lab.paths[1], now).unwrap();
+    let delivered = need::peek(&lab.paths[1]).unwrap();
+    let delivered = delivered.iter().find(|need| need.id == refused.id).unwrap();
+    assert_eq!(delivered.state, State::Published);
+    assert!(delivered.seq.is_some_and(|seq| seq > floor));
+    let accepted = need::satisfied(&lab.paths[1], &Want::Notary, Purpose::ReleaseNotary)
+        .unwrap()
+        .unwrap();
+    assert_eq!(accepted.state, State::Fulfilled);
 }
 
 /// A requester posts at most 16 live requests, the most the table counts from one Mac; a 17th

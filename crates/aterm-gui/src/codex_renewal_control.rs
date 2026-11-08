@@ -1721,7 +1721,8 @@ mod tests {
         drop(failure);
         assert!(acknowledged_receipt_reply(&env, &consumed).contains("state=consumed"));
         let mut newer = consumed.clone();
-        newer.generation += 1;
+        newer.successor_pid = Some(99);
+        newer.successor_birth = Some(100);
         renewal::with_receipt_writer(&env, |_| renewal::write_receipt(&env, &newer))
             .unwrap()
             .unwrap();

@@ -568,15 +568,244 @@ pub fn staged_bundle_liveness_gate(
     )))
 }
 
-/// Where the publication engine keeps its ledger.
+/// `<git common dir>/aterm-release` of the clone at `repo`: its release journal, run claim and
+/// publication engine ([`engine_copy`]); `<repo>/.git/aterm-release` where git names no common
+/// directory.
 #[must_use]
-pub fn publication_mappings_path() -> PathBuf {
-    env::var_os("PUBLICATION_ENGINE")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join("publication")))
-        .unwrap_or_else(|| PathBuf::from("publication"))
-        .join("mappings.json")
+pub fn release_dir(repo: &Path) -> PathBuf {
+    crate::ledger::GitCli::new(repo)
+        .git(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .ok()
+        .filter(crate::ledger::RunOut::success)
+        .map_or_else(
+            || repo.join(".git"),
+            |out| PathBuf::from(out.stdout_utf8().trim()),
+        )
+        .join("aterm-release")
+}
+
+/// The release's own publication engine in its release directory `release` ([`release_dir`]):
+/// the checkout `ship release` runs `pub` in, syncs to the engine's origin and reads the ledger
+/// of, and hands every child as `PUBLICATION_ENGINE`. Only the run holding that directory's run
+/// claim writes it: the engine refuses a stage whose own HEAD moved while it ran, and a checkout
+/// anything else aligns (`~/publication`) moved under 0.172.0's stage on m3 (2026-11-07).
+#[must_use]
+pub fn engine_copy(release: &Path) -> PathBuf {
+    release.join("engine")
+}
+
+/// The main of a publication engine's `origin`, its one commit fetched (no tags) into a scratch
+/// bare repository nothing else reads or writes: the engine as its origin holds it now. What a
+/// reader with no synced engine of its own judges (a release before its sync step, a dry run, a
+/// cut, status or yank run by hand), never a checkout's working tree, which is as old as
+/// whatever last moved it.
+pub struct OriginMain {
+    scratch: aterm_tempfile::TempDir,
+}
+
+/// How a git child is run and waited for (a release forwards its interrupts to it).
+pub type RunGit<'a> = &'a dyn Fn(&mut Command) -> std::io::Result<std::process::Output>;
+
+impl OriginMain {
+    /// Fetch `origin`'s main, each git child run by `run`.
+    ///
+    /// # Errors
+    /// No scratch directory, or git's own words for a fetch that failed.
+    pub fn fetch(origin: &str, run: RunGit<'_>) -> std::result::Result<Self, String> {
+        let scratch = aterm_tempfile::tempdir().map_err(|e| e.to_string())?;
+        let main = Self { scratch };
+        main.git(&["init", "--quiet", "--bare"], run, false)?;
+        main.git(
+            &[
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--depth=1",
+                origin,
+                "refs/heads/main",
+            ],
+            run,
+            true,
+        )?;
+        Ok(main)
+    }
+
+    /// The text of `path` in that commit.
+    ///
+    /// # Errors
+    /// git's own words: no such file there, or not UTF-8.
+    pub fn text(&self, path: &str, run: RunGit<'_>) -> std::result::Result<String, String> {
+        let out = self.git(&["show", &format!("FETCH_HEAD:{path}")], run, true)?;
+        String::from_utf8(out).map_err(|e| format!("{path}: {e}"))
+    }
+
+    fn git(
+        &self,
+        args: &[&str],
+        run: RunGit<'_>,
+        within: bool,
+    ) -> std::result::Result<Vec<u8>, String> {
+        let at = self.scratch.path().join("main.git");
+        let mut cmd = command(aterm_uds::os_path!("git"));
+        if within {
+            cmd.arg("--git-dir").arg(&at);
+        }
+        cmd.args(args);
+        if !within {
+            cmd.arg(&at);
+        }
+        let out = run(&mut cmd).map_err(|e| e.to_string())?;
+        if out.status.success() {
+            Ok(out.stdout)
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
+}
+
+/// The ledger the release's engine at `copy` committed (`HEAD:mappings.json`) where it holds a
+/// ledger commit its origin's main lacks, as it last fetched it: a row `pub publish` recorded and
+/// could not push, which only that engine holds until its next sync delivers it
+/// ([`ledger_with_unpushed`]). `None` where it holds none, or is no checkout.
+pub fn unpushed_ledger(copy: &Path, run: RunGit<'_>) -> Option<String> {
+    if !copy.join(".git").exists() {
+        return None;
+    }
+    let git = |args: &[&str]| {
+        let mut cmd = command(aterm_uds::os_path!("git"));
+        cmd.arg("-C").arg(copy).args(args);
+        run(&mut cmd)
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| out.stdout)
+    };
+    let ahead = git(&[
+        "rev-list",
+        "refs/remotes/origin/main..HEAD",
+        "--",
+        "mappings.json",
+    ])?;
+    if ahead.trim_ascii().is_empty() {
+        return None;
+    }
+    String::from_utf8(git(&["show", "HEAD:mappings.json"])?).ok()
+}
+
+/// The ledger `origin` holds with each `mappings.<repo>.<commit>` row of `unpushed`
+/// ([`unpushed_ledger`]) it lacks added: everything recorded, pushed or not. `origin` as it is
+/// where either does not parse as a ledger.
+#[must_use]
+pub fn ledger_with_unpushed(origin: &str, unpushed: &str) -> String {
+    use aterm_json::{Map, Value};
+    let (Ok(mut whole), Ok(extra)) = (
+        aterm_json::from_str::<Value>(origin),
+        aterm_json::from_str::<Value>(unpushed),
+    ) else {
+        return origin.to_string();
+    };
+    let (Some(top), Some(extra)) = (
+        whole.as_object_mut(),
+        extra.get("mappings").and_then(Value::as_object),
+    ) else {
+        return origin.to_string();
+    };
+    let Some(mappings) = top
+        .entry("mappings".to_string())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+    else {
+        return origin.to_string();
+    };
+    for (repo, rows) in extra {
+        let (Some(rows), Some(into)) = (
+            rows.as_object(),
+            mappings
+                .entry(repo.clone())
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut(),
+        ) else {
+            continue;
+        };
+        for (commit, row) in rows {
+            into.entry(commit.clone()).or_insert_with(|| row.clone());
+        }
+    }
+    aterm_json::to_string(&whole).unwrap_or_else(|_| origin.to_string())
+}
+
+/// How long a reader by hand waits on the engine's origin: a hang detector, since a fetch of its
+/// main's one commit takes about a second (0.80-0.82 s on m19, 2026-11-07).
+const ORIGIN_READ_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The ledger a reader of the clone at `repo` judges, `var` the environment, and where it was
+/// read: `PUBLICATION_ENGINE`'s, the engine a release hands each child (its own, synced), read
+/// in place; else the one on the main of the origin the clone's engine names ([`engine_copy`],
+/// where a release made one; else `~/publication`), fetched now ([`OriginMain`]), since no
+/// checkout here is kept level with it, with the rows the clone's engine holds unpushed
+/// ([`unpushed_ledger`]).
+fn ledger_text(
+    repo: &Path,
+    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<(String, String)> {
+    if let Some(named) = var("PUBLICATION_ENGINE").filter(|v| !v.is_empty()) {
+        let ledger = PathBuf::from(named).join("mappings.json");
+        let text = read_bounded_string(&ledger, 64 << 20).map_err(|e| {
+            Error::new(format!(
+                "cannot read the publication ledger {} ({e}) — PUBLICATION_ENGINE names the \
+                 engine whose ledger is read in place: the one `ship release` synced and \
+                 published through, which it hands the cut; unset it to read the ledger on the \
+                 engine's origin. Nothing was claimed.",
+                ledger.display(),
+            ))
+        })?;
+        return Ok((text, ledger.display().to_string()));
+    }
+    let copy = engine_copy(&release_dir(repo));
+    let home = var("HOME").map(|home| PathBuf::from(home).join("publication"));
+    let origin = [Some(copy.clone()), home.clone()]
+        .into_iter()
+        .flatten()
+        .filter(|engine| engine.join(".git").exists())
+        .find_map(|engine| {
+            crate::ledger::GitCli::new(&engine)
+                .git(&["remote", "get-url", "origin"])
+                .ok()
+                .filter(crate::ledger::RunOut::success)
+                .map(|out| out.stdout_utf8().trim().to_string())
+                .filter(|url| !url.is_empty())
+        })
+        .ok_or_else(|| {
+            Error::new(format!(
+                "no publication engine here names the ledger's origin: neither {} nor {} is a \
+                 checkout with an origin — clone the engine to ~/publication, or point \
+                 PUBLICATION_ENGINE at the engine that published. Nothing was claimed.",
+                copy.display(),
+                home.map_or_else(|| "~/publication".into(), |h| h.display().to_string()),
+            ))
+        })?;
+    let run: RunGit<'_> = &|cmd: &mut Command| {
+        aterm_uds::deadline::output_within(cmd, ORIGIN_READ_PATIENCE)
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    };
+    let text = OriginMain::fetch(&origin, run)
+        .and_then(|main| main.text("mappings.json", run))
+        .map_err(|e| {
+            Error::new(format!(
+                "cannot read the publication ledger on the engine's origin {origin} ({e}) — a \
+                 cut releases the newest commit `pub publish` recorded there. Check the network \
+                 (git ls-remote {origin}). Nothing was claimed.",
+            ))
+        })?;
+    Ok(match unpushed_ledger(&copy, run) {
+        Some(unpushed) => (
+            ledger_with_unpushed(&text, &unpushed),
+            format!(
+                "mappings.json on {origin}'s main, with the rows {} holds unpushed",
+                copy.display()
+            ),
+        ),
+        None => (text, format!("mappings.json on {origin}'s main")),
+    })
 }
 
 /// The dev commit the newest aterm source publication exported, and when.
@@ -664,10 +893,22 @@ fn rfc3339_instant(s: &str) -> Option<(i64, u32)> {
     Some((civil_secs - offset_secs, nanos.saturating_add(extra_leap)))
 }
 
-/// The newest `mappings.aterm` row by `verified_at` in the engine's ledger text.
+/// The rows of `repo` the engine's ledger `value` revoked (`revoked.<repo>`, keyed by source
+/// commit): a revoked publication is not one any reader counts, as the engine's own projection
+/// counts none (`bin/pub_projection.py`'s `live_rows`).
+#[must_use]
+pub fn revoked_rows<'a>(value: &'a aterm_json::Value, repo: &str) -> Option<&'a aterm_json::Map> {
+    value
+        .get("revoked")
+        .and_then(|r| r.get(repo))
+        .and_then(aterm_json::Value::as_object)
+}
+
+/// The newest live `mappings.aterm` row by `verified_at` in the engine's ledger text, every
+/// revoked row ([`revoked_rows`]) left out.
 ///
 /// # Errors
-/// Unparseable JSON, no `mappings.aterm` object, or no row with a full-hex key.
+/// Unparseable JSON, no `mappings.aterm` object, or no live row with a full-hex key.
 pub fn newest_published_source(mappings_json: &str) -> Result<PublishedSource> {
     let value: aterm_json::Value = aterm_json::from_str(mappings_json)
         .map_err(|e| Error::new(format!("the publication ledger is not JSON: {e}")))?;
@@ -676,8 +917,10 @@ pub fn newest_published_source(mappings_json: &str) -> Result<PublishedSource> {
         .and_then(|m| m.get("aterm"))
         .and_then(aterm_json::Value::as_object)
         .ok_or_else(|| Error::new("the publication ledger has no `mappings.aterm` rows"))?;
+    let revoked = revoked_rows(&value, "aterm");
     rows.iter()
         .filter(|(sha, _)| aterm_codec::hex::is_hex(sha, 40))
+        .filter(|(sha, _)| !revoked.is_some_and(|r| r.contains_key(*sha)))
         .map(|(sha, row)| {
             let verified_at = row
                 .get("verified_at")
@@ -690,7 +933,7 @@ pub fn newest_published_source(mappings_json: &str) -> Result<PublishedSource> {
             commit: commit.to_string(),
             verified_at: verified_at.to_string(),
         })
-        .ok_or_else(|| Error::new("the publication ledger has no aterm row with a commit key"))
+        .ok_or_else(|| Error::new("the publication ledger has no live aterm row with a commit key"))
 }
 
 pub(crate) fn read_bounded_bytes(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
@@ -739,22 +982,21 @@ pub(crate) fn read_bounded_string(path: &Path, max_bytes: u64) -> std::io::Resul
     Ok(text)
 }
 
-/// The commit a real cut releases.
+/// The commit a real cut of the clone at `repo` releases: the newest aterm row of the ledger
+/// [`ledger_text`] reads.
 ///
 /// # Errors
 /// An unreadable or rowless ledger is a refusal.
-pub fn published_source() -> Result<PublishedSource> {
-    let ledger = publication_mappings_path();
-    let text = read_bounded_string(&ledger, 64 << 20).map_err(|e| {
-        Error::new(format!(
-            "cannot read the publication ledger {} ({e}) — a real cut releases the commit \
-             `pub publish` recorded there. Pull the engine (`git -C {} pull \
-             --ff-only`) or point PUBLICATION_ENGINE at its checkout. Nothing was claimed.",
-            ledger.display(),
-            ledger.parent().unwrap_or(&ledger).display()
-        ))
-    })?;
-    newest_published_source(&text).map_err(|e| Error::new(format!("{}: {e}", ledger.display())))
+pub fn published_source(repo: &Path) -> Result<PublishedSource> {
+    published_source_in(repo, &|name| env::var_os(name))
+}
+
+fn published_source_in(
+    repo: &Path,
+    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PublishedSource> {
+    let (text, read) = ledger_text(repo, var)?;
+    newest_published_source(&text).map_err(|e| Error::new(format!("{read}: {e}")))
 }
 
 /// Where [`place_published`] put the commit a real cut releases.
@@ -4556,6 +4798,28 @@ mod published_commit_tests {
         );
         assert!(newest_published_source(r#"{"mappings":{}}"#).is_err());
         assert!(newest_published_source("not json").is_err());
+        // A revoked row is no publication: the newest live row is released. NEGATIVE CONTROL:
+        // the same rows unrevoked release the newer one (above, `b`).
+        let revoked = |rows: &str| {
+            format!(
+                r#"{{"mappings":{{"aterm":{{
+                    "{}":{{"verified_at":"2026-09-21T19:38:24+00:00"}},
+                    "{}":{{"verified_at":"2026-09-22T23:37:28+00:00"}}
+                }}}},"revoked":{{"aterm":{{{rows}}}}}}}"#,
+                sha('a'),
+                sha('b'),
+            )
+        };
+        let one = format!(r#""{}":{{"reason":"withdrawn"}}"#, sha('b'));
+        assert_eq!(
+            newest_published_source(&revoked(&one)).unwrap().commit,
+            sha('a')
+        );
+        let both = format!(r#"{one},"{}":{{}}"#, sha('a'));
+        assert!(
+            newest_published_source(&revoked(&both)).is_err(),
+            "no live row, no source"
+        );
     }
 
     #[test]
@@ -4953,5 +5217,180 @@ mod published_commit_tests {
         let r = not_run(Err(&none));
         assert!(r.why.contains(&none.why), "{r:?}");
         assert_eq!(r.remedy, none.fix);
+    }
+}
+
+#[cfg(test)]
+mod ledger_reader_tests {
+    use super::*;
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let out = crate::ledger::testing::git()
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git -C {} {args:?}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn ledger(rows: &[(&str, &str)]) -> String {
+        let rows: Vec<String> = rows
+            .iter()
+            .map(|(sha, at)| format!("\"{sha}\":{{\"verified_at\":\"{at}\"}}"))
+            .collect();
+        format!("{{\"mappings\":{{\"aterm\":{{{}}}}}}}\n", rows.join(","))
+    }
+
+    /// A checkout at `dir` of a new bare origin `origin` holding `text` as its ledger.
+    fn engine(dir: &Path, origin: &Path, text: &str) {
+        git_in(
+            dir.parent().unwrap(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                &origin.display().to_string(),
+            ],
+        );
+        crate::ledger::testing::init(
+            dir,
+            &[
+                ("user.name", "Test"),
+                ("user.email", "test@example.invalid"),
+            ],
+        );
+        std::fs::write(dir.join("mappings.json"), text).unwrap();
+        git_in(dir, &["add", "mappings.json"]);
+        git_in(dir, &["commit", "-q", "-m", "ledger"]);
+        git_in(
+            dir,
+            &["remote", "add", "origin", &origin.display().to_string()],
+        );
+        git_in(dir, &["push", "-q", "-u", "origin", "main"]);
+    }
+
+    /// A CUT, STATUS OR YANK RUN BY HAND READS THE LEDGER ON THE ENGINE'S ORIGIN, AND A RELEASE'S
+    /// CHILD THE ENGINE IT WAS HANDED: with no `PUBLICATION_ENGINE`, the newest aterm row is the
+    /// one on the main of the origin the clone's own engine names (a release re-points it at each
+    /// sync), else `~/publication`'s, though each checkout is behind it; `PUBLICATION_ENGINE`'s
+    /// ledger is read in place (the release's synced engine, its own unpushed row included); the
+    /// rows the clone's engine committed and could not push count as recorded; with no engine
+    /// naming an origin, nothing is read. NEGATIVE CONTROL: the checkouts' own
+    /// ledgers name an older row, which a reader of their working trees (as before) would release.
+    #[test]
+    fn a_reader_by_hand_reads_the_origins_ledger_and_a_releases_child_its_engines() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (old, new, third) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let (home, origin) = (root.join("home"), root.join("publication.git"));
+        std::fs::create_dir(&home).unwrap();
+        let shared = home.join("publication");
+        engine(&shared, &origin, &ledger(&[(&old, "2026-11-01T00:00:00Z")]));
+        let peer = root.join("peer");
+        git_in(
+            &root,
+            &["clone", "-q", &origin.display().to_string(), "peer"],
+        );
+        std::fs::write(
+            peer.join("mappings.json"),
+            ledger(&[
+                (&old, "2026-11-01T00:00:00Z"),
+                (&new, "2026-11-07T00:00:00Z"),
+            ]),
+        )
+        .unwrap();
+        git_in(
+            &peer,
+            &[
+                "-c",
+                "user.name=P",
+                "-c",
+                "user.email=p@example.invalid",
+                "commit",
+                "-q",
+                "-am",
+                "row",
+            ],
+        );
+        git_in(&peer, &["push", "-q", "origin", "HEAD:main"]);
+        let repo = root.join("aterm");
+        crate::ledger::testing::init(&repo, &[]);
+        let var = |engine: Option<&Path>| {
+            let (home, engine) = (home.clone(), engine.map(Path::to_path_buf));
+            move |name: &str| match name {
+                "HOME" => Some(home.clone().into_os_string()),
+                "PUBLICATION_ENGINE" => engine.clone().map(PathBuf::into_os_string),
+                _ => None,
+            }
+        };
+        let in_place = |dir: &Path| {
+            newest_published_source(&std::fs::read_to_string(dir.join("mappings.json")).unwrap())
+                .unwrap()
+                .commit
+        };
+
+        let by_hand = published_source_in(&repo, &var(None)).unwrap();
+        assert_eq!(by_hand.commit, new, "the origin's newest row");
+        assert_eq!(
+            in_place(&shared),
+            old,
+            "NEGATIVE CONTROL: the checkout's own is older"
+        );
+        let child = published_source_in(&repo, &var(Some(&shared))).unwrap();
+        assert_eq!(
+            child.commit, old,
+            "PUBLICATION_ENGINE's ledger, read in place"
+        );
+
+        // The clone's own engine names the origin a reader by hand reads.
+        let copy = engine_copy(&release_dir(&repo));
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        engine(
+            &copy,
+            &root.join("elsewhere.git"),
+            &ledger(&[(&third, "2026-11-02T00:00:00Z")]),
+        );
+        assert_eq!(
+            published_source_in(&repo, &var(None)).unwrap().commit,
+            third
+        );
+        // A row the clone's engine committed and could not push is as recorded as the origin's.
+        let fourth = "d".repeat(40);
+        std::fs::write(
+            copy.join("mappings.json"),
+            ledger(&[
+                (&third, "2026-11-02T00:00:00Z"),
+                (&fourth, "2026-11-03T00:00:00Z"),
+            ]),
+        )
+        .unwrap();
+        git_in(&copy, &["commit", "-q", "-am", "unpushed row"]);
+        assert_eq!(
+            published_source_in(&repo, &var(None)).unwrap().commit,
+            fourth
+        );
+        assert_eq!(
+            ledger_with_unpushed(&ledger(&[(&third, "2026-11-02T00:00:00Z")]), "not json"),
+            ledger(&[(&third, "2026-11-02T00:00:00Z")]),
+            "an unreadable unpushed ledger adds nothing"
+        );
+
+        // No engine names an origin: nothing is read, and the refusal says where it looked.
+        std::fs::remove_dir_all(&copy).unwrap();
+        std::fs::remove_dir_all(&shared).unwrap();
+        let none = published_source_in(&repo, &var(None))
+            .unwrap_err()
+            .to_string();
+        assert!(none.contains("names the ledger's origin"), "{none}");
+        assert!(none.contains(&shared.display().to_string()), "{none}");
     }
 }

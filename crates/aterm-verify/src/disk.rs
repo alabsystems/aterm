@@ -1053,7 +1053,7 @@ mod tests {
             std::fs::write(build.join("unit.rlib"), [0u8; 1 << 16]).expect("the run's writes");
             let log_path = checkout.join("log");
             let mut log = std::fs::File::create(&log_path).expect("the log");
-            crate::let_disk_go(Disk::Held(held), passed, Some(&mut log));
+            crate::let_disk_go(Disk::Held(held), passed, Some(&mut log), None);
             assert_eq!(
                 aterm_capacity::Footprints::load(&checkout.join(FOOTPRINT))
                     .runs()
@@ -1176,7 +1176,7 @@ mod tests {
             );
         }
         let mut log = std::fs::File::create(dir.join("log")).expect("the log");
-        crate::let_disk_go(held, true, Some(&mut log));
+        crate::let_disk_go(held, true, Some(&mut log), None);
         drop(release);
     }
 

@@ -38,6 +38,7 @@ use super::accounts::{
     self, Advice, Class, Condition, Me, Mode, Mover, Point, Roster, State, StayWhy, TapRead,
     WindowRead,
 };
+use super::quota_view::{Burn, Chart, GAP_MARK, HANDOFF_MARK, RESET_MARK, Role};
 
 /// The week's pace looks back this far ([`Demand::week`]).
 pub const WEEK_LOOKBACK_S: i64 = 24 * 3600;
@@ -3444,92 +3445,6 @@ fn whole(x10: u32) -> u32 {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The bar (§3)
-
-/// One cell of a bar.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum BarCell {
-    /// `━` used now.
-    Used,
-    /// `╍` more use by the window's reset, from the replay.
-    More,
-    /// `┽` where use stands at the reset (under 100%).
-    Tick,
-    /// `─` left over at the reset.
-    Left,
-}
-
-impl BarCell {
-    /// Its glyph: procedural box drawing, on the rule's own centre line.
-    #[must_use]
-    pub const fn glyph(self) -> char {
-        match self {
-            BarCell::Used => '\u{2501}',
-            BarCell::More => '\u{254d}',
-            BarCell::Tick => '\u{253d}',
-            BarCell::Left => '\u{2500}',
-        }
-    }
-
-    /// Whether it takes the meter's ink (else the track's).
-    #[must_use]
-    pub const fn metered(self) -> bool {
-        matches!(self, BarCell::Used | BarCell::More | BarCell::Tick)
-    }
-}
-
-/// `n` cells of a bar of `used_x10` with `projection` at its reset (§3.3): used cells
-/// `round(used·n/100)` (at least one while used, at most n−1 while under 100%); no dashes and no
-/// tick without a projection; dashes to the end when the projection fills; else a tick at
-/// `clamp(round(proj·n/100) − 1, u, n−1)` with dashes up to it and the track after.
-#[must_use]
-pub fn bar_cells(used_x10: u32, projection: Option<Proj>, n: usize) -> Vec<BarCell> {
-    if n == 0 {
-        return Vec::new();
-    }
-    let used = i64::from(used_x10.min(1000));
-    let n_i = i64::try_from(n).unwrap_or(i64::MAX);
-    let mut u = (used * n_i + 500) / 1000;
-    if used > 0 {
-        u = u.max(1);
-    }
-    if used < 1000 {
-        u = u.min(n_i - 1);
-    }
-    let u = usize::try_from(u.clamp(0, n_i)).unwrap_or(0);
-    let mut out = vec![BarCell::Left; n];
-    for c in out.iter_mut().take(u) {
-        *c = BarCell::Used;
-    }
-    let Some(proj) = projection else {
-        return out;
-    };
-    let at = i64::from(proj.at_reset_x10.min(1000));
-    if proj.fills_at.is_some() || at >= 1000 {
-        for c in out.iter_mut().skip(u) {
-            *c = BarCell::More;
-        }
-        return out;
-    }
-    if u >= n {
-        return out;
-    }
-    let tick = ((at * n_i + 500) / 1000 - 1).clamp(i64::try_from(u).unwrap_or(0), n_i - 1);
-    let tick = usize::try_from(tick).unwrap_or(u);
-    for c in out.iter_mut().take(tick).skip(u) {
-        *c = BarCell::More;
-    }
-    out[tick] = BarCell::Tick;
-    out
-}
-
-/// The bar as text.
-#[must_use]
-pub fn bar_text(cells: &[BarCell]) -> String {
-    cells.iter().map(|c| c.glyph()).collect()
-}
-
-// ---------------------------------------------------------------------------------------------
 // The verdict's words (§2.2)
 
 /// The verdict's words, at each rung's length (§2.2).
@@ -3629,16 +3544,6 @@ impl Outlook {
         }
     }
 
-    /// The span a stop is said to last, from its words' own instants; `None` for an open one.
-    fn stop_span(&self, from: i64, end: StopEnd) -> Option<i64> {
-        let end = match end {
-            StopEnd::Reset(r) => r,
-            StopEnd::About(t) => self.end_at(t),
-            StopEnd::Open => return None,
-        };
-        Some(end - round_down(from, self.as_of, &self.offsets))
-    }
-
     fn carrier_plan(&self) -> (i64, Option<String>) {
         let row = self.carrier.as_deref().and_then(|c| self.row(c));
         (
@@ -3654,62 +3559,6 @@ impl Outlook {
         u32::try_from((pace.x10_m_per_day / m).clamp(0, 1000))
             .ok()
             .map(whole)
-    }
-
-    /// The pass's chain up to its first stop (each move with its instant, a row that comes back
-    /// with what it had left, a lean with `?`), and what carries the work after that stop.
-    fn chain_words(&self, pass: &Pass, lasts: bool) -> (String, Option<String>) {
-        let stop = pass.stops.first();
-        let mut out = String::new();
-        let mut left: BTreeMap<&str, u32> = BTreeMap::new();
-        let mut prev: Option<&str> = None;
-        for link in pass
-            .chain
-            .iter()
-            .filter(|l| stop.is_none_or(|s| l.to <= s.from))
-        {
-            match prev {
-                None => out.push_str(&link.label),
-                Some(p) if p == link.label => {}
-                Some(_) => {
-                    out.push_str(&format!(
-                        " \u{2192} {} {}",
-                        link.label,
-                        self.about(link.from)
-                    ));
-                    if let Some(x10) = left.get(link.label.as_str()).filter(|_| lasts) {
-                        let last = 100u32.saturating_sub(whole(*x10));
-                        out.push_str(&format!(" (its last {last}%)"));
-                    }
-                }
-            }
-            if let Some(x10) = link.left_at_x10 {
-                left.insert(&link.label, x10);
-            }
-            prev = Some(&link.label);
-        }
-        if stop.is_none()
-            && let Some(lean) = &pass.lean
-        {
-            out.push_str(&format!(" \u{2192} {} {} ?", lean.row, self.about(lean.at)));
-        }
-        let after = stop.and_then(|s| {
-            let next = pass.chain.iter().find(|l| l.from >= s.from)?;
-            match s.end {
-                StopEnd::Reset(r) => Some(format!(
-                    "then {} from its reset {}",
-                    next.label,
-                    self.when(r)
-                )),
-                StopEnd::About(t) => Some(format!(
-                    "then {} from ~{}",
-                    next.label,
-                    self.when(self.end_at(t))
-                )),
-                StopEnd::Open => None,
-            }
-        });
-        (out, after)
     }
 
     /// The verdict's words (§2.2); `None` for a refused pace.
@@ -3871,21 +3720,43 @@ fn words_of(out: &Outlook, verdict: &Verdict) -> Option<VerdictWords> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The card (§8)
+// The Accounts card (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4)
 
-/// A card cell's ink ([`CardRow::Plot`]): the GUI floors each against the card's ground.
+/// A card cell's ink ([`CardRow::Plot`]): the GUI paints each from the glass's tokens, a hued
+/// one at its column's palette position over the card's own width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CardInk {
-    /// The meter: `━ ╍ ┽` and a carrier's run.
-    Meter,
-    /// The track: `─ ┄`.
+    /// A measured level, `▁…█`: the column's mark.
+    Read,
+    /// The projected line, `▁ 🭻…🭶 ▔` (a lane's under its ceiling, `▁ 🭻…🭸`): the column's
+    /// letter.
+    Ahead,
+    /// `→` and `↺`: lit.
+    Mark,
+    /// `┄`: the track.
     Track,
-    /// A stop: `╳`.
+    /// `╳`, `$` and a lane's out line: warn, bold.
     Warn,
-    /// A label's text and a figure.
+    /// A name inside a chart: a value.
     Value,
-    /// The axis and the legend's words.
+    /// The day axis, the legend's words, `▕` and the work row's word: quiet.
     Axis,
+}
+
+impl CardInk {
+    /// The card's ink of a quota view part's [`Role`].
+    #[must_use]
+    pub const fn of(role: Role) -> CardInk {
+        match role {
+            Role::Mark => CardInk::Read,
+            Role::Line => CardInk::Ahead,
+            Role::Lit => CardInk::Mark,
+            Role::Track => CardInk::Track,
+            Role::Warn => CardInk::Warn,
+            Role::Value => CardInk::Value,
+            Role::Quiet => CardInk::Axis,
+        }
+    }
 }
 
 /// One row of the Accounts card, in the outlook's words.
@@ -3897,7 +3768,7 @@ pub enum CardRow {
         text: String,
         /// What a reader hears, where it differs.
         spoken: Option<String>,
-        /// Said in warn ink, its `╳` (a projected stop) or `⧗` (a wall now) leading.
+        /// Said in warn ink, its `╳` (a projected stop), `⧗` (a wall now) or `$` leading.
         warn: bool,
         /// Said in value ink (else the label's).
         value: bool,
@@ -3909,7 +3780,9 @@ pub enum CardRow {
         /// Its caption.
         spoken: String,
     },
-    /// One roster row's item: the GUI keeps its act, its check and its place.
+    /// One roster row's item, with its burn-up lane where the card draws one: the GUI keeps its
+    /// act, its check and its place, and draws the lane on the row under it, so an item and its
+    /// lane are placed, or left out, together.
     Account {
         /// The roster label.
         label: String,
@@ -3917,66 +3790,193 @@ pub enum CardRow {
         text: String,
         /// What a reader hears.
         spoken: String,
+        /// Its burn-up lane, drawn on the row under the item.
+        lane: Option<CardLane>,
     },
     /// A rule.
     Rule,
 }
 
-impl CardRow {
-    fn note(text: impl Into<String>) -> CardRow {
-        CardRow::Note {
-            text: text.into(),
-            spoken: None,
-            warn: false,
-            value: false,
-        }
-    }
+/// An item's burn-up lane ([`CardRow::Account`], [`Burn::cells`]): its cells from the card's
+/// left edge, on the work row's clock (its `▕` in the work row's `▕` column), and its caption.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CardLane {
+    /// Its cells.
+    pub cells: Vec<(char, CardInk)>,
+    /// Its caption.
+    pub spoken: String,
+}
 
-    /// The cells it takes ([`CARD_ITEM_LEAD`] for an item's glyph).
+impl CardRow {
+    /// The cells it takes ([`CARD_ITEM_LEAD`] for an item's glyph), an item's lane included.
     #[must_use]
     pub fn width(&self) -> usize {
         match self {
             CardRow::Note { text, .. } => super::footer::text_width(text),
-            CardRow::Account { text, .. } => super::footer::text_width(text) + CARD_ITEM_LEAD,
+            CardRow::Account { text, lane, .. } => (super::footer::text_width(text)
+                + CARD_ITEM_LEAD)
+                .max(lane.as_ref().map_or(0, |lane| lane.cells.len())),
             CardRow::Plot { cells, .. } => cells.len(),
             CardRow::Rule => 0,
         }
     }
-}
 
-/// One roster row on the card while [`Outlook::card_rows`] lays it out: its item, its item with
-/// its bars folded in, its bars by window, and whether it carries the work.
-type CardItem = (CardRow, CardRow, Vec<(Window, CardRow)>, bool);
+    /// The card rows it takes: an item with its lane takes two.
+    #[must_use]
+    pub const fn rows(&self) -> usize {
+        match self {
+            CardRow::Account { lane: Some(_), .. } => 2,
+            _ => 1,
+        }
+    }
+
+    /// It is the card's legend, which closes the card's drawn rows (§1.4): what follows it
+    /// needs no rule of its own.
+    #[must_use]
+    pub fn is_legend(&self) -> bool {
+        matches!(self, CardRow::Plot { spoken, .. } if spoken == LEGEND_SPOKEN)
+    }
+}
 
 /// The cells an item's glyph and gap take before its words (`⎆  `).
 pub const CARD_ITEM_LEAD: usize = 3;
 
-/// How a bar row sits in the card: its window's word, its cells, its figure, its reset.
-fn bar_row(
-    window: Window,
-    cells: &[BarCell],
-    figure: &str,
-    reset: &str,
+/// At this many cells or fewer the card says its accounts in words only (§1.4).
+pub const CARD_WORDS_ONLY: usize = 30;
+
+/// The card's chart grains, finest first, in cells a day: 6 at 60 cells, 4 at 44 (§1.4).
+pub const CARD_PER_DAY: [u8; 3] = [6, 4, 3];
+
+/// The work row's word, before its chart; a lane's cells start as many blanks in, so the
+/// lanes share the work row's clock.
+pub const WORK_WORD: &str = "work ";
+
+/// The legend's parts (§1.4), in the order they give way to a narrow card (the last first):
+/// their glyphs, each in its ink, and their word. Out is a lane's line at its ceiling in the
+/// warn ink ([`super::quota_view::Cell::Out`], `🭷`) and the work row's `╳`; the projected line
+/// is shown below a lane's ceiling (`🭹`), so the two differ in ink and in height.
+pub const LEGEND: [(&[(char, CardInk)], &str); 5] = [
+    (&[('\u{2584}', CardInk::Read)], "read"),
+    (&[('\u{1fb79}', CardInk::Ahead)], "projected"),
+    (
+        &[
+            ('\u{1fb77}', CardInk::Warn),
+            (' ', CardInk::Axis),
+            (GAP_MARK, CardInk::Warn),
+        ],
+        "out",
+    ),
+    (&[(RESET_MARK, CardInk::Mark)], "reset"),
+    (&[(HANDOFF_MARK, CardInk::Mark)], "moves"),
+];
+
+/// What a reader hears of the legend: no drawing glyph.
+const LEGEND_SPOKEN: &str = "Legend: a solid step, read on this Mac; a thin line, projected; a \
+                             warning line along a lane's top or a cross, out; a circular arrow, \
+                             a reset; an arrow, the work moves.";
+
+/// The card's grain at `room` cells: the finest of [`CARD_PER_DAY`] whose work row fits (each
+/// lane is as wide, on the same clock), 0 (words only) at [`CARD_WORDS_ONLY`] cells or fewer.
+#[must_use]
+pub fn card_per_day(room: usize) -> u8 {
+    if room <= CARD_WORDS_ONLY {
+        return 0;
+    }
+    CARD_PER_DAY
+        .into_iter()
+        .find(|&k| WORK_WORD.len() + 8 * usize::from(k) < room)
+        .unwrap_or(0)
+}
+
+/// Where a card row gives way to a short pane: kept, or dropped at this step of the ladder
+/// ([`Outlook::card_rows`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GiveWay {
+    /// The verdict, the items and the rules between them: never dropped.
+    Stays,
+    /// The extra notes (a lean's worst case, the assumptions, the rows not needed).
+    Notes,
+    /// The legend and its rule.
+    Legend,
+    /// The day axis.
+    Axis,
+    /// The burn-up lanes.
+    Lanes,
+    /// The work row and the rule under it.
+    Work,
+    /// The pace line.
+    Pace,
+}
+
+/// One account's item words on the card: its columns and its forms.
+struct Item {
+    label: String,
+    name: String,
+    figure: String,
+    plan: String,
+    /// The words after the plan, widest first (`out ~Sat 03:00 · ↺ Wed 18:00`, `out ~Sat 03:00`).
+    tail: Vec<String>,
+    /// Its run-out's compact words, widest first (`out ~Sat 03:00`, `out ~Sat`); empty when its
+    /// week is not projected out.
+    out: Vec<String>,
+    /// The words-only form (`main 75% ↺ Sat`).
+    narrow: String,
     spoken: String,
-) -> CardRow {
-    let mut out: Vec<(char, CardInk)> = Vec::new();
-    let mut text = |t: &str, ink: CardInk| out.extend(t.chars().map(|c| (c, ink)));
-    text("   ", CardInk::Axis);
-    text(&format!("{:<5}", window.word()), CardInk::Axis);
-    for c in cells {
-        let ink = if c.metered() {
-            CardInk::Meter
-        } else {
-            CardInk::Track
-        };
-        text(&c.glyph().to_string(), ink);
+}
+
+impl Item {
+    /// Its forms at the column widths of its group, widest first. The words after the plan
+    /// (its run-out and its reset) give way after the plan does: the lane under the item draws
+    /// its run-out ([`super::quota_view::Cell::Out`]), and the item always says it in words
+    /// (§1.4), so an item that runs out has no form that keeps its plan or its padded columns
+    /// without the run-out: its compact forms (`alab-pool-01 58% out ~Thu`) come first, and the
+    /// shortest of them fits wherever a lane is drawn (a name is at most 12 cells).
+    fn forms(&self, (nw, fw, pw): (usize, usize, usize)) -> Vec<String> {
+        let head = format!("{:<nw$}  {:>fw$}", self.name, self.figure);
+        let mut out = Vec::new();
+        for tail in &self.tail {
+            out.push(format!("{head}  {:<pw$}  {tail}", self.plan));
+        }
+        for tail in &self.tail {
+            out.push(format!("{head}  {tail}"));
+        }
+        if self.out.is_empty() {
+            out.push(format!("{head}  {}", self.plan));
+            out.push(head);
+        }
+        for words in &self.out {
+            out.push(format!("{} {} {words}", self.name, self.figure));
+        }
+        out.push(format!("{} {}", self.name, self.figure));
+        out.into_iter().map(|s| s.trim_end().to_owned()).collect()
     }
-    text(&format!("{figure:>6}"), CardInk::Value);
-    if !reset.is_empty() {
-        text("  ", CardInk::Axis);
-        text(reset, CardInk::Axis);
+
+    /// Its row at `room` cells, with its `lane`.
+    fn row(
+        &self,
+        widths: (usize, usize, usize),
+        room: usize,
+        narrow: bool,
+        lane: Option<CardLane>,
+    ) -> CardRow {
+        let room = room.saturating_sub(CARD_ITEM_LEAD);
+        CardRow::Account {
+            label: self.label.clone(),
+            text: if narrow {
+                first_fit(
+                    vec![
+                        self.narrow.clone(),
+                        format!("{} {}", self.name, self.figure),
+                    ],
+                    room,
+                )
+            } else {
+                first_fit(self.forms(widths), room)
+            },
+            spoken: self.spoken.clone(),
+            lane,
+        }
     }
-    CardRow::Plot { cells: out, spoken }
 }
 
 impl Outlook {
@@ -3984,747 +3984,442 @@ impl Outlook {
         span_words(self.as_of - at.unwrap_or(self.as_of))
     }
 
-    fn class_word(&self, row: &RowOutlook, short: bool) -> String {
+    /// A row's class in words, for an item with no figure to say: `signed out`, `never read`.
+    fn class_word(&self, row: &RowOutlook) -> String {
         let Some(week) = row.window(Window::Week) else {
             return String::new();
         };
-        let since =
-            |t: Option<i64>| t.map_or_else(String::new, |t| format!(" since {}", self.when(t)));
         match week.fresh {
             Fresh::Now => "now".into(),
-            Fresh::AsOf => format!("as of {}", self.age(week.at)),
+            Fresh::AsOf | Fresh::Pool => format!("as of {}", self.age(week.at)),
             Fresh::Stale => format!("read {} ago while in use", self.age(week.at)),
-            Fresh::IdleHere if short => format!("idle here {}", self.age(week.at)),
-            Fresh::IdleHere => format!("idle here{}", since(week.at)),
-            Fresh::UsedSince if short => format!("used since {}", self.age(week.at)),
-            Fresh::UsedSince => format!("used here{}", since(week.at)),
-            Fresh::Pool if short => format!("as of {}", self.age(week.at)),
-            Fresh::Pool => format!("as of {}, others may use it", self.age(week.at)),
-            Fresh::ResetUnread if short => "not read since reset".into(),
-            Fresh::ResetUnread => "reset passed, not read since".into(),
+            Fresh::IdleHere => format!("idle here {}", self.age(week.at)),
+            Fresh::UsedSince => format!("used since {}", self.age(week.at)),
+            Fresh::ResetUnread => "not read since reset".into(),
             Fresh::NeverRead => "never read".into(),
             Fresh::ClockInvalid => "observation time unconfirmed".into(),
-            Fresh::Walled => format!(
-                "limited to {}",
-                row.walled
-                    .as_ref()
-                    .and_then(|w| w.until)
-                    .or(match row.condition {
-                        Condition::Limited { until } => Some(until),
-                        _ => None,
-                    })
-                    .map_or_else(|| "its reset".into(), |u| self.when(u))
-            ),
+            Fresh::Walled => "limited".into(),
             Fresh::SignedOut => "signed out".into(),
             Fresh::NotEnrolled => "not enrolled".into(),
         }
     }
 
-    /// What a reader hears of a row's class: its age, then its class.
-    fn class_spoken(&self, row: &RowOutlook) -> String {
-        let Some(week) = row.window(Window::Week) else {
-            return String::new();
-        };
-        let ago = |at: Option<i64>| {
-            format!(
-                "read {} ago",
-                spoken_span(self.as_of - at.unwrap_or(self.as_of))
-            )
-        };
-        match week.fresh {
-            Fresh::Now => "read now".into(),
-            Fresh::AsOf | Fresh::Stale => format!("{}, while in use", ago(week.at)),
-            Fresh::IdleHere => format!("{}, idle here since", ago(week.at)),
-            Fresh::UsedSince => format!("{}, used here since", ago(week.at)),
-            Fresh::Pool => format!("{}, others may use it", ago(week.at)),
-            _ => self.class_word(row, false),
-        }
-    }
-
-    fn figure_words(week: &WindowOutlook) -> String {
-        match (week.fresh, week.used_x10) {
-            (Fresh::Walled, _) => "0%".into(),
-            (f, Some(x10)) if f.bounded() => {
-                format!("\u{2264}{}", pct(1000 - x10.min(1000)))
-            }
-            (f, Some(x10)) if f.shows_figure() => pct(1000 - x10.min(1000)),
-            _ => "\u{2014}".into(),
-        }
-    }
-
-    fn reset_words(&self, w: &WindowOutlook) -> String {
-        if !w
-            .at
-            .is_some_and(|at| super::profile::usage_read_age(at, self.as_of).is_some())
-        {
-            return String::new();
-        }
-        match (w.fresh, w.reset) {
-            (Fresh::ResetUnread, Some(r)) => {
-                format!("reset {}", day_words(r, &self.offsets))
-            }
-            (_, Some(r)) if r > self.as_of => format!("\u{267b} {}", self.when(r)),
-            _ => String::new(),
-        }
-    }
-
-    fn bar_spoken(&self, row: &RowOutlook, w: &WindowOutlook, proj: Option<Proj>) -> String {
-        let name = if w.window == Window::Week {
-            "week"
-        } else {
-            "5-hour"
-        };
-        match (w.fresh, w.used_x10) {
-            (_, Some(x10)) => {
-                let mut out = format!(
-                    "{}, {name}: {} percent used, {} left",
-                    row.label,
-                    whole(x10),
-                    whole(1000 - x10.min(1000))
-                );
-                let reset = w.reset.filter(|r| *r > self.as_of);
-                if let Some(clause) = self.reset_pace_spoken(reset, proj) {
-                    out.push_str(", ");
-                    out.push_str(&clause);
-                }
-                out.push('.');
-                out
-            }
-            _ => format!("{}, {name}: no figure.", row.label),
-        }
-    }
-
-    /// What a reader hears of a window's reset and where today's pace takes it by then
-    /// (`resets Thursday 09:00; at today's pace about 98 percent used by then`): the one source
-    /// of the footer's spoken week and the card's bar captions.
-    fn reset_pace_spoken(&self, reset: Option<i64>, proj: Option<Proj>) -> Option<String> {
-        let reset = reset.map(|r| format!("resets {}", self.spoken_when(r)));
-        let pace = proj.map(|p| {
-            if p.fills_at.is_some() || p.at_reset_x10 >= 1000 {
-                "at today's pace it runs out before then".to_string()
+    /// The item of `row` with its `figure`, its week's `reset` and the instant its week is
+    /// projected out (`out_at`), `this_tab` for the pane's own account.
+    fn card_item(
+        &self,
+        row: &RowOutlook,
+        figure: Figure,
+        reset: Option<i64>,
+        out_at: Option<i64>,
+        this_tab: bool,
+    ) -> Item {
+        let name = super::quota_view::cut(&row.label);
+        let plan = row.plan.title();
+        // Projected out before its reset: said here, in words, as the lane's out line draws it.
+        let out_at = out_at.filter(|t| *t > self.as_of && figure != Figure::Out);
+        let mut tail = Vec::new();
+        let mut narrow = format!("{name} {}", figure.words());
+        let out = out_at.map_or_else(Vec::new, |t| {
+            let about = self.about(t);
+            let at = round_down(t, self.as_of, &self.offsets);
+            let (day, _) = local(at, self.offsets.at(at));
+            let (today, _) = local(self.as_of, self.offsets.at(self.as_of));
+            // A later day within the week says its weekday alone (`~Thu`); today's time is
+            // already short (`~07:00`).
+            if (1..7).contains(&(day - today)) {
+                let weekday = WEEKDAYS[usize::try_from(day.rem_euclid(7)).unwrap_or(0)];
+                vec![format!("out {about}"), format!("out ~{weekday}")]
             } else {
-                format!(
-                    "at today's pace about {} percent used by then",
-                    whole(p.at_reset_x10)
-                )
+                vec![format!("out {about}")]
             }
         });
-        match (reset, pace) {
-            (Some(reset), Some(pace)) => Some(format!("{reset}; {pace}")),
-            (reset, pace) => reset.or(pace),
+        match (reset, out_at) {
+            (Some(r), Some(t)) => {
+                tail.push(format!(
+                    "out {} \u{b7} {RESET_MARK} {}",
+                    self.about(t),
+                    self.when(r)
+                ));
+                tail.push(format!("out {}", self.about(t)));
+            }
+            (Some(r), None) => tail.push(format!("{RESET_MARK} {}", self.when(r))),
+            (None, Some(t)) => tail.push(format!("out {}", self.about(t))),
+            (None, None) if figure == Figure::Unread => tail.push(self.class_word(row)),
+            (None, None) => {}
+        }
+        if let Some(r) = reset {
+            let (day, _) = local(r, self.offsets.at(r));
+            let weekday = WEEKDAYS[usize::try_from(day.rem_euclid(7)).unwrap_or(0)];
+            narrow.push_str(&format!(" {RESET_MARK} {weekday}"));
+        } else if figure == Figure::Unread {
+            narrow = format!("{name} {}", self.class_word(row));
+        }
+        let mut spoken = row.label.clone();
+        if this_tab {
+            spoken.push_str(", this tab");
+        }
+        if row.class == Class::Pool {
+            spoken.push_str(", pool");
+        }
+        spoken.push_str(&format!(
+            ", {}, {}",
+            plan.clone().unwrap_or_else(|| "plan not seen".into()),
+            figure.spoken()
+        ));
+        if let Some(r) = reset {
+            spoken.push_str(&format!(", resets {}", self.spoken_when(r)));
+        }
+        if let Some(t) = out_at {
+            spoken.push_str(&format!(", out from {}", self.spoken_about(t)));
+        }
+        if figure == Figure::Unread && reset.is_none() {
+            spoken.push_str(&format!(", {}", self.class_word(row)));
+        }
+        spoken.push('.');
+        Item {
+            label: row.label.clone(),
+            name,
+            figure: figure.words(),
+            plan: plan.unwrap_or_else(|| "plan ?".into()),
+            tail,
+            out,
+            narrow,
+            spoken,
         }
     }
 
-    /// The 7-day strip at `cells` cells after `lead` cells of margin, and its axis (§8.3).
-    fn strip(&self, cells: usize, lead: usize) -> Option<(CardRow, CardRow)> {
-        let pass = self.week.as_ref()?;
-        if cells == 0 {
-            return None;
-        }
-        let start = self.as_of;
-        let span = accounts::WEEK_WINDOW_S;
-        let per = span / i64::try_from(cells).unwrap_or(1);
-        let cell_at = |c: usize| start + per * i64::try_from(c).unwrap_or(0);
-        let covers = |from: i64, to: i64, c: usize| {
-            let (a, b) = (cell_at(c), cell_at(c) + per);
-            (to.min(b) - from.max(a)) * 2 >= per
-        };
-        #[derive(Clone, PartialEq)]
-        enum Holds {
-            Row(String),
-            Stop,
-            Lean,
-            Empty,
-        }
-        let holder: Vec<Holds> = (0..cells)
-            .map(|c| {
-                if pass
-                    .lean
-                    .as_ref()
-                    .is_some_and(|l| cell_at(c) + per / 2 >= l.at)
-                {
-                    Holds::Lean
-                } else if pass
-                    .stops
-                    .iter()
-                    .any(|s| covers(s.from, s.end.at().unwrap_or(i64::MAX), c))
-                {
-                    Holds::Stop
-                } else if let Some(link) = pass.chain.iter().find(|l| covers(l.from, l.to, c)) {
-                    Holds::Row(link.label.clone())
+    /// The day axis over the work row and the lanes at `k` cells a day (§1.4): each local
+    /// midnight's weekday from the cell that holds it, while the labels keep a blank between
+    /// them. The `▕` column holds no label: a past midnight whose label would reach it starts
+    /// its label at the first cell after `▕`, still in the day it began (now lies in it), unless
+    /// that crowds out the next day's label, which stands at its own midnight.
+    fn card_axis(&self, chart: &Chart, k: u8) -> CardRow {
+        let s = DAY / i64::from(k);
+        let lead = WORK_WORD.len();
+        let bar = lead + usize::from(k);
+        let width = bar + 1 + 7 * usize::from(k);
+        let mut cells = vec![(' ', CardInk::Axis); width];
+        let mut said: Vec<&str> = Vec::new();
+        let mut free = lead;
+        let start = chart.now - DAY;
+        let floor = |span: i64| usize::try_from(span.div_euclid(s)).unwrap_or(0);
+        // Each label's column, its day, and whether it moved off `▕`.
+        let laid: Vec<(usize, usize, bool)> = chart
+            .midnights
+            .iter()
+            .map(|&m| {
+                let (day, _) = local(m, self.offsets.at(m));
+                let day = usize::try_from(day.rem_euclid(7)).unwrap_or(0);
+                let len = WEEKDAYS[day].len();
+                if m >= chart.now {
+                    (bar + 1 + floor(m - chart.now), day, false)
+                } else if lead + floor(m - start) + len > bar {
+                    (bar + 1, day, true)
                 } else {
-                    Holds::Empty
+                    (lead + floor(m - start), day, false)
                 }
             })
             .collect();
-        let mut out: Vec<(char, CardInk)> = vec![(' ', CardInk::Axis); lead];
-        let mut c = 0;
-        while c < cells {
-            match &holder[c] {
-                Holds::Stop => {
-                    out.push(('\u{2573}', CardInk::Warn));
-                    c += 1;
-                }
-                Holds::Row(label) => {
-                    let run = holder[c..].iter().take_while(|h| *h == &holder[c]).count();
-                    let text: Vec<char> = label.chars().collect();
-                    if text.len() <= run {
-                        out.extend(text.iter().map(|ch| (*ch, CardInk::Value)));
-                        out.extend((text.len()..run).map(|_| ('\u{2501}', CardInk::Meter)));
-                    } else {
-                        out.push(('\u{2502}', CardInk::Meter));
-                        out.extend((1..run).map(|_| ('\u{2501}', CardInk::Meter)));
-                    }
-                    c += run;
-                }
-                Holds::Lean => {
-                    let rest = cells - c;
-                    let mut text: Vec<char> = pass
-                        .lean
-                        .as_ref()
-                        .map(|l| l.row.chars().collect())
-                        .unwrap_or_default();
-                    text.push('?');
-                    text.truncate(rest);
-                    out.extend(text.iter().map(|ch| (*ch, CardInk::Value)));
-                    out.extend((text.len()..rest).map(|_| ('\u{2504}', CardInk::Track)));
-                    c = cells;
-                }
-                Holds::Empty => {
-                    out.push(('\u{2500}', CardInk::Track));
-                    c += 1;
-                }
-            }
-        }
-        // The axis: `now`, then each day named at its noon where it fits.
-        let mut axis: Vec<(char, CardInk)> = vec![(' ', CardInk::Axis); lead + cells];
-        for (i, ch) in "now".chars().enumerate() {
-            axis[lead + i] = (ch, CardInk::Axis);
-        }
-        let (today, _) = local(start, self.offsets.at(start));
-        let mut named: Vec<&str> = Vec::new();
-        for d in 1..=7 {
-            // Each day's noon on its own clock (a daylight-saving change moves it an hour).
-            let guess = (today + d) * DAY + 12 * HOUR - self.offsets.at(start);
-            let noon = (today + d) * DAY + 12 * HOUR - self.offsets.at(guess);
-            if noon >= start + span {
-                break;
-            }
-            let at = usize::try_from((noon - start) / per).unwrap_or(usize::MAX);
-            let begin = (lead + at).saturating_sub(1);
-            if begin < lead + 4 || begin + 3 > lead + cells || axis[begin - 1].0 != ' ' {
+        for (i, &(col, day, moved)) in laid.iter().enumerate() {
+            let label = WEEKDAYS[day];
+            let crowds = laid
+                .get(i + 1)
+                .is_some_and(|&(next, _, _)| next < col + label.len() + 1);
+            if col < free || col + label.len() > width || (moved && crowds) {
                 continue;
             }
-            let day = usize::try_from((today + d).rem_euclid(7)).unwrap_or(0);
-            for (i, ch) in WEEKDAYS[day].chars().enumerate() {
-                axis[begin + i] = (ch, CardInk::Axis);
+            for (i, ch) in label.chars().enumerate() {
+                cells[col + i] = (ch, CardInk::Axis);
             }
-            named.push(WEEKDAYS_LONG[day]);
+            free = col + label.len() + 1;
+            said.push(WEEKDAYS_LONG[day]);
         }
-        Some((
-            CardRow::Plot {
-                cells: out,
-                spoken: self.strip_spoken(pass),
-            },
-            CardRow::Plot {
-                cells: axis,
-                spoken: format!("Days: now, then {} at noon.", named.join(", ")),
-            },
-        ))
+        CardRow::Plot {
+            cells,
+            spoken: format!("Days across the work row: {}.", said.join(", ")),
+        }
     }
 
-    /// The strip's caption: the chain in order, with its stops and its lean.
-    fn strip_spoken(&self, pass: &Pass) -> String {
-        enum Part<'a> {
-            Link(&'a Link),
-            Stop(&'a Stop),
-        }
-        let mut parts: Vec<(i64, Part<'_>)> = pass
-            .chain
-            .iter()
-            .filter(|l| l.to > l.from)
-            .map(|l| (l.from, Part::Link(l)))
-            .chain(pass.stops.iter().map(|s| (s.from, Part::Stop(s))))
-            .collect();
-        parts.sort_by_key(|(t, _)| *t);
-        let mut said: Vec<String> = Vec::new();
-        let mut last: Option<&str> = None;
-        let lean_at = pass.lean.as_ref().map(|l| l.at);
-        for (i, (_, part)) in parts.iter().enumerate() {
-            let next_from = parts.get(i + 1).map(|(t, _)| *t).or(lean_at);
-            match part {
-                Part::Link(link) => {
-                    if last == Some(link.label.as_str()) {
-                        if let (Some(t), Some(prev)) = (next_from, said.last_mut()) {
-                            *prev = format!("{} until {}", link.label, self.spoken_about(t));
-                        }
-                        continue;
-                    }
-                    last = Some(&link.label);
-                    said.push(match next_from {
-                        Some(t) => format!("{} until {}", link.label, self.spoken_about(t)),
-                        None => link.label.clone(),
-                    });
-                }
-                Part::Stop(stop) => {
-                    last = None;
-                    said.push(self.spoken_end(stop.end).map_or_else(
-                        || "a stop with no end in reach".into(),
-                        |end| format!("a stop until {end}"),
-                    ));
-                }
-            }
-        }
-        let mut out = format!("Next 7 days at today's pace: {}", said.join(", then "));
-        if let Some(lean) = &pass.lean {
-            let cause = match lean.why {
-                Fresh::NeverRead => "which aterm has never read",
-                Fresh::ClockInvalid => "whose observation time is unconfirmed",
-                _ => "which aterm cannot read",
-            };
-            out.push_str(&format!(", then {}, {cause}", lean.row));
-        } else if pass.stops.is_empty() {
-            out.push_str("; no stop");
-        }
-        out.push('.');
-        out
-    }
-
-    fn verdict_row(&self, room: usize, narrow: bool) -> CardRow {
-        let spoken = Some(self.verdict_spoken());
-        let note = |cands: Vec<String>, warn: bool| CardRow::Note {
-            text: first_fit(cands, room),
-            spoken: spoken.clone(),
-            warn,
-            value: !warn,
-        };
-        if narrow {
-            return match (&self.verdict, self.verdict_words()) {
-                (Verdict::Refused(why), _) => {
-                    note(vec![format!("\u{21bb}  {}", why.words())], false)
-                }
-                (_, Some(w)) if w.warn => note(vec![w.full, w.short], true),
-                (_, Some(w)) => note(
-                    vec![
-                        format!("\u{21bb}  {}", w.full),
-                        format!("\u{21bb}  {}", w.short),
-                    ],
-                    false,
-                ),
-                (_, None) => note(vec![String::new()], false),
-            };
-        }
-        match &self.verdict {
-            Verdict::Stop {
-                pass, from, end, ..
-            } => {
-                let what = if *pass == PassKind::Working {
-                    "5h stop"
+    /// The work row at `k` cells a day (§1.4): `work`, then the quota view's chart.
+    fn card_work(&self, chart: &Chart, tab: &str, movable: bool, k: u8) -> CardRow {
+        let mut drawn = Vec::new();
+        chart.cells(k, &mut drawn);
+        let mut cells: Vec<(char, CardInk)> =
+            WORK_WORD.chars().map(|c| (c, CardInk::Axis)).collect();
+        cells.extend(drawn.iter().map(|c| (c.glyph(), CardInk::of(c.role()))));
+        let said = self.card_work_said(tab, movable);
+        CardRow::Plot {
+            cells,
+            spoken: format!(
+                "Work, the last day as read on this Mac and the next 7 days.{}",
+                if said.is_empty() {
+                    " Nothing is projected."
                 } else {
-                    "Stop"
-                };
-                let span = self.stop_span(*from, *end);
-                let from = self.about(*from);
-                let forms = match (self.end_words(*end), span) {
-                    (Some(to), Some(span)) => {
-                        let stop = format!("\u{2573}  {what} {from} \u{2013} {to}");
-                        let span = span_words(span);
-                        vec![
-                            format!("{stop} ({span}): every account out"),
-                            format!("{stop} ({span})"),
-                            stop,
-                        ]
-                    }
-                    _ => {
-                        let stop = format!("\u{2573}  {what} from {from}");
-                        vec![format!("{stop}: every account out"), stop]
-                    }
-                };
-                note(forms, true)
-            }
-            Verdict::Walled { to: None, .. } => note(
-                vec![format!(
-                    "\u{29d7}  Walled now: {}",
-                    self.verdict_words()
-                        .map(|w| w.full.trim_start_matches("\u{29d7} ").to_owned())
-                        .unwrap_or_default()
-                )],
-                true,
-            ),
-            Verdict::Walled { to: Some(to), .. } => note(
-                vec![
-                    format!("\u{21bb}  Walled now: \u{2192} {to} at turn end"),
-                    format!("\u{21bb}  Walled: \u{2192} {to}"),
-                ],
-                false,
-            ),
-            Verdict::Lean {
-                until, row, why, ..
-            } => {
-                let head = format!("\u{21bb}  Continuous to {}, then {row}", self.about(*until));
-                note(
-                    vec![
-                        format!(
-                            "{head} ({})",
-                            match why {
-                                Fresh::NeverRead => "never read",
-                                Fresh::ClockInvalid => "observation time unconfirmed",
-                                f if f.bounded() => "not read lately",
-                                _ => "not read",
-                            }
-                        ),
-                        format!("{head} ?"),
-                    ],
-                    false,
-                )
-            }
-            Verdict::Refused(why) => note(vec![format!("\u{21bb}  {}", why.words())], false),
-            Verdict::Credits { at } => note(
-                vec![format!("\u{21bb}  Usage credits from {}", self.about(*at))],
-                false,
-            ),
-            Verdict::Continuous => note(
-                vec![
-                    "\u{21bb}  Continuous for the next 7 days".into(),
-                    "\u{21bb}  Continuous 7 days".into(),
-                ],
-                false,
+                    &said
+                }
             ),
         }
     }
 
-    /// The Accounts card's rows for the pane whose row is `label` (§8), each at most `room` cells
-    /// wide and, where `height` is given, at most that many rows in all: the verdict and the
-    /// chain, the 7-day strip, the legend, then one [`CardRow::Account`] per roster row in roster
-    /// order with its bars. Rows give way to height in §8.4's order; the verdict lines and the
-    /// items stay.
+    /// What a reader hears of a lane: its week, its readings and where it is projected.
+    fn lane_said(&self, lane: &Burn) -> String {
+        // As an item says a figure: 100 only for a reading of 100 (never an inferred 100%).
+        let pct = super::quota_view::whole_spoken;
+        let mut s = format!(
+            "{}'s week, to its reset {}",
+            lane.label,
+            self.spoken_when(lane.renews)
+        );
+        match (lane.read.first(), lane.read.last()) {
+            (Some(a), Some(b)) if a.x10 != b.x10 => s.push_str(&format!(
+                ": read on this Mac from {} to {} percent",
+                pct(a.x10),
+                pct(b.x10)
+            )),
+            (_, Some(b)) => s.push_str(&format!(": read on this Mac at {} percent", pct(b.x10))),
+            _ => s.push_str(": not read on this Mac this week"),
+        }
+        match (lane.out_at, lane.by_renewal()) {
+            (Some(t), _) if t <= self.as_of => s.push_str(", out now"),
+            (Some(t), _) => s.push_str(&format!(", projected out from {}", self.spoken_about(t))),
+            (None, Some(x10)) if x10 < 1000 => {
+                s.push_str(&format!(", about {} percent by its reset", pct(x10)));
+            }
+            (None, Some(_)) => s.push_str(", projected out by its reset"),
+            (None, None) => s.push_str(", not projected"),
+        }
+        s.push('.');
+        s
+    }
+
+    /// The legend at `room` cells: every part where it fits, else without its last parts, down
+    /// to the measured step and the projected line; none where even they do not fit.
+    fn card_legend(room: usize) -> Option<CardRow> {
+        (2..=LEGEND.len()).rev().find_map(|parts| {
+            let mut cells: Vec<(char, CardInk)> = Vec::new();
+            for (i, (glyphs, word)) in LEGEND[..parts].iter().enumerate() {
+                if i > 0 {
+                    cells.extend([(' ', CardInk::Axis); 2]);
+                }
+                cells.extend(glyphs.iter().copied());
+                cells.push((' ', CardInk::Axis));
+                cells.extend(word.chars().map(|c| (c, CardInk::Axis)));
+            }
+            (cells.len() <= room).then(|| CardRow::Plot {
+                cells,
+                spoken: LEGEND_SPOKEN.into(),
+            })
+        })
+    }
+
+    /// The Accounts card's rows for the pane whose account is `tab` (its roster label), with the
+    /// footer's own week figure `own` where it holds one, for a tab the rotation can move
+    /// (`movable`, as the footer's view of it: else nothing is projected and no verdict is said,
+    /// §2.2, §2.3), each at most `room` cells wide and, where `height` is given, at most that many
+    /// rows in all (§1.4):
+    ///
+    /// - the verdict, then the pace (`at 36% a day (this Mac, the last 24 h)`);
+    /// - the day axis and the work row: the quota view's chart ([`Chart::cells`]) at 6 cells a
+    ///   day at 60 cells, 4 at 44;
+    /// - one item per named account in the view's order, each with its burn-up lane
+    ///   ([`Burn::cells`]) on the work row's clock, so the axis reads across every lane and each
+    ///   lane's `↺` falls under its reset;
+    /// - the folded accounts' items under a rule, every roster row an item, none dropped;
+    /// - the legend.
+    ///
+    /// At [`CARD_WORDS_ONLY`] cells or fewer the card is words only (`main 75% ↺ Sat`). Rows give
+    /// way to height in one order (the extra notes, the legend, the day axis, the lanes, the work
+    /// row, the pace); the verdict and every item stay.
     #[must_use]
     pub fn card_rows(
         &self,
-        label: Option<&str>,
+        tab: &str,
+        own: Option<Figure>,
+        movable: bool,
         room: usize,
         height: Option<usize>,
     ) -> Vec<CardRow> {
-        let wide = room >= 60;
-        let narrow = room <= 30;
-        let bar_n = if wide { 30 } else { 16 };
-        let strip_n = if wide { 56 } else { 42 };
-        let note = |cands: Vec<String>| CardRow::note(first_fit(cands, room));
-        // A projected stop's `╳` is drawn, never heard: a reader hears `a stop`.
-        let stop_note = |cands: Vec<String>| {
-            let text = first_fit(cands, room);
+        let view = self.quota(tab, own, movable);
+        let k = card_per_day(room);
+        let narrow = k == 0;
+        let verdict = self.card_verdict(&view, tab, movable);
+        let mut rows: Vec<(GiveWay, CardRow)> = vec![(
+            GiveWay::Stays,
             CardRow::Note {
-                spoken: Some(text.trim_start().replace('\u{2573}', "a stop")),
-                text,
-                warn: false,
-                value: false,
+                text: first_fit(verdict.forms, room),
+                spoken: Some(verdict.spoken),
+                warn: verdict.ink == Role::Warn,
+                value: verdict.ink == Role::Value,
+            },
+        )];
+        if !narrow && movable {
+            if let Some((forms, spoken)) = self.card_pace() {
+                rows.push((
+                    GiveWay::Pace,
+                    CardRow::Note {
+                        text: first_fit(forms.iter().map(|f| format!("  {f}")).collect(), room),
+                        spoken: Some(spoken),
+                        warn: false,
+                        value: false,
+                    },
+                ));
             }
-        };
-        let mut head: Vec<CardRow> = vec![self.verdict_row(room, narrow)];
-        // Notes that give way to height first (§15: the design's mockups leave them out).
-        let mut extra: Vec<CardRow> = Vec::new();
-        if !narrow {
-            if let Verdict::Lean { stop, row, why, .. } = &self.verdict {
-                if let Some((from, end)) = stop {
-                    let from = self.about(*from);
-                    head.push(stop_note(match self.end_words(*end) {
-                        Some(to) => vec![
-                            format!("   if {row} has nothing: \u{2573} {from} \u{2013} {to}"),
-                            format!("   if nothing: \u{2573} {from} \u{2013} {to}"),
-                            format!("   if nothing: \u{2573} {from}"),
-                        ],
-                        None => vec![
-                            format!("   if {row} has nothing: \u{2573} from {from}"),
-                            format!("   if nothing: \u{2573} from {from}"),
-                        ],
-                    }));
-                }
-                head.push(note(match why {
-                    f if f.bounded() => vec![
-                        format!("   if {row} holds what was read: continuous for 7 days"),
-                        "   if it holds what was read: continuous 7d".into(),
-                    ],
-                    _ => vec![
-                        format!("   if {row} has a fresh week: continuous for 7 days"),
-                        "   if a fresh week: continuous 7d".into(),
-                    ],
-                }));
+            if let Some((forms, spoken)) = verdict.worst {
+                rows.push((
+                    GiveWay::Notes,
+                    CardRow::Note {
+                        text: first_fit(forms, room),
+                        spoken: Some(spoken),
+                        warn: true,
+                        value: false,
+                    },
+                ));
             }
-            if let Some(pass) = &self.week {
-                let (chain, after) = self.chain_words(pass, true);
-                let (bare, _) = self.chain_words(pass, false);
-                let clause = match (wide, self.day_pct(), after.is_some()) {
-                    (true, Some(day), false) => format!(" \u{b7} at today's pace ({day}% a day)"),
-                    (true, _, _) => " \u{b7} at today's pace".to_string(),
-                    (false, _, _) => " \u{b7} today's pace".to_string(),
-                };
-                match after {
-                    None => head.push(note(vec![
-                        format!("   {chain}{clause}"),
-                        format!("   {chain}"),
-                        format!("   {bare}"),
-                    ])),
-                    Some(after) => {
-                        head.push(note(vec![format!("   {chain}"), format!("   {bare}")]));
-                        head.push(note(vec![
-                            format!("   {after}{clause}"),
-                            format!("   {after}"),
-                        ]));
-                    }
+            if !self.not_needed.is_empty() {
+                let all = self.not_needed.join(", ");
+                let mut forms = vec![format!("  not needed: {all}")];
+                if self.not_needed.len() > 1 {
+                    forms.push(format!("  {} rows not needed", self.not_needed.len()));
                 }
+                rows.push((
+                    GiveWay::Notes,
+                    CardRow::Note {
+                        text: first_fit(forms, room),
+                        spoken: Some(format!("Not needed: {all}.")),
+                        warn: false,
+                        value: false,
+                    },
+                ));
             }
-            let five_stop = matches!(
-                self.verdict,
-                Verdict::Stop {
-                    pass: PassKind::Working,
-                    ..
-                }
-            );
-            let five = match (&self.working, self.demand.five) {
-                (_, Err(Refusal::Idle)) => Some(note(vec!["   5h: idle".to_string()])),
-                (Some(w), _) if w.stops.is_empty() => Some(note(vec![
-                    "   5h: no stop in the next 12h at this hour's pace".into(),
-                    "   5h: no stop in the next 12h".into(),
-                ])),
-                // The verdict says the stop; the 5-hour line says what carries the work after it.
-                (Some(w), _) if five_stop => self
-                    .chain_words(w, false)
-                    .1
-                    .map(|after| note(vec![format!("   5h: {after}")])),
-                (Some(w), _) => w.stops.first().map(|s| {
-                    let from = self.about(s.from);
-                    stop_note(vec![self.end_words(s.end).map_or_else(
-                        || format!("   5h: \u{2573} from {from}"),
-                        |to| format!("   5h: \u{2573} {from} \u{2013} {to}"),
-                    )])
-                }),
-                (None, Err(why)) => Some(note(vec![format!("   5h: {}", why.words())])),
-                (None, Ok(_)) => None,
-            };
-            head.extend(five);
-            if wide {
-                if !self.not_needed.is_empty() {
-                    extra.push(CardRow::note(format!(
-                        "   not needed: {}",
-                        self.not_needed.join(", ")
-                    )));
-                }
-                for a in &self.approx {
-                    extra.push(note(
-                        self.approx_words(a, true)
-                            .into_iter()
-                            .map(|w| format!("   \u{2248} {w}"))
-                            .collect(),
-                    ));
-                }
+            for a in &self.approx {
+                let words = self.approx_words(a, true);
+                let spoken = format!(
+                    "Approximately: {}.",
+                    words.first().map_or("", String::as_str)
+                );
+                let forms = words.iter().map(|w| format!("  \u{2248} {w}")).collect();
+                rows.push((
+                    GiveWay::Notes,
+                    CardRow::Note {
+                        text: first_fit(forms, room),
+                        spoken: Some(spoken),
+                        warn: false,
+                        value: false,
+                    },
+                ));
             }
         }
-        let lead = 4usize.min(room.saturating_sub(strip_n));
-        let strip = (!narrow).then(|| self.strip(strip_n, lead)).flatten();
-        // The legend at 60 cells only: the 44-cell card of §8.2 has none.
-        let legend = wide.then(|| {
-            let mut c: Vec<(char, CardInk)> = Vec::new();
-            let mut text = |t: &str, ink: CardInk| c.extend(t.chars().map(|ch| (ch, ink)));
-            text("   ", CardInk::Axis);
-            text("\u{2501}", CardInk::Meter);
-            text(" used now  ", CardInk::Axis);
-            text("\u{254d}", CardInk::Meter);
-            text(" more by its reset at today's pace  ", CardInk::Axis);
-            text("\u{2500}", CardInk::Track);
-            text(" left", CardInk::Axis);
-            CardRow::Plot {
-                cells: c,
-                spoken: "Legend: heavy, used now; dashed, more by its reset at today's pace; \
-                         light, left."
-                    .into(),
-            }
-        });
-        // The accounts, in roster order: (item, its folded item, its bars, carrier).
-        let mut items: Vec<CardItem> = Vec::new();
-        for row in &self.rows {
-            let Some(week) = row.window(Window::Week) else {
-                continue;
-            };
-            let plan = row.plan.title().unwrap_or_else(|| "plan ?".into());
-            let figure = week.fresh.shows_figure().then(|| Self::figure_words(week));
-            let reset = self.reset_words(week);
-            let short_item = |with_reset: bool| match &figure {
-                Some(f) if with_reset && !reset.is_empty() => {
-                    format!("{} \u{b7} {f} left \u{b7} {reset}", row.label)
-                }
-                Some(f) => format!("{} \u{b7} {f} left", row.label),
-                None => format!("{} \u{b7} {}", row.label, self.class_word(row, true)),
-            };
-            let text = if narrow {
-                let full = short_item(true);
-                if super::footer::text_width(&full) + CARD_ITEM_LEAD <= room {
-                    full
-                } else {
-                    short_item(false)
-                }
-            } else {
-                let mut t = match (row.class, wide) {
-                    (Class::Pool, true) => format!(
-                        "{} \u{b7} pool \u{b7} {plan} \u{b7} {}",
-                        row.label,
-                        self.class_word(row, false)
-                    ),
-                    (Class::Pool, false) => {
-                        format!(
-                            "{} \u{b7} pool \u{b7} {}",
-                            row.label,
-                            self.class_word(row, true)
-                        )
-                    }
-                    (Class::Preferred, true) => format!(
-                        "{} \u{b7} {plan} \u{b7} preferred \u{b7} {}",
-                        row.label,
-                        self.class_word(row, false)
-                    ),
-                    (Class::Preferred, false) => {
-                        format!(
-                            "{} \u{b7} {plan} \u{b7} {}",
-                            row.label,
-                            self.class_word(row, true)
-                        )
-                    }
-                };
-                if wide && label == Some(row.label.as_str()) {
-                    t.push_str(" \u{b7} this tab");
-                }
-                t
-            };
-            let spoken = format!(
-                "{}, {}, {}, {}, {}.",
-                row.label,
-                row.plan.title().unwrap_or_else(|| "plan not seen".into()),
-                match row.class {
-                    Class::Preferred => "preferred",
-                    Class::Pool => "pool",
-                },
-                match (week.fresh.shows_figure(), week.used_x10) {
-                    (true, Some(x10)) if week.fresh == Fresh::Walled => {
-                        let _ = x10;
-                        "0 percent left".to_string()
-                    }
-                    (true, Some(x10)) if week.fresh.bounded() => {
-                        format!("at most {} percent left", whole(1000 - x10.min(1000)))
-                    }
-                    (true, Some(x10)) => format!("{} percent left", whole(1000 - x10.min(1000))),
-                    _ => "no figure".into(),
-                },
-                self.class_spoken(row)
-            );
-            let item = CardRow::Account {
-                label: row.label.clone(),
-                text,
-                spoken: spoken.clone(),
-            };
-            let folded = CardRow::Account {
-                label: row.label.clone(),
-                text: short_item(true),
-                spoken,
-            };
-            let mut bars = Vec::new();
-            if !narrow {
-                if let Some(used) = week.used_x10.filter(|_| week.fresh.shows_figure()) {
-                    let proj = week.projection.filter(|_| self.demand.week.is_ok());
-                    let used = if week.fresh == Fresh::Walled {
-                        1000
-                    } else {
-                        used
-                    };
-                    bars.push((
-                        Window::Week,
-                        bar_row(
-                            Window::Week,
-                            &bar_cells(used, proj, bar_n),
-                            &Self::figure_words(week),
-                            &reset,
-                            self.bar_spoken(row, week, proj),
-                        ),
-                    ));
-                }
-                if let Some(five) = row.window(Window::Five)
-                    && let Some(used) = five.used_x10.filter(|_| five.fresh.shows_figure())
-                    && five.reset.is_some_and(|r| r > self.as_of)
-                    && (row.carrier
-                        || five.fresh == Fresh::Walled
-                        || whole(used) >= accounts::LOW_SESSION_PCT)
-                {
-                    let proj = five.projection.filter(|_| self.demand.five.is_ok());
-                    bars.push((
-                        Window::Five,
-                        bar_row(
-                            Window::Five,
-                            &bar_cells(used, proj, bar_n),
-                            &Self::figure_words(five),
-                            &self.reset_words(five),
-                            self.bar_spoken(row, five, proj),
-                        ),
-                    ));
-                }
-            }
-            items.push((item, folded, bars, row.carrier));
+        rows.push((GiveWay::Stays, CardRow::Rule));
+        if !narrow && !view.waiting() {
+            rows.push((GiveWay::Axis, self.card_axis(&view.chart, k)));
+            rows.push((GiveWay::Work, self.card_work(&view.chart, tab, movable, k)));
+            rows.push((GiveWay::Work, CardRow::Rule));
         }
-        // The height ladder (§8.4), after the extra notes: the strip with its rule, the legend
-        // with its rule, the other rows' bars (folded into their items), the carrier's 5-hour
-        // bar, the carrier's week bar.
-        let kept = |w: Window, carrier: bool, keep: &[bool; 6]| match (carrier, w) {
-            (false, _) => keep[3],
-            (true, Window::Five) => keep[4],
-            (true, Window::Week) => keep[5],
-        };
-        let mut keep = [true; 6];
-        keep[1] = strip.is_some();
-        keep[2] = legend.is_some();
-        let count = |keep: &[bool; 6]| {
-            let mut n = head.len() + if keep[0] { extra.len() } else { 0 };
-            n += if keep[1] { 3 } else { 0 } + usize::from(keep[2]) + usize::from(!narrow);
-            for (_, _, bars, carrier) in &items {
-                n += 1;
-                n += bars
-                    .iter()
-                    .filter(|(w, _)| kept(*w, *carrier, keep))
-                    .count();
+        // The named accounts, each with its lane on the work row's clock.
+        let lead = vec![(' ', CardInk::Axis); WORK_WORD.len()];
+        let mut cells = Vec::new();
+        let named: Vec<(Item, Option<CardLane>)> = view
+            .named
+            .iter()
+            .filter_map(|n| {
+                let row = self.row(&n.label)?;
+                let lane = view.lanes.iter().find(|l| l.label == n.label);
+                let item = self.card_item(
+                    row,
+                    n.figure,
+                    n.reset,
+                    lane.and_then(|l| l.out_at),
+                    n.this_tab,
+                );
+                let lane = lane.filter(|l| !narrow && l.renews > self.as_of).map(|l| {
+                    l.cells(k, self.as_of, &mut cells);
+                    let mut drawn = lead.clone();
+                    drawn.extend(cells.iter().map(|c| (c.glyph(), CardInk::of(c.role()))));
+                    CardLane {
+                        cells: drawn,
+                        spoken: self.lane_said(l),
+                    }
+                });
+                Some((item, lane))
+            })
+            .collect();
+        // The folded accounts: still selectable, enrolled and rotating, each an item.
+        let drawn = movable && self.week.is_some();
+        let folded: Vec<Item> = view
+            .folded
+            .iter()
+            .filter_map(|label| {
+                let row = self.row(label)?;
+                let lane = self.lane_of(row, drawn);
+                Some(self.card_item(
+                    row,
+                    row.figure(self.as_of),
+                    super::quota_view::reset_ahead(row, self.as_of),
+                    lane.out_at,
+                    false,
+                ))
+            })
+            .collect();
+        // One set of columns for every item, named and folded alike.
+        let group: Vec<&Item> = named.iter().map(|(item, _)| item).chain(&folded).collect();
+        let at = widths_of(&group);
+        let items: Vec<CardRow> = named
+            .iter()
+            .map(|(item, lane)| item.row(at, room, narrow, lane.clone()))
+            .collect();
+        rows.extend(items.into_iter().map(|item| (GiveWay::Stays, item)));
+        if !folded.is_empty() {
+            rows.push((GiveWay::Stays, CardRow::Rule));
+            for item in &folded {
+                rows.push((GiveWay::Stays, item.row(at, room, narrow, None)));
             }
-            n
-        };
+        }
+        if let Some(legend) = (!narrow).then(|| Self::card_legend(room)).flatten() {
+            rows.push((GiveWay::Legend, CardRow::Rule));
+            rows.push((GiveWay::Legend, legend));
+        }
         if let Some(h) = height {
-            for step in 0..6 {
-                if count(&keep) <= h {
+            let taken =
+                |rows: &[(GiveWay, CardRow)]| rows.iter().map(|(_, r)| r.rows()).sum::<usize>();
+            for step in [
+                GiveWay::Notes,
+                GiveWay::Legend,
+                GiveWay::Axis,
+                GiveWay::Lanes,
+                GiveWay::Work,
+                GiveWay::Pace,
+            ] {
+                if taken(&rows) <= h {
                     break;
                 }
-                keep[step] = false;
+                if step == GiveWay::Lanes {
+                    for (_, row) in &mut rows {
+                        if let CardRow::Account { lane, .. } = row {
+                            *lane = None;
+                        }
+                    }
+                } else {
+                    rows.retain(|(way, _)| *way != step);
+                }
             }
         }
-        let mut out = head;
-        if keep[0] {
-            out.extend(extra);
-        }
-        if let (true, Some((strip, axis))) = (keep[1], strip) {
-            out.push(CardRow::Rule);
-            out.push(strip);
-            out.push(axis);
-        }
-        // The rule above the items stays with them; the legend sits under it.
-        if !narrow {
-            out.push(CardRow::Rule);
-        }
-        if let (true, Some(legend)) = (keep[2], legend) {
-            out.push(legend);
-        }
-        for (item, folded, bars, carrier) in items {
-            let fold = !carrier && !keep[3] && !bars.is_empty();
-            out.push(if fold { folded } else { item });
-            out.extend(
-                bars.into_iter()
-                    .filter(|(w, _)| kept(*w, carrier, &keep))
-                    .map(|(_, bar)| bar),
-            );
-        }
-        out.into_iter().map(|row| fit_card_row(row, room)).collect()
+        rows.into_iter()
+            .map(|(_, row)| fit_card_row(row, room))
+            .collect()
     }
+}
+
+/// A group's column widths: its widest name, figure and plan.
+fn widths_of(items: &[&Item]) -> (usize, usize, usize) {
+    let w = |f: fn(&Item) -> &str| {
+        items
+            .iter()
+            .map(|i| f(i).chars().count())
+            .max()
+            .unwrap_or(0)
+    };
+    (w(|i| &i.name), w(|i| &i.figure), w(|i| &i.plan))
 }
 
 /// The first of `cands` that fits in `room` cells, else the last (which [`fit_card_row`] cuts).
@@ -4771,10 +4466,15 @@ fn fit_card_row(row: CardRow, room: usize) -> CardRow {
             label,
             text,
             spoken,
+            lane,
         } => CardRow::Account {
             label,
             text: cut(text, room.saturating_sub(CARD_ITEM_LEAD)),
             spoken,
+            lane: lane.map(|mut lane| {
+                lane.cells.truncate(room);
+                lane
+            }),
         },
         CardRow::Plot { mut cells, spoken } => {
             cells.truncate(room);
@@ -5001,11 +4701,22 @@ impl Outlook {
                 };
                 let counted = format!("{label}: {seen}, counted as {}", like(carrier_plan));
                 if card {
-                    vec![counted]
+                    // Widest first; the card's narrowest names the row as its item does.
+                    let name = super::quota_view::cut(label);
+                    let like = like(carrier_plan);
+                    vec![
+                        counted,
+                        format!("{name} counted as {like}"),
+                        format!("{name} as {like}"),
+                    ]
                 } else {
                     vec![format!("{counted} like {carrier}")]
                 }
             }
+            Approx::PlansAlike { carrier } if card => vec![
+                format!("{carrier}: plan not seen; every row counted alike"),
+                "every row counted alike".into(),
+            ],
             Approx::PlansAlike { carrier } => {
                 vec![format!("{carrier}: plan not seen; every row counted alike")]
             }
@@ -5017,6 +4728,7 @@ impl Outlook {
             Approx::MultiplesScaled => vec![
                 "weeks scaled by the plans' 5-hour multiples".into(),
                 "weeks scaled by 5-hour multiples".into(),
+                "weeks on one scale".into(),
             ],
         }
     }

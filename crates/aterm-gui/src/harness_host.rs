@@ -2914,6 +2914,8 @@ type StartupsFn = dyn Fn(&std::collections::HashSet<String>) -> Vec<Startup> + S
 /// The startup deadline's mark for the task observation it judged ([`Acts::startup_mark`]).
 /// True when it landed; false keeps the decision's next look armed.
 type StartupMarkFn = dyn Fn(&Startup, &StartupMark<'_>) -> bool + Send + Sync;
+/// The NEEDS YOU set the window holds for tab `sid`'s needs entry standing, with the entry's text it was told with ([`Acts::needs_told`]).
+type NeedsToldFn = dyn Fn(&str) -> Option<(Vec<String>, String)> + Send + Sync;
 /// The limit row the conversation of a tab's agent stands at, by its transcript.
 type StandingLimitFn =
     dyn Fn(&str, &Snapshot) -> Option<aterm_agent::harness::upgrade::StandingLimit> + Send + Sync;
@@ -3730,6 +3732,8 @@ pub(crate) struct Acts {
     pub(crate) startup_mark: Arc<StartupMarkFn>,
     /// The limit only the transcript shows ([`WorkerIdle::standing_limit`]).
     pub(crate) standing_limit: Arc<StandingLimitFn>,
+    /// The NEEDS YOU set a loop before this worker's left standing ([`WorkerIdle::needs_told`], live [`needs_told_of`]).
+    pub(crate) needs_told: Arc<NeedsToldFn>,
     /// The session's own usage wall, recorded for its account ([`WorkerIdle::limited`]).
     pub(crate) account_wall: Arc<AccountWallFn>,
     /// The fleet accounts' upkeep, as injected.
@@ -6354,6 +6358,13 @@ impl IdleHost for WorkerIdle {
         if (self.hooks.needs)(&self.sid, needs, entry) {
             (self.hooks.fact)(&self.sid, crate::HarnessFact::Needs);
         }
+    }
+
+    /// The set a loop before this worker's left standing ([`IdleHost::needs_told`]). A worker's
+    /// end takes down none of it ([`end_notes`]): a loop that really ends tells the window its
+    /// take-down itself, and one handed over leaves it for its successor to adopt.
+    fn needs_told(&self) -> Option<(Vec<String>, String)> {
+        (self.hooks.acts.needs_told)(&self.sid)
     }
 
     /// The hold's own words (§14.17 item 1, slice 4b): stored under the tab's leaf lock with no
@@ -19244,6 +19255,7 @@ fn live_acts(
     let idle_store = store.clone();
     let snapshot_store = store.clone();
     let primary_store = store.clone();
+    let needs_store = store.clone();
     let row = live_row(store.clone());
     let [w1, w2, w3, w4, w5, w6, w7, w8, w9, w10] = std::array::from_fn(|_| Arc::clone(&row));
     let opts = move |sid: &str, grace: u32| {
@@ -19686,6 +19698,7 @@ fn live_acts(
             let tail = upgrade_drive::snapshot_transcript_tail(snap)?;
             relaunch::standing_limit(&standing_opts(sid, 0)?, snap, &tail)
         }),
+        needs_told: Arc::new(move |sid| needs_told_of(&needs_store, sid)),
         account_wall: Arc::new(move |sid, agent, settled| {
             account_wall_live(account_home.as_deref(), sid, agent, settled, &wall_upkeep)
         }),
@@ -27520,6 +27533,30 @@ pub(crate) fn store_needs(store: &Store, sid: &str, needs: &[String], entry: &st
         .set_harness_needs(told, standing.as_deref())
 }
 
+/// [`Acts::needs_told`], live: the set tab `sid`'s window holds for its needs entry standing
+/// ([`crate::needs::ToldNeeds::left_for`]).
+pub(crate) fn needs_told_of(store: &Store, sid: &str) -> Option<(Vec<String>, String)> {
+    let ctx = store
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .by_sid(&aterm_session::SessionId::new(sid))
+        .map(|h| Arc::clone(&h.ctx))?;
+    let standing = ctx
+        .meta
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .attention_owners
+        .get(NEEDS_ATTENTION_OWNER)
+        .map(str::to_string)?;
+    let told = ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .harness_needs();
+    told.left_for(Some(&standing))
+        .map(|held| (held.needs().to_vec(), held.entry().to_string()))
+}
+
 /// [`Hooks::hold`], live: tab `sid`'s Land hold as its loop told it.
 pub(crate) fn store_land_held(
     store: &Store,
@@ -27822,6 +27859,7 @@ impl Acts {
             startups: Arc::new(|_| Vec::new()),
             startup_mark: Arc::new(|_, _| false),
             standing_limit: Arc::new(|_, _| None),
+            needs_told: Arc::new(|_| None),
             account_wall: Arc::new(|_, _, _| ("inert", None)),
             accounts_upkeep: AccountsUpkeep::Inert,
             account_usage: Arc::new(|_, _, _, _, _| "inert"),

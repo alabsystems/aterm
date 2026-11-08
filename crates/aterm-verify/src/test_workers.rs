@@ -110,7 +110,7 @@ mod tests {
                 .child_env_add
                 .iter()
                 .any(|(k, v)| k == "RUST_TEST_THREADS" && v == "5"),
-            "builders and serial fallbacks carry the pool's width"
+            "builders and the recording pass carry the pool's width"
         );
         assert_eq!(make(None).test_share(), 1, "unadopted: no unbounded share");
     }

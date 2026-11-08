@@ -1070,7 +1070,7 @@ impl DocumentGrantStore {
         if !grant.access.permits_write() {
             return failed(AtomicSaveStage::Preflight, "document grant is read-only");
         }
-        execute_atomic_save(&grant.target, plan)
+        execute_atomic_save_after(&grant.target, plan, std::time::Duration::ZERO)
     }
 
     /// Re-observe one already-minted file capability without widening it or accepting a caller-supplied path.
@@ -1115,10 +1115,29 @@ impl DocumentGrantStore {
 
 /// Execute a save using only the exact capability minted by the UI-thread grant store.
 pub fn execute_granted_save(grant: &DocumentGrant, plan: &SavePlan) -> AtomicSaveResult {
+    execute_granted_save_with_elapsed(grant, plan, std::time::Duration::ZERO)
+}
+
+/// Execute the same granted save with time already spent waiting for its write lock.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn execute_granted_save_after(
+    grant: &DocumentGrant,
+    plan: &SavePlan,
+    elapsed: std::time::Duration,
+) -> AtomicSaveResult {
+    execute_granted_save_with_elapsed(grant, plan, elapsed)
+}
+
+fn execute_granted_save_with_elapsed(
+    grant: &DocumentGrant,
+    plan: &SavePlan,
+    elapsed: std::time::Duration,
+) -> AtomicSaveResult {
     if !grant.access.permits_write() {
         return failed(AtomicSaveStage::Preflight, "document grant is read-only");
     }
-    execute_atomic_save(&grant.target, plan)
+    execute_atomic_save_after(&grant.target, plan, elapsed)
 }
 
 /// Decode file bytes into a buffer [`Decoded`], stripping any UTF-8 BOM and normalizing pure CRLF to LF.
@@ -1754,8 +1773,12 @@ fn modified_ns(metadata: &fs::Metadata) -> Option<u64> {
         .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
 }
 
-fn execute_atomic_save(target: &AtomicFileTarget, plan: &SavePlan) -> AtomicSaveResult {
-    match commit_atomic_bytes_with_seed(
+fn execute_atomic_save_after(
+    target: &AtomicFileTarget,
+    plan: &SavePlan,
+    elapsed: std::time::Duration,
+) -> AtomicSaveResult {
+    match commit_atomic_bytes_with_lock_elapsed(
         &AtomicFileBaseline {
             target: target.clone(),
             observed: plan.expected,
@@ -1764,6 +1787,7 @@ fn execute_atomic_save(target: &AtomicFileTarget, plan: &SavePlan) -> AtomicSave
         next_temporary_seed(),
         Flush::Durable,
         Directories::Existing,
+        elapsed,
     ) {
         AtomicCommitResult::Committed(proof) => AtomicSaveResult::Committed(proof),
         AtomicCommitResult::Conflict { observed, .. } => AtomicSaveResult::Conflict {
@@ -2028,8 +2052,11 @@ fn write_lock_busy() -> String {
     "save target is busy; retry Save after the other writer finishes".to_string()
 }
 
-/// Bounded contention budget for the sibling write lock.
+/// Optional journal work on the event loop yields promptly to a sibling writer.
 pub const WRITE_LOCK_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// A required save waits for its sibling writer, with a minute hang detector.
+const SAVE_LOCK_HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Why [`acquire_advisory_lock_within`] gave up.
 pub enum AdvisoryLockRefusal {
@@ -2134,14 +2161,27 @@ fn acquire_write_lock_within(
     })
 }
 
-fn acquire_write_lock(lock_file: File) -> Result<HeldAdvisoryLock, StepFailure> {
-    acquire_write_lock_within(lock_file, WRITE_LOCK_RETRY_BUDGET)
+fn acquire_write_lock_after(
+    lock_file: File,
+    elapsed: std::time::Duration,
+    acquire: impl FnOnce(File, std::time::Duration) -> Result<HeldAdvisoryLock, StepFailure>,
+) -> Result<HeldAdvisoryLock, StepFailure> {
+    let left = SAVE_LOCK_HANG
+        .checked_sub(elapsed)
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| {
+            StepFailure::met(
+                SaveTouch::Lock,
+                write_lock_busy(),
+                std::io::ErrorKind::WouldBlock,
+            )
+        })?;
+    acquire(lock_file, left)
 }
 
-/// Bounded retry for the pre-publication phase of a commit: a failed preflight is tried again
-/// at least once, then while this budget from the first attempt lasts, so a transient (a lock
-/// held a moment, a folder replaced between its open and its lock) fails no save on a host
-/// whose first attempt alone outran the budget.
+/// Retry an independently failed preflight at least once, then while this grace from the
+/// first attempt lasts: a folder replaced between its open and its lock can settle even
+/// when the first attempt alone outran the grace. The write lock has its own hang detector.
 const PREFLIGHT_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// THE POINTS OF A COMMIT A TEST ACTS AT: what another process may do to the folder between
@@ -2225,6 +2265,7 @@ mod seam {
 fn lock_and_verify_target(
     baseline: &AtomicFileBaseline,
     directories: Directories,
+    lock_elapsed: std::time::Duration,
 ) -> Result<(HeldAdvisoryLock, usize, Folder), AtomicCommitResult> {
     let target = &baseline.target;
     if let Err(error) = validate_atomic_target(target) {
@@ -2290,7 +2331,7 @@ fn lock_and_verify_target(
             &save_lock_path(path, parent),
         )
         .map_err(|failure| atomic_failed(AtomicSaveStage::Preflight, failure))?;
-    let lock = acquire_write_lock(lock_file)
+    let lock = acquire_write_lock_after(lock_file, lock_elapsed, acquire_write_lock_within)
         .map_err(|failure| atomic_failed(AtomicSaveStage::Preflight, failure))?;
 
     if let Err(error) = validate_atomic_target(target) {
@@ -2357,6 +2398,24 @@ fn commit_atomic_bytes_with_seed(
     flush: Flush,
     directories: Directories,
 ) -> AtomicCommitResult {
+    commit_atomic_bytes_with_lock_elapsed(
+        baseline,
+        bytes,
+        seed,
+        flush,
+        directories,
+        std::time::Duration::ZERO,
+    )
+}
+
+fn commit_atomic_bytes_with_lock_elapsed(
+    baseline: &AtomicFileBaseline,
+    bytes: &[u8],
+    seed: u64,
+    flush: Flush,
+    directories: Directories,
+    lock_elapsed: std::time::Duration,
+) -> AtomicCommitResult {
     if exceeds_document_limit(bytes.len() as u64) {
         return atomic_failed(
             AtomicSaveStage::Preflight,
@@ -2375,9 +2434,22 @@ fn commit_atomic_bytes_with_seed(
     let mut backoff = std::time::Duration::from_millis(1);
     let mut retried = false;
     let (_lock_file, baseline_limit, folder) = loop {
-        match lock_and_verify_target(baseline, directories) {
+        match lock_and_verify_target(baseline, directories, lock_elapsed) {
             Ok(ready) => break ready,
             Err(verdict) => {
+                if matches!(
+                    &verdict,
+                    AtomicCommitResult::Failed {
+                        stage: AtomicSaveStage::Preflight,
+                        cause: Some(SaveCause {
+                            touch: SaveTouch::Lock,
+                            kind: std::io::ErrorKind::WouldBlock
+                        }),
+                        ..
+                    }
+                ) {
+                    return verdict;
+                }
                 if !matches!(
                     verdict,
                     AtomicCommitResult::Failed {
@@ -3705,7 +3777,7 @@ mod tests {
         );
     }
 
-    /// A lock holder that releases within the wait budget is ridden out without failing the save.
+    /// A required writer outlives optional journal patience, and still has a hang detector.
     #[test]
     fn a_transient_save_lock_holder_is_ridden_out_instead_of_refusing_the_save() {
         let path = unique_file("transient-save-lock", b"before");
@@ -3713,19 +3785,40 @@ mod tests {
             ".{}.aterm-write.lock",
             path.file_name().unwrap().to_string_lossy()
         ));
-        let held = HeldAdvisoryLock::lock(open_write_lock(&lock_path).unwrap()).unwrap();
+        let mut held = Some(HeldAdvisoryLock::lock(open_write_lock(&lock_path).unwrap()).unwrap());
         let probe = open_write_lock(&lock_path).unwrap();
-
-        let (entered, saw_entry) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn(move || {
-            entered.send(()).unwrap();
-            acquire_write_lock_within(probe, aterm_spec::wait::MUST_HAPPEN)
-        });
-        saw_entry.recv().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        drop(held);
-
-        assert!(waiter.join().unwrap().is_ok());
+        let next = acquire_write_lock_after(
+            probe,
+            std::time::Duration::from_millis(600),
+            |file, left| {
+                let (file, why) = HeldAdvisoryLock::try_lock_keeping(file)
+                    .expect_err("CONTROL: the native writer still holds it");
+                assert!(matches!(why, std::fs::TryLockError::WouldBlock));
+                drop(held.take());
+                acquire_write_lock_within(file, left)
+            },
+        )
+        .expect("the required save can follow its scheduled sibling writer");
+        assert!(held.is_none());
+        let expired = acquire_write_lock_after(
+            open_write_lock(&lock_path).unwrap(),
+            std::time::Duration::from_secs(61),
+            |_, _| panic!("no acquisition past the hang detector"),
+        )
+        .expect_err("the exhausted hang detector preserves the other writer");
+        assert_eq!(
+            expired.cause,
+            Some(SaveCause {
+                touch: SaveTouch::Lock,
+                kind: std::io::ErrorKind::WouldBlock
+            })
+        );
+        assert!(matches!(
+            HeldAdvisoryLock::try_lock(open_write_lock(&lock_path).unwrap()),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"before");
+        drop(next);
     }
 
     #[test]
@@ -3738,9 +3831,8 @@ mod tests {
         ));
         let held = HeldAdvisoryLock::lock(open_write_lock(&lock_path).unwrap()).unwrap();
 
-        let started = std::time::Instant::now();
         assert!(matches!(
-            commit_atomic_bytes(&contents.baseline, b"after"),
+            commit_atomic_bytes_with_lock_elapsed(&contents.baseline, b"after", next_temporary_seed(), Flush::Durable, Directories::Create, std::time::Duration::from_secs(61)),
             AtomicCommitResult::Failed {
                 stage: AtomicSaveStage::Preflight,
                 message,
@@ -3750,10 +3842,6 @@ mod tests {
                 }),
             } if message.contains("busy") && message.contains("retry Save")
         ));
-        assert!(
-            started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
-            "the held save lock parked the commit"
-        );
         assert_eq!(fs::read(&path).unwrap(), b"before");
 
         drop(held);
@@ -3775,8 +3863,11 @@ mod tests {
             path.file_name().unwrap().to_string_lossy()
         ));
 
-        let Ok((held, _, _)) = lock_and_verify_target(&contents.baseline, Directories::Create)
-        else {
+        let Ok((held, _, _)) = lock_and_verify_target(
+            &contents.baseline,
+            Directories::Create,
+            std::time::Duration::ZERO,
+        ) else {
             panic!("an uncontended preflight takes the save lock");
         };
         let forked_copy = held.0.try_clone().unwrap();

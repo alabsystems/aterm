@@ -400,7 +400,9 @@ mod tests {
     #[test]
     fn an_oracle_that_decided_nothing_names_how_it_ended_on_its_row() {
         let run = |code: Option<i32>| Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok: code == Some(0),
             output: "== x86_64-pc-windows-msvc\n".into(),
             code,
@@ -443,7 +445,9 @@ mod tests {
     #[test]
     fn a_child_that_died_of_the_machine_is_could_not_run_and_one_that_failed_is_a_finding() {
         let run = |ok: bool, output: &str, spawn: Option<&str>| Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok,
             output: output.into(),
             code: None,
@@ -505,7 +509,9 @@ mod tests {
             )
         };
         let run = |output: String| Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok: false,
             output,
             code: Some(101),

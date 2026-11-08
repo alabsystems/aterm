@@ -29,6 +29,9 @@ pub struct Cmd {
     pub args: Vec<OsString>,
     /// Extra environment on top of the inherited one, or the whole one under [`Cmd::exact_env`].
     pub envs: Vec<(OsString, OsString)>,
+    /// Inherited variables removed for this command alone, after [`ExecEnv::add_env`] and before
+    /// [`Self::envs`].
+    pub remove_envs: Vec<OsString>,
     pub capture: Capture,
     /// Spawn under utility QoS rather than the run's inherited tier while a person may be at the
     /// desk ([`AWAY_AFTER`]).
@@ -55,10 +58,15 @@ pub struct Cmd {
 pub struct CaseWatch {
     /// cargo's re-run spec for the binary.
     pub spec: String,
+    /// The executable cargo ran, which a hung row names even when the spec is shared.
+    pub binary: String,
     /// The binary writes libtest's JSON events; a human log's failures are decided at its end.
     pub json: bool,
     /// End the binary at its first decisive red case: the run halts at its first red.
     pub stop_at_red: bool,
+    /// How long neither a complete output line nor process-tree CPU may advance before the
+    /// binary is hung. Production uses [`TEST_BINARY_HANG`]; tests inject a shorter window.
+    pub hang_after: Duration,
 }
 
 impl Cmd {
@@ -68,6 +76,7 @@ impl Cmd {
             program: program.into(),
             args: Vec::new(),
             envs: Vec::new(),
+            remove_envs: Vec::new(),
             capture: Capture::Emit,
             demoted: false,
             cwd: None,
@@ -125,6 +134,17 @@ impl Cmd {
         match self.envs.iter_mut().find(|(key, _)| *key == k) {
             Some(set) => set.1 = v,
             None => self.envs.push((k, v)),
+        }
+        self
+    }
+
+    /// Remove one inherited variable from this command. A later [`Self::env`] of the same name
+    /// deliberately wins, matching [`std::process::Command`].
+    #[must_use]
+    pub fn remove_env(mut self, k: impl Into<OsString>) -> Self {
+        let k = k.into();
+        if !self.remove_envs.contains(&k) {
+            self.remove_envs.push(k);
         }
         self
     }
@@ -199,6 +219,8 @@ pub fn stage_label(argv: &[String]) -> String {
 /// The invariant part of every invocation.
 #[derive(Clone, Copy, Debug)]
 pub struct ExecEnv<'a> {
+    /// The run's data-only event sink; never inherited by the child.
+    pub events: Option<&'a crate::event_log::EventLog>,
     pub cwd: &'a Path,
     pub path: &'a OsStr,
     pub scratch: &'a Path,
@@ -214,6 +236,29 @@ pub struct ExecEnv<'a> {
     pub stage_groups: Option<&'a dyn StageGroupEnd>,
     /// What a child's spawn and its clock read of the machine ([`LIVE_HOST`] in a run).
     pub host: &'a dyn Host,
+    /// Owner-private directory beside the run log for a hung test binary's raw stack sample.
+    /// It is made lazily only when a binary is proved hung.
+    pub hang_samples: Option<&'a Path>,
+}
+
+/// What stack sampling retained. Collection can fail after the native sampler created and wrote
+/// its owner-private report, so `report` and `error` are independent rather than a `Result`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StackSample {
+    /// The complete or partial raw all-thread report.
+    pub report: Option<PathBuf>,
+    /// Why collection did not complete, absent after a successful sample.
+    pub error: Option<String>,
+}
+
+impl StackSample {
+    fn failed(error: io::Error) -> Self {
+        let report = aterm_uds::wait_sample::retained_report(&error).map(Path::to_path_buf);
+        Self {
+            report,
+            error: Some(error.to_string()),
+        }
+    }
 }
 
 /// What a child's spawn and its clock read of the machine
@@ -224,6 +269,54 @@ pub trait Host: Sync + std::fmt::Debug {
     /// ([`aterm_sysprobe::group_usage`]); `None` where unread, and the clock then counts every
     /// span with no marked wait as work.
     fn group_usage(&self, pgid: u32) -> Option<Vec<aterm_sysprobe::MemberUsage>>;
+    /// A complete reading of `root` and every process whose parent chain reaches it, including
+    /// descendants that formed another process group. `None` means the tree cannot be proved
+    /// complete, so a no-progress verdict must fail open.
+    fn tree_usage(&self, root: u32) -> Option<Vec<TreeMember>> {
+        self.group_usage(root).map(|members| {
+            members
+                .into_iter()
+                .map(|member| TreeMember {
+                    pid: member.pid,
+                    start: member.start,
+                    cpu_ns: member.cpu_ns,
+                })
+                .collect()
+        })
+    }
+    /// A complete descendant-tree reading from a process-table sweep begun by this call. The
+    /// live host bypasses its shared cadence cache; an injected host with no cache may use its
+    /// current reading.
+    fn fresh_tree_usage(&self, root: u32) -> Option<Vec<TreeMember>> {
+        self.tree_usage(root)
+    }
+    /// How often a child's process-group counters are read. The live host uses
+    /// [`READ_USAGE_EVERY`]; a test may make its injected progress probe immediate.
+    fn usage_every(&self) -> Duration {
+        READ_USAGE_EVERY
+    }
+    /// Take an identity-checked all-thread sample of `pid` into owner-private `output_dir`.
+    /// The live implementation reuses [`aterm_uds::wait_sample`]; a test injects its sampler.
+    fn sample(&self, pid: u32, output_dir: &Path, canceled: &dyn Fn() -> bool) -> StackSample {
+        let sampled = (|| {
+            let pid = i32::try_from(pid)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid is out of range"))?;
+            let identity = aterm_uds::process::read_identity(pid).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "the test binary identity is unreadable",
+                )
+            })?;
+            aterm_uds::wait_sample::sample(identity, output_dir, canceled)
+        })();
+        match sampled {
+            Ok(sample) => StackSample {
+                report: Some(sample.report),
+                error: None,
+            },
+            Err(error) => StackSample::failed(error),
+        }
+    }
     /// How long since a person last touched this machine's keyboard or mouse
     /// ([`aterm_sysprobe::hid_idle`]); `None` where unread.
     fn idle(&self) -> Option<Duration>;
@@ -252,6 +345,17 @@ pub trait Host: Sync + std::fmt::Debug {
     }
 }
 
+/// One member of a complete descendant-tree CPU reading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TreeMember {
+    pub pid: u32,
+    pub start: u64,
+    /// Own CPU plus CPU of descendants this process has already reaped. Across a tree this
+    /// preserves work as a child moves from a live row into its parent's reaped counter. Windows
+    /// exposes own CPU only; membership changes still disarm comparison there.
+    pub cpu_ns: u64,
+}
+
 /// The OS's answers ([`Host`]).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LiveHost;
@@ -259,6 +363,14 @@ pub struct LiveHost;
 impl Host for LiveHost {
     fn group_usage(&self, pgid: u32) -> Option<Vec<aterm_sysprobe::MemberUsage>> {
         aterm_sysprobe::group_usage(pgid)
+    }
+
+    fn tree_usage(&self, root: u32) -> Option<Vec<TreeMember>> {
+        live_tree_usage(root, false)
+    }
+
+    fn fresh_tree_usage(&self, root: u32) -> Option<Vec<TreeMember>> {
+        live_tree_usage(root, true)
     }
 
     fn idle(&self) -> Option<Duration> {
@@ -301,6 +413,82 @@ impl Host for LiveHost {
     }
 }
 
+/// More than this many descendants is an incomplete liveness observation, never evidence of
+/// zero CPU. Ordinary test binaries stay many orders below it.
+const TEST_TREE_CAP: usize = 4_096;
+
+/// Select `root` and its current descendants from one complete process-table sweep. Parentage,
+/// identity and counters must all be readable; any ambiguity fails open.
+fn tree_usage_from_sweep(sweep: &aterm_sysprobe::Sweep, root: u32) -> Option<Vec<TreeMember>> {
+    if sweep.truncated {
+        return None;
+    }
+    let mut by_pid = BTreeMap::new();
+    let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for process in &sweep.procs {
+        if by_pid.insert(process.pid, process).is_some() {
+            return None;
+        }
+        children.entry(process.ppid).or_default().push(process.pid);
+    }
+    if !by_pid.contains_key(&root) {
+        return None;
+    }
+    let mut open = VecDeque::from([root]);
+    let mut seen = BTreeSet::new();
+    let mut members = Vec::new();
+    while let Some(pid) = open.pop_front() {
+        if !seen.insert(pid) || members.len() >= TEST_TREE_CAP {
+            return None;
+        }
+        let process = by_pid.get(&pid)?;
+        // A current-process sweep loses a descendant that starts and exits between reads. The
+        // root's cumulative reaped-child counter is what makes the sweep complete across that
+        // gap. Windows' probe cannot supply that counter yet, so it must fail open rather than
+        // turn an unread generation into zero and convict a parent waiting on a busy child.
+        let reaped_cpu = process.child_cpu_ns?;
+        members.push(TreeMember {
+            pid,
+            start: process.start?,
+            cpu_ns: process.cpu_ns?.saturating_add(reaped_cpu),
+        });
+        if let Some(next) = children.get(&pid) {
+            open.extend(next.iter().copied());
+        }
+    }
+    members.sort_unstable();
+    Some(members)
+}
+
+/// The full process-table sweep behind `sys jobs`, shared by every concurrent test binary. One
+/// sweep per usage cadence avoids turning hundreds of binaries into hundreds of table walks.
+/// A post-sample confirmation forces a new sweep so another binary's cached pre-resume view can
+/// never convict this one.
+fn live_tree_usage(root: u32, fresh: bool) -> Option<Vec<TreeMember>> {
+    #[derive(Debug, Default)]
+    struct Kept {
+        at: Option<Instant>,
+        sweep: Option<aterm_sysprobe::Sweep>,
+    }
+    static KEPT: std::sync::OnceLock<std::sync::Mutex<Kept>> = std::sync::OnceLock::new();
+    let now = Instant::now();
+    let mut kept = KEPT
+        .get_or_init(|| std::sync::Mutex::new(Kept::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if fresh
+        || kept
+            .at
+            .is_none_or(|at| now.saturating_duration_since(at) >= READ_USAGE_EVERY)
+    {
+        kept.sweep = aterm_sysprobe::processes();
+        kept.at = Some(now);
+    }
+    kept.sweep
+        .as_ref()
+        .and_then(|sweep| tree_usage_from_sweep(sweep, root))
+}
+
 /// The host a run's children are spawned and timed on.
 pub static LIVE_HOST: LiveHost = LiveHost;
 
@@ -332,6 +520,8 @@ pub trait StageGroupEnd: Sync + std::fmt::Debug {
 /// What a child did.
 #[derive(Clone, Debug, Default)]
 pub struct Run {
+    /// Declared libtest mode and a bounded, incomplete sample of observed failures.
+    pub case_observations: Option<test_progress::Observations>,
     /// True only on exit status 0.
     pub ok: bool,
     pub output: String,
@@ -346,6 +536,78 @@ pub struct Run {
     /// Set when verify ended this test binary at its first decisive red case ([`CaseWatch`]):
     /// its run is a FAIL by construction, read from the blocks of the cases that finished.
     pub stopped_at: Option<crate::libtest_json::Stopped>,
+    /// Set when verify ended a test binary whose complete output lines and whole descendant-tree
+    /// CPU both made no progress for its evidence window. This is a red, never an environment
+    /// refusal or a retry.
+    pub hung: Option<Hung>,
+}
+
+/// A test binary verify proved hung before it ended its owned process group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hung {
+    /// Cargo's re-run spec.
+    pub spec: String,
+    /// The executable that stopped making progress.
+    pub binary: String,
+    /// Libtest JSON cases with `started` and no terminal event when the sample began.
+    pub running: Vec<String>,
+    /// The no-output/no-CPU evidence window.
+    pub window: Duration,
+    /// The complete or partial raw all-thread sample, and any collection error.
+    pub sample: StackSample,
+    /// Whether the binary supplied libtest JSON, and therefore whether `running` is complete
+    /// evidence rather than unavailable.
+    pub json: bool,
+}
+
+impl Hung {
+    /// Keep the synchronous red and its event bounded even when a malicious harness starts many
+    /// cases or gives one an enormous name. The full sorted list remains in [`Self::running`].
+    fn running_detail(&self) -> String {
+        const SHOWN: usize = 8;
+        const NAME_BYTES: usize = 200;
+        if !self.json {
+            return "unavailable (the binary did not run in libtest JSON format)".to_owned();
+        }
+        if self.running.is_empty() {
+            return "none reported by libtest JSON".to_owned();
+        }
+        let mut shown = self
+            .running
+            .iter()
+            .take(SHOWN)
+            .map(|name| crate::report::clip_json(name, NAME_BYTES))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if self.running.len() > SHOWN {
+            shown.push_str(&format!(" (+{} more)", self.running.len() - SHOWN));
+        }
+        shown
+    }
+
+    /// The named red kept in the binary's log and event.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        let tests = self.running_detail();
+        let sample = match (&self.sample.report, &self.sample.error) {
+            (Some(path), None) => format!("stack sample: {}", path.display()),
+            (Some(path), Some(why)) => {
+                format!(
+                    "partial stack sample: {} (collection failed: {why})",
+                    path.display()
+                )
+            }
+            (None, Some(why)) => format!("stack sample unavailable: {why}"),
+            (None, None) => "stack sample unavailable: no report or error".to_owned(),
+        };
+        format!(
+            "HUNG — test binary {} ({}) printed no complete output line and its descendant tree \
+             consumed no CPU for {}; still running: {tests}; {sample}",
+            crate::report::clip_json(&self.binary, crate::report::EVENT_ROW_BYTES),
+            crate::report::clip_json(&self.spec, crate::report::EVENT_ROW_BYTES),
+            aterm_capacity::span(self.window),
+        )
+    }
 }
 
 /// WHAT A CHILD'S TREE USED (`docs/DESIGN-fast-build-release-2026-11-05.md` §4.1, A1), as its
@@ -397,6 +659,11 @@ impl Run {
         }
         if let Some(e) = &self.spawn_error {
             return Some(e.clone());
+        }
+        if self.hung.is_some() {
+            // A completed no-progress proof is a tree red even when the sampler's diagnostic
+            // happens to name an environmental phrase such as a full disk.
+            return None;
         }
         if crate::libtest::has_ceiling_kill(&self.output) {
             return None;
@@ -571,10 +838,73 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 /// macOS's QoS launcher.
 pub const TASKPOLICY: &str = aterm_uds::os_path!("taskpolicy");
 
+/// Open one spawned test binary's live capture stream. Kept injectable so the fail-closed path
+/// has a real forever-blocking negative control rather than relying on a filesystem race.
+type CaseOpener = dyn Fn(&Path, bool) -> io::Result<test_progress::LiveCases> + Sync;
+
 /// Spawn, wait, and collect.
 #[must_use]
 pub fn run(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
-    run_captured(cmd, env, None)
+    run_captured(
+        cmd,
+        env,
+        None,
+        None,
+        None,
+        None,
+        &test_progress::LiveCases::open,
+    )
+}
+
+/// [`run`], with the local test dispatcher closed synchronously once a hang is reconfirmed and
+/// before its process group is ended. This orders the first red before every later admission.
+#[must_use]
+pub(crate) fn run_test(cmd: &Cmd, env: ExecEnv<'_>, hung_red: &(dyn Fn() + Sync)) -> Run {
+    run_captured(
+        cmd,
+        env,
+        None,
+        Some(hung_red),
+        None,
+        None,
+        &test_progress::LiveCases::open,
+    )
+}
+
+/// [`run_test`] with an injected live-capture opener, for the negative control that makes the
+/// real child block forever while monitoring initialization fails.
+#[cfg(test)]
+fn run_test_opening(
+    cmd: &Cmd,
+    env: ExecEnv<'_>,
+    hung_red: &(dyn Fn() + Sync),
+    open_cases: &CaseOpener,
+) -> Run {
+    run_captured(cmd, env, None, Some(hung_red), None, None, open_cases)
+}
+
+/// [`run_test`], with an exclusive cross-process admission lock held by the caller across the
+/// last first-red check and this test binary's actual spawn. The descriptor is explicitly
+/// unlocked immediately after the spawn attempt, and on every earlier return. This closes the
+/// check/start race for rustdoc runtools in separate processes without serializing binaries that
+/// are already running.
+#[must_use]
+pub(crate) fn run_test_admitted(
+    cmd: &Cmd,
+    env: ExecEnv<'_>,
+    hung_red: &(dyn Fn() + Sync),
+    admission: &File,
+    external_stop: &(dyn Fn() -> Option<String> + Sync),
+) -> Run {
+    run_captured(
+        cmd,
+        env,
+        None,
+        Some(hung_red),
+        Some(admission),
+        Some(external_stop),
+        &test_progress::LiveCases::open,
+    )
 }
 
 /// One compiler invocation's machine stdout, separate from its diagnostic stderr.
@@ -586,11 +916,71 @@ pub(crate) struct MachineRun {
 /// Capture compiler stdout without allowing diagnostic text to become machine evidence.
 pub(crate) fn run_machine(cmd: &Cmd, env: ExecEnv<'_>) -> MachineRun {
     let mut stdout = Err("compiler stdout was not captured".to_owned());
-    let run = run_captured(cmd, env, Some(&mut stdout));
+    let run = run_captured(
+        cmd,
+        env,
+        Some(&mut stdout),
+        None,
+        None,
+        None,
+        &test_progress::LiveCases::open,
+    );
     MachineRun { run, stdout }
 }
 
-fn run_captured(cmd: &Cmd, env: ExecEnv<'_>, machine: Option<&mut Result<String, String>>) -> Run {
+fn run_captured(
+    cmd: &Cmd,
+    env: ExecEnv<'_>,
+    machine: Option<&mut Result<String, String>>,
+    hung_red: Option<&(dyn Fn() + Sync)>,
+    admission: Option<&File>,
+    external_stop: Option<&(dyn Fn() -> Option<String> + Sync)>,
+    open_cases: &CaseOpener,
+) -> Run {
+    let mut run = run_captured_inner(
+        cmd,
+        env,
+        machine,
+        hung_red,
+        admission,
+        external_stop,
+        open_cases,
+    );
+    if let Some(watch) = &cmd.test_cases {
+        run.case_observations
+            .get_or_insert_with(|| test_progress::Observations {
+                json: watch.json,
+                ..Default::default()
+            });
+    }
+    run
+}
+
+/// Take a bounded sample from the original capture, never its rendered human summary.
+#[cfg(test)]
+pub(crate) fn case_observations(path: &Path, json: bool) -> test_progress::Observations {
+    let mut observations = test_progress::Observations {
+        json,
+        read_end: test_progress::ReadEnd::Unread,
+        failures: Vec::new(),
+    };
+    if let Ok(mut cases) = test_progress::LiveCases::open(path, json) {
+        let _ = cases.poll();
+        observations = cases.observations().clone();
+    }
+    observations
+}
+
+fn run_captured_inner(
+    cmd: &Cmd,
+    env: ExecEnv<'_>,
+    machine: Option<&mut Result<String, String>>,
+    hung_red: Option<&(dyn Fn() + Sync)>,
+    admission: Option<&File>,
+    external_stop: Option<&(dyn Fn() -> Option<String> + Sync)>,
+    open_cases: &CaseOpener,
+) -> Run {
+    let mut admission = SpawnAdmission(admission);
     let mut c = spawn_command(cmd, env, Path::new(TASKPOLICY));
     c.current_dir(cmd.cwd.as_deref().unwrap_or(env.cwd));
     if cmd.exact_env {
@@ -617,6 +1007,9 @@ fn run_captured(cmd: &Cmd, env: ExecEnv<'_>, machine: Option<&mut Result<String,
         if let Some(marker) = crate::memory::cover() {
             c.env(aterm_capacity::COVER_ENV, &*marker);
         }
+    }
+    for k in &cmd.remove_envs {
+        c.env_remove(k);
     }
     for (k, v) in &cmd.envs {
         c.env(k, v);
@@ -673,7 +1066,21 @@ fn run_captured(cmd: &Cmd, env: ExecEnv<'_>, machine: Option<&mut Result<String,
     match &cmd.capture {
         Capture::Silent => {
             c.stdout(Stdio::null()).stderr(Stdio::null());
-            finish(c, cmd, env, None, &label, marks).0
+            finish(
+                c,
+                cmd,
+                env,
+                None,
+                &label,
+                marks,
+                FinishControls {
+                    local_red: hung_red,
+                    admission: &mut admission,
+                    external_stop,
+                    open_cases,
+                },
+            )
+            .0
         }
         Capture::Emit => {
             // Quiet transcript writes without changing the short root for Unix sockets.
@@ -706,7 +1113,20 @@ fn run_captured(cmd: &Cmd, env: ExecEnv<'_>, machine: Option<&mut Result<String,
             } else {
                 c.stdout(file).stderr(file2);
             }
-            let (mut r, logged) = finish(c, cmd, env, Some(&log), &label, marks);
+            let (mut r, logged) = finish(
+                c,
+                cmd,
+                env,
+                Some(&log),
+                &label,
+                marks,
+                FinishControls {
+                    local_red: hung_red,
+                    admission: &mut admission,
+                    external_stop,
+                    open_cases,
+                },
+            );
             r.output
                 .insert_str(0, logged.as_deref().unwrap_or_default());
             if let Some(stdout) = machine {
@@ -732,6 +1152,30 @@ fn run_captured(cmd: &Cmd, env: ExecEnv<'_>, machine: Option<&mut Result<String,
     }
 }
 
+/// A caller-held cross-process start admission. The normal path releases it immediately after
+/// `spawn`; every earlier return releases it here. A failed unlock leaves the descriptor here so
+/// dropping it still closes the lock before [`run_captured`] returns.
+struct SpawnAdmission<'a>(Option<&'a File>);
+
+impl SpawnAdmission<'_> {
+    fn release(&mut self) -> io::Result<()> {
+        let Some(file) = self.0 else {
+            return Ok(());
+        };
+        file.unlock()?;
+        self.0 = None;
+        Ok(())
+    }
+}
+
+impl Drop for SpawnAdmission<'_> {
+    fn drop(&mut self) {
+        if let Some(file) = self.0.take() {
+            let _ = file.unlock();
+        }
+    }
+}
+
 fn create_stage_log(path: &Path) -> io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -743,6 +1187,49 @@ fn create_stage_log(path: &Path) -> io::Result<File> {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     options.open(path)
+}
+
+/// Make (or validate) the owner-private directory a hung binary's raw sample is retained in.
+/// A pre-existing symlink, foreign owner or group/world-accessible directory is refused by the
+/// shared private-file boundary before `/usr/bin/sample` is launched.
+fn prepare_sample_dir(path: &Path) -> io::Result<()> {
+    let made = {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        builder.create(path)
+    };
+    if let Err(error) = made
+        && error.kind() != io::ErrorKind::AlreadyExists
+    {
+        return Err(error);
+    }
+    aterm_uds::private_file::check_private_dir(path)
+}
+
+/// Sample `pid` before its hung group is ended. The sampler's own one-minute detector is
+/// shortened by cancellation so a broken sampler cannot violate A3's 30-second red-to-verdict
+/// target.
+fn sample_hung(env: ExecEnv<'_>, pid: u32) -> StackSample {
+    let Some(dir) = env.hang_samples else {
+        return StackSample {
+            report: None,
+            error: Some("the run log has no sample directory".to_owned()),
+        };
+    };
+    if let Err(error) = prepare_sample_dir(dir) {
+        return StackSample {
+            report: None,
+            error: Some(format!("cannot prepare {}: {error}", dir.display())),
+        };
+    }
+    let begun = Instant::now();
+    env.host.sample(pid, dir, &|| {
+        ending() || begun.elapsed() >= STACK_SAMPLE_HANG
+    })
 }
 
 /// The directory a child's tree marks its waits in ([`aterm_toolchain::waits::VAR`]), removed
@@ -776,10 +1263,66 @@ const LOOK_EVERY: Duration = Duration::from_millis(25);
 /// short of its ceiling; at the ceiling it reads once more before it judges.
 pub(crate) const READ_USAGE_EVERY: Duration = Duration::from_millis(500);
 
+/// How long a test binary may produce neither a complete output line nor any descendant-tree CPU
+/// before verify proves it hung. Three minutes is three times the project's one-minute detector
+/// for an event that must happen: long enough for a heavily loaded Mac to schedule and account
+/// one instruction, while reducing the measured 26-minute deadlock to a bounded red. This is a
+/// liveness window over evidence, never a test latency budget.
+pub const TEST_BINARY_HANG: Duration = Duration::from_secs(3 * 60);
+
+/// A stack sampler normally finishes in one second. Its own failure must not turn A3's
+/// red-to-verdict target into another indefinite wait, so cancellation reaches it after 20 s.
+const STACK_SAMPLE_HANG: Duration = Duration::from_secs(20);
+
 /// How often a child's stage meter reads its process group in its first [`READ_USAGE_EVERY`]: a
 /// child that ends before the first full read (a 400 ms link of 3 GiB) is still read near its peak,
 /// and not booked as nothing or not at all.
 const EARLY_METER_EVERY: Duration = Duration::from_millis(25);
+
+/// Evidence that one test binary is still alive: either a complete output line or a generation
+/// of CPU use by any member of its descendant tree. An unread/incomplete process probe can prove
+/// nothing and disarms the window until a fresh complete baseline is available.
+#[derive(Clone, Copy, Debug)]
+struct TestProgress {
+    window: Duration,
+    last: Instant,
+    lines: u64,
+    cpu: u64,
+    armed: bool,
+}
+
+impl TestProgress {
+    fn new(window: Duration, now: Instant) -> Self {
+        Self {
+            window,
+            last: now,
+            lines: 0,
+            cpu: 0,
+            armed: false,
+        }
+    }
+
+    /// Observe the two progress generations at `now`. `None` means the descendant-tree probe is
+    /// unread or may be truncated, so elapsed wall time cannot convict the binary.
+    fn hung(&mut self, now: Instant, lines: Option<u64>, cpu: Option<u64>) -> bool {
+        let (Some(lines), Some(cpu)) = (lines, cpu) else {
+            self.armed = false;
+            self.last = now;
+            if let Some(lines) = lines {
+                self.lines = lines;
+            }
+            return false;
+        };
+        if !self.armed || self.lines != lines || self.cpu != cpu {
+            self.armed = true;
+            self.last = now;
+            self.lines = lines;
+            self.cpu = cpu;
+            return false;
+        }
+        now.saturating_duration_since(self.last) >= self.window
+    }
+}
 
 /// Whether a child begun at `begun`, its group last read for its meter at `last`, is due a read
 /// at `now`: at once, then every [`EARLY_METER_EVERY`] through its first [`READ_USAGE_EVERY`],
@@ -962,6 +1505,19 @@ struct Usage<'a> {
     span: CoreWaitSpan,
 }
 
+/// Complete descendant-tree readings kept separately from the process-group meter: a child may
+/// form another group, and group usage is unavailable off macOS, while the shared process sweep
+/// still proves its CPU progress.
+struct TreeProgressClock<'a> {
+    host: &'a dyn Host,
+    root: u32,
+    read_at: Instant,
+    seen: Vec<TreeMember>,
+    observations: u64,
+    comparable: bool,
+    generation: u64,
+}
+
 /// A CHILD'S OWN METER ([`TreeUsage`]): every read its clock and its sweep make of its tree, booked
 /// as its stage's meter books them ([`crate::memory::Meter::book`]), and each incarnation's most
 /// runnable time beside them.
@@ -1037,6 +1593,8 @@ struct Clock<'a> {
     waits_before: Vec<aterm_toolchain::waits::Waiting>,
     /// `None` once its host has no reading of the tree: every span with no marked wait is work.
     usage: Option<Usage<'a>>,
+    /// The complete descendant tree's CPU progress, independent of process-group accounting.
+    tree: Option<TreeProgressClock<'a>>,
     /// The child's own meter, which each read that books its stage's meter books too
     /// ([`TreeUsage`]); `None` for a clock that keeps no account of its child.
     own: Option<&'a Own>,
@@ -1082,7 +1640,29 @@ impl<'a> Clock<'a> {
                 progressed_at: now,
                 span: CoreWaitSpan::default(),
             }),
+            tree: None,
         }
+    }
+
+    /// Read the descendant tree only for a child carrying [`CaseWatch`]. Other verifier stages
+    /// retain the existing cheap process-group meter and do not cause process-table sweeps.
+    fn watching_tree(mut self, yes: bool) -> Self {
+        if yes {
+            self.tree = Some(TreeProgressClock {
+                host: self.usage.as_ref().expect("a new clock has its host").host,
+                root: self
+                    .usage
+                    .as_ref()
+                    .expect("a new clock has its process group")
+                    .pgid,
+                read_at: self.last,
+                seen: Vec::new(),
+                observations: 0,
+                comparable: false,
+                generation: 0,
+            });
+        }
+        self
     }
 
     /// This clock books its reads into `own` as well ([`Clock::own`]).
@@ -1105,6 +1685,17 @@ impl<'a> Clock<'a> {
     /// read the tree once [`READ_USAGE_EVERY`] has; through the first of those, read it for its
     /// meters alone (its stage's, its own) as often as [`meter_due`] says.
     fn tick(&mut self) {
+        self.tick_kind(true);
+    }
+
+    /// Advance every clock except the cached descendant-tree probe. A post-sample confirmation
+    /// follows this immediately with [`Self::read_tree_usage_fresh`], preserving the last
+    /// comparable pre-sample baseline even when the shared cached sweep is unreadable.
+    fn tick_before_fresh_tree_usage(&mut self) {
+        self.tick_kind(false);
+    }
+
+    fn tick_kind(&mut self, read_tree: bool) {
         let now = Instant::now();
         if now.saturating_duration_since(self.begun) < READ_USAGE_EVERY
             && meter_due(self.begun, self.metered_at, now)
@@ -1136,9 +1727,16 @@ impl<'a> Clock<'a> {
         if self
             .usage
             .as_ref()
-            .is_some_and(|u| now.saturating_duration_since(u.read_at) >= READ_USAGE_EVERY)
+            .is_some_and(|u| now.saturating_duration_since(u.read_at) >= u.host.usage_every())
         {
             self.read_usage();
+        }
+        if read_tree
+            && self.tree.as_ref().is_some_and(|tree| {
+                now.saturating_duration_since(tree.read_at) >= tree.host.usage_every()
+            })
+        {
+            self.read_tree_usage();
         }
     }
 
@@ -1179,6 +1777,80 @@ impl<'a> Clock<'a> {
         let moved = u.span.book(wall, used, worked, u.cores, self.worked);
         self.worked -= moved;
         self.starved += moved;
+    }
+
+    /// Read a complete descendant tree. An unread tree, changed membership, or a counter that
+    /// moved backwards is incomparable and therefore disarms the hang window for this read.
+    fn read_tree_usage(&mut self) {
+        self.read_tree_usage_kind(false);
+    }
+
+    /// Read a complete descendant tree without the live host's cadence cache. This is the final
+    /// post-sample observation: it must begin after sampling, because a cached pre-resume view is
+    /// not independent evidence that the binary remained still.
+    fn read_tree_usage_fresh(&mut self) {
+        self.read_tree_usage_kind(true);
+    }
+
+    fn read_tree_usage_kind(&mut self, fresh: bool) {
+        let Some(tree) = &mut self.tree else {
+            return;
+        };
+        tree.read_at = self.last;
+        let reading = if fresh {
+            tree.host.fresh_tree_usage(tree.root)
+        } else {
+            tree.host.tree_usage(tree.root)
+        };
+        let Some(mut now) = reading else {
+            tree.seen.clear();
+            tree.observations = 0;
+            tree.comparable = false;
+            return;
+        };
+        now.sort_unstable();
+        if now.is_empty() {
+            tree.seen.clear();
+            tree.observations = 0;
+            tree.comparable = false;
+            return;
+        }
+        if tree.observations == 0 {
+            tree.seen = now;
+            tree.observations = 1;
+            tree.comparable = true;
+            return;
+        }
+        let same = tree.seen.len() == now.len()
+            && tree
+                .seen
+                .iter()
+                .zip(&now)
+                .all(|(before, after)| (before.pid, before.start) == (after.pid, after.start));
+        let monotone = same
+            && tree
+                .seen
+                .iter()
+                .zip(&now)
+                .all(|(before, after)| before.cpu_ns <= after.cpu_ns);
+        if monotone
+            && tree
+                .seen
+                .iter()
+                .zip(&now)
+                .any(|(before, after)| before.cpu_ns < after.cpu_ns)
+        {
+            tree.generation = tree.generation.saturating_add(1);
+        }
+        tree.seen = now;
+        tree.observations = tree.observations.saturating_add(1);
+        tree.comparable = monotone;
+    }
+
+    /// The process tree's CPU progress generation, only after a successful complete reading.
+    fn cpu_progress(&self) -> Option<u64> {
+        let tree = self.tree.as_ref()?;
+        tree.comparable.then_some(tree.generation)
     }
 
     /// Whether its work has reached `limit`, as of a read of its tree that covers it: one more
@@ -1484,14 +2156,168 @@ fn resolves(cmd: &Cmd, env: ExecEnv<'_>) -> bool {
 /// ceiling ([`STUCK_GRACE`] when it has none) and as the ceiling's own kill gives it at the
 /// ceiling. A child that ends after waiting longer than [`STARVED_SAID`] for a core says so on
 /// stderr.
+fn emit_case(
+    events: Option<&crate::event_log::EventLog>,
+    watch: &CaseWatch,
+    seen: &test_progress::Seen,
+    evidence: Option<&test_progress::Failure>,
+    elapsed: Duration,
+    halts: bool,
+) {
+    use test_progress::Seen;
+    // A spared case's own block says its machine, not the tree, refused it: it reads
+    // NOT RUN, as its binary's row will; a red or an undecided case reads FAIL.
+    let running_long = matches!(seen, Seen::RunningLong { .. });
+    let outcome = if running_long {
+        "RUNNING"
+    } else if matches!(seen, Seen::Spared { .. }) {
+        "NOT RUN"
+    } else {
+        "FAIL"
+    };
+    let (case, says) = match &seen {
+        Seen::RunningLong { case } => (Some(case.as_str()), None),
+        Seen::Red { case, marks } | Seen::Spared { case, marks } => {
+            (Some(case.as_str()), block_says(*marks))
+        }
+        Seen::Undecided { case } => (case.as_deref(), Some("unknown")),
+    };
+    crate::event_log::emit(
+        events,
+        &format!(
+            "verify-event: {}",
+            aterm_json::json!({
+                "schema": 1,
+                "event": if running_long { "test-case-running-long" } else { "test-case-failed" },
+                "outcome": outcome,
+                "test": watch.spec, "case": case.map(|name| crate::report::clip_json(name, crate::report::EVENT_ROW_BYTES)),
+                "at_unix_ms": aterm_time::unix_millis(),
+                "elapsed_s": elapsed.as_secs_f64(),
+                "binary_completed": false,
+                "halts": halts, "block_says": says,
+                "sample_complete": false,
+                "output": evidence.map(|f| f.output.as_str()),
+                "omitted_bytes": evidence.map(|f| f.omitted_bytes),
+                "source_path": evidence.and_then(|f| f.source_path.as_deref()),
+                "start_line": evidence.and_then(|f| f.start_line),
+                "start_col": evidence.and_then(|f| f.start_col),
+                "detail": match seen {
+                    Seen::RunningLong { .. } => "libtest reports this case is still running; no verdict",
+                    Seen::Red { .. } => "its block decides its binary a FAIL",
+                    Seen::Spared { .. } => "its block says its machine, not the tree",
+                    Seen::Undecided { .. } => "its block is decided at its binary's end",
+                },
+            })
+        ),
+    );
+}
+
+/// Observe a bounded final batch only after the owner has positively reaped its child.
+/// No observation here can stop a process or set the returned run's `stopped_at`.
+fn observe_reaped(
+    cases: &mut test_progress::LiveCases,
+    watch: &CaseWatch,
+    events: Option<&crate::event_log::EventLog>,
+    elapsed: Duration,
+) {
+    for seen in cases.poll() {
+        let evidence = cases.observations().failures.iter().find(|f| match &seen {
+            test_progress::Seen::Red { case, .. } | test_progress::Seen::Spared { case, .. } => {
+                f.case == *case
+            }
+            _ => false,
+        });
+        emit_case(events, watch, &seen, evidence, elapsed, false);
+    }
+}
+
+fn observed_case(
+    watch: &CaseWatch,
+    seen: test_progress::Seen,
+    begun: Instant,
+    events: Option<&crate::event_log::EventLog>,
+    evidence: Option<&test_progress::Failure>,
+) -> Option<crate::libtest_json::Stopped> {
+    use test_progress::Seen;
+    let halts = watch.stop_at_red && matches!(seen, Seen::Red { .. }) && !ending();
+    emit_case(events, watch, &seen, evidence, begun.elapsed(), halts);
+    match (halts, seen) {
+        (true, Seen::Red { case, .. }) => Some(crate::libtest_json::Stopped {
+            spec: watch.spec.clone(),
+            case,
+        }),
+        _ => None,
+    }
+}
+
+fn discard_sample(sample: &StackSample) {
+    if let Some(path) = &sample.report {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+struct FinishControls<'a, 'lock> {
+    local_red: Option<&'a (dyn Fn() + Sync)>,
+    admission: &'a mut SpawnAdmission<'lock>,
+    external_stop: Option<&'a (dyn Fn() -> Option<String> + Sync)>,
+    open_cases: &'a CaseOpener,
+}
+
+struct ObservedFinish<'a, 'control, 'lock> {
+    controls: FinishControls<'control, 'lock>,
+    cases: &'a mut Option<test_progress::LiveCases>,
+}
+
 fn finish(
+    c: Command,
+    cmd: &Cmd,
+    env: ExecEnv<'_>,
+    log: Option<&Path>,
+    label: &str,
+    marks: Option<&Path>,
+    controls: FinishControls<'_, '_>,
+) -> (Run, Option<String>) {
+    let mut cases = None;
+    let (mut run, logged) = finish_inner(
+        c,
+        cmd,
+        env,
+        log,
+        label,
+        marks,
+        ObservedFinish {
+            controls,
+            cases: &mut cases,
+        },
+    );
+    if let Some(watch) = &cmd.test_cases {
+        run.case_observations = Some(cases.as_ref().map_or_else(
+            || test_progress::Observations {
+                json: watch.json,
+                ..Default::default()
+            },
+            |cases| cases.observations().clone(),
+        ));
+    }
+    (run, logged)
+}
+
+fn finish_inner(
     mut c: Command,
     cmd: &Cmd,
     env: ExecEnv<'_>,
     log: Option<&Path>,
     label: &str,
     marks: Option<&Path>,
+    observed: ObservedFinish<'_, '_, '_>,
 ) -> (Run, Option<String>) {
+    let ObservedFinish { controls, cases } = observed;
+    let FinishControls {
+        local_red,
+        admission,
+        external_stop,
+        open_cases,
+    } = controls;
     let (ceiling, stage_groups) = (env.child_ceiling, env.stage_groups);
     let read_log = |log: Option<&Path>| {
         log.map(|p| {
@@ -1542,6 +2368,12 @@ fn finish(
         Ok(ch) => ch,
         Err(e) => return (failed_to_wait(&e.to_string()), read_log(log)),
     };
+    if let Err(error) = admission.release() {
+        eprintln!(
+            "verify: {label}: could not release its cross-process start admission after spawn: \
+             {error}; later starts remain closed until this binary ends"
+        );
+    }
     #[cfg(unix)]
     let mut live = group::Live::enter(child.id());
     #[cfg(unix)]
@@ -1551,11 +2383,56 @@ fn finish(
     #[cfg(unix)]
     drop(spawning);
 
-    let mut cases = cmd.test_cases.as_ref().and_then(|watch| {
-        log.and_then(|path| test_progress::LiveCases::open(path, watch.json).ok())
-    });
+    *cases = match cmd.test_cases.as_ref() {
+        None => None,
+        Some(watch) => {
+            let opened = log.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a watched test binary has no capture stream",
+                )
+            });
+            let opened = opened.and_then(|path| open_cases(path, watch.json));
+            match opened {
+                Ok(cases) => Some(cases),
+                Err(error) => {
+                    let why = format!(
+                        "cannot monitor {} for output progress: {error}",
+                        watch.binary
+                    );
+                    let killed = kill_and_reap(
+                        &mut child,
+                        #[cfg(unix)]
+                        &mut live,
+                        None,
+                        #[cfg(unix)]
+                        REAP_AFTER_KILL,
+                    );
+                    return (
+                        Run {
+                            case_observations: None,
+                            ok: false,
+                            output: format!("aterm-verify: NOT RUN — {why}\n{killed}"),
+                            code: None,
+                            spawn_error: Some(why),
+                            stopped_at: None,
+                            hung: None,
+                            usage: None,
+                        },
+                        read_log(log),
+                    );
+                }
+            }
+        }
+    };
     let begun = Instant::now();
-    let mut clock = Clock::new(marks, env.host, child.id(), crate::memory::current()).owning(&own);
+    let mut progress = cmd
+        .test_cases
+        .as_ref()
+        .map(|watch| TestProgress::new(watch.hang_after, begun));
+    let mut clock = Clock::new(marks, env.host, child.id(), crate::memory::current())
+        .watching_tree(cmd.test_cases.is_some())
+        .owning(&own);
     let mut starts = start::Watch::new(env.host, child.id(), &cmd.program);
     let used = |run: Run, clock: &Clock<'_>| Run {
         usage: own.usage(clock, begun.elapsed()),
@@ -1563,57 +2440,62 @@ fn finish(
     };
     let mut told = false;
     let mut nap = Duration::from_millis(1);
+    let mut pending = VecDeque::new();
+    let mut external_stop_due = Instant::now();
     loop {
-        if let (Some(watch), Some(cases)) = (&cmd.test_cases, &mut cases) {
-            for seen in cases.poll() {
-                use test_progress::Seen;
-                let halts = watch.stop_at_red && matches!(seen, Seen::Red { .. }) && !ending();
-                // A spared case's own block says its machine, not the tree, refused it: it reads
-                // NOT RUN, as its binary's row will; a red or an undecided case reads FAIL.
-                let running_long = matches!(seen, Seen::RunningLong { .. });
-                let outcome = if running_long {
-                    "RUNNING"
-                } else if matches!(seen, Seen::Spared { .. }) {
-                    "NOT RUN"
-                } else {
-                    "FAIL"
-                };
-                let (case, says) = match &seen {
-                    Seen::RunningLong { case } => (Some(case.as_str()), None),
-                    Seen::Red { case, marks } | Seen::Spared { case, marks } => {
-                        (Some(case.as_str()), block_says(*marks))
-                    }
-                    Seen::Undecided { case } => (case.as_deref(), Some("unknown")),
-                };
-                eprintln!(
-                    "verify-event: {}",
-                    aterm_json::json!({
-                        "schema": 1,
-                        "event": if running_long { "test-case-running-long" } else { "test-case-failed" },
-                        "outcome": outcome,
-                        "test": watch.spec, "case": case,
-                        "at_unix_ms": aterm_time::unix_millis(),
-                        "elapsed_s": begun.elapsed().as_secs_f64(),
-                        "binary_completed": false,
-                        "halts": halts, "block_says": says,
-                        "detail": match seen {
-                            Seen::RunningLong { .. } => "libtest reports this case is still running; no verdict",
-                            Seen::Red { .. } => "its block decides its binary a FAIL",
-                            Seen::Spared { .. } => "its block says its machine, not the tree",
-                            Seen::Undecided { .. } => "its block is decided at its binary's end",
-                        },
-                    })
+        let now = Instant::now();
+        if now >= external_stop_due {
+            external_stop_due = now + READ_USAGE_EVERY;
+            if let Some(why) = external_stop.and_then(|stop| stop()) {
+                eprintln!("verify: {label}: NOT RUN — {why}");
+                let killed = kill_and_reap(
+                    &mut child,
+                    #[cfg(unix)]
+                    &mut live,
+                    None,
+                    #[cfg(unix)]
+                    REAP_AFTER_KILL,
                 );
-                if let (true, Seen::Red { case, .. }) = (halts, seen) {
+                return (
+                    used(
+                        Run {
+                            case_observations: None,
+                            ok: false,
+                            output: format!("aterm-verify: NOT RUN — {why}\n{killed}"),
+                            code: None,
+                            spawn_error: Some(why),
+                            stopped_at: None,
+                            hung: None,
+                            usage: None,
+                        },
+                        &clock,
+                    ),
+                    read_log(log),
+                );
+            }
+        }
+        if let (Some(watch), Some(cases)) = (&cmd.test_cases, cases.as_mut()) {
+            pending.extend(cases.poll());
+            while let Some(seen) = pending.pop_front() {
+                if let Some(stopped) = observed_case(
+                    watch,
+                    seen.clone(),
+                    begun,
+                    env.events,
+                    cases.observations().failures.iter().find(|f| match &seen {
+                        test_progress::Seen::Red { case, .. }
+                        | test_progress::Seen::Spared { case, .. } => f.case == *case,
+                        _ => false,
+                    }),
+                ) {
                     // The red is ended here, inside the child's own run and before anything
                     // calls the run's halt (`Halt::red`, which `testrun` calls once this returns):
                     // the halt makes `ending` true, and a child reaped while the run is ending is
                     // released as interrupted (`Live::release_for_reap`), which would turn this
                     // red into a NOT RUN.
-                    let stopped = crate::libtest_json::Stopped {
-                        spec: watch.spec.clone(),
-                        case,
-                    };
+                    if let Some(red) = local_red {
+                        red();
+                    }
                     let killed = kill_and_reap(
                         &mut child,
                         #[cfg(unix)]
@@ -1625,11 +2507,13 @@ fn finish(
                     return (
                         used(
                             Run {
+                                case_observations: None,
                                 ok: false,
                                 output: killed,
                                 code: None,
                                 spawn_error: None,
                                 stopped_at: Some(stopped),
+                                hung: None,
                                 usage: None,
                             },
                             &clock,
@@ -1648,6 +2532,9 @@ fn finish(
                 if let Some(line) = clock.starved_line() {
                     eprintln!("verify: {label}: {line}");
                 }
+                if let (Some(watch), Some(cases)) = (&cmd.test_cases, cases.as_mut()) {
+                    observe_reaped(cases, watch, env.events, begun.elapsed());
+                }
                 return (used(reaped(Ok(st)), &clock), read_log(log));
             }
             Ok(None) => {}
@@ -1660,6 +2547,107 @@ fn finish(
             }
         }
         clock.tick();
+        let suspected = !ending()
+            && match (&cmd.test_cases, cases.as_ref(), &mut progress) {
+                (Some(_), Some(cases), Some(progress)) => {
+                    progress.hung(clock.last, cases.lines(), clock.cpu_progress())
+                }
+                _ => false,
+            };
+        if suspected {
+            let sample = sample_hung(env, child.id());
+            // A failed sampler may answer immediately. Wait for an independent process reading,
+            // then force a new process-table sweep and recheck every signal: sampling is
+            // evidence collection, not the verdict. The cadence begins after sampling, so a
+            // target resumed by the sampler gets a whole observation interval in which to run.
+            let confirm_at = Instant::now() + env.host.usage_every();
+            while !ending() && Instant::now() < confirm_at {
+                std::thread::sleep(
+                    LOOK_EVERY.min(confirm_at.saturating_duration_since(Instant::now())),
+                );
+            }
+            #[cfg(unix)]
+            let status = live.reap_stage_sweeping(&mut child, false, sweep, record);
+            #[cfg(not(unix))]
+            let status = child.try_wait();
+            match status {
+                Ok(Some(st)) => {
+                    discard_sample(&sample);
+                    if let (Some(watch), Some(cases)) = (&cmd.test_cases, cases.as_mut()) {
+                        observe_reaped(cases, watch, env.events, begun.elapsed());
+                    }
+                    return (used(reaped(Ok(st)), &clock), read_log(log));
+                }
+                Ok(None) => {}
+                Err(_) if ending() => {
+                    discard_sample(&sample);
+                    clock.look();
+                    return (used(failed_to_wait(&clock.ended()), &clock), read_log(log));
+                }
+                Err(error) => {
+                    discard_sample(&sample);
+                    return (
+                        used(failed_to_wait(&error.to_string()), &clock),
+                        read_log(log),
+                    );
+                }
+            }
+            clock.tick_before_fresh_tree_usage();
+            clock.read_tree_usage_fresh();
+            if let Some(cases) = cases.as_mut() {
+                pending.extend(cases.poll());
+            }
+            let confirmed = !ending()
+                && match (&cmd.test_cases, cases.as_ref(), &mut progress) {
+                    (Some(_), Some(cases), Some(progress)) => {
+                        progress.hung(clock.last, cases.lines(), clock.cpu_progress())
+                    }
+                    _ => false,
+                };
+            if confirmed && let (Some(watch), Some(cases)) = (&cmd.test_cases, cases.as_ref()) {
+                // This is the decision point. Close admission under the dispatcher's own lock
+                // before ending the binary or writing its finished event.
+                if watch.stop_at_red
+                    && let Some(red) = local_red
+                {
+                    red();
+                }
+                let hung = Hung {
+                    spec: watch.spec.clone(),
+                    binary: watch.binary.clone(),
+                    running: cases.running(),
+                    window: watch.hang_after,
+                    sample,
+                    json: watch.json,
+                };
+                eprintln!("verify: {}", hung.detail());
+                let killed = kill_and_reap(
+                    &mut child,
+                    #[cfg(unix)]
+                    &mut live,
+                    None,
+                    #[cfg(unix)]
+                    REAP_AFTER_KILL,
+                );
+                return (
+                    used(
+                        Run {
+                            case_observations: None,
+                            ok: false,
+                            output: format!("aterm-verify: {}\n{killed}", hung.detail()),
+                            code: None,
+                            spawn_error: None,
+                            stopped_at: None,
+                            hung: Some(hung),
+                            usage: None,
+                        },
+                        &clock,
+                    ),
+                    read_log(log),
+                );
+            }
+            discard_sample(&sample);
+        }
         if ending() {
             // What its tree waits for as the run ends, said at once, ahead of the row the run's
             // report gives it once every stage group is ended. The handler ends the child too (its
@@ -1686,7 +2674,9 @@ fn finish(
             return (
                 used(
                     Run {
+                        case_observations: None,
                         stopped_at: None,
+                        hung: None,
                         ok: false,
                         output: killed,
                         code: None,
@@ -1912,7 +2902,9 @@ fn over_ceiling(cmd: &Cmd, clock: &Clock<'_>, limit: Duration, kill: &str) -> Ru
     let argv = cmd.argv().join(" ");
     let waited = waited_clause(clock.waited, clock.starved);
     Run {
+        case_observations: None,
         stopped_at: None,
+        hung: None,
         ok: false,
         output: format!(
             "{} — child killed after {:.1}s of work, over the {:.1}s ceiling \
@@ -2685,7 +3677,9 @@ pub mod group {
 fn reaped(st: io::Result<std::process::ExitStatus>) -> Run {
     match st {
         Ok(st) => Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok: st.success(),
             output: ended_by_signal(st),
             code: st.code(),
@@ -2717,7 +3711,9 @@ fn ended_by_signal(st: std::process::ExitStatus) -> String {
 
 fn failed_to_wait(why: &str) -> Run {
     Run {
+        case_observations: None,
         stopped_at: None,
+        hung: None,
         ok: false,
         output: String::new(),
         code: None,
@@ -2728,7 +3724,9 @@ fn failed_to_wait(why: &str) -> Run {
 
 fn spawn_failure(cmd: &Cmd, why: &str) -> Run {
     Run {
+        case_observations: None,
         stopped_at: None,
+        hung: None,
         ok: false,
         output: format!("aterm-verify: cannot run {}: {why}", cmd.program.display()),
         code: None,
@@ -2765,6 +3763,31 @@ mod tests {
         );
     }
 
+    /// A command-local removal wins over the run's inherited additions, while an explicit value
+    /// on that same command wins over its removal, matching `Command`. NEGATIVE CONTROL: an
+    /// unrelated variable remains present.
+    #[test]
+    fn a_command_can_remove_one_inherited_variable_without_clearing_the_rest() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let removed = run(
+            &Cmd::new("/usr/bin/env").remove_env("PATH"),
+            env_in(dir.path()),
+        );
+        assert!(removed.ok, "{}", removed.output);
+        assert!(!removed.output.lines().any(|line| line.starts_with("PATH=")));
+        assert!(
+            removed.output.lines().any(|line| line.starts_with("HOME=")),
+            "an unrelated inherited variable remains"
+        );
+        let restored = run(
+            &Cmd::new("/usr/bin/env")
+                .remove_env("PATH")
+                .env("PATH", "/restored"),
+            env_in(dir.path()),
+        );
+        assert!(restored.output.lines().any(|line| line == "PATH=/restored"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_native_stage_keeps_its_inherited_pipe_descriptor() {
@@ -2795,6 +3818,7 @@ mod tests {
 
     fn ceiled(dir: &Path, child_ceiling: Option<Duration>) -> ExecEnv<'_> {
         ExecEnv {
+            events: None,
             cwd: dir,
             path: OsStr::new("/usr/bin:/bin"),
             scratch: dir,
@@ -2803,6 +3827,7 @@ mod tests {
             add_env: &[],
             stage_groups: None,
             host: &INERT,
+            hang_samples: None,
         }
     }
 
@@ -3603,7 +4628,9 @@ mod tests {
             );
             let records = pidfile.with_extension("records");
             let record = crate::runs::Runs::open(&ctx, &records, |_, _| Run {
+                case_observations: None,
                 stopped_at: None,
+                hung: None,
                 ok: false,
                 output: String::new(),
                 code: None,
@@ -5448,6 +6475,665 @@ mod tests {
         );
     }
 
+    /// A test binary is hung only after both progress generations stay fixed for the complete
+    /// evidence window. A complete line or any tree CPU restarts it; an unread tree disarms it.
+    /// NEGATIVE CONTROLS: wall time with unchanged generations convicts at exactly the window,
+    /// while each changed generation and `None` do not.
+    #[test]
+    fn test_progress_requires_no_complete_line_and_no_tree_cpu() {
+        let window = Duration::from_secs(180);
+        let begun = Instant::now();
+
+        let mut blocked = TestProgress::new(window, begun);
+        assert!(
+            !blocked.hung(begun, Some(7), Some(11)),
+            "the baseline only arms"
+        );
+        assert!(!blocked.hung(begun + window - Duration::from_nanos(1), Some(7), Some(11)));
+        assert!(blocked.hung(begun + window, Some(7), Some(11)));
+
+        let mut lines = TestProgress::new(window, begun);
+        assert!(!lines.hung(begun, Some(1), Some(0)));
+        assert!(!lines.hung(begun + window, Some(2), Some(0)));
+        assert!(!lines.hung(
+            begun + window * 2 - Duration::from_nanos(1),
+            Some(2),
+            Some(0)
+        ));
+        assert!(lines.hung(begun + window * 2, Some(2), Some(0)));
+
+        let mut cpu = TestProgress::new(window, begun);
+        assert!(!cpu.hung(begun, Some(1), Some(4)));
+        assert!(!cpu.hung(begun + window, Some(1), Some(5)));
+        assert!(!cpu.hung(
+            begun + window * 2 - Duration::from_nanos(1),
+            Some(1),
+            Some(5)
+        ));
+        assert!(cpu.hung(begun + window * 2, Some(1), Some(5)));
+
+        let mut unread = TestProgress::new(window, begun);
+        assert!(!unread.hung(begun, Some(1), Some(0)));
+        assert!(!unread.hung(begun + window, Some(1), None));
+        assert!(!unread.hung(begun + window * 2, Some(1), Some(0)));
+        assert!(unread.hung(begun + window * 3, Some(1), Some(0)));
+        assert!(!unread.hung(begun + window * 4, None, Some(0)));
+    }
+
+    /// The complete-tree probe follows parentage, not process groups, and carries reaped CPU in
+    /// the owning row. An incomplete table or unread counter proves nothing. NEGATIVE CONTROL:
+    /// the child and grandchild use different process groups from the root but remain present.
+    #[test]
+    fn tree_cpu_includes_descendants_in_other_groups_and_fails_open() {
+        let process = |pid, ppid, pgid, start, cpu, reaped| aterm_sysprobe::ProcessReading {
+            pid,
+            ppid,
+            pgid,
+            start: Some(start),
+            cpu_ns: Some(cpu),
+            child_cpu_ns: Some(reaped),
+            ..aterm_sysprobe::ProcessReading::default()
+        };
+        let mut sweep = aterm_sysprobe::Sweep {
+            procs: vec![
+                process(40, 1, 40, 400, 10, 5),
+                process(41, 40, 41, 410, 20, 0),
+                process(42, 41, 99, 420, 30, 7),
+                process(70, 1, 70, 700, 1_000, 0),
+            ],
+            truncated: false,
+        };
+        assert_eq!(
+            tree_usage_from_sweep(&sweep, 40),
+            Some(vec![
+                TreeMember {
+                    pid: 40,
+                    start: 400,
+                    cpu_ns: 15,
+                },
+                TreeMember {
+                    pid: 41,
+                    start: 410,
+                    cpu_ns: 20,
+                },
+                TreeMember {
+                    pid: 42,
+                    start: 420,
+                    cpu_ns: 37,
+                },
+            ])
+        );
+        sweep.procs[0].child_cpu_ns = None;
+        assert_eq!(
+            tree_usage_from_sweep(&sweep, 40),
+            None,
+            "an unread cumulative reaped-child counter fails open; short-lived busy children may have escaped the sweep"
+        );
+        sweep.procs[0].child_cpu_ns = Some(5);
+        sweep.truncated = true;
+        assert_eq!(tree_usage_from_sweep(&sweep, 40), None);
+        sweep.truncated = false;
+        sweep.procs[1].cpu_ns = None;
+        assert_eq!(tree_usage_from_sweep(&sweep, 40), None);
+    }
+
+    #[cfg(unix)]
+    const HUNG_CASE_FIXTURE: &str = "ATERM_VERIFY_HUNG_CASE_FIXTURE";
+    #[cfg(unix)]
+    const HUNG_CASE_SOCKET: &str = "ATERM_VERIFY_HUNG_CASE_SOCKET";
+    #[cfg(unix)]
+    const HUNG_BUSY_WORKER_SOCKET: &str = "ATERM_VERIFY_HUNG_BUSY_WORKER_SOCKET";
+
+    /// A real libtest case used by the no-progress controls. Each mode becomes ready by binding
+    /// its datagram before it stops printing. `blocked` and `resume` wait in the kernel;
+    /// `busy-parent` consumes CPU until its probe releases it; and `busy-child` waits on another
+    /// copy of this test binary which consumes the CPU. There is no time-based fixture behavior.
+    #[cfg(unix)]
+    #[test]
+    fn hung_case_fixture() {
+        let Some(mode) = std::env::var_os(HUNG_CASE_FIXTURE) else {
+            return;
+        };
+        let path = PathBuf::from(std::env::var_os(HUNG_CASE_SOCKET).expect("fixture socket"));
+        match mode.to_str().expect("fixture mode") {
+            "blocked" | "resume" => {
+                let socket = std::os::unix::net::UnixDatagram::bind(path).expect("bind fixture");
+                let mut byte = [0_u8];
+                socket.recv(&mut byte).expect("release fixture");
+            }
+            "busy-parent" => busy_until_datagram(&path),
+            "busy-child" => {
+                let mut child =
+                    aterm_uds::spawnfd::command(std::env::current_exe().expect("this test binary"));
+                child
+                    .args([
+                        "--exact",
+                        "exec::tests::hung_busy_worker_fixture",
+                        "--test-threads=1",
+                    ])
+                    .env(HUNG_BUSY_WORKER_SOCKET, &path)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                let mut child = child.spawn().expect("spawn busy descendant");
+                assert!(child.wait().expect("wait for busy descendant").success());
+            }
+            other => panic!("unknown hung fixture mode {other}"),
+        }
+    }
+
+    /// The actual busy descendant of [`hung_case_fixture`]. Its output is sent to `/dev/null`,
+    /// so only its CPU can keep the parent binary alive.
+    #[cfg(unix)]
+    #[test]
+    fn hung_busy_worker_fixture() {
+        let Some(path) = std::env::var_os(HUNG_BUSY_WORKER_SOCKET) else {
+            return;
+        };
+        busy_until_datagram(Path::new(&path));
+    }
+
+    #[cfg(unix)]
+    fn busy_until_datagram(path: &Path) {
+        let socket = std::os::unix::net::UnixDatagram::bind(path).expect("bind busy fixture");
+        socket.set_nonblocking(true).expect("nonblocking fixture");
+        let mut byte = [0_u8];
+        loop {
+            match socket.recv(&mut byte) {
+                Ok(_) => return,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::hint::black_box(byte[0]);
+                }
+                Err(error) => panic!("receive fixture release: {error}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum ProgressKind {
+        Flat,
+        Leader,
+        Descendant,
+        ResumeAfterSample,
+        UnreadCacheAfterSample,
+        SampleError,
+    }
+
+    /// An injected complete descendant-tree probe. Its counter is the deterministic clock for
+    /// the live controls; `sampled_alive` proves sampling happened before the local kill.
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct ProgressHost {
+        kind: ProgressKind,
+        reads: AtomicU64,
+        root: std::sync::atomic::AtomicU32,
+        sampled_alive: std::sync::atomic::AtomicBool,
+        sample_calls: AtomicU64,
+        fresh_reads: AtomicU64,
+        post_sample_cpu: std::sync::atomic::AtomicBool,
+        released: std::sync::atomic::AtomicBool,
+        socket: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl ProgressHost {
+        fn new(kind: ProgressKind, socket: PathBuf) -> Self {
+            Self {
+                kind,
+                reads: AtomicU64::new(0),
+                root: std::sync::atomic::AtomicU32::new(0),
+                sampled_alive: std::sync::atomic::AtomicBool::new(false),
+                sample_calls: AtomicU64::new(0),
+                fresh_reads: AtomicU64::new(0),
+                post_sample_cpu: std::sync::atomic::AtomicBool::new(false),
+                released: std::sync::atomic::AtomicBool::new(false),
+                socket,
+            }
+        }
+
+        fn release(&self) {
+            if self.released.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            std::os::unix::net::UnixDatagram::unbound()
+                .and_then(|socket| socket.send_to(&[1], &self.socket))
+                .expect("release live hang fixture");
+        }
+
+        fn reading(&self, root: u32, fresh: bool) -> Option<Vec<TreeMember>> {
+            self.root.store(root, Ordering::SeqCst);
+            if !self.socket.exists() {
+                return None;
+            }
+            let post_sample_cpu = self.post_sample_cpu.load(Ordering::SeqCst);
+            if matches!(self.kind, ProgressKind::UnreadCacheAfterSample)
+                && post_sample_cpu
+                && !fresh
+            {
+                return None;
+            }
+            let tick = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
+            let member = |pid, start, cpu_ns| TreeMember { pid, start, cpu_ns };
+            let reading = match self.kind {
+                ProgressKind::Flat | ProgressKind::SampleError => vec![member(root, 1, 0)],
+                ProgressKind::ResumeAfterSample | ProgressKind::UnreadCacheAfterSample => {
+                    vec![member(root, 1, u64::from(fresh && post_sample_cpu))]
+                }
+                ProgressKind::Leader => vec![member(root, 1, tick)],
+                ProgressKind::Descendant => vec![
+                    member(root, 1, 0),
+                    member(root.saturating_add(10_000), 2, tick),
+                ],
+            };
+            if matches!(self.kind, ProgressKind::Leader | ProgressKind::Descendant) && tick >= 4 {
+                self.release();
+            }
+            Some(reading)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Host for ProgressHost {
+        fn group_usage(&self, pgid: u32) -> Option<Vec<aterm_sysprobe::MemberUsage>> {
+            self.root.store(pgid, Ordering::SeqCst);
+            Some(vec![aterm_sysprobe::MemberUsage {
+                pid: pgid,
+                start: 1,
+                cpu_ns: self.reads.load(Ordering::SeqCst),
+                ..aterm_sysprobe::MemberUsage::default()
+            }])
+        }
+
+        fn tree_usage(&self, root: u32) -> Option<Vec<TreeMember>> {
+            self.reading(root, false)
+        }
+
+        fn fresh_tree_usage(&self, root: u32) -> Option<Vec<TreeMember>> {
+            self.fresh_reads.fetch_add(1, Ordering::SeqCst);
+            let reading = self.reading(root, true);
+            if matches!(
+                self.kind,
+                ProgressKind::ResumeAfterSample | ProgressKind::UnreadCacheAfterSample
+            ) && self.post_sample_cpu.load(Ordering::SeqCst)
+            {
+                self.release();
+            }
+            reading
+        }
+
+        fn usage_every(&self) -> Duration {
+            Duration::ZERO
+        }
+
+        fn sample(&self, pid: u32, output_dir: &Path, canceled: &dyn Fn() -> bool) -> StackSample {
+            if canceled() {
+                return StackSample {
+                    report: None,
+                    error: Some("sample canceled".to_owned()),
+                };
+            }
+            self.sample_calls.fetch_add(1, Ordering::SeqCst);
+            let alive = i32::try_from(pid)
+                .ok()
+                .and_then(aterm_uds::process::read_identity)
+                .is_some();
+            self.sampled_alive.store(alive, Ordering::SeqCst);
+            let report = output_dir.join(format!("hung-{pid}.sample.txt"));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+            if let Err(error) = options
+                .open(&report)
+                .and_then(|mut file| file.write_all(b"injected all-thread sample\n"))
+            {
+                return StackSample {
+                    report: None,
+                    error: Some(error.to_string()),
+                };
+            }
+            if matches!(
+                self.kind,
+                ProgressKind::ResumeAfterSample | ProgressKind::UnreadCacheAfterSample
+            ) {
+                // Ordinary reads deliberately retain the cached zero-CPU view. Only the
+                // post-sample fresh read observes this progress, then releases the fixture.
+                self.post_sample_cpu.store(true, Ordering::SeqCst);
+            }
+            StackSample {
+                report: Some(report),
+                error: matches!(
+                    self.kind,
+                    ProgressKind::ResumeAfterSample
+                        | ProgressKind::UnreadCacheAfterSample
+                        | ProgressKind::SampleError
+                )
+                .then(|| "injected sampler failure after writing the report".to_owned()),
+            }
+        }
+
+        fn idle(&self) -> Option<Duration> {
+            None
+        }
+
+        fn cores(&self) -> u32 {
+            1
+        }
+    }
+
+    #[cfg(unix)]
+    fn hung_fixture_command(
+        mode: &str,
+        socket: &Path,
+        hang_after: Duration,
+        stop_at_red: bool,
+    ) -> Cmd {
+        let binary = std::env::current_exe().expect("this test binary");
+        let mut command = Cmd::new(&binary)
+            .args([
+                "-Z",
+                "unstable-options",
+                "--format",
+                "json",
+                "--exact",
+                "exec::tests::hung_case_fixture",
+                "--test-threads=1",
+            ])
+            .env(HUNG_CASE_FIXTURE, mode)
+            .env(HUNG_CASE_SOCKET, socket);
+        command.test_cases = Some(CaseWatch {
+            spec: "-p aterm-verify --lib".into(),
+            binary: binary.display().to_string(),
+            json: true,
+            stop_at_red,
+            hang_after,
+        });
+        command
+    }
+
+    /// Run a live fixture under an outer one-minute hang detector. That minute is only the
+    /// test's failure detector: every successful injected decision is immediate. On failure the
+    /// still-unreaped leader retains its group id, so cleanup can signal exactly that group.
+    #[cfg(unix)]
+    fn run_hung_fixture(
+        cmd: Cmd,
+        dir: &Path,
+        host: std::sync::Arc<ProgressHost>,
+        red_alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        red_calls: std::sync::Arc<AtomicU64>,
+        fail_case_open: bool,
+    ) -> Run {
+        let dir = dir.to_path_buf();
+        let (sent, answer) = std::sync::mpsc::channel();
+        let thread_host = std::sync::Arc::clone(&host);
+        let thread = std::thread::spawn(move || {
+            let samples = dir.join("hung-samples");
+            let env = ExecEnv {
+                host: thread_host.as_ref(),
+                hang_samples: Some(&samples),
+                ..ceiled(&dir, None)
+            };
+            let callback_host = std::sync::Arc::clone(&thread_host);
+            let callback = || {
+                red_calls.fetch_add(1, Ordering::SeqCst);
+                let pid = callback_host.root.load(Ordering::SeqCst);
+                let alive = i32::try_from(pid)
+                    .ok()
+                    .and_then(aterm_uds::process::read_identity)
+                    .is_some();
+                red_alive.store(alive, Ordering::SeqCst);
+            };
+            let run = if fail_case_open {
+                run_test_opening(&cmd, env, &callback, &|_, _| {
+                    Err(io::Error::other("injected live-capture open failure"))
+                })
+            } else {
+                run_test(&cmd, env, &callback)
+            };
+            let _ = sent.send(run);
+        });
+        match answer.recv_timeout(HANG_DETECTOR) {
+            Ok(run) => {
+                let _ = thread.join();
+                run
+            }
+            Err(error) => {
+                let pid = host.root.load(Ordering::SeqCst);
+                if let Ok(pid) = i32::try_from(pid)
+                    && pid > 1
+                {
+                    // SAFETY: the worker retains this exact leader unreaped, so `-pid` still
+                    // names its owned process group. This is only the outer detector's failure
+                    // cleanup.
+                    unsafe {
+                        libc::kill(-pid, libc::SIGKILL);
+                    }
+                }
+                // Never replace the outer detector with an unbounded join. A killed fixture
+                // normally unwinds its worker promptly; if verify itself is wedged, detach it
+                // and let this test fail now.
+                if answer.recv_timeout(Duration::from_secs(5)).is_ok() {
+                    let _ = thread.join();
+                }
+                panic!("the live hang control exceeded its one-minute detector: {error}");
+            }
+        }
+    }
+
+    /// A blocked real libtest binary is sampled, named with its unfinished case, made the local
+    /// first red, and killed. NEGATIVE CONTROL: both the sampler and the local halt callback
+    /// observe its identity alive, proving they precede the kill.
+    #[cfg(unix)]
+    #[test]
+    fn a_blocked_test_binary_is_sampled_and_ends_as_hung() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = aterm_tempfile::tempdir().expect("fixture root");
+        let socket = root.path().join("fixture.sock");
+        let samples = root.path().join("hung-samples");
+        let host = std::sync::Arc::new(ProgressHost::new(ProgressKind::Flat, socket.clone()));
+        let red_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let red_calls = std::sync::Arc::new(AtomicU64::new(0));
+        let run = run_hung_fixture(
+            hung_fixture_command("blocked", &socket, Duration::ZERO, true),
+            root.path(),
+            std::sync::Arc::clone(&host),
+            std::sync::Arc::clone(&red_alive),
+            std::sync::Arc::clone(&red_calls),
+            false,
+        );
+        let hung = run.hung.as_ref().expect("a named hung red");
+        assert!(!run.ok && run.spawn_error.is_none(), "{run:?}");
+        assert_eq!(hung.spec, "-p aterm-verify --lib");
+        assert_eq!(
+            hung.binary,
+            std::env::current_exe().unwrap().display().to_string()
+        );
+        assert_eq!(hung.window, Duration::ZERO);
+        assert_eq!(hung.running, ["exec::tests::hung_case_fixture"]);
+        assert!(run.output.contains("HUNG") && run.output.contains("hung_case_fixture"));
+        assert!(run.environment_failure().is_none(), "a hang is a tree red");
+        let sample = hung.sample.report.as_ref().expect("retained sample");
+        assert!(hung.sample.error.is_none(), "{:?}", hung.sample);
+        assert!(
+            sample.starts_with(&samples) && sample.is_file(),
+            "{sample:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(sample).unwrap().permissions().mode() & 0o077,
+            0,
+            "the raw stack is owner-private"
+        );
+        assert!(host.sampled_alive.load(Ordering::SeqCst));
+        assert_eq!(host.sample_calls.load(Ordering::SeqCst), 1);
+        assert!(red_alive.load(Ordering::SeqCst));
+        assert_eq!(red_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A spawned binary whose live capture cannot be opened is ended immediately as NOT RUN;
+    /// monitoring is never silently disabled. NEGATIVE CONTROL: the real fixture blocks forever,
+    /// so converting the injected error to `None` reaches the outer one-minute hang detector.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_live_capture_ends_the_test_binary_unrun() {
+        let root = aterm_tempfile::tempdir().expect("fixture root");
+        let socket = root.path().join("fixture.sock");
+        let host = std::sync::Arc::new(ProgressHost::new(ProgressKind::Flat, socket.clone()));
+        let red_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let red_calls = std::sync::Arc::new(AtomicU64::new(0));
+        let run = run_hung_fixture(
+            hung_fixture_command("blocked", &socket, Duration::ZERO, true),
+            root.path(),
+            std::sync::Arc::clone(&host),
+            std::sync::Arc::clone(&red_alive),
+            std::sync::Arc::clone(&red_calls),
+            true,
+        );
+        assert!(!run.ok && run.hung.is_none(), "{run:?}");
+        assert!(
+            run.spawn_error
+                .as_deref()
+                .is_some_and(|why| why.contains("cannot monitor")
+                    && why.contains("injected live-capture open failure")),
+            "{run:?}"
+        );
+        assert!(run.output.contains("NOT RUN"), "{}", run.output);
+        assert_eq!(host.sample_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(red_calls.load(Ordering::SeqCst), 0);
+        assert!(!red_alive.load(Ordering::SeqCst));
+    }
+
+    /// CPU by the binary itself, and CPU by a descendant while the binary waits, both keep it
+    /// live. The descendant control keeps the root counter flat. NEGATIVE CONTROL: if either
+    /// progress generation were ignored, the zero evidence window would sample and kill it.
+    #[cfg(unix)]
+    #[test]
+    fn cpu_by_a_test_binary_or_its_busy_child_prevents_a_hung_red() {
+        for (mode, kind) in [
+            ("busy-parent", ProgressKind::Leader),
+            ("busy-child", ProgressKind::Descendant),
+        ] {
+            let root = aterm_tempfile::tempdir().expect("fixture root");
+            let socket = root.path().join("fixture.sock");
+            let host = std::sync::Arc::new(ProgressHost::new(kind, socket.clone()));
+            let red_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let red_calls = std::sync::Arc::new(AtomicU64::new(0));
+            let run = run_hung_fixture(
+                hung_fixture_command(mode, &socket, Duration::ZERO, false),
+                root.path(),
+                std::sync::Arc::clone(&host),
+                std::sync::Arc::clone(&red_alive),
+                std::sync::Arc::clone(&red_calls),
+                false,
+            );
+            assert!(run.ok && run.hung.is_none(), "{mode}: {run:?}");
+            assert_eq!(host.sample_calls.load(Ordering::SeqCst), 0, "{mode}");
+            assert_eq!(red_calls.load(Ordering::SeqCst), 0, "{mode}");
+            assert!(!red_alive.load(Ordering::SeqCst), "{mode}");
+        }
+    }
+
+    /// A tentative no-progress finding is not a verdict: sampling makes CPU progress available
+    /// while ordinary reads deliberately retain either a cached zero-CPU view or an unread view.
+    /// Only the independent post-sample sweep observes progress and releases the blocked binary
+    /// before any kill or red. NEGATIVE CONTROLS: using the cadence cache for confirmation makes
+    /// the first binary HUNG; letting an unread cached view erase the pre-sample baseline makes
+    /// the second HUNG. The discarded samples are removed, while each shared run-owned directory
+    /// stays available to another binary that may already be preparing its own sample.
+    #[cfg(unix)]
+    #[test]
+    fn progress_during_the_stack_sample_cancels_the_hung_finding() {
+        for (cache, kind) in [
+            ("stale zero", ProgressKind::ResumeAfterSample),
+            ("unread", ProgressKind::UnreadCacheAfterSample),
+        ] {
+            let root = aterm_tempfile::tempdir().expect("fixture root");
+            let socket = root.path().join("fixture.sock");
+            let samples = root.path().join("hung-samples");
+            let host = std::sync::Arc::new(ProgressHost::new(kind, socket.clone()));
+            let red_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let red_calls = std::sync::Arc::new(AtomicU64::new(0));
+            let run = run_hung_fixture(
+                hung_fixture_command("resume", &socket, Duration::ZERO, true),
+                root.path(),
+                std::sync::Arc::clone(&host),
+                std::sync::Arc::clone(&red_alive),
+                std::sync::Arc::clone(&red_calls),
+                false,
+            );
+            assert!(run.ok && run.hung.is_none(), "{cache}: {run:?}");
+            assert_eq!(host.sample_calls.load(Ordering::SeqCst), 1, "{cache}");
+            assert_eq!(
+                host.fresh_reads.load(Ordering::SeqCst),
+                1,
+                "{cache}: confirmation must bypass the shared process-table cache exactly once"
+            );
+            assert!(
+                samples.is_dir(),
+                "{cache}: the shared sample directory remains available"
+            );
+            assert_eq!(
+                std::fs::read_dir(&samples)
+                    .expect("retained sample directory")
+                    .count(),
+                0,
+                "{cache}: only this canceled report was discarded"
+            );
+            assert_eq!(red_calls.load(Ordering::SeqCst), 0, "{cache}");
+            assert!(!red_alive.load(Ordering::SeqCst), "{cache}");
+        }
+    }
+
+    /// A native sampler can fail after reserving and partly writing its private report. That
+    /// diagnostic belongs to the hung red rather than being orphaned. NEGATIVE CONTROL: the
+    /// injected sampler returns an error as well as the report; either half being discarded makes
+    /// the assertions fail.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_sampler_retains_and_names_its_partial_report() {
+        let root = aterm_tempfile::tempdir().expect("fixture root");
+        let socket = root.path().join("fixture.sock");
+        let samples = root.path().join("hung-samples");
+        let host =
+            std::sync::Arc::new(ProgressHost::new(ProgressKind::SampleError, socket.clone()));
+        let red_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let red_calls = std::sync::Arc::new(AtomicU64::new(0));
+        let run = run_hung_fixture(
+            hung_fixture_command("blocked", &socket, Duration::ZERO, true),
+            root.path(),
+            std::sync::Arc::clone(&host),
+            std::sync::Arc::clone(&red_alive),
+            std::sync::Arc::clone(&red_calls),
+            false,
+        );
+        let hung = run.hung.as_ref().expect("a named hung red");
+        let report = hung
+            .sample
+            .report
+            .as_ref()
+            .expect("the partial sample report");
+        assert!(
+            report.starts_with(&samples) && report.is_file(),
+            "{report:?}"
+        );
+        assert_eq!(
+            hung.sample.error.as_deref(),
+            Some("injected sampler failure after writing the report")
+        );
+        assert!(
+            run.output.contains("partial stack sample")
+                && run.output.contains("collection failed")
+                && run.output.contains(&report.display().to_string()),
+            "{}",
+            run.output
+        );
+        assert_eq!(host.sample_calls.load(Ordering::SeqCst), 1);
+        assert!(host.sampled_alive.load(Ordering::SeqCst));
+        assert_eq!(red_calls.load(Ordering::SeqCst), 1);
+        assert!(red_alive.load(Ordering::SeqCst));
+    }
+
     /// The arithmetic of a span of reads ([`CoreWaitSpan::book`]), 500 ms apart on 18 cores.
     /// - One thread given 5% whose time the kernel books every fourth read, in a lump: each lump
     ///   moves all 1.9 s it waited, and the reads between move nothing. Negative control: judged
@@ -5586,6 +7272,164 @@ mod tests {
         let ceiling = Duration::from_millis(50);
         let hung = bounded(Some(ceiling), move || never.recv().ok());
         assert_eq!(hung, Err(Unfinished::TimedOut(ceiling)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_child_stand_in() {
+        let Some(dir) = std::env::var_os("ATERM_VERIFY_EVIDENCE_CHILD") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        if std::env::var("ATERM_VERIFY_EVIDENCE_PREFIX").as_deref() == Ok("1") {
+            std::io::stdout().write_all(&vec![b'x'; 33 << 20]).unwrap();
+        }
+        // Single-threaded libtest leaves its human case prefix unterminated.
+        // Start this fixture's synthetic JSON stream on its own line.
+        println!();
+        println!(
+            "{}",
+            aterm_json::json!({"type":"test", "event":"started", "name":"observed-outer"})
+        );
+        println!(
+            "{}",
+            aterm_json::json!({"type":"test", "event":"failed", "name":"observed-outer", "stdout":"thread 'outer' panicked at src/owned.rs:7:9:\nowned diagnostic"})
+        );
+        std::io::stdout().flush().unwrap();
+        std::fs::write(dir.join("ready"), b"ready").unwrap();
+        let until = Instant::now() + Duration::from_secs(60);
+        while !dir.join("release").exists() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            dir.join("release").exists(),
+            "owned evidence wait was never released"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_case_evidence_is_durable_while_its_owned_child_is_still_held() {
+        for late in [false, true] {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let events_path = dir.path().join("events");
+            let events = crate::event_log::EventLog::open(&events_path).unwrap();
+            let mut cmd = Cmd::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "exec::tests::evidence_child_stand_in",
+                    "--nocapture",
+                ])
+                .env("ATERM_VERIFY_EVIDENCE_CHILD", dir.path().as_os_str())
+                .env("ATERM_VERIFY_EVIDENCE_PREFIX", if late { "1" } else { "0" });
+            cmd.test_cases = Some(CaseWatch {
+                spec: "owned-test".into(),
+                binary: "owned-evidence-child".into(),
+                hang_after: TEST_BINARY_HANG,
+                json: true,
+                stop_at_red: false,
+            });
+            let (run, early) = std::thread::scope(|scope| {
+                let run = scope.spawn(|| {
+                    run(
+                        &cmd,
+                        ExecEnv {
+                            events: Some(&events),
+                            ..ceiled(dir.path(), None)
+                        },
+                    )
+                });
+                let until = Instant::now() + Duration::from_secs(60);
+                let early = loop {
+                    let text = std::fs::read_to_string(&events_path).unwrap_or_default();
+                    if (text.contains("test-case-failed") && dir.path().join("ready").exists())
+                        || Instant::now() >= until
+                    {
+                        break text;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                let held = dir.path().join("ready").exists() && !run.is_finished();
+                // Release and join before assertions, including the old stderr-only negative.
+                std::fs::write(dir.path().join("release"), b"release").unwrap();
+                (run.join().unwrap(), (held, early))
+            });
+            assert!(early.0, "child must still own its explicit wait");
+            let event = crate::libtest_json::line_event(&early.1);
+            assert!(event.is_none(), "verify events are not libtest events");
+            let value: aterm_json::Value =
+                aterm_json::from_str(early.1.trim().strip_prefix("verify-event: ").unwrap())
+                    .unwrap();
+            assert_eq!(value["case"].as_str(), Some("observed-outer"));
+            assert!(
+                value["output"]
+                    .as_str()
+                    .unwrap()
+                    .contains("src/owned.rs:7:9")
+            );
+            assert_eq!(value["halts"].as_bool(), Some(false));
+            assert!(run.ok, "observation does not change an actual zero exit");
+            assert!(run.stopped_at.is_none());
+            assert_eq!(
+                run.case_observations.unwrap().failures[0].case,
+                "observed-outer"
+            );
+        }
+    }
+
+    #[test]
+    /// A completed stream's final poll reports its failure without granting it permission to stop
+    /// anything. NEGATIVE CONTROLS: an empty stream and a failed event without its preceding start
+    /// emit nothing. Direct fixture bytes keep this parser test independent of nested libtest's
+    /// stdout/stderr write order.
+    fn a_completed_failure_is_observed_without_forcing_a_stop() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture");
+        let mut capture = create_stage_log(&path).unwrap();
+        let events_path = dir.path().join("events");
+        let events = crate::event_log::EventLog::open(&events_path).unwrap();
+        let mut cases = test_progress::LiveCases::open(&path, true).unwrap();
+        let watch = CaseWatch {
+            spec: "completed".into(),
+            binary: "completed-fixture".into(),
+            hang_after: TEST_BINARY_HANG,
+            json: true,
+            stop_at_red: true,
+        };
+
+        observe_reaped(&mut cases, &watch, Some(&events), Duration::ZERO);
+        assert_eq!(std::fs::read_to_string(&events_path).unwrap(), "");
+
+        let failed = aterm_json::json!({
+            "type":"test", "event":"failed", "name":"observed-outer",
+            "stdout":"thread 'outer' panicked at src/owned.rs:7:9:\nowned diagnostic"
+        });
+        writeln!(capture, "{failed}").unwrap();
+        capture.flush().unwrap();
+        observe_reaped(&mut cases, &watch, Some(&events), Duration::ZERO);
+        assert_eq!(std::fs::read_to_string(&events_path).unwrap(), "");
+
+        writeln!(
+            capture,
+            "{}",
+            aterm_json::json!({"type":"test", "event":"started", "name":"observed-outer"})
+        )
+        .unwrap();
+        writeln!(capture, "{failed}").unwrap();
+        capture.flush().unwrap();
+        observe_reaped(&mut cases, &watch, Some(&events), Duration::ZERO);
+        let text = std::fs::read_to_string(events_path).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        let event: aterm_json::Value =
+            aterm_json::from_str(text.trim().strip_prefix("verify-event: ").unwrap()).unwrap();
+        assert_eq!(event["case"].as_str(), Some("observed-outer"));
+        assert_eq!(event["halts"].as_bool(), Some(false));
+        assert!(
+            event["output"]
+                .as_str()
+                .unwrap()
+                .contains("owned diagnostic")
+        );
     }
 
     #[cfg(unix)]

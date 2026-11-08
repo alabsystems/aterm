@@ -8,7 +8,7 @@ use super::{Asked, VAULT_INPUT_ENTRIES, asked, inventory, profile, repos};
 use crate::init_observe::Wait;
 use crate::items::Ctx;
 use crate::model::User;
-use crate::port::System;
+use crate::port::{Secret, System};
 use aterm_secrets::{client, need};
 use std::path::Path;
 
@@ -95,6 +95,34 @@ impl RepositorySelection {
         };
         selection.ensure_current(sys)?;
         Ok(Some(selection))
+    }
+
+    fn paired_snapshot(
+        sys: &dyn System,
+        user: &User,
+        token: &Secret,
+        paths: &client::Paths,
+        config: &client::Config,
+    ) -> Result<client::MaterializationSnapshot, String> {
+        client::with_materialization_ready_for_entries(paths, config, &VAULT_INPUT_ENTRIES, || {
+            let source = super::Github {
+                account: String::new(),
+                owner: String::new(),
+                token_file: Path::new(&user.home).join(super::TOKEN_FILE),
+                token_key: None,
+            };
+            let now = super::read_token(sys, user, &source)
+                .map_err(|why| aterm_secrets::Error::new(why.why))?;
+            if now.bytes() != token.bytes() {
+                return Err(aterm_secrets::Error::new(
+                    "the consumer's credential changed",
+                ));
+            }
+            Ok(())
+        })
+        .map_err(|why| why.to_string())?
+        .map(|paired| paired.snapshot)
+        .ok_or_else(|| "the paired credential source is not ready".to_owned())
     }
 
     /// The complete validated selection, not a count of acquired checkouts.
@@ -194,12 +222,56 @@ impl RepositorySelection {
         Ok(true)
     }
 
+    /// A failed network batch may confirm refusal once, using exactly its paired token.
+    /// No successful/healthy path reaches this read and no Git output classifies auth.
+    pub(super) fn recover_refused_credential(
+        sys: &dyn System,
+        user: &User,
+        token: &Secret,
+        current: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<(), String> {
+        let current = || {
+            current()?;
+            if sys.stopped().is_some() || sys.euid() != user.uid || sys.identity()?.user != *user {
+                return Err("repository credential recovery stopped or changed account".to_owned());
+            }
+            Ok(())
+        };
+        current()?;
+        let Some((paths, config)) =
+            Self::configured_source(sys, user).map_err(|block| block.why)?
+        else {
+            return Ok(());
+        };
+        let snapshot = Self::paired_snapshot(sys, user, token, &paths, &config)?;
+        current()?;
+        match super::signs_in_as(sys, user, token) {
+            Ok(None) => {}
+            Ok(Some(_)) | Err(_) => return Ok(()),
+        }
+        current()?;
+        let raised = need::raise_refused_from_snapshot(
+            &paths,
+            need::Want::Gh(need::GhProfile::Dev),
+            need::Purpose::AghDev,
+            &snapshot,
+            || current().map_err(aterm_secrets::Error::new),
+        )
+        .map_err(|why| why.to_string())?;
+        current()?;
+        if raised.state.ended() || raised.state == need::State::AwaitingPerson {
+            return Err(raised.line);
+        }
+        Ok(())
+    }
+
     /// The paired source's actual consumer succeeded; retire or fulfill its existing want.
     /// # Errors
     /// Intent changed or the existing ledger cannot be updated.
     pub(super) fn credential_satisfied(
         &self,
         sys: &dyn System,
+        token: &Secret,
         current: &(dyn Fn() -> Result<(), String> + Sync),
     ) -> Result<(), String> {
         if self.count == 0 {
@@ -207,26 +279,65 @@ impl RepositorySelection {
         }
         current()?;
         self.ensure_current(sys)?;
-        if !need::peek(&self.paths)
-            .map_err(|why| why.to_string())?
-            .iter()
-            .any(|need| {
-                need.want == need::Want::Gh(need::GhProfile::Dev)
-                    && need.purpose == need::Purpose::AghDev
-            })
-        {
+        let existing = need::peek(&self.paths).map_err(|why| why.to_string())?;
+        let Some(existing) = existing.iter().find(|need| {
+            need.want == need::Want::Gh(need::GhProfile::Dev)
+                && need.purpose == need::Purpose::AghDev
+        }) else {
             return Ok(());
+        };
+        let snapshot = Self::paired_snapshot(sys, &self.user, token, &self.paths, &self.config)?;
+        if existing
+            .refused
+            .is_some_and(|floor| snapshot.sequence() <= floor)
+        {
+            return Err("the rejected credential still awaits a later signed vault version".into());
         }
         if self.needs_credential(sys)? {
             return Err(self.waiting());
         }
         current()?;
-        need::satisfied(
-            &self.paths,
-            &need::Want::Gh(need::GhProfile::Dev),
-            need::Purpose::AghDev,
-        )
+        if existing.refused.is_some() {
+            match super::signs_in_as(sys, &self.user, token) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    current()?;
+                    self.ensure_current(sys)?;
+                    let raised = need::raise_refused_from_snapshot(
+                        &self.paths,
+                        existing.want.clone(),
+                        existing.purpose,
+                        &snapshot,
+                        || current().map_err(aterm_secrets::Error::new),
+                    )
+                    .map_err(|why| why.to_string())?;
+                    return Err(format!(
+                        "the provider still rejects this credential; {}",
+                        raised.line
+                    ));
+                }
+                Err(_) => {
+                    return Err(
+                        "provider acceptance of the rejected credential remains unverified".into(),
+                    );
+                }
+            }
+        }
+        current()?;
+        self.ensure_current(sys)?;
+        let accepted = need::acknowledge_from_snapshot(&self.paths, existing, &snapshot, || {
+            current().map_err(aterm_secrets::Error::new)
+        })
         .map_err(|why| why.to_string())?;
+        if let Some(need) = accepted
+            && need.state != need::State::Fulfilled
+            && !need
+                .retired
+                .as_ref()
+                .is_some_and(|retired| retired.reason == need::Reason::NotNeeded)
+        {
+            return Err(need.line);
+        }
         current()?;
         self.ensure_current(sys)
     }

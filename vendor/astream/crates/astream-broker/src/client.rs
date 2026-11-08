@@ -38,6 +38,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// A decoded reply, its broker timestamp and its optional delivery origin.
+type StampedResponse = (Response, Option<u64>, Option<(u64, u64)>);
+
 #[cfg(clean_islands)]
 #[path = "client_island.rs"]
 mod client_island;
@@ -2762,7 +2765,7 @@ impl<S: Read + Write> Client<S> {
 
     /// [`read_response_with_bt`](Self::read_response_with_bt), and on a connection that asked
     /// for origins ([`origin_stamps`](Self::origin_stamps)) the one a `Delivery` carries.
-    fn read_response_stamped(&mut self) -> io::Result<(Response, Option<u64>, Option<(u64, u64)>)> {
+    fn read_response_stamped(&mut self) -> io::Result<StampedResponse> {
         self.in_step()?;
         let frame = if self.rx.is_empty() {
             read_frame(&mut self.stream)

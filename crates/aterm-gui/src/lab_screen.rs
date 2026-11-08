@@ -978,7 +978,7 @@ mod tests {
             .get_or_insert_with(Default::default)
             .stats_bars = Some("off".into());
         let source = crate::network_deck::inactive_snapshot();
-        app.network_source = Some(Arc::new(move || Some(Arc::clone(&source))));
+        app.network_source = Some(Arc::new(move |_| Some(Arc::clone(&source))));
         assert_eq!(app.lab_state_deadline(), None);
         assert_eq!(app.network_state_deadline(), None);
         assert!(app.open_settings_tab_in_window(wid, crate::native_settings::SettingsRoute::Lab));

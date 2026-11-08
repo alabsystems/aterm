@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The account unit's inks (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.2, §4.1): its
-//! name, figure, reset, joins and a projected stop's words on the pane's rule in the glass's
-//! tokens under every palette, and the outlook's bar on the Accounts card under the macOS
-//! accents (`docs/DESIGN-accounts-outlook-2026-10-25.md` §3.4, T20), over every built-in scheme.
+//! The account unit's inks and the Accounts card's (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
+//! §1.2, §1.4, §4.1): the unit's name, figure, reset, joins and a projected stop's words on the
+//! pane's rule, and the card's drawn rows and warn words, each in the glass's tokens under every
+//! palette, over every built-in scheme.
 
 use super::*;
 use crate::autopilot_menu::{MenuRow, NoteTone, PlotCell, PlotInk};
 use crate::native_appearance::{SystemAccent, install_system_accent};
-use aterm_agent::harness::outlook::BarCell;
 use aterm_agent::harness::quota_view::QuotaView;
 use aterm_effects::cli_marks::{ICON_CONTRAST, NAME_CONTRAST};
 use aterm_effects::color_math::contrast_ratio;
@@ -38,24 +37,6 @@ const MAC_ACCENTS: [(&str, [u8; 3]); 8] = [
     ("graphite", [0x8c, 0x8c, 0x8c]),
 ];
 
-/// The accent that stays grey by design: no chroma floor holds for it.
-const GREY_ACCENT: &str = "graphite";
-
-/// The accents whose meter on the card's ground, darker than the pane's on Day, is floored below
-/// the chroma floor: yellow keeps C 0.098 there (a dark ochre that reads at 4.5:1, not the
-/// washed-out mix), while it keeps the floor on the pane's rule.
-const DULL_ON_CARD: [&str; 2] = [GREY_ACCENT, "yellow"];
-
-/// Six cells used, two more by the reset, the tick, one left.
-fn bar() -> [BarCell; 10] {
-    std::array::from_fn(|i| match i {
-        0..6 => BarCell::Used,
-        6..8 => BarCell::More,
-        8 => BarCell::Tick,
-        _ => BarCell::Left,
-    })
-}
-
 /// The account unit with a projected stop (its verdict in the warn ink) or none, as the resolver
 /// hands it.
 fn unit(stop: bool) -> FooterFacts {
@@ -76,30 +57,35 @@ fn unit(stop: bool) -> FooterFacts {
     }
 }
 
-/// A card's bar row and its stop note, every ink the outlook draws on the card.
+/// A card's drawn row and its stop note, every ink the outlook draws on the card: two read
+/// levels, now's `▕`, the projected line, `→` and a name, `┄`, `╳` and `↺`.
 fn card_rows() -> Vec<MenuRow> {
     let cell = |ch: char, ink: PlotInk| PlotCell {
         ch,
         ink,
         busy: false,
     };
-    let mut plot: Vec<PlotCell> = bar()
-        .iter()
-        .map(|c| {
-            let ink = match c {
-                BarCell::Left => PlotInk::Track,
-                _ => PlotInk::Meter,
-            };
-            cell(c.glyph(), ink)
-        })
-        .collect();
-    plot.push(cell(' ', PlotInk::Value));
-    plot.push(cell('\u{2573}', PlotInk::Warn));
+    let plot = vec![
+        cell('\u{2583}', PlotInk::Read),
+        cell('\u{2585}', PlotInk::Read),
+        cell('\u{2595}', PlotInk::Axis),
+        cell('\u{1fb78}', PlotInk::Ahead),
+        cell('\u{1fb76}', PlotInk::Ahead),
+        cell('\u{2192}', PlotInk::Mark),
+        cell('a', PlotInk::Value),
+        cell('\u{2504}', PlotInk::Track),
+        cell('\u{2594}', PlotInk::Ahead),
+        cell('\u{2573}', PlotInk::Warn),
+        cell('\u{21ba}', PlotInk::Mark),
+    ];
     vec![
-        MenuRow::plot(plot, "me: 58% used, about 78% by its reset"),
+        MenuRow::plot(
+            plot,
+            "Work, the last day as read on this Mac and the next 7 days.",
+        ),
         MenuRow::Note {
-            text: "\u{2573}  Stop ~Wed 22:00 \u{2013} Thu 09:00 (11h): every account out".into(),
-            spoken: "A stop is expected from about Wednesday 22:00 to Thursday 09:00, when every account is out.".into(),
+            text: "\u{2573} out ~Wed 22:00\u{2013}Thu 09:00".into(),
+            spoken: "Out from about Wednesday 22:00 until Thursday 09:00.".into(),
             tone: NoteTone::Warn,
         },
     ]
@@ -220,85 +206,208 @@ fn the_units_inks_read_on_every_ground_and_day_stays_vivid() {
     );
 }
 
-/// T20 ON THE ACCOUNTS CARD: over every built-in scheme, with its own accent and each macOS
-/// accent, the card's bar `━ ╍ ┽` takes the meter ink at 4.5:1 or more on the card's ground, its
-/// `─ ┄` the track ink at 3:1, `╳` and a stop's words at 4.5:1; on Aterm Day the meter keeps an
-/// OKLCH chroma of 0.10 or more for every accent but those dull on the card. The card still
-/// reads the system accent (S6 moves it onto the glass's tokens). Negative control: the dashes
-/// mixed toward the ground (`mix(meter, bg, 0.4)`) wash out on Day.
+/// A CARD THAT WEARS THE GLASS STANDS ON THE PANE'S GROUND, AND A STOP ON A WASH OF THE WARN INK
+/// (§1.4, §4.1, review 2026-11-07): over every built-in scheme under Cruise and Land, every cell
+/// of the card inside its border (its words, its rules, its drawn rows) has the pane's ground,
+/// the ground the glass's inks are solved on, so Day's letters are not floored on the band's grey
+/// into olive and brown; a warn cell (`╳`, a lane's out line) alone stands on a wash of the warn
+/// ink, so it reads apart from the projected line's letters even where a letter takes the warn's
+/// hue (Land's orange). With no palette the card keeps the band's grey. Negative controls: the
+/// card on the band's grey under a palette (S6 before this review) misses the pane's ground; a
+/// warn cell with no wash shares the letters' ground.
 #[test]
-fn the_cards_outlook_inks_read_on_every_ground_and_day_stays_vivid() {
-    let rgb = |c: aterm_types::Rgb| [c.r, c.g, c.b];
-    let accents: Vec<(&str, Option<[u8; 3]>)> = std::iter::once(("its own", None))
-        .chain(MAC_ACCENTS.iter().map(|&(name, c)| (name, Some(c))))
-        .collect();
+fn a_glass_card_stands_on_the_panes_ground_and_a_stop_on_a_warn_wash() {
+    use aterm_effects::harness_card::CardPalette;
+    let rect = crate::tab_menu::MenuRect {
+        row: 0,
+        col: 0,
+        w: 40,
+        h: 4,
+    };
     let mut checked = 0usize;
     for name in builtin_names() {
         let Some(scheme) = builtin(name) else {
             continue;
         };
         let theme = aterm_render::Theme::from(&scheme);
-        for &(accent_name, accent) in &accents {
-            install_system_accent(accent.map(|c| SystemAccent {
-                on_dark: c,
-                on_light: c,
-            }));
-            let what = format!("{name}, {accent_name} accent");
-            let vivid = name == "Aterm Day" && accent_name != GREY_ACCENT;
-            let menu = crate::tab_menu::menu_colors(theme);
-            let rect = crate::tab_menu::MenuRect {
-                row: 0,
-                col: 0,
-                w: 40,
-                h: 4,
-            };
-            let rows = card_rows();
-            let painted =
-                crate::autopilot_menu::paint(rect, &rows, Default::default(), None, theme);
-            let card_meter = legible_on(menu.band.accent, menu.card_bg);
-            for cell in &painted[1] {
-                let k = reads(cell.fg, menu.card_bg);
-                match cell.ch {
-                    '\u{2501}' | '\u{254d}' | '\u{253d}' => {
-                        assert!(k >= NAME_CONTRAST, "{what}: card meter {k:.2}:1");
-                        assert_eq!(cell.fg, card_meter, "{what}: the card's bar is the meter");
-                        if vivid && !DULL_ON_CARD.contains(&accent_name) {
-                            let c = chroma(cell.fg);
-                            assert!(c >= 0.10, "{what}: card meter on Day at C {c:.3}");
-                        }
+        let pane = rgb_of(theme.bg);
+        for palette in [CardPalette::Cruise, CardPalette::Land] {
+            let painted = crate::autopilot_menu::paint(
+                rect,
+                &card_rows(),
+                Default::default(),
+                None,
+                theme,
+                Some(palette),
+            );
+            let mut washes = 0;
+            for line in &painted[1..3] {
+                for cell in &line[1..rect.w - 1] {
+                    if cell.ch == '\u{2573}' && line == &painted[1] {
+                        assert_ne!(cell.bg, pane, "{name} {palette:?}: a stop on its wash");
+                        washes += 1;
+                    } else {
+                        assert_eq!(cell.bg, pane, "{name} {palette:?}: {:?}", cell.ch);
                     }
-                    '\u{2500}' | '\u{2504}' => {
-                        assert!(k >= ICON_CONTRAST, "{what}: card track {k:.2}:1");
-                    }
-                    '\u{2573}' => assert!(k >= NAME_CONTRAST, "{what}: card stop {k:.2}:1"),
-                    _ => {}
+                    checked += 1;
                 }
-                checked += 1;
             }
-            let note: String = painted[2].iter().map(|c| c.ch).collect();
-            assert!(note.contains("\u{2573}  Stop ~Wed"), "{what}: {note:?}");
-            for cell in painted[2]
-                .iter()
-                .filter(|c| c.ch != ' ' && c.ch != '\u{2502}')
-            {
-                let k = reads(cell.fg, menu.card_bg);
-                assert!(k >= NAME_CONTRAST, "{what}: card warn words {k:.2}:1");
+            assert_eq!(washes, 1, "{name} {palette:?}");
+        }
+        let plain =
+            crate::autopilot_menu::paint(rect, &card_rows(), Default::default(), None, theme, None);
+        let grey = crate::tab_menu::menu_colors(theme).card_bg;
+        assert!(
+            plain[1][1..rect.w - 1].iter().all(|c| c.bg == grey),
+            "{name}: no palette, the band's grey"
+        );
+    }
+    assert!(checked > 0);
+}
+
+/// T20 ON THE ACCOUNTS CARD: over every built-in scheme, under every palette and none, with its
+/// own accent and each macOS accent, the card's drawn cells wear the glass's tokens on the
+/// card's ground, the pane's own under a palette (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
+/// §1.4, §4.1): a read level its column's mark at 3:1 or more (4.5:1 on paper), the projected
+/// line its column's letter at 4.5:1, `┄` the track at 3:1, `→` and `↺` the lit ink, a stop's
+/// words the warn ink at 4.5:1 and bold, `╳` bold on a wash of a hued warn ink and floored on it
+/// to 4.5:1; on Aterm Day under Cruise and Land the levels and the line keep the vivid law
+/// ([`day_vivid`]). The system accent reads nowhere on the card: every accent paints the same
+/// cells. Negative controls: the accent meter the card wore before (`legible_on(accent,
+/// card_bg)`) is not the column's mark under some accent, and on Day under the graphite accent
+/// it is grey, below the vivid law.
+#[test]
+fn the_cards_outlook_inks_read_on_every_ground_and_day_stays_vivid() {
+    use aterm_effects::glass_inks::{GlassInks, field};
+    use aterm_effects::harness_card::CardPalette;
+    let accents: Vec<(&str, Option<[u8; 3]>)> = std::iter::once(("its own", None))
+        .chain(MAC_ACCENTS.iter().map(|&(name, c)| (name, Some(c))))
+        .collect();
+    let palettes = [
+        Some(CardPalette::Cruise),
+        Some(CardPalette::Land),
+        Some(CardPalette::Off),
+        None,
+    ];
+    let rect = crate::tab_menu::MenuRect {
+        row: 0,
+        col: 0,
+        w: 40,
+        h: 4,
+    };
+    let (mut checked, mut days, mut dull, mut accent_meters) = (0usize, 0usize, 0usize, 0usize);
+    for name in builtin_names() {
+        let Some(scheme) = builtin(name) else {
+            continue;
+        };
+        let theme = aterm_render::Theme::from(&scheme);
+        for palette in palettes {
+            let vivid = name == "Aterm Day"
+                && matches!(palette, Some(CardPalette::Cruise | CardPalette::Land));
+            let mut first: Option<Vec<Vec<RenderCell>>> = None;
+            for &(accent_name, accent) in &accents {
+                install_system_accent(accent.map(|c| SystemAccent {
+                    on_dark: c,
+                    on_light: c,
+                }));
+                let what = format!("{name}, {palette:?}, {accent_name} accent");
+                let menu = match palette {
+                    Some(_) => crate::tab_menu::glass_menu_colors(theme),
+                    None => crate::tab_menu::menu_colors(theme),
+                };
+                let glass = GlassInks::of(
+                    palette,
+                    pack_rgb(menu.card_bg),
+                    theme.fg & 0x00FF_FFFF,
+                    pack_rgb(menu.rule),
+                );
+                let light = !glass.dark();
+                let painted = crate::autopilot_menu::paint(
+                    rect,
+                    &card_rows(),
+                    Default::default(),
+                    None,
+                    theme,
+                    palette,
+                );
+                for (col, cell) in painted[1].iter().enumerate() {
+                    let at = field(col, rect.w);
+                    let k = reads(cell.fg, cell.bg);
+                    let (want, floor, bold) = match cell.ch {
+                        '\u{2583}' | '\u{2585}' => {
+                            let meter = legible_on(menu.band.accent, menu.card_bg);
+                            accent_meters += usize::from(meter != rgb_of(glass.mark(at)));
+                            if vivid {
+                                assert!(day_vivid(pack_rgb(cell.fg)), "{what}: a level on Day");
+                                dull += usize::from(!day_vivid(pack_rgb(meter)));
+                                days += 1;
+                            }
+                            let floor = if light { NAME_CONTRAST } else { ICON_CONTRAST };
+                            (glass.mark(at), floor, false)
+                        }
+                        '\u{1fb78}' | '\u{1fb76}' | '\u{2594}' => {
+                            if vivid {
+                                assert!(day_vivid(pack_rgb(cell.fg)), "{what}: the line on Day");
+                            }
+                            (glass.letter(at), NAME_CONTRAST, false)
+                        }
+                        '\u{2504}' => (glass.track(), ICON_CONTRAST, false),
+                        '\u{2192}' | '\u{21ba}' => (glass.lit(), NAME_CONTRAST, false),
+                        '\u{2573}' => {
+                            // On a wash of the warn ink where it has a hue, floored on it.
+                            let hued = glass.warn() != glass.lit();
+                            let ground = if hued {
+                                crate::chrome_band::mix3(
+                                    menu.card_bg,
+                                    rgb_of(glass.warn()),
+                                    crate::autopilot_menu::WARN_WASH,
+                                )
+                            } else {
+                                menu.card_bg
+                            };
+                            assert_eq!(cell.bg, ground, "{what}: the warn wash");
+                            let ink = aterm_effects::color_math::floor_contrast_keeping_hue(
+                                glass.warn(),
+                                pack_rgb(ground),
+                                NAME_CONTRAST,
+                            );
+                            (ink, NAME_CONTRAST, true)
+                        }
+                        _ => continue,
+                    };
+                    assert_eq!(cell.fg, rgb_of(want), "{what}: {:?} in its token", cell.ch);
+                    assert!(k >= floor, "{what}: {:?} at {k:.2}:1", cell.ch);
+                    assert_eq!(cell.bold, bold, "{what}: {:?} bold", cell.ch);
+                    checked += 1;
+                }
+                let note: String = painted[2].iter().map(|c| c.ch).collect();
+                assert!(note.contains("\u{2573} out ~Wed"), "{what}: {note:?}");
+                for cell in painted[2]
+                    .iter()
+                    .filter(|c| c.ch != ' ' && c.ch != '\u{2502}')
+                {
+                    assert_eq!(cell.fg, rgb_of(glass.warn()), "{what}: the warn words");
+                    assert!(cell.bold, "{what}: the warn words are bold");
+                    let k = reads(cell.fg, menu.card_bg);
+                    assert!(k >= NAME_CONTRAST, "{what}: card warn words {k:.2}:1");
+                }
+                let drawn: Vec<Vec<RenderCell>> = painted[1..3].to_vec();
+                match &first {
+                    None => first = Some(drawn),
+                    Some(own) => assert_eq!(own, &drawn, "{what}: the accent reads on the card"),
+                }
             }
         }
     }
     install_system_accent(None);
     let schemes = builtin_names().len();
-    assert!(checked >= schemes * accents.len(), "{checked} card cells");
-
-    // CONTROL: the washed-out look the owner ruled against (2026-10-17): the dashes mixed toward
-    // Day's ground lose their chroma below the floor.
-    let day = builtin("Aterm Day").expect("a signature theme");
-    let band = crate::chrome_band::band_colors(aterm_render::Theme::from(&day));
-    let ground = rgb(day.background);
-    let washed = mix(legible_on(band.accent, ground), ground, 0.4);
     assert!(
-        chroma(washed) < 0.10,
-        "CONTROL: a mix toward Day's ground at C {:.3}",
-        chroma(washed)
+        checked >= schemes * palettes.len() * accents.len() * 9,
+        "{checked} card cells"
     );
+    assert!(days > 0, "Aterm Day's levels were looked at");
+    // CONTROLS: the accent meter the card wore before S6 is not the glass's mark, and it takes
+    // the washed-out look the owner ruled against (2026-10-17) on Day under a grey accent.
+    assert!(accent_meters > 0, "CONTROL: the accent meter is the mark");
+    assert!(dull > 0, "CONTROL: the accent meter stays vivid on Day");
 }

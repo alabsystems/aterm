@@ -559,7 +559,7 @@ fn fetch_objects(
     path: &Path,
     dependency: &Dependency,
     current: &(dyn Fn() -> Result<(), String> + Sync),
-) -> Result<(), String> {
+) -> Result<(), crate::checkout::AcquisitionFailure> {
     let command = network(sys, user, Some(path), dependency)?
         .budget(BUDGET)
         .args([
@@ -574,9 +574,9 @@ fn fetch_objects(
             &dependency.pin,
         ]);
     current()?;
-    read(
+    crate::checkout::acquisition_read(
         sys,
-        command,
+        &command,
         "cannot fetch the required dependency's recorded commit",
     )?;
     current()?;
@@ -628,7 +628,7 @@ pub(super) fn repair(
     parent: &Path,
     repo: &Repo,
     authorized: &(dyn Fn() -> Result<(), String> + Sync),
-) -> Result<(), String> {
+) -> Result<(), crate::checkout::AcquisitionFailure> {
     if repo.required_submodules.is_empty() {
         return Ok(());
     }
@@ -723,9 +723,9 @@ pub(super) fn repair(
                     .map_err(|_| "cannot publish private required-dependency staging ownership")?;
                 let clone = staging.path().join("repo");
                 current()?;
-                read(
+                crate::checkout::acquisition_read(
                     sys,
-                    network(sys, user, None, &dependency)?
+                    &network(sys, user, None, &dependency)?
                         .budget(BUDGET)
                         .args([
                             "clone",

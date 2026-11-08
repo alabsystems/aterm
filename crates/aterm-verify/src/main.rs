@@ -16,6 +16,12 @@ fn main() -> std::process::ExitCode {
     let raw: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     if raw
         .first()
+        .is_some_and(|a| a == aterm_verify::docdriver::RUNTOOL_FLAG)
+    {
+        std::process::exit(aterm_verify::docdriver::runtool_main(&raw[1..]));
+    }
+    if raw
+        .first()
         .is_some_and(|a| a == aterm_verify::testrun::RECORD_FLAG)
     {
         std::process::exit(aterm_verify::testrun::record_main(&raw[1..]));

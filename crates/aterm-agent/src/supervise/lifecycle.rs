@@ -292,7 +292,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// A watch's first act after its claim: the keyed attention entry a previous supervisor left on the worker (owner `supervisor`) — a watcher that died, the host before a restart — is settled.
+    /// A watch's first act after its claim: the keyed attention entry a previous supervisor left on the worker (owner `supervisor`) — a watcher that died, the host before a restart — is settled, and the needs entry it left is adopted with the set the window's host holds for it ([`Self::adopt_needs`]).
     pub(super) fn reconcile(&mut self, review: &mut dyn Review) -> Result<(), Fail> {
         let read = self.call(&["meta"])?;
         if self.unserved(&read) {
@@ -310,6 +310,7 @@ impl<C: Ctl> Session<'_, C> {
                 .is_some_and(|kinds| kinds_name_owner(kinds, NEEDS_ATTENTION_OWNER))
         {
             self.needs_told = Some(NEEDS_LEFT);
+            self.adopt_needs();
         }
         let shown_owner =
             status_field(&read.stdout, "attention_owner").map(super::super::report::pct_decode);

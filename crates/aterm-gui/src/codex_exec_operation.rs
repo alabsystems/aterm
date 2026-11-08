@@ -323,11 +323,7 @@ pub(super) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
                     op.deadline
                 );
             }
-            op.receipt.phase = codex_renewal::Phase::Committing;
-            op.receipt.launch_attempted = true;
-            let written = codex_rotation::with_selected_writer(&env, &op.receipt, |_, _| {
-                codex_renewal::write_receipt(&env, &op.receipt)
-            });
+            let written = codex_rotation::publish_selected_committing(&env, &mut op.receipt);
             if !matches!(written, Ok(Some(()))) {
                 return format!(
                     "OK codex-exec-handoff state=waiting deadline_us={}\n",

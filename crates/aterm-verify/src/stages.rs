@@ -152,7 +152,8 @@ pub fn test_run_args(scope: &Scope) -> Vec<String> {
 /// The targets both test children select: every target with `test = true` (the libs, the bins and the integration tests that keep the default) and no example ([`test_compile_args`]); the release's compile child adds the measuring benches ([`measuring_bench_args`]).
 pub const TEST_TARGETS: [&str; 1] = ["--tests"];
 
-const MEASURING_TARGETS: [&str; 4] = ["paint", "spin", "aos", "rewind"];
+/// The measuring executables selected by the runner and its content receipts.
+pub const MEASURING_TARGETS: [&str; 4] = ["paint", "spin", "aos", "rewind"];
 
 /// `targo --unverified bench --profile test -p aterm-conformance --no-fail-fast --bench paint --bench spin --bench aos --bench rewind`: the measuring stage's one child, the paint, spin, aos and rewind matrices ([`MEASURING_TARGETS`]) that judge the release bundle's frames, idle wakes, repair main-thread time and Rewind step latency on a live instance.
 #[must_use]
@@ -739,6 +740,7 @@ struct Compile {
     run: exec::Run,
     stdout: Result<String, String>,
     line: String,
+    events: Vec<String>,
 }
 
 /// The step a stage's compile lines name: its report's title up to its first ` (`
@@ -763,11 +765,22 @@ fn run_compile(ctx: &Ctx, step: &str, call: &str, cmd: &Cmd) -> Compile {
         run.usage,
         began.elapsed(),
     );
-    eprintln!("{}", account.event());
+    crate::event_log::emit(ctx.events.as_ref(), &account.event());
+    let events = stdout
+        .as_deref()
+        .map(|output| crate::report::compile_unit_events(call, output))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|event| {
+            let stamped = crate::event_log::emit(ctx.events.as_ref(), &event);
+            stamped.trim_end_matches('\n').to_owned()
+        })
+        .collect();
     Compile {
         run,
         stdout,
         line: format!("  {}", account.line()),
+        events,
     }
 }
 
@@ -794,7 +807,11 @@ fn compile_labeled(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) -> bool {
         mut run,
         stdout,
         line,
+        events,
     } = run_compile(ctx, step_of(r), label, cmd);
+    for event in events {
+        r.raw(event);
+    }
     if let Ok(stdout) = &stdout {
         rejoin(&mut run, crate::compile_account::human(stdout));
     }
@@ -1089,7 +1106,11 @@ fn compile_tests(ctx: &Ctx, r: &mut Report, label: &str, compile: &Cmd) -> Compi
         mut run,
         stdout,
         line,
+        events,
     } = run_compile(ctx, step_of(r), label, compile);
+    for event in events {
+        r.raw(event);
+    }
     let mut stdout = match stdout {
         Ok(stdout) => stdout,
         Err(why) => {
@@ -1100,10 +1121,7 @@ fn compile_tests(ctx: &Ctx, r: &mut Report, label: &str, compile: &Cmd) -> Compi
             return (false, Err(why), Vec::new(), Vec::new());
         }
     };
-    for event in crate::report::compile_unit_events(label, &stdout) {
-        eprintln!("{event}");
-        r.raw(event);
-    }
+
     let artifacts = crate::shape::artifacts(&stdout);
     let script_runs = crate::shape::script_runs(&stdout);
     if run.ok {
@@ -1227,7 +1245,11 @@ fn build_to_drive(
         run: mut build,
         stdout,
         line,
+        events,
     } = run_compile(ctx, step_of(r), &build_label, &main_build_cmd(ctx, args));
+    for event in events {
+        r.raw(event);
+    }
     if build.ok {
         r.raw(line);
         return true;
@@ -1694,10 +1716,39 @@ fn doctests(ctx: &Ctx, r: &mut Report) {
             return;
         }
     };
-    run_tests_labeled(ctx, r, &label, &doctest_cmd(ctx, &driver, &skip));
+    let cmd = match doctest_cmd(ctx, &driver, &skip) {
+        Ok(cmd) => cmd,
+        Err(why) => {
+            r.cannot_run(format!(
+                "{label} — {why}; no doctest binary was run unmonitored"
+            ));
+            return;
+        }
+    };
+    let halt_marker = ctx
+        .halt
+        .armed()
+        .then(|| crate::docdriver::halt_marker(&ctx.scratch));
+    if let Some(path) = &halt_marker
+        && let Err(why) = crate::docdriver::prepare_halt_marker(path)
+    {
+        r.cannot_run(format!(
+            "{label} — cannot prepare its first-red admission: {why}; no doctest binary was run"
+        ));
+        return;
+    }
+    run_tests_labeled(ctx, r, &label, &cmd);
+    if let Some(path) = halt_marker
+        && let Err(error) = crate::docdriver::remove_halt_marker(&path)
+    {
+        r.raw(format!(
+            "aterm-verify: could not remove doctest first-red protocol {}: {error}",
+            path.display()
+        ));
+    }
 }
 
-fn doctest_cmd(ctx: &Ctx, driver: &DocDriver, skip: &[String]) -> Cmd {
+fn doctest_cmd(ctx: &Ctx, driver: &DocDriver, skip: &[String]) -> Result<Cmd, String> {
     let cmd = crate::release_test_env::command(
         ctx,
         with_checkers(
@@ -1707,21 +1758,38 @@ fn doctest_cmd(ctx: &Ctx, driver: &DocDriver, skip: &[String]) -> Cmd {
     );
     let stand_in = ctx
         .test_recorder()
-        .filter(|_| !skip.is_empty())
-        .and_then(|s| Some((s, cargo_doc_driver(ctx, driver)?)));
-    let Some((stand_in, real)) = stand_in else {
-        return match driver {
-            DocDriver::Stage2 => with_trustdoc(ctx, cmd),
-            DocDriver::Ambient => with_ambient_rustdoc(ctx, cmd),
-            _ => cmd,
-        };
-    };
-    cmd.env("RUSTDOC", stand_in)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| "cannot resolve verify's absolute doctest runtool".to_owned())?;
+    let real = cargo_doc_driver(ctx, driver).ok_or_else(|| {
+        "cannot resolve Cargo's exact doc driver to interpose the doctest runtool".to_owned()
+    })?;
+    let mut cmd = cmd
+        .remove_env(crate::docdriver::DRIVER_ENV)
+        .remove_env(crate::docdriver::SKIP_ENV)
+        .remove_env(crate::docdriver::RUNTOOL_ENV)
+        .remove_env(crate::docdriver::RUNTOOL_SCRATCH_ENV)
+        .remove_env(crate::docdriver::RUNTOOL_SAMPLES_ENV)
+        .remove_env(crate::docdriver::RUNTOOL_HALT_ENV)
+        .env("RUSTDOC", &stand_in)
         .env(crate::docdriver::DRIVER_ENV, real)
-        .env(
+        .env(crate::docdriver::RUNTOOL_ENV, &stand_in)
+        .env(crate::docdriver::RUNTOOL_SCRATCH_ENV, &ctx.scratch);
+    if ctx.halt.armed() {
+        cmd = cmd.env(
+            crate::docdriver::RUNTOOL_HALT_ENV,
+            crate::docdriver::halt_marker(&ctx.scratch),
+        );
+    }
+    if let Some(samples) = &ctx.hang_samples {
+        cmd = cmd.env(crate::docdriver::RUNTOOL_SAMPLES_ENV, samples);
+    }
+    if !skip.is_empty() {
+        cmd = cmd.env(
             crate::docdriver::SKIP_ENV,
             crate::docdriver::skip_list(skip),
-        )
+        );
+    }
+    Ok(cmd)
 }
 
 fn cargo_doc_driver(ctx: &Ctx, driver: &DocDriver) -> Option<std::path::PathBuf> {
@@ -1759,6 +1827,8 @@ fn cargo_doc_driver(ctx: &Ctx, driver: &DocDriver) -> Option<std::path::PathBuf>
         configs_name(&machine, names_rustdoc)
     };
     let file = match driver {
+        // The ordinary command binds this path as `RUSTDOC`; the stand-in replaces that binding,
+        // so this is the exact driver it must exec rather than another `trustdoc` on PATH.
         DocDriver::Stage2 => Some(ctx.tools.trustdoc.clone()),
         DocDriver::Ambient => match ctx.env.rustdoc_override.as_deref() {
             Some(value) if !value.is_empty() => {
@@ -2158,7 +2228,7 @@ fn spec_checkers(ctx: &Ctx, r: &mut Report) {
 }
 
 /// Did a passing test run not run [`crate::checks::GOLDEN`]'s test? A release's run reads this over
-/// every binary's output ([`crate::testrun::run_tests`], the serial fallback included): no frame
+/// every recorded binary's output ([`crate::testrun::run_tests`]): no frame
 /// was then held to its twin. In a passing run a test libtest names and did not ignore passed, and
 /// its `ok` need not share the line: this test writes to stderr past libtest's capture, so one
 /// libtest thread ends its name's line with that, and the `ok` comes on a line of its own. Nor need
@@ -3296,7 +3366,9 @@ mod tests {
     #[test]
     fn libc_oracle_reads_the_gates_verdict_before_the_machine() {
         let run = |code: Option<i32>, output: &str| exec::Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok: code == Some(0),
             output: output.to_string(),
             code,
@@ -3322,6 +3394,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_machine_with_no_doc_driver_anywhere_is_diagnosed_on_the_doctests_row() {
         let spec = |id| StageSpec {
@@ -3346,16 +3419,23 @@ mod tests {
             "/// ```\n/// assert!(true);\n/// ```\npub fn f() {}\n",
         )
         .unwrap();
-        #[cfg(unix)]
-        let ok_targo = PathBuf::from("/usr/bin/true");
-        #[cfg(not(unix))]
+        crate::standin_body(
+            &tmp.join("trustc"),
+            "printf 'rustc 1.93.0 (trust)\\nbinary: rustc\\nhost: aarch64-apple-darwin\\nrelease: \
+             1\\n'",
+        );
         let ok_targo = {
-            let p = tmp.join("true.cmd");
-            std::fs::write(&p, "@exit /b 0\r\n").unwrap();
+            let p = tmp.join("targo");
+            crate::standin_body(
+                &p,
+                "case \"$*\" in\n  *config*get*build.target*)\n    echo 'error: config value \
+                 `build.target` is not set' >&2\n    exit 101 ;;\nesac\nexit 0",
+            );
             p
         };
         let no_driver = |scope| {
             let mut c = ctx(scope);
+            c.tools.stage2_dir = tmp.clone();
             c.tools.targo = ok_targo.clone();
             c.tools.trustdoc = PathBuf::from("/nonexistent/trustdoc");
             c.path_env = "/nonexistent-dir".into();
@@ -3451,7 +3531,7 @@ mod tests {
             let mut c = ctx(scope);
             c.tools.trustdoc = PathBuf::from("/stage2/trustdoc");
             for skip in [&[][..], &["plain".to_string()][..]] {
-                let cmd = doctest_cmd(&c, &DocDriver::Stage2, skip);
+                let cmd = doctest_cmd(&c, &DocDriver::Stage2, skip).expect("an exact driver");
                 let unified = aterm_toolchain::build_cache::with_test_graph(&doc);
                 assert!(
                     cmd.args.ends_with(
@@ -3540,6 +3620,9 @@ mod tests {
         c.root = temp.path().to_owned();
         c.scratch = temp.path().join("scratch");
         std::fs::create_dir_all(&c.scratch).unwrap();
+        let trustdoc = temp.path().join("stage2/trustdoc");
+        crate::standin_body(&trustdoc, "exit 0");
+        c.tools.trustdoc = trustdoc.clone();
         if std::env::var_os(PROBE).is_some() {
             for key in [
                 aterm_capacity::RELEASE_RUN_ENV,
@@ -3582,8 +3665,10 @@ mod tests {
         let out = exec::run(&child, c.exec_env());
         assert!(out.ok && out.output.contains("1 passed"), "{}", out.output);
 
-        let release = ctx(Scope::workspace()).with_release(true);
-        let as_release = ctx(Scope::workspace()).with_checkers_in_tests(true);
+        let mut release = ctx(Scope::workspace()).with_release(true);
+        release.tools.trustdoc = trustdoc.clone();
+        let mut as_release = ctx(Scope::workspace()).with_checkers_in_tests(true);
+        as_release.tools.trustdoc = trustdoc;
         for context in [&c, &release, &as_release] {
             let [compile, run] = test_cmds(context, false);
             let shaped_compile = test_compile_cmd(
@@ -3611,14 +3696,14 @@ mod tests {
             assert_eq!(run.exact_env, context.checkers_in_tests);
             assert_eq!(
                 env_of(
-                    &doctest_cmd(context, &DocDriver::BarePath, &[]),
+                    &doctest_cmd(context, &DocDriver::Stage2, &[]).expect("the stage2 doc driver"),
                     aterm_capacity::RELEASE_RUN_ENV
                 ),
                 marker
             );
             assert_eq!(
                 env_of(
-                    &doctest_cmd(context, &DocDriver::BarePath, &[]),
+                    &doctest_cmd(context, &DocDriver::Stage2, &[]).expect("the stage2 doc driver"),
                     CHECKERS_ENV
                 ),
                 want
@@ -3691,7 +3776,7 @@ mod tests {
         c = c.with_checkers_in_tests(true);
         let skip = ["other".to_string(), "plain".to_string()];
         for (kind, real) in [(DocDriver::Stage2, &stage2), (DocDriver::Ambient, &caller)] {
-            let cmd = doctest_cmd(&c, &kind, &skip);
+            let cmd = doctest_cmd(&c, &kind, &skip).expect("an exact driver");
             assert_eq!(
                 env_of(&cmd, "RUSTDOC"),
                 Some(recorder.clone().into_os_string()),
@@ -3707,15 +3792,36 @@ mod tests {
                 Some("other,plain".into()),
                 "{kind:?}"
             );
-            let cmd = doctest_cmd(&c, &kind, &[]);
-            assert_eq!(env_of(&cmd, driver), None, "{kind:?}");
+            let cmd = doctest_cmd(&c, &kind, &[]).expect("an exact driver");
+            assert_eq!(
+                env_of(&cmd, driver),
+                Some(real.clone().into_os_string()),
+                "{kind:?}"
+            );
             assert_eq!(env_of(&cmd, skip_env), None, "{kind:?}");
-            let bound = match kind {
-                DocDriver::Stage2 => Some(stage2.clone().into_os_string()),
-                DocDriver::Ambient => Some(caller.clone().into_os_string()),
-                _ => None,
-            };
-            assert_eq!(env_of(&cmd, "RUSTDOC"), bound, "{kind:?}");
+            assert_eq!(
+                env_of(&cmd, "RUSTDOC"),
+                Some(recorder.clone().into_os_string()),
+                "{kind:?}"
+            );
+            assert_eq!(
+                env_of(&cmd, crate::docdriver::RUNTOOL_ENV),
+                Some(recorder.clone().into_os_string()),
+                "{kind:?}"
+            );
+            for inherited in [
+                crate::docdriver::DRIVER_ENV,
+                crate::docdriver::SKIP_ENV,
+                crate::docdriver::RUNTOOL_ENV,
+                crate::docdriver::RUNTOOL_SCRATCH_ENV,
+                crate::docdriver::RUNTOOL_SAMPLES_ENV,
+                crate::docdriver::RUNTOOL_HALT_ENV,
+            ] {
+                assert!(
+                    cmd.remove_envs.iter().any(|name| name == inherited),
+                    "{kind:?} did not scrub inherited {inherited}"
+                );
+            }
         }
         let compile = test_compile_cmd(&c, false, test_compile_args(&c.scope));
         assert!(compile.exact_env);
@@ -3758,7 +3864,8 @@ mod tests {
             resolved(&c, DocDriver::BarePath),
             Some(build.join("trustdoc"))
         );
-        let cmd = doctest_cmd(&c, &DocDriver::BarePath, &["plain".to_string()]);
+        let cmd = doctest_cmd(&c, &DocDriver::BarePath, &["plain".to_string()])
+            .expect("the resolved driver");
         assert_eq!(env_of(&cmd, "RUSTDOC"), Some("/bin/aterm-verify".into()));
         assert_eq!(
             env_of(&cmd, crate::docdriver::DRIVER_ENV),
@@ -3811,8 +3918,10 @@ mod tests {
             resolved(&c, DocDriver::Ambient),
             Some(PathBuf::from("/caller/rustdoc"))
         );
-        let cmd = doctest_cmd(&c, &DocDriver::BarePath, &["plain".to_string()]);
-        assert_eq!(env_of(&cmd, "RUSTDOC"), None);
+        assert!(
+            doctest_cmd(&c, &DocDriver::BarePath, &["plain".to_string()]).is_err(),
+            "a configured driver verify cannot resolve is refused"
+        );
         c.root = repo;
         c.env.rustdoc_override = Some("".into());
         std::fs::remove_file(build.join("trustdoc")).expect("rm");
@@ -3823,10 +3932,10 @@ mod tests {
         );
         c.path_env = links.into_os_string();
         assert_eq!(resolved(&c, DocDriver::BarePath), None);
-        let cmd = doctest_cmd(&c, &DocDriver::BarePath, &["plain".to_string()]);
-        assert_eq!(env_of(&cmd, "RUSTDOC"), None);
-        assert_eq!(env_of(&cmd, crate::docdriver::DRIVER_ENV), None);
-        assert_eq!(env_of(&cmd, crate::docdriver::SKIP_ENV), None);
+        assert!(
+            doctest_cmd(&c, &DocDriver::BarePath, &["plain".to_string()]).is_err(),
+            "an unresolved driver is refused rather than run unmonitored"
+        );
         assert_eq!(resolved(&c, DocDriver::Absent), None);
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -4075,7 +4184,9 @@ mod tests {
                 output.push_str(&format!("test {t} ... ok\n"));
             }
             exec::Run {
+                case_observations: None,
                 stopped_at: None,
+                hung: None,
                 ok,
                 output,
                 code: Some(i32::from(!ok)),
@@ -5005,7 +5116,9 @@ mod tests {
         let release = spec_check_cmd(&ctx(Scope::workspace()).with_release(true));
         assert_eq!(tail(&release), ["spec-check", "--", "--full"]);
         let run = |code: Option<i32>, output: &str| exec::Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok: code == Some(0),
             output: output.to_string(),
             code,
@@ -5339,7 +5452,9 @@ mod tests {
     /// Every ladder row `decide_measuring_child` records for `output`.
     fn decide_measured(ok: bool, output: String, subject: &Subject) -> Vec<(Outcome, String)> {
         let run = exec::Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok,
             output,
             code: Some(if ok { 0 } else { 101 }),
@@ -5703,7 +5818,9 @@ mod tests {
         }
 
         let killed = exec::Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok: false,
             output: alone,
             code: None,
@@ -5788,7 +5905,11 @@ mod tests {
         let mut c = ctx(Scope::crate_only("x"));
         c.main_build_dir = Some("build.build-dir='/cache'".to_string());
         let [compile, run] = test_cmds(&c, false);
-        let recording = crate::testrun::recording_cmd(&run, "target.'cfg(all())'.runner=[\"r\"]");
+        let recording = crate::testrun::recording_cmd(
+            &run,
+            "target.aarch64-apple-darwin.runner=[\"r\"]",
+            "aarch64-apple-darwin",
+        );
         let flag = aterm_toolchain::build_cache::TEST_GRAPH_FLAG;
         for cmd in [compile, run, recording, spec_check_cmd(&c)] {
             let argv = cmd.argv();

@@ -13533,6 +13533,8 @@ pub struct TurnEndState {
     login_seed: Option<Instant>,
     login_retaken: bool,
     yield_seed: Option<YieldSeed>,
+    /// The needs set a loop before this one typed the ack for ([`Self::seed_needs_acked`]).
+    acked_seed: u64,
     left_judged: bool,
     point_last: bool,
     ran: bool,
@@ -13734,6 +13736,7 @@ impl TurnEndState {
             login_seed: None,
             login_retaken: false,
             yield_seed: None,
+            acked_seed: 0,
             left_judged: false,
             point_last: true,
             ran: false,
@@ -15341,6 +15344,41 @@ impl TurnEndState {
     #[must_use]
     pub const fn needs_key(&self) -> u64 {
         self.needs.key
+    }
+
+    /// A LOOP BEFORE THIS ONE LEFT `needs` STANDING at a handover, as the window was told them
+    /// ([`crate::supervise::IdleHost::needs_told`]): they stand, and the menu bar shows them, as
+    /// its last tell named them, and the ack is owed for them again unless its books show an act
+    /// typed it ([`Self::seed_needs_acked`]).
+    pub fn seed_needs(&mut self, needs: &[String]) {
+        let key = needs::needs_key(needs);
+        self.needs = Needs {
+            standing: needs.to_vec(),
+            key,
+            acked: (key != 0 && self.acked_seed == key).then_some(key),
+            ..Needs::default()
+        };
+        self.needs.reshow();
+    }
+
+    /// THE NEEDS SET WHOSE ACK A LOOP BEFORE THIS ONE TYPED, as its books' note says
+    /// ([`Self::needs_acked`]; `0` for none): a set adopted from the window that is the one owes
+    /// no ack again ([`Self::seed_needs`]).
+    pub const fn seed_needs_acked(&mut self, key: u64) {
+        self.acked_seed = key;
+    }
+
+    /// The key of the needs whose ack an act typed ([`NEEDS_ACK`]): the set
+    /// [`Self::needs_ack_owed`] judges, while no ack is owed for it; `0` while none stands or its
+    /// ack is owed.
+    #[must_use]
+    pub fn needs_acked(&self) -> u64 {
+        let held = self.needs.answered_unnamed();
+        let key = needs::needs_key(&self.needs.less(&[held.as_slice()]));
+        self.needs
+            .acked
+            .filter(|&acked| key != 0 && acked == key)
+            .unwrap_or(0)
     }
 
     /// A NEW SET OF NEEDS STANDS UNACKED: the needs an act other than the go-ahead leaves on the
@@ -18875,8 +18913,16 @@ impl TurnEndState {
                 // Someone else's turn on someone's prompt (`prompted`): the
                 // person answered what stood. A turn nobody asked — Claude
                 // Code's own wake, the vendor's continuation of a limit —
-                // answered nothing. A turn a wall cut takes nothing down.
-                if !walled && awaited.is_none() && reading.worked.is_some() && prompted {
+                // answered nothing, and nor did the turn on the act the loop
+                // before this one typed (seeded), whose prompt reads as new
+                // to a loop that never typed it: there only the person's keys
+                // make the turn theirs. A turn a wall cut takes nothing down.
+                if !walled
+                    && awaited.is_none()
+                    && reading.worked.is_some()
+                    && prompted
+                    && (hand || seeded_yield.is_none())
+                {
                     self.needs = Needs::default();
                 }
                 let act = self.act_words.clone().filter(|_| reading.opens_cut);

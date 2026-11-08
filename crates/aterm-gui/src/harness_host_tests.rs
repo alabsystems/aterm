@@ -7976,6 +7976,7 @@ impl Acting {
                     a27.tasks_exited.lock().unwrap().push(sid.to_string());
                 }),
                 standing_limit: Arc::new(|_, _| None),
+                needs_told: Arc::new(|_| None),
                 account_wall: Arc::new(|_, _, _| ("inert", None)),
                 accounts_upkeep: AccountsUpkeep::Inert,
                 account_usage: Arc::new(|_, _, _, _, _| "inert"),

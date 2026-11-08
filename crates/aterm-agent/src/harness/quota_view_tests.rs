@@ -82,6 +82,64 @@ fn five_wall() -> Fx {
     fx
 }
 
+/// Case (b) as [`five_wall`], its 5-hour window read too (30% two hours ago, full now), so a
+/// working pass runs: it begins with the wait itself, and at 35% an hour the next window walls
+/// again within hours.
+fn five_wall_working() -> Fx {
+    let mut fx = case_b();
+    fx.fig(
+        "main",
+        T5 - 2 * H,
+        Some((300, T5 + 2 * H)),
+        Some((600, SAT7)),
+    );
+    fx.read("main", Some((1000, T5 + 2 * H)), Some((630, SAT7)), T5);
+    accounts::note_wall(
+        &mut fx.state,
+        "main",
+        accounts::SESSION_LIMIT,
+        Some(T5 + 2 * H),
+        T5,
+        T5,
+    );
+    fx
+}
+
+/// `me` alone, its week an hour old (its pace refused, `no pace yet`), walled now on its 5-hour
+/// window, which resets at 21:30: nothing is projected, and the work waits.
+fn early_wall() -> Fx {
+    let mut fx = Fx::new(&[("me", Class::Preferred)]);
+    let reset = NOW + 7 * D - H;
+    fx.fig("me", NOW - 40 * MIN, None, Some((10, reset)));
+    fx.read("me", None, Some((30, reset)), NOW);
+    accounts::note_wall(
+        &mut fx.state,
+        "me",
+        accounts::SESSION_LIMIT,
+        Some(NOW + 2 * H),
+        NOW,
+        NOW,
+    );
+    fx
+}
+
+/// Scenario D with a pool row, `pool1`, read at 99.9% of its week five hours ago: at alt1's
+/// 5-hour wall the working pass leans on pool1, and both branches stop, so the stop stands
+/// whatever pool1 holds (`Verdict::Stop { pass: Working, lean: Some("pool1") }`); it lies in the
+/// lean's worst branch, not among the working pass's own stops.
+fn working_lean_stops() -> Fx {
+    let mut fx = scenario_d();
+    fx.roster.rows.push(accounts::Row {
+        label: "pool1".into(),
+        class: Class::Pool,
+        dir: Some("/logins/pool1".into()),
+        ..accounts::Row::default()
+    });
+    fx.enrolled.insert("pool1".into());
+    fx.read("pool1", None, Some((999, SAT8)), NOW - 5 * H);
+    fx
+}
+
 /// `me`'s week began an hour ago, read for 40 minutes (the outlook tests' too-early case), so
 /// its pace is refused (`no pace yet`); `alt1` is read now.
 fn too_early() -> Fx {
@@ -106,9 +164,10 @@ fn long_label() -> Fx {
 }
 
 /// Every scenario, named, with its outlook and its tab: the design's four cases, a gap, a lean,
-/// a 5-hour stop, a lean whose worst case stops, one whose both branches stop, credits, a wall
-/// on either tab, a wall the work moves off, a 5-hour wall, a refused pace on either tab, and a
-/// label longer than a name.
+/// a 5-hour stop, a lean whose worst case stops, one whose both branches stop (in the week pass
+/// and in the working pass), credits, a wall on either tab, a wall the work moves off, a 5-hour
+/// wall (with no working pass, with one, and under a refused pace), a refused pace on either
+/// tab, and a label longer than a name.
 fn outlooks() -> Vec<(&'static str, Outlook, &'static str)> {
     [
         ("a", case_a(), "main"),
@@ -125,6 +184,9 @@ fn outlooks() -> Vec<(&'static str, Outlook, &'static str)> {
         ("wall-alt1", walled(), "alt1"),
         ("moves", moves(), "main"),
         ("five-wall", five_wall(), "main"),
+        ("five-wall-working", five_wall_working(), "main"),
+        ("early-wall", early_wall(), "me"),
+        ("working-lean-stop", working_lean_stops(), "me"),
         ("early", too_early(), "me"),
         ("early-alt1", too_early(), "alt1"),
         ("long", long_label(), LONG),
@@ -723,11 +785,13 @@ fn no_cell_is_full_without_a_read_100_or_a_projected_fill() {
     assert!(!cells(&wall.chart, 12).contains(&Cell::Read(8)));
 }
 
-/// A BURN-UP DRAWS READS AS AREA AND THE REPLAY AS LINE: case (b)'s lane spans main's own week to
-/// its reset: blank before this Mac's first reading, solid steps (`▁…█`) as read, `▕` now, the
-/// projected one-eighth line from the replay's fills to the reset, then `↺` at the right edge;
-/// a walled account's lane is `▔` out to its reset. Negative control: a lane that draws its
-/// past with `Cell::Ahead` fails it.
+/// A BURN-UP DRAWS READS AS AREA AND THE REPLAY AS LINE: case (b)'s lane, on the work row's
+/// clock, holds main's last day as read (solid steps under the lane's ceiling, `▁…▅`), `▕` now,
+/// the projected one-eighth line from the replay's fills (`▁ 🭻…🭸`), then `↺` in the cell its
+/// reset falls in, its last; a walled account's lane is out ([`Cell::Out`]) to its reset. No
+/// cell of either reaches the top quarter of its cell. Negative control: a lane that draws its
+/// past with `Cell::Ahead` fails it; one on the chart's eighths ([`level`]) draws `🭶` before
+/// main's reset.
 #[test]
 fn a_burn_up_draws_reads_as_area_and_the_replay_as_line() {
     let view = case_b().outlook().quota("main", None, true);
@@ -737,43 +801,78 @@ fn a_burn_up_draws_reads_as_area_and_the_replay_as_line() {
     let mut c = Vec::new();
     lane.cells(6, T5, &mut c);
     let now = c.iter().position(|c| *c == Cell::Now).unwrap();
-    assert_eq!(now, 32, "127 h of the week before now, 4 h a cell");
-    assert!(c[..now].contains(&Cell::Blank));
+    assert_eq!(now, 6, "the work row's day before now, 4 h a cell");
     assert!(
-        c[..now]
-            .iter()
-            .all(|c| matches!(c, Cell::Read(_) | Cell::Blank)),
-        "{c:?}"
+        c[..now].iter().all(|c| matches!(c, Cell::Read(_))),
+        "read from a day ago: {c:?}"
     );
-    assert!(c[now - 1] == Cell::Read(5));
+    assert!(c[now - 1] == Cell::Read(lane_level(630)));
     let ahead = &c[now + 1..c.len() - 1];
-    assert_eq!(ahead.len(), 11, "41 h to the reset");
+    assert_eq!(
+        ahead.len(),
+        10,
+        "41 h to the reset: ten cells of line, then the reset's"
+    );
     assert!(ahead.iter().all(|c| matches!(c, Cell::Ahead(_))), "{c:?}");
     assert_eq!(c.last(), Some(&Cell::Reset));
     for cell in &c[..now] {
         let g = cell.glyph();
-        assert!(g == ' ' || ('\u{2581}'..='\u{2588}').contains(&g));
+        assert!(g == ' ' || ('\u{2581}'..='\u{2585}').contains(&g), "{c:?}");
     }
     for cell in ahead {
         let g = cell.glyph();
-        assert!(g == '\u{2581}' || g == '\u{2594}' || ('\u{1fb76}'..='\u{1fb7b}').contains(&g));
+        assert!(
+            g == '\u{2581}' || ('\u{1fb78}'..='\u{1fb7b}').contains(&g),
+            "{c:?}"
+        );
     }
 
     let wall = walled().outlook().quota("main", None, true);
     let lane = &wall.lanes[0];
     lane.cells(6, T5, &mut c);
     let now = c.iter().position(|c| *c == Cell::Now).unwrap();
-    assert!(c[now + 1..c.len() - 1].iter().all(|c| *c == Cell::Ahead(8)));
+    assert!(c[now + 1..c.len() - 1].iter().all(|c| *c == Cell::Out));
+    assert_eq!(Cell::Out.role(), Role::Warn);
+}
+
+/// A LANE KEEPS THE TOP QUARTER OF ITS CELL CLEAR: a lane sits right under its item's words, so
+/// its levels ([`lane_level`]) top out at [`LANE_TOP`], the cell's sixth eighth: a full week read
+/// is `▆` and the line `🭷` at most, which only out ([`Cell::Out`]) reaches, so out stands one
+/// step above every projected level as well as in the warn ink. 63% and 98% stay apart (levels
+/// 3 and 5). Negative control: the chart's eighths ([`level`]) put 98% on `🭶` and a full read on
+/// `█`, both in the top quarter.
+#[test]
+fn a_lane_keeps_the_top_quarter_of_its_cell_clear() {
+    assert_eq!((lane_level(630), lane_level(980)), (3, 5));
+    assert_eq!(
+        (lane_level(0), lane_level(999), lane_level(1000)),
+        (1, 5, LANE_TOP)
+    );
+    let top = ['\u{2594}', '\u{1fb76}', '\u{2587}', '\u{2588}'];
+    for x10 in 0..=1000u16 {
+        let l = lane_level(x10);
+        assert!((1..=LANE_TOP).contains(&l), "{x10}");
+        assert_eq!(
+            l == LANE_TOP,
+            x10 >= 1000,
+            "{x10}: the ceiling is out alone"
+        );
+        for cell in [Cell::Read(l), Cell::Ahead(l)] {
+            assert!(!top.contains(&cell.glyph()), "{x10}: {cell:?}");
+        }
+    }
+    assert_eq!(Cell::Out.glyph(), '\u{1fb77}');
+    assert_eq!(Cell::Read(LANE_TOP).glyph(), '\u{2586}');
 }
 
 /// A RESET PAST A WEEK IS NEVER SAID OR DRAWN: a stored reading keeps the vendor's `resets_at`
 /// as sent, so a week read with one 30 days ahead, or at `i64::MAX`, on a clock east of UTC, is
 /// no week's reset: the tab says no `↺`, its lane draws nothing ahead, and no word adds the
-/// local offset to it. A lane holds at most a week of cells each side of `▕` (the span it is
-/// defined over), with `↺` only where its reset falls inside them, whatever it is built with.
-/// Negative controls: `reset_ahead` filtering only `> as_of` says `↺` for the reset 30 days on
-/// and overflows adding the offset to `i64::MAX`; `Burn::cells` without its week bound
-/// overflows on `start = i64::MIN`.
+/// local offset to it. A lane holds the work row's span, a day of cells before `▕` and a week
+/// after, with `↺` only where its reset falls inside them, whatever it is built with. Negative
+/// controls: `reset_ahead` filtering only `> as_of` says `↺` for the reset 30 days on and
+/// overflows adding the offset to `i64::MAX`; `Burn::cells` drawn to its reset unbounded runs
+/// past the chart's end on `renews = i64::MAX`.
 #[test]
 fn a_reset_past_a_week_is_never_said_or_drawn() {
     let mut c = Vec::new();
@@ -809,7 +908,11 @@ fn a_reset_past_a_week_is_never_said_or_drawn() {
     for per_day in PER_DAY {
         let k = usize::from(per_day);
         lane(i64::MAX - 7 * D, i64::MAX).cells(per_day, T5, &mut c);
-        assert_eq!(c.len(), 1 + 7 * k, "{per_day}: now, then a week of line");
+        assert_eq!(
+            c.len(),
+            k + 1 + 7 * k,
+            "{per_day}: a day, now, then a week of line"
+        );
         assert!(
             !c.contains(&Cell::Reset),
             "{per_day}: its reset is past the edge"
@@ -817,11 +920,11 @@ fn a_reset_past_a_week_is_never_said_or_drawn() {
         lane(i64::MIN, T5 + D).cells(per_day, T5, &mut c);
         assert_eq!(
             c.len(),
-            7 * k + 1 + k + 1,
-            "{per_day}: a week of past at most"
+            k + 1 + k + 1,
+            "{per_day}: the work row's day of past"
         );
-        lane(T5, T5 + 7 * D).cells(per_day, T5, &mut c);
-        assert_eq!(c.len(), 1 + 7 * k + 1, "{per_day}: a week to its reset");
+        lane(T5, T5 + 7 * D - H).cells(per_day, T5, &mut c);
+        assert_eq!(c.len(), k + 1 + 7 * k, "{per_day}: a week to its reset");
         assert_eq!(c.last(), Some(&Cell::Reset), "{per_day}");
     }
 }
@@ -999,16 +1102,27 @@ fn the_spoken_row_has_no_drawing_glyph() {
 
 /// EVERY STOP THE CHART DRAWS IS SPOKEN (§2.6: the spoken row carries the stops the row shows):
 /// across every scenario, each stop the chart draws (`╳`, or `$` under usage credits) is said by
-/// its start, `from about …`. A lean whose both branches stop (`lean-stop`: scenario C with
+/// its start, `from about …`, and a wall the pane waits at now, a stop from now, by its end, `Out
+/// now: the work waits until …`. A lean whose both branches stop (`lean-stop`: scenario C with
 /// pool1 read at 99%) is `Verdict::Stop { pass: Week, lean: Some }` with no stop of the week
 /// pass's own: the chart draws the worst branch's stop, the tail says `╳`, and a reader hears
-/// `…, whatever pool1 holds`. Negative control: `chain_spoken` without the lean's stop leaves
-/// `lean-stop`'s stop unsaid.
+/// `…, whatever pool1 holds`. Every stop the working pass projects is said within hours,
+/// whatever the verdict: `five-wall-working` waits at its wall now and walls twice more before
+/// morning. Negative controls: `chain_spoken` without the lean's stop leaves `lean-stop`'s stop
+/// unsaid; the working pass's stop said only where it is the verdict (the S3 rule) leaves
+/// `five-wall-working`'s later 5-hour stops unsaid.
 #[test]
 fn every_stop_the_chart_draws_is_spoken() {
     for (name, out, tab) in outlooks() {
         let view = out.quota(tab, None, true);
-        for &(from, _, _) in &view.chart.stops {
+        for &(from, to, _) in &view.chart.stops {
+            let waits = format!(
+                "Out now: the work waits until {}.",
+                spoken_when(to, out.as_of, &out.offsets)
+            );
+            if from <= out.as_of && view.spoken.contains(&waits) {
+                continue;
+            }
             let at = spoken_when(
                 round_down(from, out.as_of, &out.offsets),
                 out.as_of,
@@ -1054,7 +1168,239 @@ fn every_stop_the_chart_draws_is_spoken() {
     );
 }
 
-/// A WAIT IS SAID AT THE VENDOR RESET IT ENDS ON: a wall stands to its reset's grace
+/// EVERY STOP THE ROW SAYS IS DRAWN: across every scenario, where the tail's phrase 2 says a stop
+/// (`╳`), usage credits (`$`) or a wait at a wall standing now (`⧗`), the chart draws it at every
+/// grain, in a future cell its span overlaps (`$` under credits, else `╳`), and the title says it
+/// by the same instant: a stop's start, a wait's end. Negative controls: `chart_of` without the
+/// wall's stop fails `five-wall` and `early-wall`; drawing only the week pass's lean stop (the S3
+/// rule) fails `working-lean-stop`.
+#[test]
+fn every_stop_the_row_says_is_drawn() {
+    let mut said = BTreeSet::new();
+    for (name, out, tab) in outlooks() {
+        let view = out.quota(tab, None, true);
+        let Some(phrase) = &view.tail.verdict else {
+            continue;
+        };
+        let at = |t: i64| when(t, out.as_of, &out.offsets);
+        let about = |t: i64| format!("~{}", at(round_down(t, out.as_of, &out.offsets)));
+        let tab_row = out.rows.iter().position(|r| r.label == tab);
+        let (mark, from, to, words, cell) = match out.verdict_for(tab_row) {
+            Verdict::Walled {
+                to: None,
+                until: Some(until),
+            } => {
+                let end = out.wall_reset(until).unwrap_or(until);
+                let words = format!("the work waits until {}", at(end));
+                (WAIT_MARK, out.as_of, end, words, Cell::Gap)
+            }
+            Verdict::Stop { from, end, .. } => {
+                let to = end.at().unwrap_or(i64::MAX);
+                (GAP_MARK, from, to, about(from), Cell::Gap)
+            }
+            Verdict::Credits { at: from } => {
+                let to = out
+                    .week
+                    .iter()
+                    .chain(&out.working)
+                    .flat_map(Outlook::projected)
+                    .find(|(stop, _)| stop.from == from)
+                    .and_then(|(stop, _)| stop.end.at())
+                    .unwrap_or(i64::MAX);
+                (CREDITS_MARK, from, to, about(from), Cell::Credits)
+            }
+            _ => continue,
+        };
+        assert!(phrase.full.starts_with(mark), "{name}: {}", phrase.full);
+        assert!(
+            view.title.contains(&words),
+            "{name}: `{words}` in {}",
+            view.title
+        );
+        for per_day in PER_DAY {
+            let s = DAY / i64::from(per_day);
+            let f = future(&view.chart, per_day);
+            let drawn = f.iter().enumerate().any(|(j, c)| {
+                let a = out.as_of + i64::try_from(j).unwrap() * s;
+                *c == cell && a < to && from < a + s
+            });
+            assert!(drawn, "{name} at {per_day} a day: {f:?}");
+        }
+        said.insert(name);
+    }
+    for name in [
+        "b",
+        "lean-stop",
+        "working",
+        "credits",
+        "wall",
+        "five-wall",
+        "five-wall-working",
+        "early-wall",
+        "working-lean-stop",
+    ] {
+        assert!(said.contains(name), "{name} says a stop: {said:?}");
+    }
+}
+
+/// A WALL STANDING NOW IS DRAWN FROM NOW (§2.2, §2.3): the wall a pane waits at is a stop from now
+/// until it ends, at the vendor reset its grace follows, so the chart draws `╳` from `▕` by the
+/// half-cover rule, at least the first future cell, beside the tail's `⧗`, the title and the
+/// spoken words. Case (b) walled on its 5-hour window, which resets at 19:00, has no working pass
+/// (`five-wall`): its first future cell is `╳` at every grain and the next a level, on the laid
+/// row too. Under a refused pace nothing is projected (`early-wall`), and the wait is drawn over
+/// `┄`; a tab the rotation cannot move says no wait and draws none. A pass that begins the stop
+/// now itself (`five-wall-working`'s working pass, `wall`'s week pass) has it drawn once, and
+/// the working pass's is not said again within hours. Negative control: `chart_of` without the
+/// wall's stop leaves `five-wall`'s first future cell a level and `early-wall`'s `┄`.
+#[test]
+fn a_wall_standing_now_is_drawn_from_now() {
+    let out = five_wall().outlook();
+    assert!(out.working.is_none(), "no working pass");
+    let view = out.quota("main", None, true);
+    assert!(
+        view.chart.stops.contains(&(T5, T5 + 2 * H, false)),
+        "{:?}",
+        view.chart.stops
+    );
+    for per_day in PER_DAY {
+        let f = future(&view.chart, per_day);
+        assert_eq!(f[0], Cell::Gap, "{per_day} a day");
+        assert!(matches!(f[1], Cell::Ahead(_)), "{per_day} a day: {f:?}");
+    }
+    let line = laid(&view, 166).unwrap();
+    let now = line.chart.start + usize::from(line.per_day);
+    assert_eq!(
+        (line.cells[now].0, line.cells[now + 1].0),
+        (NOW_MARK, GAP_MARK)
+    );
+    assert_eq!(
+        view.tail.verdict.as_ref().unwrap().full,
+        format!("{WAIT_MARK} until 19:00")
+    );
+    assert!(
+        view.title.contains("the work waits until 19:00"),
+        "{}",
+        view.title
+    );
+    assert!(
+        view.spoken.contains("Out now: the work waits until 19:00."),
+        "{}",
+        view.spoken
+    );
+
+    let out = early_wall().outlook();
+    assert!(out.week.is_none(), "nothing projected: {:?}", out.verdict);
+    let view = out.quota("me", None, true);
+    assert_eq!(view.chart.stops, [(NOW, NOW + 2 * H, false)]);
+    for per_day in PER_DAY {
+        let f = future(&view.chart, per_day);
+        assert_eq!(f[0], Cell::Gap, "{per_day} a day");
+        assert!(
+            f[1..]
+                .iter()
+                .all(|c| matches!(c, Cell::Unknown | Cell::Reset)),
+            "{per_day} a day: {f:?}"
+        );
+    }
+    assert_eq!(
+        view.tail.verdict.as_ref().unwrap().full,
+        format!("{WAIT_MARK} until 21:30")
+    );
+    assert!(
+        view.spoken.contains("Out now: the work waits until 21:30."),
+        "{}",
+        view.spoken
+    );
+    let fixed = out.quota("me", None, false);
+    assert!(fixed.chart.stops.is_empty() && fixed.tail.verdict.is_none());
+
+    let out = five_wall_working().outlook();
+    let working = out.working.as_ref().expect("a working pass");
+    assert_eq!(working.stops[0].from, T5, "the pass begins the wait");
+    assert!(working.stops.len() > 1, "and walls again: {working:?}");
+    let view = out.quota("main", None, true);
+    assert_eq!(
+        view.spoken.matches("until 19:00").count(),
+        1,
+        "{}",
+        view.spoken
+    );
+    for out in [out, walled().outlook()] {
+        let view = out.quota("main", None, true);
+        let from_now = view
+            .chart
+            .stops
+            .iter()
+            .filter(|(from, ..)| *from <= out.as_of);
+        assert_eq!(from_now.count(), 1, "drawn once: {:?}", view.chart.stops);
+    }
+}
+
+/// THE STOP BOTH BRANCHES OF A LEAN MEET IS DRAWN IN EITHER PASS (§2.2, §2.6): scenario D with
+/// pool1 read at 99.9% of its week (`working-lean-stop`): at alt1's 5-hour wall the working pass
+/// leans on pool1 and both branches stop, so the verdict is `Stop { pass: Working, lean:
+/// Some("pool1") }` with no stop of the working pass's own. The chart draws the worst branch's
+/// stop as `╳` at every grain, and the tail, the title and the spoken words say that stop by
+/// the same start and end: `╳ ~20:10`, `… (a 5-hour limit), whatever pool1 holds`, and `Within
+/// hours: …, whatever pool1 holds`. The week pass's (`lean-stop`) is drawn as before. Negative
+/// control: `chart_of` drawing only the week pass's lean stop (the S3 rule) leaves
+/// `working-lean-stop` with no `╳`.
+#[test]
+fn the_stop_both_branches_of_a_lean_meet_is_drawn_in_either_pass() {
+    let out = working_lean_stops().outlook();
+    let Verdict::Stop {
+        pass: PassKind::Working,
+        from,
+        end,
+        lean: Some(row),
+    } = &out.verdict
+    else {
+        panic!("a working stop both branches meet: {:?}", out.verdict);
+    };
+    assert_eq!(row, "pool1");
+    let working = out.working.as_ref().unwrap();
+    assert!(working.stops.is_empty(), "the lean's stop: {working:?}");
+    assert_eq!(
+        Outlook::lean_stop(working).map(|s| (s.from, s.end)),
+        Some((*from, *end))
+    );
+    let to = end.at().unwrap();
+    let view = out.quota("me", None, true);
+    assert_eq!(view.chart.stops, [(*from, to, false)]);
+    for per_day in PER_DAY {
+        let s = DAY / i64::from(per_day);
+        let f = future(&view.chart, per_day);
+        let first = usize::try_from((from - out.as_of) / s).unwrap();
+        let last = usize::try_from((to - 1 - out.as_of) / s).unwrap();
+        assert!(
+            f[first..=last].contains(&Cell::Gap),
+            "{per_day} a day: {f:?}"
+        );
+    }
+    let start = round_down(*from, out.as_of, &out.offsets);
+    let (at, end) = (
+        when(start, out.as_of, &out.offsets),
+        when(to, out.as_of, &out.offsets),
+    );
+    assert_eq!(
+        view.tail.verdict.as_ref().unwrap().short,
+        format!("{GAP_MARK} ~{at}")
+    );
+    let title = format!("~{at} until {end} (a 5-hour limit), whatever pool1 holds");
+    assert!(view.title.contains(&title), "{}", view.title);
+    let spoken = format!(
+        "Within hours: every account out from about {} until {}, a 5-hour limit, whatever pool1 \
+         holds.",
+        spoken_when(start, out.as_of, &out.offsets),
+        spoken_when(to, out.as_of, &out.offsets)
+    );
+    assert!(view.spoken.contains(&spoken), "{}", view.spoken);
+    let week = lean_stops().outlook().quota("me", None, true);
+    assert!(cells(&week.chart, 12).contains(&Cell::Gap));
+}
+
+/// A WAIT IS SAID AT THE VENDOR RESET IT ENDS ON:a wall stands to its reset's grace
 /// (`RESET_GRACE_S` past it), and the outlook names the reset (`Walled::reset`), so the glass
 /// says the reset exactly whichever window walled: case (b) walled on its 5-hour window (reset
 /// 19:00) waits `⧗ until 19:00` on the row, in the title and in the spoken words, beside its

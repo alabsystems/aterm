@@ -25,8 +25,10 @@
 //! ([`LEVEL_ROOM`]), and one under that keeps [`OWN_SHARE`] of its reading
 //! ([`letter_bar`]), with [`OWN_ROOM`] over AA or the share for a letter read
 //! by its solid ink, never past its reading, and a level over the share for
-//! one read by its raster ([`raster_bar`]). A cell read by its raster is read
-//! again on the lights the frame will draw, its cuts laid
+//! one read by its raster ([`raster_bar`]). Against the page shades alone
+//! ([`CursorGlow::hold_page_shades`]), a letter read by its raster keeps the
+//! lower of that bar and its own reading ([`shade_bar`]). A cell read by its
+//! raster is read again on the lights the frame will draw, its cuts laid
 //! ([`CursorGlow::verify_cuts`]).
 //! Every light is then cut to that share over the cell and its ring, easing
 //! back to its whole strength over the ledger's feather. A frame with no cut
@@ -352,6 +354,9 @@ struct FrameMemo {
     /// stream's quad spans and its ramp spans
     /// ([`InkLedger::note_light_owned_laid`]).
     owned: (Vec<super::OwnedSpan>, Vec<super::OwnedSpan>),
+    /// The frame's page shades as the guard read them, sorted: the under stream's quad spans
+    /// and its ramp spans ([`InkLedger::note_page_shade_laid`]).
+    shades: (Vec<super::OwnedSpan>, Vec<super::OwnedSpan>),
     /// The streams as the guard left them, in the same order.
     made: (
         Vec<GlowQuad>,
@@ -485,6 +490,9 @@ pub(crate) struct LetterGuard {
     ),
     /// The row being read's ramp lights.
     ramp_rows: RampRows,
+    /// The page shades' cuts ([`CursorGlow::hold_page_shades`]), each judged cell's ring box and
+    /// its share.
+    shade_dims: Vec<Dim>,
     /// [`CursorGlow::holds_bloom`]'s last `(ink, ground)` and its answer.
     bloom_memo: Option<((u32, u32), bool)>,
     /// Each judged cell's verdict (the share of its lights it keeps,
@@ -562,6 +570,15 @@ pub(crate) struct LetterGuard {
     /// letters too, as before looks10 ([`CursorGlow::bloom_spares_letters`]).
     #[cfg(any(test, debug_assertions))]
     pub(crate) bloom_on_letters: bool,
+    /// A test's negative control: a page shade kept whole, unjudged
+    /// ([`CursorGlow::hold_page_shades`]), as before the Linux reds of 2026-11-07.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) shades_whole: bool,
+    /// A test's negative control: each letter under a page shade held to its raster bar
+    /// ([`RasterHold::Bar`]), not the lower of that and its own reading
+    /// ([`CursorGlow::hold_page_shades`]), as the hold's second pass held it (2026-11-07).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) shades_at_bar: bool,
 }
 
 impl LetterGuard {
@@ -614,6 +631,7 @@ impl LetterGuard {
             under: Vec::new(),
             over: Vec::new(),
         },
+        shade_dims: Vec::new(),
         bloom_memo: None,
         verdicts: Vec::new(),
         fresh: Vec::new(),
@@ -650,6 +668,10 @@ impl LetterGuard {
         classic_paper_off: false,
         #[cfg(any(test, debug_assertions))]
         bloom_on_letters: false,
+        #[cfg(any(test, debug_assertions))]
+        shades_whole: false,
+        #[cfg(any(test, debug_assertions))]
+        shades_at_bar: false,
     };
 }
 
@@ -860,8 +882,8 @@ impl StreamBounds {
 /// The lights of the frame's streams (`under`, `over`, each its quads and ramps, and the halos)
 /// that reach the text row band `ry0 .. ry1`, in the renderer's draw order, into `row` (a ramp's
 /// rows laid into `ramp_rows`); with `ledger`, the under stream's foot rails and light-owned
-/// lights left out, as the guard never weighs them. Returns the lights' extent across, `(x0,
-/// x1)`.
+/// lights left out, as the guard never weighs them with the others ([`Weighs::Guard`]). Returns
+/// the lights' extent across, `(x0, x1)`.
 #[inline]
 fn collect_row(
     row: &mut Vec<RowLight>,
@@ -883,7 +905,7 @@ fn collect_row(
             (ry0, ry1),
             &mut ramp_rows.under,
             (row, &mut row_bounds),
-            ledger,
+            ledger.map_or(Weighs::All, Weighs::Guard),
         );
     }
     if meets(bounds.over) {
@@ -893,7 +915,7 @@ fn collect_row(
             (ry0, ry1),
             &mut ramp_rows.over,
             (row, &mut row_bounds),
-            None,
+            Weighs::All,
         );
     }
     for (mode, stream, band) in [
@@ -1025,6 +1047,8 @@ struct Judge {
     /// reads it, rather than by its solid ink against its grounds' least and greatest
     /// ([`LetterGuard::holds`]).
     ring: bool,
+    /// The bars a cell read by its glyph's own pixels keeps ([`RasterHold`]).
+    hold: RasterHold,
 }
 
 impl Judge {
@@ -1047,6 +1071,7 @@ impl Judge {
             cover: None,
             core_box: [0; 4],
             ring: true,
+            hold: RasterHold::Bar,
         }
     }
 }
@@ -1163,9 +1188,23 @@ fn push_row_light(
     });
 }
 
-/// A text row's lights of a stream with ramps, in its draw order: each lit
-/// quad meeting the band `ry0 .. ry1` a row light (`push_row_light(row, bounds, stream, index, (x, w), 0)`), and each ramp meeting it one row light of its lights there,
-/// laid into `laid` (`push_row_light(row, bounds, row stream, first, (x, w), lights)`).
+/// Which of the under stream's lights a text row reads ([`row_lights`]).
+#[derive(Clone, Copy)]
+enum Weighs<'a> {
+    /// Every light.
+    All,
+    /// The lights the guard weighs: all but the rails in their rows' foot bands
+    /// ([`InkLedger::note_foot_rail`], the page shades among them), quads or ramps, and
+    /// the light-owned lights ([`InkLedger::note_light_owned_laid`]).
+    Guard(&'a InkLedger),
+    /// The page shades alone ([`InkLedger::note_page_shade_laid`]).
+    Shades(&'a InkLedger),
+}
+
+/// A text row's lights of a stream with ramps, in its draw order, those `weighs` names: each
+/// lit quad meeting the band `ry0 .. ry1` a row light (`push_row_light(row, bounds, stream,
+/// index, (x, w), 0)`), and each ramp meeting it one row light of its lights there, laid into
+/// `laid` (`push_row_light(row, bounds, row stream, first, (x, w), lights)`).
 #[inline]
 fn row_lights(
     (quads, ramps): (&[GlowQuad], &GlowRamps),
@@ -1173,15 +1212,12 @@ fn row_lights(
     (ry0, ry1): (i32, i32),
     laid: &mut Vec<GlowQuad>,
     (row, bounds): (&mut Vec<RowLight>, &mut (i32, i32)),
-    feet: Option<&InkLedger>,
+    weighs: Weighs<'_>,
 ) {
     #[inline]
     const fn band_meets_y(y: u16, h: u16, ry0: i32, ry1: i32) -> bool {
         (y as i32) < ry1 && (y as i32) + (h as i32) > ry0
     }
-    // The under stream's rails in their rows' foot bands are never weighed
-    // ([`InkLedger::note_foot_rail`]), quads or ramps, nor are its
-    // light-owned lights ([`InkLedger::note_light_owned_laid`]).
     let (mut foot_q, mut foot_r) = (0usize, 0usize);
     let (mut owned_q, mut owned_r) = (0usize, 0usize);
     ramps.in_order(quads.len(), |at| match at {
@@ -1191,11 +1227,12 @@ fn row_lights(
                 let q = &quads[k];
                 if lit(q)
                     && band_meets_y(q.y, q.h, ry0, ry1)
-                    && !match feet {
-                        Some(l) => {
-                            l.in_foot_rail(k, &mut foot_q) || l.in_light_owned(k, &mut owned_q)
+                    && match weighs {
+                        Weighs::All => true,
+                        Weighs::Guard(l) => {
+                            !(l.in_foot_rail(k, &mut foot_q) || l.in_light_owned(k, &mut owned_q))
                         }
-                        None => false,
+                        Weighs::Shades(l) => l.in_page_shade(k, &mut foot_q),
                     }
                 {
                     push_row_light(row, bounds, sq, k, (q.x, q.w), 0);
@@ -1207,11 +1244,12 @@ fn row_lights(
             let r = &ramps.items[k];
             if r.w == 0
                 || !band_meets_y(r.y, r.h, ry0, ry1)
-                || match feet {
-                    Some(l) => {
-                        l.in_foot_ramp(k, &mut foot_r) || l.in_light_owned_ramp(k, &mut owned_r)
+                || !match weighs {
+                    Weighs::All => true,
+                    Weighs::Guard(l) => {
+                        !(l.in_foot_ramp(k, &mut foot_r) || l.in_light_owned_ramp(k, &mut owned_r))
                     }
-                    None => false,
+                    Weighs::Shades(l) => l.in_page_shade_ramp(k, &mut foot_r),
                 }
             {
                 return;
@@ -1618,7 +1656,7 @@ impl LetterGuard {
     /// Whether a cell read by its glyph's own pixels ([`Judge::ring`]) reads at least `bar`
     /// with its lights at share `s`: its reading ([`ring::RingCell::holds`]) on the frame
     /// [`Self::paint_ring`] composites, its whole reading keeping its own bar there
-    /// ([`ring::RingCell::whole_holds`]).
+    /// ([`ring::RingCell::whole_holds`], at [`Judge::hold`]).
     #[inline]
     fn holds_ring(&mut self, j: Judge, s: f32, bar: f32, has_over: bool) -> bool {
         struct Frame<'a>(&'a [u32]);
@@ -1631,7 +1669,7 @@ impl LetterGuard {
         self.paint_ring(s, (j.x1 - j.x0) as usize, has_over);
         let text = std::mem::take(&mut self.px_text);
         let frame = Frame(&text);
-        let held = self.ring.holds(&frame, bar) && self.ring.whole_holds(&frame);
+        let held = self.ring.holds(&frame, bar) && self.ring.whole_holds(&frame, j.hold);
         self.px_text = text;
         held
     }
@@ -2735,22 +2773,24 @@ impl LetterGuard {
     /// how its grounds are read (tests' controls, [`OWN_ROOM`],
     /// [`Self::luma_ring`]), its face's core or
     /// (`model`, `0` for none) the glyphs and grounds of the neighbourhood
-    /// its ring is read from ([`Judge::ring`]), and each of [`Self::cell`]'s
-    /// lights, in order, by what it draws (not its index, which a light laid
-    /// before it moves).
+    /// its ring is read from ([`Judge::ring`]) and the bars it keeps there
+    /// (`hold`), and each of [`Self::cell`]'s lights, in order, by what it
+    /// draws (not its index, which a light laid before it moves).
     #[inline]
     const fn cell_key(
         &self,
         (x0, y0, x1, y1): (i32, i32, i32, i32),
         (ink, ground): (u32, u32),
-        (cover, model): (Option<Cover>, u64),
+        (cover, model, hold): (Option<Cover>, u64, RasterHold),
         streams: Streams<'_>,
     ) -> u64 {
         #[cfg(any(test, debug_assertions))]
         let (no_room, luma_ring) = (self.no_room, self.luma_ring);
         #[cfg(not(any(test, debug_assertions)))]
         let (no_room, luma_ring) = (false, false);
-        let seams = (no_room as u64) << 48 | (luma_ring as u64) << 49;
+        let seams = (no_room as u64) << 48
+            | (luma_ring as u64) << 49
+            | (matches!(hold, RasterHold::Own) as u64) << 50;
         let mut h = fold(
             fold(
                 fold(
@@ -2859,14 +2899,14 @@ impl LetterGuard {
     /// colour whole, that coverage and where the glyph lays ink
     /// ([`Judge::cover`], [`Judge::core_box`]), its core judged too. `ring`:
     /// the cell is read by its glyph's own pixels, as [`Self::ring`] holds it
-    /// ([`Judge::ring`]).
+    /// ([`Judge::ring`]), each reading kept at the bar that hold names.
     #[inline]
     fn judge(
         &mut self,
         (x0, y0, x1, y1): (i32, i32, i32, i32),
         (ink, ground): (u32, u32),
         solid: &mut Option<SolidMemo>,
-        (cover, ring): (Option<Cover>, bool),
+        (cover, ring): (Option<Cover>, Option<RasterHold>),
         streams: Streams<'_>,
     ) -> f32 {
         #[inline]
@@ -2930,13 +2970,14 @@ impl LetterGuard {
             l_fg,
             cover,
             core_box,
-            ring,
+            ring: ring.is_some(),
+            hold: ring.unwrap_or(RasterHold::Bar),
         };
-        if ring {
+        if let Some(hold) = ring {
             // Read as the judge reads it: the bar of its own reading on the bare page, and where
             // every light adds, the brightest ground the lights can make (each channel's sum
             // bounds each channel's median of a ring) against its dimmest solid ink.
-            let bar = raster_bar(self.ring.own);
+            let bar = hold.bar(self.ring.own);
             if !self.ring.ring_text
                 && !self.ring.filled()
                 && self.ring.l_min > l_ground
@@ -2945,7 +2986,7 @@ impl LetterGuard {
                 let lg = crate::color_math::relative_luminance_with(table, lifted(ground, all));
                 if lg < self.ring.l_min
                     && lum_ratio(self.ring.l_min, lg) >= bar
-                    && self.ring.whole_clears(lg)
+                    && self.ring.whole_clears(lg, hold)
                 {
                     return 1.0;
                 }
@@ -3264,6 +3305,49 @@ pub(super) fn raster_bar(bare: f32) -> f32 {
     }
 }
 
+/// The bar [`CursorGlow::hold_page_shades`] holds a letter read by its raster to under the page
+/// shades, from its own reading `bare`: [`raster_bar`], or `bare` itself where that is lower. A
+/// letter that reads at AA on its bare page and under AA's level in hand ([`LEVEL_ROOM`]) is under
+/// its raster bar before any light falls on it. Held to that bar, it lost a shade that lifted it
+/// short of the bar: Beam's body on Solarized Dark was cut from under the `w`, `j` and `g` (4.5086
+/// of their own) where the whole body read them higher, Typing's `w` at 4.5481 whole and 4.5086
+/// held. Of the cells behind the caret that `trail_letters_read`'s W6 reads at its bar with the
+/// body whole, 18 of 227 fell under it typing and 48 of 610 bursting (Linux arm64, 2026-11-07).
+/// Held here, a letter keeps every shade under which it reads its own reading or more, and loses
+/// only one that lowers it. Under a page shade such a letter gives up [`LEVEL_ROOM`]'s level in
+/// hand: held at its whole reading the guard let Beam's `d` read 4.490 in a window, and here it is
+/// held at its own reading with no level over it. Replayed on Linux's bundled face no letter at AA
+/// reads under AA in Beam's scenes on Solarized Dark (Linux arm64, 2026-11-07); no window and no
+/// Mac has read it.
+#[inline]
+#[must_use]
+fn shade_bar(bare: f32) -> f32 {
+    raster_bar(bare).min(bare)
+}
+
+/// Which bar a letter read by its raster ([`Judge::ring`]) keeps, from each of its readings on the
+/// bare page: its ring's ([`ring::RingCell::own`]) and its whole reading's
+/// ([`ring::RingCell::whole`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RasterHold {
+    /// [`raster_bar`]: under the frame's lights, weighed together.
+    Bar,
+    /// [`shade_bar`]: under the page shades alone ([`CursorGlow::hold_page_shades`]).
+    Own,
+}
+
+impl RasterHold {
+    /// The bar a reading of `bare` on the bare page keeps.
+    #[inline]
+    #[must_use]
+    fn bar(self, bare: f32) -> f32 {
+        match self {
+            Self::Bar => raster_bar(bare),
+            Self::Own => shade_bar(bare),
+        }
+    }
+}
+
 /// The most luminance a light against a glyph's foot may read and leave its letter at the bar
 /// the guard holds it to ([`raster_bar`]): a rail's foot quads go unweighed
 /// ([`InkLedger::note_foot_rail`]), so this bar is theirs to keep. It stands on the raster's
@@ -3380,6 +3464,72 @@ const fn solid_ink_with(
 }
 
 impl InkLedger {
+    /// Cut each page shade's light ([`Self::note_page_shade_laid`]) in place to the least share
+    /// of `dims` whose box it meets (`CursorGlow::hold_page_shades`): a quad, or a ramp's row of
+    /// kept ends, scaled whole, its colour and opacity truncated as a cut piece's are
+    /// ([`mask_cut_end`]). No light moves in the stream, so every span the ledger noted still
+    /// names its lights.
+    #[inline]
+    fn cut_page_shades(&self, dims: &[Dim], quads: &mut [GlowQuad], ramps: &mut GlowRamps) {
+        let share_over = |(x0, y0, x1, y1): (i32, i32, i32, i32)| -> f32 {
+            let (x0, y0, x1, y1) = (x0 as f32, y0 as f32, x1 as f32, y1 as f32);
+            dims.iter()
+                .filter(|d| x0 < d.x1 && x1 > d.x0 && y0 < d.y1 && y1 > d.y0)
+                .fold(1.0f32, |s, d| s.min(d.share))
+        };
+        for &(from, to) in &self.page_shades {
+            let to = (to as usize).min(quads.len());
+            for q in quads.iter_mut().take(to).skip(from as usize) {
+                let (x0, y0) = (i32::from(q.x), i32::from(q.y));
+                let s = share_over((x0, y0, x0 + i32::from(q.w), y0 + i32::from(q.h)));
+                if s < 1.0 {
+                    q.color = scale_rgb(q.color, s);
+                    q.color2 = scale_rgb(q.color2, s);
+                    q.alpha = scale_u8(u32::from(q.alpha), s) as u8;
+                    q.alpha2 = scale_u8(u32::from(q.alpha2), s) as u8;
+                }
+            }
+        }
+        let scale_end = |e: GlowEnd, s: f32| {
+            glow_end(scale_rgb(e & 0x00FF_FFFF, s), scale_u8(e >> 24, s) as u8)
+        };
+        let mut cut = false;
+        for &(from, to) in &self.page_shade_ramps {
+            for k in from as usize..(to as usize).min(ramps.items.len()) {
+                let r = ramps.items[k];
+                if r.w == 0 || r.h == 0 {
+                    continue;
+                }
+                let (x0, x1) = (i32::from(r.x), i32::from(r.x) + i32::from(r.w));
+                // Each row of kept ends and the rows it lays ([`GlowRamp::end_row`]).
+                for slot in 0..=r.end_row(r.h - 1) {
+                    let y0 = i32::from(r.y)
+                        + i32::from(slot)
+                        + if slot > r.join {
+                            i32::from(r.joined)
+                        } else {
+                            0
+                        };
+                    let h = if slot == r.join {
+                        i32::from(r.joined) + 1
+                    } else {
+                        1
+                    };
+                    let s = share_over((x0, y0, x1, y0 + h));
+                    if s < 1.0 {
+                        let at = r.ink as usize + 2 * usize::from(slot);
+                        ramps.ends[at] = scale_end(ramps.ends[at], s);
+                        ramps.ends[at + 1] = scale_end(ramps.ends[at + 1], s);
+                        cut = true;
+                    }
+                }
+            }
+        }
+        if cut {
+            ramps.lit = ramps.count_lit();
+        }
+    }
+
     /// Cut every quad of `quads` (additive or source-over) to the guard's
     /// dims ([`Self::mask_at_with`]), easing back to the whole light off them,
     /// and the stream's `ramps` with them ([`Self::guard_mask_ramps`]). With
@@ -4074,7 +4224,9 @@ impl CursorGlow {
                     | u16::from(l.foot_rails_weighed) << 5
                     | u16::from(g.ring_off) << 8
                     | u16::from(g.luma_ring) << 9
-                    | u16::from(g.ring.whole_off) << 10,
+                    | u16::from(g.ring.whole_off) << 10
+                    | u16::from(g.shades_whole) << 11
+                    | u16::from(g.shades_at_bar) << 12,
                 !g.no_reuse,
             )
         };
@@ -4101,9 +4253,11 @@ impl CursorGlow {
             ),
             seams | u16::from(caret_block) << 6 | u16::from(spared) << 7,
         );
-        // The rails are read in order, kept or not.
+        // The rails and the page shades are read in order, kept or not.
         self.ink_ledger.rails.sort_unstable();
         self.ink_ledger.rail_ramps.sort_unstable();
+        self.ink_ledger.page_shades.sort_unstable();
+        self.ink_ledger.page_shade_ramps.sort_unstable();
         let mut memo = self.letter_guard.memo.take().unwrap_or_default();
         let text = &self.frame_text;
         if reuse
@@ -4118,6 +4272,8 @@ impl CursorGlow {
             && memo.rails.1 == self.ink_ledger.rail_ramps
             && memo.owned.0 == self.ink_ledger.light_owned
             && memo.owned.1 == self.ink_ledger.light_owned_ramps
+            && memo.shades.0 == self.ink_ledger.page_shades
+            && memo.shades.1 == self.ink_ledger.page_shade_ramps
             && memo.text == (text.lo, text.cols, text.col0)
             && memo.text_rows == text.rows
             && memo.text_pairs == text.pairs
@@ -4159,6 +4315,8 @@ impl CursorGlow {
         memo.rails.1.clone_from(&self.ink_ledger.rail_ramps);
         memo.owned.0.clone_from(&self.ink_ledger.light_owned);
         memo.owned.1.clone_from(&self.ink_ledger.light_owned_ramps);
+        memo.shades.0.clone_from(&self.ink_ledger.page_shades);
+        memo.shades.1.clone_from(&self.ink_ledger.page_shade_ramps);
         let print =
             self.guard_letters_inner(over, (caret, caret_block), (geom, cfg), (spared, trail));
         memo.made.0.clone_from(&self.under_out);
@@ -4234,6 +4392,7 @@ impl CursorGlow {
             self.letter_guard = guard;
             return 0;
         }
+        self.hold_page_shades(&mut guard, &bounds, (caret, caret_block), trail);
         let mut ramp_rows = std::mem::take(&mut guard.ramp_rows);
         let mut rows_cut = std::mem::take(&mut guard.rows_cut);
         let mut cuts = std::mem::take(&mut guard.row_cuts);
@@ -4353,7 +4512,7 @@ impl CursorGlow {
                     let key = guard.cell_key(
                         (cx0, ry0, cx1, ry1),
                         (ink, ground),
-                        (cover, model.unwrap_or(0)),
+                        (cover, model.unwrap_or(0), RasterHold::Bar),
                         streams,
                     );
                     let share = if let Some(share) = guard.verdict(key) {
@@ -4372,7 +4531,7 @@ impl CursorGlow {
                             (cx0, ry0, cx1, ry1),
                             (ink, ground),
                             &mut solid,
-                            (cover, model.is_some()),
+                            (cover, model.map(|_| RasterHold::Bar)),
                             streams,
                         );
                         guard.fresh.push((key, share));
@@ -4468,6 +4627,169 @@ impl CursorGlow {
         guard.checks = checks;
         self.letter_guard = guard;
         print
+    }
+
+    /// Hold each letter a page shade reaches ([`InkLedger::note_page_shade_laid`]) to its bar
+    /// against the shades alone, before the guard weighs the frame's other lights, which leave the
+    /// shades out ([`Weighs::Guard`]). Each lettered cell but the caret's whose ring box a shade
+    /// meets and that the guard reads by its glyph's own pixels ([`ring`]) is judged as the guard
+    /// judges a cell ([`LetterGuard::judge`]) under the shades' lights there, and each shade's
+    /// light is cut in place to the least share of the judged cells whose ring box it meets
+    /// ([`InkLedger::cut_page_shades`]). The cuts do not ease along the row as the other lights'
+    /// do ([`ramp_row`]): eased, they cut the shade off the held letters' ring boxes too, 2547 px
+    /// of Beam's burst on Solarized Dark against 2281 and 4926 of its line past the margin against
+    /// 3620 (Linux arm64, 2026-11-07), and the unit law
+    /// `a_letter_under_its_raster_bar_keeps_a_shade_that_does_not_lower_it` fails on its edge rows.
+    /// When the hold judged each letter at its raster bar, easing cut Beam's body from under every
+    /// letter between two held ones (`n fox` between the burst's `w` and `j`), to 0.005 off the
+    /// page in a cell behind the caret where `trail_letters_read`'s W6 keeps 0.05.
+    ///
+    /// Each reading of a letter is held to the lower of its raster bar and its own reading on the
+    /// bare page ([`shade_bar`], [`RasterHold::Own`]): a letter under its raster bar there keeps
+    /// every shade under which it reads its own reading or more, and the hold cuts only a shade
+    /// that lowers it.
+    ///
+    /// Weighed with the other lights instead, a shade was cut with the caret's halo under the last
+    /// word, Beam's body a navy box stopping a word short of the caret
+    /// (`bed::BedScratch::shade_runs`); kept whole, it lowered a letter at AA under AA (the
+    /// ledger's note). A cell read by its solid ink keeps the shade whole: that reading bounds each
+    /// channel's median by the least and the greatest ground round the letter apart, so on a ring
+    /// that holds the shade and the page it reads the brighter of each channel, and judged so,
+    /// Beam's body was cut from under the CJK letters behind the caret (0.006 off the page there,
+    /// where `trail_letters_read`'s W6 keeps 0.05; Linux arm64, 2026-11-07).
+    #[inline]
+    fn hold_page_shades(
+        &mut self,
+        guard: &mut LetterGuard,
+        bounds: &StreamBounds,
+        (caret, caret_block): CaretCell,
+        trail: Trail<'_>,
+    ) {
+        #[cfg(any(test, debug_assertions))]
+        let (whole, ring_off, at_bar) = (guard.shades_whole, guard.ring_off, guard.shades_at_bar);
+        #[cfg(not(any(test, debug_assertions)))]
+        let (whole, ring_off, at_bar) = (false, false, false);
+        let hold = if at_bar {
+            RasterHold::Bar
+        } else {
+            RasterHold::Own
+        };
+        let ledger = &self.ink_ledger;
+        // With the foot rails weighed (a test's control), the guard weighs the shades with them.
+        if whole || !ledger.has_page_shades() || !ledger.foot_rails_whole() {
+            return;
+        }
+        let (ox, oy) = (ledger.grid.0 as i32, ledger.grid.1 as i32);
+        let (cw, ch) = (ledger.grid.2 as i32, ledger.grid.3 as i32);
+        let text = &self.frame_text;
+        let under = (self.under_out.as_slice(), &self.under_ramps);
+        let ring_inks = self.glyph_ink.as_deref().filter(|_| !ring_off);
+        let mut ramp_rows = std::mem::take(&mut guard.ramp_rows);
+        let mut dims = std::mem::take(&mut guard.shade_dims);
+        dims.clear();
+        let mut solid = None;
+        for (i, extent) in text.rows.iter().enumerate() {
+            let Some((first, end)) = *extent else {
+                continue;
+            };
+            let row = text.lo + i as i32;
+            let (ry0, ry1) = (oy + row * ch - RING, oy + (row + 1) * ch + RING);
+            if ry1 <= bounds.under.0 || ry0 >= bounds.under.1 {
+                continue;
+            }
+            guard.row.clear();
+            ramp_rows.under.clear();
+            let mut row_bounds = (i32::MAX, i32::MIN);
+            row_lights(
+                under,
+                (Stream::Under, Stream::UnderRow),
+                (ry0, ry1),
+                &mut ramp_rows.under,
+                (&mut guard.row, &mut row_bounds),
+                Weighs::Shades(ledger),
+            );
+            if guard.row.is_empty() {
+                continue;
+            }
+            let skip = match caret {
+                Some((r, c)) if i32::from(r) == row => Some(i32::from(c)),
+                _ => None,
+            };
+            for col in first..end {
+                let (cx0, cx1) = (ox + col * cw - RING, ox + (col + 1) * cw + RING);
+                if row_bounds.1 <= cx0 {
+                    break;
+                }
+                if row_bounds.0 >= cx1 || skip == Some(col) {
+                    continue;
+                }
+                let Some((Some(ink), ground)) = text.pair(row, col) else {
+                    continue;
+                };
+                let (ink, ground) = (ink & 0x00FF_FFFF, ground & 0x00FF_FFFF);
+                guard.cell_lights(cx0, cx1);
+                if guard.cell.is_empty() {
+                    continue;
+                }
+                let streams = Streams {
+                    quads: [under.0, &ramp_rows.under, &[], &[]],
+                    halos: &[],
+                };
+                let Some((model, cells, inks)) = ring_inks.and_then(|inks| {
+                    ring_cells(
+                        (text, inks),
+                        (row, col),
+                        ground,
+                        (caret, caret_block),
+                        trail,
+                    )
+                    .map(|(model, cells)| (model, cells, inks))
+                }) else {
+                    continue;
+                };
+                let key = guard.cell_key(
+                    (cx0, ry0, cx1, ry1),
+                    (ink, ground),
+                    (None, model, hold),
+                    streams,
+                );
+                let share = if let Some(share) = guard.verdict(key) {
+                    share
+                } else {
+                    guard.ring.read(
+                        ((cx1 - cx0) as usize, (ry1 - ry0) as usize),
+                        (cw as usize, ch as usize),
+                        RING as usize,
+                        &cells,
+                        (inks.raster_table(), inks.corrected()),
+                    );
+                    let share = guard.judge(
+                        (cx0, ry0, cx1, ry1),
+                        (ink, ground),
+                        &mut solid,
+                        (None, Some(hold)),
+                        streams,
+                    );
+                    guard.fresh.push((key, share));
+                    share
+                };
+                if share < 1.0 {
+                    dims.push(Dim {
+                        x0: cx0 as f32,
+                        y0: ry0 as f32,
+                        x1: cx1 as f32,
+                        y1: ry1 as f32,
+                        share,
+                    });
+                }
+            }
+        }
+        guard.ramp_rows = ramp_rows;
+        if !dims.is_empty() {
+            self.ink_ledger
+                .cut_page_shades(&dims, &mut self.under_out, &mut self.under_ramps);
+        }
+        guard.shade_dims = dims;
     }
 
     /// Lay the rows' cuts (`rows`, each its cells' `(column, share)` in `cuts`) as the ledger's
@@ -4636,7 +4958,7 @@ impl CursorGlow {
                 && guard.cell_key(
                     (cx0, ry0, cx1, ry1),
                     (c.ink, c.ground),
-                    (None, model),
+                    (None, model, RasterHold::Bar),
                     streams,
                 ) == c.key
             {
@@ -4702,6 +5024,23 @@ impl CursorGlow {
     #[inline]
     pub const fn set_letter_guard_ring(&mut self, on: bool) {
         self.letter_guard.ring_off = !on;
+    }
+
+    /// A test's negative control: each page shade kept whole (`false`), unjudged
+    /// ([`Self::hold_page_shades`]), as before the Linux reds of 2026-11-07.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_letter_guard_shades(&mut self, on: bool) {
+        self.letter_guard.shades_whole = !on;
+    }
+
+    /// A test's negative control: each letter under a page shade held to its raster bar
+    /// (`false`), not the lower of that and its own reading ([`Self::hold_page_shades`]), as the
+    /// hold's second pass held it (2026-11-07).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_letter_guard_shades_to_own(&mut self, on: bool) {
+        self.letter_guard.shades_at_bar = !on;
     }
 
     /// A test's negative control: each letter kept by its ring alone (`false`), its whole reading
@@ -5763,6 +6102,7 @@ mod tests {
             cover,
             core_box,
             ring: false,
+            hold: RasterHold::Bar,
         };
         (j, bar, quads, halos, cell)
     }
@@ -6092,7 +6432,7 @@ mod tests {
                     );
                 }
                 let reading = guard.ring.reading(&Px(&want));
-                let whole = guard.ring.whole_holds(&Px(&want));
+                let whole = guard.ring.whole_holds(&Px(&want), RasterHold::Bar);
                 for (bar, holds) in [
                     (reading.next_down(), true),
                     (reading, true),
@@ -6109,7 +6449,8 @@ mod tests {
             let bar = raster_bar(guard.ring.own);
             let holds = |guard: &mut LetterGuard, s: f32| {
                 let frame = frame_at(s);
-                guard.ring.reading(&Px(&frame)) >= bar && guard.ring.whole_holds(&Px(&frame))
+                guard.ring.reading(&Px(&frame)) >= bar
+                    && guard.ring.whole_holds(&Px(&frame), RasterHold::Bar)
             };
             let want = if holds(&mut guard, 1.0) {
                 1.0
@@ -6872,5 +7213,373 @@ mod tests {
                 "ramped {ramped}, control: the glass not light-owned is cut"
             );
         }
+    }
+
+    /// A PAGE SHADE IS HELD TO THE LETTERS IT REACHES ([`CursorGlow::hold_page_shades`]): a shade
+    /// at Solarized Dark's own luminance in a red's hue ([`crate::cursor_glow::page_lit_ink`],
+    /// noted as a page shade), laid in one-pixel columns as Beam's body is, whose top edge crosses
+    /// a row of solid `l`s at each pixel row of their cells, under Solarized's text (4.75 on its
+    /// page, kept at the floor). Each column is laid as its quads, and as Beam lays its body,
+    /// through a [`aterm_render::RampSink`]: one ramp a column, its rows one pixel tall but a run
+    /// of four (`join`, `joined`) and running past the letters' ring band. The guard leaves the
+    /// shade whole away from the letters' ring boxes, and over them cuts it until every letter
+    /// keeps its bar by the guard's own reading of its pixels: the guard read again over what it
+    /// laid cuts nothing more. Negative control ([`CursorGlow::set_letter_guard_shades`]): kept
+    /// whole, the shade over the letters is laid as it came, and on some edge row it lowers a
+    /// letter under its bar, as a guard holding it reads, laid either way.
+    #[test]
+    fn a_page_shade_is_held_to_the_letters_it_reaches() {
+        use aterm_render::glyph_ink::GlyphCoverage;
+        use aterm_render::{BeamRows, RampCost, RampSink};
+        let g = Geom {
+            cw: 8,
+            ch: 16,
+            rows: 6,
+            cols: 40,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 320,
+            win_h: 96,
+            head: 0,
+        };
+        let row = 2u16;
+        const PAGE: u32 = 0x0000_2B36;
+        let page = aterm_core::terminal::RenderCell {
+            fg: [0x83, 0x94, 0x96],
+            bg: [0x00, 0x2B, 0x36],
+            ..aterm_core::terminal::RenderCell::default()
+        };
+        let mut cells = vec![vec![page; g.cols]; g.rows];
+        let letters = 2..6;
+        for col in letters.clone() {
+            cells[usize::from(row)][col].ch = 'l';
+        }
+        // The face's `l`: a solid stem two pixels wide, rows 2 to 13 of its cell.
+        let at = usize::from(aterm_render::GlyphInk::index('l', false));
+        let mut regular: [GlyphCoverage; 95] = std::array::from_fn(|_| GlyphCoverage::default());
+        let bold: [GlyphCoverage; 95] = std::array::from_fn(|_| GlyphCoverage::default());
+        regular[at].max = 255;
+        regular[at].cell_box = Some([3, 2, 5, 14]);
+        let mut rasters = vec![None; 190];
+        rasters[at] = Some(aterm_render::GlyphRaster {
+            x: 3,
+            y: 2,
+            w: 2,
+            cov: vec![255; 2 * 12].into_boxed_slice(),
+        });
+        let face = std::sync::Arc::new(
+            aterm_render::GlyphInk::from_coverage(regular, bold, false).with_rasters(rasters),
+        );
+        let shade = crate::cursor_glow::page_lit_ink(0x00DC_322F, PAGE);
+        // The ramps' rows run this far, past the letters' ring band.
+        let foot = (row + 1) * 16 + RING as u16 + 4;
+        // The shade from window row `top`, columns 0 to 11: as quads, down to the band's foot;
+        // `ramped`, as ramps down to `foot`, each column's two rows, its run of four, its rest.
+        let laid = |top: u16, ramped: bool| -> (Vec<GlowQuad>, GlowRamps) {
+            let (mut quads, mut ramps) = (Vec::new(), GlowRamps::default());
+            if !ramped {
+                quads = (0..12 * 8)
+                    .map(|x| GlowQuad {
+                        row,
+                        x,
+                        y: top,
+                        w: 1,
+                        h: (row + 1) * 16 - top,
+                        color: shade,
+                        alpha: 0xFF,
+                        color2: shade,
+                        alpha2: 0xFF,
+                    })
+                    .collect();
+                return (quads, ramps);
+            }
+            let mut sink = RampSink::new(&mut quads, &mut ramps).costed(RampCost::ALWAYS);
+            let end = (shade, 0xFF);
+            for x in 0..12 * 8 {
+                sink.slab();
+                let mut y = top;
+                while y < foot {
+                    if y == top + 2 {
+                        sink.rect(0, row, (x, y, 1, 4), end);
+                        y += 4;
+                    } else {
+                        sink.row(0, row, (x, y, 1), end, end);
+                        y += 1;
+                    }
+                }
+            }
+            drop(sink);
+            (quads, ramps)
+        };
+        // The stream the guard leaves of `(quads, ramps)`, expanded into its lights in draw order.
+        let guard = |(quads, ramps): &(Vec<GlowQuad>, GlowRamps), held: bool| -> Vec<GlowQuad> {
+            let mut glow = CursorGlow::default();
+            glow.observe_glyph_ink(Some(face.clone()));
+            glow.observe_frame_text(Some((row, 30)), &cells, Instant::now());
+            glow.set_letter_guard_shades(held);
+            glow.ink_ledger.note_page_shade_laid(
+                (0, GlowRamps::default().mark()),
+                (quads.len(), ramps.mark()),
+            );
+            glow.under_out.clone_from(quads);
+            glow.under_ramps = ramps.clone();
+            let cfg = GlowConfig {
+                style: GlowStyle::Beam,
+                ..GlowConfig::default()
+            };
+            let _ = glow.guard_letters(
+                &mut Vec::new(),
+                (Some((row, 30)), true),
+                (g, &cfg),
+                (&[], 0),
+            );
+            let mut lights = Vec::new();
+            glow.under_ramps.expand_into(&glow.under_out, &mut lights);
+            lights
+        };
+        let expand = |(quads, ramps): &(Vec<GlowQuad>, GlowRamps)| {
+            let mut lights = Vec::new();
+            ramps.expand_into(quads, &mut lights);
+            lights
+        };
+        // Whether a light meets a letter's ring box.
+        let over_letters = |q: &GlowQuad| {
+            let (x, y) = (i32::from(q.x), i32::from(q.y));
+            let band = (i32::from(row) * 16 - RING, (i32::from(row) + 1) * 16 + RING);
+            x + i32::from(q.w) > letters.start as i32 * 8 - RING
+                && x < letters.end as i32 * 8 + RING
+                && y + i32::from(q.h) > band.0
+                && y < band.1
+        };
+        for ramped in [false, true] {
+            let mut lowered = 0;
+            for top in row * 16..(row + 1) * 16 {
+                let stream = laid(top, ramped);
+                if ramped {
+                    assert!(
+                        stream.0.is_empty()
+                            && stream.1.items.len() == 12 * 8
+                            && stream.1.items.iter().all(|r| r.joined == 3 && r.join == 2),
+                        "fixture: each column is one ramp with a run of four"
+                    );
+                } else {
+                    assert!(stream.1.is_empty(), "fixture: the shade is laid as quads");
+                }
+                let shade = expand(&stream);
+                let held = guard(&stream, true);
+                assert_eq!(
+                    held.len(),
+                    shade.len(),
+                    "ramped {ramped}, edge at {top}: the shade's lights stay in place"
+                );
+                for (q, h) in shade.iter().zip(&held) {
+                    if !over_letters(q) {
+                        assert_eq!(
+                            q, h,
+                            "ramped {ramped}, edge at {top}: the shade off the letters' ring boxes is \
+                             whole"
+                        );
+                    }
+                }
+                let again = (held.clone(), GlowRamps::default());
+                assert_eq!(
+                    guard(&again, true),
+                    held,
+                    "ramped {ramped}, edge at {top}: a letter under the shade as the guard laid it \
+                     reads under its bar"
+                );
+                assert_eq!(
+                    guard(&stream, false),
+                    shade,
+                    "control, ramped {ramped}, edge at {top}: the shade is kept whole"
+                );
+                if held != shade {
+                    lowered += 1;
+                }
+            }
+            assert!(
+                lowered > 0,
+                "control, ramped {ramped}: kept whole, the shade lowers no letter under its bar on \
+                 any edge row"
+            );
+        }
+    }
+
+    /// A LETTER UNDER ITS RASTER BAR KEEPS A SHADE THAT DOES NOT LOWER IT
+    /// ([`CursorGlow::hold_page_shades`], [`shade_bar`]): solid `l`s in `#7f9092` on Solarized
+    /// Dark's page read 4.5086 there, at AA as the judges read it and under AA's level in hand
+    /// ([`raster_bar`], 4.563), as Beam's `w`, `j` and `g` read on Linux's face; three `l`s in
+    /// `#eee8d5` stand between two of them, far over the floor. A page shade at the page's
+    /// luminance in a red's hue ([`crate::cursor_glow::page_lit_ink`]) laid wholly over their ring
+    /// boxes is left whole: every ring reads the shade alone, no brighter than the page. Where the
+    /// shade's top edge crosses their cells, a ring lying on it and on the page reads a ground
+    /// brighter than either, and on some edge row the guard cuts the shade over the dim `l`s; it
+    /// cuts nothing off their ring boxes, the bright `l`s between them included (eased along the
+    /// row as the guard's other cuts are, the hold cut Beam's body from under the letters between
+    /// two it held), and a guard reading again over what it laid cuts nothing more. Negative
+    /// control ([`CursorGlow::set_letter_guard_shades_to_own`]): held to their raster bar, the
+    /// shade wholly over them is cut. A verdict weighed at the raster bar is not taken for one at
+    /// the letter's own reading: the frame after one held at the bar leaves the shade whole.
+    #[test]
+    fn a_letter_under_its_raster_bar_keeps_a_shade_that_does_not_lower_it() {
+        use aterm_render::glyph_ink::GlyphCoverage;
+        let g = Geom {
+            cw: 8,
+            ch: 16,
+            rows: 6,
+            cols: 40,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 320,
+            win_h: 96,
+            head: 0,
+        };
+        let row = 2u16;
+        const PAGE: u32 = 0x0000_2B36;
+        const INK: u32 = 0x007F_9092;
+        let page = aterm_core::terminal::RenderCell {
+            fg: [0x7F, 0x90, 0x92],
+            bg: [0x00, 0x2B, 0x36],
+            ..aterm_core::terminal::RenderCell::default()
+        };
+        let mut cells = vec![vec![page; g.cols]; g.rows];
+        // The dim `l`s at columns 2 and 6, the bright ones between.
+        let dim = [2usize, 6];
+        for (col, cell) in cells[usize::from(row)]
+            .iter_mut()
+            .enumerate()
+            .take(7)
+            .skip(2)
+        {
+            cell.ch = 'l';
+            if !dim.contains(&col) {
+                cell.fg = [0xEE, 0xE8, 0xD5];
+            }
+        }
+        let table = crate::color_math::relative_luminance_table();
+        let lum = |c: u32| crate::color_math::relative_luminance_with(table, c);
+        let own = (lum(INK) + 0.05) / (lum(PAGE) + 0.05);
+        assert!(
+            (AA_READ..raster_bar(own)).contains(&own),
+            "fixture: the dim `l` reads {own}, at AA and under its raster bar {}",
+            raster_bar(own)
+        );
+        // The face's `l`: a solid stem two pixels wide, rows 2 to 13 of its cell.
+        let at = usize::from(aterm_render::GlyphInk::index('l', false));
+        let mut regular: [GlyphCoverage; 95] = std::array::from_fn(|_| GlyphCoverage::default());
+        let bold: [GlyphCoverage; 95] = std::array::from_fn(|_| GlyphCoverage::default());
+        regular[at].max = 255;
+        regular[at].cell_box = Some([3, 2, 5, 14]);
+        let mut rasters = vec![None; 190];
+        rasters[at] = Some(aterm_render::GlyphRaster {
+            x: 3,
+            y: 2,
+            w: 2,
+            cov: vec![255; 2 * 12].into_boxed_slice(),
+        });
+        let face = std::sync::Arc::new(
+            aterm_render::GlyphInk::from_coverage(regular, bold, false).with_rasters(rasters),
+        );
+        let shade = crate::cursor_glow::page_lit_ink(0x00DC_322F, PAGE);
+        assert!(
+            lum(shade) <= lum(PAGE) && shade & 0x00FF_FFFF != PAGE,
+            "fixture: the shade {shade:06x} lies off the page's hue, at or under its luminance"
+        );
+        // The shade in one-pixel columns 0 to 11, from window row `top` to the band's foot.
+        let band = (i32::from(row) * 16 - RING, (i32::from(row) + 1) * 16 + RING);
+        let laid = |top: u16| -> Vec<GlowQuad> {
+            (0..12 * 8)
+                .map(|x| GlowQuad {
+                    row,
+                    x,
+                    y: top,
+                    w: 1,
+                    h: band.1 as u16 - top,
+                    color: shade,
+                    alpha: 0xFF,
+                    color2: shade,
+                    alpha2: 0xFF,
+                })
+                .collect()
+        };
+        // The shade `quads` as one guard leaves it on the last of its frames, each frame's letters
+        // held to their own reading or to their raster bar as `to_own` says in turn.
+        let guard = |quads: &[GlowQuad], to_own: &[bool]| -> Vec<GlowQuad> {
+            let mut glow = CursorGlow::default();
+            glow.observe_glyph_ink(Some(face.clone()));
+            let cfg = GlowConfig {
+                style: GlowStyle::Beam,
+                ..GlowConfig::default()
+            };
+            for &to_own in to_own {
+                glow.observe_frame_text(Some((row, 30)), &cells, Instant::now());
+                glow.set_letter_guard_shades_to_own(to_own);
+                glow.ink_ledger.clear_rails();
+                let ramps = GlowRamps::default();
+                glow.ink_ledger
+                    .note_page_shade_laid((0, ramps.mark()), (quads.len(), ramps.mark()));
+                glow.under_out = quads.to_vec();
+                glow.under_ramps = ramps;
+                let _ = glow.guard_letters(
+                    &mut Vec::new(),
+                    (Some((row, 30)), true),
+                    (g, &cfg),
+                    (&[], 0),
+                );
+            }
+            glow.under_out
+        };
+        let over = laid(band.0 as u16);
+        assert_eq!(
+            guard(&over, &[true]),
+            over,
+            "the shade wholly over the letters' ring boxes is cut"
+        );
+        assert_ne!(
+            guard(&over, &[false]),
+            over,
+            "control: held to their raster bar, the letters keep the shade wholly over them whole"
+        );
+        assert_eq!(
+            guard(&over, &[false, true]),
+            over,
+            "the frame after one held at the raster bar takes that frame's verdicts"
+        );
+        // Whether a light meets a dim `l`'s ring box.
+        let on_dim = |q: &GlowQuad| {
+            let x = i32::from(q.x);
+            dim.iter().any(|&col| {
+                x + i32::from(q.w) > col as i32 * 8 - RING && x < (col as i32 + 1) * 8 + RING
+            })
+        };
+        let mut lowered = 0;
+        for top in row * 16..(row + 1) * 16 {
+            let shade = laid(top);
+            let held = guard(&shade, &[true]);
+            assert_eq!(
+                held.len(),
+                shade.len(),
+                "edge at {top}: the shade's lights stay in place"
+            );
+            for (q, h) in shade.iter().zip(&held) {
+                if !on_dim(q) {
+                    assert_eq!(
+                        q, h,
+                        "edge at {top}: the shade off the dim letters' ring boxes is cut"
+                    );
+                }
+            }
+            assert_eq!(
+                guard(&held, &[true]),
+                held,
+                "edge at {top}: a letter under the shade as the guard laid it reads under its own \
+                 reading"
+            );
+            lowered += usize::from(held != shade);
+        }
+        assert!(
+            lowered > 0,
+            "no edge row's shade lowers a letter under its own reading"
+        );
     }
 }

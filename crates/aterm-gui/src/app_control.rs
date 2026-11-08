@@ -18,6 +18,8 @@ use crate::{App, WindowId};
 
 #[path = "app_control_network.rs"]
 mod network;
+#[cfg(test)]
+pub(crate) use network::INSPECTED_FOR;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum InspectRequest {

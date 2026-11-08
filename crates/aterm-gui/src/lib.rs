@@ -9040,12 +9040,6 @@ const AUTOMATIC_UPDATE_ACTIVITY_GRACE: Duration = native_update_auto_intent::PRE
 
 const AUTOMATIC_UPDATE_KEYSTROKE_GAP: Duration = Duration::from_millis(2_500);
 
-/// How long no aterm window may have had keyboard focus before keys typed meanwhile (into another
-/// app, or one of aterm's own sheets) count as unseen once one takes it back
-/// ([`App::note_keyboard_focus`]): a shorter flick (focus passing from one aterm window to
-/// another, a panel taking key for a moment) holds no typing.
-const FOCUS_AWAY_FOR: Duration = Duration::from_secs(1);
-
 fn hands_off_keys(focused: bool, last_keystroke_at: Option<Instant>, now: Instant) -> bool {
     !focused
         || last_keystroke_at
@@ -10235,6 +10229,9 @@ struct App {
     network_source: Option<NetworkSnapshotSource>,
     network_source_busy: bool,
     network_next_poll: Option<Instant>,
+    /// When the network projection was last inspected ([`app_control::InspectRequest::Network`]),
+    /// whose reader reads the services' states as the band does.
+    network_inspected: Option<Instant>,
     lab_screen: lab_screen::LabScreen,
     harness_progress_next_poll: Option<Instant>,
     workstation_setup: workstation_setup::Host,
@@ -10819,11 +10816,6 @@ struct App {
     update_handoff_activity_epoch: u64,
     last_update_activity_at: Instant,
     last_keystroke_at: Option<Instant>,
-    /// When the last aterm window with keyboard focus lost it ([`App::note_keyboard_focus`]).
-    keyboard_focus_lost_at: Option<Instant>,
-    /// When an aterm window took keyboard focus back after none had it for [`FOCUS_AWAY_FOR`] or
-    /// more ([`App::note_keyboard_focus`]).
-    keyboard_focus_back_at: Option<Instant>,
     /// When the person last typed a key, pressed a mouse button or scrolled in an aterm window,
     /// which aterm sees itself ([`App::person_present_within`]'s reading where macOS's idle time
     /// cannot be read).
@@ -11736,34 +11728,15 @@ impl App {
             .is_some_and(|at| now.saturating_duration_since(at) < within)
     }
 
-    /// Keep the edges of aterm's keyboard focus at a window's `Focused` event, `had` being
-    /// whether any aterm window had it before the event: when the last one lost it, and when one
-    /// took it back after none had it for [`FOCUS_AWAY_FOR`] or more (or for the first time).
-    /// Keys typed while none had it went to another app, or to one of aterm's own sheets, and
-    /// [`Self::last_keystroke_at`] never saw them, so System State's steps count their key rest
-    /// from that return too ([`Self::step_moment_is_quiet`]).
-    pub(crate) fn note_keyboard_focus(&mut self, had: bool, now: Instant) {
-        let has = self.any_os_window_focused();
-        if had && !has {
-            self.keyboard_focus_lost_at = Some(now);
-        } else if !had
-            && has
-            && self
-                .keyboard_focus_lost_at
-                .is_none_or(|lost| now.saturating_duration_since(lost) >= FOCUS_AWAY_FOR)
-        {
-            self.keyboard_focus_back_at = Some(now);
-        }
-    }
-
-    /// Whether a person is known to have been at this Mac within `within` of `now`, as System
-    /// State's steps and the permission walk that starts by itself both read it: the keyboard or
-    /// pointer touched then, by the idle time macOS gives; where macOS gives none
+    /// Whether a person is known to have been at this Mac within `within` of `now`: the keyboard
+    /// or pointer touched then, by the idle time macOS gives; where macOS gives none
     /// (`user_input_readable` false: `user_input_recent` then reads input just now, which shows
     /// nobody there), a key typed, a mouse button pressed or a scroll in an aterm window then,
-    /// which aterm sees itself ([`Self::last_person_input_at`]). An unreadable idle time so holds
-    /// first-run setup only until the person touches aterm, never for good, and nothing opens
-    /// System Settings with nobody known to be there.
+    /// which aterm sees itself ([`Self::last_person_input_at`]). System State's person stages
+    /// ([`Self::person_at_this_screen`]) and the time of a permission walk's page
+    /// (`walk_person_away`) read it, so an unreadable idle time holds them only until the person
+    /// touches aterm, never for good. System State's automatic steps and the start of a walk read
+    /// no presence ([`Self::step_moment_is_quiet`]).
     pub(crate) fn person_present_within(&self, within: Duration, now: Instant) -> bool {
         self.presence().within(within, now)
     }
@@ -15324,6 +15297,7 @@ impl App {
             network_source: None,
             network_source_busy: false,
             network_next_poll: None,
+            network_inspected: None,
             lab_screen: lab_screen::LabScreen::default(),
             harness_progress_next_poll: None,
             vitals: vitals_host::VitalsHost::default(),
@@ -15753,8 +15727,6 @@ impl App {
             update_handoff_activity_epoch: 0,
             last_update_activity_at: Instant::now(),
             last_keystroke_at: None,
-            keyboard_focus_lost_at: None,
-            keyboard_focus_back_at: None,
             last_person_input_at: None,
             #[cfg(unix)]
             next_update_handoff_id: 1,
@@ -16371,7 +16343,6 @@ impl App {
 
     fn window_focus_event(&mut self, wid: WindowId, focused: bool) {
         let gained = focused && self.windows.get(&wid).is_some_and(|window| !window.focused);
-        let had_keyboard_focus = self.any_os_window_focused();
         if focused {
             workstation_setup::window_focus_gained();
             if cfg!(target_os = "macos") && !self.headless {
@@ -16419,7 +16390,6 @@ impl App {
             self.system_state_focus_returned(wid);
             self.packages_page_met_the_front(wid);
         }
-        self.note_keyboard_focus(had_keyboard_focus, Instant::now());
         let _ = self.carried_window_show_focus_event(wid);
     }
 
@@ -19919,6 +19889,7 @@ impl App {
                 let _ = reply.send(lines);
             }
             Wake::InspectApp { request, reply } => {
+                self.note_inspection(&request, Instant::now());
                 let _ = reply.send(self.inspect_app(request));
             }
             Wake::ActApp { request, reply } => {
@@ -26501,8 +26472,23 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
 
 /// A nonblocking read of a host-owned immutable network/service snapshot.
 /// `None` is a busy read, not an empty or newly unavailable observation.
-pub type NetworkSnapshotSource =
-    Arc<dyn Fn() -> Option<Arc<aterm_types::network_state::NetworkStateSnapshot>> + Send + Sync>;
+pub type NetworkSnapshotSource = Arc<
+    dyn Fn(NetworkRead) -> Option<Arc<aterm_types::network_state::NetworkStateSnapshot>>
+        + Send
+        + Sync,
+>;
+
+/// What a [`NetworkSnapshotSource`] reader shows. Only a reader that shows the services'
+/// states (the band, its lens, the Lab page, a network inspection) asks for them, since a
+/// services read is what keeps their observer sampling; a reader of the network alone gets the
+/// services' last sample, aged as it ages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkRead {
+    /// The network observation; the services as last read.
+    Network,
+    /// The network observation and the services read now.
+    WithServices,
+}
 
 /// A host-owned worker's nonblocking maintenance. A deadline is returned only
 /// while its next start is owed; a live worker wakes the window when it ends.
@@ -26546,8 +26532,7 @@ pub fn main_entry_with_network(
     // A Commons peer heard again after a silence is this window's "network moved"
     // (`network_moved`), beside its route socket and browse.
     if let Some(read) = network_source.as_ref() {
-        let read = Arc::clone(read);
-        network_moved::hear_commons(move || read().map(|snapshot| snapshot.network.peers.clone()));
+        network_moved::hear_commons(network_moved::beacon_peers(Arc::clone(read)));
     }
     #[cfg(windows)]
     let _ = win32::attach_parent_console();
@@ -28310,8 +28295,9 @@ pub fn main_entry_with_network(
         network_source
             .as_ref()
             .map_or_else(network_deck::inactive_snapshot, |read| {
+                // The seed draws nothing: the first turn that draws the services asks for them.
                 network_deck::snapshot_after_read(
-                    read(),
+                    read(NetworkRead::Network),
                     &Arc::new(aterm_types::network_state::NetworkStateSnapshot::default()),
                     &mut network_source_busy,
                     aterm_time::unix_millis(),
@@ -28409,6 +28395,7 @@ pub fn main_entry_with_network(
         network_source,
         network_source_busy,
         network_next_poll: None,
+        network_inspected: None,
         lab_screen: lab_screen::LabScreen::default(),
         harness_progress_next_poll: None,
         vitals: vitals_host::VitalsHost::default(),
@@ -28888,8 +28875,6 @@ pub fn main_entry_with_network(
         update_handoff_activity_epoch: 0,
         last_update_activity_at: Instant::now(),
         last_keystroke_at: None,
-        keyboard_focus_lost_at: None,
-        keyboard_focus_back_at: None,
         last_person_input_at: None,
         #[cfg(unix)]
         next_update_handoff_id: 1,

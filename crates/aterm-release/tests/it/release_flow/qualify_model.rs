@@ -129,6 +129,7 @@ fn replay(w: &World) -> Replay {
                     }
                     r.fire(&format!("{x}Pass"));
                 }
+                "red" if x == "Tree" && w.keep_build_on_test_red => r.fire("TreeTestRed"),
                 "red" => r.fire(&format!("{x}Red")),
                 "could-not-run" => r.fire(&format!("{x}CouldNotRun")),
                 // A branch the red stopped before it started never ran: the model keeps it idle.
@@ -301,6 +302,11 @@ fn the_model_refuses_the_defects_the_graph_must_not_have() {
         r
     };
     let mut r = start();
+    r.fire("TreeTestRed");
+    r.refuses("StopBuild");
+    r.fire("BuildPass");
+
+    let mut r = start();
     r.fire("BuildPass");
     r.fire("ExportPush");
     r.fire("ExportPass");
@@ -328,4 +334,24 @@ fn the_model_refuses_the_defects_the_graph_must_not_have() {
     r.fire("ExportPush");
     r.fire("ExportPass");
     r.refuses("QualifyPass");
+}
+
+/// The product survives an executing-test red only when it had already started. The control
+/// replays the previous unconditional stop and must lose that product.
+#[test]
+fn a_test_red_keeps_a_started_build_and_the_model_agrees() {
+    for keep in [false, true] {
+        let mut w = World::new();
+        w.verify_outcomes.insert("test", "FAIL");
+        w.verify_code = 1;
+        w.after_tree = true;
+        w.keep_build_on_test_red = keep;
+        let (code, last) = w.run(bump());
+        assert_eq!(code, 1, "{last}");
+        let r = replay(&w);
+        assert_eq!(r.var("build"), if keep { 2 } else { 5 });
+        assert_eq!(r.var("kept_build"), i64::from(keep));
+        assert_eq!(r.var("phase"), 6);
+        assert_eq!(w.journal().unwrap().artifact.is_some(), keep);
+    }
 }

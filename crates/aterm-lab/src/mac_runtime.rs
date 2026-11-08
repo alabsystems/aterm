@@ -207,9 +207,10 @@ fn write_json(path: &Path, value: &Value) -> Result<(), Fail> {
     write(path, &bytes)
 }
 
-/// Timing drivers belong to the console's interactive session, not Tart's guest daemon.
+/// Timing drivers belong to the console's app band. An Interactive job is still a daemon
+/// task: neither its driver nor its subjects can take the UI role the instrument requests.
 /// launchd owns the job; the result file is written only after the measured child exits.
-fn interactive_job(root: &Path, phase: &str, script: &str) -> Value {
+fn app_job(root: &Path, phase: &str, script: &str) -> Value {
     let dir = root.join(phase);
     let path = |name: &str| q(&dir.join(name).display().to_string());
     let program = format!(
@@ -223,20 +224,20 @@ fn interactive_job(root: &Path, phase: &str, script: &str) -> Value {
     json!({
         "Label": format!("systems.alab.aterm.runtime.{phase}"),
         "ProgramArguments": ["/bin/sh", "-c", program],
-        "ProcessType": "Interactive", "RunAtLoad": true,
+        "ProcessType": "App", "RunAtLoad": true,
         "StandardOutPath": dir.join("stdout").display().to_string(),
         "StandardErrorPath": dir.join("stderr").display().to_string()
     })
 }
 
-fn interactive_exec(
+fn app_exec(
     vm: &Vm,
     ask: &Ask,
     phase: &str,
     script: &str,
     limit: Duration,
 ) -> Result<std::process::Output, Fail> {
-    let job = interactive_job(&Path::new(ROOT).join("driver"), phase, script);
+    let job = app_job(&Path::new(ROOT).join("driver"), phase, script);
     write_json(&ask.record.join(format!("{phase}.driver.json")), &job)?;
     let encoded = aterm_json::to_string(&job).map_err(|e| format!("driver JSON: {e}"))?;
     let dir = format!("{ROOT}/driver/{phase}");
@@ -541,7 +542,7 @@ fn run_in(ask: &Ask) -> Res {
         &json!({
             "schema": "aterm-mac-runtime-v1", "source_commit": source, "astream_commit": submodule,
             "bundle_sha256": app_sha, "image": ask.image, "lane": ask.lane,
-            "driver": "gui-launch-agent/Interactive", "count_mode": ask.count_mode,
+            "driver": "gui-launch-agent/App", "count_mode": ask.count_mode,
             "compiler": compiler.display().to_string(), "compiler_lock_override": tool.lock_override,
             "guest": {"cpus": ask.cpus, "memory_mib": ask.memory_mib, "disk_gb": ask.disk_gb, "graphics": ask.graphics}
         }),
@@ -710,7 +711,7 @@ fn run_in(ask: &Ask) -> Res {
         "mac runtime: {} warm-up (not one of the five takes)",
         ask.lane
     );
-    let warm = interactive_exec(&vm, ask, "warmup", &untimed, BUILD)?;
+    let warm = app_exec(&vm, ask, "warmup", &untimed, BUILD)?;
     write(&ask.record.join("warmup.stdout"), &warm.stdout)?;
     write(&ask.record.join("warmup.stderr"), &warm.stderr)?;
     let warm_artifacts = collect(&vm, ask, "warmup", &String::from_utf8_lossy(&warm.stdout))?;
@@ -734,7 +735,7 @@ fn run_in(ask: &Ask) -> Res {
             ask.lane
         );
         let (out, loads) =
-            sampled(|| interactive_exec(&vm, ask, &format!("take-{take}"), &invocation, TAKE));
+            sampled(|| app_exec(&vm, ask, &format!("take-{take}"), &invocation, TAKE));
         let out = out?;
         codes.push(out.status.code());
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -765,7 +766,7 @@ fn run_in(ask: &Ask) -> Res {
         &json!({"schema": "aterm-mac-runtime-v1",
         "complete": true, "all_exits_zero": exit == 0, "exit": exit, "warmup_exit": warm.status.code(), "warmup_artifacts": warm_artifacts, "source_commit": source, "astream_commit": submodule,
         "bundle_sha256": app_sha, "image": ask.image, "lane": ask.lane,
-        "driver": "gui-launch-agent/Interactive", "count_mode": ask.count_mode,
+        "driver": "gui-launch-agent/App", "count_mode": ask.count_mode,
         "guest": {"cpus": ask.cpus, "memory_mib": ask.memory_mib, "disk_gb": ask.disk_gb, "graphics": ask.graphics},
         "granted_share": admitted.jobs,
         "command": command, "wall_s": spread(&real), "cpu_s": spread(&cpu), "rows": rows}),
@@ -779,15 +780,94 @@ mod tests {
     use super::*;
 
     #[test]
-    fn timing_is_an_interactive_gui_job_with_lossless_arguments_and_separate_results() {
+    fn runtime_role_probe() {
+        let Some(record) = std::env::var_os("ATERM_Q4_ROLE_RECORD") else {
+            return;
+        };
+        let promoted = crate::sys::set_darwin_role(0, 1).is_ok();
+        let role = crate::sys::darwin_role(0).unwrap();
+        std::fs::write(record, format!("{promoted} {role}\n")).unwrap();
+    }
+
+    /// Exercise the generated job through launchd. A plist string alone cannot establish the
+    /// task type its shell's children inherit; Interactive is the daemon negative control.
+    #[test]
+    fn timing_children_can_take_the_app_role_but_interactive_daemons_cannot() {
+        use std::time::Instant;
+
+        struct Loaded(String);
+        impl Drop for Loaded {
+            fn drop(&mut self) {
+                let _ = aterm_uds::deadline::output_until(
+                    command("/bin/launchctl").args(["bootout", &self.0]),
+                    Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+                );
+            }
+        }
+
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        for (mutation, expected) in [(None, "true 1\n"), (Some("Interactive"), "false 0\n")] {
+            let phase = format!("role-{}-{}", std::process::id(), mutation.unwrap_or("App"));
+            let dir = tmp.path().join(&phase);
+            std::fs::create_dir(&dir).unwrap();
+            let record = dir.join("role");
+            let script = format!(
+                "export ATERM_Q4_ROLE_RECORD={}; {} --exact mac_runtime::tests::runtime_role_probe --nocapture",
+                q(&record.display().to_string()),
+                q(&exe.display().to_string())
+            );
+            let mut job = app_job(tmp.path(), &phase, &script);
+            if let Some(kind) = mutation {
+                job.as_object_mut()
+                    .unwrap()
+                    .insert("ProcessType".into(), json!(kind));
+            }
+            let input = dir.join("job.json");
+            let plist = dir.join("job.plist");
+            write_json(&input, &job).unwrap();
+            let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+            let converted = aterm_uds::deadline::output_until(
+                command("/usr/bin/plutil").args([
+                    "-convert",
+                    "xml1",
+                    "-o",
+                    plist.to_str().unwrap(),
+                    input.to_str().unwrap(),
+                ]),
+                until,
+            )
+            .unwrap();
+            assert!(converted.status.success(), "{converted:?}");
+            let domain = format!("gui/{}", crate::sys::getuid());
+            let target = format!("{domain}/{}", job["Label"].as_str().unwrap());
+            let loaded = aterm_uds::deadline::output_until(
+                command("/bin/launchctl").args(["bootstrap", &domain, plist.to_str().unwrap()]),
+                until,
+            )
+            .unwrap();
+            assert!(loaded.status.success(), "{loaded:?}");
+            let _loaded = Loaded(target);
+            while !dir.join("exit").is_file() {
+                assert!(
+                    Instant::now() < until,
+                    "the native role probe did not finish"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert_eq!(std::fs::read_to_string(dir.join("exit")).unwrap(), "0\n");
+            assert_eq!(std::fs::read_to_string(&record).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn timing_job_preserves_arguments_and_separate_results() {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let root = tmp.path().join("a driver's files");
         let dir = root.join("take-2");
         std::fs::create_dir_all(&dir).unwrap();
         let command = "printf '%s' '<&>\\\"'; printf failure >&2; exit 17";
-        let job = interactive_job(&root, "take-2", command);
-        // Removing this property (or using Background) recreates the daemon-driver control.
-        assert_eq!(job["ProcessType"].as_str(), Some("Interactive"));
+        let job = app_job(&root, "take-2", command);
         assert_eq!(job["RunAtLoad"].as_bool(), Some(true));
         assert_eq!(job["ProgramArguments"][0].as_str(), Some("/bin/sh"));
         assert_eq!(job["ProgramArguments"][1].as_str(), Some("-c"));

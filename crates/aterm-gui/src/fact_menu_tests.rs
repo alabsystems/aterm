@@ -11,7 +11,7 @@ use aterm_agent::harness::session_usage::TrafficView;
 use super::{
     AccountLabel, AccountMenuRow, FactAct, FactMenuFacts, RowWeek, SessionWeek,
     account_menu_rows_from, band_glyphs, band_level, rows, traffic_rows, weekly_facts,
-    weekly_gap_why, weekly_meter_bar,
+    weekly_gap_why,
 };
 use crate::autopilot_menu::{MenuAct, MenuRow, PlotInk};
 use crate::claude_lights::Fact;
@@ -219,7 +219,7 @@ fn the_newest_login_failure_remains_visible_in_a_short_account_menu() {
         let menu = rows(Fact::Account, &facts);
         let rect = crate::autopilot_menu::place(&menu, (12, 0), (0..14, 0..cols), (cols, 14), 0)
             .expect("short account menu");
-        let text = crate::autopilot_menu::paint(rect, &menu, Default::default(), None, theme)
+        let text = crate::autopilot_menu::paint(rect, &menu, Default::default(), None, theme, None)
             .into_iter()
             .map(|line| {
                 line.iter()
@@ -272,7 +272,8 @@ fn menu_facts(off: FactMask, side: bool) -> FactMenuFacts {
         branch: Some("main".into()),
         context: Some("ctx 84% left".into()),
         subscription: None,
-        weekly_meter: None,
+        weekly: None,
+        own: None,
         weekly_gap: None,
         cli: None,
         own_login: None,
@@ -292,6 +293,7 @@ fn menu_facts(off: FactMask, side: bool) -> FactMenuFacts {
         token: None,
         outlook: None,
         account_row: None,
+        movable: true,
         height: None,
     }
 }
@@ -723,7 +725,7 @@ fn busy_columns_take_the_shaded_ground() {
     let mut card = vec![MenuRow::Header("Traffic \u{b7} tab 1".into())];
     card.extend(traffic_rows(&traffic(), T0 + 240, Some(0), 30));
     let rect = place(&card, (20, 0), (0..20, 0..80), (80, 21), 0).expect("a card");
-    let painted = paint(rect, &card, Default::default(), None, theme);
+    let painted = paint(rect, &card, Default::default(), None, theme, None);
     let row = &painted[3];
     let text = row.iter().map(|cell| cell.ch).collect::<String>();
     let lead = text
@@ -801,21 +803,21 @@ fn the_account_menu_says_why_the_week_is_missing() {
             );
         }
         let metered = FactMenuFacts {
-            weekly_meter: Some(weekly_meter_bar("weekly 38% used")),
+            weekly: Some("weekly 38% used".into()),
             ..facts
         };
         assert!(
             !shown(&rows(Fact::Account, &metered)).contains(&head),
-            "a meter says the week instead"
+            "the footer's words say the week instead"
         );
     }
 }
 
 /// THE ACCOUNT MENU TAKES THE FOOTER'S WEEK as the footer says it: a figure's words (`weekly 39%
-/// used`, a bound `weekly ≥38% used`) give the meter and the session's row its whole percent
-/// left, an aged figure its age as a
-/// store row's, a 7d wall gives `weekly out` (no meter, never a percentage) and the session's
-/// row a limited one, and with neither the footer's reason goes to the menu's why.
+/// used`, a bound `weekly ≥38% used`) give the card's weekly words as said and the session's row
+/// its whole percent left, an aged figure its age as a store row's, a 7d wall gives `weekly out`
+/// (never a percentage) and the session's row a limited one, and with neither the footer's reason
+/// goes to the menu's why.
 #[test]
 fn the_account_menu_takes_the_footers_week_or_its_reason() {
     use aterm_agent::harness::profile::{SubscriptionDisplay, WeeklyFigure, WeeklyGap};
@@ -828,12 +830,8 @@ fn the_account_menu_takes_the_footers_week_or_its_reason() {
     let left = |pct: u32, age: &str| Some(RowWeek::Left(pct, age.to_owned()));
     assert_eq!(
         weekly_facts(&sub(Some("weekly 39% used"), None), false, NOW),
-        (
-            left(61, ""),
-            Some("\u{25b0}\u{25b0}\u{25b0}\u{25b0}\u{25b1}  weekly 39% used".into()),
-            None
-        ),
-        "the words give the meter and the row's percent left"
+        (left(61, ""), Some("weekly 39% used".into()), None),
+        "the words are said as they are and give the row's percent left"
     );
     assert_eq!(
         weekly_facts(&sub(Some("weekly \u{2265}38% used"), None), false, NOW).0,
@@ -861,7 +859,7 @@ fn the_account_menu_takes_the_footers_week_or_its_reason() {
     assert_eq!(
         weekly_facts(&aged, false, NOW + 86_400),
         (None, None, None),
-        "its week reset since the footer's read: no row figure and no meter of the expired week"
+        "its week reset since the footer's read: no row figure and no words of the expired week"
     );
     let future = SubscriptionDisplay {
         weekly_figure: Some(WeeklyFigure {
@@ -886,10 +884,6 @@ fn the_account_menu_takes_the_footers_week_or_its_reason() {
         weekly_facts(&sub(None, Some(WeeklyGap::NoReply)), true, NOW),
         (Some(RowWeek::Out), Some("weekly out".into()), None),
         "a 7d wall over every reason"
-    );
-    assert_eq!(
-        weekly_meter_bar("weekly 39% used"),
-        "\u{25b0}\u{25b0}\u{25b0}\u{25b0}\u{25b1}  weekly 39% used"
     );
 }
 
@@ -1392,24 +1386,12 @@ fn the_sessions_week_reaches_the_row_its_login_is_judged_to() {
 }
 
 #[test]
-fn account_menu_shows_weekly_meter_and_rotation_accounts() {
-    assert_eq!(
-        weekly_meter_bar("weekly 100% used"),
-        "\u{25b1}\u{25b1}\u{25b1}\u{25b1}\u{25b1}  weekly 100% used"
-    );
-    assert_eq!(
-        weekly_meter_bar("weekly 27% used"),
-        "\u{25b0}\u{25b0}\u{25b0}\u{25b0}\u{25b1}  weekly 27% used"
-    );
-    assert_eq!(
-        weekly_meter_bar("weekly 0% used"),
-        "\u{25b0}\u{25b0}\u{25b0}\u{25b0}\u{25b0}  weekly 0% used"
-    );
+fn account_menu_shows_weekly_words_and_rotation_accounts() {
     let facts = FactMenuFacts {
         title: "Accounts \u{b7} tab 1".into(),
         spoken: "Accounts, tab 1".into(),
         subscription: Some("sol-m27@example.test \u{b7} max 20x".into()),
-        weekly_meter: Some(weekly_meter_bar("weekly 100% used")),
+        weekly: Some("weekly 100% used".into()),
         cli: Some(aterm_agent::harness::accounts::Cli::Claude),
         accounts: vec![
             AccountMenuRow {
@@ -1436,10 +1418,7 @@ fn account_menu_shows_weekly_meter_and_rotation_accounts() {
         ..menu_facts(FactMask::default(), true)
     };
     let menu = rows(Fact::Account, &facts);
-    for value in [&facts.subscription, &facts.weekly_meter]
-        .into_iter()
-        .flatten()
-    {
+    for value in [&facts.subscription, &facts.weekly].into_iter().flatten() {
         assert!(
             menu.iter()
                 .any(|row| matches!(row, MenuRow::Note { text, .. } if text.ends_with(value)))
@@ -1931,14 +1910,16 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
 }
 
 /// A MUSE SESSION'S ACCOUNT MENU SPEAKS FOR MUSE, not the rotation pool it has none of: its
-/// own login note, its usage refresh, and never Claude Code's roster or settings rows.
+/// own login note, its usage refresh under `⇄` (never `↻`, which reads as the reset's `↺`,
+/// `docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §4.2), and never Claude Code's roster or
+/// settings rows.
 #[test]
 fn a_muse_sessions_account_menu_is_its_own_login() {
     let facts = FactMenuFacts {
         title: "Accounts \u{b7} tab 1".into(),
         spoken: "Accounts, tab 1".into(),
         subscription: Some("someone@example.test \u{b7} max usage".into()),
-        weekly_meter: Some(weekly_meter_bar("weekly 49% used")),
+        weekly: Some("weekly 49% used".into()),
         own_login: Some("Muse's own login \u{2014} no rotation pool; switch with its /login"),
         refresh_usage: true,
         ..menu_facts(FactMask::default(), true)
@@ -1954,7 +1935,9 @@ fn a_muse_sessions_account_menu_is_its_own_login() {
         "{menu:?}"
     );
     assert!(rows(Fact::Account, &facts).iter().all(|row| match row {
-        MenuRow::Item { act, .. } => *act == MenuAct::Fact(Fact::Account, FactAct::RefreshUsage),
+        MenuRow::Item { act, glyph, .. } =>
+            *act == MenuAct::Fact(Fact::Account, FactAct::RefreshUsage)
+                && *glyph == crate::fact_menu::PIN_GLYPH,
         _ => true,
     }));
     let plain = FactMenuFacts {

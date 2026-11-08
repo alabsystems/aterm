@@ -6366,7 +6366,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         let _ = fs::remove_file(&journal_path);
     }
     let published = if kind == CutKind::Real {
-        let source = gates::published_source()?;
+        let source = gates::published_source(repo)?;
         let checkout = gates::place_published(&operator, repo, &source)?;
         step(
             "source",
@@ -6383,7 +6383,10 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         gates::own_cutter_gate(&GitCli::new(&checkout.tree), &source.commit, false)?;
         Some(checkout)
     } else {
-        step("source", &dry_run_source_line(&gates::published_source()));
+        step(
+            "source",
+            &dry_run_source_line(&gates::published_source(repo)),
+        );
         None
     };
     let tree = published

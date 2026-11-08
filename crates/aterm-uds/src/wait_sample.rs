@@ -59,6 +59,46 @@ pub struct Sample {
     pub elapsed: Duration,
 }
 
+/// The private raw report retained by a failed [`sample`] call, when collection got far enough
+/// to reserve one. The error remains an [`io::Error`] with its original kind; this accessor is
+/// the only way callers learn the untrusted report's path.
+#[must_use]
+pub fn retained_report(error: &io::Error) -> Option<&Path> {
+    error
+        .get_ref()?
+        .downcast_ref::<RetainedReport>()
+        .map(|retained| retained.report.as_path())
+}
+
+#[derive(Debug)]
+struct RetainedReport {
+    report: PathBuf,
+    error: io::Error,
+}
+
+impl std::fmt::Display for RetainedReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for RetainedReport {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.get_ref().map(|error| error as _)
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn retain_report(error: io::Error, report: &Path) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        RetainedReport {
+            report: report.to_path_buf(),
+            error,
+        },
+    )
+}
+
 /// Explicitly sample `expected` for one second, with 100 ms between stack readings. The
 /// caller supplies an existing owner-private directory; this call never asks for permission,
 /// escalates privileges, or automatically samples another pid. Same-UID birth and exec version
@@ -66,9 +106,9 @@ pub struct Sample {
 /// `canceled` is checked before work and between waits of at most 25 ms. Cancellation sends
 /// `SIGKILL` only to the owned sample child and waits at most 100 ms for its reap; a child the
 /// kernel will not reap is left to the existing reaper. It never signals the sampled process.
-/// Raw output is retained even when collection or classification fails; only the closed kind
-/// and the private report's path are returned on success. Neither a file descriptor nor a
-/// frame names a lock holder here.
+/// Raw output is retained even when collection or classification fails. On success the private
+/// report's path is in [`Sample`]; on failure [`retained_report`] returns it when collection got
+/// far enough to reserve one. Neither a file descriptor nor a frame names a lock holder here.
 ///
 /// # Errors
 /// `Unsupported` off macOS; `InvalidInput` for an incomplete identity; `NotFound` when its
@@ -306,7 +346,7 @@ fn leaf(symbol: &str) -> Kind {
 mod macos {
     use super::{
         C_NAME, C_PATH, Identity, Image, KERNEL_NAME, KERNEL_PATH, MAX_REPORT, Path, Sample,
-        classify, identity_matches, io,
+        classify, identity_matches, io, retain_report,
     };
     use std::ffi::{CStr, c_void};
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -365,20 +405,25 @@ mod macos {
             .stdin(crate::spawnfd::Stdio::null())
             .stdout(crate::spawnfd::Stdio::null())
             .stderr(crate::spawnfd::Stdio::null());
-        // Recheck after private-file setup, immediately before the only sample invocation.
-        check(expected)?;
-        check_cancellation(&canceled)?;
-        let status = run(&mut command, &canceled)?;
-        check(expected)?;
-        check_cancellation(&canceled)?;
+        // Recheck after private-file setup, immediately before the only sample invocation. Once
+        // the report exists, every error carries its path so a diagnostic caller can retain it.
+        check(expected).map_err(|error| retain_report(error, &report))?;
+        check_cancellation(&canceled).map_err(|error| retain_report(error, &report))?;
+        let status = run(&mut command, &canceled).map_err(|error| retain_report(error, &report))?;
+        check(expected).map_err(|error| retain_report(error, &report))?;
+        check_cancellation(&canceled).map_err(|error| retain_report(error, &report))?;
         if !status.success() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "the sample tool failed or refused the process",
+            return Err(retain_report(
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "the sample tool failed or refused the process",
+                ),
+                &report,
             ));
         }
         let bytes = crate::private_file::read_private(output_dir, &name, MAX_REPORT)
-            .map_err(io::Error::other)?;
+            .map_err(io::Error::other)
+            .map_err(|error| retain_report(error, &report))?;
         let kernel = system_image(libc::read as *const c_void, KERNEL_NAME, KERNEL_PATH);
         let c_image = system_image(libc::nanosleep as *const c_void, C_NAME, C_PATH);
         let kind = std::str::from_utf8(&bytes)
@@ -387,8 +432,8 @@ mod macos {
             .map_or(super::Kind::Unparsed, |(text, kernel)| {
                 classify(text, &kernel, c_image.as_ref())
             });
-        check(expected)?;
-        check_cancellation(&canceled)?;
+        check(expected).map_err(|error| retain_report(error, &report))?;
+        check_cancellation(&canceled).map_err(|error| retain_report(error, &report))?;
         Ok(Sample {
             kind,
             report,
@@ -511,6 +556,23 @@ mod tests {
 
     const UUID: &str = "F63BF418-8F75-34A4-AAF1-8CAF2B9B6A05";
     const C_UUID: &str = "FBA7B23E-AA60-3A90-9AA4-A7A2E0AD63EE";
+
+    /// Once a native report exists, a collection failure keeps both its original I/O class and
+    /// the report path. NEGATIVE CONTROL: a plain error carries no path.
+    #[test]
+    fn a_failed_sample_can_return_its_retained_report() {
+        let path = Path::new("private/wait-deadbeef.sample.txt");
+        let error = retain_report(
+            io::Error::new(io::ErrorKind::PermissionDenied, "sample refused"),
+            path,
+        );
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "sample refused");
+        assert_eq!(retained_report(&error), Some(path));
+
+        let before_reservation = io::Error::new(io::ErrorKind::NotFound, "identity vanished");
+        assert_eq!(retained_report(&before_reservation), None);
+    }
 
     fn decode(report: &str, uuid: &str) -> Kind {
         classify(report, &kernel(uuid), Some(&c_image()))

@@ -25,6 +25,7 @@ fn other(root: &Receipt, phase: Phase) -> Receipt {
     prepare.id.clone_from(&old.id);
     old.native_prepare = NativeRequest::prepare(*prepare).encode().unwrap();
     old.phase = phase;
+    old.accepted_turn = (old.phase == Phase::Consumed).then(|| old.intent.wall.clone());
     old
 }
 

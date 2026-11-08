@@ -266,6 +266,15 @@ pub fn compile_unit_events(stage: &str, output: &str) -> Vec<String> {
         let string = |key| value.get(key).and_then(Value::as_str);
         let fresh = value.get("fresh").and_then(Value::as_bool);
         let (cause, cause_status) = unit.cause(fresh);
+        // Only the four measuring benches supply cross-tree bundle evidence. Hash the
+        // executable itself, including its linked harness implementation and dependencies.
+        let harness_sha256 = value.get("target").filter(|target| {
+            target["kind"].as_array().is_some_and(|k| k.len() == 1 && k[0].as_str() == Some("bench"))
+                && target["name"].as_str().is_some_and(|name| crate::stages::MEASURING_TARGETS.contains(&name))
+        }).and_then(|_| value["manifest_path"].as_str())
+            .filter(|path| path.ends_with("/crates/aterm-conformance/Cargo.toml"))
+            .and_then(|_| value["executable"].as_str())
+            .and_then(|path| crate::test_index::digest(std::path::Path::new(path)).ok());
         format!("verify-event: {}", aterm_json::json!({
             "schema": 1, "event": "compile-unit-finished", "stage": stage,
             "package_id": string("package_id"),
@@ -280,8 +289,22 @@ pub fn compile_unit_events(stage: &str, output: &str) -> Vec<String> {
             "fresh": fresh,
             "rebuild_reason": cause,
             "rebuild_reason_status": cause_status,
+            "measure_harness_sha256": harness_sha256,
         }))
     }).collect()
+}
+
+/// Capture the running verifier before it starts a compiler that may uplift its path. Both
+/// release halves use the same Cargo launch; workspace compilation must not change this key.
+pub(crate) fn running_driver() -> Option<&'static str> {
+    static DRIVER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    DRIVER
+        .get_or_init(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|path| crate::test_index::digest(&path).ok())
+        })
+        .as_deref()
 }
 
 /// A stage admitted to execute, paired with its completion by the run-local index.
@@ -372,19 +395,14 @@ pub const EVENT_ROW_BYTES: usize = 512;
 /// `\u` escape, a quote or a backslash as two, any other character as its UTF-8 length.
 #[must_use]
 pub fn clip_json(text: &str, max: usize) -> String {
-    let cost = |c: char| match c {
-        '"' | '\\' => 2,
-        c if u32::from(c) < 0x20 => 6,
-        c => c.len_utf8(),
-    };
-    if text.chars().map(cost).sum::<usize>() <= max {
+    if text.chars().map(json_char_bytes).sum::<usize>() <= max {
         return text.to_owned();
     }
     let room = max.saturating_sub('…'.len_utf8());
     let mut used = 0;
     let mut out = String::new();
     for c in text.chars() {
-        used += cost(c);
+        used += json_char_bytes(c);
         if used > room {
             break;
         }
@@ -392,6 +410,15 @@ pub fn clip_json(text: &str, max: usize) -> String {
     }
     out.push('…');
     out
+}
+
+/// An upper bound on one character's JSON string encoding, excluding its quotes.
+pub(crate) fn json_char_bytes(c: char) -> usize {
+    match c {
+        '"' | '\\' => 2,
+        c if u32::from(c) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
 }
 
 /// A finished check's `check-finished` event, one newline-terminated line: its outcome word, its
@@ -708,6 +735,30 @@ pub fn moved_checkout(
 
 #[cfg(test)]
 mod tests {
+    /// Evidence hashes the linked executable. Wrong targets, a missing executable, and one
+    /// changed harness byte cannot authorize reuse of the same measurement.
+    #[test]
+    fn measure_evidence_is_the_linked_harness_content() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let executable = dir.path().join("paint");
+        std::fs::write(&executable, b"first linked harness").unwrap();
+        let artifact = |kind: &str| aterm_json::json!({"reason":"compiler-artifact", "manifest_path":"/r/crates/aterm-conformance/Cargo.toml", "target":{"name":"paint","kind":[kind]}, "executable":executable});
+        let wire = artifact("bench");
+        let digest = |wire: &aterm_json::Value| {
+            let line = super::compile_unit_events("compile", &wire.to_string())
+                .pop()
+                .unwrap();
+            let event: aterm_json::Value =
+                aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap();
+            event["measure_harness_sha256"].as_str().map(str::to_owned)
+        };
+        let first = digest(&wire).unwrap();
+        std::fs::write(&executable, b"second linked harness").unwrap();
+        assert_ne!(digest(&wire).unwrap(), first);
+        assert!(digest(&artifact("test")).is_none());
+        std::fs::remove_file(executable).unwrap();
+        assert!(digest(&wire).is_none());
+    }
     use super::*;
 
     #[test]

@@ -5,8 +5,6 @@
 
 #![deny(unsafe_code)]
 
-#[cfg(all(test, unix))]
-aterm_db::admission_waits_in_tests!(aterm_spec::wait::MUST_HAPPEN);
 #[cfg(test)]
 aterm_durable::plain_durable_flushes_in_tests!();
 

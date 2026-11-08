@@ -5,6 +5,8 @@
 
 use aterm_agent::supervise::Autopilot;
 use aterm_core::terminal::RenderCell;
+use aterm_effects::glass_inks::{GlassInks, field};
+use aterm_effects::harness_card::CardPalette;
 use aterm_render::Theme;
 
 use crate::autopilot::AutopilotView;
@@ -187,20 +189,29 @@ pub(crate) struct PlotCell {
     pub(crate) busy: bool,
 }
 
-/// Ink role for a [`PlotCell`].
+/// Ink role for a [`PlotCell`]: the Accounts card's follow its `CardInk`
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §5.1), each a token of the glass the card
+/// wears ([`GlassInks`]), a hued one at its column's palette position over the card's own width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PlotInk {
+    /// The traffic card's inbound band: the card's accent.
     In,
+    /// The traffic card's outbound band: the card's value ink.
     Out,
+    /// The day axis, a legend's or a row's words, `▕`: the glass's quiet ink.
     Axis,
-    /// A bar's used and projected cells (`━ ╍ ┽`) and a carrier's run: the accent floored to
-    /// 4.5:1 on the card.
-    Meter,
-    /// A bar's room left (`─ ┄`): the rule's ink floored to 3:1 on the card.
+    /// A measured level (`▁…█`): the glass's mark at the cell's column, 3:1 or more.
+    Read,
+    /// The projected line (`▁ 🭻…🭶 ▔`; a lane's `▁ 🭻…🭸`): the glass's letter at the cell's
+    /// column, 4.5:1 or more.
+    Ahead,
+    /// `→` and `↺`: the glass's lit ink.
+    Mark,
+    /// `┄`: the glass's track, 3:1 or more.
     Track,
-    /// A stop (`╳`): the warn ink floored to 4.5:1 on the card.
+    /// `╳`, `$` and a lane's out line: the glass's warn ink, bold, on its wash ([`WARN_WASH`]).
     Warn,
-    /// A label's text or a figure: the card's value ink.
+    /// A name inside a chart: the glass's value ink.
     Value,
 }
 
@@ -690,7 +701,38 @@ pub(crate) const fn key_of(key: &aterm_types::keyboard::Key) -> MenuKey {
     }
 }
 
-/// Render the menu card into `rect.h` rows of `rect.w` cells.
+/// The glass a card wears ([`paint`]): the inks and the card's painted height.
+struct CardGlass {
+    inks: GlassInks,
+    /// The rows the card paints, its border's included.
+    rows: usize,
+    /// Its rules are drawn inside the border, so the arc runs whole round the card.
+    arc: bool,
+}
+
+impl CardGlass {
+    /// The border's ink at `row`, `col` of a card `w` cells wide.
+    fn border(&self, row: usize, col: usize, w: usize) -> [u8; 3] {
+        unpack(self.inks.border(row, col, self.rows, w))
+    }
+}
+
+const fn pack(c: [u8; 3]) -> u32 {
+    u32::from_be_bytes([0, c[0], c[1], c[2]])
+}
+
+const fn unpack(c: u32) -> [u8; 3] {
+    [(c >> 16) as u8, (c >> 8) as u8, c as u8]
+}
+
+/// Render the menu card into `rect.h` rows of `rect.w` cells, wearing `palette`'s glass
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4, §4.1): a fact card the glass opens
+/// wears its pane's Autopilot palette on the pane's own ground ([`crate::tab_menu::glass_menu_colors`],
+/// the ground the glass's inks are solved on), its border the static arc
+/// ([`GlassInks::border`]), its rules inside the border, its drawn rows the glass's tokens with
+/// each column's hue and a warn cell on a wash of the warn ink ([`WARN_WASH`]); with no palette
+/// (the Autopilot chip's menu, a pane with no harness theme) the card stands on the band's
+/// grey, every token is neutral and the border is the card's rule ink.
 #[must_use]
 pub(crate) fn paint(
     rect: MenuRect,
@@ -698,26 +740,54 @@ pub(crate) fn paint(
     viewport: MenuViewport,
     highlight: Option<usize>,
     theme: Theme,
+    palette: Option<CardPalette>,
 ) -> Vec<Vec<RenderCell>> {
-    let c = crate::tab_menu::menu_colors(theme);
+    let c = match palette {
+        Some(_) => crate::tab_menu::glass_menu_colors(theme),
+        None => crate::tab_menu::menu_colors(theme),
+    };
     let w = rect.w;
     let pad = side_pad(w, rows);
     let text_start = 1 + pad;
     let text_end = w.saturating_sub(1 + pad);
     let cell = crate::chrome_band::cell;
-    let edge = |left: char, fill: char, right: char| {
-        let mut row = vec![cell(fill, c.rule, c.card_bg, false, false); w];
-        if let Some(first) = row.first_mut() {
-            *first = cell(left, c.rule, c.card_bg, false, false);
-        }
+    let visible = viewport.range(rows.len(), rect.h.saturating_sub(2));
+    let glass = CardGlass {
+        inks: GlassInks::of(
+            palette,
+            pack(c.card_bg),
+            theme.fg & 0x00FF_FFFF,
+            pack(c.rule),
+        ),
+        rows: (visible.len() + 2).min(rect.h),
+        arc: palette.is_some(),
+    };
+    let edge = |r: usize, left: char, fill: char, right: char| {
+        (0..w)
+            .map(|col| {
+                let ch = match col {
+                    0 => left,
+                    col if col + 1 == w => right,
+                    _ => fill,
+                };
+                cell(ch, glass.border(r, col, w), c.card_bg, false, false)
+            })
+            .collect::<Vec<_>>()
+    };
+    let sides = |r: usize, row: &mut [RenderCell]| {
+        row[0] = cell('\u{2502}', glass.border(r, 0, w), c.card_bg, false, false);
         if w >= 2 {
-            row[w - 1] = cell(right, c.rule, c.card_bg, false, false);
+            row[w - 1] = cell(
+                '\u{2502}',
+                glass.border(r, w - 1, w),
+                c.card_bg,
+                false,
+                false,
+            );
         }
-        row
     };
     let mut out = Vec::with_capacity(rect.h);
-    out.push(edge('\u{250C}', '\u{2500}', '\u{2510}'));
-    let visible = viewport.range(rows.len(), rect.h.saturating_sub(2));
+    out.push(edge(0, '\u{250C}', '\u{2500}', '\u{2510}'));
     if visible.start > 0 && w > 2 {
         out[0][w - 2] = cell('↑', c.band.value, c.card_bg, true, false);
     }
@@ -727,12 +797,25 @@ pub(crate) fn paint(
         .take(visible.end)
         .skip(visible.start)
     {
+        let r = out.len();
         if matches!(row, MenuRow::Rule) {
-            out.push(edge('\u{251C}', '\u{2500}', '\u{2524}'));
+            if glass.arc {
+                // Inside the border, so the arc runs whole round the card.
+                let mut cells = vec![cell(' ', c.rule, c.card_bg, false, false); w];
+                sides(r, &mut cells);
+                for slot in cells.iter_mut().take(text_end).skip(text_start) {
+                    *slot = cell('\u{2500}', c.rule, c.card_bg, false, false);
+                }
+                out.push(cells);
+            } else {
+                out.push(edge(r, '\u{251C}', '\u{2500}', '\u{2524}'));
+            }
             continue;
         }
         if let MenuRow::Plot { cells: plot, .. } = row {
-            out.push(paint_plot(w, (text_start, text_end), plot, &c));
+            let mut cells = paint_plot(w, (text_start, text_end), plot, &c, &glass.inks);
+            sides(r, &mut cells);
+            out.push(cells);
             continue;
         }
         let selected = highlight == Some(i) && row.selectable();
@@ -746,10 +829,7 @@ pub(crate) fn paint(
             MenuRow::Note {
                 tone: NoteTone::Warn,
                 ..
-            } => (
-                crate::claude_footer::legible_on(c.band.warn, c.card_bg),
-                false,
-            ),
+            } => (unpack(glass.inks.warn()), true),
             MenuRow::Note { .. } | MenuRow::SetBy { .. } | MenuRow::Item { enabled: false, .. } => {
                 (c.disabled, false)
             }
@@ -757,10 +837,7 @@ pub(crate) fn paint(
             _ => (c.band.value, false),
         };
         let mut cells = vec![cell(' ', fg, bg, false, false); w];
-        cells[0] = cell('\u{2502}', c.rule, c.card_bg, false, false);
-        if w >= 2 {
-            cells[w - 1] = cell('\u{2502}', c.rule, c.card_bg, false, false);
-        }
+        sides(out.len(), &mut cells);
         let checked = matches!(row, MenuRow::Item { checked: true, .. });
         let room = text_end
             .saturating_sub(text_start)
@@ -776,7 +853,7 @@ pub(crate) fn paint(
         out.push(cells);
     }
     if out.len() < rect.h {
-        out.push(edge('\u{2514}', '\u{2500}', '\u{2518}'));
+        out.push(edge(out.len(), '\u{2514}', '\u{2500}', '\u{2518}'));
     }
     if visible.end < rows.len()
         && w > 2
@@ -788,35 +865,54 @@ pub(crate) fn paint(
     out
 }
 
+/// How far a warn cell's ground is mixed toward the warn ink on a drawn row: where the warn ink
+/// has a hue of its own (Cruise, Land), a stop and an out line stand on a wash of it, so they
+/// read apart from the projected line's letters even where a letter takes the warn's hue (Land's
+/// sunset at its orange); the warn ink is floored along its hue to 4.5:1 on the wash.
+pub(crate) const WARN_WASH: f32 = 0.16;
+
+/// A drawn row's cells inside the border (its sides are the caller's): each cell in its ink,
+/// a hued one at its column's palette position over the card's own `w` cells, and a warn cell
+/// on its wash ([`WARN_WASH`]).
 fn paint_plot(
     w: usize,
     (text_start, text_end): (usize, usize),
     plot: &[PlotCell],
     c: &crate::tab_menu::MenuColors,
+    glass: &GlassInks,
 ) -> Vec<RenderCell> {
     let cell = crate::chrome_band::cell;
     let busy_bg = crate::chrome_band::mix3(c.card_bg, c.band.accent, 0.10);
+    // A warn cell's ground and ink: on a wash of the warn ink where it has a hue of its own.
+    let warn_on = (glass.warn() != glass.lit()).then(|| {
+        let wash = crate::chrome_band::mix3(c.card_bg, unpack(glass.warn()), WARN_WASH);
+        let ink = aterm_effects::color_math::floor_contrast_keeping_hue(
+            glass.warn(),
+            pack(wash),
+            aterm_effects::cli_marks::NAME_CONTRAST,
+        );
+        (wash, unpack(ink))
+    });
     let mut cells = vec![cell(' ', c.band.value, c.card_bg, false, false); w];
-    cells[0] = cell('\u{2502}', c.rule, c.card_bg, false, false);
-    if w >= 2 {
-        cells[w - 1] = cell('\u{2502}', c.rule, c.card_bg, false, false);
-    }
-    for (slot, p) in cells
-        .iter_mut()
-        .take(text_end)
-        .skip(text_start)
-        .zip(plot.iter())
-    {
-        let fg = match p.ink {
-            PlotInk::In => c.band.accent,
-            PlotInk::Out | PlotInk::Value => c.band.value,
-            PlotInk::Axis => c.band.label,
-            PlotInk::Meter => crate::claude_footer::legible_on(c.band.accent, c.card_bg),
-            PlotInk::Track => crate::claude_footer::visible_on(c.rule, c.card_bg),
-            PlotInk::Warn => crate::claude_footer::legible_on(c.band.warn, c.card_bg),
+    for (col, p) in (text_start..text_end).zip(plot.iter()) {
+        let at = field(col, w);
+        let (fg, bold) = match p.ink {
+            PlotInk::In => (c.band.accent, false),
+            PlotInk::Out => (c.band.value, false),
+            PlotInk::Axis => (unpack(glass.quiet()), false),
+            PlotInk::Read => (unpack(glass.mark(at)), false),
+            PlotInk::Ahead => (unpack(glass.letter(at)), false),
+            PlotInk::Mark => (unpack(glass.lit()), false),
+            PlotInk::Track => (unpack(glass.track()), false),
+            PlotInk::Warn => (warn_on.map_or(unpack(glass.warn()), |(_, ink)| ink), true),
+            PlotInk::Value => (unpack(glass.value()), false),
         };
-        let bg = if p.busy { busy_bg } else { c.card_bg };
-        *slot = cell(p.ch, fg, bg, false, false);
+        let bg = match (p.busy, warn_on) {
+            (true, _) => busy_bg,
+            (false, Some((wash, _))) if p.ink == PlotInk::Warn => wash,
+            (false, _) => c.card_bg,
+        };
+        cells[col] = cell(p.ch, fg, bg, bold, false);
     }
     cells
 }
@@ -1061,6 +1157,18 @@ pub(crate) fn fingerprint(menu: Option<&AutopilotMenu>, wid: WindowId) -> u64 {
 }
 
 impl App {
+    /// The Autopilot palette the glass of `session`'s pane wears
+    /// ([`crate::autopilot::harness_theme`]), which a fact card it opens wears too.
+    pub(crate) fn card_palette(&self, session: u64) -> Option<CardPalette> {
+        let (word, view, supervised) = self.session_autopilot(session);
+        crate::autopilot::harness_theme(
+            view,
+            supervised,
+            word,
+            self.unhosted_glass(self.session_agent(session)),
+        )
+    }
+
     /// Session place label and optional title for menu headers.
     pub(crate) fn menu_place_and_name(&self, session: u64) -> (String, Option<String>) {
         let sid = self
@@ -1381,6 +1489,12 @@ impl App {
         }
         let top = usize::from(self.chrome_rows(wid));
         let theme = self.overlay_card_theme(wid);
+        // A fact card wears the glass of its session's pane: its Autopilot palette, as the
+        // pane's lines do (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4).
+        let palette = match owner {
+            MenuOwner::Autopilot => None,
+            MenuOwner::Fact(_) => self.card_palette(session),
+        };
         let ((cw, ch), pad) = (self.win_cell_size(wid), self.win_pad(wid));
         let grid_top = self.win_pad_top(wid) + self.win_head(wid);
         let pane = self.autopilot_menu_pane(wid, session);
@@ -1413,7 +1527,14 @@ impl App {
                 .px
                 .and_then(|(x, y)| self.frame_cell_at(wid, x, y))
                 .is_some_and(|(row, col)| rect.contains(row, col));
-        let painted = paint(rect, &menu.rows, menu.viewport, menu.highlight, theme);
+        let painted = paint(
+            rect,
+            &menu.rows,
+            menu.viewport,
+            menu.highlight,
+            theme,
+            palette,
+        );
         let ws = self.windows.get_mut(&wid)?;
         let ground = crate::tab_menu::ground_cell(theme, ws.input_scratch.default_bg);
         let right = rect.col + rect.w;

@@ -689,7 +689,15 @@ fn a_worker_whose_first_prompt_comes_late_still_starts() {
 /// nothing.
 #[test]
 fn a_program_worker_concludes_on_its_exit_status_with_its_output_as_its_result() {
-    let inst = boot("p", "/bin/bash", Some(SUPERVISED), None);
+    // This checks program output and exit status. Bash job control can add an
+    // unrelated child-setpgid diagnostic; foreground_handback_live_headless
+    // exercises job control separately. Keep this fixture's exact output check.
+    let inst = boot(
+        "p",
+        "/bin/bash",
+        Some(SUPERVISED),
+        Some((".bashrc", "set +m\n")),
+    );
     let (_, manager) = boot_session(&inst);
     let work = inst.tmp.join("work");
     for (task, state, conclusion, exit, said) in [

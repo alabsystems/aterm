@@ -560,7 +560,9 @@ impl Git<'_> {
     fn ok(&self, args: &[&str], within: Duration) -> Result<String, String> {
         let out = self.complete(args, within)?;
         if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            Ok(String::from_utf8_lossy(&out.stdout)
+                .trim_end_matches(['\r', '\n'])
+                .to_owned())
         } else {
             Err(format!(
                 "git {}: {}",
@@ -797,22 +799,11 @@ impl Git<'_> {
                     )
                 });
         }
-        match self.local(&["symbolic-ref", "--quiet", "HEAD"]) {
-            Ok(branch) => {
-                self.local(&["update-ref", "-m", "verify land", &branch, landing, judged])
-            }
-            Err(_) => self.local(&[
-                "update-ref",
-                "--no-deref",
-                "-m",
-                "verify land",
-                "HEAD",
-                landing,
-                judged,
-            ]),
-        }
-        .map(drop)
-        .map_err(not_moved)
+        // Git resolves HEAD's exact referent, including names that cannot round-trip through
+        // text. The same transaction also handles a detached HEAD and checks its old commit.
+        self.local(&["update-ref", "-m", "verify land", "HEAD", landing, judged])
+            .map(drop)
+            .map_err(not_moved)
     }
 }
 

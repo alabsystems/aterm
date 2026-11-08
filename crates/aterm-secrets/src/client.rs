@@ -2871,6 +2871,47 @@ const CURRENT_WAIT: Duration = Duration::from_secs(30);
 const CURRENT_LOOK: Duration = Duration::from_millis(100);
 
 impl MaterializationSnapshot {
+    /// The historical materialized version admitted beside the captured local inputs.
+    /// This is not their immutable origin or proof of current currency or signed delivery;
+    /// unversioned Plain-file materialization records zero.
+    pub const fn sequence(&self) -> u64 {
+        self.seq
+    }
+
+    /// Hold the ordinary readiness guard while using this exact source/version, rather
+    /// than the looser scoped-file currency that permits unrelated later versions.
+    pub(crate) fn at_current_version<T>(
+        &self,
+        paths: &Paths,
+        entries: &[String],
+        read: impl FnOnce() -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        if entries.is_empty()
+            || entries
+                .iter()
+                .any(|entry| !self.manifest.files.contains_key(entry))
+            || self
+                .entries
+                .as_ref()
+                .is_some_and(|covered| entries.iter().any(|entry| !covered.contains(entry)))
+        {
+            return Err(Error::new(
+                "the captured version does not cover this credential want",
+            ));
+        }
+        match with_ready_state(paths, Some(&self.config), files_intact, None, |now| {
+            if now.seq != self.seq || now.digest != self.digest || !now.holds_the_files_of(self) {
+                return Err(Error::new("the captured credential version changed"));
+            }
+            read()
+        })? {
+            MaterializationObservation::Ready(ready) => Ok(ready.inputs),
+            MaterializationObservation::Blocked(_) => {
+                Err(Error::new("the captured credential source is not ready"))
+            }
+        }
+    }
+
     /// Historical evidence from an actual signed URL body whose admitted context matched
     /// this guarded observation. It is not a claim of remote currency or provider sign-in.
     pub const fn network_materialization(&self) -> Option<VaultNetworkMaterialization> {
@@ -2994,11 +3035,12 @@ pub fn with_materialization_ready_for_entries<T>(
             "entry-scoped materialization needs at least one registered entry",
         ));
     }
-    with_ready_state(paths, Some(expected), files_intact, Some(entries), read).map(|observation| {
-        match observation {
-            MaterializationObservation::Ready(inputs) => Some(*inputs),
-            MaterializationObservation::Blocked(_) => None,
-        }
+    with_ready_state(paths, Some(expected), files_intact, Some(entries), |_| {
+        read()
+    })
+    .map(|observation| match observation {
+        MaterializationObservation::Ready(inputs) => Some(*inputs),
+        MaterializationObservation::Blocked(_) => None,
     })
 }
 
@@ -3013,7 +3055,7 @@ pub fn observe_materialization<T>(
     expected: &Config,
     read: impl FnOnce() -> crate::Result<T>,
 ) -> crate::Result<MaterializationObservation<T>> {
-    with_ready_state(paths, Some(expected), files_intact, None, read)
+    with_ready_state(paths, Some(expected), files_intact, None, |_| read())
 }
 
 fn materialization_ready_with(
@@ -3022,7 +3064,7 @@ fn materialization_ready_with(
     intact: impl FnOnce(&Paths, &State) -> bool,
 ) -> crate::Result<bool> {
     Ok(matches!(
-        with_ready_state(paths, expected, intact, None, || Ok(()))?,
+        with_ready_state(paths, expected, intact, None, |_| Ok(()))?,
         MaterializationObservation::Ready(_)
     ))
 }
@@ -3070,7 +3112,7 @@ fn with_ready_state<T>(
     expected: Option<&Config>,
     intact: impl FnOnce(&Paths, &State) -> bool,
     entries: Option<&[&str]>,
-    read: impl FnOnce() -> crate::Result<T>,
+    read: impl FnOnce(&MaterializationSnapshot) -> crate::Result<T>,
 ) -> crate::Result<MaterializationObservation<T>> {
     use MaterializationBlocker as Blocker;
     let blocked = |why| Ok(MaterializationObservation::Blocked(why));
@@ -3102,16 +3144,17 @@ fn with_ready_state<T>(
     } else {
         None
     };
+    let snapshot = MaterializationSnapshot {
+        network_materialization: network_observation::project(paths, &config, &state),
+        config,
+        seq: state.seq,
+        digest: state.digest.or(state.records_digest),
+        manifest: state.manifest,
+        entries,
+    };
     Ok(MaterializationObservation::Ready(Box::new(Materialized {
-        inputs: read()?,
-        snapshot: MaterializationSnapshot {
-            network_materialization: network_observation::project(paths, &config, &state),
-            config,
-            seq: state.seq,
-            digest: state.digest.or(state.records_digest),
-            manifest: state.manifest,
-            entries,
-        },
+        inputs: read(&snapshot)?,
+        snapshot,
     })))
 }
 

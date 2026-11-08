@@ -181,6 +181,8 @@ pub(crate) struct Unread {
     pub(crate) why: String,
     /// Origin's host could not be reached ([`fn@unreachable`]).
     pub(crate) offline: bool,
+    /// An admitted network command failed, without classifying its remote reason.
+    pub(crate) network: bool,
 }
 
 impl From<String> for Unread {
@@ -188,8 +190,60 @@ impl From<String> for Unread {
         Self {
             why,
             offline: false,
+            network: false,
         }
     }
+}
+
+/// An acquisition error retains whether an admitted network command actually failed.
+/// A nonzero Git result alone never proves authentication refusal.
+#[derive(Debug)]
+pub(crate) enum AcquisitionFailure {
+    Local(String),
+    Network(String),
+}
+
+impl AcquisitionFailure {
+    pub(crate) const fn is_network(&self) -> bool {
+        matches!(self, Self::Network(_))
+    }
+}
+
+impl From<String> for AcquisitionFailure {
+    fn from(why: String) -> Self {
+        Self::Local(why)
+    }
+}
+
+impl From<&str> for AcquisitionFailure {
+    fn from(why: &str) -> Self {
+        Self::Local(why.to_owned())
+    }
+}
+
+impl std::fmt::Display for AcquisitionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local(why) | Self::Network(why) => f.write_str(why),
+        }
+    }
+}
+
+/// Read one admitted network command without inspecting its diagnostic text.
+/// # Errors
+/// The process did not complete, or Git returned a nonzero status.
+pub(crate) fn acquisition_read(
+    sys: &dyn System,
+    command: &Cmd,
+    why: &str,
+) -> Result<Vec<u8>, AcquisitionFailure> {
+    let ran = sys
+        .run_complete_stdout(command)
+        .map_err(|_| AcquisitionFailure::Local(why.into()))?;
+    if !ran.success() {
+        return Err(AcquisitionFailure::Network(why.into()));
+    }
+    Ok(ran.stdout)
 }
 
 /// Whether `url` names `github.com/<owner>/<name>` over HTTPS or SSH, with no credential in it
@@ -547,11 +601,10 @@ fn remote_head(sys: &dyn System, user: &User, path: &Path) -> Result<(String, St
             Unread {
                 why: "cannot reach origin to read its default branch (offline)".into(),
                 offline: true,
+                network: true,
             }
         } else {
-            "cannot read origin's default branch (no access to origin, or no such repository)"
-                .to_owned()
-                .into()
+            Unread { why: "cannot read origin's default branch (no access to origin, or no such repository)".into(), offline: false, network: true }
         }));
     }
     let (mut branch, mut tip) = (None, None);
@@ -927,11 +980,14 @@ pub(crate) fn align_guarded(
             Unread {
                 why: "cannot reach origin to fetch from it (offline)".into(),
                 offline: true,
+                network: true,
             }
         } else {
-            "git fetch origin failed (no access to origin, or no such repository)"
-                .to_owned()
-                .into()
+            Unread {
+                why: "git fetch origin failed (no access to origin, or no such repository)".into(),
+                offline: false,
+                network: true,
+            }
         });
     }
     let local = match local(sys, user, path, origin) {

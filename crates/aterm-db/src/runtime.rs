@@ -150,11 +150,6 @@ fn serve_paced<E>(
     }
     Ok(())
 }
-/// Local custody admission budget: 2 s in product, 60 s hang detector on loaded test hosts.
-#[cfg(not(test))]
-const ADMISSION: Duration = Duration::from_secs(2);
-#[cfg(test)]
-const ADMISSION: Duration = Duration::from_secs(60);
 /// How often the contact ledger is kept, and a steward refreshes the roster from it.
 const KEEP: Duration = Duration::from_secs(600);
 
@@ -1123,7 +1118,7 @@ fn waiting_publication(
 /// No default configuration path or historical generation can stand in for that owner.
 fn transport_publication(paths: &Paths) -> Option<crate::network_state::Publication> {
     let selected =
-        crate::generation::observed_paths_until(paths, Instant::now() + ADMISSION).ok()?;
+        crate::generation::observed_paths_until(paths, crate::admission::deadline()).ok()?;
     crate::network_state::read_transport_publication(&selected.dir.join("commons")).ok()
 }
 
@@ -1271,7 +1266,7 @@ fn serve_selected(
     if !enabled(config).map_err(refusal("configuration"))? {
         return Err(Status::Disabled);
     }
-    let source_snapshot = match commons::observe_until(paths, Instant::now() + ADMISSION) {
+    let source_snapshot = match commons::observe_until(paths, crate::admission::deadline()) {
         Ok(commons::Observation::Visible(snapshot)) => snapshot,
         _ => {
             return serve_presence(
@@ -1290,7 +1285,7 @@ fn serve_selected(
         .ok_or(Status::Waiting)?;
     let lease = Arc::new(lease);
     // Locals drop in reverse order: transport closes/drains before lease unlock.
-    let deadline = Instant::now() + ADMISSION;
+    let deadline = crate::admission::deadline();
     let bootstrap = Bootstrap::cached_until(paths, deadline)
         .map_err(refusal("secrets custody"))?
         .ok_or(Status::Dormant)?;
@@ -1664,7 +1659,7 @@ fn refresh(paths: &Paths, bootstrap: &Bootstrap, ledger: &mut Ledger, now_ms: u6
     if let Ok(mut journal) = Journal::open_existing_until(
         bootstrap.journal_dir(),
         bootstrap.trust(),
-        Instant::now() + ADMISSION,
+        crate::admission::deadline(),
     ) {
         let _ = admin.refresh_commons_roster(bootstrap, &mut journal, ledger, now_ms);
     }

@@ -2442,6 +2442,9 @@ pub struct StreakSeed {
     pub program: Option<aterm_phase::Program>,
     /// The wall's pass at the row ([`Carried::pass`]): none from an older build's row.
     pub pass: WallPass,
+    /// The needs set acked ([`Carried::needs_acked`]), as the latest point row or the latest row
+    /// that notes one says: a box's key or a restart typed since tells nothing of it.
+    pub needs_acked: u64,
 }
 
 #[must_use]
@@ -2452,6 +2455,7 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
     let mut last: Option<StreakSeed> = None;
     let mut recorded = false;
+    let mut acked: Option<(i64, u64)> = None;
     for v in act_lines(body)
         .filter(|l| {
             l.contains(",\"decision\":\"typed\",") || l.contains(",\"decision\":\"waiting\",")
@@ -2502,6 +2506,7 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
                             switch_spent: None,
                             program: None,
                             pass: WallPass::default(),
+                            needs_acked: 0,
                         });
                     }
                 }
@@ -2528,6 +2533,10 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
         let Some(at_ms) = v.get("ts").and_then(aterm_json::Value::as_i64) else {
             continue;
         };
+        let noted = text("reason").and_then(needs_acked_note_of);
+        if (point || noted.is_some()) && acked.is_none_or(|(ms, _)| at_ms >= ms) {
+            acked = Some((at_ms, noted.unwrap_or(0)));
+        }
         if last.as_ref().is_some_and(|l| at_ms < l.at_ms) {
             continue;
         }
@@ -2564,9 +2573,15 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
             switch_spent,
             program,
             pass: text("reason").map(wall_pass_of).unwrap_or_default(),
+            needs_acked: 0,
         });
     }
-    last.map(|l| StreakSeed { recorded, ..l })
+    let needs_acked = acked.map_or(0, |(_, key)| key);
+    last.map(|l| StreakSeed {
+        recorded,
+        needs_acked,
+        ..l
+    })
 }
 
 /// THE SHORT STREAK A ROW'S REASON NAMES ([`point_reason`], [`act_reason_after`]): its `(short
@@ -2698,13 +2713,14 @@ pub const RULE_POINT: &str = "point@v1";
 #[must_use]
 pub fn point_reason(after: Carried, esc: bool) -> String {
     format!(
-        "the turn-end policy judged the point ({SHORT_STREAK}: {}){}{}{}{}{}{}",
+        "the turn-end policy judged the point ({SHORT_STREAK}: {}){}{}{}{}{}{}{}",
         after.short,
         retry_mark(after.retry),
         replies_note(after.said, after.said_reset_ms),
         checks_note(after.checks),
         land_books_note(after.land),
         wall_pass_note(after.pass),
+        needs_acked_note(after.needs_acked),
         if esc {
             format!(" ({PERSONS_ESC})")
         } else {
@@ -2731,6 +2747,8 @@ pub struct Carried {
     /// The wall's pass ([`super::policy::turn_end::TurnEndState::wall_pass`], v6 §14.17.5.7), so
     /// a loop after this one counts a wall's next cut act as this one would.
     pub pass: WallPass,
+    /// The NEEDS YOU set whose ack an act typed ([`super::policy::turn_end::TurnEndState::needs_acked`]; `0` for none), so a loop after this one that adopts the set types it no second time.
+    pub needs_acked: u64,
 }
 
 impl Carried {
@@ -2753,6 +2771,7 @@ impl Carried {
                 spent: false,
                 owed: false,
             },
+            needs_acked: 0,
         }
     }
 }
@@ -2801,6 +2820,22 @@ fn checks_note(checks: u8) -> String {
 fn checks_note_of(reason: &str) -> Option<u8> {
     let (_, rest) = reason.split_once(&format!("({DONE_CHECKS}: "))?;
     crate::parse_uint(rest.split(')').next()?)
+}
+
+const NEEDS_ACKED: &str = "the needs set acked";
+
+/// The ledger's note of the needs set whose ack was typed ([`Carried::needs_acked`]): none while none is, so a ledger that never typed one reads as before.
+fn needs_acked_note(key: u64) -> String {
+    if key == 0 {
+        return String::new();
+    }
+    format!(" ({NEEDS_ACKED}: {key:016x})")
+}
+
+/// [`needs_acked_note`] read back: `None` where a reason holds no such note or a key that is no hex number.
+fn needs_acked_note_of(reason: &str) -> Option<u64> {
+    let (_, rest) = reason.split_once(&format!("({NEEDS_ACKED}: "))?;
+    u64::from_str_radix(rest.split(')').next()?, 16).ok()
 }
 
 const LAND_BOOKS: &str = "the land check's books";
@@ -3095,6 +3130,7 @@ pub fn act_reason_after(after: Carried, limit: Option<LimitTry>) -> String {
     reason.push_str(&checks_note(after.checks));
     reason.push_str(&land_books_note(after.land));
     reason.push_str(&wall_pass_note(after.pass));
+    reason.push_str(&needs_acked_note(after.needs_acked));
     if let Some(l) = limit {
         let head = if l.in_place {
             IN_LIMITS_PLACE
@@ -5636,6 +5672,7 @@ mod tests {
                 checks: 0,
                 land: LandBooks::default(),
                 pass: WallPass::default(),
+                needs_acked: 0,
             };
             let reason = act_reason_after(carried, None);
             let path = seed_ledger(
@@ -5685,6 +5722,7 @@ mod tests {
                 checks: 0,
                 land: LandBooks::default(),
                 pass: WallPass::default(),
+                needs_acked: 0,
             },
             Some(limit),
         );
@@ -5788,6 +5826,79 @@ mod tests {
             .replace(&checks_note(4), "");
         assert_ne!(older, typed);
         assert_eq!(short_streak_in(&older, sid).map(|s| s.checks), Some(0));
+    }
+
+    /// THE NEEDS ACK RIDES THE BOOKS, so a handover's successor adopts the set acked: the act that
+    /// typed it notes the set's key, a box's key typed since leaves it standing, and the next
+    /// point row says what stands acked then. NEGATIVE CONTROLS: a point row noting none takes it
+    /// back (the set changed or came down), and an older build's rows, with no note, read none.
+    #[test]
+    fn the_needs_acked_note_stands_until_a_point_row_says_otherwise() {
+        use super::super::policy::turn_end::RULE_CONTINUE;
+        let sid = Some("@s-9");
+        let row = |ts: i64, rule_id: &str, outcome: Outcome, command: &str, reason: &str| {
+            let row = Row {
+                rule_id,
+                outcome,
+                command,
+                reason,
+                box_seq: 1,
+            };
+            format!("{}\n", row.to_json(ts, sid))
+        };
+        let acked = |needs_acked: u64| Carried {
+            needs_acked,
+            ..Carried::streak(0)
+        };
+        let set = 0x0123_4567_89ab_cdef_u64;
+        assert_eq!(
+            needs_acked_note_of(&act_reason_after(acked(set), None)),
+            Some(set)
+        );
+        assert_eq!(
+            needs_acked_note_of(&point_reason(acked(set), false)),
+            Some(set)
+        );
+        assert_eq!(needs_acked_note_of(&point_reason(acked(0), false)), None);
+        let seed = |body: &str| short_streak_in(body, sid).map(|s| s.needs_acked);
+        let point = row(
+            10_000,
+            RULE_POINT,
+            Outcome::Waiting,
+            "",
+            &point_reason(acked(0), false),
+        );
+        assert_eq!(seed(&point), Some(0));
+        let typed = format!(
+            "{point}{}",
+            row(
+                20_000,
+                RULE_CONTINUE,
+                Outcome::Typed,
+                "keep going Needs on screen; carry on.",
+                &act_reason_after(acked(set), None)
+            )
+        );
+        assert_eq!(seed(&typed), Some(set));
+        let boxed = format!(
+            "{typed}{}",
+            row(30_000, "allow@v1", Outcome::Typed, "1", "1. Yes")
+        );
+        assert_eq!(seed(&boxed), Some(set), "a box's key says nothing of it");
+        let pointed = format!(
+            "{boxed}{}",
+            row(
+                40_000,
+                RULE_POINT,
+                Outcome::Waiting,
+                "",
+                &point_reason(acked(0), false)
+            )
+        );
+        assert_eq!(seed(&pointed), Some(0), "the point row's word stands");
+        let older = typed.replace(&needs_acked_note(set), "");
+        assert_ne!(older, typed);
+        assert_eq!(seed(&older), Some(0));
     }
 
     /// v6 §14.5 (5a): every angle's check, bare, with its suffixes and as the person's hour cuts it
@@ -6054,6 +6165,7 @@ mod tests {
                         checks: 0,
                         land: LandBooks::default(),
                         pass: WallPass::default(),
+                        needs_acked: 0,
                     },
                     false,
                 ),
@@ -6074,6 +6186,7 @@ mod tests {
                         checks: 0,
                         land: LandBooks::default(),
                         pass: WallPass::default(),
+                        needs_acked: 0,
                     },
                     None,
                 ),
@@ -6155,6 +6268,7 @@ mod tests {
                         checks: 0,
                         land: LandBooks::default(),
                         pass: WallPass::default(),
+                        needs_acked: 0,
                     },
                     false,
                 ),
@@ -6353,6 +6467,7 @@ mod tests {
                         checks: 0,
                         land: LandBooks::default(),
                         pass: WallPass::default(),
+                        needs_acked: 0,
                     },
                     false,
                 ),

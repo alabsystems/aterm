@@ -81,6 +81,10 @@ pub struct Complete {
     pub macho_sha256: String,
     /// [`bundle_digest`] of the whole bundle.
     pub bundle_digest: String,
+    /// U: all bundle content, with identity and signature storage normalized. Older completed
+    /// builds remain readable and can ship, but cannot supply a cross-tree measure receipt.
+    #[serde(default)]
+    pub content: Option<String>,
     #[serde(default)]
     pub slices: Vec<SliceRecord>,
     /// The published index run the bytes compiled in (`buildplan::index_hint_now`), when the build found one: a guess its fresh installs' first discovery round follows.
@@ -123,7 +127,7 @@ pub fn store(repo: &Path) -> Result<PathBuf, String> {
     Ok(CacheRoot::for_repo(repo)?.artifacts())
 }
 
-/// The key a bundle of `identity`, built with `compilers`, is kept under: SHA-256 over [`SCHEMA`] and each input, NUL-separated, lowercase hex.
+/// The pre-build lookup key for `identity` and `compilers`: SHA-256 over [`SCHEMA`] and each input, NUL-separated, lowercase hex. New entries are addressed by [`stamped_key`]; earlier completed entries remain at this key.
 #[must_use]
 pub fn key(identity: &Identity, compilers: &Compilers) -> String {
     key_parts(
@@ -134,6 +138,22 @@ pub fn key(identity: &Identity, compilers: &Compilers) -> String {
         &compilers.rustc,
         &compilers.inputs,
     )
+}
+
+/// The stamped product's address: U and the complete reservation/compiler identity. The
+/// pre-build identity key is only an index into these immutable product entries.
+pub fn stamped_key(content: &str, identity_key: &str, index_hint: Option<&str>) -> String {
+    let mut h = aterm_digest::Sha256::new();
+    for part in [
+        "aterm-stamped-product-v1",
+        content,
+        identity_key,
+        index_hint.unwrap_or_default(),
+    ] {
+        h.update(part.as_bytes());
+        h.update(b"\0");
+    }
+    aterm_codec::hex::encode_lower(&h.finalize())
 }
 
 fn key_parts(
@@ -176,6 +196,54 @@ pub fn bundle_digest(app: &Path) -> Result<String, String> {
         h.update([0u8]);
         h.update(line.as_bytes());
         h.update([0u8]);
+    }
+    Ok(aterm_codec::hex::encode_lower(&h.finalize()))
+}
+
+/// U covers every file, link and mode. Only the executable's dedicated identity/signature
+/// storage and the plist's three identity values are normalized.
+pub fn content_digest(app: &Path) -> Result<String, String> {
+    crate::postlink::verify(&app.join("Contents/MacOS/aterm"))?;
+    let mut entries = Vec::new();
+    walk(app, app, &mut entries)?;
+    for (path, line) in &mut entries {
+        let full = app.join(path.as_str());
+        let bytes = if path == "Contents/MacOS/aterm" {
+            crate::postlink::normalized(
+                &crate::durable::read_regular_bytes(&full, u64::MAX)
+                    .map_err(|e| format!("read product: {e}"))?,
+            )?
+        } else if path == "Contents/Info.plist" {
+            let mut plist = crate::durable::read_regular_text(&full, 1024 * 1024)
+                .map_err(|e| format!("read product plist: {e}"))?;
+            for key in [
+                "CFBundleShortVersionString",
+                "CFBundleVersion",
+                "ATermGitCommit",
+            ] {
+                plist = crate::bundle::set_plist_string(&plist, key, "")?;
+            }
+            plist.into_bytes()
+        } else {
+            continue;
+        };
+        let mut h = aterm_digest::Sha256::new();
+        h.update(bytes);
+        let digest = aterm_codec::hex::encode_lower(&h.finalize());
+        let prefix = line
+            .rsplit_once('\0')
+            .ok_or("missing bundle file digest")?
+            .0;
+        *line = format!("{prefix}\0{digest}");
+    }
+    entries.sort_unstable();
+    let mut h = aterm_digest::Sha256::new();
+    h.update(b"aterm-bundle-content-v1\0");
+    for (path, line) in entries {
+        h.update(path.as_bytes());
+        h.update(b"\0");
+        h.update(line.as_bytes());
+        h.update(b"\0");
     }
     Ok(aterm_codec::hex::encode_lower(&h.finalize()))
 }
@@ -237,7 +305,14 @@ pub fn macho_sha256(app: &Path) -> Result<String, String> {
 /// # Errors
 /// A record that does not parse or names another key, and bytes that are not the record's — changed after the build, so never reused and never shipped.
 pub fn read(store: &Path, key: &str) -> Result<Option<Complete>, String> {
-    let dir = store.join(key);
+    let indexed = match crate::durable::read_regular_text(&store.join("identity").join(key), 128) {
+        Ok(text) if aterm_codec::hex::is_lower(&text, 64) => Some(text),
+        Ok(_) => return Err("invalid artifact identity index".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("read artifact identity index: {e}")),
+    };
+    let address = indexed.as_deref().unwrap_or(key);
+    let dir = store.join(address);
     let record = dir.join(COMPLETE_FILE);
     let text = match crate::durable::read_regular_text(&record, 1024 * 1024) {
         Ok(text) => text,
@@ -246,7 +321,7 @@ pub fn read(store: &Path, key: &str) -> Result<Option<Complete>, String> {
     };
     let complete: Complete = aterm_toml::from_str(&text)
         .map_err(|e| format!("{} is not a build record: {e}", record.display()))?;
-    if complete.schema != SCHEMA || complete.key != key {
+    if complete.schema != SCHEMA || complete.key != address {
         return Err(format!(
             "{} is the record of {} ({}), not of {key}",
             record.display(),
@@ -262,7 +337,13 @@ pub fn read(store: &Path, key: &str) -> Result<Option<Complete>, String> {
         &complete.rustc,
         &complete.inputs,
     );
-    if calculated != key {
+    if indexed.is_some() && calculated != key {
+        return Err("artifact identity index names another reservation or compiler".into());
+    }
+    let calculated = complete.content.as_ref().map_or(calculated.clone(), |u| {
+        stamped_key(u, &calculated, complete.index_hint.as_deref())
+    });
+    if calculated != address {
         return Err("the COMPLETE record's build inputs do not match its cache key".into());
     }
     prove(&complete, &app_in(&dir))?;
@@ -294,6 +375,46 @@ pub fn prove(complete: &Complete, app: &Path) -> Result<(), String> {
             complete.build,
             complete.version
         ));
+    }
+    if let Some(expected) = &complete.content {
+        if content_digest(app)? != *expected {
+            return Err("bundle's normalized product content changed".into());
+        }
+        if !aterm_codec::hex::is_lower(&complete.commit, 40) {
+            return Err("product commit is not canonical".into());
+        }
+        let build = complete.build.to_string();
+        let time = crate::bundle::epoch_to_rfc3339(complete.build);
+        let plist =
+            crate::durable::read_regular_text(&app.join("Contents/Info.plist"), 1024 * 1024)
+                .map_err(|e| format!("read reservation plist: {e}"))?;
+        for (key, expected) in [
+            ("CFBundleShortVersionString", complete.version.as_str()),
+            ("CFBundleVersion", build.as_str()),
+            ("ATermGitCommit", &complete.commit[..12]),
+        ] {
+            if crate::manifest_out::plist_string(&plist, key).as_deref() != Some(expected) {
+                return Err(format!("bundle plist {key} differs from the reservation"));
+            }
+        }
+        crate::postlink::prove_stamp(
+            &crate::durable::read_regular_bytes(&app.join("Contents/MacOS/aterm"), u64::MAX)
+                .map_err(|e| e.to_string())?,
+            &[
+                ("version", &complete.version),
+                ("commit", &complete.commit[..12]),
+                ("full_commit", &complete.commit),
+                ("dirty", "false"),
+                ("built_at", &time),
+                ("build", &build),
+                ("dev_commits", "0"),
+                (
+                    "index_hint",
+                    complete.index_hint.as_deref().unwrap_or_default(),
+                ),
+                ("release", "true"),
+            ],
+        )?;
     }
     Ok(())
 }
@@ -382,9 +503,11 @@ pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
                 .into(),
         );
     }
+    let content = content_digest(&built.app)?;
+    let product_key = stamped_key(&content, &key, index_hint.as_deref());
     let complete = Complete {
         schema: SCHEMA.to_string(),
-        key: key.clone(),
+        key: product_key.clone(),
         version: identity.version.clone(),
         build: identity.build,
         commit: identity.commit.clone(),
@@ -396,6 +519,7 @@ pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
         compiler_line: built.compiler_line,
         macho_sha256: macho_sha256(&built.app)?,
         bundle_digest: bundle_digest(&built.app)?,
+        content: Some(content),
         slices: built
             .slices
             .iter()
@@ -411,14 +535,23 @@ pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
             .collect(),
         index_hint,
     };
-    write_complete(&dir, &complete)?;
+    let product_dir = store.join(&product_key);
+    in_use::remove_unused(&product_dir)
+        .map_err(|e| format!("replace incomplete product entry: {e}"))?;
+    std::fs::rename(&dir, &product_dir)
+        .map_err(|e| format!("address stamped product by U: {e}"))?;
+    write_complete(&product_dir, &complete)?;
+    let index = store.join("identity");
+    crate::snapshot::private_dir(&index, "artifact identity index")?;
+    crate::durable::write_atomic_durable(&index.join(&key), product_key.as_bytes(), 0o600)
+        .map_err(|e| format!("write artifact identity index: {e}"))?;
     let needed = needed_keys(repo);
     let mut keep: Vec<&str> = needed.iter().map(String::as_str).collect();
-    keep.push(&key);
+    keep.push(&product_key);
     prune(&store, &keep);
     println!(
         "==> built ONCE: {} — executable sha256 {}, bundle {}",
-        built.app.display(),
+        complete.app(&store).display(),
         complete.macho_sha256,
         complete.bundle_digest
     );

@@ -403,7 +403,7 @@ mod tests {
             EffectRecord::Exchange {
                 door: "probe.env".to_string(),
                 request: b"HOME".to_vec(),
-                reply: b"/Users//test".to_vec(),
+                reply: b"/fixture-home".to_vec(),
             },
             EffectRecord::Exchange {
                 door: "probe.git".to_string(),
@@ -419,7 +419,7 @@ mod tests {
         assert_eq!(
             seam.exchange("probe.env", b"HOME", &mut live_never)
                 .unwrap(),
-            b"/Users//test"
+            b"/fixture-home"
         );
         assert_eq!(
             seam.exchange("probe.git", b"status", &mut live_never)

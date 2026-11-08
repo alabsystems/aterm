@@ -315,7 +315,9 @@ pub fn probe_cached(path_var: Option<&OsStr>, host: &CcHost, cache: Option<&CcCa
 /// when project configuration is inherited. `None` when the compiler cannot
 /// be read or an explicit SDK or developer directory is used: changes within its SDK have
 /// no Apple install receipt to retire a cached success. The policy domain retires verdicts
-/// made by weaker output or SDK custody checks.
+/// made by weaker output, SDK custody or native configuration identity checks. Native PATH
+/// and deployment-target bytes are encoded exactly; unrepresentable SDK/developer paths
+/// disable caching rather than supply a lossy identity.
 fn cc_key(
     located: &Located,
     path_var: Option<&OsStr>,
@@ -331,8 +333,10 @@ fn cc_key(
     };
     let developer_dir = host.developer_dir();
     let receipt = receipt_key(&cache.receipt)?;
-    let sdk = std::fs::canonicalize(developer_dir.join("SDKs/MacOSX.sdk"))
-        .map_or_else(|_| "no sdk".to_owned(), |sdk| sdk.display().to_string());
+    let sdk = match std::fs::canonicalize(developer_dir.join("SDKs/MacOSX.sdk")) {
+        Ok(sdk) => sdk.to_str()?.to_owned(),
+        Err(_) => "no sdk".to_owned(),
+    };
     // The compiler the developer directory holds, where `locate` looks for it: an Xcode
     // install, update or replacement rewrites it while the Command Line Tools receipt stays,
     // and an update that leaves `cc` refusing (a license not yet agreed to) must probe again.
@@ -341,21 +345,21 @@ fn cc_key(
         .map(|clang| crate::probe_cache::identity(clang).unwrap_or_else(|| "absent".to_owned()))
         .collect::<Vec<_>>()
         .join(" ");
-    fn lossy(value: Option<&OsStr>) -> String {
+    fn native(value: Option<&OsStr>) -> String {
         value
-            .map(|v| v.to_string_lossy().into_owned())
+            .map(|v| aterm_codec::hex::encode_lower(v.as_encoded_bytes()))
             .unwrap_or_default()
     }
     crate::probe_cache::key([
-        Some("fresh-executable-link-v5".to_owned()),
+        Some("fresh-executable-link-v6".to_owned()),
         Some(kind.to_owned()),
         crate::probe_cache::identity(cc),
-        Some(developer_dir.display().to_string()),
+        Some(developer_dir.to_str()?.to_owned()),
         Some(clang),
         Some(receipt),
         Some(sdk),
-        Some(lossy(path_var)),
-        Some(lossy(host.deployment_target())),
+        Some(native(path_var)),
+        Some(native(host.deployment_target())),
         Some(host.inherit_environment.to_string()),
         compiler_environment_key(host.inherit_environment),
     ])
@@ -1463,6 +1467,56 @@ mod tests {
     }
 
     #[test]
+    fn distinct_native_paths_cannot_reuse_a_cached_compiler_success() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let root = scratch("native-path-cache");
+        let bin = root.join("bin");
+        let asked = root.join("asked");
+        script(
+            &bin.join("cc"),
+            &format!(
+                "echo asked >> '{}'\ncase \"$1\" in --version) echo cc;; -o) case \"$PATH\" in *$(printf '\\201')) echo 'PATH configuration refused' >&2; exit 1;; esac; printf x > \"$2\"; /bin/chmod +x \"$2\";; esac",
+                asked.display()
+            ),
+        );
+        let host = CcHost {
+            inherit_environment: false,
+            ..plain_host(&root)
+        };
+        let cache = CcCache {
+            file: root.join("state/cc"),
+            receipt: root.join("no-receipt"),
+        };
+        let path = |byte| {
+            let mut bytes = bin.as_os_str().as_encoded_bytes().to_vec();
+            bytes.extend_from_slice(b":/not-a-directory-");
+            bytes.push(byte);
+            std::ffi::OsString::from_vec(bytes)
+        };
+        let first = path(0x80);
+        let changed = path(0x81);
+        assert_eq!(first.to_string_lossy(), changed.to_string_lossy());
+        let ready = CcVerdict::Ready {
+            driver: bin.join("cc"),
+        };
+        for _ in 0..2 {
+            assert_eq!(probe_cached(Some(&first), &host, Some(&cache)), ready);
+        }
+        assert_eq!(std::fs::read_to_string(&asked).unwrap().lines().count(), 2);
+        assert!(matches!(
+            probe_with(Some(&changed), &host),
+            CcVerdict::Broken { why, .. } if why == "PATH configuration refused"
+        ));
+        assert!(matches!(
+            probe_cached(Some(&changed), &host, Some(&cache)),
+            CcVerdict::Broken { why, .. } if why == "PATH configuration refused"
+        ));
+        assert_eq!(probe_cached(Some(&first), &host, Some(&cache)), ready);
+        assert_eq!(std::fs::read_to_string(&asked).unwrap().lines().count(), 6);
+    }
+
+    #[test]
     fn a_changed_deployment_target_cannot_reuse_a_cached_success() {
         let root = scratch("deployment-target");
         let bin = root.join("bin");
@@ -1586,8 +1640,8 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        // The preceding policy could keep a private SDK's success under the same effective
-        // developer directory, then reuse it after its explicit override was removed.
+        // The preceding policy could alias distinct native PATH or deployment-target values
+        // after converting them to lossy text. No fact from that namespace is reusable.
         let current = cc_key(
             &Located::Plain(cc.clone()),
             Some(bin.as_os_str()),
@@ -1595,7 +1649,7 @@ mod tests {
             &cache,
         )
         .unwrap();
-        old_keys.push(current.replacen("fresh-executable-link-v5", "fresh-executable-link-v4", 1));
+        old_keys.push(current.replacen("fresh-executable-link-v6", "fresh-executable-link-v5", 1));
         // The old receipt reader also called an unread receipt absent. Retire that fact
         // even if the receipt really is absent now and all other inputs still match.
         old_keys.push(current.replacen("receipt-v1 absent", "no receipt", 1));

@@ -39,6 +39,9 @@ pub(crate) struct Event {
     pub(crate) message: Option<String>,
     /// Why a case libtest timed failed (`time limit exceeded` under `--ensure-time`).
     pub(crate) reason: Option<String>,
+    pub(crate) source_path: Option<String>,
+    pub(crate) start_line: Option<u64>,
+    pub(crate) start_col: Option<u64>,
     pub(crate) test_count: Option<u64>,
     pub(crate) passed: Option<u64>,
     pub(crate) failed: Option<u64>,
@@ -118,6 +121,9 @@ pub(crate) fn parse_event(line: &str) -> Option<Event> {
         stdout: text("stdout"),
         message: text("message"),
         reason: text("reason"),
+        source_path: text("source_path"),
+        start_line: count("start_line"),
+        start_col: count("start_col"),
         test_count: count("test_count"),
         passed: count("passed"),
         failed: count("failed"),
@@ -327,3 +333,28 @@ fn write_failures(out: &mut String, failures: &[(String, String)]) {
 #[cfg(test)]
 #[path = "libtest_json_tests.rs"]
 mod tests;
+
+// An actual nested GUI failure block from the 8ad verifier incident. The child
+// summary must remain diagnostic text, never replace the outer case identity.
+#[cfg(test)]
+pub(crate) const NESTED_GUI_FAILURE: &str = r#"thread 'seamless::carry_tests::fixture_generator::generate_handoff_fixtures' (155504210) panicked at crates/aterm-gui/src/seamless_fixture_generator_tests.rs:39:5:
+`seamless::carry_tests::fixture_generator::generate_handoff_fixtures`, alone in its own process, failed (exit status: 101)
+stdout:
+
+running 1 test
+test seamless::carry_tests::fixture_generator::generate_handoff_fixtures ... FAILED
+
+failures:
+
+failures:
+    seamless::carry_tests::fixture_generator::generate_handoff_fixtures
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15194 filtered out; finished in 1.20s
+
+
+stderr:
+
+thread 'seamless::carry_tests::fixture_generator::generate_handoff_fixtures' (155504231) panicked at crates/aterm-gui/src/seamless_fixture_generator_tests.rs:4723:5:
+carried fields and variants no desk here writes (held since v0.170.0); give each a value in a desk, as a real session would carry it, or name one no handoff writes in NO_HANDOFF_WRITES with why (tests/fixtures/handoff/README.md):
+  meta OutputStateRepr.program_state_began (listed, but no desk reaches it)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"#;

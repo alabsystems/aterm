@@ -1757,6 +1757,8 @@ impl Root {
             let read_at = Some(std::time::Instant::now());
             let ticks = stat.utime.saturating_add(stat.stime);
             let ns = u128::from(ticks) * 1_000_000_000 / u128::from(hz);
+            let child_ticks = stat.cutime.saturating_add(stat.cstime);
+            let child_ns = u128::from(child_ticks) * 1_000_000_000 / u128::from(hz);
             let (footprint, resident) = if stat.kernel_thread() {
                 (Some(0), None)
             } else {
@@ -1787,7 +1789,7 @@ impl Root {
                 ppid: stat.ppid,
                 exec: Some(stat.exec()),
                 cpu_ns: Some(u64::try_from(ns).unwrap_or(u64::MAX)),
-                child_cpu_ns: None,
+                child_cpu_ns: Some(u64::try_from(child_ns).unwrap_or(u64::MAX)),
                 footprint,
                 resident,
                 disk_read: None,

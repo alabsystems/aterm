@@ -778,7 +778,13 @@ impl Book {
                 "published" if thread.published.is_none() => {
                     let vault = record.body.get("vault").and_then(Value::as_str);
                     let seq = record.body.get("seq").and_then(Value::as_u64);
-                    thread.published = vault.zip(seq).map(|(vault, seq)| (vault.to_owned(), seq));
+                    if let Some((vault, seq)) = vault.zip(seq) {
+                        if thread.refused.is_some_and(|refused| seq <= refused) {
+                            inert(entry.id, "does not exceed the requester's refused version");
+                            continue;
+                        }
+                        thread.published = Some((vault.to_owned(), seq));
+                    }
                 }
                 // The first attested decision names who had not answered; a later one changes
                 // nothing.
@@ -1579,6 +1585,7 @@ enum Plan {
         id: [u8; 16],
         recipient: aterm_secrets::age::Recipient,
         want: Want,
+        refused: Option<u64>,
         offered: bool,
         offer_window_ended: bool,
         decided: bool,
@@ -1678,6 +1685,7 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
                 id: thread.id,
                 recipient: binding.recipient(),
                 want: thread.want.clone(),
+                refused: thread.refused,
                 offered: !thread.offers.is_empty(),
                 offer_window_ended,
                 decided: swept || offer_window_ended,
@@ -1700,12 +1708,22 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
                 id,
                 recipient,
                 want,
+                refused,
                 offered,
                 offer_window_ended,
                 decided,
                 asked,
                 unanswered,
             } => {
+                // The opened published version is the copy's source. Another request in
+                // this batch must not make a refused source look new.
+                if refused.is_some_and(|seq| admin.seq() <= seq) {
+                    report.waiting.push((
+                        id,
+                        "waits for a vault version after the requester's refused value".into(),
+                    ));
+                    continue;
+                }
                 // The first entry answers the want; the others (a mailbox's TOTP) go with it
                 // where the vault holds them, and never without it. A copy the draft refuses
                 // leaves the draft as this request found it, and the request waits alone.

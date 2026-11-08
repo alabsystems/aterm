@@ -7,12 +7,10 @@ use crate::{Error, Result};
 use aterm_codec::hex::encode_lower;
 use aterm_json::{Value, json};
 use aterm_secrets::{client::Paths, commons::binding::Binding};
-use std::time::{Duration, Instant};
-
-const WITHIN: Duration = Duration::from_secs(2);
+use std::time::Instant;
 
 pub(super) fn run() -> Result<Value> {
-    let deadline = Instant::now() + WITHIN;
+    let deadline = crate::admission::deadline();
     let paths = Paths::live().map_err(|_| Error::new("Commons lineage path is unavailable"))?;
     read_at(&paths, deadline)
 }

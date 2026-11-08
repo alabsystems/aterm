@@ -263,7 +263,8 @@ pub struct ReleaseOptions {
     pub linux: LinuxDecl,
     /// `--release-credentials <path>`; default `~/.aterm/release-ring/release-credentials.toml`.
     pub release_credentials: Option<PathBuf>,
-    /// `--engine <path>`; default `$PUBLICATION_ENGINE`, else `~/publication`.
+    /// `--engine <path>`; default `$PUBLICATION_ENGINE`, else `~/publication`: the engine whose
+    /// origin the release's own engine is cloned from ([`crate::gates::engine_copy`]).
     pub engine: Option<PathBuf>,
     pub dry_run: bool,
     pub verbose: bool,
@@ -277,7 +278,7 @@ pub struct ReleaseOptions {
     pub abandon: Option<String>,
 }
 
-const PATH_FLAGS: [&str; 3] = ["--engine", "--release-credentials", "--linux-artifacts"];
+const PATH_FLAGS: [&str; 2] = ["--release-credentials", "--linux-artifacts"];
 
 /// `path` as the directory `cwd` reads it: an absolute path as given; a relative one joined to `cwd`, and canonical when it exists.
 #[must_use]
@@ -302,12 +303,14 @@ impl ReleaseOptions {
     }
 
     /// `args` (a process's own, after the program) as the re-run as R's own cutter is handed
-    /// them: each path flag's value replaced by these options', and `--fix` with its commits
-    /// left out, since the re-run resumes the head the journal names (the hops are made).
+    /// them: each path flag's value replaced by these options'; `--fix` with its commits left
+    /// out, since the re-run resumes the head the journal names (the hops are made); and
+    /// `--engine` with its directory left out, since the re-run's engine is this release's own,
+    /// handed it as `PUBLICATION_ENGINE` ([`crate::gates::engine_copy`]), and a cutter older than
+    /// that copy would run and sync the directory `--engine` named in place.
     #[must_use]
     pub fn rerun_args(&self, args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
         let value = |flag: &str| match flag {
-            "--engine" => self.engine.as_ref(),
             "--release-credentials" => self.release_credentials.as_ref(),
             _ => self.linux.artifacts.as_ref(),
         };
@@ -316,6 +319,10 @@ impl ReleaseOptions {
         while let Some(arg) = args.next() {
             if arg.to_str() == Some("--fix") {
                 while args.next_if(|a| a.to_str().is_some_and(is_value)).is_some() {}
+                continue;
+            }
+            if arg.to_str() == Some("--engine") {
+                let _ = args.next();
                 continue;
             }
             let flag = arg
@@ -949,7 +956,8 @@ impl Branch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ended {
     Passed,
-    /// The candidate failed: every other branch is stopped, and the release refuses R.
+    /// The candidate failed: the other branches stop, except a proven test-execution red's
+    /// already running build, and the release refuses R after the branches end.
     Red,
     /// Nothing about the code was decided: the other branches finish, so their records survive.
     CouldNotRun,
@@ -1202,6 +1210,11 @@ impl BranchStop {
 /// ([`Run::qualify`]); `&self` throughout, so they run at once. Each branch's work is a child
 /// process its stop reaches ([`BranchStop`]).
 pub trait Branches: Sync {
+    /// An executing test failed after compilation, with no other tree red. Only a build that
+    /// already started may finish and retain its product for the next hop.
+    fn keep_build_on_test_red(&self, _c: &Candidate) -> bool {
+        false
+    }
     fn say(&self, line: &str);
     fn now(&self) -> u64;
     /// Whether a person's signal reached the release ([`Backend::interrupted`]): it reaches
@@ -1628,8 +1641,9 @@ impl Run<'_> {
         self.begin(Step::Sync)?;
         if self.dry {
             self.finish(
-                "would fast-forward the engine to its origin/main (appended audit rows kept) \
-                 and run `git submodule update --init vendor/astream`",
+                "would bring the release's own engine to its origin/main (cloned from it the \
+                 first time; appended audit rows kept, unpushed records delivered) and run \
+                 `git submodule update --init vendor/astream`",
             );
         } else {
             match self.b.sync() {
@@ -5648,7 +5662,8 @@ fn branch_event(br: &dyn Branches, branch: Branch, phase: &str, at: u64, seconds
 /// Run step 4's graph on `br`: the tree first; the build once the tree holds an admitted memory
 /// claim ([`Branches::tree_admitted`]), the export as the build starts, each in a thread of its
 /// own; the ledger's memory claims decide what runs together, and every branch draws from the
-/// one pool [`Backend::qualify_begin`] made. A branch's red stops every other branch at once
+/// one pool [`Backend::qualify_begin`] made. A branch's red stops the other branches at once,
+/// except a proven test-execution red retains an already running build for the next hop
 /// ([`BranchStop::fire`]: an export whose staging push began finishes it, and a branch not
 /// started never starts), and says so in a branch line with its rerun; a COULD NOT RUN stops
 /// nothing. Returns once every branch it started ended.
@@ -5747,16 +5762,25 @@ fn run_graph(
                 }
                 let at = fmt_dur(now.saturating_sub(t0));
                 if ended == Ended::Red && !red.swap(true, Ordering::SeqCst) {
+                    let keep_build = branch == Branch::Tree
+                        && started.contains_key(&Branch::Build)
+                        && br.keep_build_on_test_red(c);
                     let done: Vec<Branch> = graph.ended.iter().map(|(b, ..)| *b).collect();
                     let halted: Vec<&str> = plan
                         .branches()
                         .into_iter()
-                        .filter(|b| !done.contains(b) && stop_of(*b).fire())
+                        .filter(|b| {
+                            !done.contains(b)
+                                && !(keep_build && *b == Branch::Build)
+                                && stop_of(*b).fire()
+                        })
                         .map(Branch::name)
                         .collect();
                     // A branch outside the plan never starts; its stop fires all the same.
                     for b in Branch::ALL {
-                        stop_of(b).fire();
+                        if !(keep_build && b == Branch::Build) {
+                            stop_of(b).fire();
+                        }
                     }
                     let pushing =
                         stop_of(Branch::Export).pushing() && !done.contains(&Branch::Export);

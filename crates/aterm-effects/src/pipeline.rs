@@ -1025,8 +1025,8 @@ impl EffectsPipeline {
     }
 
     /// A test's negative control: `on` (as shipped), Beam's body under a lit page's letters is a
-    /// page shade the letter guard keeps whole; off, it is weighed and cut with the lights in its
-    /// cells (`CursorGlow::set_lit_body_a_shade`).
+    /// page shade the letter guard holds by itself; off, it is weighed and cut with the lights in
+    /// its cells (`CursorGlow::set_lit_body_a_shade`).
     #[cfg(any(test, debug_assertions))]
     #[inline]
     pub const fn set_lit_body_a_shade(&mut self, on: bool) {
@@ -1188,6 +1188,22 @@ impl EffectsPipeline {
     #[inline]
     pub const fn set_letter_guard_ring(&mut self, on: bool) {
         self.cursor.glow.set_letter_guard_ring(on);
+    }
+
+    /// A test's negative control: each page shade kept whole, unjudged
+    /// (`CursorGlow::set_letter_guard_shades`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_letter_guard_shades(&mut self, on: bool) {
+        self.cursor.glow.set_letter_guard_shades(on);
+    }
+
+    /// A test's negative control: each letter under a page shade held to its raster bar, not the
+    /// lower of that and its own reading (`CursorGlow::set_letter_guard_shades_to_own`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_letter_guard_shades_to_own(&mut self, on: bool) {
+        self.cursor.glow.set_letter_guard_shades_to_own(on);
     }
 
     /// A test's negative control: the letter guard blind to the cursor trail's fill

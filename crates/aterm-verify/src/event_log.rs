@@ -4,57 +4,333 @@
 //! A run's own file of its events, apart from its output (`--events`): what a release's cutter
 //! keeps its records from (A19) and `verify land` judges by (B10).
 //!
-//! The `check-finished` and `test-binary-finished` lines it keeps go to the run's output too, which its children share: there a child's unfinished line,
+//! Check, binary and observed case events go to the run's output too, which its children share: there a child's unfinished line,
 //! or a line longer than a pipe writes at once, can land inside one. Here each line is one
 //! `write_all` under one lock, to a file opened close-on-exec, so no child inherits it and no two
 //! lines interleave.
 
 use std::fs::File;
-use std::io::Write as _;
+use std::io::{self, Write as _};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-/// The events file a run writes (`--events`).
+/// Prepare once, mirror without holding a file lock, then persist the identical bytes.
+pub(crate) fn emit(events: Option<&EventLog>, event: &str) -> String {
+    let line = events.map_or_else(|| terminated(event), |events| events.prepare(event));
+    let _ = std::io::stderr().lock().write_all(line.as_bytes());
+    if let Some(events) = events {
+        events.write_prepared(&line);
+    }
+    line
+}
+
+fn terminated(line: &str) -> String {
+    let mut line = line.trim_end_matches('\n').to_owned();
+    line.push('\n');
+    line
+}
+
+/// Captured selection facts, never a claim that the checkout is clean or equals HEAD.
+#[derive(Clone, Debug)]
+pub(crate) struct Context(aterm_json::Value);
+
+impl Context {
+    pub(crate) fn captured(ctx: &crate::Ctx) -> Self {
+        let selection = ctx.scope.label();
+        let bounded = crate::report::clip_json(&selection, 512);
+        let head = ctx.head_at_start.as_deref().filter(|head| {
+            [40, 64].contains(&head.len()) && head.bytes().all(|b| b.is_ascii_hexdigit())
+        });
+        Self(aterm_json::json!({
+            "observed_head": head,
+            "selection": bounded, "selection_truncated": bounded != selection,
+            "checks": ctx.checks.iter().take(32).map(|c| c.name()).collect::<Vec<_>>(),
+            "checks_omitted": ctx.checks.len().saturating_sub(32),
+            "release": ctx.release, "fix": ctx.fix, "no_windows": ctx.no_windows,
+            "compile_only": ctx.compile_only,
+        }))
+    }
+}
+
+fn source_observation(value: &aterm_json::Value) -> Option<String> {
+    let object = value.as_object()?;
+    let keys = [
+        "observed_head",
+        "selection",
+        "selection_truncated",
+        "checks",
+        "checks_omitted",
+        "release",
+        "fix",
+        "no_windows",
+        "compile_only",
+    ];
+    if object.len() != keys.len() || object.keys().any(|k| !keys.contains(&k.as_str())) {
+        return None;
+    }
+    let head = &value["observed_head"];
+    if !head.is_null()
+        && !head.as_str().is_some_and(|s| {
+            [40, 64].contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit())
+        })
+    {
+        return None;
+    }
+    let selection = value["selection"].as_str()?;
+    if crate::report::clip_json(selection, 512) != selection {
+        return None;
+    }
+    if value["checks_omitted"].as_u64().is_none()
+        || value["selection_truncated"].as_bool().is_none()
+    {
+        return None;
+    }
+    let checks = value["checks"].as_array()?;
+    if checks.len() > 32
+        || checks.iter().any(|c| {
+            !c.as_str().is_some_and(|s| {
+                s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+        })
+    {
+        return None;
+    }
+    if ["release", "fix", "no_windows", "compile_only"]
+        .iter()
+        .any(|key| value[*key].as_bool().is_none())
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+pub(crate) fn valid_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+pub(crate) struct Attribution {
+    pub(crate) id: String,
+    pub(crate) source_observation: Option<String>,
+}
+
+/// Decode diagnostic attribution only, never source or execution authority.
+pub(crate) fn attribution(value: &aterm_json::Value) -> Option<Attribution> {
+    if value["schema"].as_u64() != Some(1) || value["event"].as_str().is_none() {
+        return None;
+    }
+    let binding = value["invocation"].as_object()?;
+    if binding.len() != 3
+        || binding
+            .keys()
+            .any(|key| !["id", "source_observation", "identity_error"].contains(&key.as_str()))
+        || !value["invocation"]["identity_error"].is_null()
+    {
+        return None;
+    }
+    let id = value["invocation"]["id"]
+        .as_str()
+        .filter(|id| valid_id(id))?;
+    let source = source_observation(&value["invocation"]["source_observation"]);
+    if !value["invocation"]["source_observation"].is_null() && source.is_none() {
+        return None;
+    }
+    Some(Attribution {
+        id: id.to_owned(),
+        source_observation: source,
+    })
+}
+
+/// The companion writer shares only file custody, not the verifier or any authority.
+#[derive(Debug)]
+pub(crate) struct Retained {
+    pub(crate) file: File,
+    // Close every writer before the last custody reference releases its lock.
+    pub(crate) _custody: Arc<aterm_uds::file_lock::LockFile>,
+}
+
+#[derive(Debug, Default)]
+struct Sinks {
+    external: Option<File>,
+    retained: Option<Retained>,
+}
+
+/// One invocation's optional external append stream and private retained companion.
 #[derive(Debug)]
 pub struct EventLog {
-    file: Mutex<File>,
+    prepared: AtomicBool,
+    id: Option<String>,
+    context: Option<Context>,
+    sinks: Mutex<Sinks>,
 }
 
 impl EventLog {
-    /// Open `path` to append to (made, owner-only, when it is not there), close-on-exec as every
-    /// file std opens is.
-    ///
-    /// # Errors
-    /// It cannot be opened.
-    pub fn open(path: &Path) -> std::io::Result<Self> {
-        let mut open = std::fs::OpenOptions::new();
-        open.append(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            open.mode(0o600);
-        }
-        Ok(Self {
-            file: Mutex::new(open.open(path)?),
-        })
+    pub(crate) fn unrecorded() -> Self {
+        Self::with_entropy(aterm_uds::rand::hex_token::<16>)
     }
 
-    /// Append `line` (a `verify-event: ` line; its newline added when it has none) whole. A
-    /// write that fails loses the line, which its reader takes as nothing said: a release's
-    /// cutter runs a check with no record again, and `verify land`, whose run's last line
-    /// (`run-finished`) then names a check no line holds, or is lost itself, pushes nothing.
-    pub fn write(&self, line: &str) {
-        let line = line.strip_suffix('\n').unwrap_or(line);
-        let mut whole = String::with_capacity(line.len() + 1);
-        whole.push_str(line);
-        whole.push('\n');
-        let mut file = self
-            .file
+    fn with_entropy(entropy: impl FnOnce() -> io::Result<String>) -> Self {
+        Self {
+            prepared: AtomicBool::new(false),
+            id: entropy().ok(),
+            context: None,
+            sinks: Mutex::new(Sinks::default()),
+        }
+    }
+
+    pub(crate) fn bind(&mut self, context: Context) {
+        // Binding happens once, after Ctx selection capture and before any stages run.
+        if self.context.is_none() && !self.prepared.load(Ordering::Relaxed) {
+            self.context = Some(context);
+        }
+    }
+
+    pub(crate) fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    pub(crate) fn retain(&mut self, retained: Retained) {
+        let sinks = self
+            .sinks
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(external) = &sinks.external {
+            // One physical destination gets one record, including an external hard-link alias.
+            // If comparison fails, preserve the private sink and treat external IO as unavailable.
+            if crate::run_log::file_key(external)
+                .ok()
+                .zip(crate::run_log::file_key(&retained.file).ok())
+                .is_none_or(|(a, b)| a == b)
+            {
+                sinks.external = None;
+            }
+        }
+        sinks.retained = Some(retained);
+    }
+
+    /// Open an external regular append file. Independent writers serialize each record on
+    /// this actual file's lock, including when its path is a hard-link alias.
+    ///
+    /// # Errors
+    /// The file cannot be opened or is not a stable regular file.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let mut open = std::fs::OpenOptions::new();
+        open.append(true).create(true);
+        private_flags(&mut open);
+        let file = open.open(path)?;
+        if !file.metadata()?.is_file() || !crate::run_log::same_file(&file, path) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "events is no stable regular file",
+            ));
+        }
+        let mut log = Self::unrecorded();
+        log.sinks
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .external = Some(file);
+        Ok(log)
+    }
+
+    pub(crate) fn prepare(&self, event: &str) -> String {
+        self.prepared.store(true, Ordering::Relaxed);
+        let raw = event.trim_end_matches('\n');
+        let Some(json) = raw.strip_prefix("verify-event: ") else {
+            return terminated(raw);
+        };
+        let Ok(mut value) = aterm_json::from_str::<aterm_json::Value>(json) else {
+            return terminated(raw);
+        };
+        if value["schema"].as_u64() != Some(1) || value["event"].as_str().is_none() {
+            return terminated(raw);
+        }
+        let Some(object) = value.as_object_mut() else {
+            return terminated(raw);
+        };
+        // Only raw producer events enter here; mirrored sinks use write_prepared.
+        object.insert("invocation".into(), aterm_json::json!({
+            "id": self.id,
+            "source_observation": self.context.as_ref().map(|context| &context.0),
+            "identity_error": if self.id.is_none() { Some("entropy-unavailable") } else { None },
+        }));
+        let line = format!("verify-event: {value}\n");
+        if line.len() <= 64 << 10 {
+            return line;
+        }
+        // An unreadable-sized diagnostic is unknown, never a clipped invented check row.
+        format!(
+            "verify-event: {}\n",
+            aterm_json::json!({
+                "schema":1, "event":"observation-unavailable",
+                "producer_event":value["event"].as_str().map(|s| crate::report::clip_json(s, 128)),
+                "reason":"record exceeds encoded line bound", "invocation":value["invocation"],
+            })
+        )
+    }
+
+    /// Append one attributed observation. IO failure remains a missing observation, never a
+    /// verdict. No fsync or power-loss completeness is promised.
+    pub fn write(&self, event: &str) {
+        self.write_prepared(&self.prepare(event));
+    }
+
+    pub(crate) fn write_prepared(&self, line: &str) {
+        let mut sinks = self
+            .sinks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = file.write_all(whole.as_bytes());
+        // Always attempt our own companion, even when the external append is unavailable.
+        if let Some(retained) = &mut sinks.retained
+            && let Ok(_held) = AppendLock::take(&retained.file)
+        {
+            let _ = (&retained.file).write_all(line.as_bytes());
+        }
+        if let Some(file) = &mut sinks.external
+            && let Ok(_held) = AppendLock::take(file)
+        {
+            let _ = (&*file).write_all(line.as_bytes());
+        }
     }
 }
+
+struct AppendLock<'a>(&'a File);
+impl<'a> AppendLock<'a> {
+    fn take(file: &'a File) -> io::Result<Self> {
+        aterm_uds::file_lock::lock_exclusive_until(
+            file,
+            Instant::now() + Duration::from_secs(1),
+            "event append is busy",
+        )?;
+        Ok(Self(file))
+    }
+}
+impl Drop for AppendLock<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn private_flags(open: &mut std::fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    open.mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+}
+#[cfg(windows)]
+pub(crate) fn private_flags(open: &mut std::fs::OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    open.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+}
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn private_flags(_: &mut std::fs::OpenOptions) {}
+
+#[cfg(test)]
+#[path = "event_log_identity_tests.rs"]
+mod identity_tests;
 
 /// One dev-set run: its exit code, each finished check's row, its wall seconds, and what its
 /// last event says it finished.

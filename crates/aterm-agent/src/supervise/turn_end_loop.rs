@@ -2754,6 +2754,7 @@ impl<C: Ctl> Session<'_, C> {
             checks: self.turn_end.checks(),
             land: self.turn_end.land_books(),
             pass: self.turn_end.wall_pass(),
+            needs_acked: self.turn_end.needs_acked(),
         }
     }
 

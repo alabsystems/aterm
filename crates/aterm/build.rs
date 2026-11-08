@@ -945,8 +945,9 @@ mod build_stamp {
     /// The record changes only with what it holds. Unset, [`input::MODE`] writes a constant
     /// record: the product version and nothing per commit, so no edit or commit reruns this
     /// script, and a bump rebuilds this package alone. `commit` stamps the record from git, or
-    /// from the pins a
-    /// release, `ship dev-app` or a handoff fixture sets, and watches what the stamp is of.
+    /// from the pins `ship dev-app`, a handoff fixture or a non-Mac release sets, and watches
+    /// what the stamp is of. `postlink` writes a constant nonzero placeholder and watches no
+    /// commit or reservation inputs: the macOS release patches that section after linking.
     pub fn emit() {
         println!("cargo:rerun-if-env-changed={}", input::MODE);
         let version =
@@ -958,8 +959,9 @@ mod build_stamp {
         {
             None => constant(&version),
             Some("commit") => from_commit(&version),
+            Some("postlink") => Stamp::UNSTAMPED,
             Some(other) => panic!(
-                "{}={other}: the identity record is written unset (constant) or `commit`",
+                "{}={other}: expected unset, `commit` or `postlink`",
                 input::MODE
             ),
         };

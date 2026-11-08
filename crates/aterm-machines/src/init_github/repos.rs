@@ -4,7 +4,7 @@
 //! Clone missing GitHub repositories into `~` and fast-forward clean worktrees that are behind.
 
 use super::{Github, auth_id, auth_ready, get};
-use crate::checkout::{Origin, Stands, git, github_origin as origin_matches};
+use crate::checkout::{AcquisitionFailure, Origin, Stands, git, github_origin as origin_matches};
 use crate::github_pages::Page;
 use crate::init_observe::{LastReading, Reading};
 use crate::items::{Ctx, Item};
@@ -459,6 +459,7 @@ pub(super) fn partition(sys: &dyn System, user: &User, all: &[Repo]) -> Result<P
 pub(super) struct Refreshed {
     pub(super) moved: bool,
     pub(super) failed: Vec<String>,
+    pub(super) network_failed: bool,
 }
 
 /// Refresh only ordinary, locally eligible checkouts from a previously admitted
@@ -606,14 +607,18 @@ pub(super) fn refresh_existing(
     let mut refreshed = Refreshed {
         moved: false,
         failed: Vec::new(),
+        network_failed: false,
     };
     for (_, repo, result) in results {
         match result {
             Ok(Some(Stands::Behind { .. })) => refreshed.moved = true,
             Ok(_) => {}
-            Err(unread) => refreshed
-                .failed
-                .push(format!("~/{}: {}", repo.name, unread.why)),
+            Err(unread) => {
+                refreshed.network_failed |= unread.network;
+                refreshed
+                    .failed
+                    .push(format!("~/{}: {}", repo.name, unread.why));
+            }
         }
     }
     Ok(refreshed)
@@ -1215,6 +1220,7 @@ pub(super) fn clone_one_guarded(
         Some(&CloneGuard::new(current)),
         None,
     )
+    .map_err(|why| why.to_string())
 }
 
 #[cfg(test)]
@@ -1224,7 +1230,7 @@ pub(super) fn clone_one(
     owner: &str,
     repo: &Repo,
 ) -> Result<Placed, String> {
-    clone_one_with(sys, user, owner, repo, None, None)
+    clone_one_with(sys, user, owner, repo, None, None).map_err(|why| why.to_string())
 }
 
 /// How many clones run at once ([`clone_all`]).
@@ -1239,6 +1245,7 @@ pub(super) struct Cloned {
     pub(super) left: Vec<String>,
     /// Why each clone that failed did, `~/<name>: <why>`, in list order.
     pub(super) failed: Vec<String>,
+    pub(super) network_failed: bool,
     /// What each clone it published made of the hook installer it carries
     /// ([`install_hooks`]), `~/<name>: <outcome>`, in list order: a note, never a failure.
     pub(super) hooks: Vec<String>,
@@ -1325,10 +1332,9 @@ pub(super) fn clone_all(
                         Ok(staging) => {
                             clone_one_with(sys, user, &repo.owner, repo, guard, Some(staging))
                         }
-                        Err(_) => {
-                            Err("cannot allocate private repository staging in this home"
-                                .to_owned())
-                        }
+                        Err(_) => Err(AcquisitionFailure::Local(
+                            "cannot allocate private repository staging in this home".to_owned(),
+                        )),
                     };
                     let published =
                         matches!(parent, Ok(Placed::Published | Placed::PublishedStagingLeft));
@@ -1368,7 +1374,10 @@ pub(super) fn clone_all(
     for (repo, result, staging_left, hooks) in results {
         match result {
             Ok(_) => done.cloned.push(repo.clone()),
-            Err(why) => done.failed.push(format!("~/{}: {why}", repo.name)),
+            Err(why) => {
+                done.network_failed |= why.is_network();
+                done.failed.push(format!("~/{}: {why}", repo.name));
+            }
         }
         if staging_left {
             done.failed.push(format!(
@@ -1605,7 +1614,7 @@ fn clone_one_with(
     repo: &Repo,
     guard: Option<&CloneGuard<'_>>,
     staging: Option<Scratch<'_>>,
-) -> Result<Placed, String> {
+) -> Result<Placed, AcquisitionFailure> {
     let current = || guard.map_or(Ok(()), |guard| (guard.current)());
     current()?;
     let home = Path::new(&user.home);
@@ -1618,16 +1627,13 @@ fn clone_one_with(
             return Ok(Placed::InPlace);
         }
         _ => {
-            return Err(format!(
-                "~/{} appeared before cloning; left untouched",
-                repo.name
-            ));
+            return Err(format!("~/{} appeared before cloning; left untouched", repo.name).into());
         }
     }
     let url = format!("https://github.com/{owner}/{}.git", repo.name);
     current()?;
     let command = clone_command(sys, user, git(sys, user, None), owner, repo, &url)?;
-    let source = text(
+    let source = crate::checkout::acquisition_read(
         sys,
         &command.args([
             "ls-remote",
@@ -1640,7 +1646,9 @@ fn clone_one_with(
         ]),
         "cannot read the GitHub repository's complete remote references",
     )?;
-    let source = remote(&source)?;
+    let source = std::str::from_utf8(&source)
+        .map_err(|_| "cannot read the GitHub repository's complete remote references")?;
+    let source = remote(source)?;
     if let Some(head) = &source.head {
         // The private inventory selects this repository, not a permanent branch.
         // Its saved default may precede a rename or the repository's first commit.
@@ -1688,7 +1696,7 @@ fn clone_one_with(
             &url,
         ])
         .arg(&clone);
-    text(
+    crate::checkout::acquisition_read(
         sys,
         &command,
         "GitHub clone failed; existing destination left untouched",
@@ -1730,7 +1738,8 @@ fn clone_one_with(
         return Err(format!(
             "cannot publish ~/{} without replacing an existing destination; left untouched",
             repo.name
-        ));
+        )
+        .into());
     }
     Ok(if staging.close().is_ok() {
         Placed::Published

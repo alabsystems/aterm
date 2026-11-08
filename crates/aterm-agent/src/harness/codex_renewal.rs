@@ -765,12 +765,70 @@ pub fn read_receipt(env: &Env, id: &str) -> Option<Receipt> {
 
 /// Caller holds the Codex store writer guard, also serializing concurrent
 /// prepare, commit and consume for this receipt.
+/// Accepted history cannot regress even when a caller retained an older mirror.
+/// An authorized descendant may still update the successor process binding.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "ConsumedReceiptPublication",
+        action = "NextCase",
+        reason = "The caller supplies a retained receipt and a proposed replacement"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "ConsumedReceiptPublication",
+        action = "PriorRevocation",
+        reason = "The retained root may already carry revocation"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "ConsumedReceiptPublication",
+        action = "NextFault",
+        reason = "The filesystem can refuse a directory durability barrier"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "ConsumedReceiptPublication",
+        action = "Publish",
+        project = "aterm_agent::harness::codex_renewal::attempts::tests::consumed::transition"
+    )
+)]
 pub fn write_receipt(env: &Env, receipt: &Receipt) -> Result<(), &'static str> {
     if receipt.target_identity().is_none()
         || !hex(&receipt.intent.identity.account, 64)
         || !hex(&receipt.intent.identity.user, 64)
     {
         return Err("receipt-identity-transition");
+    }
+    // Read the raw root, not its cancellation projection. A failed consume
+    // acknowledgement may have left Consumed on disk while the caller still
+    // holds Committing; neither that caller nor a stale cancellation may erase
+    // the accepted turn. An unreadable root is not an absent root.
+    if let Some(stored) = attempts::read_root(env, &receipt.id)?
+        && stored.phase == Phase::Consumed
+        && (receipt.phase != Phase::Consumed
+            || receipt.accepted_turn != stored.accepted_turn
+            || !receipt.same_intent(&stored)
+            || receipt.current_attempt != stored.current_attempt
+            || receipt.candidate != stored.candidate
+            || (stored.successor_pid.is_some() && receipt.successor_pid.is_none())
+            || (stored.successor_birth.is_some() && receipt.successor_birth.is_none())
+            || (stored.launch_attempted && !receipt.launch_attempted)
+            || (stored.revoked && !receipt.revoked))
+    {
+        return Err("receipt-consumed-changed");
+    }
+    if receipt.phase == Phase::Consumed
+        && (receipt.accepted_turn.as_deref() != Some(receipt.intent.wall.as_str())
+            || receipt.successor_pid.is_some() != receipt.successor_birth.is_some())
+    {
+        return Err("receipt-consumed-shape");
     }
     let path = receipt_path(env, &receipt.id).ok_or("receipt-id")?;
     let parent = path.parent().ok_or("receipt-path")?;

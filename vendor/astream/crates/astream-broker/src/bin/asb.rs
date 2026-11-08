@@ -261,7 +261,8 @@ use astream_cap::capfile;
 #[path = "../../../astream-cap/src/capfile.rs"]
 mod capfile;
 
-const USAGE: &str = "usage: asb serve  <endpoint> [log] [--tcp] [--key-env NAME | --key-file PATH] [--handshake]
+const USAGE: &str = "usage: asb --help | --version
+       asb serve  <endpoint> [log] [--tcp] [--key-env NAME | --key-file PATH] [--handshake]
                   [--secret-env NAME | --secret-file PATH] [--revocation-file PATH] [--unix SOCKET] [--allow-remote]
                   [--at-rest-key-env NAME | --at-rest-key-file PATH] [--anti-rollback | --anti-rollback-init]
                   [--durability strict|ordered|relaxed] [--horizon-ms N] [--health-ms N] [--rate-limit SPEC]
@@ -1245,7 +1246,7 @@ fn usage_error(msg: &str) -> u8 {
     2
 }
 
-fn parse() -> Result<Cli, u8> {
+fn arguments() -> Result<Vec<String>, u8> {
     // `args_os`, NOT `args`: `std::env::args()` PANICS on an argument that is not
     // valid Unicode — exit 101 with a backtrace, before any of this strict-flag
     // handling runs. A non-UTF-8 `--key-file` path is a plausible real input on any
@@ -1261,6 +1262,10 @@ fn parse() -> Result<Cli, u8> {
             }
         }
     }
+    Ok(args)
+}
+
+fn parse(args: &[String]) -> Result<Cli, u8> {
     let mut pos = Vec::new();
     let mut bools: HashSet<String> = HashSet::new();
     let mut kv: HashMap<String, String> = HashMap::new();
@@ -4219,7 +4224,19 @@ fn cmd_federate(cli: &Cli) -> Result<(), AsbErr> {
 }
 
 fn run() -> Result<(), AsbErr> {
-    let cli = parse()?;
+    let args = arguments()?;
+    // Informational flags stand alone: never hide an invalid command or skip its
+    // argument validation just because --help/--version appears elsewhere.
+    if let [_, flag] = args.as_slice() {
+        match flag.as_str() {
+            "--help" => return say(USAGE).map_err(AsbErr::Io),
+            "--version" => {
+                return say(concat!("asb ", env!("CARGO_PKG_VERSION"))).map_err(AsbErr::Io);
+            }
+            _ => {}
+        }
+    }
+    let cli = parse(&args)?;
     match cli.pos.first().map(String::as_str) {
         Some("repair") => cmd_repair(&cli),
         Some("stats") => cmd_stats(&cli),

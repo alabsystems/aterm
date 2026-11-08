@@ -30,7 +30,13 @@ fn me_at_today(fx: &mut Fx) {
 
 /// `me` at `week` tenths of a Max 20x week now, after 16 points of it in the last 24 h.
 fn me_at(fx: &mut Fx, week: u32) {
-    fx.plan("me", "max", Some("20x"), NOW - H);
+    at_today_as(fx, "me", week);
+}
+
+/// `label`, this tab's account, at `week` tenths of a Max 20x week now, after 16 points of it in
+/// the last 24 h, its week resetting [`THU9`].
+fn at_today_as(fx: &mut Fx, label: &str, week: u32) {
+    fx.plan(label, "max", Some("20x"), NOW - H);
     for (t, rose, five) in [
         (NOW - 24 * H, 0, None),
         (NOW - 16 * H, 53, None),
@@ -39,15 +45,15 @@ fn me_at(fx: &mut Fx, week: u32) {
         (NOW - 30 * MIN, 157, Some(304)),
     ] {
         fx.fig(
-            "me",
+            label,
             t,
             five.map(|f| (f, NOW + 150 * MIN)),
             Some((week - 160 + rose, THU9)),
         );
     }
-    fx.read("me", Some((380, NOW + 150 * MIN)), Some((week, THU9)), NOW);
-    fx.ran("me", NOW);
-    fx.session("s-me", "me", NOW);
+    fx.read(label, Some((380, NOW + 150 * MIN)), Some((week, THU9)), NOW);
+    fx.ran(label, NOW);
+    fx.session(&format!("s-{label}"), label, NOW);
 }
 
 /// `alt1`, Max 20x, its week at `week` tenths read 19:30 (now), run here last at 15:30; its
@@ -454,7 +460,7 @@ fn quota_clock_admission_survives_the_codec_without_current_claims() {
             assert_eq!(week.projection, None);
             assert_eq!(out.demand.week, Err(Refusal::Skew));
             for width in [44, 60] {
-                let cards = out.card_rows(Some("me"), width, None);
+                let cards = out.card_rows("me", None, true, width, None);
                 assert!(
                     cards
                         .iter()
@@ -503,7 +509,17 @@ fn access_classes_cannot_admit_a_rejected_quota_clock() {
         );
         assert_eq!((week.at, week.reset), (Some(NOW + 120), Some(THU9)));
         assert_eq!(week.used_x10, None);
-        assert!(out.reset_words(week).is_empty());
+        for room in [60, 30] {
+            let item = out
+                .card_rows("me", None, true, room, None)
+                .into_iter()
+                .find_map(|r| match r {
+                    CardRow::Account { label, text, .. } if label == "me" => Some(text),
+                    _ => None,
+                })
+                .expect("me's item");
+            assert!(!item.contains(RESET_MARK), "{room}: {item}");
+        }
         let five = row.window(Window::Five).unwrap();
         let mut without_source = five.clone();
         without_source.at = None;
@@ -1363,7 +1379,7 @@ fn unavailable_pool_cards_keep_the_reason_and_observed_rows() {
         let json = out.json();
         assert_eq!(json["verdict"]["why"].as_str(), Some(why.word()));
         assert!(json["passes"].as_array().unwrap().is_empty());
-        assert!(out.strip(56, 4).is_none());
+        assert!(!projects(&out.card_rows("me", None, true, 60, None)));
         assert!(
             out.rows
                 .iter()
@@ -1371,7 +1387,7 @@ fn unavailable_pool_cards_keep_the_reason_and_observed_rows() {
                 .all(|window| window.projection.is_none())
         );
         for room in [60, 44, 30] {
-            let rows = out.card_rows(Some("me"), room, None);
+            let rows = out.card_rows("me", None, true, room, None);
             assert!(rows.iter().all(|row| row.width() <= room));
             assert!(matches!(rows[0], CardRow::Note { .. }));
             assert!(row_text(&rows[0]).contains(&why.words()));
@@ -1443,7 +1459,7 @@ fn a_paused_session_keeps_pool_observations_without_service_advice() {
     }
     for width in [60, 44, 30] {
         let labels: Vec<_> = view
-            .card_rows(Some("me"), width, None)
+            .card_rows("me", None, true, width, None)
             .into_iter()
             .filter_map(|row| {
                 if let CardRow::Account { label, .. } = row {
@@ -1460,7 +1476,7 @@ fn a_paused_session_keeps_pool_observations_without_service_advice() {
                 .map(|row| row.label.clone())
                 .collect::<Vec<_>>()
         );
-        assert!(view.strip(width, 4).is_none());
+        assert!(!projects(&view.card_rows("me", None, true, width, None)));
     }
     assert_eq!(raw, before);
     let mut busy = view.clone();
@@ -1881,65 +1897,151 @@ fn row_text(row: &CardRow) -> String {
     }
 }
 
-fn is_strip(row: &CardRow) -> bool {
-    matches!(row, CardRow::Plot { spoken, .. } if spoken.starts_with("Next 7 days"))
+fn caption(row: &CardRow) -> Option<&str> {
+    match row {
+        CardRow::Plot { spoken, .. } => Some(spoken),
+        _ => None,
+    }
+}
+
+/// The work row: the quota view's chart under the day axis.
+fn is_work(row: &CardRow) -> bool {
+    caption(row).is_some_and(|s| s.starts_with("Work,"))
+}
+
+fn is_axis(row: &CardRow) -> bool {
+    caption(row).is_some_and(|s| s.starts_with("Days across"))
+}
+
+/// An item's lane, where the card draws one under it.
+fn lane_of(row: &CardRow) -> Option<&CardLane> {
+    match row {
+        CardRow::Account { lane, .. } => lane.as_ref(),
+        _ => None,
+    }
+}
+
+/// Every caption the card's rows carry: each drawn row's and each lane's.
+fn captions(rows: &[CardRow]) -> impl Iterator<Item = &str> {
+    rows.iter().flat_map(|row| {
+        caption(row)
+            .into_iter()
+            .chain(lane_of(row).map(|lane| lane.spoken.as_str()))
+    })
+}
+
+fn has_lane(row: &CardRow) -> bool {
+    lane_of(row).is_some()
 }
 
 fn is_legend(row: &CardRow) -> bool {
-    matches!(row, CardRow::Plot { spoken, .. } if spoken.starts_with("Legend"))
+    row.is_legend()
 }
 
-/// The bars under each item: (label, windows kept).
-fn bars_of(rows: &[CardRow]) -> Vec<(String, Vec<&'static str>)> {
-    let mut out: Vec<(String, Vec<&'static str>)> = Vec::new();
-    for row in rows {
-        match row {
-            CardRow::Account { label, .. } => out.push((label.clone(), Vec::new())),
-            CardRow::Plot { spoken, .. } => {
-                if let Some(last) = out.last_mut() {
-                    if spoken.contains(", week:") {
-                        last.1.push("week");
-                    } else if spoken.contains(", 5-hour:") {
-                        last.1.push("5h");
-                    }
-                }
-            }
-            _ => {}
-        }
+fn is_pace(row: &CardRow) -> bool {
+    matches!(row, CardRow::Note { text, .. } if text.starts_with("  at "))
+}
+
+/// A lean's worst case, a row not needed or an assumption.
+fn is_extra_note(row: &CardRow) -> bool {
+    matches!(row, CardRow::Note { text, .. }
+        if ["  if ", "  not needed", "  \u{2248}"].iter().any(|p| text.starts_with(p))
+            || text.ends_with(" rows not needed"))
+}
+
+/// A lane's out cell: its line at the lane's ceiling, in the warn ink.
+fn is_out(cell: &(char, CardInk)) -> bool {
+    *cell == (crate::harness::quota_view::Cell::Out.glyph(), CardInk::Warn)
+}
+
+/// The card draws a projection: a cell in the projected line's ink outside the legend, on the
+/// work row or a lane.
+fn projects(rows: &[CardRow]) -> bool {
+    let ahead = |cells: &[(char, CardInk)]| cells.iter().any(|c| c.1 == CardInk::Ahead);
+    rows.iter().any(|r| match r {
+        CardRow::Plot { cells, .. } => !r.is_legend() && ahead(cells),
+        _ => lane_of(r).is_some_and(|lane| ahead(&lane.cells)),
+    })
+}
+
+/// The items in card order, each with the label its lane's caption names.
+fn items_of(rows: &[CardRow]) -> Vec<(String, Option<String>)> {
+    rows.iter()
+        .filter_map(|row| match row {
+            CardRow::Account { label, lane, .. } => Some((
+                label.clone(),
+                lane.as_ref()
+                    .and_then(|lane| lane.spoken.split("'s week").next().map(str::to_owned)),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The card's items in the order the quota view names them: its named, then its folded.
+fn view_order(out: &Outlook, tab: &str) -> Vec<String> {
+    let view = out.quota(tab, None, true);
+    view.named
+        .iter()
+        .map(|n| n.label.clone())
+        .chain(view.folded.iter().cloned())
+        .collect()
+}
+
+/// The column of `▕` in a row's cells.
+fn now_col(cells: &[(char, CardInk)]) -> usize {
+    cells
+        .iter()
+        .position(|c| c.0 == crate::harness::quota_view::NOW_MARK)
+        .expect("now's mark")
+}
+
+/// The work row's cells.
+fn work_cells(rows: &[CardRow]) -> &[(char, CardInk)] {
+    match rows.iter().find(|r| is_work(r)) {
+        Some(CardRow::Plot { cells, .. }) => cells,
+        _ => panic!("the work row"),
     }
-    out
 }
 
-/// T22 (the agent's half): ACCESSIBILITY. No spoken or title string holds a box-drawing glyph
-/// (U+2500-257F); every drawn row carries a caption; the strip's caption names the chain in its
-/// order. Negative controls: a strip caption that names the chain backwards fails scenario A
-/// (`me` then `alt1`); a bar's glyph in its caption fails every scene.
+/// T22 (the agent's half): ACCESSIBILITY. No spoken or title string holds a box, block,
+/// legacy-computing or braille glyph (U+2500-259F, U+1FB00-1FBFF, U+2800-28FF); every drawn row
+/// and every lane carries a caption; the work row's caption names the chain in its order.
+/// Negative controls: a work caption that names the chain backwards fails scenario A (`me` then
+/// `alt1`); a lane's `↺` or a level in its caption fails every scene.
 #[test]
 fn spoken_words_carry_no_glyph_and_name_the_chain() {
-    let boxy = |s: &str| s.chars().any(|c| ('\u{2500}'..='\u{257f}').contains(&c));
+    let drawn = |s: &str| {
+        s.chars().any(|c| {
+            ('\u{2500}'..='\u{259f}').contains(&c)
+                || ('\u{2800}'..='\u{28ff}').contains(&c)
+                || ('\u{1fb00}'..='\u{1fbff}').contains(&c)
+        })
+    };
     for (name, out) in scenes() {
         for room in [60, 44, 30] {
-            for row in out.card_rows(Some("me"), room, None) {
-                match &row {
+            let rows = out.card_rows("me", None, true, room, None);
+            for row in &rows {
+                match row {
                     CardRow::Note {
                         spoken: Some(s), ..
-                    } => assert!(!boxy(s), "{name}: {s}"),
-                    CardRow::Plot { spoken, .. } => {
-                        assert!(
-                            !spoken.is_empty(),
-                            "{name} {room}: a plot without a caption"
-                        );
-                        assert!(!boxy(spoken), "{name}: {spoken}");
-                    }
-                    CardRow::Account { spoken, .. } => assert!(!boxy(spoken), "{name}: {spoken}"),
+                    } => assert!(!drawn(s), "{name}: {s}"),
+                    CardRow::Account { spoken, .. } => assert!(!drawn(spoken), "{name}: {spoken}"),
                     _ => {}
                 }
+            }
+            for spoken in captions(&rows) {
+                assert!(
+                    !spoken.is_empty(),
+                    "{name} {room}: a plot without a caption"
+                );
+                assert!(!drawn(spoken), "{name}: {spoken}");
             }
         }
         for label in ["me", "alt1"] {
             let view = out.quota(label, None, true);
             for s in [&view.title, &view.spoken] {
-                assert!(!boxy(s), "{name}: {s}");
+                assert!(!drawn(s), "{name}: {s}");
             }
         }
         let pass = out.week.as_ref().expect("the week pass");
@@ -1949,119 +2051,84 @@ fn spoken_words_carry_no_glyph_and_name_the_chain() {
                 order.push(&link.label);
             }
         }
-        let caption = out
-            .card_rows(Some("me"), 60, None)
-            .into_iter()
-            .find(is_strip)
-            .map(|row| match row {
-                CardRow::Plot { spoken, .. } => spoken,
-                _ => String::new(),
-            })
-            .expect("the strip");
+        let rows = out.card_rows("me", None, true, 60, None);
+        let caption = rows
+            .iter()
+            .find(|r| is_work(r))
+            .and_then(caption)
+            .expect("the work row");
+        // Each label as a word, after the one before it.
+        let word = |from: usize, label: &str| {
+            caption[from..]
+                .match_indices(label)
+                .map(|(i, _)| from + i)
+                .find(|&i| {
+                    let before = caption[..i].chars().next_back();
+                    let after = caption[i + label.len()..].chars().next();
+                    !before.is_some_and(char::is_alphanumeric)
+                        && !after.is_some_and(char::is_alphanumeric)
+                })
+        };
         let mut at = 0;
         for label in &order {
-            let found = caption[at..]
-                .find(&format!("{label} until"))
-                .or_else(|| caption[at..].find(&format!("then {label}")))
-                .or_else(|| caption[at..].find(label));
-            let found = found.unwrap_or_else(|| panic!("{name}: {label} in order in {caption}"));
-            at += found + label.len();
-        }
-        if let Some(lean) = &pass.lean {
-            assert!(
-                caption[at..].contains(&lean.row),
-                "{name}: the lean last: {caption}"
-            );
+            let found =
+                word(at, label).unwrap_or_else(|| panic!("{name}: {label} in order in {caption}"));
+            at = found + label.len();
         }
     }
 }
 
-/// T23: THE CARD FITS. At 60, 44 and 30 cells every row fits and none of the scenarios' rows is
-/// cut; items keep roster order; with less height, rows give way in §8.4's order (the extra notes,
-/// the strip, the legend, the other rows' bars folded into their items, the carrier's 5-hour bar,
-/// its week bar) while the verdict and every item stay. Negative controls: a card that always
-/// takes its widest words cuts scenario B's verdict at 44; dropping the carrier's week bar before
-/// its 5-hour bar breaks the order.
+/// T23: THE CARD FITS. At every room from 30 to 60 cells every row fits and none of the
+/// scenarios' rows is cut: the pace, a lean's worst case, the rows not needed and every
+/// assumption each have a form that fits from 31 cells; the items come in the quota view's
+/// order (its named, then its folded); at 30 cells or fewer the card is words only. With less
+/// height, rows give way in one order (the extra notes, the legend, the day axis, the lanes, the
+/// work row, the pace) while the verdict and every item stay. Negative controls: dropping the
+/// work row before the lanes breaks the order; a card that always takes an item's widest words
+/// cuts scenario A's items at 30; the pace with its one form is cut at 31 to 39 cells.
 #[test]
 fn card_rows_fit() {
     for (name, out) in scenes() {
-        let roster: Vec<String> = out.rows.iter().map(|r| r.label.clone()).collect();
-        for room in [60usize, 44, 30] {
-            let rows = out.card_rows(Some("me"), room, None);
+        let order = view_order(&out, "me");
+        for room in CARD_WORDS_ONLY..=60 {
+            let rows = out.card_rows("me", None, true, room, None);
             for row in &rows {
                 let text = row_text(row);
                 assert!(row.width() <= room, "{name} {room}: {text}");
                 assert!(!text.ends_with('\u{2026}'), "{name} {room}: cut: {text}");
             }
-            let items: Vec<String> = rows
-                .iter()
-                .filter_map(|r| match r {
-                    CardRow::Account { label, .. } => Some(label.clone()),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(items, roster, "{name} {room}: roster order");
+            let items: Vec<String> = items_of(&rows).into_iter().map(|(l, _)| l).collect();
+            assert_eq!(items, order, "{name} {room}: the view's order");
             assert!(
                 matches!(rows[0], CardRow::Note { .. }),
                 "{name}: the verdict leads"
             );
-            if room <= 30 {
+            if room <= CARD_WORDS_ONLY {
                 assert!(rows.iter().all(|r| !matches!(r, CardRow::Plot { .. })));
+                assert!(!rows.iter().any(has_lane));
             }
         }
         // The height ladder.
-        let full = out.card_rows(Some("me"), 60, None);
-        let carrier = out.carrier.clone().expect("a carrier");
-        let mut last_score = 0usize;
-        for h in (0..=full.len()).rev() {
-            let rows = out.card_rows(Some("me"), 60, Some(h));
-            assert_eq!(rows[0], full[0], "{name} h{h}: the verdict stays");
-            let items = rows
-                .iter()
-                .filter(|r| matches!(r, CardRow::Account { .. }))
-                .count();
-            assert_eq!(items, roster.len(), "{name} h{h}: every item stays");
-            let bars = bars_of(&rows);
-            let others = bars.iter().any(|(l, b)| *l != carrier && !b.is_empty());
-            let mine = bars
-                .iter()
-                .find(|(l, _)| *l == carrier)
-                .map(|(_, b)| b.clone())
-                .unwrap_or_default();
-            // What is still shown, as the rung of the ladder it sits on: each step down drops
-            // the next kind in order, never a later one first.
-            let kinds = [
-                rows.iter().any(|r| {
-                    row_text(r).starts_with("   not needed")
-                        || row_text(r).starts_with("   \u{2248}")
-                }),
-                rows.iter().any(is_strip),
+        let full = out.card_rows("me", None, true, 60, None);
+        let taken = |rows: &[CardRow]| rows.iter().map(CardRow::rows).sum::<usize>();
+        let kinds = |rows: &[CardRow]| -> [bool; 6] {
+            [
+                rows.iter().any(is_extra_note),
                 rows.iter().any(is_legend),
-                others,
-                mine.contains(&"5h"),
-                mine.contains(&"week"),
-            ];
-            let present = kinds.to_vec();
-            let had: Vec<bool> = {
-                let k = [
-                    full.iter().any(|r| {
-                        row_text(r).starts_with("   not needed")
-                            || row_text(r).starts_with("   \u{2248}")
-                    }),
-                    full.iter().any(is_strip),
-                    full.iter().any(is_legend),
-                    bars_of(&full)
-                        .iter()
-                        .any(|(l, b)| *l != carrier && !b.is_empty()),
-                    bars_of(&full)
-                        .iter()
-                        .any(|(l, b)| *l == carrier && b.contains(&"5h")),
-                    bars_of(&full)
-                        .iter()
-                        .any(|(l, b)| *l == carrier && b.contains(&"week")),
-                ];
-                k.to_vec()
-            };
+                rows.iter().any(is_axis),
+                rows.iter().any(has_lane),
+                rows.iter().any(is_work),
+                rows.iter().any(is_pace),
+            ]
+        };
+        let had = kinds(&full);
+        let mut last_score = 0usize;
+        for h in (0..=taken(&full)).rev() {
+            let rows = out.card_rows("me", None, true, 60, Some(h));
+            assert_eq!(rows[0], full[0], "{name} h{h}: the verdict stays");
+            let items: Vec<String> = items_of(&rows).into_iter().map(|(l, _)| l).collect();
+            assert_eq!(items, order, "{name} h{h}: every item stays");
+            let present = kinds(&rows);
             // The first kind still present that the full card had: every earlier one is gone,
             // every later one the full card had is still there.
             let score = (0..6).find(|&i| had[i] && present[i]).unwrap_or(6);
@@ -2076,9 +2143,338 @@ fn card_rows_fit() {
             }
             assert!(score >= last_score, "{name} h{h}: a later kind went first");
             last_score = score;
-            if h >= full.len() {
+            if h >= taken(&full) {
                 assert_eq!(rows, full, "{name}: room enough drops nothing");
             }
+        }
+    }
+}
+
+/// THE CARD'S LANES ARE THE ROWS NAMED THREE: a lane under each account the quota view names,
+/// in its order, each lane its own account's, and none under a folded item. On `pool1`'s pane
+/// in scenario A the view names `me`, `alt1` and `pool1` (the pane's account takes `alt2`'s
+/// place), so `alt2` is folded. Negative control: lanes for the roster's first three draw one
+/// under `alt2` and none under `pool1`.
+#[test]
+fn the_cards_lanes_are_the_rows_named_three() {
+    let out = scenario_a().outlook();
+    let view = out.quota("pool1", None, true);
+    let named: Vec<&str> = view.named.iter().map(|n| n.label.as_str()).collect();
+    assert_eq!(named, ["me", "alt1", "pool1"]);
+    assert_eq!(view.folded, ["alt2"]);
+    for room in [60, 44] {
+        let items = items_of(&out.card_rows("pool1", None, true, room, None));
+        let laned: Vec<&str> = items
+            .iter()
+            .filter_map(|(label, lane)| {
+                let lane = lane.as_deref()?;
+                assert_eq!(lane, label, "{room}: {label}'s lane is its own");
+                Some(label.as_str())
+            })
+            .collect();
+        assert_eq!(laned, named, "{room}: a lane per named account");
+        assert_eq!(
+            items.last(),
+            Some(&("alt2".to_owned(), None)),
+            "{room}: the folded item last, laneless"
+        );
+    }
+}
+
+/// THE LANES SHARE THE WORK ROW'S CLOCK: every lane's `▕` sits in the work row's `▕` column and
+/// each of its cells spans the instants the work row's cell above it does, so the day axis
+/// reads across every lane. Negative control: lanes right-aligned so their `↺` share a column
+/// (the first S6 layout) put `me`'s `▕` and `alt1`'s in different columns from the work row's.
+#[test]
+fn the_lanes_share_the_work_rows_clock() {
+    for (name, out) in scenes() {
+        for room in [60, 44, 36] {
+            let rows = out.card_rows("me", None, true, room, None);
+            let bar = now_col(work_cells(&rows));
+            let lanes: Vec<&CardLane> = rows.iter().filter_map(lane_of).collect();
+            assert!(!lanes.is_empty(), "{name} {room}: lanes");
+            for lane in lanes {
+                assert_eq!(now_col(&lane.cells), bar, "{name} {room}: {}", lane.spoken);
+                assert!(
+                    lane.cells[..WORK_WORD.len()].iter().all(|c| c.0 == ' '),
+                    "{name} {room}: the work word's cells stay blank"
+                );
+            }
+        }
+    }
+}
+
+/// A BURN-UP IS BLANK BEFORE ITS FIRST READING: in scenario A `alt1` was first read this week
+/// now, so each of its lane's past cells is blank but the last (which ends now and holds the
+/// reading), and `me`, read from 24 h ago, has a measured level in every past cell (never `▁`
+/// for a span nobody read). Negative control: a lane that carries its first reading back to the
+/// week's start draws a level in `alt1`'s first cell.
+#[test]
+fn a_burn_up_is_blank_before_its_first_reading() {
+    let out = scenario_a().outlook();
+    assert_eq!(out.rows[1].read.first().map(|r| r.t), Some(NOW));
+    for (room, k) in [(60, 6usize), (44, 4)] {
+        let rows = out.card_rows("me", None, true, room, None);
+        let lane = |label: &str| {
+            rows.iter()
+                .filter_map(lane_of)
+                .find(|l| l.spoken.starts_with(&format!("{label}'s week")))
+                .unwrap_or_else(|| panic!("{label}'s lane"))
+        };
+        let past = |lane: &CardLane| lane.cells[WORK_WORD.len()..now_col(&lane.cells)].to_vec();
+        let alt1 = past(lane("alt1"));
+        assert_eq!(alt1.len(), k, "{room}: a day of past cells");
+        assert!(
+            alt1[..k - 1].iter().all(|c| c.0 == ' '),
+            "{room}: blank before alt1's reading: {alt1:?}"
+        );
+        assert_eq!(alt1[k - 1].1, CardInk::Read, "{room}: the reading now");
+        for (glyph, ink) in past(lane("me")) {
+            assert_eq!(ink, CardInk::Read, "{room}: me is read all day");
+            assert!(
+                ('\u{2581}'..='\u{2588}').contains(&glyph),
+                "{room}: {glyph}"
+            );
+        }
+    }
+}
+
+/// A BURN-UP ENDS AT ITS RESET: each lane runs from now to its own account's reset and ends
+/// with `↺` in the cell that holds it, the cell of the work row's clock the reset falls in, so
+/// each `↺` sits under its reset on the day axis. Negative control: a lane drawn a week past
+/// now, to the chart's edge, runs past its reset.
+#[test]
+fn a_burn_up_ends_at_its_reset() {
+    let out = scenario_a().outlook();
+    for (room, k) in [(60, 6i64), (44, 4)] {
+        let rows = out.card_rows("me", None, true, room, None);
+        let lanes: Vec<&CardLane> = rows.iter().filter_map(lane_of).collect();
+        assert!(lanes.len() >= 2, "{room}: me's and alt1's lanes");
+        let bar = now_col(work_cells(&rows));
+        for (lane, reset) in lanes.iter().zip([THU9, FRI14]) {
+            let s = D / k;
+            let at = bar + 1 + usize::try_from((reset - NOW) / s).unwrap();
+            assert_eq!(lane.cells.len(), at + 1, "{room}: {}", lane.spoken);
+            assert_eq!(lane.cells[at].0, RESET_MARK, "{room}");
+            assert!(
+                lane.cells[bar + 1..at]
+                    .iter()
+                    .all(|c| c.1 == CardInk::Ahead || c.1 == CardInk::Track),
+                "{room}: the line to the reset"
+            );
+        }
+    }
+}
+
+/// A LANE IS OUT ONLY WHERE ITS OWN PASS FILLS IT (§1.4, §3.2): an item says `out ~T`, and its
+/// lane draws its out line, only for a fill the drawn pass itself projects, never for the worst case a
+/// lean assumes past it (an unread row walled at the lean's instant, never an inferred 100%);
+/// past the lean the lane is `┄` to its reset, as the work row is. In scenario A with `alt1`
+/// idle here the week pass leans on `alt1`, whose worst case walls it at the lean, so nothing
+/// is out from the lean on. Negative control: taking
+/// `out_at` from the row's projection (the bars' [`Pass::projections`], the lean's worst case
+/// included) says `out ~` at the lean and draws the out line past it.
+#[test]
+fn a_lane_is_out_only_where_its_own_pass_fills_it() {
+    let out = scenario_a_idle().outlook();
+    let week = out.week.as_ref().expect("the week pass");
+    let lean = week.lean.as_ref().expect("the work leans on alt1").at;
+    for room in [60, 44] {
+        let k = i64::from(card_per_day(room));
+        let s = D / k;
+        let rows = out.card_rows("me", None, true, room, None);
+        let bar = now_col(work_cells(&rows));
+        for row in &rows {
+            let CardRow::Account {
+                label, text, lane, ..
+            } = row
+            else {
+                continue;
+            };
+            let lane = lane.as_ref().map_or(&[][..], |l| &l.cells[..]);
+            for (j, cell) in lane.iter().enumerate().skip(bar + 1) {
+                let from = NOW + i64::try_from(j - bar - 1).unwrap() * s;
+                if from >= lean && cell.0 != RESET_MARK {
+                    assert_eq!(cell.0, '\u{2504}', "{room} {label}: unknown past the lean");
+                }
+            }
+            let reset = out
+                .row(label)
+                .and_then(|row| crate::harness::quota_view::reset_ahead(row, NOW));
+            let fills = week.fills.get(label).is_some_and(|k| {
+                k.iter().any(|k| {
+                    k.x10.is_some_and(|x| x >= 1000) && k.t > NOW && reset.is_some_and(|r| k.t < r)
+                })
+            });
+            assert_eq!(
+                text.contains("out ~"),
+                fills,
+                "{room} {label}: out only where the pass fills it: {text}"
+            );
+            assert_eq!(
+                lane.iter().any(is_out),
+                fills,
+                "{room} {label}: out only where the pass fills it"
+            );
+        }
+    }
+}
+
+/// AN ITEM SAYS ITS RUN-OUT BEFORE ITS PLAN: the lane under an item draws its out line where its account
+/// runs out, and the item says it in words whatever the card's width (§1.4), so the plan gives
+/// way first, at every width that draws a lane. With a name of 12 cells (the most a name takes)
+/// at 44 cells, `alab-pool-01`'s item has no room for its plan, its run-out and its reset
+/// together, and from 31 to 35 cells not for its padded columns and its run-out either, where
+/// its compact form (`alab-pool-01 58% out ~Thu`) says it. Negative controls: the forms in their
+/// first S6 order (the plan before the run-out) keep `Max 20x` and drop `out ~`; the forms the
+/// review fixed them to (the plan form after the run-out's, no compact form) keep `Max 20x` at
+/// 31 to 35 cells, as the recheck found.
+#[test]
+fn an_item_says_its_run_out_before_its_plan() {
+    let mut fx = Fx::new(&[
+        ("alab-pool-01", Class::Preferred),
+        ("alt1", Class::Preferred),
+    ]);
+    at_today_as(&mut fx, "alab-pool-01", 580);
+    alt1_read(&mut fx, 920);
+    let out = fx.outlook();
+    for room in (CARD_WORDS_ONLY + 1)..=60 {
+        let rows = out.card_rows("alab-pool-01", None, true, room, None);
+        let mut drawn = 0;
+        for row in &rows {
+            let CardRow::Account {
+                label,
+                text,
+                lane: Some(lane),
+                ..
+            } = row
+            else {
+                continue;
+            };
+            if lane.cells.iter().any(is_out) {
+                drawn += 1;
+                assert!(text.contains("out ~"), "{room} {label}: {text}");
+            }
+        }
+        assert!(drawn >= 1, "{room}: a lane runs out");
+    }
+}
+
+/// A TAB THE ROTATION CANNOT MOVE IS PROJECTED NOWHERE ON THE CARD (§2.2, §2.3): its footer
+/// draws `┄` and says no verdict, so its card draws no projected cell on the work row or a lane,
+/// says no `╳` (nor a pace or a lean's worst case), and says why; a refused outlook (a paused
+/// session's) says its refusal, the reason nothing is projected for anyone, whatever the tab.
+/// Negative controls: the card built as movable (the first S6 call, whatever the pane's route)
+/// draws scenario B's projection and its `╳` headline; a card whose route check comes before
+/// the refusal says `not projected` for a paused session.
+#[test]
+fn a_card_for_a_tab_the_rotation_cannot_move_projects_nothing() {
+    for (name, out) in scenes() {
+        for room in [60, 44, 30] {
+            let rows = out.card_rows("me", None, false, room, None);
+            assert!(!projects(&rows), "{name} {room}: nothing projected");
+            let head = row_text(&rows[0]);
+            assert!(!head.contains(GAP_MARK), "{name} {room}: {head}");
+            assert!(head.contains("not projected"), "{name} {room}: {head}");
+            assert!(
+                !rows.iter().any(|r| is_pace(r) || is_extra_note(r)),
+                "{name} {room}"
+            );
+        }
+    }
+    let b = scenario_b().outlook();
+    let rows = b.card_rows("me", None, true, 60, None);
+    assert!(projects(&rows) && row_text(&rows[0]).contains(GAP_MARK));
+    let paused = b.observations_only(Refusal::SessionPaused);
+    for movable in [true, false] {
+        let rows = paused.card_rows("me", None, movable, 60, None);
+        let head = row_text(&rows[0]);
+        assert!(
+            head.contains(&Refusal::SessionPaused.words()),
+            "{movable}: {head}"
+        );
+    }
+}
+
+/// A LANE SAYS A READING AS ITS ITEM DOES: a week read at 99.9% is `99 percent` in the lane's
+/// caption, as the item's figure is `99%`; 100 only for a reading of 100 (§2.1). Negative
+/// control: the caption's percent rounded half up with no cap says `100 percent`.
+#[test]
+fn a_lane_says_a_reading_as_its_item_does() {
+    let mut fx = Fx::new(&[("me", Class::Preferred), ("alt1", Class::Preferred)]);
+    me_at(&mut fx, 999);
+    alt1_read(&mut fx, 310);
+    let out = fx.outlook();
+    let rows = out.card_rows("me", None, true, 60, None);
+    let lane = captions(&rows)
+        .find(|s| s.starts_with("me's week"))
+        .expect("me's lane");
+    assert!(lane.contains("to 99 percent"), "{lane}");
+    assert!(!lane.contains("100 percent"), "{lane}");
+}
+
+/// A FOLDED ACCOUNT KEEPS ITS ITEM: scenario A's fourth account, `pool1`, is folded from the
+/// named three on `me`'s pane, yet it keeps its item (its figure and its reset) under a rule at
+/// every width and every height, never folded into a count. Negative control: a card that draws
+/// only the named three loses `pool1` at every size.
+#[test]
+fn a_folded_account_keeps_its_item() {
+    let out = scenario_a().outlook();
+    assert_eq!(out.quota("me", None, true).folded, ["pool1"]);
+    let full = out.card_rows("me", None, true, 60, None);
+    for (room, h) in [60, 44, 30]
+        .into_iter()
+        .flat_map(|room| (0..=full.len() * 2).map(move |h| (room, Some(h))))
+        .chain([(60, None), (44, None), (30, None)])
+    {
+        let rows = out.card_rows("me", None, true, room, h);
+        let at = rows
+            .iter()
+            .position(|r| matches!(r, CardRow::Account { label, .. } if label == "pool1"))
+            .unwrap_or_else(|| panic!("{room} {h:?}: pool1's item"));
+        assert_eq!(rows[at - 1], CardRow::Rule, "{room} {h:?}: under a rule");
+        let text = row_text(&rows[at]);
+        assert!(text.contains("40%"), "{room} {h:?}: {text}");
+        assert!(text.contains(RESET_MARK), "{room} {h:?}: {text}");
+        assert!(
+            !rows.iter().any(|r| row_text(r).contains("+1")),
+            "{room} {h:?}"
+        );
+    }
+}
+
+/// THE DAY AXIS LABELS THE CELL THAT HOLDS EACH MIDNIGHT (§1.4): a weekday sits over the cell
+/// its midnight falls in, so the hand-off a cell holds reads under its own day, and never over
+/// the `▕` column. On a +05:30 clock a local midnight falls an hour before now, inside the last
+/// past cell: at 60 cells its label moves to the first cell after `▕`, which is still that day;
+/// at 44 that would crowd out the next day's label, which keeps its own cell. Negative
+/// controls: the labels from the first cell beginning after each midnight (the first S6 axis)
+/// put Monday's label over `▕`, and every later one a cell late.
+#[test]
+fn the_day_axis_labels_the_cell_that_holds_each_midnight() {
+    let mut fx = scenario_a();
+    fx.offset = |_| 5 * H + 30 * MIN;
+    let out = fx.outlook();
+    for room in [60, 44] {
+        let k = i64::from(card_per_day(room));
+        let s = D / k;
+        let rows = out.card_rows("me", None, true, room, None);
+        let bar = now_col(work_cells(&rows));
+        let Some(CardRow::Plot { cells, .. }) = rows.iter().find(|r| is_axis(r)) else {
+            panic!("the axis");
+        };
+        let text: Vec<char> = cells.iter().map(|c| c.0).collect();
+        let at = |col: usize| -> String { text[col..col + 3].iter().collect() };
+        assert_eq!(text[bar], ' ', "{room}: nothing over `▕`: {text:?}");
+        // Mon 00:00 local, an hour ago: its label just after `▕`, where it crowds no other.
+        if room == 60 {
+            assert_eq!(at(bar + 1), "Mon", "{room}: {text:?}");
+        }
+        // Each later midnight, 23 h on and then a day apart: over the cell that holds it.
+        for (i, day) in ["Tue", "Wed", "Thu"].iter().enumerate() {
+            let m = NOW - H + (i64::try_from(i).unwrap() + 1) * D;
+            let col = bar + 1 + usize::try_from((m - NOW) / s).unwrap();
+            assert_eq!(at(col), *day, "{room}: {text:?}");
         }
     }
 }
@@ -2237,7 +2633,7 @@ fn an_unseen_carrier_tier_counts_every_row_alike() {
 fn a_leans_stop_ends_on_the_reset() {
     let out = scenario_c().outlook();
     let rows: Vec<String> = out
-        .card_rows(Some("me"), 60, None)
+        .card_rows("me", None, true, 60, None)
         .iter()
         .map(row_text)
         .collect();
@@ -2246,7 +2642,7 @@ fn a_leans_stop_ends_on_the_reset() {
         .find(|r| r.contains("has nothing"))
         .expect("the lean's worst case");
     assert!(
-        note.ends_with(&format!("\u{2013} {}", out.when(THU9))),
+        note.ends_with(&format!("\u{2013}{}", out.when(THU9))),
         "{note}"
     );
     assert!(!note.contains(&format!("~{}", out.when(THU9))), "{note}");
@@ -2282,7 +2678,7 @@ fn every_assumption_is_said_on_the_card_and_in_the_text() {
         assert!(kinds.contains(&kind), "A says {kind}: {:?}", out.approx);
     }
     let card: Vec<String> = out
-        .card_rows(Some("me"), 60, None)
+        .card_rows("me", None, true, 60, None)
         .iter()
         .map(row_text)
         .collect();
@@ -2291,7 +2687,7 @@ fn every_assumption_is_said_on_the_card_and_in_the_text() {
         assert!(
             out.approx_words(a, true)
                 .iter()
-                .any(|w| card.contains(&format!("   \u{2248} {w}"))),
+                .any(|w| card.contains(&format!("  \u{2248} {w}"))),
             "the card says {a:?}: {card:#?}"
         );
         let said = out.approx_words(a, false).into_iter().next().unwrap();
@@ -2349,31 +2745,27 @@ fn a_stops_words_lead_with_its_mark() {
     }
 }
 
-/// THE CARD SAYS ITS RESET ALOUD: the card's bar says the week's reset and where today's pace
-/// leaves it, in one clause. Negative control: a clause without its reset says only the pace.
+/// THE CARD SAYS ITS RESET ALOUD: the card's item for the account says its week's reset, and its
+/// lane the same reset, on the clock it falls on. Negative controls: `card_item`'s spoken words
+/// without their `resets` clause fail the first assertion; a lane caption that stops at now
+/// (the chart's span, not the account's own week) fails the second.
 #[test]
 fn the_card_says_its_reset_aloud() {
     let out = scenario_a().outlook();
     let reset = out.spoken_when(THU9);
-    let clause = out
-        .reset_pace_spoken(
-            Some(THU9),
-            out.rows[0].window(Window::Week).unwrap().projection,
-        )
-        .expect("a clause");
-    assert!(clause.contains(&format!("resets {reset}")), "{clause}");
-    let card_spoken: Vec<String> = out
-        .card_rows(Some("me"), 60, None)
+    let card = out.card_rows("me", None, true, 60, None);
+    let item = card
         .iter()
-        .filter_map(|r| match r {
-            CardRow::Plot { spoken, .. } => Some(spoken.clone()),
+        .find_map(|r| match r {
+            CardRow::Account { label, spoken, .. } if label == "me" => Some(spoken.clone()),
             _ => None,
         })
-        .collect();
-    assert!(
-        card_spoken.iter().any(|s| s.contains(&clause)),
-        "{card_spoken:#?}"
-    );
+        .expect("me's item");
+    assert!(item.contains(&format!("resets {reset}")), "{item}");
+    let lane = captions(&card)
+        .find(|s| s.starts_with("me's week"))
+        .expect("me's lane");
+    assert!(lane.contains(&format!("to its reset {reset}")), "{lane}");
 }
 
 /// A RESET PAST A DAYLIGHT CHANGE IS SAID ON ITS OWN CLOCK: on Los Angeles' clock (PDT until

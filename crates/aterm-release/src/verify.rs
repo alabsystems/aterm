@@ -868,7 +868,7 @@ pub fn run_status(repo: &Path) -> Result<()> {
     })?;
     step(
         "app",
-        &next_cut_line(repo, gates::published_source(), &release_version),
+        &next_cut_line(repo, gates::published_source(repo), &release_version),
     );
     step(
         "ledger",

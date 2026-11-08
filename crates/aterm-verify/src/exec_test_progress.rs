@@ -29,6 +29,89 @@ use crate::libtest_json::{Kind, case_block, line_event};
 /// The longest line read as an event; a longer one is [`Seen::Undecided`].
 pub(super) const LINE_CAP: usize = 4 << 20;
 
+/// One bounded diagnostic, classified from its full block before clipping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Failure {
+    pub case: String,
+    pub output: String,
+    pub omitted_bytes: usize,
+    pub(crate) marks: Marks,
+    pub source_path: Option<String>,
+    pub start_line: Option<u64>,
+    pub start_col: Option<u64>,
+}
+
+/// Observations, never a complete failure census or a binary verdict.
+#[derive(Clone, Debug, Default)]
+pub struct Observations {
+    pub read_end: ReadEnd,
+    pub json: bool,
+    pub failures: Vec<Failure>,
+}
+
+/// Why the last bounded read ended; an empty batch alone never means EOF.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReadEnd {
+    Budget,
+    Eof,
+    Partial,
+    #[default]
+    Unread,
+}
+
+impl ReadEnd {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Budget => "budget",
+            Self::Eof => "eof",
+            Self::Partial => "partial",
+            Self::Unread => "unread",
+        }
+    }
+}
+
+fn diagnostic(case: String, block: &str, marks: Marks) -> Failure {
+    let cap = crate::testrun::FAILURE_OUTPUT_BYTES;
+    let cost = crate::report::json_char_bytes;
+    let (output, omitted_bytes) = if block.chars().map(cost).sum::<usize>() <= cap {
+        (block.to_owned(), 0)
+    } else {
+        let marker = "\n…\n";
+        let room = cap - marker.chars().map(cost).sum::<usize>();
+        let mut used = 0;
+        let mut head = 0;
+        for (at, c) in block.char_indices() {
+            if used + cost(c) > room / 2 {
+                break;
+            }
+            used += cost(c);
+            head = at + c.len_utf8();
+        }
+        let mut used = 0;
+        let mut tail = block.len();
+        for (at, c) in block.char_indices().rev() {
+            if at < head || used + cost(c) > room - room / 2 {
+                break;
+            }
+            used += cost(c);
+            tail = at;
+        }
+        (
+            format!("{}{marker}{}", &block[..head], &block[tail..]),
+            tail - head,
+        )
+    };
+    Failure {
+        case,
+        output,
+        omitted_bytes,
+        marks,
+        source_path: None,
+        start_line: None,
+        start_col: None,
+    }
+}
+
 /// What a case reports while its binary runs: a long wait or its failed block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Seen {
@@ -49,10 +132,17 @@ pub(crate) enum Seen {
 
 /// The cases of one binary's log, read as it grows.
 pub(super) struct LiveCases {
+    observations: Observations,
     file: std::fs::File,
     json: bool,
     line: Vec<u8>,
     oversized: bool,
+    /// Complete output lines read from the binary. A partial line is no progress until its
+    /// newline arrives.
+    lines: u64,
+    /// False after the capture file returned an error, until a later read succeeds. Wall time
+    /// plus an unread output stream cannot prove that the binary printed nothing.
+    readable: bool,
     started: BTreeSet<String>,
     ended: BTreeSet<String>,
     long_running: BTreeSet<String>,
@@ -64,10 +154,16 @@ impl LiveCases {
     /// Read `path` from its start; `json` when the binary writes libtest's JSON events.
     pub(super) fn open(path: &Path, json: bool) -> std::io::Result<Self> {
         Ok(Self {
+            observations: Observations {
+                json,
+                ..Default::default()
+            },
             file: crate::open_regular(path)?,
             json,
             line: Vec::new(),
             oversized: false,
+            lines: 0,
+            readable: true,
             started: BTreeSet::new(),
             ended: BTreeSet::new(),
             long_running: BTreeSet::new(),
@@ -77,18 +173,31 @@ impl LiveCases {
     }
 
     /// A bounded read of newly appended output: failed cases and long-running reports, in log
-    /// order. Nothing once a case was [`Seen::Red`].
+    /// order. After a case is [`Seen::Red`], lines and case ends are still consumed for the
+    /// binary's liveness record, but no later failure is reported a second time.
     pub(super) fn poll(&mut self) -> Vec<Seen> {
         let mut out = Vec::new();
-        if self.red {
-            return out;
-        }
+        self.observations.read_end = ReadEnd::Budget;
         let mut bytes = vec![0; 1 << 16];
         for _ in 0..512 {
-            let Ok(n) = self.file.read(&mut bytes) else {
-                return out;
+            let n = match self.file.read(&mut bytes) {
+                Ok(n) => {
+                    self.readable = true;
+                    n
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    self.readable = false;
+                    self.observations.read_end = ReadEnd::Unread;
+                    return out;
+                }
             };
             if n == 0 {
+                self.observations.read_end = if self.line.is_empty() && !self.oversized {
+                    ReadEnd::Eof
+                } else {
+                    ReadEnd::Partial
+                };
                 return out;
             }
             for &byte in &bytes[..n] {
@@ -102,16 +211,35 @@ impl LiveCases {
                 }
                 let line = std::mem::take(&mut self.line);
                 let oversized = std::mem::replace(&mut self.oversized, false);
+                self.lines = self.lines.saturating_add(1);
                 if let Some(seen) = self.line_ended(&line, oversized) {
-                    let red = matches!(seen, Seen::Red { .. });
                     out.push(seen);
-                    if red {
-                        return out;
-                    }
                 }
             }
         }
         out
+    }
+
+    pub(super) fn observations(&self) -> &Observations {
+        &self.observations
+    }
+
+    /// Complete output lines consumed so far. A test's unterminated bytes do not move it.
+    pub(super) const fn lines(&self) -> Option<u64> {
+        if self.readable {
+            Some(self.lines)
+        } else {
+            None
+        }
+    }
+
+    /// Libtest JSON cases that started and have not reported `ok`, `failed` or `ignored`, sorted
+    /// by name. A human-format run has no such evidence and returns none.
+    pub(super) fn running(&self) -> Vec<String> {
+        if !self.json {
+            return Vec::new();
+        }
+        self.started.difference(&self.ended).cloned().collect()
     }
 
     fn line_ended(&mut self, line: &[u8], oversized: bool) -> Option<Seen> {
@@ -150,10 +278,21 @@ impl LiveCases {
                 if !self.started.contains(&name) || !self.ended.insert(name.clone()) {
                     return None;
                 }
-                if ev.event != "failed" {
+                if ev.event != "failed" || self.red {
                     return None;
                 }
-                let marks = crate::libtest::marks(&case_block(&ev));
+                let block = case_block(&ev);
+                let marks = crate::libtest::marks(&block);
+                if self.observations.failures.len() < crate::report::FINDINGS_SHOWN {
+                    let mut failure = diagnostic(name.clone(), &block, marks);
+                    failure.source_path = ev
+                        .source_path
+                        .as_ref()
+                        .map(|p| crate::report::clip_json(p, crate::report::EVENT_ROW_BYTES));
+                    failure.start_line = ev.start_line;
+                    failure.start_col = ev.start_col;
+                    self.observations.failures.push(failure);
+                }
                 self.seen.push(marks);
                 if crate::libtest::decisive(&self.seen) {
                     self.red = true;

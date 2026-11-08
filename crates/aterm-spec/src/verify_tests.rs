@@ -4,6 +4,99 @@
 
 use super::is_pending_stub;
 
+#[test]
+fn committed_report_keeps_late_actions_and_every_broken_law() {
+    use crate::{interp, ty_model};
+    use std::collections::BTreeSet;
+    let model = ty_model! {
+        CommittedCoverage {
+            const Buggy = 0;
+            var step = 0;
+            action First when (step == 0) { step = 1; }
+            action Later when (step == 1) { step = 2; }
+            action Last when (step == 2) { step = 3; }
+            invariant FirstLaw: step <= 0;
+            invariant SecondLaw: step <= 2;
+        }
+    };
+    let (laws, fired) = super::committed_report(&model);
+    assert_eq!(laws, BTreeSet::from(["FirstLaw", "SecondLaw"]));
+    assert_eq!(fired, BTreeSet::from(["First", "Last", "Later"]));
+
+    let mut valid = model;
+    valid.invariants.clear();
+    let (laws, fired) = super::committed_report(&valid);
+    assert!(laws.is_empty());
+    assert_eq!(fired, interp::fired_actions(&valid));
+    assert_eq!(fired, BTreeSet::from(["First", "Last", "Later"]));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "manual paired instruction measurement of committed model coverage"]
+fn committed_report_cost() {
+    use crate::{interp, test_models};
+    fn instructions() -> u64 {
+        let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
+        // SAFETY: this flavor initializes the complete buffer on success.
+        let status = unsafe {
+            libc::proc_pid_rusage(
+                libc::getpid(),
+                libc::RUSAGE_INFO_V4,
+                info.as_mut_ptr().cast(),
+            )
+        };
+        assert_eq!(status, 0);
+        // SAFETY: the successful call initialized the selected buffer.
+        unsafe { info.assume_init() }.ri_instructions
+    }
+    let models = [
+        test_models::ring_model(),
+        test_models::subscribe_model(),
+        test_models::pane_tree_model(),
+        test_models::tab_nav_model(),
+        test_models::config_catalog_snapshot_model(),
+        test_models::evict_full_model(),
+        test_models::native_update_status_reconciliation_model(),
+    ];
+    for (index, model) in models.into_iter().enumerate() {
+        if model.is_function_valued() {
+            eprintln!(
+                "committed_report model={} skipped=function-valued",
+                model.name
+            );
+            continue;
+        }
+        let model = interp::with_buggy(&model, 0);
+        let states = interp::bmc(&model).unwrap();
+        let expected = (
+            interp::violated_invariants(&model),
+            interp::fired_actions(&model),
+        );
+        assert_eq!(super::committed_report(&model), expected);
+        for round in 0..9 {
+            for offset in 0..2 {
+                let combined = (round + index + offset) % 2 == 0;
+                let before = instructions();
+                let result = if combined {
+                    super::committed_report(std::hint::black_box(&model))
+                } else {
+                    (
+                        interp::violated_invariants(std::hint::black_box(&model)),
+                        interp::fired_actions(std::hint::black_box(&model)),
+                    )
+                };
+                let retired = instructions() - before;
+                assert_eq!(result, expected);
+                eprintln!(
+                    "committed_report model={} states={states} round={round} combined={combined} instructions={retired}",
+                    model.name
+                );
+            }
+        }
+    }
+}
+
 /// One compiled executable chooses its checker policy from each fresh process's environment.
 /// The absent, zero and noncanonical values are negative controls for the required arm.
 #[test]

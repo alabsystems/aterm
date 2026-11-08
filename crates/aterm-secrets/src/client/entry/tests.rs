@@ -310,6 +310,11 @@ fn public_roster_waits_out_a_writer_holding_the_vault_state() {
     let held = StateLock::take(&f.paths).unwrap();
     let err = current_public_roster_until(&f.paths, Instant::now()).unwrap_err();
     assert!(err.to_string().contains("busy or unavailable"), "{err}");
+    let expired = current_public_roster_after(&f.paths, Duration::from_secs(61)).unwrap_err();
+    assert!(
+        expired.to_string().contains("busy or unavailable"),
+        "{expired}"
+    );
 
     let paths = &f.paths;
     let (read, blocked) = std::thread::scope(|scope| {
@@ -324,17 +329,17 @@ fn public_roster_waits_out_a_writer_holding_the_vault_state() {
                         drop(held.take());
                     }));
                 });
-                let read = current_public_roster(paths);
+                let read = current_public_roster_after(paths, Duration::from_secs(31));
                 crate::client::OBSERVE_BLOCKED.with(|hook| hook.borrow_mut().take());
                 (read, blocked.get())
             })
             .join()
             .unwrap()
     });
-    assert_eq!(blocked, 1, "the read found the state held once");
     let PublicRosterRead::Pair(pair) = read.unwrap() else {
         panic!("the pair once the writer let go");
     };
+    assert_eq!(blocked, 1, "the read found the state held once");
     assert_eq!(pair.roster, b"public body");
 }
 

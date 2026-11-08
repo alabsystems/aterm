@@ -116,7 +116,8 @@ fn painted_pool_work_keeps_the_full_account_route_and_original_time() {
         assert_eq!(spoken.matches("mailbox").count(), 1);
         let rect = crate::autopilot_menu::place(&menu, (39, 0), (0..40, 0..cols), (cols, 40), 0)
             .expect("the account menu fits");
-        let painted = crate::autopilot_menu::paint(rect, &menu, Default::default(), None, theme);
+        let painted =
+            crate::autopilot_menu::paint(rect, &menu, Default::default(), None, theme, None);
         let visible = painted
             .iter()
             .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
@@ -251,7 +252,7 @@ fn painted_login_diagnostics_preserve_distinct_full_labels_without_inventing_cha
         )
         .expect("every account menu row has room to paint");
         assert_eq!(rect.h, menu.len() + 2);
-        let painted = autopilot_menu::paint(rect, &menu, Default::default(), None, theme);
+        let painted = autopilot_menu::paint(rect, &menu, Default::default(), None, theme, None);
         assert_eq!(painted.len(), menu.len() + 2);
         let painted_row = |index: usize| {
             painted[index + 1][1..rect.w - 1]

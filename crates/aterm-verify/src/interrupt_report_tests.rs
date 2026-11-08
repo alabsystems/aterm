@@ -169,6 +169,7 @@ fn standin_run_reports_once_interrupted() {
         crate::disk::Disk::Held(disk),
         code == crate::exit::PASS,
         Some(&mut log),
+        ctx.events.as_ref(),
     );
     crate::end_run(&ctx, &scratch);
     std::process::exit(code);

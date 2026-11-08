@@ -5149,6 +5149,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             self.turn_end.seed_replies(seed.said, ago, self.fx.mono());
             self.turn_end.seed_switch_spent(seed.switch_spent);
             self.turn_end.seed_checks(seed.checks);
+            self.turn_end.seed_needs_acked(seed.needs_acked);
             let reset = seed.said_reset_ms.map(|ms| self.instant_of_ms(ms));
             self.turn_end.seed_replies_reset(reset);
             if seed.point && !seed.ran {

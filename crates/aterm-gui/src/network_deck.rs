@@ -220,7 +220,10 @@ impl crate::App {
                 && self.network_band_drawn())
             .then(due);
         }
-        (self.lab_page_shown() || self.network_band_drawn()).then(due)
+        (self.lab_page_shown()
+            || self.network_band_drawn()
+            || self.network_inspected_at(std::time::Instant::now()))
+        .then(due)
     }
 
     /// Project the Fleet Field again where what it stands on moved: the glance's generation,
@@ -277,10 +280,19 @@ impl crate::App {
             None
         };
         let fleet = band && self.fleet_glance.is_some();
+        // The services' cells are drawn only on the band, its lens and the Lab page, and their
+        // states are read by an inspection of the projection; with none of these the services'
+        // observer is not asked to sample, and their last sample ages.
+        let inspected = self.network_inspected_at(now);
+        let services = if band || self.lab_page_shown() || inspected {
+            crate::NetworkRead::WithServices
+        } else {
+            crate::NetworkRead::Network
+        };
         let snapshot = if let Some(read) = self.network_source.as_ref() {
             self.network_next_poll = Some(now + std::time::Duration::from_secs(1));
             snapshot_after_read(
-                read(),
+                read(services),
                 &self.network_snapshot,
                 &mut self.network_source_busy,
                 aterm_time::unix_millis(),
@@ -1394,7 +1406,7 @@ mod tests {
         known.network.peers.push(peer(7, Reachability::Reachable));
         known.services.accounts.refresh_failed = true;
         app.network_snapshot = std::sync::Arc::new(known);
-        app.network_source = Some(std::sync::Arc::new(|| None));
+        app.network_source = Some(std::sync::Arc::new(|_| None));
         let now = std::time::Instant::now();
         app.service_network_state(now);
         assert!(app.network_source_busy);
@@ -2462,7 +2474,7 @@ mod tests {
             .get_or_insert_with(Default::default)
             .stats_bars = Some("off".into());
         let snapshot = inactive_snapshot();
-        app.network_source = Some(std::sync::Arc::new(move || Some(snapshot.clone())));
+        app.network_source = Some(std::sync::Arc::new(move |_| Some(snapshot.clone())));
         let due = std::time::Instant::now() + std::time::Duration::from_secs(1);
         app.network_next_poll = Some(due);
         assert_eq!(app.network_state_deadline(), None);
@@ -2477,6 +2489,124 @@ mod tests {
         assert!(app.open_network_lens());
         app.network_source = None;
         assert_eq!(app.network_state_deadline(), None);
+    }
+
+    /// The window asks for the services only while their cells are drawn, on the band's lens or
+    /// the Lab page, or for a minute after an inspection of the projection; with none of these,
+    /// or the lens occluded, it reads the network alone.
+    /// NEGATIVE CONTROLS: a read that always asks for the services records `WithServices` with
+    /// nothing drawn; one that leaves out the Lab page, or the inspection, records `Network`
+    /// there; an inspection that never lapses records `WithServices` a minute on.
+    #[test]
+    fn the_window_reads_the_services_only_while_their_cells_are_drawn_or_inspected() {
+        use crate::NetworkRead::{Network, WithServices};
+        let mut app = crate::App::headless_for_test();
+        let wid = *app.windows.keys().next().expect("window");
+        app.config
+            .sys
+            .get_or_insert_with(Default::default)
+            .stats_bars = Some("off".into());
+        let snapshot = inactive_snapshot();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reads = std::sync::Arc::clone(&asked);
+        app.network_source = Some(std::sync::Arc::new(move |read| {
+            reads.lock().unwrap().push(read);
+            Some(snapshot.clone())
+        }));
+        let now = std::cell::Cell::new(std::time::Instant::now());
+        let read = |app: &mut crate::App, after: std::time::Duration| {
+            now.set(now.get() + after);
+            app.service_network_state(now.get());
+            std::mem::take(&mut *asked.lock().unwrap())
+        };
+        let second = std::time::Duration::from_secs(1);
+        assert_eq!(
+            read(&mut app, second),
+            [Network],
+            "nothing draws the services"
+        );
+        assert!(app.open_network_lens());
+        assert_eq!(
+            read(&mut app, second),
+            [WithServices],
+            "the lens draws them"
+        );
+        app.windows.get_mut(&wid).unwrap().occluded = true;
+        assert_eq!(
+            read(&mut app, second),
+            [Network],
+            "an occluded lens draws nothing"
+        );
+        app.windows.get_mut(&wid).unwrap().occluded = false;
+        app.close_stats_lens(wid);
+        assert_eq!(read(&mut app, second), [Network], "the lens closed");
+        assert!(app.open_settings_tab_in_window(wid, crate::native_settings::SettingsRoute::Lab));
+        assert_eq!(
+            read(&mut app, second),
+            [WithServices],
+            "the Lab page draws them"
+        );
+        assert!(app.open_settings_tab_in_window(wid, crate::native_settings::SettingsRoute::Home));
+        assert_eq!(read(&mut app, second), [Network], "the Lab page left");
+        app.note_inspection(&crate::app_control::InspectRequest::Tabs, now.get());
+        assert_eq!(
+            read(&mut app, second),
+            [Network],
+            "the tabs' inspection reads none"
+        );
+        app.note_inspection(&crate::app_control::InspectRequest::Network, now.get());
+        let at_once = std::time::Duration::ZERO;
+        assert_eq!(
+            read(&mut app, at_once),
+            [WithServices],
+            "an inspection reads them at once"
+        );
+        let minute = crate::app_control::INSPECTED_FOR;
+        assert_eq!(read(&mut app, minute), [WithServices], "a minute on");
+        assert_eq!(read(&mut app, second), [Network], "past a minute");
+    }
+
+    /// An inspection owes the window a read each second for a minute, drawn or not: the next
+    /// turn's at once, then the ordinary poll's; one within that minute leaves the poll alone.
+    /// NEGATIVE CONTROLS: a deadline that leaves out the inspection is `None` with nothing drawn;
+    /// an inspection that keeps the poll waits for it; one that clears it each time reads at each.
+    #[test]
+    fn an_inspection_owes_the_window_a_read_each_second_for_a_minute() {
+        let mut app = crate::App::headless_for_test();
+        app.config
+            .sys
+            .get_or_insert_with(Default::default)
+            .stats_bars = Some("off".into());
+        let snapshot = inactive_snapshot();
+        app.network_source = Some(std::sync::Arc::new(move |_| Some(snapshot.clone())));
+        let second = std::time::Duration::from_secs(1);
+        let now = std::time::Instant::now();
+        app.service_network_state(now);
+        assert_eq!(app.network_next_poll, Some(now + second));
+        assert_eq!(
+            app.network_state_deadline(),
+            None,
+            "nothing shows the services"
+        );
+        app.note_inspection(&crate::app_control::InspectRequest::Network, now);
+        assert_eq!(app.network_next_poll, None, "the next turn reads at once");
+        assert!(app.network_state_deadline().is_some());
+        app.service_network_state(now);
+        assert_eq!(
+            app.network_state_deadline(),
+            Some(now + second),
+            "then each second"
+        );
+        app.note_inspection(&crate::app_control::InspectRequest::Network, now);
+        assert_eq!(
+            app.network_next_poll,
+            Some(now + second),
+            "a repeat leaves the poll"
+        );
+        app.network_inspected =
+            std::time::Instant::now().checked_sub(crate::app_control::INSPECTED_FOR + second);
+        assert!(app.network_inspected.is_some());
+        assert_eq!(app.network_state_deadline(), None, "past a minute");
     }
 
     #[test]

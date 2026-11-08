@@ -7769,9 +7769,27 @@ mod tests {
         )
         .unwrap();
 
-        let started = std::time::Instant::now();
-        let error = app.save_document_checkpoint(document, view).unwrap_err();
-        assert!(started.elapsed() < REFUSES_WITHOUT_BLOCKING);
+        let pending = app.hold_document_save_for_test(document);
+        let grant = app
+            .native_documents
+            .grants
+            .cloned_grant(pending.grant)
+            .unwrap();
+        let result = crate::native_document_host::execute_granted_save_after(
+            &grant,
+            &pending.plan,
+            std::time::Duration::from_secs(61),
+        );
+        let error = app
+            .finish_native_document_save(
+                document,
+                view,
+                pending.plan.generation,
+                pending.plan.bytes,
+                result,
+                None,
+            )
+            .unwrap_err();
         assert_eq!(
             error,
             format!(

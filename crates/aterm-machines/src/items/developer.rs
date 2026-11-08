@@ -74,8 +74,7 @@ const INSTALLER_TICK: Duration = Duration::from_secs(2);
 /// Why the tools wait while the network is in Low Data Mode.
 pub const LOW_DATA: &str = "Low Data Mode is on for this network, and the Command Line Tools \
                             are about half a gigabyte to download: turn it off for this network \
-                            in System Settings > Network, or join another network, then run \
-                            `aterm init --only base.clt`";
+                            in System Settings > Network, or join another network";
 
 /// [`LOW_DATA`] when the network this Mac uses now is in Low Data Mode
 /// ([`System::low_data_mode`]); nothing when it is not, or cannot be told.
@@ -842,7 +841,7 @@ impl Item for CommandLineTools {
     fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
         let probe = self.read(sys);
         self.note(match &probe {
-            Probe::Blocked { .. } => Some(Unfinished::Catalog),
+            Probe::Blocked { .. } => Some(Unfinished::LowData),
             Probe::Unusable { .. } => Some(Unfinished::Other),
             _ => None,
         });
@@ -1749,7 +1748,7 @@ Software Update found the following new or updated software:\n\
                 why: LOW_DATA.into()
             }
         );
-        assert!(LOW_DATA.contains("`aterm init --only base.clt`"));
+        assert_eq!(items[0].unfinished(), Some(Unfinished::LowData));
         assert!(
             sys.calls()
                 .iter()
@@ -1765,6 +1764,7 @@ Software Update found the following new or updated software:\n\
                 matches!(items[0].probe(&sys, &ctx()), Probe::Change { .. }),
                 "{low_data:?}"
             );
+            assert_eq!(items[0].unfinished(), None, "{low_data:?}");
         }
     }
 

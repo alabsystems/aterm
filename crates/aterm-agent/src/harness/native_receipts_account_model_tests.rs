@@ -167,11 +167,27 @@ pub(crate) fn transition(state: &State, action: &str) -> State {
 }
 
 fn step(state: &State, action: &str, fault: u8, mut evidence: Option<&mut StepEvidence>) -> State {
-    let w = lay(state);
     let mut next = state.clone();
     next.insert("ack", 0);
     next.insert("observed", 0);
     next.insert("which", 0);
+    // These unmodeled choices select fixture parameters, not journal transitions.
+    // The following real operations reconstruct and verify the selected journal.
+    let parameter = match action {
+        "LegacyParent" => Some(("known", 0)),
+        "WrongPhase" => Some(("phase", 1)),
+        "RightPhase" => Some(("phase", 0)),
+        "WrongBinding" => Some(("binding", 0)),
+        "RightBinding" => Some(("binding", 1)),
+        "TightRecords" => Some(("limit", 4)),
+        "TightBytes" => Some(("byte_limit", 2455)),
+        _ => None,
+    };
+    if let Some((name, value)) = parameter {
+        next.insert(name, value);
+        return next;
+    }
+    let w = lay(state);
     let which = if action.ends_with('B') { 2 } else { 1 };
     let phase = if fault == 1 { 0 } else { state["phase"] };
     let c = candidate(&w, which, phase);
@@ -191,28 +207,6 @@ fn step(state: &State, action: &str, fault: u8, mut evidence: Option<&mut StepEv
         candidate: &c,
     };
     match action {
-        "LegacyParent" => {
-            next.insert("known", 0);
-            return project(&lay(&next), next);
-        }
-        "WrongPhase" => {
-            next.insert("phase", 1);
-        }
-        "RightPhase" => {
-            next.insert("phase", 0);
-        }
-        "WrongBinding" => {
-            next.insert("binding", 0);
-        }
-        "RightBinding" => {
-            next.insert("binding", 1);
-        }
-        "TightRecords" => {
-            next.insert("limit", 4);
-        }
-        "TightBytes" => {
-            next.insert("byte_limit", 2455);
-        }
         "ClaimA" | "ClaimB" | "RefuseA" | "RefuseB" | "ReplayA" | "ReplayB" => {
             let name = match action {
                 "ClaimA" => "ClaimA",

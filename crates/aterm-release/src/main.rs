@@ -13,6 +13,7 @@ mod bundle;
 mod changelog;
 mod check_record;
 mod checkout_bin;
+mod postlink;
 
 mod channel;
 

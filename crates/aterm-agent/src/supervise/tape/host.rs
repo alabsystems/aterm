@@ -1912,6 +1912,31 @@ impl TapeValue for Option<(PathBuf, String)> {
     }
 }
 
+/// `needs_told`'s answer as a tape holds it: the set and the entry's text.
+#[derive(Serialize, Deserialize)]
+struct NeedsToldWire {
+    needs: Vec<String>,
+    entry: String,
+}
+
+impl TapeValue for Option<(Vec<String>, String)> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.as_ref().map(|(needs, entry)| NeedsToldWire {
+            needs: needs.clone(),
+            entry: entry.clone(),
+        }))
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        Ok(of_json::<Option<NeedsToldWire>>(bytes)?.map(|w| (w.needs, w.entry)))
+    }
+
+    /// A tape recorded before the door: its host held no set to adopt.
+    fn absent() -> Option<Self> {
+        Some(None)
+    }
+}
+
 /// `account_probe`'s answer: `null` for a claim, else the refusal's word.
 impl TapeValue for Result<(), ProbeNo> {
     fn to_tape(&self) -> Vec<u8> {

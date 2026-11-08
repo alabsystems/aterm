@@ -190,8 +190,8 @@ struct RingRead {
     core: Box<[u32]>,
     bed: Box<[u32]>,
     /// The lower of the whole reading on the clean frame and [`Self::own`], the judges' own
-    /// reading, whose [`super::raster_bar`] the whole reading keeps ([`RingCell::whole_holds`]);
-    /// and the luminance of the clean core's median ink.
+    /// reading, whose bar the whole reading keeps ([`RingCell::whole_bar`]); and the luminance of
+    /// the clean core's median ink.
     whole_own: f32,
     l_core: f32,
 }
@@ -678,30 +678,32 @@ impl RingCell {
         (li.max(lg) + 0.05) / (li.min(lg) + 0.05)
     }
 
-    /// The bar [`Self::whole`] keeps: [`super::raster_bar`] of the lower of its reading on the
-    /// clean frame and [`Self::own`], the judges' own reading; none under the test's control
+    /// The bar [`Self::whole`] keeps under `hold`: the bar `hold` names
+    /// ([`super::RasterHold::bar`]) for the lower of its reading on the clean frame and
+    /// [`Self::own`], the judges' own reading; none under the test's control
     /// ([`Self::whole_off`]). Worked out at each use, not kept with the read, so the bar's own
     /// controls (`with_share_over_aa`, `with_aa_unrounded`) reach a neighbourhood read before.
-    fn whole_bar(&self) -> f32 {
+    fn whole_bar(&self, hold: super::RasterHold) -> f32 {
         #[cfg(any(test, debug_assertions))]
         if self.whole_off {
             return 0.0;
         }
-        super::raster_bar(self.current().whole_own)
+        hold.bar(self.current().whole_own)
     }
 
-    /// Whether frame `px` keeps the letter's whole reading at its bar.
-    pub(super) fn whole_holds(&self, px: &impl FramePx) -> bool {
-        self.whole(px) >= self.whole_bar()
+    /// Whether frame `px` keeps the letter's whole reading at its bar under `hold`.
+    pub(super) fn whole_holds(&self, px: &impl FramePx, hold: super::RasterHold) -> bool {
+        self.whole(px) >= self.whole_bar(hold)
     }
 
-    /// Whether the whole reading keeps its bar on any frame whose lights add, lifting each pixel
-    /// and no channel of the bed's median past luminance `lg`: the core's ink can only rise.
-    pub(super) fn whole_clears(&self, lg: f32) -> bool {
+    /// Whether the whole reading keeps its bar under `hold` on any frame whose lights add,
+    /// lifting each pixel and no channel of the bed's median past luminance `lg`: the core's ink
+    /// can only rise.
+    pub(super) fn whole_clears(&self, lg: f32, hold: super::RasterHold) -> bool {
         let read = self.current();
         read.core.is_empty()
             || read.bed.is_empty()
-            || (lg < read.l_core && (read.l_core + 0.05) / (lg + 0.05) >= self.whole_bar())
+            || (lg < read.l_core && (read.l_core + 0.05) / (lg + 0.05) >= self.whole_bar(hold))
     }
 }
 
@@ -773,6 +775,7 @@ fn median_of(at: &[u32], px: &impl FramePx) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::RasterHold;
     use super::*;
 
     const PAGE: u32 = 0x0000_2B36;
@@ -879,8 +882,8 @@ mod tests {
             "{what}: its whole reading"
         );
         assert_eq!(
-            kept.whole_holds(&Px(frame)),
-            fresh.whole_holds(&Px(frame)),
+            kept.whole_holds(&Px(frame), RasterHold::Bar),
+            fresh.whole_holds(&Px(frame), RasterHold::Bar),
             "{what}: whether its whole reading holds"
         );
     }
@@ -1161,18 +1164,18 @@ mod tests {
         cell.read((w, h), (cw, ch), r, &cells, (&table, false));
         let clean = cell.clean.clone();
         assert_eq!(
-            cell.whole_bar(),
+            cell.whole_bar(RasterHold::Bar),
             super::super::raster_bar(cell.whole(&Px(&clean)).min(cell.own)),
             "the bar is what the whole reading reads on the clean frame"
         );
         let own = cell.reading(&Px(&clean));
         assert!(
-            own > 4.6 && cell.whole_bar() < 4.6,
+            own > 4.6 && cell.whole_bar(RasterHold::Bar) < 4.6,
             "fixture: the ring reads {own}, the core's bar is {}",
-            cell.whole_bar()
+            cell.whole_bar(RasterHold::Bar)
         );
         assert!(
-            cell.whole_holds(&Px(&clean)),
+            cell.whole_holds(&Px(&clean), RasterHold::Bar),
             "the clean frame keeps its bar"
         );
         // The upper half of the cell burns; the row over the dot and everything lower does not.
@@ -1209,9 +1212,9 @@ mod tests {
             "the cell's whole reading {read}, the judges' {want}"
         );
         assert!(
-            !cell.whole_holds(&Px(&frame)),
+            !cell.whole_holds(&Px(&frame), RasterHold::Bar),
             "a flame over the cell takes its bed: the whole reading {read} against its bar {}",
-            cell.whole_bar()
+            cell.whole_bar(RasterHold::Bar)
         );
     }
 

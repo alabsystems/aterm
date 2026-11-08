@@ -128,8 +128,13 @@ pub(crate) const fn page_lit_ink(rgb: u32, page: u32) -> u32 {
 /// own luminance, but where the stop's OKLCH hue lies within `turn` degrees
 /// of the page's, turned that far off the page's hue on the stop's side,
 /// with the most chroma the page's luminance holds there up to the stop's
-/// own. It never lies over the page's luminance, so a letter over it keeps
-/// its reading whole; only its hue reads. Beam's ice on Solarized Dark's
+/// own. It never lies over the page's luminance, so a letter wholly over it
+/// keeps its reading; only its hue reads. Off the page's hue it lies over
+/// the page in some channel, so at its edge, where a letter's ring lies on
+/// it and on the page, the judges' median of each channel (the upper one of
+/// an even count) can read a ground brighter than either; the letter guard
+/// holds the body to that letter's bar (`CursorGlow::hold_page_shades`).
+/// Beam's ice on Solarized Dark's
 /// teal (OKLCH hue 238 on the page's 220) solved to `#032a3a` there, the
 /// page itself to the eye, so its tube had no body under its letters
 /// (the after-land lows' W6); turned 40 degrees it is a deep ice blue.
@@ -1256,7 +1261,8 @@ pub(crate) struct BedScratch {
     pub(crate) bar: Option<((i32, i32), f32)>,
     /// Per run, whether its body is a page shade ([`BedShape::lit_body_turn`]
     /// on a lit page, no sample of it in the air): laid at or under the
-    /// page's luminance, kept whole by the letter guard
+    /// page's luminance, kept from the letter guard's weighing of the other
+    /// lights, which holds it to the letters it reaches by itself
     /// ([`InkLedger::note_page_shade_laid`]). Weighed with the lights in its
     /// cells, Beam's body was cut with the caret's halo under the last word
     /// on Solarized Dark, a navy box stopping a word short of the caret.
@@ -3672,7 +3678,7 @@ impl CursorGlow {
             ri += 1;
             air_lit(run, geom, &text, air_opts, &mut lit);
             // A body laid under its letters alone, at the page's luminance,
-            // is a page shade the letter guard keeps whole.
+            // is a page shade the letter guard holds by itself.
             scratch.shade_runs.push(
                 body_turn > 0.0
                     && !shade_weighed

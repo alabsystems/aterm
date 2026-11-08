@@ -541,3 +541,88 @@ fn values_read_apart_from_quiet_words() {
         "CONTROL: the old value {old:06x} reads {apart:.3} L from quiet {quiet:06x}"
     );
 }
+
+/// A card's border cells along the launch card's arc, clockwise from the top-left corner: the
+/// top edge left to right, the right side down, the bottom edge right to left, the left side up.
+fn clockwise(rows: usize, cols: usize) -> Vec<(usize, usize)> {
+    let mut walk: Vec<(usize, usize)> = (0..cols).map(|c| (0, c)).collect();
+    walk.extend((1..rows - 1).map(|r| (r, cols - 1)));
+    walk.extend((0..cols).rev().map(|c| (rows - 1, c)));
+    walk.extend((1..rows - 1).rev().map(|r| (r, 0)));
+    walk
+}
+
+/// The launch card's perimeter fraction (`HarnessCard`'s `border_arc_x` and `border_arc_y`) of a
+/// point `(x, y)` on the border of a `w` by `h` box from its top-left corner, `side` naming the
+/// edge: 0 top, 1 right, 2 bottom, 3 left.
+fn launch_arc(side: u8, (x, y): (f32, f32), (w, h): (f32, f32)) -> f32 {
+    let along = match side {
+        0 => x,
+        1 => w + y,
+        2 => w + h + (w - x),
+        _ => 2.0 * w + h + (h - y),
+    };
+    along / (2.0 * (w + h))
+}
+
+/// A CARD'S BORDER IS THE LAUNCH CARD'S ARC, CELL BY CELL (§1.4): a fact card `rows` by `cols`
+/// cells, a cell [`CELL_ASPECT`] widths tall, maps each border cell's centre to the fraction the
+/// launch card's border gives that point (top `x`, right `w + y`, bottom `w + h + (w − x)`,
+/// left `2w + h + (h − y)`, over `2(w + h)`), so its corners sit at the arc's quarter marks and
+/// the fraction rises clockwise round the card. Negative control: the arc walked the other way
+/// (`1 − s`, the right side reading up) puts the top-right corner off its mark and falls along
+/// the walk.
+#[test]
+fn a_cards_border_is_the_launch_cards_arc() {
+    let reversed = |r, c, rows, cols| (1.0 - perimeter(r, c, rows, cols)).rem_euclid(1.0);
+    for (rows, cols) in [(3, 5), (8, 36), (14, 62), (22, 46)] {
+        let (w, h) = (cols as f32, rows as f32 * CELL_ASPECT);
+        let centre = |r: usize, c: usize| (c as f32 + 0.5, (r as f32 + 0.5) * CELL_ASPECT);
+        for (r, c) in clockwise(rows, cols) {
+            let side = if r == 0 {
+                0
+            } else if c + 1 == cols {
+                1
+            } else if r + 1 == rows {
+                2
+            } else {
+                3
+            };
+            let want = launch_arc(side, centre(r, c), (w, h));
+            let got = perimeter(r, c, rows, cols);
+            assert!(
+                (got - want).abs() < 1e-5,
+                "{rows}x{cols} ({r}, {c}): {got} against the launch card's {want}"
+            );
+        }
+        let walk: Vec<f32> = clockwise(rows, cols)
+            .into_iter()
+            .map(|(r, c)| perimeter(r, c, rows, cols))
+            .collect();
+        assert!(
+            walk.windows(2).all(|p| p[1] > p[0]),
+            "{rows}x{cols}: clockwise {walk:?}"
+        );
+        // The corners at the arc's quarter marks, within the half cell their centres sit in.
+        let half = CELL_ASPECT / (2.0 * (w + h));
+        let corner = |r, c, at: f32| (perimeter(r, c, rows, cols) - at).abs() <= half + 1e-6;
+        assert!(
+            corner(0, cols - 1, w / (2.0 * (w + h))),
+            "{rows}x{cols}: top right"
+        );
+        assert!(corner(rows - 1, cols - 1, (w + h) / (2.0 * (w + h))));
+        assert!(corner(rows - 1, 0, (2.0 * w + h) / (2.0 * (w + h))));
+        let back: Vec<f32> = clockwise(rows, cols)
+            .into_iter()
+            .map(|(r, c)| reversed(r, c, rows, cols))
+            .collect();
+        assert!(
+            !back.windows(2).all(|p| p[1] > p[0]),
+            "CONTROL: the reversed arc rises clockwise"
+        );
+        assert!(
+            (reversed(0, cols - 1, rows, cols) - w / (2.0 * (w + h))).abs() > half,
+            "CONTROL: the reversed arc's top right at its mark"
+        );
+    }
+}

@@ -124,7 +124,7 @@ impl Recovery {
             ));
         }
         let paths = crate::generation::selected(&self.paths)?;
-        let deadline = Instant::now() + PASS;
+        let deadline = crate::admission::deadline();
         let (bootstrap, journal) = Bootstrap::required_with_journal_until(&paths, deadline)
             .map_err(crate::table::failure)?;
         let session = Session::from_admitted_journal_until(&bootstrap, journal, Some(deadline))?;
@@ -171,7 +171,7 @@ impl Recovery {
     /// Current signed requests, without creating tables or acquiring a writer.
     /// Their body is still untrusted input, never permission to issue a grant.
     pub fn pending(&self) -> Result<Vec<Request>> {
-        self.pending_until(Instant::now() + PASS)
+        self.pending_until(crate::admission::deadline())
     }
 
     pub fn pending_until(&self, deadline: Instant) -> Result<Vec<Request>> {
@@ -180,7 +180,7 @@ impl Recovery {
 
     #[cfg(test)]
     fn pending_at(&self, now: u64) -> Result<Vec<Request>> {
-        self.pending_at_until(now, Instant::now() + PASS)
+        self.pending_at_until(now, crate::admission::deadline())
     }
 
     #[cfg_attr(
@@ -288,14 +288,6 @@ impl Recovery {
         Ok(latest.into_values().map(|(_, request)| request).collect())
     }
 }
-
-/// How long one recovery pass may take before it gives up.
-#[cfg(not(test))]
-const PASS: Duration = Duration::from_secs(2);
-/// A test's pass is its hang detector: a loaded machine can keep a test's journal reads from
-/// finishing within the product's bound.
-#[cfg(test)]
-const PASS: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 fn now() -> Result<u64> {
     aterm_time::unix_millis()

@@ -919,8 +919,8 @@ pub struct CursorGlow {
     #[cfg(test)]
     lit_bodiless: bool,
     /// Test-only: Beam's body under a lit page's letters weighed and cut by
-    /// the letter guard with the lights in its cells, not kept whole as a
-    /// page shade ([`bed::BedScratch::shade_runs`]).
+    /// the letter guard with the lights in its cells, not held by itself as
+    /// a page shade ([`bed::BedScratch::shade_runs`]).
     #[cfg(any(test, debug_assertions))]
     lit_body_weighed: bool,
     /// Test-only: a bar caret's rail laid to its cell's far edge, as under a
@@ -2463,8 +2463,8 @@ impl CursorGlow {
     }
 
     /// A test's negative control: `on` (as shipped), Beam's body under a lit page's letters is a
-    /// page shade the letter guard keeps whole; off, it is weighed and cut with the lights in its
-    /// cells ([`bed::BedScratch::shade_runs`]).
+    /// page shade the letter guard holds by itself; off, it is weighed and cut with the lights in
+    /// its cells ([`bed::BedScratch::shade_runs`]).
     #[cfg(any(test, debug_assertions))]
     #[inline]
     pub const fn set_lit_body_a_shade(&mut self, on: bool) {

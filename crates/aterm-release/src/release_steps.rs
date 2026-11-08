@@ -212,7 +212,23 @@ pub struct Real {
     pub(crate) handed_inputs: fn() -> Option<PathBuf>,
     repo: PathBuf,
     home: PathBuf,
+    /// The publication engine this release is named (`--engine`, else `$PUBLICATION_ENGINE`, else
+    /// `~/publication`): it names the engine's origin and committer, and nothing here runs, syncs
+    /// or writes it, since other processes move it ([`crate::gates::engine_copy`]).
+    engine_source: PathBuf,
+    /// The engine this release runs, syncs, reads and hands every child as `PUBLICATION_ENGINE`:
+    /// its own copy ([`crate::gates::engine_copy`], made from `engine_source`'s origin by
+    /// [`Real::engine_copy`]); in a dry run, which never makes or moves one, `engine_source` until a
+    /// real run has made it.
     engine: PathBuf,
+    /// The main of the engine's origin, fetched at step 1 ([`Backend::fetch`]): what the release
+    /// judges of the engine (its ledger, its code) until it has synced its copy
+    /// ([`Real::engine_text`]), which may be a release behind or not made yet; a dry run, which
+    /// syncs none, judges it throughout.
+    origin_main: Option<crate::gates::OriginMain>,
+    /// This run brought its copy to the origin's main ([`Real::engine_sync`]): what it judges of
+    /// the engine is the copy's from then on, whose ledger this run's own `pub publish` writes.
+    engine_synced: std::sync::atomic::AtomicBool,
     state: PathBuf,
     logs: PathBuf,
     /// `<git common dir>/aterm-release`: the journal, the run claim, the child's note.
@@ -314,6 +330,13 @@ struct RealBranches<'a> {
 }
 
 impl Branches for RealBranches<'_> {
+    fn keep_build_on_test_red(&self, c: &Candidate) -> bool {
+        (self.real.build_inputs)()
+            .and_then(|seal| {
+                crate::check_record::keep_build_on_test_failure(&self.real.git(), &c.commit, &seal)
+            })
+            .unwrap_or(false)
+    }
     fn say(&self, line: &str) {
         say_to(&self.real.transcript(), line);
     }
@@ -499,15 +522,22 @@ impl Real {
             .filter(|h| !h.is_empty())
             .map(PathBuf::from)
             .ok_or("HOME is not set")?;
-        let engine = engine.map(Path::to_path_buf).unwrap_or_else(|| {
+        let source = engine.map(Path::to_path_buf).unwrap_or_else(|| {
             std::env::var_os("PUBLICATION_ENGINE")
                 .filter(|v| !v.is_empty())
                 .map_or_else(|| home.join("publication"), PathBuf::from)
         });
-        let engine = std::env::current_dir().map_or_else(
-            |_| engine.clone(),
-            |cwd| crate::release::anchor(&engine, &cwd),
+        let engine_source = std::env::current_dir().map_or_else(
+            |_| source.clone(),
+            |cwd| crate::release::anchor(&source, &cwd),
         );
+        let release = crate::gates::release_dir(repo);
+        let copy = crate::gates::engine_copy(&release);
+        let engine = if dry && !copy.join(".git").exists() {
+            engine_source.clone()
+        } else {
+            copy
+        };
         let state = release_state(&home);
         let started = now();
         let offset = i64::try_from(started)
@@ -525,22 +555,16 @@ impl Real {
                 .join(format!("{stamp}-{}", std::process::id()))
         };
         std::fs::create_dir_all(&logs).map_err(|e| format!("create {}: {e}", logs.display()))?;
-        let release = GitCli::new(repo)
-            .git(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
-            .ok()
-            .filter(crate::ledger::RunOut::success)
-            .map_or_else(
-                || repo.join(".git"),
-                |out| PathBuf::from(out.stdout_utf8().trim()),
-            )
-            .join("aterm-release");
         Ok(Self {
             build_inputs: crate::build_inputs::current,
             arm_inputs: crate::build_inputs::arm,
             handed_inputs: crate::build_inputs::handed_path,
             repo: repo.to_path_buf(),
             home,
+            engine_source,
             engine,
+            origin_main: None,
+            engine_synced: std::sync::atomic::AtomicBool::new(false),
             state,
             logs,
             release,
@@ -1099,7 +1123,240 @@ impl Real {
             .join(format!("{:02}-{}-{what}.log", step.number(), step.name()))
     }
 
+    /// Bring this release's engine to its origin's main: made first where it has none, or pointed
+    /// at the origin `engine_source` names ([`Real::engine_copy`]), then fast-forwarded with the
+    /// audit rows its stages appended committed and pushed ([`Real::engine_fast_forward`]).
     fn engine_sync(&self) -> Result<(), Refusal> {
+        self.engine_copy()?;
+        self.engine_fast_forward()?;
+        self.engine_synced
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// The origin `engine_source` names (`git remote get-url origin`), or why it names none.
+    fn source_origin(&self) -> Result<String, Refusal> {
+        let s = self.engine_source.display().to_string();
+        if !self.engine_source.join(".git").exists() {
+            return Err(Refusal::new(
+                format!("no publication engine at {s}"),
+                "clone it there, or name one: --engine <path> (or PUBLICATION_ENGINE)",
+            ));
+        }
+        let mut cmd = command(aterm_uds::os_path!("git"));
+        cmd.arg("-C")
+            .arg(&self.engine_source)
+            .args(["remote", "get-url", "origin"]);
+        self.output_forwarded(&mut cmd)
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| {
+                Refusal::new(
+                    format!("the publication engine {s} names no origin"),
+                    format!("git -C {s} remote add origin <the engine's repository>"),
+                )
+            })
+    }
+
+    /// The main of the engine's `origin` ([`crate::gates::OriginMain`]), or why it cannot be
+    /// read.
+    fn read_origin_main(&self, origin: &str) -> Result<crate::gates::OriginMain, Refusal> {
+        crate::gates::OriginMain::fetch(origin, &|cmd| self.output_forwarded(cmd)).map_err(|why| {
+            Refusal::new(
+                format!("cannot read the publication engine's origin ({origin}): {why}"),
+                format!("check the network: git ls-remote {origin}, then {RELEASE_COMMAND} again"),
+            )
+            .could_not_run()
+        })
+    }
+
+    /// Step 1's read of the engine's origin main ([`Real::origin_main`]), or why it could not
+    /// be read. An engine that names no origin is step 1's own refusal
+    /// ([`Real::engine_unready`]), so it reads nothing here.
+    fn fetch_engine_origin(&mut self) -> Result<(), Refusal> {
+        if let Ok(engine_origin) = self.source_origin() {
+            self.origin_main = Some(self.read_origin_main(&engine_origin)?);
+        }
+        Ok(())
+    }
+
+    /// `path` of the engine as this run judges it: its own copy's once it has synced it, else
+    /// the origin's main fetched at step 1; `None` where neither holds it.
+    fn engine_text(&self, path: &str) -> Option<String> {
+        if self
+            .engine_synced
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return crate::durable::read_text(&self.engine.join(path)).ok();
+        }
+        self.origin_main
+            .as_ref()?
+            .text(path, &|cmd| self.output_forwarded(cmd))
+            .ok()
+    }
+
+    /// The release's own engine ([`crate::gates::engine_copy`]): cloned from the origin
+    /// `engine_source` names where there is none yet (into a name of its own, then renamed into
+    /// place, so an interrupted clone is never taken for one), or where the one there was made
+    /// from another origin and holds nothing that origin lacks (one that does is refused, never
+    /// delivered to this origin), and given `engine_source`'s committer, which its audit-row and
+    /// ledger commits are made as.
+    /// Nothing is read from `engine_source` but its origin and committer. Never in a dry run, and
+    /// nothing to do where the release was named its own copy (the re-run as R's own cutter is
+    /// handed it as `PUBLICATION_ENGINE`).
+    fn engine_copy(&self) -> Result<(), Refusal> {
+        let e = self.engine.display().to_string();
+        if self.scratch_logs {
+            return Err(Refusal::new(
+                format!("a dry run makes and moves no publication engine, so {e} was not synced"),
+                format!("{RELEASE_COMMAND} without --dry-run"),
+            ));
+        }
+        if self.engine_is_its_source() {
+            return Ok(());
+        }
+        let origin = self.source_origin()?;
+        let git = |dir: &Path, args: &[&str]| {
+            let mut cmd = command(aterm_uds::os_path!("git"));
+            cmd.arg("-C").arg(dir).args(args);
+            self.output_forwarded(&mut cmd)
+                .is_ok_and(|out| out.status.success())
+        };
+        if self.engine.join(".git").exists()
+            && self
+                .engine_git(&["remote", "get-url", "origin"])
+                .is_none_or(|url| url.trim() != origin)
+        {
+            // A copy of another origin: what it holds is that origin's, never this one's to
+            // deliver, so it is made again from this origin, or kept where it holds anything
+            // its own origin lacks.
+            let was = self
+                .engine_git(&["remote", "get-url", "origin"])
+                .unwrap_or_default();
+            let holds = self
+                .engine_git(&["status", "--porcelain"])
+                .is_none_or(|out| !out.trim().is_empty())
+                || self
+                    .engine_git(&["rev-list", "refs/remotes/origin/main..HEAD"])
+                    .is_none_or(|out| !out.trim().is_empty());
+            if holds {
+                return Err(Refusal::new(
+                    format!(
+                        "the release's engine {e} was made from {}, and holds changes or commits \
+                         that origin lacks; the engine it is named now names {origin}",
+                        was.trim()
+                    ),
+                    copy_remedy(
+                        &e,
+                        &format!("status, and git -C {e} log --stat origin/main..HEAD"),
+                    ),
+                ));
+            }
+            if std::fs::remove_dir_all(&self.engine).is_err() {
+                return Err(Refusal::new(
+                    format!(
+                        "could not remove the release's engine {e}, made from {}",
+                        was.trim()
+                    ),
+                    format!(
+                        "remove {e} (it holds nothing its origin lacks), then {RELEASE_COMMAND} again"
+                    ),
+                ));
+            }
+        }
+        if !self.engine.join(".git").exists() {
+            let made = self
+                .engine
+                .with_file_name(format!("engine.new-{}", std::process::id()));
+            // A clone a killed run left: the run claim makes this run the clone's only one.
+            if let Some(parent) = made.parent()
+                && let Ok(entries) = std::fs::read_dir(parent)
+            {
+                for entry in entries.flatten() {
+                    if entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("engine.new-")
+                    {
+                        let _ = std::fs::remove_dir_all(entry.path());
+                    }
+                }
+            }
+            let Some(parent) = made.parent() else {
+                return Err(Refusal::new(
+                    format!("{e} names no directory to clone the publication engine into"),
+                    "release from a clone with a git directory",
+                ));
+            };
+            let made_s = made.display().to_string();
+            let cloned = std::fs::create_dir_all(parent).is_ok()
+                && git(
+                    parent,
+                    &[
+                        &["clone"],
+                        &BYTE_EXACT[..],
+                        &["--quiet", "--no-checkout", &origin, &made_s],
+                    ]
+                    .concat(),
+                )
+                && git(
+                    &made,
+                    &[
+                        "checkout",
+                        "--quiet",
+                        "--track",
+                        "-B",
+                        "main",
+                        "origin/main",
+                    ],
+                );
+            if !cloned || std::fs::rename(&made, &self.engine).is_err() {
+                let _ = std::fs::remove_dir_all(&made);
+                return Err(Refusal::new(
+                    format!("could not clone the publication engine's origin ({origin}) into {e}"),
+                    format!(
+                        "check the network (git ls-remote {origin}) and that nothing else is at \
+                         {e}, then {RELEASE_COMMAND} again"
+                    ),
+                ));
+            }
+        }
+        for key in ["user.name", "user.email"] {
+            let mut cmd = command(aterm_uds::os_path!("git"));
+            cmd.arg("-C")
+                .arg(&self.engine_source)
+                .args(["config", "--get", key]);
+            let value = self
+                .output_forwarded(&mut cmd)
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+            if let Some(value) = value.filter(|v| !v.is_empty())
+                && self.engine_git(&["config", key, &value]).is_none()
+            {
+                return Err(Refusal::new(
+                    format!("could not give the publication engine {e} its committer ({key})"),
+                    format!("git -C {e} config {key} '{value}'"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The release was named its own copy as its engine.
+    fn engine_is_its_source(&self) -> bool {
+        match (
+            self.engine.canonicalize(),
+            self.engine_source.canonicalize(),
+        ) {
+            (Ok(engine), Ok(source)) => engine == source,
+            _ => false,
+        }
+    }
+
+    fn engine_fast_forward(&self) -> Result<(), Refusal> {
         let e = self.engine.display().to_string();
         if self.engine_git(&["fetch", "-q", "origin"]).is_none() {
             return Err(Refusal::new(
@@ -1109,8 +1366,8 @@ impl Real {
         }
         if self.engine_dirty() {
             return Err(Refusal::new(
-                format!("the engine {e} has local changes besides its audit log"),
-                format!("commit or discard them there: git -C {e} status --short"),
+                format!("the release's engine {e} has local changes besides its audit log"),
+                copy_remedy(&e, "status --short"),
             ));
         }
         let rows: Vec<String> = self
@@ -1128,21 +1385,87 @@ impl Real {
             let _ = writeln!(f, "{}", rows.join("\n"));
         }
         let _ = self.engine_git(&["checkout", "-q", "--", "verification-log.jsonl"]);
-        if self
+        // A refusal below puts the rows back in the audit log, where the next sync finds them.
+        let put_back = |refusal: Refusal| {
+            if !rows.is_empty() {
+                let path = self.engine.join("verification-log.jsonl");
+                let text = crate::durable::read_text(&path).unwrap_or_default();
+                let _ = crate::durable::write_fresh(&path, audit_rows_merged(&text, &rows));
+            }
+            Err(refusal)
+        };
+        // Commits its origin lacks are records whose push failed (an audit row's, a ledger row
+        // `pub publish` made): nothing else writes this engine, so nothing else delivers them.
+        let ahead = self
+            .engine_git(&["rev-list", "origin/main..HEAD"])
+            .is_none_or(|out| !out.trim().is_empty());
+        if ahead {
+            let code: Vec<String> = self
+                .engine_git(&["diff", "--name-only", "origin/main...HEAD"])
+                .map_or_else(
+                    || vec!["(unread)".to_string()],
+                    |out| {
+                        out.lines()
+                            .filter(|p| !engine_data_plane(p))
+                            .map(str::to_string)
+                            .collect()
+                    },
+                );
+            if !code.is_empty() {
+                return put_back(Refusal::new(
+                    format!(
+                        "the release's engine {e} holds commits its origin's main lacks that \
+                         change more than its records ({}); its audit rows are kept in {}",
+                        code.join(", "),
+                        kept.display()
+                    ),
+                    copy_remedy(&e, "log --stat origin/main..HEAD"),
+                ));
+            }
+            let behind = self
+                .engine_git(&["merge-base", "--is-ancestor", "origin/main", "HEAD"])
+                .is_none();
+            if behind
+                && self
+                    .engine_git(&["merge", "--no-edit", "-q", "origin/main"])
+                    .is_none()
+            {
+                let _ = self.engine_git(&["merge", "--abort"]);
+                return put_back(Refusal::new(
+                    format!(
+                        "the records the release's engine {e} holds unpushed do not merge with \
+                         its origin's main (its audit rows are kept in {})",
+                        kept.display()
+                    ),
+                    copy_remedy(&e, "log -p origin/main..HEAD"),
+                ));
+            }
+        } else if self
             .engine_git(&["merge", "--ff-only", "-q", "origin/main"])
             .is_none()
         {
-            return Err(Refusal::new(
+            return put_back(Refusal::new(
                 format!(
-                    "the engine {e} is not a fast-forward of its origin/main (its audit rows are \
+                    "the engine {e} could not fast-forward to its origin/main (its audit rows are \
                      kept in {})",
                     kept.display()
                 ),
-                format!("reconcile it by hand: git -C {e} log --oneline origin/main..HEAD"),
+                format!("read git -C {e} status, then {RELEASE_COMMAND} again"),
             ));
         }
         if rows.is_empty() {
-            return Ok(());
+            return if !ahead
+                || self
+                    .engine_git(&["push", "-q", "origin", "HEAD:main"])
+                    .is_some()
+            {
+                Ok(())
+            } else {
+                Err(Refusal::new(
+                    format!("could not push the records the engine {e} holds to its origin's main"),
+                    format!("{RELEASE_COMMAND} again (they stay in {e} until they land)"),
+                ))
+            };
         }
         let path = self.engine.join("verification-log.jsonl");
         let text = crate::durable::read_text(&path).unwrap_or_default();
@@ -1270,9 +1593,25 @@ impl Real {
         })
     }
 
+    /// Step 1's ask of the engines: `engine_source` is an engine checkout that names an origin,
+    /// and the release's own copy, where it has one, is on main with no change but its audit log.
+    /// `engine_source`'s branch and changes are its users', not the release's.
     fn engine_unready(&self) -> Option<Refusal> {
-        if let Some(why) = self.no_engine() {
+        let s = self.engine_source.display().to_string();
+        if self.engine_source.join(".git").exists() && !self.engine_source.join("bin/pub").is_file()
+        {
+            return Some(Refusal::new(
+                format!("no publication engine at {s} (bin/pub)"),
+                "clone it there, or name one: --engine <path> (or PUBLICATION_ENGINE)",
+            ));
+        }
+        if let Err(why) = self.source_origin() {
             return Some(why);
+        }
+        if self.engine != crate::gates::engine_copy(&self.release)
+            || !self.engine.join(".git").exists()
+        {
+            return None;
         }
         let e = self.engine.display().to_string();
         if self
@@ -1280,14 +1619,16 @@ impl Real {
             .is_none_or(|b| b.trim() != "main")
         {
             return Some(Refusal::new(
-                format!("the engine {e} is not on main — stage and publish run from its main"),
-                format!("git -C {e} switch main"),
+                format!(
+                    "the release's engine {e} is not on main — stage and publish run from its main"
+                ),
+                copy_remedy(&e, "status"),
             ));
         }
         self.engine_dirty().then(|| {
             Refusal::new(
-                format!("the engine {e} has local changes besides its audit log"),
-                format!("commit or discard them there: git -C {e} status --short"),
+                format!("the release's engine {e} has local changes besides its audit log"),
+                copy_remedy(&e, "status --short"),
             )
         })
     }
@@ -1297,16 +1638,8 @@ impl Real {
             return Err(why);
         }
         let e = self.engine.display().to_string();
-        let origin = self
-            .engine_git(&["remote", "get-url", "origin"])
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                Refusal::new(
-                    format!("the engine {e} names no origin"),
-                    format!("git -C {e} remote add origin <the engine's repository>"),
-                )
-            })?;
+        // The origin a real run would sync its engine to: the one the named engine names.
+        let origin = self.source_origin()?;
         let copy = scratch.dir.join("engine");
         let _ = std::fs::remove_dir_all(&copy);
         let copy_s = copy.display().to_string();
@@ -2225,6 +2558,11 @@ impl Real {
         });
         let read = crate::check_record::events(&events)
             .map_err(|e| format!("read {}: {e}", events.display()));
+        if let Ok(events) = &read
+            && let Err(why) = crate::check_record::keep_harnesses(&root, &tree, &seal, events)
+        {
+            ran.detail.push(why);
+        }
         let written = crate::check_record::write_run(
             &root,
             &facts,
@@ -2241,6 +2579,21 @@ impl Real {
             Err(e) => ran
                 .detail
                 .push(format!("its records were not all written: {e}")),
+        }
+        if let Some(artifact) = artifact
+            && read.as_ref().is_ok_and(|events| {
+                events.whole()
+                    && events.finished.iter().any(|e| {
+                        e["check"].as_str() == Some("measure")
+                            && matches!(e["outcome"].as_str(), Some("ok" | "FAIL"))
+                    })
+            })
+            && let Ok(content) = crate::artifact::content_digest(&artifact.app)
+            && let Ok(Some(product)) =
+                crate::check_record::product_key(&root, &tree, &seal, &content)
+            && let Err(why) = crate::check_record::remember_product(&root, &facts, &product)
+        {
+            ran.detail.push(why);
         }
         Ok(ran)
     }
@@ -2906,6 +3259,23 @@ fn tail(path: &Path, n: usize) -> Vec<String> {
     let mut out: Vec<String> = text.lines().rev().take(n).map(str::to_string).collect();
     out.reverse();
     out
+}
+
+/// What to do about the release's own engine `e` in a state no release leaves it in: nothing
+/// but a release writes it, so whatever made the state is read (`git -C e <read>`) and kept where
+/// it is wanted before the copy goes; the next release clones it again.
+fn copy_remedy(e: &str, read: &str) -> String {
+    format!(
+        "nothing but a release writes it: read git -C {e} {read}, land what is wanted on the \
+         engine's main, then remove {e} (the next release clones it again) and {RELEASE_COMMAND} \
+         again"
+    )
+}
+
+/// A path of the engine's records rather than its code (`bin/pub`'s `ENGINE_DATA_PLANE` and
+/// `ENGINE_DATA_PLANE_PREFIXES`): its ledger, its audit log, its handoff records.
+fn engine_data_plane(path: &str) -> bool {
+    matches!(path, "mappings.json" | "verification-log.jsonl") || path.starts_with("handoff/")
 }
 
 /// Each kept audit row put back in time order (the pub-sync pattern).
@@ -4385,6 +4755,7 @@ impl Backend for Real {
                 .detail([why])
             })?;
         self.origin_tags = origin.tags;
+        self.fetch_engine_origin()?;
         Ok(origin.main)
     }
 
@@ -4451,8 +4822,21 @@ impl Backend for Real {
     }
 
     fn engine_rows(&mut self, commit: Option<&str>) -> EngineRows {
-        let text =
-            crate::durable::read_text(&self.engine.join("mappings.json")).unwrap_or_default();
+        let text = self.engine_text("mappings.json").unwrap_or_default();
+        if self
+            .engine_synced
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return engine_rows_in(&text, commit);
+        }
+        // Before its sync delivers them, the rows the release's engine holds unpushed are as
+        // recorded as the origin's: a publish whose ledger push failed published its commit.
+        let copy = crate::gates::engine_copy(&self.release);
+        let text = crate::gates::unpushed_ledger(&copy, &|cmd| self.output_forwarded(cmd))
+            .map_or_else(
+                || text.clone(),
+                |unpushed| crate::gates::ledger_with_unpushed(&text, &unpushed),
+            );
         engine_rows_in(&text, commit)
     }
 
@@ -4658,7 +5042,8 @@ impl Backend for Real {
             .engine_git(&["rev-parse", "--short", "HEAD"])
             .unwrap_or_default();
         Ok(format!(
-            "engine at {}, its origin/main; vendor/astream at its gitlink",
+            "the release's engine {} at {}, its origin/main; vendor/astream at its gitlink",
+            self.engine.display(),
             head.trim()
         ))
     }
@@ -4667,10 +5052,13 @@ impl Backend for Real {
         let edit = self.engine.join("bin/pub-bump-edit");
         if !edit.is_file() {
             return Err(Refusal::new(
-                "the engine has no bin/pub-bump-edit",
                 format!(
-                    "update the engine: git -C {} pull --ff-only",
+                    "the release's engine {} has no bin/pub-bump-edit at its origin's main",
                     self.engine.display()
+                ),
+                format!(
+                    "land bin/pub-bump-edit on the engine's main, then {RELEASE_COMMAND} again \
+                     (its sync step brings the release's engine to it)"
                 ),
             ));
         }
@@ -4933,6 +5321,35 @@ impl Backend for Real {
         let executable = artifact
             .filter(|_| built.yes)
             .map(|a| a.macho_sha256.as_str());
+        // Bundle reuse is content evidence only; tree checks still judge the new tree.
+        if let Some(artifact) = artifact.filter(|_| built.yes) {
+            let reused = (|| -> Result<bool, String> {
+                let root = crate::check_record::root(&git)?;
+                let tree = crate::check_record::tree_of(&git, &c.commit)?;
+                let seal = (self.build_inputs)()?;
+                let content = crate::artifact::content_digest(&artifact.app)?;
+                let Some(product) =
+                    crate::check_record::product_key(&root, &tree, &seal, &content)?
+                else {
+                    return Ok(false);
+                };
+                let facts = crate::check_record::RunFacts {
+                    commit: &c.commit,
+                    tree: &tree,
+                    seal: &seal,
+                    executable: Some(&artifact.macho_sha256),
+                    log: &self.logs,
+                    run: "product-reuse",
+                    asked: &[],
+                };
+                crate::check_record::reuse_product(&root, &facts, &product)
+            })();
+            if matches!(reused, Ok(true)) {
+                println!(
+                    "    measure: product U, linked harnesses and seal unchanged; using recorded verdict"
+                );
+            }
+        }
         let checks = crate::check_record::checks(&git, &c.commit, executable, self.build_inputs)
             .unwrap_or_else(|e| {
                 crate::check_record::Checks::unanswered(format!(
@@ -5068,18 +5485,21 @@ impl Backend for Real {
         if let Err(why) = self.prepare_prerequisites() {
             blocks.push(why);
         }
-        let seam = crate::durable::read_text(&self.engine.join("bin/pub"))
-            .is_ok_and(|t| t.contains("run_pre_promote_hook"));
+        let seam = self
+            .engine_text("bin/pub")
+            .is_some_and(|t| t.contains("run_pre_promote_hook"));
         if !seam {
             blocks.push(Refusal::new(
                 format!(
-                    "the engine {} has no pre-promote seam (`run_pre_promote_hook` in its \
-                     bin/pub): `pub publish` would not run publish/pre-promote, and a publish \
-                     by hand would promote R's attestation before it is verified",
-                    self.engine.display()
+                    "the publication engine's main ({}'s origin) has no pre-promote seam \
+                     (`run_pre_promote_hook` in its bin/pub): `pub publish` would not run \
+                     publish/pre-promote, and a publish by hand would promote R's attestation \
+                     before it is verified",
+                    self.engine_source.display()
                 ),
-                "use a publication engine whose main carries the seam (on its main since \
-                 2026-09-29: git -C <engine> pull --ff-only), or name one with --engine",
+                "name a publication engine whose origin's main carries the seam (on the \
+                 engine's main since 2026-09-29) with --engine; the release syncs its own copy \
+                 of it",
             ));
         }
         blocks
@@ -5453,11 +5873,14 @@ pub fn engine_rows_in(mappings: &str, commit: Option<&str>) -> EngineRows {
             .and_then(aterm_json::Value::as_str)
             .unwrap_or("")
     }
+    let revoked = crate::gates::revoked_rows(&value, "aterm");
+    let live = |sha: &str| !revoked.is_some_and(|r| r.contains_key(sha));
     let newest = rows
         .iter()
+        .filter(|(sha, _)| live(sha))
         .max_by_key(|(_, row)| at(row))
         .map(|(sha, _)| sha.clone());
-    let mine = commit.and_then(|c| rows.get(c));
+    let mine = commit.filter(|c| live(c)).and_then(|c| rows.get(c));
     EngineRows {
         newest,
         has: mine.is_some(),
@@ -5783,6 +6206,10 @@ pub const WASM32_GATE: &str = "wasm32 engine";
 #[cfg(test)]
 #[path = "release_steps_public_reads_http_tests.rs"]
 mod public_reads_http_tests;
+
+#[cfg(test)]
+#[path = "release_steps_engine_tests.rs"]
+mod engine_tests;
 
 #[cfg(test)]
 mod tests {
@@ -7249,6 +7676,13 @@ mod tests {
         );
         assert!(!engine_rows_in(&json, Some("c")).has);
         assert_eq!(engine_rows_in("not json", None), EngineRows::default());
+        // A revoked row is no publication of its commit, nor the newest. NEGATIVE CONTROL: the
+        // same rows unrevoked (above) have `a` published and `b` newest.
+        let revoked = format!(
+            "{}, \"revoked\":{{\"aterm\":{{\"{b}\":{{}},\"{a}\":{{}}}}}}}}",
+            json.strip_suffix('}').unwrap()
+        );
+        assert_eq!(engine_rows_in(&revoked, Some(&a)), EngineRows::default());
         let attestation = |gate: &str, mode: &str| {
             format!(
                 "{{\"source\":{{\"commit\":\"{a}\"}},\"guards\":{{\"public_clone\":\"{gate}\"}},\
@@ -7648,15 +8082,21 @@ mod tests {
         engine_git
             .git(&["remote", "add", "origin", &origin.display().to_string()])
             .unwrap();
-        let mut real = Real::new(&repo, Some(&engine), true, false).unwrap();
+        // A real run's backend (a dry one makes no engine to stage from), its logs its own.
+        let backend = |engine: &Path, logs: &str| {
+            let mut real = Real::new(&repo, Some(engine), false, false).unwrap();
+            real.logs = dir.path().join(logs);
+            std::fs::create_dir_all(&real.logs).unwrap();
+            real
+        };
+        let mut real = backend(&engine, "logs");
         real.home = dir.path().join("empty-home");
         real.prerequisite_acquire = crate::managed_prerequisites::simulated;
-        let mut missing =
-            Real::new(&repo, Some(&dir.path().join("missing-engine")), true, false).unwrap();
+        let mut missing = backend(&dir.path().join("missing-engine"), "logs-missing");
         let unsynced =
             Backend::stage(&mut missing, &candidate, &prover, StageTarget::Remote).unwrap_err();
         assert!(
-            unsynced.why.starts_with("cannot fetch the engine's origin"),
+            unsynced.why.starts_with("no publication engine at"),
             "the engine is synced before the export: {unsynced:?}"
         );
         let scanner_failure =

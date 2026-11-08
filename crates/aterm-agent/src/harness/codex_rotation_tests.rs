@@ -8,6 +8,9 @@ use crate::harness::codex_rotation::{self, UsageReader};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
+#[path = "codex_rotation_publication_tests.rs"]
+mod publication;
+
 struct Reader {
     calls: RefCell<Vec<PathBuf>>,
     answers: BTreeMap<PathBuf, IdentifiedUsage>,

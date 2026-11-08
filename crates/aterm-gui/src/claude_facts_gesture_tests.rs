@@ -696,6 +696,16 @@ fn ctrl_shift_tab_walks_the_chips_then_the_facts_that_fit() {
             app.windows[&wid].claude_lights.selected,
             Some((session, want))
         );
+        for (fact, _) in SET {
+            assert_eq!(
+                app.windows[&wid]
+                    .claude_lights
+                    .fact_reading(session, fact)
+                    .is_some(),
+                want == Target::Fact(fact),
+                "{want:?}: reading of {fact:?}"
+            );
+        }
         frame(&mut app, wid);
     }
     tap(&mut app, wid, NamedKey::Escape, KeyCode::Escape, "\u{1b}");
@@ -743,9 +753,30 @@ fn return_on_a_selected_fact_is_its_click() {
         panic!("{fact:?} never selected");
     };
     select(&mut app, Fact::Branch);
+    assert!(
+        app.windows[&wid]
+            .claude_lights
+            .fact_reading(session, Fact::Branch)
+            .is_some()
+    );
+    tap(&mut app, wid, NamedKey::Escape, KeyCode::Escape, "\u{1b}");
+    assert_eq!(app.windows[&wid].claude_lights.selected, None);
+    assert_eq!(
+        app.windows[&wid]
+            .claude_lights
+            .fact_reading(session, Fact::Branch),
+        None
+    );
+    select(&mut app, Fact::Branch);
     tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
     assert_eq!(app.fact_mask(session), mask(&[FactKind::Branch]));
     assert_eq!(app.windows[&wid].claude_lights.selected, None);
+    assert_eq!(
+        app.windows[&wid]
+            .claude_lights
+            .fact_reading(session, Fact::Branch),
+        None
+    );
     frame(&mut app, wid);
     assert!(row_text(&app, wid, footer_row(&app, wid)).contains("\u{2387} main off"));
     select(&mut app, Fact::Branch);

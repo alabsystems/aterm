@@ -3902,16 +3902,17 @@ fn a_bar_caret_s_rail_ends_at_the_bar() {
 }
 
 /// AFTER-LAND LOWS MUST-FIX (W6), THROUGH THE LETTER GUARD: Beam's body on
-/// Solarized Dark is a page shade the guard keeps whole. Laid at the page's
-/// luminance it never lifts a letter's reading, but weighed with the lights
-/// in its cells it was cut with the caret's halo under the last word: a navy
-/// box behind `brown`, stopping a word short of the caret (the after-land
-/// lows' first capture of this fix). Typed on Solarized Dark, the frame's
-/// under stream keeps more of its lights whole than with the body weighed
-/// (`lit_body_weighed`, the control), by the body's own; on the reference
-/// dark, where the body is light, the seam changes nothing.
+/// Solarized Dark is a page shade the guard keeps from its weighing of the
+/// other lights. Weighed with the lights in its cells it was cut with the
+/// caret's halo under the last word: a navy box behind `brown`, stopping a
+/// word short of the caret (the after-land lows' first capture of this fix);
+/// the guard holds it to the letters it reaches by itself
+/// (`CursorGlow::hold_page_shades`). Typed on Solarized Dark, the frame's
+/// under stream keeps more of its lights from that weighing than with the
+/// body weighed (`lit_body_weighed`, the control), by the body's own; on the
+/// reference dark, where the body is light, the seam changes nothing.
 #[test]
-fn beam_s_lit_body_is_a_shade_the_guard_keeps_whole() {
+fn beam_s_lit_body_is_a_shade_kept_from_the_guard_s_weighing() {
     const SOLARIZED: (u32, u32) = (0x0083_9496, 0x0000_2B36);
     let kept = |look: (u32, u32), weighed: bool| {
         let (_, _, _, fx) = typed_frame_on(
@@ -3920,12 +3921,13 @@ fn beam_s_lit_body_is_a_shade_the_guard_keeps_whole() {
             LINE.chars().count(),
             look,
         );
-        fx.glow.ink_ledger.kept_whole()
+        fx.glow.ink_ledger.kept_from_weighing()
     };
-    let (whole, weighed) = (kept(SOLARIZED, false), kept(SOLARIZED, true));
+    let (apart, weighed) = (kept(SOLARIZED, false), kept(SOLARIZED, true));
     assert!(
-        whole > weighed,
-        "Beam's body is kept whole on Solarized Dark: {whole} lights whole against {weighed} weighed"
+        apart > weighed,
+        "Beam's body on Solarized Dark is weighed with the other lights: {apart} lights kept from \
+         the weighing against {weighed} with the body weighed"
     );
     assert_eq!(
         kept((FG, BG), false),

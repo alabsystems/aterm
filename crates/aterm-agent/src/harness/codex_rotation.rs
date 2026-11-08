@@ -189,6 +189,74 @@ pub fn with_selected_writer<T>(
     with_selection_writer(env, receipt, SelectionPhase::Forward, use_selected)
 }
 
+/// Publish an exec attempt only after the selected account's writer admits it.
+/// Refusal before the callback preserves the receipt. Once writing starts,
+/// even an error retains the prospective attempt because its bytes may exist.
+/// This publishes metadata; the native host must independently authorize Go.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "ExecPublication",
+        action = "PriorAttempt",
+        reason = "The fixture starts with a retained earlier attempt."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "ExecPublication",
+        action = "NextFault",
+        reason = "The fixture chooses writer, policy and real-file failure conditions."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "ExecPublication",
+        action = "Publish",
+        project = "aterm_agent::harness::accounts_pool::tests::quota_proposals::publication::publication_transition"
+    )
+)]
+pub fn publish_selected_committing(
+    env: &Env,
+    receipt: &mut Receipt,
+) -> Result<Option<()>, &'static str> {
+    publish_selected_committing_using(env, receipt, renewal::write_receipt)
+}
+
+pub(super) fn publish_selected_committing_using(
+    env: &Env,
+    receipt: &mut Receipt,
+    write: impl FnOnce(&Env, &Receipt) -> Result<(), &'static str>,
+) -> Result<Option<()>, &'static str> {
+    if receipt.intent.purpose != renewal::Purpose::WeeklyQuota
+        || receipt.target_identity().is_none()
+    {
+        return Err("not-quota-receipt");
+    }
+    if receipt.revoked {
+        return Err("receipt-revoked");
+    }
+    let first = receipt.phase == renewal::Phase::Ready && !receipt.launch_attempted;
+    let retry = receipt.phase == renewal::Phase::Committing && receipt.launch_attempted;
+    if !(first || retry)
+        || receipt.accepted_turn.is_some()
+        || receipt.successor_pid.is_some()
+        || receipt.successor_birth.is_some()
+        || receipt.candidate.is_some()
+        || receipt.current_attempt.is_some()
+    {
+        return Err("not-committing");
+    }
+    let mut committing = receipt.clone();
+    committing.phase = renewal::Phase::Committing;
+    committing.launch_attempted = true;
+    with_selected_writer(env, &committing, |_, _| {
+        receipt.clone_from(&committing);
+        write(env, receipt)
+    })
+}
+
 /// Validate data for a Ready receipt before the pool move has been committed.
 /// This is not execution authority; native admission uses `with_selected_writer`.
 pub fn with_prepared_writer<T>(

@@ -1710,7 +1710,9 @@ fn a_runs_record_roots_are_the_dirs_its_build_names() {
             "the run's child environment"
         );
         crate::exec::Run {
+            case_observations: None,
             stopped_at: None,
+            hung: None,
             ok: true,
             output: format!(
                 "targo: a lane banner\n{{\"target_directory\":\"{}\",\
@@ -1801,7 +1803,9 @@ fn a_stage_groups_line_is_bounded_whatever_its_label() {
         PathBuf::from("/tmp/atv-s"),
     );
     let runs = Runs::open(&ctx, dir.path(), |_, _| crate::exec::Run {
+        case_observations: None,
         stopped_at: None,
+        hung: None,
         ok: false,
         output: String::new(),
         code: None,
@@ -1869,6 +1873,7 @@ fn a_real_stage_makes_its_group_under_its_label() {
         .args((0..200).map(|n| format!("argument-{n:03}")))
         .capture(crate::exec::Capture::Silent);
     let env = crate::exec::ExecEnv {
+        events: None,
         cwd: dir.path(),
         path: std::ffi::OsStr::new("/usr/bin:/bin"),
         scratch: dir.path(),
@@ -1877,6 +1882,7 @@ fn a_real_stage_makes_its_group_under_its_label() {
         add_env: &[],
         stage_groups: Some(&probe),
         host: &crate::exec::LIVE_HOST,
+        hang_samples: None,
     };
     let run = crate::exec::run(&cmd, env);
     assert!(run.ok, "the stage: {}", run.output);
@@ -2085,6 +2091,7 @@ fn a_stage_survivor_running_from_the_roots_is_ended_at_its_stage_end() {
             .env(SURVIVOR_ENV, dir)
             .capture(crate::exec::Capture::Silent);
         let env = crate::exec::ExecEnv {
+            events: None,
             cwd: dir,
             path: std::ffi::OsStr::new("/usr/bin:/bin"),
             scratch: dir,
@@ -2093,6 +2100,7 @@ fn a_stage_survivor_running_from_the_roots_is_ended_at_its_stage_end() {
             add_env: &[],
             stage_groups: Some(&probe),
             host: &crate::exec::LIVE_HOST,
+            hang_samples: None,
         };
         let run = crate::exec::run(&cmd, env);
         assert!(run.ok, "the stage: {}", run.output);
@@ -2213,7 +2221,9 @@ fn a_real_stage_that_leaves_nothing_is_recorded_closed() {
         PathBuf::from("/tmp/atv-s"),
     );
     let runs = Runs::open(&ctx, dir.path(), |_, _| crate::exec::Run {
+        case_observations: None,
         stopped_at: None,
+        hung: None,
         ok: false,
         output: String::new(),
         code: None,
@@ -2225,6 +2235,7 @@ fn a_real_stage_that_leaves_nothing_is_recorded_closed() {
         .args(["-c", "exit 0"])
         .capture(crate::exec::Capture::Silent);
     let env = crate::exec::ExecEnv {
+        events: None,
         cwd: dir.path(),
         path: std::ffi::OsStr::new("/usr/bin:/bin"),
         scratch: dir.path(),
@@ -2233,6 +2244,7 @@ fn a_real_stage_that_leaves_nothing_is_recorded_closed() {
         add_env: &[],
         stage_groups: Some(&runs),
         host: &crate::exec::LIVE_HOST,
+        hang_samples: None,
     };
     let run = crate::exec::run(&cmd, env);
     assert!(run.ok, "the stage: {}", run.output);
@@ -2294,7 +2306,9 @@ fn a_closed_line_lands_on_the_group_its_sweep_proved_empty() {
         PathBuf::from("/tmp/atv-s"),
     );
     let runs = Runs::open(&ctx, dir.path(), |_, _| crate::exec::Run {
+        case_observations: None,
         stopped_at: None,
+        hung: None,
         ok: false,
         output: String::new(),
         code: None,
@@ -2882,7 +2896,9 @@ fn the_default_poster_is_inert() {
         PathBuf::from("/tmp/atv-s"),
     );
     let runs = Runs::open(&ctx, dir.path(), |_, _| crate::exec::Run {
+        case_observations: None,
         stopped_at: None,
+        hung: None,
         ok: false,
         output: String::new(),
         code: None,

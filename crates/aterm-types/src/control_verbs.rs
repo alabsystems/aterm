@@ -1985,7 +1985,11 @@ pub const VERBS: &[VerbSpec] = &[
         "| `inspect app/v1 view <view-id> <text|controls|tree|audit>`. `inspect app/v1 network` \
          is owner-only: a versioned header and sanitized JSON from the retained GUI network \
          projection. Its handler does not read or refresh producers; normal event-loop \
-         housekeeping may run before handling the request. It supplies no frame or presentation \
+         housekeeping may run before handling the request. It keeps the window reading the \
+         services for a minute, shown or not: the first after a minute nobody showed or \
+         inspected them reports their last sample, aged, and asks for a new one, which a later \
+         inspection reports once the sample has landed and the window's next once-a-second \
+         read has adopted it. It supplies no frame or presentation \
          correspondence. `tabs` prints each tab's \
          one-based `index=` (`tab <N>` / `tab close <N>`), matching its Cmd-<N> shortcut.",
     ),

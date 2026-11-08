@@ -703,8 +703,10 @@ else
 fi
 
 # On bash < 5, `$HISTCMD` reads 1 in traps regardless of whether the line was
-# saved (bash 3.2.57), so also snapshot the last history entry at the prompt and
-# require it to differ on the first trap.
+# saved (bash 3.2.57), and on 4.4 the real number again, at the prompt and in a
+# trap, once a function's `local -` returns (`__aterm_untraced` under functrace),
+# so there `$HISTCMD` tells nothing: snapshot the last history entry at the prompt
+# and require it to differ on the first trap.
 __aterm_hist_seen="${__aterm_hist_seen:-}"
 if (( BASH_VERSINFO[0] < 5 )); then
     __aterm_hist_mark_take() {
@@ -723,7 +725,8 @@ __aterm_typed_line() {
     local __aterm_mark=$__aterm_hist_mark __aterm_seen=${__aterm_hist_seen-}
     __aterm_hist_mark=
     __aterm_hist_seen=
-    if [[ "$__aterm_mark" == [1-9]* && "${HISTCMD-}" == "$__aterm_mark" ]] &&
+    if [[ "$__aterm_mark" == [1-9]* &&
+        ( ${BASH_VERSINFO[0]} -lt 5 || "${HISTCMD-}" == "$__aterm_mark" ) ]] &&
         __aterm_history_line && [[ "$REPLY" != "$__aterm_seen" ]]; then
         REPLY="${REPLY#*[0-9][* ] }"
         [[ -n "$REPLY" ]] && return 0

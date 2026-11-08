@@ -808,7 +808,8 @@ impl<C: Ctl> Session<'_, C> {
     }
 }
 
-/// The key [`Session::needs_told`] holds for a needs entry a loop before this one left.
+/// The key [`Session::needs_told`] holds for a needs entry a loop before this one left, where the
+/// window's host holds no set for it ([`Session::adopt_needs`]).
 pub(super) const NEEDS_LEFT: u64 = 0;
 
 /// Why the entry a loop before this one left ([`NEEDS_LEFT`]) is taken down.
@@ -974,6 +975,33 @@ impl<C: Ctl> Session<'_, C> {
         let tail = self.need_tail(self.autopilot.word().unwrap_or(self.metadata_global));
         (self.needs_pending || told != entry_key(self.turn_end.shown_key(), tail))
             && self.needs_retry_at.is_none_or(|at| self.fx.mono() >= at)
+    }
+
+    /// THE SET A LOOP BEFORE THIS ONE LEFT STANDING at a handover, as the window's host holds it
+    /// for the entry standing ([`IdleHost::needs_told`]): this loop holds it as told, with the
+    /// entry's words (their tail, [`NeedTail`], keys it as [`entry_key`] does), as it adopts a
+    /// box, so its first point retells it rather than taking the entry down
+    /// ([`NEEDS_LEFT_DOWN`]); the ack is owed again unless the books seeded show an act typed it
+    /// for this set (`TurnEndState::seed_needs_acked`). With no set held the entry stays
+    /// [`NEEDS_LEFT`].
+    pub(super) fn adopt_needs(&mut self) {
+        let Some((needs, entry)) = self.stall_host.as_ref().and_then(|host| host.needs_told())
+        else {
+            return;
+        };
+        if needs.is_empty() || entry.is_empty() {
+            return;
+        }
+        self.turn_end.seed_needs(&needs);
+        let tail = if entry.trim_end().ends_with(NeedTail::WaitsOnYou.words()) {
+            NeedTail::WaitsOnYou
+        } else {
+            NeedTail::CarryingOn
+        };
+        let key = entry_key(self.turn_end.shown_key(), tail);
+        self.needs_told = Some(key);
+        self.needs_told_text.clone_from(&entry);
+        self.needs_heard = Some((key, entry));
     }
 
     /// Take the needs entry down for `why` (none stands now, an Off park, the loop's end).

@@ -138,6 +138,31 @@ pub const fn field(col: usize, cols: usize) -> f32 {
     1.0 - col as f32 / (cols - 1) as f32
 }
 
+/// How many cell widths tall a cell counts along a card's perimeter ([`perimeter`]): a terminal
+/// cell is about twice as tall as it is wide, as the launch card's pixels measure it.
+pub const CELL_ASPECT: f32 = 2.0;
+
+/// The perimeter fraction `s` of the border cell at `row`, `col` of a card `rows` by `cols`
+/// cells, at the cell's centre: clockwise from the top-left corner, as the launch card maps its
+/// border (the top edge left to right, the right side down, the bottom edge right to left, the
+/// left side up), a row counted [`CELL_ASPECT`] cell widths tall. A cell off the border reads as
+/// the left side's.
+#[must_use]
+pub fn perimeter(row: usize, col: usize, rows: usize, cols: usize) -> f32 {
+    let (w, h) = (cols.max(1) as f32, rows.max(1) as f32 * CELL_ASPECT);
+    let (x, y) = (col as f32 + 0.5, (row as f32 + 0.5) * CELL_ASPECT);
+    let along = if row == 0 {
+        x
+    } else if col + 1 >= cols {
+        w + y
+    } else if row + 1 >= rows {
+        w + h + (w - x)
+    } else {
+        2.0 * w + h + (h - y)
+    };
+    (along / (2.0 * (w + h))).rem_euclid(1.0)
+}
+
 /// What a [`GlassInks`] is made from: the palette, the pane's ground and ink, and the grey
 /// Claude draws its rules in (`0x00RRGGBB` each).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -311,6 +336,18 @@ impl GlassInks {
         let lifted = mix_rgb(palette.art(t, self.dark), ink, RULE_TOWARD_INK);
         let fg = mix_rgb(rule, lifted, RULE_OVER);
         if fg == rule { fg ^ 0x0001_0000 } else { fg }
+    }
+
+    /// A card border's cell at `row`, `col` of a card `rows` by `cols` cells: the static arc,
+    /// [`Self::rule`] at `tri(2s)`, `s` its [`perimeter`] fraction (the launch card's border at
+    /// φ = 0, `docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4), worn by every fact card the
+    /// glass opens; Claude's rule grey with no palette.
+    #[must_use]
+    #[inline]
+    pub fn border(&self, row: usize, col: usize, rows: usize, cols: usize) -> u32 {
+        self.rule(crate::rainbow_kitty::meteor::tri(
+            2.0 * perimeter(row, col, rows, cols),
+        ))
     }
 
     /// The hero word's letter at `k` across it (`0.0..=1.0`): the launch card's settled hero

@@ -60,6 +60,7 @@ impl Owned {
             "--test-threads=1",
         ]);
         let env = ExecEnv {
+            events: None,
             cwd: directory.path(),
             path: OsStr::new("/usr/bin:/bin"),
             scratch: directory.path(),
@@ -68,6 +69,7 @@ impl Owned {
             add_env: &[],
             stage_groups: None,
             host: &super::tests::INERT,
+            hang_samples: None,
         };
         let mut command = spawn_command(&command, env, Path::new("/usr/bin/taskpolicy"));
         command

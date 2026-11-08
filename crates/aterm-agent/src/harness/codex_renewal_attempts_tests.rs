@@ -10,6 +10,12 @@ use crate::harness::native_act::{
 #[path = "codex_renewal_creation_tests.rs"]
 mod creation;
 
+#[path = "codex_renewal_consumed_tests.rs"]
+mod consumed;
+
+#[path = "codex_renewal_cancellation_history_tests.rs"]
+mod cancellation_history;
+
 pub(super) fn fixture() -> (aterm_tempfile::TempDir, Env, Receipt, Prepare) {
     let tmp = aterm_tempfile::tempdir().unwrap();
     let mut env = Env::from_process().unwrap();

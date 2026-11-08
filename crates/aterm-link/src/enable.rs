@@ -2899,7 +2899,7 @@ fn binary_has_link(p: &Paths) -> Result<(), String> {
     if !p.is_link_shim() {
         cmd.arg("link");
     }
-    let out = aterm_uds::deadline::output_within(&mut cmd, Duration::from_secs(15))
+    let out = required_output_after(&mut cmd, Duration::ZERO)
         .map_err(|e| format!("{}: {e}", safe(&p.aterm, 256)))?;
     let text = format!(
         "{}{}",
@@ -2914,6 +2914,20 @@ fn binary_has_link(p: &Paths) -> Result<(), String> {
             safe(&p.aterm, 256)
         ))
     }
+}
+
+/// A minute hang detector for required local capability and service-manager work.
+const REQUIRED_CHILD_HANG: Duration = Duration::from_secs(60);
+
+fn required_output_after(
+    cmd: &mut aterm_uds::spawnfd::Command,
+    elapsed: Duration,
+) -> Result<std::process::Output, aterm_uds::deadline::RunError> {
+    let remaining = REQUIRED_CHILD_HANG
+        .checked_sub(elapsed)
+        .filter(|left| !left.is_zero())
+        .ok_or(aterm_uds::deadline::RunError::TimedOut)?;
+    aterm_uds::deadline::output_until(cmd, Instant::now() + remaining)
 }
 
 /// Reach the broker for real, through the report's own probe.
@@ -3004,8 +3018,8 @@ fn launchctl_program() -> std::ffi::OsString {
 pub(crate) fn launchctl(args: &[&str]) -> Result<(), String> {
     let mut cmd = aterm_uds::spawnfd::command(launchctl_program());
     cmd.args(args);
-    let out = aterm_uds::deadline::output_within(&mut cmd, Duration::from_secs(30))
-        .map_err(|e| format!("launchctl: {e}"))?;
+    let out =
+        required_output_after(&mut cmd, Duration::ZERO).map_err(|e| format!("launchctl: {e}"))?;
     if out.status.success() {
         Ok(())
     } else {
@@ -3055,7 +3069,7 @@ pub(crate) fn launchd_job(label: &str) -> LaunchdJob {
 fn launchd_print(label: &str) -> (Option<i32>, String) {
     let mut cmd = aterm_uds::spawnfd::command(launchctl_program());
     cmd.args(["print", &format!("gui/{}/{label}", uid())]);
-    match aterm_uds::deadline::output_within(&mut cmd, Duration::from_secs(30)) {
+    match required_output_after(&mut cmd, Duration::ZERO) {
         Ok(out) => (
             out.status.code(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -3127,7 +3141,7 @@ fn job_of(code: Option<i32>, stdout: &str) -> LaunchdJob {
 pub(crate) fn launchd_disabled(label: &str) -> Result<bool, String> {
     let mut cmd = aterm_uds::spawnfd::command(launchctl_program());
     cmd.args(["print-disabled", &format!("gui/{}", uid())]);
-    let out = aterm_uds::deadline::output_within(&mut cmd, Duration::from_secs(30))
+    let out = required_output_after(&mut cmd, Duration::ZERO)
         .map_err(|e| format!("`launchctl print-disabled` could not run: {e}"))?;
     if !out.status.success() {
         return Err(format!(
@@ -3462,8 +3476,8 @@ fn systemd_user_manager() -> Result<(), String> {
 pub(crate) fn systemctl(args: &[&str]) -> Result<(), String> {
     let mut cmd = aterm_uds::spawnfd::command("systemctl");
     cmd.arg("--user").args(args);
-    let out = aterm_uds::deadline::output_within(&mut cmd, Duration::from_secs(30))
-        .map_err(|e| format!("systemctl: {e}"))?;
+    let out =
+        required_output_after(&mut cmd, Duration::ZERO).map_err(|e| format!("systemctl: {e}"))?;
     if out.status.success() {
         Ok(())
     } else {
@@ -3492,8 +3506,8 @@ fn systemd_unit(label: &str) -> Result<(Option<u32>, bool), String> {
         "UnitFileState",
         label,
     ]);
-    let out = aterm_uds::deadline::output_within(&mut cmd, Duration::from_secs(30))
-        .map_err(|e| format!("systemctl: {e}"))?;
+    let out =
+        required_output_after(&mut cmd, Duration::ZERO).map_err(|e| format!("systemctl: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "no systemd user manager answers this login (`systemctl --user show` exited {}: {})",
@@ -3560,7 +3574,7 @@ fn systemd_up(
 fn systemd_main_pid(label: &str) -> Option<u32> {
     let mut cmd = aterm_uds::spawnfd::command("systemctl");
     cmd.args(["--user", "show", "-p", "MainPID", "--value", label]);
-    let out = aterm_uds::deadline::output_within(&mut cmd, Duration::from_secs(30)).ok()?;
+    let out = required_output_after(&mut cmd, Duration::ZERO).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -7131,6 +7145,37 @@ pub fn doctor(retire_ghosts: bool, yes: bool) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn required_local_child_waits_for_a_scheduled_completion() {
+        let program = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+        let mut cmd = aterm_uds::spawnfd::command(&program);
+        cmd.args(["-c", "printf ready"]);
+        let out = required_output_after(&mut cmd, Duration::from_secs(31))
+            .expect("required local work completes before the hang detector");
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"ready");
+
+        let mut refused = aterm_uds::spawnfd::command(&program);
+        refused.args(["-c", "printf refused; exit 7"]);
+        let out = required_output_after(&mut refused, Duration::ZERO).unwrap();
+        assert_eq!(out.status.code(), Some(7));
+        assert_eq!(out.stdout, b"refused");
+
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let marker = scratch.path().join("never-started");
+        let mut expired = aterm_uds::spawnfd::command(&program);
+        expired
+            .args(["-c", "printf unexpected > \"$1\"", "stand-in"])
+            .arg(&marker);
+        let result = required_output_after(&mut expired, Duration::from_secs(61));
+        assert!(matches!(
+            result,
+            Err(aterm_uds::deadline::RunError::TimedOut)
+        ));
+        assert!(!marker.exists(), "expiry must not start the child");
+    }
 
     #[test]
     fn an_armed_supervisor_can_be_scheduled_after_the_old_observation_budget() {
