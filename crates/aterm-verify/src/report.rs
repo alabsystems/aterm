@@ -40,17 +40,8 @@ fn unit_dispatch(value: &aterm_json::Value) -> Option<UnitDispatch<'_>> {
     }
     let mode = value.get("trust_compile_mode")?.as_str()?;
     let kind = value.get("trust_compile_kind")?.as_str()?;
-    if !matches!(
-        mode,
-        "test"
-            | "build"
-            | "check-test"
-            | "check"
-            | "doc"
-            | "doctest"
-            | "docscrape"
-            | "run-custom-build"
-    ) || !matches!(kind, "host" | "target")
+    if !crate::compiler_observation::dispatch_mode(mode)
+        || !crate::compiler_observation::compile_kind(kind)
     {
         return None;
     }
@@ -113,67 +104,25 @@ fn unit_dispatch(value: &aterm_json::Value) -> Option<UnitDispatch<'_>> {
 
 /// One complete compiler message observed, without whole-output joins or completion evidence.
 pub(crate) fn provisional_compile_event(stage: &str, line: &str) -> Option<String> {
+    use crate::compiler_observation::{Metadata, Observation};
     let UnitMessage::Unit(value) = aterm_json::from_str::<UnitMessage>(line).ok()? else {
         return None;
     };
     let reason = value.get("reason")?.as_str()?;
-    let (kind, mode, compile_kind, target_name, target_kinds) = match reason {
+    let metadata = match reason {
         "compilation-unit-dispatched" => {
             let dispatch = unit_dispatch(&value)?;
-            (
-                "dispatch",
-                Some(dispatch.mode),
-                Some(dispatch.kind),
-                None,
-                None,
-            )
+            Metadata::dispatch(dispatch.mode, dispatch.kind)?
         }
         "compiler-artifact" => {
             let target = value.get("target")?;
             let name = target.get("name")?.as_str()?;
-            if name.is_empty()
-                || name.len() > 256
-                || !name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-            {
-                return None;
-            }
             let kinds = crate::compiler_message::artifact_target_kinds(&value).ok()?;
-            if kinds.is_empty()
-                || kinds.len() > 16
-                || kinds.iter().any(|kind| {
-                    !matches!(
-                        *kind,
-                        "lib"
-                            | "rlib"
-                            | "dylib"
-                            | "cdylib"
-                            | "staticlib"
-                            | "proc-macro"
-                            | "bin"
-                            | "example"
-                            | "test"
-                            | "bench"
-                            | "custom-build"
-                    )
-                })
-            {
-                return None;
-            }
-            ("artifact", None, None, Some(name), Some(kinds))
+            Metadata::artifact(name, &kinds)?
         }
         _ => return None,
     };
-    Some(format!(
-        "verify-event: {}",
-        aterm_json::json!({
-            "schema":1, "event":"compile-message-observed", "stage":stage,
-            "provisional":true, "sample_complete":false, "message_kind":kind,
-            "compile_mode":mode, "compile_kind":compile_kind,
-            "target_name":target_name, "target_kinds":target_kinds,
-        })
-    ))
+    Some(Observation::new(stage, metadata)?.event())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

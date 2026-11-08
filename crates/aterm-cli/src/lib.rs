@@ -4289,9 +4289,22 @@ const fn session_limits(mode: aterm_containment::ContainmentMode) -> aterm_sandb
     }
 }
 
+/// A PTY host's owned maintenance, with a deadline only while it still owes work.
+#[cfg(unix)]
+pub type SessionMaintenance = Box<dyn FnMut() -> Option<std::time::Instant> + Send>;
+
 /// Run the transparent PTY session: containment init, root-authority mint, protected shell
-/// spawn, and passthrough loop.
-pub fn session_main(quiet: bool) -> ! {
+/// spawn, and passthrough loop, retaining maintenance through shell settlement.
+pub fn session_main(quiet: bool, #[cfg(unix)] maintenance: Option<SessionMaintenance>) -> ! {
+    let code = session_code(
+        quiet,
+        #[cfg(unix)]
+        maintenance,
+    );
+    std::process::exit(code);
+}
+
+fn session_code(quiet: bool, #[cfg(unix)] maintenance: Option<SessionMaintenance>) -> i32 {
     let (rows, cols) = driver::host_winsize();
 
     let flags = session_flags();
@@ -4313,11 +4326,11 @@ pub fn session_main(quiet: bool) -> ! {
         aterm_containment::SpawnDecision::Permit { sbpl, .. } => sbpl,
         aterm_containment::SpawnDecision::Deny { reason, .. } => {
             eprintln!("aterm: {reason}");
-            std::process::exit(1);
+            return 1;
         }
         _ => {
             eprintln!("aterm: containment mode {mode} denies spawning a shell (fail-closed)");
-            std::process::exit(1);
+            return 1;
         }
     };
 
@@ -4363,7 +4376,7 @@ pub fn session_main(quiet: bool) -> ! {
         env_add.push(("AGY_CLI_FAST_PROMPT_EDITOR".to_string(), "true".to_string()));
     }
 
-    let shell = aterm_pty::spawn_shell_with_pid(
+    let shell = match aterm_pty::spawn_shell_with_pid(
         rows,
         cols,
         &spawn_cap,
@@ -4376,11 +4389,13 @@ pub fn session_main(quiet: bool) -> ! {
         None,
         sandbox_wrap.as_deref(),
         session_limits(mode),
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("aterm: could not start the shell: {e}");
-        std::process::exit(1);
-    });
+    ) {
+        Ok(shell) => shell,
+        Err(e) => {
+            eprintln!("aterm: could not start the shell: {e}");
+            return 1;
+        }
+    };
 
     {
         use std::io::IsTerminal as _;
@@ -4392,8 +4407,12 @@ pub fn session_main(quiet: bool) -> ! {
         }
     }
 
-    let code = driver::run(shell, flags.verbose);
-    std::process::exit(code);
+    driver::run(
+        shell,
+        flags.verbose,
+        #[cfg(unix)]
+        maintenance,
+    )
 }
 
 #[cfg(test)]

@@ -410,6 +410,38 @@ fn a_tap_figure_is_current_to_a_tenth_and_void_after_its_reset() {
     );
 }
 
+/// ACCOUNT STATS JSON SAYS 100% ONLY FOR A READING OF 100, as the glass and usage HUD do:
+/// the compatibility whole is 99 for 995 and 999 tenths and 100 at 1000, while the exact tenths
+/// stay unchanged. `left_pct` keeps its existing complement-of-half-up semantics. NEGATIVE
+/// CONTROL: publishing `(pct_x10 + 5) / 10` makes both sub-100 readings `used_pct: 100` (run
+/// once, restored).
+#[test]
+fn account_stats_json_says_100_only_for_a_reading_of_100() {
+    let window = |pct_x10| Win {
+        id: SESSION_LIMIT,
+        kind: SESSION_LIMIT,
+        name: None,
+        length_s: 5 * HOUR,
+        fig: Some(accounts::WindowFig {
+            pct_x10,
+            reset: NOW + HOUR,
+            at: NOW - MIN,
+            by: MACHINE.to_owned(),
+            source: accounts::SOURCE_TAP.to_owned(),
+            epoch_at: None,
+        }),
+        void_at: None,
+        missing: None,
+        since: None,
+    };
+    for (x10, whole) in [(995, 99), (999, 99), (1000, 100)] {
+        let value = window_value(&window(x10), NOW);
+        assert_eq!(value["used_pct_x10"], Value::from(x10), "{x10} tenths");
+        assert_eq!(value["used_pct"], Value::from(whole), "{x10} tenths");
+        assert_eq!(value["left_pct"], Value::from(0), "{x10} tenths");
+    }
+}
+
 #[test]
 fn a_reset_used_with_no_reading_since_says_so() {
     let mut state = tapped(1000, 400, NOW - HOUR);

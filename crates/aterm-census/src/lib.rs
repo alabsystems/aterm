@@ -565,6 +565,10 @@ fn mod_decls(text: &str) -> Vec<ModDecl> {
     let lexed = lex::lex(text);
     let lines: Vec<&str> = lexed.code.lines().collect();
     let sources: Vec<&str> = lexed.text.lines().collect();
+    let spans = lex::outer_attributes(text);
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(at, _)| at + 1))
+        .collect();
     let mut out = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         if line.starts_with(char::is_whitespace) {
@@ -596,13 +600,14 @@ fn mod_decls(text: &str) -> Vec<ModDecl> {
         if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             continue;
         }
-        for (j, above) in lines[..i].iter().enumerate().rev() {
-            let above = above.trim_end();
-            if above.starts_with("#[") {
-                attrs.push(sources[j]);
-            } else if !above.trim().is_empty() {
+        let item_start = line_starts[i];
+        let mut before = item_start;
+        while let Some(&(start, end)) = spans.iter().rev().find(|&&(_, end)| end <= before) {
+            if !lexed.code[end..before].trim().is_empty() {
                 break;
             }
+            attrs.push(&lexed.text[start..end]);
+            before = start;
         }
         let path = attrs.iter().find_map(|attr| {
             attr.strip_prefix("#[path")
@@ -619,7 +624,7 @@ fn mod_decls(text: &str) -> Vec<ModDecl> {
         out.push(ModDecl {
             name: name.to_string(),
             path,
-            test_only: attrs.contains(&"#[cfg(test)]"),
+            test_only: attrs.iter().any(|attr| cfg_attr_never_ships(attr)),
         });
     }
     out
@@ -706,27 +711,9 @@ fn cfg_attr_never_ships(attr: &str) -> bool {
     cfg_pred_entails_unshipped(pred)
 }
 
+/// The shared strict evaluator is also used by closure-anchor attributes.
 fn cfg_pred_entails_unshipped(pred: &str) -> bool {
-    let pred = pred.trim();
-    if pred == "test" {
-        return true;
-    }
-    for (head, all_children_required) in [("all(", false), ("any(", true)] {
-        if let Some(rest) = pred.strip_prefix(head)
-            && let Some(inner) = rest.strip_suffix(')')
-        {
-            let children = split_top_level_commas(inner);
-            if children.is_empty() {
-                return false;
-            }
-            return if all_children_required {
-                children.iter().all(|c| cfg_pred_entails_unshipped(c))
-            } else {
-                children.iter().any(|c| cfg_pred_entails_unshipped(c))
-            };
-        }
-    }
-    false
+    crate::wasm_cfg::when_test_disabled(pred) == crate::wasm_cfg::Truth::False
 }
 
 fn split_top_level_commas(args: &str) -> Vec<&str> {
@@ -1656,6 +1643,29 @@ mod tests {
         .map(|rel| root.join(rel))
         .collect();
         assert_eq!(gated, expected);
+    }
+
+    #[test]
+    fn complete_false_cfg_loaders_exclude_files_until_a_live_loader_rescues_them() {
+        let lib = "#[cfg(\r\n all(test, unix)\n)]\n#[path = \"dead.rs\"]\nmod hidden;\n#[cfg(not(not(test)))]\n#[path = \"shared.rs\"]\nmod dead_shared;\n#[cfg(any(test, feature = \"x\"))]\n#[path = \"shared.rs\"]\nmod live_shared;\n";
+        let lib = lib.replace("\r\n", "\n").replace('\n', "\r\n");
+        let files = [
+            ("crates/a/src/lib.rs".to_owned(), lib),
+            ("crates/a/src/dead.rs".to_owned(), String::new()),
+            ("crates/a/src/shared.rs".to_owned(), String::new()),
+        ];
+        let root = synth_tree("aterm-census-cfg-loaders", "complete", &files);
+        let mut all = Vec::new();
+        collect_rs_files(&root.join("crates"), &mut all).expect("fixture files");
+        assert_eq!(
+            test_gated_module_files(&all),
+            std::collections::BTreeSet::from([root.join("crates/a/src/dead.rs")])
+        );
+        let declarations = mod_decls(
+            "#[cfg(all(test, broken(,)))]\nmod unknown;\n#[cfg(not(test))]\nmod production;\n",
+        );
+        assert_eq!(declarations.len(), 2);
+        assert!(declarations.iter().all(|decl| !decl.test_only));
     }
 
     #[test]

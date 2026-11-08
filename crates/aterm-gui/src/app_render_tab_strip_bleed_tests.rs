@@ -117,33 +117,3 @@ fn the_build_badge_sits_below_the_strip() {
     let two = dy(&mut app, 2);
     assert_eq!(two - one, ch as u32, "…and it follows the strip's rows");
 }
-
-#[test]
-fn band_row_edges_place_each_metered_row_at_its_chrome_row() {
-    let edges = [
-        Some(([0x11, 0x22, 0x33], [0x44, 0x55, 0x66])),
-        None,
-        Some(([1, 2, 3], [4, 5, 6])),
-    ];
-    let got = super::band_row_edges(2, 3, &edges);
-    assert_eq!(
-        got[0],
-        Some(aterm_render::ChromeRowEdges {
-            row: 2,
-            left: 0x0011_2233,
-            right: 0x0044_5566,
-        })
-    );
-    assert_eq!(got[1], None);
-    assert_eq!(
-        got[2].map(|e| (e.row, e.left, e.right)),
-        Some((4, 0x0001_0203, 0x0004_0506))
-    );
-    let trimmed = super::band_row_edges(0, 1, &edges);
-    assert_eq!(trimmed[0].map(|e| e.row), Some(0));
-    assert_eq!(
-        &trimmed[1..],
-        &[None, None],
-        "an uncommitted row is not on glass"
-    );
-}

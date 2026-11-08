@@ -503,6 +503,10 @@ mod macos {
         ) {
         }
         fn user_event(&mut self, _el: &ActiveEventLoop, w: Wake) {
+            if let Wake::DispatchFence(reply) = w {
+                let _ = reply.send(());
+                return;
+            }
             if let Wake::NativeTabCommand { window, command } = &w {
                 self.native_wakes.push((*window, *command));
             }
@@ -1051,16 +1055,39 @@ mod macos {
         let ns_window = unsafe { s_id(ns_view, sel!(window)) };
         // SAFETY: as above.
         let win_no = unsafe { s_isize(ns_window, sel!(windowNumber)) };
-        let pump = |d: &mut Driver, el: &mut EventLoop<Wake>, ms: u64| {
-            let t = Instant::now();
-            while t.elapsed() < Duration::from_millis(ms) {
-                let _ = el.pump_app_events(Some(Duration::from_millis(4)), d);
-            }
+        let pump = |d: &mut Driver, el: &mut EventLoop<Wake>| {
+            aterm_objc::autoreleasepool(|_| {
+                // SAFETY: these are this driver's live NSViews, on the main thread.
+                unsafe {
+                    let strip = strip_of(ns_window);
+                    aterm_objc::send::send_v(strip, sel!(layoutSubtreeIfNeeded));
+                    aterm_objc::send::send_v(ns_view, sel!(layoutSubtreeIfNeeded));
+                }
+                let (send, reply) = std::sync::mpsc::channel();
+                let started = Instant::now();
+                proxy
+                    .send_event(Wake::DispatchFence(send))
+                    .expect("driver event loop is open");
+                assert!(
+                    crate::dispatch_fence::observe(&reply, started, || {
+                        let _ = el.pump_app_events(Some(Duration::from_millis(4)), d);
+                    }),
+                    "native callback dispatch never reached its FIFO fence"
+                );
+                // SAFETY: the same live views; flush their actual model after dispatch.
+                unsafe {
+                    let strip = strip_of(ns_window);
+                    aterm_objc::send::send_v(strip, sel!(layoutSubtreeIfNeeded));
+                    aterm_objc::send::send_v(strip, sel!(displayIfNeeded));
+                    aterm_objc::send::send_v(ns_view, sel!(layoutSubtreeIfNeeded));
+                    aterm_objc::send::send_v(ns_view, sel!(displayIfNeeded));
+                }
+            });
         };
 
         let m3 = model(3);
         apply(&handle, &m3);
-        pump(&mut d, &mut el, 250);
+        pump(&mut d, &mut el);
 
         let mut cx = Ctx {
             findings: Vec::new(),
@@ -1165,7 +1192,7 @@ mod macos {
             );
         };
         take_focus(&mut d, &mut el);
-        pump(&mut d, &mut el, 250);
+        pump(&mut d, &mut el);
         for (i, c) in cs.iter().enumerate() {
             d.clear_wakes();
             let before = focused();
@@ -1187,7 +1214,7 @@ mod macos {
                 s_v_id(hit, sel!(mouseUp:), mouse_event(LEFT_UP, wp, 0, win_no, 1));
                 println!("  --  chip{i} hitTest -> {}", name_of(hit));
             }
-            pump(&mut d, &mut el, 120);
+            pump(&mut d, &mut el);
             cx.check_focused(
                 before && focused(),
                 d.native_wakes == [(strip_window, NativeTabCommand::Select(m3.ids[i]))],
@@ -1208,7 +1235,7 @@ mod macos {
                 s_v_id(*c, sel!(closeTab:), Id::NIL);
                 pressed
             };
-            pump(&mut d, &mut el, 120);
+            pump(&mut d, &mut el);
             cx.check(
                 pressed
                     && d.native_wakes
@@ -1240,7 +1267,7 @@ mod macos {
         }
         // SAFETY: the current chip implements the void(id, SEL, id) callback.
         unsafe { s_v_id(protected_chips[1], sel!(closeTab:), Id::NIL) };
-        pump(&mut d, &mut el, 120);
+        pump(&mut d, &mut el);
         cx.check(
             d.native_wakes.is_empty(),
             format!(
@@ -1325,7 +1352,7 @@ mod macos {
                     mouse_event(LEFT_UP, p2, 0, win_no, 1),
                 );
             }
-            pump(&mut d, &mut el, 200);
+            pump(&mut d, &mut el);
             cx.check_focused(
                 before && focused(),
                 d.native_wakes == [
@@ -1382,7 +1409,7 @@ mod macos {
             println!("      {l}");
         }
         take_focus(&mut d, &mut el);
-        pump(&mut d, &mut el, 250);
+        pump(&mut d, &mut el);
         for (i, c) in cs.iter().enumerate() {
             d.clear_wakes();
             let before = focused();
@@ -1405,7 +1432,7 @@ mod macos {
                     mouse_event(LEFT_UP, wp, 0, win_no, 1),
                 );
             }
-            pump(&mut d, &mut el, 120);
+            pump(&mut d, &mut el);
             cx.check_focused(
                 before && focused(),
                 d.native_wakes == [(strip_window, NativeTabCommand::Select(m3.ids[i]))],
@@ -1451,7 +1478,7 @@ mod macos {
                     sel!(sendEvent:),
                     mouse_event(LEFT_UP, wp, 0, win_no, 1),
                 );
-                pump(&mut d, &mut el, 200);
+                pump(&mut d, &mut el);
                 let control_arrived =
                     d.native_wakes == [(strip_window, NativeTabCommand::Select(m3.ids[1]))];
                 println!("  --  [NSApp sendEvent:] plain left -> {:?}", d.wakes);
@@ -1469,7 +1496,7 @@ mod macos {
                     sel!(sendEvent:),
                     mouse_event(LEFT_UP, wp, CTRL, win_no, 1),
                 );
-                pump(&mut d, &mut el, 250);
+                pump(&mut d, &mut el);
                 println!(
                     "  --  [NSApp sendEvent:] ctrl-left    -> {:?}  (pops routed: {})",
                     d.wakes,
@@ -1484,7 +1511,7 @@ mod macos {
                     sel!(sendEvent:),
                     mouse_event(RIGHT_UP, wp, 0, win_no, 1),
                 );
-                pump(&mut d, &mut el, 250);
+                pump(&mut d, &mut el);
                 println!(
                     "  --  [NSApp sendEvent:] rightMouse   -> {:?}  (pops routed: {})",
                     d.wakes,
@@ -1510,7 +1537,7 @@ mod macos {
                     d.clear_wakes();
                     let before = pops();
                     s_v_id(recv, s, ev);
-                    pump(&mut d, &mut el, 300);
+                    pump(&mut d, &mut el);
                     println!(
                         "  --  [{label}] -> {:?}  (pops: {}, items in the last: {})",
                         d.wakes,
@@ -1560,7 +1587,7 @@ mod macos {
                     ] {
                         d.clear_wakes();
                         s_v_id(lab, s, ev);
-                        pump(&mut d, &mut el, 300);
+                        pump(&mut d, &mut el);
                         println!("  --  [{label_txt}] -> {:?}", d.wakes);
                         cx.check(
                             d.wakes.iter().any(|w| w == "TabContextMenuOpening"),
@@ -1660,7 +1687,7 @@ mod macos {
                             mouse_event(RIGHT_DOWN, point, 0, win_no, 1),
                         );
                     }
-                    pump(&mut d, &mut el, 120);
+                    pump(&mut d, &mut el);
                     let popped = pops() > before
                         && d.wakes.iter().any(|wake| wake == "TabContextMenuOpening");
                     cx.check(
@@ -1700,7 +1727,7 @@ mod macos {
                 unsafe {
                     s_v_id(receivers[1], sel!(tabMenuRewind:), item.id());
                 }
-                pump(&mut d, &mut el, 120);
+                pump(&mut d, &mut el);
                 let expected = if !pop {
                     vec![(strip_window, m3.ids[1], original, original_time)]
                 } else {
@@ -1841,7 +1868,7 @@ mod macos {
                             mouse_event(RIGHT_DOWN, point, 0, win_no, 1),
                         );
                     }
-                    pump(&mut d, &mut el, 120);
+                    pump(&mut d, &mut el);
                     let popped = pops() > before
                         && d.wakes.iter().any(|wake| wake == "TabContextMenuOpening");
                     cx.check(
@@ -1890,7 +1917,7 @@ mod macos {
                 unsafe {
                     s_v_id(receivers[1], sel!(tabMenuSessionAction:), item.id());
                 }
-                pump(&mut d, &mut el, 120);
+                pump(&mut d, &mut el);
                 let expected = if !accepted {
                     Vec::new()
                 } else if !pop {
@@ -1926,7 +1953,7 @@ mod macos {
                 true,
             );
         }
-        pump(&mut d, &mut el, 250);
+        pump(&mut d, &mut el);
         // SAFETY: `strip` is live.
         let strip_w1 = unsafe { s_rect(strip, sel!(bounds)) }.size.width;
         cx.check(
@@ -1949,7 +1976,7 @@ mod macos {
             );
         }
         toolbar::reflow_window_tabs(&handle);
-        pump(&mut d, &mut el, 100);
+        pump(&mut d, &mut el);
         // SAFETY: `strip` is live.
         let flowed: Vec<CGRect> = unsafe { chips(strip) }
             .into_iter()
@@ -1968,7 +1995,7 @@ mod macos {
             ),
         );
         apply(&handle, &m3);
-        pump(&mut d, &mut el, 200);
+        pump(&mut d, &mut el);
         let (kept, chrome) = hovers_keep_presence(&handle, 3);
         cx.check(
             kept,
@@ -2031,7 +2058,7 @@ mod macos {
             toolbar::begin_tab_rename(&handle, m3.ids[1], 77, "vim", "name"),
             "begin_tab_rename".to_owned(),
         );
-        pump(&mut d, &mut el, 200);
+        pump(&mut d, &mut el);
         cx.check(
             d.wakes.is_empty(),
             format!("opening the editor posted no outcome; saw {:?}", d.wakes),
@@ -2082,7 +2109,7 @@ mod macos {
                 );
             }
         }
-        pump(&mut d, &mut el, 200);
+        pump(&mut d, &mut el);
         let typed = toolbar::rename_editor_text(&handle);
         cx.check(
             typed
@@ -2108,7 +2135,7 @@ mod macos {
                 key_event(KEY_UP, win_no, nsstr("\u{1b}"), 53),
             );
         }
-        pump(&mut d, &mut el, 300);
+        pump(&mut d, &mut el);
         println!("  --  Escape in the field editor -> {:?}", d.wakes);
         cx.check(
             d.wakes.iter().any(|w| w.starts_with("CancelSessionRename")),
@@ -2118,13 +2145,13 @@ mod macos {
             ),
         );
         toolbar::end_tab_rename(&handle);
-        pump(&mut d, &mut el, 150);
+        pump(&mut d, &mut el);
         d.clear_wakes();
         cx.check(
             toolbar::begin_tab_rename(&handle, m3.ids[1], 77, "vim", "name"),
             "begin_tab_rename again, for the commit branch".to_owned(),
         );
-        pump(&mut d, &mut el, 200);
+        pump(&mut d, &mut el);
         d.clear_wakes();
         // SAFETY: live NSApp, +0 autoreleased events.
         unsafe {
@@ -2139,7 +2166,7 @@ mod macos {
                 key_event(KEY_UP, win_no, nsstr("\r"), 36),
             );
         }
-        pump(&mut d, &mut el, 300);
+        pump(&mut d, &mut el);
         println!("  --  Return in the field editor -> {:?}", d.wakes);
         cx.check(
             d.wakes
@@ -2151,7 +2178,7 @@ mod macos {
             ),
         );
         toolbar::end_tab_rename(&handle);
-        pump(&mut d, &mut el, 150);
+        pump(&mut d, &mut el);
         // SAFETY: `ns_window` is live.
         println!(
             "  --  firstResponder after end: {}",
@@ -2165,7 +2192,7 @@ mod macos {
         println!("\n-- stage 8: the ownership ledger over 200 pooled strip rebuilds");
         let m4 = model(4);
         apply(&handle, &m3);
-        pump(&mut d, &mut el, 100);
+        pump(&mut d, &mut el);
         // SAFETY: `strip` is live; every send is a read-only accessor.
         let (rc0, sv0, ta0) = unsafe {
             (
@@ -2185,7 +2212,7 @@ mod macos {
             aterm_objc::autoreleasepool(|_| apply(&handle, if i % 2 == 0 { &m4 } else { &m3 }));
         }
         apply(&handle, &m3);
-        pump(&mut d, &mut el, 200);
+        pump(&mut d, &mut el);
         // SAFETY: as above.
         let (rc1, sv1, ta1) = unsafe {
             (
@@ -2239,7 +2266,7 @@ mod macos {
                 true,
             );
         }
-        pump(&mut d, &mut el, 150);
+        pump(&mut d, &mut el);
         let mut matrix: Vec<(String, Option<u64>)> = Vec::new();
         let row = |name: &str,
                    d: &mut Driver,
@@ -2396,7 +2423,7 @@ mod macos {
             d.clear_wakes();
             // SAFETY: as above.
             unsafe { s_v_id(p, sel!(mouseUp:), mouse_event(LEFT_UP, wp, 0, win_no, 1)) };
-            pump(&mut d, &mut el, 150);
+            pump(&mut d, &mut el);
             println!("  --  plus click -> {:?}", d.wakes);
             cx.check(
                 d.wakes.iter().any(|w| w.contains("NewTab")),

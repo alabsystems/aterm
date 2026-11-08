@@ -589,8 +589,8 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
 
 enum Scanner {
     Signed(atpkg::prerequisite::HeldSet),
-    // Content fixtures exercise the real pinned scanner without reopening the
-    // host's live package source inside an isolated release-test environment.
+    // Content fixtures exercise the host's scanner without reopening the live
+    // package source inside an isolated release-test environment.
     #[cfg(test)]
     Fixture(std::path::PathBuf),
 }
@@ -620,7 +620,15 @@ fn run_with(ctx: &Ctx, r: &mut Report, acquire: impl FnOnce() -> Result<Scanner,
     let gitleaks = match acquire() {
         Ok(held) => Some(held),
         Err(absent) => {
-            not_run.push(format!("export-scan — signed gitleaks: {absent}, so it did not run (fix: `aterm pkg install gitleaks`)"));
+            if let Some(transport) = atpkg::prerequisite::freshness_transport(&absent) {
+                not_run.push(format!(
+                    "export-scan — signed gitleaks channel freshness COULD NOT RUN: \
+                     {transport}, so the scanner did not run (retry when the channel transport \
+                     answers)"
+                ));
+            } else {
+                not_run.push(format!("export-scan — signed gitleaks: {absent}, so it did not run (fix: `aterm pkg install gitleaks`)"));
+            }
             None
         }
     };

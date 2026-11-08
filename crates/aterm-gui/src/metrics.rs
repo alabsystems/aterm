@@ -603,7 +603,6 @@ label_enum! {
         Presence => "presence",
         HandoffPark => "handoff_park",
         AccountDrain => "account_drain",
-        MessageBandMotion => "message_band_motion",
         SessionWaits => "session_waits",
         AosEchoHold => "aos_echo_hold",
         InputWatch => "input_watch",

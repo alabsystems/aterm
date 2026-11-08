@@ -1027,6 +1027,18 @@ fn compat_execution_must_match_the_separately_authenticated_payload() {
         w.select(w.working(), None).is_err(),
         "missing compat root is not repaired by selection"
     );
+    // The refused selection let its lease go, but a sibling test's fork keeps a copy of the
+    // descriptor until that child's exec, and the deep pass below refuses a held build. A
+    // one-minute hang detector, not a latency budget.
+    let subject = atpkg::lease::Subject::build("trust", 7).expect("subject");
+    let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    while atpkg::lease::holders(&w.inputs.prefix, &subject) != atpkg::lease::Holders::Free {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the refused selection's lease is let go"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     let layout = atpkg::Layout {
         prefix: w.inputs.prefix.clone(),
     };

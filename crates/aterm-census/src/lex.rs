@@ -247,6 +247,36 @@ fn utf8(bytes: Vec<u8>) -> String {
     String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
+/// Complete outer attributes, with byte offsets into the original source. Literal and
+/// comment contents never open an attribute; an incomplete attribute supplies no evidence.
+pub(crate) fn outer_attributes(source: &str) -> Vec<(usize, usize)> {
+    let code = lex(source).code;
+    let bytes = code.as_bytes();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at + 1 < bytes.len() {
+        if bytes[at..].starts_with(b"#[") {
+            let start = at;
+            at += 2;
+            let mut depth = 1usize;
+            while at < bytes.len() && depth > 0 {
+                match bytes[at] {
+                    b'[' => depth += 1,
+                    b']' => depth -= 1,
+                    _ => {}
+                }
+                at += 1;
+            }
+            if depth == 0 {
+                out.push((start, at));
+            }
+        } else {
+            at += 1;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

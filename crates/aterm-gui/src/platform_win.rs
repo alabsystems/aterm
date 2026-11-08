@@ -1378,12 +1378,9 @@ impl crate::App {
         {
             return band;
         }
-        let ws = self.windows.get(&wid);
-        if self.message_band_rows > 0 {
-            let [r, g, b] = crate::chrome_band::band_colors(header).bar_bg;
-            return (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
-        }
-        ws.map(|ws| ws.input_scratch.default_bg)
+        self.windows
+            .get(&wid)
+            .map(|ws| ws.input_scratch.default_bg)
             .filter(|&bg| bg >> 24 == 0)
             .unwrap_or(self.theme.bg)
             & 0x00FF_FFFF
@@ -2074,7 +2071,6 @@ mod tests {
         assert_eq!(app.caption_surface_tone(wid), band);
         assert_ne!(band, app.theme.bg & 0x00FF_FFFF, "the band is its own tone");
         app.tab_strip_rows = 0;
-        app.message_band_rows = 0;
         app.windows.get_mut(&wid).unwrap().input_scratch.default_bg = 0x002a_00ff;
         assert_eq!(app.caption_surface_tone(wid), 0x002a_00ff);
         app.windows.get_mut(&wid).unwrap().input_scratch.default_bg =

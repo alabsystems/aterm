@@ -1308,6 +1308,48 @@ fn managed_rows_authenticate_instead_of_admitting_legacy_cache_stamps() {
 }
 
 #[test]
+fn managed_channel_transport_is_could_not_run_not_an_install_remedy() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let m = machine(home.path());
+    let row = row("gitleaks").unwrap();
+    let mut host = Fake::new();
+    host.managed_result = Err(
+        "signed channel freshness transport: curl: (56) HTTP 504 from releases/download".into(),
+    );
+
+    for state in [check(row, &m, &host), provide(row, &m, &host, &mut |_| {})] {
+        let why = match state {
+            State::CouldNotRun(why) => why,
+            other => panic!("freshness transport was not COULD NOT RUN: {other:?}"),
+        };
+        assert!(why.contains("curl: (56) HTTP 504"), "{why}");
+        assert!(why.contains("transport answers"), "{why}");
+        assert!(
+            !why.contains("pkg install"),
+            "reinstalling local bytes cannot answer channel freshness: {why}"
+        );
+    }
+    assert_eq!(
+        host.managed.borrow().as_slice(),
+        [
+            (atpkg::prerequisite::Prerequisite::Gitleaks, false),
+            (atpkg::prerequisite::Prerequisite::Gitleaks, true),
+        ]
+    );
+
+    host.managed.borrow_mut().clear();
+    host.managed_result = Err("no signed selected build is installed".into());
+    assert!(matches!(
+        check(row, &m, &host),
+        State::Missing(why) if why.contains("pkg install gitleaks")
+    ));
+    assert!(matches!(
+        provide(row, &m, &host, &mut |_| {}),
+        State::Failed(why) if why.contains("pkg install gitleaks")
+    ));
+}
+
+#[test]
 fn unavailable_managed_hosts_refuse_before_discovery_and_do_not_report_all_ready() {
     let home = aterm_tempfile::tempdir().unwrap();
     let mut m = machine(home.path());

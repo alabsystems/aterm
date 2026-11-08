@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shared themed cells for compact in-grid chrome (find bar, message band, native-tab rows).
+//! Shared themed cells for compact in-grid chrome (find bar, native-tab rows).
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -134,8 +134,6 @@ const fn unpack(c: u32) -> [u8; 3] {
 /// On-theme tones for compact chrome bands ([`aterm_messages::ink::BandInks`]).
 pub(crate) type BandColors = aterm_messages::ink::BandInks;
 
-#[cfg(test)]
-pub(crate) use aterm_messages::ink::{PRIMARY_HOVER_LIFT, TRACK_TINT, hover_ink};
 pub(crate) use aterm_messages::ink::{contrast, ensure_contrast, forced_ink, mix3, warn_mark};
 
 /// A packed `0x00RRGGBB` theme colour as sRGB bytes.
@@ -224,11 +222,6 @@ impl From<Theme> for ChromePalette {
 }
 
 impl ChromePalette {
-    /// The band's colours for this palette ([`band_colors`]).
-    pub(crate) fn colors(self) -> BandColors {
-        band_colors(self)
-    }
-
     /// The theme's background, foreground and cursor as bytes.
     pub(crate) fn inks(&self) -> ThemeInks {
         ThemeInks {
@@ -249,7 +242,7 @@ impl ChromePalette {
             authored: self.authored,
             system_accent: crate::native_appearance::system_accent()
                 .map(|accent| accent.for_surface(inks.bg)),
-            base: bar_base(),
+            base: PLATFORM_BAR_BASE,
         }
     }
 
@@ -280,30 +273,6 @@ pub(crate) fn authored_of(c: &aterm_types::scheme::ChromeColors) -> AuthoredChro
         border: bytes(c.border),
         search_match: bytes(c.search_match),
     }
-}
-
-/// The base this thread's bands are derived on: the platform's
-/// ([`PLATFORM_BAR_BASE`]), or in a test the one
-/// `lay_bands_on_the_theme_blend_for_test` chose.
-fn bar_base() -> BarBase {
-    #[cfg(test)]
-    if let Some(base) = BAR_BASE_FOR_TEST.get() {
-        return base;
-    }
-    PLATFORM_BAR_BASE
-}
-
-#[cfg(test)]
-std::thread_local! {
-    /// This test thread's band base in place of the platform's ([`bar_base`]).
-    static BAR_BASE_FOR_TEST: std::cell::Cell<Option<BarBase>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Derive this test thread's bands on the theme blend.
-#[cfg(test)]
-pub(crate) fn lay_bands_on_the_theme_blend_for_test() {
-    BAR_BASE_FOR_TEST.set(Some(BarBase::Blend));
 }
 
 /// Where this platform's band ground comes from.
@@ -410,12 +379,6 @@ mod tests {
                 };
                 let colors = band_colors(hostile);
                 assert_eq!(colors.accent, palette.highlight, "{name}");
-                assert_eq!(colors.meter_track, palette.window, "{name}");
-                assert_eq!(
-                    colors.on_accent,
-                    forced_ink(palette.highlight_text, palette.highlight),
-                    "{name}"
-                );
                 assert_eq!(colors.bar_bg, palette.btn_face, "{name}: band is BTNFACE");
                 assert_eq!(colors.field_bg, palette.window, "{name}: well is WINDOW");
                 for (role, value) in [
@@ -431,19 +394,6 @@ mod tests {
                 assert!(
                     contrast(colors.caret, colors.field_bg) >= 4.5,
                     "{name} caret must meet WCAG-AA in the well"
-                );
-                assert_eq!(colors.capsule_hover, palette.highlight, "{name}");
-                assert!(
-                    contrast(colors.capsule_hover_ink, colors.capsule_hover) >= 4.5,
-                    "{name} hovered capsule ink must meet WCAG-AA under High Contrast"
-                );
-                assert_eq!(colors.capsule_primary_hover, palette.highlight, "{name}");
-                assert!(
-                    contrast(
-                        colors.capsule_primary_hover_ink,
-                        colors.capsule_primary_hover
-                    ) >= 4.5,
-                    "{name} hovered Primary ink must meet WCAG-AA under High Contrast"
                 );
                 if contrast(colors.field_bg, colors.bar_bg) < 3.0 {
                     let rule = colors.well_rule.unwrap_or_else(|| {
@@ -612,44 +562,6 @@ mod tests {
         }
     }
 
-    /// The meter's floor: the fill is the theme's cursor accent (or `warn` on a
-    /// Warn/Error row), floored against the band, and the glint is one fixed
-    /// perceptual step of that fill away from its words' ink, so the words only gain
-    /// contrast under it and the hot head clears 3:1 on the track wherever the fill
-    /// does.
-    fn meter_floors(name: &str, colors: &BandColors) {
-        for fill in [colors.accent, colors.warn] {
-            let inks = crate::message_band::MeterInks::of(colors, fill);
-            let comet = crate::message_band::MeterInks::comet(colors, fill).0;
-            let head = crate::message_band::tone_rgb(aterm_messages::Tone::HEAD, &comet);
-            let words = crate::message_band::fill_ink(colors, fill);
-            assert_eq!(
-                inks.glint,
-                crate::message_band::glint_step(fill, words, false),
-                "{name}"
-            );
-            assert!(
-                contrast(ensure_contrast(colors.label, fill, 4.5), fill) >= 4.5,
-                "{name}: no ink reaches AA on {fill:?}"
-            );
-            assert!(
-                contrast(words, inks.glint) >= contrast(words, fill) - 0.02,
-                "{name}: the glint of {fill:?} must never cost its words contrast: \
-                 {:.2}:1 on the glint, {:.2}:1 on the fill",
-                contrast(words, inks.glint),
-                contrast(words, fill)
-            );
-            if contrast(comet.fill, colors.meter_track) >= 3.0 {
-                assert!(
-                    contrast(head, colors.meter_track) >= 3.0,
-                    "{name}: the comet head of {fill:?} must clear 3:1 against the track: \
-                     {head:?} on {:?}",
-                    colors.meter_track
-                );
-            }
-        }
-    }
-
     /// THE TONES ARE KEPT FOR THE SAME THEME (`band_colors`): asked again
     /// for the theme last asked for, nothing is derived and the tones are the
     /// derivation's exactly; every other theme, the same theme with the
@@ -763,108 +675,6 @@ mod tests {
                     "{name}: the well's fill alone is its edge only at 3:1"
                 ),
             }
-            assert!(
-                contrast(colors.capsule_hover_ink, colors.capsule_hover) >= 4.5,
-                "{name} hovered capsule label must meet WCAG-AA"
-            );
-            assert_eq!(
-                colors.capsule_hover_ink,
-                hover_ink(colors.value, colors.capsule_hover),
-                "{name}: the hovered label is the value ink lifted on the risen fill"
-            );
-            assert!(
-                contrast(colors.bar_bg, colors.accent) >= 3.0,
-                "{name} Primary capsule ink must clear 3:1 on the accent fill"
-            );
-            meter_floors(name, &colors);
-            assert_eq!(colors.capsule_primary_hover_ink, colors.bar_bg, "{name}");
-            assert!(
-                contrast(
-                    colors.capsule_primary_hover_ink,
-                    colors.capsule_primary_hover
-                ) >= 3.0,
-                "{name} lit Primary ink must clear 3:1 on the lit fill"
-            );
-            if colors.accent != rgb(theme.fg) {
-                assert_ne!(
-                    colors.capsule_primary_hover, colors.accent,
-                    "{name}: the lit Primary must move off the resting accent"
-                );
-                let lifted = mix3(colors.accent, rgb(theme.fg), PRIMARY_HOVER_LIFT);
-                for (c, &want) in lifted.iter().enumerate() {
-                    let (a, f, lit, want) = (
-                        f32::from(colors.accent[c]),
-                        f32::from(rgb(theme.fg)[c]),
-                        f32::from(colors.capsule_primary_hover[c]),
-                        f32::from(want),
-                    );
-                    let toward = (f - a).signum();
-                    assert!(
-                        (lit - a) * toward + 1.0 >= (want - a) * toward,
-                        "{name}: channel {c} of the lit Primary ({lit}) is short of \
-                         {PRIMARY_HOVER_LIFT} of the way from the accent ({a}) to \
-                         the ink ({f}): wanted {want}"
-                    );
-                }
-            }
-            assert_ne!(
-                colors.capsule_primary_hover, colors.capsule_hover,
-                "{name}: the lit Primary is not the grey hover"
-            );
-            if contrast(colors.value, mix3(colors.bar_bg, rgb(theme.fg), 0.05)) >= 4.5 {
-                assert_ne!(
-                    colors.capsule_hover, colors.bar_bg,
-                    "{name}: the hover fill must move off the band"
-                );
-            }
-        }
-    }
-
-    /// The fault wash stays in its hull: a Fault echo cross-fades the fill's coverage to
-    /// warn (premultiplied, linear light), so on every builtin scheme and stock High
-    /// Contrast palette, for both fills a row can wear (accent, warn), each step lies
-    /// inside the track–fill–warn triangle with the fill (or track) and warn as its ends.
-    #[test]
-    fn the_fault_wash_stays_inside_the_track_fill_warn_hull() {
-        let check = |name: &str, colors: &BandColors| {
-            for fill_ink in [colors.accent, colors.warn] {
-                let inks = crate::message_band::MeterInks::of(colors, fill_ink);
-                let corners = [inks.track, inks.fill, inks.warn];
-                for cover in [255u8, 128, 1] {
-                    for u in 0..=255u16 {
-                        let w = u8::try_from((u16::from(cover) * u + 127) / 255).unwrap();
-                        let t = aterm_messages::Tone {
-                            fill: cover - w,
-                            lift: 0,
-                            warn: w,
-                        };
-                        let rgb = crate::message_band::tone_rgb(t, &inks);
-                        let d = crate::message_band::hull_distance(rgb, corners);
-                        assert!(d < 0.01, "{name}: {t:?} → {rgb:?} is {d:.4} outside");
-                    }
-                }
-                let at = |fill, warn| {
-                    crate::message_band::tone_rgb(
-                        aterm_messages::Tone {
-                            fill,
-                            lift: 0,
-                            warn,
-                        },
-                        &inks,
-                    )
-                };
-                assert_eq!(at(255, 0), inks.fill, "{name}");
-                assert_eq!(at(0, 255), inks.warn, "{name}");
-                assert_eq!(at(0, 0), inks.track, "{name}");
-            }
-        };
-        for name in aterm_types::scheme::builtin_names() {
-            let scheme = aterm_types::scheme::builtin(name).expect("listed scheme exists");
-            let theme = Theme::from(&scheme);
-            check(name, &band_colors(theme));
-        }
-        for (name, palette) in hc_fixtures::STOCK {
-            hc_fixtures::with_forced(palette, || check(name, &band_colors(Theme::default())));
         }
     }
 }

@@ -293,10 +293,7 @@ pub fn off_refused<R>(kind: io::ErrorKind, run: impl FnOnce() -> R) -> R {
 /// `run` with this thread's waits for the book's lock lasting `wait` in place of [`LOCK_WAIT`] (a test seam).
 #[cfg(any(test, debug_assertions))]
 pub fn lock_waiting<R>(wait: Duration, run: impl FnOnce() -> R) -> R {
-    let before = TEST_WAIT.with_borrow_mut(|seam| seam.replace((wait, None)));
-    let ran = run();
-    TEST_WAIT.with_borrow_mut(|seam| *seam = before);
-    ran
+    with_lock_wait(wait, None, run)
 }
 
 /// [`lock_waiting`], with `told` sent to each time the lock is found held (a test seam).
@@ -306,10 +303,25 @@ pub fn lock_waiting_told<R>(
     told: std::sync::mpsc::Sender<()>,
     run: impl FnOnce() -> R,
 ) -> R {
-    let before = TEST_WAIT.with_borrow_mut(|seam| seam.replace((wait, Some(told))));
-    let ran = run();
-    TEST_WAIT.with_borrow_mut(|seam| *seam = before);
-    ran
+    with_lock_wait(wait, Some(told), run)
+}
+
+#[cfg(any(test, debug_assertions))]
+fn with_lock_wait<R>(
+    wait: Duration,
+    told: Option<std::sync::mpsc::Sender<()>>,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<(Duration, Option<std::sync::mpsc::Sender<()>>)>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_WAIT.with_borrow_mut(|seam| *seam = self.0.take());
+        }
+    }
+
+    let _restore = Restore(TEST_WAIT.with_borrow_mut(|seam| seam.replace((wait, told))));
+    run()
 }
 
 fn lock_wait() -> Duration {

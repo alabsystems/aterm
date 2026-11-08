@@ -154,7 +154,7 @@ fn await_spare(inst: &Instance, state: &str) {
     }
 }
 
-fn fold_failed(log: &str) -> Option<Vec<String>> {
+fn fold_failed(log: &str) -> Option<(Vec<String>, &str)> {
     let lines: Vec<&str> = log.lines().collect();
     let verdict = lines
         .iter()
@@ -166,8 +166,9 @@ fn fold_failed(log: &str) -> Option<Vec<String>> {
         .take_while(|l| !VERDICTS.iter().any(|v| l.contains(v)))
         .find(|l| {
             l.contains("spare gate: unclean run: failed=") || l.contains("spare gate: escape:")
-        })?;
-    Some(match named.split("failed=").nth(1) {
+        })
+        .copied()?;
+    let failed = match named.split("failed=").nth(1) {
         Some(rest) => rest
             .split([':', ' '])
             .next()?
@@ -175,7 +176,8 @@ fn fold_failed(log: &str) -> Option<Vec<String>> {
             .map(str::to_owned)
             .collect(),
         None => vec!["escape".to_owned()],
-    })
+    };
+    Some((failed, named))
 }
 
 fn log_through(inst: &Instance, verdict: &str, n: usize) -> String {
@@ -732,15 +734,23 @@ fn an_unclean_rc_never_opens_the_gate() {
         (
             "daemon",
             &["escape"],
-            "( { n=0; while [[ ! -e $HOME/rc-release && $n -lt 1200 ]]; do /bin/sleep 0.05; \
-             n=$((n + 1)); done; : > \"$HOME/daemon-finished\"; } & )"
+            "( { IFS= read -r __aterm_release < \"$HOME/daemon-hold\"; \
+             : > \"$HOME/daemon-finished\"; } & \
+             printf '%s\\n' \"$!\" > \"$HOME/daemon-pid\"; \
+             n=0; while [[ ! -e $HOME/daemon-parent-release && $n -lt 1200 ]]; do \
+             /bin/sleep 0.05; n=$((n + 1)); done ) & \
+             __aterm_daemon_parent=$!; \
+             printf '%s\\n' \"$__aterm_daemon_parent\" > \"$HOME/daemon-parent-pid\"; \
+             n=0; while [[ ! -e $HOME/daemon-observed && $n -lt 1200 ]]; do \
+             /bin/sleep 0.05; n=$((n + 1)); done; \
+             wait \"$__aterm_daemon_parent\"; unset __aterm_daemon_parent n"
                 .to_owned(),
         ),
     ];
-    // Each case first samples a clean boot. A different case's deliberately
-    // orphaned daemon is indistinguishable from an escape in that sample, so
-    // these fixtures must finish one at a time. Still run every case and report
-    // a real failed assertion ahead of a machine that could not be sampled.
+    // Each case waits for its boot sample without requiring a clean account-wide scan.
+    // The negative run must then publish its own unclean sample and name its rule. Run
+    // sequentially so every owned daemon is settled before the next case, and report a
+    // real failed assertion ahead of a machine that could not be sampled.
     let ends = cases
         .iter()
         .filter_map(|(name, rules, misbehave)| {
@@ -806,27 +816,40 @@ fn an_unclean_run(name: &str, rules: &[&str], misbehave: &str) {
         &[("ATERM_DEBUG_SPARE_IDLE_MS", "100")],
     );
     let held = RcRelease(inst.tmp.join("home/rc-release"));
-    boot_run_is_clean(&inst);
+    let (_, boot) = boot_session(&inst);
+    await_text(&inst, &boot, "SPARE%");
+    let before = await_first_sample(&inst);
+    let before_log = log_through(&inst, "saw a visible run:", 1);
+    let mut daemon_hold = (name == "daemon").then(|| {
+        (
+            held_daemon_fifo(&inst),
+            RcRelease(inst.tmp.join("home/daemon-parent-release")),
+            RcRelease(inst.tmp.join("home/daemon-observed")),
+        )
+    });
     if rules.contains(&"start") {
         set_window(&inst.tmp, HELD_RC_WINDOW_MS);
     }
     std::fs::write(inst.tmp.join("home/armed"), b"").expect("arm");
     let tier = await_visible_run_tier(&inst);
-    let before = gate_snapshot(&inst).expect("one settled generation");
     let sid = spawn(&inst, &[]);
     assert_eq!(born(&inst, &sid), tier, "{name}");
+    let daemon = daemon_hold
+        .as_ref()
+        .map(|(_, release, observed)| prove_daemon(&inst, release, observed));
     let after = await_sample_after(&inst, &before);
     let log = log_through(&inst, "saw a visible run:", 2);
-    if after.streak != 0
-        && let Some(line) = an_unsettled_scan(&log)
-    {
-        an_unsettled_scan_decided_it(&format!("{name}: {line}"), &log);
+    let new_log = log
+        .strip_prefix(&before_log)
+        .expect("the new fold follows the captured boot sample");
+    if let Some(line) = an_unsettled_scan(new_log) {
+        an_unsettled_scan_decided_it(&format!("{name}: {line}"), new_log);
     }
     assert_eq!(
         after.streak, 0,
-        "{name}: the actual negative fold reset the streak"
+        "{name}: the actual negative fold leaves the gate closed"
     );
-    let failed = fold_failed(&log)
+    let (failed, evidence) = fold_failed(new_log)
         .unwrap_or_else(|| panic!("{name}: an unclean fold names what it failed:\n{log}"));
     assert!(
         failed.iter().any(|rule| rules.contains(&rule.as_str())),
@@ -835,8 +858,30 @@ fn an_unclean_run(name: &str, rules: &[&str], misbehave: &str) {
     await_gate(&inst, "learning_0/3");
     match name {
         "daemon" => {
-            held.release().expect("release the daemon");
+            let daemon = daemon.as_ref().expect("the owned daemon");
+            let reported = evidence
+                .split_whitespace()
+                .find_map(|word| word.strip_prefix("pid="))
+                .and_then(|pid| pid.parse::<i32>().ok())
+                .expect("an escape verdict names its process");
+            assert_eq!(
+                aterm_uds::process::read_identity(daemon.identity.pid),
+                Some(daemon.identity),
+                "the captured daemon remains live through its verdict"
+            );
+            if reported != daemon.identity.pid {
+                aterm_spec::host::could_not_run(format!(
+                    "the escape verdict named pid {reported}, not the owned daemon {}: {evidence}",
+                    daemon.identity.token()
+                ));
+            }
+            drop(daemon_hold.take());
             await_private_file(&inst, &inst.tmp.join("home/daemon-finished"));
+            let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+            while !daemon.ended() {
+                assert!(Instant::now() < give_up, "the owned daemon never ended");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
         }
         "slow" => {
             held.release().expect("release the slow rc");
@@ -847,6 +892,94 @@ fn an_unclean_run(name: &str, rules: &[&str], misbehave: &str) {
     ctl_ok(&inst, &[&format!("@{sid}"), "close"]);
     assert_eq!(adopted(&inst, "ready"), 0, "{name}");
     assert_eq!(adopted(&inst, "warming"), 0, "{name}");
+}
+
+fn held_daemon_fifo(inst: &Instance) -> std::fs::File {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let path = inst.tmp.join("home/daemon-hold");
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("a C path");
+    // SAFETY: `c` holds a valid NUL-terminated path in the fixture's private home.
+    assert_eq!(
+        unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+        0,
+        "make daemon FIFO"
+    );
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .expect("hold the daemon FIFO read-write until release")
+}
+
+fn prove_daemon(inst: &Instance, release_parent: &RcRelease, observed: &RcRelease) -> Leftover {
+    use aterm_uds::process::{read_identity, read_lineage, read_process_path};
+    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let pid_in = |name: &str| loop {
+        if let Ok(line) = std::fs::read_to_string(inst.tmp.join("home").join(name))
+            && line.ends_with('\n')
+            && let Ok(pid) = line.trim().parse::<i32>()
+            && pid > 1
+        {
+            break pid;
+        }
+        assert!(Instant::now() < give_up, "the fixture never wrote {name}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let parent_pid = pid_in("daemon-parent-pid");
+    let daemon_pid = pid_in("daemon-pid");
+    let parent_line = read_lineage(parent_pid).expect("the held intermediate shell");
+    let shell_pid = i32::try_from(parent_line.parent).expect("the visible shell's pid");
+    let shell_path = std::fs::canonicalize(shell().path).expect("the login shell's path");
+    let prove = |parent, pid| {
+        proven_spare(
+            parent,
+            pid,
+            &shell_path,
+            read_lineage,
+            read_process_path,
+            read_identity,
+        )
+        .expect("the held process is its captured parent's own login shell")
+    };
+    let shell = prove(inst.child.id(), shell_pid);
+    let shell_line = read_lineage(shell_pid).expect("the visible shell's lineage");
+    assert_eq!(shell_line.identity, shell, "the same visible shell");
+    let parent = Leftover {
+        identity: prove(shell.pid.unsigned_abs(), parent_pid),
+        shell: shell_path.clone(),
+    };
+    let daemon = Leftover {
+        identity: prove(parent.identity.pid.unsigned_abs(), daemon_pid),
+        shell: shell_path,
+    };
+    assert_eq!(read_identity(shell_pid), Some(shell), "the same ancestor");
+    release_parent.release().expect("release the proven parent");
+    loop {
+        let line = read_lineage(daemon_pid).expect("the held daemon remains readable");
+        assert_eq!(line.identity, daemon.identity, "the captured daemon birth");
+        #[cfg(target_os = "macos")]
+        let adopted = line.parent == 1 && line.launched_by(&parent.identity) == Some(true);
+        #[cfg(target_os = "linux")]
+        let adopted = line.orphaned(None, shell_line.uniqueid, || {
+            i32::try_from(line.parent)
+                .ok()
+                .and_then(read_lineage)
+                .map(|parent| parent.uniqueid)
+        });
+        if adopted && parent.ended() {
+            break;
+        }
+        assert!(
+            Instant::now() < give_up,
+            "the owned daemon was never adopted"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    observed
+        .release()
+        .expect("let the ordinary startup complete");
+    daemon
 }
 
 #[test]
@@ -1078,7 +1211,7 @@ fn spare_entries(dir: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// A spare's shell, proven while its instance lived ([`proven_spare`]). Its drop ends it only
+/// An owned login shell, proven while its parent lived ([`proven_spare`]). Its drop ends it only
 /// through [`aterm_uds::process::end_proven`] on that identity, re-read on each side of a read
 /// that it still runs the login shell.
 struct Leftover {

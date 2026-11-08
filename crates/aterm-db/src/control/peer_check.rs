@@ -370,9 +370,13 @@ fn combined(
             Error::new("Commons peer belongs to another membership log"),
         );
     }
-    for record in peer_log.records().skip(1) {
-        if let Err(error) = combined.insert(record.clone()) {
-            return Reading::of(Read::Out, failure(error));
+    // Where this Mac's log holds each of the peer's heads it holds every record the peer's does,
+    // and each insert would answer `Known` ([`Log::holds_all`]).
+    if !combined.holds_all(peer_log) {
+        for record in peer_log.records().skip(1) {
+            if let Err(error) = combined.insert(record.clone()) {
+                return Reading::of(Read::Out, failure(error));
+            }
         }
     }
     if denied_by(paths, &combined, request, roster)

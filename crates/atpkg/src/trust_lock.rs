@@ -27,8 +27,8 @@ pub const LOCK_CAPABILITY: &str = "aterm-trust-lock-v1";
 /// The flag that asks a front for [`LOCK_CAPABILITY`].
 pub const LOCK_CAPABILITY_FLAG: &str = "--lock-capabilities";
 
-/// How long a fold waits for its lease on the build before it folds nothing.
-const FOLD_LEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Hang detector for the lease required to fold a complete, unrecorded build.
+const FOLD_LEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Where `lock`'s build stands in the store at `prefix` ([`locked_build`]), absent unless the
 /// store reads it complete for this slice ([`crate::store::build_is_complete`]). A complete build
@@ -37,6 +37,10 @@ const FOLD_LEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// so it stands [`LockedBuild::Present`] or [`LockedBuild::Mismatch`] from then on.
 #[must_use]
 pub fn standing(prefix: &Path, lock: &TrustLock) -> LockedBuild {
+    standing_started(prefix, lock, std::time::Instant::now())
+}
+
+fn standing_started(prefix: &Path, lock: &TrustLock, started: std::time::Instant) -> LockedBuild {
     let first = locked_build(prefix, lock);
     if matches!(first, LockedBuild::Present { .. } | LockedBuild::Unrecorded)
         && !crate::store::build_is_complete(&build_dir(prefix, lock.build))
@@ -49,8 +53,13 @@ pub fn standing(prefix: &Path, lock: &TrustLock) -> LockedBuild {
     let Some(subject) = crate::lease::Subject::build(PROGRAM, lock.build) else {
         return first;
     };
-    let Ok(_lease) = crate::lease::take(prefix, &subject, "trust.lock fold", FOLD_LEASE_WAIT)
+    let Some(remaining) = FOLD_LEASE_WAIT
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
     else {
+        return first;
+    };
+    let Ok(_lease) = crate::lease::take(prefix, &subject, "trust.lock fold", remaining) else {
         return first;
     };
     let dir = build_dir(prefix, lock.build);

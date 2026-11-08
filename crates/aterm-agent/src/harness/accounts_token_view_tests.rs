@@ -514,6 +514,7 @@ fn the_doctor_words_count_the_states() {
 
 /// THE VIEW READS THE VAULT ONCE AND COVERS A ROW-LESS SESSION LOGIN: with no roster, a login
 /// record's account is covered by its own email, and the vault's `listed` read is the one read.
+/// Its offer stands only where the host's verb makes a token ([`Places::offers`]).
 #[test]
 fn the_view_covers_a_rowless_session_login_in_one_read() {
     struct Once {
@@ -573,20 +574,24 @@ fn the_view_covers_a_rowless_session_login_in_one_read() {
     let vault = Once {
         listed: RefCell::new(0),
     };
-    let shown = journal::with_keyer(
-        |_, _| Some(KEY.to_owned()),
-        || {
-            view(
-                &Places {
-                    store: &store,
-                    roster: None,
-                    logins: &logins,
-                    now: i64::try_from(NOW).unwrap(),
-                },
-                &vault,
-            )
-        },
-    );
+    let shown_where = |offers: bool| {
+        journal::with_keyer(
+            |_, _| Some(KEY.to_owned()),
+            || {
+                view(
+                    &Places {
+                        store: &store,
+                        roster: None,
+                        logins: &logins,
+                        now: i64::try_from(NOW).unwrap(),
+                        offers,
+                    },
+                    &vault,
+                )
+            },
+        )
+    };
+    let shown = shown_where(true);
     assert_eq!(*vault.listed.borrow(), 1);
     assert_eq!(shown.len(), 1);
     assert_eq!(shown[0].key, KEY);
@@ -598,6 +603,13 @@ fn the_view_covers_a_rowless_session_login_in_one_read() {
             replace: false,
         })
     );
+    // CONTROL: a host whose verb makes no token (off macOS) is offered no step, and still says
+    // the token's state.
+    let elsewhere = shown_where(false);
+    assert_eq!(elsewhere.len(), 1);
+    assert_eq!(elsewhere[0].state, TokenState::None);
+    assert!(elsewhere[0].offer.is_none(), "{:?}", elsewhere[0].offer);
+    assert!(elsewhere[0].phrase(i64::try_from(NOW).unwrap()).is_none());
 }
 
 /// A vault whose post a server takes where `takes`, counting the posts it was asked for; it

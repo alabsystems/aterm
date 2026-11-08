@@ -18,7 +18,7 @@ fn ms(n: u64) -> Duration {
 }
 
 fn present(c: &MessageCenter, cols: usize) -> Presentation {
-    c.presentation(cols, &char_width, None, Links::Painted)
+    c.presentation(cols, &char_width, Links::Painted)
 }
 
 fn notice(c: &mut MessageCenter, g: &mut WireGate, line: &str, now: Instant) -> Applied {

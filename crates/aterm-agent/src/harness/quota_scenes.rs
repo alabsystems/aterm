@@ -5,7 +5,8 @@
 //! state and series rows built through the stores' own writers ([`Fx`]), and the glass design's
 //! four cases (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1) at its now, Thu 5 Nov 2026
 //! 17:00, UTC. The outlook's and the quota view's tests build on it, and so do the window's
-//! (its quota row's gallery draws [`cases`]); nothing a release build compiles reaches it.
+//! (its quota row's gallery draws [`cases`]) and its private-dev `harness-layouts` scene, which a
+//! debug build or one with `dev-seams` compiles; no shipped build reaches it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -254,6 +255,47 @@ pub fn case_d() -> Fx {
     let mut fx = Fx::new(&[("main", Class::Preferred)]);
     fx.now = T5;
     fx
+}
+
+/// The words the tap prints under the composer's bottom rule for the tab `view` is of
+/// ([`super::tap::Reading::week_words`]), said on [`utc`] at the view's now: its account's week,
+/// as the view reads it, and its reset; no figure (`week · no figure yet`) where the view has
+/// none to read. A scene that lays the row for the claim to read takes these, so a case's figure
+/// or the tap's grammar cannot drift from what the glass draws over them.
+#[must_use]
+pub fn tap_words(view: &QuotaView) -> String {
+    use super::outlook::Figure;
+    use super::tap::{Reading, Row, Window};
+    let seven_day = view.named.iter().find(|n| n.this_tab).and_then(|tab| {
+        let (Figure::Exact(x10) | Figure::AtLeast(x10)) = tab.figure else {
+            return None;
+        };
+        let x10 = u32::from(x10);
+        Some(Window {
+            pct: (x10 + 5) / 10,
+            resets_at: tab.reset.unwrap_or_default(),
+            pct_x10: Some(x10),
+        })
+    });
+    Reading {
+        at: view.as_of,
+        sid: "s-main".to_owned(),
+        pid: 1,
+        session: None,
+        login: None,
+        home: None,
+        api_ms: 0,
+        five_hour: None,
+        seven_day,
+        warm: None,
+        cache_expires_at: None,
+        version: None,
+        model: None,
+        ctx_left: None,
+        dur_us: 0,
+        row: Some(Row::Own),
+    }
+    .week_words(view.as_of, Some(&utc()))
 }
 
 /// The design's four cases as `main`'s tab sees them, each named by its letter: one account

@@ -6,42 +6,65 @@
 //! sharing on.
 
 use std::path::Path;
+use std::time::Instant;
+
+use aterm_secrets::converge::{Last, RunnerRetry};
 
 /// How often a process whose Commons runtime `[swarm] enabled = false` holds looks at the switch
-/// again ([`when_sharing_on`]): one `stat` ([`aterm_secrets::swarm::Switch`]).
+/// again: one `stat` ([`aterm_secrets::swarm::Switch`]).
 pub(crate) const SHARING_LOOK: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Run `start` (this process's Commons runtime) once `home`'s `[swarm] enabled` leaves sharing on:
-/// at once where it does now, else on a thread of its own that looks at the switch each `look`
-/// until a person turns it on. `docs/DESIGN-alab-swarm-2026-10-27.md` §9: the switch sets
-/// `[commons] enabled = false` among the rest, so no Commons runtime runs while it is off. A switch that cannot be read holds it as an off one does, as Commons' own
-/// policy read refuses it. Whether `start` ran at once.
-pub(crate) fn when_sharing_on(
-    home: &Path,
-    look: std::time::Duration,
-    start: impl FnOnce() + Send + 'static,
-) -> bool {
-    let mut switch = aterm_secrets::swarm::Switch::new(home);
-    let said = |line: &str| aterm_log::warn!("Commons: {line}");
-    if switch.enabled_saying(&said) == Ok(true) {
-        start();
-        return true;
+/// The process host retains a Commons start until the canonical runtime was published.
+/// Its existing event loop supplies the deadline; recovery never needs another thread.
+pub(crate) struct Startup {
+    switch: aterm_secrets::swarm::Switch,
+    start: Option<Box<dyn FnMut() -> bool + Send>>,
+    clock: Instant,
+    due: Option<Instant>,
+    retry: RunnerRetry,
+}
+
+impl Startup {
+    pub(crate) fn new(home: &Path, start: impl FnMut() -> bool + Send + 'static) -> Self {
+        Self {
+            switch: aterm_secrets::swarm::Switch::new(home),
+            start: Some(Box::new(start)),
+            clock: Instant::now(),
+            due: None,
+            retry: RunnerRetry::default(),
+        }
     }
-    let waits = std::thread::Builder::new()
-        .name("commons-sharing-off".into())
-        .spawn(move || {
-            while switch.enabled_saying(&said) != Ok(true) {
-                std::thread::sleep(look);
-            }
-            start();
-        });
-    if let Err(error) = waits {
-        aterm_log::warn!(
-            "Commons waits for [swarm] enabled, and its wait could not start ({error}): it starts \
-             at aterm's next launch with sharing on"
-        );
+
+    pub(crate) fn maintain(&mut self) -> Option<Instant> {
+        self.maintain_at(Instant::now())
     }
-    false
+
+    fn maintain_at(&mut self, now: Instant) -> Option<Instant> {
+        let start = self.start.as_mut()?;
+        if self.due.is_some_and(|due| now < due) {
+            return self.due;
+        }
+        // Unread sharing remains held, just as the runtime's own policy read does.
+        if self
+            .switch
+            .enabled_saying(&|line| aterm_log::warn!("Commons: {line}"))
+            != Ok(true)
+        {
+            self.due = Some(now + SHARING_LOOK);
+            return self.due;
+        }
+        self.retry.started();
+        if start() {
+            self.start = None;
+            self.due = None;
+            return None;
+        }
+        let elapsed = now.saturating_duration_since(self.clock).as_millis();
+        let elapsed = u64::try_from(elapsed).unwrap_or(u64::MAX);
+        self.retry.reaped(Last::Failed, elapsed);
+        self.due = self.retry.remaining(elapsed).map(|pause| now + pause);
+        self.due
+    }
 }
 
 /// Install this process's reader of `home`'s `[swarm] enabled` for its automatic LAN uses
@@ -62,7 +85,8 @@ pub(crate) fn install_sharing(home: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// `[swarm] enabled = false` starts no Commons runtime, and a person turning it on starts
     /// one; with the switch on, it starts at once.
@@ -75,24 +99,36 @@ mod tests {
                 .unwrap();
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         aterm_uds::atomic_file::write(&config, b"[swarm]\nenabled = false\n", 0o600).unwrap();
-        let (started, heard) = std::sync::mpsc::channel();
-        let at_once = super::when_sharing_on(home, Duration::from_millis(10), move || {
-            let _ = started.send(());
-        });
-        assert!(!at_once, "swarm off: no Commons runtime now");
-        assert!(heard.try_recv().is_err(), "nor started by the wait");
-        std::fs::write(&config, "[swarm]\nenabled = true\n").unwrap();
-        heard
-            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-            .expect("turned on: the runtime starts");
-        let (started, heard) = std::sync::mpsc::channel();
-        assert!(super::when_sharing_on(
-            home,
-            Duration::from_millis(10),
-            move || {
-                let _ = started.send(());
+        for enabled in [false, true] {
+            std::fs::write(&config, format!("[swarm]\nenabled = {enabled}\n")).unwrap();
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let tried = Arc::clone(&attempts);
+            let mut startup =
+                super::Startup::new(home, move || tried.fetch_add(1, Ordering::SeqCst) > 0);
+            let mut now = startup.clock;
+            let due = startup.maintain_at(now).unwrap();
+            assert_eq!(attempts.load(Ordering::SeqCst), usize::from(enabled));
+            if !enabled {
+                assert_eq!(due, now + super::SHARING_LOOK);
+                std::fs::write(&config, "[swarm]\nenabled = true\n").unwrap();
+                now = due;
             }
-        ));
-        assert!(heard.try_recv().is_ok(), "swarm on: at once");
+            if !enabled {
+                let _ = startup.maintain_at(now);
+            }
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            let due = startup.due.unwrap();
+            startup.maintain_at(due - std::time::Duration::from_nanos(1));
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            // A failed constructor never gives a later retry permission to bypass sharing.
+            std::fs::write(&config, "[swarm]\nenabled = false\n").unwrap();
+            let held = startup.maintain_at(due).unwrap();
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            std::fs::write(&config, "[swarm]\nenabled = true\n").unwrap();
+            assert_eq!(startup.maintain_at(held), None);
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+            assert_eq!(startup.maintain_at(held + super::SHARING_LOOK), None);
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        }
     }
 }

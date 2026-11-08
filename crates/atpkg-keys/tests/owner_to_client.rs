@@ -66,7 +66,7 @@ struct Registry {
 impl Fetcher for Registry {
     fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
         Ok(vec![Candidate {
-            label: "atpkg-index-1".into(),
+            label: "atpkg-index-41".into(),
             index_bytes: self.index.0.clone(),
             sig: self.index.1.clone(),
             roster_bytes: self.roster.0.clone(),

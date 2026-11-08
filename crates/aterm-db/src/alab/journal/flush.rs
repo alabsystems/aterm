@@ -116,52 +116,8 @@ pub(crate) fn pass_with(
     pass_started(paths, spool, presence, holdings, off, now, Instant::now())
 }
 
-#[cfg(all(test, unix))]
-#[test]
-fn native_journal_flush_waits_for_unchanged_custody() {
-    use std::{os::unix::fs::MetadataExt as _, time::Duration};
-
-    let lab = crate::table::tests::Lab::new(&[aterm_secrets::commons::roster::Role::Writer]);
-    lab.bootstrap(0);
-    let paths = &lab.paths[0];
-    let held = aterm_uds::private_file::PrivateLock::take_with(
-        &paths.dir,
-        "commons.lock",
-        Duration::ZERO,
-        "private custody held",
-        || {},
-    )
-    .unwrap();
-    let named = std::fs::metadata(paths.dir.join("commons.lock")).unwrap();
-    let identity = (named.dev(), named.ino());
-    let mut held = Some(held);
-    let result = aterm_uds::file_lock::with_lock_wait_observer(
-        move |file| {
-            let actual = file.metadata().unwrap();
-            assert_eq!((actual.dev(), actual.ino()), identity);
-            if let Some(held) = held.take() {
-                drop(held);
-            }
-        },
-        || {
-            let started = Instant::now() - Duration::from_secs(3);
-            let scratch = aterm_tempfile::tempdir().unwrap();
-            let spool = Spool::at(scratch.path().join("spool"));
-            pass_started(
-                paths,
-                &spool,
-                &Presence::default,
-                &|| None,
-                false,
-                1_728_000_600,
-                started,
-            )
-        },
-    );
-    assert!(matches!(result, Ok(Flushed::Wrote { .. })), "{result:?}");
-}
-
-fn pass_started(
+/// [`pass_with`] with local custody admission's hang detector running from `started`.
+pub(super) fn pass_started(
     paths: &Paths,
     spool: &Spool,
     presence: &dyn Fn() -> Presence,
@@ -219,6 +175,11 @@ fn pass_started(
     if now < book.held_until || (book.sum_period == Some(period) && quiet) {
         return Ok(Flushed::Idle);
     }
+
+    // Asked before the journal writer is taken: a first look at the lab reads the registry, which
+    // takes `commons.lock`, and an admission holds that lock while it waits for this writer, so
+    // asking with the writer in hand would be a lock-order cycle only a hang detector ends.
+    let held_here = if off { None } else { holdings() };
 
     let selected = crate::generation::selected(paths)?;
     let paths = &selected;
@@ -304,7 +265,7 @@ fn pass_started(
         book.save(spool)?;
         return Ok(Flushed::Idle);
     }
-    if !off && let Some(held) = holdings() {
+    if let Some(held) = held_here {
         book.hold(&held, now);
     }
     if !book.due(&outbox, true, now, period, under, off) {

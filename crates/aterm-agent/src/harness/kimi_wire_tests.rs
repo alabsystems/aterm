@@ -218,6 +218,31 @@ fn a_partial_or_unparsed_line_binds_nothing() {
     );
 }
 
+/// Only a line holding an event type the fold reads, as a JSON string, is parsed, so a line that
+/// holds neither leaves the record readable however it is written: here one torn in a longer
+/// string that holds the request's type, after it or before it. Control: the same torn line
+/// holding the request's type, or the answer's, is parsed and leaves the record unread.
+#[test]
+fn a_line_holding_no_type_the_fold_reads_is_never_parsed() {
+    let torn = |word: &str| format!("{{\"type\":\"{word}\",\"id\":\n");
+    for other in ["interaction.requested", "re.interaction.request"] {
+        assert_eq!(
+            folded(&[HEAD, &torn(other), REQUEST])
+                .pending()
+                .map(<[Pending]>::len),
+            Some(1),
+            "a line holding {other:?}, no type the fold reads"
+        );
+    }
+    for word in ["interaction.request", "interaction.resolved"] {
+        assert_eq!(
+            folded(&[HEAD, &torn(word), REQUEST]).pending(),
+            None,
+            "NEGATIVE CONTROL: a torn line holding {word:?}"
+        );
+    }
+}
+
 #[test]
 fn a_request_asked_before_the_last_input_lends_nothing() {
     let drawn = readings(&["cat README.md"]);

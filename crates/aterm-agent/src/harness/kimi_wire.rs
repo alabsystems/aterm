@@ -20,6 +20,28 @@ use std::time::SystemTime;
 
 use aterm_json::Value;
 
+// The words of Kimi's record and session layout this reader reads, as the anchors name them
+// (`aterm_phase::anchors::KIMI_WIRE_KEYS`, which `vendor_drift` holds Kimi's bundle to).
+const TYPE_REQUEST: &str = aterm_phase::anchor!("kimi.wire.interaction.request");
+const TYPE_RESOLVED: &str = aterm_phase::anchor!("kimi.wire.interaction.resolved");
+const KEY_TYPE: &str = aterm_phase::anchor!("kimi.wire.type");
+const KEY_KIND: &str = aterm_phase::anchor!("kimi.wire.kind");
+const KIND_APPROVAL: &str = aterm_phase::anchor!("kimi.wire.approval");
+const KEY_ID: &str = aterm_phase::anchor!("kimi.wire.id");
+const KEY_TIME: &str = aterm_phase::anchor!("kimi.wire.time");
+const KEY_REQUEST: &str = aterm_phase::anchor!("kimi.wire.request");
+const KEY_TOOL: &str = aterm_phase::anchor!("kimi.wire.toolName");
+const KEY_DISPLAY: &str = aterm_phase::anchor!("kimi.wire.display");
+/// Both the `kind` of a command's display and the key of its string.
+const COMMAND: &str = aterm_phase::anchor!("kimi.wire.command");
+const TOOL_BASH: &str = aterm_phase::anchor!("kimi.wire.Bash");
+const FILE_PROJECTS: &str = aterm_phase::anchor!("kimi.wire.projects.json");
+const DIR_SESSIONS: &str = aterm_phase::anchor!("kimi.wire.sessions");
+const DIR_AGENTS: &str = aterm_phase::anchor!("kimi.wire.agents");
+const FILE_STATE: &str = aterm_phase::anchor!("kimi.wire.state.json");
+const KEY_CWD: &str = aterm_phase::anchor!("kimi.wire.cwd");
+const FILE_WIRE: &str = aterm_phase::anchor!("kimi.wire.wire.jsonl");
+
 /// One approval Kimi asked for and has not had answered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pending {
@@ -43,7 +65,7 @@ pub struct Pending {
 pub fn kimi_home_of(open: &[PathBuf]) -> Option<PathBuf> {
     let mut homes = open
         .iter()
-        .filter(|path| path.is_absolute() && path.ends_with("projects.json"))
+        .filter(|path| path.is_absolute() && path.ends_with(FILE_PROJECTS))
         .filter_map(|path| path.parent());
     let home = homes.next()?;
     homes.all(|other| other == home).then(|| home.to_path_buf())
@@ -82,7 +104,7 @@ pub fn verdict(
         return Verdict::Withheld;
     };
     let passes = |p: &Pending| {
-        p.tool == "Bash"
+        p.tool == TOOL_BASH
             && p.command.as_deref().is_some_and(|command| {
                 !command.chars().any(|c| c.is_control() && c != '\n')
                     && crate::supervise::policy::approval::readings_read_only(
@@ -118,9 +140,9 @@ pub struct Wire {
     identity: Option<(u64, u64)>,
     /// The requests asked and not resolved, in the order asked.
     open: Vec<Pending>,
-    /// A line that names an interaction did not parse, or an approval or answer lacks what this
-    /// reader needs of it: the record is not this reader's. It holds for the rest of this file,
-    /// since the line it could not read may be a request still open.
+    /// A line holding an event type the fold reads did not parse, or an approval or answer lacks
+    /// what this reader needs of it: the record is not this reader's. It holds for the rest of
+    /// this file, since the line it could not read may be a request still open.
     broken: bool,
     /// The file's last byte is not a newline: an append is in progress.
     partial: bool,
@@ -141,11 +163,11 @@ impl Wire {
         self.offset += whole as u64;
     }
 
-    /// Fold one line. Only a line naming an interaction is parsed: the rest of the record
-    /// (prompts, loop events, tool snapshots) never moves the open set.
+    /// Fold one line. Only a line holding, as a JSON string, one of the two event types the fold
+    /// reads is parsed: the rest of the record (prompts, loop events, tool snapshots) never moves
+    /// the open set.
     fn fold(&mut self, line: &[u8]) {
-        const MARK: &[u8] = b"\"interaction.";
-        if !line.windows(MARK.len()).any(|w| w == MARK) {
+        if !quotes(line, TYPE_REQUEST) && !quotes(line, TYPE_RESOLVED) {
             return;
         }
         let Ok(v) = aterm_json::from_slice::<Value>(&lone_surrogates_mended(line)) else {
@@ -157,24 +179,24 @@ impl Wire {
                 .and_then(Value::as_str)
                 .map(str::to_string)
         };
-        match v.get("type").and_then(Value::as_str) {
-            Some("interaction.request") => {
-                if v.get("kind").and_then(Value::as_str) != Some("approval") {
+        match v.get(KEY_TYPE).and_then(Value::as_str) {
+            Some(TYPE_REQUEST) => {
+                if v.get(KEY_KIND).and_then(Value::as_str) != Some(KIND_APPROVAL) {
                     return;
                 }
-                let request = v.get("request");
+                let request = v.get(KEY_REQUEST);
                 let (Some(id), Some(tool), Some(asked)) = (
-                    text(Some(&v), "id"),
-                    text(request, "toolName"),
-                    v.get("time").and_then(Value::as_u64),
+                    text(Some(&v), KEY_ID),
+                    text(request, KEY_TOOL),
+                    v.get(KEY_TIME).and_then(Value::as_u64),
                 ) else {
                     self.broken = true;
                     return;
                 };
-                let display = request.and_then(|r| r.get("display"));
+                let display = request.and_then(|r| r.get(KEY_DISPLAY));
                 let command = display
-                    .filter(|d| d.get("kind").and_then(Value::as_str) == Some("command"))
-                    .and_then(|d| text(Some(d), "command"));
+                    .filter(|d| d.get(KEY_KIND).and_then(Value::as_str) == Some(COMMAND))
+                    .and_then(|d| text(Some(d), COMMAND));
                 self.open.retain(|p| p.id != id);
                 self.open.push(Pending {
                     id,
@@ -183,7 +205,7 @@ impl Wire {
                     asked,
                 });
             }
-            Some("interaction.resolved") => match text(Some(&v), "id") {
+            Some(TYPE_RESOLVED) => match text(Some(&v), KEY_ID) {
                 Some(id) => self.open.retain(|p| p.id != id),
                 None => self.broken = true,
             },
@@ -197,6 +219,13 @@ impl Wire {
     pub fn pending(&self) -> Option<&[Pending]> {
         (!self.broken && !self.partial).then_some(self.open.as_slice())
     }
+}
+
+/// Whether `line` holds `word` between two quotes, as a JSON string of it is written.
+fn quotes(line: &[u8], word: &str) -> bool {
+    let word = word.as_bytes();
+    line.windows(word.len() + 2)
+        .any(|w| w[0] == b'"' && w[w.len() - 1] == b'"' && &w[1..w.len() - 1] == word)
 }
 
 /// `line` with each `\u` escape of a lone UTF-16 surrogate written as `\ufffd`, the character
@@ -282,7 +311,7 @@ impl Bound {
             });
         let mut seen = Vec::new();
         let mut pending = Vec::new();
-        for workspace in std::fs::read_dir(home.join("sessions")).ok()? {
+        for workspace in std::fs::read_dir(home.join(DIR_SESSIONS)).ok()? {
             let workspace = workspace.ok()?;
             if !workspace.file_type().ok()?.is_dir() {
                 continue;
@@ -294,7 +323,7 @@ impl Bound {
                 }
                 let dir = session.path();
                 let mut wires = Vec::new();
-                let readable = wires_under(&dir.join("agents"), started, &mut wires).is_some();
+                let readable = wires_under(&dir.join(DIR_AGENTS), started, &mut wires).is_some();
                 if readable && wires.is_empty() || !session_in(&dir, &want) {
                     continue;
                 }
@@ -328,7 +357,7 @@ fn canonical(path: &Path) -> PathBuf {
 
 /// Whether the session at `dir` works in `want` (its `state.json`'s `cwd`, canonical).
 fn session_in(dir: &Path, want: &Path) -> bool {
-    let Some((file, _)) = super::footer::open_regular_with_meta(&dir.join("state.json")) else {
+    let Some((file, _)) = super::footer::open_regular_with_meta(&dir.join(FILE_STATE)) else {
         return false;
     };
     let mut text = String::new();
@@ -337,7 +366,7 @@ fn session_in(dir: &Path, want: &Path) -> bool {
     }
     aterm_json::from_str::<Value>(&text)
         .ok()
-        .and_then(|v| v.get("cwd").and_then(Value::as_str).map(PathBuf::from))
+        .and_then(|v| v.get(KEY_CWD).and_then(Value::as_str).map(PathBuf::from))
         .is_some_and(|cwd| canonical(&cwd) == want)
 }
 
@@ -358,7 +387,7 @@ fn wires_under(dir: &Path, started: SystemTime, out: &mut Vec<PathBuf>) -> Optio
         if kind.is_dir() {
             wires_under(&path, started, out)?;
         } else if kind.is_file()
-            && entry.file_name() == "wire.jsonl"
+            && entry.file_name() == FILE_WIRE
             && entry.metadata().and_then(|m| m.modified()).ok()? >= started
         {
             out.push(path);

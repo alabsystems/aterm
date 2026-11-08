@@ -1319,11 +1319,35 @@ mod tests {
 
     /// An inherited offer retains the exact original subject after its sender goes away.
     /// Mutating the independently derived subject or substituting a fresh open refuses while
-    /// consuming each refused owned offer exactly once (the negative controls).
+    /// consuming each refused owned offer exactly once (the negative controls). It runs in a
+    /// re-exec of its own: a parallel test's open can take a consumed number, which would read
+    /// as still open.
     #[cfg(unix)]
     #[test]
     fn inherited_lease_adopts_only_the_selected_subjects_original_description() {
         use std::os::fd::AsRawFd as _;
+
+        const NAME: &str =
+            "lease::tests::inherited_lease_adopts_only_the_selected_subjects_original_description";
+        const ISOLATED: &str = "ATERM_TOOLCHAIN_LEASE_ADOPT_ISOLATED";
+        if std::env::var_os(ISOLATED).is_none() {
+            let mut isolated = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+            isolated
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(ISOLATED, "1");
+            let output = aterm_uds::deadline::output_within(
+                &mut isolated,
+                std::time::Duration::from_secs(60),
+            )
+            .expect("run the adoption fixture in its own process");
+            assert!(
+                output.status.success(),
+                "isolated adoption fixture failed:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
 
         let root = aterm_tempfile::tempdir().unwrap();
         let bin = root.path().join("store/trust/9192/bin");

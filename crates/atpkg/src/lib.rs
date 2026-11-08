@@ -153,6 +153,7 @@ pub mod selfupdate;
 mod serde_corpus_tests;
 pub mod shim_env;
 pub mod sig;
+pub mod signed_artifact_cache;
 mod source;
 /// Canonical per-program state spellings shared by `status.toml`, pass logs, `doctor`, and `which`.
 pub mod state;

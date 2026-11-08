@@ -497,7 +497,7 @@ impl Access {
                 "historical access requires the current local membership",
             )));
         }
-        let log = match crate::client::trusted_commons_log(paths, self.trust) {
+        let log = match crate::client::trusted_commons_log_now(paths, self.trust) {
             Ok(Some((log, _heads_digest))) => log,
             Ok(None) => return read(Err(Error::new("Commons membership log is unavailable"))),
             Err(error) => return read(Err(error)),
@@ -930,7 +930,7 @@ fn log_observation_is_current(
     if recipient.is_some_and(|expected| expected != identity.recipient()) {
         return Ok(false);
     }
-    let Some((log, heads_digest)) = crate::client::trusted_commons_log(paths, trust)? else {
+    let Some((log, heads_digest)) = crate::client::trusted_commons_log_now(paths, trust)? else {
         return Ok(false);
     };
     if remembered == Some(commons_log_state_digest(paths, heads_digest)?) {

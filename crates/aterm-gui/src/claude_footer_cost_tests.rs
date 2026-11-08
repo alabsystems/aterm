@@ -214,7 +214,6 @@ fn unicode_account_label_survives_the_native_splice_and_rests_without_allocation
                 isolated.combining[row].clear();
                 let empty = renderer.render_input(&isolated);
                 isolated.cells[row][at] = input.cells[row][at];
-                isolated.cells[row][at].script = aterm_core::terminal::Script::Sub { nudge: 0 };
                 let reference = renderer.render_input(&isolated);
                 let expected = differences(&reference, &empty);
                 assert!(!expected.is_empty(), "the isolated @ paints ink");

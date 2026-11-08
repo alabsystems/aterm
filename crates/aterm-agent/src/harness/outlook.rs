@@ -3440,26 +3440,11 @@ fn pct(x10: u32) -> String {
     }
 }
 
+/// A projected or paced figure as the CLI's outlook says it: half up, but `100` only at a fill, so
+/// a curve short of one says at most `~99%` (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
+/// §2.1, [`super::decimal::whole_used`]).
 fn whole(x10: u32) -> u32 {
-    (x10.min(1000) + 5) / 10
-}
-
-// ---------------------------------------------------------------------------------------------
-// The verdict's words (§2.2)
-
-/// The verdict's words, at each rung's length (§2.2).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct VerdictWords {
-    /// The widest form.
-    pub full: String,
-    /// The short form.
-    pub short: String,
-    /// The shortest form, where it stays at the narrow rungs.
-    pub shortest: Option<String>,
-    /// Said in warn ink, its mark leading: `╳` a projected stop, `⧗` a wall that waits now.
-    pub warn: bool,
-    /// It stays when the rule is narrow (a stop or a wall verdict).
-    pub kept_narrow: bool,
+    super::decimal::whole_used(x10.min(1000))
 }
 
 impl Outlook {
@@ -3525,17 +3510,8 @@ impl Outlook {
         round_up(t, self.as_of, &self.offsets)
     }
 
-    /// The end of a stop: the vendor's reset exact, else `~T` rounded up by its lead; `None`
-    /// for one nothing ends in reach.
-    fn end_words(&self, end: StopEnd) -> Option<String> {
-        match end {
-            StopEnd::Reset(r) => Some(self.when(r)),
-            StopEnd::About(t) => Some(format!("~{}", self.when(self.end_at(t)))),
-            StopEnd::Open => None,
-        }
-    }
-
-    /// [`Self::end_words`] for a screen reader.
+    /// The end of a stop as a screen reader hears it: the vendor's reset exact, else the
+    /// forecast end rounded up by its lead; `None` for one nothing ends in reach.
     fn spoken_end(&self, end: StopEnd) -> Option<String> {
         match end {
             StopEnd::Reset(r) => Some(self.spoken_when(r)),
@@ -3559,12 +3535,6 @@ impl Outlook {
         u32::try_from((pace.x10_m_per_day / m).clamp(0, 1000))
             .ok()
             .map(whole)
-    }
-
-    /// The verdict's words (§2.2); `None` for a refused pace.
-    #[must_use]
-    pub fn verdict_words(&self) -> Option<VerdictWords> {
-        words_of(self, &self.verdict)
     }
 
     /// The verdict as spoken sentences.
@@ -3654,68 +3624,6 @@ impl Outlook {
             }
             Verdict::Refused(why) => why.spoken(),
         }
-    }
-}
-
-fn words_of(out: &Outlook, verdict: &Verdict) -> Option<VerdictWords> {
-    let words = |full: String, short: String, shortest: Option<String>, warn: bool| {
-        Some(VerdictWords {
-            kept_narrow: shortest.is_some(),
-            full,
-            short,
-            shortest,
-            warn,
-        })
-    };
-    match verdict {
-        Verdict::Walled { to: Some(to), .. } => words(
-            format!("\u{2192} {to} at turn end"),
-            format!("\u{2192} {to}"),
-            Some(format!("\u{2192} {to}")),
-            false,
-        ),
-        Verdict::Walled { to: None, until } => {
-            let until = until.map_or_else(|| "its reset".into(), |u| out.when(u));
-            words(
-                format!("\u{29d7} waits to {until}"),
-                format!("\u{29d7} to {until}"),
-                Some(format!("\u{29d7} to {until}")),
-                true,
-            )
-        }
-        // A projected stop is `╳` whichever pass found it (`⧗` is a wall standing now), and
-        // the 5-hour window is never named here (§2.3).
-        Verdict::Stop {
-            from, end, lean, ..
-        } => {
-            let start = out.about(*from);
-            let q = if lean.is_some() { " ?" } else { "" };
-            let short = format!("\u{2573} {start}{q}");
-            let full = out.end_words(*end).map_or_else(
-                || format!("\u{2573} from {start}{q}"),
-                |end| format!("\u{2573} {start}\u{2013}{end}{q}"),
-            );
-            let short = if end.at().is_none() {
-                full.clone()
-            } else {
-                short
-            };
-            words(full, short.clone(), Some(short), true)
-        }
-        Verdict::Lean { until, row, .. } => words(
-            format!("continuous to {}, then {row} ?", out.about(*until)),
-            format!("to {} ?", out.about(*until)),
-            None,
-            false,
-        ),
-        Verdict::Credits { at } => words(
-            format!("\u{2192} credits {}", out.about(*at)),
-            "\u{2192} credits".into(),
-            None,
-            false,
-        ),
-        Verdict::Continuous => words("continuous 7d".into(), "continuous 7d".into(), None, false),
-        Verdict::Refused(_) => None,
     }
 }
 
@@ -4741,10 +4649,17 @@ impl Outlook {
             long_when(self.as_of, &self.offsets),
             self.mode.as_str()
         );
+        // The verdict in the quota row's own phrase 2 (glass design §2.3), whose grammar the
+        // glass and the card say it in; the two the row draws with no phrase in words of their own.
         let verdict = match &self.verdict {
             Verdict::Continuous => "continuous".to_string(),
             Verdict::Refused(why) => format!("not projected: {}", why.words()),
-            v => words_of(self, v).map_or_else(|| v.kind().to_string(), |w| w.full),
+            Verdict::Walled { to: Some(to), .. } => {
+                format!("the work moves to {to} at the turn's end")
+            }
+            v => self
+                .verdict_phrase()
+                .map_or_else(|| v.kind().to_string(), |phrase| phrase.full),
         };
         out.push_str(&format!("  {verdict}\n"));
         let (m, plan) = self.carrier_plan();

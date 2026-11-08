@@ -844,6 +844,46 @@ struct StopSaid<'a> {
     lean: Option<&'a str>,
 }
 
+/// Phrase 2 of `verdict` (§2.3) in `words`, `carrier` whether the pane is the carrier's, the
+/// one a refused pace is said on: a wall the work waits at (`⧗ until Sat 10:00`, the vendor's
+/// reset said exactly), a projected stop (`╳ ~Sat 03:00–Sat 10:00`), a lean on an unread row, the
+/// work on credits, a refused pace; `None` for a run that goes on and for a wall the work moves
+/// off at the turn's end.
+fn phrase_of(words: &Words<'_>, verdict: &Verdict, carrier: bool) -> Option<Phrase> {
+    let phrase = |full: String, short: String, ink: Role, kept: bool| {
+        Some(Phrase {
+            full,
+            short,
+            ink,
+            kept,
+        })
+    };
+    match verdict {
+        Verdict::Walled { to: None, until } => {
+            let until =
+                until.map_or_else(|| "its reset".to_owned(), |u| words.when(words.resumes(u)));
+            let words = format!("{WAIT_MARK} until {until}");
+            phrase(words.clone(), words, Role::Warn, true)
+        }
+        Verdict::Stop { from, end, .. } => {
+            let (full, short) = words.stop_phrase(*from, *end);
+            phrase(full, short, Role::Warn, true)
+        }
+        Verdict::Lean { until, row, .. } => phrase(
+            format!("? {} unread from {}", cut(row), words.about(*until)),
+            format!("? {} {}", cut(row), words.about(*until)),
+            Role::Value,
+            true,
+        ),
+        Verdict::Credits { at } => {
+            let words = format!("{CREDITS_MARK} {}", words.about(*at));
+            phrase(words.clone(), words, Role::Warn, true)
+        }
+        Verdict::Refused(why) if carrier => phrase(why.short(), why.short(), Role::Quiet, false),
+        Verdict::Walled { to: Some(_), .. } | Verdict::Continuous | Verdict::Refused(_) => None,
+    }
+}
+
 /// The words of one view: the outlook's clock and this tab.
 struct Words<'a> {
     out: &'a Outlook,
@@ -1159,6 +1199,21 @@ impl Outlook {
         view.title = self.title_of(&words, &view, drawn, movable);
         view.spoken = self.spoken_of(&words, &view, drawn, movable);
         view
+    }
+
+    /// The outlook's own verdict as the quota row's phrase 2 says it (§2.3), on the carrier's
+    /// pane, whose pace it is: what `aterm accounts outlook` prints, so the CLI and the glass say
+    /// one verdict in one grammar. `None` where the row says none: the work runs on, or a wall
+    /// the work moves off at the turn's end (the chart's `→`; the CLI says that move itself).
+    #[must_use]
+    pub fn verdict_phrase(&self) -> Option<Phrase> {
+        let words = Words {
+            out: self,
+            tab: "",
+            tab_reset: None,
+            single: self.rows.len() <= 1,
+        };
+        phrase_of(&words, &self.verdict, true)
     }
 
     /// The words of a view of the pane whose account is `tab`.
@@ -1694,41 +1749,11 @@ impl Outlook {
             };
         }
         let verdict = self.verdict_for(tab_row);
-        let phrase = |full: String, short: String, ink: Role, kept: bool| {
-            Some(Phrase {
-                full,
-                short,
-                ink,
-                kept,
-            })
-        };
         let carrier = tab_row.is_some_and(|i| self.rows[i].carrier);
-        let said = match &verdict {
-            _ if !movable => None,
-            Verdict::Walled { to: None, until } => {
-                let until =
-                    until.map_or_else(|| "its reset".to_owned(), |u| words.when(words.resumes(u)));
-                let words = format!("{WAIT_MARK} until {until}");
-                phrase(words.clone(), words, Role::Warn, true)
-            }
-            Verdict::Stop { from, end, .. } => {
-                let (full, short) = words.stop_phrase(*from, *end);
-                phrase(full, short, Role::Warn, true)
-            }
-            Verdict::Lean { until, row, .. } => phrase(
-                format!("? {} unread from {}", cut(row), words.about(*until)),
-                format!("? {} {}", cut(row), words.about(*until)),
-                Role::Value,
-                true,
-            ),
-            Verdict::Credits { at } => {
-                let words = format!("{CREDITS_MARK} {}", words.about(*at));
-                phrase(words.clone(), words, Role::Warn, true)
-            }
-            Verdict::Refused(why) if carrier => {
-                phrase(why.short(), why.short(), Role::Quiet, false)
-            }
-            Verdict::Walled { to: Some(_), .. } | Verdict::Continuous | Verdict::Refused(_) => None,
+        let said = if movable {
+            phrase_of(words, &verdict, carrier)
+        } else {
+            None
         };
         // Phrase 1 is left out only where it would repeat phrase 2: a wait that resumes at this
         // tab's own reset (`⧗ until Sat 10:00` says it). A wait that ends at another account's

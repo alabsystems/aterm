@@ -2899,20 +2899,23 @@ mod tests {
         assert!(marker.is_file(), "the marker is the SIBLING <build>.ready");
     }
 
-    fn block_the_marker_write(build_dir: &Path) -> PathBuf {
-        let parent = build_dir.parent().unwrap();
-        std::fs::create_dir_all(parent).unwrap();
-        let blocker = parent.join(format!(".ready.tmp-{}", std::process::id()));
-        std::fs::create_dir_all(&blocker).unwrap();
-        std::fs::write(blocker.join("occupied"), b"x").unwrap();
-        blocker
+    fn block_the_marker_write(build_dir: &Path) -> (PathBuf, crate::metadata_io::seam::Guard) {
+        let marker = crate::store::ready_marker_path(build_dir).unwrap();
+        let blocker = marker.clone();
+        let guard = crate::metadata_io::seam::before_publish(move |destination| {
+            if destination == marker {
+                std::fs::create_dir_all(marker.join("occupied"))?;
+            }
+            Ok(())
+        });
+        (blocker, guard)
     }
 
     #[test]
     fn a_marker_write_that_fails_after_the_swap_keeps_the_verified_tree() {
         let b = bundle("marker-fail-keeps-tree");
         let (build, witness) = b.installed();
-        let blocker = block_the_marker_write(&build);
+        let (blocker, guard) = block_the_marker_write(&build);
         assert!(
             crate::store::build_is_complete(&build),
             "PRECONDITION: build 18 is installed and complete before the re-stage"
@@ -2943,6 +2946,7 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&blocker).unwrap();
+        drop(guard);
         verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
         assert!(crate::store::build_is_complete(&build));
     }

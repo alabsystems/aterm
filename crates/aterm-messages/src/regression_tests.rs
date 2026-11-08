@@ -563,7 +563,7 @@ fn band(msgs: &[Message], cols: usize) -> Presentation {
         c.post(msg.clone(), stamp(1_000), now);
     }
     c.commit_rows(now, 3);
-    c.presentation(cols, &char_width, None, Links::Painted)
+    c.presentation(cols, &char_width, Links::Painted)
 }
 
 #[test]
@@ -1231,7 +1231,7 @@ fn messages_prints_load_only_where_the_glass_says_it() {
         .primary_load(Load::Network);
     c.post(msg, stamp(1), now);
     c.commit_rows(now, 3);
-    let glass = c.presentation(120, &char_width, None, Links::Painted);
+    let glass = c.presentation(120, &char_width, Links::Painted);
     assert_eq!(
         glass.rows[0].load, None,
         "premise: the band paints no load words for the work's own load"

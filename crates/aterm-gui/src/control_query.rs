@@ -2698,8 +2698,9 @@ const fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::
         line_sizes: _,   // frame "line_sizes"
         line_size_spans: _, // OMITTED: compose-time per-pane refinement, empty for one Terminal
         default_bg_spans: _, // OMITTED: compose-time per-pane refinement; cells carry their bg
-        chrome_rasters: _, // OMITTED: host-owned message-band meter raster (pixel ground, rail, ink split), not engine cell content
-        images: _,         // frame "images"
+        chrome_rasters: _, // OMITTED: host-owned chrome rasters (the strip's seam and find-bar rails; find-bar, card and scene icons), not engine cell content
+        chrome_icon_spares: _, // OMITTED: host scratch storage (retired chrome rasters' emptied icon lists), not frame content
+        images: _,             // frame "images"
         wallpaper: _, // OMITTED: host-owned backdrop base layer (render bling), not engine cell content
         default_bg: _, // OMITTED: engine-resolved live default-bg for padding, not per-cell content (cells carry their own bg)
         default_fg: _, // OMITTED: its twin — the effects layer's tint anchor, not per-cell content

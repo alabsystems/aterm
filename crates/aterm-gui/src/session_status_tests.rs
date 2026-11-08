@@ -4072,7 +4072,7 @@ fn handed(
 }
 
 /// `execs`, each with the steers the kernel's record of an exec of `exec_path` handed `argv`
-/// gives ([`crate::command_ran::steers_of_procargs`]).
+/// gives ([`crate::command_ran::steers_of_procargs`], [`crate::command_ran::scripts_of_procargs`]).
 fn kernel(
     mut execs: Vec<crate::command_ran::Exec>,
     exec_path: &str,
@@ -4087,9 +4087,11 @@ fn kernel(
         record.push(0);
     }
     let (path, handed) = crate::command_ran::steers_of_procargs(&record);
+    let scripts = crate::command_ran::scripts_of_procargs(&record);
     for exec in &mut execs {
         exec.names.env_path = path.as_deref().map(Into::into);
         exec.names.handed = handed.clone();
+        exec.names.scripts = scripts.clone();
     }
     execs
 }
@@ -4108,7 +4110,7 @@ fn lawful(detail: &str, ran: &[crate::command_ran::Exec]) -> bool {
             .iter()
             .flat_map(|exec| exec.names.iter())
             .any(|name| name == program)
-        || gate_files().ran_by_identity(program, ran);
+        || gate_files().ran_by_identity(program, ran, GATE_CWD);
     let sub_listed = sub.is_none_or(|sub| {
         SUBCOMMANDS
             .iter()
@@ -4251,8 +4253,9 @@ fn path_words(line: &str) -> Vec<&str> {
 }
 
 /// THE DETAIL'S LAW: over the whole corpus, with the execs each line's real programs give (each
-/// handed every path of the line, as a program handed a path argument or a prompt hook handed the
-/// typed line is; then again with an `atuin`-shaped hook exec beside them), every detail is
+/// handed every path of the line, as its file and as a script, as a program handed a path
+/// argument or a prompt hook handed the typed line is; then again with an `atuin`-shaped hook
+/// exec beside them), every detail is
 /// `None` or names a listed builtin, a name the kernel keeps for an image that ran, or a file
 /// that by identity ran (with an allowlisted subcommand); no `QZP7` word ever appears.
 /// NEGATIVE CONTROLS (scratch): `command_detail` returning the text reader's candidate
@@ -4273,7 +4276,10 @@ fn a_detail_names_only_a_program_that_ran_or_a_builtin() {
     let mut broken: Vec<String> = Vec::new();
     for (line, runs) in &corpus {
         let paths = path_words(line);
-        let real = handed(crate::command_ran::ran_of(runs), &paths);
+        let real = crate::command_ran::handed_scripts(
+            handed(crate::command_ran::ran_of(runs), &paths),
+            &paths,
+        );
         // The hook's exec is placed where a prompt hook's runs, in no job of this block's
         // (the shell's own group, its stamp in the window): it counts only for its own file.
         let mut hooked = real.clone();
@@ -4281,7 +4287,11 @@ fn a_detail_names_only_a_program_that_ran_or_a_builtin() {
             pid: 3,
             pgid: 1,
             during: crate::command_ran::During::Shell(Some(crate::command_ran::Heard::BLOCK)),
-            ..handed(crate::command_ran::ran_of(&["atuin"]), &paths).remove(0)
+            ..crate::command_ran::handed_scripts(
+                handed(crate::command_ran::ran_of(&["atuin"]), &paths),
+                &paths,
+            )
+            .remove(0)
         });
         for execs in [real, hooked] {
             let got = gated(&ran, line, execs.clone());
@@ -4419,7 +4429,11 @@ fn every_audited_line_reads_none_or_the_program_that_ran() {
     let wrong: Vec<String> = cases
         .iter()
         .filter_map(|(line, runs, want)| {
-            let got = gated(&ran, line, crate::command_ran::ran_of(runs));
+            let execs = crate::command_ran::handed_scripts(
+                crate::command_ran::ran_of(runs),
+                &path_words(line),
+            );
+            let got = gated(&ran, line, execs);
             (got.as_deref() != *want)
                 .then(|| format!("{line:?} (ran {runs:?}): {got:?}, want {want:?}"))
         })
@@ -4480,11 +4494,23 @@ fn a_wrapper_or_a_script_is_confirmed_by_what_the_kernel_mapped() {
     assert_eq!(
         gate(
             "./deploy.sh --token QZP7B2",
-            &[leader(9, "sh", Some("sh"), true)]
+            &crate::command_ran::handed_scripts(
+                vec![leader(9, "sh", Some("sh"), true)],
+                &["./deploy.sh"]
+            )
         )
         .as_deref(),
         Some("deploy.sh"),
-        "its interpreter's file ran: its own name"
+        "its interpreter's file ran, handed it: its own name"
+    );
+    assert_eq!(
+        gate(
+            "./deploy.sh --token QZP7B2",
+            &[leader(9, "sh", Some("sh"), true)]
+        )
+        .as_deref(),
+        Some("sh"),
+        "its interpreter's file ran, handed no script: it stands in"
     );
     assert_eq!(
         read("QZP7B4", &unread),
@@ -4578,20 +4604,22 @@ fn a_fish_begin_group_reads_the_program_it_runs() {
 /// CONFIRMED BY FILE IDENTITY: a program reached by a name its image does not carry is the
 /// program that ran when the file the shell would exec for it is that image (`vi -> vim`,
 /// `whoami` = `id`, `~/.local/bin/claude -> versions/2.1.271`), or a `#!` script whose
-/// interpreter's file ran (`./deploy.sh`, `#!/bin/sh`, also through macOS's `/bin/sh` stub to
+/// interpreter's file ran in a process the kernel handed that script (PRIV4-2: `./deploy.sh`,
+/// `#!/bin/sh`, also through macOS's `/bin/sh` stub to
 /// `bash`; a bare `deploy` on `PATH`, `#!/usr/bin/env python3`; CXP-1's bare `codex`, an atpkg
 /// shim `#!/bin/sh` on `PATH`, at the first read after `sh` or its stub's `bash` is heard, and
 /// after the shim execs its binary; a bare name the shell ran through a link whose path its
 /// exec was given as its file, before and after `/bin/sh`'s stub re-execs). A `#!` script whose
 /// directory no steering `PATH` names reads none of its own: the path the kernel handed its
-/// interpreter is an argument, never a steer, and the interpreter that ran stands in. A word
-/// whose own file did not run reads the job's program as a stand-in (H2 rule 2), never as its
-/// own. NEGATIVE CONTROLS (scratch): comparing no file identity fails the `vi`, `whoami`,
+/// interpreter steers only the identity check of a file the shell's own lookup found, never adds
+/// one, and the interpreter that ran stands in; so does it for a script whose interpreter ran
+/// handed nothing (`./deploy.sh` with `sh` alone). A word whose own file did not run reads the
+/// job's program as a stand-in (H2 rule 2), never as its own. NEGATIVE CONTROLS (scratch): comparing no file identity fails the `vi`, `whoami`,
 /// `claude` and script rows; any program file confirming fails `/usr/bin/true` when only `ls`
 /// ran (it reads `true` as its own); no `/bin/sh` stub fails `./deploy.sh` and `codex` run by
 /// `bash`; an `env` line's program never looked up fails the bare `deploy` run by `python3`; no
-/// handed path steering fails both `r13witness` rows; reading argument words as steers again
-/// fails the first `mytool` row (it reads `mytool` as its own).
+/// handed path steering fails both `r13witness` rows; reading argument words as lookup steers
+/// again fails the first `mytool` row (it reads `mytool` as its own).
 #[test]
 fn a_link_or_a_script_is_the_program_whose_file_ran() {
     use crate::command_ran::ran_of;
@@ -4607,18 +4635,65 @@ fn a_link_or_a_script_is_the_program_whose_file_ran() {
         ("QZP7S2 x", ran_of(&["2.1.271"]), Some(("2.1.271", false))),
         (
             "./deploy.sh --token QZP7S5",
-            ran_of(&["sh"]),
+            kernel(
+                ran_of(&["sh"]),
+                "/bin/sh",
+                &["/bin/sh", "./deploy.sh", "--token", "QZP7S5"],
+            ),
             Some(("deploy.sh", true)),
         ),
-        ("./deploy.sh", ran_of(&["bash"]), Some(("deploy.sh", true))),
-        ("/w/deploy.sh", ran_of(&["sh"]), Some(("deploy.sh", true))),
+        (
+            "./deploy.sh",
+            kernel(
+                ran_of(&["bash"]),
+                "/private/var/select/sh",
+                &["/bin/sh", "./deploy.sh"],
+            ),
+            Some(("deploy.sh", true)),
+        ),
+        (
+            "/w/deploy.sh",
+            kernel(ran_of(&["sh"]), "/bin/sh", &["/bin/sh", "/w/deploy.sh"]),
+            Some(("deploy.sh", true)),
+        ),
         (
             "deploy --token QZP7S3",
-            ran_of(&["env", "python3"]),
+            [
+                kernel(
+                    ran_of(&["env"]),
+                    "/usr/bin/env",
+                    &[
+                        "/usr/bin/env",
+                        "python3",
+                        "/opt/bin/deploy",
+                        "--token",
+                        "QZP7S3",
+                    ],
+                ),
+                ran_of(&["python3"]),
+            ]
+            .concat(),
             Some(("deploy", true)),
         ),
-        ("deploy", ran_of(&["python3"]), Some(("deploy", true))),
-        ("brew update", ran_of(&["bash"]), Some(("brew", true))),
+        (
+            "deploy",
+            kernel(
+                ran_of(&["python3"]),
+                "/usr/bin/python3",
+                &["python3", "/opt/bin/deploy"],
+            ),
+            Some(("deploy", true)),
+        ),
+        (
+            "brew update",
+            kernel(
+                ran_of(&["bash"]),
+                "/bin/bash",
+                &["/bin/bash", "/opt/bin/brew", "update"],
+            ),
+            Some(("brew", true)),
+        ),
+        ("./deploy.sh", ran_of(&["sh"]), Some(("sh", false))),
         (
             "mytool --token QZP7S4",
             kernel(
@@ -4633,10 +4708,22 @@ fn a_link_or_a_script_is_the_program_whose_file_ran() {
             ran_of(&["bash"]),
             Some(("bash", false)),
         ),
-        ("codex exec QZP7S6", ran_of(&["sh"]), Some(("codex", true))),
         (
             "codex exec QZP7S6",
-            ran_of(&["bash"]),
+            kernel(
+                ran_of(&["sh"]),
+                "/bin/sh",
+                &["/bin/sh", "/opt/bin/codex", "exec", "QZP7S6"],
+            ),
+            Some(("codex", true)),
+        ),
+        (
+            "codex exec QZP7S6",
+            kernel(
+                ran_of(&["bash"]),
+                "/private/var/select/sh",
+                &["/bin/sh", "/opt/bin/codex", "exec", "QZP7S6"],
+            ),
             Some(("codex", true)),
         ),
         (
@@ -4669,6 +4756,182 @@ fn a_link_or_a_script_is_the_program_whose_file_ran() {
         .iter()
         .filter_map(|(line, execs, want)| {
             let got = read_gated(&ran, line, execs.clone());
+            let want = want.map(|(d, own)| (d.to_owned(), own));
+            (got != want).then(|| format!("{line:?}: {got:?}, want {want:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// PRIV4-2, A SCRIPT THAT NEVER RAN IS NEVER NAMED: a `#!` script reads its own name only where
+/// a process that mapped its interpreter was handed it (the kernel's `#!` handling hands the
+/// interpreter the script's path, which only steers: the identity of the file it names, from the
+/// block's directory, confirms), whichever exec of that process (macOS's `/bin/sh` stub
+/// re-execs the shell; only the first exec's record is read). In `./qzfail.sh && ./QZ.sh`
+/// whose first script failed, the interpreter that ran was handed the first script only, so the
+/// second, which never ran, is never named: its job's program stands in. A script handed to a
+/// program that is not its interpreter (`perl ./QZ.sh`), and an interpreter that ran a `-c`
+/// command, confirm nothing either. Nor does the script's own interpreter handed it anywhere but
+/// where the kernel's `#!` handling puts it, right after the line's own words (read here from
+/// real `KERN_PROCARGS2` records): `sh -n ./QZ.sh` (a syntax check, which runs nothing),
+/// another script's argument (`./lint.sh ./QZ.sh`), and a script whose line adds a word
+/// (`#!/bin/sh -e`) handed after another script; while that script run itself, and an `env -S`
+/// script in `env`'s record and in its program's after `env` re-execs, read their own names.
+/// NEGATIVE CONTROLS (scratch): any exec of the interpreter confirming the script (the rule
+/// before) fails the first two rows with `QZP7S40.sh` and `QZP7S30.sh`; any of an exec's first
+/// script words confirming it, wherever it stands (the rule before the review), fails the
+/// `-n`, `qzlint.sh` and `#!/bin/sh -e` rows with `QZP7S51.sh`, `QZP7S50.sh` and
+/// `QZP7S52.sh`.
+#[test]
+fn a_script_reads_its_name_only_where_its_interpreter_was_handed_it() {
+    use crate::command_ran::{Exec, Heard, Table, handed_scripts, ran_of};
+    let files = Table::default()
+        .program("/bin/sh", "sh")
+        .program("/private/var/select/sh", "bash")
+        .program("/usr/bin/sleep", "sleep")
+        .program("/usr/bin/false", "false")
+        .program("/usr/bin/perl", "perl")
+        .program("/usr/bin/env", "env")
+        .program("/usr/bin/python3", "python3")
+        .script("/w/d/qzfail.sh", "/bin/sh")
+        .script("/w/d/qzlint.sh", "/bin/sh")
+        .script("/w/d/QZP7S40.sh", "/bin/sh")
+        .script("/w/d/QZP7S30.sh", "/bin/sh")
+        .script("/w/d/QZP7S50.sh", "/bin/sh")
+        .script("/w/d/QZP7S51.sh", "/bin/sh")
+        .script("/w/d/QZP7S52.sh", "/bin/sh -e")
+        .script("/w/d/qzpy", "/usr/bin/env -S python3 -u");
+    let ran = Ran::with_files(Box::new(files), None);
+    let of = |pid: i32, names: &[&str], scripts: &[&str]| -> Vec<Exec> {
+        handed_scripts(ran_of(names), scripts)
+            .into_iter()
+            .map(|e| Exec {
+                pid,
+                pgid: pid,
+                ..e
+            })
+            .collect()
+    };
+    // A process whose first exec's record the kernel wrote as `argv` (the shell's `execve` of a
+    // script, the kernel's `#!` handling done), then its re-exec of `then` (`/bin/sh`'s stub).
+    let record = |pid: i32, names: &[&str], argv: &[&str]| -> Vec<Exec> {
+        let [first, rest @ ..] = names else {
+            return Vec::new();
+        };
+        [
+            kernel(of(pid, &[first], &[]), argv[0], argv),
+            of(pid, rest, &[]),
+        ]
+        .concat()
+    };
+    let read = |line: &str, execs: Vec<Exec>| {
+        let heard = Heard::of(&ran, execs, Some("/w"), Some("/usr/bin:/bin"));
+        crate::session_status::command_reading(line, &heard).map(|r| (r.text, r.own))
+    };
+    let rows: [ExecRow; 13] = [
+        (
+            "./d/qzfail.sh && ./d/QZP7S40.sh",
+            [of(11, &["sh"], &["./d/qzfail.sh"]), of(11, &["bash"], &[])].concat(),
+            Some(("sh", false)),
+        ),
+        (
+            "sh -c 'sleep 1' && false && ./d/QZP7S30.sh",
+            [
+                of(11, &["sh"], &[]),
+                of(12, &["sleep"], &[]),
+                of(13, &["false"], &[]),
+            ]
+            .concat(),
+            Some(("sh", false)),
+        ),
+        (
+            "perl ./d/QZP7S40.sh && ./d/QZP7S40.sh",
+            of(11, &["perl"], &["./d/QZP7S40.sh"]),
+            Some(("perl", false)),
+        ),
+        (
+            "./d/qzfail.sh && ./d/QZP7S40.sh",
+            [
+                of(11, &["sh"], &["./d/qzfail.sh"]),
+                of(12, &["sh"], &["./d/QZP7S40.sh"]),
+            ]
+            .concat(),
+            Some(("QZP7S40.sh", true)),
+        ),
+        (
+            "./d/QZP7S40.sh",
+            [
+                of(12, &["sh"], &["/w/d/QZP7S40.sh"]),
+                of(12, &["bash"], &[]),
+            ]
+            .concat(),
+            Some(("QZP7S40.sh", true)),
+        ),
+        (
+            "./d/QZP7S40.sh",
+            [of(12, &["sh"], &[]), of(12, &["bash"], &["./d/QZP7S40.sh"])].concat(),
+            Some(("QZP7S40.sh", true)),
+        ),
+        (
+            "./d/QZP7S40.sh",
+            [of(11, &["sh"], &["./d/qzfail.sh"]), of(12, &["bash"], &[])].concat(),
+            Some(("sh", false)),
+        ),
+        (
+            "./d/qzlint.sh ./d/QZP7S50.sh && ./d/QZP7S50.sh",
+            record(
+                11,
+                &["sh", "bash"],
+                &["/bin/sh", "./d/qzlint.sh", "./d/QZP7S50.sh"],
+            ),
+            Some(("sh", false)),
+        ),
+        (
+            "sh -n ./d/QZP7S51.sh && ./d/QZP7S51.sh",
+            record(11, &["sh", "bash"], &["sh", "-n", "./d/QZP7S51.sh"]),
+            Some(("sh", false)),
+        ),
+        (
+            "./d/qzlint.sh ./d/QZP7S52.sh && ./d/QZP7S52.sh",
+            record(
+                11,
+                &["sh", "bash"],
+                &["/bin/sh", "./d/qzlint.sh", "./d/QZP7S52.sh"],
+            ),
+            Some(("sh", false)),
+        ),
+        (
+            "./d/QZP7S52.sh",
+            record(12, &["sh", "bash"], &["/bin/sh", "-e", "./d/QZP7S52.sh"]),
+            Some(("QZP7S52.sh", true)),
+        ),
+        (
+            "./d/qzpy",
+            record(
+                12,
+                &["env", "python3"],
+                &["/usr/bin/env", "-S", "python3", "-u", "./d/qzpy"],
+            ),
+            Some(("qzpy", true)),
+        ),
+        (
+            "./d/qzpy",
+            [
+                of(12, &["env"], &[]),
+                kernel(
+                    of(12, &["python3"], &[]),
+                    "/usr/bin/python3",
+                    &["python3", "-u", "./d/qzpy"],
+                ),
+            ]
+            .concat(),
+            Some(("qzpy", true)),
+        ),
+    ];
+    let wrong: Vec<String> = rows
+        .into_iter()
+        .filter_map(|(line, execs, want)| {
+            let got = read(line, execs);
             let want = want.map(|(d, own)| (d.to_owned(), own));
             (got != want).then(|| format!("{line:?}: {got:?}, want {want:?}"))
         })
@@ -4775,6 +5038,9 @@ fn a_prompt_hooks_program_never_stands_in() {
     use crate::command_ran::{During, Heard, ran_of};
     let ran = gate_ran();
     let at = |name: &str, during: During| placed(ran_of(&[name]), during);
+    let handed_at = |name: &str, during: During| {
+        crate::command_ran::handed_scripts(at(name, during), &["./run.sh"])
+    };
     let read = |line: &str, execs| read_gated(&ran, line, execs);
     let own = During::Job(Some(Heard::BLOCK));
     assert_eq!(
@@ -4783,9 +5049,9 @@ fn a_prompt_hooks_program_never_stands_in() {
         "the job's perl stands in, never as the script's own name"
     );
     assert_eq!(
-        read("./run.sh --token QZP7S7", at("python3", own)),
+        read("./run.sh --token QZP7S7", handed_at("python3", own)),
         Some(("run.sh".into(), true)),
-        "its own interpreter heard: its own name"
+        "its own interpreter heard, handed it: its own name"
     );
     assert_eq!(
         read("./QZP7S8.sh", at("perl", own)),
@@ -4816,7 +5082,10 @@ fn a_prompt_hooks_program_never_stands_in() {
         );
     }
     assert_eq!(
-        read("./run.sh", at("python3", During::Shell(Some(Heard::BLOCK)))),
+        read(
+            "./run.sh",
+            handed_at("python3", During::Shell(Some(Heard::BLOCK)))
+        ),
         Some(("run.sh".into(), true)),
         "the shell's own group in the block confirms its own file"
     );
@@ -4845,23 +5114,28 @@ fn every_gate3_line_reads_its_own_name_its_jobs_program_or_none() {
     let ran = gate_ran();
     let hook = During::Job(None);
     let pwsh = |names: &[&str], at: u64| placed(ran_of(names), During::Shell(Some(at)));
+    // The shell expands `~/` and `$HOME/` before its `execve`, so the kernel hands the
+    // interpreter the home's path.
+    let home_sh = |names: &[&str]| {
+        crate::command_ran::handed_scripts(ran_of(names), &[&format!("{GATE_HOME}/x.sh")])
+    };
     let rows: Vec<ShellRow> = vec![
         ("qzl", ran_of(&["ls"]), true, Some(("ls", false))),
         ("qzf", ran_of(&["sleep"]), true, Some(("sleep", false))),
         ("qza", ran_of(&["true"]), true, Some(("true", false))),
         ("qza", Vec::new(), true, None),
-        ("~/x.sh", ran_of(&["sh"]), true, Some(("x.sh", true))),
-        ("$HOME/x.sh", ran_of(&["sh"]), true, Some(("x.sh", true))),
+        ("~/x.sh", home_sh(&["sh"]), true, Some(("x.sh", true))),
+        ("$HOME/x.sh", home_sh(&["sh"]), true, Some(("x.sh", true))),
         (
             "${HOME}/x.sh",
-            ran_of(&["bash"]),
+            home_sh(&["bash"]),
             true,
             Some(("x.sh", true)),
         ),
         ("$QZP9VAR/x.sh", ran_of(&["sh"]), true, Some(("sh", false))),
         (
             "./x.sh",
-            pwsh(&["sh"], Heard::BLOCK),
+            crate::command_ran::handed_scripts(pwsh(&["sh"], Heard::BLOCK), &["/w/x.sh"]),
             false,
             Some(("x.sh", true)),
         ),

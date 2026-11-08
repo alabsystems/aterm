@@ -830,6 +830,12 @@ pub enum BandIcon {
     House,
     /// `◆` — a diamond filled to the ring's box: the model a fact menu shows.
     Diamond,
+    /// `⎇` — a line that steps up and runs on beside its foot's own, in the ring's box: the
+    /// branch line D shows.
+    Fork,
+    /// `⎆` — an arrow entering a diamond outline, in the ring's box: the account line D's
+    /// fallback unit and the Accounts card's items show.
+    Enter,
     /// A padlock, the need pictogram ([`Self::is_pictogram`]) for a tab that waits for you: a password, an approval, an answer.
     Lock,
     /// An hourglass, its sand run down, the need pictogram for a stuck job.
@@ -840,7 +846,7 @@ pub enum BandIcon {
 
 impl BandIcon {
     /// Every icon, in its index order ([`Self::index`]).
-    pub const ALL: [BandIcon; 26] = [
+    pub const ALL: [BandIcon; 28] = [
         Self::Info,
         Self::Success,
         Self::Warn,
@@ -864,6 +870,8 @@ impl BandIcon {
         Self::InsetDiamond,
         Self::House,
         Self::Diamond,
+        Self::Fork,
+        Self::Enter,
         Self::Lock,
         Self::Hourglass,
         Self::Drive,
@@ -884,6 +892,8 @@ impl BandIcon {
             '\u{25c8}' => Self::InsetDiamond,
             '\u{2302}' => Self::House,
             '\u{25c6}' => Self::Diamond,
+            '\u{2387}' => Self::Fork,
+            '\u{2386}' => Self::Enter,
             _ => return None,
         })
     }
@@ -952,6 +962,8 @@ impl BandIcon {
             Self::InsetDiamond => '\u{25c8}',
             Self::House => '\u{2302}',
             Self::Diamond => '\u{25c6}',
+            Self::Fork => '\u{2387}',
+            Self::Enter => '\u{2386}',
             Self::Lock => '\u{26bf}',
             Self::Hourglass => '\u{29d6}',
             Self::Drive => '\u{1f5b4}',
@@ -1268,6 +1280,8 @@ pub struct RenderInput {
     pub default_bg_spans: Vec<Vec<DefaultBgSpan>>,
     /// Host chrome rows drawn at pixel resolution ([`ChromeRaster`]), at most one per row, in any order.
     pub chrome_rasters: Vec<ChromeRaster>,
+    /// The emptied icon lists of retired chrome rasters ([`Self::retire_chrome_rasters`]), kept for the host's next ones ([`Self::chrome_icon_list`]) so a refilled frame's icons allocate nothing. Scratch storage, not frame content: no renderer reads it, equality ignores it, a clone starts with none and `clone_from` keeps the destination's own.
+    pub chrome_icon_spares: Vec<Vec<ChromeIcon>>,
     /// Per-row, sparse inline-image placements (`term.images_row(r)`): `(col, ImageRef)` for every covered cell.
     pub images: Vec<Vec<(usize, aterm_grid::ImageRef)>>,
     /// Wallpaper base layer: a host-prepared RGBA8 image, pre-scaled to the frame (cover-fit) and pre-dimmed; the renderer only blits.
@@ -1452,7 +1466,9 @@ pub enum FrameRefill {
 }
 
 impl Clone for RenderInput {
-    /// A deep copy of every field, `snapshot_seq` included.
+    /// A deep copy of every field, `snapshot_seq` and the other metadata included, but
+    /// [`Self::chrome_icon_spares`]: the new value starts with none, because those lists are
+    /// destination-local scratch.
     #[inline]
     fn clone(&self) -> Self {
         let mut out = Self::empty();
@@ -1460,7 +1476,9 @@ impl Clone for RenderInput {
         out
     }
 
-    /// Capacity-reusing in-place update, identical to `*self = source.clone()`.
+    /// Capacity-reusing in-place update: afterwards every field, metadata included, holds what
+    /// `*self = source.clone()` would leave in it, but [`Self::chrome_icon_spares`], which keeps
+    /// the destination's own lists.
     #[inline]
     fn clone_from(&mut self, source: &Self) {
         self.copy_from(source, true);
@@ -1705,6 +1723,42 @@ impl RenderInput {
         self.chrome_rasters.iter().find(|m| usize::from(m.row) == r)
     }
 
+    /// Retire every chrome raster, keeping each one's icon list, emptied, for [`Self::chrome_icon_list`]: at most [`Self::rows`] lists in all (a frame holds at most one raster per row; past that bound the oldest spares are dropped first), stacked so they are handed back in their rasters' order, so a host that lays the same icons in the same order again (the band's badges through `aterm_render::band::compose_band`, then the marks) gets each raster's own list back, allocates nothing, and the spares stay bounded.
+    #[inline]
+    pub fn retire_chrome_rasters(&mut self) {
+        let keep = self.rows;
+        let current = self
+            .chrome_rasters
+            .iter()
+            .filter(|raster| raster.icons.capacity() > 0)
+            .count()
+            .min(keep);
+        let old_keep = keep - current;
+        if self.chrome_icon_spares.len() > old_keep {
+            let discard = self.chrome_icon_spares.len() - old_keep;
+            drop(self.chrome_icon_spares.drain(..discard));
+        }
+        let current_at = self.chrome_icon_spares.len();
+        for raster in self.chrome_rasters.drain(..) {
+            let mut icons = raster.icons;
+            if icons.capacity() > 0 && self.chrome_icon_spares.len() < keep {
+                icons.clear();
+                self.chrome_icon_spares.push(icons);
+            }
+        }
+        // `chrome_icon_list` pops: reverse only the just-retired lists so the next frame's first
+        // taker gets the first retired raster's list, its second the second's, and so on. Older
+        // unused spares stay underneath.
+        self.chrome_icon_spares[current_at..].reverse();
+    }
+
+    /// An empty icon list for a new chrome raster: one [`Self::retire_chrome_rasters`] kept (the last retirement's in its rasters' order, then older ones), else a new one.
+    #[must_use]
+    #[inline]
+    pub fn chrome_icon_list(&mut self) -> Vec<ChromeIcon> {
+        self.chrome_icon_spares.pop().unwrap_or_default()
+    }
+
     /// Update a damage-cache snapshot, dropping the four large cursor-effect payloads whose producer supplied compact metadata.
     #[inline]
     pub fn clone_damage_cache_from(&mut self, source: &Self) {
@@ -1886,6 +1940,7 @@ impl RenderInput {
             implicit_blank: RenderCell::default(),
             cursor_color: COLOR_UNSET,
             chrome_rasters: Vec::new(),
+            chrome_icon_spares: Vec::new(),
             snapshot_seq: 0,
             content_seq: 0,
             drawn_at: None,

@@ -158,6 +158,8 @@ impl MenuRow {
 /// `text` as a screen reader is told it: its words, the glyphs that mark or
 /// draw (`◆`, `⎇`, `▱▱▱`, an arrow) left out, and a `·` or `—` between two
 /// parts a comma: `⎆  sol@example.test · max 20x` is `sol@example.test, max 20x`.
+/// A lower bound's `≥` is a word, said `at least`: `weekly ≥38% used` is
+/// `weekly at least 38% used`, never the bound as an exact figure.
 #[must_use]
 pub(crate) fn spoken_words(text: &str) -> String {
     let glyph = |c: char| !c.is_ascii() && !c.is_alphanumeric();
@@ -176,6 +178,12 @@ pub(crate) fn spoken_words(text: &str) -> String {
             out.push_str(if part { ", " } else { " " });
         }
         part = false;
+        if token
+            .trim_start_matches(|c| glyph(c) && c != '\u{2265}')
+            .starts_with('\u{2265}')
+        {
+            out.push_str("at least ");
+        }
         out.push_str(word);
     }
     out

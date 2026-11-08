@@ -693,8 +693,8 @@ impl CommandLineTools {
         Self::wait_on_window(
             sys,
             &format!(
-                "Apple's installer window, already open, did not install them within {} minutes: \
-                 press Install in it, or quit it, then run `aterm init --only base.clt`",
+                "Apple's installer window, already open, did not install the Command Line Tools \
+                 within {} minutes",
                 INSTALLER_PATIENCE.as_secs() / 60
             ),
         )
@@ -732,9 +732,7 @@ impl CommandLineTools {
                 }
                 return Err(Failure::new(
                     Unfinished::WindowClosed,
-                    "Apple's installer window closed without installing the Command Line Tools: \
-                     press Install\u{2026} on System State, or run `aterm init --only base.clt`, \
-                     to try again"
+                    "Apple's installer window closed without installing the Command Line Tools"
                         .to_owned(),
                 ));
             }

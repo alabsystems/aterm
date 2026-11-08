@@ -166,7 +166,7 @@ fn a_click_on_the_branch_greys_it_off_and_a_click_on_off_brings_it_back() {
     let o = |app: &App| of(app, 'o');
     let value =
         app.windows[&wid].input_scratch.cells[row][fact_hit(&app, wid, Fact::Path).cols.1 - 1];
-    assert!(value.bold, "CONTROL: a value is bold");
+    assert!(!value.bold, "a value is terminal text, regular");
     assert_ne!(value.fg, rule_cell.fg, "CONTROL: and lifted from the gray");
     let lit = o(&app);
     assert_eq!(
@@ -181,7 +181,7 @@ fn a_click_on_the_branch_greys_it_off_and_a_click_on_off_brings_it_back() {
     let quiet = quiet_ink(&app, wid);
     assert_ne!(quiet, value.fg, "CONTROL: the quiet ink is not the value's");
     assert_eq!(rest.fg, quiet, "the stub is in the glass's quiet ink");
-    assert!(!rest.bold, "and thin, as main draws a dark ground's stub");
+    assert!(!rest.bold, "and regular, as every word on line D");
     assert_eq!(rest.underline, UnderlineStyle::None);
     let name = of(&app, 'm');
     assert_eq!(
@@ -266,8 +266,8 @@ fn a_click_on_the_context_greys_it_off_and_a_click_on_its_stub_brings_it_back() 
     frame(&mut app, wid);
     let words = ink(&app, &shown, 'x');
     assert!(
-        words.bold && words.fg != rule_cell.fg,
-        "CONTROL: the shown context is a value: {words:?}"
+        !words.bold && words.fg != rule_cell.fg,
+        "CONTROL: the shown context is a value, regular and lifted from the gray: {words:?}"
     );
 
     click_fact(&mut app, wid, Fact::Context);
@@ -285,7 +285,7 @@ fn a_click_on_the_context_greys_it_off_and_a_click_on_its_stub_brings_it_back() 
         assert_eq!(
             (cell.fg, cell.bold),
             (quiet_ink(&app, wid), false),
-            "{ch:?}: greyed in the glass's quiet ink, thin on the dark ground"
+            "{ch:?}: greyed in the glass's quiet ink, regular"
         );
     }
 
@@ -510,30 +510,123 @@ fn hovering_any_part_of_the_account_lights_the_whole_unit() {
             lit.iter().zip(&rest).any(|(l, r)| l.2 != r.2),
             "{col}: NEGATIVE CONTROL: the hover changed some ink"
         );
-        // The underline lies under the ink, so an end glyph nudged off its cell's middle may
-        // stand past it; every glyph between, the joins among them, is under it where its ink
-        // is drawn (its cell moved by its nudge: small type runs ahead of the cells).
-        let under_ink = |c: usize| {
-            let cells = &app.windows[&wid].input_scratch.cells[row];
-            let n = isize::from(aterm_agent::harness::footer::NUDGES_PER_CELL);
-            let nudge = match cells[c].script {
-                aterm_core::terminal::Script::Sub { nudge } => isize::from(nudge),
-                _ => 0,
-            };
-            let drawn = (c as isize * n + nudge + n / 2).div_euclid(n);
-            usize::try_from(drawn)
-                .ok()
-                .and_then(|d| cells.get(d))
-                .is_some_and(|cell| cell.underline == UnderlineStyle::Single)
-        };
+        // The underline lies under the ink: every glyph of the unit, from its mark to the
+        // verdict's last word, stands in its own cell, and each is underlined.
         assert!(
-            lit[1..lit.len() - 1].iter().all(|g| under_ink(g.0)),
+            lit.iter().all(|g| g.3),
             "{col}: the whole unit is underlined: {lit:?}"
         );
         assert_eq!(
             glyph_cells(&app, Fact::Model),
             model_rest,
             "{col}: no other fact"
+        );
+    }
+}
+
+/// THE ACCOUNT LIGHTS WHOLE BESIDE A WALL: the wall (`⧗ until 3pm`) and the fallback unit
+/// (`⎆ main …`) are two spans of one fact, the account, which the pointer and the keyboard light
+/// as one target and a click opens as one. With the pointer on the unit, the unit lifts and both
+/// spans are underlined; on the wall, the same. NEGATIVE CONTROL (run once, restored): lighting
+/// only the first span of the lit fact (`find` in `compose_rule_spans`) underlines the wall and
+/// leaves the hovered unit at rest, and fails.
+#[test]
+fn hovering_the_account_beside_a_wall_lights_both_its_spans() {
+    use aterm_agent::harness::session_usage::{ModelTokens, More, UsageFacts, Wall};
+    let (mut app, wid, session, _reader) = wider_app();
+    {
+        let entry = app.pool.get(session).expect("session");
+        let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        timeline.note_foreground_group(PGID);
+        assert!(timeline.set_claude_footer(
+            PGID,
+            None,
+            Some(aterm_agent::harness::footer::FooterFacts {
+                model: Some("Opus 5.5".into()),
+                effort: Some("xhigh".into()),
+                path: Some("~/aterm".into()),
+                account: Some("main".into()),
+                subscription: Some(aterm_agent::harness::profile::SubscriptionDisplay {
+                    plan: Some("Max 20x".into()),
+                    weekly: Some("weekly 63% used".into()),
+                    ..Default::default()
+                }),
+                quota: Some(aterm_agent::harness::quota_view::QuotaView::sample()),
+                usage: UsageFacts::of(
+                    (
+                        vec![ModelTokens {
+                            label: "opus".into(),
+                            input: 48_000_000,
+                            output: 310_000,
+                        }],
+                        More::default(),
+                    ),
+                    Some(Wall {
+                        label: "5h",
+                        resets: "3pm".into(),
+                    }),
+                    None,
+                ),
+                ..Default::default()
+            }),
+        ));
+    }
+    draw_claude(&app, session, BYPASS);
+    frame(&mut app, wid);
+    let row = footer_row(&app, wid);
+    let mut spans: Vec<FactHit> = app.windows[&wid]
+        .claude_lights
+        .fact_hits
+        .iter()
+        .filter(|h| h.fact == Fact::Account)
+        .copied()
+        .collect();
+    spans.sort_by_key(|h| h.cols.0);
+    let [wall, unit] = spans[..] else {
+        panic!("the wall and the unit, two spans of the account: {spans:?}");
+    };
+    assert_eq!(glyphs(&app, wid, &wall), "\u{29D7}until3pm");
+    assert!(
+        glyphs(&app, wid, &unit).starts_with("\u{2386}main63%"),
+        "{}",
+        glyphs(&app, wid, &unit)
+    );
+    // Each glyph of `hit`: its char, its ink, and whether it is underlined.
+    let read = |app: &App, hit: &FactHit| -> Vec<(char, [u8; 3], bool)> {
+        let cells = &app.windows[&wid].input_scratch.cells[row];
+        (hit.cols.0..hit.cols.1)
+            .filter(|&c| cells[c].ch != ' ')
+            .map(|c| {
+                (
+                    cells[c].ch,
+                    cells[c].fg,
+                    cells[c].underline == UnderlineStyle::Single,
+                )
+            })
+            .collect()
+    };
+    let (wall_rest, unit_rest) = (read(&app, &wall), read(&app, &unit));
+    assert!(
+        wall_rest.iter().chain(&unit_rest).all(|g| !g.2),
+        "CONTROL: nothing lit at rest"
+    );
+    for (hovered, name) in [(unit, "the unit"), (wall, "the wall")] {
+        let (x, y) = px_of(&app, wid, (hovered.frame_row, hovered.cols.0));
+        app.on_cursor_moved(wid, x, y);
+        frame(&mut app, wid);
+        assert_eq!(
+            app.windows[&wid].claude_lights.hover,
+            Some((session, Target::Fact(Fact::Account))),
+            "{name}"
+        );
+        let (wall_lit, unit_lit) = (read(&app, &wall), read(&app, &unit));
+        assert!(
+            wall_lit.iter().chain(&unit_lit).all(|g| g.2),
+            "{name}: both spans of the account are underlined: {wall_lit:?} {unit_lit:?}"
+        );
+        assert!(
+            unit_lit.iter().zip(&unit_rest).any(|(l, r)| l.1 != r.1),
+            "{name}: the unit lifts: {unit_lit:?}"
         );
     }
 }

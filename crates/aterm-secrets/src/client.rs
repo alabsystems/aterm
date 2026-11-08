@@ -210,7 +210,7 @@ pub use subscriber::mend_subscriber;
 pub(crate) use vault_memo::observe_commons_now;
 pub use vault_memo::{
     DeskInputs, acknowledged_commons_log_now, desk_inputs, local_swarm_roster_for_log_now,
-    swarm_denied_nodes_now, swarm_roster_now_until,
+    swarm_denied_nodes_now, swarm_roster_now_until, trusted_commons_log_now,
 };
 #[cfg(test)]
 mod approver_queue_tests;

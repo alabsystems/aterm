@@ -173,7 +173,10 @@ fn shell_command(shell: &str) -> ShellCommand {
     for key in aterm_spec::host::SHELL_START_POINTERS {
         cmd.env_remove(key);
     }
-    cmd.env("ZDOTDIR", home)
+    // The shell starts in its home, not the test's checkout: the prompt's path and git segments
+    // read the directory a shell starts in.
+    cmd.current_dir(home)
+        .env("ZDOTDIR", home)
         .env("XDG_DATA_DIRS", hermetic_data(home));
     ShellCommand { cmd, home: dir }
 }
@@ -2911,8 +2914,10 @@ impl LiveShell {
     }
 
     /// What every live shell starts with ([`Self::spawn`], [`Self::spawn_on_pty`]): nothing
-    /// of this process, the default SIGINT and SIGQUIT, and a fish's completions made
-    /// ([`mark_fish_completions_made`]). Its argv goes to the test's captured output, which a
+    /// of this process, the default SIGINT and SIGQUIT, a fish's completions made
+    /// ([`mark_fish_completions_made`]), and, where its caller named no directory, the `HOME`
+    /// it was handed as the directory it starts in, so the prompt's path and git segments read
+    /// that home, not the test's checkout. Its argv goes to the test's captured output, which a
     /// failure prints, so a test that runs more than one bash says which one failed.
     fn defaults(cmd: &mut Command) {
         use aterm_uds::spawnfd::InheritNothing as _;
@@ -2923,6 +2928,16 @@ impl LiveShell {
                 .chain(cmd.get_args())
                 .collect::<Vec<_>>()
         );
+        let home = cmd
+            .get_envs()
+            .find_map(|(key, value)| (key == "HOME").then_some(value).flatten())
+            .map(std::path::PathBuf::from)
+            .filter(|home| home.is_dir());
+        if cmd.get_current_dir().is_none()
+            && let Some(home) = home
+        {
+            cmd.current_dir(home);
+        }
         cmd.inherit_nothing();
         // SAFETY: between fork and exec, `signal` alone, which is
         // async-signal-safe: no allocation, no lock.

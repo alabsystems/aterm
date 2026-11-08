@@ -255,9 +255,21 @@ pub fn version_text(commit: &str, host: &str) -> String {
 
 /// A toolchain the client's content checker admits when its `-vV` probe answers
 /// [`version_text`]: native-object `bin/trustc` and `bin/targo` (headers only) and one
-/// `lib/librustc_driver-*.so`. Returns `<root>/bin`.
+/// `lib/librustc_driver-*.so`. On a GNU host a store build is complete only when its runtime
+/// admission reads each ELF as one of this machine's whose header declares its own size, so the
+/// headers are this machine's and say so. Returns `<root>/bin`.
 pub fn toolchain(root: &Path) -> PathBuf {
-    let head = elf(EM_X86_64, 2, 1);
+    let mut head = elf(
+        if cfg!(target_arch = "aarch64") {
+            EM_AARCH64
+        } else {
+            EM_X86_64
+        },
+        2,
+        1,
+    );
+    // e_ehsize: an ELF64 header is 64 bytes.
+    head[52..54].copy_from_slice(&64u16.to_le_bytes());
     let mut trustc = head.clone();
     trustc.extend(b"fixture trustc");
     put_exe(&root.join("bin/trustc"), &trustc);

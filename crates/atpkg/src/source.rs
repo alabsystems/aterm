@@ -24,6 +24,7 @@ pub(crate) fn github_fetcher(
         .with_overrides(crate::repo_overrides(cfg))
         .with_index_floor(floor)
         .with_index_hint(hint)
+        .with_artifact_layout(layout)
         .with_unit_peers(crate::peers::unit_peers(cfg.peers.as_deref()))
 }
 

@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use aterm_agent::harness::footer::{FactKind, FactMask};
+use aterm_agent::harness::outlook::Figure;
 use aterm_agent::harness::profile::{WEEKLY_OUT, WeeklyFigure, WeeklyGap};
 use aterm_agent::harness::session_usage::{TrafficView, runtime_short, tokens_short};
 
@@ -115,37 +116,49 @@ impl FactAct {
 pub(crate) struct AccountMenuRow {
     /// The canonical identity, independent of the formatted label and row order.
     pub(crate) account: AccountLabel,
-    /// The row's label on the card (`m27 · preferred · 61% left`; a wall's `out (limited)`).
+    /// The row's label on the card: its week used (`m27 · preferred · 39% used`, an older
+    /// reading's lower bound `≥39% used`; a wall's `out (limited)`), never what is left.
     pub(crate) label: String,
+    /// What a screen reader is told of it (`m27, preferred, at least 39 percent used`).
+    pub(crate) spoken: String,
     /// Whether this account is currently active (`●` at the right edge).
     pub(crate) active: bool,
     /// Whether clicking this row can switch to or enrol this account.
     pub(crate) enabled: bool,
 }
 
-/// The whole percent left of the share weekly words say used (`weekly 27% used`: 73; a bound,
-/// `weekly ≥27% used`, gives the most that can be left: 73), as [`whole_left`] says it; `None`
-/// for words with no figure (a wall's `weekly out`, a gap's).
-fn weekly_pct(text: &str) -> Option<u32> {
-    let used = aterm_agent::harness::profile::weekly_figure_words(text)?
-        .trim_start_matches('\u{2265}')
-        .strip_suffix('%')?;
-    let used = used
+/// The figure weekly words say, as they say it: `weekly 39% used` exact, the bound `weekly ≥38%
+/// used` a lower bound, a wall's `weekly out` out; `None` for words with no figure (a gap's).
+fn said_figure(text: &str) -> Option<Figure> {
+    let words = aterm_agent::harness::profile::weekly_figure_words(text)?;
+    if words == "out" {
+        return Some(Figure::Out);
+    }
+    let (bound, share) = match words.strip_prefix('\u{2265}') {
+        Some(share) => (true, share),
+        None => (false, words),
+    };
+    let share = share.strip_suffix('%')?;
+    let used = share
         .bytes()
         .all(|b| b.is_ascii_digit())
-        .then(|| used.parse::<u32>().ok())
+        .then(|| share.parse::<u16>().ok())
         .flatten()?;
-    Some(whole_left(1000u32.saturating_sub(used.min(100) * 10)))
+    let x10 = used.min(100) * 10;
+    Some(if bound {
+        Figure::AtLeast(x10)
+    } else {
+        Figure::Exact(x10)
+    })
 }
 
-/// The whole percent left of `left_x10` tenths, the footer's tenths cut, but never to the `0`
-/// an account row reads as limited while a tenth is left (`0.5% left`: 1).
-fn whole_left(left_x10: u32) -> u32 {
-    if left_x10 == 0 {
-        0
-    } else {
-        (left_x10 / 10).max(1)
-    }
+/// Whether `figure` says the week is spent: a wall, or a reading of 100% (now or before), which
+/// an account row says as limited.
+fn spent(figure: Figure) -> bool {
+    matches!(
+        figure,
+        Figure::Out | Figure::Exact(1000..) | Figure::AtLeast(1000..)
+    )
 }
 
 /// The account menu's full why under the footer's short word for a weekly figure it has not
@@ -244,25 +257,17 @@ pub(crate) fn weekly_gap_why(gap: WeeklyGap) -> &'static [&'static str] {
     }
 }
 
-/// An account row's week on the Account menu ([`account_menu_rows_from`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum RowWeek {
-    /// Its whole percent left and, once past [`WeeklyFigure::current`], its age (` · 40m ago`).
-    Left(u32, String),
-    /// A standing wall: `out (limited)`, never a percentage (never an inferred 100% used).
-    Out,
-}
-
 /// What the account menu takes from a footer's subscription `sub` at `now` (`walled`: a 7d wall
 /// in its transcript): the session's own row week (as [`row_figure`] gives it), the footer's
 /// weekly words, and the footer's gap where there is neither. A figure whose week has reset or whose
-/// observation clock is not admitted gives no row or meter; a screen's words, with no figure
-/// behind them, give their own percent, and a wall's ([`WEEKLY_OUT`]) [`RowWeek::Out`].
+/// observation clock is not admitted gives no row figure and no words; a screen's words, with no
+/// figure behind them, give the figure they say ([`said_figure`]), a wall's ([`WEEKLY_OUT`])
+/// [`Figure::Out`].
 pub(crate) fn weekly_facts(
     sub: &aterm_agent::harness::profile::SubscriptionDisplay,
     walled: bool,
     now: i64,
-) -> (Option<RowWeek>, Option<String>, Option<WeeklyGap>) {
+) -> (Option<Figure>, Option<String>, Option<WeeklyGap>) {
     let held = session_figure(sub, now);
     let expired = held.is_none() && sub.weekly.is_some() && sub.weekly_figure.is_some();
     let weekly = sub
@@ -273,9 +278,8 @@ pub(crate) fn weekly_facts(
     match weekly {
         Some(weekly) => {
             let row = match held {
-                Some(figure) => Some(row_figure(figure, now)),
-                None if weekly == WEEKLY_OUT => Some(RowWeek::Out),
-                None => weekly_pct(&weekly).map(|pct| RowWeek::Left(pct, String::new())),
+                Some(figure) => row_figure(figure, now),
+                None => said_figure(&weekly),
             };
             (row, Some(weekly), None)
         }
@@ -298,22 +302,11 @@ pub(crate) fn session_figure(
     })
 }
 
-/// An account row's whole percent left and, once the figure is past [`WeeklyFigure::current`],
-/// its age (` · 40m ago`, ` · 3h ago`, ` · 2d ago`). Its caller admits observation time first.
-fn row_figure(figure: WeeklyFigure, now: i64) -> RowWeek {
-    let left = whole_left(1000u32.saturating_sub(figure.used_x10.min(1000)));
-    let age = now.saturating_sub(figure.at);
-    if figure.current(now) || age <= 0 {
-        return RowWeek::Left(left, String::new());
-    }
-    let (n, unit) = if age < 3600 {
-        (age / 60, 'm')
-    } else if age < 2 * 86_400 {
-        (age / 3600, 'h')
-    } else {
-        (age / 86_400, 'd')
-    };
-    RowWeek::Left(left, format!(" \u{b7} {n}{unit} ago"))
+/// An account row's week of a reading at `now` ([`Figure::of_weekly`]): exact while current, a
+/// lower bound after (`≥39%`, never an age), none once its window reset. Its caller admits
+/// observation time first.
+fn row_figure(figure: WeeklyFigure, now: i64) -> Option<Figure> {
+    Some(Figure::of_weekly(&figure, now)).filter(|figure| *figure != Figure::Unread)
 }
 
 /// Inputs used to build a fact menu.
@@ -573,7 +566,7 @@ fn outlook_rows(
                 fact,
                 acct,
                 acct.label.clone(),
-                acct.label.clone(),
+                acct.spoken.clone(),
             ));
         }
     }
@@ -973,7 +966,7 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                             fact,
                             acct,
                             acct.label.clone(),
-                            acct.label.clone(),
+                            acct.spoken.clone(),
                         ));
                     }
                 }
@@ -1341,9 +1334,9 @@ pub(crate) struct SessionWeek {
     /// The figure behind the footer's words while its week runs ([`session_figure`]), which the
     /// row takes over the store's where it was read later.
     pub(crate) figure: Option<WeeklyFigure>,
-    /// The row's week from the footer's words ([`weekly_facts`]), where the store holds
+    /// The row's week as the footer's words say it ([`weekly_facts`]), where the store holds
     /// nothing of the account.
-    pub(crate) left: Option<RowWeek>,
+    pub(crate) said: Option<Figure>,
 }
 
 /// The Account menu's rows of `roster`, each with its condition and quota and whether it can be
@@ -1409,16 +1402,16 @@ pub(crate) fn account_menu_rows_from(
                 && session_label == Some(row.label.as_str())
                 && barrier.is_none_or(|window| window.admits_reading(figure.at))
         });
-        let left_admitted = session_admitted
+        let said_admitted = session_admitted
             && match session.figure {
                 Some(_) => own.is_some(),
                 None => {
                     barrier.is_none_or(|window| window.epoch_at.is_none())
-                        || matches!(session.left, Some(RowWeek::Out | RowWeek::Left(0, _)))
+                        || session.said.is_some_and(spent)
                 }
             };
-        let pct_left = if matches!(cond, accounts::Condition::Limited { .. }) {
-            Some(RowWeek::Out)
+        let week = if matches!(cond, accounts::Condition::Limited { .. }) {
+            Some(Figure::Out)
         } else {
             state
                 .accounts
@@ -1426,29 +1419,32 @@ pub(crate) fn account_menu_rows_from(
                 .and_then(|acct| {
                     let [tapped, sampled] = crate::claude_footer::store_figures(acct, now);
                     WeeklyFigure::newer(WeeklyFigure::newer(tapped, sampled), own)
-                        .map(|figure| row_figure(figure, now))
+                        .and_then(|figure| row_figure(figure, now))
                         .or_else(|| {
-                            acct.warned_week
-                                .as_ref()
-                                .filter(|warning| {
-                                    aterm_agent::harness::profile::usage_read_age(warning.at, now)
-                                        .is_some()
-                                        && barrier
-                                            .is_none_or(|window| window.admits_reading(warning.at))
-                                })
-                                .and_then(|w| w.figure(accounts::WEEK_WINDOW_S, now))
-                                .map(|(pct, _)| {
-                                    RowWeek::Left(
-                                        100u32.saturating_sub(pct.min(100)),
-                                        String::new(),
-                                    )
-                                })
+                            let warning = acct.warned_week.as_ref().filter(|warning| {
+                                aterm_agent::harness::profile::usage_read_age(warning.at, now)
+                                    .is_some()
+                                    && barrier
+                                        .is_none_or(|window| window.admits_reading(warning.at))
+                            })?;
+                            // A warning's share used, as of when it was said: a reading.
+                            let (pct, resets_at) = warning.figure(accounts::WEEK_WINDOW_S, now)?;
+                            row_figure(
+                                WeeklyFigure {
+                                    used_x10: pct.min(100) * 10,
+                                    resets_at,
+                                    at: warning.at,
+                                },
+                                now,
+                            )
                         })
                 })
                 .or_else(|| {
-                    (left_admitted && session_label == Some(row.label.as_str()))
-                        .then(|| session.left.clone())
-                        .flatten()
+                    session.said.filter(|figure| {
+                        said_admitted
+                            && session_label == Some(row.label.as_str())
+                            && *figure != Figure::Unread
+                    })
                 })
         };
         let class_word = match row.class {
@@ -1456,23 +1452,40 @@ pub(crate) fn account_menu_rows_from(
             accounts::Class::Pool => "pool",
         };
         let has_email = auto_login && row.email.is_some();
-        // A wall is `out`, never a percentage; `0% left` only where a reading said 100% used.
-        let avail = match (cond, pct_left, has_email) {
-            (accounts::Condition::Limited { .. }, _, _) | (_, Some(RowWeek::Out), _) => {
-                "out (limited)".to_string()
+        // The week is said used, as the glass says it, never what is left
+        // (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1): a wall is `out`, never a
+        // percentage; `100%` only where a reading said 100.
+        let (avail, said): (String, String) = match (cond, week, has_email) {
+            (accounts::Condition::Limited { .. }, _, _) | (_, Some(Figure::Out), _) => {
+                ("out (limited)".into(), "out, limited".into())
             }
-            (_, Some(RowWeek::Left(0, age)), _) => format!("0% left{age} (limited)"),
-            (accounts::Condition::SignedOut, _, true) => "signed out (auto-login)".to_string(),
-            (accounts::Condition::SignedOut, _, false) => "signed out".to_string(),
-            (accounts::Condition::NotEnrolled, Some(RowWeek::Left(pct, age)), true) => {
-                format!("{pct}% left{age} (auto-login)")
+            (_, Some(figure), _) if spent(figure) => (
+                "100% used (limited)".into(),
+                "100 percent used, limited".into(),
+            ),
+            (accounts::Condition::SignedOut, _, true) => (
+                "signed out (auto-login)".into(),
+                "signed out, auto-login".into(),
+            ),
+            (accounts::Condition::SignedOut, _, false) => {
+                ("signed out".into(), "signed out".into())
             }
-            (accounts::Condition::NotEnrolled, _, false) => "not enrolled".to_string(),
-            (_, Some(RowWeek::Left(pct, age)), _) => format!("{pct}% left{age}"),
-            (accounts::Condition::NotEnrolled, None, true) => {
-                format!("{}; quota unknown (auto-login)", cond.as_str())
+            (accounts::Condition::NotEnrolled, Some(figure), true) => (
+                format!("{} used (auto-login)", figure.words()),
+                format!("{}, auto-login", figure.spoken()),
+            ),
+            (accounts::Condition::NotEnrolled, _, false) => {
+                ("not enrolled".into(), "not enrolled".into())
             }
-            (_, None, _) => format!("{}; quota unknown", cond.as_str()),
+            (_, Some(figure), _) => (format!("{} used", figure.words()), figure.spoken()),
+            (accounts::Condition::NotEnrolled, None, true) => (
+                format!("{}; quota unknown (auto-login)", cond.as_str()),
+                format!("{}, quota unknown, auto-login", cond.as_str()),
+            ),
+            (_, None, _) => (
+                format!("{}; quota unknown", cond.as_str()),
+                format!("{}, quota unknown", cond.as_str()),
+            ),
         };
         let enabled = !matches!(
             cond,
@@ -1481,6 +1494,7 @@ pub(crate) fn account_menu_rows_from(
         rows.push(AccountMenuRow {
             account,
             label: format!("{} \u{b7} {class_word} \u{b7} {avail}", row.label),
+            spoken: format!("{}, {class_word}, {said}", row.label),
             active: is_active,
             enabled,
         });

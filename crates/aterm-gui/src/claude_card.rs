@@ -45,8 +45,8 @@ const TRAIL_MIN: usize = 8;
 const TRAIL_MAX: usize = 20;
 const KITTY_MARGIN: usize = 4;
 const LINE_LEAD: usize = 2;
-/// Emphasized hero word in the card status line: the brand, as the top rule's label reads it
-/// (`alab claude harness v0.5`).
+/// Emphasized hero word in the card status line (`enhanced by alab claude harness v0.5`): the
+/// brand, which the top rule's label leads with too (`alab v0.5 (v2.1.305)`).
 pub(crate) const HERO_WORD: &str = "alab";
 const FLOW_TAG: u64 = 0xF10F_0000_0000_0000;
 const MOTION_TAG: u64 = 0xA417_0000_0000_0000;
@@ -815,6 +815,28 @@ pub(crate) struct WindowCards {
 }
 
 impl WindowCards {
+    /// A digest of the glass hits (`glass_hits`) the last frame composed, `0` when none are open.
+    pub(crate) fn glass_hits_digest(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        if self.glass_hits.is_empty() {
+            return 0;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.glass_hits.len().hash(&mut h);
+        for hit in &self.glass_hits {
+            (
+                hit.session,
+                hit.frame_row,
+                hit.term_row,
+                &hit.cols,
+                hit.url.is_some(),
+                hit.link,
+            )
+                .hash(&mut h);
+        }
+        h.finish() | 1
+    }
+
     /// Recorded card fx layers for test assertions.
     #[cfg(test)]
     pub(crate) fn painted_layers(&self) -> &[FxLayer] {
@@ -839,7 +861,10 @@ impl WindowCards {
     /// Draw each full-size, narrow cell of `cells` (written on frame row
     /// `frame_row` from column `col`) whose character is a glass mark
     /// ([`BandIcon::glass_mark`]) as the chrome's icon of it, the cell keeping
-    /// its character; a facts' `Script::Sub` mark keeps its glyph.
+    /// its character; a cell in small script (`Script::Sub`) keeps its glyph.
+    /// The footer's write passes every cell it lays on a rule, line D's facts
+    /// among them, so their `◆`, `⌂`, `◐`, `⎇` and `⎆` are drawn as the chips'
+    /// marks are, whole strokes in their own cells.
     pub(crate) fn paint_marks(
         &mut self,
         scratch: &mut RenderInput,
@@ -864,22 +889,30 @@ impl WindowCards {
 
     /// Record and draw `icon` on `row`'s chrome raster for [`strip`]. A row
     /// with no raster gets one whose ground and rail are the one shared empty
-    /// row, so it allocates only its icon list.
+    /// row and whose icon list is one the refill retired
+    /// ([`RenderInput::retire_chrome_rasters`]), so at rest it allocates nothing.
     pub(crate) fn paint_icon(&mut self, scratch: &mut RenderInput, row: u16, icon: ChromeIcon) {
-        let rasters = &mut scratch.chrome_rasters;
-        match rasters.iter_mut().find(|raster| raster.row == row) {
+        match scratch
+            .chrome_rasters
+            .iter_mut()
+            .find(|raster| raster.row == row)
+        {
             Some(raster) => raster.icons.push(icon),
-            None => rasters.push(ChromeRaster {
-                row,
-                ground: Arc::clone(&self.no_px),
-                rail: Arc::clone(&self.no_px),
-                rail_h: 0,
-                clear_rail: false,
-                own: Vec::new(),
-                split: None,
-                rings: Vec::new(),
-                icons: vec![icon],
-            }),
+            None => {
+                let mut icons = scratch.chrome_icon_list();
+                icons.push(icon);
+                scratch.chrome_rasters.push(ChromeRaster {
+                    row,
+                    ground: Arc::clone(&self.no_px),
+                    rail: Arc::clone(&self.no_px),
+                    rail_h: 0,
+                    clear_rail: false,
+                    own: Vec::new(),
+                    split: None,
+                    rings: Vec::new(),
+                    icons,
+                });
+            }
         }
         self.painted.icons.push((row, icon));
     }
@@ -1462,12 +1495,13 @@ fn line_texts_for(rows_kind: usize) -> &'static [String] {
     slot.get_or_init(|| make_line_texts_for(harness))
 }
 
-/// The card line's rungs, widest first, naming `harness` the way its top rule does (`alab
-/// <cli> harness`) and its own version (never aterm's build): `enhanced by {named} ·
-/// alab.systems`, `{named} · alab.systems`, `alab <cli> harness · alab.systems`,
-/// `alab.systems`, `alab`, where `{named}` is `alab <cli> harness v<version>` and the site's
-/// name is a link ([`line_link`]). Every rung the site's name fits in keeps it: the link is the
-/// line's point, so the words before it give way first.
+/// The card line's rungs, widest first, naming `harness` as the card line alone does (`alab
+/// <cli> harness`), with its own version (never aterm's build); the top rule's label (`alab
+/// v<ver> (v<build>)`) names no CLI, since the lockup at its other end does. The rungs:
+/// `enhanced by {named} · alab.systems`, `{named} · alab.systems`, `alab <cli> harness ·
+/// alab.systems`, `alab.systems`, `alab`, where `{named}` is `alab <cli> harness v<version>`
+/// and the site's name is a link ([`line_link`]). Every rung the site's name fits in keeps it:
+/// the link is the line's point, so the words before it give way first.
 fn make_line_texts_for(harness: CliHarness) -> Vec<String> {
     let site = aterm_types::identity::SITE;
     let brand = format!("{HERO_WORD} {} harness", harness.cli());

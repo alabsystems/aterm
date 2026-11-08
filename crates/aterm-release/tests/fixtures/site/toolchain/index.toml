@@ -1,5 +1,5 @@
 # Fixture (crates/aterm-release/src/site/toolchain.rs): the shape `atpkg-publish index`
-# publishes — read for the toolchain facts, never signed or installed from.
+# publishes — tests sign it with fixture-only keys and read it only for toolchain facts.
 schema = 2
 index_build = 50
 valid_until = "2099-01-01T00:00:00Z"

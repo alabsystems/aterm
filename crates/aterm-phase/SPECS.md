@@ -8,7 +8,7 @@
 > - Host-dependent vendor drift checks run in the explicit `vendor_drift` acceptance bench
 >   (`targo --unverified bench -p aterm-phase --bench vendor_drift`), checking Claude anchors,
 >   transcript keys, reset templates and wall phrases; Codex rollout keys; agy, Muse, Grok and
->   Kimi anchors. Pure version, managed-path, build-record, template and committed-rollout
+>   Kimi anchors; Kimi's record keys. Pure version, managed-path, build-record, template and committed-rollout
 >   fixtures remain ordinary unit tests.
 > - The Gemini CLI reader is retired (agy replaces it): `src/gemini.rs`, its tests, its anchors and
 >   its `gemini-*` captures are removed, and a program named `gemini` or `gemini-cli` reads as no

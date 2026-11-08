@@ -430,12 +430,7 @@ mod tests {
             let _ = c.post(row.clone(), crate::model::WallStamp { unix_ms: 1_000 }, now);
             let _ = c.settle(now, true);
             c.commit_rows(now, 3);
-            let p = c.presentation(
-                cols,
-                &crate::text::char_width,
-                None,
-                crate::glass::Links::Painted,
-            );
+            let p = c.presentation(cols, &crate::text::char_width, crate::glass::Links::Painted);
             p.rows
                 .first()
                 .and_then(|r| r.detail.clone())

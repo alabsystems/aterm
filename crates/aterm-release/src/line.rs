@@ -856,6 +856,41 @@ pub fn record(
 /// A refusal naming the first mismatch, in that order; COULD NOT RUN when git cannot read an
 /// object, the clone lacks one, or [`hop_tree`] cannot run.
 pub fn verify(git: &dyn GitRunner, line: &Line) -> Result<String, Stop> {
+    verify_with(git, line, true)
+}
+
+/// Prove the same patch, ancestry, frozen-path and version obligations before the head's
+/// content-neutral record merge is written. This grants no publication authority.
+///
+/// # Errors
+/// Every structural refusal of [`verify`] still applies; only the head's presence in main is
+/// deferred until the record merge. Missing objects or unreadable Git remain COULD NOT RUN.
+pub fn verify_pending(git: &dyn GitRunner, line: &Line) -> Result<String, Stop> {
+    verify_with(git, line, false)
+}
+
+/// The newest prefix whose head is retained on source main. A fleet claim publishes this
+/// prefix until a private pending hop has passed its own checks and its source record lands.
+///
+/// # Errors
+/// Git cannot answer, or even the line's base is absent from local origin/main.
+pub fn recorded_prefix(git: &dyn GitRunner, line: &Line) -> Result<Line, Stop> {
+    let mut prefix = line.clone();
+    loop {
+        if is_ancestor(git, prefix.head(), "origin/main")? {
+            return Ok(prefix);
+        }
+        if prefix.hops.pop().is_none() {
+            return Err(Stop::new(
+                Reason::BaseOffMain,
+                "the line's base is not retained on source main",
+                drop_line(),
+            ));
+        }
+    }
+}
+
+fn verify_with(git: &dyn GitRunner, line: &Line, recorded: bool) -> Result<String, Stop> {
     let bad = |reason: Reason, why: String| Stop::new(reason, why, drop_line());
     let judged = |stop: Stop| {
         if stop.could_not_run() {
@@ -1008,7 +1043,7 @@ pub fn verify(git: &dyn GitRunner, line: &Line) -> Result<String, Stop> {
         prev = hop.commit.as_str();
         prev_tree = tree;
     }
-    if !is_ancestor(git, prev, "origin/main")? {
+    if recorded && !is_ancestor(git, prev, "origin/main")? {
         return Err(Stop::new(
             Reason::Unrecorded,
             format!(
@@ -1020,7 +1055,12 @@ pub fn verify(git: &dyn GitRunner, line: &Line) -> Result<String, Stop> {
         ));
     }
     let carried: Vec<&str> = line.hops.iter().map(|hop| short(&hop.carries)).collect();
-    Ok(if carried.is_empty() {
+    Ok(if !recorded {
+        format!(
+            "line v{}: local patch obligations proved; record on main still required",
+            line.version
+        )
+    } else if carried.is_empty() {
         format!(
             "line v{}: its base {} is on origin/main, with no hops",
             line.version,

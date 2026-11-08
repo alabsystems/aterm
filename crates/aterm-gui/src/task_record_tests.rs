@@ -10,6 +10,238 @@ use super::*;
 
 const SID: &str = "s-0123456789abcdef0123";
 
+#[test]
+fn a_replacement_agent_keeps_its_task_open_across_a_late_exit() {
+    use crate::session_timeline::{AgentStamp, SessionTimeline};
+    use aterm_phase::Program;
+
+    let mut timeline = SessionTimeline::default();
+    let now = Instant::now();
+    let asks = Asks::default();
+    timeline.mark_task(&TaskMark::new(TaskState::Working), &asks, now, 1);
+    timeline.set_task_worker(Program::Claude, None);
+    let mut exited = TaskMark::new(TaskState::Exited);
+    exited.why = Some(WHY_EXIT);
+    timeline.mark_task(&exited, &asks, now, 2);
+    assert_eq!(timeline.task().unwrap().state, TaskState::Exited);
+    assert!(timeline.task().unwrap().has_news());
+    let carried = timeline.task().unwrap().carry_row(now);
+    timeline.seed_task(TaskRecord::from_carry_row(&carried, None, now, 2).unwrap());
+    assert!(
+        timeline.task().unwrap().unfinished_exit,
+        "an update must preserve that this exit interrupted unfinished work"
+    );
+
+    // The shell/wrapper ended before the new Claude process was identified.
+    timeline.note_foreground_group(42);
+    timeline.set_program(42, Some("claude".to_string()));
+    timeline.publish_agent(
+        "busy",
+        None,
+        None,
+        Some(Program::Claude),
+        AgentStamp {
+            generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+            fp: 1,
+        },
+    );
+    let working = timeline.task().unwrap().clone();
+    // Negative control: the old unconditional ledger write closes this very same task.
+    let (unfenced, changed) = exited.apply(Some(&working), &asks, now, 3);
+    assert!(changed);
+    assert_eq!(unfenced.state, TaskState::Exited);
+    assert!(unfenced.has_news());
+    assert_eq!(working.state, TaskState::Working);
+    assert_eq!(working.why, Some("moved"));
+    assert!(!working.has_news());
+    assert_eq!(working.started_unix_ms, 1);
+    assert_eq!(working.agent, Some(Program::Claude));
+
+    // A delayed exit of the old process must not close the replacement's task.
+    timeline.mark_task(&exited, &asks, now, 3);
+    assert_eq!(timeline.task().unwrap().rev, working.rev);
+    assert_eq!(timeline.task().unwrap().state, TaskState::Working);
+
+    // A real exit still concludes the task once the foreground agent is gone.
+    timeline.note_foreground_group(7);
+    timeline.mark_task(&exited, &asks, now, 4);
+    assert_eq!(
+        timeline.task().unwrap().state,
+        TaskState::Working,
+        "a foreground change can precede the sweep clearing its busy word"
+    );
+    timeline.publish_agent(
+        "-",
+        None,
+        None,
+        None,
+        AgentStamp {
+            generation: crate::control::ScreenGen { epoch: 1, seq: 2 },
+            fp: 2,
+        },
+    );
+    assert_eq!(
+        timeline.task().unwrap().state,
+        TaskState::Exited,
+        "an exit arriving before the publication cleared is not lost"
+    );
+    timeline.mark_task(&exited, &asks, now, 4);
+    assert_eq!(timeline.task().unwrap().state, TaskState::Exited);
+}
+
+#[test]
+fn an_agent_return_reopens_only_an_unfinished_agent_exit() {
+    use crate::session_timeline::{AgentStamp, SessionTimeline};
+    use aterm_phase::Program;
+
+    for (state, why, program_worker, expected) in [
+        (TaskState::Exited, Some(WHY_EXIT), false, TaskState::Working),
+        (TaskState::Done, Some(WHY_LANDED), false, TaskState::Done),
+        (
+            TaskState::Failed,
+            Some(WHY_COULD_NOT_FINISH),
+            false,
+            TaskState::Failed,
+        ),
+        (TaskState::Exited, Some(WHY_EXIT), true, TaskState::Exited),
+    ] {
+        let mut timeline = SessionTimeline::default();
+        let now = Instant::now();
+        if expected == TaskState::Working {
+            timeline.mark_task(&TaskMark::new(TaskState::Working), &Asks::default(), now, 0);
+        }
+        let mut mark = TaskMark::new(state);
+        mark.why = why;
+        timeline.mark_task(&mark, &Asks::default(), now, 1);
+        if program_worker {
+            timeline.set_task_worker(Program::Generic, None);
+            timeline.set_task_program(Some("bench"));
+        }
+        // An editor is not evidence that an agent came back.
+        timeline.note_foreground_group(42);
+        timeline.set_program(42, Some("vim".to_string()));
+        assert_eq!(timeline.task().unwrap().state, state);
+        // A screen-identified agent also works before its process name is resolved.
+        timeline.note_foreground_group(43);
+        timeline.publish_agent(
+            "busy",
+            None,
+            None,
+            Some(Program::Claude),
+            AgentStamp {
+                generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                fp: 1,
+            },
+        );
+        assert_eq!(
+            timeline.task().unwrap().state,
+            expected,
+            "{state:?}, {program_worker}"
+        );
+        if program_worker {
+            timeline.mark_task(&TaskMark::new(TaskState::Working), &Asks::default(), now, 2);
+            timeline.mark_task(&mark, &Asks::default(), now, 3);
+            assert_eq!(
+                timeline.task().unwrap().state,
+                TaskState::Exited,
+                "a program worker's exit is not deferred by an agent screen"
+            );
+        }
+    }
+}
+
+#[test]
+fn task_rows_keep_the_exit_and_agent_from_the_same_observation() {
+    use crate::session_timeline::AgentStamp;
+    use aterm_phase::Program;
+
+    let handle = crate::session_store::test_handle(16);
+    let ctx = &handle.ctx;
+    mark_session_task(ctx, 16, &TaskMark::new(TaskState::Working)).expect("unfenced");
+    let mut exit = TaskMark::new(TaskState::Exited);
+    exit.why = Some(WHY_EXIT);
+    mark_session_task(ctx, 16, &exit).expect("unfenced");
+    let before = task_reading(ctx);
+    {
+        let mut timeline = ctx.timeline.lock().unwrap();
+        timeline.note_foreground_group(42);
+        timeline.set_program(42, Some("claude".to_string()));
+        timeline.publish_agent(
+            "busy",
+            None,
+            None,
+            Some(Program::Claude),
+            AgentStamp {
+                generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                fp: 1,
+            },
+        );
+    }
+    let after = task_reading(ctx);
+    assert_eq!(
+        (before.record.as_ref().unwrap().state, before.agent),
+        (TaskState::Exited, "-")
+    );
+    assert_eq!(
+        (after.record.as_ref().unwrap().state, after.agent),
+        (TaskState::Working, "busy")
+    );
+    // Negative control: the old split read combines the prior record with the new verdict.
+    let split = await_row(
+        SID,
+        before.record.as_ref(),
+        after.agent,
+        &after.program,
+        &after.attention,
+        false,
+    );
+    assert!(split.contains("state=exited agent=busy"));
+    for read in [&before, &after] {
+        let row = await_row(
+            SID,
+            read.record.as_ref(),
+            read.agent,
+            &read.program,
+            &read.attention,
+            false,
+        );
+        assert!(!row.contains("state=exited agent=busy"), "{row}");
+    }
+    let reply = cmd_task(ctx, 16, Scope::Owner, "");
+    assert!(reply.contains("state=working"), "{reply}");
+    assert!(reply.contains("agent=busy"), "{reply}");
+    assert_eq!(
+        cmd_result(ctx, 16, ""),
+        "ERR result unavailable why=working\n"
+    );
+}
+
+#[test]
+fn a_persons_program_after_an_exit_is_not_the_unfinished_worker() {
+    use crate::session_timeline::AgentStamp;
+    let handle = crate::session_store::test_handle(17);
+    let ctx = &handle.ctx;
+    mark_session_task(ctx, 17, &TaskMark::new(TaskState::Working)).unwrap();
+    let mut exit = TaskMark::new(TaskState::Exited);
+    exit.why = Some(WHY_EXIT);
+    mark_session_task(ctx, 17, &exit).unwrap();
+    assert!(ctx.timeline.lock().unwrap().task().unwrap().unfinished_exit);
+    crate::app_input::note_person(ctx, crate::human_input::Gesture::PlainEnter);
+    let mut timeline = ctx.timeline.lock().unwrap();
+    timeline.publish_agent(
+        "busy",
+        None,
+        None,
+        Some(aterm_phase::Program::Claude),
+        AgentStamp {
+            generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+            fp: 1,
+        },
+    );
+    assert_eq!(timeline.task().unwrap().state, TaskState::Exited);
+    assert!(!timeline.task().unwrap().unfinished_exit);
+}
+
 fn native(unix: &str) -> String {
     if cfg!(windows) {
         let swapped = unix.replace('/', "\\");
@@ -323,6 +555,7 @@ fn a_carried_record_keeps_only_the_time_it_was_awake() {
         left: None,
         exit: None,
         finished: false,
+        unfinished_exit: false,
         result_bytes: 0,
         result_path: None,
         attention: false,
@@ -389,6 +622,7 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         left: None,
         exit: Some(-2),
         finished: false,
+        unfinished_exit: false,
         result_bytes: 9,
         result_path: Some(tasks().join("r 1.txt")),
         attention: true,
@@ -559,6 +793,7 @@ fn the_reply_event_and_status_spellings() {
         left: None,
         exit: None,
         finished: false,
+        unfinished_exit: false,
         result_bytes: 120,
         result_path: None,
         attention: false,
@@ -1768,6 +2003,7 @@ fn the_carry_holds_the_fact_word_and_its_rev_and_reads_them_leniently() {
         left: None,
         exit: None,
         finished: false,
+        unfinished_exit: false,
         result_bytes: 0,
         result_path: None,
         attention: false,
@@ -2074,11 +2310,17 @@ fn a_planted_attention_or_title_never_reaches_fact() {
             .collect()
     };
     let rows = || {
-        let record = ctx.timeline.lock().unwrap().task().cloned();
-        let (agent, program, attention) = agent_program_and_attention(ctx);
+        let reading = task_reading(ctx);
         [
             cmd_task(ctx, 15, Scope::Owner, ""),
-            await_row(SID, record.as_ref(), agent, &program, &attention, false),
+            await_row(
+                SID,
+                reading.record.as_ref(),
+                reading.agent,
+                &reading.program,
+                &reading.attention,
+                false,
+            ),
         ]
     };
     for row in rows() {

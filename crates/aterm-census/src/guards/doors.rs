@@ -2809,7 +2809,9 @@ impl Default for PagePress {}
             ),
             (
                 "    Nobody,\n    #[allow\n    Alert,\n    #[cfg(test)]\n    StandIn(",
-                vec!["    #[allow"],
+                // An incomplete outer attribute cannot prove that the following
+                // cfg excludes the variant.
+                vec!["    #[allow", "    StandIn("],
             ),
         ] {
             let yes = YES.replace(arm, new);

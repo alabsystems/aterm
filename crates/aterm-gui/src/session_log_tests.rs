@@ -1043,6 +1043,8 @@ fn a_stand_in_detail_is_amended_once_to_the_program_that_ran() {
     // `sh` heard before its file was read (a stand-in), then the shell macOS's `/bin/sh` stub
     // re-execs, its file read: the script's interpreter ran.
     // Each exec is placed in its block's own job (a stand-in is only ever the block's own job's).
+    // The first exec of a process is the one whose record is read: the kernel handed `sh` the
+    // script.
     let heard = |ran: &Ran, ms: u64, pid: i32, name: &str, file: bool| {
         ran.note(Exec {
             at_ms: WALL0 + ms,
@@ -1051,6 +1053,11 @@ fn a_stand_in_detail_is_amended_once_to_the_program_that_ran() {
             names: ExecNames {
                 image: Some(name.into()),
                 file: file.then(|| test_id(name)),
+                scripts: if name == "sh" {
+                    Box::new(["./QZP7D2/deploy.sh".into()])
+                } else {
+                    Box::default()
+                },
                 ..ExecNames::default()
             },
             during: crate::command_ran::During::Job(Some(u64::from(ms >= 500))),

@@ -134,7 +134,8 @@ fn a_window_is_full_only_where_the_vendors_figure_is_100() {
         })
     };
     let near = five("99.6");
-    assert_eq!(near.and_then(|t| t.figure).map(|f| f.pct), Some(100));
+    // Its whole figure is held under 100 too: no reading under 100 is said as 100.
+    assert_eq!(near.and_then(|t| t.figure).map(|f| f.pct), Some(99));
     assert_eq!(says(&[FIVE], &[&[(FIVE, near)]]), TapSays::Nothing, "99.6");
     for pct in ["100.0", "100"] {
         assert_eq!(

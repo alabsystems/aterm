@@ -628,6 +628,13 @@ fn managed_row(
         Ok((path, true)) => State::Present(path),
         Ok((path, false)) => State::Placed(path),
         Err(why) => {
+            if let Some(transport) = atpkg::prerequisite::freshness_transport(&why) {
+                return State::CouldNotRun(format!(
+                    "{}: signed prerequisite channel freshness: {transport} (retry when the \
+                     channel transport answers)",
+                    want.program()
+                ));
+            }
             let why = format!(
                 "{}: signed prerequisite: {why} (fix: `aterm pkg install {}`)",
                 want.program(),

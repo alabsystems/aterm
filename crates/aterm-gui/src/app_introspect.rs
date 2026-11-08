@@ -4606,9 +4606,7 @@ impl App {
     > {
         use crate::app_render::CapturePreparation;
         self.sample_native_preview_for_capture(wid, &plan);
-        // Every route splices the message band, so each captures it at the capture instant.
         let capture_now = clock.unwrap_or_else(Instant::now);
-        self.prepare_band_motion(wid, capture_now);
         let (plan, terminal_grid) = match route {
             crate::VisibleContentRoute::Terminal { .. } => {
                 let clock = self.composed_capture_cursor_fx_clock(wid, capture_now);
@@ -4678,7 +4676,6 @@ impl App {
             return false;
         }
         let now = Instant::now();
-        self.prepare_band_motion(wid, now);
         let CapturePreparation::Ready((grid, plan)) = self
             .prepare_terminal_capture_grid_with_cursor_fx_for_plan_outcome(
                 wid,

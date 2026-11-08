@@ -8835,6 +8835,58 @@ fn a_windows_figures_merge_by_anchor_then_epoch_then_size() {
     assert_eq!(both(&fig(900, reset, NOW - 9, None), &plain).pct_x10, 900);
 }
 
+/// A store written before the whole percent was held under 100 says a held 996 tenths as `100`
+/// in the sample it wrote from them; that sample is still the held figure, never a reading of a
+/// full window, so the window keeps its 996 and the glass never says it full.
+#[test]
+fn a_sample_written_from_the_held_figure_is_never_a_new_full_reading() {
+    let reset = NOW + HOUR;
+    let held = WindowFig {
+        pct_x10: 996,
+        reset,
+        at: NOW - MIN,
+        by: "m".to_string(),
+        source: SOURCE_TAP.to_string(),
+        epoch_at: None,
+    };
+    let written = |pct: u32, reset: i64, at: i64| Sample {
+        session_pct: Some(pct),
+        session_reset: Some(reset),
+        session_read_at: Some(at),
+        at,
+        by: "m".to_string(),
+        ..Sample::default()
+    };
+    let window = |s: &Sample| sample_window(Some(s), SESSION_LIMIT, Some(&held));
+    for pct in [99, 100] {
+        let s = written(pct, reset, held.at);
+        assert_eq!(
+            window(&s).map(|f| f.pct_x10),
+            None,
+            "{pct}% written from 996"
+        );
+        let kept = merge_fig(Some(&held), window(&s).as_ref(), NOW);
+        assert_eq!(
+            kept.map(|f| f.pct_x10),
+            Some(996),
+            "{pct}% written from 996"
+        );
+    }
+    // A figure the held one does not round to, a later read and another reset are readings.
+    assert_eq!(
+        window(&written(98, reset, held.at)).map(|f| f.pct_x10),
+        Some(980)
+    );
+    assert_eq!(
+        window(&written(100, reset, NOW)).map(|f| f.pct_x10),
+        Some(1000)
+    );
+    assert_eq!(
+        window(&written(100, reset + HOUR, held.at)).map(|f| f.pct_x10),
+        Some(1000)
+    );
+}
+
 #[test]
 fn a_reset_used_cuts_the_walled_windows_tap_figure() {
     let week_end = NOW + 4 * DAY;

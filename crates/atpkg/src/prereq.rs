@@ -154,8 +154,9 @@ pub struct CcHost {
     pub sdkroot_override: Option<PathBuf>,
     /// The inherited minimum macOS version for a build, independent of installed tool health.
     pub deployment_target_override: Option<std::ffi::OsString>,
-    /// Inherit project compiler configuration. Machine setup clears the environment instead,
-    /// then applies the explicit probe inputs and temporary directory.
+    /// Inherit project compiler configuration, which cannot retain a cached success because
+    /// it can name mutable inputs. Machine setup clears the environment instead, then applies
+    /// the explicit probe inputs and temporary directory.
     pub inherit_environment: bool,
     /// How long each compiler probe may take: [`PROBE_TIMEOUT`] on this machine.
     pub bound: Duration,
@@ -305,6 +306,7 @@ pub fn probe(path_var: Option<&OsStr>) -> CcVerdict {
 /// key matches answers `Ready` with nothing spawned (no `xcrun`, no compile and link); any other
 /// verdict is probed every time. When a key is available, revalidate it before returning a
 /// verdict or publishing a cached fact; an observed change leaves the current toolchain unproven.
+/// A native driver the text cache cannot represent is returned without caching.
 #[must_use]
 pub fn probe_cached(path_var: Option<&OsStr>, host: &CcHost, cache: Option<&CcCache>) -> CcVerdict {
     const CHANGED: &str = "C toolchain inputs changed or became unreadable during the check";
@@ -338,21 +340,24 @@ pub fn probe_cached(path_var: Option<&OsStr>, host: &CcHost, cache: Option<&CcCa
                 why: CHANGED.into(),
             };
         }
-        if let CcVerdict::Ready { driver } = &verdict {
-            crate::probe_cache::put(&cache.file, key, &driver.to_string_lossy());
+        if let CcVerdict::Ready { driver } = &verdict
+            && let Some(driver) = driver.to_str()
+        {
+            crate::probe_cache::put(&cache.file, key, driver);
         }
     }
     verdict
 }
 
 /// What a `Ready` verdict for `located` depends on, read without spawning: the compiler as it is
-/// now ([`crate::probe_cache::identity`]), the active developer directory (`DEVELOPER_DIR`,
-/// else `xcode-select`'s link, else Xcode or the standalone tools), the identity of its `clang`,
+/// now ([`crate::probe_cache::identity`]), the shim's discovery executable, the active developer
+/// directory (`DEVELOPER_DIR`, else `xcode-select`'s link, else Xcode or the standalone tools),
+/// the identity of its `clang`,
 /// the Command Line Tools receipt's identity and digest, the SDK a build would fall back to and the `PATH`
-/// the build sees, its minimum macOS deployment target, and the inherited environment's digest
-/// when project configuration is inherited. `None` when the compiler cannot
-/// be read, discovery is unreadable, or an explicit SDK or developer directory is used:
-/// changes within its SDK have no Apple install receipt to retire a cached success. The policy
+/// the build sees and its minimum macOS deployment target. `None` when project configuration
+/// is inherited, the compiler cannot be read, discovery is unreadable, or an explicit SDK or
+/// developer directory is used. Project configuration can name arbitrary mutable inputs;
+/// changes within an explicit SDK have no Apple install receipt to retire a cached success. The policy
 /// domain retires verdicts made by weaker discovery, output, SDK custody, native configuration
 /// identity or snapshot validation checks. Native PATH and deployment-target bytes are encoded
 /// exactly; unrepresentable SDK/developer paths disable caching rather than supply a lossy identity.
@@ -362,12 +367,16 @@ fn cc_key(
     host: &CcHost,
     cache: &CcCache,
 ) -> Option<String> {
-    if host.sdkroot().is_some() || host.developer_override().is_some() {
+    if host.inherit_environment || host.sdkroot().is_some() || host.developer_override().is_some() {
         return None;
     }
     let (kind, cc) = match located {
         Located::Plain(cc) => ("plain", cc),
         Located::Shim(cc) => ("shim", cc),
+    };
+    let discovery = match located {
+        Located::Plain(_) => "unused".to_owned(),
+        Located::Shim(cc) => crate::probe_cache::identity(&discovery_program(cc))?,
     };
     let developer_dir = host.developer_dir().ok()?;
     let receipt = receipt_key(&cache.receipt)?;
@@ -412,17 +421,16 @@ fn cc_key(
             .unwrap_or_default()
     }
     crate::probe_cache::key([
-        Some("fresh-executable-link-v10".to_owned()),
+        Some("fresh-executable-link-v13".to_owned()),
         Some(kind.to_owned()),
         crate::probe_cache::identity(cc),
+        Some(discovery),
         Some(developer_dir.to_str()?.to_owned()),
         Some(clang),
         Some(receipt),
         Some(sdk),
         Some(native(path_var)),
         Some(native(host.deployment_target())),
-        Some(host.inherit_environment.to_string()),
-        compiler_environment_key(host.inherit_environment),
     ])
 }
 
@@ -453,26 +461,6 @@ fn receipt_key(path: &Path) -> Option<String> {
         crate::probe_cache::metadata_identity(path, &metadata)?,
         aterm_codec::hex::encode_lower(&digest.finalize())
     ))
-}
-
-/// Include arbitrary compiler configuration without persisting environment names or values.
-/// Native byte lengths delimit each name and value; sorting names removes enumeration order.
-fn compiler_environment_key(inherit: bool) -> Option<String> {
-    if !inherit {
-        return Some("isolated".to_owned());
-    }
-    let mut environment: Vec<_> = std::env::vars_os().collect();
-    environment.sort_by_key(|(name, _)| name.clone());
-    let mut digest = aterm_digest::Sha256::new();
-    digest.update(b"aterm-cc-environment-v1");
-    for (name, value) in environment {
-        for part in [&name, &value] {
-            let bytes = part.as_os_str().as_encoded_bytes();
-            digest.update(u64::try_from(bytes.len()).ok()?.to_le_bytes());
-            digest.update(bytes);
-        }
-    }
-    Some(aterm_codec::hex::encode_lower(&digest.finalize()))
 }
 
 /// [`probe`] over an injected host.
@@ -516,15 +504,14 @@ pub(crate) fn probe_with_elapsed(
 fn probe_located(located: &Located, path_var: Option<&OsStr>, host: &CcHost) -> CcVerdict {
     let cc = match located {
         Located::Plain(cc) => {
-            return match ask(cc, cc, &["--version"], host) {
+            return match ask(cc, cc, CcQuery::Version, host) {
                 CcVerdict::Ready { driver } => build_probe(cc, driver, path_var, host),
                 other => other,
             };
         }
         Located::Shim(cc) => cc,
     };
-    let shim_dir = cc.parent().unwrap_or(Path::new("/usr/bin"));
-    match ask(&shim_dir.join("xcrun"), cc, &["--find", "cc"], host) {
+    match ask(&discovery_program(cc), cc, CcQuery::Find, host) {
         CcVerdict::Ready { driver } => build_probe(cc, driver, path_var, host),
         other => other,
     }
@@ -807,28 +794,62 @@ fn first_stderr_line(out: &std::process::Output) -> String {
         )
 }
 
-/// Run `bin args…` within `bound` as a verdict about `driver`: exit 0 is Ready (naming the
-/// path `xcrun` printed, if any), any other exit is Broken with the first stderr line.
-fn ask(bin: &Path, driver: &Path, args: &[&str], host: &CcHost) -> CcVerdict {
+#[derive(Clone, Copy)]
+enum CcQuery {
+    Version,
+    Find,
+}
+
+fn discovery_program(cc: &Path) -> PathBuf {
+    cc.parent().unwrap_or(Path::new("/usr/bin")).join("xcrun")
+}
+
+/// Run the query within `bound`. A successful version query retains `driver`; discovery
+/// requires one absolute native path. A captured nonzero exit is Broken with the first stderr line.
+fn ask(bin: &Path, driver: &Path, query: CcQuery, host: &CcHost) -> CcVerdict {
     let bound = host.bound;
     let mut cmd = aterm_uds::spawnfd::command(bin);
+    let args: &[&str] = match query {
+        CcQuery::Version => &["--version"],
+        CcQuery::Find => &["--find", "cc"],
+    };
     cmd.args(args);
     host.apply_environment(&mut cmd);
-    match crate::doctor::output_bounded_capturing(&mut cmd, bound) {
+    let output = match query {
+        CcQuery::Version => crate::doctor::output_bounded_capturing(&mut cmd, bound),
+        CcQuery::Find => {
+            use aterm_uds::deadline::{CompleteOutputError, RunError};
+            match aterm_uds::deadline::output_until_complete_stdout(
+                &mut cmd,
+                std::time::Instant::now() + bound,
+            ) {
+                Ok(out) => Some(out),
+                Err(CompleteOutputError::Run(RunError::TimedOut)) => None,
+                Err(error) => {
+                    return CcVerdict::Unproven {
+                        driver: driver.to_path_buf(),
+                        why: format!("compiler discovery output is unavailable: {error}"),
+                    };
+                }
+            }
+        }
+    };
+    match output {
         None => CcVerdict::Unanswered {
             driver: driver.to_path_buf(),
             bound,
         },
         Some(out) if out.status.success() => {
-            let printed = String::from_utf8_lossy(&out.stdout);
-            let named = printed
-                .lines()
-                .next()
-                .map(str::trim)
-                .filter(|line| line.starts_with('/'))
-                .map(PathBuf::from);
-            CcVerdict::Ready {
-                driver: named.unwrap_or_else(|| driver.to_path_buf()),
+            let named = match query {
+                CcQuery::Version => Some(driver.to_path_buf()),
+                CcQuery::Find => discovered_compiler(&out.stdout),
+            };
+            match named {
+                Some(driver) => CcVerdict::Ready { driver },
+                None => CcVerdict::Unproven {
+                    driver: driver.to_path_buf(),
+                    why: "compiler discovery did not name one absolute path".to_owned(),
+                },
             }
         }
         Some(out) => CcVerdict::Broken {
@@ -836,6 +857,28 @@ fn ask(bin: &Path, driver: &Path, args: &[&str], host: &CcHost) -> CcVerdict {
             why: first_stderr_line(&out),
         },
     }
+}
+
+/// Remove one protocol line ending without trimming path bytes or accepting multiple records.
+fn discovered_compiler(bytes: &[u8]) -> Option<PathBuf> {
+    let bytes = bytes
+        .strip_suffix(b"\r\n")
+        .or_else(|| bytes.strip_suffix(b"\n"))
+        .unwrap_or(bytes);
+    if bytes
+        .iter()
+        .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
+    {
+        return None;
+    }
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStrExt as _;
+        PathBuf::from(OsStr::from_bytes(bytes))
+    };
+    #[cfg(not(unix))]
+    let path = PathBuf::from(std::str::from_utf8(bytes).ok()?);
+    path.is_absolute().then_some(path)
 }
 
 /// A nonempty regular file this user may execute (never a directory named `cc`).
@@ -902,7 +945,7 @@ mod tests {
             developer_dir_override: None,
             sdkroot_override: None,
             deployment_target_override: None,
-            inherit_environment: true,
+            inherit_environment: false,
             bound: ANSWER,
             tmp_root,
         }
@@ -1113,6 +1156,92 @@ mod tests {
             CcVerdict::NoDriver
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_version_banner_cannot_rename_the_compiler() {
+        let root = scratch("version-banner");
+        let bin = root.join("bin");
+        let cc = bin.join("cc");
+        script(
+            &cc,
+            "[ \"$1\" = --version ] && { echo /not-the-compiler; exit 0; }\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"",
+        );
+        assert_eq!(
+            probe_with(Some(bin.as_os_str()), &plain_host(&root)),
+            CcVerdict::Ready { driver: cc }
+        );
+    }
+
+    #[test]
+    fn compiler_discovery_requires_one_absolute_native_path() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let root = scratch("discovery-output");
+        let bin = root.join("bin");
+        let answer = root.join("answer");
+        let compiled = root.join("compiled");
+        script(
+            &bin.join("cc"),
+            &format!(
+                "echo compiled >> '{}'\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"",
+                compiled.display()
+            ),
+        );
+        script(
+            &bin.join("xcrun"),
+            &format!("/bin/cat '{}'", answer.display()),
+        );
+        let developer = root.join("developer");
+        script(&developer.join("usr/bin/clang"), "exit 0");
+        let host = CcHost {
+            shim_dir: Some(bin.clone()),
+            default_developer_dir: developer,
+            ..plain_host(&root)
+        };
+        let oversized = vec![b'/'; aterm_uds::deadline::OUTPUT_KEEP + 1];
+        for invalid in [
+            b"".as_slice(),
+            b"relative/cc\n",
+            b"/one\n/two\n",
+            b"/cc\0\n",
+            oversized.as_slice(),
+        ] {
+            std::fs::write(&answer, invalid).unwrap();
+            assert!(
+                matches!(
+                    probe_with(Some(bin.as_os_str()), &host),
+                    CcVerdict::Unproven { .. }
+                ),
+                "invalid discovery output length: {}",
+                invalid.len()
+            );
+            assert!(!compiled.exists(), "unproven discovery starts no build");
+        }
+        for (index, name) in [b"compiler \xc2\xa0".as_slice(), b"compiler-\xff "]
+            .into_iter()
+            .enumerate()
+        {
+            let path = root.join(std::ffi::OsString::from_vec(name.to_vec()));
+            let mut bytes = path.as_os_str().as_encoded_bytes().to_vec();
+            bytes.extend_from_slice(b"\r\n");
+            std::fs::write(&answer, bytes).unwrap();
+            let cache = CcCache {
+                file: root.join(format!("state/cc-{index}")),
+                receipt: root.join("no-receipt"),
+            };
+            for _ in 0..2 {
+                assert_eq!(
+                    probe_cached(Some(bin.as_os_str()), &host, Some(&cache)),
+                    CcVerdict::Ready {
+                        driver: path.clone()
+                    }
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(compiled).unwrap().lines().count(),
+            3
+        );
     }
 
     /// The shim never runs without a compiler behind it: with no clang in the developer
@@ -1848,16 +1977,17 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_inherited_environment_retires_a_cached_compiler_fact() {
+    fn inherited_compiler_configuration_cannot_retain_a_cached_fact() {
         const CHILD: &str = "ATERM_CC_CACHE_ENVIRONMENT_CHILD";
-        const PRIVATE_VALUE: &str = "private environment fixture\nvalue-c1b4d6";
         if let Some(root) = std::env::var_os(CHILD).map(PathBuf::from) {
             let bin = root.join("bin");
             let cache = CcCache {
                 file: root.join("state/cc"),
                 receipt: root.join("no-receipt"),
             };
-            let verdict = probe_cached(Some(bin.as_os_str()), &plain_host(&root), Some(&cache));
+            let mut host = plain_host(&root);
+            host.inherit_environment = true;
+            let verdict = probe_cached(Some(bin.as_os_str()), &host, Some(&cache));
             let result = match verdict {
                 CcVerdict::Ready { .. } => "ready",
                 CcVerdict::Broken { why, .. } if why == "project headers refused" => "refused",
@@ -1869,33 +1999,32 @@ mod tests {
         let root = scratch("changed-compiler-environment");
         let bin = root.join("bin");
         let asked = root.join("asked");
+        let headers = root.join("headers");
+        std::fs::create_dir(&headers).unwrap();
         script(
             &bin.join("cc"),
             &format!(
-                "echo asked >> '{}'\n[ \"$1\" = --version ] && {{ echo cc; exit 0; }}\nif [ -n \"$CPATH\" ]; then echo 'project headers refused' >&2; exit 1; fi\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"",
+                "echo asked >> '{}'\n[ \"$1\" = --version ] && {{ echo cc; exit 0; }}\nif [ \"$(/bin/cat \"$CPATH/fixture.h\")\" = reject ]; then echo 'project headers refused' >&2; exit 1; fi\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"",
                 asked.display()
             ),
         );
-        for (cpath, expected, calls) in [
-            (None, "ready", 2),
-            (Some("project compiler configuration"), "refused", 4),
-            (None, "ready", 4),
+        for (header, expected, calls) in [
+            ("accept", "ready", 2),
+            ("reject", "refused", 4),
+            ("accept", "ready", 6),
         ] {
+            std::fs::write(headers.join("fixture.h"), header).unwrap();
             let result = root.join("result");
             let _ = std::fs::remove_file(&result);
             let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
             cmd.args([
                 "--exact",
-                "prereq::tests::a_changed_inherited_environment_retires_a_cached_compiler_fact",
+                "prereq::tests::inherited_compiler_configuration_cannot_retain_a_cached_fact",
                 "--nocapture",
             ])
             .env_clear()
             .env(CHILD, root.as_path())
-            .env("ATPKG_PROBE_ENV_FIXTURE", PRIVATE_VALUE)
-            .env_remove("CPATH");
-            if let Some(cpath) = cpath {
-                cmd.env("CPATH", cpath);
-            }
+            .env("CPATH", &headers);
             let output = aterm_uds::deadline::output_until(
                 &mut cmd,
                 std::time::Instant::now() + Duration::from_secs(60),
@@ -1914,9 +2043,8 @@ mod tests {
             );
         }
         assert!(
-            !std::fs::read_to_string(root.join("state/cc"))
-                .unwrap()
-                .contains(PRIVATE_VALUE)
+            !root.join("state/cc").exists(),
+            "inherited configuration retains no fact"
         );
     }
 
@@ -1953,6 +2081,7 @@ mod tests {
             "[ \"$1\" = --version ] && { echo cc; exit 0; }\nif [ -n \"$CPATH\" ]; then echo 'project headers refused' >&2; exit 1; fi\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"",
         );
         let mut host = plain_host(&root);
+        host.inherit_environment = true;
         let cache = CcCache {
             file: root.join("state/cc"),
             receipt: root.join("no-receipt"),
@@ -2153,8 +2282,7 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        // The preceding policy called an unread compiler absent. No fact from that namespace
-        // is reusable even when that compiler really is absent now.
+        // No fact from the preceding query-output policy may retain an old driver spelling.
         let current = cc_key(
             &Located::Plain(cc.clone()),
             Some(bin.as_os_str()),
@@ -2162,7 +2290,11 @@ mod tests {
             &cache,
         )
         .unwrap();
-        old_keys.push(current.replacen("fresh-executable-link-v10", "fresh-executable-link-v9", 1));
+        old_keys.push(current.replacen(
+            "fresh-executable-link-v13",
+            "fresh-executable-link-v12",
+            1,
+        ));
         // The old receipt reader also called an unread receipt absent. Retire that fact
         // even if the receipt really is absent now and all other inputs still match.
         old_keys.push(current.replacen("receipt-v1 absent", "no receipt", 1));
@@ -2262,6 +2394,82 @@ mod tests {
                 driver: developer.join("usr/bin/cc")
             }
         );
+    }
+
+    #[test]
+    fn a_changed_discovery_program_retires_a_cached_compiler_success() {
+        for fault in ["permissions", "missing", "loop", "replacement"] {
+            let root = scratch("discovery-program-cache");
+            let bin = root.join("bin");
+            let xcrun = bin.join("xcrun");
+            let developer = root.join("developer");
+            let driver = developer.join("usr/bin/cc");
+            let compiled = root.join("compiled");
+            script(&developer.join("usr/bin/clang"), "exit 0");
+            script(&xcrun, &format!("echo '{}'", driver.display()));
+            script(
+                &bin.join("cc"),
+                &format!(
+                    "echo build >> '{}'\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"",
+                    compiled.display()
+                ),
+            );
+            let host = CcHost {
+                shim_dir: Some(bin.clone()),
+                default_developer_dir: developer,
+                ..plain_host(&root)
+            };
+            let cache = CcCache {
+                file: root.join("state/cc"),
+                receipt: root.join("no-receipt"),
+            };
+            let path = Some(bin.as_os_str());
+            let ready = CcVerdict::Ready {
+                driver: driver.clone(),
+            };
+            assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+            assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+            assert_eq!(
+                std::fs::read_to_string(&compiled).unwrap().lines().count(),
+                1
+            );
+            match fault {
+                "permissions" => {
+                    std::fs::set_permissions(&xcrun, std::fs::Permissions::from_mode(0o600))
+                        .unwrap()
+                }
+                "missing" => std::fs::remove_file(&xcrun).unwrap(),
+                "loop" => {
+                    std::fs::remove_file(&xcrun).unwrap();
+                    std::os::unix::fs::symlink("xcrun", &xcrun).unwrap();
+                }
+                "replacement" => script(&xcrun, "echo 'discovery refused' >&2; exit 7"),
+                _ => unreachable!(),
+            }
+            let fresh = probe_with(path, &host);
+            assert!(matches!(
+                fresh,
+                CcVerdict::Unproven { .. } | CcVerdict::Broken { .. }
+            ));
+            assert_eq!(probe_cached(path, &host, Some(&cache)), fresh, "{fault}");
+            assert_eq!(
+                std::fs::read_to_string(&compiled).unwrap().lines().count(),
+                1
+            );
+            if fault != "missing" {
+                std::fs::remove_file(&xcrun).unwrap();
+            }
+            script(
+                &xcrun,
+                &format!("# repaired discovery\necho '{}'", driver.display()),
+            );
+            assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+            assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+            assert_eq!(
+                std::fs::read_to_string(&compiled).unwrap().lines().count(),
+                2
+            );
+        }
     }
 
     /// An Xcode update replaces the automatically discovered compiler while the

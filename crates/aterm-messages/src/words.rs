@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Relative and local time words, `~` path abbreviation, and copy-to-clipboard formatting.
+//! Relative and local time words and copy-to-clipboard formatting.
 
 use crate::log::LogRecord;
 
@@ -324,41 +324,6 @@ fn push_padded(out: &mut String, v: u64, width: usize) {
     out.push_str(&digits);
 }
 
-/// `path` with a leading `home` component abbreviated to `~`.
-#[must_use]
-pub(crate) fn home_abbreviate(path: &str, home: Option<&str>) -> String {
-    let Some(home) = home.filter(|h| !h.is_empty()) else {
-        return path.to_string();
-    };
-    let trimmed = home.trim_end_matches('/');
-    let home = if trimmed.is_empty() { "/" } else { trimmed };
-    match path.strip_prefix(home) {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("~{rest}"),
-        _ => path.to_string(),
-    }
-}
-
-/// `text` with every path atom abbreviated by [`home_abbreviate`].
-#[must_use]
-pub(crate) fn abbreviate_paths_in(text: &str, home: Option<&str>) -> String {
-    let Some(home) = home.filter(|h| !h.is_empty()) else {
-        return text.to_string();
-    };
-    let mut out = String::with_capacity(text.len());
-    let mut token = String::new();
-    for c in text.chars() {
-        if c.is_whitespace() {
-            out.push_str(&home_abbreviate(&token, Some(home)));
-            token.clear();
-            out.push(c);
-        } else {
-            token.push(c);
-        }
-    }
-    out.push_str(&home_abbreviate(&token, Some(home)));
-    out
-}
-
 /// The closed table a Complete echo reads a title's leading present participle through: the verbs
 /// band titles use.
 const FINISHED_VERBS: [(&str, &str); 43] = [
@@ -620,41 +585,6 @@ mod tests {
         assert_eq!(stamp_words(1_709_164_800_000), "2024-02-29 00:00:00 UTC");
         assert_eq!(stamp_words(1_709_164_799_000), "2024-02-28 23:59:59 UTC");
         assert_eq!(stamp_words(1_758_470_000_123), "2025-09-21 15:53:20 UTC");
-    }
-
-    #[test]
-    fn home_abbreviation_is_the_tab_label_rule() {
-        let home = Some("/Users//w");
-        assert_eq!(home_abbreviate("/Users//w", home), "~");
-        assert_eq!(
-            home_abbreviate("/Users//w/Library/x.log", home),
-            "~/Library/x.log"
-        );
-        assert_eq!(home_abbreviate("/Users//wx/y", home), "/Users//wx/y");
-        assert_eq!(home_abbreviate("/tmp/x", home), "/tmp/x");
-        assert_eq!(home_abbreviate("/Users//w/x", None), "/Users//w/x");
-        assert_eq!(home_abbreviate("/Users//w/x", Some("")), "/Users//w/x");
-        assert_eq!(
-            home_abbreviate("/Users//w/x.log", Some("/Users//w/")),
-            "~/x.log"
-        );
-        assert_eq!(home_abbreviate("/Users//w", Some("/Users//w/")), "~");
-        assert_eq!(
-            home_abbreviate("/Users//wx/y", Some("/Users//w/")),
-            "/Users//wx/y"
-        );
-        assert_eq!(
-            home_abbreviate("/Users//w", Some("/")),
-            "/Users//w",
-            "the root is nobody's home"
-        );
-        assert_eq!(home_abbreviate("/Users//w", Some("//")), "/Users//w");
-        assert_eq!(
-            abbreviate_paths_in("crash log at /Users//w/Library/x.log under /Users//w", home),
-            "crash log at ~/Library/x.log under ~"
-        );
-        assert_eq!(abbreviate_paths_in("no paths here", home), "no paths here");
-        assert_eq!(abbreviate_paths_in("/Users//w/x", None), "/Users//w/x");
     }
 
     #[test]

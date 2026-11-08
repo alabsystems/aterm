@@ -188,7 +188,7 @@ impl App {
                 .and_then(|f| f.usage.as_ref())
                 .and_then(|u| u.wall.as_ref())
                 .is_some_and(|w| w.label == "7d");
-            week.left = crate::fact_menu::weekly_facts(sub, walled, now).0;
+            week.said = crate::fact_menu::weekly_facts(sub, walled, now).0;
             week.figure = crate::fact_menu::session_figure(sub, now);
             week.label.clone_from(&sub.label);
         }

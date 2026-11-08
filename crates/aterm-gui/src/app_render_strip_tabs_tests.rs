@@ -41,15 +41,9 @@ fn the_strip_floor_is_what_the_frame_puts_under_the_seam() {
     let wid = WindowId(0);
     app.tab_strip_rows = 1;
     let header = app.chrome_palette(crate::app_render::ChromeSurface::Header);
-    let band = crate::chrome_band::band_colors(header).bar_bg;
     let ground = crate::settings::u32_rgb(header.theme.bg);
 
-    assert_eq!(app.strip_floor(wid, 0, header), tab_bar::StripFloor::Ground);
-    assert_eq!(
-        app.strip_floor(wid, 1, header),
-        tab_bar::StripFloor::Surface(band),
-        "the message band under the strip"
-    );
+    assert_eq!(app.strip_floor(wid, header), tab_bar::StripFloor::Ground);
 
     term_lock(&app.pool.get(0).expect("session 0").term).process(b"\r\n\r\n\r\n\r\nhit\r\n");
     find(&mut app, wid, "hit");
@@ -59,16 +53,16 @@ fn the_strip_floor_is_what_the_frame_puts_under_the_seam() {
     )
     .bar_bg;
     assert_eq!(
-        app.strip_floor(wid, 0, header),
+        app.strip_floor(wid, header),
         tab_bar::StripFloor::Surface(panel),
         "the find panel under the strip"
     );
     app.search_cancel();
-    assert_eq!(app.strip_floor(wid, 0, header), tab_bar::StripFloor::Ground);
+    assert_eq!(app.strip_floor(wid, header), tab_bar::StripFloor::Ground);
 
     app.split_active_stub_tab(wid);
     crate::reset_visible_leaf_plan_builds();
-    let floor = app.strip_floor(wid, 0, header);
+    let floor = app.strip_floor(wid, header);
     assert_eq!(
         crate::visible_leaf_plan_builds(),
         0,
@@ -86,7 +80,7 @@ fn the_strip_floor_is_what_the_frame_puts_under_the_seam() {
     )
     .surface;
     assert_eq!(
-        app.strip_floor(wid, 0, header),
+        app.strip_floor(wid, header),
         tab_bar::StripFloor::Surface(page),
         "Settings in front"
     );

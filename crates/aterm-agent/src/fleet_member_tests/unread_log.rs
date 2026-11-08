@@ -67,26 +67,53 @@ fn relabel(registry: &aterm_db::alab::Registry, mac: &str, label: &str) {
 fn a_registry_label_waits_for_its_local_writer() {
     let lab = Lab::new("registry-label-writer");
     label_this_mac(&lab, "m42");
-    let target = registry_target_started(
-        &lab.places,
-        "m42",
-        std::time::Instant::now() - std::time::Duration::from_secs(16),
-    )
-    .unwrap()
-    .unwrap();
+    let target = registry_target(&lab.places, "m42").unwrap().unwrap();
     assert_eq!(target.transport, own_node().node());
     let principal = member::node_principal(own_node().key());
     assert_eq!(target.node, principal);
 
+    // Both real command routes must spend only their caller's budget resolving a label.
+    // Ready roster facts require no wait; the expired registry read must refuse before the
+    // own-label resolution could turn into the different self-target refusal.
+    {
+        let book = member::hold_book(&lab.places.state).unwrap();
+        book.write_key(&[0x44; 24]).unwrap();
+        crate::fleet_vault::take(&book, Vault::configured(&lab.paths).as_ref()).unwrap();
+    }
+    let Err(drive) = drive_fleet_in(&lab.places, "m42", Duration::ZERO) else {
+        panic!("an expired drive cannot resolve the label");
+    };
+    let Err(survey) = survey_fleet_in(
+        &lab.places,
+        &aterm_ctl::FleetAsk {
+            host: Some("m42"),
+            within: Duration::ZERO,
+        },
+    ) else {
+        panic!("an expired survey cannot resolve the label");
+    };
+    for why in [&drive.why, &survey.why] {
+        assert!(why.contains("registry unread"), "{why}");
+        assert!(!why.contains("this machine itself"), "{why}");
+    }
+    let Err(drive) = drive_fleet_in(&lab.places, "m42", HANG) else {
+        panic!("the resolved label names this machine");
+    };
+    let Err(survey) = survey_fleet_in(
+        &lab.places,
+        &aterm_ctl::FleetAsk {
+            host: Some("m42"),
+            within: HANG,
+        },
+    ) else {
+        panic!("the resolved label names this machine");
+    };
+    for why in [&drive.why, &survey.why] {
+        assert!(why.contains("this machine itself"), "{why}");
+    }
+
     let held = client::test_hold_state_lock(&lab.paths).unwrap();
-    assert!(
-        registry_target_started(
-            &lab.places,
-            "m42",
-            std::time::Instant::now() - std::time::Duration::from_secs(61),
-        )
-        .is_err()
-    );
+    assert!(registry_target_until(&lab.places, "m42", Instant::now()).is_err());
     drop(held);
     assert_eq!(
         registry_target(&lab.places, "m42")
@@ -96,14 +123,10 @@ fn a_registry_label_waits_for_its_local_writer() {
         own_node().node()
     );
     assert_eq!(
-        registry_target_started(
-            &lab.places,
-            &principal,
-            std::time::Instant::now() - std::time::Duration::from_secs(61),
-        )
-        .unwrap()
-        .unwrap()
-        .transport,
+        registry_target_until(&lab.places, &principal, Instant::now())
+            .unwrap()
+            .unwrap()
+            .transport,
         own_node().node(),
         "an explicit node needs no registry but retains membership validation"
     );

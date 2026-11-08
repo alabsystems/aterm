@@ -274,7 +274,7 @@ pub fn published_index_run() -> Result<IndexHint, String> {
     slug.push('/');
     slug.push_str(crate::manifest::INDEX_REPO);
     let (newest, low) = newest_index(0, &mut |build| {
-        head_verdict(&slug, build, &Wire).map_err(|(msg, _)| msg)
+        head_verdict(&slug, build, &Wire).map_err(|(msg, _, _)| msg)
     })?;
     Ok(IndexHint {
         low: Some(low),
@@ -310,6 +310,8 @@ fn fetch_run(
     slug: &str,
     (newest, low): (u64, u64),
     fetch: &WebFetch<'_>,
+    cache: Option<&crate::signed_artifact_cache::SignedArtifactCache<'_>>,
+    cache_source: Option<&str>,
     first_error: &mut Option<String>,
 ) -> Result<Vec<Candidate>, String> {
     let oldest = newest.saturating_sub(INDEX_CANDIDATE_CAP - 1).max(low);
@@ -320,9 +322,26 @@ fn fetch_run(
             index_quad(slug, &tag).ok_or_else(|| underivable(slug, &tag))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let cached: Vec<Option<Candidate>> = quads
+        .iter()
+        .map(|quad| {
+            let cache = cache?;
+            let source = cache_source?;
+            let key = crate::signed_artifact_cache::SignedIndexKey::release(source, &quad.label)?;
+            cache.load_index(
+                &key,
+                usize::try_from(MANIFEST_CAP).unwrap_or(usize::MAX),
+                usize::try_from(SIG_CAP).unwrap_or(usize::MAX),
+                usize::try_from(ROSTER_CAP).unwrap_or(usize::MAX),
+                usize::try_from(SIG_CAP).unwrap_or(usize::MAX),
+            )
+        })
+        .collect();
     let assets: Vec<(&str, u64)> = quads
         .iter()
-        .flat_map(|quad| {
+        .zip(&cached)
+        .filter(|(_, candidate)| candidate.is_none())
+        .flat_map(|(quad, _)| {
             [
                 (quad.index.as_str(), MANIFEST_CAP),
                 (quad.index_sig.as_str(), SIG_CAP),
@@ -338,10 +357,17 @@ fn fetch_run(
             .unwrap_or_else(|| Err(underivable(slug, "an index asset")))
     };
     let mut out = Vec::new();
-    for quad in &quads {
-        match whole_quad(&quad.label, [take(), take(), take(), take()]) {
+    for (quad, cached) in quads.iter().zip(cached) {
+        let candidate = cached.map_or_else(
+            || whole_quad(&quad.label, [take(), take(), take(), take()]),
+            Ok,
+        );
+        match candidate {
             Ok(candidate) => out.push(candidate),
             Err(e) => {
+                if signed_index_asset_error_is_transport(&e) {
+                    return Err(e);
+                }
                 first_error.get_or_insert(e);
             }
         }
@@ -426,16 +452,17 @@ type WebFetch<'a> = dyn Fn(&str, u64) -> Result<Vec<u8>, String> + Sync + 'a;
 
 type ManifestFetch<'a> = dyn Fn(&str, &str, u64) -> Result<(Vec<u8>, Vec<u8>), String> + Sync + 'a;
 
-type HeadVerdict = Result<bool, (String, bool)>;
+/// `Err(message, link_down, transport_failed)` for one freshness probe.
+type HeadVerdict = Result<bool, (String, bool, bool)>;
 
 fn head_verdict(slug: &str, build: u64, head: &HeadFn<'_>) -> HeadVerdict {
     let url = index_head_url(slug, build)?;
     read_head_answer(&url, build, head.whole(&url))
 }
 
-fn index_head_url(slug: &str, build: u64) -> Result<String, (String, bool)> {
+fn index_head_url(slug: &str, build: u64) -> Result<String, (String, bool, bool)> {
     let tag = index_tag(build);
-    web_asset_url(slug, &tag, "index.toml").ok_or_else(|| (underivable(slug, &tag), false))
+    web_asset_url(slug, &tag, "index.toml").ok_or_else(|| (underivable(slug, &tag), false, false))
 }
 
 fn read_head_answer(
@@ -450,7 +477,7 @@ fn read_head_answer(
         msg.push_str(url);
         msg.push_str(": ");
         msg.push_str(&e.to_string());
-        (msg, link_down)
+        (msg, link_down, true)
     })?;
     let code = answer.code;
     match classify(build, Ok(answer)) {
@@ -462,7 +489,7 @@ fn read_head_answer(
             msg.push_str(" answered ");
             msg.push_str(&code.to_string());
             msg.push_str(", not GitHub's redirect to a release asset");
-            Err((msg, false))
+            Err((msg, false, true))
         }
     }
 }
@@ -640,15 +667,26 @@ pub struct GithubFetcher {
     /// A build something saw published, and where the run starts when that is known
     /// ([`Self::with_index_hint`]): a guess the discovery rounds follow, never an answer.
     index_hint: Option<IndexHint>,
+    /// The package layout whose content-addressed signed-document cache can answer exact index
+    /// releases after the live HEAD walk selects their immutable labels. Ad-hoc/test fetchers
+    /// have none and retain the transport-only behavior.
+    artifact_layout: Option<crate::store::Layout>,
     /// Whether the last discovery's HEAD failed on the link (curl reached no host), which
     /// [`crate::flow::Fetcher::index_link_down`] reads.
     link_down: std::sync::atomic::AtomicBool,
+    /// Whether the last candidate discovery failed while reading channel freshness rather than
+    /// receiving a source verdict. Kept separately from `link_down`: an HTTP 5xx reached a host
+    /// but still did not answer the freshness question.
+    transport_failed: std::sync::atomic::AtomicBool,
     /// What the last discovery asked (its HEADs, the rounds they went out in, its asset GETs),
     /// for the package log's `index-resolved` line.
     walk_cost: [std::sync::atomic::AtomicU32; 3],
     /// Per-invocation memo of the raw `(pkg-<program>-<build>.toml, .sig)` bytes, keyed by
     /// `(slug, program, build)`.
     manifests: ManifestMemo,
+    /// One whole manifest-pair API fallback per fetcher, claimed before native requests and
+    /// never refunded. Normal web reads and successful manifest memo hits consume none.
+    manifest_api_used: std::sync::atomic::AtomicBool,
     /// The LAN peers an archive download races ([`crate::peers::unit_peers`]: `[packages]
     /// peers`, else this machine's fleet members; [`crate::peers::race`]).
     unit_peers: Vec<String>,
@@ -664,9 +702,12 @@ impl GithubFetcher {
             index: std::sync::Mutex::new(None),
             index_floor: 0,
             index_hint: None,
+            artifact_layout: None,
             link_down: std::sync::atomic::AtomicBool::new(false),
+            transport_failed: std::sync::atomic::AtomicBool::new(false),
             walk_cost: Default::default(),
             manifests: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            manifest_api_used: std::sync::atomic::AtomicBool::new(false),
             unit_peers: Vec::new(),
         }
     }
@@ -697,6 +738,13 @@ impl GithubFetcher {
     #[must_use]
     pub const fn with_index_hint(mut self, hint: Option<IndexHint>) -> Self {
         self.index_hint = hint;
+        self
+    }
+
+    /// Attach the layout that owns durable, verified signed-artifact copies.
+    #[must_use]
+    pub fn with_artifact_layout(mut self, layout: &crate::store::Layout) -> Self {
+        self.artifact_layout = Some(layout.clone());
         self
     }
 
@@ -746,11 +794,19 @@ impl GithubFetcher {
                 .map_err(|error| format!("{program} build {build} package signature on {slug} tag {tag} asset {sig_name}: {error}"))?;
             Ok((toml, sig))
         })()
-        .or_else(|web: String| {
-            api(&slug, program, build).map_err(|api| {
-                format!("package metadata web fetch failed: {web}; API fetch failed: {api}")
-            })
-        })?;
+            .or_else(|web: String| {
+                if self.manifest_api_used.compare_exchange(
+                    false, true, std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                ).is_err() {
+                    return Err(format!(
+                        "package metadata web fetch failed: {web}; this fetcher's one manifest-pair API fallback is already spent"
+                    ));
+                }
+                api(&slug, program, build).map_err(|api| {
+                    format!("package metadata web fetch failed: {web}; API fetch failed: {api}")
+                })
+            })?;
         let pair = std::sync::Arc::new(pair);
         if let Ok(mut memo) = self.manifests.lock() {
             memo.insert(key, std::sync::Arc::clone(&pair));
@@ -797,13 +853,23 @@ impl GithubFetcher {
     ) -> Result<Vec<Candidate>, String> {
         self.link_down
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.transport_failed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let [heads_asked, rounds, gets] = &self.walk_cost;
         for count in &self.walk_cost {
             count.store(0, std::sync::atomic::Ordering::Relaxed);
         }
         let counted = |url: &str, cap: u64| {
             gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            fetch(url, cap)
+            let answer = fetch(url, cap);
+            if answer
+                .as_ref()
+                .is_err_and(|error| signed_index_asset_error_is_transport(error))
+            {
+                self.transport_failed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            answer
         };
         let fetch: &WebFetch<'_> = &counted;
         let mut known = std::collections::BTreeMap::<u64, HeadVerdict>::new();
@@ -837,9 +903,13 @@ impl GithubFetcher {
             }
             match known.get(&build) {
                 Some(Ok(published)) => Ok(*published),
-                Some(Err((msg, link_down))) => {
+                Some(Err((msg, link_down, transport_failed))) => {
                     if *link_down {
                         self.link_down
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if *transport_failed {
+                        self.transport_failed
                             .store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     Err(msg.clone())
@@ -849,8 +919,20 @@ impl GithubFetcher {
         };
         let floor = self.index_floor;
         let run = newest_index(floor, &mut |build| probe_from(floor, build))?;
+        let artifact_cache = self
+            .artifact_layout
+            .as_ref()
+            .map(crate::signed_artifact_cache::SignedArtifactCache::for_layout);
+        let cache_source = github_source_id(&self.owner);
         let mut first_error: Option<String> = None;
-        let mut out = fetch_run(slug, run, fetch, &mut first_error)?;
+        let mut out = fetch_run(
+            slug,
+            run,
+            fetch,
+            artifact_cache.as_ref(),
+            Some(&cache_source),
+            &mut first_error,
+        )?;
         if out.is_empty()
             && floor > 0
             && run.0 == floor
@@ -858,7 +940,14 @@ impl GithubFetcher {
             && let Ok(found) = newest_index(0, &mut |build| probe_from(0, build))
             && found.0 < floor - 1
         {
-            out = fetch_run(slug, found, fetch, &mut first_error)?;
+            out = fetch_run(
+                slug,
+                found,
+                fetch,
+                artifact_cache.as_ref(),
+                Some(&cache_source),
+                &mut first_error,
+            )?;
         }
         if out.is_empty() {
             return Err(first_error.unwrap_or_else(|| underivable(slug, "the index")));
@@ -900,6 +989,48 @@ impl crate::flow::Fetcher for GithubFetcher {
 
     fn index_link_down(&self) -> bool {
         self.link_down.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn index_error_is_transport(&self, _error: &str) -> bool {
+        self.transport_failed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn cache_verified_index(&self, index_build: u64, candidate: &Candidate) {
+        let Some(layout) = &self.artifact_layout else {
+            return;
+        };
+        if candidate.label != index_tag(index_build) {
+            eprintln!(
+                "atpkg: verified index {} was not cached under noncanonical label {}",
+                index_build, candidate.label
+            );
+            return;
+        }
+        let source = github_source_id(&self.owner);
+        let Some(key) =
+            crate::signed_artifact_cache::SignedIndexKey::release(&source, &candidate.label)
+        else {
+            eprintln!(
+                "atpkg: verified index {} has no immutable cache key",
+                candidate.label
+            );
+            return;
+        };
+        let cache = crate::signed_artifact_cache::SignedArtifactCache::for_layout(layout);
+        if let Err(error) = cache.store_verified_index(
+            &key,
+            candidate,
+            usize::try_from(MANIFEST_CAP).unwrap_or(usize::MAX),
+            usize::try_from(SIG_CAP).unwrap_or(usize::MAX),
+            usize::try_from(ROSTER_CAP).unwrap_or(usize::MAX),
+            usize::try_from(SIG_CAP).unwrap_or(usize::MAX),
+        ) {
+            eprintln!(
+                "atpkg: verified index {} signed documents were not cached ({error})",
+                candidate.label
+            );
+        }
     }
 
     fn pkg_manifest(
@@ -1008,14 +1139,23 @@ impl crate::flow::Fetcher for GithubFetcher {
     fn source_id(&self) -> String {
         github_source_id(&self.owner)
     }
-
     fn package_source_id(&self, repo: &str, program: &str) -> Option<String> {
         Some(format!("github:{}", self.slug_for(program, repo)))
     }
 }
 
+/// An immutable index asset's read failed in transport rather than receiving the exact 404
+/// source verdict. URL-construction refusals are local/source errors; rate limits and HTTP 5xx
+/// are transport availability failures even though the host answered.
+fn signed_index_asset_error_is_transport(error: &str) -> bool {
+    !aterm_update_core::download_error_is_not_found(error)
+        && !error.starts_with("refusing asset URL with non-https scheme")
+        && !error.starts_with("not the release download host")
+        && !error.starts_with("no release download URL derives")
+}
+
 /// The §14 cache key of the GitHub source under `owner`.
-pub(crate) fn github_source_id(owner: &str) -> String {
+pub fn github_source_id(owner: &str) -> String {
     format!("github:{owner}/{}", crate::discovery::index_repo())
 }
 
@@ -1196,6 +1336,121 @@ mod tests {
         let (raw, sig) = f.manifest_pair("aterm", "cpython", 1, &web, &api).unwrap();
         assert!(raw.ends_with(b"pkg-cpython-1.toml"));
         assert!(sig.ends_with(b"pkg-cpython-1.toml.sig"));
+        let unavailable_web = |_: &str, _: u64| Err("HTTP 504".to_string());
+        let fallback = |_: &str, _: &str, _: u64| Ok((b"toml".to_vec(), b"sig".to_vec()));
+        assert_eq!(
+            f.manifest_pair("aterm", "lean", 3, &unavailable_web, &fallback)
+                .unwrap(),
+            (b"toml".to_vec(), b"sig".to_vec()),
+            "the successful web pair left the fallback allowance available"
+        );
+    }
+
+    #[test]
+    fn concurrent_manifest_failures_share_one_api_pair_allowance() {
+        let f = GithubFetcher::new("alabsystems".into());
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let hang = std::time::Duration::from_secs(60);
+        let web = |_: &str, _: u64| {
+            ready_tx.send(()).map_err(|error| error.to_string())?;
+            release_rx
+                .lock()
+                .map_err(|error| error.to_string())?
+                .recv_timeout(hang)
+                .map_err(|error| error.to_string())?;
+            Err("HTTP 504".to_string())
+        };
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let api = |_: &str, _: &str, _: u64| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok((b"toml".to_vec(), b"sig".to_vec()))
+        };
+        let (ready, results) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| f.manifest_pair("aterm", "cpython", 1, &web, &api));
+            let second = scope.spawn(|| f.manifest_pair("aterm", "lean", 3, &web, &api));
+            // Each of the two requests starts both web halves in the same wave.
+            let ready = std::array::from_fn::<_, 4, _>(|_| ready_rx.recv_timeout(hang));
+            for _ in 0..4 {
+                let _ = release_tx.send(());
+            }
+            (ready, [first.join().unwrap(), second.join().unwrap()])
+        });
+        assert!(ready.iter().all(Result::is_ok));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let refused = results.into_iter().find_map(Result::err).unwrap();
+        assert!(refused.contains("HTTP 504") && refused.contains("already spent"));
+    }
+
+    #[test]
+    fn a_failed_manifest_api_pair_does_not_refund_the_allowance() {
+        let f = GithubFetcher::new("alabsystems".into());
+        let web = |_: &str, _: u64| Err("HTTP 504".to_string());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let api = |_: &str, _: &str, _: u64| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err("API denied".to_string())
+        };
+        let first = f
+            .manifest_pair("aterm", "cpython", 1, &web, &api)
+            .unwrap_err();
+        let second = f.manifest_pair("aterm", "lean", 3, &web, &api).unwrap_err();
+        assert!(first.contains("API denied"));
+        assert!(second.contains("HTTP 504") && second.contains("already spent"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(f.manifests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_repository_override_has_a_distinct_durable_artifact_namespace() {
+        let official = GithubFetcher::new("alabsystems".into());
+        let official_source =
+            crate::flow::Fetcher::package_source_id(&official, "aterm", "cpython").unwrap();
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("cpython".into(), "private/tools".into());
+        let overridden = GithubFetcher::new("alabsystems".into()).with_overrides(overrides);
+        let overridden_source =
+            crate::flow::Fetcher::package_source_id(&overridden, "aterm", "cpython").unwrap();
+        assert_eq!(official_source, "github:alabsystems/aterm");
+        assert_eq!(overridden_source, "github:private/tools");
+        assert_ne!(official_source, overridden_source);
+    }
+
+    #[test]
+    fn a_newest_exact_quad_transport_failure_never_selects_an_older_release() {
+        let slug = "alabsystems/aterm";
+        let mut first_error = None;
+        let fetch = |url: &str, _cap: u64| {
+            if url.contains("/atpkg-index-2/") {
+                Err(format!(
+                    "curl asset download failed with HTTP 504 for {url}"
+                ))
+            } else {
+                Ok(url.as_bytes().to_vec())
+            }
+        };
+        let error = fetch_run(slug, (2, 1), &fetch, None, None, &mut first_error).unwrap_err();
+        assert!(error.contains("HTTP 504"), "{error}");
+
+        let mut first_error = None;
+        let absent = |url: &str, _cap: u64| {
+            if url.contains("/atpkg-index-2/") {
+                Err(format!("HTTP 404 for {url}: release carries no asset"))
+            } else {
+                Ok(url.as_bytes().to_vec())
+            }
+        };
+        let candidates = fetch_run(slug, (2, 1), &absent, None, None, &mut first_error).unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| c.label.as_str())
+                .collect::<Vec<_>>(),
+            ["atpkg-index-1"],
+            "negative control: an answered missing release is not a transport outage"
+        );
     }
 
     #[test]
@@ -2159,6 +2414,9 @@ mod tests {
         publication: std::cell::RefCell<Publication>,
         /// The builds up to which an index's freshness window has already lapsed.
         lapsed_through: std::cell::Cell<u64>,
+        head_reads: std::sync::atomic::AtomicUsize,
+        asset_reads: std::sync::atomic::AtomicUsize,
+        assets_fail: std::sync::atomic::AtomicBool,
     }
 
     impl crate::flow::Fetcher for SignedChannel {
@@ -2166,12 +2424,16 @@ mod tests {
             use crate::sig::testkit;
             let p = self.publication.borrow().clone();
             let lapsed_through = self.lapsed_through.get();
+            let head_reads = &self.head_reads;
+            let asset_reads = &self.asset_reads;
+            let assets_fail = &self.assets_fail;
             let up = |build: u64| p.run.as_ref().is_some_and(|run| run.contains(&build));
             let generation =
                 |newer_from: u64, build: u64| testkit::SEQ + u64::from(build >= newer_from);
             self.fetcher.walk_candidates(
                 &self.fetcher.index_slug(),
                 &|url: &str| {
+                    head_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     if p.run.is_none() {
                         return Err(aterm_update_core::HttpError::Transport(
                             "curl: (6) Could not resolve host".into(),
@@ -2184,6 +2446,10 @@ mod tests {
                     }
                 },
                 &|url: &str, _cap: u64| {
+                    asset_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if assets_fail.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err("exact release transport is blocked".into());
+                    }
                     let (build, asset) = url
                         .split_once("/atpkg-index-")
                         .and_then(|(_, rest)| rest.split_once('/'))
@@ -2226,6 +2492,9 @@ mod tests {
         fn index_link_down(&self) -> bool {
             self.fetcher.index_link_down()
         }
+        fn cache_verified_index(&self, build: u64, candidate: &Candidate) {
+            crate::flow::Fetcher::cache_verified_index(&self.fetcher, build, candidate);
+        }
         fn pkg_manifest(&self, _: &str, _: &str, _: u64) -> Result<(Vec<u8>, Vec<u8>), String> {
             Err("not asked".into())
         }
@@ -2235,6 +2504,80 @@ mod tests {
         fn source_id(&self) -> String {
             github_source_id("alabsystems")
         }
+    }
+
+    #[test]
+    fn a_verified_exact_index_survives_blocked_asset_transport_but_not_corruption() {
+        use crate::sig::testkit;
+        use std::sync::atomic::Ordering;
+
+        let store = crate::testdir::absent_layout("atpkg-net-signed-index-cache-");
+        let f = SignedChannel {
+            fetcher: GithubFetcher::new("alabsystems".into())
+                .with_index_floor(47)
+                .with_artifact_layout(&store),
+            publication: std::cell::RefCell::new(Publication {
+                run: Some(47..=47),
+                newer_roster_from: u64::MAX,
+                newer_index_from: u64::MAX,
+                outsider_from: u64::MAX,
+            }),
+            lapsed_through: std::cell::Cell::new(0),
+            head_reads: std::sync::atomic::AtomicUsize::new(0),
+            asset_reads: std::sync::atomic::AtomicUsize::new(0),
+            assets_fail: std::sync::atomic::AtomicBool::new(false),
+        };
+        let resolve = || {
+            crate::flow::resolve_verified_index(
+                &f,
+                &store,
+                &testkit::anchor(),
+                crate::sig::BuildFloor::default(),
+                testkit::NOW,
+            )
+        };
+
+        assert_eq!(resolve().unwrap().index_build, 47);
+        assert!(f.head_reads.load(Ordering::SeqCst) > 0);
+        assert_eq!(f.asset_reads.load(Ordering::SeqCst), 4);
+
+        f.head_reads.store(0, Ordering::SeqCst);
+        f.asset_reads.store(0, Ordering::SeqCst);
+        f.assets_fail.store(true, Ordering::SeqCst);
+        assert_eq!(resolve().unwrap().index_build, 47);
+        assert!(
+            f.head_reads.load(Ordering::SeqCst) > 0,
+            "freshness HEADs remain live"
+        );
+        assert_eq!(
+            f.asset_reads.load(Ordering::SeqCst),
+            0,
+            "the verified exact quad needs no transport"
+        );
+
+        let source = github_source_id("alabsystems");
+        let key = crate::signed_artifact_cache::SignedIndexKey::release(&source, "atpkg-index-47")
+            .unwrap();
+        let cache = crate::signed_artifact_cache::SignedArtifactCache::for_layout(&store);
+        let object = cache
+            .object_path_for_index(&key)
+            .expect("cached exact quad");
+        std::fs::write(object, b"changed after verification").unwrap();
+        let _ = std::fs::remove_file(store.prefix.join("index-cache.toml"));
+        f.head_reads.store(0, Ordering::SeqCst);
+        f.asset_reads.store(0, Ordering::SeqCst);
+        f.assets_fail.store(false, Ordering::SeqCst);
+        f.publication.borrow_mut().outsider_from = 47;
+        assert!(
+            resolve().is_err(),
+            "the mismatched network signature is refused"
+        );
+        assert!(f.head_reads.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            f.asset_reads.load(Ordering::SeqCst),
+            4,
+            "corruption turns the local object into a miss"
+        );
     }
 
     #[test]
@@ -2250,6 +2593,9 @@ mod tests {
                 outsider_from: u64::MAX,
             }),
             lapsed_through: std::cell::Cell::new(0),
+            head_reads: std::sync::atomic::AtomicUsize::new(0),
+            asset_reads: std::sync::atomic::AtomicUsize::new(0),
+            assets_fail: std::sync::atomic::AtomicBool::new(false),
         };
         let pass = |run: Option<std::ops::RangeInclusive<u64>>,
                     roster_from: u64,
@@ -2428,7 +2774,7 @@ mod tests {
             loop {
                 let mut need = None;
                 let found = newest_index(floor, &mut |b| match known.get(&b) {
-                    Some(verdict) => verdict.clone().map_err(|(msg, _)| msg),
+                    Some(verdict) => verdict.clone().map_err(|(msg, _, _)| msg),
                     None => {
                         need = Some(b);
                         Err(String::new())
@@ -2673,7 +3019,9 @@ mod tests {
         let after = aterm_update_core::head_no_redirect(&index_head_url(slug, 8).unwrap());
         let said = |verdict: &HeadVerdict| match verdict {
             Ok(published) => format!("ok {published}"),
-            Err((_, link_down)) => format!("err link_down={link_down}"),
+            Err((_, link_down, transport_failed)) => {
+                format!("err link_down={link_down} transport_failed={transport_failed}")
+            }
         };
         let mut out: Vec<String> = round.iter().map(said).collect();
         out.push(match after {
@@ -2744,9 +3092,9 @@ mod tests {
         assert_eq!(
             verdicts,
             [
-                "err link_down=true",
-                "err link_down=true",
-                "err link_down=true",
+                "err link_down=true transport_failed=true",
+                "err link_down=true transport_failed=true",
+                "err link_down=true transport_failed=true",
                 "after err transport",
             ]
         );
@@ -2758,7 +3106,12 @@ mod tests {
         );
         assert_eq!(
             verdicts,
-            ["ok false", "ok false", "err link_down=true", "after 404"]
+            [
+                "ok false",
+                "ok false",
+                "err link_down=true transport_failed=true",
+                "after 404",
+            ]
         );
     }
 

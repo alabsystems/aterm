@@ -22,6 +22,7 @@ pub mod cli;
 pub mod compile_account;
 pub mod compile_width;
 mod compiler_message;
+mod compiler_observation;
 /// The disk a run will write, claimed before it builds (`docs/DESIGN-adaptive-build-2026-10-24.md`, DISK-ADMIT).
 #[cfg(unix)]
 pub mod disk;
@@ -59,6 +60,7 @@ pub mod status;
 pub mod test_history;
 pub mod test_index;
 pub mod test_plan;
+mod test_progress;
 mod test_workers;
 pub mod testrun;
 pub mod unitgraph;

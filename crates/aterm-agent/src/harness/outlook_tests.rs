@@ -1024,10 +1024,10 @@ fn scenarios_to_the_minute() {
             lean: None
         }
     );
-    let words = b.verdict_words().unwrap();
+    let words = b.verdict_phrase().unwrap();
     // 75 hours ahead, the start rounds down to the hour; the reset is exact.
     assert_eq!(words.full, "\u{2573} ~Wed 22:00\u{2013}Thu 09:00");
-    assert!(words.warn && words.kept_narrow);
+    assert!(words.ink == Role::Warn && words.kept);
 
     // C: alt1 leaves early onto `pool1` (shared, never read) at Wed 15:00: the worst case is B's
     // stop, the best none.
@@ -1067,7 +1067,7 @@ fn scenarios_to_the_minute() {
     let alt1_reset = NOW + 100 * MIN;
     assert_eq!(stops(working)[0], (alt1_wall, StopEnd::Reset(alt1_reset)));
     assert_eq!(
-        d.verdict_words().unwrap().full,
+        d.verdict_phrase().unwrap().full,
         "\u{2573} ~20:10\u{2013}21:10"
     );
 }
@@ -1098,9 +1098,13 @@ fn a_lean_bounds_both_ways() {
     };
     assert_eq!(row, "pool1");
     assert!(stop.is_some(), "its worst case stops");
-    let words = out.verdict_words().unwrap();
-    assert!(!words.warn, "a lean is not a stop");
-    assert!(words.full.ends_with("then pool1 ?"), "{}", words.full);
+    let words = out.verdict_phrase().unwrap();
+    assert_ne!(words.ink, Role::Warn, "a lean is not a stop");
+    assert!(
+        words.full.starts_with("? pool1 unread from ~"),
+        "{}",
+        words.full
+    );
     // Both branches stop: a stop with `?`.
     let mut both = scenario_c();
     both.read("pool1", None, Some((990, SAT8)), NOW - 5 * H);
@@ -1110,7 +1114,12 @@ fn a_lean_bounds_both_ways() {
         "{:?}",
         out.verdict
     );
-    assert!(out.verdict_words().unwrap().full.ends_with(" ?"));
+    let words = out.verdict_phrase().unwrap();
+    assert!(
+        words.ink == Role::Warn && words.full.starts_with("\u{2573} "),
+        "the stop both branches meet: {}",
+        words.full
+    );
 }
 
 #[test]
@@ -1877,6 +1886,18 @@ fn text_and_json_one_model() {
             }
         }
     }
+}
+
+/// The CLI's outlook says a projection short of a fill at most `~99%`: its whole percent is half
+/// up but `100` only at 1000 tenths (§2.1), so 99.5 to 99.9 by reset is `~99%`, never the `~100%`
+/// that reads as full. Negative control: plain half up (`(x10 + 5) / 10`) says 995 as 100.
+#[test]
+fn the_clis_projection_is_never_said_full_short_of_a_fill() {
+    assert_eq!(
+        [994, 995, 999, 1000, 1200].map(whole),
+        [99, 99, 99, 100, 100]
+    );
+    assert_eq!([0, 4, 5, 625].map(whole), [0, 0, 1, 63]);
 }
 
 /// The scenarios the card and the footer are drawn for.
@@ -2695,28 +2716,21 @@ fn every_assumption_is_said_on_the_card_and_in_the_text() {
     }
 }
 
-/// A STOP'S WORDS LEAD WITH ITS MARK: every warn form (full, short and shortest) of every
-/// projected stop in B and D (the week's and the 5-hour one alike) begins with `╳`, the gap,
-/// and a wall standing now with `⧗`, its one meaning (glass design §4.3). The words never name
-/// the 5-hour window (§2.3). Negative controls: a short form without the mark fails it; the
+/// A STOP'S WORDS LEAD WITH ITS MARK: both forms (full and short) of the verdict's phrase
+/// ([`Outlook::verdict_phrase`], the quota row's phrase 2, which the CLI says) of every
+/// projected stop in B and D (the week's and the 5-hour one alike) begin with `╳`, the gap, and
+/// a wall standing now with `⧗`, its one meaning (glass design §4.3). The words never name the
+/// 5-hour window (§2.3). Negative controls: a short form without the mark fails it; the
 /// projected stop marked `⧗` (the words before the glass design) fails the first loop.
 #[test]
 fn a_stops_words_lead_with_its_mark() {
-    let forms = |words: &VerdictWords| -> Vec<String> {
-        [
-            Some(&words.full),
-            Some(&words.short),
-            words.shortest.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .cloned()
-        .collect()
+    let forms = |words: &crate::harness::quota_view::Phrase| -> [String; 2] {
+        [words.full.clone(), words.short.clone()]
     };
     for fx in [scenario_b(), scenario_d()] {
         let out = fx.outlook();
-        let words = out.verdict_words().expect("a stop");
-        assert!(words.warn);
+        let words = out.verdict_phrase().expect("a stop");
+        assert_eq!(words.ink, Role::Warn);
         for form in forms(&words) {
             assert!(form.starts_with("\u{2573} "), "{form}");
             assert!(!form.contains("5h") && !form.contains("stop"), "{form}");
@@ -2738,8 +2752,8 @@ fn a_stops_words_lead_with_its_mark() {
         "{:?}",
         out.verdict
     );
-    let words = out.verdict_words().expect("a wall");
-    assert!(words.warn);
+    let words = out.verdict_phrase().expect("a wall");
+    assert_eq!(words.ink, Role::Warn);
     for form in forms(&words) {
         assert!(form.starts_with('\u{29d7}'), "{form}");
     }
@@ -2848,7 +2862,7 @@ fn a_stop_past_the_horizon_ends_at_the_reset_that_resumes_it() {
             lean: None
         }
     );
-    let words = out.verdict_words().unwrap();
+    let words = out.verdict_phrase().unwrap();
     assert_eq!(
         words.full,
         "\u{2573} ~Thu 12 Nov 04:00\u{2013}Sat 14 Nov 10:00"
@@ -2940,14 +2954,10 @@ fn a_stop_nothing_ends_is_open() {
     assert_eq!(end, StopEnd::Open);
     let said = format!("\u{2573} from {}", out.about(from));
     assert_eq!(said, "\u{2573} from ~Sun 1 Nov 07:00");
-    let words = out.verdict_words().unwrap();
+    let words = out.verdict_phrase().unwrap();
     assert_eq!(
-        (
-            words.full.as_str(),
-            words.short.as_str(),
-            words.shortest.as_deref()
-        ),
-        (said.as_str(), said.as_str(), Some(said.as_str()))
+        (words.full.as_str(), words.short.as_str()),
+        (said.as_str(), said.as_str())
     );
     assert!(
         out.verdict_spoken().contains("with no end in reach"),
@@ -3135,7 +3145,7 @@ fn forecast_instants_round_by_their_lead() {
     assert_eq!(when(round_up(runout, T5, &u), T5, &u), "Thu 12 Nov 06:00");
     let b = scenario_b().outlook();
     assert!(
-        b.verdict_words()
+        b.verdict_phrase()
             .unwrap()
             .full
             .ends_with("\u{2013}Thu 09:00")

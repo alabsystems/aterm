@@ -821,12 +821,13 @@ pub(super) fn clock_local(t: i64, now: i64, tz_at: &dyn Fn(i64) -> i64) -> Strin
     }
 }
 
-/// A percent in tenths as the text says it.
+/// A percent in tenths as the text says it. The whole percent is [`super::decimal::whole_used`]'s,
+/// so no reading under 100 is said as `100%`.
 pub fn percent(x10: u32, tenths: bool) -> String {
     if tenths {
         format!("{}.{}%", x10 / 10, x10 % 10)
     } else {
-        format!("{}%", (x10 + 5) / 10)
+        format!("{}%", super::decimal::whole_used(x10))
     }
 }
 
@@ -1278,7 +1279,7 @@ pub fn window_value(win: &Win, now: i64) -> Value {
     let current = win.current(now);
     o.insert(
         "used_pct".to_owned(),
-        Value::from(current.map(|f| (f.pct_x10 + 5) / 10)),
+        Value::from(current.map(WindowFig::whole)),
     );
     o.insert(
         "used_pct_x10".to_owned(),

@@ -565,6 +565,8 @@ pub enum Failure {
     Refused { kind: Refusal, why: String },
     /// Child process `child` failed with output `said`.
     Child { child: &'static str, said: String },
+    /// A live external read could not answer, so the sync decided nothing about the source.
+    CouldNotRun { why: String },
 }
 
 impl std::fmt::Display for Failure {
@@ -585,7 +587,9 @@ impl std::fmt::Display for Failure {
                 "interrupted (signal {signal}) — nothing further was started; the step it \
                  stopped said: {ended}"
             ),
-            Self::Refused { why, .. } | Self::Child { said: why, .. } => f.write_str(why),
+            Self::Refused { why, .. }
+            | Self::Child { said: why, .. }
+            | Self::CouldNotRun { why } => f.write_str(why),
         }
     }
 }
@@ -606,6 +610,10 @@ fn child_failed(child: &'static str, said: impl Into<String>) -> Failure {
         child,
         said: said.into(),
     }
+}
+
+fn could_not_run(why: impl Into<String>) -> Failure {
+    Failure::CouldNotRun { why: why.into() }
 }
 
 fn short(sha: &str) -> &str {
@@ -770,6 +778,18 @@ fn say(out: &mut dyn Write, line: &str) {
 
 fn read_text(path: &Path) -> Option<String> {
     crate::durable::read_regular_text(path, MAX_SITE_FILE_BYTES).ok()
+}
+
+fn signed_artifact_layout(env: &Env) -> Option<atpkg::Layout> {
+    let home = env.home.as_deref()?;
+    if aterm_types::dirs::home_dir().as_deref() == Some(home) {
+        return atpkg::store::resolve_configured();
+    }
+    // Site-sync integration worlds carry an explicit isolated HOME. Keep their cache beside that
+    // world instead of consulting or changing the operator's configured package store.
+    Some(atpkg::Layout {
+        prefix: atpkg::store::default_prefix(home),
+    })
 }
 
 /// Synchronizes the site checkout to the public commit and elected release downloads.
@@ -1025,19 +1045,27 @@ fn steps(
         (Some(c), _) => c.clone(),
         (None, true) => {
             halt(launch, "asking GitHub for main's tip")?;
-            let sha = world
+            let answer = world
                 .github(&format!("repos/{slug}/commits/main"), false)
-                .ok()
-                .and_then(|j| aterm_json::from_str::<aterm_json::Value>(&j).ok())
-                .and_then(|v| {
-                    v.get("sha")
-                        .and_then(aterm_json::Value::as_str)
-                        .map(str::to_string)
-                })
+                .map_err(|e| {
+                    could_not_run(format!(
+                        "could not read the tip of {slug} main from GitHub's API ({e})"
+                    ))
+                })?;
+            let value: aterm_json::Value = aterm_json::from_str(&answer).map_err(|e| {
+                refusal(
+                    Refusal::Commit,
+                    format!("the tip of {slug} main is not GitHub JSON: {e}"),
+                )
+            })?;
+            let sha = value
+                .get("sha")
+                .and_then(aterm_json::Value::as_str)
+                .map(str::to_string)
                 .ok_or_else(|| {
-                    child_failed(
-                        "github",
-                        format!("could not read the tip of {slug} main from GitHub's API"),
+                    refusal(
+                        Refusal::Commit,
+                        format!("the tip of {slug} main names no commit sha"),
                     )
                 })?;
             say(out, &format!("--latest: {slug} main is at {sha}"));
@@ -1196,14 +1224,10 @@ fn steps(
         None => world
             .github(&format!("repos/{slug}/releases?per_page=100"), true)
             .map_err(|e| {
-                child_failed(
-                    "github",
-                    format!(
-                        "could not list releases for {slug} from GitHub's API — the complete \
-                         history, every page ({})",
-                        last_line(&e)
-                    ),
-                )
+                could_not_run(format!(
+                    "could not list releases for {slug} from GitHub's API — the complete \
+                     history, every page ({e})"
+                ))
             })?,
     };
     let catalog = releases::parse_releases(&list).map_err(|e| {
@@ -1212,6 +1236,7 @@ fn steps(
             format!("releases JSON is not valid JSON: {e}"),
         )
     })?;
+    let signed_artifacts = signed_artifact_layout(env);
     halt(launch, "the downloads were elected")?;
     let mut notes = Vec::new();
     let masters: Vec<&str> = env.masters.iter().map(String::as_str).collect();
@@ -1221,6 +1246,7 @@ fn steps(
             slug,
             masters: &masters,
             now_unix: env.now_unix,
+            artifact_layout: signed_artifacts.as_ref(),
             get: &mut get,
         };
         releases::elect(&catalog, slug, &mut chain, &mut notes)
@@ -1323,8 +1349,16 @@ fn steps(
     halt(launch, "the toolchain facts were read")?;
     let levels = {
         let mut get = |url: &str, limit: u64| world.download(url, limit);
-        toolchain::fetch(&catalog, slug, &env.download_base, &mut get)
-            .and_then(|f| toolchain::fetched_levels(&f).map(|l| (f.tag, f.manifests.len(), l)))
+        toolchain::fetch(
+            &catalog,
+            slug,
+            &env.download_base,
+            signed_artifacts.as_ref(),
+            &masters,
+            env.now_unix,
+            &mut get,
+        )
+        .and_then(|f| toolchain::fetched_levels(&f).map(|l| (f.tag, f.manifests.len(), l)))
     };
     let levels = match levels {
         Ok((tag, n, l)) => {
@@ -2172,6 +2206,10 @@ pub fn report(ended: &Result<Outcome, Failure>) -> i32 {
             3
         }
         Ok(o) => o.exit_code(),
+        Err(Failure::CouldNotRun { why }) => {
+            eprintln!("ship site: COULD NOT RUN: {why}");
+            3
+        }
         Err(failure) => {
             eprintln!("ship site: FAIL: {failure}");
             1

@@ -272,7 +272,7 @@ fn gpu_backpressure_excess_ns(acquire_wait_ns: u64, frame_interval: std::time::D
 /// Which surface a piece of chrome paints on, and so which theme its palette ([`App::chrome_palette`]) takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ChromeSurface {
-    /// The window's header (tab strip, message band, presence, pane headers).
+    /// The window's header (tab strip, presence, pane headers).
     Header,
     /// A card or band drawn over window `wid`'s grid (the find panel, the paste and close banners, the tab menu, the settings overlay, the badge).
     OverGrid(WindowId),
@@ -3233,9 +3233,6 @@ pub(crate) fn prepend_strip_rows(
         pool,
     );
 }
-
-/// The chrome bleed's per-row gutter tones for the message band's metered rows (`aterm_render::band`).
-pub(crate) use aterm_render::band::band_row_edges;
 
 /// [`prepend_strip_rows`] over borrowed rows.
 pub(crate) fn prepend_strip_row_slices<'a>(
@@ -11935,7 +11932,6 @@ impl App {
             crate::platform_win::verify_chrome_appearance(w);
         }
         let frame_started = frame_clock.unwrap_or_else(Instant::now);
-        self.prepare_band_motion(id, frame_started);
         self.overview_prepaint(id);
         if let Err(reason) = self.ensure_cpu_present_target(id) {
             self.handle_failed_present(id, reason, frame_started);
@@ -12439,7 +12435,6 @@ impl App {
                         .sample(&session.ctx.sink, frame_started)
                 })
                 .unwrap_or_default();
-            let band_geom = self.band_geometry(id);
             let claude_footer_fp = self.claude_footer_fp(id, plan);
             let deck_fp = self.stats_deck_fp(id);
             let Some(ws) = self.windows.get_mut(&id) else {
@@ -13029,12 +13024,6 @@ impl App {
                 .as_ref()
                 .filter(|_| !(ws.drag_hover && !ws.overlay_open()))
                 .map(|l| l.fingerprint(frame_started));
-            let band_fp = ws.band.band_fp(
-                &self.messages,
-                usize::from(ws.cols),
-                ws.band_hover,
-                band_geom,
-            );
             let key = RepaintKey {
                 damage_epoch: epoch,
                 grid_top,
@@ -13074,7 +13063,6 @@ impl App {
                 badge_fp,
                 deck_fp,
                 level_up_fp,
-                band_fp,
                 question,
                 system_dark: repaint_system_dark(self.os_appearance),
                 link_caption: ws.link_hover,
@@ -16752,14 +16740,6 @@ impl App {
             .as_ref()
             .filter(|_| !drag_covers)
             .map(|l| l.fingerprint(now));
-        let band_fp = self.windows.get(&wid).map_or(0, |ws| {
-            ws.band.band_fp(
-                &self.messages,
-                usize::from(ws.cols),
-                ws.band_hover,
-                self.band_geometry(wid),
-            )
-        });
         let overlay_fp = match overlay_inputs {
             Some(inputs) => self.windows.get_mut(&wid).map_or(0, |ws| {
                 ws.pane_overlay
@@ -16816,7 +16796,6 @@ impl App {
             badge_fp,
             deck_fp,
             level_up_fp,
-            band_fp,
             question: self.question_key(wid),
             system_dark: repaint_system_dark(self.os_appearance),
             link_caption: self.windows.get(&wid).and_then(|ws| ws.link_hover),
@@ -17225,14 +17204,10 @@ impl App {
     pub(crate) fn strip_floor(
         &self,
         wid: WindowId,
-        bars: usize,
         header: crate::chrome_band::ChromePalette,
     ) -> tab_bar::StripFloor {
         if !tab_bar::SELECTED_TAB_IS_GROUND {
             return tab_bar::StripFloor::Ground;
-        }
-        if bars > 0 {
-            return tab_bar::StripFloor::Surface(chrome_band::band_colors(header).bar_bg);
         }
         if self.find_panel_meets_strip(wid) {
             let panel = self.chrome_palette(ChromeSurface::OverGrid(wid));
@@ -17259,7 +17234,7 @@ impl App {
     pub(crate) fn automatic_tab_color(&self, wid: WindowId) -> [u8; 3] {
         let mut header = self.chrome_palette(ChromeSurface::Header);
         header.authored.active_tab = self.installed_colors.theme_authored_chrome().active_tab;
-        let floor = self.strip_floor(wid, usize::from(self.message_band_rows), header);
+        let floor = self.strip_floor(wid, header);
         tab_bar::automatic_active_tab_color(
             header,
             floor,
@@ -17317,54 +17292,30 @@ impl App {
 
     /// Splice with the strip fingerprint `tab_strip` the caller already computed (the redraw reuses the RepaintKey's, so each tab's terminal is locked once per present).
     pub(crate) fn splice_tab_strip_with(&mut self, wid: WindowId, tab_strip: u64) {
-        // Composed panes reuse scratch without extracting a whole frame, so retire
-        // its previous chrome even when no band remains; current band rasters are
-        // installed below at their new rows.
+        // Composed panes reuse scratch without extracting a whole frame, so retire the
+        // previous frame's chrome rasters before this frame's chrome splices push their own.
+        // Each retired raster's icon list is kept for the next ones
+        // (`RenderInput::chrome_icon_list`).
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.input_scratch.chrome_rasters.clear();
+            ws.input_scratch.retire_chrome_rasters();
         }
         let strip = self.tab_strip_rows as usize;
-        let extend_top = false;
-        let bars = usize::from(self.message_band_rows);
         let header = self.chrome_palette(ChromeSurface::Header);
-        let chrome_theme = header.theme;
         #[cfg(windows)]
         if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
             crate::platform_win::note_caption_surface(w, self.caption_surface_tone(wid));
         }
-        let strip_bleed = (strip > 0)
+        let bleed = (strip > 0)
             .then(|| tab_bar::strip_bleed_tones(header))
-            .flatten();
-        let bleed = match strip_bleed {
-            Some((color, seam)) => Some(aterm_render::ChromeBleed {
-                rows: strip + bars,
+            .flatten()
+            .map(|(color, seam)| aterm_render::ChromeBleed {
+                rows: strip,
                 first: 0,
                 color,
                 seam,
-                top_extends_cells: extend_top,
+                top_extends_cells: false,
                 row_edges: [None; aterm_render::CHROME_ROW_EDGES],
-            }),
-            None if bars > 0 => Some(aterm_render::band::band_bleed(
-                &chrome_band::band_colors(header),
-                strip,
-                bars,
-                [None; aterm_render::CHROME_ROW_EDGES],
-            )),
-            None => None,
-        };
-        if bars > 0 && self.windows.contains_key(&wid) {
-            self.splice_message_band(wid, chrome_theme);
-        }
-        let bleed = bleed.map(|mut b| {
-            if let Some(ws) = self.windows.get(&wid) {
-                b.row_edges = band_row_edges(
-                    strip,
-                    usize::from(self.message_band_rows),
-                    &ws.cached_band_edges,
-                );
-            }
-            b
-        });
+            });
         self.backend.set_chrome_bleed(bleed);
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.chrome_rows.clear();
@@ -17383,7 +17334,7 @@ impl App {
             ),
             None => return,
         };
-        let floor = self.strip_floor(wid, bars, header);
+        let floor = self.strip_floor(wid, header);
         let tab_strip = {
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -17722,73 +17673,6 @@ impl App {
             ansi,
             authored: self.installed_colors.authored_chrome(),
         }
-    }
-
-    /// Paint (cached) and prepend the message band rows onto the just-composed frame.
-    pub(crate) fn splice_message_band(&mut self, wid: WindowId, theme: aterm_render::Theme) {
-        let Some((cols, hover)) = self
-            .windows
-            .get(&wid)
-            .map(|ws| (ws.cols as usize, ws.band_hover))
-        else {
-            return;
-        };
-        let palette = self.chrome_palette_on(theme);
-        let prepared = self
-            .windows
-            .get(&wid)
-            .is_some_and(|ws| ws.band.is_prepared(&self.messages, cols));
-        if !prepared {
-            self.prepare_band_motion(wid, Instant::now());
-        }
-        let geom = self.band_geometry(wid);
-        let forced = crate::chrome_band::forced_chrome().is_some();
-        let inks_once = std::cell::OnceCell::new();
-        let inks = || *inks_once.get_or_init(|| palette.colors());
-        if let Some(ws) = self.windows.get_mut(&wid)
-            && let Some(resolved) = ws
-                .band
-                .paint(&self.messages, cols, hover, geom, forced, &inks)
-        {
-            (
-                ws.cached_band_rows,
-                ws.cached_band_edges,
-                ws.cached_band_rasters,
-            ) = aterm_render::band::rows(resolved);
-        }
-        let cell_h = self.win_cell_size(wid).1;
-        let room = aterm_render::band::native_host_room(|| self.backend.band_room());
-        let pad = self.win_pad(wid);
-        let grid_top = self.win_pad_top(wid) + self.win_head(wid);
-        let committed = usize::from(self.message_band_rows);
-        let Some(ws) = self.windows.get_mut(&wid) else {
-            return;
-        };
-        if committed == 0 {
-            return;
-        }
-        let inks = inks();
-        let at = aterm_render::band::BandFrame {
-            cols,
-            cell_w: geom.cell_w,
-            cell_h,
-            pad,
-            lo: geom.cells_x.saturating_sub(pad),
-            frame_w: cols.saturating_mul(geom.cell_w).saturating_add(2 * pad),
-            grid_top,
-            room,
-        };
-        let _ = aterm_render::band::compose_band(
-            &mut ws.input_scratch,
-            &ws.cached_band_rows,
-            &ws.cached_band_rasters,
-            committed,
-            &inks,
-            forced,
-            at,
-            &mut ws.strip_row_pool,
-            aterm_core::render::HostRowPixels::Placed,
-        );
     }
 
     fn set_scroll_band(&mut self, wid: WindowId) {
@@ -18193,20 +18077,28 @@ impl App {
                 col,
                 icon: aterm_render::BandIcon::Error,
             };
-            let rasters = &mut ws.input_scratch.chrome_rasters;
-            match rasters.iter_mut().find(|raster| raster.row == row) {
+            let scratch = &mut ws.input_scratch;
+            match scratch
+                .chrome_rasters
+                .iter_mut()
+                .find(|raster| raster.row == row)
+            {
                 Some(raster) => raster.icons.push(icon),
-                None => rasters.push(aterm_render::ChromeRaster {
-                    row,
-                    ground: Arc::from(Vec::new()),
-                    rail: Arc::from(Vec::new()),
-                    rail_h: 0,
-                    clear_rail: false,
-                    own: Vec::new(),
-                    split: None,
-                    rings: Vec::new(),
-                    icons: vec![icon],
-                }),
+                None => {
+                    let mut icons = scratch.chrome_icon_list();
+                    icons.push(icon);
+                    scratch.chrome_rasters.push(aterm_render::ChromeRaster {
+                        row,
+                        ground: Arc::from(Vec::new()),
+                        rail: Arc::from(Vec::new()),
+                        rail_h: 0,
+                        clear_rail: false,
+                        own: Vec::new(),
+                        split: None,
+                        rings: Vec::new(),
+                        icons,
+                    });
+                }
             }
         }
         claim_chrome_rows(ws, frame_band.clone());
@@ -18850,7 +18742,7 @@ impl App {
         }
     }
 
-    /// Paint the multi-line-paste confirmation banner (`self.paste_banner`) by overwriting the top rows in place, over the message band's rows for the duration of the question.
+    /// Paint the multi-line-paste confirmation banner (`self.paste_banner`) by overwriting the top rows in place for the duration of the question.
     pub(crate) fn splice_paste_banner(&mut self, wid: WindowId) {
         let (panel_rows, cols) = {
             let Some(pending) = self.paste_banner.as_ref().filter(|p| p.wid == wid) else {

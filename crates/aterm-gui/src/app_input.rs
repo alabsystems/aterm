@@ -2732,7 +2732,10 @@ fn terminal_emacs_search_direction(
     (bare_super || agent_composer()).then_some(forward)
 }
 
-/// The shipping `SessionFactory::handed_terminal`.
+/// The shipping `SessionFactory::handed_terminal`. It runs on the thread that draws (a frame's
+/// composer check, a key's route), so each member is named from the process table alone
+/// ([`crate::session_status::program::program_of_names_only`]): no path a process wrote into its
+/// title is stat'ed here.
 pub(crate) fn agent_handed_terminal(pgid: i32) -> bool {
     let Some(leader) = u32::try_from(pgid).ok().filter(|pgid| *pgid > 0) else {
         return false;
@@ -2741,7 +2744,7 @@ pub(crate) fn agent_handed_terminal(pgid: i32) -> bool {
         members.into_iter().any(|member| {
             i32::try_from(member)
                 .ok()
-                .and_then(crate::session_status::program::program_of)
+                .and_then(crate::session_status::program::program_of_names_only)
                 .is_some_and(|name| hands_the_terminal_off(&name))
         })
     })
@@ -3524,6 +3527,9 @@ pub(crate) fn deliver_keyed(
 ) -> bool {
     if noted.burst {
         let mut tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        if reaches {
+            tl.person_reached_task();
+        }
         let at = tl.slog().now();
         let own = crate::session_log::PersonGesture {
             burst: Some(noted.seq),
@@ -3534,6 +3540,9 @@ pub(crate) fn deliver_keyed(
         tl.ring_rows();
         tl.slog_take_wake()
     } else if let Ok(mut tl) = ctx.timeline.try_lock() {
+        if reaches {
+            tl.person_reached_task();
+        }
         let at = tl.slog().now();
         let own = crate::session_log::PersonGesture {
             burst: None,

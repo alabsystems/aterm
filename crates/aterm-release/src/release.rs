@@ -53,6 +53,9 @@ pub const JOURNAL_FILE: &str = "release.toml";
 /// The release line's source: a head whose tree lacks it has a cutter that keeps no line, so
 /// `--fix` refuses to carry onto it.
 pub const LINE_SOURCE: &str = "crates/aterm-release/src/line.rs";
+const PENDING_LINE: &str = "locally-carried-line";
+const SUPERSEDED_LINE: &str = "supersession-completed";
+const SELECTION_FILE: &str = "candidate.toml";
 
 /// The live run's claim, beside the journal.
 pub const RUNNING_FILE: &str = "running";
@@ -341,6 +344,16 @@ impl ReleaseOptions {
             }
         }
         out
+    }
+
+    /// A dispatch before judgment preserves a requested supersession until its replacement
+    /// cutter has performed it. Subsequent execs use the ordinary completed-operation args.
+    pub fn dispatch_args(&self, args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+        let mut args = self.exec_args(args);
+        if self.supersede {
+            args.push("--supersede".into());
+        }
+        args
     }
 }
 
@@ -1295,6 +1308,7 @@ pub trait Backend {
     fn supersede_line(&mut self, _line: &crate::line::Line) -> Result<String, String> {
         Err("supersession is unavailable".into())
     }
+    fn supersession_completed(&mut self) {}
     /// Record a step boundary and detect an adopted lease before starting more work.
     fn fleet_boundary(&mut self, _line: &crate::line::Line, _step: Step) -> Result<(), String> {
         Ok(())
@@ -1321,6 +1335,11 @@ pub trait Backend {
     fn cleared_env(&mut self) -> Vec<String>;
     fn machine(&mut self, creds: &Path, explicit: bool) -> (String, Vec<Refusal>);
     fn fetch(&mut self) -> Result<String, Refusal>;
+    /// Local safety check before selecting and freezing a candidate. No network or engine
+    /// discovery belongs here: the selected cutter performs those judgments at step 1.
+    fn prepare_clone(&mut self) -> Result<(), Refusal> {
+        Ok(())
+    }
     fn head(&mut self) -> String;
     fn branch_is_main(&mut self) -> bool;
     fn rev(&mut self, rev: &str) -> Option<String>;
@@ -1345,26 +1364,48 @@ pub trait Backend {
         line: &crate::line::Line,
         rev: &str,
     ) -> Result<crate::line::Admitted, Refusal>;
-    /// Carry `fixes` onto `line`'s head in ancestry order ([`crate::line::order`],
-    /// [`crate::line::carry`]) and put the new head into origin/main's history
-    /// ([`crate::line::record`]'s content-neutral merge): the hops, and how the head reached main.
+    /// Construct local hops in ancestry order. This does not read or write any remote.
     fn carry(
         &mut self,
         line: &crate::line::Line,
         fixes: &[crate::line::Fix],
     ) -> Result<(Vec<crate::line::Hop>, String), Refusal>;
+    /// Record the proved, unpublished line on main through a content-neutral merge. Only the
+    /// frozen head's cutter calls this, after its fresh publication and claim checks.
+    fn record_line(&mut self, _line: &crate::line::Line) -> Result<String, Refusal> {
+        Ok("line recorded".into())
+    }
     /// The line's meaning check ([`crate::line::verify`]), which writes no ref: its summary.
     fn verify_line(&mut self, line: &crate::line::Line) -> Result<String, Refusal>;
+    fn verify_pending_line(&mut self, line: &crate::line::Line) -> Result<String, Refusal> {
+        self.verify_line(line)
+    }
 
     fn sync(&mut self) -> Result<String, Refusal>;
     fn bump(&mut self, from: &str, to: &str, prover: &Prover) -> Result<String, Refusal>;
     fn move_to(&mut self, commit: &str) -> Result<(), Refusal>;
+    /// Rewind only a clean, structurally proved, locally generated pending line to its source
+    /// prefix before adopting another fleet line. No owner-authored commit is discarded.
+    fn rewind_selection(&mut self, _line: &crate::line::Line) -> Result<(), Refusal> {
+        Ok(())
+    }
     /// Provision the selected checkout's tools before staging or compiling the product.
     fn validation_tools(&mut self) -> Result<String, Refusal>;
     fn own_cutter(&mut self, commit: &str) -> Result<String, crate::cutter::NotOwn>;
+    fn frozen_commit(&mut self) -> Option<String> {
+        None
+    }
     /// Build, freeze and prove R's tools, then replace this image with its cutter. A real
     /// success never returns; `Ok(())` is only a model backend's representation of that edge.
     fn exec_cutter(&mut self, commit: &str, prover: &Prover) -> Result<(), Refusal>;
+    /// Start the verifier build beside steps 1–2; validation_tools joins and freezes it before
+    /// qualification. A refusal or interrupt owns and settles the outstanding build.
+    fn warm_tools(&mut self, _commit: &str, _prover: &Prover) -> Result<(), Refusal> {
+        Ok(())
+    }
+    /// Settle preparation children before the run releases the clone claim, including after a
+    /// panic. Another run must never move this clone while its old verifier still compiles.
+    fn stop_tools(&mut self) {}
     fn facts(&mut self, c: &Candidate, prover: &Prover, artifact: Option<&Artifact>) -> Facts;
     fn disk(&mut self) -> (Option<u64>, bool);
     /// What this machine's last releases wrote, by their own records
@@ -1428,7 +1469,9 @@ pub trait Backend {
     /// ([`crate::publish::discard_signed`]); what could not be removed.
     fn discard_signed(&mut self, version: &str, build: u64) -> Vec<String>;
     fn after_cut(&mut self, version: &str) -> Result<AfterCut, Refusal>;
-    fn latest(&mut self) -> Result<String, String>;
+    /// The channel head tag. Transport errors are distinct from a successful response whose
+    /// document names no tag, so step 10 can report only the former as COULD NOT RUN.
+    fn latest(&mut self) -> Result<Option<String>, String>;
 }
 
 /// How a run ended.
@@ -1587,6 +1630,7 @@ pub fn run_with(b: &mut dyn Backend, opts: &ReleaseOptions, home: &Path) -> Outc
             1
         }
     };
+    run.b.stop_tools();
     Outcome {
         code,
         last: run.last,
@@ -1599,7 +1643,10 @@ impl Run<'_> {
             return self.forget();
         }
         self.take_claim();
-        self.journal = match Journal::load(&self.journal_path) {
+        let selection = self.b.release_dir().join(SELECTION_FILE);
+        self.journal = match Journal::load(&selection).and_then(|pending| {
+            pending.map_or_else(|| Journal::load(&self.journal_path), |j| Ok(Some(j)))
+        }) {
             Ok(j) => j,
             Err(why) => {
                 return self.final_refusal(Refusal::new(
@@ -1609,14 +1656,25 @@ impl Run<'_> {
             }
         };
         self.t_start = self.b.now();
+        self.cur_t0 = self.t_start;
+        self.b.observe_operational();
         if self.dry {
             self.say(
                 "release: DRY RUN — nothing is changed; each step says what a real run would do",
             );
         }
 
+        if !self.dry {
+            self.journal_path = selection;
+            self.prepare_candidate()?;
+            let prover = self.prover.clone().ok_or(Halt::Said(1))?;
+            let commit = self.commit_r();
+            if let Err(refusal) = self.b.warm_tools(&commit, &prover) {
+                return self.refuse_hard(refusal);
+            }
+        }
+
         self.begin(Step::Checks)?;
-        self.b.observe_operational();
         let note = self.checks()?;
         self.finish(&note);
 
@@ -1635,11 +1693,14 @@ impl Run<'_> {
         }
 
         self.begin(Step::Commit)?;
-        let note = self.commit()?;
+        self.journal_path = self.b.release_dir().join(JOURNAL_FILE);
+        let note = self.commit(false)?;
         self.finish(&note);
-        self.own_cutter()?;
-        // The cutter now belongs to the selected commit, so its provisioning
-        // rows are that candidate's pins, not a newer launcher's defaults.
+        if !self.dry {
+            let _ = std::fs::remove_file(self.b.release_dir().join(SELECTION_FILE));
+        }
+        // Selection and every image handover finished before step 1. Provision this
+        // candidate's pins before qualification.
         if !self.dry && !self.journal.as_ref().is_some_and(Journal::finished) {
             match self.b.validation_tools() {
                 Ok(note) => self.say(&format!("        validation tools: {note}")),
@@ -2163,7 +2224,11 @@ impl Run<'_> {
             self.say(&last);
             return Err(Halt::Said(1));
         }
-        let asks = Journal::load(&self.journal_path)
+        let selected = self.b.release_dir().join(SELECTION_FILE);
+        let asks = Journal::load(&selected)
+            .and_then(|pending| {
+                pending.map_or_else(|| Journal::load(&self.journal_path), |j| Ok(Some(j)))
+            })
             .ok()
             .flatten()
             .map(|j| j.asks)
@@ -2175,6 +2240,7 @@ impl Run<'_> {
             };
             self.say(&format!("release: the ask {key} — {how}"));
         }
+        let _ = std::fs::remove_file(self.b.release_dir().join(SELECTION_FILE));
         self.last = match std::fs::remove_file(&self.journal_path) {
             Ok(()) => format!(
                 "release: forgot this clone's release journal ({}); nothing public changed",
@@ -2607,8 +2673,8 @@ impl Run<'_> {
         );
         match taken {
             Ok(claim) => {
-                // The preceding image took its first steps' records, its seal call among them,
-                // into its own logs ([`crate::release_timeline::Timeline`]).
+                // The preceding image kept its selection and freeze records in its own logs.
+                // Link those records to this image's step timeline.
                 if let Some(from) = &claim.previous_logs {
                     let event_name = if claim.legacy_handoff {
                         "handed"
@@ -2703,8 +2769,12 @@ impl Run<'_> {
             Ok(tip) => self.tip = tip,
             Err(r) => self.refuse_hard(r)?,
         }
+        self.record_selected_line()?;
         let head = self.b.head();
-        if self.b.branch_is_main() && !self.b.is_ancestor(&head, &self.tip.clone()) {
+        if self.b.branch_is_main()
+            && head != self.commit_r()
+            && !self.b.is_ancestor(&head, &self.tip.clone())
+        {
             self.refuse(if self.heads_a_hop(&head) {
                 Refusal::new(
                     format!(
@@ -2723,7 +2793,7 @@ impl Run<'_> {
             })?;
         }
 
-        self.choose_candidate()?;
+        self.choose_candidate(false)?;
         if self.cand.as_ref().is_some_and(|c| c.bump_from.is_none()) {
             self.public_state();
         }
@@ -2864,6 +2934,64 @@ impl Run<'_> {
         self.b.cut_journal().is_some_and(|c| c.version == v)
     }
 
+    fn record_selected_line(&mut self) -> Flow {
+        let Some(journal) = self.journal.clone().filter(|j| j.has(PENDING_LINE)) else {
+            return Ok(());
+        };
+        let line = journal.line();
+        // Local construction is not publication authority. Ask the live roster and cut state
+        // in the new image before recording even the content-neutral merge on source main.
+        let rows = self.b.engine_rows(None);
+        let published = rows
+            .newest
+            .as_deref()
+            .is_some_and(|rev| self.b.version_at(rev).as_deref() == Some(line.version.as_str()));
+        if published
+            || self
+                .b
+                .cut_journal()
+                .is_some_and(|c| c.version == line.version)
+        {
+            if !self.dry {
+                let _ = std::fs::remove_file(self.b.release_dir().join(SELECTION_FILE));
+                self.journal = Journal::load(&self.b.release_dir().join(JOURNAL_FILE))
+                    .ok()
+                    .flatten();
+            }
+            return self.refuse_hard(Refusal::new(
+                "the release in progress is already published or claimed; its local fix was not recorded",
+                "finish the published release, then start the next line",
+            ));
+        }
+        if let Err(refusal) = self.b.verify_pending_line(&line) {
+            return self.refuse_hard(refusal);
+        }
+        if !self.dry {
+            if let Err(why) = self.b.fleet_audit() {
+                return self.refuse_hard(Refusal::new(
+                    why,
+                    "retry the release after inspecting the line claim",
+                ));
+            }
+            match self.b.record_line(&line) {
+                Ok(note) => self.say(&format!("        {note}")),
+                Err(refusal) => return self.refuse_hard(refusal),
+            }
+            self.tip = self
+                .b
+                .rev("origin/main^{commit}")
+                .unwrap_or_else(|| self.tip.clone());
+            if let Some(j) = self.journal.as_mut() {
+                j.done.retain(|fact| fact != PENDING_LINE);
+                if let Err(why) = j.save(&self.b.release_dir().join(SELECTION_FILE)) {
+                    return self
+                        .refuse_hard(Refusal::new(why, "restore the release journal and retry"));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn public_state(&mut self) {
         let v = self.version();
         let r = self.commit_r();
@@ -2880,12 +3008,202 @@ impl Run<'_> {
         };
     }
 
-    fn choose_candidate(&mut self) -> Flow {
+    /// Select locally, freeze, and only then let the candidate's cutter judge the release.
+    /// Selection is deliberately independent of the launching cutter's origin refresh and
+    /// publication roster reader. An old local origin/main is a pinned candidate, not a claim
+    /// about the current remote tip; step 1 refreshes and proves its ancestry before a product
+    /// build or staging begins.
+    fn prepare_candidate(&mut self) -> Flow {
+        if let Some(refusal) = self.claim_refused.take() {
+            return self.refuse_hard(refusal);
+        }
+        if !self.b.branch_is_main() {
+            return self.refuse_hard(Refusal::new(
+                "this clone is not on main",
+                "release from a clean clone on main (git switch main)",
+            ));
+        }
+        if let Err(refusal) = self.b.prepare_clone() {
+            return self.refuse_hard(refusal);
+        }
+        self.tip = self.b.rev("origin/main^{commit}").ok_or_else(|| {
+            self.halted(Refusal::new(
+                "this clone has no local origin/main candidate",
+                "git fetch origin, then run the release again",
+            ))
+        })?;
+        self.choose_candidate(true)?;
+        let r = self.commit_r();
+        if self.b.head() != r
+            && let Err(refusal) = self.b.move_to(&r)
+        {
+            return self.refuse_hard(refusal);
+        }
+        let journaled = self
+            .journal
+            .as_ref()
+            .filter(|j| !j.finished())
+            .map(|j| j.prover.clone());
+        let prover = self.b.prover(journaled.as_deref()).map_err(|why| {
+            self.halted(Refusal::new(
+                format!("no Trust prover: {why}"),
+                "restore the locked Trust toolchain and retry",
+            ))
+        })?;
+        if let Err(why) = self.b.lease(&prover) {
+            return self.refuse_hard(Refusal::new(why, "restore the toolchain lease and retry"));
+        }
+        self.prover = Some(prover);
+        // A bump needs the publication engine. Dispatch to its base's content-proved cutter
+        // first, so no previous line's engine discovery can hold the next line hostage.
+        if self.cand.as_ref().is_some_and(|c| c.bump_from.is_some()) {
+            self.own_cutter()?;
+            if let Err(refusal) = self.b.sync() {
+                return self.refuse_hard(refusal);
+            }
+        }
+        self.commit(true)?;
+        self.own_cutter()?;
+        if self.opts.supersede {
+            if !self
+                .journal
+                .as_ref()
+                .is_some_and(|j| j.has(SUPERSEDED_LINE))
+            {
+                let version = self.version();
+                if self.version_used(&version, &self.tip.clone()) {
+                    return self.refuse_hard(Refusal::new(
+                        format!("v{version} has public release state and cannot be superseded"),
+                        "finish the existing release",
+                    ));
+                }
+                if let Some(previous) = Journal::load(&self.b.release_dir().join(JOURNAL_FILE))
+                    .ok()
+                    .flatten()
+                    .filter(|j| !j.finished())
+                {
+                    self.refuse_published(&previous, "--supersede")?;
+                }
+                let line = crate::line::Line::start(&version, &self.commit_r(), self.t_start);
+                match self.b.supersede_line(&line) {
+                    Ok(note) => self.say(&note),
+                    Err(why) => {
+                        let code = if why.starts_with("CUTTING ELSEWHERE:") {
+                            4
+                        } else {
+                            2
+                        };
+                        self.say(&why);
+                        self.last = why;
+                        return Err(Halt::Said(code));
+                    }
+                }
+                if let Some(journal) = self.journal.as_mut() {
+                    journal.add(SUPERSEDED_LINE);
+                }
+                self.save_journal()?;
+            }
+            self.opts.supersede = false;
+            self.b.supersession_completed();
+        }
+        // Fleet discovery also belongs to a frozen image, but must precede judgment: adopting
+        // another head after checks would otherwise judge once with the wrong cutter.
+        let pending = self
+            .journal
+            .clone()
+            .filter(|j| j.has(PENDING_LINE))
+            .map(|j| j.line());
+        let pending_fixes: Vec<String> = pending.as_ref().map_or_else(Vec::new, |line| {
+            line.hops
+                .iter()
+                .filter(|hop| !self.b.is_ancestor(&hop.commit, &self.tip.clone()))
+                .map(|hop| hop.carries.clone())
+                .collect()
+        });
+        let mut selected = self.cand.clone().ok_or(Halt::Said(1))?;
+        let established = Journal::load(&self.b.release_dir().join(JOURNAL_FILE))
+            .map_err(|why| self.halted(Refusal::new(why, "restore the judged release journal")))?
+            .is_some_and(|j| !j.finished() && j.version == selected.version)
+            || pending.is_some();
+        let mut following = if established {
+            self.journal.clone()
+        } else {
+            None
+        };
+        if let Err(refusal) = crate::line_claim::follow(self.b, &mut selected, &mut following) {
+            return self.refuse_hard(refusal);
+        }
+        if selected.commit != self.commit_r() || established {
+            self.journal = following;
+        } else if let (Some(journal), Some(following)) = (self.journal.as_mut(), following) {
+            journal.line = following.line;
+        }
+        if let Err(why) = crate::line_claim::select(
+            self.b,
+            self.claim.as_ref().is_some_and(|c| c.continued),
+            &mut selected,
+            &mut self.journal,
+            self.t_start,
+        ) {
+            self.last = why;
+            let last = self.last.clone();
+            self.say(&last);
+            return Err(Halt::Said(if last.starts_with("CUTTING ELSEWHERE:") {
+                4
+            } else {
+                3
+            }));
+        }
+        if selected.commit != self.commit_r() {
+            if let Some(pending) = pending
+                && let Err(refusal) = self.b.rewind_selection(&pending)
+            {
+                return self.refuse_hard(refusal);
+            }
+            if !pending_fixes.is_empty() {
+                let line = self
+                    .journal
+                    .as_ref()
+                    .map(Journal::line)
+                    .ok_or(Halt::Said(1))?;
+                for fix in pending_fixes {
+                    if self.b.is_ancestor(&fix, line.head()) {
+                        continue;
+                    }
+                    match self.b.fix_of(&line, &fix) {
+                        Ok(crate::line::Admitted::Fix(fix)) => selected.carry.push(fix),
+                        Ok(crate::line::Admitted::Carried) => {}
+                        Err(refusal) => return self.refuse_hard(refusal),
+                    }
+                }
+            }
+            self.cand = Some(selected);
+            let commit = self.commit_r();
+            if let Err(refusal) = self.b.move_to(&commit) {
+                return self.refuse_hard(refusal);
+            }
+            let prover = self
+                .b
+                .prover(None)
+                .map_err(|why| self.halted(Refusal::new(why, "restore the selected toolchain")))?;
+            if let Err(why) = self.b.lease(&prover) {
+                return self.refuse_hard(Refusal::new(why, "restore the selected toolchain lease"));
+            }
+            self.prover = Some(prover);
+            self.commit(true)?;
+            self.own_cutter()?;
+        }
+        Ok(())
+    }
+
+    fn choose_candidate(&mut self, selecting: bool) -> Flow {
         let tip = self.tip.clone();
         let j = self.journal.clone();
         let unfinished = j.as_ref().filter(|j| !j.finished());
         let continued = self.claim.as_ref().is_some_and(|c| c.continued);
-        let mut cand = if let Some(j) = j.as_ref().filter(|_| continued) {
+        let mut cand = if !selecting && !self.dry {
+            self.cand.clone().ok_or(Halt::Said(1))?
+        } else if let Some(j) = j.as_ref().filter(|j| continued && !j.finished()) {
             Candidate {
                 commit: j.commit.clone(),
                 version: j.version.clone(),
@@ -2894,7 +3212,7 @@ impl Run<'_> {
                 carry: Vec::new(),
             }
         } else if !self.opts.fix.is_empty() {
-            self.fix_candidate(unfinished)?
+            self.fix_candidate(unfinished, selecting)?
         } else if let Some(rev) = self.opts.commit.clone() {
             let Some(r) = self.b.rev(&format!("{rev}^{{commit}}")) else {
                 return self.refuse_hard(Refusal::new(
@@ -2906,12 +3224,14 @@ impl Run<'_> {
                 && j.commit != r
                 && !self.opts.supersede
             {
-                self.refuse_published(j, "--commit")?;
+                if !selecting {
+                    self.refuse_published(j, "--commit")?;
+                }
                 let line = j.line();
                 return self.refuse_hard(Refusal::new(
                     format!(
-                        "this clone's release is line v{} at {} (base {}, {} hop(s)), not \
-                         published, and --commit only starts a line",
+                        "this clone's release is line v{} at {} (base {}, {} hop(s)), \
+                         and --commit only starts a line",
                         line.version,
                         short(line.head()),
                         short(&line.base),
@@ -2962,7 +3282,12 @@ impl Run<'_> {
                     "fix [workspace.package] version on main",
                 ));
             };
-            if !self.version_used(&v0, &tip) {
+            let used = if selecting {
+                self.b.local_tag(&format!("v{v0}")) || self.b.ledger_versions(&tip).contains(&v0)
+            } else {
+                self.version_used(&v0, &tip)
+            };
+            if !used {
                 return self.refuse_hard(Refusal::new(
                     format!(
                         "origin/main already declares {v0}, which no release has used (no tag, \
@@ -2989,6 +3314,23 @@ impl Run<'_> {
             }
         };
 
+        if selecting {
+            if cand.version.is_empty() {
+                cand.version = self.b.version_at(&cand.commit).unwrap_or_default();
+            }
+            if public_version(&cand.version).is_none() {
+                return self.refuse_hard(Refusal::new(
+                    format!(
+                        "{} has no public MAJOR.MINOR.0 version",
+                        short(&cand.commit)
+                    ),
+                    "select a release commit with --commit",
+                ));
+            }
+            self.cand = Some(cand);
+            return Ok(());
+        }
+
         if !self.b.is_ancestor(&cand.commit, &tip) {
             self.cand = Some(cand.clone());
             let hop = self.heads_a_hop(&cand.commit);
@@ -3007,7 +3349,8 @@ impl Run<'_> {
         if cand.version.is_empty() {
             cand.version = self.b.version_at(&cand.commit).unwrap_or_default();
         }
-        if public_version(&cand.version).is_some()
+        if self.dry
+            && public_version(&cand.version).is_some()
             && (!self.opts.supersede || continued)
             && let Err(refusal) = crate::line_claim::follow(self.b, &mut cand, &mut self.journal)
         {
@@ -3174,7 +3517,11 @@ impl Run<'_> {
     /// claimed, whose tree knows lines ([`LINE_SOURCE`]), with each commit `--fix` names
     /// admitted ([`Backend::fix_of`]) for step 3 to carry. One a hop carries already is dropped;
     /// when every one is, the run resumes the line as it is.
-    fn fix_candidate(&mut self, unfinished: Option<&Journal>) -> Result<Candidate, Halt> {
+    fn fix_candidate(
+        &mut self,
+        unfinished: Option<&Journal>,
+        selecting: bool,
+    ) -> Result<Candidate, Halt> {
         let Some(j) = unfinished else {
             return Err(self.halted(Refusal::new(
                 "--fix carries landed fixes onto this clone's unpublished line, and this clone \
@@ -3186,7 +3533,18 @@ impl Run<'_> {
                 ),
             )));
         };
-        self.refuse_published(j, "--fix")?;
+        if !selecting {
+            self.refuse_published(j, "--fix")?;
+        } else if self
+            .b
+            .cut_journal()
+            .is_some_and(|cut| cut.version == j.version)
+        {
+            return Err(self.halted(Refusal::new(
+                "the release in progress is already published or claimed and cannot carry a fix",
+                "finish this release and start the next line",
+            )));
+        }
         let line = j.line();
         let head = line.head().to_string();
         let knows_lines = match self.b.tree_has(&head, LINE_SOURCE) {
@@ -3287,7 +3645,7 @@ impl Run<'_> {
         ))
     }
 
-    fn commit(&mut self) -> Result<String, Halt> {
+    fn commit(&mut self, selecting: bool) -> Result<String, Halt> {
         let Some(mut cand) = self.cand.clone() else {
             return Ok(String::new());
         };
@@ -3338,34 +3696,15 @@ impl Run<'_> {
                 }
             }
         }
-        let superseding =
-            self.opts.supersede && !self.claim.as_ref().is_some_and(|claim| claim.continued);
-        if superseding {
-            let line = crate::line::Line::start(&cand.version, &cand.commit, self.t_start);
-            match self.b.supersede_line(&line) {
-                Ok(note) => {
-                    self.say(&note);
-                    self.journal = None;
-                }
-                Err(why) => {
-                    let code = if why.starts_with("CUTTING ELSEWHERE:") {
-                        4
-                    } else {
-                        2
-                    };
-                    self.say(&why);
-                    self.last = why;
-                    return Err(Halt::Said(code));
-                }
-            }
-        }
-        if let Err(why) = crate::line_claim::select(
-            self.b,
-            self.claim.as_ref().is_some_and(|claim| claim.continued),
-            &mut cand,
-            &mut self.journal,
-            self.t_start,
-        ) {
+        if self.dry
+            && let Err(why) = crate::line_claim::select(
+                self.b,
+                self.claim.as_ref().is_some_and(|claim| claim.continued),
+                &mut cand,
+                &mut self.journal,
+                self.t_start,
+            )
+        {
             let code = if why.starts_with("CUTTING ELSEWHERE:") {
                 4
             } else if why.starts_with("COULD NOT RUN:") {
@@ -3409,7 +3748,9 @@ impl Run<'_> {
                 Err(r) => self.refuse(r)?,
             }
         }
-        if let Err(r) = self.b.move_to(&cand.commit) {
+        if self.b.head() != cand.commit
+            && let Err(r) = self.b.move_to(&cand.commit)
+        {
             self.refuse(r)?;
         }
         let same = self
@@ -3433,7 +3774,11 @@ impl Run<'_> {
                 bumped,
                 started: now,
                 linux: self.linux.clone(),
-                done: Vec::new(),
+                done: if selecting && !line.hops.is_empty() {
+                    vec![PENDING_LINE.into()]
+                } else {
+                    Vec::new()
+                },
                 asks,
                 reserved: None,
                 artifact: None,
@@ -3458,18 +3803,26 @@ impl Run<'_> {
                 }
             }
         }
+        let path = if selecting {
+            self.b.release_dir().join(SELECTION_FILE)
+        } else {
+            self.journal_path.clone()
+        };
         if let Some(j) = &self.journal
-            && let Err(why) = j.save(&self.journal_path)
+            && let Err(why) = j.save(&path)
         {
             self.refuse(Refusal::new(
                 why,
                 "check the permissions of the clone's .git/aterm-release",
             ))?;
         }
-        if let Some(r) = self.newest_row_refusal() {
-            self.refuse(r)?;
+        self.halt_if_interrupted()?;
+        if !selecting {
+            if let Some(r) = self.newest_row_refusal() {
+                self.refuse(r)?;
+            }
+            self.public_state();
         }
-        self.public_state();
         Ok(format!(
             "v{} at {} ({})",
             cand.version,
@@ -3486,7 +3839,10 @@ impl Run<'_> {
         match self.b.own_cutter(&r) {
             Ok(_) => Ok(()),
             Err(not) => {
-                if self.claim.as_ref().is_some_and(|c| c.continued) {
+                if self.claim.as_ref().is_some_and(|c| c.continued)
+                    && self.journal.as_ref().is_some_and(|j| j.commit == r)
+                    && self.b.frozen_commit().is_none_or(|commit| commit == r)
+                {
                     return self.refuse(Refusal::new(
                         format!(
                             "this cutter was rebuilt at {} and is still not its own ({})",
@@ -5433,16 +5789,8 @@ impl Run<'_> {
             ));
             return self.dry_final();
         }
-        let latest = self.b.latest();
-        if latest.as_deref() != Ok(&format!("v{v}")) {
-            let said = latest.unwrap_or_else(|e| format!("unreadable ({e})"));
-            return self.refuse(Refusal::new(
-                format!("the channel's latest release is {said}, not v{v}"),
-                format!(
-                    "read the cut's log, then {RELEASE_COMMAND} (its after-cut step checks the \
-                     release's shape again)"
-                ),
-            ));
+        if let Some(refusal) = latest_refusal(&v, self.b.latest()) {
+            return self.refuse(refusal);
         }
         self.journal_add("check")?;
         self.finish(&format!("v{v} is the channel's latest release"));
@@ -5462,6 +5810,34 @@ impl Run<'_> {
         let last = self.last.clone();
         self.say(&last);
         Ok(())
+    }
+}
+
+/// The verdict of step 10's live channel-head read. A transport error decides nothing about the
+/// channel and is therefore resumable; a response naming no head or another head is a semantic
+/// refusal.
+fn latest_refusal(version: &str, latest: Result<Option<String>, String>) -> Option<Refusal> {
+    let expected = format!("v{version}");
+    match latest {
+        Ok(Some(found)) if found == expected => None,
+        Ok(found) => {
+            let found = found.unwrap_or_else(|| "no release".to_string());
+            Some(Refusal::new(
+                format!("the channel's latest release is {found}, not {expected}"),
+                format!(
+                    "read the cut's log, then {RELEASE_COMMAND} (its after-cut step checks the \
+                     release's shape again)"
+                ),
+            ))
+        }
+        Err(transport) => Some(
+            Refusal::new(
+                format!("the channel freshness read for {expected} did not run"),
+                format!("restore the transport named in the log, then {RELEASE_COMMAND}"),
+            )
+            .detail([format!("latest release transport: {transport}")])
+            .could_not_run(),
+        ),
     }
 }
 
@@ -6247,6 +6623,32 @@ fn newer(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Step 10 distinguishes an unanswered freshness read from an answered channel verdict.
+    /// NEGATIVE CONTROLS: a response with no tag and one with the wrong tag remain ordinary
+    /// refusals, while the expected tag has no refusal.
+    #[test]
+    fn latest_transport_is_not_a_channel_refusal() {
+        let transport = "curl asset request failed with HTTP 504";
+        let unavailable = latest_refusal("0.175.0", Err(transport.into())).unwrap();
+        assert!(unavailable.could_not_run);
+        assert!(
+            unavailable
+                .detail
+                .iter()
+                .any(|line| line.contains(transport)),
+            "the transport's own detail is retained"
+        );
+
+        for answered in [None, Some("v0.174.0".to_string())] {
+            let semantic = latest_refusal("0.175.0", Ok(answered.clone())).unwrap();
+            assert!(
+                !semantic.could_not_run,
+                "an answered channel with {answered:?} made a semantic decision"
+            );
+        }
+        assert!(latest_refusal("0.175.0", Ok(Some("v0.175.0".into()))).is_none());
+    }
 
     /// An exec'd image continues the live claim of its exact pid and start, atomically replacing
     /// its logs and retaining the preceding image's different logs. The continued image's end

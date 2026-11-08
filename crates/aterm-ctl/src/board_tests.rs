@@ -133,6 +133,61 @@ fn a_closed_answer_always_lands_and_keeps_what_the_board_knew() {
 }
 
 #[test]
+#[cfg(unix)]
+fn required_board_accept_waits_for_its_native_writer() {
+    let (_dir, board) = scratch();
+    let row = worker("s-0a1", "queued-accept", at(1));
+    board.record(&row).unwrap();
+    board
+        .record(&worker("s-0b2", "queued-accept", at(2)))
+        .unwrap();
+    let bound = board.bind(true).unwrap();
+    let accepted_at = at(3);
+    for (who, sid) in [("@s-0a1", "s-0a1"), ("queued-accept", "s-0b2")] {
+        let mut expected = board.row(sid).unwrap();
+        expected.accept = Some("passed".to_owned());
+        expected.accept_ms = Some(accepted_at);
+        let accepted = bound
+            .accept_started(
+                who,
+                "passed",
+                accepted_at,
+                std::time::Instant::now() - Duration::from_secs(11),
+            )
+            .unwrap();
+        assert_eq!(accepted, expected);
+        assert_eq!(board.row(sid).unwrap(), expected);
+    }
+    let held = bound.lock().unwrap();
+    let before = board.scan().rows;
+    let expired = std::time::Instant::now() - Duration::from_secs(61);
+    assert_eq!(
+        bound
+            .accept_started("queued-accept", "failed", at(4), expired)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        bound
+            .accept_started("queued-accept", "bad word", at(4), expired)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert_eq!(board.scan().rows, before);
+    drop(held);
+    let fresh = board.accept("queued-accept", "fresh", at(5)).unwrap();
+    assert_eq!(fresh.sid, "s-0b2");
+    assert_eq!(fresh.accept.as_deref(), Some("fresh"));
+    assert_eq!(board.row("s-0b2").unwrap(), fresh);
+    assert_eq!(
+        board.accept("@s-0ff", "passed", at(6)).unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
+}
+
+#[test]
 fn a_board_records_reads_merges_and_accepts_its_rows() {
     let (_dir, board) = scratch();
     assert_eq!(board.scan(), Scan::default(), "no folder is an empty board");

@@ -66,6 +66,56 @@ fn an_unrecorded_build_is_folded_once_and_the_fold_recorded() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_scheduled_reclaim_does_not_make_a_complete_build_unrecorded() {
+    use std::time::{Duration, Instant};
+
+    let scratch = crate::testdir::dir("atpkg-lock-fold-reclaim-");
+    let prefix = scratch.join("pkg");
+    let root = store_build(&prefix, 16387);
+    let lock = lock_of(16387, &root);
+    let present = LockedBuild::Present {
+        bin: build_dir(&prefix, lock.build).join("bin"),
+    };
+    assert_eq!(
+        standing_started(&prefix, &lock, Instant::now() - Duration::from_secs(6)),
+        present
+    );
+    assert_eq!(locked_build(&prefix, &lock), present);
+    assert_eq!(
+        standing_started(&prefix, &lock, Instant::now() - Duration::from_secs(61)),
+        present,
+        "an already recorded complete build needs no fold lease"
+    );
+    assert_eq!(
+        standing(&prefix, &lock_of(lock.build, &"a".repeat(64))),
+        LockedBuild::Mismatch { recorded: root }
+    );
+
+    let root = store_build(&prefix, 16388);
+    let lock = lock_of(16388, &root);
+    let subject = crate::lease::Subject::build(PROGRAM, lock.build).unwrap();
+    let crate::lease::Reclaim::Clear(held) = crate::lease::reclaim(&prefix, &subject) else {
+        panic!("the complete build has no active lease");
+    };
+    assert_eq!(
+        standing_started(&prefix, &lock, Instant::now() - Duration::from_secs(61)),
+        LockedBuild::Unrecorded
+    );
+    assert!(!tree_root_record(&prefix, lock.build).exists());
+    held.check_subject(&prefix, &subject).unwrap();
+    drop(held);
+    let result = standing(&prefix, &lock);
+    assert_eq!(
+        result,
+        LockedBuild::Present {
+            bin: build_dir(&prefix, lock.build).join("bin")
+        }
+    );
+    assert_eq!(locked_build(&prefix, &lock), result);
+}
+
 /// A TREE THE STORE DOES NOT READ COMPLETE IS NO LOCKED BUILD, and is never folded: one with no
 /// ready marker (a stage cut short, or a build its resolve check refused while a first-exec hold
 /// kept the tree) and one whose marker records another slice both stand absent, recorded or not.

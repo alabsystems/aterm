@@ -133,6 +133,9 @@ pub fn select_index(
         let Ok((index, verified)) = a.roster.authorize_index(a.index_bytes, &a.sig) else {
             continue;
         };
+        if !release_label_matches_build(&a.label, index.index_build) {
+            continue;
+        }
         if !floor.admits(index.authorizing_seq(), index.index_build) {
             continue;
         }
@@ -182,6 +185,19 @@ pub fn select_index(
         observed_roster_seq,
         refused,
     }
+}
+
+/// Production index-release labels carry their signed build number. Diagnostic fixture labels
+/// remain free-form, but anything claiming the `atpkg-index-` namespace must be canonical and
+/// must agree with the authenticated document.
+fn release_label_matches_build(label: &str, build: u64) -> bool {
+    let Some(digits) = label.strip_prefix("atpkg-index-") else {
+        return true;
+    };
+    !digits.is_empty()
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+        && (digits == "0" || !digits.starts_with('0'))
+        && digits.parse::<u64>() == Ok(build)
 }
 
 #[cfg(test)]
@@ -304,6 +320,24 @@ mod tests {
                 .selected
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_canonical_release_label_must_name_the_signed_index_build() {
+        let out = select_index(
+            &anchor(0),
+            vec![
+                signed("atpkg-index-61", 60),
+                signed("atpkg-index-060", 60),
+                signed("atpkg-index-59", 59),
+            ],
+            no_floor(),
+            None,
+            testkit::NOW,
+        );
+        let selected = out.selected.expect("the accurately labelled release wins");
+        assert_eq!(selected.label, "atpkg-index-59");
+        assert_eq!(selected.index.index_build, 59);
     }
 
     #[test]

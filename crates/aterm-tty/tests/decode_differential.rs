@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use aterm_core::terminal::Terminal;
 use aterm_tty::decode::{
-    Decoder, ESC_TIMEOUT, Event, MAX_PASTE_BYTES, ModeState, MouseKind, PASTE_TIMEOUT, Reply,
+    Decoder, ESC_TIMEOUT, Event, FRAME_HANG, MAX_PASTE_BYTES, ModeState, MouseKind, Reply,
 };
 use aterm_types::keyboard::{
     Key, KeyEventType, KeyboardMode, Modifiers, NamedKey, encode_key_with_text, shifted_character,
@@ -20,7 +20,7 @@ fn decode_all(bytes: &[u8]) -> Vec<Event> {
     let t = Instant::now();
     let mut decoder = Decoder::new();
     let mut events = decoder.feed(bytes, t);
-    events.extend(decoder.flush(t + ESC_TIMEOUT));
+    events.extend(decoder.flush(t + FRAME_HANG));
     events
 }
 
@@ -804,13 +804,13 @@ fn paste_and_focus_round_trip() {
         let mut events = decoder.feed(head, t);
         let deadline = match split {
             1..=5 => Some(t + ESC_TIMEOUT),
-            _ if (6..=stream.len() - 2).contains(&split) => Some(t + PASTE_TIMEOUT),
+            _ if (6..=stream.len() - 2).contains(&split) => Some(t + FRAME_HANG),
             _ => None,
         };
         assert_eq!(decoder.deadline(), deadline, "split at {split}");
         let later = t + Duration::from_secs(60);
         events.extend(decoder.feed(tail, later));
-        events.extend(decoder.flush(later + PASTE_TIMEOUT));
+        events.extend(decoder.flush(later + FRAME_HANG));
         assert_eq!(events, want, "split at {split}");
     }
 
@@ -829,22 +829,112 @@ fn a_stalled_paste_is_delivered_after_its_timeout() {
     let mut decoder = Decoder::new();
     assert!(decoder.feed(b"\x1b[200~abc", t).is_empty());
     assert!(decoder.feed(b"\rdef\x1b[20", t + ms(1500)).is_empty());
-    assert_eq!(decoder.deadline(), Some(t + ms(1500) + PASTE_TIMEOUT));
+    assert_eq!(decoder.deadline(), Some(t + ms(1500) + FRAME_HANG));
     assert!(decoder.flush(t + ms(3000)).is_empty());
+    assert!(
+        decoder
+            .flush(t + ms(1500) + FRAME_HANG - Duration::from_nanos(1))
+            .is_empty()
+    );
     assert_eq!(
-        decoder.flush(t + ms(3500)),
+        decoder.flush(t + ms(1500) + FRAME_HANG),
         [Event::Paste("abc\rdef\x1b[20".to_owned())]
     );
     assert_eq!(decoder.deadline(), None);
     assert_eq!(
-        decoder.feed(b"\x07", t + ms(3600)),
+        decoder.feed(b"\x07", t + ms(1500) + FRAME_HANG + ms(100)),
         [chord('g', Modifiers::CTRL)]
     );
     assert!(decoder.feed(b"\x1b[200~", t).is_empty());
-    assert_eq!(
-        decoder.flush(t + PASTE_TIMEOUT),
-        [Event::Paste(String::new())]
-    );
+    assert_eq!(decoder.flush(t + FRAME_HANG), [Event::Paste(String::new())]);
+}
+
+#[test]
+fn unambiguous_frames_keep_their_bytes_until_the_completion_hang() {
+    let t = Instant::now();
+    let hang = aterm_spec::wait::MUST_HAPPEN;
+    let cases = [
+        (
+            b"\x1b[200~head\x1b[20".as_slice(),
+            b"1~".as_slice(),
+            Event::Paste("head".to_owned()),
+            Event::Paste("head\x1b[20".to_owned()),
+        ),
+        (
+            b"\xe6".as_slice(),
+            b"\x97\xa5".as_slice(),
+            typed('日'),
+            typed('�'),
+        ),
+        (
+            b"\xe6\x97".as_slice(),
+            b"\xa5".as_slice(),
+            typed('日'),
+            typed('�'),
+        ),
+        (
+            b"\x1b[M".as_slice(),
+            b" !!".as_slice(),
+            mouse(
+                MouseKind::Press,
+                Some(MouseButton::Left),
+                0,
+                0,
+                Modifiers::empty(),
+            ),
+            Event::Unknown(b"\x1b[M".to_vec()),
+        ),
+        (
+            b"\x1b[M ".as_slice(),
+            b"!!".as_slice(),
+            mouse(
+                MouseKind::Press,
+                Some(MouseButton::Left),
+                0,
+                0,
+                Modifiers::empty(),
+            ),
+            Event::Unknown(b"\x1b[M ".to_vec()),
+        ),
+        (
+            b"\x1b[M !".as_slice(),
+            b"!".as_slice(),
+            mouse(
+                MouseKind::Press,
+                Some(MouseButton::Left),
+                0,
+                0,
+                Modifiers::empty(),
+            ),
+            Event::Unknown(b"\x1b[M !".to_vec()),
+        ),
+    ];
+    for (head, tail, complete, unfinished) in cases {
+        let mut decoder = Decoder::new();
+        assert!(decoder.feed(head, t).is_empty());
+        assert!(
+            decoder.flush(t + Duration::from_secs(3)).is_empty(),
+            "{head:?}"
+        );
+        assert!(
+            decoder.flush(t + hang - Duration::from_nanos(1)).is_empty(),
+            "{head:?}"
+        );
+        assert_eq!(
+            decoder.feed(tail, t + hang - Duration::from_nanos(1)),
+            [complete]
+        );
+        assert_eq!(decoder.deadline(), None);
+
+        assert!(decoder.feed(head, t).is_empty());
+        assert_eq!(decoder.flush(t + hang), [unfinished], "{head:?}");
+        assert_eq!(decoder.deadline(), None);
+        assert!(decoder.flush(t + hang + Duration::from_secs(1)).is_empty());
+        assert_eq!(
+            decoder.feed(b"z", t + hang + Duration::from_secs(1)),
+            [typed('z')]
+        );
+    }
 }
 
 #[test]
@@ -1067,12 +1157,16 @@ fn a_sequence_split_across_slow_reads_is_still_one_sequence() {
         let mut decoder = Decoder::new();
         assert!(decoder.feed(head, t).is_empty(), "{head:?}");
         let mut events = decoder.feed(tail, late);
-        events.extend(decoder.flush(late + PASTE_TIMEOUT));
+        events.extend(decoder.flush(late + FRAME_HANG));
         assert_eq!(events, want, "{head:?} then {tail:?}");
     }
     let mut decoder = Decoder::new();
     assert!(decoder.feed(b"\xe6\x97", t).is_empty());
-    assert_eq!(decoder.flush(late), [typed('\u{fffd}')]);
+    assert!(decoder.flush(late).is_empty());
+    assert_eq!(
+        decoder.flush(t + aterm_spec::wait::MUST_HAPPEN),
+        [typed('\u{fffd}')]
+    );
 }
 
 struct Rng(u64);
@@ -1136,7 +1230,7 @@ fn never_panics_on_arbitrary_bytes() {
         }
         let mut whole = Decoder::new();
         let mut want = whole.feed(&buf, t);
-        want.extend(whole.flush(t + PASTE_TIMEOUT));
+        want.extend(whole.flush(t + FRAME_HANG));
         assert_eq!(whole.deadline(), None, "case {case}: {buf:?}");
 
         for slow in [false, true] {
@@ -1152,7 +1246,7 @@ fn never_panics_on_arbitrary_bytes() {
                 }
                 rest = tail;
             }
-            got.extend(chunked.flush(now + PASTE_TIMEOUT));
+            got.extend(chunked.flush(now + FRAME_HANG));
             assert_eq!(got, want, "case {case} (slow: {slow}): {buf:?}");
         }
 
@@ -1164,12 +1258,12 @@ fn never_panics_on_arbitrary_bytes() {
             let _ = timed.feed(head, now);
             now += Duration::from_millis(rng.below(40) as u64);
             if rng.below(8) == 0 {
-                now += PASTE_TIMEOUT;
+                now += FRAME_HANG;
             }
             let _ = timed.flush(now);
             rest = tail;
         }
-        let _ = timed.flush(now + PASTE_TIMEOUT);
+        let _ = timed.flush(now + FRAME_HANG);
         assert_eq!(timed.deadline(), None, "case {case}: {buf:?}");
     }
 }

@@ -4,24 +4,72 @@
 //! Explicit private-dev gallery: synthetic states through the production footer composition.
 
 use super::*;
-use crate::autopilot::{HarnessSwitch, SwitchOff};
+use crate::autopilot::{AutopilotView, HarnessSwitch, SwitchOff};
+use aterm_agent::harness::quota_scenes;
+use aterm_agent::harness::quota_view::QuotaView;
 use aterm_effects::harness_card::CardPalette;
 use aterm_phase::Program;
 
 /// A sample Claude Code version; this scene does not create a live upgrade offer.
 const PRODUCT: &str = "2.1.305";
 
+/// The rows between one top-rule sample's title and the next's.
+const TOP_PITCH: usize = 3;
+
+/// The glass design's quota samples (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.2,
+/// §1.3), widest first, each a title over line D and, where line E is claimed, the quota row
+/// under it: its case, its first row, its title, and whether the row under the bottom rule holds
+/// the tap's words for the case ([`quota_scenes::tap_words`]), which the glass claims (`false`:
+/// line E is not claimed, so line D carries the account unit).
+const QUOTA_SAMPLES: [(&str, usize, &str, bool); 3] = [
+    (
+        "b",
+        29,
+        "Synthetic: case (b), line E claimed: line D without the account, line E the quota row",
+        true,
+    ),
+    (
+        "c",
+        33,
+        "Synthetic: case (c), three named accounts: line D without the account, line E the quota row",
+        true,
+    ),
+    (
+        "b",
+        37,
+        "Synthetic: case (b), line E not claimed: line D carries the words-only account unit",
+        false,
+    ),
+];
+
+/// The first footer of the quota samples (the top rules', the chips' and the effort's before).
+const QUOTA_FOOTER: usize = 9;
+
 #[derive(Default)]
 struct Layouts {
-    footers: [PaneFooter; 9],
+    footers: [PaneFooter; QUOTA_FOOTER + QUOTA_SAMPLES.len()],
     marks: MarkContents,
     rings: RingContents,
+    /// The design's cases (`quota_scenes::cases`), replayed once for every frame after.
+    cases: Option<Vec<(&'static str, QuotaView)>>,
 }
 
 thread_local! {
     /// A gallery, like a live pane, retains composed cells and sprite identities across frames.
     /// Boxed lazily so idle threads do not carry 30 KB in the image's TLS template.
     static LAYOUTS: std::cell::RefCell<Option<Box<Layouts>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The rows the scene lays its samples in: the frame's terminal band where it declares one (a
+/// windowed frame's, below its chrome strip), else every row. A windowless capture lays a frame
+/// that declares no band (`grid_bot_row` 0, as a split window's), and the scene still fills it.
+fn scene_rows(input: &RenderInput) -> std::ops::Range<usize> {
+    let rows = input.cells.len();
+    if input.grid_bot_row > input.grid_top_row {
+        input.grid_top_row.min(rows)..input.grid_bot_row.min(rows)
+    } else {
+        0..rows
+    }
 }
 
 /// Replace the private instance's grid with samples, retaining its actual theme and cell metrics.
@@ -44,7 +92,8 @@ fn paint_with(layouts: &mut Layouts, input: &mut RenderInput, cell: (usize, usiz
         ch: ' ',
         ..input.implicit_blank
     };
-    for row in input.grid_top_row..input.grid_bot_row.min(input.cells.len()) {
+    let band = scene_rows(input);
+    for row in band.clone() {
         input.cells[row] = vec![blank; input.cols];
         if let Some(entries) = input.clusters.get_mut(row) {
             entries.clear();
@@ -116,9 +165,9 @@ fn paint_with(layouts: &mut Layouts, input: &mut RenderInput, cell: (usize, usiz
         ),
     ];
     for (i, (title, program, hover, version, state)) in samples.into_iter().enumerate() {
-        let title_row = input.grid_top_row + 2 + i * 4;
+        let title_row = band.start + 1 + i * TOP_PITCH;
         let frame_row = title_row + 1;
-        if frame_row >= input.grid_bot_row || frame_row >= input.cells.len() {
+        if frame_row >= band.end {
             break;
         }
         for (cell, ch) in input.cells[title_row].iter_mut().zip(title.chars()) {
@@ -172,7 +221,7 @@ fn paint_with(layouts: &mut Layouts, input: &mut RenderInput, cell: (usize, usiz
         };
         let key = TopKey {
             frame_row,
-            term_row: frame_row - input.grid_top_row,
+            term_row: frame_row - band.start,
             run: TopRun {
                 col: 2,
                 len: input.cols.saturating_sub(4),
@@ -213,15 +262,21 @@ fn paint_with(layouts: &mut Layouts, input: &mut RenderInput, cell: (usize, usiz
             .fx_layers
             .extend(top.mark.iter().chain(top.ring.iter()).cloned());
     }
-    paint_chip_and_effort_samples(layouts, input, blank);
+    paint_chip_and_effort_samples(layouts, input, blank, &band);
+    paint_quota_samples(layouts, input, blank, (cw, ch), &band);
 }
 
-/// The glass a sample rule wears under Cruise, laid from frame column 2 to two short of a row
+/// The glass a sample rule wears under `palette`, laid from frame column 2 to two short of a row
 /// `cols` wide, as a pane's composer rule is.
-fn scene_glass(cols: usize, rule: RenderCell, blank: RenderCell) -> (GlassInks, RuleAt) {
+fn scene_glass(
+    palette: CardPalette,
+    cols: usize,
+    rule: RenderCell,
+    blank: RenderCell,
+) -> (GlassInks, RuleAt) {
     (
         GlassInks::of(
-            Some(CardPalette::Cruise),
+            Some(palette),
             pack_rgb(blank.bg),
             pack_rgb(blank.fg),
             pack_rgb(rule.fg),
@@ -238,9 +293,10 @@ fn paint_chip_and_effort_samples(
     layouts: &mut Layouts,
     input: &mut RenderInput,
     blank: RenderCell,
+    band: &std::ops::Range<usize>,
 ) {
-    let base = input.grid_top_row;
-    if base + 35 >= input.grid_bot_row || base + 35 >= input.cells.len() {
+    let base = band.start;
+    if base + 27 >= band.end {
         return;
     }
     let title = |input: &mut RenderInput, row: usize, text: &str| {
@@ -250,7 +306,7 @@ fn paint_chip_and_effort_samples(
     };
     title(
         input,
-        30,
+        22,
         "Synthetic: worded Autopilot and permission chips, separated by rule",
     );
     let rule = RenderCell {
@@ -258,7 +314,8 @@ fn paint_chip_and_effort_samples(
         fg: mix(blank.fg, blank.bg, 0.6),
         ..blank
     };
-    let (glass, at) = scene_glass(input.cols, rule, blank);
+    // Land's chip, worded as a click that just reached it shows it, under Land's sunset.
+    let (glass, at) = scene_glass(CardPalette::Land, input.cols, rule, blank);
     let block = crate::claude_lights::Block::layout_scene(
         blank,
         crate::claude_lights::ChipAt {
@@ -266,6 +323,12 @@ fn paint_chip_and_effort_samples(
             col: 2 + footer::RULE_LEAD + 1,
             cols: input.cols,
         },
+        (
+            AutopilotView::Land,
+            "  \u{23f8} plan mode on (shift+tab to cycle)",
+            true,
+            false,
+        ),
     );
     let footer = &mut layouts.footers[7];
     footer.compose(
@@ -276,15 +339,15 @@ fn paint_chip_and_effort_samples(
         (glass, at),
         None,
     );
-    input.cells[base + 31].fill(rule);
-    for (out, cell) in input.cells[base + 31]
+    input.cells[base + 23].fill(rule);
+    for (out, cell) in input.cells[base + 23]
         .iter_mut()
         .skip(2)
         .zip(&footer.rule.paint.cells)
     {
         *out = *cell;
     }
-    paint_effort_sample(&mut layouts.footers[8], input, blank, rule);
+    paint_effort_sample(&mut layouts.footers[8], input, (blank, rule), base);
 }
 
 /// An explicitly admitted synthetic hint fills open facts through the production card/facts
@@ -292,11 +355,10 @@ fn paint_chip_and_effort_samples(
 fn paint_effort_sample(
     footer: &mut PaneFooter,
     input: &mut RenderInput,
-    blank: RenderCell,
-    rule: RenderCell,
+    (blank, rule): (RenderCell, RenderCell),
+    base: usize,
 ) {
-    let base = input.grid_top_row;
-    for (cell, ch) in input.cells[base + 33]
+    for (cell, ch) in input.cells[base + 25]
         .iter_mut()
         .zip("Synthetic: admitted hint fills open effort; the mode row keeps jobs".chars())
     {
@@ -325,7 +387,7 @@ fn paint_effort_sample(
         effort: Some(level.to_owned()),
     };
     footer.note_facts(&facts, Some(&card), true, FactMask::default());
-    let (glass, at) = scene_glass(input.cols, rule, blank);
+    let (glass, at) = scene_glass(CardPalette::Cruise, input.cols, rule, blank);
     footer.compose(
         footer::rule_room(&(2..at.end)),
         None,
@@ -334,8 +396,8 @@ fn paint_effort_sample(
         (glass, at),
         None,
     );
-    input.cells[base + 34].fill(rule);
-    for (out, cell) in input.cells[base + 34]
+    input.cells[base + 26].fill(rule);
+    for (out, cell) in input.cells[base + 26]
         .iter_mut()
         .skip(2)
         .zip(&footer.rule.paint.cells)
@@ -348,7 +410,147 @@ fn paint_effort_sample(
         mode.keeping_effort()
     };
     if let Some(mode) = mode {
-        paint_mode_sample(input, blank, &rows, mode, base + 35);
+        paint_mode_sample(input, blank, &rows, mode, base + 27);
+    }
+}
+
+/// The glass design's line D and line E (§1.2, §1.3) for [`QUOTA_SAMPLES`], through the production
+/// paths a live Claude pane takes: the facts a pane publishes with its case's quota view, the
+/// claim of the row under the bottom rule ([`PaneFooter::claim_quota_row`] over a scratch screen
+/// of the rule and the tap's words), line D's rule composed with line E claimed or not
+/// ([`PaneFooter::note_line_e`]), and the quota row and its midnight ticks
+/// ([`PaneFooter::compose_quota_row`]) under it. The cases' words are said at offset 0, UTC, as
+/// [`quota_scenes`] builds them.
+fn paint_quota_samples(
+    layouts: &mut Layouts,
+    input: &mut RenderInput,
+    blank: RenderCell,
+    cell: (u16, u16),
+    band: &std::ops::Range<usize>,
+) {
+    let base = band.start;
+    let Ok(cols16) = u16::try_from(input.cols) else {
+        return;
+    };
+    let rule = RenderCell {
+        ch: '\u{2500}',
+        fg: mix(blank.fg, blank.bg, 0.6),
+        ..blank
+    };
+    // The design's own samples (§1.2): Cruise's chip, `∞ yolo`, under Cruise's rainbow.
+    let (glass, at) = scene_glass(CardPalette::Cruise, input.cols, rule, blank);
+    let block = crate::claude_lights::Block::layout_scene(
+        blank,
+        crate::claude_lights::ChipAt {
+            glass,
+            col: 2 + footer::RULE_LEAD + 1,
+            cols: input.cols,
+        },
+        (
+            AutopilotView::Cruise,
+            "  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle)",
+            false,
+            true,
+        ),
+    );
+    let cases = layouts.cases.get_or_insert_with(quota_scenes::cases);
+    for (i, &(case, row, title, claimed)) in QUOTA_SAMPLES.iter().enumerate() {
+        // Its title, line D and, claimed, line E: a grid too short for them ends the samples.
+        let last = base + row + 1 + usize::from(claimed);
+        if last >= band.end {
+            break;
+        }
+        let Some(view) = cases.iter().find(|(name, _)| *name == case).map(|(_, v)| v) else {
+            continue;
+        };
+        for (out, ch) in input.cells[base + row].iter_mut().zip(title.chars()) {
+            out.ch = ch;
+        }
+        let footer = &mut layouts.footers[QUOTA_FOOTER + i];
+        footer.session = (QUOTA_FOOTER + i) as u64 + 1;
+        let facts = FooterFacts {
+            model: Some("Opus 5.5".to_owned()),
+            effort: Some("xhigh".to_owned()),
+            path: Some("~/aterm".to_owned()),
+            branch: Some("main".to_owned()),
+            account: Some("main".to_owned()),
+            subscription: Some(SubscriptionDisplay {
+                tap_own: claimed,
+                ..SubscriptionDisplay::default()
+            }),
+            quota: Some(view.clone()),
+            ..FooterFacts::default()
+        };
+        footer.note_facts(&facts, None, true, FactMask::default());
+        // The claim reads the row under the bottom rule as a live pane's splice does.
+        let words = claimed.then(|| quota_scenes::tap_words(view));
+        let claim = words.map_or(quota::Claim::Not, |words| {
+            let rows = ["\u{2500}".repeat(input.cols), format!("  {words}")];
+            let mut term = aterm_core::terminal::Terminal::new(3, cols16);
+            term.process(format!("{}\r\n{}", rows[0], rows[1]).as_bytes());
+            let mut scratch = term.cell_frame(3, input.cols);
+            scratch.cursor_visible = false;
+            footer.claim_quota_row(&quota::RowAt {
+                scratch: &scratch,
+                rows: &rows,
+                region: PaneTextRegion {
+                    strip: scratch.grid_top_row,
+                    row_off: 0,
+                    col_off: 0,
+                    rows: 3,
+                    cols: input.cols,
+                },
+                rule: 0,
+                chrome_owned: false,
+            })
+        });
+        footer.note_line_e(matches!(claim, quota::Claim::Laid(_)));
+        footer.compose(
+            footer::rule_room(&(2..at.end)),
+            Some(&block),
+            rule,
+            blank,
+            (glass, at),
+            None,
+        );
+        let d = base + row + 1;
+        input.cells[d].fill(rule);
+        for (out, composed) in input.cells[d]
+            .iter_mut()
+            .skip(2)
+            .zip(&footer.rule.paint.cells)
+        {
+            *out = *composed;
+        }
+        let quota::Claim::Laid(span) = claim else {
+            continue;
+        };
+        let region = PaneTextRegion {
+            strip: base,
+            row_off: 0,
+            col_off: 0,
+            rows: band.end - base,
+            cols: input.cols,
+        };
+        let Some(write) = footer.compose_quota_row(
+            footer.session,
+            0,
+            span,
+            (region, d + 1),
+            (glass, blank, false),
+            cell,
+            aterm_core::render::PxRect::EVERYWHERE,
+        ) else {
+            continue;
+        };
+        for (out, composed) in input.cells[d + 1]
+            .iter_mut()
+            .skip(write.col)
+            .zip(footer.quota.cells())
+        {
+            *out = *composed;
+        }
+        input.fx_layers.extend(write.ticks);
     }
 }
 
@@ -403,56 +605,167 @@ fn paint_mode_sample(
 mod tests {
     use super::*;
 
+    /// Also the glass design's line D and line E (§1.2, §1.3): line D gives up its account unit
+    /// while line E is claimed, and carries it, the case's words, while not. Negative control:
+    /// noting every sample's line E as unclaimed (`note_line_e(false)`) puts `⎆` back on a
+    /// claimed sample's line D, and the test fails.
+    ///
+    /// A frame that declares no terminal band (`grid_bot_row` 0, as a windowless capture lays
+    /// it) is filled as a windowed one is, so `lab instance --scene harness-layouts --image`
+    /// shows the samples headless too. NEGATIVE CONTROL (run once, restored): bounding the
+    /// samples by `grid_bot_row` alone, as the scene did, leaves that frame unpainted and fails.
+    /// Each quota sample wears Cruise's chip (`∞ yolo`) under Cruise's rainbow, as §1.2 draws
+    /// it, and the worded-chips sample Land's under Land's sunset, so no chip contradicts its
+    /// palette. NEGATIVE CONTROL: composing the Land sample with Cruise's glass leaves its words
+    /// intact but gives `land` Cruise's letter ink, and fails the exact palette assertion.
     #[test]
     fn the_private_scene_draws_whole_products_and_actionable_rings_at_actual_cell_size() {
-        for (fg, bg) in [("d0d0d0", "111318"), ("202020", "ffffff")] {
-            let mut term = aterm_core::terminal::Terminal::new(38, 250);
+        for ((fg, bg), declared) in [("d0d0d0", "111318"), ("202020", "ffffff")]
+            .into_iter()
+            .flat_map(|ground| [(ground, true), (ground, false)])
+        {
+            let mut term = aterm_core::terminal::Terminal::new(40, 250);
             term.process(format!("\x1b]10;#{fg}\x07\x1b]11;#{bg}\x07x").as_bytes());
-            let mut input = term.cell_frame(38, 250);
-            input.grid_bot_row = input.rows;
+            let mut input = term.cell_frame(40, 250);
+            input.grid_bot_row = if declared { input.rows } else { 0 };
             let original = input.clone();
             paint(&mut input, (0, 14));
             assert_eq!(input, original, "invalid metrics do not replace the frame");
             paint(&mut input, (7, 14));
             let row = |offset: usize| read_glass(&input.cells[input.grid_top_row + offset]);
-            assert!(row(3).contains(PRODUCT));
-            assert!(row(7).contains(PRODUCT));
-            assert!(row(11).contains("1 shell"));
-            assert!(row(11).contains(UP_ARROW), "the actionable colour arrow");
-            for offset in [15, 23] {
+            assert!(row(2).contains(PRODUCT));
+            assert!(row(5).contains(PRODUCT));
+            assert!(row(8).contains("1 shell"));
+            assert!(row(8).contains(UP_ARROW), "the actionable colour arrow");
+            for offset in [11, 17] {
                 assert!(row(offset).contains('↑'), "a held move's quiet arrow");
                 assert!(!row(offset).contains(UP_ARROW), "held is not actionable");
             }
-            assert!(row(19).contains(&"7".repeat(CLI_VERSION_MAX - "0.1.0-dev.".len())));
+            assert!(row(14).contains(&"7".repeat(CLI_VERSION_MAX - "0.1.0-dev.".len())));
             assert!(
-                row(27).contains("updating to") || row(27).contains('→'),
+                row(20).contains("updating to") || row(20).contains('→'),
                 "asked forms keep the verb or under-way marker"
             );
             assert!(
-                row(31).contains("land"),
+                row(23).contains("land"),
                 "the sample uses a worded Land chip"
             );
-            assert!(row(31).contains("plan"), "its permission chip follows it");
+            assert!(row(23).contains("plan"), "its permission chip follows it");
             assert!(
-                row(31).contains(" ─ "),
+                row(23).contains(" ─ "),
                 "worded chips are set apart by the rule"
             );
+            let word_col = |offset: usize, word: &str| {
+                input.cells[input.grid_top_row + offset]
+                    .windows(word.chars().count())
+                    .position(|cells| cells.iter().map(|cell| cell.ch).eq(word.chars()))
+                    .unwrap_or_else(|| panic!("{word:?} in scene row {offset}"))
+            };
+            let blank = RenderCell {
+                ch: ' ',
+                ..input.implicit_blank
+            };
+            let rule = RenderCell {
+                ch: '\u{2500}',
+                fg: mix(blank.fg, blank.bg, 0.6),
+                ..blank
+            };
+            let palette_ink = |palette, col| {
+                let (glass, _) = scene_glass(palette, input.cols, rule, blank);
+                rgb_of(glass.letter(aterm_effects::glass_inks::field(col, input.cols)))
+            };
+            let land_col = word_col(23, "land");
+            let land_chip_col = word_col(23, AutopilotView::Land.glyph());
+            assert_eq!(
+                input.cells[input.grid_top_row + 23][land_col].fg,
+                palette_ink(CardPalette::Land, land_chip_col),
+                "the worded Land chip wears Land's sunset"
+            );
+            assert_ne!(
+                palette_ink(CardPalette::Land, land_chip_col),
+                palette_ink(CardPalette::Cruise, land_chip_col),
+                "CONTROL: the palettes differ at the asserted cell"
+            );
             assert!(
-                row(34).contains("Opus 5.5") && row(34).contains("medium"),
+                row(26).contains("Opus 5.5") && row(26).contains("medium"),
                 "the parsed hint fills the card's open effort on the composed rule: {:?}",
-                row(34)
+                row(26)
             );
             assert_eq!(
-                row(35).trim_end(),
+                row(27).trim_end(),
                 "1 shell",
                 "effort filled from the admitted hint leaves only jobs"
             );
+            for d in [30, 34, 38] {
+                assert!(
+                    row(d).contains("\u{221e} yolo") && !row(d).contains("land"),
+                    "a quota sample wears Cruise's chip: {:?}",
+                    row(d)
+                );
+                let cruise_chip_col = word_col(d, AutopilotView::Cruise.glyph());
+                assert_eq!(
+                    input.cells[input.grid_top_row + d][cruise_chip_col].fg,
+                    palette_ink(CardPalette::Cruise, cruise_chip_col),
+                    "the quota sample's Cruise chip wears Cruise's rainbow"
+                );
+            }
+            for d in [30, 34] {
+                assert!(row(d).contains("Opus 5.5"), "line D's facts: {:?}", row(d));
+                assert!(
+                    !row(d).contains('⎆'),
+                    "line D gives up its account unit while line E is claimed: {:?}",
+                    row(d)
+                );
+            }
+            for e in [31, 35] {
+                assert!(row(e).contains('▕'), "line E's chart: {:?}", row(e));
+                assert!(row(e).contains('↺'), "the reset on the chart: {:?}", row(e));
+                assert!(
+                    !row(e).contains("resets"),
+                    "the tap's words are covered: {:?}",
+                    row(e)
+                );
+            }
+            assert!(
+                row(31).contains("main 63%"),
+                "case (b)'s figure: {:?}",
+                row(31)
+            );
+            assert!(row(31).contains('╳'), "case (b) runs out: {:?}", row(31));
+            assert!(
+                row(35).contains("main 75%"),
+                "case (c)'s figure: {:?}",
+                row(35)
+            );
+            assert!(
+                row(35).contains('→'),
+                "case (c)'s work moves: {:?}",
+                row(35)
+            );
+            assert!(
+                row(38).contains("⎆ main 63%") && row(38).contains("↺ Sat 10:00"),
+                "unclaimed, line D carries the words-only unit: {:?}",
+                row(38)
+            );
+            assert!(
+                row(39).trim().is_empty(),
+                "an unclaimed sample has no line E"
+            );
+            for e in [31, 35] {
+                assert!(
+                    input
+                        .fx_layers
+                        .iter()
+                        .any(|l| l.offset.1 == (input.grid_top_row + e) as i32 * 14),
+                    "line E's midnights are hairlines on its row"
+                );
+            }
             let ring = input
                 .fx_layers
                 .iter()
                 .find(|l| l.id == top_ring_id(3))
                 .expect("the actionable ready arrow is ringed");
-            assert_eq!(ring.offset.1, (input.grid_top_row + 11) as i32 * 14);
+            assert_eq!(ring.offset.1, (input.grid_top_row + 8) as i32 * 14);
             for i in [4, 6] {
                 assert!(
                     !input.fx_layers.iter().any(|l| l.id == top_ring_id(i)),

@@ -536,7 +536,10 @@ fn a_band_painted_over_a_bidi_row_drops_its_map() {
             .is_empty()
     );
     let cell_h = app.win_cell_size(wid).1;
-    let blank = crate::message_band::blank_band_row(cols, app.chrome_palette_theme());
+    let blank = aterm_render::band::blank_band_row(
+        cols,
+        &crate::chrome_band::band_colors(app.chrome_palette_theme()),
+    );
     app.splice_band_rows_at(wid, 4, vec![blank], cols, cell_h);
     assert!(
         app.windows[&wid]

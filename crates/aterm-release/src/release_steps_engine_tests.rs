@@ -8,7 +8,10 @@
 //! `revalidate_push_inputs`): HEAD is the origin's main when the stage starts, and a HEAD that
 //! moved by anything but the data plane while it ran refuses the push.
 
+use super::tests::{bind_native_engine_fixture, native_engine_fixture};
 use super::*;
+
+const ENGINE_URL: &str = "https://github.com/fixture/app.git";
 
 const SHARED_NAME: &str = "Engine Owner";
 const SHARED_EMAIL: &str = "owner@example.invalid";
@@ -90,6 +93,7 @@ impl World {
                  case \"$1\" in\n\
                  scanner-preflight) cat '{report}'; exit 0 ;;\n\
                  stage)\n\
+                 if [ -x '{before}' ]; then '{before}' || exit $?; fi\n\
                  captured=$(git -C \"$here\" rev-parse HEAD) || exit 12\n\
                  remote=$(git --git-dir='{origin}' rev-parse refs/heads/main) || exit 12\n\
                  [ \"$captured\" = \"$remote\" ] || {{ echo \"FAIL: publication engine HEAD \
@@ -107,6 +111,7 @@ impl World {
                  esac\nexit 9\n",
                 report = report.display(),
                 origin = origin.display(),
+                before = root.join("before-capture").display(),
                 mid = root.join("mid-stage").display(),
             ),
         );
@@ -141,6 +146,7 @@ impl World {
             bump_from: None,
             carry: Vec::new(),
         };
+        bind_native_engine_fixture(&shared, &origin);
         let bin = root.join("bin");
         std::fs::create_dir(&bin).unwrap();
         std::os::unix::fs::symlink("/usr/bin/false", bin.join("targo")).unwrap();
@@ -169,9 +175,7 @@ impl World {
     /// A real run's backend named the shared checkout (`dry`: a dry run's), its logs its own.
     fn real(&self, dry: bool) -> Real {
         let mut real = Real::new(&self.repo, Some(&self.shared), dry, false).unwrap();
-        real.engine_repository = Ok(agh::Slug::parse("fixture/app").unwrap());
-        real.engine_origin = crate::github_remote::engine_fixture;
-        real.engine_url = tests::fixture_engine_url;
+        real.engine_origin = native_engine_fixture;
         real.prerequisite_acquire = crate::managed_prerequisites::simulated;
         real.scanner_probe = |_| Ok(scanner_tools::test_output());
         real.logs = self.root.join(format!("logs-{}", u8::from(dry)));
@@ -278,7 +282,6 @@ fn a_second_writer_moving_the_shared_engine_mid_stage_leaves_the_stage_unaffecte
 
     // NEGATIVE CONTROL: the release's engine as the checkout it was named.
     w.mid_stage(&w.lands_and_aligns("pub-ledger", &format!("'{}'", w.shared.display())));
-    tests::bind_native_engine_fixture(&w.shared, &w.origin);
     real.engine = w.shared.clone();
     let ran = Backend::stage(&mut real, &w.candidate, &w.prover, StageTarget::Remote).unwrap();
     let log = w.log(&real);
@@ -319,7 +322,7 @@ fn the_releases_own_engine_still_refuses_code_moving_its_head_mid_stage() {
          git -C \"$1\" fetch -q '{origin}' refs/heads/main:refs/remotes/origin/main\n\
          git -C \"$1\" merge -q --ff-only origin/main\n",
         peer = w.peer.display(),
-        origin = w.origin.display()
+        origin = w.origin.display(),
     ));
     let ran = Backend::stage(&mut real, &w.candidate, &w.prover, StageTarget::Remote).unwrap();
     let log = w.log(&real);
@@ -364,10 +367,7 @@ fn step_two_makes_the_releases_engine_from_its_origin_and_never_writes_the_named
         git_in(&copy, &["rev-parse", "--abbrev-ref", "main@{upstream}"]),
         "origin/main"
     );
-    assert_eq!(
-        tests::fixture_engine_url(&copy).unwrap(),
-        w.origin.display().to_string()
-    );
+    assert_eq!(git_in(&copy, &["remote", "get-url", "origin"]), ENGINE_URL);
     assert_eq!(git_in(&copy, &["config", "user.name"]), SHARED_NAME);
     assert_eq!(git_in(&copy, &["config", "user.email"]), SHARED_EMAIL);
     assert!(copy.join("bin/pub-later").is_file());
@@ -379,7 +379,7 @@ fn step_two_makes_the_releases_engine_from_its_origin_and_never_writes_the_named
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
 
-    // A later sync fast-forwards it, and follows the origin the shared checkout is pointed at.
+    // A later sync follows the same logical repository through a relocated fixture transport.
     w.peer_lands_code("pub-next");
     let mirror = w.root.join("mirror.git");
     git_in(
@@ -392,34 +392,17 @@ fn step_two_makes_the_releases_engine_from_its_origin_and_never_writes_the_named
             "mirror.git",
         ],
     );
-    git_in(
-        &w.shared,
-        &["remote", "set-url", "origin", &mirror.display().to_string()],
-    );
+    bind_native_engine_fixture(&w.shared, &mirror);
     real.engine_sync().unwrap();
-    assert_eq!(
-        tests::fixture_engine_url(&copy).unwrap(),
-        mirror.display().to_string()
-    );
+    assert_eq!(git_in(&copy, &["remote", "get-url", "origin"]), ENGINE_URL);
     assert_eq!(
         git_in(&copy, &["rev-parse", "HEAD"]),
         git_in(&mirror, &["rev-parse", "refs/heads/main"])
     );
-    git_in(
-        &w.shared,
-        &[
-            "remote",
-            "set-url",
-            "origin",
-            &w.origin.display().to_string(),
-        ],
-    );
-    // Holding nothing the mirror lacks, the copy is made again from the origin named now.
+    bind_native_engine_fixture(&w.shared, &w.origin);
+    // Returning the fixture transport does not change the captured logical authority.
     real.engine_sync().unwrap();
-    assert_eq!(
-        tests::fixture_engine_url(&copy).unwrap(),
-        w.origin.display().to_string()
-    );
+    assert_eq!(git_in(&copy, &["remote", "get-url", "origin"]), ENGINE_URL);
     assert_eq!(git_in(&copy, &["rev-parse", "HEAD"]), w.origin_main());
     let after = (
         git_in(&w.shared, &["rev-parse", "HEAD"]),
@@ -654,29 +637,24 @@ fn every_child_of_a_real_run_is_handed_the_releases_engine() {
     real.engine_sync().unwrap();
     // The re-run as R's own cutter: named the copy, it runs it in place, from its own origin.
     w.peer_lands_code("pub-again");
+    bind_native_engine_fixture(&copy, &w.origin);
     let mut again = Real::new(&w.repo, Some(&copy), false, false).unwrap();
-    again.engine_origin = crate::github_remote::engine_fixture;
-    again.engine_url = tests::fixture_engine_url;
+    again.engine_origin = native_engine_fixture;
     again.logs = w.root.join("logs-again");
     std::fs::create_dir_all(&again.logs).unwrap();
     assert_eq!((&again.engine, &again.engine_source), (&copy, &copy));
     assert!(again.engine_unready().is_none());
     again.engine_sync().unwrap();
     assert_eq!(git_in(&copy, &["rev-parse", "HEAD"]), w.origin_main());
-    assert_eq!(
-        tests::fixture_engine_url(&copy).unwrap(),
-        w.origin.display().to_string()
-    );
+    assert_eq!(git_in(&copy, &["remote", "get-url", "origin"]), ENGINE_URL);
 }
 
-/// A COPY OF ANOTHER ORIGIN IS MADE AGAIN, AND WHAT IT HELD IS NEVER DELIVERED TO THIS ONE: a
-/// release named an engine whose origin is a fork (sharing the engine's history, with ledger
-/// rows of its own), then one whose origin is the engine's; the copy, holding nothing the fork
-/// lacks, is cloned again from the engine's origin, and the fork's row (records ahead of the
-/// engine's main, the shape a failed push leaves) never reaches the engine's main. NEGATIVE
-/// CONTROL: a copy holding a row its fork lacks is refused and kept, and pushes nothing anywhere.
+/// A DIFFERENT LOGICAL ORIGIN CANNOT RETARGET A CAPTURED RELEASE: the engine's source
+/// is re-pointed at a foreign repository after the backend captured fixture/app. Both an
+/// otherwise clean copy and one holding unpushed ledger rows stay untouched; neither origin
+/// receives those rows. Physical fixture transport is declared separately from logical identity.
 #[test]
-fn a_copy_of_another_origin_is_made_again_and_never_delivered_to_this_one() {
+fn a_foreign_origin_cannot_retarget_the_releases_captured_engine() {
     let w = World::new();
     let fork = w.root.join("fork.git");
     git_in(
@@ -689,15 +667,6 @@ fn a_copy_of_another_origin_is_made_again_and_never_delivered_to_this_one() {
             "fork.git",
         ],
     );
-    let point = |at: &Path| {
-        git_in(
-            &w.shared,
-            &["remote", "set-url", "origin", &at.display().to_string()],
-        );
-    };
-    let real = w.real(false);
-    point(&fork);
-    real.engine_sync().unwrap();
     let forker = w.root.join("forker");
     git_in(
         &w.root,
@@ -722,47 +691,53 @@ fn a_copy_of_another_origin_is_made_again_and_never_delivered_to_this_one() {
         ],
     );
     git_in(&forker, &["push", "-q", "origin", "HEAD:main"]);
+    let mut real = w.real(false);
     real.engine_sync().unwrap();
     let copy = w.copy();
-    assert!(
-        std::fs::read_to_string(copy.join("mappings.json"))
-            .unwrap()
-            .contains("fork")
-    );
-    let origin_was = w.origin_main();
-
-    point(&w.origin);
-    real.engine_sync().unwrap();
-    assert_eq!(
-        tests::fixture_engine_url(&copy).unwrap(),
-        w.origin.display().to_string()
-    );
-    assert_eq!(git_in(&copy, &["rev-parse", "HEAD"]), origin_was);
-    assert_eq!(
-        w.origin_main(),
-        origin_was,
-        "the fork's row reached nothing"
-    );
-    assert!(!git_in(&w.origin, &["show", "main:mappings.json"]).contains("fork"));
-
-    // NEGATIVE CONTROL: a row the fork lacks keeps the copy, and nothing is pushed.
-    point(&fork);
-    real.engine_sync().unwrap();
-    std::fs::write(copy.join("mappings.json"), "{\"mappings\":{\"mine\":{}}}\n").unwrap();
-    git_in(&copy, &["commit", "-q", "-am", "feat(ledger): mine"]);
-    let held = git_in(&copy, &["rev-parse", "HEAD"]);
-    let fork_was = git_in(&fork, &["rev-parse", "refs/heads/main"]);
-    point(&w.origin);
-    let refused = real.engine_sync().unwrap_err();
-    assert!(
-        refused
-            .why
-            .contains("holds changes or commits that origin lacks"),
-        "{refused:?}"
-    );
-    assert_eq!(git_in(&copy, &["rev-parse", "HEAD"]), held);
-    assert_eq!(w.origin_main(), origin_was);
-    assert_eq!(git_in(&fork, &["rev-parse", "refs/heads/main"]), fork_was);
+    let original_main = w.origin_main();
+    let fork_main = git_in(&fork, &["rev-parse", "refs/heads/main"]);
+    for holds_row in [false, true] {
+        if holds_row {
+            std::fs::write(copy.join("mappings.json"), "{\"mappings\":{\"mine\":{}}}\n").unwrap();
+            git_in(&copy, &["commit", "-q", "-am", "feat(ledger): mine"]);
+        }
+        let held = git_in(&copy, &["rev-parse", "HEAD"]);
+        let rows = std::fs::read_to_string(copy.join("mappings.json")).unwrap();
+        git_in(
+            &w.shared,
+            &["config", "remote.fixture.url", &fork.display().to_string()],
+        );
+        git_in(
+            &w.shared,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/foreign/app.git",
+            ],
+        );
+        let refused = real.fetch_engine_origin().unwrap_err();
+        assert!(!refused.why.is_empty(), "{refused:?}");
+        let refused = real.engine_sync().unwrap_err();
+        assert!(!refused.why.is_empty(), "{refused:?}");
+        assert_eq!(git_in(&copy, &["rev-parse", "HEAD"]), held);
+        assert_eq!(
+            std::fs::read_to_string(copy.join("mappings.json")).unwrap(),
+            rows
+        );
+        assert_eq!(git_in(&copy, &["status", "--porcelain"]), "");
+        assert_eq!(w.origin_main(), original_main);
+        assert_eq!(git_in(&fork, &["rev-parse", "refs/heads/main"]), fork_main);
+        assert!(!git_in(&w.origin, &["show", "main:mappings.json"]).contains("fork"));
+        assert!(
+            !std::fs::read_to_string(copy.join("mappings.json"))
+                .unwrap()
+                .contains("fork")
+        );
+        assert!(!git_in(&w.origin, &["show", "main:mappings.json"]).contains("mine"));
+        assert!(!git_in(&fork, &["show", "main:mappings.json"]).contains("mine"));
+        bind_native_engine_fixture(&w.shared, &w.origin);
+    }
 }
 
 /// STEP 1 COUNTS THE ROWS THE RELEASE'S ENGINE HOLDS UNPUSHED: `pub publish` made R public and
@@ -816,6 +791,184 @@ fn peer_lands(w: &World, path: &str, text: &str) {
     git_in(&w.peer, &["add", "-A"]);
     git_in(&w.peer, &["commit", "-q", "-m", &format!("land {path}")]);
     git_in(&w.peer, &["push", "-q", "origin", "HEAD:main"]);
+}
+
+/// A peer can land after qualify prepared the engine and scanners but before its export
+/// branch starts. The raw stage is the negative control: its exact-origin guard refuses.
+#[test]
+fn the_export_admits_an_engine_origin_that_advanced_since_sync() {
+    for path in ["verification-log.jsonl", "bin/new-engine-code"] {
+        let w = World::new();
+        let mut real = w.real(false);
+        real.engine_sync().unwrap();
+        real.prepare_scanner_tools(&w.prover).unwrap();
+        peer_lands(&w, path, "peer landed before export\n");
+        let admitted = w.origin_main();
+        let (mut raw, _) = real
+            .stage_command(&w.candidate.commit, &w.prover, StageTarget::Remote)
+            .unwrap();
+        let refused = real.output_forwarded(&mut raw).unwrap();
+        assert!(!refused.status.success(), "the stale engine must refuse");
+        assert!(
+            String::from_utf8_lossy(&refused.stdout)
+                .contains("does not exactly match queried origin/main")
+        );
+
+        let ran = Backend::branches(&mut real)
+            .export(
+                &w.candidate,
+                &w.prover,
+                StageTarget::Remote,
+                &BranchStop::default(),
+            )
+            .unwrap();
+        assert_eq!(ran.code, 0, "{path}: {ran:?}");
+        assert!(
+            git_in(
+                &w.copy(),
+                &["merge-base", "--is-ancestor", &admitted, "HEAD"]
+            )
+            .is_empty()
+        );
+        assert!(
+            git_in(&w.origin, &["show", "main:verification-log.jsonl"])
+                .contains("\"stage\":\"aterm\"")
+        );
+    }
+}
+
+/// Even a rewrite consisting only of records is not a fast-forward admission. Neither the
+/// engine HEAD nor its origin may be repaired by merging the rewritten history at stage entry.
+#[test]
+fn the_export_refuses_a_rewritten_engine_origin_before_stage() {
+    for divergent in [false, true] {
+        let w = World::new();
+        let base = w.origin_main();
+        peer_lands(&w, "handoff/first", "first record\n");
+        let mut real = w.real(false);
+        real.engine_sync().unwrap();
+        real.prepare_scanner_tools(&w.prover).unwrap();
+        let held = git_in(&w.copy(), &["rev-parse", "HEAD"]);
+        let rewritten = if divergent {
+            git_in(&w.peer, &["checkout", "-q", "-b", "rewritten", &base]);
+            std::fs::create_dir_all(w.peer.join("handoff")).unwrap();
+            std::fs::write(w.peer.join("handoff/other"), "other record\n").unwrap();
+            git_in(&w.peer, &["add", "-A"]);
+            git_in(&w.peer, &["commit", "-qm", "divergent record"]);
+            git_in(&w.peer, &["rev-parse", "HEAD"])
+        } else {
+            base
+        };
+        // Install the fixture's rewritten origin without any force-push transport.
+        if divergent {
+            git_in(
+                &w.origin,
+                &["fetch", "-q", &w.peer.display().to_string(), "rewritten"],
+            );
+        }
+        git_in(&w.origin, &["update-ref", "refs/heads/main", &rewritten]);
+        let refusal = Backend::branches(&mut real)
+            .export(
+                &w.candidate,
+                &w.prover,
+                StageTarget::Remote,
+                &BranchStop::default(),
+            )
+            .unwrap_err();
+        assert!(refusal.could_not_run, "{refusal:?}");
+        assert!(refusal.why.contains("fast-forward"), "{refusal:?}");
+        assert_eq!(git_in(&w.copy(), &["rev-parse", "HEAD"]), held);
+        assert_eq!(w.origin_main(), rewritten);
+        assert!(
+            !real.side_log(Step::Qualify, Branch::Export.name()).exists(),
+            "stage never starts"
+        );
+    }
+}
+
+/// A push after the last admission can still win the entry race. Preserve the engine's
+/// refusal, but report no red of aterm's tree and prescribe an unchanged-candidate rerun.
+#[test]
+fn an_engine_push_after_export_admission_is_retryable_without_an_aterm_fix() {
+    let w = World::new();
+    let mut real = w.real(false);
+    real.engine_sync().unwrap();
+    real.prepare_scanner_tools(&w.prover).unwrap();
+    write_exec(
+        &w.root.join("before-capture"),
+        &format!(
+            "#!/bin/sh\nset -e\n{}",
+            w.lands_and_aligns("last-instant", &format!("'{}'", w.peer.display()))
+        ),
+    );
+    let refusal = Backend::branches(&mut real)
+        .export(
+            &w.candidate,
+            &w.prover,
+            StageTarget::Remote,
+            &BranchStop::default(),
+        )
+        .unwrap_err();
+    assert!(refusal.could_not_run, "{refusal:?}");
+    assert!(
+        refusal.why.contains("engine") && refusal.why.contains("race"),
+        "{refusal:?}"
+    );
+    assert!(refusal.remedy.contains(RELEASE_COMMAND), "{refusal:?}");
+    assert!(
+        !refusal.remedy.contains("--fix") && !refusal.remedy.contains("land"),
+        "{refusal:?}"
+    );
+    assert!(
+        refusal
+            .detail
+            .iter()
+            .any(|line| line.contains("does not exactly match queried origin/main")),
+        "{refusal:?}"
+    );
+    assert_eq!(git_in(&w.copy(), &["rev-parse", "HEAD"]), w.origin_main());
+    std::fs::remove_file(w.root.join("before-capture")).unwrap();
+
+    // The engine also refuses code drift at its final pre-push revalidation.
+    peer_lands(
+        &w,
+        "bin/pub",
+        "#!/bin/sh\necho 'FAIL: publication engine origin/main changed during stage (non-data-plane paths: bin/pub-tool); refusing to push'\nexit 1\n",
+    );
+    let drift = Backend::branches(&mut real)
+        .export(
+            &w.candidate,
+            &w.prover,
+            StageTarget::Remote,
+            &BranchStop::default(),
+        )
+        .unwrap_err();
+    assert!(
+        drift.could_not_run && drift.why.contains("engine origin race"),
+        "{drift:?}"
+    );
+
+    // Negative control: an ordinary tree failure remains a stage verdict, not an engine race.
+    peer_lands(
+        &w,
+        "bin/pub",
+        "#!/bin/sh\necho 'FAIL: transforms failed'\nexit 1\n",
+    );
+    let ran = Backend::branches(&mut real)
+        .export(
+            &w.candidate,
+            &w.prover,
+            StageTarget::Remote,
+            &BranchStop::default(),
+        )
+        .unwrap();
+    assert_eq!(ran.code, 1, "{ran:?}");
+    assert!(
+        ran.detail
+            .iter()
+            .any(|line| line.contains("transforms failed")),
+        "{ran:?}"
+    );
 }
 
 /// The peer renames `from` to `to` on the engine's origin.

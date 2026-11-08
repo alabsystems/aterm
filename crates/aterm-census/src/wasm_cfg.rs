@@ -42,52 +42,128 @@ const KEYED: &[(&str, &str)] = &[
 
 /// Evaluates `pred` on `wasm32-unknown-unknown` in a shipped build.
 pub(crate) fn on_wasm32(pred: &str) -> Truth {
-    let pred = pred.trim();
-    if let Some(inner) = call(pred, "not") {
-        let args = crate::split_top_level_commas(inner);
-        return match args.as_slice() {
-            [one] => on_wasm32(one).not(),
-            _ => Truth::Unknown,
-        };
-    }
-    for (head, is_all) in [("all", true), ("any", false)] {
-        if let Some(inner) = call(pred, head) {
-            let (mut any_unknown, absorbing) =
-                (false, if is_all { Truth::False } else { Truth::True });
-            for arg in crate::split_top_level_commas(inner) {
-                match on_wasm32(arg) {
-                    t if t == absorbing => return absorbing,
-                    Truth::Unknown => any_unknown = true,
-                    _ => {}
-                }
-            }
-            return if any_unknown {
-                Truth::Unknown
-            } else {
-                absorbing.not()
+    evaluate(pred, &|pred| {
+        if matches!(pred, "test" | "unix" | "windows") {
+            return Truth::False;
+        }
+        if let Some((name, value)) = pred.split_once('=') {
+            let value = value
+                .trim()
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .filter(|v| !v.contains(['"', '\\']));
+            return match (KEYED.iter().find(|(key, _)| *key == name.trim()), value) {
+                (Some((_, ours)), Some(value)) if *ours == value => Truth::True,
+                (Some(_), Some(_)) => Truth::False,
+                _ => Truth::Unknown,
             };
         }
-    }
-    match pred {
-        "test" | "unix" | "windows" => return Truth::False,
-        _ => {}
-    }
-    if let Some((name, value)) = pred.split_once('=') {
-        let (name, value) = (name.trim(), value.trim());
-        let Some(value) = value
-            .strip_prefix('"')
-            .and_then(|v| v.strip_suffix('"'))
-            .filter(|v| !v.contains(['"', '\\']))
-        else {
-            return Truth::Unknown;
+        Truth::Unknown
+    })
+}
+
+/// With tests disabled, every other cfg atom remains unsettled.
+pub(crate) fn when_test_disabled(pred: &str) -> Truth {
+    evaluate(pred, &|atom| {
+        if atom == "test" {
+            Truth::False
+        } else {
+            Truth::Unknown
+        }
+    })
+}
+
+/// Parse the complete predicate before accepting even an absorbing boolean result.
+fn evaluate(pred: &str, atom: &dyn Fn(&str) -> Truth) -> Truth {
+    fn parse(input: &str, at: &mut usize, atom: &dyn Fn(&str) -> Truth) -> Option<Truth> {
+        let bytes = input.as_bytes();
+        let space = |at: &mut usize| {
+            while bytes.get(*at).is_some_and(u8::is_ascii_whitespace) {
+                *at += 1;
+            }
         };
-        return match KEYED.iter().find(|(key, _)| *key == name) {
-            Some((_, ours)) if *ours == value => Truth::True,
-            Some(_) => Truth::False,
-            None => Truth::Unknown,
-        };
+        space(at);
+        let start = *at;
+        if !bytes
+            .get(*at)
+            .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+        {
+            return None;
+        }
+        *at += 1;
+        while bytes
+            .get(*at)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        {
+            *at += 1;
+        }
+        let name = &input[start..*at];
+        space(at);
+        if bytes.get(*at) == Some(&b'(') {
+            *at += 1;
+            space(at);
+            let mut values = Vec::new();
+            if bytes.get(*at) != Some(&b')') {
+                loop {
+                    values.push(parse(input, at, atom)?);
+                    space(at);
+                    if bytes.get(*at) != Some(&b',') {
+                        break;
+                    }
+                    *at += 1;
+                    space(at);
+                    if bytes.get(*at) == Some(&b')') {
+                        break;
+                    }
+                }
+            }
+            if bytes.get(*at) != Some(&b')') {
+                return None;
+            }
+            *at += 1;
+            return match name {
+                "not" if values.len() == 1 => Some(values[0].not()),
+                "not" => None,
+                "all" if values.contains(&Truth::False) => Some(Truth::False),
+                "any" if values.contains(&Truth::True) => Some(Truth::True),
+                "all" | "any" if values.contains(&Truth::Unknown) => Some(Truth::Unknown),
+                "all" => Some(Truth::True),
+                "any" => Some(Truth::False),
+                _ => None,
+            };
+        }
+        if bytes.get(*at) == Some(&b'=') {
+            *at += 1;
+            space(at);
+            if bytes.get(*at) != Some(&b'"') {
+                return None;
+            }
+            *at += 1;
+            while let Some(&byte) = bytes.get(*at) {
+                if byte == b'"' {
+                    break;
+                }
+                if byte == b'\\' {
+                    return None;
+                }
+                *at += 1;
+            }
+            if bytes.get(*at) != Some(&b'"') {
+                return None;
+            }
+            *at += 1;
+        }
+        Some(atom(input[start..*at].trim()))
     }
-    Truth::Unknown
+    let mut at = 0;
+    let Some(value) = parse(pred, &mut at, atom) else {
+        return Truth::Unknown;
+    };
+    if pred[at..].trim().is_empty() {
+        value
+    } else {
+        Truth::Unknown
+    }
 }
 
 /// The arguments of `head(..)` when `pred` is exactly that call.
@@ -483,6 +559,33 @@ fn normalize(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_disabled_evaluation_requires_complete_syntax_and_settles_only_test() {
+        for predicate in [
+            "test",
+            "all(test, unix)",
+            "all(feature = \"a,b\", test)",
+            "not(not(test))",
+            "any(test, test)",
+        ] {
+            assert_eq!(when_test_disabled(predicate), Truth::False, "{predicate}");
+        }
+        for predicate in [
+            "any(test, debug_assertions)",
+            "any(test, feature = \"x\")",
+            "all(test, broken(,))",
+            "all(test, unix))",
+            "all(test,,unix)",
+            "all(test, feature = \"\\q\")",
+            "all(test, feature = \"unfinished)",
+        ] {
+            assert_eq!(when_test_disabled(predicate), Truth::Unknown, "{predicate}");
+        }
+        assert_eq!(when_test_disabled("not(test)"), Truth::True);
+        assert_eq!(on_wasm32("all(unix, broken(,))"), Truth::Unknown);
+        assert_eq!(on_wasm32("target_os = \"un\\known\""), Truth::Unknown);
+    }
 
     #[test]
     fn the_platforms_wasm32_is_not_are_false_and_its_own_are_true() {

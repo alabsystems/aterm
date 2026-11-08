@@ -117,7 +117,11 @@ fn naming_policy_refuses_before_the_canonical_set_or_any_system_operation() {
 
 #[test]
 fn a_partial_name_publication_retries_without_rechoosing_and_rejects_a_stale_retry() {
+    use std::os::unix::fs::MetadataExt as _;
+
     let scratch = fresh();
+    let prior_config: &[u8] = b"bell_sound = false\n";
+    std::fs::write(&scratch.config, prior_config).unwrap();
     let names = Names::new(true);
     let requested = request(86);
     let edited = change_number(
@@ -148,6 +152,24 @@ fn a_partial_name_publication_retries_without_rechoosing_and_rejects_a_stale_ret
         publish::publication(&scratch.state, &scratch.config, &edited.name, Some(&names.values.borrow())).unwrap(),
         publish::Publication::Owed(owed) if owed.len() == 1 && matches!(&owed[0], publish::Owed::SystemNames(_))
     ));
+    let backup = scratch.config.with_file_name("aterm.toml.bak");
+    assert_eq!(std::fs::read(&backup).unwrap(), prior_config);
+    // Keep both original inodes alive, so a replacement cannot pass through inode reuse.
+    let held_files = [&scratch.config, &backup].map(|path| {
+        (
+            path,
+            std::fs::File::open(path).unwrap(),
+            std::fs::read(path).unwrap(),
+        )
+    });
+    let unchanged_files = || {
+        for (path, held, bytes) in &held_files {
+            let before = held.metadata().unwrap();
+            let after = std::fs::metadata(path).unwrap();
+            assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+            assert_eq!(&std::fs::read(path).unwrap(), bytes);
+        }
+    };
 
     // The actual panel-open producer sees a saved number and the unfinished OS step. Its
     // untouched fields request publication, rather than choosing the number again.
@@ -177,8 +199,26 @@ fn a_partial_name_publication_retries_without_rechoosing_and_rejects_a_stale_ret
         "a nickname edit never borrows synchronization authority"
     );
 
+    let applies = || {
+        names
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| matches!(call, Call::Apply(number) if *number == requested.num))
+            .count()
+    };
+    let applied = applies();
+    assert!(matches!(
+        naming::synchronize(&scratch.state, &scratch.config, requested.num, &names),
+        Err(publish::Pending::SystemNames(_))
+    ));
+    assert_eq!(applies(), applied + 1);
+    unchanged_files();
+
     names.fail.set(false);
     naming::synchronize(&scratch.state, &scratch.config, requested.num, &names).unwrap();
+    assert_eq!(applies(), applied + 2);
+    unchanged_files();
     assert_eq!(
         file::read(&scratch.state).unwrap(),
         Some(edited.name.clone()),

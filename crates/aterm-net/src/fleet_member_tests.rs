@@ -1190,6 +1190,30 @@ fn a_leave_goes_on_unlocked_only_where_no_edit_could_lock() {
 #[test]
 fn a_lock_refusal_names_the_directory_once() {
     use std::os::unix::ffi::OsStrExt as _;
+    let before = lock_wait();
+    let (told, heard) = std::sync::mpsc::channel();
+    lock_waiting_told(Duration::ZERO, told.clone(), || {
+        assert_eq!(lock_wait(), Duration::ZERO);
+        assert_eq!(std::thread::spawn(lock_wait).join().unwrap(), LOCK_WAIT);
+        lock_waiting(HANG, || assert_eq!(lock_wait(), HANG));
+        assert_eq!(lock_wait(), Duration::ZERO);
+        let unwound = std::panic::catch_unwind(|| {
+            lock_waiting(HANG, || panic!("the inner wait unwinds"));
+        });
+        assert!(unwound.is_err());
+        assert_eq!(lock_wait(), Duration::ZERO);
+        found_held();
+        heard.try_recv().expect("the outer observer is restored");
+    });
+    assert_eq!(lock_wait(), before);
+    let unwound = std::panic::catch_unwind(|| {
+        lock_waiting_told(Duration::ZERO, told, || panic!("the outer wait unwinds"));
+    });
+    assert!(unwound.is_err());
+    assert_eq!(lock_wait(), before);
+    found_held();
+    assert!(heard.try_recv().is_err(), "no observer escapes its scope");
+
     let state = State::new("lock-named");
     let dir = state.dir();
     let lock = dir.join(PEERS_LOCK);

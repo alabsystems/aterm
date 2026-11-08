@@ -8,6 +8,7 @@ use super::{Body, EpochAudience, Log, Record, RecordId, epoch_commitment};
 use crate::commons::binding::Binding;
 use crate::{Error, Result, age::Identity};
 use aterm_digest::Sha256;
+use std::cell::OnceCell;
 use zeroize::Zeroizing;
 
 /// Identity of the exact complete record bytes in their retained causal order.
@@ -20,25 +21,10 @@ pub(crate) trait RecordReader {
     fn read(&self, id: &RecordId) -> Result<Option<&Record>>;
 }
 
-impl RecordReader for Log {
-    fn read(&self, id: &RecordId) -> Result<Option<&Record>> {
-        Ok(self.get(id))
-    }
-}
-
-/// One immutable verified Log and its fallible record provider.
-pub(crate) struct HistoryView<'a> {
-    log: &'a Log,
-    reader: &'a dyn RecordReader,
-    generation: Generation,
-}
-
-impl<'a> HistoryView<'a> {
-    pub(crate) fn new(log: &'a Log) -> Self {
-        Self::with_reader(log, log)
-    }
-
-    pub(crate) fn with_reader(log: &'a Log, reader: &'a dyn RecordReader) -> Self {
+/// The [`Generation`] of `log`'s held records, derived once for them: the log keeps it until it
+/// holds another record, and its clones share it.
+fn held_generation(log: &Log) -> Generation {
+    *log.generation.get_or_init(|| {
         let mut digest = Sha256::new();
         digest.update(b"aterm/membership/history-generation/1\0");
         digest.update(log.network());
@@ -46,19 +32,55 @@ impl<'a> HistoryView<'a> {
         for record in log.records() {
             digest.update(record.id());
         }
+        Generation(digest.finalize())
+    })
+}
+
+/// One immutable verified Log and where a lease takes its records from.
+pub(crate) struct HistoryView<'a> {
+    log: &'a Log,
+    /// A fallible provider of the log's records, or `None` for the log's own held records.
+    reader: Option<&'a dyn RecordReader>,
+    generation: Generation,
+}
+
+impl<'a> HistoryView<'a> {
+    /// A view of `log`'s held records, which its leases take from the log itself: they are the
+    /// records its generation names, so a lease reads none of them back. Each lease of a quiet
+    /// repair round looked every record up in the log again, 3.6% of such a round over a log of
+    /// 9,605 records (2026-11-08).
+    pub(crate) fn new(log: &'a Log) -> Self {
         Self {
             log,
-            reader,
-            generation: Generation(digest.finalize()),
+            reader: None,
+            generation: held_generation(log),
+        }
+    }
+
+    /// A view of `log` whose leases read each of its records from `reader`.
+    #[cfg(test)]
+    pub(crate) fn with_reader(log: &'a Log, reader: &'a dyn RecordReader) -> Self {
+        Self {
+            log,
+            reader: Some(reader),
+            generation: held_generation(log),
         }
     }
 
     /// Pin every complete record before any query or cache lookup. The returned immutable
-    /// references keep those exact bytes available for the lease without further provider I/O.
+    /// references keep those exact bytes available for the lease without further provider I/O; a
+    /// lease of the log's own records borrows them from the log.
     pub(crate) fn lease_complete(&self) -> Result<HistoryLease<'_>> {
+        let Some(reader) = self.reader else {
+            return Ok(HistoryLease {
+                view: self,
+                writers: OnceCell::new(),
+                records: None,
+            });
+        };
         let mut records = Vec::with_capacity(self.log.held_count());
         for expected in self.log.records() {
-            let Some(record) = self.reader.read(expected.id())? else {
+            let Some(record) = reader.read(expected.id())? else {
                 return Err(Error::new("complete membership history is unavailable"));
             };
             if !std::ptr::eq(record, expected)
@@ -70,7 +92,8 @@ impl<'a> HistoryView<'a> {
         }
         Ok(HistoryLease {
             view: self,
-            records,
+            writers: OnceCell::new(),
+            records: Some(records),
         })
     }
 }
@@ -89,7 +112,11 @@ pub(crate) struct RecordLease<'a> {
 
 pub(crate) struct HistoryLease<'a> {
     view: &'a HistoryView<'a>,
-    records: Vec<&'a Record>,
+    /// What every epoch's historical writers read of the log, derived once for the lease's
+    /// epochs ([`super::eval::HistoricalWriters`]).
+    writers: OnceCell<super::eval::HistoricalWriters<'a>>,
+    /// The records a provider gave, pinned for the lease, or `None` where they are the log's own.
+    records: Option<Vec<&'a Record>>,
 }
 
 impl HistoryLease<'_> {
@@ -105,7 +132,11 @@ impl HistoryLease<'_> {
                 RecordState::Absent
             });
         };
-        let Some(&record) = self.records.get(at) else {
+        let record = match &self.records {
+            None => self.view.log.order.get(at),
+            Some(records) => records.get(at).copied(),
+        };
+        let Some(record) = record else {
             return Err(Error::new("complete membership history is unavailable"));
         };
         Ok(RecordState::Complete(RecordLease {
@@ -132,8 +163,8 @@ impl HistoryLease<'_> {
         let log = self.view.log;
         let id = epoch.record.id();
         Ok(log
-            .historical_commons_writers(id)
-            .or_else(|| log.historical_fold_writers(id)))
+            .historical_commons_writers_in(&self.writers, id)
+            .or_else(|| log.historical_fold_writers_in(&self.writers, id)))
     }
 
     pub(crate) fn unwrap_commons_epoch(
@@ -272,6 +303,127 @@ mod tests {
             lease.record(child.id()).unwrap(),
             RecordState::Complete(_)
         ));
+    }
+
+    /// A log's history generation names its held records in their order, derived once for them
+    /// and shared by its clones: after each record a log holds, asked first through a clone, a
+    /// lease's generation is the one a log given the same records afresh gives, and the clone
+    /// keeps its own; a clone first asked after the log held another record and was asked gives
+    /// its own records' too.
+    /// NEGATIVE CONTROL: `Log::hold` keeping the generation gives the log's lease the generation
+    /// before the record it held.
+    #[test]
+    fn a_leases_generation_follows_each_record_the_log_holds() {
+        let (mut log, seed, incarnation, actor) = fixture();
+        let generation = |log: &Log| HistoryView::new(log).lease_complete().unwrap().generation();
+        let afresh = |log: &Log| {
+            let mut records = log.records().cloned();
+            let mut fresh = Log::new(records.next().unwrap()).unwrap();
+            for record in records {
+                assert_eq!(fresh.insert(record).unwrap(), Inserted::Held);
+            }
+            generation(&fresh)
+        };
+        let hold = |log: &mut Log, n: u64| {
+            let next = log
+                .draft(
+                    &actor,
+                    2 + n,
+                    Body::Name {
+                        name: format!("name-{n}"),
+                    },
+                )
+                .sign(&seed, incarnation)
+                .unwrap();
+            assert_eq!(log.insert(next).unwrap(), Inserted::Held);
+        };
+        for n in 0..4 {
+            let asked = log.clone();
+            let before = generation(&asked);
+            assert_eq!(before, afresh(&log));
+            hold(&mut log, n);
+            assert_eq!(generation(&log), afresh(&log));
+            assert_ne!(generation(&log), before);
+            assert_eq!(generation(&asked), before);
+        }
+        hold(&mut log, 4);
+        let unasked = log.clone();
+        hold(&mut log, 5);
+        assert_eq!(generation(&log), afresh(&log));
+        assert_eq!(generation(&unasked), afresh(&unasked));
+    }
+
+    /// A lease answers each held record as the log holds it, whether it takes the log's own
+    /// records or reads them through a provider, and a waiting or unknown one as such.
+    /// NEGATIVE CONTROL: the log's own lease answering the record before the one asked
+    /// (`order.get(at.saturating_sub(1))`) answers the genesis for the record after it.
+    #[test]
+    fn a_lease_answers_each_held_record_as_the_log_holds_it() {
+        struct Reads<'a>(&'a Log);
+        impl RecordReader for Reads<'_> {
+            fn read(&self, id: &RecordId) -> Result<Option<&Record>> {
+                Ok(self.0.get(id))
+            }
+        }
+        let (mut log, seed, incarnation, actor) = fixture();
+        for n in 0..3 {
+            let next = log
+                .draft(
+                    &actor,
+                    2 + n,
+                    Body::Name {
+                        name: format!("name-{n}"),
+                    },
+                )
+                .sign(&seed, incarnation)
+                .unwrap();
+            assert_eq!(log.insert(next).unwrap(), Inserted::Held);
+        }
+        let mut future = log.clone();
+        let parent = future
+            .draft(
+                &actor,
+                5,
+                Body::Name {
+                    name: "parent".into(),
+                },
+            )
+            .sign(&seed, incarnation)
+            .unwrap();
+        future.insert(parent).unwrap();
+        let child = future
+            .draft(
+                &actor,
+                6,
+                Body::Name {
+                    name: "child".into(),
+                },
+            )
+            .sign(&seed, incarnation)
+            .unwrap();
+        assert_eq!(log.insert(child.clone()).unwrap(), Inserted::Waiting);
+        let reads = Reads(&log);
+        for view in [
+            HistoryView::new(&log),
+            HistoryView::with_reader(&log, &reads),
+        ] {
+            let lease = view.lease_complete().unwrap();
+            for held in log.records() {
+                let RecordState::Complete(record) = lease.record(held.id()).unwrap() else {
+                    panic!("a held record is complete")
+                };
+                assert!(std::ptr::eq(record.record, held));
+                assert_eq!(record.generation, lease.generation());
+            }
+            assert!(matches!(
+                lease.record(child.id()).unwrap(),
+                RecordState::Pending
+            ));
+            assert!(matches!(
+                lease.record(&[0xff; 32]).unwrap(),
+                RecordState::Absent
+            ));
+        }
     }
 
     #[test]

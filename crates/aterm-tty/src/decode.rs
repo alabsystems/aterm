@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 use aterm_types::keyboard::{Key, Modifiers, NamedKey};
 use aterm_types::mouse::{ALT_MASK, CTRL_MASK, MouseButton, SHIFT_MASK, WheelDir};
 
-/// How long a read that ended inside a sequence waits for the rest of it.
+/// Ambiguity interval for an ESC-prefixed key sequence.
 pub const ESC_TIMEOUT: Duration = Duration::from_millis(25);
 
-/// How long a bracketed paste may stall, with nothing read, before what came of it is delivered.
-pub const PASTE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Hang detector for an unfinished paste, UTF-8 character or X10 mouse report.
+pub const FRAME_HANG: Duration = Duration::from_secs(60);
 
 /// The most of one bracketed paste kept.
 pub const MAX_PASTE_BYTES: usize = 32 * 1024 * 1024;
@@ -227,7 +227,8 @@ impl Decoder {
     const fn wait(&self) -> Option<Duration> {
         match self.state {
             State::Ground => None,
-            State::Paste { .. } => Some(PASTE_TIMEOUT),
+            State::Paste { .. } | State::X10 { .. } => Some(FRAME_HANG),
+            State::Utf8 { .. } | State::Utf8Tail { .. } if !self.alt => Some(FRAME_HANG),
             _ => Some(ESC_TIMEOUT),
         }
     }

@@ -533,10 +533,13 @@ pub(crate) fn build_is_complete_on(
     }
     // A runtime this process cannot read, or one past the inspector's entry bound, is no
     // verdict: the marker, written only after a whole admission, answers for it as it does where
-    // no admission runs, and gc never sweeps a marked build for it.
+    // no admission runs, and gc never sweeps a marked build for it. A build laid aside is judged
+    // by the tree its link names, as it stands ([`build_stands`]) and is looked up.
+    let tree = aterm_toolchain::layout::aside_of(build_dir)
+        .filter(|_| aterm_toolchain::layout::is_linked_aside(build_dir))
+        .unwrap_or_else(|| build_dir.to_path_buf());
     if host.is_some_and(|host| {
-        aterm_toolchain::gnu_runtime::admit_tree_on(build_dir, host)
-            .is_err_and(|why| why.is_refusal())
+        aterm_toolchain::gnu_runtime::admit_tree_on(&tree, host).is_err_and(|why| why.is_refusal())
     }) {
         return false;
     }
@@ -632,24 +635,8 @@ pub(crate) fn mark_build_ready_on(
     let dest = ready_marker_path(build_dir).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "build dir has no name")
     })?;
-    let parent = dest.parent().unwrap_or(build_dir);
-    let tmp = parent.join(format!(".ready.tmp-{}", std::process::id()));
     let body = ready_body(build_dir);
-    let written = (|| -> std::io::Result<()> {
-        use std::io::Write as _;
-        let mut f = crate::platform::open_create_write(&tmp, 0o644)?;
-        f.write_all(body.as_bytes())?;
-        sync_contents_or_accept_refusal(&f)
-    })();
-    if let Err(err) = written {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(err);
-    }
-    if let Err(err) = std::fs::rename(&tmp, &dest) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(err);
-    }
-    Ok(())
+    crate::metadata_io::write_record_durably(&dest, body.as_bytes())
 }
 
 fn ready_body(build_dir: &Path) -> String {
@@ -1040,7 +1027,6 @@ fn write_stage_refusal(
         .map_or(1, |prior| prior.attempts.saturating_add(1));
     let parent = dest.parent().unwrap_or(build_dir);
     make_build_parent(build_dir)?;
-    let tmp = parent.join(format!(".refused.tmp-{}", std::process::id()));
     let mut body = String::from(STAGE_REFUSAL_HEADER);
     body.push('\n');
     body.push_str(digest.0.key());
@@ -1070,11 +1056,7 @@ fn write_stage_refusal(
         .collect();
     body.push_str(&one_line);
     body.push('\n');
-    write_record_temp(&tmp, body.as_bytes())?;
-    if let Err(e) = std::fs::rename(&tmp, &dest) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
+    crate::metadata_io::write_record_atomic(&dest, body.as_bytes())?;
     if lane == MemoLane::Update
         && let Some(name) = dest.file_name()
     {
@@ -1305,23 +1287,7 @@ pub(crate) fn write_sidecar_durably(
     let dest = sidecar_path(build_dir, suffix).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "build dir has no name")
     })?;
-    let parent = dest.parent().unwrap_or(build_dir);
-    let mut tmp_name = String::from(suffix);
-    tmp_name.push_str(".tmp-");
-    tmp_name.push_str(&std::process::id().to_string());
-    let tmp = parent.join(tmp_name);
-    let written = (|| {
-        use std::io::Write as _;
-        let mut f = crate::platform::open_create_write(&tmp, 0o644)?;
-        f.write_all(bytes)?;
-        sync_contents_or_accept_refusal(&f)?;
-        drop(f);
-        std::fs::rename(&tmp, &dest)
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    written
+    crate::metadata_io::write_record_durably(&dest, bytes)
 }
 
 /// Forget every refusal recorded for `program`.
@@ -1370,13 +1336,6 @@ pub fn clear_all_stage_refusals(layout: &Layout) -> usize {
 /// The sibling scratch directory a stage extracts into before it swaps.
 pub(crate) fn incoming_dir(build_dir: &Path) -> Option<PathBuf> {
     scratch_sibling(build_dir, ".incoming-")
-}
-
-/// Write the temp of a small record renamed into place beside a build.
-pub(crate) fn write_record_temp(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let _ = std::fs::remove_file(tmp);
-    crate::platform::open_create_write(tmp, 0o644)?.write_all(bytes)
 }
 
 /// Create `store/<program>/` ([`crate::extract::safe_mode`], [`crate::platform::make_dirs_born`]).
@@ -2307,6 +2266,80 @@ mod tests {
 
     fn temp_home(label: &str) -> crate::testdir::Dir {
         crate::testdir::dir(&format!("atpkg-store-{label}-"))
+    }
+
+    #[test]
+    fn record_writers_preserve_occupied_staging_paths_and_their_linked_bytes() {
+        for kind in ["ready", "sidecar", "refusal", "environment"] {
+            let home = temp_home(&format!("record-staging-{kind}"));
+            let build = home.join("store/tool/7");
+            std::fs::create_dir_all(&build).unwrap();
+            let parent = build.parent().unwrap();
+            let stem = match kind {
+                "ready" => ".ready",
+                "sidecar" => EXPOSES_SUFFIX,
+                "refusal" => ".refused",
+                "environment" => ".shim-env",
+                _ => unreachable!(),
+            };
+            let occupied = parent.join(format!("{stem}.tmp-{}", std::process::id()));
+            let unrelated = home.join("unrelated-record");
+            std::fs::write(&unrelated, b"another writer's bytes").unwrap();
+            std::fs::hard_link(&unrelated, &occupied).unwrap();
+            let destination = match kind {
+                "ready" => {
+                    mark_build_ready_on(&build, None).unwrap();
+                    assert!(build_is_complete(&build));
+                    ready_marker_path(&build).unwrap()
+                }
+                "sidecar" => {
+                    write_sidecar_durably(&build, EXPOSES_SUFFIX, b"sidecar contents").unwrap();
+                    sidecar_path(&build, EXPOSES_SUFFIX).unwrap()
+                }
+                "refusal" => {
+                    record_refusal_in(
+                        MemoLane::Named,
+                        RefusalKind::Held,
+                        &build,
+                        (DigestAlg::Sha256, &"a".repeat(64)),
+                        &"b".repeat(64),
+                        "fixture refusal",
+                        123,
+                    )
+                    .unwrap();
+                    stage_refusal_path(&build).unwrap()
+                }
+                "environment" => {
+                    let environment =
+                        crate::shim_env::ShimEnv::admit(&["LEAN_CC=/usr/bin/cc".into()]).unwrap();
+                    crate::shim_env::write_sidecar(&build, &environment).unwrap();
+                    crate::shim_env::sidecar_path(&build).unwrap()
+                }
+                _ => unreachable!(),
+            };
+            assert!(destination.is_file(), "{kind}");
+            assert_eq!(
+                std::fs::read(&occupied).unwrap(),
+                b"another writer's bytes",
+                "{kind}"
+            );
+            assert_eq!(
+                std::fs::read(&unrelated).unwrap(),
+                b"another writer's bytes",
+                "{kind}"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let control = home.join("prior-creation-policy");
+                drop(crate::platform::open_create_write(&control, 0o644).unwrap());
+                assert_eq!(
+                    std::fs::metadata(destination).unwrap().permissions().mode() & 0o777,
+                    std::fs::metadata(control).unwrap().permissions().mode() & 0o777,
+                    "{kind}"
+                );
+            }
+        }
     }
 
     /// THE VERSION RECORD READS BACK WHAT WAS WRITTEN AND NOTHING ELSE: a one-word version

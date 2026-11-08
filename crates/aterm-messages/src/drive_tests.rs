@@ -40,7 +40,6 @@ fn lay(cols: usize) -> Lay {
     Lay {
         cols,
         links: Links::Withheld,
-        home: || None,
     }
 }
 
@@ -165,11 +164,10 @@ fn afford_keeps_every_grid_its_last_row() {
 }
 
 #[test]
-fn the_look_moves_only_on_screen_unfrozen_and_allowed() {
+fn the_look_moves_only_on_screen_and_allowed() {
     let on = LookIn {
         motion_allowed: true,
         on_screen: true,
-        frozen: false,
         forced: false,
     };
     assert_eq!(drive::look(on), Look::MOVING);
@@ -182,7 +180,6 @@ fn the_look_moves_only_on_screen_unfrozen_and_allowed() {
             on_screen: false,
             ..on
         },
-        LookIn { frozen: true, ..on },
     ] {
         assert_eq!(drive::look(off), STILL, "{off:?}");
     }
@@ -201,23 +198,15 @@ fn an_idle_band_arms_nothing_a_held_row_only_its_hold_and_a_still_look_only_tick
     assert_eq!(drive::state_deadline(&center, &gate, false), None);
     assert_eq!(view.prepare(&center, &l, t0, Look::MOVING), 0);
     let over = |center: &MessageCenter, view: &View, now: Instant, look: Look| {
-        drive::motion_deadline_over(
-            center,
-            center.committed_rows(),
-            false,
-            now,
-            [(view, l, look)],
-        )
+        drive::motion_deadline_over(center, center.committed_rows(), now, [(view, l, look)])
     };
     assert_eq!(over(&center, &view, t0, Look::MOVING), None);
-    assert!(drive::due_views(&center, 0, false, t0, [(0u8, &view, l, Look::MOVING)]).is_empty());
     assert_eq!(
         view.paint(&center, 80, None, geom(80), false, &|| panic!(
             "idle derives no inks"
         )),
         None
     );
-    assert_eq!(view.band_fp(&center, 80, None, geom(80)), 0);
     let _ = center.post(warn("Disk nearly full", 5), STAMP, t0);
     let _ = step(&mut center, &mut gate, t0);
     assert_eq!(
@@ -244,12 +233,7 @@ fn an_idle_band_arms_nothing_a_held_row_only_its_hold_and_a_still_look_only_tick
     let still = over(&center, &view, at, STILL).expect("a tick");
     assert!(still >= t0 + ELAPSED_AFTER, "{:?}", still - t0);
     assert_eq!(
-        drive::motion_deadline_over(&center, 1, true, at, [(&view, l, Look::MOVING)]),
-        None,
-        "frozen: nothing armed"
-    );
-    assert_eq!(
-        drive::motion_deadline_over(&center, 0, false, at, [(&view, l, Look::MOVING)]),
+        drive::motion_deadline_over(&center, 0, at, [(&view, l, Look::MOVING)]),
         None,
         "no row reserved: nothing armed"
     );
@@ -301,16 +285,10 @@ fn the_next_frame_memo_hits_on_its_key_and_misses_on_each_term() {
     let _ = view.next_frame(&center, &l, probe, STILL);
     assert_eq!(view.deadline_computations(), 5);
     assert_eq!(view.last_from(), Some(probe));
-    assert!(view.due(&center, &l, probe, STILL), "another look: due now");
-    assert!(
-        !view.due(&center, &l, at, Look::MOVING),
-        "its own look: not yet"
-    );
     let next = view
         .motion_deadline(&center, &l, at, Look::MOVING)
         .expect("next");
     let before = view.deadline_computations();
-    assert!(view.due(&center, &l, next, Look::MOVING));
     let _ = view.prepare(&center, &l, next, Look::MOVING);
     let _ = view.next_frame(&center, &l, next, Look::MOVING);
     assert_eq!(

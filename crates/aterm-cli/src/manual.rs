@@ -1729,8 +1729,8 @@ VAULT TOKENS (Claude Code's pool, macOS)
 
 THE FOOTER
   A supervised tab's footer bar carries an Autopilot chip (`∞` cruise, `⤓` land,
-  `✓ landed`, `⤓ quiet`, `○` off, or `✋ you` while you hold it), context and usage
-  meters and status lights. `[claude_footer]` keys, each true by default, switch its
+  `✓ landed`, `⤓ quiet`, `○` off, or `✋ you` while you hold it), the session's facts
+  and status lights. `[claude_footer]` keys, each true by default, switch its
   extras: `usage` (the `Σ` working time and tokens), `acts` (what the harness just did,
   beside the chip), `card` (the decorated launch card, its line linking alab.systems,
   and the banners over Claude Code's update notice and startup announcement) and
@@ -1747,22 +1747,69 @@ THE FOOTER
   its version opens native build and update details. Its plain interface has no ALab
   controls; aterm draws no overlay over either interface. There is no separate Codex
   harness version. Vendor `codex` has no aterm footer.
-  With a roster of accounts, Claude Code's account reads as one unit: `⎆ <name> · weekly
-  <bar> 42% left ♻ <reset> · 5h 62% left · <outlook>` (the 5-hour part only for a figure
-  read now). The bar's `━` is used, `╍` the use expected by the week's reset at today's
-  pace and `─` left (`┽` where use will stand at the reset). The outlook is
-  `continuous 7d`, `╳ ~<from>–<to>` when every account runs out (ending at the reset
-  that resumes the work, `╳ from ~<from>` when none does within a week past the 7 days),
-  or `continuous to ~<when>, then <label> ?` when it leans on an account aterm has never
-  read. A weekly wall reads `weekly out`, never a percentage. It replays the rotation's
-  own policy over what aterm already observed, at most once a minute and off the main
-  thread; it never probes, alerts or moves anything. Its times are said on the local
-  clock as it will read then, a forecast to 10 minutes within 6 hours, to 30 within a
-  day, to the hour beyond. Narrow rules drop the 5-hour part, shorten the words, then
-  drop the bar before the name is cut; the narrowest keep a stop beside the name alone.
-  A pane whose profile the account gate refused shows no outlook. Clicking the unit
-  opens the Accounts card: each account's bar and freshness, and the week's chain, read
-  from what the footer holds (no file is read).
+  Around Claude Code's composer the glass draws three lines whose hues are one field
+  across the pane, so a column wears one hue on all three (Autopilot's palette: Cruise
+  the rainbow, Land the sunset, Off the moonbow; neutral inks with no harness). Line B,
+  the rule above the composer, ends with the harness label `alab v<ver> (v<cli>)`, or
+  `alab v<ver>` where the CLI's build does not fit or is not known.
+  Line D, the rule below it, sets its facts at one size, as terminal text: `◆` the model
+  and effort, `⌂` the path, `⎇` the branch, `◐` the context, `Σ` the session's usage,
+  and `⧗ until <when>` only while the account is out at a usage limit (that slot carries
+  a wall and nothing else). It names the account only where line E is not aterm's: 10 s
+  after the session's first frame or its last claim of line E with no claim since (the
+  grace is the session's, so a tab shown again keeps its state), and always for agy, a
+  CLI with no line E, or a harness switched off. That unit is words only:
+  `⎆ main 63% · ↺ Sat 10:00 · ╳ ~Thu 12 Nov 05:00`, then without the reset, then the
+  name and figure, then the name, each shorter form only after the other facts gave way.
+  Line E is the row Claude Code prints from aterm's usage tap under the bottom rule:
+  `week 63% used · resets Sat 10:00` (`week 63% used` with no reset to say,
+  `week · no figure yet` before a figure). Where the tap's newest reading says the row
+  is its own and its cells are plain, aterm lays its quota row over it, from column 2 to
+  two cells before a notice of Claude's on the row; the grid, a copy and a recording keep
+  the tap's words, which also show in a frame with a selection or the cursor on the row.
+  A row Claude cut with `…`, an owner's statusLine and a room no form fits stay Claude's.
+  The quota row holds, in order:
+  * the named accounts and their weeks used, `main 75% · alt1 80% · alt2 90%`: at most
+    three in roster order (preferred first), this tab's in bold and the one carrying the
+    work always among them, the rest folded into `+N`, never dropped; one account reads
+    `main 63% used`. A figure is `63%` read within 15 minutes, `≥70%` for an older
+    reading (use only rises within a week), `out` at a wall and `?` unread; `100%` only
+    for a reading of 100.
+  * one chart over [now − 1 d, now + 7 d) at 3 to 12 cells a day: this tab's week as
+    read on this Mac in solid steps (blank before its first reading), `▕` now, then the
+    projected fill of whichever account carries the work as a thin line, with `↺` a
+    reset, `→` a hand-off (the next account's name after it where it fits), `╳` a stop
+    (every account out, or the wall the work waits at now), `$` usage credits and `┄`
+    not projected (after an unread account the work would reach, or the whole week with
+    no pace yet, a paused recovery or a tab the rotation cannot move). Ticks at the foot
+    of its level cells mark local midnights.
+  * at most two phrases: `~98% by ↺ Sat 10:00` (or `↺ Sat 10:00`), then the verdict:
+    `╳ ~Thu 12 Nov 05:00–Sat 14 Nov 10:00` (a stop, to the vendor reset that resumes
+    the work, or `–~<when>`; `╳ from ~Wed 16:00` where nothing ends it in reach),
+    `⧗ until Sat 10:00` (the work waits at a wall now), `? alt2 unread from ~Sat 06:00`,
+    `$ ~Sat 06:00` (credits) or `no pace yet`.
+  A narrower row steps down: a coarser chart, shorter phrases, the other accounts
+  folded, then no chart; this tab's name and figure, and a stop's or a wait's words,
+  stay. Times are said on the local clock as it will read then, a forecast to 10 minutes
+  within 6 hours, to 30 within a day, to the hour beyond, with the date from a week on
+  (`Thu 12 Nov 05:00`). The outlook replays the rotation's own policy over what aterm
+  already observed, at most once a minute and off the main thread; it never probes,
+  alerts or moves anything, and a pane whose profile the account gate refused names no
+  account's figure. Hovering the row titles it (each week, the pace, the rotation's
+  progress); hovering a chart column names its span; clicking it, or line D's unit,
+  opens the Accounts card.
+  The Accounts card shows the verdict and its pace (`at 36% a day (this Mac, the last
+  24 h)`), a day axis over the work row (line E's chart), then each named account's item
+  (`⎆ main  75%  Max 20x  ↺ Sat 10:00`, the active one checked; one whose week runs out
+  says `out ~Sat 03:00`, kept after its plan gives way) over its burn-up lane: its own
+  vendor week on the work row's clock, read then projected to its reset, out drawn as a
+  line along the lane's top. Folded accounts are items under a rule, and a legend names
+  the glyphs; an account the outlook has no words for keeps the store's own (`m27 ·
+  preferred · 39% used`), and without an outlook every item does. Choosing an item
+  switches this machine to that account and pins it;
+  `⇄ No pinned account · this machine` releases the pin; `⋯ Account settings…` opens a
+  tab in aterm's configuration folder. The window's thread reads no file for the card:
+  its outlook is the one the footer last replayed.
   Settings ▸ Harness shows the supervised sessions, what the harness decided for you,
   a 7-day comparison of the Autopilot modes, and every `[harness]` key. Its WHAT THE
   HARNESS DID counts today and the last 7 days: `Forced continues` (the agent said it

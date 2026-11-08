@@ -3086,6 +3086,8 @@ impl Wake {
             Wake::CancelSessionRename { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::AllocationMonitorChanged => None,
+            #[cfg(target_os = "macos")]
+            Wake::DispatchFence(_) => None,
             #[cfg(all(unix, not(test)))]
             Wake::NetworkPlaceChanged => None,
             Wake::AccountsDrained { .. }

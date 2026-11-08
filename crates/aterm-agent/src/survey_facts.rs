@@ -895,6 +895,7 @@ fn claude_token_states(env: &Env) -> BTreeMap<String, String> {
                 roster: roster.as_deref(),
                 logins: &[],
                 now: env.now,
+                offers: view::OFFERED_HERE,
             },
             &vault,
         )
@@ -1837,6 +1838,7 @@ mod tests {
                     roster: Some(&roster),
                     logins: &[],
                     now: env.now,
+                    offers: view::OFFERED_HERE,
                 },
                 &crate::harness::accounts_tokens::Vault(aterm_secrets::client::Paths::for_home(
                     &home,

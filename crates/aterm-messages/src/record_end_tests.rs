@@ -143,14 +143,14 @@ fn a_scripts_first_load_is_its_declaration_and_reserves_only_its_words() {
     let live = c.live_rows().find(|l| l.id != alab).expect("the row");
     assert_eq!(live.msg.loads, Loads::NONE.with(Load::Disk));
     assert_eq!(live.load_slot, Loads::NONE.with(Load::Disk));
-    let p = c.presentation(60, &char_width, None, Links::Painted);
+    let p = c.presentation(60, &char_width, Links::Painted);
     assert_eq!(p.rows.len(), 2, "{p:?}");
     assert_eq!(p.rows[0].kind, crate::glass::RowKind::Message(alab));
     let row = &p.rows[1];
     assert!(row.eta.is_some(), "{row:?}");
     assert_eq!(row.capsules.len(), 1, "{row:?}");
     assert_eq!(row.capsules[0].full_label, "Details \u{203a}");
-    let p = c.presentation(70, &char_width, None, Links::Painted);
+    let p = c.presentation(70, &char_width, Links::Painted);
     let row = &p.rows[1];
     assert_eq!(
         row.load.map(|(_, words)| words),

@@ -331,6 +331,9 @@ pub(crate) struct TaskRecord {
     /// never rewrites that ([`TaskMark::apply`], [`TaskState::conclusion`]). Worked out from nothing
     /// else, so a carry row holds it (`finished=1`).
     pub(crate) finished: bool,
+    /// The agent disappeared while this task was unfinished. A returning agent can resume it;
+    /// an initially ended record, an explicit conclusion and a person's later input cannot.
+    pub(crate) unfinished_exit: bool,
     /// Size in bytes of the worker's result file (`0` when absent).
     pub(crate) result_bytes: u64,
     /// Path to the result file under [`tasks_dir`], if any.
@@ -497,6 +500,9 @@ impl TaskRecord {
         if self.finished {
             out.push_str(" finished=1");
         }
+        if self.unfinished_exit {
+            out.push_str(" unfinished_exit=1");
+        }
         let ms = |stood: std::time::Duration| u64::try_from(stood.as_millis()).unwrap_or(u64::MAX);
         if self.started_unix_ms != self.since_unix_ms {
             out.push_str(&format!(" started={}", self.started_unix_ms));
@@ -631,6 +637,7 @@ impl TaskRecord {
                 None => None,
             },
             finished: field("finished") == Some("1"),
+            unfinished_exit: field("unfinished_exit") == Some("1"),
             result_bytes: parse_u64(field("result_bytes")?)?,
             result_path: match field("result_path") {
                 Some(path) => Some(result_path(path, tasks)?),
@@ -893,6 +900,7 @@ impl TaskMark {
                 left: self.left.clone(),
                 exit: self.exit,
                 finished: false,
+                unfinished_exit: false,
                 result_bytes: self.result_bytes,
                 result_path: self.result_path.clone(),
                 attention,
@@ -931,6 +939,11 @@ impl TaskMark {
         } else {
             self.left.clone()
         };
+        let unfinished_exit = self.state == TaskState::Exited
+            && why == Some(WHY_EXIT)
+            && !current.runs_a_program()
+            && (matches!(current.state, TaskState::Working | TaskState::Stalled)
+                || current.unfinished_exit);
         let same = current.state == self.state
             && current.from == from
             && current.why == why
@@ -938,6 +951,7 @@ impl TaskMark {
             && current.left == left
             && current.exit == self.exit
             && current.finished == finished
+            && current.unfinished_exit == unfinished_exit
             && current.result_bytes == self.result_bytes
             && current.result_path == self.result_path
             && current.attention == attention
@@ -967,6 +981,7 @@ impl TaskMark {
         next.left = left;
         next.exit = self.exit;
         next.finished = finished;
+        next.unfinished_exit = unfinished_exit;
         next.result_bytes = self.result_bytes;
         next.result_path.clone_from(&self.result_path);
         next.attention = attention;
@@ -1801,37 +1816,48 @@ pub(crate) fn seed_carried(ctx: &SessionCtx, row: Option<&str>) {
     crate::session_timeline::keep_worker_autopilot(ctx);
 }
 
-/// Returns the session's published agent word, the program's own report as the timeline
+/// Returns the task record, the session's published agent word, the program's own report as the timeline
 /// shows it (`program_state=`, [`crate::program_state::column`]: a claim beside `agent=`, read
 /// under the same lock) and the percent-encoded attention text, an ask before any wait
 /// ([`crate::session_timeline::SessionMeta::row_attention`]).
-pub(crate) fn agent_program_and_attention(ctx: &SessionCtx) -> (&'static str, String, String) {
+pub(crate) fn task_reading(ctx: &SessionCtx) -> TaskReading {
     let attention = ctx
         .meta
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .row_attention()
         .map_or_else(|| "-".to_string(), crate::control::pct_encode);
-    let (agent, program) = {
-        let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-        (
-            timeline.agent().word,
-            crate::program_state::column(timeline.program_shown()),
-        )
-    };
-    (agent, program, attention)
+    let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+    TaskReading {
+        record: timeline.task().cloned(),
+        agent: timeline.agent().word,
+        program: crate::program_state::column(timeline.program_shown()),
+        attention,
+    }
 }
 
-/// The `task` reply line for `record`, unterminated: `OK task -` with none,
+/// A task and the agent publication read under one timeline lock. A reply must never combine
+/// an old process's exit record with its replacement's agent verdict.
+pub(crate) struct TaskReading {
+    pub(crate) record: Option<TaskRecord>,
+    pub(crate) agent: &'static str,
+    pub(crate) program: String,
+    pub(crate) attention: String,
+}
+
+/// The current `task` reply line, unterminated: `OK task -` with no record,
 /// else `OK task <fields> agent= program_state= attention=`.
-fn task_reply(ctx: &SessionCtx, record: Option<&TaskRecord>) -> String {
-    let Some(record) = record else {
+fn task_reply(ctx: &SessionCtx) -> String {
+    let reading = task_reading(ctx);
+    let Some(record) = reading.record else {
         return "OK task -".to_string();
     };
-    let (agent, program, attention) = agent_program_and_attention(ctx);
     format!(
-        "OK task {} agent={agent} program_state={program} attention={attention}",
-        record.wire_fields()
+        "OK task {} agent={} program_state={} attention={}",
+        record.wire_fields(),
+        reading.agent,
+        reading.program,
+        reading.attention
     )
 }
 
@@ -1849,13 +1875,7 @@ pub(crate) fn retired_task_reply(record: &TaskRecord) -> String {
 pub(crate) fn cmd_task(ctx: &SessionCtx, local_id: u64, scope: Scope, rest: &str) -> String {
     let rest = rest.trim();
     if rest.is_empty() {
-        let record = ctx
-            .timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .task()
-            .cloned();
-        return format!("{}\n", task_reply(ctx, record.as_ref()));
+        return format!("{}\n", task_reply(ctx));
     }
     let Some(args) = rest
         .strip_prefix("mark")
@@ -1906,11 +1926,7 @@ pub(crate) fn cmd_task(ctx: &SessionCtx, local_id: u64, scope: Scope, rest: &str
     if marked.attention_moved {
         crate::presence::post_meta_changed(local_id);
     }
-    format!(
-        "{} changed={}\n",
-        task_reply(ctx, marked.record.as_ref()),
-        u8::from(marked.moved)
-    )
+    format!("{} changed={}\n", task_reply(ctx), u8::from(marked.moved))
 }
 
 /// How an `await task` over multiple targets completes.

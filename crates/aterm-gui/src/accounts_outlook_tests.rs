@@ -1173,12 +1173,12 @@ fn watching_account_observations_gallery() {
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
-            // The admitted figure: used on the outlook's card (never `% left`); the card without
-            // one says the pane's own weekly words.
+            // The admitted figure, used (never `% left`, on either card): the outlook's card says
+            // its bound; the card without one says the pane's own weekly words.
+            assert!(!drawn.contains("% left"), "{cols}: {drawn}");
             let figure = if unavailable {
                 weekly.clone()
             } else {
-                assert!(!drawn.contains("% left"), "{cols}: {drawn}");
                 format!("\u{2265}{}%", admitted.used_x10 / 10)
             };
             assert!(drawn.contains(&figure), "{cols}: {figure:?} in {drawn}");

@@ -473,6 +473,122 @@ fn procargs_steer_by_the_path_and_the_paths_an_exec_was_given_as_its_file() {
     );
 }
 
+/// PRIV4-2: what an exec's record may have been handed as the `#!` script the kernel handed an
+/// interpreter: a word with a `/` among the first [`SCRIPT_WORDS`] after `argv[0]` (after the
+/// `#!` line's own words, which macOS splits), never a flag, a word with no `/` (a token, a
+/// `-c` command), a word with a control character, a later word, one longer than `PATH_MAX`,
+/// or more than `HANDED_MAX`; the steers of the same record keep naming only the exec path and
+/// `argv[0]`. A word kept only steers a lookup of the file it names, which confirms a script
+/// only where it is that script's file. NEGATIVE CONTROL (scratch): keeping every argument word
+/// fails the first assertion, keeping `--token`.
+#[test]
+fn procargs_hand_an_interpreter_its_script_and_no_other_word() {
+    let scripts = |argv: &[&str]| {
+        scripts_of_procargs(&procargs2("/bin/sh", argv, &[]))
+            .iter()
+            .map(|s| s.path.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        scripts(&["/bin/sh", "./d/QZP7P5.sh", "--token", "QZP7P6"]),
+        ["./d/QZP7P5.sh"],
+        "the script the kernel handed /bin/sh"
+    );
+    assert_eq!(
+        scripts(&["/usr/bin/env", "-S", "python3", "-u", "/opt/x/QZP7P7"]),
+        ["/opt/x/QZP7P7"],
+        "after an env line's own words"
+    );
+    assert_eq!(
+        scripts(&["sh", "-c", "sleep 1"]),
+        Vec::<String>::new(),
+        "a -c command with no path"
+    );
+    assert_eq!(
+        scripts(&["sh", "-c", "cd /tmp\n./QZP7P8.sh"]),
+        Vec::<String>::new(),
+        "a word with a control character names no script file"
+    );
+    assert_eq!(
+        scripts(&["a", "b", "c", "d", "e", "/opt/x/QZP7P9"]),
+        Vec::<String>::new(),
+        "past SCRIPT_WORDS"
+    );
+    assert_eq!(
+        scripts(&["a", "/x/1", "/x/2", "/x/3"]),
+        ["/x/1", "/x/2"],
+        "at most HANDED_MAX"
+    );
+    let long = format!("/{}", "q".repeat(PATH_MAX));
+    assert_eq!(
+        scripts(&["a", &long, "--/QZP7P10"]),
+        Vec::<String>::new(),
+        "too long, and a flag"
+    );
+    let (_, handed) = steers_of_procargs(&procargs2("/bin/sh", &["/bin/sh", "./d/QZP7P5.sh"], &[]));
+    assert_eq!(
+        handed.iter().map(|h| &**h).collect::<Vec<_>>(),
+        ["/bin/sh"],
+        "a script path never steers a program word's lookup"
+    );
+    let slots = |argv: &[&str]| {
+        scripts_of_procargs(&procargs2("/bin/sh", argv, &[]))
+            .iter()
+            .map(|s| (s.path.to_string(), s.before))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        slots(&["sh", "-n", "./d/QZP7P11.sh", "./d/QZP7P12.sh"]),
+        [
+            ("./d/QZP7P11.sh".to_owned(), words_digest(["-n"])),
+            (
+                "./d/QZP7P12.sh".to_owned(),
+                words_digest(["-n", "./d/QZP7P11.sh"])
+            ),
+        ],
+        "each path keeps the digest of the words before it, never the words"
+    );
+}
+
+/// PRIV4-2 (the review's slot): where a `#!` line puts its script in the `argv` of the process
+/// that runs it ([`script_slots`]): right after the words its interpreter is handed, which
+/// macOS's kernel splits at blanks (`#!/bin/sh -e` hands `-e` then the script) and Linux's hands
+/// whole as one word (`-e -x`); for the known `env`, also right after the words that follow
+/// its program, as `env` hands them to the program it re-execs (`python3 -u <script>`). A
+/// script right after `argv[0]` stands only where its line adds no word, so `sh -n ./x.sh`
+/// (`-n` before it) never puts `#!/bin/sh`'s script where the kernel does. NEGATIVE CONTROL
+/// (scratch): dropping the `env` slot fails the `env -S` assertion.
+#[test]
+fn a_shebang_line_puts_its_script_after_its_own_words() {
+    let has = |line: &str, env: bool, words: &[&str]| {
+        script_slots(line, env).contains(&words_digest(words.iter().copied()))
+    };
+    assert!(has("/bin/sh", false, &[]), "no word: right after argv[0]");
+    assert!(
+        !has("/bin/sh", false, &["-n"]),
+        "a flag the line never adds"
+    );
+    assert!(has("/bin/sh -e", false, &["-e"]) && !has("/bin/sh -e", false, &[]));
+    assert!(
+        has("/bin/bash -e -x", false, &["-e", "-x"]) && has("/bin/bash -e -x", false, &["-e -x"]),
+        "split at blanks on macOS, whole on Linux"
+    );
+    let line = "/usr/bin/env -S python3 -u";
+    assert!(
+        has(line, true, &["-S", "python3", "-u"]) && has(line, true, &["-u"]),
+        "env's own record, and its program's once it re-execs"
+    );
+    assert!(
+        !has(line, false, &["-u"]),
+        "an interpreter that is not env re-execs nothing"
+    );
+    assert!(!has(line, true, &[]));
+    assert!(
+        script_slots("", false).is_empty(),
+        "no interpreter, no slot"
+    );
+}
+
 /// NEGATIVE CONTROL (scratch): `env_program` taking `-u`'s value for the program fails the last
 /// assertion.
 #[test]
@@ -485,7 +601,7 @@ fn a_shebang_is_the_first_lines_text_after_its_two_bytes() {
     assert_eq!(shebang_line(b" #!/bin/sh\n"), None, "the first two bytes");
     assert_eq!(shebang_line(b"\x7fELF"), None);
     assert_eq!(
-        env_program(["-S", "-i", "-u", "QZP7E1", "A=QZP7E2", "python3", "-u"].into_iter()),
+        env_program(&mut ["-S", "-i", "-u", "QZP7E1", "A=QZP7E2", "python3", "-u"].into_iter()),
         Some("python3"),
         "env's flags, an unset name and an assignment are passed"
     );
@@ -549,6 +665,11 @@ fn the_ring_holds_a_bounded_entry_whatever_an_exec_was_given() {
                 image: Some(word[1..].into()),
                 exec: Some(word[1..].into()),
                 handed: Box::new([word.as_str().into(), "/u/jsmith/bin/QZP7R9".into()]),
+                scripts: Box::new([
+                    word.as_str().into(),
+                    word.as_str().into(),
+                    "./QZP7R10".into(),
+                ]),
                 env_path: Some(Arc::from(format!("{word}:{i}"))),
                 file: Some(test_id("x")),
                 linked: false,
@@ -556,7 +677,7 @@ fn the_ring_holds_a_bounded_entry_whatever_an_exec_was_given() {
             ..exec(i, "x")
         });
     }
-    let per_entry = 2 * NAME_MAX + HANDED_MAX * PATH_MAX;
+    let per_entry = 2 * NAME_MAX + 2 * HANDED_MAX * PATH_MAX;
     let bound = RAN_MAX * per_entry + PATHS_KEPT * ENV_PATH_MAX;
     assert!(
         ran.held_bytes() <= bound,
@@ -803,7 +924,12 @@ fn lookup_stops_before_an_unsupported_path_directory() {
             .program("/usr/bin/env", "real-env")
             .script("/w/via-env", "/usr/bin/env sentinel");
         let ran = Ran::with_files(Box::new(files), None);
-        let heard = Heard::of(&ran, ran_of(&["vim"]), Some("/w"), Some(path));
+        let heard = Heard::of(
+            &ran,
+            handed_scripts(ran_of(&["vim"]), &["./via-env"]),
+            Some("/w"),
+            Some(path),
+        );
         assert_eq!(
             heard.look(Word::Bare("sentinel")),
             if confirmed { Look::Ran } else { Look::Nothing },
@@ -849,11 +975,11 @@ fn lookup_env_programs_require_the_known_interpreter_identity() {
             .script("/w/sentinel", "/unrelated/env python3")
             .script("/w/legit", "/usr/bin/env python3")
             .script("/w/env-link", "/alias/launcher python3");
-        let observed = ran_of(&["python3"]);
-        let oracle = files.ran_by_identity(name, &observed);
+        let word = format!("./{name}");
+        let observed = handed_scripts(ran_of(&["python3"]), &[&word]);
+        let oracle = files.ran_by_identity(name, &observed, "/w");
         let ran = Ran::with_files(Box::new(files), None);
         let heard = Heard::of(&ran, observed, Some("/w"), Some("/usr/bin"));
-        let word = format!("./{name}");
         let reading = crate::session_status::command_reading(&word, &heard)
             .map(|reading| (reading.text, reading.own));
         got.push((heard.look(Word::Path(&word)), reading, oracle));

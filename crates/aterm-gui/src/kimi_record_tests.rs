@@ -362,8 +362,9 @@ fn a_box_settled_short_of_read_only_keeps_its_verdict_without_a_read() {
 
 /// A box Kimi swaps for one drawn alike with no input between them stands on a new screen: a
 /// `bash:read-only` judged off a read begun before that screen is judged again one pass later,
-/// off a read begun since, until [`READ_FOR`] after the screen. Every other verdict needs no
-/// such read.
+/// off a read begun since, until [`READ_FOR`] after the screen. Meanwhile it holds for
+/// [`SETTLE`], then reads `bash`; with no such read by [`READ_FOR`] it settles at `bash`, never
+/// at `bash:read-only`. Every other verdict needs no such read.
 #[test]
 fn a_read_only_box_off_a_read_older_than_its_screen_is_read_again() {
     let t0 = Instant::now();
@@ -434,11 +435,30 @@ fn a_read_only_box_off_a_read_older_than_its_screen_is_read_again() {
         (Some("bash:not-read-only".to_string()), Judged::Settled),
         "a not-read-only needs no read begun since its screen"
     );
+    let mut lagging = None;
+    let _ = judged_at(None, t0, t0, &mut lagging, t0);
+    let _ = judged_at(honest(), read, t0, &mut lagging, past);
+    assert_eq!(
+        judged_at(honest(), read, swapped, &mut lagging, swapped + SETTLE),
+        (Some("bash".to_string()), Judged::Again),
+        "held for SETTLE, a read-only off a read older than its screen is withheld while the lane lags"
+    );
     let stale_long = swapped + READ_FOR;
     assert_eq!(
-        judged_at(honest(), read, swapped, &mut seen, stale_long),
-        (Some("bash:read-only".to_string()), Judged::Settled),
-        "a lane that never reads again is not asked on and on"
+        judged_at(honest(), read, swapped, &mut lagging, stale_long),
+        (Some("bash".to_string()), Judged::Settled),
+        "a lane that never reads again is not asked on and on, and settles it withheld"
+    );
+    assert_eq!(
+        judged_at(
+            honest(),
+            stale_long,
+            swapped,
+            &mut lagging,
+            stale_long + SETTLE
+        ),
+        (Some("bash".to_string()), Judged::Settled),
+        "and the box keeps that verdict while it stands"
     );
 }
 
@@ -567,6 +587,19 @@ pub(crate) fn hold_read(session: u64, read: Read) {
 /// The record of the honest `cat README.md` box, standing.
 pub(crate) fn honest_record() -> Option<Vec<Pending>> {
     pending_of(&[HEAD, REQUEST])
+}
+
+/// The record of the honest `cat README.md` box, standing, its request asked at `ms` (wall-clock
+/// milliseconds since the Unix epoch) instead of when it was measured.
+pub(crate) fn honest_record_asked_at(ms: u64) -> Option<Vec<Pending>> {
+    let measured = "\"time\":1794115339426";
+    assert_eq!(
+        REQUEST.matches(measured).count(),
+        1,
+        "PRECONDITION: the request's one time"
+    );
+    let request = REQUEST.replacen(measured, &format!("\"time\":{ms}"), 1);
+    pending_of(&[HEAD, &request])
 }
 
 /// `text`'s screen with `from` changed to `to` in the one row that holds it.

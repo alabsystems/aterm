@@ -1022,8 +1022,8 @@ fn the_row_figure_the_curve_and_the_tail_agree() {
 /// NO GLASS WORD NAMES 5H, 7D OR LEFT: across every scenario, the row at every room, the title,
 /// the spoken words and the fallback say use (`used`, `≥`, `out`), never `% left`, and never name
 /// the 5-hour or 7-day window by its short word (a 5-hour stop's title says `a 5-hour limit`).
-/// Negative control: a phrase 2 taken from `Outlook::verdict_words` says `continuous 7d` on case
-/// (a).
+/// Negative control: a phrase 2 in the words the outlook's verdict had before the glass (case
+/// (a)'s `continuous 7d`, deleted with them in 2026-11-07's review fixes) fails it.
 #[test]
 fn no_glass_word_names_5h_7d_or_left() {
     for (name, view) in scenarios() {
@@ -1923,4 +1923,40 @@ fn the_reset_mark_is_laid_bold() {
         "the scenarios draw a reset on the row and in the fallback: {seen:?}"
     );
     assert!(!heavy('·', Role::Quiet) && heavy('↺', Role::Lit) && heavy('╳', Role::Warn));
+}
+
+/// A SCENE'S TAP WORDS ARE THE TAP'S OWN FOR ITS CASE ([`crate::harness::quota_scenes::tap_words`]):
+/// the private-dev scene lays, for the claim to read, the line the tap prints for the case's
+/// reading, through [`crate::harness::tap::Reading::week_words`], never hand-typed words. Each
+/// parses as the tap's grammar ([`crate::harness::tap::parse_line`]) whole, says the figure the
+/// view's lead says, and case (d)'s is the tap's no-figure line. CONTROL: case (b) read at 64%
+/// says 64%, so the words follow the case.
+#[test]
+fn a_scenes_tap_words_are_the_taps_own_for_its_case() {
+    use crate::harness::quota_scenes::{cases, tap_words};
+    use crate::harness::tap::{NO_WEEK, parse_line};
+    let said: Vec<(&str, String)> = cases()
+        .iter()
+        .map(|(name, view)| (*name, tap_words(view)))
+        .collect();
+    assert_eq!(
+        said,
+        [
+            ("a", "week 40% used \u{b7} resets Sat 10:00".to_owned()),
+            ("b", "week 63% used \u{b7} resets Sat 10:00".to_owned()),
+            ("c", "week 75% used \u{b7} resets Sat 10:00".to_owned()),
+            ("d", NO_WEEK.to_owned()),
+        ]
+    );
+    for (name, words) in &said {
+        assert_eq!(
+            parse_line(words),
+            Some(words.chars().count()),
+            "{name}: {words}"
+        );
+    }
+    let mut moved = case_b();
+    moved.read("main", None, Some((640, SAT7)), T5);
+    let view = moved.outlook().quota("main", None, true);
+    assert_eq!(tap_words(&view), "week 64% used \u{b7} resets Sat 10:00");
 }

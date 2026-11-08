@@ -228,6 +228,81 @@ impl Remote {
         Ok(main)
     }
 
+    /// Materialize main in a new owned checkout without changing this source.
+    /// Native agh imports the observed commit; local Git only initializes and
+    /// checks out its exact bytes with the release's tree-writing policy.
+    pub(crate) fn copy_main(&self, dest: &Path) -> Result<(Self, String), String> {
+        self.ensure_origin()?;
+        let source = self
+            .repo
+            .canonicalize()
+            .map_err(|error| format!("resolve engine source: {error}"))?;
+        let parent = dest
+            .parent()
+            .ok_or("owned engine has no parent")?
+            .canonicalize()
+            .map_err(|error| format!("resolve owned engine parent: {error}"))?;
+        let physical = parent.join(dest.file_name().ok_or("owned engine has no name")?);
+        if physical.starts_with(&source) || source.starts_with(&physical) {
+            return Err("an owned engine must be outside its source checkout".into());
+        }
+        std::fs::create_dir(dest).map_err(|error| format!("create owned engine: {error}"))?;
+        let local = |args: &[&str]| {
+            let mut cmd = crate::ledger::object_git(dest);
+            cmd.args(args);
+            let out = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
+                &mut cmd,
+                STALL_WINDOW,
+                "prepare owned engine local Git",
+            )
+            .map_err(|error| format!("prepare owned engine: {error}"))?;
+            if out.status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "prepare owned engine: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ))
+            }
+        };
+        local(&["init", "--quiet", "--initial-branch=main"])?;
+        for (key, value) in [
+            ("core.autocrlf", "false"),
+            ("core.eol", "lf"),
+            ("core.attributesFile", "/dev/null"),
+        ] {
+            local(&["config", key, value])?;
+        }
+        local(&[
+            "config",
+            "remote.origin.url",
+            &format!("https://github.com/{}.git", self.slug),
+        ])?;
+        local(&[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/main:refs/remotes/origin/main",
+        ])?;
+        let copied = Self::new(self.client.clone(), self.slug.clone(), dest)?;
+        let tip = copied.refresh_main()?;
+        local(
+            &[
+                &crate::ledger::BYTE_EXACT[..],
+                &[
+                    "checkout",
+                    "--quiet",
+                    "--track",
+                    "-B",
+                    "main",
+                    "origin/main",
+                ],
+            ]
+            .concat(),
+        )?;
+        self.ensure_origin()?;
+        Ok((copied, tip))
+    }
+
     /// Read main and every tag through the configured native identity, import
     /// that exact commit, then record only the owned remote-tracking ref.
     pub(crate) fn fetch_origin(&self) -> Result<FetchedOrigin, String> {

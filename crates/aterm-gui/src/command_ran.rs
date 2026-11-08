@@ -8,8 +8,9 @@
 //! when it was heard ([`Spot`], [`Places`]); one placed by no job (a sampled image, the shell's
 //! own group) counts by its stamp in the block's [`Window`]. A command's detail names its own
 //! program only when the file the shell would exec for its program word is an image that ran in
-//! its block, or a `#!` script whose interpreter ran there, compared by file identity and never
-//! by a string a process can write ([`Heard::look`], [`crate::session_status::command_detail`]);
+//! its block, or a `#!` script handed to an exec of its interpreter there, compared by file
+//! identity and never by a string a process can write ([`Heard::look`],
+//! [`crate::session_status::command_detail`]);
 //! otherwise the first program its own job ran may stand in ([`Heard::stand_in`]). So a word the
 //! person typed reaches `detail=` only when it names a program file that ran, and a stand-in only
 //! names a file the command's own job ran, never a prompt hook's or another command's. A ring
@@ -51,9 +52,17 @@ pub(crate) const NAME_MAX: usize = 255;
 /// longer one, so nothing longer names a program that ran.
 pub(crate) const PATH_MAX: usize = 1_024;
 
-/// How many paths an exec was handed one ring entry keeps ([`ExecNames::handed`]).
+/// How many paths an exec was handed one ring entry keeps ([`ExecNames::handed`]), and how many
+/// script paths ([`ExecNames::scripts`]).
 #[cfg(any(unix, test))]
 pub(crate) const HANDED_MAX: usize = 2;
+
+/// How many argument words after `argv[0]` are looked at for the `#!` script the kernel's `#!`
+/// handling handed an interpreter ([`ExecNames::scripts`]): it puts the script's path after the
+/// `#!` line's own words, which macOS splits (`#!/usr/bin/env -S python3 -u` hands it fourth). A
+/// script handed later is not seen, and its interpreter stands in for it.
+#[cfg(any(unix, test))]
+pub(crate) const SCRIPT_WORDS: usize = 4;
 
 /// The longest `PATH` an exec's environment steers by; a longer one steers nothing.
 pub(crate) const ENV_PATH_MAX: usize = 4_096;
@@ -85,11 +94,53 @@ pub(crate) struct FileId {
     pub(crate) ino: u64,
 }
 
+/// A path an exec's `argv` holds after `argv[0]`, where the kernel's `#!` handling may have
+/// handed its interpreter a script ([`ExecNames::scripts`]): the kernel puts the script's path
+/// right after the `#!` line's own words, so the path is that script's only where the words
+/// before it are that line's, which [`Self::before`] says without keeping them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScriptSlot {
+    /// The path, as the exec was handed it.
+    pub(crate) path: Box<str>,
+    /// The digest of the words between `argv[0]` and the path ([`words_digest`]): a `#!` script
+    /// is this path only where its line's words digest to it ([`script_slots`]). A digest, never
+    /// the words: an argument (`-n`, a token) is never kept.
+    pub(crate) before: u64,
+}
+
+/// A test's script path handed right after `argv[0]`, where the kernel puts the script of a
+/// `#!` line with no word after its interpreter (`#!/bin/sh`).
+#[cfg(test)]
+impl From<&str> for ScriptSlot {
+    fn from(path: &str) -> Self {
+        Self {
+            path: path.into(),
+            before: words_digest([]),
+        }
+    }
+}
+
+/// `digest` with `word` folded in, then a NUL, which no `argv` word holds: so a sequence of
+/// words digests apart from any other split of the same bytes ([`words_digest`]).
+fn digest_word(digest: u64, word: &str) -> u64 {
+    aterm_hash::fnv1a_64_extend(aterm_hash::fnv1a_64_extend(digest, word.as_bytes()), &[0])
+}
+
+/// The digest of a sequence of `argv` words (FNV-1a through [`aterm_hash`], each word ended by
+/// a NUL; no word at all is the offset basis): how [`ScriptSlot::before`] and a `#!` line's
+/// words ([`script_slots`]) are compared, the words themselves never kept.
+pub(crate) fn words_digest<'a>(words: impl IntoIterator<Item = &'a str>) -> u64 {
+    words
+        .into_iter()
+        .fold(aterm_hash::FNV64_OFFSET, digest_word)
+}
+
 /// What the kernel keeps for one image, and what may steer the lookup of a program word. Only
 /// [`ExecNames::image`] and [`ExecNames::exec`] (a bare word equal to one), and
 /// [`ExecNames::file`] (the file a word resolves to, by identity), confirm a word; the rest are
 /// strings from the process's own memory, which steer where a lookup looks and never confirm.
-/// Every field is bounded ([`ExecNames::bounded`]): a ring entry never holds an argument word.
+/// Every field is bounded ([`ExecNames::bounded`]): a ring entry holds no argument word but the
+/// script paths in [`ExecNames::scripts`], which steer only the `#!` identity check.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ExecNames {
     /// The canonical executable's file name (macOS `proc_pidpath`, Linux `/proc/<pid>/exe`):
@@ -112,6 +163,15 @@ pub(crate) struct ExecNames {
     /// (a path handed to a program as its argument is never the program), never shown, stored or
     /// sent.
     pub(crate) handed: Box<[Box<str>]>,
+    /// The words after `argv[0]` that may be the `#!` script the kernel's `#!` handling handed
+    /// this exec, its interpreter ([`script_words`]: a word with a `/` that is no flag, among the
+    /// first [`SCRIPT_WORDS`]; macOS `KERN_PROCARGS2`, Linux `/proc/<pid>/cmdline`), each with
+    /// the digest of the words before it ([`ScriptSlot`]). Each steers one thing only: whether a
+    /// `#!` script the shell would exec for a typed word was handed to an exec of its
+    /// interpreter where the kernel puts a script, right after its `#!` line's own words, which
+    /// the identity of the file the word names confirms ([`judge`]). None steers a program
+    /// word's lookup or confirms a word itself, and none is shown, stored or sent.
+    pub(crate) scripts: Box<[ScriptSlot]>,
     /// Whether the image's file has other names (macOS, `st_nlink` above one): `proc_pidpath`
     /// then names whichever of them the kernel last cached, so [`Self::image`] may be another
     /// program's name (macOS's developer-tool shim is one file under dozens of names, `python3`
@@ -157,9 +217,10 @@ impl ExecNames {
 
     /// These names as a ring entry keeps them, whatever they were read from: a name longer
     /// than [`NAME_MAX`], a handed path longer than [`PATH_MAX`] (or whose file name a confirming
-    /// name already is: it steers nothing new) and a `PATH` longer than [`ENV_PATH_MAX`] are
-    /// dropped, and at most [`HANDED_MAX`] handed paths are kept. So an entry's size is bounded
-    /// whatever an exec was given.
+    /// name already is: it steers nothing new), a script path longer than [`PATH_MAX`] and a
+    /// `PATH` longer than [`ENV_PATH_MAX`] are dropped, and at most [`HANDED_MAX`] handed paths
+    /// and as many script paths are kept. So an entry's size is bounded whatever an exec was
+    /// given.
     #[cfg(any(unix, test))]
     pub(crate) fn bounded(mut self) -> Self {
         let name = |n: Option<Box<str>>| n.filter(|n| n.len() <= NAME_MAX);
@@ -182,6 +243,14 @@ impl ExecNames {
             }
         }
         self.handed = handed.into();
+        let mut scripts: Vec<ScriptSlot> = Vec::new();
+        for slot in std::mem::take(&mut self.scripts) {
+            if slot.path.len() <= PATH_MAX && !scripts.contains(&slot) && scripts.len() < HANDED_MAX
+            {
+                scripts.push(slot);
+            }
+        }
+        self.scripts = scripts.into();
         self
     }
 
@@ -190,6 +259,7 @@ impl ExecNames {
     pub(crate) fn held_bytes(&self) -> usize {
         self.iter().map(str::len).sum::<usize>()
             + self.handed.iter().map(|h| h.len()).sum::<usize>()
+            + self.scripts.iter().map(|s| s.path.len()).sum::<usize>()
     }
 }
 
@@ -343,19 +413,48 @@ pub(crate) fn read_names(pid: i32, steer: Steering<'_>) -> ExecNames {
     let exe = aterm_sysprobe::process_path(id);
     let (file, linked) =
         image_file(id, exe.as_deref()).map_or((None, false), |(f, l)| (Some(f), l));
-    let (env_path, handed) = if steer(file) {
+    let steers = if steer(file) {
         exec_args(id)
     } else {
-        (None, Box::default())
+        Steers::default()
     };
     ExecNames {
         image: exe.as_deref().and_then(file_name),
         exec: exec_name(pid),
         file,
-        env_path: env_path.map(Arc::from),
-        handed,
+        env_path: steers.env_path.map(Arc::from),
+        handed: steers.handed,
+        scripts: steers.scripts,
         linked,
     }
+}
+
+/// The names the kernel keeps for process `pid`'s exec ([`ExecNames::iter`]: its image's file
+/// name, macOS's `p_name`), read from the process table alone: no file is stat'ed and no record
+/// read, so the thread that draws may ask ([`crate::session_status::program::LeaderImage::names_only`]).
+#[cfg(unix)]
+pub(crate) fn kernel_names(pid: i32) -> ExecNames {
+    let Some(id) = u32::try_from(pid).ok().filter(|p| *p > 1) else {
+        return ExecNames::default();
+    };
+    ExecNames {
+        image: aterm_sysprobe::process_path(id)
+            .as_deref()
+            .and_then(file_name),
+        exec: exec_name(pid),
+        ..ExecNames::default()
+    }
+}
+
+/// What one exec's record steers by ([`exec_args`]): its `PATH`, the paths it was given as its
+/// file ([`ExecNames::handed`]) and the script paths it may have been handed
+/// ([`ExecNames::scripts`]).
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct Steers {
+    env_path: Option<Box<str>>,
+    handed: Box<[Box<str>]>,
+    scripts: Box<[ScriptSlot]>,
 }
 
 /// The identity of the file `path` names, links followed.
@@ -401,32 +500,48 @@ thread_local! {
     static STEER_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The `PATH` and the paths of one `KERN_PROCARGS2` read ([`steers_of_procargs`]), when the
-/// record is at most [`STEER_READ_MAX`] bytes: a longer one is refused unparsed.
+/// The `PATH`, the paths and the script paths of one `KERN_PROCARGS2` read
+/// ([`steers_of_procargs`], [`scripts_of_procargs`]), when the record is at most
+/// [`STEER_READ_MAX`] bytes: a longer one is refused unparsed.
 #[cfg(target_vendor = "apple")]
-fn exec_args(pid: u32) -> (Option<Box<str>>, Box<[Box<str>]>) {
+fn exec_args(pid: u32) -> Steers {
     STEER_BUF.with_borrow_mut(|buf| {
         if buf.len() != STEER_READ_MAX {
             buf.resize(STEER_READ_MAX, 0);
         }
         aterm_uds::procargs::read_into(pid, buf)
             .and_then(|len| buf.get(..len))
-            .map(steers_of_procargs)
+            .map(|record| {
+                let (env_path, handed) = steers_of_procargs(record);
+                Steers {
+                    env_path,
+                    handed,
+                    scripts: scripts_of_procargs(record),
+                }
+            })
             .unwrap_or_default()
     })
 }
 
-/// Linux shows a process's environment (`/proc/<pid>/environ`): its `PATH`. No argument word is
-/// read.
+/// Linux shows a process's environment (`/proc/<pid>/environ`): its `PATH`; and its arguments
+/// (`/proc/<pid>/cmdline`), of which only [`script_words`] are kept.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn exec_args(pid: u32) -> (Option<Box<str>>, Box<[Box<str>]>) {
+fn exec_args(pid: u32) -> Steers {
     let environ = aterm_sysprobe::read_bounded(Path::new(&format!("/proc/{pid}/environ")));
     let path = environ
         .as_deref()
         .and_then(|env| env.split('\0').find_map(|kv| kv.strip_prefix("PATH=")))
         .filter(|p| p.len() <= ENV_PATH_MAX)
         .map(Into::into);
-    (path, Box::default())
+    let cmdline = aterm_sysprobe::read_bounded(Path::new(&format!("/proc/{pid}/cmdline")));
+    Steers {
+        env_path: path,
+        handed: Box::default(),
+        scripts: cmdline
+            .as_deref()
+            .map(|args| script_words(args.split('\0')))
+            .unwrap_or_default(),
+    }
 }
 
 /// Nothing steers a lookup here.
@@ -434,8 +549,8 @@ fn exec_args(pid: u32) -> (Option<Box<str>>, Box<[Box<str>]>) {
     unix,
     not(any(target_vendor = "apple", target_os = "linux", target_os = "android"))
 ))]
-fn exec_args(_pid: u32) -> (Option<Box<str>>, Box<[Box<str>]>) {
-    (None, Box::default())
+fn exec_args(_pid: u32) -> Steers {
+    Steers::default()
 }
 
 /// The image's `PATH` (at most [`ENV_PATH_MAX`] bytes) and the absolute paths it was given as
@@ -461,6 +576,78 @@ pub(crate) fn steers_of_procargs(buf: &[u8]) -> (Option<Box<str>>, Box<[Box<str>
         }
     }
     (env_path, handed.into())
+}
+
+/// The script paths one `KERN_PROCARGS2` answer's arguments may hold ([`script_words`] of its
+/// `argv`); a word that is no UTF-8 names nothing.
+#[cfg(any(target_vendor = "apple", test))]
+pub(crate) fn scripts_of_procargs(buf: &[u8]) -> Box<[ScriptSlot]> {
+    aterm_uds::procargs::parse(buf).map_or_else(Box::default, |args| {
+        script_words(
+            args.argv
+                .iter()
+                .map(|w| std::str::from_utf8(w).unwrap_or_default()),
+        )
+    })
+}
+
+/// The words of an exec's `argv` that may be the `#!` script the kernel's `#!` handling handed an
+/// interpreter ([`ExecNames::scripts`]): among the first [`SCRIPT_WORDS`] after `argv[0]`, each
+/// with a `/` (the kernel hands the path the shell gave `execve`, which a bare name found on
+/// `PATH` makes absolute) that is no flag, holds no control character and is at most
+/// [`PATH_MAX`] bytes, at most [`HANDED_MAX`]; each with the digest of the words before it
+/// ([`ScriptSlot::before`]), so `sh -n ./x.sh` and `./lint.sh ./x.sh` hand `./x.sh` where no
+/// `#!` line of `x.sh` puts it.
+#[cfg(any(unix, test))]
+fn script_words<'a>(argv: impl Iterator<Item = &'a str>) -> Box<[ScriptSlot]> {
+    let mut kept: Vec<ScriptSlot> = Vec::new();
+    let mut before = words_digest([]);
+    for word in argv.skip(1).take(SCRIPT_WORDS) {
+        if word.contains('/')
+            && !word.starts_with('-')
+            && !word.contains(char::is_control)
+            && word.len() <= PATH_MAX
+            && !kept.iter().any(|k| *k.path == *word && k.before == before)
+            && kept.len() < HANDED_MAX
+        {
+            kept.push(ScriptSlot {
+                path: word.into(),
+                before,
+            });
+        }
+        before = digest_word(before, word);
+    }
+    kept.into()
+}
+
+/// The digests a `#!` line (what follows `#!`) puts before its script's path in the `argv` of
+/// the process that runs it ([`ScriptSlot::before`]): the words after its interpreter as macOS's
+/// kernel splits them; the rest of the line as one word, as Linux's hands it; and, for the known
+/// `/usr/bin/env` (`env`), the words after the program `env` runs ([`env_program`]), which `env`
+/// hands that program in front of the script when it re-execs in the same process.
+fn script_slots(line: &str, env: bool) -> Box<[u64]> {
+    let blank = [' ', '\t', '\r'];
+    let mut words = line.split(blank).filter(|w| !w.is_empty());
+    let Some(interpreter) = words.next() else {
+        return Box::default();
+    };
+    let mut slots = vec![words_digest(words.clone())];
+    let rest = line
+        .trim_start_matches(blank)
+        .strip_prefix(interpreter)
+        .unwrap_or_default()
+        .trim_matches([' ', '\t']);
+    slots.push(if rest.is_empty() {
+        words_digest([])
+    } else {
+        words_digest([rest])
+    });
+    if env && env_program(&mut words).is_some() {
+        slots.push(words_digest(words));
+    }
+    slots.sort_unstable();
+    slots.dedup();
+    slots.into()
 }
 
 /// `p_name` (the exec's file name, up to 32 bytes), else `p_comm` (16).
@@ -645,29 +832,55 @@ impl Table {
 #[cfg(test)]
 impl Table {
     /// The oracle of the detail's law: whether some file of the table named `name` is, by
-    /// identity, one of `ran`'s images, or a `#!` script whose interpreter file (or `/bin/sh`'s
-    /// stub's shell, or an `env` line's program on `/usr/bin`) is.
-    pub(crate) fn ran_by_identity(&self, name: &str, ran: &[Exec]) -> bool {
-        let files: Vec<FileId> = ran.iter().filter_map(|e| e.names.file).collect();
+    /// identity, one of `ran`'s images, or a `#!` script whose interpreter's file (or `/bin/sh`'s
+    /// stub's shell, or an `env` line's program on `/usr/bin`) is the image of an exec whose
+    /// process was handed it (a script path, from `cwd`, naming it) where the kernel puts it:
+    /// right after the line's words (split at its blanks, or whole as Linux hands them), or, for
+    /// an `env` line, after the words that follow `env`'s program.
+    pub(crate) fn ran_by_identity(&self, name: &str, ran: &[Exec], cwd: &str) -> bool {
         let id_of = |path: &str| self.files.get(Path::new(path)).map(|(id, _)| *id);
-        let mapped = |id: Option<FileId>| {
+        let maps = |exec: &Exec, id: Option<FileId>| {
             id.is_some_and(|id| {
-                files.contains(&id)
+                exec.names.file == Some(id)
                     || (id_of("/bin/sh") == Some(id)
-                        && id_of("/private/var/select/sh").is_some_and(|s| files.contains(&s)))
+                        && id_of("/private/var/select/sh")
+                            .is_some_and(|s| exec.names.file == Some(s)))
+            })
+        };
+        let mapped = |id: Option<FileId>| ran.iter().any(|e| maps(e, id));
+        let handed = |pid: i32, script: FileId, slots: &[u64]| {
+            ran.iter().filter(|e| e.pid == pid).any(|exec| {
+                exec.names.scripts.iter().any(|steer| {
+                    slots.contains(&steer.before)
+                        && script_file(Some(cwd), &steer.path)
+                            .and_then(|file| file.to_str().and_then(id_of))
+                            .is_some_and(|id| id == script)
+                })
             })
         };
         self.files.iter().any(|(path, (id, line))| {
             path.file_name().is_some_and(|n| n == name)
                 && (mapped(Some(*id))
                     || line.as_deref().is_some_and(|line| {
-                        let mut words = line.split(' ');
-                        let interpreter = words.next().unwrap_or_default();
-                        mapped(id_of(interpreter))
-                            || (id_of(interpreter)
-                                .is_some_and(|id| id_of("/usr/bin/env") == Some(id))
-                                && env_program(words)
-                                    .is_some_and(|p| mapped(id_of(&format!("/usr/bin/{p}")))))
+                        let words: Vec<&str> = line.split(' ').filter(|w| !w.is_empty()).collect();
+                        let after = words.get(1..).unwrap_or_default();
+                        let interpreter = id_of(words.first().copied().unwrap_or_default());
+                        let env = interpreter.is_some_and(|i| id_of("/usr/bin/env") == Some(i));
+                        let mut rest = after.iter().copied();
+                        let program = env_program(&mut rest);
+                        let joined = after.join(" ");
+                        let mut slots = vec![
+                            words_digest(after.iter().copied()),
+                            words_digest((!joined.is_empty()).then_some(joined.as_str())),
+                        ];
+                        if env && program.is_some() {
+                            slots.push(words_digest(rest));
+                        }
+                        let program = program.and_then(|p| id_of(&format!("/usr/bin/{p}")));
+                        ran.iter().any(|exec| {
+                            (maps(exec, interpreter) || (env && maps(exec, program)))
+                                && handed(exec.pid, *id, &slots)
+                        })
                     }))
         })
     }
@@ -827,6 +1040,7 @@ struct Steered {
     file: FileId,
     env_path: Option<Arc<str>>,
     handed: Box<[Box<str>]>,
+    scripts: Box<[ScriptSlot]>,
 }
 
 /// A byte count as an offset in the session's output.
@@ -1223,6 +1437,7 @@ impl Ran {
             file,
             env_path: names.env_path.clone(),
             handed: names.handed.clone(),
+            scripts: names.scripts.clone(),
         });
     }
 
@@ -1394,10 +1609,11 @@ pub(crate) enum Word<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Look {
     /// The file the shell would exec is an image an exec in the window mapped, or a `#!` script
-    /// whose interpreter one mapped: the word names a program that ran.
+    /// handed to an exec in the window that mapped its interpreter: the word names a program that
+    /// ran.
     Ran,
-    /// A `#!` script whose interpreter was not found among the window's images: its
-    /// interpreter may stand in for it until its own name is confirmed.
+    /// A `#!` script no exec of its interpreter in the window was handed: the program its job
+    /// ran (its interpreter, where it ran) may stand in for it until its own name is confirmed.
     Script,
     /// Nothing that ran: a missing path, a file no one may execute, or an image no exec in the
     /// window mapped.
@@ -1422,6 +1638,10 @@ pub(crate) struct Resolution {
     files: Box<[Found]>,
     /// `/bin/sh`'s identity and the identity of the shell its stub re-execs ([`SH_STUB`]).
     stub: Option<(FileId, FileId)>,
+    /// Each script path the window's execs were handed that may be the word's file
+    /// ([`Key::scripts`]), with the identity of the program file it names from the block's
+    /// directory: [`judge`] confirms a `#!` script handed to its interpreter by it.
+    scripts: Box<[(Box<str>, FileId)]>,
     /// No program file, and the word names a directory ([`Look::Cd`]).
     dir: bool,
 }
@@ -1430,29 +1650,61 @@ pub(crate) struct Resolution {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Found {
     id: FileId,
-    /// For a `#!` script, the files its `#!` line's interpreter is: the line's own, and for an
-    /// `env` line the program `env` would find on each steering `PATH`.
-    script: Option<Box<[FileId]>>,
+    /// For a `#!` script, what its `#!` line makes of the process that runs it ([`Shebang`]).
+    script: Option<Shebang>,
+}
+
+/// What a `#!` script's line makes of the process that runs it ([`interpreters`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Shebang {
+    /// The files its interpreter is: the line's own, and for an `env` line the program `env`
+    /// would find on each steering `PATH`.
+    interpreters: Box<[FileId]>,
+    /// The digests of the words the kernel (and an `env` line's `env`) puts before the script's
+    /// path in that process's `argv` ([`script_slots`]): a script path handed anywhere else is
+    /// another program's argument, never this script run.
+    slots: Box<[u64]>,
 }
 
 /// What `res` makes of a window whose execs are `execs` ([`Look`]): a file of the word that is
 /// an image one of them mapped (for `/bin/sh`, also the shell its stub re-execs) ran, as does a
-/// `#!` script whose interpreter's file is one; a script whose interpreter is none is a script.
+/// `#!` script whose interpreter's file a process mapped that was handed the script where the
+/// kernel puts it: a script path one of its execs was handed right after the script's `#!` line's
+/// own words ([`Shebang::slots`]) names, by identity, the script's own file. A process's
+/// re-exec (`/bin/sh`'s stub, `env`) keeps what its first exec was handed, whose record alone is
+/// read. So an interpreter another command of the line ran, handed another script, confirms
+/// nothing (PRIV4-2), nor does one handed the script as its argument (`sh -n ./x.sh`, another
+/// script's `./lint.sh ./x.sh`); any other script is a script.
 fn judge(res: &Resolution, execs: &[Arc<Exec>]) -> Look {
-    let mapped = |id: FileId| execs.iter().any(|e| e.names.file == Some(id));
-    let ran_file = |id: FileId| {
-        mapped(id)
+    let maps = |exec: &Exec, id: FileId| {
+        exec.names.file == Some(id)
             || res
                 .stub
-                .is_some_and(|(stub, shell)| stub == id && mapped(shell))
+                .is_some_and(|(stub, shell)| stub == id && exec.names.file == Some(shell))
+    };
+    let handed = |pid: i32, script: FileId, line: &Shebang| {
+        execs.iter().filter(|e| e.pid == pid).any(|e| {
+            e.names.scripts.iter().any(|slot| {
+                line.slots.contains(&slot.before)
+                    && res
+                        .scripts
+                        .iter()
+                        .any(|(steer, id)| *steer == slot.path && *id == script)
+            })
+        })
     };
     let mut script = false;
     for found in &res.files {
-        if ran_file(found.id) {
+        if execs.iter().any(|e| maps(e, found.id)) {
             return Look::Ran;
         }
-        if let Some(interpreters) = &found.script {
-            if interpreters.iter().any(|id| ran_file(*id)) {
+        if let Some(line) = &found.script {
+            if execs.iter().any(|e| {
+                line.interpreters
+                    .iter()
+                    .any(|interpreter| maps(e, *interpreter))
+                    && handed(e.pid, found.id, line)
+            }) {
                 return Look::Ran;
             }
             script = true;
@@ -1469,7 +1721,8 @@ fn judge(res: &Resolution, execs: &[Arc<Exec>]) -> Look {
 
 /// One lookup a session remembers: what the word was typed as and judged from (how it was
 /// typed, the directory, the steering `PATH`s, the paths the window's execs were handed as the
-/// word's file, and the block), never anything an exec was handed as an argument.
+/// word's file, the script paths they were handed that have the word's own file name, and the
+/// block), never another argument an exec was handed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Key {
     path: bool,
@@ -1477,6 +1730,9 @@ struct Key {
     cwd: Option<Box<str>>,
     paths: Box<[Arc<str>]>,
     handed: Box<[Box<str>]>,
+    /// The window's execs' script paths whose file name is the word's own ([`ExecNames::scripts`]):
+    /// each is looked up only to judge a `#!` script the word names, never to find one.
+    scripts: Box<[Box<str>]>,
     /// The block's id: a new block looks again.
     block: u64,
 }
@@ -1719,11 +1975,35 @@ fn resolve(files: &dyn Files, home: Option<&Path>, key: &Key) -> Resolution {
         && directory_for(home, key)
             .filter(|dir| dir.as_os_str().len() <= PATH_MAX)
             .is_some_and(|dir| files.directory(&dir));
+    let scripts = if found.iter().any(|f| f.script.is_some()) {
+        key.scripts
+            .iter()
+            .filter_map(|steer| {
+                let file = script_file(key.cwd.as_deref(), steer)?;
+                files.program(&file).map(|id| (steer.clone(), id))
+            })
+            .collect()
+    } else {
+        Box::default()
+    };
     Resolution {
         files: found,
         stub,
         dir,
+        scripts,
     }
+}
+
+/// The file a script path an exec was handed names ([`ExecNames::scripts`]): itself when
+/// absolute, else from the block's directory (the shell's, where its `execve` was resolved);
+/// `None` past [`PATH_MAX`].
+fn script_file(cwd: Option<&str>, steer: &str) -> Option<PathBuf> {
+    let file = if steer.starts_with('/') {
+        PathBuf::from(steer)
+    } else {
+        Path::new(cwd.filter(|cwd| cwd.starts_with('/'))?).join(steer)
+    };
+    (file.as_os_str().len() <= PATH_MAX).then_some(file)
 }
 
 /// The prefixes of a typed path the shell replaces with the home directory before it looks.
@@ -1808,19 +2088,24 @@ fn first_on_path(files: &dyn Files, path: &str, name: &str) -> Option<(PathBuf, 
         .find_map(|file| files.program(&file).map(|id| (file, id)))
 }
 
-/// The files the interpreter of a `#!` line (what follows `#!`) is: its own file; for
-/// the known `/usr/bin/env` file (also reached through a link) with `[-S] [-flags] [NAME=V…]
-/// prog`, also the file `prog` names (an absolute one, or the first on each steering `PATH`, as
-/// `env` finds it). A custom interpreter named `env` establishes no such semantics.
-fn interpreters(files: &dyn Files, line: &str, paths: &[Arc<str>]) -> Box<[FileId]> {
+/// What a `#!` line (what follows `#!`) makes of the process that runs it ([`Shebang`]): the
+/// files its interpreter is, its own file; for the known `/usr/bin/env` file (also reached
+/// through a link) with `[-S] [-flags] [NAME=V…] prog`, also the file `prog` names (an absolute
+/// one, or the first on each steering `PATH`, as `env` finds it); and where its script's path
+/// stands in that process's `argv` ([`script_slots`]). A custom interpreter named `env`
+/// establishes no such semantics.
+fn interpreters(files: &dyn Files, line: &str, paths: &[Arc<str>]) -> Shebang {
     let mut words = line.split([' ', '\t', '\r']).filter(|w| !w.is_empty());
     let Some(interpreter) = words.next().filter(|i| i.starts_with('/')) else {
-        return Box::default();
+        return Shebang {
+            interpreters: Box::default(),
+            slots: Box::default(),
+        };
     };
     let interpreter_id = files.program(Path::new(interpreter));
     let mut ids: Vec<FileId> = interpreter_id.into_iter().collect();
     let env = interpreter_id.is_some_and(|id| files.program(Path::new("/usr/bin/env")) == Some(id));
-    if let Some(program) = env_program(words).filter(|_| env) {
+    if let Some(program) = env_program(&mut words).filter(|_| env) {
         if program.starts_with('/') {
             ids.extend(files.program(Path::new(program)));
         } else if !program.contains('/') {
@@ -1831,7 +2116,10 @@ fn interpreters(files: &dyn Files, line: &str, paths: &[Arc<str>]) -> Box<[FileI
             );
         }
     }
-    ids.into()
+    Shebang {
+        interpreters: ids.into(),
+        slots: script_slots(line, env),
+    }
 }
 
 /// What one block's detail is confirmed against ([`Ran::heard`]): the execs that count for it
@@ -1944,12 +2232,29 @@ impl<'a> Heard<'a> {
                 }
             }
         }
+        let own_name = if path {
+            Path::new(&text.replace("\\ ", " "))
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        } else {
+            Some(text.to_owned())
+        };
+        let mut scripts: Vec<Box<str>> = Vec::new();
+        for s in self.execs.iter().flat_map(|e| e.names.scripts.iter()) {
+            let named = Path::new(&*s.path)
+                .file_name()
+                .is_some_and(|n| own_name.as_deref().is_some_and(|own| n == own));
+            if named && !scripts.contains(&s.path) {
+                scripts.push(s.path.clone());
+            }
+        }
         let key = Key {
             path,
             word: text.into(),
             cwd: self.cwd.clone(),
             paths: self.paths.clone().into(),
             handed: handed.into(),
+            scripts: scripts.into(),
             block: self.block,
         };
         let mut seen: Vec<FileId> = self.execs.iter().filter_map(|e| e.names.file).collect();
@@ -1977,7 +2282,7 @@ impl Exec {
 
 /// The program an `env` `#!` line runs: its first word that is no flag (`-S`, `-i`; `-u NAME` and
 /// `-P DIR` with their values) and no `NAME=VALUE`.
-fn env_program<'a>(mut words: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+fn env_program<'a>(words: &mut impl Iterator<Item = &'a str>) -> Option<&'a str> {
     while let Some(word) = words.next() {
         match word {
             "-u" | "-P" | "-C" | "--unset" | "--chdir" => {
@@ -1995,6 +2300,17 @@ fn env_program<'a>(mut words: impl Iterator<Item = &'a str>) -> Option<&'a str> 
 #[cfg(test)]
 pub(crate) fn ran_of(names: &[&str]) -> Vec<Exec> {
     names.iter().map(|name| test_exec(0, name)).collect()
+}
+
+/// `execs`, each handed each of `scripts` right after `argv[0]`, as the kernel's `#!` handling
+/// hands an interpreter the path of a script whose line adds no word (`#!/bin/sh`)
+/// ([`ExecNames::scripts`]).
+#[cfg(test)]
+pub(crate) fn handed_scripts(mut execs: Vec<Exec>, scripts: &[&str]) -> Vec<Exec> {
+    for exec in &mut execs {
+        exec.names.scripts = scripts.iter().map(|s| (*s).into()).collect();
+    }
+    execs
 }
 
 /// A test's exec of `name` by one job leader, stamped `at_ms`, its file [`test_id`]`(name)`.
@@ -2103,6 +2419,7 @@ impl RanFeed {
             Some(s) => {
                 names.env_path = s.env_path;
                 names.handed = s.handed;
+                names.scripts = s.scripts;
             }
             None if first => self.ran.steered(&names, spot),
             None => {}
@@ -2204,7 +2521,8 @@ impl RanFeed {
             return;
         }
         let read = (self.read)(pgid, &mut |_| true);
-        let file = read.file.filter(|_| read.image == names.image);
+        let same = read.image == names.image;
+        let file = read.file.filter(|_| same);
         self.ran.hear(
             Exec {
                 at_ms: 0,
@@ -2213,6 +2531,7 @@ impl RanFeed {
                 names: ExecNames {
                     file,
                     env_path: read.env_path,
+                    scripts: if same { read.scripts } else { Box::default() },
                     ..names
                 },
                 during: During::Window,

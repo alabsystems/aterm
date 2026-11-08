@@ -12,9 +12,12 @@ use crate::session_timeline::SessionTimeline;
 
 const PROGRAM_MAX: usize = 32;
 
-/// The program name `argv[0]` names.
-pub(crate) fn program_from_argv0(argv0: &str) -> Option<String> {
-    let trimmed = argv0.trim_end_matches('/');
+/// The program name a file's path names: its file name (a vendor `versions/<VERSION>` file names
+/// its tool, not its version), its leading `-`s dropped (a login shell's `-zsh`), kept to
+/// `[A-Za-z0-9._+-]` and at most [`PROGRAM_MAX`] bytes. For a word that is a file's own path (a
+/// front's target, a shim script), and for an `argv[0]` [`program_from_argv0`] reads as one word.
+pub(crate) fn path_program(path: &str) -> Option<String> {
+    let trimmed = path.trim_end_matches('/');
     let mut parts = trimmed.rsplit('/');
     let base = parts.next().unwrap_or("");
     let base = match (parts.next(), parts.next()) {
@@ -30,18 +33,178 @@ pub(crate) fn program_from_argv0(argv0: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// Whether `c` ends a process title's first word: a blank of any kind (an argument word follows
+/// it) or a control character (a terminal sequence's bytes follow it).
+fn is_title_break(c: char) -> bool {
+    c.is_whitespace() || c.is_control()
+}
+
+/// What the kernel and the file system say of a process's image, for reading the `argv[0]` it
+/// may have rewritten ([`program_from_argv0`]); asked only of an `argv[0]` that is a process
+/// title.
+pub(crate) trait Image {
+    /// Whether `path` names, by device and inode, the file the process's image was mapped from.
+    fn is_file(&self, path: &str) -> bool;
+    /// Whether `path`, an absolute path, names a program file (a regular file with an execute
+    /// bit, links followed), whichever process maps it.
+    fn is_program(&self, path: &str) -> bool;
+    /// The names the kernel keeps for the exec, which no process sets afterwards: the mapped
+    /// file's name and macOS's `p_name` ([`crate::command_ran::ExecNames::iter`]).
+    fn names(&self) -> Vec<String>;
+}
+
+/// The [`Image`] of process `pid`, read once and only when asked: the kernel's names and the
+/// mapped file's identity ([`crate::command_ran::read_names`]: macOS `proc_pidpath`'s file and
+/// `p_name`, Linux `/proc/<pid>/exe` itself; nothing off unix), with the paths a title names
+/// stat'ed ([`LeaderImage::of`]); or the kernel's names alone, nothing stat'ed
+/// ([`LeaderImage::names_only`]).
+pub(crate) struct LeaderImage {
+    pid: i32,
+    /// Whether a path is stat'ed: the mapped file's and the paths a title names.
+    stat: bool,
+    #[cfg(unix)]
+    read: std::cell::OnceCell<crate::command_ran::ExecNames>,
+}
+
+impl LeaderImage {
+    /// The image of `pid`, unread, whose files are stat'ed when asked: for a reader on its own
+    /// thread (the status sweep, the leader read, a control peer's name).
+    pub(crate) const fn of(pid: i32) -> Self {
+        Self {
+            pid,
+            stat: true,
+            #[cfg(unix)]
+            read: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The image of `pid` as the thread that draws may read it: the names the kernel keeps for
+    /// the exec ([`crate::command_ran::kernel_names`]: a process-table read, no file system),
+    /// and no path stat'ed, so a title that names an automount or a network path never stalls a
+    /// frame; a path that only a stat could vouch for is not vouched for.
+    pub(crate) const fn names_only(pid: i32) -> Self {
+        Self {
+            pid,
+            stat: false,
+            #[cfg(unix)]
+            read: std::cell::OnceCell::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn read(&self) -> &crate::command_ran::ExecNames {
+        self.read.get_or_init(|| {
+            if self.stat {
+                crate::command_ran::read_names(self.pid, &mut |_| false)
+            } else {
+                crate::command_ran::kernel_names(self.pid)
+            }
+        })
+    }
+
+    /// Whether `path` may be stat'ed: this image stats, and it is an absolute path short enough
+    /// to name a file.
+    #[cfg(unix)]
+    fn statted(&self, path: &str) -> bool {
+        self.stat && path.starts_with('/') && path.len() <= crate::command_ran::PATH_MAX
+    }
+}
+
+impl Image for LeaderImage {
+    #[cfg(unix)]
+    fn is_file(&self, path: &str) -> bool {
+        self.statted(path)
+            && self.read().file.is_some_and(|image| {
+                crate::command_ran::file_id(std::path::Path::new(path)) == Some(image)
+            })
+    }
+
+    #[cfg(not(unix))]
+    fn is_file(&self, _path: &str) -> bool {
+        let _ = (self.pid, self.stat);
+        false
+    }
+
+    #[cfg(unix)]
+    fn is_program(&self, path: &str) -> bool {
+        use crate::command_ran::Files as _;
+        self.statted(path)
+            && crate::command_ran::RealFiles
+                .program(std::path::Path::new(path))
+                .is_some()
+    }
+
+    #[cfg(not(unix))]
+    fn is_program(&self, _path: &str) -> bool {
+        false
+    }
+
+    #[cfg(unix)]
+    fn names(&self) -> Vec<String> {
+        self.read().iter().map(str::to_owned).collect()
+    }
+
+    #[cfg(not(unix))]
+    fn names(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// What Linux's `/proc/<pid>/exe` appends to the path of a file unlinked since the exec (a
+/// binary a package upgrade replaced by rename): a mark, never part of the file's name.
+const DELETED_MARK: &str = " (deleted)";
+
+/// The program name `argv[0]` names (H6: a name steers, the kernel's read of the image confirms).
+/// An `argv[0]` of one word (`claude`, `-zsh`, `/bin/sleep`, `exec -a NAME`'s) names it as its
+/// path does ([`path_program`]). One with a blank or a control character in it is a process
+/// title a process may have rewritten (setproctitle's `postgres: alice orders …`, npm's
+/// `npm run <script>`, perl's `$0`), whose words after the first are arguments: it is read whole
+/// only where the kernel vouches for the whole, its path naming by device and inode the file the
+/// image was mapped from (an app path with spaces) or its name being one the kernel keeps for the
+/// exec (Linux's ` (deleted)` mark dropped); otherwise only its first word names the program, a
+/// trailing `:` dropped. A first word that is a path is a path cut at a blank, so it may end in a
+/// directory's word (`/opt/My Tools/tool` cut to `/opt/My`): it names the program only where it
+/// names a program file or its name is one the kernel keeps. Otherwise, and for a title with no
+/// first word, the kernel's own name for the exec. So no word after a title's first ever reaches
+/// `program=`, and no directory's word does.
+pub(crate) fn program_from_argv0(argv0: &str, image: &dyn Image) -> Option<String> {
+    let Some(cut) = argv0.find(is_title_break) else {
+        return path_program(argv0);
+    };
+    let kept = || {
+        image
+            .names()
+            .into_iter()
+            .filter_map(|n| path_program(n.strip_suffix(DELETED_MARK).unwrap_or(&n)))
+    };
+    let vouched =
+        |path: &str, name: &String| kept().any(|kept| kept == *name) || image.is_program(path);
+    let whole = path_program(argv0);
+    if whole
+        .as_ref()
+        .is_some_and(|whole| image.is_file(argv0) || kept().any(|kept| kept == *whole))
+    {
+        return whole;
+    }
+    let first = argv0[..cut].trim_end_matches(':');
+    let named = path_program(first).filter(|name| !first.contains('/') || vouched(first, name));
+    named.or_else(|| kept().next())
+}
+
 use atpkg::image::SCRIPT_SHELLS;
 
-/// Program for `argv0 [argv1]` ([`program_from_argv0`], [`SCRIPT_SHELLS`], [`atpkg_shim`]).
+/// Program for `argv0 [argv1]` ([`program_from_argv0`] of the process whose image is `image`,
+/// [`SCRIPT_SHELLS`], [`atpkg_shim`]).
 pub(crate) fn program_from_argv(
     argv0: &str,
     argv1: Option<&str>,
     is_shim: &dyn Fn(&str) -> bool,
+    image: &dyn Image,
 ) -> Option<String> {
-    let name = program_from_argv0(argv0)?;
+    let name = program_from_argv0(argv0, image)?;
     if SCRIPT_SHELLS.contains(&name.as_str())
         && let Some(script) = argv1.filter(|a| !a.starts_with('-'))
-        && let Some(agent) = program_from_argv0(script)
+        && let Some(agent) = path_program(script)
         && atpkg::stub::is_agent_program(&agent)
         && is_shim(script)
     {
@@ -111,31 +274,47 @@ fn argv_head(words: &[std::ffi::OsString]) -> Option<(String, Option<String>)> {
     Some((argv0, argv1))
 }
 
-/// The published program of `pid` ([`program_of_words`] its arguments).
+/// The published program of `pid` ([`program_of_words`] its arguments, its image read with
+/// its files stat'ed: [`LeaderImage::of`]), as a reader on its own thread reads it: `reveal`'s
+/// agent check on the control thread ([`crate::control_reveal::Live`]), as a control peer's name
+/// is read there, and the live tests' reading of the law [`leader_facts`] ships;
+/// [`program_of_names_only`] is the one the thread that draws reads.
 pub(crate) fn program_of(pid: i32) -> Option<String> {
+    program_of_image(pid, &LeaderImage::of(pid))
+}
+
+/// [`program_of`] as the thread that draws may read it: the image's names from the process
+/// table alone, no path a title names stat'ed ([`LeaderImage::names_only`]).
+pub(crate) fn program_of_names_only(pid: i32) -> Option<String> {
+    program_of_image(pid, &LeaderImage::names_only(pid))
+}
+
+/// [`program_of_words`] of `pid`'s arguments against `image`.
+fn program_of_image(pid: i32, image: &dyn Image) -> Option<String> {
     if pid <= 0 {
         return None;
     }
-    program_of_words(&aterm_uds::process::read_process_argv(pid)?)
+    program_of_words(&aterm_uds::process::read_process_argv(pid)?, image)
 }
 
-/// The published program of a process whose arguments are `words`: a build's front by the build
-/// it becomes ([`front_program`]), else [`program_from_argv`] its head ([`argv_head`]).
-fn program_of_words(words: &[std::ffi::OsString]) -> Option<String> {
+/// The published program of a process whose arguments are `words` and whose image is `image`: a
+/// build's front by the build it becomes ([`front_program`]), else [`program_from_argv`] its head
+/// ([`argv_head`]).
+fn program_of_words(words: &[std::ffi::OsString], image: &dyn Image) -> Option<String> {
     if aterm_uds::build_front::front(words).is_some() {
         return front_program(words);
     }
     let (argv0, argv1) = argv_head(words)?;
-    program_from_argv(&argv0, argv1.as_deref(), &atpkg_shim)
+    program_from_argv(&argv0, argv1.as_deref(), &atpkg_shim, image)
 }
 
 /// THE PROGRAM A BUILD'S FRONT BECOMES, where `argv` names one ([`aterm_uds::build_front::front`]):
-/// its target's name as [`program_from_argv0`] reads it, which is how the tab names the build once
+/// its target's name as [`path_program`] reads it, which is how the tab names the build once
 /// the front has exec'd it. The one naming rule of a front, for `status` and the survey (the
 /// leader's facts) and for `sys jobs` (`vitals_jobs`' rows). `None` for any other argv.
 pub(crate) fn front_program<S: AsRef<std::ffi::OsStr>>(argv: &[S]) -> Option<String> {
     let front = aterm_uds::build_front::front(argv)?;
-    program_from_argv0(&front.target.as_ref().to_string_lossy())
+    path_program(&front.target.as_ref().to_string_lossy())
 }
 
 /// A BUILD'S FRONT WAITING FOR MEMORY, as `status` says it (`wait=memory wait_gib= wait_ahead=`):
@@ -280,7 +459,7 @@ pub(crate) struct LeaderFacts {
     pub(crate) build_wait: Option<BuildWait>,
 }
 
-/// [`LeaderFacts`] from one parsed `KERN_PROCARGS2` read.
+/// [`LeaderFacts`] from one parsed `KERN_PROCARGS2` read of the process whose image is `image`.
 pub(crate) fn facts_from(
     args: &atpkg::caller_shell::ProcArgs,
     ppid: Option<i32>,
@@ -288,16 +467,17 @@ pub(crate) fn facts_from(
     managed: Option<&atpkg::store::Layout>,
     shim_of: &dyn Fn(&str) -> Option<Shim>,
     holds_agent: &dyn Fn(&str) -> bool,
+    image: &dyn Image,
 ) -> LeaderFacts {
     let argv0 = args.argv.first().map_or("", String::as_str);
     let argv1 = args.argv.get(1).map(String::as_str);
     let front = front_program(&args.argv);
     let is_front = front.is_some();
-    let named = program_from_argv(argv0, argv1, &|script| shim_of(script).is_some());
+    let named = program_from_argv(argv0, argv1, &|script| shim_of(script).is_some(), image);
     let shim = !is_front
         && named
             .as_deref()
-            .is_some_and(|p| program_from_argv0(argv0).as_deref() != Some(p));
+            .is_some_and(|p| program_from_argv0(argv0, image).as_deref() != Some(p));
     let program = front.or(named);
     let reroute = shim && argv1.and_then(shim_of) == Some(Shim::Reroute);
     let store = managed.map(|layout| layout.prefix.join("store"));
@@ -306,7 +486,7 @@ pub(crate) fn facts_from(
         .filter(|p| aterm_phase::may_host_agent(p))
         .and(argv1)
         .filter(|script| !script.starts_with('-'))
-        .and_then(program_from_argv0)
+        .and_then(path_program)
         .filter(|script| atpkg::stub::is_agent_program(script));
     let copy = if reroute {
         None
@@ -408,7 +588,9 @@ pub(crate) fn leader_facts(pgid: i32, shell: i32) -> LeaderFacts {
             .as_deref()
             .is_some_and(|words| aterm_uds::build_front::front(words).is_some());
         return LeaderFacts {
-            program: words.as_deref().and_then(program_of_words),
+            program: words
+                .as_deref()
+                .and_then(|words| program_of_words(words, &LeaderImage::of(pgid))),
             build_wait: front.then(|| build_wait_of(pgid, &|_| None)).flatten(),
             ..LeaderFacts::default()
         };
@@ -425,6 +607,7 @@ pub(crate) fn leader_facts(pgid: i32, shell: i32) -> LeaderFacts {
         managed.as_ref(),
         &|script| managed.as_ref().and_then(|layout| shim_in(script, layout)),
         &|dir| holds_agent(dir, &laid),
+        &LeaderImage::of(pgid),
     );
     if facts.build_wait.is_some() {
         facts.build_wait = build_wait_of(pgid, &|key| args.env_var(key).map(str::to_owned));
@@ -1282,30 +1465,148 @@ mod tests {
         }
     }
 
+    /// A test's [`Image`]: the mapped file is the one `file` spells, the kernel keeps `names`
+    /// for the exec, and `programs` (and `file`) are the program files there are.
+    struct Mapped {
+        file: Option<&'static str>,
+        names: &'static [&'static str],
+        programs: &'static [&'static str],
+    }
+
+    impl Image for Mapped {
+        fn is_file(&self, path: &str) -> bool {
+            self.file == Some(path)
+        }
+
+        fn is_program(&self, path: &str) -> bool {
+            self.file == Some(path) || self.programs.contains(&path)
+        }
+
+        fn names(&self) -> Vec<String> {
+            self.names.iter().map(|n| (*n).to_owned()).collect()
+        }
+    }
+
+    /// An image the kernel says nothing of.
+    const NO_IMAGE: Mapped = Mapped {
+        file: None,
+        names: &[],
+        programs: &[],
+    };
+
     #[test]
     fn argv0_reduces_to_the_program_name() {
-        assert_eq!(program_from_argv0("claude").as_deref(), Some("claude"));
-        assert_eq!(program_from_argv0("-zsh").as_deref(), Some("zsh"));
-        assert_eq!(program_from_argv0("/bin/sleep").as_deref(), Some("sleep"));
+        let p = |argv0: &str| program_from_argv0(argv0, &NO_IMAGE);
+        assert_eq!(p("claude").as_deref(), Some("claude"));
+        assert_eq!(p("-zsh").as_deref(), Some("zsh"));
+        assert_eq!(p("/bin/sleep").as_deref(), Some("sleep"));
         assert_eq!(
-            program_from_argv0("/Users//x/.local/share/claude/versions/2.1.280").as_deref(),
+            p("/Users//x/.local/share/claude/versions/2.1.280").as_deref(),
             Some("claude"),
             "a vendor version directory names its tool, not its version"
         );
         assert_eq!(
-            program_from_argv0("/opt/versions/tool").as_deref(),
+            p("/opt/versions/tool").as_deref(),
             Some("tool"),
             "only a VERSION-shaped basename under versions/ is rewritten"
         );
         assert_eq!(
-            program_from_argv0("evil\u{1b}]0;x\u{7}").as_deref(),
-            Some("evil0x")
+            p("evil\u{1b}]0;x\u{7}").as_deref(),
+            Some("evil"),
+            "a control character ends the name: no byte of a sequence after it joins it"
         );
-        assert_eq!(program_from_argv0(""), None);
-        assert_eq!(program_from_argv0("///"), None);
-        assert_eq!(
-            program_from_argv0(&"a".repeat(100)).map(|s| s.len()),
-            Some(32)
+        assert_eq!(p(""), None);
+        assert_eq!(p("///"), None);
+        assert_eq!(p(&"a".repeat(100)).map(|s| s.len()), Some(32));
+    }
+
+    /// PRIV4-1, A REWRITTEN TITLE NAMES ITS PROGRAM BY ITS FIRST WORD: an `argv[0]` a process
+    /// rewrote (setproctitle's `postgres: …` and `nginx: …`, npm's `npm run <script>`, perl's
+    /// `$0`) never carries a word after its first into the name, whatever blank or control
+    /// character divides them; a title with no first word reads the kernel's name for the exec.
+    /// A path with a blank is read whole only where the kernel vouches for it: its file is the
+    /// mapped image's by device and inode, or its name is one the kernel keeps for the exec (a
+    /// store `claude` under `Application Support` whose file an update replaced; a Linux binary
+    /// a package upgrade replaced, whose `/proc/<pid>/exe` name ends ` (deleted)`). A first word
+    /// that is a path cut at a blank names the program only where it is a program file or a
+    /// name the kernel keeps; else the kernel's name stands, never a directory's word
+    /// (`/opt/QZ… Tools/qztool` cut to `/opt/QZ…`). One word (`exec -a NAME`) still names the
+    /// program as H6 ruled. NEGATIVE CONTROLS (scratch): reading every `argv[0]` as one path (the
+    /// filter alone, as before) fails the first row with `qztQZP7W1QZP7W2`; taking a cut path's
+    /// file name unvouched (the rule before the review) fails the `QZP7W16`-`QZP7W19` rows with
+    /// their directory words; keeping Linux's ` (deleted)` mark fails the `QZP7W16` row with
+    /// `qztooldeleted`.
+    #[test]
+    fn a_rewritten_title_names_its_program_by_its_first_word_only() {
+        let perl = Mapped {
+            file: Some("/usr/bin/perl"),
+            names: &["perl"],
+            programs: &["/opt/x/qzt"],
+        };
+        let app = "/Applications/Q Z.app/Contents/MacOS/qzapp";
+        let replaced = Mapped {
+            file: None,
+            names: &["qztool (deleted)"],
+            programs: &[],
+        };
+        let rows: [(&str, &Mapped, Option<&str>); 19] = [
+            ("qzt QZP7W1 QZP7W2", &perl, Some("qzt")),
+            (
+                "postgres: jsmith orders 10.0.0.5(5432) QZP7W3",
+                &perl,
+                Some("postgres"),
+            ),
+            (
+                "nginx: master process /usr/local/bin/nginx -c /u/jsmith/QZP7W4/site.conf",
+                &perl,
+                Some("nginx"),
+            ),
+            ("npm run QZP7W5", &perl, Some("npm")),
+            ("/opt/x/qzt -c /u/jsmith/QZP7W6.conf", &perl, Some("qzt")),
+            ("qzt\u{a0}QZP7W7", &perl, Some("qzt")),
+            ("qzt\tQZP7W8", &perl, Some("qzt")),
+            ("qzt\u{1b}]0;QZP7W9\u{7}", &perl, Some("qzt")),
+            (" QZP7W10", &perl, Some("perl")),
+            (": QZP7W11", &perl, Some("perl")),
+            (": QZP7W12", &NO_IMAGE, None),
+            (
+                app,
+                &Mapped {
+                    file: Some(app),
+                    names: &["qzreal"],
+                    programs: &[],
+                },
+                Some("qzapp"),
+            ),
+            (
+                app,
+                &Mapped {
+                    file: None,
+                    names: &["qzapp"],
+                    programs: &[],
+                },
+                Some("qzapp"),
+            ),
+            (app, &perl, Some("perl")),
+            ("qzname", &perl, Some("qzname")),
+            ("/opt/QZP7W16 Tools/qztool", &replaced, Some("qztool")),
+            ("/opt/QZP7W17 Tools/qztool", &NO_IMAGE, None),
+            ("/opt/QZP7W18 Tools/qztool", &perl, Some("perl")),
+            ("./QZP7W19 d/qzt x", &perl, Some("perl")),
+        ];
+        let wrong: Vec<String> = rows
+            .iter()
+            .filter_map(|(argv0, image, want)| {
+                let got = program_from_argv0(argv0, *image);
+                (got.as_deref() != *want).then(|| format!("{argv0:?}: {got:?}, want {want:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        assert!(
+            rows.iter()
+                .filter_map(|(argv0, image, _)| program_from_argv0(argv0, *image))
+                .all(|name| !name.contains("QZP7W")),
+            "no word after a title's first is named"
         );
     }
 
@@ -1354,10 +1655,118 @@ mod tests {
         assert_eq!(named.as_deref(), Some("claude"));
     }
 
+    /// PRIV4-1 LIVE: a real perl that set its `$0` to a title (setproctitle's shape) is named by
+    /// the title's first word, never the words after it, by [`program_of`], by
+    /// [`leader_facts`] (the leader read `status program=` and the log's `prog=` come from) and
+    /// by [`program_of_names_only`] (the thread that draws); a real process run through a path
+    /// with a blank, whose file is its image by device and inode, is named whole, and read with
+    /// no stat it is named by the kernel's name for its image (`sleep`: macOS's `p_name` is the
+    /// link's target's name too, so nothing vouches for the whole), never by the directory's
+    /// word. NEGATIVE CONTROLS (scratch): reading every `argv[0]` as one path fails the perl
+    /// assertions with `qztQZP7W13QZP7W14`; cutting every title at its first blank fails the
+    /// `read whole` assertion with `q`; taking a cut path's file name unvouched fails the last
+    /// with `q`.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_title_is_named_by_its_first_word_and_its_image_path_whole() {
+        let Some(perl) = ["/usr/bin/perl", "/bin/perl"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+        else {
+            aterm_spec::host::could_not_run("no perl here for the `$0` half".to_owned());
+        };
+        let mut child = quiet_child(
+            aterm_uds::spawnfd::command(perl).args(["-e", "$0 = 'qzt QZP7W13 QZP7W14'; sleep 30"]),
+        )
+        .spawn()
+        .expect("spawn perl");
+        let pid = i32::try_from(child.id()).expect("pid");
+        let head = settled_argv_head(pid, |a0, _| a0.starts_with("qzt "));
+        let named = program_of(pid);
+        let leader = leader_facts(pid, 0).program;
+        let drawn = program_of_names_only(pid);
+        kill_group(&mut child);
+        assert!(
+            head.is_some_and(|(a0, _)| a0.starts_with("qzt ")),
+            "perl's title never settled"
+        );
+        assert_eq!(named.as_deref(), Some("qzt"), "program_of");
+        assert_eq!(leader.as_deref(), Some("qzt"), "leader_facts");
+        assert_eq!(drawn.as_deref(), Some("qzt"), "program_of_names_only");
+
+        let scratch = aterm_tempfile::tempdir().expect("a scratch dir");
+        let dir = scratch.path().join("q z");
+        std::fs::create_dir(&dir).expect("mkdir");
+        let link = dir.join("qzsleep");
+        std::os::unix::fs::symlink("/bin/sleep", &link).expect("link");
+        let spelled = link.to_string_lossy().into_owned();
+        let mut child = quiet_child(aterm_uds::spawnfd::command(&link).arg("30"))
+            .spawn()
+            .expect("spawn sleep by a path with a blank");
+        let pid = i32::try_from(child.id()).expect("pid");
+        let head = settled_argv_head(pid, |a0, a1| a0 == spelled && a1 == Some("30"));
+        let named = program_of(pid);
+        let drawn = program_of_names_only(pid);
+        kill_group(&mut child);
+        assert_eq!(
+            head.map(|(a0, _)| a0),
+            Some(spelled),
+            "the path never settled"
+        );
+        assert_eq!(named.as_deref(), Some("qzsleep"), "read whole");
+        if cfg!(target_vendor = "apple") {
+            assert_eq!(
+                drawn.as_deref(),
+                Some("sleep"),
+                "read with no stat: the kernel's name for the image, never the directory's word"
+            );
+        } else {
+            assert!(
+                drawn.as_deref().is_some_and(|d| d != "q"),
+                "read with no stat: the image's name, never the directory's word: {drawn:?}"
+            );
+        }
+    }
+
+    /// The thread that draws names a process from the process table alone
+    /// ([`LeaderImage::names_only`], [`program_of_names_only`]): it vouches for no path by a stat,
+    /// not even the very file the process maps, while [`LeaderImage::of`] (a reader's own
+    /// thread) does, and both read the names the kernel keeps. NEGATIVE CONTROL (scratch): a
+    /// names-only image that stats fails the second assertion.
+    #[cfg(unix)]
+    #[test]
+    fn the_drawing_thread_names_a_process_with_no_stat() {
+        let pid = i32::try_from(std::process::id()).expect("pid");
+        let exe = std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .expect("this test's executable");
+        let name = exe
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .expect("its file name");
+        let exe = exe.to_string_lossy().into_owned();
+        let statted = LeaderImage::of(pid);
+        let unstatted = LeaderImage::names_only(pid);
+        assert!(
+            statted.is_file(&exe) && statted.is_program(&exe),
+            "a reader's own thread stats the image's path"
+        );
+        assert!(
+            !unstatted.is_file(&exe) && !unstatted.is_program(&exe),
+            "the thread that draws stats nothing"
+        );
+        assert!(
+            statted.names().contains(&name) && unstatted.names().contains(&name),
+            "both read the kernel's names: {:?} {:?}",
+            statted.names(),
+            unstatted.names()
+        );
+    }
+
     #[test]
     fn a_shim_script_named_after_an_agent_is_that_agent() {
         let atpkg = |script: &str| script.contains("/pkg/agents/");
-        let p = |a0: &str, a1: Option<&str>| program_from_argv(a0, a1, &atpkg);
+        let p = |a0: &str, a1: Option<&str>| program_from_argv(a0, a1, &atpkg, &NO_IMAGE);
         let twin = "/Users//x/Library/Application Support/aterm/pkg/agents/claude";
         assert_eq!(p("/bin/sh", Some(twin)).as_deref(), Some("claude"));
         assert_eq!(
@@ -1369,13 +1778,20 @@ mod tests {
             assert_eq!(p("/bin/sh", Some(&shim)).as_deref(), Some(*agent));
         }
         assert_eq!(
-            p(
+            program_from_argv(
                 "/Users//x/Library/Application Support/aterm/pkg/store/claude/2026092201/bin/claude",
-                None
+                None,
+                &atpkg,
+                &Mapped {
+                    file: None,
+                    names: &["claude"],
+                    programs: &[],
+                },
             )
             .as_deref(),
             Some("claude"),
-            "the exec'd store claude, argv[0] as measured"
+            "the exec'd store claude, argv[0] as measured: a path with a blank, read whole \
+             where the kernel keeps its name"
         );
         assert_eq!(p("/bin/sh", Some("build.sh")).as_deref(), Some("sh"));
         assert_eq!(p("/bin/sh", Some("-c")).as_deref(), Some("sh"));
@@ -1492,6 +1908,7 @@ mod tests {
                 Some(&layout()),
                 &no_shim,
                 &holds,
+                &NO_IMAGE,
             )
         };
         let live = facts(
@@ -1543,7 +1960,15 @@ mod tests {
         assert_eq!(outside, PathVerdict::Frozen);
         let hidden = atpkg::caller_shell::parse_procargs2(&procargs2("/bin/zsh", &["-zsh"], &[]))
             .expect("argv only");
-        let shell_read = facts_from(&hidden, Some(1), 1916, Some(&layout()), &no_shim, &holds);
+        let shell_read = facts_from(
+            &hidden,
+            Some(1),
+            1916,
+            Some(&layout()),
+            &no_shim,
+            &holds,
+            &NO_IMAGE,
+        );
         assert_eq!(shell_read.path, None);
         assert_eq!(shell_read.copy, None, "zsh is no agent");
     }
@@ -1605,7 +2030,15 @@ mod tests {
                 ],
                 env: Vec::new(),
             };
-            facts_from(&args, None, 0, Some(&layout), shim_of, &|_| false)
+            facts_from(
+                &args,
+                None,
+                0,
+                Some(&layout),
+                shim_of,
+                &|_| false,
+                &NO_IMAGE,
+            )
         };
         let now = |script: &str| shim_in(script, &layout);
         let rerouted = facts(&stub, &now);
@@ -1654,7 +2087,15 @@ mod tests {
                 argv: argv.iter().map(|a| (*a).to_string()).collect(),
                 env: Vec::new(),
             };
-            facts_from(&args, None, 0, Some(&layout), &|_| None, &|_| false)
+            facts_from(
+                &args,
+                None,
+                0,
+                Some(&layout),
+                &|_| None,
+                &|_| false,
+                &NO_IMAGE,
+            )
         };
         let npm = facts(
             "/usr/local/bin/node",
@@ -1719,7 +2160,17 @@ mod tests {
         let fake = atpkg::store::Layout {
             prefix: std::path::PathBuf::from("/nonexistent"),
         };
-        let facts = |shell: i32| facts_from(&args, ppid, shell, Some(&fake), &|_| None, &|_| false);
+        let facts = |shell: i32| {
+            facts_from(
+                &args,
+                ppid,
+                shell,
+                Some(&fake),
+                &|_| None,
+                &|_| false,
+                &NO_IMAGE,
+            )
+        };
         assert_eq!(facts(parent).path, Some(PathVerdict::Live));
         assert_eq!(facts(parent + 1).path, None, "not this shell's child");
     }
@@ -1767,7 +2218,7 @@ mod tests {
                 argv: argv.iter().map(|s| (*s).to_string()).collect(),
                 env: env.iter().map(|s| (*s).to_string()).collect(),
             };
-            facts_from(&args, None, 0, None, &|_| None, &|_| false).no_harness
+            facts_from(&args, None, 0, None, &|_| None, &|_| false, &NO_IMAGE).no_harness
         };
         assert!(make(&["agy", "--no-harness"], &[]));
         assert!(make(&["agy", "--no-alab-harness"], &[]));
@@ -1813,7 +2264,15 @@ mod tests {
             argv: argv.iter().map(|s| (*s).to_string()).collect(),
             env: Vec::new(),
         };
-        facts_from(&args, Some(1916), 1916, None, &|_| None, &|_| false)
+        facts_from(
+            &args,
+            Some(1916),
+            1916,
+            None,
+            &|_| None,
+            &|_| false,
+            &NO_IMAGE,
+        )
     }
 
     /// A BUILD'S FRONT IS NAMED BY THE BUILD IT BECOMES, WAITING: the leader whose argv is a

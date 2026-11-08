@@ -736,17 +736,24 @@ fn the_switch_draws_its_mark_as_one_set_in_every_state() {
             .all(|r| drawn_marks(&app, wid, r).is_empty()),
         "control: no switch draws no mark"
     );
+    let faces = [BandIcon::Disc, BandIcon::Ring, BandIcon::DottedRing];
+    let on_rule = drawn_marks(&app, wid, rule);
     assert!(
-        drawn_marks(&app, wid, rule)
-            .iter()
-            .all(|i| i.icon == BandIcon::SlashedRing),
-        "control: the rule's chip alone, {:?}",
+        on_rule.iter().all(|i| !faces.contains(&i.icon)),
+        "control: the rule's chip and facts, no switch face: {on_rule:?} on {:?}",
         row_text(&app, wid, rule)
     );
 }
 
+/// Line D's marks, the chip's and the facts' (`◆`, `⌂`, `⎇`), are drawn as the switch's is: each
+/// the glass's icon over its own cell, whole strokes in the marks' ink where the font's thin
+/// glyph read faint on Day at 1x (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §4.1, §4.3,
+/// §7's "Day inks vivid"); Cruise's `∞` is no mark and keeps its glyph.
+/// NEGATIVE CONTROL: handing the icon painter only the rule's cells before the facts (the S7
+/// footer's `&r.painted[..facts_at]`) draws no mark under Cruise and only the chip's under Off
+/// and Land (run once, restored).
 #[test]
-fn the_chips_marks_are_drawn_as_the_switchs_are() {
+fn line_ds_marks_are_drawn_as_the_switchs_are() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
     let rule = footer_row(&app, wid);
     assert!(
@@ -754,47 +761,53 @@ fn the_chips_marks_are_drawn_as_the_switchs_are() {
         "the facts are on the rule: {:?}",
         row_text(&app, wid, rule)
     );
-    assert_eq!(
-        drawn_marks(&app, wid, rule),
-        [],
-        "control: Cruise's ∞ and the facts"
-    );
     let at = |app: &App, ch: char| {
         let cells = &app.windows[&wid].input_scratch.cells[rule];
         let col = cells.iter().position(|c| c.ch == ch);
         u16::try_from(col.unwrap_or_else(|| panic!("the rule keeps {ch:?}"))).expect("a column")
     };
+    let marks = |app: &App, chip: Option<BandIcon>| {
+        let mut want: Vec<ChromeIcon> = chip
+            .into_iter()
+            .chain([BandIcon::Diamond, BandIcon::House, BandIcon::Fork])
+            .map(|icon| ChromeIcon {
+                col: at(app, icon.ch()),
+                icon,
+            })
+            .collect();
+        want.sort_by_key(|i| i.col);
+        want
+    };
+    let drawn = |app: &App| {
+        let mut drawn = drawn_marks(app, wid, rule);
+        drawn.sort_by_key(|i| i.col);
+        drawn
+    };
+    assert_eq!(
+        drawn(&app),
+        marks(&app, None),
+        "Cruise: the facts' marks, and no icon for ∞"
+    );
     for (mode, icon) in [
         (Autopilot::Off, BandIcon::Ring),
         (Autopilot::Land, BandIcon::ToBar),
     ] {
         assert!(app.set_session_autopilot(session, Some(mode), crate::autopilot::Surface::Chip));
         frame(&mut app, wid);
-        let want = [ChromeIcon {
-            col: at(&app, icon.ch()),
-            icon,
-        }];
+        let want = marks(&app, Some(icon));
         assert_eq!(
-            drawn_marks(&app, wid, rule),
+            drawn(&app),
             want,
-            "{mode:?}: the chip's mark"
+            "{mode:?}: the chip's mark and the facts'"
         );
         frame(&mut app, wid);
-        assert_eq!(
-            drawn_marks(&app, wid, rule),
-            want,
-            "{mode:?}: painted again"
-        );
+        assert_eq!(drawn(&app), want, "{mode:?}: painted again");
         let (plan, route) = app.active_visible_frame_layout(wid).expect("a layout");
         for k in 0..3 {
             let (_, allocations) = crate::work_counts::allocations_in(|| {
                 app.splice_claude_footer(wid, &plan, route);
             });
-            assert_eq!(
-                drawn_marks(&app, wid, rule),
-                want,
-                "{mode:?}: spliced again"
-            );
+            assert_eq!(drawn(&app), want, "{mode:?}: spliced again");
             assert!(
                 k == 0 || allocations == 0,
                 "{mode:?}: splice {k} allocated {allocations}"
@@ -802,11 +815,7 @@ fn the_chips_marks_are_drawn_as_the_switchs_are() {
         }
         let ws = app.windows.get_mut(&wid).expect("window");
         crate::claude_card::strip(&mut ws.claude_card, &mut ws.input_scratch);
-        assert_eq!(
-            drawn_marks(&app, wid, rule),
-            [],
-            "{mode:?}: the strip takes it back"
-        );
+        assert_eq!(drawn(&app), [], "{mode:?}: the strip takes them back");
     }
     assert!(app.set_session_autopilot(
         session,
@@ -814,7 +823,7 @@ fn the_chips_marks_are_drawn_as_the_switchs_are() {
         crate::autopilot::Surface::Chip
     ));
     frame(&mut app, wid);
-    assert_eq!(drawn_marks(&app, wid, rule), [], "control: Cruise again");
+    assert_eq!(drawn(&app), marks(&app, None), "Cruise again");
 }
 
 #[test]
@@ -829,7 +838,7 @@ fn the_glass_draws_its_marks_by_the_character_alone() {
     };
     let cell = |ch: char| aterm_core::terminal::RenderCell { ch, ..blank };
     let mut cells: Vec<_> =
-        "\u{25cf}\u{25cb}\u{25d0}\u{25cc}\u{2298}\u{2913}\u{221e}\u{2713}\u{23f8}\u{b7}x"
+        "\u{25cf}\u{25cb}\u{25d0}\u{25cc}\u{2298}\u{2913}\u{2387}\u{2386}\u{221e}\u{2713}\u{23f8}\u{b7}x"
             .chars()
             .map(cell)
             .collect();
@@ -853,22 +862,26 @@ fn the_glass_draws_its_marks_by_the_character_alone() {
             icon(7, BandIcon::DottedRing),
             icon(8, BandIcon::SlashedRing),
             icon(9, BandIcon::ToBar),
+            icon(10, BandIcon::Fork),
+            icon(11, BandIcon::Enter),
         ]
     );
 }
 
+/// A refilled frame (the terminal's cells laid again, every chrome raster retired) draws its
+/// marks, line B's switch and line D's chip and facts, with no allocation: the icon lists the
+/// refill retired are the ones the footer fills again (`RenderInput::retire_chrome_rasters`,
+/// `RenderInput::chrome_icon_list`). NEGATIVE CONTROL: laying the cells with a plain
+/// `chrome_rasters.clear()` (aterm-core's `cell_frame_fill`) allocates one icon list per marked
+/// row on every refilled frame (run once, restored).
 #[test]
-fn a_refilled_frames_marks_allocate_only_their_lists() {
+fn a_refilled_frames_marks_allocate_nothing() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
     let refill = |app: &mut App| {
         app.capture_words(wid, Instant::now());
         app.splice_tab_strip(wid);
     };
-    for (mode, rows) in [
-        (Autopilot::Cruise, 1),
-        (Autopilot::Off, 2),
-        (Autopilot::Land, 2),
-    ] {
+    for mode in [Autopilot::Cruise, Autopilot::Off, Autopilot::Land] {
         assert!(app.set_session_autopilot(session, Some(mode), crate::autopilot::Surface::Chip));
         let (plan, route) = app.active_visible_frame_layout(wid).expect("a layout");
         refill(&mut app);
@@ -878,7 +891,7 @@ fn a_refilled_frames_marks_allocate_only_their_lists() {
         let marked = (0..app.windows[&wid].input_scratch.cells.len())
             .filter(|&r| !drawn_marks(&app, wid, r).is_empty())
             .count();
-        assert_eq!(marked, rows, "{mode:?}: the rows that draw a mark");
+        assert_eq!(marked, 2, "{mode:?}: lines B and D draw marks");
         assert!(
             composed > marked,
             "{mode:?}: control, the composing pass allocated {composed}"
@@ -888,9 +901,13 @@ fn a_refilled_frames_marks_allocate_only_their_lists() {
             let (_, allocations) = crate::work_counts::allocations_in(|| {
                 app.splice_claude_footer(wid, &plan, route);
             });
+            assert_eq!(allocations, 0, "{mode:?}: refilled frame {i}");
+            let again = (0..app.windows[&wid].input_scratch.cells.len())
+                .filter(|&r| !drawn_marks(&app, wid, r).is_empty())
+                .count();
             assert_eq!(
-                allocations, marked,
-                "{mode:?}: refilled frame {i}, {marked} marked rows"
+                again, marked,
+                "{mode:?}: refilled frame {i} draws its marks"
             );
         }
         let (_, again) = crate::work_counts::allocations_in(|| {
@@ -1641,19 +1658,22 @@ fn the_facts_words_read_on_a_tab_theme_of_its_own() {
         .copied()
         .expect("the branch's stub is on the glass");
     assert_eq!(branch.frame_row, at, "the stub is on the facts' row");
+    let hits = &app.windows[&wid].claude_lights.fact_hits;
+    let a_fact = |col: usize| {
+        hits.iter()
+            .any(|h| h.frame_row == at && (h.cols.0..h.cols.1).contains(&col))
+    };
     let words: Vec<_> = row
         .iter()
         .enumerate()
-        .filter(|(_, c)| {
-            c.ch != ' '
-                && !marks.contains(&c.ch)
-                && matches!(c.script, aterm_core::terminal::Script::Sub { .. })
-        })
+        .filter(|&(col, c)| c.ch != ' ' && !marks.contains(&c.ch) && a_fact(col))
         .collect();
     assert!(
-        words.iter().all(|(_, c)| c.bold),
-        "on the light paper every word at the values' weight, the stub quieter by its ink: \
-         {text:?}"
+        words
+            .iter()
+            .all(|(_, c)| { c.script == aterm_core::terminal::Script::Normal && !c.bold }),
+        "on the light paper every word is terminal text at one weight, the stub quieter by its \
+         ink: {text:?}"
     );
     let stub = |col: usize| (branch.cols.0..branch.cols.1).contains(&col);
     let values: Vec<f32> = words

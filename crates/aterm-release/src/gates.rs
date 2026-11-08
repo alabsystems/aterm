@@ -3528,12 +3528,11 @@ mod cut_lease_tests {
 
     /// The gate exports one close-on-exec copy and retains an adopted original description
     /// after the sender map disappears. Selecting another managed subject is the negative
-    /// control: its valid-looking environment leaf cannot redirect adoption.
+    /// control: its valid-looking environment leaf cannot redirect adoption, and the refused offer
+    /// is consumed rather than retained, so the toolchain is let go once the adopted lease drops.
     #[cfg(unix)]
     #[test]
     fn a_cut_lease_offer_adopts_only_for_its_independently_selected_toolchain() {
-        use std::os::fd::AsRawFd as _;
-
         let root = aterm_tempfile::tempdir().unwrap();
         let prefix = root.path().canonicalize().unwrap();
         let bin = prefix.join("store/trust/9192/bin");
@@ -3553,7 +3552,6 @@ mod cut_lease_tests {
         );
         let wrong_leaf = wrong.leaf;
         let wrong = inherited(wrong.descriptor);
-        let wrong_raw = wrong.as_raw_fd();
         let mut receiver = ToolchainLeases::new();
         // SAFETY: this exclusive inherited-form offer is intentionally paired with a different
         // independently selected subject. The adoption boundary consumes it on refusal.
@@ -3563,8 +3561,6 @@ mod cut_lease_tests {
                 .contains("selected toolchain subject")
         );
         assert!(receiver.is_empty());
-        // SAFETY: F_GETFD observes that the owned offer was consumed exactly once.
-        assert_eq!(unsafe { fcntl(wrong_raw, F_GETFD) }, -1);
 
         let offer = offer_cut_lease(&sender, &bin).unwrap().unwrap();
         let leaf = offer.leaf;
@@ -3582,6 +3578,8 @@ mod cut_lease_tests {
             "the adopted gate lease alone retains the toolchain"
         );
         drop(receiver);
+        // Nothing else holds the description: neither the refused offer nor the adopted one
+        // outlives its owner. (A descriptor number would not say so; any thread may reuse it.)
         assert_eq!(
             atpkg::lease::let_go_within(&path, aterm_spec::wait::MUST_HAPPEN),
             Ok(())

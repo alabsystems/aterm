@@ -29,10 +29,13 @@ impl Peer {
     /// Reads the connected peer identity of `stream`.
     pub(crate) fn of(stream: &aterm_uds::CtlStream) -> Self {
         let pid = aterm_uds::fdpass::peer_pid(stream).ok();
-        let program = pid
-            .and_then(|p| i32::try_from(p).ok())
-            .and_then(crate::session_status::program::argv_head_of)
-            .and_then(|(argv0, _)| crate::session_status::program::program_from_argv0(&argv0));
+        let program = pid.and_then(|p| i32::try_from(p).ok()).and_then(|pid| {
+            let (argv0, _) = crate::session_status::program::argv_head_of(pid)?;
+            crate::session_status::program::program_from_argv0(
+                &argv0,
+                &crate::session_status::program::LeaderImage::of(pid),
+            )
+        });
         Self { pid, program }
     }
 

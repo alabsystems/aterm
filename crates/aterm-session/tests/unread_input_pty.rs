@@ -97,7 +97,8 @@ fn unread_input_is_the_keys_the_program_has_not_read_and_the_backlog_reads_it() 
 /// A look reads every driven byte read only once none is on its way, spilled or queued: a key
 /// held before its fd lock is unread though the queue is empty, a queued one until the program
 /// reads it, and a reply moves no mark but is unread while queued. A canonical slave, whose queue
-/// does not count a partial line, is never read, and another sink's mark differs.
+/// does not count a partial line, is never read, and another sink's mark differs; a sink with no
+/// tty can never tell ([`aterm_session::sink::InputLook::known`]).
 #[test]
 fn an_input_look_is_read_once_its_program_has_read_every_driven_byte() {
     let (master, slave) = aterm_pty::open_pty_pair().expect("a pty");
@@ -122,6 +123,7 @@ fn an_input_look_is_read_once_its_program_has_read_every_driven_byte() {
     };
     let quiet = sink.input_look();
     assert!(quiet.read, "nothing driven");
+    assert!(quiet.known, "a pty's look can tell");
     assert_eq!(sink.input_look(), quiet, "a look moves nothing");
 
     let key = {
@@ -171,7 +173,66 @@ fn an_input_look_is_read_once_its_program_has_read_every_driven_byte() {
         other.mark, read.mark,
         "another sink's mark, after as much driven into it"
     );
-    assert!(!other.read, "a sink with no tty is never read");
+    assert!(
+        !other.read && !other.known,
+        "a sink with no tty is never read and cannot tell"
+    );
+    drop(sink);
+    // SAFETY: both fds are this test's own, closed once, no sink left over them.
+    unsafe {
+        libc::close(slave);
+        libc::close(master);
+    }
+}
+
+/// A key driven and read while a look is under way leaves that look unread: the look's counts
+/// and queue said nothing was waiting, but its mark cannot name the key, so a look that called
+/// itself read would hide input its program read since the look before it. The key is written
+/// and read at the seam after the look read the slave's queue and mode. Control: the next look
+/// is read, under the key's mark.
+#[test]
+fn a_key_driven_and_read_during_a_look_leaves_it_unread() {
+    let (master, slave) = aterm_pty::open_pty_pair().expect("a pty");
+    slave_mode(slave, false);
+    let sink = Arc::new(SinkWriter::new(master));
+    let (at_look, reached) = mpsc::channel();
+    let (done, finished) = mpsc::channel::<()>();
+    let finished = Mutex::new(finished);
+    let armed = Arc::new(AtomicBool::new(false));
+    {
+        let armed = Arc::clone(&armed);
+        sink.seam_for_testing(move |seam| {
+            if seam == Seam::InputLook && armed.swap(false, Ordering::SeqCst) {
+                let _ = at_look.send(());
+                let _ = finished.lock().map(|f| f.recv_timeout(MUST_HAPPEN));
+            }
+        });
+    }
+    let before = sink.input_look();
+    assert!(before.read, "nothing driven");
+    let program = {
+        let sink = Arc::clone(&sink);
+        std::thread::spawn(move || {
+            reached
+                .recv_timeout(MUST_HAPPEN)
+                .expect("the look reached its seam");
+            assert_eq!(sink.write_frame(b"k").expect("a key"), 1);
+            assert_eq!(read_byte(slave), b'k');
+            let _ = done.send(());
+        })
+    };
+    armed.store(true, Ordering::SeqCst);
+    let during = sink.input_look();
+    program.join().expect("the key's writer and reader");
+    assert_eq!(sink.unread_input(), Some(0), "the program read the key");
+    assert!(
+        !during.read,
+        "a look the key was driven and read under is unread"
+    );
+    let after = sink.input_look();
+    assert!(after.read, "control: the next look is read");
+    assert_ne!(after.mark, before.mark, "under the key's mark");
+    assert_eq!(after.mark, during.mark, "the look under way names the key");
     drop(sink);
     // SAFETY: both fds are this test's own, closed once, no sink left over them.
     unsafe {
@@ -181,9 +242,10 @@ fn an_input_look_is_read_once_its_program_has_read_every_driven_byte() {
 }
 
 /// Bytes the sink still holds in its spill keep the look unread though the slave's queue is
-/// empty: the program read every byte the kernel took while the drainer, parked before its next
-/// write, holds the rest. Control: once the drainer writes them and the program reads them, the
-/// look is read.
+/// empty: the program read every byte the kernel took while the drainer, parked waiting for the
+/// kernel's room with the spill's lock let go, holds the rest. The look reads the spill's length
+/// (the lock is free), not a lock it could not take. Control: once the drainer writes them and
+/// the program reads them, the look is read.
 #[test]
 fn a_byte_left_in_the_spill_keeps_the_look_unread() {
     const FRAME: usize = 4000;
@@ -206,24 +268,22 @@ fn a_byte_left_in_the_spill_keeps_the_look_unread() {
     {
         let armed = Arc::clone(&armed);
         sink.seam_for_testing(move |seam| {
-            if seam == Seam::DrainWrite && armed.swap(false, Ordering::SeqCst) {
+            if seam == Seam::DrainPark && armed.swap(false, Ordering::SeqCst) {
                 let _ = parked.send(());
                 let _ = gate.lock().map(|gate| gate.recv());
             }
         });
     }
+    armed.store(true, Ordering::SeqCst);
     assert_eq!(
         sink.write_frame_nonparking(&[b'p'; FRAME])
             .expect("a paste"),
         FRAME
     );
-    armed.store(true, Ordering::SeqCst);
-    // A byte read makes the kernel room the drainer wakes for.
-    assert_eq!(read_byte(slave), b'p');
     at_write
         .recv_timeout(MUST_HAPPEN)
-        .expect("the drainer reached its next write");
-    let mut read = 1;
+        .expect("the drainer parked for the kernel's room");
+    let mut read = 0;
     while let Some(n) = sink.unread_input().filter(|n| *n > 0) {
         for _ in 0..n {
             assert_eq!(read_byte(slave), b'p');
@@ -239,10 +299,14 @@ fn a_byte_left_in_the_spill_keeps_the_look_unread() {
         Some(0),
         "PRECONDITION: the queue is empty"
     );
-    assert!(
-        !sink.input_look().read,
-        "bytes left in the spill keep the look unread"
+    assert_eq!(
+        sink.try_egress_drained_to_kernel(),
+        Some(false),
+        "PRECONDITION: the spill holds bytes and its lock is free"
     );
+    let look = sink.input_look();
+    assert!(look.known, "PRECONDITION: a look that can tell");
+    assert!(!look.read, "bytes left in the spill keep the look unread");
     go.send(()).expect("the drainer goes on");
     while read < FRAME {
         assert_eq!(read_byte(slave), b'p');

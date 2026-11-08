@@ -1969,7 +1969,15 @@ mod tests {
         app.tab_strip_rows = 1;
         app.windows.get_mut(&wid).unwrap().a11y_active = true;
         crate::scripted_redraw_fixture::feed(&app, b"top row words");
+        // Twice: on Linux and Windows the strip is a band set in the UI face, and a face that
+        // lands while the first frame draws it asks one frame more and drops the frame's key
+        // (`rearm_for_strip_band_landing`).
         app.redraw_window(wid);
+        app.redraw_window(wid);
+        assert!(
+            app.windows[&wid].last_present.is_some(),
+            "PRECONDITION: the window holds the frame it presented"
+        );
         (app, wid)
     }
 

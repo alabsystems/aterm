@@ -16,7 +16,7 @@ fn stamp() -> WallStamp {
 }
 
 fn present(c: &MessageCenter, cols: usize) -> Presentation {
-    c.presentation(cols, &char_width, None, Links::Painted)
+    c.presentation(cols, &char_width, Links::Painted)
 }
 
 /// The rows that carry decision buttons: an ask with a Primary and a

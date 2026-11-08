@@ -81,9 +81,21 @@ const fn rail_px(cell_h: usize) -> usize {
     if r > 2 { r } else { 2 }
 }
 
-/// Row raster `r` on a frame whose column 0 starts `lo` window pixels in from the window's left edge (the leading remainder band, `cells_x − pad`) and which is `frame_w` pixels wide, for chrome row `row` whose band is `cell_h` pixels tall: the renderer's [`ChromeRaster`].
+/// Row raster `r` on a frame whose column 0 starts `lo` window pixels in from the window's left edge (the leading remainder band, `cells_x − pad`) and which is `frame_w` pixels wide, for chrome row `row` whose band is `cell_h` pixels tall: the renderer's [`ChromeRaster`], its icons laid in `icons`, emptied first ([`compose_band`] passes one the frame's last refill retired, [`RenderInput::chrome_icon_list`]).
 #[must_use]
-pub fn on_frame(r: &RowRaster, row: u16, lo: usize, frame_w: usize, cell_h: usize) -> ChromeRaster {
+pub fn on_frame(
+    r: &RowRaster,
+    row: u16,
+    lo: usize,
+    frame_w: usize,
+    cell_h: usize,
+    mut icons: Vec<ChromeIcon>,
+) -> ChromeRaster {
+    icons.clear();
+    icons.extend(r.icons.iter().map(|&(col, icon)| ChromeIcon {
+        col,
+        icon: band_icon(icon),
+    }));
     let pack = |c: [u8; 3]| (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
     let at = |v: &[[u8; 3]], x: usize| v[(x + lo).min(v.len().saturating_sub(1))];
     let ground: std::sync::Arc<[u32]> = if r.ground.is_empty() {
@@ -121,14 +133,7 @@ pub fn on_frame(r: &RowRaster, row: u16, lo: usize, frame_w: usize, cell_h: usiz
                 seam: None,
             })
             .collect(),
-        icons: r
-            .icons
-            .iter()
-            .map(|&(col, icon)| ChromeIcon {
-                col,
-                icon: band_icon(icon),
-            })
-            .collect(),
+        icons,
         split: r.split.and_then(|(col, x, ink, bg)| {
             Some(InkSplit {
                 col,
@@ -415,7 +420,7 @@ pub struct BandFrame {
     pub room: Option<(usize, usize)>,
 }
 
-/// Splice the band onto the just-composed frame `dst`, above the grid ([`RenderInput::prepend_host_rows`]): the painted `rows` and `rasters` trimmed or padded to the `committed` count, each raster placed ([`on_frame`]), the stack sealed ([`seal_stack`]), the seams drawn as rails where the stack allows it ([`seam_can_rail`]), and each outlined capsule floored ([`floor_rings`]).
+/// Splice the band onto the just-composed frame `dst`, above the grid ([`RenderInput::prepend_host_rows`]): the painted `rows` and `rasters` trimmed or padded to the `committed` count, the rasters `dst` held retired ([`RenderInput::retire_chrome_rasters`]), each new raster placed ([`on_frame`]) with its icons in a list a retirement kept ([`RenderInput::chrome_icon_list`]), the stack sealed ([`seal_stack`]), the seams drawn as rails where the stack allows it ([`seam_can_rail`]), and each outlined capsule floored ([`floor_rings`]).
 #[allow(
     clippy::too_many_arguments,
     reason = "the one compose both hosts call: every input is a plain value of the frame it composes"
@@ -449,7 +454,7 @@ pub fn compose_band(
         rows
     };
     let composed = rows.len();
-    dst.chrome_rasters.clear();
+    dst.retire_chrome_rasters();
     dst.prepend_host_rows(
         composed,
         rows.iter().map(Vec::as_slice),
@@ -462,8 +467,15 @@ pub fn compose_band(
         if let Some(r) = raster
             && let Ok(row) = u16::try_from(i)
         {
+            // A badge row's icons take a list the refill retired, as the host's marks' do, so
+            // every retired list is taken back and each raster gets its own again.
+            let icons = if r.icons.is_empty() {
+                Vec::new()
+            } else {
+                dst.chrome_icon_list()
+            };
             dst.chrome_rasters
-                .push(on_frame(r, row, at.lo, at.frame_w, at.cell_h));
+                .push(on_frame(r, row, at.lo, at.frame_w, at.cell_h, icons));
         }
     }
     seal_stack(&mut dst.cells[..composed], inks, forced);
@@ -642,6 +654,143 @@ mod tests {
             f.cells[0][0].underline_color,
             Some(c.label),
             "under a forced palette the divider is the seam's own ink"
+        );
+    }
+
+    /// A badge row's icons are laid in a list the frame's last refill retired, as the host's
+    /// marks' are (`RenderInput::chrome_icon_list`), so with one or two badge rows up every
+    /// list circulates. In the baseline native host's order, without Find or Build adornments
+    /// (the terminal's cells laid again, the band composed, then line D's five marks and line B's
+    /// one, each row taking a list as `WindowCards::paint_icon` does), every refilled frame's icon
+    /// lists, the badges' and the marks', are the ones the frame before retired, no mark outgrows
+    /// the list it took, and the spares stay within the pane's rows, for more refills than the pane
+    /// has rows.
+    /// NEGATIVE CONTROL: collecting a badge row's icons into a new list (`on_frame` before it
+    /// took one) hands line D a badge's one-slot list, which its marks outgrow on every refilled
+    /// frame (run once, restored).
+    #[test]
+    fn a_badge_rows_icon_lists_circulate_with_the_marks() {
+        use aterm_core::terminal::Terminal;
+        let c = inks();
+        let (pane, cols) = (6u16, 4u16);
+        let (rows_n, cols_n) = (usize::from(pane), usize::from(cols));
+        let at = BandFrame {
+            cols: cols_n,
+            cell_w: 8,
+            cell_h: 16,
+            pad: 2,
+            lo: 0,
+            frame_w: 36,
+            grid_top: 0,
+            room: None,
+        };
+        for badges in [1usize, 2] {
+            let rows = vec![vec![cell('!', c.value, c.bar_bg, false, false); cols_n]; badges];
+            let badge = RowRaster {
+                icons: vec![(0, Icon::Warn)],
+                ..RowRaster::default()
+            };
+            let rasters = vec![Some(badge); badges];
+            let mut term = Terminal::new(pane, cols);
+            let mut f = RenderInput::empty();
+            let mut pool = Vec::new();
+            let mut retired: Vec<*const ChromeIcon> = Vec::new();
+            for refill in 0..3 * rows_n {
+                let at_refill = format!("{badges} badge row(s), refill {refill}");
+                term.cell_frame_into(&mut f, rows_n, cols_n);
+                assert!(
+                    f.chrome_icon_spares.len() <= rows_n,
+                    "{at_refill}: at most a list per row"
+                );
+                let n = compose_band(
+                    &mut f,
+                    &rows,
+                    &rasters,
+                    badges,
+                    &c,
+                    false,
+                    at,
+                    &mut pool,
+                    HostRowPixels::Placed,
+                );
+                assert_eq!(n, badges, "{at_refill}: the band is up");
+                for (line, row, marks) in [("D", f.rows - 2, 5u16), ("B", f.rows - 1, 1)] {
+                    let mut icons = f.chrome_icon_list();
+                    let taken = icons.as_ptr();
+                    if refill > 0 {
+                        assert!(
+                            icons.capacity() >= usize::from(marks),
+                            "{at_refill}: line {line}'s marks outgrow the list they took"
+                        );
+                    }
+                    icons.extend((0..marks).map(|col| ChromeIcon {
+                        col,
+                        icon: BandIcon::Diamond,
+                    }));
+                    assert!(
+                        refill == 0 || icons.as_ptr() == taken,
+                        "{at_refill}: line {line}'s list moved despite its capacity"
+                    );
+                    f.chrome_rasters.push(ChromeRaster {
+                        row: u16::try_from(row).expect("a frame row"),
+                        ground: std::sync::Arc::from(Vec::new()),
+                        rail: std::sync::Arc::from(Vec::new()),
+                        rail_h: 0,
+                        clear_rail: false,
+                        own: Vec::new(),
+                        split: None,
+                        rings: Vec::new(),
+                        icons,
+                    });
+                }
+                let mut held: Vec<*const ChromeIcon> = f
+                    .chrome_rasters
+                    .iter()
+                    .filter(|r| r.icons.capacity() > 0)
+                    .map(|r| r.icons.as_ptr())
+                    .collect();
+                held.sort_unstable();
+                assert_eq!(held.len(), badges + 2, "{at_refill}: every row's icons");
+                if refill > 0 {
+                    assert_eq!(
+                        held, retired,
+                        "{at_refill}: every icon list is one the refill retired"
+                    );
+                }
+                retired = held;
+            }
+        }
+    }
+
+    /// Band row `i` is chrome row `first + i`, each metered row carries its packed gutter tones,
+    /// and only the committed rows carry any.
+    #[test]
+    fn band_row_edges_place_each_metered_row_at_its_chrome_row() {
+        let edges = [
+            Some(([0x11, 0x22, 0x33], [0x44, 0x55, 0x66])),
+            None,
+            Some(([1, 2, 3], [4, 5, 6])),
+        ];
+        let got = band_row_edges(2, 3, &edges);
+        assert_eq!(
+            got[0],
+            Some(crate::ChromeRowEdges {
+                row: 2,
+                left: 0x0011_2233,
+                right: 0x0044_5566,
+            })
+        );
+        assert_eq!(got[1], None);
+        assert_eq!(
+            got[2].map(|e| (e.row, e.left, e.right)),
+            Some((4, 0x0001_0203, 0x0004_0506))
+        );
+        let trimmed = band_row_edges(0, 1, &edges);
+        assert_eq!(trimmed[0].map(|e| e.row), Some(0));
+        assert_eq!(
+            &trimmed[1..],
+            &[None, None],
+            "an uncommitted row is not on glass"
         );
     }
 }

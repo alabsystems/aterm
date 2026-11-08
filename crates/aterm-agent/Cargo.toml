@@ -20,9 +20,11 @@ workspace = true
 [features]
 # DEVELOPMENT SEAMS in an optimized build: this crate's `aterm_types::dev_seam!`
 # read (the live upgrade's settle, `ATERM_UPGRADE_QUIET_S`, which the live suite
-# shortens). A debug build compiles it anyway; the release cutter never enables
-# this (aterm's and aterm-gui's `dev-seams` forward here), so a shipped binary
-# settles the full `upgrade::QUIET_S`.
+# shortens) and `harness::quota_scenes`, the synthetic accounts the window's
+# private `harness-layouts` scene draws. A debug build compiles both anyway; the
+# release cutter never enables this (aterm's and aterm-gui's `dev-seams` forward
+# here), so a shipped binary settles the full `upgrade::QUIET_S` and holds no
+# synthetic account.
 dev-seams = []
 
 [dependencies]

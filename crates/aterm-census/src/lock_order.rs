@@ -70,8 +70,12 @@ pub const LOCK_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits 
         owner. `Self::name` uses the caller's enclosing impl; `Type::name`
         selects that impl when the corpus supplies it, including UFCS methods.
         Lexical fn/impl type parameters never prove a concrete owner. Unproved
-        aliases, module paths and generic forms keep the conservative by-name
-        fallback. This uses lexical type names, not compiler resolution;
+        aliases, reexports and generic forms keep the conservative by-name
+        fallback. A module path narrows only through actual declared file loads
+        (including #[path]) to a matching root free-function definition. A full
+        std/core/alloc path is outside this corpus only when its root is lexically
+        unshadowed and no caller/ancestor include can introduce a binding.
+        This uses lexical type names, not compiler resolution;
         same-named types can still merge. Across a namespace they do not merge
         — see NAMESPACE BOUNDARY ON THE HOP.
         Otherwise the callee is chosen BY NAME, so the shapes are limited: a free fn and
@@ -618,9 +622,10 @@ pub(crate) fn mask_literals(line: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| line.to_string())
 }
 
-/// Blank out `#[cfg(test)]`-gated items so the census graphs only the shipped lock discipline.
+/// Blank items whose complete cfg predicate is false with test disabled;
+/// other cfg atoms and uncertain item boundaries remain conservative.
 pub(crate) fn mask_cfg_test_items(text: &str) -> String {
-    mask_gated_items(text, &["#[cfg(test)]"])
+    mask_items_where(text, &crate::cfg_attr_never_ships)
 }
 
 /// The graph reads Rust code, not diagnostic strings or quoted source fixtures.
@@ -657,35 +662,74 @@ pub(crate) fn unmasked_lines(text: &str, is_gate: &dyn Fn(&str) -> bool) -> Vec<
     // attribute values in the text view for value-aware target predicates.
     let lexed = crate::lex::lex(text);
     let lines: Vec<&str> = lexed.code.lines().collect();
-    let attrs: Vec<&str> = lexed.text.lines().collect();
+    let attribute_spans = crate::lex::outer_attributes(text);
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(at, _)| at + 1))
+        .collect();
+    let attributes: BTreeMap<usize, (usize, &str, bool)> = attribute_spans
+        .iter()
+        .map(|&(start, end)| {
+            let first = line_starts.partition_point(|&at| at <= start) - 1;
+            let last = line_starts.partition_point(|&at| at <= end) - 1;
+            let tail = lexed.code[end..]
+                .lines()
+                .next()
+                .is_some_and(|line| !line.trim().is_empty());
+            (first, (last, &lexed.text[start..end], tail))
+        })
+        .collect();
     let carried = lines_opening_in_a_span(text, lines.len());
     let indent_of = |line: &str| line.len() - line.trim_start().len();
     let mut keep = vec![true; lines.len()];
     let mut i = 0;
     while i < lines.len() {
         let t = lines[i].trim_start();
-        if !t.starts_with("#[") || !is_gate(attrs[i].trim()) {
+        let Some(&(attr_end, attr, tail)) = attributes.get(&i) else {
+            i += 1;
+            continue;
+        };
+        if !t.starts_with("#[") || tail || !is_gate(attr.trim()) {
             i += 1;
             continue;
         }
         let indent = lines[i].len() - t.len();
-        keep[i] = false;
-        let mut j = i + 1;
-        while j < lines.len() && lines[j].trim_start().starts_with("#[") {
-            keep[j] = false;
-            j += 1;
+        let mut j = attr_end + 1;
+        let mut ambiguous_tail = false;
+        while let Some(&(end, _, tail)) = attributes.get(&j) {
+            if tail {
+                ambiguous_tail = true;
+                break;
+            }
+            j = end + 1;
         }
+        // This line-based mask cannot exclude one item while preserving another on
+        // the same line. Keep that spelling rather than hiding unrelated code.
+        if ambiguous_tail {
+            i = j + 1;
+            continue;
+        }
+        keep[i..j].fill(false);
         if j >= lines.len() {
             break;
         }
         let mut k = j;
         let mut opened = false;
         let mut terminated = false;
+        let mut ambiguous = false;
+        let mut item_delimiters = Vec::new();
         while k < lines.len() {
             let item = lines[k];
             if k > j && !carried[k] && !item.trim().is_empty() && indent_of(lines[k]) < indent {
                 k -= 1;
                 terminated = true;
+                break;
+            }
+            // A gated const/use can end before a different item's brace on this
+            // same line. Inspect the top-level terminator before treating any brace
+            // as belonging to the gated candidate.
+            if item_has_ambiguous_tail(item, &mut item_delimiters) {
+                keep[i..=k].fill(true);
+                ambiguous = true;
                 break;
             }
             keep[k] = false;
@@ -695,13 +739,18 @@ pub(crate) fn unmasked_lines(text: &str, is_gate: &dyn Fn(&str) -> bool) -> Vec<
                 break;
             }
             let s = item.trim_end();
-            if s.ends_with(';')
-                || (s.ends_with(',') && !carried[k] && indent_of(lines[k]) == indent)
+            if item_delimiters.is_empty()
+                && (s.ends_with(';')
+                    || (s.ends_with(',') && !carried[k] && indent_of(lines[k]) == indent))
             {
                 terminated = true;
                 break;
             }
             k += 1;
+        }
+        if ambiguous {
+            i = k + 1;
+            continue;
         }
         if !terminated {
             for slot in keep.iter_mut().take(lines.len()).skip(j) {
@@ -712,12 +761,15 @@ pub(crate) fn unmasked_lines(text: &str, is_gate: &dyn Fn(&str) -> bool) -> Vec<
         if opened {
             let first = lines[k];
             let single = first.matches('{').count() == first.matches('}').count();
-            if !single {
+            if single && !brace_item_ends_line(first) {
+                keep[i..=k].fill(true);
+            } else if !single {
                 let end = (k + 1..lines.len()).find(|m| {
                     let c = lines[*m];
                     c.as_bytes().get(indent) == Some(&b'}')
                         && c.as_bytes()[..indent].iter().all(|&b| b == b' ')
                         && !c.contains('{')
+                        && item_tail(&c[indent + 1..])
                 });
                 match end {
                     Some(end) => {
@@ -737,6 +789,67 @@ pub(crate) fn unmasked_lines(text: &str, is_gate: &dyn Fn(&str) -> bool) -> Vec<
         i = k + 1;
     }
     keep
+}
+
+/// A balanced brace item may share its line with another item; that is not an
+/// exclusion this line mask can represent.
+fn brace_item_ends_line(code: &str) -> bool {
+    let mut depth = 0usize;
+    let mut opened = false;
+    for (at, byte) in code.bytes().enumerate() {
+        match byte {
+            b'{' => {
+                opened = true;
+                depth += 1;
+            }
+            b'}' if opened => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return item_tail(&code[at + 1..]);
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// A closure/array call may close delimiters after its brace. No named call,
+/// operator or second item can be hidden by accepting only this punctuation.
+fn item_tail(tail: &str) -> bool {
+    let tail = tail.trim();
+    if tail.is_empty() {
+        return true;
+    }
+    let Some(body) = tail.strip_suffix(';').or_else(|| tail.strip_suffix(',')) else {
+        return false;
+    };
+    body.bytes()
+        .all(|byte| byte.is_ascii_whitespace() || matches!(byte, b')' | b']' | b'?'))
+}
+
+/// Array lengths/repetitions and nested expressions contain semicolons without
+/// ending the candidate. A top-level terminator followed by code is a different
+/// item/statement that this line-based mask must preserve.
+fn item_has_ambiguous_tail(code: &str, stack: &mut Vec<u8>) -> bool {
+    for (at, byte) in code.bytes().enumerate() {
+        match byte {
+            b'(' | b'[' | b'{' => stack.push(byte),
+            b')' | b']' | b'}' => {
+                let wanted = match byte {
+                    b')' => b'(',
+                    b']' => b'[',
+                    _ => b'{',
+                };
+                if stack.pop() != Some(wanted) {
+                    return true;
+                }
+            }
+            b';' if stack.is_empty() => return !code[at + 1..].trim().is_empty(),
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Per line of `text` (`count` of them, as [`str::lines`] splits it), whether the line opens inside
@@ -1433,10 +1546,275 @@ fn alias_target(line: &str, ctx: &SiteCtx<'_>) -> Option<String> {
 struct CallTarget {
     name: String,
     qualifier: Option<String>,
+    /// Every written path segment before the function, retaining the external root.
+    path: Vec<String>,
     /// Neither a qualified path nor a method call: module-local free functions may shadow.
     unqualified: bool,
     /// A lexical parameter can shadow `Key::f`, but not the explicit path `crate::Key::f`.
     bare_qualifier: bool,
+}
+
+/// A proven module target, an unshadowed language-library root, or no proof.
+enum ModuleResolution {
+    File(String),
+    External,
+    Unknown,
+}
+
+/// Only declarations read by the existing module loader establish module edges.
+struct ModulePaths {
+    sources: BTreeMap<String, String>,
+    edges: BTreeMap<(String, Vec<String>), BTreeSet<String>>,
+    parents: BTreeMap<String, BTreeSet<String>>,
+    spliced: BTreeSet<String>,
+    /// Pure lexical facts reused only within this immutable source snapshot.
+    shadow_facts: BTreeMap<(String, String, bool), bool>,
+}
+
+impl ModulePaths {
+    fn new(sources: &BTreeMap<String, String>) -> Self {
+        let mut edges: BTreeMap<(String, Vec<String>), BTreeSet<String>> = BTreeMap::new();
+        let mut parents: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut spliced = BTreeSet::new();
+        for (file, source) in sources {
+            let reader = crate::guards::SourceFile::new(file.clone(), source.clone());
+            for load in reader.loads() {
+                let Some(module) = &load.module else {
+                    spliced.insert(file.clone());
+                    continue;
+                };
+                if load.gated {
+                    continue;
+                }
+                let files: Vec<_> = load
+                    .files
+                    .iter()
+                    .filter(|path| sources.contains_key(*path))
+                    .collect();
+                if let [target] = files.as_slice() {
+                    edges
+                        .entry((file.clone(), module.clone()))
+                        .or_default()
+                        .insert((*target).clone());
+                    if module.len() == 1 {
+                        parents
+                            .entry((*target).clone())
+                            .or_default()
+                            .insert(file.clone());
+                    }
+                }
+            }
+        }
+        Self {
+            sources: sources.clone(),
+            edges,
+            parents,
+            spliced,
+            shadow_facts: BTreeMap::new(),
+        }
+    }
+
+    fn shadowed(&mut self, file: &str, root: &str, module: bool) -> bool {
+        let key = (file.to_owned(), root.to_owned(), module);
+        if let Some(&fact) = self.shadow_facts.get(&key) {
+            return fact;
+        }
+        let fact = self.sources.get(file).is_none_or(|source| {
+            if module {
+                module_root_shadowed(source, root)
+            } else {
+                root_may_be_shadowed(source, root)
+            }
+        });
+        self.shadow_facts.insert(key, fact);
+        fact
+    }
+
+    fn resolve(&mut self, caller: &FnLockFacts, target: &CallTarget) -> ModuleResolution {
+        let file = &caller.source_file;
+        let Some(first) = target.path.first() else {
+            return ModuleResolution::Unknown;
+        };
+        if caller.type_params.contains(first) {
+            return ModuleResolution::Unknown;
+        }
+        if matches!(first.as_str(), "std" | "core" | "alloc") && target.path.len() > 1 {
+            let mut scopes = BTreeSet::from([file.clone()]);
+            let mut pending = vec![file.clone()];
+            while let Some(scope) = pending.pop() {
+                if let Some(parents) = self.parents.get(&scope) {
+                    for parent in parents {
+                        if scopes.insert(parent.clone()) {
+                            pending.push(parent.clone());
+                        }
+                    }
+                }
+            }
+            let shadowed = scopes
+                .iter()
+                .any(|scope| self.shadowed(scope, first, false));
+            if !shadowed && scopes.iter().all(|scope| !self.spliced.contains(scope)) {
+                return ModuleResolution::External;
+            }
+        }
+        let Some(file) = &caller.module else {
+            return ModuleResolution::Unknown;
+        };
+        if !matches!(first.as_str(), "crate" | "self" | "super") && self.shadowed(file, first, true)
+        {
+            return ModuleResolution::Unknown;
+        }
+        let mut file = file.clone();
+        let mut path = target.path.as_slice();
+        match first.as_str() {
+            "crate" => {
+                let mut visited = BTreeSet::new();
+                while let Some(parents) = self.parents.get(&file) {
+                    if parents.len() != 1 || !visited.insert(file.clone()) {
+                        return ModuleResolution::Unknown;
+                    }
+                    file = parents.first().expect("one parent").clone();
+                }
+                if !file.ends_with("/lib.rs") && !file.ends_with("/main.rs") {
+                    return ModuleResolution::Unknown;
+                }
+                path = &path[1..];
+            }
+            "self" => path = &path[1..],
+            "super" => {
+                while path.first().is_some_and(|part| part == "super") {
+                    let Some(parents) = self.parents.get(&file) else {
+                        return ModuleResolution::Unknown;
+                    };
+                    if parents.len() != 1 {
+                        return ModuleResolution::Unknown;
+                    }
+                    file = parents.first().expect("one parent").clone();
+                    path = &path[1..];
+                }
+            }
+            _ => {}
+        }
+        while !path.is_empty() {
+            let found = (1..=path.len()).rev().find_map(|len| {
+                self.edges
+                    .get(&(file.clone(), path[..len].to_vec()))
+                    .filter(|files| files.len() == 1)
+                    .and_then(|files| files.first())
+                    .map(|file| (file.clone(), len))
+            });
+            let Some((next, len)) = found else {
+                return ModuleResolution::Unknown;
+            };
+            file = next;
+            path = &path[len..];
+        }
+        if self.spliced.contains(&file) {
+            ModuleResolution::Unknown
+        } else {
+            ModuleResolution::File(file)
+        }
+    }
+}
+
+/// Lexical uncertainty is not proof of an external root. In particular a glob may
+/// import a module with this name, and an alias or type parameter may shadow it.
+fn root_may_be_shadowed(source: &str, root: &str) -> bool {
+    let masked = lock_graph_code(source);
+    if masked.contains(&format!("r#{root}")) {
+        return true;
+    }
+    let code = masked.replace("r#", "");
+    let words: Vec<_> = code
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if words.windows(2).any(|pair| {
+        pair[1] == root
+            && matches!(
+                pair[0],
+                "mod" | "type" | "struct" | "enum" | "trait" | "union" | "as" | "crate"
+            )
+    }) {
+        return true;
+    }
+    for at in use_starts(&code) {
+        let import = code[at + 3..].split(';').next().unwrap_or_default();
+        if import.contains('*') {
+            return true;
+        }
+        let import = import
+            .trim()
+            .strip_prefix(&format!("{root}::"))
+            .unwrap_or(import.trim());
+        if import
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|word| word == root)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// A local import/type can shadow a same-named declared module. More than one
+/// lexical module declaration is not enough evidence to pick a scope.
+fn module_root_shadowed(source: &str, root: &str) -> bool {
+    let masked = lock_graph_code(source);
+    if masked.contains(&format!("r#{root}")) {
+        return true;
+    }
+    let code = masked.replace("r#", "");
+    let words: Vec<_> = code
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if words
+        .windows(2)
+        .filter(|pair| pair[0] == "mod" && pair[1] == root)
+        .count()
+        > 1
+    {
+        return true;
+    }
+    if words.windows(2).any(|pair| {
+        pair[1] == root
+            && matches!(
+                pair[0],
+                "type" | "struct" | "enum" | "trait" | "union" | "as" | "crate"
+            )
+    }) {
+        return true;
+    }
+    for at in use_starts(&code) {
+        let import = code[at + 3..].split(';').next().unwrap_or_default();
+        if import.contains('*') {
+            return true;
+        }
+        let import = import
+            .trim()
+            .strip_prefix(&format!("{root}::"))
+            .unwrap_or(import.trim());
+        if import
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|word| word == root)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Keyword boundaries allow whitespace or comments between `use` and its tree.
+fn use_starts(code: &str) -> Vec<usize> {
+    let ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    code.match_indices("use")
+        .filter_map(|(at, _)| {
+            let before = at.checked_sub(1).and_then(|at| code.as_bytes().get(at));
+            let after = code.as_bytes().get(at + 3);
+            (!before.is_some_and(|&b| ident(b)) && !after.is_some_and(|&b| ident(b))).then_some(at)
+        })
+        .collect()
 }
 
 /// A call the census will follow one hop: `(byte offset in the line, target)`.
@@ -1619,7 +1997,12 @@ fn held_call_targets(line: &str) -> (Vec<TrustedCall>, Vec<FieldRecvCall>) {
             .trim_end()
             .strip_suffix("::")
             .map(str::trim_end);
-        let qualifier = qualifier_path
+        let path = qualifier_path.and_then(ascii_qualified_segments);
+        // A non-ASCII candidate is unsupported as a whole. Retaining only its
+        // ASCII suffix could falsely prove either an external root or an impl.
+        let qualifier = path
+            .as_ref()
+            .and(qualifier_path)
             .and_then(|prefix| ident_ending_at(prefix, prefix.len()))
             .map(str::to_owned);
         let bare_qualifier =
@@ -1635,12 +2018,39 @@ fn held_call_targets(line: &str) -> (Vec<TrustedCall>, Vec<FieldRecvCall>) {
             CallTarget {
                 name: name.to_string(),
                 qualifier,
+                path: path.unwrap_or_default(),
                 unqualified: !line[..start].trim_end().ends_with(['.', ':']),
                 bare_qualifier,
             },
         ));
     }
     (out, field_recv)
+}
+
+/// Preserve the complete supported candidate, never a suffix after an unsupported
+/// Unicode identifier or whitespace-separated continuation. Character offsets keep
+/// every slice on a UTF-8 boundary; unsupported candidates retain by-name edges.
+fn ascii_qualified_segments(prefix: &str) -> Option<Vec<String>> {
+    let mut start = 0;
+    for (at, character) in prefix.char_indices().rev() {
+        if !character.is_ascii() || matches!(character, '#' | '$') {
+            return None;
+        }
+        if !(character.is_ascii_alphanumeric() || matches!(character, '_' | ':')) {
+            start = at + character.len_utf8();
+            break;
+        }
+    }
+    if prefix[..start].trim_end().ends_with("::") || prefix[start..].starts_with("::") {
+        return None;
+    }
+    Some(
+        prefix[start..]
+            .split("::")
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )
 }
 
 /// Everything the census learned about one fn.
@@ -1650,6 +2060,8 @@ struct FnLockFacts {
     span: String,
     /// The identity namespace of the crate defining this fn ([`WORKSPACE_NS`] for aterm crates).
     namespace: Option<&'static str>,
+    /// Source file even when the function's inline module cannot be resolved.
+    source_file: String,
     /// Proven file-level module; inline/unproved modules keep the by-name fallback.
     module: Option<String>,
     /// An actual free function, not a method or an unnameable impl's associated function.
@@ -1802,6 +2214,7 @@ fn scan_fn(
         name: name.to_string(),
         span: span.to_string(),
         namespace: file.namespace,
+        source_file: file.rel.to_owned(),
         module: module_root.then(|| file.rel.to_owned()),
         free_function: enclosing_impl.is_none() && module_root,
         impl_ty: file
@@ -2115,6 +2528,7 @@ const LOCKS: &str = "lock-order census";
 pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
     let mut log = String::new();
     let mut failures = 0usize;
+    let mut module_sources = BTreeMap::new();
     let _ = writeln!(
         log,
         "=== lock-order census (L0 deadlock, lock-graph sense) ===\n\
@@ -2161,6 +2575,7 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
                 continue;
             };
             let rel = crate::rel_path(root, &file);
+            module_sources.insert(rel.clone(), text.clone());
             let masked = lock_graph_code(&text);
             field_types.harvest(&masked);
             let impls = impl_spans(&masked);
@@ -2201,6 +2616,7 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
                     .any(|p| in_crate == *p || in_crate.starts_with(&format!("{p}/")))
             });
             let rel = crate::rel_path(root, &file);
+            module_sources.insert(rel.clone(), text.clone());
             let masked = lock_graph_code(&text);
             let impls = impl_spans(&masked);
             let root_lines = module_root_lines(&masked);
@@ -2269,6 +2685,7 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
                     CallTarget {
                         name: callee,
                         qualifier: None,
+                        path: Vec::new(),
                         unqualified: false,
                         bare_qualifier: false,
                     },
@@ -2288,6 +2705,7 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
         .flat_map(|f| f.binding_calls.iter().cloned())
         .collect();
 
+    let mut modules = ModulePaths::new(&module_sources);
     let mut by_name: BTreeMap<&str, BTreeMap<Option<&'static str>, Vec<usize>>> = BTreeMap::new();
     for (idx, f) in fns.iter().enumerate() {
         by_name
@@ -2436,6 +2854,10 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
                 });
         }
         for (hold, target, call_span) in &f.held_calls {
+            let resolution = modules.resolve(f, target);
+            if matches!(resolution, ModuleResolution::External) {
+                continue;
+            }
             let Some(per_ns) = by_name.get(target.name.as_str()) else {
                 continue;
             };
@@ -2452,14 +2874,33 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
                 });
             // Only narrow a by-name hop when the corpus supplies the named impl owner.
             // Aliases, module paths and other unproved forms keep the conservative fallback.
-            let owner = qualifier.filter(|owner| {
-                per_ns
+            let owner = qualifier
+                .filter(|_| {
+                    !target
+                        .path
+                        .first()
+                        .is_some_and(|root| matches!(root.as_str(), "std" | "core" | "alloc"))
+                })
+                .filter(|owner| {
+                    per_ns
+                        .values()
+                        .flatten()
+                        .any(|&g| fns[g].impl_ty.as_deref() == Some(*owner))
+                });
+            let defined_in_module = match &resolution {
+                ModuleResolution::File(module) => per_ns
                     .values()
                     .flatten()
-                    .any(|&g| fns[g].impl_ty.as_deref() == Some(*owner))
-            });
-            let compatible =
-                |g: usize| owner.is_none_or(|owner| fns[g].impl_ty.as_deref() == Some(owner));
+                    .any(|&g| fns[g].free_function && fns[g].module.as_ref() == Some(module)),
+                _ => false,
+            };
+            let compatible = |g: usize| match &resolution {
+                ModuleResolution::File(module) if defined_in_module => {
+                    fns[g].free_function && fns[g].module.as_ref() == Some(module)
+                }
+                ModuleResolution::File(_) => true,
+                _ => owner.is_none_or(|owner| fns[g].impl_ty.as_deref() == Some(owner)),
+            };
             let module_local = |g: usize| {
                 target.unqualified
                     && fns[g].free_function
@@ -3095,6 +3536,272 @@ mod tests {
             files.push((rel.to_string(), contents.to_string()));
         }
         run_lock_order_census(&synth_tree("aterm-lock-census", name, &files))
+    }
+
+    #[test]
+    fn qualified_module_hops_follow_actual_path_mounts_and_preserve_cycles() {
+        let caller = "#[path = \"worker.rs\"]\nmod child;\nfn first() {\n    let a = alpha.lock().unwrap();\n    child::take();\n}\nfn reverse() {\n    let b = beta.lock().unwrap();\n    alpha.lock();\n}\n";
+        let red = run_synth_files(
+            "qualified-path-cycle",
+            caller,
+            &[(
+                "crates/aterm-gui/src/worker.rs",
+                "fn take() {\n    beta.lock();\n}\n",
+            )],
+        );
+        assert!(red.log.contains("CYCLE"), "{}", red.log);
+        let green = run_synth_files(
+            "qualified-path-isolation",
+            &format!("{caller}fn take() {{\n    alpha.lock();\n}}\n"),
+            &[("crates/aterm-gui/src/worker.rs", "fn take() {}\n")],
+        );
+        assert!(green.ok, "{}", green.log);
+        let reexport_caller = format!("#[path = \"other.rs\"]\nmod other;\n{caller}");
+        let reexport = run_synth_files(
+            "qualified-reexport-cycle",
+            &reexport_caller,
+            &[
+                (
+                    "crates/aterm-gui/src/worker.rs",
+                    "pub use super::other::take;\n",
+                ),
+                (
+                    "crates/aterm-gui/src/other.rs",
+                    "pub fn take() {\n    beta.lock();\n}\n",
+                ),
+            ],
+        );
+        assert!(reexport.log.contains("CYCLE"), "{}", reexport.log);
+        let shadow = run_synth_files(
+            "qualified-path-alias-shadow",
+            &format!(
+                "{}fn take() {{\n    alpha.lock();\n}}\n",
+                caller.replace(
+                    "    child::take();",
+                    "    use unknown as child;\n    child::take();"
+                )
+            ),
+            &[("crates/aterm-gui/src/worker.rs", "fn take() {}\n")],
+        );
+        assert!(!shadow.ok, "{}", shadow.log);
+    }
+
+    #[test]
+    fn unresolved_qualified_and_bare_calls_keep_conservative_edges() {
+        for (name, prelude, call) in [
+            ("alias", "use unknown as alias;", "alias::take()"),
+            ("ufcs", "", "<Thing as Trait>::take()"),
+            ("bare", "", "take()"),
+            ("generic", "", "T::take()"),
+        ] {
+            let generic = if name == "generic" { "<T>" } else { "" };
+            let text = format!(
+                "{prelude}\nfn first{generic}() {{\n    let a = alpha.lock().unwrap();\n    {call};\n}}\nfn take() {{\n    beta.lock();\n}}\nfn reverse() {{\n    let b = beta.lock().unwrap();\n    alpha.lock();\n}}\n"
+            );
+            let out = run_synth(name, &text);
+            assert!(out.log.contains("CYCLE"), "{name}: {}", out.log);
+        }
+    }
+
+    #[test]
+    fn external_roots_need_absence_of_shadowing_and_unknown_globs() {
+        let body = "fn first() {\n    let a = alpha.lock().unwrap();\n    std::thread::sleep();\n}\nfn sleep() {\n    beta.lock();\n}\nfn reverse() {\n    let b = beta.lock().unwrap();\n    alpha.lock();\n}\n";
+        let green = run_synth("external-root", body);
+        assert!(green.ok, "{}", green.log);
+        let included = run_synth_files(
+            "external-include-shadow",
+            &format!("include!(\"bindings.rs\");\n{body}"),
+            &[(
+                "crates/aterm-gui/src/bindings.rs",
+                "mod std {\n    pub mod thread {\n        pub fn sleep() {\n            beta.lock();\n        }\n    }\n}\n",
+            )],
+        );
+        assert!(included.log.contains("CYCLE"), "{}", included.log);
+        let type_shadow = run_synth(
+            "external-type-shadow",
+            &body.replace("fn first()", "fn first<std>()"),
+        );
+        assert!(type_shadow.log.contains("CYCLE"), "{}", type_shadow.log);
+        let file_owner = body
+            .replace("std::thread::sleep()", "std::fs::File::open()")
+            .replace(
+                "fn sleep() {\n    beta.lock();\n}",
+                "impl File {\n    fn open() {\n        beta.lock();\n    }\n}",
+            );
+        let external_file = run_synth("external-file-owner", &file_owner);
+        assert!(external_file.ok, "{}", external_file.log);
+        for (name, prefix) in [
+            ("module-shadow", "mod std {}"),
+            ("raw-module-shadow", "mod r#std {}"),
+            ("raw-type-shadow", "type r#std = Local;"),
+            ("alias-shadow", "use other as std;"),
+            ("glob-shadow", "use other::*;"),
+            ("multiline-glob", "use\n other::{*};"),
+        ] {
+            let out = run_synth(name, &format!("{prefix}\n{body}"));
+            assert!(out.log.contains("CYCLE"), "{name}: {}", out.log);
+        }
+    }
+
+    #[test]
+    fn unsupported_unicode_qualifiers_never_panic_or_prove_an_ascii_suffix() {
+        for path in ["éstd::thread::take", "module::éKey::take"] {
+            let source = format!(
+                "fn first() {{\n    let a = alpha.lock().unwrap();\n    {path}();\n}}\nstruct Key;\nimpl Key {{\n    fn take() {{}}\n}}\nfn take() {{\n    beta.lock();\n}}\nfn reverse() {{\n    let b = beta.lock().unwrap();\n    alpha.lock();\n}}\n"
+            );
+            let out = run_synth("unicode-qualified-hop", &source);
+            assert!(out.log.contains("CYCLE"), "{path}: {}", out.log);
+            let (calls, _) = held_call_targets(&format!("{path}();"));
+            assert_eq!(calls.len(), 1);
+            assert!(calls[0].1.path.is_empty());
+            assert!(calls[0].1.qualifier.is_none());
+        }
+    }
+
+    #[test]
+    fn whitespace_qualified_paths_never_prove_a_discarded_external_suffix() {
+        qualified_suffix_cycles(&[
+            "other :: std::thread::take",
+            "other:: std::thread::take",
+            "other ::std::thread::take",
+            "other\t::\tstd::thread::take",
+            "other::std ::thread::take",
+        ]);
+    }
+
+    #[test]
+    fn raw_qualified_paths_never_prove_a_discarded_impl_owner() {
+        qualified_suffix_cycles(&["other::r#Key::take", "other::r#std::thread::take"]);
+    }
+
+    #[test]
+    fn macro_metavariable_roots_never_prove_external_paths() {
+        macro_metavariable_cycle(
+            "std",
+            "$std::thread::take",
+            "pub mod thread {\n    pub fn take() {\n        beta.lock();\n    }\n}\n",
+        );
+    }
+
+    #[test]
+    fn macro_metavariable_owners_never_prove_an_ascii_impl() {
+        macro_metavariable_cycle(
+            "Key",
+            "$Key::take",
+            "pub fn take() {\n    beta.lock();\n}\n",
+        );
+    }
+
+    fn macro_metavariable_cycle(parameter: &str, path: &str, other: &str) {
+        let source = format!(
+            "mod other;\nstruct Key;\nimpl Key {{\n    fn take() {{}}\n}}\nfn first() {{\n    let a = alpha.lock().unwrap();\n    macro_rules! go {{\n        (${parameter}:ident) => {{\n            {path}();\n        }};\n    }}\n    go!(other);\n}}\nfn reverse() {{\n    let b = beta.lock().unwrap();\n    alpha.lock();\n}}\n"
+        );
+        let out = run_synth_files(
+            "macro-qualified-hop",
+            &source,
+            &[("crates/aterm-gui/src/other.rs", other)],
+        );
+        assert!(out.log.contains("CYCLE"), "{path}: {}", out.log);
+        let (calls, _) = held_call_targets(&format!("{path}();"));
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].1.path.is_empty(), "{path}");
+        assert!(calls[0].1.qualifier.is_none(), "{path}");
+    }
+
+    fn qualified_suffix_cycles(paths: &[&str]) {
+        for path in paths {
+            let source = format!(
+                "mod other;\nstruct Key;\nimpl Key {{\n    fn take() {{}}\n}}\nfn first() {{\n    let a = alpha.lock().unwrap();\n    {path}();\n}}\nfn reverse() {{\n    let b = beta.lock().unwrap();\n    alpha.lock();\n}}\n"
+            );
+            let out = run_synth_files(
+                "whitespace-qualified-hop",
+                &source,
+                &[(
+                    "crates/aterm-gui/src/other.rs",
+                    "pub mod std {\n    pub mod thread {\n        pub fn take() {\n            beta.lock();\n        }\n    }\n}\npub mod r#Key {\n    pub fn take() {\n        beta.lock();\n    }\n}\n",
+                )],
+            );
+            assert!(out.log.contains("CYCLE"), "{path}: {}", out.log);
+            let (calls, _) = held_call_targets(&format!("{path}();"));
+            assert_eq!(calls.len(), 1);
+            assert!(calls[0].1.path.is_empty(), "{path}");
+            assert!(calls[0].1.qualifier.is_none(), "{path}");
+        }
+    }
+
+    #[test]
+    fn strict_test_cfg_masks_only_complete_provably_false_items() {
+        for attr in [
+            "#[cfg(all(test, unix))]",
+            "#[cfg(\n all(test,\n unix)\n)]",
+            "#[cfg(not(not(test)))]",
+        ] {
+            let source = format!(
+                "{attr}\nmod hidden {{\n    fn cycle() {{\n        let a = alpha.lock().unwrap();\n        alpha.lock();\n    }}\n}}\nfn visible() {{\n    beta.lock();\n}}\n"
+            );
+            let masked = lock_graph_code(&source);
+            assert!(!masked.contains("fn cycle"), "{attr}: {masked}");
+            assert!(masked.contains("fn visible"));
+        }
+        for attr in [
+            "#[cfg(any(test, debug_assertions))]",
+            "#[cfg(any(test, feature = \"x\"))]",
+            "#[cfg(not(test))]",
+            "#[cfg(all(test, bogus(,)))]",
+            "#[cfg(all(test, unix)) trailing)]",
+        ] {
+            let source = format!("{attr}\nfn visible() {{\n    beta.lock();\n}}\n");
+            assert!(lock_graph_code(&source).contains("fn visible"), "{attr}");
+        }
+        let cycle = "mod gated {\n    fn cycle() {\n        let a = alpha.lock().unwrap();\n        alpha.lock();\n    }\n}\nfn visible() {\n    beta.lock();\n}\n";
+        let absent = run_synth(
+            "false-cfg-cycle",
+            &format!("#[cfg(\n all(test, unix)\n)]\n{cycle}"),
+        );
+        assert!(absent.ok, "{}", absent.log);
+        let retained = run_synth(
+            "unknown-cfg-cycle",
+            &format!("#[cfg(any(test, debug_assertions))]\n{cycle}"),
+        );
+        assert!(!retained.ok, "{}", retained.log);
+        let array_then_module = "#[cfg(test)]\nconst KEY: [u8; 32] = [0; 32];\n#[cfg(test)]\nmod later {\n    fn hidden() { alpha.lock(); }\n}\nfn shipped() { beta.lock(); }\n";
+        let masked = lock_graph_code(array_then_module);
+        assert!(!masked.contains("const KEY"), "{masked}");
+        assert!(!masked.contains("fn hidden"), "{masked}");
+        assert!(masked.contains("fn shipped"), "{masked}");
+        let closure_then_module = "fn first() {\n    #[cfg(test)]\n    WAITER.with(|waiter| {\n        take(waiter);\n    });\n}\n#[cfg(test)]\nmod later {\n    fn hidden() { alpha.lock(); }\n}\nfn shipped() { beta.lock(); }\n";
+        let masked = lock_graph_code(closure_then_module);
+        assert!(!masked.contains("WAITER"), "{masked}");
+        assert!(!masked.contains("fn hidden"), "{masked}");
+        assert!(masked.contains("fn shipped"), "{masked}");
+        let multiline = "#[cfg(test)]\nfn hidden(\n    argument: usize,\n) {\n    alpha.lock();\n}\n#[cfg(test)]\nconst CALLED: usize = identity(\n    1,\n);\n#[cfg(test)]\nmod later {\n    fn hidden_too() { beta.lock(); }\n}\nfn shipped() { beta.lock(); }\n";
+        let masked = lock_graph_code(multiline);
+        assert!(!masked.contains("fn hidden"), "{masked}");
+        assert!(!masked.contains("const CALLED"), "{masked}");
+        assert!(masked.contains("fn shipped"), "{masked}");
+        let mixed_const = lock_graph_code(
+            "#[cfg(test)]\nconst HIDDEN: u8 = 0; fn shipped() { alpha.lock(); }\n#[cfg(test)]\nfn later() { beta.lock(); }\n",
+        );
+        assert!(mixed_const.contains("fn shipped"), "{mixed_const}");
+        assert!(!mixed_const.contains("fn later"), "{mixed_const}");
+        let mixed_then_module = "#[cfg(test)]\nfn hidden() {} fn shipped() { alpha.lock(); }\n#[cfg(test)]\nfn later() { beta.lock(); }\n";
+        let masked = lock_graph_code(mixed_then_module);
+        assert!(masked.contains("fn shipped"), "{masked}");
+        assert!(!masked.contains("fn later"), "{masked}");
+        let prefixed = "// λ padded   \r\nconst NOTE: &str = \"λ\";   \r\n#[cfg(\r\n all(test, unix)\r\n)]\r\nfn hidden() {\r\n    alpha.lock();\r\n}\r\nfn visible() {\r\n    beta.lock();\r\n}\r\n";
+        let masked = lock_graph_code(prefixed);
+        assert!(!masked.contains("fn hidden"), "{masked}");
+        assert!(masked.contains("fn visible"), "{masked}");
+        let same_line = lock_graph_code(
+            "#[cfg(all(test, unix))] fn hidden() {}\nfn visible() {\n    beta.lock();\n}\n",
+        );
+        assert!(same_line.contains("fn hidden"));
+        assert!(same_line.contains("fn visible"));
+        let shared_line =
+            lock_graph_code("#[cfg(test)] fn hidden() {} fn shipped() { alpha.lock(); }\n");
+        assert!(shared_line.contains("fn shipped"));
+        let literal = "const SOURCE: &str = r#\"\n#[cfg(all(test, unix))]\nfn fake() {}\n\"#;\nfn visible() {\n    beta.lock();\n}\n";
+        assert!(lock_graph_code(literal).contains("fn visible"));
     }
 
     fn no_aliases() -> BTreeMap<String, (i32, String)> {

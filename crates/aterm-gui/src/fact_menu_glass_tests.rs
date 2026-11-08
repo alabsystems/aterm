@@ -644,8 +644,9 @@ fn card_and_its_marks(app: &App, wid: WindowId) -> (MenuRect, Vec<(usize, Chrome
 #[test]
 fn a_cards_marks_are_drawn_while_it_is_open_and_gone_once_it_closes() {
     use crate::fact_menu::FactMenuFacts;
-    let (mut app, wid, _session, _reader) = glass(true);
+    let (mut app, wid, session, _reader) = glass(true);
     let _host = host(&mut app);
+    name_the_account(&app, session, "main");
     menu_frame(&mut app, wid);
     let before = drawn_marks(&app, wid);
     let autopilot = |app: &mut App| {
@@ -669,13 +670,49 @@ fn a_cards_marks_are_drawn_while_it_is_open_and_gone_once_it_closes() {
         app.open_front_fact_menu(Fact::Path)
             .expect("the folder is on the glass");
     };
+    let account = |app: &mut App| {
+        use std::collections::BTreeSet;
+
+        use crate::fact_menu::{SessionWeek, account_menu_rows_from};
+        use aterm_agent::harness::accounts::{Cli, Roster, Row, State};
+
+        app.open_front_fact_menu(Fact::Account)
+            .expect("the account is on the glass");
+        let roster = Roster {
+            rows: vec![Row {
+                label: "main".into(),
+                ..Row::default()
+            }],
+        };
+        let enrolled = BTreeSet::from(["main".to_string()]);
+        let (accounts, pool_unpinned) = account_menu_rows_from(
+            &roster,
+            &State::default(),
+            &enrolled,
+            true,
+            Some("main"),
+            None,
+            SessionWeek::default(),
+            1_793_000_000,
+        );
+        let facts = FactMenuFacts {
+            title: "Accounts \u{b7} tab 1".into(),
+            room: 44,
+            cli: Some(Cli::Claude),
+            accounts,
+            pool_unpinned,
+            ..FactMenuFacts::default()
+        };
+        app.autopilot_menu.as_mut().expect("open").rows =
+            crate::fact_menu::rows(Fact::Account, &facts);
+    };
     type Case = (
         &'static str,
         fn(&mut App),
         &'static [BandIcon],
         &'static [char],
     );
-    let cases: [Case; 3] = [
+    let cases: [Case; 4] = [
         (
             "Autopilot",
             autopilot,
@@ -694,6 +731,7 @@ fn a_cards_marks_are_drawn_while_it_is_open_and_gone_once_it_closes() {
             &[BandIcon::House, BandIcon::Ring],
             &['+', '\u{29c9}'],
         ),
+        ("account", account, &[BandIcon::Enter], &['\u{22ef}']),
     ];
     for (what, open, want, plain) in cases {
         open(&mut app);
@@ -806,9 +844,13 @@ fn a_fact_card_is_named_in_its_words_never_its_glyphs() {
     );
 }
 
-/// A LINE'S SPOKEN WORDS (review 13): a mark or a meter's glyphs left out,
-/// a `·` or `—` between two parts a comma, the words between kept as they
-/// stand. CONTROL: a line of words alone is said as it reads.
+/// A LINE'S SPOKEN WORDS (review 13): a mark or a drawn glyph left out, a
+/// `·` or `—` between two parts a comma, the words between kept as they
+/// stand, and a lower bound's `≥` said `at least`, so a reader never hears
+/// an older reading's bound as an exact figure
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1). CONTROL: a line
+/// of words alone is said as it reads; trimming `≥` as a mark (the words
+/// before 2026-11-07) says the bound as `weekly 38% used`.
 #[test]
 fn a_lines_spoken_words_leave_its_glyphs_out() {
     use crate::autopilot_menu::spoken_words;
@@ -817,9 +859,11 @@ fn a_lines_spoken_words_leave_its_glyphs_out() {
             "\u{2386}  sol@example.test \u{b7} max 20x",
             "sol@example.test, max 20x",
         ),
+        ("   weekly \u{2265}38% used", "weekly at least 38% used"),
+        ("   weekly 38% used", "weekly 38% used"),
         (
-            "\u{25f7}  \u{25b0}\u{25b0}\u{25b1} 64% weekly",
-            "64% weekly",
+            "\u{2386} main   75%  Max 20x   \u{21ba} Sat 10:00",
+            "main 75% Max 20x Sat 10:00",
         ),
         (
             "No rotation accounts configured \u{2014} run aterm init",

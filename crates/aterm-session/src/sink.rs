@@ -45,6 +45,11 @@ pub struct InputLook {
     /// and the slave reads input byte by byte (not canonical), so the queue counts every byte
     /// its program can read. False wherever any of that is unknown.
     pub read: bool,
+    /// The slave's input queue and its mode could be read at all. False on a platform that
+    /// counts no unread input (Windows), for a sink with no tty, or where the kernel refused
+    /// either read; such a look is never `read`, and no look after it can tell sooner when the
+    /// program reads.
+    pub known: bool,
 }
 
 /// Which sink an [`InputLook`] looked at and how much input had been driven into it: it moves at
@@ -64,6 +69,19 @@ impl InputLook {
         Self {
             mark: InputMark { sink, driven },
             read,
+            known: true,
+        }
+    }
+
+    /// A look that could not read the slave's queue or mode (not [`Self::known`]), after
+    /// `driven` driven writes into sink `sink`, for another crate's tests of what reads looks.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub const fn blind_for_testing(sink: u64, driven: u64) -> Self {
+        Self {
+            mark: InputMark { sink, driven },
+            read: false,
+            known: false,
         }
     }
 }
@@ -460,6 +478,7 @@ pub enum Seam {
     DiscardFlush,
     DrainWrite,
     FrameLock,
+    InputLook,
     WriterPark,
     DrainPark,
     SpillCapPark,
@@ -1265,25 +1284,32 @@ impl SinkWriter {
         DrivenInputWatch(Arc::clone(&self.driven_input))
     }
 
-    /// Whether this sink's program has read every byte driven into it, as of this look. Read
-    /// in this order, so that a write reserved before the count is read is either seen unplaced
-    /// or, once placed, seen in the spill or the queue until its program reads it: the placed
-    /// count, the driven count, the spill, then the slave's queue
-    /// ([`Self::unread_input`]) and its mode. A reply ([`Self::write_reply`]) moves no count,
-    /// but its bytes while unread make the look unread too.
+    /// Whether this sink's program has read every byte driven into it, as of this look. The
+    /// placed count is read first and the driven count last, so a write reserved at any point of
+    /// the look leaves the placed count short of the driven one and the look unread, even one
+    /// placed and read before the look ends. A write reserved before the look is either seen
+    /// unplaced or, once placed, seen in the spill (whose bytes count until the kernel takes
+    /// them) or the slave's queue ([`Self::unread_input`]) until its program reads it. The slave
+    /// must be raw: a canonical queue does not count a partial line. A reply
+    /// ([`Self::write_reply`]) moves no count, but its bytes while unread make the look unread too.
+    /// Whether the look could tell at all is [`InputLook::known`].
     #[must_use]
     pub fn input_look(&self) -> InputLook {
         let placed = self.driven_placed.load(Ordering::Acquire);
-        let driven = self.driven_input.load(Ordering::Acquire);
         let spilled = self.shared.try_spill_len();
         let queued = self.unread_input();
-        let raw = self.tty_echo().is_some_and(|echo| !echo.canonical);
+        let echo = self.tty_echo();
+        let raw = echo.is_some_and(|echo| !echo.canonical);
+        #[cfg(all(unix, any(test, debug_assertions)))]
+        self.shared.at_seam(Seam::InputLook);
+        let driven = self.driven_input.load(Ordering::Acquire);
         InputLook {
             mark: InputMark {
                 sink: self.serial,
                 driven,
             },
             read: placed == driven && spilled == Some(0) && queued == Some(0) && raw,
+            known: queued.is_some() && echo.is_some(),
         }
     }
 

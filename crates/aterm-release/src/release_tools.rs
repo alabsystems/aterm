@@ -13,7 +13,120 @@ pub const CUTTER_VERSION: &str = "aterm-release tool 1";
 pub const VERIFY_VERSION: &str = aterm_verify::FROZEN_TOOL_VERSION;
 pub const RECORD_ENV: &str = "ATERM_RELEASE_TOOL_RECORD";
 const RECORD: &str = "tool.toml";
+const CUTTER_RECORD: &str = "cutter.toml";
 const SCHEMA: u32 = 1;
+
+/// The launch proof needs only the cutter. The verifier is built while the frozen cutter's
+/// first steps run, then frozen in the complete tool set before qualification.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cutter {
+    schema: u32,
+    pub commit: String,
+    pub tool: Tool,
+}
+
+pub fn cutter_record_path(release: &Path) -> PathBuf {
+    release.join(CUTTER_RECORD)
+}
+
+impl Cutter {
+    fn validate(&self, release: &Path) -> Result<(), String> {
+        if self.schema != SCHEMA
+            || !aterm_codec::hex::is_lower(&self.commit, 40)
+            || !aterm_codec::hex::is_lower(&self.tool.sha256, 64)
+            || !release.is_absolute()
+            || self.tool.path
+                != release
+                    .join("tools")
+                    .join(&self.tool.sha256)
+                    .join("aterm-release")
+        {
+            return Err("invalid frozen cutter binding".into());
+        }
+        real_directory(&release.join("tools"), "frozen-tool root")?;
+        real_directory(
+            self.tool.path.parent().ok_or("no cutter directory")?,
+            "frozen cutter directory",
+        )?;
+        let metadata = std::fs::symlink_metadata(&self.tool.path).map_err(|e| e.to_string())?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || crate::dmg::sha256_file(&self.tool.path)? != self.tool.sha256
+        {
+            return Err("the frozen cutter's bytes differ from its proof".into());
+        }
+        Ok(())
+    }
+}
+
+/// Read the cutter proof and authenticate every binding and its executable bytes.
+///
+/// # Errors
+/// The proof cannot be read or decoded, its shape or bytes differ, or it names another commit.
+pub fn recorded_cutter(release: &Path, commit: &str) -> Result<Cutter, String> {
+    let text =
+        crate::durable::read_text(&cutter_record_path(release)).map_err(|e| e.to_string())?;
+    let cutter: Cutter = aterm_toml::from_str(&text).map_err(|e| e.to_string())?;
+    cutter.validate(release)?;
+    if cutter.commit != commit {
+        return Err("the cutter proof names another commit".into());
+    }
+    Ok(cutter)
+}
+
+/// Copy and prove a cutter without waiting for a verifier build. The caller checks clean R
+/// before this call and again before publishing the proof.
+///
+/// # Errors
+/// The root or commit is invalid, storage or copying fails, a directory or source is a
+/// symlink, the copied bytes differ, or the exact successful first exec cannot be proved.
+pub fn stage_cutter(release: &Path, commit: &str, source: &Path) -> Result<Cutter, String> {
+    let digest = crate::dmg::sha256_file(source)?;
+    let root = release.join("tools");
+    let dir = root.join(&digest);
+    if !release.is_absolute() || !aterm_codec::hex::is_lower(commit, 40) {
+        return Err("the cutter needs an absolute release root and full commit".into());
+    }
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    real_directory(&root, "frozen-tool root")?;
+    let cutter = Cutter {
+        schema: SCHEMA,
+        commit: commit.into(),
+        tool: Tool {
+            path: dir.join("aterm-release"),
+            sha256: digest,
+        },
+    };
+    match std::fs::symlink_metadata(&dir) {
+        Ok(_) => cutter.validate(release)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let stage = aterm_tempfile::Builder::new()
+                .prefix(".cutter-")
+                .tempdir_in(&root)
+                .map_err(|e| e.to_string())?;
+            copy_executable(source, &stage.path().join("aterm-release"))?;
+            crate::durable::sync_dir(stage.path()).map_err(|e| e.to_string())?;
+            std::fs::rename(stage.path(), &dir).map_err(|e| e.to_string())?;
+            crate::durable::sync_dir(&root).map_err(|e| e.to_string())?;
+        }
+        Err(error) => return Err(error.to_string()),
+    }
+    cutter.validate(release)?;
+    prove_exec(&cutter.tool.path, CUTTER_VERSION)?;
+    Ok(cutter)
+}
+
+/// Publish the cutter proof only after the caller's second clean-tree check.
+///
+/// # Errors
+/// The cutter binding or bytes are invalid, serialization fails, or the durable write fails.
+pub fn publish_cutter(release: &Path, cutter: &Cutter) -> Result<(), String> {
+    cutter.validate(release)?;
+    let text = aterm_toml::to_string(cutter).map_err(|e| e.to_string())?;
+    crate::durable::write_atomic_durable(&cutter_record_path(release), text.as_bytes(), 0o600)
+        .map_err(|e| e.to_string())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -406,22 +519,21 @@ pub fn proved_running(exe: &Path) -> Result<Option<String>, String> {
         return Ok(None);
     };
     let record = PathBuf::from(record);
-    if !record.is_absolute() || record.file_name().and_then(|n| n.to_str()) != Some(RECORD) {
-        return Err("the frozen-tool proof does not name an absolute tool.toml".into());
+    if !record.is_absolute() || record.file_name().and_then(|n| n.to_str()) != Some(CUTTER_RECORD) {
+        return Err("the frozen-tool proof does not name an absolute cutter.toml".into());
     }
     let release = record
         .parent()
         .ok_or("the frozen-tool proof has no release directory")?;
     let text = crate::durable::read_text(&record)
         .map_err(|e| format!("read frozen-tool proof {}: {e}", record.display()))?;
-    let tools: ToolSet = aterm_toml::from_str(&text)
+    let cutter: Cutter = aterm_toml::from_str(&text)
         .map_err(|e| format!("parse frozen-tool proof {}: {e}", record.display()))?;
-    tools.validate_shape(release)?;
-    tools.validate_bytes()?;
+    cutter.validate(release)?;
     let actual = std::fs::canonicalize(exe)
         .map_err(|e| format!("resolve running cutter {}: {e}", exe.display()))?;
-    let recorded = std::fs::canonicalize(&tools.cutter.path)
-        .map_err(|e| format!("resolve frozen cutter {}: {e}", tools.cutter.path.display()))?;
+    let recorded = std::fs::canonicalize(&cutter.tool.path)
+        .map_err(|e| format!("resolve frozen cutter {}: {e}", cutter.tool.path.display()))?;
     if actual != recorded {
         return Err(format!(
             "the running cutter {} is not the recorded frozen cutter {}",
@@ -430,8 +542,8 @@ pub fn proved_running(exe: &Path) -> Result<Option<String>, String> {
         ));
     }
     let repo = std::env::current_dir().map_err(|e| format!("name the release clone: {e}"))?;
-    clean_at(&repo, &tools.commit)?;
-    Ok(Some(tools.commit))
+    clean_at(&repo, &cutter.commit)?;
+    Ok(Some(cutter.commit))
 }
 
 pub fn clean_at(repo: &Path, commit: &str) -> Result<(), String> {
@@ -459,6 +571,32 @@ mod tests {
     use super::*;
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// NEGATIVE CONTROLS: requiring a verifier prevents the first proof; accepting another
+    /// commit, path, schema or changed image makes one of the mutated bindings pass.
+    #[test]
+    fn a_cutter_can_be_frozen_before_the_verifier_but_every_binding_is_required() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let release = temp.path().join("release");
+        let source = tool_source(temp.path(), "cutter-only", CUTTER_VERSION, 0);
+        let cutter = stage_cutter(&release, COMMIT, &source).unwrap();
+        assert!(!record_path(&release).exists());
+        publish_cutter(&release, &cutter).unwrap();
+        assert_eq!(recorded_cutter(&release, COMMIT).unwrap(), cutter);
+        assert!(recorded_cutter(&release, &"f".repeat(40)).is_err());
+        for field in 0..3 {
+            let mut mutant = cutter.clone();
+            match field {
+                0 => mutant.schema += 1,
+                1 => mutant.tool.path = source.clone(),
+                _ => mutant.tool.sha256 = "0".repeat(64),
+            }
+            assert!(publish_cutter(&release, &mutant).is_err());
+        }
+        std::fs::write(&cutter.tool.path, b"mutated after first exec completed").unwrap();
+        assert!(recorded_cutter(&release, COMMIT).is_err());
+        assert!(stage_cutter(&release, COMMIT, &source).is_err());
+    }
 
     fn tool_source(dir: &Path, name: &str, version: &str, exit: i32) -> PathBuf {
         assert!(!version.contains('\''), "the shell literal stays quoted");

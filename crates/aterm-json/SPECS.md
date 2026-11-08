@@ -3,7 +3,7 @@
 
 # aterm-json: spec recovery from unit tests
 
-The general properties the tests in `crates/aterm-json/tests/json.rs` sample, stated as specs to prove
+The general properties the tests in `crates/aterm-json/tests/json.rs` and `crates/aterm-json/tests/number_lexeme.rs` sample, stated as specs to prove
 through Trust/Clean about the compiled Rust functions (§1), and which spec retires each test (§2). Most
 tests are digest-pinned sweeps that hash their verdicts and output bytes into one FNV-1a value; a spec
 replaces the sweep, not the digest (§5.3). Every claim comes from reading the code; nothing was
@@ -111,6 +111,7 @@ serializer-data-model	contract	ser::Serializer (all serialize_* methods), ser::C
 deserializer-faithful	refinement	<&mut de::Deserializer as serde::Deserializer>::{deserialize_any,deserialize_option,deserialize_enum,deserialize_struct,deserialize_newtype_struct,deserialize_unit}, de::Deserializer::end_container, de::SeqAccess, de::MapAccess, de::{Deserializer::key,Key}, serde::de::value::TextKeyDeserializer (aterm-serde's buffered-text-key), de::EnumAccess (EnumAccess + VariantAccess)	∀ b ∈ JSONa, ∀ visitor: the calls the Deserializer makes follow Faithful(b). Consequences: (a) a visitor that takes exactly N elements ([T;N], a tuple, a newtype over [T;N]) succeeds only on arrays of exactly N elements (longer is Err at end_container, shorter is the visitor's Err); (b) every key in the document, unknown or duplicate, reaches the visitor, so deny_unknown_fields rejects unknown keys and derive's duplicate-field check rejects repeated keys (the Deserializer itself decides neither); (c) ∀ T whose derived Serialize and Deserialize are mutually inverse over the serde data model: from_str::<T>(&to_string(&x)?) = Ok(x) and from_value::<T>(to_value(&x)?) = Ok(x); (d) in particular every map whose keys KeySer writes reads back as itself, whatever its key type (integer of any width, bool, char, unit variant, newtype or String), whether read directly or through serde's buffer (#[serde(flatten)], untagged, internally tagged), and an integer or bool key is read from KeySer's spelling and no other.	json::typed_deserialization_verdicts_and_values_are_pinned, deny_unknown_fields_denies, typed_models_serialize_to_pinned_bytes_and_read_back, to_value_and_from_value_round_trip, every_map_the_writer_accepts_reads_back, a_key_reads_back_only_in_the_spelling_the_writer_uses	VERY HARD: serde Deserializer/SeqAccess/MapAccess/EnumAccess/VariantAccess impls generic over the visitor; &mut borrows nested in access structs; serde_derive impls; a higher-order spec quantified over an arbitrary visitor	0,1,2,3,4,5,7,9,11,12,13
 json-macro-denotation	other (macro denotation)	macros::{json,json_build}	∀ json! invocation: json!(null)/json!(true)/json!(false) are Null/Bool(true)/Bool(false); json!([e1,…,en]) = Array([J(e1),…,J(en)]); json!({k1: e1, …}) = Object(foldl insert (ki.into(), J(ei)) from an empty Map), so a repeated key is last-wins; [] and {} give empty containers; a trailing comma is allowed; any other expression e gives to_value(&e).expect(..). J is json! applied recursively to nested [] and {} token trees. With value-encoding, to_string(json!(…)) is the sorted compact document.	json::the_json_macro	MEDIUM: a macro_rules token muncher. Trust sees only the expansion at each call site, so the proof is per expansion arm; there is no surface yet for a theorem about the macro itself.	0,1,4,11
 json-pointer-rfc6901	contract	value::Value::pointer, value::array_index	∀ v: Value, p: &str: pointer("") = Some(v); p not starting with `/` gives None; otherwise fold over p.split('/').skip(1), each token unescaped `~1`→`/` first, then `~0`→`~`: an Object steps to map.get(token), an Array to items.get(array_index(token)?), anything else or any miss is None. array_index(t) = Some(n) ⇔ t ∈ (0 | [1-9][0-9]*) ∧ n = dec(t) ≤ usize::MAX; so `00`, `+0`, `-` and non-digits give None.	json::json_pointer	MEDIUM: str::split iterator, str::replace (allocation), starts_with, str::parse::<usize> (which accepts a leading `+`, hence the explicit guard), a loop with `?` on Option, BTreeMap::get, Vec::get. array_index alone is EASY.	0,1,3,5,7
+json-number-lexeme-path	contract	de::{number_lexeme_at_path,PathSegment}, de::Deserializer::{find_number_lexeme,find_number_in_object,find_number_in_object_body,find_number_in_array,find_number_in_array_body,skip_value,parse_string_body,parse_number,enter,leave,end}	∀ b: &[u8], p: &[PathSegment]: number_lexeme_at_path(b, p).is_ok() ⇔ from_slice::<Value>(b).is_ok(). The whole document is validated, with the same grammar, number rules and depth bound (json-accepts-exactly-grammar, recursion-limit), and a match never ends the walk early. The walker's own object and array loops refuse exactly what MapAccess, SeqAccess and skip_value refuse: a trailing comma, a missing separator, a non-string key, an unclosed container and nesting past 127. When it is Ok(r): r = Some(t) ⇔ walking Den(b) along p reaches a Number. A Key(k) step takes an Object's entry under k, with keys compared after escape decoding and a duplicate last-wins, as Den's foldl insert, so a later duplicate whose value is no number, or misses the rest of p, gives None. An Index(i) step takes an Array's i-th element. Any other step, or a miss, gives None. Then t is that number's source token, the bytes parse_number consumed (`62.999999999999999`, `3e-1`, `-0`, `-12.30e+4`), never a re-spelling of its value. The empty path names the root.	number_lexeme::{a_number_lexeme_does_not_round_trip_through_f64, decoded_keys_and_last_duplicate_entries_match_value, typed_array_paths_and_misses_return_the_expected_option, a_match_does_not_short_circuit_validation}	MEDIUM-HARD: two hand-written container loops beside MapAccess, SeqAccess and skip_value, whose agreement with them (separators, trailing commas, depth through enter/leave) is the work; recursion over &[PathSegment] by split_first; a Cow<str> key compared with &str; a saturating usize index; a &'de str borrowed from the input. Rests on skip-equals-materialize and json-accepts-exactly-grammar.	0,1,2,3,5,7,11
 index-total	no-panic	<Value as Index<&str>>::index, <Value as Index<usize>>::index, value::Value::{get,get_index,is_null,as_u64}	∀ v: Value, k: &str, i: usize: the index sugar never panics. v[k] is the value under k if v is an object holding k, else &Null. v[i] is items[i] if v is an array with i < len, else &Null. Indexing a scalar always gives Null.	json::index_sugar_is_total	EASY: enum match, BTreeMap::get, slice get, unwrap_or on a reference to a static	0,1,3
 ```
 
@@ -149,12 +150,17 @@ crates/aterm-json/tests/json.rs	our_float_parsing_is_correctly_rounded	float-par
 crates/aterm-json/tests/json.rs	json_pointer	json-pointer-rfc6901	
 crates/aterm-json/tests/json.rs	index_sugar_is_total	index-total	
 crates/aterm-json/tests/json.rs	json_const_helpers_round_trip	recursion-limit	json-accepts-exactly-grammar
+crates/aterm-json/tests/number_lexeme.rs	a_number_lexeme_does_not_round_trip_through_f64	json-number-lexeme-path	float-parse-correctly-rounded
+crates/aterm-json/tests/number_lexeme.rs	decoded_keys_and_last_duplicate_entries_match_value	json-number-lexeme-path	json-accepts-exactly-grammar
+crates/aterm-json/tests/number_lexeme.rs	typed_array_paths_and_misses_return_the_expected_option	json-number-lexeme-path
+crates/aterm-json/tests/number_lexeme.rs	a_match_does_not_short_circuit_validation	json-number-lexeme-path	json-accepts-exactly-grammar
 ```
 
 ## 3. Coverage
 
-- All 28 live `#[test]` functions in `crates/aterm-json/tests/json.rs` map to one of the 19 specs
-  in §1 (`[lib] test = false` in `Cargo.toml`, so tests live in `tests/json.rs` and doctests).
+- All 28 live `#[test]` functions in `crates/aterm-json/tests/json.rs` and the 4 in
+  `crates/aterm-json/tests/number_lexeme.rs` map to one of the 20 specs in §1 (`[lib] test = false`
+  in `Cargo.toml`, so tests live in `tests/*.rs` and doctests).
 - `number-normal-form` retires no test as primary; it is a lemma of `value-roundtrip`.
 - A test goes only when every spec it samples (`primary` and `also`) is Certified. For example,
   `wide_integers_round_trip_or_fail` needs `typed-integer-targets`, `integer-format` and `to-value-exact`.
@@ -222,7 +228,8 @@ Every spec needs gap 1 and, except the macro, gap 3.
 4. Then, in dependency order: `array_index` (the core of `json-pointer-rfc6901`), the writer half of
    `string-escape-roundtrip`, `value-encoding` (floats assumed), `recursion-limit` (bounded stack on
    any input), the `skip-equals-materialize` lemma (`skip_string_body` ≡ `parse_string_body`),
-   `json-accepts-exactly-grammar`, `value-roundtrip`, then `typed-integer-targets`, `to-value-exact`,
+   `json-accepts-exactly-grammar`, `json-number-lexeme-path` (its walker against the two above),
+   `value-roundtrip`, then `typed-integer-targets`, `to-value-exact`,
    `key-serializer-refuses` and `serializer-data-model`.
 5. Last: `deserializer-faithful` (higher-order serde specs, gaps 9 and 13) and the float specs
    (`float-parse-correctly-rounded`, `float-f64-shortest-roundtrip`, `float-f32-shortest`), a separate

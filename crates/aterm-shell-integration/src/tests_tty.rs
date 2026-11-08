@@ -2554,3 +2554,30 @@ fn an_integrated_bash_in_posix_mode_runs_no_trap_it_was_not_given() {
         sh.finish();
     }
 }
+
+/// A SHELL ON A PTY STARTS IN THE HOME IT WAS HANDED, NOT THE TEST'S CHECKOUT
+/// ([`LiveShell::defaults`]): the prompt's path and git segments read the directory a shell
+/// starts in, so a fixture's shell must not start in whatever checkout runs the tests.
+/// NEGATIVE CONTROL: with that default removed, this shell prints the crate's directory in
+/// the checkout, where the test process runs.
+#[cfg(unix)]
+#[test]
+fn a_pty_shell_starts_in_its_home_not_the_tests_checkout() {
+    let zsh = live_pty_zsh();
+    let fx = LiveFixture::new();
+    std::fs::write(fx.home.join(".zshrc"), "").expect(".zshrc");
+    let ours = install_script_set(&fx.base).expect("install");
+    let mut sh = spawn_pty_shell(ShellType::Zsh, zsh, &fx, &ours, &[]);
+    let from = sh.len();
+    let end = sh.run_line("print -r -- START=$(pwd -P)", "0");
+    let out = stdout_between(&sh, from, end);
+    // The echoed line holds `START=$(pwd -P)`; only the printed one holds a path.
+    let started: Vec<&str> = out
+        .split("START=")
+        .filter_map(|rest| rest.split(['\r', '\n']).next())
+        .filter(|path| path.starts_with('/'))
+        .collect();
+    let home = fx.home.canonicalize().expect("the fixture's home");
+    assert_eq!(started, [home.to_str().expect("UTF-8 home")], "{out:?}");
+    sh.finish();
+}

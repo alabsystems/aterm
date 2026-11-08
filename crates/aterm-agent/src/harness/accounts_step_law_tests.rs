@@ -805,6 +805,8 @@ fn every_step_a_surface_names_can_be_taken() {
             }
         }
     }
+    #[cfg(unix)]
+    claude_token_worlds(&mut seen, &mut wrong);
     // One example of each class: the words past the world, with each scratch path's words gone.
     let mut classes = BTreeMap::<String, &String>::new();
     for why in &wrong {
@@ -830,8 +832,6 @@ fn every_step_a_surface_names_can_be_taken() {
             .collect::<Vec<_>>()
             .join("\n")
     );
-    #[cfg(unix)]
-    claude_token_worlds(&mut seen, &mut wrong);
     for floor in [
         "aterm harness accounts --cli",
         "aterm harness accounts sync",
@@ -853,6 +853,8 @@ fn every_step_a_surface_names_can_be_taken() {
 /// offer's step; each step parses into a [`Step`] and, through the real parser and the real entry
 /// in a fresh copy of the world, gets past the verb's preflight to the setup-token program (a
 /// stand-in that answers none). A world whose report names no step fails, as does a step refused.
+/// The host answers as a Mac's ([`token::Host`]'s `macos`), so the report offers and the verb
+/// takes on every Unix; a host that makes no token offers no step (`accounts_token_view`'s tests).
 #[cfg(unix)]
 fn claude_token_worlds(seen: &mut BTreeSet<String>, wrong: &mut Vec<String>) {
     use crate::harness::accounts_tokens::tests as token;

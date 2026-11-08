@@ -16464,6 +16464,7 @@ fn clone_input_stamped_inner(dst: &mut RenderInput, src: &RenderInput, drop_effe
         extract_gen,
         engine_fill_seq,
         composed_fill_seq,
+        chrome_icon_spares: _,
     } = src;
 
     for r in 0..rows {
@@ -29146,7 +29147,7 @@ mod tests {
         };
         let size = |(x0, x1, y0, y1): (usize, usize, usize, usize)| (x1 - x0 + 1, y1 - y0 + 1);
         let near = |a: usize, b: usize| a.abs_diff(b) <= 1;
-        const FAMILY: [BandIcon; 9] = [
+        const FAMILY: [BandIcon; 11] = [
             BandIcon::Disc,
             BandIcon::Ring,
             BandIcon::HalfDisc,
@@ -29156,6 +29157,8 @@ mod tests {
             BandIcon::InsetDiamond,
             BandIcon::House,
             BandIcon::Diamond,
+            BandIcon::Fork,
+            BandIcon::Enter,
         ];
         for px in [12.0f32, 24.0] {
             let mut r = Renderer::from_system(px, Theme::default()).expect(NO_FONT);
@@ -29194,7 +29197,7 @@ mod tests {
                 let boxes: Vec<_> = FAMILY.into_iter().map(|i| drawn(&mut r, i)).collect();
                 assert!(
                     boxes.iter().all(|b| *b == boxes[0]),
-                    "{at}: ● ○ ◐ ◌ ⊘ ◉ ◈ ⌂ ◆ measure {boxes:?}"
+                    "{at}: ● ○ ◐ ◌ ⊘ ◉ ◈ ⌂ ◆ ⎇ ⎆ measure {boxes:?}"
                 );
                 let (w, h) = size(boxes[0]);
                 if let Some((dw, dh)) = dot {

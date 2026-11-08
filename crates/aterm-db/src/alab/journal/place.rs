@@ -137,16 +137,8 @@ pub fn read(paths: &aterm_secrets::client::Paths, now: u64) -> crate::Result<Opt
     read_started(paths, now, std::time::Instant::now())
 }
 
-#[cfg(all(test, unix))]
-#[test]
-fn native_journal_places_wait_for_unchanged_custody() {
-    let read = crate::admission::with_delayed_custody(|paths, started| {
-        read_started(paths, 1_728_000_600, started)
-    });
-    assert!(read.unwrap().is_some());
-}
-
-fn read_started(
+/// [`read`] with local custody admission's hang detector running from `started`.
+pub(super) fn read_started(
     paths: &aterm_secrets::client::Paths,
     now: u64,
     started: std::time::Instant,

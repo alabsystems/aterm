@@ -81,6 +81,7 @@ pub mod codex_steps;
 pub mod codex_tap;
 pub mod contract;
 pub mod credit_offers;
+mod decimal;
 pub mod disk;
 pub mod email_cli;
 pub mod excerpt;
@@ -145,7 +146,7 @@ pub mod open_url;
 pub mod outlook;
 pub mod profile;
 pub mod provider_read;
-#[cfg(any(test, debug_assertions))]
+#[cfg(any(test, debug_assertions, feature = "dev-seams"))]
 pub mod quota_scenes;
 pub mod quota_view;
 pub mod relaunch;

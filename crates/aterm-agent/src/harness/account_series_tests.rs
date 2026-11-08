@@ -95,6 +95,16 @@ fn fig_of(pct_x10: u32, reset: i64, at: i64) -> Fig {
     }
 }
 
+/// A SERIES FIGURE SAYS 100 ONLY FOR A READING OF 100: its whole-point movement uses the same
+/// half-up-except-full boundary as the store and the glass. NEGATIVE CONTROL: plain half-up
+/// (`(pct_x10 + 5) / 10`) makes 995 and 999 tenths 100 (run once, restored).
+#[test]
+fn a_series_whole_figure_says_100_only_for_a_reading_of_100() {
+    for (x10, whole) in [(994, 99), (995, 99), (999, 99), (1000, 100)] {
+        assert_eq!(fig_of(x10, NOW + D, NOW).whole(), whole, "{x10} tenths");
+    }
+}
+
 fn fig_row(t: i64, five_hour: Option<Fig>, seven_day: Option<Fig>) -> SeriesRow {
     SeriesRow {
         t,

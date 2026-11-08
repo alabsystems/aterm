@@ -2324,10 +2324,7 @@ mod tests {
             "CONTROL: outside a scratch world the owed tab is due"
         );
         app.workstation_setup.developer_tools_scratch_world = true;
-        assert_eq!(
-            app.developer_tools_install_held(false),
-            Some("a scratch world (a check's bundle asks for no password)")
-        );
+        assert!(!app.developer_tools_install_due(false));
     }
 
     /// A person typing (a vault password into System State, say) holds the tab back until the

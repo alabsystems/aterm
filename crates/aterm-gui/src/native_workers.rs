@@ -1085,6 +1085,7 @@ mod tests {
             left: None,
             exit,
             finished: false,
+            unfinished_exit: false,
             result_bytes: 0,
             result_path: None,
             attention: false,

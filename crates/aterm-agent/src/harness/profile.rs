@@ -1885,6 +1885,40 @@ pub fn parse_agy_auth_log(bytes: &[u8]) -> Option<String> {
     parse_agy_auth_record(bytes).flatten()
 }
 
+/// The tenths used of a week whose exact JSON decimal `left` fraction (`0.0..=1.0`) a vendor
+/// reports, rounded down so a lower bound said of it stays true
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1). Computing
+/// `1000 - ceil(left * 1000)` by decimal integer arithmetic keeps a just-above-boundary fraction
+/// from becoming a false higher bound after an `f64` rounds it down.
+fn used_x10_of_left(left: &str) -> Option<u32> {
+    let (floor, remainder) = super::decimal::scaled_floor(left, 3, 1000)?;
+    Some(
+        1000u32
+            .saturating_sub(floor)
+            .saturating_sub(u32::from(remainder)),
+    )
+}
+
+/// Find the indexed bucket whose object satisfies `matches`.
+fn agy_usage_bucket(
+    groups: &[aterm_json::Value],
+    mut matches: impl FnMut(&aterm_json::Value) -> bool,
+) -> Option<(usize, usize, &aterm_json::Value)> {
+    for (group_index, group) in groups.iter().enumerate() {
+        let Some(buckets) = group.get("buckets").and_then(aterm_json::Value::as_array) else {
+            continue;
+        };
+        if let Some((bucket_index, bucket)) = buckets
+            .iter()
+            .enumerate()
+            .find(|(_, bucket)| matches(bucket))
+        {
+            return Some((group_index, bucket_index, bucket));
+        }
+    }
+    None
+}
+
 /// Parses `agy -p /usage --output-format json` output into a [`WeeklyFigure`].
 #[must_use]
 pub fn parse_agy_usage_json(bytes: &[u8], third_party: bool, now: i64) -> Option<WeeklyFigure> {
@@ -1902,29 +1936,29 @@ pub fn parse_agy_usage_json(bytes: &[u8], third_party: bool, now: i64) -> Option
     } else {
         "gemini-weekly"
     };
-    let bucket = groups
-        .iter()
-        .flat_map(|g| g.get("buckets").and_then(aterm_json::Value::as_array))
-        .flatten()
-        .find(|b| b.get("id").and_then(aterm_json::Value::as_str) == Some(want_id))
-        .or_else(|| {
-            groups
-                .iter()
-                .flat_map(|g| g.get("buckets").and_then(aterm_json::Value::as_array))
-                .flatten()
-                .find(|b| b.get("window").and_then(aterm_json::Value::as_str) == Some("weekly"))
-        })?;
-    let rem = bucket
-        .get("remaining_fraction")
-        .and_then(aterm_json::Value::as_f64)?
-        .clamp(0.0, 1.0);
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "clamped to 0.0..=1.0"
-    )]
-    let left_pct = ((rem * 100.0).round() as u32).min(100);
-    let used_x10 = 100u32.saturating_sub(left_pct).saturating_mul(10);
+    let (group_index, bucket_index, bucket) = agy_usage_bucket(groups, |bucket| {
+        bucket.get("id").and_then(aterm_json::Value::as_str) == Some(want_id)
+    })
+    .or_else(|| {
+        agy_usage_bucket(groups, |bucket| {
+            bucket.get("window").and_then(aterm_json::Value::as_str) == Some("weekly")
+        })
+    })?;
+    use aterm_json::PathSegment::{Index, Key};
+    let rem = aterm_json::number_lexeme_at_path(
+        bytes,
+        &[
+            Key("command"),
+            Key("data"),
+            Key("groups"),
+            Index(group_index),
+            Key("buckets"),
+            Index(bucket_index),
+            Key("remaining_fraction"),
+        ],
+    )
+    .ok()??;
+    let used_x10 = used_x10_of_left(rem)?;
     let reset_str = bucket
         .get("reset_time")
         .and_then(aterm_json::Value::as_str)?;
@@ -3389,16 +3423,22 @@ fn fable_plan(plan: &Plan, flags: RawFeatures) -> FablePlan {
     }
 }
 
+/// The tenths of a percent Claude Code cached for a window (`cachedUsageUtilization`), rounded
+/// down so a lower bound said of it stays true, and 1000 only for a reading of 100 or more: 99.96
+/// is 999, said `99%` and once aged `≥99%`, never `100%`; 62.96 is 629, whose bound is `≥62%`
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1). Claude Code writes the cache with
+/// `JSON.stringify`, whose number is the shortest decimal that reads back as the same `f64`, and
+/// `f64`'s `Display` gives that shortest decimal again, so [`super::decimal::scaled_floor`] floors
+/// the digits the file holds rather than a product in binary that can fall a tenth off them.
 fn pct_x10(pct: f64) -> Option<u16> {
     if !pct.is_finite() || pct < 0.0 {
         return None;
     }
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "0..=1000"
-    )]
-    Some((pct * 10.0).round().min(1000.0) as u16)
+    if pct >= 100.0 {
+        return Some(1000);
+    }
+    let (x10, _) = super::decimal::scaled_floor(&pct.to_string(), 1, 1000)?;
+    u16::try_from(x10).ok()
 }
 
 fn whole(n: f64) -> Option<i64> {

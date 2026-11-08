@@ -106,6 +106,66 @@ impl Keep for Log {
         record
     }
 }
+/// A log holds all of another ([`Log::holds_all`]) exactly when it holds each record the other
+/// holds, whichever of them grew or forked, and a record it keeps waiting is not one it holds.
+/// NEGATIVE CONTROLS: `holds_all` asking for the other's first head alone takes one side of a
+/// fork to hold both sides; counting a waiting record as held takes a log that keeps the other's
+/// head waiting to hold all of it.
+#[test]
+fn a_log_holds_all_of_another_exactly_when_it_holds_each_of_its_records() {
+    let base = found(&[(A, "m1"), (B, "m2")]);
+    let mut left = base.clone();
+    left.keep(sign(
+        &left,
+        A,
+        Body::Name {
+            name: "left".to_owned(),
+        },
+    ));
+    let mut right = base.clone();
+    right.keep(sign(
+        &right,
+        B,
+        Body::Name {
+            name: "right".to_owned(),
+        },
+    ));
+    let mut both = left.clone();
+    both.merge(&right).unwrap();
+    assert_eq!(both.heads().len(), 2);
+    let mut longer = right.clone();
+    let after = longer.keep(sign(
+        &longer,
+        B,
+        Body::Name {
+            name: "after".to_owned(),
+        },
+    ));
+    let mut waits = base.clone();
+    assert_eq!(waits.insert(after).unwrap(), Inserted::Waiting);
+    let each = |log: &Log, other: &Log| other.records().all(|r| log.get(r.id()).is_some());
+    let logs = [
+        ("base", &base),
+        ("left", &left),
+        ("right", &right),
+        ("both", &both),
+        ("longer", &longer),
+        ("waits", &waits),
+    ];
+    for (name, log) in logs {
+        for (other_name, other) in logs {
+            assert_eq!(
+                log.holds_all(other),
+                each(log, other),
+                "{name} holding all of {other_name}"
+            );
+        }
+    }
+    assert!(both.holds_all(&left) && both.holds_all(&right));
+    assert!(!left.holds_all(&both) && !right.holds_all(&both));
+    assert!(waits.holds_all(&base) && !waits.holds_all(&longer));
+}
+
 fn heal(one: &mut Log, two: &mut Log) {
     one.merge(two).unwrap();
     two.merge(one).unwrap();

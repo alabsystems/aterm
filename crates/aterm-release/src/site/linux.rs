@@ -5,6 +5,8 @@
 
 use aterm_update_core::linux::LinuxTarget;
 use aterm_update_core::{Manifest, Roster, verify_roster};
+use atpkg::signed_artifact_cache::{SignedArtifactCache, SignedReleaseKey};
+use atpkg::store::Layout;
 
 use super::releases::{LinuxDownload, LinuxKind, LinuxProver, Release, linux_appcast_name};
 
@@ -18,6 +20,8 @@ pub struct Chain<'a> {
     /// The paper master keyset (`pins::PAPER_MASTER_PUBKEYS`; a test pins its own).
     pub masters: &'a [&'a str],
     pub now_unix: i64,
+    /// The manager layout that keeps exact, already-verified signed release pairs.
+    pub artifact_layout: Option<&'a Layout>,
     /// A release asset's bytes at `url`, at most `limit` of them.
     pub get: &'a mut super::Fetch<'a>,
 }
@@ -34,6 +38,96 @@ impl Chain<'_> {
         Ok(bytes)
     }
 
+    fn pair_is_listed(&self, r: &Release, name: &str) -> Result<(), String> {
+        if r.named(name).is_none() {
+            return Err(format!("missing or duplicate {name}"));
+        }
+        let sig = format!("{name}.sig");
+        if r.named(&sig).is_none() {
+            return Err(format!("missing or duplicate {sig}"));
+        }
+        Ok(())
+    }
+
+    fn cached_pair(&self, r: &Release, name: &str, limit: u64) -> Option<(Vec<u8>, Vec<u8>)> {
+        let layout = self.artifact_layout?;
+        let source = format!("github:{}", self.slug);
+        let key = SignedReleaseKey::asset(&source, &r.tag, name)?;
+        SignedArtifactCache::for_layout(layout).load_pair(
+            &key,
+            usize::try_from(limit).ok()?,
+            usize::try_from(SIG_LIMIT).ok()?,
+        )
+    }
+
+    fn store_pair(&self, r: &Release, name: &str, limit: u64, bytes: &[u8], sig: &[u8]) {
+        let Some(layout) = self.artifact_layout else {
+            return;
+        };
+        let Ok(document_cap) = usize::try_from(limit) else {
+            return;
+        };
+        let Ok(signature_cap) = usize::try_from(SIG_LIMIT) else {
+            return;
+        };
+        let source = format!("github:{}", self.slug);
+        let Some(key) = SignedReleaseKey::asset(&source, &r.tag, name) else {
+            return;
+        };
+        let _ = SignedArtifactCache::for_layout(layout).store_verified_pair(
+            &key,
+            bytes,
+            sig,
+            document_cap,
+            signature_cap,
+        );
+    }
+
+    fn fetch_pair(
+        &mut self,
+        r: &Release,
+        name: &str,
+        limit: u64,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let sig_name = format!("{name}.sig");
+        Ok((
+            self.fetch(r, name, limit)?,
+            self.fetch(r, &sig_name, SIG_LIMIT)?,
+        ))
+    }
+
+    fn roster(&mut self, authority: &Release) -> Result<Roster, String> {
+        const NAME: &str = "aterm-machines.toml";
+        self.pair_is_listed(authority, NAME)?;
+        if let Some((bytes, sig)) = self.cached_pair(authority, NAME, ROSTER_LIMIT)
+            && let Ok(roster) = admitted_roster(self.masters, self.now_unix, bytes, &sig)
+        {
+            return Ok(roster);
+        }
+        let (bytes, sig) = self.fetch_pair(authority, NAME, ROSTER_LIMIT)?;
+        let roster = admitted_roster(self.masters, self.now_unix, bytes.clone(), &sig)?;
+        self.store_pair(authority, NAME, ROSTER_LIMIT, &bytes, &sig);
+        Ok(roster)
+    }
+
+    fn release_appcast(
+        &mut self,
+        roster: &Roster,
+        release: &Release,
+        name: &str,
+    ) -> Result<Manifest, String> {
+        self.pair_is_listed(release, name)?;
+        if let Some((bytes, sig)) = self.cached_pair(release, name, APPCAST_LIMIT)
+            && let Ok(manifest) = self.appcast(roster, &bytes, &sig, &release.tag)
+        {
+            return Ok(manifest);
+        }
+        let (bytes, sig) = self.fetch_pair(release, name, APPCAST_LIMIT)?;
+        let manifest = self.appcast(roster, &bytes, &sig, &release.tag)?;
+        self.store_pair(release, name, APPCAST_LIMIT, &bytes, &sig);
+        Ok(manifest)
+    }
+
     fn appcast(
         &self,
         roster: &Roster,
@@ -43,6 +137,21 @@ impl Chain<'_> {
     ) -> Result<Manifest, String> {
         signed_release_appcast(self.slug, roster, bytes, sig, tag, self.now_unix)
     }
+}
+
+fn admitted_roster(
+    masters: &[&str],
+    now_unix: i64,
+    bytes: Vec<u8>,
+    sig: &[u8],
+) -> Result<Roster, String> {
+    let verified = verify_roster(masters, bytes, sig)
+        .map_err(|e| format!("roster is not signed by the pinned paper master ({e:?})"))?;
+    let roster = Roster::parse(&verified).map_err(|e| format!("roster refused ({e:?})"))?;
+    roster
+        .admit(0, now_unix)
+        .map_err(|e| format!("roster refused ({e:?})"))?;
+    Ok(roster)
 }
 
 /// `bytes`, the appcast of `slug`'s release `tag`, held under `roster` to the rules install.sh's
@@ -110,24 +219,13 @@ impl LinuxProver for Chain<'_> {
         if release.version_key() > authority.version_key() {
             return Err("native release is newer than the current appcast head".into());
         }
-        let roster_bytes = self.fetch(authority, "aterm-machines.toml", ROSTER_LIMIT)?;
-        let roster_sig = self.fetch(authority, "aterm-machines.toml.sig", SIG_LIMIT)?;
-        let verified = verify_roster(self.masters, roster_bytes, &roster_sig)
-            .map_err(|e| format!("roster is not signed by the pinned paper master ({e:?})"))?;
-        let roster = Roster::parse(&verified).map_err(|e| format!("roster refused ({e:?})"))?;
-        roster
-            .admit(0, self.now_unix)
-            .map_err(|e| format!("roster refused ({e:?})"))?;
-        let head = self.fetch(authority, "aterm-appcast.toml", APPCAST_LIMIT)?;
-        let head_sig = self.fetch(authority, "aterm-appcast.toml.sig", SIG_LIMIT)?;
-        let current = self.appcast(&roster, &head, &head_sig, &authority.tag)?;
+        let roster = self.roster(authority)?;
+        let current = self.release_appcast(&roster, authority, "aterm-appcast.toml")?;
         let archived;
         let manifest = if release.tag == authority.tag {
             &current
         } else {
-            let bytes = self.fetch(release, &proof, APPCAST_LIMIT)?;
-            let sig = self.fetch(release, &format!("{proof}.sig"), SIG_LIMIT)?;
-            archived = self.appcast(&roster, &bytes, &sig, &release.tag)?;
+            archived = self.release_appcast(&roster, release, &proof)?;
             &archived
         };
         let floor = current.min_build.unwrap_or(0);
@@ -271,9 +369,47 @@ mod tests {
             slug: SLUG,
             masters: &masters,
             now_unix: NOW,
+            artifact_layout: None,
             get: &mut get,
         };
         elect(releases, SLUG, &mut chain, &mut Vec::new()).map_err(|e| e.to_string())
+    }
+
+    fn prove_cached(
+        layout: &Layout,
+        served: &BTreeMap<String, Vec<u8>>,
+        release: &Release,
+    ) -> (Result<LinuxDownload, String>, usize) {
+        let master = pk(&MASTER);
+        let masters = [master.as_str()];
+        let mut reads = 0;
+        let result = {
+            let mut get = |url: &str, _limit: u64| {
+                reads += 1;
+                served
+                    .get(url)
+                    .cloned()
+                    .ok_or_else(|| format!("blocked transport: {url}"))
+            };
+            let mut chain = Chain {
+                slug: SLUG,
+                masters: &masters,
+                now_unix: NOW,
+                artifact_layout: Some(layout),
+                get: &mut get,
+            };
+            chain.prove(release, "aarch64", release)
+        };
+        (result, reads)
+    }
+
+    fn corrupt_cached_objects(layout: &Layout) {
+        let objects = layout.prefix.join("signed-artifacts/v2/objects/sha256");
+        for shard in std::fs::read_dir(objects).unwrap() {
+            for object in std::fs::read_dir(shard.unwrap().path()).unwrap() {
+                std::fs::write(object.unwrap().path(), b"partial object").unwrap();
+            }
+        }
     }
 
     #[test]
@@ -421,6 +557,60 @@ mod tests {
         assert!(
             err.contains("not signed by the pinned paper master"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn a_second_proof_with_blocked_transport_reverifies_exact_cached_pairs() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let layout = Layout {
+            prefix: scratch.path().join("pkg"),
+        };
+        let mut served = BTreeMap::new();
+        let head = release(
+            &mut served,
+            "0.64.0",
+            &appcast("0.64.0", 20, 0, 9000),
+            &MACHINE,
+            9000,
+            true,
+        );
+        let (first, reads) = prove_cached(&layout, &served, &head);
+        first.unwrap();
+        assert_eq!(reads, 4, "one document/signature pair for each proof");
+
+        let (second, reads) = prove_cached(&layout, &BTreeMap::new(), &head);
+        second.expect("content-addressed pairs are reverified without transport");
+        assert_eq!(reads, 0, "an exact verified pair makes no network read");
+    }
+
+    #[test]
+    fn a_corrupt_cached_pair_reads_transport_and_refuses_a_mismatch() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let layout = Layout {
+            prefix: scratch.path().join("pkg"),
+        };
+        let mut served = BTreeMap::new();
+        let head = release(
+            &mut served,
+            "0.64.0",
+            &appcast("0.64.0", 20, 0, 9000),
+            &MACHINE,
+            9000,
+            true,
+        );
+        prove_cached(&layout, &served, &head).0.unwrap();
+        corrupt_cached_objects(&layout);
+
+        let appcast_url =
+            format!("https://github.com/{SLUG}/releases/download/v0.64.0/aterm-appcast.toml");
+        served.insert(appcast_url, appcast("0.64.0", 21, 0, 9000));
+        let (result, reads) = prove_cached(&layout, &served, &head);
+        let error = result.unwrap_err();
+        assert!(reads >= 4, "both corrupt pairs must fall back to transport");
+        assert!(
+            error.contains("no authorized live machine signature"),
+            "{error}"
         );
     }
 }

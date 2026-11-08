@@ -34,7 +34,7 @@ fn band(msgs: Vec<Message>, cols: usize) -> Presentation {
         c.post(msg, stamp(), now);
     }
     c.commit_rows(now, 3);
-    c.presentation(cols, &char_width, None, Links::Painted)
+    c.presentation(cols, &char_width, Links::Painted)
 }
 
 fn labels(p: &Presentation) -> Vec<Vec<String>> {
@@ -391,7 +391,7 @@ fn revealed_with(msg: Message, cols: usize, width: &dyn Fn(&str) -> usize) -> Ro
     let later = now + PROGRESS_GRACE + Duration::from_millis(1);
     let _ = c.settle(later, true);
     c.commit_rows(later, 3);
-    let mut p = c.presentation(cols, width, None, Links::Painted);
+    let mut p = c.presentation(cols, width, Links::Painted);
     assert_eq!(p.rows.len(), 1, "one row on the band");
     p.rows.remove(0)
 }

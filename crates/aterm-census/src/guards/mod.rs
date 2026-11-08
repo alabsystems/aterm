@@ -514,6 +514,9 @@ pub(crate) struct Load {
     pub(crate) files: Vec<String>,
     /// How the loader brings [`Self::files`] in.
     pub(crate) kind: LoadKind,
+    /// Declared logical module segments, including enclosing inline modules. Includes
+    /// splice into the caller and have no independently proven module identity.
+    pub(crate) module: Option<Vec<String>>,
     /// Outside the shipped lines: inside an item whose `cfg` proves it
     /// test-only.
     pub(crate) gated: bool,
@@ -728,7 +731,7 @@ pub(crate) struct Line<'a> {
 }
 
 impl SourceFile {
-    const fn new(rel: String, raw: String) -> Self {
+    pub(crate) const fn new(rel: String, raw: String) -> Self {
         Self {
             rel,
             raw,
@@ -764,9 +767,7 @@ impl SourceFile {
 
     /// Every line outside an item whose `cfg` proves it test-only.
     pub(crate) fn shipped_lines(&self) -> impl Iterator<Item = Line<'_>> {
-        let shipped = self
-            .shipped
-            .get_or_init(|| crate::shipped_lines(&self.lexed().code));
+        let shipped = self.shipped.get_or_init(|| crate::shipped_lines(&self.raw));
         self.lines()
             .filter(move |l| shipped.get(l.no - 1).copied().unwrap_or(true))
     }
@@ -842,9 +843,7 @@ impl SourceFile {
         if decls.is_empty() && !code.contains("include") {
             return Vec::new();
         }
-        let shipped = self
-            .shipped
-            .get_or_init(|| crate::shipped_lines(&self.lexed().code));
+        let shipped = self.shipped.get_or_init(|| crate::shipped_lines(&self.raw));
         let starts: Vec<usize> = std::iter::once(0)
             .chain(code.match_indices('\n').map(|(at, _)| at + 1))
             .collect();
@@ -885,6 +884,14 @@ impl SourceFile {
             out.push(Load {
                 files,
                 kind,
+                module: Some(
+                    chain
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(*name))
+                        .map(str::to_owned)
+                        .collect(),
+                ),
                 gated: gated(*at),
             });
         }
@@ -930,6 +937,7 @@ fn include_loads(
                 out.push(Load {
                     files: vec![joined(mdir, suffix.trim_start_matches('/'))],
                     kind: LoadKind::Include,
+                    module: None,
                     gated: gated(at),
                 });
             }
@@ -949,6 +957,7 @@ fn include_loads(
         out.push(Load {
             files: vec![joined(dir, path)],
             kind: LoadKind::Include,
+            module: None,
             gated: gated(at),
         });
     }

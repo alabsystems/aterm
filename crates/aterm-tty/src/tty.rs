@@ -323,11 +323,7 @@ mod dev {
                 let timeout = match deadline {
                     None => -1,
                     Some(deadline) => {
-                        let now = Instant::now();
-                        if now >= deadline {
-                            return Ok(Readiness::Timeout);
-                        }
-                        let left = deadline.duration_since(now);
+                        let left = deadline.saturating_duration_since(Instant::now());
                         let ms = left.as_micros().div_ceil(1000);
                         libc::c_int::try_from(ms).unwrap_or(libc::c_int::MAX)
                     }
@@ -352,6 +348,9 @@ mod dev {
                         continue;
                     }
                     return Err(error);
+                }
+                if ready == 0 && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Ok(Readiness::Timeout);
                 }
                 if fds[1].revents != 0 {
                     self.signals.drain();

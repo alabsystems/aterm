@@ -209,13 +209,12 @@ impl WebBand {
         drive::look(LookIn {
             motion_allowed: self.motion_ok,
             on_screen: self.visible,
-            frozen: false,
             forced: self.forced.is_some(),
         })
     }
 
     /// How a `cols`-wide page lays the band out ([`Lay::web`]): links withheld
-    /// until the page has a Details view, and no `$HOME` to abbreviate.
+    /// until the page has a Details view.
     #[inline]
     fn lay(&self, cols: usize) -> Lay {
         Lay::web(cols, self.details)
@@ -308,7 +307,6 @@ impl WebBand {
         let motion = drive::motion_deadline_over(
             &self.center,
             reserved,
-            false,
             now,
             [(&self.view, self.lay(cols), self.look())],
         );

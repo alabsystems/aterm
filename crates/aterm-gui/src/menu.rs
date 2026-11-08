@@ -2502,9 +2502,12 @@ pub(crate) fn local_file_picker_available() -> bool {
     false
 }
 
-/// Record an operational error without opening a modal or desktop notification.
-pub(crate) fn notify(title: &str, body: &str) {
-    aterm_log::warn!("{title}: {body}");
+/// Record an operational error without opening a modal or desktop notification: aterm.log keeps
+/// its title (aterm's own words) and its body's length, never the body, which can name the
+/// person's file (DESIGN-session-log §3.6; PRIV4-3: an alert's text until 1a7cad3eb5 made it a
+/// log line). The body keeps its home: each caller writes it to stderr whole.
+pub(crate) fn notify(title: &'static str, body: &str) {
+    aterm_log::warn!("{title}: {}", aterm_log::words::Len(body));
 }
 
 /// Help, off macOS: the project page in the default browser.

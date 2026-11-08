@@ -60,8 +60,6 @@ pub enum MotionEffect {
     OutputStreak,
     /// The upgrade rim (the host's `level_up`): pulse, climb, hue travel and thickening scale with it.
     UpgradeSurge,
-    /// The message band's live indicator: a busy row's braille spinner and whole-row comet (`aterm_messages::Meter::busy`), the determinate bar's glide and glint, the completion echo's glow and fade.
-    BandProgress,
     /// The harness card's motion (`HarnessCard::tick`'s `animate`): its intro — the border's drift and specular head, the trail's step wave and shimmer, the kitty's blink and tail flick, the stars' twinkle and burst — and the FLOW after it, for as long as this verdict allows: the border's hue travelling on and Claude's mascot ripple running out from its wand across the card (`crate::ripple`).
     HarnessCard,
     /// The stats deck's live edge (`aterm-gui`'s `stats_live`): its strips' glide to the left
@@ -93,7 +91,7 @@ pub const NATIVE_FADE_MAX_MS: u32 = 150;
 impl MotionEffect {
     /// The complete governed-effect set, which the totality proof iterates.
     #[cfg(test)]
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 13] = [
         Self::CursorGlow,
         Self::WordSparkles,
         Self::SmoothScroll,
@@ -101,7 +99,6 @@ impl MotionEffect {
         Self::MatrixRain,
         Self::OutputStreak,
         Self::UpgradeSurge,
-        Self::BandProgress,
         Self::HarnessCard,
         Self::DeckLive,
         Self::NativeInPlace,
@@ -122,7 +119,6 @@ impl MotionEffect {
             | Self::MatrixRain
             | Self::OutputStreak
             | Self::UpgradeSurge
-            | Self::BandProgress
             | Self::HarnessCard
             | Self::DeckLive
             | Self::NativeInPlace
@@ -155,8 +151,6 @@ pub enum SeriousEffect {
     LevelUp,
     SettingsPreview,
     GpuPostFx,
-    /// The message band's live indicator motion, the busy spinner and comet included.
-    BandProgress,
     /// The harness card's kitty, rainbow trail, stars and border motion: serious mode keeps a static border, so the session still shows as wrapped.
     HarnessCard,
     /// The act ticker's label on the Autopilot chip (`✓ approved` for 3 s, design `docs/DESIGN-harness-autopilot-2026-10-15.md` §9.2.1): serious mode withholds it.
@@ -171,7 +165,7 @@ pub enum SeriousEffect {
 
 impl SeriousEffect {
     #[cfg(test)]
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 15] = [
         Self::TerminalSound,
         Self::CursorTrail,
         Self::CursorGlow,
@@ -182,7 +176,6 @@ impl SeriousEffect {
         Self::LevelUp,
         Self::SettingsPreview,
         Self::GpuPostFx,
-        Self::BandProgress,
         Self::HarnessCard,
         Self::HarnessTicker,
         Self::OutputStreak,
@@ -218,7 +211,6 @@ impl SeriousModePolicy {
             | SeriousEffect::LevelUp
             | SeriousEffect::SettingsPreview
             | SeriousEffect::GpuPostFx
-            | SeriousEffect::BandProgress
             | SeriousEffect::HarnessCard
             | SeriousEffect::HarnessTicker
             | SeriousEffect::OutputStreak
@@ -262,7 +254,6 @@ impl MotionPolicy {
                 | MotionEffect::MatrixRain
                 | MotionEffect::OutputStreak
                 | MotionEffect::UpgradeSurge
-                | MotionEffect::BandProgress
                 | MotionEffect::HarnessCard
                 | MotionEffect::DeckLive
                 | MotionEffect::NativeInPlace

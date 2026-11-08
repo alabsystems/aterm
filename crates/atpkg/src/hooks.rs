@@ -238,42 +238,33 @@ pub(crate) fn hook_is_current(dest: &Path, content: &str) -> bool {
 enum Prev {
     /// Nothing did: an unwind takes the file this pass laid back out.
     Absent,
-    /// The previous pass's hook — a regular file — moved aside to this path.
+    /// The previous hook file or link, moved aside without following it.
     Saved(std::path::PathBuf),
-    /// Something that is not a regular file (a directory, a link, a device), left where it
-    /// is: the rename that follows fails on it, and an unwind has nothing to put back.
-    Foreign,
 }
 
-fn move_aside(dest: &Path) -> Prev {
+fn move_aside(dest: &Path, saved: &Path) -> io::Result<Prev> {
     let meta = match fs::symlink_metadata(dest) {
         Ok(meta) => meta,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Prev::Absent,
-        Err(_) => return Prev::Foreign,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Prev::Absent),
+        Err(e) => return Err(e),
     };
-    if !meta.is_file() {
-        return Prev::Foreign;
+    if !meta.is_file() && !meta.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a hook file or link", dest.display()),
+        ));
     }
-    let Some(name) = dest.file_name().and_then(|s| s.to_str()) else {
-        return Prev::Foreign;
-    };
-    let saved = dest.with_file_name(format!(".{name}.prev-{}", std::process::id()));
-    let _ = fs::remove_file(&saved);
-    match fs::rename(dest, &saved) {
-        Ok(()) => Prev::Saved(saved),
-        Err(_) => Prev::Foreign,
-    }
+    fs::rename(dest, saved)?;
+    Ok(Prev::Saved(saved.to_path_buf()))
 }
 
-fn restore_prev(dest: &Path, prev: Prev) {
+fn restore_prev(dest: &Path, prev: Prev) -> io::Result<()> {
     match prev {
-        Prev::Absent => {
-            let _ = fs::remove_file(dest);
-        }
-        Prev::Saved(saved) => {
-            let _ = fs::rename(&saved, dest);
-        }
-        Prev::Foreign => {}
+        Prev::Absent => match fs::remove_file(dest) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        },
+        Prev::Saved(saved) => fs::rename(&saved, dest),
     }
 }
 
@@ -284,52 +275,147 @@ pub fn write_hooks(
     agents_dir: &Path,
     reroute_dir: &Path,
 ) -> io::Result<Vec<String>> {
-    let files = hook_files(bin_dir, agents_dir, reroute_dir);
-    let current: Vec<String> = files
-        .iter()
-        .filter(|(name, content)| hook_is_current(&shell_d.join(name), content))
-        .map(|(name, _)| name.clone())
-        .collect();
-    let mut staged = Vec::with_capacity(files.len());
-    for (name, content) in files.iter().filter(|(name, _)| !current.contains(name)) {
-        let dest = shell_d.join(name);
-        match stage_hook(&dest, content) {
-            Ok(tmp) => staged.push((tmp, dest, name.clone())),
-            Err(e) => {
-                for (tmp, _, _) in &staged {
-                    let _ = fs::remove_file(tmp);
-                }
-                return Err(e);
-            }
+    HookPublication::prepare(shell_d, bin_dir, agents_dir, reroute_dir)?.publish()
+}
+
+fn hook_lock_file(shell_d: &Path) -> io::Result<fs::File> {
+    let path = shell_d.join("hooks.lock");
+    crate::index_probe::open_private(&path, true).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a writable regular non-link lock file",
+                path.display()
+            ),
+        )
+    })
+}
+
+struct HookPublication {
+    // Keep the rendezvous file in place: unlinking it would split concurrent locks.
+    _lock: crate::lock::Flock,
+    directory: Option<aterm_tempfile::TempDir>,
+    shell_d: std::path::PathBuf,
+    staged: Vec<(std::path::PathBuf, std::path::PathBuf, String)>,
+    current: Vec<String>,
+}
+
+impl HookPublication {
+    fn prepare(
+        shell_d: &Path,
+        bin_dir: &Path,
+        agents_dir: &Path,
+        reroute_dir: &Path,
+    ) -> io::Result<Self> {
+        Self::prepare_with(shell_d, bin_dir, agents_dir, reroute_dir, stage_hook)
+    }
+
+    fn prepare_with(
+        shell_d: &Path,
+        bin_dir: &Path,
+        agents_dir: &Path,
+        reroute_dir: &Path,
+        mut stage: impl FnMut(&Path, &str) -> io::Result<std::path::PathBuf>,
+    ) -> io::Result<Self> {
+        let lock = crate::lock::Flock::lock_within(
+            hook_lock_file(shell_d)?,
+            std::time::Duration::from_secs(60),
+            &shell_d.join("hooks.lock"),
+        )?;
+        let files = hook_files(bin_dir, agents_dir, reroute_dir);
+        let current: Vec<String> = files
+            .iter()
+            .filter(|(name, content)| hook_is_current(&shell_d.join(name), content))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let directory = if current.len() == files.len() {
+            None
+        } else {
+            Some(
+                aterm_tempfile::Builder::new()
+                    .prefix("hook-publication-")
+                    .suffix(".noindex")
+                    .tempdir_in(shell_d)?,
+            )
+        };
+        let mut staged = Vec::with_capacity(files.len());
+        for (name, content) in files.iter().filter(|(name, _)| !current.contains(name)) {
+            let dest = shell_d.join(name);
+            let tmp = stage(
+                &directory
+                    .as_ref()
+                    .expect("changed hooks own staging")
+                    .path()
+                    .join(name),
+                content,
+            )?;
+            staged.push((tmp, dest, name.clone()));
         }
+        Ok(Self {
+            _lock: lock,
+            directory,
+            shell_d: shell_d.to_path_buf(),
+            staged,
+            current,
+        })
     }
-    let mut written = current;
-    let mut published: Vec<(std::path::PathBuf, Prev)> = Vec::with_capacity(staged.len());
-    for (index, (tmp, dest, name)) in staged.iter().enumerate() {
-        let prev = move_aside(dest);
-        if let Err(e) = fs::rename(tmp, dest) {
-            restore_prev(dest, prev);
-            for (done, was) in std::mem::take(&mut published).into_iter().rev() {
-                restore_prev(&done, was);
+
+    fn publish(mut self) -> io::Result<Vec<String>> {
+        let mut written = std::mem::take(&mut self.current);
+        let mut published: Vec<(std::path::PathBuf, Prev)> = Vec::with_capacity(self.staged.len());
+        for (tmp, dest, name) in std::mem::take(&mut self.staged) {
+            let saved = self
+                .directory
+                .as_ref()
+                .expect("staged hooks own their directory")
+                .path()
+                .join(format!("previous-{name}"));
+            let prev = match move_aside(&dest, &saved) {
+                Ok(prev) => prev,
+                Err(e) => return Err(self.rollback(published, e)),
+            };
+            if let Err(e) = fs::rename(tmp, &dest) {
+                published.push((dest, prev));
+                return Err(self.rollback(published, e));
             }
-            for (rest, _, _) in &staged[index..] {
-                let _ = fs::remove_file(rest);
-            }
-            return Err(e);
+            published.push((dest, prev));
+            written.push(name);
         }
-        published.push((dest.clone(), prev));
-        written.push(name.clone());
-    }
-    for (_, prev) in published {
-        if let Prev::Saved(saved) = prev {
-            let _ = fs::remove_file(&saved);
+        let stray = self.shell_d.join(format!("{HOOK_BASENAME}.sh"));
+        if stray.exists() {
+            let _ = fs::remove_file(&stray);
         }
+        Ok(written)
     }
-    let stray = shell_d.join(format!("{HOOK_BASENAME}.sh"));
-    if stray.exists() {
-        let _ = fs::remove_file(&stray);
+
+    fn rollback(
+        &mut self,
+        published: Vec<(std::path::PathBuf, Prev)>,
+        cause: io::Error,
+    ) -> io::Error {
+        let failures: Vec<String> = published
+            .into_iter()
+            .rev()
+            .filter_map(|(dest, previous)| {
+                restore_prev(&dest, previous)
+                    .err()
+                    .map(|e| format!("{}: {e}", dest.display()))
+            })
+            .collect();
+        if failures.is_empty() {
+            return cause;
+        }
+        let kept = self
+            .directory
+            .take()
+            .expect("failed publication owns staging")
+            .keep();
+        io::Error::other(format!(
+            "hook publication failed: {cause}; rollback failed: {}; saved files retained at {}",
+            failures.join("; "),
+            kept.display()
+        ))
     }
-    Ok(written)
 }
 
 /// Hook filenames under `<home>/.aterm/shell.d` that differ from what [`write_hooks`] lays.
@@ -895,7 +981,7 @@ pub(crate) fn ensure_rc_sources_hooks(
             })
             .and_then(|()| fs::rename(&tmp, &real));
         if written.is_err() {
-            let _ = fs::remove_file(&tmp);
+            let _ = fs::remove_file(tmp);
             outcomes.push((rc, RcOutcome::WriteFailed));
         } else {
             record_rc_wired(home, &real, &mut ledger);
@@ -1523,24 +1609,15 @@ fn ps_quote(bin_dir: &Path) -> String {
     bin_dir.to_string_lossy().replace('\'', "''")
 }
 
-fn stage_hook(dest: &Path, content: &str) -> io::Result<std::path::PathBuf> {
-    let name = dest
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "hook path has no file name"))?;
-    let parent = dest
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "hook path has no parent"))?;
-    let tmp = parent.join(format!(".{name}.tmp-{}", std::process::id()));
-    let _ = fs::remove_file(&tmp);
-    let staged = crate::platform::create_private_new(&tmp).and_then(|mut f| {
+fn stage_hook(tmp: &Path, content: &str) -> io::Result<std::path::PathBuf> {
+    let staged = crate::platform::create_private_new(tmp).and_then(|mut f| {
         io::Write::write_all(&mut f, content.as_bytes())?;
         crate::platform::set_mode_on(&f, 0o600)
     });
     match staged {
-        Ok(()) => Ok(tmp),
+        Ok(()) => Ok(tmp.to_path_buf()),
         Err(e) => {
-            let _ = fs::remove_file(&tmp);
+            let _ = fs::remove_file(tmp);
             Err(e)
         }
     }
@@ -2253,7 +2330,7 @@ mod tests {
         fs::write(&zshrc, user).unwrap();
         let shell_d = home.join(".aterm").join("shell.d");
         fs::create_dir_all(&shell_d).unwrap();
-        let blocked = shell_d.join(format!(".{HOOK_BASENAME}.zsh.tmp-{}", std::process::id()));
+        let blocked = shell_d.join(format!("{HOOK_BASENAME}.zsh"));
         fs::create_dir_all(&blocked).unwrap();
 
         refresh_at(
@@ -3278,14 +3355,17 @@ mod tests {
     #[test]
     fn a_failed_hook_write_replaces_none_of_the_dialects() {
         let d = tmp("writeset");
-        let blocked = d.join(format!(".{HOOK_BASENAME}.fish.tmp-{}", std::process::id()));
-        fs::create_dir_all(&blocked).unwrap();
-
-        let out = write_hooks(
+        let out = HookPublication::prepare_with(
             &d,
             Path::new("/p/bin"),
             Path::new("/p/agents"),
             Path::new("/p/reroute"),
+            |path, content| {
+                if path.extension().is_some_and(|e| e == "fish") {
+                    fs::create_dir(path).unwrap();
+                }
+                stage_hook(path, content)
+            },
         );
         assert!(
             out.is_err(),
@@ -3319,13 +3399,26 @@ mod tests {
         }
         fs::create_dir_all(d.join("00-atpkg.ps1").join("occupied")).unwrap();
 
-        let out = write_hooks(
+        let publication = HookPublication::prepare(
             &d,
             Path::new("/p/bin"),
             Path::new("/p/agents"),
             Path::new("/p/reroute"),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                crate::lock::Flock::try_lock(hook_lock_file(&d).unwrap()),
+                Err(std::fs::TryLockError::WouldBlock)
+            ),
+            "another writer cannot enter the staged transaction"
         );
+        let out = publication.publish();
         assert!(out.is_err(), "a rename onto a directory must fail the pass");
+        drop(
+            crate::lock::Flock::try_lock(hook_lock_file(&d).unwrap())
+                .expect("rollback releases its lock"),
+        );
 
         for name in ["00-atpkg.zsh", "00-atpkg.bash", "00-atpkg.fish"] {
             assert_eq!(
@@ -3340,7 +3433,7 @@ mod tests {
             .unwrap()
             .flatten()
             .filter_map(|e| e.file_name().to_str().map(str::to_owned))
-            .filter(|n| n.contains(".tmp-") || n.contains(".prev-"))
+            .filter(|n| n.starts_with("hook-publication-"))
             .collect();
         assert!(
             litter.is_empty(),
@@ -3562,6 +3655,108 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn publication_preserves_another_writers_staging_and_predecessor() {
+        let d = tmp("other-publication");
+        let stage = d.join(format!(".{HOOK_BASENAME}.zsh.tmp-{}", std::process::id()));
+        let saved = d.join(format!(".{HOOK_BASENAME}.zsh.prev-{}", std::process::id()));
+        fs::write(&stage, b"another transaction's staging").unwrap();
+        fs::write(&saved, b"another transaction's predecessor").unwrap();
+        fs::write(d.join("00-atpkg.zsh"), b"existing hook").unwrap();
+
+        write_hooks(
+            &d,
+            Path::new("/p/bin"),
+            Path::new("/p/agents"),
+            Path::new("/p/reroute"),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(stage).unwrap(), b"another transaction's staging");
+        assert_eq!(
+            fs::read(saved).unwrap(),
+            b"another transaction's predecessor"
+        );
+    }
+
+    #[test]
+    fn failed_rollback_retains_the_predecessor_and_releases_the_writer_lock() {
+        let d = tmp("rollback-retained");
+        let destination = d.join("00-atpkg.zsh");
+        fs::write(&destination, b"original bytes").unwrap();
+        let mut publication = HookPublication::prepare(
+            &d,
+            Path::new("/p/bin"),
+            Path::new("/p/agents"),
+            Path::new("/p/reroute"),
+        )
+        .unwrap();
+        let directory = publication.directory.as_ref().unwrap().path().to_path_buf();
+        let saved = directory.join("previous-00-atpkg.zsh");
+        let previous = move_aside(&destination, &saved).unwrap();
+        // An outside edit prevents restoring this destination; its predecessor must survive.
+        fs::create_dir(&destination).unwrap();
+        let error = publication.rollback(
+            vec![(destination.clone(), previous)],
+            io::Error::other("publish refused"),
+        );
+        drop(publication);
+        assert_eq!(fs::read(saved).unwrap(), b"original bytes");
+        assert!(destination.is_dir());
+        assert!(
+            error.to_string().contains(&directory.display().to_string()),
+            "{error}"
+        );
+        drop(
+            crate::lock::Flock::try_lock(hook_lock_file(&d).unwrap())
+                .expect("failed rollback releases its writer lock"),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_cannot_redirect_the_hook_writer_lock() {
+        let d = tmp("publication-lock-link");
+        let target = d.join("unrelated");
+        fs::write(&target, b"unrelated bytes").unwrap();
+        std::os::unix::fs::symlink(&target, d.join("hooks.lock")).unwrap();
+        assert!(
+            write_hooks(
+                &d,
+                Path::new("/p/bin"),
+                Path::new("/p/agents"),
+                Path::new("/p/reroute")
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"unrelated bytes");
+        assert!(!d.join("00-atpkg.zsh").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_restores_a_hook_link_without_modifying_its_target() {
+        let d = tmp("rollback-link");
+        let target = d.join("unrelated");
+        fs::write(&target, b"unrelated contents").unwrap();
+        std::os::unix::fs::symlink(&target, d.join("00-atpkg.zsh")).unwrap();
+        fs::create_dir(d.join("00-atpkg.ps1")).unwrap();
+        assert!(
+            write_hooks(
+                &d,
+                Path::new("/p/bin"),
+                Path::new("/p/agents"),
+                Path::new("/p/reroute")
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_link(d.join("00-atpkg.zsh")).unwrap(), target);
+        assert_eq!(
+            fs::read(d.join("unrelated")).unwrap(),
+            b"unrelated contents"
+        );
     }
 
     /// A hook that is already current is never rewritten (same inode), while one whose bytes

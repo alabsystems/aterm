@@ -326,7 +326,12 @@ impl EditLanded {
 }
 
 impl ConfigEdit<'_> {
-    /// Replace the text.
+    /// Replace changed text, returning the new backup's path where one was written.
+    /// Identical existing bytes return `None` after validating the locked snapshot,
+    /// leaving the file, metadata and prior backup untouched. No publication or flush
+    /// is performed in that case, so it supplies no new durability confirmation.
+    /// An absent file is still created, even when `text` is empty.
+    ///
     /// # Errors
     /// The target's bytes changed since [`ConfigFile::open`] read them — found before the `.bak` is
     /// written, or before the rename — or a write's own error: the target is left as it is. Or
@@ -345,6 +350,13 @@ impl ConfigEdit<'_> {
     ) -> io::Result<Option<PathBuf>> {
         let file = self.file;
         file.unchanged()?;
+        if file
+            .before
+            .as_ref()
+            .is_some_and(|(old, _)| old.as_slice() == text.as_bytes())
+        {
+            return Ok(None);
+        }
         let (bak, mode) = match &file.before {
             Some((old, mode)) => {
                 let mut bak = file.target.clone().into_os_string();

@@ -3866,7 +3866,7 @@ fn named_here(
     what: &str,
     unread: Option<&Missed>,
 ) -> Result<Option<Peer>, String> {
-    if let Some(node) = registry_label_node(places, what)? {
+    if let Some(node) = registry_label_node(places, what, None)? {
         return Ok(book
             .iter()
             .find(|peer| peer.node.as_deref() == Some(&node))
@@ -5260,7 +5260,7 @@ fn names_this_machine(places: &Places, word: &str) -> Result<Option<String>, Str
     if word.is_empty() {
         return Ok(None);
     }
-    if let Some(node) = registry_label_node(places, word)? {
+    if let Some(node) = registry_label_node(places, word, None)? {
         return Ok((node == own).then_some(own));
     }
     let vault_paths = vault_paths_for(places);
@@ -7847,13 +7847,18 @@ fn bound_peer(places: &Places, what: &str, unread: Option<&Missed>) -> Result<Bo
 /// before brought none to keep (`unread`), so [`named_here`] refuses it as it does every word that
 /// names the issuer loosely: a member that joined since may answer to it.
 /// # Errors
-/// The book cannot be read, or `what` is a short name of more than one peer
-/// ([`member::several_short`]).
-fn host_word(places: &Places, what: &str, unread: Option<&Missed>) -> Result<String, String> {
+/// The book cannot be read, a registry label cannot be resolved by `by`, or `what` is a short name
+/// of more than one peer ([`member::several_short`]).
+fn host_word(
+    places: &Places,
+    what: &str,
+    unread: Option<&Missed>,
+    by: Instant,
+) -> Result<String, String> {
     if member::is_node_word(what) {
         return Ok(what.to_owned());
     }
-    if let Some(node) = registry_label_node(places, what)? {
+    if let Some(node) = registry_label_node(places, what, Some(by))? {
         return Ok(node);
     }
     host_word_among(places, what, unread, &roster_identities(places)?)
@@ -7861,11 +7866,20 @@ fn host_word(places: &Places, what: &str, unread: Option<&Missed>) -> Result<Str
 
 /// A registry label is authority only where its owner cell and the seat's signed facts
 /// agree. Transport ids from an older book are selected by key, never by a host name.
-fn registry_label_node(places: &Places, word: &str) -> Result<Option<String>, String> {
+fn registry_label_node(
+    places: &Places,
+    word: &str,
+    by: Option<Instant>,
+) -> Result<Option<String>, String> {
     let Some(label) = registry_label(word) else {
         return Ok(None);
     };
-    registry_target(places, &label).map(|seat| seat.map(|seat| seat.transport))
+    registry_target_until(
+        places,
+        &label,
+        by.unwrap_or_else(|| after_now(REGISTRY_READ)),
+    )
+    .map(|seat| seat.map(|seat| seat.transport))
 }
 
 fn registry_label(word: &str) -> Option<String> {
@@ -7902,13 +7916,13 @@ fn registry_unread(word: &str, why: &dyn std::fmt::Display) -> String {
 }
 
 fn registry_target(places: &Places, word: &str) -> Result<Option<RegistryTarget>, String> {
-    registry_target_started(places, word, std::time::Instant::now())
+    registry_target_until(places, word, after_now(REGISTRY_READ))
 }
 
-fn registry_target_started(
+fn registry_target_until(
     places: &Places,
     word: &str,
-    started: std::time::Instant,
+    by: Instant,
 ) -> Result<Option<RegistryTarget>, String> {
     let explicit = member::is_node_id(word);
     let label = if explicit { None } else { registry_label(word) };
@@ -7920,7 +7934,9 @@ fn registry_target_started(
         return Ok(None);
     };
     let registry = (!explicit)
-        .then(|| aterm_db::alab::Registry::at(paths.clone()).view_until(started + REGISTRY_READ))
+        .then(|| {
+            aterm_db::alab::Registry::at(paths.clone()).view_until(by.min(after_now(REGISTRY_READ)))
+        })
         .transpose()
         .map_err(|why| registry_unread(word, &why))?;
     if registry.as_ref().is_some_and(|view| !view.complete) {
@@ -8880,7 +8896,7 @@ fn drive_fleet_proven_in(
         (after_now(check), check),
     );
     // A Mac's short name (`m102`) binds the one peer it names, by its whole node id.
-    let mut word = host_word(places, host, unread.as_ref())?;
+    let mut word = host_word(places, host, unread.as_ref(), deadline.0)?;
     if let Some(own) = this_machine_alone(places, &word, unread.as_ref()).map_err(|why| {
         aterm_ctl::DriveRefused {
             again: unread.as_ref().is_some_and(|missed| missed.silent),
@@ -8919,7 +8935,7 @@ fn drive_fleet_proven_in(
         if !read {
             match copy_again(places, &secret, Some(&me), (after_now(check), check)) {
                 Ok(true) => {
-                    word = host_word(places, host, None)?;
+                    word = host_word(places, host, None, deadline.0)?;
                     if let Some(own) = this_machine_alone(places, &word, None)? {
                         return Err(itself(&own));
                     }
@@ -9266,7 +9282,7 @@ fn survey_fleet_in(
             (after_now(check), check),
         );
         // A Mac's short name (`m102`) reads the one peer it names, by its whole node id.
-        let mut word = host_word(places, what, missed.as_ref())?;
+        let mut word = host_word(places, what, missed.as_ref(), deadline.0)?;
         if let Some(own) = this_machine_alone(places, &word, missed.as_ref()).map_err(|why| {
             aterm_ctl::FleetRefused {
                 why,
@@ -9303,7 +9319,7 @@ fn survey_fleet_in(
                         let known = known_peers(places).map_err(failure_words)?;
                         keys = known.keys;
                         book = known.peers.into_iter().map(|(peer, _)| peer).collect();
-                        word = host_word(places, what, None)?;
+                        word = host_word(places, what, None, deadline.0)?;
                         if let Some(own) = this_machine_alone(places, &word, None)? {
                             return Err(itself(&own).into());
                         }
@@ -9983,7 +9999,7 @@ fn replace_held(_held: &impl Beside, config: &ConfigFile, text: &str) -> Result<
 /// What [`replace_held`] left in effect.
 #[derive(Debug)]
 struct Edited {
-    /// Where the previous text was saved; `None` when there was no file.
+    /// Where the previous text was saved; `None` when no new backup was written.
     bak: Option<PathBuf>,
     /// The folder's flush error, where it failed after the edit's rename.
     unflushed: Option<String>,

@@ -10,7 +10,7 @@ use crate::animate::{BandMotion, Look, Pace};
 use crate::glass::{Links, Presentation};
 use crate::ink::{self, BandInks, Resolved};
 use crate::log::{LogLine, Shelf};
-use crate::paint::{self, BandKey, Geometry, Hover};
+use crate::paint::{BandKey, Geometry, Hover};
 use crate::wire::WireGate;
 use crate::{Instant, MAX_ROWS, MessageCenter};
 
@@ -94,17 +94,11 @@ pub fn state_deadline(center: &MessageCenter, gate: &WireGate, frozen: bool) -> 
 
 /// What decides a view's look, each a host's own reading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "four independent host readings, each a yes or no"
-)]
 pub struct LookIn {
     /// Whether the host's motion gates allow the band to animate.
     pub motion_allowed: bool,
     /// The view is on screen (not occluded, minimized or headless).
     pub on_screen: bool,
-    /// A handoff freezes the band.
-    pub frozen: bool,
     /// An OS-forced palette owns the chrome (High Contrast).
     pub forced: bool,
 }
@@ -113,7 +107,7 @@ pub struct LookIn {
 #[must_use]
 pub const fn look(i: LookIn) -> Look {
     Look {
-        pace: if i.on_screen && !i.frozen && i.motion_allowed {
+        pace: if i.on_screen && i.motion_allowed {
             Pace::Moving
         } else {
             Pace::Still
@@ -129,8 +123,6 @@ pub struct Lay {
     pub cols: usize,
     /// Whether rows end in their links ([`Links`]).
     pub links: Links,
-    /// The home paths under which are printed `~/…` (`None`: none).
-    pub home: fn() -> Option<String>,
 }
 
 impl Lay {
@@ -144,20 +136,13 @@ impl Lay {
             } else {
                 Links::Withheld
             },
-            home: || None,
         }
     }
 
     /// The width law's layout of `center` at this view's width.
     #[must_use]
     pub fn presentation(&self, center: &MessageCenter) -> Presentation {
-        let home = (self.home)();
-        center.presentation(
-            self.cols,
-            &crate::text::char_width,
-            home.as_deref(),
-            self.links,
-        )
+        center.presentation(self.cols, &crate::text::char_width, self.links)
     }
 }
 
@@ -179,8 +164,6 @@ pub struct View {
     layout: Option<(u64, usize, Presentation)>,
     /// The motion frame the next present reads; `None` with no row.
     motion: Option<BandMotion>,
-    /// [`Self::motion`]'s fingerprint (0 when nothing moves).
-    motion_fp: u64,
     /// Monotone generation bumped whenever prepared `motion.rows` structurally changes.
     motion_gen: u64,
     /// The look [`Self::motion`] was drawn in.
@@ -207,7 +190,6 @@ impl View {
         if fp == 0 {
             self.layout = None;
             self.motion = None;
-            self.motion_fp = 0;
             self.look = None;
             self.memo.set(None);
             return 0;
@@ -224,7 +206,6 @@ impl View {
             self.motion_gen = self.motion_gen.wrapping_add(1);
         }
         self.motion = Some(motion);
-        self.motion_fp = mfp;
         self.look = Some(look);
         mfp
     }
@@ -326,28 +307,6 @@ impl View {
         self.scan(center, &p, now, look)
     }
 
-    /// Returns whether the view is due a new frame at `now`.
-    #[must_use]
-    pub(crate) fn due(&self, center: &MessageCenter, lay: &Lay, now: Instant, look: Look) -> bool {
-        if self.motion.is_some() && self.look != Some(look) {
-            return center.fingerprint(lay.cols) != 0;
-        }
-        self.next_frame(center, lay, now, look)
-            .is_some_and(|d| d <= now || self.motion.is_none())
-    }
-
-    /// Returns the band repaint fingerprint for this view.
-    #[must_use]
-    pub fn band_fp(
-        &self,
-        center: &MessageCenter,
-        cols: usize,
-        hover: Option<Hover>,
-        geom: Geometry,
-    ) -> u64 {
-        paint::band_fp(center.fingerprint(cols), hover, geom, self.motion_fp)
-    }
-
     /// Paints the view's rows when their inputs changed, or returns `None` if unchanged.
     pub fn paint(
         &mut self,
@@ -404,12 +363,6 @@ impl View {
         self.look
     }
 
-    /// The prepared frame's fingerprint (0 when nothing moves).
-    #[must_use]
-    pub const fn motion_fp(&self) -> u64 {
-        self.motion_fp
-    }
-
     /// How many next-change scans this view has run.
     #[must_use]
     pub const fn deadline_computations(&self) -> u64 {
@@ -427,33 +380,14 @@ impl View {
 pub fn motion_deadline_over<'a>(
     center: &MessageCenter,
     reserved: u16,
-    frozen: bool,
     now: Instant,
     views: impl IntoIterator<Item = (&'a View, Lay, Look)>,
 ) -> Option<Instant> {
-    if reserved == 0 || frozen {
+    if reserved == 0 {
         return None;
     }
     views
         .into_iter()
         .filter_map(|(v, lay, look)| v.motion_deadline(center, &lay, now, look))
         .min()
-}
-
-/// Returns the keys of on-screen `views` that are due a new frame at `now`.
-pub fn due_views<'a, K>(
-    center: &MessageCenter,
-    reserved: u16,
-    frozen: bool,
-    now: Instant,
-    views: impl IntoIterator<Item = (K, &'a View, Lay, Look)>,
-) -> Vec<K> {
-    if reserved == 0 || frozen {
-        return Vec::new();
-    }
-    views
-        .into_iter()
-        .filter(|(_, v, lay, look)| v.due(center, lay, now, *look))
-        .map(|(k, ..)| k)
-        .collect()
 }

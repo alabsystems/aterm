@@ -6,12 +6,12 @@
 use std::path::PathBuf;
 
 use aterm_agent::harness::footer::{FactKind, FactMask};
+use aterm_agent::harness::outlook::Figure;
 use aterm_agent::harness::session_usage::TrafficView;
 
 use super::{
-    AccountLabel, AccountMenuRow, FactAct, FactMenuFacts, RowWeek, SessionWeek,
-    account_menu_rows_from, band_glyphs, band_level, rows, traffic_rows, weekly_facts,
-    weekly_gap_why,
+    AccountLabel, AccountMenuRow, FactAct, FactMenuFacts, SessionWeek, account_menu_rows_from,
+    band_glyphs, band_level, rows, traffic_rows, weekly_facts, weekly_gap_why,
 };
 use crate::autopilot_menu::{MenuAct, MenuRow, PlotInk};
 use crate::claude_lights::Fact;
@@ -815,9 +815,9 @@ fn the_account_menu_says_why_the_week_is_missing() {
 
 /// THE ACCOUNT MENU TAKES THE FOOTER'S WEEK as the footer says it: a figure's words (`weekly 39%
 /// used`, a bound `weekly ≥38% used`) give the card's weekly words as said and the session's row
-/// its whole percent left, an aged figure its age as a store row's, a 7d wall gives `weekly out`
-/// (never a percentage) and the session's row a limited one, and with neither the footer's reason
-/// goes to the menu's why.
+/// the same figure used (exact, or the bound), the session's own figure read past fifteen minutes
+/// a lower bound, a 7d wall gives `weekly out` (never a percentage) and the session's row
+/// [`Figure::Out`], and with neither the footer's reason goes to the menu's why.
 #[test]
 fn the_account_menu_takes_the_footers_week_or_its_reason() {
     use aterm_agent::harness::profile::{SubscriptionDisplay, WeeklyFigure, WeeklyGap};
@@ -827,16 +827,24 @@ fn the_account_menu_takes_the_footers_week_or_its_reason() {
         weekly_gap: gap,
         ..SubscriptionDisplay::default()
     };
-    let left = |pct: u32, age: &str| Some(RowWeek::Left(pct, age.to_owned()));
     assert_eq!(
         weekly_facts(&sub(Some("weekly 39% used"), None), false, NOW),
-        (left(61, ""), Some("weekly 39% used".into()), None),
-        "the words are said as they are and give the row's percent left"
+        (
+            Some(Figure::Exact(390)),
+            Some("weekly 39% used".into()),
+            None
+        ),
+        "the words are said as they are and give the row the figure they say"
     );
     assert_eq!(
         weekly_facts(&sub(Some("weekly \u{2265}38% used"), None), false, NOW).0,
-        left(62, ""),
-        "an aged figure's words with no figure behind them"
+        Some(Figure::AtLeast(380)),
+        "an aged figure's words with no figure behind them: the bound they say"
+    );
+    assert_eq!(
+        weekly_facts(&sub(Some("weekly 100% used"), None), false, NOW).0,
+        Some(Figure::Exact(1000)),
+        "a reading's 100, said as read"
     );
     let aged = SubscriptionDisplay {
         weekly_figure: Some(WeeklyFigure {
@@ -848,12 +856,12 @@ fn the_account_menu_takes_the_footers_week_or_its_reason() {
     };
     assert_eq!(
         weekly_facts(&aged, false, NOW).0,
-        left(62, " \u{b7} 40m ago"),
-        "the session's own aged figure keeps its age in its row"
+        Some(Figure::AtLeast(380)),
+        "the session's own aged figure is a lower bound in its row, never an age"
     );
     assert_eq!(
         weekly_facts(&aged, false, NOW - 30 * 60).0,
-        left(62, ""),
+        Some(Figure::Exact(380)),
         "the control: the same figure while current"
     );
     assert_eq!(
@@ -869,10 +877,10 @@ fn the_account_menu_takes_the_footers_week_or_its_reason() {
         ..aged.clone()
     };
     assert_eq!(weekly_facts(&future, false, NOW), (None, None, None));
-    assert_eq!(weekly_facts(&future, true, NOW).0, Some(RowWeek::Out));
+    assert_eq!(weekly_facts(&future, true, NOW).0, Some(Figure::Out));
     assert_eq!(
         weekly_facts(&aged, true, NOW + 86_400).0,
-        Some(RowWeek::Out),
+        Some(Figure::Out),
         "a 7d wall still says its own"
     );
     assert_eq!(
@@ -882,16 +890,19 @@ fn the_account_menu_takes_the_footers_week_or_its_reason() {
     );
     assert_eq!(
         weekly_facts(&sub(None, Some(WeeklyGap::NoReply)), true, NOW),
-        (Some(RowWeek::Out), Some("weekly out".into()), None),
+        (Some(Figure::Out), Some("weekly out".into()), None),
         "a 7d wall over every reason"
     );
 }
 
-/// AN ACCOUNT ROW SAYS HOW OLD ITS STORE FIGURE IS (the footer's one age rule): current for
-/// fifteen minutes, then with its age, however old, while its week runs; never an old
-/// figure read as current, nor dropped to an inferred `100% left` for an account nobody read.
+/// AN ACCOUNT ROW SAYS ITS AGED STORE FIGURE AS A LOWER BOUND (the footer's one age rule,
+/// `docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1): exact for fifteen minutes (`39%
+/// used`), then, however old, a bound rounded down (`≥38% used`) while its week runs, since use
+/// only rises within a week; never an old figure read as exact, nor an inferred `100%` for an
+/// account nobody read, nor an age. Each source is dated by its own reading: a tap's or a
+/// sample's beyond the clock's skew is not one.
 #[test]
-fn an_account_rows_store_figure_carries_its_age() {
+fn an_account_rows_aged_store_figure_is_a_lower_bound() {
     use aterm_agent::harness::accounts;
     const NOW: i64 = 1_790_000_000;
     let roster = accounts::Roster {
@@ -936,7 +947,7 @@ fn an_account_rows_store_figure_carries_its_age() {
         rows[0].label.clone()
     };
     let label = |at: i64| label_with(at, None);
-    assert_eq!(label(NOW - 60), "main \u{b7} preferred \u{b7} 61% left");
+    assert_eq!(label(NOW - 60), "main \u{b7} preferred \u{b7} 39% used");
     assert_eq!(label(NOW + 60), label(NOW - 60));
     let mut observed = accounts::State::default();
     accounts::note_auth(&mut observed, "main", accounts::Auth::Ok, NOW);
@@ -957,7 +968,7 @@ fn an_account_rows_store_figure_carries_its_age() {
     assert_eq!(label(NOW + 120), unknown);
     assert_eq!(label(0), unknown);
     let sampled = |read_at| accounts::Sample {
-        week_pct: Some(39),
+        week_pct: Some(41),
         week_reset: Some(NOW + 86_400),
         week_read_at: Some(read_at),
         at: NOW + 120,
@@ -965,27 +976,27 @@ fn an_account_rows_store_figure_carries_its_age() {
     };
     assert_eq!(
         label_with(NOW + 120, Some(sampled(NOW - 20 * 60))),
-        label(NOW - 20 * 60)
+        "main \u{b7} preferred \u{b7} \u{2265}41% used",
+        "a tap beyond the skew is no reading: the sample's"
     );
     assert_eq!(
         label_with(NOW - 20 * 60, Some(sampled(NOW + 120))),
-        label(NOW - 20 * 60)
-    );
-    assert_eq!(
         label(NOW - 20 * 60),
-        "main \u{b7} preferred \u{b7} 61% left \u{b7} 20m ago"
+        "a sample beyond the skew is no reading: the tap's"
     );
-    assert_eq!(
-        label(NOW - 3 * 3600),
-        "main \u{b7} preferred \u{b7} 61% left \u{b7} 3h ago"
-    );
-    assert_eq!(
-        label(NOW - 2 * 86_400),
-        "main \u{b7} preferred \u{b7} 61% left \u{b7} 2d ago",
-        "a two-day-old reading whose week still runs"
-    );
+    for (age, what) in [
+        (20 * 60, "twenty minutes"),
+        (3 * 3600, "three hours"),
+        (2 * 86_400, "a two-day-old reading whose week still runs"),
+    ] {
+        assert_eq!(
+            label(NOW - age),
+            "main \u{b7} preferred \u{b7} \u{2265}38% used",
+            "{what}: a bound rounded down, never `≥39%`, and no age"
+        );
+    }
     let restamped = accounts::Sample {
-        week_pct: Some(39),
+        week_pct: Some(41),
         week_reset: Some(NOW + 86_400),
         week_read_at: Some(NOW - 3 * 3600),
         at: NOW - 60,
@@ -993,8 +1004,8 @@ fn an_account_rows_store_figure_carries_its_age() {
     };
     assert_eq!(
         label_with(NOW - 3 * 3600, Some(restamped)),
-        "main \u{b7} preferred \u{b7} 61% left \u{b7} 3h ago",
-        "a tap's note re-stamps the week it holds: as old as the window's reading"
+        "main \u{b7} preferred \u{b7} \u{2265}38% used",
+        "a tap's note re-stamps the week it holds: as old as the window's reading, never read now"
     );
     let (rows, _) = account_menu_rows_from(
         &roster,
@@ -1006,13 +1017,17 @@ fn an_account_rows_store_figure_carries_its_age() {
         SessionWeek {
             label: None,
             figure: None,
-            left: Some(RowWeek::Left(62, " \u{b7} 40m ago".into())),
+            said: Some(Figure::AtLeast(380)),
         },
         NOW,
     );
     assert_eq!(
-        rows[0].label, "main \u{b7} preferred \u{b7} 62% left \u{b7} 40m ago",
-        "no store figure: the session's own, with its age"
+        rows[0].label, "main \u{b7} preferred \u{b7} \u{2265}38% used",
+        "no store figure: the session's own, its bound kept"
+    );
+    assert_eq!(
+        rows[0].spoken, "main, preferred, at least 38 percent used",
+        "a reader hears the bound in words"
     );
     let beside = |session: Option<&str>, at: i64| {
         let mut state = accounts::State::default();
@@ -1044,7 +1059,7 @@ fn an_account_rows_store_figure_carries_its_age() {
             SessionWeek {
                 label: None,
                 figure: Some(figure),
-                left: Some(RowWeek::Left(40, String::new())),
+                said: Some(Figure::Exact(600)),
             },
             NOW,
         );
@@ -1052,17 +1067,17 @@ fn an_account_rows_store_figure_carries_its_age() {
     };
     assert_eq!(
         beside(Some("main"), NOW - 60),
-        "main \u{b7} preferred \u{b7} 40% left",
+        "main \u{b7} preferred \u{b7} 60% used",
         "the session's own figure, read since the store's, on its own account's row"
     );
     assert_eq!(
         beside(Some("main"), NOW - 3 * 86_400),
-        "main \u{b7} preferred \u{b7} 61% left \u{b7} 2d ago",
+        "main \u{b7} preferred \u{b7} \u{2265}38% used",
         "the store's, read since the session's"
     );
     assert_eq!(
         beside(Some("other"), NOW - 60),
-        "main \u{b7} preferred \u{b7} 61% left \u{b7} 2d ago",
+        "main \u{b7} preferred \u{b7} \u{2265}38% used",
         "the control: another account's session figure never reaches this row"
     );
     {
@@ -1091,12 +1106,12 @@ fn an_account_rows_store_figure_carries_its_age() {
             SessionWeek {
                 label: None,
                 figure: Some(figure),
-                left: None,
+                said: None,
             },
             NOW,
         );
         assert_eq!(
-            rows[0].label, "main \u{b7} preferred \u{b7} 40% left \u{b7} 25m ago",
+            rows[0].label, "main \u{b7} preferred \u{b7} \u{2265}60% used",
             "the session's own figure wins over a warned_week when no store window figure exists"
         );
     }
@@ -1154,7 +1169,7 @@ fn an_account_rows_store_figure_carries_its_age() {
                     resets_at: NOW + 86_400,
                     at: NOW - 60,
                 }),
-                left: Some(RowWeek::Left(40, String::new())),
+                said: Some(Figure::Exact(600)),
             },
             NOW,
         )
@@ -1162,9 +1177,9 @@ fn an_account_rows_store_figure_carries_its_age() {
     };
     let rows = menu(None, Some("main@example.test"), true);
     assert!(rows[0].active && !rows[1].active);
-    assert!(rows[0].label.ends_with("40% left"));
+    assert!(rows[0].label.ends_with("\u{b7} 60% used"));
     assert!(
-        rows[1].label.ends_with("80% left \u{b7} 40m ago"),
+        rows[1].label.ends_with("\u{b7} \u{2265}20% used"),
         "a custom-home session identified only by email cannot replace machine-active work's figure"
     );
     for (label, email) in [
@@ -1177,9 +1192,9 @@ fn an_account_rows_store_figure_carries_its_age() {
             !rows[0].active && rows[1].active,
             "the machine's UI fallback"
         );
-        assert!(rows[0].label.ends_with("61% left \u{b7} 40m ago"));
+        assert!(rows[0].label.ends_with("\u{b7} \u{2265}38% used"));
         assert!(
-            rows[1].label.ends_with("80% left \u{b7} 40m ago"),
+            rows[1].label.ends_with("\u{b7} \u{2265}20% used"),
             "an unknown or contradictory session identity lends no figure to the active row"
         );
         let rows = menu(label, email, false);
@@ -1190,11 +1205,11 @@ fn an_account_rows_store_figure_carries_its_age() {
     }
     let rows = menu(Some("main"), None, true);
     assert!(
-        rows[0].label.ends_with("40% left"),
+        rows[0].label.ends_with("\u{b7} 60% used"),
         "its own explicit label"
     );
     let rows = menu(None, Some("main@example.test"), false);
-    assert!(rows[0].label.ends_with("40% left"));
+    assert!(rows[0].label.ends_with("\u{b7} 60% used"));
     assert!(
         !rows[1].label.contains('%'),
         "only the email's own row takes its words"
@@ -1260,7 +1275,7 @@ fn quota_rows_keep_only_time_admitted_post_refill_fallbacks() {
         let session = SessionWeek {
             label: Some("main".into()),
             figure: Some(figure),
-            left: Some(RowWeek::Left(20, String::new())),
+            said: Some(Figure::Exact(800)),
         };
         let got = row(&state, session.clone(), NOW);
         if own_after {
@@ -1346,7 +1361,7 @@ fn the_sessions_week_reaches_the_row_its_login_is_judged_to() {
                     resets_at: NOW + 86_400,
                     at: NOW - 60,
                 }),
-                left: Some(RowWeek::Left(10, String::new())),
+                said: Some(Figure::Exact(900)),
             },
             NOW,
         );
@@ -1354,17 +1369,17 @@ fn the_sessions_week_reaches_the_row_its_login_is_judged_to() {
     };
     assert_eq!(
         row(Some("main"), None),
-        ("main \u{b7} preferred \u{b7} 10% left".into(), true),
+        ("main \u{b7} preferred \u{b7} 90% used".into(), true),
         "the row its login is judged to takes its newer figure, with no email to match"
     );
     let kept = (
-        "main \u{b7} preferred \u{b7} 61% left \u{b7} 30m ago".to_string(),
+        "main \u{b7} preferred \u{b7} \u{2265}38% used".to_string(),
         true,
     );
     for label in [Some("main"), None] {
         assert_eq!(
             row(label, Some("canonical@example.test")),
-            ("main \u{b7} preferred \u{b7} 10% left".into(), true),
+            ("main \u{b7} preferred \u{b7} 90% used".into(), true),
             "the provider identity selects the alias row's newer figure"
         );
         assert_eq!(
@@ -1396,7 +1411,8 @@ fn account_menu_shows_weekly_words_and_rotation_accounts() {
         accounts: vec![
             AccountMenuRow {
                 account: AccountLabel::new("m27").unwrap(),
-                label: "m27 \u{b7} dedicated \u{b7} 0% left (limited)".into(),
+                label: "m27 \u{b7} dedicated \u{b7} 100% used (limited)".into(),
+                spoken: "m27, dedicated, 100 percent used, limited".into(),
                 active: true,
                 enabled: true,
             },
@@ -1404,12 +1420,14 @@ fn account_menu_shows_weekly_words_and_rotation_accounts() {
                 account: AccountLabel::new("m27-2").unwrap(),
                 label: "m27-2 \u{b7} dedicated \u{b7} not-enrolled; quota unknown (auto-login)"
                     .into(),
+                spoken: "m27-2, dedicated, not-enrolled, quota unknown, auto-login".into(),
                 active: false,
                 enabled: true,
             },
             AccountMenuRow {
                 account: AccountLabel::new("m27-3").unwrap(),
                 label: "m27-3 \u{b7} pool \u{b7} not-enrolled; quota unknown (auto-login)".into(),
+                spoken: "m27-3, pool, not-enrolled, quota unknown, auto-login".into(),
                 active: false,
                 enabled: true,
             },
@@ -1525,8 +1543,8 @@ fn account_menu_shows_weekly_words_and_rotation_accounts() {
 
 /// The Account menu's rows tell an auto-login row from a disabled one, and a walled row says
 /// `out (limited)`, never a percentage (glass design §2.1: never an inferred 100%). Negative
-/// control: a limited row or a footer's wall said `0% left (limited)` (the S1 slice before its
-/// review) fails the walled row.
+/// control: a limited row or a footer's wall said with a percentage (`0% left (limited)`, the S1
+/// slice before its review; an inferred `100% used (limited)`) fails the walled row.
 #[test]
 fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
     use aterm_agent::harness::accounts;
@@ -1596,7 +1614,7 @@ fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
         SessionWeek {
             label: None,
             figure: None,
-            left: Some(RowWeek::Out),
+            said: Some(Figure::Out),
         },
         NOW,
     );
@@ -2120,11 +2138,12 @@ fn no_weekly_why_tells_the_person_to_open_usage() {
 }
 
 /// T8 (`docs/DESIGN-accounts-outlook-2026-10-25.md` §6, §11): AN ACCOUNT ROW WITH NO FIGURE
-/// SHOWS NO NUMBER, NEVER AN INFERRED `100% left`: an account nobody read here (`Unseen`), one
-/// whose login is not made here but signs in by itself (`NotEnrolled` with an email), and one on
-/// record with no figure of its week (`Usable`, its login proven only) may each be spent
-/// elsewhere, so each says its condition and that its quota is unknown, and the one that signs
-/// in by itself keeps its `(auto-login)`. Negative control: the `100%` fallback restored.
+/// SHOWS NO NUMBER, NEVER AN INFERRED ONE (an unread week as `0% used`, as `100% left` was):
+/// an account nobody read here (`Unseen`), one whose login is not made here but signs in by
+/// itself (`NotEnrolled` with an email), and one on record with no figure of its week (`Usable`,
+/// its login proven only) may each be spent elsewhere, so each says its condition and that its
+/// quota is unknown, and the one that signs in by itself keeps its `(auto-login)`. Negative
+/// control: an unread week given a figure (the old `100% left` fallback) restored.
 #[test]
 fn no_row_reads_full_without_a_figure() {
     use aterm_agent::harness::accounts;
@@ -2173,4 +2192,175 @@ fn no_row_reads_full_without_a_figure() {
     }
     assert!(labels[1].ends_with("(auto-login)"), "{}", labels[1]);
     assert!(!labels[0].ends_with("(auto-login)") && !labels[2].ends_with("(auto-login)"));
+}
+
+/// NO GLASS WEEK FIGURE SAYS LEFT (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1: "Use"
+/// is the owner's word, and `% left` leaves the glass). Over Account menu rows of every condition
+/// and figure (a wall, signed out and not enrolled each with and without auto-login, a fresh
+/// reading, an aged one, one of 99.5% and one of 100%, a warned week, and none), each label says
+/// its week used in the glass's forms (`39% used`, an older reading's bound `≥38% used`, a wall's
+/// `out (limited)`, `100%` only where a reading said 100) and each spoken row says it in words
+/// (`at least 38 percent used`), and no row says `left`. Negative control: the rows' words before
+/// 2026-11-07 (`row_figure`'s `61% left`, an aged one's `61% left · 3h ago`, a read 100's `0% left
+/// (limited)`) fail it.
+#[test]
+fn no_glass_week_figure_says_left() {
+    use aterm_agent::harness::accounts;
+    const NOW: i64 = 1_790_000_000;
+    let row = |label: &str, dir: &str, email: bool| accounts::Row {
+        label: label.into(),
+        class: accounts::Class::Pool,
+        dir: Some(format!("/synthetic/{dir}")),
+        email: email.then(|| format!("{label}@example.test")),
+        ..accounts::Row::default()
+    };
+    let roster = accounts::Roster {
+        rows: vec![
+            row("walled", "walled", true),
+            row("fresh", "fresh", false),
+            row("aged", "aged", false),
+            row("nearly", "nearly", false),
+            row("spent", "spent", false),
+            row("warned", "warned", false),
+            row("gone", "gone", true),
+            row("gone-quiet", "gone-quiet", false),
+            row("away", "away", true),
+            row("away-quiet", "away-quiet", false),
+            row("away-unread", "away-unread", true),
+            row("unread", "unread", false),
+        ],
+    };
+    let enrolled = roster
+        .rows
+        .iter()
+        .map(|row| row.label.clone())
+        .filter(|label| !label.starts_with("away"))
+        .collect();
+    let mut state = accounts::State::default();
+    for (label, pct_x10, at) in [
+        ("fresh", 385, NOW - 60),
+        ("aged", 385, NOW - 3 * 3600),
+        ("nearly", 995, NOW - 60),
+        ("spent", 1000, NOW - 60),
+        ("gone", 200, NOW - 60),
+        ("away", 500, NOW - 3 * 3600),
+    ] {
+        state
+            .accounts
+            .entry(label.into())
+            .or_default()
+            .windows
+            .insert(
+                accounts::WEEK_LIMIT.into(),
+                accounts::WindowFig {
+                    pct_x10,
+                    reset: NOW + 86_400,
+                    at,
+                    by: "m22".into(),
+                    source: accounts::SOURCE_TAP.into(),
+                    epoch_at: None,
+                },
+            );
+    }
+    state
+        .accounts
+        .entry("warned".into())
+        .or_default()
+        .warned_week = Some(accounts::WindowSaid {
+        pct: Some(70),
+        reset: Some(NOW + 86_400),
+        at: NOW - 60,
+    });
+    let _ = accounts::note_wall(
+        &mut state,
+        "walled",
+        accounts::WEEK_LIMIT,
+        Some(NOW + 86_400),
+        NOW - 60,
+        NOW,
+    );
+    for label in ["gone", "gone-quiet"] {
+        let _ = accounts::note_auth(&mut state, label, accounts::Auth::SignedOut, NOW);
+    }
+    let _ = accounts::note_auth(&mut state, "unread", accounts::Auth::Ok, NOW);
+    let words = |auto_login: bool| {
+        account_menu_rows_from(
+            &roster,
+            &state,
+            &enrolled,
+            auto_login,
+            None,
+            None,
+            SessionWeek::default(),
+            NOW,
+        )
+        .0
+        .into_iter()
+        .map(|row| {
+            let (label, week) = row.label.split_once(" \u{b7} pool \u{b7} ").unwrap();
+            (label.to_owned(), week.to_owned(), row.spoken)
+        })
+        .collect::<Vec<_>>()
+    };
+    let said = |label: &str, week: &str, spoken: &str| {
+        (
+            label.to_owned(),
+            week.to_owned(),
+            format!("{label}, pool, {spoken}"),
+        )
+    };
+    assert_eq!(
+        words(true),
+        [
+            said("walled", "out (limited)", "out, limited"),
+            said("fresh", "39% used", "39 percent used"),
+            said("aged", "\u{2265}38% used", "at least 38 percent used"),
+            said("nearly", "99% used", "99 percent used"),
+            said("spent", "100% used (limited)", "100 percent used, limited"),
+            said("warned", "70% used", "70 percent used"),
+            said("gone", "signed out (auto-login)", "signed out, auto-login"),
+            said("gone-quiet", "signed out", "signed out"),
+            said(
+                "away",
+                "\u{2265}50% used (auto-login)",
+                "at least 50 percent used, auto-login"
+            ),
+            said("away-quiet", "not enrolled", "not enrolled"),
+            said(
+                "away-unread",
+                "not-enrolled; quota unknown (auto-login)",
+                "not-enrolled, quota unknown, auto-login"
+            ),
+            said("unread", "usable; quota unknown", "usable, quota unknown"),
+        ]
+    );
+    for auto_login in [true, false] {
+        for (label, week, spoken) in words(auto_login) {
+            let what = format!("{label} (auto-login {auto_login}): {week:?}, {spoken:?}");
+            assert!(
+                !week.contains("left") && !spoken.contains("left"),
+                "the week is said used, never left: {what}"
+            );
+            assert!(
+                week.match_indices('%')
+                    .all(|(at, _)| week[at..].starts_with("% used")),
+                "every figure says used: {what}"
+            );
+            assert!(
+                !spoken.contains(['%', '\u{2265}']),
+                "a reader hears the figure in words: {what}"
+            );
+            assert_eq!(
+                week.contains("100%"),
+                label == "spent",
+                "100% only where a reading said 100: {what}"
+            );
+            if label == "walled" {
+                assert!(
+                    !week.contains(|c: char| c.is_ascii_digit()),
+                    "a wall says out, never a percentage: {what}"
+                );
+            }
+        }
+    }
 }

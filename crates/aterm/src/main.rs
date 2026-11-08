@@ -321,7 +321,7 @@ fn node_unavailable() -> ExitCode {
 }
 
 /// The background Commons runtime `aterm node serve` holds, once it started
-/// ([`spawn_node_commons_runtime`]).
+/// ([`node_commons_startup`]).
 #[cfg(unix)]
 static NODE_COMMONS: std::sync::OnceLock<aterm_db::runtime::Runtime> = std::sync::OnceLock::new();
 
@@ -342,39 +342,21 @@ fn commons_host_enabled() -> bool {
 }
 
 /// Start `aterm node serve`'s background Commons runtime (C22) while `[swarm] enabled` leaves
-/// sharing on, else once a person turns it on ([`commons_lan::when_sharing_on`]), publishing its
+/// sharing on, retaining a failed start until its owned maintenance can retry, publishing its
 /// observation to the account claims and its peers to the node job's "network moved" signal.
 #[cfg(unix)]
-fn spawn_node_commons_runtime() {
+fn node_commons_startup() -> Option<commons_lan::Startup> {
     if !commons_host_enabled() {
-        return;
+        return None;
     }
-    let Ok(paths) = aterm_secrets::client::Paths::live() else {
-        return;
-    };
-    let Some(config) = aterm_types::dirs::aterm_config_path() else {
-        return;
-    };
+    let paths = aterm_secrets::client::Paths::live().ok()?;
+    let config = aterm_types::dirs::aterm_config_path()?;
     let home = paths.home.clone();
-    commons_lan::when_sharing_on(&home, commons_lan::SHARING_LOOK, move || {
-        let Some(runtime) = start_node_commons_runtime(paths, config) else {
-            return;
-        };
-        let runtime = NODE_COMMONS.get_or_init(|| runtime);
-        // With the one mesh on, a peer that speaks `Bus` with the node service's mesh gets no
-        // repair round or redial, and a push waits for the relay's ack (§11 B7b).
-        if aterm_types::mesh_switch::MESH {
-            relay_tables(runtime);
-        }
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        {
-            let _ = NODE_OBSERVATION.set(runtime.network_observation());
-            let _ = NODE_PUSHER.set(runtime.pusher());
-        }
-        // A Commons peer heard again after a silence is the node job's "network moved" too.
-        let observation = runtime.network_observation();
-        aterm_gui::hear_commons(move || Some(observation.snapshot().peers));
+    let mut startup = commons_lan::Startup::new(&home, move || {
+        start_node_commons_runtime(paths.clone(), config.clone())
     });
+    let _ = startup.maintain();
+    Some(startup)
 }
 
 /// Hand the node service's Commons `runtime` its mesh: which peers speak `Bus`
@@ -419,7 +401,10 @@ fn relay_by_node(runtime: &aterm_db::runtime::Runtime, state_dir: std::path::Pat
 fn start_node_commons_runtime(
     paths: aterm_secrets::client::Paths,
     config: std::path::PathBuf,
-) -> Option<aterm_db::runtime::Runtime> {
+) -> bool {
+    if NODE_COMMONS.get().is_some() {
+        return true;
+    }
     let rounds = alab_register::reports(paths.clone(), config.clone());
     match aterm_db::runtime::Runtime::start_background_with_reports(
         paths,
@@ -439,12 +424,26 @@ fn start_node_commons_runtime(
         rounds,
     ) {
         Ok(runtime) => {
-            alab_journal::start_backfill();
-            Some(runtime)
+            if NODE_COMMONS.set(runtime).is_ok() {
+                let runtime = NODE_COMMONS.get().expect("published node runtime");
+                // Bus peers use the node mesh's relay acknowledgment (§11 B7b).
+                if aterm_types::mesh_switch::MESH {
+                    relay_tables(runtime);
+                }
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                {
+                    let _ = NODE_OBSERVATION.set(runtime.network_observation());
+                    let _ = NODE_PUSHER.set(runtime.pusher());
+                }
+                let observation = runtime.network_observation();
+                aterm_gui::hear_commons(move || Some(observation.snapshot().peers));
+                alab_journal::start_backfill();
+            }
+            true
         }
         Err(error) => {
             aterm_log::warn!("Commons node background runtime could not start: {error}");
-            None
+            false
         }
     }
 }
@@ -494,15 +493,19 @@ fn dispatch_node(forwarded: &[OsString]) -> ExitCode {
             }
             // Its own pass every minute, and the windows' needs pushes from the first one.
             metrics_publish::start();
-            spawn_node_commons_runtime();
+            node_commons_startup().map(|startup| {
+                let startup = std::sync::Mutex::new(startup);
+                std::sync::Arc::new(move || {
+                    if let Ok(mut startup) = startup.try_lock() {
+                        let _ = startup.maintain();
+                    }
+                }) as aterm_gui::NodeMaintenance
+            })
         };
         #[cfg(target_os = "macos")]
         return input_attachments::node_serve(startup);
         #[cfg(not(target_os = "macos"))]
-        return aterm_gui::run_node_serve_owning(|| {
-            startup();
-            None
-        });
+        return aterm_gui::run_node_serve_owning(startup);
     }
     let Some(home) = aterm_types::dirs::home_dir() else {
         eprintln!("aterm node: HOME is not set");
@@ -1315,8 +1318,8 @@ fn front_door_main(
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if session_lane_is_interactive() {
-        spawn_commons_runtime();
+    let commons_maintenance = if session_lane_is_interactive() {
+        let startup = commons_startup();
         let build = aterm_gui::running_build_number();
         #[cfg(target_os = "linux")]
         start_linux_session_trial(build);
@@ -1327,7 +1330,14 @@ fn front_door_main(
             None,
             None,
         );
-    }
+        startup.map(|mut startup| {
+            Box::new(move || startup.maintain()) as aterm_cli::SessionMaintenance
+        })
+    } else {
+        None
+    };
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+    let commons_maintenance = None;
 
     let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
     // The day's host settings are this Mac's: a remote shell (ssh) changes none of them and
@@ -1362,7 +1372,11 @@ fn front_door_main(
             .spawn(aterm_machines::cli::retire_lan_agent);
     }
 
-    session_lane(quiet)
+    session_lane(
+        quiet,
+        #[cfg(unix)]
+        commons_maintenance,
+    )
 }
 
 /// A terminal session's part in a replaced Linux executable's trial: count this start
@@ -1601,8 +1615,15 @@ fn session_pass_args(layout: &atpkg::store::Layout) -> Vec<std::ffi::OsString> {
 
 /// The session route as a function that returns an `ExitCode`, like every other route.
 #[inline(never)]
-fn session_lane(quiet: bool) -> ExitCode {
-    aterm_cli::session_main(quiet)
+fn session_lane(
+    quiet: bool,
+    #[cfg(unix)] maintenance: Option<aterm_cli::SessionMaintenance>,
+) -> ExitCode {
+    aterm_cli::session_main(
+        quiet,
+        #[cfg(unix)]
+        maintenance,
+    )
 }
 
 fn gui_alias_entry(rest: Vec<OsString>) -> ExitCode {
@@ -1682,17 +1703,32 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
         commons_lan::install_sharing(&home);
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if ordinary {
-        spawn_commons_runtime();
-    }
+    let mut commons = ordinary.then(commons_startup).flatten();
     #[cfg(target_os = "macos")]
     if ordinary {
         spawn_acaffeine_watch();
     }
     #[cfg(target_os = "macos")]
-    let input_maintenance = ordinary.then(input_attachments::spawn).flatten();
-    #[cfg(not(target_os = "macos"))]
-    let input_maintenance = None;
+    let mut input_maintenance = ordinary.then(input_attachments::spawn).flatten();
+    #[cfg(target_os = "linux")]
+    let mut input_maintenance: Option<aterm_gui::HostMaintenance> = None;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let input_maintenance: Option<aterm_gui::HostMaintenance> = None;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let maintenance = if input_maintenance.is_some() || commons.is_some() {
+        Some(Box::new(move || {
+            let inputs = input_maintenance.as_mut().and_then(|keep| keep());
+            let commons = commons.as_mut().and_then(commons_lan::Startup::maintain);
+            match (inputs, commons) {
+                (Some(inputs), Some(commons)) => Some(inputs.min(commons)),
+                (inputs, commons) => inputs.or(commons),
+            }
+        }) as aterm_gui::HostMaintenance)
+    } else {
+        None
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let maintenance = input_maintenance;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let network_source = ordinary.then(network_state_source).flatten();
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -1701,7 +1737,7 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
         clippy::disallowed_methods,
         reason = "the one window door: every window route reaches the GUI here"
     )]
-    aterm_gui::main_entry_with_network(args, first_run, network_source, input_maintenance);
+    aterm_gui::main_entry_with_network(args, first_run, network_source, maintenance);
     ExitCode::SUCCESS
 }
 
@@ -1871,29 +1907,29 @@ fn claims_observation() -> Option<aterm_types::network_state::NetworkObservation
     .map(account_claims::current_observation)
 }
 
-/// Start this process's Commons runtime once, while `[swarm] enabled` leaves sharing on, else
-/// once a person turns it on ([`commons_lan::when_sharing_on`]).
+/// Keep this process's start intent in its host's maintenance until the canonical runtime is
+/// published, respecting sharing on every attempt.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn spawn_commons_runtime() {
+fn commons_startup() -> Option<commons_lan::Startup> {
     if !commons_host_enabled() || COMMONS_RUNTIME.get().is_some() {
-        return;
+        return None;
     }
-    let Ok(paths) = aterm_secrets::client::Paths::live() else {
-        return;
-    };
-    let Some(config) = aterm_types::dirs::aterm_config_path() else {
-        return;
-    };
+    let paths = aterm_secrets::client::Paths::live().ok()?;
+    let config = aterm_types::dirs::aterm_config_path()?;
     let home = paths.home.clone();
-    commons_lan::when_sharing_on(&home, commons_lan::SHARING_LOOK, move || {
-        start_commons_runtime(paths, &config);
-    });
+    let mut startup =
+        commons_lan::Startup::new(&home, move || start_commons_runtime(paths.clone(), &config));
+    let _ = startup.maintain();
+    Some(startup)
 }
 
 /// Start this process's Commons runtime now, with `paths` and `config`. On a Mac its LAN
 /// traffic goes through the LAN broker; its first LAN use waits for the broker's answer.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn start_commons_runtime(paths: aterm_secrets::client::Paths, config: &std::path::Path) {
+fn start_commons_runtime(paths: aterm_secrets::client::Paths, config: &std::path::Path) -> bool {
+    if COMMONS_RUNTIME.get().is_some() {
+        return true;
+    }
     let config = config.to_owned();
     let rounds = alab_register::reports(paths.clone(), config.clone());
     match aterm_db::runtime::Runtime::start_with_reports(
@@ -1918,17 +1954,23 @@ fn start_commons_runtime(paths: aterm_secrets::client::Paths, config: &std::path
         rounds,
     ) {
         Ok(runtime) => {
-            // With the one mesh on, this process's push asks the node service, whose mesh relays
-            // the tables, to wait for a neighbour's ack (§11 B7b).
-            if aterm_types::mesh_switch::MESH
-                && let Some(state_dir) = aterm_types::dirs::state_dir()
-            {
-                relay_by_node(&runtime, state_dir);
+            if COMMONS_RUNTIME.set(runtime).is_ok() {
+                // With the one mesh on, this process's push asks the node service, whose mesh
+                // relays the tables, to wait for a neighbour's ack (§11 B7b).
+                if aterm_types::mesh_switch::MESH
+                    && let Some(state_dir) = aterm_types::dirs::state_dir()
+                    && let Some(runtime) = COMMONS_RUNTIME.get()
+                {
+                    relay_by_node(runtime, state_dir);
+                }
+                alab_journal::start_backfill();
             }
-            let _ = COMMONS_RUNTIME.set(runtime);
-            alab_journal::start_backfill();
+            true
         }
-        Err(error) => warn_when_logging(format!("Commons runtime could not start: {error}")),
+        Err(error) => {
+            warn_when_logging(format!("Commons runtime could not start: {error}"));
+            false
+        }
     }
 }
 
@@ -1943,7 +1985,7 @@ fn network_state_source() -> Option<aterm_gui::NetworkSnapshotSource> {
 
     static SERVICES: OnceLock<Option<aterm_db::service_state::Runtime>> = OnceLock::new();
     // Read at each look, not once: with `[swarm] enabled = false` the runtime starts only once a
-    // person turns sharing on ([`spawn_commons_runtime`]), and the page then shows what it hears.
+    // person turns sharing on ([`commons_startup`]), and the page then shows what it hears.
     let started = COMMONS_RUNTIME.get().is_some();
     let network = || {
         COMMONS_RUNTIME

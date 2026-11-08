@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use crate::exec::{self, Cmd, Run};
 use crate::ladder::{Outcome, Report, Severity};
 use crate::test_plan::{self, Dispatcher, Plan, Planned};
+use crate::test_progress::{Phase, Progress};
 
 /// The flag cargo's runner config hands this binary.
 pub const RECORD_FLAG: &str = "--record-test-binary";
@@ -1824,6 +1825,8 @@ pub fn run_tests(
     serial: &Cmd,
     check: crate::checks::Check,
 ) {
+    let mut progress = Progress::new(ctx.events.as_ref(), check);
+    progress.enter(Phase::Preparation);
     if let Err(why) = crate::release_test_env::prepare(ctx) {
         r.cannot_run(format!(
             "cannot prepare release test environment: {why}; no test was run"
@@ -1853,6 +1856,7 @@ pub fn run_tests(
         ctx.scope.crates(),
         ctx.memory.as_ref().and_then(|book| book.physical),
     );
+    progress.enter(Phase::RecordingAdmission);
     let claims = match claim_both(
         ctx,
         label,
@@ -1868,6 +1872,7 @@ pub fn run_tests(
             return;
         }
     };
+    progress.enter(Phase::RecordingSetup);
     let granted_cores = claims.granted;
     let recording_resources = claims.resources.as_ref();
     let thread_override = (ctx.env.build_slot_held.is_some()
@@ -1943,12 +1948,14 @@ pub fn run_tests(
         r.cannot_run("verify could not name itself as the exact-host test recording runner");
         return;
     };
+    progress.enter(Phase::Recording);
     let began = Instant::now();
     let mut pass = {
         let _held = holding(recording_resources);
         exec::run(&recording_cmd(serial, &config, &host), ctx.exec_env())
     };
     let pass_wall = began.elapsed();
+    progress.enter(Phase::Planning);
     let records = read_records(&dir);
     std::fs::remove_dir_all(&dir).ok();
 
@@ -2024,7 +2031,15 @@ pub fn run_tests(
         preface,
         rerun: rerun.clone(),
     };
-    run_planned(ctx, r, label, planned, check);
+    run_planned_observed(
+        ctx,
+        r,
+        label,
+        planned,
+        check,
+        exec::TEST_BINARY_HANG,
+        &mut progress,
+    );
 }
 
 /// What [`run_tests`] planned for its binaries' runs.
@@ -2284,6 +2299,7 @@ pub struct Watch {
 /// is armed: a JSON run ends that binary at its first decisive red case (`exec`'s `LiveCases`), a
 /// human one at its end; no binary starts after it, and those it stopped are one NOT RUN row with
 /// the halt's words.
+#[cfg(test)]
 pub(crate) fn run_planned(
     ctx: &crate::Ctx,
     r: &mut Report,
@@ -2295,6 +2311,7 @@ pub(crate) fn run_planned(
 }
 
 /// [`run_planned`], with the JSON probe's no-progress window injected for deterministic tests.
+#[cfg(test)]
 fn run_planned_with_probe_window(
     ctx: &crate::Ctx,
     r: &mut Report,
@@ -2303,6 +2320,28 @@ fn run_planned_with_probe_window(
     check: crate::checks::Check,
     probe_hang_after: Duration,
 ) {
+    let mut progress = Progress::new(ctx.events.as_ref(), check);
+    run_planned_observed(
+        ctx,
+        r,
+        label,
+        planned,
+        check,
+        probe_hang_after,
+        &mut progress,
+    );
+}
+
+fn run_planned_observed(
+    ctx: &crate::Ctx,
+    r: &mut Report,
+    label: &str,
+    planned: RunPlan,
+    check: crate::checks::Check,
+    probe_hang_after: Duration,
+    progress: &mut Progress<'_>,
+) {
+    progress.enter(Phase::Planning);
     let RunPlan {
         bins,
         history,
@@ -2353,6 +2392,7 @@ fn run_planned_with_probe_window(
     let claimed = plan_claim(&plan);
     // The plan's claims replace the one-at-a-time ones, memory before cores as ever: a grant that
     // moved meanwhile plans the run again, its binaries' peaks still held within this claim.
+    progress.enter(Phase::ExecutionAdmission);
     let claims = match claim_both(
         ctx,
         label,
@@ -2368,6 +2408,7 @@ fn run_planned_with_probe_window(
             return;
         }
     };
+    progress.enter(Phase::Planning);
     let mut plan = if claims.granted == plan.share {
         plan
     } else {
@@ -2393,6 +2434,7 @@ fn run_planned_with_probe_window(
     let mut preface = preface;
     let mut probe_hung_count = 0_usize;
     let mut probe_samples = Vec::new();
+    progress.enter(Phase::Probing);
     let probe = loop {
         match probe_json(ctx, &bins, probe_hang_after) {
             Ok(probe) => break probe,
@@ -2488,6 +2530,7 @@ fn run_planned_with_probe_window(
     let meter = crate::memory::current();
     let live = || meter.as_ref().and_then(|m| m.live_rate()).unwrap_or(0.0);
     let ceiling = ctx.exec_env().child_ceiling;
+    progress.enter(Phase::Dispatch);
     let started = Instant::now();
     let spent = || ceiling.is_some_and(|limit| started.elapsed() >= limit);
     let stop = || spent() || ctx.halted().is_some();
@@ -2549,6 +2592,7 @@ fn run_planned_with_probe_window(
         |binary, ran, halt| ended(binary, ran, true, Some(halt)),
     );
     let total = started.elapsed();
+    progress.enter(Phase::Reporting);
     // A binary the dispatch left unstarted: stopped by the run's first red, with the halt's words;
     // or by its spent ceiling, a FAIL of its own, as it always was. Each is heard as the rest
     // were, and keeps no sample.
@@ -3101,6 +3145,7 @@ mod tests {
     #[test]
     fn broken_subprocess_pool_initialization_refuses_before_test_dispatch() {
         let tmp = aterm_tempfile::tempdir().expect("scratch");
+        let events = tmp.path().join("phases.events");
         let scratch = tmp.path().join("not-a-directory");
         std::fs::write(&scratch, b"retained").expect("block pool initialization");
         let ctx = crate::Ctx::new(
@@ -3108,7 +3153,8 @@ mod tests {
             crate::Scope::workspace(),
             crate::EnvSnapshot::default(),
             scratch.clone(),
-        );
+        )
+        .with_events(Some(crate::event_log::EventLog::open(&events).unwrap()));
         let mut report = Report::new("pool refusal");
         run_tests(
             &ctx,
@@ -3125,6 +3171,25 @@ mod tests {
         assert_eq!(
             std::fs::read(&scratch).expect("retained blocker"),
             b"retained"
+        );
+        let phases: Vec<aterm_json::Value> = std::fs::read_to_string(events)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("verify-event: "))
+            .map(|line| aterm_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            phases.last().unwrap()["phase"].as_str(),
+            Some("recording-setup")
+        );
+        assert_eq!(
+            phases.last().unwrap()["scope_exit"].as_str(),
+            Some("returned")
+        );
+        assert!(
+            !phases
+                .iter()
+                .any(|event| event["phase"].as_str() == Some("recording"))
         );
     }
 

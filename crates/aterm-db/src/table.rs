@@ -323,7 +323,7 @@ impl<'a> Session<'a> {
             {
                 return Ok(());
             }
-            if aterm_secrets::client::trusted_commons_log(
+            if aterm_secrets::client::trusted_commons_log_now(
                 self.bootstrap.paths(),
                 self.bootstrap.trust(),
             )
@@ -357,7 +357,7 @@ impl<'a> Session<'a> {
         if !self.access.is_log_backed() {
             return std::collections::BTreeMap::new();
         }
-        let Some((log, _)) = aterm_secrets::client::trusted_commons_log(
+        let Some((log, _)) = aterm_secrets::client::trusted_commons_log_now(
             self.bootstrap.paths(),
             self.bootstrap.trust(),
         )
@@ -680,7 +680,7 @@ impl<'a> Session<'a> {
         // derived from its `[everyone]` epochs (one-mesh M6): a member admitted after one holds
         // no `Wrap` of it and asks a peer for its table key.
         if self.access.is_log_backed()
-            && let Some((log, _)) = aterm_secrets::client::trusted_commons_log(
+            && let Some((log, _)) = aterm_secrets::client::trusted_commons_log_now(
                 self.bootstrap.paths(),
                 self.bootstrap.trust(),
             )

@@ -424,7 +424,7 @@ pub struct BandMotion {
 }
 
 impl BandMotion {
-    /// The repaint-key term.
+    /// The fingerprint of every row's motion terms: 0 when no row moves.
     #[must_use]
     pub fn fingerprint(&self) -> u64 {
         if self.rows.iter().all(|r| *r == RowMotion::default()) {

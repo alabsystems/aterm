@@ -9398,10 +9398,17 @@ mod tests {
             };
             assert_eq!(targets, [first, second], "routed by {routed:?}");
         }
-        // Every Mac has a loopback interface to scope to.
+        // Every host has a loopback interface to scope to (`lo0` on a Mac, `lo` on Linux).
+        let on_loopback = scoped(
+            if cfg!(target_os = "macos") {
+                "lo0"
+            } else {
+                "lo"
+            },
+            [192, 168, 1, 5],
+        );
         let scoped_advert =
-            vault_advert(&scoped("lo0", [192, 168, 1, 5]), "alab-secrets", 7484, None)
-                .expect("lo0 is there");
+            vault_advert(&on_loopback, "alab-secrets", 7484, None).expect("the loopback is there");
         assert!(
             scoped_advert.interface.is_some_and(|index| index != 0),
             "a scoped registration is made on its interface alone"
@@ -9424,7 +9431,7 @@ mod tests {
             "an unmatched route never replaces the interface's own address"
         );
         assert_eq!(
-            vault_advert(&scoped("lo0", [192, 168, 1, 5]), "alab-secrets", 7484, None).unwrap(),
+            vault_advert(&on_loopback, "alab-secrets", 7484, None).unwrap(),
             scoped_advert,
             "one LAN stays scoped too"
         );

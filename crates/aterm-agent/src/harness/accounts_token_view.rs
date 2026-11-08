@@ -10,7 +10,7 @@
 //!   this Mac's table keeps a row of.
 //! - **The view** ([`view`]): one read of the vault's tokens ([`TokenVault::listed`]), this Mac's
 //!   table and the clock make each account's [`TokenState`] (§5.1), its login half, and the offer
-//!   where one stands.
+//!   where one stands on a host whose verb makes a token ([`Places::offers`]).
 //! - **The offer** is a pair, the token state and the login state (`ok`, `ending` under
 //!   [`ENDING_S`] left, `ended`; `-` while a token is in use), each with the date it began. It
 //!   stands for an account a session here is logged into, in a state [`TokenState::offer`] offers
@@ -390,7 +390,9 @@ impl AccountToken {
 }
 
 /// Whether this platform is offered a token's step: macOS, where the verb makes one and aterm's
-/// wrapper serves it (`accounts_tokens` refuses the verb elsewhere).
+/// wrapper serves it (`accounts_tokens` refuses the verb elsewhere). A surface with no host
+/// passes it as [`Places::offers`]; one with a host asks that host, as the verb does
+/// ([`AccountsHost::on_macos`](super::cli::AccountsHost::on_macos)).
 pub const OFFERED_HERE: bool = cfg!(target_os = "macos");
 
 /// `at` as the pair's date, `-` where none says it.
@@ -400,7 +402,8 @@ fn since_word(at: Option<i64>) -> String {
 }
 
 /// The account `covered` as its vault lookup `found`, its table row `row` and whether a write of
-/// it waits here (`pending`) make it at `now` (unix seconds), its offer where one stands.
+/// it waits here (`pending`) make it at `now` (unix seconds), its offer where one stands on a host
+/// whose verb makes a token ([`view`] keeps it only where [`Places::offers`]).
 #[must_use]
 pub fn account(
     covered: Covered,
@@ -431,9 +434,8 @@ pub fn account(
         since_word(login.since()),
     );
     let named = covered.label.as_deref().unwrap_or(&covered.email);
-    // The step makes a token only where aterm's wrapper serves one (the verb refuses elsewhere),
-    // so no other platform is offered it; its surfaces still say the token's state.
-    let offer = (covered.logged_in && OFFERED_HERE)
+    let offer = covered
+        .logged_in
         .then(|| state.offer(named, pending != Some(false)))
         .flatten()
         .map(|step| Offer {
@@ -465,6 +467,9 @@ pub struct Places<'a> {
     pub logins: &'a [SessionLogin],
     /// The clock (unix seconds).
     pub now: i64,
+    /// Whether this host's verb makes a token ([`OFFERED_HERE`] for a surface with no host), so
+    /// its surfaces offer the step; where it does not, they still say each token's state.
+    pub offers: bool,
 }
 
 /// The accounts the surfaces cover (§5.9, §5.10): each roster row that names an email and that the
@@ -528,7 +533,7 @@ pub fn covered(places: &Places<'_>) -> Vec<Covered> {
 }
 
 /// Each covered account ([`covered`]) and each account this Mac's table keeps a row of, as one
-/// read of `vault` and the table make it now.
+/// read of `vault` and the table make it now, each with no offer where `places` offers none.
 #[must_use]
 pub fn view(places: &Places<'_>, vault: &dyn TokenVault) -> Vec<AccountToken> {
     let mut covered = covered(places);
@@ -563,7 +568,13 @@ pub fn view(places: &Places<'_>, vault: &dyn TokenVault) -> Vec<AccountToken> {
             };
             let pending = vault.waiting_here(&account_here.key).ok();
             let row = table.rows.get(account_here.key.as_str()).cloned();
-            account(account_here, &found, row, pending, now)
+            let mut shown = account(account_here, &found, row, pending, now);
+            // The step makes a token only where aterm's wrapper serves one (the verb refuses
+            // elsewhere), so no other host is offered it; its surfaces still say the state.
+            if !places.offers {
+                shown.offer = None;
+            }
+            shown
         })
         .collect()
 }
@@ -1052,6 +1063,7 @@ pub fn view_here(
             roster: roster.as_deref(),
             logins: &logins,
             now,
+            offers: OFFERED_HERE,
         },
         &vault,
     );

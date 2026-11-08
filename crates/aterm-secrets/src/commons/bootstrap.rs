@@ -1587,7 +1587,7 @@ impl Bootstrap {
     /// # Errors
     /// Local custody files cannot be read.
     pub fn is_log_backed(&self) -> Result<bool> {
-        Ok(client::trusted_commons_log(&self.paths, self.trust())?.is_some())
+        Ok(client::trusted_commons_log_now(&self.paths, self.trust())?.is_some())
     }
 
     /// Select the causal membership log proving this device's historical seat and any later
@@ -1601,7 +1601,7 @@ impl Bootstrap {
         static WITNESS_CACHE: std::sync::Mutex<std::collections::VecDeque<WitnessCacheEntry>> =
             std::sync::Mutex::new(std::collections::VecDeque::new());
 
-        let Some((log, heads_digest)) = client::trusted_commons_log(&self.paths, self.trust())?
+        let Some((log, heads_digest)) = client::trusted_commons_log_now(&self.paths, self.trust())?
         else {
             return Ok(None);
         };
@@ -1824,7 +1824,7 @@ impl Bootstrap {
             return Ok(None);
         }
         let maybe_access = if let Some((log, heads_digest)) =
-            client::trusted_commons_log(&self.paths, self.trust())?
+            client::trusted_commons_log_now(&self.paths, self.trust())?
         {
             let lock =
                 lock.ok_or_else(|| Error::new("Commons membership log has no vault observation"))?;

@@ -210,23 +210,13 @@ fn checkout(lib: &str) -> (aterm_tempfile::TempDir, Ctx) {
     (dir, Ctx::new(root, scope, env, scratch))
 }
 
-fn verdict(ctx: &Ctx) -> (Vec<Outcome>, Vec<String>) {
+fn verdict(ctx: &Ctx, scanner: Result<Scanner, String>) -> (Vec<Outcome>, Vec<String>, Report) {
     let mut r = Report::new("export-scan");
-    run_with(ctx, &mut r, || {
-        Ok(Scanner::Fixture(aterm_uds::host::need_tool("gitleaks")))
-    });
-    if r.outcomes()
-        .any(|(outcome, _)| outcome == Outcome::Fail(Severity::CouldNotRun))
-    {
-        eprintln!(
-            "export-scan fixture could not run: {:?}",
-            r.outcomes().collect::<Vec<_>>()
-        );
-    }
-    require_fixture(&r).unwrap_or_else(|why| aterm_uds::host::could_not_run(why));
+    run_with(ctx, &mut r, || scanner);
     (
         r.outcomes().map(|(o, _)| o).collect(),
         r.findings().iter().map(|f| f.id.clone()).collect(),
+        r,
     )
 }
 
@@ -264,14 +254,21 @@ fn an_unavailable_export_fixture_is_not_a_product_failure() {
 /// push, and passes the same file without it.
 #[test]
 fn a_fixture_gitleaks_refuses_is_found_before_a_cut() {
+    let scanner = aterm_uds::host::need_tool("gitleaks");
     let key = planted_key();
     let (_dir, ctx) = checkout(&format!("// a fixture\nlet api_key = \"{key}\";\n"));
-    let (outcomes, ids) = verdict(&ctx);
-    assert_eq!(outcomes, [Outcome::Fail(Severity::GateFailed)], "{ids:?}");
-    assert_eq!(ids, ["crates/x/src/lib.rs:2"]);
+    let (outcomes, ids, report) = verdict(&ctx, Ok(Scanner::Fixture(scanner.clone())));
+    require_fixture(&report).unwrap_or_else(|why| aterm_uds::host::could_not_run(why));
+    assert_eq!(
+        outcomes,
+        [Outcome::Fail(Severity::GateFailed)],
+        "{ids:?}; {report:#?}"
+    );
+    assert_eq!(ids, ["crates/x/src/lib.rs:2"], "{report:#?}");
     let (_dir, ctx) = checkout("// a fixture\nlet api_key = \"\";\n");
-    let (outcomes, ids) = verdict(&ctx);
-    assert_eq!(outcomes, [Outcome::Ok], "{ids:?}");
+    let (outcomes, ids, report) = verdict(&ctx, Ok(Scanner::Fixture(scanner)));
+    require_fixture(&report).unwrap_or_else(|why| aterm_uds::host::could_not_run(why));
+    assert_eq!(outcomes, [Outcome::Ok], "{ids:?}; {report:#?}");
 }
 
 #[test]
@@ -322,7 +319,7 @@ fn without_the_engine_the_exports_own_rows_still_hold() {
     let (_dir, mut ctx) = checkout("// zebraword\n// quokkaword\n");
     std::fs::create_dir_all(ctx.root.join("publish")).expect("mkdir");
     std::fs::write(ctx.root.join(rows::EXTRA), "zebraword\n").expect("rows");
-    let (_, with) = verdict(&ctx);
+    let (_, with, _) = verdict(&ctx, Err("no signed scanner in fixture".into()));
     assert_eq!(
         with.iter()
             .filter(|id| id.contains("lib.rs"))
@@ -350,6 +347,30 @@ fn without_the_engine_the_exports_own_rows_still_hold() {
         ids.contains(&"crates/x/src/lib.rs:1".to_string())
             && !ids.contains(&"crates/x/src/lib.rs:2".to_string()),
         "the export's row holds, the engine's baseline row is not judged: {ids:?}"
+    );
+}
+
+#[test]
+fn scanner_freshness_transport_is_could_not_run_not_an_install_remedy() {
+    let (_dir, ctx) = checkout("pub fn clean() {}\n");
+    let mut report = Report::new("export-scan");
+    run_with(&ctx, &mut report, || {
+        Err("signed channel freshness transport: curl: (56) HTTP 504".into())
+    });
+    let rows: Vec<(Outcome, String)> = report
+        .outcomes()
+        .map(|(outcome, line)| (outcome, line.to_string()))
+        .collect();
+    let (_, line) = rows
+        .iter()
+        .find(|(outcome, line)| {
+            *outcome == Outcome::Fail(Severity::CouldNotRun) && line.contains("HTTP 504")
+        })
+        .unwrap_or_else(|| panic!("transport detail did not reach COULD NOT RUN: {rows:#?}"));
+    assert!(line.contains("transport answers"), "{line}");
+    assert!(
+        !line.contains("pkg install"),
+        "negative control: replacing local bytes cannot establish channel freshness: {line}"
     );
 }
 

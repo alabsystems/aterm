@@ -124,6 +124,8 @@ struct World {
     /// reads it (`release_steps::site_outcome`).
     site: Result<crate::site::Outcome, crate::site::Failure>,
     own_cutter: bool,
+    warming_active: bool,
+    unrecorded_hops: BTreeSet<String>,
     asks: Vec<String>,
     resolved: Vec<String>,
     withdrawn: Vec<String>,
@@ -308,6 +310,8 @@ impl World {
             after_cut: Ok("the release's shape checked".into()),
             site: Ok(crate::site::Outcome::Synced { deployed: true }),
             own_cutter: true,
+            warming_active: false,
+            unrecorded_hops: BTreeSet::new(),
             asks: Vec::new(),
             resolved: Vec::new(),
             withdrawn: Vec::new(),
@@ -1056,6 +1060,7 @@ impl Backend for World {
         Ok(self.supersession.clone())
     }
     fn supersede_line(&mut self, line: &Line) -> Result<String, String> {
+        self.calls.push("supersede".into());
         if let Some(why) = &self.fleet_refusal {
             return Err(why.clone());
         }
@@ -1074,9 +1079,6 @@ impl Backend for World {
             .existing_fleet_line
             .clone()
             .filter(|line| line.version == version);
-        if line.is_some() {
-            self.fetch()?;
-        }
         Ok(line)
     }
     fn fleet_line(
@@ -1199,6 +1201,9 @@ impl Backend for World {
         self.versions.get(&full).cloned()
     }
     fn is_ancestor(&mut self, a: &str, b: &str) -> bool {
+        if (b == "origin/main" || b == self.tip()) && self.unrecorded_hops.contains(a) {
+            return false;
+        }
         matches!((self.pos(a), self.pos(b)), (Some(a), Some(b)) if a <= b)
     }
     fn origin_tag(&mut self, tag: &str) -> Option<String> {
@@ -1308,6 +1313,7 @@ impl Backend for World {
             })
             .collect();
         for hop in &hops {
+            self.unrecorded_hops.insert(hop.commit.clone());
             self.history.push(hop.commit.clone());
             self.versions
                 .insert(hop.commit.clone(), line.version.clone());
@@ -1341,6 +1347,7 @@ impl Backend for World {
         Ok(made.into())
     }
     fn validation_tools(&mut self) -> Result<String, Refusal> {
+        self.warming_active = false;
         self.observations.push("validation-tools");
         self.calls.push("validation-tools".into());
         self.validation_tools.clone()
@@ -1366,6 +1373,32 @@ impl Backend for World {
         self.calls.push("exec-cutter".into());
         self.exec_commit = Some(commit.to_owned());
         self.exec_result.clone()
+    }
+    fn warm_tools(&mut self, _commit: &str, _prover: &Prover) -> Result<(), Refusal> {
+        self.observations.push("warm-tools");
+        self.warming_active = true;
+        Ok(())
+    }
+    fn stop_tools(&mut self) {
+        if self.warming_active {
+            assert!(
+                self.release_dir().join(RUNNING_FILE).exists(),
+                "the clone remains claimed until its compiler is settled"
+            );
+        }
+        self.warming_active = false;
+    }
+    fn record_line(&mut self, line: &Line) -> Result<String, Refusal> {
+        self.calls.push("record-line".into());
+        for hop in &line.hops {
+            self.unrecorded_hops.remove(&hop.commit);
+        }
+        Ok("recorded on main".into())
+    }
+    fn rewind_selection(&mut self, line: &Line) -> Result<(), Refusal> {
+        self.calls.push("rewind-selection".into());
+        self.head = line.base.clone();
+        Ok(())
     }
     fn facts(&mut self, c: &Candidate, _prover: &Prover, artifact: Option<&Artifact>) -> Facts {
         let down = self.judge_down;
@@ -1626,10 +1659,10 @@ impl Backend for World {
             note: format!("{shape}; {}", site.note),
         })
     }
-    fn latest(&mut self) -> Result<String, String> {
+    fn latest(&mut self) -> Result<Option<String>, String> {
         match &self.cut {
-            Some(c) if c.finished && !self.latest_lags => Ok(format!("v{}", c.version)),
-            _ => Ok("v0.5.0".into()),
+            Some(c) if c.finished && !self.latest_lags => Ok(Some(format!("v{}", c.version))),
+            _ => Ok(Some("v0.5.0".into())),
         }
     }
 }
@@ -1895,7 +1928,8 @@ fn a_build_inputs_seal_failure_stops_step_one_with_its_own_remedy() {
         last.ends_with(". restore the release build inputs and retry"),
         "{last}"
     );
-    assert_eq!(world.calls, ["lease", "seal-inputs"]);
+    assert_eq!(world.count("seal-inputs"), 1);
+    assert_eq!(world.count("validation-tools"), 0);
     let mut dry = World::new();
     dry.seal_error = Some("never asked".into());
     let (code, last) = dry.run(ReleaseOptions {
@@ -1987,6 +2021,7 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
             "sync",
             "bump",
             "move cccc",
+            "sync",
             "validation-tools",
             "disk-claim 30",
             "commit-gates",
@@ -2566,19 +2601,18 @@ fn a_step_one_refusal_keeps_its_detail_in_the_named_log() {
     assert!(kept.contains(DETAIL), "{kept:?}");
 }
 
-/// The cutter refreshes origin again after finding an existing fleet line. That path preserves
-/// the fetch refusal as structured evidence instead of replacing its detail and remedy with a
-/// generic fleet-read error. NEGATIVE CONTROL: converting the refusal to `r.why` makes the log
-/// lose `DETAIL` and this test fail.
+/// An existing local fleet line adds no refresh. The final cutter's single refresh preserves
+/// structured evidence. NEGATIVE CONTROLS: duplicate it, or convert its refusal to `r.why`,
+/// and either the count changes or the log loses DETAIL.
 #[test]
-fn an_existing_fleet_lines_second_fetch_keeps_its_refusal_detail() {
+fn an_existing_fleet_line_refreshes_once_and_keeps_its_refusal_detail() {
     const DETAIL: &str =
         "git fetch-batch fixture/app made no progress while waiting on its native fetch step";
     const REMEDY: &str = "check the reported native routing or source-state refusal, then re-run";
     let mut w = World::new();
     w.existing_fleet_line = Some(Line::start("0.6.0", TIP, 999_000));
     w.fetch_refusal = Some((
-        2,
+        1,
         Refusal::new("cannot refresh origin through agh", REMEDY)
             .detail([DETAIL.to_string()])
             .could_not_run(),
@@ -2595,13 +2629,16 @@ fn an_existing_fleet_lines_second_fetch_keeps_its_refusal_detail() {
         "{last}"
     );
     assert!(last.contains(REMEDY), "{last}");
-    assert_eq!(w.fetches, 2, "the existing line caused a second refresh");
+    assert_eq!(
+        w.fetches, 1,
+        "fleet discovery must not duplicate step 1's refresh"
+    );
     let kept = std::fs::read_to_string(&log).expect("the named step log");
     assert!(kept.contains(DETAIL), "{kept:?}");
 }
 
 #[test]
-fn what_would_refuse_the_release_refuses_it_before_anything_changes() {
+fn a_refused_candidate_never_stages_or_publishes() {
     type Change = fn(&mut World);
     let cases: [(&str, Change, &str); 9] = [
         (
@@ -2679,8 +2716,15 @@ fn what_would_refuse_the_release_refuses_it_before_anything_changes() {
             "{case}: a refused preflight is no fact the cut could read"
         );
         if at == "1/10 checks" {
-            assert_eq!(w.count("bump"), 0, "{case}: nothing pushed: {:?}", w.calls);
-            assert!(w.journal().is_none(), "{case}: nothing journaled");
+            assert!(
+                w.journal().is_none(),
+                "{case}: no judged candidate journaled"
+            );
+            assert_eq!(
+                w.count("publish"),
+                0,
+                "{case}: no publication before judgment"
+            );
         }
 
         let mut w = World::new();
@@ -2815,7 +2859,7 @@ fn a_published_candidate_cannot_be_replaced() {
         code == 1 && last.contains("is already published"),
         "claimed: {last}"
     );
-    assert_eq!(w.count("carry"), 0, "{:?}", w.calls);
+    assert_eq!(w.count("record-line"), 0, "{:?}", w.calls);
     assert_eq!(w.journal().unwrap().commit, BUMP, "the cut's line stays");
 }
 
@@ -3046,9 +3090,9 @@ fn fix_needs_this_clones_unfinished_line_whose_head_knows_lines() {
     assert_eq!(w.journal().unwrap().commit, BUMP);
 }
 
-/// A line whose meaning check fails ([`crate::line::verify`]) is never exported: the stage
-/// refuses before `pub stage` (and before the private export of `--qualify`). NEGATIVE
-/// CONTROL: drop `line_holds` before the remote stage, and `pub stage` runs.
+/// A pending line whose meaning check fails is refused by its frozen head before recording
+/// on source main or starting either export. NEGATIVE CONTROL: omit the pending-line proof
+/// and the source record and export can run.
 #[test]
 fn a_line_that_fails_its_meaning_check_is_never_exported() {
     for qualify in [false, true] {
@@ -3075,7 +3119,7 @@ fn a_line_that_fails_its_meaning_check_is_never_exported() {
             ..mac()
         });
         assert!(
-            code == 1 && last.starts_with("REFUSED at 4/10 qualify"),
+            code == 1 && last.starts_with("REFUSED at 1/10 checks"),
             "qualify {qualify}: {last}"
         );
         assert!(last.contains("is not 1111's patch"), "{last}");
@@ -3208,7 +3252,7 @@ fn a_dry_fix_plans_the_new_head_and_agrees_with_the_real_run() {
 
 /// The cut's gates of R's own tree (its handoff fixtures and policy) are asked at step 1 of the
 /// head the release goes on with: a bare re-run of a head that fails them refuses there, naming
-/// `--fix`, and that `--fix` is not refused by the head it replaces: step 3 carries it, and the
+/// `--fix`, and that `--fix` is not refused by the head it replaces: preparation carries it, and the
 /// new head meets those gates. NEGATIVE CONTROL: ask them of the old head while its fixes are
 /// still to carry, and `--fix` refuses at step 1 with the remedy that named it.
 #[test]
@@ -3259,12 +3303,12 @@ fn a_fix_is_never_judged_by_the_head_it_replaces() {
     );
 }
 
-/// A carry that cannot be made (a conflict, a record that cannot land) refuses at step 3 with
+/// A carry that cannot be made refuses during preparation with
 /// its own words: the journal keeps the line as it was, the clone is moved nowhere, and nothing
 /// is staged or verified. NEGATIVE CONTROL: swallow the carry's refusal, and the red head is
 /// staged and verified again.
 #[test]
-fn a_carry_that_cannot_be_made_refuses_at_step_three_and_keeps_the_line() {
+fn a_carry_that_cannot_be_made_refuses_before_judgment_and_keeps_the_line() {
     let mut w = red_line();
     let before = w.journal().unwrap();
     w.carry_refusal = Some(Refusal::new(
@@ -3276,7 +3320,7 @@ fn a_carry_that_cannot_be_made_refuses_at_step_three_and_keeps_the_line() {
     let (code, last) = w.run(fix(&[FIX]));
     assert!(
         code == 1
-            && last.starts_with("REFUSED at 3/10 commit")
+            && last.starts_with("REFUSED at 1/10 checks")
             && last.contains("it conflicts in src/fixed.rs"),
         "{last}"
     );
@@ -3382,7 +3426,7 @@ fn a_hop_main_no_longer_holds_drops_the_line() {
 /// A remedy that starts a line (`--commit`, `--bump`) names `--forget` first while this clone
 /// holds an unfinished line, which `--commit` refuses to replace and `--bump` resumes: the
 /// predecessor's claim missing from the line's history, an unfinished cut of another version.
-/// The remedy then goes through; with no line held it is the bare command. NEGATIVE CONTROL:
+/// The remedy then goes through; a pending selection is held until forgotten too. NEGATIVE CONTROL:
 /// drop the `--forget`, and the remedy's `--commit` refuses with "only starts a line".
 #[test]
 fn a_remedy_that_starts_a_line_drops_the_held_line_first() {
@@ -3429,12 +3473,8 @@ fn a_remedy_that_starts_a_line_drops_the_held_line_first() {
     assert!(
         code == 1
             && last.contains("does not contain v0.5.0's claim commit")
-            && last.contains(&format!(
-                "after that claim: {} --commit origin/main",
-                crate::ledger::RELEASE_COMMAND
-            ))
-            && !last.contains("--forget"),
-        "no line is held: {last}"
+            && last.contains("--forget"),
+        "the selected candidate must be forgotten before replacing it: {last}"
     );
 
     let mut w = red_line();
@@ -3483,7 +3523,7 @@ fn a_second_run_in_the_same_clone_is_refused_naming_the_first() {
 }
 
 /// A cutter built from another commit asks the backend to replace this image exactly once with
-/// R's frozen cutter. A pre-exec refusal is this image's step-3 refusal; the successful exec edge
+/// R's frozen cutter. A pre-exec refusal ends preparation before step 1; the successful exec edge
 /// returns no final line because the real backend never returns from it.
 /// NEGATIVE CONTROLS: exec a commit other than R, call exec twice, or continue into validation
 /// work in the old image, and these assertions fail.
@@ -3502,7 +3542,7 @@ fn a_foreign_cutter_execs_once_at_r_and_only_a_refusal_returns() {
     assert_eq!(w.count("exec-cutter"), 1, "{:?}", w.calls);
     assert_eq!(w.exec_commit.as_deref(), Some(TIP));
     assert!(
-        code == 1 && last.starts_with("REFUSED at 3/10 commit"),
+        code == 1 && last.starts_with("REFUSED at 1/10 checks"),
         "an exec that could not begin: {last}"
     );
     assert!(
@@ -3531,6 +3571,234 @@ fn a_foreign_cutter_execs_once_at_r_and_only_a_refusal_returns() {
         !claim.exists(),
         "the fake success edge returns and drops it; a real exec retains the process"
     );
+}
+
+/// NEGATIVE CONTROL: put checks before prepare_candidate and the launcher's planted network
+/// failure prevents exec; judge them again after exec and the final count exceeds one.
+#[test]
+fn only_the_frozen_candidate_judges_step_one() {
+    let mut w = World::new();
+    w.versions.insert(TIP.into(), "0.6.0".into());
+    w.own_cutter = false;
+    w.exec_result = Ok(());
+    w.fetch_refusal = Some((
+        1,
+        Refusal::new("planted refresh defect", "use the candidate cutter"),
+    ));
+    let options = ReleaseOptions {
+        commit: Some(TIP.into()),
+        qualify: true,
+        ..mac()
+    };
+    assert_eq!(w.run(options.clone()).0, 0);
+    assert_eq!(w.exec_commit.as_deref(), Some(TIP));
+    assert_eq!(w.fetches, 0);
+    assert_eq!(w.count("seal-inputs"), 0);
+    assert!(!w.observations.contains(&"machine"));
+    assert_eq!(w.count("record-line"), 0);
+
+    // Model the replacement image: its fixed refresh answers, and its own step 1 alone runs.
+    w.own_cutter = true;
+    w.fetch_refusal = None;
+    assert_eq!(w.run(options).0, 0, "{:#?}", w.out);
+    assert_eq!(w.fetches, 1);
+    assert_eq!(w.count("seal-inputs"), 1);
+    assert_eq!(
+        w.observations
+            .iter()
+            .filter(|&&item| item == "machine")
+            .count(),
+        1
+    );
+    assert!(
+        w.observations.iter().position(|&item| item == "warm-tools")
+            < w.observations.iter().position(|&item| item == "machine")
+    );
+}
+
+/// NEGATIVE CONTROL: invoking sync or bump before dispatch lets the previous line's engine
+/// code decide whether a new line can start.
+#[test]
+fn a_bump_dispatches_to_its_base_before_touching_the_engine() {
+    let mut w = World::new();
+    w.own_cutter = false;
+    w.exec_result = Ok(());
+    assert_eq!(w.run(bump()).0, 0);
+    assert_eq!(w.exec_commit.as_deref(), Some(TIP));
+    assert_eq!(w.count("sync"), 0);
+    assert_eq!(w.count("bump"), 0);
+    assert_eq!(w.fetches, 0);
+    assert_eq!(w.count("seal-inputs"), 0);
+}
+
+#[test]
+fn supersession_is_performed_by_its_replacement_cutter_once() {
+    let mut w = World::new();
+    w.versions.insert(TIP.into(), "0.6.0".into());
+    w.history.insert(1, NEXT.into());
+    w.versions.insert(NEXT.into(), "0.6.0".into());
+    w.existing_fleet_line = Some(Line::start("0.6.0", NEXT, 100));
+    let options = ReleaseOptions {
+        commit: Some(TIP.into()),
+        supersede: true,
+        ..mac()
+    };
+    let args = vec!["release".into(), "--supersede".into()];
+    assert!(
+        options
+            .dispatch_args(args.clone())
+            .iter()
+            .any(|arg| arg == "--supersede")
+    );
+    assert!(
+        !options
+            .exec_args(args)
+            .iter()
+            .any(|arg| arg == "--supersede")
+    );
+    w.own_cutter = false;
+    w.exec_result = Ok(());
+    assert_eq!(w.run(options.clone()).0, 0);
+    assert_eq!(w.exec_commit.as_deref(), Some(TIP));
+    assert_eq!(
+        w.count("supersede"),
+        0,
+        "the launcher must not retire a line"
+    );
+    assert_eq!(w.fetches, 0);
+    w.own_cutter = true;
+    let (code, last) = w.run(options.clone());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.count("supersede"), 1);
+    assert_eq!(w.run(options).0, 0);
+    assert_eq!(
+        w.count("supersede"),
+        1,
+        "a completed request is not repeated"
+    );
+}
+
+#[test]
+fn a_fresh_proposal_adopts_a_durable_replacement_without_becoming_a_retired_journal() {
+    let mut w = World::new();
+    for commit in [TIP, NEXT] {
+        w.versions.insert(commit.into(), "0.6.0".into());
+    }
+    w.history.insert(1, NEXT.into());
+    let previous = Line::start("0.6.0", OLD, 50);
+    let replacement = Line::start("0.6.0", NEXT, 100);
+    w.supersession = Some(crate::line::Supersession {
+        previous,
+        replacement: replacement.clone(),
+        reason: "explicit retirement".into(),
+    });
+    w.existing_fleet_line = Some(replacement);
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.journal().unwrap().commit, NEXT);
+    assert_eq!(w.count("supersede"), 0);
+}
+
+/// NEGATIVE CONTROL: releasing the Run before stop_tools either leaves the compiler active,
+/// or fails the fake's assertion that cleanup still owns the clone claim.
+#[test]
+fn a_step_one_refusal_settles_tools_before_releasing_the_clone() {
+    let mut w = World::new();
+    w.versions.insert(TIP.into(), "0.6.0".into());
+    w.machine_refusals = vec![Refusal::new("planted machine refusal", "retry")];
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 1, "{last}");
+    assert!(w.observations.contains(&"warm-tools"));
+    assert!(!w.warming_active);
+    assert!(!w.release_dir().join(RUNNING_FILE).exists());
+}
+
+/// NEGATIVE CONTROLS: checking the old roster, refreshing before carrying, recording the hop
+/// from the launcher, or executing the old head each breaks a different assertion here.
+#[test]
+fn a_fix_reaches_its_own_step_one_before_any_remote_read_or_record() {
+    let mut w = red_line();
+    w.calls.clear();
+    w.observations.clear();
+    let fetches = w.fetches;
+    w.own_cutter = false;
+    w.exec_result = Ok(());
+    w.fetch_refusal = Some((
+        fetches + 1,
+        Refusal::new("old step 1 cannot refresh", "carry its fix"),
+    ));
+    assert_eq!(w.run(fix(&[FIX])).0, 0);
+    assert_eq!(w.exec_commit.as_deref(), Some(hop_of(FIX).as_str()));
+    assert_eq!(w.fetches, fetches);
+    assert_eq!(w.count("carry"), 1);
+    assert_eq!(w.count("record-line"), 0);
+    assert!(!w.observations.contains(&"machine"));
+    assert_eq!(
+        w.journal().unwrap().commit,
+        BUMP,
+        "the judged line stays until the new head passes"
+    );
+
+    w.own_cutter = true;
+    w.fetch_refusal = None;
+    w.verify_passes = true;
+    w.verify_code = 0;
+    assert_eq!(w.run(mac()).0, 0, "{:#?}", w.out);
+    assert_eq!(w.count("record-line"), 1);
+    assert_eq!(w.fetches, fetches + 1);
+    assert_eq!(w.journal().unwrap().commit, hop_of(FIX));
+}
+
+#[test]
+fn a_pending_fix_survives_step_one_failure_without_a_fleet_record_deadlock() {
+    let mut w = red_line();
+    w.machine_refusals = vec![Refusal::new("planted step-one refusal", "retry")];
+    let (code, last) = w.run(fix(&[FIX]));
+    assert_eq!(code, 1, "{last}");
+    assert!(w.unrecorded_hops.contains(&hop_of(FIX)));
+    assert_eq!(w.journal().unwrap().commit, BUMP);
+    w.existing_fleet_line = Some(w.journal().unwrap().line());
+    w.machine_refusals.clear();
+    w.verify_passes = true;
+    w.verify_code = 0;
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(!w.unrecorded_hops.contains(&hop_of(FIX)));
+    assert_eq!(w.journal().unwrap().commit, hop_of(FIX));
+}
+
+#[test]
+fn fleet_adoption_recarries_the_pending_fixes_on_its_selected_base() {
+    let mut w = World::new();
+    w.versions.insert(TIP.into(), "0.6.0".into());
+    w.verify_passes = false;
+    w.verify_code = 1;
+    assert_eq!(
+        w.run(ReleaseOptions {
+            commit: Some(TIP.into()),
+            ..mac()
+        })
+        .0,
+        1
+    );
+    for commit in [N2, FIX] {
+        w.history.push(commit.into());
+        w.versions.insert(commit.into(), "0.6.0".into());
+    }
+    w.fleet_selected = Some(Line::start("0.6.0", N2, 999_000));
+    w.verify_passes = true;
+    w.verify_code = 0;
+    let (code, last) = w.run(fix(&[FIX]));
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    let line = w.journal().unwrap().line();
+    assert_eq!(line.base, N2, "the fleet's exact base is retained");
+    assert_eq!(line.hops.len(), 1);
+    assert_eq!(
+        line.hops[0].carries, FIX,
+        "the requested fix is not lost at adoption"
+    );
+    assert_eq!(w.count("carry"), 2);
+    assert_eq!(w.count("rewind-selection"), 1);
 }
 
 /// A world at the boundary after the old image chose R and exec'd R's cutter. The claim names
@@ -3636,7 +3904,7 @@ fn a_continued_cutter_that_is_still_foreign_never_execs_again() {
     });
     assert_eq!(code, 1, "{last}");
     assert!(
-        last.starts_with("REFUSED at 3/10 commit") && last.contains("this cutter was rebuilt at"),
+        last.starts_with("REFUSED at 1/10 checks") && last.contains("this cutter was rebuilt at"),
         "{last}"
     );
     assert_eq!(w.count("exec-cutter"), 0, "{:?}", w.calls);
@@ -4096,11 +4364,8 @@ fn an_interrupt_ends_the_run_in_one_line_and_it_resumes() {
             "publish",
         ),
         (
-            |w| {
-                w.own_cutter = false;
-                w.signal_at = Some("move");
-            },
-            "INTERRUPTED at 3/10 commit (by SIGTERM)",
+            |w| w.signal_at = Some("move"),
+            "INTERRUPTED at 1/10 checks (by SIGTERM)",
             "exec-cutter",
         ),
     ];
@@ -4338,7 +4603,7 @@ fn asks_are_carried_over_each_new_head_and_withdrawn_by_forget() {
 }
 
 #[test]
-fn an_ask_no_journal_took_is_withdrawn_when_the_run_stops_before_step_3() {
+fn an_ask_before_judgment_is_retained_by_selection_and_forgotten_once() {
     let mut w = World::new();
     w.audits = VecDeque::from([owner_gap()]);
     w.cut_gate_refusals = vec![lease_held()];
@@ -4347,6 +4612,19 @@ fn an_ask_no_journal_took_is_withdrawn_when_the_run_stops_before_step_3() {
     assert!(last.starts_with("REFUSED at 1/10 checks"), "{last}");
     assert!(w.journal().is_none(), "nothing journaled");
     assert_eq!(w.asks, ["release.notary"]);
+    assert!(w.withdrawn.is_empty());
+    let selection = Journal::load(&w.release_dir().join("candidate.toml"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(selection.asks, ["release.notary"]);
+    assert_eq!(
+        w.run(ReleaseOptions {
+            forget: true,
+            ..mac()
+        })
+        .0,
+        0
+    );
     assert_eq!(w.withdrawn, ["release.notary"]);
 }
 
@@ -5471,7 +5749,7 @@ fn a_fail_is_never_rerolled_into_a_pass() {
 /// A FAIL refuses only its own tree (A19 with A18's line): after a test FAILs on the line's base,
 /// `--fix` carries a landed fix as a hop, the FAIL rule judges the hop's tree, which has no
 /// record, and the release verifies the new head once and ships it from there. Negative control:
-/// a step 3 that carries the hop but leaves the run's candidate at the old head refuses with the
+/// preparation that carries the hop but leaves the run's candidate at the old head refuses with the
 /// base's FAIL.
 #[test]
 fn a_fail_refuses_its_own_tree_and_a_fix_hop_is_verified_anew() {

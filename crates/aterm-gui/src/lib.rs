@@ -750,7 +750,6 @@ mod licence_fence;
 #[cfg(unix)]
 mod lifeline;
 mod main_thread_probe;
-mod message_band;
 mod message_inbox;
 mod message_reporters;
 mod messages_host;
@@ -1012,6 +1011,8 @@ mod tab_bar;
 mod tab_label;
 mod tab_menu;
 pub(crate) use aterm_gui_tabs::tab_model;
+#[cfg(any(test, target_os = "macos"))]
+mod dispatch_fence;
 mod tab_marks;
 #[cfg(test)]
 mod tab_model_conformance;
@@ -2635,10 +2636,50 @@ fn paste_needs_confirm(text: &str, bracketed: bool) -> bool {
     !bracketed && text.contains(['\n', '\r'])
 }
 
-fn fatal_launch_error(_headless: bool, detail: &str) -> ! {
+/// What stopped a launch, as aterm.log names it ([`fatal_launch_error`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaunchFatal {
+    /// No monospace face could be built.
+    Font,
+    /// The backend-build thread stopped.
+    Backend,
+    /// The containment mode refused the shell.
+    Containment,
+    /// No display could be opened.
+    Display,
+    /// The first session's shell could not be spawned.
+    Spawn,
+}
+
+impl LaunchFatal {
+    /// Its word in aterm.log.
+    pub(crate) const fn word(self) -> &'static str {
+        match self {
+            Self::Font => "font",
+            Self::Backend => "backend",
+            Self::Containment => "containment",
+            Self::Display => "display",
+            Self::Spawn => "spawn",
+        }
+    }
+}
+
+/// A launch that cannot go on: its detail, which can name a path, a shell or a config value, goes
+/// to stderr whole, and aterm.log keeps its kind and the detail's length (DESIGN-session-log
+/// §3.6; PRIV4-3: this was an alert's text until 1a7cad3eb5 made it a log line).
+fn fatal_launch_error(_headless: bool, why: LaunchFatal, detail: &str) -> ! {
     crate::logging::stderr_line!("aterm-gui: {detail}");
-    aterm_log::error!("aterm could not start: {detail}");
+    log_launch_fatal(why, detail);
     exit_without_process_teardown(1)
+}
+
+/// [`fatal_launch_error`]'s aterm.log line: its kind and its detail's length, never the detail.
+pub(crate) fn log_launch_fatal(why: LaunchFatal, detail: &str) {
+    aterm_log::error!(
+        "aterm could not start: {} ({})",
+        why.word(),
+        aterm_log::words::Len(detail)
+    );
 }
 
 /// Leave the process with `code` now, with no `atexit` handlers, static destructors or runtime cleanup.
@@ -2685,6 +2726,7 @@ mod launch_fatal_exit_tests {
         assert_eq!(armed, 0, "atexit accepted the handler");
         super::fatal_launch_error(
             true,
+            super::LaunchFatal::Spawn,
             "spawn failed: child could not exec `/opt/homebrew/bin/fish`",
         );
     }
@@ -3191,7 +3233,6 @@ struct RepaintKey {
     badge_fp: u64,
     deck_fp: u64,
     level_up_fp: Option<level_up::LevelUpRepaintKey>,
-    band_fp: u64,
     question: (u64, u64),
     system_dark: bool,
     link_caption: Option<link_target::LinkHover>,
@@ -3398,6 +3439,9 @@ impl OutageWait {
 
 #[derive(Debug)]
 enum Wake {
+    /// Acknowledgement of this FIFO position, independent of callback payloads.
+    #[cfg(target_os = "macos")]
+    DispatchFence(std::sync::mpsc::Sender<()>),
     AccountsDrained {
         serial: u64,
         drained: app_account_work::Settlement,
@@ -7730,14 +7774,9 @@ struct WindowState {
     band_menu_release_pending: bool,
     rename_edit: Option<app_rename::TabRenameEdit>,
     cached_strip_rows: Vec<Vec<RenderCell>>,
-    cached_band_rows: Vec<Vec<RenderCell>>,
-    cached_band_edges: Vec<Option<([u8; 3], [u8; 3])>>,
-    cached_band_rasters: Vec<Option<crate::message_band::RowRaster>>,
-    band: aterm_messages::drive::View,
     occluded: bool,
     #[cfg(test)]
     band_on_screen_for_test: bool,
-    band_hover: Option<message_band::BandHover>,
     presence: presence::WindowView,
     regrow_floor: aterm_messages::chrome::RegrowFloor,
     #[cfg(test)]
@@ -8865,14 +8904,9 @@ impl WindowState {
             band_menu_release_pending: false,
             rename_edit: None,
             cached_strip_rows: Vec::new(),
-            cached_band_rows: Vec::new(),
-            cached_band_edges: Vec::new(),
-            cached_band_rasters: Vec::new(),
-            band: aterm_messages::drive::View::default(),
             occluded: false,
             #[cfg(test)]
             band_on_screen_for_test: false,
-            band_hover: None,
             presence: presence::WindowView::default(),
             regrow_floor: aterm_messages::chrome::RegrowFloor::default(),
             #[cfg(test)]
@@ -10656,7 +10690,6 @@ struct App {
     folder_rows: spawn_folder::RowFolders,
     restored_shown: app_restore::RestoredShown,
     message_band_rows: u16,
-    band_lay: fn(usize) -> aterm_messages::drive::Lay,
     messages_log: Option<messages_store::Writer>,
     messages_last_publish: Option<Instant>,
     messages_published_revision: u64,
@@ -15575,7 +15608,6 @@ impl App {
             folder_rows: spawn_folder::RowFolders::default(),
             restored_shown: app_restore::RestoredShown::default(),
             message_band_rows: 0,
-            band_lay: message_band::band_lay,
             messages_log: None,
             messages_last_publish: None,
             messages_published_revision: 0,
@@ -17927,11 +17959,6 @@ impl ApplicationHandler<Wake> for App {
                 window.request_redraw();
             }
         }
-        for wid in self.band_motion_due(Instant::now()) {
-            if let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
-                window.request_redraw();
-            }
-        }
         for wid in self.claude_card_redraws() {
             if let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
                 window.request_redraw();
@@ -18041,7 +18068,6 @@ impl ApplicationHandler<Wake> for App {
             if band_folded {
                 to_redraw.extend(self.windows.keys().copied());
             }
-            to_redraw.extend(self.band_motion_due(now));
             let native_preview_phase_ms =
                 u64::try_from(self.lat_epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
             for wid in native_motion_due {
@@ -18685,14 +18711,6 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::MessageBand,
             );
         }
-        if let Some(d) = self.band_motion_deadline(native_preview_now) {
-            fold_owned_deadline(
-                &mut deadline,
-                &mut deadline_owner,
-                d,
-                metrics::DeadlineOwner::MessageBandMotion,
-            );
-        }
         let waits_now = native_preview_now;
         self.session_waits_tick(waits_now);
         if let Some(d) = self.session_waits_deadline() {
@@ -19196,7 +19214,6 @@ impl ApplicationHandler<Wake> for App {
             && mhz > 0
         {
             self.frame_interval = Duration::from_nanos(1_000_000_000_000u64 / u64::from(mhz));
-            self.messages.set_refresh(self.frame_interval);
         }
         el.set_control_flow(ControlFlow::Wait);
         if self.headless {
@@ -19377,6 +19394,10 @@ impl App {
             self.finalize_backend();
         }
         match ev {
+            #[cfg(target_os = "macos")]
+            Wake::DispatchFence(reply) => {
+                let _ = reply.send(());
+            }
             Wake::AccountsDrained { serial, drained } => {
                 self.finish_account_drain(el, serial, drained)
             }
@@ -25886,6 +25907,7 @@ fn warm_config(headless: bool, zoom: app_config::CarriedZoom) -> WarmConfig {
                 || {
                     fatal_launch_error(
                         headless,
+                        LaunchFatal::Font,
                         "no system monospace font found (set font_family in aterm.toml, \
                          or launch with --font <family|file>)",
                     )
@@ -26014,6 +26036,7 @@ fn warm_config(headless: bool, zoom: app_config::CarriedZoom) -> WarmConfig {
     {
         fatal_launch_error(
             headless,
+            LaunchFatal::Backend,
             "backend-build thread stopped before font admission",
         );
     }
@@ -26224,10 +26247,15 @@ fn warm_prologue(
             sbpl
         }
         aterm_containment::SpawnDecision::Deny { reason, .. } => {
-            fatal_launch_error(headless, &format!("containment mode {mode}: {reason}"));
+            fatal_launch_error(
+                headless,
+                LaunchFatal::Containment,
+                &format!("containment mode {mode}: {reason}"),
+            );
         }
         _ => fatal_launch_error(
             headless,
+            LaunchFatal::Containment,
             &format!("containment mode {mode} denies spawning a shell (fail-closed)"),
         ),
     };
@@ -26378,6 +26406,7 @@ fn build_event_loop(headless: bool, successor: bool) -> BuiltLoop {
         Err(e) => {
             fatal_launch_error(
                 headless,
+                LaunchFatal::Display,
                 &format!(
                     "cannot open a display ({e}).\n\
                      Is a graphical session running, with $DISPLAY (X11) or \
@@ -27514,7 +27543,9 @@ pub fn main_entry_with_network(
         None, // no worker's task
         adopt0,
     )
-    .unwrap_or_else(|e| fatal_launch_error(headless, &format!("spawn failed: {e}")));
+    .unwrap_or_else(|e| {
+        fatal_launch_error(headless, LaunchFatal::Spawn, &format!("spawn failed: {e}"))
+    });
     if bootstrap_payload.is_some() {
         session_factory.exec_command = bootstrap_payload;
     }
@@ -28711,7 +28742,6 @@ pub fn main_entry_with_network(
         folder_rows: spawn_folder::RowFolders::default(),
         restored_shown: app_restore::RestoredShown::default(),
         message_band_rows: 0,
-        band_lay: message_band::band_lay,
         messages_log,
         messages_last_publish: None,
         messages_published_revision: 0,

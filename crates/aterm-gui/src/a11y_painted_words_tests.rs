@@ -326,8 +326,15 @@ fn a_session_field_beside_a_page_holds_the_focus() {
     app.redraw_window(WID);
 
     let tree = sent(&app);
-    let (field, _) = node_of(tree, Role::TextInput).expect("the field");
-    assert_eq!(tree.focus, field);
+    // By its label: a page wide enough to show its search field (Linux's 9 px cells make this
+    // half window that wide) holds a text input of its own, and the page's nodes come ahead of
+    // the chrome's.
+    let (field, _) = tree
+        .nodes
+        .iter()
+        .find(|(_, node)| node.role() == Role::TextInput && node.label() == Some("Session name"))
+        .expect("the field");
+    assert_eq!(tree.focus, *field);
 }
 
 #[test]

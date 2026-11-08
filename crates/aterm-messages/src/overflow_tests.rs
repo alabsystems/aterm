@@ -21,7 +21,7 @@ fn ms(n: u64) -> Duration {
 }
 
 fn present(c: &MessageCenter, cols: usize) -> Presentation {
-    c.presentation(cols, &char_width, None, Links::Painted)
+    c.presentation(cols, &char_width, Links::Painted)
 }
 
 fn download(title: &str, done: u64) -> Message {
@@ -180,7 +180,7 @@ fn the_overflow_row_names_a_hidden_download_and_degrades_to_a_count() {
         p.rows[1].title.1,
         "Downloading Homebrew 20% \u{b7} 1 more \u{203a}"
     );
-    let p = c.presentation(120, &char_width, None, Links::Withheld);
+    let p = c.presentation(120, &char_width, Links::Withheld);
     assert_eq!(p.rows[1].title.1, "Downloading Homebrew 20% \u{b7} 1 more");
     let mut c = MessageCenter::new(MessageLog::empty(), now);
     c.post(

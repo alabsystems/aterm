@@ -3598,11 +3598,13 @@ fn a_verb_the_books_lock_refuses_still_says_it_narrowed_an_open_state() {
         };
         let _held = member::hold_book(state).unwrap();
         std::fs::set_permissions(state, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let refused = if issues {
-            init(&issuer.places, &[])
-        } else {
-            join(&member.places, &opts, &code)
-        };
+        let refused = member::lock_waiting(Duration::ZERO, || {
+            if issues {
+                init(&issuer.places, &[])
+            } else {
+                join(&member.places, &opts, &code)
+            }
+        });
         assert!(
             matches!(&refused, Err(Failure::Failed(why)) if why.contains("writing the book")),
             "{refused:?}"
@@ -7910,7 +7912,9 @@ fn a_read_while_a_join_of_another_fleet_writes_its_key_finds_the_old_fleet_whole
             let key = key.clone();
             move |at| {
                 if at == "key" {
-                    let _ = with_peers_answering(|| peers(&elsewhere, &[]));
+                    let _ = member::lock_waiting(Duration::ZERO, || {
+                        with_peers_answering(|| peers(&elsewhere, &[]))
+                    });
                     // The key's write fails now.
                     std::fs::remove_file(&key).unwrap();
                     std::fs::create_dir(&key).unwrap();
@@ -8173,7 +8177,8 @@ fn an_older_aterms_edit_never_comes_between_a_joins_marks_and_its_key() {
         move |at| {
             // An older aterm's edit of the book under its lock: every line written back unmarked.
             if at == "key"
-                && let Ok(_book) = member::hold_book(&state)
+                && let Ok(_book) =
+                    member::lock_waiting(Duration::ZERO, || member::hold_book(&state))
             {
                 let mut text = String::from("# The fleet's peers, one per line.\n");
                 for peer in read_as_older(&state) {
@@ -8371,10 +8376,13 @@ fn a_leave_beside_an_edit_of_the_book_leaves_no_book() {
         &args(&["--host", "127.0.0.1", "--port", &closed_port().to_string()]),
     ));
     let state = issuer.places.state.clone();
-    // Inside an edit of the book: the leave waits it out, and past the lock's wait removes nothing.
+    // This edit cannot release its real lock until the leave returns, so refuse without waiting
+    // through the production hang detector. The leave must remove nothing.
     let during = member::update_peers(&state, |book| {
         member::record(book, manual_peer("127.0.0.1".to_owned(), 7199))?;
-        Ok(leave(&issuer.places, &[]))
+        Ok(member::lock_waiting(Duration::ZERO, || {
+            leave(&issuer.places, &[])
+        }))
     })
     .unwrap();
     assert!(during.is_err(), "{during:?}");
@@ -8685,15 +8693,17 @@ fn a_join_while_a_leave_edits_aterm_toml_leaves_no_fleet_half_held() {
     // The join holds its node key and the issuer's answer before the leave begins, so only its
     // locked steps meet the leave.
     let mut joining = Some(std::thread::spawn(move || {
-        with_step_hook(
-            move |at| {
-                if at == "lock" {
-                    dialled.send(()).unwrap();
-                    gone.recv_timeout(HANG).unwrap();
-                }
-            },
-            || join(&elsewhere, &opts, &code),
-        )
+        member::lock_waiting(Duration::ZERO, || {
+            with_step_hook(
+                move |at| {
+                    if at == "lock" {
+                        dialled.send(()).unwrap();
+                        gone.recv_timeout(HANG).unwrap();
+                    }
+                },
+                || join(&elsewhere, &opts, &code),
+            )
+        })
     }));
     at_lock.recv_timeout(HANG).expect("the join dials");
     let (joins, joined) = std::sync::mpsc::channel();
@@ -11532,7 +11542,9 @@ fn a_sync_on_ends_fleet_off_under_the_books_lock() {
     let off = member.places.state.join(member::OFF_FILE);
     assert!(off.is_file());
     let held = member::hold_book(&member.places.state).unwrap();
-    let busy = sync_with(&member.places, true, publishes(&code), &sync_here());
+    let busy = member::lock_waiting(Duration::ZERO, || {
+        sync_with(&member.places, true, publishes(&code), &sync_here())
+    });
     assert!(
         matches!(&busy, Err(Failure::Failed(why)) if why.contains("another aterm is writing the book")),
         "{busy:?}"
@@ -11578,7 +11590,7 @@ fn a_host_word_that_is_a_macs_short_name_binds_its_whole_node() {
         .collect();
     write_private(&world.places.state, PEERS_FILE, text.as_bytes()).unwrap();
     let node = |byte: u8| format!("{byte:02x}").repeat(16);
-    let word = |what: &str| host_word(&world.places, what, None);
+    let word = |what: &str| host_word(&world.places, what, None, after_now(HANG));
     assert_eq!(
         word("m27"),
         Ok(node(0x11)),
@@ -11733,7 +11745,9 @@ fn a_short_name_of_the_issuer_is_refused_while_no_book_here_lists_its_members() 
         silent: true,
         unserved: false,
     };
-    let word = |what: &str, unread: Option<&Missed>| host_word(&world.places, what, unread);
+    let word = |what: &str, unread: Option<&Missed>| {
+        host_word(&world.places, what, unread, after_now(HANG))
+    };
 
     // No copy held: the issuer's short names stay as typed, and binding one is refused.
     for short_name in ["MacbookAir", "m27"] {

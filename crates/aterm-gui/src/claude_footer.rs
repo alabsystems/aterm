@@ -4085,11 +4085,12 @@ impl RuleAt {
 /// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §4.1): a fact's mark in the mark ink of its
 /// column, a value and a quiet word in theirs; the account unit by its pieces' tones, its name
 /// and `↺` in the lit ink, its `·` in the quiet ink, its figures and times in the value ink and a
-/// projected gap's words in the warn ink. Under a palette the rule's own `─` (its
-/// lead, the run between the chips and the facts, and its close) wear the arc of their columns,
-/// so the whole run is written; with none, the run between stays Claude's. A run with no room
-/// (`footer::RULE_LEAD + 1` cells or fewer) takes no cells either way: the arc's lead and close
-/// would not fit inside it.
+/// projected gap's words in the warn ink. The facts are terminal text: Normal script, each glyph
+/// in the cells [`footer::set_facts`] gives it, regular but for the parts laid bold (a warning's
+/// words, `↺`). Under a palette the rule's own `─` (its lead, the run between the chips and the
+/// facts, and its close) wear the arc of their columns, so the whole run is written; with none,
+/// the run between stays Claude's. A run with no room (`footer::RULE_LEAD + 1` cells or fewer)
+/// takes no cells either way: the arc's lead and close would not fit inside it.
 fn compose_rule_spans(
     fit: &footer::RuleFit,
     block: Option<&crate::claude_lights::Block>,
@@ -4133,64 +4134,66 @@ fn compose_rule_spans(
     let mut clusters = Vec::new();
     let mut combining = Vec::new();
     if !fit.segments.is_empty() {
-        let quiet = |fg: u32| RenderCell {
+        // Line D's facts are terminal text (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
+        // §4.3): Normal script, each glyph in its own cells, regular weight but where a part is
+        // laid bold (a warning's words and `↺`, `footer::Segment::bold`).
+        let laid = |fg: u32| RenderCell {
             fg: rgb_of(fg),
-            bold: true,
-            script: aterm_core::terminal::Script::Sub { nudge: 0 },
+            bold: false,
+            script: aterm_core::terminal::Script::Normal,
             ..blank
         };
-        let value = quiet(glass.value());
-        // A stub is quieter than its value by its ink ([`GlassInks::quiet`]). On a light ground
-        // it keeps the values' weight: at the subscript size a thin dark stroke covers no whole
-        // pixel and reads lighter than the ink it was floored to. A dark ground keeps its thin
-        // stub (owner ruling 2026-10-28: the black theme is not changed).
-        let stub = RenderCell {
-            bold: !crate::claude_card::dark_ground(blank),
-            ..quiet(glass.quiet())
-        };
+        let value = laid(glass.value());
+        // A stub is quieter than its value by its ink alone ([`GlassInks::quiet`]).
+        let stub = laid(glass.quiet());
         let lifted = |cell: RenderCell, fg: u32| RenderCell {
             fg: rgb_of(fg),
             ..cell
         };
-        let warn = quiet(glass.warn());
+        let warn = laid(glass.warn());
         let set = footer::set_facts(&fit.segments);
         // The facts are laid against the run's close, at pane column `at.end - 1`: their cell
         // `c` (a blank first) sits at this pane column.
         let fact_col = |c: usize| (at.end + c).saturating_sub(set.cells + 3);
         spans = footer::fact_spans(&set, &fit.segments);
-        let lit_span = lit.and_then(|kind| {
+        // Every span of the lit fact lights: one fact can lie in two (the wall `⧗ until 3pm` and
+        // the account unit `⎆ main …` are both the account, one target the pointer and the
+        // keyboard light and a click opens as one).
+        let lit_cells = |kind: FactKind| {
             spans
                 .iter()
                 .flatten()
-                .find(|span| span.kind == kind)
-                .copied()
-        });
-        let lit_cells = lit_span.map(|span| usize::from(span.cells.0)..usize::from(span.cells.1));
-        let mut lit_inks: Vec<(isize, [u8; 3])> = Vec::new();
+                .filter(move |span| span.kind == kind)
+                .map(|span| usize::from(span.cells.0)..usize::from(span.cells.1))
+        };
+        let is_lit =
+            |cell: usize| lit.is_some_and(|kind| lit_cells(kind).any(|c| c.contains(&cell)));
+        // Each lit glyph's middle, in half cells (`2 × cell + cols`), and its ink.
+        let mut lit_inks: Vec<(usize, [u8; 3])> = Vec::new();
         facts = vec![blank; set.cells + 2];
         for glyph in &set.glyphs {
-            let lit = lit_cells.as_ref().is_some_and(|c| c.contains(&glyph.cell));
+            let lit = is_lit(glyph.cell);
             let t = at.t(fact_col(1 + glyph.cell));
             // Line D's inks (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.2): marks in
             // the field's hue, values in the value ink, the account unit's name and `↺` lit,
             // its `·` quiet, a projected gap's words warn. A hovered fact lifts each ink (the
             // lit name to the field's letter ink, as its mark) but a warning's.
             let ink = match (glyph.mark, glyph.quiet, lit, glyph.tone) {
-                (true, _, false, _) => quiet(glass.mark(t)),
-                (true, _, true, _) => quiet(glass.letter(t)),
+                (true, _, false, _) => laid(glass.mark(t)),
+                (true, _, true, _) => laid(glass.letter(t)),
                 (false, true, false, _) | (false, false, false, footer::Tone::Quiet) => stub,
                 (false, true, true, _) | (false, false, true, footer::Tone::Quiet) => {
                     lifted(stub, glass.value())
                 }
                 (false, false, _, footer::Tone::Warn) => warn,
-                (false, false, false, footer::Tone::Lit) => quiet(glass.lit()),
-                (false, false, true, footer::Tone::Lit) => quiet(glass.letter(t)),
+                (false, false, false, footer::Tone::Lit) => laid(glass.lit()),
+                (false, false, true, footer::Tone::Lit) => laid(glass.letter(t)),
                 (false, false, false, footer::Tone::Value) => value,
                 (false, false, true, footer::Tone::Value) => lifted(value, glass.lit()),
             };
             let cell = RenderCell {
                 ch: glyph.ch,
-                script: aterm_core::terminal::Script::Sub { nudge: glyph.nudge },
+                bold: glyph.bold,
                 ..ink
             };
             facts[1 + glyph.cell] = cell;
@@ -4202,25 +4205,19 @@ fn compose_rule_spans(
                 };
             }
             if lit {
-                let n = isize::from(footer::NUDGES_PER_CELL);
-                let middle = glyph.cell as isize * n
-                    + isize::from(glyph.nudge)
-                    + glyph.cols as isize * n / 2;
-                lit_inks.push((middle, cell.fg));
+                lit_inks.push((2 * glyph.cell + glyph.cols, cell.fg));
             }
         }
-        if let Some(span) = lit_span {
-            let n = isize::from(footer::NUDGES_PER_CELL);
-            for c in footer::drawn_cells(&set, &span) {
-                let middle = c as isize * n + n / 2;
-                let ink = lit_inks
-                    .iter()
-                    .min_by_key(|(at, _)| (at - middle).abs())
-                    .map(|&(_, fg)| fg);
-                let cell = &mut facts[1 + c];
-                cell.underline = aterm_core::terminal::UnderlineStyle::Single;
-                cell.underline_color = ink;
-            }
+        // A lit fact's underline runs under each of its spans' cells, its glyphs' and the blanks
+        // between them, each cell's in the ink of the glyph nearest it.
+        for c in lit.into_iter().flat_map(lit_cells).flatten() {
+            let ink = lit_inks
+                .iter()
+                .min_by_key(|(middle, _)| middle.abs_diff(2 * c + 1))
+                .map(|&(_, fg)| fg);
+            let cell = &mut facts[1 + c];
+            cell.underline = aterm_core::terminal::UnderlineStyle::Single;
+            cell.underline_color = ink;
         }
         clusters = set.clusters;
         combining = set.combining;
@@ -4339,8 +4336,6 @@ fn rule_edits<'a>(
     .into_iter()
     .filter(|(_, _, cells, _)| !cells.is_empty())
 }
-
-const _: () = assert!(footer::NUDGES_PER_CELL == aterm_core::terminal::Script::NUDGES_PER_CELL);
 
 /// How far the values' ink is lifted from Claude's rule gray toward the pane's text colour.
 const VALUE_LIFT: f32 = 1.0 / 3.0;
@@ -10986,54 +10981,12 @@ fn read_footer(
     crate::reader_guard::read_or_none(session, "Claude Code footer", rows, || read(rows)).flatten()
 }
 
-/// Reconstructs the display string of `row` on the glass.
+/// Reconstructs the display string of `row` on the glass: each cell's character in order, a wide
+/// glyph's right half its blank. Line D's facts are terminal text at pitch 1, so their cells read
+/// as they are.
 #[cfg(test)]
 pub(crate) fn read_glass(row: &[RenderCell]) -> String {
-    use aterm_core::terminal::Script;
-    let glyph = |c: &RenderCell| matches!(c.script, Script::Sub { .. }) && !c.wide && c.ch != ' ';
-    let in_run =
-        |c: &RenderCell| matches!(c.script, Script::Sub { .. }) || (c.ch == ' ' && !c.wide);
-    let step = 1.0 / f32::from(Script::NUDGES_PER_CELL);
-    let mut out = String::new();
-    let mut c = 0;
-    while c < row.len() {
-        if !glyph(&row[c]) {
-            out.push(row[c].ch);
-            c += 1;
-            continue;
-        }
-        let mut end = c;
-        let mut k = c;
-        while k < row.len() && in_run(&row[k]) {
-            if glyph(&row[k]) || row[k].wide {
-                end = k + 1;
-            }
-            k += 1;
-        }
-        let mut last: Option<(f32, usize)> = None;
-        for (k, cell) in row.iter().enumerate().take(end).skip(c) {
-            let Script::Sub { nudge } = cell.script else {
-                continue;
-            };
-            if !glyph(cell) {
-                continue;
-            }
-            let cols = if row.get(k + 1).is_some_and(|n| n.wide) {
-                2
-            } else {
-                1
-            };
-            let at = k as f32 + cols as f32 / 2.0 + f32::from(nudge) * step;
-            if let Some((before, before_cols)) = last {
-                let room = (at - before) / footer::FACT_PITCH - (before_cols + cols) as f32 / 2.0;
-                out.extend(std::iter::repeat_n(' ', room.round().max(0.0) as usize));
-            }
-            out.push(cell.ch);
-            last = Some((at, cols));
-        }
-        c = end;
-    }
-    out
+    row.iter().map(|c| c.ch).collect()
 }
 
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
@@ -11931,16 +11884,6 @@ mod tests {
         footer::segments_width(&segments) + 2
     }
 
-    fn unplaced(cell: RenderCell) -> RenderCell {
-        match cell.script {
-            aterm_core::terminal::Script::Sub { .. } => RenderCell {
-                script: aterm_core::terminal::Script::Sub { nudge: 0 },
-                ..cell
-            },
-            aterm_core::terminal::Script::Normal => cell,
-        }
-    }
-
     fn facts() -> FooterFacts {
         FooterFacts {
             model: Some("Opus 5.5".into()),
@@ -11989,13 +11932,10 @@ mod tests {
         assert!(!set.glyphs.is_empty());
         for glyph in &set.glyphs {
             let painted = plain_cells[1 + glyph.cell];
+            assert_eq!(painted.bold, glyph.bold, "{glyph:?}");
             assert_eq!(
-                painted.bold,
-                glyph.mark || !glyph.quiet || !crate::claude_card::dark_ground(blank),
-                "{glyph:?}"
-            );
-            assert!(
-                matches!(painted.script, aterm_core::terminal::Script::Sub { .. }),
+                painted.script,
+                aterm_core::terminal::Script::Normal,
                 "{glyph:?}"
             );
         }
@@ -12100,6 +12040,114 @@ mod tests {
         );
     }
 
+    /// LINE D IS ONE SCRIPT AT ONE PITCH (glass design §1.2, §4.3, §6 S7): every glyph line D's
+    /// facts lay is Normal script and advances exactly its cell width, so the facts' cells read,
+    /// cell for cell, as their words: each mark one blank before its value, a part of the account
+    /// unit one blank after the part before it, a fact [`footer::GAP`] blanks after the one before
+    /// it, a wide char two cells, a blank on each side. Over the account unit, the wall and usage,
+    /// a hidden fact's stub and a wide branch, at every rung `fit_rule` gives from 0 to 200 cells,
+    /// under a palette and none. NEGATIVE CONTROLS: one value glyph in the old small script
+    /// (`Script::Sub`) fails the pin, and so do the same glyphs at the old 0.8 pitch (each at four
+    /// fifths of its cell).
+    #[test]
+    fn line_d_is_one_script_at_one_pitch() {
+        use aterm_core::terminal::Script;
+        let blank = cell(' ', [200, 200, 200]);
+        let rule = cell('\u{2500}', [60, 60, 60]);
+        // What `segments` read as at pitch 1, a wide char's right half its blank.
+        let words = |segments: &[footer::Segment]| -> String {
+            let mut out = String::from(" ");
+            for (i, segment) in segments.iter().enumerate() {
+                if i > 0 {
+                    let gap = if segment.attached { 1 } else { footer::GAP };
+                    out.extend(std::iter::repeat_n(' ', gap));
+                }
+                if let Some(mark) = segment.drawn_mark() {
+                    out.push(mark);
+                    out.push(' ');
+                }
+                for ch in segment.text.chars() {
+                    out.push(ch);
+                    if aterm_grapheme::char_width(ch) == 2 {
+                        out.push(' ');
+                    }
+                }
+            }
+            out.push(' ');
+            out
+        };
+        // Whether `laid`, the facts' cells and their outer blanks, is `reading` in Normal script.
+        let one_pitch = |laid: &[RenderCell], reading: &str| -> Result<(), String> {
+            let read: String = laid.iter().map(|c| c.ch).collect();
+            if read != reading {
+                return Err(format!("{read:?}, not {reading:?}"));
+            }
+            laid.iter()
+                .find(|c| c.ch != ' ' && c.script != Script::Normal)
+                .map_or(Ok(()), |c| Err(format!("{:?} in {:?}", c.ch, c.script)))
+        };
+        let unit = FooterFacts {
+            account: Some("main".into()),
+            subscription: Some(aterm_agent::harness::profile::SubscriptionDisplay::default()),
+            quota: Some(aterm_agent::harness::quota_view::QuotaView::sample()),
+            ..facts()
+        };
+        let stub = FooterFacts {
+            off: footer::FactMask::default().with(FactKind::Branch, true),
+            ..facts()
+        };
+        let wide = FooterFacts {
+            branch: Some("\u{6F22}\u{5B57}".into()),
+            ..facts()
+        };
+        let corpus = [facts(), unit, facts_with_usage(), stub, wide];
+        let palettes = [None, Some(aterm_effects::harness_card::CardPalette::Cruise)];
+        let (mut checked, mut control) = (0usize, None);
+        for (f, facts) in corpus.iter().enumerate() {
+            for palette in palettes {
+                let glass = rule_glass(palette, rule, blank);
+                for room in 0..=200 {
+                    let fit = footer::fit_rule(facts, room, None);
+                    if fit.segments.is_empty() {
+                        continue;
+                    }
+                    let place = (&glass, rule_at_room(room));
+                    let paint = compose_rule_spans(&fit, None, rule, blank, place, room, None);
+                    let reading = words(&fit.segments);
+                    let laid = paint
+                        .cells
+                        .get(paint.facts_at..paint.facts_at + reading.chars().count())
+                        .unwrap_or_else(|| panic!("facts {f} at {room}: the facts are laid"));
+                    if let Err(why) = one_pitch(laid, &reading) {
+                        panic!("facts {f} under {palette:?} at {room}: {why}");
+                    }
+                    control.get_or_insert_with(|| (laid.to_vec(), reading));
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 5 * 2 * 100, "{checked} lines");
+        let (laid, reading) = control.expect("a line");
+        let value = laid
+            .iter()
+            .position(|c| c.ch.is_ascii_alphanumeric())
+            .expect("a value glyph");
+        let mut small = laid.clone();
+        small[value].script = Script::Sub { nudge: 0 };
+        assert!(
+            one_pitch(&small, &reading).is_err(),
+            "NEGATIVE CONTROL: a value glyph in the old small script"
+        );
+        let mut squeezed = vec![blank; laid.len()];
+        for (c, cell) in laid.iter().enumerate().filter(|(_, c)| c.ch != ' ') {
+            squeezed[(c as f32 * 0.8).round() as usize] = *cell;
+        }
+        assert!(
+            one_pitch(&squeezed, &reading).is_err(),
+            "NEGATIVE CONTROL: the same glyphs at the old 0.8 pitch"
+        );
+    }
+
     #[test]
     fn the_facts_are_painted_where_they_are_set() {
         let blank = cell(' ', [200, 200, 200]);
@@ -12114,7 +12162,7 @@ mod tests {
             assert_eq!(painted.ch, glyph.ch);
             assert_eq!(
                 painted.script,
-                aterm_core::terminal::Script::Sub { nudge: glyph.nudge },
+                aterm_core::terminal::Script::Normal,
                 "{glyph:?}"
             );
             glyph_cells.insert(1 + glyph.cell);
@@ -12126,10 +12174,10 @@ mod tests {
         }
         let reading = " \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main ";
         assert_eq!(text_of(&cells), reading);
-        assert!(
-            cells.len() < reading.chars().count(),
-            "CONTROL: {}",
-            cells.len()
+        assert_eq!(
+            cells.len(),
+            reading.chars().count(),
+            "one cell per character"
         );
     }
 
@@ -12165,7 +12213,6 @@ mod tests {
                 .all(|c| c.underline == UnderlineStyle::None),
             "CONTROL: nothing underlined at rest"
         );
-        let step = 1.0 / f32::from(Script::NUDGES_PER_CELL);
         for kind in [
             FactKind::Account,
             FactKind::Model,
@@ -12183,22 +12230,19 @@ mod tests {
                 .expect("the fact is on the line");
             let at = paint.facts_at + 1;
             let own = at + usize::from(span.cells.0)..at + usize::from(span.cells.1);
-            let mut drawn: Vec<(f32, f32, [u8; 3])> = Vec::new();
+            let mut drawn: Vec<(usize, usize, [u8; 3])> = Vec::new();
             for c in own.clone() {
                 let cell = paint.cells[c];
                 if cell.ch == ' ' {
                     continue;
                 }
-                let Script::Sub { nudge } = cell.script else {
-                    panic!("{kind:?}: cell {c} is no set glyph");
-                };
+                assert_eq!(cell.script, Script::Normal, "{kind:?}: cell {c}");
                 let cols = if paint.cells.get(c + 1).is_some_and(|n| n.wide) {
-                    2.0
+                    2
                 } else {
-                    1.0
+                    1
                 };
-                let left = c as f32 + f32::from(nudge) * step;
-                drawn.push((left, left + cols, cell.fg));
+                drawn.push((c, c + cols, cell.fg));
                 // A lit-toned word (the account's name) already wears the lit ink at rest; with
                 // no palette the hovered letter ink is that same ink, so it stays.
                 assert!(
@@ -12206,11 +12250,11 @@ mod tests {
                     "{kind:?}: cell {c} is lifted"
                 );
             }
-            let left = drawn.iter().map(|d| d.0).fold(f32::MAX, f32::min);
-            let right = drawn.iter().map(|d| d.1).fold(f32::MIN, f32::max);
+            let left = drawn.iter().map(|d| d.0).min().expect("the fact's ink");
+            let right = drawn.iter().map(|d| d.1).max().expect("the fact's ink");
+            assert_eq!(left..right, own, "{kind:?}: its ink is its own cells");
             for (c, cell) in paint.cells.iter().enumerate() {
-                let middle = c as f32 + 0.5;
-                let under = (left..right).contains(&middle);
+                let under = (left..right).contains(&c);
                 assert_eq!(
                     cell.underline == UnderlineStyle::Single,
                     under,
@@ -12220,10 +12264,7 @@ mod tests {
                 if under {
                     let nearest = drawn
                         .iter()
-                        .min_by(|a, b| {
-                            let d = |g: &(f32, f32, [u8; 3])| ((g.0 + g.1) / 2.0 - middle).abs();
-                            d(a).total_cmp(&d(b))
-                        })
+                        .min_by_key(|g| (g.0 + g.1).abs_diff(2 * c + 1))
                         .map(|g| g.2);
                     assert_eq!(cell.underline_color, nearest, "{kind:?}: cell {c}'s ink");
                 }
@@ -12235,12 +12276,6 @@ mod tests {
                     );
                 }
             }
-            if kind == FactKind::Path {
-                assert!(
-                    left - own.start as f32 > 1.5 && own.end as f32 - right > 1.5,
-                    "NEGATIVE CONTROL: the path's own cells {own:?} are not its ink {left}..{right}"
-                );
-            }
         }
     }
 
@@ -12249,8 +12284,9 @@ mod tests {
     /// `⎆ main 63% · ↺ Sat 10:00 · ╳ ~Thu 12 Nov 05:00`, reads with one blank between its parts and
     /// the facts' gap before the next fact; at rest `⎆` takes the marks' ink of its column, the
     /// name and `↺` the lit ink, the figure and time the values', each `·` the quiet ink, the gap
-    /// the warn ink. Lit, every glyph but the warning's is lifted, under one underline, and the
-    /// next fact stays as at rest. Negative control: the figure's ink differs from the name's.
+    /// the warn ink; every word regular but `↺` and the gap's, which are bold. Lit, every glyph but
+    /// the warning's is lifted, under one underline, and the next fact stays as at rest. Negative
+    /// control: the figure's ink differs from the name's.
     #[test]
     fn the_account_unit_reads_and_lights_as_one() {
         use aterm_core::terminal::UnderlineStyle;
@@ -12327,6 +12363,19 @@ mod tests {
             arc.cells[first('m')].fg,
             "NEGATIVE CONTROL: the figure's ink is not the name's"
         );
+        // Words are regular; the warning's and `↺`, whose glyph has so little ink, are laid bold
+        // (§4.3, `quota_view::Piece::bold`).
+        for (ch, bold) in [
+            (footer::ACCOUNT_MARK, false),
+            ('m', false),
+            ('6', false),
+            ('\u{b7}', false),
+            ('\u{21ba}', true),
+            ('S', false),
+            ('\u{2573}', true),
+        ] {
+            assert_eq!(arc.cells[first(ch)].bold, bold, "{ch:?}'s weight");
+        }
         let lit = compose_rule_spans(
             &fit,
             None,
@@ -12401,9 +12450,9 @@ mod tests {
             Some('\u{5B57}')
         );
         assert_eq!(row.len(), footer::segments_width(&fit.segments) + 2);
-        assert_eq!(cells_for(" \u{2387} \u{6F22}\u{5B57} "), 7);
-        assert!(!footer::fit_rule(&wide, 7, None).segments.is_empty());
-        assert!(footer::fit_rule(&wide, 6, None).segments.is_empty());
+        assert_eq!(cells_for(" \u{2387} \u{6F22}\u{5B57} "), 8);
+        assert!(!footer::fit_rule(&wide, 8, None).segments.is_empty());
+        assert!(footer::fit_rule(&wide, 7, None).segments.is_empty());
     }
 
     fn facts_with_usage() -> FooterFacts {
@@ -12432,6 +12481,11 @@ mod tests {
     /// glass's marks ink of their own column ([`GlassInks::mark`]), under Cruise on a dark ground,
     /// and the wall says until when alone (`⧗ until 3pm`, no window name). CONTROL: the marks stand
     /// at different columns and their inks differ, so the column, not one fixed ink, decides.
+    ///
+    /// The wall's words are the one warning on line D a person can act on (glass design §4.1,
+    /// §4.3, §8 item 16): the warn ink, bold, behind `⧗`, while the usage words beside them stay a
+    /// regular value (the control). NEGATIVE CONTROL (run once, restored): a plain wall segment in
+    /// `footer::fact_segments` lays `until 3pm` regular in the value ink and fails here.
     #[test]
     fn the_wall_and_usage_marks_take_the_marks_ink() {
         let blank = cell(' ', [200, 200, 200]);
@@ -12448,13 +12502,13 @@ mod tests {
         );
         let (glass, at) = (rule_glass(palette, rule, blank), rule_at_room(room));
         let col = |mark: char| cells.iter().position(|c| c.ch == mark).unwrap();
-        let model = unplaced(cells[col('\u{25C6}')]);
+        let model = cells[col('\u{25C6}')];
         assert_eq!(model.fg, rgb_of(glass.mark(at.t(col('\u{25C6}')))), "`◆`");
         let mut inks = vec![model.fg];
         for mark in ['\u{29D7}', '\u{03A3}'] {
             let c = col(mark);
             assert_eq!(
-                unplaced(cells[c]),
+                cells[c],
                 RenderCell {
                     ch: mark,
                     fg: rgb_of(glass.mark(at.t(c))),
@@ -12466,6 +12520,33 @@ mod tests {
         }
         inks.dedup();
         assert!(inks.len() > 1, "CONTROL: one ink at every column");
+        // The words after a mark, up to the next run of blanks.
+        let words_after = |mark: char| -> Vec<RenderCell> {
+            cells[col(mark) + 2..]
+                .iter()
+                .take_while(|c| c.ch != ' ')
+                .copied()
+                .collect()
+        };
+        let wall = words_after('\u{29D7}');
+        assert_eq!(
+            wall.iter().map(|c| c.ch).collect::<String>(),
+            "until",
+            "the wall's first word"
+        );
+        assert!(
+            wall.iter().all(|c| c.fg == rgb_of(glass.warn()) && c.bold),
+            "the wall's words are a warning, the warn ink and bold: {wall:?}"
+        );
+        let usage = words_after('\u{03A3}');
+        assert!(
+            !usage.is_empty()
+                && usage
+                    .iter()
+                    .all(|c| c.fg == rgb_of(glass.value()) && !c.bold),
+            "CONTROL: the usage words stay a regular value: {usage:?}"
+        );
+        assert_ne!(glass.warn(), glass.value(), "CONTROL: two inks");
     }
     #[test]
     fn the_offset_cache_keeps_answers_and_asks_again_after_a_failure() {
@@ -14587,9 +14668,10 @@ mod tests {
                 rgb_of(rule_glass(None, glyph, blank).value()),
                 "{label}: the value, in the glass's value ink"
             );
-            assert!(
-                matches!(rule[o].script, aterm_core::terminal::Script::Sub { .. }),
-                "{label}: small and low"
+            assert_eq!(
+                rule[o].script,
+                aterm_core::terminal::Script::Normal,
+                "{label}: terminal text"
             );
             for (c, (was, now)) in vendor[strip + bottom].iter().zip(rule).enumerate() {
                 if was != now {
@@ -14677,7 +14759,7 @@ mod tests {
 
     #[test]
     fn a_split_panes_rule_carries_its_own_footer() {
-        let (mut app, wid, session) = glass(80);
+        let (mut app, wid, session) = glass(100);
         let _other = app.split_active_stub_tab(wid);
         let (pane_rows, cols) = {
             let term = crate::term_lock(&app.pool.get(session).unwrap().term);

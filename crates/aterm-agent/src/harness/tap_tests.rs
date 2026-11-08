@@ -657,6 +657,70 @@ fn a_reading_keeps_the_vendors_tenths_and_its_model() {
     assert_eq!(r.model, None);
 }
 
+/// NO READING UNDER 100 IS SAID AS 100, AND A BOUND STAYS TRUE
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1): the tenths of a `used_percentage`
+/// round down, so `99.96` is 999 tenths, said `99%` now and `≥99%` once aged, and `62.999` is
+/// 629, whose bound `≥62%` the reading meets; only a reading of 100 is 1000 and `100%`. The
+/// whole-percent field the usage line and the survey print holds the same rule: half up from the
+/// tenths (62.96 is 63), but 99 at 99.5, 99.96 and 99.999999999999999, and 100 only at 100. The
+/// exact JSON lexeme decides the boundary: a decimal just below 63 stays below it even where
+/// `f64` would round it to 63, while exact `63.0` stays 630.
+/// NEGATIVE CONTROLS: rounding through hundredths makes 62.999 630; parsing
+/// 62.999999999999999 through `f64` makes it 63. Both falsely say the aged bound is 63%.
+/// Rounding the whole field plainly half up from the tenths (`(x10 + 5) / 10`) makes 99.96 a
+/// whole 100 (run once, restored).
+/// The earlier negative control (run once, restored): rounding the tenths half up
+/// (`(f * 10.0).round()`) gives 99.96 1000 and fails at `99%`.
+#[test]
+fn no_reading_under_a_hundred_is_said_as_a_hundred() {
+    use super::super::outlook::Figure;
+    let now = 1_792_050_000;
+    let reset = now + 86_400;
+    let read = |pct: &str| {
+        let text = format!(
+            r#"{{"cost":{{"total_api_duration_ms":9}},"rate_limits":{{"seven_day":{{"used_percentage":{pct},"resets_at":{reset}}}}}}}"#
+        );
+        let week = Reading::of_stdin(&text, &vars(), now)
+            .expect("a reading")
+            .seven_day
+            .expect("its week");
+        let x10 = u16::try_from(week.x10()).expect("tenths");
+        (
+            week.pct,
+            week.x10(),
+            Figure::Exact(x10).words(),
+            Figure::AtLeast(x10).words(),
+        )
+    };
+    let said = |pct: u32, x10: u32, now: &str, aged: &str| (pct, x10, now.into(), aged.into());
+    assert_eq!(read("99.96"), said(99, 999, "99%", "\u{2265}99%"));
+    assert_eq!(read("99.5"), said(99, 995, "99%", "\u{2265}99%"));
+    assert_eq!(read("99.49"), said(99, 994, "99%", "\u{2265}99%"));
+    assert_eq!(read("62.96"), said(63, 629, "63%", "\u{2265}62%"));
+    assert_eq!(read("62.999"), said(63, 629, "63%", "\u{2265}62%"));
+    assert_eq!(
+        read("62.999999999999999"),
+        said(63, 629, "63%", "\u{2265}62%")
+    );
+    assert_eq!(
+        read("6.2999999999999999e1"),
+        said(63, 629, "63%", "\u{2265}62%")
+    );
+    assert_eq!(read("63.0"), said(63, 630, "63%", "\u{2265}63%"));
+    assert_eq!(read("62.6"), said(63, 626, "63%", "\u{2265}62%"));
+    assert_eq!(
+        read("99.999999999999999"),
+        said(99, 999, "99%", "\u{2265}99%")
+    );
+    assert_eq!(
+        read("100.0"),
+        said(100, 1000, "100%", "\u{2265}100%"),
+        "CONTROL: a reading of 100 is 100"
+    );
+    assert_eq!(read("100"), said(100, 1000, "100%", "\u{2265}100%"));
+    assert_eq!(read("1e2"), said(100, 1000, "100%", "\u{2265}100%"));
+}
+
 /// THE CONTEXT LEFT (Claude Code 2.1.311's status-line payload): `context_window` carries
 /// `remaining_percentage`, Claude Code's own count of the window left, which the file keeps
 /// rounded for the survey; before the first reply it is `null`, and an older file, which never

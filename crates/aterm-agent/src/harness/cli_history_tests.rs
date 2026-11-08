@@ -1072,6 +1072,38 @@ fn history_puts_the_open_window_on_its_rows_day() {
     );
 }
 
+/// A DAY IS SAID FULL ONLY WHERE A READING WAS. A five-hour window whose highest figure is
+/// 99.9% (999 tenths) prints `peak 99%`; at 100.0% it prints `peak 100%`
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1: 100% is printed only when a reading
+/// says 100). Negative control: the history's whole percent rounded plain half up prints
+/// `peak 100%, open 100%` for 999, and the first case fails.
+#[test]
+fn a_days_peak_says_100_only_for_a_reading_of_100() {
+    for (x10, said) in [(999, "99%"), (1000, "100%")] {
+        let tmp = tmp_dir(&format!("history-full-{x10}"));
+        let env = env_at(&tmp);
+        let now = env.now;
+        let machine = pool(&tmp, &env, &["work"], &[]);
+        let row = SeriesRow {
+            t: now - H + 5 * 60,
+            by: "m".into(),
+            said: Said::Fig {
+                five_hour: Some(fig(x10, now + 2 * H, now - H - 5 * 60)),
+                seven_day: None,
+                ac: None,
+                key: None,
+            },
+        };
+        write_series(&env, "work", &machine, &[row]);
+        let text = history_of(&env, Some("work"), (false, false), east);
+        assert_eq!(
+            day_lines(&text),
+            [format!("  Sun Sep 21  5h peak {said}, open {said}")],
+            "{text}"
+        );
+    }
+}
+
 /// A HISTORY WITHOUT A NAME FINDS A FORGOTTEN ROW'S KEY. The row `now`, keyed by the lab as
 /// `ac-…`, has no record here, but the record this Mac forgot under that lab key holds the
 /// account key its old series `before` carries: the history of every row finds that series as

@@ -393,24 +393,38 @@ impl TapVars {
     }
 }
 
-/// A percent from the vendor, an integer or a finite number in `0..=100`,
-/// as the whole percent it rounds to and in tenths, rounded.
-fn pct_of(value: &Value) -> Option<(u32, u32)> {
+/// A vendor percent's exact JSON decimal lexeme as its whole percent and its conservative
+/// tenths. Integer arithmetic keeps a just-below-boundary decimal below the bound even where
+/// parsing it as `f64` would round it across that boundary. The whole percent rounds the tenths
+/// half up but is 100 only for a reading of 100 ([`super::decimal::whole_used`]), so a printer of
+/// it (the usage line, the survey) says `99%` for 99.96, as the glass does.
+fn pct_of(text: &str) -> Option<(u32, u32)> {
+    let (x10, _) = super::decimal::scaled_floor(text, 1, 1000)?;
+    Some((super::decimal::whole_used(x10), x10))
+}
+
+/// A display-only whole percentage, rounded as the vendor's legacy field was.
+fn whole_pct_of(value: &Value) -> Option<u32> {
     if let Some(n) = value.as_u64() {
-        let pct = u32::try_from(n).ok().filter(|p| *p <= 100)?;
-        return Some((pct, pct * 10));
+        return u32::try_from(n).ok().filter(|p| *p <= 100);
     }
     let f = value
         .as_f64()
         .filter(|f| f.is_finite() && (0.0..=100.0).contains(f))?;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    Some((f.round() as u32, (f * 10.0).round() as u32))
+    Some(f.round() as u32)
 }
 
 /// `rate_limits.<name>` as a [`Window`]: both fields, or none.
-fn window_of(limits: Option<&Value>, name: &str) -> Option<Window> {
+fn window_of(limits: Option<&Value>, name: &str, text: &str) -> Option<Window> {
+    use aterm_json::PathSegment::Key;
     let w = limits?.get(name)?;
-    let (pct, x10) = pct_of(w.get("used_percentage")?)?;
+    let lexeme = aterm_json::number_lexeme_at_path(
+        text.as_bytes(),
+        &[Key("rate_limits"), Key(name), Key("used_percentage")],
+    )
+    .ok()??;
+    let (pct, x10) = pct_of(lexeme)?;
     Some(Window {
         pct,
         resets_at: w.get("resets_at")?.as_i64().filter(|t| *t > 0)?,
@@ -457,8 +471,8 @@ impl Reading {
                 .and_then(|c| c.get("total_api_duration_ms"))
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
-            five_hour: window_of(limits, "five_hour"),
-            seven_day: window_of(limits, "seven_day"),
+            five_hour: window_of(limits, "five_hour", text),
+            seven_day: window_of(limits, "seven_day", text),
             warm: cache.and_then(|c| c.get("warm")).and_then(Value::as_bool),
             cache_expires_at: cache
                 .and_then(|c| c.get("expires_at"))
@@ -469,8 +483,8 @@ impl Reading {
             ctx_left: doc
                 .get("context_window")
                 .and_then(|c| c.get("remaining_percentage"))
-                .and_then(pct_of)
-                .and_then(|(pct, _)| u8::try_from(pct).ok()),
+                .and_then(whole_pct_of)
+                .and_then(|pct| u8::try_from(pct).ok()),
             dur_us: 0,
             row: None,
         })

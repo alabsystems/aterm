@@ -11,6 +11,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use aterm_uds::spawnfd::{Child, Command};
+use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
 use crate::site::hosting::{self, Failed, Released};
 use crate::site::pages::{self, Difference};
@@ -865,6 +866,13 @@ fn refused(ended: Result<Outcome, Failure>, out: &str, kind: Refusal) -> String 
     match failure(ended, out) {
         Failure::Refused { kind: k, why } if k == kind => why,
         other => panic!("expected a {kind:?} refusal, got {other:?}\n{out}"),
+    }
+}
+
+fn could_not_run(ended: Result<Outcome, Failure>, out: &str) -> String {
+    match failure(ended, out) {
+        Failure::CouldNotRun { why } => why,
+        other => panic!("expected a transport that could not run, got {other:?}\n{out}"),
     }
 }
 
@@ -1903,7 +1911,12 @@ fn the_commit_is_the_promoted_one_and_github_is_read_through_its_api_only() {
     let mut world = lab.fake("releases-fat.json");
     world.github_dead = true;
     let (ended, out) = lab.sync(&latest, &env, &mut world);
-    assert_eq!(failed_child(ended, &out).0, "github", "main's tip");
+    assert_eq!(crate::site::report(&ended), 3);
+    let after_cut = crate::release_steps::site_outcome(&ended, Vec::new()).unwrap_err();
+    assert!(after_cut.could_not_run, "{after_cut:?}");
+    assert!(after_cut.why.contains("HTTP 401"), "{after_cut:?}");
+    let why = could_not_run(ended, &out);
+    assert!(why.contains("HTTP 401") && why.contains("main"), "{why}");
     let (ended, out) = lab.sync(
         &Options {
             no_deploy: true,
@@ -1912,12 +1925,50 @@ fn the_commit_is_the_promoted_one_and_github_is_read_through_its_api_only() {
         &lab.env(),
         &mut world,
     );
-    assert_eq!(failed_child(ended, &out).0, "github", "the release list");
+    assert_eq!(crate::site::report(&ended), 3);
+    let after_cut = crate::release_steps::site_outcome(&ended, Vec::new()).unwrap_err();
+    assert!(after_cut.could_not_run, "{after_cut:?}");
+    assert!(after_cut.why.contains("HTTP 401"), "{after_cut:?}");
+    let why = could_not_run(ended, &out);
+    assert!(why.contains("HTTP 401") && why.contains("release"), "{why}");
     assert!(
         world.calls.iter().all(|c| matches!(c, Call::Github(_))),
         "{:?}",
         world.calls
     );
+
+    let mut world = lab.fake("releases-fat.json");
+    world.releases = "not release JSON".into();
+    let (ended, out) = lab.sync(
+        &Options {
+            no_deploy: true,
+            ..Options::default()
+        },
+        &lab.env(),
+        &mut world,
+    );
+    assert_eq!(crate::site::report(&ended), 1);
+    assert!(
+        !crate::release_steps::site_outcome(&ended, Vec::new())
+            .unwrap_err()
+            .could_not_run,
+        "semantic source refusal is the negative control"
+    );
+    let why = refused(ended, &out, Refusal::Release);
+    assert!(why.contains("not valid JSON"), "{why}");
+
+    let mut world = lab.fake("releases-fat.json");
+    world.main_sha = Some(String::new());
+    let (ended, out) = lab.sync(&latest, &env, &mut world);
+    assert_eq!(crate::site::report(&ended), 1);
+    assert!(
+        !crate::release_steps::site_outcome(&ended, Vec::new())
+            .unwrap_err()
+            .could_not_run,
+        "a malformed successful answer is not a transport failure"
+    );
+    let why = refused(ended, &out, Refusal::Commit);
+    assert!(why.contains("full hex commit sha"), "{why}");
 }
 
 #[test]
@@ -2313,25 +2364,74 @@ fn an_undeployed_sync_commit_is_deployed_by_the_next_run() {
 
 #[test]
 fn the_intel_mark_and_the_toolchain_facts_reach_the_committed_pages() {
+    const MASTER: [u8; 32] = [0x71; 32];
+    const MACHINE: [u8; 32] = [0x72; 32];
+
+    fn key(seed: &[u8; 32]) -> Ed25519KeyPair {
+        Ed25519KeyPair::from_seed_unchecked(seed).unwrap()
+    }
+
+    fn public_key(seed: &[u8; 32]) -> String {
+        aterm_codec::base64::encode(key(seed).public_key().as_ref()).unwrap()
+    }
+
+    fn sign(seed: &[u8; 32], bytes: &[u8]) -> Vec<u8> {
+        key(seed).sign(bytes).as_ref().to_vec()
+    }
+
     let lab = Lab::new();
     let dl = lab.root.join("dl");
-    let lay = |repo: &str, tag: &str, file: &str| {
+    let lay = |repo: &str, tag: &str, file: &str, bytes: &[u8]| {
         let dir = dl
             .join("alabsystems")
             .join(repo)
             .join("releases/download")
             .join(tag);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::copy(fixture(&format!("toolchain/{file}")), dir.join(file)).unwrap();
+        std::fs::write(dir.join(file), bytes).unwrap();
     };
-    lay("aterm", "atpkg-index-50", "index.toml");
-    lay("ay", "atpkg-ay-8256", "pkg-ay-8256.toml");
-    lay("trust", "atpkg-trust-9192", "pkg-trust-9192.toml");
+    let index = std::fs::read(fixture("toolchain/index.toml")).unwrap();
+    let roster = format!(
+        "schema = 1\nroster_seq = 1\nvalid_until = \"2099-01-01T00:00:00Z\"\n\
+         revoked = []\n\n[[machine]]\nid = \"m0\"\npubkey = \"{}\"\n\
+         added_at = \"2026-08-01T00:00:00Z\"\n",
+        public_key(&MACHINE)
+    )
+    .into_bytes();
+    for (name, bytes) in [
+        ("index.toml", index.as_slice()),
+        ("aterm-machines.toml", roster.as_slice()),
+    ] {
+        lay("aterm", "atpkg-index-50", name, bytes);
+    }
     lay(
         "aterm",
-        "atpkg-claude-2026092601",
-        "pkg-claude-2026092601.toml",
+        "atpkg-index-50",
+        "index.toml.sig",
+        &sign(&MACHINE, &index),
     );
+    lay(
+        "aterm",
+        "atpkg-index-50",
+        "aterm-machines.toml.sig",
+        &sign(&MASTER, &roster),
+    );
+    for (repo, program, build) in [
+        ("ay", "ay", 8256_u64),
+        ("trust", "trust", 9192),
+        ("aterm", "claude", 2_026_092_601),
+    ] {
+        let name = format!("pkg-{program}-{build}.toml");
+        let raw = read(&fixture(&format!("toolchain/{name}")))
+            .replace(
+                "kind = \"binary\"",
+                "kind = \"binary\"\nasset = \"fixture\"",
+            )
+            .into_bytes();
+        let tag = format!("atpkg-{program}-{build}");
+        lay(repo, &tag, &name, &raw);
+        lay(repo, &tag, &format!("{name}.sig"), &sign(&MACHINE, &raw));
+    }
     let mut releases: aterm_json::Value =
         aterm_json::from_str(&read(&fixture("releases-fat.json"))).unwrap();
     let list = releases.as_array_mut().unwrap();
@@ -2347,13 +2447,14 @@ fn the_intel_mark_and_the_toolchain_facts_reach_the_committed_pages() {
     }
     list.push(
         aterm_json::from_str(
-            r#"{"tag_name":"atpkg-index-50","prerelease":true,"draft":false,"assets":[{"name":"index.toml","size":1}]}"#,
+            r#"{"tag_name":"atpkg-index-50","prerelease":true,"draft":false,"assets":[{"name":"index.toml","size":1},{"name":"index.toml.sig","size":64},{"name":"aterm-machines.toml","size":1},{"name":"aterm-machines.toml.sig","size":64}]}"#,
         )
         .unwrap(),
     );
     let mut world = lab.fake(&aterm_json::to_string(&releases).unwrap());
     let env = Env {
         download_base: format!("file://{}", dl.display()),
+        masters: vec![public_key(&MASTER)],
         ..lab.env()
     };
     let (ended, out) = lab.sync(&Options::default(), &env, &mut world);

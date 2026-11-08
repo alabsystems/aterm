@@ -649,8 +649,10 @@ fn harness_update_rows(
             .map(|row| format!("{} · {}", row.title, row.detail))
             .unwrap_or_else(|| "Not read yet. Open AI CLI versions to refresh.".to_string())
     };
-    // Every harness by the name its launch card reads (`alab <cli> harness`), with its own
-    // version, built into this aterm build.
+    // Every harness by the name its launch card reads (`enhanced by alab <cli> harness v<ver>`),
+    // with its own version, built into this aterm build. Line B's label (`alab v<ver> (v<build>)`,
+    // the running CLI's build in parentheses) names no CLI: the lockup at the rule's other end
+    // does.
     let mut rows: Vec<(String, String)> = aterm_phase::CliHarness::ALL
         .iter()
         .map(|h| {

@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Read check completions and incomplete case metadata by exact per-event invocation identities.
+//! Read check completions and incomplete case/compiler metadata by diagnostic invocation.
 //! Legacy records remain unattributed; captured source facts never prove the checkout.
 //! This reader grants no check, resource-retirement or land verdict.
 
@@ -12,6 +12,58 @@ use crate::event_log::{CheckRow, Finished, Judged};
 
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
+const COMPILER_STAGE_ROWS: usize = 64;
+const LONG_CASE_ROWS: usize = 64;
+const CASE_NAME_BYTES: usize = 4096;
+
+/// Historical observations keyed by exact reported names, not binary or original case identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedLongCase {
+    pub test: String,
+    pub case: String,
+    pub occurrences: usize,
+    /// Timestamp from the last supported record in supplied file order, not current activity.
+    pub last_reported_at_unix_ms: u64,
+}
+
+// Decode raw JSON before a map can erase duplicate known fields. Extra producer fields
+// (including elapsed time, bodies and locations) are neither interpreted nor copied.
+#[derive(serde::Deserialize)]
+struct LongCaseWire {
+    schema: u64,
+    event: String,
+    test: String,
+    case: String,
+    outcome: String,
+    binary_completed: bool,
+    sample_complete: bool,
+    halts: bool,
+    at_unix_ms: u64,
+}
+
+impl LongCaseWire {
+    fn read(json: &str) -> Option<Self> {
+        let wire: Self = aterm_json::from_str(json).ok()?;
+        (wire.schema == 1
+            && wire.event == "test-case-running-long"
+            && wire.outcome == "RUNNING"
+            && !wire.binary_completed
+            && !wire.sample_complete
+            && !wire.halts
+            && !wire.test.is_empty()
+            && wire.test.len() <= CASE_NAME_BYTES
+            && wire.case.len() <= CASE_NAME_BYTES)
+            .then_some(wire)
+    }
+}
+
+/// Last safe provisional message in supplied file order, not an active compiler or unit count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedCompilerStage {
+    pub stage: String,
+    pub observed_message_records: usize,
+    latest: crate::compiler_observation::Metadata,
+}
 
 /// All outcomes observed for one check, retaining duplicates and conflicts.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,6 +106,15 @@ pub struct Observed {
     pub checks: Vec<ObservedCheck>,
     /// Supported failed-case observations, independently of finished checks and terminals.
     pub early_cases: Vec<ObservedCase>,
+    /// Incomplete historical long-case observations, independent of check/terminal verdicts.
+    pub long_cases: Vec<ObservedLongCase>,
+    pub long_case_records: usize,
+    pub long_case_omitted_records: usize,
+    /// At most 64 stage rows; grouping uses full stage labels before display clipping.
+    pub compiler_progress: Vec<ObservedCompilerStage>,
+    pub compiler_message_records: usize,
+    /// Valid observations for stage keys not retained because the row cap was reached.
+    pub compiler_omitted_records: usize,
     /// Number of complete parsed terminal records in the file.
     pub terminal_records: usize,
     /// Whether one terminal list matches all observed rows; not run attribution.
@@ -84,6 +145,12 @@ fn record_value(line: &str) -> Option<aterm_json::Value> {
 fn observe_one(text: &str) -> Observed {
     let mut checks = BTreeMap::<String, ObservedCheck>::new();
     let mut cases = BTreeMap::<(String, Option<String>), ObservedCase>::new();
+    let mut long_cases = BTreeMap::<(String, String), ObservedLongCase>::new();
+    let mut long_case_records = 0;
+    let mut long_case_omitted_records = 0;
+    let mut compiler = BTreeMap::<String, ObservedCompilerStage>::new();
+    let mut compiler_message_records = 0;
+    let mut compiler_omitted_records = 0;
     let mut rows = Vec::new();
     let mut terminals = Vec::new();
     let mut malformed = 0;
@@ -100,6 +167,58 @@ fn observe_one(text: &str) -> Observed {
             continue;
         };
         match value["event"].as_str() {
+            Some("test-case-running-long") => {
+                let Some(wire) = line
+                    .strip_prefix("verify-event: ")
+                    .and_then(LongCaseWire::read)
+                else {
+                    unprojected += 1;
+                    continue;
+                };
+                long_case_records += 1;
+                let key = (wire.test.clone(), wire.case.clone());
+                if let Some(row) = long_cases.get_mut(&key) {
+                    row.occurrences += 1;
+                    row.last_reported_at_unix_ms = wire.at_unix_ms;
+                } else if long_cases.len() < LONG_CASE_ROWS {
+                    long_cases.insert(
+                        key,
+                        ObservedLongCase {
+                            test: wire.test,
+                            case: wire.case,
+                            occurrences: 1,
+                            last_reported_at_unix_ms: wire.at_unix_ms,
+                        },
+                    );
+                } else {
+                    long_case_omitted_records += 1;
+                }
+            }
+            Some("compile-message-observed") => {
+                let observation = line
+                    .strip_prefix("verify-event: ")
+                    .and_then(crate::compiler_observation::Observation::read);
+                let Some(observation) = observation else {
+                    unprojected += 1;
+                    continue;
+                };
+                compiler_message_records += 1;
+                if let Some(row) = compiler.get_mut(&observation.stage) {
+                    row.observed_message_records += 1;
+                    row.latest = observation.metadata;
+                } else if compiler.len() < COMPILER_STAGE_ROWS {
+                    compiler.insert(
+                        observation.stage.clone(),
+                        ObservedCompilerStage {
+                            stage: observation.stage,
+                            observed_message_records: 1,
+                            latest: observation.metadata,
+                        },
+                    );
+                } else {
+                    compiler_omitted_records += 1;
+                }
+            }
             Some("test-case-failed") => {
                 let Some((test, case, word)) = failed_case_metadata(&value) else {
                     // Previously unprojected events cannot alter check/terminal consistency
@@ -175,6 +294,12 @@ fn observe_one(text: &str) -> Observed {
         unattributed: None,
         checks: checks.into_values().collect(),
         early_cases: cases.into_values().collect(),
+        long_cases: long_cases.into_values().collect(),
+        long_case_records,
+        long_case_omitted_records,
+        compiler_progress: compiler.into_values().collect(),
+        compiler_message_records,
+        compiler_omitted_records,
         terminal_records: terminals.len(),
         terminal_consistency,
         malformed_complete_records: malformed,
@@ -260,6 +385,31 @@ impl Observed {
                 "occurrences": check.occurrences, "conflict": check.outcomes.len() > 1,
             })).collect::<Vec<_>>(),
             "case_observations_complete": false,
+            "long_case_observations_complete":false,
+            "long_case_scope":"historical reported spec/case names; not binary identity or current activity",
+            "long_case_timestamp_order":"last supported record in supplied file order",
+            "long_case_row_cap":LONG_CASE_ROWS,
+            "long_case_records":self.long_case_records,
+            "long_case_omitted_records":self.long_case_omitted_records,
+            "long_cases":self.long_cases.iter().map(|row| {
+                let test = crate::report::clip_json(&row.test, crate::report::EVENT_ROW_BYTES);
+                let case = crate::report::clip_json(&row.case, crate::report::EVENT_ROW_BYTES);
+                aterm_json::json!({"test_truncated":test != row.test,"case_truncated":case != row.case,
+                    "test":test,"case":case,"occurrences":row.occurrences,
+                    "last_reported_at_unix_ms":row.last_reported_at_unix_ms,
+                    "reported_outcome":"RUNNING","binary_completed":false,"sample_complete":false,"halts":false})
+            }).collect::<Vec<_>>(),
+            "compiler_progress_complete":false,
+            "compiler_progress_order":"last complete supported record in supplied file order",
+            "compiler_progress_row_cap":COMPILER_STAGE_ROWS,
+            "compiler_message_records":self.compiler_message_records,
+            "compiler_omitted_records":self.compiler_omitted_records,
+            "compiler_progress":self.compiler_progress.iter().map(|row| {
+                let stage = crate::report::clip_json(&row.stage, crate::report::EVENT_ROW_BYTES);
+                aterm_json::json!({"stage_truncated":stage != row.stage, "stage":stage,
+                    "observed_message_records":row.observed_message_records,
+                    "provisional":true,"sample_complete":false,"latest":row.latest.json()})
+            }).collect::<Vec<_>>(),
             "early_cases": self.early_cases.iter().map(|case| {
                 let test = crate::report::clip_json(&case.test, crate::report::EVENT_ROW_BYTES);
                 let name = case.case.as_ref().map(|name| crate::report::clip_json(name, crate::report::EVENT_ROW_BYTES));
@@ -322,6 +472,8 @@ impl Observed {
             ));
         }
         self.render_cases(&mut out, "");
+        self.render_long_cases(&mut out, "");
+        self.render_compiler(&mut out, "");
         out.push_str(&format!("Terminal records: {}; consistency: {}.\nMalformed complete records: {}; unprojected events: {}; trailing partial: {}.\n",
             self.terminal_records, self.terminal_consistency, self.malformed_complete_records,
             self.unprojected_records, self.trailing_partial));
@@ -351,6 +503,8 @@ impl Observed {
                 ));
             }
             run.observed.render_cases(&mut out, "  ");
+            run.observed.render_long_cases(&mut out, "  ");
+            run.observed.render_compiler(&mut out, "  ");
         }
         out
     }
@@ -397,6 +551,50 @@ impl Observed {
             ));
         }
     }
+
+    fn render_compiler(&self, out: &mut String, prefix: &str) {
+        if self.compiler_message_records == 0 {
+            return;
+        }
+        out.push_str(&format!("{prefix}Compiler observations (provisional; incomplete; last supported record in supplied file order):\n"));
+        out.push_str(&format!(
+            "{prefix}  {} message records; row cap {}; {} records omitted by row cap.\n",
+            self.compiler_message_records, COMPILER_STAGE_ROWS, self.compiler_omitted_records
+        ));
+        for row in &self.compiler_progress {
+            let stage = crate::report::clip_json(&row.stage, crate::report::EVENT_ROW_BYTES);
+            out.push_str(&format!(
+                "{prefix}  stage={}{}: {} ({} observed records; sample_complete=false)\n",
+                aterm_json::Value::String(stage.clone()),
+                if stage != row.stage {
+                    " [truncated]"
+                } else {
+                    ""
+                },
+                row.latest.json(),
+                row.observed_message_records
+            ));
+        }
+    }
+
+    fn render_long_cases(&self, out: &mut String, prefix: &str) {
+        if self.long_case_records == 0 {
+            return;
+        }
+        out.push_str(&format!("{prefix}Historical long-case observations (incomplete; reported names, not binary identity or current activity):\n"));
+        out.push_str(&format!(
+            "{prefix}  {} records; row cap {}; {} records omitted by row cap.\n",
+            self.long_case_records, LONG_CASE_ROWS, self.long_case_omitted_records
+        ));
+        for row in &self.long_cases {
+            let test = crate::report::clip_json(&row.test, crate::report::EVENT_ROW_BYTES);
+            let case = crate::report::clip_json(&row.case, crate::report::EVENT_ROW_BYTES);
+            out.push_str(&format!("{prefix}  test={} case={}: reported RUNNING ({} observations; last supplied record timestamp {}; sample_complete=false{}).\n",
+                aterm_json::Value::String(test.clone()), aterm_json::Value::String(case.clone()),
+                row.occurrences, row.last_reported_at_unix_ms,
+                if test != row.test || case != row.case { "; display names truncated" } else { "" }));
+        }
+    }
 }
 
 fn arguments(args: &[String]) -> Option<(PathBuf, bool)> {
@@ -416,7 +614,7 @@ fn arguments(args: &[String]) -> Option<(PathBuf, bool)> {
 /// Exit zero means the file was inspected, regardless of the checks' observed outcomes.
 #[must_use]
 pub fn run(args: &[String], cwd: &Path) -> i32 {
-    const USAGE: &str = "usage: verify status --events <path> [--json]\nRead recorded check completions, incomplete case observations, invocation groups and captured source observations; no landing verdict.\nExit: 0 inspected, 2 usage, 3 file unavailable.\n";
+    const USAGE: &str = "usage: verify status --events <path> [--json]\nRead recorded check completions, incomplete case/compiler observations, invocation groups and captured source observations; no landing verdict.\nExit: 0 inspected, 2 usage, 3 file unavailable.\n";
     if matches!(args, [help] if help == "--help" || help == "-h") {
         print!("{USAGE}");
         return crate::exit::PASS;
@@ -446,7 +644,442 @@ mod tests {
     use super::*;
     use crate::{Check, Outcome};
 
+    fn compiler_wire(stage: &str, artifact: bool) -> String {
+        let fixture = include_str!("../tests/fixtures/targo-unit-dispatch-v1.jsonl");
+        let line = fixture.lines().nth(usize::from(artifact)).unwrap();
+        crate::report::provisional_compile_event(stage, line).unwrap()
+    }
+
+    #[test]
+    fn compiler_progress_is_latest_file_order_metadata_independent_of_terminal_verdicts() {
+        let dispatch = compiler_wire("test compile", false);
+        let artifact = compiler_wire("test compile", true);
+        let before = observe(&format!("{dispatch}\n"));
+        assert_eq!(
+            before.json()["compiler_progress"][0]["latest"]["message_kind"].as_str(),
+            Some("dispatch")
+        );
+        let text = format!("{dispatch}\n{artifact}\n{artifact}\n");
+        let observed = observe(&text);
+        assert_eq!(observed.compiler_message_records, 3);
+        assert_eq!(observed.compiler_progress[0].observed_message_records, 3);
+        assert_eq!(
+            observed.json()["compiler_progress"][0]["latest"]["message_kind"].as_str(),
+            Some("artifact")
+        );
+        assert!(observed.checks.is_empty());
+        assert_eq!(observed.terminal_records, 0);
+        let terminal = format!(
+            "{}{}",
+            event(Check::Doc),
+            crate::report::run_event(&[result(Check::Doc, Outcome::Ok)], crate::exit::PASS)
+        );
+        let completed = observe(&format!("{text}{terminal}"));
+        let baseline = observe(&terminal);
+        assert_eq!(completed.compiler_progress, observed.compiler_progress);
+        assert_eq!(completed.checks, baseline.checks);
+        assert_eq!(completed.early_cases, baseline.early_cases);
+        assert_eq!(
+            completed.terminal_consistency,
+            baseline.terminal_consistency
+        );
+        assert_eq!(
+            completed.json()["compiler_progress_complete"].as_bool(),
+            Some(false)
+        );
+        assert!(
+            completed
+                .render()
+                .contains("last supported record in supplied file order")
+        );
+    }
+
+    #[test]
+    fn compiler_progress_keeps_exact_invocations_and_unattributed_records_separate() {
+        let first = writer(None);
+        let second = writer(None);
+        let dispatch = compiler_wire("compile", false);
+        let artifact = compiler_wire("compile", true);
+        let observed = observe(&format!(
+            "{}{}{dispatch}\n",
+            first.prepare(&dispatch),
+            second.prepare(&artifact)
+        ));
+        assert_eq!(observed.invocations.len(), 2);
+        for group in &observed.invocations {
+            assert_eq!(group.observed.compiler_message_records, 1);
+            let expected = if Some(group.id.as_str()) == first.id() {
+                "dispatch"
+            } else {
+                "artifact"
+            };
+            assert_eq!(
+                group.observed.json()["compiler_progress"][0]["latest"]["message_kind"].as_str(),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            observed
+                .unattributed
+                .as_ref()
+                .unwrap()
+                .compiler_message_records,
+            1
+        );
+        let mut conflict: aterm_json::Value = aterm_json::from_str(
+            second
+                .prepare(&artifact)
+                .trim()
+                .strip_prefix("verify-event: ")
+                .unwrap(),
+        )
+        .unwrap();
+        let binding = conflict
+            .as_object_mut()
+            .unwrap()
+            .get_mut("invocation")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        binding.insert("id".into(), first.id().unwrap().into());
+        binding.insert("source_observation".into(), aterm_json::json!({
+            "observed_head":null,"selection":"different","selection_truncated":false,"checks":[],
+            "checks_omitted":0,"release":false,"fix":false,"no_windows":false,"compile_only":false,
+        }));
+        let conflicting = observe(&format!(
+            "{}verify-event: {conflict}\n",
+            first.prepare(&dispatch)
+        ));
+        assert!(conflicting.invocations[0].source_conflict);
+        assert!(conflicting.invocations[0].source_observation.is_none());
+        assert_eq!(
+            conflicting.invocations[0].observed.compiler_message_records,
+            2
+        );
+    }
+
+    #[test]
+    fn unsupported_compiler_metadata_is_unprojected_and_cannot_change_finished_checks() {
+        let wire = compiler_wire("compile", false);
+        let complete = format!(
+            "{}{}",
+            event(Check::Doc),
+            crate::report::run_event(&[result(Check::Doc, Outcome::Ok)], crate::exit::PASS)
+        );
+        let baseline = observe(&complete);
+        for unsupported in [
+            wire.replace("\"provisional\":true", "\"provisional\":false"),
+            wire.replace("\"sample_complete\":false", "\"sample_complete\":true"),
+            wire.replace(
+                "\"provisional\":true",
+                "\"provisional\":false,\"provisional\":true",
+            ),
+            wire.replace(
+                "\"stage\":\"compile\"",
+                "\"stage\":\"other\",\"stage\":\"compile\"",
+            ),
+            wire.replace(
+                "\"compile_mode\":\"build\"",
+                "\"compile_mode\":\"arbitrary\"",
+            ),
+            wire.replace("\"target_name\":null", "\"target_name\":\"private\""),
+            compiler_wire("compile", true).replace(
+                "\"target_kinds\":[\"lib\"]",
+                "\"target_kinds\":[\"unknown\"]",
+            ),
+            compiler_wire("compile", true)
+                .replace("dispatch_serialization_probe", "/private/target"),
+            wire.replace(
+                "\"stage\":\"compile\"",
+                &format!(
+                    "\"stage\":\"{}\"",
+                    "x".repeat(crate::compiler_observation::STAGE_BYTES + 1)
+                ),
+            ),
+        ] {
+            assert_ne!(unsupported, wire);
+            let observed = observe(&format!("{complete}{unsupported}\n"));
+            assert_eq!(observed.compiler_message_records, 0, "{unsupported}");
+            assert_eq!(observed.checks, baseline.checks);
+            assert_eq!(observed.terminal_consistency, baseline.terminal_consistency);
+            assert_eq!(
+                observed.malformed_complete_records,
+                baseline.malformed_complete_records
+            );
+            assert_eq!(
+                observed.unprojected_records,
+                baseline.unprojected_records + 1
+            );
+        }
+        for missing in [
+            "stage",
+            "provisional",
+            "sample_complete",
+            "compile_mode",
+            "target_name",
+        ] {
+            let mut value: aterm_json::Value =
+                aterm_json::from_str(wire.strip_prefix("verify-event: ").unwrap()).unwrap();
+            value.as_object_mut().unwrap().remove(missing);
+            let observed = observe(&format!("{complete}verify-event: {value}\n"));
+            assert_eq!(observed.compiler_message_records, 0);
+            assert_eq!(observed.terminal_consistency, baseline.terminal_consistency);
+            assert_eq!(
+                observed.unprojected_records,
+                baseline.unprojected_records + 1
+            );
+        }
+        let partial = observe(&wire);
+        assert!(partial.trailing_partial);
+        assert_eq!(partial.compiler_message_records, 0);
+        assert_eq!(observe(&format!("{wire}\r\n")).compiler_message_records, 1);
+    }
+
+    #[test]
+    fn compiler_rows_are_capped_but_retained_rows_still_update_and_full_keys_do_not_merge() {
+        let mut text = String::new();
+        for at in 0..COMPILER_STAGE_ROWS + 2 {
+            text.push_str(&format!(
+                "{}\n",
+                compiler_wire(&format!("stage-{at}"), false)
+            ));
+        }
+        text.push_str(&format!("{}\n", compiler_wire("stage-0", true)));
+        let observed = observe(&text);
+        assert_eq!(observed.compiler_progress.len(), COMPILER_STAGE_ROWS);
+        assert_eq!(observed.compiler_message_records, COMPILER_STAGE_ROWS + 3);
+        assert_eq!(observed.compiler_omitted_records, 2);
+        let row = observed
+            .compiler_progress
+            .iter()
+            .find(|row| row.stage == "stage-0")
+            .unwrap();
+        assert_eq!(row.observed_message_records, 2);
+        let prefix = "\n\u{1b}界".repeat(150);
+        let mut text = String::new();
+        for suffix in ["one", "two"] {
+            let wire = compiler_wire(&format!("{prefix}{suffix}"), true);
+            let mut value: aterm_json::Value =
+                aterm_json::from_str(wire.strip_prefix("verify-event: ").unwrap()).unwrap();
+            for field in [
+                "output",
+                "source_path",
+                "fresh",
+                "rebuild_reason",
+                "producer_unit_sha256",
+            ] {
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(field.into(), "PRIVATE-SENTINEL".into());
+            }
+            text.push_str(&format!("verify-event: {value}\n"));
+        }
+        let observed = observe(&text);
+        assert_eq!(observed.compiler_progress.len(), 2);
+        let json = observed.json();
+        assert_eq!(
+            json["compiler_progress"][0]["stage"],
+            json["compiler_progress"][1]["stage"]
+        );
+        assert_eq!(
+            json["compiler_progress"][0]["stage_truncated"].as_bool(),
+            Some(true)
+        );
+        assert!(!json.to_string().contains("PRIVATE-SENTINEL"));
+        assert!(!observed.render().contains("PRIVATE-SENTINEL"));
+        assert!(!observed.render().contains('\u{1b}'));
+    }
+
     const FAILED_CASE: &str = r#"verify-event: {"schema":1,"event":"test-case-failed","outcome":"FAIL","test":"-p fixture --lib","case":"t::a","binary_completed":false,"sample_complete":false}"#;
+
+    fn long_case_wire(test: &str, case: &str, at: u64) -> String {
+        format!(
+            "verify-event: {}\n",
+            aterm_json::json!({
+                "schema":1,"event":"test-case-running-long","test":test,"case":case,
+                "outcome":"RUNNING","binary_completed":false,"sample_complete":false,
+                "halts":false,"at_unix_ms":at,
+            })
+        )
+    }
+
+    #[test]
+    fn long_cases_are_historical_metadata_and_never_change_terminal_consistency() {
+        let terminal = format!(
+            "{}{}",
+            event(Check::Doc),
+            crate::report::run_event(&[result(Check::Doc, Outcome::Ok)], crate::exit::PASS)
+        );
+        let wire = long_case_wire("-p fixture --lib", "t::a", 20);
+        let observed = observe(&format!(
+            "{wire}{terminal}{}",
+            long_case_wire("-p fixture --lib", "t::a", 10)
+        ));
+        let baseline = observe(&terminal);
+        assert_eq!(observed.checks, baseline.checks);
+        assert_eq!(observed.terminal_consistency, baseline.terminal_consistency);
+        assert!(observed.early_cases.is_empty());
+        assert_eq!(observed.long_case_records, 2);
+        assert_eq!(observed.long_cases[0].occurrences, 2);
+        assert_eq!(observed.long_cases[0].last_reported_at_unix_ms, 10);
+        assert_eq!(
+            observed.json()["long_case_observations_complete"].as_bool(),
+            Some(false)
+        );
+        assert!(
+            observed
+                .render()
+                .contains("not binary identity or current activity")
+        );
+        assert!(observe(wire.trim_end()).long_cases.is_empty());
+        let crlf = wire.replace('\n', "\r\n");
+        assert_eq!(observe(&crlf).long_cases.len(), 1);
+        for (key, bad) in [
+            ("test", aterm_json::json!("")),
+            ("case", aterm_json::Value::Null),
+            ("outcome", aterm_json::json!("FAIL")),
+            ("binary_completed", aterm_json::json!(true)),
+            ("sample_complete", aterm_json::json!(true)),
+            ("halts", aterm_json::json!(true)),
+            ("at_unix_ms", aterm_json::json!(-1)),
+            ("at_unix_ms", aterm_json::json!("10")),
+            ("test", aterm_json::json!("x".repeat(CASE_NAME_BYTES + 1))),
+            ("case", aterm_json::json!("x".repeat(CASE_NAME_BYTES + 1))),
+        ] {
+            let mut value: aterm_json::Value =
+                aterm_json::from_str(wire.trim().strip_prefix("verify-event: ").unwrap()).unwrap();
+            value.as_object_mut().unwrap().insert(key.into(), bad);
+            let invalid = observe(&format!("{terminal}verify-event: {value}\n"));
+            assert!(invalid.long_cases.is_empty(), "{key}");
+            assert_eq!(invalid.unprojected_records, 1);
+            assert_eq!(invalid.checks, baseline.checks);
+            assert_eq!(invalid.terminal_consistency, baseline.terminal_consistency);
+        }
+        for key in [
+            "schema",
+            "event",
+            "test",
+            "case",
+            "outcome",
+            "binary_completed",
+            "sample_complete",
+            "halts",
+            "at_unix_ms",
+        ] {
+            let json = wire.trim().strip_prefix("verify-event: ").unwrap();
+            let original: aterm_json::Value = aterm_json::from_str(json).unwrap();
+            let duplicate = format!(
+                "{},\"{key}\":{}}}",
+                json.strip_suffix('}').unwrap(),
+                original[key]
+            );
+            let invalid = observe(&format!("{terminal}verify-event: {duplicate}\n"));
+            assert!(invalid.long_cases.is_empty(), "duplicate {key}");
+            assert_eq!(invalid.terminal_consistency, baseline.terminal_consistency);
+        }
+    }
+
+    #[test]
+    fn long_cases_keep_exact_invocations_source_conflicts_and_unattributed_records() {
+        let first = writer(None);
+        let second = writer(Some("b".repeat(40)));
+        let wire = long_case_wire("spec", "case", 10);
+        let first_line = first.prepare(&wire);
+        let second_line = second.prepare(&wire);
+        let observed = observe(&format!("{first_line}{second_line}{wire}"));
+        assert_eq!(observed.invocations.len(), 2);
+        assert!(
+            observed
+                .invocations
+                .iter()
+                .all(|run| run.observed.long_case_records == 1)
+        );
+        assert_eq!(observed.unattributed.as_ref().unwrap().long_case_records, 1);
+        let mut conflict: aterm_json::Value =
+            aterm_json::from_str(second_line.trim().strip_prefix("verify-event: ").unwrap())
+                .unwrap();
+        conflict
+            .as_object_mut()
+            .unwrap()
+            .get_mut("invocation")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("id".into(), first.id().unwrap().into());
+        let observed = observe(&format!("{first_line}verify-event: {conflict}\n"));
+        assert_eq!(observed.invocations.len(), 1);
+        assert!(observed.invocations[0].source_conflict);
+        assert!(observed.invocations[0].source_observation.is_none());
+        assert_eq!(
+            observed.invocations[0].observed.long_cases[0].occurrences,
+            2
+        );
+        conflict
+            .as_object_mut()
+            .unwrap()
+            .get_mut("invocation")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("id".into(), "invalid".into());
+        let observed = observe(&format!("{first_line}verify-event: {conflict}\n"));
+        assert_eq!(observed.invocations[0].observed.long_case_records, 1);
+        assert_eq!(observed.unattributed.as_ref().unwrap().long_case_records, 1);
+    }
+
+    #[test]
+    fn long_cases_bound_rows_update_retained_keys_and_clip_only_presentation() {
+        let mut text = String::new();
+        for index in 0..LONG_CASE_ROWS + 2 {
+            text.push_str(&long_case_wire("spec", &format!("case-{index}"), 10));
+        }
+        text.push_str(&long_case_wire("spec", "case-0", 5));
+        let observed = observe(&text);
+        assert_eq!(observed.long_cases.len(), LONG_CASE_ROWS);
+        assert_eq!(observed.long_case_records, LONG_CASE_ROWS + 3);
+        assert_eq!(observed.long_case_omitted_records, 2);
+        let retained = observed
+            .long_cases
+            .iter()
+            .find(|row| row.case == "case-0")
+            .unwrap();
+        assert_eq!(retained.occurrences, 2);
+        assert_eq!(retained.last_reported_at_unix_ms, 5);
+        let prefix = "\n\u{1b}界".repeat(150);
+        let mut text = String::new();
+        for suffix in ["one", "two"] {
+            let mut value: aterm_json::Value = aterm_json::from_str(
+                long_case_wire(
+                    &format!("{prefix}{suffix}"),
+                    &format!("{prefix}{suffix}"),
+                    10,
+                )
+                .trim()
+                .strip_prefix("verify-event: ")
+                .unwrap(),
+            )
+            .unwrap();
+            for key in ["output", "source_path", "detail", "elapsed_s"] {
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(key.into(), "PRIVATE-SENTINEL".into());
+            }
+            text.push_str(&format!("verify-event: {value}\n"));
+        }
+        let observed = observe(&text);
+        assert_eq!(observed.long_cases.len(), 2);
+        let json = observed.json();
+        assert_eq!(json["long_cases"][0]["case"], json["long_cases"][1]["case"]);
+        assert_eq!(
+            json["long_cases"][0]["case_truncated"].as_bool(),
+            Some(true)
+        );
+        assert!(!json.to_string().contains("PRIVATE-SENTINEL"));
+        assert!(!observed.render().contains("PRIVATE-SENTINEL"));
+        assert!(!observed.render().contains('\u{1b}'));
+    }
 
     #[test]
     fn case_observations_keep_repeats_conflicts_and_null_or_empty_reported_names() {

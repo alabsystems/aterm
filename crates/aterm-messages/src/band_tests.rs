@@ -9,12 +9,11 @@ use crate::ink::{
     chip_inks, contrast, crisp_on_fill, fill_anchor, fill_ink, floor_word, keep_side, mix3,
     words_anchor,
 };
-use crate::paint::{Geometry, Hover, HoverTarget, MeterSpan, band_fp};
+use crate::paint::{Geometry, Hover, HoverTarget, MeterSpan};
 use crate::palette::{luminance, oklch};
 use crate::{
-    ActionIndex, BandMotion, CapsuleRole, GLYPH_COL, Hold, Instant, Intent, Links, Look, MARGIN,
-    Message, MessageCenter, MessageLog, Meter, Presentation, RowLayout, Severity, Tone, WallStamp,
-    tags,
+    BandMotion, CapsuleRole, GLYPH_COL, Hold, Instant, Intent, Links, Look, MARGIN, Message,
+    MessageCenter, MessageLog, Meter, Presentation, RowLayout, Severity, Tone, WallStamp, tags,
 };
 
 const DEFAULT: ThemeInks = ThemeInks {
@@ -168,7 +167,7 @@ const BUILTIN: [(&str, ThemeInks); 17] = [
     ),
 ];
 
-const STOCK: [(&str, ForcedPalette); 4] = [
+pub(crate) const STOCK: [(&str, ForcedPalette); 4] = [
     (
         "Aquatic",
         ForcedPalette {
@@ -228,7 +227,7 @@ fn cell_width(s: &str) -> usize {
 }
 
 fn present(center: &MessageCenter, cols: usize) -> Presentation {
-    center.presentation(cols, &cell_width, None, Links::Painted)
+    center.presentation(cols, &cell_width, Links::Painted)
 }
 
 fn paint_rows(
@@ -279,7 +278,7 @@ fn frame_rasters(
         .unzip()
 }
 
-fn row_inks(c: &BandInks, l: &RowLayout, hc: bool) -> (MeterInks, Option<[u8; 3]>) {
+pub(crate) fn row_inks(c: &BandInks, l: &RowLayout, hc: bool) -> (MeterInks, Option<[u8; 3]>) {
     let alarm = matches!(l.severity, Severity::Warn | Severity::Error);
     let fill = if hc || !alarm { c.meter } else { c.warn };
     ink::inks_for(c, fill, l.track.is_some(), hc)
@@ -338,7 +337,7 @@ fn busy_center(now: Instant) -> MessageCenter {
     center
 }
 
-fn word_grounds(
+pub(crate) fn word_grounds(
     row: &[InkedCell],
     raster: Option<&RowRaster>,
     geom: Geometry,
@@ -617,66 +616,7 @@ fn the_time_slot_words_wear_their_meanings_ink() {
 }
 
 #[test]
-fn band_fp_is_zero_with_no_row_and_moves_only_with_what_it_draws() {
-    let g = Geometry::cells_only(100);
-    let wide = Geometry {
-        win_w: 1000,
-        cells_x: 20,
-        cell_w: 9,
-    };
-    let hovers = [
-        None,
-        Some(Hover {
-            row: 0,
-            target: HoverTarget::Body,
-        }),
-        Some(Hover {
-            row: 2,
-            target: HoverTarget::Capsule(ActionIndex(1)),
-        }),
-    ];
-    for hover in hovers {
-        for geom in [g, wide] {
-            for motion in [0u64, 0x1234] {
-                assert_eq!(band_fp(0, hover, geom, motion), 0, "no row, no key");
-                let fp = band_fp(0x1234_5678, hover, geom, motion);
-                assert_eq!(fp & 1, 1, "non-empty band_fp is odd");
-                assert_eq!(
-                    fp,
-                    band_fp(0x1234_5678, hover, geom, motion),
-                    "the same inputs, the same key"
-                );
-            }
-        }
-    }
-    for center_fp in [1u64, 2u64, 0x1234_5678, u64::MAX] {
-        for motion in [0u64, 0x1234] {
-            let mut seen = std::collections::HashSet::new();
-            assert!(seen.insert(band_fp(center_fp, None, g, motion)));
-            for row in [0u8, 1, 2, 255] {
-                assert!(seen.insert(band_fp(
-                    center_fp,
-                    Some(Hover {
-                        row,
-                        target: HoverTarget::Body,
-                    }),
-                    g,
-                    motion
-                )));
-                for k in [0u8, 1, 8, 254, 255] {
-                    assert!(seen.insert(band_fp(
-                        center_fp,
-                        Some(Hover {
-                            row,
-                            target: HoverTarget::Capsule(ActionIndex(k)),
-                        }),
-                        g,
-                        motion
-                    )));
-                }
-            }
-        }
-    }
+fn a_motion_fingerprint_is_zero_with_nothing_moving_and_fixed_per_frame() {
     let now = t0();
     let mut center = MessageCenter::new(MessageLog::empty(), now);
     center.post(
@@ -696,7 +636,7 @@ fn band_fp_is_zero_with_no_row_and_moves_only_with_what_it_draws() {
             .motion(&p, now + crate::ANIM_FRAME * k, look)
             .fingerprint()
     };
-    assert_eq!(at(0, Look::STILL) & 1, 1, "the still track is odd");
+    assert_ne!(at(0, Look::STILL), 0, "the still track has a fingerprint");
     assert_eq!(
         at(0, Look::STILL),
         at(90, Look::STILL),
@@ -704,9 +644,14 @@ fn band_fp_is_zero_with_no_row_and_moves_only_with_what_it_draws() {
     );
     for k in [0u32, 4] {
         let mfp = at(k, Look::MOVING);
-        assert_eq!(mfp & 1, 1, "moving frame fingerprint is odd");
+        assert_ne!(mfp, 0, "a moving frame has a fingerprint");
         assert_eq!(mfp, at(k, Look::MOVING), "deterministic per frame");
     }
+    assert_ne!(
+        at(0, Look::MOVING),
+        at(4, Look::MOVING),
+        "the comet's frames differ"
+    );
 }
 
 #[test]
@@ -955,20 +900,4 @@ fn words_on_a_fill_wear_the_rows_crisp_ink_in_every_frame() {
     let c = inks(DEFAULT);
     let crisp = contrast(fill_ink(&c, c.accent), c.accent);
     assert!(crisp >= 7.0, "the default ground's crisp ink: {crisp:.2}:1");
-}
-
-#[test]
-fn every_hover_target_on_a_row_is_its_own_key() {
-    let fp = 0x1234_5678;
-    let g = Geometry::cells_only(120);
-    let key = |target| band_fp(fp, Some(Hover { row: 1, target }), g, 0);
-    let mut seen = std::collections::HashSet::new();
-    assert!(seen.insert(band_fp(fp, None, g, 0)), "no hover");
-    assert!(seen.insert(key(HoverTarget::Body)), "the body");
-    for k in 0..=8u8 {
-        assert!(
-            seen.insert(key(HoverTarget::Capsule(ActionIndex(k)))),
-            "capsule {k} shares a key"
-        );
-    }
 }

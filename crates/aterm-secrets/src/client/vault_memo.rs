@@ -97,6 +97,21 @@ pub fn acknowledged_commons_log_now(
     })
 }
 
+/// [`trusted_commons_log`](super::trusted_commons_log) through
+/// [`acknowledged_commons_log_now`]. A Commons repair round checks its roster access, the log
+/// behind it and the session's members at nearly every step: hundreds of whole reads of the vault
+/// and its log a round, half a second of CPU on a node with fifty peers (2026-11-08), of files
+/// that had not moved.
+///
+/// # Errors
+/// As [`trusted_commons_log`](super::trusted_commons_log).
+pub fn trusted_commons_log_now(
+    paths: &Paths,
+    trust: crate::commons::journal::Trust,
+) -> crate::Result<Option<(crate::membership_log::Log, [u8; 32])>> {
+    acknowledged_commons_log_now(paths, trust).map(super::CommonsLog::trusted)
+}
+
 /// [`swarm_roster_until`](super::swarm_roster_until), read again only when one of the files it
 /// reads ([`inputs`]) moved; quiet, as [`local_swarm_roster_for_log_now`], so a writer holding
 /// the vault is waited for until `deadline` as before, and what it kept is never a permissive
@@ -118,11 +133,11 @@ pub fn swarm_roster_now_until(
 /// [`swarm_roster_until`](super::swarm_roster_until) take their answer from: the configured source
 /// (`source.toml`), the state lock the deny list observes (`.lock`, whose presence and mode decide
 /// that read), the applied state (`state.toml`), this Mac's identity, the held envelope (`vault`),
-/// the membership records entry and selected data, and the membership history this Mac
-/// acknowledged ([`Paths::acknowledged_history_files`]). The vault folder holds others that
-/// change every few seconds and that these reads never open (the vault server's `served/`, the
-/// rest of `commons/`, the jobs' logs, the needs and answers queues), so a change to them reads
-/// nothing again.
+/// the membership records entry, the layout pin that selects its data (`records.layout`) and that
+/// data, and the membership history this Mac acknowledged ([`Paths::acknowledged_history_files`]).
+/// The vault folder holds others that change every few seconds and that these reads never open
+/// (the vault server's `served/`, the rest of `commons/`, the jobs' logs, the needs and answers
+/// queues), so a change to them reads nothing again.
 pub(super) fn inputs(paths: &Paths) -> Option<Vec<PathBuf>> {
     let [claim, anchor, receipts, checkpoint] = paths.acknowledged_history_files();
     Some(vec![
@@ -132,6 +147,7 @@ pub(super) fn inputs(paths: &Paths) -> Option<Vec<PathBuf>> {
         paths.identity_file(),
         paths.cache_file(),
         paths.records_file(),
+        crate::records_storage::pin_path(&paths.records_file()).ok()?,
         paths.records_data_file().ok()?,
         claim,
         anchor,

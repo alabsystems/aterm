@@ -3650,8 +3650,7 @@ fn band_row(msg: Message, cols: usize) -> aterm_messages::RowLayout {
     c.commit_rows(later, 3);
     let mut p = c.presentation(
         cols,
-        &crate::message_band::cell_width,
-        None,
+        &aterm_messages::text::char_width,
         aterm_messages::Links::Painted,
     );
     assert_eq!(p.rows.len(), 1, "one row on the band");
@@ -3726,7 +3725,7 @@ fn every_tab_notices_step_stands_on_the_band() {
             );
             if shown == notice::COMMAND_UNDER_DETAILS && row.title.1 != title {
                 let (col, words) = row.detail.as_ref().expect("the short form");
-                let end = col + crate::message_band::cell_width(words);
+                let end = col + aterm_messages::text::char_width(words);
                 let first = row.capsules.first().expect("Show tab 1").col;
                 let blank = first.saturating_sub(end + BAND_CLEARANCE);
                 let details = row.capsules.iter().any(|c| c.text == DETAILS_LINK);
@@ -4043,7 +4042,7 @@ fn a_config_rows_narrow_band_says_what_is_wrong() {
         if let Some(short) = msg
             .short_title
             .as_deref()
-            .filter(|short| crate::message_band::cell_width(short) <= 11)
+            .filter(|short| aterm_messages::text::char_width(short) <= 11)
         {
             assert_eq!(band_row(msg.clone(), 22).title.1, short, "{:?}", msg.title);
         }

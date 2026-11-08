@@ -509,19 +509,28 @@ pub(super) fn convergence_inputs(
 }
 
 /// Start only inside the node job's owned startup, after its boot and exclusive lease.
-pub(super) fn node_serve(startup: impl FnOnce()) -> ExitCode {
-    node_serve_with(aterm_gui::run_node_serve_owning, spawn_background, startup)
+pub(super) fn node_serve(startup: impl FnOnce() -> Option<aterm_gui::NodeMaintenance>) -> ExitCode {
+    node_serve_with(
+        aterm_gui::run_node_serve_owning,
+        spawn_background,
+        |inputs| match (inputs, startup()) {
+            (Some(inputs), Some(commons)) => Some(Arc::new(move || {
+                inputs();
+                commons();
+            }) as aterm_gui::NodeMaintenance),
+            (inputs, commons) => inputs.or(commons),
+        },
+    )
 }
 
 fn node_serve_with<'a, R, S: 'a>(
     own: impl FnOnce(Box<dyn FnOnce() -> S + 'a>) -> R,
     start: impl FnOnce() -> S + 'a,
-    runtime: impl FnOnce() + 'a,
+    runtime: impl FnOnce(S) -> S + 'a,
 ) -> R {
     own(Box::new(move || {
         let maintenance = start();
-        runtime();
-        maintenance
+        runtime(maintenance)
     }))
 }
 
@@ -1517,7 +1526,7 @@ mod tests {
                         ExitCode::from(75)
                     },
                     || events.borrow_mut().push("keeper"),
-                    || {
+                    |()| {
                         assert_eq!(*events.borrow(), ["lease", "keeper"]);
                         events.borrow_mut().push("runtime");
                     },

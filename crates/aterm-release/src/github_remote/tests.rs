@@ -292,6 +292,33 @@ fn native_origin_refresh_records_only_main_and_preserves_annotated_tag_peels() {
         local_head
     );
     assert_eq!(git(&target, &["tag", "--list"]), "local-only");
+    let refs_before = git(&target, &["for-each-ref"]);
+    let copy = root.path().join("owned-engine");
+    let (copied, captured) = remote.copy_main(&copy).unwrap();
+    assert_eq!(captured, new);
+    assert_eq!(git(&copy, &["rev-parse", "HEAD"]), captured);
+    assert_eq!(
+        git(&copy, &["rev-parse", "HEAD^{tree}"]),
+        git(&bare, &["rev-parse", "main^{tree}"])
+    );
+    assert_eq!(
+        std::fs::read(copy.join("line.toml")).unwrap(),
+        b"new remote\n"
+    );
+    assert_eq!(copied.repository(), remote.repository());
+    assert!(
+        remote.copy_main(&copy).is_err(),
+        "an existing destination is never reused"
+    );
+    assert!(remote.copy_main(&target.join("inside")).is_err());
+    assert!(!target.join("inside").exists());
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(&copy, &alias).unwrap();
+    assert!(
+        remote.copy_main(&alias).is_err(),
+        "a destination symlink is not owned output"
+    );
+    assert_eq!(git(&target, &["for-each-ref"]), refs_before);
     assert_eq!(
         before,
         files.map(|name| std::fs::read(gitdir.join(name)).unwrap())
@@ -416,10 +443,31 @@ fn typed_origin_keeps_atomic_updates_expected_deletes_and_immutable_tag_reads() 
         origin.get(fence).is_err(),
         "cached objects cannot establish a current ref"
     );
-    // A raw OID whose complete graph is local needs no network transfer. Ref
-    // freshness above still needs the remote, and a missing graph below does too.
     origin.import(&token).unwrap();
     assert!(origin.import(&"f".repeat(40)).is_err());
+
+    // Borrowing a complete immutable graph needs no remote transfer. A lone
+    // tag object still cannot establish its missing commit/tree graph.
+    let incomplete = repo(root.path(), "root-only", false);
+    git(
+        &incomplete,
+        &[
+            "config",
+            "remote.origin.url",
+            "https://github.com/fixture/app.git",
+        ],
+    );
+    let object = PathBuf::from(".git/objects")
+        .join(&token[..2])
+        .join(&token[2..]);
+    std::fs::create_dir_all(incomplete.join(&object).parent().unwrap()).unwrap();
+    std::fs::copy(source.join(&object), incomplete.join(&object)).unwrap();
+    assert_eq!(git(&incomplete, &["cat-file", "-t", &token]), "tag");
+    let incomplete_remote = claim_fixture(&incomplete, &bare);
+    assert!(
+        incomplete_remote.fetch_exact(&token).is_err(),
+        "a root object without its graph cannot be imported offline"
+    );
     assert_eq!(origin.peel(&token).unwrap(), Some(old));
 }
 

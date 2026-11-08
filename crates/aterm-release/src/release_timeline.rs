@@ -103,8 +103,10 @@ pub struct Timeline {
     children: Vec<ChildRow>,
     qualify: Vec<QualifyRow>,
     branches: Vec<aterm_json::Value>,
-    /// Verify's open stages, by (log, stage index): when each started.
-    open_stages: BTreeMap<(String, u64), Option<u64>>,
+    /// Verify starts by (log, diagnostic invocation ID, stage index). Consumed, missing or
+    /// repeated start times stay unknown; bounded slots remain to reject reuse of one key.
+    /// New keys past MAX_ROWS have unknown starts; this is not a complete activity census.
+    stage_starts: BTreeMap<(String, String, u64), Option<u64>>,
     first_red_at_unix_ms: Option<u64>,
     first_red: Option<aterm_json::Value>,
     hashed: Option<u64>,
@@ -196,12 +198,16 @@ impl Timeline {
             }
             Some("stage-started") => {
                 if let Some(index) = event["stage_index"].as_u64()
-                    && self.open_stages.len() < MAX_ROWS
+                    && let Some(invocation) =
+                        aterm_verify::event_log::diagnostic_invocation_id(event)
                 {
-                    self.open_stages.insert(
-                        (log.to_owned(), index),
-                        event["started_at_unix_ms"].as_u64(),
-                    );
+                    let key = (log.to_owned(), invocation, index);
+                    if let Some(started) = self.stage_starts.get_mut(&key) {
+                        *started = None;
+                    } else if self.stage_starts.len() < MAX_ROWS {
+                        self.stage_starts
+                            .insert(key, event["started_at_unix_ms"].as_u64());
+                    }
                 }
             }
             Some("stage-finished") => self.verify_stage(log, event),
@@ -418,10 +424,23 @@ impl Timeline {
     }
 
     fn verify_stage(&mut self, log: &str, event: &aterm_json::Value) {
-        let started = event["stage_index"]
-            .as_u64()
-            .and_then(|index| self.open_stages.remove(&(log.to_owned(), index)))
-            .flatten();
+        let started = if let Some(index) = event["stage_index"].as_u64()
+            && let Some(invocation) = aterm_verify::event_log::diagnostic_invocation_id(event)
+        {
+            let key = (log.to_owned(), invocation, index);
+            if let Some(started) = self.stage_starts.get_mut(&key) {
+                started.take()
+            } else {
+                // An unmatched completion also consumes its key: a later start cannot repair
+                // event order or supply a timestamp to another completion.
+                if self.stage_starts.len() < MAX_ROWS {
+                    self.stage_starts.insert(key, None);
+                }
+                None
+            }
+        } else {
+            None
+        };
         let execution_s = event["execution_s"].as_f64();
         let ended = event["ended_at_unix_ms"].as_u64().or_else(|| {
             let (started, execution) = (started?, execution_s?);
@@ -766,6 +785,188 @@ mod tests {
         )
     }
 
+    fn attributed(event: aterm_json::Value, id: &str) -> aterm_json::Value {
+        let mut event = event;
+        event.as_object_mut().unwrap().insert(
+            "invocation".into(),
+            aterm_json::json!({
+                "id":id, "identity_error":null, "source_observation":null,
+            }),
+        );
+        event
+    }
+
+    fn attributed_line(line: &str, id: &str) -> String {
+        let event =
+            aterm_json::from_str(line.trim().strip_prefix("verify-event: ").unwrap()).unwrap();
+        format!("verify-event: {}\n", attributed(event, id))
+    }
+
+    fn verify_start(id: &str, at: u64) -> aterm_json::Value {
+        attributed(
+            aterm_json::json!({"schema":1,"event":"stage-started",
+            "stage_index":3,"stage":"test","started_at_unix_ms":at}),
+            id,
+        )
+    }
+
+    fn verify_finish(id: &str, at: u64) -> aterm_json::Value {
+        attributed(
+            aterm_json::json!({"schema":1,"event":"stage-finished",
+            "stage_index":3,"stage":"test","ended_at_unix_ms":at,"execution_s":2.0,
+            "child_cpu":{"observed_s":7.0},"decisions":[{"outcome":"FAIL","detail":"kept"}]}),
+            id,
+        )
+    }
+
+    #[test]
+    fn a_later_never_started_invocation_cannot_borrow_an_abandoned_start() {
+        let a = "a".repeat(32);
+        let b = "b".repeat(32);
+        let text = [
+            verify_start(&a, 100),
+            verify_finish(&b, 200),
+            verify_finish(&a, 300),
+        ]
+        .iter()
+        .map(|event| format!("verify-event: {event}\n"))
+        .collect::<String>();
+        let mut timeline = Timeline::default();
+        timeline.read("06-verify.log", text.as_bytes()).unwrap();
+        let value = timeline.value();
+        let rows = value["branches"].as_array().unwrap();
+        assert!(rows[0]["started_at_unix_ms"].is_null());
+        assert_eq!(rows[0]["ended_at_unix_ms"].as_u64(), Some(200));
+        assert_eq!(rows[0]["cpu_s"].as_f64(), Some(7.0));
+        assert_eq!(rows[0]["execution_s"].as_f64(), Some(2.0));
+        assert_eq!(rows[1]["started_at_unix_ms"].as_u64(), Some(100));
+        assert_eq!(value["first_red"]["ended_at_unix_ms"].as_u64(), Some(200));
+        assert_eq!(
+            value["first_red"]["decisions"][0]["detail"].as_str(),
+            Some("kept")
+        );
+    }
+
+    #[test]
+    fn stage_pairing_keeps_invocations_and_logs_independent() {
+        let a = "a".repeat(32);
+        let b = "b".repeat(32);
+        let mut timeline = Timeline::default();
+        timeline.observe("06-verify.log", &verify_start(&a, 100));
+        timeline.observe("06-verify.log", &verify_start(&b, 200));
+        timeline.observe("04-qualify-tree.log", &verify_start(&a, 300));
+        timeline.observe("06-verify.log", &verify_finish(&a, 400));
+        timeline.observe("04-qualify-tree.log", &verify_finish(&a, 500));
+        timeline.observe("06-verify.log", &verify_finish(&b, 600));
+        let value = timeline.value();
+        let starts: Vec<_> = value["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["started_at_unix_ms"].as_u64())
+            .collect();
+        assert_eq!(starts, [Some(100), Some(300), Some(200)]);
+    }
+
+    #[test]
+    fn unsupported_attribution_cannot_supply_or_consume_a_stage_start() {
+        let a = "a".repeat(32);
+        for invalid in [
+            aterm_json::Value::Null,
+            aterm_json::json!({"id":"invalid","identity_error":null,"source_observation":null}),
+            aterm_json::json!({"id":a,"identity_error":"unavailable","source_observation":null}),
+            aterm_json::json!({"id":a,"identity_error":null,"source_observation":{"unknown":"context"}}),
+        ] {
+            let mut timeline = Timeline::default();
+            timeline.observe("log", &verify_start(&a, 100));
+            for mut event in [verify_start(&a, 200), verify_finish(&a, 300)] {
+                if invalid.is_null() {
+                    event.as_object_mut().unwrap().remove("invocation");
+                } else {
+                    event
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("invocation".into(), invalid.clone());
+                }
+                timeline.observe("log", &event);
+            }
+            timeline.observe("log", &verify_finish(&a, 400));
+            let value = timeline.value();
+            assert!(value["branches"][0]["started_at_unix_ms"].is_null());
+            assert_eq!(
+                value["branches"][1]["started_at_unix_ms"].as_u64(),
+                Some(100)
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_starts_and_consumed_stage_keys_never_choose_a_timestamp() {
+        let a = "a".repeat(32);
+        let mut timeline = Timeline::default();
+        timeline.observe("log", &verify_start(&a, 100));
+        timeline.observe("log", &verify_start(&a, 200));
+        timeline.observe("log", &verify_finish(&a, 300));
+        timeline.observe("log", &verify_start(&a, 400));
+        timeline.observe("log", &verify_finish(&a, 500));
+        let value = timeline.value();
+        assert!(
+            value["branches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["started_at_unix_ms"].is_null())
+        );
+        let mut out_of_order = Timeline::default();
+        out_of_order.observe("log", &verify_finish(&a, 100));
+        out_of_order.observe("log", &verify_start(&a, 200));
+        out_of_order.observe("log", &verify_finish(&a, 300));
+        assert!(
+            out_of_order.value()["branches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["started_at_unix_ms"].is_null())
+        );
+    }
+
+    #[test]
+    fn the_stage_key_bound_keeps_overflow_and_repeated_starts_unknown() {
+        let a = "a".repeat(32);
+        let mut timeline = Timeline::default();
+        for index in 0..MAX_ROWS {
+            let mut event = verify_start(&a, 100);
+            event
+                .as_object_mut()
+                .unwrap()
+                .insert("stage_index".into(), u64::try_from(index).unwrap().into());
+            timeline.observe("log", &event);
+        }
+        // A repeated key at capacity must still lose its timestamp; overflow supplies none.
+        timeline.observe("log", &verify_start(&a, 200));
+        timeline.observe("log", &verify_finish(&a, 300));
+        let mut overflow = verify_start(&a, 400);
+        overflow.as_object_mut().unwrap().insert(
+            "stage_index".into(),
+            u64::try_from(MAX_ROWS).unwrap().into(),
+        );
+        timeline.observe("log", &overflow);
+        let mut finished = verify_finish(&a, 500);
+        finished.as_object_mut().unwrap().insert(
+            "stage_index".into(),
+            u64::try_from(MAX_ROWS).unwrap().into(),
+        );
+        timeline.observe("log", &finished);
+        assert_eq!(timeline.stage_starts.len(), MAX_ROWS);
+        assert!(
+            timeline.value()["branches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["started_at_unix_ms"].is_null())
+        );
+    }
+
     /// Steps and their children's CPU add up, a verify stage's red dates the first red from the
     /// run's start, and each record kind is counted where it was written.
     #[test]
@@ -801,7 +1002,9 @@ mod tests {
             "verify-event: {\"schema\":1,\"event\":\"compile-finished\",\"units\":{\"fresh\":600,\"compiled\":2,\"unknown\":0},\"output_bytes\":24}\n",
             "verify-event: {\"schema\":1,\"event\":\"disk\",\"mode\":\"claimed\",\"walks\":3}\n",
         ]
-        .concat();
+        .into_iter().enumerate().map(|(at, line)| if at < 2 {
+            attributed_line(line, &"a".repeat(32))
+        } else { line.to_owned() }).collect::<String>();
         let value = timeline_of(&[
             ("transcript.log", &transcript),
             ("05-build.log", &build),

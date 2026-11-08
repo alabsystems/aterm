@@ -2292,6 +2292,94 @@ impl App {
     }
 }
 
+/// The Complete echo says the finished form, for one reporter's live-work row: the echo keeps
+/// every cell of the live row but its title, which says `finished` (whole where the live title's
+/// room holds it, else from its head), its motion draws the check mark, and the record keeps the
+/// finished words with no in-flight line.
+#[cfg(test)]
+pub(crate) fn assert_completes_in_place(msg: &Message, finished: &str) {
+    use aterm_messages::text::char_width;
+    use aterm_messages::{
+        CapsuleRole, Duration, Links, Look, MessageCenter, MessageLog, RowKind, RowLayout,
+    };
+    assert_eq!(msg.finished_title(), finished, "{}", msg.title);
+    let mut msg = msg.clone();
+    msg.reveal_after = None;
+    if let Some(m) = msg.meter.as_mut().filter(|m| m.fill_permille.is_some()) {
+        m.fill_permille = Some(1000);
+        m.stats.clear();
+    }
+    let but_title = |r: &RowLayout| {
+        let mut r = r.clone();
+        r.kind = RowKind::Overflow { hidden: 0 };
+        r.title.1.clear();
+        r.stats = None;
+        r.load = None;
+        r.pct = None;
+        for cap in &mut r.capsules {
+            cap.text = " ".repeat(cap.text.chars().count());
+            cap.full_label = "";
+            cap.role = CapsuleRole::Details;
+        }
+        r
+    };
+    for cols in [60usize, 80, 120, 160] {
+        let now = Instant::now();
+        let mut center = MessageCenter::new(MessageLog::empty(), now);
+        let id = center.post(msg.clone(), WallStamp { unix_ms: 1 }, now).id;
+        center.commit_rows(now, 3);
+        let present = |c: &MessageCenter| c.presentation(cols, &char_width, Links::Painted);
+        let live = present(&center).rows[0].clone();
+        let at = now + Duration::from_secs(20);
+        assert!(center.resolve(id, Outcome::Ok, at), "{}", msg.title);
+        let p = present(&center);
+        let echo = &p.rows[0];
+        assert!(
+            matches!(echo.kind, RowKind::Echo(_)),
+            "{}@{cols}",
+            msg.title
+        );
+        assert_eq!(
+            but_title(echo),
+            but_title(&live),
+            "{}@{cols}: nothing but the title moved",
+            msg.title
+        );
+        assert_eq!(echo.load, None, "{}@{cols}: no load words", msg.title);
+        let laid = char_width(&live.title.1);
+        assert!(char_width(&echo.title.1) >= laid, "{}@{cols}", msg.title);
+        let words = echo.title.1.trim_end();
+        if char_width(finished) <= laid {
+            assert_eq!(words, finished, "{}@{cols}: whole", msg.title);
+        } else {
+            let stem = words.trim_end_matches('\u{2026}');
+            assert!(
+                finished.starts_with(stem),
+                "{}@{cols}: {words:?}",
+                msg.title
+            );
+        }
+        let motion = center.motion(&p, at + Duration::from_millis(100), Look::STILL);
+        assert_eq!(
+            motion.rows[0].glyph,
+            Some('\u{2713}'),
+            "{}@{cols}: the check mark",
+            msg.title
+        );
+        let rec = center.log().get(id).unwrap();
+        assert_eq!(rec.title, finished, "the record's words");
+        assert!(
+            rec.detail.is_empty(),
+            "no in-flight frame: {:?}",
+            rec.detail
+        );
+        assert_eq!(
+            (rec.severity, rec.glyph.ch()),
+            (Severity::Success, '\u{2713}')
+        );
+    }
+}
+
 /// Returns whether window `ws` is visible on screen and capable of showing the message band.
 pub(crate) fn band_on_screen(ws: &crate::WindowState) -> bool {
     let shown = ws.pending_reveal.is_none() && !ws.occluded;
@@ -2305,91 +2393,6 @@ pub(crate) fn band_on_screen(ws: &crate::WindowState) -> bool {
     let minimized =
         |w: &aterm_window::window::Window| cfg!(windows) && w.is_minimized() == Some(true);
     shown && ws.os_window.as_deref().is_some_and(|w| !minimized(w))
-}
-
-impl App {
-    /// Returns the animation [`aterm_messages::Look`] for window `wid`'s message band.
-    pub(crate) fn band_look(&self, wid: WindowId) -> aterm_messages::Look {
-        use crate::motion::{MotionEffect, SeriousEffect};
-        let (focused, on_screen) = self
-            .windows
-            .get(&wid)
-            .map_or((false, false), |ws| (ws.focused, band_on_screen(ws)));
-        let effect = MotionEffect::BandProgress;
-        let motion_allowed = self
-            .effect_policy(effect, self.motion_focus(wid, focused))
-            .animate(effect)
-            && self
-                .serious_mode_policy()
-                .allows(SeriousEffect::BandProgress);
-        drive::look(drive::LookIn {
-            motion_allowed,
-            on_screen,
-            frozen: self.message_holds_frozen(),
-            forced: crate::chrome_band::forced_chrome().is_some(),
-        })
-    }
-
-    /// Returns the earliest instant when any visible window's message band needs an animation frame.
-    pub(crate) fn band_motion_deadline(&self, now: Instant) -> Option<Instant> {
-        drive::motion_deadline_over(
-            &self.messages,
-            self.message_band_rows,
-            self.message_holds_frozen(),
-            now,
-            self.windows
-                .iter()
-                .filter(|(_, ws)| band_on_screen(ws))
-                .map(|(wid, ws)| {
-                    (
-                        &ws.band,
-                        (self.band_lay)(usize::from(ws.cols)),
-                        self.band_look(*wid),
-                    )
-                }),
-        )
-    }
-
-    /// Returns the visible windows whose message band is due for an animation frame at `now`.
-    pub(crate) fn band_motion_due(&self, now: Instant) -> Vec<WindowId> {
-        drive::due_views(
-            &self.messages,
-            self.message_band_rows,
-            self.message_holds_frozen(),
-            now,
-            self.windows
-                .iter()
-                .filter(|(_, ws)| band_on_screen(ws))
-                .map(|(wid, ws)| {
-                    (
-                        *wid,
-                        &ws.band,
-                        (self.band_lay)(usize::from(ws.cols)),
-                        self.band_look(*wid),
-                    )
-                }),
-        )
-    }
-
-    /// Prepares window `wid`'s message band layout and animation frame at `now`.
-    pub(crate) fn prepare_band_motion(&mut self, wid: WindowId, now: Instant) -> u64 {
-        let look = self.band_look(wid);
-        self.prepare_band_motion_with(wid, now, look)
-    }
-
-    /// Prepares window `wid`'s message band frame at `now` with an explicit [`aterm_messages::Look`].
-    pub(crate) fn prepare_band_motion_with(
-        &mut self,
-        wid: WindowId,
-        now: Instant,
-        look: aterm_messages::Look,
-    ) -> u64 {
-        let Some(ws) = self.windows.get_mut(&wid) else {
-            return 0;
-        };
-        let lay = (self.band_lay)(usize::from(ws.cols));
-        ws.band.prepare(&self.messages, &lay, now, look)
-    }
 }
 
 impl App {
@@ -2695,10 +2698,6 @@ fn describes_the_old_process(key: &str) -> bool {
 #[cfg(all(test, unix))]
 #[path = "carried_health_conformance.rs"]
 pub(crate) mod carried_health_conformance;
-
-#[cfg(test)]
-#[path = "band_motion_tests.rs"]
-mod band_motion_tests;
 
 /// Proof level demonstrating that part or all of the update pipeline has healed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

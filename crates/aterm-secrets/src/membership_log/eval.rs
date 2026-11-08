@@ -940,14 +940,139 @@ pub(super) fn undo(history: History<'_>, weighing: &Weighing, actor: &MemberId) 
     })
 }
 
-/// Historical Commons writer bindings eligible to authenticate table records sealed under the
-/// effective `Epoch` record at `epoch_index`.
-pub(super) fn historical_bindings_for_epoch(
-    history: History<'_>,
-    weighing: &Weighing,
-    epoch_index: usize,
-) -> Option<Vec<Binding>> {
-    Graph::new(history).historical_bindings_for_epoch(weighing, epoch_index)
+/// What the historical writers of every epoch of one history read of it, derived once for them
+/// all: the effects and authorization under the weighing, the standing they give, which records
+/// count, the counting Commons epochs and the recipients of each epoch's counting `Wrap`s. Each
+/// epoch's writers are then its founders' and entrants' bindings these admit
+/// ([`HistoricalWriters::of_epoch`]). A quiet repair round asks for 16 epochs' writers under one
+/// history lease: over a log of 9,605 records that batch's writers took 4.3% of such a round, most
+/// of it each epoch deriving these again (2026-11-08).
+pub(super) struct HistoricalWriters<'a> {
+    graph: Graph<'a>,
+    effects: Effects,
+    authorized: Vec<bool>,
+    standing: Standing,
+    /// Whether each record counts: authorized and unvoided under the weighing, and not cut off by
+    /// an effective removal. The genesis is no epoch, and counts as none here.
+    counts: Vec<bool>,
+    /// The counting Commons epochs, in record order.
+    commons_epochs: Vec<usize>,
+    /// The recipients of each epoch's counting `Wrap`s, by the epoch's id.
+    wrapped: BTreeMap<RecordId, BTreeSet<Recipient>>,
+}
+
+impl<'a> HistoricalWriters<'a> {
+    pub(super) fn of(history: History<'a>, weighing: &Weighing) -> Self {
+        Self::of_graph(Graph::new(history), weighing)
+    }
+
+    fn of_graph(graph: Graph<'a>, weighing: &Weighing) -> Self {
+        let (effects, authorized) = graph.settled(weighing, &mut graph.scratch());
+        let all = |_: usize| true;
+        let standing = graph.standing(&all, &effects.void, &effects.out, &authorized);
+        let mut counts = vec![false; graph.records.len()];
+        let mut commons_epochs = Vec::new();
+        let mut wrapped: BTreeMap<RecordId, BTreeSet<Recipient>> = BTreeMap::new();
+        for i in 1..graph.records.len() {
+            counts[i] = !effects.void[i]
+                && authorized[i]
+                && !graph.cut(i, &standing.removes, &standing.admits);
+            if !counts[i] {
+                continue;
+            }
+            match graph.records[i].body() {
+                Body::Epoch {
+                    audience: super::EpochAudience::Commons,
+                    ..
+                } => commons_epochs.push(i),
+                Body::Wrap {
+                    epoch, recipient, ..
+                } => {
+                    wrapped.entry(*epoch).or_default().insert(*recipient);
+                }
+                _ => {}
+            }
+        }
+        Self {
+            graph,
+            effects,
+            authorized,
+            standing,
+            counts,
+            commons_epochs,
+            wrapped,
+        }
+    }
+
+    /// Historical Commons writer bindings eligible to authenticate table records sealed under the
+    /// effective `Epoch` record at `epoch_index`.
+    pub(super) fn of_epoch(&self, epoch_index: usize) -> Option<Vec<Binding>> {
+        let Self {
+            graph,
+            effects,
+            authorized,
+            standing,
+            counts,
+            commons_epochs,
+            wrapped,
+        } = self;
+        if epoch_index == 0 || epoch_index >= graph.records.len() || !counts[epoch_index] {
+            return None;
+        }
+        let empty = BTreeSet::new();
+        let wrapped_for_epoch = wrapped
+            .get(graph.records[epoch_index].id())
+            .unwrap_or(&empty);
+        let allowed_recipient = |binding: &Binding| {
+            wrapped_for_epoch.is_empty() || wrapped_for_epoch.contains(&binding.recipient())
+        };
+        let mut set: BTreeSet<Binding> = BTreeSet::new();
+        for seat in graph.founders() {
+            let member = seat.member();
+            if effects.out.contains(&member) {
+                continue;
+            }
+            let removed_before_epoch = standing
+                .removes
+                .get(&member)
+                .is_some_and(|rs| rs.iter().any(|&r| graph.before(r, epoch_index)));
+            if !removed_before_epoch && allowed_recipient(seat.binding) {
+                set.insert(seat.binding.clone());
+            }
+        }
+        for (&member, entries) in &standing.admits {
+            if effects.out.contains(&member) {
+                continue;
+            }
+            for &entry_idx in entries {
+                if !graph.admit_binds(
+                    entry_idx,
+                    member,
+                    &effects.out,
+                    authorized,
+                    &effects.void,
+                    standing,
+                ) {
+                    continue;
+                }
+                let removed_before_epoch = standing.removes.get(&member).is_some_and(|rs| {
+                    rs.iter()
+                        .any(|&r| !graph.before(r, entry_idx) && graph.before(r, epoch_index))
+                });
+                let superseded_before_entry = commons_epochs
+                    .iter()
+                    .any(|&e2| graph.before(epoch_index, e2) && graph.before(e2, entry_idx));
+                if !removed_before_epoch
+                    && !superseded_before_entry
+                    && let Body::Admit { entrant, .. } = graph.records[entry_idx].body()
+                    && allowed_recipient(entrant.request.binding())
+                {
+                    set.insert(entrant.request.binding().clone());
+                }
+            }
+        }
+        Some(set.into_iter().collect())
+    }
 }
 
 /// The quorum weighing of a log's weighed records (the genesis, every `Admit` and every
@@ -2931,89 +3056,14 @@ impl<'a> Graph<'a> {
         standing.admits.contains_key(actor)
     }
 
+    /// [`HistoricalWriters::of_epoch`] over this graph alone (the dense oracle's tests).
+    #[cfg(test)]
     fn historical_bindings_for_epoch(
         self,
         weighing: &Weighing,
         epoch_index: usize,
     ) -> Option<Vec<Binding>> {
-        if epoch_index == 0 || epoch_index >= self.records.len() {
-            return None;
-        }
-        let (effects, authorized) = self.settled(weighing, &mut self.scratch());
-        let all = |_: usize| true;
-        let standing = self.standing(&all, &effects.void, &effects.out, &authorized);
-        let counts = |i: usize| {
-            !effects.void[i] && authorized[i] && !self.cut(i, &standing.removes, &standing.admits)
-        };
-        if !counts(epoch_index) {
-            return None;
-        }
-        let epoch_id = *self.records[epoch_index].id();
-        let mut commons_epochs = Vec::new();
-        let mut wrapped_for_epoch = BTreeSet::new();
-        for i in (1..self.records.len()).filter(|&i| counts(i)) {
-            match self.records[i].body() {
-                Body::Epoch {
-                    audience: super::EpochAudience::Commons,
-                    ..
-                } => commons_epochs.push(i),
-                Body::Wrap {
-                    epoch, recipient, ..
-                } if *epoch == epoch_id => {
-                    wrapped_for_epoch.insert(*recipient);
-                }
-                _ => {}
-            }
-        }
-        let allowed_recipient = |binding: &Binding| {
-            wrapped_for_epoch.is_empty() || wrapped_for_epoch.contains(&binding.recipient())
-        };
-        let mut set: BTreeSet<Binding> = BTreeSet::new();
-        for seat in self.founders() {
-            let member = seat.member();
-            if effects.out.contains(&member) {
-                continue;
-            }
-            let removed_before_epoch = standing
-                .removes
-                .get(&member)
-                .is_some_and(|rs| rs.iter().any(|&r| self.before(r, epoch_index)));
-            if !removed_before_epoch && allowed_recipient(seat.binding) {
-                set.insert(seat.binding.clone());
-            }
-        }
-        for (&member, entries) in &standing.admits {
-            if effects.out.contains(&member) {
-                continue;
-            }
-            for &entry_idx in entries {
-                if !self.admit_binds(
-                    entry_idx,
-                    member,
-                    &effects.out,
-                    &authorized,
-                    &effects.void,
-                    &standing,
-                ) {
-                    continue;
-                }
-                let removed_before_epoch = standing.removes.get(&member).is_some_and(|rs| {
-                    rs.iter()
-                        .any(|&r| !self.before(r, entry_idx) && self.before(r, epoch_index))
-                });
-                let superseded_before_entry = commons_epochs
-                    .iter()
-                    .any(|&e2| self.before(epoch_index, e2) && self.before(e2, entry_idx));
-                if !removed_before_epoch
-                    && !superseded_before_entry
-                    && let Body::Admit { entrant, .. } = self.records[entry_idx].body()
-                    && allowed_recipient(entrant.request.binding())
-                {
-                    set.insert(entrant.request.binding().clone());
-                }
-            }
-        }
-        Some(set.into_iter().collect())
+        HistoricalWriters::of_graph(self, weighing).of_epoch(epoch_index)
     }
 
     /// The cutoff of a quorum `Remove` of `actor` that every honest Mac holding these records

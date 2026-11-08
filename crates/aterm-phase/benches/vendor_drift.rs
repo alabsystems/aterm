@@ -59,6 +59,10 @@ const ROWS: &[(&str, Check)] = &[
         every_literal_kimi_anchor_is_in_the_store_kimi,
     ),
     (
+        "every_wire_key_is_in_the_store_kimi",
+        every_wire_key_is_in_the_store_kimi,
+    ),
+    (
         "every_wall_phrase_is_in_the_store_claude",
         every_wall_phrase_is_in_the_store_claude,
     ),
@@ -290,6 +294,47 @@ fn every_literal_grok_anchor_is_in_the_store_grok() -> Outcome {
 }
 fn every_literal_kimi_anchor_is_in_the_store_kimi() -> Outcome {
     literal_anchors_are_in_the_store("kimi", "ATERM_KIMI_BIN", KIMI_ANCHORS)
+}
+
+/// A record key no Kimi build holds: the wire keys' negative control.
+const PLANTED_WIRE_KEY: &[Anchor] = &[Anchor {
+    id: "kimi.wire.planted",
+    text: "interaction.planted_by_no_build",
+    since: "2.5.2",
+    kind: AnchorKind::Literal,
+    gone_in: None,
+}];
+
+fn every_wire_key_is_in_the_store_kimi() -> Outcome {
+    let Some((path, bytes)) = store_binary("kimi", "ATERM_KIMI_BIN") else {
+        return Outcome::CouldNotRun(
+            "no kimi build (set ATERM_KIMI_BIN or `aterm pkg install kimi`); wire keys not checked"
+                .into(),
+        );
+    };
+    let outcome = literal_anchors_in_build(&path, &bytes, KIMI_WIRE_KEYS);
+    if !matches!(outcome, Outcome::Pass(_)) {
+        return outcome;
+    }
+    // The fold parses only a line holding an event type as a quoted string, and the bare word
+    // `interaction.request` is also inside `interaction.requested`: the bundle must hold each
+    // type as the string it writes.
+    for id in [
+        "kimi.wire.interaction.request",
+        "kimi.wire.interaction.resolved",
+    ] {
+        let quoted = format!("\"{}\"", anchor(id));
+        assert!(
+            contains_bytes(&bytes, quoted.as_bytes()),
+            "{path}: the event type {quoted} is not in the bundle as a string"
+        );
+    }
+    assert_eq!(
+        missing(&bytes, PLANTED_WIRE_KEY),
+        ["kimi.wire.planted"],
+        "{path}: the planted key"
+    );
+    outcome
 }
 
 fn every_wall_phrase_is_in_the_store_claude() -> Outcome {

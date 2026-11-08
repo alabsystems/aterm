@@ -15142,6 +15142,7 @@ fn a_summary_from_the_cached_index_says_so() {
         reached,
         why: why.map(String::from),
         answered,
+        transport_failed: !reached && !answered,
     };
     let tools: Vec<String> = (1..=11).map(|n| format!("tool{n}")).collect();
     let all = "all 11 ALab tools are up to date";

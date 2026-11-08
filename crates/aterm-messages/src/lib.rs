@@ -310,6 +310,8 @@ mod presence_tests;
 #[cfg(test)]
 mod progress_words_tests;
 #[cfg(test)]
+mod raster_tests;
+#[cfg(test)]
 mod record_end_tests;
 #[cfg(test)]
 mod regression_tests;

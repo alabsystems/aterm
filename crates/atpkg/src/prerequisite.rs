@@ -16,7 +16,6 @@ use crate::lookup::{Record, Status};
 use crate::sig::{Anchor, BuildFloor, TrustedIndex};
 use crate::store::Layout;
 
-mod manifest_cache;
 mod named;
 pub use named::configured_build;
 
@@ -24,6 +23,16 @@ pub use named::configured_build;
 pub const LEASE_CAPABILITY: &str = "aterm-signed-prerequisite-leases-v1";
 /// Explicit named-build support, independent of the original selected-tool contract.
 pub const NAMED_LEASE_CAPABILITY: &str = "aterm-signed-named-prerequisite-leases-v1";
+
+const FRESHNESS_TRANSPORT_PREFIX: &str = "signed channel freshness transport: ";
+
+/// The transport detail from a prerequisite admission that could not establish the live
+/// channel head. Callers report this as COULD NOT RUN and must not suggest reinstalling an
+/// already-present package.
+#[must_use]
+pub fn freshness_transport(error: &str) -> Option<&str> {
+    error.strip_prefix(FRESHNESS_TRANSPORT_PREFIX)
+}
 
 /// Admit prerequisites from the same configured source, prefix, trust anchor,
 /// freshness cache and durable floors the package manager uses. Payloads must
@@ -93,7 +102,7 @@ fn admitted_in(
         crate::flow::now_unix(),
         triple,
     )
-    .map_err(|e| format!("signed prerequisite index: {e}"))?;
+    .map_err(admission_error)?;
     let session = session.with_description(who);
     let mut current = true;
     if install {
@@ -108,6 +117,17 @@ fn admitted_in(
         session.index.roster_seq(),
     );
     Ok((held, current))
+}
+
+fn admission_error(error: crate::FlowError) -> String {
+    let provenance = crate::flow::last_resolve();
+    if let Some(provenance) = provenance
+        && provenance.transport_failed
+    {
+        let why = provenance.why.unwrap_or_else(|| error.to_string());
+        return format!("{FRESHNESS_TRANSPORT_PREFIX}{why}");
+    }
+    format!("signed prerequisite index: {error}")
 }
 
 /// A signed prerequisite and its public package command.
@@ -226,7 +246,8 @@ impl<'a> Session<'a> {
     /// floor, succession and authenticated-cache admission.
     ///
     /// # Errors
-    /// The existing verified index resolver's failures.
+    /// The existing verified index resolver's failures, or a cached fallback that cannot answer
+    /// this operation's required live-freshness question.
     pub fn resolve(
         fetcher: &'a dyn Fetcher,
         layout: &'a Layout,
@@ -236,6 +257,18 @@ impl<'a> Session<'a> {
         triple: &'a str,
     ) -> Result<Self, crate::FlowError> {
         let index = crate::flow::resolve_verified_index(fetcher, layout, anchor, floor, now_unix)?;
+        if let Some(provenance) = crate::flow::last_resolve()
+            && !provenance.reached
+        {
+            if provenance.transport_failed {
+                return Err(crate::FlowError::Unreachable(
+                    provenance.why.unwrap_or_else(|| {
+                        "the signed channel freshness read did not reach its source".to_string()
+                    }),
+                ));
+            }
+            return Err(crate::FlowError::NoIndex);
+        }
         Ok(Self {
             fetcher,
             layout,
@@ -301,14 +334,16 @@ impl<'a> Session<'a> {
             .program(program)
             .ok_or("the signed index has no prerequisite program")?;
         let source = self.fetcher.package_source_id(&row.repo, program);
-        let cache = manifest_cache::Cache::new(self.layout);
-        if let Some((raw, signature)) = source
-            .as_deref()
-            .and_then(|source| cache.load(source, program, build))
-        {
-            // A cache hit is only a byte source. Recheck the current delegation,
-            // recipe and target exactly as for bytes received from the network.
-            if let Ok(prepared) = self.prepare_package(want, build, named, raw, signature) {
+        let cache = crate::signed_artifact_cache::SignedArtifactCache::for_layout(self.layout);
+        let document_cap = usize::try_from(crate::net::MANIFEST_CAP).unwrap_or(usize::MAX);
+        let signature_cap = usize::try_from(crate::net::SIG_CAP).unwrap_or(usize::MAX);
+        if let Some(source) = source.as_deref() {
+            let key = crate::signed_artifact_cache::SignedArtifactKey::package(
+                source, &row.repo, program, build,
+            );
+            if let Some((raw, signature)) = cache.load(&key, document_cap, signature_cap)
+                && let Ok(prepared) = self.prepare_package(want, build, named, raw, signature)
+            {
                 return Ok(prepared);
             }
         }
@@ -317,8 +352,21 @@ impl<'a> Session<'a> {
             .pkg_manifest(&row.repo, program, build)
             .map_err(|why| format!("{program} build {build} signed manifest fetch: {why}"))?;
         let prepared = self.prepare_package(want, build, named, raw, signature)?;
-        if let Some(source) = source {
-            cache.store(&source, program, build, &prepared.signed);
+        if let Some(source) = source.as_deref() {
+            let key = crate::signed_artifact_cache::SignedArtifactKey::package(
+                source, &row.repo, program, build,
+            );
+            if let Err(error) = cache.store_verified(
+                &key,
+                &prepared.signed.0,
+                &prepared.signed.1,
+                document_cap,
+                signature_cap,
+            ) {
+                eprintln!(
+                    "atpkg: the verified {program} {build} package document was not cached ({error})"
+                );
+            }
         }
         Ok(prepared)
     }
@@ -398,12 +446,11 @@ impl<'a> Session<'a> {
             );
         }
         crate::shim_env::ShimEnv::admit(&package.shim_env)?;
-        let prepared = Prepared {
+        Ok(Prepared {
             build,
             package,
             signed: (raw, signature),
-        };
-        Ok(prepared)
+        })
     }
 
     fn install(&self, want: Prerequisite) -> Result<bool, String> {

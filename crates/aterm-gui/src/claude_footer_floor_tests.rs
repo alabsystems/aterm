@@ -226,16 +226,12 @@ fn every_fact_mark_reads_on_every_ground() {
 
 /// EVERY FACT WORD READS ON EVERY GROUND: under every palette and none, a value at rest in the
 /// glass's value ink at 7:1 (4.5:1 lit) and a hidden fact's stub in its quiet ink at 4.5:1 and
-/// quieter than the quietest value, by its ink. Every value is bold. On a light ground the stub
-/// keeps the values' weight, since a thin dark stroke at the subscript size covers no whole pixel
-/// and reads lighter than its ink; on a dark ground it stays thin (owner ruling 2026-10-28: the
-/// black theme keeps main's stub). NEGATIVE CONTROLS: a bold stub everywhere fails the dark pin, a
-/// thin one everywhere the light pin. On glass (the lab's `pls` frames of Claude Code 2.1.305 at
-/// 80 x 40, scale 2, 2026-10-28, not kept), the bold stub's darkest pixel on Default Light
-/// reaches its ink, #717171 at 4.55:1, in 9 of its 10 inked cells (the eleventh is the gap
-/// between words); its last inked cell reads #737373 at 4.42:1, just under the 4.5:1 this test
-/// asks of the ink. The dark stub stays main's (#858585 at 5.04:1 at best, its weakest cell
-/// 3.85:1), by the owner ruling.
+/// quieter than the quietest value, by its ink. Every word is terminal text, Normal script at
+/// regular weight (glass design §4.3, S7, 2026-11-07): at full size a stroke covers whole pixels
+/// on either ground, so the bold the subscript size gave the values and a light ground's stub is
+/// gone, and a dark ground's stub stays thin, as main drew it (owner ruling 2026-10-28: the black
+/// theme keeps main's stub). NEGATIVE CONTROL: the old fact cell, bold in `Script::Sub`, fails
+/// the weight and script pin.
 #[test]
 fn every_fact_word_reads_on_every_ground() {
     let sides = sides();
@@ -251,7 +247,16 @@ fn every_fact_word_reads_on_every_ground() {
         .collect();
     assert!(!stub_cells.is_empty(), "the line hides a fact");
     let (mut values, mut stubs) = (0usize, 0usize);
-    let (mut thin_stubs, mut bold_stubs) = (0usize, 0usize);
+    let terminal_text =
+        |c: &RenderCell| c.script == aterm_core::terminal::Script::Normal && !c.bold;
+    assert!(
+        !terminal_text(&RenderCell {
+            script: aterm_core::terminal::Script::Sub { nudge: 0 },
+            bold: true,
+            ..RenderCell::default()
+        }),
+        "NEGATIVE CONTROL: the old fact cell"
+    );
     let at = rule_at_room(room);
     for palette in PALETTES {
         for &(tab, blank) in &tabs {
@@ -289,12 +294,9 @@ fn every_fact_word_reads_on_every_ground() {
                     assert!(quietest_value.is_finite(), "values are on the line");
                     for (stub, c) in words {
                         let k = reads(c.fg, blank.bg);
-                        // Every value is bold; a stub is bold on a light ground, where a thin
-                        // dark stroke reads lighter than its ink, and thin on a dark one, as main
-                        // draws the black theme.
+                        // Every word is terminal text: Normal script, regular weight.
                         assert!(
-                            matches!(c.script, aterm_core::terminal::Script::Sub { .. })
-                                && c.bold == (!stub || !dark),
+                            terminal_text(c),
                             "{}: a {} on a {} ground at {:?}, bold {}",
                             what(c),
                             if stub { "stub" } else { "value" },
@@ -302,11 +304,6 @@ fn every_fact_word_reads_on_every_ground() {
                             c.script,
                             c.bold
                         );
-                        if stub && c.bold {
-                            bold_stubs += 1;
-                        } else if stub {
-                            thin_stubs += 1;
-                        }
                         if !stub {
                             assert!(k >= NAME_CONTRAST, "{}: a value at {k:.2}:1", what(c));
                             if lit.is_none() {
@@ -347,10 +344,6 @@ fn every_fact_word_reads_on_every_ground() {
         "CONTROL: only a tab whose own ink reads under the floor leaves no room"
     );
     assert!(stubs >= PALETTES.len() * tabs.len() * 3 * 8 * 10, "{stubs}");
-    assert!(
-        thin_stubs > 0 && bold_stubs > 0,
-        "stubs on dark and light grounds: {thin_stubs} thin, {bold_stubs} bold"
-    );
     assert!(
         crate::claude_card::dark_ground(side(&sides, "Default").blank)
             && !crate::claude_card::dark_ground(side(&sides, "Default Light").blank),

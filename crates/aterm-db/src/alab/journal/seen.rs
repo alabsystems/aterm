@@ -757,39 +757,40 @@ pub fn read(
     heard: Option<(&super::Spool, u64)>,
     now: u64,
 ) -> crate::Result<Option<Seen>> {
-    read_started(paths, heard, now, std::time::Instant::now())
+    read_started(paths, heard, now, std::time::Instant::now(), || {
+        crate::accounts::claims::read(paths).ok()
+    })
 }
 
-#[cfg(all(test, unix))]
-#[test]
-fn native_journal_seen_waits_for_unchanged_custody() {
-    let read = crate::admission::with_delayed_custody(|paths, started| {
-        read_started(paths, None, 1_728_000_600, started)
-    });
-    assert!(read.unwrap().is_some());
-}
-
-fn read_started(
+/// [`read`] with local custody admission's hang detector running from `started`, and `claims` for
+/// the claims ring's read.
+pub(super) fn read_started(
     paths: &aterm_secrets::client::Paths,
     heard: Option<(&super::Spool, u64)>,
     now: u64,
     started: std::time::Instant,
+    claims: impl FnOnce() -> Option<crate::accounts::claims::Read>,
 ) -> crate::Result<Option<Seen>> {
     use crate::{catalog::Directory, table::Session};
     use aterm_secrets::commons::bootstrap::Bootstrap;
     let selected = crate::generation::selected(paths)?;
     let deadline = crate::admission::deadline_at(started);
-    let Ok((bootstrap, journal)) = Bootstrap::required_with_journal_until(&selected, deadline)
-    else {
-        return Ok(None);
+    // The journal writer goes before the claims ring is read: that read takes `commons.lock`,
+    // which an admission holds while it waits for this writer, so asking with the writer in hand
+    // would be a lock-order cycle only the admission's hang detector ends.
+    let mut seen = {
+        let Ok((bootstrap, journal)) = Bootstrap::required_with_journal_until(&selected, deadline)
+        else {
+            return Ok(None);
+        };
+        let Ok(session) = Session::from_admitted_journal(&bootstrap, journal) else {
+            return Ok(None);
+        };
+        let directory = Directory::new(&selected, bootstrap.trust());
+        let window = super::flush::window(&session, &directory, now)?;
+        let resolve = owned::commons::historical(&session);
+        Seen::of(&window.ops, &resolve, now)
     };
-    let Ok(session) = Session::from_admitted_journal(&bootstrap, journal) else {
-        return Ok(None);
-    };
-    let directory = Directory::new(&selected, bootstrap.trust());
-    let window = super::flush::window(&session, &directory, now)?;
-    let resolve = owned::commons::historical(&session);
-    let mut seen = Seen::of(&window.ops, &resolve, now);
     if let Some((spool, since)) = heard {
         // The archive is this Mac's own; one that cannot be read leaves the window's log.
         if let Ok(batches) = super::heard::batches(spool.dir(), since) {
@@ -798,7 +799,7 @@ fn read_started(
     }
     // The claims ring says who holds an account now; one that cannot be read leaves the
     // journal's answer.
-    if let Ok(claims) = crate::accounts::claims::read(paths) {
+    if let Some(claims) = claims() {
         seen.claim(&claims.rows);
     }
     Ok(Some(seen))

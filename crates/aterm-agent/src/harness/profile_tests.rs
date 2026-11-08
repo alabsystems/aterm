@@ -2408,6 +2408,134 @@ fn an_agy_usage_fetch_is_bounded_whole() {
     assert!(gone.is_some(), "agy's child {child:?} outlived the read");
 }
 
+/// AGY'S WEEK IS SAID AS USED, NEVER AN INFERRED 100, AND ITS BOUND STAYS TRUE
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1): `remaining_fraction` 0.004 is 99.6%
+/// used, `weekly 99% used` now and `weekly ≥99% used` once aged; 0.374 is 62.6% used and 0.37001
+/// is 62.999% used, whose bounds are `≥62%`, never above either reading; only 0.0 is `100%`.
+/// The exact JSON lexeme decides the boundary: 0.37000000000000001 is just under 63% used even
+/// where `f64` rounds it to 0.37, while exact 0.37 is 63% used, 0.8 is 20% and 0.32 is 68%.
+/// NEGATIVE CONTROLS: rounding through hundredths makes 0.37001 630 tenths; parsing
+/// 0.37000000000000001 through `f64` makes it 0.37 and likewise falsely says a 63% bound; the
+/// `f64` floor `((1.0 - left) × 1000).floor()` makes 0.8 199 tenths and 0.32 679, bounds a step
+/// under the readings (`≥19%`, `≥67%`) (run once, restored).
+/// The earlier negative control (run once, restored):
+/// rounding to a whole percent left first (`(100 - round(rem × 100)) × 10`) says 0.004 as
+/// `weekly 100% used` and fails.
+#[test]
+fn agys_week_is_never_said_full_before_it_is() {
+    let now = 1_792_796_000;
+    let aged = now + 20 * 60;
+    let said = |left: &str| {
+        let doc = format!(
+            r#"{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups":[{{"name":"Gemini Models","buckets":[{{"id":"gemini-weekly","window":"weekly","remaining_fraction":{left},"reset_time":"2026-10-29T16:31:22Z"}}]}}]}}}}}}"#
+        );
+        let fig = parse_agy_usage_json(doc.as_bytes(), false, now).expect("gemini weekly");
+        (
+            fig.used_x10,
+            fig.words(now).unwrap_or_default(),
+            fig.words(aged).unwrap_or_default(),
+        )
+    };
+    let words = |x10: u32, now: &str, aged: &str| (x10, now.to_owned(), aged.to_owned());
+    assert_eq!(
+        said("0.004"),
+        words(996, "weekly 99% used", "weekly \u{2265}99% used")
+    );
+    assert_eq!(
+        said("0.00001"),
+        words(999, "weekly 99% used", "weekly \u{2265}99% used")
+    );
+    assert_eq!(
+        said("0.374"),
+        words(626, "weekly 63% used", "weekly \u{2265}62% used")
+    );
+    assert_eq!(
+        said("0.37001"),
+        words(629, "weekly 63% used", "weekly \u{2265}62% used")
+    );
+    assert_eq!(
+        said("0.37000000000000001"),
+        words(629, "weekly 63% used", "weekly \u{2265}62% used")
+    );
+    assert_eq!(
+        said("0.37"),
+        words(630, "weekly 63% used", "weekly \u{2265}63% used")
+    );
+    assert_eq!(
+        said("0.8"),
+        words(200, "weekly 20% used", "weekly \u{2265}20% used")
+    );
+    assert_eq!(
+        said("0.32"),
+        words(680, "weekly 68% used", "weekly \u{2265}68% used")
+    );
+    assert_eq!(
+        said("0"),
+        words(1000, "weekly 100% used", "weekly \u{2265}100% used"),
+        "CONTROL: nothing left is 100"
+    );
+}
+
+/// CLAUDE CODE'S CACHED WEEK IS NEVER SAID FULL BEFORE IT IS, AND ITS BOUND STAYS TRUE
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1), as agy's and the tap's are: a
+/// `cachedUsageUtilization.seven_day.utilization` of 99.96 is 999 tenths, `weekly 99% used` read
+/// now and `weekly ≥99% used` once aged, and 62.96 is 629, whose bound is `≥62%`; 62.5 is said
+/// `63%` read now (an exact figure rounds half up) and `≥62%` once aged; only 100 and above is
+/// 1000 and `100%`.
+/// NEGATIVE CONTROL: rounding the tenths half up (`(pct × 10).round()`, the old `pct_x10`) makes
+/// 99.96 1000, `weekly 100% used`, and 62.96 630, `≥63%` (run once, restored).
+#[test]
+fn claudes_cached_week_is_never_said_full_before_it_is() {
+    let fetched = 1_792_050_000;
+    let aged = fetched + 20 * 60;
+    let said = |pct: Value| {
+        let v = with(
+            composed(),
+            &[
+                "cachedUsageUtilization",
+                "utilization",
+                "seven_day",
+                "utilization",
+            ],
+            pct,
+        );
+        let usage = parsed(&v).usage.expect("the cached body");
+        let week = cached_weekly(&usage, fetched).expect("the week");
+        (
+            week.used_x10,
+            week.words(fetched).unwrap_or_default(),
+            week.words(aged).unwrap_or_default(),
+        )
+    };
+    let words = |x10: u32, now: &str, aged: &str| (x10, now.to_owned(), aged.to_owned());
+    assert_eq!(
+        said(json!(99.96)),
+        words(999, "weekly 99% used", "weekly \u{2265}99% used")
+    );
+    assert_eq!(
+        said(json!(62.96)),
+        words(629, "weekly 63% used", "weekly \u{2265}62% used")
+    );
+    assert_eq!(
+        said(json!(62.5)),
+        words(625, "weekly 63% used", "weekly \u{2265}62% used")
+    );
+    assert_eq!(
+        said(json!(0.05)),
+        words(0, "weekly 0% used", "weekly \u{2265}0% used")
+    );
+    assert_eq!(
+        said(json!(100)),
+        words(1000, "weekly 100% used", "weekly \u{2265}100% used"),
+        "CONTROL: a reading of 100 is 100"
+    );
+    assert_eq!(
+        said(json!(104.2)),
+        words(1000, "weekly 100% used", "weekly \u{2265}100% used"),
+        "a reading past 100 is full"
+    );
+}
+
 #[test]
 fn agy_subscription_reads_auth_log_and_usage_json() {
     let log_bytes = br"I1022 09:30:56.342240 375 main.go:1084] Starting CLI v1.4.5
@@ -2512,9 +2640,11 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
             Some(&store),
         )
         .expect("locked fallback subscription");
+        // 0.782786 left is 21.7% used: the bound rounds down, so it stays true (glass design
+        // §2.1); rounding the whole percent left first said `≥22%`, above the reading.
         assert_eq!(
             locked_fallback.weekly.as_deref(),
-            Some("weekly \u{2265}22% used")
+            Some("weekly \u{2265}21% used")
         );
         drop(held_lock);
         // Mid-session /login switch to a new email bypasses the previous account's

@@ -7343,7 +7343,7 @@ mod tests {
                     "ATERM_VERIFY_COMPILER_PROGRESS_FAIL",
                     if fails { "1" } else { "0" },
                 );
-            let (result, held, early) = std::thread::scope(|scope| {
+            let (result, held, (early, early_status)) = std::thread::scope(|scope| {
                 let run = scope.spawn(|| {
                     run_machine(
                         &cmd,
@@ -7357,16 +7357,23 @@ mod tests {
                 let until = Instant::now() + Duration::from_secs(60);
                 let early = loop {
                     let text = std::fs::read_to_string(&path).unwrap_or_default();
-                    let observed = text
+                    let observed: Vec<aterm_json::Value> = text
                         .split_inclusive('\n')
                         .filter_map(|line| line.strip_suffix('\n'))
                         .filter_map(|line| line.strip_prefix("verify-event: "))
                         .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
-                        .any(|event| event["event"].as_str() == Some("compile-message-observed"));
-                    if (dir.path().join("ready").exists() && (step.is_none() || observed))
+                        .filter(|event| event["event"].as_str() == Some("compile-message-observed"))
+                        .collect();
+                    let both = ["dispatch", "artifact"].iter().all(|kind| {
+                        observed
+                            .iter()
+                            .any(|event| event["message_kind"].as_str() == Some(*kind))
+                    });
+                    if (dir.path().join("ready").exists() && (step.is_none() || both))
                         || Instant::now() >= until
                     {
-                        break text;
+                        let status = crate::status::observe(&text);
+                        break (text, status);
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 };
@@ -7416,8 +7423,33 @@ mod tests {
                             && row["provisional"].as_bool() == Some(true)
                             && row["sample_complete"].as_bool() == Some(false))
                 );
+                assert_eq!(early_status.compiler_message_records, 2);
+                assert_eq!(early_status.compiler_progress.len(), 1);
+                assert!(early_status.checks.is_empty());
+                assert_eq!(early_status.terminal_records, 0);
+                let status = early_status.json();
+                assert_eq!(
+                    status["compiler_progress"][0]["latest"]["message_kind"].as_str(),
+                    Some("artifact")
+                );
+                assert_eq!(
+                    status["compiler_progress"][0]["provisional"].as_bool(),
+                    Some(true)
+                );
+                assert_eq!(
+                    status["compiler_progress"][0]["sample_complete"].as_bool(),
+                    Some(false)
+                );
+                assert_eq!(early_status.invocations.len(), 1);
+                assert_eq!(
+                    early_status.invocations[0]
+                        .observed
+                        .compiler_message_records,
+                    2
+                );
             } else {
                 assert!(early.is_empty());
+                assert!(early_status.compiler_progress.is_empty());
             }
             let final_events = crate::report::compile_unit_events("test compile", &stdout);
             let artifact: aterm_json::Value = final_events

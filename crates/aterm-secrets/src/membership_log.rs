@@ -36,6 +36,7 @@ use crate::text::Audience;
 use crate::{Error, Result};
 use aterm_digest::Sha256;
 use ring::signature::{Ed25519KeyPair, KeyPair};
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
@@ -1445,6 +1446,12 @@ pub struct Log {
     /// records, 16% of such a round (2026-11-08). `hold` lets it go; clones share it until one
     /// holds a record.
     advertised: Arc<OnceLock<store::Advertised>>,
+    /// The identity of the held records in their order that each history lease is taken under
+    /// ([`history::Generation`]): a digest of every record's id, which a quiet repair round's
+    /// leases took again at each lease, 6.5% of such a round over a log of 9,605 records
+    /// (2026-11-08). `hold` lets it go; clones share it until one holds a record.
+    #[cfg(unix)]
+    generation: Arc<OnceLock<history::Generation>>,
 }
 
 /// The Macs a log let back in after a removal, named as a roster names them: canonical `m<N>`
@@ -1534,6 +1541,8 @@ impl Log {
             epochs: Arc::default(),
             restored: Arc::default(),
             advertised: Arc::default(),
+            #[cfg(unix)]
+            generation: Arc::default(),
         })
     }
 
@@ -1904,6 +1913,17 @@ impl Log {
         Ok(Inserted::Held)
     }
 
+    /// Whether this log holds every record `other` holds: each of `other`'s heads, since a log
+    /// holds a record only after its past and each record it holds is a head or in a head's past.
+    /// Inserting each of them here would answer [`Inserted::Known`]; a quiet repair round's peer
+    /// check did that for every record of the peer's log, 4% of such a round over a log of 9,605
+    /// records (2026-11-08).
+    #[must_use]
+    pub fn holds_all(&self, other: &Log) -> bool {
+        other.network() == self.network()
+            && other.heads.iter().all(|head| self.held.contains_key(head))
+    }
+
     /// Insert every record `other` holds or keeps waiting. A record `other` holds that this log
     /// refuses is skipped and the rest come in: both logs check records the same way, so that
     /// happens only at this log's bounds (its [`RecordBudgets`], [`MAX_WAITING`]), which depend on
@@ -1915,8 +1935,10 @@ impl Log {
         if other.network() != self.network() {
             return Err(Error::new("cannot merge another network's membership log"));
         }
-        for record in other.order.iter().skip(1) {
-            let _ = self.insert(record.clone());
+        if !self.holds_all(other) {
+            for record in other.order.iter().skip(1) {
+                let _ = self.insert(record.clone());
+            }
         }
         loop {
             let mut progressed = false;
@@ -2093,6 +2115,17 @@ impl Log {
     /// [`EpochAudience::Commons`] [`Body::Epoch`] in this log.
     #[must_use]
     pub fn historical_commons_writers(&self, epoch: &RecordId) -> Option<(u64, Vec<Binding>)> {
+        self.historical_commons_writers_in(&OnceCell::new(), epoch)
+    }
+
+    /// [`Log::historical_commons_writers`], reading what every epoch's writers read of this log
+    /// from `writers`, which the first epoch that needs it fills: a batch of epochs derives it
+    /// once.
+    fn historical_commons_writers_in<'a>(
+        &'a self,
+        writers: &OnceCell<eval::HistoricalWriters<'a>>,
+        epoch: &RecordId,
+    ) -> Option<(u64, Vec<Binding>)> {
         let &idx = self.held.get(epoch)?;
         let Body::Epoch {
             audience: EpochAudience::Commons,
@@ -2102,8 +2135,16 @@ impl Log {
         else {
             return None;
         };
-        let writers = eval::historical_bindings_for_epoch(self.history(), self.weighing(), idx)?;
+        let writers = self.historical_writers(writers).of_epoch(idx)?;
         Some((*generation, writers))
+    }
+
+    /// What every epoch's historical writers read of this log, derived into `writers` once.
+    fn historical_writers<'a, 'w>(
+        &'a self,
+        writers: &'w OnceCell<eval::HistoricalWriters<'a>>,
+    ) -> &'w eval::HistoricalWriters<'a> {
+        writers.get_or_init(|| eval::HistoricalWriters::of(self.history(), self.weighing()))
     }
 
     fn check_against_parents(&self, record: &Record) -> Result<()> {
@@ -2250,6 +2291,10 @@ impl Log {
         self.effective = Arc::default();
         self.restored = Arc::default();
         self.advertised = Arc::default();
+        #[cfg(unix)]
+        {
+            self.generation = Arc::default();
+        }
         #[cfg(test)]
         let carried = eval::MUTANT.get() == Some(eval::Mutant::CarryAcross(record.kind()));
         #[cfg(not(test))]

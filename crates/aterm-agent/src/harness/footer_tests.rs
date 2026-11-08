@@ -1971,7 +1971,18 @@ fn the_account_stands_after_the_wall_and_before_the_model() {
         },
         "the label, whole, lit"
     );
-    assert_eq!(segments(&facts)[0].text, "until 3pm", "no window name");
+    // The wall's words are a warning: the warn ink, bold, behind `⧗` (glass design §4.1, §4.3),
+    // not a value beside the path. NEGATIVE CONTROL (run once, restored): a plain wall segment
+    // (`Segment::plain`, the value ink, regular) fails here.
+    assert_eq!(
+        segments(&facts)[0],
+        Segment {
+            tone: Tone::Warn,
+            bold: true,
+            ..Segment::plain(WALL_MARK, "until 3pm")
+        },
+        "until when alone, no window name, a warning"
+    );
     let bare = FooterFacts {
         model: Some("Opus 5.5".into()),
         account: Some("work-2".into()),
@@ -2796,55 +2807,48 @@ fn the_rule_run_is_the_widest_plain_run() {
     assert_eq!(rule_room(&(0..3)), 0, "too narrow for any write");
 }
 
-fn read_set(set: &SetFacts, pitches: f32) -> String {
-    let pitch = set.cells as f32 / pitches;
-    let at = |g: &SetGlyph| {
-        g.cell as f32 + g.cols as f32 / 2.0 + f32::from(g.nudge) / f32::from(NUDGES_PER_CELL)
-    };
-    let mut out = String::new();
-    for (i, g) in set.glyphs.iter().enumerate() {
-        if let Some(before) = i.checked_sub(1).map(|b| &set.glyphs[b]) {
-            let room = (at(g) - at(before)) / pitch - (before.cols + g.cols) as f32 / 2.0;
-            out.extend(std::iter::repeat_n(' ', room.round() as usize));
+/// Where each glyph of `reading` lies at pitch 1: every character in order, each at the running
+/// sum of the cells of the characters before it (a blank one cell, a wide char two).
+fn cells_of(reading: &str) -> (Vec<(char, usize, usize)>, usize) {
+    let mut at = 0usize;
+    let mut glyphs = Vec::new();
+    for ch in reading.chars() {
+        let cols = aterm_grapheme::char_width(ch);
+        if ch != ' ' {
+            glyphs.push((ch, at, cols));
         }
-        out.push(g.ch);
+        at += cols;
     }
-    out
+    (glyphs, at)
 }
 
+/// THE FACTS ARE SET AS A LINE OF TYPE, CELL-EXACT (glass design §1.2, §4.3): each glyph's cell
+/// is the running sum of the widths of the glyphs before it plus the blanks and gaps between
+/// them (one blank after a mark, [`GAP`] blanks between two facts), it takes its own width, and
+/// the line takes exactly the cells of its reading. NEGATIVE CONTROL: the reading set at the old
+/// 0.8 pitch (each glyph at its running sum times 0.8, rounded) lands most of its glyphs off the
+/// cells this pins.
 #[test]
 fn the_facts_are_set_as_a_line_of_type() {
-    let step = 1.0 / f32::from(NUDGES_PER_CELL);
-    let at = |g: &SetGlyph| {
-        g.cell as f32 + g.cols as f32 / 2.0 + f32::from(g.nudge) / f32::from(NUDGES_PER_CELL)
-    };
     let check = |facts: &FooterFacts, reading: &str| {
-        let segments = segments(facts);
-        let set = set_facts(&segments);
-        let pitches = reading
-            .chars()
-            .map(aterm_grapheme::char_width)
-            .sum::<usize>() as f32;
-        assert_eq!(read_set(&set, pitches), reading);
-        let pitch = set.cells as f32 / pitches;
-        let ink = set.glyphs.iter().map(|g| g.cols).sum::<usize>() as f32;
-        let tight = FACT_PITCH.max(ink / pitches);
-        assert!(
-            (tight..tight + 1.0 / pitches).contains(&pitch),
-            "{reading}: {pitch}"
+        let set = set_facts(&segments(facts));
+        let (want, cells) = cells_of(reading);
+        let got: Vec<(char, usize, usize)> =
+            set.glyphs.iter().map(|g| (g.ch, g.cell, g.cols)).collect();
+        assert_eq!(got, want, "{reading}");
+        assert_eq!(
+            set.cells, cells,
+            "{reading}: the line takes its reading's cells"
         );
-        let (first, last) = (set.glyphs[0], set.glyphs[set.glyphs.len() - 1]);
-        assert!((at(&first) - first.cols as f32 * pitch / 2.0).abs() <= step);
-        assert!((set.cells as f32 - at(&last) - last.cols as f32 * pitch / 2.0).abs() <= step);
-        for pair in set.glyphs.windows(2) {
-            assert!(pair[1].cell >= pair[0].cell + pair[0].cols, "{pair:?}");
-        }
-        assert!(last.cell + last.cols <= set.cells);
+        let squeezed: Vec<(char, usize, usize)> = want
+            .iter()
+            .map(|&(ch, at, cols)| (ch, (at as f32 * 0.8).round() as usize, cols))
+            .collect();
+        let moved = squeezed.iter().zip(&want).filter(|(s, w)| s != w).count();
         assert!(
-            set.cells < reading.chars().count(),
-            "CONTROL: {} cells, {} characters",
-            set.cells,
-            reading.chars().count()
+            moved > want.len() / 2,
+            "NEGATIVE CONTROL: the old pitch moves {moved} of {} glyphs: {reading}",
+            want.len()
         );
         set
     };
@@ -2877,28 +2881,19 @@ fn the_facts_are_set_as_a_line_of_type() {
         "\u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} \u{6F22}\u{5B57}",
     );
     assert_eq!(set.glyphs.iter().filter(|g| g.cols == 2).count(), 2);
-    let deep = FooterFacts {
-        path: Some(format!("~/{}", "deep/".repeat(30))),
+    // The account unit's parts follow one blank apart, as words do, and a fact the facts' gap.
+    let unit = FooterFacts {
+        account: Some("main".into()),
+        quota: Some(super::super::quota_view::QuotaView::sample()),
         ..facts
     };
-    let set = set_facts(&segments(&deep));
-    let d = set
-        .glyphs
-        .iter()
-        .position(|g| g.ch == 'd')
-        .expect("the path");
-    let pitches: Vec<f32> = set.glyphs[d..d + 40]
-        .windows(2)
-        .map(|p| at(&p[1]) - at(&p[0]))
-        .collect();
-    let (lo, hi) = pitches
-        .iter()
-        .fold((f32::MAX, 0.0f32), |(lo, hi), &p| (lo.min(p), hi.max(p)));
-    assert!(
-        lo > FACT_PITCH && hi - lo <= 2.0 * step,
-        "looser, evenly: {lo}..{hi}"
+    check(
+        &unit,
+        "\u{2386} main 63% \u{b7} \u{21ba} Sat 10:00 \u{b7} \u{2573} ~Thu 12 Nov 05:00   \
+         \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main",
     );
     assert!(set_facts(&[]).glyphs.is_empty());
+    assert_eq!(set_facts(&[]).cells, 0);
 }
 
 #[test]
@@ -2923,10 +2918,6 @@ fn native_footer_text_preserves_combining_and_joined_graphemes_when_set_and_elid
         }
         assert_eq!(actual, email);
         if email.contains('👩') {
-            assert!(
-                set.glyphs.iter().all(|glyph| glyph.nudge == 0),
-                "full-size color emoji must leave adjacent text at native pitch"
-            );
             let emoji = set.glyphs.iter().find(|glyph| glyph.ch == '👩').unwrap();
             let at = set.glyphs.iter().find(|glyph| glyph.ch == '@').unwrap();
             assert!(at.cell >= emoji.cell + emoji.cols);
@@ -3108,7 +3099,6 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
             (owned(&[model_effort, cut, branch]), TitleFit::Short, true),
             (owned(&[model_effort, cut]), TitleFit::Short, true),
             (owned(&[model_effort]), TitleFit::Short, true),
-            (owned(&[model_effort, path, branch]), TitleFit::None, true),
             (owned(&[model_effort, cut, branch]), TitleFit::None, true),
             (owned(&[model_effort, cut]), TitleFit::None, true),
             (owned(&[model_effort]), TitleFit::None, true),
@@ -5488,42 +5478,6 @@ fn the_key_state_rides_over_a_settled_newer_read() {
 }
 
 #[test]
-fn drawn_cells_follow_the_glyphs_nudges() {
-    let glyph = |cell: usize, cols: usize, nudge: i8| SetGlyph {
-        ch: 'a',
-        cell,
-        cols,
-        nudge,
-        mark: false,
-        tail: false,
-        quiet: false,
-        ..SetGlyph::default()
-    };
-    let set = |glyphs: Vec<SetGlyph>| SetFacts {
-        cells: 12,
-        glyphs,
-        ..SetFacts::default()
-    };
-    let span = |from: u16, to: u16| FactSpan {
-        kind: FactKind::Path,
-        cells: (from, to),
-        restores: FactMask::default(),
-    };
-    let quarter = NUDGES_PER_CELL / 4;
-    let right = set(vec![glyph(4, 1, 3 * quarter), glyph(5, 1, 3 * quarter)]);
-    assert_eq!(drawn_cells(&right, &span(4, 6)), 5..7);
-    let left = set(vec![glyph(4, 1, -3 * quarter), glyph(5, 1, -3 * quarter)]);
-    assert_eq!(drawn_cells(&left, &span(4, 6)), 3..5);
-    let wide = set(vec![glyph(4, 2, 3 * quarter)]);
-    assert_eq!(drawn_cells(&wide, &span(4, 6)), 5..7);
-    let half = set(vec![glyph(4, 1, 2 * quarter)]);
-    assert_eq!(drawn_cells(&half, &span(4, 5)), 4..5, "4.5..5.5: cell 4");
-    let still = set(vec![glyph(4, 1, 0), glyph(5, 1, 0)]);
-    assert_eq!(drawn_cells(&still, &span(4, 6)), 4..6);
-    assert_eq!(drawn_cells(&still, &span(8, 10)), 0..0);
-}
-
-#[test]
 fn fact_spans_split_model_and_effort_by_their_glyphs() {
     let facts = FooterFacts {
         account: Some("work-2".into()),
@@ -5678,7 +5632,7 @@ fn the_context_fact_is_a_span_its_stub_restores_and_it_goes_first() {
         subscription: Some(crate::harness::profile::SubscriptionDisplay {
             email: Some("person@example.com".into()),
             plan: Some("Max".into()),
-            weekly: Some("weekly 29% left".into()),
+            weekly: Some("weekly 71% used".into()),
             ..Default::default()
         }),
         ..facts.clone()

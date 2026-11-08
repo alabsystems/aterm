@@ -175,6 +175,13 @@ pub(crate) fn attribution(value: &aterm_json::Value) -> Option<Attribution> {
     })
 }
 
+/// The validated per-event diagnostic invocation ID, without inferring attribution from
+/// neighboring records. This establishes no source, execution, custody or qualification authority.
+#[must_use]
+pub fn diagnostic_invocation_id(value: &aterm_json::Value) -> Option<String> {
+    attribution(value).map(|binding| binding.id)
+}
+
 /// The companion writer shares only file custody, not the verifier or any authority.
 #[derive(Debug)]
 pub(crate) struct Retained {

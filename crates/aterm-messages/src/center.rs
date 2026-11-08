@@ -28,7 +28,6 @@ use crate::progress::{
     Eta, ProgressTrack, elapsed_word_change, elapsed_words, eta_words, eta_words_short,
 };
 use crate::text::clip;
-use crate::words::abbreviate_paths_in;
 use crate::{
     ANIM_FRAME, DETAIL_LINE_CAP, DETAIL_LINES_CAP, DONE_WORD, Duration, ECHO_DRAIN,
     ECHO_FAULT_CROSS, ECHO_FAULT_FLASH, FAILED_WORD, GLINT_TRAVEL, Instant, LOAD_AFTER,
@@ -1789,7 +1788,6 @@ impl MessageCenter {
         &self,
         cols: usize,
         width: &dyn Fn(&str) -> usize,
-        home: Option<&str>,
         links: Links,
     ) -> Presentation {
         let plus = self.plus_hidden();
@@ -1850,7 +1848,6 @@ impl MessageCenter {
             links,
             cols,
             width,
-            home,
         };
         let laid = lay_band(&inputs, &lay);
         let mut rows = Vec::with_capacity(laid.len());
@@ -3168,7 +3165,6 @@ struct LayIn<'a> {
     links: Links,
     cols: usize,
     width: &'a dyn Fn(&str) -> usize,
-    home: Option<&'a str>,
 }
 
 #[derive(Default)]
@@ -3233,13 +3229,12 @@ fn message_layout(row: &RowIn<'_>, lay: &LayIn<'_>, forms: &BandForms) -> RowLay
         links,
         cols,
         width,
-        home,
     } = *lay;
     let detail0 = msg
         .detail
         .first()
         .filter(|_| msg.excerpt)
-        .map(|d| abbreviate_paths_in(d, home));
+        .map(String::as_str);
     let echo = matches!(kind, RowKind::Echo(_));
     let mut capsules: Vec<CapsuleSpec> = msg
         .actions
@@ -3275,7 +3270,7 @@ fn message_layout(row: &RowIn<'_>, lay: &LayIn<'_>, forms: &BandForms) -> RowLay
         glyph: msg.glyph.ch(),
         title: &msg.title,
         title_short: msg.short_title.as_deref(),
-        detail0: detail0.as_deref(),
+        detail0,
         step,
         step_short,
         meter: msg.meter.as_ref().map(|_| (ind.fill, stats)),
@@ -5594,11 +5589,11 @@ mod tests {
         );
         c.commit_rows(now, 1);
         assert_eq!(glass_ids(&c), vec![a]);
-        let before = c.presentation(80, &char_width, None, Links::Painted);
+        let before = c.presentation(80, &char_width, Links::Painted);
         assert_eq!(before.rows[0].capsules.last().unwrap().text, "+2 \u{203a}");
         let settled = c.settle(now + OVERFLOW_PATIENCE_MIN, true);
         assert_eq!(settled.retired.len(), 2);
-        let after = c.presentation(80, &char_width, None, Links::Painted);
+        let after = c.presentation(80, &char_width, Links::Painted);
         assert_ne!(before, after, "the capsule now reads Details ›");
         assert!(
             settled.glass_changed,

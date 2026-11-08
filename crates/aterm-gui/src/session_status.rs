@@ -184,9 +184,23 @@ struct AgentWatch {
 struct InputSeen {
     /// The last look; none before the first.
     look: Option<aterm_session::sink::InputLook>,
-    /// No earlier than when the program read the last input driven into it: wall-clock
-    /// milliseconds since the Unix epoch.
+    /// No earlier than when the program read the last input driven into it, as the looks that
+    /// could tell found it: wall-clock milliseconds since the Unix epoch.
     ms: u64,
+}
+
+impl InputSeen {
+    /// The moment a Kimi box's record is judged against ([`crate::kimi_record::judge`]):
+    /// [`Self::ms`], or, while the last look could not tell
+    /// ([`aterm_session::sink::InputLook::known`]), one no request is asked after, so nothing
+    /// lends there and the moment stands still.
+    fn moment(self) -> u64 {
+        if self.look.is_some_and(|look| !look.known) {
+            u64::MAX
+        } else {
+            self.ms
+        }
+    }
 }
 
 /// Published agent status tuple: `(word, detail, prompt_subject, program_name)`.
@@ -3160,7 +3174,7 @@ impl StatusObserver {
                         (at + AGENT_MIN_INTERVAL).max(slot.next_due)
                     })
                 });
-                let unread = (w.kimi && w.input.look.is_some_and(|look| !look.read))
+                let unread = (w.kimi && w.input.look.is_some_and(|look| look.known && !look.read))
                     .then_some(slot.next_due);
                 [
                     followup,
@@ -3314,7 +3328,9 @@ impl StatusObserver {
     /// ([`crate::kimi_record::judge`]). That moment is this look's, unless this look and the one
     /// before it both found every driven byte read and nothing driven between them: then it
     /// stays where it was. So the program read no input after it that it had read by this
-    /// look. It never moves back, whatever the wall clock does.
+    /// look. It never moves back, whatever the wall clock does. A look that cannot tell
+    /// ([`aterm_session::sink::InputLook::known`]) moves nothing: while it is the last, the
+    /// moment judged against is one no request is asked after ([`InputSeen::moment`]).
     pub(crate) fn note_input(
         &mut self,
         session: u64,
@@ -3329,7 +3345,7 @@ impl StatusObserver {
             && w.input
                 .look
                 .is_some_and(|last| last.read && last.mark == look.mark);
-        if !quiet {
+        if look.known && !quiet {
             w.input.ms = w.input.ms.max(wall_ms);
         }
         w.input.look = Some(look);
@@ -3338,7 +3354,10 @@ impl StatusObserver {
     /// Returns whether the current sweep should read `session`'s terminal screen rows for agent
     /// classification. `runs` is the title's run bit ([`crate::presence::title_runs`]): a move of
     /// it alone is a move, since a title-only OSC moves neither the screen nor the cursor, and so
-    /// is a rest settle come due ([`AgentWatch::rest_at`]).
+    /// is a rest settle come due ([`AgentWatch::rest_at`]). So is input its program read under a
+    /// standing Kimi box: a key answers a box when Kimi reads it, and Kimi may draw the box after
+    /// it cell for cell, so a box judged against an earlier moment is judged again
+    /// ([`Self::note_input`], which the sweep calls before this too).
     pub(crate) fn agent_zone_wanted(
         &mut self,
         session: u64,
@@ -3361,7 +3380,9 @@ impl StatusObserver {
             || program_moved
             || w.runs_seen != runs
             || settle_due
-            || w.kimi_again;
+            || w.kimi_again
+            || w.kimi_box
+                .is_some_and(|seen| seen.input_ms() != w.input.moment());
         if !moved {
             return false;
         }
@@ -3519,7 +3540,7 @@ impl StatusObserver {
             pgid,
             &mut verdict,
             || crate::presence::prompt_drawn(aterm_phase::Program::Kimi, &rows),
-            (w.input.ms, w.screen_at.unwrap_or(now)),
+            (w.input.moment(), w.screen_at.unwrap_or(now)),
             &mut w.kimi_box,
             now,
         );
@@ -3920,6 +3941,14 @@ impl crate::App {
                 crate::telemetry_host::note_sid(id, h.sid.as_str());
             }
             let (master, pid) = (session.master, session.pid);
+            // A look before the screen is read too, so a Kimi box whose program read input since
+            // the last look is read again at this pass though its screen did not move
+            // (`agent_zone_wanted`); the look after the read is the one the box is judged by.
+            self.session_status.note_input(
+                id,
+                session.ctx.sink.input_look(),
+                crate::kimi_record::wall_ms(),
+            );
             let latest_output_ns = session
                 .latest_output_activity_ns
                 .load(std::sync::atomic::Ordering::Relaxed);

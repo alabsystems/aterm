@@ -22,6 +22,7 @@ pub struct Geometry {
 
 impl Geometry {
     /// Geometry with unit cells and no gutters.
+    #[cfg(test)]
     #[inline]
     #[must_use]
     pub const fn cells_only(cols: usize) -> Self {
@@ -133,40 +134,6 @@ pub type BandKey = (
     Geometry,
     u64,
 );
-
-/// Repaint fingerprint combining `center_fp`, `hover`, `geom`, and `motion`.
-#[must_use]
-pub fn band_fp(center_fp: u64, hover: Option<Hover>, geom: Geometry, motion_fp: u64) -> u64 {
-    if center_fp == 0 {
-        return 0;
-    }
-    let center_fp = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        center_fp.hash(&mut h);
-        geom.hash(&mut h);
-        h.finish()
-    };
-    let hover_code = match hover {
-        None => 0u64,
-        Some(Hover { row, target }) => {
-            let t = match target {
-                HoverTarget::Body => 1u64,
-                HoverTarget::Capsule(k) => 2u64 + u64::from(k.0),
-            };
-            (u64::from(row) << 10) | t
-        }
-    };
-    let base = if motion_fp == 0 {
-        center_fp
-    } else {
-        center_fp
-            ^ motion_fp
-                .wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
-                .rotate_left(17)
-    };
-    (base | 1) ^ (hover_code.wrapping_mul(0x9E37_79B9_7F4A_7C15) << 1)
-}
 
 /// Drawn vector icon replacing the glyph cell's font character.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -884,7 +851,7 @@ mod tests {
     }
 
     fn present(c: &MessageCenter, cols: usize) -> Presentation {
-        c.presentation(cols, &char_width, None, Links::Painted)
+        c.presentation(cols, &char_width, Links::Painted)
     }
 
     fn window(cols: usize) -> Geometry {

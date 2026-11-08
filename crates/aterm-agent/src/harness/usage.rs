@@ -1157,7 +1157,10 @@ impl AccountView {
                 self.windows.insert(
                     name.to_owned(),
                     WindowView {
-                        used_pct: w.pct,
+                        // `pct_x10` is the authoritative figure when the tap file has it. Early
+                        // format-v1 writers rounded 99.9x to the legacy whole `pct = 100`; deriving
+                        // the display whole from the tenths keeps those persisted rows below 100.
+                        used_pct: super::decimal::whole_used(w.x10()),
                         resets_at: w.resets_at,
                         age_s,
                         source: super::accounts::SOURCE_TAP,
@@ -2982,6 +2985,68 @@ mod tests {
             now,
         );
         assert_eq!(cached.windows["five_hour"].source, "usage-cache");
+    }
+
+    /// THE USAGE LINE SAYS 100% ONLY FOR A READING OF 100
+    /// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1, as the glass says it): a tap
+    /// reading of 99.96 and a held figure of 999 tenths are each `99%` on the line, half up
+    /// below that (62.96 is `63%`), and a reading of 100 is `100%`. NEGATIVE CONTROL: rounding
+    /// the tap's whole field and `WindowFig::whole` plainly half up from the tenths
+    /// (`(x10 + 5) / 10`) prints `100%/5h` and `100%/7d`; trusting the whole field persisted by
+    /// an earlier format-v1 tap does the same even though its `pct_x10` is 999 (run once, restored).
+    #[test]
+    fn the_usage_line_says_100_only_for_a_reading_of_100() {
+        let vars = crate::harness::tap::TapVars {
+            sid: Some("s-60776b6e2ed1b73bd013".to_owned()),
+            pid: Some("68537".to_owned()),
+            login: None,
+            home: None,
+        };
+        let now = 1_793_473_703;
+        let line_of = |reading: &crate::harness::tap::Reading, week_x10: u32| {
+            let mut a = AccountView::new("work", true);
+            a.model = Some("claude-opus-5-5".to_owned());
+            a.add_reading(reading, now);
+            let week = crate::harness::accounts::WindowFig {
+                pct_x10: week_x10,
+                reset: now + 86_400,
+                at: now - 60,
+                by: "here".to_owned(),
+                source: "tap".to_owned(),
+                epoch_at: None,
+            };
+            a.add_held("seven_day", &week, now);
+            let mut view = UsageView::new(now);
+            view.accounts.push(a);
+            let line = hud_line(&view);
+            let figures = line.split(" \u{b7} acct").next().unwrap_or_default();
+            figures.to_owned()
+        };
+        let reading = |five: &str| {
+            let text = format!(
+                r#"{{"model":{{"id":"claude-opus-5-5"}},"rate_limits":{{"five_hour":{{"used_percentage":{five},"resets_at":{}}}}}}}"#,
+                now + 3_600
+            );
+            crate::harness::tap::Reading::of_stdin(&text, &vars, now).expect("a reading")
+        };
+        let line = |five: &str, week_x10: u32| line_of(&reading(five), week_x10);
+        assert_eq!(line("99.96", 999), "opus 99%/5h \u{b7} 99%/7d");
+        assert_eq!(line("99.5", 995), "opus 99%/5h \u{b7} 99%/7d");
+        assert_eq!(line("62.96", 629), "opus 63%/5h \u{b7} 63%/7d");
+        assert_eq!(
+            line("100", 1000),
+            "opus 100%/5h \u{b7} 100%/7d",
+            "CONTROL: a reading of 100 is 100%"
+        );
+        let mut old_v1 = reading("99.96");
+        old_v1.five_hour.as_mut().expect("the window").pct = 100;
+        let old_v1 = crate::harness::tap::Reading::of_json(&old_v1.to_json())
+            .expect("the persisted format-v1 reading");
+        assert_eq!(
+            line_of(&old_v1, 999),
+            "opus 99%/5h \u{b7} 99%/7d",
+            "the exact tenths override an older writer's rounded whole"
+        );
     }
 
     #[test]

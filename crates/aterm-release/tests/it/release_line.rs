@@ -679,6 +679,30 @@ fn a_clean_hop_is_the_landed_fixs_patch_on_the_base_and_verifies() {
     let mut carried = start.clone();
     carried.hops = hops.clone();
     assert_eq!(carried.head(), hop.commit);
+    assert!(line::verify_pending(&git, &carried).is_ok());
+    assert_eq!(
+        line::recorded_prefix(&git, &carried).unwrap(),
+        start,
+        "a fleet claim must not advertise an unrecorded hop"
+    );
+    let mut invalid = carried.clone();
+    invalid.hops[0].paths.clear();
+    assert!(
+        line::verify_pending(&git, &invalid).is_err(),
+        "the pre-record proof still checks the actual patch"
+    );
+    assert!(run(&fix.work, &["status", "--porcelain"]).is_empty());
+    run(&fix.work, &["reset", "-q", "--keep", &hop.commit]);
+    let mut real =
+        crate::release_steps::Real::new(&fix.work, Some(&fix.work), true, false).unwrap();
+    assert!(crate::release::Backend::rewind_selection(&mut real, &invalid).is_err());
+    assert_eq!(
+        rev(&fix.work, "HEAD"),
+        hop.commit,
+        "an unproved pending line cannot be rewound"
+    );
+    crate::release::Backend::rewind_selection(&mut real, &carried).unwrap();
+    assert_eq!(rev(&fix.work, "HEAD"), start.head());
     let unrecorded = stopped(line::verify(&git, &carried), Reason::Unrecorded);
     assert!(
         unrecorded.remedy.contains("--forget"),
@@ -697,6 +721,7 @@ fn a_clean_hop_is_the_landed_fixs_patch_on_the_base_and_verifies() {
         panic!("a quiet main takes the record merge on the first push: {recorded:?}");
     };
     assert_eq!(fix.origin_main(), merge);
+    assert_eq!(line::recorded_prefix(&git, &carried).unwrap(), carried);
     assert_eq!(
         parents(&fix.origin, &merge),
         [s.tip.clone(), hop.commit.clone()]

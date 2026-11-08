@@ -1982,6 +1982,48 @@ pub const KIMI_ANCHORS: &[Anchor] = &[
     ),
 ];
 
+/// The words of Kimi Code's session record that `aterm-agent`'s wire reader (`kimi_wire`) reads,
+/// each through [`anchor!`](macro@crate::anchor): the event types and approval fields of an
+/// agent's `wire.jsonl`, the tool name the read-only rule passes, and the names of the session
+/// layout that leads to it (`docs/DESIGN-kimi-wire-verdict-2026-11-07.md` §2, §4). A build that
+/// renames one never lends a false `read-only`: a renamed event type, approval field or layout
+/// name leaves the reader finding nothing, which withholds the verdict; a renamed `display`,
+/// `command` or `Bash` leaves a request with no Bash command, which fails the box; a renamed
+/// `interaction.resolved` leaves answered requests open, each still held to the rule.
+/// `vendor_drift`'s `every_wire_key_is_in_the_store_kimi` finds each word in the installed
+/// bundle, and each event type as a quoted string, so it names a build that drops a distinctive
+/// word (an event type, `toolName`, `projects.json`, `state.json`, `wire.jsonl`). A short word
+/// (`id`, `type`, `kind`, `time`, …) is in any bundle for other reasons, so the row cannot see the
+/// record rename it; the reader's withheld or failed verdict is then the only sign.
+pub const KIMI_WIRE_KEYS: &[Anchor] = &[
+    lit(
+        "kimi.wire.interaction.request",
+        "interaction.request",
+        "2.5.2",
+    ),
+    lit(
+        "kimi.wire.interaction.resolved",
+        "interaction.resolved",
+        "2.5.2",
+    ),
+    lit("kimi.wire.type", "type", "2.5.2"),
+    lit("kimi.wire.kind", "kind", "2.5.2"),
+    lit("kimi.wire.approval", "approval", "2.5.2"),
+    lit("kimi.wire.id", "id", "2.5.2"),
+    lit("kimi.wire.time", "time", "2.5.2"),
+    lit("kimi.wire.request", "request", "2.5.2"),
+    lit("kimi.wire.toolName", "toolName", "2.5.2"),
+    lit("kimi.wire.display", "display", "2.5.2"),
+    lit("kimi.wire.command", "command", "2.5.2"),
+    lit("kimi.wire.Bash", "Bash", "2.5.2"),
+    lit("kimi.wire.projects.json", "projects.json", "2.5.2"),
+    lit("kimi.wire.sessions", "sessions", "2.5.2"),
+    lit("kimi.wire.agents", "agents", "2.5.2"),
+    lit("kimi.wire.state.json", "state.json", "2.5.2"),
+    lit("kimi.wire.cwd", "cwd", "2.5.2"),
+    lit("kimi.wire.wire.jsonl", "wire.jsonl", "2.5.2"),
+];
+
 /// The keys and closed words of Claude Code's transcript rows the session log's step fold reads:
 /// `lab claude-measure` refuses GONE when a build drops one the previous measured build showed,
 /// and NEW-KEY when a build shows one no measured build showed. aterm-agent's step tests hold the
@@ -2184,6 +2226,7 @@ pub fn anchor(id: &str) -> &'static str {
         .chain(MUSE_ANCHORS)
         .chain(GROK_ANCHORS)
         .chain(KIMI_ANCHORS)
+        .chain(KIMI_WIRE_KEYS)
         .chain(TRANSCRIPT_KEYS)
         .chain(ROLLOUT_KEYS)
         .find(|a| a.id == id)
@@ -2253,6 +2296,13 @@ pub const fn anchor_text(id: &str) -> &'static str {
     while i < KIMI_ANCHORS.len() {
         if same(KIMI_ANCHORS[i].id, id) {
             return KIMI_ANCHORS[i].text;
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < KIMI_WIRE_KEYS.len() {
+        if same(KIMI_WIRE_KEYS[i].id, id) {
+            return KIMI_WIRE_KEYS[i].text;
         }
         i += 1;
     }
@@ -2574,12 +2624,17 @@ mod tests {
     }
 
     #[test]
-    fn the_transcript_keys_are_literals_the_lookups_read() {
-        for a in TRANSCRIPT_KEYS {
-            assert_eq!(a.kind, AnchorKind::Literal, "{}", a.id);
-            assert_eq!(anchor(a.id), a.text);
-            assert_eq!(anchor_text(a.id), a.text);
-            assert_eq!(a.id.strip_prefix("transcript."), Some(a.text));
+    fn the_record_keys_are_literals_the_lookups_read() {
+        for (prefix, table) in [
+            ("transcript.", TRANSCRIPT_KEYS),
+            ("kimi.wire.", KIMI_WIRE_KEYS),
+        ] {
+            for a in table {
+                assert_eq!(a.kind, AnchorKind::Literal, "{}", a.id);
+                assert_eq!(anchor(a.id), a.text);
+                assert_eq!(anchor_text(a.id), a.text);
+                assert_eq!(a.id.strip_prefix(prefix), Some(a.text));
+            }
         }
         let mut ids: Vec<&str> = ANCHORS
             .iter()
@@ -2587,6 +2642,7 @@ mod tests {
             .chain(MUSE_ANCHORS)
             .chain(GROK_ANCHORS)
             .chain(KIMI_ANCHORS)
+            .chain(KIMI_WIRE_KEYS)
             .chain(TRANSCRIPT_KEYS)
             .chain(ROLLOUT_KEYS)
             .map(|a| a.id)

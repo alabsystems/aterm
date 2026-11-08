@@ -151,9 +151,18 @@ impl Log {
     /// `None` where `epoch` is no counting `[everyone]` epoch.
     #[must_use]
     pub fn historical_fold_writers(&self, epoch: &RecordId) -> Option<(u64, Vec<Binding>)> {
+        self.historical_fold_writers_in(&std::cell::OnceCell::new(), epoch)
+    }
+
+    /// [`Log::historical_fold_writers`], reading what every epoch's writers read of this log from
+    /// `writers` ([`Log::historical_commons_writers_in`]).
+    pub(super) fn historical_fold_writers_in<'a>(
+        &'a self,
+        writers: &std::cell::OnceCell<super::eval::HistoricalWriters<'a>>,
+        epoch: &RecordId,
+    ) -> Option<(u64, Vec<Binding>)> {
         let (at, generation, _) = self.fold_epoch(epoch)?;
-        let writers =
-            super::eval::historical_bindings_for_epoch(self.history(), self.weighing(), at)?;
+        let writers = self.historical_writers(writers).of_epoch(at)?;
         Some((generation, writers))
     }
 

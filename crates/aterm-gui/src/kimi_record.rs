@@ -183,6 +183,14 @@ pub(crate) struct Seen {
     settled: Option<Verdict>,
 }
 
+impl Seen {
+    /// When the program last read its tab's input, as the box was first seen so: a later moment
+    /// is the box seen anew ([`judge_read`]).
+    pub(crate) const fn input_ms(self) -> u64 {
+        self.input_ms
+    }
+}
+
 #[cfg(test)]
 impl Seen {
     /// When the box was first seen so.
@@ -198,11 +206,12 @@ pub(crate) enum Judged {
     Untouched,
     /// Judged from the record, which needs reading no more while this screen stands:
     /// `bash:not-read-only`, which no later line makes safer, or a verdict past [`READ_FOR`]
-    /// (`bash:read-only` off a read begun since its screen was first seen).
+    /// (`bash:read-only` off a read begun since its screen was first seen, or `bash` where none
+    /// was begun within [`READ_FOR`] of it).
     Settled,
-    /// Judged `bash` or `bash:read-only` before [`READ_FOR`], or `bash:read-only` off a read
-    /// begun before its screen was: read the box again, since a request that lands on disk
-    /// later may decide it or take `read-only` away.
+    /// Judged `bash` or `bash:read-only` before [`READ_FOR`], or off a read begun before its
+    /// screen was: read the box again, since a request that lands on disk later may decide it
+    /// or take `read-only` away.
     Again,
 }
 
@@ -246,7 +255,9 @@ pub(crate) fn judge(
 /// has passed is to be read again ([`Judged::Again`]): a request may land on disk after it. So
 /// is one judged `bash:read-only` off a read begun before its screen was, until [`READ_FOR`]
 /// after that screen: a box Kimi swapped for one drawn alike, with no input between them, is
-/// judged off a read begun after the swap one pass later. A box settled at `bash:not-read-only`,
+/// judged off a read begun after the swap one pass later. Such a verdict holds for [`SETTLE`]
+/// after its screen (a repaint around the box does not flicker it), then reads `bash` until a
+/// read begun since comes, and settles at `bash` if none has come by [`READ_FOR`]. A box settled at `bash:not-read-only`,
 /// or at `bash` past [`READ_FOR`], keeps that verdict while it stands, without a read.
 pub(crate) fn judge_read(
     verdict: &mut crate::presence::AgentVerdict,
@@ -317,9 +328,18 @@ pub(crate) fn judge_read(
         ),
         None => Verdict::Withheld,
     };
+    // A `bash:read-only` off a read begun before its screen holds for SETTLE while a read begun
+    // since is awaited, so a repaint around the box does not flicker it; past that it is
+    // withheld, and it never settles so.
+    let stale = judged == Verdict::ReadOnly && !fresh;
+    let judged = if stale && now >= screen_at + SETTLE {
+        Verdict::Withheld
+    } else {
+        judged
+    };
     *detail = Some(word(judged));
     if judged != Verdict::NotReadOnly && now < since + READ_FOR
-        || judged == Verdict::ReadOnly && !fresh && now < screen_at + READ_FOR
+        || stale && now < screen_at + READ_FOR
     {
         return Judged::Again;
     }

@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded, same-handle reads and private atomic writes for package metadata.
+//! Bounded, same-handle reads and atomic publication for package metadata.
 
 use std::io::{self, Read as _};
 use std::path::Path;
@@ -9,7 +9,35 @@ use std::path::Path;
 /// Replace metadata with a complete private file. The caller prepares and
 /// hardens the parent directory according to its store layout.
 pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    PendingMetadata::prepare(path, bytes)?.commit()
+    PendingMetadata::prepare(path, bytes, Publication::Private)?.commit()
+}
+
+/// Atomically publish a record with a 0644 creation mode, honoring the caller's
+/// umask, without adding a content-flush obligation.
+pub(crate) fn write_record_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    PendingMetadata::prepare(path, bytes, Publication::Record)?.commit()
+}
+
+/// Flush a record's contents before atomically publishing it. Its 0644 creation
+/// mode honors the caller's umask; directory ordering remains with the caller.
+pub(crate) fn write_record_durably(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    PendingMetadata::prepare(path, bytes, Publication::DurableRecord)?.commit()
+}
+
+#[derive(Clone, Copy)]
+enum Publication {
+    Private,
+    Record,
+    DurableRecord,
+}
+
+impl Publication {
+    const fn mode(self) -> u32 {
+        match self {
+            Self::Private => 0o600,
+            Self::Record | Self::DurableRecord => 0o644,
+        }
+    }
 }
 
 struct PendingMetadata {
@@ -18,7 +46,18 @@ struct PendingMetadata {
 }
 
 impl PendingMetadata {
-    fn prepare(path: &Path, bytes: &[u8]) -> io::Result<Self> {
+    fn prepare(path: &Path, bytes: &[u8], publication: Publication) -> io::Result<Self> {
+        Self::prepare_with(path, bytes, publication, |file| {
+            aterm_durable::refusal_accepted(crate::platform::sync_file_contents(file))
+        })
+    }
+
+    fn prepare_with(
+        path: &Path,
+        bytes: &[u8],
+        publication: Publication,
+        flush: impl FnOnce(&std::fs::File) -> io::Result<()>,
+    ) -> io::Result<Self> {
         let parent = path.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -29,9 +68,17 @@ impl PendingMetadata {
             .prefix("package-metadata-")
             .suffix(".noindex")
             .tempdir_in(parent)?;
-        let mut file = crate::platform::create_private_new(&directory.path().join("data"))?;
+        let mut file = crate::platform::open_create_new_write(
+            &directory.path().join("data"),
+            publication.mode(),
+        )?;
+        if matches!(publication, Publication::Private) {
+            crate::platform::set_mode_on(&file, 0o600)?;
+        }
         std::io::Write::write_all(&mut file, bytes)?;
-        crate::platform::set_mode_on(&file, 0o600)?;
+        if matches!(publication, Publication::DurableRecord) {
+            flush(&file)?;
+        }
         Ok(Self {
             directory,
             destination: path.to_path_buf(),
@@ -39,9 +86,38 @@ impl PendingMetadata {
     }
 
     fn commit(self) -> io::Result<()> {
+        #[cfg(test)]
+        seam::before_commit(&self.destination)?;
         // Each pending write owns its path until rename. Concurrent writers may
         // replace the destination, but cannot unlink one another's staging file.
         std::fs::rename(self.directory.path().join("data"), &self.destination)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod seam {
+    use super::*;
+    type Callback = Box<dyn Fn(&Path) -> io::Result<()>>;
+    thread_local! {
+        static BEFORE_COMMIT: std::cell::RefCell<Option<Callback>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(crate) struct Guard(Option<Callback>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            BEFORE_COMMIT.with(|slot| {
+                slot.replace(self.0.take());
+            });
+        }
+    }
+    pub(crate) fn before_publish(callback: impl Fn(&Path) -> io::Result<()> + 'static) -> Guard {
+        Guard(BEFORE_COMMIT.with(|slot| slot.replace(Some(Box::new(callback)))))
+    }
+    pub(super) fn before_commit(path: &Path) -> io::Result<()> {
+        BEFORE_COMMIT.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map_or(Ok(()), |callback| callback(path))
+        })
     }
 }
 
@@ -331,13 +407,120 @@ pub(crate) fn read_bounded_regular_utf8_follow_final_links(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn record_publication_respects_a_restrictive_umask() {
+        if !crate::testdir::isolated_lifecycle(
+            "metadata_io::tests::record_publication_respects_a_restrictive_umask",
+        ) {
+            return;
+        }
+        struct RestoreMask(libc::mode_t);
+        impl Drop for RestoreMask {
+            fn drop(&mut self) {
+                // SAFETY: this exact-test child owns its process-wide mask for this scope.
+                unsafe { libc::umask(self.0) };
+            }
+        }
+        // SAFETY: the lifecycle helper runs only this case in its owned child process.
+        let _restore = RestoreMask(unsafe { libc::umask(0o077) });
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = fixture("restricted-mask");
+        let private = root.join("private");
+        let buffered = root.join("buffered");
+        let durable = root.join("durable");
+        write_private_atomic(&private, b"private bytes").unwrap();
+        write_record_atomic(&buffered, b"buffered bytes").unwrap();
+        write_record_durably(&durable, b"durable bytes").unwrap();
+        for path in [private, buffered, durable] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn publication_policy_preserves_permissions_and_flush_boundary() {
+        for (policy, expected_flushes, expected_mode) in [
+            (Publication::Private, 0, 0o600),
+            (Publication::Record, 0, 0o644),
+            (Publication::DurableRecord, 1, 0o644),
+        ] {
+            let root = fixture("flush-boundary");
+            let path = root.join("record");
+            std::fs::write(&path, b"previous bytes").unwrap();
+            let flushes = std::cell::Cell::new(0);
+            let pending =
+                PendingMetadata::prepare_with(&path, b"complete new bytes", policy, |file| {
+                    assert_eq!(file.metadata()?.len(), b"complete new bytes".len() as u64);
+                    assert_eq!(
+                        std::fs::read(&path)?,
+                        b"previous bytes",
+                        "flush precedes publication"
+                    );
+                    flushes.set(flushes.get() + 1);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(flushes.get(), expected_flushes);
+            assert_eq!(std::fs::read(&path).unwrap(), b"previous bytes");
+            pending.commit().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"complete new bytes");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let expected_mode = if matches!(policy, Publication::Private) {
+                    expected_mode
+                } else {
+                    let control = root.join("prior-creation-policy");
+                    drop(crate::platform::open_create_write(&control, expected_mode).unwrap());
+                    std::fs::metadata(control).unwrap().permissions().mode() & 0o777
+                };
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    expected_mode
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = expected_mode;
+        }
+    }
+
+    #[test]
+    fn failed_content_flush_keeps_old_record_and_removes_staging() {
+        let root = fixture("flush-failure");
+        let path = root.join("record");
+        std::fs::write(&path, b"original").unwrap();
+        let result = PendingMetadata::prepare_with(
+            &path,
+            b"replacement",
+            Publication::DurableRecord,
+            |_| Err(io::Error::other("injected content flush failure")),
+        );
+        assert!(
+            result.is_err(),
+            "a required flush failure refuses publication"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"original");
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            1,
+            "failed staging is cleaned"
+        );
+    }
+
     #[test]
     fn overlapping_metadata_writes_publish_complete_bytes_and_keep_independent_staging() {
         let root = fixture("overlap");
         let path = root.join("metadata");
         std::fs::write(&path, b"original").unwrap();
-        let first = PendingMetadata::prepare(&path, b"first complete version").unwrap();
-        let second = PendingMetadata::prepare(&path, b"second complete version").unwrap();
+        let first =
+            PendingMetadata::prepare(&path, b"first complete version", Publication::Private)
+                .unwrap();
+        let second =
+            PendingMetadata::prepare(&path, b"second complete version", Publication::Private)
+                .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"original");
         first.commit().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"first complete version");
@@ -363,7 +546,7 @@ mod tests {
         let root = fixture("abandon");
         let path = root.join("metadata");
         std::fs::write(&path, b"original").unwrap();
-        drop(PendingMetadata::prepare(&path, b"abandoned").unwrap());
+        drop(PendingMetadata::prepare(&path, b"abandoned", Publication::Private).unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), b"original");
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
         let blocked = root.join("blocked");

@@ -562,8 +562,10 @@ fn git_takes_the_token_through_its_scoped_helper_and_only_with_one() {
     let rig = Rig::new();
     let expected = basic("x-access-token", &rig.secret);
     let dest = rig.dir.path().join("clone");
+    let mut git_env = hermetic_git().to_vec();
+    git_env.push(("GIT_ALLOW_PROTOCOL", OsStr::new("http")));
     let seen = against_git_server(|base| {
-        let host = rig.host_at(base);
+        let host = rig.host_at(base).with_git_env(&git_env);
         let clone = host.clone_repo(&slug(), &dest);
         assert!(matches!(clone, Err(HostError::Unreachable(_))), "{clone:?}");
         std::fs::create_dir_all(&dest).expect("a directory to fetch into");
@@ -580,8 +582,7 @@ fn git_takes_the_token_through_its_scoped_helper_and_only_with_one() {
         [None, Some(expected.clone()), None, Some(expected.clone())]
     );
     let seen = against_git_server(|base| {
-        let host =
-            RestHost::at(None, rig.origins.clone(), base.to_string()).with_git_env(&hermetic_git());
+        let host = RestHost::at(None, rig.origins.clone(), base.to_string()).with_git_env(&git_env);
         let clone = host.clone_repo(&slug(), &rig.dir.path().join("anonymous"));
         assert!(matches!(clone, Err(HostError::Unreachable(_))), "{clone:?}");
     });
@@ -861,6 +862,7 @@ fn git_hands_its_token_over_whatever_helpers_and_use_http_path_the_users_config_
         ("GIT_CONFIG_NOSYSTEM", OsStr::new("1")),
         ("GIT_CONFIG_GLOBAL", config.as_os_str()),
         ("XDG_CONFIG_HOME", OsStr::new("/dev/null")),
+        ("GIT_ALLOW_PROTOCOL", OsStr::new("http")),
     ];
     let seen = against_git_server(|base| {
         user_config(base);
@@ -881,6 +883,7 @@ fn git_hands_its_token_over_whatever_helpers_and_use_http_path_the_users_config_
             .arg(format!("{base}/fixture-dev/packs.git"))
             .arg(rig.dir.path().join(dest))
             .env("GIT_CONFIG_GLOBAL", &config)
+            .env("GIT_ALLOW_PROTOCOL", "http")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", "")
             .output()

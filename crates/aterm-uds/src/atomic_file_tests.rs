@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::atomic_file::read_bounded_stream;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
 #[test]
 fn native_config_writer_waits_for_an_unchanged_original_holder() {
@@ -209,8 +209,45 @@ fn aterm_toml_is_written_through_its_link_and_never_over_a_change() {
     assert_eq!(mode_of(&dotfiles), 0o664, "the file keeps its own mode");
     assert_eq!(mode_of(&bak), 0o664, "and so does its .bak");
 
+    // Keep both old inodes alive: a replacement cannot pass this check by reusing
+    // an inode the filesystem just freed. An OS-only naming retry has these bytes.
+    let target_held = std::fs::File::open(&dotfiles).expect("hold current config");
+    let backup_held = std::fs::File::open(&bak).expect("hold prior backup");
+    let identity = |meta: std::fs::Metadata| (meta.dev(), meta.ino());
+    let same = ConfigFile::open(&config)
+        .expect("open current config")
+        .lock()
+        .and_then(|edit| edit.replace("theme = \"Dracula\"\n"))
+        .expect("unchanged text succeeds");
+    assert_eq!(
+        identity(std::fs::metadata(&dotfiles).unwrap()),
+        identity(target_held.metadata().unwrap()),
+        "an identical replacement must retain the current file"
+    );
+    assert_eq!(
+        identity(std::fs::metadata(&bak).unwrap()),
+        identity(backup_held.metadata().unwrap()),
+        "an identical replacement must retain the prior backup"
+    );
+    assert_eq!(std::fs::read_to_string(&bak).unwrap(), "theme = \"Nord\"\n");
+    assert_eq!(same, None, "no new backup was written");
+    ConfigFile::open(&config)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .replace_flushing_dir("theme = \"Dracula\"\n", |_, _| {
+            panic!("unchanged text performs no new publication or directory flush")
+        })
+        .unwrap();
+
     let file = ConfigFile::open(&config).expect("open");
     std::fs::write(&dotfiles, "theme = \"Solarized\"\n").expect("the other writer");
+    assert!(
+        file.lock()
+            .and_then(|edit| edit.replace("theme = \"Dracula\"\n"))
+            .is_err(),
+        "matching the captured bytes cannot bypass the current-file check"
+    );
     assert!(
         file.lock()
             .and_then(|edit| edit.replace("theme = \"Gruvbox\"\n"))
@@ -252,6 +289,35 @@ fn aterm_toml_is_written_through_its_link_and_never_over_a_change() {
         .expect("replace");
     assert_eq!(bak, None, "no .bak for a file nobody made");
     assert_eq!(mode_of(&fresh), 0o600, "a new file is private");
+
+    let empty = scratch.0.join("new-empty.toml");
+    assert_eq!(ConfigFile::open(&empty).unwrap().text().unwrap(), None);
+    assert_eq!(
+        ConfigFile::open(&empty)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .replace("")
+            .unwrap(),
+        None
+    );
+    let empty_held = std::fs::File::open(&empty).expect("an absent empty config was created");
+    assert_eq!(empty_held.metadata().unwrap().len(), 0);
+    assert_eq!(mode_of(&empty), 0o600);
+    assert_eq!(ConfigFile::open(&empty).unwrap().text().unwrap(), Some(""));
+    assert_eq!(
+        ConfigFile::open(&empty)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .replace("")
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        identity(std::fs::metadata(&empty).unwrap()),
+        identity(empty_held.metadata().unwrap())
+    );
 }
 
 /// An edit whose directory flush fails after the rename is in effect, and its error says so:

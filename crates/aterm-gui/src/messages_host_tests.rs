@@ -1875,19 +1875,28 @@ fn a_v0_147_parents_band_is_read_past_and_nothing_regrids_to_commit() {
         .expect("the desk's manifest");
     let text = std::fs::read_to_string(&manifest).expect("the manifest reads");
     let (_nonce, toml) = text.split_once('\n').expect("the nonce line");
+    let band: u16 = 3;
     assert!(
-        toml.contains("status_bar_rows = 3") && toml.contains("on_glass = true"),
+        toml.contains(&format!("status_bar_rows = {band}")) && toml.contains("on_glass = true"),
         "PRECONDITION: the parent committed band rows and carried rows on its glass"
     );
     let handoff: crate::session_store::SessionHandoff =
         aterm_toml::from_str(toml).expect("a v0.147.0 manifest still decodes");
     let carry = handoff.window.expect("the window carry");
     let [width, height] = carry.inner_px.expect("the carried frame");
-    let carried = aterm_window::dpi::PhysicalSize::new(width, height);
+    assert!(
+        width.is_multiple_of(u32::from(carry.cols))
+            && height.is_multiple_of(u32::from(carry.rows + band)),
+        "PRECONDITION: the carried frame is the grid and the band's rows, in whole cells"
+    );
 
     let wid = crate::WindowId(0);
     let mut successor = App::headless_for_test();
     let exact = successor.window_frame_px_for(wid, carry.rows, carry.cols);
+    // The desk's frame is in the cells of the face that generated it (1407x462 is 7x14 px
+    // cells); this host's face may lay others (Linux's headless face lays 9x20), so the parent
+    // here carried the same grid and band rows in this face's cells.
+    let carried = successor.window_frame_px_for(wid, carry.rows + band, carry.cols);
     assert!(
         carried.height > exact.height,
         "PRECONDITION: the carried frame holds the band's rows"
@@ -4519,8 +4528,7 @@ fn a_restatement_carries_the_titles_short_form() {
         c.commit_rows(later, 3);
         let mut p = c.presentation(
             40,
-            &crate::message_band::cell_width,
-            None,
+            &aterm_messages::text::char_width,
             aterm_messages::Links::Painted,
         );
         assert_eq!(p.rows.len(), 1, "one row on the band");
@@ -4686,5 +4694,74 @@ fn automatic_reports_are_records_without_banners_or_a_user_action() {
     assert_eq!(
         app.messages.log().get(id).unwrap().title,
         "Another approach succeeded"
+    );
+}
+
+/// A live update download with an amount: a determinate bar with an ETA slot.
+fn metered_download(done: u64) -> Message {
+    use aterm_messages::{Amount, Meter, STALE_UPDATE, Unit};
+    let total = 74_000_000;
+    Message::new(tags::UPDATE, Severity::Info, "Downloading aterm v0.92.0")
+        .meter(Meter {
+            fill_permille: Some(u16::try_from(done * 1000 / total).unwrap()),
+            stats: String::new(),
+            amount: Some(Amount {
+                series: Amount::series_of("aterm 0.92.0"),
+                done,
+                total,
+                unit: Unit::Bytes,
+            }),
+            ..Meter::default()
+        })
+        .hold(Hold::Live {
+            stale_after: STALE_UPDATE,
+        })
+        .key("update.progress")
+}
+
+/// `appstatus` output is invariant across time: its rows carry no motion words.
+#[test]
+fn appstatus_carries_no_motion_words() {
+    let mut app = App::headless_for_test();
+    app.post_message(metered_download(30_000_000));
+    app.announce_toolchain_pass("installing 10 ALab program(s)", true);
+    let read = |app: &App, at: Instant| {
+        aterm_messages::wire::activity_rows_compat(&app.messages, at, &crate::control::pct_encode)
+    };
+    let now = Instant::now();
+    let first = read(&app, now);
+    assert_eq!(first.len(), 2, "{first:?}");
+    assert_eq!(read(&app, now + std::time::Duration::from_secs(30)), first);
+}
+
+/// `Hold::LogOnly` messages stay off the glass and appear in Settings ▸ Messages newest first.
+#[test]
+fn the_messages_page_lists_log_only_records() {
+    let mut app = App::headless_for_test();
+    let ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
+    ws.band_on_screen_for_test = true;
+    ws.focused = true;
+    let first = app.record_message(Message::new(
+        tags::TOOLCHAIN,
+        Severity::Info,
+        "ALab tools installed",
+    ));
+    let second = app.record_message(
+        Message::new(tags::UPDATE, Severity::Warn, "aterm update failed")
+            .line("could not verify the download"),
+    );
+    assert_eq!(app.message_band_rows, 0, "never on the glass");
+    assert_eq!(app.messages_deadline(), None);
+    let state = app.messages_state();
+    let ids: Vec<u64> = state.entries.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [second.raw(), first.raw()], "newest first");
+    for id in [first, second] {
+        let e = state.entry(id.raw()).expect("listed");
+        assert_eq!(e.state, "recorded");
+    }
+    assert_eq!(
+        state.entry(second.raw()).unwrap().detail,
+        vec!["could not verify the download"],
+        "its detail rides the page"
     );
 }

@@ -12235,6 +12235,7 @@ fn token_report(env: &Env, host: &dyn AccountsHost) -> super::accounts_token_vie
             roster: roster.as_deref(),
             logins: &logins,
             now,
+            offers: host.on_macos(),
         },
         vault.as_ref(),
     );

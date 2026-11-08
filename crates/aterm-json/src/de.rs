@@ -13,6 +13,15 @@ use crate::error::{Error, Result};
 /// Container recursion threshold (`128`, matching `serde_json`); at most `127` nested containers are accepted.
 pub const RECURSION_LIMIT: u32 = 128;
 
+/// One step in a typed path through a JSON document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathSegment<'a> {
+    /// Select the value of an object entry whose decoded key equals this text.
+    Key(&'a str),
+    /// Select an array element by its zero-based index.
+    Index(usize),
+}
+
 /// JSON deserializer over a byte slice.
 pub struct Deserializer<'de> {
     input: &'de [u8],
@@ -476,6 +485,125 @@ impl<'de> Deserializer<'de> {
             _ => Err(self.err("expected a JSON value")),
         }
     }
+
+    /// Consume one value and retain its number spelling only when `path`
+    /// resolves to that number.
+    fn find_number_lexeme(&mut self, path: &[PathSegment<'_>]) -> Result<Option<&'de str>> {
+        let Some((segment, rest)) = path.split_first() else {
+            return if matches!(self.peek_value()?, b'-' | b'0'..=b'9') {
+                self.parse_number().map(|parsed| Some(parsed.text))
+            } else {
+                self.skip_value()?;
+                Ok(None)
+            };
+        };
+
+        let byte = self.peek_value()?;
+        match (segment, byte) {
+            (PathSegment::Key(key), b'{') => self.find_number_in_object(key, rest),
+            (PathSegment::Index(index), b'[') => self.find_number_in_array(*index, rest),
+            _ => {
+                self.skip_value()?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn find_number_in_object(
+        &mut self,
+        wanted: &str,
+        rest: &[PathSegment<'_>],
+    ) -> Result<Option<&'de str>> {
+        self.enter()?;
+        self.bump();
+        let result = self.find_number_in_object_body(wanted, rest);
+        self.leave();
+        result
+    }
+
+    fn find_number_in_object_body(
+        &mut self,
+        wanted: &str,
+        rest: &[PathSegment<'_>],
+    ) -> Result<Option<&'de str>> {
+        let mut first = true;
+        let mut found = None;
+        loop {
+            let byte = self.peek_value()?;
+            if byte == b'}' {
+                self.bump();
+                return Ok(found);
+            }
+            if first {
+                first = false;
+            } else if byte == b',' {
+                self.bump();
+                if self.peek_value()? == b'}' {
+                    return Err(self.err("trailing comma in object"));
+                }
+            } else {
+                return Err(self.err("expected `,` or `}`"));
+            }
+
+            self.expect(b'"', "an object key")?;
+            let key = self.parse_string_body()?;
+            self.expect(b':', "`:`")?;
+            if key == wanted {
+                // `Value` inserts each object entry into its map in source
+                // order, so a later duplicate replaces even a prior number
+                // with a non-number or a missing deeper path.
+                found = self.find_number_lexeme(rest)?;
+            } else {
+                self.skip_value()?;
+            }
+        }
+    }
+
+    fn find_number_in_array(
+        &mut self,
+        wanted: usize,
+        rest: &[PathSegment<'_>],
+    ) -> Result<Option<&'de str>> {
+        self.enter()?;
+        self.bump();
+        let result = self.find_number_in_array_body(wanted, rest);
+        self.leave();
+        result
+    }
+
+    fn find_number_in_array_body(
+        &mut self,
+        wanted: usize,
+        rest: &[PathSegment<'_>],
+    ) -> Result<Option<&'de str>> {
+        let mut first = true;
+        let mut index = 0usize;
+        let mut found = None;
+        loop {
+            let byte = self.peek_value()?;
+            if byte == b']' {
+                self.bump();
+                return Ok(found);
+            }
+            if first {
+                first = false;
+            } else if byte == b',' {
+                self.bump();
+                if self.peek_value()? == b']' {
+                    return Err(self.err("trailing comma in array"));
+                }
+            } else {
+                return Err(self.err("expected `,` or `]`"));
+            }
+
+            if index == wanted {
+                found = self.find_number_lexeme(rest)?;
+            } else {
+                self.skip_value()?;
+            }
+            index = index.saturating_add(1);
+        }
+    }
 }
 
 /// A classified JSON number.
@@ -845,4 +973,24 @@ pub fn from_slice<'de, T: serde::Deserialize<'de>>(input: &'de [u8]) -> Result<T
 #[inline]
 pub fn from_str<'de, T: serde::Deserialize<'de>>(input: &'de str) -> Result<T> {
     from_slice(input.as_bytes())
+}
+
+/// Return the original number spelling at `path`, after validating the whole
+/// JSON document.
+///
+/// Object keys are compared after JSON escape decoding. A duplicate key has
+/// the same last-entry-wins meaning as [`crate::Value`]. An absent path or a
+/// value that is not a number returns `None`.
+///
+/// # Errors
+/// Any syntax error, number rejected by this deserializer, nesting past
+/// [`RECURSION_LIMIT`], or trailing data after the value.
+pub fn number_lexeme_at_path<'de>(
+    input: &'de [u8],
+    path: &[PathSegment<'_>],
+) -> Result<Option<&'de str>> {
+    let mut de = Deserializer::from_slice(input);
+    let found = de.find_number_lexeme(path)?;
+    de.end()?;
+    Ok(found)
 }

@@ -5534,10 +5534,11 @@ impl WindowFig {
         self.epoch_at.is_none_or(|epoch| at >= epoch)
     }
 
-    /// Utilization percentage rounded half-up to a whole integer.
+    /// Utilization percentage rounded half-up to a whole integer, but 100 only for a reading of
+    /// 100 or more ([`super::decimal::whole_used`]): 999 tenths is 99.
     #[must_use]
     pub const fn whole(&self) -> u32 {
-        self.pct_x10.saturating_add(5) / 10
+        super::decimal::whole_used(self.pct_x10)
     }
 }
 
@@ -9605,6 +9606,12 @@ fn sample_fig(pct: Option<u32>, reset: Option<i64>, at: i64, sample: &Sample) ->
 
 /// Converts a `/usage` [`Sample`] bucket ([`SESSION_LIMIT`] or [`WEEK_LIMIT`]) into a figure;
 /// `None` when it has no figure there or `stored` already holds that figure as recently.
+///
+/// A sample [`note_reading`] wrote from a held figure says that figure's whole percent. A store
+/// written before the whole percent was held under 100 (2026-11-07, `docs/DESIGN-harness-glass-
+/// rainbow-2026-11-05.md` §2.1) says 995 to 999 tenths as `100`, so either whole is the held
+/// figure: read as a new reading, such a sample would outrank its own tenths and say the window
+/// full when no reading was.
 #[must_use]
 pub fn sample_window(
     sample: Option<&Sample>,
@@ -9624,7 +9631,10 @@ pub fn sample_window(
     }?;
     stored
         .is_none_or(|held| {
-            (held.whole() * 10, held.reset) != (f.pct_x10, f.reset) || f.at > held.at
+            let wholes = [held.whole(), held.pct_x10.saturating_add(5) / 10];
+            held.reset != f.reset
+                || !wholes.iter().any(|w| w.saturating_mul(10) == f.pct_x10)
+                || f.at > held.at
         })
         .then_some(f)
 }

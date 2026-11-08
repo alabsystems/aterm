@@ -1962,7 +1962,9 @@ mod tests {
     /// not it is its row's slowest; a faster one, the park and a count row are not. An ack that
     /// commits is one span in two rows, with one start. The write carries the recorder's calls
     /// merged with the state dir's and the process's flush times, a flush ring that holds every
-    /// slow flush this test made (read after the write) among its last ones.
+    /// slow flush this test made (read after the write) among its last ones, or below the
+    /// oldest index it still holds. Off Apple the flush clock starts at the process's first
+    /// reading, so a start before it saturates at 0, as the recorder's does.
     #[test]
     fn every_slow_call_is_kept_with_its_start_on_the_flush_clock() {
         let dir = aterm_tempfile::tempdir().expect("scratch");
@@ -1976,7 +1978,8 @@ mod tests {
         let first = on.calls.iter().next().expect("kept");
         assert_eq!((first.row, first.ns), (Row::LaneSent, 3 * slow_ns));
         assert!(
-            (before - 3 * slow_ns..=after - 3 * slow_ns).contains(&first.start_ns),
+            (before.saturating_sub(3 * slow_ns)..=after.saturating_sub(3 * slow_ns))
+                .contains(&first.start_ns),
             "{first:?} does not start its length before a reading in {before}..={after}"
         );
         on.span(Row::LaneSent, slow_ns);
@@ -2014,7 +2017,8 @@ mod tests {
             .find(|c| c.row == Row::AppendSelfAcked)
             .expect("the state dir's slow call");
         assert!(
-            (opened - 2 * slow_ns..=closed - 2 * slow_ns).contains(&dir_call.start_ns),
+            (opened.saturating_sub(2 * slow_ns)..=closed.saturating_sub(2 * slow_ns))
+                .contains(&dir_call.start_ns),
             "the kept row's start: {written:?}"
         );
         assert_eq!(written.calls.iter().last(), Some(dir_call), "it ended last");
@@ -2022,10 +2026,12 @@ mod tests {
         assert!(
             written.times.full_ns <= times.full_ns && written.times.slow_count <= times.slow_count
         );
+        // The ring keeps the last flushes by index, which each takes as it returns: one that
+        // left it has an index below the oldest kept, whenever it began.
         assert!(
             written.times.slow().all(|f| times.slow.contains(&f)
-                || times.slow.first().is_some_and(|g| f.start_ns <= g.start_ns)),
-            "the written ring is the process's: {written:?}"
+                || times.slow.first().is_some_and(|g| f.index < g.index)),
+            "the written ring is the process's: {written:?} against {times:?}"
         );
     }
 

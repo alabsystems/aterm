@@ -464,6 +464,8 @@ impl Shape {
                     ((px - self.cx).abs() + (py - cyr).abs() - r) * std::f32::consts::FRAC_1_SQRT_2;
                 diamond.max(self.mark_box(px, py))
             }
+            BandIcon::Fork => self.fork(px, py),
+            BandIcon::Enter => self.enter(px, py),
             BandIcon::Lock => self.lock(px, py),
             BandIcon::Hourglass => self.hourglass(px, py),
             BandIcon::Drive => self.drive(px, py),
@@ -586,6 +588,50 @@ impl Shape {
             drum = drum.min(rim(top_c + t * 0.5 + gap));
         }
         drum
+    }
+
+    /// `⎇` in the family's box ([`Self::mark_box`]), one stroke wide ([`Self::mark_t`]): a foot along the box's floor from its left side, a rise to its top, a head along the top to its right side, and apart from the rise a second foot along the floor to the right side, the line the first one steps off. The rise and the second foot stand apart on the floor's row: a clear pixel between them on the measured faces at 2x, and at least a pixel under half ink between them on every measured 1x face.
+    fn fork(&self, px: f32, py: f32) -> f32 {
+        let ((r, cyr), t) = (self.mark_frame(), self.mark_t());
+        let (l, rt) = (self.cx - r, self.cx + r);
+        let (hi, lo) = (cyr - r + t * 0.5, cyr + r - t * 0.5);
+        let seg =
+            |x0: f32, y0: f32, x1: f32, y1: f32| super::seg_dist(px, py, x0, y0, x1, y1) - t * 0.5;
+        let span = 2.0 * r;
+        let step = (l + 0.25 * span).round() + 0.5 * (t % 2.0);
+        let top = (l + 0.55 * span).round() + 0.5 * (t % 2.0);
+        let foot = (top + t).max(step + 2.0 * t + 1.0).min(rt - t * 0.5);
+        seg(l, lo, step, lo)
+            .min(seg(step, lo, top, hi))
+            .min(seg(top, hi, rt, hi))
+            .min(seg(foot, lo, rt, lo))
+            .max(self.mark_box(px, py))
+    }
+
+    /// `⎆` in the family's box ([`Self::mark_box`]): `◆`'s diamond as an outline one stroke wide ([`Self::mark_t`]), and inside it an arrow along its centre row from its left corner to its right-pointing tip, with two diagonal head strokes. The shaft and head use the outline's stroke where the diamond holds three of them across its inside, else a thinner stroke down to a pixel; a half-pixel centreline joins the shaft through the head to its tip without closing the smallest face.
+    fn enter(&self, px: f32, py: f32) -> f32 {
+        let ((r, cyr), t) = (self.mark_frame(), self.mark_t());
+        let diamond =
+            ((px - self.cx).abs() + (py - cyr).abs() - r) * std::f32::consts::FRAC_1_SQRT_2;
+        let inner = (r - std::f32::consts::SQRT_2 * t).max(1.0);
+        let ta = t.min((inner / 3.0).floor()).max(1.0);
+        let half = (0.55 * inner).max(ta * 0.5 + 0.5);
+        let (base, tip) = (self.cx, self.cx + half);
+        let y0 = (cyr - ta * 0.5).round();
+        let mid = y0 + ta * 0.5;
+        let nose = super::seg_dist(px, py, base, mid, tip, mid) - 0.25;
+        let stem = rect(px, py, self.cx - r, y0, base, y0 + ta).min(nose);
+        let head = super::seg_dist(px, py, base, mid - half, tip, mid).min(super::seg_dist(
+            px,
+            py,
+            tip,
+            mid,
+            base,
+            mid + half,
+        )) - ta * 0.5;
+        self.mark_outline(diamond)
+            .min(stem.min(head).max(diamond))
+            .max(self.mark_box(px, py))
     }
 
     /// The ring family's radius ([`ring_radius`]) and centre row: the face's `●` on the capitals' centre line, its sides and its top on pixel boundaries.
@@ -1019,10 +1065,12 @@ mod tests {
         }
     }
 
-    /// The glass's ring family is one set: `●`, `○`, `◐`, `◌`, `⊘` and `◉`, and the `◈`, `⌂` and
-    /// `◆` drawn in their box, share one ink box on every face, inside their own cell on either
-    /// raster, no taller than the face's own `●` ([`IconMetrics::disc`]) where it is under the
-    /// capitals. Each mark's own shape (hollow, struck, dotted, halved, roofed) is asserted.
+    /// The glass's ring family is one set: `●`, `○`, `◐`, `◌`, `⊘` and `◉`, and the `◈`, `⌂`,
+    /// `◆`, `⎇` and `⎆` drawn in their box, share one ink box on every face, inside their own cell
+    /// on either raster, no taller than the face's own `●` ([`IconMetrics::disc`]) where it is
+    /// under the capitals. Each mark's own shape (hollow, struck, dotted, halved, roofed, forked,
+    /// entered) is asserted. NEGATIVE CONTROL: drawing `⎆` as `◆`'s filled diamond, or `⎇`
+    /// without its second foot, fails the entered and forked shapes (run once, restored).
     #[test]
     fn the_ring_family_shares_one_outline() {
         let shorter = FACES.map(|(cw, ch, m)| {
@@ -1046,11 +1094,13 @@ mod tests {
                     draw(BandIcon::DottedRing),
                     draw(BandIcon::SlashedRing),
                 );
-                let (eye, diamond, house, filled) = (
+                let (eye, diamond, house, filled, fork, enter) = (
                     draw(BandIcon::Fisheye),
                     draw(BandIcon::InsetDiamond),
                     draw(BandIcon::House),
                     draw(BandIcon::Diamond),
+                    draw(BandIcon::Fork),
+                    draw(BandIcon::Enter),
                 );
                 let at = format!("{cw}x{ch} stem {} disc {} spill {spill}", m.stem, m.disc);
                 let outline = ink_box(&disc, w);
@@ -1062,6 +1112,8 @@ mod tests {
                 assert_eq!(ink_box(&diamond, w), outline, "{at}: ◈ is ●'s size");
                 assert_eq!(ink_box(&house, w), outline, "{at}: ⌂ is ●'s size");
                 assert_eq!(ink_box(&filled, w), outline, "{at}: ◆ is ●'s size");
+                assert_eq!(ink_box(&fork, w), outline, "{at}: ⎇ is ●'s size");
+                assert_eq!(ink_box(&enter, w), outline, "{at}: ⎆ is ●'s size");
                 let (x0, x1, y0, y1) = outline;
                 let own = if spill { cw } else { 0 };
                 assert!(
@@ -1119,6 +1171,25 @@ mod tests {
                     eye.iter().zip(&ring).all(|(&e, &o)| e >= o),
                     "{at}: ◉ is ○ and a dot"
                 );
+                let (top, floor) = (&fork[y0 * w..][x0..x1], &fork[(y1 - 1) * w..][x0..x1]);
+                assert!(
+                    top[0] == 0 && top[top.len() - 1] == 255,
+                    "{at}: ⎇'s head runs along the top to its right side alone {top:?}"
+                );
+                let apart = floor.iter().rposition(|&c| c == 0);
+                assert!(
+                    floor[0] == 255
+                        && floor[floor.len() - 1] == 255
+                        && apart.is_some_and(|k| floor[..k].contains(&255)),
+                    "{at}: ⎇'s two feet stand apart on the floor {floor:?}"
+                );
+                for (x, y) in [(x0, y0), (x1 - 1, y0), (x0, y1 - 1), (x1 - 1, y1 - 1)] {
+                    assert_eq!(enter[y * w + x], 0, "{at}: ⎆'s corner ({x}, {y}) is clear");
+                }
+                assert!(
+                    (y0..y1).any(|y| (x0..=cx).all(|x| enter[y * w + x] > 0)),
+                    "{at}: ⎆'s arrow runs from its left corner to its centre"
+                );
                 let corner = |x: usize, y: usize| house[y * w + x];
                 assert_eq!(corner(x0, y0), 0, "{at}: ⌂'s top left corner is clear");
                 assert_eq!(corner(x1 - 1, y0), 0, "{at}: ⌂'s top right corner is clear");
@@ -1128,6 +1199,7 @@ mod tests {
                 );
                 let ink = |b: &[u8]| b.iter().map(|&c| u32::from(c)).sum::<u32>();
                 assert!(ink(&dots) < ink(&ring), "{at}: ◌ has gaps");
+                assert!(ink(&enter) < ink(&filled), "{at}: ⎆'s diamond is hollow");
                 assert!(
                     dots.iter().zip(&ring).all(|(&d, &r)| d == 0 || r > 0),
                     "{at}: ◌'s dots lie on ○'s line"
@@ -1320,6 +1392,92 @@ mod tests {
         ("Menlo 8", [5.0, 9.0, 7.0, 6.0, 0.722, 0.0, 6.0]),
         ("Menlo 9", [5.0, 10.0, 8.0, 7.0, 0.808, 0.0, 6.0]),
     ];
+
+    /// At every measured 1x face, `⎇` keeps two feet, a pixel under half ink between them on
+    /// the floor's row (the separation its doc promises there), joined by its rise, and `⎆`
+    /// keeps a stroked arrowhead inside a hollow diamond. This is the tight case the procedural
+    /// marks exist for: a font's thin strokes read faint on Day. NEGATIVE CONTROLS: deleting the
+    /// Fork rise or the Enter head fails this test's interior-row or three-point-head assertion;
+    /// deleting Enter's nose fails the full-face ring-family test's connected-shaft assertion;
+    /// moving the second Fork foot one half-stroke left closes its floor gap (each run once,
+    /// restored).
+    #[test]
+    fn fork_and_enter_keep_their_shapes_on_every_small_face() {
+        for (name, [cw, ch, baseline, cap, stem, head, disc]) in
+            SMALLEST_FACES.into_iter().chain(SMALL_FACES)
+        {
+            let (cw, ch) = (cw as usize, ch as usize);
+            let metrics = IconMetrics {
+                baseline,
+                cap,
+                stem,
+                head,
+                disc,
+            };
+            for spill in [false, true] {
+                let w = band_icon_width(cw, spill);
+                let draw = |icon| band_icon_coverage(icon, cw, ch, metrics, spill);
+                let fork = draw(BandIcon::Fork);
+                let enter = draw(BandIcon::Enter);
+                let filled = draw(BandIcon::Diamond);
+                let (x0, x1, y0, y1) = ink_box(&fork, w);
+                let at = format!("{name} {cw}x{ch} spill {spill}");
+                let top = &fork[y0 * w + x0..y0 * w + x1];
+                let floor = &fork[(y1 - 1) * w + x0..(y1 - 1) * w + x1];
+                assert!(
+                    top[0] == 0 && top[top.len() - 1] > 0,
+                    "{at}: the Fork head alone reaches the top right {top:?}"
+                );
+                assert!(
+                    floor[0] > 0
+                        && floor[floor.len() - 1] > 0
+                        && (1..floor.len() - 1).any(|x| {
+                            floor[x] < 128
+                                && floor[..x].iter().any(|&c| c > 0)
+                                && floor[x + 1..].iter().any(|&c| c > 0)
+                        }),
+                    "{at}: the Fork feet keep a pixel under half ink between them {floor:?}"
+                );
+                for y in y0 + 1..y1 - 1 {
+                    assert!(
+                        (x0..x1).any(|x| fork[y * w + x] > 0),
+                        "{at}: the Fork rise crosses interior row {y}"
+                    );
+                }
+
+                let (ex0, ex1, ey0, ey1) = ink_box(&enter, w);
+                let (cx, cy) = ((ex0 + ex1) / 2, (ey0 + ey1) / 2);
+                assert!(
+                    cy > ey0 && cy + 1 < ey1,
+                    "{at}: the Enter box has an interior"
+                );
+                let tip = cx + 1..ex1 - 1;
+                assert!(
+                    enter[(cy - 1) * w + cx] > 0
+                        && enter[(cy + 1) * w + cx] > 0
+                        && (tip.is_empty() || tip.clone().any(|x| enter[cy * w + x] > 0)),
+                    "{at}: the Enter head has its upper and lower strokes, and a tip where room"
+                );
+                assert!(
+                    (ey0..ey1).any(|y| (ex0..=cx).all(|x| enter[y * w + x] > 0)),
+                    "{at}: the Enter shaft stays connected from its left corner through its centre"
+                );
+                for (x, y) in [
+                    (ex0, ey0),
+                    (ex1 - 1, ey0),
+                    (ex0, ey1 - 1),
+                    (ex1 - 1, ey1 - 1),
+                ] {
+                    assert_eq!(enter[y * w + x], 0, "{at}: Enter corner ({x}, {y})");
+                }
+                let ink = |buf: &[u8]| buf.iter().map(|&c| u32::from(c)).sum::<u32>();
+                assert!(
+                    ink(&enter) < ink(&filled),
+                    "{at}: the Enter diamond stays hollow"
+                );
+            }
+        }
+    }
 
     /// On the small faces `⏸` and `!` between blanks are `[3cap/4, cap + 1]` rows and `⤓` is the
     /// capitals' height (a row either way) standing on the baseline, spilled and in a cell of

@@ -1278,16 +1278,7 @@ pub fn promise_pass(layout: &crate::store::Layout, owner: u32, secs: u64) {
     let Ok(text) = aterm_json::to_string(&promise) else {
         return;
     };
-    let tmp = path.with_file_name(format!("pass-owed.json.tmp-{}", std::process::id()));
-    let Ok(mut file) = crate::platform::create_private_new(&tmp) else {
-        return;
-    };
-    use std::io::Write as _;
-    let wrote = file.write_all(text.as_bytes());
-    drop(file);
-    if wrote.is_err() || std::fs::rename(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    let _ = crate::metadata_io::write_private_atomic(&path, text.as_bytes());
 }
 
 /// Retire the promise: the pass it was for has planned, or ended.
@@ -2081,16 +2072,41 @@ mod writer_tests {
                 .is_file(),
             "a colliding FIFO must not replace the regular promise"
         );
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let refreshed = read_promise(&l).expect("a colliding FIFO cannot suppress refresh");
+        assert!(
+            refreshed.until_unix
+                > aterm_json::from_slice::<PassPromise>(&before)
+                    .unwrap()
+                    .until_unix
+        );
         assert!(
             pass_owed(&l, unix_now()),
-            "the original promise remains live"
+            "the refreshed promise remains live"
         );
         assert!(
             std::fs::symlink_metadata(&tmp)
                 .unwrap()
                 .file_type()
                 .is_fifo()
+        );
+    }
+
+    #[test]
+    fn an_occupied_staging_path_cannot_suppress_the_first_pass_promise() {
+        let l = layout("promise-occupied-first");
+        let path = l.pass_owed_file();
+        let occupied = path.with_file_name(format!("pass-owed.json.tmp-{}", std::process::id()));
+        std::fs::write(&occupied, b"a previous writer's staged bytes").unwrap();
+        let owner = std::process::id();
+
+        promise_pass(&l, owner, PASS_PROMISE_SECS);
+
+        let promise = read_promise(&l).expect("the current pass publishes its promise");
+        assert_eq!(promise.owner, owner);
+        assert!(pass_owed(&l, unix_now()));
+        assert_eq!(
+            std::fs::read(occupied).unwrap(),
+            b"a previous writer's staged bytes"
         );
     }
 
@@ -2112,15 +2128,12 @@ mod writer_tests {
         promise_pass(&l, std::process::id(), PASS_PROMISE_SECS);
 
         assert_eq!(std::fs::read(&victim).unwrap(), b"preserve this metadata");
-        assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
         assert!(tmp.exists(), "an unowned colliding entry is left untouched");
 
-        std::fs::remove_file(&tmp).unwrap();
-        promise_pass(&l, std::process::id(), PASS_PROMISE_SECS);
         let refreshed: PassPromise =
             aterm_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(

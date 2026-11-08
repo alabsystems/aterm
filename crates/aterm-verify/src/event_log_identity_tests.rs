@@ -15,6 +15,40 @@ fn row(pad: &str) -> String {
 }
 
 #[test]
+fn diagnostic_id_uses_the_existing_complete_attribution_validation() {
+    let events = EventLog::unrecorded();
+    let id = events
+        .id()
+        .expect("the real diagnostic writer acquired an invocation identity");
+    let wire = events.prepare(&row(""));
+    let event: aterm_json::Value =
+        aterm_json::from_str(wire.trim().strip_prefix("verify-event: ").unwrap()).unwrap();
+    assert_eq!(diagnostic_invocation_id(&event).as_deref(), Some(id));
+    for (field, value) in [
+        ("id", aterm_json::json!("invalid")),
+        ("identity_error", aterm_json::json!("unavailable")),
+        (
+            "source_observation",
+            aterm_json::json!({"invalid":"context"}),
+        ),
+    ] {
+        let mut unsupported = event.clone();
+        unsupported
+            .as_object_mut()
+            .unwrap()
+            .get_mut("invocation")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(field.into(), value);
+        assert!(diagnostic_invocation_id(&unsupported).is_none());
+    }
+    let mut absent = event;
+    absent.as_object_mut().unwrap().remove("invocation");
+    assert!(diagnostic_invocation_id(&absent).is_none());
+}
+
+#[test]
 fn optional_progress_batches_keep_individual_stamps_and_skip_busy_external_sink() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let external = dir.path().join("external");

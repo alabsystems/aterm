@@ -6415,7 +6415,29 @@ fn a_press_on_an_unfocused_panes_banner_focuses_the_pane() {
         "the focus click opens nothing"
     );
     frame(&mut app, wid);
+    app.refresh_glass_cursor_for_frame(wid);
+    assert!(
+        app.windows[&wid].hover_pointer,
+        "focused, the hand on the link without pointer motion"
+    );
     assert!(hand(&mut app), "focused, the hand on the link");
+    app.windows
+        .get_mut(&wid)
+        .unwrap()
+        .chrome_rows
+        .push(0..(words.0 + 1));
+    app.evict_stale_glass_hover(wid);
+    app.refresh_glass_cursor_for_frame(wid);
+    assert!(
+        !app.windows[&wid].hover_pointer,
+        "covered by a band, no hand on the link"
+    );
+    frame(&mut app, wid);
+    app.refresh_glass_cursor_for_frame(wid);
+    assert!(
+        app.windows[&wid].hover_pointer,
+        "uncovered again, the hand returns without pointer motion"
+    );
     click(&mut app, wid, words, ModifiersState::empty());
     assert!(
         pty(&mut reader, 0).is_empty(),

@@ -195,6 +195,33 @@ fn wait_for(pid: libc::pid_t) -> Option<libc::c_int> {
     }
 }
 
+/// Own raw-mode restoration and the exact shell through normal return or maintenance unwind.
+struct Passthrough {
+    master: Option<libc::c_int>,
+    shell: libc::pid_t,
+    original: Option<libc::termios>,
+    reaped: Option<Option<libc::c_int>>,
+}
+
+impl Passthrough {
+    fn settle(&mut self) -> Option<libc::c_int> {
+        if let Some(original) = self.original.take() {
+            restore(libc::STDIN_FILENO, &original);
+        }
+        if let Some(master) = self.master.take() {
+            // SAFETY: this owner closes the session's PTY master once, before its exact wait.
+            unsafe { libc::close(master) };
+        }
+        *self.reaped.get_or_insert_with(|| wait_for(self.shell))
+    }
+}
+
+impl Drop for Passthrough {
+    fn drop(&mut self) {
+        let _ = self.settle();
+    }
+}
+
 const fn exit_code(status: Option<libc::c_int>) -> i32 {
     match status {
         Some(status) if libc::WIFEXITED(status) => libc::WEXITSTATUS(status),
@@ -241,12 +268,22 @@ fn drain_master(master: libc::c_int, buf: &mut [u8], pass: &mut impl FnMut(&[u8]
 static BEFORE_POLL: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 
 /// Run the raw-mode passthrough `poll(2)` loop until the shell exits and return its exit code.
-pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
+pub(crate) fn run(
+    shell: aterm_pty::SpawnedShell,
+    verbose: bool,
+    mut maintenance: Option<crate::SessionMaintenance>,
+) -> i32 {
     let master = shell.master;
     let shell_pid = shell.pid;
 
     let stdin_is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
     let orig = stdin_is_tty.then(|| set_raw(libc::STDIN_FILENO)).flatten();
+    let mut session = Passthrough {
+        master: Some(master),
+        shell: shell_pid,
+        original: orig,
+        reaped: None,
+    };
     let wake_rd = wake_pipe();
     catch(libc::SIGWINCH, 0);
     catch(libc::SIGCHLD, libc::SA_NOCLDSTOP);
@@ -254,7 +291,7 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
         GOT_WINCH.store(true, Ordering::Release);
     }
     GOT_CHLD.store(true, Ordering::Release);
-    let wait_ms = if wake_rd.is_some() { -1 } else { 100 };
+    let idle_wait_ms = if wake_rd.is_some() { -1 } else { 100 };
 
     let mut bytes_in: u64 = 0;
     let mut spoke = false;
@@ -289,8 +326,6 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
         },
     ];
     let mut buf = [0u8; 8192];
-    let mut reaped: Option<Option<libc::c_int>> = None;
-
     loop {
         // Apply a pending resize before blocking.
         if GOT_WINCH.swap(false, Ordering::AcqRel) {
@@ -300,10 +335,13 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
         if GOT_CHLD.swap(false, Ordering::AcqRel)
             && let Some(status) = reap_if_exited(shell_pid)
         {
+            session.reaped = Some(status);
             drain_master(master, &mut buf, &mut pass);
-            reaped = Some(status);
             break;
         }
+
+        let deadline = maintenance.as_mut().and_then(|keep| keep());
+        let wait_ms = maintenance_wait(idle_wait_ms, deadline, std::time::Instant::now());
 
         fds[0].fd = if stdin_open && pending.len() < INPUT_BACKLOG_MAX {
             libc::STDIN_FILENO
@@ -362,16 +400,31 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
         }
     }
 
-    if let Some(t) = orig {
-        restore(libc::STDIN_FILENO, &t);
-    }
-    // SAFETY: closes the session's owned PTY master fd once after the loop.
-    unsafe { libc::close(master) };
-    let status = reaped.unwrap_or_else(|| wait_for(shell_pid));
+    let status = session.settle();
+    // `session_main` exits the process, so release the owned callback here, after settlement.
+    drop(maintenance);
     if verbose {
         eprintln!("\r\n[aterm] session ended — {bytes_in} bytes passed through.");
     }
     exit_code(status)
+}
+
+/// Bound only an owed maintenance deadline; a settled host retains its infinite wake-pipe poll.
+fn maintenance_wait(
+    idle: libc::c_int,
+    deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> libc::c_int {
+    let Some(deadline) = deadline else {
+        return idle;
+    };
+    let remaining = deadline.saturating_duration_since(now);
+    // Round positive fractions up, so sub-millisecond deadlines cannot busy-spin.
+    let millis = remaining
+        .as_millis()
+        .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0));
+    let due = libc::c_int::try_from(millis).unwrap_or(libc::c_int::MAX);
+    if idle < 0 { due } else { idle.min(due) }
 }
 
 #[cfg(test)]
@@ -388,12 +441,17 @@ mod tests {
                 "{}::run_returns_the_shells_status_not_an_older_zombie_childs",
                 module_path!().split_once("::").map_or("", |(_, rest)| rest)
             );
-            let out = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
+            let mut command =
+                aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"));
+            command
                 .args(["--exact", &name, "--nocapture", "--test-threads=1"])
                 .env(CHILD, "1")
-                .stdin(aterm_uds::spawnfd::Stdio::null())
-                .output()
-                .expect("re-exec the test binary");
+                .stdin(aterm_uds::spawnfd::Stdio::null());
+            let out = aterm_uds::deadline::output_within(
+                &mut command,
+                std::time::Duration::from_secs(60),
+            )
+            .expect("re-exec the test binary");
             let text = format!(
                 "{}{}",
                 String::from_utf8_lossy(&out.stdout),
@@ -443,24 +501,165 @@ mod tests {
         let command: [std::ffi::OsString; 3] = [
             "/bin/sh".into(),
             "-c".into(),
-            "trap '' HUP; exec 0<&- 1>&- 2>&-; sleep 0.3; exit 3".into(),
+            "trap '' HUP; exec 1>&- 2>&-; read -r release; exit 3".into(),
         ];
-        let shell = aterm_pty::spawn_shell_with_pid(
-            24,
-            80,
-            &spawn_cap,
-            &sandbox_cap,
-            &[],
-            None,
-            None,
-            None,
-            Some(&command),
-            None,
-            None,
-            aterm_sandbox::Limits::shell_default(),
-        )
-        .expect("protected shell spawn");
-        let code = run(shell, false);
+        let spawn = |command: &[std::ffi::OsString]| {
+            aterm_pty::spawn_shell_with_pid(
+                24,
+                80,
+                &spawn_cap,
+                &sandbox_cap,
+                &[],
+                None,
+                None,
+                None,
+                Some(command),
+                None,
+                None,
+                aterm_sandbox::Limits::shell_default(),
+            )
+            .expect("protected shell spawn")
+        };
+        let shell = spawn(&command);
+        // No shell output or exit can wake this session until its production maintenance
+        // deadline releases the quiet read. The signal pipe otherwise permits an infinite poll.
+        assert!(wake_pipe().is_some());
+        let now = std::time::Instant::now();
+        assert_eq!(maintenance_wait(-1, None, now), -1);
+        assert_eq!(maintenance_wait(-1, Some(now), now), 0);
+        assert_eq!(
+            maintenance_wait(-1, Some(now + std::time::Duration::from_nanos(1)), now),
+            1
+        );
+        assert_eq!(
+            maintenance_wait(100, Some(now + std::time::Duration::from_secs(1)), now),
+            100
+        );
+        let master = shell.master;
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct Released(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Released {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let owned = Released(std::sync::Arc::clone(&released));
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tried = std::sync::Arc::clone(&attempts);
+        let mut due = None;
+        let mut done = false;
+        let maintenance = Box::new(move || {
+            let _keep = &owned;
+            if done {
+                return None;
+            }
+            let now = std::time::Instant::now();
+            let Some(deadline) = due else {
+                tried.fetch_add(1, Ordering::SeqCst);
+                let deadline = now + std::time::Duration::from_millis(20);
+                due = Some(deadline);
+                return due;
+            };
+            if now < deadline {
+                return due;
+            }
+            tried.fetch_add(1, Ordering::SeqCst);
+            write_all(master, b"release\n");
+            done = true;
+            None
+        });
+        let code = run(shell, false, Some(maintenance));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(
+            released.load(Ordering::SeqCst),
+            "driver owns and releases maintenance before process exit"
+        );
+
+        // A panicking host callback still restores the terminal and settles only its shell.
+        let (host, slave) = aterm_pty::open_pty_pair().expect("private host terminal");
+        // SAFETY: keep this isolated test child's stdin and install its owned terminal.
+        let stdin = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+        assert!(stdin >= 0);
+        // SAFETY: `slave` is this fixture's live terminal descriptor.
+        assert_eq!(
+            unsafe { libc::dup2(slave, libc::STDIN_FILENO) },
+            libc::STDIN_FILENO
+        );
+        aterm_pty::close_fd(slave);
+        let attributes = || {
+            // SAFETY: `termios` is initialized by the successful read from our private terminal.
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut t) }, 0);
+            // Darwin's sys/termios.h classifies PENDIN as pending-input state; restoring
+            // canonical mode may set it. Compare every setting, without this kernel state bit.
+            #[cfg(target_os = "macos")]
+            {
+                t.c_lflag &= !libc::PENDIN;
+            }
+            (t.c_iflag, t.c_oflag, t.c_cflag, t.c_lflag, t.c_cc)
+        };
+        let original = attributes();
+        assert_ne!(
+            original.3 & libc::ICANON,
+            0,
+            "the private host starts canonical"
+        );
+        let shell = spawn(&[
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf READY; read -r release; exit 4".into(),
+        ]);
+        let mut ready = Vec::new();
+        while ready.len() < 5 {
+            let mut chunk = [0; 5];
+            let n = aterm_pty::read(shell.master, &mut chunk);
+            assert!(n > 0, "the owned shell ended before its quiet read");
+            ready.extend_from_slice(&chunk[..n as usize]);
+        }
+        assert_eq!(ready, b"READY", "the owned shell reached its quiet read");
+        let (master, pid) = (shell.master, shell.pid);
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let owned = Released(std::sync::Arc::clone(&released));
+        let raw = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let raw_seen = std::sync::Arc::clone(&raw);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run(
+                shell,
+                false,
+                Some(Box::new(move || {
+                    let _keep = &owned;
+                    raw_seen.store(attributes().3 & libc::ICANON == 0, Ordering::SeqCst);
+                    panic!("the owned maintenance unwound");
+                })),
+            )
+        }));
+        assert!(failed.is_err());
+        assert!(raw.load(Ordering::SeqCst), "the callback ran in raw mode");
+        assert_eq!(attributes(), original, "raw mode was restored on unwind");
+        assert!(released.load(Ordering::SeqCst));
+        // SAFETY: query only the descriptor and exact child owned by this driver invocation.
+        assert_eq!(unsafe { libc::fcntl(master, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        let mut status = 0;
+        // SAFETY: the queried pid is the protected shell this invocation owned.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        // SAFETY: restore the isolated fixture's saved stdin before closing its private terminal.
+        assert_eq!(
+            unsafe { libc::dup2(stdin, libc::STDIN_FILENO) },
+            libc::STDIN_FILENO
+        );
+        aterm_pty::close_fd(stdin);
+        aterm_pty::close_fd(host);
         let mut status = 0;
         unsafe { libc::waitpid(decoy_pid, &mut status, libc::WNOHANG) };
         assert_eq!(code, 3, "the session took another child's exit status");
@@ -530,7 +729,7 @@ mod tests {
             0,
             "nothing before the shell speaks"
         );
-        assert_eq!(run(shell, false), 0);
+        assert_eq!(run(shell, false, None), 0);
         assert_eq!(RAN.load(Ordering::SeqCst), 1, "once, however much it said");
     }
 
@@ -634,7 +833,7 @@ mod tests {
         )
         .expect("protected shell spawn");
         assert_eq!(
-            run(shell, false),
+            run(shell, false, None),
             5,
             "the session returns the program's status"
         );
@@ -730,7 +929,7 @@ mod tests {
             seen.extend_from_slice(&buf[..n as usize]);
         }
         aterm_pty::resize(host, 40, 120);
-        let code = run(shell, false);
+        let code = run(shell, false, None);
         // SAFETY: restores `harness_stdout`, a descriptor this test owns, onto `STDOUT_FILENO`.
         unsafe { libc::dup2(harness_stdout, libc::STDOUT_FILENO) };
         aterm_pty::close_fd(harness_stdout);
@@ -924,7 +1123,7 @@ mod tests {
                 .is_ok(),
             "the seam is this process's"
         );
-        let code = run(shell, false);
+        let code = run(shell, false, None);
         // SAFETY: restores `harness_stdout` onto `STDOUT_FILENO`.
         unsafe { libc::dup2(harness_stdout, libc::STDOUT_FILENO) };
         aterm_pty::close_fd(harness_stdout);
@@ -1024,7 +1223,7 @@ mod tests {
                 .is_ok(),
             "the seam is this process's"
         );
-        let code = run(shell, false);
+        let code = run(shell, false, None);
         let held_to_the_end = dir.join("held-to-the-end").exists();
         std::fs::write(dir.join("release"), "").expect("let the job go");
         wait_until("the job has not finished", || dir.join("done").exists());

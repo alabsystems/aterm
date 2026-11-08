@@ -64,34 +64,45 @@ fn persistent_manifest_cache_never_supplies_authority() {
                 .unwrap(),
         );
         let layout = fixture.layout.clone();
-        let cache = manifest_cache::Cache::new(&layout);
+        let source = fixture.cache_source.clone().unwrap();
+        let key = crate::signed_artifact_cache::SignedArtifactKey::package(
+            &source,
+            fixture.want.program(),
+            fixture.want.program(),
+            7,
+        );
+        let cache = crate::signed_artifact_cache::SignedArtifactCache::for_layout(&layout);
+        let document_cap = usize::try_from(crate::net::MANIFEST_CAP).unwrap();
+        let signature_cap = usize::try_from(crate::net::SIG_CAP).unwrap();
         match fault {
             "source" => fixture.cache_source = Some("fixture:two".into()),
-            "signature" => cache.store(
-                "fixture:one",
-                "gitleaks",
-                7,
-                &(fixture.package.as_bytes().to_vec(), vec![0; 64]),
-            ),
+            "signature" => cache
+                .store_verified(
+                    &key,
+                    fixture.package.as_bytes(),
+                    &[0; 64],
+                    document_cap,
+                    signature_cap,
+                )
+                .unwrap(),
             "identity" => {
                 fixture.change_package("program=\"gitleaks\"", "program=\"other\"");
-                cache.store(
-                    "fixture:one",
-                    "gitleaks",
-                    7,
-                    &(
-                        fixture.package.as_bytes().to_vec(),
-                        fixture.signature.clone(),
-                    ),
-                );
+                cache
+                    .store_verified(
+                        &key,
+                        fixture.package.as_bytes(),
+                        &fixture.signature,
+                        document_cap,
+                        signature_cap,
+                    )
+                    .unwrap();
             }
             "yank" => fixture.index.push_str("yanked=[\"gitleaks@7\"]\n"),
             "rotation" => fixture.index_seed = testkit::OUTSIDER_SEED,
-            "corrupt" => std::fs::write(
-                fixture.layout.prefix.join("prerequisite-manifests.toml"),
-                b"invalid",
-            )
-            .unwrap(),
+            "corrupt" => {
+                let object = cache.object_path_for_key(&key).unwrap();
+                std::fs::write(object, b"invalid").unwrap();
+            }
             _ => unreachable!(),
         }
         fixture.manifest_unavailable.set(true);
@@ -439,7 +450,9 @@ struct Fixture {
     package: String,
     signature: Vec<u8>,
     index_reads: Cell<usize>,
+    index_fails_after_first: Cell<bool>,
     manifest_reads: Cell<usize>,
+    manifest_fails_after_first: Cell<bool>,
     after_first: Option<(Vec<u8>, Vec<u8>)>,
     archive: Option<Vec<u8>>,
     downloads: Cell<usize>,
@@ -492,7 +505,9 @@ impl Fixture {
             package,
             signature,
             index_reads: Cell::new(0),
+            index_fails_after_first: Cell::new(false),
             manifest_reads: Cell::new(0),
+            manifest_fails_after_first: Cell::new(false),
             after_first: None,
             archive: None,
             downloads: Cell::new(0),
@@ -559,11 +574,20 @@ impl Fixture {
 
 impl Fetcher for Fixture {
     fn package_source_id(&self, _: &str, _: &str) -> Option<String> {
-        self.cache_source.clone()
+        self.cache_source.clone().or_else(|| {
+            Some(format!(
+                "fixture:{}/{}",
+                self.want.program(),
+                self.want.program()
+            ))
+        })
     }
 
     fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
         self.index_reads.set(self.index_reads.get() + 1);
+        if self.index_reads.get() > 1 && self.index_fails_after_first.get() {
+            return Err("curl: (56) channel freshness transport failed".to_string());
+        }
         let mut roster = testkit::roster();
         roster.machines[0].pubkey = testkit::pubkey_b64(&self.index_seed);
         let roster_bytes = roster.to_toml().unwrap().into_bytes();
@@ -588,6 +612,9 @@ impl Fetcher for Fixture {
             (self.want.program(), self.want.program(), 7)
         );
         self.manifest_reads.set(self.manifest_reads.get() + 1);
+        if self.manifest_reads.get() > 1 && self.manifest_fails_after_first.get() {
+            return Err("curl: (56) exact package download blocked".to_string());
+        }
         if self.manifest_unavailable.get() {
             return Err("fixture offline".into());
         }
@@ -599,6 +626,10 @@ impl Fetcher for Fixture {
         Ok((self.package.as_bytes().to_vec(), self.signature.clone()))
     }
 
+    fn index_error_is_transport(&self, error: &str) -> bool {
+        error.contains("freshness transport failed")
+    }
+
     fn download(&self, _: &str, asset: &str, to: &Path) -> Result<(), String> {
         assert_eq!(asset, "fixture.tar.zst");
         self.downloads.set(self.downloads.get() + 1);
@@ -608,6 +639,189 @@ impl Fetcher for Fixture {
             .expect("a prerequisite lookup never downloads a payload");
         std::fs::write(to, archive).map_err(|e| e.to_string())
     }
+}
+
+/// NEGATIVE CONTROL: an index cache can authenticate old bytes, but it cannot answer whether
+/// the channel moved. A publication prerequisite must surface the failed freshness transport so
+/// its caller reports COULD NOT RUN instead of silently treating the cached head as current.
+#[test]
+fn a_cached_index_does_not_turn_a_failed_freshness_read_into_prerequisite_authority() {
+    let fixture = Fixture::new(Prerequisite::Gitleaks);
+    let first = fixture.session(TRIPLE);
+    assert!(
+        first.is_ok(),
+        "the live read seeds the ordinary index fallback"
+    );
+    drop(first);
+
+    fixture.index_fails_after_first.set(true);
+    let error = match fixture.session(TRIPLE) {
+        Ok(_) => panic!("cached channel bytes cannot answer a live freshness question"),
+        Err(error) => error,
+    };
+    match error {
+        crate::FlowError::Unreachable(why) => {
+            assert!(why.contains("channel freshness transport failed"), "{why}");
+            let admitted = super::admission_error(crate::FlowError::Unreachable(why));
+            assert_eq!(
+                super::freshness_transport(&admitted),
+                Some("curl: (56) channel freshness transport failed"),
+                "the real session error retains its transport class through admission"
+            );
+        }
+        other => panic!("freshness transport was misclassified as {other:?}"),
+    }
+    assert_eq!(
+        fixture.index_reads.get(),
+        2,
+        "the second run still asks the source"
+    );
+}
+
+#[test]
+fn a_second_run_reads_a_verified_package_copy_but_still_reads_freshness() {
+    let fixture = Fixture::new(Prerequisite::Gitleaks);
+    let first = fixture
+        .session(TRIPLE)
+        .unwrap()
+        .acquire(Prerequisite::Gitleaks)
+        .unwrap();
+    drop(first);
+    assert_eq!(
+        (fixture.index_reads.get(), fixture.manifest_reads.get()),
+        (1, 1)
+    );
+
+    fixture.manifest_fails_after_first.set(true);
+    let second = fixture
+        .session(TRIPLE)
+        .unwrap()
+        .acquire(Prerequisite::Gitleaks)
+        .unwrap();
+    second.validate().unwrap();
+    assert_eq!(
+        fixture.index_reads.get(),
+        2,
+        "the cache does not answer whether the channel head moved"
+    );
+    assert_eq!(
+        fixture.manifest_reads.get(),
+        1,
+        "the second exact signed package read is wholly local"
+    );
+}
+
+#[test]
+fn corrupt_cached_package_bytes_fall_back_to_transport_and_cannot_authorize_a_mismatch() {
+    let mut fixture = Fixture::new(Prerequisite::Gitleaks);
+    let first = fixture
+        .session(TRIPLE)
+        .unwrap()
+        .acquire(Prerequisite::Gitleaks)
+        .unwrap();
+    drop(first);
+
+    let source =
+        Fetcher::package_source_id(&fixture, fixture.want.program(), fixture.want.program())
+            .unwrap();
+    let key = crate::signed_artifact_cache::SignedArtifactKey::package(
+        &source,
+        fixture.want.program(),
+        fixture.want.program(),
+        7,
+    );
+    let cache = crate::signed_artifact_cache::SignedArtifactCache::for_layout(&fixture.layout);
+    let object = cache
+        .object_path_for_key(&key)
+        .expect("the first admission caches its verified signed pair");
+    let mut changed = std::fs::read(&object).unwrap();
+    *changed.last_mut().unwrap() ^= 1;
+    std::fs::write(&object, changed).unwrap();
+
+    let wrong = fixture
+        .package
+        .replace("program=\"gitleaks\"", "program=\"foreign\"");
+    assert_ne!(wrong, fixture.package, "nonvacuous network mismatch");
+    fixture.after_first = Some((
+        wrong.as_bytes().to_vec(),
+        testkit::sign(&testkit::MACHINE_SEED, wrong.as_bytes()),
+    ));
+    let error = match fixture
+        .session(TRIPLE)
+        .unwrap()
+        .acquire(Prerequisite::Gitleaks)
+    {
+        Ok(_) => panic!("the signed network mismatch cannot authorize gitleaks"),
+        Err(error) => error,
+    };
+    assert!(error.contains("identity differs"), "{error}");
+    assert_eq!(
+        (fixture.index_reads.get(), fixture.manifest_reads.get()),
+        (2, 2),
+        "freshness and the network fallback both ran; corrupt local bytes authorized nothing"
+    );
+}
+
+#[test]
+fn content_addressed_but_wrong_cached_identity_is_reverified_before_network_fallback() {
+    let mut fixture = Fixture::new(Prerequisite::Gitleaks);
+    let first = fixture
+        .session(TRIPLE)
+        .unwrap()
+        .acquire(Prerequisite::Gitleaks)
+        .unwrap();
+    drop(first);
+
+    let source =
+        Fetcher::package_source_id(&fixture, fixture.want.program(), fixture.want.program())
+            .unwrap();
+    let key = crate::signed_artifact_cache::SignedArtifactKey::package(
+        &source,
+        fixture.want.program(),
+        fixture.want.program(),
+        7,
+    );
+    let cache = crate::signed_artifact_cache::SignedArtifactCache::for_layout(&fixture.layout);
+    let cached_wrong = fixture
+        .package
+        .replace("program=\"gitleaks\"", "program=\"cache-poison\"");
+    assert_ne!(cached_wrong, fixture.package, "nonvacuous cached mismatch");
+    let cached_wrong_sig = testkit::sign(&testkit::MACHINE_SEED, cached_wrong.as_bytes());
+    // Deliberately violate store_verified's caller precondition to prove that content addressing
+    // alone grants no authority: Session must rerun signature and semantic admission on the hit.
+    cache
+        .store_verified(
+            &key,
+            cached_wrong.as_bytes(),
+            &cached_wrong_sig,
+            usize::try_from(crate::net::MANIFEST_CAP).unwrap(),
+            usize::try_from(crate::net::SIG_CAP).unwrap(),
+        )
+        .unwrap();
+
+    let network_wrong = fixture.package.replace("build_number=7", "build_number=8");
+    assert_ne!(
+        network_wrong, fixture.package,
+        "nonvacuous network mismatch"
+    );
+    fixture.after_first = Some((
+        network_wrong.as_bytes().to_vec(),
+        testkit::sign(&testkit::MACHINE_SEED, network_wrong.as_bytes()),
+    ));
+    let error = match fixture
+        .session(TRIPLE)
+        .unwrap()
+        .acquire(Prerequisite::Gitleaks)
+    {
+        Ok(_) => panic!("neither wrong signed identity can authorize gitleaks"),
+        Err(error) => error,
+    };
+    assert!(error.contains("identity differs"), "{error}");
+    assert_eq!(
+        fixture.manifest_reads.get(),
+        2,
+        "the hash-valid cache poison was rejected before the network mismatch"
+    );
 }
 
 #[test]

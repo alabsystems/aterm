@@ -99,6 +99,10 @@ impl std::fmt::Display for VendorFetchError {
 /// The network operations the install flow needs, abstracted so the orchestration is testable.
 pub trait Fetcher {
     fn index_candidates(&self) -> Result<Vec<Candidate>, String>;
+    /// Retain one exact candidate only after the signature, parser, roster, floor and
+    /// succession gates admitted it. Network fetchers use this to answer a later HEAD-selected
+    /// immutable release from their content-addressed cache.
+    fn cache_verified_index(&self, _index_build: u64, _candidate: &Candidate) {}
     fn pkg_manifest(
         &self,
         repo: &str,
@@ -185,10 +189,19 @@ pub trait Fetcher {
     fn source_id(&self) -> String {
         "fetcher:unspecified".to_string()
     }
-    /// Stable identity of the actual package repository, including overrides.
-    /// Unidentified fetchers do not participate in persistent manifest reuse.
+    /// Stable identity of the actual signed package repository, including overrides.
+    ///
+    /// This is deliberately opt-in: a test, directory or custom fetcher that does not provide
+    /// a globally stable source identity must never share exact signed bytes with another
+    /// fetcher merely because their program and build numbers coincide.
     fn package_source_id(&self, _repo: &str, _program: &str) -> Option<String> {
         None
+    }
+    /// Whether the most recent [`Self::index_candidates`] error was a failed transport read.
+    /// Source verdicts (an empty channel, an invalid URL, or an exhausted discovery bound) are
+    /// false; production fetchers retain the typed transport class at their network boundary.
+    fn index_error_is_transport(&self, _error: &str) -> bool {
+        false
     }
     fn index_link_down(&self) -> bool {
         false
@@ -533,7 +546,7 @@ fn verified_package(
     build: u64,
 ) -> Result<crate::manifest::PkgManifest, FlowError> {
     let verified = index
-        .verify_pkg(raw, &sig)
+        .verify_pkg(raw.clone(), &sig)
         .map_err(|_| FlowError::PkgVerify)?;
     let pkg = parse_pkg(&verified).map_err(pkg_parse_error)?;
     if !pkg.is_for(program) || pkg.build_number != build {
@@ -1406,7 +1419,7 @@ pub fn signed_pkg(
         FlowError::PkgFetch(e)
     })?;
     let verified = index
-        .verify_pkg(raw, &sig)
+        .verify_pkg(raw.clone(), &sig)
         .map_err(|_| FlowError::PkgVerify)?;
     let pkg = parse_pkg(&verified).map_err(pkg_parse_error)?;
     if !pkg.is_for(program) || pkg.build_number != build {
@@ -3075,8 +3088,15 @@ pub fn resolve_verified_index(
     let live = last_resolve().is_some_and(|r| r.reached);
     let index = if served {
         let _ = layout.ensure_dir(&layout.prefix);
-        let selected =
-            verify_select_fresh_from(layout, anchor, candidates.clone(), floor, now_unix, live);
+        let selected = verify_select_fresh_from(
+            fetcher,
+            layout,
+            anchor,
+            candidates.clone(),
+            floor,
+            now_unix,
+            live,
+        );
         if matches!(selected, Err(FlowError::NoIndex))
             && let Some(cached) = cache.load(&src)
         {
@@ -3084,10 +3104,12 @@ pub fn resolve_verified_index(
                 false,
                 Some(format!("the source served {}", FlowError::NoIndex)),
                 true,
+                false,
             );
             let served_n = candidates.len();
             let both = candidates.iter().chain(&cached).cloned().collect();
-            let (verdict, won) = verify_select_at(layout, anchor, both, floor, now_unix, false);
+            let (verdict, won) =
+                verify_select_at(fetcher, layout, anchor, both, floor, now_unix, false);
             if let Some(won) = won {
                 let mut kept = candidates;
                 kept.extend(
@@ -3098,12 +3120,12 @@ pub fn resolve_verified_index(
                 cache.store(&src, &kept);
                 return verdict;
             }
-            note_resolve(true, None, true);
+            note_resolve(true, None, true, false);
         }
         cache.store(&src, &candidates);
         selected?
     } else {
-        verify_select_fresh_from(layout, anchor, candidates, floor, now_unix, live)?
+        verify_select_fresh_from(fetcher, layout, anchor, candidates, floor, now_unix, live)?
     };
     if live {
         LIVE_VERIFICATIONS.with(|n| n.set(n.get().saturating_add(1)));
@@ -3119,10 +3141,11 @@ fn verify_select_fresh(
     now_unix: i64,
 ) -> Result<TrustedIndex, FlowError> {
     let candidates = fetcher.index_candidates().map_err(FlowError::Unreachable)?;
-    verify_select_fresh_from(layout, anchor, candidates, floor, now_unix, true)
+    verify_select_fresh_from(fetcher, layout, anchor, candidates, floor, now_unix, true)
 }
 
 fn verify_select_fresh_from(
+    fetcher: &dyn Fetcher,
     layout: &Layout,
     anchor: &Anchor,
     candidates: Vec<Candidate>,
@@ -3130,10 +3153,11 @@ fn verify_select_fresh_from(
     now_unix: i64,
     live: bool,
 ) -> Result<TrustedIndex, FlowError> {
-    verify_select_at(layout, anchor, candidates, floor, now_unix, live).0
+    verify_select_at(fetcher, layout, anchor, candidates, floor, now_unix, live).0
 }
 
 fn verify_select_at(
+    fetcher: &dyn Fetcher,
     layout: &Layout,
     anchor: &Anchor,
     candidates: Vec<Candidate>,
@@ -3143,6 +3167,7 @@ fn verify_select_at(
 ) -> (Result<TrustedIndex, FlowError>, Option<usize>) {
     let record = crate::succession::Record::read(layout);
     let trusted = crate::succession::Record::sources_of(record.as_ref());
+    let candidate_bytes = candidates.clone();
     let pass = select_index(anchor, candidates, floor, trusted, now_unix);
     observe_roster_generation(layout, pass.observed_roster_seq);
     let Some(selected) = pass.selected else {
@@ -3167,6 +3192,9 @@ fn verify_select_at(
         if let Err(e) = written {
             eprintln!("atpkg: the vendor yank latch was not written ({e})");
         }
+    }
+    if let Some(candidate) = candidate_bytes.get(won) {
+        fetcher.cache_verified_index(index.index_build, candidate);
     }
     (Ok(index), Some(won))
 }
@@ -3220,21 +3248,32 @@ fn resolve_candidates(
 ) -> Result<(Vec<Candidate>, bool), FlowError> {
     match fetcher.index_candidates() {
         Ok(c) if !c.is_empty() => {
-            note_resolve(true, None, true);
+            note_resolve(true, None, true, false);
             Ok((c, true))
         }
         Ok(_) => match cache.load(src) {
             Some(cached) => {
-                note_resolve(false, Some("the source listed no index".into()), true);
+                note_resolve(
+                    false,
+                    Some("the source listed no index".into()),
+                    true,
+                    false,
+                );
                 Ok((cached, false))
             }
             None => {
-                note_resolve(true, None, true);
+                note_resolve(true, None, true, false);
                 Err(FlowError::NoIndex)
             }
         },
         Err(why) => {
-            note_resolve(false, Some(why.clone()), !fetcher.index_link_down());
+            let transport_failed = fetcher.index_error_is_transport(&why);
+            note_resolve(
+                false,
+                Some(why.clone()),
+                !fetcher.index_link_down(),
+                transport_failed,
+            );
             cache
                 .load(src)
                 .map(|c| (c, false))
@@ -3252,6 +3291,10 @@ pub struct ResolveProvenance {
     pub why: Option<String>,
     /// Whether a host answered at all (the source, or a refusal with a status).
     pub answered: bool,
+    /// Whether the live source read failed in its transport, rather than serving an empty or
+    /// unusable channel answer. An HTTP failure is a transport failure even when its host
+    /// answered, so this is deliberately independent of [`Self::answered`].
+    pub transport_failed: bool,
 }
 
 thread_local! {
@@ -3259,12 +3302,13 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-fn note_resolve(reached: bool, why: Option<String>, answered: bool) {
+fn note_resolve(reached: bool, why: Option<String>, answered: bool, transport_failed: bool) {
     LAST_RESOLVE.with(|slot| {
         *slot.borrow_mut() = Some(ResolveProvenance {
             reached,
             why,
             answered: reached || answered,
+            transport_failed,
         });
     });
 }
@@ -3650,8 +3694,11 @@ fn verified_pkg_or_miss(
     let (raw, sig) = fetcher
         .pkg_manifest(&repo, program, pinned)
         .map_err(|_| false)?;
-    let verified = index.verify_pkg(raw, &sig).map_err(|_| true)?;
+    let verified = index.verify_pkg(raw.clone(), &sig).map_err(|_| true)?;
     let pkg = parse_pkg(&verified).map_err(|_| true)?;
+    if !pkg.is_for(program) || pkg.build_number != pinned {
+        return Err(true);
+    }
     Ok((pinned, repo, pkg))
 }
 
@@ -3663,9 +3710,12 @@ fn signed_pkg_of_build(
     build: u64,
 ) -> Option<crate::manifest::PkgManifest> {
     let (raw, sig) = fetcher.pkg_manifest(repo, program, build).ok()?;
-    let verified = index.verify_pkg(raw, &sig).ok()?;
+    let verified = index.verify_pkg(raw.clone(), &sig).ok()?;
     let pkg = parse_pkg(&verified).ok()?;
-    (pkg.is_for(program) && pkg.build_number == build).then_some(pkg)
+    if !pkg.is_for(program) || pkg.build_number != build {
+        return None;
+    }
+    Some(pkg)
 }
 
 fn signed_root_for(pkg: &crate::manifest::PkgManifest, triple: &str) -> Option<String> {

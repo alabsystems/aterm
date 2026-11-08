@@ -1733,3 +1733,177 @@ fn book_facts_read_back_what_the_book_saved() {
     let later = book_facts(&spool, now + 8 * 86_400);
     assert_eq!(later.accounts.get(&ann).map(|f| f.sessions_7d), Some(0));
 }
+
+/// A reading of a real Commons lock another holder keeps: `read` runs as an admission that started
+/// `age` ago, and the holder lets go the first time the admission waits on that very inode. The
+/// count of those waits comes back with what `read` returned, so a test tells an admission that
+/// waited from one that gave up before waiting, with no sleep.
+#[cfg(unix)]
+fn against_held_custody<R>(
+    age: std::time::Duration,
+    read: impl FnOnce(&Paths, std::time::Instant) -> R,
+) -> (R, usize) {
+    use std::{cell::Cell, os::unix::fs::MetadataExt as _, rc::Rc};
+    let lab = Lab::new(&[Role::Writer]);
+    lab.bootstrap(0);
+    let paths = &lab.paths[0];
+    let holder = aterm_uds::private_file::PrivateLock::take_with(
+        &paths.dir,
+        "commons.lock",
+        std::time::Duration::ZERO,
+        "private custody held",
+        || {},
+    )
+    .unwrap();
+    let named = std::fs::metadata(paths.dir.join("commons.lock")).unwrap();
+    let identity = (named.dev(), named.ino());
+    let waits = Rc::new(Cell::new(0));
+    let observed = waits.clone();
+    let mut holder = Some(holder);
+    let read = aterm_uds::file_lock::with_lock_wait_observer(
+        move |file| {
+            let actual = file.metadata().unwrap();
+            assert_eq!((actual.dev(), actual.ino()), identity);
+            observed.set(observed.get() + 1);
+            drop(holder.take());
+        },
+        || read(paths, std::time::Instant::now() - age),
+    );
+    (read, waits.get())
+}
+
+/// Older than any latency budget, inside the hang detector: the admission waits for the holder.
+#[cfg(unix)]
+const WITHIN_THE_MINUTE: std::time::Duration = std::time::Duration::from_secs(3);
+/// Past the hang detector: the admission gives up without waiting at all.
+#[cfg(unix)]
+const PAST_THE_MINUTE: std::time::Duration = std::time::Duration::from_secs(61);
+
+#[cfg(unix)]
+#[test]
+fn a_due_flush_waits_out_held_custody_until_the_hang_detector() {
+    let flush = |age| {
+        against_held_custody(age, |paths, started| {
+            let scratch = aterm_tempfile::tempdir().unwrap();
+            let spool = Spool::at(scratch.path().join("alab"));
+            let now = W * WEEK + 600;
+            flush::pass_started(
+                paths,
+                &spool,
+                &Presence::default,
+                &|| None,
+                false,
+                now,
+                started,
+            )
+        })
+    };
+    let (written, waits) = flush(WITHIN_THE_MINUTE);
+    assert!(matches!(written, Ok(Flushed::Wrote { .. })), "{written:?}");
+    assert_eq!(waits, 1, "the write came after the wait on the holder");
+    let (refused, waits) = flush(PAST_THE_MINUTE);
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(waits, 0, "the detector ended the admission");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_place_read_waits_out_held_custody_until_the_hang_detector() {
+    let read = |age| {
+        against_held_custody(age, |paths, started| {
+            place::read_started(paths, W * WEEK + 600, started)
+        })
+    };
+    let (read_held, waits) = read(WITHIN_THE_MINUTE);
+    assert!(read_held.unwrap().is_some(), "held custody is no absence");
+    assert_eq!(waits, 1, "the read came after the wait on the holder");
+    let (given_up, waits) = read(PAST_THE_MINUTE);
+    assert!(given_up.unwrap().is_none());
+    assert_eq!(waits, 0, "the detector ended the admission");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_seen_read_waits_out_held_custody_until_the_hang_detector() {
+    let read = |age| {
+        against_held_custody(age, |paths, started| {
+            seen::read_started(paths, None, W * WEEK + 600, started, || None)
+        })
+    };
+    let (read_held, waits) = read(WITHIN_THE_MINUTE);
+    assert!(read_held.unwrap().is_some(), "held custody is no absence");
+    assert_eq!(waits, 1, "the read came after the wait on the holder");
+    let (given_up, waits) = read(PAST_THE_MINUTE);
+    assert!(given_up.unwrap().is_none());
+    assert_eq!(waits, 0, "the detector ended the admission");
+}
+
+/// A flush asks for this Mac's holdings, whose first look at the lab takes `commons.lock`, while
+/// the journal writer is free: an admission holds that lock while it waits for this writer.
+#[cfg(unix)]
+#[test]
+fn a_due_flush_asks_for_holdings_before_it_takes_the_journal_writer() {
+    use aterm_secrets::commons::journal::Journal;
+    let lab = Lab::new(&[Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let spool = Spool::at(scratch.path().join("alab"));
+    let asked = std::cell::Cell::new(false);
+    let holdings = || {
+        asked.set(true);
+        let writer = Journal::open_existing_until(
+            bootstrap.journal_dir(),
+            bootstrap.trust(),
+            std::time::Instant::now(),
+        );
+        assert!(
+            writer.is_ok(),
+            "the pass held the writer: {:?}",
+            writer.err()
+        );
+        None
+    };
+    let flushed = flush::pass_with(
+        &lab.paths[0],
+        &spool,
+        &Presence::default,
+        &holdings,
+        false,
+        W * WEEK + 600,
+    );
+    assert!(matches!(flushed, Ok(Flushed::Wrote { .. })), "{flushed:?}");
+    assert!(asked.get(), "a due pass asks for holdings");
+}
+
+/// A seen read asks for the claims ring, which takes `commons.lock`, only once the journal writer
+/// is free: an admission holds that lock while it waits for this writer.
+#[cfg(unix)]
+#[test]
+fn a_seen_read_lets_go_of_the_journal_writer_before_it_reads_the_claims() {
+    use aterm_secrets::commons::journal::Journal;
+    let lab = Lab::new(&[Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let asked = std::cell::Cell::new(false);
+    let read = seen::read_started(
+        &lab.paths[0],
+        None,
+        W * WEEK + 600,
+        std::time::Instant::now(),
+        || {
+            asked.set(true);
+            let writer = Journal::open_existing_until(
+                bootstrap.journal_dir(),
+                bootstrap.trust(),
+                std::time::Instant::now(),
+            );
+            assert!(
+                writer.is_ok(),
+                "the read kept the writer: {:?}",
+                writer.err()
+            );
+            None
+        },
+    );
+    assert!(read.unwrap().is_some());
+    assert!(asked.get(), "the claims ring was read");
+}

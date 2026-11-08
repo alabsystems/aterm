@@ -3,7 +3,7 @@
 
 //! The guard on a real terminal, a pty pair from aterm-pty.
 
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::process::ExitStatusExt as _;
 use std::sync::{MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -234,6 +234,183 @@ fn signal_self(signal: libc::c_int) {
 fn wait(tty: &mut DevTty, buf: &mut [u8]) -> Readiness {
     tty.read(buf, Some(Instant::now() + MUST_HAPPEN))
         .expect("a wait")
+}
+
+fn tty_ready(fd: &OwnedFd) {
+    aterm_uds::ready::until(
+        fd.as_fd(),
+        aterm_uds::ready::Interest::Read,
+        Instant::now() + MUST_HAPPEN,
+    )
+    .expect("the actual terminal is ready without consuming its bytes");
+}
+
+#[test]
+fn ready_frames_survive_a_scheduled_read() {
+    use aterm_types::keyboard::{Key, Modifiers, NamedKey};
+
+    let _alone = alone();
+    for (head, tail, expected) in [
+        (
+            b"\x1b[200~head ".as_slice(),
+            b"tail\x1b[201~".as_slice(),
+            Event::Paste("head tail".to_owned()),
+        ),
+        (
+            b"\x1b[1;5".as_slice(),
+            b"A".as_slice(),
+            Event::Key {
+                key: Key::Named(NamedKey::ArrowUp),
+                mods: Modifiers::CTRL,
+                text: None,
+            },
+        ),
+        (
+            b"\xe6\x97".as_slice(),
+            b"\xa5".as_slice(),
+            Event::Key {
+                key: Key::Character('日'),
+                mods: Modifiers::empty(),
+                text: Some('日'),
+            },
+        ),
+    ] {
+        let (master, slave) = pty();
+        let mut tty = DevTty::from_fd(slave.try_clone().unwrap()).expect("raw");
+        let mut decoder = Decoder::new();
+        assert!(
+            decoder
+                .feed(head, Instant::now() - Duration::from_secs(61))
+                .is_empty()
+        );
+        type_in(&master, tail);
+        tty_ready(&slave);
+        let hang = Instant::now() + MUST_HAPPEN;
+        let mut buf = [0u8; 64];
+        let events = loop {
+            assert!(Instant::now() < hang, "the queued frame finishes");
+            let events = match tty.read(&mut buf, decoder.deadline()).unwrap() {
+                Readiness::Bytes(n) => decoder.feed(&buf[..n], tty.now()),
+                Readiness::Timeout => decoder.flush(tty.now()),
+                other => panic!("queued input, not {other:?}"),
+            };
+            if !events.is_empty() {
+                break events;
+            }
+        };
+        assert_eq!(events, [expected]);
+    }
+}
+
+#[test]
+fn a_scheduled_producer_finishes_unambiguous_frames() {
+    use crate::decode::MouseKind;
+    use aterm_types::keyboard::{Key, Modifiers};
+    use aterm_types::mouse::MouseButton;
+
+    let _alone = alone();
+    for (head, tail, expected) in [
+        (
+            b"\x1b[200~head ".as_slice(),
+            b"tail\x1b[201~".as_slice(),
+            Event::Paste("head tail".to_owned()),
+        ),
+        (
+            b"\xe6\x97".as_slice(),
+            b"\xa5".as_slice(),
+            Event::Key {
+                key: Key::Character('日'),
+                mods: Modifiers::empty(),
+                text: Some('日'),
+            },
+        ),
+        (
+            b"\x1b[M".as_slice(),
+            b" !!".as_slice(),
+            Event::Mouse {
+                kind: MouseKind::Press,
+                button: Some(MouseButton::Left),
+                col: 0,
+                row: 0,
+                mods: Modifiers::empty(),
+            },
+        ),
+    ] {
+        let (master, slave) = pty();
+        let mut tty = DevTty::from_fd(slave.try_clone().unwrap()).expect("raw");
+        let mut decoder = Decoder::new();
+        type_in(&master, head);
+        let mut read = 0;
+        let mut buf = [0u8; 64];
+        while read < head.len() {
+            let Readiness::Bytes(n) = wait(&mut tty, &mut buf) else {
+                panic!("the native frame prefix is readable");
+            };
+            read += n;
+            assert!(
+                decoder
+                    .feed(&buf[..n], tty.now() - Duration::from_secs(3))
+                    .is_empty()
+            );
+        }
+        assert!(
+            decoder.flush(tty.now()).is_empty(),
+            "an unambiguous frame is still pending"
+        );
+        type_in(&master, tail);
+        tty_ready(&slave);
+        let hang = Instant::now() + MUST_HAPPEN;
+        let events = loop {
+            assert!(Instant::now() < hang, "the actual producer finishes");
+            let events = match tty.read(&mut buf, decoder.deadline()).unwrap() {
+                Readiness::Bytes(n) => decoder.feed(&buf[..n], tty.now()),
+                Readiness::Timeout => decoder.flush(tty.now()),
+                other => panic!("producer input, not {other:?}"),
+            };
+            if !events.is_empty() {
+                break events;
+            }
+        };
+        assert_eq!(events, [expected]);
+    }
+}
+
+#[test]
+fn expired_reads_keep_native_readiness_and_signal_priority() {
+    let _alone = alone();
+    let (master, slave) = pty();
+    let mut tty = DevTty::from_fd(slave.try_clone().unwrap()).expect("raw");
+    let expired = Instant::now() - Duration::from_secs(61);
+    let mut buf = [0u8; 64];
+    assert_eq!(
+        tty.read(&mut buf, Some(expired)).unwrap(),
+        Readiness::Timeout
+    );
+    signal_self(libc::SIGWINCH);
+    assert_eq!(wait(&mut tty, &mut buf), Readiness::Signal);
+    type_in(&master, b"k");
+    tty_ready(&slave);
+    assert_eq!(tty.read(&mut [], Some(expired)).unwrap(), Readiness::Signal);
+    assert!(tty.take_signals().unwrap().contains(Signals::WINCH));
+    assert_eq!(
+        tty.read(&mut [], Some(expired)).unwrap(),
+        Readiness::Bytes(0)
+    );
+    assert_eq!(
+        tty.read(&mut buf, Some(expired)).unwrap(),
+        Readiness::Bytes(1)
+    );
+    assert_eq!(&buf[..1], b"k");
+    assert_eq!(
+        tty.read(&mut buf, Some(expired)).unwrap(),
+        Readiness::Timeout
+    );
+    drop(master);
+    tty_ready(&slave);
+    assert_eq!(
+        tty.read(&mut buf, Some(expired)).unwrap(),
+        Readiness::Closed
+    );
 }
 
 #[test]

@@ -356,7 +356,9 @@ fn check_capacity(required: usize) -> Result<()> {
     Ok(())
 }
 
-fn pin_path(entry: &Path) -> Result<PathBuf> {
+/// The readiness pin beside `entry` (`records.layout`): where it stands, the data file is the one
+/// inside the entry ([`data_path`]).
+pub(crate) fn pin_path(entry: &Path) -> Result<PathBuf> {
     side_path(entry, "layout")
 }
 

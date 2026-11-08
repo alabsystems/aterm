@@ -3612,6 +3612,9 @@ pub(crate) struct SessionTimeline {
     #[cfg(any(unix, test))]
     handoff_ceiling: Option<u64>,
     task: Option<crate::task_record::TaskRecord>,
+    /// An exit read before the agent publication cleared. A new task mark supersedes it;
+    /// otherwise it takes effect only once a publication sees no agent in the tab.
+    pending_task_exit: Option<crate::task_record::TaskMark>,
     worker_launch: Option<(std::time::Instant, String)>,
     /// The worker's launcher is installing its program or preparing its Google sign-in now
     /// (`task_launch::InstallingMark`).
@@ -4737,6 +4740,23 @@ impl SessionTimeline {
         now: std::time::Instant,
         now_unix_ms: u64,
     ) -> (crate::task_record::TaskRecord, bool) {
+        // An exit belongs to the process that left, not a replacement already in this tab.
+        // Serialize this decision with agent publication, so a late host worker cannot close
+        // the replacement's task between a status read and this mark.
+        if mark.state == crate::task_record::TaskState::Exited
+            && mark.why == Some(crate::task_record::WHY_EXIT)
+            && (self.task_agent_present() || self.agent.word == "busy")
+            && let Some(task) = self.task.as_ref()
+            && !task.runs_a_program()
+            && matches!(
+                task.state,
+                crate::task_record::TaskState::Working | crate::task_record::TaskState::Stalled
+            )
+        {
+            self.pending_task_exit = Some(mark.clone());
+            return (task.clone(), false);
+        }
+        self.pending_task_exit = None;
         let (next, changed) = mark.apply(self.task.as_ref(), asks, now, now_unix_ms);
         if changed {
             let at = self.slog.now();
@@ -4745,6 +4765,68 @@ impl SessionTimeline {
         }
         self.task = Some(next.clone());
         (next, changed)
+    }
+
+    /// A worker's agent is currently identified in this tab. Program workers have their own
+    /// block/exit-status lifecycle and are never reopened by an agent's screen.
+    fn task_agent_present(&self) -> bool {
+        self.task.as_ref().is_some_and(|task| {
+            !task.runs_a_program() && crate::harness_host::identified_agent(&self.agent).is_some()
+        })
+    }
+
+    /// A new agent observation supersedes an unfinished exit of its predecessor. A deferred exit
+    /// takes effect when a fresh screen read sees the agent gone (`screen_read`). A resolver's
+    /// name change alone can precede that screen read. Keep completed work and explicit failures intact.
+    fn reconcile_task_agent(&mut self, screen_read: bool) -> bool {
+        use crate::task_record::{TaskMark, TaskState, WHY_EXIT};
+        if !self.task_agent_present() {
+            if !screen_read {
+                return false;
+            }
+            let Some(exit) = self.pending_task_exit.take() else {
+                return false;
+            };
+            let asks = self
+                .task
+                .as_ref()
+                .map(|task| task.asks.clone())
+                .unwrap_or_default();
+            return self
+                .mark_task(
+                    &exit,
+                    &asks,
+                    std::time::Instant::now(),
+                    aterm_time::unix_millis().unwrap_or(0),
+                )
+                .1;
+        }
+        let Some(task) = self.task.as_ref().filter(|task| {
+            task.state == TaskState::Exited && task.why == Some(WHY_EXIT) && task.unfinished_exit
+        }) else {
+            return false;
+        };
+        let asks = task.asks.clone();
+        let mut working = TaskMark::new(TaskState::Working);
+        working.why = Some("moved");
+        let (_, moved) = self.mark_task(
+            &working,
+            &asks,
+            std::time::Instant::now(),
+            aterm_time::unix_millis().unwrap_or(0),
+        );
+        moved
+    }
+
+    /// A person's input into an ended tab begins their exchange, not the old worker's task.
+    pub(crate) fn person_reached_task(&mut self) {
+        if let Some(task) = self
+            .task
+            .as_mut()
+            .filter(|task| task.state == crate::task_record::TaskState::Exited)
+        {
+            task.unfinished_exit = false;
+        }
     }
 
     /// The asks standing under the task owners moved ([`crate::task_record::supervisor_asks`]):
@@ -4808,6 +4890,7 @@ impl SessionTimeline {
     /// Seed the record a seamless update carried, before the adopted session is registered
     /// ([`crate::task_record::seed_carried`]).
     pub(crate) fn seed_task(&mut self, record: crate::task_record::TaskRecord) {
+        self.pending_task_exit = None;
         self.task = Some(record);
     }
 
@@ -4907,6 +4990,7 @@ impl SessionTimeline {
         self.agent.screen_word = word;
         self.agent.screen_detail = detail;
         let changed = self.settle_agent_word(regrid);
+        let task_changed = self.reconcile_task_agent(true);
         self.settle_regrid(regrid, changed);
         if reader_changed || self.agent.word != old_word {
             // One wake after publication, even if both reader and phase moved.
@@ -4914,7 +4998,7 @@ impl SessionTimeline {
         } else if self.note_screen_move(std::time::Instant::now()) {
             crate::harness_host::ring_phase();
         }
-        changed
+        changed || task_changed
     }
 
     fn note_screen_move(&mut self, now: std::time::Instant) -> bool {
@@ -5430,6 +5514,7 @@ impl SessionTimeline {
                 );
             }
             self.agent.program = program;
+            self.reconcile_task_agent(false);
             crate::harness_host::ring();
             let at = self.slog.now();
             self.slog.program_named(

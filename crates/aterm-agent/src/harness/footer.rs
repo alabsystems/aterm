@@ -46,17 +46,9 @@ pub const UNOBSERVED_RECOVERY_FINDING: &str = "Recovery status is unobserved";
 /// Most transcript bytes one [`FooterCache::usage`] folds.
 pub const FOLD_BUDGET: u64 = 64 * 1024 * 1024;
 
-/// The pitch the facts are set at, in cells ([`set_facts`]).
-pub const FACT_PITCH: f32 = 0.8;
-
-/// The space between two facts, in pitches.
-pub const GAP: f32 = 3.0;
-
-/// The space before a part attached to the segment before it ([`Segment::attached`]), in pitches.
-pub const JOIN_GAP: f32 = 1.0;
-
-/// The steps a cell is divided into for a fact glyph's sideways move ([`SetGlyph::nudge`]).
-pub const NUDGES_PER_CELL: i8 = 16;
+/// The blank cells between two facts ([`set_facts`]); a part attached to the segment before it
+/// ([`Segment::attached`]) follows one blank, as a word does.
+pub const GAP: usize = 3;
 
 /// Rule glyphs left at the left end of the run aterm writes into ([`rule_run`]).
 pub const RULE_LEAD: usize = 3;
@@ -351,11 +343,14 @@ pub struct Segment {
     pub split: Option<usize>,
     /// Whether the head and the tail (`split`) are a hidden fact's stub.
     pub quiet: (bool, bool),
-    /// Whether it continues the segment before it as one unit ([`Self::attached`]): set
-    /// [`JOIN_GAP`] after it with no mark drawn, and one fact with it ([`fact_spans`]).
+    /// Whether it continues the segment before it as one unit ([`Self::attached`]): set one blank
+    /// after it with no mark drawn, and one fact with it ([`fact_spans`]).
     pub attached: bool,
     /// How its words are inked.
     pub tone: Tone,
+    /// Whether its words are laid bold: a warn part and the reset mark
+    /// ([`super::quota_view::Piece::bold`]); every other word on line D is regular.
+    pub bold: bool,
 }
 
 impl Segment {
@@ -369,7 +364,7 @@ impl Segment {
         }
     }
 
-    /// A part of the segment before it: [`JOIN_GAP`] after that one and no mark drawn, so it lies
+    /// A part of the segment before it: one blank after that one and no mark drawn, so it lies
     /// in that segment's fact ([`fact_spans`]); `mark` only names it. Line D's account unit sets
     /// each of its inked parts this way ([`account_unit`]).
     #[must_use]
@@ -3755,17 +3750,19 @@ fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
         })
     };
     let plain = |mark: char, text: Option<String>| text.map(|text| Segment::plain(mark, text));
-    // The wall leads: the account is out now, and until when. The unit follows it, where line E
-    // is not the glass's quota row (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.2); the
-    // plan is not on the rule (the hover title and the Accounts card say it).
-    let mut out: Vec<Segment> = plain(
-        WALL_MARK,
-        usage
-            .and_then(|u| u.wall.as_ref())
-            .map(super::session_usage::wall_text),
-    )
-    .into_iter()
-    .collect();
+    // The wall leads: the account is out now, and until when, its words in the warn ink and bold
+    // behind `⧗` (§4.1, §4.3), the one fact here a person can act on. The unit follows it, where
+    // line E is not the glass's quota row (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
+    // §1.2); the plan is not on the rule (the hover title and the Accounts card say it).
+    let mut out: Vec<Segment> = usage
+        .and_then(|u| u.wall.as_ref())
+        .map(|wall| Segment {
+            tone: Tone::Warn,
+            bold: true,
+            ..Segment::plain(WALL_MARK, super::session_usage::wall_text(wall))
+        })
+        .into_iter()
+        .collect();
     out.extend(account_unit(facts).into_iter().next().unwrap_or_default());
     out.extend(
         [
@@ -3868,6 +3865,7 @@ pub fn account_unit(facts: &FooterFacts) -> Vec<Vec<Segment>> {
                 };
                 unit.push(Segment {
                     tone: Tone::of(piece.role),
+                    bold: piece.bold,
                     ..segment
                 });
             }
@@ -3906,8 +3904,6 @@ pub struct SetGlyph {
     pub cell: usize,
     /// The cells it takes: 1, or 2 for a wide char.
     pub cols: usize,
-    /// How far its glyph is drawn from the middle of its cells, in [`NUDGES_PER_CELL`]ths of a cell.
-    pub nudge: i8,
     /// A fact's mark (`◆`, `⌂`, ...) rather than a character of its value.
     pub mark: bool,
     /// A character of the model-and-effort segment's effort, past its [`Segment::split`].
@@ -3916,14 +3912,16 @@ pub struct SetGlyph {
     pub quiet: bool,
     /// How its segment's words are inked ([`Segment::tone`]); a mark's is [`Tone::Value`].
     pub tone: Tone,
+    /// Laid bold ([`Segment::bold`]); a mark never is.
+    pub bold: bool,
 }
 
-/// The facts set as a line of small type ([`set_facts`]).
+/// The facts set as a line of terminal text ([`set_facts`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SetFacts {
-    /// The cells the line takes, a whole number.
+    /// The cells the line takes: its glyphs' cells, its blanks and the gaps between its facts.
     pub cells: usize,
-    /// Every glyph, in reading order, each in a cell of its own.
+    /// Every glyph, in reading order, each in cells of its own.
     pub glyphs: Vec<SetGlyph>,
     /// Native emoji clusters at their set lead cell.
     pub clusters: Vec<(usize, Box<str>)>,
@@ -3931,19 +3929,19 @@ pub struct SetFacts {
     pub combining: Vec<(usize, Box<[char]>)>,
 }
 
-/// Set the facts as a line of type at [`FACT_PITCH`], each glyph in a whole cell of its own and
-/// nudged toward its place on the line.
+/// Set the facts as a line of terminal text (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
+/// §1.2, §4.3): each glyph in whole cells at its own cell, the running sum of the cells before it
+/// (the glyphs' widths, a value's blanks, [`GAP`] blanks between two facts and one before an
+/// attached part), so the line is Normal script at pitch 1 with no glyph moved off its cells.
 #[must_use]
 pub fn set_facts(segments: &[Segment]) -> SetFacts {
     let mut glyphs: Vec<SetGlyph> = Vec::new();
-    let mut place: Vec<f32> = Vec::new();
     let mut clusters = Vec::new();
     let mut combining: Vec<(usize, Vec<char>)> = Vec::new();
-    let mut native_pitch = false;
-    let mut line = 0.0f32;
+    let mut cell = 0usize;
     for (i, segment) in segments.iter().enumerate() {
         if i > 0 {
-            line += if segment.attached { JOIN_GAP } else { GAP };
+            cell += if segment.attached { 1 } else { GAP };
         }
         let quiet = |tail: bool| {
             if tail {
@@ -3966,36 +3964,33 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
             (after_mark, false, false),
             (segment.text.as_str(), false, true),
         ] {
+            let glyph =
+                |ch: char, cell: usize, cols: usize, (tail, quiet): (bool, bool)| SetGlyph {
+                    ch,
+                    cell,
+                    cols,
+                    mark,
+                    tail,
+                    quiet,
+                    tone: tone(own),
+                    bold: own && segment.bold,
+                };
             let mut grid = aterm_grapheme::GridColumns::new();
             let mut base = None;
             for cluster in aterm_grapheme::split_graphemes(text) {
                 if cluster.is_emoji || cluster.text.contains('\u{20e3}') {
-                    native_pitch |= cluster.width == 2
-                        && (cluster.codepoint_count > 1
-                            || cluster
-                                .text
-                                .chars()
-                                .next()
-                                .is_some_and(aterm_grapheme::is_emoji_presentation));
                     grid.advance_str(cluster.text);
-                    let index = glyphs.len();
-                    let (tail, quiet) = of_text(own, cluster.byte_offset);
-                    place.push(line);
-                    glyphs.push(SetGlyph {
-                        ch: cluster.text.chars().next().unwrap_or(' '),
-                        cell: 0,
-                        cols: cluster.width,
-                        nudge: 0,
-                        mark,
-                        tail,
-                        quiet,
-                        tone: tone(own),
-                    });
+                    base = Some(glyphs.len());
+                    glyphs.push(glyph(
+                        cluster.text.chars().next().unwrap_or(' '),
+                        cell,
+                        cluster.width,
+                        of_text(own, cluster.byte_offset),
+                    ));
                     if cluster.codepoint_count > 1 {
-                        clusters.push((index, Box::<str>::from(cluster.text)));
+                        clusters.push((cell, Box::<str>::from(cluster.text)));
                     }
-                    line += cluster.width as f32;
-                    base = Some(index);
+                    cell += cluster.width;
                     continue;
                 }
                 for (at, ch) in cluster
@@ -4006,37 +4001,32 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
                     match grid.step(ch) {
                         aterm_grapheme::GridStep::Opens { width, .. } => {
                             if ch.is_whitespace() {
-                                line += width as f32;
+                                cell += width;
                                 base = None;
                                 continue;
                             }
-                            let (tail, quiet) = of_text(own, cluster.byte_offset + at);
                             base = Some(glyphs.len());
-                            place.push(line);
-                            glyphs.push(SetGlyph {
+                            glyphs.push(glyph(
                                 ch,
-                                cell: 0,
-                                cols: width,
-                                nudge: 0,
-                                mark,
-                                tail,
-                                quiet,
-                                tone: tone(own),
-                            });
-                            line += width as f32;
+                                cell,
+                                width,
+                                of_text(own, cluster.byte_offset + at),
+                            ));
+                            cell += width;
                         }
                         step => {
                             if let Some(index) = base {
+                                let lead = &mut glyphs[index];
                                 if step == (aterm_grapheme::GridStep::Joins { widened: true }) {
-                                    line += (2 - glyphs[index].cols) as f32;
-                                    glyphs[index].cols = 2;
+                                    cell += 2 - lead.cols;
+                                    lead.cols = 2;
                                 }
                                 if let Some((_, marks)) =
-                                    combining.last_mut().filter(|(at, _)| *at == index)
+                                    combining.last_mut().filter(|(at, _)| *at == lead.cell)
                                 {
                                     marks.push(ch);
                                 } else {
-                                    combining.push((index, vec![ch]));
+                                    combining.push((lead.cell, vec![ch]));
                                 }
                             }
                         }
@@ -4045,70 +4035,17 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
             }
         }
     }
-    let ink: usize = glyphs.iter().map(|g| g.cols).sum();
     if glyphs.is_empty() {
         return SetFacts::default();
     }
-    let reach = f32::from(i8::MAX) / f32::from(NUDGES_PER_CELL);
-    let pitch = if native_pitch { 1.0 } else { FACT_PITCH };
-    let mut cells = ((line * pitch - 1e-3).ceil() as usize).max(ink);
-    loop {
-        let pitch = cells as f32 / line;
-        let mut before = Vec::with_capacity(glyphs.len());
-        let mut used = 0usize;
-        for g in &glyphs {
-            before.push(used);
-            used += g.cols;
-        }
-        let want: Vec<f32> = glyphs
-            .iter()
-            .zip(&place)
-            .zip(&before)
-            .map(|((g, &at), &b)| {
-                (at + g.cols as f32 / 2.0) * pitch - g.cols as f32 / 2.0 - b as f32
-            })
-            .collect();
-        let mut high = Vec::with_capacity(want.len());
-        let mut most = f32::MIN;
-        for &w in &want {
-            most = most.max(w);
-            high.push(most);
-        }
-        let mut low = vec![0.0f32; want.len()];
-        let mut least = f32::MAX;
-        for (i, &w) in want.iter().enumerate().rev() {
-            least = least.min(w);
-            low[i] = least;
-        }
-        let slack = (cells - ink) as f32;
-        let mut fits = true;
-        let mut set = glyphs.clone();
-        for (i, g) in set.iter_mut().enumerate() {
-            let lead = ((high[i] + low[i]) / 2.0).clamp(0.0, slack).round() as usize + before[i];
-            let moved =
-                (place[i] + g.cols as f32 / 2.0) * pitch - (lead as f32 + g.cols as f32 / 2.0);
-            if moved.abs() > reach {
-                fits = false;
-                break;
-            }
-            g.cell = lead;
-            g.nudge = (moved * f32::from(NUDGES_PER_CELL)).round() as i8;
-        }
-        if fits {
-            return SetFacts {
-                cells,
-                clusters: clusters
-                    .into_iter()
-                    .map(|(index, text)| (set[index].cell, text))
-                    .collect(),
-                combining: combining
-                    .into_iter()
-                    .map(|(index, marks)| (set[index].cell, marks.into_boxed_slice()))
-                    .collect(),
-                glyphs: set,
-            };
-        }
-        cells += 1;
+    SetFacts {
+        cells: cell,
+        glyphs,
+        clusters,
+        combining: combining
+            .into_iter()
+            .map(|(at, marks)| (at, marks.into_boxed_slice()))
+            .collect(),
     }
 }
 
@@ -4117,7 +4054,8 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
 pub struct FactSpan {
     /// Which fact.
     pub kind: FactKind,
-    /// Its cells in the set run ([`SetFacts::cells`]), `start..end`.
+    /// Its cells in the set run ([`SetFacts::cells`]), `start..end`: from its first glyph's cell
+    /// to its last glyph's end, which is where its ink lies, so an underline under it takes these.
     pub cells: (u16, u16),
     /// The hidden facts a click on it shows again.
     pub restores: FactMask,
@@ -4195,28 +4133,6 @@ pub fn fact_spans(set: &SetFacts, segments: &[Segment]) -> FactSpans {
         }
     }
     spans
-}
-
-/// The cells of the set run ([`SetFacts::cells`]) an underline under `span`'s fact takes.
-#[must_use]
-pub fn drawn_cells(set: &SetFacts, span: &FactSpan) -> std::ops::Range<usize> {
-    let n = isize::from(NUDGES_PER_CELL);
-    let own = usize::from(span.cells.0)..usize::from(span.cells.1);
-    let mut edges: Option<(isize, isize)> = None;
-    for glyph in set.glyphs.iter().filter(|g| own.contains(&g.cell)) {
-        let left = glyph.cell as isize * n + isize::from(glyph.nudge);
-        let right = left + glyph.cols as isize * n;
-        edges = Some(edges.map_or((left, right), |(l, r)| (l.min(left), r.max(right))));
-    }
-    let Some((left, right)) = edges else {
-        return 0..0;
-    };
-    let first = |edge: isize| {
-        (edge - n / 2 + n - 1)
-            .div_euclid(n)
-            .clamp(0, set.cells as isize) as usize
-    };
-    first(left)..first(right)
 }
 
 /// The run of the composer's bottom rule aterm may write into.

@@ -153,10 +153,11 @@ impl Fig {
         (self.pct_x10, self.reset, self.epoch) == (other.pct_x10, other.reset, other.epoch)
     }
 
-    /// The figure in whole points, rounded half up ([`WindowFig::whole`]).
+    /// The figure in whole points, rounded as [`WindowFig::whole`] rounds it: half up, but 100
+    /// only for a reading of 100 or more.
     #[must_use]
     pub const fn whole(&self) -> u32 {
-        self.pct_x10.saturating_add(5) / 10
+        super::decimal::whole_used(self.pct_x10)
     }
 }
 

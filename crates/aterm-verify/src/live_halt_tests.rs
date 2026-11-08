@@ -301,6 +301,7 @@ fn a_bare_run_says_its_red_and_ends_nothing() {
 #[test]
 fn a_long_running_case_is_journaled_before_completion_and_halts_nothing() {
     let dir = scratch();
+    let mut held = None;
     let ran = run_arm(dir.path(), "long", |read| {
         let event = until_within(MUST_HAPPEN, "the live long-running case event", || {
             read().lines().find_map(|line| {
@@ -309,18 +310,45 @@ fn a_long_running_case_is_journaled_before_completion_and_halts_nothing() {
                 (event["event"].as_str() == Some("test-case-running-long")).then_some(event)
             })
         });
-        assert_eq!(event["case"].as_str(), Some("libtest_fixture::z_napper"));
-        assert_eq!(event["test"].as_str(), Some("-p aterm-verify --lib a"));
-        assert_eq!(event["outcome"].as_str(), Some("RUNNING"));
-        assert_eq!(event["halts"].as_bool(), Some(false));
-        assert_eq!(event["binary_completed"].as_bool(), Some(false));
-        assert!(dir.path().join("napper.started").is_file());
-        assert!(
-            !dir.path().join("b").exists(),
-            "the first binary still owns its turn"
-        );
+        let phase = read()
+            .lines()
+            .filter_map(|line| {
+                aterm_json::from_str::<aterm_json::Value>(line.strip_prefix("verify-event: ")?).ok()
+            })
+            .rfind(|event| {
+                matches!(
+                    event["event"].as_str(),
+                    Some("test-phase-started" | "test-phase-ended")
+                )
+            });
+        held = Some((
+            event,
+            phase,
+            crate::status::observe(&read()),
+            dir.path().join("napper.started").is_file(),
+            dir.path().join("b").exists(),
+        ));
         std::fs::write(dir.path().join("napper.release"), "").expect("release the case");
     });
+    let (event, phase, observed, started, b_started) = held.expect("the held snapshot");
+    assert_eq!(event["case"].as_str(), Some("libtest_fixture::z_napper"));
+    assert_eq!(event["test"].as_str(), Some("-p aterm-verify --lib a"));
+    assert_eq!(event["outcome"].as_str(), Some("RUNNING"));
+    assert_eq!(event["halts"].as_bool(), Some(false));
+    assert_eq!(event["binary_completed"].as_bool(), Some(false));
+    assert!(started);
+    assert!(!b_started, "the first binary still owned its turn");
+    let phase = phase.expect("the live dispatch phase");
+    assert_eq!(phase["event"].as_str(), Some("test-phase-started"));
+    assert_eq!(phase["phase"].as_str(), Some("dispatch"));
+    assert_eq!(observed.long_cases.len(), 1);
+    assert_eq!(observed.long_cases[0].test, "-p aterm-verify --lib a");
+    assert_eq!(observed.long_cases[0].case, "libtest_fixture::z_napper");
+    assert_eq!(observed.long_cases[0].occurrences, 1);
+    assert_eq!(
+        crate::status::observe(&ran.events).long_cases,
+        observed.long_cases
+    );
     let all = format!("{}\n{}\n{}", ran.rows, ran.block, ran.events);
     assert!(ran.b_ran, "{all}");
     assert_eq!(words(&ran.rows), ["ok"], "{all}");

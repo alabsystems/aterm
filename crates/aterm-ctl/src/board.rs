@@ -28,6 +28,8 @@ const KEEPER_LOCK: &str = ".keeper";
 /// How long a write waits for another writer of the board.
 #[cfg(unix)]
 const LOCK_WITHIN: Duration = Duration::from_secs(10);
+/// Hang detector for the caller's required, durable accept word.
+const ACCEPT_HANG: Duration = Duration::from_secs(60);
 
 /// The most a row's file is read for.
 #[cfg(unix)]
@@ -947,8 +949,19 @@ impl BoundBoard {
     /// Record `word`, what the dispatcher observed of the package's accept test, on the row
     /// `who` names (`@<sid>`, or a label: the newest row with it), at `now_ms`.
     /// # Errors
-    /// `word` or `who` is no word a board takes, no row is named, or as [`Board::record`].
+    /// `word` or `who` is invalid, no row is named, directory admission, locking
+    /// or publication fails, or the required write's minute hang detector expires.
     pub fn accept(&self, who: &str, word: &str, now_ms: u64) -> io::Result<Row> {
+        self.accept_started(who, word, now_ms, std::time::Instant::now())
+    }
+
+    fn accept_started(
+        &self,
+        who: &str,
+        word: &str,
+        now_ms: u64,
+        started: std::time::Instant,
+    ) -> io::Result<Row> {
         let invalid = |why: String| io::Error::new(io::ErrorKind::InvalidInput, why);
         if !valid_name(word) {
             return Err(invalid(format!(
@@ -957,7 +970,16 @@ impl BoundBoard {
                 one_line(word)
             )));
         }
-        let _lock = self.lock()?;
+        let within = ACCEPT_HANG
+            .checked_sub(started.elapsed())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "another writer held the board's lock",
+                )
+            })?;
+        let _lock = self.lock_for(within)?;
         let scan = self.scan();
         let named = match who.strip_prefix('@') {
             Some(sid) => scan.rows.into_iter().find(|row| row.sid == sid),
@@ -1023,8 +1045,13 @@ impl BoundBoard {
 
     #[cfg(unix)]
     fn lock(&self) -> io::Result<aterm_uds::private_file::PrivateLock> {
+        self.lock_for(LOCK_WITHIN)
+    }
+
+    #[cfg(unix)]
+    fn lock_for(&self, within: Duration) -> io::Result<aterm_uds::private_file::PrivateLock> {
         self.root
-            .lock(LOCK, LOCK_WITHIN, "another writer held the board's lock")
+            .lock(LOCK, within, "another writer held the board's lock")
     }
 
     #[cfg(not(unix))]
@@ -1033,6 +1060,11 @@ impl BoundBoard {
             io::ErrorKind::Unsupported,
             "this platform keeps no board",
         ))
+    }
+
+    #[cfg(not(unix))]
+    fn lock_for(&self, _within: Duration) -> io::Result<()> {
+        self.lock()
     }
 
     #[cfg(unix)]

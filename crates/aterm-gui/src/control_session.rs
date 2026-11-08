@@ -1167,7 +1167,7 @@ pub(crate) fn await_tasks(
             latch.unwrap_or_else(|| {
                 task_wait_row(
                     target,
-                    task_record_of(target.ctx).as_ref(),
+                    &crate::task_record::task_reading(target.ctx),
                     exited(store),
                     false,
                 )
@@ -1199,17 +1199,16 @@ fn task_record_of(ctx: &SessionCtx) -> Option<crate::task_record::TaskRecord> {
 /// initial leg whose armed rev/fact edges the client has not read yet.
 fn task_wait_row(
     target: &TaskTarget<'_>,
-    record: Option<&crate::task_record::TaskRecord>,
+    reading: &crate::task_record::TaskReading,
     closed: bool,
     news: bool,
 ) -> String {
-    let (agent, program, attention) = crate::task_record::agent_program_and_attention(target.ctx);
     let mut row = crate::task_record::await_row(
         target.ctx.self_id.as_str(),
-        record,
-        agent,
-        &program,
-        &attention,
+        reading.record.as_ref(),
+        reading.agent,
+        &reading.program,
+        &reading.attention,
         closed,
     );
     row.push_str(&format!(" task_news={}", u8::from(news)));
@@ -1228,24 +1227,14 @@ fn latch_task_news<F: Fn(&Store) -> bool>(
             continue;
         }
         let closed = exited(store);
-        let news = {
-            let timeline = target
-                .ctx
-                .timeline
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            let (rev_edge, fact_edge) = *edge;
-            timeline
-                .task()
-                .filter(|task| {
-                    (task.rev > rev_edge && task.has_news())
-                        || fact_edge.is_some_and(|edge| task.fact_rev > edge && task.fact.is_some())
-                })
-                .cloned()
-        };
-        if closed || news.is_some() {
-            let record = news.or_else(|| task_record_of(target.ctx));
-            *latch = Some(task_wait_row(target, record.as_ref(), closed, true));
+        let reading = crate::task_record::task_reading(target.ctx);
+        let (rev_edge, fact_edge) = *edge;
+        let news = reading.record.as_ref().is_some_and(|task| {
+            (task.rev > rev_edge && task.has_news())
+                || fact_edge.is_some_and(|edge| task.fact_rev > edge && task.fact.is_some())
+        });
+        if closed || news {
+            *latch = Some(task_wait_row(target, &reading, closed, true));
         }
     }
 }
@@ -7328,6 +7317,50 @@ mod tests {
             task_reply(&all),
             ("OK 3", vec!["stalled", "done", "exited"])
         );
+    }
+
+    #[test]
+    fn a_returned_agent_is_working_for_the_task_waiter() {
+        use crate::session_timeline::AgentStamp;
+        use crate::task_record::{Combine, TaskMark, TaskState, mark_session_task};
+
+        let store = crate::session_store::new_store();
+        let workers = three_workers(&store);
+        let w = &workers[0];
+        let mut exited = TaskMark::new(TaskState::Exited);
+        exited.why = Some(crate::task_record::WHY_EXIT);
+        mark_session_task(&w.ctx, w.local_id, &exited).expect("unfenced");
+        {
+            let mut timeline = w.ctx.timeline.lock().unwrap();
+            timeline.note_foreground_group(42);
+            timeline.set_program(42, Some("claude".to_string()));
+            timeline.publish_agent(
+                "busy",
+                None,
+                None,
+                Some(aterm_phase::Program::Claude),
+                AgentStamp {
+                    generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                    fp: 1,
+                },
+            );
+        }
+        let reply = await_task(
+            &store,
+            &[TaskTarget {
+                local_id: w.local_id,
+                ctx: &w.ctx,
+                since: Some(0),
+                facts: false,
+                fact_since: None,
+            }],
+            Combine::Any,
+            0,
+        );
+        assert!(reply.contains("status=timeout"), "{reply}");
+        assert!(reply.contains("state=working agent=busy"), "{reply}");
+        assert!(reply.contains("task_news=0"), "{reply}");
+        assert!(!reply.contains("conclusion=failed"), "{reply}");
     }
 
     /// A CLAIM IS NO TASK NEWS: a codex's own report (`program_state=`) rides an `await task`

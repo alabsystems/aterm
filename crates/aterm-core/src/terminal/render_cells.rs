@@ -1158,7 +1158,7 @@ impl Terminal {
         }
         scratch.selection_clip = None;
         scratch.selections.clear();
-        scratch.chrome_rasters.clear();
+        scratch.retire_chrome_rasters();
 
         let cur = self.cursor();
         scratch.cursor_col = cur.col as usize;
@@ -1473,6 +1473,89 @@ mod tests {
         assert!(
             scratch.selections.is_empty(),
             "the per-pane list would REPLACE the scalar selection"
+        );
+    }
+
+    /// A refill retires the host's chrome rasters and keeps each one's icon list, emptied, for
+    /// the next ones, at most one per row, so a host that lays the same icons again allocates
+    /// nothing; a second retirement with no raster left keeps them. A smaller next frame trims
+    /// older spares to its row bound. NEGATIVE CONTROLS: laying the cells with a plain
+    /// `chrome_rasters.clear()`, omitting the pool's shrink clamp, or consuming the retired lists
+    /// newest-first fails this test (each run once, restored).
+    #[test]
+    fn cell_frame_into_keeps_the_retired_rasters_icon_lists() {
+        use crate::render::{BandIcon, ChromeIcon, ChromeRaster};
+        let mark = ChromeIcon {
+            col: 1,
+            icon: BandIcon::House,
+        };
+        let raster = |row: u16, icons: Vec<ChromeIcon>| ChromeRaster {
+            row,
+            ground: std::sync::Arc::from(Vec::new()),
+            rail: std::sync::Arc::from(Vec::new()),
+            rail_h: 0,
+            clear_rail: false,
+            own: Vec::new(),
+            split: None,
+            rings: Vec::new(),
+            icons,
+        };
+        let mut term = Terminal::new(2, 8);
+        let mut scratch = crate::render::RenderInput::empty();
+        let marks = |capacity: usize| {
+            let mut icons = Vec::with_capacity(capacity);
+            icons.resize(capacity, mark);
+            icons
+        };
+        scratch.chrome_rasters = vec![
+            raster(0, marks(1)),
+            raster(1, marks(8)),
+            raster(2, marks(2)),
+        ];
+        scratch.chrome_rasters.push(raster(3, Vec::new()));
+        let lists: Vec<*const ChromeIcon> = scratch
+            .chrome_rasters
+            .iter()
+            .map(|r| r.icons.as_ptr())
+            .collect();
+        let capacities: Vec<usize> = scratch
+            .chrome_rasters
+            .iter()
+            .map(|r| r.icons.capacity())
+            .collect();
+
+        term.cell_frame_into(&mut scratch, 2, 8);
+        scratch.retire_chrome_rasters();
+
+        assert!(
+            scratch.chrome_rasters.is_empty(),
+            "no raster outlives a refill"
+        );
+        let kept: Vec<*const ChromeIcon> =
+            scratch.chrome_icon_spares.iter().map(Vec::as_ptr).collect();
+        assert_eq!(
+            kept,
+            [lists[1], lists[0]],
+            "the first two rows' lists, stacked for same-order reuse"
+        );
+        for (want, capacity) in [(lists[0], capacities[0]), (lists[1], capacities[1])] {
+            let list = scratch.chrome_icon_list();
+            assert!(list.is_empty() && list.capacity() > 0);
+            assert_eq!(list.as_ptr(), want);
+            assert_eq!(list.capacity(), capacity, "the same row's capacity");
+        }
+        assert_eq!(scratch.chrome_icon_list().capacity(), 0, "then a new one");
+
+        scratch.chrome_icon_spares = (1..=4).map(Vec::with_capacity).collect();
+        term.cell_frame_into(&mut scratch, 2, 8);
+        assert_eq!(
+            scratch
+                .chrome_icon_spares
+                .iter()
+                .map(Vec::capacity)
+                .collect::<Vec<_>>(),
+            [3, 4],
+            "a shrink keeps at most one spare per new frame row"
         );
     }
 

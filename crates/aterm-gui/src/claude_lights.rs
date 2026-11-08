@@ -1033,6 +1033,8 @@ pub(crate) struct WindowLights {
     pub(crate) mark_hits: Vec<MarkHit>,
     /// The session whose top line's lockup the pointer rests on ([`App::track_claude_light_hover`]).
     pub(crate) mark_hover: Option<u64>,
+    /// The card or banner hit under the pointer: `(session, is_link, is_front)`.
+    pub(crate) glass_hit_hover: Option<(u64, bool, bool)>,
     /// The window pixel the last motion put the pointer on while it hovered a switch or a lockup.
     glass_hover_px: Option<(f64, f64)>,
     /// The grid the lists were laid.
@@ -1362,6 +1364,7 @@ type GlassHover = (
     Option<u64>,
     Option<(u64, crate::claude_footer::HoverAt)>,
     Option<u64>,
+    Option<(u64, bool, bool)>,
 );
 
 impl WindowLights {
@@ -1373,6 +1376,7 @@ impl WindowLights {
             self.switch_hover,
             self.part_hover,
             self.mark_hover,
+            self.glass_hit_hover,
         )
     }
 
@@ -1390,11 +1394,13 @@ impl WindowLights {
         h.finish() | 1
     }
 
-    /// A digest of where the last paint laid what a pointer hit-tests ([`App::claude_glass_at`]):
-    /// the chips' cells, the switches with their labels and arrows, the facts and the lockups.
-    fn places(&self) -> u64 {
+    /// A digest of where the last paint laid what a pointer hit-tests ([`App::claude_glass_at`] and
+    /// [`App::claude_glass_hit_at`]): the chips' cells, the switches with their labels and arrows,
+    /// the facts, the lockups and the card/banner hits.
+    fn places(&self, card_hits: u64, focused: Option<u64>) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
+        (card_hits, focused).hash(&mut h);
         self.hits.len().hash(&mut h);
         for hit in &self.hits {
             (hit.frame_row, hit.term_row, hit.col, hit.session, hit.chip).hash(&mut h);
@@ -3679,24 +3685,33 @@ pub(crate) struct Block {
 }
 
 impl Block {
-    /// Synthetic private-dev input through the production lights reading and chip composition.
+    /// Synthetic private-dev input through the production lights reading and chip composition:
+    /// Autopilot `view`'s chip over Claude Code's mode row `mode` (`  ⏸ plan mode on (shift+tab
+    /// to cycle)`), the mode's name worded on the chip where `worded`, as a click that just
+    /// reached it shows it (`⤓ land ─ ⏸ plan`), else its glyph alone; where `rewritten`, the
+    /// glass has rewritten the mode row, as it does a live pane's, so the mode's one home is its
+    /// light even where the mode is the expected one (`∞ yolo`). A sample laid under a palette
+    /// wears the chip of that palette's mode, so the two agree.
     #[cfg(any(debug_assertions, feature = "dev-seams"))]
-    pub(crate) fn layout_scene(blank: RenderCell, at: ChipAt) -> Block {
+    pub(crate) fn layout_scene(
+        blank: RenderCell,
+        at: ChipAt,
+        (view, mode, worded, rewritten): (AutopilotView, &str, bool, bool),
+    ) -> Block {
         let mut lights = WindowLights::default();
         let rows = [
             "─".repeat(80),
             "❯ ".to_owned(),
             "─".repeat(80),
-            "  ⏸ plan mode on (shift+tab to cycle)".to_owned(),
+            mode.to_owned(),
         ];
         lights.observe(0, lights::read_lights(&rows));
+        lights.note_row(0, rewritten);
         let now = Instant::now();
-        let view = AutopilotView::Land;
         lights.note_autopilot_at(0, view.mode(), view, ChipGlass::default(), || now);
-        // Land just reached by a click: its name worded on the chip (`⤓ land ─ ⏸ plan`).
         let s = lights.sessions.entry(0).or_default();
-        s.word = Some(ChipWord {
-            mode: Autopilot::Land,
+        s.word = view.mode().filter(|_| worded).map(|mode| ChipWord {
+            mode,
             from: now,
             fades: true,
             asked: 0,
@@ -4146,6 +4161,7 @@ impl App {
         if let Some(ws) = self.windows.get_mut(&wid) {
             let prev_hover = ws.claude_lights.hover.take();
             had_fact = prev_hover.is_some_and(|(_, t)| t.fact().is_some());
+            ws.claude_lights.glass_hit_hover = None;
             if prev_hover.is_some()
                 | ws.claude_lights.switch_hover.take().is_some()
                 | ws.claude_lights.part_hover.take().is_some()
@@ -4169,6 +4185,7 @@ impl App {
     ) {
         let band_active = self.paste_banner.as_ref().is_some_and(|p| p.wid == wid)
             || self.close_band(wid).is_some();
+        let focused = self.focused_session_id(wid);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -4178,9 +4195,10 @@ impl App {
             std::mem::replace(&mut ws.claude_lights.chrome_rows_laid, chrome) != chrome;
         let uncovered =
             !band_active && std::mem::replace(&mut ws.claude_lights.band_covered, false);
+        let card_hits = ws.claude_card.glass_hits_digest();
         let lights = &mut ws.claude_lights;
         let was = lights.glass_hover();
-        let laid = (lights.places(), was);
+        let laid = (lights.places(card_hits, focused), was);
         // Glass laid elsewhere under the same hover moved under a still pointer (a re-laid rule,
         // a newly drawn ⬆️, a changed chrome band): track it again. A paint under a hover that
         // changed since the last paint (a motion's, or a track's here) only records its places,
@@ -4236,10 +4254,13 @@ impl App {
     /// Clear any glass hover in `wid` whose target moved away or was covered by a chrome band.
     pub(crate) fn evict_stale_glass_hover(&mut self, wid: WindowId) {
         self.evict_stale_glass_selection(wid);
-        let Some(lights) = self.windows.get(&wid).map(|ws| &ws.claude_lights) else {
+        let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        let Some((x, y)) = lights.glass_hover_px else {
+        if WindowLights::chrome_rows_digest(&ws.chrome_rows) != ws.claude_lights.chrome_rows_laid {
+            ws.claude_lights.band_covered = true;
+        }
+        let Some((x, y)) = ws.claude_lights.glass_hover_px else {
             return;
         };
         let at = self.claude_glass_at(wid, x, y);
@@ -4255,11 +4276,13 @@ impl App {
             at.and_then(|(session, glass)| matches!(glass, GlassAt::Switch(_)).then_some(session));
         let part = at.and_then(|(session, glass)| Some((session, part_of(glass)?)));
         let mark = at.and_then(|(session, glass)| (glass == GlassAt::Mark).then_some(session));
+        let glass_hit = self.glass_hit_hover_at(wid, x, y);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
         let lights = &mut ws.claude_lights;
         let mut gone = false;
+        let mut cursor_gone = false;
         let mut fact_gone = false;
         if lights.hover.is_some() && lights.hover != over {
             fact_gone = lights.hover.is_some_and(|(_, t)| t.fact().is_some());
@@ -4283,20 +4306,32 @@ impl App {
             lights.mark_hover = None;
             gone = true;
         }
+        if lights.glass_hit_hover.is_some() && lights.glass_hit_hover != glass_hit {
+            lights.glass_hit_hover = glass_hit;
+            cursor_gone = true;
+        }
         if lights.hover.is_none()
             && lights.switch_hover.is_none()
             && lights.part_hover.is_none()
             && lights.mark_hover.is_none()
+            && lights.glass_hit_hover.is_none()
         {
             lights.glass_hover_px = None;
         }
-        if gone {
+        if gone || cursor_gone {
             lights.cursor_owed = true;
+        }
+        if gone {
             redraw(ws);
             if fact_gone {
                 self.note_fact_readings(wid);
             }
         }
+    }
+
+    fn glass_hit_hover_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(u64, bool, bool)> {
+        let (session, url) = self.claude_glass_hit_at(wid, x, y)?;
+        Some((session, url.is_some(), self.session_is_front(wid, session)))
     }
 
     /// The cursor follows the glass's hover.
@@ -4367,15 +4402,20 @@ impl App {
         let column = over
             .filter(|(_, t)| *t == Target::Fact(Fact::Account))
             .and_then(|_| self.quota_column_at(wid, x, y));
+        let glass_hit = self.glass_hit_hover_at(wid, x, y);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return OverChips::No;
         };
         if ws.selecting {
             return OverChips::No;
         }
-        ws.claude_lights.glass_hover_px =
-            (over.is_some() || switch.is_some() || part.is_some() || mark.is_some())
-                .then_some((x, y));
+        ws.claude_lights.glass_hover_px = (over.is_some()
+            || switch.is_some()
+            || part.is_some()
+            || mark.is_some()
+            || glass_hit.is_some())
+        .then_some((x, y));
+        ws.claude_lights.glass_hit_hover = glass_hit;
         if ws.claude_lights.hover != over
             || ws.claude_lights.switch_hover != switch
             || ws.claude_lights.part_hover != part
@@ -7246,9 +7286,11 @@ mod gesture_tests {
             let mode = hit(&app, wid, Light::Mode);
             assert_eq!(cell_at(&app, wid, mode).ch, '\u{25CC}');
             let text = row_text(&app, wid, mode.0);
+            // At pitch 1 the whole facts leave an 80-column pane the title's short form: the title
+            // gives way before any fact does.
             assert!(
-                text.contains("switching to bypass or auto\u{2026}") && text.contains(WHOLE_FACTS),
-                "the title, whole in an 80-column pane, beside the whole facts: {text:?}"
+                text.contains("switching\u{2026}") && text.contains(WHOLE_FACTS),
+                "the title, short in an 80-column pane, beside the whole facts: {text:?}"
             );
             assert_ne!(app.windows[&wid].claude_lights.fingerprint(Instant::now), 0);
             app.on_claude_footer_changed(session);
@@ -7657,8 +7699,8 @@ mod gesture_tests {
             "the facts stay whole while the toggle is in flight: {text:?}"
         );
         assert!(
-            text.contains("switching to bypass or auto\u{2026}"),
-            "the title, whole beside the lights and the facts: {text:?}"
+            text.contains("switching\u{2026}"),
+            "the title, short beside the lights and the whole facts (it gives way first): {text:?}"
         );
         assert_eq!(
             hit(&app, wid, Light::Mode),
@@ -8380,9 +8422,10 @@ mod gesture_tests {
         let (mut app, wid, session, mut reader) = self::app();
         let _host = host(&mut app);
         publish_facts(&app, session);
+        // At 36 columns the model, set at pitch 1, leaves no room for the mode's chip.
         for (cols, chips) in [
             (40_u16, &[Chip::Autopilot, MODE][..]),
-            (36, &[Chip::Autopilot, MODE][..]),
+            (36, &[Chip::Autopilot][..]),
             (30, &[Chip::Autopilot][..]),
         ] {
             assert!(app.apply_term_resize(wid, 24, cols));
@@ -8412,7 +8455,7 @@ mod gesture_tests {
                     "{cols}: {want:?} on the glass"
                 );
             }
-            assert_eq!(painted(&app, wid, MODE), cols != 30, "{cols}");
+            assert_eq!(painted(&app, wid, MODE), cols == 40, "{cols}");
             tap(&mut app, wid, NamedKey::Escape, KeyCode::Escape, "\u{1b}");
             assert_eq!(app.windows[&wid].claude_lights.selected, None);
         }
