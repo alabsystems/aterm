@@ -1762,11 +1762,6 @@ fn the_access_question_posts_nothing_and_watches_the_probe() {
     let mut app = access_card_windowed();
     let other = app.post_message(Message::new(tags::SYSTEM, Severity::Warn, "already here"));
     access_card_due(&mut app, t0);
-    assert_eq!(
-        app.messages.on_glass().next().map(|l| l.id),
-        None,
-        "neither diagnostic asks for attention"
-    );
     assert!(
         app.messages.live(other).is_some(),
         "the previous diagnostic remains recorded"

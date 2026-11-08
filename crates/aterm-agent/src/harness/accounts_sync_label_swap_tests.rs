@@ -271,7 +271,10 @@ fn signed_in(dir: &Path, email: &str) -> String {
 
 /// The account the profile in `dir` names, if any.
 fn signed_in_as(dir: &str) -> Option<String> {
-    profile_email(&Path::new(dir).join(".claude.json"))
+    profile_email(
+        &Path::new(dir).join(".claude.json"),
+        &read_local_source_text,
+    )
 }
 
 /// Every row of `desk`'s roster whose login directory's profile names another account than the

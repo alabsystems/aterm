@@ -103,12 +103,32 @@ fn hand_transforms_cutter(stage: &mut Command, commit: &str) -> String {
 /// and [`RELEASE_CUTTER_SINCE_ENV`] carries `since`, the moment its start judgment dated its
 /// inputs from ([`crate::cutter::reference`]), handed on by this process
 /// ([`crate::cutter::hand_value`]), or is removed when there is none or this process's start is
-/// unread.
+/// unread. A frozen cutter also hands the record it was proved by
+/// ([`crate::release_tools::proof_for_this_image`]), so a child running this same image proves
+/// itself the same way; any other image named by it fails that proof closed.
 fn hand_this_cutter(cmd: &mut Command, exe: &Path, since: Option<std::time::SystemTime>) {
+    hand_cutter_with_proof(
+        cmd,
+        exe,
+        since,
+        crate::release_tools::proof_for_this_image(),
+    );
+}
+
+fn hand_cutter_with_proof(
+    cmd: &mut Command,
+    exe: &Path,
+    since: Option<std::time::SystemTime>,
+    proof: Option<std::ffi::OsString>,
+) {
     cmd.env(RELEASE_CUTTER_ENV, exe);
     match since.and_then(crate::cutter::hand_value) {
         Some(since) => cmd.env(RELEASE_CUTTER_SINCE_ENV, since),
         None => cmd.env_remove(RELEASE_CUTTER_SINCE_ENV),
+    };
+    match proof {
+        Some(record) => cmd.env(crate::release_tools::RECORD_ENV, record),
+        None => cmd.env_remove(crate::release_tools::RECORD_ENV),
     };
 }
 
@@ -203,7 +223,8 @@ pub struct Real {
     pub(crate) handed_inputs: fn() -> Option<PathBuf>,
     repo: PathBuf,
     home: PathBuf,
-    /// The publication engine this release is named (`--engine`, else `$PUBLICATION_ENGINE`, else
+    /// The publication engine this release is named (`--engine`, else the source a release that
+    /// execed this cutter handed it ([`ENGINE_SOURCE_ENV`]), else `$PUBLICATION_ENGINE`, else
     /// `~/publication`): it names the engine's origin and committer, and nothing here runs, syncs
     /// or writes it, since other processes move it ([`crate::gates::engine_copy`]).
     engine_source: PathBuf,
@@ -212,7 +233,9 @@ pub struct Real {
     /// [`Real::engine_copy`]); in a dry run, which never makes or moves one, `engine_source` until a
     /// real run has made it.
     engine: PathBuf,
-    /// Captured once; a missing engine defers refusal until an engine operation.
+    /// Captured once, when the release starts, and handed with `engine_source` to its own frozen
+    /// cutter on exec ([`hand_engine_capture`], [`engine_authority`]); a missing engine defers
+    /// refusal until an engine operation.
     engine_repository: Result<agh::Slug, String>,
     engine_url: fn(&Path) -> Result<String, String>,
     /// The main of the engine's origin, fetched at step 1 ([`Backend::fetch`]): what the release
@@ -551,16 +574,23 @@ impl Real {
             .filter(|h| !h.is_empty())
             .map(PathBuf::from)
             .ok_or("HOME is not set")?;
+        // A release's own frozen cutter takes the source the release that execed it named
+        // (ENGINE_SOURCE_ENV), not the copy it is also handed as PUBLICATION_ENGINE.
         let source = engine.map(Path::to_path_buf).unwrap_or_else(|| {
-            std::env::var_os("PUBLICATION_ENGINE")
-                .filter(|v| !v.is_empty())
+            [ENGINE_SOURCE_ENV, "PUBLICATION_ENGINE"]
+                .into_iter()
+                .find_map(|name| std::env::var_os(name).filter(|v| !v.is_empty()))
                 .map_or_else(|| home.join("publication"), PathBuf::from)
         });
         let engine_source = std::env::current_dir().map_or_else(
             |_| source.clone(),
             |cwd| crate::release::anchor(&source, &cwd),
         );
-        let engine_repository = crate::github_remote::origin_slug(&engine_source);
+        let engine_repository = engine_authority(
+            crate::github_remote::origin_slug(&engine_source),
+            std::env::var_os(ENGINE_REPOSITORY_ENV),
+            std::env::var_os(ENGINE_REPOSITORY_WHY_ENV),
+        );
         let release = crate::gates::release_dir(repo);
         let copy = crate::gates::engine_copy(&release);
         let engine = if dry && !copy.join(".git").exists() {
@@ -796,6 +826,26 @@ impl Real {
 
     fn scrubbed(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         self.scrubbed_command(publication_command(&self.engine, program))
+    }
+
+    /// The image [`Backend::exec_cutter`] execs in place: the frozen `cutter` with this release's
+    /// arguments, its record, and the engine source and repository it captured
+    /// ([`hand_engine_capture`]), without Trust's `targo` handovers; the exec adds the freezer's
+    /// envelope ([`crate::release_tools::Recovery::hand`]) and its descriptor guards.
+    fn cutter_command(&self, cutter: &Path) -> Command {
+        let mut command = self.scrubbed(cutter);
+        command.args(&self.argv).current_dir(&self.repo).env(
+            crate::release_tools::RECORD_ENV,
+            crate::release_tools::cutter_record_path(&self.release),
+        );
+        hand_engine_capture(&mut command, &self.engine_source, &self.engine_repository);
+        for name in std::env::vars_os().map(|(name, _)| name).filter(|name| {
+            name.to_str()
+                .is_some_and(|name| name.starts_with("TRUST_TARGO_"))
+        }) {
+            command.env_remove(name);
+        }
+        command
     }
 
     fn scrubbed_command(&self, mut cmd: Command) -> Command {
@@ -1296,8 +1346,10 @@ impl Real {
     /// delivered to this origin), and given `engine_source`'s committer, which its audit-row and
     /// ledger commits are made as.
     /// Nothing is read from `engine_source` but its origin and committer. Never in a dry run, and
-    /// nothing to do where the release was named its own copy (the re-run as R's own cutter is
-    /// handed it as `PUBLICATION_ENGINE`).
+    /// nothing to do where the release was named its own copy (by hand, or as the frozen cutter of
+    /// a release older than the engine handover, which names it only the copy, as
+    /// `PUBLICATION_ENGINE`); R's own cutter is handed the release's source
+    /// ([`ENGINE_SOURCE_ENV`]) and makes the copy itself.
     fn engine_copy(&self) -> Result<(), Refusal> {
         let e = self.engine.display().to_string();
         if self.scratch_logs {
@@ -1957,13 +2009,28 @@ impl Real {
         Ok(tools)
     }
 
+    fn cutter_retry(&self) -> String {
+        let args = self
+            .argv
+            .iter()
+            .map(|arg| crate::release::shell_word(&arg.to_string_lossy()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "from {} run `targo --unverified ship {args}`",
+            crate::release::shell_word(&self.repo.to_string_lossy())
+        )
+    }
+
     fn frozen_cutter(
         &self,
         commit: &str,
         prover: &Prover,
     ) -> Result<crate::release_tools::Cutter, String> {
         crate::release_tools::clean_at(&self.repo, commit)?;
-        if let Ok(cutter) = crate::release_tools::recorded_cutter(&self.release, commit) {
+        if crate::release_tools::Recovery::read(commit) != crate::release_tools::Recovery::Refreeze
+            && let Ok(cutter) = crate::release_tools::recorded_cutter(&self.release, commit)
+        {
             return Ok(cutter);
         }
         // A dep-info proof of this exact candidate already proves the launcher's build. Copy
@@ -3615,6 +3682,88 @@ fn scrub(cmd: &mut Command) {
     scrub_names(cmd, std::env::vars_os().map(|(name, _)| name));
 }
 
+/// The engine source a release named when it started (`--engine`, else `PUBLICATION_ENGINE`, else
+/// `~/publication`), handed to the frozen cutter it execs in place ([`Backend::exec_cutter`]).
+/// That image is also named the release's own copy as `PUBLICATION_ENGINE`, the engine a cutter
+/// older than this handover syncs in place. A cutter that reads it takes the same source as the
+/// release that execed it, so its own sync makes the copy where none exists yet and makes a
+/// clean copy of another origin again from that source ([`Real::engine_copy`]). The first exec
+/// comes before step 1 and the release's sync (a bump's second hop comes after it), so engine
+/// discovery belongs to R's own cutter.
+const ENGINE_SOURCE_ENV: &str = "ATERM_RELEASE_ENGINE_SOURCE";
+
+/// The engine repository (`OWNER/REPO`) a release captured when it started, handed beside
+/// [`ENGINE_SOURCE_ENV`]: the authority the exec'd image holds to ([`engine_authority`]), or
+/// [`ENGINE_REPOSITORY_NONE`] where the release admitted none.
+const ENGINE_REPOSITORY_ENV: &str = "ATERM_RELEASE_ENGINE_REPOSITORY";
+
+/// [`ENGINE_REPOSITORY_ENV`] where the release admitted no engine repository: the image refuses
+/// as the release would, with its reason ([`ENGINE_REPOSITORY_WHY_ENV`]), and hands the same to
+/// the next image it execs, however many hops follow.
+const ENGINE_REPOSITORY_NONE: &str = "none";
+
+/// Why a release that admitted no engine repository ([`ENGINE_REPOSITORY_NONE`]) refused it: the
+/// capture's own refusal, which the exec'd image refuses with in turn, unchanged.
+const ENGINE_REPOSITORY_WHY_ENV: &str = "ATERM_RELEASE_ENGINE_REPOSITORY_WHY";
+
+/// Hand `cmd`, a release's own frozen cutter, the engine `source` the release named and the
+/// repository it `captured` ([`ENGINE_SOURCE_ENV`], [`ENGINE_REPOSITORY_ENV`]), or why it
+/// admitted none ([`ENGINE_REPOSITORY_WHY_ENV`]).
+fn hand_engine_capture(cmd: &mut Command, source: &Path, captured: &Result<agh::Slug, String>) {
+    cmd.env(ENGINE_SOURCE_ENV, source);
+    match captured {
+        Ok(slug) => cmd.env(ENGINE_REPOSITORY_ENV, slug.to_string()),
+        Err(why) => cmd
+            .env(ENGINE_REPOSITORY_ENV, ENGINE_REPOSITORY_NONE)
+            .env(ENGINE_REPOSITORY_WHY_ENV, why),
+    };
+}
+
+/// The engine repository this release holds to: the one its engine source names (`named`),
+/// unless it was `handed` one ([`ENGINE_REPOSITORY_ENV`]) by the release that execed it, which it
+/// then holds to, accepting only a source naming that one, and refusing where that release
+/// admitted none ([`ENGINE_REPOSITORY_NONE`]), with the reason it was handed (`why`,
+/// [`ENGINE_REPOSITORY_WHY_ENV`]). A handover can only refuse, never widen: every engine
+/// operation also checks the source's own name against it ([`Real::engine_remote`]).
+fn engine_authority(
+    named: Result<agh::Slug, String>,
+    handed: Option<std::ffi::OsString>,
+    why: Option<std::ffi::OsString>,
+) -> Result<agh::Slug, String> {
+    let Some(handed) = handed.filter(|handed| !handed.is_empty()) else {
+        return named;
+    };
+    if handed == ENGINE_REPOSITORY_NONE {
+        return Err(why.filter(|why| !why.is_empty()).map_or_else(
+            || {
+                "the release that started this cutter admitted no publication engine repository"
+                    .into()
+            },
+            |why| why.to_string_lossy().into_owned(),
+        ));
+    }
+    let handed = handed
+        .to_str()
+        .and_then(|handed| agh::Slug::parse(handed).ok())
+        .ok_or_else(|| {
+            format!(
+                "{ENGINE_REPOSITORY_ENV} names no OWNER/REPO: {}",
+                handed.to_string_lossy()
+            )
+        })?;
+    match named {
+        Ok(named) if named == handed => Ok(handed),
+        Ok(named) => Err(format!(
+            "the release that started this cutter captured {handed} as its publication engine, \
+             and the engine it handed it names {named}"
+        )),
+        Err(why) => Err(format!(
+            "the release that started this cutter captured {handed} as its publication engine, \
+             and the engine it handed it names no repository: {why}"
+        )),
+    }
+}
+
 /// A direct generator has an explicit runtime manifest from the checked artifact.
 /// Keep that value after removing the launcher's inherited Cargo environment.
 fn scrub_fixture_command(cmd: &mut Command) {
@@ -3633,9 +3782,12 @@ fn scrub_fixture_command(cmd: &mut Command) {
 /// been handed ([`RELEASE_CUTTER_ENV`], [`RELEASE_CUTTER_SINCE_ENV`]), which a child has only
 /// from [`hand_this_cutter`], step 7's gate ([`PUBLISH_GATE_ENV`]), which only the source's
 /// `pub publish` is handed ([`Branches::source`]), the build-inputs seal it may have been handed
-/// ([`crate::build_inputs::SEAL_ENV`]), which a child has only from [`hand_inputs_seal`], and a
+/// ([`crate::build_inputs::SEAL_ENV`]), which a child has only from [`hand_inputs_seal`], a
 /// disk claim it may have been named ([`aterm_capacity::DISK_COVER_ENV`]), which a child has
-/// only from this release's own claim ([`Real::scrubbed`]).
+/// only from this release's own claim ([`Real::scrubbed`]), and the engine source and repository
+/// a release captured ([`ENGINE_SOURCE_ENV`], [`ENGINE_REPOSITORY_ENV`],
+/// [`ENGINE_REPOSITORY_WHY_ENV`]), which only its own frozen cutter is handed
+/// ([`hand_engine_capture`]).
 fn scrub_names(cmd: &mut Command, inherited: impl IntoIterator<Item = std::ffi::OsString>) {
     for name in inherited {
         if let Some(name) = name.to_str()
@@ -3643,9 +3795,16 @@ fn scrub_names(cmd: &mut Command, inherited: impl IntoIterator<Item = std::ffi::
                 || launcher_env(name)
                 || name == RELEASE_CUTTER_ENV
                 || name == RELEASE_CUTTER_SINCE_ENV
+                || name == crate::release_tools::RECORD_ENV
+                || name == crate::release_tools::FREEZER_ENV
+                || name == crate::release_tools::CONTRACT_ENV
+                || name == crate::release_tools::REFREEZE_ENV
                 || name == PUBLISH_GATE_ENV
                 || name == crate::build_inputs::SEAL_ENV
-                || name == aterm_capacity::DISK_COVER_ENV)
+                || name == aterm_capacity::DISK_COVER_ENV
+                || name == ENGINE_SOURCE_ENV
+                || name == ENGINE_REPOSITORY_ENV
+                || name == ENGINE_REPOSITORY_WHY_ENV)
         {
             cmd.env_remove(name);
         }
@@ -5475,13 +5634,20 @@ impl Backend for Real {
             return engine_rows_in(&text, commit);
         }
         // Before its sync delivers them, the rows the release's engine holds unpushed are as
-        // recorded as the origin's: a publish whose ledger push failed published its commit.
+        // recorded as the origin's: a publish whose ledger push failed published its commit. Only
+        // a copy naming the repository this release captured holds that repository's rows; one
+        // naming another holds the other's, which its sync keeps there and never delivers here.
         let copy = crate::gates::engine_copy(&self.release);
-        let text = crate::gates::unpushed_ledger(&copy, &|cmd| self.output_forwarded(cmd))
-            .map_or_else(
-                || text.clone(),
-                |unpushed| crate::gates::ledger_with_unpushed(&text, &unpushed),
-            );
+        let captured = self.engine_repository.as_ref().is_ok_and(|captured| {
+            crate::github_remote::origin_slug(&copy).is_ok_and(|named| &named == captured)
+        });
+        let unpushed = captured
+            .then(|| crate::gates::unpushed_ledger(&copy, &|cmd| self.output_forwarded(cmd)))
+            .flatten();
+        let text = unpushed.map_or_else(
+            || text.clone(),
+            |unpushed| crate::gates::ledger_with_unpushed(&text, &unpushed),
+        );
         engine_rows_in(&text, commit)
     }
 
@@ -5998,7 +6164,10 @@ impl Backend for Real {
     }
 
     fn own_cutter(&mut self, commit: &str) -> Result<String, crate::cutter::NotOwn> {
-        crate::gates::own_frozen_cutter(commit)
+        crate::gates::own_frozen_cutter(commit).map_err(|mut not| {
+            not.fix = self.cutter_retry();
+            not
+        })
     }
 
     fn frozen_commit(&mut self) -> Option<String> {
@@ -6008,28 +6177,33 @@ impl Backend for Real {
         }
     }
 
+    fn cutter_recovery(&mut self, commit: &str) -> crate::release_tools::Recovery {
+        crate::release_tools::Recovery::read(commit)
+    }
+
     fn exec_cutter(&mut self, commit: &str, prover: &Prover) -> Result<(), Refusal> {
+        let retry = self.cutter_retry();
         let cannot = |why: String| {
             Refusal::new(
                 format!("cannot exec R's frozen cutter ({why})"),
-                format!("run {RELEASE_COMMAND} again from the clone"),
+                retry.clone(),
             )
         };
         if interrupt::caught().is_some() {
             return Err(cannot("not started: the release was interrupted".into()));
         }
         let cutter = self.frozen_cutter(commit, prover).map_err(cannot)?;
-        let mut command = self.scrubbed(&cutter.tool.path);
-        command.args(&self.argv).current_dir(&self.repo).env(
-            crate::release_tools::RECORD_ENV,
-            crate::release_tools::cutter_record_path(&self.release),
+        let mut command = self.cutter_command(&cutter.tool.path);
+        // The writer's identity is independent of the target it just built. A failed legacy
+        // proof cannot supply it; the explicit re-freeze marker still bounds that repair.
+        let freezer =
+            crate::cutter::running_stamp().map_or("unproved", crate::cutter::Stamp::commit);
+        crate::release_tools::Recovery::read(commit).hand(
+            &mut command,
+            commit,
+            freezer,
+            std::env::var_os(crate::release_tools::REFREEZE_ENV).as_deref(),
         );
-        for name in std::env::vars_os().map(|(name, _)| name).filter(|name| {
-            name.to_str()
-                .is_some_and(|name| name.starts_with("TRUST_TARGO_"))
-        }) {
-            command.env_remove(name);
-        }
         #[cfg(unix)]
         self.hand_exec_guards(&mut command, prover)
             .map_err(cannot)?;
@@ -9021,6 +9195,21 @@ mod tests {
             return false;
         };
         let (repo, r) = setup_crlf_fixture_repos(&root);
+        // The configuration the parent chose is what this probe's own git reads (it was started
+        // with `crate::ledger::testing::CHOSEN_GIT_ENV`), not the test binary's hermetic one.
+        let host = GitCli::new(&repo);
+        let read = |args: &[&str]| {
+            crate::ledger::GitRunner::git(&host, args)
+                .unwrap()
+                .stdout_utf8()
+                .trim()
+                .to_owned()
+        };
+        assert_eq!(read(&["config", "core.autocrlf"]), "true");
+        assert_eq!(
+            read(&["check-attr", "eol", "--", "notes.txt"]),
+            "notes.txt: eol: crlf"
+        );
         let lf = |tree: &Path, notes: &str, with_sub: bool| {
             let read = |rel: &str| fs::read_to_string(tree.join(rel)).unwrap();
             assert_eq!(read("bin/pub"), "#!/bin/sh\n", "{}", tree.display());
@@ -9152,6 +9341,7 @@ mod tests {
             .env("XDG_STATE_HOME", root.join("state"))
             .env("GIT_CONFIG_GLOBAL", &config)
             .env("XDG_CONFIG_HOME", root.join("xdg"))
+            .env(crate::ledger::testing::CHOSEN_GIT_ENV, "1")
             .stdin(Stdio::null());
         // The probe is a whole release's git work: the hang detector is a minute in which its
         // fixture tree stops growing, not a minute for all of it.
@@ -10063,6 +10253,253 @@ mod tests {
         let kept = PathBuf::from("/state/aterm-release/inputs-seal/k.toml");
         hand_inputs_seal(&mut cmd, Some(kept.clone()));
         assert_eq!(handed(&cmd), Some(Some(kept.into_os_string())));
+    }
+
+    /// A RELEASE'S OWN FROZEN CUTTER TAKES THE ENGINE SOURCE AND REPOSITORY THE RELEASE CAPTURED:
+    /// the exec hands both ([`hand_engine_capture`]) beside the release's copy as
+    /// `PUBLICATION_ENGINE`, the engine a cutter older than the handover syncs, never the source;
+    /// no other child inherits them ([`scrub_names`]); and the new image (this test binary run with
+    /// the exec's engine handover, `Real::new` reading its environment) takes the release's source
+    /// and holds to its repository ([`engine_authority`]), and hands both to the next image it
+    /// would exec. A source that names another repository since the capture is refused, as is a
+    /// handover from a release that admitted none, with that release's own reason, and either
+    /// refusal is handed on unchanged ([`ENGINE_REPOSITORY_NONE`], [`ENGINE_REPOSITORY_WHY_ENV`]),
+    /// so no later hop adopts what the copy names. NEGATIVE CONTROL: the exec of a release older
+    /// than the handover, which names only the copy, has the image take the copy as its source and
+    /// hold to the other repository the copy names.
+    #[test]
+    fn a_releases_frozen_cutter_takes_the_engine_source_and_repository_it_captured() {
+        const PROBE: &str = "ATERM_RELEASE_ENGINE_CAPTURE_PROBE";
+        const HANDOVER: [&str; 4] = [
+            "PUBLICATION_ENGINE",
+            ENGINE_SOURCE_ENV,
+            ENGINE_REPOSITORY_ENV,
+            ENGINE_REPOSITORY_WHY_ENV,
+        ];
+        let named = |cmd: &Command, name: &str| {
+            cmd.get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(name))
+                .map(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
+        };
+        if let Some(repo) = std::env::var_os(PROBE) {
+            let real = Real::new(Path::new(&repo), None, true, false).unwrap();
+            let next = real.cutter_command(Path::new("/usr/bin/true"));
+            let next = |name: &str| {
+                named(&next, name)
+                    .flatten()
+                    .map(|v| v.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            };
+            println!(
+                "PROBE source={} repository={} next_source={} next_repository={} next_why={}",
+                real.engine_source.display(),
+                real.engine_repository
+                    .as_ref()
+                    .map_or_else(|why| format!("refused: {why}"), ToString::to_string),
+                next(ENGINE_SOURCE_ENV),
+                next(ENGINE_REPOSITORY_ENV),
+                next(ENGINE_REPOSITORY_WHY_ENV),
+            );
+            // A dry run removes its scratch logs when it drops, and `exit` runs no destructor.
+            drop(real);
+            std::process::exit(0);
+        }
+        let slug = |s: &str| agh::Slug::parse(s).unwrap();
+        let handed = |s: &str| Some(std::ffi::OsString::from(s));
+        assert_eq!(
+            engine_authority(Ok(slug("foreign/app")), handed(""), handed("no origin")),
+            Ok(slug("foreign/app"))
+        );
+        assert_eq!(
+            engine_authority(
+                Ok(slug("fixture/app")),
+                handed(ENGINE_REPOSITORY_NONE),
+                handed("no origin")
+            ),
+            Err("no origin".to_owned()),
+            "a release that admitted none is refused for its own reason"
+        );
+        for refused in [
+            engine_authority(Ok(slug("foreign/app")), handed("fixture/app"), None),
+            engine_authority(Err("no origin".into()), handed("fixture/app"), None),
+            engine_authority(Ok(slug("fixture/app")), handed("not one repository"), None),
+            engine_authority(
+                Ok(slug("fixture/app")),
+                handed(ENGINE_REPOSITORY_NONE),
+                None,
+            ),
+            engine_authority(
+                Ok(slug("fixture/app")),
+                handed(ENGINE_REPOSITORY_NONE),
+                handed(""),
+            ),
+        ] {
+            assert!(refused.is_err(), "{refused:?}");
+        }
+        let mut inherited = command("/usr/bin/true");
+        let captured = &HANDOVER[1..];
+        scrub_names(
+            &mut inherited,
+            captured.iter().map(std::ffi::OsString::from),
+        );
+        for name in captured {
+            assert_eq!(
+                named(&inherited, name),
+                Some(None),
+                "{name} is not inherited"
+            );
+        }
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let checkout = |name: &str, url: &str| {
+            let at = root.join(name);
+            crate::ledger::testing::init(&at, &[]);
+            crate::ledger::git_ok(&GitCli::new(&at), &["remote", "add", "origin", url]).unwrap();
+            at
+        };
+        let source = checkout("publication", "https://github.com/fixture/app.git");
+        let copy = checkout("copy", "https://github.com/foreign/app.git");
+        let moved = checkout("moved", "https://github.com/other/app.git");
+        let repo = root.join("aterm");
+        std::fs::create_dir(&repo).unwrap();
+        let probe = |exec: &Command| {
+            let mut cmd = command(std::env::current_exe().unwrap());
+            cmd.args([
+                "--exact",
+                "release_steps::tests::a_releases_frozen_cutter_takes_the_engine_source_and_repository_it_captured",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PROBE, &repo)
+            .stdin(Stdio::null());
+            for name in HANDOVER {
+                cmd.env_remove(name);
+                if let Some(Some(value)) = named(exec, name) {
+                    cmd.env(name, value);
+                }
+            }
+            let out = cmd.output().unwrap();
+            assert!(out.status.success(), "{out:?}");
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            stdout
+                .lines()
+                .find_map(|line| line.split_once("PROBE ").map(|(_, probe)| probe.to_owned()))
+                .unwrap_or_else(|| panic!("no probe line: {stdout}"))
+        };
+        let (s, c, m) = (source.display(), copy.display(), moved.display());
+
+        let mut real = Real::new(&repo, Some(&source), true, false).unwrap();
+        assert_eq!(real.engine_repository, Ok(slug("fixture/app")));
+        // A real run's engine is its copy; this dry one has none made.
+        real.engine.clone_from(&copy);
+        let cutter = Path::new("/usr/bin/true");
+        let exec = real.cutter_command(cutter);
+        assert_eq!(
+            named(&exec, "PUBLICATION_ENGINE"),
+            Some(Some(copy.clone().into_os_string())),
+            "a cutter older than the handover is named the release's copy, never its source"
+        );
+        assert_eq!(
+            probe(&exec),
+            format!(
+                "source={s} repository=fixture/app next_source={s} next_repository=fixture/app \
+                 next_why="
+            )
+        );
+        assert_eq!(
+            probe(&real.scrubbed(cutter)),
+            format!(
+                "source={c} repository=foreign/app next_source={c} next_repository=foreign/app \
+                 next_why="
+            ),
+            "NEGATIVE CONTROL: the exec of a release older than the handover"
+        );
+        real.engine_source.clone_from(&moved);
+        let why = engine_authority(Ok(slug("other/app")), handed("fixture/app"), None).unwrap_err();
+        assert_eq!(
+            probe(&real.cutter_command(cutter)),
+            format!(
+                "source={m} repository=refused: {why} next_source={m} next_repository=none \
+                 next_why={why}"
+            ),
+            "a source naming another repository since the capture"
+        );
+        real.engine_repository = Err("no origin".into());
+        real.engine_source.clone_from(&copy);
+        assert_eq!(
+            probe(&real.cutter_command(cutter)),
+            format!(
+                "source={c} repository=refused: no origin next_source={c} next_repository=none \
+                 next_why=no origin"
+            ),
+            "a release that admitted none, refused for its own reason"
+        );
+    }
+
+    /// NEGATIVE CONTROL: leaking a launch envelope lets a nested cutter mistake the
+    /// parent's proof or retry budget for its own.
+    #[test]
+    fn only_exec_explicitly_hands_the_freezer_envelope() {
+        let names = [
+            crate::release_tools::RECORD_ENV,
+            crate::release_tools::FREEZER_ENV,
+            crate::release_tools::CONTRACT_ENV,
+            crate::release_tools::REFREEZE_ENV,
+        ];
+        let mut cmd = command("/usr/bin/true");
+        scrub_names(&mut cmd, names.map(std::ffi::OsString::from));
+        for name in names {
+            assert!(
+                cmd.get_envs()
+                    .any(|(key, value)| key == name && value.is_none())
+            );
+        }
+    }
+
+    /// NEGATIVE CONTROL for the scrub above: a child that runs this frozen image (step 7's
+    /// `cut --sign`, step 8's `cut`) gets back the record this process was proved by, and no
+    /// part of the freezer envelope. Without it the copy falls back to a dep-info judgment no
+    /// copy passes: 0.177.0 refused at step 7 on 2026-11-08 ("this aterm-release binary is no
+    /// commit's cutter: cannot read …/aterm-release.d") when only the scrub ran. A cutter that
+    /// was not proved hands no record.
+    #[test]
+    fn a_child_of_this_frozen_image_is_handed_its_proof_and_never_the_envelope() {
+        use crate::release_tools::{CONTRACT_ENV, FREEZER_ENV, RECORD_ENV, REFREEZE_ENV};
+        let names = [RECORD_ENV, FREEZER_ENV, CONTRACT_ENV, REFREEZE_ENV];
+        let exe = Path::new("/release/tools/0a/aterm-release");
+        let record = std::ffi::OsStr::new("/release/cutter.toml");
+
+        let mut proved = command("/usr/bin/true");
+        scrub_names(&mut proved, names.map(std::ffi::OsString::from));
+        hand_cutter_with_proof(&mut proved, exe, None, Some(record.to_owned()));
+        let envs: Vec<_> = proved.get_envs().collect();
+        assert!(
+            envs.contains(&(std::ffi::OsStr::new(RECORD_ENV), Some(record))),
+            "{envs:?}"
+        );
+        assert!(
+            envs.contains(&(
+                std::ffi::OsStr::new(RELEASE_CUTTER_ENV),
+                Some(exe.as_os_str())
+            )),
+            "{envs:?}"
+        );
+        for name in [FREEZER_ENV, CONTRACT_ENV, REFREEZE_ENV] {
+            assert!(
+                envs.contains(&(std::ffi::OsStr::new(name), None)),
+                "{name}: {envs:?}"
+            );
+        }
+
+        let mut built = command("/usr/bin/true");
+        scrub_names(&mut built, names.map(std::ffi::OsString::from));
+        hand_cutter_with_proof(&mut built, exe, None, None);
+        assert!(
+            built
+                .get_envs()
+                .any(|(key, value)| key == RECORD_ENV && value.is_none())
+        );
     }
 
     /// Step 1's seal arms keeping in the release state, then takes the seal, whose failure is

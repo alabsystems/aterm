@@ -689,10 +689,8 @@ impl WebTerminal {
             &mut band.center,
             Commit {
                 now,
-                frozen: false,
                 afford,
                 reserved: before,
-                floor: None,
             },
         );
         let (lines, _) = drive::drain_and_pace(&mut band.center, &mut band.gate, now, true);

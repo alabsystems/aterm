@@ -104,9 +104,9 @@ fn a_non_home_warm_grant_wakes_a_sync_to_release_prepared_execution() {
             if cli == Cli::Claude {
                 init_sync_needed(&home, &state_dir, &roster, now, false)
             } else {
-                !cli_sync_due(cli, &home, &state_dir, &config, now)
-                    .unwrap()
-                    .is_empty()
+                // The combined probe may also owe Claude's empty-pool setup. This control
+                // checks the actual prepared grant's contribution for this CLI.
+                matches!(read_resync(&home, &state_dir, &config_dir.join(accounts::ACCOUNTS_FILE), now), ResyncRead::Due(why) if why.contains(cli.id()))
             }
         };
         store.save(&state).unwrap();

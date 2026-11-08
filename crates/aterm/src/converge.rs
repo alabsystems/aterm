@@ -409,7 +409,7 @@ fn accounts_env() -> Result<(aterm_agent::harness::cli::Env, PathBuf, PathBuf), 
 /// `sync.accounts`' read over these places: off where `config`'s `[harness] accounts` says
 /// `"off"` (`accounts_sync_off`, the switch every automatic sync reads; read first, so an off
 /// Mac reads nothing else), no source where none is configured or found, due wherever the
-/// apply's resync would sync (`resync_due`, its own rule: a missing roster, a source that
+/// apply's resync would sync (`read_resync`, its own rule: a missing roster, a source that
 /// changed, another CLI's pool with a row to add), else current.
 fn accounts_at(
     config: Option<&Path>,
@@ -418,20 +418,18 @@ fn accounts_at(
     roster: &Path,
     now: i64,
 ) -> AccountsRead {
-    use aterm_agent::harness::accounts_sync::{
-        accounts_sync_off, has_resync_accounts_source, resync_due,
-    };
+    use aterm_agent::harness::accounts_sync::{ResyncRead, accounts_sync_off, read_resync};
     if accounts_sync_off(config) {
         return AccountsRead::Off;
     }
-    if !has_resync_accounts_source(home, state, roster, now) {
-        return AccountsRead::NoSource(
+    match read_resync(home, state, roster, now) {
+        ResyncRead::NoSource => AccountsRead::NoSource(
             "no fleet accounts source is configured or found on this Mac".to_owned(),
-        );
-    }
-    match resync_due(home, state, roster, now) {
-        Some(why) => AccountsRead::Due(why),
-        None => AccountsRead::Current("the roster is in step with its sources".to_owned()),
+        ),
+        ResyncRead::Due(why) => AccountsRead::Due(why),
+        ResyncRead::Current => {
+            AccountsRead::Current("the roster is in step with its sources".to_owned())
+        }
     }
 }
 
@@ -2938,7 +2936,6 @@ mod tests {
             &home, &state, &roster, now
         ));
         let before = accounts_at(Some(&config), &home, &state, &roster, now);
-        let due = accounts_sync::resync_due(&home, &state, &roster, now);
         assert!(!roster.exists() && !codex.exists() && !state.exists());
         let applied = accounts_sync::resync_for_setup(&home, &state, &roster, now, false);
         let after = accounts_at(Some(&config), &home, &state, &roster, now + 1);
@@ -2956,10 +2953,9 @@ mod tests {
         }
         assert_eq!(std::fs::read_to_string(source).unwrap(), fleet);
         assert!(
-            matches!(before, AccountsRead::Due(_))
-                && due.as_deref().is_some_and(|why| why.contains("codex"))
+            matches!(&before, AccountsRead::Due(why) if why.contains("codex"))
                 && matches!(after, AccountsRead::Current(_)),
-            "before={before:?}; due={due:?}; applied={applied:?}; after={after:?}"
+            "before={before:?}; applied={applied:?}; after={after:?}"
         );
     }
 

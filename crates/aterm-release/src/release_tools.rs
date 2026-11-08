@@ -12,9 +12,72 @@ use crate::ledger::{GitCli, GitRunner as _};
 pub const CUTTER_VERSION: &str = "aterm-release tool 1";
 pub const VERIFY_VERSION: &str = aterm_verify::FROZEN_TOOL_VERSION;
 pub const RECORD_ENV: &str = "ATERM_RELEASE_TOOL_RECORD";
+pub const FREEZER_ENV: &str = "ATERM_RELEASE_FREEZER_COMMIT";
+pub const CONTRACT_ENV: &str = "ATERM_RELEASE_FREEZER_CONTRACT";
+pub const REFREEZE_ENV: &str = "ATERM_RELEASE_REFROZEN_COMMIT";
+pub const CONTRACT: &str = "cutter.toml/1";
 const RECORD: &str = "tool.toml";
 const CUTTER_RECORD: &str = "cutter.toml";
 const SCHEMA: u32 = 1;
+
+/// Recovery permission only; none of these launch hints is a content proof.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Recovery {
+    #[default]
+    Initial,
+    Refreeze,
+    Refuse,
+}
+
+impl Recovery {
+    pub fn read(commit: &str) -> Self {
+        Self::from_launch(commit, crate::cutter::running_stamp().is_ok(), |name| {
+            std::env::var(name).ok()
+        })
+    }
+
+    fn from_launch(commit: &str, has_stamp: bool, get: impl Fn(&str) -> Option<String>) -> Self {
+        // A valid cutter for an earlier candidate is a normal dispatch, not a failed
+        // freeze. Do not consume the next candidate's repair on that transition.
+        if has_stamp {
+            return Self::Initial;
+        }
+        if get(REFREEZE_ENV).as_deref() == Some(commit) {
+            return Self::Refuse;
+        }
+        if get(RECORD_ENV).is_none() {
+            return Self::Initial;
+        }
+        if get(FREEZER_ENV).as_deref() == Some(commit)
+            && get(CONTRACT_ENV).as_deref() == Some(CONTRACT)
+        {
+            Self::Refuse
+        } else {
+            // Pre-envelope freezers (including tool.toml) cannot name their contract.
+            // Re-freeze, never interpret their proof as evidence for this image.
+            Self::Refreeze
+        }
+    }
+
+    pub fn hand(
+        self,
+        command: &mut aterm_uds::spawnfd::Command,
+        commit: &str,
+        freezer: &str,
+        previous: Option<&std::ffi::OsStr>,
+    ) {
+        command
+            .env(FREEZER_ENV, freezer)
+            .env(CONTRACT_ENV, CONTRACT);
+        if self == Self::Refreeze {
+            command.env(REFREEZE_ENV, commit);
+        } else if let Some(previous) = previous {
+            command.env(REFREEZE_ENV, previous);
+        } else {
+            command.env_remove(REFREEZE_ENV);
+        }
+    }
+}
 
 /// The launch proof needs only the cutter. The verifier is built while the frozen cutter's
 /// first steps run, then frozen in the complete tool set before qualification.
@@ -512,6 +575,21 @@ pub fn publish(release: &Path, tools: &ToolSet) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// The proof this process started under, for a child that runs this same frozen image (step 7's
+/// `cut --sign`, step 8's `cut`): the [`RECORD_ENV`] record [`proved_running`] validated, and
+/// only while this process's stamp is that proof ([`crate::cutter::Stamp::Proved`]). A child
+/// is scrubbed of every inherited record and freezer envelope
+/// ([`crate::release_steps`]'s `scrub_names`), and without this record the frozen copy falls
+/// back to a dep-info judgment no copy can pass, since cargo writes no `.d` beside it. The
+/// exec-only envelope ([`FREEZER_ENV`], [`CONTRACT_ENV`], [`REFREEZE_ENV`]) is never handed
+/// with it.
+pub fn proof_for_this_image() -> Option<std::ffi::OsString> {
+    match crate::cutter::running_stamp() {
+        Ok(crate::cutter::Stamp::Proved(_)) => std::env::var_os(RECORD_ENV),
+        _ => None,
+    }
+}
+
 /// Validate the explicit proof handed to a copied cutter at startup. With no proof variable,
 /// answer `Ok(None)` so hand-run verbs retain the dep-info judgment.
 pub fn proved_running(exe: &Path) -> Result<Option<String>, String> {
@@ -519,13 +597,20 @@ pub fn proved_running(exe: &Path) -> Result<Option<String>, String> {
         return Ok(None);
     };
     let record = PathBuf::from(record);
+    let cutter = proved_cutter(exe, &record)?;
+    let repo = std::env::current_dir().map_err(|e| format!("name the release clone: {e}"))?;
+    clean_at(&repo, &cutter.commit)?;
+    Ok(Some(cutter.commit))
+}
+
+fn proved_cutter(exe: &Path, record: &Path) -> Result<Cutter, String> {
     if !record.is_absolute() || record.file_name().and_then(|n| n.to_str()) != Some(CUTTER_RECORD) {
         return Err("the frozen-tool proof does not name an absolute cutter.toml".into());
     }
     let release = record
         .parent()
         .ok_or("the frozen-tool proof has no release directory")?;
-    let text = crate::durable::read_text(&record)
+    let text = crate::durable::read_text(record)
         .map_err(|e| format!("read frozen-tool proof {}: {e}", record.display()))?;
     let cutter: Cutter = aterm_toml::from_str(&text)
         .map_err(|e| format!("parse frozen-tool proof {}: {e}", record.display()))?;
@@ -541,9 +626,7 @@ pub fn proved_running(exe: &Path) -> Result<Option<String>, String> {
             recorded.display()
         ));
     }
-    let repo = std::env::current_dir().map_err(|e| format!("name the release clone: {e}"))?;
-    clean_at(&repo, &cutter.commit)?;
-    Ok(Some(cutter.commit))
+    Ok(cutter)
 }
 
 pub fn clean_at(repo: &Path, commit: &str) -> Result<(), String> {
@@ -571,6 +654,113 @@ mod tests {
     use super::*;
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// NEGATIVE CONTROLS: the old tool.toml path must not veto repair; own-writer failures
+    /// and a second failure must not repair; a marker for a prior candidate cannot veto R.
+    #[test]
+    fn launch_contract_bounds_recovery_without_authenticating_the_proof() {
+        let old = "f".repeat(40);
+        let decide = |fields: &[(&str, &str)]| {
+            Recovery::from_launch(COMMIT, false, |name| {
+                fields
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            })
+        };
+        assert_eq!(decide(&[]), Recovery::Initial);
+        assert_eq!(
+            decide(&[(RECORD_ENV, "/release/tool.toml")]),
+            Recovery::Refreeze
+        );
+        let own = [
+            (RECORD_ENV, "/release/cutter.toml"),
+            (FREEZER_ENV, COMMIT),
+            (CONTRACT_ENV, CONTRACT),
+        ];
+        assert_eq!(decide(&own), Recovery::Refuse);
+        assert_eq!(
+            decide(&[
+                (RECORD_ENV, "/release/cutter.toml"),
+                (FREEZER_ENV, &old),
+                (CONTRACT_ENV, CONTRACT)
+            ]),
+            Recovery::Refreeze
+        );
+        assert_eq!(
+            decide(&[
+                (RECORD_ENV, "/release/cutter.toml"),
+                (FREEZER_ENV, COMMIT),
+                (CONTRACT_ENV, "older")
+            ]),
+            Recovery::Refreeze
+        );
+        assert_eq!(
+            decide(&[(RECORD_ENV, "/release/tool.toml"), (REFREEZE_ENV, COMMIT)]),
+            Recovery::Refuse
+        );
+        assert_eq!(decide(&[(REFREEZE_ENV, COMMIT)]), Recovery::Refuse);
+        assert_eq!(
+            decide(&[(RECORD_ENV, "/release/tool.toml"), (REFREEZE_ENV, &old)]),
+            Recovery::Refreeze
+        );
+        assert_eq!(
+            Recovery::from_launch(COMMIT, true, |name| match name {
+                RECORD_ENV => Some("/release/cutter.toml".into()),
+                FREEZER_ENV | REFREEZE_ENV => Some(COMMIT.into()),
+                CONTRACT_ENV => Some(CONTRACT.into()),
+                _ => None,
+            }),
+            Recovery::Initial,
+            "a valid stamp dispatches normally even after a prior repair"
+        );
+        for (recovery, prior, expected) in [
+            (Recovery::Initial, None, None),
+            (Recovery::Refreeze, None, Some(COMMIT)),
+            (Recovery::Initial, Some(COMMIT), Some(COMMIT)),
+        ] {
+            let mut command = aterm_uds::spawnfd::command("/usr/bin/true");
+            recovery.hand(
+                &mut command,
+                COMMIT,
+                COMMIT,
+                prior.map(std::ffi::OsStr::new),
+            );
+            let env = command
+                .get_envs()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(
+                env[std::ffi::OsStr::new(REFREEZE_ENV)],
+                expected.map(std::ffi::OsStr::new)
+            );
+            assert_eq!(
+                env[std::ffi::OsStr::new(FREEZER_ENV)],
+                Some(std::ffi::OsStr::new(COMMIT))
+            );
+            assert_eq!(
+                env[std::ffi::OsStr::new(CONTRACT_ENV)],
+                Some(std::ffi::OsStr::new(CONTRACT))
+            );
+        }
+    }
+
+    /// NEGATIVE CONTROL: accepting the legacy proof bypasses the re-freeze; trusting the
+    /// repair hint instead of the new proof accepts the deliberately mutated image.
+    #[test]
+    fn legacy_tool_record_needs_a_new_content_proof() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let (release, _, _, old) = staged_fixture(temp.path());
+        publish(&release, &old).unwrap();
+        assert!(proved_cutter(&old.cutter.path, &record_path(&release)).is_err());
+        let repaired = stage_cutter(&release, COMMIT, &old.cutter.path).unwrap();
+        publish_cutter(&release, &repaired).unwrap();
+        assert_eq!(
+            proved_cutter(&repaired.tool.path, &cutter_record_path(&release)).unwrap(),
+            repaired
+        );
+        std::fs::write(&repaired.tool.path, b"invalid replacement").unwrap();
+        assert!(proved_cutter(&repaired.tool.path, &cutter_record_path(&release)).is_err());
+    }
 
     /// NEGATIVE CONTROLS: requiring a verifier prevents the first proof; accepting another
     /// commit, path, schema or changed image makes one of the mutated bindings pass.

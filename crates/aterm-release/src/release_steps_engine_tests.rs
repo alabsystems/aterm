@@ -603,10 +603,11 @@ fn step_one_and_a_dry_run_judge_the_origins_ledger_and_a_synced_run_its_own() {
     assert_eq!(w.real(true).engine, w.copy());
 }
 
-/// EVERY CHILD OF A REAL RUN IS HANDED THE RELEASE'S ENGINE, AND THE RE-RUN AS R'S OWN CUTTER,
-/// handed it as its engine, runs it in place: `PUBLICATION_ENGINE` names the copy for each child
-/// (`pub` itself, `ship cut`, which reads its ledger, `verify`, which reads its baseline), even
-/// before step 2 makes it; a backend named the copy keeps it and syncs it from its own origin.
+/// EVERY CHILD OF A REAL RUN IS HANDED THE RELEASE'S ENGINE, AND A BACKEND NAMED THAT COPY RUNS
+/// IT IN PLACE: `PUBLICATION_ENGINE` names the copy for each child (`pub` itself, `ship cut`,
+/// which reads its ledger, `verify`, which reads its baseline), even before step 2 makes it; a
+/// backend named the copy (by hand, or as a release older than the engine handover execs R's
+/// cutter) keeps it and syncs it from its own origin.
 /// NEGATIVE CONTROL: a dry run with no copy hands the checkout it was named.
 #[test]
 fn every_child_of_a_real_run_is_handed_the_releases_engine() {
@@ -635,7 +636,8 @@ fn every_child_of_a_real_run_is_handed_the_releases_engine() {
     );
 
     real.engine_sync().unwrap();
-    // The re-run as R's own cutter: named the copy, it runs it in place, from its own origin.
+    // A backend named the copy, as a release older than the handover execs R's cutter: it runs
+    // it in place, from its own origin.
     w.peer_lands_code("pub-again");
     bind_native_engine_fixture(&copy, &w.origin);
     let mut again = Real::new(&w.repo, Some(&copy), false, false).unwrap();
@@ -780,6 +782,42 @@ fn step_one_counts_the_rows_the_releases_engine_holds_unpushed() {
     next.engine_sync().unwrap();
     assert!(next.engine_rows(Some(&r)).has);
     assert!(git_in(&w.origin, &["show", "main:mappings.json"]).contains(&r));
+}
+
+/// STEP 1 COUNTS NO UNPUSHED ROW OF A COPY NAMING ANOTHER REPOSITORY: the release's engine holds
+/// a committed ledger row of R its origin lacks, but names foreign/app, not the fixture/app this
+/// release captured. That row is foreign/app's record, so step 1 (a dry run too) judges R by the
+/// captured repository's ledger alone, which has none. NEGATIVE CONTROL: the same copy naming the
+/// captured repository again has its row counted.
+#[test]
+fn step_one_counts_no_unpushed_row_of_a_copy_naming_another_repository() {
+    let w = World::new();
+    w.real(false).engine_sync().unwrap();
+    let copy = w.copy();
+    let r = "d".repeat(40);
+    std::fs::write(
+        copy.join("mappings.json"),
+        format!(
+            "{{\"mappings\":{{\"aterm\":{{\"{r}\":{{\"verified_at\":\"2026-11-07T20:00:00Z\",\
+             \"release_rev\":\"e2\"}}}}}}}}\n"
+        ),
+    )
+    .unwrap();
+    git_in(&copy, &["commit", "-q", "-am", "feat(ledger): aterm"]);
+    let captured = git_in(&copy, &["remote", "get-url", "origin"]);
+    let counted = |named: &str| {
+        git_in(&copy, &["remote", "set-url", "origin", named]);
+        [true, false].map(|dry| {
+            let mut next = w.real(dry);
+            next.fetch_engine_origin().unwrap();
+            next.engine_rows(Some(&r)).has
+        })
+    };
+    assert_eq!(
+        counted("https://github.com/foreign/app.git"),
+        [false, false]
+    );
+    assert_eq!(counted(&captured), [true, true], "NEGATIVE CONTROL");
 }
 
 /// The peer lands `path` holding `text` on the engine's origin.

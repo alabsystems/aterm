@@ -124,6 +124,7 @@ struct World {
     /// reads it (`release_steps::site_outcome`).
     site: Result<crate::site::Outcome, crate::site::Failure>,
     own_cutter: bool,
+    cutter_recovery: crate::release_tools::Recovery,
     warming_active: bool,
     unrecorded_hops: BTreeSet<String>,
     asks: Vec<String>,
@@ -310,6 +311,7 @@ impl World {
             after_cut: Ok("the release's shape checked".into()),
             site: Ok(crate::site::Outcome::Synced { deployed: true }),
             own_cutter: true,
+            cutter_recovery: crate::release_tools::Recovery::Initial,
             warming_active: false,
             unrecorded_hops: BTreeSet::new(),
             asks: Vec::new(),
@@ -1368,6 +1370,9 @@ impl Backend for World {
                 fix: "the verdict's own remedy".into(),
             })
         }
+    }
+    fn cutter_recovery(&mut self, _commit: &str) -> crate::release_tools::Recovery {
+        self.cutter_recovery
     }
     fn exec_cutter(&mut self, commit: &str, _prover: &Prover) -> Result<(), Refusal> {
         self.calls.push("exec-cutter".into());
@@ -3908,6 +3913,44 @@ fn a_continued_cutter_that_is_still_foreign_never_execs_again() {
         "{last}"
     );
     assert_eq!(w.count("exec-cutter"), 0, "{:?}", w.calls);
+}
+
+/// NEGATIVE CONTROLS: retaining the continued-claim veto prevents the repair; ignoring the
+/// retry marker repeats exec; treating the repair hint as a proof reaches step 1 too early.
+#[test]
+fn an_old_contract_refreezes_once_and_only_the_proved_image_continues() {
+    use crate::release_tools::Recovery;
+    let options = ReleaseOptions {
+        commit: Some(TIP.into()),
+        ..mac()
+    };
+    let mut w = world_after_cutter_exec(true);
+    w.own_cutter = false;
+    w.cutter_recovery = Recovery::Refreeze;
+    w.exec_result = Ok(());
+    assert_eq!(w.run(options.clone()).0, 0);
+    assert_eq!(w.count("exec-cutter"), 1);
+    assert_eq!(w.exec_commit.as_deref(), Some(TIP));
+    assert_eq!(w.count("validation-tools"), 0);
+
+    // A failed replacement must not retry, even when the continued claim was lost.
+    let mut invalid = World::new();
+    invalid.own_cutter = false;
+    invalid.cutter_recovery = Recovery::Refuse;
+    assert_eq!(invalid.run(options.clone()).0, 1);
+    assert_eq!(invalid.count("exec-cutter"), 0);
+    assert_eq!(invalid.count("validation-tools"), 0);
+
+    w.own_cutter = true;
+    w.cutter_recovery = Recovery::Refuse;
+    w.audits = VecDeque::from([passes()]);
+    assert_eq!(w.run(options).0, 0, "{:#?}", w.out);
+    assert_eq!(
+        w.count("exec-cutter"),
+        1,
+        "the proved replacement did not exec again"
+    );
+    assert_eq!(w.count("validation-tools"), 1);
 }
 #[test]
 fn a_judge_that_cannot_answer_stops_at_minute_one() {

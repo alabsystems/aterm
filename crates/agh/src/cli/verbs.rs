@@ -816,6 +816,22 @@ pub static VERBS: &[Verb] = &[
         run: cmd_repo::repo_fetch,
     },
     Verb {
+        path: &["repo", "commit-ancestry"],
+        class: Class::Git,
+        usage: "agh repo commit-ancestry REPO DIR --input FILE [--anonymous]",
+        summary: "bounded exact commit-only intake and original parent ancestry; no refs or trees fetched",
+        example: "agh repo commit-ancestry alabsystems/aterm . --input commits.json",
+        noun: Noun::Raw,
+        gh: "-",
+        milestone: 2,
+        flags: &[value(
+            "--input",
+            "JSON {commits:[OID],queries:[{ancestor,descendant}]} with exact immutable OIDs",
+        )],
+        positionals: &["REPO", "DIR"],
+        run: cmd_repo::repo_commit_ancestry,
+    },
+    Verb {
         path: &["repo", "fetch-main"],
         class: Class::Git,
         usage: "agh repo fetch-main REPO DIR",

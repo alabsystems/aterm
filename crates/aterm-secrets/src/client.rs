@@ -7880,9 +7880,11 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
         away: &away,
     };
     let projection = projection::Projection::observing(
+        paths,
         &converging,
         convergence_inputs(paths, ConvergenceRole::Subscriber),
-    );
+    )
+    .logging(log);
     let run = |maintain: &mut dyn FnMut() -> member_routes::Status| {
         subscriber_loop_projecting(paths, log, &|| false, &hearing, &projection, maintain)
     };
@@ -7981,7 +7983,7 @@ fn subscriber_loop_until(
     converging: &Converging<'_>,
     hearing: &Hearing<'_>,
 ) -> crate::Result<()> {
-    let projection = projection::Projection::new(converging);
+    let projection = projection::Projection::new(paths, converging).logging(log);
     subscriber_loop_projecting(paths, log, stop, hearing, &projection, &mut || {
         member_routes::Status {
             listening: false,
@@ -8010,12 +8012,9 @@ fn subscriber_loop_projecting(
     let mut notary = release::NotaryRounds::default();
     // `[swarm] enabled = false` holds every round: no ask, long-poll, apply or converge pass
     // until it is on again, looked at each [`SWARM_LOOK`] at the cost of one `stat`.
-    let mut swarm = crate::swarm::Switch::new(&paths.home);
-    let mut held = false;
-    if swarm_lets(&mut swarm, &mut held, "this subscriber", log) {
+    if projection.allowed() {
         projection.start();
     } else {
-        // The first healthy pass once sharing is on starts it.
         projection.failed();
     }
     loop {
@@ -8035,7 +8034,7 @@ fn subscriber_loop_projecting(
             log("this program was replaced on disk; exiting so the service starts the new one");
             return Ok(());
         }
-        if !swarm_lets(&mut swarm, &mut held, "this subscriber", log) {
+        if !projection.allowed() {
             projection.failed();
             (hearing.hold)();
             std::thread::sleep(SWARM_LOOK);
@@ -8046,6 +8045,8 @@ fn subscriber_loop_projecting(
         // follows the network round; the healthy listener remains independent of its HTTP.
         if !listener.listening {
             projection.poll();
+        } else {
+            projection.resume();
         }
         // Whether or not the vault's source answers: the members on this LAN can let this Mac
         // in while it cannot be reached.

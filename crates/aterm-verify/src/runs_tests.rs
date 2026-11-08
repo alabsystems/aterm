@@ -872,7 +872,7 @@ fn a_held_programs_environment_is_never_read() {
     assert_eq!(
         lines[0],
         "the verify run of pid 41983 (/wt-a) left 2 processes: named aterm \u{d7}1, \
-         targo \u{d7}1; 1 held at macOS's program check, not judged"
+         targo \u{d7}1; 1 not observed running, program-check cause unconfirmed; not judged"
     );
     assert!(
         dir.path().join("41983-999.run").exists(),
@@ -884,7 +884,7 @@ fn a_held_programs_environment_is_never_read() {
     assert_eq!(
         lines[0],
         "the verify run of pid 41983 (/wt-a) left 1 processes: named targo \u{d7}1; \
-         1 held at macOS's program check, not judged"
+         1 not observed running, program-check cause unconfirmed; not judged"
     );
     assert!(
         dir.path().join("41983-999.run").exists(),
@@ -1407,7 +1407,7 @@ fn the_run_end_sweep_ends_this_runs_own_orphans() {
     assert_eq!(
         lines[1],
         "the run left 4 processes: ended aterm \u{d7}1; named aterm \u{d7}2, ssh-agent \u{d7}1; \
-         1 held at macOS's program check, not judged",
+         1 not observed running, program-check cause unconfirmed; not judged",
         "{lines:?}"
     );
     let before = std::fs::read(&path).expect("own record before leftover finish");
@@ -2527,7 +2527,7 @@ impl Drop for Launcher {
 /// so it would be counted unjudged and the record kept. NEGATIVE CONTROLS: make
 /// `Judge::judge`'s `w_run` false, and the marked survivor is left too: nothing is ended; list
 /// every process of this user while another test's copy of this binary is held, and the pass
-/// says `1 held at macOS's program check, not judged`.
+/// says `1 not observed running, program-check cause unconfirmed; not judged`.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_sigkilled_runs_marked_orphan_is_ended_by_the_next_runs_start_pass() {

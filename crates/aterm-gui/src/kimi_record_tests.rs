@@ -591,6 +591,7 @@ pub(crate) fn honest_record() -> Option<Vec<Pending>> {
 
 /// The record of the honest `cat README.md` box, standing, its request asked at `ms` (wall-clock
 /// milliseconds since the Unix epoch) instead of when it was measured.
+#[cfg(unix)]
 pub(crate) fn honest_record_asked_at(ms: u64) -> Option<Vec<Pending>> {
     let measured = "\"time\":1794115339426";
     assert_eq!(

@@ -3302,12 +3302,7 @@ fn a_front_door_failure_after_the_send_is_delivered() {
     let dir = tokened_socket_dir("fdsend");
     let sock = dir.join("mock.sock");
     let sock_str = sock.to_str().expect("utf8 path").to_string();
-    // The stand-ins answer the accept probe, so each accept is held to the hang detector too.
-    let send = |reply| {
-        with_accept_within(HANG_DETECTOR, || {
-            front_door_send_within(&sock_str, "spawn\n", HANG_DETECTOR, reply)
-        })
-    };
+    let send = |reply| front_door_send_within(&sock_str, "spawn\n", HANG_DETECTOR, reply);
 
     let refused = send(HANG_DETECTOR).expect_err("nothing listens");
     assert!(!front_door_delivered(&refused), "{refused}");
@@ -3462,11 +3457,8 @@ fn a_front_door_ask_counts_an_aterm_only_where_it_answers() {
             return;
         }
     });
-    // This server answers the accept probe, so its accept is held to the hang detector too.
     assert_eq!(
-        with_accept_within(HANG_DETECTOR, || {
-            front_door_ask_at(&path, ("status\n", HANG_DETECTOR), running)
-        }),
+        front_door_ask_at(&path, ("status\n", HANG_DETECTOR), running),
         FrontDoorAnswer::Answered("OK schema=1 fleet=off".to_owned())
     );
     srv.join().expect("mock server");
@@ -4116,6 +4108,123 @@ fn a_forward_whose_host_went_away_is_a_replacement_not_a_refusal() {
     successor.join().expect("successor");
 }
 
+#[cfg(unix)]
+fn serve_required_server(
+    listener: std::os::unix::net::UnixListener,
+    ready: std::sync::mpsc::Sender<()>,
+) -> io::Result<Vec<String>> {
+    use std::io::{BufRead as _, Write as _};
+
+    let (stream, _) = listener.accept()?;
+    stream.set_read_timeout(Some(HANG_DETECTOR))?;
+    stream.set_write_timeout(Some(HANG_DETECTOR))?;
+    ready.send(()).unwrap();
+    let mut reader = std::io::BufReader::new(stream.try_clone()?);
+    let mut writer = &stream;
+    let mut lines = Vec::new();
+    for expected in ["AUTH deadbeef\n", "version\n"] {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(lines);
+        }
+        if line != expected {
+            return Err(io::Error::other("native authentication/probe mismatch"));
+        }
+        lines.push(line);
+    }
+    writer.write_all(b"OK version=native\n")?;
+    let mut request = String::new();
+    if reader.read_line(&mut request)? == 0 {
+        return Ok(lines);
+    }
+    if request != "status\n" {
+        return Err(io::Error::other("native request mismatch"));
+    }
+    lines.push(request);
+    writer.write_all(b"OK native-complete\n")?;
+    Ok(lines)
+}
+
+#[cfg(unix)]
+fn required_server_wait(delayed_reply: bool, age: std::time::Duration) {
+    let dir = tokened_socket_dir(if delayed_reply {
+        "required-reply"
+    } else {
+        "required-accept"
+    });
+    let sock = dir.join("mock.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let (ready, listening) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || serve_required_server(listener, ready));
+    let path = sock.to_str().unwrap();
+    let clock = || {
+        listening
+            .recv_timeout(HANG_DETECTOR)
+            .expect("native listener configured before the client can close");
+        std::time::Instant::now() - age
+    };
+    let reply = if delayed_reply {
+        front_door_send_with_reply_clock(
+            path,
+            "status\n",
+            REQUIRED_SERVER_HANG,
+            REQUIRED_SERVER_HANG,
+            clock,
+        )
+    } else {
+        (|| -> io::Result<String> {
+            match open_accepted_with_clock(path, TargetOrigin::Pinned, Some(HANG_DETECTOR), clock)?
+            {
+                Acceptance::Served(stream) => {
+                    (&stream).write_all(b"status\n")?;
+                    let mut reply = String::new();
+                    reply_on(&stream).read_line(&mut reply)?;
+                    Ok(reply.trim_end().to_owned())
+                }
+                Acceptance::NotAccepted(_) => Err(io::ErrorKind::TimedOut.into()),
+                _ => Err(io::Error::other("a native serving peer was not accepted")),
+            }
+        })()
+    };
+    let served = server
+        .join()
+        .expect("native server joins before the verdict");
+    let lines = served.unwrap();
+    if age < HANG_DETECTOR {
+        assert_eq!(reply.unwrap(), "OK native-complete");
+        assert_eq!(lines, ["AUTH deadbeef\n", "version\n", "status\n"]);
+    } else {
+        let error = reply.expect_err("an elapsed hang detector sends no request");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            !front_door_delivered(&error),
+            "an unsent request has no delivery claim"
+        );
+        if delayed_reply {
+            assert_eq!(lines, ["AUTH deadbeef\n", "version\n"]);
+        } else {
+            assert!(
+                lines.is_empty(),
+                "expired acceptance sends neither auth nor probe"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn required_server_accept_survives_a_scheduled_listener() {
+    required_server_wait(false, std::time::Duration::from_secs(11));
+    required_server_wait(false, std::time::Duration::from_secs(61));
+}
+
+#[cfg(unix)]
+#[test]
+fn required_server_reply_survives_a_scheduled_handler() {
+    required_server_wait(true, std::time::Duration::from_secs(11));
+    required_server_wait(true, std::time::Duration::from_secs(61));
+}
+
 /// A listener that never accepts: the client's connect succeeds into the kernel
 /// queue and nothing ever answers (to the client, the same as an instance that
 /// takes the connection and never answers).
@@ -4155,7 +4264,7 @@ fn a_dead_listen_queue_fails_fast_and_named() {
             open_accepted(&path, TargetOrigin::Pinned, Some(short)),
             Ok(Acceptance::NotAccepted(d)) if d == short
         ),
-        "the connect phase waits the caller's {short:?}, not {ACCEPT_DEADLINE:?}"
+        "the connect phase waits the caller's {short:?}, not {REQUIRED_SERVER_HANG:?}"
     );
 }
 
@@ -4245,17 +4354,15 @@ fn the_retry_after_a_replaced_listener_sends_the_new_token() {
         })
     };
     let path = sock.to_str().expect("utf8").to_string();
-    let outcome = with_accept_within(HANG_DETECTOR, || {
-        exchange(
-            &path,
-            TargetOrigin::Pinned,
-            "status\n",
-            "status",
-            Some(std::time::Duration::from_secs(60)),
-            false,
-            &redial::Redial::none(),
-        )
-    })
+    let outcome = exchange(
+        &path,
+        TargetOrigin::Pinned,
+        "status\n",
+        "status",
+        Some(std::time::Duration::from_secs(60)),
+        false,
+        &redial::Redial::none(),
+    )
     .expect("exchange");
     let (first, lines) = server.join().expect("server");
     assert_eq!(first, ["AUTH deadbeef\n", "version\n"]);
@@ -4346,10 +4453,7 @@ fn a_busy_reply_is_reported_as_busy() {
             .expect("busy");
     });
     let path = sock.to_str().expect("utf8").to_string();
-    let outcome = with_accept_within(HANG_DETECTOR, || {
-        open_accepted(&path, TargetOrigin::Pinned, Some(HANG_DETECTOR))
-    })
-    .expect("open");
+    let outcome = open_accepted(&path, TargetOrigin::Pinned, Some(HANG_DETECTOR)).expect("open");
     server.join().expect("server");
     match outcome {
         Acceptance::Refused(line) => assert_eq!(line, BUSY),

@@ -863,6 +863,11 @@ pub(crate) mod testing {
 
     pub(crate) use aterm_uds::fixture_git::git;
 
+    /// Set by a test that starts its own test binary again with a Git environment it chose (a
+    /// global config, a `GIT_DIR`, a global attributes file), so the restarted binary's load-time
+    /// hook (the integration binary's `hermetic_git`) keeps that environment.
+    pub(crate) const CHOSEN_GIT_ENV: &str = "ATERM_FIXTURE_GIT_CHOSEN";
+
     /// The [`GitRunner`](super::GitRunner) a test hands the code under test:
     /// [`GitCli`](super::GitCli)'s `git -C <repo> <args…>`, run by [`git`] (the direct git,
     /// isolated from this machine) rather than the trampolined `git` on PATH.

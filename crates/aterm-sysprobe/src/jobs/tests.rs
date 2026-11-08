@@ -407,6 +407,8 @@ fn an_arch_answer_gives_its_cpu_type() {
 fn the_program_check_judge_holds_only_an_old_lone_unstarted_thread() {
     let m1 = StartFacts {
         lone_zero: true,
+        user_ns: Some(0),
+        program_check_wait: true,
         stopped: false,
         traced: false,
         translated: false,
@@ -415,6 +417,30 @@ fn the_program_check_judge_holds_only_an_old_lone_unstarted_thread() {
         start_us: None,
     };
     let rows = [
+        (
+            "old fork with no per-process request evidence",
+            StartFacts {
+                program_check_wait: false,
+                ..m1
+            },
+            AtStart::Unstarted,
+        ),
+        (
+            "zero userspace handle but the kernel measured user execution",
+            StartFacts {
+                user_ns: Some(1),
+                ..m1
+            },
+            AtStart::Started,
+        ),
+        (
+            "unread execution time cannot establish a hold",
+            StartFacts {
+                user_ns: None,
+                ..m1
+            },
+            AtStart::Unstarted,
+        ),
         ("M1: one unstarted thread, 21 s", m1, AtStart::Held),
         (
             "M2: a normal exec at its first instruction",
@@ -574,6 +600,8 @@ fn a_held_start_older_than_the_running_syspolicyd_is_stranded_once_that_daemon_a
     );
     let held = StartFacts {
         lone_zero: true,
+        user_ns: Some(0),
+        program_check_wait: true,
         stopped: false,
         traced: false,
         translated: false,
@@ -1931,9 +1959,9 @@ fn a_start_suspended_child_reads_one_unstarted_thread_and_is_not_held() {
         if translated {
             AtStart::Translating
         } else {
-            AtStart::Held
+            AtStart::Unstarted
         },
-        "its stop, not its age, is what excludes it"
+        "removing its stop does not establish a program-check request"
     );
     let f = JobsReader::new()
         .read_all_at(&[ReadReq { pid, fds: false }], later)
@@ -1971,6 +1999,58 @@ fn a_start_suspended_child_reads_one_unstarted_thread_and_is_not_held() {
     let me = read_start(std::process::id(), later).expect("this process reads");
     assert!(!me.lone_zero, "{me:?}");
     drop(held);
+}
+
+/// A running platform image is never a program-check hold, including with an old
+/// fork date and a zero userspace handle. The injected request is the positive
+/// control; removing its evidence must remove the hold.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_running_sleep_is_not_held_and_an_old_fork_is_not_request_evidence() {
+    let mut child = aterm_uds::spawnfd::command("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("sleep starts");
+    let pid = child.id();
+    let mut facts = None;
+    wait_for("sleep executes user instructions", || {
+        facts = read_start(pid, now_us() + 30_000_000);
+        facts.is_some_and(|f| !f.lone_zero || f.user_ns.is_some_and(|ns| ns > 0))
+    });
+    let actual = facts.expect("sleep read");
+    let at = at_start(pid);
+    let ran = aterm_uds::process::thread_ran(pid as i32);
+    child.kill().expect("kill our sleep");
+    child.wait().expect("reap our sleep");
+    assert_eq!(judge_start(&actual), AtStart::Started, "{actual:?}");
+    assert_eq!(at, Some(AtStart::Started));
+    assert_eq!(ran, Some(true));
+    let candidate = StartFacts {
+        lone_zero: true,
+        user_ns: Some(0),
+        age_ms: Some(30_000),
+        local: Some(true),
+        ..StartFacts::default()
+    };
+    assert_eq!(judge_start(&candidate), AtStart::Unstarted);
+    assert_eq!(
+        judge_start(&StartFacts {
+            program_check_wait: true,
+            ..candidate
+        }),
+        AtStart::Held
+    );
+    assert_eq!(
+        judge_start(&StartFacts {
+            user_ns: Some(1),
+            program_check_wait: true,
+            ..candidate
+        }),
+        AtStart::Started
+    );
+    eprintln!(
+        "old-fork zero-handle false hold: before=1 after=0; injected confirmed request: before=1 after=1"
+    );
 }
 
 /// A program stopped by `SIGSTOP` after it ran keeps its threads' handles:

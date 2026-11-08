@@ -113,11 +113,9 @@ pub(crate) fn enter_low_nofile_test_child(spare_descriptors: usize) -> bool {
 const CAPTURE_LOCK_DIR: &str = ".capture-locks";
 const CAPTURE_NAMESPACE_LEASE_FILE: &str = "explicit";
 
-/// How long an explicit capture waits for the previous reply's retention guard before it
-/// refuses: long enough that overlapping drivers queue (a guard is released at its client's
-/// acknowledgement), short enough that a stuck holder is reported rather than hanging the
-/// control thread.
-const CAPTURE_NAMESPACE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Hang detector for an explicit capture waiting for the previous reply's retention guard,
+/// which is released at its client's acknowledgement.
+const CAPTURE_NAMESPACE_HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Stable, collision-resistant identity for this server process instance.
 #[must_use]
@@ -1083,13 +1081,36 @@ pub(crate) fn acquire_capture_name_lease(
     target: &ConfinedImage,
     cancelled: impl Fn() -> bool,
 ) -> std::io::Result<Option<ArtifactPathLease>> {
-    acquire_capture_name_lease_with_wait(target, cancelled, CAPTURE_NAMESPACE_WAIT)
+    acquire_capture_name_lease_started(target, cancelled, std::time::Instant::now())
 }
 
+fn acquire_capture_name_lease_started(
+    target: &ConfinedImage,
+    cancelled: impl Fn() -> bool,
+    started: std::time::Instant,
+) -> std::io::Result<Option<ArtifactPathLease>> {
+    acquire_capture_name_lease_with_wait_started(target, cancelled, CAPTURE_NAMESPACE_HANG, started)
+}
+
+#[cfg(test)]
 pub(crate) fn acquire_capture_name_lease_with_wait(
     target: &ConfinedImage,
     cancelled: impl Fn() -> bool,
     explicit_wait: std::time::Duration,
+) -> std::io::Result<Option<ArtifactPathLease>> {
+    acquire_capture_name_lease_with_wait_started(
+        target,
+        cancelled,
+        explicit_wait,
+        std::time::Instant::now(),
+    )
+}
+
+fn acquire_capture_name_lease_with_wait_started(
+    target: &ConfinedImage,
+    cancelled: impl Fn() -> bool,
+    explicit_wait: std::time::Duration,
+    waited_from: std::time::Instant,
 ) -> std::io::Result<Option<ArtifactPathLease>> {
     let automatic = is_current_automatic_image(target);
     let key = if automatic {
@@ -1104,7 +1125,6 @@ pub(crate) fn acquire_capture_name_lease_with_wait(
     let mut held = leases
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let waited_from = std::time::Instant::now();
     while held.contains_key(&key) {
         if cancelled() {
             return Ok(None);
@@ -4483,7 +4503,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_capture_waiter_acquires_after_reply_release() {
+    fn capture_namespace_default_waits_for_reply_release() {
         let dir = std::env::temp_dir().join(format!("aterm-img-lease-wake-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         ensure_private_dir(&dir).unwrap();
@@ -4492,17 +4512,29 @@ mod tests {
         let first_lease = acquire_capture_name_lease(&first, || false)
             .expect("first lease acquisition")
             .expect("first explicit lease");
+        let expired = std::time::Instant::now() - std::time::Duration::from_secs(61);
+        assert_eq!(
+            acquire_capture_name_lease_started(&first, || false, expired)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(
+            acquire_capture_name_lease_started(&first, || true, expired)
+                .unwrap()
+                .is_none()
+        );
         let second = ConfinedImage::for_test(&dir, "second.png");
         let observed_wait = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_observed_wait = std::sync::Arc::clone(&observed_wait);
         let waiter = std::thread::spawn(move || {
-            acquire_capture_name_lease_with_wait(
+            acquire_capture_name_lease_started(
                 &second,
                 || {
                     worker_observed_wait.store(true, std::sync::atomic::Ordering::Release);
                     false
                 },
-                aterm_spec::wait::MUST_HAPPEN,
+                std::time::Instant::now() - std::time::Duration::from_secs(3),
             )
         });
         aterm_spec::wait::until_within(
@@ -4522,6 +4554,11 @@ mod tests {
             .expect("released predecessor wakes its waiter")
             .expect("waiter acquires the explicit namespace");
         drop(second_lease);
+        drop(
+            acquire_capture_name_lease(&first, || false)
+                .unwrap()
+                .expect("a fresh owner"),
+        );
         drop(first);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4627,7 +4664,7 @@ mod tests {
     /// refusal says why.
     #[test]
     #[cfg(unix)]
-    fn another_processs_namespace_lock_is_waited_for_then_named() {
+    fn capture_namespace_default_waits_for_native_sibling() {
         let dir =
             std::env::temp_dir().join(format!("aterm-img-sibling-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -4641,6 +4678,18 @@ mod tests {
                 .expect("the sibling's own description of the directory"),
         )
         .expect("the sibling holds the namespace");
+        let expired = std::time::Instant::now() - std::time::Duration::from_secs(61);
+        assert_eq!(
+            acquire_capture_name_lease_started(&image, || false, expired)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(
+            acquire_capture_name_lease_started(&image, || true, expired)
+                .unwrap()
+                .is_none()
+        );
         let error = acquire_capture_name_lease_with_wait(
             &image,
             || false,
@@ -4653,7 +4702,7 @@ mod tests {
             "the refusal names the cause: {error}"
         );
         let asks = std::sync::atomic::AtomicUsize::new(0);
-        let lease = acquire_capture_name_lease_with_wait(
+        let lease = acquire_capture_name_lease_started(
             &image,
             || {
                 if asks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 1 {
@@ -4661,7 +4710,7 @@ mod tests {
                 }
                 false
             },
-            aterm_spec::wait::MUST_HAPPEN,
+            std::time::Instant::now() - std::time::Duration::from_secs(3),
         )
         .expect("the queued capture proceeds once the sibling lets go")
         .expect("not cancelled");
@@ -4671,6 +4720,11 @@ mod tests {
         );
         drop(lease);
         drop(sibling);
+        drop(
+            acquire_capture_name_lease(&image, || false)
+                .unwrap()
+                .expect("a fresh native owner"),
+        );
         drop(image);
         let _ = std::fs::remove_dir_all(&dir);
     }

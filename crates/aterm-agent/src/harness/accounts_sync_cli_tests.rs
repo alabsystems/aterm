@@ -874,16 +874,6 @@ fn the_source_table_includes_pending_rows_without_a_sync_or_machine_id() {
         pool_bed.sync(Cli::Codex, None),
         Ok(CliSync::Unlisted { machine: None, .. })
     ));
-    assert_eq!(
-        cli_sync_due(
-            Cli::Codex,
-            &pool_bed.home,
-            &pool_bed.state,
-            &pool_bed.aterm_toml(),
-            NOW,
-        ),
-        Ok(Vec::new())
-    );
     assert!(cli_pools_due(&pool_bed.aterm_toml(), &pool_bed.state, &pool_bed.home, NOW).is_empty());
 }
 
@@ -1275,8 +1265,18 @@ fn the_resync_source_check_keeps_each_pools_policy_and_reports_refused_sources()
     for cli in OTHER_CLIS {
         let bed = Bed::new("resync-pool-source");
         let roster = bed.config.join(accounts::ACCOUNTS_FILE);
-        let has_source = || has_resync_accounts_source(&bed.home, &bed.state, &roster, NOW);
-        assert!(!has_source());
+        let read = Mutex::new(Rediscovery::default());
+        let probe = || {
+            read_resync_with(
+                &bed.home,
+                &bed.state,
+                &roster,
+                NOW,
+                &read,
+                &read_local_source_text,
+            )
+        };
+        assert_eq!(probe(), ResyncRead::NoSource);
         let region = if cli == Cli::Kimi {
             "region = 'global'\n"
         } else {
@@ -1289,29 +1289,41 @@ fn the_resync_source_check_keeps_each_pools_policy_and_reports_refused_sources()
         let source = bed.secrets().join(cli_fleet_file(cli));
         bed.secret(&cli_fleet_file(cli), &fleet);
         assert!(
-            has_source(),
+            matches!(probe(), ResyncRead::Due(_)),
             "{cli:?}: a listed pool syncs by default without a local roster"
         );
         bed.keep_roster(cli);
-        assert!(has_source(), "{cli:?}: a kept roster still has its source");
+        assert!(
+            matches!(probe(), ResyncRead::Due(_)),
+            "{cli:?}: a kept roster still has its source"
+        );
         assert_eq!(fs::read_to_string(&source).unwrap(), fleet);
         assert!(fs::read(bed.roster(cli)).unwrap().is_empty());
         assert!(!bed.state.exists(), "a source read writes no account state");
 
         assert!(matches!(bed.sync(cli, None), Ok(CliSync::Synced(_))));
         assert_eq!(
-            cli_sync_due(cli, &bed.home, &bed.state, &bed.aterm_toml(), NOW),
-            Ok(Vec::new())
+            probe(),
+            ResyncRead::Current,
+            "{cli:?}: the actual sync settled its pool"
         );
-        assert!(has_source(), "{cli:?}: a current pool still has its source");
 
         fs::write(&source, "[[account]\n").unwrap();
-        assert!(has_source(), "{cli:?}: a refused source must be reported");
-        assert!(cli_sync_due(cli, &bed.home, &bed.state, &bed.aterm_toml(), NOW).is_err());
+        assert!(
+            matches!(probe(), ResyncRead::Due(_)),
+            "{cli:?}: a refused source must be reported"
+        );
+        let before = Bed::tree(bed._dir.path());
+        assert!(bed.sync(cli, None).is_err());
+        assert_eq!(
+            Bed::tree(bed._dir.path()),
+            before,
+            "a refused source changes no account records"
+        );
         assert_eq!(fs::read_to_string(&source).unwrap(), "[[account]\n");
         fs::remove_file(bed.roster(cli)).unwrap();
         assert!(
-            has_source(),
+            matches!(probe(), ResyncRead::Due(_)),
             "{cli:?}: a refused source is reported without a local roster"
         );
         crate::test_config::write(
@@ -1319,17 +1331,13 @@ fn the_resync_source_check_keeps_each_pools_policy_and_reports_refused_sources()
             "[fleet]\nmachine = 'm16'\n[harness]\naccounts = 'off'\n",
         )
         .unwrap();
+        let before = Bed::tree(bed._dir.path());
         assert_eq!(
-            resync_due_with(
-                &bed.home,
-                &bed.state,
-                &roster,
-                NOW,
-                &Mutex::new(Rediscovery::default()),
-            ),
-            None,
-            "{cli:?}: Off stops the automatic read before a refused source"
+            resync_for_setup(&bed.home, &bed.state, &roster, NOW, false),
+            Resync::default(),
+            "{cli:?}: Off holds the automatic sync over a refused source"
         );
+        assert_eq!(Bed::tree(bed._dir.path()), before);
     }
 }
 
@@ -1343,8 +1351,18 @@ fn a_pools_converge_read_names_what_its_sync_adds_and_nothing_once_it_ran() {
     let bed = Bed::new("pool-due");
     bed.keep_roster(Cli::Kimi);
     bed.secret(&cli_fleet_file(Cli::Kimi), KIMI_FLEET);
-    let due = || cli_sync_due(Cli::Kimi, &bed.home, &bed.state, &bed.aterm_toml(), NOW);
-    assert_eq!(due(), Ok(vec!["kimi-1".to_owned()]));
+    let read = Mutex::new(Rediscovery::default());
+    let probe = || {
+        read_resync_with(
+            &bed.home,
+            &bed.state,
+            &bed.config.join(accounts::ACCOUNTS_FILE),
+            NOW,
+            &read,
+            &read_local_source_text,
+        )
+    };
+    assert!(matches!(probe(), ResyncRead::Due(why) if why.contains("kimi-1")));
     let Ok(CliSync::Synced(synced)) = bed.sync(Cli::Kimi, None) else {
         panic!("Kimi's pool syncs");
     };
@@ -1353,7 +1371,7 @@ fn a_pools_converge_read_names_what_its_sync_adds_and_nothing_once_it_ran() {
         ["kimi-1"],
         "the read named what the sync added"
     );
-    assert_eq!(due(), Ok(Vec::new()), "nothing left to add");
+    assert_eq!(probe(), ResyncRead::Current, "nothing left to add");
 
     bed.secret(
         &cli_fleet_file(Cli::Kimi),
@@ -1362,24 +1380,15 @@ fn a_pools_converge_read_names_what_its_sync_adds_and_nothing_once_it_ran() {
              machines = [\"m16\"]\nregion = \"global\"\n"
         ),
     );
-    assert_eq!(due(), Ok(vec!["kimi-2".to_owned()]), "the vault's new row");
     assert!(
-        resync_due_with(
-            &bed.home,
-            &bed.state,
-            &bed.config.join(accounts::ACCOUNTS_FILE),
-            NOW,
-            &Mutex::new(Rediscovery::default()),
-        )
-        .is_some_and(|why| why.contains("kimi's pool has accounts to add (kimi-2)")),
-        "the pass's read names the pool"
+        matches!(probe(), ResyncRead::Due(why) if why.contains("kimi-2")),
+        "the vault's new row is due"
     );
 
     let off = Bed::new("pool-due-off");
     off.secret(&cli_fleet_file(Cli::Kimi), KIMI_FLEET);
-    assert_eq!(
-        cli_sync_due(Cli::Kimi, &off.home, &off.state, &off.aterm_toml(), NOW),
-        Ok(vec!["kimi-1".to_owned()]),
+    assert!(
+        matches!(read_resync(&off.home, &off.state, &off.config.join(accounts::ACCOUNTS_FILE), NOW), ResyncRead::Due(why) if why.contains("kimi-1")),
         "CONTROL: a listed pool needs no local roster"
     );
     crate::test_config::write(
@@ -1387,17 +1396,20 @@ fn a_pools_converge_read_names_what_its_sync_adds_and_nothing_once_it_ran() {
         "[fleet]\nmachine = 'm16'\n[harness]\naccounts = 'off'\n",
     )
     .unwrap();
+    let before = Bed::tree(off._dir.path());
     assert_eq!(
-        resync_due_with(
+        resync_for_setup(
             &off.home,
             &off.state,
             &off.config.join(accounts::ACCOUNTS_FILE),
             NOW,
-            &Mutex::new(Rediscovery::default()),
+            false
         ),
-        None,
+        Resync::default(),
         "CONTROL: Off holds a listed pool without a local roster"
     );
+    assert_eq!(Bed::tree(off._dir.path()), before);
+
     let other = Bed::new("pool-due-other");
     other.keep_roster(Cli::Kimi);
     other.secret(
@@ -1406,14 +1418,13 @@ fn a_pools_converge_read_names_what_its_sync_adds_and_nothing_once_it_ran() {
          machines = [\"m22\"]\nregion = \"global\"\n",
     );
     assert_eq!(
-        cli_sync_due(
-            Cli::Kimi,
+        read_resync(
             &other.home,
             &other.state,
-            &other.aterm_toml(),
+            &other.config.join(accounts::ACCOUNTS_FILE),
             NOW
         ),
-        Ok(Vec::new()),
+        ResyncRead::Current,
         "CONTROL: m22's row is not m16's"
     );
 }
@@ -1450,15 +1461,21 @@ fn a_default_pools_converge_read_matches_the_syncs_admission() {
         } else {
             Vec::new()
         };
-        assert_eq!(
-            cli_sync_due(Cli::Codex, &bed.home, &bed.state, &bed.aterm_toml(), NOW),
-            Ok(want.clone()),
-            "{tag}: what the sync would add"
+        let combined = read_resync_with(
+            &bed.home,
+            &bed.state,
+            &claude_roster(&bed),
+            NOW,
+            &Mutex::new(Rediscovery::default()),
+            &read_local_source_text,
         );
-        assert_eq!(
-            has_resync_accounts_source(&bed.home, &bed.state, &claude_roster(&bed), NOW),
-            admitted,
-            "{tag}: only an admitted default pool has work for setup"
+        assert!(
+            if admitted {
+                matches!(combined, ResyncRead::Due(_))
+            } else {
+                combined == ResyncRead::NoSource
+            },
+            "{tag}: the combined read preserves admission: {combined:?}"
         );
         assert_eq!(
             Bed::tree(bed._dir.path()),
@@ -1469,8 +1486,15 @@ fn a_default_pools_converge_read_matches_the_syncs_admission() {
             CliSync::Synced(synced) if admitted => {
                 assert_eq!(synced.added, want);
                 assert_eq!(
-                    cli_sync_due(Cli::Codex, &bed.home, &bed.state, &bed.aterm_toml(), NOW),
-                    Ok(Vec::new()),
+                    read_resync_with(
+                        &bed.home,
+                        &bed.state,
+                        &claude_roster(&bed),
+                        NOW,
+                        &Mutex::new(Rediscovery::default()),
+                        &read_local_source_text
+                    ),
+                    ResyncRead::Current,
                     "{tag}: the applied rows are no longer due"
                 );
             }
@@ -1499,15 +1523,16 @@ fn a_default_pools_converge_read_reports_recovery_before_its_source_gate() {
     fs::write(&receipt, "{").unwrap();
     let before = Bed::tree(bed._dir.path());
     assert!(store.sync_needs_recovery());
-    assert_eq!(
-        cli_sync_due(Cli::Codex, &bed.home, &bed.state, &bed.aterm_toml(), NOW),
-        Ok(vec!["recovery".to_owned()])
-    );
-    assert!(has_resync_accounts_source(
-        &bed.home,
-        &bed.state,
-        &claude_roster(&bed),
-        NOW
+    assert!(matches!(
+        read_resync_with(
+            &bed.home,
+            &bed.state,
+            &claude_roster(&bed),
+            NOW,
+            &Mutex::new(Rediscovery::default()),
+            &|_| panic!("pending recovery is observed before any source is opened"),
+        ),
+        ResyncRead::Due(_)
     ));
     assert_eq!(
         Bed::tree(bed._dir.path()),

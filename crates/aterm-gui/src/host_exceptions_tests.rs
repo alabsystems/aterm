@@ -16,7 +16,6 @@ use aterm_phase::Program;
 use crate::App;
 use crate::harness_host::{AccountsSaid, HostNote, RelaunchSay};
 use crate::message_reporters as mr;
-use crate::messages_host::message_regrids;
 use crate::update_words::{self, HealthKind};
 
 const DAY: Duration = Duration::from_secs(24 * 3600);
@@ -752,7 +751,6 @@ fn a_carried_excerpt_dates_the_day_from_the_end_of_its_day() {
 #[test]
 fn a_supervisor_that_keeps_failing_is_a_record_then_a_line_after_an_hour() {
     let mut app = App::headless_for_test();
-    let message = message_regrids();
     let pause = Duration::from_secs(300);
     let failing = |why: &str| HostNote::SupervisorFailing {
         sid: "s-7".to_string(),
@@ -807,8 +805,7 @@ fn a_supervisor_that_keeps_failing_is_a_record_then_a_line_after_an_hour() {
     });
     assert!(app.ripening_deadline().is_none());
     assert!(app.messages.digest().is_empty());
-    assert_eq!(message_regrids(), message);
-    assert!(app.messages.live_rows().count() == 0, "no band row");
+    assert!(app.messages.live_rows().count() == 0, "no live row");
 }
 
 /// A rating card the harness will not press: a record now, "press 0 in that tab" an hour on,
@@ -973,14 +970,11 @@ fn a_full_disk_is_one_standing_alert_and_what_was_freed_is_a_fact() {
 fn a_developer_tools_reading_posts_nothing() {
     use crate::devtools_watch::Step;
     let mut app = App::headless_for_test();
-    let regrids = message_regrids();
     assert!(app.apply_devtools_step(Step::NotOn { hand_over: true }));
     assert!(!app.apply_devtools_step(Step::NotOn { hand_over: false }));
     assert!(!app.apply_devtools_step(Step::Nothing));
     assert!(!app.apply_devtools_step(Step::Clear));
     assert!(app.messages.digest().is_empty(), "no line, ever");
-    assert_eq!(app.message_band_rows, 0, "never a band row");
-    assert_eq!(message_regrids(), regrids, "no re-grid");
     app.on_devtools_probe_ready();
     assert!(app.messages.digest().is_empty());
 }
@@ -1261,10 +1255,9 @@ fn records_the_view_cannot_read_are_one_line_until_they_read() {
     );
 }
 
-/// What a note of the accounts may never move: the band's rows, a tab's
-/// attention (its strip's bit, its session's badge), and the band's re-grid
-/// count (presence owns no row to re-grid).
-fn glass(app: &App) -> (usize, usize, usize, u64) {
+/// What a note of the accounts may never move: the center's live rows and a tab's
+/// attention (its strip's bit, its session's badge).
+fn glass(app: &App) -> (usize, usize, usize) {
     let marked = app
         .windows
         .values()
@@ -1279,12 +1272,7 @@ fn glass(app: &App) -> (usize, usize, usize, u64) {
             meta.attention.is_some()
         })
         .count();
-    (
-        app.messages.live_rows().count(),
-        marked,
-        badged,
-        message_regrids(),
-    )
+    (app.messages.live_rows().count(), marked, badged)
 }
 
 /// The Claude accounts' lines (`HostNote::Accounts`) mark nothing on the glass: an account signed
@@ -3531,12 +3519,11 @@ fn turning_palette_sets_on_clears_the_refusal_line() {
 }
 
 /// A repaint that gave up is one `render.<tab>.unrepaired` line ("Tab N may be one row off"),
-/// with no tab mark, band row or re-grid, and only while its epoch is the tab's open, at-risk
-/// one: a give-up for a healed epoch, or a session the store does not know, raises nothing.
+/// with no tab mark, and only while its epoch is the tab's open, at-risk one: a give-up for a
+/// healed epoch, or a session the store does not know, raises nothing.
 #[test]
 fn a_repaint_that_gave_up_is_one_line_and_none_for_a_healed_epoch() {
     let mut app = App::headless_for_test();
-    let message = message_regrids();
     app.note_render_unrepaired(404, 7, GiveUp::NoAnswer);
     assert!(app.messages.digest().is_empty());
     let session = app.pool.iter().map(|s| s.id).next().expect("session 0");
@@ -3547,7 +3534,6 @@ fn a_repaint_that_gave_up_is_one_line_and_none_for_a_healed_epoch() {
         "epoch 7 is not at risk: no line"
     );
     assert_eq!(app.messages.digest_revision(), rev, "nothing moved");
-    assert_eq!(message_regrids(), message);
 
     let (registered, sid) = session_with_open_epoch(&mut app, 40);
     app.note_render_unrepaired(registered, 1, GiveUp::NoAnswer);
@@ -3556,7 +3542,6 @@ fn a_repaint_that_gave_up_is_one_line_and_none_for_a_healed_epoch() {
         app.messages.digest().entries[0].key,
         mr::render_unrepaired_key(&sid)
     );
-    assert_eq!(message_regrids(), message);
     let session_ref = app.pool.get(registered).expect("registered session");
     session_ref
         .ctx

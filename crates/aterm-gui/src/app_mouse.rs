@@ -1456,6 +1456,12 @@ impl App {
         let Some(ws) = self.windows.get(&wid) else {
             return false;
         };
+        let (px, py) = ws.last_cursor_px;
+        if self.band_banner_at(wid, px, py).is_some()
+            || self.find_bar_cell_at(wid, px, py).is_some()
+        {
+            return false;
+        }
         let (wr, wc, rows, cols) = (
             ws.last_mouse_window_cell.0,
             ws.last_mouse_window_cell.1,
@@ -3308,6 +3314,12 @@ impl App {
 
     fn divider_cursor_under_pointer(&self, wid: WindowId) -> Option<CursorIcon> {
         let ws = self.windows.get(&wid)?;
+        let (px, py) = ws.last_cursor_px;
+        if self.band_banner_at(wid, px, py).is_some()
+            || self.find_bar_cell_at(wid, px, py).is_some()
+        {
+            return None;
+        }
         let (wr, wc) = ws.last_mouse_window_cell;
         if let Some(tree) = self.active_tree(wid) {
             if tree.len() == 1 {
@@ -4362,7 +4374,7 @@ impl App {
         if let Some((_, url)) = self.claude_glass_hit_at(wid, px, py) {
             return url.map(|url| (url.to_owned(), false));
         }
-        if self.glass_swallows_at(wid, px, py) {
+        if !self.pointer_is_inside_focused_pane(wid) || self.glass_swallows_at(wid, px, py) {
             return None;
         }
         let term = term_lock(&ws.front_terminal()?.term);
@@ -4394,6 +4406,7 @@ impl App {
         if crate::claude_lights::OverChips::of_glass(self.claude_glass_at(wid, px, py).as_ref())
             != crate::claude_lights::OverChips::No
             || self.claude_glass_hit_at(wid, px, py).is_some()
+            || !self.pointer_is_inside_focused_pane(wid)
             || self.glass_swallows_at(wid, px, py)
         {
             return None;
@@ -4940,7 +4953,8 @@ impl App {
                 .windows
                 .get(&wid)
                 .map_or((0.0, 0.0), |window| window.last_cursor_px);
-            let on_banner = self.band_banner_at(wid, px, py).is_some();
+            let on_banner = self.band_banner_at(wid, px, py).is_some()
+                || self.find_bar_cell_at(wid, px, py).is_some();
             let in_content = !on_banner && self.strip_col_at(wid, px, py).is_none();
             if in_content && self.press_claude_light(wid, at) {
                 return None;
@@ -5266,16 +5280,28 @@ impl App {
                 }
                 return None;
             }
-            if button != WinitMouseButton::Right {
-                if let Some(col) = self.strip_col_at(wid, px, py) {
-                    if button == WinitMouseButton::Middle {
-                        self.handle_tab_strip_middle_press(wid, col);
-                    }
-                    return None;
+            if self.band_banner_at(wid, px, py).is_some()
+                || self.find_bar_cell_at(wid, px, py).is_some()
+            {
+                if self.inline_rename_edit(wid).is_some() {
+                    self.clear_strip_press(wid);
+                    self.settle_rename_edit(wid);
                 }
-                if self.band_banner_at(wid, px, py).is_some() {
-                    return None;
+                #[cfg(windows)]
+                if button == WinitMouseButton::Right
+                    && let Some(ws) = self.windows.get_mut(&wid)
+                {
+                    ws.band_menu_release_pending = false;
                 }
+                return None;
+            }
+            if button != WinitMouseButton::Right
+                && let Some(col) = self.strip_col_at(wid, px, py)
+            {
+                if button == WinitMouseButton::Middle {
+                    self.handle_tab_strip_middle_press(wid, col);
+                }
+                return None;
             }
         }
         let press_route = if pressed && button != WinitMouseButton::Left {
@@ -11417,6 +11443,80 @@ mod tests {
         let ch = app.win_cell_size(wid).1 as f64;
         assert!(app.selection_autoscroll(wid, -4.0 * ch));
         assert_eq!(crate::term_lock(&term).grid().display_offset(), 6);
+    }
+
+    #[test]
+    fn unfocused_pane_clamped_cell_exposes_no_focused_links_and_banners_shield_dividers_and_non_left_clicks()
+     {
+        use aterm_window::event::{ElementState, MouseButton};
+        use aterm_window::window::CursorIcon;
+
+        use crate::{FindBarHit, term_lock};
+
+        let (mut app, wid, top, bottom) = stacked_autoscroll_fixture();
+        let bottom_term = app.pool.get(bottom).expect("bottom terminal").term.clone();
+        term_lock(&bottom_term).process(b"\x1b[2J\x1b[Hhttps://example.com");
+        let (bottom_row, bottom_col, ..) = app.focused_pane_rect(wid);
+
+        let (bx, by) = app
+            .cell_centre_px(wid, bottom_row, bottom_col + 2)
+            .expect("focused pane row 0");
+        app.on_cursor_moved(wid, bx, by);
+        assert_eq!(
+            app.link_under_pointer(wid).as_deref(),
+            Some("https://example.com")
+        );
+
+        let (tx, ty) = app.cell_centre_px(wid, 0, 2).expect("unfocused top pane");
+        app.on_cursor_moved(wid, tx, ty);
+        assert!(!app.pointer_is_inside_focused_pane(wid));
+        assert_eq!(
+            app.windows[&wid].last_mouse_cell,
+            (0, 2),
+            "last_mouse_cell clamps to the focused pane's top edge"
+        );
+        assert_eq!(app.link_under_pointer(wid), None);
+        assert_eq!(app.path_link_under_pointer(wid), None);
+
+        let (top_row, _, top_rows, _) = app.visible_session_rect(wid, top).expect("top pane");
+        let div_row = top_row + top_rows;
+        let (dx, dy) = app.cell_centre_px(wid, div_row, 2).expect("divider cell");
+        app.on_cursor_moved(wid, dx, dy);
+        assert_eq!(
+            app.divider_cursor_under_pointer(wid),
+            Some(CursorIcon::RowResize)
+        );
+
+        let laid = app.glass_grid(wid);
+        let cols = usize::from(app.windows[&wid].cols);
+        app.windows.get_mut(&wid).expect("window").find_bar_hit = Some(FindBarHit {
+            row: usize::from(div_row),
+            case_cols: None,
+            regex_cols: None,
+            prev_cols: None,
+            next_cols: None,
+            close_cols: None,
+            field_cols: 0..cols,
+            field_scroll: 0,
+            band: usize::from(div_row)..usize::from(div_row) + 1,
+            cols: 0..cols,
+            laid,
+        });
+        assert_eq!(app.divider_cursor_under_pointer(wid), None);
+        assert!(!app.begin_divider_drag(wid));
+
+        for session in [top, bottom] {
+            let term = app.pool.get(session).expect("pane terminal").term.clone();
+            term_lock(&term).process(b"\x1b[?1003h\x1b[?1006h");
+        }
+        for button in [MouseButton::Middle, MouseButton::Right] {
+            app.on_mouse_input(wid, ElementState::Pressed, button);
+            assert_eq!(
+                app.windows[&wid].reported_buttons, 0,
+                "find bar must swallow {button:?} press"
+            );
+            app.on_mouse_input(wid, ElementState::Released, button);
+        }
     }
 }
 

@@ -506,6 +506,7 @@ fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
     let clock = AtomicU64::new(start);
     let stop = AtomicBool::new(false);
     let lan = AtomicBool::new(false);
+    let held = AtomicBool::new(false);
     let runners = AtomicUsize::new(0);
     let work = std::sync::Mutex::new(Vec::new());
     let looked = AtomicUsize::new(0);
@@ -520,7 +521,7 @@ fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
                 stop: &stop,
                 held: &|| {
                     looked.fetch_add(1, Ordering::AcqRel);
-                    false
+                    held.load(Ordering::Acquire)
                 },
                 may_post: &|| lan.load(Ordering::Acquire),
                 routes: &|| [None; 3],
@@ -604,6 +605,33 @@ fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
         let records = load_records(m7).unwrap().encode();
         source.store(1, Ordering::Release);
         looks_past(10);
+        assert_eq!(runners.load(Ordering::Acquire), 3);
+        for subscriber_off in [false, true] {
+            if subscriber_off {
+                crate::service::record_subscriber_off(&m7.home).unwrap();
+            } else {
+                held.store(true, Ordering::Release);
+            }
+            looks_past(5);
+            let before = runners.load(Ordering::Acquire);
+            looks_past(5);
+            assert_eq!(
+                runners.load(Ordering::Acquire),
+                before,
+                "held starts no job"
+            );
+            if subscriber_off {
+                std::fs::remove_file(crate::service::subscriber_off_path(&m7.home)).unwrap();
+            } else {
+                held.store(false, Ordering::Release);
+            }
+            looks_past(10);
+            assert_eq!(
+                runners.load(Ordering::Acquire),
+                before + 1,
+                "a resumed node owes one refresh with unchanged records and clock"
+            );
+        }
         stop.store(true, Ordering::Release);
         assert_eq!(made_inputs.load(Ordering::Acquire), 1);
         assert_eq!(load_records(m7).unwrap().encode(), records);
@@ -617,6 +645,8 @@ fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
             vec![
                 crate::converge::RepositoryWork::Refresh,
                 crate::converge::RepositoryWork::Repair,
+                crate::converge::RepositoryWork::Refresh,
+                crate::converge::RepositoryWork::Refresh,
                 crate::converge::RepositoryWork::Refresh,
             ],
             "a relevant local source change refreshes without another signed record"

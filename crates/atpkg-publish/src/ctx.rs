@@ -67,6 +67,8 @@ pub struct Ctx {
     pub pkg_prefix: PathBuf,
     /// The trust checkout the lineage receipt switch is read from (`$HOME/trust`).
     pub trust_repo: PathBuf,
+    /// Explicit portable frontend receipt on the raw source seal; never inferred from files.
+    pub frontend_component: Option<String>,
     /// The accounts.
     pub accounts: Accounts,
     /// The token files.
@@ -216,6 +218,7 @@ impl Ctx {
             state_dir: state_root.join("aterm-auto"),
             pkg_prefix: atpkg::toolchain::atpkg_prefix(home, xdg_config_home),
             trust_repo: home.join("trust"),
+            frontend_component: None,
             accounts: Accounts {
                 staging: STAGING_OWNER.to_string(),
                 public: aterm_update_core::ATPKG_INDEX_OWNER.to_string(),

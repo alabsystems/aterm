@@ -1449,9 +1449,9 @@ impl App {
         self.chrome_rows_shared()
     }
 
-    /// The chrome rows every window shares — the strip and the message band.
+    /// The chrome rows every window shares: the tab strip's.
     pub(crate) const fn chrome_rows_shared(&self) -> u16 {
-        self.tab_strip_rows.saturating_add(self.message_band_rows)
+        self.tab_strip_rows
     }
 
     /// One title per top-level tab of window `wid`, for the strip labels.

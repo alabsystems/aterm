@@ -191,6 +191,29 @@ fn host_flag(args: &[String]) -> Result<(Option<HostChoice>, &[String])> {
     Ok((Some(choice), rest.as_slice()))
 }
 
+/// An explicit raw-seal component selection after the optional global host.
+fn frontend_flag(args: &[String]) -> Result<(Option<String>, &[String])> {
+    let Some((first, rest)) = args.split_first() else {
+        return Ok((None, args));
+    };
+    let (value, rest) = if first == "--frontend-component" {
+        let (value, rest) = rest
+            .split_first()
+            .ok_or_else(|| Error::usage("--frontend-component needs its receipt SHA256"))?;
+        (value.as_str(), rest)
+    } else if let Some(value) = first.strip_prefix("--frontend-component=") {
+        (value, rest)
+    } else {
+        return Ok((None, args));
+    };
+    if !aterm_codec::hex::is_lower(value, 64) {
+        return Err(Error::usage(
+            "--frontend-component needs a lowercase SHA256",
+        ));
+    }
+    Ok((Some(value.to_owned()), rest))
+}
+
 /// Run one command line (without `argv[0]`).
 ///
 /// # Errors
@@ -200,11 +223,17 @@ fn host_flag(args: &[String]) -> Result<(Option<HostChoice>, &[String])> {
 /// `lane install` (each takes its own, or none).
 pub fn run(args: &[String]) -> Result<()> {
     let (choice, args) = host_flag(args)?;
+    let (frontend_component, args) = frontend_flag(args)?;
     let Some((verb, rest)) = args.split_first() else {
         eprint!("{}", usage());
         return Err(Error::usage("no verb (atpkg-publish help)"));
     };
     if matches!(verb.as_str(), "help" | "--help" | "-h") {
+        if frontend_component.is_some() {
+            return Err(Error::usage(
+                "--frontend-component selects pack, pack-bundle, or publish-group rustc",
+            ));
+        }
         print!("{}", usage());
         return Ok(());
     }
@@ -237,11 +266,20 @@ pub fn run(args: &[String]) -> Result<()> {
     if !VERBS.iter().any(|v| v.name == verb.as_str()) {
         return Err(unknown_verb(verb));
     }
-    let ctx = if live_identity_lookup(verb, rest) {
+    if frontend_component.is_some()
+        && !(matches!(verb.as_str(), "pack" | "pack-bundle")
+            || verb == "publish-group" && rest.first().is_some_and(|v| v == "rustc"))
+    {
+        return Err(Error::usage(
+            "--frontend-component selects pack, pack-bundle, or publish-group rustc",
+        ));
+    }
+    let mut ctx = if live_identity_lookup(verb, rest) {
         Ctx::from_env_hosts(choice.unwrap_or_default())?
     } else {
         Ctx::from_env_hosts_view(choice.unwrap_or_default())?
     };
+    ctx.frontend_component = frontend_component;
     dispatch(&ctx, verb, rest)
 }
 
@@ -315,7 +353,7 @@ pub fn usage() -> String {
     use std::fmt::Write as _;
     let mut s = String::from(
         "atpkg-publish — owner-side atpkg producer (never shipped)\n\n\
-         usage: atpkg-publish [--host gh|agh-staging|agh] <verb> [args]\n\n",
+         usage: atpkg-publish [--host gh|agh-staging|agh] [--frontend-component SHA256] <verb> [args]\n\n",
     );
     for v in VERBS {
         let _ = writeln!(s, "  {}\n      {}", v.synopsis, v.does);
@@ -326,6 +364,39 @@ pub fn usage() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frontend_selection_is_explicit_and_rejects_unused_or_invalid_authority() {
+        let words = |args: &[&str]| args.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let sha = "a".repeat(64);
+        let args = words(&[
+            "--frontend-component",
+            &sha,
+            "publish-group",
+            "rustc",
+            "--dry-run",
+        ]);
+        let (selected, rest) = super::frontend_flag(&args).unwrap();
+        assert_eq!(selected.as_deref(), Some(sha.as_str()));
+        assert_eq!(rest, &args[2..]);
+        let args = words(&["publish-group", "rustc"]);
+        assert_eq!(
+            super::frontend_flag(&args).unwrap(),
+            (None, args.as_slice())
+        );
+        for args in [
+            words(&["--frontend-component"]),
+            words(&["--frontend-component", ""]),
+            words(&["--frontend-component=not-a-hash", "pack"]),
+            words(&["--frontend-component", &sha, "status"]),
+            words(&["--frontend-component", &sha, "publish-group", "unrelated"]),
+        ] {
+            assert!(matches!(
+                super::run(&args),
+                Err(crate::error::Error::Usage(_))
+            ));
+        }
+    }
+
     #[test]
     fn identity_learning_is_only_for_an_explicit_publishing_run() {
         let words = |args: &[&str]| args.iter().map(ToString::to_string).collect::<Vec<_>>();

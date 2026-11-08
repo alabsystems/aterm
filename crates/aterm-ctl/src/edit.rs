@@ -8,8 +8,6 @@ use std::time::{Duration, Instant};
 
 pub use amacs_protocol::edit::{AwaitEdit, AwaitKey, EditOk, EditOutcome, EditRequest, Ticket};
 
-const CONNECT_WAIT: Duration = Duration::from_secs(10);
-
 const EDIT_REPLY_WAIT: Duration = Duration::from_secs(45);
 
 const LEG: Duration = crate::await_task::LEG_MAX;
@@ -106,7 +104,7 @@ impl Wire for SocketWire<'_> {
     }
 
     fn send(&mut self, sock: &str, request: &str, reply: Duration) -> io::Result<String> {
-        crate::front_door_send_within(sock, request, CONNECT_WAIT, reply)
+        crate::front_door_send_within(sock, request, crate::REQUIRED_SERVER_HANG, reply)
     }
 
     fn pause(&mut self, wait: Duration) {

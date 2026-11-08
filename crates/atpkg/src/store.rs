@@ -3321,6 +3321,37 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn runtime_admission_follows_only_the_owned_aside() {
+        let home = temp_home("ready-runtime-aside");
+        let build = home.join("store/trust/7");
+        std::fs::create_dir_all(build.join("bin")).unwrap();
+        std::fs::write(build.join("bin/targo"), b"synthetic non-ELF tool").unwrap();
+        mark_build_ready(&build).unwrap();
+        let host = Some(aterm_toolchain::gnu_runtime::Host {
+            machine: 62,
+            glibc: aterm_toolchain::gnu_runtime::Version::parse("2.17").unwrap(),
+        });
+        assert!(build_is_complete_on(&build, host));
+        let aside = aterm_toolchain::layout::aside_of(&build).unwrap();
+        std::fs::rename(&build, &aside).unwrap();
+        std::os::unix::fs::symlink("7.noindex", &build).unwrap();
+        assert!(build_is_complete_on(&build, host));
+
+        std::fs::remove_file(&build).unwrap();
+        std::os::unix::fs::symlink("elsewhere", &build).unwrap();
+        let outside = build.with_file_name("elsewhere");
+        std::fs::rename(&aside, &outside).unwrap();
+        assert!(!build_is_complete_on(&build, host));
+
+        std::fs::remove_file(&build).unwrap();
+        std::os::unix::fs::symlink("7.noindex", &build).unwrap();
+        std::os::unix::fs::symlink("elsewhere", &aside).unwrap();
+        assert!(!build_is_complete_on(&build, host));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn a_marker_from_the_other_slice_reads_as_not_installed() {
         let home = temp_home("readyslice");
         let build = home.join("store").join("ay").join("18");

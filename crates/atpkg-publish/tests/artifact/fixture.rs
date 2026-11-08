@@ -285,6 +285,13 @@ pub fn toolchain(root: &Path) -> PathBuf {
     root.join("bin")
 }
 
+/// The native CPU expressed as a GNU target for synthetic compiler probes.
+pub const NATIVE_HOST: &str = if cfg!(target_arch = "aarch64") {
+    "aarch64-unknown-linux-gnu"
+} else {
+    "x86_64-unknown-linux-gnu"
+};
+
 use atpkg_publish::artifact::tools::{Ran, Run, RunError, Tools};
 
 /// What a fake answers for one run it does not otherwise know.

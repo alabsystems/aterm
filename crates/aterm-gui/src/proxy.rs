@@ -844,14 +844,8 @@ pub(crate) fn forward_first_line(token: &str, verb: &str) -> String {
     format!("TOKEN {token} {verb}\n")
 }
 
-/// Deadline for a forwarded connection's connect probe.
-#[cfg(not(test))]
-pub(crate) const FORWARD_ACCEPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
-/// A unit test's hosts serve, or refuse or close at once, and its forwards run on threads a
-/// per-thread bound would not reach: the probe waits the hang detector. A test of a host that
-/// accepts nothing passes its own bound to [`deliver_then_relay`].
-#[cfg(test)]
-pub(crate) const FORWARD_ACCEPT_DEADLINE: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
+/// Hang detector for required admission and follow-up probes of a forwarding host.
+const FORWARD_HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Verify the host serves on `hop`, send `line` and `client_prebuffered`, and splice `client`.
 pub(crate) fn relay_hop(
@@ -865,7 +859,7 @@ pub(crate) fn relay_hop(
         line,
         client,
         client_prebuffered,
-        FORWARD_ACCEPT_DEADLINE,
+        FORWARD_HANG,
         relay_bidirectional,
     )
 }
@@ -879,8 +873,9 @@ fn prove_host_serving(
     host: &CtlStream,
     token: &str,
     within: std::time::Duration,
+    started: impl FnOnce() -> std::time::Instant,
 ) -> std::io::Result<()> {
-    let line = probe_answer(host, token, within)?;
+    let line = probe_answer(host, token, within, started)?;
     if is_connection_refusal(&line) {
         return Err(std::io::Error::other(format!("the host answered {line:?}")));
     }
@@ -891,24 +886,29 @@ fn probe_answer(
     host: &CtlStream,
     token: &str,
     within: std::time::Duration,
+    started: impl FnOnce() -> std::time::Instant,
 ) -> std::io::Result<String> {
     let mut hello = String::with_capacity(token.len() + 16);
     hello.push_str("TOKEN ");
     hello.push_str(token);
     hello.push_str(" version\n");
-    match (&*host)
+    let sent = (&*host)
         .write_all(hello.as_bytes())
-        .and_then(|()| (&*host).flush())
-    {
-        Ok(()) => read_probe_line(host, within),
-        Err(e) => read_probe_line(host, within).map_err(|_| e),
+        .and_then(|()| (&*host).flush());
+    let answer = read_probe_line(host, within, started());
+    match sent {
+        Ok(()) => answer,
+        Err(e) => answer.map_err(|_| e),
     }
 }
 
-fn read_probe_line(host: &CtlStream, within: std::time::Duration) -> std::io::Result<String> {
+fn read_probe_line(
+    host: &CtlStream,
+    within: std::time::Duration,
+    start: std::time::Instant,
+) -> std::io::Result<String> {
     use std::io::{Error, ErrorKind};
     const MAX_PROBE_LINE: usize = 4096;
-    let start = std::time::Instant::now();
     let deadline = start
         .checked_add(within)
         .unwrap_or_else(|| start + std::time::Duration::from_secs(365 * 24 * 3600));
@@ -971,21 +971,18 @@ struct ForwardHost {
     listener: Option<aterm_uds::listener::ListenerId>,
 }
 
-/// How long a look at a host that ended a forward waits for its answer.
-#[cfg(not(test))]
-const HOST_LOOK: std::time::Duration = std::time::Duration::from_secs(2);
-/// A unit test's host answers its looks, or drops its listener, which refuses or resets them: a
-/// look a loaded machine slows waits the hang detector rather than calling a serving host gone.
-#[cfg(test)]
-const HOST_LOOK: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
-
 impl ForwardHost {
     fn gone_line(&self) -> Option<String> {
-        let pid = self.pid?;
-        (!self.serves(pid)).then(|| aterm_types::control_verbs::host_gone_line(pid, &self.sock))
+        self.gone_line_with_clock(std::time::Instant::now)
     }
 
-    fn serves(&self, pid: u32) -> bool {
+    fn gone_line_with_clock(&self, started: impl FnOnce() -> std::time::Instant) -> Option<String> {
+        let pid = self.pid?;
+        (!self.serves(pid, started))
+            .then(|| aterm_types::control_verbs::host_gone_line(pid, &self.sock))
+    }
+
+    fn serves(&self, pid: u32, started: impl FnOnce() -> std::time::Instant) -> bool {
         let Ok(look) = CtlStream::connect(&self.sock) else {
             return false;
         };
@@ -993,7 +990,7 @@ impl ForwardHost {
         if answered.is_some_and(|answered| answered != pid) {
             return false;
         }
-        probe_answer(&look, &self.token, HOST_LOOK).is_ok()
+        probe_answer(&look, &self.token, FORWARD_HANG, started).is_ok()
             && match answered {
                 Some(_) => aterm_uds::listener::still_names(&self.sock, self.listener),
                 None => self
@@ -1011,13 +1008,33 @@ fn deliver_then_relay(
     accept_within: std::time::Duration,
     relay: impl FnOnce(&CtlStream, &CtlStream, ForwardHost) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+    deliver_then_relay_with_clock(
+        hop,
+        line,
+        client,
+        client_prebuffered,
+        accept_within,
+        relay,
+        std::time::Instant::now,
+    )
+}
+
+fn deliver_then_relay_with_clock(
+    hop: Hop,
+    line: &str,
+    client: &CtlStream,
+    client_prebuffered: &[u8],
+    accept_within: std::time::Duration,
+    relay: impl FnOnce(&CtlStream, &CtlStream, ForwardHost) -> std::io::Result<()>,
+    started: impl FnOnce() -> std::time::Instant,
+) -> std::io::Result<()> {
     let Hop {
         stream: child,
         sock,
         token,
         listener,
     } = hop;
-    prove_host_serving(&child, &token, accept_within)?;
+    prove_host_serving(&child, &token, accept_within, started)?;
     let pid = aterm_uds::fdpass::peer_pid(&child).ok();
     (&child).write_all(line.as_bytes())?;
     (&child).write_all(b"\n")?;
@@ -1406,6 +1423,139 @@ mod tests {
         assert!(read_private_text(&entry).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn required_proxy_accepts_a_scheduled_host() {
+        for age in [
+            std::time::Duration::from_secs(11),
+            std::time::Duration::from_secs(61),
+        ] {
+            let expired = age >= aterm_spec::wait::MUST_HAPPEN;
+            let dir = crate::test_scratch::short_dir("scheduled-hop");
+            let sock = dir.path().join("host.sock");
+            let listener = aterm_uds::CtlListener::bind(&sock).unwrap();
+            let (ready, listening) = std::sync::mpsc::channel();
+            let host = std::thread::spawn(move || -> std::io::Result<Vec<String>> {
+                let (stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))?;
+                stream.set_write_timeout(Some(aterm_spec::wait::MUST_HAPPEN))?;
+                ready.send(()).unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut probe = String::new();
+                reader.read_line(&mut probe)?;
+                if probe != "TOKEN tok version\n" {
+                    return Err(std::io::Error::other("wrong native probe"));
+                }
+                if expired {
+                    let mut rest = String::new();
+                    reader.read_to_string(&mut rest)?;
+                    return Ok(vec![probe, rest]);
+                }
+                (&stream).write_all(b"OK version=host\n")?;
+                let mut verb = String::new();
+                reader.read_line(&mut verb)?;
+                Ok(vec![probe, verb])
+            });
+            let (_application, client) = CtlStream::pair().unwrap();
+            let mut relayed = false;
+            let result = deliver_then_relay_with_clock(
+                hop_to(&sock, "tok"),
+                "status",
+                &client,
+                &[],
+                FORWARD_HANG,
+                |_, _, _| {
+                    relayed = true;
+                    Ok(())
+                },
+                || {
+                    listening
+                        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                        .unwrap();
+                    std::time::Instant::now() - age
+                },
+            );
+            let heard = host.join().unwrap();
+            if expired {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+                assert_eq!(heard.unwrap(), ["TOKEN tok version\n", ""]);
+                assert!(
+                    !relayed,
+                    "an expired proof sends no command and starts no relay"
+                );
+            } else {
+                result.expect("a scheduled valid host still accepts the forward");
+                assert_eq!(heard.unwrap(), ["TOKEN tok version\n", "status\n"]);
+                assert!(relayed);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn required_proxy_keeps_a_scheduled_host_present() {
+        for age in [
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(61),
+        ] {
+            let expired = age >= aterm_spec::wait::MUST_HAPPEN;
+            let dir = crate::test_scratch::short_dir("scheduled-host-look");
+            let sock = dir.path().join("host.sock");
+            let listener = aterm_uds::CtlListener::bind(&sock).unwrap();
+            let identity = aterm_uds::listener::listener_at(&sock);
+            let (ready, listening) = std::sync::mpsc::channel();
+            let host = std::thread::spawn(move || -> std::io::Result<String> {
+                let (stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))?;
+                stream.set_write_timeout(Some(aterm_spec::wait::MUST_HAPPEN))?;
+                ready.send(()).unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut probe = String::new();
+                reader.read_line(&mut probe)?;
+                if probe != "TOKEN tok version\n" {
+                    return Err(std::io::Error::other("wrong native probe"));
+                }
+                if !expired {
+                    (&stream).write_all(b"OK version=host\n")?;
+                }
+                let mut rest = String::new();
+                reader.read_to_string(&mut rest)?;
+                if !rest.is_empty() {
+                    return Err(std::io::Error::other("a look sent a command"));
+                }
+                Ok(probe)
+            });
+            let look = ForwardHost {
+                sock: sock.to_str().unwrap().to_owned(),
+                token: "tok".into(),
+                pid: Some(std::process::id()),
+                listener: identity,
+            };
+            let gone = look.gone_line_with_clock(|| {
+                listening
+                    .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                    .unwrap();
+                std::time::Instant::now() - age
+            });
+            let heard = host.join().unwrap();
+            if expired {
+                assert_eq!(
+                    gone,
+                    Some(aterm_types::control_verbs::host_gone_line(
+                        std::process::id(),
+                        sock.to_str().unwrap()
+                    ))
+                );
+            } else {
+                assert_eq!(
+                    gone, None,
+                    "a scheduling pause is not proof that the native host went away"
+                );
+            }
+            assert_eq!(heard.unwrap(), "TOKEN tok version\n");
+        }
+    }
+
     #[test]
     fn a_child_that_accepts_nothing_fails_the_forward_fast() {
         let dir = crate::test_scratch::short_dir("a hop's socket");
@@ -1531,7 +1681,12 @@ mod tests {
             .write_all(b"ERR control server busy; retry\n")
             .unwrap();
         drop(conn);
-        let answer = probe_answer(&look, "tok", std::time::Duration::from_secs(60));
+        let answer = probe_answer(
+            &look,
+            "tok",
+            std::time::Duration::from_secs(60),
+            std::time::Instant::now,
+        );
         assert_eq!(
             answer.expect("the line left behind"),
             "ERR control server busy; retry"

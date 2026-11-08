@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 use aterm_digest::Sha256;
 
+mod frontend;
+
 /// The receipt a signed bundle carries beside its compiler (the producer's stamp writes it).
 pub const LINEAGE_FILE: &str = "LINEAGE";
 /// The trust repo's pack-cut receipt (scripts/promote-toolchain.sh seals it).
@@ -440,8 +442,23 @@ pub fn check_compiler_with(
     policy: LineagePolicy,
     probe: &dyn Fn(&Path) -> Result<String, String>,
 ) -> Result<Compiler, Vec<String>> {
+    check_compiler_with_frontend(bin_dir, policy, probe, None)
+}
+
+/// Admit an explicitly selected, qualified supplementary frontend on a raw seal.
+///
+/// `frontend_sha256` selects the portable component receipt, never its presence.
+/// Transformed bundles use ordinary final `LINEAGE` admission without this selector.
+/// # Errors
+/// Every content, component, or lineage refusal, one line each.
+pub fn check_compiler_with_frontend(
+    bin_dir: &Path,
+    policy: LineagePolicy,
+    probe: &dyn Fn(&Path) -> Result<String, String>,
+    frontend_sha256: Option<&str>,
+) -> Result<Compiler, Vec<String>> {
     let content = admit_content_with(bin_dir, probe)?;
-    let lineage = admit_lineage(&content, policy)?;
+    let lineage = admit_lineage_selected(&content, policy, frontend_sha256)?;
     Ok(Compiler { content, lineage })
 }
 
@@ -452,9 +469,23 @@ pub fn admit_lineage(
     c: &CompilerContent,
     policy: LineagePolicy,
 ) -> Result<LineageProof, Vec<String>> {
+    admit_lineage_selected(c, policy, None)
+}
+
+fn admit_lineage_selected(
+    c: &CompilerContent,
+    policy: LineagePolicy,
+    frontend_sha256: Option<&str>,
+) -> Result<LineageProof, Vec<String>> {
     let lineage = c.root.join(LINEAGE_FILE);
     let seed_mint = c.root.join(SEED_MINT_FILE);
     if std::fs::symlink_metadata(&lineage).is_ok() {
+        if frontend_sha256.is_some() {
+            return Err(vec![
+                "a frontend component selects a raw SEED-MINT seal, not a transformed LINEAGE tree"
+                    .to_owned(),
+            ]);
+        }
         return lineage_record_refusals(c).map(|(receipt_sha256, relation)| {
             LineageProof::Lineage {
                 receipt_sha256,
@@ -463,7 +494,8 @@ pub fn admit_lineage(
         });
     }
     if std::fs::symlink_metadata(&seed_mint).is_ok() {
-        let (receipt, mut refusals) = seed_mint_refusals_inner(&c.root, &c.version.commit, true);
+        let (receipt, mut refusals) =
+            seed_mint_refusals_selected(&c.root, &c.version.commit, true, frontend_sha256);
         let receipt_sha256 = receipt
             .as_ref()
             .map(|r| r.sha256.clone())
@@ -494,6 +526,11 @@ pub fn admit_lineage(
         } else {
             Err(refusals)
         };
+    }
+    if frontend_sha256.is_some() {
+        return Err(vec![
+            "selected frontend component has no raw SEED-MINT to bind".to_owned(),
+        ]);
     }
     match policy {
         LineagePolicy::Dormant => Ok(LineageProof::Unproven),
@@ -569,10 +606,31 @@ pub fn seed_mint_refusals(seal: &Path, commit: &str) -> Vec<String> {
     seed_mint_refusals_inner(seal, commit, true).1
 }
 
+/// [`seed_mint_refusals`] with an explicitly selected portable frontend receipt.
+/// Only the original literal `bin/targo-trust` file row may compare the qualified
+/// replacement digest; every other original file/link comparison remains strict.
+#[must_use]
+pub fn seed_mint_refusals_with_frontend(
+    seal: &Path,
+    commit: &str,
+    frontend_sha256: Option<&str>,
+) -> Vec<String> {
+    seed_mint_refusals_selected(seal, commit, true, frontend_sha256).1
+}
+
 fn seed_mint_refusals_inner(
     seal: &Path,
     commit: &str,
     compare_files: bool,
+) -> (Option<Receipt>, Vec<String>) {
+    seed_mint_refusals_selected(seal, commit, compare_files, None)
+}
+
+fn seed_mint_refusals_selected(
+    seal: &Path,
+    commit: &str,
+    compare_files: bool,
+    frontend_sha256: Option<&str>,
 ) -> (Option<Receipt>, Vec<String>) {
     let path = seal.join(SEED_MINT_FILE);
     let Some(r) = read_receipt(&path) else {
@@ -596,7 +654,14 @@ fn seed_mint_refusals_inner(
             )],
         );
     };
-    let out = seed_mint_refusals_for_receipt(seal, &r, commit, compare_files);
+    let binding = match frontend_sha256
+        .map(|sha| frontend::validate(seal, commit, sha))
+        .transpose()
+    {
+        Ok(binding) => binding,
+        Err(why) => return (Some(r), vec![format!("selected frontend component: {why}")]),
+    };
+    let out = seed_mint_refusals_bound(seal, &r, commit, compare_files, binding.as_ref());
     (Some(r), out)
 }
 
@@ -605,6 +670,16 @@ fn seed_mint_refusals_for_receipt(
     r: &Receipt,
     commit: &str,
     compare_files: bool,
+) -> Vec<String> {
+    seed_mint_refusals_bound(seal, r, commit, compare_files, None)
+}
+
+fn seed_mint_refusals_bound(
+    seal: &Path,
+    r: &Receipt,
+    commit: &str,
+    compare_files: bool,
+    binding: Option<&frontend::Binding>,
 ) -> Vec<String> {
     let mut out = Vec::new();
     if r.field("schema") != SEED_MINT_SCHEMA {
@@ -656,12 +731,30 @@ fn seed_mint_refusals_for_receipt(
     if !compare_files {
         return out;
     }
+    if let Some(binding) = binding {
+        let rows: Vec<_> = r
+            .files
+            .iter()
+            .filter(|(_, rel)| rel == "bin/targo-trust")
+            .collect();
+        if r.sha256 != binding.mint
+            || rows.len() != 1
+            || rows[0].0 != binding.original
+            || r.links.iter().any(|(_, rel)| rel == "bin/targo-trust")
+        {
+            out.push("selected frontend must bind this exact SEED-MINT and exactly one original bin/targo-trust file row".to_owned());
+            return out;
+        }
+    }
     let mut bad: Vec<&str> = Vec::new();
     for (want, rel) in &r.files {
+        let want = binding
+            .filter(|_| rel == "bin/targo-trust")
+            .map_or(want.as_str(), |b| b.replacement.as_str());
         // sha256_file opens with O_NOFOLLOW and fstats a regular file,
         // avoiding a separate lstat before reading.
         let got = inside(seal, rel).and_then(|p| crate::tree::sha256_file(&p).ok());
-        if got.as_deref() != Some(want.as_str()) {
+        if got.as_deref() != Some(want) {
             bad.push(rel);
         }
     }

@@ -7,9 +7,7 @@
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
 
-const CONNECT_WAIT: Duration = Duration::from_secs(10);
 const REPLY_LINE_LIMIT: usize = 4096;
 
 /// The words after `sudo` when this request runs a command; `None` for any other verb and for
@@ -150,8 +148,11 @@ pub(crate) fn run(
     }
 
     let path = crate::resolve_path(sock, pid, std::env::var(crate::SELF_SID_ENV).ok())?;
-    let stream = match crate::open_accepted(&path, crate::TargetOrigin::Pinned, Some(CONNECT_WAIT))?
-    {
+    let stream = match crate::open_accepted(
+        &path,
+        crate::TargetOrigin::Pinned,
+        Some(crate::REQUIRED_SERVER_HANG),
+    )? {
         crate::Acceptance::Served(stream) => stream,
         crate::Acceptance::Refused(_) => {
             return Err(io::Error::new(
@@ -164,7 +165,7 @@ pub(crate) fn run(
     };
     // The socket's options are all set before what aterm answers: aterm closes once it has
     // refused or the command ended, and macOS then refuses an option (EINVAL) though the answer
-    // is still there to read. `open_accepted` left the read bounded by `CONNECT_WAIT`.
+    // is still there to read. `open_accepted` left the read bounded by the server hang detector.
     (&stream).write_all(request.as_bytes())?;
     let admitted = read_line(&stream)?;
     if admitted != "OK sudo stdio" {

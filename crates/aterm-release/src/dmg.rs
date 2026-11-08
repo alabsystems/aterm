@@ -185,12 +185,12 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
 }
 
 /// Computes the streaming SHA-256 of `path` as lowercase hex together with its descriptor size.
+/// Ring uses the CPU's SHA instructions; all bytes still pass through the checked descriptor.
 pub fn sha256_and_size(path: &Path) -> Result<(String, u64), String> {
-    use aterm_digest::Sha256;
     use std::io::Read;
     let (mut f, meta) = crate::durable::open_regular_file_with_meta(path)
         .map_err(|e| format!("open {}: {e}", path.display()))?;
-    let mut hasher = Sha256::new();
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
     let mut buf = [0u8; 16 * 1024];
     loop {
         let n = f
@@ -202,7 +202,7 @@ pub fn sha256_and_size(path: &Path) -> Result<(String, u64), String> {
         hasher.update(&buf[..n]);
     }
     Ok((
-        aterm_codec::hex::encode_lower(&hasher.finalize()),
+        aterm_codec::hex::encode_lower(hasher.finish().as_ref()),
         meta.len(),
     ))
 }
@@ -223,6 +223,73 @@ mod tests {
     use super::{archive_app, assert_zip_has_no_metadata, command, copy_into_stage};
     use std::collections::BTreeSet;
     use std::path::Path;
+
+    #[test]
+    fn accelerated_file_digest_binds_every_byte_and_descriptor_size() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("digest");
+        for length in [0, 1, 55, 56, 63, 64, 65, 16_383, 16_384, 16_385, 65_537] {
+            let mut bytes: Vec<u8> = (0..length).map(|i| (i % 251) as u8).collect();
+            std::fs::write(&path, &bytes).unwrap();
+            let expected = aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(&bytes));
+            assert_eq!(
+                super::sha256_and_size(&path).unwrap(),
+                (expected.clone(), length as u64)
+            );
+            if let Some(last) = bytes.last_mut() {
+                *last ^= 1;
+                std::fs::write(&path, &bytes).unwrap();
+                assert_ne!(super::sha256_file(&path).unwrap(), expected);
+            }
+        }
+    }
+
+    /// Credential-free, interleaved comparison of the exact old and new file loops.
+    #[test]
+    #[ignore = "measurement: run explicitly with --ignored --nocapture"]
+    fn measure_cut_digest() {
+        use std::io::Read as _;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("container");
+        std::fs::write(&path, vec![0xa5; 64 * 1024 * 1024]).unwrap();
+        let mut expected = None;
+        for accelerated in [false, true, true, false] {
+            let got = crate::cut_timing::measure(
+                if accelerated {
+                    "64MiB ring"
+                } else {
+                    "64MiB scalar"
+                },
+                || {
+                    if accelerated {
+                        super::sha256_file(&path).unwrap()
+                    } else {
+                        let (mut file, _) =
+                            crate::durable::open_regular_file_with_meta(&path).unwrap();
+                        let mut hasher = aterm_digest::Sha256::new();
+                        let mut buf = [0; 16 * 1024];
+                        loop {
+                            let n = file.read(&mut buf).unwrap();
+                            if n == 0 {
+                                break;
+                            }
+                            hasher.update(&buf[..n]);
+                        }
+                        aterm_codec::hex::encode_lower(&hasher.finalize())
+                    }
+                },
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(&got, expected);
+            }
+            expected = Some(got);
+        }
+        crate::cut_timing::measure("staging process scan", || {
+            let processes = crate::bundle::running_processes().unwrap();
+            println!("processes={}", processes.len());
+            crate::bundle::live_staging_dirs(dir.path(), &processes)
+        });
+    }
 
     fn tagged_app(root: &Path) -> std::path::PathBuf {
         let app = root.join("aterm.app");

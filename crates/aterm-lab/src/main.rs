@@ -978,8 +978,8 @@ Outside any lab (no jail, no stub):
   git-starts --read [--reads K]
                                  read each local agent session's work record K times (5) under the repository probe's
                                  rules; print the git starts and the wall time per read (names no folder)
-  presence-flap --window|--headless [--aterm PATH] [--client PATH] [--phases \"A H B D T X\"] [--trials N] [--keep]
-                                 OPENS A WINDOW (with --window): verify zero re-grid flap across fenced/harness turns and chrome pairs (~3 min)
+  presence-flap --window|--headless [--aterm PATH] [--client PATH] [--phases \"A H B D T\"] [--trials N] [--keep]
+                                 OPENS A WINDOW (with --window): verify zero re-grid flap across fenced/harness turns and a lease (~2 min)
   look-away [--aterm PATH] [--keep]
                                  OPENS A WINDOW (~30 s): its front tab's task is marked done while Calculator, opened and
                                  quit by PID here, is the active app; wants the Done for you row to stand (done=1), still

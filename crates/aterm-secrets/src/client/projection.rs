@@ -78,6 +78,19 @@ pub fn convergence_inputs(paths: &super::Paths, role: ConvergenceRole) -> Conver
 struct Running {
     due: Due,
     child: Option<aterm_uds::spawnfd::Child>,
+    sharing: crate::swarm::Switch,
+    held: bool,
+}
+
+impl Running {
+    fn allowed(&mut self, log: &dyn Fn(&str)) -> bool {
+        let allowed =
+            super::swarm_lets(&mut self.sharing, &mut self.held, "local convergence", log);
+        if !allowed {
+            self.due.paused();
+        }
+        allowed
+    }
 }
 
 pub(super) struct Projection<'a> {
@@ -86,26 +99,39 @@ pub(super) struct Projection<'a> {
     clock: Box<dyn Fn() -> u64 + Send + Sync + 'a>,
     ports: &'a Converging<'a>,
     inputs: Mutex<ConvergenceInputs>,
+    log: &'a (dyn Fn(&str) + Sync),
 }
 
 impl<'a> Projection<'a> {
     #[cfg(test)]
-    pub(super) fn new(ports: &'a Converging<'a>) -> Self {
-        Self::observing(ports, ConvergenceInputs::new(Box::new(|_| None)))
+    pub(super) fn new(paths: &super::Paths, ports: &'a Converging<'a>) -> Self {
+        Self::observing(paths, ports, ConvergenceInputs::new(Box::new(|_| None)))
     }
 
-    pub(super) fn observing(ports: &'a Converging<'a>, inputs: ConvergenceInputs) -> Self {
+    pub(super) fn observing(
+        paths: &super::Paths,
+        ports: &'a Converging<'a>,
+        inputs: ConvergenceInputs,
+    ) -> Self {
         let begun = Instant::now();
         Self {
             running: Mutex::new(Running {
                 due: Due::default(),
                 child: None,
+                sharing: crate::swarm::Switch::new(&paths.home),
+                held: false,
             }),
             program: crate::program_watch::ProgramWatch::current(),
             clock: Box::new(move || u64::try_from(begun.elapsed().as_millis()).unwrap_or(u64::MAX)),
             ports,
             inputs: Mutex::new(inputs),
+            log: &|_| {},
         }
+    }
+
+    pub(super) fn logging(mut self, log: &'a (dyn Fn(&str) + Sync)) -> Self {
+        self.log = log;
+        self
     }
 
     pub(super) fn replaced(&self) -> bool {
@@ -123,12 +149,18 @@ impl<'a> Projection<'a> {
     }
 
     fn update(&self, read: impl FnOnce(&mut Due, u64, crate::converge::Routes, Last) -> bool) {
+        if !self.allowed() {
+            return;
+        }
         let (refresh, request) = self
             .inputs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .snapshot();
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        if !running.allowed(self.log) {
+            return;
+        }
         let now = self.now();
         let last = Last::of(&mut running.child);
         running.due.observe(refresh);
@@ -153,6 +185,29 @@ impl<'a> Projection<'a> {
 
     pub(super) fn poll(&self) {
         self.poll_with(false);
+    }
+
+    /// All hold observers serialize their fresh sharing read with the retained debt.
+    /// A delayed caller cannot re-arm an old Off observation after another caller resumed.
+    pub(super) fn allowed(&self) -> bool {
+        self.running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .allowed(self.log)
+    }
+
+    /// The HTTP owner also services a hold the listener missed. Healthy rounds do not
+    /// create another input observation or refresh boundary.
+    pub(super) fn resume(&self) {
+        let pending = self
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .due
+            .activation_pending();
+        if pending {
+            self.poll();
+        }
     }
 
     /// An interrupted observation can have consumed local changes. Request ordinary

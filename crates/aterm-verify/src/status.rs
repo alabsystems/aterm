@@ -15,6 +15,18 @@ const MAX_RECORD_BYTES: usize = 1024 * 1024;
 const COMPILER_STAGE_ROWS: usize = 64;
 const LONG_CASE_ROWS: usize = 64;
 const CASE_NAME_BYTES: usize = 4096;
+const PHASE_END_ROWS: usize = 64;
+
+/// Historical END metadata, never reconstructed phase timing or current activity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedPhaseEnd {
+    pub invocation_id: Option<String>,
+    pub test_run: u64,
+    pub phase_sequence: u32,
+    pub occurrences: usize,
+    pub conflict: bool,
+    end: Option<crate::test_progress::End>,
+}
 
 /// Historical observations keyed by exact reported names, not binary or original case identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,6 +122,9 @@ pub struct Observed {
     pub long_cases: Vec<ObservedLongCase>,
     pub long_case_records: usize,
     pub long_case_omitted_records: usize,
+    pub phase_ends: Vec<ObservedPhaseEnd>,
+    pub phase_end_records: usize,
+    pub phase_end_omitted_records: usize,
     /// At most 64 stage rows; grouping uses full stage labels before display clipping.
     pub compiler_progress: Vec<ObservedCompilerStage>,
     pub compiler_message_records: usize,
@@ -148,6 +163,9 @@ fn observe_one(text: &str) -> Observed {
     let mut long_cases = BTreeMap::<(String, String), ObservedLongCase>::new();
     let mut long_case_records = 0;
     let mut long_case_omitted_records = 0;
+    let mut phase_ends = BTreeMap::<(Option<String>, u64, u32), ObservedPhaseEnd>::new();
+    let mut phase_end_records = 0;
+    let mut phase_end_omitted_records = 0;
     let mut compiler = BTreeMap::<String, ObservedCompilerStage>::new();
     let mut compiler_message_records = 0;
     let mut compiler_omitted_records = 0;
@@ -167,6 +185,39 @@ fn observe_one(text: &str) -> Observed {
             continue;
         };
         match value["event"].as_str() {
+            Some("test-phase-ended") => {
+                let Some(end) = line
+                    .strip_prefix("verify-event: ")
+                    .and_then(crate::test_progress::End::read)
+                else {
+                    unprojected += 1;
+                    continue;
+                };
+                phase_end_records += 1;
+                let id = crate::event_log::diagnostic_invocation_id(&value);
+                let key = (id.clone(), end.run, end.sequence);
+                if let Some(row) = phase_ends.get_mut(&key) {
+                    row.occurrences += 1;
+                    if row.end.as_ref() != Some(&end) {
+                        row.conflict = true;
+                        row.end = None;
+                    }
+                } else if phase_ends.len() < PHASE_END_ROWS {
+                    phase_ends.insert(
+                        key,
+                        ObservedPhaseEnd {
+                            invocation_id: id,
+                            test_run: end.run,
+                            phase_sequence: end.sequence,
+                            occurrences: 1,
+                            conflict: false,
+                            end: Some(end),
+                        },
+                    );
+                } else {
+                    phase_end_omitted_records += 1;
+                }
+            }
             Some("test-case-running-long") => {
                 let Some(wire) = line
                     .strip_prefix("verify-event: ")
@@ -297,6 +348,9 @@ fn observe_one(text: &str) -> Observed {
         long_cases: long_cases.into_values().collect(),
         long_case_records,
         long_case_omitted_records,
+        phase_ends: phase_ends.into_values().collect(),
+        phase_end_records,
+        phase_end_omitted_records,
         compiler_progress: compiler.into_values().collect(),
         compiler_message_records,
         compiler_omitted_records,
@@ -385,6 +439,18 @@ impl Observed {
                 "occurrences": check.occurrences, "conflict": check.outcomes.len() > 1,
             })).collect::<Vec<_>>(),
             "case_observations_complete": false,
+            "phase_end_observations_complete":false,
+            "phase_end_scope":"historical END records only; unattributed counters may collide; no current phase or reconstructed duration",
+            "phase_end_row_cap":PHASE_END_ROWS,
+            "phase_end_records":self.phase_end_records,
+            "phase_end_omitted_records":self.phase_end_omitted_records,
+            "phase_ends":self.phase_ends.iter().map(|row| aterm_json::json!({
+                "invocation_id":row.invocation_id,"check":row.end.as_ref().map(|end|end.check.name()),"test_run":row.test_run,
+                "phase_sequence":row.phase_sequence,"phase":row.end.as_ref().map(|end|end.phase),"occurrences":row.occurrences,
+                "conflict":row.conflict,"seconds":row.end.as_ref().map(crate::test_progress::End::seconds),
+                "scope_exit":row.end.as_ref().map(|end| end.scope_exit),
+                "provisional":true,"sample_complete":false,
+            })).collect::<Vec<_>>(),
             "long_case_observations_complete":false,
             "long_case_scope":"historical reported spec/case names; not binary identity or current activity",
             "long_case_timestamp_order":"last supported record in supplied file order",
@@ -473,6 +539,7 @@ impl Observed {
         }
         self.render_cases(&mut out, "");
         self.render_long_cases(&mut out, "");
+        self.render_phase_ends(&mut out, "");
         self.render_compiler(&mut out, "");
         out.push_str(&format!("Terminal records: {}; consistency: {}.\nMalformed complete records: {}; unprojected events: {}; trailing partial: {}.\n",
             self.terminal_records, self.terminal_consistency, self.malformed_complete_records,
@@ -504,6 +571,7 @@ impl Observed {
             }
             run.observed.render_cases(&mut out, "  ");
             run.observed.render_long_cases(&mut out, "  ");
+            run.observed.render_phase_ends(&mut out, "  ");
             run.observed.render_compiler(&mut out, "  ");
         }
         out
@@ -593,6 +661,34 @@ impl Observed {
                 aterm_json::Value::String(test.clone()), aterm_json::Value::String(case.clone()),
                 row.occurrences, row.last_reported_at_unix_ms,
                 if test != row.test || case != row.case { "; display names truncated" } else { "" }));
+        }
+    }
+
+    fn render_phase_ends(&self, out: &mut String, prefix: &str) {
+        if self.phase_end_records == 0 {
+            return;
+        }
+        out.push_str(&format!("{prefix}Historical test-phase END observations (incomplete; no current phase or reconstructed duration):\n"));
+        out.push_str(&format!(
+            "{prefix}  {} records; row cap {}; {} records omitted by row cap.\n",
+            self.phase_end_records, PHASE_END_ROWS, self.phase_end_omitted_records
+        ));
+        for row in &self.phase_ends {
+            let metadata = row.end.as_ref().map_or_else(
+                || "duration/scope unknown (conflicting records)".into(),
+                |end| {
+                    format!(
+                        "check={} phase={} seconds={} scope_exit={}",
+                        end.check.name(),
+                        aterm_json::json!(end.phase),
+                        end.seconds(),
+                        aterm_json::json!(end.scope_exit)
+                    )
+                },
+            );
+            out.push_str(&format!("{prefix}  invocation={} run={} sequence={}: {} ({} observations; sample_complete=false).\n",
+                aterm_json::json!(row.invocation_id), row.test_run, row.phase_sequence,
+                metadata, row.occurrences));
         }
     }
 }
@@ -892,6 +988,197 @@ mod tests {
     }
 
     const FAILED_CASE: &str = r#"verify-event: {"schema":1,"event":"test-case-failed","outcome":"FAIL","test":"-p fixture --lib","case":"t::a","binary_completed":false,"sample_complete":false}"#;
+    const PHASE_END: &str = r#"verify-event: {"schema":1,"event":"test-phase-ended","check":"test","test_run":1,"phase_sequence":6,"phase":"execution-admission","scope_exit":"advanced","seconds":1.5,"provisional":true,"sample_complete":false}"#;
+
+    fn changed_phase(key: &str, value: aterm_json::Value) -> String {
+        let mut wire: aterm_json::Value =
+            aterm_json::from_str(PHASE_END.strip_prefix("verify-event: ").unwrap()).unwrap();
+        wire.as_object_mut().unwrap().insert(key.into(), value);
+        format!("verify-event: {wire}\n")
+    }
+
+    #[test]
+    fn phase_ends_reject_unsupported_payloads_without_changing_verdicts() {
+        let terminal = format!(
+            "{}{}",
+            event(Check::Doc),
+            crate::report::run_event(&[result(Check::Doc, Outcome::Ok)], crate::exit::PASS)
+        );
+        let baseline = observe(&terminal);
+        let zero = observe(&changed_phase("seconds", aterm_json::json!(0)));
+        assert_eq!(zero.phase_ends[0].end.as_ref().unwrap().seconds(), 0.0);
+        for (key, value) in [
+            ("event", aterm_json::json!("test-phase-started")),
+            ("provisional", aterm_json::json!(false)),
+            ("sample_complete", aterm_json::json!(true)),
+            ("check", aterm_json::json!("doc")),
+            ("check", aterm_json::json!("unknown")),
+            ("test_run", aterm_json::json!(0)),
+            ("test_run", aterm_json::json!(-1)),
+            ("phase_sequence", aterm_json::json!(0)),
+            ("phase_sequence", aterm_json::json!(4294967296u64)),
+            ("phase", aterm_json::json!("unknown")),
+            ("scope_exit", aterm_json::json!("completed")),
+            ("seconds", aterm_json::json!(-1.0)),
+            ("seconds", aterm_json::json!("1.5")),
+        ] {
+            let invalid = observe(&format!("{terminal}{}", changed_phase(key, value)));
+            assert!(invalid.phase_ends.is_empty(), "{key}");
+            assert_eq!(invalid.unprojected_records, 1);
+            assert_eq!(invalid.checks, baseline.checks);
+            assert_eq!(invalid.terminal_consistency, baseline.terminal_consistency);
+        }
+        let json = PHASE_END.strip_prefix("verify-event: ").unwrap();
+        assert!(crate::test_progress::End::read(&json.replace("1.5", "1e999")).is_none());
+        assert!(
+            crate::test_progress::End::read(
+                &json.replace("\"test_run\":1", "\"test_run\":18446744073709551616")
+            )
+            .is_none()
+        );
+        for key in [
+            "schema",
+            "event",
+            "check",
+            "test_run",
+            "phase_sequence",
+            "phase",
+            "scope_exit",
+            "seconds",
+            "provisional",
+            "sample_complete",
+        ] {
+            let value: aterm_json::Value = aterm_json::from_str(json).unwrap();
+            let duplicate = format!(
+                "{},\"{key}\":{}}}",
+                json.strip_suffix('}').unwrap(),
+                value[key]
+            );
+            let invalid = observe(&format!("{terminal}verify-event: {duplicate}\n"));
+            assert!(invalid.phase_ends.is_empty(), "duplicate {key}");
+            assert_eq!(invalid.unprojected_records, 1);
+            assert_eq!(invalid.terminal_consistency, baseline.terminal_consistency);
+        }
+        let partial = observe(PHASE_END);
+        assert!(partial.phase_ends.is_empty());
+        assert!(partial.trailing_partial);
+        assert_eq!(observe(&format!("{PHASE_END}\r\n")).phase_ends.len(), 1);
+    }
+
+    #[test]
+    fn phase_ends_keep_exact_partitions_and_make_counter_conflicts_sticky_unknown() {
+        let first = writer(None);
+        let second = writer(Some("b".repeat(40)));
+        let first_line = first.prepare(PHASE_END);
+        let second_line = second.prepare(&changed_phase("seconds", aterm_json::json!(2.5)));
+        let observed = observe(&format!("{first_line}{second_line}"));
+        assert_eq!(observed.phase_ends.len(), 2);
+        assert!(observed.phase_ends.iter().all(|row| !row.conflict));
+        assert_eq!(observed.invocations.len(), 2);
+        assert!(
+            observed
+                .invocations
+                .iter()
+                .all(|group| group.observed.phase_ends.len() == 1)
+        );
+        for (key, value) in [
+            ("check", aterm_json::json!("checkers")),
+            ("phase", aterm_json::json!("dispatch")),
+            ("seconds", aterm_json::json!(2.5)),
+            ("scope_exit", aterm_json::json!("returned")),
+        ] {
+            let conflicting = first.prepare(&changed_phase(key, value));
+            let observed = observe(&format!(
+                "{first_line}{first_line}{conflicting}{first_line}"
+            ));
+            assert_eq!(observed.phase_ends.len(), 1);
+            assert!(observed.phase_ends[0].conflict);
+            assert_eq!(observed.phase_ends[0].occurrences, 4);
+            assert!(observed.phase_ends[0].end.is_none());
+            let json = observed.json();
+            let row = &json["phase_ends"][0];
+            for field in ["check", "phase", "seconds", "scope_exit"] {
+                assert!(row[field].is_null());
+            }
+        }
+        let repeated = observe(&format!("{first_line}{first_line}"));
+        assert_eq!(repeated.phase_ends[0].occurrences, 2);
+        assert!(!repeated.phase_ends[0].conflict);
+        let mut conflict: aterm_json::Value =
+            aterm_json::from_str(second_line.trim().strip_prefix("verify-event: ").unwrap())
+                .unwrap();
+        conflict
+            .as_object_mut()
+            .unwrap()
+            .get_mut("invocation")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("id".into(), first.id().unwrap().into());
+        let observed = observe(&format!(
+            "{first_line}verify-event: {conflict}\n{PHASE_END}\n"
+        ));
+        assert!(observed.invocations[0].source_conflict);
+        assert!(observed.invocations[0].source_observation.is_none());
+        assert!(observed.invocations[0].observed.phase_ends[0].conflict);
+        assert_eq!(observed.unattributed.as_ref().unwrap().phase_ends.len(), 1);
+        assert!(
+            observed.unattributed.as_ref().unwrap().phase_ends[0]
+                .invocation_id
+                .is_none()
+        );
+        conflict
+            .as_object_mut()
+            .unwrap()
+            .get_mut("invocation")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("id".into(), "invalid".into());
+        let invalid = observe(&format!("{first_line}verify-event: {conflict}\n"));
+        assert!(!invalid.invocations[0].observed.phase_ends[0].conflict);
+        assert!(
+            invalid.unattributed.as_ref().unwrap().phase_ends[0]
+                .invocation_id
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn phase_ends_cap_keys_update_existing_and_survive_terminals_without_start_joins() {
+        let mut text = String::new();
+        for sequence in 1..=PHASE_END_ROWS + 2 {
+            text.push_str(&changed_phase(
+                "phase_sequence",
+                aterm_json::json!(u64::try_from(sequence).unwrap()),
+            ));
+        }
+        text.push_str(&changed_phase("phase_sequence", aterm_json::json!(1)));
+        let observed = observe(&text);
+        assert_eq!(observed.phase_ends.len(), PHASE_END_ROWS);
+        assert_eq!(observed.phase_end_records, PHASE_END_ROWS + 3);
+        assert_eq!(observed.phase_end_omitted_records, 2);
+        assert_eq!(observed.phase_ends[0].occurrences, 2);
+        let terminal = format!(
+            "{}{}",
+            event(Check::Doc),
+            crate::report::run_event(&[result(Check::Doc, Outcome::Ok)], crate::exit::PASS)
+        );
+        let completed = observe(&format!("{text}{terminal}"));
+        assert_eq!(completed.phase_ends, observed.phase_ends);
+        assert_eq!(
+            completed.terminal_consistency,
+            observe(&terminal).terminal_consistency
+        );
+        assert_eq!(
+            completed.json()["phase_end_observations_complete"].as_bool(),
+            Some(false)
+        );
+        let start = changed_phase("event", aterm_json::json!("test-phase-started"));
+        let observed = observe(&start);
+        assert!(observed.phase_ends.is_empty());
+        assert_eq!(observed.unprojected_records, 1);
+    }
 
     fn long_case_wire(test: &str, case: &str, at: u64) -> String {
         format!(
@@ -926,11 +1213,6 @@ mod tests {
         assert_eq!(
             observed.json()["long_case_observations_complete"].as_bool(),
             Some(false)
-        );
-        assert!(
-            observed
-                .render()
-                .contains("not binary identity or current activity")
         );
         assert!(observe(wire.trim_end()).long_cases.is_empty());
         let crlf = wire.replace('\n', "\r\n");

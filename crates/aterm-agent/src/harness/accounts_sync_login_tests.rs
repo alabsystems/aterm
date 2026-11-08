@@ -141,7 +141,7 @@ fn machine_identity_is_not_inferred_from_discovered_addresses() {
             "{\"oauthAccount\":{\"emailAddress\":\"owner@example.test\"}}\n",
         )
         .unwrap();
-        let env = quiet_env(
+        let mut env = quiet_env(
             &desk.home,
             &desk.state,
             &desk.config.join("aterm.toml"),
@@ -162,6 +162,86 @@ fn machine_identity_is_not_inferred_from_discovered_addresses() {
         }
         assert!(!desk.fleet_file().exists(), "discovery only observes");
         assert!(!desk.roster().exists(), "discovery only observes");
+
+        // Count only local_shows' bounded local reader. Discovery's later current-default
+        // read is independent and remains above, outside this operation's captured inputs.
+        let reads = std::cell::RefCell::new(BTreeMap::<PathBuf, usize>::new());
+        let read = |path: &Path| {
+            *reads.borrow_mut().entry(path.to_owned()).or_default() += 1;
+            read_local_source_text(path)
+        };
+        let shown = local_shows(&env, &read);
+        assert!(shown.claude.contains("sol-m27@example.test"));
+        assert!(shown.claude.contains("owner@example.test"));
+        assert_eq!(
+            reads.borrow().get(&desk.home.join(".claude.json.backup")),
+            Some(&1)
+        );
+        assert_eq!(
+            reads.borrow().get(&desk.home.join(".claude.json")),
+            Some(&1)
+        );
+        if !machine.is_empty() {
+            let primary = desk.home.join(".claude.json");
+            desk.default_login("fresh@example.test");
+            reads.borrow_mut().clear();
+            let fresh = local_shows(&env, &read);
+            assert!(fresh.claude.contains("fresh@example.test"));
+            assert!(!fresh.claude.contains("sol-m27@example.test"));
+            assert_eq!(
+                reads.borrow().get(&primary),
+                Some(&1),
+                "a new call reads fresh inputs"
+            );
+
+            // A failed parse is not a successful observation to reuse: the enumerated file
+            // can have become valid after that first attempt.
+            fs::write(&primary, "{").unwrap();
+            reads.borrow_mut().clear();
+            let repaired = std::cell::Cell::new(false);
+            let recovered = local_shows(&env, &|path| {
+                let result = read(path);
+                if path.as_os_str() == primary.as_os_str() && !repaired.replace(true) {
+                    desk.default_login("recovered@example.test");
+                }
+                result
+            });
+            assert!(recovered.claude.contains("recovered@example.test"));
+            assert_eq!(reads.borrow().get(&primary), Some(&2));
+
+            let custom = desk.home.join(".claude-custom-oauth.json");
+            fs::write(
+                &custom,
+                r#"{"oauthAccount":{"emailAddress":"custom@example.test"}}"#,
+            )
+            .unwrap();
+            env.claude_custom_oauth = true;
+            reads.borrow_mut().clear();
+            let custom_seen = local_shows(&env, &read);
+            assert!(custom_seen.claude.contains("custom@example.test"));
+            assert!(custom_seen.claude.contains("recovered@example.test"));
+            assert_eq!(reads.borrow().get(&custom), Some(&1));
+            assert_eq!(
+                reads.borrow().get(&primary),
+                Some(&1),
+                "a distinct default path skips no ordinary profile"
+            );
+
+            let legacy = desk.home.join(".claude/.config.json");
+            fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            fs::write(
+                &legacy,
+                r#"{"oauthAccount":{"emailAddress":"legacy@example.test"}}"#,
+            )
+            .unwrap();
+            env.claude_custom_oauth = false;
+            reads.borrow_mut().clear();
+            let legacy_seen = local_shows(&env, &read);
+            assert!(legacy_seen.claude.contains("legacy@example.test"));
+            assert!(legacy_seen.claude.contains("recovered@example.test"));
+            assert_eq!(reads.borrow().get(&legacy), Some(&1));
+            assert_eq!(reads.borrow().get(&primary), Some(&1));
+        }
     }
 }
 

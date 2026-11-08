@@ -103,6 +103,7 @@ pub struct Timeline {
     children: Vec<ChildRow>,
     qualify: Vec<QualifyRow>,
     branches: Vec<aterm_json::Value>,
+    cut_gates: Vec<aterm_json::Value>,
     /// Verify starts by (log, diagnostic invocation ID, stage index). Consumed, missing or
     /// repeated start times stay unknown; bounded slots remain to reject reuse of one key.
     /// New keys past MAX_ROWS have unknown starts; this is not a complete activity census.
@@ -166,6 +167,11 @@ impl Timeline {
             return;
         }
         match event["event"].as_str() {
+            Some("cut-gate-finished") => {
+                if self.cut_gates.len() < MAX_ROWS {
+                    self.cut_gates.push(event.clone());
+                }
+            }
             Some("release-stage") => self.release_stage(event),
             Some("qualify-branch") => self.qualify_branch(event),
             Some("step-child-finished") => {
@@ -718,6 +724,10 @@ impl Timeline {
             ),
             ("steps".to_owned(), aterm_json::Value::Array(steps)),
             (
+                "cut_gates".to_owned(),
+                aterm_json::Value::Array(self.cut_gates.clone()),
+            ),
+            (
                 "qualify".to_owned(),
                 aterm_json::Value::Array(self.qualify_rows()),
             ),
@@ -761,6 +771,27 @@ mod tests {
 
     fn timeline_of(logs: &[(&str, &str)]) -> aterm_json::Value {
         read_timeline(logs).value()
+    }
+
+    #[test]
+    fn cut_gate_costs_survive_the_log_without_inflating_step_totals() {
+        let gate = aterm_json::json!({
+            "schema": 1, "event": "cut-gate-finished", "gate": "digest",
+            "execution_s": 3.0, "self_cpu_s": 2.0,
+            "child_cpu": {"observed_s": 1.0}, "inclusive": true
+        });
+        let log = format!(
+            "{}{}{}release-event: {gate}\n",
+            stage("publish", "started", 1000, 0, 0),
+            stage("publish", "ok", 1003, 0, 3),
+            child("publish", 9.0, 1024),
+        );
+        let value = timeline_of(&[("08-publish.log", &log)]);
+        assert_eq!(value["cut_gates"][0], gate);
+        assert_eq!(value["cut_gates"].as_array().unwrap().len(), 1);
+        // A nested cost is diagnostic detail, not another child to charge.
+        assert_eq!(value["steps"][0]["cpu_s"].as_f64(), Some(9.0));
+        assert_eq!(value["steps"][0]["children"].as_u64(), Some(1));
     }
 
     fn stage(step: &str, outcome: &str, at: u64, waiting: u64, execution: u64) -> String {

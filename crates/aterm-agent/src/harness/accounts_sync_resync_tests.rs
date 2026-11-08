@@ -441,7 +441,7 @@ fn a_local_accounts_source_is_synced_again_each_time_it_changes() {
 /// THE CONVERGE READ OF A RESYNC is due wherever the resync syncs: a roster that is missing,
 /// before the first sync and again once removed, never reads as in step; after each sync that
 /// wrote it, the read in the same process reads nothing left. CONTROL: `[harness] accounts =
-/// "off"` reads nothing due over the same missing roster.
+/// "off"` holds the actual resync over the same missing roster.
 /// NEGATIVE CONTROL: a read that leaves the missing roster to `needs_init_accounts_sync` reads
 /// the removed roster as in step.
 #[test]
@@ -453,7 +453,16 @@ fn the_converge_read_is_due_where_the_resync_syncs_a_missing_roster() {
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
     let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
     let read = Mutex::new(Rediscovery::default());
-    let due = |now: i64| resync_due_with(&desk.home, &desk.state, &desk.roster(), now, &read);
+    let probe = |now: i64| {
+        read_resync_with(
+            &desk.home,
+            &desk.state,
+            &desk.roster(),
+            now,
+            &read,
+            &read_local_source_text,
+        )
+    };
     // Each runner is a process of its own: a resync with fresh effects, as the pass's apply.
     let resync = |now: i64| {
         let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
@@ -461,26 +470,23 @@ fn the_converge_read_is_due_where_the_resync_syncs_a_missing_roster() {
         resync_with(&desk.home, &desk.state, (&desk.roster(), now, false), &fx)
     };
 
-    assert!(
-        due(NOW).is_some_and(|why| why.contains("the roster is missing")),
-        "no roster yet"
-    );
+    assert!(matches!(probe(NOW), ResyncRead::Due(_)), "no roster yet");
     let first = resync(NOW);
     assert!(first.synced && first.changed, "{first:?}");
     assert_eq!(
-        due(NOW + 1),
-        None,
+        probe(NOW + 1),
+        ResyncRead::Current,
         "the read after the sync reads it in step"
     );
 
     fs::remove_file(desk.roster()).unwrap();
     assert!(
-        due(NOW + 2).is_some_and(|why| why.contains("the roster is missing")),
+        matches!(probe(NOW + 2), ResyncRead::Due(_)),
         "a removed roster is never read as in step"
     );
     let back = resync(NOW + 3);
     assert!(back.synced && desk.roster().is_file(), "{back:?}");
-    assert_eq!(due(NOW + 4), None);
+    assert_eq!(probe(NOW + 4), ResyncRead::Current);
 
     fs::remove_file(desk.roster()).unwrap();
     crate::test_config::write(
@@ -488,7 +494,11 @@ fn the_converge_read_is_due_where_the_resync_syncs_a_missing_roster() {
         "[fleet]\nmachine = \"m27\"\n[harness]\naccounts = \"off\"\n",
     )
     .unwrap();
-    assert_eq!(due(NOW + 5), None, "CONTROL: off reads nothing due");
+    assert_eq!(
+        resync(NOW + 5),
+        Resync::default(),
+        "CONTROL: off holds automatic sync"
+    );
 }
 
 #[test]
@@ -510,16 +520,31 @@ fn a_kimi_only_resync_reaches_current_without_a_claude_roster_or_source() {
         &desk.roster(),
         NOW
     ));
-    assert!(has_resync_accounts_source(
-        &desk.home,
-        &desk.state,
-        &desk.roster(),
-        NOW
-    ));
 
-    let read = Mutex::new(Rediscovery::default());
-    let due = |now| resync_due_with(&desk.home, &desk.state, &desk.roster(), now, &read);
-    assert!(due(NOW).is_some_and(|why| why.contains("kimi")));
+    // Availability and due work belong to one probe of this actual selected local source.
+    // Count bounded reads, not generic named-source fetches, which defaults do not use.
+    let reads = std::cell::RefCell::new(BTreeMap::<PathBuf, usize>::new());
+    let local_read = |path: &Path| {
+        *reads.borrow_mut().entry(path.to_owned()).or_default() += 1;
+        read_local_source_text(path)
+    };
+    assert!(matches!(
+        read_resync_with(
+            &desk.home,
+            &desk.state,
+            &desk.roster(),
+            NOW,
+            &Mutex::new(Rediscovery::default()),
+            &local_read,
+        ),
+        ResyncRead::Due(_)
+    ));
+    assert_eq!(
+        reads.borrow().get(&source),
+        Some(&1),
+        "one selected-source read per probe"
+    );
+
     let fetch = |_: &Env, source: &str| -> Result<String, String> {
         Err(format!("no fetch in a test: {source}"))
     };
@@ -528,21 +553,74 @@ fn a_kimi_only_resync_reaches_current_without_a_claude_roster_or_source() {
     let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
     let fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
     let synced = resync_with(&desk.home, &desk.state, (&desk.roster(), NOW, false), &fx);
-    let after = due(NOW + 1);
 
     assert!(synced.synced && synced.changed, "{synced:?}");
     assert!(fs::read_to_string(&kimi).unwrap().contains("kimi-1"));
-    assert_eq!(
-        cli_sync_due(Cli::Kimi, &desk.home, &desk.state, &config, NOW + 1),
-        Ok(Vec::new())
-    );
     assert!(synced.cli_failed.is_empty(), "{synced:?}");
     assert!(!desk.roster().exists() && !desk.fleet_file().exists());
-    assert_eq!(fs::read_to_string(source).unwrap(), fleet);
-    assert!(
-        synced.failed.is_none() && after.is_none(),
-        "resync={synced:?}; read after actual pool sync={after:?}"
-    );
+    assert_eq!(fs::read_to_string(&source).unwrap(), fleet);
+    assert!(synced.failed.is_none(), "{synced:?}");
+
+    let store = accounts::Store::at_for(&desk.state, Cli::Kimi, &desk.home);
+    // A legacy CLI fleet need not create pool identity state. Preserve actual absence too,
+    // while an unreadable state file remains a fixture failure rather than an absent file.
+    let state_bytes = || match fs::read(store.state_file()) {
+        Ok(bytes) => Some(bytes),
+        Err(why) if why.kind() == io::ErrorKind::NotFound => None,
+        Err(why) => panic!("could not read fixture account state: {why}"),
+    };
+    let before = (fs::read(&kimi).unwrap(), state_bytes());
+    reads.borrow_mut().clear();
+    let probe = || {
+        read_resync_with(
+            &desk.home,
+            &desk.state,
+            &desk.roster(),
+            NOW + 2,
+            &Mutex::new(Rediscovery::default()),
+            &local_read,
+        )
+    };
+    assert_eq!(probe(), ResyncRead::Current);
+    assert_eq!(reads.borrow().get(&source), Some(&1));
+
+    // A new probe must reopen even when a refused replacement has the same size and stamp.
+    let stamp = fs::metadata(&source).unwrap().modified().unwrap();
+    fs::write(
+        &source,
+        format!("{:<width$}", "[[account]\n", width = fleet.len()),
+    )
+    .unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&source)
+        .unwrap()
+        .set_modified(stamp)
+        .unwrap();
+    assert_eq!(fs::metadata(&source).unwrap().len(), fleet.len() as u64);
+    assert_eq!(fs::metadata(&source).unwrap().modified().unwrap(), stamp);
+    reads.borrow_mut().clear();
+    assert!(matches!(probe(), ResyncRead::Due(_)));
+    assert_eq!(reads.borrow().get(&source), Some(&1));
+    assert_eq!((fs::read(&kimi).unwrap(), state_bytes()), before);
+
+    // All three other CLIs select this same pool before the refused Kimi-specific source.
+    // This counter covers their local loader, not Claude's separate scheduling/discovery IO.
+    let pool = secrets.join(super::super::ai_pool::AI_POOL_FILE);
+    fs::write(
+        &pool,
+        concat!(
+            "version=1\n[[account]]\nprovider='codex'\nemail='c@example.test'\nwarm=['m16']\n",
+            "[[account]]\nprovider='grok'\nemail='g@example.test'\nwarm=['m16']\n",
+            "[[account]]\nprovider='kimi:global'\nemail='k@example.test'\nwarm=['m16']\n",
+        ),
+    )
+    .unwrap();
+    reads.borrow_mut().clear();
+    assert!(matches!(probe(), ResyncRead::Due(_)));
+    assert_eq!(reads.borrow().get(&pool), Some(&1));
+    assert!(!reads.borrow().contains_key(&source));
+    assert_eq!((fs::read(&kimi).unwrap(), state_bytes()), before);
 }
 
 #[test]
@@ -563,8 +641,17 @@ fn a_missing_claude_roster_keeps_its_unannotated_local_source_and_its_refusal() 
             NOW
         ));
         let read = Mutex::new(Rediscovery::default());
-        let due = |now| resync_due_with(&desk.home, &desk.state, &desk.roster(), now, &read);
-        assert!(due(NOW).is_some_and(|why| why.contains("the roster is missing")));
+        let probe = |now| {
+            read_resync_with(
+                &desk.home,
+                &desk.state,
+                &desk.roster(),
+                now,
+                &read,
+                &read_local_source_text,
+            )
+        };
+        assert_eq!(probe(NOW), ResyncRead::NoSource);
         let fetch = |_: &Env, source: &str| -> Result<String, String> {
             Err(format!("no fetch in a test: {source}"))
         };
@@ -581,12 +668,12 @@ fn a_missing_claude_roster_keeps_its_unannotated_local_source_and_its_refusal() 
                     .unwrap()
                     .contains("claude-1")
             );
-            assert_eq!(due(NOW + 1), None);
+            assert_eq!(probe(NOW + 1), ResyncRead::Current);
         } else {
             assert!(synced.failed.is_some(), "{synced:?}");
             assert!(!desk.roster().exists());
             assert_eq!(fs::read_to_string(desk.fleet_file()).unwrap(), source);
-            assert!(due(NOW + 1).is_some());
+            assert_eq!(probe(NOW + 1), ResyncRead::NoSource);
         }
     }
 }
@@ -603,25 +690,26 @@ fn an_ai_pool_without_claude_accounts_for_this_machine_reaches_current() {
         "version = 1\n\n[[account]]\nprovider = \"codex\"\nemail = \"codex-one@example.test\"\nwarm = [\"m16\"]\n",
     )
     .unwrap();
-    assert!(has_resync_accounts_source(
-        &desk.home,
-        &desk.state,
-        &desk.roster(),
-        NOW
-    ));
     assert_eq!(
         cli_pools_due(&config, &desk.state, &desk.home, NOW),
         vec![Cli::Codex]
     );
 
     let read = Mutex::new(Rediscovery::default());
-    let due = |now| resync_due_with(&desk.home, &desk.state, &desk.roster(), now, &read);
+    let probe = |now| {
+        read_resync_with(
+            &desk.home,
+            &desk.state,
+            &desk.roster(),
+            now,
+            &read,
+            &read_local_source_text,
+        )
+    };
+    let before = probe(NOW);
     assert!(
-        due(NOW)
-            .as_deref()
-            .is_some_and(|why| why.contains("codex's pool has accounts to add (codex-m16)")),
-        "before sync: {:?}",
-        due(NOW)
+        matches!(&before, ResyncRead::Due(why) if why.contains("codex-m16")),
+        "before sync: {before:?}"
     );
     let fetch = |_: &Env, source: &str| -> Result<String, String> {
         Err(format!("no fetch in a test: {source}"))
@@ -638,8 +726,8 @@ fn an_ai_pool_without_claude_accounts_for_this_machine_reaches_current() {
     assert!(!desk.roster().exists(), "no Claude accounts for m16");
     assert!(fs::read_to_string(&codex).unwrap().contains("codex-m16"));
     assert_eq!(
-        due(NOW + 1),
-        None,
+        probe(NOW + 1),
+        ResyncRead::Current,
         "empty Claude pool is settled and Codex pool is synced"
     );
     let quiet = resync_with(
@@ -655,12 +743,10 @@ fn an_ai_pool_without_claude_accounts_for_this_machine_reaches_current() {
         "version = 1\n\n[[account]]\nprovider = \"codex\"\nemail = \"codex-one@example.test\"\nwarm = [\"m22\"]\n",
     )
     .unwrap();
+    let moved = probe(NOW + 61);
     assert!(
-        due(NOW + 61)
-            .as_deref()
-            .is_some_and(|why| why.contains("codex's pool has accounts to add (codex-m16)")),
-        "holder change on existing Codex row is due: {:?}",
-        due(NOW + 61)
+        matches!(&moved, ResyncRead::Due(why) if why.contains("codex-m16")),
+        "holder change on existing Codex row is due: {moved:?}"
     );
     let reassigned = resync_with(
         &desk.home,
@@ -682,5 +768,5 @@ fn an_ai_pool_without_claude_accounts_for_this_machine_reaches_current() {
             .and_then(|row| row.held_by.as_deref()),
         Some("m22")
     );
-    assert_eq!(due(NOW + 63), None);
+    assert_eq!(probe(NOW + 63), ResyncRead::Current);
 }

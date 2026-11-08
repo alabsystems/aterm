@@ -83,7 +83,7 @@ pub fn has_section(text: &str, version: &str) -> bool {
     text.lines().any(|l| is_section_header(l, version))
 }
 
-/// Pre-claim gates, in transcript order: `[Unreleased]` exists, its real body is non-empty, and the raw section carries no `'''` or raw control character.
+/// Pre-claim gates: `[Unreleased]` exists, has no entry already released, its real body is non-empty, and the raw section carries no `'''` or raw control character.
 /// Leftover git conflict-marker lines (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>`) in the raw section are also refused.
 pub fn gate_unreleased(text: &str) -> Result<GateSummary> {
     gate_section(text, "Unreleased")
@@ -145,6 +145,7 @@ pub fn gate_section(text: &str, section: &str) -> Result<GateSummary> {
              section, so no release's notes would carry it — move it under \"## [{section}]\""
         )));
     }
+    refuse_repeated_notes(text, section)?;
     let body = real_body(text, section);
     if body.iter().all(|l| l.starts_with(HARNESS_ENTRY_HEAD)) {
         return Err(Error::new(format!(
@@ -190,6 +191,7 @@ pub fn gate_section(text: &str, section: &str) -> Result<GateSummary> {
 
 /// Roll `## [Unreleased]` → `## [<version>] - <date>` (spec §3): the new heading is inserted right below the Unreleased header with one blank line between — the whole current body changes ownership to the release and a fresh EMPTY `[Unreleased]` scaffold is what remains on top.
 pub fn roll(text: &str, version: &str, date: &str) -> Result<String> {
+    refuse_repeated_notes(text, "Unreleased")?;
     // Double-roll guard: a second `## [X.Y.Z]` would split the notes across two headings,
     // and recut detection keys on this section's presence.
     if has_section(text, version) {
@@ -255,9 +257,10 @@ pub fn claim_changelogs(
 
 /// The release commit's changelog ([`claim_changelogs`]' first half, shared by the reservation that writes it and the claim that checks it): `source` rolled for `version` on `date`, or `source` as it stands when it already carries the section.
 /// # Errors
-/// [`roll`]'s.
+/// [`roll`]'s, or an already-rolled section repeats an older release's entry.
 pub fn release_changelog(source: &str, version: &str, date: &str) -> Result<String> {
     if has_section(source, version) {
+        refuse_repeated_notes(source, version)?;
         Ok(source.to_string())
     } else {
         roll(source, version, date)
@@ -277,6 +280,7 @@ pub fn section_date<'a>(text: &'a str, version: &str) -> Option<&'a str> {
 
 /// Roll `main` for a release whose notes are `source`'s (the published commit's) `[Unreleased]` body rather than main's own.
 pub fn roll_shipped(main: &str, source: &str, version: &str, date: &str) -> Result<String> {
+    refuse_repeated_notes(source, "Unreleased")?;
     if has_section(main, version) {
         return Err(Error::new(format!(
             "{CHANGELOG_FILE} already has a \"## [{version}]\" section — already rolled"
@@ -330,6 +334,66 @@ fn unreleased_body(text: &str) -> Result<Vec<&str>> {
 enum Unit<'a> {
     Heading(&'a str),
     Entry(Vec<&'a str>),
+}
+
+/// Full entries, with comments/scaffolds removed and whitespace folded. The whole
+/// entry matters: a follow-up may reuse a bold title while describing a new fix.
+/// Harness versions have their own release-window rule in `harness_versions`.
+fn note_keys(text: &str, section: &str) -> Vec<String> {
+    let body = real_body(text, section);
+    let lines: Vec<&str> = body.iter().map(String::as_str).collect();
+    units(&lines)
+        .into_iter()
+        .filter_map(|unit| match unit {
+            Unit::Entry(lines) if !lines[0].starts_with(HARNESS_ENTRY_HEAD) => {
+                let joined = lines.join("\n");
+                let entry = joined
+                    .strip_prefix("- ")
+                    .or_else(|| joined.strip_prefix("* "))
+                    .unwrap_or(&joined);
+                Some(entry.split_whitespace().collect::<Vec<_>>().join(" "))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Compare only sections below the candidate. A recut must not compare its notes
+/// with a newer release or with a peer's reintroduced Unreleased entry.
+fn refuse_repeated_notes(text: &str, section: &str) -> Result<()> {
+    let Some((_, end)) = section_span(text, section) else {
+        return Ok(());
+    };
+    let mut released = std::collections::BTreeMap::new();
+    for line in text.lines().skip(end) {
+        let Some(name) = line
+            .strip_prefix("## [")
+            .and_then(|s| s.split_once(']').map(|p| p.0))
+        else {
+            continue;
+        };
+        let parts: Vec<_> = name.split('.').collect();
+        if parts.len() != 3
+            || !parts
+                .iter()
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            || !is_section_header(line, name)
+        {
+            continue;
+        }
+        for entry in note_keys(text, name) {
+            released.entry(entry).or_insert(name);
+        }
+    }
+    for entry in note_keys(text, section) {
+        if let Some(earlier) = released.get(&entry) {
+            return Err(Error::new(format!(
+                "{CHANGELOG_FILE}: [{section}] repeats an entry already released in [{earlier}]: \
+                 {entry} — remove the merged duplicate before cutting"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn units<'a>(body: &[&'a str]) -> Vec<Unit<'a>> {
@@ -634,6 +698,49 @@ fn section_span(text: &str, section: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The original gate accepted this merge artifact. Each refusal assertion is
+    /// a negative control against removing the duplicate check at that boundary.
+    #[test]
+    fn repeated_notes_cannot_pass_the_gate_or_roll() {
+        let doc = "## [Unreleased]\n\n- **Fix.** Same  words.\n  Continued here.\n\n## [0.2.0] - date\n\n- newer unrelated fix\n\n## [0.1.0] - date\n\n* **Fix.** Same words. Continued here.\n";
+        let err = gate_unreleased(doc).unwrap_err().to_string();
+        assert!(
+            err.contains("[Unreleased]") && err.contains("[0.1.0]"),
+            "{err}"
+        );
+        assert!(roll(doc, "0.3.0", "date").is_err());
+        assert!(release_changelog(doc, "0.3.0", "date").is_err());
+        assert!(roll_shipped(doc, doc, "0.3.0", "date").is_err());
+        let recut = doc.replace("## [Unreleased]", "## [0.3.0] - date");
+        assert!(gate_section(&recut, "0.3.0").is_err());
+        assert!(release_changelog(&recut, "0.3.0", "date").is_err());
+
+        // Same bold lead, new description: a legitimate follow-up survives.
+        let followup = doc.replacen("Same  words.", "A further fix.", 1);
+        assert!(gate_unreleased(&followup).is_ok());
+        assert!(roll(&followup, "0.3.0", "date").is_ok());
+        // Removing the older entry also changes the verdict.
+        assert!(
+            gate_unreleased(&doc.replace(
+                "* **Fix.** Same words. Continued here.",
+                "- distinct older entry"
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn harness_entries_keep_their_own_rule_and_recuts_ignore_newer_notes() {
+        let harness = format!("{HARNESS_ENTRY_HEAD}0.1.0: tool 2**");
+        let doc = format!(
+            "## [Unreleased]\n\n- fresh note\n\n{harness}\n\n## [0.2.0] - date\n\n- old note\n\n{harness}\n\n## [0.1.0] - date\n\n- oldest note\n"
+        );
+        assert!(gate_unreleased(&doc).is_ok());
+        let duplicate = doc.replace("fresh note", "old note");
+        assert!(gate_unreleased(&duplicate).is_err());
+        assert!(gate_section(&duplicate, "0.2.0").is_ok());
+    }
 
     /// TODAY IN LOS ANGELES IS WHAT `date` SAYS under `TZ=America/Los_Angeles` (the reader
     /// [`today_la`] replaced, as its oracle; read between two of ours, so a midnight between

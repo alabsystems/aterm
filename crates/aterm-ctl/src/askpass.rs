@@ -12,9 +12,6 @@ use std::time::Duration;
 /// The wait for the server's answer: longer than the server's own 300 s sheet
 /// deadline, so the server's reply (or timeout line) always arrives first.
 const REPLY_WAIT: Duration = Duration::from_secs(360);
-/// The connect phase: a running aterm answers at once.
-const CONNECT_WAIT: Duration = Duration::from_secs(10);
-
 /// Refuse: a reason to fd 2, nothing to fd 1, exit nonzero.
 fn refuse(reason: &str) -> ExitCode {
     eprintln!("aterm-askpass: refused: {reason}");
@@ -43,7 +40,7 @@ pub fn main_entry(_args: Vec<std::ffi::OsString>) -> ExitCode {
         }
     };
 
-    let reply = match send_askpass(&sock, CONNECT_WAIT, REPLY_WAIT) {
+    let reply = match send_askpass(&sock, crate::REQUIRED_SERVER_HANG, REPLY_WAIT) {
         Ok(reply) => reply,
         Err(e) => return refuse(&format!("the aterm did not answer ({e})")),
     };

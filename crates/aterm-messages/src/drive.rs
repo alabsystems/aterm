@@ -19,14 +19,10 @@ use crate::{Instant, MAX_ROWS, MessageCenter};
 pub struct Commit {
     /// The step's instant (the host's clock, read once).
     pub now: Instant,
-    /// Whether a seamless handoff currently freezes the band.
-    pub frozen: bool,
     /// The most rows the band may take ([`afford`]).
     pub afford: u16,
     /// The row count the host's geometry reserves now.
     pub reserved: u16,
-    /// Latest chrome regrow floor across windows resized by the band.
-    pub floor: Option<Instant>,
 }
 
 /// What one step changed.
@@ -34,24 +30,20 @@ pub struct Commit {
 pub struct Committed {
     /// Something painted changed ([`crate::Settled::glass_changed`]).
     pub glass_changed: bool,
-    /// Row count the host should re-grid to, or `None` when unchanged or frozen.
+    /// Row count the host should re-grid to, or `None` when unchanged.
     pub regrid: Option<u16>,
 }
 
 /// Commits the row count and returns `Some(rows)` when the host must re-grid.
-pub fn commit(center: &mut MessageCenter, c: Commit) -> Option<u16> {
-    center.set_regrow_floor(c.floor);
-    if c.frozen {
-        return None;
-    }
+fn commit(center: &mut MessageCenter, c: Commit) -> Option<u16> {
     let moved = center.commit_rows(c.now, c.afford);
     let rows = center.committed_rows();
     (moved.is_some() || rows != c.reserved).then_some(rows)
 }
 
-/// Retires expired entries and commits the row count for `c`.
+/// Retires expired entries, holds included, and commits the row count for `c`.
 pub fn settle_and_commit(center: &mut MessageCenter, c: Commit) -> Committed {
-    let settled = center.settle(c.now, !c.frozen);
+    let settled = center.settle(c.now, true);
     Committed {
         glass_changed: settled.glass_changed,
         regrid: commit(center, c),

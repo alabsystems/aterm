@@ -10660,8 +10660,8 @@ struct App {
     linux_held_said: Option<u64>,
     config_cleared: std::collections::BTreeSet<String>,
     config_settings_shows: std::collections::BTreeSet<String>,
-    /// The front window and its tab at the last sync (`App::band_meets_the_front`).
-    band_front: Option<(WindowId, Option<tab_model::TabId>)>,
+    /// The front window and its tab at the last sync (`App::sync_active_session`).
+    front_shown: Option<(WindowId, Option<tab_model::TabId>)>,
     managed_current_recorded:
         Option<(Vec<toolchain_words::ManagedItem>, aterm_messages::MessageId)>,
     /// The whole text of the last harness note recorded (`App::record_harness_note`).
@@ -10689,7 +10689,6 @@ struct App {
     wire_gate: aterm_messages::wire::WireGate,
     folder_rows: spawn_folder::RowFolders,
     restored_shown: app_restore::RestoredShown,
-    message_band_rows: u16,
     messages_log: Option<messages_store::Writer>,
     messages_last_publish: Option<Instant>,
     messages_published_revision: u64,
@@ -14050,7 +14049,7 @@ impl App {
         reclaim
     }
 
-    /// Request a redraw of every open window, for global banner state (the message band settle, the update-ready nudge).
+    /// Request a redraw of every open window, for global banner state (a messages settle, the update-ready nudge).
     pub(crate) fn request_redraw_all_windows(&self) {
         for ws in self.windows.values() {
             if let Some(w) = &ws.os_window {
@@ -15032,8 +15031,8 @@ impl App {
                 .get(&front)
                 .and_then(|ws| ws.tab_set.active_id()),
         );
-        let changed = self.band_front.replace(shown) != Some(shown);
-        self.band_meets_the_front(changed);
+        let changed = self.front_shown.replace(shown) != Some(shown);
+        self.settings_meets_the_front();
         if changed {
             self.packages_page_met_the_front(front);
         }
@@ -15607,7 +15606,6 @@ impl App {
             wire_gate: aterm_messages::wire::WireGate::default(),
             folder_rows: spawn_folder::RowFolders::default(),
             restored_shown: app_restore::RestoredShown::default(),
-            message_band_rows: 0,
             messages_log: None,
             messages_last_publish: None,
             messages_published_revision: 0,
@@ -15643,7 +15641,7 @@ impl App {
             linux_held_said: None,
             config_cleared: std::collections::BTreeSet::new(),
             config_settings_shows: std::collections::BTreeSet::new(),
-            band_front: None,
+            front_shown: None,
             managed_current_recorded: None,
             harness_note_recorded: None,
             upgrade_view: upgrade_host::UpgradeView::default(),
@@ -17991,7 +17989,7 @@ impl ApplicationHandler<Wake> for App {
                 self.level_up = None;
             }
             let level_up_animating = self.level_up.is_some();
-            let band_folded = self.settle_messages(now);
+            let messages_repaint = self.settle_messages(now);
             self.presence_tick(now);
             for (id, ws) in self.windows.iter_mut() {
                 let mut dirty = ws.bell_flash.expire(now);
@@ -18065,7 +18063,7 @@ impl ApplicationHandler<Wake> for App {
             if level_up_animating || level_up_gone {
                 to_redraw.extend(self.windows.keys().copied());
             }
-            if band_folded {
+            if messages_repaint {
                 to_redraw.extend(self.windows.keys().copied());
             }
             let native_preview_phase_ms =
@@ -18182,9 +18180,6 @@ impl ApplicationHandler<Wake> for App {
             self.post_update_landed(crate::build_info::version_display(), build, repainted);
         }
         self.sync_settings_views();
-        if self.sync_message_band_rows(park_now) {
-            self.request_redraw_all_windows();
-        }
         #[cfg(any(target_os = "macos", all(test, unix)))]
         if let Some(retry_at) = self
             .update_handoff_prelaunch
@@ -28741,7 +28736,6 @@ pub fn main_entry_with_network(
         wire_gate: aterm_messages::wire::WireGate::default(),
         folder_rows: spawn_folder::RowFolders::default(),
         restored_shown: app_restore::RestoredShown::default(),
-        message_band_rows: 0,
         messages_log,
         messages_last_publish: None,
         messages_published_revision: 0,
@@ -28777,7 +28771,7 @@ pub fn main_entry_with_network(
         linux_held_said: None,
         config_cleared: std::collections::BTreeSet::new(),
         config_settings_shows: launch_settings_shows,
-        band_front: None,
+        front_shown: None,
         managed_current_recorded: None,
         harness_note_recorded: None,
         upgrade_view: upgrade_host::UpgradeView::with_writer(

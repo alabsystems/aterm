@@ -1159,7 +1159,8 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
     let trust_repo = lineage_switch::default_trust_repo(ctx);
     let switch = lineage_switch::read(ctx, &trust_repo)?;
     say_switch(ctx, &trust_repo, &switch);
-    let compiler = toolchain::admit(tools, &tc.bin, &switch)?;
+    let compiler =
+        toolchain::admit_with_frontend(tools, &tc.bin, &switch, ctx.frontend_component.as_deref())?;
     let signer = match request.signing {
         Signing::MachineKey => Some(Signer::load(ctx)?),
         Signing::Unsigned => None,

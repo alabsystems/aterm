@@ -20,17 +20,12 @@ pub(crate) struct Seen {
     flips: i64,
 }
 
-/// Project the live strip into the shared chrome-floor model. Automatic messages never
-/// supply the model's optional band source.
+/// Project the live strip into the chrome-floor model.
 pub(crate) fn project(app: &App, wid: WindowId, now: Instant, seen: &Seen) -> State {
     let ws = &app.windows[&wid];
     let strip = app.tab_strip_rows > 0;
     let mut state = State::new();
     for (name, value) in [
-        ("bw", 0),
-        ("b", 0),
-        ("bq", 1),
-        ("cramped", 0),
         (
             "sw",
             i64::from(app.strip_fall.map_or(strip, |rows| rows > 0)),

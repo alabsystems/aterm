@@ -625,7 +625,6 @@ mod tests {
             },
             Some(2),
         );
-        assert_eq!(app.message_band_rows, 0);
         assert!(!app.messages.log().is_empty());
     }
 

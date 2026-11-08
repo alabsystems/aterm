@@ -164,7 +164,7 @@ EXIT CODES:
          ends it in its own words; a worker the peer hosts no more is a
          closed row, as on one Mac.
     2    could not reach: the instance accepted the connection but did not
-         serve it within 10 s (or a shorter --timeout; --timeout 0 waits
+         serve it within 60 s (or a shorter --timeout; --timeout 0 waits
          without bound), so the request was not sent. With --host, an aterm
          took the connection and sent no fleet handshake in time: a drive's
          peer within 28 s (each `await task` leg's: its wait and 8 s) or a
@@ -823,7 +823,7 @@ fn front_door_ask_at(
 
 /// Hand one request line to the instance at `path` and return its first reply line, trimmed.
 pub fn front_door_send(path: &str, request: &str) -> io::Result<String> {
-    front_door_send_within(path, request, FRONT_DOOR_DEADLINE, FRONT_DOOR_DEADLINE)
+    front_door_send_within(path, request, REQUIRED_SERVER_HANG, REQUIRED_SERVER_HANG)
 }
 
 /// [`front_door_send`] with `accept` bounding the connect phase and the request's write, and `reply` the wait for the answer to the request.
@@ -832,6 +832,16 @@ pub fn front_door_send_within(
     request: &str,
     accept: std::time::Duration,
     reply: std::time::Duration,
+) -> io::Result<String> {
+    front_door_send_with_reply_clock(path, request, accept, reply, std::time::Instant::now)
+}
+
+fn front_door_send_with_reply_clock(
+    path: &str,
+    request: &str,
+    accept: std::time::Duration,
+    reply: std::time::Duration,
+    reply_started: impl FnOnce() -> std::time::Instant,
 ) -> io::Result<String> {
     let stream = match open_accepted(path, TargetOrigin::Pinned, Some(accept))? {
         Acceptance::Served(stream) => stream,
@@ -844,7 +854,17 @@ pub fn front_door_send_within(
         }
         Acceptance::Dropped => return Err(io::ErrorKind::UnexpectedEof.into()),
     };
-    stream.set_read_timeout(Some(reply))?;
+    let started = reply_started();
+    let Some(remaining) = reply
+        .checked_sub(started.elapsed())
+        .filter(|d| !d.is_zero())
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "reply deadline elapsed before the request was sent",
+        ));
+    };
+    stream.set_read_timeout(Some(remaining))?;
     allow_foreground_handoff(path);
     if let Err(e) = (&stream)
         .write_all(request.as_bytes())
@@ -883,7 +903,7 @@ pub fn front_door_send_within(
     }
 }
 
-const FRONT_DOOR_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const REQUIRED_SERVER_HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Debug)]
 struct Delivered(String);
@@ -5554,39 +5574,6 @@ fn connect_stream(path: &str, origin: TargetOrigin) -> io::Result<(CtlStream, Op
     connect_then_read(path, read_token_for).map_err(|e| connect_error(path, &e, origin))
 }
 
-const ACCEPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
-
-#[cfg(test)]
-thread_local! {
-    static ACCEPT_WITHIN: std::cell::Cell<Option<std::time::Duration>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// How long a connect to a server that keeps a token waits for it to accept ([`open_accepted`])
-/// at most, where the caller's deadline is longer: [`ACCEPT_DEADLINE`], or what a test set for a
-/// server that serves, which a loaded machine can keep from accepting within
-/// [`ACCEPT_DEADLINE`]. A unit test sets it on its thread (`with_accept_within`); a test of the
-/// binary sets the dev seam [`ACCEPT_WITHIN_SEAM`] (milliseconds).
-fn accept_within() -> std::time::Duration {
-    #[cfg(test)]
-    if let Some(within) = ACCEPT_WITHIN.get() {
-        return within;
-    }
-    seamed_within(ACCEPT_WITHIN_SEAM, ACCEPT_DEADLINE)
-}
-
-/// The dev seam that sets [`accept_within`] for a test of the binary.
-pub const ACCEPT_WITHIN_SEAM: &str = "ATERM_DEBUG_CTL_ACCEPT_WITHIN_MS";
-
-/// `act` with each accept of this thread's connects bounded by `within` ([`accept_within`]).
-#[cfg(all(test, unix))]
-fn with_accept_within<R>(within: std::time::Duration, act: impl FnOnce() -> R) -> R {
-    let before = ACCEPT_WITHIN.replace(Some(within));
-    let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(act));
-    ACCEPT_WITHIN.set(before);
-    done.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-}
-
 const ACCEPT_PROBE: &[u8] = b"version\n";
 
 enum Acceptance {
@@ -5645,16 +5632,36 @@ fn open_accepted(
     origin: TargetOrigin,
     deadline: Option<std::time::Duration>,
 ) -> io::Result<Acceptance> {
+    open_accepted_with_clock(path, origin, deadline, std::time::Instant::now)
+}
+
+fn open_accepted_with_clock(
+    path: &str,
+    origin: TargetOrigin,
+    deadline: Option<std::time::Duration>,
+    started: impl FnOnce() -> std::time::Instant,
+) -> io::Result<Acceptance> {
     let (stream, token) =
         connect_then_read(path, read_token_file_at).map_err(|e| connect_error(path, &e, origin))?;
     let token = token.ok();
     let patience = match token {
-        Some(_) => deadline.map(|d| d.min(accept_within())),
+        Some(_) => deadline.map(|d| d.min(REQUIRED_SERVER_HANG)),
         None => deadline,
+    };
+    let started = started();
+    let remaining = match patience {
+        Some(bound) => match bound
+            .checked_sub(started.elapsed())
+            .filter(|d| !d.is_zero())
+        {
+            Some(remaining) => Some(remaining),
+            None => return Ok(Acceptance::NotAccepted(bound)),
+        },
+        None => None,
     };
     if let Err(e) = stream
         .set_write_timeout(deadline)
-        .and_then(|()| stream.set_read_timeout(patience))
+        .and_then(|()| stream.set_read_timeout(remaining))
     {
         if !peer_already_closed(&e) {
             return Err(e);
@@ -5685,7 +5692,7 @@ fn open_accepted(
         Ok(_) => {}
         Err(e) if is_timeout_error(&e) => {
             return Ok(Acceptance::NotAccepted(
-                patience.unwrap_or_else(accept_within),
+                patience.unwrap_or(REQUIRED_SERVER_HANG),
             ));
         }
         Err(e) if is_peer_drop(&e) => return Ok(Acceptance::Dropped),

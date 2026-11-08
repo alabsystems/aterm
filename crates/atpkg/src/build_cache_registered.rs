@@ -1611,6 +1611,31 @@ fn configs_name_a_lock_root(machine: &super::Machine<'_>) -> bool {
 /// adopting it. A command name used as an option value, an external alias or lint argument
 /// proves none of this; a free verb still runs through every other rule of the shim's front.
 fn non_producing_command(args: &[String], tool: super::Tool, machine: &super::Machine<'_>) -> bool {
+    // These exact native build-tree operations never compile. Their own
+    // manager checks tree custody and Cargo locks; asking about that custody
+    // must not first adopt or reject the workspace's build output directory.
+    // `exec` and unknown operations remain possible producers here.
+    if tool == super::Tool::Targo
+        && let [trust, repo, lock, rest @ ..] = args
+        && trust == "trust"
+        && repo == "repo"
+        && lock == "lock"
+        && matches!(
+            rest.first().map(String::as_str),
+            None | Some(
+                "--protocol"
+                    | "--help"
+                    | "-h"
+                    | "status"
+                    | "acquire"
+                    | "release"
+                    | "break"
+                    | "reclaim-incremental"
+            )
+        )
+    {
+        return true;
+    }
     // A native scheduler capability probe has no command or build output.
     // Recognize only its exact shape; aliases and mixed commands still owe
     // normal cache ownership and build admission.
@@ -3308,6 +3333,67 @@ mod tests {
         home: PathBuf,
         owner: PathBuf,
         target: PathBuf,
+    }
+
+    #[test]
+    fn native_build_tree_administration_does_not_read_or_adopt_build_caches() {
+        let directory = aterm_tempfile::tempdir().unwrap();
+        let home = directory.path();
+        let machine = super::super::Machine {
+            home: Some(home),
+            root: None,
+            cwd: Some(home),
+            env: &|_| panic!("native tree administration must not inspect build-cache settings"),
+            read: &|_| panic!("native tree administration must not read build-cache config"),
+            writable: &|_| panic!("native tree administration must not register build output"),
+        };
+        for operation in [
+            None,
+            Some("--protocol"),
+            Some("--help"),
+            Some("-h"),
+            Some("status"),
+            Some("acquire"),
+            Some("release"),
+            Some("break"),
+            Some("reclaim-incremental"),
+        ] {
+            let mut args = vec!["trust".into(), "repo".into(), "lock".into()];
+            args.extend(operation.map(str::to_owned));
+            assert!(
+                !observe_for_producer(&args, super::super::Tool::Targo, home, &machine, true)
+                    .unwrap(),
+                "{args:?}"
+            );
+            assert!(crate::build_admit::classify(&args, super::super::Tool::Targo).is_none());
+            for tool in [super::super::Tool::Cargo, super::super::Tool::Tippy] {
+                assert!(!non_producing_command(&args, tool, &machine));
+            }
+        }
+        assert_eq!(std::fs::read_dir(home).unwrap().count(), 0);
+        for words in [
+            vec!["trust", "repo", "lock", "exec", "--", "build"],
+            vec!["trust", "repo", "lock", "unknown"],
+            vec!["trust", "repo", "locker", "status"],
+            vec!["--config", "trust", "repo", "lock", "status"],
+            vec!["alias", "trust", "repo", "lock", "status"],
+            vec![
+                "--unverified",
+                "run",
+                "--",
+                "trust",
+                "repo",
+                "lock",
+                "status",
+            ],
+            vec!["--unverified", "build", "trust", "repo", "lock", "status"],
+        ] {
+            let args = words.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(
+                !non_producing_command(&args, super::super::Tool::Targo, &machine),
+                "{args:?}"
+            );
+        }
     }
 
     impl World {

@@ -46,31 +46,32 @@ pub fn today() -> Option<u64> {
     aterm_time::since_epoch().map(|d| d.as_secs() / 86_400)
 }
 
-/// The parts of a key joined into one; `None` when a part could not be read (no key is
-/// better than one that leaves out what the answer depends on) or holds a line break.
+/// The parts of a key framed into one, preserving empty fields and their positions.
+/// `None` when a part is unavailable or contains a line break or reserved separator:
+/// an unread dependency cannot leave a usable partial key.
 #[must_use]
 pub fn key<I, S>(parts: I) -> Option<String>
 where
     I: IntoIterator<Item = Option<S>>,
     S: AsRef<str>,
 {
-    let mut joined = String::new();
+    // The old encoding never began with UNIT. Framing also retires its ambiguous records.
+    let mut joined = UNIT.to_string();
     for part in parts {
         let part = part?;
         let part = part.as_ref();
         if part.contains(['\n', '\r', UNIT, RECORD]) {
             return None;
         }
-        if !joined.is_empty() {
-            joined.push(UNIT);
-        }
         joined.push_str(part);
+        joined.push(UNIT);
     }
     Some(joined)
 }
 
 /// What a file is now, followed through links: its path as resolved, device, inode, length and
-/// modification time to the nanosecond, plus Unix mode and ownership. This is metadata identity,
+/// modification time to the nanosecond, plus Unix mode and ownership. The resolved path's native
+/// bytes are encoded without lossy conversion. This is metadata identity,
 /// not a content digest:
 /// an in-place rewrite preserving length and modification time can retain it.
 #[must_use]
@@ -103,8 +104,8 @@ pub(crate) fn metadata_identity(path: &Path, meta: &std::fs::Metadata) -> Option
     #[cfg(not(unix))]
     let node = String::new();
     Some(format!(
-        "{} {node} {} {modified}",
-        path.display(),
+        "native-path-v1:{} {node} {} {modified}",
+        aterm_codec::hex::encode_lower(path.as_os_str().as_encoded_bytes()),
         meta.len()
     ))
 }
@@ -175,10 +176,18 @@ pub fn get(file: &Path, key: &str) -> Option<String> {
 }
 
 /// Keep `value` under `key` in `file`, replacing what it kept under that key, newest last and
-/// at most [`ENTRIES`] keys; written whole beside it and renamed over it, so a reader never
-/// sees half a file. A key or value with a line break or a record separator is not kept.
+/// at most [`ENTRIES`] keys within the reader's byte limit; written whole beside it and renamed
+/// over it, so a reader never sees half a file. A key or value with a line break or record
+/// separator, or a record larger than that limit, is not kept.
 pub fn put(file: &Path, key: &str, value: &str) {
-    if key.is_empty() || value.contains(['\n', '\r', RECORD]) || key.contains(['\n', '\r', RECORD])
+    let record_bytes = key
+        .len()
+        .saturating_add(value.len())
+        .saturating_add(RECORD.len_utf8() + 1);
+    if key.is_empty()
+        || record_bytes > MAX_PROBE_CACHE_BYTES
+        || value.contains(['\n', '\r', RECORD])
+        || key.contains(['\n', '\r', RECORD])
     {
         return;
     }
@@ -221,7 +230,12 @@ pub fn put(file: &Path, key: &str, value: &str) {
         .collect();
     let line = format!("{key}{RECORD}{value}");
     lines.push(&line);
-    let keep = lines.len().saturating_sub(ENTRIES);
+    let mut keep = lines.len().saturating_sub(ENTRIES);
+    let mut bytes: usize = lines[keep..].iter().map(|line| line.len() + 1).sum();
+    while bytes > MAX_PROBE_CACHE_BYTES {
+        bytes -= lines[keep].len() + 1;
+        keep += 1;
+    }
     let mut text = lines[keep..].join("\n");
     text.push('\n');
     let nanos = aterm_time::since_epoch().map_or(0, |d| d.as_nanos());
@@ -240,6 +254,70 @@ pub fn put(file: &Path, key: &str, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_writes_fit_the_read_limit_without_partial_records() {
+        let dir = crate::testdir::dir("atpkg-probe-cache-bytes-");
+        let file = dir.join("doctor/readings");
+        let large = "é".repeat(MAX_PROBE_CACHE_BYTES / 4);
+        put(&file, "oldest", &large);
+        put(&file, "newest", &large);
+        assert!(
+            file.metadata().unwrap().len() <= MAX_PROBE_CACHE_BYTES as u64,
+            "the writer exceeded the reader's byte limit"
+        );
+        assert!(get(&file, "newest").is_some_and(|value| value == large));
+        assert_eq!(get(&file, "oldest"), None);
+        let before = std::fs::read(&file).unwrap();
+        let oversized = "é".repeat(MAX_PROBE_CACHE_BYTES / 2);
+        for (key, value) in [("too-big", oversized.as_str()), (oversized.as_str(), "x")] {
+            put(&file, key, value);
+            assert!(
+                std::fs::read(&file).unwrap() == before,
+                "an oversized record replaced readable cache entries"
+            );
+        }
+        let exact_key = "exact";
+        let exact = "y".repeat(MAX_PROBE_CACHE_BYTES - exact_key.len() - RECORD.len_utf8() - 1);
+        put(&file, exact_key, &exact);
+        assert_eq!(file.metadata().unwrap().len(), MAX_PROBE_CACHE_BYTES as u64);
+        assert!(get(&file, exact_key).is_some_and(|value| value == exact));
+        assert_eq!(get(&file, "newest"), None);
+        put(&file, "tail", "small");
+        assert_eq!(get(&file, "tail").as_deref(), Some("small"));
+        assert_eq!(get(&file, exact_key), None);
+    }
+
+    #[test]
+    fn empty_key_fields_keep_their_positions_and_cannot_reuse_old_records() {
+        let shapes: &[&[&str]] = &[
+            &["x"],
+            &["", "x"],
+            &["x", ""],
+            &["", "x", ""],
+            &[],
+            &[""],
+            &["", ""],
+            &["x", "y"],
+            &["x", "", "y"],
+        ];
+        let mut keys = Vec::new();
+        for parts in shapes {
+            let encoded = key(parts.iter().copied().map(Some)).unwrap();
+            assert!(!keys.contains(&encoded), "key fields collapsed: {parts:?}");
+            keys.push(encoded);
+        }
+        let dir = crate::testdir::dir("atpkg-probe-key-fields-");
+        let file = dir.join("doctor/readings");
+        put(&file, "x", "old ambiguous encoding");
+        assert_eq!(get(&file, &keys[0]), None);
+        for (index, encoded) in keys.iter().enumerate() {
+            put(&file, encoded, &index.to_string());
+        }
+        for (index, encoded) in keys.iter().enumerate() {
+            assert_eq!(get(&file, encoded), Some(index.to_string()));
+        }
+    }
 
     #[test]
     fn a_reading_is_found_only_under_its_whole_key_and_the_newest_stay() {
@@ -267,8 +345,9 @@ mod tests {
             "a value with a line break is not kept"
         );
         assert_eq!(key([Some("x"), None]), None, "an unread part leaves no key");
+        put(&file, "x\u{1f}y", "old unframed encoding");
         let joined = key([Some("x"), Some("y")]).expect("two read parts");
-        assert_eq!(joined, "x\u{1f}y");
+        assert_eq!(get(&file, &joined), None);
         put(&file, &joined, "joined");
         assert_eq!(
             get(&file, &joined).as_deref(),
@@ -281,6 +360,26 @@ mod tests {
         assert_eq!(super::file(".."), None);
         assert_eq!(super::file("a/b"), None);
         assert_eq!(super::file("a\\b"), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_paths_remain_distinct_for_the_same_file_metadata() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let dir = crate::testdir::dir("atpkg-probe-cache-native-id-");
+        let file = dir.join("compiler");
+        std::fs::write(&file, "compiler fixture").unwrap();
+        let metadata = file.metadata().unwrap();
+        let first = dir.join(std::ffi::OsString::from_vec(b"compiler-\xff".to_vec()));
+        let second = dir.join(std::ffi::OsString::from_vec(b"compiler-\xfe".to_vec()));
+        assert_eq!(first.display().to_string(), second.display().to_string());
+        let first_id = metadata_identity(&first, &metadata).unwrap();
+        assert_eq!(metadata_identity(&first, &metadata).unwrap(), first_id);
+        assert_ne!(first_id, metadata_identity(&second, &metadata).unwrap());
+        let alias = dir.join("alias");
+        std::os::unix::fs::symlink(&file, &alias).unwrap();
+        assert_eq!(identity(&alias).unwrap(), identity(&file).unwrap());
     }
 
     #[test]

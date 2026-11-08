@@ -4533,6 +4533,7 @@ fn sign_ctx_manifest(
     manifest: &Path,
     validate: impl FnOnce(&CutCtx) -> Result<()>,
 ) -> Result<PathBuf> {
+    let _timing = crate::cut_timing::Timer::new("manifest signature");
     validate(ctx)?;
     sign_manifest_with_policy(ctx, manifest)
 }
@@ -6326,6 +6327,7 @@ pub(crate) fn verified_release_bundle_with_inputs(
 
 /// Run `targo --unverified ship cut`.
 pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
+    let _timing = crate::cut_timing::Timer::new("cut total");
     gates::arm_toolchain_lease();
     let credentials = sign::ReleaseCredentials::resolve(opts.release_credentials.as_deref(), repo)
         .map_err(Error::new)?;
@@ -6392,9 +6394,12 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         let _ = fs::remove_file(&journal_path);
     }
     let published = if kind == CutKind::Real {
-        let source = gates::published_source(repo)?;
+        let source =
+            crate::cut_timing::measure("published source", || gates::published_source(repo))?;
         let origin = native_origin(repo)?;
-        let checkout = gates::place_published(&operator, &origin, repo, &source)?;
+        let checkout = crate::cut_timing::measure("place published source", || {
+            gates::place_published(&operator, &origin, repo, &source)
+        })?;
         step(
             "source",
             &format!(
@@ -6558,7 +6563,9 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         Some(checkout) => checkout.source.commit.clone(),
         None => rev_parse(&git, "HEAD")?,
     };
-    let verified = verified_release_bundle(&operator, repo, &source, &version, &toolchain)?;
+    let verified = crate::cut_timing::measure("verified release bundle", || {
+        verified_release_bundle(&operator, repo, &source, &version, &toolchain)
+    })?;
     step(
         "gate",
         &format!(
@@ -6570,9 +6577,13 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         ),
     );
     let origin = native_origin(&tree)?;
-    let fixtures = gates::handoff_fixture_gate_at(&git, &origin, &source, &version)?;
+    let fixtures = crate::cut_timing::measure("handoff fixtures", || {
+        gates::handoff_fixture_gate_at(&git, &origin, &source, &version)
+    })?;
     step("gate", &gates::handoff_fixtures_line(fixtures.as_ref()));
-    let policy = gates::handoff_policy_gate_at(&git, &origin, &source, &version)?;
+    let policy = crate::cut_timing::measure("handoff policy", || {
+        gates::handoff_policy_gate_at(&git, &origin, &source, &version)
+    })?;
     step(
         "gate",
         &format!("handoff policy sealed into the bundle: {policy}"),
@@ -6590,22 +6601,30 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         )));
     }
     if kind == CutKind::Real {
-        preflight_release_lease(&native_origin(repo)?)?;
+        crate::cut_timing::measure("release lock preflight", || {
+            preflight_release_lease(&native_origin(repo)?)
+        })?;
         step("lock", "release lock is free");
     }
     if kind == CutKind::Real {
-        preflight_channel_target(&publish_slug, false)?;
+        crate::cut_timing::measure("channel target preflight", || {
+            preflight_channel_target(&publish_slug, false)
+        })?;
         step(
             "channel",
             &format!("release channel {publish_slug} is public and writable (pre-claim)"),
         );
     }
 
-    let head_scan = verify::scan_head_before_claim(&publish_slug)?;
+    let head_scan = crate::cut_timing::measure("channel head and floor", || {
+        verify::scan_head_before_claim(&publish_slug)
+    })?;
     let newest_channel = head_scan.first();
     let newest_min_build = newest_channel.and_then(|published| published.min_build);
-    let signature_verdict = preflight_signature_policy(credentials, RosterDuty::Sign)
-        .map_err(|e| Error::new(format!("{}; nothing was claimed", e.0)))?;
+    let signature_verdict = crate::cut_timing::measure("signature policy", || {
+        preflight_signature_policy(credentials, RosterDuty::Sign)
+    })
+    .map_err(|e| Error::new(format!("{}; nothing was claimed", e.0)))?;
     let signature_policy = signature_verdict.policy.clone();
     step(
         "signature",
@@ -6616,7 +6635,10 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     );
     let manifest_roster_seq = published_roster_seq(newest_channel)?;
     let observed_roster = if kind == CutKind::Real {
-        machines::channel_roster_document(&publish_slug).map_err(|e| {
+        crate::cut_timing::measure("channel roster", || {
+            machines::channel_roster_document(&publish_slug)
+        })
+        .map_err(|e| {
             Error::new(format!(
                 "cannot read the machine roster on the channel {publish_slug}'s latest \
                  release ({e}); refusing to reason about the fleet's roster floor — a wrong \
@@ -6674,7 +6696,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
 
     let now = unix_now();
     let ledger_text = if kind == CutKind::Real {
-        ledger::show_origin_ledger(&git)?
+        crate::cut_timing::measure("ledger floor", || ledger::show_origin_ledger(&git))?
     } else {
         gates::read_bounded_string(&tree.join(ledger::LEDGER_FILE), 64 << 20)
             .map_err(|e| Error::new(format!("read {}: {e}", ledger::LEDGER_FILE)))?
@@ -6717,8 +6739,10 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
                 changelog::claim_changelogs(source, main, &version, &date)
             };
             let origin = native_origin(&tree)?;
-            let claim = ledger::claim(&git, &origin, &tree, &plan, &verified.reserved, &rolls)
-                .map_err(|error| discard_on_lost_race(&git, &dist, &version, reserved, error))?;
+            let claim = crate::cut_timing::measure("claim and verify main", || {
+                ledger::claim(&git, &origin, &tree, &plan, &verified.reserved, &rolls)
+            })
+            .map_err(|error| discard_on_lost_race(&git, &dist, &version, reserved, error))?;
             step(
                 "",
                 &format!(
@@ -7199,6 +7223,7 @@ fn run_pipeline_inner(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
         if ctx.is_done(name) {
             continue;
         }
+        let _timing = crate::cut_timing::Timer::new(name);
         if ctx.kind == CutKind::Real && !matches!(name, "lock" | "unlock") {
             ensure_ctx_release_lease(ctx)?;
         }
@@ -7629,6 +7654,7 @@ struct SigningSource {
 /// built as this cut's version, number and commit, and every check's record of R stands for its
 /// executable (NOTHING SHIPS UNVERIFIED).
 fn signing_source(ctx: &CutCtx) -> Result<SigningSource> {
+    let _timing = crate::cut_timing::Timer::new("signing source reproof");
     let (Some(key), Some(macho_sha256)) = (ctx.artifact.clone(), ctx.macho_sha256.clone()) else {
         return Err(Error::new(
             "internal: this cut names no verified bundle to sign — a cut signs only the \
@@ -7828,6 +7854,7 @@ fn stage_twins_and_sidecars(
     zip: &Path,
     zip_sha: &str,
 ) -> Result<()> {
+    let _timing = crate::cut_timing::Timer::new("container twins and sidecars");
     for (source, twin) in [(dmg, ctx.stable_dmg_path()), (zip, ctx.stable_zip_path())] {
         crate::durable::copy_regular_fresh(source, &twin).map_err(|e| {
             Error::new(format!(
@@ -7877,6 +7904,7 @@ fn stage_twins_and_sidecars(
 /// sidecars staged from the containers, and nothing is signed or notarized again. A record that
 /// does not stand is removed, and `None` has the copy signed again.
 fn adopted_copy(ctx: &CutCtx, source: &SigningSource) -> Result<Option<SignedCopy>> {
+    let _timing = crate::cut_timing::Timer::new("adopt signed bytes");
     let Some(record) = read_signed_record(&ctx.dist, ctx.build).transpose() else {
         return Ok(None);
     };
@@ -8247,25 +8275,38 @@ pub fn selfcheck_signing(
     dmg: &Path,
     tools: &dyn sign::AppleTools,
 ) -> Result<&'static str> {
-    tools.codesign_verify_strict(app).map_err(|e| {
-        Error::new(format!(
-            "self-check failed: codesign --verify --deep --strict: {e}"
-        ))
-    })?;
+    crate::cut_timing::measure("codesign verify", || tools.codesign_verify_strict(app)).map_err(
+        |e| {
+            Error::new(format!(
+                "self-check failed: codesign --verify --deep --strict: {e}"
+            ))
+        },
+    )?;
     if team.is_empty() {
         return Ok("");
     }
     sign::apple_selfcheck_verdict(&sign::AppleSelfcheck {
         team_id: team,
-        app_codesign_dv: &tools.codesign_dv(app).map_err(Error::new)?,
-        app_stapled: tools.stapler_validate(app).map_err(Error::new)?,
-        app_gatekeeper_ok: tools
-            .gatekeeper_ok(app, sign::GatekeeperKind::App)
-            .map_err(Error::new)?,
-        dmg_stapled: tools.stapler_validate(dmg).map_err(Error::new)?,
-        dmg_gatekeeper_ok: tools
-            .gatekeeper_ok(dmg, sign::GatekeeperKind::Dmg)
-            .map_err(Error::new)?,
+        app_codesign_dv: &crate::cut_timing::measure("codesign identity", || {
+            tools.codesign_dv(app)
+        })
+        .map_err(Error::new)?,
+        app_stapled: crate::cut_timing::measure("app stapled ticket", || {
+            tools.stapler_validate(app)
+        })
+        .map_err(Error::new)?,
+        app_gatekeeper_ok: crate::cut_timing::measure("app Gatekeeper", || {
+            tools.gatekeeper_ok(app, sign::GatekeeperKind::App)
+        })
+        .map_err(Error::new)?,
+        dmg_stapled: crate::cut_timing::measure("dmg stapled ticket", || {
+            tools.stapler_validate(dmg)
+        })
+        .map_err(Error::new)?,
+        dmg_gatekeeper_ok: crate::cut_timing::measure("dmg Gatekeeper", || {
+            tools.gatekeeper_ok(dmg, sign::GatekeeperKind::Dmg)
+        })
+        .map_err(Error::new)?,
     })
     .map_err(Error::new)?;
     Ok(" · Tier APPLE: TeamIdentifier + stapled ticket + Gatekeeper on .app and .dmg")
@@ -8303,6 +8344,7 @@ fn prove_bundle_on_disk(ctx: &CutCtx) -> Result<()> {
 }
 
 fn prove_publication_on_disk(ctx: &CutCtx) -> Result<Manifest> {
+    let _timing = crate::cut_timing::Timer::new("publication bytes and manifest");
     if ctx.artifact.is_some() {
         crate::service_qualification::verify(&ctx.app_path(), &ctx.manifest_path())?;
     } else {
@@ -8510,13 +8552,15 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
     let manifest = prove_artifacts_on_disk(ctx)?;
     let team = manifest.team_id.clone().unwrap_or_default();
     if ctx.adopted {
-        let apple_note = adopted_selfcheck(
-            &team,
-            aterm_update_core::pins::APPLE_TEAM_ID,
-            &ctx.app_path(),
-            &ctx.dmg_path(),
-            &sign::RealAppleTools,
-        )?;
+        let apple_note = crate::cut_timing::measure("adopted codesign and Gatekeeper", || {
+            adopted_selfcheck(
+                &team,
+                aterm_update_core::pins::APPLE_TEAM_ID,
+                &ctx.app_path(),
+                &ctx.dmg_path(),
+                &sign::RealAppleTools,
+            )
+        })?;
         step(
             "selfcheck",
             &format!(
@@ -8538,7 +8582,7 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
         );
     }
 
-    let best = best_published(ctx)?;
+    let best = crate::cut_timing::measure("published floor", || best_published(ctx))?;
     step(
         "",
         &format!(
@@ -9117,6 +9161,7 @@ impl LiveChannelRelease<'_> {
 
 impl channel::ChannelRelease for LiveChannelRelease<'_> {
     fn head_made(&mut self) -> Result<bool> {
+        let _timing = crate::cut_timing::Timer::new("channel published state");
         let Some(release_id) = self.ctx.release_id.filter(|_| self.ctx.release_intent) else {
             return Ok(false);
         };
@@ -9164,16 +9209,23 @@ impl channel::ChannelRelease for LiveChannelRelease<'_> {
     }
 
     fn upload(&mut self, file: &Path) -> Result<()> {
+        let label = format!(
+            "upload {}",
+            file.file_name().unwrap_or_default().to_string_lossy()
+        );
+        let _timing = crate::cut_timing::Timer::new(&label);
         let (release_id, adopted) = self.bound()?;
         upload_channel_asset(self.ctx, self.slug, release_id, file, !adopted)
     }
 
     fn prove_assets(&mut self) -> Result<()> {
+        let _timing = crate::cut_timing::Timer::new("channel asset proof");
         let (release_id, adopted) = self.bound()?;
         prove_channel_assets(self.ctx, self.slug, release_id, !adopted)
     }
 
     fn ratchet_head(&mut self) -> Result<()> {
+        let _timing = crate::cut_timing::Timer::new("channel head ratchet");
         let (slug, ctx) = (self.slug, &*self.ctx);
         prove_channel_head_is_older(
             slug,
@@ -9196,11 +9248,13 @@ impl channel::ChannelRelease for LiveChannelRelease<'_> {
     }
 
     fn bind(&mut self) -> Result<()> {
+        let _timing = crate::cut_timing::Timer::new("bind channel release");
         self.bound = Some(bind_channel_release(self.ctx, self.slug)?);
         Ok(())
     }
 
     fn make_head(&mut self) -> Result<()> {
+        let _timing = crate::cut_timing::Timer::new("publish full and latest");
         let (release_id, adopted) = self.bound()?;
         let (slug, expect_draft) = (self.slug, !adopted);
         let ctx = &*self.ctx;
@@ -9231,6 +9285,7 @@ impl channel::ChannelRelease for LiveChannelRelease<'_> {
     }
 
     fn prove_head(&mut self) -> Result<()> {
+        let _timing = crate::cut_timing::Timer::new("public head and anonymous downloads");
         let (release_id, _) = self.bound()?;
         let slug = self.slug;
         let ctx = &*self.ctx;

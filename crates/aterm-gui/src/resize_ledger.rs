@@ -43,7 +43,7 @@ pub(crate) enum Cause {
     Input,
     /// The OS window changed size (`App::on_resize`).
     Window,
-    /// The window's chrome rows changed — the tab strip or the message band appeared or folded.
+    /// The window's chrome rows changed: the tab strip appeared or folded.
     Chrome,
     /// One window's sessions re-gridded directly.
     Term,
@@ -142,7 +142,7 @@ pub(crate) struct Attribution {
     pub(crate) site: Site,
     /// The window's grid `(cols, rows)` when the resize ran.
     pub(crate) win: Option<(u16, u16)>,
-    /// The window's chrome rows (strip, message band, presence row) then.
+    /// The window's chrome rows (the tab strip's) then.
     pub(crate) chrome: Option<u16>,
 }
 
@@ -2080,7 +2080,7 @@ mod tests {
     }
 
     #[test]
-    fn the_band_regrid_books_site_chrome() {
+    fn a_chrome_regrid_books_site_chrome() {
         let sites = |app: &crate::App| -> Vec<String> {
             let reply = app
                 .pool

@@ -45,7 +45,7 @@ impl World {
         seed_mint(&payload, COMMIT);
         let receipt = atpkg::sha256_file(&payload.join("SEED-MINT")).expect("receipt");
         atpkg_publish::artifact::lineage::stamp_with(&payload, &payload.join("bin"), &|_| {
-            Ok(fixture::version_text(COMMIT, "x86_64-unknown-linux-gnu"))
+            Ok(fixture::version_text(COMMIT, fixture::NATIVE_HOST))
         })
         .expect("stamp signed lineage");
         put(&trust_lock::ready_marker(&prefix, 7), b"ok\n");
@@ -61,6 +61,10 @@ impl World {
         };
         let repo = root.join("project with spaces");
         std::fs::create_dir_all(&repo).expect("repo");
+        aterm_uds::private_file::create_private_dir(&repo.join(".git"))
+            .expect("private source metadata, independent of the inherited umask");
+        aterm_uds::private_file::write_private(&repo.join(".git"), "config", b"")
+            .expect("private source config");
         put(
             &repo.join("trust.lock"),
             atpkg_publish::adopt::lock_text(&lock)
@@ -78,7 +82,7 @@ impl World {
             _tmp: tmp,
             root,
             inputs,
-            tools: FakeTools::new("x86_64-unknown-linux-gnu"),
+            tools: FakeTools::new(fixture::NATIVE_HOST),
             lock,
         }
     }
@@ -110,6 +114,31 @@ impl World {
         git(&self.inputs.repo, &["commit", "-qm", "pinned"]);
         git(&self.inputs.repo, &["rev-parse", "HEAD"])
     }
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn native_fixture_admits_its_runtime_and_rejects_foreign_or_malformed_elf() {
+    let w = World::new();
+    let payload = trust_lock::build_dir(&w.inputs.prefix, 7);
+    assert!(atpkg::store::build_is_complete(&payload));
+    let compiler = payload.join("bin/trustc");
+    let original = std::fs::read(&compiler).expect("synthetic compiler");
+    let mut malformed = original.clone();
+    malformed[52..54].fill(0);
+    put(&compiler, &malformed);
+    assert!(!atpkg::store::build_is_complete(&payload));
+    let mut foreign = original.clone();
+    let machine = if cfg!(target_arch = "aarch64") {
+        fixture::EM_X86_64
+    } else {
+        fixture::EM_AARCH64
+    };
+    foreign[18..20].copy_from_slice(&machine.to_le_bytes());
+    put(&compiler, &foreign);
+    assert!(!atpkg::store::build_is_complete(&payload));
+    put(&compiler, &original);
+    assert!(atpkg::store::build_is_complete(&payload));
 }
 
 #[test]
@@ -718,6 +747,10 @@ fn native_hop_checks_actual_config_and_arguments_before_compiler_birth() {
 #[test]
 #[ignore = "exact child for isolated inherited Git context"]
 fn source_read_child() {
+    if std::env::var_os("ATPKG_PROJECT_TEST_COMPAT").is_some() {
+        compat_execution_child();
+        return;
+    }
     if std::env::var_os("ATPKG_PROJECT_TEST_SCOPE").is_some() {
         controller_scope_child();
         return;
@@ -767,7 +800,7 @@ fn controller_scope_child() {
         authority,
         None,
         &|_| Ok(lock.tree_root.clone()),
-        &FakeTools::new("x86_64-unknown-linux-gnu"),
+        &FakeTools::new(fixture::NATIVE_HOST),
     )
     .expect("leased fixture");
     let script = r#"
@@ -875,6 +908,12 @@ fn native_controller_keeps_sdk_lease_through_background_work_and_late_signals() 
         let mut child = command.spawn().expect("owned helper");
         let release = Release(scope.clone());
         until("root and worker ready", || {
+            if let Some(status) = child.try_wait().expect("helper status") {
+                panic!(
+                    "helper exited {status}: {}",
+                    std::fs::read_to_string(&stderr).expect("stderr")
+                );
+            }
             scope.join("root-ready").is_file() && scope.join("worker-ready").is_file()
         });
         if before {
@@ -1012,6 +1051,33 @@ fn owned_aside_is_accepted_but_external_payload_indirection_is_refused() {
 
 #[test]
 fn compat_execution_must_match_the_separately_authenticated_payload() {
+    let mut child = aterm_uds::spawnfd::command(std::env::current_exe().expect("self"));
+    child
+        .args([
+            "--exact",
+            "artifact::project_toolchain::source_read_child",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("ATPKG_PROJECT_TEST_COMPAT", "1");
+    let out = aterm_uds::deadline::output_until_complete_stdout(
+        &mut child,
+        std::time::Instant::now() + std::time::Duration::from_secs(60),
+    )
+    .expect("isolated compat fixture");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("1 passed; 0 failed"),
+        "the isolated compat case must execute"
+    );
+}
+
+fn compat_execution_child() {
     let mut w = World::new();
     let payload = trust_lock::build_dir(&w.inputs.prefix, 7);
     fixture::put_exe(&payload.join("bin/rustc"), b"other rustc bytes");
@@ -1027,18 +1093,6 @@ fn compat_execution_must_match_the_separately_authenticated_payload() {
         w.select(w.working(), None).is_err(),
         "missing compat root is not repaired by selection"
     );
-    // The refused selection let its lease go, but a sibling test's fork keeps a copy of the
-    // descriptor until that child's exec, and the deep pass below refuses a held build. A
-    // one-minute hang detector, not a latency budget.
-    let subject = atpkg::lease::Subject::build("trust", 7).expect("subject");
-    let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-    while atpkg::lease::holders(&w.inputs.prefix, &subject) != atpkg::lease::Holders::Free {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the refused selection's lease is let go"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
     let layout = atpkg::Layout {
         prefix: w.inputs.prefix.clone(),
     };

@@ -620,7 +620,8 @@ pub fn fresh_dylib(path: &[u8], mtime_s: i64, start_us: Option<u64>) -> bool {
             >= start_us
 }
 
-/// How long since its fork a process whose one thread never ran must have stood before it reads as held at macOS's program check: a normal exec reads its first thread's handle as `0` for under 0.3 ms (M2).
+/// Fork-age threshold for inspecting an unresolved start. This is not an exec-wait duration:
+/// an exec preserves the fork date, and passing this threshold never establishes its cause.
 pub const PROGRAM_CHECK_AGE_MS: u64 = 20_000;
 
 /// The most CPU a process may have used for a reader of many to ask its start ([`read_start`]). A
@@ -631,9 +632,11 @@ pub const HELD_CPU_NS: u64 = 20_000_000;
 /// Where a process stands at its start (`docs/DESIGN-leftover-processes-2026-10-16.md` §4.2), judged by [`judge_start`] from its [`StartFacts`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AtStart {
-    /// It runs: its thread set its handle, or it is younger than [`PROGRAM_CHECK_AGE_MS`].
+    /// User execution was measured, its thread set its handle, or its fork is
+    /// younger than the unresolved-start threshold [`PROGRAM_CHECK_AGE_MS`].
     Started,
-    /// Held at macOS's program check: one thread that never ran, past [`PROGRAM_CHECK_AGE_MS`], neither stopped nor traced, native, its executable on a local volume.
+    /// Affirmative per-process program-check evidence, with no measured user execution,
+    /// neither stopped nor traced, native, and a local executable.
     Held,
     /// One thread that never ran, past [`PROGRAM_CHECK_AGE_MS`], that reads stopped or traced: a start-suspended spawn, a debugger's launch, or a program the check holds that reads either way, which nothing has measured (the leftover-processes design's U3). Never counted as held; `sys jobs` names it with what it read.
     StoppedUnstarted {
@@ -644,15 +647,24 @@ pub enum AtStart {
     },
     /// The same signature in an x86_64 process on an arm64 Mac: Rosetta translates it, and the Developer Tools grant does not reach that.
     Translating,
-    /// The same signature on an executable whose volume is not proven local: it has not started, and nothing read says why.
+    /// An unresolved zero-handle start. No program-check cause was established;
+    /// unread execution time also reaches this verdict.
     Unstarted,
 }
 
 /// What [`judge_start`] judges a process's start by, as [`read_start`] reads it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StartFacts {
-    /// Its thread list is one handle, `0`: its one thread never ran far enough to set it (M1).
+    /// Its thread list contains one userspace handle, `0`. This alone does not
+    /// establish whether the thread ran or why it waits.
     pub lone_zero: bool,
+    /// User CPU time of the lone thread. A positive value proves that it ran even
+    /// when its userspace thread handle is still zero; `None` means unread.
+    pub user_ns: Option<u64>,
+    /// Affirmative, per-process evidence of an outstanding program-check request.
+    /// A zero handle, fork age, zero CPU time and a busy daemon do not supply it.
+    /// The native libproc reader cannot attribute a wait and leaves this false.
+    pub program_check_wait: bool,
     /// Its BSD status is `SSTOP`: a start-suspended spawn, a `SIGSTOP`, a tracer's stop.
     pub stopped: bool,
     /// A debugger traces it (`PROC_FLAG_TRACED`).
@@ -672,9 +684,14 @@ pub struct StartFacts {
 /// Where a process with `f` stands at its start: [`AtStart::Started`] unless its one thread never
 /// ran, past [`PROGRAM_CHECK_AGE_MS`]; then [`AtStart::StoppedUnstarted`] when it reads stopped or
 /// traced, else [`AtStart::Translating`] for an x86_64 process on an arm64 Mac, else
-/// [`AtStart::Unstarted`] unless its executable's volume reads local, else [`AtStart::Held`].
+/// [`AtStart::Unstarted`] unless its executable's volume reads local, no user execution
+/// was measured, and affirmative per-process request evidence establishes [`AtStart::Held`].
+/// Positive user execution always gives [`AtStart::Started`].
 #[must_use]
 pub fn judge_start(f: &StartFacts) -> AtStart {
+    if f.user_ns.is_some_and(|ns| ns > 0) {
+        return AtStart::Started;
+    }
     if !(f.lone_zero && f.age_ms >= Some(PROGRAM_CHECK_AGE_MS)) {
         return AtStart::Started;
     }
@@ -687,8 +704,10 @@ pub fn judge_start(f: &StartFacts) -> AtStart {
         AtStart::Translating
     } else if f.local != Some(true) {
         AtStart::Unstarted
-    } else {
+    } else if f.program_check_wait && f.user_ns == Some(0) {
         AtStart::Held
+    } else {
+        AtStart::Unstarted
     }
 }
 

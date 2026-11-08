@@ -222,6 +222,7 @@ none), `rust_features` (what the proof must handle), `blocking_gaps`.
 
 ```tsv
 id	kind	functions	statement	subsumes	rust_features	blocking_gaps
+rel-freezer-recovery	contract	release_tools::Recovery, release::Run::own_cutter, release_steps::Real::exec_cutter	A failed proof from R's own freezer contract refuses. A failed proof from a different or unidentified legacy freezer may re-freeze once at R; the exec carries a marker for R and a second failure refuses independently of the journal or claim. Recovery hints never establish Stamp::Proved: clean R, the current cutter record, exact image path and content digest remain required. Ordinary children receive no freezer envelope.	src/release_tools.rs::launch_contract_bounds_recovery_without_authenticating_the_proof, src/release_tools.rs::legacy_tool_record_needs_a_new_content_proof, tests/it/release_flow.rs::an_old_contract_refreezes_once_and_only_the_proved_image_continues, src/release_steps.rs::only_exec_explicitly_hands_the_freezer_envelope	environment, filesystem, process exec	1,5,7,8
 rel-apple-leaf-pem-by-sha1	contract	apple.rs::leaf_pem_by_sha1	∀ text, sha1: Some(B) iff some PEM block (BEGIN CERTIFICATE line to next END CERTIFICATE line) is preceded by a most-recent line whose trim starts "SHA-1 hash:" with value = sha1 ignoring ASCII case. B is the first such block, each line followed by '\n'; no other block's bytes appear in B. No match → None.	src/apple.rs::the_certificate_is_selected_by_digest_not_by_position	stateful line loop, String building	1,3,5,7
 rel-apple-key-id	contract	apple.rs::key_id_from_text	∀ text, header: H = first line whose trim starts with header (none → None). raw = trimmed rest of H after header if non-empty, else the trimmed next line (none → None). hex = raw minus a leading "keyid:", trimmed, all ':' removed. Result = Some(uppercase(hex)) iff hex is non-empty ASCII hex.	src/apple.rs::the_issuing_key_is_read_out_of_both_identifier_forms	&str iterators, skip_while, filter/collect	1,3,5,7
 rel-apple-enddate-iso	contract	apple.rs::enddate_iso	∀ line: Some("{Y:04}-{M:02}-{D:02}") iff trim(line) = "notAfter=" MON ws D ws TIME ws Y ..., MON one of the 12 English abbreviations (M its 1-based index), D and Y u32. Otherwise None (e.g. a notBefore line).	src/apple.rs::the_expiry_date_reads_as_iso	split_whitespace, parse::<u32>, format!	1,3,5
@@ -645,6 +646,10 @@ other specs it samples. §3's tests are not in this table, though `rel-site-stab
 
 ```tsv
 file	test	primary	also
+src/release_tools.rs	launch_contract_bounds_recovery_without_authenticating_the_proof	rel-freezer-recovery	-
+src/release_tools.rs	legacy_tool_record_needs_a_new_content_proof	rel-freezer-recovery	rel-frozen-tools
+tests/it/release_flow.rs	an_old_contract_refreezes_once_and_only_the_proved_image_continues	rel-freezer-recovery	-
+src/release_steps.rs	only_exec_explicitly_hands_the_freezer_envelope	rel-freezer-recovery	-
 src/apple.rs	nothing_outside_aterms_own_folder_is_read_unless_the_operator_named_it	rel-apple-watch-dirs	rel-apple-errand-structure
 src/apple.rs	the_certificate_is_selected_by_digest_not_by_position	rel-apple-leaf-pem-by-sha1	
 src/apple.rs	the_consent_note_names_only_a_guarded_folder_the_operator_named	rel-apple-consent-note	

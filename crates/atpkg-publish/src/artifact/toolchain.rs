@@ -143,8 +143,21 @@ pub fn lease_required(ctx: &Ctx, dir: &Path, who: &str) -> Result<Held> {
 /// # Errors
 /// A refusal carrying every reason the checker gave.
 pub fn admit(tools: &dyn Tools, bin: &Path, switch: &Switch) -> Result<atpkg::lineage::Compiler> {
+    admit_with_frontend(tools, bin, switch, None)
+}
+
+/// Admit the raw source with an explicit qualified supplementary frontend.
+/// Unrelated donor/hello roots and final transformed LINEAGE keep [`admit`].
+/// # Errors
+/// A refusal carrying every reason the checker gave.
+pub fn admit_with_frontend(
+    tools: &dyn Tools,
+    bin: &Path,
+    switch: &Switch,
+    frontend: Option<&str>,
+) -> Result<atpkg::lineage::Compiler> {
     let probe = |p: &Path| tools::version(tools, p);
-    atpkg::lineage::check_compiler_with(bin, switch.policy(), &probe).map_err(|lines| {
+    atpkg::lineage::check_compiler_with_frontend(bin, switch.policy(), &probe, frontend).map_err(|lines| {
         let unknown = match switch {
             Switch::Unknown(why) => {
                 format!("\n  (the receipt is required because nothing shows the switch is dormant: {why})")

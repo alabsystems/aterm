@@ -19,6 +19,16 @@ use super::GIT_BUDGET;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GitOp {
+    /// Bounded commit-only object intake and exact parent ancestry. General
+    /// fetch semantics are unchanged; no ref/tree/checkout promise is made.
+    CommitRead {
+        /// Screened existing repository whose immutable objects are reused.
+        dir: PathBuf,
+        /// Validated exact objects and ancestry questions.
+        request: super::CommitRead,
+        /// An explicit credential-free read, never a fallback.
+        anonymous: bool,
+    },
     /// Admit local object reads under the same source-config and discovery guards.
     /// No remote request, credentials, grant or source update participates.
     CheckLocal {
@@ -144,6 +154,23 @@ pub struct GitRun {
 }
 
 impl GitRun {
+    /// Exact commit-only reads, with no whole-history fetch or worker ref writes.
+    #[must_use]
+    pub fn commit_read(
+        slug: &Slug,
+        dir: &Path,
+        request: super::CommitRead,
+        anonymous: bool,
+    ) -> GitRun {
+        GitRun::of(
+            slug,
+            GitOp::CommitRead {
+                dir: dir.to_path_buf(),
+                request,
+                anonymous,
+            },
+        )
+    }
     /// Screen one local source for reads, without consulting a GitHub identity.
     #[must_use]
     pub fn check_local(slug: &Slug, dir: &Path) -> GitRun {
@@ -354,8 +381,8 @@ impl GitRun {
     }
 }
 
-/// What a run printed: stdout and stderr, each redacted and cut to its last 64 KiB, and who it
-/// spoke as.
+/// What a run printed, redacted, and who it spoke as. Ordinary streams keep
+/// their last 64 KiB; commit-only observations are complete within 256 KiB.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct GitOut {
@@ -497,6 +524,8 @@ mod unix {
     use crate::policy::{Decision, Named, RefusalCode, RouteRequest, RouteTarget, Tier};
     use crate::redact::Redactor;
     use crate::slug::Slug;
+
+    mod ancestry;
 
     /// The route door's fact naming where a profile's token lives (`Fx::fact`).
     const SOURCE: &str = "source";
@@ -660,6 +689,14 @@ mod unix {
                 Ok(())
             }
             GitOp::PushControl { .. } => Ok(()),
+            GitOp::CommitRead { .. } => {
+                if run.progress_window.is_some() {
+                    return Err(Error::usage(
+                        "commit ancestry requires its finite original wall budget, not a progress-only window",
+                    ));
+                }
+                Ok(())
+            }
             GitOp::CheckLocal { .. }
             | GitOp::Fetch { .. }
             | GitOp::FetchBatch { .. }
@@ -773,6 +810,7 @@ mod unix {
     }
 
     /// What the run's children share: the program, the environment and the directories.
+    #[derive(Clone)]
     struct Children<'a> {
         gh: &'a Github,
         /// The absolute `git`, or the bare `git` of a run nothing runs.
@@ -946,6 +984,7 @@ mod unix {
     /// screen read, and the fetch force-write the refs and tags of, the enclosing repository.
     fn ceiling(root: &Path, op: &GitOp) -> Result<OsString> {
         let (GitOp::CheckLocal { dir }
+        | GitOp::CommitRead { dir, .. }
         | GitOp::Fetch { dir }
         | GitOp::FetchMain { dir, .. }
         | GitOp::FetchRef { dir, .. }
@@ -1053,6 +1092,7 @@ mod unix {
     fn op_word(op: &GitOp) -> &'static str {
         match op {
             GitOp::CheckLocal { .. } => "check-local",
+            GitOp::CommitRead { .. } => "commit-ancestry",
             GitOp::Clone { .. } | GitOp::Mirror { .. } => "clone",
             GitOp::Fetch { .. }
             | GitOp::FetchMain { .. }
@@ -1423,6 +1463,10 @@ mod unix {
                     anonymous: true,
                     ..
                 }
+                | GitOp::CommitRead {
+                    anonymous: true,
+                    ..
+                }
         );
         let release = router.tier_of(slug.owner()) == Tier::Release;
         if release && !push && !literal_for(&run.named, slug) {
@@ -1547,7 +1591,10 @@ mod unix {
             env,
             work: Some(root.join("work")),
             scratch_git: (push
-                || matches!(run.op, GitOp::FetchRef { .. } | GitOp::FetchBatch { .. }))
+                || matches!(
+                    run.op,
+                    GitOp::FetchRef { .. } | GitOp::FetchBatch { .. } | GitOp::CommitRead { .. }
+                ))
             .then(|| root.join("scratch.git")),
             budget: run.budget,
             progress_window: run.progress_window,
@@ -1573,6 +1620,7 @@ mod unix {
         let read_only = matches!(
             &run.op,
             GitOp::CheckLocal { .. }
+                | GitOp::CommitRead { .. }
                 | GitOp::Fetch { .. }
                 | GitOp::FetchMain { .. }
                 | GitOp::FetchRef { .. }
@@ -2893,6 +2941,29 @@ mod unix {
         let redactor = children.gh.redactor();
         let url = os(remote.url());
         let (args, cwd): (Vec<OsString>, Option<&Path>) = match &run.op {
+            GitOp::CommitRead {
+                dir,
+                request,
+                anonymous,
+            } => {
+                let out =
+                    ancestry::read(children, run, dir, request, profile.as_deref(), *anonymous)?;
+                if out.stdout.len() > 256 * 1024 {
+                    return Err(Error::protocol(
+                        "native commit observation exceeds its complete output bound",
+                    ));
+                }
+                return Ok(GitOut {
+                    stdout: redactor
+                        .apply_cow(std::str::from_utf8(&out.stdout).map_err(|_| {
+                            Error::protocol("native commit observation is not UTF8")
+                        })?)
+                        .into_owned(),
+                    stderr: kept(&out.stderr, redactor),
+                    as_: profile,
+                    grant,
+                });
+            }
             GitOp::Mirror { dest } => {
                 let dest = std::path::absolute(dest)
                     .map_err(|e| Error::local(format!("{}: {e}", dest.display())))?;

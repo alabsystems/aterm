@@ -51,6 +51,7 @@ fn live_phases_are_attributed_and_close_without_claiming_a_verdict() {
         });
         ready_rx.recv_timeout(MUST_HAPPEN).unwrap();
         let during = events(&path);
+        let status_during = std::fs::read_to_string(&path).map(|raw| crate::status::observe(&raw));
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut other = Progress::new(ctx.events.as_ref(), Check::Checkers);
             other.enter(Phase::Preparation);
@@ -59,8 +60,14 @@ fn live_phases_are_attributed_and_close_without_claiming_a_verdict() {
         release_tx.send(()).unwrap();
         worker.join().unwrap();
         assert!(caught.is_err());
-        during
+        (during, status_during)
     });
+    let (during, status_during) = during;
+    let status_during = status_during.expect("the held observation was read");
+    assert!(
+        status_during.phase_ends.is_empty(),
+        "START never supplies an END"
+    );
     assert_eq!(during.len(), 1, "the held scope has not ended");
     assert_eq!(during[0]["event"].as_str(), Some("test-phase-started"));
     assert_eq!(during[0]["phase"].as_str(), Some("recording-admission"));
@@ -81,6 +88,26 @@ fn live_phases_are_attributed_and_close_without_claiming_a_verdict() {
         .collect();
     assert_eq!(unwound.len(), 2);
     assert_eq!(unwound[1]["scope_exit"].as_str(), Some("unwound"));
+    let status_after = crate::status::observe(&std::fs::read_to_string(&path).unwrap());
+    assert_eq!(status_after.phase_end_records, 3);
+    assert_eq!(status_after.phase_ends.len(), 3);
+    assert!(status_after.checks.is_empty());
+    assert_eq!(status_after.terminal_records, 0);
+    let json = status_after.json();
+    let mut exits: Vec<_> = json["phase_ends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["scope_exit"].as_str().unwrap())
+        .collect();
+    exits.sort_unstable();
+    assert_eq!(exits, ["advanced", "returned", "unwound"]);
+    assert!(json["phase_ends"].as_array().unwrap().iter().all(|row| {
+        row["seconds"]
+            .as_f64()
+            .is_some_and(|seconds| seconds.is_finite() && seconds >= 0.0)
+            && row["conflict"].as_bool() == Some(false)
+    }));
     for event in all {
         let attribution = crate::event_log::attribution(&event).expect("bound to invocation");
         assert_eq!(

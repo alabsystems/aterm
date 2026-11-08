@@ -522,6 +522,28 @@ fn a_seed_mint_admits_the_bytes_it_compared_and_nothing_else() {
 }
 
 #[test]
+fn an_explicit_frontend_never_becomes_unused_dormant_or_lineage_permission() {
+    let (_dir, root) = tmp("explicit-frontend-authority");
+    let bin = toolchain(&root, b"");
+    let probe = probe_says(trust_vv(TRUST));
+    let selected = "a".repeat(64);
+    check_compiler_with(&bin, LineagePolicy::Dormant, &probe).expect("ordinary dormant route");
+    let refused =
+        check_compiler_with_frontend(&bin, LineagePolicy::Dormant, &probe, Some(&selected))
+            .expect_err("selected authority requires its mint");
+    assert!(refused.iter().any(|line| line.contains("no raw SEED-MINT")));
+    std::fs::write(root.join(LINEAGE_FILE), b"not a usable raw seal").unwrap();
+    let refused =
+        check_compiler_with_frontend(&bin, LineagePolicy::Require, &probe, Some(&selected))
+            .expect_err("selection must not flow into transformed LINEAGE");
+    assert!(
+        refused
+            .iter()
+            .any(|line| line.contains("not a transformed LINEAGE"))
+    );
+}
+
+#[test]
 fn each_seed_mint_defect_alone_is_one_refusal_naming_it() {
     let (_dir, d) = tmp("mint-words");
     toolchain(&d, b"");

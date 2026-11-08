@@ -8,8 +8,6 @@
 use std::path::Path;
 use std::time::Instant;
 
-use aterm_secrets::converge::{Last, RunnerRetry};
-
 /// How often a process whose Commons runtime `[swarm] enabled = false` holds looks at the switch
 /// again: one `stat` ([`aterm_secrets::swarm::Switch`]).
 pub(crate) const SHARING_LOOK: std::time::Duration = std::time::Duration::from_secs(5);
@@ -18,31 +16,34 @@ pub(crate) const SHARING_LOOK: std::time::Duration = std::time::Duration::from_s
 /// Its existing event loop supplies the deadline; recovery never needs another thread.
 pub(crate) struct Startup {
     switch: aterm_secrets::swarm::Switch,
-    start: Option<Box<dyn FnMut() -> bool + Send>>,
-    clock: Instant,
+    constructor: crate::host_startup::Constructor,
     due: Option<Instant>,
-    retry: RunnerRetry,
 }
 
 impl Startup {
     pub(crate) fn new(home: &Path, start: impl FnMut() -> bool + Send + 'static) -> Self {
         Self {
             switch: aterm_secrets::swarm::Switch::new(home),
-            start: Some(Box::new(start)),
-            clock: Instant::now(),
+            constructor: crate::host_startup::Constructor::new(start),
             due: None,
-            retry: RunnerRetry::default(),
         }
     }
 
     pub(crate) fn maintain(&mut self) -> Option<Instant> {
+        if !self.constructor.pending() {
+            return None;
+        }
         self.maintain_at(Instant::now())
     }
 
     fn maintain_at(&mut self, now: Instant) -> Option<Instant> {
-        let start = self.start.as_mut()?;
-        if self.due.is_some_and(|due| now < due) {
-            return self.due;
+        if !self.constructor.pending() {
+            return None;
+        }
+        if let Some(due) = self.due.or(self.constructor.deadline())
+            && now < due
+        {
+            return Some(due);
         }
         // Unread sharing remains held, just as the runtime's own policy read does.
         if self
@@ -53,17 +54,8 @@ impl Startup {
             self.due = Some(now + SHARING_LOOK);
             return self.due;
         }
-        self.retry.started();
-        if start() {
-            self.start = None;
-            self.due = None;
-            return None;
-        }
-        let elapsed = now.saturating_duration_since(self.clock).as_millis();
-        let elapsed = u64::try_from(elapsed).unwrap_or(u64::MAX);
-        self.retry.reaped(Last::Failed, elapsed);
-        self.due = self.retry.remaining(elapsed).map(|pause| now + pause);
-        self.due
+        self.due = None;
+        self.constructor.maintain_at(now)
     }
 }
 
@@ -105,19 +97,17 @@ mod tests {
             let tried = Arc::clone(&attempts);
             let mut startup =
                 super::Startup::new(home, move || tried.fetch_add(1, Ordering::SeqCst) > 0);
-            let mut now = startup.clock;
+            let now = std::time::Instant::now();
             let due = startup.maintain_at(now).unwrap();
             assert_eq!(attempts.load(Ordering::SeqCst), usize::from(enabled));
-            if !enabled {
+            let due = if !enabled {
                 assert_eq!(due, now + super::SHARING_LOOK);
                 std::fs::write(&config, "[swarm]\nenabled = true\n").unwrap();
-                now = due;
-            }
-            if !enabled {
-                let _ = startup.maintain_at(now);
-            }
+                startup.maintain_at(due).unwrap()
+            } else {
+                due
+            };
             assert_eq!(attempts.load(Ordering::SeqCst), 1);
-            let due = startup.due.unwrap();
             startup.maintain_at(due - std::time::Duration::from_nanos(1));
             assert_eq!(attempts.load(Ordering::SeqCst), 1);
             // A failed constructor never gives a later retry permission to bypass sharing.

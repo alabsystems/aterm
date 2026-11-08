@@ -5823,6 +5823,8 @@ mod tests {
                 pid,
                 facts: aterm_sysprobe::jobs::StartFacts {
                     lone_zero: true,
+                    user_ns: Some(0),
+                    program_check_wait: true,
                     stopped: self.stopped,
                     local: Some(true),
                     age_ms: Some(now_us.saturating_sub(start_us) / 1000),

@@ -2487,8 +2487,8 @@ fn base_ai_accounts_syncs_codex_without_an_unassigned_claude_login() {
         aterm_types::macos_setup::Standing::InPlace
     );
     assert_eq!(
-        accounts_sync::resync_due(&home, &env.state, &env.accounts_roster().unwrap(), env.now),
-        None
+        accounts_sync::read_resync(&home, &env.state, &env.accounts_roster().unwrap(), env.now),
+        accounts_sync::ResyncRead::Current
     );
 
     // A desired assignment rejected because the sheet conflicts is a real failure.
@@ -2517,15 +2517,15 @@ fn base_ai_accounts_syncs_codex_without_an_unassigned_claude_login() {
             .unwrap()
             .contains("Claude account provisioning pending")
     );
-    assert!(
-        accounts_sync::resync_due(
+    assert!(matches!(
+        accounts_sync::read_resync(
             &home,
             &env.state,
             &env.accounts_roster().unwrap(),
             env.now + 1
-        )
-        .is_some()
-    );
+        ),
+        accounts_sync::ResyncRead::Due(_)
+    ));
     super::ai_accounts_apply(&env).unwrap();
     assert_eq!(
         accounts::Roster::load(&env.accounts_roster().unwrap())

@@ -210,28 +210,32 @@ fn thread_handles(pid: c_int, room: usize) -> Option<Vec<u64>> {
     Some(handles)
 }
 
+/// One thread's kernel execution counters and scheduler state, or an unread probe.
+fn thread_info(pid: c_int, handle: u64) -> Option<libc::proc_threadinfo> {
+    // SAFETY: plain integer fields and bytes; all-zero is valid.
+    let mut info: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
+    // SAFETY: info is a writable buffer of the flavor's exact layout and size.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTHREADINFO,
+            handle,
+            (&raw mut info).cast::<c_void>(),
+            THREAD_SIZE as c_int,
+        )
+    };
+    (usize::try_from(got).ok() == Some(THREAD_SIZE)).then_some(info)
+}
+
 /// Each listed thread read, and whether the list (of up to `MAX_THREADS + 1`) was cut.
 fn threads(pid: c_int, listed: &[u64]) -> (Vec<ThreadReading>, bool) {
     let truncated = listed.len() > MAX_THREADS;
     let handles = &listed[..listed.len().min(MAX_THREADS)];
     let mut out = Vec::with_capacity(handles.len());
     for &h in handles {
-        // SAFETY: plain integers and bytes; all-zero is valid.
-        let mut info: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
-        // SAFETY: `info` is `THREAD_SIZE` writable bytes of the flavor's
-        // layout; the argument is the thread's handle.
-        let got = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTHREADINFO,
-                h,
-                (&raw mut info).cast::<c_void>(),
-                THREAD_SIZE as c_int,
-            )
-        };
-        if usize::try_from(got).ok() != Some(THREAD_SIZE) {
+        let Some(info) = thread_info(pid, h) else {
             continue;
-        }
+        };
         out.push(ThreadReading {
             id: h,
             state: RunState::from_mach_thread(info.pth_run_state),
@@ -290,6 +294,8 @@ fn start_facts(
         .saturating_add(b.pbi_start_tvusec);
     Some(StartFacts {
         lone_zero: true,
+        user_ns: thread_info(pid, 0).map(|t| t.pth_user_time),
+        program_check_wait: false,
         stopped: b.pbi_status == darwin::SSTOP,
         traced: b.pbi_flags & darwin::PROC_FLAG_TRACED != 0,
         translated: translated(pid)?,

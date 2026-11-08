@@ -547,6 +547,22 @@ pub fn route_decode(bytes: &[u8]) -> Result<Decision> {
 pub fn git_request(run: &crate::git::GitRun) -> Vec<u8> {
     let slug = &run.slug;
     let text = match &run.op {
+        GitOp::CommitRead {
+            request, anonymous, ..
+        } => {
+            let mut text = format!("git commit-ancestry {slug}\nanonymous {anonymous}");
+            for oid in request.commits() {
+                let _ = write!(text, "\ncommit {oid}");
+            }
+            for query in request.queries() {
+                let _ = write!(
+                    text,
+                    "\nancestor {}\ndescendant {}",
+                    query.ancestor, query.descendant
+                );
+            }
+            text
+        }
         GitOp::CheckLocal { .. } => format!("git check-local {slug}\nread-only true"),
         GitOp::Mirror { .. } => format!("git clone-mirror {slug}"),
         GitOp::Clone { depth, .. } => match depth {

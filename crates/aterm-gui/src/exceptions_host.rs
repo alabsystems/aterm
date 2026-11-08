@@ -1911,7 +1911,6 @@ mod tests {
     use aterm_messages::need::{Reason, Then, Why};
 
     use crate::App;
-    use crate::messages_host::message_regrids;
 
     fn tab_one() -> Entry {
         Entry::new(
@@ -1978,12 +1977,13 @@ mod tests {
         app.crash_journal = crate::crash_journal::Lane::inert();
     }
 
-    /// Posting, restating, clearing, and dismissing digest entries never re-grid the terminal band.
+    /// Posting, restating, clearing, and dismissing digest entries never re-grid a window's chrome.
     #[test]
     fn a_digest_costs_no_regrid() {
         let mut app = App::headless_for_test();
-        let message = message_regrids();
-        let rows = app.message_band_rows;
+        let wid = crate::WindowId(0);
+        let rows = app.chrome_rows(wid);
+        let _ = crate::app_presence::take_chrome_regrids_applied();
         app.sync_messages();
         app.except_replace(Family::Upgrade, &[tab_one()]);
         app.sync_messages();
@@ -1998,9 +1998,14 @@ mod tests {
         assert_eq!(app.dismiss_exceptions(), 1);
         app.sync_messages();
         assert!(app.messages.digest().is_empty());
-        assert_eq!(message_regrids(), message, "no band re-grid");
         assert_eq!(
-            app.message_band_rows, rows,
+            crate::app_presence::take_chrome_regrids_applied(),
+            Vec::new(),
+            "no chrome re-grid"
+        );
+        assert_eq!(
+            app.chrome_rows(wid),
+            rows,
             "the pane's chrome rows never moved"
         );
     }

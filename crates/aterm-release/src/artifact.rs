@@ -227,9 +227,9 @@ pub fn content_digest(app: &Path) -> Result<String, String> {
         } else {
             continue;
         };
-        let mut h = aterm_digest::Sha256::new();
-        h.update(bytes);
-        let digest = aterm_codec::hex::encode_lower(&h.finalize());
+        let digest = aterm_codec::hex::encode_lower(
+            ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref(),
+        );
         let prefix = line
             .rsplit_once('\0')
             .ok_or("missing bundle file digest")?

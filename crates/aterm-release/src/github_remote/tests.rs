@@ -1124,7 +1124,8 @@ fn ambient_git_state_cannot_rebind_the_explicit_source() {
         // this negative control. The command-config case's longer prefix wins.
         child
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", &global);
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env(crate::ledger::testing::CHOSEN_GIT_ENV, "1");
         if case == "dir" {
             child.env("GIT_DIR", other.join(".git"));
         } else {

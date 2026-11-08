@@ -15,6 +15,39 @@ use crate::github::RepoListKind;
 use crate::policy::{Access, Named};
 use crate::slug::Slug;
 
+/// Read only exact commit objects and original parent ancestry. No ref,
+/// checkout, tree/blob completeness or published-ref inventory is implied.
+pub(crate) fn repo_commit_ancestry(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
+    if inv.global.as_profile.is_some() {
+        return Err(
+            inv.usage("repo commit-ancestry uses routed credentials or --anonymous, not --as")
+        );
+    }
+    let file = inv
+        .flag("--input")
+        .ok_or_else(|| inv.usage("--input FILE is required"))?;
+    let request = crate::git::CommitRead::new(super::cmd_api::read_input(file)?)?;
+    let dir = inv
+        .rest()
+        .first()
+        .ok_or_else(|| inv.usage("DIR is required"))?;
+    let dir = std::path::absolute(dir).map_err(|error| inv.usage(format!("DIR: {error}")))?;
+    let gh = ctx.github()?;
+    let (slug, named) = inv.repo(gh.router())?;
+    let out = gh.run_git(
+        &GitRun::commit_read(&slug, &dir, request, inv.global.anonymous).with_named(named),
+    )?;
+    Ok(Outcome {
+        answer: Answer::Object {
+            noun: Noun::Raw,
+            value: aterm_json::from_str(&out.stdout).map_err(|error| {
+                inv.usage(format!("invalid native ancestry observation: {error}"))
+            })?,
+        },
+        receipt: Receipt::for_repo(inv, &gh, &slug),
+    })
+}
+
 /// Admit local source reads with no identity load, request, grant or source mutation.
 pub(crate) fn repo_check_local(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let dir = inv

@@ -6,7 +6,7 @@
 #![cfg(unix)]
 
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Instant;
 
@@ -52,6 +52,17 @@ fn boot_with_launch(
     rc: Option<(&str, &str)>,
     extra: &[&str],
 ) -> Instance {
+    boot_with_setup(tag, shell, harness, rc, extra, |_| None)
+}
+
+fn boot_with_setup(
+    tag: &str,
+    shell: &str,
+    harness: Option<&str>,
+    rc: Option<(&str, &str)>,
+    extra: &[&str],
+    setup: impl FnOnce(&Path) -> Option<PathBuf>,
+) -> Instance {
     let deferred = extra
         .iter()
         .any(|arg| matches!(*arg, "-e" | "--no-shell-integration"));
@@ -88,6 +99,9 @@ fn boot_with_launch(
                 .env("ATERM_LOG", "info")
                 .args(["--lines", "24", "--columns", "100"])
                 .args(extra);
+            if let Some(shell) = setup(tmp) {
+                cmd.env("SHELL", shell);
+            }
         },
         |_| true,
     );
@@ -689,14 +703,34 @@ fn a_worker_whose_first_prompt_comes_late_still_starts() {
 /// nothing.
 #[test]
 fn a_program_worker_concludes_on_its_exit_status_with_its_output_as_its_result() {
-    // This checks program output and exit status. Bash job control can add an
-    // unrelated child-setpgid diagnostic; foreground_handback_live_headless
-    // exercises job control separately. Keep this fixture's exact output check.
-    let inst = boot(
+    // Disable monitor mode before Bash's startup loader can fork. Changing it
+    // in .bashrc is too late for the loader's children; interactive Bash also
+    // enables it despite +m in argv. The first rc disables it, then delegates
+    // to the real integration loader. The user rc checks that boundary.
+    // foreground_handback_live_headless exercises actual job control separately.
+    let inst = boot_with_setup(
         "p",
         "/bin/bash",
         Some(SUPERVISED),
-        Some((".bashrc", "set +m\n")),
+        Some((".bashrc", "case $- in *m*) exit 78 ;; esac\n")),
+        &[],
+        |tmp| {
+            let shell = tmp.join("bin/bash");
+            headless_boot::standin(
+                &shell,
+                "#!/bin/sh\n\
+                case \"$1\" in --rcfile)\n\
+                  export ATERM_TEST_ORIGINAL_RC=\"$2\"; shift 2\n\
+                  exec /bin/bash --rcfile \"$HOME/.early-bashrc\" \"$@\" ;;\n\
+                  *) exec /bin/bash \"$@\" ;; esac\n",
+            );
+            std::fs::write(
+                tmp.join("home/.early-bashrc"),
+                "set +m\n. \"$ATERM_TEST_ORIGINAL_RC\"\n",
+            )
+            .unwrap();
+            Some(shell)
+        },
     );
     let (_, manager) = boot_session(&inst);
     let work = inst.tmp.join("work");

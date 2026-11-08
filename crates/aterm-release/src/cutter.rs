@@ -151,7 +151,7 @@ pub fn judge_at_start() {
                     return Judged {
                         stamp: Err(NotOwn::new(
                             format!("the frozen-tool proof is invalid ({why})"),
-                            "restore the clean release clone and run the release again",
+                            "from the clean release clone run `targo --unverified ship release` with the same arguments",
                         )),
                         since: None,
                     };

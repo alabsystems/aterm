@@ -519,12 +519,10 @@ pub(crate) const TRAIL_LIGHT_COMPOSER: EffectsLane = composer_lane(
     "light",
 );
 
-/// The report keys whose figures are the operating point the effects lane's GPU keys are
-/// measured at: the reference full repaint's GPU p50 and the blank one's, in us. Every GPU
-/// key is a ratio against those frames, and its level moves with the GPU's state, which
-/// either figure alone misses: this box measured 175.9 and 195.3 us references with blank
-/// repaints of 117.6 and 80.4 us and episode ratios of 1.73 and 2.84 ([`PointFigure`]). The
-/// CPU keys count instructions, which the GPU's state does not move.
+/// Report suffixes for the calibration of the run supplying a GPU ratio's median.
+/// Pooled reference medians include other scenes and runs. The ledger uses distinct
+/// ratio-local names so those older rows cannot calibrate these observations. CPU keys
+/// count instructions and carry no GPU point.
 const EFFECTS_GPU_POINT: &[&str] = &["ref_gpu_p50_us", "ref_blank_gpu_p50_us"];
 
 /// The features the effects harness is built with: its pass-economy ablation is a dev seam.
@@ -917,28 +915,33 @@ fn judge_effects(lane: &EffectsLane, json: &Value, record: bool) -> LaneRun {
 /// trend when the report does not say: held against another state's rows, a state change reads
 /// as a regression.
 fn at_gpu_point(lane: &EffectsLane, run: &mut LaneRun, json: &Value) {
-    let at: Option<Vec<PointFigure>> = EFFECTS_GPU_POINT
-        .iter()
-        .map(|&name| {
-            number(json, name)
-                .filter(|v| *v > 0.0)
-                .map(|value| PointFigure { name, value })
-        })
-        .collect();
     let before = run.samples.len();
     run.samples.retain_mut(|s| {
         if !lane.gpu.keys.contains(&s.metric.as_str()) {
             return true;
         }
-        s.at.clone_from(at.as_ref().unwrap_or(&Vec::new()));
-        at.is_some()
+        let at: Option<Vec<PointFigure>> = EFFECTS_GPU_POINT
+            .iter()
+            .zip(["ratio_ref_gpu_p50_us", "ratio_ref_blank_gpu_p50_us"])
+            .map(|(&suffix, name)| {
+                number(json, &format!("{}_{suffix}", s.metric))
+                    .filter(|v| *v > 0.0)
+                    .map(|value| PointFigure { name, value })
+            })
+            .collect();
+        if let Some(at) = at {
+            s.at = at;
+            true
+        } else {
+            false
+        }
     });
     let dropped = before - run.samples.len();
     if dropped > 0 {
         let figures = EFFECTS_GPU_POINT.join(", ");
         eprintln!(
             "    NO TREND SAMPLE for {dropped} GPU key(s) — the report lacks a positive \
-             {figures}, so it does not say which GPU state they were measured in."
+             ratio-local {figures}, so it does not say which GPU state they were measured in."
         );
         run.unjudged.push(format!(
             "{} GPU trend ({dropped} key(s); the report lacks {figures})",
@@ -1787,11 +1790,25 @@ mod tests {
             let unplaced = judge_effects(lane, &full, false);
             let mut half = full.clone();
             if let Some(o) = full.as_object_mut() {
+                // Deliberately unrelated pooled summaries cannot place a scene ratio.
                 o.insert("ref_gpu_p50_us".to_string(), Value::from(535.667));
                 o.insert("ref_blank_gpu_p50_us".to_string(), Value::from(367.5));
+                for (index, key) in lane.gpu.keys.iter().enumerate() {
+                    o.insert(
+                        format!("{key}_ref_gpu_p50_us"),
+                        Value::from(100.0 + index as f64),
+                    );
+                    o.insert(
+                        format!("{key}_ref_blank_gpu_p50_us"),
+                        Value::from(50.0 + index as f64),
+                    );
+                }
             }
             if let Some(o) = half.as_object_mut() {
                 o.insert("ref_gpu_p50_us".to_string(), Value::from(535.667));
+                for key in lane.gpu.keys {
+                    o.insert(format!("{key}_ref_gpu_p50_us"), Value::from(100.0));
+                }
             }
             let run = judge_effects(lane, &full, false);
             assert!(!run.failed(), "{run:?}");
@@ -1799,14 +1816,20 @@ mod tests {
             for s in &run.samples {
                 let gpu = lane.gpu.keys.contains(&s.metric.as_str());
                 let want = if gpu {
+                    let index = lane
+                        .gpu
+                        .keys
+                        .iter()
+                        .position(|key| *key == s.metric)
+                        .unwrap();
                     vec![
                         PointFigure {
-                            name: "ref_gpu_p50_us",
-                            value: 535.667,
+                            name: "ratio_ref_gpu_p50_us",
+                            value: 100.0 + index as f64,
                         },
                         PointFigure {
-                            name: "ref_blank_gpu_p50_us",
-                            value: 367.5,
+                            name: "ratio_ref_blank_gpu_p50_us",
+                            value: 50.0 + index as f64,
                         },
                     ]
                 } else {

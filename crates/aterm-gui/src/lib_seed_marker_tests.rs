@@ -142,7 +142,6 @@ fn appnotice_text_is_recorded() {
         Ok(super::AppNoticeTaken::Recorded)
     );
     assert_eq!(live(&app), 0);
-    assert_eq!(app.message_band_rows, 0, "nothing reached the glass");
     let texts: Vec<&str> = app
         .messages
         .log()

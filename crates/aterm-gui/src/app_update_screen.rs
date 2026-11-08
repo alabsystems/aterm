@@ -76,10 +76,6 @@ impl App {
         self.staged_said = None;
         self.update_ctl_checks = 0;
         self.update_quiet = None;
-        if self.message_band_rows != 0 {
-            self.message_band_rows = 0;
-            self.regrid_for_chrome_rows();
-        }
         self.sync_messages();
     }
 }
@@ -1932,7 +1928,7 @@ pub(crate) mod tests {
             app.messages
                 .live_by_key(crate::update_words::KEY_PROGRESS)
                 .is_none(),
-            "a staged build nothing can press is not a band row"
+            "a staged build nothing can press is not a live row"
         );
         let headless = ApplyPosture::HandoffDisabled {
             why: HandoffUnavailable::Headless,
@@ -1940,7 +1936,6 @@ pub(crate) mod tests {
             image_kept: false,
         };
         assert_eq!(staged_record(&app), staged_detail(headless));
-        assert_eq!(app.message_band_rows, 0, "…and no row is reserved");
 
         let latch = |retry_at| crate::AutoApplyManualOnly {
             build,

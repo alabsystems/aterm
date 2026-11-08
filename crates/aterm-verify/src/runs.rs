@@ -296,7 +296,7 @@ impl Left {
         !self.named.is_empty() || self.unjudged > 0
     }
 
-    /// `ended aterm ×2; named ssh-agent ×1; 1 held at macOS's program check, not judged`.
+    /// `ended aterm ×2; named ssh-agent ×1; 1 not observed running, program-check cause unconfirmed; not judged`.
     fn words(&self) -> String {
         let mut parts = Vec::new();
         if !self.ended.is_empty() {
@@ -307,7 +307,7 @@ impl Left {
         }
         if self.unjudged > 0 {
             parts.push(format!(
-                "{} held at macOS's program check, not judged",
+                "{} not observed running, program-check cause unconfirmed; not judged",
                 self.unjudged
             ));
         }

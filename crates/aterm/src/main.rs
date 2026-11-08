@@ -1715,22 +1715,25 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let input_maintenance: Option<aterm_gui::HostMaintenance> = None;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let maintenance = if input_maintenance.is_some() || commons.is_some() {
+    let (network_source, mut services) = ordinary
+        .then(network_state_source)
+        .flatten()
+        .map_or((None, None), |(source, startup)| (Some(source), startup));
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let maintenance = if input_maintenance.is_some() || commons.is_some() || services.is_some() {
         Some(Box::new(move || {
             let inputs = input_maintenance.as_mut().and_then(|keep| keep());
             let commons = commons.as_mut().and_then(commons_lan::Startup::maintain);
-            match (inputs, commons) {
-                (Some(inputs), Some(commons)) => Some(inputs.min(commons)),
-                (inputs, commons) => inputs.or(commons),
-            }
+            let services = services
+                .as_mut()
+                .and_then(host_startup::Constructor::maintain);
+            [inputs, commons, services].into_iter().flatten().min()
         }) as aterm_gui::HostMaintenance)
     } else {
         None
     };
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let maintenance = input_maintenance;
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let network_source = ordinary.then(network_state_source).flatten();
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let network_source = None;
     #[expect(
@@ -1974,16 +1977,20 @@ fn start_commons_runtime(paths: aterm_secrets::client::Paths, config: &std::path
     }
 }
 
-/// Join the independent producers, loading fallback history once before the GUI starts.
+/// Join the independent producers, loading fallback history once before the GUI starts and
+/// retaining a failed service-owner start for the host's maintenance.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn network_state_source() -> Option<aterm_gui::NetworkSnapshotSource> {
+fn network_state_source() -> Option<(
+    aterm_gui::NetworkSnapshotSource,
+    Option<host_startup::Constructor>,
+)> {
     use std::sync::OnceLock;
 
     if !commons_host_enabled() {
         return None;
     }
 
-    static SERVICES: OnceLock<Option<aterm_db::service_state::Runtime>> = OnceLock::new();
+    static SERVICES: OnceLock<aterm_db::service_state::Runtime> = OnceLock::new();
     // Read at each look, not once: with `[swarm] enabled = false` the runtime starts only once a
     // person turns sharing on ([`commons_startup`]), and the page then shows what it hears.
     let started = COMMONS_RUNTIME.get().is_some();
@@ -1992,38 +1999,65 @@ fn network_state_source() -> Option<aterm_gui::NetworkSnapshotSource> {
             .get()
             .map(aterm_db::runtime::Runtime::network_observation)
     };
-    let services = SERVICES
-        .get_or_init(|| {
-            let paths = aterm_secrets::client::Paths::live().ok()?;
-            let config = aterm_types::dirs::aterm_config_path()?;
-            aterm_db::service_state::Runtime::start(paths, config).ok()
-        })
-        .as_ref()
-        .map(aterm_db::service_state::Runtime::observation);
+    // This local metadata observer is independent of sharing. Its constructor does no
+    // sampling; only WithServices reads ask the published worker for an observation.
+    let startup = if SERVICES.get().is_none() {
+        aterm_secrets::client::Paths::live()
+            .ok()
+            .zip(aterm_types::dirs::aterm_config_path())
+            .map(|(paths, config)| {
+                let mut startup = host_startup::Constructor::new(move || {
+                    if SERVICES.get().is_some() {
+                        return true;
+                    }
+                    match aterm_db::service_state::Runtime::start(paths.clone(), config.clone()) {
+                        Ok(runtime) => {
+                            let _ = SERVICES.set(runtime);
+                            true
+                        }
+                        Err(error) => {
+                            warn_when_logging(format!("Service observer could not start: {error}"));
+                            false
+                        }
+                    }
+                });
+                let _ = startup.maintain();
+                startup
+            })
+    } else {
+        None
+    };
     let retained = if started {
         None
     } else {
         aterm_types::dirs::aterm_config_path()
             .and_then(|config| aterm_db::network_state::read_history(&config).ok())
     };
-    Some(network_state_source_from(network, services, retained))
+    Some((
+        network_state_source_from(
+            network,
+            || {
+                SERVICES
+                    .get()
+                    .map(aterm_db::service_state::Runtime::observation)
+            },
+            retained,
+        ),
+        startup,
+    ))
 }
 
-/// Compose independent observers, including when only one could start: `network` reads the
-/// network observer's handle, which may come after the source does.
+/// Compose independent observers, looking up either handle lazily because its owner may start
+/// after this source does.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn network_state_source_from(
     network: impl Fn() -> Option<aterm_db::network_state::ObservationHandle> + Send + Sync + 'static,
-    services: Option<aterm_db::service_state::ObservationHandle>,
+    services: impl Fn() -> Option<aterm_db::service_state::ObservationHandle> + Send + Sync + 'static,
     retained: Option<aterm_types::network_state::NetworkObservation>,
 ) -> aterm_gui::NetworkSnapshotSource {
     network_state_source_with_readers(
         move || network().and_then(|network| network.try_publication()),
-        move || {
-            services
-                .as_ref()
-                .and_then(|services| services.try_publication())
-        },
+        move || services().and_then(|services| services.try_publication()),
         retained,
         || (std::time::Instant::now(), aterm_time::unix_millis()),
     )
@@ -16322,6 +16356,8 @@ mod unit_peers;
 /// leaves sharing on.
 #[cfg(unix)]
 mod commons_lan;
+#[cfg(unix)]
+mod host_startup;
 
 #[path = "doctor.rs"]
 mod doctor;
@@ -18675,9 +18711,44 @@ mod tests {
     #[test]
     fn a_missing_service_observer_does_not_hide_network_observations() {
         use aterm_types::network_state::{ServiceAvailability, Visibility};
+        use std::{
+            sync::{
+                Arc, OnceLock,
+                atomic::{AtomicUsize, Ordering},
+            },
+            time::{Duration, Instant},
+        };
 
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let paths = aterm_secrets::client::Paths::for_home(&scratch.path().join("home"));
+        let config = scratch.path().join("aterm.toml");
+        aterm_uds::atomic_file::write(&config, b"[swarm]\nenabled = false\n", 0o600).unwrap();
+        let published = Arc::new(OnceLock::<aterm_db::service_state::Runtime>::new());
+        let publisher = published.clone();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let tried = attempts.clone();
+        let mut startup = super::host_startup::Constructor::new(move || {
+            if tried.fetch_add(1, Ordering::SeqCst) == 0 {
+                return false;
+            }
+            let runtime =
+                aterm_db::service_state::Runtime::start(paths.clone(), config.clone()).unwrap();
+            assert!(publisher.set(runtime).is_ok());
+            true
+        });
+        let now = Instant::now();
+        let due = startup.maintain_at(now).unwrap();
         let network = aterm_db::network_state::ObservationHandle::default();
-        let read = super::network_state_source_from(move || Some(network.clone()), None, None);
+        let services = published.clone();
+        let read = super::network_state_source_from(
+            move || Some(network.clone()),
+            move || {
+                services
+                    .get()
+                    .map(aterm_db::service_state::Runtime::observation)
+            },
+            None,
+        );
         let snapshot = read(aterm_gui::NetworkRead::WithServices).unwrap();
         assert_eq!(snapshot.network.visibility, Visibility::Checking);
         assert_eq!(
@@ -18688,6 +18759,44 @@ mod tests {
             snapshot.services.secrets.availability,
             ServiceAvailability::Unknown
         );
+        let _ = read(aterm_gui::NetworkRead::Network);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "readers never run constructors"
+        );
+        startup.maintain_at(due - Duration::from_nanos(1));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "failed starts keep their backoff"
+        );
+        assert_eq!(startup.maintain_at(due), None);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        // The same held source discovers the real owner, even while sharing is off. Ordinary
+        // WithServices demand supplies its first paid metadata sample; painting starts nothing.
+        let healthy = aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the recovered service owner's first metadata publication",
+            || {
+                let snapshot = read(aterm_gui::NetworkRead::WithServices)?;
+                (snapshot.services.accounts.observed_at_ms != 0
+                    && snapshot.services.secrets.observed_at_ms != 0)
+                    .then_some(snapshot)
+            },
+        );
+        assert_eq!(healthy.network.visibility, Visibility::Checking);
+        assert!(healthy.revision > snapshot.revision);
+        assert_eq!(startup.maintain_at(due + Duration::from_secs(120)), None);
+        let _ = read(aterm_gui::NetworkRead::Network);
+        let _ = read(aterm_gui::NetworkRead::WithServices);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "a published owner is not restarted"
+        );
+        drop(read);
+        drop(published);
     }
 
     /// Only a reader that draws the services reads them, since a services read asks their
@@ -18785,7 +18894,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let read = super::network_state_source_from(|| None, None, Some(retained.clone()));
+        let read = super::network_state_source_from(|| None, || None, Some(retained.clone()));
         let snapshot = read(aterm_gui::NetworkRead::WithServices).unwrap();
         assert_eq!(snapshot.network.visibility, Visibility::Unavailable);
         assert!(snapshot.network.observer.is_none());

@@ -1870,6 +1870,8 @@ pub(crate) mod tests {
     fn judged(at: AtStart) -> StartFacts {
         let unstarted = StartFacts {
             lone_zero: true,
+            user_ns: Some(0),
+            program_check_wait: true,
             local: Some(true),
             age_ms: Some(probe::PROGRAM_CHECK_AGE_MS),
             ..StartFacts::default()
@@ -2579,6 +2581,8 @@ pub(crate) mod tests {
         ];
         let unstarted = |translated| probe::StartFacts {
             lone_zero: true,
+            user_ns: Some(0),
+            program_check_wait: true,
             translated,
             local: Some(true),
             age_ms: Some(probe::PROGRAM_CHECK_AGE_MS),
@@ -2741,6 +2745,8 @@ pub(crate) mod tests {
             start: Some(7),
             start_facts: Some(probe::StartFacts {
                 lone_zero: true,
+                user_ns: Some(0),
+                program_check_wait: true,
                 local: Some(true),
                 age_ms: Some(probe::PROGRAM_CHECK_AGE_MS),
                 ..probe::StartFacts::default()
@@ -3280,6 +3286,8 @@ pub(crate) mod tests {
                 let before = NOW.load(Ordering::SeqCst) < T;
                 Some(StartFacts {
                     lone_zero: pid != 51 || !before,
+                    user_ns: Some(0),
+                    program_check_wait: true,
                     stopped: pid == 52 && before,
                     local: Some(true),
                     age_ms: Some(now_us.saturating_sub(fork) / 1_000),
@@ -3811,6 +3819,8 @@ pub(crate) mod tests {
             pid: 32,
             start_facts: Some(probe::StartFacts {
                 lone_zero: true,
+                user_ns: Some(0),
+                program_check_wait: true,
                 local: Some(true),
                 age_ms: Some(probe::PROGRAM_CHECK_AGE_MS),
                 ..probe::StartFacts::default()
@@ -3842,6 +3852,8 @@ pub(crate) mod tests {
             pid: 40,
             start_facts: Some(probe::StartFacts {
                 lone_zero: true,
+                user_ns: Some(0),
+                program_check_wait: true,
                 stopped,
                 translated,
                 local,

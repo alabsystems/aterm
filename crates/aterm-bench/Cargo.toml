@@ -67,6 +67,10 @@ required-features = ["aos-gpu"]
 test = true
 
 [[example]]
+name = "effects_harness"
+test = true
+
+[[example]]
 name = "vte_engine_harness"
 # Its unit tests (the interleave and the performance-core cycle count) run in
 # `targo --unverified test -p aterm-bench`.

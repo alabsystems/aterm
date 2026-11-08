@@ -1572,7 +1572,7 @@ impl App {
         Ok(seq)
     }
 
-    /// Run `f` with every chrome-row re-grid it causes (`regrid_for_chrome_rows`) recorded, then apply one re-grid from the rows the commits left.
+    /// Run `f` with every chrome-row re-grid it causes (`regrid_for_chrome_rows`) recorded, then apply one re-grid from the rows it left.
     #[cfg(any(unix, test))]
     pub(crate) fn with_chrome_regrid_batch<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         if self.chrome_regrid_batch.is_some() {
@@ -1617,15 +1617,16 @@ impl App {
         });
     }
 
-    /// Note a rise of the chrome rows every window shares (a band row reached the glass, the tab strip grew) on every window's regrow floor.
+    /// Note a rise of the chrome rows every window shares (the tab strip grew) on every window's regrow floor.
     pub(crate) fn note_chrome_rise_everywhere(&mut self, now: Instant) {
         for ws in self.windows.values_mut() {
             ws.regrow_floor.rose(now);
         }
     }
 
-    /// The floor the band's quiet shrink and the tab strip's fall wait.
-    pub(crate) fn band_regrow_floor(&self) -> Option<Instant> {
+    /// The floor the tab strip's fall waits: the latest regrow floor of the windows whose grid
+    /// re-grids with their chrome rows.
+    pub(crate) fn chrome_regrow_floor(&self) -> Option<Instant> {
         aterm_messages::chrome::latest(
             self.windows
                 .values()

@@ -1402,19 +1402,25 @@ fn machine_id_among(names: impl IntoIterator<Item = String>) -> Option<String> {
 
 /// The address the profile of the home `env` names is signed in as.
 pub(crate) fn read_default_profile_email(env: &Env) -> Option<String> {
-    let path = env.claude_profile.as_deref().map(|own| {
+    profile_email(&default_profile_path(env)?, &read_local_source_text)
+}
+
+fn default_profile_path(env: &Env) -> Option<PathBuf> {
+    env.claude_profile.as_deref().map(|own| {
         super::profile::effective(own, env.claude_dir().as_deref(), env.claude_custom_oauth)
-    })?;
-    profile_email(&path)
+    })
 }
 
 /// The default login's address at `home`, as a sync from init reads it ([`quiet_env`]).
 fn home_default_email(home: &Path) -> Option<String> {
-    profile_email(&super::profile::effective(
-        &home.join(".claude.json"),
-        Some(&home.join(".claude")),
-        false,
-    ))
+    profile_email(
+        &super::profile::effective(
+            &home.join(".claude.json"),
+            Some(&home.join(".claude")),
+            false,
+        ),
+        &read_local_source_text,
+    )
 }
 
 /// Match a checked default login to its current row without trusting its label
@@ -2163,8 +2169,8 @@ fn transact_login_observation(
 }
 
 /// The address Claude Code's profile at `path` is signed in as.
-fn profile_email(path: &Path) -> Option<String> {
-    let text = read_local_source_text(path).ok()?;
+fn profile_email(path: &Path, read: &LocalSourceRead<'_>) -> Option<String> {
+    let text = read(path).ok()?;
     let val: Value = aterm_json::from_str(&text).ok()?;
     val.get("oauthAccount")?
         .get("emailAddress")?
@@ -3338,35 +3344,41 @@ pub(super) fn source_key(config: &Path) -> Option<String> {
 }
 
 type Fetch<'f> = dyn Fn(&Env, &str) -> Result<String, String> + Sync + 'f;
+type LocalSourceRead<'r> = dyn Fn(&Path) -> io::Result<String> + 'r;
 
 #[derive(Debug, Clone)]
-pub(super) struct PoolSyncCtx {
-    pool: super::ai_pool::Pool,
-    identity: super::ai_pool::LocalPoolIdentity,
+pub(super) struct PoolSyncCtx<P = super::ai_pool::Pool, I = super::ai_pool::LocalPoolIdentity> {
+    pool: P,
+    identity: I,
 }
 
-impl PoolSyncCtx {
+impl<
+    P: std::borrow::Borrow<super::ai_pool::Pool>,
+    I: std::borrow::Borrow<super::ai_pool::LocalPoolIdentity>,
+> PoolSyncCtx<P, I>
+{
     fn holder_for_row(&self, cli: Cli, row: &Row) -> Option<String> {
         let email = row.expected_identity_email().or(row.email.as_deref())?;
-        let Some(acct) = self.pool.accounts.iter().find(|a| {
+        let Some(acct) = self.pool.borrow().accounts.iter().find(|a| {
             a.provider == cli
                 && accounts::same_provider_realm(cli, row.vendor.region, a.vendor.region)
                 && accounts::email_matches(&a.email, email)
         }) else {
             return Some(super::ai_pool::POOL_HOLDER_UNASSIGNED.to_owned());
         };
-        (!acct.is_warm_for(&self.identity)).then(|| acct.holder_word().to_owned())
+        (!acct.is_warm_for(self.identity.borrow())).then(|| acct.holder_word().to_owned())
     }
 
     fn is_home_for_row(&self, cli: Cli, row: &Row) -> bool {
         let Some(email) = row.expected_identity_email().or(row.email.as_deref()) else {
             return false;
         };
-        self.pool.accounts.iter().any(|a| {
+        self.pool.borrow().accounts.iter().any(|a| {
             a.provider == cli
                 && accounts::same_provider_realm(cli, row.vendor.region, a.vendor.region)
                 && accounts::email_matches(&a.email, email)
-                && a.home_mac().is_some_and(|h| self.identity.matches(h))
+                && a.home_mac()
+                    .is_some_and(|h| self.identity.borrow().matches(h))
         })
     }
 }
@@ -3590,7 +3602,11 @@ fn discover_local_fleet(env: &Env) -> Option<FleetRoster> {
 }
 
 fn discover_local_fleet_with_min(env: &Env, min_accounts: usize) -> Option<FleetRoster> {
-    discovered_fleet(env, &local_shows(env), min_accounts)
+    discovered_fleet(
+        env,
+        &local_shows(env, &read_local_source_text),
+        min_accounts,
+    )
 }
 
 /// What this machine's own files show of the accounts on it, each address by what shows it
@@ -3634,7 +3650,7 @@ impl Shown {
 }
 
 /// Reads [`Shown`] from `env`'s home, state and config.
-fn local_shows(env: &Env) -> Shown {
+fn local_shows(env: &Env, read: &LocalSourceRead<'_>) -> Shown {
     let mut shown = Shown::default();
     let record = |into: &mut BTreeSet<String>, candidate: &str| {
         let trimmed = candidate.trim();
@@ -3642,8 +3658,10 @@ fn local_shows(env: &Env) -> Shown {
             into.insert(trimmed.to_owned());
         }
     };
-    if let Some(de) = read_default_profile_email(env) {
-        record(&mut shown.claude, &de);
+    let default = default_profile_path(env)
+        .and_then(|path| profile_email(&path, read).map(|email| (path, email)));
+    if let Some((_, de)) = &default {
+        record(&mut shown.claude, de);
     }
     if let Some(home) = &env.home {
         if let Ok(entries) = fs::read_dir(home) {
@@ -3652,9 +3670,18 @@ fn local_shows(env: &Env) -> Shown {
                 let Some(name_str) = name.to_str() else {
                     continue;
                 };
-                if name_str.starts_with(".claude.json")
-                    && entry.file_type().is_ok_and(|ft| ft.is_file())
-                    && let Ok(text) = read_local_source_text(&entry.path())
+                if !name_str.starts_with(".claude.json")
+                    || !entry.file_type().is_ok_and(|ft| ft.is_file())
+                {
+                    continue;
+                }
+                let path = entry.path();
+                // Keep every backup or distinct effective profile, and retry an earlier
+                // failed read. Only this call's successful exact lexical path is paid.
+                if default
+                    .as_ref()
+                    .is_none_or(|(seen, _)| seen.as_os_str() != path.as_os_str())
+                    && let Ok(text) = read(&path)
                     && let Ok(v) = aterm_json::from_str::<Value>(&text)
                     && let Some(em) = v
                         .get("oauthAccount")
@@ -3666,7 +3693,7 @@ fn local_shows(env: &Env) -> Shown {
             }
         }
         let muse_auth = home.join(".config/muse/auth.json");
-        if let Ok(text) = read_local_source_text(&muse_auth)
+        if let Ok(text) = read(&muse_auth)
             && let Ok(v) = aterm_json::from_str::<Value>(&text)
             && let Some(providers) = v.get("providers").and_then(Value::as_object)
         {
@@ -3709,7 +3736,7 @@ fn local_shows(env: &Env) -> Shown {
                 continue;
             }
             let dir_path = entry.path();
-            if let Ok(text) = read_local_source_text(&dir_path.join(".claude.json"))
+            if let Ok(text) = read(&dir_path.join(".claude.json"))
                 && let Ok(v) = aterm_json::from_str::<Value>(&text)
                 && let Some(em) = v
                     .get("oauthAccount")
@@ -3718,8 +3745,7 @@ fn local_shows(env: &Env) -> Shown {
             {
                 record(&mut shown.claude, em);
             }
-            if let Ok(text) =
-                read_local_source_text(&dir_path.join(accounts::RENEWAL_CHECKPOINT_FILE))
+            if let Ok(text) = read(&dir_path.join(accounts::RENEWAL_CHECKPOINT_FILE))
                 && let Ok(v) = aterm_json::from_str::<Value>(&text)
                 && let Some(em) = v.get("email").and_then(Value::as_str)
             {
@@ -3731,7 +3757,7 @@ fn local_shows(env: &Env) -> Shown {
         if let Ok(backups) = fs::read_dir(claude_dir.join("backups")) {
             for entry in backups.flatten() {
                 if entry.file_type().is_ok_and(|ft| ft.is_file())
-                    && let Ok(text) = read_local_source_text(&entry.path())
+                    && let Ok(text) = read(&entry.path())
                     && let Ok(v) = aterm_json::from_str::<Value>(&text)
                     && let Some(em) = v
                         .get("oauthAccount")
@@ -5762,15 +5788,25 @@ fn apply_pool_execution(
     before != state.prepared_accounts.len()
 }
 
-fn pool_executes(row: &Row, cli: Cli, pool: &PoolSyncCtx) -> bool {
+fn pool_executes<
+    P: std::borrow::Borrow<super::ai_pool::Pool>,
+    I: std::borrow::Borrow<super::ai_pool::LocalPoolIdentity>,
+>(
+    row: &Row,
+    cli: Cli,
+    pool: &PoolSyncCtx<P, I>,
+) -> bool {
     row.expected_identity_email().is_some() && pool.holder_for_row(cli, row).is_none()
 }
 
-fn pool_execution_pending(
+fn pool_execution_pending<
+    P: std::borrow::Borrow<super::ai_pool::Pool>,
+    I: std::borrow::Borrow<super::ai_pool::LocalPoolIdentity>,
+>(
     state: &accounts::State,
     rows: &[Row],
     cli: Cli,
-    pool: &PoolSyncCtx,
+    pool: &PoolSyncCtx<P, I>,
 ) -> bool {
     rows.iter()
         .any(|row| state.prepared_accounts.contains(&row.label) && pool_executes(row, cli, pool))
@@ -9253,7 +9289,7 @@ fn init_sync_needed(
         claude_tmp: None,
         claude_running: None,
     };
-    let shown = local_shows(&env);
+    let shown = local_shows(&env, &read_local_source_text);
     fleet_takes_discovered(opt_in, &existing_fleet, || shown.clone())
         && discovered_fleet(&env, &shown, 1).is_some_and(|local| {
             local.accounts.iter().any(|acct| {
@@ -9325,10 +9361,14 @@ fn capture_init_fleet(
         let opt_in = opt_in_of(&text);
         let mut shown = None;
         if fleet_takes_discovered(opt_in, &fleet, || {
-            shown.get_or_insert_with(|| local_shows(env)).clone()
-        }) && let Some(local) =
-            discovered_fleet(env, shown.get_or_insert_with(|| local_shows(env)), 1)
-        {
+            shown
+                .get_or_insert_with(|| local_shows(env, &read_local_source_text))
+                .clone()
+        }) && let Some(local) = discovered_fleet(
+            env,
+            shown.get_or_insert_with(|| local_shows(env, &read_local_source_text)),
+            1,
+        ) {
             added = merge_discovered_accounts(&mut fleet, local)?;
             if added {
                 answer = fleet.to_toml_for(opt_in);
@@ -9750,7 +9790,7 @@ fn resync_with(
     done
 }
 
-/// What [`resync_due`] has read in this process: kept apart from the syncs' own
+/// What [`read_resync`] has read in this process: kept apart from the syncs' own
 /// ([`REDISCOVERY`]), so a read never uses up a sync's turn, and kept across a converge pass's
 /// probe and its read-back, so the read after a sync reads what that sync left.
 static RESYNC_READ: std::sync::Mutex<Rediscovery> = std::sync::Mutex::new(Rediscovery {
@@ -9762,144 +9802,216 @@ static RESYNC_READ: std::sync::Mutex<Rediscovery> = std::sync::Mutex::new(Redisc
     sheet_said: Vec::new(),
 });
 
-/// Whether [`resync_for_setup`] has a source to read: Claude Code's configured or discovered
-/// source ([`has_init_accounts_source`]), or another CLI's fleet where its pool syncs by default
-/// ([`syncs_by_default`]) and its default admission takes rows, or this machine already keeps
-/// its roster. A vault file alone opts no machine into a pool that does not sync by default;
-/// a default pool this machine left or whose fleet does not list it stays out.
-/// An interrupted sync's recovery counts first, as it runs before that admission.
-/// An unusable selected source also counts so [`resync_due`] can report its refusal.
-#[must_use]
-pub fn has_resync_accounts_source(
-    home: &Path,
-    state_dir: &Path,
-    roster_path: &Path,
-    now: i64,
-) -> bool {
-    if has_init_accounts_source(home, state_dir, roster_path, now) {
-        return true;
-    }
-    let config = config_beside(roster_path);
-    let env = quiet_env(home, state_dir, &config, now);
-    OTHER_CLIS.into_iter().any(|cli| {
-        let Some(roster) = accounts::roster_beside_for(&config, cli) else {
-            return false;
-        };
-        let by_default = !roster.is_file();
-        if by_default && !syncs_by_default(cli) {
-            return false;
-        }
-        let store = accounts::Store::at_for(state_dir, cli, home);
-        if store.sync_needs_recovery() {
-            return true;
-        }
-        match load_cli_fleet_source(cli, &env, home, None, None, &fetch_source_text) {
-            Ok(None) => false,
-            Ok(Some((fleet, _, machine))) if by_default => {
-                !matches!(by_default_admits(&store, &fleet, machine, now), Ok(Err(_)))
-            }
-            Ok(Some(_)) | Err(_) => true,
-        }
-    })
+/// One read-only setup probe's source availability and work, with no sync or sign-in started.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResyncRead {
+    /// No source is configured or found, including default pools this machine left or is not in.
+    NoSource,
+    /// The available sources and local account records need no sync.
+    Current,
+    /// A sync is due, including a selected source or local record whose read is refused.
+    Due(String),
 }
 
-/// Why [`resync_for_setup`] would sync this machine's accounts now, read with nothing synced or
-/// written (the converge pass's `sync.accounts` probe), or `None` where it would sync nothing.
-/// THE SAME RULE as its sync: nothing where [`accounts_sync_off`] holds; Claude Code's roster
-/// where it is missing with a source to read or [`sync_called_for`] calls for a sync; and each
-/// other CLI's pool whose sync would add a row ([`cli_sync_due`]), or whose sync would refuse
-/// (a read of its fleet or roster that fails, which the sync reports). A process's first read reads every input; a later
-/// one, as a sync's does, reads again what changed.
+/// Read availability and due work together. The caller still checks its own automatic policy
+/// before this read; the due rule also reads the configuration beside the roster as usual.
 #[must_use]
-pub fn resync_due(home: &Path, state_dir: &Path, roster_path: &Path, now: i64) -> Option<String> {
-    resync_due_with(home, state_dir, roster_path, now, &RESYNC_READ)
+pub fn read_resync(home: &Path, state_dir: &Path, roster_path: &Path, now: i64) -> ResyncRead {
+    read_resync_with(
+        home,
+        state_dir,
+        roster_path,
+        now,
+        &RESYNC_READ,
+        &read_local_source_text,
+    )
 }
 
-fn resync_due_with(
+fn read_resync_with(
     home: &Path,
     state_dir: &Path,
     roster_path: &Path,
     now: i64,
     rediscovery: &std::sync::Mutex<Rediscovery>,
-) -> Option<String> {
+    read: &LocalSourceRead<'_>,
+) -> ResyncRead {
     let config = config_beside(roster_path);
-    if accounts_sync_off(Some(&config)) {
-        return None;
-    }
-    // Read whether or not the roster stands, so the read after a sync that wrote it compares
-    // with this one rather than reading every input as new.
-    let called = sync_called_for(home, state_dir, (roster_path, &config), now, rediscovery);
-    let mut why = Vec::new();
-    if claude_roster_missing(home, state_dir, roster_path, now) {
-        why.push("the roster is missing".to_owned());
-    } else if called {
-        why.push("a source it is made from changed or is due a fresh read".to_owned());
-    }
-    for cli in OTHER_CLIS {
-        match cli_sync_due(cli, home, state_dir, &config, now) {
-            Ok(added) if added.is_empty() => {}
-            Ok(added) => why.push(format!(
-                "{}'s pool has accounts to add ({})",
-                cli.id(),
-                added.join(", ")
-            )),
-            Err(error) => why.push(format!("{}'s pool cannot be synced: {error}", cli.id())),
+    let env = quiet_env(home, state_dir, &config, now);
+    let mut sources = ResyncSources::new(&env, home, read);
+    let mut pools = Vec::new();
+    let mut due_allowed = None;
+    let mut available = has_init_accounts_source(home, state_dir, roster_path, now);
+    if !available {
+        for cli in OTHER_CLIS {
+            let pool =
+                read_cli_resync(cli, state_dir, &config, now, &mut sources, &mut due_allowed);
+            available = pool.available;
+            pools.push(pool);
+            if available {
+                break;
+            }
         }
     }
-    (!why.is_empty()).then(|| why.join("; "))
+    if !available {
+        return ResyncRead::NoSource;
+    }
+    // The due policy uses the configuration beside the roster. The application's
+    // supplied-configuration Off check already ran before source availability.
+    if !*due_allowed.get_or_insert_with(|| !accounts_sync_off(Some(&config))) {
+        return ResyncRead::Current;
+    }
+    let mut why = claude_resync_due(home, state_dir, roster_path, now, rediscovery);
+    for (index, cli) in OTHER_CLIS.into_iter().enumerate() {
+        if pools.len() <= index {
+            pools.push(read_cli_resync(
+                cli,
+                state_dir,
+                &config,
+                now,
+                &mut sources,
+                &mut due_allowed,
+            ));
+        }
+        add_cli_resync_due(&mut why, cli, &pools[index].due);
+    }
+    if why.is_empty() {
+        ResyncRead::Current
+    } else {
+        ResyncRead::Due(why.join("; "))
+    }
 }
 
-/// The labels a sync of `cli`'s pool ([`sync_cli_with`], as [`resync_for_setup`] runs it, with
-/// no source named) would add to its roster beside `config`, read with nothing written: none
-/// where its pool neither syncs by default ([`syncs_by_default`]) nor has a kept roster,
-/// no fleet of it is there, or its default admission leaves it out ([`by_default_admits`]);
-/// this machine's fleet rows no roster row matches by identity and none holds by label, as
-/// the sync adds them. A store whose last sync left a commit to recover reads due first
-/// (its own `recovery`), as the sync recovers before reading its fleet or default admission.
-///
-/// # Errors
-/// As the sync's reads: the fleet, roster or pool's store is refused, or a kept roster's
-/// machine id is unknown.
-fn cli_sync_due(
+struct CliResyncRead {
+    available: bool,
+    due: Result<Vec<String>, String>,
+}
+
+fn read_cli_resync(
     cli: Cli,
-    home: &Path,
     state_dir: &Path,
     config: &Path,
     now: i64,
-) -> Result<Vec<String>, String> {
-    let roster_path = accounts::roster_beside_for(config, cli)
-        .ok_or_else(|| format!("{} has no directory", config.display()))?;
-    let by_default = !roster_path.is_file();
-    if by_default && !syncs_by_default(cli) {
-        return Ok(Vec::new());
-    }
-    let store = accounts::Store::at_for(state_dir, cli, home);
-    if store.sync_needs_recovery() {
-        return Ok(vec!["recovery".to_owned()]);
-    }
-    let env = quiet_env(home, state_dir, config, now);
-    let Some((fleet, pool_ctx, machine)) =
-        load_cli_fleet_source(cli, &env, home, None, None, &fetch_source_text)?
-    else {
-        return Ok(Vec::new());
+    sources: &mut ResyncSources<'_>,
+    due_allowed: &mut Option<bool>,
+) -> CliResyncRead {
+    let absent = || CliResyncRead {
+        available: false,
+        due: Ok(Vec::new()),
     };
+    let refused = |why| CliResyncRead {
+        available: true,
+        due: Err(why),
+    };
+    let Some(roster) = accounts::roster_beside_for(config, cli) else {
+        return CliResyncRead {
+            available: false,
+            due: Err(format!("{} has no directory", config.display())),
+        };
+    };
+    let by_default = !roster.is_file();
+    if by_default && !syncs_by_default(cli) {
+        return absent();
+    }
+    let store = accounts::Store::at_for(state_dir, cli, sources.home);
+    if store.sync_needs_recovery() {
+        return CliResyncRead {
+            available: true,
+            due: Ok(vec!["recovery".to_owned()]),
+        };
+    }
+    let loaded = match sources.load(cli) {
+        Ok(Some(loaded)) => loaded,
+        Ok(None) => return absent(),
+        Err(why) => return refused(why),
+    };
+    let (fleet, pool, machine) = loaded;
     let machine = if by_default {
-        match by_default_admits(&store, &fleet, machine, now)? {
-            Ok(machine) => machine,
-            Err(_) => return Ok(Vec::new()),
+        match by_default_admits(&store, &fleet, machine, now) {
+            Ok(Ok(machine)) => machine,
+            Ok(Err(_)) => return absent(),
+            Err(why) => return refused(why),
         }
     } else {
-        machine.ok_or_else(|| {
-            "could not determine machine id (`m<N>`); pass `--machine m8`".to_owned()
-        })?
+        match machine {
+            Some(machine) => machine,
+            None => {
+                return refused(
+                    "could not determine machine id (`m<N>`); pass `--machine m8`".to_owned(),
+                );
+            }
+        }
     };
-    let (read_from, _) = super::cli::roster_target(&roster_path)?;
+    // Availability admits only the source/default pool. Preserve the due-side Off boundary
+    // before reading a kept roster or its account state, including with a different caller config.
+    if !*due_allowed.get_or_insert_with(|| !accounts_sync_off(Some(config))) {
+        return CliResyncRead {
+            available: true,
+            due: Ok(Vec::new()),
+        };
+    }
+    CliResyncRead {
+        available: true,
+        due: cli_roster_due(cli, &store, &roster, now, &fleet, pool.as_ref(), &machine),
+    }
+}
+
+fn claude_resync_due(
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    now: i64,
+    rediscovery: &std::sync::Mutex<Rediscovery>,
+) -> Vec<String> {
+    // Read whether or not the roster stands, so the read after a sync that wrote it compares
+    // with this one rather than reading every input as new. Claude discovery and scheduling
+    // keep their existing reads; ResyncSources only captures the other CLIs' selected inputs.
+    let called = sync_called_for(
+        home,
+        state_dir,
+        (roster_path, &config_beside(roster_path)),
+        now,
+        rediscovery,
+    );
+    if claude_roster_missing(home, state_dir, roster_path, now) {
+        vec!["the roster is missing".to_owned()]
+    } else if called {
+        vec!["a source it is made from changed or is due a fresh read".to_owned()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn add_cli_resync_due(why: &mut Vec<String>, cli: Cli, due: &Result<Vec<String>, String>) {
+    match due {
+        Ok(added) if added.is_empty() => {}
+        Ok(added) => why.push(format!(
+            "{}'s pool has accounts to add ({})",
+            cli.id(),
+            added.join(", ")
+        )),
+        Err(error) => why.push(format!("{}'s pool cannot be synced: {error}", cli.id())),
+    }
+}
+
+fn cli_roster_due<
+    P: std::borrow::Borrow<super::ai_pool::Pool>,
+    I: std::borrow::Borrow<super::ai_pool::LocalPoolIdentity>,
+>(
+    cli: Cli,
+    store: &accounts::Store,
+    roster_path: &Path,
+    now: i64,
+    fleet: &CliFleet,
+    pool_ctx: Option<&PoolSyncCtx<P, I>>,
+    machine: &str,
+) -> Result<Vec<String>, String> {
+    let (read_from, _) = super::cli::roster_target(roster_path)?;
     let existing_text = accounts::roster_text(&read_from)?.unwrap_or_default();
     let existing = Roster::parse_for(cli, &existing_text)
         .map_err(|why| format!("the roster at {} is refused: {why}", roster_path.display()))?;
     let mut added: Vec<String> = fleet
         .roster
-        .accounts_for_machine(&machine)
+        .accounts_for_machine(machine)
         .into_iter()
         .filter(|acct| {
             !existing
@@ -9911,7 +10023,7 @@ fn cli_sync_due(
         .map(|acct| acct.label.clone())
         .collect();
     if added.is_empty()
-        && let Some(ctx) = &pool_ctx
+        && let Some(ctx) = pool_ctx
     {
         for row in &existing.rows {
             if (row.email.is_some() || row.identity_email.is_some())
@@ -9921,6 +10033,7 @@ fn cli_sync_due(
             }
         }
         if added.is_empty() && (!existing.rows.is_empty() || store.dir.exists()) {
+            let identity = ctx.identity.borrow();
             let home_accounts: BTreeSet<String> = existing
                 .rows
                 .iter()
@@ -9930,12 +10043,12 @@ fn cli_sync_due(
             let (state, _) = store
                 .load(now)
                 .map_err(|why| format!("{}: {why}", store.dir.display()))?;
-            if state.swarm_label.as_deref() != Some(ctx.identity.primary.as_str())
-                || state.swarm_aliases != ctx.identity.aliases
+            if state.swarm_label.as_deref() != Some(identity.primary.as_str())
+                || state.swarm_aliases != identity.aliases
                 || state.home_accounts != home_accounts
                 || pool_execution_pending(&state, &existing.rows, cli, ctx)
             {
-                added.push(ctx.identity.primary.clone());
+                added.push(identity.primary.clone());
             }
         }
     }
@@ -10090,7 +10203,174 @@ fn load_cli_fleet(
 
 /// A fleet [`load_cli_fleet_source`] loaded: the fleet, the pool and local identity where its
 /// source is a pool, and the machine it was read for.
-type LoadedFleet = (CliFleet, Option<PoolSyncCtx>, Option<String>);
+type LoadedFleet<P = super::ai_pool::Pool, I = super::ai_pool::LocalPoolIdentity> =
+    (CliFleet, Option<PoolSyncCtx<P, I>>, Option<String>);
+
+struct LocalCliSource {
+    path: PathBuf,
+    csv: bool,
+}
+
+fn local_cli_source(
+    cli: Cli,
+    home: &Path,
+    present: &mut dyn FnMut(&Path, bool) -> bool,
+) -> Option<LocalCliSource> {
+    let secrets = home.join(".secrets");
+    let pool = secrets.join(super::ai_pool::AI_POOL_FILE);
+    let toml = secrets.join(cli_fleet_file(cli));
+    let claude = (cli == Cli::Claude).then(|| secrets.join(FLEET_ROSTER_FILE));
+    let csv = secrets.join(ACCOUNTS_CSV_FILE);
+    let path = if present(&pool, true) {
+        pool
+    } else if present(&toml, false) {
+        toml
+    } else if let Some(path) = claude.filter(|path| present(path, false)) {
+        path
+    } else if sheet_read_here() && present(&csv, false) {
+        return Some(LocalCliSource {
+            path: csv,
+            csv: true,
+        });
+    } else {
+        return None;
+    };
+    Some(LocalCliSource { path, csv: false })
+}
+
+fn cli_lab_source(cli: Cli, env: &Env, named: Option<&str>) -> Result<Option<CliFleet>, String> {
+    let roster = env
+        .config
+        .as_deref()
+        .and_then(|config| accounts::roster_beside_for(config, cli));
+    Ok(
+        super::alab_roster::chosen(cli, roster.as_deref(), named, env.config.as_deref())?.map(
+            |roster| CliFleet {
+                cli,
+                roster,
+                held: Vec::new(),
+            },
+        ),
+    )
+}
+
+fn parse_cli_source(cli: Cli, chosen: &str, raw: &str) -> Result<CliFleet, String> {
+    if chosen.ends_with(".toml") || raw.trim_start().starts_with('#') || raw.contains("[[account]]")
+    {
+        Ok(CliFleet {
+            cli,
+            roster: FleetRoster::from_toml_for(cli, raw, chosen)?,
+            held: Vec::new(),
+        })
+    } else if sheet_read_here() {
+        parse_accounting_csv_for(cli, raw, chosen)
+    } else {
+        Err(sheet_refused(chosen, cli))
+    }
+}
+
+struct CapturedLocalSource {
+    raw: String,
+    pool: Option<Result<Option<super::ai_pool::Pool>, String>>,
+}
+
+/// Only one availability/due operation owns these observations. They confer no sync authority:
+/// every later probe and every applying sync reopens its inputs through their ordinary paths.
+/// Claude's discovery/scheduler reads are deliberately outside this OTHER_CLIS capture.
+struct ResyncSources<'a> {
+    env: &'a Env,
+    home: &'a Path,
+    read: &'a LocalSourceRead<'a>,
+    presence: BTreeMap<PathBuf, bool>,
+    local: BTreeMap<PathBuf, Result<CapturedLocalSource, String>>,
+    identity: Option<Result<Option<super::ai_pool::LocalPoolIdentity>, String>>,
+}
+
+impl<'a> ResyncSources<'a> {
+    fn new(env: &'a Env, home: &'a Path, read: &'a LocalSourceRead<'a>) -> Self {
+        Self {
+            env,
+            home,
+            read,
+            presence: BTreeMap::new(),
+            local: BTreeMap::new(),
+            identity: None,
+        }
+    }
+
+    fn load(
+        &mut self,
+        cli: Cli,
+    ) -> Result<
+        Option<LoadedFleet<&super::ai_pool::Pool, &super::ai_pool::LocalPoolIdentity>>,
+        String,
+    > {
+        if let Some(fleet) = cli_lab_source(cli, self.env, None)? {
+            let machine = fleet.roster.alab.clone();
+            return Ok(Some((fleet, None, machine)));
+        }
+        let selected = local_cli_source(cli, self.home, &mut |path, pool| {
+            *self.presence.entry(path.to_owned()).or_insert_with(|| {
+                if pool {
+                    pool_entry_present(path)
+                } else {
+                    source_entry_present(path)
+                }
+            })
+        });
+        let Some(selected) = selected else {
+            return Ok(None);
+        };
+        let chosen = selected.path.display().to_string();
+        let captured = self.local.entry(selected.path.clone()).or_insert_with(|| {
+            (self.read)(&selected.path)
+                .map(|raw| CapturedLocalSource { raw, pool: None })
+                .map_err(|why| format!("{}: {why}", selected.path.display()))
+        });
+        let captured = captured.as_mut().map_err(|why| why.clone())?;
+        if selected.csv && !csv_names_column(cli, &captured.raw) {
+            return Ok(None);
+        }
+        let pool = captured.pool.get_or_insert_with(|| {
+            if super::ai_pool::Pool::looks_like_pool(&chosen, &captured.raw) {
+                super::ai_pool::Pool::from_toml(&captured.raw, &chosen).map(Some)
+            } else {
+                Ok(None)
+            }
+        });
+        if let Some(pool) = pool.as_ref().map_err(Clone::clone)? {
+            let identity = self
+                .identity
+                .get_or_insert_with(|| {
+                    super::ai_pool::resolve_local_pool_identity(
+                        Some(self.home),
+                        self.env.config.as_deref(),
+                        None,
+                    )
+                })
+                .as_ref()
+                .map_err(Clone::clone)?;
+            let machine = identity.as_ref().map(|identity| identity.primary.clone());
+            let roster = project_pool_fleet(pool, cli, identity.as_ref());
+            return Ok(Some((
+                CliFleet {
+                    cli,
+                    roster,
+                    held: Vec::new(),
+                },
+                identity
+                    .as_ref()
+                    .map(|identity| PoolSyncCtx { pool, identity }),
+                machine,
+            )));
+        }
+        Ok(Some((
+            parse_cli_source(cli, &chosen, &captured.raw)?,
+            None,
+            machine_for(self.env.config.as_deref(), None),
+        )))
+    }
+}
 
 fn load_cli_fleet_source(
     cli: Cli,
@@ -10100,50 +10380,28 @@ fn load_cli_fleet_source(
     machine_override: Option<&str>,
     fetch: &Fetch<'_>,
 ) -> Result<Option<LoadedFleet>, String> {
-    let roster = env
-        .config
-        .as_deref()
-        .and_then(|config| accounts::roster_beside_for(config, cli));
-    if let Some(roster) =
-        super::alab_roster::chosen(cli, roster.as_deref(), source, env.config.as_deref())?
-    {
-        let machine = roster.alab.clone();
-        return Ok(Some((
-            CliFleet {
-                cli,
-                roster,
-                held: Vec::new(),
-            },
-            None,
-            machine,
-        )));
+    if let Some(fleet) = cli_lab_source(cli, env, source)? {
+        let machine = fleet.roster.alab.clone();
+        return Ok(Some((fleet, None, machine)));
     }
     let (chosen, raw) = match source.map(str::trim).filter(|s| !s.is_empty()) {
         Some(named) => (named.to_owned(), fetch(env, named)?),
         None => {
-            let secrets = home.join(".secrets");
-            let pool = secrets.join(super::ai_pool::AI_POOL_FILE);
-            let toml = secrets.join(cli_fleet_file(cli));
-            let claude_fleet = (cli == Cli::Claude).then(|| secrets.join(FLEET_ROSTER_FILE));
-            let csv = secrets.join(ACCOUNTS_CSV_FILE);
-            let read = |path: &Path| {
-                read_local_source_text(path).map_err(|why| format!("{}: {why}", path.display()))
-            };
-            if pool_entry_present(&pool) {
-                (pool.display().to_string(), read(&pool)?)
-            } else if source_entry_present(&toml) {
-                (toml.display().to_string(), read(&toml)?)
-            } else if let Some(path) = claude_fleet.filter(|p| source_entry_present(p)) {
-                (path.display().to_string(), read(&path)?)
-            } else if sheet_read_here() && source_entry_present(&csv) {
-                let text = read(&csv)?;
-                if !csv_names_column(cli, &text) {
-                    return Ok(None);
+            let Some(selected) = local_cli_source(cli, home, &mut |path, pool| {
+                if pool {
+                    pool_entry_present(path)
+                } else {
+                    source_entry_present(path)
                 }
-                (csv.display().to_string(), text)
-            } else {
+            }) else {
+                return Ok(None);
+            };
+            let raw = read_local_source_text(&selected.path)
+                .map_err(|why| format!("{}: {why}", selected.path.display()))?;
+            if selected.csv && !csv_names_column(cli, &raw) {
                 return Ok(None);
             }
+            (selected.path.display().to_string(), raw)
         }
     };
     if super::ai_pool::Pool::looks_like_pool(&chosen, &raw) {
@@ -10165,20 +10423,7 @@ fn load_cli_fleet_source(
             machine,
         )));
     }
-    let fleet = if chosen.ends_with(".toml")
-        || raw.trim_start().starts_with('#')
-        || raw.contains("[[account]]")
-    {
-        CliFleet {
-            cli,
-            roster: FleetRoster::from_toml_for(cli, &raw, &chosen)?,
-            held: Vec::new(),
-        }
-    } else if sheet_read_here() {
-        parse_accounting_csv_for(cli, &raw, &chosen)?
-    } else {
-        return Err(sheet_refused(&chosen, cli));
-    };
+    let fleet = parse_cli_source(cli, &chosen, &raw)?;
     let machine = machine_for(env.config.as_deref(), machine_override);
     Ok(Some((fleet, None, machine)))
 }

@@ -167,7 +167,7 @@ Components: main universe restricted multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 ";
 
-/// The development libraries the X11, Wayland and xkb code links or loads (the winit fork, softbuffer, x11-dl's `build.rs` probes, wgpu's GL and Vulkan loaders), installed for both architectures.
+/// The development libraries the X11, Wayland and xkb code links or loads (the winit fork, softbuffer, x11-dl's `build.rs` probes, wgpu's GL and Vulkan loaders), plus the GNU Git source build's headers, installed for both architectures.
 pub const DEV_LIBRARIES: &[&str] = &[
     "libx11-dev",
     "libx11-xcb-dev",
@@ -186,15 +186,22 @@ pub const DEV_LIBRARIES: &[&str] = &[
     "libegl-dev",
     "libgl-dev",
     "libvulkan-dev",
+    "libcurl4-openssl-dev",
+    "libpcre2-dev",
+    "libexpat1-dev",
+    "zlib1g-dev",
 ];
 
 /// Mesa's software drivers, installed for both architectures: llvmpipe (GL) and lavapipe (Vulkan), the lane's GPU.
 pub const MESA: &[&str] = &["libgl1-mesa-dri", "libegl-mesa0", "mesa-vulkan-drivers"];
 
 /// The guest's own tools: the build, the display servers, the second X client of the clipboard round trip, the baseline's input and probe tools (xdotool's XTEST keys and pointer, xset and xrdb, xdpyinfo, wayland-info, wl-clipboard's second Wayland client, ibus as the XIM server, GNOME Shell, whose IBus bridge is the one input method that reaches Mutter's text-input-v3, and pipewire, without which Mutter has no screencast, the space RemoteDesktop places a finger in), the session bus and the accessibility bus, Orca with speech-dispatcher (whose dummy output module answers speech with no audio device) and x11-utils' xev (the window an Orca row has Mutter frame before aterm-gui starts, [`crate::linux_a11y::FRAMES_PRIMER`]) and xdg-desktop-portal with its GTK backend (the Settings portal aterm's motion read asks), the GPU probes, fonts (a stock Ubuntu desktop's: Noto CJK and Noto Color Emoji are the CJK and colour faces aterm-render's script and emoji tests need, and without them those answer COULD NOT RUN), the x86_64 cross toolchain with its libc, zsh and fish, the shells aterm integrates beside bash, whose integration tests run each one and cannot run without it (apt's fish, 3.7 on noble, is the fish floor lane, docs/DESIGN-init-system-2026-10-20.md §6.2: the guest never takes the pinned 4.9.3 `verify provision` builds on macOS; pwsh, the fourth, is [`PWSH`], Microsoft's release archive held to its sha256), the build tools [`BASH_INSTALL`] needs beyond build-essential (patch, which applies GNU's official patches, autotools-dev's `config.guess` and `config.sub`, which know aarch64 where 3.2's own do not, and bison, which 3.2's 2006 build files need), unzip, which `verify provision` unpacks the browser lane's pinned browsers with, sway (headless wlroots: the one lane compositor that grants server-side decorations and offers cursor-shape-v1 and a virtual pointer, for `linux edges`), grim (its screenshot, for the shadow margin's pixels), GStreamer's pipewire source and PNG encoder (a frame of Mutter's screencast, the pixels a Mutter CPU row is held to), ibus-libpinyin (a CJK engine with a preedit, for XIM), xtrace (a proxy display that logs an X11 client's requests, for the baseline's `x11.wire.*` lines, [`crate::linux_xwire`]), and python3 and openssl, the install_sh tests' floor for install.sh's embedded verifier (Python 3.11+, OpenSSL 3: docs/DESIGN-init-system-2026-10-20.md §6.1 row 14).
+/// GNU Git source packaging also needs `patchelf` for ELF relocation and `xz-utils` for its pinned source archive.
 pub const TOOLS: &[&str] = &[
     "build-essential",
     "pkg-config",
+    "patchelf",
+    "xz-utils",
     "ca-certificates",
     "curl",
     "unzip",

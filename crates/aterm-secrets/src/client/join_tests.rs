@@ -57,6 +57,16 @@ fn serve_holding(store: &Path, hold: Duration) -> crate::server::Running {
     .expect("server starts")
 }
 
+struct EndServer(Option<crate::server::Running>);
+
+impl Drop for EndServer {
+    fn drop(&mut self) {
+        if let Some(server) = self.0.take() {
+            server.stop();
+        }
+    }
+}
+
 /// The team vault `ma` makes at `server`: its admin, its pinned URL and its join password.
 fn team(root: &Path, server: &crate::server::Running) -> (Paths, String, SecretBytes) {
     let admin = Paths::for_home(&root.join("ma"));
@@ -3261,15 +3271,6 @@ fn a_route_asks_pending_members_without_waiting_for_the_vault_long_poll() {
     use std::os::unix::net::UnixStream;
     use std::sync::Arc;
 
-    struct EndServer(Option<crate::server::Running>);
-    impl Drop for EndServer {
-        fn drop(&mut self) {
-            if let Some(server) = self.0.take() {
-                server.stop();
-            }
-        }
-    }
-
     let cases: &[bool] = if cfg!(target_os = "macos") {
         &[false, true]
     } else {
@@ -3390,10 +3391,13 @@ fn a_route_asks_pending_members_without_waiting_for_the_vault_long_poll() {
                             &|_| {},
                             &|| stop.load(Ordering::SeqCst),
                             &hearing,
-                            &projection::Projection::new(&Converging {
-                                start: &|_, _| None,
-                                routes: &crate::server::route_sources,
-                            }),
+                            &projection::Projection::new(
+                                me,
+                                &Converging {
+                                    start: &|_, _| None,
+                                    routes: &crate::server::route_sources,
+                                },
+                            ),
                             maintain,
                         )
                     },
@@ -3458,15 +3462,6 @@ fn a_broker_arrival_asks_pending_members_without_a_route_change() {
     use aterm_uds::lan::wire::{self, Frame, Reader};
     use std::os::unix::net::UnixListener;
 
-    struct EndServer(Option<crate::server::Running>);
-    impl Drop for EndServer {
-        fn drop(&mut self) {
-            if let Some(server) = self.0.take() {
-                server.stop();
-            }
-        }
-    }
-
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let server = serve_holding(&root.path().join("store"), Duration::from_secs(600));
     let (_admin, mb, alab) = waiting_for_alab(root.path(), &server);
@@ -3524,10 +3519,13 @@ fn a_broker_arrival_asks_pending_members_without_a_route_change() {
                                 &|_| {},
                                 &|| stop.load(Ordering::SeqCst),
                                 &hearing,
-                                &projection::Projection::new(&Converging {
-                                    start: &|_, _| None,
-                                    routes: &crate::server::route_sources,
-                                }),
+                                &projection::Projection::new(
+                                    me,
+                                    &Converging {
+                                        start: &|_, _| None,
+                                        routes: &crate::server::route_sources,
+                                    },
+                                ),
                                 maintain,
                             )
                         },
@@ -3620,6 +3618,7 @@ fn member_route_wakes_preserve_sharing_holds_and_revocation() {
             routes: &|| [None; 3],
         };
         let projection = projection::Projection::observing(
+            &mb,
             &ports,
             ConvergenceInputs::new(Box::new(|_| panic!("maintenance reads no readiness")))
                 .with_maintenance(Box::new(move || {
@@ -3645,7 +3644,12 @@ fn member_route_wakes_preserve_sharing_holds_and_revocation() {
                     member_routes::ProjectionEvent::Observe
                         | member_routes::ProjectionEvent::Recovered
                 ) {
-                    observations.fetch_add(1, Ordering::SeqCst);
+                    if off {
+                        // Even a dispatched look cannot read readiness through sharing Off.
+                        projection.poll();
+                    } else {
+                        observations.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
             },
             move |most| {
@@ -3702,7 +3706,7 @@ fn member_admission_projects_after_the_previous_runner_without_releasing_the_lon
             start: &start,
             routes: &|| [None; 3],
         };
-        let projection = projection::Projection::new(&ports);
+        let projection = projection::Projection::new(&mb, &ports);
         let stop = AtomicBool::new(false);
         let (route, routes) = std::sync::mpsc::channel();
         let (handled, handling) = std::sync::mpsc::channel();
@@ -3811,6 +3815,13 @@ fn local_inputs_restart_subscriber_projection_while_http_and_retry_time_stand_st
             let ready = root.path().join("input-ready");
             let observed = ready.clone();
             let (polled, polling) = std::sync::mpsc::channel();
+            let (completed, completing) = std::sync::mpsc::channel();
+            let (held, holding) = std::sync::mpsc::channel();
+            let log = |line: &str| {
+                if line.starts_with("sharing is off") && line.contains("convergence") {
+                    held.send(()).unwrap();
+                }
+            };
             let mut previous = false;
             let inputs = ConvergenceInputs::new(Box::new(move |_| {
                 let now = observed.is_file();
@@ -3839,9 +3850,12 @@ fn local_inputs_restart_subscriber_projection_while_http_and_retry_time_stand_st
                 start: &start,
                 routes: &|| [None; 3],
             };
-            let projection = projection::Projection::observing(&ports, inputs).at_clock(|| 0);
+            let projection = projection::Projection::observing(&mb, &ports, inputs)
+                .logging(&log)
+                .at_clock(|| 0);
             let stop = AtomicBool::new(false);
             std::thread::scope(|scope| {
+                let mut server = EndServer(Some(server));
                 let _stops = StopsOnDrop(&stop);
                 let subscriber = scope.spawn(|| {
                     let hearing = deaf();
@@ -3849,10 +3863,13 @@ fn local_inputs_restart_subscriber_projection_while_http_and_retry_time_stand_st
                         &mb,
                         &hearing.members,
                         &|_| Ok(0),
-                        &|_| {},
+                        &log,
                         &|admitted| match admitted {
                             member_routes::ProjectionEvent::Admitted => projection.admitted(),
-                            member_routes::ProjectionEvent::Observe => projection.poll(),
+                            member_routes::ProjectionEvent::Observe => {
+                                projection.poll();
+                                completed.send(()).unwrap();
+                            }
                             member_routes::ProjectionEvent::Recovered => projection.recovered(),
                             member_routes::ProjectionEvent::Maintenance => projection.maintain(),
                             member_routes::ProjectionEvent::BrokerReady
@@ -3874,7 +3891,9 @@ fn local_inputs_restart_subscriber_projection_while_http_and_retry_time_stand_st
                         },
                     )
                 });
-                until("the real vault long-poll is held", || server.waiting() == 1);
+                until("the real vault long-poll is held", || {
+                    server.0.as_ref().unwrap().waiting() == 1
+                });
                 until("the first runner is reaped", || {
                     let pid = pid.load(Ordering::SeqCst);
                     pid != 0
@@ -3897,19 +3916,57 @@ fn local_inputs_restart_subscriber_projection_while_http_and_retry_time_stand_st
                         1,
                         "unchanged input spends no retry"
                     );
+                    let config = mb.home.join(".config/aterm/aterm.toml");
+                    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+                    crate::fsx::write_owned_in_place(&config, "[swarm]\nenabled = false\n");
+                    holding.recv_timeout(HANG_DETECTOR).unwrap();
+                    while polling.try_recv().is_ok() {}
+                    assert_eq!(starts.load(Ordering::SeqCst), 1, "off starts no job");
+                    crate::fsx::write_owned_in_place(&config, "[swarm]\nenabled = true\n");
+                    // Off dispatches finish too, but only an admitted capture signals polled.
+                    polling.recv_timeout(HANG_DETECTOR).unwrap();
+                    while completing.try_recv().is_ok() {}
+                    completing.recv_timeout(HANG_DETECTOR).unwrap();
+                    assert_eq!(
+                        starts.load(Ordering::SeqCst),
+                        2,
+                        "re-enabling sharing owes readback with unchanged inputs and HTTP"
+                    );
+                    // The HTTP owner can see an Off interval shorter than the listener's
+                    // look. Both use this same serialized gate and retained activation.
+                    crate::fsx::write_owned_in_place(&config, "[swarm]\nenabled = false\n");
+                    assert!(!projection.allowed());
+                    crate::fsx::write_owned_in_place(&config, "[swarm]\nenabled = true\n");
+                    assert!(projection.allowed());
+                    projection.resume();
+                    assert_eq!(starts.load(Ordering::SeqCst), 3);
+                    projection.resume();
+                    completing.recv_timeout(HANG_DETECTOR).unwrap();
+                    assert_eq!(
+                        starts.load(Ordering::SeqCst),
+                        3,
+                        "a concurrent listener and repeated healthy resume owe no second boundary"
+                    );
                 }
                 let mut expected = vec![crate::converge::RepositoryWork::Refresh];
                 if changed {
                     expected.push(crate::converge::RepositoryWork::Repair);
+                } else {
+                    expected.push(crate::converge::RepositoryWork::Refresh);
+                    expected.push(crate::converge::RepositoryWork::Refresh);
                 }
                 assert_eq!(
                     *work_seen.lock().unwrap(),
                     expected,
                     "exit={exit}, changed={changed}"
                 );
-                assert_eq!(server.waiting(), 1, "no HTTP response or timer advanced");
+                assert_eq!(
+                    server.0.as_ref().unwrap().waiting(),
+                    1,
+                    "no HTTP response or timer advanced"
+                );
                 stop.store(true, Ordering::SeqCst);
-                server.stop();
+                server.0.take().unwrap().stop();
                 subscriber.join().unwrap().unwrap();
             });
         }
@@ -3955,7 +4012,7 @@ fn a_failed_readiness_round_recovers_local_inputs_while_http_is_held() {
         start: &start,
         routes: &|| [None; 3],
     };
-    let projection = projection::Projection::observing(&ports, inputs).at_clock(|| 0);
+    let projection = projection::Projection::observing(&mb, &ports, inputs).at_clock(|| 0);
     let stop = AtomicBool::new(false);
     let (fail, failing) = mpsc::channel();
     let resumed = std::thread::scope(|scope| {

@@ -2141,14 +2141,14 @@ impl Scene {
             .collect()
     }
 
-    fn run_rels(&self, f: Figure, reference: RefFigure) -> Vec<Option<f64>> {
+    fn run_rels(&self, f: Figure, reference: RefFigure) -> Vec<Option<(f64, &Run)>> {
         self.runs
             .iter()
             .map(|run| {
                 let mut refs: Vec<f64> = run.refs.iter().filter_map(reference).collect();
                 let mut scene: Vec<f64> = run.samples.iter().filter_map(f).collect();
                 (!refs.is_empty() && !scene.is_empty())
-                    .then(|| pct(&mut refs, 50.0) / pct(&mut scene, 50.0).max(1.0))
+                    .then(|| (pct(&mut refs, 50.0) / pct(&mut scene, 50.0).max(1.0), run))
             })
             .collect()
     }
@@ -2379,15 +2379,20 @@ impl Scene {
             let Some(mut rels) = self
                 .run_rels(f, reference)
                 .into_iter()
-                .collect::<Option<Vec<f64>>>()
+                .collect::<Option<Vec<_>>>()
             else {
                 fail(format!(
                     "a {s} run drew no reference frame to calibrate {what} against"
                 ));
             };
-            r.num(format!("{s}_{what}_rel"), pct(&mut rels, 50.0));
-            let lo = rels.iter().copied().fold(f64::INFINITY, f64::min);
-            let hi = rels.iter().copied().fold(0.0, f64::max);
+            let key = format!("{s}_{what}_rel");
+            let (value, run) = median_ratio(&mut rels);
+            r.num(&key, value);
+            if what == "gpu" {
+                report_ratio_point(r, &key, run);
+            }
+            let lo = rels.iter().map(|x| x.0).fold(f64::INFINITY, f64::min);
+            let hi = rels.iter().map(|x| x.0).fold(0.0, f64::max);
             r.num(
                 format!("{s}_{what}_rel_spread"),
                 hi / lo.max(f64::MIN_POSITIVE),
@@ -2441,6 +2446,66 @@ impl Scene {
     }
 }
 
+/// Retain the observation that supplied the nearest-rank median, including its calibration.
+fn median_ratio<'a>(values: &mut [(f64, &'a Run)]) -> (f64, &'a Run) {
+    values.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    values[(values.len() - 1) / 2]
+}
+
+fn report_ratio_point(r: &mut Report, key: &str, run: &Run) {
+    for (name, figure) in [
+        (
+            "ref_gpu_p50_us",
+            (|x: &RefSample| x.gpu_ns) as fn(&RefSample) -> Option<u64>,
+        ),
+        (
+            "ref_blank_gpu_p50_us",
+            (|x: &RefSample| x.blank_gpu_ns) as fn(&RefSample) -> Option<u64>,
+        ),
+    ] {
+        let mut values: Vec<_> = run.refs.iter().filter_map(figure).map(ns).collect();
+        if !values.is_empty() {
+            r.num(format!("{key}_{name}"), pct(&mut values, 50.0) / 1_000.0);
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn the_median_keeps_its_own_calibration_through_sorting() {
+    let runs: Vec<_> = (1..=5)
+        .map(|i| Run {
+            refs: vec![RefSample {
+                gpu_ns: Some(i * 100_000),
+                blank_gpu_ns: Some(i * 10_000),
+                ..RefSample::default()
+            }],
+            ..Run::default()
+        })
+        .collect();
+    // The median ratio's reference is 500 us; the pooled reference median is 300 us.
+    let observations = [
+        (9.0, &runs[0]),
+        (1.0, &runs[1]),
+        (7.0, &runs[2]),
+        (2.0, &runs[3]),
+        (4.0, &runs[4]),
+    ];
+    for shift in 0..observations.len() {
+        let mut values = observations.to_vec();
+        values.rotate_left(shift);
+        let (value, run) = median_ratio(&mut values);
+        assert_eq!(value, 4.0);
+        let mut report = Report::default();
+        report_ratio_point(&mut report, "scene_gpu_rel", run);
+        assert_eq!(report.get("scene_gpu_rel_ref_gpu_p50_us"), "500.000");
+        assert_eq!(report.get("scene_gpu_rel_ref_blank_gpu_p50_us"), "50.000");
+        // Even counts use the same lower nearest-rank median as pct(..., 50).
+        let (even, _) = median_ratio(&mut values[..4]);
+        assert_eq!(even, 2.0);
+    }
+}
+
 fn report_reference(r: &mut Report, scenes: &[Scene], clocked: bool, counted: bool) {
     let all = || {
         scenes
@@ -2481,7 +2546,7 @@ fn report_reference(r: &mut Report, scenes: &[Scene], clocked: bool, counted: bo
     let mut blank: Vec<f64> = all().filter_map(|x| x.blank_gpu_ns.map(ns)).collect();
     r.num("ref_blank_gpu_p50_us", us(pct(&mut blank, 50.0)));
     r.num("ref_blank_gpu_p95_us", us(pct(&mut blank, 95.0)));
-    let mut rels: Vec<f64> = scenes
+    let mut rels: Vec<_> = scenes
         .iter()
         .flat_map(|scene| &scene.runs)
         .filter_map(|run| {
@@ -2492,15 +2557,17 @@ fn report_reference(r: &mut Report, scenes: &[Scene], clocked: bool, counted: bo
                 .filter_map(|x| x.blank_gpu_ns.map(ns))
                 .collect();
             (!text.is_empty() && !blank.is_empty())
-                .then(|| pct(&mut blank, 50.0) / pct(&mut text, 50.0).max(1.0))
+                .then(|| (pct(&mut blank, 50.0) / pct(&mut text, 50.0).max(1.0), run))
         })
         .collect();
     if rels.is_empty() {
         fail("no run drew a reference frame to calibrate the reference against");
     }
-    r.num("ref_text_gpu_rel", pct(&mut rels, 50.0));
-    let lo = rels.iter().copied().fold(f64::INFINITY, f64::min);
-    let hi = rels.iter().copied().fold(0.0, f64::max);
+    let (value, run) = median_ratio(&mut rels);
+    r.num("ref_text_gpu_rel", value);
+    report_ratio_point(r, "ref_text_gpu_rel", run);
+    let lo = rels.iter().map(|x| x.0).fold(f64::INFINITY, f64::min);
+    let hi = rels.iter().map(|x| x.0).fold(0.0, f64::max);
     r.num("ref_text_gpu_rel_spread", hi / lo.max(f64::MIN_POSITIVE));
 }
 

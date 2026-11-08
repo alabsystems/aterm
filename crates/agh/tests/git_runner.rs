@@ -24,6 +24,8 @@ use agh_fake::{FakeGithub, FakeOrigin, RepoSpec};
 
 use crate::common;
 
+mod commit_ancestry_tests;
+
 /// A host `git` command in `dir`, under a cleared environment holding only what makes it
 /// hermetic: no system or global config, a fixed author, committer and date.
 pub(crate) fn host_git(dir: &Path, args: &[&str]) -> String {

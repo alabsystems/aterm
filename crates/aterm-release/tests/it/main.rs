@@ -19,6 +19,11 @@
 // drive-cache drain only a power loss shows.
 aterm_durable::plain_durable_flushes_in_tests!();
 
+// Every git this binary runs, the cutter's own included, reads no configuration of the machine
+// it runs on: a host's `insteadOf`, commit signing, hooks path, ignore rules or attributes would
+// change what its engine fixtures see.
+mod hermetic_git;
+
 #[path = "../../src/accepted_measure.rs"]
 #[allow(dead_code)]
 mod accepted_measure;
@@ -58,6 +63,9 @@ mod cli;
 #[path = "../../src/credential_wait.rs"]
 #[allow(dead_code)]
 mod credential_wait;
+#[path = "../../src/cut_timing.rs"]
+#[allow(dead_code)]
+mod cut_timing;
 #[path = "../../src/cutter.rs"]
 #[allow(dead_code)]
 mod cutter;
@@ -208,6 +216,8 @@ mod durable_post_intent_model;
 mod export_policy;
 mod handoff_policy_bundle;
 mod hooks;
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+mod host_git;
 mod journal_prefix_model;
 mod ledger_race;
 mod machine_roster;

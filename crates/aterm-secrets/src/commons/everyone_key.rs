@@ -16,8 +16,8 @@ use crate::membership_log::RecordId;
 use std::fmt;
 use zeroize::Zeroizing;
 
-/// How long [`newest`] waits on a writer holding the local membership history.
-const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Hang detector for a required read of the authenticated local membership history.
+const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The newest `[everyone]` epoch's id and key. Its `Debug` prints the id only.
 pub struct EveryoneKey {
@@ -40,7 +40,14 @@ impl fmt::Debug for EveryoneKey {
 /// # Errors
 /// As [`newest_until`].
 pub fn newest(paths: &crate::client::Paths) -> crate::Result<Option<EveryoneKey>> {
-    newest_until(paths, std::time::Instant::now() + BUSY_WAIT)
+    newest_started(paths, std::time::Instant::now())
+}
+
+fn newest_started(
+    paths: &crate::client::Paths,
+    started: std::time::Instant,
+) -> crate::Result<Option<EveryoneKey>> {
+    newest_until(paths, started + BUSY_WAIT)
 }
 
 /// The newest `[everyone]` epoch this Mac holds, read from its authenticated local membership
@@ -56,4 +63,53 @@ pub fn newest_until(
 ) -> crate::Result<Option<EveryoneKey>> {
     Ok(crate::client::newest_everyone_until(paths, deadline)?
         .map(|(epoch, key)| EveryoneKey { epoch, key }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_scheduled_writer_preserves_the_newest_everyone_key() {
+        let lab = crate::client::two_log_macs_for_test(&[(
+            crate::text::Audience::Everyone,
+            "epoch-probe",
+            b"fixture",
+        )]);
+        let paths = lab.m22.clone();
+        let expected = newest(&paths).unwrap().unwrap();
+        let held = std::rc::Rc::new(std::cell::RefCell::new(Some(
+            crate::client::test_hold_state_lock(&paths).unwrap(),
+        )));
+        let release = std::rc::Rc::clone(&held);
+        crate::client::OBSERVE_BLOCKED.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                release.borrow_mut().take();
+            }));
+        });
+        let observed = newest_started(
+            &paths,
+            std::time::Instant::now() - std::time::Duration::from_secs(11),
+        );
+        crate::client::OBSERVE_BLOCKED.with(|hook| hook.borrow_mut().take());
+        let observed = observed.unwrap().unwrap();
+        assert!(held.borrow().is_none());
+        assert_eq!(observed.epoch, expected.epoch);
+        assert!(*observed.key == *expected.key);
+
+        let owner = crate::client::test_hold_state_lock(&paths).unwrap();
+        for refused in [
+            newest_started(
+                &paths,
+                std::time::Instant::now() - std::time::Duration::from_secs(61),
+            ),
+            newest_until(&paths, std::time::Instant::now()),
+        ] {
+            assert_eq!(refused.unwrap_err().kind(), crate::ErrorKind::VaultBusy);
+        }
+        drop(owner);
+        let fresh = newest(&paths).unwrap().unwrap();
+        assert_eq!(fresh.epoch, expected.epoch);
+        assert!(*fresh.key == *expected.key);
+    }
 }

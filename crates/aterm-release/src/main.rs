@@ -22,6 +22,7 @@ mod cli;
 
 mod credential_wait;
 
+mod cut_timing;
 mod cutter;
 
 mod dev_app;

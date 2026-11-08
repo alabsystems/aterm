@@ -310,9 +310,11 @@ impl ReleaseOptions {
     /// `args` (a process's own, after the program) as R's frozen cutter receives them on exec:
     /// each path flag's value replaced by these options'; `--fix` with its commits left out,
     /// since the new image resumes the head the journal names (the hops are made); and
-    /// `--engine` with its directory left out, since the exec'd image receives this release's own
-    /// engine as `PUBLICATION_ENGINE` ([`crate::gates::engine_copy`]), and a cutter older than that
-    /// copy would run and sync the directory `--engine` named in place.
+    /// `--engine` with its directory left out, since the exec'd image is handed the engine source
+    /// this release took (`ATERM_RELEASE_ENGINE_SOURCE`) and the repository it captured, beside
+    /// this release's own engine as `PUBLICATION_ENGINE` ([`crate::gates::engine_copy`]), which a
+    /// cutter older than that handover takes, and a cutter older than that copy would run and sync
+    /// the directory `--engine` named in place.
     #[must_use]
     pub fn exec_args(&self, args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
         let value = |flag: &str| match flag {
@@ -1394,6 +1396,9 @@ pub trait Backend {
     fn own_cutter(&mut self, commit: &str) -> Result<String, crate::cutter::NotOwn>;
     fn frozen_commit(&mut self) -> Option<String> {
         None
+    }
+    fn cutter_recovery(&mut self, _commit: &str) -> crate::release_tools::Recovery {
+        crate::release_tools::Recovery::Initial
     }
     /// Build, freeze and prove R's tools, then replace this image with its cutter. A real
     /// success never returns; `Ok(())` is only a model backend's representation of that edge.
@@ -3839,9 +3844,12 @@ impl Run<'_> {
         match self.b.own_cutter(&r) {
             Ok(_) => Ok(()),
             Err(not) => {
-                if self.claim.as_ref().is_some_and(|c| c.continued)
-                    && self.journal.as_ref().is_some_and(|j| j.commit == r)
-                    && self.b.frozen_commit().is_none_or(|commit| commit == r)
+                let recovery = self.b.cutter_recovery(&r);
+                if recovery == crate::release_tools::Recovery::Refuse
+                    || (recovery == crate::release_tools::Recovery::Initial
+                        && self.claim.as_ref().is_some_and(|c| c.continued)
+                        && self.journal.as_ref().is_some_and(|j| j.commit == r)
+                        && self.b.frozen_commit().is_none_or(|commit| commit == r))
                 {
                     return self.refuse(Refusal::new(
                         format!(

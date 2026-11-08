@@ -239,10 +239,21 @@ pub struct Due {
     observed: RefreshObservation,
     /// A pass failed since the last healthy one ([`Due::failed`]).
     failing: bool,
+    /// Automatic work was held. Its next admitted input capture owes fresh readback.
+    activation: bool,
     retry: RunnerRetry,
 }
 
 impl Due {
+    /// Retain readback while automatic work is explicitly held, without reading inputs.
+    pub(crate) fn paused(&mut self) {
+        self.activation = true;
+    }
+
+    pub(crate) fn activation_pending(&self) -> bool {
+        self.activation
+    }
+
     /// Supply the same receipt facts used to bind this round's input transition.
     pub fn observe(&mut self, observed: RefreshObservation) {
         self.observed = observed;
@@ -406,6 +417,12 @@ impl Due {
         last: Last,
     ) -> bool {
         self.reaped(last, now_ms);
+        if std::mem::take(&mut self.activation) {
+            self.request(RepositoryRequest::Refresh(RefreshRequest::after(
+                None,
+                self.observed.version,
+            )));
+        }
         self.pending = merge_requests(self.pending, called);
         // A new Refresh supersedes retained retry inputs before acknowledgment
         // can demote it to Repair. A local Repair alone leaves that retry intact.

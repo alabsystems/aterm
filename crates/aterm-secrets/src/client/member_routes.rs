@@ -284,13 +284,13 @@ impl<C: Changes> Listener<C> {
         if route || broker_ready || now >= self.look {
             self.look = now + LOOK;
             project(ProjectionEvent::Maintenance);
-            if swarm_lets(&mut self.switch, &mut self.held, "member convergence", log) {
-                if self.recovered {
-                    project(ProjectionEvent::Recovered);
-                    self.recovered = false;
-                } else {
-                    project(ProjectionEvent::Observe);
-                }
+            // The projection owns its sharing observation and retained activation debt.
+            // Dispatch while Off too; it returns before capturing private readiness.
+            if self.recovered {
+                project(ProjectionEvent::Recovered);
+                self.recovered = false;
+            } else {
+                project(ProjectionEvent::Observe);
             }
         }
         if self.due.is_none_or(|at| at > Instant::now()) {

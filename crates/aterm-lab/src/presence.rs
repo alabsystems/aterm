@@ -3,149 +3,29 @@
 
 //! `presence-flap --window`.
 
-use std::io::{BufRead as _, Read as _, Write as _};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::instance::{self, CONFIG_OFF, Instance, Launch, Reply, World};
 use crate::screen::field;
 use crate::stop::{self, Stopped};
 use crate::{Fail, LAB, Res};
 
-/// `aterm_messages::chrome::CHROME_REGROW_SETTLE`.
-pub const FLOOR_MS: u64 = 400;
-
 /// The steps, in the order they run.
-pub const PHASES: [char; 6] = ['A', 'H', 'B', 'D', 'T', 'X'];
-
-/// The cross-source schedules of phase X.
-pub const SCHEDULES: [&str; 2] = ["strip-rise-then-bandshrink", "band-rise-then-stripfall"];
-
-/// How long before the band's quiet shrink is due phase X asks the strip's rise
-/// (`strip-rise-then-bandshrink`): instants swept, not a budget.
-const LEADS_MS: [u64; 3] = [350, 100, 20];
-
-/// How long a rise nothing has taken back is waited for before phase X calls its
-/// fall lost: a hang detector, never a budget (the floor is a least gap).
-const HANG: Duration = Duration::from_mins(1);
+pub const PHASES: [char; 5] = ['A', 'H', 'B', 'D', 'T'];
 
 fn sleep(secs: f64) -> Result<(), Stopped> {
     stop::sleep(Duration::try_from_secs_f64(secs).unwrap_or(Duration::ZERO))
 }
 
-/// One resize row of the ledger.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Resize {
-    pub id: u64,
-    pub t: u64,
-    pub from_rows: u32,
-    pub to_rows: u32,
-}
-
-/// A `resize <id> t=<ms> … from=<CxR> to=<CxR> …` row.
+/// The id of a `resize <id> …` ledger row.
 #[must_use]
-pub fn parse_resize(line: &str) -> Option<Resize> {
-    let rest = line.strip_prefix("resize ")?;
-    let id = rest.split_whitespace().next()?.parse().ok()?;
-    let rows = |key: &str| -> Option<u32> { field(line, key)?.split_once('x')?.1.parse().ok() };
-    Some(Resize {
-        id,
-        t: field(line, "t")?.parse().ok()?,
-        from_rows: rows("from")?,
-        to_rows: rows("to")?,
-    })
-}
-
-/// Each shrink paired with the grow that takes it back (the newest open shrink of the opposite sizes), as the gap between them in ms.
-#[must_use]
-pub fn pair_gaps(rows: &[Resize]) -> Vec<u64> {
-    let mut open: Vec<Resize> = Vec::new();
-    let mut gaps = Vec::new();
-    for r in rows {
-        if r.to_rows < r.from_rows {
-            open.push(*r);
-        } else if r.to_rows > r.from_rows
-            && let Some(at) = open
-                .iter()
-                .rposition(|s| s.from_rows == r.to_rows && s.to_rows == r.from_rows)
-        {
-            let s = open.remove(at);
-            gaps.push(r.t.saturating_sub(s.t));
-        }
-    }
-    gaps
-}
-
-/// What one phase X schedule's resize rows (those after its base) show.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Measured {
-    /// Each shrink and the grow that took it back, ms apart.
-    Pairs(Vec<u64>),
-    /// No pair formed because the schedule missed its instant.
-    Missed(String),
-    /// A rise re-gridded the window and nothing took it back.
-    Stuck(String),
-}
-
-/// Reads one schedule's resize rows in the ledger's own order, so the verdict never rests on how fast the host ran the schedule.
-#[must_use]
-pub fn measure(rows: &[Resize]) -> Measured {
-    let gaps = pair_gaps(rows);
-    if !gaps.is_empty() {
-        return Measured::Pairs(gaps);
-    }
-    let shrink = rows.iter().find(|r| r.to_rows < r.from_rows);
-    let grow = rows.iter().find(|r| r.to_rows > r.from_rows);
-    match (shrink, grow) {
-        (Some(s), Some(g)) if g.id < s.id => Measured::Missed(format!(
-            "the fall landed first (resize {} t={}), the rise {} ms after it (resize {} t={})",
-            g.id,
-            g.t,
-            s.t.saturating_sub(g.t),
-            s.id,
-            s.t
-        )),
-        (Some(s), _) => Measured::Stuck(format!(
-            "resize {} t={} rows {} -> {}: no grow took it back",
-            s.id, s.t, s.from_rows, s.to_rows
-        )),
-        (None, _) => Measured::Missed(format!(
-            "no rise re-gridded the window ({} resize rows)",
-            rows.len()
-        )),
-    }
-}
-
-/// A phase X sweep's verdict.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Verdict {
-    /// Every pair landed the floor apart.
-    Held(u64),
-    /// The closest pair, in ms, is under the floor.
-    Under(u64),
-    /// A rise nothing took back.
-    Stuck(String),
-    /// No run formed a pair.
-    NotMeasured(String),
-}
-
-/// Judges a sweep (one or more runs of a schedule) whole.
-#[must_use]
-pub fn judge_sweep(runs: &[Measured]) -> Verdict {
-    let mut gaps = Vec::new();
-    let mut missed = Vec::new();
-    for m in runs {
-        match m {
-            Measured::Pairs(g) => gaps.extend_from_slice(g),
-            Measured::Missed(why) => missed.push(why.as_str()),
-            Measured::Stuck(why) => return Verdict::Stuck(why.clone()),
-        }
-    }
-    match gaps.iter().min().copied() {
-        Some(min) if min + 1 >= FLOOR_MS => Verdict::Held(min),
-        Some(min) => Verdict::Under(min),
-        None => Verdict::NotMeasured(format!("no pair formed: {}", missed.join("; "))),
-    }
+pub fn parse_resize(line: &str) -> Option<u64> {
+    line.strip_prefix("resize ")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// The phases `--phases` names (`"A H"`, `"A,H"` or `"AH"`).
@@ -157,7 +37,7 @@ pub fn parse_phases(spec: &str) -> Result<Vec<char>, String> {
     for c in spec.chars().filter(|c| !c.is_whitespace() && *c != ',') {
         let c = c.to_ascii_uppercase();
         if !PHASES.contains(&c) {
-            return Err(format!("unknown phase: {c} (A, H, B, D, T, X)"));
+            return Err(format!("unknown phase: {c} (A, H, B, D, T)"));
         }
         if !out.contains(&c) {
             out.push(c);
@@ -204,84 +84,17 @@ fn failed(asked: &str, r: &Reply) -> String {
     )
 }
 
-/// A `resizes` reply's rows.
+/// A `resizes` reply's resize row ids.
 ///
 /// # Errors
 /// The reply failed or carried no `OK` header: its words ([`failed`]), never an
 /// empty ledger.
-fn ledger_rows(asked: &str, r: &Reply) -> Result<Vec<Resize>, String> {
+fn ledger_rows(asked: &str, r: &Reply) -> Result<Vec<u64>, String> {
     if r.code != 0 || r.header().is_empty() {
         return Err(failed(asked, r));
     }
     Ok(r.stdout.lines().filter_map(parse_resize).collect())
 }
-
-/// One held control connection: a schedule's requests go out milliseconds
-/// apart, or pipelined in one write.
-struct Held {
-    w: aterm_uds::CtlStream,
-    r: std::io::BufReader<aterm_uds::CtlStream>,
-}
-
-impl Held {
-    fn open(inst: &Instance) -> Result<Held, String> {
-        let client = inst.connect()?;
-        let w = client
-            .transport()
-            .try_clone()
-            .map_err(|e| format!("cannot share the connection: {e}"))?;
-        let r = w
-            .try_clone()
-            .map_err(|e| format!("cannot share the connection: {e}"))?;
-        let _ = r.set_read_timeout(Some(Duration::from_secs(60)));
-        Ok(Held {
-            w,
-            r: std::io::BufReader::new(r),
-        })
-    }
-
-    fn send(&mut self, lines: &[&str]) -> Result<(), String> {
-        let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
-        self.w
-            .write_all(text.as_bytes())
-            .map_err(|e| format!("the control connection: {e}"))
-    }
-
-    fn line(&mut self) -> Result<String, String> {
-        const MAX_LINE: usize = 1024 * 1024;
-        let mut l = String::new();
-        match std::io::Read::by_ref(&mut self.r)
-            .take((MAX_LINE as u64) + 1)
-            .read_line(&mut l)
-        {
-            Ok(0) => Err("the control socket closed".into()),
-            Ok(_) if l.len() > MAX_LINE => Err("the control reply exceeds 1 MiB".into()),
-            Ok(_) => Ok(l.trim_end_matches(['\r', '\n']).to_string()),
-            Err(e) => Err(format!("the control connection: {e}")),
-        }
-    }
-
-    fn req(&mut self, line: &str) -> Result<String, String> {
-        self.send(&[line])?;
-        self.line()
-    }
-}
-
-/// Busy-wait to `t`: a schedule's instants are milliseconds wide.
-fn until(t: Instant) -> Result<(), Stopped> {
-    while Instant::now() < t {
-        stop::check()?;
-        std::thread::sleep(Duration::from_micros(500));
-    }
-    Ok(())
-}
-
-fn message_id(reply: &str) -> Option<String> {
-    field(reply, "message").filter(|m| m.chars().all(|c| c.is_ascii_digit()))
-}
-
-/// The band row phase X posts.
-const BAND: &str = "notice post probe sev=warn Probe band row";
 
 struct Probe {
     inst: Instance,
@@ -291,7 +104,6 @@ struct Probe {
     base_risks: String,
     oks: u32,
     fails: u32,
-    unmeasured: u32,
 }
 
 impl Probe {
@@ -311,21 +123,16 @@ impl Probe {
         );
     }
 
-    fn not_measured(&mut self, what: &str, why: &str) {
-        self.unmeasured += 1;
-        println!("{:<4}  {what:<60}  NOT MEASURED: {why}", "--");
-    }
-
     fn status(&self) -> String {
         self.ctl(&["status"]).first()
     }
 
     /// `resizes since=<since>` (every retained row at 0): the reply and its
-    /// resize rows.
+    /// resize row ids.
     ///
     /// # Errors
     /// The reply gave no reading ([`ledger_rows`]).
-    fn resizes(&self, since: u64) -> Result<(Reply, Vec<Resize>), String> {
+    fn resizes(&self, since: u64) -> Result<(Reply, Vec<u64>), String> {
         let since = format!("since={since}");
         let r = self.ctl(&["resizes", &since]);
         let rows = ledger_rows(&format!("resizes {since}"), &r)?;
@@ -341,7 +148,7 @@ impl Probe {
     /// failed read before a count can only add rows to it.
     fn read_resizes(&mut self, show: bool) -> Result<(String, usize), String> {
         let (r, rows) = self.resizes(self.last)?;
-        if let Some(m) = rows.iter().map(|x| x.id).max() {
+        if let Some(&m) = rows.iter().max() {
             self.last = self.last.max(m);
         }
         if show {
@@ -583,212 +390,6 @@ impl Probe {
         Ok(())
     }
 
-    /// The newest resize row's id now (0: the ledger holds none).
-    ///
-    /// # Errors
-    /// The reply gave no reading ([`ledger_rows`]): never base 0, which would
-    /// measure the whole ledger.
-    fn newest_resize(&self) -> Result<u64, String> {
-        let (_, rows) = self.resizes(0)?;
-        Ok(rows.iter().map(|r| r.id).max().unwrap_or(0))
-    }
-
-    /// What the resize rows after `base` show, each row and pair printed. A rise
-    /// nothing has taken back yet is waited for, up to [`HANG`]. A read that
-    /// gives no reading is passed over: the last reading stands and the ledger
-    /// is polled again in the same wait. The inner `Err`: every read in it failed.
-    fn measured_since(&self, base: u64) -> Result<Result<Measured, String>, Stopped> {
-        let settled = |read: &Result<Vec<Resize>, String>| matches!(read, Ok(rows) if !matches!(measure(rows), Measured::Stuck(_)));
-        let deadline = Instant::now() + HANG;
-        let mut read = self.resizes(base).map(|(_, rows)| rows);
-        while !settled(&read) && Instant::now() < deadline {
-            sleep(0.25)?;
-            let next = self.resizes(base).map(|(_, rows)| rows);
-            if next.is_ok() || read.is_err() {
-                read = next;
-            }
-        }
-        let rows = match read {
-            Ok(rows) => rows,
-            Err(why) => {
-                return Ok(Err(format!(
-                    "every read in {} s failed, the last: {why}",
-                    HANG.as_secs()
-                )));
-            }
-        };
-        for r in &rows {
-            println!(
-                "      resize {} t={} rows {} -> {}",
-                r.id, r.t, r.from_rows, r.to_rows
-            );
-        }
-        let m = measure(&rows);
-        match &m {
-            Measured::Pairs(gaps) => {
-                for g in gaps {
-                    println!("      pair: shrink and its grow back {g} ms apart");
-                }
-            }
-            Measured::Missed(why) => println!("      no pair: {why}"),
-            Measured::Stuck(why) => println!("      no pair: {why} in {} s", HANG.as_secs()),
-        }
-        Ok(Ok(m))
-    }
-
-    /// The tab strip rises `lead` before the band's quiet shrink falls due (its
-    /// `SHRINK_QUIET`, 1.5 s past the dismiss): the band's fall must wait the
-    /// floor past the strip's rise.
-    fn strip_rise_then_bandshrink(
-        &mut self,
-        lead: Duration,
-    ) -> Result<Result<Measured, String>, Stopped> {
-        let mut c = match Held::open(&self.inst) {
-            Ok(c) => c,
-            Err(e) => return Ok(Err(e)),
-        };
-        let posted = match c.req(BAND) {
-            Ok(p) => p,
-            Err(e) => return Ok(Err(e)),
-        };
-        println!("      notice post: {posted}");
-        let Some(mid) = message_id(&posted) else {
-            return Ok(Err(format!("no message id in {posted:?}")));
-        };
-        sleep(0.8)?;
-        let base = match self.newest_resize() {
-            Ok(base) => base,
-            Err(why) => {
-                let r = c
-                    .req(&format!("notice dismiss {mid}"))
-                    .unwrap_or_else(|e| e);
-                println!("      cleanup: dismiss {mid}: {r}");
-                sleep(2.5)?;
-                return Ok(Err(format!("the base read: {why}")));
-            }
-        };
-        let t0 = Instant::now();
-        let r = c
-            .req(&format!("notice dismiss {mid}"))
-            .unwrap_or_else(|e| e);
-        println!("      dismiss: {r}");
-        until(t0 + Duration::from_millis(1500) - lead)?;
-        let at = t0.elapsed();
-        let r = c.req("settings set tab_strip_rows 1").unwrap_or_else(|e| e);
-        println!(
-            "      strip rise asked at dismiss+{:.1} ms, answered at +{:.1} ms: {r}",
-            at.as_secs_f64() * 1000.0,
-            t0.elapsed().as_secs_f64() * 1000.0
-        );
-        sleep(2.5)?;
-        let m = self.measured_since(base)?;
-        let r = c.req("settings unset tab_strip_rows").unwrap_or_else(|e| e);
-        println!("      cleanup: strip down: {r}");
-        sleep(2.5)?;
-        Ok(m)
-    }
-
-    /// A band row rises and the tab strip falls on the next request (one write):
-    /// the strip's fall must wait the floor past the band's rise.
-    fn band_rise_then_stripfall(&mut self) -> Result<Result<Measured, String>, Stopped> {
-        let mut c = match Held::open(&self.inst) {
-            Ok(c) => c,
-            Err(e) => return Ok(Err(e)),
-        };
-        let r = c.req("settings set tab_strip_rows 1").unwrap_or_else(|e| e);
-        println!("      strip up: {r}");
-        sleep(2.5)?;
-        let base = match self.newest_resize() {
-            Ok(base) => base,
-            Err(why) => {
-                let r = c.req("settings unset tab_strip_rows").unwrap_or_else(|e| e);
-                println!("      cleanup: strip down: {r}");
-                sleep(2.5)?;
-                return Ok(Err(format!("the base read: {why}")));
-            }
-        };
-        let t0 = Instant::now();
-        if let Err(e) = c.send(&[BAND, "settings unset tab_strip_rows"]) {
-            return Ok(Err(e));
-        }
-        let (posted, unset) = match (c.line(), c.line()) {
-            (Ok(p), Ok(u)) => (p, u),
-            (Err(e), _) | (_, Err(e)) => return Ok(Err(e)),
-        };
-        println!(
-            "      notice post: {posted} ; strip down: {unset} (one write, both answered at +{:.1} ms)",
-            t0.elapsed().as_secs_f64() * 1000.0
-        );
-        sleep(2.5)?;
-        let m = self.measured_since(base)?;
-        if let Some(mid) = message_id(&posted) {
-            let r = c
-                .req(&format!("notice dismiss {mid}"))
-                .unwrap_or_else(|e| e);
-            println!("      cleanup: dismiss {mid}: {r}");
-        }
-        sleep(2.5)?;
-        Ok(m)
-    }
-
-    fn judge(&mut self, case: &str, ran: Result<Vec<Measured>, String>) {
-        let apart = format!("X {case}: the pair lands the floor apart");
-        match ran.map(|runs| judge_sweep(&runs)) {
-            Err(why) => self.row(false, &format!("X {case}: the schedule ran"), &why),
-            Ok(Verdict::Held(min)) => {
-                self.row(
-                    true,
-                    &apart,
-                    &format!("min gap {min} ms (floor {FLOOR_MS} ms)"),
-                );
-            }
-            Ok(Verdict::Under(min)) => {
-                self.row(
-                    false,
-                    &apart,
-                    &format!("min gap {min} ms (floor {FLOOR_MS} ms)"),
-                );
-            }
-            Ok(Verdict::Stuck(why)) => {
-                self.row(false, &format!("X {case}: every rise is taken back"), &why);
-            }
-            Ok(Verdict::NotMeasured(why)) => self.not_measured(&apart, &why),
-        }
-    }
-
-    fn phase_x(&mut self) -> Result<(), Stopped> {
-        println!(
-            "---- X: cross-source chrome pairs, the stand-in busy (size read 20 ms late, a glyph every 5 ms)"
-        );
-        self.quiet()?;
-        let _ = self.read_resizes(false);
-        println!("      busy: {}", verdict(&self.ctl(&["ctrl", "n"])));
-        sleep(0.5)?;
-        let mut swept = Ok(Vec::new());
-        for lead_ms in LEADS_MS {
-            println!(
-                "    -- {} (rise asked {lead_ms} ms before the shrink)",
-                SCHEDULES[0]
-            );
-            let ran = self.strip_rise_then_bandshrink(Duration::from_millis(lead_ms))?;
-            match (&mut swept, ran) {
-                (Ok(all), Ok(m)) => all.push(m),
-                (Ok(_), Err(why)) => swept = Err(why),
-                (Err(_), _) => {}
-            }
-        }
-        let leads = LEADS_MS.map(|ms| ms.to_string()).join(", ");
-        self.judge(&format!("{} (leads {leads} ms)", SCHEDULES[0]), swept);
-        println!("    -- {}", SCHEDULES[1]);
-        let ran = self.band_rise_then_stripfall()?;
-        self.judge(SCHEDULES[1], ran.map(|m| vec![m]));
-        println!("      quiet: {}", verdict(&self.ctl(&["ctrl", "o"])));
-        sleep(0.5)?;
-        let _ = self.read_resizes(false);
-        self.no_new_flap("X");
-        Ok(())
-    }
-
     fn end(&mut self, lines: u32) -> Result<(), Stopped> {
         println!("---- END");
         self.quiet()?;
@@ -884,7 +485,7 @@ fn gui_session() -> bool {
 const COLUMNS: u32 = 80;
 const LINES: u32 = 24;
 
-/// `presence-flap --window|--headless [--aterm PATH] [--client PATH] [--phases "A H B D T X"] [--trials N] [--keep]`.
+/// `presence-flap --window|--headless [--aterm PATH] [--client PATH] [--phases "A H B D T"] [--trials N] [--keep]`.
 ///
 /// # Errors
 /// Usage, a lane that could not run, or an interrupt.
@@ -908,13 +509,8 @@ pub fn cmd_presence_flap(args: &[String]) -> Res {
     }
     let phases = match named {
         Some(spec) => parse_phases(&spec).map_err(Fail::usage)?,
-        None => PHASES.into_iter().filter(|&p| window || p != 'X').collect(),
+        None => PHASES.to_vec(),
     };
-    if headless && phases.contains(&'X') {
-        return Err(Fail::usage(
-            "phase X judges the window's chrome re-grids: it needs --window".to_string(),
-        ));
-    }
     let aterm = instance::take_value(&mut a, "--aterm")?;
     if let Some(extra) = a.first() {
         return Err(Fail::usage(format!(
@@ -981,20 +577,10 @@ pub fn cmd_presence_flap(args: &[String]) -> Res {
         base_risks: String::new(),
         oks: 0,
         fails: 0,
-        unmeasured: 0,
     };
     let finish = |p: &Probe| -> Res {
-        println!(
-            "\n{} ok, {} FAIL, {} not measured",
-            p.oks, p.fails, p.unmeasured
-        );
-        Ok(if p.fails > 0 {
-            1
-        } else if p.unmeasured > 0 {
-            3
-        } else {
-            0
-        })
+        println!("\n{} ok, {} FAIL", p.oks, p.fails);
+        Ok(if p.fails > 0 { 1 } else { 0 })
     };
     if let Err(f) = p.inst.await_socket(instance::BOOT) {
         let why = f.msg.unwrap_or_default();
@@ -1044,19 +630,12 @@ pub fn cmd_presence_flap(args: &[String]) -> Res {
             'H' => p.phase_h()?,
             'B' => p.phase_b()?,
             'D' => p.phase_d()?,
-            'T' => p.phase_t(trials)?,
-            _ => p.phase_x()?,
+            _ => p.phase_t(trials)?,
         }
     }
     p.end(LINES)?;
     finish(&p)
 }
-
-/// How late a BUSY stand-in reads its size after a SIGWINCH.
-const LAG: Duration = Duration::from_millis(20);
-/// How often a BUSY stand-in writes its spinner glyph.
-const TICK: Duration = Duration::from_millis(5);
-const GLYPHS: [char; 4] = ['|', '/', '-', '\\'];
 
 /// Claude Code's shape on the alternate screen.
 #[must_use]
@@ -1090,10 +669,6 @@ struct Standin {
     /// The size the program believes: what it last read.
     seen: (u16, u16),
     composer: String,
-    busy: bool,
-    read_at: Option<Instant>,
-    spin_at: Instant,
-    spin: usize,
 }
 
 fn size() -> (u16, u16) {
@@ -1124,27 +699,6 @@ impl Standin {
             put(&frame(now.0, now.1, &self.composer));
         }
     }
-
-    fn on_winch(&mut self) {
-        if self.busy {
-            self.read_at.get_or_insert_with(|| Instant::now() + LAG);
-        } else {
-            self.read_size();
-        }
-    }
-
-    /// The status cell against the size the program BELIEVES, then the cursor
-    /// back to the composer: one write, no erase.
-    fn spin(&mut self) {
-        self.spin += 1;
-        put(&format!(
-            "\x1b[{};3H{}\x1b[{};{}H",
-            self.seen.0.saturating_sub(1),
-            GLYPHS[self.spin % 4],
-            self.seen.0.saturating_sub(4),
-            3 + self.composer.chars().count()
-        ));
-    }
 }
 
 /// The stand-in's `main` (`aterm-lab presence-standin`, the tab's program).
@@ -1158,36 +712,13 @@ pub fn standin_main(_args: &[String]) -> i32 {
     let mut s = Standin {
         seen,
         composer: String::new(),
-        busy: false,
-        read_at: None,
-        spin_at: Instant::now(),
-        spin: 0,
     };
     put(&format!("\x1b[?1049h{}", frame(seen.0, seen.1, "")));
     loop {
-        let timeout = if s.busy {
-            let due = s.read_at.map_or(s.spin_at, |r| r.min(s.spin_at));
-            let ms = due
-                .saturating_duration_since(Instant::now())
-                .as_micros()
-                .div_ceil(1000);
-            i32::try_from(ms).unwrap_or(i32::MAX)
-        } else {
-            -1
-        };
         let mut fds = [crate::sys::pollfd(0), crate::sys::pollfd(winch.read_fd)];
-        let _ = crate::sys::poll(&mut fds, timeout);
+        let _ = crate::sys::poll(&mut fds, -1);
         if fds[1].revents != 0 && !winch.drain().is_empty() {
-            s.on_winch();
-        }
-        let now = Instant::now();
-        if s.read_at.is_some_and(|t| now >= t) {
-            s.read_at = None;
             s.read_size();
-        }
-        if s.busy && now >= s.spin_at {
-            s.spin();
-            s.spin_at = now + TICK;
         }
         if fds[0].revents == 0 {
             continue;
@@ -1196,16 +727,6 @@ pub fn standin_main(_args: &[String]) -> i32 {
         let n = crate::sys::read(0, &mut b).unwrap_or(0);
         match (n, b[0]) {
             (0, _) | (_, b'q') => std::process::exit(0),
-            (_, 0x0e) => {
-                s.busy = true;
-                s.spin_at = now;
-            }
-            (_, 0x0f) => {
-                s.busy = false;
-                if s.read_at.take().is_some() {
-                    s.read_size();
-                }
-            }
             (_, b'\r' | b'\n') => {
                 s.composer.clear();
                 s.diff();
@@ -1223,19 +744,10 @@ pub fn standin_main(_args: &[String]) -> i32 {
 mod tests {
     use super::*;
 
-    fn rz(id: u64, t: u64, from_rows: u32, to_rows: u32) -> Resize {
-        Resize {
-            id,
-            t,
-            from_rows,
-            to_rows,
-        }
-    }
-
     #[test]
-    fn a_resize_row_reads_its_id_time_and_rows() {
+    fn a_resize_row_reads_its_id_and_a_run_row_is_none() {
         let line = "resize 7 t=1234 run=2 ord=3 from=80x24 to=80x23 alt=1 sync=0 site=chrome at=- win=80x24 chrome=1";
-        assert_eq!(parse_resize(line), Some(rz(7, 1234, 24, 23)));
+        assert_eq!(parse_resize(line), Some(7));
         assert_eq!(parse_resize("run 2 t=1 n=2"), None);
     }
 
@@ -1243,53 +755,11 @@ mod tests {
     fn phases_parse_in_any_spelling_and_refuse_strangers() {
         assert_eq!(parse_phases("A H").unwrap(), vec!['A', 'H']);
         assert_eq!(parse_phases("b,t").unwrap(), vec!['B', 'T']);
-        assert_eq!(parse_phases("x").unwrap(), vec!['X']);
-        assert!(parse_phases("Q").is_err());
-    }
-
-    #[test]
-    fn a_shrink_pairs_with_the_grow_that_takes_it_back() {
-        let rows = [rz(1, 100, 24, 23), rz(2, 500, 23, 24)];
-        assert_eq!(pair_gaps(&rows), vec![400]);
-        assert_eq!(measure(&rows), Measured::Pairs(vec![400]));
-        let rows = [rz(3, 1000, 23, 22), rz(4, 1006, 22, 23)];
-        assert_eq!(pair_gaps(&rows), vec![6]);
-        assert_eq!(
-            pair_gaps(&[rz(5, 0, 23, 24), rz(6, 9, 24, 23)]),
-            Vec::<u64>::new()
-        );
-    }
-
-    #[test]
-    fn a_sweep_fails_only_on_what_the_ledger_shows_wrong() {
-        let held = Measured::Pairs(vec![401, 400]);
-        let missed = measure(&[rz(10, 118_022, 23, 24), rz(11, 118_047, 24, 23)]);
         assert!(
-            matches!(&missed, Measured::Missed(why) if why.contains("25 ms after")),
-            "{missed:?}"
+            parse_phases("x").is_err(),
+            "phase X went with the message band"
         );
-        let under = measure(&[rz(14, 27_325, 23, 22), rz(15, 27_363, 22, 23)]);
-        assert_eq!(under, Measured::Pairs(vec![38]));
-        let stuck = measure(&[rz(2, 103_312, 23, 22)]);
-        assert!(matches!(stuck, Measured::Stuck(_)), "{stuck:?}");
-
-        assert_eq!(
-            judge_sweep(&[held.clone(), missed.clone()]),
-            Verdict::Held(400)
-        );
-        assert_eq!(
-            judge_sweep(&[Measured::Pairs(vec![399])]),
-            Verdict::Held(399),
-            "1 ms is the ledger's rounding"
-        );
-        assert_eq!(judge_sweep(&[held.clone(), under]), Verdict::Under(38));
-        assert!(matches!(judge_sweep(&[held, stuck]), Verdict::Stuck(_)));
-        let none = measure(&[]);
-        assert!(matches!(none, Measured::Missed(_)), "{none:?}");
-        assert!(matches!(
-            judge_sweep(&[missed.clone(), missed, none]),
-            Verdict::NotMeasured(why) if why.starts_with("no pair formed: the fall landed first")
-        ));
+        assert!(parse_phases("Q").is_err());
     }
 
     #[test]
@@ -1324,10 +794,7 @@ mod tests {
             stdout: "resize 7 t=1234 run=2 ord=3 from=80x24 to=80x23 alt=1\nrun 2 t=1 n=1\n".into(),
             stderr: "aterm-ctl: OK 2 total=7 runs=2 flaps=0 risks=0 render=ok\n".into(),
         };
-        assert_eq!(
-            ledger_rows("resizes since=6", &ok),
-            Ok(vec![rz(7, 1234, 24, 23)])
-        );
+        assert_eq!(ledger_rows("resizes since=6", &ok), Ok(vec![7]));
         let none = Reply {
             stderr: "OK 0 total=7 runs=2 flaps=0 risks=0 render=ok\n".into(),
             ..Reply::default()

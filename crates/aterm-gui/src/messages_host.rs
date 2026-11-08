@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `App` integration for the unified message center, band geometry sync, log persistence, and update/toolchain rows.
+//! `App` integration for the unified message center, log persistence, and update/toolchain rows.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -127,11 +127,6 @@ impl page::Host for PageDesk<'_> {
 
 #[cfg(test)]
 thread_local! {
-    static PTY_RESIZES_FOR_MESSAGES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-thread_local! {
     pub(crate) static UPDATER_ADOPTED_HEALTH: std::cell::RefCell<Vec<&'static str>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -141,12 +136,6 @@ fn adopt_updater_announced_health(class: &'static str) {
     UPDATER_ADOPTED_HEALTH.with(|adopted| adopted.borrow_mut().push(class));
     #[cfg(not(test))]
     aterm_update::adopt_announced_health(class);
-}
-
-/// Returns the count of window re-grids triggered by the message band on this thread (test-only).
-#[cfg(test)]
-pub(crate) fn message_regrids() -> u64 {
-    PTY_RESIZES_FOR_MESSAGES.with(|c| c.get())
 }
 
 /// What aterm.log keeps of a message: its key where that is a word, and its title's length.
@@ -359,12 +348,14 @@ fn open_path_external(path: &str) -> bool {
 }
 
 impl App {
-    /// Posts `msg` into the message center at the current timestamp, logs it, and syncs the band.
+    /// Posts `msg` into the message center at the current timestamp, logs it, and syncs the center
+    /// ([`Self::sync_messages`]).
     pub(crate) fn post_message(&mut self, msg: Message) -> MessageId {
         self.post_message_at(msg, self.messages_wall.now())
     }
 
-    /// Posts `msg` into the message center with an explicit ingress `stamp` and syncs the band.
+    /// Posts `msg` into the message center with an explicit ingress `stamp` and syncs the center
+    /// ([`Self::sync_messages`]).
     pub(crate) fn post_message_at(&mut self, msg: Message, stamp: WallStamp) -> MessageId {
         let id = self.post_unsynced(msg, stamp);
         self.sync_messages();
@@ -553,7 +544,7 @@ impl App {
         })
     }
 
-    /// Posts and logs `msg` at `stamp` without running a band settle pass.
+    /// Posts and logs `msg` at `stamp` without a settle pass ([`Self::sync_messages`]).
     pub(crate) fn post_unsynced(&mut self, msg: Message, stamp: WallStamp) -> MessageId {
         self.post_unsynced_at(msg, stamp, Instant::now())
     }
@@ -618,14 +609,10 @@ impl App {
             .extend(shown.iter().map(|key| (*key).to_string()));
     }
 
-    /// The front window or its tab may have changed (`changed` when it did):
-    /// config rows Settings now shows on its own rows become records, and a band
-    /// row the new view does not want leaves before its first frame
-    /// ([`aterm_messages::MessageCenter::view_changed`]).
-    pub(crate) fn band_meets_the_front(&mut self, changed: bool) {
-        let kept = self.keep_config_rows_settings_shows_as_records();
-        let fall = (changed || kept > 0) && self.messages.view_changed();
-        if kept > 0 || fall {
+    /// The front window or its tab may have changed: config rows Settings now shows on its own
+    /// rows become records.
+    pub(crate) fn settings_meets_the_front(&mut self) {
+        if self.keep_config_rows_settings_shows_as_records() > 0 {
             self.sync_messages();
         }
     }
@@ -666,7 +653,7 @@ impl App {
         kept
     }
 
-    /// Resolves live row `id` with `outcome` and syncs the band.
+    /// Resolves live row `id` with `outcome` and syncs the center ([`Self::sync_messages`]).
     pub(crate) fn resolve_message(&mut self, id: MessageId, outcome: Outcome) -> bool {
         let resolved = self.messages.resolve(id, outcome, Instant::now());
         if resolved {
@@ -675,7 +662,7 @@ impl App {
         resolved
     }
 
-    /// Withdraws live row `id` without an outcome and syncs the band.
+    /// Withdraws live row `id` without an outcome and syncs the center ([`Self::sync_messages`]).
     pub(crate) fn withdraw_message(&mut self, id: MessageId) -> bool {
         let withdrawn = self.messages.withdraw(id, Instant::now());
         if withdrawn {
@@ -684,7 +671,7 @@ impl App {
         withdrawn
     }
 
-    /// Resolves live row `id` as `Answered` with `label` and syncs the band.
+    /// Resolves live row `id` as `Answered` with `label` and syncs the center ([`Self::sync_messages`]).
     pub(crate) fn answer_message(&mut self, id: MessageId, label: &str) -> bool {
         let answered = self.messages.answer(id, label, Instant::now());
         if answered {
@@ -693,7 +680,8 @@ impl App {
         answered
     }
 
-    /// Settles expired rows, updates band geometry, persists log lines, and schedules repaints.
+    /// Settles the center ([`Self::settle_messages`]), publishes Settings ▸ Messages when due,
+    /// and requests a redraw of every window.
     pub(crate) fn sync_messages(&mut self) {
         let now = Instant::now();
         self.settle_messages(now);
@@ -701,7 +689,9 @@ impl App {
         self.request_redraw_all_windows();
     }
 
-    /// Settles messages at `now` without requesting a repaint, returning whether band visuals changed.
+    /// Settles messages at `now` without requesting a repaint, returning whether the windows need
+    /// one: the tab strip's waiting fall re-gridded them ([`Self::settle_strip_fall`]), or the
+    /// wire gate's paced paint fell due.
     pub(crate) fn settle_messages(&mut self, now: Instant) -> bool {
         let strip = self.settle_strip_fall(now);
         if self.messages.settle_digest(wall_stamp_now(), now) {
@@ -709,14 +699,12 @@ impl App {
         }
         self.ripen_exceptions(now);
         self.keep_owed_rows(now);
-        let commit = self.band_commit(now);
-        let step = drive::settle_and_commit(&mut self.messages, commit);
-        let committed = self.regrid_message_band(step.regrid, now);
+        let _ = self.messages.settle(now, !self.message_holds_frozen());
         let persist = !self.message_persist_frozen();
         let (lines, wire) =
             drive::drain_and_pace(&mut self.messages, &mut self.wire_gate, now, persist);
         self.append_message_lines(&lines);
-        step.glass_changed || committed || wire || strip
+        strip || wire
     }
 
     fn persist_messages(&mut self) {
@@ -779,69 +767,12 @@ impl App {
         self.incoming_handoff_pending
     }
 
-    /// Commits the current message band row count to window geometry, re-gridding if it changed.
-    pub(crate) fn sync_message_band_rows(&mut self, now: Instant) -> bool {
-        let commit = self.band_commit(now);
-        let regrid = drive::commit(&mut self.messages, commit);
-        self.regrid_message_band(regrid, now)
-    }
-
-    fn band_commit(&self, now: Instant) -> drive::Commit {
-        drive::Commit {
-            now,
-            frozen: self.message_holds_frozen(),
-            // Diagnostics retain their lifecycle and durable history, but never take
-            // terminal rows or require an acknowledgement before work can continue.
-            afford: 0,
-            reserved: self.message_band_rows,
-            floor: self.band_regrow_floor(),
-        }
-    }
-
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "ChromeRegrowFloor",
-            action = "BandRise",
-            project = "aterm_gui::chrome_regrow_conformance::project"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "ChromeRegrowFloor",
-            action = "BandFall",
-            project = "aterm_gui::chrome_regrow_conformance::project"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "ChromeRegrowFloor",
-            action = "BandTaken",
-            project = "aterm_gui::chrome_regrow_conformance::project"
-        )
-    )]
-    fn regrid_message_band(&mut self, regrid: Option<u16>, now: Instant) -> bool {
-        let Some(rows) = regrid else {
-            return false;
-        };
-        if aterm_messages::chrome::is_rise(self.message_band_rows, rows) {
-            self.note_chrome_rise_everywhere(now);
-        }
-        self.message_band_rows = rows;
-        #[cfg(test)]
-        PTY_RESIZES_FOR_MESSAGES.with(|c| c.set(c.get() + 1));
-        self.regrid_for_chrome_rows();
-        true
-    }
-
-    /// Returns whether a seamless handoff is currently freezing message holds and band re-gridding.
+    /// Returns whether a seamless handoff is currently freezing message holds.
     pub(crate) fn message_holds_frozen(&self) -> bool {
         self.update_handoff_parked() || self.incoming_handoff_pending
     }
 
-    /// Returns the earliest instant when the message band next requires an event-loop wake.
+    /// Returns the earliest instant the messages next require an event-loop wake.
     pub(crate) fn messages_deadline(&self) -> Option<Instant> {
         let state =
             drive::state_deadline(&self.messages, &self.wire_gate, self.message_holds_frozen());
@@ -1776,7 +1707,7 @@ pub(crate) enum FlowPhase {
 }
 
 impl App {
-    /// Returns `App::update_flow` only while its message row is still live on the band.
+    /// Returns `App::update_flow` only while its message row is still live in the message center.
     pub(crate) fn live_update_flow(&self) -> Option<&UpdateFlow> {
         self.update_flow
             .as_ref()
@@ -2803,45 +2734,9 @@ fn carried_health_scope_waivers() {}
 #[cfg(any(test, debug_assertions))]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "ChromeRegrowFloor",
-    action = "BandUnwant",
-    reason = "The band row's want drops (a dismissal, a hold's end): the center's state. \
-              Tier-1 dismisses a real row and settles the real host step."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ChromeRegrowFloor",
-    action = "BandBack",
-    reason = "A band row wanted again while its shrink waits: no re-grid (D1). The engine's \
-              `commit_rows` Equal arm; pinned by the center's own D1 tests."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ChromeRegrowFloor",
-    action = "BandQuiet",
-    reason = "Time: the band's own `SHRINK_QUIET` runs out. Tier-1 steps the clock past \
-              `MessageCenter::quiet_shrink_at`."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ChromeRegrowFloor",
     action = "Tick",
     reason = "Time: the floor's `CHROME_REGROW_SETTLE` runs out. Tier-1 steps the clock past \
               the window's `RegrowFloor::floor`."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ChromeRegrowFloor",
-    action = "Cramp",
-    reason = "The window's frame loses its room (a drag, a zoom): the OS window's size, \
-              booked by `on_resize`. Tier-1 takes the stand-in's terminal rows to none and \
-              drives the take (`BandTaken`) inside the floor."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ChromeRegrowFloor",
-    action = "Uncramp",
-    reason = "The window's frame gets its room back: the OS window's size."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ChromeRegrowFloor",
-    action = "BandFallOwnQuiet",
-    reason = "`Buggy = 1` mutant: the band's quiet shrink before the floor. The Tier-1 \
-              negative control is admitted only as this."
 )]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "ChromeRegrowFloor",

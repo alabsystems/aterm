@@ -460,11 +460,7 @@ fn a_repeated_config_warning_is_a_record_once_its_row_left_the_glass() {
         );
     }
     assert_eq!(records(&app), before + 3, "…and the log keeps each one");
-    assert_eq!(
-        app.messages.wanted_rows(),
-        0,
-        "the band wants no row for it"
-    );
+    assert_eq!(app.messages.wanted_rows(), 0, "no row is revealed for it");
     app.replace_config_messages(typo(5, "colums"));
     let changed = app.messages.live_by_key(key).expect("a new typo's row");
     assert!(changed.msg.detail.iter().any(|d| d.contains("colums")));
@@ -1486,7 +1482,6 @@ fn appstatus(app: &App) -> Vec<String> {
 #[test]
 fn a_routine_pass_raises_no_row_and_records_every_outcome() {
     let mut app = App::headless_for_test();
-    let regrids = message_regrids();
     app.announce_toolchain_pass(
         "installing 1 program(s) over the network: ty (about 40 MB)",
         false,
@@ -1507,8 +1502,6 @@ fn a_routine_pass_raises_no_row_and_records_every_outcome() {
     ));
     app.toolchain_pass_ended(true);
     assert_eq!(app.messages.live_rows().count(), 0, "no row");
-    assert_eq!(app.message_band_rows, 0);
-    assert_eq!(message_regrids(), regrids, "no re-grid for routine work");
     assert_eq!(app.messages_deadline(), None, "nothing to wake for");
     let rows = appstatus(&app);
     assert_eq!(rows.len(), 5, "every outcome on record: {rows:#?}");
@@ -1797,15 +1790,6 @@ fn a_handoff_carries_live_rows() {
         0,
         "nothing crossed as a log line"
     );
-    assert_eq!(
-        successor.chrome_rows(crate::WindowId(0)),
-        successor.tab_strip_rows,
-        "the successor reserves no band row"
-    );
-    assert!(
-        successor.messages.on_glass().next().is_none(),
-        "…and puts nothing on the glass"
-    );
 
     let mut plain = App::headless_for_test();
     plain.seed_carried_messages(&carry, None);
@@ -1853,9 +1837,9 @@ fn a_handoff_carries_live_rows() {
 }
 
 /// A v0.147.0 parent, the last whose band took rows, carried `status_bar_rows = 3` and rows
-/// `on_glass`. Both keys are read past: the successor reserves no band row and seeds no glass,
-/// its window takes the exact frame of the carried grid (the band's rows are dropped, the grid
-/// keeps its size), and nothing re-grids from the seed to Commit.
+/// `on_glass`. Both keys are read past: the successor's window takes the exact frame of the
+/// carried grid (the band's rows are dropped, the grid keeps its size), and nothing re-grids from
+/// the seed to Commit.
 #[cfg(unix)]
 #[test]
 fn a_v0_147_parents_band_is_read_past_and_nothing_regrids_to_commit() {
@@ -1901,7 +1885,6 @@ fn a_v0_147_parents_band_is_read_past_and_nothing_regrids_to_commit() {
         carried.height > exact.height,
         "PRECONDITION: the carried frame holds the band's rows"
     );
-    let regrids = message_regrids();
     let _ = crate::app_presence::take_chrome_regrids_applied();
     successor.incoming_handoff_pending = true;
     successor.seed_carried_messages(&carry, Some("0.148.0"));
@@ -1912,14 +1895,8 @@ fn a_v0_147_parents_band_is_read_past_and_nothing_regrids_to_commit() {
     let frame = successor.attach_frame_px(wid, carry.rows, carry.cols, Some(carried));
     assert_eq!(frame, exact, "the exact frame of the carried grid");
     successor.on_resize(wid, frame);
-    let strip = successor.tab_strip_rows;
     let grid = (carry.rows, carry.cols);
     let still = |app: &App, at: &str| {
-        assert_eq!(app.chrome_rows(wid), strip, "{at}: no band row");
-        assert!(
-            app.messages.on_glass().next().is_none(),
-            "{at}: an empty glass"
-        );
         assert_eq!(
             app.windows.get(&wid).map(|ws| (ws.rows, ws.cols)),
             Some(grid),
@@ -1934,11 +1911,6 @@ fn a_v0_147_parents_band_is_read_past_and_nothing_regrids_to_commit() {
     successor.release_successor_commit_freeze();
     still(&successor, "Commit");
     assert_eq!(
-        message_regrids(),
-        regrids,
-        "no message re-grid from the seed to Commit"
-    );
-    assert_eq!(
         crate::app_presence::take_chrome_regrids_applied(),
         Vec::new(),
         "no chrome re-grid from the seed to Commit"
@@ -1946,7 +1918,7 @@ fn a_v0_147_parents_band_is_read_past_and_nothing_regrids_to_commit() {
 }
 
 /// A current parent carries no band rows and no glass: its rows cross, and the successor's
-/// Commit re-grids nothing, since the seed took no row for the first unfrozen commit to drop.
+/// Commit re-grids no window's chrome.
 #[cfg(unix)]
 #[test]
 fn a_current_parents_rows_cross_and_commit_regrids_nothing() {
@@ -1963,16 +1935,10 @@ fn a_current_parents_rows_cross_and_commit_regrids_nothing() {
     );
 
     let mut successor = App::headless_for_test();
-    let regrids = message_regrids();
     let _ = crate::app_presence::take_chrome_regrids_applied();
     successor.incoming_handoff_pending = true;
     successor.seed_carried_messages(&carry, Some("0.76.0"));
     successor.sync_messages();
-    assert_eq!(
-        successor.messages.committed_rows(),
-        0,
-        "the seed took no row"
-    );
     successor.incoming_handoff_pending = false;
     successor.messages.after_handoff_commit(Instant::now());
     successor.release_successor_commit_freeze();
@@ -1980,11 +1946,10 @@ fn a_current_parents_rows_cross_and_commit_regrids_nothing() {
         successor.messages.live_rows().count() >= 2,
         "the rows cross Commit"
     );
-    assert_eq!(message_regrids(), regrids, "Commit re-grids nothing");
     assert_eq!(
         crate::app_presence::take_chrome_regrids_applied(),
         Vec::new(),
-        "…not even the chrome"
+        "Commit re-grids no window's chrome"
     );
 }
 
@@ -3145,7 +3110,6 @@ fn an_automatic_download_that_fails_is_a_record_with_its_version() {
         detail: "connection reset".into(),
     });
     assert_eq!(app.messages.live_rows().count(), 0);
-    assert!(app.messages.echoes().is_empty());
     assert!(app.update_quiet.is_none());
     assert!(
         app.messages
@@ -3674,15 +3638,12 @@ fn the_switch_record_never_doubles_a_posted_installing_row() {
 #[test]
 fn a_harness_note_is_recorded_and_never_takes_a_row() {
     let mut app = App::headless_for_test();
-    let regrids = message_regrids();
     assert_eq!(
         app.take_app_notice("harness", "aterm harness acting \u{00b7} approving rm"),
         Ok(crate::AppNoticeTaken::Recorded)
     );
     assert_eq!(app.messages.live_rows().count(), 0);
-    assert_eq!(app.message_band_rows, 0);
     assert_eq!(app.messages_deadline(), None);
-    assert_eq!(message_regrids(), regrids);
     let len = app.messages.log().len();
     assert!(!app.record_harness_note("aterm harness acting \u{00b7} approving rm"));
     assert_eq!(
@@ -4571,7 +4532,7 @@ fn a_tools_later_entry_is_one_digest_entry_its_link_press_files() {
     );
     let again = app.take_notice_within(req(), within);
     assert!(again.ends_with(" how=duplicate"), "{again}");
-    assert_eq!(app.messages.wanted_rows(), 0, "never a band row");
+    assert_eq!(app.messages.wanted_rows(), 0, "never a revealed row");
     let digest = app.messages.digest();
     assert_eq!(digest.len(), 1);
     let entry = &digest.entries[0];
@@ -4673,13 +4634,6 @@ fn open_in_browser_opens_only_an_https_page() {
 fn automatic_reports_are_records_without_banners_or_a_user_action() {
     let mut app = App::headless_for_test();
     let id = app.post_message(warn("Automatic work failed"));
-    assert!(
-        app.messages.wanted_rows() > 0,
-        "control: this report could alert"
-    );
-    assert_eq!(app.message_band_rows, 0);
-    assert_eq!(app.messages.committed_rows(), 0);
-    assert!(app.messages.on_glass().next().is_none());
     let log = app.messages.log().get(id).expect("diagnostic retained");
     assert_eq!(log.title, "Automatic work failed");
     assert!(app.restate_message(
@@ -4690,7 +4644,6 @@ fn automatic_reports_are_records_without_banners_or_a_user_action() {
         }
     ));
     assert!(app.resolve_message(id, Outcome::Ok));
-    assert_eq!(app.message_band_rows, 0);
     assert_eq!(
         app.messages.log().get(id).unwrap().title,
         "Another approach succeeded"
@@ -4750,7 +4703,6 @@ fn the_messages_page_lists_log_only_records() {
         Message::new(tags::UPDATE, Severity::Warn, "aterm update failed")
             .line("could not verify the download"),
     );
-    assert_eq!(app.message_band_rows, 0, "never on the glass");
     assert_eq!(app.messages_deadline(), None);
     let state = app.messages_state();
     let ids: Vec<u64> = state.entries.iter().map(|e| e.id).collect();
@@ -4763,5 +4715,45 @@ fn the_messages_page_lists_log_only_records() {
         state.entry(second.raw()).unwrap().detail,
         vec!["could not verify the download"],
         "its detail rides the page"
+    );
+}
+
+/// A tab strip fall the regrow floor held commits when a settle passes the floor, and that
+/// settle asks for a repaint: the strip's re-grid is drawn though no message moved.
+#[test]
+fn a_strip_fall_the_floor_held_is_redrawn_when_a_settle_takes_it() {
+    use aterm_messages::chrome::CHROME_REGROW_SETTLE;
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let sid = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session(sid));
+    app.windows
+        .get_mut(&wid)
+        .expect("window 0")
+        .chrome_regrids_for_test = true;
+    let t0 = Instant::now();
+    let _ = app.settle_messages(t0);
+    app.set_tab_strip_rows(1, t0);
+    app.set_tab_strip_rows(0, t0 + std::time::Duration::from_millis(20));
+    assert_eq!(
+        app.tab_strip_rows, 1,
+        "PRECONDITION: the floor holds the fall"
+    );
+    let _ = crate::app_presence::take_chrome_regrids_applied();
+    assert!(
+        !app.settle_messages(t0 + CHROME_REGROW_SETTLE / 2),
+        "inside the floor: nothing to draw"
+    );
+    assert_eq!(app.tab_strip_rows, 1, "still held");
+    assert!(
+        app.settle_messages(t0 + CHROME_REGROW_SETTLE),
+        "the fall's re-grid asks for a repaint"
+    );
+    assert_eq!(app.tab_strip_rows, 0, "the strip fell");
+    assert!(
+        crate::app_presence::take_chrome_regrids_applied()
+            .iter()
+            .any(|(w, rows)| *w == wid && *rows == app.chrome_rows(wid)),
+        "the window re-gridded to the fallen strip"
     );
 }

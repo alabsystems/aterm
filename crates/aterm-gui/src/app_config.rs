@@ -6519,7 +6519,8 @@ impl App {
         }
     }
 
-    /// Chrome rows changed (tab strip or status bar).
+    /// The chrome rows (the tab strip's) changed: every window re-grids, or the open
+    /// `App::with_chrome_regrid_batch` records it.
     #[track_caller]
     pub(crate) fn regrid_for_chrome_rows(&mut self) {
         if let Some(batch) = self.chrome_regrid_batch.as_mut() {
@@ -6562,7 +6563,7 @@ impl App {
         }
         if aterm_messages::chrome::is_rise(self.tab_strip_rows, rows) {
             self.note_chrome_rise_everywhere(now);
-        } else if !aterm_messages::chrome::fall_allowed(self.band_regrow_floor(), now) {
+        } else if !aterm_messages::chrome::fall_allowed(self.chrome_regrow_floor(), now) {
             self.strip_fall = Some(rows);
             return;
         }
@@ -6583,7 +6584,7 @@ impl App {
         let Some(rows) = self.strip_fall else {
             return false;
         };
-        if !aterm_messages::chrome::fall_allowed(self.band_regrow_floor(), now) {
+        if !aterm_messages::chrome::fall_allowed(self.chrome_regrow_floor(), now) {
             return false;
         }
         self.strip_fall = None;
@@ -6597,7 +6598,7 @@ impl App {
 
     /// When the tab strip's waiting fall may commit.
     pub(crate) fn strip_fall_due(&self) -> Option<std::time::Instant> {
-        self.strip_fall.and(self.band_regrow_floor())
+        self.strip_fall.and(self.chrome_regrow_floor())
     }
 
     /// [`Self::regrid_for_chrome_rows`] but for window `settling`, which its caller fits ([`Self::sync_strip_header_row`]).

@@ -385,10 +385,11 @@ pub fn run_all(
     state: &Path,
     opts: &GateOpts,
 ) -> Result<GateReport> {
-    host_gate()?;
-    submodules_at_gitlinks(git)?;
-    clean_tree(git)?;
-    let head = rev_parse(git, "HEAD")?;
+    use crate::cut_timing::measure;
+    measure("host", host_gate)?;
+    measure("submodule gitlinks", || submodules_at_gitlinks(git))?;
+    measure("clean tree", || clean_tree(git))?;
+    let head = measure("HEAD", || rev_parse(git, "HEAD"))?;
     if let Some(published) = &opts.published
         && head != published.source.commit
     {
@@ -399,13 +400,20 @@ pub fn run_all(
             published.tree.display()
         )));
     }
-    own_cutter_gate(git, &head, opts.allow_stale_cutter)?;
-    tag_gate(git, origin, &opts.version, !opts.offline)?;
-    let github_login = github_identity_gate(opts.offline)?;
-    let free_disk_gib = disk_gate(tree)?;
-    let processes_checked =
-        staged_bundle_liveness_gate(&state.join("dist"), &crate::bundle::running_processes)?;
-    let channel_version = channel_version_gate(tree, &opts.version, opts.offline)?;
+    measure("own cutter", || {
+        own_cutter_gate(git, &head, opts.allow_stale_cutter)
+    })?;
+    measure("tag free", || {
+        tag_gate(git, origin, &opts.version, !opts.offline)
+    })?;
+    let github_login = measure("GitHub identity", || github_identity_gate(opts.offline))?;
+    let free_disk_gib = measure("disk", || disk_gate(tree))?;
+    let processes_checked = measure("staging process scan", || {
+        staged_bundle_liveness_gate(&state.join("dist"), &crate::bundle::running_processes)
+    })?;
+    let channel_version = measure("public channel", || {
+        channel_version_gate(tree, &opts.version, opts.offline)
+    })?;
     Ok(GateReport {
         head_short: head.chars().take(8).collect(),
         github_login,
@@ -894,7 +902,14 @@ fn ledger_text(
                  (git ls-remote {origin}). Nothing was claimed.",
             ))
         })?;
-    Ok(match unpushed_ledger(&copy, run) {
+    // The copy's unpushed rows are its own origin's records: they count only where that is the
+    // origin read. A copy whose origin URL is gone while its remote-tracking refs stay (its
+    // remote section removed or its URL unset by hand; `git remote remove` deletes the refs too)
+    // keeps the main it last fetched, and `~/publication` may name another repository.
+    let unpushed = (source == copy)
+        .then(|| unpushed_ledger(&copy, run))
+        .flatten();
+    Ok(match unpushed {
         Some(unpushed) => (
             ledger_with_unpushed(&text, &unpushed),
             format!(
@@ -5802,8 +5817,9 @@ mod ledger_reader_tests {
     /// one on the main of the origin the clone's own engine names (a release re-points it at each
     /// sync), else `~/publication`'s, though each checkout is behind it; `PUBLICATION_ENGINE`'s
     /// ledger is read in place (the release's synced engine, its own unpushed row included); the
-    /// rows the clone's engine committed and could not push count as recorded; with no engine
-    /// naming an origin, nothing is read. NEGATIVE CONTROL: the checkouts' own
+    /// rows the clone's engine committed and could not push count as recorded where its own
+    /// origin is the one read, and not where it names none and `~/publication`'s is; with no
+    /// engine naming an origin, nothing is read. NEGATIVE CONTROL: the checkouts' own
     /// ledgers name an older row, which a reader of their working trees (as before) would release.
     #[test]
     fn a_reader_by_hand_reads_the_origins_ledger_and_a_releases_child_its_engines() {
@@ -5906,6 +5922,36 @@ mod ledger_reader_tests {
             ledger_with_unpushed(&ledger(&[(&third, "2026-11-02T00:00:00Z")]), "not json"),
             ledger(&[(&third, "2026-11-02T00:00:00Z")]),
             "an unreadable unpushed ledger adds nothing"
+        );
+        // A copy whose remote section is gone keeps the main it last fetched and the row it holds
+        // unpushed, which is that origin's record, never the one `~/publication` names.
+        let fifth = "e".repeat(40);
+        std::fs::write(
+            copy.join("mappings.json"),
+            ledger(&[
+                (&third, "2026-11-02T00:00:00Z"),
+                (&fourth, "2026-11-03T00:00:00Z"),
+                (&fifth, "2026-11-09T00:00:00Z"),
+            ]),
+        )
+        .unwrap();
+        git_in(&copy, &["commit", "-q", "-am", "unpushed row"]);
+        let elsewhere = root.join("elsewhere.git").display().to_string();
+        git_in(&copy, &["config", "--remove-section", "remote.origin"]);
+        assert_eq!(
+            published_source_in(&repo, &var(None), &open)
+                .unwrap()
+                .commit,
+            new,
+            "~/publication's origin, without the copy's row"
+        );
+        git_in(&copy, &["remote", "add", "origin", &elsewhere]);
+        assert_eq!(
+            published_source_in(&repo, &var(None), &open)
+                .unwrap()
+                .commit,
+            fifth,
+            "NEGATIVE CONTROL: the copy's own origin, with its row"
         );
 
         // No engine names an origin: nothing is read, and the refusal says where it looked.

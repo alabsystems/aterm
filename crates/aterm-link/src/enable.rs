@@ -6966,28 +6966,18 @@ fn retire_through_bridge(
         return false;
     }
     println!("  asked the bridge at pid {pid}: {}", safe(&header, 80));
-    let mut done = 0;
-    let deadline = std::time::Instant::now() + RETIRE_WAIT;
-    let mut pending: Vec<&str> = sids.clone();
     let since = report.broker.head;
-    let mut refused = BTreeMap::new();
-    let mut refusals_read = false;
-    while !pending.is_empty() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let Ok(progress) = fabric::retire_progress(report, node, &pending, since) else {
-            refusals_read = false;
-            continue;
-        };
-        refusals_read = progress.refusals_read;
-        pending.retain(|sid| {
-            let retired = progress.states.get(*sid).is_some_and(|s| s == "exited");
-            if retired {
-                done += 1;
-            }
-            !retired && !progress.refused.contains_key(*sid)
-        });
-        refused.extend(progress.refused);
-    }
+    let Retirement {
+        done,
+        pending,
+        refused,
+        refusals_read,
+    } = await_retirement(
+        &sids,
+        std::time::Instant::now(),
+        |pending| fabric::retire_progress(report, node, pending, since),
+        || std::thread::sleep(std::time::Duration::from_millis(200)),
+    );
     for (sid, why) in &refused {
         println!("  @{}: the bridge refused it: {why}", safe(sid, 64));
     }
@@ -7007,7 +6997,45 @@ fn retire_through_bridge(
     pending.is_empty() && refused.is_empty()
 }
 
-const RETIRE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+const RETIRE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+struct Retirement<'a> {
+    done: usize,
+    pending: Vec<&'a str>,
+    refused: BTreeMap<String, String>,
+    refusals_read: bool,
+}
+
+fn await_retirement<'a>(
+    sids: &[&'a str],
+    started: std::time::Instant,
+    mut observe: impl FnMut(&[&str]) -> io::Result<fabric::RetireProgress>,
+    mut pause: impl FnMut(),
+) -> Retirement<'a> {
+    let mut outcome = Retirement {
+        done: 0,
+        pending: sids.to_vec(),
+        refused: BTreeMap::new(),
+        refusals_read: false,
+    };
+    while !outcome.pending.is_empty() && started.elapsed() < RETIRE_WAIT {
+        pause();
+        let Ok(progress) = observe(&outcome.pending) else {
+            outcome.refusals_read = false;
+            continue;
+        };
+        outcome.refusals_read = progress.refusals_read;
+        outcome.pending.retain(|sid| {
+            let retired = progress.states.get(*sid).is_some_and(|s| s == "exited");
+            if retired {
+                outcome.done += 1;
+            }
+            !retired && !progress.refused.contains_key(*sid)
+        });
+        outcome.refused.extend(progress.refused);
+    }
+    outcome
+}
 
 fn running_bridge(instances: &[fabric::InstanceView], node: &str) -> Option<u32> {
     instances
@@ -7145,6 +7173,67 @@ pub fn doctor(retire_ghosts: bool, yes: bool) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_accepted_retirement_waits_for_its_actual_publication() {
+        let (send, reply) = std::sync::mpsc::channel();
+        send.send(fabric::RetireProgress {
+            states: BTreeMap::from([("s-fixture".to_owned(), "exited".to_owned())]),
+            refusals_read: true,
+            ..fabric::RetireProgress::default()
+        })
+        .unwrap();
+        let outcome = await_retirement(
+            &["s-fixture"],
+            Instant::now() - Duration::from_secs(6),
+            |_| Ok(reply.try_recv().unwrap_or_default()),
+            || {},
+        );
+        assert_eq!(outcome.done, 1);
+        assert!(outcome.pending.is_empty());
+        assert!(outcome.refused.is_empty());
+        assert!(outcome.refusals_read);
+
+        send.send(fabric::RetireProgress {
+            states: BTreeMap::from([("s-fixture".to_owned(), "exited".to_owned())]),
+            ..fabric::RetireProgress::default()
+        })
+        .unwrap();
+        let expired = await_retirement(
+            &["s-fixture"],
+            Instant::now() - Duration::from_secs(61),
+            |_| panic!("an expired wait does not observe another result"),
+            || panic!("an expired wait never pauses"),
+        );
+        assert_eq!(expired.done, 0);
+        assert_eq!(expired.pending, ["s-fixture"]);
+        assert_eq!(
+            reply
+                .try_recv()
+                .unwrap()
+                .states
+                .get("s-fixture")
+                .map(String::as_str),
+            Some("exited")
+        );
+
+        let reasons = BTreeMap::from([("s-fixture".to_owned(), "fixture refusal".to_owned())]);
+        let mut progress = Some(fabric::RetireProgress {
+            refused: reasons.clone(),
+            refusals_read: true,
+            ..fabric::RetireProgress::default()
+        });
+        let refused = await_retirement(
+            &["s-fixture"],
+            Instant::now(),
+            |_| Ok(progress.take().expect("one actual refusal")),
+            || {},
+        );
+        assert_eq!(refused.done, 0);
+        assert!(refused.pending.is_empty());
+        assert_eq!(refused.refused, reasons);
+        assert!(refused.refusals_read);
+    }
 
     #[test]
     #[cfg(target_os = "macos")]

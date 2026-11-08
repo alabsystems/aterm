@@ -89,10 +89,8 @@ fn step(center: &mut MessageCenter, gate: &mut WireGate, now: Instant) -> drive:
         center,
         Commit {
             now,
-            frozen: false,
             afford: MAX_ROWS,
             reserved,
-            floor: None,
         },
     );
     let _ = drive::drain_and_pace(center, gate, now, true);
@@ -100,7 +98,7 @@ fn step(center: &mut MessageCenter, gate: &mut WireGate, now: Instant) -> drive:
 }
 
 #[test]
-fn the_step_commits_after_its_settle_and_a_freeze_holds_the_rows_and_the_log() {
+fn the_step_commits_after_its_settle_and_an_unpersisted_drain_keeps_the_log() {
     let t0 = Instant::now();
     let mut center = MessageCenter::new(MessageLog::default(), t0);
     let mut gate = WireGate::default();
@@ -109,21 +107,8 @@ fn the_step_commits_after_its_settle_and_a_freeze_holds_the_rows_and_the_log() {
     assert_eq!(c.regrid, Some(1), "the row is committed in the same step");
     let t = t0 + Duration::from_secs(3);
     let _ = center.post(warn("Deploy failed", 2), STAMP, t);
-    let frozen = drive::settle_and_commit(
-        &mut center,
-        Commit {
-            now: t,
-            frozen: true,
-            afford: MAX_ROWS,
-            reserved: 1,
-            floor: None,
-        },
-    );
-    assert_eq!(frozen.regrid, None, "a freeze never re-grids");
-    assert_eq!(center.committed_rows(), 1);
-    assert_eq!(center.on_glass().count(), 1, "the hold is suspended");
     let (lines, _) = drive::drain_and_pace(&mut center, &mut gate, t, false);
-    assert!(lines.is_empty(), "a frozen successor writes nothing");
+    assert!(lines.is_empty(), "an unpersisted drain writes nothing");
     let (lines, _) = drive::drain_and_pace(&mut center, &mut gate, t, true);
     assert!(!lines.is_empty(), "the lines waited for the persist");
     let c = step(&mut center, &mut gate, t);
@@ -132,10 +117,8 @@ fn the_step_commits_after_its_settle_and_a_freeze_holds_the_rows_and_the_log() {
         &mut center,
         Commit {
             now: t,
-            frozen: false,
             afford: MAX_ROWS,
             reserved: 0,
-            floor: None,
         },
     );
     assert_eq!(c.regrid, Some(center.committed_rows()));
@@ -425,97 +408,4 @@ fn the_paint_key_moves_with_every_term_it_paints_from() {
         "an invalidated view repaints, even empty"
     );
     assert_eq!(view.paint(&center, 80, None, g, false, &|| dark), None);
-}
-
-fn step_floored(
-    center: &mut MessageCenter,
-    gate: &mut WireGate,
-    now: Instant,
-    afford: u16,
-    floor: Option<Instant>,
-) -> drive::Committed {
-    let reserved = center.committed_rows();
-    let c = drive::settle_and_commit(
-        center,
-        Commit {
-            now,
-            frozen: false,
-            afford,
-            reserved,
-            floor,
-        },
-    );
-    let _ = drive::drain_and_pace(center, gate, now, true);
-    c
-}
-
-#[test]
-fn the_bands_quiet_shrink_waits_the_windows_regrow_floor() {
-    use crate::chrome::CHROME_REGROW_SETTLE;
-    let ms = Duration::from_millis;
-    let run = |floored: bool| {
-        let t0 = Instant::now();
-        let mut center = MessageCenter::new(MessageLog::default(), t0);
-        let mut gate = WireGate::default();
-        let _ = center.post(warn("Disk nearly full", 2), STAMP, t0);
-        let c = step_floored(&mut center, &mut gate, t0, MAX_ROWS, None);
-        assert_eq!(c.regrid, Some(1), "a rise is never floored");
-        let drop = t0 + Duration::from_secs(3);
-        let c = step_floored(&mut center, &mut gate, drop, MAX_ROWS, None);
-        assert_eq!(c.regrid, None, "the quiet");
-        let due = drop + SHRINK_QUIET;
-        assert_eq!(drive::state_deadline(&center, &gate, false), Some(due));
-        let birth = due - ms(5);
-        let floor = floored.then(|| birth + CHROME_REGROW_SETTLE);
-        let c = step_floored(&mut center, &mut gate, birth, MAX_ROWS, floor);
-        assert_eq!(c.regrid, None);
-        (center, gate, due, floor)
-    };
-    let (mut center, mut gate, due, floor) = run(true);
-    let floor_at = floor.expect("floored");
-    assert_eq!(
-        drive::state_deadline(&center, &gate, false),
-        Some(floor_at),
-        "the floor, not the quiet's end"
-    );
-    let c = step_floored(&mut center, &mut gate, due, MAX_ROWS, floor);
-    assert_eq!(c.regrid, None, "5 ms after the birth: the band waits");
-    assert_eq!(center.committed_rows(), 1);
-    let c = step_floored(&mut center, &mut gate, floor_at - ms(1), MAX_ROWS, floor);
-    assert_eq!(c.regrid, None);
-    let c = step_floored(&mut center, &mut gate, floor_at, MAX_ROWS, floor);
-    assert_eq!(c.regrid, Some(0), "at the floor, the shrink");
-    assert_eq!(drive::state_deadline(&center, &gate, false), None, "idle");
-    let (mut center, mut gate, due, _) = run(false);
-    let c = step_floored(&mut center, &mut gate, due, MAX_ROWS, None);
-    assert_eq!(c.regrid, Some(0));
-    let (mut center, mut gate, due, floor) = run(true);
-    let c = step_floored(&mut center, &mut gate, due, 0, floor);
-    assert_eq!(c.regrid, Some(0), "the window's own shrink is not floored");
-}
-
-#[test]
-fn a_frozen_step_hands_the_floor_and_arms_no_shrink() {
-    use crate::chrome::CHROME_REGROW_SETTLE;
-    let t0 = Instant::now();
-    let mut center = MessageCenter::new(MessageLog::default(), t0);
-    let mut gate = WireGate::default();
-    let _ = center.post(warn("Disk nearly full", 2), STAMP, t0);
-    let _ = step_floored(&mut center, &mut gate, t0, MAX_ROWS, None);
-    let drop = t0 + Duration::from_secs(3);
-    let _ = step_floored(&mut center, &mut gate, drop, MAX_ROWS, None);
-    let floor = Some(drop + SHRINK_QUIET + CHROME_REGROW_SETTLE);
-    let frozen = drive::settle_and_commit(
-        &mut center,
-        Commit {
-            now: drop,
-            frozen: true,
-            afford: MAX_ROWS,
-            reserved: 1,
-            floor,
-        },
-    );
-    assert_eq!(frozen.regrid, None);
-    assert_eq!(drive::state_deadline(&center, &gate, true), None);
-    assert_eq!(drive::state_deadline(&center, &gate, false), floor);
 }

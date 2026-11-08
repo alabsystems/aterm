@@ -2379,6 +2379,8 @@ pub fn run_node_pass(host: &NodePassHost<'_>) {
                 }
             }
             converge.tend(host, inputs);
+        } else {
+            converge.due.paused();
         }
         std::thread::sleep(host.pace.look);
     }

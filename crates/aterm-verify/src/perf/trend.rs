@@ -656,7 +656,8 @@ which is also where a\n# pre-W-1 hostname is claimed as the box it was measured 
 box name here\n# to merge two machines — add the claim to perf-boxes.tsv, where the chip column \
 keeps it\n# honest. A row a re-record (`--record LANE`) wrote carries `rerecorded` in an eighth column:\n# that lane's new level is declared, and each of its metrics' windows starts there. A row \
 measured\n# at an operating point carries its figures last (the effects GPU keys: \
-`ref_gpu_p50_us=<us>`,\n# `ref_blank_gpu_p50_us=<us>`); a sample that names one is judged only \
+`ratio_ref_gpu_p50_us=<us>`,\n# `ratio_ref_blank_gpu_p50_us=<us>`, from the run supplying that ratio's median); \
+a sample that names one is judged only \
 against rows whose\n# figures are each within OPERATING_POINT_BAND of its own.\n# \
 date\tsha\tbox\tlane/metric\tvalue\ttoolchain\tshape\trerecorded\tpoint...\n";
 
@@ -1203,6 +1204,36 @@ mod tests {
         );
         assert!(fresh.breaches.is_empty(), "a first run never blocks");
         assert!(fresh.elsewhere.is_empty());
+    }
+
+    #[test]
+    fn ratio_local_calibration_excludes_pooled_history_but_keeps_real_slowdowns() {
+        let old = gpu_sample("episode_gpu_rel", 4.5, 270.0, 80.0);
+        let ledger = rows_for("2026-11-08", "old", "boxA", &[old]);
+        let mut local = gpu_sample("episode_gpu_rel", 2.0, 270.0, 80.0);
+        local.at[0].name = "ratio_ref_gpu_p50_us";
+        local.at[1].name = "ratio_ref_blank_gpu_p50_us";
+        let judged_local = judged(&ledger, "boxA", std::slice::from_ref(&local));
+        assert!(judged_local.breaches.is_empty());
+        assert_eq!(judged_local.elsewhere.len(), 1);
+        assert_eq!(
+            judged(
+                &ledger,
+                "boxA",
+                &[gpu_sample("episode_gpu_rel", 2.0, 270.0, 80.0)]
+            )
+            .breaches
+            .len(),
+            1,
+            "the pooled calibration would report the original breach"
+        );
+        let calibrated = rows_for("2026-11-08", "local", "boxA", std::slice::from_ref(&local));
+        local.value = 0.9;
+        assert_eq!(
+            judged(&calibrated, "boxA", &[local]).breaches.len(),
+            1,
+            "a slowdown at the same ratio-local operating point still fails"
+        );
     }
 
     #[test]

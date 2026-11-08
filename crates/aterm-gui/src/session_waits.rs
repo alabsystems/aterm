@@ -478,7 +478,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use aterm_messages::waits::{WAIT_SAMPLE, WAIT_SAMPLE_IDLE};
-    use aterm_messages::{EchoKind, Intent, PROGRESS_GRACE};
+    use aterm_messages::{Intent, PROGRESS_GRACE};
     use aterm_session::sink::SinkWriter;
 
     use crate::app_search::FindAction;
@@ -591,7 +591,6 @@ mod tests {
         assert!(app.session_waits.pastes.is_empty(), "the watch ended");
         assert_eq!(app.session_waits_deadline(), None, "nothing armed");
         assert_eq!(app.messages.live_rows().count(), 0, "no row");
-        assert!(app.messages.echoes().is_empty(), "no echo");
     }
 
     #[test]
@@ -618,7 +617,6 @@ mod tests {
             Some(PROGRESS_GRACE - PROGRESS_GRACE / 4),
             "the grace counts from the paste"
         );
-        assert_eq!(app.message_band_rows, 0, "inside its grace");
         assert!(
             app.session_waits_deadline()
                 .is_some_and(|d| d <= t0 + WAIT_SAMPLE),
@@ -643,13 +641,6 @@ mod tests {
         assert!(app.perform_intent(WindowId(0), id, Intent::StopPaste { session: 0 }));
         assert!(app.session_waits.pastes.is_empty(), "no longer watched");
         assert_eq!(app.messages.live_rows().count(), 0, "the row fades");
-        assert!(
-            app.messages
-                .echoes()
-                .iter()
-                .all(|e| e.kind == EchoKind::Vanish),
-            "a stop claims nothing"
-        );
         let mut chunk = [0u8; 8192];
         while !got.ends_with(b"K") {
             let n = reader.read(&mut chunk).expect("the rest");
@@ -683,7 +674,6 @@ mod tests {
         let late = Instant::now() + PROGRESS_GRACE * 2;
         app.sample_session_waits(late);
         app.settle_messages(late);
-        assert_eq!(app.message_band_rows, 0, "progress stays in the journal");
         let drain = std::thread::spawn(move || {
             let mut sink_bytes = Vec::new();
             let mut chunk = [0u8; 65536];
@@ -702,10 +692,6 @@ mod tests {
         app.sample_session_waits(late + WAIT_SAMPLE);
         assert!(app.session_waits.pastes.is_empty());
         assert_eq!(app.session_waits_deadline(), None, "idle again");
-        assert!(
-            app.messages.echoes().is_empty(),
-            "unshown progress has no visual completion echo"
-        );
         let state = app.messages_state();
         let entry = &state.entries[0];
         assert_eq!(entry.severity, "success");
@@ -753,17 +739,12 @@ mod tests {
         let later = Instant::now() + PROGRESS_GRACE * 2;
         app.sample_session_waits(later);
         app.settle_messages(later);
-        assert_eq!(app.message_band_rows, 0, "progress stays in the journal");
         assert!(app.messages.live(id).is_some(), "the row is still up");
         gauge.pass_done(3_400_000, None);
         gauge.end(aterm_messages::WaitEnd::Done);
         app.sample_session_waits(later + WAIT_SAMPLE);
         assert!(app.session_waits.rewraps.is_empty());
         assert_eq!(app.session_waits_deadline(), None);
-        assert!(
-            app.messages.echoes().is_empty(),
-            "unshown progress has no visual completion echo"
-        );
     }
 
     #[test]
@@ -1018,21 +999,9 @@ mod tests {
         let late = t0 + PROGRESS_GRACE * 2;
         app.sample_session_waits(late);
         app.settle_messages(late);
-        assert_eq!(app.message_band_rows, 0, "progress stays in the journal");
         meter.abandon();
         app.sample_session_waits(late + WAIT_SAMPLE);
         assert!(app.session_waits.pastes.is_empty(), "the watch ended");
-        let completes: Vec<String> = app
-            .messages
-            .echoes()
-            .iter()
-            .filter(|e| e.kind == EchoKind::Complete)
-            .map(|e| e.msg.finished_title())
-            .collect();
-        assert!(
-            completes.is_empty(),
-            "a paste 0 of 1 MB sent ended in a Complete echo: {completes:?}"
-        );
         let state = app.messages_state();
         let entry = &state.entries[0];
         assert_eq!(entry.title, super::PASTE_STOPPED, "{entry:?}");

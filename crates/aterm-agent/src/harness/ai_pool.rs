@@ -1547,10 +1547,8 @@ warm = ["m9"]
             vec![Cli::Codex]
         );
         assert!(
-            accounts_sync::resync_due(&home, &state_dir, &roster_path, NOW + 10)
-                .as_deref()
-                .is_some_and(|why| why.contains("codex's pool has accounts to add")),
-            "resync_due resolves swarm-roster alias m32 -> m100"
+            matches!(accounts_sync::read_resync(&home, &state_dir, &roster_path, NOW + 10), accounts_sync::ResyncRead::Due(why) if why.contains("codex")),
+            "the combined probe resolves swarm-roster alias m32 -> m100"
         );
 
         let resync1 =
@@ -1562,7 +1560,7 @@ warm = ["m9"]
         // Only warm unenrolled rows (`a01` and `a02`) are queued for sign-in, never `csv-only` or `a03`.
         assert_eq!(resync1.to_sign_in.len(), 2);
 
-        // Immediately converged: `needs_init_accounts_sync` and `resync_due` are now false/None.
+        // Immediately converged: init needs no sync and the combined probe reads Current.
         assert!(!accounts_sync::needs_init_accounts_sync(
             &home,
             &state_dir,
@@ -1570,8 +1568,8 @@ warm = ["m9"]
             NOW + 11
         ));
         assert_eq!(
-            accounts_sync::resync_due(&home, &state_dir, &roster_path, NOW + 11),
-            None
+            accounts_sync::read_resync(&home, &state_dir, &roster_path, NOW + 11),
+            accounts_sync::ResyncRead::Current
         );
 
         let claude_roster = accounts::Roster::load(&roster_path).unwrap();

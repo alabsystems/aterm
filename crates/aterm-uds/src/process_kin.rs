@@ -627,10 +627,11 @@ fn namespace_inode(link: &str) -> Option<String> {
     (!inode.is_empty() && inode.bytes().all(|b| b.is_ascii_digit())).then(|| inode.to_owned())
 }
 
-/// Whether macOS's program check holds `pid` now: `Some(true)` when
+/// Whether a program-check hold is established for `pid`: `Some(true)` when
 /// [`aterm_sysprobe::jobs::at_start`] judges it [`aterm_sysprobe::jobs::AtStart::Held`]
 /// (`docs/DESIGN-leftover-processes-2026-10-16.md` §4.2). `None` when unread (gone, another
-/// user's, a pid that is no process).
+/// user's, a pid that is no process). `Some(false)` includes an unresolved start:
+/// the native libproc reader does not identify a per-PID syspolicyd request.
 #[cfg(target_vendor = "apple")]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -656,16 +657,23 @@ pub fn at_program_check(_pid: i32) -> Option<bool> {
 }
 
 /// Whether `pid`'s one thread has run, for a reader that would read its arguments or signal it:
-/// `Some(false)` for a thread list that is one handle `0`, whatever its age, arch, volume or stop
-/// ([`aterm_sysprobe::jobs::StartFacts::lone_zero`]), since reading such a program's arguments
-/// can hang and whether a signal reaches it is unmeasured. The other facts are
-/// [`at_program_check`]'s to weigh. `None` when unread.
+/// A nonzero thread handle or positive kernel thread user time establishes execution.
+/// A lone zero handle with zero user time remains unresolved (`Some(false)`),
+/// whatever its age, arch, volume or stop. Its arguments can hang a reader and
+/// whether a signal reaches it is unmeasured. `None` when unread, including
+/// unread user time for a lone zero handle. Neither unresolved result attributes a cause.
 #[cfg(target_vendor = "apple")]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn thread_ran(pid: i32) -> Option<bool> {
     let pid = u32::try_from(pid).ok().filter(|p| *p > 0)?;
-    aterm_sysprobe::jobs::read_start(pid, aterm_sysprobe::jobs::now_us()).map(|f| !f.lone_zero)
+    aterm_sysprobe::jobs::read_start(pid, aterm_sysprobe::jobs::now_us()).and_then(|f| {
+        if f.lone_zero {
+            f.user_ns.map(|ns| ns > 0)
+        } else {
+            Some(true)
+        }
+    })
 }
 
 /// See the Apple twin: nothing on Linux holds a program before its first instruction, so every
@@ -1115,6 +1123,8 @@ mod tests {
         const NINE_H: u64 = 9 * 3_600_000;
         let held = |age_ms| StartFacts {
             lone_zero: true,
+            user_ns: Some(0),
+            program_check_wait: true,
             local: Some(true),
             age_ms: Some(age_ms),
             ..StartFacts::default()
@@ -1124,16 +1134,24 @@ mod tests {
             2 => Some(held(20_000)),
             3 => Some(held(0)),
             4 => Some(StartFacts::default()),
+            6 => Some(StartFacts {
+                program_check_wait: false,
+                ..held(NINE_H)
+            }),
+            7 => Some(StartFacts {
+                user_ns: Some(1),
+                ..held(NINE_H)
+            }),
             _ => None,
         };
         assert_eq!(
-            held_among(&[1, 2, 3, 4, 5], read),
+            held_among(&[1, 2, 3, 4, 5, 6, 7], read),
             HeldNow {
                 count: 2,
                 oldest_ms: NINE_H
             }
         );
-        assert_eq!(held_among(&[3, 4, 5], read), HeldNow::default());
+        assert_eq!(held_among(&[3, 4, 5, 6, 7], read), HeldNow::default());
     }
 
     /// Only a held row forked at or after the daemon's start counts: one forked before it, a
@@ -1145,6 +1163,8 @@ mod tests {
         const T: u64 = 1_800_000_000_000_000;
         let held = |start_us| StartFacts {
             lone_zero: true,
+            user_ns: Some(0),
+            program_check_wait: true,
             local: Some(true),
             age_ms: Some(30_000),
             start_us,
