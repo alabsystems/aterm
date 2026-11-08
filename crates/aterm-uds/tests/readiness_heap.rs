@@ -4,7 +4,8 @@
 //! Count allocations on the calling thread, independently of the test runner.
 #![cfg(unix)]
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use aterm_bench::allocator::{Observed, Observer};
+use std::alloc::System;
 use std::cell::Cell;
 use std::io::{Read as _, Write as _};
 use std::os::fd::AsFd as _;
@@ -20,34 +21,20 @@ struct Counting;
 fn count() {
     let _ = COUNTING.try_with(|on| {
         if on.get() {
-            let _ = CALLS.try_with(|calls| calls.set(calls.get() + 1));
+            let _ = CALLS.try_with(|calls| calls.set(calls.get().wrapping_add(1)));
         }
     });
 }
 
-// SAFETY: every operation forwards the allocator's original pointer and layout
-// to System. The constant thread-local counters allocate nothing.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+// SAFETY: constant, drop-free thread-locals and wrapping arithmetic neither allocate nor unwind.
+unsafe impl Observer for Counting {
+    fn requested(&self, _size: usize) {
         count();
-        // SAFETY: the caller supplied this valid layout.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        count();
-        // SAFETY: the pointer, original layout and new size come from the caller.
-        unsafe { System.realloc(pointer, layout, size) }
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        // SAFETY: the matching pointer and layout come from the caller.
-        unsafe { System.dealloc(pointer, layout) }
     }
 }
 
 #[global_allocator]
-static ALLOCATOR: Counting = Counting;
+static ALLOCATOR: Observed<System, Counting> = Observed::new(System, Counting);
 
 fn measured<T>(work: impl FnOnce() -> T) -> (T, usize) {
     CALLS.with(|calls| calls.set(0));

@@ -7,6 +7,9 @@
     reason = "never linked into the shipped binary: the verify CLI spawns its checks"
 )]
 
+/// The exact first-exec line B1's frozen release-tool proof expects.
+pub const FROZEN_TOOL_VERSION: &str = "aterm-verify tool 1";
+
 #[cfg(all(test, unix, debug_assertions))]
 mod benchmark_fixture_tests;
 
@@ -1176,6 +1179,7 @@ pub(crate) type Admitter = fn(
 #[derive(Clone, Copy)]
 struct Seams {
     stage: fn(&Ctx, &plan::StageSpec) -> Report,
+    prepare_cells: Option<fn(&Ctx) -> Option<cells::PreparedRun>>,
     admit_quiet: Admitter,
     admit_memory: Admitter,
 }
@@ -1183,6 +1187,7 @@ struct Seams {
 /// The stages themselves, and the per-user capacity ledger on the live machine.
 const LIVE: Seams = Seams {
     stage: stages::run_stage,
+    prepare_cells: Some(stages::prepare_cells),
     admit_quiet: admit_live,
     admit_memory: admit_live,
 };
@@ -2023,7 +2028,16 @@ fn claim_bytes(
     }
 }
 
-/// One stage, run by `seams.stage` once its memory is claimed ([`claim_memory`]), on the run's
+fn before_stage_claim(ctx: &Ctx) -> Result<(), String> {
+    #[cfg(unix)]
+    if ctx.background && watch::foreground_waiting(&ctx.root)? {
+        exec::group::stop_run();
+        return Err("background sample yielded to foreground work".into());
+    }
+    Ok(())
+}
+
+/// One stage, run by its callback once its memory is claimed ([`claim_memory`]), on the run's
 /// quiet machine when it is timed ([`quietly`]), with the machine read as it starts and as it
 /// ends and its memory metered ([`memory::Meter`]): the report, when it started (after any
 /// admission wait) and what the machine did meanwhile, with `held`, what the run's memory budget
@@ -2044,8 +2058,8 @@ fn staged(
     held: Option<String>,
     seams: Seams,
     on_started: impl Fn(),
+    run_stage: impl Fn() -> Report,
 ) -> (Report, Instant, String, Option<memory::ObservedCpu>) {
-    let stage = seams.stage;
     let could_not_run = |why: String, held: Option<String>| {
         let mut report = Report::new(spec.title.clone());
         report.cannot_run(format!("{} — {why}", spec.title));
@@ -2061,11 +2075,7 @@ fn staged(
         }
     });
     let run = || {
-        #[cfg(unix)]
-        if ctx.background && watch::foreground_waiting(&ctx.root)? {
-            exec::group::stop_run();
-            return Err("background sample yielded to foreground work".into());
-        }
+        before_stage_claim(ctx)?;
         let claim = claim_memory(ctx, spec, seams.admit_memory)?;
         let _reservation =
             holding_resource_claim(claim.as_ref().map(|held| Arc::clone(&held.claim)));
@@ -2077,7 +2087,7 @@ fn staged(
         let begun = Instant::now();
         let from = aterm_capacity::Live.read(None);
         on_started();
-        let report = stage(ctx, spec);
+        let report = run_stage();
         let to = aterm_capacity::Live.read(None);
         Ok((report, begun, aterm_capacity::between(&from, &to), claim))
     };
@@ -2237,6 +2247,58 @@ fn run_with(
     let _ = write!(log, "{}", toolchain_lines(ctx));
 
     let stages = plan::plan(ctx);
+    // Readiness is diagnostic, not a success dependency of any native stage. Keep the captured
+    // stock and terminal unready-cell results owned by this invocation, not by reusable Ctx.
+    let cell_stage = stages
+        .iter()
+        .find(|stage| stage.id == plan::StageId::ForeignCells);
+    let mut preparation = if cell_stage.is_some() && ended(ctx).is_none() {
+        seams.prepare_cells.and_then(|prepare| prepare(ctx))
+    } else {
+        None
+    };
+    let mut observed = true;
+    if let (Some(spec), Some(prepared)) = (cell_stage, preparation.as_mut())
+        && prepared.needs_resolution()
+    {
+        // A failed admission defers resolution to the ordinary cells stage; it cannot invent
+        // a missing-tool result or prevent the other checks from running.
+        observed = false;
+        if before_stage_claim(ctx).is_ok()
+            && let Ok(claim) = claim_memory(ctx, spec, seams.admit_memory)
+            && ended(ctx).is_none()
+        {
+            let _reservation =
+                holding_resource_claim(claim.as_ref().map(|held| Arc::clone(&held.claim)));
+            let _covering = memory::covering(claim.as_ref().and_then(ResourceClaim::cover));
+            prepared.resolve_unready(ctx);
+            observed = true;
+        }
+    }
+    if let Some(prepared) = &preparation
+        && observed
+    {
+        for (cell, triple, why) in prepared.unavailable(ctx) {
+            let event = ctx.record_event(&format!(
+                "verify-event: {}",
+                aterm_json::json!({
+                    "schema":1, "event":"cell-prerequisite-unavailable", "complete":false,
+                    "cell":cell, "triple":triple, "detail":why
+                })
+            ));
+            out.write_all(event.as_bytes())?;
+            writeln!(
+                out,
+                "verify: cell prerequisite {cell} ({triple}): {why} (preparation only; cells check not finished)"
+            )?;
+            out.flush()?;
+            let _ = writeln!(
+                log,
+                "cell prerequisite {cell} ({triple}): {why} (preparation only; cells check not finished)"
+            );
+        }
+    }
+    let preparation = Mutex::new(preparation);
     let owners: Vec<Option<Check>> = stages
         .iter()
         .map(|s| checks::owner(s.id, &ctx.checks))
@@ -2273,12 +2335,34 @@ fn run_with(
                 .unwrap_or_default();
             let owner = owners[i].and_then(|c| ctx.checks.iter().position(|k| *k == c));
             let held = held_note(&stages, i, held, budget);
-            let (report, begun_at, machine, cpu) = staged(ctx, &quiet, spec, held, seams, || {
-                let event = ctx.record_event(&report::stage_started(i, &spec.title));
-                if let Ok(mut o) = out.lock() {
-                    let _ = o.write_all(event.as_bytes()).and_then(|()| o.flush());
-                }
-            });
+            let (report, begun_at, machine, cpu) = staged(
+                ctx,
+                &quiet,
+                spec,
+                held,
+                seams,
+                || {
+                    let event = ctx.record_event(&report::stage_started(i, &spec.title));
+                    if let Ok(mut o) = out.lock() {
+                        let _ = o.write_all(event.as_bytes()).and_then(|()| o.flush());
+                    }
+                },
+                || {
+                    let prepared = if spec.id == plan::StageId::ForeignCells {
+                        preparation
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take()
+                    } else {
+                        None
+                    };
+                    if let Some(prepared) = prepared {
+                        stages::run_stage_prepared(ctx, spec, Some(prepared))
+                    } else {
+                        (seams.stage)(ctx, spec)
+                    }
+                },
+            );
             let waiting = begun_at.saturating_duration_since(t0);
             let execution = begun_at.elapsed();
             // The ordered log and aggregate check result can wait for other stages;
@@ -4113,7 +4197,11 @@ mod tests {
             &mut LiveOutput,
             &mut std::io::sink(),
             &Show::default(),
-            Seams { stage, ..LIVE },
+            Seams {
+                stage,
+                prepare_cells: None,
+                ..LIVE
+            },
         );
         assert_eq!(result.unwrap(), exit::PASS);
         assert!(REPORTED.load(Ordering::SeqCst));
@@ -4152,7 +4240,11 @@ mod tests {
                 &mut Vec::new(),
                 &mut log,
                 &Show::default(),
-                Seams { stage, ..LIVE }
+                Seams {
+                    stage,
+                    prepare_cells: None,
+                    ..LIVE
+                }
             )
             .unwrap(),
             exit::PASS
@@ -4203,7 +4295,11 @@ mod tests {
             &mut out,
             &mut log,
             &Show::default(),
-            Seams { stage, ..LIVE },
+            Seams {
+                stage,
+                prepare_cells: None,
+                ..LIVE
+            },
         )
         .unwrap();
         assert_eq!(code, exit::PASS);
@@ -4325,7 +4421,11 @@ mod tests {
             &mut out,
             &mut std::io::sink(),
             &Show::default(),
-            Seams { stage, ..LIVE },
+            Seams {
+                stage,
+                prepare_cells: None,
+                ..LIVE
+            },
         )
         .unwrap();
         assert_eq!(code, exit::FAILED);
@@ -4462,6 +4562,7 @@ mod tests {
                 &Show::default(),
                 Seams {
                     stage,
+                    prepare_cells: None,
                     admit_quiet: LIVE.admit_quiet,
                     admit_memory: LIVE.admit_memory,
                 },

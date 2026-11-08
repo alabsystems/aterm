@@ -65,6 +65,7 @@ aterm-bidi = { workspace = true }
 aterm-sixel = { workspace = true }
 
 [dev-dependencies]
+aterm-bench = { path = "../aterm-bench" }
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-core = { workspace = true }

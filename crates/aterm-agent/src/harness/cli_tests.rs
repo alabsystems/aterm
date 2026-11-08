@@ -48,6 +48,9 @@ mod outlook_report;
 #[path = "cli_history_tests.rs"]
 mod history_report;
 
+#[path = "cli_account_backfill_tests.rs"]
+mod account_backfill;
+
 #[path = "cli_upgrade_policy_tests.rs"]
 mod upgrade_policy;
 

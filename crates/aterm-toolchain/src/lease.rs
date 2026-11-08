@@ -206,6 +206,90 @@ impl Lease {
         Ok(descriptor)
     }
 
+    /// Adopt an explicitly inherited lease descriptor for `toolchain_dir` under the
+    /// independently selected store `prefix`.
+    ///
+    /// `leaf` is only a bounded locator. The subject is derived from `prefix` and
+    /// `toolchain_dir`, and the accepted leaf must be one this lease implementation can have
+    /// generated for that exact subject. No environment-supplied path or subject grants lease
+    /// custody.
+    ///
+    /// The owned descriptor is consumed on every answer, including a refusal before or after the
+    /// lock boundary. Callers never recover or close its former raw number.
+    ///
+    /// # Safety
+    /// Call before threads or callbacks can close, replace or otherwise use `fd`'s raw number,
+    /// with the exclusive startup custody required by
+    /// [`crate::record_lock::CloseOnlyLock::adopt_inherited`]. `prefix` and `toolchain_dir`
+    /// must have been selected independently of the inherited descriptor and its environment
+    /// locator.
+    ///
+    /// # Errors
+    /// The store paths or leaf do not identify one exact managed subject, the inherited
+    /// description is not its original held lease, or the current named lease is unsafe.
+    #[cfg(unix)]
+    pub unsafe fn adopt_inherited(
+        fd: std::os::fd::OwnedFd,
+        prefix: &Path,
+        toolchain_dir: &Path,
+        leaf: &str,
+    ) -> io::Result<Self> {
+        // SAFETY: this public boundary carries the caller's startup and path-selection contract.
+        unsafe { Self::adopt_inherited_with(fd, prefix, toolchain_dir, leaf, |_| {}) }
+    }
+
+    #[cfg(unix)]
+    unsafe fn adopt_inherited_with(
+        fd: std::os::fd::OwnedFd,
+        prefix: &Path,
+        toolchain_dir: &Path,
+        leaf: &str,
+        after_lock: impl FnOnce(&Path),
+    ) -> io::Result<Self> {
+        use std::os::fd::{FromRawFd as _, IntoRawFd as _};
+
+        if !prefix.is_absolute() || !toolchain_dir.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "lease adoption needs absolute independently selected store paths",
+            ));
+        }
+        let subject = Subject::of_dir(prefix, toolchain_dir).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "toolchain directory does not name a managed lease subject",
+            )
+        })?;
+        if !inherited_leaf_matches(&subject, leaf) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "inherited lease leaf does not name the selected toolchain subject",
+            ));
+        }
+        let path = dir(prefix).join(leaf);
+        let raw = fd.into_raw_fd();
+        // SAFETY: the caller supplies exclusive startup custody. The expected path is derived
+        // from the independently selected prefix and the strictly validated subject leaf. The
+        // lower boundary consumes `raw` exactly on success and leaves it open on every error.
+        let file = match unsafe { crate::record_lock::CloseOnlyLock::adopt_inherited(raw, &path) } {
+            Ok(file) => file,
+            Err(error) => {
+                // SAFETY: CloseOnlyLock's refusal contract leaves this exclusively offered raw
+                // number open. Reconstructing its sole owner makes this API consume it on error.
+                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
+                return Err(error);
+            }
+        };
+        after_lock(&path);
+        let lease = Self {
+            file,
+            path,
+            subject,
+        };
+        lease.check_current()?;
+        Ok(lease)
+    }
+
     /// Check that the named slot still denotes this actual held description.
     /// This checks lease custody, not SDK authenticity or immutable SDK bytes.
     /// Failure leaves the original lock held and never adopts a replacement.
@@ -250,6 +334,31 @@ impl Lease {
             ))
         }
     }
+}
+
+#[cfg(unix)]
+fn inherited_leaf_matches(subject: &Subject, leaf: &str) -> bool {
+    if leaf.len() > 192 {
+        return false;
+    }
+    let head = format!("{}{HOLDER_SEP}", subject.stem());
+    let Some(tag) = leaf
+        .strip_prefix(&head)
+        .and_then(|name| name.strip_suffix(LEASE_SUFFIX))
+    else {
+        return false;
+    };
+    let Some((pid, nonce)) = tag.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid != "0"
+        && !(pid.len() > 1 && pid.starts_with('0'))
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && !nonce.is_empty()
+        && nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// How long [`Lease::release`] waits for the lease to be let go: a hang detector, not a budget.
@@ -1179,6 +1288,321 @@ mod tests {
             !path.exists(),
             "reclaim removes the positively unlocked slot"
         );
+    }
+
+    #[cfg(unix)]
+    fn inherited(fd: std::os::fd::OwnedFd) -> std::os::fd::OwnedFd {
+        use std::os::fd::AsRawFd as _;
+
+        let raw = fd.as_raw_fd();
+        // SAFETY: the test exclusively owns this candidate and changes only its inheritance
+        // flag, exactly as the controlled exec boundary does.
+        let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+        // SAFETY: the live owned descriptor remains exclusively held by `fd`.
+        assert_eq!(
+            unsafe { libc::fcntl(raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+            0
+        );
+        fd
+    }
+
+    #[cfg(unix)]
+    fn lease_leaf(lease: &Lease) -> String {
+        lease
+            .path()
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("generated lease leaf")
+            .to_owned()
+    }
+
+    /// An inherited offer retains the exact original subject after its sender goes away.
+    /// Mutating the independently derived subject or substituting a fresh open refuses while
+    /// consuming each refused owned offer exactly once (the negative controls).
+    #[cfg(unix)]
+    #[test]
+    fn inherited_lease_adopts_only_the_selected_subjects_original_description() {
+        use std::os::fd::AsRawFd as _;
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let bin = root.path().join("store/trust/9192/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let original = take_for_dir(root.path(), &bin, "exec sender")
+            .unwrap()
+            .expect("managed store toolchain");
+        let path = original.path().to_owned();
+        let leaf = lease_leaf(&original);
+
+        let wrong_dir = root.path().join("store/trust/9193/bin");
+        std::fs::create_dir_all(&wrong_dir).unwrap();
+        let wrong_subject = inherited(original.try_clone_descriptor().unwrap());
+        let wrong_raw = wrong_subject.as_raw_fd();
+        // SAFETY: this is an exclusive inherited-form offer. The deliberately wrong subject
+        // refuses while consuming the owned offer.
+        assert!(
+            unsafe { Lease::adopt_inherited(wrong_subject, root.path(), &wrong_dir, &leaf) }
+                .is_err()
+        );
+        // SAFETY: F_GETFD only observes that the refused OwnedFd was consumed.
+        assert_eq!(unsafe { libc::fcntl(wrong_raw, libc::F_GETFD) }, -1);
+
+        let independently_opened = std::fs::File::open(&path).unwrap();
+        let independent = inherited(independently_opened.into());
+        let independent_raw = independent.as_raw_fd();
+        // SAFETY: this known-ineligible independent description is supplied only for checked
+        // refusal; the boundary consumes it.
+        assert!(unsafe { Lease::adopt_inherited(independent, root.path(), &bin, &leaf) }.is_err());
+        // SAFETY: F_GETFD only observes that the refused OwnedFd was consumed.
+        assert_eq!(unsafe { libc::fcntl(independent_raw, libc::F_GETFD) }, -1);
+
+        let offered = inherited(original.try_clone_descriptor().unwrap());
+        let offered_raw = offered.as_raw_fd();
+        // SAFETY: the actual shared description is exclusively offered before any thread can
+        // reuse its number, and both paths were selected independently of the offer.
+        let adopted = unsafe { Lease::adopt_inherited(offered, root.path(), &bin, &leaf) }.unwrap();
+        // SAFETY: successful adoption consumed and closed the advertised raw number.
+        assert_eq!(unsafe { libc::fcntl(offered_raw, libc::F_GETFD) }, -1);
+        assert_eq!(adopted.subject(), &trust(9192));
+        assert_eq!(adopted.path(), path);
+        drop(original);
+        assert!(
+            matches!(holders(root.path(), &trust(9192)), Holders::Held(_)),
+            "the adopted description alone retains the selected toolchain"
+        );
+        drop(adopted);
+        assert_eq!(let_go_within(&path, LET_GO_HANG), Ok(()));
+        assert_eq!(holders(root.path(), &trust(9192)), Holders::Free);
+    }
+
+    /// A refusal after the lower lock boundary has consumed the inherited raw slot must never
+    /// close that numeric slot again. An isolated re-exec keeps parallel tests out of this
+    /// process's descriptor table; there the callback replaces the named lease after adoption
+    /// and deliberately reuses the former number for an unrelated sentinel before
+    /// `check_current` refuses. NEGATIVE CONTROL: closing the advertised raw number for every
+    /// outer error closes the sentinel and makes its final write fail.
+    #[cfg(unix)]
+    #[test]
+    fn a_post_boundary_refusal_never_closes_a_reused_descriptor() {
+        use std::cell::RefCell;
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+
+        const NAME: &str = "lease::tests::a_post_boundary_refusal_never_closes_a_reused_descriptor";
+        const ISOLATED: &str = "ATERM_TOOLCHAIN_LEASE_REUSED_FD_ISOLATED";
+        if std::env::var_os(ISOLATED).is_none() {
+            let mut isolated = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+            isolated
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(ISOLATED, "1");
+            let output = aterm_uds::deadline::output_within(
+                &mut isolated,
+                std::time::Duration::from_secs(60),
+            )
+            .expect("run the descriptor-custody fixture in its own process");
+            assert!(
+                output.status.success(),
+                "isolated descriptor-custody fixture failed:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let bin = root.path().join("store/trust/9192/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let original = take_for_dir(root.path(), &bin, "exec sender")
+            .unwrap()
+            .expect("managed store toolchain");
+        let leaf = lease_leaf(&original);
+        let moved = original.path().with_extension("lease.moved");
+        let sentinel_path = root.path().join("unrelated-sentinel");
+        let offered = inherited(original.try_clone_descriptor().unwrap());
+        let former_raw = offered.as_raw_fd();
+        let sentinel = RefCell::new(None);
+
+        // SAFETY: this single-threaded fixture owns the inherited-form descriptor and selects
+        // both paths independently. The callback runs only after the lower boundary consumed the
+        // raw slot and retains the unrelated file that deliberately reuses its number.
+        let error = unsafe {
+            Lease::adopt_inherited_with(offered, root.path(), &bin, &leaf, |slot| {
+                std::fs::rename(slot, &moved).unwrap();
+                std::fs::write(slot, b"replacement").unwrap();
+                let unrelated = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .read(true)
+                    .write(true)
+                    .open(&sentinel_path)
+                    .unwrap();
+                assert_eq!(
+                    unrelated.as_raw_fd(),
+                    former_raw,
+                    "the former offer number is reused before the outer refusal"
+                );
+                *sentinel.borrow_mut() = Some(unrelated);
+            })
+        }
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("original lease slot changed"),
+            "{error}"
+        );
+
+        let mut unrelated = sentinel.into_inner().expect("callback retained sentinel");
+        unrelated
+            .write_all(b"still-open")
+            .expect("a post-boundary refusal did not close the reused number");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the descriptor-reuse fixture must publish its unrelated bytes before inspection"
+        )]
+        unrelated.sync_all().unwrap();
+        assert_eq!(std::fs::read(&sentinel_path).unwrap(), b"still-open");
+    }
+
+    /// The release handoff's actual native exec keeps the original lease description visible
+    /// to the kernel until startup adopts it. A corrupted leaf is refused while consuming the
+    /// inherited slot exactly once (the negative control), while the exact leaf remains held after
+    /// the sender's image and all of its close-on-exec descriptions are gone.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_toolchain_lease_is_visible_to_lsof_and_adopts_across_a_real_exec() {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::time::Duration;
+
+        const NAME: &str =
+            "lease::tests::a_toolchain_lease_is_visible_to_lsof_and_adopts_across_a_real_exec";
+        const STAGE: &str = "ATERM_TOOLCHAIN_LEASE_EXEC_STAGE";
+        const PREFIX: &str = "ATERM_TOOLCHAIN_LEASE_EXEC_PREFIX";
+        const TOOLCHAIN: &str = "ATERM_TOOLCHAIN_LEASE_EXEC_TOOLCHAIN";
+        const LEAF: &str = "ATERM_TOOLCHAIN_LEASE_EXEC_LEAF";
+        const FD: &str = "ATERM_TOOLCHAIN_LEASE_EXEC_FD";
+        const PID: &str = "ATERM_TOOLCHAIN_LEASE_EXEC_PID";
+        const REFUSE: &str = "ATERM_TOOLCHAIN_LEASE_EXEC_REFUSE";
+
+        let path = |name: &str| PathBuf::from(std::env::var_os(name).expect("fixture path"));
+        match std::env::var(STAGE).as_deref() {
+            Ok("observer") => {
+                let prefix = path(PREFIX);
+                let toolchain = path(TOOLCHAIN);
+                let fd: std::os::fd::RawFd = std::env::var(FD).unwrap().parse().unwrap();
+                let pid = std::env::var(PID).unwrap();
+                assert_eq!(pid, std::process::id().to_string(), "exec changed the pid");
+                let leaf = std::env::var(LEAF).unwrap();
+                let lease_path = dir(&prefix).join(&leaf);
+                let kernel_path = std::fs::canonicalize(&lease_path).unwrap();
+
+                let mut lsof = aterm_uds::spawnfd::command("/usr/sbin/lsof");
+                lsof.args(["-a", "-p", &pid, "-d", &fd.to_string(), "-Fn"]);
+                let seen = aterm_uds::deadline::output_within(&mut lsof, Duration::from_secs(60))
+                    .expect("lsof the inherited lease");
+                assert!(
+                    seen.status.success(),
+                    "lsof failed: {}",
+                    String::from_utf8_lossy(&seen.stderr)
+                );
+                let lines = String::from_utf8_lossy(&seen.stdout);
+                assert!(
+                    lines.lines().any(|line| line == format!("f{fd}")),
+                    "lsof did not see descriptor {fd}: {lines}"
+                );
+                assert!(
+                    lines.lines().any(|line| line.strip_prefix('n')
+                        == Some(kernel_path.to_string_lossy().as_ref())),
+                    "lsof did not name {}: {lines}",
+                    lease_path.display()
+                );
+                // SAFETY: observer startup exclusively owns the inherited raw number and creates
+                // its one Rust owner before any other code can close or reuse it.
+                let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+
+                if std::env::var_os(REFUSE).is_some() {
+                    // SAFETY: startup exclusively owns the actual inherited description. The
+                    // deliberately corrupted leaf is refused and the OwnedFd is consumed.
+                    assert!(
+                        unsafe {
+                            Lease::adopt_inherited(
+                                fd,
+                                &prefix,
+                                &toolchain,
+                                "wrong-subject@1-1.lease",
+                            )
+                        }
+                        .is_err()
+                    );
+                    println!("toolchain-lease-exec-refused-mutated-leaf");
+                    return;
+                }
+
+                // SAFETY: this single-threaded startup owns the actual inherited description;
+                // the store paths came from the parent fixture, independently of its fd.
+                let lease = unsafe { Lease::adopt_inherited(fd, &prefix, &toolchain, &leaf) }
+                    .expect("adopt the lease handed through exec");
+                assert_eq!(lease.subject(), &trust(9192));
+                assert!(matches!(
+                    holders(&prefix, lease.subject()),
+                    Holders::Held(_)
+                ));
+                println!("toolchain-lease-exec-adopted-original-description");
+                return;
+            }
+            Ok("actor") => {
+                let prefix = path(PREFIX);
+                let toolchain = path(TOOLCHAIN);
+                let lease = take_for_dir(&prefix, &toolchain, "exec sender")
+                    .unwrap()
+                    .expect("managed store toolchain");
+                let leaf = lease_leaf(&lease);
+                let descriptor = lease.try_clone_descriptor().unwrap();
+                let fd = descriptor.as_raw_fd();
+                let mut observer = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+                observer
+                    .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                    .env(STAGE, "observer")
+                    .env(PREFIX, &prefix)
+                    .env(TOOLCHAIN, &toolchain)
+                    .env(LEAF, leaf)
+                    .env(FD, fd.to_string())
+                    .env(PID, std::process::id().to_string());
+                if std::env::var_os(REFUSE).is_some() {
+                    observer.env(REFUSE, "1");
+                }
+                observer.inherit_exec_guards(vec![descriptor]).unwrap();
+                panic!("lease handoff exec returned: {:?}", observer.exec());
+            }
+            _ => {}
+        }
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let toolchain = root.path().join("store/trust/9192/bin");
+        std::fs::create_dir_all(&toolchain).unwrap();
+        for refused in [true, false] {
+            let mut actor = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+            actor
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(STAGE, "actor")
+                .env(PREFIX, root.path())
+                .env(TOOLCHAIN, &toolchain);
+            if refused {
+                actor.env(REFUSE, "1");
+            }
+            let output = aterm_uds::deadline::output_within(&mut actor, Duration::from_secs(60))
+                .expect("run the lease exec actor");
+            assert!(
+                output.status.success(),
+                "lease exec actor failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let output = String::from_utf8_lossy(&output.stdout);
+            let expected = if refused {
+                "toolchain-lease-exec-refused-mutated-leaf"
+            } else {
+                "toolchain-lease-exec-adopted-original-description"
+            };
+            assert!(output.contains(expected), "missing {expected}: {output}");
+        }
     }
 
     #[cfg(unix)]

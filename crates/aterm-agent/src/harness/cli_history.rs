@@ -7,8 +7,11 @@
 //! beneath ([`alab_seen::history`]); with no name, every roster row's, in roster order. Only the
 //! account's own readings count: its label's series and, by its keys, any other of this Mac's
 //! series that holds its rows (a renamed row's), each row judged by the keys it carries
-//! ([`judged`]). It stores nothing of its own: no compaction runs and no derived row is kept.
-//! Nothing calls a provider, and a ledger row's free text is never printed.
+//! ([`judged`]). On a Mac whose roster has one login, the walls its home's transcripts record
+//! from before the series began join the home's row's days ([`account_backfill`], marked
+//! `(backfill)`). It stores nothing of its own: no compaction runs and no derived or backfilled
+//! row is kept. Nothing calls a provider, and neither a ledger row's free text nor a transcript's
+//! text is printed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -18,11 +21,12 @@ use std::process::ExitCode;
 
 use aterm_json::{Map, Value};
 
-use super::{Cli, Env, no_home_for, put_time};
+use super::{Cli, Env, home_profile, no_home_for, put_time, stats_label};
+use crate::harness::account_backfill::{self, Cut, Walls};
 use crate::harness::account_series::{
     self, Close, Day, DayFive, DayWeek, Keys, Said, SeriesRow, Stored,
 };
-use crate::harness::account_stats::{day_of, hm, percent, span as span_word};
+use crate::harness::account_stats::{self, day_of, hm, percent, span as span_word};
 use crate::harness::accounts::{self, SESSION_LIMIT, WEEK_LIMIT, WEEK_WINDOW_S};
 use crate::harness::alab_seen;
 use crate::harness::profile::AccountKey;
@@ -239,6 +243,9 @@ fn by_key(dir: &Path, machine: &str, whos: &[(Who, Option<PathBuf>)]) -> Vec<Vec
 struct Series {
     /// Each file's rows of the account, by `t`.
     files: Vec<Vec<SeriesRow>>,
+    /// The closes the backfill booked to it inside the span ([`account_backfill::book`]), by
+    /// `t`: in memory only.
+    backfill: Vec<SeriesRow>,
     /// Their stored lines inside the span, by `t`, where `--rows` asked for them.
     stored: Vec<(i64, String)>,
     /// The oldest of their rows' `t`.
@@ -460,6 +467,8 @@ struct DayOut {
     events: Vec<Happened>,
     /// Its ledger and journal lines, oldest first.
     lines: Vec<String>,
+    /// The windows whose part of the day counts a close the backfill booked.
+    backfilled: BTreeSet<&'static str>,
 }
 
 impl DayOut {
@@ -484,19 +493,22 @@ fn day_entry(days: &mut BTreeMap<i64, DayOut>, day: i64, tz_at: fn(i64) -> i64) 
             open_x10: None,
             events: Vec::new(),
             lines: Vec::new(),
+            backfilled: BTreeSet::new(),
         }
     })
 }
 
 /// The days of `span` that hold anything, oldest first, under `tz_at`. Each file gives its days
 /// ([`file_days`]: its stored `day` rows and, over what they do not cover, the summaries of its
-/// readings and closes), added up by local date ([`add_day`]); on a day two files both hold (a
-/// row renamed that day), each five-hour window is counted once, from the closes of the
-/// account's files folded by anchor ([`merged_closes`]), wherever the series still holds a
-/// close that ended that day. Over the account's rows of every file with those closes: the
-/// five-hour window still open, on the day of the row that read it, the series' events and each
-/// limit reset used ([`account_series::resets_used`]). And `lines`, the ledger and journal
-/// lines, each on its day.
+/// readings and closes), and so do the backfill's closes, as one more file of closes alone, each
+/// part of a day they count in marked ([`DayOut::backfilled`]); these are added up by local date
+/// ([`add_day`]); on a day two files both hold (a row renamed that day), each five-hour window
+/// is counted once, from the closes of the account's files folded by anchor
+/// ([`merged_closes`]), wherever the series still holds a close that ended that day. Over the
+/// account's rows of every file with those closes: the five-hour window still open, on the day
+/// of the row that read it, the series' events and each limit reset used
+/// ([`account_series::resets_used`]). And `lines`, the ledger and journal lines, each on its
+/// day.
 fn days_of(
     series: &Series,
     lines: &[(i64, String)],
@@ -506,14 +518,17 @@ fn days_of(
 ) -> Vec<DayOut> {
     let mut days: BTreeMap<i64, DayOut> = BTreeMap::new();
     let local = |t: i64| account_series::local_day(t, tz_at);
-    let own_closes: Vec<Vec<SeriesRow>> = series
+    // The account's files, and last the backfill's closes.
+    let files: Vec<&Vec<SeriesRow>> = series
         .files
         .iter()
-        .map(|rows| file_closes(rows, now))
+        .chain(std::iter::once(&series.backfill))
         .collect();
+    let backfill_at = series.files.len();
+    let own_closes: Vec<Vec<SeriesRow>> = files.iter().map(|rows| file_closes(rows, now)).collect();
     let closes = merged_closes(own_closes.iter().flatten().cloned());
     let mut held_by: BTreeMap<i64, BTreeSet<usize>> = BTreeMap::new();
-    for (f, (rows, closes)) in series.files.iter().zip(&own_closes).enumerate() {
+    for (f, (rows, closes)) in files.iter().zip(&own_closes).enumerate() {
         for (row, stored) in file_days(rows, closes, span, tz_at) {
             let Said::Day(d) = &row.said else {
                 continue;
@@ -522,6 +537,14 @@ fn days_of(
             let day = day_entry(&mut days, date, tz_at);
             if stored && !day.stored {
                 (day.t, day.tz_s, day.span_s, day.stored) = (row.t, d.tz_s, d.span_s, true);
+            }
+            if f == backfill_at {
+                if d.five_hour.is_some() {
+                    day.backfilled.insert(SESSION_LIMIT);
+                }
+                if d.seven_day.is_some() {
+                    day.backfilled.insert(WEEK_LIMIT);
+                }
             }
             add_day(&mut day.sum, d);
             held_by.entry(date).or_default().insert(f);
@@ -553,9 +576,9 @@ fn days_of(
         }
     }
     // Every file's rows of the account as one series, its closes folded by anchor.
-    let mut rows: Vec<SeriesRow> = series
-        .files
+    let mut rows: Vec<SeriesRow> = files
         .iter()
+        .copied()
         .flatten()
         .filter(|row| !matches!(row.said, Said::Close(_)))
         .cloned()
@@ -637,8 +660,16 @@ fn happened_words(e: &Happened, tz_at: fn(i64) -> i64) -> String {
 }
 
 /// One day's line: `Sat Nov 7  week 58% → 71% (resets Sun Nov 8 20:50) · 5h 3 windows, peak
-/// 100%, 1 full · reset used 14:10`; the five-hour peak is the day's highest five-hour figure.
+/// 100%, 1 full · reset used 14:10`; the five-hour peak is the day's highest five-hour figure. A
+/// part that counts a close the backfill booked ends `(backfill)`.
 fn day_line(day: &DayOut, tz_at: fn(i64) -> i64) -> String {
+    let marked = |w: &str| {
+        if day.backfilled.contains(w) {
+            " (backfill)"
+        } else {
+            ""
+        }
+    };
     let at = |t: i64| format!("{} {}", day_of(t, tz_at(t)), clock(t, tz_at));
     let mut parts = Vec::new();
     if let Some(week) = day.sum.as_ref().and_then(|s| s.seven_day) {
@@ -651,7 +682,7 @@ fn day_line(day: &DayOut, tz_at: fn(i64) -> i64) -> String {
         if let Some(began) = day.new_week() {
             words = format!("new week {}, {words}", clock(began, tz_at));
         }
-        parts.push(format!("week {figures} ({words})"));
+        parts.push(format!("week {figures} ({words}){}", marked(WEEK_LIMIT)));
     }
     if let Some(five) = day.sum.as_ref().and_then(|s| s.five_hour) {
         let mut bits = Vec::new();
@@ -667,7 +698,7 @@ fn day_line(day: &DayOut, tz_at: fn(i64) -> i64) -> String {
         if let Some(open) = day.open_x10 {
             bits.push(format!("open {}", pct(open)));
         }
-        parts.push(format!("5h {}", bits.join(", ")));
+        parts.push(format!("5h {}{}", bits.join(", "), marked(SESSION_LIMIT)));
     }
     parts.extend(day.events.iter().map(|e| happened_words(e, tz_at)));
     let date = day_of(day.t, day.tz_s);
@@ -698,6 +729,10 @@ fn day_json(day: &DayOut) -> Value {
             f.insert("peak_pct_x10".to_owned(), Value::from(five.peak));
             f.insert("full".to_owned(), Value::from(five.walled));
             f.insert("open_pct_x10".to_owned(), Value::from(day.open_x10));
+            f.insert(
+                "backfill".to_owned(),
+                Value::from(day.backfilled.contains(SESSION_LIMIT)),
+            );
             Value::Object(f)
         }),
     );
@@ -709,6 +744,10 @@ fn day_json(day: &DayOut) -> Value {
             w.insert("last_pct_x10".to_owned(), Value::from(week.last));
             put_time(&mut w, "resets_at", Some(week.reset));
             put_time(&mut w, "new_window", day.new_week());
+            w.insert(
+                "backfill".to_owned(),
+                Value::from(day.backfilled.contains(WEEK_LIMIT)),
+            );
             Value::Object(w)
         }),
     );
@@ -730,12 +769,83 @@ fn day_json(day: &DayOut) -> Value {
     Value::Object(o)
 }
 
+/// The home the environment names, as the backfill reads it ([`account_backfill`]).
+struct Home {
+    /// The label `accounts stats` names it by ([`stats_label`]).
+    label: String,
+    /// What its transcripts hold and the newest instant another account was seen on it
+    /// ([`account_stats::another_seen`]), or why nothing is booked to it: `not-the-home` (no
+    /// block of its label is made, so nothing is read), `several-logins` (the roster lists
+    /// several, so its walls may be any of theirs), `no-home` (no Claude Code directory is known)
+    /// or `another-account` (the label's record is another account's than the one the home's
+    /// profile names).
+    read: Result<(Walls, Option<i64>), &'static str>,
+}
+
+impl Home {
+    /// The home `env` names, of `records`, read for a history over `span` where `wanted` says a
+    /// block of its label is made: its transcripts last written since the span's start less a
+    /// week (no close of a wall before then ends inside the span) and since another account was
+    /// last seen on it, within [`account_backfill::READ_BYTES`] and [`super::STATS_FOLD_S`].
+    fn of(
+        env: &Env,
+        records: &accounts::AccountRecords,
+        span: Span,
+        wanted: impl FnOnce(&str) -> bool,
+    ) -> Home {
+        let profile = home_profile(env);
+        let key = profile.as_ref().ok().and_then(|p| p.key);
+        let label = stats_label(env, key, &records.roster);
+        let read = if !wanted(&label) {
+            Err("not-the-home")
+        } else if records.roster.several() {
+            Err("several-logins")
+        } else if let Some(dir) = env.claude_dir() {
+            let record = records.state.accounts.get(&label);
+            if record.is_some_and(|a| a.of_another(key)) {
+                Err("another-account")
+            } else {
+                let seen = account_stats::another_seen(
+                    env.now,
+                    records.roster.several(),
+                    record,
+                    profile.as_ref().ok(),
+                );
+                let since = span
+                    .from
+                    .saturating_sub(WEEK_WINDOW_S)
+                    .max(seen.unwrap_or(i64::MIN));
+                let start = std::time::Instant::now();
+                let limits = crate::harness::spend::Limits {
+                    bytes: account_backfill::READ_BYTES,
+                    until: start.checked_add(std::time::Duration::from_secs(super::STATS_FOLD_S)),
+                };
+                let walls = account_backfill::read(&dir.join("projects"), since, &limits, env.now);
+                Ok((walls, seen))
+            }
+        } else {
+            Err("no-home")
+        };
+        Home { label, read }
+    }
+}
+
+/// What the backfill did for one account's block: how many closes it booked inside the span,
+/// whether the transcripts were read whole (else what cut the read), or why it booked nothing
+/// (the home's [`Home::read`], or `not-the-home` for an account other than the home's).
+#[derive(Debug, Clone, Copy)]
+struct Booked {
+    booked: usize,
+    cut: Option<Cut>,
+    why: Option<&'static str>,
+}
+
 /// One account's history: who it is, its ledger and journal lines (all of them, with their
-/// instants), and, for Claude Code's pool, its series and days.
+/// instants), and, for Claude Code's pool, its series, its days and what the backfill did.
 struct Block {
     who: Who,
     lines: Vec<(i64, String)>,
-    series: Option<(Series, Vec<DayOut>)>,
+    series: Option<(Series, Vec<DayOut>, Booked)>,
 }
 
 impl Block {
@@ -743,11 +853,16 @@ impl Block {
     fn is_unknown(&self) -> bool {
         self.who.label.is_none()
             && self.who.pk.is_none()
-            && self.series.as_ref().is_none_or(|(s, _)| s.files.is_empty())
+            && self
+                .series
+                .as_ref()
+                .is_none_or(|(s, _, _)| s.files.is_empty() && s.backfill.is_empty())
     }
 
     /// The account's object in `--json`: the lab model's `{label, ac, journal, lines}` and, with
-    /// a series, `span`, `series`, `days` and (with `--rows`) `rows`; without one, `series: false`.
+    /// a series, `span`, `series`, `days`, `backfill` (`{booked, complete, cut, why, closes}`,
+    /// each close as a series row would say it, `src: "backfill"`) and (with `--rows`) `rows`, the
+    /// stored rows alone; without one, `series: false`.
     fn json(&self, span: Span, (machine, journal, rows): (&str, bool, bool)) -> Map {
         let mut o = Map::new();
         o.insert("label".to_owned(), Value::from(self.who.label.clone()));
@@ -762,7 +877,7 @@ impl Block {
                     .collect(),
             ),
         );
-        let Some((series, days)) = &self.series else {
+        let Some((series, days, booked)) = &self.series else {
             o.insert("series".to_owned(), Value::from(false));
             return o;
         };
@@ -778,6 +893,26 @@ impl Block {
             "days".to_owned(),
             Value::Array(days.iter().map(day_json).collect()),
         );
+        let mut b = Map::new();
+        b.insert(
+            "booked".to_owned(),
+            Value::from(u64::try_from(booked.booked).unwrap_or(u64::MAX)),
+        );
+        b.insert("complete".to_owned(), Value::from(booked.cut.is_none()));
+        b.insert("cut".to_owned(), Value::from(booked.cut.map(Cut::as_str)));
+        b.insert("why".to_owned(), Value::from(booked.why));
+        b.insert(
+            "closes".to_owned(),
+            Value::Array(
+                series
+                    .backfill
+                    .iter()
+                    .filter_map(SeriesRow::line)
+                    .filter_map(|line| aterm_json::from_str::<Value>(&line).ok())
+                    .collect(),
+            ),
+        );
+        o.insert("backfill".to_owned(), Value::Object(b));
         if rows {
             o.insert(
                 "rows".to_owned(),
@@ -793,12 +928,13 @@ impl Block {
         o
     }
 
-    /// The account's block of text: its header, then each day's line with that day's ledger
-    /// and journal lines indented beneath, or `nothing recorded in 30d`; with `--rows`, the
-    /// account's stored rows inside the span after it, exactly as stored.
+    /// The account's block of text: its header (which says `transcripts read in part (<cut>)`
+    /// where the backfill's read was cut), then each day's line with that day's ledger and
+    /// journal lines indented beneath, or `nothing recorded in 30d`; with `--rows`, the account's
+    /// stored rows inside the span after it, exactly as stored.
     fn text(&self, cli: Cli, span: Span, rows: bool, tz_at: fn(i64) -> i64) -> String {
         let mut out = String::new();
-        let Some((series, days)) = &self.series else {
+        let Some((series, days, booked)) = &self.series else {
             let _ = writeln!(out, "{}{DOT}{}", self.who.name, cli.id());
             if self.lines.is_empty() {
                 out.push_str("  nothing recorded\n");
@@ -820,10 +956,14 @@ impl Block {
         );
         match series.oldest {
             Some(t) => {
-                let _ = writeln!(out, "{DOT}series since {}", at(t));
+                let _ = write!(out, "{DOT}series since {}", at(t));
             }
-            None => out.push_str(" \u{b7} no series yet\n"),
+            None => out.push_str(" \u{b7} no series yet"),
         }
+        if let Some(cut) = booked.cut {
+            let _ = write!(out, "{DOT}transcripts read in part ({})", cut.as_str());
+        }
+        out.push('\n');
         if days.is_empty() {
             let _ = writeln!(out, "  nothing recorded in {}", span_word(span.s));
         }
@@ -920,21 +1060,55 @@ pub(super) fn run(
     let ledger = store.tail(accounts::LEDGER_KEEP_ROWS).unwrap_or_default();
     let seen = alab_seen::current(true);
     let flags = (machine, seen.is_some(), rows);
+    // The home the environment names, read only where a block of its label is made.
+    let home = (cli == Cli::Claude).then(|| {
+        Home::of(env, &records, span, |label| {
+            whos.iter()
+                .any(|(who, _)| who.label.as_deref() == Some(label))
+        })
+    });
     let block_of = |who: Who, own: Option<PathBuf>, elsewhere: Vec<PathBuf>| {
         let journal = seen
             .as_deref()
             .zip(who.pk.as_deref())
             .and_then(|(seen, pk)| seen.accounts.get(pk));
         let lines = alab_seen::history(&who.asked(), &ledger, journal);
-        let series = (cli == Cli::Claude).then(|| {
+        let series = home.as_ref().map(|home| {
             let files: Vec<(PathBuf, bool)> = own
                 .into_iter()
                 .map(|path| (path, true))
                 .chain(elsewhere.into_iter().map(|path| (path, false)))
                 .collect();
-            let series = gather(&files, &who, span, rows);
+            let mut series = gather(&files, &who, span, rows);
+            let booked = match &home.read {
+                _ if who.label.as_deref() != Some(home.label.as_str()) => Booked {
+                    booked: 0,
+                    cut: None,
+                    why: Some("not-the-home"),
+                },
+                Err(why) => Booked {
+                    booked: 0,
+                    cut: None,
+                    why: Some(why),
+                },
+                Ok((walls, another_seen)) => {
+                    series.backfill = account_backfill::book(
+                        walls,
+                        series.files.iter().flatten(),
+                        *another_seen,
+                        ((who.pk.as_deref(), who.key), machine),
+                        env.now,
+                    );
+                    series.backfill.retain(|close| span.holds(close.t));
+                    Booked {
+                        booked: series.backfill.len(),
+                        cut: walls.cut,
+                        why: None,
+                    }
+                }
+            };
             let days = days_of(&series, &lines, span, tz_at, env.now);
-            (series, days)
+            (series, days, booked)
         });
         Block { who, lines, series }
     };

@@ -1040,32 +1040,36 @@ pub(crate) fn kept_lines(
     width: f32,
     lay_out: impl FnOnce() -> Vec<String>,
 ) -> Vec<String> {
+    use std::ops::ControlFlow::{Break, Continue};
     let at = (rule, face_code(face), px.to_bits(), width.to_bits());
-    let font = {
-        let mut fonts = lock_fonts();
+    let font = match with_fonts(|fonts| {
         let Some(font) = fonts.ui_font(face).cloned() else {
-            drop(fonts);
-            return lay_out();
+            return Continue(None);
         };
         match fonts.measures.lines(at, &font, text) {
-            Some((lines, misses)) if misses.is_empty() => return lines.clone(),
+            Some((lines, misses)) if misses.is_empty() => return Break(lines.clone()),
             Some((lines, misses)) => {
                 let (lines, misses) = (lines.clone(), misses.clone());
                 if misses.iter().all(|&(character, advance)| {
                     fonts.ui_miss_advance(face, character, px).to_bits() == advance
                 }) {
-                    return lines;
+                    return Break(lines);
                 }
             }
             None => {}
         }
-        font
+        Continue(Some(font))
+    }) {
+        Break(lines) => return lines,
+        Continue(None) => return lay_out(),
+        Continue(Some(font)) => font,
     };
     let lines = lay_out();
-    let mut fonts = lock_fonts();
-    if let Some(misses) = ui_misses(&mut fonts, &font, face, text, px) {
-        fonts.measures.keep_lines(at, &font, text, &lines, misses);
-    }
+    with_fonts(|fonts| {
+        if let Some(misses) = ui_misses(fonts, &font, face, text, px) {
+            fonts.measures.keep_lines(at, &font, text, &lines, misses);
+        }
+    });
     lines
 }
 
@@ -1284,10 +1288,12 @@ fn chrome_fonts() -> &'static Mutex<ChromeFonts> {
 }
 
 #[cfg(not(test))]
-fn lock_fonts() -> std::sync::MutexGuard<'static, ChromeFonts> {
-    chrome_fonts()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+fn with_fonts<R>(visit: impl FnOnce(&mut ChromeFonts) -> R) -> R {
+    visit(
+        &mut chrome_fonts()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
 }
 
 #[cfg(test)]
@@ -1327,16 +1333,20 @@ fn stroke_visits() -> u64 {
 }
 
 #[cfg(test)]
-fn lock_fonts() -> std::sync::MutexGuard<'static, ChromeFonts> {
+// A visit cannot return a borrow of this thread's store. Owning it here lets thread exit
+// release its faces, glyphs and semantic worker instead of retaining them for the process.
+fn with_fonts<R>(visit: impl FnOnce(&mut ChromeFonts) -> R) -> R {
     thread_local! {
-        static FONTS: &'static Mutex<ChromeFonts> =
-            Box::leak(Box::new(Mutex::new(default_chrome_fonts())));
+        static FONTS: Mutex<ChromeFonts> = Mutex::new(default_chrome_fonts());
     }
     FONT_STORE_VISITS.with(|visits| visits.set(visits.get() + 1));
-    FONTS
-        .with(|fonts| *fonts)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    FONTS.with(|fonts| {
+        visit(
+            &mut fonts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    })
 }
 
 /// Install the renderer-resolved chrome faces, `(bytes, collection index)` of the primary terminal
@@ -1348,7 +1358,7 @@ pub(crate) fn set_chrome_fonts(
     semantic: Option<Renderer>,
 ) {
     let (p, b) = (chrome_face_for_slot(&primary), chrome_face_for_slot(&bold));
-    reload_chrome_fonts_locked(&mut lock_fonts(), p, b, semantic);
+    with_fonts(|fonts| reload_chrome_fonts_locked(fonts, p, b, semantic));
 }
 
 fn chrome_face_for_slot(slot: &Option<(std::sync::Arc<[u8]>, u32)>) -> Option<ChromeFace> {
@@ -1376,12 +1386,9 @@ pub(crate) fn prepare_chrome_fonts(
 }
 
 pub(crate) fn set_prepared_chrome_fonts(prepared: PreparedChromeFonts) {
-    reload_chrome_fonts_locked(
-        &mut lock_fonts(),
-        prepared.primary,
-        prepared.bold,
-        prepared.semantic,
-    );
+    with_fonts(|fonts| {
+        reload_chrome_fonts_locked(fonts, prepared.primary, prepared.bold, prepared.semantic)
+    });
 }
 
 fn reload_chrome_fonts_locked(
@@ -1433,7 +1440,7 @@ fn land_chrome_coverage(warm: impl FnOnce() -> usize, wake: impl FnOnce()) -> us
 pub(crate) fn chrome_coverage_epoch() -> u64 {
     use std::hash::Hasher;
 
-    coverage_epoch_locked(&mut lock_fonts()).finish()
+    with_fonts(|fonts| coverage_epoch_locked(fonts).finish())
 }
 
 /// EVERY FACE CHROME TEXT MEASURES IN: [`chrome_coverage_epoch`]'s, and the terminal faces
@@ -1442,10 +1449,11 @@ pub(crate) fn chrome_coverage_epoch() -> u64 {
 pub(crate) fn chrome_measure_epoch() -> u64 {
     use std::hash::{Hash, Hasher};
 
-    let mut fonts = lock_fonts();
-    let mut epoch = coverage_epoch_locked(&mut fonts);
-    fonts.semantic_generation.hash(&mut epoch);
-    epoch.finish()
+    with_fonts(|fonts| {
+        let mut epoch = coverage_epoch_locked(fonts);
+        fonts.semantic_generation.hash(&mut epoch);
+        epoch.finish()
+    })
 }
 
 fn coverage_epoch_locked(fonts: &mut ChromeFonts) -> std::collections::hash_map::DefaultHasher {
@@ -1472,10 +1480,12 @@ fn coverage_epoch_locked(fonts: &mut ChromeFonts) -> std::collections::hash_map:
 /// they stand once it painted (`retain_native_leaf_raster`), so a face its own previews parsed
 /// mid-paint does not draw it again.
 pub(crate) fn chrome_text_holes() -> u64 {
-    lock_fonts().text_holes
+    with_fonts(|fonts| fonts.text_holes)
 }
 
-fn chrome_coverage_warm(fonts: &ChromeFonts) -> Option<impl FnOnce() -> usize + Send + 'static> {
+fn chrome_coverage_warm(
+    fonts: &ChromeFonts,
+) -> Option<impl FnOnce() -> usize + Send + 'static + use<>> {
     let chain = fonts.semantic.as_ref().map(Renderer::fallback_coverage);
     let ui = fonts.ui_cjk.clone();
     (chain.is_some() || ui.is_some())
@@ -1535,21 +1545,23 @@ fn install_chrome_faces_locked(
 /// px and its bitmap is coverage alone: the drop frees what the old scale drew, and starts the
 /// memo again with the chrome a new theme redraws.
 pub(crate) fn forget_kept_glyphs() {
-    lock_fonts().glyphs = GlyphMemo::default();
+    with_fonts(|fonts| fonts.glyphs = GlyphMemo::default());
 }
 
 /// How many glyphs rasters keep for the next on this test thread ([`GlyphMemo`]).
 #[cfg(test)]
 pub(crate) fn kept_glyphs() -> usize {
-    lock_fonts().glyphs.len()
+    with_fonts(|fonts| fonts.glyphs.len())
 }
 
 /// Test-only: turn every kept glyph's coverage over, the stale glyph a test of the memo must see.
 #[cfg(test)]
 pub(crate) fn spoil_kept_glyphs_for_test() {
-    for kept in lock_fonts().glyphs.glyphs.values_mut() {
-        kept.bitmap = kept.bitmap.iter().map(|coverage| !coverage).collect();
-    }
+    with_fonts(|fonts| {
+        for kept in fonts.glyphs.glyphs.values_mut() {
+            kept.bitmap = kept.bitmap.iter().map(|coverage| !coverage).collect();
+        }
+    });
 }
 
 /// Test-only: install `renderer` as this test thread's settled semantic chrome font.
@@ -1558,11 +1570,12 @@ pub(crate) fn install_settled_chrome_fonts_for_test(mut renderer: Renderer) -> u
     renderer.prepare_semantic_typography(
         "Input→present λ π √ ✓ 你好世界 日本語 한글 🚀 😀 🐈\u{200d}⬛ e\u{301}",
     );
-    let mut fonts = lock_fonts();
-    install_chrome_faces_locked(&mut fonts, None, None, Some(renderer));
-    fonts.semantic_prewarm_ms = Some(0);
-    fonts.semantic_worker = None;
-    fonts.semantic_ready_epoch
+    with_fonts(|fonts| {
+        install_chrome_faces_locked(fonts, None, None, Some(renderer));
+        fonts.semantic_prewarm_ms = Some(0);
+        fonts.semantic_worker = None;
+        fonts.semantic_ready_epoch
+    })
 }
 
 /// Drive the real request/result channel without a racing worker.
@@ -1572,13 +1585,14 @@ pub(crate) fn install_pending_chrome_fonts_for_test(
 ) -> PendingChromeFontsForTest {
     let queue = Arc::new(SemanticPrewarmQueue::new());
     let (tx, results) = std::sync::mpsc::channel();
-    let mut fonts = lock_fonts();
-    install_chrome_faces_locked(&mut fonts, None, None, Some(renderer));
-    fonts.semantic_worker = Some(SemanticPrewarmWorker {
-        queue: queue.clone(),
-        results,
-    });
-    PendingChromeFontsForTest { queue, tx }
+    with_fonts(|fonts| {
+        install_chrome_faces_locked(fonts, None, None, Some(renderer));
+        fonts.semantic_worker = Some(SemanticPrewarmWorker {
+            queue: queue.clone(),
+            results,
+        });
+        PendingChromeFontsForTest { queue, tx }
+    })
 }
 
 #[cfg(test)]
@@ -1624,15 +1638,16 @@ impl PendingChromeFontsForTest {
 #[cfg(test)]
 impl Drop for PendingChromeFontsForTest {
     fn drop(&mut self) {
-        let mut fonts = lock_fonts();
-        if fonts
-            .semantic_worker
-            .as_ref()
-            .is_some_and(|worker| Arc::ptr_eq(&worker.queue, &self.queue))
-        {
-            fonts.semantic_worker = None;
-            fonts.semantic_pending = None;
-        }
+        with_fonts(|fonts| {
+            if fonts
+                .semantic_worker
+                .as_ref()
+                .is_some_and(|worker| Arc::ptr_eq(&worker.queue, &self.queue))
+            {
+                fonts.semantic_worker = None;
+                fonts.semantic_pending = None;
+            }
+        });
     }
 }
 
@@ -1640,10 +1655,11 @@ impl Drop for PendingChromeFontsForTest {
 /// does (dormant, no warmup) and parks no worker, so nothing lands through this store later.
 #[cfg(test)]
 pub(crate) fn install_dormant_chrome_fonts_for_test(renderer: Renderer) -> u64 {
-    let mut fonts = lock_fonts();
-    install_chrome_faces_locked(&mut fonts, None, None, Some(renderer));
-    fonts.semantic_worker = None;
-    fonts.semantic_ready_epoch
+    with_fonts(|fonts| {
+        install_chrome_faces_locked(fonts, None, None, Some(renderer));
+        fonts.semantic_worker = None;
+        fonts.semantic_ready_epoch
+    })
 }
 
 /// The broad CJK face the host's built-in fallback chain leads with, where it is installed, so a
@@ -1725,7 +1741,7 @@ pub(crate) fn warm_chrome_coverage_for_test(live: &Renderer) -> usize {
 /// stack and the coverage rung: [`ChromeFonts::face_for`]), without parsing anything.
 #[cfg(test)]
 pub(crate) fn chrome_cascade_reaches_for_test(ch: char) -> bool {
-    lock_fonts().face_for(TextWeight::Regular, ch).is_some()
+    with_fonts(|fonts| fonts.face_for(TextWeight::Regular, ch).is_some())
 }
 
 /// Whether this test thread's chrome draws `ch` in a run set in `face` from a face it holds parsed
@@ -1733,15 +1749,13 @@ pub(crate) fn chrome_cascade_reaches_for_test(ch: char) -> bool {
 /// [`ChromeFonts::ui_miss_face`]), without parsing anything.
 #[cfg(all(test, not(target_os = "macos")))]
 pub(crate) fn chrome_ui_reaches_for_test(face: TextFace, ch: char) -> bool {
-    lock_fonts()
-        .ui_miss_face(face, TextWeight::Regular, ch)
-        .is_some()
+    with_fonts(|fonts| fonts.ui_miss_face(face, TextWeight::Regular, ch).is_some())
 }
 
 /// Test-only generation token for the current libtest worker's chrome-font context.
 #[cfg(test)]
 pub(crate) fn chrome_font_epoch_for_test() -> u64 {
-    lock_fonts().semantic_ready_epoch
+    with_fonts(|fonts| fonts.semantic_ready_epoch)
 }
 
 /// For direct semantic-view tests, which build no renderer backend: install the proportional UI
@@ -1749,19 +1763,20 @@ pub(crate) fn chrome_font_epoch_for_test() -> u64 {
 #[cfg(test)]
 pub(crate) fn prepare_ui_fonts_for_direct_view_test() {
     let ui = prepared_ui_font_assets();
-    let mut fonts = lock_fonts();
-    fonts.ui_regular = ui.regular.clone();
-    fonts.ui_semibold = ui.semibold.clone();
-    if fonts.ui_cjk.is_none() {
-        fonts.set_ui_cjk(ui_cjk_store_for_install());
-    }
+    with_fonts(|fonts| {
+        fonts.ui_regular = ui.regular.clone();
+        fonts.ui_semibold = ui.semibold.clone();
+        if fonts.ui_cjk.is_none() {
+            fonts.set_ui_cjk(ui_cjk_store_for_install());
+        }
+    })
 }
 
 /// Replace this test thread's East Asian UI fallback ([`UiCjkFaces`]): `None` stands in for a host
 /// with no such faces, for a test of the terminal chain's rung under it.
 #[cfg(all(test, not(target_os = "macos")))]
 pub(crate) fn set_ui_cjk_faces_for_test(store: Option<Arc<UiCjkFaces>>) {
-    lock_fonts().set_ui_cjk(store);
+    with_fonts(|fonts| fonts.set_ui_cjk(store));
 }
 
 /// A cold East Asian UI fallback store of this host's faces, nothing parsed, or `None` when the
@@ -1775,18 +1790,20 @@ pub(crate) fn host_ui_cjk_faces_for_test() -> Option<Arc<UiCjkFaces>> {
 /// ([`set_chrome_fonts`]): a test that holds it measures in the same faces whatever the host's.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn set_ui_face_for_test(face: &Arc<ChromeFont>) {
-    let mut fonts = lock_fonts();
-    fonts.ui_regular = Some(Arc::clone(face));
-    fonts.ui_semibold = Some(Arc::clone(face));
+    with_fonts(|fonts| {
+        fonts.ui_regular = Some(Arc::clone(face));
+        fonts.ui_semibold = Some(Arc::clone(face));
+    })
 }
 
 /// The inverse seam: return this test thread's chrome stack to the cold, UI-face-less store.
 #[cfg(test)]
 pub(crate) fn clear_ui_fonts_for_test() {
-    let mut fonts = lock_fonts();
-    fonts.ui_regular = None;
-    fonts.ui_semibold = None;
-    fonts.set_ui_cjk(None);
+    with_fonts(|fonts| {
+        fonts.ui_regular = None;
+        fonts.ui_semibold = None;
+        fonts.set_ui_cjk(None);
+    })
 }
 
 /// An owned, immutable semantic renderer input for deterministic direct-view tests.
@@ -2289,7 +2306,7 @@ fn semantic_font_snapshot_locked(
 pub(crate) fn semantic_font_snapshot_for_test(
     candidate: &crate::widget::SemanticFontCandidate,
 ) -> SemanticFontSnapshot {
-    semantic_font_snapshot_locked(&lock_fonts(), candidate)
+    with_fonts(|fonts| semantic_font_snapshot_locked(fonts, candidate))
 }
 
 type SemanticForkMemo = (
@@ -2307,31 +2324,34 @@ thread_local! {
 pub(crate) fn prepare_semantic_font(
     candidate: &crate::widget::SemanticFontCandidate,
 ) -> PreparedSemanticFont {
-    let mut fonts = lock_fonts();
-    let _ = fonts.ensure_semantic_candidate(candidate);
-    let snapshot = semantic_font_snapshot_locked(&fonts, candidate);
-    let memoized = SEMANTIC_FORK_MEMO.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .and_then(|(memo_candidate, memo_epoch, renderer)| {
-                (memo_candidate == candidate && *memo_epoch == snapshot.ready_epoch)
-                    .then(|| renderer.clone())
-            })
+    let (snapshot, renderer, remember) = with_fonts(|fonts| {
+        let _ = fonts.ensure_semantic_candidate(candidate);
+        let snapshot = semantic_font_snapshot_locked(fonts, candidate);
+        let memoized = SEMANTIC_FORK_MEMO.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .and_then(|(memo_candidate, memo_epoch, renderer)| {
+                    (memo_candidate == candidate && *memo_epoch == snapshot.ready_epoch)
+                        .then(|| renderer.clone())
+                })
+        });
+        let (renderer, remember) = match memoized {
+            Some(renderer) => (renderer, false),
+            None => {
+                let renderer = fonts
+                    .semantic_renderer_fork_for(candidate, 14.0, aterm_render::Theme::default())
+                    .map(Rc::new);
+                (renderer, true)
+            }
+        };
+        (snapshot, renderer, remember)
     });
-    let renderer = match memoized {
-        Some(renderer) => renderer,
-        None => {
-            let renderer = fonts
-                .semantic_renderer_fork_for(candidate, 14.0, aterm_render::Theme::default())
-                .map(Rc::new);
-            drop(fonts);
-            let memo = renderer.clone();
-            SEMANTIC_FORK_MEMO.with(|slot| {
-                *slot.borrow_mut() = Some((candidate.clone(), snapshot.ready_epoch, memo));
-            });
-            renderer
-        }
-    };
+    if remember {
+        let memo = renderer.clone();
+        SEMANTIC_FORK_MEMO.with(|slot| {
+            *slot.borrow_mut() = Some((candidate.clone(), snapshot.ready_epoch, memo));
+        });
+    }
     PreparedSemanticFont {
         candidate: candidate.clone(),
         snapshot,
@@ -2342,28 +2362,30 @@ pub(crate) fn prepare_semantic_font(
 /// The width of `s` at `px` in the chrome stack: real advances with the raster pen's per-char face
 /// pick and fixed-point accumulation.
 pub(crate) fn measure_text(s: &str, px: f32, weight: TextWeight) -> f32 {
-    let mut fonts = lock_fonts();
-    let mut pen_q: i64 = 0;
-    for ch in s.chars() {
-        if let Some(face) = fonts.face_for(weight, ch) {
-            pen_q += px_to_q(face.advance_em(ch) * px);
-            continue;
+    with_fonts(|fonts| {
+        let mut pen_q: i64 = 0;
+        for ch in s.chars() {
+            if let Some(face) = fonts.face_for(weight, ch) {
+                pen_q += px_to_q(face.advance_em(ch) * px);
+                continue;
+            }
+            fonts.note_text_hole();
+            if let Some(advance) = synthesized::advance(ch, px) {
+                pen_q += px_to_q(advance);
+            }
         }
-        fonts.note_text_hole();
-        if let Some(advance) = synthesized::advance(ch, px) {
-            pen_q += px_to_q(advance);
-        }
-    }
-    q_to_px(pen_q)
+        q_to_px(pen_q)
+    })
 }
 
 fn chrome_cap_ratio() -> f32 {
-    let fonts = lock_fonts();
-    fonts
-        .primary
-        .as_ref()
-        .or(fonts.fallback.as_ref())
-        .map_or(0.7, |f| f.cap_ratio)
+    with_fonts(|fonts| {
+        fonts
+            .primary
+            .as_ref()
+            .or(fonts.fallback.as_ref())
+            .map_or(0.7, |f| f.cap_ratio)
+    })
 }
 
 /// The cap-height-centred baseline for a `size`-px run in the row `[y0, y0 + row_h)`
@@ -2520,9 +2542,10 @@ pub(crate) fn install_linux_ui_fonts_for_test(
         ) else {
             continue;
         };
-        let mut fonts = lock_fonts();
-        fonts.ui_regular = Some(regular_face);
-        fonts.ui_semibold = Some(semibold_face);
+        with_fonts(|fonts| {
+            fonts.ui_regular = Some(regular_face);
+            fonts.ui_semibold = Some(semibold_face);
+        });
         return Some(regular);
     }
     None
@@ -2644,7 +2667,7 @@ fn prepared_ui_font_assets() -> &'static UiFontAssets {
 #[cfg(not(test))]
 pub(crate) fn warm_chrome_font_assets() {
     let _ = prepared_ui_font_assets();
-    drop(lock_fonts());
+    with_fonts(|_| ());
 }
 
 /// Tests keep chrome fonts per thread, so a process-global warm means nothing there.
@@ -2655,14 +2678,15 @@ pub(crate) fn warm_chrome_font_assets() {}
 /// chrome-face install epoch with the parsed East Asian UI faces, the coverage rung's size and
 /// the UI regular's presence folded in.
 pub(crate) fn strip_band_font_epoch() -> u64 {
-    font_epoch_in(&mut lock_fonts())
+    with_fonts(font_epoch_in)
 }
 
 /// The UI face `face` sets text in, then [`strip_band_font_epoch`], read under one lock.
 pub(crate) fn ui_font_and_epoch(face: TextFace) -> (Option<Arc<ChromeFont>>, u64) {
-    let mut fonts = lock_fonts();
-    let font = fonts.ui_font(face).cloned();
-    (font, font_epoch_in(&mut fonts))
+    with_fonts(|fonts| {
+        let font = fonts.ui_font(face).cloned();
+        (font, font_epoch_in(fonts))
+    })
 }
 
 /// [`strip_band_font_epoch`] of `fonts`.
@@ -2684,14 +2708,14 @@ fn font_epoch_in(fonts: &mut ChromeFonts) -> u64 {
 /// Whether a real proportional UI face is installed.
 #[cfg(any(not(target_os = "macos"), test))]
 pub(crate) fn strip_band_ui_ready() -> bool {
-    lock_fonts().ui_regular.is_some()
+    with_fonts(|fonts| fonts.ui_regular.is_some())
 }
 
 /// The variable semibold instance for the strip band's active label, or `None` when the host's UI
 /// regular is static (the caller then draws `TextFace::UiBold` from the static sibling or regular).
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn strip_band_variable_semibold() -> Option<UiVariableSemibold> {
-    let installed = lock_fonts().ui_regular.clone()?;
+    let installed = with_fonts(|fonts| fonts.ui_regular.clone())?;
     prepared_ui_font_assets()
         .variable_semibold
         .clone()
@@ -2708,23 +2732,26 @@ pub(crate) fn strip_band_run_coverable(s: &str) -> bool {
 /// [`strip_band_run_coverable`] for a label set in `face`, whose East Asian text is looked up in
 /// the faces of `face`'s weight ([`UiCjkWeight::of`]).
 pub(crate) fn strip_band_run_coverable_in(face: TextFace, s: &str) -> bool {
-    let (ui_cjk, coverage, wanted) = {
-        let mut fonts = lock_fonts();
+    use std::ops::ControlFlow::{Break, Continue};
+    let (ui_cjk, coverage, wanted) = match with_fonts(|fonts| {
         if fonts.ui_regular.is_none() {
-            return false;
+            return Break(false);
         }
         let misses = fonts.label_misses(face, s);
         if misses.is_empty() {
-            return true;
+            return Break(true);
         }
         if !misses.iter().copied().all(chain_may_draw_in_a_label) {
-            return false;
+            return Break(false);
         }
-        (
+        Continue((
             fonts.ui_cjk.clone(),
             fonts.semantic.as_ref().map(Renderer::fallback_coverage),
             misses.into_iter().collect::<String>(),
-        )
+        ))
+    }) {
+        Break(coverable) => return coverable,
+        Continue(wanted) => wanted,
     };
     let rest = match ui_cjk {
         Some(store) => store.materialise_for(UiCjkWeight::of(face), &wanted).1,
@@ -2736,7 +2763,7 @@ pub(crate) fn strip_band_run_coverable_in(face: TextFace, s: &str) -> bool {
         };
         coverage.materialise_for(&rest);
     }
-    lock_fonts().label_misses(face, s).is_empty()
+    with_fonts(|fonts| fonts.label_misses(face, s).is_empty())
 }
 
 fn chain_may_draw_in_a_label(ch: char) -> bool {
@@ -2781,16 +2808,18 @@ pub(crate) fn chrome_colour_emoji(cluster: &str, px: f32) -> Option<Arc<ChromeEm
     if !(px.is_finite() && px >= 1.0) || cluster.is_empty() {
         return None;
     }
-    let generation = lock_fonts().semantic_generation;
+    let generation = with_fonts(|fonts| fonts.semantic_generation);
     MEMO.with_borrow_mut(|memo| {
         if memo
             .as_ref()
             .is_none_or(|(held, bits, _, _)| *held != generation || *bits != px.to_bits())
         {
-            let fork = lock_fonts()
-                .semantic
-                .as_ref()?
-                .fork_semantic_surface(px, aterm_render::Theme::default())?;
+            let fork = with_fonts(|fonts| {
+                fonts
+                    .semantic
+                    .as_ref()?
+                    .fork_semantic_surface(px, aterm_render::Theme::default())
+            })?;
             *memo = Some((generation, px.to_bits(), fork, HashMap::new()));
         }
         let (_, _, renderer, rasters) = memo.as_mut()?;
@@ -2845,19 +2874,20 @@ fn ui_text_wrap_ranges_impl(
     maximum_width: f32,
 ) -> (Vec<std::ops::Range<usize>>, usize) {
     let maximum_width = maximum_width.max(1.0);
-    {
-        let fonts = lock_fonts();
-        if let Some(font) = fonts.ui_font(TextFace::Ui)
-            && let Some(lines) = fonts.measures.wrap(font, px, maximum_width, text)
-        {
-            return lines;
-        }
+    if let Some(lines) = with_fonts(|fonts| {
+        fonts
+            .ui_font(TextFace::Ui)
+            .and_then(|font| fonts.measures.wrap(font, px, maximum_width, text))
+    }) {
+        return lines;
     }
     let (lines, font) = ui_text_wrap_walk(text, px, maximum_width);
     if let Some(font) = font {
-        lock_fonts()
-            .measures
-            .keep_wrap(&font, px, maximum_width, text, &lines);
+        with_fonts(|fonts| {
+            fonts
+                .measures
+                .keep_wrap(&font, px, maximum_width, text, &lines)
+        });
     }
     lines
 }
@@ -2882,40 +2912,41 @@ fn ui_text_wrap_walk(
         return ((std::iter::once(0..0).collect(), 0), None);
     }
 
-    let mut fonts = lock_fonts();
-    let font = fonts.ui_font(TextFace::Ui).cloned();
     let ascii_slot = |character: char| {
         u8::try_from(character)
             .ok()
             .filter(u8::is_ascii)
             .map(usize::from)
     };
-    let mut ascii: [Option<(f32, bool)>; 128] = [None; 128];
-    let mut advances: HashMap<char, (f32, bool)> = HashMap::new();
-    for character in text.chars() {
-        let known = match ascii_slot(character) {
-            Some(slot) => ascii[slot].is_some(),
-            None => advances.contains_key(&character),
-        };
-        if known {
-            continue;
-        }
-        let (advance, ui_covers) = match font.as_ref() {
-            None => (px * 0.6, false),
-            Some(f) if f.maps(character) => (
-                f.char_metrics(character, px).advance_width + UI_TRACKING_EM * px,
-                true,
-            ),
-            Some(_) => (fonts.ui_miss_advance(TextFace::Ui, character, px), false),
-        };
-        match ascii_slot(character) {
-            Some(slot) => ascii[slot] = Some((advance, ui_covers)),
-            None => {
-                advances.insert(character, (advance, ui_covers));
+    let (font, ascii, advances) = with_fonts(|fonts| {
+        let font = fonts.ui_font(TextFace::Ui).cloned();
+        let mut ascii: [Option<(f32, bool)>; 128] = [None; 128];
+        let mut advances: HashMap<char, (f32, bool)> = HashMap::new();
+        for character in text.chars() {
+            let known = match ascii_slot(character) {
+                Some(slot) => ascii[slot].is_some(),
+                None => advances.contains_key(&character),
+            };
+            if known {
+                continue;
+            }
+            let (advance, ui_covers) = match font.as_ref() {
+                None => (px * 0.6, false),
+                Some(f) if f.maps(character) => (
+                    f.char_metrics(character, px).advance_width + UI_TRACKING_EM * px,
+                    true,
+                ),
+                Some(_) => (fonts.ui_miss_advance(TextFace::Ui, character, px), false),
+            };
+            match ascii_slot(character) {
+                Some(slot) => ascii[slot] = Some((advance, ui_covers)),
+                None => {
+                    advances.insert(character, (advance, ui_covers));
+                }
             }
         }
-    }
-    drop(fonts);
+        (font, ascii, advances)
+    });
     let whole_font = font
         .clone()
         .filter(|_| advances.values().all(|(_, ui_covers)| *ui_covers));
@@ -3072,31 +3103,32 @@ pub(crate) fn ui_measures_whole<T>(measure: impl FnOnce() -> T) -> (T, bool) {
 
 /// Face-aware proportional measure.
 pub(crate) fn ui_text_width_for(face: TextFace, s: &str, px: f32) -> f32 {
-    let mut fonts = lock_fonts();
-    if let Some(font) = fonts.ui_font(face)
-        && let Some(width) = fonts.measures.width(face, font, px, s)
-    {
-        return width;
-    }
-    let font = fonts.ui_font(face).cloned();
-    let (width, _, whole) = ui_text_width_walk(&mut fonts, face, s, px, 0.0);
-    match font.as_ref() {
-        Some(font) if whole => fonts.measures.keep_width(face, font, px, s, width),
-        _ => UI_MEASURE_PARTIAL.with(|partial| partial.set(true)),
-    }
-    width
+    with_fonts(|fonts| {
+        if let Some(font) = fonts.ui_font(face)
+            && let Some(width) = fonts.measures.width(face, font, px, s)
+        {
+            return width;
+        }
+        let font = fonts.ui_font(face).cloned();
+        let (width, _, whole) = ui_text_width_walk(fonts, face, s, px, 0.0);
+        match font.as_ref() {
+            Some(font) if whole => fonts.measures.keep_width(face, font, px, s, width),
+            _ => UI_MEASURE_PARTIAL.with(|partial| partial.set(true)),
+        }
+        width
+    })
 }
 
 /// The installed font [`ui_text_width_for`] measures `face` in, or `None` with no UI face installed
 /// (each scalar then measures 0.6 em).
 pub(crate) fn ui_font_of(face: TextFace) -> Option<Arc<ChromeFont>> {
-    lock_fonts().ui_font(face).cloned()
+    with_fonts(|fonts| fonts.ui_font(face).cloned())
 }
 
 /// Whether every scalar in any substring of `s` advances at least `minimum` pixels under the
 /// routing, tracking and kerning the proportional pen uses.
 pub(crate) fn ui_text_advances_at_least(face: TextFace, s: &str, px: f32, minimum: f32) -> bool {
-    ui_text_width_with_floor(&mut lock_fonts(), face, s, px, minimum).1
+    with_fonts(|fonts| ui_text_width_with_floor(fonts, face, s, px, minimum).1)
 }
 
 fn ui_text_width_with_floor(
@@ -3200,37 +3232,38 @@ pub(crate) fn ui_text_widths_at(
     tail: &str,
     px: f32,
 ) -> Vec<f32> {
-    let mut fonts = lock_fonts();
-    let Some(f) = fonts.ui_font(face).cloned() else {
-        let tail_chars = tail.chars().count();
-        return cuts
-            .iter()
+    with_fonts(|fonts| {
+        let Some(f) = fonts.ui_font(face).cloned() else {
+            let tail_chars = tail.chars().count();
+            return cuts
+                .iter()
+                .map(|&cut| {
+                    (text.get(..cut).map_or(0, |prefix| prefix.chars().count()) + tail_chars) as f32
+                        * px
+                        * 0.6
+                })
+                .collect();
+        };
+        let any = |_: f32, _: f32| true;
+        let mut pen = UiPen::default();
+        let mut chars = text.char_indices().peekable();
+        cuts.iter()
             .map(|&cut| {
-                (text.get(..cut).map_or(0, |prefix| prefix.chars().count()) + tail_chars) as f32
-                    * px
-                    * 0.6
-            })
-            .collect();
-    };
-    let any = |_: f32, _: f32| true;
-    let mut pen = UiPen::default();
-    let mut chars = text.char_indices().peekable();
-    cuts.iter()
-        .map(|&cut| {
-            while let Some(&(at, ch)) = chars.peek() {
-                if at >= cut {
-                    break;
+                while let Some(&(at, ch)) = chars.peek() {
+                    if at >= cut {
+                        break;
+                    }
+                    pen.push(fonts, &f, face, ch, px, &any);
+                    chars.next();
                 }
-                pen.push(&mut fonts, &f, face, ch, px, &any);
-                chars.next();
-            }
-            let mut tailed = pen;
-            for ch in tail.chars() {
-                tailed.push(&mut fonts, &f, face, ch, px, &any);
-            }
-            tailed.w
-        })
-        .collect()
+                let mut tailed = pen;
+                for ch in tail.chars() {
+                    tailed.push(fonts, &f, face, ch, px, &any);
+                }
+                tailed.w
+            })
+            .collect()
+    })
 }
 
 fn srgb_to_linear_lut() -> &'static [f32; 256] {
@@ -5357,75 +5390,76 @@ pub(crate) fn rasterize_tray_region(
 }
 
 fn rasterize_tray_on_canvas(prims: &[DrawPrim], scale: f32, mut cv: Canvas) -> Vec<u8> {
-    let mut fonts = lock_fonts();
-    cv.glyphs = std::mem::take(&mut fonts.glyphs);
-    cv.glyphs.begin();
-    let mut frames: Vec<(usize, Rc<aterm_render::Frame>)> = Vec::new();
-    match occluding_specimen(prims, scale, &cv, &mut frames) {
-        Some((cover, covered)) => {
-            let tile = cv.device_bounds();
-            for (x0, y0, x1, y1) in tile_around(tile, covered) {
-                let (clips, fades, subpixel) = (cv.clip.len(), cv.fade.len(), cv.subpixel);
-                cv.push_clip(x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32);
+    with_fonts(|fonts| {
+        cv.glyphs = std::mem::take(&mut fonts.glyphs);
+        cv.glyphs.begin();
+        let mut frames: Vec<(usize, Rc<aterm_render::Frame>)> = Vec::new();
+        match occluding_specimen(prims, scale, &cv, &mut frames) {
+            Some((cover, covered)) => {
+                let tile = cv.device_bounds();
+                for (x0, y0, x1, y1) in tile_around(tile, covered) {
+                    let (clips, fades, subpixel) = (cv.clip.len(), cv.fade.len(), cv.subpixel);
+                    cv.push_clip(x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32);
+                    let mut skipped = 0;
+                    replay_tray(
+                        &mut cv,
+                        fonts,
+                        prims,
+                        0..cover,
+                        scale,
+                        true,
+                        &frames,
+                        &mut skipped,
+                    );
+                    while cv.fade.len() > fades {
+                        cv.pop_fade();
+                    }
+                    cv.clip.truncate(clips);
+                    cv.subpixel = subpixel;
+                }
                 let mut skipped = 0;
                 replay_tray(
                     &mut cv,
-                    &mut fonts,
+                    fonts,
                     prims,
                     0..cover,
+                    scale,
+                    false,
+                    &frames,
+                    &mut skipped,
+                );
+                replay_tray(
+                    &mut cv,
+                    fonts,
+                    prims,
+                    cover..prims.len(),
                     scale,
                     true,
                     &frames,
                     &mut skipped,
                 );
-                while cv.fade.len() > fades {
-                    cv.pop_fade();
-                }
-                cv.clip.truncate(clips);
-                cv.subpixel = subpixel;
             }
-            let mut skipped = 0;
-            replay_tray(
-                &mut cv,
-                &mut fonts,
-                prims,
-                0..cover,
-                scale,
-                false,
-                &frames,
-                &mut skipped,
-            );
-            replay_tray(
-                &mut cv,
-                &mut fonts,
-                prims,
-                cover..prims.len(),
-                scale,
-                true,
-                &frames,
-                &mut skipped,
-            );
+            None => {
+                let mut skipped = 0;
+                replay_tray(
+                    &mut cv,
+                    fonts,
+                    prims,
+                    0..prims.len(),
+                    scale,
+                    true,
+                    &frames,
+                    &mut skipped,
+                );
+            }
         }
-        None => {
-            let mut skipped = 0;
-            replay_tray(
-                &mut cv,
-                &mut fonts,
-                prims,
-                0..prims.len(),
-                scale,
-                true,
-                &frames,
-                &mut skipped,
-            );
+        while !cv.fade.is_empty() {
+            cv.pop_fade();
         }
-    }
-    while !cv.fade.is_empty() {
-        cv.pop_fade();
-    }
-    fonts.glyphs = std::mem::take(&mut cv.glyphs);
-    fonts.glyphs.trim();
-    cv.px
+        fonts.glyphs = std::mem::take(&mut cv.glyphs);
+        fonts.glyphs.trim();
+        cv.px
+    })
 }
 
 #[cfg(test)]
@@ -5598,7 +5632,7 @@ fn covered_by_a_later_panel(
 #[allow(clippy::too_many_arguments)]
 fn replay_tray(
     cv: &mut Canvas,
-    fonts: &mut std::sync::MutexGuard<'static, ChromeFonts>,
+    fonts: &mut ChromeFonts,
     prims: &[DrawPrim],
     range: std::ops::Range<usize>,
     scale: f32,
@@ -6187,15 +6221,15 @@ mod tests {
         let walks = measure_walks();
         let _ = ui_text_width_for(TextFace::Ui, mixed, px);
         assert_eq!(measure_walks(), walks + 1, "never kept");
-        let held = lock_fonts().ui_regular.clone();
+        let held = with_fonts(|fonts| fonts.ui_regular.clone());
         let other = ChromeFace::from_bytes(aterm_render::embedded_font(), 0)
             .map(|face| face.font)
             .expect("the embedded face");
-        lock_fonts().ui_regular = Some(other);
+        with_fonts(|fonts| fonts.ui_regular = Some(other));
         let walks = measure_walks();
         let _ = ui_text_width_for(TextFace::Ui, word, px);
         assert_eq!(measure_walks(), walks + 1, "a new font measures afresh");
-        lock_fonts().ui_regular = held;
+        with_fonts(|fonts| fonts.ui_regular = held);
     }
 
     #[test]
@@ -6218,13 +6252,15 @@ mod tests {
         lay(path);
         lay(path);
         assert_eq!(laid.get(), 1, "kept");
-        for (_, kept) in lock_fonts().measures.lines.values_mut() {
-            for (_, misses) in kept.values_mut() {
-                for (_, advance) in misses.iter_mut() {
-                    *advance ^= 1;
+        with_fonts(|fonts| {
+            for (_, kept) in fonts.measures.lines.values_mut() {
+                for (_, misses) in kept.values_mut() {
+                    for (_, advance) in misses.iter_mut() {
+                        *advance ^= 1;
+                    }
                 }
             }
-        }
+        });
         lay(path);
         assert_eq!(
             laid.get(),
@@ -6303,25 +6339,25 @@ mod tests {
     #[test]
     fn chrome_font_store_is_cold_until_host_preparation_installs_ui_faces() {
         std::thread::spawn(|| {
-            {
-                let fonts = lock_fonts();
+            with_fonts(|fonts| {
                 assert!(fonts.ui_regular.is_none());
                 assert!(fonts.ui_semibold.is_none());
-            }
+            });
 
             set_chrome_fonts(None, None, None);
             let expected = prepared_ui_font_assets();
-            let fonts = lock_fonts();
-            match (&expected.regular, &fonts.ui_regular) {
-                (Some(expected), Some(installed)) => assert!(Arc::ptr_eq(expected, installed)),
-                (None, None) => {}
-                _ => panic!("regular UI face did not match the prepared host asset"),
-            }
-            match (&expected.semibold, &fonts.ui_semibold) {
-                (Some(expected), Some(installed)) => assert!(Arc::ptr_eq(expected, installed)),
-                (None, None) => {}
-                _ => panic!("semibold UI face did not match the prepared host asset"),
-            }
+            with_fonts(|fonts| {
+                match (&expected.regular, &fonts.ui_regular) {
+                    (Some(expected), Some(installed)) => assert!(Arc::ptr_eq(expected, installed)),
+                    (None, None) => {}
+                    _ => panic!("regular UI face did not match the prepared host asset"),
+                }
+                match (&expected.semibold, &fonts.ui_semibold) {
+                    (Some(expected), Some(installed)) => assert!(Arc::ptr_eq(expected, installed)),
+                    (None, None) => {}
+                    _ => panic!("semibold UI face did not match the prepared host asset"),
+                }
+            });
         })
         .join()
         .expect("cold-to-prepared font transition exits cleanly");
@@ -6508,7 +6544,7 @@ mod tests {
         set_chrome_fonts(None, None, None);
         let attempts = UI_FONT_RESOLVE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed);
         assert!(attempts >= 1, "host preparation exercised the resolver");
-        let installed = lock_fonts().ui_regular.clone();
+        let installed = with_fonts(|fonts| fonts.ui_regular.clone());
 
         let tree = UiTree::new(
             UiNode::new(
@@ -6543,7 +6579,7 @@ mod tests {
             attempts,
             "compile, measure, tray paint, and image raster perform no font resolution",
         );
-        let after = lock_fonts().ui_regular.clone();
+        let after = with_fonts(|fonts| fonts.ui_regular.clone());
         match (installed, after) {
             (Some(before), Some(after)) => assert!(Arc::ptr_eq(&before, &after)),
             (None, None) => {}
@@ -6716,13 +6752,14 @@ mod tests {
     }
 
     fn primary_draws(ch: char) -> bool {
-        let mut fonts = lock_fonts();
-        let Some(primary) = fonts.primary.as_ref().map(|face| Arc::clone(&face.font)) else {
-            return false;
-        };
-        fonts
-            .face_for(TextWeight::Regular, ch)
-            .is_some_and(|face| Arc::ptr_eq(&face.font, &primary))
+        with_fonts(|fonts| {
+            let Some(primary) = fonts.primary.as_ref().map(|face| Arc::clone(&face.font)) else {
+                return false;
+            };
+            fonts
+                .face_for(TextWeight::Regular, ch)
+                .is_some_and(|face| Arc::ptr_eq(&face.font, &primary))
+        })
     }
 
     #[test]
@@ -6853,8 +6890,7 @@ mod tests {
         let px = 16.0_f32;
         let row_h = 28.0_f32;
         let baseline = row_baseline(0.0, row_h, px);
-        {
-            let mut fonts = lock_fonts();
+        with_fonts(|fonts| {
             assert_eq!(
                 select_chrome_face(false, false, false),
                 ChromeFacePick::Fallback,
@@ -6868,7 +6904,7 @@ mod tests {
                 fonts.face_for(TextWeight::Regular, '日').is_some(),
                 "the coverage rung reaches 日"
             );
-        }
+        });
         let prims = vec![crate::widget::text_prim(
             2.0,
             baseline,
@@ -6914,8 +6950,7 @@ mod tests {
         let s = "A日B";
         let px = 13.0_f32;
         let measured = ui_text_width_for(TextFace::Ui, s, px);
-        let notdef_measure = {
-            let fonts = lock_fonts();
+        let notdef_measure = with_fonts(|fonts| {
             let f = fonts.ui_regular.clone().expect("UI regular");
             let mut w = 0.0;
             let mut prev: Option<char> = None;
@@ -6927,7 +6962,7 @@ mod tests {
                 prev = Some(ch);
             }
             w
-        };
+        });
         assert!(
             measured - notdef_measure > 2.0,
             "the `.notdef` measure {notdef_measure} must under-measure the pen's {measured}"
@@ -6968,44 +7003,44 @@ mod tests {
         if !install_chrome_fonts_with_cjk_chain_for_test() {
             aterm_spec::host::could_not_run("no CJK chain face here to install");
         }
-        let mut fonts = lock_fonts();
-        let dejavu = fonts
-            .fallback
-            .as_ref()
-            .expect("embedded DejaVu parses")
-            .font
-            .clone();
-        fonts.sync_coverage();
-        let chain = fonts
-            .coverage
-            .first()
-            .expect("the parsed CJK face is admitted")
-            .font
-            .clone();
-        assert!(chain.maps('日'));
-        let shared = ['\u{2713}', 'λ', 'π', '√', 'A']
-            .into_iter()
-            .find(|&ch| dejavu.maps(ch) && chain.maps(ch))
-            .expect("Latin at least is in both");
-        let face = fonts
-            .face_for(TextWeight::Regular, shared)
-            .expect("covered");
-        assert!(
-            Arc::ptr_eq(&face.font, &dejavu),
-            "{shared:?} stays on the embedded fallback"
-        );
-        for weight in [TextWeight::Regular, TextWeight::Bold] {
-            let face = fonts.face_for(weight, '日').expect("the rung covers 日");
+        with_fonts(|fonts| {
+            let dejavu = fonts
+                .fallback
+                .as_ref()
+                .expect("embedded DejaVu parses")
+                .font
+                .clone();
+            fonts.sync_coverage();
+            let chain = fonts
+                .coverage
+                .first()
+                .expect("the parsed CJK face is admitted")
+                .font
+                .clone();
+            assert!(chain.maps('日'));
+            let shared = ['\u{2713}', 'λ', 'π', '√', 'A']
+                .into_iter()
+                .find(|&ch| dejavu.maps(ch) && chain.maps(ch))
+                .expect("Latin at least is in both");
+            let face = fonts
+                .face_for(TextWeight::Regular, shared)
+                .expect("covered");
             assert!(
-                Arc::ptr_eq(&face.font, &chain),
-                "日 at {weight:?} draws from the chain face"
+                Arc::ptr_eq(&face.font, &dejavu),
+                "{shared:?} stays on the embedded fallback"
             );
-        }
-        assert!(
-            fonts.face_for(TextWeight::Regular, '\u{10FFFD}').is_none(),
-            "a char no loaded face carries still resolves to nothing"
-        );
-        drop(fonts);
+            for weight in [TextWeight::Regular, TextWeight::Bold] {
+                let face = fonts.face_for(weight, '日').expect("the rung covers 日");
+                assert!(
+                    Arc::ptr_eq(&face.font, &chain),
+                    "日 at {weight:?} draws from the chain face"
+                );
+            }
+            assert!(
+                fonts.face_for(TextWeight::Regular, '\u{10FFFD}').is_none(),
+                "a char no loaded face carries still resolves to nothing"
+            );
+        });
         clear_ui_fonts_for_test();
     }
 
@@ -7027,13 +7062,12 @@ mod tests {
         install_dormant_chrome_fonts_for_test(seed);
         prepare_ui_fonts_for_direct_view_test();
         let before = strip_band_font_epoch();
-        {
-            let mut fonts = lock_fonts();
+        with_fonts(|fonts| {
             assert!(
                 fonts.face_for(TextWeight::Regular, '日').is_none(),
                 "an unparsed chain face is not admitted"
             );
-        }
+        });
         assert_eq!(
             strip_band_font_epoch(),
             before,
@@ -7050,13 +7084,12 @@ mod tests {
         )
         .unwrap_or_else(strip_band_font_epoch);
         assert_ne!(after, before, "the band key witnesses the landing");
-        {
-            let mut fonts = lock_fonts();
+        with_fonts(|fonts| {
             assert!(
                 fonts.face_for(TextWeight::Regular, '日').is_some(),
                 "the rung now reaches 日"
             );
-        }
+        });
         if strip_band_ui_ready() {
             assert!(strip_band_run_coverable("日本語 shell"));
         }
@@ -7064,10 +7097,12 @@ mod tests {
     }
 
     fn ready_chain_faces() -> usize {
-        lock_fonts()
-            .semantic
-            .as_ref()
-            .map_or(0, |seed| seed.ready_fallback_faces().count())
+        with_fonts(|fonts| {
+            fonts
+                .semantic
+                .as_ref()
+                .map_or(0, |seed| seed.ready_fallback_faces().count())
+        })
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -7106,11 +7141,13 @@ mod tests {
         assert_eq!(ready_chain_faces(), 0, "CONTROL: nothing parsed yet");
         assert!(warm_chrome_coverage(Some(&live.fallback_coverage()), None) >= 1);
         assert!(chrome_cascade_reaches_for_test('日'));
-        let parsed: Vec<Arc<ChromeFont>> = lock_fonts()
-            .semantic
-            .as_ref()
-            .map(|seed| seed.ready_fallback_faces().cloned().collect())
-            .unwrap_or_default();
+        let parsed: Vec<Arc<ChromeFont>> = with_fonts(|fonts| {
+            fonts
+                .semantic
+                .as_ref()
+                .map(|seed| seed.ready_fallback_faces().cloned().collect())
+                .unwrap_or_default()
+        });
         assert!(!parsed.is_empty());
         for face in &parsed {
             assert!(
@@ -7174,11 +7211,12 @@ mod tests {
             !chrome_cascade_reaches_for_test('設'),
             "CONTROL: nothing has parsed the CJK face"
         );
-        let warm = chrome_coverage_warm(&lock_fonts()).expect("an install warms its faces");
+        let warm =
+            with_fonts(|fonts| chrome_coverage_warm(fonts)).expect("an install warms its faces");
         assert!(warm() >= 1, "the warm parses the chain's CJK face");
         assert!(chrome_cascade_reaches_for_test('設'));
         assert_eq!(
-            lock_fonts().label_misses(TextFace::Ui, label),
+            with_fonts(|fonts| fonts.label_misses(TextFace::Ui, label)),
             Vec::<char>::new(),
             "{label} draws in ink"
         );
@@ -7291,40 +7329,38 @@ mod tests {
                 "{text} in the selected label is heavier: {semibold_n} lit px against {cjk_n}"
             );
             let ch = text.chars().next().unwrap();
-            let mut fonts = lock_fonts();
-            for (face, weight) in [
-                (TextFace::Ui, UiCjkWeight::Regular),
-                (TextFace::UiBold, UiCjkWeight::Semibold),
-            ] {
-                let drawn = Arc::clone(
-                    &fonts
-                        .ui_miss_face(face, TextWeight::Regular, ch)
-                        .expect("a face")
-                        .font,
-                );
-                assert!(
-                    store
-                        .rung(weight)
-                        .iter()
-                        .any(|entry| entry.parsed().is_some_and(|font| Arc::ptr_eq(font, &drawn))),
-                    "{ch:?} in {face:?} draws from the {weight:?} rung"
-                );
-            }
-            drop(fonts);
-            for face in [TextFace::Ui, TextFace::UiBold] {
-                let mut fonts = lock_fonts();
-                let pen: f32 = text
-                    .chars()
-                    .map(|ch| {
-                        fonts
+            with_fonts(|fonts| {
+                for (face, weight) in [
+                    (TextFace::Ui, UiCjkWeight::Regular),
+                    (TextFace::UiBold, UiCjkWeight::Semibold),
+                ] {
+                    let drawn = Arc::clone(
+                        &fonts
                             .ui_miss_face(face, TextWeight::Regular, ch)
                             .expect("a face")
-                            .font
-                            .char_metrics(ch, px)
-                            .advance_width
-                    })
-                    .sum();
-                drop(fonts);
+                            .font,
+                    );
+                    assert!(
+                        store.rung(weight).iter().any(|entry| entry
+                            .parsed()
+                            .is_some_and(|font| Arc::ptr_eq(font, &drawn))),
+                        "{ch:?} in {face:?} draws from the {weight:?} rung"
+                    );
+                }
+            });
+            for face in [TextFace::Ui, TextFace::UiBold] {
+                let pen: f32 = with_fonts(|fonts| {
+                    text.chars()
+                        .map(|ch| {
+                            fonts
+                                .ui_miss_face(face, TextWeight::Regular, ch)
+                                .expect("a face")
+                                .font
+                                .char_metrics(ch, px)
+                                .advance_width
+                        })
+                        .sum()
+                });
                 assert_eq!(ui_text_width_for(face, text, px), pen, "{text} in {face:?}");
             }
         }
@@ -7348,22 +7384,22 @@ mod tests {
         prepare_ui_fonts_for_direct_view_test();
         set_ui_cjk_faces_for_test(Some(Arc::clone(&store)));
         store.materialise_for(UiCjkWeight::Regular, "日の");
-        let mut fonts = lock_fonts();
-        assert!(
-            fonts
-                .ui_miss_face(TextFace::Ui, TextWeight::Regular, '日')
-                .is_some(),
-            "CONTROL: the Regular run reaches the Regular face"
-        );
-        assert!(
-            fonts
-                .ui_miss_face(TextFace::UiBold, TextWeight::Regular, '日')
-                .is_none(),
-            "the Semibold run does not borrow it"
-        );
-        assert_eq!(fonts.label_misses(TextFace::UiBold, "日"), ['日']);
-        assert!(fonts.label_misses(TextFace::Ui, "日").is_empty());
-        drop(fonts);
+        with_fonts(|fonts| {
+            assert!(
+                fonts
+                    .ui_miss_face(TextFace::Ui, TextWeight::Regular, '日')
+                    .is_some(),
+                "CONTROL: the Regular run reaches the Regular face"
+            );
+            assert!(
+                fonts
+                    .ui_miss_face(TextFace::UiBold, TextWeight::Regular, '日')
+                    .is_none(),
+                "the Semibold run does not borrow it"
+            );
+            assert_eq!(fonts.label_misses(TextFace::UiBold, "日"), ['日']);
+            assert!(fonts.label_misses(TextFace::Ui, "日").is_empty());
+        });
         store.materialise_for(UiCjkWeight::Semibold, "の");
         let advance = |weight: UiCjkWeight| {
             store.rung(weight)[0]
@@ -7407,9 +7443,9 @@ mod tests {
         };
         assert_eq!(store.parsed_count(), 0, "CONTROL: a cold store");
         assert!(
-            lock_fonts()
+            with_fonts(|fonts| fonts
                 .ui_miss_face(TextFace::Ui, TextWeight::Regular, '日')
-                .is_none(),
+                .is_none()),
             "CONTROL: nothing reaches 日"
         );
         assert!(strip_band_run_coverable("alpha"));
@@ -7621,14 +7657,15 @@ mod tests {
         .expect("embedded renderer");
         renderer.set_runtime_font_discovery(false);
         set_chrome_fonts(None, None, Some(renderer));
-        let fonts = lock_fonts();
-        assert!(fonts.semantic.is_some(), "exact fork is retained dormant");
-        assert!(
-            fonts.semantic_worker.is_some(),
-            "backend startup parks the worker before Settings can request a candidate"
-        );
-        assert!(fonts.semantic_pending.is_none());
-        assert!(fonts.semantic_prewarm_ms.is_none());
+        with_fonts(|fonts| {
+            assert!(fonts.semantic.is_some(), "exact fork is retained dormant");
+            assert!(
+                fonts.semantic_worker.is_some(),
+                "backend startup parks the worker before Settings can request a candidate"
+            );
+            assert!(fonts.semantic_pending.is_none());
+            assert!(fonts.semantic_prewarm_ms.is_none());
+        })
     }
 
     fn await_semantic_landing(fonts: &mut ChromeFonts) {
@@ -8026,6 +8063,53 @@ mod tests {
             "returning to B is a bounded renderer-cache swap"
         );
         assert_eq!(fonts.semantic_identity.as_ref(), Some(&second));
+    }
+
+    #[test]
+    fn exiting_a_test_thread_releases_its_font_store_and_prewarm_worker() {
+        let child = std::thread::spawn(|| {
+            let font = Arc::new(
+                ChromeFont::from_bytes(
+                    aterm_render::embedded_font(),
+                    aterm_render::font::FontSettings::default(),
+                )
+                .expect("embedded font parses"),
+            );
+            let face = Arc::downgrade(&font);
+            with_fonts(|fonts| {
+                fonts.ui_regular = Some(font);
+                fonts.semantic_worker = SemanticPrewarmWorker::spawn();
+                let queue = Arc::downgrade(
+                    &fonts
+                        .semantic_worker
+                        .as_ref()
+                        .expect("prewarm worker")
+                        .queue,
+                );
+                (face, queue)
+            })
+        });
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !child.is_finished() {
+            assert!(
+                std::time::Instant::now() < until,
+                "font-store thread did not exit"
+            );
+            aterm_uds::deadline::poll_yield();
+        }
+        let (face, queue) = child.join().expect("font-store thread");
+        assert!(
+            face.upgrade().is_none(),
+            "thread-local font store retained its face"
+        );
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while queue.strong_count() != 0 {
+            assert!(
+                std::time::Instant::now() < until,
+                "thread-local prewarm worker did not exit"
+            );
+            aterm_uds::deadline::poll_yield();
+        }
     }
 
     #[test]
@@ -8840,19 +8924,23 @@ mod tests {
         prepare_ui_fonts_for_direct_view_test();
         forget_kept_glyphs();
         memo_raster(DARK_INK, DARK_GROUND, LIGHT_GROUND, 2.0);
-        let held: Vec<usize> = lock_fonts()
-            .glyphs
-            .faces
-            .iter()
-            .map(|face| Arc::as_ptr(face) as usize)
-            .collect();
-        let named: std::collections::BTreeSet<usize> = lock_fonts()
-            .glyphs
-            .glyphs
-            .keys()
-            .map(|&(address, ..)| address)
-            .filter(|&address| address != 0)
-            .collect();
+        let held: Vec<usize> = with_fonts(|fonts| {
+            fonts
+                .glyphs
+                .faces
+                .iter()
+                .map(|face| Arc::as_ptr(face) as usize)
+                .collect()
+        });
+        let named: std::collections::BTreeSet<usize> = with_fonts(|fonts| {
+            fonts
+                .glyphs
+                .glyphs
+                .keys()
+                .map(|&(address, ..)| address)
+                .filter(|&address| address != 0)
+                .collect()
+        });
         assert!(named.len() >= 3, "the UI, its semibold and a mono face");
         assert!(
             named.iter().all(|address| held.contains(address)),
@@ -8880,14 +8968,21 @@ mod tests {
         // Past the bounds, only the last raster's glyphs are kept, and only their faces.
         rasterize_tray(&sizes(157), 600, 40, 1.0, [0, 0, 0, 255]);
         let alone = kept_glyphs();
-        assert!(alone <= GLYPH_MEMO_ENTRIES && lock_fonts().glyphs.bytes <= GLYPH_MEMO_BYTES);
+        assert!(
+            alone <= GLYPH_MEMO_ENTRIES
+                && with_fonts(|fonts| fonts.glyphs.bytes) <= GLYPH_MEMO_BYTES
+        );
         forget_kept_glyphs();
         memo_raster(DARK_INK, DARK_GROUND, LIGHT_GROUND, 2.0);
         let before = kept_glyphs();
         assert!(before + alone > GLYPH_MEMO_ENTRIES, "{before} + {alone}");
         rasterize_tray(&sizes(157), 600, 40, 1.0, [0, 0, 0, 255]);
         assert_eq!(kept_glyphs(), alone, "the last raster's glyphs alone");
-        assert_eq!(lock_fonts().glyphs.faces.len(), 1, "the UI face alone");
+        assert_eq!(
+            with_fonts(|fonts| fonts.glyphs.faces.len()),
+            1,
+            "the UI face alone"
+        );
         // Negative control: within the bounds a raster keeps what the one before it kept.
         forget_kept_glyphs();
         memo_raster(DARK_INK, DARK_GROUND, LIGHT_GROUND, 2.0);
@@ -8898,18 +8993,19 @@ mod tests {
     /// The kept glyphs' bitmap bytes by their size in device px and their char, each kept once;
     /// the memo's byte count is their sum.
     fn kept_bytes_by_glyph() -> HashMap<(u32, char), usize> {
-        let fonts = lock_fonts();
-        let mut by_glyph = HashMap::new();
-        for (&(_, px, ch, _), kept) in fonts.glyphs.glyphs.iter() {
-            let once = by_glyph.insert((px, ch), kept.bitmap.len()).is_none();
-            assert!(once, "{ch:?} at {} px kept once", f32::from_bits(px));
-        }
-        assert_eq!(
-            fonts.glyphs.bytes,
-            by_glyph.values().sum::<usize>(),
-            "the memo counts its kept bitmaps' bytes"
-        );
-        by_glyph
+        with_fonts(|fonts| {
+            let mut by_glyph = HashMap::new();
+            for (&(_, px, ch, _), kept) in fonts.glyphs.glyphs.iter() {
+                let once = by_glyph.insert((px, ch), kept.bitmap.len()).is_none();
+                assert!(once, "{ch:?} at {} px kept once", f32::from_bits(px));
+            }
+            assert_eq!(
+                fonts.glyphs.bytes,
+                by_glyph.values().sum::<usize>(),
+                "the memo counts its kept bitmaps' bytes"
+            );
+            by_glyph
+        })
     }
 
     #[test]
@@ -8956,7 +9052,9 @@ mod tests {
             0,
             "104 glyphs past the byte bound in one raster keep none"
         );
-        assert!(kept_bytes_by_glyph().is_empty() && lock_fonts().glyphs.faces.is_empty());
+        assert!(
+            kept_bytes_by_glyph().is_empty() && with_fonts(|fonts| fonts.glyphs.faces.is_empty())
+        );
 
         // Negative control: just under the bound a raster keeps what the one before it kept. The
         // second line's longest run of letters that fits beside the first line, then one more.
@@ -8984,7 +9082,11 @@ mod tests {
             (0..=fit).all(|at| past.get(&(second_px, letters[at])) == Some(&glyph_bytes(at))),
             "every one of them, none of the first raster's"
         );
-        assert_eq!(lock_fonts().glyphs.faces.len(), 1, "the UI face alone");
+        assert_eq!(
+            with_fonts(|fonts| fonts.glyphs.faces.len()),
+            1,
+            "the UI face alone"
+        );
         forget_kept_glyphs();
     }
 

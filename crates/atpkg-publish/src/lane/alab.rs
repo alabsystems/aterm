@@ -36,6 +36,13 @@ pub const HORIZON_WARN_DAYS: i64 = 30;
 /// Consecutive unreadable heads before a person is told.
 pub const HEAD_FAILURES_NOTIFY: u64 = 6;
 
+/// The publication engine's repository on the staging owner ([`Options::engine`]).
+pub const ENGINE_REPO: &str = "publication";
+
+/// The ref a run reads the engine's main into, in its own repository under the run's work
+/// directory ([`engine_ledger`]).
+const ENGINE_MAIN: &str = "refs/atpkg-publish/engine-main";
+
 /// The Apple targets: one build carries both rows, so the pins are resolved for both
 /// (and a program the two resolve to different builds is refused, not collapsed).
 pub const TARGETS: &[Triple] = programs::DUAL_DARWIN;
@@ -44,12 +51,14 @@ pub const TARGETS: &[Triple] = programs::DUAL_DARWIN;
 #[derive(Clone, Debug)]
 pub struct Options {
     /// Decide and print, and change nothing: no clone, build, sign, upload, state or
-    /// notification (an existing scratch clone is read but not fetched).
+    /// notification (an existing scratch clone is read but not fetched; the engine's ledger is
+    /// read from its main as in a real run, [`engine_ledger`]).
     pub dry_run: bool,
     /// Pack failures of one build before it is latched.
     pub block_after: u32,
-    /// The publication engine's ledger (`~/publication/mappings.json`).
-    pub ledger: PathBuf,
+    /// The publication engine's repository, whose main holds the ledger (`mappings.json`) that
+    /// maps each signed release to the dev commit it was cut from.
+    pub engine: Slug,
 }
 
 impl Options {
@@ -59,7 +68,7 @@ impl Options {
         Self {
             dry_run,
             block_after: BLOCK_AFTER,
-            ledger: ctx.home.join("publication/mappings.json"),
+            engine: ctx.staging_slug(ENGINE_REPO),
         }
     }
 }
@@ -877,9 +886,56 @@ fn horizon_note(ctx: &Ctx, head: &VerifiedQuad) -> Result<Option<String>> {
 }
 
 enum CachedLedger {
-    Missing,
+    /// The engine's main could not be read: why.
+    Unread(String),
+    /// The ledger on the engine's main does not parse: why.
     Invalid(String),
-    Parsed(aterm_json::Value),
+    /// The ledger, and the main it was read from (`<slug> main <commit12>`).
+    Parsed {
+        at: String,
+        value: aterm_json::Value,
+    },
+}
+
+/// The engine's ledger as `engine`'s main holds it, read once per run through the staging host,
+/// as the staging owner's identity (its token, or agh's route for that owner)
+/// ([`crate::host::ReleaseHost::fetch_main`] into a bare repository in the run's `work`), never from an engine checkout on this Mac: such a checkout's working
+/// tree, branch and HEAD are whatever a session left there, and no release fast-forwards it
+/// any more (a release runs the engine in its own clone), so it falls behind the rows each
+/// promote records on the engine's main. A dry run reads it the same way: the read writes only
+/// under `work`, which every run lays down afresh.
+fn engine_ledger(ctx: &Ctx, engine: &Slug, work: &Path) -> CachedLedger {
+    let dir = work.join("engine.git");
+    let read = crate::git::run(work, &["init", "--quiet", "--bare", "engine.git"])
+        .map_err(|e| {
+            format!(
+                "could not make {} to read {engine}'s main: {e}",
+                ctx.shown(&dir)
+            )
+        })
+        .and_then(|_| {
+            ctx.hosts
+                .staging
+                .fetch_main(engine, &dir, ENGINE_MAIN)
+                .map_err(|e| format!("could not read {engine}'s main from the host ({e})"))
+        })
+        .and_then(|()| {
+            let commit = crate::git::run(&dir, &["rev-parse", "--verify", ENGINE_MAIN])
+                .map_err(|e| format!("{engine}'s main was fetched but cannot be read: {e}"))?;
+            let text = crate::git::run(&dir, &["show", &format!("{ENGINE_MAIN}:mappings.json")])
+                .map_err(|e| format!("{engine}'s main has no readable mappings.json: {e}"))?;
+            Ok((
+                format!("{engine} main {}", &commit[..commit.len().min(12)]),
+                text,
+            ))
+        });
+    match read {
+        Err(why) => CachedLedger::Unread(why),
+        Ok((at, text)) => match aterm_json::from_str(&text) {
+            Ok(value) => CachedLedger::Parsed { at, value },
+            Err(e) => CachedLedger::Invalid(format!("the ledger on {at} does not parse: {e}")),
+        },
+    }
 }
 
 struct Clones<'a> {
@@ -901,17 +957,10 @@ impl<'a> Clones<'a> {
         }
     }
 
-    fn ledger(&mut self, path: &Path) -> &CachedLedger {
+    fn ledger(&mut self, engine: &Slug, work: &Path) -> &CachedLedger {
         let ctx = self.ctx;
-        self.ledger.get_or_insert_with(|| {
-            let Ok(text) = crate::identity::read_regular_text(path, SUMS_CAP) else {
-                return CachedLedger::Missing;
-            };
-            match aterm_json::from_str(&text) {
-                Ok(v) => CachedLedger::Parsed(v),
-                Err(e) => CachedLedger::Invalid(format!("{} does not parse: {e}", ctx.shown(path))),
-            }
-        })
+        self.ledger
+            .get_or_insert_with(|| engine_ledger(ctx, engine, work))
     }
 
     fn of(&mut self, def: &ProgramDef) -> std::result::Result<PathBuf, String> {
@@ -1044,9 +1093,7 @@ fn signed_release(
     };
     let clone = clones.of(def).map_err(unresolved)?;
     let dev_commit = resolve_dev(
-        ctx,
-        &opts.ledger,
-        clones.ledger(&opts.ledger),
+        clones.ledger(&opts.engine, work),
         def.repo,
         &public_commit,
         &clone,
@@ -1140,10 +1187,15 @@ fn signed_commit(
 }
 
 /// The dev commits whose `repo` row in the engine's ledger `value` records `public_commit` as its
-/// release, every revoked row (`revoked.<repo>.<dev>`) left out, as the engine's own projection
-/// leaves them out (`bin/pub_projection.py`'s `live_rows`): a revoked row's release is not what it
-/// built.
-fn live_sources<'a>(value: &'a aterm_json::Value, repo: &str, public_commit: &str) -> Vec<&'a str> {
+/// release, split into the live ones and the revoked ones (`revoked.<repo>.<dev>`). Only a live
+/// row names a source, as the engine's own projection reads it (`bin/pub_projection.py`'s
+/// `live_rows`): a revoked row's release is not what it built, and a release whose every row is
+/// revoked is one the engine withdrew (`revoked_release_source`).
+fn sources<'a>(
+    value: &'a aterm_json::Value,
+    repo: &str,
+    public_commit: &str,
+) -> (Vec<&'a str>, Vec<&'a str>) {
     let revoked = value
         .get("revoked")
         .and_then(|r| r.get(repo))
@@ -1152,63 +1204,71 @@ fn live_sources<'a>(value: &'a aterm_json::Value, repo: &str, public_commit: &st
         .get("mappings")
         .and_then(|m| m.get(repo))
         .and_then(aterm_json::Value::as_object)
-        .map_or_else(Vec::new, |rows| {
+        .map_or_else(Default::default, |rows| {
             rows.iter()
-                .filter(|(dev, _)| !revoked.is_some_and(|r| r.contains_key(*dev)))
                 .filter(|(_, row)| {
                     row.get("release_rev").and_then(aterm_json::Value::as_str)
                         == Some(public_commit)
                 })
                 .map(|(dev, _)| dev.as_str())
-                .collect()
+                .partition(|dev| !revoked.is_some_and(|r| r.contains_key(*dev)))
         })
 }
 
+fn short12(sha: &str) -> &str {
+    &sha[..sha.len().min(12)]
+}
+
 fn resolve_dev(
-    ctx: &Ctx,
-    ledger_path: &Path,
     ledger: &CachedLedger,
     repo: &str,
     public_commit: &str,
     clone: &Path,
 ) -> std::result::Result<String, String> {
     let short = &public_commit[..public_commit.len().min(12)];
-    let value = match ledger {
-        CachedLedger::Missing => {
+    let (at, value) = match ledger {
+        CachedLedger::Unread(why) => {
             return Err(format!(
-                "no engine ledger at {} to map the signed commit {short} to a dev commit",
-                ctx.shown(ledger_path)
+                "{why}, so the signed commit {short} is not mapped to a dev commit"
             ));
         }
         CachedLedger::Invalid(err) => return Err(err.clone()),
-        CachedLedger::Parsed(v) => v,
+        CachedLedger::Parsed { at, value } => (at, value),
     };
-    let src = match live_sources(value, repo, public_commit).as_slice() {
-        [one] => one.to_string(),
-        [] => {
+    let listed = |devs: &[&str]| {
+        devs.iter()
+            .map(|d| short12(d))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let src = match sources(value, repo, public_commit) {
+        (live, _) if live.len() == 1 => live[0].to_string(),
+        (live, revoked) if live.is_empty() && !revoked.is_empty() => {
             return Err(format!(
-                "{} has no live {repo} row whose release_rev is the signed commit {short} — `git \
-                 -C ~/publication pull --ff-only`, or the promote ran elsewhere",
-                ctx.shown(ledger_path)
+                "{at} has no live {repo} row whose release_rev is the signed commit {short}: \
+                 every row naming it is revoked ({}), so the engine withdrew this release and it \
+                 is not built",
+                listed(&revoked)
             ));
         }
-        many => {
+        (live, _) if live.is_empty() => {
             return Err(format!(
-                "{} maps the signed commit {short} to {} live {repo} rows ({}), so which dev \
+                "{at} has no live {repo} row whose release_rev is the signed commit {short}: \
+                 its promote has recorded none there yet"
+            ));
+        }
+        (many, _) => {
+            return Err(format!(
+                "{at} maps the signed commit {short} to {} live {repo} rows ({}), so which dev \
                  commit it was cut from is not decided",
-                ctx.shown(ledger_path),
                 many.len(),
-                many.iter()
-                    .map(|dev| &dev[..dev.len().min(12)])
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                listed(&many)
             ));
         }
     };
     if src.len() != 40 || !src.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!(
-            "{} maps the signed commit {short} to `{src}`, which is not a 40-hex dev commit",
-            ctx.shown(ledger_path)
+            "{at} maps the signed commit {short} to `{src}`, which is not a 40-hex dev commit"
         ));
     }
     crate::git::run(
@@ -1735,6 +1795,16 @@ pub fn parse_vv(text: &str) -> Option<PinCommit> {
 mod tests {
     use super::*;
 
+    fn ledger(one: &str, two: &str, live: &str, revoked: &str) -> aterm_json::Value {
+        aterm_json::from_str::<aterm_json::Value>(&format!(
+            "{{\"mappings\":{{\"ay\":{{\"{one}\":{{\"release_rev\":\"d766\"}},\
+             \"{two}\":{{\"release_rev\":\"d766\"}},\"{live}\":{{\"release_rev\":\"d766\"}},\
+             \"{}\":{{\"release_rev\":\"other\"}}}}}},\"revoked\":{{{revoked}}}}}",
+            "9".repeat(40)
+        ))
+        .unwrap()
+    }
+
     /// A REVOKED ROW NEVER NAMES THE DEV COMMIT A SIGNED RELEASE WAS CUT FROM, AND TWO LIVE ROWS
     /// DECIDE NONE: ay's signed commit d766… is the release of two revoked rows and one live one,
     /// as the ledger held it on 2026-11-07, and only the live one is its source. NEGATIVE
@@ -1742,23 +1812,60 @@ mod tests {
     #[test]
     fn a_revoked_row_never_names_the_source_and_two_live_rows_decide_none() {
         let (one, two, live) = ("0".repeat(40), "5".repeat(40), "6".repeat(40));
-        let ledger = |revoked: &str| {
-            aterm_json::from_str::<aterm_json::Value>(&format!(
-                "{{\"mappings\":{{\"ay\":{{\"{one}\":{{\"release_rev\":\"d766\"}},\
-                 \"{two}\":{{\"release_rev\":\"d766\"}},\"{live}\":{{\"release_rev\":\"d766\"}},\
-                 \"{}\":{{\"release_rev\":\"other\"}}}}}},\"revoked\":{{{revoked}}}}}",
-                "9".repeat(40)
-            ))
-            .unwrap()
-        };
-        let revoked = ledger(&format!("\"ay\":{{\"{one}\":{{}},\"{two}\":{{}}}}"));
-        assert_eq!(live_sources(&revoked, "ay", "d766"), vec![live.as_str()]);
-        assert!(live_sources(&revoked, "trust-ir", "d766").is_empty());
-        let unrevoked = ledger("");
+        let revoked = ledger(
+            &one,
+            &two,
+            &live,
+            &format!("\"ay\":{{\"{one}\":{{}},\"{two}\":{{}}}}"),
+        );
         assert_eq!(
-            live_sources(&unrevoked, "ay", "d766"),
+            sources(&revoked, "ay", "d766"),
+            (vec![live.as_str()], vec![one.as_str(), two.as_str()])
+        );
+        assert_eq!(sources(&revoked, "trust-ir", "d766"), (vec![], vec![]));
+        let unrevoked = ledger(&one, &two, &live, "");
+        assert_eq!(
+            sources(&unrevoked, "ay", "d766").0,
             vec![one.as_str(), two.as_str(), live.as_str()],
             "NEGATIVE CONTROL: without the revocations every row is live, so none is decided"
+        );
+    }
+
+    /// A RELEASE WHOSE EVERY ROW IS REVOKED IS SAID TO BE WITHDRAWN, NOT AWAITING ITS PROMOTE:
+    /// the engine refuses to map a revoked source again, so waiting for a promote would wait for
+    /// one that already ran. NEGATIVE CONTROL: the same rows unrevoked are no withdrawal, and a
+    /// release with no row at all is still awaiting its promote.
+    #[test]
+    fn a_release_whose_every_row_is_revoked_is_withdrawn_not_awaited() {
+        let (one, two, three) = ("0".repeat(40), "5".repeat(40), "6".repeat(40));
+        let every = ledger(
+            &one,
+            &two,
+            &three,
+            &format!("\"ay\":{{\"{one}\":{{}},\"{two}\":{{}},\"{three}\":{{}}}}"),
+        );
+        let parsed = |value| CachedLedger::Parsed {
+            at: "engine main 0123".into(),
+            value,
+        };
+        let clone = Path::new("/nonexistent");
+        let why = resolve_dev(&parsed(every.clone()), "ay", "d766", clone).unwrap_err();
+        assert!(why.contains("every row naming it is revoked"), "{why}");
+        assert!(
+            why.contains(&one[..12]) && why.contains(&three[..12]),
+            "{why}"
+        );
+        assert!(!why.contains("recorded none"), "{why}");
+        let none = resolve_dev(&parsed(every), "ay", "absent", clone).unwrap_err();
+        assert!(
+            none.contains("its promote has recorded none there yet"),
+            "{none}"
+        );
+        let live =
+            resolve_dev(&parsed(ledger(&one, &two, &three, "")), "ay", "d766", clone).unwrap_err();
+        assert!(
+            live.contains("3 live ay rows") && !live.contains("withdrew"),
+            "NEGATIVE CONTROL: {live}"
         );
     }
 }

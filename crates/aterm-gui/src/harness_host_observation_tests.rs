@@ -628,6 +628,7 @@ fn a_known_identity_contradiction_never_proves_the_active_account() {
                 sid: sid.into(),
                 at: a.clock(),
                 took: false,
+                native_receipt: None,
             });
         });
         std::fs::write(

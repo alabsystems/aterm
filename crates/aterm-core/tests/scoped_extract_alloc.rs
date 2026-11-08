@@ -4,7 +4,8 @@
 
 //! Damage-scoped refill allocates nothing once warm and stays on the scoped arm.
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use aterm_bench::allocator::{Observed, Observer};
+use std::alloc::System;
 use std::cell::Cell;
 
 thread_local! {
@@ -15,37 +16,20 @@ thread_local! {
 
 struct Counting;
 
-// SAFETY: every method forwards to `System` with the caller's layout and pointer; the thread-local
-// counter never allocates.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+// SAFETY: constant, drop-free thread-locals and wrapping arithmetic neither allocate nor unwind.
+unsafe impl Observer for Counting {
+    fn requested(&self, size: usize) {
         let _ = ACTIVE.try_with(|active| {
             if active.get() {
-                let _ = ALLOC_CALLS.try_with(|n| n.set(n.get() + 1));
-                let _ = ALLOC_BYTES.try_with(|n| n.set(n.get() + l.size() as u64));
+                let _ = ALLOC_CALLS.try_with(|n| n.set(n.get().wrapping_add(1)));
+                let _ = ALLOC_BYTES.try_with(|n| n.set(n.get().wrapping_add(size as u64)));
             }
         });
-        // SAFETY: forwarding to System with the same layout.
-        unsafe { System.alloc(l) }
-    }
-    unsafe fn realloc(&self, p: *mut u8, l: Layout, new_size: usize) -> *mut u8 {
-        let _ = ACTIVE.try_with(|active| {
-            if active.get() {
-                let _ = ALLOC_CALLS.try_with(|n| n.set(n.get() + 1));
-                let _ = ALLOC_BYTES.try_with(|n| n.set(n.get() + new_size as u64));
-            }
-        });
-        // SAFETY: forwarding to System with the same ptr+layout.
-        unsafe { System.realloc(p, l, new_size) }
-    }
-    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        // SAFETY: forwarding to System with the same ptr+layout.
-        unsafe { System.dealloc(p, l) }
     }
 }
 
 #[global_allocator]
-static ALLOC: Counting = Counting;
+static ALLOC: Observed<System, Counting> = Observed::new(System, Counting);
 
 fn allocs_in<R>(f: impl FnOnce() -> R) -> (R, u64) {
     ALLOC_CALLS.with(|n| n.set(0));

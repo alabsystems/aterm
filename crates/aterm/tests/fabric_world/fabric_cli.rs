@@ -132,10 +132,6 @@ fn fabric_cmd(s: &Scratch, env_cmd: Option<&str>, args: &[&str]) -> Command {
         .env("HOME", s.path("home"))
         .env("XDG_CONFIG_HOME", s.path("cfg"))
         .env("XDG_RUNTIME_DIR", s.path("run"))
-        .env(
-            harness::FABRIC_IO_WAIT.0,
-            harness::FABRIC_IO_WAIT.1.as_millis().to_string(),
-        )
         .stdin(Stdio::null());
     if let Some(c) = env_cmd {
         cmd.env("ATERM_FABRIC_COMMAND", c);
@@ -953,41 +949,6 @@ fn doctor_retire_ghosts_lists_dry_and_publishes_exited_with_yes() {
     assert!(
         !after.contains("t=1789400000000"),
         "t= is refreshed: {after}"
-    );
-}
-
-/// **AN INSTANCE THAT DID NOT ANSWER KEEPS ITS ROWS OUT OF THE RETIRE SET.**
-#[test]
-fn doctor_retire_ghosts_refuses_while_an_instance_has_not_answered() {
-    let s = Scratch::new("ghostmute");
-    let sock = s.sock();
-    let _broker = Broker::spawn(&s);
-    let node = "n-00000000000000aa";
-    let subject = format!("/f/t1/pub/{node}/s-ghost/presence");
-    let live = "v=1 t=1789400000000 inc=7 epoch=e1 gen=g1 state=live hold=0";
-    publish(&sock, &[(subject.clone(), live.to_string())]);
-    let env_cmd = s.command(&sock, true);
-
-    let dir = std::path::PathBuf::from(s.path("run")).join("aterm");
-    std::fs::create_dir_all(&dir).expect("run/aterm");
-    let mute = dir.join(format!("aterm-{}.sock", std::process::id()));
-    let _listener = harness::kept(UnixListener::bind(&mute).expect("bind a mute instance socket"));
-
-    // The product's bound on the instance's read, which the mute socket runs out.
-    let mut doctor = fabric_cmd(&s, Some(&env_cmd), &["doctor", "--retire-ghosts", "--yes"]);
-    doctor.env_remove(harness::FABRIC_IO_WAIT.0);
-    let out = harness::output_within(&mut doctor, "aterm fabric");
-    assert_ne!(
-        out.status.code(),
-        Some(0),
-        "out={} err={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(
-        last_body(&sock, &subject).as_deref(),
-        Some(live),
-        "a row an unanswered instance may host must not be retired"
     );
 }
 

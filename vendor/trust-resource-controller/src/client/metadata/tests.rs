@@ -25,6 +25,20 @@ fn actual_streams() -> (MetadataStreams, UnixStream, std::io::PipeWriter, std::i
 }
 
 #[test]
+fn a_valid_native_event_survives_scheduling_delay() {
+    let (mut streams, peer, _stdout, _stderr) = actual_streams();
+    let mut peer = Channel::new(peer).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    peer.send(&status(Status::Attached).encode().unwrap(), deadline).unwrap();
+    assert!(matches!(
+        streams.poll_at(&request(), deadline, Instant::now() - Duration::from_secs(1)),
+        Ok(StreamReady::Pending)
+    ));
+    assert!(streams.state.attached);
+    assert!(streams.poll_at(&request(), Instant::now(), Instant::now()).is_err());
+}
+
+#[test]
 fn concurrent_fresh_capture_and_lifeline_transfer_preserve_original_pipe_flags() {
     let barrier = std::sync::Barrier::new(2);
     std::thread::scope(|scope| {

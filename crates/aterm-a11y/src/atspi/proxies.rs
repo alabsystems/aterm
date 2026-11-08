@@ -11,12 +11,7 @@ use super::serve::PROPERTIES;
 use super::wire::{self, ObjectId, ROOT_PATH};
 
 /// How long a call waits for its answer.
-#[cfg(not(test))]
-pub(crate) const CALL: Duration = Duration::from_secs(25);
-/// A unit test's peer answers every call it is sent (an unanswered one is a hang), so the
-/// bound outlasts the tests' one-minute hang detector, which then names what never came.
-#[cfg(test)]
-pub(crate) const CALL: Duration = Duration::from_secs(120);
+pub(crate) const CALL: Duration = Duration::from_secs(60);
 
 const A11Y_BUS: &str = "org.a11y.Bus";
 const A11Y_BUS_PATH: &str = "/org/a11y/bus";
@@ -42,19 +37,51 @@ fn call(
     member: &str,
     body: Vec<Value>,
 ) -> aterm_dbus::Result<Message> {
+    call_after(
+        conn,
+        destination,
+        path,
+        interface,
+        member,
+        body,
+        Duration::ZERO,
+    )
+}
+
+fn call_after(
+    conn: &mut Connection,
+    destination: &str,
+    path: &str,
+    interface: &str,
+    member: &str,
+    body: Vec<Value>,
+    elapsed: Duration,
+) -> aterm_dbus::Result<Message> {
+    let remaining = CALL
+        .checked_sub(elapsed)
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(aterm_dbus::Error::Timeout)?;
     let msg = Message::method_call(Some(destination), path, Some(interface), member)?;
-    conn.call(msg.with_body(body), CALL)
+    conn.call(msg.with_body(body), remaining)
 }
 
 /// `org.a11y.Status.IsEnabled`.
 pub(crate) fn is_enabled(session: &mut Connection) -> aterm_dbus::Result<bool> {
-    let reply = call(
+    is_enabled_after(session, Duration::ZERO)
+}
+
+pub(super) fn is_enabled_after(
+    session: &mut Connection,
+    elapsed: Duration,
+) -> aterm_dbus::Result<bool> {
+    let reply = call_after(
         session,
         A11Y_BUS,
         A11Y_BUS_PATH,
         PROPERTIES,
         "Get",
         vec![STATUS.into(), "IsEnabled".into()],
+        elapsed,
     )?;
     reply
         .body

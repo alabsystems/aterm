@@ -80,7 +80,7 @@ fn admitted_in(
     let triple = crate::cli::current_triple();
     for &want in wants {
         if !want.supports(triple) {
-            return Err(format!("{} is unavailable on {triple}", want.recipe().name));
+            return Err(format!("{} is unavailable on {triple}", want.program()));
         }
     }
     let fetcher = crate::source::resolve_fetcher(layout, None);
@@ -109,7 +109,7 @@ fn admitted_in(
     Ok((held, current))
 }
 
-/// The shared immutable recipe and its public package command.
+/// A signed prerequisite and its public package command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Prerequisite {
     /// Secret scanning.
@@ -120,17 +120,45 @@ pub enum Prerequisite {
     OpenSslSigning,
     /// Lean's project builder. The global `lean` name still means Clean.
     Lake,
+    /// ALab's separately packaged release-signing helper.
+    AtpkgKeys,
 }
 
 impl Prerequisite {
-    /// The existing recipe; versions, hashes and supported hosts have one authority.
+    /// The upstream recipe, when this prerequisite wraps an upstream tool.
+    /// First-party versions and targets come from the signed package manifest.
     #[must_use]
-    pub const fn recipe(self) -> &'static PinnedTool {
+    pub const fn recipe(self) -> Option<&'static PinnedTool> {
         match self {
-            Self::Gitleaks => &upstream::GITLEAKS,
-            Self::Python => &upstream::CPYTHON,
-            Self::OpenSslSigning => &upstream::OPENSSL_SIGNING,
-            Self::Lake => &upstream::LEAN4,
+            Self::Gitleaks => Some(&upstream::GITLEAKS),
+            Self::Python => Some(&upstream::CPYTHON),
+            Self::OpenSslSigning => Some(&upstream::OPENSSL_SIGNING),
+            Self::Lake => Some(&upstream::LEAN4),
+            Self::AtpkgKeys => None,
+        }
+    }
+
+    /// Owning package in the signed index and manifest.
+    #[must_use]
+    pub const fn program(self) -> &'static str {
+        match self {
+            Self::Gitleaks => upstream::GITLEAKS.name,
+            Self::Python => upstream::CPYTHON.name,
+            Self::OpenSslSigning => upstream::OPENSSL_SIGNING.name,
+            Self::Lake => upstream::LEAN4.name,
+            Self::AtpkgKeys => "atpkg-keys",
+        }
+    }
+
+    /// Executable relative to the authenticated package root.
+    #[must_use]
+    pub const fn package_executable(self) -> &'static str {
+        match self {
+            Self::Gitleaks => upstream::GITLEAKS.executable,
+            Self::Python => upstream::CPYTHON.executable,
+            Self::OpenSslSigning => upstream::OPENSSL_SIGNING.executable,
+            Self::Lake => upstream::LEAN4.executable,
+            Self::AtpkgKeys => "bin/atpkg-keys",
         }
     }
 
@@ -142,6 +170,7 @@ impl Prerequisite {
             Self::Python => "python3.14",
             Self::OpenSslSigning => "openssl-signing",
             Self::Lake => "lake",
+            Self::AtpkgKeys => "atpkg-keys",
         }
     }
 
@@ -153,6 +182,7 @@ impl Prerequisite {
             Self::Python,
             Self::OpenSslSigning,
             Self::Lake,
+            Self::AtpkgKeys,
         ]
         .into_iter()
         .find(|want| want.executable() == name)
@@ -168,7 +198,8 @@ impl Prerequisite {
             "x86_64-unknown-linux-gnu" => "linux-x86_64",
             _ => "unsupported",
         };
-        self.recipe().hosts.contains(&platform)
+        self.recipe()
+            .is_none_or(|recipe| recipe.hosts.contains(&platform))
     }
 }
 
@@ -185,7 +216,6 @@ pub struct Session<'a> {
 #[derive(Clone)]
 struct Prepared {
     build: u64,
-    recipe: &'static PinnedTool,
     package: crate::manifest::PkgManifest,
     signed: crate::flow::PackageBytes,
 }
@@ -232,9 +262,9 @@ impl<'a> Session<'a> {
         {
             return Ok(prepared);
         }
-        let recipe = want.recipe();
+        let program = want.program();
         if !want.supports(self.triple) {
-            return Err(format!("{} is unavailable on {}", recipe.name, self.triple));
+            return Err(format!("{program} is unavailable on {}", self.triple));
         }
         let channel = self
             .index
@@ -242,8 +272,8 @@ impl<'a> Session<'a> {
             .ok_or("the signed stable channel is unavailable")?;
         let build = *channel
             .pin
-            .get(recipe.name)
-            .ok_or_else(|| format!("{} has no signed channel pin", recipe.name))?;
+            .get(program)
+            .ok_or_else(|| format!("{program} has no signed channel pin"))?;
         let prepared = self.read_package(want, build, false)?;
         self.prepared.borrow_mut().push((want, prepared.clone()));
         Ok(prepared)
@@ -255,33 +285,33 @@ impl<'a> Session<'a> {
         build: u64,
         named: bool,
     ) -> Result<Prepared, String> {
-        let base = want.recipe();
+        let program = want.program();
         let channel = self
             .index
             .channel_for(crate::config::CHANNEL, self.triple)
             .ok_or("the signed stable channel is unavailable")?;
-        if !crate::gate::current_build_ok(&channel, base.name, Some(build)) {
+        if !crate::gate::current_build_ok(&channel, program, Some(build)) {
             return Err(format!(
-                "{} {build} is withdrawn or below its signed floor",
-                base.name
+                "{program} {build} is withdrawn or below its signed floor"
             ));
         }
         let row = self
             .index
-            .program(base.name)
+            .program(program)
             .ok_or("the signed index has no prerequisite program")?;
-        let (raw, signature) = self.fetcher.pkg_manifest(&row.repo, base.name, build)?;
+        let (raw, signature) = self.fetcher.pkg_manifest(&row.repo, program, build)?;
         let verified = self
             .index
             .verify_pkg(raw.clone(), &signature)
-            .map_err(|e| format!("{} package signature: {e:?}", base.name))?;
+            .map_err(|e| format!("{program} package signature: {e:?}"))?;
         let package = crate::manifest::parse_pkg(&verified)
-            .map_err(|e| format!("{} package manifest: {e:?}", base.name))?;
-        let recipe = if named {
-            base.versioned(&package.version)
-                .ok_or("the named prerequisite version has no shared recipe")?
-        } else {
-            base
+            .map_err(|e| format!("{program} package manifest: {e:?}"))?;
+        let recipe = match want.recipe() {
+            Some(base) if named => Some(
+                base.versioned(&package.version)
+                    .ok_or("the named prerequisite version has no shared recipe")?,
+            ),
+            recipe => recipe,
         };
         let platform = match self.triple {
             "aarch64-apple-darwin" => "macos-aarch64",
@@ -290,27 +320,33 @@ impl<'a> Session<'a> {
             "x86_64-unknown-linux-gnu" => "linux-x86_64",
             _ => "unsupported",
         };
-        if !recipe.hosts.contains(&platform) {
-            return Err(format!(
-                "{} {} is unavailable on {}",
-                recipe.name, recipe.version, self.triple
-            ));
+        if let Some(recipe) = recipe {
+            if !recipe.hosts.contains(&platform) {
+                return Err(format!(
+                    "{} {} is unavailable on {}",
+                    recipe.name, recipe.version, self.triple
+                ));
+            }
+            if package.version != recipe.version {
+                return Err(format!(
+                    "{program} signed package identity differs from its shared recipe"
+                ));
+            }
         }
-        if !package.is_for(recipe.name)
+        if !package.is_for(program)
             || package.build_number != build
-            || package.version != recipe.version
+            || package.version.is_empty()
             || !package.exposes.iter().any(|e| e == want.executable())
         {
             return Err(format!(
-                "{} signed package identity differs from its shared recipe",
-                recipe.name
+                "{program} signed package identity differs from its shared recipe"
             ));
         }
         let artifact = package
             .artifacts
             .iter()
             .find(|a| a.target == self.triple)
-            .ok_or_else(|| format!("{} has no published build on {}", recipe.name, self.triple))?;
+            .ok_or_else(|| format!("{program} has no published build on {}", self.triple))?;
         if artifact.tree_root.len() != 64
             || !artifact
                 .tree_root
@@ -320,7 +356,7 @@ impl<'a> Session<'a> {
             return Err("the signed package has no valid immutable tree root".into());
         }
         let expected_env: Vec<String> = recipe
-            .shim_env
+            .map_or(&[][..], |recipe| recipe.shim_env)
             .iter()
             .map(|entry| (*entry).to_owned())
             .collect();
@@ -332,7 +368,6 @@ impl<'a> Session<'a> {
         crate::shim_env::ShimEnv::admit(&package.shim_env)?;
         let prepared = Prepared {
             build,
-            recipe,
             package,
             signed: (raw, signature),
         };
@@ -345,10 +380,10 @@ impl<'a> Session<'a> {
         let prepared = self.package(want)?;
         let req = crate::InstallRequest {
             channel: crate::config::CHANNEL,
-            program: want.recipe().name,
+            program: want.program(),
             triple: self.triple,
             installed: crate::active_builds(self.layout)
-                .get(want.recipe().name)
+                .get(want.program())
                 .copied(),
         };
         let report = crate::flow::install_collecting_assets_with_snapshot(
@@ -375,7 +410,7 @@ impl<'a> Session<'a> {
     /// Unsupported targets, missing or withdrawn pins, invalid signed package
     /// identity, unmanaged shims, missing leases, mutated bytes or selection races.
     pub fn acquire(&self, want: Prerequisite) -> Result<HeldTool, String> {
-        let recipe = want.recipe();
+        let program = want.program();
         let prepared = self.package(want)?;
         let (build, package) = (prepared.build, prepared.package);
         let artifact = package
@@ -417,7 +452,7 @@ impl<'a> Session<'a> {
         let (image, metadata) =
             aterm_uds::regular_file::open(physical).map_err(|e| e.to_string())?;
         let image_identity = ImageIdentity::of(&metadata);
-        let modes = crate::store::declared_modes(&self.layout.build_dir(recipe.name, build))
+        let modes = crate::store::declared_modes(&self.layout.build_dir(program, build))
             .map_err(|e| e.to_string())?;
         let actual = crate::tree::tree_root_declared(root, &modes).map_err(|e| e.to_string())?;
         let after = crate::lookup::read(Some(self.layout), want.executable());
@@ -426,8 +461,7 @@ impl<'a> Session<'a> {
             || crate::trust_lock::tree_identity(root).as_deref() != Some(&identity)
         {
             return Err(format!(
-                "{} prerequisite bytes or selection differ from the signed tree",
-                recipe.name
+                "{program} prerequisite bytes or selection differ from the signed tree"
             ));
         }
         let tool = HeldTool {
@@ -439,11 +473,11 @@ impl<'a> Session<'a> {
             image_identity,
             environment: signed_env,
             lease,
-            program: recipe.name,
+            program,
             build,
             tree_root: actual,
             root: root.to_path_buf(),
-            version: prepared.recipe.version,
+            version: package.version,
         };
         tool.validate()?;
         Ok(tool)
@@ -548,7 +582,7 @@ fn hold_selection(
     selected: &Record,
     description: &str,
 ) -> Result<(Lease, Record), String> {
-    let subject = Subject::build(want.recipe().name, build)
+    let subject = Subject::build(want.program(), build)
         .ok_or("the prerequisite lease identity is invalid")?;
     let lease = crate::lease::take(
         &layout.prefix,
@@ -556,7 +590,7 @@ fn hold_selection(
         description,
         crate::lease::DEFAULT_WAIT,
     )
-    .map_err(|e| format!("{} prerequisite lease: {e}", want.recipe().name))?;
+    .map_err(|e| format!("{} prerequisite lease: {e}", want.program()))?;
     let held = crate::lookup::read(Some(layout), want.executable());
     admit_selection(&held, want, build)?;
     if !same_selection(selected, &held) {
@@ -568,14 +602,14 @@ fn hold_selection(
 fn admit_selection(record: &Record, want: Prerequisite, build: u64) -> Result<(), String> {
     if record.status != Status::Ready
         || !record.managed
-        || record.package.as_deref() != Some(want.recipe().name)
+        || record.package.as_deref() != Some(want.program())
         || record.build != Some(build)
     {
         return Err(format!(
             "{} needs signed atpkg {} {build}; install with `aterm pkg install {}`",
             want.executable(),
-            want.recipe().name,
-            want.recipe().name
+            want.program(),
+            want.program()
         ));
     }
     Ok(())
@@ -609,7 +643,7 @@ pub struct HeldTool {
     /// Freshly folded signed payload root.
     tree_root: String,
     root: PathBuf,
-    version: &'static str,
+    version: String,
 }
 
 impl HeldTool {
@@ -631,10 +665,11 @@ impl HeldTool {
         &self.tree_root
     }
 
-    /// Exact signed upstream version admitted by the shared recipe.
+    /// Exact signed package version, also checked against the shared upstream
+    /// recipe when this prerequisite wraps an upstream tool.
     #[must_use]
-    pub const fn version(&self) -> &'static str {
-        self.version
+    pub fn version(&self) -> &str {
+        &self.version
     }
 
     /// Immutable physical payload root retained by this tool's lease.

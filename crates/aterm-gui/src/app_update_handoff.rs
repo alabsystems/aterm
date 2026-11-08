@@ -5691,7 +5691,6 @@ impl App {
                     .filter(|size| size.width > 0 && size.height > 0)
                     .map(|size| [size.width, size.height]),
                 presence_row: false,
-                status_bar_rows: self.message_band_rows,
                 messages: carried.messages,
                 next_message_id: carried.next_message_id,
                 update_verified_unix_ms: crate::update_words::verified_unix_ms(

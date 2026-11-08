@@ -80,6 +80,7 @@ pub(crate) fn seed_reference(state: &mut State, logins: &mut Logins, label: &str
                 sid: "canary-session".into(),
                 at: NOW,
                 took: false,
+                native_receipt: None,
             };
             state.canary = Some(canary.clone());
             state.undo.push(Undo {

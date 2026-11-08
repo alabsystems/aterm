@@ -79,6 +79,7 @@ fn lit_video() -> ScanReport {
             sampling_hole_us: NOMINAL,
             nominal_dt_us: NOMINAL,
             mature_lead_us: 130_000,
+            all_composed_frames: false,
         },
         ..lit_burst()
     }

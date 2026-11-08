@@ -105,6 +105,10 @@ const OUTBOX_MAX: usize = 16;
 /// What a derived `close` row says it came from.
 pub const SRC_SERIES: &str = "series";
 
+/// What a `close` row the account backfill booked says it came from (`super::account_backfill`):
+/// one `accounts history` makes in memory from a home's transcripts, which no file holds.
+pub const SRC_BACKFILL: &str = "backfill";
+
 /// How far back from a file's end a writer looks for the last `fig` row.
 const LAST_FIG_BYTES: u64 = 4096;
 
@@ -194,7 +198,7 @@ pub struct Close {
     pub epochs: Vec<i64>,
     /// A newer anchor's first figure came before this reset.
     pub early: bool,
-    /// What it came from ([`SRC_SERIES`]).
+    /// What it came from ([`SRC_SERIES`], [`SRC_BACKFILL`]).
     pub src: String,
     /// The record's lab key, from its newest `fig` row that held one.
     pub ac: Option<String>,

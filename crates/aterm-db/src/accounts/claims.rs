@@ -39,10 +39,7 @@ use aterm_codec::hex;
 use aterm_digest::Sha256;
 use aterm_json::Value;
 use aterm_secrets::{client::Paths, commons::bootstrap::Bootstrap};
-use std::{
-    collections::BTreeMap,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, time::Instant};
 
 /// A row's canonical body is at most this long.
 pub const MAX_ROW: usize = crate::crypto::MAX_BODY - 4096;
@@ -583,7 +580,16 @@ pub fn push(
 /// The day table that holds this writer's latest ring row (its scope digest), read without the
 /// table's writer lock or enrolling any table; none while its peers read its clock as off.
 fn own_table(paths: &Paths, now: u64, deadline: Instant) -> Result<astream_wire::sync::Digest> {
-    let admission = deadline.min(Instant::now() + Duration::from_secs(2));
+    own_table_started(paths, now, deadline, Instant::now())
+}
+
+fn own_table_started(
+    paths: &Paths,
+    now: u64,
+    deadline: Instant,
+    started: Instant,
+) -> Result<astream_wire::sync::Digest> {
+    let admission = deadline.min(crate::admission::deadline_at(started));
     let bootstrap = Bootstrap::required_until(paths, admission).map_err(crate::table::failure)?;
     let session = Session::observe(&bootstrap)?;
     let directory = Directory::new(paths, bootstrap.trust());
@@ -677,9 +683,19 @@ pub fn write(paths: &Paths, body: &Value) -> Result<()> {
     )
 )]
 pub(crate) fn write_at(paths: &Paths, body: &Value, now: u64, caps: Caps) -> Result<()> {
+    write_started(paths, body, now, caps, Instant::now())
+}
+
+fn write_started(
+    paths: &Paths,
+    body: &Value,
+    now: u64,
+    caps: Caps,
+    started: Instant,
+) -> Result<()> {
     let selected = crate::generation::selected(paths)?;
     let paths = &selected;
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::admission::deadline_at(started);
     let (bootstrap, journal) =
         Bootstrap::required_with_journal_until(paths, deadline).map_err(crate::table::failure)?;
     let session = Session::from_admitted_journal(&bootstrap, journal)?;

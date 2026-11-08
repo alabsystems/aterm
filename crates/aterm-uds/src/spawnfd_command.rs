@@ -178,6 +178,9 @@ pub struct Command {
     /// Pass-through commands retain the caller's non-close-on-exec table. Ordinary commands
     /// still hand on only explicitly named guards.
     inherit_all: bool,
+    /// An in-place native exec keeps this thread's signal mask instead of starting empty.
+    #[cfg(target_vendor = "apple")]
+    inherit_exec_signal_mask: bool,
     pgroup: Option<i32>,
     setsid: bool,
     /// The SPI that makes the child its own responsible process, when asked
@@ -247,6 +250,8 @@ impl Command {
             #[cfg(unix)]
             guards: Vec::new(),
             inherit_all: false,
+            #[cfg(target_vendor = "apple")]
+            inherit_exec_signal_mask: false,
             pgroup: None,
             setsid: false,
             disclaim: None,
@@ -421,6 +426,31 @@ impl Command {
                 });
             }
             self.guards = placed;
+            Ok(self)
+        }
+    }
+
+    /// Preserve the calling thread's current signal mask across this command's in-place native
+    /// exec. Spawned children still start with no signal blocked, and unsupported platforms
+    /// refuse before changing command state.
+    ///
+    /// The caller must arrange the receiver's handler installation and selective mask restore;
+    /// carrying a mask grants neither a signal disposition nor permission to unblock it.
+    ///
+    /// # Errors
+    /// This platform has no qualified native in-place exec boundary.
+    #[cfg(unix)]
+    pub fn inherit_exec_signal_mask(&mut self) -> io::Result<&mut Self> {
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "signal-mask handoff requires the native Apple exec boundary",
+            ))
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            self.inherit_exec_signal_mask = true;
             Ok(self)
         }
     }
@@ -1362,6 +1392,12 @@ impl Command {
                 "mapped guard exec cannot preserve the failure table",
             ));
         }
+        if self.inherit_exec_signal_mask && !replace {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a signal mask is inherited only by an in-place exec",
+            ));
+        }
         if replace && self.disclaim.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -1525,6 +1561,7 @@ impl Command {
                 replace,
                 long_entry_ends: !self.env.saw_path(),
                 inherit_all: self.inherit_all,
+                inherit_signal_mask: self.inherit_exec_signal_mask,
                 native_image: self.native_image,
                 disclaim: self.disclaim,
                 suspended: self.suspended,

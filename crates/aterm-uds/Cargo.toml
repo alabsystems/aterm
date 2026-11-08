@@ -76,6 +76,7 @@ libc = { workspace = true }
 astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
 
 [dev-dependencies]
+aterm-bench = { path = "../aterm-bench" }
 # Test scratch directories (mode 0700, an unpredictable name); itself dependency-free.
 aterm-tempfile = { workspace = true }
 # The relocated watcher tests use the shared one-minute hang detector and wait helpers.

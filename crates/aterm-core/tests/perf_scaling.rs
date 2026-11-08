@@ -4,7 +4,8 @@
 
 //! Deterministic heap-allocation complexity guard for the terminal engine.
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use aterm_bench::allocator::{Observed, Observer};
+use std::alloc::System;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -12,23 +13,18 @@ static ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 
 struct Counting;
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+// SAFETY: the callback uses only nonallocating, nonpanicking atomic arithmetic.
+unsafe impl Observer for Counting {
+    fn requested(&self, size: usize) {
         if ACTIVE.load(Ordering::Relaxed) {
             ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-            ALLOC_BYTES.fetch_add(l.size() as u64, Ordering::Relaxed);
+            ALLOC_BYTES.fetch_add(size as u64, Ordering::Relaxed);
         }
-        // SAFETY: forwarding to System with the same layout.
-        unsafe { System.alloc(l) }
-    }
-    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        // SAFETY: forwarding to System with the same ptr+layout.
-        unsafe { System.dealloc(p, l) }
     }
 }
 
 #[global_allocator]
-static ALLOC: Counting = Counting;
+static ALLOC: Observed<System, Counting> = Observed::new(System, Counting);
 
 fn workload(lines: usize) -> Vec<u8> {
     let mut v = Vec::new();

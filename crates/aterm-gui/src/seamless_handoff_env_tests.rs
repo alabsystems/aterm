@@ -626,7 +626,6 @@ fn a_stale_hint_is_reselected_before_any_carried_present() {
             outer_y: None,
             inner_px: None,
             presence_row: false,
-            status_bar_rows: 0,
             messages: Default::default(),
             next_message_id: Default::default(),
             update_verified_unix_ms: None,

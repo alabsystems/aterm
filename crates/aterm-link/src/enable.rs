@@ -190,18 +190,13 @@ const BIND_DEADLINE: Duration = Duration::from_secs(60);
 
 const ARM_DEADLINE: Duration = Duration::from_secs(60);
 
-#[cfg(not(test))]
-const IO_TIMEOUT: Duration = Duration::from_secs(8);
-/// The unit tests' instances are in-process stand-ins, so a reply one of them sends late is a
-/// loaded machine, not an instance gone silent: their sockets wait the hang detector.
-#[cfg(test)]
-const IO_TIMEOUT: Duration = aterm_spec::wait::MUST_HAPPEN;
-
-/// The bound on each read and write of an instance's control socket: [`IO_TIMEOUT`], or the
-/// `aterm fabric` sockets' seam a development build was given ([`fabric::io_seam`]), so a test's
-/// instance that the loaded machine keeps from answering for 8 s is waited for, not left unarmed.
+/// The required local control exchange uses the fabric's minute hang detector.
 fn io_timeout() -> Duration {
-    fabric::io_seam().unwrap_or(IO_TIMEOUT)
+    io_timeout_at(Instant::now())
+}
+
+pub(crate) fn io_timeout_at(started: Instant) -> Duration {
+    fabric::io_timeout_at(started)
 }
 
 const TRACE_ENV: &str = "ATERM_FABRIC_TRACE";
@@ -3189,6 +3184,10 @@ pub(crate) trait Launchd {
     fn running(&self, pid: u32) -> bool;
     /// Wait `pause` before the next look at a job launchd is still letting go.
     fn pause(&self, pause: Duration);
+    /// The clock used to detect a hung service transition.
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
 }
 
 /// The live `launchctl` (`$ATERM_TEST_LAUNCHCTL`'s stand-in in a test build).
@@ -3212,13 +3211,9 @@ impl Launchd for LiveLaunchd {
     }
 }
 
-/// The most looks, [`GONE_POLL`] apart, the broker step takes at a job it booted out while it
-/// waits for launchd to let the job go, or at the process a `kickstart -k` killed: thirty
-/// seconds, past launchd's default `ExitTimeOut` (20 s from its SIGTERM to its SIGKILL; `on`'s
-/// plist sets none). launchd's `bootout` returns
-/// before the job is gone, and a `bootstrap` of the same label until then fails (`5:
-/// Input/output error`, `37: Operation already in progress`), which left the job unloaded.
-const GONE_POLLS: u32 = 300;
+/// Hang detector for observing a stopped job or process disappear.
+/// launchd can return from bootout before it releases the label.
+const GONE_HANG: Duration = Duration::from_secs(60);
 
 const GONE_POLL: Duration = Duration::from_millis(100);
 
@@ -3239,15 +3234,23 @@ enum Up {
     Held(String),
 }
 
-/// Wait until `gone` holds, [`GONE_POLLS`] looks [`GONE_POLL`] apart at most: whether it did.
+/// Wait until `gone` holds, bounded only by the service transition hang detector.
 fn until_gone(lc: &dyn Launchd, gone: impl Fn() -> bool) -> bool {
-    for _ in 0..GONE_POLLS {
+    until_gone_at(lc, gone, lc.now())
+}
+
+fn until_gone_at(lc: &dyn Launchd, gone: impl Fn() -> bool, started: Instant) -> bool {
+    let deadline = started + GONE_HANG;
+    loop {
         if gone() {
             return true;
         }
-        lc.pause(GONE_POLL);
+        let remaining = deadline.saturating_duration_since(lc.now());
+        if remaining.is_zero() {
+            return false;
+        }
+        lc.pause(GONE_POLL.min(remaining));
     }
-    gone()
 }
 
 /// Wait while launchd still holds `label`: whether it let it go. Only `print`'s "no such job"
@@ -3324,7 +3327,7 @@ fn launchd_up(
                     Some(old) if !until_gone(lc, || !lc.running(old)) => Err(format!(
                         "pid {old} of {job} still ran {} s after `launchctl kickstart -k` \
                          killed it, so no broker of this build was started",
-                        (GONE_POLL * GONE_POLLS).as_secs()
+                        GONE_HANG.as_secs()
                     )),
                     _ => Ok(Up::InPlace),
                 };
@@ -3349,7 +3352,7 @@ fn launchd_up(
             failed.extend(bootout);
             failed.push(format!(
                 "launchd still held {job} {} s after its bootout",
-                (GONE_POLL * GONE_POLLS).as_secs()
+                GONE_HANG.as_secs()
             ));
             return Err(format!(
                 "launchd still holds {job} as it was loaded before, so {shown} was neither \
@@ -4138,7 +4141,7 @@ fn retire_launchd(p: &Paths, label: &str, lc: &dyn Launchd) -> Result<RetiredJob
         .and_then(|argv| crate::durability::Durability::named_of_argv(&argv));
     record_job_tier(&p.root, named, on_disk.then_some(plist.as_path()))?;
     let domain = format!("gui/{}/{label}", uid());
-    let waited = (GONE_POLL * GONE_POLLS).as_secs();
+    let waited = GONE_HANG.as_secs();
     if held {
         // By domain, with no legacy `unload` fallback: that acts on the caller's domain and exits
         // 0 whatever it did.
@@ -4222,7 +4225,7 @@ fn retire_systemd(
                 "pid {pid} of systemd --user {label} still ran {} s after it was stopped, \
                  holding bus.log's lock: `kill {pid}` ends it, and the node service opens the \
                  log at its next pass",
-                (GONE_POLL * GONE_POLLS).as_secs()
+                GONE_HANG.as_secs()
             ));
         }
     }
@@ -6812,27 +6815,24 @@ fn retire_ghosts_action(yes: bool) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let silent = fabric::unanswered(&report);
-    if !silent.is_empty() {
-        println!(
+    let ghosts = match fabric::retirement_candidates(&report) {
+        Ok(ghosts) => ghosts,
+        Err(silent) => {
+            println!(
             "refused: {} local instance(s) did not answer, so no row on this node can be shown \
              unhosted:",
             silent.len()
         );
-        for why in &silent {
-            println!("  ! {why}");
-        }
-        println!(
-            "  fix: make every instance answerable (`aterm fabric status` names each one), \
+            for why in &silent {
+                println!("  ! {why}");
+            }
+            println!(
+                "  fix: make every instance answerable (`aterm fabric status` names each one), \
              then re-run"
-        );
-        return ExitCode::from(2);
-    }
-    let local = fabric::local_nodes(&report.instances, report.node.as_deref());
-    let ghosts: Vec<(String, String)> = fabric::ghost_rows(&report.sessions, &local)
-        .into_iter()
-        .map(|s| (s.sid.clone(), s.node.clone()))
-        .collect();
+            );
+            return ExitCode::from(2);
+        }
+    };
     if ghosts.is_empty() {
         println!("no ghost rows: every live row on this node is hosted here");
         return ExitCode::SUCCESS;
@@ -7145,6 +7145,49 @@ pub fn doctor(retire_ghosts: bool, yes: bool) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn native_service_retirement_waits_for_its_original_child_to_finish() {
+        let program = aterm_uds::deadline::stand_in(Path::new("/bin/cat"));
+        let mut command = aterm_uds::spawnfd::command(program);
+        command.stdin(Stdio::piped()).stdout(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let input = std::cell::RefCell::new(Some(aterm_uds::deadline::cat_echoes(&mut child)));
+        let child = std::cell::RefCell::new(child);
+        assert!(!until_gone_at(
+            &LiveLaunchd,
+            || child.borrow_mut().try_wait().unwrap().is_some(),
+            Instant::now() - Duration::from_secs(61),
+        ));
+        assert!(child.borrow_mut().try_wait().unwrap().is_none());
+        let inspected = std::cell::Cell::new(false);
+        let completed = until_gone_at(
+            &LiveLaunchd,
+            || {
+                if inspected.replace(true) {
+                    drop(input.borrow_mut().take());
+                }
+                child.borrow_mut().try_wait().unwrap().is_some()
+            },
+            Instant::now() - Duration::from_secs(31),
+        );
+        drop(input.borrow_mut().take());
+        let mut exit = aterm_uds::deadline::ExitWait::on_pid(child.borrow().id());
+        let cleanup = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(status) = child.borrow_mut().try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            assert!(
+                Instant::now() < cleanup,
+                "private cat did not exit after EOF"
+            );
+            exit.wait(cleanup.saturating_duration_since(Instant::now()));
+        }
+        assert!(completed);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -8415,12 +8458,15 @@ mod tests {
         aterm_types::fabric_command::split_line(line)
     }
 
+    const FAKE_GONE_POLLS: u32 = 600;
+
     /// launchd as the measured Mac's behaved, in memory: `bootout` returns at once while the job
     /// stays held for `lingers` more `print`s, a `bootstrap` of a label launchd still holds fails
     /// as launchd fails it (`5: Input/output error`), and `kickstart -k` restarts only a loaded
     /// job, the process it killed running `lingers` more looks. The plist on disk starts as
     /// `old`. Each verb is recorded by its first word, a plist write as `write`.
     struct FakeLaunchd {
+        clock: std::cell::Cell<Instant>,
         loaded: std::cell::Cell<bool>,
         /// The plist text the loaded job was loaded from.
         loaded_from: std::cell::RefCell<String>,
@@ -8453,6 +8499,7 @@ mod tests {
     impl FakeLaunchd {
         fn new(loaded: bool, lingers: u32) -> Self {
             Self {
+                clock: std::cell::Cell::new(Instant::now()),
                 loaded: std::cell::Cell::new(loaded),
                 loaded_from: std::cell::RefCell::new("old".to_string()),
                 plist: std::cell::RefCell::new("old".to_string()),
@@ -8604,8 +8651,13 @@ mod tests {
             running
         }
 
-        fn pause(&self, _pause: Duration) {
+        fn pause(&self, pause: Duration) {
             self.pauses.set(self.pauses.get() + 1);
+            self.clock.set(self.clock.get() + pause);
+        }
+
+        fn now(&self) -> Instant {
+            self.clock.get()
         }
     }
 
@@ -8730,7 +8782,7 @@ mod tests {
             3,
             "the killed process was waited for"
         );
-        let lingering = FakeLaunchd::new(true, 3 * GONE_POLLS);
+        let lingering = FakeLaunchd::new(true, 3 * FAKE_GONE_POLLS);
         let why = launchd_up(&lingering, label, plist, (true, Some(4242)), None)
             .expect_err("the killed process never exits");
         assert!(
@@ -8961,7 +9013,7 @@ mod tests {
         );
         assert_eq!(silent.count("bootstrap"), 1);
 
-        let stuck = FakeLaunchd::new(true, 3 * GONE_POLLS);
+        let stuck = FakeLaunchd::new(true, 3 * FAKE_GONE_POLLS);
         let why = launchd_up(
             &stuck,
             label,
@@ -8980,7 +9032,10 @@ mod tests {
             "no write, no bootstrap over a job launchd holds: {why}"
         );
         assert_eq!(stuck.on_disk(), "old");
-        assert_eq!(stuck.pauses.get(), GONE_POLLS, "a bounded wait");
+        assert!(
+            stuck.pauses.get() > 0,
+            "the retained job was observed again"
+        );
     }
 
     /// The wait for a starting broker connects until one answers and names its process once,
@@ -12304,7 +12359,7 @@ mod tests {
         install(&p, None);
         let stuck = FakeLaunchd::new(true, 0);
         stuck.pid.set(Some(4242));
-        stuck.exiting.set(GONE_POLLS + 5);
+        stuck.exiting.set(FAKE_GONE_POLLS + 5);
         let failed = retire_with(&p, Service::Launchd, &stuck, &no_systemd, &no_unit);
         assert!(
             matches!(&failed, Err(why) if why.contains("kill 4242")),

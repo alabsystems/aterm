@@ -198,6 +198,19 @@ const fn harness(name: &'static str, tool: &'static str) -> ProgramDef {
 
 /// Every program the channel pins, in index order.
 pub static PROGRAMS: &[ProgramDef] = &[
+    ProgramDef {
+        name: "atpkg-keys",
+        repo: "aterm",
+        group: None,
+        system: None,
+        unavailable_hint: Some(
+            "The managed release-signing helper is published for ARM macOS only",
+        ),
+        shape: Shape::Plain {
+            darwin: ARM_DARWIN,
+            harness: None,
+        },
+    },
     plain("ay", None, DUAL_DARWIN),
     plain("clean", None, DUAL_DARWIN),
     plain("nn", None, DUAL_DARWIN),

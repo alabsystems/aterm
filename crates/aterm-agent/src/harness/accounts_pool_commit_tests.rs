@@ -109,6 +109,7 @@ fn observe(operation: i64, fault: i64) -> [bool; 6] {
                     sid: "silent".into(),
                     at: NOW - accounts::CANARY_HOLD_S - 1,
                     took: false,
+                    native_receipt: None,
                 });
                 Ok(Vec::new())
             })

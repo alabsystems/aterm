@@ -10,7 +10,11 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm — OWNER-side Ed25519 signing for atpkg manifests (provisioning + detached sign over exact raw bytes). Produces signatures the verify-only atpkg client accepts; never shipped to clients."
+description = "aterm — OWNER-side Ed25519 signing for atpkg manifests (provisioning + detached sign over exact raw bytes), distributed as a separate managed release-host tool."
+
+[package.metadata.atpkg]
+expose = ["atpkg-keys"]
+build-args = ["--locked", "-p", "atpkg-keys", "--bin", "atpkg-keys"]
 
 [lib]
 path = "src/lib.rs"
@@ -23,7 +27,7 @@ test = false
 
 [dependencies]
 # The full ring crate (RNG for keygen, the signing op). The client, atpkg, is verify-only
-# (`default-features = false`); this owner-only tool is never shipped. At or above the
+# (`default-features = false`); this owner tool ships separately, never in the client. At or above the
 # deny.toml ring floor.
 ring = { workspace = true, features = ["default"] }
 # Encode the 32-byte raw public keys of the paper master and the machine keys (the pins.rs

@@ -1182,6 +1182,167 @@ fn a_scratch_clone_is_fetched_as_the_staging_identity_never_by_its_origin() {
     );
 }
 
+/// A home `~/publication` whose ledger maps `repo`'s `dev` commit to `tag`'s signed commit:
+/// the checkout the lane read before, which no release fast-forwards any more.
+fn home_ledger(w: &World, repo: &str, dev: &str, tag: &str) {
+    let home = w.fx.ctx.home.join("publication");
+    std::fs::create_dir_all(&home).expect("mkdir");
+    let public = fixture::hex40(&format!("{repo}@{tag}"));
+    std::fs::write(
+        home.join("mappings.json"),
+        format!(
+            "{{\"mappings\": {{\"{repo}\": {{\"{dev}\": {{\"release_rev\": \"{public}\"}}}}}}}}"
+        ),
+    )
+    .expect("a home checkout's ledger");
+}
+
+/// THE LEDGER IS THE ENGINE ORIGIN'S MAIN, READ AS THE STAGING IDENTITY, NEVER AN ENGINE
+/// CHECKOUT ON THIS MAC: a home `~/publication` that a release no longer fast-forwards maps the
+/// new release to another dev commit (the one before), while the engine's main (where the
+/// promote recorded it) maps it to the commit it was cut from, and that one is built. NEGATIVE
+/// CONTROL: the lane's old read of `~/publication/mappings.json` built the build before; a read
+/// of both found two live rows and built none.
+#[test]
+fn the_ledger_is_read_from_the_engine_origins_main_never_a_home_checkout() {
+    let w = World::settled("alab-engine-main");
+    let build = ay_release(&w, "v0.7.0");
+    let stale = git(&w.dev("ay"), &["rev-parse", "HEAD~1"]);
+    home_ledger(&w, "ay", &stale, "v0.7.0");
+    let (o, tx) = ok(w.run(false));
+    assert!(
+        rendered(&o, "ay").starts_with(&format!("PACK: v0.7.0 (build {build})")),
+        "{}",
+        tx.text()
+    );
+    assert!(
+        w.fx.calls("fetch-main ")
+            .contains(&"fetch-main alabsystems/publication".to_string()),
+        "{:?}",
+        w.fx.calls("fetch-main ")
+    );
+}
+
+/// THE ENGINE'S MAIN IS READ THROUGH THE STAGING HOST, WHOSE OWNER HOLDS THE ENGINE: with a
+/// channel host that reads no repository's main, the release is still mapped and built.
+/// NEGATIVE CONTROL: a read through the channel host (the public owner's identity, which cannot
+/// see the private engine) is refused, and the release is UNRESOLVED.
+#[test]
+fn the_engines_main_is_read_through_the_staging_host() {
+    let w = World::settled("alab-engine-staging-host");
+    let build = ay_release(&w, "v0.7.0");
+    let mut ctx = w.fx.ctx.clone();
+    ctx.hosts = atpkg_publish::host::Hosts {
+        staging: w.fx.host.clone(),
+        channel: std::sync::Arc::new(under_agh::RefusesOne {
+            inner: w.fx.host.clone(),
+            refused: ctx.staging_slug("never-asked"),
+        }),
+    };
+    let (o, tx) = ok(w.run_as(&ctx, false));
+    assert!(
+        rendered(&o, "ay").starts_with(&format!("PACK: v0.7.0 (build {build})")),
+        "{}",
+        tx.text()
+    );
+}
+
+/// A LEDGER THE ENGINE'S MAIN DOES NOT HOLD, OR HOLDS UNREADABLE, RESOLVES NOTHING: with
+/// `mappings.json` removed from the engine's main, and again with it unparseable, the release
+/// is UNRESOLVED with that reason and nothing is packed. NEGATIVE CONTROL: either read as an
+/// empty ledger would say the promote recorded no row yet.
+#[test]
+fn a_ledger_the_engines_main_lacks_or_garbles_resolves_nothing() {
+    let w = World::settled("alab-engine-no-ledger");
+    ay_release(&w, "v0.7.0");
+    let packs = w.fx.packer.legs().len();
+    let origin = w.fx.engine_origin();
+    git(&origin, &["rm", "-q", "mappings.json"]);
+    fixture::commit(&origin, "no ledger", None);
+    let (o, _) = ok(w.run(false));
+    assert!(
+        matches!(&row(&o, "ay").decision, Decision::Unresolved(why)
+            if why.contains("alabsystems/publication's main has no readable mappings.json")),
+        "{:?}",
+        row(&o, "ay").decision
+    );
+    std::fs::write(origin.join("mappings.json"), "{not json").expect("garble");
+    git(&origin, &["add", "mappings.json"]);
+    fixture::commit(&origin, "garbled ledger", None);
+    let (o, _) = ok(w.run(false));
+    assert!(
+        matches!(&row(&o, "ay").decision, Decision::Unresolved(why)
+            if why.contains("the ledger on alabsystems/publication main")
+                && why.contains("does not parse")),
+        "{:?}",
+        row(&o, "ay").decision
+    );
+    assert_eq!(
+        w.fx.packer.legs().len(),
+        packs,
+        "nothing unresolved is built"
+    );
+}
+
+/// A REVOKED ROW NEVER NAMES THE DEV COMMIT A SIGNED RELEASE IS BUILT FROM, END TO END: the
+/// release's signed commit is the `release_rev` of two rows, as ay's and trust-ir's were on
+/// 2026-11-07's ledger. While both are live the lane decides neither (NEGATIVE CONTROL: the
+/// lane before 54cf70906b took the first row, revoked or not); once the engine revokes one, the
+/// other is built.
+#[test]
+fn a_revoked_row_never_names_the_dev_commit_a_release_is_built_from() {
+    let w = World::settled("alab-revoked-row");
+    let build = ay_release(&w, "v0.7.0");
+    let ay = w.dev("ay");
+    let live = git(&ay, &["rev-parse", "HEAD"]);
+    let revoked = git(&ay, &["rev-parse", "HEAD~1"]);
+    w.fx.map("ay", &revoked, "v0.7.0");
+    let (o, _) = ok(w.run(false));
+    assert!(
+        matches!(&row(&o, "ay").decision, Decision::Unresolved(why) if why.contains("to 2 live ay rows")),
+        "{:?}",
+        row(&o, "ay").decision
+    );
+    let packs = w.fx.packer.legs().len();
+    w.fx.revoke("ay", &revoked);
+    let (o, tx) = ok(w.run(false));
+    assert!(
+        rendered(&o, "ay").starts_with(&format!("PACK: v0.7.0 (build {build})")),
+        "{}",
+        tx.text()
+    );
+    assert!(w.fx.packer.legs().len() > packs, "the live row is built");
+    assert_ne!(live, revoked);
+}
+
+/// AN ENGINE MAIN THE HOST DOES NOT SERVE RESOLVES NOTHING: the release is UNRESOLVED with the
+/// host's reason and nothing is packed, though a home `~/publication` maps it to the commit it
+/// was cut from. NEGATIVE CONTROL: a lane that falls back to that checkout when the engine's
+/// main cannot be read finds the live row there and packs v0.7.0.
+#[test]
+fn an_engine_main_the_host_does_not_serve_resolves_nothing() {
+    let w = World::settled("alab-engine-unread");
+    ay_release(&w, "v0.7.0");
+    let head = git(&w.dev("ay"), &["rev-parse", "HEAD"]);
+    home_ledger(&w, "ay", &head, "v0.7.0");
+    let packs = w.fx.packer.legs().len();
+    w.fx.host
+        .set_not_visible(&w.fx.ctx.staging_slug("publication"), true);
+    let (o, _) = ok(w.run(false));
+    assert!(
+        matches!(&row(&o, "ay").decision, Decision::Unresolved(why)
+            if why.contains("could not read alabsystems/publication's main from the host")
+                && why.contains("not visible to this identity (HTTP 404)")),
+        "{:?}",
+        row(&o, "ay").decision
+    );
+    assert_eq!(
+        w.fx.packer.legs().len(),
+        packs,
+        "nothing unresolved is built"
+    );
+}
+
 #[test]
 fn a_sums_larger_than_a_manifest_is_still_read_and_verified() {
     let w = World::settled("alab-big-sums");
@@ -1265,10 +1426,11 @@ mod under_agh {
 
     /// A `FakeHost` whose `write_preflight` refuses one slug, a program repository's, and
     /// delegates every other: the run's staging host only, so the role, not the slug, says
-    /// which check asks.
-    struct RefusesOne {
-        inner: Arc<FakeHost>,
-        refused: Slug,
+    /// which check asks. It reads no repository's main (`fetch_main` is the trait's refusing
+    /// default), so as a run's channel host it shows which host the engine's main is read on.
+    pub(super) struct RefusesOne {
+        pub(super) inner: Arc<FakeHost>,
+        pub(super) refused: Slug,
     }
 
     impl ReleaseHost for RefusesOne {

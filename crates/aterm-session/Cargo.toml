@@ -25,6 +25,7 @@ aterm-digest = { workspace = true }
 aterm-spec-anchor = { workspace = true }
 
 [dev-dependencies]
+aterm-bench = { path = "../aterm-bench" }
 # `ty_model!` models and the interpreter for the conformance tests; the `test` cfg also
 # expands the fd-lifecycle anchors.
 aterm-spec = { workspace = true }

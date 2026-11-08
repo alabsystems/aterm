@@ -335,6 +335,7 @@ fn a_carried_row_keeps_its_excerpt_flag() {
     let mut child = fresh(now);
     child.seed_carried(&carry, stamp(), now);
     assert!(!child.live(id).unwrap().msg.excerpt);
+    child.commit_rows(now, 3);
     assert_eq!(present(&child, 160).rows[0].detail, None);
     let mut parent = fresh(now);
     parent.post(download(1).reveal_after(PROGRESS_GRACE), stamp(), now);

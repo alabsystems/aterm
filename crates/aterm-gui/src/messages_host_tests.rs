@@ -3,8 +3,6 @@
 
 use super::*;
 use crate::update_words::LiveHealth as _;
-#[cfg(unix)]
-use aterm_messages::MAX_ROWS;
 use aterm_messages::{LogRecord, LogState, Retired, Severity, tags};
 
 fn warn(title: &str) -> Message {
@@ -1650,9 +1648,8 @@ pub(crate) fn parked() -> crate::PendingUpdateHandoff {
     }
 }
 
-/// The manifest's window carry around what `carried_messages` handed over, as the two construction sites in `app_update_handoff` write it.
+/// The manifest's window carry around what `carried_messages` handed over, as `App::handoff_window_carry` writes it, with no frame, position or font zoom.
 pub(super) fn window_carry(
-    rows: u16,
     carried: crate::session_store::MessagesCarry,
 ) -> crate::session_store::WindowCarry {
     crate::session_store::WindowCarry {
@@ -1662,7 +1659,6 @@ pub(super) fn window_carry(
         outer_y: None,
         inner_px: None,
         presence_row: false,
-        status_bar_rows: rows,
         messages: carried.messages,
         next_message_id: carried.next_message_id,
         update_verified_unix_ms: None,
@@ -1683,7 +1679,7 @@ fn restoring_messages_retires_obsolete_join_alerts_before_polling() {
     for key in ["members.ask.1", "secrets.asking.ABCD", "unrelated.warning"] {
         parent.post_message(warn("Carried warning").key(key));
     }
-    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+    let carry = window_carry(parent.carried_messages());
     for finishing in [None, Some("0.149.0")] {
         let mut successor = App::headless_for_test();
         successor.seed_carried_messages(&carry, finishing);
@@ -1778,11 +1774,10 @@ fn a_handoff_carries_live_rows() {
     let installing = parent.post_message(update_words::installing("0.76.0"));
     parent.post_message(toolchain_words::announced("installing ay, trust"));
     parent.pending_update_handoff = Some(parked());
-    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+    let carry = window_carry(parent.carried_messages());
 
     let mut successor = App::headless_for_test();
     successor.incoming_handoff_pending = true;
-    successor.message_band_rows = carry.status_bar_rows.min(MAX_ROWS);
     successor.seed_carried_messages(&carry, Some("0.76.0"));
     assert_eq!(
         successor
@@ -1803,8 +1798,13 @@ fn a_handoff_carries_live_rows() {
         "nothing crossed as a log line"
     );
     assert_eq!(
-        successor.message_band_rows, carry.status_bar_rows,
-        "the geometry is the parent's until Commit"
+        successor.chrome_rows(crate::WindowId(0)),
+        successor.tab_strip_rows,
+        "the successor reserves no band row"
+    );
+    assert!(
+        successor.messages.on_glass().next().is_none(),
+        "…and puts nothing on the glass"
     );
 
     let mut plain = App::headless_for_test();
@@ -1822,7 +1822,7 @@ fn a_handoff_carries_live_rows() {
 
     let mut other = App::headless_for_test();
     other.post_message(toolchain_words::announced("installing ay"));
-    let no_progress = window_carry(1, other.carried_messages());
+    let no_progress = window_carry(other.carried_messages());
     let mut successor = App::headless_for_test();
     successor.seed_carried_messages(&no_progress, Some("0.76.0"));
     assert!(
@@ -1837,11 +1837,8 @@ fn a_handoff_carries_live_rows() {
          glyph = \"!\"\ntitle = \"ALab toolchain\"\ndetail = \"\"\ntone = \"warn\"\n\
          fill_permille = 430\n",
     )
-    .expect("an older parent's window carry still decodes");
-    assert_eq!(
-        old.status_bar_rows, 1,
-        "the rows it had committed still count"
-    );
+    .expect("an older parent's window carry still decodes, its band rows read past");
+    assert_eq!((old.rows, old.cols), (24, 80));
     let mut adopting = App::headless_for_test();
     adopting.seed_carried_messages(&old, Some("0.76.0"));
     assert_eq!(
@@ -1850,9 +1847,136 @@ fn a_handoff_carries_live_rows() {
         "no bar is carried"
     );
     let mut empty = App::headless_for_test();
-    empty.seed_carried_messages(&window_carry(0, Default::default()), Some("0.76.0"));
+    empty.seed_carried_messages(&window_carry(Default::default()), Some("0.76.0"));
     assert_eq!(empty.messages.live_rows().count(), 0);
     assert_eq!(empty.messages.log().next_id(), MessageId::FIRST);
+}
+
+/// A v0.147.0 parent, the last whose band took rows, carried `status_bar_rows = 3` and rows
+/// `on_glass`. Both keys are read past: the successor reserves no band row and seeds no glass,
+/// its window takes the exact frame of the carried grid (the band's rows are dropped, the grid
+/// keeps its size), and nothing re-grids from the seed to Commit.
+#[cfg(unix)]
+#[test]
+fn a_v0_147_parents_band_is_read_past_and_nothing_regrids_to_commit() {
+    let desk = aterm_tempfile::manifest_dir().join("tests/fixtures/handoff/v0.147.0/carried-state");
+    let manifest = std::fs::read_dir(&desk)
+        .expect("the shipped desk")
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with("seamless-")
+                    && name.ends_with(".toml")
+                    && !name.ends_with(".layout.toml")
+            })
+        })
+        .expect("the desk's manifest");
+    let text = std::fs::read_to_string(&manifest).expect("the manifest reads");
+    let (_nonce, toml) = text.split_once('\n').expect("the nonce line");
+    assert!(
+        toml.contains("status_bar_rows = 3") && toml.contains("on_glass = true"),
+        "PRECONDITION: the parent committed band rows and carried rows on its glass"
+    );
+    let handoff: crate::session_store::SessionHandoff =
+        aterm_toml::from_str(toml).expect("a v0.147.0 manifest still decodes");
+    let carry = handoff.window.expect("the window carry");
+    let [width, height] = carry.inner_px.expect("the carried frame");
+    let carried = aterm_window::dpi::PhysicalSize::new(width, height);
+
+    let wid = crate::WindowId(0);
+    let mut successor = App::headless_for_test();
+    let exact = successor.window_frame_px_for(wid, carry.rows, carry.cols);
+    assert!(
+        carried.height > exact.height,
+        "PRECONDITION: the carried frame holds the band's rows"
+    );
+    let regrids = message_regrids();
+    let _ = crate::app_presence::take_chrome_regrids_applied();
+    successor.incoming_handoff_pending = true;
+    successor.seed_carried_messages(&carry, Some("0.148.0"));
+    assert!(
+        successor.messages.live_rows().count() > 0,
+        "PRECONDITION: rows crossed"
+    );
+    let frame = successor.attach_frame_px(wid, carry.rows, carry.cols, Some(carried));
+    assert_eq!(frame, exact, "the exact frame of the carried grid");
+    successor.on_resize(wid, frame);
+    let strip = successor.tab_strip_rows;
+    let grid = (carry.rows, carry.cols);
+    let still = |app: &App, at: &str| {
+        assert_eq!(app.chrome_rows(wid), strip, "{at}: no band row");
+        assert!(
+            app.messages.on_glass().next().is_none(),
+            "{at}: an empty glass"
+        );
+        assert_eq!(
+            app.windows.get(&wid).map(|ws| (ws.rows, ws.cols)),
+            Some(grid),
+            "{at}: the carried grid"
+        );
+    };
+    still(&successor, "seeded");
+    successor.sync_messages();
+    still(&successor, "a frozen sync");
+    successor.incoming_handoff_pending = false;
+    successor.messages.after_handoff_commit(Instant::now());
+    successor.release_successor_commit_freeze();
+    still(&successor, "Commit");
+    assert_eq!(
+        message_regrids(),
+        regrids,
+        "no message re-grid from the seed to Commit"
+    );
+    assert_eq!(
+        crate::app_presence::take_chrome_regrids_applied(),
+        Vec::new(),
+        "no chrome re-grid from the seed to Commit"
+    );
+}
+
+/// A current parent carries no band rows and no glass: its rows cross, and the successor's
+/// Commit re-grids nothing, since the seed took no row for the first unfrozen commit to drop.
+#[cfg(unix)]
+#[test]
+fn a_current_parents_rows_cross_and_commit_regrids_nothing() {
+    let mut parent = App::headless_for_test();
+    parent.post_message(update_words::installing("0.76.0"));
+    parent.post_message(toolchain_words::announced("installing ay, trust"));
+    parent.post_message(warn("a carried warning"));
+    parent.pending_update_handoff = Some(parked());
+    let carry = window_carry(parent.carried_messages());
+    assert!(
+        carry.messages.len() >= 2,
+        "PRECONDITION: rows to carry: {:?}",
+        carry.messages
+    );
+
+    let mut successor = App::headless_for_test();
+    let regrids = message_regrids();
+    let _ = crate::app_presence::take_chrome_regrids_applied();
+    successor.incoming_handoff_pending = true;
+    successor.seed_carried_messages(&carry, Some("0.76.0"));
+    successor.sync_messages();
+    assert_eq!(
+        successor.messages.committed_rows(),
+        0,
+        "the seed took no row"
+    );
+    successor.incoming_handoff_pending = false;
+    successor.messages.after_handoff_commit(Instant::now());
+    successor.release_successor_commit_freeze();
+    assert!(
+        successor.messages.live_rows().count() >= 2,
+        "the rows cross Commit"
+    );
+    assert_eq!(message_regrids(), regrids, "Commit re-grids nothing");
+    assert_eq!(
+        crate::app_presence::take_chrome_regrids_applied(),
+        Vec::new(),
+        "…not even the chrome"
+    );
 }
 
 #[cfg(unix)]
@@ -1882,10 +2006,7 @@ fn a_record_the_seed_moves_off_a_carried_id_lands_above_the_parked_band() {
     let mut successor = App::headless_for_test();
     successor.messages = aterm_messages::MessageCenter::new(boot, Instant::now());
     successor.incoming_handoff_pending = true;
-    successor.seed_carried_messages(
-        &window_carry(parent.message_band_rows, carried.clone()),
-        Some("0.76.0"),
-    );
+    successor.seed_carried_messages(&window_carry(carried.clone()), Some("0.76.0"));
     assert_eq!(
         successor.messages.live(row).map(|l| l.msg.title.as_str()),
         Some("Parent row"),
@@ -1933,7 +2054,7 @@ fn a_landed_update_leaves_no_outcome_row_that_said_it_had_not() {
             "{title}: the outcome is up"
         );
         parent.begin_update_installing(false);
-        let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+        let carry = window_carry(parent.carried_messages());
         let mut successor = App::headless_for_test();
         successor.seed_carried_messages(&carry, Some("9.9.9"));
         successor.messages.after_handoff_commit(Instant::now());
@@ -1967,7 +2088,7 @@ fn landed_successor(automatic: bool, raise: impl FnOnce(&mut App)) -> App {
     if !automatic {
         parent.post_message(update_words::installing("9.9.9"));
     }
-    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+    let carry = window_carry(parent.carried_messages());
     let mut successor = App::headless_for_test();
     successor.seed_carried_messages(&carry, Some("9.9.9"));
     successor.messages.after_handoff_commit(Instant::now());
@@ -2031,7 +2152,7 @@ fn a_carried_unhealed_stall_never_silences_the_successors_own_watchdog() {
             );
             assert!(parent.live_update_health(|_| true).is_empty(), "folded");
         }
-        let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+        let carry = window_carry(parent.carried_messages());
         assert_eq!(carry.update_health_said.len(), usize::from(carried));
         let mut successor = App::headless_for_test();
         successor.seed_carried_messages(&carry, Some("9.9.9"));
@@ -2362,7 +2483,7 @@ fn a_late_park_successor_sees_the_parents_records_written_after_its_boot() {
     successor.incoming_handoff_pending = true;
     parent.resolve_message(x, Outcome::Ok);
     let r = parent.record_message(warn("written after the boot"));
-    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+    let carry = window_carry(parent.carried_messages());
     parent.pending_update_handoff = Some(parked());
     assert!(
         parent.flush_messages_log_within(COMMIT_FLUSH_IN_TESTS),
@@ -2480,7 +2601,7 @@ fn committed_after_park(
     parent.messages_log = crate::messages_store::Writer::spawn(&path);
     raise(&mut parent);
     parent.sync_messages();
-    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+    let carry = window_carry(parent.carried_messages());
     parent.pending_update_handoff = Some(parked());
     while_parked(&mut parent);
     assert!(parent.flush_messages_log_within(COMMIT_FLUSH_IN_TESTS));
@@ -2644,7 +2765,7 @@ fn a_kind_the_parked_parent_healed_leaves_no_row_whatever_the_file_says_of_it() 
     let mut parent = App::headless_for_test();
     say_check_warning(&mut parent);
     parent.sync_messages();
-    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+    let carry = window_carry(parent.carried_messages());
     let from = carry.next_message_id;
     let mut healer = App::headless_for_test();
     healer.messages.raise_next_id(from);
@@ -2821,7 +2942,7 @@ fn a_record_the_parked_parent_makes_never_shares_an_id_with_the_successor() {
         Instant::now(),
     );
     successor.incoming_handoff_pending = true;
-    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+    let carry = window_carry(parent.carried_messages());
     parent.pending_update_handoff = Some(parked());
     assert_eq!(
         parent.take_app_notice("toolchain", "aterm pkg: a note while parked"),
@@ -2894,7 +3015,7 @@ fn a_record_the_parked_parent_makes_never_shares_an_id_with_the_successor() {
 #[test]
 fn a_notice_while_parked_is_refused_for_a_retry_and_mints_nothing() {
     let mut parent = App::headless_for_test();
-    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+    let carry = window_carry(parent.carried_messages());
     parent.pending_update_handoff = Some(parked());
     let before = parent.messages.log().next_id();
     let req = || wire::NoticeRequest::parse("post script sev=warn Deploy failed").expect("a post");
@@ -2930,7 +3051,7 @@ fn a_carried_dead_publisher_row_leaves_with_the_process_it_described() {
         .settle_messages(Instant::now() + PROGRESS_GRACE + std::time::Duration::from_millis(10));
     let carried = parent.carried_messages();
     assert_eq!(carried.messages.len(), 2, "both rows are carried");
-    let carry = window_carry(parent.message_band_rows, carried);
+    let carry = window_carry(carried);
     let mut successor = App::headless_for_test();
     successor.seed_carried_messages(&carry, Some("9.9.9"));
     successor.messages.after_handoff_commit(Instant::now());
@@ -2964,7 +3085,7 @@ fn a_carried_recovery_row_offers_no_end_sessions_that_ends_nothing() {
     ));
     let _ = parent
         .settle_messages(Instant::now() + PROGRESS_GRACE + std::time::Duration::from_millis(10));
-    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+    let carry = window_carry(parent.carried_messages());
     assert!(
         carry.messages.iter().any(|m| m.id == id.raw()),
         "premise: the recovery row crosses"
@@ -3288,10 +3409,7 @@ fn the_landing_records_the_healing_with_no_progress_row_and_after_the_fold() {
                     parent.resolve_message(id, Outcome::Warn);
                 }
             }
-            let crossed = through_the_wire(&window_carry(
-                parent.message_band_rows,
-                parent.carried_messages(),
-            ));
+            let crossed = through_the_wire(&window_carry(parent.carried_messages()));
             assert!(!crossed.update_health_said.is_empty(), "{case}");
             let mut successor = App::headless_for_test();
             successor.seed_carried_messages(&crossed, Some("0.76.0"));
@@ -3316,7 +3434,7 @@ fn the_landing_records_the_healing_with_no_progress_row_and_after_the_fold() {
     plain.seed_carried_messages(&carry, None);
     plain.post_update_landed("0.76.0", 7, 0);
     assert!(healed(&plain).is_empty());
-    let quiet = window_carry(0, App::headless_for_test().carried_messages());
+    let quiet = window_carry(App::headless_for_test().carried_messages());
     let text = aterm_toml::to_string(&quiet).expect("encodes");
     assert!(!text.contains("update_health_said"), "{text}");
 }
@@ -3344,7 +3462,7 @@ fn the_heal_is_keyed_by_kind_and_an_older_builds_words_still_heal() {
     let carried = |title: &str| {
         let mut parent = App::headless_for_test();
         parent.post_message(older(title));
-        let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+        let carry = window_carry(parent.carried_messages());
         let mut app = App::headless_for_test();
         app.seed_carried_messages(&carry, None);
         assert_eq!(health_rows(&app).len(), 1, "{title}: carried");
@@ -4134,7 +4252,7 @@ fn an_owed_install_warning_is_answered_by_the_landing_it_is_carried_to() {
     );
 
     parent.post_message(update_words::installing("9.9.9"));
-    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+    let carry = window_carry(parent.carried_messages());
     let mut seamless = App::headless_for_test();
     seamless.incoming_handoff_pending = true;
     on_screen(&mut seamless, true);

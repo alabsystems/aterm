@@ -4,8 +4,9 @@
 //! Encoding validates the wire without constructing another owned payload.
 #![cfg(unix)]
 
+use aterm_bench::allocator::{Observed, Observer};
 use aterm_uds::lan::wire::{self, Advert, Event, Frame, Instance, Request};
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::System;
 use std::cell::Cell;
 
 thread_local! {
@@ -41,11 +42,11 @@ fn added(bytes: usize, removed: usize, allocation: bool) {
     let _ = ACTIVE.try_with(|active| {
         if active.get() {
             LIVE.with(|live| {
-                live.set(live.get() - removed + bytes);
+                live.set(live.get().wrapping_sub(removed).wrapping_add(bytes));
                 PEAK.with(|peak| peak.set(peak.get().max(live.get())));
             });
             if allocation {
-                CALLS.with(|calls| calls.set(calls.get() + 1));
+                CALLS.with(|calls| calls.set(calls.get().wrapping_add(1)));
             }
         }
     });
@@ -53,34 +54,15 @@ fn added(bytes: usize, removed: usize, allocation: bool) {
 
 struct Counting;
 
-// SAFETY: every allocation forwards its original pointer and layout to System.
-// Constant thread-local counters allocate nothing; realloc accounts for the replacement.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: the caller supplied this valid layout.
-        let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null() {
-            added(layout.size(), 0, true);
-        }
-        pointer
-    }
-    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        // SAFETY: the caller supplied this pointer, original layout and new size.
-        let replacement = unsafe { System.realloc(pointer, layout, size) };
-        if !replacement.is_null() {
-            added(size, layout.size(), true);
-        }
-        replacement
-    }
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        added(0, layout.size(), false);
-        // SAFETY: the caller supplied the matching pointer and layout.
-        unsafe { System.dealloc(pointer, layout) };
+// SAFETY: constant, drop-free thread-locals and wrapping arithmetic neither allocate nor unwind.
+unsafe impl Observer for Counting {
+    fn retained(&self, old: usize, new: usize) {
+        added(new, old, new != 0);
     }
 }
 
 #[global_allocator]
-static ALLOCATOR: Counting = Counting;
+static ALLOCATOR: Observed<System, Counting> = Observed::new(System, Counting);
 
 #[test]
 fn encoded_output_is_the_only_live_heap_during_validation() {

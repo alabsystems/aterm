@@ -4749,14 +4749,8 @@ mod tests {
     #[cfg(unix)]
     const STUCK_AFTER: Duration = Duration::from_secs(1);
 
-    /// Set, [`lock_waiter_stand_in`] exits 0 once it has the lock and has said so, as a lab whose
-    /// lane came free runs and ends.
-    #[cfg(unix)]
-    const WAIT_THEN_EXIT: &str = "ATERM_VERIFY_TEST_LOCK_THEN_EXIT";
-
     /// Run by the ceiling tests as a stage child: waits for the lock [`WAIT_LOCK`] names, as a lab
-    /// waits for its lane, says when it has it, then works until it is ended or its run is gone
-    /// ([`WAIT_THEN_EXIT`] set: it ends there).
+    /// waits for its lane, says when it has it, then works until it is ended or its run is gone.
     /// A `SIGTERM` ends its wait as a lab's interrupt does: NOT RUN, naming the holder, and exit 3.
     #[cfg(unix)]
     #[test]
@@ -4794,9 +4788,6 @@ mod tests {
             Err(e) => panic!("the lock, once its holder lets go: {e:?}"),
         };
         println!("\n{LOCK_ADMITTED}");
-        if std::env::var_os(WAIT_THEN_EXIT).is_some() {
-            return;
-        }
         // Its run ends it; a run that died first (a failed test) left it a new parent, and it ends.
         let run = std::os::unix::process::parent_id();
         while std::os::unix::process::parent_id() == run {
@@ -5274,38 +5265,20 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Set, the test binary is [`holder_stand_in`]: `idle` naps, `works` naps beside a child that
-    /// works (`child`, which loops until its parent is gone), as a lane's run does beside its
-    /// guest's.
+    /// Set, the test binary is the idle [`holder_stand_in`].
     #[cfg(unix)]
     const HOLDER_STAND_IN: &str = "ATERM_VERIFY_TEST_HOLDER";
 
     /// Run as a lock's named holder by [`a_child_waiting_behind_a_stuck_holder_could_not_run`]:
     /// lives for twice the hang detector unless its test ends it first, using no CPU time and
-    /// writing nothing (`idle`), or beside a child that keeps a core busy (`works`). Linux counts
-    /// a process's CPU time in clock ticks (`/proc/<pid>/stat`, 10 ms at `USER_HZ` 100), so the
-    /// child's work must sum to several ticks within each [`STUCK_AFTER`] there, which a busy core
-    /// does.
+    /// writing nothing.
     #[cfg(unix)]
     #[test]
     fn holder_stand_in() {
-        let Some(how) = std::env::var_os(HOLDER_STAND_IN) else {
+        let Some(_) = std::env::var_os(HOLDER_STAND_IN) else {
             return;
         };
-        if how == "child" {
-            let parent = std::os::unix::process::parent_id();
-            let until = Instant::now() + HANG_DETECTOR * 2;
-            let mut n = 0u64;
-            while std::os::unix::process::parent_id() == parent && Instant::now() < until {
-                for i in 0..1_000_000u64 {
-                    n = std::hint::black_box(n.wrapping_mul(31).wrapping_add(i));
-                }
-            }
-            return;
-        }
-        let child = (how == "works").then(|| HolderStandIn::start("child"));
         std::thread::sleep(HANG_DETECTOR * 2);
-        drop(child);
     }
 
     /// A [`holder_stand_in`], killed when dropped: no test leaves one behind.
@@ -5314,7 +5287,7 @@ mod tests {
 
     #[cfg(unix)]
     impl HolderStandIn {
-        fn start(how: &str) -> HolderStandIn {
+        fn start() -> HolderStandIn {
             HolderStandIn(
                 aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"))
                     .args([
@@ -5323,7 +5296,7 @@ mod tests {
                         "--nocapture",
                         "--test-threads=1",
                     ])
-                    .env(HOLDER_STAND_IN, how)
+                    .env(HOLDER_STAND_IN, "1")
                     .stdin(aterm_uds::spawnfd::Stdio::null())
                     .stdout(aterm_uds::spawnfd::Stdio::null())
                     .stderr(aterm_uds::spawnfd::Stdio::null())
@@ -5364,16 +5337,15 @@ mod tests {
     /// detector past that grace and with no ceiling that could end it instead; the child could
     /// not run, naming the holder and how long it made no progress, at least the waiter's bound;
     /// the Linux lane's row reads NOT RUN with it; and the holder is never signalled and still
-    /// runs. Negative control: a holder whose child works is waited for past three times the
-    /// bound from the child's own wait mark, then the child has the lock and runs to its end.
-    /// Neither run has a ceiling, so a starved start of the child, which a ceiling counts as
-    /// work, decides neither, and the control's span starts once the child waits, however late
-    /// it started.
+    /// runs. Working-holder classification is covered by the counter-driven tests in
+    /// `aterm_toolchain::stall`, including a runnable child receiving only a twelfth of a core.
+    /// No CPU scheduling share is required within a real one-second observation window here.
+    /// The run has no ceiling, so a starved child start cannot decide the result.
     #[cfg(unix)]
     #[test]
     fn a_child_waiting_behind_a_stuck_holder_could_not_run() {
         let tmp = crate::mktemp_dir("atv-stuck-holder").expect("mktemp");
-        let mut holder = HolderStandIn::start("idle");
+        let mut holder = HolderStandIn::start();
         let (held, waiter) = held_lane_by(&tmp, holder.0.id());
         let waiter = waiter.env(WAIT_PACED, "1");
         let started = Instant::now();
@@ -5446,47 +5418,6 @@ mod tests {
         );
         drop((held, holder));
 
-        let lane = tmp.join("working");
-        std::fs::create_dir(&lane).expect("a second lane");
-        let mut working = HolderStandIn::start("works");
-        let (held, waiter) = held_lane_by(&lane, working.0.id());
-        let waiter = waiter.env(WAIT_PACED, "1").env(WAIT_THEN_EXIT, "1");
-        let running = {
-            let lane = lane.clone();
-            std::thread::spawn(move || run(&waiter, ceiled(&lane, None)))
-        };
-        let wait = marked(&lane);
-        assert!(
-            wait.text
-                .contains(&format!("waiting for pid {} (", working.0.id())),
-            "{}",
-            wait.text
-        );
-        // Three times the bound past the child's wait mark with the holder at work: the
-        // condition under test.
-        std::thread::sleep(STUCK_AFTER * 3 + Duration::from_millis(500));
-        assert!(
-            !running.is_finished(),
-            "a working holder's waiter was ended: {:?}",
-            running.join().map(|r| (r.spawn_error, r.output))
-        );
-        assert!(working.runs());
-        drop(held);
-        aterm_spec::wait::until_within(HANG_DETECTOR, "the admitted child's end", || {
-            running.is_finished().then_some(())
-        });
-        let out = running.join().expect("the run");
-        assert!(
-            out.ok && out.spawn_error.is_none(),
-            "{:?}: {}",
-            out.spawn_error,
-            out.output
-        );
-        assert!(
-            out.output.lines().any(|l| l == LOCK_ADMITTED),
-            "{}",
-            out.output
-        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 

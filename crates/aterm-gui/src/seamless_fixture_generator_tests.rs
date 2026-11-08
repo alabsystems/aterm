@@ -477,24 +477,15 @@ fn fx_pane_mirror(
     })
 }
 
-fn fx_window(
-    rows: u16,
-    cols: u16,
-    tabs: Vec<crate::restore::RestoredTab>,
-) -> crate::restore::WindowLayout {
-    fx_window_in(rows, cols, 0, tabs)
-}
-
-fn fx_inner_px(rows: u16, cols: u16, band_rows: u16) -> Option<[u32; 2]> {
+fn fx_inner_px(rows: u16, cols: u16) -> Option<[u32; 2]> {
     let app = crate::App::headless_for_test();
-    let size = app.frame_px(rows.saturating_add(band_rows), cols);
+    let size = app.frame_px(rows, cols);
     Some([size.width, size.height]).filter(|[width, height]| *width > 0 && *height > 0)
 }
 
-fn fx_window_in(
+fn fx_window(
     rows: u16,
     cols: u16,
-    band_rows: u16,
     tabs: Vec<crate::restore::RestoredTab>,
 ) -> crate::restore::WindowLayout {
     use crate::restore::{
@@ -566,7 +557,7 @@ fn fx_window_in(
         outer_x: Some(96),
         outer_y: Some(48),
         maximized: None,
-        inner_px: fx_inner_px(rows, cols, band_rows),
+        inner_px: fx_inner_px(rows, cols),
         presence_row: false,
         show,
         tabs: terminal_tabs,
@@ -584,15 +575,13 @@ fn fx_window_carry(rows: u16, cols: u16, installing: bool) -> WindowCarry {
         app.post_message(crate::update_words::installing(&fx_successor_version()));
     }
     let carried = app.carried_messages();
-    let band_rows = u16::from(installing);
     WindowCarry {
         rows,
         cols,
         outer_x: Some(96),
         outer_y: Some(48),
-        inner_px: fx_inner_px(rows, cols, band_rows),
+        inner_px: fx_inner_px(rows, cols),
         presence_row: false,
-        status_bar_rows: band_rows,
         update_verified_unix_ms: installing.then_some((fx_target_build() + 3_600) * 1_000),
         messages: carried.messages,
         next_message_id: carried.next_message_id,
@@ -2375,10 +2364,9 @@ fn fx_incident_desk() -> FxDesk {
         ceiling: aterm_update_core::handoff_policy::CarryCeiling::Full,
         window: fx_window_carry(55, 149, true),
         sessions: vec![claude, shell],
-        layout: RestoreManifest::new(vec![fx_window_in(
+        layout: RestoreManifest::new(vec![fx_window(
             55,
             149,
-            1,
             vec![
                 fx_tab(fx_leaf(0, "claude", Some("/home/dev/src/aterm"))),
                 fx_tab(fx_leaf(1, "zsh", Some("/home/dev/src/aterm"))),
@@ -3117,10 +3105,9 @@ fn fx_policy_visible_desk() -> FxDesk {
         ceiling: aterm_update_core::handoff_policy::CarryCeiling::Visible,
         window: fx_window_carry(42, 240, true),
         sessions,
-        layout: RestoreManifest::new(vec![fx_window_in(
+        layout: RestoreManifest::new(vec![fx_window(
             42,
             240,
-            1,
             vec![
                 fx_tab(fx_split(
                     SplitKind::Vertical,
@@ -3788,8 +3775,6 @@ fn fx_carried_state_desk() -> FxDesk {
         + aterm_messages::PROGRESS_GRACE
         + std::time::Duration::from_millis(10);
     app.settle_messages(parked);
-    app.sync_message_band_rows(parked);
-    let band_rows = app.message_band_rows;
     let carried = app.carried_messages();
     assert!(
         carried.messages.iter().any(|m| m.wire && m.repeats == 2),
@@ -3826,7 +3811,7 @@ fn fx_carried_state_desk() -> FxDesk {
     );
     assert!(!carried.update_health_said.is_empty(), "the warning said");
     let (rows, cols) = (ROWS, COLS * 2 + 1);
-    let size = app.frame_px(rows.saturating_add(band_rows), cols);
+    let size = app.frame_px(rows, cols);
     let inner_px = Some([size.width, size.height]).filter(|[w, h]| *w > 0 && *h > 0);
     let window = WindowCarry {
         rows,
@@ -3835,7 +3820,6 @@ fn fx_carried_state_desk() -> FxDesk {
         outer_y: Some(48),
         inner_px,
         presence_row: false,
-        status_bar_rows: band_rows,
         messages: carried.messages,
         next_message_id: carried.next_message_id,
         update_verified_unix_ms: None,
@@ -4031,10 +4015,9 @@ fn fx_carried_state_desk() -> FxDesk {
     });
     let first = leaf_of(0, "zsh", &|leaf| leaf.theme = Some("Nord".to_string()));
     let pair = |a, b| fx_tab(fx_split(crate::restore::SplitKind::Vertical, a, b));
-    let mut front = fx_window_in(
+    let mut front = fx_window(
         rows,
         cols,
-        band_rows,
         vec![
             pair(first, owed),
             pair(muse, agy),
@@ -4667,6 +4650,13 @@ const NO_HANDOFF_WRITES_OFF_MACOS: &[(&str, &str)] = &[
 const NO_HANDOFF_WRITES: &[(&str, &str)] = &[
     ("control", "Wire.turn_ids"),
     ("manifest", "WindowCarry.presence_row"),
+    // Retired when a successor stopped taking the message band's rows and glass from its carry:
+    // the newest recorded release wrote them, so the hold wants them named here until a
+    // release's `fields.toml` omits them. The first one recorded after the fields went does;
+    // these rows then answer "listed, but no desk reaches it" and generate_handoff_fixtures
+    // fails: remove them then. Older manifests keep the keys; the reader skips them.
+    ("manifest", "WindowCarry.status_bar_rows"),
+    ("manifest", "CarriedMessage.on_glass"),
     ("layout", "WindowLayout.presence_row"),
     ("layout", "WindowLayout.maximized"),
     ("layout", "TerminalLeafRestore.held"),

@@ -10,6 +10,69 @@ use std::thread::{self, JoinHandle};
 
 const HANG: Duration = Duration::from_secs(60);
 
+fn answer_handshake(mut bus: CtlStream, uid: u32) -> std::io::Result<()> {
+    bus.set_read_timeout(Some(HANG))?;
+    bus.set_write_timeout(Some(HANG))?;
+    let read_line = |bus: &mut CtlStream| -> std::io::Result<Vec<u8>> {
+        let mut line = Vec::new();
+        while !line.ends_with(b"\r\n") {
+            let mut byte = [0];
+            bus.read_exact(&mut byte)?;
+            line.push(byte[0]);
+            assert!(line.len() <= auth::MAX_LINE);
+        }
+        Ok(line)
+    };
+    assert_eq!(read_line(&mut bus)?, auth::first(uid));
+    bus.write_all(b"OK 8e4f0c2a1b7d6e5f8e4f0c2a1b7d6e5f\r\n")?;
+    assert_eq!(read_line(&mut bus)?, auth::BEGIN);
+    let hello = heard(&mut bus);
+    assert_eq!(hello.destination.as_deref(), Some(BUS_NAME));
+    assert_eq!(hello.path.as_ref().unwrap().as_str(), BUS_PATH);
+    assert_eq!(hello.interface.as_deref(), Some(BUS_NAME));
+    assert_eq!(hello.member.as_deref(), Some("Hello"));
+    assert_eq!(hello.serial, 1);
+    let mut reply = Message::method_return(&hello).with_body(vec![Value::from(":1.42")]);
+    reply.serial = 1;
+    bus.write_all(&reply.encode().unwrap())?;
+    Ok(())
+}
+
+#[test]
+fn the_default_handshake_waits_for_a_scheduled_bus() {
+    let (ours, bus) = CtlStream::pair().unwrap();
+    let served = thread::spawn(move || answer_handshake(bus, 1000));
+    let client = thread::spawn(move || {
+        FROZEN_NOW.with(|frozen| frozen.set(Some(Instant::now())));
+        Connection::handshake_after(
+            ours,
+            1000,
+            Some("8e4f0c2a1b7d6e5f8e4f0c2a1b7d6e5f"),
+            Duration::from_secs(26),
+        )
+        .map(|conn| (conn.unique_name().to_owned(), conn.server_guid().to_owned()))
+    });
+    let result = client.join();
+    let served = served.join();
+    let (name, guid) = result.unwrap().expect("the bus completed its handshake");
+    assert_eq!(
+        (name, guid),
+        (
+            ":1.42".to_owned(),
+            "8e4f0c2a1b7d6e5f8e4f0c2a1b7d6e5f".to_owned()
+        )
+    );
+    served
+        .unwrap()
+        .expect("the authenticated native bus answered Hello");
+
+    let (ours, mut bus) = CtlStream::pair().unwrap();
+    bus.set_read_timeout(Some(HANG)).unwrap();
+    let result = Connection::handshake_after(ours, 1000, None, Duration::from_secs(61));
+    assert!(matches!(result, Err(Error::Timeout)));
+    assert_eq!(bus.read(&mut [0]).unwrap(), 0, "expiry sent no AUTH bytes");
+}
+
 fn connected(stream: CtlStream) -> Connection {
     Connection {
         stream,
@@ -218,14 +281,15 @@ fn a_joins_handshake_ends_by_the_callers_bound_not_the_default() {
     let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
     let addresses = address::parse(&format!("unix:path={}", path.display())).unwrap();
     let (done, joined) = mpsc::channel();
+    let hang = Instant::now() + HANG;
     let worker = thread::spawn(move || {
         // Frozen, the clock lapses no deadline: the join connects and sends its AUTH whatever
         // the load, and only the read timeout set from the handshake's deadline ends its wait.
         FROZEN_NOW.with(|frozen| frozen.set(Some(Instant::now())));
         let outcome = Connection::open_within(&addresses, Duration::from_millis(100));
-        let _ = done.send(outcome.err());
+        let _ = done.send((outcome.err(), Instant::now()));
     });
-    let outcome = joined.recv_timeout(HANG);
+    let outcome = joined.recv_timeout(hang.saturating_duration_since(Instant::now()));
     // The bus answers nothing, and accepts the join only now: its connection waits in the backlog.
     listener.set_nonblocking(true).unwrap();
     let (mut bus, _) = listener.accept().expect("the join connected");
@@ -233,7 +297,11 @@ fn a_joins_handshake_ends_by_the_callers_bound_not_the_default() {
     // A join still waiting hears the bus hang up and ends; one that gave up has hung up already.
     let _ = bus.shutdown(Shutdown::Write);
     worker.join().unwrap();
-    let outcome = outcome.expect("the handshake outlived its caller's bound");
+    let (outcome, completed) = outcome.expect("the handshake outlived its caller's bound");
+    assert!(
+        completed <= hang,
+        "the caller-bound check exceeded its minute hang detector"
+    );
     assert!(matches!(outcome, Some(Error::Timeout)), "{outcome:?}");
     let mut heard = Vec::new();
     bus.read_to_end(&mut heard).unwrap();

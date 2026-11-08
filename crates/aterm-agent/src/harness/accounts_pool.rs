@@ -4568,6 +4568,14 @@ fn finish_move<T>(
                     None
                 };
                 if let Some((id, binding)) = native {
+                    if *rotates || *takes_canary {
+                        let canary = state
+                            .canary
+                            .as_mut()
+                            .filter(|canary| canary.sid == session.sid)
+                            .ok_or("native canary ownership changed during admission")?;
+                        canary.native_receipt = Some(id.to_owned());
+                    }
                     logins
                         .native_rotations
                         .insert(id.to_owned(), binding.to_owned());

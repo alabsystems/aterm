@@ -2545,8 +2545,8 @@ fn the_tab_closes_itself_once_it_installed_them_but_never_ends_its_window() {
 
 /// A package pass that says `c-toolchain: missing` while aterm's own Mac Setup tab
 /// installs them files no only-you entry telling the person to run that install (nux round 9's
-/// sixth exception): the verdict waits for the tab. A tab the person stopped leaves the tools to
-/// them, so the entry is filed then; a tab that installed them files none.
+/// sixth exception): the verdict waits for the tab. Once the tab stops, confirmed absence files
+/// the entry and confirmed presence ends it. Unread presence keeps it pending until a later read.
 /// NEGATIVE CONTROL: with no install on its way the same verdict files the entry at once.
 #[test]
 fn clt_a_missing_toolchain_waits_for_the_tabs_own_install() {
@@ -2556,6 +2556,7 @@ fn clt_a_missing_toolchain_waits_for_the_tabs_own_install() {
         let mut app = App::headless_for_test();
         app.workstation_setup.developer_tools_session = vec![Terminal::running(77, false, None)];
         app.workstation_setup.developer_tools_attempt = Some(77);
+        app.workstation_setup.developer_tools_installed = Some(|| Some(false));
         app.note_c_toolchain(atpkg::cli::C_TOOLCHAIN_MISSING);
         app
     };
@@ -2573,6 +2574,32 @@ fn clt_a_missing_toolchain_waits_for_the_tabs_own_install() {
         app.owes_exception(&key),
         "stopped: the step is the person's"
     );
+
+    let unread: fn() -> Option<bool> = || None;
+    for reader in [None, Some(unread)] {
+        for (later, missing) in [
+            ((|| Some(false)) as fn() -> Option<bool>, true),
+            ((|| Some(true)) as fn() -> Option<bool>, false),
+        ] {
+            let mut app = installing();
+            app.workstation_setup.developer_tools_installed = reader;
+            app.developer_tools_install_ended(
+                77,
+                Some(aterm_pty::ChildExit::Code(i32::from(
+                    aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED,
+                ))),
+            );
+            assert!(
+                !app.owes_exception(&key),
+                "unread is no missing-tools proof"
+            );
+            assert!(app.workstation_setup.c_toolchain_missing_held);
+            app.workstation_setup.developer_tools_installed = Some(later);
+            app.settle_missing_tools_exception();
+            assert_eq!(app.owes_exception(&key), missing);
+            assert!(!app.workstation_setup.c_toolchain_missing_held);
+        }
+    }
 
     let mut app = installing();
     app.workstation_setup.developer_tools_installed = Some((|| Some(true)) as fn() -> Option<bool>);

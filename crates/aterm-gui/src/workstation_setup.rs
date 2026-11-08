@@ -375,7 +375,8 @@ pub(crate) struct Host {
     pub(crate) developer_tools_unfinished: bool,
     /// A package pass said `c-toolchain: missing` while an install of the tools was on its way
     /// ([`App::developer_tools_on_their_way`]): its only-you entry waits, since it would ask a
-    /// person to start what aterm is doing, and is filed only if that install goes without them
+    /// person to start what aterm is doing, and is filed only if they are confirmed absent
+    /// after that install ends
     /// ([`App::settle_missing_tools_exception`]).
     pub(crate) c_toolchain_missing_held: bool,
     /// Whether Low Data Mode holds the tools' download back, as the network watch reads it or the

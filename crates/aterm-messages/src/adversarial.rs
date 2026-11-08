@@ -73,7 +73,7 @@ fn a_queued_carried_held_row_is_not_folded_as_read_after_commit() {
     let later = now + secs(5);
     let mut child = fresh(later);
     child.seed_carried(&carry, stamp(5_000), later);
-    assert_eq!(glass_ids(&child), vec![ids[0], ids[1]]);
+    assert!(glass_ids(&child).is_empty(), "the seed takes no row");
     assert!(child.live(ids[2]).unwrap().is_queued());
     let commit = later + secs(1);
     child.after_handoff_commit(commit);
@@ -303,6 +303,12 @@ fn a_carried_ask_row_keeps_its_own_hold_after_the_commit() {
     let later = now + secs(5);
     let mut child = fresh(later);
     child.seed_carried(&carry, stamp(5_000), later);
+    child.commit_rows(later, 3);
+    assert_eq!(
+        child.live(id).unwrap().fold_at,
+        None,
+        "on the glass before the commit, its hold waits"
+    );
     child.after_handoff_commit(later + secs(1));
     let row = child.live(id).unwrap();
     assert_eq!(

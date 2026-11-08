@@ -65,7 +65,8 @@ resolver = "2"
 # The executable surface read by `atpkg-publish pack`: `expose` names commands
 # shimmed onto PATH; `bundle` names additional executables shipped without shims.
 # aterm dispatches its verbs in-process, so no sibling executable is bundled.
-# Producer, signing and check-runner binaries are development tools only.
+# The signing helper has its own package-scoped managed recipe; it is not part of
+# the app's payload. Producer and check-runner binaries remain development tools.
 [workspace.metadata.atpkg]
 expose = ["aterm"]
 bundle = []
@@ -83,7 +84,7 @@ update_channel = "alabsystems/aterm"
 # record (crates/aterm-stamp); nothing depends on that package. Every library's own version is a
 # constant `0.0.0`, so a bump is an input of no library unit (census `identity-read`).
 [workspace.package]
-version = "0.173.0"
+version = "0.174.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"

@@ -152,10 +152,12 @@ fn stage_memory_survives_until_direct_and_pool_nested_workers_both_end() {
         None,
         crate::Seams {
             stage,
+            prepare_cells: None,
             admit_quiet: admit,
             admit_memory: admit,
         },
         || {},
+        || stage(&ctx, &spec),
     );
     let held_after_stage = held(&ledger);
     let blocked_after_stage = !admits_competing_work(&ledger);

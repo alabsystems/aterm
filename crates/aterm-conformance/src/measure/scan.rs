@@ -1148,12 +1148,16 @@ pub fn rainbow_summary(flags: &[bool], duplicates: &[bool]) -> (usize, usize, us
     )
 }
 
-/// A recording's own index (`index.json` beside a `ctl video` take): each frame's stamp on the recorder's clock, the covered span's start, and the ticks whose redraw proved the screen unchanged.
+/// A recording's own index: frame stamps, coverage, unchanged redraw ticks, and the full
+/// offscreen capture's loss account. The latter can establish a composition history, never
+/// compositor pickup or display scanout.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecordingIndex {
     pub stamps: BTreeMap<String, i64>,
     pub covered_from: Option<i64>,
     pub ticks: Vec<i64>,
+    /// Every offscreen composition was retained, with no rate cap, loss or truncation.
+    all_composed_frames: bool,
 }
 
 impl RecordingIndex {
@@ -1166,7 +1170,7 @@ impl RecordingIndex {
         if !value.is_object() {
             return Err("index.json is not an object".into());
         }
-        let stamps = value
+        let stamps: BTreeMap<String, i64> = value
             .get("frames")
             .and_then(aterm_json::Value::as_array)
             .map(|rows| {
@@ -1188,11 +1192,67 @@ impl RecordingIndex {
             .and_then(aterm_json::Value::as_array)
             .map(|ticks| ticks.iter().filter_map(aterm_json::Value::as_i64).collect())
             .unwrap_or_default();
+        let frames = value.get("frames").and_then(aterm_json::Value::as_array);
+        let all_composed_frames = frames.is_some_and(|rows| {
+            rows.len() >= 2
+                && rows.len() == stamps.len()
+                && value
+                    .pointer("/meta/mode")
+                    .and_then(aterm_json::Value::as_str)
+                    == Some("offscreen-present-real")
+                && value
+                    .pointer("/meta/frames_written")
+                    .and_then(aterm_json::Value::as_u64)
+                    == u64::try_from(rows.len()).ok()
+                && [
+                    "dropped_frames",
+                    "ring_skipped",
+                    "evicted_frames",
+                    "decimated_frames",
+                ]
+                .iter()
+                .all(|field| {
+                    value
+                        .pointer(&format!("/meta/{field}"))
+                        .and_then(aterm_json::Value::as_u64)
+                        == Some(0)
+                })
+                && ["head_truncated", "resized_early_stop", "half_res"]
+                    .iter()
+                    .all(|field| {
+                        value
+                            .pointer(&format!("/meta/{field}"))
+                            .and_then(aterm_json::Value::as_bool)
+                            == Some(false)
+                    })
+                && value
+                    .pointer("/meta/fps_cap")
+                    .is_some_and(aterm_json::Value::is_null)
+                && rows.windows(2).all(|pair| {
+                    pair[0].get("t_us").and_then(aterm_json::Value::as_i64)
+                        <= pair[1].get("t_us").and_then(aterm_json::Value::as_i64)
+                })
+                && covered_from == stamps.values().min().copied()
+                && value
+                    .pointer("/meta/covered_us/1")
+                    .and_then(aterm_json::Value::as_i64)
+                    == stamps.values().max().copied()
+        });
         Ok(Self {
             stamps,
             covered_from,
             ticks,
+            all_composed_frames,
         })
+    }
+
+    /// The scan must have read every indexed image exactly once before it can use the
+    /// recorder's complete composition history. An absent image never proves a held image.
+    fn covers_all_composed_frames(&self, names: &[String]) -> bool {
+        self.all_composed_frames
+            && names.len() == self.stamps.len()
+            && names.iter().all(|name| self.stamps.contains_key(name))
+            && names.iter().collect::<BTreeSet<_>>().len() == names.len()
     }
 
     /// Read and parse `path`.
@@ -1217,6 +1277,9 @@ pub struct DrivenWindow {
     pub nominal_dt_us: i64,
     /// The excused span before the band's first sustained lit frame.
     pub mature_lead_us: i64,
+    /// All composed images are known. Between compositions the last image is held; a gap in
+    /// composition times is not a missing observation. This says nothing about display scanout.
+    pub all_composed_frames: bool,
 }
 
 impl DrivenWindow {
@@ -1226,6 +1289,7 @@ impl DrivenWindow {
         sampling_hole_us: 0,
         nominal_dt_us: 0,
         mature_lead_us: 0,
+        all_composed_frames: false,
     };
 }
 
@@ -1241,6 +1305,7 @@ pub fn driven_window_darkness(
     let Some(index) = index else {
         return DrivenWindow::NOT_MEASURED;
     };
+    let complete_ledger = index.covers_all_composed_frames(names);
     let ordered: Vec<(i64, &str)> = names
         .iter()
         .filter_map(|n| index.stamps.get(n).map(|&t| (t, n.as_str())))
@@ -1271,6 +1336,13 @@ pub fn driven_window_darkness(
     let anchor = i128::from(index.covered_from.unwrap_or(ordered[0].0));
     let low = anchor + i128::from(lo_ms) * 1000;
     let high = anchor + i128::from(hi_ms) * 1000 + i128::from(DRIVEN_GRACE_US);
+    let all_composed_frames = complete_ledger
+        && low >= anchor
+        && index
+            .stamps
+            .values()
+            .max()
+            .is_some_and(|&end| high <= i128::from(end));
     let window: Vec<(i64, &str)> = ordered
         .into_iter()
         .filter(|&(t, _)| {
@@ -1313,7 +1385,11 @@ pub fn driven_window_darkness(
         }
         if lit {
             if let (Some(&first), Some(&last)) = (run.first(), run.last()) {
-                worst = worst.max(i128::from(last) - i128::from(first) + nominal);
+                // A complete ledger records state transitions, not periodic samples. The dark
+                // image stays dark until the next lit composition, including any render stall.
+                let end = if all_composed_frames { t } else { last };
+                let tail = if all_composed_frames { 0 } else { nominal };
+                worst = worst.max(i128::from(end) - i128::from(first) + tail);
             }
             run.clear();
         } else {
@@ -1326,7 +1402,12 @@ pub fn driven_window_darkness(
         } else {
             0
         };
-        worst = worst.max((i128::from(last) - i128::from(first) + nominal - allowance).max(0));
+        let end = if all_composed_frames {
+            high
+        } else {
+            i128::from(last) + nominal
+        };
+        worst = worst.max((end - i128::from(first) - allowance).max(0));
     }
     let window_end = window[window.len() - 1].0;
     let samples: BTreeSet<i64> = window
@@ -1352,6 +1433,7 @@ pub fn driven_window_darkness(
         sampling_hole_us: clamp_i64(hole),
         nominal_dt_us: clamp_i64(nominal),
         mature_lead_us: mature_lead,
+        all_composed_frames,
     }
 }
 

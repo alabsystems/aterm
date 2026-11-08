@@ -136,9 +136,15 @@ mod release_status;
 #[path = "../../src/release_steps.rs"]
 #[allow(dead_code)]
 mod release_steps;
+#[path = "../../src/release_target.rs"]
+#[allow(dead_code)]
+mod release_target;
 #[path = "../../src/release_timeline.rs"]
 #[allow(dead_code)]
 mod release_timeline;
+#[path = "../../src/release_tools.rs"]
+#[allow(dead_code)]
+mod release_tools;
 #[path = "../../src/service_qualification.rs"]
 #[allow(
     dead_code,

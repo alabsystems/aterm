@@ -812,6 +812,7 @@ fn the_state_round_trips_through_json_with_sorted_keys_and_null_for_unknown() {
             sid: "s-one".into(),
             at: NOW - 30,
             took: false,
+            native_receipt: None,
         }),
         undo: vec![
             Undo::default(),
@@ -822,6 +823,7 @@ fn the_state_round_trips_through_json_with_sorted_keys_and_null_for_unknown() {
                     sid: "s-zero".into(),
                     at: NOW - 900,
                     took: true,
+                    native_receipt: None,
                 }),
             },
         ],
@@ -1268,6 +1270,7 @@ fn transactions_preserve_accounts_and_bound_observation_history() {
             sid: "s-zero".into(),
             at: NOW,
             took: false,
+            native_receipt: None,
         }),
         undo: (0..MAX_UNDO)
             .map(|i| Undo {
@@ -2500,6 +2503,7 @@ fn the_unproven_active_account_is_not_probed() {
             sid: "s-two".to_string(),
             at: NOW - 30,
             took: false,
+            native_receipt: None,
         }),
         ..s.clone()
     };
@@ -2892,6 +2896,7 @@ fn the_owners_clearing_resumes_a_session_at_the_wall_it_lifted() {
             sid: "s-two".into(),
             at: NOW - MIN,
             took: false,
+            native_receipt: None,
         }),
         ..s.clone()
     };
@@ -2933,6 +2938,7 @@ fn a_held_sessions_wait_ends_at_the_rosters_next_opening_when_that_comes_first()
             sid: "s-two".into(),
             at: NOW - 4 * MIN,
             took: false,
+            native_receipt: None,
         }),
         ..state()
     };
@@ -2950,6 +2956,7 @@ fn a_held_sessions_wait_ends_at_the_rosters_next_opening_when_that_comes_first()
             sid: "s-two".into(),
             at: NOW - CANARY_HOLD_S,
             took: false,
+            native_receipt: None,
         }),
         ..held.clone()
     };
@@ -3086,6 +3093,7 @@ fn the_compare_and_set_refuses_by_name_and_changes_nothing() {
             sid: String::new(),
             at: NOW,
             took: false,
+            native_receipt: None,
         }),
         ..state()
     };
@@ -3223,6 +3231,7 @@ fn the_canarys_hold_lasts_ten_minutes_then_the_next_session_takes_its_place() {
         sid: "s-two".into(),
         at: lapsed,
         took: true,
+        native_receipt: None,
     };
     assert_eq!(before.undo.len(), 1);
     assert_eq!(
@@ -3678,6 +3687,7 @@ fn every_rotation_the_advice_gives_commits_once_the_wall_is_recorded() {
                             sid: "s-zero".into(),
                             at: NOW - ago,
                             took: false,
+                            native_receipt: None,
                         }),
                         rotations: vec![NOW - MIN; if spent { 2 * labels.len() } else { 0 }],
                         ..base.clone()
@@ -9698,6 +9708,7 @@ fn a_worker_starts_where_the_host_would_move_its_tab() {
             sid: "s-canary".into(),
             at,
             took: false,
+            native_receipt: None,
         }),
         ..walled.clone()
     };

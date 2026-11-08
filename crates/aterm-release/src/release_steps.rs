@@ -39,6 +39,17 @@ pub const RELEASE_CUTTER_ENV: &str = "ATERM_RELEASE_CUTTER";
 /// a child has them only from [`hand_this_cutter`].
 pub const RELEASE_CUTTER_SINCE_ENV: &str = "ATERM_RELEASE_CUTTER_SINCE";
 
+#[cfg(unix)]
+const TOOLCHAIN_LEASE_FD_ENV: &str = "ATERM_RELEASE_TOOLCHAIN_LEASE_FD";
+#[cfg(unix)]
+const TOOLCHAIN_LEASE_LEAF_ENV: &str = "ATERM_RELEASE_TOOLCHAIN_LEASE_LEAF";
+#[cfg(unix)]
+const LINE_FD_ENV: &str = "ATERM_RELEASE_LINE_FD";
+#[cfg(unix)]
+const LINE_WRITER_FD_ENV: &str = "ATERM_RELEASE_LINE_WRITER_FD";
+#[cfg(unix)]
+const LINE_LEAF_ENV: &str = "ATERM_RELEASE_LINE_LEAF";
+
 /// The cutter a `pub stage` of `commit` hands its `publish/transforms.sh`: `exe`, when this
 /// process is `commit`'s own build (`built`, [`crate::cutter::running`]: built from that commit's
 /// clean, tracked cutter sources, lockfile, manifests, cargo config and toolchain pin, and the
@@ -168,26 +179,6 @@ pub(crate) fn started_of(pid: u32) -> Option<String> {
     (out.status.success() && !s.is_empty()).then_some(s)
 }
 
-/// Record the line's lifetime independently of any resource reservation. This is a journal
-/// observation, never a release gate. The injected admission keeps tests off the live ledger.
-pub(crate) fn line_priority_with(
-    admit: impl FnOnce(
-        aterm_capacity::Need,
-        aterm_capacity::Admit,
-    ) -> Result<aterm_capacity::Claim, aterm_capacity::Error>,
-) -> Option<aterm_capacity::Claim> {
-    match admit(
-        aterm_capacity::Need::new("release line").rank(aterm_capacity::Rank::Release),
-        aterm_capacity::Admit::Wait,
-    ) {
-        Ok(priority) => Some(priority),
-        Err(why) => {
-            eprintln!("release line priority could not be recorded: {why}");
-            None
-        }
-    }
-}
-
 /// The release state below HOME: its logs, its build times and its kept build-inputs seal
 /// (`inputs-seal/`, [`crate::build_inputs::arm`]).
 const RELEASE_STATE: &str = ".local/state/aterm-release";
@@ -240,8 +231,8 @@ pub struct Real {
     /// The step the run is at ([`Backend::entered`]): what a child is noted under.
     step: Step,
     /// This process's arguments (after the program) with every path flag's value
-    /// anchored and no `--fix` ([`crate::release::ReleaseOptions::rerun_args`]): what the
-    /// re-run as R's own cutter ([`Real::reexec_command`]) passes on, from the clone's root.
+    /// anchored and no `--fix` ([`crate::release::ReleaseOptions::exec_args`]): what the
+    /// frozen cutter receives when it replaces this image, from the clone's root.
     argv: Vec<std::ffi::OsString>,
     source_signing: Option<crate::source_signing::Tools>,
     prerequisites: Option<crate::managed_prerequisites::Tools>,
@@ -258,6 +249,8 @@ pub struct Real {
     engine_agh_explicit: Option<std::ffi::OsString>,
     /// The release's one disk claim ([`Backend::claim_disk`]), named to every child it starts.
     disk_claim: Option<atpkg::admit_disk::Whole>,
+    /// The one Release-rank line marker, retained across the in-place cutter exec.
+    line_priority: Option<aterm_capacity::Claim>,
     fleet_line: Option<crate::line_claim::Claim>,
     /// The qualify graph's one pool ([`Backend::qualify_begin`]), handed to every child it starts.
     pool: Option<Pool>,
@@ -582,6 +575,7 @@ impl Real {
             checkout_build: Real::build_checkout_bin,
             engine_agh_explicit: std::env::var_os(ENGINE_AGH_ENV),
             disk_claim: None,
+            line_priority: None,
             fleet_line: None,
             pool: None,
         })
@@ -919,35 +913,6 @@ impl Real {
         Ok(cmd)
     }
 
-    /// The release again as R's own cutter, `targo --unverified ship <its arguments>` in the
-    /// clone with `prover`'s `targo`: [`Real::scrubbed`], and without the `TRUST_TARGO_*`
-    /// variables this process inherited (`inherited` names them), so it is a `targo` of its own,
-    /// not one nested in the `targo` that ran this cutter. A nested one would exec into the
-    /// cutter it built, a process whose parent is this one, not the program `$CARGO` names, so
-    /// that cutter would have no Launch moment and be judged from its link; a `targo` of its own
-    /// starts the cutter as its own child, and the cutter is judged from that `targo`'s start
-    /// ([`crate::cutter::Since::Launch`]), a fork after the bump and checkout this run wrote. It
-    /// is started as this process's child, in its process group, and waited on, and takes the
-    /// run claim over ([`RunClaim::hand`]).
-    ///
-    /// [`RunClaim::hand`]: crate::release::RunClaim::hand
-    fn reexec_command(
-        &self,
-        prover: &Prover,
-        inherited: impl IntoIterator<Item = std::ffi::OsString>,
-    ) -> Command {
-        let mut cmd = self.scrubbed(prover.bin.join("targo"));
-        for name in inherited {
-            if name.to_str().is_some_and(|n| n.starts_with("TRUST_TARGO_")) {
-                cmd.env_remove(name);
-            }
-        }
-        cmd.args(["--unverified", "ship"])
-            .args(&self.argv)
-            .current_dir(&self.repo);
-        cmd
-    }
-
     fn publish_command(&self, prover: &Prover) -> Result<Command, Refusal> {
         let mut cmd = self.with_scanners(self.engine_child(&self.engine, Some(prover))?);
         cmd.args(["publish", "aterm", "--skip-site", "--repo-path"])
@@ -981,6 +946,20 @@ impl Real {
     /// Run `cmd` as a child of `at.step` into `at.log`, its output streamed when `at.stream`,
     /// ended by `at.stop` too, and its lines read by `at.push`.
     fn logged_in(&self, at: Logged<'_>, cmd: &mut Command) -> Ran {
+        #[cfg(test)]
+        let ran = self.logged_in_with_drain(at, cmd, LOG_DRAIN_AFTER_EXIT, None);
+        #[cfg(not(test))]
+        let ran = self.logged_in_with_drain(at, cmd, LOG_DRAIN_AFTER_EXIT);
+        ran
+    }
+
+    fn logged_in_with_drain(
+        &self,
+        at: Logged<'_>,
+        cmd: &mut Command,
+        drain: std::time::Duration,
+        #[cfg(test)] pump_active: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Ran {
         let Logged {
             step,
             log,
@@ -1013,11 +992,11 @@ impl Real {
             .then(|| crate::durable::open_append(&self.side_log(step, "arrivals"), true).ok())
             .flatten();
         let pipe = if stream || arrivals.is_some() || push.is_some() {
-            let made = std::io::pipe().and_then(|(r, w)| Ok((r, w.try_clone()?, w)));
+            let made = LoggedPipe::new();
             match made {
-                Ok((reader, out, err)) => {
+                Ok((pipe, out, err)) => {
                     cmd.stdout(out).stderr(err);
-                    Some(reader)
+                    Some(pipe)
                 }
                 Err(e) => {
                     let _ = writeln!(file, "pipe: {e}");
@@ -1056,40 +1035,70 @@ impl Real {
                 };
             }
         };
-        let pumped = pipe.and_then(|reader| {
+        let pumped = pipe.and_then(|pipe| {
             let mut log = file.try_clone().ok()?;
             let (done, finished) = std::sync::mpsc::channel::<()>();
             let mut arrivals = arrivals.map(Arrivals::new);
             let mut push = push;
-            std::thread::spawn(move || {
-                let mut reader = reader;
-                let mut buf = [0u8; 8192];
-                while let Ok(n) = std::io::Read::read(&mut reader, &mut buf) {
-                    if n == 0 {
-                        break;
+            #[cfg(test)]
+            let pump_active = PumpActive::new(pump_active);
+            let LoggedPipe {
+                mut reader,
+                #[cfg(unix)]
+                cancel_reader,
+                #[cfg(unix)]
+                cancel_writer,
+            } = pipe;
+            let thread = std::thread::Builder::new()
+                .name("release-output-pump".into())
+                .spawn(move || {
+                    #[cfg(test)]
+                    let _pump_active = pump_active;
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        #[cfg(unix)]
+                        {
+                            use std::os::fd::AsFd as _;
+
+                            match aterm_uds::ready::either(reader.as_fd(), cancel_reader.as_fd()) {
+                                Ok(ready) if !ready.second => {}
+                                Ok(_) | Err(_) => break,
+                            }
+                        }
+                        let Ok(n) = std::io::Read::read(&mut reader, &mut buf) else {
+                            break;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        let _ = log.write_all(&buf[..n]);
+                        if stream {
+                            let _ = std::io::stdout().write_all(&buf[..n]);
+                        }
+                        if let Some(arrivals) = &mut arrivals {
+                            arrivals.read(&buf[..n]);
+                        }
+                        if let Some(push) = &mut push {
+                            push.read(&buf[..n]);
+                        }
                     }
-                    let _ = log.write_all(&buf[..n]);
-                    if stream {
-                        let _ = std::io::stdout().write_all(&buf[..n]);
-                    }
-                    if let Some(arrivals) = &mut arrivals {
-                        arrivals.read(&buf[..n]);
-                    }
-                    if let Some(push) = &mut push {
-                        push.read(&buf[..n]);
-                    }
-                }
-                let _ = done.send(());
-            });
-            Some(finished)
+                    let _ = done.send(());
+                })
+                .ok()?;
+            Some(OutputPump {
+                finished,
+                thread,
+                #[cfg(unix)]
+                cancel: cancel_writer,
+            })
         });
         let waited = wait_accounted(&mut child);
         let ended_at_unix_ms = now_ms();
         let code = waited
             .as_ref()
             .map_or(-1, |(status, _)| status.code().unwrap_or(-1));
-        if let Some(finished) = pumped {
-            let _ = finished.recv_timeout(std::time::Duration::from_secs(5));
+        if let Some(pumped) = pumped {
+            pumped.finish(drain);
         }
         drop(forwarded);
         let usage = waited.ok().and_then(|(_, usage)| usage);
@@ -1180,6 +1189,25 @@ impl Real {
             self.origin_main = Some(self.read_origin_main(&engine_origin)?);
         }
         Ok(())
+    }
+
+    /// Step 1's reads of both origins: aterm's main and tags through `aterm` (agh's fetch, in
+    /// `Backend::fetch`), then the engine's main ([`Real::fetch_engine_origin`]), which step 1
+    /// judges the ledger and `bin/pub` on until step 2 syncs the release's engine; aterm's main.
+    fn fetch_origins(
+        &mut self,
+        aterm: impl FnOnce(&Path) -> Result<crate::github_remote::FetchedOrigin, String>,
+    ) -> Result<String, Refusal> {
+        let origin = aterm(&self.repo).map_err(|why| {
+            Refusal::new(
+                "cannot refresh origin through agh",
+                "check the reported native routing or source-state refusal, then re-run",
+            )
+            .detail([why])
+        })?;
+        self.origin_tags = origin.tags;
+        self.fetch_engine_origin()?;
+        Ok(origin.main)
     }
 
     /// `path` of the engine as this run judges it: its own copy's once it has synced it, else
@@ -1717,6 +1745,141 @@ impl Real {
             ));
         }
         Ok(out.stdout)
+    }
+
+    /// Build one of R's frozen tools with the already leased prover into verify's shared main
+    /// build directory, and return the exact executable cargo reported.
+    fn build_frozen_tool(
+        &self,
+        prover: &Prover,
+        bin: &crate::checkout_bin::Bin,
+        profile: &str,
+    ) -> Result<PathBuf, String> {
+        let layout = verify_layout(&self.repo).1;
+        let args = Self::frozen_tool_args(&self.repo, bin, profile, layout.as_deref());
+        let mut command = self.child(prover.bin.join("targo"), Some(prover));
+        command.args(&args).current_dir(&self.repo);
+        let output = self
+            .output_forwarded(&mut command)
+            .map_err(|e| format!("{} build: {e}", bin.what))?;
+        if let Ok(mut log) = crate::durable::open_append(&self.step_log(self.step), true) {
+            let _ = log.write_all(&output.stdout);
+            let _ = log.write_all(&output.stderr);
+        }
+        if !output.status.success() {
+            return Err(format!(
+                "{} build exited {}: {}",
+                bin.what,
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        crate::checkout_bin::built(&self.repo, bin, &output.stdout)
+    }
+
+    /// The exact locked-targo line for one frozen tool. The verifier uses the main test graph;
+    /// the gate-profile cutter does not widen its features.
+    fn frozen_tool_args(
+        repo: &Path,
+        bin: &crate::checkout_bin::Bin,
+        profile: &str,
+        layout: Option<&str>,
+    ) -> Vec<std::ffi::OsString> {
+        let mut args: Vec<String> = [
+            "--unverified",
+            "build",
+            "--locked",
+            "--profile",
+            profile,
+            "-p",
+            bin.package,
+            "--bin",
+            bin.package,
+            "--message-format=json",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        if bin.package == FROZEN_VERIFY.package {
+            args = aterm_toolchain::build_cache::with_test_graph(&args);
+        }
+        if let Some(layout) = layout {
+            args.splice(0..0, ["--config".to_owned(), layout.to_owned()]);
+        }
+        let mut args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+        args.push("--manifest-path".into());
+        args.push(repo.join("Cargo.toml").into_os_string());
+        args
+    }
+
+    /// R's two immutable executable copies, with the record published only after the second
+    /// exact clean-R check.
+    fn frozen_tools(
+        &self,
+        commit: &str,
+        prover: &Prover,
+    ) -> Result<crate::release_tools::ToolSet, String> {
+        if let Ok(recorded) = crate::release_tools::recorded(&self.release, commit) {
+            crate::release_tools::clean_at(&self.repo, commit)?;
+            return Ok(recorded);
+        }
+        crate::release_tools::clean_at(&self.repo, commit)?;
+        let cutter = self.build_frozen_tool(prover, &FROZEN_CUTTER, "gate")?;
+        let verify = self.build_frozen_tool(prover, &FROZEN_VERIFY, "test")?;
+        let tools = crate::release_tools::stage(&self.release, commit, &cutter, &verify)?;
+        crate::release_tools::clean_at(&self.repo, commit)?;
+        crate::release_tools::publish(&self.release, &tools)?;
+        Ok(tools)
+    }
+
+    #[cfg(unix)]
+    fn hand_exec_guards(&self, command: &mut Command, prover: &Prover) -> Result<(), String> {
+        use std::os::fd::AsRawFd as _;
+
+        let mut guards = Vec::new();
+        if let Some(lease) = crate::gates::offer_toolchain_lease(&prover.bin)? {
+            command
+                .env(
+                    TOOLCHAIN_LEASE_FD_ENV,
+                    lease.descriptor.as_raw_fd().to_string(),
+                )
+                .env(TOOLCHAIN_LEASE_LEAF_ENV, &lease.leaf);
+            guards.push(lease.descriptor);
+        }
+        let claim = self
+            .line_priority
+            .as_ref()
+            .ok_or("the release-line claim is absent at the cutter handover")?;
+        let descriptor = claim
+            .descriptor()
+            .map_err(|e| format!("duplicate release-line claim: {e}"))?;
+        let leaf = claim
+            .path()
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .filter(|leaf| !leaf.is_empty() && !leaf.contains('/'))
+            .ok_or("the release-line claim has no bounded UTF-8 leaf")?;
+        command
+            .env(LINE_FD_ENV, descriptor.as_raw_fd().to_string())
+            .env(LINE_LEAF_ENV, leaf);
+        guards.push(descriptor);
+        let cohort = aterm_capacity::Ledger::user()
+            .ok_or("no account ledger exists for the release-line claim")?
+            .cohort_aware()
+            .map_err(|e| format!("validate the release-line ledger: {e}"))?;
+        if cohort {
+            let writer = claim
+                .cohort_writer_descriptor()
+                .map_err(|e| format!("duplicate release-line writer: {e}"))?;
+            command.env(LINE_WRITER_FD_ENV, writer.as_raw_fd().to_string());
+            guards.push(writer);
+        } else {
+            command.env_remove(LINE_WRITER_FD_ENV);
+        }
+        command
+            .inherit_exec_guards(guards)
+            .map_err(|e| format!("arm release handover descriptors: {e}"))?;
+        Ok(())
     }
 
     /// The agh the engine's dry run reads GitHub through ([`ENGINE_AGH_ENV`]): the caller's own,
@@ -2452,9 +2615,16 @@ impl Real {
             )
             .could_not_run()
         };
-        let mut cmd = self.child(prover.bin.join("targo"), Some(prover));
+        let frozen = crate::release_tools::recorded(&self.release, &c.commit).map_err(|why| {
+            Refusal::new(
+                format!("R's recorded verifier is unavailable ({why}) — nothing ran"),
+                format!("run {RELEASE_COMMAND} again to rebuild and prove R's tools"),
+            )
+            .could_not_run()
+        })?;
+        let mut cmd = self.child(&frozen.verify.path, Some(prover));
         self.hand_pool(&mut cmd, true)?;
-        cmd.args(crate::release::VERIFY_ARGS).arg(run.half.flag());
+        cmd.arg("release").arg(run.half.flag());
         if run.strict_subset() {
             cmd.arg("--checks").arg(run.checks.join(","));
         }
@@ -2944,6 +3114,79 @@ fn now_ms() -> Option<u64> {
         .and_then(|d| u64::try_from(d.as_millis()).ok())
 }
 
+/// A child that exits normally gets this long for every inherited pipe writer to close and for
+/// its already-written output to reach the log. A descendant that keeps a writer is not allowed
+/// to keep the pump thread alive past the step boundary.
+const LOG_DRAIN_AFTER_EXIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct LoggedPipe {
+    reader: std::io::PipeReader,
+    #[cfg(unix)]
+    cancel_reader: std::io::PipeReader,
+    #[cfg(unix)]
+    cancel_writer: std::io::PipeWriter,
+}
+
+impl LoggedPipe {
+    fn new() -> std::io::Result<(Self, std::io::PipeWriter, std::io::PipeWriter)> {
+        let (reader, writer) = std::io::pipe()?;
+        let stderr = writer.try_clone()?;
+        #[cfg(unix)]
+        let (cancel_reader, cancel_writer) = std::io::pipe()?;
+        Ok((
+            Self {
+                reader,
+                #[cfg(unix)]
+                cancel_reader,
+                #[cfg(unix)]
+                cancel_writer,
+            },
+            writer,
+            stderr,
+        ))
+    }
+}
+
+/// The one reader of a logged child's shared stdout/stderr pipe. Its owner first gives it the
+/// drain grace, then wakes it through `cancel` and joins it, so no output thread survives a step.
+struct OutputPump {
+    finished: std::sync::mpsc::Receiver<()>,
+    thread: std::thread::JoinHandle<()>,
+    #[cfg(unix)]
+    cancel: std::io::PipeWriter,
+}
+
+#[cfg(test)]
+struct PumpActive(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>);
+
+#[cfg(test)]
+impl PumpActive {
+    fn new(active: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> Self {
+        if let Some(active) = &active {
+            active.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        Self(active)
+    }
+}
+
+#[cfg(test)]
+impl Drop for PumpActive {
+    fn drop(&mut self) {
+        if let Some(active) = &self.0 {
+            active.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+impl OutputPump {
+    fn finish(self, drain: std::time::Duration) {
+        let _ = self.finished.recv_timeout(drain);
+        #[cfg(unix)]
+        drop(self.cancel);
+        let _ = self.thread.join();
+    }
+}
+
 /// How [`Real::logged_in`] runs a step's child.
 struct Logged<'a> {
     step: Step,
@@ -3412,6 +3655,18 @@ const ENGINE_AGH: crate::checkout_bin::Bin = crate::checkout_bin::Bin {
     package: "agh",
     env: ENGINE_AGH_ENV,
     what: "agh",
+};
+
+const FROZEN_CUTTER: crate::checkout_bin::Bin = crate::checkout_bin::Bin {
+    package: "aterm-release",
+    env: "ATERM_RELEASE_FROZEN_CUTTER",
+    what: "release cutter",
+};
+
+const FROZEN_VERIFY: crate::checkout_bin::Bin = crate::checkout_bin::Bin {
+    package: "aterm-verify",
+    env: "ATERM_RELEASE_FROZEN_VERIFY",
+    what: "release verifier",
 };
 
 /// Git config for the export engine's public reads, as `(key, value)`. Only the engine's
@@ -4431,9 +4686,6 @@ fn hms_local(epoch: u64, offset_at: impl FnOnce(i64) -> Option<i64>) -> String {
 }
 
 impl Backend for Real {
-    fn line_priority(&mut self) -> Option<aterm_capacity::Claim> {
-        line_priority_with(aterm_capacity::admit)
-    }
     fn now(&mut self) -> u64 {
         now()
     }
@@ -4468,10 +4720,6 @@ impl Backend for Real {
         (pid, self.started_of(pid).unwrap_or_default())
     }
 
-    fn ancestors(&mut self) -> Vec<u32> {
-        crate::cutter::ancestors()
-    }
-
     fn started_of(&mut self, pid: u32) -> Option<String> {
         started_of(pid)
     }
@@ -4503,8 +4751,8 @@ impl Backend for Real {
         }
     }
 
-    fn fleet_line(&mut self, line: &Line, handed: bool) -> Result<Line, String> {
-        let claim = crate::line_claim::Claim::take(&self.repo, line, &self.logs, handed)?;
+    fn fleet_line(&mut self, line: &Line, continued: bool) -> Result<Line, String> {
+        let claim = crate::line_claim::Claim::take(&self.repo, line, &self.logs, continued)?;
         let selected = claim.line.clone();
         self.fleet_line = Some(claim);
         Ok(selected)
@@ -4532,10 +4780,6 @@ impl Backend for Real {
             .as_mut()
             .ok_or("no fleet line claim")?
             .audit()
-    }
-
-    fn fleet_hand(&mut self) {
-        self.fleet_line.take();
     }
 
     fn observe_operational(&mut self) {
@@ -4745,18 +4989,9 @@ impl Backend for Real {
     }
 
     fn fetch(&mut self) -> Result<String, Refusal> {
-        let origin = crate::github_remote::Remote::origin(&self.repo)
-            .and_then(|remote| remote.fetch_origin())
-            .map_err(|why| {
-                Refusal::new(
-                    "cannot refresh origin through agh",
-                    "check the reported native routing or source-state refusal, then re-run",
-                )
-                .detail([why])
-            })?;
-        self.origin_tags = origin.tags;
-        self.fetch_engine_origin()?;
-        Ok(origin.main)
+        self.fetch_origins(|repo| {
+            crate::github_remote::Remote::origin(repo).and_then(|remote| remote.fetch_origin())
+        })
     }
 
     fn head(&mut self) -> String {
@@ -5287,30 +5522,49 @@ impl Backend for Real {
     }
 
     fn own_cutter(&mut self, commit: &str) -> Result<String, crate::cutter::NotOwn> {
-        crate::gates::own_cutter(&self.git(), commit)
+        crate::gates::own_frozen_cutter(commit)
     }
 
-    /// [`Real::reexec_command`], never started once this process caught a signal, waited on
-    /// with each signal this process catches meanwhile passed on to it, a `SIGINT` as a
-    /// `SIGTERM` ([`interrupt::wait_passing_on`]): one sent to this pid alone (a second run's
-    /// refusal names it until the re-run takes the claim over) reaches the re-run's `targo` too,
-    /// which passes it on to the cutter it started.
-    fn reexec(&mut self, prover: &Prover) -> Result<i32, Refusal> {
+    fn exec_cutter(&mut self, commit: &str, prover: &Prover) -> Result<(), Refusal> {
         let cannot = |why: String| {
             Refusal::new(
-                format!("cannot re-run as R's own cutter ({why})"),
+                format!("cannot exec R's frozen cutter ({why})"),
                 format!("run {RELEASE_COMMAND} again from the clone"),
             )
         };
         if interrupt::caught().is_some() {
             return Err(cannot("not started: the release was interrupted".into()));
         }
-        let inherited = std::env::vars_os().map(|(name, _)| name);
-        let mut cmd = self.reexec_command(prover, inherited);
-        let status = cmd
-            .spawn()
-            .and_then(|mut child| interrupt::wait_passing_on(&mut child, &interrupt::counts));
-        crate::hook::exit_code(status, &prover.bin.join("targo")).map_err(cannot)
+        let tools = self.frozen_tools(commit, prover).map_err(cannot)?;
+        let mut command = self.scrubbed(&tools.cutter.path);
+        command.args(&self.argv).current_dir(&self.repo).env(
+            crate::release_tools::RECORD_ENV,
+            crate::release_tools::record_path(&self.release),
+        );
+        for name in std::env::vars_os().map(|(name, _)| name).filter(|name| {
+            name.to_str()
+                .is_some_and(|name| name.starts_with("TRUST_TARGO_"))
+        }) {
+            command.env_remove(name);
+        }
+        #[cfg(unix)]
+        self.hand_exec_guards(&mut command, prover)
+            .map_err(cannot)?;
+        #[cfg(not(unix))]
+        return Err(cannot("descriptor handover requires Unix".into()));
+        // The fleet claim's sampler and publisher are Real's only persistent worker threads.
+        // Join both before blocking this execing thread: a process-directed stop can then only
+        // become pending on the thread whose mask the frozen image inherits. The same pid/start
+        // reclaims the fleet line when the flow resumes in the new image; only the reader for an
+        // already-running pre-B1 handed parent admits the old child-process boundary.
+        drop(self.fleet_line.take());
+        #[cfg(unix)]
+        let _signals = interrupt::block_for_exec(&mut command).map_err(cannot)?;
+        if interrupt::caught().is_some() {
+            return Err(cannot("not started: the release was interrupted".into()));
+        }
+        let error = command.exec();
+        Err(cannot(error.to_string()))
     }
 
     fn facts(&mut self, c: &Candidate, prover: &Prover, artifact: Option<&Artifact>) -> Facts {
@@ -5442,7 +5696,7 @@ impl Backend for Real {
         if dry && let Err(not) = crate::gates::own_cutter(&git, &c.commit) {
             self.say(&format!(
                 "        note: R's pre-claim gates asked of this cutter, not yet R's own (a real \
-                 run re-runs as R's): {}",
+                 real run executes as R's frozen cutter): {}",
                 not.why
             ));
         }
@@ -5977,11 +6231,194 @@ pub fn attested_candidate(json: &str) -> Option<(String, String)> {
     (!revision.is_empty() && !tree.is_empty()).then(|| (revision.into(), tree.into()))
 }
 
+#[cfg(unix)]
+fn inherited_fd_number(name: &str, value: &std::ffi::OsStr) -> Result<std::os::fd::RawFd, String> {
+    let text = value
+        .to_str()
+        .ok_or_else(|| format!("{name} is not a descriptor number"))?;
+    let raw: std::os::fd::RawFd = text
+        .parse()
+        .map_err(|_| format!("{name} is not a descriptor number"))?;
+    if raw < 3 {
+        return Err(format!("{name} names a standard descriptor"));
+    }
+    Ok(raw)
+}
+
+#[cfg(unix)]
+fn unique_inherited_fds(offers: [(&str, Option<std::os::fd::RawFd>); 3]) -> Result<(), String> {
+    let mut seen = std::collections::BTreeMap::new();
+    for (name, raw) in offers {
+        let Some(raw) = raw else {
+            continue;
+        };
+        if let Some(first) = seen.insert(raw, name) {
+            return Err(format!(
+                "{name} duplicates {first}'s inherited descriptor offer"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn inherited_fd_offers(
+    lease: Option<&std::ffi::OsStr>,
+    line: Option<&std::ffi::OsStr>,
+    writer: Option<&std::ffi::OsStr>,
+) -> Result<[Option<std::os::fd::RawFd>; 3], String> {
+    let lease = lease
+        .map(|value| inherited_fd_number(TOOLCHAIN_LEASE_FD_ENV, value))
+        .transpose()?;
+    let line = line
+        .map(|value| inherited_fd_number(LINE_FD_ENV, value))
+        .transpose()?;
+    let writer = writer
+        .map(|value| inherited_fd_number(LINE_WRITER_FD_ENV, value))
+        .transpose()?;
+    // Validate the complete offer before any raw number becomes an OwnedFd. Otherwise one
+    // malicious or stale number repeated in two variables would create two Rust owners.
+    unique_inherited_fds([
+        (TOOLCHAIN_LEASE_FD_ENV, lease),
+        (LINE_FD_ENV, line),
+        (LINE_WRITER_FD_ENV, writer),
+    ])?;
+    Ok([lease, line, writer])
+}
+
+#[cfg(unix)]
+fn inherited_fd(name: &str, raw: std::os::fd::RawFd) -> Result<std::os::fd::OwnedFd, String> {
+    use std::os::fd::FromRawFd as _;
+
+    unsafe extern "C" {
+        fn fcntl(fd: std::os::fd::RawFd, command: i32, ...) -> i32;
+    }
+    const F_GETFD: i32 = 1;
+    const FD_CLOEXEC: i32 = 1;
+
+    // SAFETY: F_GETFD only observes this startup offer. No threads exist yet that can close it.
+    let flags = unsafe { fcntl(raw, F_GETFD) };
+    if flags < 0 || flags & FD_CLOEXEC != 0 {
+        return Err(format!("{name} is not a live inherited descriptor offer"));
+    }
+    // SAFETY: this process image received exclusive ownership of the explicitly inherited slot.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+}
+
+#[cfg(unix)]
+fn take_handover_env(name: &str) -> Option<std::ffi::OsString> {
+    let value = std::env::var_os(name);
+    // SAFETY: release startup is single-threaded, and these private variables are consumed once.
+    unsafe { std::env::remove_var(name) };
+    value
+}
+
+/// Adopt the two original resource descriptions handed through the native in-place exec.
+/// Paths are derived from the receiver's selected store and account ledger; only bounded leaf
+/// names and exact descriptor numbers cross the image boundary.
+#[cfg(unix)]
+fn adopt_exec_handoffs() -> Result<Option<aterm_capacity::Claim>, String> {
+    let resource_offer = [
+        TOOLCHAIN_LEASE_FD_ENV,
+        TOOLCHAIN_LEASE_LEAF_ENV,
+        LINE_FD_ENV,
+        LINE_WRITER_FD_ENV,
+        LINE_LEAF_ENV,
+    ]
+    .into_iter()
+    .any(|name| std::env::var_os(name).is_some());
+    if resource_offer && !interrupt::exec_handoff_installed() {
+        return Err(
+            "inherited resource offers arrived without a proved signal-mask handoff".into(),
+        );
+    }
+    let lease_fd = take_handover_env(TOOLCHAIN_LEASE_FD_ENV);
+    let lease_leaf = take_handover_env(TOOLCHAIN_LEASE_LEAF_ENV);
+    let line_fd = take_handover_env(LINE_FD_ENV);
+    let writer_fd = take_handover_env(LINE_WRITER_FD_ENV);
+    let line_leaf = take_handover_env(LINE_LEAF_ENV);
+    let [lease_fd, line_fd, writer_fd] = inherited_fd_offers(
+        lease_fd.as_deref(),
+        line_fd.as_deref(),
+        writer_fd.as_deref(),
+    )?;
+    match (lease_fd, lease_leaf) {
+        (None, None) => {}
+        (Some(fd), Some(leaf)) => {
+            let fd = inherited_fd(TOOLCHAIN_LEASE_FD_ENV, fd)?;
+            let leaf = leaf
+                .to_str()
+                .filter(|leaf| !leaf.is_empty() && !leaf.contains('/'))
+                .ok_or("the inherited toolchain lease leaf is invalid")?;
+            let toolchain = crate::gates::trust_stage2_bin().map_err(|e| e.to_string())?;
+            // SAFETY: inherited_fd established exclusive startup ownership; the receiver chose
+            // the pinned toolchain independently, and adoption consumes the OwnedFd on every
+            // answer, including a check after the lock boundary.
+            unsafe { crate::gates::adopt_toolchain_lease(fd, &toolchain, leaf) }?;
+        }
+        _ => return Err("the inherited toolchain lease handover is incomplete".into()),
+    }
+
+    let (fd, leaf) = match (line_fd, line_leaf) {
+        (Some(fd), Some(leaf)) => (fd, leaf),
+        (None, None) if writer_fd.is_none() => return Ok(None),
+        _ => return Err("the inherited release-line handover is incomplete".into()),
+    };
+    let fd = inherited_fd(LINE_FD_ENV, fd)?;
+    let writer = writer_fd
+        .map(|value| inherited_fd(LINE_WRITER_FD_ENV, value))
+        .transpose()?;
+    let leaf = leaf
+        .to_str()
+        .filter(|leaf| {
+            leaf.len() <= 128
+                && !leaf.is_empty()
+                && !leaf.contains('/')
+                && !leaf.contains("..")
+                && leaf.ends_with(".claim")
+        })
+        .ok_or("the inherited release-line leaf is invalid")?;
+    let ledger = aterm_capacity::Ledger::user()
+        .ok_or("no account ledger exists for the inherited release-line claim")?;
+    let path = ledger.dir().join(leaf);
+    let claim = if let Some(writer) = writer {
+        aterm_capacity::Claim::adopt_cohort(fd, writer, &path)
+    } else {
+        aterm_capacity::Claim::adopt(fd, &path)
+    }
+    .map_err(|e| format!("adopt inherited release-line claim: {e}"))?;
+    Ok(Some(claim))
+}
+
 /// Run a release in the clone at `repo`; the exit code.
 #[must_use]
 pub fn run(repo: &Path, opts: &crate::release::ReleaseOptions) -> i32 {
+    #[cfg(unix)]
+    let inherited_line = match adopt_exec_handoffs() {
+        Ok(line) => line,
+        Err(why) => {
+            eprintln!("release handover: {why}");
+            return 2;
+        }
+    };
+    #[cfg(not(unix))]
+    let inherited_line = None;
+    let retired_deps = if matches!(
+        crate::cutter::running_stamp(),
+        Ok(crate::cutter::Stamp::Proved(_))
+    ) {
+        match crate::release_target::retire(repo) {
+            Ok(entries) => Some(entries),
+            Err(why) => {
+                eprintln!("release target retirement: {why}");
+                return 2;
+            }
+        }
+    } else {
+        None
+    };
     interrupt::install();
-    let _line = if !opts.dry_run {
+    let line = if !opts.dry_run && inherited_line.is_none() {
         match aterm_capacity::admit(
             aterm_capacity::Need::new("release line").rank(aterm_capacity::Rank::Release),
             aterm_capacity::Admit::Wait,
@@ -5993,7 +6430,7 @@ pub fn run(repo: &Path, opts: &crate::release::ReleaseOptions) -> i32 {
             }
         }
     } else {
-        None
+        inherited_line
     };
     if !opts.dry_run {
         crate::gates::arm_toolchain_lease();
@@ -6009,7 +6446,21 @@ pub fn run(repo: &Path, opts: &crate::release::ReleaseOptions) -> i32 {
             return 2;
         }
     };
-    real.argv = opts.rerun_args(std::env::args_os().skip(1).collect());
+    if let Some(entries) = retired_deps {
+        real.say(&format!(
+            "release: retired the legacy in-tree target; deps entries remaining: {entries}"
+        ));
+        real.say(&format!(
+            "release-event: {}",
+            aterm_json::json!({
+                "schema": 1,
+                "event": "target-retired",
+                "deps_entries": entries,
+            })
+        ));
+    }
+    real.line_priority = line;
+    real.argv = opts.exec_args(std::env::args_os().skip(1).collect());
     let home = real.home.clone();
     crate::release::run_with(&mut real, &opts, &home).code
 }
@@ -6313,6 +6764,53 @@ mod tests {
         );
     }
     use super::*;
+
+    /// Every exec resource offer owns a distinct descriptor slot before any slot becomes an
+    /// `OwnedFd`. NEGATIVE CONTROL: repeat the toolchain, line, or cohort-writer number in either
+    /// other variable, and validation must refuse while the original descriptor remains owned by
+    /// this test.
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_exec_resource_descriptor_offers_are_refused_before_ownership() {
+        use std::os::fd::AsRawFd as _;
+
+        let held = std::fs::File::open("/dev/null").unwrap();
+        let repeated = std::ffi::OsString::from(held.as_raw_fd().to_string());
+        for (lease, line, writer) in [
+            (Some(repeated.as_os_str()), Some(repeated.as_os_str()), None),
+            (Some(repeated.as_os_str()), None, Some(repeated.as_os_str())),
+            (None, Some(repeated.as_os_str()), Some(repeated.as_os_str())),
+        ] {
+            let why = inherited_fd_offers(lease, line, writer).unwrap_err();
+            assert!(why.contains("duplicates"), "{why}");
+            assert!(
+                held.metadata().is_ok(),
+                "refusal took ownership of the offered descriptor"
+            );
+        }
+
+        let lease = std::fs::File::open("/dev/null").unwrap();
+        let line = std::fs::File::open("/dev/null").unwrap();
+        let writer = std::fs::File::open("/dev/null").unwrap();
+        let values = [
+            std::ffi::OsString::from(lease.as_raw_fd().to_string()),
+            std::ffi::OsString::from(line.as_raw_fd().to_string()),
+            std::ffi::OsString::from(writer.as_raw_fd().to_string()),
+        ];
+        assert_eq!(
+            inherited_fd_offers(
+                Some(values[0].as_os_str()),
+                Some(values[1].as_os_str()),
+                Some(values[2].as_os_str()),
+            )
+            .unwrap(),
+            [
+                Some(lease.as_raw_fd()),
+                Some(line.as_raw_fd()),
+                Some(writer.as_raw_fd()),
+            ]
+        );
+    }
 
     #[cfg(unix)]
     #[test]
@@ -8350,82 +8848,60 @@ mod tests {
         );
     }
 
-    /// The re-run as R's own cutter is `targo --unverified ship <the release's arguments>` in the
-    /// clone, started as this process's child in its process group and waited on, its exit code
-    /// the re-run's, and it inherits no `TRUST_TARGO_*` variable, so it is a `targo` of its own
-    /// rather than one nested in the `targo` that ran this cutter. NEGATIVE CONTROLS: keep the
-    /// inherited `TRUST_TARGO_*` variables, and the nested endpoint reaches the re-run; `exec`
-    /// the command (as before), and this test's own process is replaced by the stand-in.
-    #[cfg(unix)]
+    /// Frozen tools share verify's main build directory, and only the test-profile verifier
+    /// widens to the workspace test graph. NEGATIVE CONTROL: applying those words to the gate
+    /// cutter would change its compiled feature set.
     #[test]
-    fn the_rerun_is_a_targo_of_its_own_that_this_run_waits_on() {
-        use std::ffi::{OsStr, OsString};
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let mut real = Real::new(&root, Some(&root), false, false).unwrap();
-        real.argv = ["release", "--commit", "origin/main"]
-            .map(OsString::from)
-            .to_vec();
-        let bin = root.join("store/bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let said = root.join("said");
-        let targo = bin.join("targo");
-        std::fs::write(
-            &targo,
-            format!(
-                "#!/bin/sh\n{{ echo \"$PPID\"; ps -o pgid= -p $$; pwd -P; printf '%s\\n' \"$@\"; \
-                 }} > '{}'\nexit 7\n",
-                said.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&targo, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
-        let prover = Prover {
-            bin: bin.clone(),
-            commit: "321aaeda7".into(),
-            source: "the store".into(),
+    fn frozen_tools_use_the_main_layout_and_only_verify_uses_the_test_graph() {
+        let repo = Path::new("/release");
+        let layout = "build.build-dir='/cache/build.noindex'";
+        let words = |args: Vec<std::ffi::OsString>| {
+            args.into_iter()
+                .map(|word| word.into_string().unwrap())
+                .collect::<Vec<_>>()
         };
-        let inherited = [
-            "TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT",
-            "TRUST_STAGE2_BIN",
-            "HOME",
-        ];
-        let cmd = real.reexec_command(&prover, inherited.map(OsString::from));
-        let envs: Vec<_> = cmd.get_envs().collect();
+        let cutter = words(Real::frozen_tool_args(
+            repo,
+            &FROZEN_CUTTER,
+            "gate",
+            Some(layout),
+        ));
+        let verify = words(Real::frozen_tool_args(
+            repo,
+            &FROZEN_VERIFY,
+            "test",
+            Some(layout),
+        ));
+        assert_eq!(&cutter[..4], ["--config", layout, "--unverified", "build"]);
         assert!(
-            envs.contains(&(OsStr::new("TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT"), None)),
-            "{envs:?}"
+            !cutter
+                .iter()
+                .any(|word| word == aterm_toolchain::build_cache::TEST_GRAPH_FLAG)
         );
-        for kept in ["TRUST_STAGE2_BIN", "HOME"] {
+        let [config, workspace] = aterm_toolchain::build_cache::TEST_GRAPH_CONFIG;
+        assert_eq!(
+            &verify[..7],
+            [
+                "--config",
+                layout,
+                "--unverified",
+                config,
+                workspace,
+                "build",
+                aterm_toolchain::build_cache::TEST_GRAPH_FLAG
+            ]
+        );
+        for (args, package, profile) in [
+            (&cutter, FROZEN_CUTTER.package, "gate"),
+            (&verify, FROZEN_VERIFY.package, "test"),
+        ] {
+            assert!(args.windows(2).any(|pair| pair == ["--profile", profile]));
+            assert!(args.windows(2).any(|pair| pair == ["-p", package]));
             assert!(
-                !envs.iter().any(|(k, _)| *k == OsStr::new(kept)),
-                "{kept}: {envs:?}"
+                args.windows(2)
+                    .any(|pair| pair == ["--manifest-path", "/release/Cargo.toml"])
             );
         }
-
-        assert_eq!(real.reexec(&prover), Ok(7), "the re-run's exit code");
-        let said = std::fs::read_to_string(&said).unwrap();
-        let said: Vec<&str> = said.lines().map(str::trim).collect();
-        assert_eq!(
-            said[0],
-            std::process::id().to_string(),
-            "a child of this process"
-        );
-        #[cfg(target_os = "macos")]
-        assert_eq!(
-            said[1],
-            aterm_sysprobe::kproc::record(std::process::id())
-                .unwrap()
-                .pgid
-                .to_string(),
-            "in this process's group"
-        );
-        assert_eq!(said[2], root.display().to_string(), "in the clone");
-        assert_eq!(
-            said[3..],
-            ["--unverified", "ship", "release", "--commit", "origin/main"]
-        );
     }
 
     /// A Cargo test binary's release keeps its state, its logs included, below that binary's own
@@ -8450,230 +8926,6 @@ mod tests {
             "{}",
             real.logs.display()
         );
-    }
-
-    /// This test binary run again as a release waiting on the re-run as R's own cutter: its
-    /// handler installed as the release's is (from the default dispositions, whatever the test
-    /// inherited), it prints what [`Real::reexec`] answered with `<root>/bin/targo` and exits.
-    /// With `interrupted`, it first sends itself a `SIGTERM` and waits until its handler caught
-    /// it (a one-minute hang detector), as a release that caught one before its re-run.
-    #[cfg(unix)]
-    fn reexec_probe(root: &Path, interrupted: bool) -> ! {
-        unsafe extern "C" {
-            fn signal(sig: i32, handler: usize) -> usize;
-        }
-        for sig in [interrupt::SIGHUP, interrupt::SIGINT, interrupt::SIGTERM] {
-            // SAFETY: SIG_DFL (0) for a signal no handler of this process holds yet.
-            unsafe {
-                signal(sig, 0);
-            }
-        }
-        interrupt::install();
-        if interrupted {
-            interrupt::send(std::process::id().cast_signed(), interrupt::SIGTERM);
-            let bound = std::time::Instant::now() + std::time::Duration::from_secs(60);
-            while interrupt::caught().is_none() {
-                if std::time::Instant::now() > bound {
-                    println!("never caught its own SIGTERM");
-                    std::process::exit(1);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-        }
-        let mut real = Real::new(root, Some(root), true, false).unwrap();
-        let prover = Prover {
-            bin: root.join("bin"),
-            commit: "321aaeda7".into(),
-            source: "the store".into(),
-        };
-        println!("reexec: {:?}", real.reexec(&prover));
-        std::process::exit(0);
-    }
-
-    /// A stand-in `targo` under `root` for [`reexec_probe`], and the run of `test` (this test,
-    /// named as `--exact` takes it) as that probe, with `probe` naming `root`, in a process group
-    /// of its own, which the stand-in joins ([`Real::reexec`]). Started, the stand-in writes its
-    /// pid to `<root>/armed`, records each `SIGINT`, `SIGHUP` and `SIGTERM` it gets as a line of
-    /// `<root>/record` and ends 3 on its second `SIGTERM`; it ends 9 once its parent (the probe)
-    /// is reaped or this test is gone, or after about five minutes, so a probe left behind takes
-    /// it along, and a test killed outright (its group signalled, which the probe's own group
-    /// misses) leaves neither: the stand-in ends, so the probe's wait returns and it exits.
-    #[cfg(unix)]
-    fn reexec_stand_in(root: &Path, test: &str, probe: &str) -> aterm_uds::spawnfd::Child {
-        let bin = root.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let targo = bin.join("targo");
-        std::fs::write(
-            &targo,
-            format!(
-                "#!/bin/sh\nrec='{root}/record'\ntrap 'echo INT >> \"$rec\"' INT\n\
-                 trap 'echo HUP >> \"$rec\"' HUP\n\
-                 t=0\ntrap 'echo TERM >> \"$rec\"; t=$((t + 1)); [ $t -lt 2 ] || exit 3' TERM\n\
-                 echo $$ > '{root}/armed.new' && mv '{root}/armed.new' '{root}/armed'\ni=0\n\
-                 while kill -0 $PPID 2>/dev/null && kill -0 {test_pid} 2>/dev/null \
-                 && [ $i -lt 3000 ]; do\n\
-                 sleep 0.1; i=$((i + 1)); done\nexit 9\n",
-                root = root.display(),
-                test_pid = std::process::id()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&targo, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
-        command(std::env::current_exe().unwrap())
-            .args(["--exact", test, "--nocapture", "--test-threads=1"])
-            .env(probe, root)
-            .process_group(0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap()
-    }
-
-    /// Fail a test of [`reexec_stand_in`] with `what` and the probe's output. A probe this test
-    /// has not reaped has its process group, the stand-in in it, sent `SIGKILL`: that group's id
-    /// is the probe's pid, which no other process can take until this test reaps the probe, so
-    /// the kill reaches no other group. The stand-in's watch of its parent would not do there:
-    /// `kill -0` answers 0 for an unreaped process (macOS 27.0, measured), and `wait_with_output`
-    /// reads the output the stand-in holds open to its end before it reaps the probe. A probe
-    /// already reaped is not signalled: the stand-in's watch fails once that pid is free, and it
-    /// ends at its next look, 0.1 s on.
-    #[cfg(unix)]
-    fn reexec_failed(mut probe: aterm_uds::spawnfd::Child, what: &str) -> ! {
-        if probe.try_wait().unwrap().is_none() {
-            interrupt::send(-i32::try_from(probe.id()).unwrap(), interrupt::SIGKILL);
-        }
-        let out = probe.wait_with_output().unwrap();
-        panic!(
-            "{what}: {}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        )
-    }
-
-    /// A release that caught a signal before its re-run as R's own cutter starts none: the
-    /// stand-in `targo` never runs, and [`Real::reexec`] says why. NEGATIVE CONTROL: drop the
-    /// check, and the re-run starts and is passed the `SIGTERM` this run caught, so reexec
-    /// answers Ok with its exit code.
-    #[cfg(unix)]
-    #[test]
-    fn a_rerun_never_starts_once_this_run_caught_a_signal() {
-        use std::time::{Duration, Instant};
-        const PROBE: &str = "ATERM_RELEASE_REEXEC_INTERRUPTED_PROBE";
-        if let Some(root) = std::env::var_os(PROBE) {
-            reexec_probe(Path::new(&root), true);
-        }
-        let scratch = aterm_tempfile::tempdir().unwrap();
-        let root = scratch.path().canonicalize().unwrap();
-        let mut probe = reexec_stand_in(
-            &root,
-            "release_steps::tests::a_rerun_never_starts_once_this_run_caught_a_signal",
-            PROBE,
-        );
-        let bound = Instant::now() + Duration::from_secs(60);
-        while probe.try_wait().unwrap().is_none() {
-            if Instant::now() > bound {
-                reexec_failed(probe, "the probe did not end");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let out = probe.wait_with_output().unwrap();
-        let said = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            said.contains(
-                "reexec: Err(Refusal { why: \"cannot re-run as R's own cutter (not started: \
-                 the release was interrupted)\""
-            ),
-            "{said}"
-        );
-        assert!(
-            !root.join("armed").exists() && !root.join("record").exists(),
-            "the stand-in never ran"
-        );
-    }
-
-    /// Each signal sent to this run alone while it waits on the re-run as R's own cutter reaches
-    /// the re-run's `targo` once, a `SIGINT` as a `SIGTERM` (which that `targo` passes on to its
-    /// cutter, as it does not a `SIGINT`), and the run ends with that `targo`'s exit code. The
-    /// test sends each only after the stand-in recorded the one before, so the record keeps the
-    /// order they were sent in (within one look, the wait passes `SIGHUP`s, then `SIGINT`s, then
-    /// `SIGTERM`s). Each wait for the stand-in has a one-minute hang detector of its own, and a
-    /// failure kills the probe's process group, the stand-in in it ([`reexec_failed`]). NEGATIVE
-    /// CONTROLS: wait on the re-run without passing signals on (`child.wait()`, as before), and
-    /// the stand-in never gets the `SIGINT`; pass a `SIGINT` on as itself, and the stand-in
-    /// records `INT`.
-    #[cfg(unix)]
-    #[test]
-    fn a_signal_sent_to_this_run_alone_reaches_the_reruns_targo() {
-        use std::time::{Duration, Instant};
-        const PROBE: &str = "ATERM_RELEASE_REEXEC_SIGNAL_PROBE";
-        if let Some(root) = std::env::var_os(PROBE) {
-            reexec_probe(Path::new(&root), false);
-        }
-        let scratch = aterm_tempfile::tempdir().unwrap();
-        let root = scratch.path().canonicalize().unwrap();
-        let record = root.join("record");
-        let armed = root.join("armed");
-        let mut probe = reexec_stand_in(
-            &root,
-            "release_steps::tests::a_signal_sent_to_this_run_alone_reaches_the_reruns_targo",
-            PROBE,
-        );
-        let pid = i32::try_from(probe.id()).unwrap();
-        // A one-minute hang detector for what must happen, the probe still running.
-        let came = |probe: &mut aterm_uds::spawnfd::Child, done: &dyn Fn() -> bool| {
-            let bound = Instant::now() + Duration::from_secs(60);
-            while !done() {
-                if Instant::now() > bound || probe.try_wait().unwrap().is_some() {
-                    return false;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            true
-        };
-        let fail = |probe, what: &str| reexec_failed(probe, what);
-        if !came(&mut probe, &|| armed.exists()) {
-            fail(probe, "the re-run's targo never armed");
-        }
-        let read = || std::fs::read_to_string(&record).unwrap_or_default();
-        for (sig, name, recorded) in [
-            (interrupt::SIGINT, "INT", "TERM\n"),
-            (interrupt::SIGHUP, "HUP", "TERM\nHUP\n"),
-        ] {
-            let before = read().len();
-            interrupt::send(pid, sig);
-            if !came(&mut probe, &|| read().len() > before) {
-                fail(
-                    probe,
-                    &format!("the re-run's targo never got the SIG{name} sent to this run"),
-                );
-            }
-            let got = read();
-            if got != recorded {
-                fail(
-                    probe,
-                    &format!(
-                        "the SIG{name} reached the re-run's targo as {got:?}, not {recorded:?}"
-                    ),
-                );
-            }
-        }
-        interrupt::send(pid, interrupt::SIGTERM);
-        let bound = Instant::now() + Duration::from_secs(60);
-        while probe.try_wait().unwrap().is_none() {
-            if Instant::now() > bound {
-                fail(probe, "the run did not end with its re-run");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let out = probe.wait_with_output().unwrap();
-        let said = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            said.contains("reexec: Ok(3)"),
-            "the re-run's exit code: {said}"
-        );
-        assert_eq!(read(), "TERM\nHUP\nTERM\n", "each once, in the order sent");
     }
 
     /// A handed cutter carries the moment it was judged from, with this process as the one that
@@ -8765,8 +9017,8 @@ mod tests {
     }
 
     /// Step 1's seal arms keeping in the release state, then takes the seal, whose failure is
-    /// the step's; every child the backend starts (a step, the cut, the re-run as R's cutter)
-    /// is handed the kept seal, and none while none is kept. CONTROL: off macOS step 1 arms and
+    /// the step's; every child the backend starts (a step or the cut) is handed the kept seal,
+    /// and none while none is kept. CONTROL: off macOS step 1 arms and
     /// takes nothing. The seal's reports go to the run's transcript, as the cutter's stderr
     /// reaches no log. NEGATIVE CONTROL: drop the hand-off from [`Real::scrubbed`], the arm
     /// from [`Real::seal_inputs`], or its transcript, and the children carry no seal, nothing
@@ -8831,21 +9083,16 @@ mod tests {
                 real.child("/usr/bin/true", None),
                 real.cut_command_of(exe(), &["cut".into()], &prover)
                     .unwrap(),
-                real.reexec_command(&prover, std::iter::empty()),
             ]
             .map(|cmd| seal(&cmd))
         };
         real.handed_inputs = || None;
-        assert_eq!(
-            children(&real),
-            [None, None, None],
-            "none kept, none handed"
-        );
+        assert_eq!(children(&real), [None, None], "none kept, none handed");
         real.handed_inputs = || Some(PathBuf::from("/state/aterm-release/inputs-seal/k.toml"));
         let kept = Some(std::ffi::OsString::from(
             "/state/aterm-release/inputs-seal/k.toml",
         ));
-        assert_eq!(children(&real), [kept.clone(), kept.clone(), kept]);
+        assert_eq!(children(&real), [kept.clone(), kept]);
     }
 
     #[test]
@@ -8899,6 +9146,58 @@ mod tests {
             at("one\n") < at("two\n") && at("two\n") < at("three\n"),
             "{log}"
         );
+    }
+
+    /// The direct child exits only after its background descendant holds the shared output
+    /// writer. The zero drain grace makes the step cancel immediately, and its witness must say
+    /// the pump is gone before the return. NEGATIVE CONTROL: discarding the pump's join handle
+    /// after the timed receive leaves the witness set until the descendant is released.
+    #[cfg(unix)]
+    #[test]
+    fn a_logged_step_joins_its_pump_when_a_grandchild_holds_the_pipe() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let go = dir.path().join("finish-after-return");
+        let finished = dir.path().join("grandchild-finished");
+        let token = dir.path().join("pump-token");
+        std::fs::write(&token, b"pump-read-before-direct-exit\n").unwrap();
+        let pump_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let real = Real::new(dir.path(), None, true, false).expect("a backend");
+        let log = real.step_log(Step::Sync);
+        let mut cmd = real.child("/bin/sh", None);
+        cmd.arg("-c")
+            .arg(
+                "(token=$(/bin/cat \"$2\"); printf '%s\\n' \"$token\"; \
+                 while [ ! -e \"$0\" ]; do /bin/sleep 0.01; done; : > \"$1\") & \
+                 token=$(/bin/cat \"$2\"); \
+                 while ! /usr/bin/grep -Fq \"$token\" \"$3\"; do /bin/sleep 0.01; done; exit 0",
+            )
+            .arg(&go)
+            .arg(&finished)
+            .arg(&token)
+            .arg(&log);
+        let ran = real.logged_in_with_drain(
+            Logged {
+                step: Step::Sync,
+                log,
+                stream: true,
+                stop: None,
+                push: None,
+                arrivals: false,
+            },
+            &mut cmd,
+            std::time::Duration::ZERO,
+            Some(pump_active.clone()),
+        );
+
+        let active_after_return = pump_active.load(std::sync::atomic::Ordering::SeqCst);
+        std::fs::write(&go, b"go").unwrap();
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the grandchild to finish after the pump assertion",
+            || finished.exists().then_some(()),
+        );
+        assert_eq!(ran.code, 0, "{ran:?}");
+        assert!(!active_after_return, "the output pump survived the return");
     }
 
     /// Each step child leaves one `step-child-finished` record after its output: its exit, when

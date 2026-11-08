@@ -6,7 +6,8 @@
 //! allocator that counts each thread's live bytes while that thread asks it to.
 #![cfg(target_vendor = "apple")]
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use aterm_bench::allocator::{Observed, Observer};
+use std::alloc::System;
 use std::cell::Cell;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -23,35 +24,23 @@ thread_local! {
 
 struct Counting;
 
-// SAFETY: every call forwards its pointer and layout unchanged to `System`; the counters are
-// constant thread-locals, which allocate nothing.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: the caller's valid layout, unchanged.
-        let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null() {
-            count(layout.size().cast_signed());
-        }
-        pointer
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        count(-layout.size().cast_signed());
-        // SAFETY: the matching pointer and layout, unchanged.
-        unsafe { System.dealloc(pointer, layout) };
+// SAFETY: constant, drop-free thread-locals and wrapping arithmetic neither allocate nor unwind.
+unsafe impl Observer for Counting {
+    fn retained(&self, old: usize, new: usize) {
+        count(new.cast_signed().wrapping_sub(old.cast_signed()));
     }
 }
 
 fn count(bytes: isize) {
     let _ = COUNTING.try_with(|on| {
         if on.get() {
-            let _ = LIVE.try_with(|live| live.set(live.get() + bytes));
+            let _ = LIVE.try_with(|live| live.set(live.get().wrapping_add(bytes)));
         }
     });
 }
 
 #[global_allocator]
-static ALLOCATOR: Counting = Counting;
+static ALLOCATOR: Observed<System, Counting> = Observed::new(System, Counting);
 
 /// A creation that finds another holding the spawn lock waits, takes the lock and leaves its
 /// thread's heap as it found it: the wait's own bookkeeping keeps nothing. A records write runs

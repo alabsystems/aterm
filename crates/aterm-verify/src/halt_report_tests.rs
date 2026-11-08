@@ -123,6 +123,7 @@ fn standin_halted_run() {
         &Show::default(),
         Seams {
             stage,
+            prepare_cells: None,
             admit_quiet: admit_in_scratch,
             admit_memory: admit_in_scratch,
         },

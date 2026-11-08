@@ -156,6 +156,7 @@ fn standin_run_reports_once_interrupted() {
         &Show::default(),
         Seams {
             stage,
+            prepare_cells: None,
             admit_quiet: admit_in_scratch,
             admit_memory: admit_in_scratch,
         },

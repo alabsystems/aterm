@@ -15,11 +15,90 @@ use crate::{
 };
 use aterm_json::json;
 use aterm_secrets::commons::roster::Role;
-use std::ops::RangeInclusive;
+use std::{ops::RangeInclusive, time::Duration};
 
 const DAY: u64 = EPOCH_S;
 /// Day 20,000 since the Unix epoch, a fixed clock for the tests that set one.
 const D: u64 = 20_000;
+
+#[test]
+#[cfg(unix)]
+fn native_claims_write_waits_for_unchanged_custody() {
+    native_claims_custody(true);
+}
+
+#[test]
+#[cfg(unix)]
+fn native_claims_own_table_waits_for_unchanged_custody() {
+    native_claims_custody(false);
+}
+
+#[cfg(unix)]
+fn native_claims_custody(writing: bool) {
+    let lab = Lab::new(&[Role::Writer]);
+    let now = at(D, 600);
+    write_at(&lab.paths[0], &row(1, now), now, Caps::default()).unwrap();
+    let held = aterm_uds::private_file::PrivateLock::take_with(
+        &lab.paths[0].dir,
+        "commons.lock",
+        Duration::ZERO,
+        "private custody held",
+        || {},
+    )
+    .unwrap();
+    let mut held = Some(held);
+    let result = aterm_uds::file_lock::with_lock_wait_observer(
+        move |_| {
+            if let Some(held) = held.take() {
+                drop(held);
+            }
+        },
+        || {
+            let started = Instant::now() - Duration::from_secs(3);
+            if writing {
+                write_started(&lab.paths[0], &row(2, now), now, Caps::default(), started)
+            } else {
+                own_table_started(
+                    &lab.paths[0],
+                    now,
+                    started + Duration::from_secs(60),
+                    started,
+                )
+                .map(|_| ())
+            }
+        },
+    );
+    assert!(result.is_ok(), "writing={writing}: {result:?}");
+    let held = aterm_uds::private_file::PrivateLock::take_with(
+        &lab.paths[0].dir,
+        "commons.lock",
+        Duration::ZERO,
+        "private custody held",
+        || {},
+    )
+    .unwrap();
+    let started = Instant::now();
+    assert!(
+        own_table_started(
+            &lab.paths[0],
+            now,
+            started - Duration::from_secs(1),
+            started
+        )
+        .is_err()
+    );
+    assert!(
+        write_started(
+            &lab.paths[0],
+            &row(3, now),
+            now,
+            Caps::default(),
+            started - Duration::from_secs(61)
+        )
+        .is_err()
+    );
+    drop(held);
+}
 
 #[test]
 #[cfg(unix)]

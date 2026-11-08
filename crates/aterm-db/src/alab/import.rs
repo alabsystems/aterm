@@ -922,7 +922,28 @@ struct ReadNow<'a> {
     settled: bool,
 }
 
-impl ReadNow<'_> {
+impl<'a> ReadNow<'a> {
+    /// What `input` reads: only what an earlier import of one of these sources wrote is ever
+    /// retracted, so a run that reads one sheet leaves the other sheet's cells.
+    fn of(input: &'a Input<'a>) -> Self {
+        Self {
+            kinds: input
+                .sheets
+                .iter()
+                .map(|sheet| sheet.kind)
+                .filter(|kind| !input.unread.contains(kind))
+                .map(SheetKind::word)
+                .chain((!input.macs.is_empty()).then_some("swarm-roster"))
+                .collect(),
+            files: input
+                .sheets
+                .iter()
+                .filter(|sheet| sheet.kind.several())
+                .collect(),
+            settled: input.sheets.iter().all(|sheet| sheet.conflicted.is_empty()),
+        }
+    }
+
     /// Whether the source row `row`, key `pk`, is one this run read and can take back from.
     fn covers(&self, pk: &str, row: &cell::Row) -> bool {
         let Some(kind) = row.get("kind").and_then(Value::as_str) else {
@@ -931,6 +952,18 @@ impl ReadNow<'_> {
         self.settled
             && self.kinds.contains(kind)
             && (!several_word(kind) || self.files.iter().any(|sheet| sheet.said(pk, row)))
+    }
+
+    /// Whether the source row `row`, key `pk`, is one this run reads as it is: what it wrote and no
+    /// longer states, `finish` takes back (`own`), where what an edited replica's earlier import
+    /// wrote is only reported.
+    fn reads_as_written(&self, pk: &str, row: &cell::Row) -> bool {
+        let Some(kind) = row.get("kind").and_then(Value::as_str) else {
+            return false;
+        };
+        self.settled
+            && self.kinds.contains(kind)
+            && (!several_word(kind) || self.files.iter().any(|sheet| sheet.wrote(pk, row)))
     }
 }
 
@@ -972,6 +1005,21 @@ fn decide(field: Option<&Field>, same: impl Fn(&Value) -> bool, mode: Mode, own:
     }
 }
 
+/// Whether the source row `wrote` records a dump's phones table, the one source that states a
+/// phone's label.
+fn states_phone_labels(wrote: &cell::Row) -> bool {
+    let phones = DUMP_TABLES
+        .iter()
+        .find(|(_, table, _)| *table == Dump::Phones)
+        .map(|(word, _, _)| *word);
+    wrote.get("kind").and_then(Value::as_str) == Some(SheetKind::FleetDb(Dump::Phones).word())
+        && wrote
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|name| name.rsplit_once('#'))
+            .is_some_and(|(_, table)| Some(table) == phones)
+}
+
 /// The source row of the one value `field` holds, with its key, if an import wrote it.
 fn source_row<'p>(field: &Field, sources: &'p Projection) -> Option<(&'p str, &'p cell::Row)> {
     let Field::Value(candidate) = field else {
@@ -981,6 +1029,86 @@ fn source_row<'p>(field: &Field, sources: &'p Projection) -> Option<(&'p str, &'
         .rows
         .get_key_value(candidate.value.s.as_deref()?)
         .map(|(pk, row)| (pk.as_str(), row))
+}
+
+/// Reorder the entries of `rows` in `slots` (each one's place and key) that `frees_first` pairs,
+/// among the places they take up, so a row freeing a name comes before the row taking it; a pair of
+/// one row frees nothing. Rows trading names have no such order: one goes first whose every row
+/// freeing it a name takes one back from it, so only names two rows trade are on both, and the next
+/// run finishes what a cut left. A ring of rows each taking a name from the next has no such row:
+/// one of it goes first. A row that only takes a name, or takes one from a row it trades nothing
+/// with, still waits for the row freeing it.
+fn free_names_first(
+    rows: &mut [Vec<Change>],
+    slots: &[(usize, String)],
+    frees_first: &[(String, String)],
+) {
+    // Every row `pk` waits on, directly or through the rows those wait on, among the rows left.
+    fn waits_on<'a>(
+        frees_first: &'a [(String, String)],
+        left: &BTreeSet<&str>,
+        pk: &str,
+    ) -> BTreeSet<&'a str> {
+        let mut found = BTreeSet::new();
+        let mut todo = vec![pk.to_owned()];
+        while let Some(at) = todo.pop() {
+            for (frees, _) in frees_first.iter().filter(|(frees, takes)| {
+                *takes == at && frees != takes && left.contains(frees.as_str())
+            }) {
+                if found.insert(frees.as_str()) {
+                    todo.push(frees.clone());
+                }
+            }
+        }
+        found
+    }
+    let mut left: BTreeSet<&str> = frees_first
+        .iter()
+        .flat_map(|(frees, takes)| [frees.as_str(), takes.as_str()])
+        .filter(|pk| slots.iter().any(|(_, slot)| slot == pk))
+        .collect();
+    let mut places = Vec::new();
+    let mut entries = Vec::new();
+    // The first row in key order that waits on nothing left. Else, every row left waiting on
+    // another: the first whose every row left freeing it a name takes one from it in turn, so
+    // writing it first puts on two rows only names it trades with another row. Else, rows in rings
+    // only: the first that every row it waits on waits on in turn, a ring waiting on no row outside
+    // it, so the name its write puts on two rows is one the ring moves among itself.
+    let trades = |left: &BTreeSet<&str>, pk: &str| {
+        frees_first
+            .iter()
+            .filter(|(frees, takes)| {
+                takes.as_str() == pk && frees != takes && left.contains(frees.as_str())
+            })
+            .all(|(frees, _)| {
+                frees_first
+                    .iter()
+                    .any(|(back, to)| back.as_str() == pk && to == frees)
+            })
+    };
+    while let Some(next) = left
+        .iter()
+        .copied()
+        .find(|pk| waits_on(frees_first, &left, pk).is_empty())
+        .or_else(|| left.iter().copied().find(|pk| trades(&left, pk)))
+        .or_else(|| {
+            left.iter().copied().find(|pk| {
+                waits_on(frees_first, &left, pk)
+                    .iter()
+                    .all(|other| waits_on(frees_first, &left, other).contains(pk))
+            })
+        })
+    {
+        left.remove(next);
+        if let Some((slot, _)) = slots.iter().find(|(_, pk)| pk == next) {
+            places.push(*slot);
+            entries.push(std::mem::take(&mut rows[*slot]));
+        }
+    }
+    places.sort_unstable();
+    for (place, entry) in places.into_iter().zip(entries) {
+        rows[place] = entry;
+    }
 }
 
 /// Whether `field` holds what an earlier import of a source this run read wrote. Only such a cell
@@ -1057,6 +1185,21 @@ struct Planner<'a> {
     statuses: Vec<(String, String, Coord)>,
     /// Every machine name a sheet stated so far this run.
     stated: BTreeSet<String>,
+    /// The roster's labels another row held when they were read, each with its key and coordinate,
+    /// until the roster has moved every row it moves.
+    label_waits: Vec<(String, String, Coord)>,
+    /// Pairs of machine rows, the first freeing a name the second takes: the first's write reaches the
+    /// log first, so a run cut short, or a replica part way through, never shows the name on two rows.
+    frees_first: Vec<(String, String)>,
+    /// Each machine row's names a table states of another row, which this plan could not move: the
+    /// finding says so, and they stay until a source or the row settles it.
+    names_kept: BTreeMap<String, BTreeSet<String>>,
+    /// Each machine row's names an earlier pass of this plan gave up although the node or the host
+    /// it then wanted for the row reaches them ([`Planner::reached_later`]): they stay from the start.
+    names_reached: BTreeMap<String, BTreeSet<String>>,
+    /// The machine rows the roster found by the principal their Mac published (`node`): its `active`
+    /// replaces the `planned` any import wrote, since the Mac has joined.
+    joined: BTreeSet<String>,
 }
 
 /// The digits of a phone number as the registry keeps them: ASCII digits only, a US number's
@@ -1139,56 +1282,87 @@ fn roster_source(macs: &[KnownMac]) -> (String, String) {
 
 /// Plan an import of `input` over the registry's `cells`.
 ///
+/// A pass that gave a row's name up, while the node or host it came to want for that row reaches
+/// the name, plans again keeping it from the start: what a source states beside a name then still
+/// tells the row it, whichever source the run read first. Each pass keeps one more name, so passes
+/// end.
+///
 /// # Errors
 /// A value the importer built breaks its column's type, which is a bug, not a sheet problem
 /// (sheet problems are findings).
 pub fn plan(input: &Input<'_>, cells: &Cells) -> Result<Plan> {
-    let current: BTreeMap<&'static str, Projection> = [
-        &ADDRESS,
-        &ACCOUNT,
-        &MACHINE,
-        &PREFERENCE,
-        &MAILBOX,
-        &PHONE,
-        &SOURCE,
-    ]
-    .into_iter()
-    .map(|collection| (collection.name, cell::project(collection, cells)))
-    .collect();
-    let address_index = AddressIndex::of(&current[ADDRESS.name]);
-    let mut planner = Planner {
-        input,
-        current,
-        address_index,
-        rows: BTreeMap::new(),
-        findings: BTreeSet::new(),
-        phones: BTreeMap::new(),
-        protected: BTreeSet::new(),
-        decided: BTreeMap::new(),
-        placed: BTreeMap::new(),
-        unsettled: BTreeSet::new(),
-        unsettled_logins: BTreeSet::new(),
-        address_unread: false,
-        corrected: BTreeSet::new(),
-        listed: BTreeMap::new(),
-        minted_labels: BTreeSet::new(),
-        placeholder_labels: BTreeSet::new(),
-        no_account: BTreeSet::new(),
-        roster: roster_source(input.macs),
-        logins: listed_logins(input.sheets),
-        links: names::NameLinks::read(input.sheets, input.macs),
-        statuses: Vec::new(),
-        stated: BTreeSet::new(),
-    };
-    let mut order: Vec<usize> = (0..input.sheets.len()).collect();
-    order.sort_by_key(|&n| (input.sheets[n].mode, input.sheets[n].kind));
-    planner.dump_marks();
-    for n in order {
-        planner.sheet(n)?;
+    let mut names_reached = BTreeMap::new();
+    loop {
+        let mut planner = Planner::new(input, cells, names_reached);
+        let mut order: Vec<usize> = (0..input.sheets.len()).collect();
+        order.sort_by_key(|&n| (input.sheets[n].mode, input.sheets[n].kind));
+        planner.dump_marks();
+        for n in order {
+            planner.sheet(n)?;
+        }
+        planner.aliases();
+        planner.known_macs();
+        let later = planner.reached_later();
+        if later.is_empty() {
+            planner.names_given_up();
+            return planner.finish();
+        }
+        names_reached = std::mem::take(&mut planner.names_reached);
+        for (pk, names) in later {
+            names_reached.entry(pk).or_default().extend(names);
+        }
     }
-    planner.aliases();
-    planner.known_macs();
-    planner.finish()
+}
+
+impl<'a> Planner<'a> {
+    fn new(
+        input: &'a Input<'a>,
+        cells: &Cells,
+        names_reached: BTreeMap<String, BTreeSet<String>>,
+    ) -> Self {
+        let current: BTreeMap<&'static str, Projection> = [
+            &ADDRESS,
+            &ACCOUNT,
+            &MACHINE,
+            &PREFERENCE,
+            &MAILBOX,
+            &PHONE,
+            &SOURCE,
+        ]
+        .into_iter()
+        .map(|collection| (collection.name, cell::project(collection, cells)))
+        .collect();
+        let address_index = AddressIndex::of(&current[ADDRESS.name]);
+        Self {
+            input,
+            current,
+            address_index,
+            rows: BTreeMap::new(),
+            findings: BTreeSet::new(),
+            phones: BTreeMap::new(),
+            protected: BTreeSet::new(),
+            decided: BTreeMap::new(),
+            placed: BTreeMap::new(),
+            unsettled: BTreeSet::new(),
+            unsettled_logins: BTreeSet::new(),
+            address_unread: false,
+            corrected: BTreeSet::new(),
+            listed: BTreeMap::new(),
+            minted_labels: BTreeSet::new(),
+            placeholder_labels: BTreeSet::new(),
+            no_account: BTreeSet::new(),
+            roster: roster_source(input.macs),
+            logins: listed_logins(input.sheets),
+            links: names::NameLinks::read(input.sheets, input.macs),
+            statuses: Vec::new(),
+            stated: BTreeSet::new(),
+            label_waits: Vec::new(),
+            frees_first: Vec::new(),
+            names_kept: BTreeMap::new(),
+            names_reached,
+            joined: BTreeSet::new(),
+        }
+    }
 }
 
 fn coord(sheet: &Sheet, n: usize, row: usize, col: usize) -> Coord {
@@ -2826,6 +3000,9 @@ impl Planner<'_> {
             unsettled_logins,
             address_unread,
             links,
+            frees_first,
+            names_kept,
+            joined: joined_rows,
             ..
         } = self;
         let mut plan = Plan {
@@ -2835,24 +3012,8 @@ impl Planner<'_> {
         let collections = [&ADDRESS, &ACCOUNT, &MACHINE, &PREFERENCE, &MAILBOX, &PHONE];
         let mut touched_rows: BTreeSet<(usize, &'static str, String)> = BTreeSet::new();
         let mut written_rows = Vec::new();
-        // The sources read this run: only what an earlier import of one of them wrote is ever
-        // retracted, so a run that reads one sheet leaves the other sheet's cells.
-        let read = ReadNow {
-            kinds: input
-                .sheets
-                .iter()
-                .map(|sheet| sheet.kind)
-                .filter(|kind| !input.unread.contains(kind))
-                .map(SheetKind::word)
-                .chain((!input.macs.is_empty()).then_some("swarm-roster"))
-                .collect(),
-            files: input
-                .sheets
-                .iter()
-                .filter(|sheet| sheet.kind.several())
-                .collect(),
-            settled: input.sheets.iter().all(|sheet| sheet.conflicted.is_empty()),
-        };
+        let mut machine_slots: Vec<(usize, String)> = Vec::new();
+        let read = ReadNow::of(input);
         // The `+tag` rule's cells move only on a run that can see the owner's corrections.
         let logins_read = read.kinds.contains(SheetKind::Logins.word());
         let sources = &current[SOURCE.name];
@@ -3000,11 +3161,25 @@ impl Planner<'_> {
                         Some(elem) => format!("{column}.{elem}"),
                         None => column.to_owned(),
                     };
+                    // `planned` is the word a machine row holds until its Mac joins, whichever
+                    // import wrote it: the roster's `active` on a row its Mac published its
+                    // principal on says the Mac has.
+                    let joined = joined_rows.contains(pk.as_str())
+                        && x == json!("active")
+                        && field.and_then(Field::value) == Some(&json!("planned"));
+                    // A phone label only a dump's phones table states: one another import wrote
+                    // is a label it made up for a phone no source labelled, which a stated one
+                    // replaces.
+                    let invented = name == PHONE.name
+                        && column == "label"
+                        && field
+                            .and_then(|field| source_row(field, sources))
+                            .is_some_and(|(_, wrote)| !states_phone_labels(wrote));
                     let mut decided = decide(
                         field,
                         |held| *held == x,
                         mode_of(cell_sheet),
-                        own(field, cell_sheet),
+                        own(field, cell_sheet) || joined || invented,
                     );
                     // Provenance moves with a value: another source's coordinates are kept, quietly.
                     if decided == Decided::Differs && matches!(column, "src" | "notes_src") {
@@ -3222,7 +3397,10 @@ impl Planner<'_> {
                                             .get(column.as_str())
                                             .is_some_and(|elems| elems.contains_key(elem))
                                         && !(name == MACHINE.name
-                                            && Self::linked_to(&links, row, elem))
+                                            && (Self::linked_to(&links, row, elem)
+                                                || names_kept
+                                                    .get(pk)
+                                                    .is_some_and(|kept| kept.contains(elem))))
                                         && let Some((ret_sheet, ret_source)) = retract_source(field)
                                     {
                                         if own(Some(field), ret_sheet) {
@@ -3380,10 +3558,14 @@ impl Planner<'_> {
                         .insert((name, pk.clone(), column));
                 }
                 if !changes.is_empty() {
+                    if name == MACHINE.name {
+                        machine_slots.push((written_rows.len(), pk.clone()));
+                    }
                     written_rows.push(changes);
                 }
             }
         }
+        free_names_first(&mut written_rows, &machine_slots, &frees_first);
         // A preference an earlier import wrote that no source states now ends, three-way: a row
         // with an owner's cell on it stays and is a finding, and an account with a cell this run
         // could not read keeps its rows, as does every row when a file or an address cell could

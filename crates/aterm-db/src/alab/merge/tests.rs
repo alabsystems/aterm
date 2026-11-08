@@ -26,6 +26,8 @@ const NODE: &str = "00112233445566778899aabbccddeeff";
 const OTHER_NODE: &str = "ffeeddccbbaa99887766554433221100";
 const KEY: [u8; 32] = [0x5a; 32];
 const ANN: &str = "ann@example.invalid";
+/// A hold's `why` and what writes its cause into a book, given the two keys its case names.
+type Shape = (&'static str, fn(&mut Book, &str, &str));
 
 fn roster_of(labels: &[&str]) -> Roster {
     labels
@@ -34,12 +36,20 @@ fn roster_of(labels: &[&str]) -> Roster {
         .collect()
 }
 
+/// A plan with a facts row naming each of `bound` as its Mac's row.
 fn run(cells: &Cells, bound: &[&str], roster: &[&str]) -> Plan {
-    let bound = bound.iter().map(|pk| (*pk).to_owned()).collect();
+    let facts = bound
+        .iter()
+        .map(|pk| (Some((*pk).to_owned()), None))
+        .collect();
+    run_facts(cells, facts, roster)
+}
+
+fn run_facts(cells: &Cells, facts: Vec<(Option<String>, Option<String>)>, roster: &[&str]) -> Plan {
     plan(
         &cell::project(&MACHINE, cells),
         &cell::project(&PREFERENCE, cells),
-        &bound,
+        &Facts::new(facts),
         &roster_of(roster),
     )
     .unwrap()
@@ -1104,7 +1114,7 @@ fn plan_with(cells: &Cells, roster: &Roster) -> Plan {
     plan(
         &cell::project(&MACHINE, cells),
         &cell::project(&PREFERENCE, cells),
-        &BTreeSet::new(),
+        &Facts::default(),
         roster,
     )
     .unwrap()
@@ -1239,6 +1249,98 @@ fn with_no_roster_name_the_node_bound_row_keeps_its_label() {
     assert_eq!(kept.fields["aliases"].members(), BTreeSet::from(["m104"]));
 }
 
+/// A Mac the roster names otherwise than it registered keeps two rows that share no name: its own,
+/// bound to its node under the label it went by, and the row an import gave the roster's name. The
+/// roster ties them: the row with no node folds into the node-bound row, which takes the roster's
+/// name and keeps its own as an alias, and a plan over the result is empty. A named row holding a
+/// node of its own, a name two rows answer, or a node two rows hold, ties nothing.
+/// NEGATIVE CONTROL: with no roster ties: `left: 0 right: 1` at `merges.len()`. With a named row
+/// holding a node tied too, the pair is held: `Plan { merges: [], held: [Held { rows: [..], names:
+/// ["m164", "m91"], why: "two-macs" }], ..`. With the first of two rows answering the name tied, the
+/// merge folds both: `Plan { merges: [Merge { .., gone: ["mc-696c4977a99298d5",
+/// "mc-daa06bd2720cb8db"], ..`. With the first of two rows holding the node tied: `Plan { merges:
+/// [Merge { keep: "mc-1c9fe56a93607a37", ..`.
+#[test]
+fn a_mac_the_roster_names_otherwise_folds_its_two_rows() {
+    let principal = "0011223344556677";
+    let roster: Roster = BTreeMap::from([(
+        "m164".to_owned(),
+        BTreeMap::from([("node", principal.to_owned())]),
+    )]);
+    let shape = |book: &mut Book| {
+        let (own, named) = (keys::machine_pk("m91"), keys::machine_pk("m164"));
+        machine_row(
+            book,
+            &own,
+            "m91",
+            vec![
+                put(&MACHINE, &own, "node", json!(principal)),
+                put(&MACHINE, &own, "status", json!("active")),
+            ],
+        );
+        machine_row(
+            book,
+            &named,
+            "m164",
+            vec![put(&MACHINE, &named, "status", json!("planned"))],
+        );
+        (own, named)
+    };
+    let mut book = Book::new();
+    let (own, named) = shape(&mut book);
+    let first = plan_with(&book.cells(), &roster);
+    assert_eq!(first.merges.len(), 1, "{first:?}");
+    assert_eq!(first.merges[0].keep, own);
+    assert_eq!(first.merges[0].gone, std::slice::from_ref(&named));
+    assert_eq!(first.merges[0].label_to, "m164");
+    let cells = apply(&mut book, &first);
+    let kept = row(&cells, &own);
+    assert_eq!(kept.get("label"), Some(&json!("m164")));
+    assert_eq!(kept.get("status"), Some(&json!("active")));
+    assert_eq!(kept.fields["aliases"].members(), BTreeSet::from(["m91"]));
+    assert!(!row(&cells, &named).live());
+    let again = plan_with(&cells, &roster);
+    assert!(again.rows.is_empty(), "{again:?}");
+
+    let mut book = Book::new();
+    let (_, named) = shape(&mut book);
+    book.write(
+        2,
+        &[],
+        vec![put(&MACHINE, &named, "fleet_node", json!(OTHER_NODE))],
+    );
+    let apart = plan_with(&book.cells(), &roster);
+    assert!(
+        apart.merges.is_empty() && apart.held.is_empty(),
+        "{apart:?}"
+    );
+    let mut book = Book::new();
+    let (own, _) = shape(&mut book);
+    let third = keys::machine_pk("m7");
+    machine_row(
+        &mut book,
+        &third,
+        "m7",
+        vec![elem(&MACHINE, &third, "aliases", "m164")],
+    );
+    let two = plan_with(&book.cells(), &roster);
+    assert!(
+        two.merges.is_empty() && two.held.iter().all(|held| !held.rows.contains(&own)),
+        "{two:?}"
+    );
+    let mut book = Book::new();
+    shape(&mut book);
+    let twin = keys::machine_pk("m8");
+    machine_row(
+        &mut book,
+        &twin,
+        "m8",
+        vec![put(&MACHINE, &twin, "node", json!(principal))],
+    );
+    let twice = plan_with(&book.cells(), &roster);
+    assert!(twice.merges.is_empty(), "{twice:?}");
+}
+
 /// A run cut short after any record finishes on the next: each preference moves whole with its end,
 /// a carried cell moves before the row it came from ends, and the names change with the duplicate's
 /// end, so a reader never sees a name on none of the rows, and the second run writes only what the
@@ -1294,4 +1396,790 @@ fn a_run_cut_short_finishes_on_the_next() {
         assert_eq!(on_keep.get("rank"), Some(&json!(1)), "cut {cut}");
         assert!(run(&cells, &[], &["m104"]).rows.is_empty(), "cut {cut}");
     }
+}
+
+/// A row an import wrote, with a word of `status`.
+fn imported_row(pk: &str, label: &str, status: &str, more: Vec<Change>) -> Vec<Change> {
+    let cell = |col: &str, x: Value| {
+        cell::change(
+            &MACHINE,
+            CellKey {
+                pk,
+                col,
+                elem: None,
+            },
+            &CellValue::imported(MACHINE.version, x, "sr-0123456789abcdef"),
+        )
+        .unwrap()
+    };
+    let mut changes = vec![
+        cell("label", json!(label)),
+        cell("row", json!("live")),
+        cell("status", json!(status)),
+    ];
+    changes.extend(more);
+    changes
+}
+
+/// A live preference a Mac wrote on a row since merged moves along its `merged_into`, also along a
+/// chain of them and onto the row a merge in this very plan keeps, and a plan over the result is
+/// empty. One that reaches no live row, or that a merge would hold for, is held and left.
+/// NEGATIVE CONTROL: with no `move_strays`: `left: 0 right: 1` at `strays.len()`. With `merge_target`
+/// ignoring this plan's merges, or a stray listed apart from the merge that keeps its row, the move
+/// lands in `strays`: `Plan { .. strays: [Moved { from: ..`. With one hop of `merged_into`:
+/// `left: 0 right: 1` at `moved.len()`. With a merged row holding no live preference counted:
+/// `left: 2 right: 1` at `held.len()`. With any row counted as merged, a plan over the result writes:
+/// `assertion failed: run(&cells, &[], &["m104"]).rows.is_empty()`. With each hold off (a preference or
+/// the one it would move onto that this build cannot read or that is in dispute, a `merged_into` this
+/// build cannot read, a row a Mac's facts name, a chain through a row not merged), the move goes on:
+/// `Plan { merges: [], held: [], strays: [Moved { ..`. With a disputed `merged_into` followed, it
+/// reads as no target: `left: "no-merge-target" right: "conflicted"`. With only the stray's own row
+/// held to `bound`, a chain through a bound merged row moves on: `Plan { merges: [], held: [],
+/// strays: [Moved { ..`. With a bound live row at its end held too: `Plan { merges: [], held:
+/// [Held { rows: ["mc-2042463f4ef5fb03"], names: [], why: "bound-by-its-mac" }], ..`. With no Mac's
+/// facts read as rebound, a Mac gone along the merge still holds it: that same `held: [Held { ..`.
+/// With every Mac read as rebound, or only the first row the chain passes checked, a chain through
+/// a bound row moves on: `Plan { merges: [], held: [], strays: [Moved { ..`; with a Mac that
+/// rebound anywhere read as gone along the merge: `left: 0 right: 1` at `held.len()`.
+#[test]
+fn a_preference_on_a_merged_row_moves_along_its_merge() {
+    let mut book = Book::new();
+    let (keep, gone) = two_rows(&mut book);
+    let merged = run(&book.cells(), &[], &["m104"]);
+    apply(&mut book, &merged);
+    let stray = preference(&mut book, &gone, Some(3));
+    let target = keys::preference_pk(&keep, &account()).unwrap();
+    let plan = run(&book.cells(), &[], &["m104"]);
+    assert!(plan.merges.is_empty(), "{:?}", plan.merges);
+    assert!(plan.held.is_empty(), "{:?}", plan.held);
+    assert_eq!(plan.strays.len(), 1, "{plan:?}");
+    assert_eq!(plan.strays[0].from, stray);
+    assert_eq!(plan.strays[0].to, target);
+    assert_eq!(plan.strays[0].how, How::Moved);
+    assert_eq!(plan.report()["strays"][0]["to"], json!(target));
+    let cells = apply(&mut book, &plan);
+    let preferences = cell::project(&PREFERENCE, &cells);
+    assert!(!preferences.rows[&stray].live());
+    assert!(preferences.rows[&target].live());
+    assert_eq!(preferences.rows[&target].get("rank"), Some(&json!(3)));
+    assert!(run(&cells, &[], &["m104"]).rows.is_empty());
+
+    // Along a chain, and onto what a merge in this plan keeps.
+    let merged_row = |pk: &str, label: &str, into: &str| {
+        vec![
+            put(&MACHINE, pk, "label", json!(label)),
+            put(&MACHINE, pk, "merged_into", json!(into)),
+            put(&MACHINE, pk, "row", json!("merged")),
+        ]
+    };
+    let mut book = Book::new();
+    let (keep, gone) = two_rows(&mut book);
+    let (first, second) = (keys::machine_pk("m1"), keys::machine_pk("m2"));
+    book.write(2, &[], merged_row(&first, "m1", &second));
+    book.write(2, &[], merged_row(&second, "m2", &gone));
+    let stray = preference(&mut book, &first, Some(1));
+    let plan = run(&book.cells(), &[], &["m104"]);
+    assert_eq!(plan.merges.len(), 1, "{:?}", plan.held);
+    assert!(plan.strays.is_empty(), "{plan:?}");
+    let moved = &plan.merges[0].preferences;
+    assert_eq!(moved.len(), 1, "{plan:?}");
+    assert_eq!(moved[0].from, stray);
+    assert_eq!(moved[0].to, keys::preference_pk(&keep, &account()).unwrap());
+    assert!(
+        run(&apply(&mut book, &plan), &[], &["m104"])
+            .rows
+            .is_empty()
+    );
+
+    // A `merged_into` that reaches nothing live: a cycle, then a key no row has.
+    for into in ["m2", "m9"] {
+        let mut book = Book::new();
+        let (first, second) = (keys::machine_pk("m1"), keys::machine_pk(into));
+        book.write(2, &[], merged_row(&first, "m1", &second));
+        if into == "m2" {
+            book.write(2, &[], merged_row(&second, "m2", &first));
+        }
+        let stray = preference(&mut book, &first, Some(1));
+        let plan = run(&book.cells(), &[], &[]);
+        assert!(plan.rows.is_empty(), "{plan:?}");
+        assert_eq!(plan.held.len(), 1, "{plan:?}");
+        assert_eq!(plan.held[0].why, "no-merge-target");
+        assert!(!stray.is_empty());
+    }
+
+    // A `merged_into` through a row that is not merged ends there.
+    let mut book = Book::new();
+    let (first, second, third) = (
+        keys::machine_pk("m1"),
+        keys::machine_pk("m2"),
+        keys::machine_pk("m3"),
+    );
+    book.write(2, &[], merged_row(&first, "m1", &second));
+    book.write(
+        2,
+        &[],
+        vec![
+            put(&MACHINE, &second, "label", json!("m2")),
+            put(&MACHINE, &second, "merged_into", json!(third)),
+            put(&MACHINE, &second, "row", json!("retired")),
+        ],
+    );
+    machine_row(&mut book, &third, "m3", Vec::new());
+    preference(&mut book, &first, Some(1));
+    let plan = run(&book.cells(), &[], &[]);
+    assert!(plan.rows.is_empty(), "{plan:?}");
+    assert_eq!(plan.held.len(), 1, "{plan:?}");
+    assert_eq!(plan.held[0].why, "no-merge-target");
+
+    // A `merged_into` through a merged row a Mac's facts name stops there, the live row it ends at
+    // bound or not; a bound live row at its end alone takes the move.
+    let mut book = Book::new();
+    let (first, second, third) = (
+        keys::machine_pk("m1"),
+        keys::machine_pk("m2"),
+        keys::machine_pk("m3"),
+    );
+    book.write(2, &[], merged_row(&first, "m1", &second));
+    book.write(2, &[], merged_row(&second, "m2", &third));
+    machine_row(&mut book, &third, "m3", Vec::new());
+    preference(&mut book, &first, Some(1));
+    for bound in [vec![second.as_str()], vec![second.as_str(), third.as_str()]] {
+        let plan = run(&book.cells(), &bound, &[]);
+        assert!(plan.rows.is_empty(), "{plan:?}");
+        assert_eq!(plan.held.len(), 1, "{plan:?}");
+        assert_eq!(plan.held[0].why, "bound-by-its-mac");
+        assert_eq!(plan.held[0].rows, std::slice::from_ref(&first));
+    }
+    let plan = run(&book.cells(), &[third.as_str()], &[]);
+    assert!(plan.held.is_empty(), "{plan:?}");
+    assert_eq!(plan.strays.len(), 1, "{plan:?}");
+    // A Mac whose facts show it rebound from a row to one further along the chain has moved off it,
+    // at either hop; a Mac still on it, one that rebound onto it, or one that went elsewhere holds
+    // the move.
+    let facts = |rows: &[(&str, Option<&str>)]| {
+        rows.iter()
+            .map(|(mac, into)| (Some((*mac).to_owned()), into.map(str::to_owned)))
+            .collect::<Vec<_>>()
+    };
+    for rebound in [
+        facts(&[(&second, Some(&third))]),
+        facts(&[(&first, Some(&third))]),
+        facts(&[(&first, Some(&third)), (&second, Some(&third))]),
+    ] {
+        let plan = run_facts(&book.cells(), rebound, &[]);
+        assert!(plan.held.is_empty(), "{plan:?}");
+        assert_eq!(plan.strays.len(), 1, "{plan:?}");
+    }
+    let other = keys::machine_pk("m9");
+    for holding in [
+        facts(&[(&second, Some(&third)), (&second, None)]),
+        facts(&[(&second, Some(&third)), (&other, Some(&second))]),
+        facts(&[(&first, Some(&second))]),
+        facts(&[(&second, Some(&first))]),
+        facts(&[(&first, Some(&other))]),
+    ] {
+        let plan = run_facts(&book.cells(), holding, &[]);
+        assert_eq!(plan.held.len(), 1, "{plan:?}");
+        assert_eq!(plan.held[0].why, "bound-by-its-mac");
+    }
+
+    // What a merge holds for holds the move.
+    let shapes: [Shape; 4] = [
+        ("conflicted", |book, stray, _| {
+            book.write(3, &[], vec![put(&PREFERENCE, stray, "rank", json!(9))]);
+        }),
+        ("conflicted", |book, _, target| {
+            for (replica, rank) in [(3, 7), (4, 8)] {
+                book.write(
+                    replica,
+                    &[],
+                    vec![put(&PREFERENCE, target, "rank", json!(rank))],
+                );
+            }
+        }),
+        ("unreadable", |book, stray, _| {
+            book.write(
+                3,
+                &[],
+                vec![Change {
+                    collection: PREFERENCE.name.to_owned(),
+                    key: format!("{stray}.machine"),
+                    value: Some(json!("not a cell")),
+                }],
+            );
+        }),
+        ("unreadable", |book, _, target| {
+            book.write(
+                3,
+                &[],
+                vec![Change {
+                    collection: PREFERENCE.name.to_owned(),
+                    key: format!("{target}.machine"),
+                    value: Some(json!("not a cell")),
+                }],
+            );
+        }),
+    ];
+    for (why, shape) in shapes {
+        let mut book = Book::new();
+        let (keep, gone) = two_rows(&mut book);
+        let merged = run(&book.cells(), &[], &["m104"]);
+        apply(&mut book, &merged);
+        let stray = preference(&mut book, &gone, Some(3));
+        let target = keys::preference_pk(&keep, &account()).unwrap();
+        shape(&mut book, &stray, &target);
+        let plan = run(&book.cells(), &[], &["m104"]);
+        assert!(plan.strays.is_empty(), "{why} {plan:?}");
+        assert!(plan.rows.is_empty(), "{why} {plan:?}");
+        assert_eq!(plan.held.len(), 1, "{plan:?}");
+        assert_eq!(plan.held[0].why, why);
+        assert_eq!(plan.held[0].rows, [gone]);
+    }
+
+    // A `merged_into` that cannot be told holds the move, as does a row a Mac's facts still name.
+    let shapes: [Shape; 3] = [
+        ("unreadable", |book, gone, _| {
+            book.write(
+                3,
+                &[],
+                vec![Change {
+                    collection: MACHINE.name.to_owned(),
+                    key: format!("{gone}.merged_into"),
+                    value: Some(json!("not a cell")),
+                }],
+            );
+        }),
+        ("conflicted", |book, gone, keep| {
+            let other = keys::machine_pk("m9");
+            machine_row(book, &other, "m9", Vec::new());
+            for (replica, into) in [(3, keep), (4, other.as_str())] {
+                book.write(
+                    replica,
+                    &[],
+                    vec![put(&MACHINE, gone, "merged_into", json!(into))],
+                );
+            }
+        }),
+        ("bound-by-its-mac", |_, _, _| {}),
+    ];
+    for (why, shape) in shapes {
+        let mut book = Book::new();
+        let (keep, gone) = two_rows(&mut book);
+        let merged = run(&book.cells(), &[], &["m104"]);
+        apply(&mut book, &merged);
+        preference(&mut book, &gone, Some(3));
+        shape(&mut book, &gone, &keep);
+        let bound: &[&str] = if why == "bound-by-its-mac" {
+            &[&gone]
+        } else {
+            &[]
+        };
+        let plan = run(&book.cells(), bound, &["m104"]);
+        assert!(plan.rows.is_empty(), "{why} {plan:?}");
+        assert_eq!(plan.held.len(), 1, "{why} {plan:?}");
+        assert_eq!(plan.held[0].why, why);
+        assert_eq!(plan.held[0].rows, [gone]);
+    }
+
+    // A preference on a row retired, not merged, is no stray: it stays where the owner left it.
+    let mut book = Book::new();
+    let retired = keys::machine_pk("m1");
+    book.write(
+        2,
+        &[],
+        vec![
+            put(&MACHINE, &retired, "label", json!("m1")),
+            put(&MACHINE, &retired, "row", json!("retired")),
+        ],
+    );
+    preference(&mut book, &retired, Some(1));
+    let plan = run(&book.cells(), &[], &[]);
+    assert!(plan.rows.is_empty(), "{plan:?}");
+    assert!(plan.held.is_empty(), "{plan:?}");
+}
+
+/// An import's `active` on a row no Mac has joined goes back to `planned` with its provenance, the
+/// word `register::pick` adopts a Mac's label by, and nothing else does: not the owner's word, nor a
+/// row with a principal, a host or a Mac's facts, a row merged or held, nor any row it cannot read. A
+/// plan over the result is empty, and a replica still saying `active` writes no status.
+/// NEGATIVE CONTROL: with each condition of `wait_for_macs` dropped, the row it spares joins the list:
+/// `left: [("mc-2042463f4ef5fb03", "m1"), ("mc-76c301532f85bec9", "m12"), ("mc-962e227ed7abc82b", "m4")]`
+/// for a host, and likewise for another word, the owner's word (`m2`), a principal or a Mac's facts, a
+/// conflict, a held row, and a label, status, node or host it cannot read. With no provenance on the
+/// write: `left: None right: Some("sr-0123456789abcdef")`.
+#[test]
+fn an_imports_active_on_a_row_no_mac_joined_goes_back_to_planned() {
+    let mut book = Book::new();
+    let pk = |label: &str| keys::machine_pk(label);
+    let raw = |pk: &str, col: &str| Change {
+        collection: MACHINE.name.to_owned(),
+        key: format!("{pk}.{col}"),
+        value: Some(json!("not a cell")),
+    };
+    let (m1, m2, m3, m4, m5, m6, m7) = (
+        pk("m1"),
+        pk("m2"),
+        pk("m3"),
+        pk("m4"),
+        pk("m5"),
+        pk("m6"),
+        pk("m7"),
+    );
+    let (m8, m9, m10, m11, m12, m13) = (
+        pk("m8"),
+        pk("m9"),
+        pk("m10"),
+        pk("m11"),
+        pk("m12"),
+        pk("m13"),
+    );
+    let held = pk("m14");
+    let held_too = pk("m14/2");
+    book.write(2, &[], imported_row(&m1, "m1", "active", Vec::new()));
+    machine_row(
+        &mut book,
+        &m2,
+        "m2",
+        vec![put(&MACHINE, &m2, "status", json!("active"))],
+    );
+    book.write(
+        2,
+        &[],
+        imported_row(
+            &m3,
+            "m3",
+            "active",
+            vec![put(&MACHINE, &m3, "node", json!("0011223344556677"))],
+        ),
+    );
+    book.write(
+        2,
+        &[],
+        imported_row(
+            &m4,
+            "m4",
+            "active",
+            vec![put(&MACHINE, &m4, "hosts", json!(["m4.local"]))],
+        ),
+    );
+    book.write(2, &[], imported_row(&m5, "m5", "active", Vec::new()));
+    book.write(2, &[], imported_row(&m6, "m6", "planned", Vec::new()));
+    book.write(2, &[], imported_row(&m7, "m7", "parked", Vec::new()));
+    book.write(
+        2,
+        &[],
+        vec![
+            put(&MACHINE, &m8, "label", json!("m8")),
+            put(&MACHINE, &m8, "row", json!("retired")),
+            put(&MACHINE, &m8, "status", json!("active")),
+        ],
+    );
+    book.write(
+        2,
+        &[],
+        imported_row(&m9, "m9", "active", vec![raw(&m9, "node")]),
+    );
+    book.write(2, &[], imported_row(&m10, "m10", "active", Vec::new()));
+    book.write(3, &[], vec![put(&MACHINE, &m10, "status", json!("parked"))]);
+    book.write(2, &[], imported_row(&m11, "m11", "active", Vec::new()));
+    book.write(3, &[], vec![put(&MACHINE, &m11, "note", json!("a"))]);
+    book.write(4, &[], vec![put(&MACHINE, &m11, "note", json!("b"))]);
+    book.write(
+        2,
+        &[],
+        imported_row(
+            &m12,
+            "m12",
+            "active",
+            vec![put(&MACHINE, &m12, "fleet_node", json!(NODE))],
+        ),
+    );
+    // Each column that says whether a row waits, as a newer build wrote it: a label this build would
+    // not take for one, then a status and a host beside a word it reads.
+    let mut unread = imported_row(&m13, "m13", "active", Vec::new());
+    unread.retain(|change| change.key != format!("{m13}.label"));
+    unread.push(Change {
+        collection: MACHINE.name.to_owned(),
+        key: format!("{m13}.label"),
+        value: Some(json!({"r": MACHINE.version, "x": "not a label!", "s": "sr-0123456789abcdef"})),
+    });
+    book.write(2, &[], unread);
+    let (m15, m16) = (pk("m15"), pk("m16"));
+    book.write(2, &[], imported_row(&m15, "m15", "active", Vec::new()));
+    book.write(3, &[], vec![raw(&m15, "status")]);
+    book.write(2, &[], imported_row(&m16, "m16", "active", Vec::new()));
+    book.write(3, &[], vec![raw(&m16, "hosts")]);
+    book.write(2, &[], imported_row(&held, "m14", "active", Vec::new()));
+    book.write(2, &[], imported_row(&held_too, "m14", "active", Vec::new()));
+    let plan = run(&book.cells(), &[&m5], &[]);
+    let waiting: Vec<(&str, &str)> = plan
+        .waiting
+        .iter()
+        .map(|row| (row.row.as_str(), row.label.as_str()))
+        .collect();
+    assert_eq!(
+        waiting,
+        BTreeSet::from([(m1.as_str(), "m1"), (m12.as_str(), "m12")])
+            .into_iter()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(plan.held.len(), 1, "{:?}", plan.held);
+    assert_eq!(plan.held[0].why, "no-node");
+    assert_eq!(plan.report()["waiting"][0]["label"], json!(waiting[0].1));
+    let cells = apply(&mut book, &plan);
+    let Some(Field::Value(word)) = row(&cells, &m1).fields.get("status").cloned() else {
+        panic!("no status");
+    };
+    assert_eq!(word.value.x, json!("planned"));
+    assert_eq!(word.value.s.as_deref(), Some("sr-0123456789abcdef"));
+    assert!(run(&cells, &[&m5], &[]).rows.is_empty());
+}
+
+/// A row a merge decides waits as the merge left it: the row that stays, with the label it takes,
+/// unless it took `planned` or a host from a duplicate, and never the duplicate. A replica still
+/// saying `active` of a row set back writes no status.
+/// NEGATIVE CONTROL: with no `wait_for_macs`: `left: 0 right: 1`. With the duplicate counted:
+/// `left: 2 right: 1`. With the old label listed: `left: "m36" right: "m104"`. With a row that took
+/// `planned` or a host still listed: `Plan { .. waiting: [Waiting { row: "mc-0ee010d923d4a1ac", ..`. With
+/// `machine_statuses` taking `active` over `planned`, the last assertion prints the `status` it plans:
+/// `[Planned { collection: "machine", pk: "mc-71781bc08893dc43", column: "status", x: String("active"),
+/// step: Write }, ..`.
+#[test]
+fn a_merged_row_waits_as_the_merge_left_it() {
+    let shape = |gone_status: &str, gone_more: fn(&str) -> Vec<Change>| {
+        let keep = keys::machine_pk("m36");
+        let gone = keys::machine_pk("m104");
+        let mut book = Book::new();
+        book.write(
+            2,
+            &[],
+            imported_row(
+                &keep,
+                "m36",
+                "active",
+                vec![
+                    elem(&MACHINE, &keep, "aliases", "m104"),
+                    put(&MACHINE, &keep, "fleet_node", json!(NODE)),
+                ],
+            ),
+        );
+        book.write(
+            2,
+            &[],
+            imported_row(&gone, "m104", gone_status, gone_more(&gone)),
+        );
+        (book, keep, gone)
+    };
+    let (mut book, keep, gone) = shape("active", |_| Vec::new());
+    let plan = run(&book.cells(), &[], &["m104"]);
+    assert_eq!(plan.merges.len(), 1, "{:?}", plan.held);
+    assert_eq!(plan.waiting.len(), 1, "{plan:?}");
+    assert_eq!(plan.waiting[0].row, keep);
+    assert_eq!(plan.waiting[0].label, "m104");
+    let cells = apply(&mut book, &plan);
+    assert_eq!(row(&cells, &keep).get("status"), Some(&json!("planned")));
+    assert_eq!(row(&cells, &gone).get("status"), Some(&json!("active")));
+    assert!(run(&cells, &[], &["m104"]).rows.is_empty());
+
+    let (book, keep, _) = shape("planned", |_| Vec::new());
+    let plan = run(&book.cells(), &[], &["m104"]);
+    assert_eq!(plan.merges[0].carried[0].1, "status", "{plan:?}");
+    assert!(plan.waiting.is_empty(), "{plan:?}");
+    assert_eq!(plan.merges[0].keep, keep);
+
+    let (book, _, _) = shape("active", |gone| {
+        vec![put(&MACHINE, gone, "hosts", json!(["m104.local"]))]
+    });
+    let plan = run(&book.cells(), &[], &["m104"]);
+    assert_eq!(plan.merges[0].carried[0].1, "hosts", "{plan:?}");
+    assert!(plan.waiting.is_empty(), "{plan:?}");
+
+    // A replica still saying `active`, whose import wrote the word: its status stays `planned`.
+    let sheets = import::dump_sheets(
+        "fleet-db-m104.json",
+        &aterm_json::to_vec(&json!({"computers": [
+            {"label": "m50", "hostname": "m50.local", "status": "active"}
+        ]}))
+        .unwrap(),
+        Mode::Authoritative,
+        &KEY,
+    )
+    .unwrap();
+    let pk = keys::machine_pk("m50");
+    let source = sheets[0].source.clone();
+    let mut book = Book::new();
+    let cell = |col: &str, x: Value| {
+        cell::change(
+            &MACHINE,
+            CellKey {
+                pk: &pk,
+                col,
+                elem: None,
+            },
+            &CellValue::imported(MACHINE.version, x, &source),
+        )
+        .unwrap()
+    };
+    book.write(
+        2,
+        &[],
+        vec![
+            cell("label", json!("m50")),
+            cell("row", json!("live")),
+            cell("status", json!("active")),
+        ],
+    );
+    let plan = run(&book.cells(), &[], &[]);
+    assert_eq!(plan.waiting.len(), 1, "{plan:?}");
+    let cells = apply(&mut book, &plan);
+    let import = import::plan(&import_input(&sheets, &[]), &cells).unwrap();
+    assert!(
+        import
+            .planned
+            .iter()
+            .all(|planned| planned.column != "status"),
+        "{:?}",
+        import.planned
+    );
+}
+
+/// A row a merge keeps waits from the merge's own plan, also with no `status` of its own, taking the
+/// word an import's `active` means there, and with no label, taking the one the merge gives it: a
+/// plan over the result is empty. A row bound to its Mac takes the word as it stands.
+/// NEGATIVE CONTROL: with `carry_cells` moving an import's `active` as it stands, the row
+/// that stays keeps it: `left: Some(String("active")) right: Some(String("planned"))`. Turning it into
+/// `planned` on a row bound to its Mac, or for the owner's word: `left: Some(String("planned"))
+/// right: Some(String("active"))`. With `wait_for_macs` reading only the row's own label, the row
+/// with none waits a plan late: `left: 0 right: 1`.
+#[test]
+fn a_row_a_merge_keeps_waits_from_the_merges_own_plan() {
+    let keep = keys::machine_pk("m36");
+    let gone = keys::machine_pk("m104");
+    let names = vec![
+        elem(&MACHINE, &keep, "aliases", "m104"),
+        put(&MACHINE, &keep, "fleet_node", json!(NODE)),
+    ];
+    let mut book = Book::new();
+    machine_row(&mut book, &keep, "m36", names.clone());
+    book.write(2, &[], imported_row(&gone, "m104", "active", Vec::new()));
+    let plan = run(&book.cells(), &[], &["m104"]);
+    assert_eq!(plan.merges.len(), 1, "{:?}", plan.held);
+    let cells = apply(&mut book, &plan);
+    assert_eq!(row(&cells, &keep).get("status"), Some(&json!("planned")));
+    assert!(run(&cells, &[], &["m104"]).rows.is_empty());
+
+    let mut book = Book::new();
+    machine_row(&mut book, &keep, "m36", names.clone());
+    book.write(2, &[], imported_row(&gone, "m104", "active", Vec::new()));
+    let plan = run(&book.cells(), &[&keep], &["m104"]);
+    let cells = apply(&mut book, &plan);
+    assert_eq!(row(&cells, &keep).get("status"), Some(&json!("active")));
+
+    // The owner's `active` is a statement, and moves as it stands.
+    let mut book = Book::new();
+    machine_row(&mut book, &keep, "m36", names.clone());
+    machine_row(
+        &mut book,
+        &gone,
+        "m104",
+        vec![put(&MACHINE, &gone, "status", json!("active"))],
+    );
+    let plan = run(&book.cells(), &[], &["m104"]);
+    let cells = apply(&mut book, &plan);
+    assert_eq!(row(&cells, &keep).get("status"), Some(&json!("active")));
+    assert!(run(&cells, &[], &["m104"]).rows.is_empty());
+
+    let mut book = Book::new();
+    let mut labelless = imported_row(&keep, "m36", "active", names);
+    labelless.retain(|change| change.key != format!("{keep}.label"));
+    book.write(2, &[], labelless);
+    book.write(2, &[], imported_row(&gone, "m104", "active", Vec::new()));
+    let plan = run(&book.cells(), &[], &["m104"]);
+    assert_eq!(plan.merges.len(), 1, "{:?}", plan.held);
+    assert_eq!(plan.waiting.len(), 1, "{plan:?}");
+    assert_eq!(plan.waiting[0].label, "m104");
+    let cells = apply(&mut book, &plan);
+    assert_eq!(row(&cells, &keep).get("status"), Some(&json!("planned")));
+    assert!(run(&cells, &[], &["m104"]).rows.is_empty());
+}
+
+/// A row no Mac joined that the roster gives another Mac, or two of its names, is held, not set
+/// waiting: `register::pick` would adopt it for the wrong Mac. A row the roster's node for its name
+/// agrees with waits.
+/// NEGATIVE CONTROL: with either hold off, or `other_mac` reading only the node the roster
+/// states for the row's name or only the nodes of its other names, the row waits: `Plan { merges:
+/// [], held: [], strays: [], waiting: [Waiting { row: "mc-2042463f4ef5fb03", label: "m1" }], ..`.
+#[test]
+fn a_row_the_roster_gives_another_mac_does_not_wait() {
+    let stated = |node: &str| BTreeMap::from([("fleet_node", node.to_owned())]);
+    let run_on = |cells: &Cells, roster: &Roster| {
+        plan(
+            &cell::project(&MACHINE, cells),
+            &cell::project(&PREFERENCE, cells),
+            &Facts::default(),
+            roster,
+        )
+        .unwrap()
+    };
+    let pk = keys::machine_pk("m1");
+    let row_with_node = || {
+        let mut book = Book::new();
+        book.write(
+            2,
+            &[],
+            imported_row(
+                &pk,
+                "m1",
+                "active",
+                vec![put(&MACHINE, &pk, "fleet_node", json!(NODE))],
+            ),
+        );
+        book
+    };
+    let book = row_with_node();
+    for roster in [
+        Roster::from([("m1".to_owned(), stated(OTHER_NODE))]),
+        Roster::from([
+            ("m1".to_owned(), BTreeMap::new()),
+            ("m9".to_owned(), stated(NODE)),
+        ]),
+    ] {
+        let plan = run_on(&book.cells(), &roster);
+        assert!(plan.waiting.is_empty(), "{plan:?}");
+        assert!(plan.rows.is_empty(), "{plan:?}");
+        assert_eq!(plan.held.len(), 1, "{plan:?}");
+        assert_eq!(plan.held[0].why, "two-macs");
+    }
+    let agrees = Roster::from([("m1".to_owned(), stated(NODE))]);
+    assert_eq!(run_on(&book.cells(), &agrees).waiting.len(), 1);
+
+    let mut book = Book::new();
+    book.write(
+        2,
+        &[],
+        imported_row(
+            &pk,
+            "m1",
+            "active",
+            vec![elem(&MACHINE, &pk, "aliases", "m2")],
+        ),
+    );
+    let plan = run(&book.cells(), &[], &["m1", "m2"]);
+    assert!(plan.waiting.is_empty(), "{plan:?}");
+    assert_eq!(plan.held.len(), 1, "{plan:?}");
+    assert_eq!(plan.held[0].why, "two-roster-names");
+    assert_eq!(plan.held[0].names, ["m1", "m2"]);
+}
+
+/// A row `merge` set waiting goes back to `active` once its Mac publishes its principal: the roster's
+/// word ends the wait whichever import wrote `planned`, and the plans settle. The owner's `planned`
+/// stands against it, and so does an import's against `adopt`, which finds the row by its label.
+/// NEGATIVE CONTROL: with the roster's `active` deciding as any import's, or the row it found by the
+/// principal not recorded as joined, it is a finding: `[Finding { kind: AdoptedByNode, .. },
+/// Finding { kind: Differs, collection: Some("machine"), pk: Some("mc-71781bc08893dc43"), column:
+/// Some("status"), ..`. With any word ending the wait: `left: Some(String("parked")) right:
+/// Some(String("planned"))`; with `active` ending any word: `left: Some(String("active")) right:
+/// Some(String("parked"))`. With any row the roster found ending it: `left: Some(String("active"))
+/// right: Some(String("planned"))`.
+#[test]
+fn a_mac_joining_a_row_merge_set_waiting_makes_it_active() {
+    const PRINCIPAL: &str = "0011223344556677";
+    let pk = keys::machine_pk("m50");
+    let mac = KnownMac {
+        label: Some(Label::plain(50)),
+        aliases: Vec::new(),
+        node: Some(PRINCIPAL.to_owned()),
+        fleet_node: None,
+        hosts: Vec::new(),
+    };
+    let macs = [mac];
+    let mut book = Book::new();
+    book.write(2, &[], imported_row(&pk, "m50", "active", Vec::new()));
+    let plan = run(&book.cells(), &[], &[]);
+    assert_eq!(plan.waiting.len(), 1, "{plan:?}");
+    apply(&mut book, &plan);
+    book.write(3, &[], vec![put(&MACHINE, &pk, "node", json!(PRINCIPAL))]);
+    let joined = import::plan(&import_input(&[], &macs), &book.cells()).unwrap();
+    assert!(
+        joined
+            .findings
+            .iter()
+            .all(|found| found.kind != import::Kind::Differs),
+        "{:?}",
+        joined.findings
+    );
+    let cells = apply_rows(&mut book, &joined.rows);
+    assert_eq!(row(&cells, &pk).get("status"), Some(&json!("active")));
+    let again = import::plan(&import_input(&[], &macs), &cells).unwrap();
+    assert!(again.rows.is_empty(), "{:?}", again.planned);
+    assert!(run(&cells, &[&pk], &[]).rows.is_empty());
+
+    let mut book = Book::new();
+    machine_row(
+        &mut book,
+        &pk,
+        "m50",
+        vec![
+            put(&MACHINE, &pk, "status", json!("planned")),
+            put(&MACHINE, &pk, "node", json!(PRINCIPAL)),
+        ],
+    );
+    let owner = import::plan(&import_input(&[], &macs), &book.cells()).unwrap();
+    let cells = apply_rows(&mut book, &owner.rows);
+    assert_eq!(row(&cells, &pk).get("status"), Some(&json!("planned")));
+
+    // Only `active` ends the wait, and it ends only `planned`: another import's `parked` stands
+    // against the roster, and a replica's `parked` against `planned`, under fill-only.
+    let mut book = Book::new();
+    book.write(
+        2,
+        &[],
+        imported_row(
+            &pk,
+            "m50",
+            "parked",
+            vec![put(&MACHINE, &pk, "node", json!(PRINCIPAL))],
+        ),
+    );
+    let parked = import::plan(&import_input(&[], &macs), &book.cells()).unwrap();
+    let cells = apply_rows(&mut book, &parked.rows);
+    assert_eq!(row(&cells, &pk).get("status"), Some(&json!("parked")));
+
+    let mut book = Book::new();
+    book.write(2, &[], imported_row(&pk, "m50", "planned", Vec::new()));
+    let sheets = import::dump_sheets(
+        "fleet-db-m104.json",
+        &aterm_json::to_vec(&json!({"computers": [
+            {"label": "m50", "hostname": "m50.local", "status": "parked"}
+        ]}))
+        .unwrap(),
+        Mode::FillOnly,
+        &KEY,
+    )
+    .unwrap();
+    let replica = import::plan(&import_input(&sheets, &[]), &book.cells()).unwrap();
+    let cells = apply_rows(&mut book, &replica.rows);
+    assert_eq!(row(&cells, &pk).get("status"), Some(&json!("planned")));
+
+    // `adopt` finds the row by its label, which says nothing of the Mac having joined: an import's
+    // `planned` stands until the Mac publishes its principal.
+    let mut book = Book::new();
+    book.write(2, &[], imported_row(&pk, "m50", "planned", Vec::new()));
+    let adopt = Input {
+        births: false,
+        ..import_input(&[], &macs)
+    };
+    let adopted = import::plan(&adopt, &book.cells()).unwrap();
+    let cells = apply_rows(&mut book, &adopted.rows);
+    assert_eq!(row(&cells, &pk).get("status"), Some(&json!("planned")));
+    // Nor over the roster's own `planned`, on the row it birthed under the Mac's key: `adopt` and
+    // `merge` then plan nothing over each other.
+    let mut book = Book::new();
+    let born = import::plan(&import_input(&[], &macs), &book.cells()).unwrap();
+    apply_rows(&mut book, &born.rows);
+    let keyed = keys::machine_pk(&format!("n-{PRINCIPAL}"));
+    let adopted = import::plan(&adopt, &book.cells()).unwrap();
+    let cells = apply_rows(&mut book, &adopted.rows);
+    assert_eq!(row(&cells, &keyed).get("status"), Some(&json!("planned")));
+    assert!(run(&cells, &[], &[]).rows.is_empty());
 }

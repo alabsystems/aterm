@@ -11,6 +11,11 @@ use aterm_agent::harness::codex_exec_handoff::transaction::{Stage, Transaction};
 use aterm_agent::harness::native_act::Binding;
 use std::collections::BTreeMap;
 
+#[path = "codex_exec_monitor.rs"]
+mod monitor;
+#[path = "codex_exec_settlement.rs"]
+mod settlement;
+
 #[derive(Debug)]
 pub(in crate::native_act) struct Operation {
     binding: Binding,
@@ -18,18 +23,10 @@ pub(in crate::native_act) struct Operation {
     successor: Option<ExecSource>,
     command: ExecCommand,
     checkpoint: String,
-    receipt: codex_renewal::Receipt,
     proposal: codex_rotation::Proposal<ExecCommand>,
     preparation: Arc<Preparation>,
-    authority: SupervisorAuthority,
-    source_connection: u64,
-    source_disconnected: bool,
-    human_seq: u64,
-    deadline: u64,
-    tx: Transaction,
     tree: Option<aterm_agent::harness::codex_exec_handoff::tree::Admission>,
-    custody: Option<Arc<NativeCustody>>,
-    terminate: bool,
+    gate: settlement::Execution,
 }
 
 fn fields(line: &str) -> Option<(&str, BTreeMap<&str, &str>)> {
@@ -71,8 +68,13 @@ fn environment() -> Option<Env> {
     Env::from_process().ok()
 }
 
-fn admitted(ctx: &crate::SessionCtx, op: &Operation, authority: &SupervisorAuthority) -> bool {
-    !op.terminate
+fn admitted(
+    ctx: &crate::SessionCtx,
+    op: &settlement::State,
+    authority: &SupervisorAuthority,
+) -> bool {
+    op.active
+        && !op.terminate
         && op.tx.stage() != Stage::Cancelled
         && remaining(op.deadline).is_some()
         && ctx.fabric.hold().is_none()
@@ -81,12 +83,28 @@ fn admitted(ctx: &crate::SessionCtx, op: &Operation, authority: &SupervisorAutho
         && *authority == op.authority
 }
 
-fn grant(op: &Operation, state: &str) -> String {
+fn grant(launch: &Operation, op: &settlement::State, state: &str) -> String {
+    grant_fields(
+        &launch.binding,
+        &launch.command,
+        &launch.checkpoint,
+        op,
+        state,
+    )
+}
+
+fn grant_fields(
+    binding: &Binding,
+    command: &ExecCommand,
+    checkpoint: &str,
+    op: &settlement::State,
+    state: &str,
+) -> String {
     let target = op.receipt.destination.as_ref().expect("quota destination");
     format!(
         "OK codex-exec-handoff state={state} id={} cap={} deadline_us={} thread={} turn={} source_account={} source_user={} target_account={} target_user={} auth={} checkpoint={}\n",
-        op.binding.id,
-        op.binding.capability,
+        binding.id,
+        binding.capability,
         op.deadline,
         op.receipt.intent.thread,
         op.receipt.intent.wall,
@@ -94,8 +112,8 @@ fn grant(op: &Operation, state: &str) -> String {
         op.receipt.intent.identity.user,
         target.account,
         target.user,
-        aterm_codec::hex::encode_lower(op.command.auth_path.as_bytes()),
-        aterm_codec::hex::encode_lower(op.checkpoint.as_bytes())
+        aterm_codec::hex::encode_lower(command.auth_path.as_bytes()),
+        aterm_codec::hex::encode_lower(checkpoint.as_bytes())
     )
 }
 
@@ -143,23 +161,31 @@ pub(super) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
     let Some(generation) = current.exec_generation else {
         return DENIED.into();
     };
-    let Some(env) = environment() else {
-        return DENIED.into();
-    };
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     let authority = meta.supervisor_authority(crate::metrics::now_us());
-    let mut op = operation.lock().unwrap_or_else(|p| p.into_inner());
-    if *id != op.binding.id
-        || *cap != op.binding.capability
-        || pid != op.source.process.pid
+    let mut launch = operation.lock().unwrap_or_else(|p| p.into_inner());
+    let Operation {
+        binding,
+        source,
+        successor,
+        command,
+        checkpoint,
+        proposal,
+        preparation,
+        tree,
+        gate,
+    } = &mut *launch;
+    let mut op = gate.lock();
+    let env = op.environment(i64::try_from(now_ms() / 1000).unwrap_or(i64::MAX));
+    if *id != binding.id
+        || *cap != binding.capability
+        || pid != source.process.pid
         || crate::quit_safety::foreground_pgrp(master) != i32::try_from(pid).unwrap_or(-1)
     {
         return DENIED.into();
     }
     if verb == "bind-tree" {
-        if current != op.source
-            || op.tx.stage() != Stage::Reserved
-            || !admitted(ctx, &op, &authority)
+        if current != *source || op.tx.stage() != Stage::Reserved || !admitted(ctx, &op, &authority)
         {
             return DENIED.into();
         }
@@ -182,21 +208,17 @@ pub(super) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
         ) else {
             return DENIED.into();
         };
-        if op
-            .tree
-            .as_ref()
-            .is_some_and(|tree| !tree.matches(&manifest))
-        {
+        if tree.as_ref().is_some_and(|tree| !tree.matches(&manifest)) {
             return DENIED.into();
         }
         let digest = manifest.digest().to_owned();
-        op.tree.get_or_insert_with(|| {
+        tree.get_or_insert_with(|| {
             aterm_agent::harness::codex_exec_handoff::tree::Admission::new(manifest)
         });
         return format!("OK codex-exec-handoff state=tree-bound digest={digest}\n");
     }
     if verb == "admit-member" {
-        if op.successor.as_ref() != Some(&current)
+        if successor.as_ref() != Some(&current)
             || !matches!(op.tx.stage(), Stage::Loaded(bound) | Stage::Consumed(bound) if bound == generation)
             || !admitted(ctx, &op, &authority)
         {
@@ -231,7 +253,7 @@ pub(super) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
             };
             Some(turn)
         };
-        let Some(tree) = op.tree.as_mut() else {
+        let Some(tree) = tree.as_mut() else {
             return DENIED.into();
         };
         let Some(fresh) = tree.admit(digest, thread, turn.as_deref()) else {
@@ -242,26 +264,19 @@ pub(super) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
             u8::from(fresh)
         );
     }
-    if verb == "cancel" && current == op.source {
-        if op.tx.cancel() && !op.receipt.launch_attempted {
-            match codex_renewal::cancel_unexecuted_rotation(
-                &env,
-                &op.receipt,
-                &op.proposal.destination.label,
-            ) {
-                Ok(Some(retired)) => {
-                    op.receipt = retired;
-                    op.custody.take();
-                }
-                _ => return DENIED.into(),
-            }
-        }
+    if verb == "cancel" && current == *source {
+        op.close(
+            codex_renewal::CancellationKind::OwnerStop,
+            ctx.human_input.seq(),
+            false,
+            std::time::Instant::now(),
+        );
         return "OK codex-exec-handoff state=cancelled\n".into();
     }
     // A lost consume ACK may be reconciled only by that same successor, while
     // its claim still stands. It cannot authorize a later exec generation.
     if op.tx.stage() == Stage::Consumed(generation)
-        && op.successor.as_ref() == Some(&current)
+        && successor.as_ref() == Some(&current)
         && authority.identity() == op.authority.identity()
         && !op.terminate
         && ctx.fabric.hold().is_none()
@@ -277,7 +292,7 @@ pub(super) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
         }
         let _ = codex_renewal::retire_pool_record(&env, &op.receipt);
         return if matches!(verb, "load" | "consume") {
-            grant(&op, "consumed")
+            grant_fields(binding, command, checkpoint, &op, "consumed")
         } else {
             DENIED.into()
         };
@@ -286,16 +301,16 @@ pub(super) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
         return DENIED.into();
     }
     match verb {
-        "reserve" if current == op.source => {
+        "reserve" if current == *source => {
             if !matches!(op.tx.stage(), Stage::Armed | Stage::Reserved) {
                 return DENIED.into();
             }
-            if op.proposal.commit(&op.receipt, env.now).is_err() {
+            if proposal.commit(&op.receipt, env.now).is_err() {
                 // A healthy destination may still be another session's canary.
                 // An invalid preparation must instead be retired and selected
                 // again while the original quota-waiting turn is still alive.
                 if codex_rotation::with_prepared_writer(&env, &op.receipt, |_, _| Ok(())).is_err() {
-                    op.preparation.invalidate_selection(&op.receipt);
+                    preparation.invalidate_selection(&op.receipt);
                     return DENIED.into();
                 }
                 return format!(
@@ -311,13 +326,13 @@ pub(super) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
                 op.deadline
             )
         }
-        "execute" if current == op.source => {
+        "execute" if current == *source => {
             if !matches!(op.tx.stage(), Stage::Reserved | Stage::Executing) {
                 return DENIED.into();
             }
             // The shared pool recognizes this receipt id/binding on retry, so
             // ACK loss never allocates another rotation or selects another row.
-            if op.proposal.commit(&op.receipt, env.now).is_err() {
+            if proposal.commit(&op.receipt, env.now).is_err() {
                 return format!(
                     "OK codex-exec-handoff state=waiting deadline_us={}\n",
                     op.deadline
@@ -339,25 +354,26 @@ pub(super) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
             )
         }
         "load" | "consume" => {
-            if current.process != op.source.process
-                || current.config_home != op.source.config_home
-                || current.command_for(&current.auth_path).as_ref() != Some(&op.command)
+            if current.process != source.process
+                || current.config_home != source.config_home
+                || current.command_for(&current.auth_path).as_ref() != Some(command)
+            {
+                return DENIED.into();
+            }
+            if successor.as_ref().is_some_and(|saved| *saved != current) {
+                return DENIED.into();
+            }
+            if !matches!(
+                codex_rotation::with_selected_writer(&env, &op.receipt, |_, _| Ok(())),
+                Ok(Some(()))
+            ) || !admitted(ctx, &op, &authority)
                 || !op.tx.load(generation)
             {
                 return DENIED.into();
             }
-            if op.successor.as_ref().is_some_and(|saved| *saved != current) {
-                return DENIED.into();
-            }
-            op.successor = Some(current);
-            if !matches!(
-                codex_rotation::with_selected_writer(&env, &op.receipt, |_, _| Ok(())),
-                Ok(Some(()))
-            ) {
-                return DENIED.into();
-            }
+            *successor = Some(current);
             if verb == "load" {
-                return grant(&op, "loaded");
+                return grant_fields(binding, command, checkpoint, &op, "loaded");
             }
             let Some(connection) = crate::control::serving_connection() else {
                 return DENIED.into();
@@ -366,7 +382,7 @@ pub(super) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
             consumed.phase = codex_renewal::Phase::Consumed;
             consumed.accepted_turn = Some(consumed.intent.wall.clone());
             consumed.successor_pid = Some(pid);
-            consumed.successor_birth = Some(op.source.process.birth);
+            consumed.successor_birth = Some(source.process.birth);
             if !matches!(
                 codex_rotation::with_selected_writer(&env, &op.receipt, |_, _| {
                     codex_renewal::write_receipt(&env, &consumed)
@@ -392,7 +408,7 @@ pub(super) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
             }
             op.custody.take();
             let _ = codex_renewal::retire_pool_record(&env, &op.receipt);
-            grant(&op, "consumed")
+            grant_fields(binding, command, checkpoint, &op, "consumed")
         }
         _ => DENIED.into(),
     }
@@ -456,17 +472,18 @@ fn arm(ctx: &Arc<crate::SessionCtx>, master: i32, fields: &BTreeMap<&str, &str>)
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     if let Some(existing) = &table.exec_operation {
-        let op = existing.lock().unwrap_or_else(|p| p.into_inner());
+        let launch = existing.lock().unwrap_or_else(|p| p.into_inner());
+        let op = launch.gate.lock();
         if op.custody.is_some() {
-            return if op.source == source
+            return if launch.source == source
                 && op.receipt.intent == intent
-                && op.checkpoint == checkpoint
+                && launch.checkpoint == checkpoint
                 && op.receipt.destination.as_ref().is_some_and(|target| {
                     target.account == target_account && target.user == target_user
                 })
                 && admitted(ctx, &op, &authority)
             {
-                grant(&op, "armed")
+                grant(&launch, &op, "armed")
             } else {
                 DENIED.into()
             };
@@ -570,6 +587,14 @@ fn arm(ctx: &Arc<crate::SessionCtx>, master: i32, fields: &BTreeMap<&str, &str>)
     else {
         return DENIED.into();
     };
+    // Reserve capacity and start the receiver before a durable root exists.
+    // Saturation or thread-start failure cannot strand a published operation.
+    let Some(monitor) = monitor::Monitor::reserve() else {
+        return DENIED.into();
+    };
+    let Some(connection) = crate::control::serving_connection() else {
+        return DENIED.into();
+    };
     if !matches!(
         codex_rotation::with_prepared_writer(&env, &receipt, |_, writer| writer.create(&receipt)),
         Ok(Some(()))
@@ -579,61 +604,78 @@ fn arm(ctx: &Arc<crate::SessionCtx>, master: i32, fields: &BTreeMap<&str, &str>)
         job.invalidate_selection(&receipt);
         return DENIED.into();
     }
-    let Some(connection) = crate::control::serving_connection() else {
-        return DENIED.into();
-    };
+    let (gate, cleanup) = settlement::Execution::new(
+        env,
+        proposal.destination.label.clone(),
+        settlement::Initial {
+            receipt,
+            authority,
+            source_connection: connection,
+            human_seq: ctx.human_input.seq(),
+            deadline,
+            tx: Transaction::new(generation),
+            custody: Arc::new(custody),
+        },
+    );
     let op = Arc::new(Mutex::new(Operation {
         binding: Binding { id, capability },
         source,
         successor: None,
         command,
         checkpoint,
-        receipt,
+        gate,
         proposal,
         preparation: Arc::clone(job),
-        authority,
-        source_connection: connection,
-        source_disconnected: false,
-        human_seq: ctx.human_input.seq(),
-        deadline,
-        tx: Transaction::new(generation),
         tree: None,
-        custody: Some(Arc::new(custody)),
-        terminate: false,
     }));
+    {
+        let launch = op.lock().unwrap_or_else(|p| p.into_inner());
+        monitor.start(ctx, &launch.source, cleanup);
+    }
     table.exec_operation = Some(Arc::clone(&op));
     drop(table);
     drop(meta);
-    // Never leave a native marker without a monitor able to retire it after the
-    // captured process dies. A failed monitor launch cancels before any Go.
-    if !monitor(ctx, &op) {
-        let mut op = op.lock().unwrap_or_else(|p| p.into_inner());
-        op.tx.cancel();
-        op.custody.take();
-        return DENIED.into();
-    }
-    let wait = op.lock().unwrap_or_else(|p| p.into_inner()).custody.clone();
+    let wait = op
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .gate
+        .lock()
+        .custody
+        .clone();
     if !wait
         .as_ref()
         .is_some_and(|custody| custody.await_predecessors(deadline))
     {
-        let mut op = op.lock().unwrap_or_else(|p| p.into_inner());
-        op.tx.cancel();
-        op.custody.take();
+        let launch = op.lock().unwrap_or_else(|p| p.into_inner());
+        launch.gate.lock().close(
+            codex_renewal::CancellationKind::OwnerStop,
+            ctx.human_input.seq(),
+            false,
+            std::time::Instant::now(),
+        );
         return DENIED.into();
     }
     drop(wait);
     let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-    let op = op.lock().unwrap_or_else(|p| p.into_inner());
-    if !admitted(
-        ctx,
-        &op,
-        &meta.supervisor_authority(crate::metrics::now_us()),
-    ) || !op.source.current()
+    let launch = op.lock().unwrap_or_else(|p| p.into_inner());
+    let mut op = launch.gate.lock();
+    if !op.activate()
+        || !admitted(
+            ctx,
+            &op,
+            &meta.supervisor_authority(crate::metrics::now_us()),
+        )
+        || !launch.source.current()
     {
+        op.close(
+            codex_renewal::CancellationKind::ChangedRecord,
+            ctx.human_input.seq(),
+            false,
+            std::time::Instant::now(),
+        );
         return DENIED.into();
     }
-    grant(&op, "armed")
+    grant(&launch, &op, "armed")
 }
 
 pub(in crate::native_act) fn retain_claim(ctx: &crate::SessionCtx, connection: u64) -> bool {
@@ -645,7 +687,8 @@ pub(in crate::native_act) fn retain_claim(ctx: &crate::SessionCtx, connection: u
         .exec_operation
         .clone();
     let Some(active) = active else { return false };
-    let mut op = active.lock().unwrap_or_else(|p| p.into_inner());
+    let launch = active.lock().unwrap_or_else(|p| p.into_inner());
+    let mut op = launch.gate.lock();
     if op.source_connection != connection || op.custody.is_none() {
         return false;
     }
@@ -663,6 +706,8 @@ pub(in crate::native_act) fn pending(ctx: &crate::SessionCtx) -> bool {
         .is_some_and(|op| {
             op.lock()
                 .unwrap_or_else(|p| p.into_inner())
+                .gate
+                .lock()
                 .custody
                 .is_some()
         })
@@ -678,149 +723,16 @@ pub(in crate::native_act) fn cancel_owner(ctx: &crate::SessionCtx) -> bool {
         .exec_operation
         .clone();
     let Some(active) = active else { return false };
-    let mut op = active.lock().unwrap_or_else(|p| p.into_inner());
+    let launch = active.lock().unwrap_or_else(|p| p.into_inner());
+    let mut op = launch.gate.lock();
     if op.custody.is_none() {
         return false;
     }
-    op.terminate = true;
-    op.tx.cancel();
+    op.close(
+        codex_renewal::CancellationKind::OwnerStop,
+        ctx.human_input.seq(),
+        true,
+        std::time::Instant::now(),
+    );
     true
-}
-
-fn monitor(ctx: &Arc<crate::SessionCtx>, op: &Arc<Mutex<Operation>>) -> bool {
-    let weak = Arc::downgrade(ctx);
-    let operation = Arc::clone(op);
-    std::thread::Builder::new()
-        .name("codex-exec-custody".into())
-        .spawn(move || {
-            loop {
-                let Some(ctx) = weak.upgrade() else { return };
-                let authority = ctx
-                    .meta
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .supervisor_authority(crate::metrics::now_us());
-                let (source, terminate, disconnected, connection, retired) = {
-                    let mut op = operation.lock().unwrap_or_else(|p| p.into_inner());
-                    if op.custody.is_none() {
-                        let release = op.source_disconnected;
-                        let connection = op.source_connection;
-                        drop(op);
-                        if release {
-                            crate::session_timeline::publish_release_supervisor(
-                                &ctx,
-                                Some(connection),
-                                crate::metrics::now_us(),
-                                aterm_slog::Actor::Aterm,
-                            )
-                            .published();
-                            crate::session_timeline::close_claim_connection(
-                                &ctx,
-                                connection,
-                                crate::metrics::now_us(),
-                            );
-                        }
-                        return;
-                    }
-                    let revoked = remaining(op.deadline).is_none()
-                        || ctx.fabric.hold().is_some()
-                        || ctx.human_input.seq() != op.human_seq
-                        || authority != op.authority
-                        || !ctx.native_policy.quota_rotation_enabled();
-                    // A prior client cancellation retains any issued Go. An
-                    // ungranted source may still be writing its checkpoint;
-                    // revocation alone cannot interrupt that durable write.
-                    if revoked && op.tx.revoke() {
-                        op.terminate = true;
-                    }
-                    let retired =
-                        (op.tx.stage() == Stage::Cancelled && !op.receipt.revoked).then(|| {
-                            if op.receipt.launch_attempted {
-                                op.receipt.revoked = true;
-                                op.receipt.phase = codex_renewal::Phase::Retired;
-                            }
-                            op.receipt.clone()
-                        });
-                    (
-                        op.source.clone(),
-                        op.terminate,
-                        op.source_disconnected,
-                        op.source_connection,
-                        retired,
-                    )
-                };
-                if let Some(receipt) = retired
-                    && let Some(env) = environment()
-                {
-                    if !receipt.launch_attempted {
-                        let target = operation
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .proposal
-                            .destination
-                            .label
-                            .clone();
-                        if let Ok(Some(retired)) =
-                            codex_renewal::cancel_unexecuted_rotation(&env, &receipt, &target)
-                        {
-                            let mut op = operation.lock().unwrap_or_else(|p| p.into_inner());
-                            op.receipt = retired;
-                            op.custody.take();
-                        }
-                    } else {
-                        let _ = codex_renewal::with_receipt_writer(&env, |_| {
-                            codex_renewal::write_receipt(&env, &receipt)
-                        });
-                        let _ = codex_renewal::retire_pool_record(&env, &receipt);
-                    }
-                }
-                let pid = i32::try_from(source.process.pid).unwrap_or(-1);
-                let gone = aterm_uds::process::read_birth(pid)
-                    .is_some_and(|birth| birth.0 != source.process.birth)
-                    || matches!(
-                        aterm_uds::process::process_presence(pid),
-                        aterm_uds::process::ProcessPresence::Absent
-                            | aterm_uds::process::ProcessPresence::Exited
-                    );
-                if gone {
-                    operation
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .custody
-                        .take();
-                    if disconnected {
-                        crate::session_timeline::publish_release_supervisor(
-                            &ctx,
-                            Some(connection),
-                            crate::metrics::now_us(),
-                            aterm_slog::Actor::Aterm,
-                        )
-                        .published();
-                        crate::session_timeline::close_claim_connection(
-                            &ctx,
-                            connection,
-                            crate::metrics::now_us(),
-                        );
-                    }
-                    return;
-                }
-                if terminate
-                    && let Some(current) = ExecSource::capture(source.process.pid)
-                    && current.process == source.process
-                    && let Some(identity) = aterm_uds::process::read_identity(pid)
-                {
-                    let _ = aterm_uds::process::end_proven(
-                        identity,
-                        Duration::from_secs(1),
-                        &mut aterm_uds::process::EndControlLive,
-                        |_| {
-                            ExecSource::capture(source.process.pid)
-                                .is_some_and(|now| now.process == source.process)
-                        },
-                    );
-                }
-                std::thread::park_timeout(Duration::from_millis(100));
-            }
-        })
-        .is_ok()
 }

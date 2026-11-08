@@ -204,7 +204,6 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
         (pid, &start),
         &release,
         &mut crate::release_steps::started_of,
-        &[],
     )
     .map_err(|e| format!("profile-pilot cannot run beside a release claim: {e:?}"))?;
     if let Some(dir) = &opts.inspect {

@@ -6230,6 +6230,9 @@ pub struct Canary {
     pub at: i64,
     /// It took the place of a canary that did not answer ([`take_canary`], [`Strike::NotMoved`]).
     pub took: bool,
+    /// The exact native reservation that created or took this canary. A
+    /// missing owner cannot authorize native cancellation to undo the hold.
+    pub native_receipt: Option<String>,
 }
 
 /// Rollback snapshot saved by [`begin_rotation`].
@@ -6741,6 +6744,9 @@ fn canary_json(c: &Canary) -> Value {
     m.insert("sid".to_owned(), Value::from(c.sid.as_str()));
     m.insert("at".to_owned(), Value::from(c.at));
     m.insert("took".to_owned(), Value::from(c.took));
+    if let Some(id) = &c.native_receipt {
+        m.insert("native_receipt".to_owned(), Value::from(id.as_str()));
+    }
     Value::Object(m)
 }
 
@@ -6749,6 +6755,13 @@ fn canary_of(v: &Value) -> Option<Canary> {
         sid: word(v.get("sid"), WORD_MAX).unwrap_or_default(),
         at: int(v.get("at"))?,
         took: v.get("took").and_then(Value::as_bool).unwrap_or(false),
+        // Preserve the canary even when its optional native owner is unknown.
+        // Unknown ownership never grants a stale cancellation permission.
+        native_receipt: v
+            .get("native_receipt")
+            .and_then(Value::as_str)
+            .filter(|id| id.len() == 32 && aterm_codec::hex::is_lower(id, 32))
+            .map(str::to_owned),
     })
 }
 
@@ -10522,6 +10535,7 @@ pub fn begin_rotation(
             sid: sid.clone(),
             at: now,
             took: false,
+            native_receipt: None,
         }),
     };
     state.undo.push(over);
@@ -10556,6 +10570,7 @@ pub fn take_canary(
         sid: sid.clone(),
         at: now,
         took: true,
+        native_receipt: None,
     });
     state.undo.clear();
     let why = match silent {
@@ -10628,6 +10643,40 @@ pub enum Strike {
 /// back to [`State::previous`] ([`State::undo`]), except a [`Strike::NotMoved`] of a canary that
 /// took a silent one's place; a [`Strike::NotMoved`] counts only from that account's own canary.
 pub fn strike(state: &mut State, account: &str, sid: &str, why: &Strike, now: i64) -> Vec<Event> {
+    strike_as(state, account, sid, why, now, None)
+}
+
+/// Native cancellation names the exact retained reservation. An ordinary
+/// not-moved report cannot clear a native canary even in the same session.
+pub(super) fn strike_native_unexecuted(
+    state: &mut State,
+    account: &str,
+    sid: &str,
+    receipt: &str,
+    why: &str,
+    now: i64,
+) -> Vec<Event> {
+    if state.pinned {
+        return Vec::new();
+    }
+    strike_as(
+        state,
+        account,
+        sid,
+        &Strike::NotMoved(why.into()),
+        now,
+        Some(receipt),
+    )
+}
+
+fn strike_as(
+    state: &mut State,
+    account: &str,
+    sid: &str,
+    why: &Strike,
+    now: i64,
+    native_receipt: Option<&str>,
+) -> Vec<Event> {
     if !admissible_label(account) {
         return Vec::new();
     }
@@ -10635,7 +10684,11 @@ pub fn strike(state: &mut State, account: &str, sid: &str, why: &Strike, now: i6
     let canary = state.active.as_deref() == Some(account) && !state.proven;
     let not_moved = matches!(why, Strike::NotMoved(_));
     let its_own = !sid.is_empty() && state.canary.as_ref().is_some_and(|c| c.sid == sid);
-    if not_moved && !(canary && its_own) {
+    let same_reservation = state
+        .canary
+        .as_ref()
+        .is_some_and(|canary| canary.native_receipt.as_deref() == native_receipt);
+    if not_moved && !(canary && its_own && same_reservation) {
         return Vec::new();
     }
     let word = match why {

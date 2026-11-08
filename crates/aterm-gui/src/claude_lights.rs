@@ -4148,6 +4148,11 @@ impl App {
                 lights.cursor_owed |= lights.glass_hover() != was;
             }
         }
+        self.evict_stale_glass_hover(wid);
+    }
+
+    /// Clear any glass hover in `wid` whose target moved away or was covered by a chrome band.
+    pub(crate) fn evict_stale_glass_hover(&mut self, wid: WindowId) {
         let Some(lights) = self.windows.get(&wid).map(|ws| &ws.claude_lights) else {
             return;
         };
@@ -4224,10 +4229,18 @@ impl App {
     /// The pointer on `at`.
     #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn hover_claude_chip(&mut self, wid: WindowId, at: Option<(u64, Chip)>) {
+        let mut had_fact = false;
         if let Some(ws) = self.windows.get_mut(&wid) {
+            had_fact = ws
+                .claude_lights
+                .hover
+                .is_some_and(|(_, t)| t.fact().is_some());
             ws.claude_lights.hover = at.map(|(session, chip)| (session, Target::Chip(chip)));
             ws.claude_lights.quota_column = None;
             ws.claude_lights.glass_hover_px = None;
+        }
+        if had_fact {
+            self.note_fact_readings(wid);
         }
     }
 

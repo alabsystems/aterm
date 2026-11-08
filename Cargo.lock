@@ -148,7 +148,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.173.0"
+version = "0.174.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -550,6 +550,7 @@ name = "aterm-core"
 version = "0.0.0"
 dependencies = [
  "aterm-alloc",
+ "aterm-bench",
  "aterm-bidi",
  "aterm-codec",
  "aterm-digest",
@@ -812,6 +813,7 @@ name = "aterm-grid"
 version = "0.0.0"
 dependencies = [
  "aterm-alloc",
+ "aterm-bench",
  "aterm-grapheme",
  "aterm-hash",
  "aterm-log",
@@ -1670,6 +1672,7 @@ dependencies = [
  "aterm-verify",
  "atpkg",
  "atpkg-keys",
+ "libc",
  "ring",
 ]
 
@@ -1677,6 +1680,7 @@ dependencies = [
 name = "aterm-render"
 version = "0.0.0"
 dependencies = [
+ "aterm-bench",
  "aterm-bidi",
  "aterm-codec",
  "aterm-core",
@@ -1785,6 +1789,7 @@ dependencies = [
 name = "aterm-search"
 version = "0.0.0"
 dependencies = [
+ "aterm-bench",
  "aterm-grapheme",
  "aterm-hash",
  "aterm-log",
@@ -1864,6 +1869,7 @@ dependencies = [
 name = "aterm-session"
 version = "0.0.0"
 dependencies = [
+ "aterm-bench",
  "aterm-cap",
  "aterm-digest",
  "aterm-models-core",
@@ -2064,6 +2070,7 @@ name = "aterm-uds"
 version = "0.0.0"
 dependencies = [
  "astream-sys",
+ "aterm-bench",
  "aterm-dirfd",
  "aterm-durable",
  "aterm-spec",

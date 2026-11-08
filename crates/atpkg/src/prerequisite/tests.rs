@@ -345,10 +345,14 @@ struct Fixture {
     downloads: Cell<usize>,
 }
 
+fn fixture_version(want: Prerequisite) -> &'static str {
+    want.recipe().map_or("0.0.0", |recipe| recipe.version)
+}
+
 impl Fixture {
     fn new(want: Prerequisite) -> Self {
         let layout = crate::testdir::layout("signed-prerequisite");
-        let root = layout.build_dir(want.recipe().name, 7);
+        let root = layout.build_dir(want.program(), 7);
         std::fs::create_dir_all(root.join("bin")).unwrap();
         let executable = root.join("bin").join(want.executable());
         std::fs::write(&executable, b"synthetic fixture, never executed").unwrap();
@@ -366,13 +370,13 @@ impl Fixture {
             testkit::MACHINE_ID,
             testkit::SEQ
         );
-        let program = want.recipe().name;
+        let program = want.program();
         let index = format!(
             "schema=2\nindex_build=41\nvalid_until=\"2099-01-01T00:00:00Z\"\n{attr}[programs.{program}]\nrepo=\"{program}\"\n[[channels]]\nname=\"stable\"\npin={{ {program}=7 }}\n"
         );
         let package = format!(
             "schema=2\n{attr}program=\"{program}\"\nversion=\"{}\"\nbuild_number=7\nexposes=[\"{}\"]\n[[artifact]]\ntarget=\"{TRIPLE}\"\nkind=\"sysroot-bundle\"\nasset=\"fixture.tar.zst\"\nsha256=\"{}\"\ntree_root=\"{tree}\"\nsize=1\n",
-            want.recipe().version,
+            fixture_version(want),
             want.executable(),
             "a".repeat(64)
         );
@@ -468,7 +472,7 @@ impl Fetcher for Fixture {
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
         assert_eq!(
             (repo, program, build),
-            (self.want.recipe().name, self.want.recipe().name, 7)
+            (self.want.program(), self.want.program(), 7)
         );
         self.manifest_reads.set(self.manifest_reads.get() + 1);
         if self.manifest_reads.get() > 1
@@ -491,9 +495,9 @@ impl Fetcher for Fixture {
 }
 
 #[test]
-fn all_four_shared_recipes_admit_only_signed_bytes_and_hold_their_build_until_drop() {
+fn declared_prerequisites_admit_only_signed_bytes_and_hold_their_build_until_drop() {
     if !crate::testdir::isolated_lifecycle(
-        "prerequisite::tests::all_four_shared_recipes_admit_only_signed_bytes_and_hold_their_build_until_drop",
+        "prerequisite::tests::declared_prerequisites_admit_only_signed_bytes_and_hold_their_build_until_drop",
     ) {
         return;
     }
@@ -502,15 +506,16 @@ fn all_four_shared_recipes_admit_only_signed_bytes_and_hold_their_build_until_dr
         Prerequisite::Python,
         Prerequisite::OpenSslSigning,
         Prerequisite::Lake,
+        Prerequisite::AtpkgKeys,
     ] {
         let fixture = Fixture::new(want);
         let session = fixture.session(TRIPLE).unwrap();
         let tool = session.acquire(want).unwrap();
         assert_eq!(tool.path(), fixture.executable());
-        assert_eq!((tool.program(), tool.build()), (want.recipe().name, 7));
+        assert_eq!((tool.program(), tool.build()), (want.program(), 7));
         assert!(tool.environment().is_empty());
         assert_eq!(fixture.index_reads.get(), 1);
-        let subject = Subject::build(want.recipe().name, 7).unwrap();
+        let subject = Subject::build(want.program(), 7).unwrap();
         assert!(matches!(
             crate::lease::reclaim(&fixture.layout.prefix, &subject),
             crate::lease::Reclaim::Keep(_)
@@ -525,6 +530,59 @@ fn all_four_shared_recipes_admit_only_signed_bytes_and_hold_their_build_until_dr
     }
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     inherited_description_keeps_a_dropped_prerequisite_until_actual_child_reap();
+}
+
+#[test]
+fn first_party_selected_and_named_leases_take_the_version_from_the_signed_package() {
+    let mut fixture = Fixture::new(Prerequisite::AtpkgKeys);
+    fixture.change_package("version=\"0.0.0\"", "version=\"0.1.0\"");
+    crate::store::mark_build_ready(&fixture.root).unwrap();
+    let session = fixture.session(TRIPLE).unwrap();
+    let selected = session.acquire(fixture.want).unwrap();
+    assert_eq!(selected.version(), "0.1.0");
+    assert_eq!(selected.program(), "atpkg-keys");
+    selected.validate().unwrap();
+    drop(selected);
+    let named = session.acquire_build(fixture.want, 7).unwrap();
+    assert_eq!(named.version(), "0.1.0");
+    assert_eq!(named.path(), fixture.executable().canonicalize().unwrap());
+    named.validate().unwrap();
+}
+
+#[test]
+fn first_party_admission_refuses_forged_identity_environment_target_and_payload() {
+    for case in [
+        "signature",
+        "program",
+        "command",
+        "environment",
+        "target",
+        "payload",
+    ] {
+        let mut fixture = Fixture::new(Prerequisite::AtpkgKeys);
+        crate::store::mark_build_ready(&fixture.root).unwrap();
+        match case {
+            "signature" => fixture.signature[0] ^= 1,
+            "program" => fixture.change_package("program=\"atpkg-keys\"", "program=\"different\""),
+            "command" => {
+                fixture.change_package("exposes=[\"atpkg-keys\"]", "exposes=[\"different\"]")
+            }
+            "environment" => {
+                fixture.change_package("exposes=[", "shim_env=[\"LEAN_CC=/usr/bin/cc\"]\nexposes=[")
+            }
+            "target" => fixture.change_package(TRIPLE, "x86_64-apple-darwin"),
+            "payload" => {
+                std::fs::write(fixture.executable(), b"changed after signed publication").unwrap()
+            }
+            _ => unreachable!(),
+        }
+        let session = fixture.session(TRIPLE).unwrap();
+        assert!(session.acquire(fixture.want).is_err(), "selected {case}");
+        assert!(
+            session.acquire_build(fixture.want, 7).is_err(),
+            "named {case}"
+        );
+    }
 }
 
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
@@ -592,7 +650,7 @@ fn provision_refuses_wrong_signed_recipe_before_changing_a_current_selection() {
     let before = std::fs::read(fixture.executable()).unwrap();
     let original = crate::lookup::read(Some(&fixture.layout), fixture.want.executable());
     fixture.change_package(
-        &format!("version=\"{}\"", fixture.want.recipe().version),
+        &format!("version=\"{}\"", fixture_version(fixture.want)),
         "version=\"0.0.0\"",
     );
     assert!(
@@ -617,7 +675,7 @@ fn provision_freezes_one_signed_document_through_fresh_install_and_admission() {
         fixture.fresh_install();
         let valid = fixture.package.clone();
         let wrong = valid.replace(
-            &format!("version=\"{}\"", fixture.want.recipe().version),
+            &format!("version=\"{}\"", fixture_version(fixture.want)),
             "version=\"0.0.0\"",
         );
         assert_ne!(
@@ -654,7 +712,7 @@ fn provision_freezes_one_signed_document_through_fresh_install_and_admission() {
             held.tool(fixture.want).unwrap().validate().unwrap();
             assert_eq!(
                 crate::store::recorded_version(&fixture.root).as_deref(),
-                Some(fixture.want.recipe().version)
+                Some(fixture_version(fixture.want))
             );
             assert_eq!(fixture.downloads.get(), 1);
         }
@@ -749,7 +807,7 @@ fn authenticated_manifest_identity_and_local_bytes_are_both_required() {
         match case {
             "signature" => fixture.signature[0] ^= 1,
             "version" => fixture.change_package(
-                &format!("version=\"{}\"", Prerequisite::Python.recipe().version),
+                &format!("version=\"{}\"", fixture_version(Prerequisite::Python)),
                 "version=\"0.0.0\"",
             ),
             "program" => fixture.change_package("program=\"cpython\"", "program=\"foreign\""),

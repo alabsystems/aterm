@@ -59,7 +59,9 @@ mod release_disk;
 mod release_keychain;
 mod release_status;
 mod release_steps;
+mod release_target;
 mod release_timeline;
+mod release_tools;
 
 mod managed_prerequisites;
 mod sign;
@@ -90,7 +92,21 @@ mod trust_oblig;
 mod verify;
 
 fn main() -> std::process::ExitCode {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(result) = interrupt::exec_probe_if_asked() {
+        return match result {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(why) => {
+                eprintln!("release signal exec probe: {why}");
+                std::process::ExitCode::from(2)
+            }
+        };
+    }
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.len() == 1 && args[0] == "--version" {
+        println!("{}", release_tools::CUTTER_VERSION);
+        return std::process::ExitCode::SUCCESS;
+    }
     match github_remote::helper_arguments(&args) {
         Ok(Some(args)) => return agh::cli::main_entry(args),
         Ok(None) => {}
@@ -98,6 +114,15 @@ fn main() -> std::process::ExitCode {
             eprintln!("aterm-release: {why}");
             return std::process::ExitCode::from(2);
         }
+    }
+    // POSIX resets caught dispositions when the frozen cutter replaces the launcher's image.
+    // The old image carried HUP/INT/TERM blocked across exec; install handlers before selectively
+    // restoring that mask, and do both before content proof or resource adoption.
+    if std::env::var_os(interrupt::EXEC_MASK_ENV).is_some()
+        && let Err(why) = interrupt::install_exec_handoff()
+    {
+        eprintln!("release signal handover: {why}");
+        return std::process::ExitCode::from(2);
     }
     cutter::judge_at_start();
     std::process::exit(cli::run());

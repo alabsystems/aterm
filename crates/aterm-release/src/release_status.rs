@@ -256,6 +256,8 @@ fn read_events(reader: impl Read) -> std::io::Result<Events> {
                                 | "compile-unit-message-unavailable"
                                 | "inputs"
                                 | "handed"
+                                | "continued"
+                                | "target-retired"
                                 | "disk"
                                 | "publish-line"
                         )
@@ -897,19 +899,38 @@ mod tests {
         assert_eq!(read_events(unknown.as_bytes()).unwrap().rejected_lines, 1);
     }
 
-    /// The record a re-run as R's own cutter writes, naming the logs of the run that handed it
-    /// the release (`handed`, which [`crate::release_timeline::Timeline`] follows), is an event of
-    /// the run and no failure. NEGATIVE CONTROL: without it among the known events it is a
-    /// rejected line and the re-run's observations are incomplete.
+    /// The record an exec'd image writes, naming the preceding image's logs (`continued`, which
+    /// [`crate::release_timeline::Timeline`] follows), and the `handed` spelling a cutter already
+    /// running at the B1 boundary wrote are events of the run and no failure. NEGATIVE CONTROL:
+    /// without either among the known events that cut's observations become incomplete.
     #[test]
-    fn a_reruns_handed_record_is_an_event_of_the_run() {
-        let text = format!(
-            "release-event: {}\n",
-            aterm_json::json!({"schema": 1, "event": "handed", "from": "/state/logs/outer"})
-        );
-        let events = read_events(text.as_bytes()).unwrap();
-        assert_eq!((events.rejected_lines, events.count), (0, 1), "{text}");
-        assert!(events.first_failure.is_none());
+    fn a_continued_images_record_is_an_event_of_the_run() {
+        for event in ["handed", "continued"] {
+            let text = format!(
+                "release-event: {}\n",
+                aterm_json::json!({"schema": 1, "event": event, "from": "/state/logs/outer"})
+            );
+            let events = read_events(text.as_bytes()).unwrap();
+            assert_eq!((events.rejected_lines, events.count), (0, 1), "{text}");
+            assert!(events.first_failure.is_none());
+        }
+    }
+
+    /// A frozen cutter's retirement measurement is a first-class release event, so the next
+    /// cutter can read the exact zero from its transcript. Changing its name makes the negative
+    /// control's otherwise identical line rejected.
+    #[test]
+    fn target_retirement_records_its_remaining_deps_count() {
+        let line = |event| {
+            format!(
+                "release-event: {}\n",
+                aterm_json::json!({"schema": 1, "event": event, "deps_entries": 0})
+            )
+        };
+        let accepted = read_events(line("target-retired").as_bytes()).unwrap();
+        assert_eq!((accepted.rejected_lines, accepted.count), (0, 1));
+        let unknown = read_events(line("target-retire-mutant").as_bytes()).unwrap();
+        assert_eq!((unknown.rejected_lines, unknown.count), (1, 0));
     }
 
     /// aterm-verify's per-unit compile evidence, a line for each unit of each compile
@@ -1225,7 +1246,7 @@ mod tests {
             started: "now".into(),
             logs: String::new(),
             step: Some("verify".into()),
-            handed: false,
+            legacy_handed: false,
         };
         assert_eq!(
             resolve_logs(Some(&child), &pointer).unwrap(),

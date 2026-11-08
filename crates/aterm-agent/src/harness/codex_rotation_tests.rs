@@ -11,6 +11,9 @@ use std::collections::BTreeMap;
 #[path = "codex_rotation_publication_tests.rs"]
 mod publication;
 
+#[path = "codex_rotation_canary_tests.rs"]
+mod canary_ownership;
+
 struct Reader {
     calls: RefCell<Vec<PathBuf>>,
     answers: BTreeMap<PathBuf, IdentifiedUsage>,

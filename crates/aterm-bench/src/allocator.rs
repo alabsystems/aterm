@@ -28,6 +28,11 @@ impl<A, O> Observed<A, O> {
     pub const fn new(inner: A, observer: O) -> Self {
         Self { inner, observer }
     }
+
+    /// Read the observer's counters without exposing the underlying allocator.
+    pub const fn observer(&self) -> &O {
+        &self.observer
+    }
 }
 
 // SAFETY: all four operations preserve the inner allocator's pointer/layout contract. Observer's

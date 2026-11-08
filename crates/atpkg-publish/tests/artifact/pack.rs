@@ -580,6 +580,103 @@ fn the_declared_bundle_ships_unshimmed_and_build_args_reach_the_build() {
     );
 }
 
+fn signing_tool_metadata(checkout: &Path, recipe: aterm_json::Value) -> String {
+    aterm_json::to_string(&aterm_json::json!({
+        "packages": [
+            {"name":"aterm", "version":"0.170.0", "manifest_path":checkout.join("Cargo.toml").to_string_lossy().into_owned()},
+            {"name":"atpkg-keys", "version":"0.0.0", "manifest_path":checkout.join("Cargo.toml").to_string_lossy().into_owned(),
+             "metadata":{"atpkg":recipe}},
+            {"name":"unrelated", "version":"1.0.0", "metadata":{"atpkg":{"expose":["unrelated-tool"],"bundle-only":true}}}
+        ],
+        "metadata":{"atpkg":{"expose":["aterm"],"bundle":["app-helper"],"build-args":["--workspace"]}}
+    }))
+    .expect("metadata JSON")
+}
+
+fn signing_tool_recipe() -> aterm_json::Value {
+    aterm_json::json!({
+        "expose":["atpkg-keys"],
+        "build-args":["--locked","-p","atpkg-keys","--bin","atpkg-keys"]
+    })
+}
+
+#[test]
+fn a_program_package_recipe_packs_its_tool_without_the_workspace_application() {
+    let w = world("pack-signing-tool");
+    let metadata = signing_tool_metadata(&w.checkout, signing_tool_recipe());
+    let parsed = pack::parse_metadata(metadata.as_bytes(), "atpkg-keys").expect("own recipe");
+    assert_eq!(parsed.version, "0.0.0");
+    assert!(!parsed.bundle_only && parsed.bundle.is_empty());
+    let app = pack::parse_metadata(metadata.as_bytes(), "aterm").expect("workspace app");
+    assert_eq!(app.expose, ["aterm"]);
+    assert_eq!(app.build_args, ["--workspace"]);
+    let t = tools(
+        &w,
+        "aarch64-apple-darwin",
+        metadata,
+        vec![
+            (
+                "atpkg-keys",
+                bin_bytes(macho(CPU_ARM64), "owner signing tool"),
+            ),
+            ("aterm", bin_bytes(macho(CPU_ARM64), "workspace app")),
+        ],
+    );
+    let mut request = w.request(AARCH64_APPLE_DARWIN);
+    request.program = "atpkg-keys".into();
+    let out = pack::pack_with(&w.ctx, &request, &t).expect("own signing-tool package");
+    assert_eq!(out.exposes, ["atpkg-keys"]);
+    let bin = w.root.join("out/atpkg-keys/root/bin");
+    assert!(bin.join("atpkg-keys").is_file());
+    assert!(!bin.join("aterm").exists());
+    let build = &t.runs_of("build")[0];
+    assert!(
+        build
+            .argv()
+            .windows(5)
+            .any(|a| a == ["--locked", "-p", "atpkg-keys", "--bin", "atpkg-keys"])
+    );
+    assert!(!build.argv().iter().any(|a| a == "--workspace"));
+    client_verifies(
+        &w.ctx,
+        &out.manifest,
+        out.signature.as_ref().expect("signed"),
+    )
+    .expect("normal client verifies the separate helper package");
+    let program = atpkg_publish::programs::get("atpkg-keys").expect("program");
+    assert_eq!(program.repo, "aterm");
+    assert!(program.system.is_none() && program.group.is_none());
+}
+
+#[test]
+fn a_malformed_program_recipe_refuses_instead_of_inheriting_workspace_tools() {
+    for recipe in [
+        aterm_json::json!(false),
+        aterm_json::json!({}),
+        aterm_json::json!({"expose":[]}),
+        aterm_json::json!({"expose":"atpkg-keys"}),
+        aterm_json::json!({"expose":["atpkg-keys",7]}),
+        aterm_json::json!({"expose":["atpkg-keys"],"build-args":[7]}),
+        aterm_json::json!({"expose":["atpkg-keys"],"bundle":"other"}),
+        aterm_json::json!({"expose":["atpkg-keys"],"bundle-only":"false"}),
+    ] {
+        let w = world("pack-invalid-own-recipe");
+        let t = tools(
+            &w,
+            "aarch64-apple-darwin",
+            signing_tool_metadata(&w.checkout, recipe),
+            Vec::new(),
+        );
+        let mut request = w.request(AARCH64_APPLE_DARWIN);
+        request.program = "atpkg-keys".into();
+        let error =
+            pack::pack_with(&w.ctx, &request, &t).expect_err("own recipe must not fall back");
+        assert!(error.to_string().contains("package.metadata.atpkg"));
+        assert!(t.runs_of("build").is_empty());
+        assert!(w.written(".toml").is_empty());
+    }
+}
+
 #[test]
 fn astream_ships_its_two_named_clis_without_workspace_tools() {
     let w = world("pack-astream");

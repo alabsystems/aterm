@@ -169,30 +169,29 @@ impl Session<'_> {
             return Err("invalid or unsupported named prerequisite build".into());
         }
         let prepared = self.read_package(want, build, true)?;
-        let recipe = prepared.recipe;
+        let program = want.program();
         let artifact = prepared
             .package
             .artifact_for(self.triple)
             .ok_or("the named prerequisite has no native artifact")?;
         let lease = crate::lease::take(
             &self.layout.prefix,
-            &Subject::build(recipe.name, build).ok_or("invalid prerequisite identity")?,
+            &Subject::build(program, build).ok_or("invalid prerequisite identity")?,
             self.description,
             crate::lease::DEFAULT_WAIT,
         )
         .map_err(|error| error.to_string())?;
-        let placed = self.layout.build_dir(recipe.name, build);
+        let placed = self.layout.build_dir(program, build);
         if !crate::store::build_is_complete(&placed) {
             return Err(format!(
-                "{} {build} is not staged; install its named build first",
-                recipe.name
+                "{program} {build} is not staged; install its named build first"
             ));
         }
-        let root = crate::lookup::payload_root(self.layout, recipe.name, build)
+        let root = crate::lookup::payload_root(self.layout, program, build)
             .ok_or("the named prerequisite has unowned path indirection")?;
         let identity = crate::trust_lock::tree_identity(&root)
             .ok_or("the named prerequisite has no stable tree identity")?;
-        let physical = root.join(recipe.executable);
+        let physical = root.join(want.package_executable());
         if physical.canonicalize().ok().as_ref() != Some(&physical) {
             return Err("the named prerequisite executable is redirected".into());
         }
@@ -214,11 +213,11 @@ impl Session<'_> {
             image_identity: ImageIdentity::of(&metadata),
             environment: crate::shim_env::ShimEnv::admit(&prepared.package.shim_env)?,
             lease,
-            program: recipe.name,
+            program,
             build,
             tree_root: actual,
             root,
-            version: recipe.version,
+            version: prepared.package.version,
         };
         tool.validate()?;
         Ok(tool)

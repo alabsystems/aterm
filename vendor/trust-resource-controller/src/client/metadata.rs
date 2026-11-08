@@ -624,10 +624,30 @@ impl MetadataStreams {
         deadline: Instant,
         observer: &mut Option<&mut OutputObserver<'_>>,
     ) -> io::Result<StreamReady> {
+        self.poll_started(request, deadline, observer, Instant::now())
+    }
+
+    #[cfg(test)]
+    fn poll_at(
+        &mut self,
+        request: &impl NativeQuery,
+        deadline: Instant,
+        started: Instant,
+    ) -> io::Result<StreamReady> {
+        self.poll_started(request, deadline, &mut None, started)
+    }
+
+    fn poll_started(
+        &mut self,
+        request: &impl NativeQuery,
+        deadline: Instant,
+        observer: &mut Option<&mut OutputObserver<'_>>,
+        started: Instant,
+    ) -> io::Result<StreamReady> {
         if self.failed {
             return Err(invalid("native stream has an earlier protocol/capture failure"));
         }
-        let outcome = self.poll_checked(request, deadline, observer);
+        let outcome = self.poll_checked(request, deadline, observer, started);
         if outcome.is_err() {
             self.failed = true;
         }
@@ -639,6 +659,7 @@ impl MetadataStreams {
         request: &impl NativeQuery,
         deadline: Instant,
         observer: &mut Option<&mut OutputObserver<'_>>,
+        started: Instant,
     ) -> io::Result<StreamReady> {
         if Instant::now() >= deadline {
             return Err(io::ErrorKind::TimedOut.into());
@@ -658,7 +679,7 @@ impl MetadataStreams {
                 }
                 break;
             }
-            let frame_deadline = deadline.min(Instant::now() + Duration::from_millis(250));
+            let frame_deadline = deadline.min(started + Duration::from_secs(60));
             let observed = &mut self.observed;
             let bytes =
                 self.events.receive_observed(frame_deadline, |bytes| observed.record(bytes))?;

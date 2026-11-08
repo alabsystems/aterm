@@ -8,8 +8,9 @@
 //! `step-child-finished` record of each
 //! child (`wait4`'s CPU and peak), verify's `stage-started`/`stage-finished`, the slices'
 //! `build-child-finished`, `compile-finished`, the inputs seal's `inputs`, verify's `disk`
-//! record and the publish step's `publish-line` arrivals. A run that another handed the release
-//! (a re-run as R's own cutter) counts that run's seal calls and walks with its own.
+//! record and the publish step's `publish-line` arrivals. An image continued through the
+//! in-place exec counts the preceding image's seal calls and walks with its own. The legacy
+//! `handed` event has the same read-time meaning for a cut already in flight at the B1 boundary.
 //!
 //! Planning data only, never a verdict. What no record says is `null`, never `0`: an older
 //! run's logs carry none of the newer records.
@@ -84,12 +85,12 @@ pub struct Timeline {
     /// A seal call's record was read from [`TRANSCRIPT`]: the cutter's own calls reach its logs,
     /// so a mode none of the run's records names is one no call took.
     own_seal: bool,
-    /// The logs of the run that handed this one the release (a `handed` record in
-    /// [`TRANSCRIPT`]): its first steps, its seal call among them, are in them.
-    handed_from: Option<PathBuf>,
-    /// Whether the handing run's own seal calls reached its logs, once [`Timeline::of_logs`]
+    /// The preceding image's logs (a `continued` record in [`TRANSCRIPT`]): its first steps, its
+    /// seal call among them, are in them.
+    continued_from: Option<PathBuf>,
+    /// Whether the preceding image's own seal calls reached its logs, once [`Timeline::of_logs`]
     /// read them; `None` where it did not (none named, or a read of the records alone).
-    handing_seal: Option<bool>,
+    preceding_seal: Option<bool>,
     disk_walks: Option<u64>,
     units_fresh: Option<u64>,
     units_compiled: Option<u64>,
@@ -229,8 +230,8 @@ impl Timeline {
                 }
                 self.own_seal |= log == TRANSCRIPT;
             }
-            Some("handed") if log == TRANSCRIPT => {
-                self.handed_from = event["from"].as_str().map(PathBuf::from);
+            Some("handed" | "continued") if log == TRANSCRIPT => {
+                self.continued_from = event["from"].as_str().map(PathBuf::from);
             }
             Some("disk") => add_u(&mut self.disk_walks, event["walks"].as_u64()),
             Some("publish-line") => {
@@ -501,19 +502,19 @@ impl Timeline {
     }
 
     /// Read `logs`'s transcript and every step log (`NN-<step>*.log`), in name order, and where
-    /// another run handed this one the release, the seal calls and walks its logs record: the
-    /// release's, though another run made them.
+    /// an earlier image continued into this one, the seal calls and walks its logs record: the
+    /// release's, though another image made them.
     /// # Errors
     /// The directory cannot be listed, or a log present cannot be read.
     pub fn of_logs(logs: &Path) -> std::io::Result<Self> {
         let mut timeline = Self::of_run(logs)?;
-        if let Some(from) = timeline.handed_from.clone() {
-            let handing = Self::of_run(&from).ok();
-            timeline.handing_seal = Some(handing.as_ref().is_some_and(|h| h.own_seal));
-            if let Some(handing) = handing {
-                add_u(&mut timeline.hashed, handing.hashed);
-                add_u(&mut timeline.rechecked, handing.rechecked);
-                add_u(&mut timeline.disk_walks, handing.disk_walks);
+        if let Some(from) = timeline.continued_from.clone() {
+            let preceding = Self::of_run(&from).ok();
+            timeline.preceding_seal = Some(preceding.as_ref().is_some_and(|h| h.own_seal));
+            if let Some(preceding) = preceding {
+                add_u(&mut timeline.hashed, preceding.hashed);
+                add_u(&mut timeline.rechecked, preceding.rechecked);
+                add_u(&mut timeline.disk_walks, preceding.disk_walks);
             }
         }
         Ok(timeline)
@@ -646,10 +647,10 @@ impl Timeline {
             .first_red_at_unix_ms
             .zip(self.run_started_at_unix_s)
             .map(|(red, start)| red.saturating_sub(start.saturating_mul(1000)) as f64 / 1000.0);
-        // Every seal call of the release reached a log where the cutter's own did, and the handing
-        // run's too where one handed it on: a mode no record names, no call took.
+        // Every seal call of the release reached a log where the cutter's own did, and the
+        // preceding image's too where one continued: a mode no record names, no call took.
         let seal_known =
-            self.own_seal && (self.handed_from.is_none() || self.handing_seal == Some(true));
+            self.own_seal && (self.continued_from.is_none() || self.preceding_seal == Some(true));
         let seal_count = |n: Option<u64>| if seal_known { Some(n.unwrap_or(0)) } else { n };
         let units = match (self.units_fresh, self.units_compiled) {
             (None, None) => aterm_json::Value::Null,
@@ -910,10 +911,11 @@ mod tests {
     /// A RELEASE COUNTS NO FULL HASH ONLY WHERE EVERY CUTTER OF IT LOGGED ITS OWN SEAL CALL: the
     /// cutter's call in its transcript makes a mode no record names known, 0 (A2's "0 on a warm
     /// machine"); a run's children's records alone (an older run, whose cutter's calls reached
-    /// its terminal only) leave it null; a run handed the release counts the handing run's seal
-    /// calls and walks with its own, and is null where those cannot be read or that run's own call
-    /// reached no log. NEGATIVE CONTROLS: making any call's record know both counts reads 0 for the
-    /// older run, and reading the re-run's logs alone reads 0 for a release that hashed once.
+    /// its terminal only) leave it null; a continued image counts the preceding image's seal
+    /// calls and walks with its own, and is null where those cannot be read or that image's own
+    /// call reached no log. NEGATIVE CONTROLS: making any call's record know both counts reads 0
+    /// for the older run, and reading the continued image's logs alone reads 0 for a release that
+    /// hashed once.
     #[test]
     fn a_release_counts_no_full_hash_only_where_every_cutter_logged_its_own_seal_call() {
         let call = |mode: &str| {
@@ -922,10 +924,10 @@ mod tests {
                 aterm_json::json!({"schema":1,"event":"inputs","mode":mode,"entries":9,"secs":0.5})
             )
         };
-        let handed = |from: &Path| {
+        let continued = |event: &str, from: &Path| {
             format!(
                 "release-event: {}\n",
-                aterm_json::json!({"schema":1,"event":"handed","from":from.display().to_string()})
+                aterm_json::json!({"schema":1,"event":event,"from":from.display().to_string()})
             )
         };
         let counts = |value: &aterm_json::Value| {
@@ -956,7 +958,7 @@ mod tests {
         )]);
         assert_eq!(counts(&of(older.path())), (None, Some(2), None));
 
-        // A bump release: the outer cutter hashed at step 1, then handed the release to R's own.
+        // A bump release: the outer image hashed at step 1, then exec'd R's own cutter.
         let outer = write(&[
             (TRANSCRIPT, call("hashed")),
             (
@@ -966,19 +968,25 @@ mod tests {
             ),
         ]);
         let rerun = write(&[
-            (TRANSCRIPT, [handed(outer.path()), call("adopted")].concat()),
+            (
+                TRANSCRIPT,
+                [continued("handed", outer.path()), call("adopted")].concat(),
+            ),
             ("06-verify.log", call("rechecked")),
         ]);
         assert_eq!(counts(&of(rerun.path())), (Some(1), Some(2), Some(1)));
 
         let gone = outer.path().join("gone");
-        let lost = write(&[(TRANSCRIPT, [handed(&gone), call("adopted")].concat())]);
+        let lost = write(&[(
+            TRANSCRIPT,
+            [continued("continued", &gone), call("adopted")].concat(),
+        )]);
         assert_eq!(counts(&of(lost.path())), (None, Some(1), None));
 
         let unlogged = write(&[("01-checks.log", call("adopted"))]);
         let after_unlogged = write(&[(
             TRANSCRIPT,
-            [handed(unlogged.path()), call("adopted")].concat(),
+            [continued("continued", unlogged.path()), call("adopted")].concat(),
         )]);
         assert_eq!(counts(&of(after_unlogged.path())), (None, Some(2), None));
 

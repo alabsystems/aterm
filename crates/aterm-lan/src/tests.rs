@@ -464,6 +464,36 @@ fn a_served_socket_is_left_to_its_broker_and_a_stale_one_cleared() {
     assert!(!socket.exists(), "the stale socket is cleared");
 }
 
+#[test]
+fn an_actual_stale_broker_socket_survives_scheduling_delay() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let socket = root.path().join("broker.sock");
+    let serving = aterm_uds::kept_out(|| aterm_uds::CtlListener::bind(&socket)).unwrap();
+    drop(serving);
+    crate::server::prepare_at(&socket, std::time::Instant::now() - Duration::from_secs(11))
+        .unwrap();
+    assert!(!socket.exists());
+    let serving = aterm_uds::kept_out(|| aterm_uds::CtlListener::bind(&socket)).unwrap();
+    assert_eq!(
+        crate::server::prepare_at(&socket, std::time::Instant::now() - Duration::from_secs(11))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    assert!(socket.exists());
+    drop(serving);
+    assert_eq!(
+        crate::server::prepare_at(&socket, std::time::Instant::now() - Duration::from_secs(61))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::TimedOut
+    );
+    assert!(
+        socket.exists(),
+        "an expired probe never establishes staleness"
+    );
+}
+
 /// Every passed socket arrives with its receive side whole: the broker holds its copy until the
 /// client took it in ([`aterm_uds::lan::wire::pass`]), so bytes sent to it after the pass are read.
 #[test]

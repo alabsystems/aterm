@@ -20,6 +20,7 @@ fn a_pooled_turn_end_cannot_prove_a_known_wrong_identity() {
             sid: "s-one".into(),
             at: NOW,
             took: false,
+            native_receipt: None,
         };
         store
             .transact(NOW, &mut None, |state| {

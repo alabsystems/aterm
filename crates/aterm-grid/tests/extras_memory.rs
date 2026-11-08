@@ -3,41 +3,24 @@
 
 //! Compare sparse extras' retained-memory estimate with allocator observations.
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use aterm_bench::allocator::{Observed, Observer};
+use std::alloc::System;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static ALLOCATED: AtomicU64 = AtomicU64::new(0);
 static FREED: AtomicU64 = AtomicU64::new(0);
 struct Counting;
 
-// SAFETY: all pointers and layouts pass through unchanged to System.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: forwarding the caller's layout.
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() {
-            ALLOCATED.fetch_add(layout.size() as u64, Ordering::Relaxed);
-        }
-        ptr
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        FREED.fetch_add(layout.size() as u64, Ordering::Relaxed);
-        // SAFETY: forwarding the caller's live allocation and layout.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        // SAFETY: forwarding the caller's live allocation, layout and new size.
-        let next = unsafe { System.realloc(ptr, layout, size) };
-        if !next.is_null() {
-            ALLOCATED.fetch_add(size as u64, Ordering::Relaxed);
-            FREED.fetch_add(layout.size() as u64, Ordering::Relaxed);
-        }
-        next
+// SAFETY: the callback uses only nonallocating, nonpanicking atomic arithmetic.
+unsafe impl Observer for Counting {
+    fn retained(&self, old: usize, new: usize) {
+        ALLOCATED.fetch_add(new as u64, Ordering::Relaxed);
+        FREED.fetch_add(old as u64, Ordering::Relaxed);
     }
 }
 
 #[global_allocator]
-static ALLOC: Counting = Counting;
+static ALLOC: Observed<System, Counting> = Observed::new(System, Counting);
 
 fn live() -> u64 {
     ALLOCATED.load(Ordering::Relaxed) - FREED.load(Ordering::Relaxed)

@@ -5,7 +5,7 @@
 //! `computers` table, the sheets and the roster, each alone and all in one run.
 
 use super::super::{
-    Input, Mode, Plan, Sheet, Step, covered, dump_sheets, plan,
+    Input, Mode, Plan, Sheet, SheetKind, Step, covered, dump_sheets, plan,
     tests::{SEALER, Stand, logins, vault},
 };
 use super::*;
@@ -525,8 +525,8 @@ fn a_name_two_sources_claim_links_nothing() {
 
 /// Each of the roster's words finds a row: a known Mac's name that cannot land stays the row's
 /// alias, a label another row holds is a finding on the column, and a row's owner keeps its label.
-/// NEGATIVE CONTROL: with `known_label` not wanting the name as an alias (its `label_lands` branch
-/// dropped), the import retracts the name the roster now gives the Mac: `left: Some(Bool(false))
+/// NEGATIVE CONTROL: with `land_label` not wanting the name as an alias (its `label_lands` branch
+/// dropped), the name the roster now gives the Mac is wanted nowhere: `left: None
 /// right: Some(Bool(true))`.
 #[test]
 fn a_roster_name_the_row_cannot_take_stays_an_alias() {
@@ -562,8 +562,8 @@ fn a_roster_name_the_row_cannot_take_stays_an_alias() {
 
 /// The roster's label on a row found by node, while another row holds that name, is a finding on
 /// `label`: the label stays put and is not given to a second holder.
-/// NEGATIVE CONTROL: with `known_label`'s `name_clash` return dropped: `left: Some(String("m120"))
-/// right: None`.
+/// NEGATIVE CONTROL: with `known_label` landing the label without asking `label_clash`:
+/// `left: Some(String("m120")) right: None`.
 #[test]
 fn a_roster_label_another_row_holds_is_a_finding() {
     let row = keys::machine_pk("m12");
@@ -997,7 +997,7 @@ fn a_stated_node_finds_its_row_under_a_contested_name() {
 /// A name a sheet still says survives the roster replacing its own label with a new one: it stays
 /// the row's as an alias, wanted by the sheet from then on, so no later run births a row for it or
 /// retracts it. A name nothing says any more is simply gone.
-/// NEGATIVE CONTROL: with `known_label` keeping no alias (`replaced` always `None`), the row loses
+/// NEGATIVE CONTROL: with `land_label` keeping no alias (`replaced` always `None`), the row loses
 /// the sheet's old name: `left: None right: Some(Bool(true))`. With `alias_element` not recording
 /// the name, a replica's alias column does the same.
 #[test]
@@ -1370,4 +1370,1221 @@ fn a_lower_source_compares_against_the_row_the_alias_means() {
         wanted(&plan, &keys::machine_pk("m36"), "aliases.m104"),
         Some(&json!(true))
     );
+}
+
+fn computers_sheet(rows: &[&str]) -> Sheet {
+    let mut bytes =
+        b"ID,Make,Arch,OS,Processor,RAM,HD,Aliases,Nickname,Nickname Aliases,Location,Notes\n"
+            .to_vec();
+    for row in rows {
+        bytes.extend_from_slice(row.as_bytes());
+        bytes.push(b'\n');
+    }
+    Sheet::parse(SheetKind::Computers, "alab-computers.csv", &bytes).unwrap()
+}
+
+fn aliases_of(cells: &Cells, pk: &str) -> Vec<String> {
+    cell::project(&MACHINE, cells).rows[pk]
+        .fields
+        .get("aliases")
+        .map(|field| field.members().iter().map(|m| (*m).to_owned()).collect())
+        .unwrap_or_default()
+}
+
+/// Every name on more than one live row.
+fn names_on_two_rows(cells: &Cells) -> Vec<String> {
+    let machines = cell::project(&MACHINE, cells);
+    let mut held: BTreeMap<&str, usize> = BTreeMap::new();
+    for row in machines.rows.values().filter(|row| row.live()) {
+        for name in row_names(row) {
+            *held.entry(name).or_default() += 1;
+        }
+    }
+    held.into_iter()
+        .filter(|(_, rows)| *rows > 1)
+        .map(|(name, _)| name.to_owned())
+        .collect()
+}
+
+fn label_at(cells: &Cells, pk: &str) -> Option<Value> {
+    cell::project(&MACHINE, cells).rows[pk]
+        .get("label")
+        .cloned()
+}
+
+/// A replica a fuller source of the same import wrote first adds no cell: the plan of it alone wants
+/// only its own source row, and that is no cell of the replica, so it judges covered for good. A row
+/// the registry lacks still does not.
+/// NEGATIVE CONTROL: with `judge` calling any plan that writes uncovered, a replica repeating the sheet never
+/// settles: `[Uncovered { kind: "unwritten", collection: None, pk: None, column: None }]`.
+#[test]
+fn a_replica_a_fuller_source_wrote_judges_covered() {
+    let computers = json!([{"label": "m50", "hostname": "m50.local", "make": "Apple",
+        "status": "active"}]);
+    let mut sheets = vec![computers_sheet(&["m50,Apple,,,,,,,,,,"])];
+    sheets.extend(replica(computers.clone(), Mode::FillOnly));
+    let mut book = Book::new();
+    let first = plan(&input(&sheets, &[]), &book.cells()).unwrap();
+    let cells = apply(&mut book, &first);
+    let alone = plan(&input(&replica(computers, Mode::FillOnly), &[]), &cells).unwrap();
+    assert_eq!(alone.rows.len(), 1, "{:?}", alone.planned);
+    assert_eq!(
+        alone.rows[0][0].collection,
+        crate::alab::registry::SOURCE.name
+    );
+    let uncovered = covered::judge(&alone, &|_| false);
+    assert!(uncovered.is_empty(), "{uncovered:?}");
+    let more = json!([{"label": "m51", "hostname": "m51.local", "status": "active"}]);
+    let more = plan(&input(&replica(more, Mode::FillOnly), &[]), &cells).unwrap();
+    assert!(!covered::judge(&more, &|_| false).is_empty());
+}
+
+/// A table that moves an alias from one row it lists to another moves it in one plan, whether the
+/// row it moves to exists or not: no finding, no fold into the row that held it, and nothing left
+/// for the next plan.
+/// NEGATIVE CONTROL: with `rows_named` never asking `gives_up`, `m7` clashes on the name: `kinds` holds
+/// `label-ambiguous`, printed as `[Finding { kind: LabelAmbiguous, collection: Some("machine"), pk: None, ..`.
+#[test]
+fn a_name_a_table_moved_to_another_row_settles_in_one_plan() {
+    let holder = keys::machine_pk("m5");
+    let row = keys::machine_pk("m7");
+    for before in [
+        vec!["m5,Apple,,,,,,m104,,,,"],
+        vec!["m5,Apple,,,,,,m104,,,,", "m7,Apple,,,,,,,,,,"],
+    ] {
+        let mut book = Book::new();
+        let first = plan(&input(&[computers_sheet(&before)], &[]), &book.cells()).unwrap();
+        let cells = apply(&mut book, &first);
+        assert_eq!(aliases_of(&cells, &holder), ["m104"]);
+        let after = [computers_sheet(&[
+            "m5,Apple,,,,,,,,,,",
+            "m7,Apple,,,,,,m104,,,,",
+        ])];
+        let moved = plan(&input(&after, &[]), &cells).unwrap();
+        assert!(
+            !kinds(&moved).contains(&"label-ambiguous"),
+            "{:?}",
+            moved.findings
+        );
+        let cells = apply(&mut book, &moved);
+        assert!(aliases_of(&cells, &holder).is_empty());
+        assert_eq!(aliases_of(&cells, &row), ["m104"]);
+        let again = plan(&input(&after, &[]), &cells).unwrap();
+        assert!(again.rows.is_empty(), "{:?}", again.planned);
+    }
+}
+
+/// The row that gives a name up is in the plan that takes it, also where its own table row found no
+/// row, so the name never ends up on two rows.
+/// NEGATIVE CONTROL: with `names_given_up` leaving the holder out of the plan, `m5` keeps the name `m7`
+/// now holds too: `assertion failed: aliases_of(&cells, &holder).is_empty()`. With `disowns` ignoring
+/// `contested`, the last row loses the name: `left: [] right: ["m104"]`.
+#[test]
+fn the_row_giving_a_name_up_is_in_the_plan_that_takes_it() {
+    let holder = keys::machine_pk("m5");
+    let mut book = Book::new();
+    let before = [computers_sheet(&["m5,Apple,,,,,,m104,,,,"])];
+    let first = plan(&input(&before, &[]), &book.cells()).unwrap();
+    apply(&mut book, &first);
+    let other = keys::machine_pk("m5/2");
+    book.write(
+        2,
+        &[],
+        vec![
+            put(&MACHINE, &other, "label", json!("m5")),
+            put(&MACHINE, &other, "row", json!("live")),
+        ],
+    );
+    let after = [computers_sheet(&[
+        "m5,Apple,,,,,,,,,,",
+        "m7,Apple,,,,,,m104,,,,",
+    ])];
+    let moved = plan(&input(&after, &[]), &book.cells()).unwrap();
+    assert!(
+        kinds(&moved).contains(&"label-ambiguous"),
+        "{:?}",
+        moved.findings
+    );
+    let cells = apply(&mut book, &moved);
+    assert!(aliases_of(&cells, &holder).is_empty());
+    assert_eq!(aliases_of(&cells, &keys::machine_pk("m7")), ["m104"]);
+
+    // A name two sources give to two rows is taken from no row this plan does not otherwise reach.
+    let mut book = Book::new();
+    let first = plan(&input(&before, &[]), &book.cells()).unwrap();
+    apply(&mut book, &first);
+    book.write(
+        2,
+        &[],
+        vec![
+            put(&MACHINE, &other, "label", json!("m5")),
+            put(&MACHINE, &other, "row", json!("live")),
+        ],
+    );
+    let mut contested = replica(
+        json!([{"label": "m8", "hostname": "m8.local", "aliases": ["m104"], "status": "active"}]),
+        Mode::Authoritative,
+    );
+    contested.push(computers_sheet(&[
+        "m5,Apple,,,,,,,,,,",
+        "m7,Apple,,,,,,m104,,,,",
+    ]));
+    let held = plan(&input(&contested, &[]), &book.cells()).unwrap();
+    let cells = apply(&mut book, &held);
+    assert_eq!(aliases_of(&cells, &holder), ["m104"]);
+}
+
+/// A name no table moves stays the row's, which finds it for a source that goes by another name: a
+/// row of another table that states the name (a table lists its own rows, no other's), and a name a
+/// table's own row states beside a label it contests.
+/// NEGATIVE CONTROL: with `disowns` reading the alias off any table, the other source's `m7` births a row:
+/// `left: 1 right: 0`. With `disowns` ignoring the table's own row, the replica's `m104` is born under
+/// its own label: `left: Some(String("m104")) right: None`.
+#[test]
+fn a_name_no_table_moved_still_finds_its_row() {
+    let holder = keys::machine_pk("m5");
+    let seeded = || {
+        let mut book = Book::new();
+        let first = plan(
+            &input(&[computers_sheet(&["m5,Apple,,,,,,m104,,,,"])], &[]),
+            &book.cells(),
+        )
+        .unwrap();
+        let cells = apply(&mut book, &first);
+        (book, cells)
+    };
+    let (_, cells) = seeded();
+    let mut apart = replica(
+        json!([{"label": "m7", "hostname": "m7.local", "aliases": ["m104"], "status": "active"}]),
+        Mode::Authoritative,
+    );
+    apart.push(computers_sheet(&["m5,Apple,,,,,,,,,,"]));
+    let found = plan(&input(&apart, &[]), &cells).unwrap();
+    assert_eq!(new_machines(&found), 0, "{:?}", found.counts);
+    assert_eq!(wanted(&found, &holder, "aliases.m7"), Some(&json!(true)));
+
+    let (_, cells) = seeded();
+    let mut own = replica(
+        json!([{"label": "m104", "hostname": "m104.local", "status": "active"}]),
+        Mode::Authoritative,
+    );
+    own.push(computers_sheet(&[
+        "m5,Apple,,,,,,m104,,,,",
+        "m6,Apple,,,,,,m5,,,,",
+    ]));
+    let found = plan(&input(&own, &[]), &cells).unwrap();
+    assert_eq!(wanted(&found, &keys::machine_pk("m104"), "label"), None);
+}
+
+/// A name moved beside another the row keeps (`m104` and `m6` together, off a row holding both) stays
+/// a finding, the two names showing the row is that Mac: nothing is born and no name has two holders.
+/// A row the sources link to the table's row by its own label is that row, the owner's alias and all.
+/// NEGATIVE CONTROL: with `gives_up` ignoring `linked_to`, or `holds_disowned` answering `false`, the moved
+/// names raise no finding: the assertion prints `[]`. With `holds_disowned` ignoring the label, the
+/// linked row is a finding: `[Finding { kind: LabelAmbiguous, ..`.
+#[test]
+fn a_name_linked_to_what_a_row_keeps_stays_on_it() {
+    let holder = keys::machine_pk("m5");
+    let mut book = Book::new();
+    let first = plan(
+        &input(&[computers_sheet(&["m5,Apple,,,,,,m104 m6,,,,"])], &[]),
+        &book.cells(),
+    )
+    .unwrap();
+    let cells = apply(&mut book, &first);
+    assert_eq!(aliases_of(&cells, &holder), ["m104", "m6"]);
+    let moved = [computers_sheet(&[
+        "m5,Apple,,,,,,,,,,",
+        "m7,Apple,,,,,,m104 m6,,,,",
+    ])];
+    let held = plan(&input(&moved, &[]), &cells).unwrap();
+    assert!(
+        kinds(&held).contains(&"label-ambiguous"),
+        "{:?}",
+        held.findings
+    );
+    assert_eq!(new_machines(&held), 0, "{:?}", held.counts);
+    let cells = apply(&mut book, &held);
+    assert_eq!(aliases_of(&cells, &holder), ["m104", "m6"]);
+
+    let mut book = Book::new();
+    book.write(
+        2,
+        &[],
+        vec![
+            put(&MACHINE, &holder, "label", json!("m5")),
+            elem(&MACHINE, &holder, "aliases", "m104"),
+            put(&MACHINE, &holder, "row", json!("live")),
+        ],
+    );
+    let mut linked = replica(
+        json!([{"label": "m104", "hostname": "m104.local", "aliases": ["m5"], "status": "active"}]),
+        Mode::Authoritative,
+    );
+    linked.push(computers_sheet(&[
+        "m5,Apple,,,,,,,,,,",
+        "m7,Apple,,,,,,m104,,,,",
+    ]));
+    let found = plan(&input(&linked, &[]), &book.cells()).unwrap();
+    assert!(
+        !kinds(&found).contains(&"label-ambiguous"),
+        "{:?}",
+        found.findings
+    );
+    assert_eq!(new_machines(&found), 0, "{:?}", found.counts);
+    assert_eq!(wanted(&found, &holder, "aliases.m7"), Some(&json!(true)));
+}
+
+/// The owner's alias stands against a table that moves the name: a finding, nothing folded into the
+/// row that holds it, no row born for the table's row, and no second holder. A table that states
+/// neither what the row is called nor a second row for the name still finds the row, as a renamed
+/// Mac's old name does.
+/// NEGATIVE CONTROL: with `gives_up` taking any writer's alias, the table's `m7` is born with no finding:
+/// the `label-ambiguous` assertion prints `[]`. With `holds_disowned` answering `false`, `m7` folds into
+/// the owner's row, and the same assertion prints `[]`.
+#[test]
+fn an_owners_alias_stands_against_a_table_that_moves_it() {
+    let mut book = Book::new();
+    let holder = keys::machine_pk("m5");
+    book.write(
+        2,
+        &[],
+        vec![
+            put(&MACHINE, &holder, "label", json!("m5")),
+            elem(&MACHINE, &holder, "aliases", "m104"),
+            put(&MACHINE, &holder, "row", json!("live")),
+        ],
+    );
+    let cells = book.cells();
+    let moved = [computers_sheet(&[
+        "m5,Apple,,,,,,,,,,",
+        "m7,Apple,,,,,,m104,,,,",
+    ])];
+    let held = plan(&input(&moved, &[]), &cells).unwrap();
+    assert!(
+        kinds(&held).contains(&"label-ambiguous"),
+        "{:?}",
+        held.findings
+    );
+    assert_eq!(new_machines(&held), 0, "{:?}", held.counts);
+    assert_eq!(wanted(&held, &holder, "aliases.m7"), None);
+    assert_eq!(wanted(&held, &holder, "aliases.m104"), None);
+    let found = [computers_sheet(&["m7,Apple,,,,,,m104,,,,"])];
+    let found = plan(&input(&found, &[]), &cells).unwrap();
+    assert_eq!(new_machines(&found), 0, "{:?}", found.counts);
+    assert_eq!(wanted(&found, &holder, "aliases.m7"), Some(&json!(true)));
+}
+
+/// A chain of roster renames lands whole in one plan, whichever way the roster lists it, with no
+/// finding and nothing left for the next plan. A row that trades labels with another stays as it is,
+/// a finding on both.
+/// NEGATIVE CONTROL: with `label_clash` ignoring `leaves`, the Mac that waits never lands:
+/// `[Finding { kind: LabelAmbiguous, ..`, and likewise the three-Mac chain with one pass of `waits`. With
+/// no finding for a label that never lands, the trade prints `left: 0 right: 2`. With `leaves` trusting a
+/// label that cannot land, the assertion prints `[Finding { kind: OwnerKept, ..`, with no clash found;
+/// ignoring an alias the row holds, it prints `[]`; ignoring one it wants, the waiting Mac lands:
+/// `left: Some(String("m2")) right: Some(String("m1"))`, as it does with `label_clash` ignoring
+/// `contested`.
+#[test]
+fn a_chain_of_roster_renames_settles_in_one_plan() {
+    let was = [
+        roster(1, &[], Some(PRINCIPAL)),
+        roster(2, &[], Some(OTHER_PRINCIPAL)),
+    ];
+    let label_of = |cells: &Cells, node: &str| {
+        cell::project(&MACHINE, cells).rows[&keys::machine_pk(&format!("n-{node}"))]
+            .get("label")
+            .cloned()
+    };
+    let start = || {
+        let mut book = Book::new();
+        let first = plan(&input(&[], &was), &book.cells()).unwrap();
+        let cells = apply(&mut book, &first);
+        assert_eq!(label_of(&cells, PRINCIPAL), Some(json!("m1")));
+        assert_eq!(label_of(&cells, OTHER_PRINCIPAL), Some(json!("m2")));
+        (book, cells)
+    };
+    let a = roster(2, &[], Some(PRINCIPAL));
+    let b = roster(3, &[], Some(OTHER_PRINCIPAL));
+    for now in [[a.clone(), b.clone()], [b, a]] {
+        let (mut book, cells) = start();
+        let moved = plan(&input(&[], &now), &cells).unwrap();
+        assert!(
+            !kinds(&moved).contains(&"label-ambiguous"),
+            "{:?}",
+            moved.findings
+        );
+        let cells = apply(&mut book, &moved);
+        assert_eq!(label_of(&cells, PRINCIPAL), Some(json!("m2")));
+        assert_eq!(label_of(&cells, OTHER_PRINCIPAL), Some(json!("m3")));
+        let again = plan(&input(&[], &now), &cells).unwrap();
+        assert!(again.rows.is_empty(), "{:?}", again.planned);
+    }
+    let (_, cells) = start();
+    let swap = [
+        roster(2, &[], Some(PRINCIPAL)),
+        roster(1, &[], Some(OTHER_PRINCIPAL)),
+    ];
+    let swapped = plan(&input(&[], &swap), &cells).unwrap();
+    let held = swapped
+        .findings
+        .iter()
+        .filter(|finding| finding.kind == Kind::LabelAmbiguous)
+        .count();
+    assert_eq!(held, 2, "{:?}", swapped.findings);
+    assert!(
+        swapped
+            .planned
+            .iter()
+            .all(|planned| planned.column != "label" || planned.step != Step::Write),
+        "{:?}",
+        swapped.planned
+    );
+
+    // Each pass lands what the last one freed, however long the chain and whichever Mac comes first.
+    const THIRD: &str = "aabbccddeeff0011";
+    let mut book = Book::new();
+    let three = [
+        roster(1, &[], Some(PRINCIPAL)),
+        roster(2, &[], Some(OTHER_PRINCIPAL)),
+        roster(3, &[], Some(THIRD)),
+    ];
+    let first = plan(&input(&[], &three), &book.cells()).unwrap();
+    let cells = apply(&mut book, &first);
+    let renamed = [
+        roster(2, &[], Some(PRINCIPAL)),
+        roster(3, &[], Some(OTHER_PRINCIPAL)),
+        roster(4, &[], Some(THIRD)),
+    ];
+    let moved = plan(&input(&[], &renamed), &cells).unwrap();
+    assert!(
+        !kinds(&moved).contains(&"label-ambiguous"),
+        "{:?}",
+        moved.findings
+    );
+    let cells = apply(&mut book, &moved);
+    assert_eq!(label_of(&cells, PRINCIPAL), Some(json!("m2")));
+    assert_eq!(label_of(&cells, THIRD), Some(json!("m4")));
+
+    // A row that keeps the label after all keeps it from the Mac that waits: the owner labelled it,
+    // it holds the name as an alias too, or a sheet still says it.
+    let moves = [
+        roster(2, &[], Some(PRINCIPAL)),
+        roster(3, &[], Some(OTHER_PRINCIPAL)),
+    ];
+    let second = keys::machine_pk(&format!("n-{OTHER_PRINCIPAL}"));
+    let stays = |book: &mut Book, sheets: &[Sheet], cells: Cells| {
+        let held = plan(&input(sheets, &moves), &cells).unwrap();
+        assert!(
+            kinds(&held).contains(&"label-ambiguous"),
+            "{:?}",
+            held.findings
+        );
+        let cells = apply(book, &held);
+        assert_eq!(label_of(&cells, PRINCIPAL), Some(json!("m1")));
+        cells
+    };
+    let (mut book, _) = start();
+    let seen = book.all();
+    book.write(2, &seen, vec![put(&MACHINE, &second, "label", json!("m2"))]);
+    let cells = book.cells();
+    let cells = stays(&mut book, &[], cells);
+    assert_eq!(label_of(&cells, OTHER_PRINCIPAL), Some(json!("m2")));
+    let (mut book, _) = start();
+    book.write(2, &[], vec![elem(&MACHINE, &second, "aliases", "m2")]);
+    let cells = book.cells();
+    stays(&mut book, &[], cells);
+    let (mut book, cells) = start();
+    let sheet = [computers_sheet(&["m2,Apple,,,,,,,,,,"])];
+    let cells = stays(&mut book, &sheet, cells);
+    assert_eq!(label_of(&cells, OTHER_PRINCIPAL), Some(json!("m3")));
+    assert_eq!(aliases_of(&cells, &second), ["m2"]);
+
+    // A label a source contests never lands, on a row its node found and no row holding it.
+    let mut book = Book::new();
+    let one = [roster(1, &[], Some(PRINCIPAL))];
+    let first = plan(&input(&[], &one), &book.cells()).unwrap();
+    let cells = apply(&mut book, &first);
+    let sheet = [computers_sheet(&[
+        "m8,Apple,,,,,,m2,,,,",
+        "m9,Apple,,,,,,m2,,,,",
+    ])];
+    let contested = [roster(2, &[], Some(PRINCIPAL))];
+    let held = plan(&input(&sheet, &contested), &cells).unwrap();
+    assert!(
+        kinds(&held).contains(&"label-ambiguous"),
+        "{:?}",
+        held.findings
+    );
+    let cells = apply(&mut book, &held);
+    assert_eq!(label_of(&cells, PRINCIPAL), Some(json!("m1")));
+}
+
+/// A phone label a replica's phones table states replaces one an import made up for a number given
+/// with none (by a phones or emails sheet, or by a replica's emails table), in the same run and in a
+/// later one under `--fill-only` too, each in one plan that a plan over its result finds nothing to
+/// add to. A made-up label keeps clear of the found phone's new one, and a row the replica holds a
+/// concurrent delete for, minted for its number, takes the label it states. A label a replica's
+/// phones table wrote is judged as any cell is: a later fill-only dump's other label differs, and is
+/// not written.
+/// NEGATIVE CONTROL: with `finish` never letting a replica's label replace one an import made up,
+/// taking every dump table to state phone labels, or `phone` given no label for a row the replica
+/// holds a concurrent delete for: `[Uncovered { kind: "differs", collection: Some("phone"), ..
+/// column: Some("label") }]`. With every phone label an import wrote taken for one it made up, a
+/// later fill-only dump relabels the found phone: `[Planned { collection: "phone", .. column:
+/// "label", x: String("kitchen"), step: Write }, ..`.
+#[test]
+fn a_phone_label_a_replica_states_replaces_one_an_import_made_up() {
+    let sheets = |phones: Value, mode: Mode| {
+        dump_sheets(
+            "fleet-db-m104.json",
+            &aterm_json::to_vec(&phones).unwrap(),
+            mode,
+            &KEY,
+        )
+        .unwrap()
+    };
+    let numbered = |pairs: &[(&str, &str)]| {
+        let phones: Vec<Value> = pairs
+            .iter()
+            .map(|(last4, label)| json!({"phone": format!("+1415555{last4}"), "label": label}))
+            .collect();
+        json!({ "phones": phones })
+    };
+    let labels = |cells: &Cells| -> BTreeMap<String, String> {
+        cell::project(&crate::alab::registry::PHONE, cells)
+            .rows
+            .values()
+            .filter_map(|row| {
+                let last4 = row.get("last4")?.as_str()?.to_owned();
+                Some((last4, row.get("label")?.as_str()?.to_owned()))
+            })
+            .collect()
+    };
+    let settles = |book: &mut Book, sheets: &[Sheet]| {
+        let read = plan(&input(sheets, &[]), &book.cells()).unwrap();
+        let cells = apply(book, &read);
+        let again = plan(&input(sheets, &[]), &cells).unwrap();
+        assert!(again.rows.is_empty(), "{:?}", again.planned);
+        let judged = covered::judge(&again, &|_| false);
+        assert!(
+            !judged
+                .iter()
+                .any(|uncovered| uncovered.column.as_deref() == Some("label")),
+            "{judged:?}"
+        );
+        cells
+    };
+    let want = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(last4, label)| ((*last4).to_owned(), (*label).to_owned()))
+            .collect()
+    };
+
+    // A phones sheet states no label: the replica's lands beside it in one run, and over the label
+    // an earlier run made up for the sheet's number in the next.
+    let csv = Sheet::parse(
+        SheetKind::Phones,
+        "alab-phones.csv",
+        b"Phone Number,Carrier / Provider\n415-555-0102,Tello Mobile\n",
+    )
+    .unwrap();
+    let desk = sheets(numbered(&[("0102", "desk")]), Mode::FillOnly);
+    let mut together = vec![csv.clone()];
+    together.extend(desk.iter().cloned());
+    let mut book = Book::new();
+    let cells = settles(&mut book, &together);
+    assert_eq!(labels(&cells), want(&[("0102", "desk")]));
+    let mut book = Book::new();
+    let cells = settles(&mut book, std::slice::from_ref(&csv));
+    assert_eq!(labels(&cells), want(&[("0102", "phone-1")]));
+    let cells = settles(&mut book, &desk);
+    assert_eq!(labels(&cells), want(&[("0102", "desk")]));
+    // So does a replica's emails table, whose phone numbers carry no label.
+    let mut book = Book::new();
+    let emails = json!({"emails": [{"email": "ann@example.invalid", "phone": "+14155550109"}]});
+    let cells = settles(&mut book, &sheets(emails, Mode::FillOnly));
+    assert_eq!(labels(&cells), want(&[("0109", "phone-1")]));
+    let kitchen = numbered(&[("0109", "kitchen")]);
+    let cells = settles(&mut book, &sheets(kitchen, Mode::FillOnly));
+    assert_eq!(labels(&cells), want(&[("0109", "kitchen")]));
+
+    // An address's number the phones table lacks is minted a label clear of the found phone's new
+    // one.
+    let mut book = Book::new();
+    settles(
+        &mut book,
+        &sheets(numbered(&[("0101", "phone-1")]), Mode::FillOnly),
+    );
+    let mut both = numbered(&[("0101", "phone-2")]);
+    both.as_object_mut().unwrap().insert(
+        "emails".to_owned(),
+        json!([{"email": "ann@example.invalid", "phone": "+14155550109"}]),
+    );
+    let cells = settles(&mut book, &sheets(both, Mode::Authoritative));
+    assert_eq!(
+        labels(&cells),
+        want(&[("0101", "phone-2"), ("0109", "phone-3")])
+    );
+
+    // A row the replica holds a concurrent delete for, minted for its number, takes its label.
+    let mut book = Book::new();
+    let deleted = json!({"phones": [{"phone": "+14155550102", "label": "desk",
+        "_conflicts": [{"_deleted": true}]}]});
+    let read = plan(&input(&sheets(deleted, Mode::FillOnly), &[]), &book.cells()).unwrap();
+    apply(&mut book, &read);
+    let cells = settles(&mut book, &desk);
+    assert_eq!(labels(&cells), want(&[("0102", "desk")]));
+
+    // A label a replica's phones table wrote is judged as any cell is: another a later fill-only dump
+    // states differs, and is not written over it.
+    let number = |label: &str| json!({"phones": [{"phone": "+14155550100", "label": label}]});
+    let mut book = Book::new();
+    let first = dump_sheets(
+        "fleet-db-m104.json",
+        &aterm_json::to_vec(&number("desk")).unwrap(),
+        Mode::FillOnly,
+        &KEY,
+    )
+    .unwrap();
+    let minted = plan(&input(&first, &[]), &book.cells()).unwrap();
+    let cells = apply(&mut book, &minted);
+    let renamed = dump_sheets(
+        "fleet-db-m200.json",
+        &aterm_json::to_vec(&number("kitchen")).unwrap(),
+        Mode::FillOnly,
+        &KEY,
+    )
+    .unwrap();
+    let read = plan(&input(&renamed, &[]), &cells).unwrap();
+    let judged = covered::judge(&read, &|_| false);
+    assert!(
+        judged
+            .iter()
+            .any(|uncovered| uncovered.column.as_deref() == Some("label")),
+        "{judged:?}"
+    );
+    assert!(
+        !read
+            .planned
+            .iter()
+            .any(|planned| planned.column == "label" && planned.step == Step::Write),
+        "{:?}",
+        read.planned
+    );
+    let again = plan(&input(&first, &[]), &cells).unwrap();
+    assert!(again.rows.is_empty(), "{:?}", again.planned);
+}
+
+/// A row giving a name up leaves the name in the plan that takes it, whichever way the taker gets
+/// it: the roster's label on a row it holds, or on a row it births, where the table's own row that
+/// states the name found nothing.
+/// NEGATIVE CONTROL: with `names_given_up` leaving the giver out of the plan, or not run:
+/// `assertion failed: aliases_of(&cells, &giver).is_empty()`. With `rows_named` never asking
+/// `gives_up`, the roster's label never lands: `left: Some(String("m1")) right: Some(String("m2"))`.
+#[test]
+fn a_name_given_up_leaves_its_row_however_it_is_taken() {
+    let giver = keys::machine_pk("m5");
+    let others = roster(7, &[], Some(OTHER_PRINCIPAL));
+    let held = (
+        vec![roster(1, &[], Some(PRINCIPAL)), others.clone()],
+        vec!["m5,,,,,,,,,,,", "m7,,,,,,,m2,,,,"],
+        vec![roster(2, &[], Some(PRINCIPAL)), others.clone()],
+    );
+    // `m8` contests `m7`, so the name `m2` links to no other Mac and the roster births its row.
+    let born = (
+        Vec::new(),
+        vec!["m5,,,,,,,,,,,", "m7,,,,,,,m2,,,,", "m8,,,,,,,m7,,,,"],
+        vec![roster(2, &[], Some(PRINCIPAL))],
+    );
+    for (was, after, now) in [held, born] {
+        let mut book = Book::new();
+        let before = [computers_sheet(&["m5,,,,,,,m2,,,,"])];
+        let first = plan(&input(&before, &was), &book.cells()).unwrap();
+        let cells = apply(&mut book, &first);
+        assert_eq!(aliases_of(&cells, &giver), ["m2"]);
+        let moved = plan(&input(&[computers_sheet(&after)], &now), &cells).unwrap();
+        let cells = apply(&mut book, &moved);
+        let taker = keys::machine_pk(&format!("n-{PRINCIPAL}"));
+        assert_eq!(label_at(&cells, &taker), Some(json!("m2")));
+        assert!(aliases_of(&cells, &giver).is_empty());
+        assert_eq!(names_on_two_rows(&cells), Vec::<String>::new());
+    }
+}
+
+/// A roster name a row cannot take as its label lands as its alias while the row holding it moves
+/// off, in one plan, whichever way the roster lists them: no finding, nothing left for the next plan.
+/// NEGATIVE CONTROL: with `land_label` asking `alias_element` for the name, which sees the row still
+/// leaving it: `[Finding { kind: OwnerKept, .. }, Finding { kind: LabelAmbiguous, collection:
+/// Some("machine"), pk: Some("mc-332a629b80e94d25"), ..`. With the alias branch dropped: `left: []
+/// right: ["m2"]`.
+#[test]
+fn a_name_a_row_cannot_take_as_its_label_moves_with_the_row_leaving_it() {
+    let owned = keys::machine_pk(&format!("n-{PRINCIPAL}"));
+    let moving = keys::machine_pk(&format!("n-{OTHER_PRINCIPAL}"));
+    let (a, b) = (
+        roster(2, &[], Some(PRINCIPAL)),
+        roster(3, &[], Some(OTHER_PRINCIPAL)),
+    );
+    for now in [[a.clone(), b.clone()], [b, a]] {
+        let mut book = Book::new();
+        let was = [roster(2, &[], Some(OTHER_PRINCIPAL))];
+        let first = plan(&input(&[], &was), &book.cells()).unwrap();
+        apply(&mut book, &first);
+        let seen = book.all();
+        book.write(
+            2,
+            &seen,
+            vec![
+                put(&MACHINE, &owned, "label", json!("m1")),
+                put(&MACHINE, &owned, "row", json!("live")),
+            ],
+        );
+        let moved = plan(&input(&[], &now), &book.cells()).unwrap();
+        assert!(
+            !kinds(&moved).contains(&"label-ambiguous"),
+            "{:?}",
+            moved.findings
+        );
+        let cells = apply(&mut book, &moved);
+        assert_eq!(label_at(&cells, &owned), Some(json!("m1")));
+        assert_eq!(aliases_of(&cells, &owned), ["m2"]);
+        assert_eq!(label_at(&cells, &moving), Some(json!("m3")));
+        let again = plan(&input(&[], &now), &cells).unwrap();
+        assert!(again.rows.is_empty(), "{:?}", again.planned);
+    }
+}
+
+/// A plan moving names reaches the log so that no prefix of it shows a name on two rows, whichever
+/// row's key sorts first: a run can stop between records and a replica can hold only the first.
+/// NEGATIVE CONTROL: with `free_names_first` not run, a prefix shows the moved label on two rows:
+/// `left: ["m2"] right: []`; likewise with `land_label` pairing no row it frees, a pair waiting on a
+/// row already placed, and `names_given_up` pairing no taker by label (`left: ["m2"]`) or by alias
+/// (`left: ["m104"]`). With a pair of one row counted, the row taking its own alias waits behind
+/// itself: `left: ["m3"] right: []`.
+#[test]
+fn no_prefix_of_a_plan_shows_a_name_on_two_rows() {
+    let stays_one = |book: &mut Book, moved: &Plan| {
+        for changes in &moved.rows {
+            book.write(1, &[], changes.clone());
+            let cells = book.cells();
+            assert_eq!(names_on_two_rows(&cells), Vec::<String>::new());
+        }
+    };
+    const THIRD: &str = "aabbccddeeff0011";
+    for (a, b, c) in [
+        (PRINCIPAL, OTHER_PRINCIPAL, THIRD),
+        (THIRD, OTHER_PRINCIPAL, PRINCIPAL),
+        (OTHER_PRINCIPAL, PRINCIPAL, THIRD),
+        (OTHER_PRINCIPAL, THIRD, PRINCIPAL),
+    ] {
+        let mut book = Book::new();
+        let was = [
+            roster(1, &[], Some(a)),
+            roster(2, &[], Some(b)),
+            roster(3, &[], Some(c)),
+        ];
+        let first = plan(&input(&[], &was), &book.cells()).unwrap();
+        let cells = apply(&mut book, &first);
+        let now = [
+            roster(2, &[], Some(a)),
+            roster(3, &[], Some(b)),
+            roster(4, &[], Some(c)),
+        ];
+        let moved = plan(&input(&[], &now), &cells).unwrap();
+        stays_one(&mut book, &moved);
+        assert_eq!(
+            label_at(&book.cells(), &keys::machine_pk(&format!("n-{a}"))),
+            Some(json!("m2"))
+        );
+    }
+    // A row taking its own alias as its label, freeing its label for another, either key first.
+    for (x, y) in [(PRINCIPAL, OTHER_PRINCIPAL), (OTHER_PRINCIPAL, PRINCIPAL)] {
+        let mut book = Book::new();
+        let was = [roster(3, &[4], Some(x)), roster(2, &[], Some(y))];
+        let first = plan(&input(&[], &was), &book.cells()).unwrap();
+        let cells = apply(&mut book, &first);
+        let now = [roster(4, &[], Some(x)), roster(3, &[], Some(y))];
+        let moved = plan(&input(&[], &now), &cells).unwrap();
+        stays_one(&mut book, &moved);
+        assert_eq!(
+            label_at(&book.cells(), &keys::machine_pk(&format!("n-{y}"))),
+            Some(json!("m3"))
+        );
+    }
+    // An alias a table gives up and the roster gives another row as its label, whichever key sorts
+    // first.
+    for giver in ["m5", "m6", "m8", "m9", "m10", "m11"] {
+        let mut book = Book::new();
+        let was = [
+            roster(1, &[], Some(PRINCIPAL)),
+            roster(7, &[], Some(OTHER_PRINCIPAL)),
+        ];
+        let before = [computers_sheet(&[&format!("{giver},,,,,,,m2,,,,")])];
+        let first = plan(&input(&before, &was), &book.cells()).unwrap();
+        let cells = apply(&mut book, &first);
+        let after = [computers_sheet(&[
+            &format!("{giver},,,,,,,,,,,"),
+            "m7,,,,,,,m2,,,,",
+        ])];
+        let now = [
+            roster(2, &[], Some(PRINCIPAL)),
+            roster(7, &[], Some(OTHER_PRINCIPAL)),
+        ];
+        let moved = plan(&input(&after, &now), &cells).unwrap();
+        stays_one(&mut book, &moved);
+        assert!(aliases_of(&book.cells(), &keys::machine_pk(giver)).is_empty());
+    }
+    // An alias a table moves, to a row whose key sorts on either side of the row giving it up.
+    for (giver, taker) in [("m5", "m7"), ("m7", "m5")] {
+        let mut book = Book::new();
+        let before = [computers_sheet(&[
+            &format!("{giver},Apple,,,,,,m104,,,,"),
+            &format!("{taker},Apple,,,,,,,,,,"),
+        ])];
+        let first = plan(&input(&before, &[]), &book.cells()).unwrap();
+        let cells = apply(&mut book, &first);
+        let after = [computers_sheet(&[
+            &format!("{giver},Apple,,,,,,,,,,"),
+            &format!("{taker},Apple,,,,,,m104,,,,"),
+        ])];
+        let moved = plan(&input(&after, &[]), &cells).unwrap();
+        stays_one(&mut book, &moved);
+        assert_eq!(
+            aliases_of(&book.cells(), &keys::machine_pk(taker)),
+            ["m104"]
+        );
+    }
+}
+
+fn dump_of(file: &str, computers: Value) -> Vec<Sheet> {
+    let dump = aterm_json::to_vec(&json!({"computers": computers})).unwrap();
+    dump_sheets(file, &dump, Mode::FillOnly, &KEY).unwrap()
+}
+
+fn goes_by(cells: &Cells, pk: &str, name: &str) -> bool {
+    row_names(&cell::project(&MACHINE, cells).rows[pk]).contains(name)
+}
+
+/// An alias an edited replica no longer states of its row stays there, in either mode: what the
+/// replica's earlier import wrote is only reported, so the row the edit names it of does not take it
+/// too, and the name stays on one row.
+/// NEGATIVE CONTROL: with `reads_as_written` asking `said` for `wrote`, or `gives_up` not asking it,
+/// the name ends on two rows: `left: ["m104"] right: []`.
+#[test]
+fn an_alias_an_edited_replica_moves_stays_on_one_row() {
+    let holder = keys::machine_pk("m5");
+    for mode in [Mode::FillOnly, Mode::Authoritative] {
+        let mut book = Book::new();
+        book.write(
+            2,
+            &[],
+            vec![
+                put(&MACHINE, &holder, "label", json!("m5")),
+                put(&MACHINE, &holder, "row", json!("live")),
+            ],
+        );
+        let read = replica(
+            json!([{"label": "m5", "aliases": ["m104"], "status": "active"}]),
+            mode,
+        );
+        let first = plan(&input(&read, &[]), &book.cells()).unwrap();
+        let cells = apply(&mut book, &first);
+        assert_eq!(aliases_of(&cells, &holder), ["m104"]);
+        let mut edited = replica(
+            json!([{"label": "m5", "status": "active"},
+                {"label": "m7", "aliases": ["m104"], "status": "active"}]),
+            mode,
+        );
+        for sheet in &mut edited {
+            sheet.earlier = read.iter().map(|sheet| sheet.source.clone()).collect();
+        }
+        let moved = plan(&input(&edited, &[]), &cells).unwrap();
+        let cells = apply(&mut book, &moved);
+        assert_eq!(names_on_two_rows(&cells), Vec::<String>::new());
+        assert_eq!(aliases_of(&cells, &holder), ["m104"]);
+    }
+}
+
+/// A row a source reaches by what else it states, a host, a transport id or a mesh id, still
+/// answers the name that source calls it, as does a row a known Mac going by the name reaches: it
+/// is that row's, another table's claim is a finding, and the name stays on one row.
+/// NEGATIVE CONTROL: with `reached_stating` ignoring a source's node or host, or `gives_up`
+/// ignoring `reached_stating`, the name ends on two rows: `left: ["m104"] right: []`. With
+/// `reached_stating` ignoring a source's mesh id, the name moves off the row: `left: [] right:
+/// ["m104"]`. Ignoring a known Mac's principal cell, its transport or its host, the row loses it
+/// and the assertion prints its key, `mc-f6ec03807c70e0f8`; ignoring the Mac's own key,
+/// `mc-332a629b80e94d25`.
+#[test]
+fn a_name_a_source_still_gives_a_row_it_reaches_stays_on_it() {
+    let holder = keys::machine_pk("m5");
+    let other = keys::machine_pk("m7");
+    let other_row = |cell: (&str, Value)| {
+        vec![
+            put(&MACHINE, &other, "label", json!("m7")),
+            put(&MACHINE, &other, cell.0, cell.1),
+            put(&MACHINE, &other, "row", json!("live")),
+        ]
+    };
+    let moving = |node_id: Value| {
+        json!([
+            {"label": "m5", "hostname": "m5.local", "status": "active"},
+            {"label": "m7", "hostname": "m7.local", "node_id": node_id, "aliases": ["m104"],
+                "status": "active"},
+        ])
+    };
+    let transport = (("fleet_node", json!(OTHER_NODE)), json!(OTHER_NODE));
+    // A replica that found the row by its host, its transport id or its mesh id wrote the alias, and
+    // says so again.
+    for (stating, more, (theirs, their_id)) in [
+        (
+            json!({"label": "m104", "hostname": "Studio", "status": "active"}),
+            ("hosts", json!(["Studio"])),
+            transport.clone(),
+        ),
+        (
+            json!({"label": "m104", "hostname": "m104.local", "node_id": NODE, "status": "active"}),
+            ("fleet_node", json!(NODE)),
+            transport.clone(),
+        ),
+        (
+            json!({"label": "m104", "hostname": "m104.local", "node_id": format!("n-{PRINCIPAL}"),
+                "status": "active"}),
+            ("node", json!(PRINCIPAL)),
+            (
+                ("node", json!(OTHER_PRINCIPAL)),
+                json!(format!("n-{OTHER_PRINCIPAL}")),
+            ),
+        ),
+    ] {
+        let mut book = Book::new();
+        let mut rows = vec![
+            put(&MACHINE, &holder, "label", json!("m5")),
+            put(&MACHINE, &holder, more.0, more.1),
+            put(&MACHINE, &holder, "row", json!("live")),
+        ];
+        rows.extend(other_row(theirs));
+        book.write(2, &[], rows);
+        let stated = dump_of("fleet-db-m200.json", json!([stating]));
+        let first = plan(&input(&stated, &[]), &book.cells()).unwrap();
+        let cells = apply(&mut book, &first);
+        assert_eq!(aliases_of(&cells, &holder), ["m104"]);
+        let mut sheets = dump_of("fleet-db-m104.json", moving(their_id));
+        sheets.extend(stated);
+        let moved = plan(&input(&sheets, &[]), &cells).unwrap();
+        let cells = apply(&mut book, &moved);
+        assert_eq!(names_on_two_rows(&cells), Vec::<String>::new());
+        assert_eq!(aliases_of(&cells, &holder), ["m104"]);
+        assert!(aliases_of(&cells, &other).is_empty());
+    }
+    // A known Mac going by the name, by its principal, under its own key, by its transport and by
+    // its host.
+    let keyed = keys::machine_pk(&format!("n-{PRINCIPAL}"));
+    let mac = |more: fn(&mut KnownMac)| {
+        let mut mac = roster(104, &[], None);
+        more(&mut mac);
+        mac
+    };
+    for (mac, pk, cell) in [
+        (
+            mac(|mac| mac.node = Some(PRINCIPAL.to_owned())),
+            &holder,
+            Some(("node", json!(PRINCIPAL))),
+        ),
+        (
+            mac(|mac| mac.node = Some(PRINCIPAL.to_owned())),
+            &keyed,
+            None,
+        ),
+        (
+            mac(|mac| mac.fleet_node = Some(NODE.to_owned())),
+            &holder,
+            Some(("fleet_node", json!(NODE))),
+        ),
+        (
+            mac(|mac| mac.hosts = vec!["Studio".to_owned()]),
+            &holder,
+            Some(("hosts", json!(["Studio"]))),
+        ),
+    ] {
+        let mut book = Book::new();
+        if *pk == keyed {
+            let born = plan(
+                &input(&[], &[roster(5, &[], Some(PRINCIPAL))]),
+                &book.cells(),
+            )
+            .unwrap();
+            apply(&mut book, &born);
+        }
+        let before = [computers_sheet(&["m5,Apple,,,,,,m104,,,,"])];
+        let first = plan(&input(&before, &[]), &book.cells()).unwrap();
+        apply(&mut book, &first);
+        let seen = book.all();
+        let mut rows = other_row(transport.0.clone());
+        rows.extend(cell.map(|(column, x)| put(&MACHINE, pk, column, x)));
+        book.write(2, &seen, rows);
+        assert_eq!(aliases_of(&book.cells(), pk), ["m104"]);
+        let mut sheets = vec![computers_sheet(&["m5,Apple,,,,,,,,,,"])];
+        sheets.extend(dump_of("fleet-db-m104.json", moving(transport.1.clone())));
+        let moved = plan(&input(&sheets, &[mac]), &book.cells()).unwrap();
+        let cells = apply(&mut book, &moved);
+        assert_eq!(names_on_two_rows(&cells), Vec::<String>::new());
+        assert!(goes_by(&cells, pk, "m104"), "{pk}");
+        assert!(aliases_of(&cells, &other).is_empty(), "{pk}");
+    }
+}
+
+/// A row this plan comes to reach by a host or a node a source states beside a name still answers
+/// that name, whichever source the run reads first: a table read before that source gives the name
+/// to another row, and the plan keeps it on its row from the start, the table's claim a finding.
+/// NEGATIVE CONTROL: with `reached_later` finding nothing, or `reached_stating` not reading what the
+/// plan wants, the name ends on two rows: `left: ["m104"] right: []`.
+#[test]
+fn a_name_a_host_or_node_this_plan_writes_reaches_stays_on_its_row() {
+    let (holder, other) = (keys::machine_pk("m5"), keys::machine_pk("m7"));
+    for (one, two) in [
+        (
+            json!({"label": "m5", "hostname": "Studio", "status": "active"}),
+            json!({"label": "m104", "hostname": "Studio", "status": "active"}),
+        ),
+        (
+            json!({"label": "m5", "node_id": NODE, "status": "active"}),
+            json!({"label": "m104", "node_id": NODE, "status": "active"}),
+        ),
+    ] {
+        let mut book = Book::new();
+        let before = [computers_sheet(&[
+            "m5,Apple,,,,,,m104,,,,",
+            "m7,Apple,,,,,,,,,,",
+        ])];
+        let first = plan(&input(&before, &[]), &book.cells()).unwrap();
+        let cells = apply(&mut book, &first);
+        assert_eq!(aliases_of(&cells, &holder), ["m104"]);
+        let mut sheets = vec![computers_sheet(&[
+            "m5,Apple,,,,,,,,,,",
+            "m7,Apple,,,,,,m104,,,,",
+        ])];
+        sheets.extend(dump_of("fleet-db-m104.json", json!([one, two])));
+        let moved = plan(&input(&sheets, &[]), &cells).unwrap();
+        assert!(
+            kinds(&moved).contains(&"label-ambiguous"),
+            "{:?}",
+            moved.findings
+        );
+        let cells = apply(&mut book, &moved);
+        assert_eq!(names_on_two_rows(&cells), Vec::<String>::new());
+        assert_eq!(aliases_of(&cells, &holder), ["m104"]);
+        assert!(aliases_of(&cells, &other).is_empty());
+        let again = plan(&input(&sheets, &[]), &cells).unwrap();
+        let cells = apply(&mut book, &again);
+        assert_eq!(names_on_two_rows(&cells), Vec::<String>::new());
+        assert_eq!(aliases_of(&cells, &holder), ["m104"]);
+    }
+}
+
+/// Rows trading names write one of them first, and a row that only takes a name a trading row frees,
+/// or takes one from a row it trades nothing with, still waits for it, whichever key sorts first:
+/// no prefix shows that name on two rows.
+/// NEGATIVE CONTROL: with the fallback taking the lowest key left, the row taking `m103` goes first:
+/// `["m103"]`. With it taking the first row in any trade, `m6`'s trade goes before the row freeing
+/// `m104`: `["m102", "m104"]`. With only a trade waiting on no row outside it preferred, `first`
+/// goes before `middle`: `["m102", "m105"]`.
+#[test]
+fn a_row_taking_a_name_from_rows_trading_names_waits_for_it() {
+    let mut labels = ["m5", "m6", "m7"];
+    labels.sort_by_key(|label| keys::machine_pk(label));
+    let [taker, a, b] = labels;
+    let mut book = Book::new();
+    let before = [computers_sheet(&[
+        &format!("{a},Apple,,,,,,m101,,,,"),
+        &format!("{b},Apple,,,,,,m102 m103,,,,"),
+        &format!("{taker},Apple,,,,,,,,,,"),
+    ])];
+    let first = plan(&input(&before, &[]), &book.cells()).unwrap();
+    apply(&mut book, &first);
+    let after = [computers_sheet(&[
+        &format!("{a},Apple,,,,,,m102,,,,"),
+        &format!("{b},Apple,,,,,,m101,,,,"),
+        &format!("{taker},Apple,,,,,,m103,,,,"),
+    ])];
+    let moved = plan(&input(&after, &[]), &book.cells()).unwrap();
+    for changes in &moved.rows {
+        book.write(1, &[], changes.clone());
+        let doubled = names_on_two_rows(&book.cells());
+        assert!(!doubled.contains(&"m103".to_owned()), "{doubled:?}");
+    }
+    let cells = book.cells();
+    assert_eq!(aliases_of(&cells, &keys::machine_pk(a)), ["m102"]);
+    assert_eq!(aliases_of(&cells, &keys::machine_pk(b)), ["m101"]);
+    assert_eq!(aliases_of(&cells, &keys::machine_pk(taker)), ["m103"]);
+    assert_eq!(names_on_two_rows(&cells), Vec::<String>::new());
+
+    // Two trades, `m6` with `m8` and `m7` with `m9` (keys sorting `m6`, `m8`, `m7`, `m9`), and `m104`
+    // moving from `m7` to `m6`: the trade `m6` is in waits on the other, so that one goes first.
+    let mut book = Book::new();
+    let before = [computers_sheet(&[
+        "m6,Apple,,,,,,m101,,,,",
+        "m8,Apple,,,,,,m102,,,,",
+        "m7,Apple,,,,,,m103 m104,,,,",
+        "m9,Apple,,,,,,m105,,,,",
+    ])];
+    let first = plan(&input(&before, &[]), &book.cells()).unwrap();
+    apply(&mut book, &first);
+    let after = [computers_sheet(&[
+        "m6,Apple,,,,,,m102 m104,,,,",
+        "m8,Apple,,,,,,m101,,,,",
+        "m7,Apple,,,,,,m105,,,,",
+        "m9,Apple,,,,,,m103,,,,",
+    ])];
+    let moved = plan(&input(&after, &[]), &book.cells()).unwrap();
+    for changes in &moved.rows {
+        book.write(1, &[], changes.clone());
+        let doubled = names_on_two_rows(&book.cells());
+        assert!(!doubled.contains(&"m104".to_owned()), "{doubled:?}");
+    }
+    let cells = book.cells();
+    assert_eq!(
+        aliases_of(&cells, &keys::machine_pk("m6")),
+        ["m102", "m104"]
+    );
+    assert_eq!(names_on_two_rows(&cells), Vec::<String>::new());
+
+    // Two trades sharing a row (`first` with `middle`, `middle` with `last`) and `m105` moving from
+    // `last` to `first`, which trade nothing: the row trading with each row it takes from goes
+    // first, so `m105` never shows on two rows.
+    let [first, middle, last] = labels;
+    let mut book = Book::new();
+    let before = [computers_sheet(&[
+        &format!("{first},Apple,,,,,,m101,,,,"),
+        &format!("{middle},Apple,,,,,,m102 m103,,,,"),
+        &format!("{last},Apple,,,,,,m104 m105,,,,"),
+    ])];
+    let born = plan(&input(&before, &[]), &book.cells()).unwrap();
+    apply(&mut book, &born);
+    let after = [computers_sheet(&[
+        &format!("{first},Apple,,,,,,m102 m105,,,,"),
+        &format!("{middle},Apple,,,,,,m101 m104,,,,"),
+        &format!("{last},Apple,,,,,,m103,,,,"),
+    ])];
+    let moved = plan(&input(&after, &[]), &book.cells()).unwrap();
+    for changes in &moved.rows {
+        book.write(1, &[], changes.clone());
+        let doubled = names_on_two_rows(&book.cells());
+        assert!(!doubled.contains(&"m105".to_owned()), "{doubled:?}");
+    }
+    let cells = book.cells();
+    assert_eq!(
+        aliases_of(&cells, &keys::machine_pk(first)),
+        ["m102", "m105"]
+    );
+    assert_eq!(aliases_of(&cells, &keys::machine_pk(last)), ["m103"]);
+    assert_eq!(names_on_two_rows(&cells), Vec::<String>::new());
+}
+
+/// A table that lists a row by any name it goes by disowns the alias it states of another row: a
+/// renamed Mac's old name, and either candidate of a conflicted label. The renamed row gives the
+/// alias up; a conflicted label settles nothing, so it is a finding whichever candidate shows and
+/// the row keeps the name until it settles.
+/// NEGATIVE CONTROL: with `disowned` reading only the label shown, the renamed row keeps the
+/// name and folds the table's `m7` in: `left: ["m104", "m200", "m7"] right: ["m104"]`. With
+/// `gives_up` taking a conflicted label as settled, the table's claim raises nothing: `m5: []`. With
+/// the name left out of `names_kept`, or `finish` not reading it, the row loses it: the assertion
+/// prints `m5`. With `holds_disowned` reading only the label shown, a candidate's own row is a
+/// finding: `m5: [Finding { kind: LabelAmbiguous, ..`; ignoring the label, `m7: [Finding { ..`.
+#[test]
+fn a_table_disowns_by_any_name_a_row_goes_by() {
+    let holder = keys::machine_pk("m36");
+    let mut book = Book::new();
+    let before = [computers_sheet(&["m36,Apple,,,,,,m104 m200,,,,"])];
+    let first = plan(&input(&before, &[]), &book.cells()).unwrap();
+    let cells = apply(&mut book, &first);
+    let after = [computers_sheet(&[
+        "m104,Apple,,,,,,,,,,",
+        "m7,Apple,,,,,,m200,,,,",
+    ])];
+    let moved = plan(&input(&after, &[]), &cells).unwrap();
+    let cells = apply(&mut book, &moved);
+    assert_eq!(aliases_of(&cells, &holder), ["m104"]);
+    assert_eq!(aliases_of(&cells, &keys::machine_pk("m7")), ["m200"]);
+    assert_eq!(names_on_two_rows(&cells), Vec::<String>::new());
+
+    // A table stating a name of a row whose label is in dispute beside a candidate of it finds that
+    // row, whichever candidate shows.
+    let holder = keys::machine_pk("m5");
+    for (alone, beside) in [("m5", "m7"), ("m7", "m5")] {
+        let mut book = Book::new();
+        let before = [computers_sheet(&["m5,Apple,,,,,,m200,,,,"])];
+        let first = plan(&input(&before, &[]), &book.cells()).unwrap();
+        apply(&mut book, &first);
+        book.write(3, &[], vec![put(&MACHINE, &holder, "label", json!("m7"))]);
+        let after = [computers_sheet(&[
+            &format!("{alone},Apple,,,,,,,,,,"),
+            &format!("{beside},Apple,,,,,,m200,,,,"),
+        ])];
+        let found = plan(&input(&after, &[]), &book.cells()).unwrap();
+        assert!(
+            !kinds(&found).contains(&"label-ambiguous"),
+            "{beside}: {:?}",
+            found.findings
+        );
+        assert_eq!(new_machines(&found), 0, "{beside}: {:?}", found.counts);
+    }
+
+    for named in ["m5", "m6"] {
+        let mut book = Book::new();
+        let before = [computers_sheet(&["m5,Apple,,,,,,m200,,,,"])];
+        let first = plan(&input(&before, &[]), &book.cells()).unwrap();
+        apply(&mut book, &first);
+        book.write(3, &[], vec![put(&MACHINE, &holder, "label", json!("m6"))]);
+        let after = [computers_sheet(&[
+            &format!("{named},Apple,,,,,,,,,,"),
+            "m7,Apple,,,,,,m200,,,,",
+        ])];
+        let held = plan(&input(&after, &[]), &book.cells()).unwrap();
+        assert!(
+            kinds(&held).contains(&"label-ambiguous"),
+            "{named}: {:?}",
+            held.findings
+        );
+        assert_eq!(new_machines(&held), 0, "{named}: {:?}", held.counts);
+        assert_eq!(wanted(&held, &holder, "aliases.m7"), None);
+        let cells = apply(&mut book, &held);
+        assert!(
+            aliases_of(&cells, &holder).contains(&"m200".to_owned()),
+            "{named}"
+        );
+        let again = plan(&input(&after, &[]), &cells).unwrap();
+        assert!(again.rows.is_empty(), "{named}: {:?}", again.planned);
+    }
+}
+
+/// A roster name that a row's conflicted label shows asks for no alias of it; with another candidate
+/// showing, the name is wanted as an alias, so it still answers the row.
+/// NEGATIVE CONTROL: with `land_label` wanting the name as an alias of a row whose label shows
+/// it: `m6 beside Some(String("m6"))` and `left: true right: false`. With the alias branch dropped,
+/// the hidden candidate answers nothing: `m5 beside Some(String("m6"))`, `left: false right: true`.
+#[test]
+fn a_roster_name_a_conflicted_label_shows_wants_no_alias() {
+    let row = keys::machine_pk(&format!("n-{PRINCIPAL}"));
+    for name in [5, 6] {
+        let mut book = Book::new();
+        let born = plan(
+            &input(&[], &[roster(5, &[], Some(PRINCIPAL))]),
+            &book.cells(),
+        )
+        .unwrap();
+        apply(&mut book, &born);
+        book.write(3, &[], vec![put(&MACHINE, &row, "label", json!("m6"))]);
+        let cells = book.cells();
+        let shown = label_at(&cells, &row);
+        let label = format!("m{name}");
+        let read = plan(&input(&[], &[roster(name, &[], Some(PRINCIPAL))]), &cells).unwrap();
+        assert_eq!(
+            wanted(&read, &row, &format!("aliases.{label}")).is_some(),
+            shown != Some(json!(label)),
+            "{label} beside {shown:?}: {:?}",
+            read.planned
+        );
+    }
 }

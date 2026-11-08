@@ -4,7 +4,9 @@
 //! `aterm db alab merge`: fold each duplicate machine row into the one row its Mac is bound to,
 //! with the registry's own `merged_into`. Rows that share a name, as a label or an alias, are one
 //! Mac when exactly one of them holds a node cell: that row stays, and the others end up
-//! `row=merged` pointing at it.
+//! `row=merged` pointing at it. So are the row holding the node the roster states of a name and the
+//! row with no node answering that name: an import gave the roster's name a row before its Mac
+//! joined, and the Mac registered a row of its own under the name it went by.
 //!
 //! The row that stays takes the Mac's current name as its label: the roster's name among the
 //! rows' names, since the roster is what a Mac's membership goes by; with none, its own label
@@ -14,7 +16,17 @@
 //! stays stands, and so does a cell of a newer build's it cannot read. The row answers every host
 //! its duplicates answered, so a Mac that would have adopted a duplicate by host adopts it, and it
 //! stays `planned` where a duplicate waited for a Mac by name, the one way `register::pick` adopts by
-//! name. A duplicate's live preference moves to the row that stays and ends where it was.
+//! name. A duplicate's live preference moves to the row that stays and ends where it was, and so
+//! does one a Mac that had not yet heard of a merge wrote on a row since merged, unless a Mac's facts
+//! name that row or one its `merged_into` passes, which only that Mac moves off (lab model §6): a
+//! Mac whose facts show it rebound along that merge has.
+//!
+//! A row an old import called `active` that no Mac has joined goes back to `planned`, the one word
+//! `register::pick` adopts a Mac's label by: fleet_db wrote that `active` for every row, and left
+//! standing, the row's Mac would birth a row of its own under another label on first registration.
+//! Only an import's word on a row with no node, no host and no Mac's facts moves; the owner's stays,
+//! and a row the roster gives another Mac, or two Macs' names, is held. The `active` a Mac's joining
+//! brings back comes from the roster, once the Mac published its principal.
 //!
 //! Anything else is held and listed: two nodes, or a node the roster states of the name against
 //! the one the row holds, or of another name against it, are two Macs; no node gives no row to keep;
@@ -61,6 +73,8 @@ const PREFERENCE_IDENTITY: [&str; 3] = ["machine", "account", LIFECYCLE];
 const PROVENANCE: [&str; 2] = ["src", "notes_src"];
 /// The changes one record may hold (`att::pack`), for a row's carried cells.
 const RECORD: usize = 64;
+/// The machine columns that say whether a row waits for its Mac by name.
+const WAIT_COLUMNS: [&str; 4] = ["label", "status", "node", "hosts"];
 
 /// The roster's labels, each with the node cells it states of that Mac by column.
 pub type Roster = BTreeMap<String, BTreeMap<&'static str, String>>;
@@ -70,8 +84,20 @@ pub type Roster = BTreeMap<String, BTreeMap<&'static str, String>>;
 pub struct Plan {
     pub merges: Vec<Merge>,
     pub held: Vec<Held>,
+    /// Live preferences found on a row already merged, moved along its `merged_into`.
+    pub strays: Vec<Moved>,
+    /// The rows set to wait for their Mac.
+    pub waiting: Vec<Waiting>,
     /// Each entry stays whole in one record: a preference with its move, then the machine rows.
     pub rows: Vec<Vec<Change>>,
+}
+
+/// A row no Mac has joined, set back to `planned` so that its Mac adopts it by name.
+#[derive(Debug)]
+pub struct Waiting {
+    pub row: String,
+    /// The label it holds once this plan ran.
+    pub label: String,
 }
 
 /// One Mac's rows folded into the one that stays.
@@ -168,10 +194,49 @@ fn status_of(row: &Row) -> Option<&str> {
     value(row.fields.get("status")).and_then(Value::as_str)
 }
 
+/// What the Macs' own facts rows say of the machine rows: each one's `mac`, the row that Mac is, and
+/// `merged_into`, the row it rebound to after that row was merged, either unset. Only a Mac moves
+/// its own row (lab model §6).
+#[derive(Clone, Debug, Default)]
+pub struct Facts {
+    rows: Vec<(Option<String>, Option<String>)>,
+}
+
+impl Facts {
+    /// The facts rows, as `(mac, merged_into)`.
+    #[must_use]
+    pub fn new(rows: Vec<(Option<String>, Option<String>)>) -> Self {
+        Self { rows }
+    }
+
+    /// Whether a facts row names `pk`, as the row its Mac is or the one it rebound to.
+    fn binds(&self, pk: &str) -> bool {
+        self.rows.iter().any(|(mac, into)| {
+            [mac, into]
+                .into_iter()
+                .any(|row| row.as_deref() == Some(pk))
+        })
+    }
+
+    /// Whether every facts row naming `from` rebound to one of `onward`, the rows a merge chain goes
+    /// on to after `from`: its Mac has moved off `from` along that chain. A Mac that rebound onto
+    /// `from` (never in `onward`, which a chain passes once), or that went elsewhere, has not.
+    fn rebound(&self, from: &str, onward: &[&str]) -> bool {
+        self.rows
+            .iter()
+            .filter(|(mac, into)| {
+                [mac, into]
+                    .into_iter()
+                    .any(|row| row.as_deref() == Some(from))
+            })
+            .all(|(_, into)| into.as_deref().is_some_and(|to| onward.contains(&to)))
+    }
+}
+
 /// Whether no Mac is bound to `keep`: it has published no principal and no facts row names it, so its
 /// Mac has yet to adopt it.
-fn unbound(keep: &str, keeper: &Row, bound: &BTreeSet<String>) -> bool {
-    !bound.contains(keep) && value(keeper.fields.get("node")).is_none()
+fn unbound(keep: &str, keeper: &Row, facts: &Facts) -> bool {
+    !facts.binds(keep) && value(keeper.fields.get("node")).is_none()
 }
 
 /// The live rows that share a name with each other, transitively: each group of two or more.
@@ -208,6 +273,68 @@ fn shared_names(machines: &Projection) -> Vec<BTreeSet<&str>> {
         }
     }
     groups
+}
+
+/// The rows to judge as one Mac's: those sharing a name, joined by each pair the roster ties (see
+/// [`roster_ties`]), in key order of their first row.
+fn groups<'a>(machines: &'a Projection, roster: &Roster) -> Vec<BTreeSet<&'a str>> {
+    let mut groups = shared_names(machines);
+    for tie in roster_ties(machines, roster) {
+        let (joined, mut apart): (Vec<_>, Vec<_>) = groups
+            .into_iter()
+            .partition(|group| !group.is_disjoint(&tie));
+        apart.push(joined.into_iter().fold(tie, |mut all, group| {
+            all.extend(group);
+            all
+        }));
+        groups = apart;
+    }
+    groups.sort();
+    groups
+}
+
+/// The pairs of live rows the roster says are one Mac though they share no name: the one row
+/// holding a node cell the roster states of a label, and the one row answering that label, which
+/// holds no node cell of its own. That is how a Mac the roster names otherwise than it named itself
+/// keeps two rows: its own, bound to its node under the label it registered with, and the one an
+/// import gave the roster's name before the Mac joined, which `register::pick`, holding no node or
+/// host of it, could adopt only by that name.
+fn roster_ties<'a>(machines: &'a Projection, roster: &Roster) -> Vec<BTreeSet<&'a str>> {
+    let live: Vec<(&str, &Row)> = machines
+        .rows
+        .iter()
+        .filter(|(_, row)| row.live())
+        .map(|(pk, row)| (pk.as_str(), row))
+        .collect();
+    let holds_node = |row: &Row, column: &str, node: &str| {
+        value(row.fields.get(column)).and_then(Value::as_str) == Some(node)
+    };
+    let mut ties = Vec::new();
+    for (label, stated) in roster {
+        let bound: Vec<&str> = live
+            .iter()
+            .filter(|(_, row)| {
+                stated
+                    .iter()
+                    .any(|(column, node)| holds_node(row, column, node))
+            })
+            .map(|(pk, _)| *pk)
+            .collect();
+        let named: Vec<(&str, &Row)> = live
+            .iter()
+            .copied()
+            .filter(|(_, row)| names_of(row).contains(label))
+            .collect();
+        if let ([keep], [(other, row)]) = (bound.as_slice(), named.as_slice())
+            && keep != other
+            && NODE_CELLS
+                .iter()
+                .all(|column| !row.fields.contains_key(*column))
+        {
+            ties.push(BTreeSet::from([*keep, *other]));
+        }
+    }
+    ties
 }
 
 /// Whether a row holds different concurrent values anywhere, a set's elements included.
@@ -250,41 +377,282 @@ fn carried(field: &CellValue, version: u32) -> CellValue {
     }
 }
 
-/// Plan the merges of `machines`, moving `preferences`. `bound` holds the machine keys any Mac's
-/// own facts row names, which only that Mac rebinds; `roster` what the roster says of each label.
+/// Plan the merges of `machines`, moving `preferences`. `facts` holds what each Mac's own facts row
+/// names, which only that Mac rebinds; `roster` what the roster says of each label.
 ///
 /// # Errors
 /// A value carried breaks its column's type, which is a bug: nothing is written then.
 pub fn plan(
     machines: &Projection,
     preferences: &Projection,
-    bound: &BTreeSet<String>,
+    facts: &Facts,
     roster: &Roster,
 ) -> Result<Plan> {
     let mut plan = Plan::default();
-    for group in shared_names(machines) {
+    for group in groups(machines, roster) {
         let rows: Vec<(&str, &Row)> = group.iter().map(|&pk| (pk, &machines.rows[pk])).collect();
         let names: BTreeSet<String> = rows.iter().flat_map(|(_, row)| names_of(row)).collect();
-        match choose(&rows, preferences, bound, &names, roster) {
+        match choose(&rows, preferences, facts, &names, roster) {
             Err(why) => plan.held.push(Held {
                 rows: rows.iter().map(|(pk, _)| (*pk).to_owned()).collect(),
                 names: names.into_iter().collect(),
                 why,
             }),
             Ok((keep, label)) => {
-                let waits = unbound(keep, &machines.rows[keep], bound);
+                let waits = unbound(keep, &machines.rows[keep], facts);
                 merge_group(&mut plan, &rows, keep, label, &names, preferences, waits)?;
             }
         }
     }
+    move_strays(&mut plan, machines, preferences, facts)?;
+    wait_for_macs(&mut plan, machines, facts, roster)?;
     Ok(plan)
+}
+
+/// The live row a merged row's `merged_into` ends at, following this plan's merges too, or why it
+/// cannot be told: a cell it is decided by that this build cannot read, a dispute over one, a merged
+/// row on the way that a Mac's facts name and that Mac has not rebound off along the chain (only
+/// that Mac moves off it), or a chain that reaches no live row.
+fn merge_target(
+    plan: &Plan,
+    machines: &Projection,
+    facts: &Facts,
+    merged: &str,
+) -> std::result::Result<String, &'static str> {
+    // The merged rows passed, in order, then the live row reached and the one a merge of this plan
+    // keeps for it.
+    let mut path: Vec<&str> = Vec::new();
+    let mut at = merged;
+    while !path.contains(&at) {
+        let row = machines.rows.get(at).ok_or("no-merge-target")?;
+        if [LIFECYCLE, "merged_into"]
+            .iter()
+            .any(|column| row.raw.contains(*column))
+        {
+            return Err("unreadable");
+        }
+        if row.live() {
+            let keep = plan
+                .merges
+                .iter()
+                .find(|merge| merge.gone.iter().any(|gone| gone == at))
+                .map_or(at, |merge| merge.keep.as_str());
+            path.extend([at, keep]);
+            let passed = path.len() - 2;
+            if (0..passed).any(|n| facts.binds(path[n]) && !facts.rebound(path[n], &path[n + 1..]))
+            {
+                return Err("bound-by-its-mac");
+            }
+            return Ok(keep.to_owned());
+        }
+        if [LIFECYCLE, "merged_into"]
+            .iter()
+            .any(|column| matches!(row.fields.get(*column), Some(Field::Conflict { .. })))
+        {
+            return Err("conflicted");
+        }
+        if row.lifecycle() != Some("merged") {
+            return Err("no-merge-target");
+        }
+        path.push(at);
+        at = value(row.fields.get("merged_into"))
+            .and_then(Value::as_str)
+            .ok_or("no-merge-target")?;
+    }
+    Err("no-merge-target")
+}
+
+/// Move each live preference found on a row already merged. A Mac that has not yet heard of a merge
+/// writes one there, and preferences on such a row would count for nothing. What `choose` holds a
+/// merge for holds the move: a row a Mac's facts name, the stray's or one its `merged_into` passes,
+/// a preference or the one it would move onto that this build cannot read or that is in dispute. So
+/// does a `merged_into` that cannot be followed.
+fn move_strays(
+    plan: &mut Plan,
+    machines: &Projection,
+    preferences: &Projection,
+    facts: &Facts,
+) -> Result<()> {
+    for (pk, row) in &machines.rows {
+        let merged = row.lifecycle() == Some("merged");
+        let on_row = |row: &&Row| row.get("machine").and_then(Value::as_str) == Some(pk.as_str());
+        let stray: Vec<&Row> = preferences.rows.values().filter(on_row).collect();
+        if !merged || !stray.iter().any(|row| row.live()) {
+            continue;
+        }
+        let why = match merge_target(plan, machines, facts, pk) {
+            Err(why) => Some(why),
+            Ok(keep)
+                if stray.iter().any(|row| {
+                    unreadable_preference(row)
+                        || target_of(row, &keep, preferences).is_some_and(unreadable_preference)
+                }) =>
+            {
+                Some("unreadable")
+            }
+            Ok(keep)
+                if stray.iter().any(|row| {
+                    unsettled_preference(row)
+                        || target_of(row, &keep, preferences).is_some_and(conflicted)
+                }) =>
+            {
+                Some("conflicted")
+            }
+            Ok(keep) => {
+                let moved = match plan.merges.iter_mut().find(|merge| merge.keep == keep) {
+                    Some(merge) => &mut merge.preferences,
+                    None => &mut plan.strays,
+                };
+                move_preferences(&mut plan.rows, moved, pk, &keep, preferences)?;
+                None
+            }
+        };
+        if let Some(why) = why {
+            plan.held.push(Held {
+                rows: vec![pk.clone()],
+                names: Vec::new(),
+                why,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Set each row an import called `active` that no Mac has joined back to `planned`, with the
+/// provenance it has, so a later import can still correct it. A row a merge just decided, or holds,
+/// is left to that: the `status` or the host it took says what the row waits for already. A row the
+/// roster gives another Mac, or two names of the roster, is held: either Mac would adopt it.
+fn wait_for_macs(
+    plan: &mut Plan,
+    machines: &Projection,
+    facts: &Facts,
+    roster: &Roster,
+) -> Result<()> {
+    let carried = |merge: &&Merge| {
+        merge
+            .carried
+            .iter()
+            .any(|(_, column)| column == "status" || column == "hosts")
+    };
+    let decided: BTreeSet<&String> = plan
+        .held
+        .iter()
+        .flat_map(|held| &held.rows)
+        .chain(plan.merges.iter().flat_map(|merge| &merge.gone))
+        .chain(plan.merges.iter().filter(carried).map(|merge| &merge.keep))
+        .collect();
+    let mut waiting = Vec::new();
+    let mut held = Vec::new();
+    for (pk, row) in machines.rows.iter().filter(|(_, row)| row.live()) {
+        let Some(Field::Value(word)) = row.fields.get("status") else {
+            continue;
+        };
+        if decided.contains(pk)
+            || word.value.x != json!("active")
+            || word.value.s.is_none()
+            || !unbound(pk, row, facts)
+            || conflicted(row)
+            || WAIT_COLUMNS.iter().any(|column| row.raw.contains(*column))
+            || row
+                .get("hosts")
+                .and_then(Value::as_array)
+                .is_some_and(|hosts| !hosts.is_empty())
+        {
+            continue;
+        }
+        let merge = plan.merges.iter().find(|merge| merge.keep == *pk);
+        let Some(label) = merge
+            .map(|merge| merge.label_to.as_str())
+            .or_else(|| label_of(row))
+        else {
+            continue;
+        };
+        let names = names_of(row);
+        let mut on_roster = names.iter().filter(|name| roster.contains_key(*name));
+        let why = match (on_roster.next(), on_roster.next()) {
+            (Some(_), Some(_)) => Some("two-roster-names"),
+            (Some(name), None) if other_mac(row, name, roster) => Some("two-macs"),
+            _ => None,
+        };
+        if let Some(why) = why {
+            held.push(Held {
+                rows: vec![pk.clone()],
+                names: names.into_iter().collect(),
+                why,
+            });
+            continue;
+        }
+        waiting.push(Waiting {
+            row: pk.clone(),
+            label: label.to_owned(),
+        });
+        plan.rows.push(vec![cell::change(
+            &MACHINE,
+            CellKey {
+                pk,
+                col: "status",
+                elem: None,
+            },
+            &CellValue {
+                r: MACHINE.version,
+                x: json!("planned"),
+                s: word.value.s.clone(),
+                a: false,
+            },
+        )?]);
+    }
+    plan.waiting = waiting;
+    plan.held.extend(held);
+    Ok(())
+}
+
+/// Whether the roster says `row` is not the Mac it calls `name`: it states another node of `name`,
+/// or a node `row` holds of another label.
+fn other_mac(row: &Row, name: &str, roster: &Roster) -> bool {
+    let holds = |column: &str, node: &str| {
+        value(row.fields.get(column)).map(|held| held.as_str() == Some(node))
+    };
+    roster.get(name).is_some_and(|stated| {
+        stated
+            .iter()
+            .any(|(column, node)| holds(column, node) == Some(false))
+    }) || roster.iter().any(|(label, stated)| {
+        label != name
+            && stated
+                .iter()
+                .any(|(column, node)| holds(column, node) == Some(true))
+    })
+}
+
+/// Whether what says which preference this is may be a newer build's.
+fn unreadable_preference(row: &Row) -> bool {
+    PREFERENCE_IDENTITY
+        .iter()
+        .any(|column| row.raw.contains(*column))
+}
+
+/// Whether a preference's end is in dispute, so it may be live, or a live one holds a dispute: it is
+/// settled before it is left behind.
+fn unsettled_preference(row: &Row) -> bool {
+    matches!(row.fields.get(LIFECYCLE), Some(Field::Conflict { .. }))
+        || (row.live() && conflicted(row))
+}
+
+/// The preference this live one would move onto, on `keep`.
+fn target_of<'a>(row: &Row, keep: &str, preferences: &'a Projection) -> Option<&'a Row> {
+    if !row.live() {
+        return None;
+    }
+    let account = row.get("account").and_then(Value::as_str)?;
+    let target = keys::preference_pk(keep, account).ok()?;
+    preferences.rows.get(&target)
 }
 
 /// The row that stays and the label it takes, or why these rows are not merged.
 fn choose<'a>(
     rows: &[(&'a str, &Row)],
     preferences: &Projection,
-    bound: &BTreeSet<String>,
+    facts: &Facts,
     names: &BTreeSet<String>,
     roster: &Roster,
 ) -> std::result::Result<(&'a str, String), &'static str> {
@@ -292,30 +660,24 @@ fn choose<'a>(
         rows.iter()
             .any(|(pk, _)| row.get("machine").and_then(Value::as_str) == Some(*pk))
     };
-    // A preference whose end is in dispute may be live, so it is settled before it is left behind.
-    let unsettled = |row: &Row| {
-        matches!(row.fields.get(LIFECYCLE), Some(Field::Conflict { .. }))
-            || (row.live() && conflicted(row))
-    };
     // What says which preference this is, or whether a row is this Mac's, may be a newer build's.
     if rows.iter().any(|(_, row)| {
         NOT_CARRIED
             .iter()
             .chain(&["status"])
             .any(|column| row.raw.contains(*column))
-    }) || preferences.rows.values().any(|row| {
-        on_group(row)
-            && PREFERENCE_IDENTITY
-                .iter()
-                .any(|column| row.raw.contains(*column))
-    }) {
+    }) || preferences
+        .rows
+        .values()
+        .any(|row| on_group(row) && unreadable_preference(row))
+    {
         return Err("unreadable");
     }
     if rows.iter().any(|(_, row)| conflicted(row))
         || preferences
             .rows
             .values()
-            .any(|row| on_group(row) && unsettled(row))
+            .any(|row| on_group(row) && unsettled_preference(row))
     {
         return Err("conflicted");
     }
@@ -341,10 +703,7 @@ fn choose<'a>(
         }
         _ => return Err("two-macs"),
     };
-    if rows
-        .iter()
-        .any(|(pk, _)| *pk != keep && bound.contains(*pk))
-    {
+    if rows.iter().any(|(pk, _)| *pk != keep && facts.binds(pk)) {
         return Err("bound-by-its-mac");
     }
     let keeper = rows
@@ -375,44 +734,21 @@ fn choose<'a>(
         }
         Some(_) => false,
     };
-    if waiting && unbound(keep, keeper, bound) && !can_wait {
+    if waiting && unbound(keep, keeper, facts) && !can_wait {
         return Err("status-differs");
     }
-    // The preference a duplicate's moves onto may itself be in dispute.
-    let target_unsettled = preferences.rows.values().any(|row| {
-        on_group(row)
-            && row.live()
-            && row
-                .get("account")
-                .and_then(Value::as_str)
-                .and_then(|account| keys::preference_pk(keep, account).ok())
-                .and_then(|target| preferences.rows.get(&target))
-                .is_some_and(conflicted)
-    });
-    if target_unsettled {
+    if preferences
+        .rows
+        .values()
+        .any(|row| on_group(row) && target_of(row, keep, preferences).is_some_and(conflicted))
+    {
         return Err("conflicted");
     }
     let mut current = names.iter().filter(|name| roster.contains_key(*name));
     let label = match (current.next(), current.next()) {
         (Some(_), Some(_)) => return Err("two-roster-names"),
-        (Some(name), None) => {
-            let holds = |column: &str, node: &str| {
-                value(keeper.fields.get(column)).map(|held| held.as_str() == Some(node))
-            };
-            let other = roster[name]
-                .iter()
-                .any(|(column, node)| holds(column, node) == Some(false))
-                || roster.iter().any(|(label, stated)| {
-                    label != name
-                        && stated
-                            .iter()
-                            .any(|(column, node)| holds(column, node) == Some(true))
-                });
-            if other {
-                return Err("two-macs");
-            }
-            name.clone()
-        }
+        (Some(name), None) if other_mac(keeper, name, roster) => return Err("two-macs"),
+        (Some(name), None) => name.clone(),
         (None, _) => {
             let held = label_of(keeper);
             match held.or_else(|| names.first().map(String::as_str)) {
@@ -457,7 +793,13 @@ fn merge_group(
     // Each preference moves in its own entry, with its end, so a run cut short leaves it on one
     // row and the next run finds nothing left to move of it.
     for (pk, _) in &gone {
-        move_preferences(plan, &mut merge, pk, keep, preferences)?;
+        move_preferences(
+            &mut plan.rows,
+            &mut merge.preferences,
+            pk,
+            keep,
+            preferences,
+        )?;
     }
     let mut carries = Vec::new();
     for (pk, row) in &gone {
@@ -682,6 +1024,10 @@ fn carry_cells(
                 }
                 if needed && !taken {
                     let mut moved = carried(&candidate.value, MACHINE.version);
+                    // An import's `active` says nothing of a row that waits for its Mac by name.
+                    if status && waits && moved.x == json!("active") && moved.s.is_some() {
+                        moved.x = json!("planned");
+                    }
                     if status
                         && held.is_some_and(|word| word != &json!("planned"))
                         && let Some(Field::Value(word)) = there
@@ -712,10 +1058,11 @@ fn carry_cells(
     Ok(())
 }
 
-/// Move every live preference of duplicate `pk` to `keep`, each in an entry of its own.
+/// Move every live preference of row `pk` to `keep`, each in an entry of its own, listing it in
+/// `moved`, which says what each earlier move gave the row it reached.
 fn move_preferences(
-    plan: &mut Plan,
-    merge: &mut Merge,
+    rows: &mut Vec<Vec<Change>>,
+    moved: &mut Vec<Moved>,
     pk: &str,
     keep: &str,
     preferences: &Projection,
@@ -740,7 +1087,7 @@ fn move_preferences(
             continue;
         };
         let target = keys::preference_pk(keep, account)?;
-        let earlier = merge.preferences.iter().filter(|moved| moved.to == target);
+        let earlier = moved.iter().filter(|moved| moved.to == target);
         let given: BTreeSet<&str> = earlier
             .clone()
             .flat_map(|moved| moved.columns.iter().map(String::as_str))
@@ -831,8 +1178,8 @@ fn move_preferences(
             LIFECYCLE,
             &CellValue::owner(PREFERENCE.version, json!("ended")),
         )?);
-        plan.rows.push(entry);
-        merge.preferences.push(Moved {
+        rows.push(entry);
+        moved.push(Moved {
             from: from.clone(),
             to: target,
             how,
@@ -851,6 +1198,15 @@ impl Plan {
                 .map(|(from, column)| json!({"from": from, "column": column}))
                 .collect()
         };
+        let moved = |moved: &Moved| {
+            json!({
+                "from": moved.from,
+                "to": moved.to,
+                "how": moved.how.word(),
+                "columns": moved.columns,
+                "kept": moved.kept,
+            })
+        };
         json!({
             "merges": self.merges.iter().map(|merge| json!({
                 "keep": merge.keep,
@@ -860,13 +1216,12 @@ impl Plan {
                 "aliases_removed": merge.aliases_removed,
                 "carried": pairs(&merge.carried),
                 "kept": pairs(&merge.kept),
-                "preferences": merge.preferences.iter().map(|moved| json!({
-                    "from": moved.from,
-                    "to": moved.to,
-                    "how": moved.how.word(),
-                    "columns": moved.columns,
-                    "kept": moved.kept,
-                })).collect::<Vec<_>>(),
+                "preferences": merge.preferences.iter().map(moved).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "strays": self.strays.iter().map(moved).collect::<Vec<_>>(),
+            "waiting": self.waiting.iter().map(|waiting| json!({
+                "row": waiting.row,
+                "label": waiting.label,
             })).collect::<Vec<_>>(),
             "held": self.held.iter().map(|held| json!({
                 "rows": held.rows,

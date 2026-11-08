@@ -68,6 +68,7 @@ fn observe_case(state: &ModelState, legacy: bool, capture_late: bool) -> [(&'sta
                 sid: "s-one".into(),
                 at: NOW,
                 took: false,
+                native_receipt: None,
             });
             state.undo.push(accounts::Undo::default());
             Ok(accounts::note_auth(

@@ -72,6 +72,7 @@ fn preparation_case(moving: bool, default: bool, case: i64) -> ([(&'static str, 
                     sid: "first-canary".into(),
                     at: NOW - HOUR,
                     took: false,
+                    native_receipt: None,
                 });
             }
             if case == 7 && moving {
@@ -117,6 +118,7 @@ fn preparation_case(moving: bool, default: bool, case: i64) -> ([(&'static str, 
                         sid: "concurrent-canary".into(),
                         at: NOW,
                         took: false,
+                        native_receipt: None,
                     });
                     Ok(Vec::new())
                 })

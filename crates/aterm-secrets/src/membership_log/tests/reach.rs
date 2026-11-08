@@ -699,7 +699,7 @@ fn insert_checks_and_seats_give_the_verdicts_of_the_walks_they_replaced() {
         let mut broken = live.clone();
         broken.reach = Reach::default();
         MUTANT.set(Some(mutant));
-        for record in &live.order {
+        for record in live.order.iter() {
             broken
                 .reach
                 .push(record.parents().iter().map(|p| live.held[p]));

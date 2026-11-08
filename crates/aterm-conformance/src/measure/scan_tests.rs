@@ -1224,6 +1224,7 @@ fn index_of(count: usize, holes: &[i64], ticks: Option<Vec<i64>>) -> (RecordingI
             stamps,
             covered_from: Some(start),
             ticks: ticks.unwrap_or_default(),
+            all_composed_frames: false,
         },
         names,
     )
@@ -1319,6 +1320,105 @@ fn a_sampling_hole_between_lit_frames_is_never_charged_as_dark() {
     holes[9] = 200_000;
     let d = measure(&[true; 20], Some((0, 10_000)), &holes, None, None);
     assert_eq!((d.dark_us, d.sampling_hole_us), (0, 200_000));
+}
+
+fn complete_composition_index() -> (aterm_json::Value, Vec<String>) {
+    let mut intervals = vec![NOMINAL; 20];
+    intervals[9] = 200_000;
+    let (index, names) = index_of(20, &intervals, None);
+    let frames: Vec<_> = names
+        .iter()
+        .map(|name| {
+            aterm_json::json!({
+                "file": name, "t_us": index.stamps[name]
+            })
+        })
+        .collect();
+    (
+        aterm_json::json!({
+            "meta": {"mode": "offscreen-present-real", "frames_written": 20,
+                "dropped_frames": 0, "ring_skipped": 0, "evicted_frames": 0,
+                "decimated_frames": 0, "head_truncated": false, "resized_early_stop": false, "half_res": false,
+                "fps_cap": null, "covered_us": [1_000_000, *index.stamps.values().max().unwrap()]},
+            "frames": frames, "ticks": []
+        }),
+        names,
+    )
+}
+
+fn parse_index(value: &aterm_json::Value) -> RecordingIndex {
+    RecordingIndex::parse(aterm_json::to_string(value).unwrap().as_bytes()).unwrap()
+}
+
+#[test]
+fn a_complete_composition_history_charges_the_image_held_through_a_render_gap() {
+    let (raw, names) = complete_composition_index();
+    let index = parse_index(&raw);
+    let mut flags = vec![true; names.len()];
+    let duplicates = vec![false; names.len()];
+    let read = |flags: &[bool]| {
+        driven_window_darkness(Some(&index), Some((0, 250)), &names, flags, &duplicates)
+    };
+    let lit = read(&flags);
+    assert!(lit.all_composed_frames);
+    assert_eq!((lit.dark_us, lit.sampling_hole_us), (0, 200_000));
+    // NEGATIVE CONTROL: this composition is black and remains black throughout the gap.
+    // Counting one nominal frame here would incorrectly pass the existing blackout bound.
+    flags[9] = false;
+    let dark = read(&flags);
+    assert_eq!(dark.dark_us, 200_000);
+    assert!(2 * dark.dark_us > 3 * dark.nominal_dt_us);
+    assert!(!index.covers_all_composed_frames(&names[..names.len() - 1]));
+    let mut repeated = names.clone();
+    repeated[1] = repeated[0].clone();
+    assert!(!index.covers_all_composed_frames(&repeated));
+    assert!(
+        !driven_window_darkness(Some(&index), Some((0, 10_000)), &names, &flags, &duplicates)
+            .all_composed_frames
+    );
+}
+
+#[test]
+fn every_loss_rate_cap_or_missing_capture_account_withholds_complete_history() {
+    use aterm_json::json;
+    let (raw, names) = complete_composition_index();
+    assert!(parse_index(&raw).covers_all_composed_frames(&names));
+    for (key, wrong) in [
+        ("dropped_frames", json!(1)),
+        ("ring_skipped", json!(1)),
+        ("evicted_frames", json!(1)),
+        ("decimated_frames", json!(1)),
+        ("head_truncated", json!(true)),
+        ("resized_early_stop", json!(true)),
+        ("half_res", json!(true)),
+        ("fps_cap", json!(60)),
+        ("frames_written", json!(19)),
+        ("mode", json!("swapchain-tap")),
+        ("covered_us", json!([1_000_001, 1_488_000])),
+    ] {
+        for replacement in [Some(wrong), None] {
+            let mut mutant = raw.clone();
+            let meta = mutant
+                .as_object_mut()
+                .unwrap()
+                .get_mut("meta")
+                .unwrap()
+                .as_object_mut()
+                .unwrap();
+            match replacement {
+                Some(value) => {
+                    meta.insert(key.into(), value);
+                }
+                None => {
+                    meta.remove(key);
+                }
+            }
+            assert!(
+                !parse_index(&mutant).covers_all_composed_frames(&names),
+                "{key}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1429,6 +1529,7 @@ fn no_index_reports_not_measured() {
         stamps: extreme_stamps,
         covered_from: Some(i64::MIN),
         ticks: vec![0],
+        all_composed_frames: false,
     };
     let extreme = driven_window_darkness(
         Some(&extreme_idx),
@@ -1478,6 +1579,7 @@ fn recorded_take(band_frames: &[usize]) -> ScanReport {
             stamps,
             covered_from: Some(1_000_000),
             ticks: vec![],
+            all_composed_frames: false,
         }),
         driven_ms: Some((0, 96)),
         typed_row: None,

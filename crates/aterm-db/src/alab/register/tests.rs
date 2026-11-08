@@ -1916,6 +1916,61 @@ fn merge_reads_the_macs_own_facts() {
     assert_eq!(plan.held[0].why, "bound-by-its-mac");
 }
 
+/// A Mac whose row an old import called `active` births a row of its own under another label, and
+/// once `merge` set that row back it adopts it, through `pick` itself.
+/// NEGATIVE CONTROL: with `wait_for_macs` writing another word (`parked`), the Mac births again:
+/// `Born { mac: "mc-1d866dd060273165" }`.
+#[test]
+fn a_mac_adopts_the_row_merge_set_waiting() {
+    let row = keys::machine_pk("m7");
+    let imported = |col: &str, x: Value| {
+        cell::change(
+            &MACHINE,
+            CellKey {
+                pk: &row,
+                col,
+                elem: None,
+            },
+            &CellValue::imported(MACHINE.version, x, "sr-0123456789abcdef"),
+        )
+        .unwrap()
+    };
+    let mut book = Book::new();
+    book.write(
+        2,
+        &[],
+        vec![
+            imported("label", json!("m7")),
+            imported("status", json!("active")),
+            imported("row", json!("live")),
+        ],
+    );
+    let before = run(&me(), &probe(), &[ME], true, &book.cells(), &facts(&[]));
+    assert!(
+        matches!(before.outcome, Outcome::Born { .. }),
+        "{:?}",
+        before.outcome
+    );
+    let cells = book.cells();
+    let merged = crate::alab::merge::plan(
+        &cell::project(&MACHINE, &cells),
+        &cell::project(&crate::alab::registry::PREFERENCE, &cells),
+        &crate::alab::merge::Facts::default(),
+        &[("m7".to_owned(), Default::default())].into(),
+    )
+    .unwrap();
+    assert_eq!(merged.waiting.len(), 1, "{merged:?}");
+    for changes in &merged.rows {
+        let seen = book.all();
+        book.write(2, &seen, changes.clone());
+    }
+    let adopted = run(&me(), &probe(), &[ME], true, &book.cells(), &facts(&[]));
+    match adopted.outcome {
+        Outcome::Adopted { mac, .. } => assert_eq!(mac, row),
+        other => panic!("{other:?}"),
+    }
+}
+
 /// A Mac that could adopt a duplicate by name adopts the row that stays, through `pick` itself: a
 /// merge leaves it no reason to birth a third row.
 /// NEGATIVE CONTROL: with `status_moves` never moving `planned` onto a row that waits, the Mac births:
@@ -1956,7 +2011,7 @@ fn a_mac_adopts_the_row_a_merge_kept() {
     let merged = crate::alab::merge::plan(
         &cell::project(&MACHINE, &cells),
         &cell::project(&crate::alab::registry::PREFERENCE, &cells),
-        &BTreeSet::new(),
+        &crate::alab::merge::Facts::default(),
         &[("m7".to_owned(), Default::default())].into(),
     )
     .unwrap();

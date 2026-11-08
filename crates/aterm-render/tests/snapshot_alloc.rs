@@ -3,7 +3,8 @@
 
 //! Counting-allocator tests for CPU snapshot framebuffer transfers, zoomed inline image raster budgets, and decode caching.
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use aterm_bench::allocator::{Observed, Observer};
+use std::alloc::System;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -15,21 +16,26 @@ static FRAME_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 /// The largest single allocation while [`TRACK_LARGEST`] is set.
 static LARGEST: AtomicUsize = AtomicUsize::new(0);
 static TRACK_LARGEST: AtomicBool = AtomicBool::new(false);
-/// Bytes currently live in the process and the peak live bytes since [`PEAK_LIVE`] was last reset.
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-static PEAK_LIVE: AtomicUsize = AtomicUsize::new(0);
 /// How many allocations of at least [`BIG_BYTES`] were made while it is non-zero.
 static BIG_BYTES: AtomicUsize = AtomicUsize::new(0);
 static BIG_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 /// The counters are process-wide: each test holds this while it reads them.
 static COUNTERS: Mutex<()> = Mutex::new(());
 
-struct CountingAlloc;
+/// Successfully retained requested bytes and their logical high-water mark, rather than the
+/// allocator's internal transient buffers or resident physical pages.
+struct CountingAlloc {
+    live: AtomicUsize,
+    peak: AtomicUsize,
+}
 
-fn note_live(grow: usize, shrink: usize) {
-    let live = LIVE.fetch_add(grow, Ordering::Relaxed) + grow;
-    PEAK_LIVE.fetch_max(live, Ordering::Relaxed);
-    LIVE.fetch_sub(shrink, Ordering::Relaxed);
+impl CountingAlloc {
+    const fn new() -> Self {
+        Self {
+            live: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        }
+    }
 }
 
 fn note_alloc(size: usize) {
@@ -45,39 +51,110 @@ fn note_alloc(size: usize) {
     }
 }
 
-// SAFETY: all operations forward the original arguments to System; the only
-// additional work is allocation-free atomic bookkeeping.
-unsafe impl GlobalAlloc for CountingAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        note_alloc(layout.size());
-        note_live(layout.size(), 0);
-        // SAFETY: forward the caller's valid layout unchanged.
-        unsafe { System.alloc(layout) }
+// SAFETY: the callbacks use only nonallocating, nonpanicking atomic arithmetic.
+unsafe impl Observer for CountingAlloc {
+    fn requested(&self, size: usize) {
+        note_alloc(size);
     }
 
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        note_alloc(layout.size());
-        note_live(layout.size(), 0);
-        // SAFETY: forward the caller's valid layout unchanged.
-        unsafe { System.alloc_zeroed(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        note_alloc(new_size);
-        note_live(new_size, layout.size());
-        // SAFETY: the pointer and layout came from this System-backed allocator.
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        note_live(0, layout.size());
-        // SAFETY: the pointer and layout came from this System-backed allocator.
-        unsafe { System.dealloc(ptr, layout) }
+    fn retained(&self, old: usize, new: usize) {
+        if new > old {
+            let growth = new - old;
+            let live = self
+                .live
+                .fetch_add(growth, Ordering::Relaxed)
+                .wrapping_add(growth);
+            self.peak.fetch_max(live, Ordering::Relaxed);
+        } else {
+            self.live.fetch_sub(old - new, Ordering::Relaxed);
+        }
     }
 }
 
 #[global_allocator]
-static GLOBAL: CountingAlloc = CountingAlloc;
+static GLOBAL: Observed<System, CountingAlloc> = Observed::new(System, CountingAlloc::new());
+
+#[test]
+fn retained_peak_preserves_in_place_realloc_and_refused_operations() {
+    use std::alloc::{GlobalAlloc, Layout};
+
+    let _counters = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // This allocator owns 512 bytes throughout each block's lifetime and accepts a smaller logical
+    // layout. Every supported reallocation is therefore deterministically in place.
+    struct InPlace;
+    const BACKING: Layout = Layout::new::<[u64; 64]>();
+    // SAFETY: successful requests fit BACKING's size/alignment. Realloc preserves the live block
+    // unchanged; null failures leave it owned by the caller. Deallocation uses its backing layout.
+    unsafe impl GlobalAlloc for InPlace {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if layout.size() > BACKING.size() || layout.align() > BACKING.align() {
+                return std::ptr::null_mut();
+            }
+            // SAFETY: BACKING is a nonzero valid layout, at least as large/aligned as requested.
+            unsafe { System.alloc(BACKING) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            if layout.size() > BACKING.size() || layout.align() > BACKING.align() {
+                return std::ptr::null_mut();
+            }
+            // SAFETY: BACKING is a nonzero valid layout, at least as large/aligned as requested.
+            unsafe { System.alloc_zeroed(BACKING) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, _layout: Layout, size: usize) -> *mut u8 {
+            if size == 128 || size > BACKING.size() {
+                std::ptr::null_mut()
+            } else {
+                ptr
+            }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+            // SAFETY: each live block came from System with BACKING and is freed only once.
+            unsafe { System.dealloc(ptr, BACKING) };
+        }
+    }
+
+    let allocator = Observed::new(InPlace, CountingAlloc::new());
+    let small = Layout::from_size_align(64, BACKING.align()).unwrap();
+    let grown = Layout::from_size_align(256, BACKING.align()).unwrap();
+    let shrunk = Layout::from_size_align(32, BACKING.align()).unwrap();
+    let too_large = Layout::from_size_align(1_024, BACKING.align()).unwrap();
+    // SAFETY: all accesses stay inside the current logical layout, successful reallocs preserve
+    // ownership, refused ones retain it, and the final logical block is deallocated exactly once.
+    unsafe {
+        assert!(allocator.alloc(too_large).is_null());
+        assert!(allocator.alloc_zeroed(too_large).is_null());
+        assert_eq!(allocator.observer().live.load(Ordering::Relaxed), 0);
+        assert_eq!(allocator.observer().peak.load(Ordering::Relaxed), 0);
+        let ptr = allocator.alloc_zeroed(small);
+        assert!(!ptr.is_null());
+        assert!(std::slice::from_raw_parts(ptr, 64).iter().all(|b| *b == 0));
+        ptr.write_bytes(0xa5, 32);
+        assert_eq!(allocator.realloc(ptr, small, 256), ptr);
+        assert_eq!(allocator.observer().live.load(Ordering::Relaxed), 256);
+        assert_eq!(allocator.observer().peak.load(Ordering::Relaxed), 256);
+        assert!(allocator.realloc(ptr, grown, 128).is_null());
+        assert!(allocator.realloc(ptr, grown, 1_024).is_null());
+        assert_eq!(allocator.observer().live.load(Ordering::Relaxed), 256);
+        assert_eq!(allocator.observer().peak.load(Ordering::Relaxed), 256);
+        assert_eq!(allocator.realloc(ptr, grown, 32), ptr);
+        assert!(
+            std::slice::from_raw_parts(ptr, 32)
+                .iter()
+                .all(|b| *b == 0xa5)
+        );
+        assert_eq!(allocator.observer().live.load(Ordering::Relaxed), 32);
+        assert_eq!(allocator.observer().peak.load(Ordering::Relaxed), 256);
+        allocator.dealloc(ptr, shrunk);
+        assert_eq!(allocator.observer().live.load(Ordering::Relaxed), 0);
+        assert_eq!(allocator.observer().peak.load(Ordering::Relaxed), 256);
+    }
+}
 
 fn count_frames<T>(bytes: usize, f: impl FnOnce() -> T) -> (T, usize) {
     FRAME_ALLOCS.store(0, Ordering::Relaxed);
@@ -109,15 +186,19 @@ fn red_sixel(w: usize, h: usize) -> Vec<u8> {
     sixel.into_bytes()
 }
 
-/// Returns `(result, largest_single_alloc, peak_live_delta)` for `f`.
+/// Returns `(result, largest_single_request, peak_retained_delta)` for `f`.
 fn largest_alloc<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
     LARGEST.store(0, Ordering::Relaxed);
-    let before = LIVE.load(Ordering::Relaxed);
-    PEAK_LIVE.store(before, Ordering::Relaxed);
+    let before = GLOBAL.observer().live.load(Ordering::Relaxed);
+    GLOBAL.observer().peak.store(before, Ordering::Relaxed);
     TRACK_LARGEST.store(true, Ordering::Relaxed);
     let result = f();
     TRACK_LARGEST.store(false, Ordering::Relaxed);
-    let peak = PEAK_LIVE.load(Ordering::Relaxed).saturating_sub(before);
+    let peak = GLOBAL
+        .observer()
+        .peak
+        .load(Ordering::Relaxed)
+        .saturating_sub(before);
     (result, LARGEST.load(Ordering::Relaxed), peak)
 }
 

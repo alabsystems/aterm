@@ -199,6 +199,7 @@ impl TransparentCommand {
                 &image,
                 &Placement {
                     inherit_all: true,
+                    inherit_signal_mask: true,
                     replace: true,
                     native_image: true,
                     long_entry_ends: true,
@@ -231,6 +232,8 @@ impl TransparentCommand {
             &image,
             &Placement {
                 inherit_all: true,
+                #[cfg(target_vendor = "apple")]
+                inherit_signal_mask: true,
                 long_entry_ends: cfg!(target_vendor = "apple"),
                 ..Placement::default()
             },

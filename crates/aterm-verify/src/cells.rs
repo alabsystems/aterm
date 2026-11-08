@@ -21,6 +21,9 @@ use aterm_forge::model::{Cell, Graph, PkgId};
 use crate::Ctx;
 
 #[cfg(test)]
+#[path = "cells_prerequisite_tests.rs"]
+mod prerequisite_tests;
+#[cfg(test)]
 #[path = "cells_unitgraph_tests.rs"]
 mod unit_graph_tests;
 #[path = "cells_units.rs"]
@@ -274,7 +277,12 @@ pub fn host_of(version: &str) -> Option<&str> {
 /// This machine's triple, as the run's `trustc` reports it.
 pub(crate) fn host_triple(ctx: &Ctx) -> Result<String, String> {
     let trustc = ctx.tools.stage2_dir.join("trustc");
-    let out = aterm_uds::spawnfd::command(&trustc)
+    exec::bounded(ctx.child_ceiling, move || host_triple_using(&trustc))
+        .unwrap_or_else(|why| Err(format!("`trustc -vV` {}", why.sentence())))
+}
+
+fn host_triple_using(trustc: &Path) -> Result<String, String> {
+    let out = aterm_uds::spawnfd::command(trustc)
         .arg("-vV")
         .output_owned()
         .map_err(|e| format!("could not run `{} -vV`: {e}", trustc.display()))?;
@@ -380,35 +388,160 @@ pub enum CellOutcome {
 /// The `cells` check's stage: one row per selected cell, the windows-sys oracles when a
 /// Windows cell is selected, then the `cshim` rows nothing could use.
 pub fn run(ctx: &Ctx, r: &mut Report) {
-    let policy = match crate::read_regular_text(ctx.root.join(POLICY))
+    run_prepared(ctx, r, None);
+}
+
+/// One invocation's inputs and terminal results for cells whose captured toolchain is unready.
+/// No resolved graph or readiness result is reused by another invocation.
+pub(crate) struct PreparedRun {
+    inputs: Result<Inputs, String>,
+}
+
+struct Inputs {
+    policy: Vec<Shim>,
+    host: String,
+    cells: Vec<Cell>,
+    stock: Result<rustup::Stock, rustup::Unready>,
+    members: Option<Result<Members, String>>,
+    cached: Vec<(Cell, CellOutcome, std::time::Duration)>,
+}
+
+fn inputs(ctx: &Ctx) -> Result<Inputs, String> {
+    let policy = crate::read_regular_text(ctx.root.join(POLICY))
         .map_err(|e| format!("cannot read {POLICY}: {e}"))
-        .and_then(|t| parse_policy(&t))
-    {
-        Ok(p) => p,
-        Err(why) => {
-            r.cannot_run(format!("cells — {why}"));
-            return;
-        }
-    };
-    let host = match host_triple(ctx) {
-        Ok(h) => h,
-        Err(why) => {
-            r.cannot_run(format!("cells — this machine's triple: {why}"));
-            return;
-        }
-    };
+        .and_then(|t| parse_policy(&t))?;
+    let host = host_triple(ctx).map_err(|why| format!("this machine's triple: {why}"))?;
     let cells = if ctx.cells_pulled {
         Ok(pulled_cells(&host))
     } else {
         selected(&ctx.cells, &host)
-    };
-    let cells = match cells {
-        Ok(c) => c,
+    }?;
+    Ok(Inputs {
+        policy,
+        host,
+        cells,
+        stock: stock_of(ctx),
+        members: None,
+        cached: Vec::new(),
+    })
+}
+
+fn validate_members(
+    ctx: &Ctx,
+    members: &mut Option<Result<Members, String>>,
+) -> Result<(), String> {
+    if let Ok(known) = members.get_or_insert_with(|| member_names(ctx)) {
+        let unknown = unknown_packages(&ctx.scope, &known.names);
+        if !unknown.is_empty() {
+            return Err(format!(
+                "-p {} is no workspace member's package name, so no cell can narrow to it \
+                 (a directory can have another name; vendored crates and dependencies are not \
+                 members, and `verify cells` with no -p checks them in the whole graph)",
+                unknown.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Capture the existing cell inputs without resolving any cell graph.
+pub(crate) fn prepare(ctx: &Ctx) -> PreparedRun {
+    PreparedRun {
+        inputs: inputs(ctx),
+    }
+}
+
+impl PreparedRun {
+    pub(crate) fn needs_resolution(&self) -> bool {
+        self.inputs.as_ref().is_ok_and(|inputs| {
+            inputs.cells.iter().any(|cell| {
+                cell.triple != inputs.host && serving(&inputs.stock, &cell.triple, true).is_err()
+            })
+        })
+    }
+
+    /// Resolve only unready cells under the caller's ordinary resource claim. The same
+    /// immutable stock snapshot prevents this walk from reaching a compiler command.
+    pub(crate) fn resolve_unready(&mut self, ctx: &Ctx) {
+        let result = self
+            .inputs
+            .as_mut()
+            .map_err(|why| why.clone())
+            .and_then(|inputs| {
+                for cell in &inputs.cells {
+                    if cell.triple == inputs.host
+                        || serving(&inputs.stock, &cell.triple, true).is_ok()
+                    {
+                        continue;
+                    }
+                    if cell_ended(ctx).is_some() {
+                        break;
+                    }
+                    validate_members(ctx, &mut inputs.members)?;
+                    let started = Instant::now();
+                    let outcome = check_cell(
+                        ctx,
+                        &inputs.stock,
+                        cell,
+                        &inputs.policy,
+                        &mut inputs.members,
+                    );
+                    inputs
+                        .cached
+                        .push((cell.clone(), outcome, started.elapsed()));
+                }
+                Ok(())
+            });
+        if let Err(why) = result {
+            self.inputs = Err(why);
+        }
+    }
+
+    /// Incomplete prerequisite observations, not check results or a reason to halt native work.
+    pub(crate) fn unavailable(&self, ctx: &Ctx) -> Vec<(String, String, String)> {
+        let Ok(inputs) = &self.inputs else {
+            return Vec::new();
+        };
+        let mut unavailable = inputs
+            .cached
+            .iter()
+            .filter_map(|(cell, outcome, _)| match outcome {
+                CellOutcome::CouldNotRun { status, detail } if status == "NO-TOOLCHAIN" => {
+                    Some((cell.name.clone(), cell.triple.clone(), detail.join("\n")))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if owes_win32_oracles(&inputs.cells, &ctx.scope, ctx.cells_pulled) {
+            for triple in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
+                if let Err(unready) = serving(&inputs.stock, triple, false) {
+                    unavailable.push(("win32 oracles".into(), triple.into(), unready.to_string()));
+                }
+            }
+        }
+        unavailable
+    }
+}
+
+pub(crate) fn run_prepared(ctx: &Ctx, r: &mut Report, prepared: Option<PreparedRun>) {
+    let prepared = prepared.unwrap_or_else(|| PreparedRun {
+        inputs: inputs(ctx),
+    });
+    let mut inputs = match prepared.inputs {
+        Ok(inputs) => inputs,
         Err(why) => {
             r.cannot_run(format!("cells — {why}"));
             return;
         }
     };
+    let Inputs {
+        policy,
+        host,
+        cells,
+        stock,
+        members,
+        cached,
+    } = &mut inputs;
     if ctx.cells_pulled {
         r.raw(format!(
             "cells: pulled by the selection, so one cell per other OS and one of this OS for its \
@@ -421,21 +554,11 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
                 .join(", ")
         ));
     }
-    let mut members: Option<Result<Members, String>> = None;
-    if let Ok(known) = members.get_or_insert_with(|| member_names(ctx)) {
-        let unknown = unknown_packages(&ctx.scope, &known.names);
-        if !unknown.is_empty() {
-            r.cannot_run(format!(
-                "cells — -p {} is no workspace member's package name, so no cell can narrow to it \
-                 (a directory can have another name; vendored crates and dependencies are not \
-                 members, and `verify cells` with no -p checks them in the whole graph)",
-                unknown.join(", ")
-            ));
-            return;
-        }
+    if let Err(why) = validate_members(ctx, members) {
+        r.cannot_run(format!("cells — {why}"));
+        return;
     }
-    let stock = stock_of(ctx);
-    for cell in &cells {
+    for cell in cells.iter() {
         // A cell that failed ends a run whose halt is armed before the next cell starts.
         crate::red_now(ctx, crate::checks::Check::Cells, r);
         let label = format!("cell {} ({})", cell.name, cell.triple);
@@ -445,33 +568,49 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
                 status: "NOT-STARTED".to_string(),
                 detail: vec![why],
             }
-        } else if cell.triple == host {
+        } else if cell.triple == *host {
             CellOutcome::Skipped {
                 why: "this machine's own triple, judged by its own build".to_string(),
                 fix: "targo --unverified verify lint test".to_string(),
             }
+        } else if let Some((_, outcome, _)) = cached.iter().find(|(known, _, _)| known == cell) {
+            outcome.clone()
         } else {
-            check_cell(ctx, &stock, cell, &policy, &mut members)
+            check_cell(ctx, stock, cell, policy, members)
         };
-        let took = format!("{label}: {}s", started.elapsed().as_secs());
+        let prepared = cached
+            .iter()
+            .find(|(known, _, _)| known == cell)
+            .map_or(std::time::Duration::ZERO, |(_, _, took)| *took);
+        let took = format!("{label}: {}s", (started.elapsed() + prepared).as_secs());
         record_cell(r, &label, took, outcome);
     }
-    if owes_win32_oracles(&cells, &ctx.scope, ctx.cells_pulled) {
-        win32_oracles(ctx, r, &stock);
+    if owes_win32_oracles(cells, &ctx.scope, ctx.cells_pulled) {
+        win32_oracles(ctx, r, stock);
     }
-    audit_policy(ctx, r, &policy, &cells);
+    audit_policy(ctx, r, policy, cells);
 }
 
 /// The checkout's stock pin as the `rustup` row (looked up on the run's `PATH`) holds it: the one
 /// toolchain every cell and both windows-sys oracles compile with.
 fn stock_of(ctx: &Ctx) -> Result<rustup::Stock, rustup::Unready> {
+    let (root, path) = (ctx.root.clone(), ctx.env.path.clone());
+    exec::bounded(ctx.child_ceiling, move || stock_using(&root, &path)).unwrap_or_else(|why| {
+        Err(rustup::Unready {
+            why: format!("stock pin discovery {}", why.sentence()),
+            fix: rustup::PROVISION.into(),
+        })
+    })
+}
+
+fn stock_using(root: &Path, path: &std::ffi::OsStr) -> Result<rustup::Stock, rustup::Unready> {
     let row = aterm_uds::host::tool("rustup");
     let found = row.locate_in(&aterm_uds::host::Lookup {
-        path: Some(ctx.env.path.clone()),
+        path: Some(path.to_owned()),
         ..aterm_uds::host::Lookup::host(row)
     });
     match found {
-        Ok(rustup) => rustup::pinned(rustup.as_path(), &ctx.root),
+        Ok(rustup) => rustup::pinned(rustup.as_path(), root),
         Err(absent) => Err(rustup::Unready {
             why: absent.why,
             fix: absent.fix,
@@ -1700,7 +1839,23 @@ impl Members {
 
 /// The workspace's members, from `targo metadata --no-deps`.
 fn member_names(ctx: &Ctx) -> Result<Members, String> {
-    let out = aterm_uds::spawnfd::command(&ctx.tools.targo)
+    let (targo, root, path) = (
+        ctx.tools.targo.clone(),
+        ctx.root.clone(),
+        ctx.path_env.clone(),
+    );
+    exec::bounded(ctx.child_ceiling, move || {
+        member_names_using(&targo, &root, &path)
+    })
+    .unwrap_or_else(|why| Err(format!("`targo metadata` {}", why.sentence())))
+}
+
+fn member_names_using(
+    targo: &Path,
+    root: &Path,
+    path: &std::ffi::OsStr,
+) -> Result<Members, String> {
+    let out = aterm_uds::spawnfd::command(targo)
         .args([
             "metadata",
             "--no-deps",
@@ -1709,8 +1864,8 @@ fn member_names(ctx: &Ctx) -> Result<Members, String> {
             "--format-version",
             "1",
         ])
-        .current_dir(&ctx.root)
-        .env("PATH", &ctx.path_env)
+        .current_dir(root)
+        .env("PATH", path)
         .output_owned()
         .map_err(|e| format!("could not run `targo metadata`: {e}"))?;
     if !out.status.success() {

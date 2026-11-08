@@ -248,7 +248,7 @@ fn listener_scan(
 /// `socket(2)` a spawn holding the spawn lock delays. Each is waited for on a thread of its own
 /// ([`within`]). A hang detector, never a budget: none takes long unless something is stuck.
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-const SCAN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+const SCAN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// What Linux's scans wait for ([`within`]).
 #[cfg(target_os = "linux")]
@@ -272,21 +272,42 @@ fn within<T: Send + 'static>(
     why: &str,
     read: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
+    within_at(deadline, std::time::Instant::now(), what, why, read)
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", all(test, unix)))]
+fn within_at<T: Send + 'static>(
+    deadline: std::time::Duration,
+    started: std::time::Instant,
+    what: &str,
+    why: &str,
+    read: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    let timed_out = || {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "{what} did not answer within {} s ({why})",
+                deadline.as_secs()
+            ),
+        )
+    };
+    let until = crate::deadline::saturating_after(started, deadline);
+    if std::time::Instant::now() >= until {
+        return Err(timed_out());
+    }
     let (answer, answered) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("aterm-holder-scan".to_string())
         .spawn(move || {
             let _ = answer.send(read());
         })?;
-    match answered.recv_timeout(deadline) {
+    let remaining = until
+        .checked_duration_since(std::time::Instant::now())
+        .ok_or_else(timed_out)?;
+    match answered.recv_timeout(remaining) {
         Ok(read) => read,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "{what} did not answer within {} s ({why})",
-                deadline.as_secs()
-            ),
-        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(timed_out()),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(format!(
             "{what} gave no answer: its thread ended"
         ))),
@@ -312,11 +333,21 @@ fn within<T: Send + 'static>(
 /// unknown.
 #[cfg(target_vendor = "apple")]
 fn serving_pid(path: &std::path::Path, hang: std::time::Duration) -> io::Result<Option<u32>> {
-    let deadline = std::time::Instant::now() + hang;
+    serving_pid_at(path, hang, std::time::Instant::now())
+}
+
+#[cfg(target_vendor = "apple")]
+fn serving_pid_at(
+    path: &std::path::Path,
+    hang: std::time::Duration,
+    started: std::time::Instant,
+) -> io::Result<Option<u32>> {
+    let deadline = crate::deadline::saturating_after(started, hang);
     let path = path.to_path_buf();
     let why = "a spawn holding the spawn lock";
-    within(
+    within_at(
         hang,
+        started,
         "the connection to the listener",
         why,
         move || match crate::connect::until(&path, deadline) {
@@ -2964,6 +2995,30 @@ mod tests {
     use crate::exitwatch::ExitWatch;
 
     const HANG: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn a_valid_native_listener_survives_scheduling_delay() {
+        let dir = aterm_tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let path = dir.path().join("l.sock");
+        let listener = crate::kept_out(|| std::os::unix::net::UnixListener::bind(&path)).unwrap();
+        let actual = super::serving_pid_at(
+            &path,
+            super::SCAN_DEADLINE,
+            Instant::now() - Duration::from_secs(11),
+        );
+        assert_eq!(actual.unwrap(), Some(std::process::id()));
+        assert_eq!(
+            super::serving_pid_at(
+                &path,
+                super::SCAN_DEADLINE,
+                Instant::now() - Duration::from_secs(61)
+            )
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        drop(listener);
+    }
 
     unsafe extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;

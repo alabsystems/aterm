@@ -18,8 +18,7 @@ fn state_of(body: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// `<bin> fabric <args>` in `w`'s scratch home, with `fabric_cmd` as its fabric command and each
-/// read of the world's instance bounded by [`harness::FABRIC_IO_WAIT`].
+/// `<bin> fabric <args>` in `w`'s scratch home, with `fabric_cmd` as its fabric command.
 fn fabric_command(w: &World, bin: &str, fabric_cmd: &str, args: &[&str]) -> std::process::Command {
     let mut fabric = std::process::Command::new(bin);
     fabric
@@ -28,10 +27,6 @@ fn fabric_command(w: &World, bin: &str, fabric_cmd: &str, args: &[&str]) -> std:
         .env("HOME", w.tmp.join("home"))
         .env("XDG_RUNTIME_DIR", w.tmp.join("run"))
         .env("ATERM_FABRIC_COMMAND", fabric_cmd)
-        .env(
-            harness::FABRIC_IO_WAIT.0,
-            harness::FABRIC_IO_WAIT.1.as_millis().to_string(),
-        )
         .stdin(std::process::Stdio::null());
     fabric
 }

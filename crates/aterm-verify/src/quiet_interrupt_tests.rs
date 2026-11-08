@@ -174,6 +174,7 @@ fn standin_run_waits_for_the_quiet_machine() {
         &Show::default(),
         Seams {
             stage,
+            prepare_cells: None,
             admit_quiet: admit_in_scratch,
             admit_memory: admit_in_scratch,
         },
@@ -370,6 +371,7 @@ fn a_timed_stage_given_up_behind_a_stuck_holder_is_not_run_and_the_run_goes_on()
         &Show::default(),
         Seams {
             stage: passes,
+            prepare_cells: None,
             admit_quiet: given_up,
             admit_memory: given_up,
         },

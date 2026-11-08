@@ -1236,9 +1236,12 @@ fn two_rows_naming_one_fleet_node_adopt_neither() {
 
 /// `adopt` binds the Macs the roster knows to the rows they already have, by fleet node first,
 /// and births none: a Mac no row answers is reported, never written. What the roster says
-/// carries the roster's coordinate, and the roster is a source row of its own.
-/// NEGATIVE CONTROL: with `known_row` birthing whatever `births` says (`None if true =>` in
-/// place of `None if self.input.births =>`), the unknown Mac gets a row: `` assertion failed:
+/// carries the roster's coordinate, and the roster is a source row of its own. A row it finds by
+/// name keeps its `planned`, which its Mac adopts it by.
+/// NEGATIVE CONTROL: with a row `adopt` finds by name called `active`: `` left:
+/// Some(String("active")) right: None ``. With `known_row` birthing whatever `births` says (`None
+/// if true =>` in place of `None if self.input.births =>`), the unknown Mac gets a row: ``
+/// assertion failed:
 /// plan.planned.iter().all(|p| p.pk != stranger) ``. With the roster's values carrying no
 /// source (`source: String::new()` in `known_row`, as before the roster was a source), the plan
 /// refuses: `` called `Result::unwrap()` on an `Err` value: Error("machine.src: a source
@@ -1285,10 +1288,7 @@ fn adopt_binds_known_macs_by_node_and_births_none() {
     };
     let plan = plan(&adopt, &cells).unwrap();
     assert_eq!(planned(&plan, "machine", &row, "node"), None);
-    assert_eq!(
-        planned(&plan, "machine", &row, "status"),
-        Some(&json!("active"))
-    );
+    assert_eq!(planned(&plan, "machine", &row, "status"), None);
     assert_eq!(
         planned(&plan, "machine", &row, "aliases.m70"),
         Some(&json!(true))

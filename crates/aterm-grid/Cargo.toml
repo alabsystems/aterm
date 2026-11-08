@@ -30,6 +30,7 @@ aterm-grapheme = { workspace = true }
 aterm-spec-anchor = { workspace = true }
 
 [dev-dependencies]
+aterm-bench = { path = "../aterm-bench" }
 aterm-selection = { workspace = true }
 # The `#[refines]` anchors under a plain test run, and the derived models and seeded
 # `XorShift` the tests use.

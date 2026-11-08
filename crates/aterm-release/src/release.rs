@@ -302,14 +302,14 @@ impl ReleaseOptions {
         opts
     }
 
-    /// `args` (a process's own, after the program) as the re-run as R's own cutter is handed
-    /// them: each path flag's value replaced by these options'; `--fix` with its commits left
-    /// out, since the re-run resumes the head the journal names (the hops are made); and
-    /// `--engine` with its directory left out, since the re-run's engine is this release's own,
-    /// handed it as `PUBLICATION_ENGINE` ([`crate::gates::engine_copy`]), and a cutter older than
-    /// that copy would run and sync the directory `--engine` named in place.
+    /// `args` (a process's own, after the program) as R's frozen cutter receives them on exec:
+    /// each path flag's value replaced by these options'; `--fix` with its commits left out,
+    /// since the new image resumes the head the journal names (the hops are made); and
+    /// `--engine` with its directory left out, since the exec'd image receives this release's own
+    /// engine as `PUBLICATION_ENGINE` ([`crate::gates::engine_copy`]), and a cutter older than that
+    /// copy would run and sync the directory `--engine` named in place.
     #[must_use]
-    pub fn rerun_args(&self, args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    pub fn exec_args(&self, args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
         let value = |flag: &str| match flag {
             "--release-credentials" => self.release_credentials.as_ref(),
             _ => self.linux.artifacts.as_ref(),
@@ -504,45 +504,40 @@ pub fn release_dir(git: &dyn crate::ledger::GitRunner) -> Result<PathBuf, String
 }
 
 /// The live run's claim: `pid`, `started` (that pid's start time, as `ps -o lstart=` prints it)
-/// and `logs`, created exclusively, or taken over from the run that handed it on
-/// ([`RunClaim::hand`]).
+/// and `logs`, created exclusively, continued by another image exec'd into the same process, or
+/// adopted once from the live ancestor that a pre-B1 cutter marked `handed` before starting this
+/// image.
 #[derive(Debug)]
 pub struct RunClaim {
     path: PathBuf,
     /// This process's pid and start, as the claim names it.
     me: (u32, String),
-    /// This run took the claim over from the run of this release that started it as R's own
-    /// cutter ([`RunClaim::hand`]).
-    pub adopted: bool,
-    /// The logs of the run that handed this one the claim, as its claim named them: what that run
-    /// did before it handed the release on is in them.
-    pub handed_logs: Option<PathBuf>,
-    /// The line exists before qualify takes any resource claims. Its rank ends Background
-    /// samples on this host even during steps which need no CPU or memory reservation.
-    priority: Option<aterm_capacity::Claim>,
+    /// This image continued the preceding cutter's claim, normally in the same process after an
+    /// exec, or once from a pre-B1 handed ancestor.
+    pub continued: bool,
+    /// The continuation was the one remaining pre-B1 child-process handoff, not a native exec.
+    pub legacy_handoff: bool,
+    /// The logs the preceding image of this process named, when they differ from this image's.
+    pub previous_logs: Option<PathBuf>,
 }
 
 impl Drop for RunClaim {
-    /// Remove the claim while it names this process: one a re-run took over is the re-run's
-    /// ([`RunClaim::remove_if_mine`]).
+    /// Remove the claim while it names this process ([`RunClaim::remove_if_mine`]).
     fn drop(&mut self) {
         self.remove_if_mine(|| {});
     }
 }
 
 /// The lock beside the claim at `path` (`<RUNNING_FILE>.lock`), held across each read of the
-/// claim and the write or removal it decides ([`RunClaim::take`], [`RunClaim::hand`],
-/// RunClaim's drop), so none lands between another's read and its write: a re-run's take never
-/// lands between this run's read of its claim and its removal of it. Taken blocking, by `flock`:
-/// each holds it only for its read and the write it decides.
+/// claim and the write or removal it decides ([`RunClaim::take`], RunClaim's drop), so none lands
+/// between another's read and its write: a continued image's take never lands between this
+/// image's read of its claim and its removal of it. Taken blocking, by `flock`: each holds it only
+/// for its read and the write it decides.
 /// # Errors
 /// The lock file cannot be opened or locked.
 fn claim_lock(path: &Path) -> std::io::Result<aterm_update_core::FileLock> {
     aterm_update_core::FileLock::acquire(&path.with_extension("lock"))
 }
-
-/// The claim's line that hands it to the re-run this run starts ([`RunClaim::hand`]).
-const HANDED: &str = "handed";
 
 /// A live claim of another run: who, since when, and its logs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -552,8 +547,8 @@ pub struct Holder {
     pub logs: String,
     /// `Some(the step)` for a child its run left behind.
     pub step: Option<String>,
-    /// The run handed its claim to the re-run it started ([`RunClaim::hand`]).
-    pub handed: bool,
+    /// A pre-B1 cutter marked this live claim for the child cutter it started.
+    pub legacy_handed: bool,
 }
 
 pub(crate) fn read_holder(path: &Path) -> Option<Holder> {
@@ -571,7 +566,7 @@ pub(crate) fn read_holder(path: &Path) -> Option<Holder> {
         started: field("started ").unwrap_or_default().to_string(),
         logs: field("logs ").unwrap_or_default().to_string(),
         step: field("step ").map(str::to_string),
-        handed: text.lines().any(|l| l.trim() == HANDED),
+        legacy_handed: text.lines().any(|line| line.trim() == "handed"),
     })
 }
 
@@ -602,11 +597,13 @@ fn live_child(dir: &Path, started_of: &mut dyn FnMut(u32) -> Option<String>) -> 
 }
 
 impl RunClaim {
-    /// Claim `path` for this process (`me`: its pid and start time), whose ancestors are
-    /// `ancestors` (its parent's pid first): created when no live run holds it, and taken over,
-    /// rewritten to name this process, when its live holder is one of `ancestors` and handed it
-    /// to the re-run it started ([`RunClaim::hand`]), the run of this release this one goes on
-    /// with ([`Self::adopted`]). The claim's lock is held throughout ([`claim_lock`]).
+    /// Claim `path` for this process (`me`: its pid and start time): created when no live run
+    /// holds it, and continued, with its logs atomically rewritten, when its live holder has
+    /// exactly this process identity ([`Self::continued`]). A claim written by a pre-B1 cutter is
+    /// also adopted only when it carries that cutter's `handed` marker and its live holder is an
+    /// ancestor of this process; this reader-only boundary lets a cut already in flight survive
+    /// the B1 deployment without retaining the old writer or child-rerun mechanism. The claim's
+    /// lock is held throughout ([`claim_lock`]).
     /// # Errors
     /// The live holder, or the claim's directory cannot be made, its lock taken, or the claim
     /// written.
@@ -615,9 +612,9 @@ impl RunClaim {
         me: (u32, &str),
         logs: &Path,
         started_of: &mut dyn FnMut(u32) -> Option<String>,
-        ancestors: &[u32],
     ) -> Result<Self, std::result::Result<Holder, String>> {
-        Self::take_locking(path, me, logs, started_of, ancestors, &claim_lock)
+        let ancestors = crate::cutter::ancestors();
+        Self::take_locking(path, me, logs, started_of, &ancestors, &claim_lock)
     }
 
     /// [`Self::take`] with the claim's lock taken by `lock`: a test's seam, to take it without
@@ -631,27 +628,30 @@ impl RunClaim {
         lock: &dyn Fn(&Path) -> std::io::Result<aterm_update_core::FileLock>,
     ) -> Result<Self, std::result::Result<Holder, String>> {
         let body = format!("pid {}\nstarted {}\nlogs {}\n", me.0, me.1, logs.display());
-        let claim = |handed_logs: Option<PathBuf>, adopted| Self {
+        let claim = |previous_logs: Option<PathBuf>, continued, legacy_handoff| Self {
             path: path.to_path_buf(),
             me: (me.0, me.1.to_string()),
-            adopted,
-            handed_logs,
-            priority: None,
+            continued,
+            legacy_handoff,
+            previous_logs,
         };
         let dir = path.parent().unwrap_or(Path::new("."));
         std::fs::create_dir_all(dir).map_err(|e| Err(format!("create {}: {e}", dir.display())))?;
         let _lock = lock(path).map_err(|e| Err(format!("lock {}: {e}", path.display())))?;
         if let Some(holder) = live_holder(path, started_of) {
-            if holder.step.is_none() && holder.handed && ancestors.contains(&holder.pid) {
-                let next = dir.join(format!("{RUNNING_FILE}.adopted"));
-                crate::durable::write_fresh(&next, &body)
-                    .and_then(|()| std::fs::rename(&next, path))
-                    .inspect_err(|_| {
-                        let _ = std::fs::remove_file(&next);
-                    })
-                    .map_err(|e| Err(format!("take over {}: {e}", path.display())))?;
-                let handed_logs = (!holder.logs.is_empty()).then(|| PathBuf::from(&holder.logs));
-                return Ok(claim(handed_logs, true));
+            if holder.step.is_none() && holder.pid == me.0 && holder.started == me.1 {
+                crate::durable::write_atomic_durable(path, body.as_bytes(), 0o600)
+                    .map_err(|e| Err(format!("continue {}: {e}", path.display())))?;
+                let previous_logs = (!holder.logs.is_empty() && Path::new(&holder.logs) != logs)
+                    .then(|| PathBuf::from(&holder.logs));
+                return Ok(claim(previous_logs, true, false));
+            }
+            if holder.step.is_none() && holder.legacy_handed && ancestors.contains(&holder.pid) {
+                crate::durable::write_atomic_durable(path, body.as_bytes(), 0o600)
+                    .map_err(|e| Err(format!("adopt pre-B1 handoff {}: {e}", path.display())))?;
+                let previous_logs = (!holder.logs.is_empty() && Path::new(&holder.logs) != logs)
+                    .then(|| PathBuf::from(&holder.logs));
+                return Ok(claim(previous_logs, true, true));
             }
             return Err(Ok(holder));
         }
@@ -666,7 +666,7 @@ impl RunClaim {
         let created = crate::durable::open_create_new(path)
             .and_then(|mut f| std::io::Write::write_all(&mut f, body.as_bytes()));
         match created {
-            Ok(()) => Ok(claim(None, false)),
+            Ok(()) => Ok(claim(None, false, false)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 Err(read_holder(path).ok_or_else(|| format!("{} appeared", path.display())))
             }
@@ -674,7 +674,7 @@ impl RunClaim {
         }
     }
 
-    /// The claim on disk names this process (its pid and start): no re-run took it over.
+    /// The claim on disk names this process (its pid and start).
     #[must_use]
     pub fn names_this_run(&self) -> bool {
         read_holder(&self.path)
@@ -693,26 +693,6 @@ impl RunClaim {
             between();
             let _ = std::fs::remove_file(&self.path);
         }
-    }
-
-    /// Hand the claim to the re-run this process starts as R's own cutter: a descendant of it
-    /// takes it over at its own checks ([`Self::take`]); until one does, it is still this run's,
-    /// and this run's end removes it. The claim's lock is held throughout ([`claim_lock`]).
-    /// # Errors
-    /// The claim's lock cannot be taken, or the claim does not name this process or cannot be
-    /// written.
-    pub fn hand(&self) -> Result<(), String> {
-        let _lock =
-            claim_lock(&self.path).map_err(|e| format!("lock {}: {e}", self.path.display()))?;
-        if !self.names_this_run() {
-            return Err(format!("{} does not name this run", self.path.display()));
-        }
-        crate::durable::open_append(&self.path, false)
-            .and_then(|mut f| {
-                std::io::Write::write_all(&mut f, HANDED.as_bytes())
-                    .and_then(|()| std::io::Write::write_all(&mut f, b"\n"))
-            })
-            .map_err(|e| format!("write {}: {e}", self.path.display()))
     }
 }
 
@@ -1293,11 +1273,13 @@ pub trait Backend {
     fn say(&mut self, line: &str);
     fn interrupted(&mut self) -> Option<i32>;
     fn entered(&mut self, _step: Step) {}
-    /// Claim the version across the fleet, adopting its existing candidate line.
+    /// Claim the version across the fleet, continuing this process's exact existing candidate
+    /// line after an image exec, crossing the authenticated pre-B1 handed-parent boundary, or
+    /// adopting a stale one by the fleet protocol.
     fn fleet_line(
         &mut self,
         line: &crate::line::Line,
-        _handed: bool,
+        _continued: bool,
     ) -> Result<crate::line::Line, String> {
         Ok(line.clone())
     }
@@ -1313,19 +1295,11 @@ pub trait Backend {
     fn fleet_audit(&mut self) -> Result<(), String> {
         Ok(())
     }
-    /// Stop this process's monitor before handing ownership to its own cutter.
-    fn fleet_hand(&mut self) {}
-    /// Register a real line with the host's scheduler. A model backend owns no host claim.
-    fn line_priority(&mut self) -> Option<aterm_capacity::Claim> {
-        None
-    }
     /// Record bounded operational observations before any release preparation.
     fn observe_operational(&mut self) {}
     fn log_path(&mut self, step: Step) -> PathBuf;
     fn me(&mut self) -> (u32, String);
     fn started_of(&mut self, pid: u32) -> Option<String>;
-    /// This process's ancestors' pids, its parent's first.
-    fn ancestors(&mut self) -> Vec<u32>;
     fn release_dir(&mut self) -> PathBuf;
     fn times(&mut self) -> String;
     /// Keep `row`'s time (a step's name, or a qualify branch's [`Branch::row`]) in `steps.tsv`.
@@ -1380,9 +1354,9 @@ pub trait Backend {
     /// Provision the selected checkout's tools before staging or compiling the product.
     fn validation_tools(&mut self) -> Result<String, Refusal>;
     fn own_cutter(&mut self, commit: &str) -> Result<String, crate::cutter::NotOwn>;
-    /// Run this release again as R's own cutter, a fresh `targo --unverified ship` of the same
-    /// arguments in the clone, and wait for it: its exit code, or why it could not start.
-    fn reexec(&mut self, prover: &Prover) -> Result<i32, Refusal>;
+    /// Build, freeze and prove R's tools, then replace this image with its cutter. A real
+    /// success never returns; `Ok(())` is only a model backend's representation of that edge.
+    fn exec_cutter(&mut self, commit: &str, prover: &Prover) -> Result<(), Refusal>;
     fn facts(&mut self, c: &Candidate, prover: &Prover, artifact: Option<&Artifact>) -> Facts;
     fn disk(&mut self) -> (Option<u64>, bool);
     /// What this machine's last releases wrote, by their own records
@@ -2585,11 +2559,9 @@ impl Run<'_> {
     }
 
     /// Claim the clone for this run before anything else it does but `--forget` (a dry run
-    /// claims nothing): a re-run as R's own cutter takes over the claim the run that started it
-    /// handed it ([`RunClaim::take`]) before it can say a final line (a signal it caught, a
-    /// journal it cannot read), so that run, finding the claim no longer its own when the re-run
-    /// ends, says none ([`Run::own_cutter`]). A claim this run cannot take is its checks'
-    /// refusal ([`Run::claim_refused`]).
+    /// claims nothing). An image exec'd into this process continues its exact pid/start claim
+    /// before it can say a final line; every other live holder is this run's checks' refusal
+    /// ([`Run::claim_refused`]).
     fn take_claim(&mut self) {
         if self.dry {
             return;
@@ -2598,24 +2570,26 @@ impl Run<'_> {
         let me = self.b.me();
         let logs = self.b.log_path(Step::Checks);
         let logs = logs.parent().map(Path::to_path_buf).unwrap_or_default();
-        let ancestors = self.b.ancestors();
         let mut started_of = |pid| self.b.started_of(pid);
         let taken = RunClaim::take(
             &release_dir.join(RUNNING_FILE),
             (me.0, &me.1),
             &logs,
             &mut started_of,
-            &ancestors,
         );
         match taken {
-            Ok(mut claim) => {
-                claim.priority = self.b.line_priority();
-                // The run that handed this one the release took its first steps' records, its
-                // seal call among them, into its own logs ([`crate::release_timeline::Timeline`]).
-                if let Some(from) = &claim.handed_logs {
+            Ok(claim) => {
+                // The preceding image took its first steps' records, its seal call among them,
+                // into its own logs ([`crate::release_timeline::Timeline`]).
+                if let Some(from) = &claim.previous_logs {
+                    let event_name = if claim.legacy_handoff {
+                        "handed"
+                    } else {
+                        "continued"
+                    };
                     let event = aterm_json::Value::Object(aterm_json::Map::from([
                         ("schema".to_string(), 1.into()),
-                        ("event".to_string(), "handed".into()),
+                        ("event".to_string(), event_name.into()),
                         ("from".to_string(), from.display().to_string().into()),
                     ]));
                     self.say(&format!("release-event: {event}"));
@@ -2882,8 +2856,8 @@ impl Run<'_> {
         let tip = self.tip.clone();
         let j = self.journal.clone();
         let unfinished = j.as_ref().filter(|j| !j.finished());
-        let reexeced = self.claim.as_ref().is_some_and(|c| c.adopted);
-        let mut cand = if let Some(j) = j.as_ref().filter(|_| reexeced) {
+        let continued = self.claim.as_ref().is_some_and(|c| c.continued);
+        let mut cand = if let Some(j) = j.as_ref().filter(|_| continued) {
             Candidate {
                 commit: j.commit.clone(),
                 version: j.version.clone(),
@@ -3183,7 +3157,7 @@ impl Run<'_> {
             return Err(self.halted(Refusal::new(
                 format!(
                     "the line's head {} predates release lines (its tree has no {LINE_SOURCE}): \
-                     its own cutter, which a hop's run re-runs as, keeps no line",
+                     its own cutter, which a hop's run executes as, keeps no line",
                     short(&head)
                 ),
                 format!("drop the line: {RELEASE_COMMAND} --forget, then start one on origin/main"),
@@ -3326,7 +3300,7 @@ impl Run<'_> {
         }
         if let Err(why) = crate::line_claim::select(
             self.b,
-            self.claim.as_ref().is_some_and(|claim| claim.adopted),
+            self.claim.as_ref().is_some_and(|claim| claim.continued),
             &mut cand,
             &mut self.journal,
             self.t_start,
@@ -3451,7 +3425,7 @@ impl Run<'_> {
         match self.b.own_cutter(&r) {
             Ok(_) => Ok(()),
             Err(not) => {
-                if self.claim.as_ref().is_some_and(|c| c.adopted) {
+                if self.claim.as_ref().is_some_and(|c| c.continued) {
                     return self.refuse(Refusal::new(
                         format!(
                             "this cutter was rebuilt at {} and is still not its own ({})",
@@ -3463,34 +3437,16 @@ impl Run<'_> {
                 }
                 self.halt_if_interrupted()?;
                 self.say(&format!(
-                    "release: {} — re-running as {}'s own cutter ({RELEASE_COMMAND}, same \
-                     arguments)",
+                    "release: {} — freezing and executing {}'s own cutter ({RELEASE_COMMAND}, \
+                     same arguments)",
                     not.why,
                     short(&r)
                 ));
                 let prover = self.prover.clone().ok_or(Halt::Said(1))?;
-                if let Some(Err(why)) = self.claim.as_ref().map(RunClaim::hand) {
-                    return self.refuse(Refusal::new(
-                        format!("cannot hand the run claim to the re-run ({why})"),
-                        "check the permissions of the clone's .git/aterm-release, then re-run",
-                    ));
-                }
-                self.b.fleet_hand();
-                let ran = self.b.reexec(&prover);
-                // A signal this run caught stops the release here, at this step, when the claim
-                // still names this run as the re-run ends: no re-run took it over. A re-run that
-                // took it said the release's final line unless it was killed outright first (it
-                // takes the claim before it can say one, `Run::take_claim`); one that could not
-                // take it may have said its own (both residuals in SPECS rf-final-line). Once one
-                // took it, the release was the re-run's to stop and to say: this run passed each
-                // signal it caught on to the re-run's `targo`.
-                if self.claim.as_ref().is_none_or(RunClaim::names_this_run) {
-                    self.halt_if_interrupted()?;
-                }
-                match ran {
-                    // The run ends with the re-run's exit code and no final line of its own,
-                    // whatever the re-run got as far as.
-                    Ok(code) => Err(Halt::Said(code)),
+                match self.b.exec_cutter(&r, &prover) {
+                    // A real backend cannot reach this edge: exec replaced it. The model uses
+                    // it to represent the old image producing no final line of its own.
+                    Ok(()) => Err(Halt::Said(0)),
                     Err(refusal) => self.refuse(refusal),
                 }
             }
@@ -6231,103 +6187,134 @@ fn newer(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// An exec'd image continues the live claim of its exact pid and start, atomically replacing
+    /// its logs and retaining the preceding image's different logs. The continued image's end
+    /// removes the claim. NEGATIVE CONTROLS: changing either half of the process identity refuses
+    /// the continuation, and appending the new body instead of replacing it leaves the old logs
+    /// as the first `logs` field [`read_holder`] reads.
     #[test]
-    fn a_live_line_has_release_rank_before_resource_work_and_releases_it_on_drop() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let path = dir.path().join(RUNNING_FILE);
-        let mut claim = RunClaim::take(
-            &path,
-            (std::process::id(), "test-start"),
-            dir.path(),
-            &mut |_| None,
-            &[],
-        )
-        .unwrap();
-        let ledger = aterm_capacity::Ledger::at(dir.path().join("capacity"));
-        claim.priority = crate::release_steps::line_priority_with(|need, mode| {
-            aterm_capacity::admit_with(
-                &ledger,
-                &aterm_capacity::Live,
-                need,
-                mode,
-                aterm_capacity::Pace::default(),
-                &mut |_| {},
-            )
-        });
-        let priority = claim
-            .priority
-            .as_ref()
-            .expect("line recorded in capacity ledger");
-        assert_eq!(priority.record().need.rank, aterm_capacity::Rank::Release);
-        let ledger_path = priority.path().to_owned();
-        assert!(ledger_path.exists());
-        drop(claim);
-        assert!(
-            !ledger_path.exists(),
-            "a finished line must no longer cancel Background work"
-        );
-    }
-
-    /// A run's end removes its claim while the claim names this run, and leaves one a re-run
-    /// took over (it now names that live process) to the re-run. NEGATIVE CONTROL: remove the
-    /// claim whatever it names, and the re-run's claim is gone with this run's end.
-    #[test]
-    fn a_runs_end_removes_its_claim_and_never_one_a_rerun_took_over() {
+    fn an_execed_image_continues_only_its_exact_process_claim() {
         let dir = aterm_tempfile::tempdir().unwrap();
         let path = dir.path().join(RUNNING_FILE);
         let me = (4242, "Thu Oct  9 02:00:00 2026");
-        let rerun = (4343, "Thu Oct  9 02:01:00 2026");
+        let reused_pid = (me.0, "Thu Oct  9 02:01:00 2026");
+        let another_pid = (4343, me.1);
         let mut started_of = |pid: u32| {
-            [me, rerun]
+            [me, another_pid]
                 .into_iter()
                 .find(|(p, _)| *p == pid)
                 .map(|(_, at)| at.to_string())
         };
         let logs = Path::new("/l");
-        let claim = RunClaim::take(&path, me, logs, &mut started_of, &[]).unwrap();
+        let claim = RunClaim::take(&path, me, logs, &mut started_of).unwrap();
         assert!(claim.names_this_run());
         drop(claim);
         assert!(!path.exists(), "a claim nobody took is removed");
 
-        let claim = RunClaim::take(&path, me, logs, &mut started_of, &[]).unwrap();
-        assert!(claim.handed_logs.is_none());
-        claim.hand().unwrap();
-        let rerun_logs = Path::new("/l2");
-        let took = RunClaim::take(&path, rerun, rerun_logs, &mut started_of, &[me.0, 1]).unwrap();
-        assert!(took.adopted && !claim.names_this_run());
+        let claim = RunClaim::take(&path, me, logs, &mut started_of).unwrap();
+        assert!(!claim.continued && claim.previous_logs.is_none());
+        for identity in [reused_pid, another_pid] {
+            let refused = RunClaim::take(&path, identity, Path::new("/wrong"), &mut started_of);
+            assert!(
+                matches!(&refused, Err(Ok(Holder { pid, .. })) if *pid == me.0),
+                "a different process identity must not continue this claim: {refused:?}"
+            );
+        }
+        let continued_logs = Path::new("/l2");
+        let continued = RunClaim::take(&path, me, continued_logs, &mut started_of).unwrap();
+        assert!(continued.continued && continued.names_this_run());
         assert_eq!(
-            took.handed_logs.as_deref(),
+            continued.previous_logs.as_deref(),
             Some(logs),
-            "the handing run's logs"
+            "the preceding image's logs"
         );
-        drop(claim);
-        assert!(
-            path.exists(),
-            "the claim the re-run took over is the re-run's"
+        assert_eq!(
+            read_holder(&path).map(|h| h.logs),
+            Some(continued_logs.display().to_string()),
+            "the atomic replacement leaves one complete current body"
         );
-        drop(took);
-        assert!(!path.exists(), "and the re-run's end removes it");
+        std::mem::forget(claim); // a successful exec does not run the preceding image's Drop
+        drop(continued);
+        assert!(!path.exists(), "the continued image's end removes it");
     }
 
-    /// A re-run's take never lands between this run's read of its claim (it names this run) and
-    /// the removal that read decided: the take, made at that moment without waiting for the
-    /// claim's lock, finds it held and writes nothing; the removal goes on, and the re-run's take
-    /// after it claims anew. The interleaving is the test's: `remove_if_mine` (RunClaim's drop)
-    /// runs the take between its read and its removal. NEGATIVE CONTROLS: remove without the
-    /// lock, and the take lands, adopting the claim, which the removal then deletes; take without
-    /// it, and the same.
+    /// A cutter already running when B1 lands may have written the old `handed` marker before it
+    /// starts R's newly built cutter as a child. That one live ancestor handoff is adopted and
+    /// rewritten without the marker; no new code writes it. NEGATIVE CONTROLS: ancestry without
+    /// the marker, and the marker on a live non-ancestor, are both ordinary competing runs.
     #[test]
-    fn a_take_never_lands_between_a_runs_read_of_its_claim_and_its_removal() {
+    fn a_pre_b1_handoff_is_adopted_once_only_from_its_live_ancestor() {
+        use std::io::Write as _;
+
+        let parent = (4242, "Thu Oct  9 02:00:00 2026");
+        let child = (4343, "Thu Oct  9 02:00:01 2026");
+        let mut started_of = |pid: u32| {
+            [parent, child]
+                .into_iter()
+                .find(|(found, _)| *found == pid)
+                .map(|(_, started)| started.to_string())
+        };
+
+        for (name, mark_handed, ancestors, adopted) in [
+            ("authentic", true, vec![parent.0], true),
+            ("unmarked", false, vec![parent.0], false),
+            ("unrelated", true, vec![9999], false),
+        ] {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let path = dir.path().join(RUNNING_FILE);
+            let old_logs = Path::new("/old/logs");
+            let old =
+                RunClaim::take_locking(&path, parent, old_logs, &mut started_of, &[], &claim_lock)
+                    .unwrap();
+            if mark_handed {
+                let mut file = crate::durable::open_append(&path, false).unwrap();
+                file.write_all(b"handed\n").unwrap();
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the legacy-handoff fixture must make the old cutter's marker durable before adoption"
+                )]
+                file.sync_all().unwrap();
+            }
+
+            let answer = RunClaim::take_locking(
+                &path,
+                child,
+                Path::new("/new/logs"),
+                &mut started_of,
+                &ancestors,
+                &claim_lock,
+            );
+            if adopted {
+                let claim = answer.unwrap();
+                assert!(claim.continued && claim.legacy_handoff, "{name}");
+                assert_eq!(claim.previous_logs.as_deref(), Some(old_logs), "{name}");
+                assert!(claim.names_this_run(), "{name}");
+                assert!(!read_holder(&path).unwrap().legacy_handed, "{name}");
+                drop(claim);
+                assert!(!path.exists(), "{name}: the adopted owner removes it");
+            } else {
+                assert!(
+                    matches!(answer, Err(Ok(Holder { pid, .. })) if pid == parent.0),
+                    "{name}: only the authenticated legacy handoff may be adopted"
+                );
+                assert!(old.names_this_run(), "{name}: the parent retains its claim");
+            }
+            drop(old);
+        }
+    }
+
+    /// A continuation never lands between this image's read of its claim and the removal that
+    /// read decided: the take, made at that moment without waiting for the claim's lock, finds it
+    /// held and writes nothing; the removal goes on, and a later take claims anew. The
+    /// interleaving is the test's: `remove_if_mine` (RunClaim's drop) runs the take between its
+    /// read and its removal. NEGATIVE CONTROL: without the common lock, the continuation lands
+    /// and the removal then deletes its rewritten claim.
+    #[test]
+    fn a_continuation_never_lands_between_a_claims_read_and_removal() {
         let dir = aterm_tempfile::tempdir().unwrap();
         let path = dir.path().join(RUNNING_FILE);
         let me = (4242, "Thu Oct  9 02:00:00 2026");
-        let rerun = (4343, "Thu Oct  9 02:01:00 2026");
-        let mut started_of = |pid: u32| {
-            [me, rerun]
-                .into_iter()
-                .find(|(p, _)| *p == pid)
-                .map(|(_, at)| at.to_string())
-        };
+        let mut started_of = |pid: u32| (pid == me.0).then(|| me.1.to_string());
         let logs = Path::new("/l");
         let at_once = |path: &Path| {
             aterm_update_core::FileLock::acquire_within(
@@ -6335,16 +6322,15 @@ mod tests {
                 std::time::Duration::ZERO,
             )
         };
-        let claim = RunClaim::take(&path, me, logs, &mut started_of, &[]).unwrap();
-        claim.hand().unwrap();
+        let claim = RunClaim::take(&path, me, logs, &mut started_of).unwrap();
         let mut between = None;
         claim.remove_if_mine(|| {
             between = Some(RunClaim::take_locking(
                 &path,
-                rerun,
-                logs,
+                me,
+                Path::new("/l2"),
                 &mut started_of,
-                &[me.0, 1],
+                &[],
                 &at_once,
             ));
         });
@@ -6358,10 +6344,10 @@ mod tests {
             "the claim this run read as its own is removed"
         );
         drop(claim);
-        let took = RunClaim::take(&path, rerun, logs, &mut started_of, &[me.0, 1]).unwrap();
+        let took = RunClaim::take(&path, me, logs, &mut started_of).unwrap();
         assert!(
-            !took.adopted && took.names_this_run(),
-            "the re-run claims anew"
+            !took.continued && took.names_this_run(),
+            "the process claims anew after the removal"
         );
     }
 

@@ -656,7 +656,7 @@ impl std::fmt::Display for PaintReport {
             "PAINT scene={} style={} companion={:?} capture={:?} backend={} expect={:?} \
              frames={} best_ink={} best_hues={} total_ink={} union_hues={} cyan_px={} \
              cyan_frames={} rainbow_frames={} rainbow_run={} rainbow_gap={} driven_dark_us={} \
-             driven_frames={} sampling_hole_us={} nominal_dt_us={} mature_lead_us={} \
+             driven_frames={} sampling_hole_us={} nominal_dt_us={} mature_lead_us={} all_composed_frames={} \
              status_frames={} ribbon_claimed={} ribbon_bound={} ribbon_dark={} \
              ribbon_window_hues={} pet_claimed={} pet_missing={} pet_missing_at={} \
              pet_final_run={} cat_claimed={} cat_missing={} cat_final_run={} companion_frames={} \
@@ -689,6 +689,7 @@ impl std::fmt::Display for PaintReport {
             s.driven.sampling_hole_us,
             s.driven.nominal_dt_us,
             s.driven.mature_lead_us,
+            s.driven.all_composed_frames,
             s.status_frames,
             s.ribbon_claimed,
             s.ribbon_bound,

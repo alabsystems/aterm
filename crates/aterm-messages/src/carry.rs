@@ -40,8 +40,6 @@ pub struct CarriedMessage {
     pub stats: String,
     /// Whether the meter was busy ([`crate::model::Meter::busy`]).
     pub busy: bool,
-    /// Whether the row was on glass when the parent froze.
-    pub on_glass: bool,
     /// Whether the band painted `detail[0]` beside the title (`Message::excerpt`).
     pub excerpt: bool,
     /// Words the row finishes with (`Message::finished`).
@@ -54,7 +52,7 @@ pub struct CarriedMessage {
     pub repeats: u32,
 }
 
-/// Next message id and live rows in glass order (on-glass rows first).
+/// Next message id and the revealed live rows, in the parent's own order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Carry {
     /// The parent's next id.

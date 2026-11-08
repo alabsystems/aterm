@@ -269,11 +269,6 @@ const GUARD_HELPERS: &[GuardHelper] = &[
         def_file: "crates/aterm-gui/src/harness_host.rs",
     },
     GuardHelper {
-        symbol: "lock_fonts",
-        identity: "chrome_fonts",
-        def_file: "crates/aterm-gui/src/tray_raster.rs",
-    },
-    GuardHelper {
         symbol: "env_lock",
         identity: "ENV_LOCK",
         def_file: "crates/aterm-log/src/lib.rs",

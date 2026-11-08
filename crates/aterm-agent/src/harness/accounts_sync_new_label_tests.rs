@@ -146,6 +146,7 @@ fn seed(case: i64, store: &accounts::Store, label: &str) {
                 sid: "kept-session".into(),
                 at: NOW,
                 took: false,
+                native_receipt: None,
             });
             state.undo.push(accounts::Undo {
                 previous: Some(label.into()),

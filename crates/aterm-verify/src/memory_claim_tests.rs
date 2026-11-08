@@ -285,10 +285,12 @@ fn failed_memory_admission_never_starts_a_stage() {
                 None,
                 Seams {
                     stage,
+                    prepare_cells: None,
                     admit_quiet: admit,
                     admit_memory: admit,
                 },
                 || starts.set(starts.get() + 1),
+                || stage(&ctx, &spec),
             );
             assert_eq!(
                 STARTED.load(Ordering::SeqCst),
@@ -464,6 +466,7 @@ fn a_stage_claims_its_memory_before_it_starts_and_holds_it_until_it_ends() {
         .expect("set once");
     let seams = Seams {
         stage: held_stage,
+        prepare_cells: None,
         admit_quiet: held_admit,
         admit_memory: held_admit,
     };
@@ -566,6 +569,7 @@ fn a_stages_memory_claim_covers_the_builds_its_children_start() {
         .expect("set once");
     let seams = Seams {
         stage: covers_stage,
+        prepare_cells: None,
         admit_quiet: covers_admit,
         admit_memory: covers_admit,
     };
@@ -632,6 +636,7 @@ fn a_stage_that_can_never_fit_asks_to_run_alone() {
         .expect("set once");
     let seams = Seams {
         stage: never_stage,
+        prepare_cells: None,
         admit_quiet: never_admit,
         admit_memory: never_admit,
     };
@@ -695,6 +700,7 @@ fn a_stage_short_only_of_memory_no_claim_holds_is_admitted_alone() {
         .expect("set once");
     let seams = Seams {
         stage: alone_stage,
+        prepare_cells: None,
         admit_quiet: alone_admit,
         admit_memory: alone_admit,
     };
@@ -753,6 +759,7 @@ fn under_admit_now_a_memory_claim_is_taken_at_once() {
     .expect("the holder's claim");
     let seams = Seams {
         stage: now_stage,
+        prepare_cells: None,
         admit_quiet: now_admit,
         admit_memory: now_admit,
     };
@@ -858,6 +865,7 @@ fn a_browser_stage_with_safari_takes_the_quiet_machine_before_its_memory() {
         .expect("set once");
     let seams = Seams {
         stage: desk_stage,
+        prepare_cells: None,
         admit_quiet: desk_admit,
         admit_memory: desk_admit,
     };
@@ -971,6 +979,7 @@ fn standin_run_waits_for_memory() {
         &Show::default(),
         Seams {
             stage: standin_stage,
+            prepare_cells: None,
             admit_quiet: standin_admit,
             admit_memory: standin_admit,
         },
@@ -1165,6 +1174,7 @@ fn standin_appkit_run() {
         &Show::default(),
         Seams {
             stage: appkit_stage,
+            prepare_cells: None,
             admit_quiet: appkit_admit,
             admit_memory: appkit_admit,
         },
@@ -1290,6 +1300,7 @@ fn a_stage_keeps_its_figure_only_when_it_did_its_work() {
         .expect("set once");
     let seams = Seams {
         stage: measured_stage,
+        prepare_cells: None,
         admit_quiet: measured_admit,
         admit_memory: measured_admit,
     };
@@ -1390,6 +1401,7 @@ fn a_passing_test_compile_keeps_its_heavy_units_peaks() {
         .expect("set once");
     let seams = Seams {
         stage: units_stage,
+        prepare_cells: None,
         admit_quiet: units_admit,
         admit_memory: units_admit,
     };
@@ -1597,6 +1609,7 @@ fn a_stage_waiting_behind_a_stuck_holder_is_not_run() {
     .expect("the holder's claim");
     let seams = Seams {
         stage: stuck_stage,
+        prepare_cells: None,
         admit_quiet: stuck_admit,
         admit_memory: stuck_admit,
     };

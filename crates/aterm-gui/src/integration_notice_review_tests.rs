@@ -197,7 +197,6 @@ fn hand_over(app: &mut App) {
         cols: 80,
         outer_x: None,
         outer_y: None,
-        status_bar_rows: app.message_band_rows,
         messages: carried.messages,
         next_message_id: carried.next_message_id,
         update_verified_unix_ms: None,

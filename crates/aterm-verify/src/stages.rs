@@ -14,6 +14,14 @@ use crate::{Ctx, is_executable_file};
 /// Dispatch one stage.
 #[must_use]
 pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
+    run_stage_prepared(ctx, spec, None)
+}
+
+pub(crate) fn run_stage_prepared(
+    ctx: &Ctx,
+    spec: &StageSpec,
+    cells: Option<crate::cells::PreparedRun>,
+) -> Report {
     let mut r = Report::new(spec.title.clone());
     if let Err(why) = crate::test_workers::admitted_share(&ctx.env) {
         r.cannot_run(format!("{why}; no stage was run"));
@@ -51,7 +59,7 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         }
         StageId::RedrawConformance => redraw_conformance(ctx, &mut r),
         StageId::ObjcDrives => objc_drives(ctx, &mut r),
-        StageId::ForeignCells => foreign_cells(ctx, &mut r),
+        StageId::ForeignCells => foreign_cells(ctx, &mut r, cells),
         StageId::WasmSmoke => {
             if in_checkout(ctx, &mut r, "wasm-smoke") {
                 crate::wasm_smoke::run(ctx, &mut r);
@@ -865,7 +873,7 @@ pub fn main_targo(ctx: &Ctx, args: Vec<String>) -> Cmd {
 #[must_use]
 pub const fn lane_build_jobs(lane: Lane) -> Option<u32> {
     match lane {
-        Lane::TrustTarget | Lane::CellsTarget => Some(4),
+        Lane::CellsTarget => Some(4),
         _ => None,
     }
 }
@@ -1981,15 +1989,12 @@ pub const EXPORT_LABEL: &str = "ship check --export";
 /// The `SIGTERM` grace `ship check --export` gets at its ceiling.
 pub const EXPORT_TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// `ship check --export` from the root, its release tools built in `<target>/verify/.ubd/trust.noindex` ([`Lane::TrustTarget`]), ended at its ceiling with [`EXPORT_TERM_GRACE`].
+/// `ship check --export` from the root, its release tools built in the main build directory after
+/// the test compile has populated it ([`Lane::MainTarget`]), ended at its ceiling with
+/// [`EXPORT_TERM_GRACE`].
 #[must_use]
 pub fn export_cmd(ctx: &Ctx) -> Cmd {
-    in_lane(
-        ctx,
-        Lane::TrustTarget,
-        targo(ctx, ship_args(["check", "--export"])),
-    )
-    .term_grace(EXPORT_TERM_GRACE)
+    main_targo(ctx, ship_args(["check", "--export"])).term_grace(EXPORT_TERM_GRACE)
 }
 
 fn fixes(transcript: &str) -> Option<String> {
@@ -2657,9 +2662,13 @@ fn glue_row(
 /// The `cells` check ([`crate::cells`]): every forge cell but this machine's
 /// own (or each `--cell`), each linted for its own triple on the checkout's
 /// stock pin (a STOCK EXCEPTION), one row per cell.
-fn foreign_cells(ctx: &Ctx, r: &mut Report) {
+pub(crate) fn prepare_cells(ctx: &Ctx) -> Option<crate::cells::PreparedRun> {
+    in_checkout(ctx, &mut Report::new("cells"), "cells").then(|| crate::cells::prepare(ctx))
+}
+
+fn foreign_cells(ctx: &Ctx, r: &mut Report, prepared: Option<crate::cells::PreparedRun>) {
     if in_checkout(ctx, r, "cells") {
-        crate::cells::run(ctx, r);
+        crate::cells::run_prepared(ctx, r, prepared);
     }
 }
 
@@ -5158,8 +5167,18 @@ mod tests {
 
     #[test]
     fn the_export_check_reads_ship_checks_exit_code() {
-        let cmd = export_cmd(&ctx(Scope::workspace()));
+        let c = ctx(Scope::workspace());
+        let cmd = export_cmd(&c);
         assert_eq!(cmd.term_grace, Some(EXPORT_TERM_GRACE));
+        assert_eq!(
+            cmd.argv(),
+            main_targo(&c, ship_args(["check", "--export"])).argv(),
+            "export uses the main target's build-dir and test graph"
+        );
+        assert!(
+            cmd.envs.iter().all(|(name, _)| name != "CARGO_TARGET_DIR"),
+            "the retired trust lane must not supply a target directory"
+        );
         assert_eq!(export_outcome(Some(0), "").0, Outcome::Ok);
         for code in [1, 2, 101] {
             assert_eq!(
@@ -5838,16 +5857,15 @@ mod tests {
 
     #[test]
     fn a_callers_cargo_build_jobs_is_a_ceiling_for_the_side_lanes() {
-        for lane in [Lane::TrustTarget, Lane::CellsTarget] {
-            let own = lane_build_jobs(lane);
-            assert_eq!(lane_jobs(lane, None), own, "{lane:?}");
-            assert_eq!(
-                lane_jobs(lane, Some(1)),
-                Some(1),
-                "{lane:?}: a smaller ceiling wins"
-            );
-            assert_eq!(lane_jobs(lane, Some(1000)), own, "{lane:?}: never a floor");
-        }
+        let lane = Lane::CellsTarget;
+        let own = lane_build_jobs(lane);
+        assert_eq!(lane_jobs(lane, None), own, "{lane:?}");
+        assert_eq!(
+            lane_jobs(lane, Some(1)),
+            Some(1),
+            "{lane:?}: a smaller ceiling wins"
+        );
+        assert_eq!(lane_jobs(lane, Some(1000)), own, "{lane:?}: never a floor");
         let ceiling = |raw: &str| {
             let mut c = ctx(Scope::workspace());
             c.env.cargo_build_jobs = Some(raw.into());
@@ -5870,7 +5888,9 @@ mod tests {
                 })
                 .collect()
         };
-        assert!(envs(&export_cmd(&c)).contains(&("CARGO_BUILD_JOBS".to_string(), "3".to_string())));
+        let export = envs(&export_cmd(&c));
+        assert!(!export.iter().any(|(name, _)| name == "CARGO_BUILD_JOBS"));
+        assert!(!export.iter().any(|(name, _)| name == "CARGO_TARGET_DIR"));
     }
 
     /// The words of `argv` (its program first) before its subcommand and those after it up to
@@ -5998,11 +6018,13 @@ mod tests {
         let value = "build.build-dir='/h/Library/Caches/aterm/cargo-build.noindex{workspace-root}/.cargo-build'";
         c.main_build_dir = Some(value.to_string());
         let [compile, run] = test_cmds(&c, false);
+        let export = export_cmd(&c);
         for cmd in [
             &compile,
             &run,
             &spec_check_cmd(&c),
             &linux_lab_build_cmd(&c),
+            &export,
         ] {
             assert_eq!(cmd.argv()[1..3], ["--config", value], "{:?}", cmd.argv());
             assert_eq!(
@@ -6046,8 +6068,11 @@ mod tests {
                 .any(|(name, _)| name == aterm_toolchain::build_cache::BUILD_DIR_ENV)
         );
         assert!(
-            !export_cmd(&c).argv().iter().any(|a| a == "--config"),
-            "a side lane keeps its own dir"
+            export_cmd(&c)
+                .envs
+                .iter()
+                .all(|(name, _)| name != "CARGO_TARGET_DIR"),
+            "an unplaced main lane still does not create a private target"
         );
     }
 

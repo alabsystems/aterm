@@ -30,7 +30,7 @@ use crate::wall::{Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 16, "0.16");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 17, "0.17");
 
 /// The usage limit is spent: the server's quota words 2.3.3's patterns matched, and its code
 /// (lowercase).
@@ -286,8 +286,8 @@ fn titled(row: &str) -> &str {
 }
 
 /// The box standing in the composer's place on `rows`: no composer is drawn, a pair of
-/// full-width rules ([`rule`]) holds it, the lower one the last drawn row (the trust prompt,
-/// which draws no footer) or standing right over the footer's two rows, the screen's last drawn
+/// full-width rules ([`rule`]) holds it, the lower one the last drawn row (the trust prompt and
+/// every fullscreen panel, which draw no footer) or standing right over the footer's two rows, the screen's last drawn
 /// ones, its `context: N%` row the second ([`footer_used`]), and the first drawn row under the
 /// upper rule is one of the titles (`TITLES`, [`approval_of`]). The upper rule is the nearest
 /// one over the lower at its column and of its width: the panel draws both at its own column
@@ -336,9 +336,12 @@ fn card(rows: &[String]) -> Option<Card> {
 /// in (`2. Approve for this session`, `[2] Blue`), measured on 2.4.0. A multi-select question's
 /// options stand two columns in as `[✓] <label>` or `[ ] <label>`, numbered on no row and focused
 /// by colour alone (read in 2.5.2's `renderQuestionTab`): each is read with no number and no
-/// focus, and [`prompt`] numbers them. A row at any other column (an option's description, a
-/// question's body, a command) is none, and so is a review step's `→  <answer>`, whose mark two
-/// spaces follow.
+/// focus, and [`prompt`] numbers them. A row at any other column (an inline option's
+/// description, a question's body, a command) is none, and so is a review step's
+/// `→  <answer>`, whose mark two spaces follow. A docked panel draws its focused choice's
+/// description in a block of its own at the focused option's column (`renderFoot`), so such a
+/// description shaped like an option is read as one: [`prompt`] reads a command's or a file's
+/// options only off the block over its key row, and another box's options carry no role.
 fn choice(row: &str, edge: usize) -> Option<(Option<u8>, bool, &str)> {
     let text = crate::text::trim(row);
     let at = crate::phase::leading_spaces(row);
@@ -453,25 +456,22 @@ fn drawn_whole(
 }
 
 /// Whether a body row's `words` were cut at the box's edge: the panel ends every body row too
-/// wide for it with `...` at its last cells (`truncateToWidth`, read in 2.5.2's binary).
-fn cut(row: &str, words: &str, edge: usize, width: usize) -> bool {
-    let end = crate::phase::leading_spaces(row) + crate::question::cells(words);
-    words.ends_with("...") && end + 2 >= edge + width
+/// wide for it with `...` (`truncateToWidth`, read in 2.5.2's binary). No width tells a cut row
+/// from a whole one: the cut stops short of the edge by up to a grapheme's width less one (a
+/// grapheme that does not fit, four cells to Kimi for `ကျွေ`), and the grid may draw a row
+/// narrower than Kimi counts it (an asat, U+103A, one cell to Kimi and none on the grid). So
+/// every row ending `...` is cut, and a path that really ends so names no file.
+fn cut(words: &str) -> bool {
+    words.ends_with("...")
 }
 
-/// The file a file's approval names, in a box whose rules start `edge` columns in and span
-/// `width` cells: its block's first row on `rows` `from..to` (a body drawn whole, [`prompt`]),
-/// two columns in from the rules, and whether that row shows it whole. A file written whole draws its path there over its numbered
+/// The file a file's approval names, in a box whose rules start `edge` columns in: its block's
+/// first row on `rows` `from..to` (a body drawn whole, [`prompt`]), two columns in from the
+/// rules, and whether that row shows it whole. A file written whole draws its path there over its numbered
 /// content; a file's edits draw a diff headed by the counts it adds and removes before the path
 /// (`+1 -1 <path>`, `renderDiffLinesClustered`, read in 2.5.2's binary). Measured on 2.5.2's
 /// write and edit frames; a path cut at the box's edge ([`cut`]) names no file.
-fn file_of(
-    rows: &[String],
-    from: usize,
-    to: usize,
-    edge: usize,
-    width: usize,
-) -> Option<(&str, bool)> {
+fn file_of(rows: &[String], from: usize, to: usize, edge: usize) -> Option<(&str, bool)> {
     let row = (from..to).find(|&i| !crate::text::blank(&rows[i]))?;
     if crate::phase::leading_spaces(&rows[row]) != edge + 2 {
         return None;
@@ -489,7 +489,7 @@ fn file_of(
             text = rest;
         }
     }
-    (!text.is_empty()).then(|| (text, !cut(&rows[row], words, edge, width)))
+    (!text.is_empty()).then(|| (text, !cut(words)))
 }
 
 /// A command's approval ([`prompt`]): each line's rows, the words its mark opens and then each
@@ -653,7 +653,9 @@ fn shell(rows: &[String], from: usize, to: usize, edge: usize) -> Option<Shell> 
 /// other box's options stand at the columns [`choice`] reads, a command's or a file's approval's
 /// only in the block over its key row ([`option_block`]), whose body is read; another box's
 /// choices may carry descriptions, drawn among them or, docked, under them in a block of their
-/// own, so its options are read wherever they stand in it, and its body for nothing. A digit
+/// own, so its options are read wherever they stand in it, and its body for nothing. A docked
+/// description stands at the focused option's column, so one shaped like an option is read as
+/// one there; such a box's options are display alone. A digit
 /// picks one, or toggles
 /// one on a multi-select question, whose options are numbered in order from the first it shows
 /// ([`first_shown`]) and whose focus and ticks are not read. Its key row is the last row in the
@@ -756,7 +758,7 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
             .find(|t| t.starts_with('/') || t.starts_with('~'))
             .map(|path| (path, true)),
         PromptKind::Write | PromptKind::Edit if whole => {
-            file_of(rows, c.title + 1, first_option, edge, width)
+            file_of(rows, c.title + 1, first_option, edge)
         }
         _ => None,
     };

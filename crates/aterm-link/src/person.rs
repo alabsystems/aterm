@@ -535,18 +535,28 @@ struct Bounds {
 /// subscription astream's [`astream_broker::IDLE_MARK_DEADLINE`] or one idle mark past the
 /// request's bound, whichever is later, so the subscription always outlasts a request.
 fn live() -> Bounds {
-    let request = crate::fabric::io_timeout();
+    bounds(crate::fabric::io_timeout())
+}
+
+const fn bounds(request: Duration) -> Bounds {
+    let after_request = request.saturating_add(astream_broker::IDLE_MARK);
     Bounds {
         request,
-        subscription: astream_broker::IDLE_MARK_DEADLINE
-            .max(request.saturating_add(astream_broker::IDLE_MARK)),
+        subscription: if after_request.as_nanos() > astream_broker::IDLE_MARK_DEADLINE.as_nanos() {
+            after_request
+        } else {
+            astream_broker::IDLE_MARK_DEADLINE
+        },
     }
 }
 
-// A shipped build's subscription keeps astream's deadline.
+// The subscription keeps the protocol's minimum and outlasts a request by an idle mark.
 const _: () = assert!(
-    astream_broker::IDLE_MARK_DEADLINE.as_millis()
-        > IO_TIMEOUT.as_millis() + astream_broker::IDLE_MARK.as_millis()
+    bounds(IO_TIMEOUT).subscription.as_nanos() >= astream_broker::IDLE_MARK_DEADLINE.as_nanos()
+        && bounds(IO_TIMEOUT).subscription.as_nanos()
+            >= IO_TIMEOUT
+                .saturating_add(astream_broker::IDLE_MARK)
+                .as_nanos()
 );
 
 fn publish(
@@ -566,7 +576,7 @@ fn publish(
     let producer = astream_cap::producer_id_of(person);
     let (off, deduped) = crate::rate_hold::waiting_out(
         || conn.publish(producer, seq, subject, body),
-        IO_TIMEOUT,
+        Duration::from_secs(3),
         std::thread::sleep,
     )?;
     if deduped {

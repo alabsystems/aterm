@@ -2967,7 +2967,9 @@ impl LoginScan {
     }
 }
 
-fn is_login_success_row(v: &Value) -> bool {
+/// Whether the transcript row `v` records a `/login` that succeeded: a user row whose content, or
+/// a `local_command` system row whose content, is the command's `Login successful` output.
+pub(crate) fn is_login_success_row(v: &Value) -> bool {
     match v.get("type").and_then(Value::as_str) {
         Some("user") => v
             .get("message")
@@ -3169,7 +3171,8 @@ pub fn notice_scan(jsonl: &str, marker: &str) -> Option<Scan> {
     })
 }
 
-fn row_time(v: &Value) -> Option<u64> {
+/// The transcript row `v`'s time: its `timestamp`, in Unix seconds.
+pub(crate) fn row_time(v: &Value) -> Option<u64> {
     v.get("timestamp")
         .and_then(Value::as_str)
         .and_then(super::upgrade_models::parse_utc)
@@ -3290,7 +3293,13 @@ pub fn transcript_standing_wall(jsonl: &str) -> Option<StandingWall> {
     StandingScan::of(jsonl).wall()
 }
 
-fn standing_wall_of(v: &Value) -> Option<StandingWall> {
+/// The quota wall one transcript row records: a `quotaLimits` rejection that is neither a spend
+/// wall ([`is_spend_row`]) nor a credit wall (`rateLimitType` `overage`), at its row's time, with
+/// its window's reset, its window (`rateLimitType`, else the window its notice names,
+/// [`super::usage::notice_window`]) and the credits word it carries. [`StandingScan::wall`] reads
+/// a transcript's standing limit row with it; the account backfill reads each rejected row with it
+/// (`super::account_backfill`).
+pub(crate) fn wall_of_row(v: &Value) -> Option<StandingWall> {
     let quota = v.get("quotaLimits")?;
     if quota.get("status").and_then(Value::as_str) != Some("rejected") || is_spend_row(v) {
         return None;
@@ -3430,7 +3439,7 @@ impl StandingScan {
     /// Returns [`transcript_standing_wall`] for the scanned rows.
     #[must_use]
     pub fn wall(&self) -> Option<StandingWall> {
-        self.read(standing_wall_of)
+        self.read(wall_of_row)
     }
 
     /// Returns [`transcript_standing_limit`] for the scanned rows.

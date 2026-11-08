@@ -4622,6 +4622,70 @@ pub(crate) mod tests {
         }
     }
 
+    /// A v0.147.0 parent (the last whose message band took rows) sized its window for its grid
+    /// plus the band's 1 to 3 rows, which no carry now names. Where those rows come to exactly
+    /// what the Full deck adds to the Folded one, the attach reads the excess as a Full deck over
+    /// a window that takes Folded: the frame is kept, and each tab re-grids once to the rows it
+    /// holds, booked `site=deck`. Every other count takes the exact frame and re-grids nothing.
+    #[test]
+    fn a_v0_147_band_excess_reads_as_a_deck_only_where_it_matches_the_full_form() {
+        use aterm_window::dpi::PhysicalSize;
+        let (mut misread, mut exact_taken) = (0, 0);
+        for scale in [1.0, 2.0] {
+            for band in 1..=aterm_messages::MAX_ROWS {
+                let at = format!("{band} band row(s) at {scale}x");
+                let _attached = attach_stats();
+                let (mut app, wid, sessions) = three_panes();
+                let band_pts = 28.0;
+                {
+                    let ws = app.windows.get_mut(&wid).expect("the window");
+                    ws.scale = scale;
+                    ws.head_pts = band_pts;
+                }
+                let (rows, cols) = (app.windows[&wid].rows, app.windows[&wid].cols);
+                app.windows.get_mut(&wid).expect("the window").deck_form = DeckForm::Folded;
+                let head = app.deck_head_px(wid, band_pts, scale, 0);
+                app.backend.set_head(head);
+                let (_, cell) = app.win_cell_size(wid);
+                let exact = app.window_frame_px_for(wid, rows, cols);
+                let band_px = u32::from(band) * u32::try_from(cell).expect("a cell's height");
+                let carried = PhysicalSize::new(exact.width, exact.height + band_px);
+                let full_over_folded =
+                    chrome_head_px(band_pts, scale, StatsBars::Deck, DeckForm::Full, cell)
+                        - chrome_head_px(band_pts, scale, StatsBars::Deck, DeckForm::Folded, cell);
+                let before = sites_of(&app, &sessions);
+                let head = app.attach_deck_head(wid, band_pts, scale);
+                app.windows.get_mut(&wid).expect("the window").metrics.head = head;
+                let size = app.attach_frame_px(wid, rows, cols, Some(carried));
+                app.regrid_to_attach_frame(wid, size);
+                let booked = new_sites(&before, &sites_of(&app, &sessions));
+                let grid = (app.windows[&wid].rows, app.windows[&wid].cols);
+                if usize::from(band) * cell == full_over_folded {
+                    misread += 1;
+                    assert_eq!(size, carried, "the frame is kept, {at}");
+                    assert_eq!(
+                        grid,
+                        (rows + band, cols),
+                        "the band's rows join the grid, {at}"
+                    );
+                    assert!(
+                        booked.iter().all(|b| b == &["site=deck"]),
+                        "one re-grid each, booked deck: {booked:?}, {at}"
+                    );
+                } else {
+                    exact_taken += 1;
+                    assert_eq!(size, exact, "the exact frame, {at}");
+                    assert_eq!(grid, (rows, cols), "{at}");
+                    assert!(booked.iter().all(Vec::is_empty), "{booked:?}, {at}");
+                }
+            }
+        }
+        assert!(
+            misread > 0 && exact_taken > 0,
+            "PRECONDITION: both readings reached: {misread} misread, {exact_taken} exact"
+        );
+    }
+
     /// A window of two tabs, the second split: three panes, each its own session.
     fn three_panes() -> (crate::App, crate::WindowId, Vec<u64>) {
         let mut app = crate::App::headless_for_test();

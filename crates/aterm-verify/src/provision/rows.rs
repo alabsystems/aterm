@@ -145,7 +145,7 @@ impl Row {
     #[must_use]
     pub fn version(&self) -> Option<&'static str> {
         if let Install::Managed { prerequisite, .. } = self.install {
-            return Some(prerequisite.recipe().version);
+            return prerequisite.recipe().map(|recipe| recipe.version);
         }
         self.tool_row().and_then(|t| t.pin).map(|p| p.version)
     }
@@ -220,7 +220,7 @@ pub const MICROSOFT_TEAM: &str = "UBF8T346G9";
 /// Every row, in the order a run provides them.
 pub const ROWS: [Row; 15] = [
     Row {
-        name: Prerequisite::OpenSslSigning.recipe().name,
+        name: Prerequisite::OpenSslSigning.program(),
         tool: Some(Prerequisite::OpenSslSigning.executable()),
         install: Install::Managed {
             prerequisite: Prerequisite::OpenSslSigning,
@@ -228,7 +228,7 @@ pub const ROWS: [Row; 15] = [
         },
     },
     Row {
-        name: Prerequisite::Python.recipe().name,
+        name: Prerequisite::Python.program(),
         tool: Some(Prerequisite::Python.executable()),
         install: Install::Managed {
             prerequisite: Prerequisite::Python,
@@ -236,7 +236,7 @@ pub const ROWS: [Row; 15] = [
         },
     },
     Row {
-        name: Prerequisite::Gitleaks.recipe().name,
+        name: Prerequisite::Gitleaks.program(),
         tool: Some(Prerequisite::Gitleaks.executable()),
         install: Install::Managed {
             prerequisite: Prerequisite::Gitleaks,
@@ -244,7 +244,7 @@ pub const ROWS: [Row; 15] = [
         },
     },
     Row {
-        name: Prerequisite::Lake.recipe().name,
+        name: Prerequisite::Lake.program(),
         tool: Some(Prerequisite::Lake.executable()),
         install: Install::Managed {
             prerequisite: Prerequisite::Lake,

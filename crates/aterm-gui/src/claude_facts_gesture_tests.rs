@@ -583,10 +583,22 @@ fn a_fact_under_a_band_is_no_target() {
     frame(&mut app, wid);
     let branch = fact_hit(&app, wid, Fact::Branch);
     let (x, y) = px_of(&app, wid, (branch.frame_row, branch.cols.0));
+    app.on_cursor_moved(wid, x, y);
     assert!(
         app.claude_glass_at(wid, x, y).is_some(),
         "CONTROL: a target"
     );
+    assert_eq!(
+        app.windows[&wid].claude_lights.hover,
+        Some((session, Target::Fact(Fact::Branch)))
+    );
+    assert!(
+        app.windows[&wid]
+            .claude_lights
+            .fact_reading(session, Fact::Branch)
+            .is_some()
+    );
+    assert!(app.windows[&wid].hover_pointer);
     app.paste_banner = Some(crate::paste_banner::PendingPaste::new(
         wid,
         Some(session),
@@ -595,9 +607,18 @@ fn a_fact_under_a_band_is_no_target() {
         PasteFraming::Gesture { bracketed: true },
     ));
     app.splice_paste_banner(wid);
+    app.refresh_glass_cursor_for_frame(wid);
     let branch = fact_hit(&app, wid, Fact::Branch);
     assert!(app.chrome_owns_terminal_row(wid, branch.term_row));
     assert_eq!(app.claude_glass_at(wid, x, y), None);
+    assert_eq!(app.windows[&wid].claude_lights.hover, None);
+    assert_eq!(
+        app.windows[&wid]
+            .claude_lights
+            .fact_reading(session, Fact::Branch),
+        None
+    );
+    assert!(!app.windows[&wid].hover_pointer);
     assert!(!app.press_visible_claude_fact(wid, session, Fact::Branch, FactMask::default()));
     assert_eq!(app.fact_mask(session), FactMask::default());
 }

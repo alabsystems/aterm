@@ -14,12 +14,26 @@
 //! as its label or an alias, so the name still answers once the source that linked it is gone, and
 //! an import never retracts a name a sheet still says.
 //!
+//! A table can also move a name: it lists `m5` and `m7` apart, with the alias `m104` on `m7`, while a
+//! row going by `m5` holds `m104`. What an earlier import of a source this run read wrote there
+//! answers for nothing, since this same plan takes it back ([`Planner::gives_up`]), so `m7` keeps a
+//! row of its own and the name moves in one plan. Held by the owner, disputed by a row's conflicted
+//! label, or stated by a source that reaches the row by a node or host it holds or this plan writes
+//! on it, it is a finding and nothing is folded into that row. A table row whose own label a row
+//! holds as an alias still finds that row, which is how a renamed Mac's old name finds it.
+//!
+//! The roster moves a row's label the same way: one it gives another row later in its list waits for
+//! that row to move off it, so a chain of renames settles in one plan. Two rows trading labels stay a
+//! finding, since nothing shows which came first. A row that frees a name is written before the row
+//! that takes it, so a run cut short leaves no name on two rows; rows trading aliases have no such
+//! order, and the next run finishes what one cut short.
+//!
 //! A row holding another node than the one stated is another Mac's, whatever else it shares
 //! (`register::pick`'s rule): a host finds it no row, and a name it answers is a finding.
 
 use super::{
-    Coord, Dump, Finding, Kind, KnownMac, Label, Planner, Sheet, SheetKind, guard, json, keys,
-    source_row,
+    Coord, Dump, Finding, Kind, KnownMac, Label, Planner, ReadNow, Sheet, SheetKind, guard, json,
+    keys, source_row,
 };
 use crate::{
     alab::{
@@ -45,6 +59,16 @@ pub(super) struct NameLinks {
     principals: BTreeMap<String, BTreeSet<String>>,
     /// The hosts a source states beside each name.
     hosts: BTreeMap<String, BTreeSet<String>>,
+    /// Each source's machine table.
+    tables: Vec<Table>,
+}
+
+/// One source's machine table: every name each label's row states, and the names any row states
+/// beside its label.
+#[derive(Debug, Default)]
+struct Table {
+    rows: BTreeMap<String, BTreeSet<String>>,
+    aliases: BTreeSet<String>,
 }
 
 /// One row of a source: its label, every name it states (the label among them), and the node and
@@ -86,7 +110,16 @@ impl NameLinks {
 
     fn table(&mut self, rows: &[Stated]) {
         let mut labels: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        let mut table = Table::default();
         for row in rows {
+            table
+                .rows
+                .entry(row.label.clone())
+                .or_default()
+                .extend(row.names.iter().cloned());
+            table
+                .aliases
+                .extend(row.names.iter().filter(|name| **name != row.label).cloned());
             for name in &row.names {
                 labels.entry(name).or_default().insert(&row.label);
                 for other in row.names.iter().filter(|other| *other != name) {
@@ -121,10 +154,24 @@ impl NameLinks {
                 .filter(|(_, labels)| labels.len() > 1)
                 .map(|(name, _)| name.to_owned()),
         );
+        self.tables.push(table);
     }
 
     fn contested(&self, name: &str) -> bool {
         self.contested.contains(name)
+    }
+
+    /// Whether a table states `alias` of another row and lists `label` as a row without it, and no
+    /// source gives `alias` to two rows.
+    fn disowns(&self, alias: &str, label: &str) -> bool {
+        !self.contested(alias)
+            && self.tables.iter().any(|table| {
+                table.aliases.contains(alias)
+                    && table
+                        .rows
+                        .get(label)
+                        .is_some_and(|names| !names.contains(alias))
+            })
     }
 
     /// `name` and every name linked to it through names no source contests.
@@ -153,6 +200,19 @@ impl NameLinks {
             .cloned()
             .collect()
     }
+}
+
+/// Every name `row` goes by: each candidate of its label, and each alias.
+fn row_names(row: &cell::Row) -> BTreeSet<&str> {
+    let mut names: BTreeSet<&str> = row
+        .fields
+        .get("aliases")
+        .map(|field| field.members().into_iter().collect())
+        .unwrap_or_default();
+    if let Some(field) = row.fields.get("label") {
+        names.extend(field.candidates_x().into_iter().filter_map(Value::as_str));
+    }
+    names
 }
 
 /// An `aliases` cell's item as a machine name, a dotted spelling (`m27.2`) read as its stored one.
@@ -258,7 +318,7 @@ impl Planner<'_> {
             .rows
             .iter()
             .filter(|(_, row)| row.live())
-            .filter(|(_, row)| {
+            .filter(|(pk, row)| {
                 // A conflicted label answers for each candidate, as `register::birth_label` reads it.
                 row.fields.get("label").is_some_and(|field| {
                     field
@@ -266,10 +326,12 @@ impl Planner<'_> {
                         .into_iter()
                         .filter_map(Value::as_str)
                         .any(|label| names.contains(label))
-                }) || row
-                    .fields
-                    .get("aliases")
-                    .is_some_and(|field| field.members().iter().any(|m| names.contains(*m)))
+                }) || row.fields.get("aliases").is_some_and(|field| {
+                    field
+                        .members()
+                        .iter()
+                        .any(|m| names.contains(*m) && !self.gives_up(pk, row, m))
+                })
             })
             .map(|(pk, _)| pk.clone())
             .collect();
@@ -285,6 +347,162 @@ impl Planner<'_> {
             }
         }
         hits
+    }
+
+    /// Whether a table lists a name `row` goes by as a row without `alias`, and states `alias` of
+    /// another ([`NameLinks::disowns`]). A table's row lists its own label, so `alias` itself is no
+    /// such name.
+    fn disowned(&self, row: &cell::Row, alias: &str) -> bool {
+        row_names(row)
+            .into_iter()
+            .any(|name| self.links.disowns(alias, name))
+    }
+
+    /// Whether a source row stating `alias` reaches `pk` by what else it states (a transport id, a
+    /// mesh id the row holds as its `node` or was born under, or a host), or a known Mac going by
+    /// `alias` does: `pk` keeps being told the name, so it cannot move. With `wanted`, the node cells
+    /// and hosts this plan wants for `pk` reach it too.
+    fn reached_stating(&self, pk: &str, row: &cell::Row, alias: &str, wanted: bool) -> bool {
+        let names = BTreeSet::from([alias.to_owned()]);
+        let want = self
+            .row_get(MACHINE.name, pk)
+            .filter(|_| wanted)
+            .map(|want| &want.values);
+        let held = |column: &str, node: &str| {
+            row.get(column).and_then(Value::as_str) == Some(node)
+                || want
+                    .and_then(|values| values.get(column))
+                    .is_some_and(|want| want.x == json!(node))
+        };
+        let hosts: Vec<&str> = row
+            .get("hosts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .chain(
+                want.and_then(|values| values.get("hosts"))
+                    .and_then(|want| want.x.as_array()),
+            )
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        let on_host = |host: &str| hosts.iter().any(|mine| same_host(mine, host));
+        NameLinks::beside(&names, &self.links.nodes)
+            .iter()
+            .any(|node| held("fleet_node", node))
+            || NameLinks::beside(&names, &self.links.principals)
+                .iter()
+                .any(|node| held("node", node) || self.row_under_key(node).as_deref() == Some(pk))
+            || NameLinks::beside(&names, &self.links.hosts)
+                .iter()
+                .any(|host| on_host(host))
+            || self.known(&names).iter().any(|mac| {
+                valid_node(mac).is_some_and(|node| {
+                    held("node", &node) || self.row_under_key(&node).as_deref() == Some(pk)
+                }) || valid_transport(mac).is_some_and(|node| held("fleet_node", &node))
+                    || valid_hosts(mac).into_iter().any(on_host)
+            })
+    }
+
+    /// Whether this plan takes `alias` off `row`: a table disowns it, an earlier import of a source
+    /// this run reads as it is wrote it (what an edited replica's earlier import wrote is only
+    /// reported, so it stays), no source still tells the row the name (by what the row holds, or what
+    /// an earlier pass came to want for it: `names_reached`), and the row's label is settled. It
+    /// answers for nothing, so the row the table states it of takes it in the same plan.
+    fn gives_up(&self, pk: &str, row: &cell::Row, alias: &str) -> bool {
+        matches!(row.fields.get("label"), None | Some(Field::Value(_)))
+            && self.disowned(row, alias)
+            && !Self::linked_to(&self.links, row, alias)
+            && !self
+                .names_reached
+                .get(pk)
+                .is_some_and(|names| names.contains(alias))
+            && !self.reached_stating(pk, row, alias, false)
+            && matches!(row.fields.get("aliases"), Some(Field::Set(elements))
+            if elements.get(alias).is_some_and(|field| {
+                source_row(field, &self.current[SOURCE.name])
+                    .is_some_and(|(key, wrote)| ReadNow::of(self.input).reads_as_written(key, wrote))
+            }))
+    }
+
+    /// The names this pass gives up that the node or hosts it came to want for their row reach
+    /// after all: a source states them beside what the row will hold, so `plan` keeps them in its
+    /// next pass. Only names this pass gives up, so each pass keeps more.
+    pub(super) fn reached_later(&self) -> BTreeMap<String, BTreeSet<String>> {
+        let mut later: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (pk, row) in &self.current[MACHINE.name].rows {
+            let Some(aliases) = row.fields.get("aliases").filter(|_| row.live()) else {
+                continue;
+            };
+            for alias in aliases.members() {
+                if self.gives_up(pk, row, alias) && self.reached_stating(pk, row, alias, true) {
+                    later
+                        .entry(pk.clone())
+                        .or_default()
+                        .insert(alias.to_owned());
+                }
+            }
+        }
+        later
+    }
+
+    /// Put every row that gives a name up in the plan, which is where `finish` takes it back,
+    /// whichever rows the sources' other rows found, and write it before any row taking that name. A
+    /// name a table disowns that its row cannot give up stays, as `names_kept`, with the finding.
+    pub(super) fn names_given_up(&mut self) {
+        let mut given = Vec::new();
+        let mut kept: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (pk, row) in &self.current[MACHINE.name].rows {
+            let Some(aliases) = row.fields.get("aliases").filter(|_| row.live()) else {
+                continue;
+            };
+            for alias in aliases.members() {
+                if self.gives_up(pk, row, alias) {
+                    given.push((pk.clone(), alias.to_owned()));
+                } else if self.disowned(row, alias) {
+                    kept.entry(pk.clone()).or_default().insert(alias.to_owned());
+                }
+            }
+        }
+        self.names_kept = kept;
+        let table = self.rows.entry(MACHINE.name).or_default();
+        for (giver, alias) in given {
+            table.entry(giver.clone()).or_default();
+            for (pk, want) in table.iter() {
+                let as_alias = want
+                    .elements
+                    .get("aliases")
+                    .is_some_and(|names| names.contains_key(&alias));
+                let as_label = want
+                    .values
+                    .get("label")
+                    .is_some_and(|label| label.x.as_str() == Some(alias.as_str()));
+                if as_alias || as_label {
+                    self.frees_first.push((giver.clone(), pk.clone()));
+                }
+            }
+        }
+    }
+
+    /// Whether `pk` answers `names` only through an alias a table disowns and this plan does not take
+    /// back: what the table says of the name is a finding, and nothing folds into that row.
+    fn holds_disowned(&self, pk: &str, names: &BTreeSet<String>) -> bool {
+        let Some(row) = self.current[MACHINE.name].rows.get(pk) else {
+            return false;
+        };
+        let by_label = row.fields.get("label").is_some_and(|field| {
+            field
+                .candidates_x()
+                .into_iter()
+                .filter_map(Value::as_str)
+                .any(|label| names.contains(label))
+        });
+        !by_label
+            && row.fields.get("aliases").is_some_and(|field| {
+                field
+                    .members()
+                    .iter()
+                    .any(|m| names.contains(*m) && self.disowned(row, m))
+            })
     }
 
     /// The live rows and this plan's rows whose node cell `column` holds `node`: one, or a clash any
@@ -398,7 +616,7 @@ impl Planner<'_> {
         let named = self.rows_named(names);
         if named
             .iter()
-            .any(|pk| self.other_mac(pk, &transports, principal))
+            .any(|pk| self.other_mac(pk, &transports, principal) || self.holds_disowned(pk, names))
         {
             return Err(Kind::LabelAmbiguous);
         }
@@ -787,9 +1005,12 @@ impl Planner<'_> {
         }
         let status = match &found {
             None => Some("planned"),
-            Some((_, Some("node"))) => Some("active"),
-            // `adopt` is the owner saying the Macs it names are the rows it finds.
-            Some(_) if !self.input.births => Some("active"),
+            Some((pk, Some("node"))) => {
+                self.joined.insert(pk.clone());
+                Some("active")
+            }
+            // A row found any other way, `adopt`'s included, waits for its Mac as it is:
+            // `register::pick` adopts by name only a `planned` row.
             Some(_) => None,
         };
         let found = found.map(|(pk, _)| pk);
@@ -826,21 +1047,58 @@ impl Planner<'_> {
         Some(pk)
     }
 
-    /// Want the roster's `label` on `pk`. A label another row answers is a finding. Where the
-    /// roster replaces its own earlier label and a sheet this run still says the old one, the old
-    /// one stays the row's as an alias, or the next run would birth a row for it. Where the row's
-    /// label stays against the roster's, the roster's name is wanted as an alias, so it still answers
-    /// this row.
+    /// Whether this plan moves `pk` off the label `label`: it wants another that lands, and keeps no
+    /// alias of the old one.
+    fn leaves(&self, pk: &str, label: &str) -> bool {
+        let Some(want) = self.row_get(MACHINE.name, pk) else {
+            return false;
+        };
+        let moves = want
+            .values
+            .get("label")
+            .and_then(|want| want.x.as_str())
+            .is_some_and(|to| to != label && self.label_lands(pk, to));
+        let keeps = want
+            .elements
+            .get("aliases")
+            .is_some_and(|set| set.contains_key(label))
+            || self.current[MACHINE.name]
+                .rows
+                .get(pk)
+                .and_then(|row| row.fields.get("aliases"))
+                .is_some_and(|field| field.has_member(label));
+        moves && !keeps
+    }
+
+    /// Whether a row other than `pk` keeps answering the roster's `label`, or a source says it means
+    /// two machines ([`Self::name_clash`], but a row this plan moves off it is no holder).
+    fn label_clash(&self, pk: &str, label: &str) -> bool {
+        self.links.contested(label)
+            || self
+                .rows_named(&BTreeSet::from([label.to_owned()]))
+                .iter()
+                .any(|hit| hit != pk && !self.leaves(hit, label))
+    }
+
+    /// Want the roster's `label` on `pk`, or wait for the row that holds it to move
+    /// ([`Self::known_macs`]).
     fn known_label(&mut self, pk: &str, label: &str, at: &Coord) {
-        if self.name_clash(pk, label) {
-            self.findings.insert(Finding {
-                kind: Kind::LabelAmbiguous,
-                collection: Some(MACHINE.name),
-                pk: Some(pk.to_owned()),
-                column: Some("label".to_owned()),
-                at: vec![at.clone()],
-            });
+        if self.label_clash(pk, label) {
+            self.label_waits
+                .push((pk.to_owned(), label.to_owned(), at.clone()));
             return;
+        }
+        self.land_label(pk, label, at);
+    }
+
+    /// Want the roster's `label` on `pk`, which no other row keeps: any row answering it now moves
+    /// off it in this plan, and is written first. Where the roster replaces its own earlier label and
+    /// a sheet this run still says the old one, the old one stays the row's as an alias, or the next
+    /// run would birth a row for it. Where the row's label stays against the roster's, the roster's
+    /// name is wanted as an alias, so it still answers this row.
+    fn land_label(&mut self, pk: &str, label: &str, at: &Coord) {
+        for hit in self.rows_named(&BTreeSet::from([label.to_owned()])) {
+            self.frees_first.push((hit, pk.to_owned()));
         }
         let replaced = self.current[MACHINE.name].rows.get(pk).and_then(|row| {
             let field = row.fields.get("label")?;
@@ -851,8 +1109,8 @@ impl Planner<'_> {
                 .map(str::to_owned)
         });
         self.want(&MACHINE, pk, "label", json!(label), at);
-        if !self.label_lands(pk, label) {
-            self.alias_element(pk, label, at);
+        if !self.label_lands(pk, label) && self.label_of(pk).as_deref() != Some(label) {
+            self.element(&MACHINE, pk, "aliases", label, at);
         }
         if let Some(old) = replaced {
             self.alias_element(pk, &old, at);
@@ -864,6 +1122,31 @@ impl Planner<'_> {
             if mac.label.is_some() || valid_node(mac).is_some() || valid_transport(mac).is_some() {
                 self.known_row(mac);
             }
+        }
+        // Each pass lands what the last one's moves freed. A label another row still holds at the end
+        // is a finding: that row stays, or the two trade labels.
+        let mut waits = std::mem::take(&mut self.label_waits);
+        loop {
+            let before = waits.len();
+            waits.retain(|(pk, label, at)| {
+                let waiting = self.label_clash(pk, label);
+                if !waiting {
+                    self.land_label(pk, label, at);
+                }
+                waiting
+            });
+            if waits.len() == before {
+                break;
+            }
+        }
+        for (pk, _, at) in waits {
+            self.findings.insert(Finding {
+                kind: Kind::LabelAmbiguous,
+                collection: Some(MACHINE.name),
+                pk: Some(pk),
+                column: Some("label".to_owned()),
+                at: vec![at],
+            });
         }
     }
 

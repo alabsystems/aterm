@@ -1058,6 +1058,53 @@ struct TestBuses {
     rejoin_first: Duration,
 }
 
+#[test]
+fn required_enabled_reply_waits_for_a_scheduled_peer() {
+    for (elapsed, expected) in [(26, true), (61, false)] {
+        let (ours, bus) = CtlStream::pair().unwrap();
+        let accept = Peer::accept(bus, ME);
+        let mut conn = Connection::handshake_within(ours, 1000, None, HANG).unwrap();
+        let mut peer = accept.join().unwrap();
+        let producer = std::thread::spawn(move || {
+            let Some(get) = peer.try_read() else {
+                return Ok(false);
+            };
+            assert_eq!(get.kind, Kind::MethodCall);
+            assert_eq!(get.member.as_deref(), Some("Get"));
+            assert_eq!(get.destination.as_deref(), Some("org.a11y.Bus"));
+            assert_eq!(get.path.as_ref().map(|p| p.as_str()), Some("/org/a11y/bus"));
+            assert_eq!(get.interface.as_deref(), Some(serve::PROPERTIES));
+            assert_eq!(
+                get.body,
+                vec![Value::from("org.a11y.Status"), Value::from("IsEnabled")]
+            );
+            let mut reply =
+                Message::method_return(&get).with_body(vec![Value::variant(Value::Bool(true))]);
+            reply.sender = Some("org.freedesktop.DBus".into());
+            reply.serial = peer.serial + 1;
+            peer.stream
+                .write_all(&reply.encode().unwrap())
+                .map(|()| true)
+        });
+        let result = proxies::is_enabled_after(&mut conn, Duration::from_secs(elapsed));
+        drop(conn);
+        let answered = producer.join().unwrap();
+        if expected {
+            assert!(matches!(result, Ok(true)), "{result:?}");
+        } else {
+            assert!(
+                matches!(result, Err(aterm_dbus::Error::Timeout)),
+                "{result:?}"
+            );
+        }
+        assert_eq!(
+            answered.unwrap(),
+            expected,
+            "only an admitted query sends Get"
+        );
+    }
+}
+
 impl TestBuses {
     fn new(
         session: CtlStream,

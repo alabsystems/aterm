@@ -176,25 +176,14 @@ pub enum JobState {
 }
 
 /// How long one `launchctl` may take before it is killed and its call fails.
-#[cfg(not(test))]
-const LAUNCHCTL_HANG: std::time::Duration = std::time::Duration::from_secs(30);
-/// A unit test's is its one-minute hang detector: launchd answers every `launchctl`, and a
-/// loaded machine only slows it.
-#[cfg(test)]
-const LAUNCHCTL_HANG: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
+const LAUNCHCTL_HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// [`LAUNCHCTL_HANG`], or the longer floor a test set on this process's peer waits
-/// (`identity::set_peer_waits_for_test`): `tests/` and the roles they start link this library
-/// without `cfg(test)`.
-fn launchctl_hang() -> std::time::Duration {
-    #[cfg(unix)]
-    {
-        crate::identity::peer_wait(LAUNCHCTL_HANG)
-    }
-    #[cfg(not(unix))]
-    {
-        LAUNCHCTL_HANG
-    }
+fn launchctl_output(
+    command: &mut aterm_uds::spawnfd::Command,
+    started: std::time::Instant,
+) -> Result<std::process::Output, aterm_uds::deadline::RunError> {
+    let deadline = started + LAUNCHCTL_HANG;
+    aterm_uds::deadline::output_until(command, deadline)
 }
 
 fn launchctl_io_error(err: aterm_uds::deadline::RunError) -> io::Error {
@@ -212,8 +201,7 @@ fn launchctl_io_error(err: aterm_uds::deadline::RunError) -> io::Error {
 pub fn state(label: &str) -> io::Result<JobState> {
     let mut cmd = aterm_uds::spawnfd::command("/bin/launchctl");
     cmd.arg("print").arg(format!("{}/{label}", gui_domain()));
-    let out = aterm_uds::deadline::output_within(&mut cmd, launchctl_hang())
-        .map_err(launchctl_io_error)?;
+    let out = launchctl_output(&mut cmd, std::time::Instant::now()).map_err(launchctl_io_error)?;
     if !out.status.success() {
         return Ok(JobState::Absent);
     }
@@ -232,8 +220,7 @@ pub fn state(label: &str) -> io::Result<JobState> {
 fn run_launchctl(argv: &[String]) -> io::Result<()> {
     let mut cmd = aterm_uds::spawnfd::command("/bin/launchctl");
     cmd.args(argv);
-    let out = aterm_uds::deadline::output_within(&mut cmd, launchctl_hang())
-        .map_err(launchctl_io_error)?;
+    let out = launchctl_output(&mut cmd, std::time::Instant::now()).map_err(launchctl_io_error)?;
     if out.status.success() {
         Ok(())
     } else {
@@ -261,6 +248,28 @@ pub fn own_bundle(exe: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn native_launchctl_survives_scheduling_delay() {
+        let program = aterm_uds::deadline::stand_in(Path::new("/bin/launchctl"));
+        let mut command = aterm_uds::spawnfd::command(program);
+        command.arg("version");
+        let output = launchctl_output(
+            &mut command,
+            std::time::Instant::now() - std::time::Duration::from_secs(31),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert!(!output.stdout.is_empty());
+        assert!(matches!(
+            launchctl_output(
+                &mut command,
+                std::time::Instant::now() - std::time::Duration::from_secs(61)
+            ),
+            Err(aterm_uds::deadline::RunError::TimedOut)
+        ));
+    }
 
     #[test]
     fn the_installed_app_and_dev_builds_never_share_a_keeper() {

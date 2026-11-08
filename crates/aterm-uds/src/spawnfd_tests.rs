@@ -66,6 +66,19 @@ fn failed_guarded_exec_keeps_parent_guard_close_on_exec() {
     assert_eq!(unsafe { fcntl(fd, F_GETFD) }, before);
 }
 
+/// Signal-mask inheritance is an explicit in-place-exec boundary, never a way to give an
+/// ordinary child the caller's blocked signals.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn an_exec_signal_mask_cannot_be_inherited_by_a_spawned_child() {
+    let mut child = command("/usr/bin/true");
+    child.inherit_exec_signal_mask().unwrap();
+    assert_eq!(
+        child.spawn().unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+}
+
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_guarded_exec_keeps_only_the_advertised_guard_at_the_same_number() {

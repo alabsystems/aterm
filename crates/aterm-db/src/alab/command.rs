@@ -32,7 +32,7 @@ use astream_wire::sync::Digest;
 use aterm_json::{Map, Value, json};
 use aterm_secrets::client::Paths;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     io::Write,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -1771,28 +1771,32 @@ fn adopt(paths: &Paths, args: &Args, now_ms: u64) -> Result<Value> {
     Ok(report)
 }
 
-/// `merge`: the registry's duplicate machine rows folded into their node-bound rows, planned over
-/// what this Mac holds; `--apply` plans again under the writer.
-/// What `merge` would do over `view`: the machines any Mac's own facts row names move only by it.
+/// What `merge` would do over `view`: a machine row a Mac's own facts row names, as its row or as
+/// the row it merged into, moves only by that Mac.
 pub(super) fn merge_plan(
     view: &att::View,
     roster: &super::merge::Roster,
 ) -> Result<super::merge::Plan> {
-    let facts = view.owned.get(registry::MACHINE_FACTS.name);
-    let bound: BTreeSet<String> = facts
-        .into_iter()
-        .flat_map(|facts| facts.rows.values())
-        .flat_map(|row| ["mac", "merged_into"].map(|column| row.value.get(column)))
-        .filter_map(|cell| cell.and_then(Value::as_str).map(str::to_owned))
-        .collect();
+    let cell =
+        |row: &Value, column: &str| row.get(column).and_then(Value::as_str).map(str::to_owned);
+    let facts = super::merge::Facts::new(
+        view.owned
+            .get(registry::MACHINE_FACTS.name)
+            .into_iter()
+            .flat_map(|facts| facts.rows.values())
+            .map(|row| (cell(&row.value, "mac"), cell(&row.value, "merged_into")))
+            .collect(),
+    );
     super::merge::plan(
         &view.project(&MACHINE),
         &view.project(&PREFERENCE),
-        &bound,
+        &facts,
         roster,
     )
 }
 
+/// `merge`: the registry's duplicate machine rows folded into their node-bound rows, planned over
+/// what this Mac holds; `--apply` plans again under the writer.
 fn merge(paths: &Paths, args: &Args) -> Result<Value> {
     // Which name is a Mac's current one, and whether two names are two Macs, is the roster's word:
     // without it a merge would fold what it would hold and keep names it would change.

@@ -556,6 +556,7 @@ fn act_case(case: Case, hold: i64) -> [(&'static str, i64); 6] {
                     sid: "another-session".into(),
                     at: a.clock(),
                     took: false,
+                    native_receipt: None,
                 });
                 Ok(Vec::new())
             })
@@ -778,6 +779,7 @@ fn contradictory_identity_does_not_bypass_a_pin_or_another_sessions_canary() {
                     sid: "another-session".into(),
                     at: a.clock(),
                     took: false,
+                    native_receipt: None,
                 });
                 Ok(Vec::new())
             })

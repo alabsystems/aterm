@@ -241,6 +241,7 @@ fn project(w: &World, m: &Model, st: &State, soon: Option<i64>) -> accounts::Sta
             sid: sid.to_string(),
             at: NOW - ago,
             took: false,
+            native_receipt: None,
         });
     }
     let rotations = usize::try_from(spent_before(w, m) + st["rot"]).unwrap();
@@ -3232,7 +3233,8 @@ fn a_canary_that_never_answers_is_replaced_by_the_next_session_after_its_hold() 
         Some(Canary {
             sid: "s-one".to_string(),
             at: chosen,
-            took: false
+            took: false,
+            native_receipt: None,
         })
     );
     assert_eq!(h.told(1), Advice::Stay(StayWhy::Canary));
@@ -3263,7 +3265,8 @@ fn a_canary_that_never_answers_is_replaced_by_the_next_session_after_its_hold() 
         Some(Canary {
             sid: "s-two".to_string(),
             at: h.now,
-            took: true
+            took: true,
+            native_receipt: None,
         })
     );
     assert_eq!(

@@ -80,7 +80,7 @@ const CHILD_HANG: Duration = Duration::from_secs(60);
 
 /// Timeout waiting for launchd to forget a booted-out job ([`install`]).
 #[cfg(any(target_os = "macos", all(test, unix)))]
-const BOOTOUT_SETTLE: Duration = Duration::from_secs(30);
+const BOOTOUT_SETTLE: Duration = Duration::from_secs(60);
 
 /// The job's launchd property list: `~/Library/LaunchAgents/<label>.plist`.
 pub fn plist_path(home: &Path, job: Job) -> PathBuf {
@@ -1360,6 +1360,34 @@ fn launchd_job_with(
         .then(|| print_pid(&String::from_utf8_lossy(&out.stdout))))
 }
 
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn settle_launchd_bootout(
+    domain: Domain,
+    label: &str,
+    launchctl: &mut LaunchctlRun<'_>,
+) -> crate::Result<()> {
+    settle_launchd_bootout_at(domain, label, launchctl, Instant::now(), || {
+        std::thread::sleep(Duration::from_millis(100));
+    })
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn settle_launchd_bootout_at(
+    domain: Domain,
+    label: &str,
+    launchctl: &mut LaunchctlRun<'_>,
+    started: Instant,
+    mut pause: impl FnMut(),
+) -> crate::Result<()> {
+    while launchd_job_with(domain, label, launchctl)?.is_some() {
+        if started.elapsed() >= BOOTOUT_SETTLE {
+            return Err(Error::new("service bootout did not settle"));
+        }
+        pause();
+    }
+    Ok(())
+}
+
 /// `launchctl`'s refusal of `call` as an error carrying what it said.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 fn launchctl_checked(call: Launchctl<'_>, launchctl: &mut LaunchctlRun<'_>) -> crate::Result<()> {
@@ -2339,10 +2367,7 @@ fn install_launchd(
     for held in [domain.other(), domain] {
         if loaded_in(held).is_some() {
             let _ = launchctl(Launchctl::Bootout(held, label));
-            let settle = Instant::now() + BOOTOUT_SETTLE;
-            while launchd_job_with(held, label, launchctl)?.is_some() && Instant::now() < settle {
-                std::thread::sleep(Duration::from_millis(100));
-            }
+            settle_launchd_bootout(held, label, launchctl)?;
         }
     }
     launchctl_checked(Launchctl::Bootstrap(domain, &plist), launchctl)?;
@@ -2866,13 +2891,7 @@ fn repair_restart_launchd(
     for held in [Domain::Gui, Domain::User] {
         if launchd_job_with(held, job.label(), manager)?.is_some() {
             launchctl_checked(Launchctl::Bootout(held, job.label()), manager)?;
-            let deadline = Instant::now() + BOOTOUT_SETTLE;
-            while launchd_job_with(held, job.label(), manager)?.is_some() {
-                if Instant::now() >= deadline {
-                    return Err(Error::new("service bootout did not settle"));
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
+            settle_launchd_bootout(held, job.label(), manager)?;
         }
     }
     crate::fsx::ensure_private_dir(&secrets_dir(home))?;
@@ -3037,14 +3056,59 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn required_bootout_settlement_waits_for_a_scheduled_observation() {
+        let mut manager = FakeLaunchd {
+            loaded: Some(Domain::Gui),
+            ..FakeLaunchd::default()
+        };
+        let mut first = true;
+        let result = settle_launchd_bootout_at(
+            Domain::Gui,
+            Job::Subscriber.label(),
+            &mut |call| {
+                let out = manager.answer(call)?;
+                if first {
+                    first = false;
+                    manager.loaded = None;
+                }
+                Ok(out)
+            },
+            Instant::now() - Duration::from_secs(31),
+            || {},
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let print = launchctl_argv(0, Launchctl::Print(Domain::Gui, Job::Subscriber.label()));
+        assert_eq!(manager.calls, [print.clone(), print.clone()]);
+
+        let mut held = FakeLaunchd {
+            loaded: Some(Domain::Gui),
+            ..FakeLaunchd::default()
+        };
+        let result = settle_launchd_bootout_at(
+            Domain::Gui,
+            Job::Subscriber.label(),
+            &mut |call| held.answer(call),
+            Instant::now() - Duration::from_secs(61),
+            || {},
+        );
+        assert!(
+            result.is_err(),
+            "an unsettled job still refuses after the hang detector"
+        );
+        assert_eq!(held.loaded, Some(Domain::Gui));
+        assert_eq!(held.calls, [print]);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn required_service_action_waits_for_a_scheduled_child() {
         let argv = ["-c".into(), "printf ready".into()];
-        let program = Path::new("/bin/sh");
-        let out = run_at(program, &argv, Instant::now() - Duration::from_secs(31))
+        let program = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+        let out = run_at(&program, &argv, Instant::now() - Duration::from_secs(31))
             .expect("required service action completes");
         assert!(out.status.success());
         assert_eq!(out.stdout, b"ready");
-        assert!(run_at(program, &argv, Instant::now() - Duration::from_secs(61)).is_err());
+        assert!(run_at(&program, &argv, Instant::now() - Duration::from_secs(61)).is_err());
     }
 
     #[cfg(target_os = "macos")]

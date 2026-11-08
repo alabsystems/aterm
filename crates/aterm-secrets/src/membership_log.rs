@@ -1390,9 +1390,19 @@ pub enum Inserted {
 /// came in: a rejoin is [`Log::merge`], and no merge record is needed.
 #[derive(Clone, Debug)]
 pub struct Log {
-    /// Every held record, each after its parents; the genesis first.
-    order: Vec<Record>,
-    held: BTreeMap<RecordId, usize>,
+    /// Every held record, each after its parents; the genesis first. Clones share it, and its
+    /// index `held`, until [`Log::hold`] extends one of them: a quiet repair round clones the
+    /// log it judges peers by for each of dozens of checks, and on a log of 4,805 records, once
+    /// its heads were kept, copying and freeing every record each time was 35% of what such a
+    /// round spent past the test pair's own rehashing of its records file (2026-11-07).
+    order: Arc<Vec<Record>>,
+    held: Arc<BTreeMap<RecordId, usize>>,
+    /// The held records no held record follows ([`Log::heads`]), kept by [`Log::hold`]: a record
+    /// is held after each of its parents, so holding one ends each parent's place here and no
+    /// held record can follow it yet. Collecting them from `order` on each read took a set of
+    /// every record's parents, and a quiet repair round reads them dozens of times: on a log of
+    /// 4,805 records, 39% of such a round's CPU (2026-11-07).
+    heads: BTreeSet<RecordId>,
     waiting: BTreeMap<RecordId, Record>,
     /// The bytes of `order`'s records, kept as they change: by [`Log::hold`] alone, since
     /// `order` only grows.
@@ -1488,7 +1498,8 @@ impl Log {
         if genesis.kind() != Kind::Genesis {
             return Err(Error::new("a membership log starts at a genesis"));
         }
-        let held = BTreeMap::from([(genesis.id, 0)]);
+        let held = Arc::new(BTreeMap::from([(genesis.id, 0)]));
+        let heads = BTreeSet::from([genesis.id]);
         let held_bytes = genesis.bytes().len();
         let mut reach = reach::Reach::default();
         reach.push(std::iter::empty());
@@ -1500,8 +1511,9 @@ impl Log {
         }
         let counts = budgets::counted(genesis.kind());
         Ok(Self {
-            order: vec![genesis],
+            order: Arc::new(vec![genesis]),
             held,
+            heads,
             waiting: BTreeMap::new(),
             held_bytes,
             waiting_bytes: 0,
@@ -1635,16 +1647,7 @@ impl Log {
     }
     /// The held records no held record follows, sorted.
     pub fn heads(&self) -> Vec<RecordId> {
-        let followed: BTreeSet<&RecordId> =
-            self.order.iter().flat_map(|r| r.parents().iter()).collect();
-        let mut heads: Vec<RecordId> = self
-            .order
-            .iter()
-            .map(|r| r.id)
-            .filter(|id| !followed.contains(id))
-            .collect();
-        heads.sort_unstable();
-        heads
+        self.heads.iter().copied().collect()
     }
 
     /// A draft by `actor` that follows the heads: its sequence one past `actor`'s highest held
@@ -2240,10 +2243,14 @@ impl Log {
         if let Some(member) = seated_by(&record) {
             self.seats.entry(member).or_default().admits.push(at);
         }
-        self.held.insert(record.id, at);
+        Arc::make_mut(&mut self.held).insert(record.id, at);
+        for parent in record.parents() {
+            self.heads.remove(parent);
+        }
+        self.heads.insert(record.id);
         self.held_bytes = self.held_bytes.saturating_add(record.bytes().len());
         self.counts = self.counts.plus(budgets::counted(record.kind()));
-        self.order.push(record);
+        Arc::make_mut(&mut self.order).push(record);
     }
 
     /// Keep `record` waiting for a parent, with [`Log::waiting_bytes`] and its seat.

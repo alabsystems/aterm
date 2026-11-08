@@ -211,26 +211,14 @@ impl<'a> Look<'a> {
         self.profile.as_ref().ok().and_then(|p| p.key)
     }
 
-    /// THE NEWEST INSTANT ANOTHER ACCOUNT THAN THE ONE THE PROFILE NAMES WAS
-    /// SEEN ON THE HOME (design §3.6): `now` where the home serves several
-    /// accounts' logins ([`Self::several`]) or the record is another
-    /// account's (its observations were of the account signed in before,
-    /// since when is not known); the instant the record's key changed
-    /// ([`Account::keyed_at`], the `epoch` row's); the fetch of a cached
-    /// `/usage` body that named another account
-    /// ([`Profile::usage_of_another_at`]).
+    /// [`another_seen`] on the home this view is of.
     fn another_seen(&self) -> Option<i64> {
-        let held = (self.several || self.account.is_some_and(|a| a.of_another(self.key())))
-            .then_some(self.now);
-        let cached = self
-            .profile
-            .as_ref()
-            .ok()
-            .and_then(|p| p.usage_of_another_at);
-        [held, self.record().and_then(|a| a.keyed_at), cached]
-            .into_iter()
-            .flatten()
-            .max()
+        another_seen(
+            self.now,
+            self.several,
+            self.account,
+            self.profile.as_ref().ok(),
+        )
     }
 
     /// WHOSE THE HOME'S SPEND FROM `from` IS (design §3.6): ASSUMED to be
@@ -245,6 +233,31 @@ impl<'a> Look<'a> {
             spend::Attribution::Assumed
         }
     }
+}
+
+/// THE NEWEST INSTANT ANOTHER ACCOUNT THAN THE ONE THE PROFILE NAMES WAS SEEN ON THE HOME
+/// (design §3.6), at `now`, of the home's label's record `account` and the home's `profile`
+/// where it was read: `now` where the home serves several accounts' logins (`several`) or the
+/// record is another account's ([`Account::of_another`]: its observations were of the account
+/// signed in before, since when is not known); the instant the record's key changed
+/// ([`Account::keyed_at`], the `epoch` row's); the fetch of a cached `/usage` body that named
+/// another account ([`Profile::usage_of_another_at`]). What the home did after it is ASSUMED to
+/// be the current account's: the spend attribution's rule ([`Look`]) and the account backfill's
+/// (`super::account_backfill`).
+pub(crate) fn another_seen(
+    now: i64,
+    several: bool,
+    account: Option<&Account>,
+    profile: Option<&Profile>,
+) -> Option<i64> {
+    let key = profile.and_then(|p| p.key);
+    let another = account.is_some_and(|a| a.of_another(key));
+    let held = (several || another).then_some(now);
+    let keyed = account.filter(|_| !another).and_then(|a| a.keyed_at);
+    [held, keyed, profile.and_then(|p| p.usage_of_another_at)]
+        .into_iter()
+        .flatten()
+        .max()
 }
 
 /// One window as the view has it.

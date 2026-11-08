@@ -98,6 +98,7 @@ impl Trial {
                 sid: sid.into(),
                 at: a.clock(),
                 took: false,
+                native_receipt: None,
             });
             with_auth(&a, state, case.before_auth);
         });

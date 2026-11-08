@@ -20,7 +20,8 @@ mod selection_projection_cost;
 
 /// Net live heap bytes, and bytes ever allocated, on the calling thread.
 mod heap {
-    use std::alloc::{GlobalAlloc, Layout, System};
+    use aterm_bench::allocator::{Observed, Observer};
+    use std::alloc::System;
     use std::cell::Cell;
 
     thread_local! {
@@ -29,12 +30,14 @@ mod heap {
         static PEAK: Cell<Option<i64>> = const { Cell::new(None) };
     }
 
-    // Const-initialized and drop-free so thread-locals never allocate during teardown.
     /// Const-initialized and drop-free, so these thread-locals never allocate
     /// and stay readable while a thread is torn down.
     fn note(grow: usize, shrink: usize) {
         let _ = NET.try_with(|n| {
-            let current = n.get() + grow as i64 - shrink as i64;
+            let current = n
+                .get()
+                .wrapping_add(grow as i64)
+                .wrapping_sub(shrink as i64);
             n.set(current);
             let _ = PEAK.try_with(|peak| {
                 if let Some(previous) = peak.get() {
@@ -42,33 +45,20 @@ mod heap {
                 }
             });
         });
-        let _ = ALLOCATED.try_with(|a| a.set(a.get() + grow as u64));
+        let _ = ALLOCATED.try_with(|a| a.set(a.get().wrapping_add(grow as u64)));
     }
 
     struct Counting;
 
-    // SAFETY: every call forwards its arguments to `System` unchanged; the only
-    // other work is thread-local arithmetic, which allocates nothing.
-    unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            note(l.size(), 0);
-            // SAFETY: the caller's layout, forwarded unchanged.
-            unsafe { System.alloc(l) }
-        }
-        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-            note(0, l.size());
-            // SAFETY: `p` and `l` came from `System` through this allocator.
-            unsafe { System.dealloc(p, l) }
-        }
-        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-            note(n, l.size());
-            // SAFETY: `p` and `l` came from `System` through this allocator.
-            unsafe { System.realloc(p, l, n) }
+    // SAFETY: constant, drop-free thread-locals and wrapping arithmetic neither allocate nor unwind.
+    unsafe impl Observer for Counting {
+        fn retained(&self, old: usize, new: usize) {
+            note(new, old);
         }
     }
 
     #[global_allocator]
-    static ALLOC: Counting = Counting;
+    static ALLOC: Observed<System, Counting> = Observed::new(System, Counting);
 
     /// Live heap bytes this thread allocated and has not freed.
     pub(crate) fn net() -> i64 {

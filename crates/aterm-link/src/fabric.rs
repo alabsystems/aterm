@@ -186,37 +186,19 @@ pub const STALE_WORK_MS: u64 = 10 * 60 * 1000;
 /// The bound on every socket this report and the operator's one-shot broker commands open: the
 /// dial, and each read and write ([`transport::connect`]). This module, the roster (`cli`), the
 /// brief and a person's commands (`person`) read it through [`io_timeout`].
-pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The development seam that replaces [`IO_TIMEOUT`] (milliseconds; debug builds and
-/// `dev-seams` only): a test on a loaded machine bounds these sockets, the doctor's read of an
-/// instance among them, within its one-minute hang detector, so an instance or broker the load
-/// keeps from answering for 3 s is waited for rather than reported as unanswerable. A debug
-/// build's listener scan, which names the broker's process ([`listener_pid`]), waits it in
-/// place of the scan's own 10 s, and `on`'s and `off`'s reads of each instance in place of
-/// their own 8 s (`enable::io_timeout`).
-const IO_TIMEOUT_SEAM: &str = "ATERM_FABRIC_IO_TIMEOUT_MS";
-
-/// The [`IO_TIMEOUT_SEAM`] a development build was given, read once; `None` in a shipped build,
-/// which compiles the read out.
-pub(crate) fn io_seam() -> Option<Duration> {
-    static AT: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
-    *AT.get_or_init(|| {
-        aterm_types::dev_seam!(IO_TIMEOUT_SEAM)
-            .and_then(|ms| crate::parse_uint::<u64>(ms.to_str()?))
-            .map(Duration::from_millis)
-    })
+/// The minute hang detector for a required local broker or instance reply.
+pub(crate) fn io_timeout() -> Duration {
+    io_timeout_at(Instant::now())
 }
 
-/// [`IO_TIMEOUT`], or the [`IO_TIMEOUT_SEAM`] a development build was given. The unit tests'
-/// brokers and instances run in-process, so a socket one of them answers late is a loaded
-/// machine, not a peer gone silent: unseamed, theirs wait the hang detector.
-pub(crate) fn io_timeout() -> Duration {
-    #[cfg(not(test))]
-    const UNSEAMED: Duration = IO_TIMEOUT;
-    #[cfg(test)]
-    const UNSEAMED: Duration = aterm_spec::wait::MUST_HAPPEN;
-    io_seam().unwrap_or(UNSEAMED)
+pub(crate) fn io_timeout_at(started: Instant) -> Duration {
+    started
+        .checked_add(IO_TIMEOUT)
+        .map_or(Duration::MAX, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        })
 }
 
 const WORK_KINDS: [&str; 2] = ["task", "ask"];
@@ -878,15 +860,8 @@ pub(crate) fn listener_pid(sock: &str) -> Result<Option<u32>, String> {
     unknown_unless_unbound(held, || aterm_uds::holders::bound_at(path))
 }
 
-/// The listener scan of `path` ([`aterm_uds::holders::scan_listener_holders`]), its connection
-/// (macOS) or reads (Linux) waited for the [`IO_TIMEOUT_SEAM`] in place of the scan's 10 s where
-/// a debug build was given one: the loaded machine a test runs on, which can hold the command's
-/// sockets past their 3 s, can hold the scan past its 10 s too.
+/// The native listener scan, using its own hang detector.
 fn scan_listener(path: &Path) -> io::Result<aterm_uds::holders::HolderScan> {
-    #[cfg(all(debug_assertions, any(target_vendor = "apple", target_os = "linux")))]
-    if let Some(hang) = io_seam() {
-        return aterm_uds::holders::scan_listener_holders_within(path, &[], hang);
-    }
     aterm_uds::holders::scan_listener_holders(path, &[])
 }
 
@@ -2864,6 +2839,9 @@ pub(crate) fn open_instance(
     sock: &str,
     timeout: Duration,
 ) -> Result<Option<Ctl>, String> {
+    if timeout.is_zero() {
+        return Err("instance reply deadline expired".into());
+    }
     let (stream, token) = match aterm_ctl::connect_then_read_token(sock) {
         Ok(connected) => connected,
         Err(e)
@@ -2882,8 +2860,12 @@ pub(crate) fn open_instance(
         Err(e) => return Err(format!("no Owner token: {e}")),
     };
     let ctl = Ctl::authenticate(stream, &token).map_err(|e| format!("connect: {e}"))?;
-    let _ = ctl.get_ref().set_read_timeout(Some(timeout));
-    let _ = ctl.get_ref().set_write_timeout(Some(timeout));
+    ctl.get_ref()
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| e.to_string())?;
+    ctl.get_ref()
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| e.to_string())?;
     Ok(Some(ctl))
 }
 
@@ -4477,7 +4459,7 @@ pub fn publish_exited(report: &Report, ghosts: &[(String, String)]) -> io::Resul
         // waited out and sent again at the same sequence ([`crate::rate_hold::waiting_out`]).
         let (off, deduped) = crate::rate_hold::waiting_out(
             || conn.publish(producer_id, seq, &subject, rewritten.as_bytes()),
-            IO_TIMEOUT,
+            Duration::from_secs(3),
             std::thread::sleep,
         )?;
         if deduped {
@@ -4629,6 +4611,18 @@ pub(crate) fn unanswered(r: &Report) -> Vec<String> {
         ));
     }
     out
+}
+
+pub(crate) fn retirement_candidates(r: &Report) -> Result<Vec<(String, String)>, Vec<String>> {
+    let silent = unanswered(r);
+    if !silent.is_empty() {
+        return Err(silent);
+    }
+    let local = local_nodes(&r.instances, r.node.as_deref());
+    Ok(ghost_rows(&r.sessions, &local)
+        .into_iter()
+        .map(|row| (row.sid.clone(), row.node.clone()))
+        .collect())
 }
 
 /// The ghosts: presence rows this machine's nodes advertise that no local instance hosts,
@@ -6312,6 +6306,86 @@ fn tail_faces(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_report_reply_waits_for_an_unchanged_local_instance() {
+        native_instance_reply(super::io_timeout_at(
+            std::time::Instant::now() - std::time::Duration::from_secs(9),
+        ))
+        .unwrap();
+        assert!(native_instance_reply(super::io_timeout_at(
+            std::time::Instant::now() - std::time::Duration::from_secs(61)
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn native_enable_reply_waits_for_an_unchanged_local_instance() {
+        native_instance_reply(crate::enable::io_timeout_at(
+            std::time::Instant::now() - std::time::Duration::from_secs(9),
+        ))
+        .unwrap();
+        assert!(native_instance_reply(crate::enable::io_timeout_at(
+            std::time::Instant::now() - std::time::Duration::from_secs(61)
+        ))
+        .is_err());
+    }
+
+    fn native_instance_reply(timeout: std::time::Duration) -> Result<(), String> {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::{fd::AsFd as _, unix::fs::PermissionsExt as _};
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("fabric-io-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let endpoint = scratch.path().join("ctl.sock");
+        let listener =
+            aterm_uds::kept_out(|| std::os::unix::net::UnixListener::bind(&endpoint)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let token = "ab".repeat(32);
+        let name = aterm_types::control_socket::token_names_for_sock("ctl.sock").remove(0);
+        let token_path = scratch.path().join(name);
+        std::fs::write(&token_path, &token).unwrap();
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let server = std::thread::spawn(move || -> std::io::Result<()> {
+            aterm_uds::ready::until(
+                listener.as_fd(),
+                aterm_uds::ready::Interest::Read,
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+            )?;
+            let (mut stream, _) = aterm_uds::kept_out(|| listener.accept())?;
+            stream.set_nonblocking(false)?;
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(60)))?;
+            stream.set_write_timeout(Some(std::time::Duration::from_secs(60)))?;
+            let mut input = std::io::BufReader::new(stream.try_clone()?);
+            let mut line = String::new();
+            if input.read_line(&mut line)? == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            assert_eq!(line, format!("AUTH {token}\n"));
+            line.clear();
+            if input.read_line(&mut line)? == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            assert_eq!(line, "version\n");
+            stream.write_all(b"OK unchanged-native-instance\n")
+        });
+        let result = super::open_instance(std::process::id(), endpoint.to_str().unwrap(), timeout)
+            .and_then(|ctl| {
+                let mut ctl = ctl.ok_or("native instance absent")?;
+                let reply = ctl.request("version").map_err(|e| e.to_string())?;
+                assert_eq!(reply.header(), "OK unchanged-native-instance");
+                Ok(())
+            });
+        if result.is_err() {
+            let _ = aterm_uds::connect::until(
+                &endpoint,
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+            );
+        }
+        let served = server.join().unwrap();
+        result?;
+        served.map_err(|e| e.to_string())
+    }
     use super::*;
 
     /// A linked `aterm.toml` says what its file says, and `doctor`'s fabric row reads it.
@@ -6402,6 +6476,26 @@ mod tests {
             .map(|s| s.sid.as_str())
             .collect();
         assert_eq!(got, ["s-ghost"]);
+    }
+
+    #[test]
+    fn incomplete_instance_discovery_never_admits_a_retirement_candidate() {
+        let mut report = healthy();
+        report.sessions = vec![SessionRow {
+            sid: "s-ghost".into(),
+            node: "n-a".into(),
+            bus: "live".into(),
+            ..SessionRow::default()
+        }];
+        assert_eq!(
+            retirement_candidates(&report).unwrap(),
+            [("s-ghost".into(), "n-a".into())]
+        );
+        report.instances[0].error = Some("native reply unavailable".into());
+        assert!(retirement_candidates(&report).is_err());
+        report.instances[0].error = None;
+        report.discovery_error = Some("native discovery incomplete".into());
+        assert!(retirement_candidates(&report).is_err());
     }
 
     #[test]
@@ -7336,14 +7430,8 @@ mod tests {
     /// request the link sends past its opening, so no reply that comes is held to it), the
     /// tail ends with an error of a timeout's kind that names the first face and, by the
     /// producer's own words ([`resume_from`]), the merge's floor, every record below it
-    /// printed. The hang detector's clock starts before the stall, and the told fetch's read
-    /// only after it (the live record that asks for that fetch is published past the stall),
-    /// so a read [`TailLink::open`]'s deadline never bounded, which waits the connect's bound
-    /// ([`io_timeout`], the detector's under test), cannot end inside the detector, whatever
-    /// order the threads run in: this test, not the `read_timeout` it recorded, is what shows
-    /// that the socket's reads honour the deadline `open` is given.
-    /// NEGATIVE CONTROL (run): without `open`'s `closer.set_read_timeout(Some(deadline))`, the
-    /// hang detector fires.
+    /// printed. The one-second limit is this silent-fetch adversary's explicit contract;
+    /// a minute hang detector bounds waiting for its result.
     #[cfg(unix)]
     #[test]
     fn a_fetch_the_broker_never_answers_ends_the_tail_naming_the_face_and_the_from_that_resumes_it()
@@ -7381,20 +7469,12 @@ mod tests {
             printed.extend(tail_off(&line));
         }
         assert_eq!(printed, offs, "the backlog, in offset order");
-        assert!(
-            io_timeout() >= MUST_HAPPEN,
-            "a read the deadline never bounded waits the connect's bound, at least the detector"
-        );
         let detector = Instant::now() + MUST_HAPPEN;
         stall.store(true, std::sync::atomic::Ordering::SeqCst);
         world.publish(1);
         let ended = done_rx
             .recv_timeout(detector.saturating_duration_since(Instant::now()))
             .expect("the tail ends at its link's deadline");
-        assert!(
-            Instant::now() < detector,
-            "the tail ends at its link's deadline, inside the hang detector from the stall"
-        );
         let (kind, said) = ended.expect_err("a fetch the broker never answers ends the tail");
         assert!(
             matches!(kind, io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut),

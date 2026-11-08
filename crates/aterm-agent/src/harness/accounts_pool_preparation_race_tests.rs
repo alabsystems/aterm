@@ -147,6 +147,7 @@ fn launch_fallback_does_not_bypass_an_existing_live_canary() {
                 sid: "held-canary".into(),
                 at: NOW,
                 took: false,
+                native_receipt: None,
             });
             Ok(Vec::new())
         })

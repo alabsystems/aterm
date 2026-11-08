@@ -27210,9 +27210,6 @@ pub fn main_entry_with_network(
         .map(|w| w.rows)
         .unwrap_or_else(|| app_config::resolve_initial_lines(&config))
         .clamp(5, 300);
-    let carried_status_bar_rows = carry_frame
-        .as_ref()
-        .map_or(0, |w| w.status_bar_rows.min(aterm_messages::MAX_ROWS));
     let launch_font = app_config::successor_font_px(resolved_size, carry_frame.as_ref());
     let build_scale = headless.then_some(headless_scale);
     let font_px = launch_font.build_px(build_scale);
@@ -28711,7 +28708,7 @@ pub fn main_entry_with_network(
         wire_gate: aterm_messages::wire::WireGate::default(),
         folder_rows: spawn_folder::RowFolders::default(),
         restored_shown: app_restore::RestoredShown::default(),
-        message_band_rows: carried_status_bar_rows,
+        message_band_rows: 0,
         band_lay: message_band::band_lay,
         messages_log,
         messages_last_publish: None,

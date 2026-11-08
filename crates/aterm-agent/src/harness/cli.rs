@@ -682,12 +682,17 @@ VERBS:
     reset used or sign-in of another account), with that day's ledger rows and every Mac's
     journal lines beneath, never a ledger row's free text. Only this account's readings count: a
     row renamed here keeps its old series, found by its key, and a label given to another
-    account shows none of the one before. `--since` takes 1d to 400d (default 30d); `--rows`
+    account shows none of the one before. Where the roster has one login, the home's row also
+    shows each five-hour or weekly window Claude Code's own transcripts record reaching its
+    limit before the series began (and after the newest sign-in of another account or
+    `/login`), marked `(backfill)`; under several logins none is shown, as their walls mix in
+    one home's transcripts. The transcripts are read for at most 10 s and 1 GiB, and a read cut
+    short says `transcripts read in part`. `--since` takes 1d to 400d (default 30d); `--rows`
     adds the account's stored rows inside the span exactly as stored; `--json` is
-    `account-history` schema 1. Another CLI's pool keeps no series: its history prints its
-    ledger and journal lines alone (`series: false`). It stores nothing of its own (no compaction
-    runs, no derived row is kept); like every accounts read, it first completes an accounts
-    publication that was cut short.
+    `account-history` schema 1, with the backfill under `backfill`. Another CLI's pool keeps no
+    series: its history prints its ledger and journal lines alone (`series: false`). It stores
+    nothing of its own (no compaction runs, no derived or backfilled row is kept); like every
+    accounts read, it first completes an accounts publication that was cut short.
   - `accounts sync [alab | <source>] [--machine <mN>] [--json]`
     Synchronizes this machine's `accounts.toml`. The default source is the lab registry
     (`alab`) wherever the lab names this Mac, ahead of every other default: its rows are the
@@ -1401,7 +1406,8 @@ pub enum AccountsCmd {
     Auto,
     /// `accounts history [<label|key>] [--since <span>] [--rows] [--json]`: one account's days
     /// from this Mac's readings series beside its ledger rows and every Mac's journal events
-    /// about it, or every roster row's in roster order ([`history::run`]).
+    /// about it, with a one-login home's earlier transcript walls backfilled in memory, or every
+    /// roster row's in roster order ([`history::run`]).
     History {
         /// A row label, a lab label or legacy label, a lab key (`ac-…`) or an account key
         /// (`c-…`); never an address. `None`: every roster row.
@@ -19156,14 +19162,20 @@ fn run_accounts_stats_of(
     ExitCode::SUCCESS
 }
 
+/// The profile of the Claude Code home the environment names ([`Env::claude_profile`], the file
+/// Claude Code reads as it, [`profile::effective`]), as `accounts stats` and `accounts history`'s
+/// backfill read it.
+fn home_profile(env: &Env) -> Result<profile::Profile, profile::NoProfile> {
+    env.claude_profile
+        .as_deref()
+        .map(|own| profile::effective(own, env.claude_dir().as_deref(), env.claude_custom_oauth))
+        .map_or(Err(profile::NoProfile::NoHome), |file| profile::read(&file))
+}
+
 fn run_accounts_stats(env: &Env, json: bool, since_s: i64, out: &mut dyn Write) -> ExitCode {
     use super::account_stats::{self, Look, SpendLook};
     use super::spend;
-    let read = env
-        .claude_profile
-        .as_deref()
-        .map(|own| profile::effective(own, env.claude_dir().as_deref(), env.claude_custom_oauth))
-        .map_or(Err(profile::NoProfile::NoHome), |file| profile::read(&file));
+    let read = home_profile(env);
     let key = read.as_ref().ok().and_then(|p| p.key);
     let store = env.accounts_store();
     let records = store.read_account_records(env.accounts_roster().as_deref(), env.now);

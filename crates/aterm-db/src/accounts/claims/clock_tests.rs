@@ -14,6 +14,7 @@ use crate::{
 };
 use aterm_json::json;
 use aterm_secrets::commons::roster::Role;
+use std::time::Duration;
 
 const DAY: u64 = EPOCH_S;
 /// Day 20,000 since the Unix epoch.
@@ -117,17 +118,23 @@ fn a_clock_two_days_ahead_writes_no_claim() {
         read.clock.skewed.is_empty(),
         "an Off Mac names nobody skewed"
     );
-    assert_eq!(
-        own_table(
-            &lab.paths[0],
-            ahead,
-            Instant::now() + Duration::from_secs(2)
-        )
-        .unwrap_err()
-        .0,
-        refused.0,
-        "no row to hand on"
+    let held = aterm_uds::private_file::PrivateLock::take_with(
+        &lab.paths[0].dir,
+        "commons.lock",
+        Duration::ZERO,
+        "clock fixture custody",
+        || {},
+    )
+    .unwrap();
+    let mut held = Some(held);
+    let started = Instant::now() - Duration::from_secs(3);
+    let own = aterm_uds::file_lock::with_lock_wait_observer(
+        move |_| {
+            drop(held.take());
+        },
+        || own_table(&lab.paths[0], ahead, crate::admission::deadline_at(started)),
     );
+    assert_eq!(own.unwrap_err().0, refused.0, "no row to hand on");
 
     // The clock comes back and one round each reads it agreeing: the clock refuses nothing. Its
     // rounds two days ahead took up the tables of that window, so it writes once its clock

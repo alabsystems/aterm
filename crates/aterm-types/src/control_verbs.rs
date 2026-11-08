@@ -2150,10 +2150,11 @@ pub const VERBS: &[VerbSpec] = &[
     ]),
     v(
         "resources", Read, Lines, Session,
-        "resources [capabilities|register]: delegated job ownership and current usage",
+        "resources [capabilities|cpu|register]: delegated job ownership and current usage",
         "— bare: `OK <n> resources version=1`, then this session's registered jobs (pid and start \
          identity, AI and job labels, `cpu_cores`, physical bytes, `procs=`, `age_ms=`, \
-         `sample=complete|unavailable`). \
+         `sample=complete|unavailable`). `resources cpu` answers `OK 1 resources-cpu version=1` \
+         and one JSON observation of the shared CPU lease pool; it acquires no lease. \
          `resources capabilities` answers `OK resources version=1 available= self_register= \
          group_signals= runner= ai= session=`. `resources register start=<kernel-start> \
          [ai=<word>] job=<pct label>` (local, Owner-only) binds the caller's kernel peer pid for \

@@ -761,7 +761,7 @@ impl Log {
                 }
             }
         }
-        for record in &self.order {
+        for record in self.order.iter() {
             if let Body::Admit { entrant, .. } = record.body() {
                 seats
                     .entry(entrant.member())

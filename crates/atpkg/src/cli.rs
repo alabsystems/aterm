@@ -3892,7 +3892,7 @@ fn parse_lease_args(rest: &[String]) -> Result<LeaseArgs, String> {
                 let (name, build) = name
                     .split_once('=')
                     .map_or((name.as_str(), None), |(name, build)| (name, Some(build)));
-                let tool = crate::prerequisite::Prerequisite::named(name).ok_or_else(|| format!("unsupported prerequisite {name:?}; use gitleaks, python3.14, openssl-signing or lake"))?;
+                let tool = crate::prerequisite::Prerequisite::named(name).ok_or_else(|| format!("unsupported prerequisite {name:?}; use gitleaks, python3.14, openssl-signing, lake or atpkg-keys"))?;
                 if let Some(build) = build {
                     let build = build
                         .parse::<u64>()
@@ -4020,7 +4020,7 @@ fn lease_and_run(
                     say(&format!(
                         "atpkg lease: {} {} build {} tree {} as {}",
                         tool.program(),
-                        want.recipe().version,
+                        tool.version(),
                         tool.build(),
                         tool.tree_root(),
                         want.executable()
@@ -6437,10 +6437,18 @@ pub const C_TOOLCHAIN_READY: &str = "ready";
 fn c_toolchain_marker(verdict: &crate::prereq::CcVerdict) -> Option<String> {
     use crate::prereq::CcVerdict;
     let body = match verdict {
-        CcVerdict::NotProbed => return None,
+        CcVerdict::NotProbed | CcVerdict::Unanswered { .. } | CcVerdict::Unproven { .. } => {
+            return None;
+        }
         CcVerdict::NoDriver | CcVerdict::NoDeveloperDir => C_TOOLCHAIN_MISSING,
-        broken if broken.fix().is_some() => C_TOOLCHAIN_BROKEN,
-        _ => C_TOOLCHAIN_READY,
+        CcVerdict::Broken { .. } => {
+            if verdict.fix().is_some() {
+                C_TOOLCHAIN_BROKEN
+            } else {
+                C_TOOLCHAIN_READY
+            }
+        }
+        CcVerdict::Ready { .. } => C_TOOLCHAIN_READY,
     };
     Some(format!("atpkg: {C_TOOLCHAIN_MARKER}{body}"))
 }
@@ -8213,7 +8221,7 @@ fn parse_install_argv(rest: &[String]) -> Result<InstallArgs<'_>, ExitCode> {
         [program, flag, _] | [program, flag, _, _]
             if flag == BUILD_FLAG
                 && program != crate::trust_lock::PROGRAM
-                && program != crate::prerequisite::Prerequisite::Lake.recipe().name =>
+                && program != crate::prerequisite::Prerequisite::Lake.program() =>
         {
             eprintln!(
                 "atpkg install: {BUILD_FLAG} stages the Trust build a trust.lock names: \

@@ -379,7 +379,10 @@ mod tests {
                 after_stages: vec![StageId::TestCompile],
                 ..spec(StageId::SpecCheck, "spec", Lane::AfterCompile, false)
             },
-            spec(StageId::Export, "export", Lane::TrustTarget, false),
+            StageSpec {
+                after_stages: vec![StageId::TestCompile],
+                ..spec(StageId::Export, "export", Lane::MainTarget, false)
+            },
             spec(StageId::LibcOracle, "libc", Lane::LibcOracleTarget, false),
             spec(StageId::Forge, "forge", Lane::Pure, false),
             spec(StageId::ForeignCells, "cells", Lane::CellsTarget, false),
@@ -845,14 +848,14 @@ mod tests {
         let cycle = vec![
             StageSpec {
                 after_stages: vec![StageId::Forge],
-                ..spec(StageId::Formatting, "a", Lane::TrustTarget, false)
+                ..spec(StageId::Formatting, "a", Lane::MainTarget, false)
             },
             StageSpec {
                 after_stages: vec![StageId::LibcOracle],
                 ..spec(StageId::Tippy, "b", Lane::TippyTarget, false)
             },
             spec(StageId::Forge, "c", Lane::TippyTarget, false),
-            spec(StageId::LibcOracle, "d", Lane::TrustTarget, false),
+            spec(StageId::LibcOracle, "d", Lane::CellsTarget, false),
         ];
         assert!(check_waits(&cycle).is_err());
         let mut specs = plan_shape();
@@ -1075,9 +1078,8 @@ mod tests {
     /// one, in declared order.
     fn wide() -> Vec<StageSpec> {
         vec![
-            claiming(StageId::TestCompile, "compile", Lane::MainTarget, 0),
+            claiming(StageId::Export, "export", Lane::MainTarget, 0),
             claiming(StageId::Tippy, "tippy", Lane::TippyTarget, 0),
-            claiming(StageId::Export, "export", Lane::TrustTarget, 0),
             claiming(StageId::LibcOracle, "libc", Lane::LibcOracleTarget, 0),
             claiming(StageId::ForeignCells, "cells", Lane::CellsTarget, 0),
             claiming(StageId::SpecCheckers, "checkers", Lane::AfterCompile, 0),
@@ -1133,7 +1135,7 @@ mod tests {
     /// fixed seed: a sample, not every assignment), in budgets of 8, 21.5 and 44 GiB, finished in
     /// three orders, never deadlocks, never claims past the budget but for one stage alone
     /// among those that claim, and never lets a stage overtake an earlier one waiting for room
-    /// ([`model_check_within`]); every assignment of those claims to the wide plan's six memory
+    /// ([`model_check_within`]); every assignment of those claims to the wide plan's five memory
     /// stages too. NEGATIVE CONTROL: a rule that lets a stage start whenever it fits alone, or
     /// lets one that fits overtake an earlier one waiting for room, fails a law here.
     #[test]
@@ -1191,7 +1193,7 @@ mod tests {
             }
         }
         let base = wide();
-        for code in 0..4usize.pow(6) {
+        for code in 0..4usize.pow(5) {
             let mut digits = code;
             let specs: Vec<StageSpec> = base
                 .iter()

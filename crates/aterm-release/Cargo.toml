@@ -131,6 +131,11 @@ aterm-tempfile = { workspace = true }
 # Nested lockfile bumps pin their directories and replace entries without following aliases.
 aterm-dirfd.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# The cutter's native-exec handoff blocks HUP/INT/TERM until the new image installs its
+# handlers, then restores only the signals the old image newly blocked.
+libc = { workspace = true }
+
 [dev-dependencies]
 # Binds the release-floor resolver and late guard to their derived lifecycle model.
 aterm-spec = { workspace = true }

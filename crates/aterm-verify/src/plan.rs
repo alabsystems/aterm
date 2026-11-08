@@ -25,8 +25,6 @@ pub enum Lane {
     AfterCompile,
     /// `tippy.noindex` under [`lanes_dir`] for lint builds.
     TippyTarget,
-    /// `trust.noindex` under [`lanes_dir`] for `ship check --export` release tools.
-    TrustTarget,
     /// `cells.noindex` under [`lanes_dir`] for cross-target cells, wasm modules, and browser runs.
     CellsTarget,
     /// `<root>/libc-oracle/target.noindex` for the per-checkout libc oracle workspace.
@@ -174,7 +172,11 @@ pub fn lanes_dir(ctx: &Ctx) -> PathBuf {
 }
 
 /// The side lanes' names, each a `<name>.noindex` directory in [`lanes_dir`].
-pub const SIDE_LANES: [&str; 3] = ["tippy", "trust", "cells"];
+pub const SIDE_LANES: [&str; 2] = ["tippy", "cells"];
+
+/// Every side lane that once built in the pre-[`lanes_dir`] location. The retired trust lane
+/// stays here until no checkout can retain one of its old directories or removal asides.
+const OLD_SIDE_LANES: [&str; 3] = ["tippy", "trust", "cells"];
 
 /// Target directory for `lane`'s cargo invocations, or `None` for [`Lane::Pure`].
 #[must_use]
@@ -184,7 +186,6 @@ pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
         Lane::Pure => None,
         Lane::MainTarget | Lane::AfterCompile => Some(ctx.target_dir.clone()),
         Lane::TippyTarget => side("tippy"),
-        Lane::TrustTarget => side("trust"),
         Lane::CellsTarget => Some(cells_dir(ctx)),
         Lane::LibcOracleTarget => Some(ctx.root.join("libc-oracle").join(LIBC_ORACLE_TARGET)),
     }
@@ -196,13 +197,14 @@ pub fn cells_dir(ctx: &Ctx) -> PathBuf {
     lanes_dir(ctx).join(noindex("cells"))
 }
 
-/// THE SIDE LANES' OLD PLACE, emptied: each `<target>/verify/<lane>.noindex` the lanes built in
-/// before they moved into [`lanes_dir`] goes whole once no build holds its cargo locks, and what
-/// an earlier run set aside of it and could not finish (`<lane>.noindex.removing`,
-/// `<lane>.noindex.removing-<n>`) is tried again, whether or not the lane is still there
-/// (`atpkg::build_cache::remove_unbuilt`): one line each for the log, and none for a lane with
-/// nothing of it left; one a build or process holds, or retention keeps, stays for a later run.
-/// Nothing of this version builds there.
+/// THE SIDE LANES' OLD PLACES, emptied: each `<target>/verify/<lane>.noindex` the lanes built in
+/// before they moved into [`lanes_dir`], and the trust lane in its later place under
+/// [`lanes_dir`], go whole once no build holds their cargo locks. What an earlier run set aside
+/// and could not finish (`<lane>.noindex.removing`, `<lane>.noindex.removing-<n>`) is tried again,
+/// whether or not the lane is still there (`atpkg::build_cache::remove_unbuilt`): one line each
+/// for the log, and none for a lane with nothing of it left; one a build or process holds, or
+/// retention keeps, stays for a later run. Nothing of this version builds in any of these paths;
+/// export now builds its release tools in the main target.
 #[cfg(unix)]
 #[must_use]
 pub fn retire_old_lanes(ctx: &Ctx) -> Vec<String> {
@@ -215,27 +217,37 @@ fn retire_old_lanes_with(
     remove: &dyn Fn(&std::path::Path) -> std::io::Result<bool>,
 ) -> Vec<String> {
     let mut said = Vec::new();
-    for name in SIDE_LANES {
-        let old = ctx.state_dir().join(noindex(name));
+    let mut retire = |name: &str, old: PathBuf, retired: bool| {
         let there = std::fs::symlink_metadata(&old).is_ok_and(|m| m.is_dir());
-        said.push(match remove(&old) {
-            Ok(true) => format!(
+        let line = match remove(&old) {
+            Ok(true) if retired => Some(format!(
+                "removed {}: export builds its release tools in the main target now",
+                old.display()
+            )),
+            Ok(true) => Some(format!(
                 "removed {}: the {name} lane builds in {} now, out of fseventsd's stream",
                 old.display(),
                 lanes_dir(ctx).display()
-            ),
-            Ok(false) if there => format!(
+            )),
+            Ok(false) if there => Some(format!(
                 "kept {} or what was set aside of it: a build holds its cargo locks, a process \
                  uses it or cannot be ruled out, or retention keeps it; a later run checks it again",
                 old.display()
-            ),
-            Ok(false) => continue,
-            Err(e) => format!(
+            )),
+            Ok(false) => None,
+            Err(e) => Some(format!(
                 "{}: not all of it could be removed ({e}); a later run tries again",
                 old.display()
-            ),
-        });
+            )),
+        };
+        if let Some(line) = line {
+            said.push(line);
+        }
+    };
+    for name in OLD_SIDE_LANES {
+        retire(name, ctx.state_dir().join(noindex(name)), name == "trust");
     }
+    retire("trust", lanes_dir(ctx).join(noindex("trust")), true);
     said
 }
 
@@ -475,11 +487,14 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
                 Lane::MainTarget,
             )
         },
-        spec(
-            StageId::Export,
-            "export guards (ship check --export: the publication engine's dry run)",
-            Lane::TrustTarget,
-        ),
+        StageSpec {
+            after_stages: vec![StageId::TestCompile],
+            ..spec(
+                StageId::Export,
+                "export guards (ship check --export: the publication engine's dry run)",
+                Lane::MainTarget,
+            )
+        },
         spec(
             StageId::LibcOracle,
             "libc ABI oracle (this host's native cell)",
@@ -684,7 +699,6 @@ mod tests {
             let lane = |l| lane_dir(&c, l).expect("a directory");
             for (l, name) in [
                 (Lane::TippyTarget, "tippy.noindex"),
-                (Lane::TrustTarget, "trust.noindex"),
                 (Lane::CellsTarget, "cells.noindex"),
             ] {
                 let quiet = target.join("verify").join(".ubd").join(name);
@@ -701,6 +715,46 @@ mod tests {
                 "the caller's target is theirs"
             );
             assert_eq!(lane_dir(&c, Lane::Pure), None);
+        }
+    }
+
+    /// The trust lane's old per-checkout and shared-cache places are both retired, while the two
+    /// live side lanes keep their shared-cache directories. NEGATIVE CONTROL: deriving every
+    /// retired path from [`SIDE_LANES`] either misses trust or removes a live lane.
+    #[cfg(unix)]
+    #[test]
+    fn the_retired_trust_lane_is_removed_without_retiring_a_live_lane() {
+        let c = Ctx::new(
+            PathBuf::from("/repo"),
+            Scope::workspace(),
+            EnvSnapshot::default(),
+            PathBuf::from("/tmp"),
+        );
+        let asked = std::sync::Mutex::new(Vec::new());
+        assert!(
+            retire_old_lanes_with(&c, &|path| {
+                asked.lock().expect("paths").push(path.to_path_buf());
+                Ok(false)
+            })
+            .is_empty()
+        );
+        let asked = asked.into_inner().expect("paths");
+        let state = c.state_dir();
+        let lanes = lanes_dir(&c);
+        assert_eq!(
+            asked,
+            [
+                state.join("tippy.noindex"),
+                state.join("trust.noindex"),
+                state.join("cells.noindex"),
+                lanes.join("trust.noindex"),
+            ]
+        );
+        for live in SIDE_LANES {
+            assert!(
+                !asked.contains(&lanes.join(noindex(live))),
+                "the live {live} lane must retain its cache"
+            );
         }
     }
 
@@ -1329,6 +1383,27 @@ mod tests {
         assert!(ready(&p, &started, &done, 0, doc, u64::MAX));
         started[test] = true;
         assert!(ready(&p, &started, &done, 1, doc, u64::MAX));
+    }
+
+    /// Export reuses the main target only after the test compile has populated it. An export-only
+    /// selection waits for nothing absent from its plan. NEGATIVE CONTROL: either the old trust
+    /// lane or an omitted dependency fails the paired plan.
+    #[test]
+    fn export_reuses_the_main_target_after_the_test_compile() {
+        use crate::sched::awaited;
+
+        let p = plan(&ctx(&[Check::Test, Check::Export], Scope::workspace()));
+        let at = |id| p.iter().position(|s| s.id == id).expect("planned");
+        let compile = at(StageId::TestCompile);
+        let export = at(StageId::Export);
+        assert_eq!(p[export].lane, Lane::MainTarget);
+        assert_eq!(p[export].after_stages, [StageId::TestCompile]);
+        assert_eq!(awaited(&p, export).collect::<Vec<_>>(), [compile]);
+
+        let alone = plan(&ctx(&[Check::Export], Scope::workspace()));
+        assert_eq!(alone.len(), 1);
+        assert_eq!(alone[0].lane, Lane::MainTarget);
+        assert!(alone[0].after_stages.is_empty());
     }
 
     fn with_app(checks: &[Check], scope: Scope) -> Ctx {

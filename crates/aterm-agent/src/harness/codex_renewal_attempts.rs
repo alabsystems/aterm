@@ -199,6 +199,38 @@ impl<'a> ReceiptWriter<'a> {
         flush_receipt_dir(self.env, expected)
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "NativeCanaryOwnership",
+            action = "NextOwner",
+            reason = "The fixture installs the current native or legacy canary owner"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "NativeCanaryOwnership",
+            action = "Taken",
+            reason = "A canary takeover retains the prior rotation's charge"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "NativeCanaryOwnership",
+            action = "Forget",
+            reason = "A preceding terminal cleanup may already have retired this exact record"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeCanaryOwnership",
+            action = "Release",
+            project = "aterm_agent::harness::accounts_pool::tests::quota_proposals::canary_ownership::model::transition"
+        )
+    )]
     pub(super) fn release_unexecuted_rotation(
         &self,
         receipt: &Receipt,
@@ -222,13 +254,12 @@ impl<'a> ReceiptWriter<'a> {
                 Ok(if state.pinned {
                     Vec::new()
                 } else {
-                    accounts::strike(
+                    accounts::strike_native_unexecuted(
                         state,
                         target,
                         &receipt.sid,
-                        &accounts::Strike::NotMoved(
-                            "native reservation cancelled before execution".into(),
-                        ),
+                        &receipt.id,
+                        "native reservation cancelled before execution",
                         self.env.now,
                     )
                 })

@@ -21,6 +21,7 @@ fn trial(case: i64, action: &str) -> [i64; 5] {
                     NOW - accounts::CANARY_HOLD_S - 1
                 },
                 took: false,
+                native_receipt: None,
             });
             state.undo = vec![accounts::Undo::default()];
             Ok(Vec::new())
@@ -53,6 +54,7 @@ fn trial(case: i64, action: &str) -> [i64; 5] {
                     sid: "replacement".into(),
                     at: NOW,
                     took: true,
+                    native_receipt: None,
                 });
                 Ok(Vec::new())
             })

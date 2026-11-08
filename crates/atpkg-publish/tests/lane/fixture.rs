@@ -184,7 +184,16 @@ pub struct Fx {
     pub packer: FakePacker,
     pub indexer: FakeIndexer,
     pub notes: Recorded,
-    ledger: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
+    ledger: Mutex<Ledger>,
+}
+
+/// The rows of the engine's ledger this world's engine origin holds on its main.
+#[derive(Clone, Default)]
+pub struct Ledger {
+    /// repo → dev commit → the public commit it was released as.
+    mappings: BTreeMap<String, BTreeMap<String, String>>,
+    /// repo → revoked dev commits.
+    revoked: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Fx {
@@ -208,7 +217,7 @@ impl Fx {
             packer: FakePacker::default(),
             indexer: FakeIndexer::new(keys.clone(), host.clone()),
             notes: Recorded::default(),
-            ledger: Mutex::new(BTreeMap::new()),
+            ledger: Mutex::new(Ledger::default()),
             tmp,
             keys,
             host,
@@ -370,36 +379,93 @@ impl Fx {
             },
         );
         if how.ledger {
-            self.ledger
-                .lock()
-                .expect("ledger")
-                .entry(repo.to_string())
-                .or_default()
-                .insert(dev_sha.to_string(), public);
-            self.write_ledger();
+            self.map(repo, dev_sha, tag);
         }
+    }
+
+    /// The engine origin's main records `dev_sha` as the dev commit `repo`'s release `tag`
+    /// (the public commit [`Fx::release`] signs for it) was cut from.
+    pub fn map(&self, repo: &str, dev_sha: &str, tag: &str) {
+        self.ledger
+            .lock()
+            .expect("ledger")
+            .mappings
+            .entry(repo.to_string())
+            .or_default()
+            .insert(dev_sha.to_string(), hex40(&format!("{repo}@{tag}")));
+        self.write_ledger();
+    }
+
+    /// The engine origin's main revokes `repo`'s row for `dev_sha`.
+    pub fn revoke(&self, repo: &str, dev_sha: &str) {
+        self.ledger
+            .lock()
+            .expect("ledger")
+            .revoked
+            .entry(repo.to_string())
+            .or_default()
+            .insert(dev_sha.to_string());
+        self.write_ledger();
+    }
+
+    /// The engine's origin: a repository the staging host serves as its `publication`, whose
+    /// main holds the ledger as committed. Its working tree is never what a reader judges.
+    #[must_use]
+    pub fn engine_origin(&self) -> PathBuf {
+        self.path("dev/publication")
     }
 
     fn write_ledger(&self) {
         let ledger = self.ledger.lock().expect("ledger");
-        let mut s = String::from("{\"mappings\": {");
-        for (i, (repo, rows)) in ledger.iter().enumerate() {
-            if i > 0 {
-                s.push(',');
-            }
-            s.push_str(&format!("\"{repo}\": {{"));
-            for (j, (dev, public)) in rows.iter().enumerate() {
-                if j > 0 {
-                    s.push(',');
-                }
-                s.push_str(&format!("\"{dev}\": {{\"release_rev\": \"{public}\"}}"));
-            }
-            s.push('}');
+        let object = |rows: Vec<(String, String)>| {
+            let fields: Vec<String> = rows
+                .into_iter()
+                .map(|(key, value)| format!("\"{key}\": {value}"))
+                .collect();
+            format!("{{{}}}", fields.join(","))
+        };
+        let mappings = object(
+            ledger
+                .mappings
+                .iter()
+                .map(|(repo, rows)| {
+                    let rows = rows
+                        .iter()
+                        .map(|(dev, public)| {
+                            (dev.clone(), format!("{{\"release_rev\": \"{public}\"}}"))
+                        })
+                        .collect();
+                    (repo.clone(), object(rows))
+                })
+                .collect(),
+        );
+        let revoked = object(
+            ledger
+                .revoked
+                .iter()
+                .map(|(repo, devs)| {
+                    let devs = devs
+                        .iter()
+                        .map(|dev| (dev.clone(), "{}".to_string()))
+                        .collect();
+                    (repo.clone(), object(devs))
+                })
+                .collect(),
+        );
+        let origin = self.engine_origin();
+        if !origin.join(".git").exists() {
+            std::fs::create_dir_all(&origin).expect("mkdir engine origin");
+            git(&origin, &["init", "-q"]);
+            self.host
+                .add_clone_source(&self.ctx.staging_slug("publication"), &origin);
         }
-        s.push_str("}}");
-        let path = self.ctx.home.join("publication/mappings.json");
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-        std::fs::write(path, s).expect("write ledger");
+        std::fs::write(
+            origin.join("mappings.json"),
+            format!("{{\"mappings\": {mappings}, \"revoked\": {revoked}}}"),
+        )
+        .expect("write ledger");
+        git(&origin, &["add", "mappings.json"]);
+        commit(&origin, "ledger", None);
     }
 
     /// A signed `pkg-<program>-<build>.toml` on the staging owner carrying `rows` (an
@@ -488,7 +554,7 @@ pub struct Held {
     indexes: Vec<IndexRequest>,
     index_fail: bool,
     notes: Vec<String>,
-    ledger: BTreeMap<String, BTreeMap<String, String>>,
+    ledger: Ledger,
 }
 
 /// How a release is published.

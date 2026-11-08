@@ -222,6 +222,9 @@ pub struct SchedInputs {
     pub late_max_us: u64,
     pub sampling_hole_us: u64,
     pub nominal_dt_us: u64,
+    /// The offscreen recorder and scan account for every composition. A render interval then
+    /// holds the last known image, instead of hiding an unknown periodically sampled image.
+    pub all_composed_frames: bool,
     pub wall_us: u64,
     pub budget_us: u64,
     pub late_threshold_us: u64,
@@ -246,7 +249,10 @@ pub const fn classify(i: &SchedInputs) -> Starvation {
             qos: i.qos,
         };
     }
-    if i.nominal_dt_us > 0 && (i.sampling_hole_us as u128) > 2 * (i.nominal_dt_us as u128) {
+    if !i.all_composed_frames
+        && i.nominal_dt_us > 0
+        && (i.sampling_hole_us as u128) > 2 * (i.nominal_dt_us as u128)
+    {
         return Starvation::CadenceBlown {
             hole_us: i.sampling_hole_us,
             nominal_us: i.nominal_dt_us,

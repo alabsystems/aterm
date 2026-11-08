@@ -4,6 +4,12 @@
 //! `targo --unverified verify` CLI entry point ([`aterm_verify::run_cli`]).
 
 fn main() -> std::process::ExitCode {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--version"))
+        && std::env::args_os().nth(2).is_none()
+    {
+        println!("{}", aterm_verify::FROZEN_TOOL_VERSION);
+        return std::process::ExitCode::SUCCESS;
+    }
     // First, while this process has one thread: a tethered child starts as this executable's
     // tether verb, and this executable is recorded as the one its own tethered spawns run through.
     if let Some(code) = aterm_uds::tether::entry() {

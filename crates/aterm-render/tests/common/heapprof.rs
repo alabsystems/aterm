@@ -4,16 +4,17 @@
 //! In-process live-heap profiler for Windows.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
-use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[path = "heap_book.rs"]
+mod heap_book;
+use heap_book::{Book, Busy, Stack};
 
 /// Allocations at least this large get a stack.
-pub const MIN_TRACK: usize = 512;
+pub const MIN_TRACK: usize = heap_book::MIN_TRACK;
 /// Return addresses captured per site.
-pub const FRAMES: usize = 16;
+pub const FRAMES: usize = heap_book::FRAMES;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -91,42 +92,8 @@ pub fn private_bytes_kb() -> u64 {
     (c.pagefile_usage / 1024) as u64
 }
 
-static LIVE_BYTES: AtomicI64 = AtomicI64::new(0);
-static PEAK_BYTES: AtomicI64 = AtomicI64::new(0);
-static LIVE_COUNT: AtomicI64 = AtomicI64::new(0);
-static TOTAL_ALLOCS: AtomicU64 = AtomicU64::new(0);
+static BOOK: Book = Book::new();
 static TRACKING: AtomicBool = AtomicBool::new(false);
-
-thread_local! {
-    static BUSY: Cell<bool> = const { Cell::new(false) };
-}
-
-#[derive(Default)]
-struct Site {
-    frames: [usize; FRAMES],
-    depth: usize,
-    live: i64,
-    live_count: i64,
-    total: u64,
-}
-
-#[derive(Default)]
-struct State {
-    live: HashMap<usize, (usize, u32)>,
-    by_stack: HashMap<u64, u32>,
-    sites: Vec<Site>,
-}
-
-fn state() -> &'static Mutex<State> {
-    static S: std::sync::OnceLock<Mutex<State>> = std::sync::OnceLock::new();
-    S.get_or_init(|| Mutex::new(State::default()))
-}
-
-fn lock() -> std::sync::MutexGuard<'static, State> {
-    state()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 
 pub struct Prof;
 
@@ -135,19 +102,14 @@ impl Prof {
         if ptr.is_null() {
             return;
         }
-        LIVE_BYTES.fetch_add(size as i64, Ordering::Relaxed);
-        LIVE_COUNT.fetch_add(1, Ordering::Relaxed);
-        TOTAL_ALLOCS.fetch_add(1, Ordering::Relaxed);
-        let live = LIVE_BYTES.load(Ordering::Relaxed);
-        PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
+        BOOK.allocated(ptr, size);
 
         if size < MIN_TRACK || !TRACKING.load(Ordering::Relaxed) {
             return;
         }
-        let already = BUSY.with(|b| b.replace(true));
-        if already {
+        let Some(busy) = Busy::enter() else {
             return;
-        }
+        };
         let mut frames = [std::ptr::null_mut::<c_void>(); FRAMES];
         let mut hash: u32 = 0;
         let n = unsafe {
@@ -162,62 +124,28 @@ impl Prof {
         for f in frames.iter().take(n) {
             key = aterm_hash::fnv_mix_u64(key, *f as u64);
         }
-        {
-            let mut st = lock();
-            let idx = match st.by_stack.get(&key) {
-                Some(i) => *i,
-                None => {
-                    let mut site = Site {
-                        depth: n,
-                        ..Site::default()
-                    };
-                    for (dst, src) in site.frames.iter_mut().zip(frames.iter()) {
-                        *dst = *src as usize;
-                    }
-                    st.sites.push(site);
-                    let i = u32::try_from(st.sites.len() - 1).unwrap_or(u32::MAX);
-                    st.by_stack.insert(key, i);
-                    i
-                }
-            };
-            if let Some(site) = st.sites.get_mut(idx as usize) {
-                site.live += size as i64;
-                site.live_count += 1;
-                site.total += size as u64;
-            }
-            st.live.insert(ptr as usize, (size, idx));
-        }
-        BUSY.with(|b| b.set(false));
+        BOOK.attribute(
+            ptr,
+            size,
+            Stack {
+                key,
+                frames: frames.map(|f| f as usize),
+                depth: n,
+            },
+            &busy,
+        );
     }
 
     fn book_dealloc(ptr: *mut u8, size: usize) {
-        if ptr.is_null() {
-            return;
-        }
-        LIVE_BYTES.fetch_sub(size as i64, Ordering::Relaxed);
-        LIVE_COUNT.fetch_sub(1, Ordering::Relaxed);
-        if size < MIN_TRACK {
-            return;
-        }
-        let already = BUSY.with(|b| b.replace(true));
-        if already {
-            return;
-        }
-        {
-            let mut st = lock();
-            if let Some((sz, idx)) = st.live.remove(&(ptr as usize))
-                && let Some(site) = st.sites.get_mut(idx as usize)
-            {
-                site.live -= sz as i64;
-                site.live_count -= 1;
-            }
-        }
-        BUSY.with(|b| b.set(false));
+        BOOK.deallocated(ptr, size);
     }
 }
 
+// SAFETY: System receives the caller's original pointer and layout. The book treats addresses as
+// opaque identities, and its drop-free TLS guard suppresses recursive stack attribution.
 unsafe impl GlobalAlloc for Prof {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwarding the caller's layout unchanged.
         let p = unsafe { System.alloc(layout) };
         Self::book_alloc(p, layout.size());
         p
@@ -225,18 +153,22 @@ unsafe impl GlobalAlloc for Prof {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         Self::book_dealloc(ptr, layout.size());
+        // SAFETY: forwarding the caller's System allocation and matching layout unchanged.
         unsafe { System.dealloc(ptr, layout) };
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwarding the caller's layout and zeroing request unchanged.
         let p = unsafe { System.alloc_zeroed(layout) };
         Self::book_alloc(p, layout.size());
         p
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        Self::book_dealloc(ptr, layout.size());
-        let p = unsafe { System.realloc(ptr, layout, new_size) };
+        // SAFETY: the native operation receives the caller's valid System allocation and layout.
+        let p = BOOK.reallocated(ptr, layout.size(), || unsafe {
+            System.realloc(ptr, layout, new_size)
+        });
         Self::book_alloc(p, new_size);
         p
     }
@@ -253,17 +185,17 @@ pub fn stop() {
 
 #[must_use]
 pub fn live_kb() -> i64 {
-    LIVE_BYTES.load(Ordering::Relaxed) / 1024
+    BOOK.live_bytes.load(Ordering::Relaxed) / 1024
 }
 
 #[must_use]
 pub fn peak_kb() -> i64 {
-    PEAK_BYTES.load(Ordering::Relaxed) / 1024
+    BOOK.peak_bytes.load(Ordering::Relaxed) / 1024
 }
 
 #[must_use]
 pub fn live_allocations() -> i64 {
-    LIVE_COUNT.load(Ordering::Relaxed)
+    BOOK.live_count.load(Ordering::Relaxed)
 }
 
 /// A named checkpoint: live heap and working set right now.
@@ -402,9 +334,9 @@ fn resolve(addr: usize) -> String {
 /// Print the top `top` allocation sites by live bytes, deepest frames first.
 pub fn report(title: &str, top: usize) {
     stop();
-    let outer = BUSY.with(|b| b.replace(true));
+    let _busy = Busy::force();
     let (mut rows, total_live, total_count) = {
-        let st = lock();
+        let st = BOOK.lock();
         let mut rows: Vec<(i64, i64, [usize; FRAMES], usize)> = st
             .sites
             .iter()
@@ -413,7 +345,7 @@ pub fn report(title: &str, top: usize) {
             .collect();
         rows.sort_by_key(|row| std::cmp::Reverse(row.0));
         let live: i64 = st.sites.iter().map(|s| s.live).sum();
-        (rows, live, st.live.len())
+        (rows, live, st.allocation_count())
     };
     rows.truncate(top);
 
@@ -455,29 +387,28 @@ pub fn report(title: &str, top: usize) {
         }
     }
     eprintln!("=============== END HEAP ATTRIBUTION ===============\n");
-    BUSY.with(|b| b.set(outer));
 }
 
 /// [`bill`] without the printing: `(value, live delta kB, own-transient peak kB)`.
 pub fn measure<T>(f: impl FnOnce() -> T) -> (T, i64, i64) {
-    let before = LIVE_BYTES.load(Ordering::Relaxed);
-    PEAK_BYTES.store(before, Ordering::Relaxed);
+    let before = BOOK.live_bytes.load(Ordering::Relaxed);
+    BOOK.peak_bytes.store(before, Ordering::Relaxed);
     let out = f();
-    let after = LIVE_BYTES.load(Ordering::Relaxed);
-    let peak = PEAK_BYTES.load(Ordering::Relaxed);
+    let after = BOOK.live_bytes.load(Ordering::Relaxed);
+    let peak = BOOK.peak_bytes.load(Ordering::Relaxed);
     (out, (after - before) / 1024, (peak - before) / 1024)
 }
 
 /// Run `f` and print its live heap delta, transient peak, working-set delta, and duration.
 pub fn bill<T>(label: &str, f: impl FnOnce() -> T) -> T {
-    let before = LIVE_BYTES.load(Ordering::Relaxed);
+    let before = BOOK.live_bytes.load(Ordering::Relaxed);
     let ws_before = working_set_kb();
-    PEAK_BYTES.store(before, Ordering::Relaxed);
+    BOOK.peak_bytes.store(before, Ordering::Relaxed);
     let t0 = std::time::Instant::now();
     let out = f();
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let after = LIVE_BYTES.load(Ordering::Relaxed);
-    let peak = PEAK_BYTES.load(Ordering::Relaxed);
+    let after = BOOK.live_bytes.load(Ordering::Relaxed);
+    let peak = BOOK.peak_bytes.load(Ordering::Relaxed);
     eprintln!(
         "[bill] {label:<52} live +{:>8} kB   peak +{:>8} kB   ws +{:>8} kB   {ms:>8.1} ms",
         (after - before) / 1024,

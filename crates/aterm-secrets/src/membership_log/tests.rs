@@ -265,6 +265,23 @@ fn records_of_another_network_or_out_of_order_are_refused() {
     assert!(one.insert(forged).is_err());
 }
 
+/// A clone shares the original's records and their index until one of the two holds another
+/// record, and that hold leaves the other's records, heads and membership as they were.
+/// NEGATIVE CONTROL: a clone that copies the records shares none.
+#[test]
+fn a_clone_shares_its_records_until_one_holds_another() {
+    let lab = found(&[(A, "m1"), (B, "m2")]);
+    let mut grown = lab.clone();
+    assert!(Arc::ptr_eq(&lab.order, &grown.order) && Arc::ptr_eq(&lab.held, &grown.held));
+    let before = (lab.held_count(), lab.heads(), members(&lab));
+    let admitted = grown.keep(admit(&grown, A, X, "m3"));
+    assert!(!Arc::ptr_eq(&lab.order, &grown.order) && !Arc::ptr_eq(&lab.held, &grown.held));
+    assert_eq!((lab.held_count(), lab.heads(), members(&lab)), before);
+    assert_eq!(grown.held_count(), before.0 + 1);
+    assert_eq!(grown.heads(), vec![*admitted.id()]);
+    assert!(lab.get(admitted.id()).is_none() && grown.get(admitted.id()).is_some());
+}
+
 /// The permutations of `0..n`, every one once, by Heap's algorithm: the arrival orders of `n`
 /// records.
 pub(in crate::membership_log) fn permutations(n: usize) -> Vec<Vec<usize>> {
@@ -290,6 +307,24 @@ pub(in crate::membership_log) fn permutations(n: usize) -> Vec<Vec<usize>> {
     all
 }
 
+/// The held records no held record follows, sorted, collected from every record as
+/// [`Log::heads`] is defined: what the heads it keeps as it holds each record must equal.
+fn unfollowed(log: &Log) -> Vec<RecordId> {
+    let followed: BTreeSet<RecordId> = log.records().flat_map(|r| r.parents()).copied().collect();
+    let mut heads: Vec<RecordId> = log
+        .records()
+        .map(|r| *r.id())
+        .filter(|id| !followed.contains(id))
+        .collect();
+    heads.sort_unstable();
+    heads
+}
+
+/// Whatever order records arrive in, waiting ones included, every log gives the same records,
+/// membership and heads, and the heads it keeps as it holds each record are those no held record
+/// follows. NEGATIVE CONTROLS: a hold that ends no parent's place keeps heads other than the
+/// unfollowed ones (and agrees with itself in every order); one that leaves the record it holds
+/// out leaves a later draft no head to follow, so building the records fails.
 #[test]
 fn every_insertion_order_gives_the_same_log_and_membership() {
     let lab = found(&[(A, "m1"), (B, "m2"), (C, "m3")]);
@@ -309,6 +344,7 @@ fn every_insertion_order_gives_the_same_log_and_membership() {
         let mut log = lab.clone();
         for &i in order {
             log.insert(records[i].clone()).unwrap();
+            assert_eq!(log.heads(), unfollowed(&log), "order {order:?}");
         }
         let got = (log.membership(), log.heads());
         match &want {

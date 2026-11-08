@@ -18753,6 +18753,7 @@ impl App {
     ) {
         debug_assert_eq!(built.len(), panel_rows);
         self.splice_band_rows_at(wid, 0, built, cols, cell_h);
+        self.evict_stale_glass_hover(wid);
     }
 
     fn splice_band_rows_at(

@@ -449,6 +449,10 @@ struct Placement<'a> {
     replace: bool,
     long_entry_ends: bool,
     inherit_all: bool,
+    /// Keep the caller's mask across an in-place exec instead of installing the ordinary empty
+    /// child mask.
+    #[cfg(target_vendor = "apple")]
+    inherit_signal_mask: bool,
     #[cfg(target_vendor = "apple")]
     native_image: bool,
     disclaim: Option<&'a std::ffi::CStr>,
@@ -518,6 +522,8 @@ impl Default for Placement<'_> {
             replace: false,
             long_entry_ends: false,
             inherit_all: false,
+            #[cfg(target_vendor = "apple")]
+            inherit_signal_mask: false,
             #[cfg(target_vendor = "apple")]
             native_image: false,
             disclaim: None,
@@ -995,7 +1001,10 @@ mod platform {
         };
         let mut flags = POSIX_SPAWN_SETSIGDEF;
         if !place.inherit_all {
-            flags |= POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGMASK;
+            flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
+        }
+        if !place.inherit_signal_mask {
+            flags |= POSIX_SPAWN_SETSIGMASK;
         }
         if place.pgroup.is_some() {
             flags |= POSIX_SPAWN_SETPGROUP;
@@ -1012,7 +1021,7 @@ mod platform {
         // SAFETY: each call takes an object `Objects::new` initialised and a live local or C string; none retains a pointer past the call. The disclaim setter is the SPI `disclaimer` resolved, called with its own prototype on that same attribute object.
         unsafe {
             check(posix_spawnattr_setflags(&mut objects.attr, flags))?;
-            if !place.inherit_all {
+            if !place.inherit_signal_mask {
                 check(posix_spawnattr_setsigmask(&mut objects.attr, &empty))?;
             }
             check(posix_spawnattr_setsigdefault(&mut objects.attr, &defaults))?;

@@ -30,8 +30,25 @@ impl NotOwn {
     }
 }
 
-/// What this running cutter is: the commit it is the build of, or why it is none.
-pub type Stamp = Result<String, NotOwn>;
+/// Provenance of the running cutter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Stamp {
+    /// Cargo's dep-info and freshness judgment binds this image to the commit.
+    Built(String),
+    /// A content-addressed frozen-tool record binds this exact image and a clean clone to R.
+    Proved(String),
+}
+
+impl Stamp {
+    #[must_use]
+    pub fn commit(&self) -> &str {
+        match self {
+            Self::Built(commit) | Self::Proved(commit) => commit,
+        }
+    }
+}
+
+type Verdict = Result<Stamp, NotOwn>;
 
 /// The checkout paths whose state decides the cutter binary.
 pub const SOURCE_INPUTS: [&str; 6] = [
@@ -113,7 +130,7 @@ impl Since {
 /// What [`judge_at_start`] found: the stamp, and the moment it dated the inputs from, when it
 /// got that far.
 struct Judged {
-    stamp: Stamp,
+    stamp: Verdict,
     since: Option<Since>,
 }
 
@@ -123,6 +140,24 @@ static RUNNING: OnceLock<Judged> = OnceLock::new();
 pub fn judge_at_start() {
     RUNNING.get_or_init(|| match std::env::current_exe() {
         Ok(exe) => {
+            match crate::release_tools::proved_running(&exe) {
+                Ok(Some(commit)) => {
+                    return Judged {
+                        stamp: Ok(Stamp::Proved(commit)),
+                        since: None,
+                    };
+                }
+                Err(why) => {
+                    return Judged {
+                        stamp: Err(NotOwn::new(
+                            format!("the frozen-tool proof is invalid ({why})"),
+                            "restore the clean release clone and run the release again",
+                        )),
+                        since: None,
+                    };
+                }
+                Ok(None) => {}
+            }
             let var = |name: &str| std::env::var_os(name);
             let handed = handed_since(
                 var(crate::release_steps::RELEASE_CUTTER_ENV).as_deref(),
@@ -153,7 +188,18 @@ pub fn running() -> Result<&'static str, &'static NotOwn> {
         })
         .stamp
         .as_ref()
-        .map(String::as_str)
+        .map(Stamp::commit)
+}
+
+/// This process's complete startup provenance, including a frozen content proof.
+pub fn running_stamp() -> Result<&'static Stamp, &'static NotOwn> {
+    RUNNING
+        .get_or_init(|| Judged {
+            stamp: Err(NotOwn::new("it was not judged when it started", RELINK)),
+            since: None,
+        })
+        .stamp
+        .as_ref()
 }
 
 /// What this process's start judgment dated its inputs from, for a cutter it hands on
@@ -390,7 +436,7 @@ fn judge_process(
     };
     let since = since(linked, placed(&meta), launcher, own, handed);
     Judged {
-        stamp: judge(exe, since),
+        stamp: judge(exe, since).map(Stamp::Built),
         since: Some(since),
     }
 }
@@ -417,7 +463,7 @@ fn stale_fix(exe: &Path, root: &Path, since: Since) -> String {
 
 /// Whether the cutter at `exe` is its checkout's `HEAD` build: its inputs judged from `since`,
 /// and a stale one's remedy as [`stale_fix`] gives it for `since`.
-fn judge(exe: &Path, since: Since) -> Stamp {
+fn judge(exe: &Path, since: Since) -> Result<String, NotOwn> {
     let dep_info = exe.with_extension("d");
     let text = crate::durable::read_text(&dep_info).map_err(|e| {
         NotOwn::new(
@@ -1060,7 +1106,7 @@ mod tests {
     }
 
     /// The judgment of a cutter run directly, from its link.
-    fn judged(b: &Built) -> Stamp {
+    fn judged(b: &Built) -> Result<String, NotOwn> {
         judge(&b.exe, Since::Link(linked(b)))
     }
 
@@ -1852,7 +1898,7 @@ mod tests {
             let own = Some(placed_at(&b));
             judge_process(&b.exe, launcher, own, handed)
         };
-        assert_eq!(run(Some(began), None).stamp, Ok(head));
+        assert_eq!(run(Some(began), None).stamp, Ok(Stamp::Built(head)));
 
         place(&b, lib, "NEW RULES\n", began + Duration::from_secs(60));
         let head = commit(&b.work, "new rules, committed while the run built");
@@ -1871,7 +1917,7 @@ mod tests {
         let later = began + Duration::from_secs(120);
         assert_eq!(
             run(Some(later), None).stamp,
-            Ok(head.clone()),
+            Ok(Stamp::Built(head.clone())),
             "a run that began after the edit"
         );
 
@@ -1888,7 +1934,10 @@ mod tests {
                 )),
                 "{not:?}"
             );
-            assert_eq!(run(launcher, Some(later)).stamp, Ok(head.clone()));
+            assert_eq!(
+                run(launcher, Some(later)).stamp,
+                Ok(Stamp::Built(head.clone()))
+            );
         }
     }
 
@@ -1924,7 +1973,7 @@ mod tests {
         );
         let own = Some(placed_at(&b));
         let launched = judge_process(&b.exe, Some(began), own, None);
-        assert_eq!(launched.stamp, Ok(head));
+        assert_eq!(launched.stamp, Ok(Stamp::Built(head)));
         assert_eq!(launched.since, Some(Since::Launch(began)));
 
         let not = judged(&b).expect_err("judged from its link");

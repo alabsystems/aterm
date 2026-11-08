@@ -4,15 +4,15 @@
 //! Test support (test and debug builds, never release ones): whether a macOS service a test needs answers, and the end of a test that needs one that does not.
 
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use super::held_words;
 use super::{Refused, TRUST};
 use crate::host::could_not_run;
 
-/// How long the probe waits for `trustd`: about a hundred times its honest answer, and half a test's one-minute hang detector.
-pub const PROBE_DEADLINE: Duration = Duration::from_secs(30);
+/// The one-minute hang detector for the native trust-service probe.
+pub const PROBE_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Whether macOS's `trustd` does not answer (asked once per process).
 #[must_use]
@@ -20,8 +20,24 @@ pub fn trust_service_silent() -> bool {
     static SILENT: OnceLock<bool> = OnceLock::new();
     *SILENT.get_or_init(|| {
         cfg!(target_vendor = "apple")
-            && TRUST.run(PROBE_DEADLINE, PROBE_DEADLINE, probe) == Err(Refused::Unanswered)
+            && probe_silent_at(Instant::now(), Instant::now(), |within| {
+                TRUST.run(within, within, probe)
+            })
     })
+}
+
+fn probe_silent_at(
+    started: Instant,
+    now: Instant,
+    run: impl FnOnce(Duration) -> Result<(), Refused>,
+) -> bool {
+    let Some(within) = (started + PROBE_DEADLINE)
+        .checked_duration_since(now)
+        .filter(|within| !within.is_zero())
+    else {
+        return true;
+    };
+    run(within) == Err(Refused::Unanswered)
 }
 
 /// End the calling test COULD NOT RUN when macOS's `trustd` does not answer ([`trust_service_silent`]): every code-signing and TLS check waits on it, so the silence is the machine's, not the code's. The words count this user's programs macOS's program check holds now ([`crate::process::held_programs`]).
@@ -687,6 +703,34 @@ fn probe() {}
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_completed_native_trust_probe_is_not_silent() {
+        super::require_trust_service();
+        static GATE: super::super::Gate = super::super::Gate::new("native-probe-test");
+        let now = std::time::Instant::now();
+        assert!(!super::probe_silent_at(
+            now - std::time::Duration::from_secs(31),
+            now,
+            |within| GATE.run(within, within, super::probe),
+        ));
+    }
+
+    #[test]
+    fn an_expired_probe_does_not_start_and_a_failed_probe_is_not_silence() {
+        let now = std::time::Instant::now();
+        assert!(super::probe_silent_at(
+            now - std::time::Duration::from_secs(61),
+            now,
+            |_| panic!("an expired probe must not start"),
+        ));
+        assert!(!super::probe_silent_at(now, now, |_| {
+            Err(super::Refused::Failed("native failure".to_owned()))
+        }));
+        assert!(super::probe_silent_at(now, now, |_| {
+            Err(super::Refused::Unanswered)
+        }));
+    }
     use std::os::unix::process::ExitStatusExt as _;
     use std::process::{ExitStatus, Output};
 

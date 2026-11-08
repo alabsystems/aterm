@@ -24,8 +24,6 @@ const OLD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const TIP: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const BUMP: &str = "cccccccccccccccccccccccccccccccccccccccc";
 const NEXT: &str = "dddddddddddddddddddddddddddddddddddddddd";
-/// The re-run as R's own cutter: its pid and start, as the claim it takes over names them.
-const RERUN: (u32, &str) = (4343, "Thu Oct  9 02:01:00 2026");
 const BUMP2: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 /// Landed, non-merge fixes on main, after the line's base.
 const FIX: &str = "1111111111111111111111111111111111111111";
@@ -53,14 +51,10 @@ struct World {
     pid: u32,
     started: String,
     alive: BTreeMap<u32, String>,
-    /// This process's ancestors, its parent's pid first.
-    ancestors: Vec<u32>,
-    /// How the re-run as R's own cutter ends: its exit code, or why it could not start.
-    reexec: Result<i32, Refusal>,
-    /// The re-run took the run claim over (it names [`RERUN`], alive) before it ended.
-    reexec_takes_claim: bool,
-    /// The re-run's end removed the claim it took over.
-    rerun_removes_claim: bool,
+    /// A refusal before exec, or the successful exec edge (which a real backend never returns).
+    exec_result: Result<(), Refusal>,
+    /// R the last exec was asked to replace this image with.
+    exec_commit: Option<String>,
     times: String,
     history: Vec<String>,
     versions: BTreeMap<String, String>,
@@ -181,8 +175,6 @@ struct World {
     staged_by: Option<String>,
     /// Whether the run claim was still on disk when the PREPARED line was said.
     running_at_prepared: Option<bool>,
-    /// The run claim's text (empty when there was none) when an INTERRUPTED line was said.
-    claim_at_interrupted: Option<String>,
     /// The stage leaves a step child's note behind, its process gone.
     child_note_at_stage: bool,
     /// Origin does not answer `git ls-remote`.
@@ -264,10 +256,11 @@ impl World {
             pid: 4242,
             started: "Thu Oct  9 02:00:00 2026".into(),
             alive: BTreeMap::new(),
-            ancestors: Vec::new(),
-            reexec: Err(Refusal::new("the fake's re-run could not start", "nothing")),
-            reexec_takes_claim: false,
-            rerun_removes_claim: false,
+            exec_result: Err(Refusal::new(
+                "the fake could not exec R's frozen cutter",
+                "nothing",
+            )),
+            exec_commit: None,
             times: String::new(),
             history: vec![OLD.into(), TIP.into()],
             versions,
@@ -338,7 +331,6 @@ impl World {
             engine: "e7e7e7e7e7".into(),
             staged_by: None,
             running_at_prepared: None,
-            claim_at_interrupted: None,
             child_note_at_stage: false,
             ls_remote_down: false,
             candidate_missing: false,
@@ -1096,10 +1088,6 @@ impl Backend for World {
         if line.starts_with("PREPARED") {
             self.running_at_prepared = Some(World::release_dir(self).join(RUNNING_FILE).exists());
         }
-        if line.starts_with("INTERRUPTED") {
-            let claim = World::release_dir(self).join(RUNNING_FILE);
-            self.claim_at_interrupted = Some(std::fs::read_to_string(claim).unwrap_or_default());
-        }
         self.out.push(line.to_string());
     }
     fn interrupted(&mut self) -> Option<i32> {
@@ -1122,9 +1110,6 @@ impl Backend for World {
             return Some(self.started.clone());
         }
         self.alive.get(&pid).cloned()
-    }
-    fn ancestors(&mut self) -> Vec<u32> {
-        self.ancestors.clone()
     }
     fn release_dir(&mut self) -> PathBuf {
         World::release_dir(self)
@@ -1336,26 +1321,10 @@ impl Backend for World {
             })
         }
     }
-    fn reexec(&mut self, _prover: &Prover) -> Result<i32, Refusal> {
-        self.calls.push("reexec".into());
-        let path = World::release_dir(self).join(RUNNING_FILE);
-        let claim = std::fs::read_to_string(&path);
-        if claim.is_ok_and(|text| text.lines().any(|l| l == "handed")) {
-            self.calls.push("reexec with the claim handed".into());
-        }
-        self.interrupt_at("reexec");
-        if self.reexec_takes_claim {
-            self.alive.insert(RERUN.0, RERUN.1.into());
-            std::fs::write(
-                &path,
-                format!("pid {}\nstarted {}\nlogs /l\n", RERUN.0, RERUN.1),
-            )
-            .unwrap();
-        }
-        if self.rerun_removes_claim {
-            std::fs::remove_file(&path).unwrap();
-        }
-        self.reexec.clone()
+    fn exec_cutter(&mut self, commit: &str, _prover: &Prover) -> Result<(), Refusal> {
+        self.calls.push("exec-cutter".into());
+        self.exec_commit = Some(commit.to_owned());
+        self.exec_result.clone()
     }
     fn facts(&mut self, c: &Candidate, _prover: &Prover, artifact: Option<&Artifact>) -> Facts {
         let down = self.judge_down;
@@ -2825,7 +2794,7 @@ fn commit_on_an_unpublished_line_refuses_naming_fix_and_forget() {
 
 /// `--fix` needs this clone's unfinished line: with no journal it refuses at step 1 and
 /// changes nothing, and a line whose head predates lines (its tree has no line.rs, so the
-/// cutter its run re-runs as keeps no line) refuses too; a tree git cannot read could not run,
+/// cutter its run executes as keeps no line) refuses too; a tree git cannot read could not run,
 /// and names no `--forget`. NEGATIVE CONTROL: drop the `tree_has` test, and the old head takes
 /// a hop.
 #[test]
@@ -3311,26 +3280,13 @@ fn a_second_run_in_the_same_clone_is_refused_naming_the_first() {
     );
 }
 
-/// A cutter that is not R's own hands its run claim to the re-run it starts, waits for it and
-/// ends with its exit code; the re-run, a descendant of it, takes the claim over, keeps the
-/// candidate, and refuses rather than re-run again. A claim handed by a live process that is
-/// not this one's ancestor, or one a live ancestor did not hand, refuses as another run's.
-/// NEGATIVE CONTROLS: take a claim over whatever its holder (the old pid test), and the re-run's
-/// own process is never its holder, so it refuses at 1/10; take it over from any live
-/// ancestor, handed or not, and the unhanded claim is adopted. The re-run names the handing run's
-/// logs in a `handed` record (its first steps' seal calls are there); a run that adopted nothing
-/// names none.
+/// A cutter built from another commit asks the backend to replace this image exactly once with
+/// R's frozen cutter. A pre-exec refusal is this image's step-3 refusal; the successful exec edge
+/// returns no final line because the real backend never returns from it.
+/// NEGATIVE CONTROLS: exec a commit other than R, call exec twice, or continue into validation
+/// work in the old image, and these assertions fail.
 #[test]
-fn a_cutter_that_is_not_rs_own_reexecs_once_and_keeps_the_candidate() {
-    let handed_from = |w: &World| -> Vec<String> {
-        w.out
-            .iter()
-            .filter_map(|l| l.strip_prefix("release-event: "))
-            .filter_map(|json| aterm_json::from_str::<aterm_json::Value>(json).ok())
-            .filter(|event| event["event"].as_str() == Some("handed"))
-            .map(|event| event["from"].as_str().unwrap_or("?").to_owned())
-            .collect()
-    };
+fn a_foreign_cutter_execs_once_at_r_and_only_a_refusal_returns() {
     let mut w = World::new();
     w.versions.insert(TIP.into(), "0.6.0".into());
     w.own_cutter = false;
@@ -3339,83 +3295,91 @@ fn a_cutter_that_is_not_rs_own_reexecs_once_and_keeps_the_candidate() {
         ..mac()
     };
     let claim = w.release_dir().join(RUNNING_FILE);
+
     let (code, last) = w.run(tip.clone());
-    assert_eq!(w.count("reexec"), 1, "{:?}", w.calls);
-    assert_eq!(w.count("reexec with the claim handed"), 1, "{:?}", w.calls);
+    assert_eq!(w.count("exec-cutter"), 1, "{:?}", w.calls);
+    assert_eq!(w.exec_commit.as_deref(), Some(TIP));
     assert!(
         code == 1 && last.starts_with("REFUSED at 3/10 commit"),
-        "a re-run that could not start: {last}"
+        "an exec that could not begin: {last}"
     );
-    assert!(handed_from(&w).is_empty(), "{:#?}", w.out);
     assert!(
         !claim.exists(),
-        "the claim no re-run took is this run's to remove"
+        "a failed exec returned, so this image removes its claim"
     );
 
-    w.reexec = Ok(5);
+    w.exec_result = Ok(());
+    w.exec_commit = None;
     w.calls.clear();
-    let (code, last) = w.run(tip.clone());
+    let (code, last) = w.run(tip);
     assert_eq!(
         (code, last.as_str()),
-        (5, ""),
-        "the re-run's exit, its own final line"
+        (0, ""),
+        "the successfully exec'd image, not this one, owns the final line"
     );
-    assert_eq!(w.count("reexec with the claim handed"), 1, "{:?}", w.calls);
-    assert!(!claim.exists());
-
-    // The re-run: its parent (or grandparent) holds the claim and handed it on.
-    let earlier = (999, "Thu Oct  9 01:59:00 2026");
-    let handed = |w: &mut World, handed: bool| {
-        w.alive.insert(earlier.0, earlier.1.into());
-        let mark = if handed { "handed\n" } else { "" };
-        std::fs::write(
-            w.release_dir().join(RUNNING_FILE),
-            format!("pid {}\nstarted {}\nlogs /l\n{mark}", earlier.0, earlier.1),
-        )
-        .unwrap();
-    };
-    w.ancestors = vec![998, earlier.0, 1];
-    handed(&mut w, true);
-    w.calls.clear();
-    let (code, last) = w.run(tip.clone());
-    assert_eq!((code, w.count("reexec")), (1, 0), "no loop: {last}");
-    assert!(last.starts_with("REFUSED at 3/10 commit"), "{last}");
-    assert_eq!(handed_from(&w), ["/l"], "{:#?}", w.out);
+    assert_eq!(w.count("exec-cutter"), 1, "{:?}", w.calls);
+    assert_eq!(w.exec_commit.as_deref(), Some(TIP));
+    assert_eq!(
+        w.count("validation-tools"),
+        0,
+        "the old image does no work after exec: {:?}",
+        w.calls
+    );
     assert!(
         !claim.exists(),
-        "the claim it took over is its own to remove"
+        "the fake success edge returns and drops it; a real exec retains the process"
     );
+}
 
-    for (ancestors, mark, what) in [
-        (
-            vec![998, 1],
-            true,
-            "handed by a live process that is no ancestor",
-        ),
-        (
-            vec![998, earlier.0, 1],
-            false,
-            "a live ancestor's, not handed",
-        ),
-    ] {
-        w.ancestors = ancestors;
-        handed(&mut w, mark);
-        w.calls.clear();
-        let (code, last) = w.run(tip.clone());
-        assert!(
-            code == 1 && last.starts_with("REFUSED at 1/10 checks") && last.contains("pid 999"),
-            "{what}: {last}"
-        );
-        assert!(w.calls.is_empty(), "{what}: {:?}", w.calls);
-        assert!(claim.exists(), "{what}: another run's claim is kept");
-    }
-
-    w.ancestors = vec![998, earlier.0, 1];
-    handed(&mut w, true);
+/// A world at the boundary after the old image chose R and exec'd R's cutter. The claim names
+/// the same process, while origin/main has moved beyond the journaled R.
+fn world_after_cutter_exec(same_process_lifetime: bool) -> World {
+    let mut w = World::new();
+    w.versions.insert(TIP.into(), "0.6.0".into());
     w.history.push(NEXT.into());
     w.versions.insert(NEXT.into(), "0.6.0".into());
-    w.own_cutter = true;
-    let (code, last) = w.run(tip);
+    std::fs::create_dir_all(w.release_dir()).unwrap();
+    Journal {
+        version: "0.6.0".into(),
+        commit: TIP.into(),
+        prover: w.prover.bin.display().to_string(),
+        trustc: w.prover.commit.clone(),
+        started: w.now,
+        line: Some(Line::start("0.6.0", TIP, w.now)),
+        ..Journal::default()
+    }
+    .save(&w.release_dir().join(JOURNAL_FILE))
+    .unwrap();
+    let claim_started = if same_process_lifetime {
+        w.started.clone()
+    } else {
+        "Thu Oct  9 01:59:59 2026".into()
+    };
+    std::fs::write(
+        w.release_dir().join(RUNNING_FILE),
+        format!(
+            "pid {}\nstarted {}\nlogs /previous-image\n",
+            w.pid, claim_started
+        ),
+    )
+    .unwrap();
+    w
+}
+
+/// The image exec'd into the exact same pid and process start continues the claim, records the
+/// preceding image's logs, and keeps the journaled R even when the repeated command line names
+/// a newer origin/main. The same pid with another start is stale, not a continuation.
+/// NEGATIVE CONTROLS: compare only the pid or reselect the command-line commit after exec, and
+/// the second half or the released commit fails.
+#[test]
+fn an_execed_cutter_continues_only_the_exact_process_and_keeps_r() {
+    let options = ReleaseOptions {
+        commit: Some("origin/main".into()),
+        ..mac()
+    };
+    let mut w = world_after_cutter_exec(true);
+    w.audits = VecDeque::from([passes()]);
+    let (code, last) = w.run(options.clone());
     assert_eq!(code, 0, "{last}\n{:#?}", w.out);
     assert!(
         last.starts_with(&format!(
@@ -3424,109 +3388,57 @@ fn a_cutter_that_is_not_rs_own_reexecs_once_and_keeps_the_candidate() {
         )),
         "{last}"
     );
+    assert_eq!(w.journal().unwrap().commit, TIP, "never chases main");
+    assert_eq!(w.count("exec-cutter"), 0, "{:?}", w.calls);
+    let continued_from: Vec<_> = w
+        .out
+        .iter()
+        .filter_map(|line| line.strip_prefix("release-event: "))
+        .filter_map(|json| aterm_json::from_str::<aterm_json::Value>(json).ok())
+        .filter(|event| event["event"].as_str() == Some("continued"))
+        .map(|event| event["from"].as_str().unwrap_or("?").to_owned())
+        .collect();
+    assert_eq!(continued_from, ["/previous-image"]);
+
+    let mut stale = world_after_cutter_exec(false);
+    let (code, last) = stale.run(options);
+    assert_ne!(code, 0, "{last}");
+    assert!(
+        stale
+            .release_dir()
+            .join(format!("{RUNNING_FILE}.stale"))
+            .exists(),
+        "the same pid from another process lifetime is stale"
+    );
+    assert!(
+        !stale.out.iter().any(|line| line.contains("\"continued\"")),
+        "a stale lifetime is no exec continuation: {:#?}",
+        stale.out
+    );
+    assert_eq!(
+        stale.journal().unwrap().commit,
+        TIP,
+        "the conflicting command-line commit never replaces the journal"
+    );
 }
 
-/// A signal this run catches while it waits on the re-run as R's own cutter stops the release
-/// at 3/10 when the claim still names this run as the re-run ends (no re-run took it over).
-/// When the claim is the re-run's then, or gone with the re-run's end, the release was the
-/// re-run's to stop and to say: this run ends with its exit code, no final line of its own, and
-/// the re-run's claim left in place. The fake fires the signal as the re-run starts, before it
-/// rewrites the claim. NEGATIVE CONTROLS: drop the interrupt check after the re-run, and the
-/// first case ends with the re-run's code and no line; make `RunClaim`'s drop remove the claim
-/// whatever it names, and the re-run's claim is gone.
+/// If the continued image still fails R's own-cutter proof, it refuses instead of execing again.
+/// NEGATIVE CONTROL: drop the continued guard and this calls exec-cutter in a loop.
 #[test]
-fn a_signal_during_the_rerun_is_this_runs_until_the_rerun_takes_the_claim() {
-    let mut w = World::new();
-    w.versions.insert(TIP.into(), "0.6.0".into());
+fn a_continued_cutter_that_is_still_foreign_never_execs_again() {
+    let mut w = world_after_cutter_exec(true);
     w.own_cutter = false;
-    w.reexec = Ok(5);
-    w.signal_at = Some("reexec");
-    let tip = ReleaseOptions {
+    let (code, last) = w.run(ReleaseOptions {
         commit: Some("origin/main".into()),
         ..mac()
-    };
-    let claim = w.release_dir().join(RUNNING_FILE);
-    let (code, last) = w.run(tip.clone());
-    assert_eq!(w.count("reexec with the claim handed"), 1, "{:?}", w.calls);
+    });
+    assert_eq!(code, 1, "{last}");
     assert!(
-        code == 130 && last.starts_with("INTERRUPTED at 3/10 commit (by SIGTERM)"),
-        "the claim still this run's as the re-run ends: {code} {last}"
+        last.starts_with("REFUSED at 3/10 commit") && last.contains("this cutter was rebuilt at"),
+        "{last}"
     );
-    assert!(
-        !claim.exists(),
-        "the claim no re-run took is this run's to remove"
-    );
-
-    w.signal = None;
-    w.reexec_takes_claim = true;
-    w.calls.clear();
-    let (code, last) = w.run(tip.clone());
-    assert_eq!(w.count("reexec with the claim handed"), 1, "{:?}", w.calls);
-    assert_eq!(
-        (code, last.as_str()),
-        (5, ""),
-        "the claim the re-run's as it ends: the re-run answers for the signal"
-    );
-    let holder = std::fs::read_to_string(&claim).unwrap_or_default();
-    assert!(
-        holder.starts_with(&format!("pid {}\n", RERUN.0)),
-        "the claim the re-run took is the re-run's: {holder:?}"
-    );
-
-    // The re-run took the claim, said its own INTERRUPTED line, and its end removed the claim
-    // (the claim the last case's re-run left, its end not modelled, goes first).
-    std::fs::remove_file(&claim).unwrap();
-    w.signal = None;
-    w.reexec = Ok(130);
-    w.rerun_removes_claim = true;
-    w.calls.clear();
-    let (code, last) = w.run(tip);
-    assert_eq!(
-        (code, last.as_str()),
-        (130, ""),
-        "one final line: the re-run's"
-    );
-    assert!(!claim.exists());
+    assert_eq!(w.count("exec-cutter"), 0, "{:?}", w.calls);
 }
-
-/// A re-run as R's own cutter takes over the claim the run that started it handed it before it
-/// can say a final line: one that caught a signal before its checks says INTERRUPTED at 1/10 with
-/// the claim naming it, and its end removes the claim, so the run that started it, finding the
-/// claim no longer its own when the re-run ends, says nothing more
-/// (a_signal_during_the_rerun_is_this_runs_until_the_rerun_takes_the_claim). NEGATIVE CONTROL:
-/// take the claim at the checks, after begin(Checks)'s interrupt check (as before), and the
-/// re-run says its line while the claim still names the run that handed it, which would say
-/// INTERRUPTED at 3/10 as well.
-#[test]
-fn a_rerun_takes_the_handed_claim_before_it_can_say_a_final_line() {
-    let mut w = World::new();
-    let earlier = (999, "Thu Oct  9 01:59:00 2026");
-    w.alive.insert(earlier.0, earlier.1.into());
-    w.ancestors = vec![998, earlier.0, 1];
-    let claim = w.release_dir().join(RUNNING_FILE);
-    std::fs::create_dir_all(w.release_dir()).unwrap();
-    std::fs::write(
-        &claim,
-        format!(
-            "pid {}\nstarted {}\nlogs /l\nhanded\n",
-            earlier.0, earlier.1
-        ),
-    )
-    .unwrap();
-    w.signal = Some(2);
-    let (code, last) = w.run(mac());
-    assert!(
-        code == 130 && last.starts_with("INTERRUPTED at 1/10 checks (by SIGINT)"),
-        "{code} {last}"
-    );
-    let said_with = w.claim_at_interrupted.clone().unwrap_or_default();
-    assert!(
-        said_with.starts_with(&format!("pid {}\n", w.pid)),
-        "the re-run's line was said with the claim its own: {said_with:?}"
-    );
-    assert!(!claim.exists(), "and its end removed the claim");
-}
-
 #[test]
 fn a_judge_that_cannot_answer_stops_at_minute_one() {
     let mut w = World::new();
@@ -3987,7 +3899,7 @@ fn an_interrupt_ends_the_run_in_one_line_and_it_resumes() {
                 w.signal_at = Some("move");
             },
             "INTERRUPTED at 3/10 commit (by SIGTERM)",
-            "reexec",
+            "exec-cutter",
         ),
     ];
     for (setup, line, never) in cases {
@@ -5198,9 +5110,9 @@ fn relative_path_flags_are_anchored_once_where_the_release_started() {
         anchored.engine,
         Some(root.path().join("publication").canonicalize().unwrap())
     );
-    // The re-run is handed no `--engine`: its engine is the release's own, handed it as
+    // The exec is handed no `--engine`: its engine is the release's own, handed it as
     // PUBLICATION_ENGINE, which an older cutter would otherwise run in place of.
-    let again = anchored.rerun_args(args);
+    let again = anchored.exec_args(args);
     let want: Vec<std::ffi::OsString> = vec![
         "release".into(),
         "--release-credentials".into(),
@@ -5211,11 +5123,11 @@ fn relative_path_flags_are_anchored_once_where_the_release_started() {
     assert_eq!(again, want);
 }
 
-/// The re-run as R's own cutter is handed no `--fix`: it resumes the head the journal names,
-/// whose hops this run made, and every other flag is passed on. NEGATIVE CONTROL: keep `--fix`
-/// and its commits in `rerun_args`, and they reach the re-run.
+/// The cutter exec'd at R receives no `--fix`: it resumes the head the journal names, whose hops
+/// the preceding image made, and every other flag is passed on. NEGATIVE CONTROL: keep `--fix`
+/// and its commits in `exec_args`, and they reach the new image.
 #[test]
-fn the_rerun_is_handed_no_fix_and_resumes_the_journaled_head() {
+fn the_execed_cutter_drops_fix_and_resumes_the_journaled_head() {
     let args = [
         "release",
         "--fix",
@@ -5226,7 +5138,7 @@ fn the_rerun_is_handed_no_fix_and_resumes_the_journaled_head() {
         N2,
         "--verbose",
     ];
-    let again = mac().rerun_args(args.iter().map(Into::into).collect());
+    let again = mac().exec_args(args.iter().map(Into::into).collect());
     let want: Vec<std::ffi::OsString> = ["release", "--mac-only", "--verbose"]
         .iter()
         .map(Into::into)
@@ -5480,9 +5392,9 @@ fn a_killed_run_that_failed_a_test_is_refused_never_resumed() {
     }
 }
 
-/// STEP 6 AS AN AGENT RUNS IT: the real backend runs the release's own `targo` —
-/// `<prover>/targo --unverified run -q -p aterm-verify -- release --events <file> --app <app>`
-/// — in the clone (a resume names its missing `--checks` and its `--passed-binaries`, and
+/// STEP 6 AS AN AGENT RUNS IT: the real backend runs R's recorded, content-proved
+/// `aterm-verify` copy directly as `release --events <file> --app <app>` in the clone (a resume
+/// names its missing `--checks` and its `--passed-binaries`, and
 /// `--app` only when it runs measure), and only a run from a clone at R's tree and clean, before
 /// and after, under one seal, keeps one record per check its events file says finished, a FAIL
 /// included, never what its output says; a moved clone or a changed seal keeps nothing, its
@@ -5521,10 +5433,13 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
     let said = dir.path().join("said");
     let mode = dir.path().join("mode");
     let events = dir.path().join("events");
+    let verify_source = dir.path().join("aterm-verify");
     std::fs::write(
-        bin.join("targo"),
+        &verify_source,
         format!(
-            "#!/bin/sh\necho \"$PWD $*\" > '{said}'\nout=; prev=\nfor a in \"$@\"; do \
+            "#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = --version ]; then \
+             echo 'aterm-verify tool 1'; exit 0; fi\necho \"$PWD $*\" > '{said}'\n\
+             out=; prev=\nfor a in \"$@\"; do \
              [ \"$prev\" = --events ] && out=$a; prev=$a; done\ncase \"$(cat '{mode}')\" in\n  \
              dirty) echo stray > stray.txt ;;\n  move) git checkout -q --detach {other} ;;\nesac\n\
              cat '{events}' >> \"$out\"\necho '{decoy}'\nexit \"$(cat '{code}')\"\n",
@@ -5537,7 +5452,18 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
         ),
     )
     .unwrap();
-    std::fs::set_permissions(bin.join("targo"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&verify_source, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let cutter_source = dir.path().join("aterm-release");
+    std::fs::write(
+        &cutter_source,
+        "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = --version ] || exit 64\n\
+         echo 'aterm-release tool 1'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&cutter_source, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let release = crate::release::release_dir(&git).unwrap();
+    let tools = crate::release_tools::stage(&release, &r, &cutter_source, &verify_source).unwrap();
+    crate::release_tools::publish(&release, &tools).unwrap();
     let prover = Prover { bin, ..prover() };
     let artifact = Artifact {
         key: "k".into(),
@@ -5677,7 +5603,7 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
     assert_eq!(
         said_now.trim(),
         format!(
-            "{} --unverified run -q -p aterm-verify -- release --tree --checks lint,test \
+            "{} release --tree --checks lint,test \
              --passed-binaries {passed} --events {events_file}",
             repo_seen.display(),
         ),
@@ -5719,7 +5645,7 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
     assert_eq!(
         said_now.trim(),
         format!(
-            "{} --unverified run -q -p aterm-verify -- release --bundle --events {bundle_events} \
+            "{} release --bundle --events {bundle_events} \
              --app {}",
             repo_seen.display(),
             artifact.app.display()

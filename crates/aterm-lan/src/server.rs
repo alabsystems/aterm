@@ -225,7 +225,7 @@ impl Drop for Live<'_> {
 
 /// How long a socket already at the path may take to accept the probe that asks whether a broker
 /// serves it: a hang detector, as a live broker accepts at once and a stale socket refuses.
-const PROBE_HANG: Duration = Duration::from_secs(10);
+const PROBE_HANG: Duration = Duration::from_secs(60);
 
 /// Make `socket`'s folder (root's, 0755, when this is root) and clear a stale socket there (one
 /// nothing accepts on): a socket a broker still serves is left to it.
@@ -234,6 +234,10 @@ const PROBE_HANG: Duration = Duration::from_secs(10);
 /// `AddrInUse` for a socket a broker serves, `AlreadyExists` for something there that is no
 /// socket, or the folder's, the probe's or the removal's error.
 pub(crate) fn prepare(socket: &Path) -> io::Result<()> {
+    prepare_at(socket, Instant::now())
+}
+
+pub(crate) fn prepare_at(socket: &Path, started: Instant) -> io::Result<()> {
     let dir = socket
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "a socket with no folder"))?;
@@ -258,7 +262,8 @@ pub(crate) fn prepare(socket: &Path) -> io::Result<()> {
     }
     match std::fs::symlink_metadata(socket) {
         Ok(meta) if meta.file_type().is_socket() => {
-            match aterm_uds::connect::until(socket, Instant::now() + PROBE_HANG) {
+            let deadline = started + PROBE_HANG;
+            match aterm_uds::connect::until(socket, deadline) {
                 Ok(_) => Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
                     format!("a broker already serves {}", socket.display()),

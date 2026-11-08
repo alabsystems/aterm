@@ -346,7 +346,7 @@ fn history_json_only_adds_keys() {
         .map(String::as_str)
         .collect();
     let mut want = vec![
-        "ac", "days", "journal", "kind", "label", "lines", "schema", "series", "span",
+        "ac", "backfill", "days", "journal", "kind", "label", "lines", "schema", "series", "span",
     ];
     want.sort_unstable();
     assert_eq!(keys, want);

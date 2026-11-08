@@ -1070,21 +1070,24 @@ impl App {
     ///
     /// A `missing` verdict held while an install was on its way
     /// ([`crate::workstation_setup::Host::c_toolchain_missing_held`]) is dropped once the tools
-    /// are there, and filed once nothing installs them any more (the tab stopped, failed or
-    /// closed, an account that may not install them).
+    /// are there, and filed once absence is confirmed and nothing installs them any more
+    /// (the tab stopped, failed or closed, an account that may not install them). An unread
+    /// presence keeps the verdict pending until a later observation decides it.
     pub(crate) fn settle_missing_tools_exception(&mut self) {
         use crate::toolchain_words::{CToolchain, c_toolchain_entry};
         let installed = || {
             self.workstation_setup
                 .developer_tools_installed
-                .is_some_and(|read| read() == Some(true))
+                .and_then(|read| read())
         };
         if self.workstation_setup.c_toolchain_missing_held {
-            if installed() {
-                self.workstation_setup.c_toolchain_missing_held = false;
-            } else if !self.developer_tools_on_their_way() {
-                self.workstation_setup.c_toolchain_missing_held = false;
-                self.except(&c_toolchain_entry(CToolchain::Missing));
+            match installed() {
+                Some(true) => self.workstation_setup.c_toolchain_missing_held = false,
+                Some(false) if !self.developer_tools_on_their_way() => {
+                    self.workstation_setup.c_toolchain_missing_held = false;
+                    self.except(&c_toolchain_entry(CToolchain::Missing));
+                }
+                Some(false) | None => {}
             }
             return;
         }
@@ -1092,11 +1095,7 @@ impl App {
         if !self.has_unresolved_exception(&missing) {
             return;
         }
-        if self
-            .workstation_setup
-            .developer_tools_installed
-            .is_some_and(|read| read() == Some(true))
-        {
+        if installed() == Some(true) {
             self.except_clear(&missing);
         }
     }

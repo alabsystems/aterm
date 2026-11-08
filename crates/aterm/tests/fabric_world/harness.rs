@@ -92,23 +92,6 @@ pub const DEADLINE: Duration = aterm_spec::wait::MUST_HAPPEN;
 /// (`link_state::a_broker_that_accepts_but_never_acks_is_stalled_no_ack`).
 pub const ACK_WAIT: (&str, Duration) = ("ATERM_LINK_ACK_DEADLINE_MS", DEADLINE);
 
-/// The bound `aterm fabric` puts on each socket its report and one-shot commands open, the
-/// doctor's read of each local instance among them (`ATERM_FABRIC_IO_TIMEOUT_MS`, the
-/// product's 3 s), on `on`'s and `off`'s reads of each instance (the product's 8 s), and on the
-/// listener scan that names the broker's process (the product's 10 s), for a command whose
-/// property is not latency. A world's instance answers on the test's loaded machine, where
-/// `fabric status` can wait past 3 s, and the doctor then refuses (`1 local instance(s) did not
-/// answer`); an `on` whose `fabric attach` waits past 8 s fails its instance step; a scan held
-/// past 10 s names no broker pid. Half of
-/// [`DEADLINE`], so a doctor that does find an instance mute says which one before the
-/// harness's bound on the command ([`output_within`]) ends the test. Set by
-/// [`prepare_gui_environment`] and [`scratch_spawnfd`]; a test of the refusal removes it, so its
-/// doctor has the product's bound.
-pub const FABRIC_IO_WAIT: (&str, Duration) = (
-    "ATERM_FABRIC_IO_TIMEOUT_MS",
-    Duration::from_secs(DEADLINE.as_secs() / 2),
-);
-
 /// How long a test's bridge reads a broker subscription with nothing arriving before it takes
 /// the link for dead: its live read deadline seam (`ATERM_LINK_LIVE_DEADLINE_MS`; astream's
 /// `IDLE_MARK_DEADLINE`, 30 s, in the product) set to the hang detector, beside [`ACK_WAIT`]
@@ -411,7 +394,7 @@ pub fn prepare_gui_environment(cmd: &mut Command) {
 
 /// The bounds every child of a test has in place of the product's ([`prepare_gui_environment`],
 /// [`scratch_spawnfd`]).
-const TEST_WAITS: [(&str, Duration); 4] = [STALE_HORIZON, ACK_WAIT, LIVE_WAIT, FABRIC_IO_WAIT];
+const TEST_WAITS: [(&str, Duration); 3] = [STALE_HORIZON, ACK_WAIT, LIVE_WAIT];
 
 /// The sleep every instance a test starts reads in its hosted harness loops
 /// ([`aterm_types::domain::ENV_DEBUG_HOST_SLEEP`]), set where [`TEST_WAITS`] are: none, a host

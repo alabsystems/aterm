@@ -5,6 +5,7 @@
 
 #[cfg(unix)]
 mod imp {
+    use std::io;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
@@ -14,94 +15,322 @@ mod imp {
     pub const SIGINT: i32 = 2;
     pub const SIGKILL: i32 = 9;
     pub const SIGTERM: i32 = 15;
-    const SIG_IGN: usize = 1;
+    /// Private old-image/new-image signal-mask description. Its value is `v1:<bits>`, where a
+    /// set bit says that HUP, INT or TERM respectively was already blocked before the old image
+    /// blocked all three for exec.
+    pub(crate) const EXEC_MASK_ENV: &str = "ATERM_RELEASE_EXEC_SIGNAL_MASK";
+    const EXEC_SIGNALS: [i32; 3] = [SIGHUP, SIGINT, SIGTERM];
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) const EXEC_PROBE_STAGE_ENV: &str = "ATERM_RELEASE_SIGNAL_EXEC_STAGE";
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) const EXEC_PROBE_REFUSE_ENV: &str = "ATERM_RELEASE_SIGNAL_EXEC_REFUSE";
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) const EXEC_PROBE_PID_ENV: &str = "ATERM_RELEASE_SIGNAL_EXEC_PID";
 
     static SIGNAL: AtomicI32 = AtomicI32::new(0);
     static COUNT: AtomicU32 = AtomicU32::new(0);
-    /// The `SIGHUP`s, `SIGINT`s and `SIGTERM`s caught, each counted apart ([`counts`]).
-    static EACH: [AtomicU32; 3] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
-    /// The signals [`EACH`] counts, in its order.
-    const CAUGHT: [i32; 3] = [SIGHUP, SIGINT, SIGTERM];
+    static EXEC_HANDOFF_INSTALLED: AtomicBool = AtomicBool::new(false);
 
     unsafe extern "C" {
-        fn signal(sig: i32, handler: usize) -> usize;
         fn kill(pid: i32, sig: i32) -> i32;
+        fn sigismember(set: *const libc::sigset_t, sig: i32) -> i32;
     }
 
     extern "C" fn on_signal(sig: i32) {
         let _ = SIGNAL.compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst);
         COUNT.fetch_add(1, Ordering::SeqCst);
-        if let Some(i) = CAUGHT.iter().position(|&c| c == sig) {
-            EACH[i].fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn try_install() -> io::Result<()> {
+        for sig in EXEC_SIGNALS {
+            // SAFETY: a null new action only reads `sig`'s disposition into the live `old`.
+            let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+            if unsafe { libc::sigaction(sig, std::ptr::null(), &raw mut old) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if old.sa_sigaction == libc::SIG_IGN {
+                continue;
+            }
+            // Querying before installing avoids the old signal(SIG_IGN) probe, which could
+            // discard a signal held pending across exec before the handler was in place.
+            // SAFETY: `on_signal` lives for the process, touches only lock-free atomics, and the
+            // native set is initialized before sigaction reads the complete value.
+            let installed = unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+                action.sa_flags = libc::SA_RESTART;
+                if libc::sigemptyset(&raw mut action.sa_mask) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                libc::sigaction(sig, &raw const action, std::ptr::null_mut())
+            };
+            if installed != 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
+        Ok(())
     }
 
     /// Catches `SIGINT`, `SIGTERM`, and `SIGHUP` unless already ignored.
     pub fn install() {
-        let handler = on_signal as extern "C" fn(i32) as usize;
-        for sig in [SIGHUP, SIGINT, SIGTERM] {
-            // SAFETY: `signal` takes an integer and a handler value: SIG_IGN, or
-            // `on_signal`, an `extern "C" fn(i32)` that lives for the whole program and
-            // does only async-signal-safe work (lock-free atomics).
-            unsafe {
-                if signal(sig, SIG_IGN) != SIG_IGN {
-                    signal(sig, handler);
+        let _ = try_install();
+    }
+
+    fn signal_set(signals: impl IntoIterator<Item = i32>) -> io::Result<libc::sigset_t> {
+        // SAFETY: sigemptyset initializes the whole live set, then sigaddset adds only the three
+        // valid signal numbers this module supplies.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            if libc::sigemptyset(&raw mut set) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            for signal in signals {
+                if libc::sigaddset(&raw mut set, signal) != 0 {
+                    return Err(io::Error::last_os_error());
                 }
             }
+            Ok(set)
         }
+    }
+
+    fn member(set: &libc::sigset_t, signal: i32) -> io::Result<bool> {
+        // SAFETY: sigismember reads the initialized set and a valid signal number.
+        match unsafe { sigismember(set, signal) } {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
+    /// The old image's temporary signal block. A failed exec drops it and restores the exact
+    /// calling-thread mask; a successful exec replaces the image, so only the encoded handoff
+    /// can authorize the new image's selective restore.
+    pub struct ExecBlock {
+        previous: libc::sigset_t,
+    }
+
+    impl Drop for ExecBlock {
+        fn drop(&mut self) {
+            // SAFETY: `previous` was written whole by pthread_sigmask for this same thread.
+            unsafe {
+                libc::pthread_sigmask(
+                    libc::SIG_SETMASK,
+                    &raw const self.previous,
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+    }
+
+    /// Arm `command` to inherit the current mask, then block HUP/INT/TERM until it either fails
+    /// and this guard drops or succeeds and the new image calls [`install_exec_handoff`].
+    ///
+    /// # Errors
+    /// The native exec cannot preserve a mask, or a signal-set operation fails.
+    pub fn block_for_exec(command: &mut aterm_uds::spawnfd::Command) -> Result<ExecBlock, String> {
+        command
+            .inherit_exec_signal_mask()
+            .map_err(|error| format!("arm exec signal mask: {error}"))?;
+        let signals = signal_set(EXEC_SIGNALS).map_err(|error| error.to_string())?;
+        // SAFETY: both sets are live; pthread_sigmask writes all of `previous` while atomically
+        // adding the initialized three-signal set to this thread's mask.
+        let mut previous: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::pthread_sigmask(libc::SIG_BLOCK, &raw const signals, &raw mut previous)
+        };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc).to_string());
+        }
+        let block = ExecBlock { previous };
+        let mut bits = 0u8;
+        for (index, signal) in EXEC_SIGNALS.into_iter().enumerate() {
+            if member(&block.previous, signal).map_err(|error| error.to_string())? {
+                bits |= 1 << index;
+            }
+        }
+        command.env(EXEC_MASK_ENV, format!("v1:{bits}"));
+        Ok(block)
+    }
+
+    /// Install this image's handlers while all handoff signals remain blocked, then unblock only
+    /// those the old image newly blocked. A malformed/incomplete handoff restores nothing.
+    ///
+    /// # Errors
+    /// The private description is absent/malformed, the inherited mask is not fully blocked, or
+    /// handler/mask installation fails.
+    pub fn install_exec_handoff() -> Result<(), String> {
+        let encoded = std::env::var_os(EXEC_MASK_ENV);
+        // SAFETY: the frozen cutter calls this at single-threaded startup, before callbacks or
+        // worker threads, and the private value is consumed exactly once.
+        unsafe { std::env::remove_var(EXEC_MASK_ENV) };
+        let encoded = encoded
+            .as_deref()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or("the exec signal-mask handoff is absent or non-UTF-8")?;
+        let raw = encoded
+            .strip_prefix("v1:")
+            .ok_or("the exec signal-mask handoff has an unknown schema")?;
+        if raw.is_empty()
+            || (raw.len() > 1 && raw.starts_with('0'))
+            || !raw.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err("the exec signal-mask handoff has a non-canonical bit set".into());
+        }
+        let bits: u8 = raw
+            .parse()
+            .ok()
+            .filter(|bits| bits & !0b111 == 0)
+            .ok_or("the exec signal-mask handoff names unknown signals")?;
+
+        // SAFETY: a null set reads the whole current mask into `current` without changing it.
+        let mut current: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let rc =
+            unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &raw mut current) };
+        if rc != 0 {
+            return Err(format!(
+                "read inherited signal mask: {}",
+                io::Error::from_raw_os_error(rc)
+            ));
+        }
+        for signal in EXEC_SIGNALS {
+            if !member(&current, signal).map_err(|error| error.to_string())? {
+                return Err("the exec signal-mask handoff arrived with a signal unblocked".into());
+            }
+        }
+
+        try_install().map_err(|error| format!("install exec signal handlers: {error}"))?;
+        let newly_blocked = signal_set(
+            EXEC_SIGNALS
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, signal)| (bits & (1 << index) == 0).then_some(signal)),
+        )
+        .map_err(|error| error.to_string())?;
+        // SAFETY: `newly_blocked` is initialized; this restores only the handoff's additions.
+        let rc = unsafe {
+            libc::pthread_sigmask(
+                libc::SIG_UNBLOCK,
+                &raw const newly_blocked,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(format!(
+                "restore exec signal mask: {}",
+                io::Error::from_raw_os_error(rc)
+            ));
+        }
+        EXEC_HANDOFF_INSTALLED.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Whether this image installed handlers and restored a valid blocked exec handoff.
+    #[must_use]
+    pub fn exec_handoff_installed() -> bool {
+        EXEC_HANDOFF_INSTALLED.load(Ordering::SeqCst)
+    }
+
+    /// Debug-only single-threaded executable probe for the real blocked-signal exec boundary.
+    /// The integration test starts the binary in `actor`; it becomes `observer` in place.
+    #[cfg(any(test, debug_assertions))]
+    pub fn exec_probe_if_asked() -> Option<Result<(), String>> {
+        let stage = std::env::var(EXEC_PROBE_STAGE_ENV).ok()?;
+        let refused = std::env::var_os(EXEC_PROBE_REFUSE_ENV).is_some();
+        let blocked = |signal| -> Result<bool, String> {
+            // SAFETY: a null set reads the current thread's complete mask into `mask`.
+            let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+            let rc =
+                unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &raw mut mask) };
+            if rc != 0 {
+                return Err(io::Error::from_raw_os_error(rc).to_string());
+            }
+            member(&mask, signal).map_err(|error| error.to_string())
+        };
+        let result = (|| -> Result<(), String> {
+            match stage.as_str() {
+                "observer" => {
+                    let same_pid = std::env::var(EXEC_PROBE_PID_ENV)
+                        .map_err(|error| error.to_string())
+                        .and_then(|pid| {
+                            (pid == std::process::id().to_string())
+                                .then_some(())
+                                .ok_or("native exec changed the pid".into())
+                        });
+                    same_pid?;
+                    let restored = install_exec_handoff();
+                    if refused {
+                        if restored.is_ok() {
+                            return Err("a malformed signal handoff was accepted".into());
+                        }
+                        if !blocked(SIGTERM).unwrap_or(false) {
+                            return Err("a refused signal handoff restored TERM".into());
+                        }
+                        println!("signal-exec-refused-malformed-handoff");
+                        Ok(())
+                    } else {
+                        restored?;
+                        if !blocked(SIGHUP)? || blocked(SIGINT)? || blocked(SIGTERM)? {
+                            return Err(
+                                "exec signal restore did not preserve only the old HUP block"
+                                    .into(),
+                            );
+                        }
+                        let bound = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                        while caught().is_none() {
+                            if std::time::Instant::now() >= bound {
+                                return Err("queued TERM was lost across exec".into());
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        if caught() != Some(SIGTERM) {
+                            return Err("the exec handoff caught a signal other than TERM".into());
+                        }
+                        println!("signal-exec-caught-queued-term-after-handler-install");
+                        Ok(())
+                    }
+                }
+                "actor" => {
+                    let hup = signal_set([SIGHUP]).map_err(|error| error.to_string())?;
+                    // SAFETY: `hup` is initialized and changes only this single-threaded startup.
+                    let rc = unsafe {
+                        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const hup, std::ptr::null_mut())
+                    };
+                    if rc != 0 {
+                        return Err(io::Error::from_raw_os_error(rc).to_string());
+                    }
+                    let mut observer = aterm_uds::spawnfd::command(
+                        std::env::current_exe().map_err(|e| e.to_string())?,
+                    );
+                    observer
+                        .env(EXEC_PROBE_STAGE_ENV, "observer")
+                        .env(EXEC_PROBE_PID_ENV, std::process::id().to_string());
+                    if refused {
+                        observer.env(EXEC_PROBE_REFUSE_ENV, "1");
+                    }
+                    let _handoff = block_for_exec(&mut observer)?;
+                    if refused {
+                        observer.env(EXEC_MASK_ENV, "broken");
+                    }
+                    // SAFETY: this is the probe's own live process and TERM is blocked in its only
+                    // thread, so the signal becomes kernel-pending until the observer restores it.
+                    if unsafe { libc::kill(std::process::id().cast_signed(), SIGTERM) } != 0 {
+                        return Err(io::Error::last_os_error().to_string());
+                    }
+                    if caught().is_some() {
+                        return Err("TERM ran before the exec boundary".into());
+                    }
+                    Err(format!("signal-handoff exec returned: {}", observer.exec()))
+                }
+                other => Err(format!("unknown signal exec probe stage {other}")),
+            }
+        })();
+        Some(result)
     }
 
     /// The signal that interrupted the release, if one did.
     pub fn caught() -> Option<i32> {
         let sig = SIGNAL.load(Ordering::SeqCst);
         (sig != 0).then_some(sig)
-    }
-
-    /// The `SIGHUP`s, `SIGINT`s and `SIGTERM`s this process has caught, in that order.
-    pub fn counts() -> [u32; 3] {
-        EACH.each_ref().map(|n| n.load(Ordering::SeqCst))
-    }
-
-    /// What [`wait_passing_on`] sends for each of [`CAUGHT`], in its order: a `SIGINT` as a
-    /// `SIGTERM`. The re-run's `targo` passes a `SIGTERM` or `SIGHUP` on to the cutter it
-    /// started and ignores a `SIGINT` sent to it alone while that cutter runs (store targo
-    /// 15698, measured), so a `SIGINT` passed on as itself would stop no cutter.
-    const PASSED_AS: [i32; 3] = [SIGHUP, SIGTERM, SIGTERM];
-
-    /// Waits for `child`, sending its pid alone each signal `caught` counts (as [`counts`]
-    /// does), one for one, until it ends: every one counted since this process started, so the
-    /// caller starts the child only when it caught none. Each is sent as [`PASSED_AS`] names
-    /// (a `SIGINT` as a `SIGTERM`), and only after a `try_wait` on this thread found the child
-    /// unreaped, so its pid is still its own; each look sends the `SIGHUP`s counted since the
-    /// last, then the `SIGINT`s, then the `SIGTERM`s. For the re-run as R's own cutter: its
-    /// `targo` shares this process's group, so a terminal's signals reach it and its cutter
-    /// already, but one sent to this pid alone (`kill -TERM`, what a second run's refusal names)
-    /// reaches nothing else. That `targo` (store targo 15698, measured) ends on any of the three
-    /// while it builds; while the cutter it started runs, it passes a `SIGTERM` or `SIGHUP` on
-    /// to it.
-    /// # Errors
-    /// The child's status cannot be read.
-    pub fn wait_passing_on(
-        child: &mut aterm_uds::spawnfd::Child,
-        caught: &dyn Fn() -> [u32; 3],
-    ) -> std::io::Result<std::process::ExitStatus> {
-        let pid = i32::try_from(child.id()).ok();
-        let mut passed = [0u32; 3];
-        loop {
-            if let Some(status) = child.try_wait()? {
-                return Ok(status);
-            }
-            let now = caught();
-            for (i, sig) in PASSED_AS.into_iter().enumerate() {
-                while passed[i] < now[i] {
-                    if let Some(pid) = pid {
-                        send(pid, sig);
-                    }
-                    passed[i] += 1;
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
     }
 
     /// Sends `sig` to `pid`.
@@ -116,12 +345,10 @@ mod imp {
     /// signal must be found to kill that group ([`Stop`]). One stop reaches the release along
     /// several paths within milliseconds: a closed terminal's `SIGHUP` or a `kill -TERM -<group>`
     /// reaches the cutter directly and again from the `targo` that started it, which passes a
-    /// `SIGHUP` or `SIGTERM` on to its cutter within a millisecond (store targo 15698, measured),
-    /// and a re-run's cutter a third time through the run waiting on it, which passes each signal
-    /// on at its next 50 ms look ([`wait_passing_on`]). The first send lists every process
-    /// before it sends ([`super::listing`]), and a copy can come while that runs: a signal caught
-    /// before that send ended, or found sooner than this after it, is taken for such a copy; a
-    /// person's second stop comes later.
+    /// `SIGHUP` or `SIGTERM` on to its cutter within a millisecond (store targo 15698, measured).
+    /// The first send lists every process before it sends ([`super::listing`]), and a copy can
+    /// come while that runs: a signal caught before that send ended, or found sooner than this
+    /// after it, is taken for such a copy; a person's second stop comes later.
     pub const ESCALATE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
     /// What a running step's group is sent ([`Stop::next`]).
@@ -337,9 +564,20 @@ mod imp {
 #[cfg(not(unix))]
 mod imp {
     use crate::release::BranchStop;
+    pub(crate) const EXEC_MASK_ENV: &str = "ATERM_RELEASE_EXEC_SIGNAL_MASK";
     pub const SIGINT: i32 = 2;
     pub const SIGTERM: i32 = 15;
     pub fn install() {}
+    #[cfg(any(test, debug_assertions))]
+    pub fn exec_probe_if_asked() -> Option<Result<(), String>> {
+        None
+    }
+    pub fn install_exec_handoff() -> Result<(), String> {
+        Err("native exec signal handoff requires Unix".into())
+    }
+    pub fn exec_handoff_installed() -> bool {
+        false
+    }
     pub fn caught() -> Option<i32> {
         None
     }
@@ -351,15 +589,6 @@ mod imp {
         pub fn enter(_leader: u32) -> Self {
             Self
         }
-    }
-    pub fn counts() -> [u32; 3] {
-        [0, 0, 0]
-    }
-    pub fn wait_passing_on(
-        child: &mut aterm_uds::spawnfd::Child,
-        _caught: &dyn Fn() -> [u32; 3],
-    ) -> std::io::Result<std::process::ExitStatus> {
-        child.wait()
     }
 }
 
@@ -527,6 +756,40 @@ fn stat_proc(stat: &str, pid: i32) -> Option<Proc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A TERM queued after the old image blocks the handoff set stays pending across a real
+    /// native exec, then reaches the new image's handler only after it is installed. HUP, which
+    /// was already blocked, stays blocked. NEGATIVE CONTROL: a corrupted private description is
+    /// refused and restores nothing, leaving the queued TERM blocked until that probe exits.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_queued_signal_survives_exec_and_a_malformed_handoff_restores_nothing() {
+        use std::time::Duration;
+
+        for refused in [true, false] {
+            let mut actor = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("aterm-release"));
+            actor.env(EXEC_PROBE_STAGE_ENV, "actor");
+            if refused {
+                actor.env(EXEC_PROBE_REFUSE_ENV, "1");
+            }
+            let output =
+                aterm_uds::deadline::output_within(&mut actor, Duration::from_secs(60)).unwrap();
+            assert!(
+                output.status.success(),
+                "signal exec actor failed ({:?}): stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let output = String::from_utf8_lossy(&output.stdout);
+            let expected = if refused {
+                "signal-exec-refused-malformed-handoff"
+            } else {
+                "signal-exec-caught-queued-term-after-handler-install"
+            };
+            assert!(output.contains(expected), "missing {expected}: {output}");
+        }
+    }
 
     /// A guard that closed before its worker was scheduled must not read stale signals,
     /// wait, or dispatch to the completed step's former numeric process group.

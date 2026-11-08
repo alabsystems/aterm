@@ -283,7 +283,7 @@ fn record_of<R: Borrow<Record>>(r: &R) -> &Record {
 fn depths(log: &Log) -> BTreeMap<RecordId, usize> {
     // `order` holds each record after its parents.
     let mut depth: BTreeMap<RecordId, usize> = BTreeMap::new();
-    for record in &log.order {
+    for record in log.order.iter() {
         let deepest = record
             .parents()
             .iter()
@@ -571,11 +571,20 @@ impl Store {
     }
 
     fn recover_decoded(mut self, records: Vec<Record>, strict: bool) -> Self {
-        if strict && self.ingest_records(records.clone()).is_ok() {
-            return self;
+        if !(strict && self.ingest_records(records.clone()).is_ok()) {
+            for record in causal(records, |_| false) {
+                let _ = self.insert(record);
+            }
         }
-        for record in causal(records, |_| false) {
-            let _ = self.insert(record);
+        // Holding records one by one leaves the held list up to twice their length, and a
+        // recovered store is often kept as it is for the process's life (`records_cache`), its
+        // clones sharing that list. Where no clone shares it yet, let the spare room go.
+        if let Some(order) = self
+            .log
+            .as_mut()
+            .and_then(|log| std::sync::Arc::get_mut(&mut log.order))
+        {
+            order.shrink_to_fit();
         }
         self
     }
@@ -1271,6 +1280,35 @@ mod tests {
                 "the copy holds the record's bytes again"
             );
         }
+    }
+
+    /// A store recovered from a records stream holds its records in no more room than they take:
+    /// the records cache keeps such a store, and its clones share that room. NEGATIVE CONTROL:
+    /// a recovery that keeps the room its holds grew into holds two records in room for four.
+    #[test]
+    fn a_recovered_store_keeps_no_spare_room_for_its_records() {
+        let (w1, inc1, m1, e1) = entrant(1, "m1");
+        let (_, _, _, e2) = entrant(2, "m2");
+        let genesis = Record::found(&[9; 32], vec![e1], 1_000).expect("genesis");
+        let admit = Log::new(genesis.clone())
+            .expect("log")
+            .draft(
+                &m1,
+                1_001,
+                Body::Admit {
+                    entrant: e2,
+                    evidence: Evidence::Phrase,
+                },
+            )
+            .sign(&w1, inc1)
+            .expect("admit");
+        let mut store = Store::for_vault("team").expect("store");
+        assert!(store.insert(genesis).expect("genesis"));
+        assert!(store.insert(admit).expect("admitted"));
+        let recovered = Store::recover("team", &store.encode()).expect("recovered");
+        let order = &recovered.log.as_ref().expect("a rooted store").order;
+        assert_eq!(order.len(), 2);
+        assert_eq!(order.capacity(), order.len(), "spare room for its records");
     }
 
     /// `log`'s running byte counters, against the sums they replace.

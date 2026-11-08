@@ -221,12 +221,21 @@ impl Echo {
     }
 }
 
+/// Where a row stands in a seamless handoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Carried {
+    /// Posted here, or carried and past the handoff commit.
+    No,
+    /// Re-seeded from the carry and not restated since: its hold and its patience wait for the
+    /// handoff commit, under the [`STALE_HANDOFF`] cap.
+    Seeded,
+    /// Re-seeded, then restated before the handoff commit: its hold runs free of the handoff cap,
+    /// and its patience still waits for the commit.
+    Restated,
+}
+
 /// One unretired message with its timers.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "five independent facts about one row (read, revealed, load words up, load slot reserved, carried), each set on its own clock; a state enum would multiply them"
-)]
 pub struct Live {
     /// The id.
     pub id: MessageId,
@@ -252,8 +261,9 @@ pub struct Live {
     pub stale_at: Option<Instant>,
     /// `reveal_at` (or the post) + `max(hold, OVERFLOW_PATIENCE_MIN)`.
     pub patience_at: Instant,
-    /// Where the patience clock runs from: the reveal (or the post), then the
-    /// last demote; a restated hold changes the span, never this anchor.
+    /// Where the patience clock runs from: the reveal (or the post), then the last
+    /// demote, restart or handoff commit (a carried row's); a restated hold changes
+    /// the span, never this anchor.
     patience_from: Instant,
     /// Details was opened.
     pub seen: bool,
@@ -278,8 +288,8 @@ pub struct Live {
     pub load_slot: Loads,
     /// The fill the bar glides from, and when the glide began.
     pub glide: Option<(u16, Instant)>,
-    /// Re-seeded from the carry and not yet past the handoff commit.
-    carried_pending: bool,
+    /// Where the row stands in a seamless handoff.
+    carried: Carried,
     /// The mark (severity, glyph) the record's Posted line carries.
     logged_mark: (Severity, Glyph),
     /// The wall clock at `posted_at` ([`Live::wall_at`]).
@@ -327,7 +337,7 @@ impl Live {
             load_shown: load.is_some(),
             load_slot: load.map_or(Loads::NONE, |(l, _)| msg.loads.reserved_with(l)),
             glide: None,
-            carried_pending: false,
+            carried: Carried::No,
             wall_anchor: stamp.unix_ms,
             logged_mark: (msg.severity, msg.glyph),
             msg,
@@ -431,8 +441,18 @@ impl Live {
             .saturating_add(u64::try_from(elapsed).unwrap_or(u64::MAX))
     }
 
+    /// A restate reached the row: one seeded from the carry becomes [`Carried::Restated`], and
+    /// the answer is whether it was seeded.
+    fn restated_before_commit(&mut self) -> bool {
+        let seeded = self.carried == Carried::Seeded;
+        if seeded {
+            self.carried = Carried::Restated;
+        }
+        seeded
+    }
+
     fn arm(&mut self, now: Instant) {
-        if self.carried_pending {
+        if self.carried == Carried::Seeded {
             return;
         }
         match self.msg.hold {
@@ -1157,7 +1177,7 @@ impl MessageCenter {
         if let Some(excerpt) = r.excerpt {
             row.msg.excerpt = excerpt;
         }
-        let was_carried = std::mem::take(&mut row.carried_pending);
+        let was_carried = row.restated_before_commit();
         let admitted = r.hold.and_then(|h| {
             let (h, demoted) = admit_restated_hold(&row.msg.need, row.msg.hold, h);
             self.demotions = self.demotions.saturating_add(u32::from(demoted));
@@ -1401,8 +1421,9 @@ impl MessageCenter {
     }
 
     /// Reveal the rows whose grace is over, show the load words that have lasted, retire what is
-    /// due (folds only when `holds`: a handoff freeze suspends them, never staleness or patience),
-    /// end the echoes that are over, and re-rank the queue.
+    /// due (folds only when `holds`: a handoff freeze suspends them, never staleness; a carried
+    /// row spends no patience until [`Self::after_handoff_commit`] restarts it), end the echoes
+    /// that are over, and re-rank the queue.
     pub fn settle(&mut self, now: Instant, holds: bool) -> Settled {
         let before = self.glass_signature();
         let mut revealed = false;
@@ -1435,7 +1456,7 @@ impl MessageCenter {
                 Some(Retired::Folded)
             } else if row.stale_at.is_some_and(|t| now >= t) {
                 Some(Retired::Stale)
-            } else if row.is_queued() && now >= row.patience_at {
+            } else if row.is_queued() && row.carried == Carried::No && now >= row.patience_at {
                 Some(Retired::Unseen)
             } else {
                 None
@@ -1471,7 +1492,7 @@ impl MessageCenter {
             [
                 if holds { l.fold_at } else { None },
                 l.stale_at,
-                l.is_queued().then_some(l.patience_at),
+                (l.is_queued() && l.carried == Carried::No).then_some(l.patience_at),
                 l.reveal_at.filter(|_| !l.revealed),
                 load,
             ]
@@ -2284,23 +2305,18 @@ impl MessageCenter {
         best
     }
 
-    /// Plain data for the successor.
+    /// Plain data for the successor: every revealed row, in the center's own order.
     #[must_use]
     pub fn carried(&self) -> Carry {
         let posted = |l: &Live| self.log.get(l.id).map(|rec| rec.posted_severity);
-        let mut live: Vec<CarriedMessage> = self
-            .on_glass()
-            .map(|l| carried_message(l, true, posted(l)))
-            .collect();
-        live.extend(
-            self.live
-                .iter()
-                .filter(|l| l.revealed && !self.glass.contains(&l.id))
-                .map(|l| carried_message(l, false, posted(l))),
-        );
         Carry {
             next_id: self.log.next_id().raw(),
-            live,
+            live: self
+                .live
+                .iter()
+                .filter(|l| l.revealed)
+                .map(|l| carried_message(l, posted(l)))
+                .collect(),
         }
     }
 
@@ -2386,7 +2402,7 @@ impl MessageCenter {
             entry.wall_anchor = wall.unix_ms.max(stamp.unix_ms);
             entry.fold_at = None;
             entry.stale_at = Some(at(now, STALE_HANDOFF));
-            entry.carried_pending = true;
+            entry.carried = Carried::Seeded;
             let mut record = LogRecord::from_posted(id, stamp, &entry.msg);
             record.posted_severity = c
                 .posted_severity
@@ -2399,15 +2415,9 @@ impl MessageCenter {
             }
             self.log
                 .show_mark(id, (entry.msg.severity, entry.msg.glyph));
-            if c.on_glass {
-                entry.on_glass_since = Some(now);
-                entry.motion_since = Some(now);
-                self.glass.push(id);
-            }
             self.live.push(entry);
         }
         self.log.raise_to(carry.next_id);
-        self.committed_rows = self.committed_rows.max(self.wanted_rows());
         self.revision += 1;
         self.rebalance(now);
     }
@@ -2442,7 +2452,7 @@ impl MessageCenter {
         let ended: Vec<MessageId> = self
             .live
             .iter()
-            .filter(|row| row.carried_pending)
+            .filter(|row| row.carried == Carried::Seeded)
             .filter(|row| record(row).is_some_and(|rec| rec.retired().is_some_and(ended_there)))
             .map(|row| row.id)
             .collect();
@@ -2470,10 +2480,19 @@ impl MessageCenter {
         gone
     }
 
-    /// The handoff committed.
+    /// The handoff committed: each carried row's patience starts now, restated or not. A row not
+    /// restated since the seed is stilled, loses the handoff cap, and arms its own hold where it
+    /// is live or already on the glass; a restated one keeps what its restate set.
     pub fn after_handoff_commit(&mut self, now: Instant) {
         for row in &mut self.live {
-            if !std::mem::take(&mut row.carried_pending) {
+            let seeded = match std::mem::replace(&mut row.carried, Carried::No) {
+                Carried::No => continue,
+                Carried::Seeded => true,
+                Carried::Restated => false,
+            };
+            row.patience_from = now;
+            row.patience_at = at(now, row.hold_span().max(OVERFLOW_PATIENCE_MIN));
+            if !seeded {
                 continue;
             }
             if let Some(meter) = row.msg.meter.as_mut() {
@@ -3473,7 +3492,7 @@ fn quit_reading(row: &Live) -> Option<String> {
     Some(format!("{}% when aterm quit", fill.min(1000) / 10))
 }
 
-fn carried_message(l: &Live, on_glass: bool, posted_severity: Option<Severity>) -> CarriedMessage {
+fn carried_message(l: &Live, posted_severity: Option<Severity>) -> CarriedMessage {
     CarriedMessage {
         id: l.id.raw(),
         unix_ms: l.stamp.unix_ms,
@@ -3496,7 +3515,6 @@ fn carried_message(l: &Live, on_glass: bool, posted_severity: Option<Severity>) 
             .as_ref()
             .map_or_else(String::new, |m| m.stats.clone()),
         busy: l.msg.meter.as_ref().is_some_and(|m| m.busy),
-        on_glass,
         excerpt: l.msg.excerpt,
         finished: l.msg.finished.clone(),
         retrospective: l.msg.retrospective,
@@ -4786,7 +4804,10 @@ mod tests {
         assert!(carry.live.iter().all(|m| m.busy), "{:?}", carry.live);
         let mut successor = fresh(now);
         successor.seed_carried(&carry, stamp(0), now);
-        assert!(successor.busy_on_glass());
+        assert!(
+            successor.live_rows().all(Live::is_busy),
+            "busy crosses on every carried row"
+        );
         assert!(successor.restate(
             flow,
             Restatement {
@@ -4856,23 +4877,12 @@ mod tests {
         parent.commit_rows(now + ms(1), 2);
         let carry = parent.carried();
         assert_eq!(carry.next_id, 5);
-        assert_eq!(carry.live.len(), 4);
         assert_eq!(
-            carry
-                .live
-                .iter()
-                .map(|m| (m.id, m.on_glass))
-                .collect::<Vec<_>>(),
-            vec![
-                (live.raw(), true),
-                (held.raw(), false),
-                (standing.raw(), false),
-                (queued.raw(), false),
-            ],
-            "the live progress row keeps the one slot at 2 rows (ruling 259); \
-             the Warn waits behind the overflow row"
+            carry.live.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![held.raw(), live.raw(), standing.raw(), queued.raw()],
+            "every revealed row, glass or queue, in the parent's own order"
         );
-        let carried_live = &carry.live[0];
+        let carried_live = &carry.live[1];
         assert_eq!(carried_live.hold, "live:30");
         assert_eq!(carried_live.actions, vec!["open-settings:/packages"]);
         assert_eq!(carried_live.fill_permille, Some(420));
@@ -4904,30 +4914,30 @@ mod tests {
         }
         assert_eq!(
             child.committed_rows(),
-            3,
-            "seeded so the rows are there before the first window is sized"
+            0,
+            "the seed takes no row: only the host's commit does"
         );
+        assert!(
+            glass_ids(&child).is_empty(),
+            "every carried row waits queued"
+        );
+        assert_eq!(
+            child.carried(),
+            carry,
+            "the successor hands on what it took"
+        );
+        child.commit_rows(later, 3);
         assert_eq!(
             glass_ids(&child),
             vec![queued, live],
-            "the carried glass row keeps its slot; the second slot takes the best queued row; the third is the overflow row"
+            "a host's commit places them: the progress row and the best queued row; the third \
+             is the overflow row"
         );
-        let said = |c: &Carry| {
-            let mut v: Vec<_> = c
-                .live
-                .iter()
-                .map(|m| {
-                    let m = CarriedMessage {
-                        on_glass: false,
-                        ..m.clone()
-                    };
-                    (m.id, m)
-                })
-                .collect();
-            v.sort_by_key(|(id, _)| *id);
-            (c.next_id, v)
-        };
-        assert_eq!(said(&child.carried()), said(&carry));
+        assert_eq!(
+            child.live(live).unwrap().stale_at,
+            Some(later + STALE_HANDOFF),
+            "on the glass, its hold still waits for the handoff commit"
+        );
         let mut junk = carry.clone();
         junk.live[1].severity = "loud".into();
         junk.live[2].tag = "Not A Tag".into();
@@ -4937,14 +4947,6 @@ mod tests {
         c.seed_carried(&junk, stamp(5_000), later);
         assert_eq!(c.live_rows().count(), 1);
         assert_eq!(c.log().next_id().raw(), 900);
-        let mut claims = carry.clone();
-        for m in &mut claims.live {
-            m.on_glass = true;
-        }
-        let mut c = fresh(later);
-        c.seed_carried(&claims, stamp(5_000), later);
-        assert!(claims.live.len() > usize::from(MAX_ROWS));
-        assert!(glass_ids(&c).len() <= usize::from(MAX_ROWS));
         let commit = later + Duration::from_secs(20);
         assert!(child.settle(commit, true).retired.is_empty());
         let restated = later + Duration::from_secs(1);
@@ -4978,7 +4980,162 @@ mod tests {
         for id in [held, standing] {
             let row = child.live(id).unwrap();
             assert_eq!((row.stale_at, row.fold_at), (None, None), "{id}");
+            assert_eq!(
+                row.patience_at,
+                commit + row.hold_span().max(OVERFLOW_PATIENCE_MIN),
+                "{id}: its patience runs from the commit"
+            );
         }
+    }
+
+    #[test]
+    fn a_carried_row_waits_out_a_two_minute_freeze_with_its_deadline_ahead() {
+        let now = t0();
+        let mut parent = fresh(now);
+        let ids: Vec<MessageId> = (0..4)
+            .map(|i| {
+                parent
+                    .post(
+                        Message::new(tags::SYSTEM, Severity::Info, format!("row {i}")),
+                        stamp(i),
+                        now,
+                    )
+                    .id
+            })
+            .collect();
+        let carry = parent.carried();
+        let mut child = fresh(now);
+        child.seed_carried(&carry, stamp(0), now);
+        let freeze = Duration::from_mins(2);
+        assert!(
+            OVERFLOW_PATIENCE_MIN < freeze && freeze < STALE_HANDOFF,
+            "PRECONDITION: the freeze outlasts the patience, not the handoff cap"
+        );
+        let mut t = now;
+        while t <= now + freeze {
+            let settled = child.settle(t, false);
+            assert!(
+                settled.retired.is_empty(),
+                "{:?} into the freeze: {:?}",
+                t - now,
+                settled.retired
+            );
+            let due = child.deadline(false).expect("the handoff cap is pending");
+            assert!(
+                due > t,
+                "{:?} into the freeze: a wake due {:?} ago would spin the event loop",
+                t - now,
+                t.saturating_duration_since(due)
+            );
+            t += Duration::from_secs(1);
+        }
+        assert!(ids.iter().all(|id| child.live(*id).is_some()));
+        let commit = now + freeze;
+        child.after_handoff_commit(commit);
+        let patience = child
+            .live(ids[0])
+            .unwrap()
+            .hold_span()
+            .max(OVERFLOW_PATIENCE_MIN);
+        assert_eq!(child.deadline(true), Some(commit + patience));
+        assert!(
+            child
+                .settle(commit + patience - ms(1), true)
+                .retired
+                .is_empty(),
+            "a whole patience from the commit"
+        );
+        let retired = child.settle(commit + patience, true).retired;
+        assert_eq!(
+            retired.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            ids,
+            "then each, unseen"
+        );
+        assert!(retired.iter().all(|(_, how)| *how == Retired::Unseen));
+    }
+
+    #[test]
+    fn a_carried_row_restated_in_the_freeze_spends_no_patience_until_the_commit() {
+        let now = t0();
+        let mut parent = fresh(now);
+        let ids: Vec<MessageId> = (0..2)
+            .map(|i| {
+                parent
+                    .post(
+                        Message::new(tags::SYSTEM, Severity::Info, format!("row {i}")),
+                        stamp(i),
+                        now,
+                    )
+                    .id
+            })
+            .collect();
+        let mut child = fresh(now);
+        child.seed_carried(&parent.carried(), stamp(0), now);
+        let freeze = Duration::from_mins(2);
+        assert!(child.settle(now, false).retired.is_empty());
+        let restated = now + Duration::from_secs(1);
+        assert!(child.restate(
+            ids[0],
+            Restatement {
+                title: Some("row 0, restated".into()),
+                ..Restatement::default()
+            },
+            restated
+        ));
+        let row = child.live(ids[0]).unwrap();
+        assert!(
+            row.is_queued() && row.stale_at.is_none(),
+            "PRECONDITION: the restate took the handoff cap from a queued row: {row:?}"
+        );
+        let mut t = restated;
+        while t <= now + freeze {
+            let settled = child.settle(t, false);
+            assert!(
+                settled.retired.is_empty(),
+                "{:?} into the freeze: {:?}",
+                t - now,
+                settled.retired
+            );
+            let due = child
+                .deadline(false)
+                .expect("the unrestated row's handoff cap is pending");
+            assert!(
+                due > t,
+                "{:?} into the freeze: a wake due {:?} ago would spin the event loop",
+                t - now,
+                t.saturating_duration_since(due)
+            );
+            t += Duration::from_secs(1);
+        }
+        let commit = now + freeze;
+        child.after_handoff_commit(commit);
+        let patience = child
+            .live(ids[0])
+            .unwrap()
+            .hold_span()
+            .max(OVERFLOW_PATIENCE_MIN);
+        assert_eq!(
+            child.live(ids[0]).unwrap().patience_at,
+            commit + patience,
+            "the restated row's patience runs from the commit"
+        );
+        assert_eq!(child.deadline(true), Some(commit + patience));
+        assert!(
+            child
+                .settle(commit + patience - ms(1), true)
+                .retired
+                .is_empty(),
+            "a whole patience from the commit"
+        );
+        let mut retired = child.settle(commit + patience, true).retired;
+        retired.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            retired,
+            ids.iter()
+                .map(|id| (*id, Retired::Unseen))
+                .collect::<Vec<_>>(),
+            "then each, restated or not, unseen"
+        );
     }
 
     #[test]

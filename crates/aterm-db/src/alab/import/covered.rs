@@ -17,13 +17,16 @@
 //!
 //! **Coverage is judged per cell** against the registry as the import left it: the replica's
 //! sheets are planned once more, alone, against the written registry ([`judge`]). A cell is
-//! covered when that plan writes nothing for it and finds nothing that keeps it out. A
+//! covered when that plan writes nothing for it and finds nothing that keeps it out; the run's own
+//! source row is no cell of the replica, so a replica a fuller source of the import already wrote
+//! is covered with no source row of its own. A
 //! `Secret` value that is a flag word (a has-password `1`, a none `0`,
 //! [`crate::typed::secret::flag_says`]) is covered when it agrees with whether the registry's
 //! cell is set; any other flag-shaped value (a password under six characters, which the registry
 //! never holds) stays uncovered, so the owner sees it before the replica goes. Every other
 //! finding about a replica cell (it differs, the owner kept another value, it is conflicted,
-//! protected, unmapped, withheld) leaves it uncovered, listed by key and column for the owner.
+//! protected, unmapped, withheld, or a value no registry cell can hold) leaves it uncovered,
+//! listed by key and column for the owner.
 //! So does a record the replica holds and its dump leaves out (a forked writer's, or one waiting
 //! for its parent): it is no cell of the dump, its rows are not in the registry, and it is counted
 //! and listed once as `withheld-operations`, with no key, and bound into the keyed digest.
@@ -46,7 +49,7 @@ const MAX_LISTED: usize = 256;
 /// (`att::secret_digest`), so a replica digest never compares equal to a table digest. Its version
 /// is the judgement's: a record an earlier judge wrote cannot pass a deletion's digest check, so
 /// its replica is imported again first.
-const REPLICA_DIGEST: &[u8] = b"aterm/fleet-db/replica-digest/3\0";
+const REPLICA_DIGEST: &[u8] = b"aterm/fleet-db/replica-digest/4\0";
 
 /// One replica cell the registry does not cover: where, and the finding's word, never a value.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]

@@ -3955,7 +3955,7 @@ fn session_context_email(line: &str) -> Option<String> {
 /// newline), passing longer ones over without keeping more than `line_max` bytes of any; a last
 /// line with no newline is handed over too. Returns how many bytes were read up to and through
 /// the last newline.
-fn each_bounded_line(
+pub(crate) fn each_bounded_line(
     reader: &mut impl BufRead,
     line_max: usize,
     mut each: impl FnMut(&[u8]),

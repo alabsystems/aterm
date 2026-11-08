@@ -24,12 +24,7 @@ pub const BUS_PATH: &str = "/org/freedesktop/DBus";
 pub const DEFAULT_MAX_INCOMING: usize = 1 << 20;
 
 /// How long the handshake may take before [`Connection::handshake`] gives up.
-#[cfg(not(test))]
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(25);
-/// A unit test's default outlasts its one-minute hang detector: a handshake meant to end at its
-/// caller's bound ([`Connection::open_within`]) that waits the default overruns the detector.
-#[cfg(test)]
-pub const HANDSHAKE_TIMEOUT: Duration = aterm_spec::wait::MUST_HAPPEN.saturating_mul(2);
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 const MAX_QUEUED_MESSAGES: usize = 256;
 const MAX_QUEUED_BYTES: usize = 1 << 20;
@@ -156,7 +151,20 @@ impl Connection {
     /// # Errors
     /// [`Error::Auth`], [`Error::Remote`], or [`Error::Timeout`] after [`HANDSHAKE_TIMEOUT`].
     pub fn handshake(stream: CtlStream, uid: u32, expect_guid: Option<&str>) -> Result<Self> {
-        Self::handshake_within(stream, uid, expect_guid, HANDSHAKE_TIMEOUT)
+        Self::handshake_after(stream, uid, expect_guid, Duration::ZERO)
+    }
+
+    fn handshake_after(
+        stream: CtlStream,
+        uid: u32,
+        expect_guid: Option<&str>,
+        elapsed: Duration,
+    ) -> Result<Self> {
+        let remaining = HANDSHAKE_TIMEOUT
+            .checked_sub(elapsed)
+            .filter(|left| !left.is_zero())
+            .ok_or(Error::Timeout)?;
+        Self::handshake_within(stream, uid, expect_guid, remaining)
     }
 
     /// [`Connection::handshake`] bounded by `timeout` instead of [`HANDSHAKE_TIMEOUT`].

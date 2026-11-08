@@ -630,6 +630,12 @@ fn named_prerequisite_leases_preserve_the_command_and_refuse_ambiguous_or_unmana
         named.subject,
         LeaseSubject::NamedPrerequisite(Prerequisite::Lake, 2)
     );
+    let keys = parse_lease_args(&args(&["--tool", "atpkg-keys=7", "--", "sign-release"])).unwrap();
+    assert_eq!(
+        keys.subject,
+        LeaseSubject::NamedPrerequisite(Prerequisite::AtpkgKeys, 7)
+    );
+    assert_eq!(keys.command, ["sign-release"]);
     for bad in [
         &["--tool", "lake=0", "--", "run"][..],
         &["--tool", "lake=oops", "--", "run"],
@@ -14855,7 +14861,7 @@ fn remove_amacs_refuses_naming_the_setting() {
 }
 
 #[test]
-fn the_c_toolchain_marker_files_what_an_install_fixes_and_is_ready_elsewhere() {
+fn the_c_toolchain_marker_reports_only_known_toolchain_state() {
     use crate::prereq::CcVerdict;
     let cc = std::path::PathBuf::from("/usr/bin/cc");
     let said = |body: &str| Some(format!("atpkg: {C_TOOLCHAIN_MARKER}{body}"));
@@ -14876,7 +14882,7 @@ fn the_c_toolchain_marker_files_what_an_install_fixes_and_is_ready_elsewhere() {
     assert_eq!(
         super::c_toolchain_marker(&broken),
         if cfg!(target_os = "macos") {
-            ready.clone()
+            ready
         } else {
             said(C_TOOLCHAIN_BROKEN)
         },
@@ -14887,14 +14893,14 @@ fn the_c_toolchain_marker_files_what_an_install_fixes_and_is_ready_elsewhere() {
             driver: cc.clone(),
             bound: crate::prereq::PROBE_TIMEOUT,
         }),
-        ready
+        None
     );
     assert_eq!(
         super::c_toolchain_marker(&CcVerdict::Unproven {
             driver: cc,
             why: "no temp".into()
         }),
-        ready
+        None
     );
     assert_eq!(super::c_toolchain_marker(&CcVerdict::NotProbed), None);
     assert_eq!(super::human_marker(missing.as_deref().unwrap()), None);

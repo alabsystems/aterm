@@ -33,11 +33,11 @@ pub enum CcVerdict {
         /// How long the probe waited for it ([`CcHost::bound`]).
         bound: Duration,
     },
-    /// The compiler answered, but the build probe could not run — unknown, not broken.
+    /// Discovery or the build probe could not establish compiler state — unknown, not broken.
     Unproven {
-        /// The compiler that answered.
+        /// The compiler or candidate whose state could not be established.
         driver: PathBuf,
-        /// Why the build probe could not run.
+        /// Why discovery or the build probe could not finish.
         why: String,
     },
     /// A target where a `cc` test is the wrong question (Windows: rustc owns MSVC discovery).
@@ -98,7 +98,7 @@ impl CcVerdict {
                 bound.as_secs()
             ),
             Self::Unproven { driver, why } => format!(
-                "the C compiler at {} answers, but the build probe could not run ({why}) — \
+                "the C toolchain at {} could not be verified ({why}) — \
                  whether Rust builds can compile C here is unknown",
                 driver.display()
             ),
@@ -200,16 +200,37 @@ impl CcHost {
     }
 
     /// The developer directory Apple's tools use, looking through aterm's temporary shim.
-    fn developer_dir(&self) -> PathBuf {
-        self.developer_override()
-            .map(Path::to_path_buf)
-            .or_else(|| std::fs::read_link(&self.xcode_select_link).ok())
-            .or_else(|| {
-                self.xcode_developer_dir
-                    .clone()
-                    .filter(|dir| holds_clang(dir))
-            })
-            .unwrap_or_else(|| self.default_developer_dir.clone())
+    /// Unread selection or compiler state is not permission to choose a fallback. Relative
+    /// link targets resolve beside the selection link, as the filesystem resolves them.
+    fn developer_dir(&self) -> Result<PathBuf, String> {
+        if let Some(dir) = self.developer_override() {
+            return Ok(dir.to_path_buf());
+        }
+        match std::fs::read_link(&self.xcode_select_link) {
+            Ok(dir) => {
+                return Ok(if dir.is_absolute() {
+                    dir
+                } else {
+                    self.xcode_select_link
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(dir)
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not read {}: {error}",
+                    self.xcode_select_link.display()
+                ));
+            }
+        }
+        if let Some(dir) = &self.xcode_developer_dir
+            && holds_clang(dir)?
+        {
+            return Ok(dir.clone());
+        }
+        Ok(self.default_developer_dir.clone())
     }
 
     fn sdkroot(&self) -> Option<&Path> {
@@ -313,11 +334,11 @@ pub fn probe_cached(path_var: Option<&OsStr>, host: &CcHost, cache: Option<&CcCa
 /// the Command Line Tools receipt's identity and digest, the SDK a build would fall back to and the `PATH`
 /// the build sees, its minimum macOS deployment target, and the inherited environment's digest
 /// when project configuration is inherited. `None` when the compiler cannot
-/// be read or an explicit SDK or developer directory is used: changes within its SDK have
-/// no Apple install receipt to retire a cached success. The policy domain retires verdicts
-/// made by weaker output, SDK custody or native configuration identity checks. Native PATH
-/// and deployment-target bytes are encoded exactly; unrepresentable SDK/developer paths
-/// disable caching rather than supply a lossy identity.
+/// be read, discovery is unreadable, or an explicit SDK or developer directory is used:
+/// changes within its SDK have no Apple install receipt to retire a cached success. The policy
+/// domain retires verdicts made by weaker discovery, output, SDK custody or native configuration
+/// identity checks. Native PATH and deployment-target bytes are encoded exactly;
+/// unrepresentable SDK/developer paths disable caching rather than supply a lossy identity.
 fn cc_key(
     located: &Located,
     path_var: Option<&OsStr>,
@@ -331,7 +352,7 @@ fn cc_key(
         Located::Plain(cc) => ("plain", cc),
         Located::Shim(cc) => ("shim", cc),
     };
-    let developer_dir = host.developer_dir();
+    let developer_dir = host.developer_dir().ok()?;
     let receipt = receipt_key(&cache.receipt)?;
     let sdk = match std::fs::canonicalize(developer_dir.join("SDKs/MacOSX.sdk")) {
         Ok(sdk) => sdk.to_str()?.to_owned(),
@@ -351,7 +372,7 @@ fn cc_key(
             .unwrap_or_default()
     }
     crate::probe_cache::key([
-        Some("fresh-executable-link-v6".to_owned()),
+        Some("fresh-executable-link-v7".to_owned()),
         Some(kind.to_owned()),
         crate::probe_cache::identity(cc),
         Some(developer_dir.to_str()?.to_owned()),
@@ -444,10 +465,18 @@ fn probe_located(located: Located, path_var: Option<&OsStr>, host: &CcHost) -> C
     }
 }
 
-/// Whether a C toolchain is installed here, read without running anything.
+/// Whether a C toolchain is installed here, read without running anything. `None` on Windows
+/// or when discovery cannot establish presence or absence.
 #[must_use]
 pub fn installed_with(path_var: Option<&OsStr>, host: &CcHost) -> Option<bool> {
-    (!cfg!(windows)).then(|| locate(path_var, host).is_ok())
+    if cfg!(windows) {
+        return None;
+    }
+    match locate(path_var, host) {
+        Ok(_) => Some(true),
+        Err(CcVerdict::NoDriver | CcVerdict::NoDeveloperDir) => Some(false),
+        Err(_) => None,
+    }
 }
 
 /// The `cc` a build would run, as [`locate`] finds it.
@@ -461,7 +490,7 @@ enum Located {
 /// The read-only half of [`probe_with`]: the first `cc` on `path_var`, and for the install
 /// shim whether the active developer directory (the override, else the link, else Xcode or
 /// the tools) holds a `clang`; [`CcVerdict::NoDriver`] or [`CcVerdict::NoDeveloperDir`] when it stops
-/// there. Nothing is spawned.
+/// there on absence, or [`CcVerdict::Unproven`] when discovery is unreadable. Nothing is spawned.
 fn locate(path_var: Option<&OsStr>, host: &CcHost) -> Result<Located, CcVerdict> {
     use aterm_types::clt_shim;
     let own = clt_shim::shim_dir();
@@ -484,15 +513,29 @@ fn locate_without_setup_shim(
     host: &CcHost,
     setup_shims: &[Option<&Path>],
 ) -> Result<Located, CcVerdict> {
-    let Some(cc) = path_var.and_then(|path| {
-        std::env::split_paths(path)
-            .filter(|dir| dir.is_absolute())
-            .filter(|dir| !setup_shims.contains(&Some(dir.as_path())))
-            .map(|dir| dir.join("cc"))
-            .find(|candidate| is_executable(candidate))
-    }) else {
-        return Err(CcVerdict::NoDriver);
-    };
+    let mut found = None;
+    for dir in path_var
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .filter(|dir| dir.is_absolute())
+        .filter(|dir| !setup_shims.contains(&Some(dir.as_path())))
+    {
+        let candidate = dir.join("cc");
+        match is_executable(&candidate) {
+            Ok(true) => {
+                found = Some(candidate);
+                break;
+            }
+            Ok(false) => {}
+            Err(why) => {
+                return Err(CcVerdict::Unproven {
+                    driver: candidate,
+                    why,
+                });
+            }
+        }
+    }
+    let cc = found.ok_or(CcVerdict::NoDriver)?;
     let is_shim = host
         .shim_dir
         .as_deref()
@@ -500,8 +543,12 @@ fn locate_without_setup_shim(
     if !is_shim {
         return Ok(Located::Plain(cc));
     }
-    let developer_dir = host.developer_dir();
-    if holds_clang(&developer_dir) {
+    let unread = |why| CcVerdict::Unproven {
+        driver: cc.clone(),
+        why,
+    };
+    let developer_dir = host.developer_dir().map_err(unread)?;
+    if holds_clang(&developer_dir).map_err(unread)? {
         Ok(Located::Shim(cc))
     } else {
         Err(CcVerdict::NoDeveloperDir)
@@ -518,10 +565,13 @@ fn clang_paths(developer: &Path) -> [PathBuf; 2] {
     ]
 }
 
-fn holds_clang(developer: &Path) -> bool {
-    clang_paths(developer)
-        .iter()
-        .any(|clang| is_executable(clang))
+fn holds_clang(developer: &Path) -> Result<bool, String> {
+    for clang in clang_paths(developer) {
+        if is_executable(&clang)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The build probe's program: the include proves the headers (the SDK on macOS, libc's on
@@ -531,7 +581,8 @@ const PROBE_SOURCE: &str = "#include <stdio.h>\nint main(void) { return 0; }\n";
 /// Make `cc` compile and link [`PROBE_SOURCE`] in a private directory under
 /// `host.tmp_root`, each attempt within `host.bound`: `Ready { driver: resolved }` only when it exits 0
 /// and wrote a non-empty executable program into this attempt's fresh output namespace.
-/// The program is never run. Its private directory's guard attempts cleanup on return.
+/// An inspection error other than absence leaves that result unproven. The program is never
+/// run. Its private directory's guard attempts cleanup on return.
 fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &CcHost) -> CcVerdict {
     let scratch = match aterm_tempfile::Builder::new()
         .prefix("atpkg-cc-")
@@ -601,7 +652,15 @@ fn build_probe_in(
             .as_deref()
             .is_some_and(|shim| cc.parent() == Some(shim))
     {
-        let developer_dir = host.developer_dir();
+        let developer_dir = match host.developer_dir() {
+            Ok(dir) => dir,
+            Err(why) => {
+                return CcVerdict::Unproven {
+                    driver: resolved,
+                    why,
+                };
+            }
+        };
         let sdk = developer_dir.join("SDKs/MacOSX.sdk");
         if sdk.is_dir() {
             let fresh = dir.join("sdk-fallback");
@@ -624,8 +683,16 @@ fn build_probe_in(
             bound: host.bound,
         },
         Some(out) if out.status.success() => {
-            let wrote = std::fs::symlink_metadata(&program)
-                .is_ok_and(|metadata| is_executable_file(&metadata));
+            let wrote = match std::fs::symlink_metadata(&program) {
+                Ok(metadata) => is_executable_file(&metadata),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => {
+                    return CcVerdict::Unproven {
+                        driver: resolved,
+                        why: format!("could not inspect {}: {error}", program.display()),
+                    };
+                }
+            };
             if wrote {
                 CcVerdict::Ready { driver: resolved }
             } else {
@@ -690,8 +757,19 @@ fn ask(bin: &Path, driver: &Path, args: &[&str], host: &CcHost) -> CcVerdict {
 }
 
 /// A nonempty regular file this user may execute (never a directory named `cc`).
-fn is_executable(path: &Path) -> bool {
-    std::fs::metadata(path).is_ok_and(|metadata| is_executable_file(&metadata))
+fn is_executable(path: &Path) -> Result<bool, String> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(is_executable_file(&metadata)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(format!("could not inspect {}: {error}", path.display())),
+    }
 }
 
 fn is_executable_file(meta: &std::fs::Metadata) -> bool {
@@ -1030,7 +1108,8 @@ mod tests {
 
         let xcode = root.join("Xcode.app/Contents/Developer");
         std::fs::create_dir_all(&xcode).unwrap();
-        std::os::unix::fs::symlink(&xcode, &host.xcode_select_link).unwrap();
+        std::os::unix::fs::symlink(xcode.strip_prefix(&root).unwrap(), &host.xcode_select_link)
+            .unwrap();
         assert_eq!(
             probe_with(Some(shim.as_os_str()), &host),
             CcVerdict::NoDeveloperDir
@@ -1072,6 +1151,96 @@ mod tests {
         assert_eq!(installed_with(Some(shim.as_os_str()), &host), Some(true));
         assert!(!ran.exists(), "nothing was spawned");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unreadable_discovery_is_unknown_and_can_recover_without_installing() {
+        let mut observations = Vec::new();
+        for kind in ["path", "clang", "xcode", "selection"] {
+            let root = scratch("unread-discovery");
+            let bin = root.join("bin");
+            let cc = bin.join("cc");
+            let ran = root.join("program-ran");
+            building_cc(&cc, &ran);
+            script(&bin.join("xcrun"), &format!("echo '{}'", cc.display()));
+            let developer = root.join("developer");
+            script(&developer.join("usr/bin/clang"), "exit 0");
+            let fault = root.join("unread");
+            std::os::unix::fs::symlink(&fault, &fault).unwrap();
+            let mut host = CcHost {
+                default_developer_dir: developer.clone(),
+                ..plain_host(&root)
+            };
+            let path = if kind == "path" {
+                fault.clone()
+            } else {
+                host.shim_dir = Some(bin.clone());
+                match kind {
+                    "clang" => host.default_developer_dir = fault.clone(),
+                    "xcode" => host.xcode_developer_dir = Some(fault.clone()),
+                    "selection" => host.xcode_select_link = fault.join("selection"),
+                    _ => unreachable!(),
+                }
+                bin.clone()
+            };
+            observations.push((
+                kind,
+                probe_with(Some(path.as_os_str()), &host),
+                installed_with(Some(path.as_os_str()), &host),
+            ));
+
+            std::fs::remove_file(&fault).unwrap();
+            if kind == "selection" {
+                std::fs::create_dir(&fault).unwrap();
+                std::os::unix::fs::symlink(&developer, fault.join("selection")).unwrap();
+            } else {
+                std::os::unix::fs::symlink(if kind == "path" { &bin } else { &developer }, &fault)
+                    .unwrap();
+            }
+            assert_eq!(
+                installed_with(Some(path.as_os_str()), &host),
+                Some(true),
+                "{kind}"
+            );
+            assert!(
+                matches!(
+                    probe_with(Some(path.as_os_str()), &host),
+                    CcVerdict::Ready { .. }
+                ),
+                "{kind}"
+            );
+            let cache = CcCache {
+                file: root.join("state/cc"),
+                receipt: root.join("no-receipt"),
+            };
+            assert!(matches!(
+                probe_cached(Some(path.as_os_str()), &host, Some(&cache)),
+                CcVerdict::Ready { .. }
+            ));
+            assert!(cache.file.is_file(), "{kind}: the success was kept");
+            if kind == "selection" {
+                std::fs::remove_dir_all(&fault).unwrap();
+            } else {
+                std::fs::remove_file(&fault).unwrap();
+            }
+            std::os::unix::fs::symlink(&fault, &fault).unwrap();
+            assert!(
+                matches!(
+                    probe_cached(Some(path.as_os_str()), &host, Some(&cache)),
+                    CcVerdict::Unproven { .. }
+                ),
+                "{kind}: a warm cache cannot hide unread discovery"
+            );
+            assert!(!ran.exists(), "the probe's program is never executed");
+        }
+        assert!(
+            observations.iter().all(|(_, verdict, installed)| {
+                matches!(verdict, CcVerdict::Unproven { .. })
+                    && !verdict.blocks_builds()
+                    && installed.is_none()
+            }),
+            "{observations:#?}"
+        );
     }
 
     /// A compiler that answers `--version` but cannot build is Broken, with its first stderr
@@ -1202,6 +1371,38 @@ mod tests {
         );
         assert!(!verdict.blocks_builds());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unreadable_output_metadata_is_unproven_and_a_fresh_attempt_can_recover() {
+        let root = scratch("unread-output");
+        let host = plain_host(&root);
+        let cc = root.join("bin/cc");
+        let disrupt = cc.with_file_name("cc.disrupt");
+        script(
+            &cc,
+            "printf x > \"$2\"; /bin/chmod +x \"$2\"\nif [ -f \"$0.disrupt\" ]; then\nprobe_dir=$(/bin/pwd)\n/bin/mv \"$probe_dir\" \"$probe_dir.saved\" || exit 2\n/bin/ln -s \"$probe_dir\" \"$probe_dir\"\nfi",
+        );
+        std::fs::write(&disrupt, b"disrupt").unwrap();
+        let dir = root.join("first");
+        std::fs::create_dir(&dir).unwrap();
+        let verdict = build_probe_in(&cc, cc.clone(), None, &host, &dir);
+        assert!(root.join("first.saved/probe.out").is_file());
+        let error = std::fs::symlink_metadata(dir.join("probe.out")).unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            matches!(&verdict, CcVerdict::Unproven { .. }),
+            "{verdict:?}"
+        );
+        assert!(!verdict.blocks_builds());
+
+        std::fs::remove_file(disrupt).unwrap();
+        let next = root.join("next");
+        std::fs::create_dir(&next).unwrap();
+        assert_eq!(
+            build_probe_in(&cc, cc.clone(), None, &host, &next),
+            CcVerdict::Ready { driver: cc }
+        );
     }
 
     /// A compiler that hangs is unknown, not broken, and the probe returns inside its
@@ -1613,7 +1814,7 @@ mod tests {
             file: root.join("state").join("cc"),
             receipt: root.join("absent-receipt"),
         };
-        let developer = host.developer_dir();
+        let developer = host.developer_dir().unwrap();
         let clang = clang_paths(&developer)
             .iter()
             .map(|path| crate::probe_cache::identity(path).unwrap_or_else(|| "absent".to_owned()))
@@ -1640,8 +1841,8 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        // The preceding policy could alias distinct native PATH or deployment-target values
-        // after converting them to lossy text. No fact from that namespace is reusable.
+        // The preceding policy could cache an automatic fallback while the actual selection
+        // was unreadable. No fact from that namespace is reusable.
         let current = cc_key(
             &Located::Plain(cc.clone()),
             Some(bin.as_os_str()),
@@ -1649,7 +1850,7 @@ mod tests {
             &cache,
         )
         .unwrap();
-        old_keys.push(current.replacen("fresh-executable-link-v6", "fresh-executable-link-v5", 1));
+        old_keys.push(current.replacen("fresh-executable-link-v7", "fresh-executable-link-v6", 1));
         // The old receipt reader also called an unread receipt absent. Retire that fact
         // even if the receipt really is absent now and all other inputs still match.
         old_keys.push(current.replacen("receipt-v1 absent", "no receipt", 1));

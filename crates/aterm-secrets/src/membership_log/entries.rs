@@ -2474,7 +2474,7 @@ impl Log {
                     .map(|f| f.recipient),
             );
         }
-        for record in &self.order {
+        for record in self.order.iter() {
             if let Body::Admit { entrant, .. } = record.body()
                 && entrant.member() == *member
             {

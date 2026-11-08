@@ -770,11 +770,9 @@ fn cli(inst: &Inst, args: &[&str]) -> (i32, String, String) {
 
 /// `<aterm> <args>` as [`cli`] runs it on the machine whose scratch is `root`: its HOME, config,
 /// runtime, state and temporary dirs, and nothing of the test's `ATERM_*` but the verify run's
-/// mark ([`harness::kept_from_runner`]). A `ctl survey`'s probe of each instance, a `fabric
-/// brief`'s read of the bus and a `link notify`'s broker answers, which serve, wait half the hang
-/// detector ([`aterm_ctl::PROBE_WITHIN_SEAM`], [`harness::FABRIC_IO_WAIT`], the seam of
-/// [`harness::ACK_WAIT`]), not their 2 s, 3 s and 5 s, so one that never answers is reported
-/// before the run is killed.
+/// mark ([`harness::kept_from_runner`]). Survey probes and notify answers use their explicit
+/// seams ([`aterm_ctl::PROBE_WITHIN_SEAM`], [`harness::ACK_WAIT`]); required fabric replies use
+/// the product's minute detector.
 pub(crate) fn cli_command(aterm: &str, root: &Path, args: &[&str]) -> aterm_uds::spawnfd::Command {
     let mut cmd = aterm_uds::spawnfd::command(aterm);
     harness::kept_from_runner(&mut cmd)
@@ -782,10 +780,6 @@ pub(crate) fn cli_command(aterm: &str, root: &Path, args: &[&str]) -> aterm_uds:
         .env(
             aterm_ctl::PROBE_WITHIN_SEAM,
             (DEADLINE / 2).as_millis().to_string(),
-        )
-        .env(
-            harness::FABRIC_IO_WAIT.0,
-            harness::FABRIC_IO_WAIT.1.as_millis().to_string(),
         )
         .env(harness::ACK_WAIT.0, (DEADLINE / 2).as_millis().to_string())
         .env("HOME", root.join("home"))

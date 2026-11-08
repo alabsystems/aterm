@@ -581,11 +581,29 @@ fn step_one_and_a_dry_run_judge_the_origins_ledger_and_a_synced_run_its_own() {
     );
     assert!(!w.copy().exists());
 
-    // A real run's step 1, before its sync: the origin's ledger, not a release-old copy's.
+    // A real run's step 1, before its sync: the origin's ledger, not a release-old copy's, read
+    // by step 1's fetch of both origins. NEGATIVE CONTROL: where aterm's origin cannot be read,
+    // step 1 refuses before it reads the engine's.
     let mut real = w.real(false);
     assert!(!real.engine_rows(Some(&r)).has, "nothing read yet");
-    real.fetch_engine_origin().unwrap();
-    assert!(real.engine_rows(Some(&r)).has);
+    let unread = real.fetch_origins(|_| Err("no route".into())).unwrap_err();
+    assert!(unread.why.contains("cannot refresh origin"), "{unread:?}");
+    assert!(
+        !real.engine_rows(Some(&r)).has,
+        "nothing read after a refusal"
+    );
+    let fetched = real.fetch_origins(|_| {
+        Ok(crate::github_remote::FetchedOrigin {
+            main: "m".repeat(40),
+            tags: "t\trefs/tags/v1".into(),
+        })
+    });
+    assert_eq!(fetched.unwrap(), "m".repeat(40));
+    assert_eq!(real.origin_tags, "t\trefs/tags/v1");
+    assert!(
+        real.engine_rows(Some(&r)).has,
+        "step 1 read the engine's origin"
+    );
     real.engine_sync().unwrap();
     // Synced: the release's own engine, with a row its publish wrote and has not pushed.
     let s = "b".repeat(40);

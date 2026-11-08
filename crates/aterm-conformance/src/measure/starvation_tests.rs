@@ -14,6 +14,7 @@ fn healthy() -> SchedInputs {
         late_max_us: 3_000,
         sampling_hole_us: 18_400,
         nominal_dt_us: 18_300,
+        all_composed_frames: false,
         wall_us: 5_400_000,
         budget_us: 60_000_000,
         late_threshold_us: DEFAULT_LATE_THRESHOLD_US,
@@ -83,6 +84,41 @@ fn a_blown_capture_cadence_is_starvation_even_when_the_driver_ran() {
     );
     // A hole at the nominal interval is not: a red there is a rendered gap.
     assert_eq!(classify(&healthy()).label(), Starved::No);
+}
+
+#[test]
+fn a_complete_composition_history_needs_no_periodic_sampling_but_still_needs_its_driver() {
+    let complete = SchedInputs {
+        all_composed_frames: true,
+        sampling_hole_us: 200_000,
+        ..healthy()
+    };
+    assert_eq!(classify(&complete).evidence(), Evidence::Sound);
+    // NEGATIVE CONTROL: one lost frame can conceal a blackout in that same interval.
+    assert_eq!(
+        classify(&SchedInputs {
+            all_composed_frames: false,
+            ..complete
+        })
+        .evidence(),
+        Evidence::Unproved
+    );
+    assert_eq!(
+        classify(&SchedInputs {
+            late_max_us: 40_000,
+            ..complete
+        })
+        .evidence(),
+        Evidence::Unproved
+    );
+    assert_eq!(
+        classify(&SchedInputs {
+            wall_us: 58_000_000,
+            ..complete
+        })
+        .evidence(),
+        Evidence::Unproved
+    );
 }
 
 #[test]

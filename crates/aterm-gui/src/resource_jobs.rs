@@ -167,7 +167,7 @@ pub(crate) fn command(ctx: &crate::SessionCtx, owner: bool, rest: &str) -> Strin
         Some("cpu") if words.next().is_none() => {
             let dir = aterm_capacity::ledger::user_dir();
             let cpu = aterm_capacity::CpuObservation::read(dir.as_deref());
-            format!("OK resources-cpu version=1\n{}\n", cpu.json())
+            format!("OK 1 resources-cpu version=1\n{}\n", cpu.json())
         }
         Some("register") => {
             if !owner {
@@ -635,11 +635,29 @@ mod tests {
 
     #[test]
     fn cpu_control_reports_the_shared_observation_without_claiming_a_lease() {
+        use std::io::{BufRead, BufReader, Write};
         let session = crate::stub_session(0);
         let reply = command(&session.ctx, true, "cpu");
-        let payload = reply.strip_prefix("OK resources-cpu version=1\n").unwrap();
-        let json: aterm_json::Value = aterm_json::from_str(payload).unwrap();
-        assert!(json.get("state").is_some());
+        let within = std::time::Duration::from_secs(60);
+        let (server, client) = aterm_uds::CtlStream::pair().unwrap();
+        server.set_read_timeout(Some(within)).unwrap();
+        server.set_write_timeout(Some(within)).unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let mut reader = BufReader::new(&server);
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                line.clear();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                assert_eq!(line.trim_end(), "resources cpu");
+                (&server).write_all(reply.as_bytes()).unwrap();
+            });
+            let lines = aterm_ctl::exchange_lines(&client, "fixture", "resources cpu", within)
+                .expect("resources cpu must use the client's line framing");
+            assert_eq!(lines.len(), 1);
+            let json: aterm_json::Value = aterm_json::from_str(&lines[0]).unwrap();
+            assert!(json.get("state").is_some());
+        });
         assert!(command(&session.ctx, true, "cpu extra").starts_with("ERR usage:"));
     }
 

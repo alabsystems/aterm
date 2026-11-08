@@ -110,6 +110,7 @@ libc = { workspace = true }
 aterm-font = { workspace = true, features = ["hint"] }
 
 [dev-dependencies]
+aterm-bench = { path = "../aterm-bench" }
 # Base64 encoder for the inline-image (OSC 1337) integration tests.
 aterm-codec = { workspace = true }
 # The child a by-name bundled-font test runs in, with an empty HOME
@@ -163,6 +164,11 @@ required-features = ["embedded-font"]
 [[test]]
 name = "win_heap_attribution"
 path = "tests/win_heap_attribution.rs"
+
+# The Windows profiler's ownership transaction, tested without its platform stack-capture API.
+[[test]]
+name = "heap_book"
+path = "tests/heap_book.rs"
 
 # ---- release perf gates: `targo --unverified bench -p aterm-render` ----------
 [[bench]]

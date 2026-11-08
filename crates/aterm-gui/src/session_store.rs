@@ -453,8 +453,6 @@ pub(crate) struct WindowCarry {
     pub inner_px: Option<[u32; 2]>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub presence_row: bool,
-    #[serde(default)]
-    pub status_bar_rows: u16,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<CarriedMessage>,
     #[serde(default)]
@@ -550,8 +548,6 @@ pub struct CarriedMessage {
     pub stats: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub busy: bool,
-    #[serde(default)]
-    pub on_glass: bool,
     #[serde(
         default = "carried_excerpt",
         skip_serializing_if = "is_carried_excerpt"
@@ -612,7 +608,6 @@ impl From<&aterm_messages::CarriedMessage> for CarriedMessage {
             fill_permille: m.fill_permille,
             stats: m.stats.clone(),
             busy: m.busy,
-            on_glass: m.on_glass,
             excerpt: m.excerpt,
             finished: m.finished.clone(),
             retrospective: m.retrospective,
@@ -640,7 +635,6 @@ impl From<&CarriedMessage> for aterm_messages::CarriedMessage {
             fill_permille: m.fill_permille,
             stats: m.stats.clone(),
             busy: m.busy,
-            on_glass: m.on_glass,
             excerpt: m.excerpt,
             finished: m.finished.clone(),
             retrospective: m.retrospective,

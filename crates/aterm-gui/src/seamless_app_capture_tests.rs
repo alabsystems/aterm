@@ -217,12 +217,6 @@ fn hand_over_as(
         "{at}: every session carried at an exact rung keeps its differ's state, and a blank \
          one has none"
     );
-    assert_eq!(
-        parked.window.as_ref().map(|window| window.status_bar_rows),
-        Some(app.message_band_rows),
-        "{at}: the window carry names the band rows the grids were sized under"
-    );
-
     let mut crossed = Crossed {
         sessions: parked.screens.len(),
         window: parked.window.clone(),
@@ -478,13 +472,7 @@ fn set_chrome(app: &mut crate::App, wid: WindowId, font_px: u32) {
     ws.metrics.font_px = font_px as f32;
 }
 
-fn field_report_window(
-    app: &mut crate::App,
-    wid: WindowId,
-    capture_band: u16,
-) -> (u32, PhysicalSize<u32>) {
-    let band = app.message_band_rows;
-    app.message_band_rows = capture_band;
+fn field_report_window(app: &mut crate::App, wid: WindowId) -> (u32, PhysicalSize<u32>) {
     let (display_width, display_height) = DISPLAYS[2];
     let smallest = crate::FONT_PX_MIN as u32;
     let found = (smallest..=48)
@@ -507,15 +495,7 @@ fn field_report_window(
         })
         .expect("PRECONDITION: some font makes a 99x338 window on the 5K display");
     set_chrome(app, wid, found.0);
-    app.message_band_rows = band;
     found
-}
-
-fn set_band_rows(app: &mut crate::App, rows: u16, sizes: &[(WindowId, PhysicalSize<u32>)]) {
-    app.message_band_rows = rows;
-    for (wid, size) in sizes {
-        app.on_resize(*wid, *size);
-    }
 }
 
 struct Desk {
@@ -535,13 +515,11 @@ fn build_desk(seed: u64, field_report: bool) -> (Desk, impl FnMut() -> u64) {
         let id = app.next_session_id;
         wids.push(app.insert_logical_window(ptys.window_session(id), 24, 80));
     }
-    let band = u16::from(next() % 2 == 1);
-    app.message_band_rows = band;
     let mut sizes = Vec::new();
     let mut shape = Vec::new();
     for (index, wid) in wids.iter().enumerate() {
         let (font_px, size, what) = if field_report && index == 0 {
-            let (font_px, size) = field_report_window(&mut app, *wid, 1 - band);
+            let (font_px, size) = field_report_window(&mut app, *wid);
             (font_px, size, "the field report's window")
         } else {
             let (width, height) = DISPLAYS[usize::try_from(next() % 4).expect("small")];
@@ -608,7 +586,7 @@ fn build_desk(seed: u64, field_report: bool) -> (Desk, impl FnMut() -> u64) {
     }
     ptys.attach_rest(&mut app);
     let shape = format!(
-        "{} session(s), band {band} row(s); {}",
+        "{} session(s); {}",
         app.pool.iter().count(),
         shape.join("; ")
     );
@@ -748,20 +726,6 @@ fn app_capture_case(case: usize, census: &mut DeskCensus) {
     }
     for (wid, _) in &sizes {
         app.resize_panes(*wid);
-    }
-    let before: Vec<u16> = sizes
-        .iter()
-        .map(|(wid, _)| app.windows.get(wid).map_or(0, |ws| ws.rows))
-        .collect();
-    let band = app.message_band_rows;
-    set_band_rows(&mut app, 1 - band, &sizes);
-    for ((wid, _), rows_before) in sizes.iter().zip(before) {
-        let rows = app.windows.get(wid).map_or(0, |ws| ws.rows);
-        assert_eq!(
-            i32::from(rows) - i32::from(rows_before),
-            if band == 0 { -1 } else { 1 },
-            "{at}: the band's row moved window {wid:?}'s grid"
-        );
     }
     if case == 0 {
         let term = app.pool.get(0).expect("window 0's first tab").term.clone();
@@ -938,7 +902,6 @@ fn the_owners_desk_hands_both_sessions_over_at_the_full_rung() {
         bytes_total: 480 * 1024 * 1024,
     });
     app.settle_messages(std::time::Instant::now() + aterm_messages::PROGRESS_GRACE * 2);
-    assert_eq!(app.message_band_rows, 0, "the update stays in the journal");
     app.on_resize(wid, size);
     assert_eq!(
         app.windows.get(&wid).map(|ws| (ws.rows, ws.cols)),
@@ -962,8 +925,8 @@ fn the_owners_desk_hands_both_sessions_over_at_the_full_rung() {
         crossed
             .window
             .as_ref()
-            .is_some_and(|window| window.status_bar_rows == 0 && !window.messages.is_empty()),
-        "{at}: the message rides the window carry without a band row: {:?}",
+            .is_some_and(|window| !window.messages.is_empty()),
+        "{at}: the message rides the window carry: {:?}",
         crossed.window
     );
     assert_eq!(

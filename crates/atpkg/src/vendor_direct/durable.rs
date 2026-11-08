@@ -64,27 +64,43 @@ fn parent_dir(path: &Path) -> &Path {
     }
 }
 
-/// How many times [`again_while_refused`] tries an operation again.
-#[cfg(windows)]
-const REFUSED_TRIES: u64 = 20;
+/// A minute hang detector for Windows to release a required file operation.
+#[cfg(any(windows, test))]
+const REPLACE_HANG: Duration = Duration::from_secs(60);
 
-fn again_while_refused<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+fn again_while_refused<T>(op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     #[cfg(windows)]
     {
-        let mut tries = 0;
-        loop {
-            match op() {
-                Err(e) if e.kind() == io::ErrorKind::PermissionDenied && tries < REFUSED_TRIES => {
-                    tries += 1;
-                    std::thread::sleep(Duration::from_millis(tries));
-                }
-                done => return done,
-            }
-        }
+        again_while_refused_windows_at(op, std::time::Instant::now(), std::thread::sleep)
     }
     #[cfg(not(windows))]
     {
+        let mut op = op;
         op()
+    }
+}
+
+#[cfg(any(windows, test))]
+fn again_while_refused_windows_at<T>(
+    mut op: impl FnMut() -> io::Result<T>,
+    started: std::time::Instant,
+    mut pause: impl FnMut(Duration),
+) -> io::Result<T> {
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        match op() {
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                let left = REPLACE_HANG.saturating_sub(started.elapsed());
+                if left.is_zero() {
+                    return Err(e);
+                }
+                pause(backoff.min(left));
+                backoff = backoff
+                    .saturating_add(Duration::from_millis(1))
+                    .min(Duration::from_millis(30));
+            }
+            done => return done,
+        }
     }
 }
 
@@ -210,6 +226,61 @@ mod tests {
 
     fn dir(label: &str) -> crate::testdir::Dir {
         crate::testdir::dir(&format!("atpkg-vendor-durable-{label}-"))
+    }
+
+    #[test]
+    fn windows_replace_waits_for_a_scheduled_file_holder() {
+        let d = dir("scheduled-windows-replace");
+        let staged = d.join("staged");
+        let dest = d.join("dest");
+        std::fs::write(&staged, b"complete").unwrap();
+        std::fs::write(&dest, b"before").unwrap();
+        let mut calls = 0;
+        let result = again_while_refused_windows_at(
+            || {
+                calls += 1;
+                if calls <= 21 {
+                    Err(io::ErrorKind::PermissionDenied.into())
+                } else {
+                    std::fs::rename(&staged, &dest)
+                }
+            },
+            std::time::Instant::now() - Duration::from_secs(1),
+            |_| {},
+        );
+        result.expect("the Windows holder releases before the hang detector");
+        assert_eq!(calls, 22);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"complete");
+        assert!(!staged.exists());
+    }
+
+    #[test]
+    fn windows_refusal_expiry_keeps_the_error_and_unpublished_bytes() {
+        let d = dir("windows-refusal");
+        let staged = d.join("staged");
+        let dest = d.join("dest");
+        std::fs::write(&staged, b"complete").unwrap();
+        std::fs::write(&dest, b"before").unwrap();
+        for (kind, elapsed) in [
+            (io::ErrorKind::PermissionDenied, Duration::from_secs(61)),
+            (io::ErrorKind::NotFound, Duration::ZERO),
+        ] {
+            let mut calls = 0;
+            let out: io::Result<()> = again_while_refused_windows_at(
+                || {
+                    calls += 1;
+                    Err(io::Error::new(kind, std::fmt::Error))
+                },
+                std::time::Instant::now() - elapsed,
+                |_| panic!("an expired wait or unrelated error must not wait again"),
+            );
+            let error = out.unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert!(error.get_ref().unwrap().is::<std::fmt::Error>());
+            assert_eq!(calls, 1);
+        }
+        assert_eq!(std::fs::read(&staged).unwrap(), b"complete");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"before");
     }
 
     #[test]

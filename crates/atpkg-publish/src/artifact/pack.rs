@@ -154,7 +154,8 @@ pub fn check_build_env(env: &[(String, String)]) -> Result<()> {
 pub struct Metadata {
     /// Every workspace member's manifest path.
     pub manifests: BTreeSet<String>,
-    /// `[workspace.metadata.atpkg] expose` (else the members' union): the shimmed tools.
+    /// The program package's `metadata.atpkg` recipe, else the workspace recipe
+    /// (with the members' exposed-list fallback): the shimmed tools.
     pub expose: Vec<String>,
     /// `bundle`: shipped, not shimmed.
     pub bundle: Vec<String>,
@@ -183,9 +184,59 @@ fn version_of(p: &aterm_json::Value) -> Option<&str> {
     p.get("version").and_then(aterm_json::Value::as_str)
 }
 
+fn package_recipe(recipe: &aterm_json::Value, program: &str) -> Result<Metadata> {
+    if recipe.as_object().is_none() {
+        return Err(Error::refused(format!(
+            "{program}'s package.metadata.atpkg must be a table"
+        )));
+    }
+    let own_strings = |key: &str| -> Result<Vec<String>> {
+        let Some(value) = recipe.get(key) else {
+            return Ok(Vec::new());
+        };
+        let values = value.as_array().ok_or_else(|| {
+            Error::refused(format!(
+                "{program}'s package.metadata.atpkg {key} must be a string array"
+            ))
+        })?;
+        values
+            .iter()
+            .map(|s| {
+                s.as_str().map(str::to_string).ok_or_else(|| {
+                    Error::refused(format!(
+                        "{program}'s package.metadata.atpkg {key} must be a string array"
+                    ))
+                })
+            })
+            .collect()
+    };
+    let bundle_only = match recipe.get("bundle-only") {
+        None => false,
+        Some(value) => value.as_bool().ok_or_else(|| {
+            Error::refused(format!(
+                "{program}'s package.metadata.atpkg bundle-only must be a boolean"
+            ))
+        })?,
+    };
+    let expose = own_strings("expose")?;
+    if expose.is_empty() && !bundle_only {
+        return Err(Error::refused(format!(
+            "{program}'s package.metadata.atpkg must name a nonempty expose list"
+        )));
+    }
+    Ok(Metadata {
+        expose,
+        bundle: own_strings("bundle")?,
+        build_args: own_strings("build-args")?,
+        bundle_only,
+        ..Metadata::default()
+    })
+}
+
 /// Read `targo metadata --no-deps --format-version 1`'s JSON.
 /// # Errors
-/// A refusal when it is not that JSON.
+/// A refusal when it is not that JSON, or the program's own recipe is malformed
+/// or names no exposed tool and is not bundle-only.
 pub fn parse_metadata(json: &[u8], program: &str) -> Result<Metadata> {
     let v: aterm_json::Value = aterm_json::from_slice(json)
         .map_err(|e| Error::refused(format!("`targo metadata` printed no JSON: {e}")))?;
@@ -194,6 +245,12 @@ pub fn parse_metadata(json: &[u8], program: &str) -> Result<Metadata> {
         .and_then(aterm_json::Value::as_array)
         .ok_or_else(|| Error::refused("`targo metadata` lists no packages"))?;
     let ws = v.get("metadata").and_then(|m| m.get("atpkg"));
+    let own = packages
+        .iter()
+        .find(|p| p.get("name").and_then(aterm_json::Value::as_str) == Some(program));
+    let recipe = own
+        .and_then(|p| p.get("metadata"))
+        .and_then(|m| m.get("atpkg"));
     let member = |key: &str| -> Vec<String> {
         packages
             .iter()
@@ -210,7 +267,7 @@ pub fn parse_metadata(json: &[u8], program: &str) -> Result<Metadata> {
         let w = strings(ws.and_then(|a| a.get(key)));
         if w.is_empty() { member(key) } else { w }
     };
-    let bundle_only = ws
+    let workspace_bundle_only = ws
         .and_then(|a| a.get("bundle-only"))
         .and_then(aterm_json::Value::as_bool)
         .unwrap_or(false)
@@ -221,10 +278,18 @@ pub fn parse_metadata(json: &[u8], program: &str) -> Result<Metadata> {
                 .and_then(aterm_json::Value::as_bool)
                 == Some(true)
         });
-    let own_version = packages
-        .iter()
-        .find(|p| p.get("name").and_then(aterm_json::Value::as_str) == Some(program))
-        .and_then(version_of);
+    let selected = if let Some(recipe) = recipe {
+        package_recipe(recipe, program)?
+    } else {
+        Metadata {
+            expose: declared("expose"),
+            bundle: declared("bundle"),
+            build_args: strings(ws.and_then(|a| a.get("build-args"))),
+            bundle_only: workspace_bundle_only,
+            ..Metadata::default()
+        }
+    };
+    let own_version = own.and_then(version_of);
     let version = own_version
         .or_else(|| packages.first().and_then(version_of))
         .unwrap_or("0.0.0")
@@ -236,12 +301,9 @@ pub fn parse_metadata(json: &[u8], program: &str) -> Result<Metadata> {
             .filter_map(|p| p.get("manifest_path").and_then(aterm_json::Value::as_str))
             .map(str::to_string)
             .collect(),
-        expose: declared("expose"),
-        bundle: declared("bundle"),
-        build_args: strings(ws.and_then(|a| a.get("build-args"))),
-        bundle_only,
         version,
         own_version,
+        ..selected
     })
 }
 

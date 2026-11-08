@@ -82,7 +82,7 @@ fn parent_carry(title: &str) -> crate::session_store::WindowCarry {
         update_words::CHECKER_STALLED_TITLE,
         &stalled
     ));
-    window_carry(parent.message_band_rows, parent.carried_messages())
+    window_carry(parent.carried_messages())
 }
 
 fn project(rig: &Rig, model_state: &State) -> State {

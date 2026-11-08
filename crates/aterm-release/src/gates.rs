@@ -55,6 +55,20 @@ fn pin_into(cell: &std::sync::OnceLock<PathBuf>, dir: &Path) -> Result<()> {
 }
 
 static LEASE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+type ToolchainLeases = std::collections::BTreeMap<PathBuf, atpkg::lease::Lease>;
+static TOOLCHAIN_LEASES: std::sync::Mutex<ToolchainLeases> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// One exact close-on-exec duplicate of the selected toolchain lease, with its bounded
+/// holder-file locator. The receiver derives the store and subject independently.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct ToolchainLeaseOffer {
+    /// A close-on-exec duplicate of the original held lease description.
+    pub descriptor: std::os::fd::OwnedFd,
+    /// Its generated direct-child filename, never a supplied path.
+    pub leaf: String,
+}
 
 /// Arm [`lease_toolchain_checked`] for every subsequent toolchain resolution.
 pub fn arm_toolchain_lease() {
@@ -65,12 +79,10 @@ pub fn arm_toolchain_lease() {
 /// # Errors
 /// The directory cannot be resolved, or the store entry's lease cannot be acquired.
 pub fn lease_toolchain_checked(dir: &Path) -> std::result::Result<(), String> {
-    static LEASES: std::sync::Mutex<std::collections::BTreeMap<PathBuf, atpkg::lease::Lease>> =
-        std::sync::Mutex::new(std::collections::BTreeMap::new());
     let dir = dir
         .canonicalize()
         .map_err(|e| format!("resolve toolchain {} before leasing: {e}", dir.display()))?;
-    let mut leases = LEASES
+    let mut leases = TOOLCHAIN_LEASES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if leases.contains_key(&dir) {
@@ -82,6 +94,115 @@ pub fn lease_toolchain_checked(dir: &Path) -> std::result::Result<(), String> {
         return Ok(());
     };
     retain_cut_lease(&mut leases, &layout.prefix, &dir)
+}
+
+/// Duplicate the retained lease for `dir` for one controlled in-place exec. An unmanaged
+/// toolchain has no atpkg lease and returns `None`.
+///
+/// # Errors
+/// The toolchain cannot be resolved or leased, its retained slot changed, its generated leaf
+/// is not representable, or its descriptor cannot be duplicated.
+#[cfg(unix)]
+pub fn offer_toolchain_lease(
+    dir: &Path,
+) -> std::result::Result<Option<ToolchainLeaseOffer>, String> {
+    let dir = dir.canonicalize().map_err(|e| {
+        format!(
+            "resolve toolchain {} before lease handover: {e}",
+            dir.display()
+        )
+    })?;
+    lease_toolchain_checked(&dir)?;
+    let leases = TOOLCHAIN_LEASES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    offer_cut_lease(&leases, &dir)
+}
+
+#[cfg(unix)]
+fn offer_cut_lease(
+    leases: &ToolchainLeases,
+    dir: &Path,
+) -> std::result::Result<Option<ToolchainLeaseOffer>, String> {
+    let Some(lease) = leases.get(dir) else {
+        return Ok(None);
+    };
+    let leaf = lease
+        .path()
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| {
+            format!(
+                "toolchain lease {} has no UTF-8 leaf",
+                lease.path().display()
+            )
+        })?
+        .to_owned();
+    let descriptor = lease
+        .try_clone_descriptor()
+        .map_err(|e| format!("duplicate toolchain lease {}: {e}", lease.path().display()))?;
+    Ok(Some(ToolchainLeaseOffer { descriptor, leaf }))
+}
+
+/// Adopt an exact inherited toolchain lease for `dir` into the process-wide retained set.
+/// The configured atpkg prefix and canonical toolchain directory are selected here; `leaf`
+/// supplies no pathname or subject authority.
+///
+/// The owned descriptor is consumed on every answer.
+///
+/// # Safety
+/// Call at image startup before threads or callbacks can close, replace or use `fd`'s raw number,
+/// under the exclusive continuous custody required by
+/// [`atpkg::lease::Lease::adopt_inherited`].
+///
+/// # Errors
+/// The configured store, canonical toolchain, original lease description or exact subject leaf
+/// cannot be established, or this image already retained a lease for the directory.
+#[cfg(unix)]
+pub unsafe fn adopt_toolchain_lease(
+    fd: std::os::fd::OwnedFd,
+    dir: &Path,
+    leaf: &str,
+) -> std::result::Result<(), String> {
+    let dir = dir
+        .canonicalize()
+        .map_err(|e| format!("resolve inherited toolchain {}: {e}", dir.display()))?;
+    let home = aterm_types::dirs::home_dir();
+    let configured = atpkg::config::load().prefix_path(home.as_deref());
+    let layout = atpkg::store::resolve(configured.as_deref()).ok_or_else(|| {
+        format!(
+            "cannot resolve the configured atpkg store for inherited toolchain {}",
+            dir.display()
+        )
+    })?;
+    let mut leases = TOOLCHAIN_LEASES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // SAFETY: the caller supplies the exclusive startup custody. The prefix and canonical
+    // directory were selected independently in this image.
+    unsafe { adopt_cut_lease(&mut leases, &layout.prefix, &dir, fd, leaf) }
+}
+
+#[cfg(unix)]
+unsafe fn adopt_cut_lease(
+    leases: &mut ToolchainLeases,
+    prefix: &Path,
+    dir: &Path,
+    fd: std::os::fd::OwnedFd,
+    leaf: &str,
+) -> std::result::Result<(), String> {
+    let std::collections::btree_map::Entry::Vacant(entry) = leases.entry(dir.to_path_buf()) else {
+        return Err(format!(
+            "this image already retained the toolchain lease for {}",
+            dir.display()
+        ));
+    };
+    // SAFETY: propagated from this startup-only helper's caller; prefix and dir are receiver
+    // selections and Lease validates the leaf against the subject it derives from them.
+    let lease = unsafe { atpkg::lease::Lease::adopt_inherited(fd, prefix, dir, leaf) }
+        .map_err(|e| format!("adopt toolchain lease for {}: {e}", dir.display()))?;
+    entry.insert(lease);
+    Ok(())
 }
 
 fn retain_cut_lease(
@@ -2286,26 +2407,43 @@ pub fn own_cutter(
     git: &dyn GitRunner,
     commit: &str,
 ) -> std::result::Result<String, crate::cutter::NotOwn> {
-    own_cutter_of(git, crate::cutter::running(), commit)
+    own_cutter_stamp_of(git, crate::cutter::running_stamp(), commit)
 }
 
-/// [`own_cutter`] for a cutter whose verdict is `stamp`.
+/// Whether the release flow is already running the content-proved frozen cutter for `commit`.
+/// Hand-run verbs keep [`own_cutter`]'s dep-info judgment; only the release flow requires this
+/// stronger boundary so even an exact tree build freezes both tools once before qualification.
 ///
 /// # Errors
-/// As [`own_cutter`].
-fn own_cutter_of(
-    git: &dyn GitRunner,
-    stamp: std::result::Result<&str, &crate::cutter::NotOwn>,
+/// The running image is not the frozen cutter proved for exactly `commit`.
+pub fn own_frozen_cutter(commit: &str) -> std::result::Result<String, crate::cutter::NotOwn> {
+    own_frozen_cutter_stamp_of(crate::cutter::running_stamp(), commit)
+}
+
+fn own_frozen_cutter_stamp_of(
+    stamp: std::result::Result<&crate::cutter::Stamp, &crate::cutter::NotOwn>,
     commit: &str,
 ) -> std::result::Result<String, crate::cutter::NotOwn> {
     match stamp {
-        Ok(stamp) => own_cutter_with(git, stamp, commit).map_err(|why| crate::cutter::NotOwn {
-            why,
+        Ok(crate::cutter::Stamp::Proved(stamp)) if stamp == commit => Ok(format!(
+            "cutter identity: content-proved from {} itself",
+            short(commit)
+        )),
+        Ok(crate::cutter::Stamp::Proved(stamp)) => Err(crate::cutter::NotOwn {
+            why: format!("this content-proved aterm-release binary is for {stamp}, not {commit}"),
             fix: format!(
-                "run it as `{}` from the release's clone (it re-runs itself as the release \
-                     commit's own cutter), or as `targo --unverified ship <verb>` from a clean \
-                     checkout of {commit} with its own target directory (cargo relinks the \
-                     cutter from that tree before it runs it)",
+                "run `{}` again from the clean release clone",
+                crate::release::RELEASE_COMMAND
+            ),
+        }),
+        Ok(crate::cutter::Stamp::Built(stamp)) => Err(crate::cutter::NotOwn {
+            why: format!(
+                "this aterm-release binary is the dep-info build of {stamp}, not the frozen \
+                 content-proved cutter for {commit}"
+            ),
+            fix: format!(
+                "run `{}` again from the clean release clone; it freezes and execs that \
+                 commit's tools",
                 crate::release::RELEASE_COMMAND
             ),
         }),
@@ -2316,6 +2454,64 @@ fn own_cutter_of(
             ),
             fix: none.fix.clone(),
         }),
+    }
+}
+
+/// [`own_cutter`] for a cutter whose verdict is `stamp`.
+///
+/// # Errors
+/// As [`own_cutter`].
+fn own_cutter_stamp_of(
+    git: &dyn GitRunner,
+    stamp: std::result::Result<&crate::cutter::Stamp, &crate::cutter::NotOwn>,
+    commit: &str,
+) -> std::result::Result<String, crate::cutter::NotOwn> {
+    match stamp {
+        Ok(crate::cutter::Stamp::Proved(stamp)) if stamp == commit => Ok(format!(
+            "cutter identity: content-proved from {} itself",
+            short(commit)
+        )),
+        Ok(crate::cutter::Stamp::Proved(stamp)) => Err(crate::cutter::NotOwn {
+            why: format!("this content-proved aterm-release binary is for {stamp}, not {commit}"),
+            fix: format!(
+                "run `{}` again from the clean release clone",
+                crate::release::RELEASE_COMMAND
+            ),
+        }),
+        Ok(crate::cutter::Stamp::Built(stamp)) => {
+            own_cutter_with(git, stamp, commit).map_err(|why| crate::cutter::NotOwn {
+                why,
+                fix: format!(
+                    "run it as `{}` from the release's clone (it freezes and executes the release \
+                     commit's own cutter), or as `targo --unverified ship <verb>` from a clean \
+                     checkout of {commit} with its own target directory (cargo relinks the \
+                     cutter from that tree before it runs it)",
+                    crate::release::RELEASE_COMMAND
+                ),
+            })
+        }
+        Err(none) => Err(crate::cutter::NotOwn {
+            why: format!(
+                "this aterm-release binary is no commit's cutter: {}",
+                none.why
+            ),
+            fix: none.fix.clone(),
+        }),
+    }
+}
+
+/// The dep-info form used by prechecks and their pure seams.
+fn own_cutter_of(
+    git: &dyn GitRunner,
+    stamp: std::result::Result<&str, &crate::cutter::NotOwn>,
+    commit: &str,
+) -> std::result::Result<String, crate::cutter::NotOwn> {
+    match stamp {
+        Ok(stamp) => {
+            let built = crate::cutter::Stamp::Built(stamp.to_owned());
+            own_cutter_stamp_of(git, Ok(&built), commit)
+        }
+        Err(not) => own_cutter_stamp_of(git, Err(not), commit),
     }
 }
 
@@ -3242,6 +3438,31 @@ mod universal_gate_tests {
 mod cut_lease_tests {
     use super::*;
 
+    #[cfg(unix)]
+    unsafe extern "C" {
+        fn fcntl(fd: std::ffi::c_int, cmd: std::ffi::c_int, ...) -> std::ffi::c_int;
+    }
+    #[cfg(unix)]
+    const F_GETFD: std::ffi::c_int = 1;
+    #[cfg(unix)]
+    const F_SETFD: std::ffi::c_int = 2;
+    #[cfg(unix)]
+    const FD_CLOEXEC: std::ffi::c_int = 1;
+
+    #[cfg(unix)]
+    fn inherited(fd: std::os::fd::OwnedFd) -> std::os::fd::OwnedFd {
+        use std::os::fd::AsRawFd as _;
+
+        let raw = fd.as_raw_fd();
+        // SAFETY: the test exclusively owns this candidate and changes only the inheritance
+        // flag, exactly as the controlled exec boundary does.
+        let flags = unsafe { fcntl(raw, F_GETFD) };
+        assert!(flags >= 0 && flags & FD_CLOEXEC != 0);
+        // SAFETY: the live owned descriptor remains exclusively held by `fd`.
+        assert_eq!(unsafe { fcntl(raw, F_SETFD, flags & !FD_CLOEXEC) }, 0);
+        fd
+    }
+
     #[test]
     fn a_store_lease_io_failure_is_not_reported_as_an_unmanaged_compiler() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -3292,6 +3513,72 @@ mod cut_lease_tests {
         drop(lease);
         assert!(take_cut_lease(&prefix, &std::env::temp_dir()).is_none());
         let _ = fs::remove_dir_all(&prefix);
+    }
+
+    /// The gate exports one close-on-exec copy and retains an adopted original description
+    /// after the sender map disappears. Selecting another managed subject is the negative
+    /// control: its valid-looking environment leaf cannot redirect adoption.
+    #[cfg(unix)]
+    #[test]
+    fn a_cut_lease_offer_adopts_only_for_its_independently_selected_toolchain() {
+        use std::os::fd::AsRawFd as _;
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let prefix = root.path().canonicalize().unwrap();
+        let bin = prefix.join("store/trust/9192/bin");
+        let other = prefix.join("store/trust/9193/bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let mut sender = ToolchainLeases::new();
+        retain_cut_lease(&mut sender, &prefix, &bin).unwrap();
+        let path = sender.get(&bin).unwrap().path().to_owned();
+        let subject = atpkg::lease::Subject::build("trust", 9192).unwrap();
+
+        let wrong = offer_cut_lease(&sender, &bin).unwrap().unwrap();
+        assert_eq!(
+            wrong.leaf,
+            path.file_name().unwrap().to_str().unwrap(),
+            "only the generated leaf crosses the handover"
+        );
+        let wrong_leaf = wrong.leaf;
+        let wrong = inherited(wrong.descriptor);
+        let wrong_raw = wrong.as_raw_fd();
+        let mut receiver = ToolchainLeases::new();
+        // SAFETY: this exclusive inherited-form offer is intentionally paired with a different
+        // independently selected subject. The adoption boundary consumes it on refusal.
+        assert!(
+            unsafe { adopt_cut_lease(&mut receiver, &prefix, &other, wrong, &wrong_leaf) }
+                .unwrap_err()
+                .contains("selected toolchain subject")
+        );
+        assert!(receiver.is_empty());
+        // SAFETY: F_GETFD observes that the owned offer was consumed exactly once.
+        assert_eq!(unsafe { fcntl(wrong_raw, F_GETFD) }, -1);
+
+        let offer = offer_cut_lease(&sender, &bin).unwrap().unwrap();
+        let leaf = offer.leaf;
+        let offer = inherited(offer.descriptor);
+        // SAFETY: this test exclusively offers the actual retained description before any
+        // thread can reuse it; prefix and bin are independently selected canonical paths.
+        unsafe { adopt_cut_lease(&mut receiver, &prefix, &bin, offer, &leaf) }.unwrap();
+        assert_eq!(receiver.get(&bin).unwrap().subject(), &subject);
+        drop(sender);
+        assert!(
+            matches!(
+                atpkg::lease::holders(&prefix, &subject),
+                atpkg::lease::Holders::Held(_)
+            ),
+            "the adopted gate lease alone retains the toolchain"
+        );
+        drop(receiver);
+        assert_eq!(
+            atpkg::lease::let_go_within(&path, aterm_spec::wait::MUST_HAPPEN),
+            Ok(())
+        );
+        assert_eq!(
+            atpkg::lease::holders(&prefix, &subject),
+            atpkg::lease::Holders::Free
+        );
     }
 }
 
@@ -3633,6 +3920,45 @@ mod cutter_identity_tests {
         assert!(not.why.ends_with(&none.why), "{not:?}");
         assert_eq!(not.fix, none.fix, "the verdict's own remedy");
         own_cutter_with(&claim, "unknown", HEAD).expect_err("not an id");
+    }
+
+    /// A frozen cutter's content proof names exactly one commit. Unlike a dep-info build, it
+    /// cannot use the claim-only child exception. That mismatch is the negative control.
+    #[test]
+    fn a_content_proved_cutter_judges_only_its_exact_commit() {
+        let claim = Claimed {
+            parent: OLDER,
+            changed: "CHANGELOG.md\nRELEASES.ledger\n",
+        };
+        let proved = crate::cutter::Stamp::Proved(HEAD.into());
+        assert!(own_cutter_stamp_of(&claim, Ok(&proved), HEAD).is_ok());
+
+        let proved_old = crate::cutter::Stamp::Proved(OLDER.into());
+        let not = own_cutter_stamp_of(&claim, Ok(&proved_old), HEAD).unwrap_err();
+        assert!(not.why.contains("content-proved"), "{not:?}");
+
+        let built_old = crate::cutter::Stamp::Built(OLDER.into());
+        assert!(
+            own_cutter_stamp_of(&claim, Ok(&built_old), HEAD).is_ok(),
+            "the existing dep-info claim exception remains for hand-run cutters"
+        );
+    }
+
+    /// Release qualification crosses the frozen-tool boundary even when the launcher is already
+    /// an exact dep-info build of R. Hand-run gates retain that build judgment. Mutating the
+    /// release-only gate to call `own_cutter_stamp_of` makes the first assertion fail.
+    #[test]
+    fn release_flow_freezes_even_an_exact_dep_info_build() {
+        let exact = crate::cutter::Stamp::Built(HEAD.into());
+        let not = own_frozen_cutter_stamp_of(Ok(&exact), HEAD).unwrap_err();
+        assert!(
+            not.why.contains("not the frozen content-proved cutter"),
+            "{not:?}"
+        );
+        assert!(own_cutter_stamp_of(&unrelated(), Ok(&exact), HEAD).is_ok());
+
+        let proved = crate::cutter::Stamp::Proved(HEAD.into());
+        assert!(own_frozen_cutter_stamp_of(Ok(&proved), HEAD).is_ok());
     }
 
     #[test]

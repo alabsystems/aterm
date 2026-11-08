@@ -1199,9 +1199,11 @@ fn edges(rows: &[String]) -> (usize, usize) {
 
 /// A FILE'S BOX NAMES ITS FILE ONLY WHEN IT IS DRAWN WHOLE (2.5.2's `renderBody`, read in its
 /// binary): the measured write with its path cut at the box's edge by `...` reads that text as
-/// its command and no path, and so does one of two-cell glyphs whose cells reach the edge.
-/// NEGATIVE CONTROL for the mutants that take the cut text for the path or count a cut row's
-/// characters for its cells.
+/// its command and no path, and so does one of two-cell glyphs whose cells reach the edge, and
+/// one whose `...` stands short of the edge: Kimi stops a cut before a grapheme that does not
+/// fit (four cells to it for `ကျွေ`) and counts an asat (U+103A) a cell the grid draws as none,
+/// so a cut row may end cells short of the edge. NEGATIVE CONTROL: the same path drawn whole
+/// is named; the short cut kills the mutant that judges a cut by the row's reach.
 #[test]
 fn a_file_box_names_its_file_only_when_drawn_whole() {
     let path = "/private/tmp/at.H2aa/proj/notes-for-the-lab.txt";
@@ -1243,6 +1245,36 @@ fn a_file_box_names_its_file_only_when_drawn_whole() {
         (p.path, p.command),
         (None, format!("{wide}...")),
         "a path of two-cell glyphs cut at the edge"
+    );
+
+    // Three asats Kimi counted as a cell each: its `...` stands three cells short of the edge.
+    let asats = "/private/tmp/at.H2aa/proj/မြန်မာ-ကင်မရာ-ဓာတ်ပုံ/";
+    let short: String = format!("{asats}{}", "b".repeat(width))
+        .chars()
+        .take_while({
+            let mut taken = String::new();
+            move |ch| {
+                taken.push(*ch);
+                crate::question::cells(&taken) <= edge + width - lead - 3 - 3
+            }
+        })
+        .collect();
+    assert!(
+        lead + crate::question::cells(&short) + 3 + 2 < edge + width,
+        "PRECONDITION: its cells fall short of the edge"
+    );
+    let mut cut_short = write.clone();
+    cut_short[at] = format!("{}{short}...", " ".repeat(lead));
+    let p = prompt(&cut_short).expect("the write");
+    assert_eq!(
+        (p.path, p.command),
+        (None, format!("{short}...")),
+        "a cut whose `...` stands short of the edge names no file"
+    );
+    assert_eq!(
+        prompt(&write).and_then(|p| p.path).as_deref(),
+        Some(path),
+        "NEGATIVE CONTROL: the path drawn whole is named"
     );
 }
 

@@ -678,7 +678,8 @@ impl Limits {
         }
     }
 
-    fn over(&self) -> bool {
+    /// Whether the deadline has passed.
+    pub(crate) fn over(&self) -> bool {
         self.until.is_some_and(|t| Instant::now() >= t)
     }
 }
@@ -1213,21 +1214,32 @@ fn fold_row(bytes: &[u8], cursor: &mut Cursor, sink: &mut Sink<'_>) {
     report.messages = report.messages.saturating_add(1);
 }
 
-struct Found {
-    rel: String,
-    path: PathBuf,
-    meta: std::fs::Metadata,
+/// One transcript a [`walk`] found.
+pub(crate) struct Found {
+    /// Its path under `projects/`.
+    pub(crate) rel: String,
+    pub(crate) path: PathBuf,
+    /// Its metadata when the walk found it.
+    pub(crate) meta: std::fs::Metadata,
 }
 
-struct Walk {
+/// What a [`walk`] found.
+pub(crate) struct Walk {
     /// Newest first.
-    files: Vec<Found>,
-    cut: bool,
+    pub(crate) files: Vec<Found>,
+    /// The walk stopped at [`MAX_WALK_ENTRIES`], [`MAX_DEPTH`] or the deadline.
+    pub(crate) cut: bool,
     /// Entries which could not be inspected or named by a UTF-8 path.
-    unread: usize,
+    pub(crate) unread: usize,
 }
 
-fn walk(projects: &Path, since: i64, limits: &Limits) -> Walk {
+/// A Claude Code home's transcripts: every regular `*.jsonl` file under `projects` (a link or a
+/// file that is not a regular one is passed over, and a `projects` that is a link is not walked),
+/// to [`MAX_DEPTH`] directories down (a session's `subagents/` and its workflows' agents among
+/// them), last written at or after `since`, newest first; at most [`MAX_WALK_ENTRIES`] entries,
+/// stopping at `limits`' deadline. The spend fold reads these; so does the account backfill
+/// (`super::account_backfill`).
+pub(crate) fn walk(projects: &Path, since: i64, limits: &Limits) -> Walk {
     let mut out = Walk {
         files: Vec::new(),
         cut: false,

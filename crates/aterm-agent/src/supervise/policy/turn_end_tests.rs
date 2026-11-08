@@ -14239,6 +14239,7 @@ fn a_session_held_at_its_wall_waits_for_whatever_comes_first() {
             sid: "s-two".to_string(),
             at: now - 60,
             took: false,
+            native_receipt: None,
         }),
         ..State::default()
     };

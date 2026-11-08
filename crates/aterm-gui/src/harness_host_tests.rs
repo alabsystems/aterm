@@ -10830,6 +10830,7 @@ fn the_rosters_advice_is_mapped_for_the_policy() {
             sid: "s-other".to_string(),
             at: ACCT_NOW - 60,
             took: false,
+            native_receipt: None,
         }),
         ..accounts::State::default()
     };
@@ -10919,6 +10920,7 @@ fn the_rosters_advice_is_mapped_for_the_policy() {
             sid: "s-other".to_string(),
             at: ACCT_NOW - accounts::CANARY_HOLD_S,
             took: false,
+            native_receipt: None,
         }),
         ..held.clone()
     };
@@ -14822,6 +14824,7 @@ fn a_followers_exit_before_its_answer_strikes_nothing_of_a_proven_account() {
             sid: "s-acct-other".to_string(),
             at: ACCT_NOW,
             took: true,
+            native_receipt: None,
         });
     });
     assert_eq!(
@@ -15316,6 +15319,7 @@ fn a_limit_an_earlier_process_wrote_follows_and_rotates_nothing() {
             sid: "s-acct-other".to_string(),
             at: ACCT_NOW - 60,
             took: false,
+            native_receipt: None,
         });
     });
     assert!(

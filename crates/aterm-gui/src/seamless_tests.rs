@@ -3143,7 +3143,6 @@ fn stage_outgoing_handoff_full(
             outer_y: Some(64),
             inner_px: None,
             presence_row: false,
-            status_bar_rows: 0,
             update_verified_unix_ms: None,
             messages: Vec::new(),
             next_message_id: 0,

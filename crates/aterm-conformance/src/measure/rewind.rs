@@ -205,6 +205,7 @@ pub fn steps_standing(sched: &SchedReading, max_p99_us: u64) -> Starvation {
         late_max_us,
         sampling_hole_us: 0,
         nominal_dt_us: 0,
+        all_composed_frames: false,
         wall_us: 0,
         budget_us: 0,
         late_threshold_us: max_p99_us,

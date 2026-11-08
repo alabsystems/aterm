@@ -71,6 +71,7 @@ fn observe_pool_session(model: &aterm_spec::interp::State) -> [i64; 4] {
                 sid: sid.into(),
                 at: seat.now,
                 took: false,
+                native_receipt: None,
             });
             if model["present"] == 1 {
                 accounts::note_session(state, sid, "pool-a", Some("newer"), seat.now);

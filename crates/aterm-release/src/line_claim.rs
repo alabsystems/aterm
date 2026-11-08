@@ -127,6 +127,35 @@ struct State {
     pub rows: Vec<String>,
 }
 
+/// Whether a continued local run claim continues the fleet holder. A native exec keeps the exact
+/// holder. The one deployment boundary also admits the live ancestor a pre-B1 cutter marked as
+/// handed before it started this image: node, host, session and boot must still agree, and
+/// `legacy_parent` independently proves that ancestor's recorded pid/start. No current writer
+/// creates that local marker.
+fn continues_holder_with(
+    continued: bool,
+    previous: &Holder,
+    current: &Holder,
+    legacy_parent: &dyn Fn(&Holder) -> bool,
+) -> bool {
+    continued
+        && (previous == current
+            || (previous.node == current.node
+                && previous.host == current.host
+                && previous.sid == current.sid
+                && previous.boot == current.boot
+                && legacy_parent(previous)))
+}
+
+fn continues_holder(continued: bool, previous: &Holder, current: &Holder) -> bool {
+    let ancestors = crate::cutter::ancestors();
+    continues_holder_with(continued, previous, current, &|holder| {
+        ancestors.contains(&holder.pid)
+            && aterm_agent::release_progress::identity(holder.pid)
+                .is_some_and(|(boot, start)| boot == holder.boot && start == holder.start)
+    })
+}
+
 /// A host observation is tri-state. Failure to reach a peer is never evidence of death.
 #[derive(Clone, Debug)]
 enum Observation {
@@ -352,7 +381,7 @@ fn adopt(
 /// the fleet's exact line, with this clone's records, and carries fixes onto that head.
 pub fn select(
     backend: &mut dyn crate::release::Backend,
-    handed: bool,
+    continued: bool,
     candidate: &mut crate::release::Candidate,
     journal: &mut Option<crate::release::Journal>,
     started: u64,
@@ -364,7 +393,7 @@ pub fn select(
             || crate::line::Line::start(&candidate.version, &candidate.commit, started),
             crate::release::Journal::line,
         );
-    let selected = backend.fleet_line(&proposed, handed)?;
+    let selected = backend.fleet_line(&proposed, continued)?;
     if selected != proposed {
         adopt(candidate, journal, selected);
     }
@@ -381,7 +410,7 @@ struct Lease {
 }
 
 impl Lease {
-    fn take(repo: &Path, line: &crate::line::Line, handed: bool) -> Result<Self, String> {
+    fn take(repo: &Path, line: &crate::line::Line, continued: bool) -> Result<Self, String> {
         let env = aterm_agent::harness::cli::Env::from_process()?;
         let host =
             aterm_agent::survey_facts::machine_label().ok_or("no canonical fleet host label")?;
@@ -407,11 +436,8 @@ impl Lease {
             let old = remote(&git, &name)?;
             if let Some((_, state)) = &old {
                 let observed = observe(state, &holder, &env.state);
-                let handed = handed
-                    && state.holder.node == holder.node
-                    && state.holder.boot == holder.boot
-                    && crate::cutter::ancestors().contains(&state.holder.pid);
-                if !handed && !adoptable(state, &observed, now()) {
+                let continued = continues_holder(continued, &state.holder, &holder);
+                if !continued && !adoptable(state, &observed, now()) {
                     if matches!(observed, Observation::Unknown)
                         || matches!(&observed, Observation::Live(live) if live.holder != state.holder)
                     {
@@ -571,9 +597,9 @@ impl Claim {
         repo: &Path,
         line: &crate::line::Line,
         logs: &Path,
-        handed: bool,
+        continued: bool,
     ) -> Result<Self, String> {
-        let lease = Lease::take(repo, line, handed)?;
+        let lease = Lease::take(repo, line, continued)?;
         let line = lease.state.line.clone();
         let local = Arc::new(Local {
             state: Mutex::new(lease.state.clone()),
@@ -922,6 +948,42 @@ mod tests {
         }
     }
 
+    /// The exact holder survives native exec, and the authenticated pre-B1 parent may cross the
+    /// one child-process deployment boundary. NEGATIVE CONTROLS: without local continuation or
+    /// the independently live parent proof, and with another node, session or boot, the flag
+    /// grants no fleet-line authority.
+    #[test]
+    fn an_exec_or_authenticated_pre_b1_parent_continues_the_fleet_holder() {
+        let previous = state("m3", 1).holder;
+        let no_parent = |_: &Holder| false;
+        assert!(continues_holder_with(
+            true, &previous, &previous, &no_parent
+        ));
+        assert!(!continues_holder_with(false, &previous, &previous, &|_| {
+            true
+        }));
+
+        let mut child = previous.clone();
+        child.pid += 1;
+        child.start += 1;
+        let parent = |holder: &Holder| holder.pid == previous.pid && holder.start == previous.start;
+        assert!(continues_holder_with(true, &previous, &child, &parent));
+        assert!(!continues_holder_with(true, &previous, &child, &no_parent));
+        for field in ["node", "host", "sid", "boot"] {
+            let mut changed = child.clone();
+            match field {
+                "node" => changed.node.push('x'),
+                "host" => changed.host.push('x'),
+                "sid" => changed.sid.push('x'),
+                _ => changed.boot.push('x'),
+            }
+            assert!(
+                !continues_holder_with(true, &previous, &changed, &parent),
+                "changed {field}"
+            );
+        }
+    }
+
     #[test]
     fn stalled_holder_is_adopted_but_live_progress_and_network_faults_are_not() {
         let old = state("m3", 1);
@@ -1145,7 +1207,6 @@ mod tests {
             (101, "start-a"),
             dir.path(),
             &mut |_| None,
-            &[],
         )
         .unwrap();
         let local_b = crate::release::RunClaim::take(
@@ -1153,7 +1214,6 @@ mod tests {
             (102, "start-b"),
             dir.path(),
             &mut |_| None,
-            &[],
         )
         .unwrap();
         let baseline_holders = [&local_a, &local_b].len();

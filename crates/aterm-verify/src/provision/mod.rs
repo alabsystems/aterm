@@ -617,10 +617,11 @@ fn managed_row(
     install: bool,
 ) -> State {
     let recipe = want.recipe();
-    if !recipe.hosts.contains(&machine.platform.as_str()) {
+    if recipe.is_some_and(|recipe| !recipe.hosts.contains(&machine.platform.as_str())) {
         return State::CouldNotRun(format!(
             "{} is unavailable on {}",
-            recipe.name, machine.platform
+            want.program(),
+            machine.platform
         ));
     }
     match host.managed(want, install) {
@@ -629,7 +630,8 @@ fn managed_row(
         Err(why) => {
             let why = format!(
                 "{}: signed prerequisite: {why} (fix: `aterm pkg install {}`)",
-                recipe.name, recipe.name
+                want.program(),
+                want.program()
             );
             if install {
                 State::Failed(why)
